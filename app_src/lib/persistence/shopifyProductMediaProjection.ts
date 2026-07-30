@@ -154,6 +154,19 @@ type ReconciliationRow = QueryResultRow & {
   latest_media_status: string | null
   latest_media_errors: unknown
   latest_observed_at: string | Date | null
+  unknown_observation_eligible_after: string | Date | null
+}
+
+type UnknownObservationSummaryRow = QueryResultRow & {
+  observation_id: string
+  observed_at: string | Date
+  provider_media_count: number
+  observation_count: string | number
+  zero_media_observation_count: string | number
+  first_observed_at: string | Date
+  last_observed_at: string | Date
+  eligible_after: string | Date
+  reconciled: boolean
 }
 
 type SourceBindingRow = QueryResultRow & {
@@ -194,6 +207,19 @@ export type ShopifyProductMediaReconciliationContext = {
     details: string | null
   }>
   observedAt: string | null
+  unknownObservationEligibleAfter: string | null
+}
+
+export type ShopifyProductMediaUnknownObservation = {
+  observationId: string
+  observedAt: string
+  providerMediaCount: number
+  observationCount: number
+  zeroMediaObservationCount: number
+  firstObservedAt: string
+  lastObservedAt: string
+  eligibleAfter: string
+  reconciled: boolean
 }
 
 const MEDIA_IMAGE_GID_PATTERN =
@@ -255,6 +281,15 @@ function reconciliationContext(
       row.media_image_gid !== null
       && !MEDIA_IMAGE_GID_PATTERN.test(row.media_image_gid)
     )
+    || (
+      state === 'unknown'
+      && (
+        !row.unknown_observation_eligible_after
+        || Number.isNaN(Date.parse(
+          String(row.unknown_observation_eligible_after),
+        ))
+      )
+    )
   ) {
     fail(
       'SHOPIFY_PRODUCT_MEDIA_RECONCILIATION_EVIDENCE_INVALID',
@@ -281,6 +316,12 @@ function reconciliationContext(
     observedAt: row.latest_observed_at
       ? new Date(row.latest_observed_at).toISOString()
       : null,
+    unknownObservationEligibleAfter:
+      row.unknown_observation_eligible_after
+        ? new Date(
+            row.unknown_observation_eligible_after,
+          ).toISOString()
+        : null,
   }
 }
 
@@ -908,7 +949,16 @@ async function assertNoUnresolvedActiveImagePublish(
            effect.id IS NULL
            AND media_grant.expires_at > clock_timestamp()
          )
-         OR effect.state IN ('pending', 'claimed', 'unknown')
+         OR effect.state IN ('pending', 'claimed')
+         OR (
+           effect.state = 'unknown'
+           AND NOT
+             operations_shopify_product_media_unknown_is_reconciled(
+               media_grant.organization_id,
+               effect.id,
+               media_grant.id
+             )
+         )
          OR (
            effect.state = 'succeeded'
            AND effect.redacted_result->>'mediaRequested' = 'true'
@@ -1638,7 +1688,19 @@ async function readReconciliationContext(
          AS initial_media_errors,
        latest.media_status AS latest_media_status,
        latest.media_errors AS latest_media_errors,
-       latest.observed_at AS latest_observed_at
+       latest.observed_at AS latest_observed_at,
+       CASE
+         WHEN effect.state = 'unknown' THEN
+           GREATEST(
+             COALESCE(
+               effect.completed_at,
+               effect.updated_at,
+               effect.created_at
+             ),
+             media_grant.expires_at
+           ) + interval '5 minutes'
+         ELSE NULL
+       END AS unknown_observation_eligible_after
      FROM operations_commerce_external_effect_intents effect
      JOIN operations_shopify_product_media_delivery_grants media_grant
        ON media_grant.organization_id = effect.organization_id
@@ -1890,6 +1952,235 @@ export async function recordShopifyProductMediaStatusObservationInPostgres(
       errors: mediaErrors(inserted.rows[0].media_errors),
       observedAt: new Date(inserted.rows[0].observed_at).toISOString(),
       replayed: false,
+    }
+  })
+}
+
+export async function recordShopifyProductMediaUnknownObservationInPostgres(
+  input: {
+    organizationId: string
+    deliveryGrantId: string
+    externalEffectId: string
+    externalEffectGlobalId: string
+    observedProductGid: string
+    observedProductTitle: string
+    providerShopGid: string
+    providerMediaCount: number
+    latestMedia: {
+      mediaGid: string
+      mediaContentType: string
+      status: 'FAILED' | 'PROCESSING' | 'READY' | 'UPLOADED'
+    } | null
+    providerResponseSha256: string
+    providerQueryContract:
+      'shopify-graphql-2026-07-product-media-absence-v1'
+    providerObservedAt: string
+    actorEmail: string
+  },
+): Promise<ShopifyProductMediaUnknownObservation> {
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shopify-product-media-unknown:${input.organizationId}:${input.externalEffectId}`,
+    )
+    const inserted = await client.query<{
+      id: string
+      observed_at: string | Date
+      provider_media_count: number
+    }>(
+      `INSERT INTO
+         operations_shopify_product_media_unknown_observations (
+           organization_id,
+           integration_account_id,
+           delivery_grant_id,
+           external_effect_id,
+           authorization_id,
+           product_id,
+           image_asset_id,
+           product_gid,
+           asset_content_sha256,
+           source_url_sha256,
+           signed_token_sha256,
+           credential_generation,
+           provider_shop_gid,
+           observed_product_gid,
+           observed_product_title,
+           provider_media_count,
+           latest_media_gid,
+           latest_media_content_type,
+           latest_media_status,
+           provider_response_sha256,
+           provider_query_contract,
+           provider_network_call_count,
+           provider_write_count,
+           observed_by,
+           observed_at
+         )
+       SELECT
+         effect.organization_id,
+         media_grant.integration_account_id,
+         media_grant.id,
+         effect.id,
+         auth.id,
+         media_grant.product_id,
+         media_grant.image_asset_id,
+         media_grant.product_gid,
+         media_grant.asset_content_sha256,
+         source_binding.source_url_sha256,
+         source_binding.signed_token_sha256,
+         media_grant.credential_generation,
+         $5,
+         $6,
+         $7,
+         $8::integer,
+         $9,
+         $10,
+         $11,
+         $12,
+         $13,
+         3,
+         0,
+         $14,
+         $15::timestamptz
+       FROM operations_commerce_external_effect_intents effect
+       JOIN operations_shopify_product_media_write_authorizations auth
+         ON auth.organization_id = effect.organization_id
+        AND auth.id = effect.shopify_product_media_authorization_id
+       JOIN operations_shopify_product_media_delivery_grants media_grant
+         ON media_grant.organization_id = auth.organization_id
+        AND media_grant.id = auth.delivery_grant_id
+        AND media_grant.integration_account_id =
+              effect.integration_account_id
+        AND media_grant.idempotency_key = effect.idempotency_key
+       JOIN operations_shopify_product_media_source_bindings source_binding
+         ON source_binding.organization_id = auth.organization_id
+        AND source_binding.integration_account_id =
+              auth.integration_account_id
+        AND source_binding.authorization_id = auth.id
+        AND source_binding.delivery_grant_id = media_grant.id
+       WHERE effect.organization_id = $1::uuid
+         AND effect.id = $2::uuid
+         AND effect.global_id = $3
+         AND media_grant.id = $4::uuid
+         AND effect.provider = 'shopify'
+         AND effect.action = 'shopify.product.update'
+         AND effect.desired_mode = 'active'
+         AND effect.state = 'unknown'
+         AND effect.provider_write_count = 0
+         AND media_grant.desired_mode = 'active'
+       RETURNING
+         id::text,
+         observed_at,
+         provider_media_count`,
+      [
+        input.organizationId,
+        input.externalEffectId,
+        input.externalEffectGlobalId,
+        input.deliveryGrantId,
+        input.providerShopGid,
+        input.observedProductGid,
+        input.observedProductTitle,
+        input.providerMediaCount,
+        input.latestMedia?.mediaGid || null,
+        input.latestMedia?.mediaContentType || null,
+        input.latestMedia?.status || null,
+        input.providerResponseSha256,
+        input.providerQueryContract,
+        input.actorEmail,
+        input.providerObservedAt,
+      ],
+    )
+    const observation = inserted.rows[0]
+    if (!observation) {
+      fail(
+        'SHOPIFY_PRODUCT_MEDIA_UNKNOWN_OBSERVATION_REJECTED',
+        'The uncertain Shopify Product-image effect changed before its provider observation was stored',
+        409,
+      )
+    }
+    const summary = await client.query<UnknownObservationSummaryRow>(
+      `SELECT
+         $4::uuid::text AS observation_id,
+         $5::timestamptz AS observed_at,
+         $6::integer AS provider_media_count,
+         count(observation.id)::text AS observation_count,
+         count(observation.id) FILTER (
+           WHERE observation.provider_media_count = 0
+         )::text AS zero_media_observation_count,
+         min(observation.observed_at) AS first_observed_at,
+         max(observation.observed_at) AS last_observed_at,
+         GREATEST(
+           COALESCE(
+             effect.completed_at,
+             effect.updated_at,
+             effect.created_at
+           ),
+           media_grant.expires_at
+         ) + interval '5 minutes' AS eligible_after,
+         operations_shopify_product_media_unknown_is_reconciled(
+           effect.organization_id,
+           effect.id,
+           $3::uuid
+         ) AS reconciled
+       FROM operations_commerce_external_effect_intents effect
+       JOIN operations_shopify_product_media_delivery_grants media_grant
+         ON media_grant.organization_id = effect.organization_id
+        AND media_grant.id = $3::uuid
+        AND media_grant.integration_account_id =
+              effect.integration_account_id
+        AND media_grant.idempotency_key = effect.idempotency_key
+       JOIN operations_shopify_product_media_unknown_observations
+         observation
+         ON observation.organization_id = effect.organization_id
+        AND observation.external_effect_id = effect.id
+        AND observation.delivery_grant_id = $3::uuid
+       WHERE effect.organization_id = $1::uuid
+         AND effect.id = $2::uuid
+       GROUP BY
+         effect.organization_id,
+         effect.id,
+         effect.completed_at,
+         effect.updated_at,
+         effect.created_at,
+         media_grant.expires_at`,
+      [
+        input.organizationId,
+        input.externalEffectId,
+        input.deliveryGrantId,
+        observation.id,
+        observation.observed_at,
+        observation.provider_media_count,
+      ],
+    )
+    const row = summary.rows[0]
+    if (
+      !row
+      || !UUID_PATTERN.test(row.observation_id)
+      || !Number.isInteger(row.provider_media_count)
+      || row.provider_media_count < 0
+    ) {
+      fail(
+        'SHOPIFY_PRODUCT_MEDIA_UNKNOWN_OBSERVATION_INVALID',
+        'Stored Shopify Product-image absence evidence is invalid',
+        500,
+      )
+    }
+    return {
+      observationId: row.observation_id,
+      observedAt: new Date(row.observed_at).toISOString(),
+      providerMediaCount: row.provider_media_count,
+      observationCount: integer(
+        row.observation_count,
+        'unknown observation count',
+      ),
+      zeroMediaObservationCount: integer(
+        row.zero_media_observation_count,
+        'zero-media observation count',
+      ),
+      firstObservedAt: new Date(row.first_observed_at).toISOString(),
+      lastObservedAt: new Date(row.last_observed_at).toISOString(),
+      eligibleAfter: new Date(row.eligible_after).toISOString(),
+      reconciled: row.reconciled === true,
     }
   })
 }

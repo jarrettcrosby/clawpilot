@@ -5,6 +5,7 @@ import {
 import { appPublicUrl } from '@/lib/publicUrl'
 import {
   executeShopifyProductImagePublish,
+  reconcileUnknownShopifyProductImagePublish,
   reconcileShopifyProductImagePublish,
   shopifyProductMediaPublicOrigin,
 } from '@/lib/integrations/shopifyProductMediaProjection'
@@ -51,10 +52,17 @@ function fail(code: string, message: string, status = 400): never {
 }
 
 function errorResponse(error: unknown) {
+  if (error instanceof ShopifyProductWritebackError) {
+    return json({
+      ok: false,
+      error: error.message,
+      code: error.code,
+      externalEffectGlobalId: error.effectGlobalId,
+    }, error.status)
+  }
   if (
     error instanceof ShopifyProductMediaProjectionError
     || error instanceof ShopifyProductMediaTokenError
-    || error instanceof ShopifyProductWritebackError
   ) {
     return json({
       ok: false,
@@ -214,6 +222,30 @@ export async function POST(
       )
     }
     const body = await boundedJson(req)
+    if (body.action === 'reconcile-unknown-product-image') {
+      const allowed = ['action', 'externalEffectGlobalId']
+      if (
+        Object.keys(body).some((field) => !allowed.includes(field))
+        || !/^gcef[0-9]{7}$/.test(
+          String(body.externalEffectGlobalId || '')
+            .trim()
+            .toLowerCase(),
+        )
+      ) {
+        fail(
+          'SHOPIFY_PRODUCT_MEDIA_COMMAND_INVALID',
+          'Shopify Product-media unknown-outcome reconciliation command is invalid',
+        )
+      }
+      const reconciliation =
+        await reconcileUnknownShopifyProductImagePublish({
+          organizationId: actor.organizationId,
+          productId,
+          externalEffectGlobalId: body.externalEffectGlobalId,
+          actorEmail: actor.email,
+        })
+      return json({ ok: true, reconciliation })
+    }
     if (body.action === 'refresh-product-image-status') {
       const allowed = ['action', 'externalEffectGlobalId']
       if (

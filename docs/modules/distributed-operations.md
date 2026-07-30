@@ -727,6 +727,33 @@ account, server-resolved parent Shopify Product GID and variant, immutable
 image asset revision, channel-state revision, prior simulation, and internal
 provider-effect mode. Changing the Product, listing, channel revision, or
 image revision clears the UI confirmation and invalidates the durable grant.
+The Shopify product-update adapter is versioned into that server-derived
+identity. Adapter v2 selects the newest returned media node with Shopify's
+forward-pagination-compatible
+`media(first: 1, reverse: true, sortKey: POSITION)` connection arguments. A
+terminal unknown v1 effect remains immutable evidence. Adapter v2 therefore
+derives a fresh Shadow identity, but a fresh Active grant remains blocked while
+the v1 effect is unresolved; changing the adapter version never bypasses the
+unknown-provider-outcome fence.
+An owner/admin can reconcile that exact unknown outcome only through the
+read-only `reconcile-unknown-product-image` command. The server waits until five
+minutes after both the provider attempt and signed-source expiry, then reads the
+server-resolved parent Product with
+`mediaCount` plus
+`media(first: 1, reverse: true, sortKey: POSITION)`. Two append-only
+zero-media observations at least one minute apart are required, and the newest
+observation must still be less than five minutes old when Active authority is
+issued. The observations bind the old effect, active grant, authorization,
+Product, Product image asset/hash, signed-source hashes, credential generation,
+query contract, and administrator. Any observed media keeps automatic recovery
+closed. The old `unknown` effect is never changed or deleted; only after this
+negative evidence may an exact fresh v2 Shadow simulation authorize one new
+Active attempt. This automated absence proof is deliberately available only
+when the Product's total media baseline is zero; a Product with any pre-existing
+image, video, or model remains closed for administrator investigation until a
+future baseline-aware recovery contract can distinguish the attempted append
+from unrelated media. Positive observations retain the newest media identity,
+content type, and status for that investigation.
 The parent-Product lock and database constraint reject any state where one
 Shopify parent Product GID maps to a second ClawPilot Product. Optional
 signed-receipt queue status is not product-write authority.

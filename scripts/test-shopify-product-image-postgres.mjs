@@ -19,9 +19,12 @@ const REQUIRED_APPLIED_MIGRATION =
   '0159_operations_shopify_receipt_and_carrier_authority.sql'
 const TARGET_MIGRATION =
   '0160_operations_shopify_product_media_shadow_authority.sql'
+const RECOVERY_MIGRATION =
+  '0161_shopify_product_media_unknown_reconciliation.sql'
 const TARGET_PRODUCT_REFERENCE = 'gp4513844'
 const TARGET_ACCOUNT_GLOBAL_ID = 'gia9286799'
 const TARGET_CHANNEL_GLOBAL_ID = 'gpcs2196232'
+const TARGET_UNKNOWN_EFFECT_GLOBAL_ID = 'gcef6462635'
 const PUBLIC_ORIGIN = 'https://dev.aiapp.eigenracing.com'
 const CONFIRMATION_STATEMENT =
   'shopify-product-image-shadow-provider-write-v1'
@@ -37,6 +40,7 @@ const SNAPSHOT_TABLES = [
   'operations_product_channel_states',
   'operations_shopify_product_media_delivery_grants',
   'operations_shopify_product_media_source_bindings',
+  'operations_shopify_product_media_unknown_observations',
   'operations_shopify_product_media_write_authorizations',
 ]
 
@@ -57,10 +61,10 @@ function requireTrustedEnvironment() {
   }
 }
 
-function migrationSql() {
+function migrationSql(filename = TARGET_MIGRATION) {
   return readFileSync(
     fileURLToPath(
-      new URL(`../db/migrations/${TARGET_MIGRATION}`, import.meta.url),
+      new URL(`../db/migrations/${filename}`, import.meta.url),
     ),
     'utf8',
   )
@@ -113,7 +117,11 @@ async function migrationState(client) {
      FROM schema_migrations
      WHERE filename = ANY($1::text[])
      ORDER BY filename`,
-    [[REQUIRED_APPLIED_MIGRATION, TARGET_MIGRATION]],
+    [[
+      REQUIRED_APPLIED_MIGRATION,
+      TARGET_MIGRATION,
+      RECOVERY_MIGRATION,
+    ]],
   )
   return result.rows.map((row) => row.filename)
 }
@@ -171,8 +179,10 @@ async function objectState(client) {
       'operations_shopify_product_media_delivery_is_authorized',
       'protect_operations_shopify_parent_product_mapping',
       'protect_operations_shopify_product_media_delivery_grant',
+      'protect_operations_shopify_product_media_unknown_observation',
       'protect_operations_shopify_product_media_source_binding',
       'protect_operations_shopify_product_media_write_authorization',
+      'operations_shopify_product_media_unknown_is_reconciled',
     ]],
   )
   return {
@@ -1004,6 +1014,335 @@ async function assertSecondProductSameParentRejected(
   )
 }
 
+async function unknownEffectSnapshot(client, target) {
+  const result = await client.query(
+    `SELECT
+       effect.id::text AS external_effect_id,
+       effect.global_id AS external_effect_global_id,
+       effect.state AS effect_state,
+       effect.provider_attempt_id::text AS provider_attempt_id,
+       effect.terminal_evidence_hash,
+       effect.error_code,
+       effect.provider_write_count,
+       effect.completed_at::text,
+       media_grant.id::text AS delivery_grant_id,
+       media_grant.integration_account_id::text,
+       media_grant.product_id::text,
+       media_grant.image_asset_id::text,
+       media_grant.product_gid,
+       media_grant.asset_content_sha256,
+       media_grant.credential_generation,
+       media_grant.expires_at::text AS grant_expires_at,
+       auth.id::text AS authorization_id,
+       source_binding.source_url_sha256,
+       source_binding.signed_token_sha256,
+       account.external_account_id AS provider_shop_gid
+     FROM operations_commerce_external_effect_intents effect
+     JOIN operations_shopify_product_media_write_authorizations auth
+       ON auth.organization_id = effect.organization_id
+      AND auth.id = effect.shopify_product_media_authorization_id
+     JOIN operations_shopify_product_media_delivery_grants media_grant
+       ON media_grant.organization_id = auth.organization_id
+      AND media_grant.id = auth.delivery_grant_id
+      AND media_grant.integration_account_id =
+            effect.integration_account_id
+      AND media_grant.idempotency_key = effect.idempotency_key
+     JOIN operations_shopify_product_media_source_bindings source_binding
+       ON source_binding.organization_id = auth.organization_id
+      AND source_binding.integration_account_id =
+            auth.integration_account_id
+      AND source_binding.authorization_id = auth.id
+      AND source_binding.delivery_grant_id = media_grant.id
+     JOIN operations_integration_accounts account
+       ON account.organization_id = media_grant.organization_id
+      AND account.id = media_grant.integration_account_id
+     WHERE effect.organization_id = $1::uuid
+       AND effect.global_id = $2
+       AND effect.provider = 'shopify'
+       AND effect.action = 'shopify.product.update'
+       AND effect.desired_mode = 'active'
+       AND media_grant.product_id = $3::uuid
+       AND media_grant.product_gid = $4`,
+    [
+      target.organization_id,
+      TARGET_UNKNOWN_EFFECT_GLOBAL_ID,
+      target.product_id,
+      target.product_gid,
+    ],
+  )
+  assert.equal(
+    result.rows.length,
+    1,
+    'exact immutable unknown Product-image effect is unavailable',
+  )
+  const row = result.rows[0]
+  assert.equal(row.external_effect_global_id, TARGET_UNKNOWN_EFFECT_GLOBAL_ID)
+  assert.equal(row.effect_state, 'unknown')
+  assert.equal(row.provider_write_count, 0)
+  assert.match(row.provider_shop_gid, /^gid:\/\/shopify\/Shop\/[1-9][0-9]*$/)
+  return row
+}
+
+async function insertUnknownObservation(
+  client,
+  target,
+  context,
+  input = {},
+) {
+  const providerMediaCount = input.providerMediaCount ?? 0
+  const latestMedia = providerMediaCount > 0
+    ? {
+        gid: 'gid://shopify/MediaImage/999999999',
+        contentType: 'IMAGE',
+        status: 'READY',
+      }
+    : {
+        gid: null,
+        contentType: null,
+        status: null,
+      }
+  const evidence = {
+    shopGid: input.providerShopGid || context.provider_shop_gid,
+    productGid: input.observedProductGid || context.product_gid,
+    title: 'Test Product',
+    mediaCount: providerMediaCount,
+    latestMedia,
+  }
+  return client.query(
+    `INSERT INTO
+       operations_shopify_product_media_unknown_observations (
+         organization_id,
+         integration_account_id,
+         delivery_grant_id,
+         external_effect_id,
+         authorization_id,
+         product_id,
+         image_asset_id,
+         product_gid,
+         asset_content_sha256,
+         source_url_sha256,
+         signed_token_sha256,
+         credential_generation,
+         provider_shop_gid,
+         observed_product_gid,
+         observed_product_title,
+         provider_media_count,
+         latest_media_gid,
+         latest_media_content_type,
+         latest_media_status,
+         provider_response_sha256,
+         provider_query_contract,
+         provider_network_call_count,
+         provider_write_count,
+         observed_by,
+         observed_at
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+         $6::uuid, $7::uuid, $8, $9, $10, $11, $12::integer,
+         $13, $14, $15, $16::integer, $17, $18, $19, $20,
+         'shopify-graphql-2026-07-product-media-absence-v1',
+         3, 0, $21, $22::timestamptz
+       )
+       RETURNING id::text, observed_at::text`,
+    [
+      target.organization_id,
+      context.integration_account_id,
+      context.delivery_grant_id,
+      context.external_effect_id,
+      context.authorization_id,
+      context.product_id,
+      context.image_asset_id,
+      context.product_gid,
+      context.asset_content_sha256,
+      context.source_url_sha256,
+      context.signed_token_sha256,
+      context.credential_generation,
+      evidence.shopGid,
+      evidence.productGid,
+      evidence.title,
+      providerMediaCount,
+      latestMedia.gid,
+      latestMedia.contentType,
+      latestMedia.status,
+      jsonHash(evidence),
+      target.actor_email,
+      input.observedAt || new Date().toISOString(),
+    ],
+  )
+}
+
+async function unknownEffectIsReconciled(client, target, context) {
+  const result = await client.query(
+    `SELECT
+       operations_shopify_product_media_unknown_is_reconciled(
+         $1::uuid,
+         $2::uuid,
+         $3::uuid
+       ) AS reconciled`,
+    [
+      target.organization_id,
+      context.external_effect_id,
+      context.delivery_grant_id,
+    ],
+  )
+  return result.rows[0]?.reconciled === true
+}
+
+async function runUnknownReconciliationAcceptance(client, target) {
+  const context = await unknownEffectSnapshot(client, target)
+  const immutableBefore = {
+    state: context.effect_state,
+    providerAttemptId: context.provider_attempt_id,
+    terminalEvidenceHash: context.terminal_evidence_hash,
+    errorCode: context.error_code,
+    providerWriteCount: context.provider_write_count,
+    completedAt: context.completed_at,
+  }
+  await client.query(
+    `SELECT pg_advisory_xact_lock(
+       hashtextextended(
+         'shopify-product-media-unknown:'
+           || $1::text || ':' || $2::text,
+         0
+       )
+     )`,
+    [target.organization_id, context.external_effect_id],
+  )
+
+  await client.query(
+    `ALTER TABLE operations_shopify_product_media_unknown_observations
+       DISABLE TRIGGER
+       protect_operations_shopify_product_media_unknown_observation_write`,
+  )
+  await client.query(
+    `DELETE FROM operations_shopify_product_media_unknown_observations
+     WHERE organization_id = $1::uuid
+       AND external_effect_id = $2::uuid`,
+    [target.organization_id, context.external_effect_id],
+  )
+  await client.query(
+    `ALTER TABLE operations_shopify_product_media_unknown_observations
+       ENABLE TRIGGER
+       protect_operations_shopify_product_media_unknown_observation_write`,
+  )
+
+  await expectDatabaseRejection(
+    client,
+    'forged provider-observation timestamp',
+    () => insertUnknownObservation(client, target, context, {
+      observedAt: new Date(Date.now() - 10_000).toISOString(),
+    }),
+    /unknown observation identity is invalid/i,
+  )
+  await expectDatabaseRejection(
+    client,
+    'different Shopify Shop observation',
+    () => insertUnknownObservation(client, target, context, {
+      providerShopGid: 'gid://shopify/Shop/999999999',
+    }),
+    /unknown observation identity is invalid/i,
+  )
+
+  const first = await insertUnknownObservation(
+    client,
+    target,
+    context,
+  )
+  assert.equal(first.rows.length, 1)
+  assert.equal(
+    await unknownEffectIsReconciled(client, target, context),
+    false,
+    'one exact provider absence observation must keep retry blocked',
+  )
+  await expectDatabaseRejection(
+    client,
+    'append-only unknown observation update',
+    () => client.query(
+      `UPDATE operations_shopify_product_media_unknown_observations
+       SET provider_response_sha256 = $3
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [
+        target.organization_id,
+        first.rows[0].id,
+        'f'.repeat(64),
+      ],
+    ),
+    /unknown observations are append-only/i,
+  )
+
+  await client.query('SELECT pg_sleep(61)')
+  const second = await insertUnknownObservation(
+    client,
+    target,
+    context,
+  )
+  assert.equal(second.rows.length, 1)
+  assert.equal(
+    await unknownEffectIsReconciled(client, target, context),
+    true,
+    'two exact provider absence reads at least one minute apart must open the recovery predicate',
+  )
+
+  await client.query('SAVEPOINT positive_media_evidence')
+  await insertUnknownObservation(client, target, context, {
+    providerMediaCount: 1,
+  })
+  assert.equal(
+    await unknownEffectIsReconciled(client, target, context),
+    false,
+    'any positive media observation must keep automatic recovery closed',
+  )
+  await client.query('ROLLBACK TO SAVEPOINT positive_media_evidence')
+
+  await client.query(
+    `ALTER TABLE operations_shopify_product_media_unknown_observations
+       DISABLE TRIGGER
+       protect_operations_shopify_product_media_unknown_observation_write`,
+  )
+  await client.query(
+    `UPDATE operations_shopify_product_media_unknown_observations
+     SET observed_at = observed_at - interval '10 minutes'
+     WHERE organization_id = $1::uuid
+       AND external_effect_id = $2::uuid`,
+    [target.organization_id, context.external_effect_id],
+  )
+  await client.query(
+    `ALTER TABLE operations_shopify_product_media_unknown_observations
+       ENABLE TRIGGER
+       protect_operations_shopify_product_media_unknown_observation_write`,
+  )
+  assert.equal(
+    await unknownEffectIsReconciled(client, target, context),
+    false,
+    'stale absence evidence must close the recovery predicate',
+  )
+
+  const immutableAfter = await unknownEffectSnapshot(client, target)
+  assert.deepEqual(
+    {
+      state: immutableAfter.effect_state,
+      providerAttemptId: immutableAfter.provider_attempt_id,
+      terminalEvidenceHash: immutableAfter.terminal_evidence_hash,
+      errorCode: immutableAfter.error_code,
+      providerWriteCount: immutableAfter.provider_write_count,
+      completedAt: immutableAfter.completed_at,
+    },
+    immutableBefore,
+    'unknown-outcome reconciliation must not mutate the old effect',
+  )
+  return {
+    unknownEffect: TARGET_UNKNOWN_EFFECT_GLOBAL_ID,
+    forgedTimeRejected: true,
+    differentShopRejected: true,
+    oneObservationBlocked: true,
+    twoSpacedObservationsOpened: true,
+    positiveMediaBlocked: true,
+    staleEvidenceBlocked: true,
+    oldUnknownEffectImmutable: true,
+  }
+}
+
 async function runAuthorityAcceptance(client) {
   const runId = randomUUID()
   await client.query(
@@ -1432,6 +1771,7 @@ async function main() {
     beforeObjects = await objectState(client)
     beforeData = await dataState(client)
     const targetApplied = beforeMigrations.includes(TARGET_MIGRATION)
+    const recoveryApplied = beforeMigrations.includes(RECOVERY_MIGRATION)
     targetPreviouslyApplied = targetApplied
     const sourceBindingExists = beforeObjects.relations.some(
       (row) => (
@@ -1445,12 +1785,25 @@ async function main() {
       targetApplied,
       '0160 migration history and Product-image authority schema disagree',
     )
+    const unknownObservationExists = beforeObjects.relations.some(
+      (row) => (
+        row.name ===
+          'operations_shopify_product_media_unknown_observations'
+        && row.relation_name !== null
+      ),
+    )
+    assert.equal(
+      unknownObservationExists,
+      recoveryApplied,
+      '0161 migration history and unknown-outcome schema disagree',
+    )
 
     await client.query('BEGIN')
     try {
       await client.query(`SET LOCAL statement_timeout = '120s'`)
       await client.query(`SET LOCAL lock_timeout = '15s'`)
       await client.query(migrationSql())
+      await client.query(migrationSql(RECOVERY_MIGRATION))
       executedTargetInsideTransaction = true
       const upgradedObjects = await objectState(client)
       assert.ok(
@@ -1465,10 +1818,14 @@ async function main() {
       )
       assert.equal(
         upgradedObjects.functions.length,
-        6,
-        '0160 exact Product-image authority functions are incomplete',
+        8,
+        '0160/0161 exact Product-image authority functions are incomplete',
       )
       acceptance = await runAuthorityAcceptance(client)
+      acceptance.unknownReconciliation =
+        await runUnknownReconciliationAcceptance(client, {
+          ...(await selectExactTarget(client)),
+        })
     } finally {
       await client.query('ROLLBACK')
     }
@@ -1509,6 +1866,7 @@ async function main() {
     databaseFingerprint: TRUSTED_DATABASE_FINGERPRINT,
     requiredAppliedMigration: REQUIRED_APPLIED_MIGRATION,
     targetMigration: TARGET_MIGRATION,
+    recoveryMigration: RECOVERY_MIGRATION,
     targetPreviouslyApplied,
     executedTargetInsideTransaction,
     ...acceptance,

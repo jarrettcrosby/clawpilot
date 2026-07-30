@@ -50,9 +50,11 @@ const ACTIVE_TERMINAL_STATES = new Set([
 export const SHOPIFY_PRODUCT_WRITEBACK_API_VERSION = '2026-07'
 export const SHOPIFY_PRODUCT_WRITEBACK_REQUIRED_SCOPE = 'write_products'
 export const SHOPIFY_PRODUCT_WRITEBACK_ADAPTER_VERSION =
-  'shopify-graphql-2026-07-product-update-v1'
+  'shopify-graphql-2026-07-product-update-v2'
 export const SHOPIFY_PRODUCT_WRITEBACK_AGGREGATE_TYPE =
   'shopify_product_projection'
+export const SHOPIFY_PRODUCT_MEDIA_ABSENCE_QUERY_CONTRACT =
+  'shopify-graphql-2026-07-product-media-absence-v1'
 
 export type ShopifyProductImageWriteback = {
   originalSource: string
@@ -130,6 +132,17 @@ export type ShopifyProductWritebackMediaResult = {
   ready: boolean
 }
 
+export type ShopifyProductMediaAbsenceRead = {
+  productGid: string
+  title: string
+  mediaCount: number
+  latestMedia: {
+    mediaGid: string
+    mediaContentType: string
+    status: ShopifyProductWritebackMediaStatus
+  } | null
+}
+
 export type ShopifyProductWritebackResult = {
   effect: CommerceExternalEffect
   productGid: string
@@ -184,6 +197,16 @@ export type ShopifyProductMediaStatusReadDependencies = Pick<
   readMediaStatus: typeof readShopifyProductMediaStatus
 }
 
+export type ShopifyProductMediaAbsenceReadDependencies = Pick<
+  ShopifyProductWritebackDependencies,
+  | 'readRuntimeCredential'
+  | 'decryptCredential'
+  | 'requestAccessToken'
+  | 'probeConnection'
+> & {
+  readProductMedia: typeof readShopifyProductMediaAbsence
+}
+
 const DEFAULT_DEPENDENCIES: ShopifyProductWritebackDependencies = {
   prepareExternalEffect: prepareCommerceExternalEffectInPostgres,
   claimExternalEffects: claimCommerceExternalEffectsInPostgres,
@@ -202,6 +225,15 @@ ShopifyProductMediaStatusReadDependencies = {
   requestAccessToken: requestShopifyAccessToken,
   probeConnection: probeShopifyConnection,
   readMediaStatus: readShopifyProductMediaStatus,
+}
+
+const DEFAULT_MEDIA_ABSENCE_DEPENDENCIES:
+ShopifyProductMediaAbsenceReadDependencies = {
+  readRuntimeCredential: readCommerceRuntimeCredentialFromPostgres,
+  decryptCredential: decryptCommerceCredential,
+  requestAccessToken: requestShopifyAccessToken,
+  probeConnection: probeShopifyConnection,
+  readProductMedia: readShopifyProductMediaAbsence,
 }
 
 function writebackError(
@@ -695,7 +727,7 @@ const SHOPIFY_PRODUCT_UPDATE_MUTATION =
         category {
           id
         }
-        media(last: 1) {
+        media(first: 1, reverse: true, sortKey: POSITION) {
           nodes {
             id
             mediaContentType
@@ -880,6 +912,223 @@ export async function readShopifyProductMediaStatus(
     options,
   )
   return safeMediaResult(data.node)
+}
+
+const SHOPIFY_PRODUCT_MEDIA_ABSENCE_QUERY =
+  `query ClawPilotShopifyProductMediaAbsence($id: ID!) {
+    product(id: $id) {
+      id
+      title
+      mediaCount {
+        count
+      }
+      media(first: 1, reverse: true, sortKey: POSITION) {
+        nodes {
+          id
+          mediaContentType
+          status
+        }
+      }
+    }
+  }`
+
+const SHOPIFY_MEDIA_GID_PATTERN =
+  /^gid:\/\/shopify\/[A-Za-z][A-Za-z0-9]*\/[1-9][0-9]*$/
+const SHOPIFY_MEDIA_CONTENT_TYPES = new Set([
+  'EXTERNAL_VIDEO',
+  'IMAGE',
+  'MODEL_3D',
+  'VIDEO',
+])
+
+function containsControlCharacter(value: string) {
+  return Array.from(value).some((character) => {
+    const codePoint = character.codePointAt(0) || 0
+    return codePoint < 32 || codePoint === 127
+  })
+}
+
+export async function readShopifyProductMediaAbsence(
+  credential: ShopifyCommerceRuntimeCredential,
+  productGid: string,
+  options: ShopifyCommerceClientOptions = {},
+): Promise<ShopifyProductMediaAbsenceRead> {
+  const exactProductGid = normalizeProductGid(productGid)
+  const data = await shopifyAdminGraphql<{ product?: unknown }>(
+    credential,
+    {
+      query: SHOPIFY_PRODUCT_MEDIA_ABSENCE_QUERY,
+      operationName: 'ClawPilotShopifyProductMediaAbsence',
+      variables: { id: exactProductGid },
+    },
+    options,
+  )
+  const product = safeRecord(data.product)
+  const mediaCountNode = safeRecord(product?.mediaCount)
+  const mediaConnection = safeRecord(product?.media)
+  const returnedProductGid = product?.id
+  const title = product?.title
+  const mediaCount = mediaCountNode?.count
+  const nodes = mediaConnection?.nodes
+  if (
+    typeof returnedProductGid !== 'string'
+    || returnedProductGid !== exactProductGid
+    || !PRODUCT_GID_PATTERN.test(returnedProductGid)
+    || typeof title !== 'string'
+    || !title.trim()
+    || title.length > 255
+    || containsControlCharacter(title)
+    || !Number.isSafeInteger(mediaCount)
+    || Number(mediaCount) < 0
+    || Number(mediaCount) > 1_000_000_000
+    || !Array.isArray(nodes)
+    || (
+      Number(mediaCount) === 0
+      && nodes.length !== 0
+    )
+    || (
+      Number(mediaCount) > 0
+      && nodes.length !== 1
+    )
+  ) {
+    writebackError(
+      'SHOPIFY_PRODUCT_MEDIA_ABSENCE_RESPONSE_INVALID',
+      'Shopify returned invalid exact-Product media evidence',
+      502,
+    )
+  }
+  let latestMedia: ShopifyProductMediaAbsenceRead['latestMedia'] = null
+  if (Number(mediaCount) > 0) {
+    const media = safeRecord(nodes[0])
+    const mediaGid = media?.id
+    const mediaContentType = media?.mediaContentType
+    const status = media?.status
+    if (
+      typeof mediaGid !== 'string'
+      || !SHOPIFY_MEDIA_GID_PATTERN.test(mediaGid)
+      || typeof mediaContentType !== 'string'
+      || !SHOPIFY_MEDIA_CONTENT_TYPES.has(mediaContentType)
+      || !['FAILED', 'PROCESSING', 'READY', 'UPLOADED'].includes(
+        String(status || ''),
+      )
+    ) {
+      writebackError(
+        'SHOPIFY_PRODUCT_MEDIA_ABSENCE_RESPONSE_INVALID',
+        'Shopify returned invalid exact-Product media evidence',
+        502,
+      )
+    }
+    latestMedia = {
+      mediaGid,
+      mediaContentType,
+      status: status as ShopifyProductWritebackMediaStatus,
+    }
+  }
+  return {
+    productGid: returnedProductGid,
+    title: title.trim(),
+    mediaCount: Number(mediaCount),
+    latestMedia,
+  }
+}
+
+export async function executeShopifyProductMediaAbsenceRead(
+  input: {
+    organizationId: unknown
+    accountGlobalId: unknown
+    credentialGeneration: unknown
+    productGid: unknown
+  },
+  overrides: Partial<ShopifyProductMediaAbsenceReadDependencies> = {},
+) {
+  let organizationId: string
+  let accountGlobalId: string
+  try {
+    organizationId = normalizeCommerceOrganizationId(input.organizationId)
+    accountGlobalId = normalizeCommerceAccountGlobalId(input.accountGlobalId)
+  } catch {
+    writebackError(
+      'SHOPIFY_PRODUCT_MEDIA_ABSENCE_IDENTITY_INVALID',
+      'Shopify Product-media absence identity is invalid',
+    )
+  }
+  const credentialGeneration = positiveRevision(
+    input.credentialGeneration,
+    'Shopify credential generation',
+  )
+  const productGid = normalizeProductGid(input.productGid)
+  const dependencies = {
+    ...DEFAULT_MEDIA_ABSENCE_DEPENDENCIES,
+    ...overrides,
+  }
+  const runtime = await dependencies.readRuntimeCredential({
+    organizationId,
+    accountGlobalId,
+  })
+  if (
+    !runtime
+    || runtime.organizationId !== organizationId
+    || runtime.globalId !== accountGlobalId
+    || runtime.provider !== 'shopify'
+    || !SHOP_GID_PATTERN.test(runtime.externalAccountId)
+    || !['active', 'disabled'].includes(runtime.status)
+    || runtime.verificationStatus !== 'verified'
+    || runtime.credentialVersion !== credentialGeneration
+    || runtime.authMode !== 'shopify_client_credentials'
+  ) {
+    writebackError(
+      'SHOPIFY_PRODUCT_MEDIA_ABSENCE_RUNTIME_STALE',
+      'The verified Shopify connection changed before unknown-outcome reconciliation',
+      409,
+    )
+  }
+  const storedCredential = decryptShopifyCredential(runtime, dependencies)
+  const shopDomain = normalizeShopifyShopDomain(
+    runtime.configuration.shopDomain,
+  )
+  const grant = await dependencies.requestAccessToken(
+    {
+      shopDomain,
+      clientId: storedCredential.clientId,
+      clientSecret: storedCredential.clientSecret,
+    },
+    { timeoutMs: 10_000 },
+  )
+  const providerCredential = {
+    shopDomain,
+    accessToken: grant.accessToken,
+  }
+  const probe = await dependencies.probeConnection(
+    providerCredential,
+    { timeoutMs: 10_000 },
+  )
+  if (
+    probe.shopId !== runtime.externalAccountId
+    || probe.shopDomain !== shopDomain
+  ) {
+    writebackError(
+      'SHOPIFY_PRODUCT_MEDIA_ABSENCE_STORE_IDENTITY_MISMATCH',
+      'Shopify returned a different store identity',
+      409,
+    )
+  }
+  assertScopeInBoth(grant.grantedScopes, probe)
+  const provider = await dependencies.readProductMedia(
+    providerCredential,
+    productGid,
+    { timeoutMs: 10_000 },
+  )
+  if (provider.productGid !== productGid) {
+    writebackError(
+      'SHOPIFY_PRODUCT_MEDIA_ABSENCE_PRODUCT_MISMATCH',
+      'Shopify returned a different Product during unknown-outcome reconciliation',
+      502,
+    )
+  }
+  return {
+    ...provider,
+    shopGid: probe.shopId,
+  }
 }
 
 export async function executeShopifyProductMediaStatusRead(

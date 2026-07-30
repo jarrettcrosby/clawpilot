@@ -173,6 +173,10 @@ function loadWritebackModule() {
 }
 
 const writeback = loadWritebackModule()
+assert.equal(
+  writeback.SHOPIFY_PRODUCT_WRITEBACK_ADAPTER_VERSION,
+  'shopify-graphql-2026-07-product-update-v2',
+)
 const organizationId = '11111111-1111-4111-8111-111111111111'
 const accountGlobalId = 'gia0000001'
 const integrationAccountId =
@@ -729,7 +733,7 @@ async function expectCode(action, code) {
   )
   assert.match(
     observed.input.query,
-    /media\(last: 1\)/,
+    /media\(first: 1, reverse: true, sortKey: POSITION\)/,
   )
   assert.match(
     observed.input.query,
@@ -803,6 +807,149 @@ async function expectCode(action, code) {
     ),
     'SHOPIFY_PRODUCT_UPDATE_REJECTED',
   )
+}
+
+{
+  let observed
+  graphqlImpl = async (_credential, input) => {
+    observed = input
+    return {
+      product: {
+        id: productGid,
+        title: 'Test Product',
+        mediaCount: { count: 0 },
+        media: { nodes: [] },
+      },
+    }
+  }
+  const result = await writeback.readShopifyProductMediaAbsence(
+    {
+      shopDomain: 'ag-alchemy.myshopify.com',
+      accessToken: 'short-lived-access-token',
+    },
+    productGid,
+  )
+  assert.equal(result.productGid, productGid)
+  assert.equal(result.title, 'Test Product')
+  assert.equal(result.mediaCount, 0)
+  assert.equal(result.latestMedia, null)
+  assert.equal(
+    observed.operationName,
+    'ClawPilotShopifyProductMediaAbsence',
+  )
+  assert.match(
+    observed.query,
+    /media\(first: 1, reverse: true, sortKey: POSITION\)/,
+  )
+  assert.match(observed.query, /mediaCount \{\s*count\s*\}/)
+}
+
+{
+  graphqlImpl = async () => ({
+    product: {
+      id: productGid,
+      title: 'Test Product',
+      mediaCount: { count: 1 },
+      media: {
+        nodes: [{
+          id: 'gid://shopify/MediaImage/987654323',
+          mediaContentType: 'IMAGE',
+          status: 'READY',
+        }],
+      },
+    },
+  })
+  const result = await writeback.readShopifyProductMediaAbsence(
+    {
+      shopDomain: 'ag-alchemy.myshopify.com',
+      accessToken: 'short-lived-access-token',
+    },
+    productGid,
+  )
+  assert.equal(result.mediaCount, 1)
+  assert.equal(
+    result.latestMedia.mediaGid,
+    'gid://shopify/MediaImage/987654323',
+  )
+}
+
+{
+  graphqlImpl = async () => ({
+    product: {
+      id: 'gid://shopify/Product/999999999',
+      title: 'Different Product',
+      mediaCount: { count: 0 },
+      media: { nodes: [] },
+    },
+  })
+  await expectCode(
+    () => writeback.readShopifyProductMediaAbsence(
+      {
+        shopDomain: 'ag-alchemy.myshopify.com',
+        accessToken: 'short-lived-access-token',
+      },
+      productGid,
+    ),
+    'SHOPIFY_PRODUCT_MEDIA_ABSENCE_RESPONSE_INVALID',
+  )
+}
+
+{
+  graphqlImpl = async () => ({
+    product: {
+      id: productGid,
+      title: 'Test Product',
+      mediaCount: { count: 0 },
+      media: {
+        nodes: [{
+          id: 'gid://shopify/MediaImage/987654323',
+          mediaContentType: 'IMAGE',
+          status: 'READY',
+        }],
+      },
+    },
+  })
+  await expectCode(
+    () => writeback.readShopifyProductMediaAbsence(
+      {
+        shopDomain: 'ag-alchemy.myshopify.com',
+        accessToken: 'short-lived-access-token',
+      },
+      productGid,
+    ),
+    'SHOPIFY_PRODUCT_MEDIA_ABSENCE_RESPONSE_INVALID',
+  )
+}
+
+{
+  const { deps, calls } = dependencies({
+    async readProductMedia(_credential, exactProductGid) {
+      assert.equal(exactProductGid, productGid)
+      return {
+        productGid,
+        title: 'Test Product',
+        mediaCount: 0,
+        latestMedia: null,
+      }
+    },
+  })
+  deps.readRuntimeCredential = async () => {
+    calls.runtime += 1
+    return runtime({ status: 'disabled' })
+  }
+  const result =
+    await writeback.executeShopifyProductMediaAbsenceRead({
+      organizationId,
+      accountGlobalId,
+      credentialGeneration: 7,
+      productGid,
+    }, deps)
+  assert.equal(result.mediaCount, 0)
+  assert.equal(result.shopGid, shopGid)
+  assert.equal(calls.runtime, 1)
+  assert.equal(calls.decrypt, 1)
+  assert.equal(calls.token, 1)
+  assert.equal(calls.probe, 1)
 }
 
 {

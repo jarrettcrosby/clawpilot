@@ -59,9 +59,21 @@ function loadProjectionModule() {
         specifier ===
         '@/lib/integrations/shopifyProductWriteback'
       ) {
-        return { executeShopifyProductWriteback() {
-          throw new Error('default writeback must be overridden')
-        } }
+        return {
+          SHOPIFY_PRODUCT_MEDIA_ABSENCE_QUERY_CONTRACT:
+            'shopify-graphql-2026-07-product-media-absence-v1',
+          SHOPIFY_PRODUCT_WRITEBACK_ADAPTER_VERSION:
+            'shopify-graphql-2026-07-product-update-v2',
+          executeShopifyProductMediaAbsenceRead() {
+            throw new Error('default absence read must be overridden')
+          },
+          executeShopifyProductMediaStatusRead() {
+            throw new Error('default status read must be overridden')
+          },
+          executeShopifyProductWriteback() {
+            throw new Error('default writeback must be overridden')
+          },
+        }
       }
       if (
         specifier ===
@@ -117,6 +129,21 @@ function loadProjectionModule() {
           bindShopifyProductMediaDeliverySourceInPostgres() {
             throw new Error('default binding must be overridden')
           },
+          readShopifyProductMediaReconciliationContextInPostgres() {
+            throw new Error('default context read must be overridden')
+          },
+          recordShopifyProductMediaStatusObservationInPostgres() {
+            throw new Error('default status observation must be overridden')
+          },
+          recordShopifyProductMediaUnknownObservationInPostgres() {
+            throw new Error('default unknown observation must be overridden')
+          },
+          recoverExpiredShopifyProductMediaClaimInPostgres() {
+            throw new Error('default recovery must be overridden')
+          },
+          resolveShopifyProductMediaProviderIdentityInPostgres() {
+            throw new Error('default identity read must be overridden')
+          },
         }
       }
       return nodeRequire(specifier)
@@ -162,6 +189,7 @@ function grant(mode = 'active', overrides = {}) {
     : null
   const idempotencyKey = `shopify-product-image:${
     createHash('sha256').update(JSON.stringify({
+      adapterVersion: 'shopify-graphql-2026-07-product-update-v2',
       account: 'gia0000001',
       product: productGid,
       variant: externalVariantId,
@@ -421,6 +449,7 @@ assert.equal(prepared, 1)
 assert.equal(writes.length, 1)
 assert.equal(boundSources.length, 1)
 assert.deepEqual(executionOrder, ['bind', 'write'])
+assert.equal(preparedInputs[0].idempotencyKey, active.idempotencyKey)
 assert.equal(
   boundSources[0].authorizationId,
   active.resourceAuthorization.id,
@@ -701,6 +730,200 @@ assert.equal(
   'investigate_unknown_provider_outcome',
 )
 
+const exactUnknownContext = {
+  ...reconciliationContext,
+  effectState: 'unknown',
+  leaseExpired: false,
+  mediaImageGid: null,
+  mediaStatus: null,
+  unknownObservationEligibleAfter: '2026-07-30T00:20:00.000Z',
+}
+let absenceReads = 0
+const settlingUnknown =
+  await projection.reconcileUnknownShopifyProductImagePublish({
+    organizationId,
+    productId,
+    externalEffectGlobalId: 'gcef0000001',
+    actorEmail: 'admin@example.com',
+  }, {
+    async readContext() {
+      return exactUnknownContext
+    },
+    async readProviderProductMedia() {
+      absenceReads += 1
+      throw new Error('quarantine must prevent provider reads')
+    },
+    async recordObservation() {
+      throw new Error('quarantine must prevent observations')
+    },
+    now() {
+      return new Date('2026-07-30T00:19:59.000Z')
+    },
+  })
+assert.equal(settlingUnknown.providerNetworkCalls, 0)
+assert.equal(
+  settlingUnknown.nextAction,
+  'wait_for_source_expiry_quarantine',
+)
+assert.equal(absenceReads, 0)
+
+let unknownObservations = 0
+const firstAbsence =
+  await projection.reconcileUnknownShopifyProductImagePublish({
+    organizationId,
+    productId,
+    externalEffectGlobalId: 'gcef0000001',
+    actorEmail: 'admin@example.com',
+  }, {
+    async readContext() {
+      return exactUnknownContext
+    },
+    async readProviderProductMedia() {
+      absenceReads += 1
+      return {
+        shopGid: 'gid://shopify/Shop/987654321',
+        productGid: active.productGid,
+        title: 'Test Product',
+        mediaCount: 0,
+        latestMedia: null,
+      }
+    },
+    async recordObservation(input) {
+      unknownObservations += 1
+      assert.equal(input.observedProductGid, active.productGid)
+      assert.equal(input.observedProductTitle, 'Test Product')
+      assert.equal(
+        input.providerShopGid,
+        'gid://shopify/Shop/987654321',
+      )
+      assert.equal(input.providerMediaCount, 0)
+      assert.equal(input.latestMedia, null)
+      assert.equal(
+        input.providerQueryContract,
+        'shopify-graphql-2026-07-product-media-absence-v1',
+      )
+      assert.equal(
+        input.providerObservedAt,
+        '2026-07-30T00:21:00.000Z',
+      )
+      assert.match(input.providerResponseSha256, /^[0-9a-f]{64}$/)
+      return {
+        observationId: '99999999-9999-4999-8999-999999999999',
+        observedAt: '2026-07-30T00:21:00.000Z',
+        providerMediaCount: 0,
+        observationCount: 1,
+        zeroMediaObservationCount: 1,
+        firstObservedAt: '2026-07-30T00:21:00.000Z',
+        lastObservedAt: '2026-07-30T00:21:00.000Z',
+        eligibleAfter: '2026-07-30T00:20:00.000Z',
+        reconciled: false,
+      }
+    },
+    now() {
+      return new Date('2026-07-30T00:21:00.000Z')
+    },
+  })
+assert.equal(firstAbsence.providerMediaCount, 0)
+assert.equal(firstAbsence.providerNetworkCalls, 3)
+assert.equal(firstAbsence.providerWriteCount, 0)
+assert.equal(
+  firstAbsence.nextAction,
+  'repeat_absence_observation_after_delay',
+)
+assert.equal(
+  firstAbsence.nextObservationEligibleAt,
+  '2026-07-30T00:22:00.000Z',
+)
+assert.equal(unknownObservations, 1)
+
+const clearedUnknown =
+  await projection.reconcileUnknownShopifyProductImagePublish({
+    organizationId,
+    productId,
+    externalEffectGlobalId: 'gcef0000001',
+    actorEmail: 'admin@example.com',
+  }, {
+    async readContext() {
+      return exactUnknownContext
+    },
+    async readProviderProductMedia() {
+      return {
+        shopGid: 'gid://shopify/Shop/987654321',
+        productGid: active.productGid,
+        title: 'Test Product',
+        mediaCount: 0,
+        latestMedia: null,
+      }
+    },
+    async recordObservation() {
+      return {
+        observationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        observedAt: '2026-07-30T00:22:01.000Z',
+        providerMediaCount: 0,
+        observationCount: 2,
+        zeroMediaObservationCount: 2,
+        firstObservedAt: '2026-07-30T00:21:00.000Z',
+        lastObservedAt: '2026-07-30T00:22:01.000Z',
+        eligibleAfter: '2026-07-30T00:20:00.000Z',
+        reconciled: true,
+      }
+    },
+    now() {
+      return new Date('2026-07-30T00:22:01.000Z')
+    },
+  })
+assert.equal(clearedUnknown.reconciled, true)
+assert.equal(
+  clearedUnknown.nextAction,
+  'run_fresh_shadow_simulation',
+)
+
+const mediaPresent =
+  await projection.reconcileUnknownShopifyProductImagePublish({
+    organizationId,
+    productId,
+    externalEffectGlobalId: 'gcef0000001',
+    actorEmail: 'admin@example.com',
+  }, {
+    async readContext() {
+      return exactUnknownContext
+    },
+    async readProviderProductMedia() {
+      return {
+        shopGid: 'gid://shopify/Shop/987654321',
+        productGid: active.productGid,
+        title: 'Test Product',
+        mediaCount: 1,
+        latestMedia: {
+          mediaGid: 'gid://shopify/MediaImage/123456789',
+          mediaContentType: 'IMAGE',
+          status: 'READY',
+        },
+      }
+    },
+    async recordObservation() {
+      return {
+        observationId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+        observedAt: '2026-07-30T00:22:01.000Z',
+        providerMediaCount: 1,
+        observationCount: 1,
+        zeroMediaObservationCount: 0,
+        firstObservedAt: '2026-07-30T00:22:01.000Z',
+        lastObservedAt: '2026-07-30T00:22:01.000Z',
+        eligibleAfter: '2026-07-30T00:20:00.000Z',
+        reconciled: false,
+      }
+    },
+    now() {
+      return new Date('2026-07-30T00:22:01.000Z')
+    },
+  })
+assert.equal(
+  mediaPresent.nextAction,
+  'investigate_provider_media_present',
+)
+assert.equal(mediaPresent.reconciled, false)
+
 prepared = 0
 writes = []
 await assert.rejects(
@@ -857,6 +1080,15 @@ assert.match(managerRoute, /publish-product-image/)
 assert.match(managerRoute, /publication: result/)
 assert.match(managerRoute, /session\?\.impersonating/)
 assert.match(managerRoute, /refresh-product-image-status/)
+assert.match(managerRoute, /reconcile-unknown-product-image/)
+assert.match(
+  managerRoute,
+  /reconcileUnknownShopifyProductImagePublish/,
+)
+assert.match(
+  managerRoute,
+  /externalEffectGlobalId: error\.effectGlobalId/,
+)
 assert.doesNotMatch(managerRoute, /project-primary-image/)
 for (const forbidden of [
   "'accountGlobalId'",
@@ -912,6 +1144,8 @@ for (const fence of [
   'source_url_sha256',
   'signed_token_sha256',
   'source_binding.signed_token_sha256 = $9',
+  'operations_shopify_product_media_unknown_is_reconciled',
+  'operations_shopify_product_media_unknown_observations',
 ]) {
   assert.equal(
     persistence.includes(fence),
@@ -1008,6 +1242,40 @@ assert.match(
 assert.match(
   shadowAuthorityMigration,
   /CREATE UNIQUE INDEX IF NOT EXISTS[\s\S]*idx_ops_shopify_media_auth_simulation_effect/,
+)
+
+const unknownReconciliationMigration = readFileSync(resolve(
+  root,
+  'db/migrations/0161_shopify_product_media_unknown_reconciliation.sql',
+), 'utf8')
+for (const fence of [
+  'operations_shopify_product_media_unknown_observations',
+  'operations_shopify_product_media_unknown_is_reconciled',
+  "effect.state = 'unknown'",
+  'effect.provider_write_count = 0',
+  "media_grant.desired_mode = 'active'",
+  'source_binding.source_url_sha256',
+  'source_binding.signed_token_sha256',
+  'provider_shop_gid',
+  "credential.verification_status",
+  "interval '5 minutes'",
+  "interval '1 minute'",
+  "statement_timestamp() - interval '5 seconds'",
+  "statement_timestamp() - interval '5 minutes'",
+  'count(observation.id) >= 2',
+  'bool_and(observation.provider_media_count = 0)',
+  'provider_write_count = 0',
+  'BEFORE INSERT OR UPDATE OR DELETE',
+]) {
+  assert.equal(
+    unknownReconciliationMigration.includes(fence),
+    true,
+    `0161 missing unknown-outcome fence ${fence}`,
+  )
+}
+assert.match(
+  unknownReconciliationMigration,
+  /GREATEST\([\s\S]*effect\.completed_at[\s\S]*media_grant\.expires_at[\s\S]*interval '5 minutes'/,
 )
 
 console.log('shopify product media projection tests passed')

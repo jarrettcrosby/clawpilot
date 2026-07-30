@@ -1,8 +1,12 @@
 import { createHash } from 'node:crypto'
 import { isIP } from 'node:net'
 import {
+  executeShopifyProductMediaAbsenceRead,
   executeShopifyProductMediaStatusRead,
   executeShopifyProductWriteback,
+  SHOPIFY_PRODUCT_MEDIA_ABSENCE_QUERY_CONTRACT,
+  SHOPIFY_PRODUCT_WRITEBACK_ADAPTER_VERSION,
+  type ShopifyProductMediaAbsenceRead,
   type ShopifyProductWritebackMediaStatus,
   type ShopifyProductWritebackResult,
 } from '@/lib/integrations/shopifyProductWriteback'
@@ -21,6 +25,7 @@ import {
   bindShopifyProductMediaDeliverySourceInPostgres,
   prepareShopifyProductMediaProjectionInPostgres,
   readShopifyProductMediaReconciliationContextInPostgres,
+  recordShopifyProductMediaUnknownObservationInPostgres,
   recordShopifyProductMediaStatusObservationInPostgres,
   recoverExpiredShopifyProductMediaClaimInPostgres,
   resolveShopifyProductMediaProviderIdentityInPostgres,
@@ -101,6 +106,16 @@ export type ShopifyProductMediaReconciliationDependencies = {
     typeof recordShopifyProductMediaStatusObservationInPostgres
 }
 
+export type ShopifyProductMediaUnknownReconciliationDependencies = {
+  readContext:
+    typeof readShopifyProductMediaReconciliationContextInPostgres
+  readProviderProductMedia:
+    typeof executeShopifyProductMediaAbsenceRead
+  recordObservation:
+    typeof recordShopifyProductMediaUnknownObservationInPostgres
+  now: () => Date
+}
+
 const DEFAULT_RECONCILIATION_DEPENDENCIES:
 ShopifyProductMediaReconciliationDependencies = {
   readContext: readShopifyProductMediaReconciliationContextInPostgres,
@@ -109,6 +124,16 @@ ShopifyProductMediaReconciliationDependencies = {
   readProviderStatus: executeShopifyProductMediaStatusRead,
   recordObservation:
     recordShopifyProductMediaStatusObservationInPostgres,
+}
+
+const DEFAULT_UNKNOWN_RECONCILIATION_DEPENDENCIES:
+ShopifyProductMediaUnknownReconciliationDependencies = {
+  readContext: readShopifyProductMediaReconciliationContextInPostgres,
+  readProviderProductMedia:
+    executeShopifyProductMediaAbsenceRead,
+  recordObservation:
+    recordShopifyProductMediaUnknownObservationInPostgres,
+  now: () => new Date(),
 }
 
 const DEFAULT_DEPENDENCIES: ShopifyProductMediaProjectionDependencies = {
@@ -168,6 +193,7 @@ function publishIdempotencyKey(input: {
 }) {
   const digest = createHash('sha256')
     .update(JSON.stringify({
+      adapterVersion: SHOPIFY_PRODUCT_WRITEBACK_ADAPTER_VERSION,
       account: input.integrationAccountGlobalId,
       product: input.productGid,
       variant: input.externalVariantId,
@@ -805,6 +831,158 @@ export async function reconcileShopifyProductImagePublish(
       : provider.status === 'FAILED'
         ? 'investigate_media_failure' as const
         : 'await_media_ready' as const,
+  }
+}
+
+function productMediaAbsenceResponseSha256(
+  provider: ShopifyProductMediaAbsenceRead & { shopGid: string },
+) {
+  return createHash('sha256')
+    .update(JSON.stringify({
+      queryContract: SHOPIFY_PRODUCT_MEDIA_ABSENCE_QUERY_CONTRACT,
+      shopGid: provider.shopGid,
+      productGid: provider.productGid,
+      title: provider.title,
+      mediaCount: provider.mediaCount,
+      latestMedia: provider.latestMedia,
+    }), 'utf8')
+    .digest('hex')
+}
+
+export async function reconcileUnknownShopifyProductImagePublish(
+  rawInput: {
+    organizationId: unknown
+    productId: unknown
+    externalEffectGlobalId: unknown
+    actorEmail: string
+  },
+  overrides: Partial<
+    ShopifyProductMediaUnknownReconciliationDependencies
+  > = {},
+) {
+  const input = {
+    organizationId: uuid(rawInput.organizationId, 'Organization'),
+    productId: uuid(rawInput.productId, 'Product'),
+    externalEffectGlobalId: String(
+      rawInput.externalEffectGlobalId || '',
+    ).trim().toLowerCase(),
+    actorEmail: rawInput.actorEmail,
+  }
+  if (!EFFECT_GLOBAL_PATTERN.test(input.externalEffectGlobalId)) {
+    fail(
+      'SHOPIFY_PRODUCT_MEDIA_EFFECT_INVALID',
+      'Shopify Product-image publication evidence is invalid',
+      404,
+    )
+  }
+  const dependencies = {
+    ...DEFAULT_UNKNOWN_RECONCILIATION_DEPENDENCIES,
+    ...overrides,
+  }
+  const context = await dependencies.readContext(input)
+  if (
+    context.effectState !== 'unknown'
+    || context.mediaImageGid !== null
+    || !context.unknownObservationEligibleAfter
+  ) {
+    fail(
+      'SHOPIFY_PRODUCT_MEDIA_UNKNOWN_RECONCILIATION_INVALID',
+      'Only an exact unresolved Shopify Product-image effect can enter absence reconciliation',
+      409,
+    )
+  }
+  const now = dependencies.now()
+  const eligibleAt = new Date(
+    context.unknownObservationEligibleAfter,
+  )
+  if (
+    Number.isNaN(now.getTime())
+    || Number.isNaN(eligibleAt.getTime())
+  ) {
+    fail(
+      'SHOPIFY_PRODUCT_MEDIA_UNKNOWN_RECONCILIATION_INVALID',
+      'Shopify Product-image reconciliation timing evidence is invalid',
+      500,
+    )
+  }
+  if (now.getTime() < eligibleAt.getTime()) {
+    return {
+      externalEffectGlobalId: context.externalEffectGlobalId,
+      effectState: context.effectState,
+      productGid: context.productGid,
+      eligibleAt: eligibleAt.toISOString(),
+      providerMediaCount: null,
+      latestMedia: null,
+      observationCount: 0,
+      zeroMediaObservationCount: 0,
+      reconciled: false,
+      providerNetworkCalls: 0,
+      providerWriteCount: 0,
+      nextAction: 'wait_for_source_expiry_quarantine' as const,
+    }
+  }
+  const provider = await dependencies.readProviderProductMedia({
+    organizationId: input.organizationId,
+    accountGlobalId: context.integrationAccountGlobalId,
+    credentialGeneration: context.credentialGeneration,
+    productGid: context.productGid,
+  })
+  const providerObservedAt = dependencies.now()
+  if (Number.isNaN(providerObservedAt.getTime())) {
+    fail(
+      'SHOPIFY_PRODUCT_MEDIA_UNKNOWN_RECONCILIATION_INVALID',
+      'Shopify Product-image provider observation timing evidence is invalid',
+      500,
+    )
+  }
+  if (provider.productGid !== context.productGid) {
+    fail(
+      'SHOPIFY_PRODUCT_MEDIA_ABSENCE_PRODUCT_MISMATCH',
+      'Shopify returned a different Product during unknown-outcome reconciliation',
+      502,
+    )
+  }
+  const observation = await dependencies.recordObservation({
+    organizationId: input.organizationId,
+    deliveryGrantId: context.deliveryGrantId,
+    externalEffectId: context.externalEffectId,
+    externalEffectGlobalId: context.externalEffectGlobalId,
+    observedProductGid: provider.productGid,
+    observedProductTitle: provider.title,
+    providerShopGid: provider.shopGid,
+    providerMediaCount: provider.mediaCount,
+    latestMedia: provider.latestMedia,
+    providerResponseSha256:
+      productMediaAbsenceResponseSha256(provider),
+    providerQueryContract:
+      SHOPIFY_PRODUCT_MEDIA_ABSENCE_QUERY_CONTRACT,
+    providerObservedAt: providerObservedAt.toISOString(),
+    actorEmail: input.actorEmail,
+  })
+  const nextObservationEligibleAt = new Date(
+    new Date(observation.firstObservedAt).getTime() + 60_000,
+  ).toISOString()
+  return {
+    externalEffectGlobalId: context.externalEffectGlobalId,
+    effectState: context.effectState,
+    productGid: context.productGid,
+    eligibleAt: observation.eligibleAfter,
+    providerMediaCount: provider.mediaCount,
+    latestMedia: provider.latestMedia,
+    observationId: observation.observationId,
+    observedAt: observation.observedAt,
+    observationCount: observation.observationCount,
+    zeroMediaObservationCount:
+      observation.zeroMediaObservationCount,
+    reconciled: observation.reconciled,
+    providerNetworkCalls: 3,
+    providerWriteCount: 0,
+    nextObservationEligibleAt,
+    nextAction: provider.mediaCount > 0
+      ? 'investigate_provider_media_present' as const
+      : observation.reconciled
+        ? 'run_fresh_shadow_simulation' as const
+        : 'repeat_absence_observation_after_delay' as const,
   }
 }
 
