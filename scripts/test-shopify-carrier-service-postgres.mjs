@@ -18,6 +18,7 @@ const MIGRATIONS = [
   '0148_operations_commerce_external_effects.sql',
   '0149_operations_shopify_checkout_rating.sql',
   '0150_operations_shopify_carrier_service_mutation_authorization.sql',
+  '0151_operations_product_pack_management_hardening.sql',
 ]
 const MIGRATION_PASSES = 1
 const EXPECTED_RELATIONS = [
@@ -214,21 +215,44 @@ async function assertRequiredDatabaseGuards(client) {
       'packaging_material_stock_row_version',
       'packaging_material_stock_on_hand_quantity',
       'carrier_parcel_snapshot',
+      'planning_method',
+      'pack_profile_version_id',
+      'pack_profile_version_row_version',
+      'self_package_line_key',
     ]],
   )
   assert.deepEqual(
     packageColumns.rows.map((row) => row.column_name),
     [
       'carrier_parcel_snapshot',
+      'pack_profile_version_id',
+      'pack_profile_version_row_version',
       'packaging_material_stock_id',
       'packaging_material_stock_on_hand_quantity',
       'packaging_material_stock_row_version',
+      'planning_method',
+      'self_package_line_key',
     ],
   )
-  assert.ok(
-    packageColumns.rows.every((row) => row.is_nullable === 'NO'),
-    'package stock and parcel evidence must be required',
-  )
+  const nullableByColumn = new Map(packageColumns.rows.map(
+    (row) => [row.column_name, row.is_nullable],
+  ))
+  assert.equal(nullableByColumn.get('carrier_parcel_snapshot'), 'NO')
+  assert.equal(nullableByColumn.get('planning_method'), 'NO')
+  for (const nullableEvidence of [
+    'packaging_material_stock_id',
+    'packaging_material_stock_row_version',
+    'packaging_material_stock_on_hand_quantity',
+    'pack_profile_version_id',
+    'pack_profile_version_row_version',
+    'self_package_line_key',
+  ]) {
+    assert.equal(
+      nullableByColumn.get(nullableEvidence),
+      'YES',
+      `${nullableEvidence} must be conditionally required by package method`,
+    )
+  }
 
   const offerColumns = await client.query(
     `SELECT column_name, is_nullable
@@ -303,11 +327,11 @@ async function main() {
     assert.deepEqual(
       beforeMigrations,
       [],
-      'rollback-only acceptance must run before migrations 0148-0150 are permanently applied',
+      'rollback-only acceptance must run before migrations 0148-0151 are permanently applied',
     )
     assert.ok(
       Object.values(beforeRelations).every((value) => value === null),
-      'rollback-only acceptance expected migrations 0148-0150 to be absent',
+      'rollback-only acceptance expected migrations 0148-0151 to be absent',
     )
 
     await client.query('BEGIN')

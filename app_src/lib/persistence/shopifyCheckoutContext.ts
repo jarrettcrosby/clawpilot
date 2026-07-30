@@ -30,6 +30,11 @@ export type ShopifyCheckoutContextResult = {
     variantGid: string
     productGlobalId: string
     packMappingGlobalId: string
+    packProfileVersionGlobalId: string
+    packProfileVersionRowVersion: number
+    packageLevel: 'each' | 'inner_pack' | 'case' | 'pallet'
+    baseEachQuantity: number
+    shipsAsOwnPackage: boolean
     inventoryLevelGlobalIds: string[]
     quantity: number
     unitWeightGrams: number
@@ -108,6 +113,13 @@ type LineRow = QueryResultRow & {
   profile_version_is_current: boolean
   profile_version_lifecycle_state:
     HybridCartonizationLine['profile']['lifecycleState']
+  profile_package_level: 'each' | 'inner_pack' | 'case' | 'pallet'
+  profile_base_each_quantity: number
+  profile_length_mm: number | null
+  profile_width_mm: number | null
+  profile_height_mm: number | null
+  profile_dimension_basis: 'inner' | 'outer' | 'unspecified'
+  profile_ships_as_own_package: boolean
   profile_fit_model: HybridCartonizationLine['profile']['fitModel']
   profile_evidence_type: HybridCartonizationLine['profile']['evidenceType']
   profile_evidence_reference: string | null
@@ -216,6 +228,13 @@ async function readLines(
        version.row_version::text AS profile_version_row_version,
        version.is_current AS profile_version_is_current,
        version.lifecycle_state AS profile_version_lifecycle_state,
+       profile.package_level AS profile_package_level,
+       version.base_each_quantity AS profile_base_each_quantity,
+       version.length_mm AS profile_length_mm,
+       version.width_mm AS profile_width_mm,
+       version.height_mm AS profile_height_mm,
+       version.dimension_basis AS profile_dimension_basis,
+       version.ships_as_own_package AS profile_ships_as_own_package,
        version.fit_model AS profile_fit_model,
        version.evidence_type AS profile_evidence_type,
        version.evidence_reference AS profile_evidence_reference,
@@ -229,6 +248,7 @@ async function readLines(
       AND mapping.provider = 'shopify'
       AND mapping.external_product_id = requested.product_gid
       AND mapping.external_variant_id = requested.variant_gid
+      AND mapping.mapping_purpose = 'shopify_checkout'
       AND mapping.is_current = true
      JOIN operations_product_channel_states state
        ON state.organization_id = mapping.organization_id
@@ -325,6 +345,35 @@ function mapLines(
       row.profile_version_row_version,
       `${row.variant_gid} pack profile row version`,
     )
+    const baseEachQuantity = integer(
+      row.profile_base_each_quantity,
+      `${row.variant_gid} base-each quantity`,
+      1,
+    )
+    const outerDimensionsMm = (
+      row.profile_dimension_basis === 'outer'
+      && row.profile_length_mm !== null
+      && row.profile_width_mm !== null
+      && row.profile_height_mm !== null
+    )
+      ? {
+          length: integer(
+            row.profile_length_mm,
+            `${row.variant_gid} profile length`,
+            1,
+          ),
+          width: integer(
+            row.profile_width_mm,
+            `${row.variant_gid} profile width`,
+            1,
+          ),
+          height: integer(
+            row.profile_height_mm,
+            `${row.variant_gid} profile height`,
+            1,
+          ),
+        }
+      : null
     const title = row.provider_variant_title?.trim()
       && row.provider_variant_title.trim().toLowerCase() !== 'default title'
       ? `${row.product_title} · ${row.provider_variant_title.trim()}`
@@ -352,6 +401,11 @@ function mapLines(
             row.profile_confirmed_at,
             `${row.variant_gid} pack profile confirmation`,
           ),
+          packageLevel: row.profile_package_level,
+          baseEachQuantity,
+          shipsAsOwnPackage: row.profile_ships_as_own_package,
+          outerDimensionsMm,
+          grossWeightGrams: row.profile_gross_weight_grams,
         },
       } satisfies HybridCartonizationLine,
       evidence: {
@@ -360,6 +414,11 @@ function mapLines(
         variantGid: input.variantGid,
         productGlobalId: row.product_global_id,
         packMappingGlobalId: row.pack_mapping_global_id,
+        packProfileVersionGlobalId: row.profile_version_global_id,
+        packProfileVersionRowVersion: rowVersion,
+        packageLevel: row.profile_package_level,
+        baseEachQuantity,
+        shipsAsOwnPackage: row.profile_ships_as_own_package,
         inventoryLevelGlobalIds: [] as string[],
         quantity: input.quantity,
         unitWeightGrams: providerWeight,

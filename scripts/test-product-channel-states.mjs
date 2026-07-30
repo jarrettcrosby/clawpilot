@@ -7,6 +7,7 @@ const read = (path) => readFile(new URL(path, root), 'utf8')
 const [
   migration,
   offerMigration,
+  taxonomyMigration,
   intake,
   shopifyIntake,
   faireClient,
@@ -18,6 +19,7 @@ const [
 ] = await Promise.all([
   read('db/migrations/0130_operations_product_channel_states.sql'),
   read('db/migrations/0132_operations_product_channel_offers.sql'),
+  read('db/migrations/0152_operations_product_channel_taxonomy.sql'),
   read('app_src/lib/persistence/commerceIntake.ts'),
   read('app_src/lib/integrations/commerceIntake.ts'),
   read('app_src/lib/integrations/faireCommerceClient.ts'),
@@ -65,6 +67,22 @@ assert.doesNotMatch(
   'historical candidates are ambiguous money evidence and must not backfill channel offers',
 )
 assert.match(offerMigration, /length\(provider_variant_title\) <= 512/)
+assert.match(
+  taxonomyMigration,
+  /provider_taxonomy_scheme IS NOT NULL[\s\S]*provider_taxonomy_scheme = CASE provider/,
+)
+assert.match(
+  taxonomyMigration,
+  /NOT jsonb_path_exists\([\s\S]*@\.type\(\) != "string"/,
+)
+assert.match(
+  taxonomyMigration,
+  /protect_operations_commerce_product_candidate_taxonomy/,
+)
+assert.match(
+  taxonomyMigration,
+  /Commerce product candidate provider taxonomy is immutable/,
+)
 
 assert.match(intake, /upsertProductChannelStateWithClient/)
 assert.match(intake, /linkProductChannelStateWithClient/)

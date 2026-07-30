@@ -115,6 +115,11 @@ const shopifySource = {
       description: 'Wholesale snack',
       vendor: 'AG Alchemy',
       productType: 'Snack Bars',
+      category: {
+        id: 'gid://shopify/TaxonomyCategory/aa-1-2',
+        name: 'Snack Bars',
+        fullName: 'Food, Beverages & Tobacco > Food Items > Snack Bars',
+      },
       status: 'ACTIVE',
       createdAt: '2026-07-01T10:00:00Z',
       updatedAt: '2026-07-26T10:00:00Z',
@@ -592,7 +597,7 @@ assert.deepEqual(
 )
 assert.equal(
   faireExternalOrderV2Normalized.normalizerVersion,
-  'faire-commerce-normalizer-v3',
+  'faire-commerce-normalizer-v4',
 )
 assert.deepEqual(
   headerMoneyProjection(faireExternalOrderV2NormalizedOrder),
@@ -988,6 +993,22 @@ assert.equal(
 assert.equal(shopifyNormalized.products[0].vendor, 'AG Alchemy')
 assert.equal(shopifyNormalized.products[0].productType, 'Snack Bars')
 assert.deepEqual(
+  clone(shopifyNormalized.products[0].providerTaxonomy),
+  {
+    state: 'available',
+    value: {
+      scheme: 'shopify_standard_product_taxonomy',
+      externalId: 'gid://shopify/TaxonomyCategory/aa-1-2',
+      name: 'Snack Bars',
+      fullName: 'Food, Beverages & Tobacco > Food Items > Snack Bars',
+      marketplacePaths: [
+        'Food, Beverages & Tobacco > Food Items > Snack Bars',
+      ],
+    },
+  },
+  'Shopify standard taxonomy must preserve its stable ID, label, and path',
+)
+assert.deepEqual(
   clone(shopifyNormalized.products[0].variants[0].selectedOptions),
   [{ name: 'Flavor', value: 'Original' }],
 )
@@ -1005,6 +1026,20 @@ assert.equal(
 )
 assert.equal(faireNormalized.products[0].vendor, 'AG Alchemy')
 assert.equal(faireNormalized.products[0].productType, 'Snack Bars')
+assert.deepEqual(
+  clone(faireNormalized.products[0].providerTaxonomy),
+  {
+    state: 'available',
+    value: {
+      scheme: 'faire_product_type',
+      externalId: 'taxonomy-snack-bars',
+      name: 'Snack Bars',
+      fullName: 'Snack Bars',
+      marketplacePaths: ['Snack Bars'],
+    },
+  },
+  'Faire product type must preserve its stable ID separately from its label',
+)
 assert.deepEqual(
   clone(faireNormalized.products[0].variants[0].selectedOptions),
   [{ name: 'Flavor', value: 'Original' }],

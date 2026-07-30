@@ -62,6 +62,7 @@ function isPublicApi(pathname: string) {
     || normalizedPath === '/api/integrations/commerce/orders/process'
     || normalizedPath.startsWith('/api/integrations/commerce/shopify/webhooks/')
     || normalizedPath.startsWith('/api/integrations/commerce/shopify/carrier-service/')
+    || normalizedPath.startsWith('/api/integrations/commerce/shopify/product-media/')
     || normalizedPath === '/api/integrations/commerce/faire/oauth/callback'
     || normalizedPath === '/api/docs/embeddings/process'
     || normalizedPath === '/api/ai-radar/process'

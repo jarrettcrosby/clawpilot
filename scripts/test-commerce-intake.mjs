@@ -178,6 +178,7 @@ includes(catalogSyncPersistenceSource, [
   "account.configuration->'requestedScopes'",
   "credential.auth_mode = 'faire_brand_token'",
   "has('read_products')",
+  "has('write_products')",
   "has('READ_PRODUCTS')",
   'commerce.intake.product_policy.connected_default',
   'connectionIsAuthorization: true',
@@ -239,6 +240,15 @@ assert.equal(
     configuration: { grantedScopes: ['read_products', 'read_orders'] },
   }),
   true,
+)
+assert.equal(
+  catalogCredentialPolicyModule.commerceCatalogCredentialSupportsProducts({
+    provider: 'shopify',
+    authMode: 'shopify_client_credentials',
+    configuration: { grantedScopes: ['write_products', 'read_orders'] },
+  }),
+  true,
+  'Shopify write_products also grants the product reads required by catalog sync',
 )
 assert.equal(
   catalogCredentialPolicyModule.commerceCatalogCredentialSupportsProducts({
@@ -702,10 +712,17 @@ includes(shopifyQuerySource, [
   'weight {',
 ], 'Shopify intake query')
 includes(serviceSource, [
-  "grant.grantedScopes.includes('read_customers')",
+  "hasEffectiveShopifyScope(\n    grant.grantedScopes,\n    'read_customers'",
+  "hasEffectiveShopifyScope(\n    probe.grantedScopes,\n    'read_customers'",
   'shopifyOrderQuery(includeCustomerIdentity)',
   'shopifyOrdersQuery(includeCustomerIdentity)',
 ], 'Shopify protected customer-data query gating')
+includes(serviceSource, [
+  "hasEffectiveShopifyScope(grant.grantedScopes, 'read_products')",
+  "hasEffectiveShopifyScope(probe.grantedScopes, 'read_products')",
+  "hasEffectiveShopifyScope(grant.grantedScopes, 'read_inventory')",
+  "hasEffectiveShopifyScope(probe.grantedScopes, 'read_inventory')",
+], 'Shopify token and installed-app scope intersection')
 assert.doesNotMatch(
   shopifyQuerySource,
   /\bmutation\b/i,
@@ -1544,6 +1561,7 @@ includes(workflowSource, [
   'candidate.selectedOptions',
   'candidate.vendor',
   'candidate.productType',
+  'candidate.providerTaxonomy',
   'candidate.compareAtPriceMinor',
   'candidate.taxable',
   'candidate.requiresShipping',
@@ -1829,6 +1847,13 @@ const service = loadTypeScriptModule(
         CommerceIntegrationRequestError: MockCommerceIntegrationRequestError,
         sanitizedCommerceIntegrationError: sanitizeCommerceError,
       },
+      '@/lib/integrations/commerceCapabilities': {
+        hasEffectiveShopifyScope(scopes, scope) {
+          if (scopes.includes(scope)) return true
+          if (!scope.startsWith('read_')) return false
+          return scopes.includes(`write_${scope.slice('read_'.length)}`)
+        },
+      },
       '@/lib/integrations/faireCommerceClient': {
         async listFaireProducts(_options, listOptions) {
           providerReads.faireProducts += 1
@@ -1887,7 +1912,7 @@ const service = loadTypeScriptModule(
       },
       '@/lib/integrations/faireCommerceNormalizer': {
         FAIRE_COMMERCE_NORMALIZER_VERSION:
-          'faire-commerce-normalizer-v3',
+          'faire-commerce-normalizer-v4',
         normalizeFaireCommerce(source) {
           normalizedSources.faire = source
           if (source.inventories) {
@@ -1908,7 +1933,7 @@ const service = loadTypeScriptModule(
       },
       '@/lib/integrations/shopifyCommerceNormalizer': {
         SHOPIFY_COMMERCE_NORMALIZER_VERSION:
-          'shopify-commerce-normalizer-v1',
+          'shopify-commerce-normalizer-v2',
         normalizeShopifyCommerce(source) {
           normalizedSources.shopify = source
           const result = envelope(
@@ -1950,7 +1975,14 @@ const service = loadTypeScriptModule(
         },
         async probeShopifyConnection() {
           providerReads.shopifyProbe += 1
-          return { shopId: shopifyRuntime.externalAccountId }
+          return {
+            shopId: shopifyRuntime.externalAccountId,
+            grantedScopes: [
+              'read_all_orders',
+              'read_orders',
+              'read_products',
+            ],
+          }
         },
         async shopifyAdminGraphql(_credential, request) {
           providerReads.shopifyGraphql += 1
@@ -2688,14 +2720,14 @@ try {
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'faire'
-      && reservation.adapterVersion === 'faire-commerce-normalizer-v3'
+      && reservation.adapterVersion === 'faire-commerce-normalizer-v4'
     )),
     'Faire provider-attempt evidence must record the v3 normalizer',
   )
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'shopify'
-      && reservation.adapterVersion === 'shopify-commerce-normalizer-v1'
+      && reservation.adapterVersion === 'shopify-commerce-normalizer-v2'
     )),
     'Shopify provider-attempt evidence must record its actual normalizer',
   )

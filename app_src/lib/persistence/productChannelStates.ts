@@ -19,6 +19,14 @@ export type ProductChannelStateObservation = {
   providerVariantTitle: string | null
   providerSku: string | null
   providerBarcode: string | null
+  providerTaxonomyScheme:
+    | 'shopify_standard_product_taxonomy'
+    | 'faire_product_type'
+    | null
+  providerCategoryId: string | null
+  providerCategoryName: string | null
+  providerCategoryFullName: string | null
+  providerCategoryPaths: readonly string[]
   wholesaleCurrencyCode: string | null
   wholesalePriceMinor: string | null
   retailCurrencyCode: string | null
@@ -49,18 +57,21 @@ export async function upsertProductChannelStateWithClient(
        organization_id, integration_account_id, pipeline_id, provider,
        external_product_id, external_variant_id, external_inventory_item_id,
        provider_product_title, provider_variant_title, provider_sku,
-       provider_barcode, wholesale_currency_code, wholesale_price_minor,
-       retail_currency_code, retail_price_minor, compare_at_currency_code,
-       compare_at_price_minor, taxable, requires_shipping, weight_grams,
+       provider_barcode, provider_taxonomy_scheme, provider_category_id,
+       provider_category_name, provider_category_full_name,
+       provider_category_paths, wholesale_currency_code,
+       wholesale_price_minor, retail_currency_code, retail_price_minor,
+       compare_at_currency_code, compare_at_price_minor, taxable,
+       requires_shipping, weight_grams,
        product_id, product_mapping_id, provider_status_raw,
        normalized_status, provider_active, provider_updated_at, observed_at,
        source_revision, source_hash, created_by, updated_by
      ) VALUES (
        $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7,
-       $8, $9, $10, $11, $12, $13::bigint, $14, $15::bigint,
-       $16, $17::bigint, $18, $19, $20, $21::uuid, $22::uuid,
-       $23, $24, $25, $26::timestamptz, $27::timestamptz, $28,
-       $29, $30, $30
+       $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb,
+       $17, $18::bigint, $19, $20::bigint, $21, $22::bigint,
+       $23, $24, $25, $26::uuid, $27::uuid, $28, $29, $30,
+       $31::timestamptz, $32::timestamptz, $33, $34, $35, $35
      )
      ON CONFLICT (
        organization_id, integration_account_id, external_variant_id
@@ -72,6 +83,11 @@ export async function upsertProductChannelStateWithClient(
        provider_variant_title = EXCLUDED.provider_variant_title,
        provider_sku = EXCLUDED.provider_sku,
        provider_barcode = EXCLUDED.provider_barcode,
+       provider_taxonomy_scheme = EXCLUDED.provider_taxonomy_scheme,
+       provider_category_id = EXCLUDED.provider_category_id,
+       provider_category_name = EXCLUDED.provider_category_name,
+       provider_category_full_name = EXCLUDED.provider_category_full_name,
+       provider_category_paths = EXCLUDED.provider_category_paths,
        wholesale_currency_code = EXCLUDED.wholesale_currency_code,
        wholesale_price_minor = EXCLUDED.wholesale_price_minor,
        retail_currency_code = EXCLUDED.retail_currency_code,
@@ -118,6 +134,11 @@ export async function upsertProductChannelStateWithClient(
       input.providerVariantTitle,
       input.providerSku,
       input.providerBarcode,
+      input.providerTaxonomyScheme,
+      input.providerCategoryId,
+      input.providerCategoryName,
+      input.providerCategoryFullName,
+      JSON.stringify(input.providerCategoryPaths),
       input.wholesaleCurrencyCode,
       input.wholesalePriceMinor,
       input.retailCurrencyCode,
@@ -202,6 +223,11 @@ export async function readProductChannelStatesInPostgres(input: {
        state.provider_variant_title,
        state.provider_sku,
        state.provider_barcode,
+       state.provider_taxonomy_scheme,
+       state.provider_category_id,
+       state.provider_category_name,
+       state.provider_category_full_name,
+       state.provider_category_paths,
        state.wholesale_currency_code,
        state.wholesale_price_minor::text,
        state.retail_currency_code,
@@ -276,6 +302,23 @@ export async function readProductChannelStatesInPostgres(input: {
       providerBarcode: row.provider_barcode
         ? String(row.provider_barcode)
         : null,
+      providerTaxonomyScheme: row.provider_taxonomy_scheme
+        ? row.provider_taxonomy_scheme as ProductSalesChannelState[
+          'providerTaxonomyScheme'
+        ]
+        : null,
+      providerCategoryId: row.provider_category_id
+        ? String(row.provider_category_id)
+        : null,
+      providerCategoryName: row.provider_category_name
+        ? String(row.provider_category_name)
+        : null,
+      providerCategoryFullName: row.provider_category_full_name
+        ? String(row.provider_category_full_name)
+        : null,
+      providerCategoryPaths: Array.isArray(row.provider_category_paths)
+        ? row.provider_category_paths.map(String)
+        : [],
       wholesaleCurrencyCode: row.wholesale_currency_code
         ? String(row.wholesale_currency_code)
         : null,

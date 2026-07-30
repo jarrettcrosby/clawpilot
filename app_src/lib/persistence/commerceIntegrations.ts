@@ -1013,8 +1013,10 @@ export async function setCommerceIntegrationEnabledInPostgres(input: {
                  account.provider <> 'shopify'
                  OR (
                    credential.webhook_verification_status = 'verified'
-                   AND account.configuration->>'scopeProfile' =
-                     'receipt_evidence_v1'
+                   AND account.configuration->>'scopeProfile' IN (
+                     'receipt_evidence_v1',
+                     'distributed_operations_v1'
+                   )
                    AND account.configuration->'missingScopes' = '[]'::jsonb
                  )
                )
@@ -1397,7 +1399,7 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
           scopeProfileIncomplete,
           JSON.stringify({
             ...(current.configuration || {}),
-            scopeProfile: 'receipt_evidence_v1',
+            scopeProfile: 'distributed_operations_v1',
             requestedScopes: input.scopeAudit.requestedScopes,
             grantedScopes: input.scopeAudit.grantedScopes,
             missingScopes: input.scopeAudit.missingScopes,

@@ -39,12 +39,13 @@ import {
   type CommerceNormalizedProduct,
   type CommerceNormalizedVariant,
   type CommercePartySnapshot,
+  type CommerceProviderTaxonomy,
   type CommerceProviderStates,
   type ReadOnlyCommerceNormalizationAdapter,
 } from '@/lib/operations/commerceNormalization'
 
 export const SHOPIFY_COMMERCE_NORMALIZER_VERSION =
-  'shopify-commerce-normalizer-v1' as const
+  'shopify-commerce-normalizer-v2' as const
 
 type ShopifySource = Readonly<Record<string, unknown>>
 
@@ -379,6 +380,31 @@ function normalizeProduct(
       product.currencyCode ?? currencyFallback,
     ))
   const lifecycleState = optionalCommerceText(product.status, 64)
+  const category = asCommerceRecord(product.category)
+  const categoryId = optionalCommerceText(category?.id, 512)
+  if (
+    categoryId
+    && !/^gid:\/\/shopify\/TaxonomyCategory\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(
+      categoryId,
+    )
+  ) {
+    throw new Error('Shopify returned an invalid taxonomy category GID')
+  }
+  const categoryName = optionalCommerceText(category?.name, 512)
+  const categoryFullName = optionalCommerceText(category?.fullName, 2_000)
+  const providerTaxonomy = (
+    categoryId || categoryName || categoryFullName
+  )
+    ? availableCommerceField(Object.freeze({
+        scheme: 'shopify_standard_product_taxonomy',
+        externalId: categoryId,
+        name: categoryName,
+        fullName: categoryFullName,
+        marketplacePaths: Object.freeze(
+          categoryFullName ? [categoryFullName] : [],
+        ),
+      }) satisfies CommerceProviderTaxonomy)
+    : unavailableCommerceField<CommerceProviderTaxonomy>('not_provided')
   const brandIdentity = GID_PATTERNS.shop.test(externalAccountId)
     ? availableCommerceField(
         createCommerceExternalIdentity('shopify', 'brand', externalAccountId),
@@ -395,6 +421,7 @@ function normalizeProduct(
     ),
     vendor: optionalCommerceText(product.vendor, 512),
     productType: optionalCommerceText(product.productType, 512),
+    providerTaxonomy,
     lifecycleState,
     active: lifecycleState === null
       ? null

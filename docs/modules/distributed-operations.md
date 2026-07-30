@@ -15,7 +15,7 @@ app_visible: false
 
 Provide native distributed order management, warehouse execution, carrier shipping, and 3PL billing inside ClawPilot. The module serves 3PL operators, retailers, distributors, manufacturers, and fulfillment operators without creating a second application or duplicating CRM, product, identity, audit, task, document, notification, or accounting masters.
 
-This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, and `0107` through `0150`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion; a bounded, manager-triggered, read-only Shopify inventory reconciliation for one eligible location and warehouse; a strict development-only Shopify cartonization preview; a recipe-first, assumption-watermarked sandbox package-and-rate evidence workflow; an executable development-only two-pass pack-and-rate replay workbench; and active-workspace measurement-presentation and product-currency defaults. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, continuous or production provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or production fulfillment-optimizer activation.
+This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, and `0107` through `0155`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; versioned Product each/case profiles and separately evidenced exact-case and loose-each recipes; retained Shopify/Faire channel taxonomy; immutable CRM Product image assets; an exact Shadow/Active Shopify image-publish command; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion; a bounded, manager-triggered, read-only Shopify inventory reconciliation for one eligible location and warehouse; a strict development-only Shopify cartonization preview; a recipe-first, assumption-watermarked sandbox package-and-rate evidence workflow; an executable development-only two-pass pack-and-rate replay workbench; and active-workspace measurement-presentation and product-currency defaults. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, continuous or production provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or production fulfillment-optimizer activation.
 
 Migrations `0128` through `0145` extend this slice with the pack hierarchy,
 CRM CSV transfer evidence, durable sales-channel lifecycle and offer
@@ -214,6 +214,30 @@ is separate: missing rated outer dimensions or tare weight is returned as a
 package-level blocker rather than invented from inner dimensions. This pure
 planner performs no database, provider, inventory, shipment, rate, label, or
 packing-list write.
+
+Migration `0151` adds a product-level management surface for versioned each
+and case profiles, exact provider-variant mapping purposes, and active
+approved recipes. Checkout context resolves only a current mapping whose
+purpose is explicitly `shopify_checkout`; a separate current `catalog`
+mapping for the same variant cannot satisfy or duplicate the checkout join.
+An exact-case recipe and a loose-each max-capacity recipe are independent
+evidence. For the 6 oz test path, an operator may retain exact 12 as the case
+path and separately activate a customer-confirmed 1-through-12 loose-pick
+range. The planner deterministically uses exact case for a complete 12, uses
+the loose-each rule for 1, and splits 13 into exact 12 plus loose 1, without
+geometric fallback. The UI never derives that lower minimum from case-only
+evidence: production eligibility requires a separate evidence reference
+confirming the complete loose-each range. Existing AG recipes whose confirmed
+minimum is 12 remain unchanged until that explicit evidence is supplied.
+
+An active case profile with `baseEachQuantity > 1` and
+`shipsAsOwnPackage = true` is already a sealed carrier parcel and therefore
+does not require or synthesize an assembly recipe. Its exact current profile
+revision supplies the rated outer dimensions and gross weight. Checkout
+quantity 1 creates one parcel; quantity 2 creates two parcels, each allocated
+to exactly one provider sell unit. Receipt persistence keeps this
+`self_package` evidence separate from `approved_recipe` cartons, while loose
+eaches continue to require an approved recipe and selected material stock.
 
 Migration `0136` adds a distinct `cartonization_package_rate` purpose to the
 existing UPS and FedEx sandbox adapters. The caller supplies the exact planned
@@ -587,11 +611,62 @@ The canonical order's merchandise total is derived from each positive remaining 
 
 Provider write-back is structurally disabled for this workflow. Its provider port contains read methods only; Shopify mutations, Faire write methods, fulfillment export, inventory export, webhook registration, and cursor advancement are absent. A database safety test compares provider attempts, sync cursors, inventory ledger, reservations, fulfillment, shipments, and export tables before and after intake and promotion. Permitted local changes are bounded intake evidence and receipts; explicitly selected catalog mappings or account-scoped CRM creations; explicitly promoted order-line product/customer records and mappings; and the canonical order/lines, external identifiers, domain event, and audit evidence. No provider-side state changes.
 
+That intake/promotion boundary is intentionally separate from the explicit
+Product-manager image command added by migrations `0153` through `0155`.
+ClawPilot stores validated PNG, JPEG, or WebP originals as immutable,
+tenant-scoped revisions and selects one local primary revision without
+overwriting bytes. An authenticated organization-manager preview streams only
+the exact tenant-, Product-, and asset-fenced revision with no-store,
+same-origin response controls; the Product editor therefore shows the stored
+image instead of metadata alone. **Simulate in Shadow** resolves the exact Product, mapped
+Shopify listing, image revision, credential generation, scope grant, and
+activation revision, persists replay-stable evidence, and guarantees zero
+provider writes. **Publish in Active** requires the exact Operations Product
+scope to be Active and an explicit confirmation, then makes at most one
+idempotent `productUpdate(..., media:)` call under the current verified
+credential and `write_products` grant. The server, not the browser, derives
+the idempotency identity from the integration account, server-resolved parent
+Shopify Product GID, immutable image asset, and mode. The advisory lock and
+unresolved-effect fence use that same provider Product identity, so two local
+variant Products mapped to one Shopify parent Product cannot publish media
+concurrently. Optional signed-receipt queue status is not product-write
+authority.
+
+Shopify media creation is asynchronous. A successful mutation means Shopify
+accepted the media request; it does not mean the image is ready or featured.
+An owner or administrator's exact Active confirmation creates one immutable,
+short-lived authorization for one delivery grant and one matching external
+effect. That narrow authorization permits only the selected image append when
+the credential remains verified, both live scope probes grant
+`write_products`, and the Product activation revision remains Active. It does
+not enable the generic integration account, signed-receipt processing, or any
+other Shopify mutation.
+
+ClawPilot retains the returned MediaImage ID and bounded media errors. The
+operator can refresh `UPLOADED` or `PROCESSING` evidence through an exact,
+read-only MediaImage lookup; each observation is append-only, and `READY` or
+`FAILED` is terminal for that publication. Refresh and terminal replay issue
+zero Shopify writes. An expired claimed effect with an unknown provider
+outcome is moved to terminal investigation without retrying the mutation, so
+operator recovery cannot duplicate an unconfirmed image append. This workflow
+does not call `productReorderMedia`, never claims position zero, and never
+labels the newly added image as Shopify's primary or featured image.
+
 Candidate party and address fields are tenant-scoped protected operational data. Routes require the active organization plus Operations-management permission, responses use `no-store`, audit payloads exclude the protected values, and candidates, read intents, rejections, and continuations become unavailable after the contracted retention interval. Migration `0115` clears encrypted cursor material when an available continuation is consumed, invalidated, or expired, but this slice does not claim a physical purge worker for intake rows. Promotion retains only the order-time snapshot already required by the canonical order. Provider raw bodies are not stored in the candidate tables.
 
 Shopify and Faire normalizers implement the same versioned envelope and semantic fields without erasing provider differences. Shopify keeps separate order, financial, fulfillment, and return states, shop and presentment money, order-time line snapshots, full provider Global IDs, and field-level unavailable/redacted evidence. Faire keeps its brand/retailer distinction, case-sensitive SKU, physical quantity separately from `unit_multiplier`, brand discounts separately from line discounts, payout facts separately from customer payment state, and an absent inventory quantity separately from zero. A provider-specific field that has no safe canonical meaning remains in typed provider evidence or becomes an explicit unsupported condition; it is never guessed.
 
 Migration `0130` makes one CRM/WMS product the canonical product master while projecting its exact provider variants through a read-only `salesChannels` field. A variant may reuse an existing product only when an exact stable SKU or GTIN/barcode resolves to one non-archived product. Multiple matches and same-SKU records with conflicting known barcodes fail closed; names and inferred pack levels never establish identity, so genuinely different each, inner-pack, and case products remain distinct. The durable channel projection retains raw lifecycle, normalized `active`, `draft`, `archived`, `unlisted`, `unavailable`, or `unknown` state, connection status, environment, external identity, and observation time after intake candidates expire and when an account is disabled or in error. It never changes `crm_products.active`. Shopify explicitly requests `ACTIVE`, `ARCHIVED`, `DRAFT`, and `UNLISTED`, and the UI labels `active` only as **Source active**, not published. Faire sends no active/status list filter and preserves every lifecycle the brand API returns. A record missing from one provider response is not inferred to be archived.
+
+Migration `0152` extends that retained channel projection with versioned
+provider taxonomy rather than copying provider categories into the editable
+ClawPilot Product category. Shopify retains its Standard Product Taxonomy
+category GID, name, full name, and hierarchy path when the provider supplies
+them; Faire retains its provider product type. A new local Product may use the
+first exact observed category as initial editable context, but later catalog
+reads never silently overwrite an operator-managed ClawPilot category.
+Creating or updating provider categories remains a separately authorized
+write workflow.
 
 Migration `0131` preserves the same canonical model while reconciling historical provider-isolated Products. The UI exposes the workflow only to authorized product editors with Operations-management authority. Every command carries both Products' source hashes and update timestamps, locks both rows and their active mappings, rechecks operational-reference blockers, and records the old Global ID as an alias before changing the projection. Exact identifier matches and administrator-confirmed same-name/same-pack matches use the same server-owned transaction; neither path treats title as durable identity.
 

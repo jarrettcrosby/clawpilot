@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 export const COMMERCE_NORMALIZATION_ENVELOPE_VERSION =
   'commerce-normalization-envelope-v1' as const
 export const COMMERCE_NORMALIZED_PRODUCT_VERSION =
-  'commerce-normalized-product-v1' as const
+  'commerce-normalized-product-v2' as const
 export const COMMERCE_NORMALIZED_VARIANT_VERSION =
   'commerce-normalized-variant-v1' as const
 export const COMMERCE_NORMALIZED_ORDER_VERSION =
@@ -146,6 +146,16 @@ export type CommerceNormalizedOption = Readonly<{
   value: string
 }>
 
+export type CommerceProviderTaxonomy = Readonly<{
+  scheme:
+    | 'shopify_standard_product_taxonomy'
+    | 'faire_product_type'
+  externalId: string | null
+  name: string | null
+  fullName: string | null
+  marketplacePaths: readonly string[]
+}>
+
 export type CommerceNormalizedVariant = Readonly<{
   schemaVersion: typeof COMMERCE_NORMALIZED_VARIANT_VERSION
   identity: CommerceExternalIdentity
@@ -176,6 +186,7 @@ export type CommerceNormalizedProduct = Readonly<{
   description: string | null
   vendor: string | null
   productType: string | null
+  providerTaxonomy: CommerceDataField<CommerceProviderTaxonomy>
   lifecycleState: string | null
   active: boolean | null
   providerCreatedAt: string | null

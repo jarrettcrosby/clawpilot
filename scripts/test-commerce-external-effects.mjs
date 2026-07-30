@@ -81,6 +81,9 @@ function loadPersistence() {
 const migration = read(
   'db/migrations/0148_operations_commerce_external_effects.sql',
 )
+const mediaAuthorityMigration = read(
+  'db/migrations/0155_shopify_product_media_authority_and_reconciliation.sql',
+)
 const persistence = read(
   'app_src/lib/persistence/commerceExternalEffects.ts',
 )
@@ -105,6 +108,16 @@ includes(migration, [
   'operations_commerce_external_effect_intents_idempotency_unique',
   'BEFORE INSERT OR UPDATE OR DELETE',
 ], 'External-effect schema')
+includes(mediaAuthorityMigration, [
+  'operations_shopify_product_media_write_authorizations',
+  'shopify_product_media_authorization_id uuid',
+  "provider = 'shopify'",
+  "action = 'shopify.product.update'",
+  "desired_mode = 'active'",
+  'AND NOT exact_product_media_authority',
+  'activation_state IS DISTINCT FROM NEW.desired_mode',
+  'activation_revision IS DISTINCT FROM NEW.activation_revision',
+], 'Exact Shopify product-media authority exception')
 
 const fenceProtection = section(
   migration,
@@ -256,7 +269,10 @@ assert.ok(
   'An idempotent replay must be returned before advancing an aggregate fence',
 )
 includes(prepare, [
-  'assertCurrentAccountFence(account, input)',
+  'exactShopifyProductMediaAuthorityIsCurrent',
+  'assertCurrentAccountFence(',
+  'exactProductMediaAuthority',
+  'shopifyProductMediaAuthorizationId',
   "CASE WHEN $5 = 'shadow' THEN 'simulated' ELSE 'pending' END",
   "CASE WHEN $5 = 'shadow' THEN now() ELSE NULL END",
   'simulationHash',

@@ -9,6 +9,9 @@ import {
   sanitizedCommerceIntegrationError,
 } from '@/lib/integrations/commerceIntegrations'
 import {
+  hasEffectiveShopifyScope,
+} from '@/lib/integrations/commerceCapabilities'
+import {
   getFaireOrder,
   listFaireInventory,
   listFaireOrders,
@@ -352,6 +355,11 @@ function shopifyProductVariantsQuery(includeInventory: boolean) {
         updatedAt
         vendor
         productType
+        category {
+          id
+          name
+          fullName
+        }
       }
     }
     pageInfo {
@@ -1057,13 +1065,6 @@ async function shopifyEnvelope(
     clientId: credential.clientId,
     clientSecret: credential.clientSecret,
   })
-  if (!grant.grantedScopes.includes('read_orders')) {
-    throw new CommerceIntegrationRequestError(
-      'Shopify must grant read_orders for current operational intake',
-      409,
-      'COMMERCE_INTAKE_SCOPE_REQUIRED',
-    )
-  }
   const probe = await probeShopifyConnection({
     shopDomain,
     accessToken: grant.accessToken,
@@ -1075,8 +1076,24 @@ async function shopifyEnvelope(
       'SHOPIFY_STORE_IDENTITY_CHANGED',
     )
   }
+  if (
+    !hasEffectiveShopifyScope(grant.grantedScopes, 'read_orders')
+    || !hasEffectiveShopifyScope(probe.grantedScopes, 'read_orders')
+  ) {
+    throw new CommerceIntegrationRequestError(
+      'Shopify must grant read_orders for current operational intake',
+      409,
+      'COMMERCE_INTAKE_SCOPE_REQUIRED',
+    )
+  }
   const providerCredential = { shopDomain, accessToken: grant.accessToken }
-  const includeCustomerIdentity = grant.grantedScopes.includes('read_customers')
+  const includeCustomerIdentity = hasEffectiveShopifyScope(
+    grant.grantedScopes,
+    'read_customers',
+  ) && hasEffectiveShopifyScope(
+    probe.grantedScopes,
+    'read_customers',
+  )
   // `read_orders` grants Shopify's current-order window. Keep unattended
   // reads explicitly inside that window; historical backfill is separate and
   // may require `read_all_orders` when introduced as its own workflow.
@@ -1186,13 +1203,6 @@ async function shopifyProductEnvelope(
     clientId: credential.clientId,
     clientSecret: credential.clientSecret,
   })
-  if (!grant.grantedScopes.includes('read_products')) {
-    throw new CommerceIntegrationRequestError(
-      'Shopify must grant read_products for catalog intake',
-      409,
-      'COMMERCE_INTAKE_SCOPE_REQUIRED',
-    )
-  }
   const probe = await probeShopifyConnection({
     shopDomain,
     accessToken: grant.accessToken,
@@ -1204,6 +1214,19 @@ async function shopifyProductEnvelope(
       'SHOPIFY_STORE_IDENTITY_CHANGED',
     )
   }
+  if (
+    !hasEffectiveShopifyScope(grant.grantedScopes, 'read_products')
+    || !hasEffectiveShopifyScope(probe.grantedScopes, 'read_products')
+  ) {
+    throw new CommerceIntegrationRequestError(
+      'Shopify must grant read_products for catalog intake',
+      409,
+      'COMMERCE_INTAKE_SCOPE_REQUIRED',
+    )
+  }
+  const includeInventory = hydrateInventory
+    && hasEffectiveShopifyScope(grant.grantedScopes, 'read_inventory')
+    && hasEffectiveShopifyScope(probe.grantedScopes, 'read_inventory')
   const data = await shopifyAdminGraphql<Record<string, unknown>>(
     {
       shopDomain,
@@ -1211,8 +1234,7 @@ async function shopifyProductEnvelope(
     },
     {
       query: shopifyProductVariantsQuery(
-        hydrateInventory
-        && grant.grantedScopes.includes('read_inventory'),
+        includeInventory,
       ),
       operationName: 'ClawPilotCommerceProductVariants',
       variables: {

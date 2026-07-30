@@ -254,6 +254,24 @@ export const SHOPIFY_RECEIPT_PROOF_SCOPES = [
   'read_inventory',
 ] as const satisfies readonly ShopifyAccessScope[]
 
+// Merchant-owned Dev Dashboard apps configure this profile in Shopify and
+// release it as one app version. ClawPilot never grants these scopes itself;
+// it reads the installed store grant and fails each capability closed when
+// its required scope is absent. Matching write scopes include their paired
+// read access under Shopify's managed-install rules.
+export const SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES = [
+  'read_all_orders',
+  'read_customers',
+  'write_inventory',
+  'read_locations',
+  'read_markets',
+  'write_merchant_managed_fulfillment_orders',
+  'read_orders',
+  'write_products',
+  'write_publications',
+  'write_shipping',
+] as const satisfies readonly ShopifyAccessScope[]
+
 export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
   shopify: {
     ownership: 'merchant_owned_same_shopify_organization',
@@ -272,6 +290,7 @@ export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
       'Copy the canonical myshopify.com domain, client ID, and client secret.',
     ],
     receiptProofScopes: SHOPIFY_RECEIPT_PROOF_SCOPES,
+    distributedOperationsScopes: SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
     acceptedReceiptTopics: SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS,
     unsupportedCredentialMode: 'legacy_admin_access_token',
   },
@@ -506,6 +525,13 @@ function effectiveGrantedScopeSet(grantedScopes: readonly string[]) {
   return effective
 }
 
+export function hasEffectiveShopifyScope(
+  grantedScopes: readonly string[],
+  scope: ShopifyAccessScope,
+) {
+  return effectiveGrantedScopeSet(grantedScopes).has(scope)
+}
+
 export function auditShopifyScopeRequirements(
   requestedScopes: readonly ShopifyAccessScope[],
   grantedScopes: readonly string[],
@@ -535,7 +561,7 @@ export function auditShopifyScopeUpdatePayload(
     throw new TypeError('Shopify scope-update payload was invalid')
   }
   return auditShopifyScopeRequirements(
-    SHOPIFY_RECEIPT_PROOF_SCOPES,
+    SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
     current,
   )
 }

@@ -59,6 +59,8 @@ import DownloadRounded from '@mui/icons-material/DownloadRounded'
 import CallMergeRounded from '@mui/icons-material/CallMergeRounded'
 import CrmDataTransferDialog from '@/components/crm/CrmDataTransferDialog'
 import ProductIdentityDialog from '@/components/crm/ProductIdentityDialog'
+import ProductImagePanel from '@/components/crm/ProductImagePanel'
+import ProductPackProfilePanel from '@/components/crm/ProductPackProfilePanel'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { annotateInteractionEventHistory } from '@/lib/crm/interactionHistory.mjs'
@@ -2332,6 +2334,23 @@ export default function CrmSection() {
                         ? ` · Barcode: ${channel.providerBarcode}`
                         : ''}
                     </Typography>
+                    {channel.providerTaxonomyScheme ? (
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        display="block"
+                      >
+                        {channel.providerTaxonomyScheme ===
+                        'shopify_standard_product_taxonomy'
+                          ? 'Shopify category'
+                          : 'Faire product type'}
+                        :{' '}
+                        {channel.providerCategoryFullName
+                          || channel.providerCategoryName
+                          || channel.providerCategoryId
+                          || 'Unavailable'}
+                      </Typography>
+                    ) : null}
                     {salesChannelOfferSummary(channel) ? (
                       <Typography
                         variant="caption"
@@ -2396,6 +2415,31 @@ export default function CrmSection() {
               </TextField>
             </Stack>
             <TextField disabled={!recordEditable} label="Product URL" type="url" value={fields.url || ''} onChange={(event) => setFields({ ...fields, url: event.target.value })} />
+            {editorRecord ? (
+              <>
+                <Divider />
+                <ProductImagePanel
+                  productId={textValue(editorRecord, 'id')}
+                  canManage={canManageHierarchy}
+                  shopifyChannels={productSalesChannels(editorRecord).filter(
+                    (channel) => channel.provider === 'shopify',
+                  )}
+                />
+              </>
+            ) : null}
+            {editorRecord && /^gp\d{7}$/.test(
+              textValue(editorRecord, 'referenceCode'),
+            ) ? (
+              <>
+                <Divider />
+                <ProductPackProfilePanel
+                  productGlobalId={textValue(
+                    editorRecord,
+                    'referenceCode',
+                  )}
+                />
+              </>
+            ) : null}
           </>}
           {editorEntity === 'meetings' && <>
             <TextField disabled={!recordEditable} label="Meeting" value={fields.subject || ''} onChange={(event) => setFields({ ...fields, subject: event.target.value })} required />

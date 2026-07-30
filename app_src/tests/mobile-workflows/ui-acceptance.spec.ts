@@ -548,11 +548,11 @@ for (const viewport of MOBILE_VIEWPORTS) {
             status: 'active',
             active: true,
           }],
-          products: [{
-            id: '00000000-0000-4000-8000-000000000108',
-            referenceCode: 'gp1234568',
-            name: 'Acceptance Product',
-            sku: 'ACCEPT-01',
+          products: Array.from({ length: 80 }, (_, index) => ({
+            id: `00000000-0000-4000-8000-${String(108 + index).padStart(12, '0')}`,
+            referenceCode: `gp${String(1234568 + index).padStart(7, '0')}`,
+            name: `Acceptance Product ${index + 1}`,
+            sku: `ACCEPT-${String(index + 1).padStart(2, '0')}`,
             productType: 'Service',
             category: 'Acceptance',
             status: 'Active',
@@ -562,7 +562,7 @@ for (const viewport of MOBILE_VIEWPORTS) {
             url: 'https://example.test/acceptance',
             description: '',
             active: true,
-          }],
+          })),
         } })
       })
       await gotoApp(page, '/#pipeline')
@@ -573,7 +573,15 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await expectUsableGeometry(setupDialog, 'Pipeline setup', 160, 280)
       await expect(setupDialog.getByText('Mobile Operator', { exact: true })).toBeVisible()
       await setupDialog.getByRole('tab', { name: /Products/ }).click()
-      await expect(setupDialog.getByText('Acceptance Product', { exact: true })).toBeVisible()
+      await expect(setupDialog.getByText('Acceptance Product 1', { exact: true })).toBeVisible()
+      await setupDialog.getByRole('button', {
+        name: 'Edit Acceptance Product 1',
+        exact: true,
+      }).click()
+      const productEditor = setupDialog.getByRole('region', { name: 'Product editor' })
+      await expect(productEditor).toBeInViewport()
+      await expect(productEditor.getByRole('textbox', { name: 'Product name' })).toHaveValue('Acceptance Product 1')
+      await productEditor.getByRole('button', { name: 'Cancel' }).click()
       await setupDialog.getByRole('tab', { name: 'Workflow', exact: true }).click()
       await expect(setupDialog.getByRole('textbox', { name: 'Stages' })).toBeVisible()
       await setupDialog.getByRole('button', { name: 'Close pipeline setup' }).click()

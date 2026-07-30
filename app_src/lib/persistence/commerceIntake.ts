@@ -351,6 +351,14 @@ type ProductCandidateRow = {
   variant_title_snapshot: string | null
   vendor_snapshot: string | null
   product_type_snapshot: string | null
+  provider_taxonomy_scheme:
+    | 'shopify_standard_product_taxonomy'
+    | 'faire_product_type'
+    | null
+  provider_category_id: string | null
+  provider_category_name: string | null
+  provider_category_full_name: string | null
+  provider_category_paths: string[]
   normalized_options: Array<{
     name: string
     value: string
@@ -1282,6 +1290,11 @@ const PRODUCT_CANDIDATE_SELECT = `SELECT
   candidate.variant_title_snapshot,
   candidate.vendor_snapshot,
   candidate.product_type_snapshot,
+  candidate.provider_taxonomy_scheme,
+  candidate.provider_category_id,
+  candidate.provider_category_name,
+  candidate.provider_category_full_name,
+  candidate.provider_category_paths,
   candidate.normalized_options,
   candidate.provider_status_raw,
   candidate.normalized_status,
@@ -4302,6 +4315,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
     let productVariantsPreserved = 0
     for (const product of input.envelope.products) {
       const status = normalizeCommerceProductChannelStatus(product)
+      const providerTaxonomy = availableValue(product.providerTaxonomy)
       for (const variant of product.variants) {
         const wholesalePrice = optionalMoney(variant.wholesalePrice)
         const retailPrice = optionalMoney(variant.retailPrice)
@@ -4330,6 +4344,11 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           providerVariantTitle: variant.title,
           providerSku: variant.sku,
           providerBarcode: variant.barcode,
+          providerTaxonomyScheme: providerTaxonomy?.scheme || null,
+          providerCategoryId: providerTaxonomy?.externalId || null,
+          providerCategoryName: providerTaxonomy?.name || null,
+          providerCategoryFullName: providerTaxonomy?.fullName || null,
+          providerCategoryPaths: providerTaxonomy?.marketplacePaths || [],
           wholesaleCurrencyCode: channelOffers.wholesale?.currency || null,
           wholesalePriceMinor: channelOffers.wholesale
             ? bigintString(channelOffers.wholesale.amountMinor)
@@ -4390,7 +4409,10 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
              provider, external_product_id, external_variant_id,
              external_inventory_item_id, sku_snapshot, barcode_snapshot,
              product_title_snapshot, variant_title_snapshot,
-             vendor_snapshot, product_type_snapshot, normalized_options,
+             vendor_snapshot, product_type_snapshot,
+             provider_taxonomy_scheme, provider_category_id,
+             provider_category_name, provider_category_full_name,
+             provider_category_paths, normalized_options,
              provider_status_raw, normalized_status, unit_multiplier,
              currency_code, price_minor, compare_at_price_minor, taxable,
              requires_shipping, inventory_quantity, weight_grams,
@@ -4401,11 +4423,12 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
              expires_at
            ) VALUES (
              $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8,
-             $9, $10, $11, $12, $13, $14, $15::jsonb, $16, $17, $18,
-             $19, $20, $21, $22, $23, $24, $25,
-             $26::timestamptz, $27::timestamptz, $28::timestamptz,
-             $29, $30, $31, $32, 'held', $33, $34::uuid, $35::uuid,
-             $36::text[], $37, $37, $38::timestamptz
+             $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+             $19::jsonb, $20::jsonb, $21, $22, $23, $24, $25, $26,
+             $27, $28, $29, $30,
+             $31::timestamptz, $32::timestamptz, $33::timestamptz,
+             $34, $35, $36, $37, 'held', $38, $39::uuid, $40::uuid,
+             $41::text[], $42, $42, $43::timestamptz
            )
            RETURNING id::text`,
           [
@@ -4423,6 +4446,11 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
             variant.title,
             product.vendor,
             product.productType,
+            providerTaxonomy?.scheme || null,
+            providerTaxonomy?.externalId || null,
+            providerTaxonomy?.name || null,
+            providerTaxonomy?.fullName || null,
+            safeJson(providerTaxonomy?.marketplacePaths || []),
             safeJson(variant.selectedOptions),
             status.raw,
             status.normalized,
@@ -6141,6 +6169,15 @@ export async function readCommerceIntakeStateFromPostgres(input: {
       variantTitle: candidate.variant_title_snapshot,
       vendor: candidate.vendor_snapshot,
       productType: candidate.product_type_snapshot,
+      providerTaxonomy: candidate.provider_taxonomy_scheme
+        ? {
+            scheme: candidate.provider_taxonomy_scheme,
+            externalId: candidate.provider_category_id,
+            name: candidate.provider_category_name,
+            fullName: candidate.provider_category_full_name,
+            marketplacePaths: candidate.provider_category_paths,
+          }
+        : null,
       selectedOptions: candidate.normalized_options,
       providerStatus: candidate.provider_status_raw,
       normalizedStatus: candidate.normalized_status,
@@ -6878,6 +6915,15 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
               selectedOptions: candidate.normalized_options,
               sku: candidate.sku_snapshot,
               barcode: candidate.barcode_snapshot,
+              providerTaxonomy: candidate.provider_taxonomy_scheme
+                ? {
+                    scheme: candidate.provider_taxonomy_scheme,
+                    externalId: candidate.provider_category_id,
+                    name: candidate.provider_category_name,
+                    fullName: candidate.provider_category_full_name,
+                    marketplacePaths: candidate.provider_category_paths,
+                  }
+                : null,
             },
             localCatalog: {
               requestedName: input.resolution.name.trim(),
@@ -6895,6 +6941,10 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
           fields: {
             name: localProductName,
             sku: localProductSku || undefined,
+            productType: candidate.product_type_snapshot || undefined,
+            category: candidate.provider_category_full_name
+              || candidate.provider_category_name
+              || undefined,
             price:
               input.resolution.unitPriceMinor / (10 ** decimals),
             currency,

@@ -1832,7 +1832,7 @@ export default function CommerceIntegrationPanel() {
                             variant="caption"
                             color="text.secondary"
                           >
-                            Least-privilege receipt profile
+                            Distributed Operations scope profile
                           </Typography>
                           <Stack
                             direction="row"

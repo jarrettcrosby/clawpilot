@@ -207,6 +207,72 @@ test('different compatibility keys never pool even with one material', () => {
   )
 })
 
+test('exact case remains the full-case path while loose each covers one and thirteen', () => {
+  const sourceLine = line(1)
+  const exactCase = recipe(sourceLine, {
+    recipeGlobalId: 'gprex000001',
+    recipeType: 'exact_case',
+    maximumInputQuantity: 12,
+    minimumInputQuantity: null,
+    contentCompatibilityKey: null,
+    allowsMixedProducts: false,
+    exclusiveContents: true,
+  })
+  const looseEach = recipe(sourceLine, {
+    recipeGlobalId: 'gprel000001',
+    recipeType: 'max_capacity',
+    maximumInputQuantity: 12,
+    minimumInputQuantity: 1,
+    contentCompatibilityKey: null,
+    allowsMixedProducts: false,
+    exclusiveContents: true,
+  })
+  const recipes = [looseEach, exactCase]
+
+  const one = planHybridCartonization(input(
+    [{ ...sourceLine, quantity: 1 }],
+    recipes,
+  ))
+  assert.equal(one.status, 'ready')
+  assert.equal(one.geometryFallbackLines.length, 0)
+  assert.equal(one.recipePackages.length, 1)
+  assert.equal(one.recipePackages[0].totalInputQuantity, 1)
+  assert.equal(
+    one.recipePackages[0].recipeEvidence[0]?.recipeGlobalId,
+    looseEach.recipeGlobalId,
+  )
+
+  const twelve = planHybridCartonization(input(
+    [{ ...sourceLine, quantity: 12 }],
+    recipes,
+  ))
+  assert.equal(twelve.status, 'ready')
+  assert.equal(twelve.geometryFallbackLines.length, 0)
+  assert.equal(twelve.recipePackages.length, 1)
+  assert.equal(twelve.recipePackages[0].totalInputQuantity, 12)
+  assert.equal(
+    twelve.recipePackages[0].recipeEvidence[0]?.recipeGlobalId,
+    exactCase.recipeGlobalId,
+  )
+
+  const thirteen = planHybridCartonization(input(
+    [{ ...sourceLine, quantity: 13 }],
+    recipes,
+  ))
+  assert.equal(thirteen.status, 'ready')
+  assert.equal(thirteen.geometryFallbackLines.length, 0)
+  assert.deepEqual(
+    thirteen.recipePackages.map((item) => item.totalInputQuantity),
+    [12, 1],
+  )
+  assert.deepEqual(
+    thirteen.recipePackages.map(
+      (item) => item.recipeEvidence[0]?.recipeGlobalId,
+    ),
+    [exactCase.recipeGlobalId, looseEach.recipeGlobalId],
+  )
+})
+
 test('stale and missing recipe evidence block recipe-only lines', () => {
   const stale = line(1)
   const missing = line(2)

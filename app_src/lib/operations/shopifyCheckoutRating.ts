@@ -40,21 +40,23 @@ export function shopifyVariantGid(value: unknown) {
 }
 
 function packageParcel(
-  recipePackage: HybridCartonizationResult['recipePackages'][number],
+  plannedPackage:
+    | HybridCartonizationResult['selfPackages'][number]
+    | HybridCartonizationResult['recipePackages'][number],
 ): CheckoutRateParcel {
   if (
-    recipePackage.rateReadiness.status !== 'ready'
-    || recipePackage.rateReadiness.blockers.length
-    || !recipePackage.rateReadiness.ratedOuterDimensionsMm
-    || !recipePackage.rateReadiness.ratedWeightGrams
+    plannedPackage.rateReadiness.status !== 'ready'
+    || plannedPackage.rateReadiness.blockers.length
+    || !plannedPackage.rateReadiness.ratedOuterDimensionsMm
+    || !plannedPackage.rateReadiness.ratedWeightGrams
   ) {
     checkoutError(
       'SHOPIFY_CHECKOUT_PACKAGE_RATE_EVIDENCE_MISSING',
-      `Package ${recipePackage.packageKey} lacks verified rating dimensions or weight`,
+      `Package ${plannedPackage.packageKey} lacks verified rating dimensions or weight`,
     )
   }
-  const dimensions = recipePackage.rateReadiness.ratedOuterDimensionsMm
-  const grossWeightGrams = recipePackage.rateReadiness.ratedWeightGrams
+  const dimensions = plannedPackage.rateReadiness.ratedOuterDimensionsMm
+  const grossWeightGrams = plannedPackage.rateReadiness.ratedWeightGrams
   if (
     !Number.isSafeInteger(dimensions.length)
     || !Number.isSafeInteger(dimensions.width)
@@ -67,7 +69,7 @@ function packageParcel(
   ) {
     checkoutError(
       'SHOPIFY_CHECKOUT_PACKAGE_RATE_EVIDENCE_INVALID',
-      `Package ${recipePackage.packageKey} has invalid rating evidence`,
+      `Package ${plannedPackage.packageKey} has invalid rating evidence`,
     )
   }
   const inches = (millimeters: number) => Math.ceil(
@@ -77,8 +79,10 @@ function packageParcel(
     (grossWeightGrams / 453.59237) * 10,
   ) / 10
   return {
-    packageKey: recipePackage.packageKey,
-    description: `ClawPilot carton ${recipePackage.sequence}`,
+    packageKey: plannedPackage.packageKey,
+    description: plannedPackage.planningMethod === 'self_package'
+      ? `ClawPilot sealed case ${plannedPackage.sequence}`
+      : `ClawPilot carton ${plannedPackage.sequence}`,
     exteriorInches: {
       length: inches(dimensions.length),
       width: inches(dimensions.width),
@@ -104,6 +108,14 @@ function assertAllocationConservation(
       )
     }
   }
+  for (const selfPackage of plan.selfPackages) {
+    for (const allocation of selfPackage.lineAllocations) {
+      allocated.set(
+        allocation.lineGlobalId,
+        (allocated.get(allocation.lineGlobalId) || 0) + allocation.quantity,
+      )
+    }
+  }
   if (
     allocated.size !== required.size
     || [...required].some(
@@ -118,9 +130,9 @@ function assertAllocationConservation(
 }
 
 /**
- * Converts only a fully evidenced, approved-recipe production plan into the
- * one package array used for both UPS and FedEx. Geometry fallback is never
- * treated as a shippable checkout quote.
+ * Converts fully evidenced self-packaged cases and approved-recipe cartons
+ * into the one package array used for both UPS and FedEx. Geometry fallback
+ * is never treated as a shippable checkout quote.
  */
 export function planShopifyCheckoutPackages(
   input: HybridCartonizationInput,
@@ -147,7 +159,11 @@ export function planShopifyCheckoutPackages(
       'Every Shopify checkout line requires a fully approved pack recipe',
     )
   }
-  if (plan.recipePackages.length < 1 || plan.recipePackages.length > 50) {
+  const plannedPackages = [
+    ...plan.selfPackages,
+    ...plan.recipePackages,
+  ].sort((left, right) => left.sequence - right.sequence)
+  if (plannedPackages.length < 1 || plannedPackages.length > 50) {
     checkoutError(
       'SHOPIFY_CHECKOUT_PACKAGE_COUNT_INVALID',
       'Shopify checkout requires between 1 and 50 complete packages',
@@ -156,6 +172,6 @@ export function planShopifyCheckoutPackages(
   assertAllocationConservation(input, plan)
   return {
     plan,
-    parcels: plan.recipePackages.map(packageParcel),
+    parcels: plannedPackages.map(packageParcel),
   }
 }

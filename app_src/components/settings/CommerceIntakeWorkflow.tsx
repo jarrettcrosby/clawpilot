@@ -234,6 +234,15 @@ type ProductCandidate = {
   variantTitle?: string | null
   vendor?: string | null
   productType?: string | null
+  providerTaxonomy?: {
+    scheme:
+      | 'shopify_standard_product_taxonomy'
+      | 'faire_product_type'
+    externalId?: string | null
+    name?: string | null
+    fullName?: string | null
+    marketplacePaths?: string[]
+  } | null
   selectedOptions?: Array<{
     name: string
     value: string
@@ -4832,6 +4841,23 @@ export default function CommerceIntakeWorkflow({
                               {candidate.productType || 'unavailable'} · barcode{' '}
                               {candidate.barcode || 'unavailable'}
                             </Typography>
+                            {candidate.providerTaxonomy ? (
+                              <Typography
+                                variant="caption"
+                                color="text.secondary"
+                                display="block"
+                              >
+                                {candidate.providerTaxonomy.scheme ===
+                                'shopify_standard_product_taxonomy'
+                                  ? 'Shopify category'
+                                  : 'Faire product type'}
+                                :{' '}
+                                {candidate.providerTaxonomy.fullName
+                                  || candidate.providerTaxonomy.name
+                                  || candidate.providerTaxonomy.externalId
+                                  || 'Unavailable'}
+                              </Typography>
+                            ) : null}
                             {candidate.externalInventoryItemId ? (
                               <Typography
                                 variant="caption"

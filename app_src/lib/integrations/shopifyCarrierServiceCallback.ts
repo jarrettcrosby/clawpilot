@@ -293,6 +293,38 @@ function responseFromTypedReceipt(
   ))
   const requiredByMaterial = new Map<string, number>()
   for (const parcel of receipt.packages) {
+    if (parcel.planningMethod === 'self_package') {
+      const sourceLine = context.lines.find(
+        (line) => line.lineKey === parcel.selfPackageLineKey,
+      )
+      const plannedLine = context.input.lines.find(
+        (line) => line.lineGlobalId === parcel.selfPackageLineKey,
+      )
+      if (
+        !sourceLine
+        || !plannedLine
+        || sourceLine.packProfileVersionGlobalId
+          !== parcel.packProfileVersionGlobalId
+        || sourceLine.packProfileVersionRowVersion
+          !== parcel.packProfileVersionRowVersion
+        || plannedLine.profile.shipsAsOwnPackage !== true
+        || plannedLine.profile.packageLevel !== 'case'
+        || plannedLine.profile.baseEachQuantity === undefined
+        || plannedLine.profile.baseEachQuantity < 2
+        || plannedLine.profile.outerDimensionsMm === null
+        || plannedLine.profile.outerDimensionsMm === undefined
+        || plannedLine.profile.grossWeightGrams
+          !== parcel.grossWeightGrams
+        || parcel.contentWeightGrams !== parcel.grossWeightGrams
+        || parcel.tareWeightGrams !== 0
+        || parcel.allocations.length !== 1
+        || parcel.allocations[0].lineKey !== parcel.selfPackageLineKey
+        || parcel.allocations[0].quantity !== 1
+      ) {
+        return null
+      }
+      continue
+    }
     const material = materialByGlobalId.get(parcel.materialGlobalId)
     if (
       !material
@@ -620,6 +652,13 @@ export async function executeShopifyCarrierServiceCallback(input: {
             variantGid: line.variantGid,
             productGlobalId: line.productGlobalId,
             packMappingGlobalId: line.packMappingGlobalId,
+            packProfileVersionGlobalId:
+              line.packProfileVersionGlobalId,
+            packProfileVersionRowVersion:
+              line.packProfileVersionRowVersion,
+            packageLevel: line.packageLevel,
+            baseEachQuantity: line.baseEachQuantity,
+            shipsAsOwnPackage: line.shipsAsOwnPackage,
             inventoryLevelGlobalIds: line.inventoryLevelGlobalIds,
             quantity: line.quantity,
             unitWeightGrams: line.unitWeightGrams,
@@ -734,7 +773,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
         maxDeliveryDate: deliveryTimestamp(offer.deliveryDate),
       })),
     )
-    const packages: ShopifyCheckoutPackageInput[] =
+    const recipePackages: ShopifyCheckoutPackageInput[] =
       plan.recipePackages.map((recipePackage) => {
         const ratedOuterDimensionsMm =
           recipePackage.rateReadiness.ratedOuterDimensionsMm
@@ -753,6 +792,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
           throw new Error('Carton plan lacks retained rating evidence')
         }
         return {
+          planningMethod: 'approved_recipe',
           packageKey: recipePackage.packageKey,
           packageSequence: recipePackage.sequence,
           materialGlobalId: recipePackage.packagingMaterialGlobalId,
@@ -779,6 +819,62 @@ export async function executeShopifyCarrierServiceCallback(input: {
           },
         }
       })
+    const selfPackages: ShopifyCheckoutPackageInput[] =
+      plan.selfPackages.map((selfPackage) => {
+        const allocation = selfPackage.lineAllocations[0]
+        const contextLine = context.lines.find(
+          (line) => line.lineKey === allocation.lineGlobalId,
+        )
+        if (
+          !contextLine
+          || contextLine.packProfileVersionGlobalId
+            !== selfPackage.packProfileVersionGlobalId
+          || contextLine.packProfileVersionRowVersion
+            !== selfPackage.packProfileVersionRowVersion
+        ) {
+          throw new Error('Self-package plan lacks retained line evidence')
+        }
+        return {
+          planningMethod: 'self_package',
+          packageKey: selfPackage.packageKey,
+          packageSequence: selfPackage.sequence,
+          packProfileVersionGlobalId:
+            selfPackage.packProfileVersionGlobalId,
+          packProfileVersionRowVersion:
+            selfPackage.packProfileVersionRowVersion,
+          selfPackageLineKey: allocation.lineGlobalId,
+          ratedOuterDimensionsMm:
+            selfPackage.rateReadiness.ratedOuterDimensionsMm,
+          contentWeightGrams: selfPackage.contentWeightGrams,
+          tareWeightGrams: 0,
+          allocations: [{
+            lineKey: allocation.lineGlobalId,
+            quantity: 1,
+          }],
+          packageSnapshot: {
+            planningMethod: selfPackage.planningMethod,
+            lineKey: allocation.lineGlobalId,
+            productGlobalId: allocation.productGlobalId,
+            packProfileVersionGlobalId:
+              selfPackage.packProfileVersionGlobalId,
+            packProfileVersionRowVersion:
+              selfPackage.packProfileVersionRowVersion,
+            packageLevel: selfPackage.packageLevel,
+            baseEachQuantity: selfPackage.baseEachQuantity,
+            ratedOuterDimensionsMm:
+              selfPackage.rateReadiness.ratedOuterDimensionsMm,
+            contentWeightGrams: selfPackage.contentWeightGrams,
+            tareWeightGrams: 0,
+          },
+        }
+      })
+    const packages: ShopifyCheckoutPackageInput[] = [
+      ...selfPackages,
+      ...recipePackages,
+    ].sort((left, right) => (
+      left.packageSequence - right.packageSequence
+      || left.packageKey.localeCompare(right.packageKey)
+    ))
     const packagePlanHash = shopifyCheckoutPackagePlanHash({ packages })
     requireCallbackTime(
       successPersistenceDeadlineAt,

@@ -528,12 +528,14 @@ function assertCurrentAccountFence(
     credentialGeneration: number
     activationRevision: number
   },
+  exactProductMediaAuthority = false,
 ) {
   if (
     account.provider !== input.provider
     || (
       input.desiredMode === 'active'
       && account.status !== 'active'
+      && !exactProductMediaAuthority
     )
     || (
       input.desiredMode === 'shadow'
@@ -557,6 +559,78 @@ function assertCurrentAccountFence(
       'Operations activation changed after this effect was reviewed',
     )
   }
+}
+
+async function exactShopifyProductMediaAuthorityIsCurrent(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    integrationAccountId: string
+    provider: CommerceExternalEffectProvider
+    action: string
+    desiredMode: CommerceExternalEffectMode
+    credentialGeneration: number
+    activationRevision: number
+    aggregateId: string
+    aggregateRevision: number
+    aggregateHash: string
+    idempotencyKey: string
+    shopifyProductMediaAuthorizationId?: string | null
+    actorEmail?: string | null
+  },
+) {
+  if (!input.shopifyProductMediaAuthorizationId) return false
+  if (
+    input.provider !== 'shopify'
+    || input.action !== 'shopify.product.update'
+    || input.desiredMode !== 'active'
+    || !input.actorEmail
+  ) {
+    externalEffectError(
+      'COMMERCE_EXTERNAL_EFFECT_PRODUCT_MEDIA_AUTHORITY_INVALID',
+      'Exact Shopify Product-image authority is invalid',
+    )
+  }
+  const result = await client.query<{ authorized: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1
+       FROM operations_shopify_product_media_write_authorizations auth
+       JOIN operations_shopify_product_media_delivery_grants media_grant
+         ON media_grant.organization_id = auth.organization_id
+        AND media_grant.id = auth.delivery_grant_id
+       WHERE auth.organization_id = $1::uuid
+         AND auth.id = $2::uuid
+         AND auth.integration_account_id = $3::uuid
+         AND auth.authorized_by = $4
+         AND auth.expires_at > clock_timestamp()
+         AND media_grant.desired_mode = 'active'
+         AND media_grant.credential_generation = $5
+         AND media_grant.activation_revision = $6
+         AND media_grant.product_reference_code = $7
+         AND media_grant.aggregate_revision = $8::bigint
+         AND media_grant.aggregate_hash = $9
+         AND media_grant.idempotency_key = $10
+     ) AS authorized`,
+    [
+      input.organizationId,
+      input.shopifyProductMediaAuthorizationId,
+      input.integrationAccountId,
+      input.actorEmail,
+      input.credentialGeneration,
+      input.activationRevision,
+      input.aggregateId,
+      input.aggregateRevision,
+      input.aggregateHash,
+      input.idempotencyKey,
+    ],
+  )
+  if (result.rows[0]?.authorized !== true) {
+    externalEffectError(
+      'COMMERCE_EXTERNAL_EFFECT_PRODUCT_MEDIA_AUTHORITY_STALE',
+      'Exact Shopify Product-image authority is missing or stale',
+    )
+  }
+  return true
 }
 
 async function readExistingEffect(
@@ -718,6 +792,7 @@ export async function prepareCommerceExternalEffectInPostgres(input: {
   idempotencyKey: string
   redactedRequest: Record<string, unknown>
   simulationEvidence?: Record<string, unknown> | null
+  shopifyProductMediaAuthorizationId?: string | null
   actorEmail?: string | null
 }) {
   assertInput(input)
@@ -748,7 +823,16 @@ export async function prepareCommerceExternalEffectInPostgres(input: {
       return externalEffect(existing)
     }
 
-    assertCurrentAccountFence(account, input)
+    const exactProductMediaAuthority =
+      await exactShopifyProductMediaAuthorityIsCurrent(client, {
+        ...input,
+        integrationAccountId: account.id,
+      })
+    assertCurrentAccountFence(
+      account,
+      input,
+      exactProductMediaAuthority,
+    )
     await advanceAggregateFence(client, {
       organizationId: input.organizationId,
       integrationAccountId: account.id,
@@ -764,25 +848,26 @@ export async function prepareCommerceExternalEffectInPostgres(input: {
          organization_id, integration_account_id, provider, action,
          desired_mode, credential_generation, activation_revision,
          aggregate_type, aggregate_id, aggregate_revision, aggregate_hash,
-         idempotency_key, request_hash, redacted_request, state,
+         idempotency_key, request_hash, redacted_request,
+         shopify_product_media_authorization_id, state,
          redacted_result, terminal_evidence_hash, provider_write_count,
          completed_at, created_by
        ) VALUES (
          $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10::bigint,
-         $11, $12, $13, $14::jsonb,
+         $11, $12, $13, $14::jsonb, $15::uuid,
          CASE WHEN $5 = 'shadow' THEN 'simulated' ELSE 'pending' END,
-         CASE WHEN $5 = 'shadow' THEN $15::jsonb ELSE NULL END,
-         CASE WHEN $5 = 'shadow' THEN $16 ELSE NULL END,
+         CASE WHEN $5 = 'shadow' THEN $16::jsonb ELSE NULL END,
+         CASE WHEN $5 = 'shadow' THEN $17 ELSE NULL END,
          0,
          CASE WHEN $5 = 'shadow' THEN now() ELSE NULL END,
-         $17
+         $18
        )
        RETURNING
          id::text,
          global_id,
          organization_id::text,
          integration_account_id::text,
-         $18 AS integration_account_global_id,
+         $19 AS integration_account_global_id,
          provider,
          action,
          desired_mode,
@@ -825,6 +910,7 @@ export async function prepareCommerceExternalEffectInPostgres(input: {
         input.idempotencyKey,
         requestHash,
         JSON.stringify(input.redactedRequest),
+        input.shopifyProductMediaAuthorizationId || null,
         simulationEvidence ? JSON.stringify(simulationEvidence) : null,
         simulationHash,
         input.actorEmail || null,
@@ -839,7 +925,33 @@ function claimabilitySql(alias = 'intent') {
   return `(
     ${alias}.state = 'pending'
     AND ${alias}.desired_mode = 'active'
-    AND account.status = 'active'
+    AND (
+      account.status = 'active'
+      OR EXISTS (
+        SELECT 1
+        FROM operations_shopify_product_media_write_authorizations auth
+        JOIN operations_shopify_product_media_delivery_grants media_grant
+          ON media_grant.organization_id = auth.organization_id
+         AND media_grant.id = auth.delivery_grant_id
+        WHERE auth.organization_id = ${alias}.organization_id
+          AND auth.id =
+                ${alias}.shopify_product_media_authorization_id
+          AND auth.integration_account_id =
+                ${alias}.integration_account_id
+          AND auth.expires_at > clock_timestamp()
+          AND media_grant.desired_mode = 'active'
+          AND media_grant.credential_generation =
+                ${alias}.credential_generation
+          AND media_grant.activation_revision =
+                ${alias}.activation_revision
+          AND media_grant.product_reference_code =
+                ${alias}.aggregate_id
+          AND media_grant.aggregate_revision =
+                ${alias}.aggregate_revision
+          AND media_grant.aggregate_hash = ${alias}.aggregate_hash
+          AND media_grant.idempotency_key = ${alias}.idempotency_key
+      )
+    )
     AND account.integration_type = 'commerce'
     AND account.provider = ${alias}.provider
     AND account.commerce_credential_generation =

@@ -32,6 +32,15 @@ export type HybridCartonizationLine = {
     evidenceType: HybridCartonizationEvidenceType
     evidenceReference: string | null
     confirmedAt: string | null
+    packageLevel?: 'each' | 'inner_pack' | 'case' | 'pallet'
+    baseEachQuantity?: number
+    shipsAsOwnPackage?: boolean
+    outerDimensionsMm?: {
+      length: number
+      width: number
+      height: number
+    } | null
+    grossWeightGrams?: number | null
   }
 }
 
@@ -186,12 +195,46 @@ export type HybridRecipePackage = {
   }>
 }
 
+export type HybridSelfPackage = {
+  packageKey: string
+  sequence: number
+  planningMethod: 'self_package'
+  packProfileVersionGlobalId: string
+  packProfileVersionRowVersion: number
+  packageLevel: 'case'
+  baseEachQuantity: number
+  lineAllocations: Array<{
+    lineGlobalId: string
+    productGlobalId: string
+    title: string
+    quantity: 1
+    profileVersionGlobalId: string
+    profileVersionRowVersion: number
+    unitWeightGrams: number
+    contentWeightGrams: number
+  }>
+  totalInputQuantity: 1
+  contentWeightGrams: number
+  rateReadiness: {
+    status: 'ready'
+    ratedOuterDimensionsMm: {
+      length: number
+      width: number
+      height: number
+    }
+    tareWeightGrams: 0
+    ratedWeightGrams: number
+    blockers: []
+  }
+}
+
 export type HybridCartonizationResult = {
   status: 'ready' | 'blocked'
   policyVersion: typeof HYBRID_CARTONIZATION_POLICY_VERSION
   algorithmVersion: typeof HYBRID_CARTONIZATION_ALGORITHM_VERSION
   inputHash: string
   resultHash: string
+  selfPackages: HybridSelfPackage[]
   recipePackages: HybridRecipePackage[]
   geometryFallbackLines: Array<{
     lineGlobalId: string
@@ -232,6 +275,7 @@ type SharedOption = {
   signature: string
   packagingMaterialGlobalId: string
   contentCompatibilityKey: string | null
+  recipeType: HybridCartonizationRecipe['recipeType']
   maximumInputQuantity: number
   minimumInputQuantity: number
   minimumBasis: 'approved_recipe' | 'sandbox_assumption'
@@ -596,6 +640,7 @@ function optionSignature(option: ValidRecipeOption) {
     recipe.packagingMaterialGlobalId,
     option.material.currentRowVersion,
     recipe.contentCompatibilityKey ?? '',
+    recipe.recipeType,
     recipe.maximumInputQuantity,
     option.appliedMinimumInputQuantity,
     option.minimumBasis,
@@ -617,6 +662,7 @@ function buildSharedOptions(lines: PlannedLine[]): SharedOption[] {
           option.recipe.packagingMaterialGlobalId,
         contentCompatibilityKey:
           option.recipe.contentCompatibilityKey,
+        recipeType: option.recipe.recipeType,
         maximumInputQuantity: option.recipe.maximumInputQuantity,
         minimumInputQuantity: option.appliedMinimumInputQuantity,
         minimumBasis: option.minimumBasis,
@@ -651,10 +697,20 @@ function buildSharedOptions(lines: PlannedLine[]): SharedOption[] {
     ))
     .sort((left, right) => (
       left.maximumInputQuantity - right.maximumInputQuantity
+      || recipeTypePriority(left.recipeType)
+        - recipeTypePriority(right.recipeType)
       || left.packagingMaterialGlobalId.localeCompare(
         right.packagingMaterialGlobalId,
       )
     ))
+}
+
+function recipeTypePriority(
+  recipeType: HybridCartonizationRecipe['recipeType'],
+) {
+  if (recipeType === 'exact_case') return 0
+  if (recipeType === 'max_capacity') return 1
+  return 2
 }
 
 function allocatePackage(
@@ -777,6 +833,83 @@ function unique(values: string[]) {
   return [...new Set(values)].sort()
 }
 
+function selfPackageEvidenceIsComplete(line: HybridCartonizationLine) {
+  const { profile } = line
+  const dimensions = profile.outerDimensionsMm
+  return (
+    profile.shipsAsOwnPackage === true
+    && profile.packageLevel === 'case'
+    && Number.isSafeInteger(profile.baseEachQuantity)
+    && Number(profile.baseEachQuantity) > 1
+    && dimensions !== null
+    && dimensions !== undefined
+    && Number.isSafeInteger(dimensions.length)
+    && dimensions.length > 0
+    && Number.isSafeInteger(dimensions.width)
+    && dimensions.width > 0
+    && Number.isSafeInteger(dimensions.height)
+    && dimensions.height > 0
+    && Number.isSafeInteger(profile.grossWeightGrams)
+    && Number(profile.grossWeightGrams) > 0
+    && profile.grossWeightGrams === line.unitWeightGrams
+  )
+}
+
+function allocateSelfPackages(
+  line: HybridCartonizationLine,
+  startingSequence: number,
+): HybridSelfPackage[] {
+  if (!selfPackageEvidenceIsComplete(line)) {
+    throw new Error(
+      `Self-package line ${line.lineGlobalId} lacks complete case evidence`,
+    )
+  }
+  const dimensions = line.profile.outerDimensionsMm
+  const baseEachQuantity = line.profile.baseEachQuantity
+  if (!dimensions || !baseEachQuantity) {
+    throw new Error('Self-package evidence changed during planning')
+  }
+  return Array.from({ length: line.quantity }, (_, index) => {
+    const sequence = startingSequence + index
+    const allocation = {
+      lineGlobalId: line.lineGlobalId,
+      productGlobalId: line.productGlobalId,
+      title: line.title,
+      quantity: 1 as const,
+      profileVersionGlobalId: line.profile.versionGlobalId,
+      profileVersionRowVersion: line.profile.currentRowVersion,
+      unitWeightGrams: line.unitWeightGrams,
+      contentWeightGrams: line.unitWeightGrams,
+    }
+    const packageEvidence = {
+      sequence,
+      planningMethod: 'self_package' as const,
+      packProfileVersionGlobalId: line.profile.versionGlobalId,
+      packProfileVersionRowVersion: line.profile.currentRowVersion,
+      lineAllocation: allocation,
+    }
+    return {
+      packageKey: `hpkg-${canonicalHash(packageEvidence).slice(0, 20)}`,
+      sequence,
+      planningMethod: 'self_package',
+      packProfileVersionGlobalId: line.profile.versionGlobalId,
+      packProfileVersionRowVersion: line.profile.currentRowVersion,
+      packageLevel: 'case',
+      baseEachQuantity,
+      lineAllocations: [allocation],
+      totalInputQuantity: 1,
+      contentWeightGrams: line.unitWeightGrams,
+      rateReadiness: {
+        status: 'ready',
+        ratedOuterDimensionsMm: dimensions,
+        tareWeightGrams: 0,
+        ratedWeightGrams: line.unitWeightGrams,
+        blockers: [],
+      },
+    }
+  })
+}
+
 /**
  * Performs the evidence-backed recipe phase before geometric cartonization.
  *
@@ -804,6 +937,7 @@ export function planHybridCartonization(
   )
   const inputHash = canonicalHash(canonicalInputSnapshot(input))
   const blockers: HybridCartonizationBlocker[] = []
+  const selfPackages: HybridSelfPackage[] = []
   const recipePackages: HybridRecipePackage[] = []
   const geometryFallbackLines:
     HybridCartonizationResult['geometryFallbackLines'] = []
@@ -830,6 +964,27 @@ export function planHybridCartonization(
     const profileProblem = profileEvidenceProblem(input, line)
     if (profileProblem) {
       blockers.push(profileProblem)
+      continue
+    }
+    if (line.profile.shipsAsOwnPackage === true) {
+      if (!selfPackageEvidenceIsComplete(line)) {
+        blockers.push({
+          code: 'PROFILE_EVIDENCE_MISSING',
+          detail:
+            `Line ${line.lineGlobalId} is marked to ship as its own package `
+            + 'but lacks an active case quantity, outer dimensions, or '
+            + 'matching gross weight.',
+          action:
+            'Confirm the current case profile, base-each quantity, outer '
+            + 'dimensions, and gross weight before checkout rating.',
+          lineGlobalIds: [line.lineGlobalId],
+          recipeGlobalIds: [],
+        })
+        continue
+      }
+      selfPackages.push(
+        ...allocateSelfPackages(line, selfPackages.length + 1),
+      )
       continue
     }
 
@@ -1039,11 +1194,18 @@ export function planHybridCartonization(
         && totalRemaining <= option.maximumInputQuantity
       ))
       const overflowPackage = [...sharedOptions]
-        .reverse()
-        .find((option) => (
+        .filter((option) => (
           totalRemaining > option.maximumInputQuantity
           && option.maximumInputQuantity >= option.minimumInputQuantity
         ))
+        .sort((left, right) => (
+          right.maximumInputQuantity - left.maximumInputQuantity
+          || recipeTypePriority(left.recipeType)
+            - recipeTypePriority(right.recipeType)
+          || left.packagingMaterialGlobalId.localeCompare(
+            right.packagingMaterialGlobalId,
+          )
+        ))[0]
       const selectedOption = singlePackage ?? overflowPackage
       if (!selectedOption) break
       const targetQuantity = singlePackage
@@ -1053,7 +1215,7 @@ export function planHybridCartonization(
         lines,
         selectedOption,
         targetQuantity,
-        recipePackages.length + 1,
+        selfPackages.length + recipePackages.length + 1,
       )
       recipePackages.push(recipePackage)
       for (const allocation of recipePackage.lineAllocations) {
@@ -1136,6 +1298,7 @@ export function planHybridCartonization(
     policyVersion: HYBRID_CARTONIZATION_POLICY_VERSION,
     algorithmVersion: HYBRID_CARTONIZATION_ALGORITHM_VERSION,
     inputHash,
+    selfPackages,
     recipePackages,
     geometryFallbackLines,
     assumptions: [...assumptions.values()].sort((left, right) => (
@@ -1158,4 +1321,4 @@ import { createHash } from 'node:crypto'
 export const HYBRID_CARTONIZATION_POLICY_VERSION =
   'hybrid-cartonization-recipe-first-v1'
 export const HYBRID_CARTONIZATION_ALGORITHM_VERSION =
-  'hybrid-recipe-pooling-v1'
+  'hybrid-recipe-pooling-v3'

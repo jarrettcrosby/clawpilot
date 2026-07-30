@@ -127,6 +127,7 @@ for (const required of [
   "mapping.provider = 'shopify'",
   'mapping.external_product_id = requested.product_gid',
   'mapping.external_variant_id = requested.variant_gid',
+  "mapping.mapping_purpose = 'shopify_checkout'",
   "level.projection_state = 'projected'",
   'level.external_inventory_item_id =',
   "recipe.lifecycle_state = 'active'",

@@ -13,7 +13,7 @@ const PRODUCT_READABLE_CONNECTION_SQL = `(
     AND COALESCE(
       account.configuration->'grantedScopes',
       '[]'::jsonb
-    ) ? 'read_products'
+    ) ?| ARRAY['read_products', 'write_products']
   )
   OR (
     account.provider = 'faire'
@@ -269,9 +269,13 @@ export function commerceCatalogCredentialSupportsProducts(input: {
   configuration: Record<string, unknown>
 }) {
   if (input.provider === 'shopify') {
-    return new Set(
+    const grantedScopes = new Set(
       stringArray(input.configuration.grantedScopes),
-    ).has('read_products')
+    )
+    return (
+      grantedScopes.has('read_products')
+      || grantedScopes.has('write_products')
+    )
   }
   return (
     input.authMode === 'faire_brand_token'

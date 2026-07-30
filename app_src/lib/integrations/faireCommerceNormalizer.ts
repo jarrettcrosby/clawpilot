@@ -40,12 +40,13 @@ import {
   type CommerceNormalizedProduct,
   type CommerceNormalizedVariant,
   type CommercePartySnapshot,
+  type CommerceProviderTaxonomy,
   type CommerceProviderStates,
   type ReadOnlyCommerceNormalizationAdapter,
 } from '@/lib/operations/commerceNormalization'
 
 export const FAIRE_COMMERCE_NORMALIZER_VERSION =
-  'faire-commerce-normalizer-v3' as const
+  'faire-commerce-normalizer-v4' as const
 
 type FaireSource = Readonly<Record<string, unknown>>
 
@@ -765,6 +766,19 @@ function normalizeProduct(
     64,
   )
   const taxonomyType = asCommerceRecord(product.taxonomy_type)
+  const taxonomyId = optionalCommerceText(taxonomyType?.id, 512)
+  const taxonomyName = optionalCommerceText(taxonomyType?.name, 512)
+  const providerTaxonomy = taxonomyId || taxonomyName
+    ? availableCommerceField(Object.freeze({
+        scheme: 'faire_product_type',
+        externalId: taxonomyId,
+        name: taxonomyName,
+        fullName: taxonomyName,
+        marketplacePaths: Object.freeze(
+          taxonomyName ? [taxonomyName] : [],
+        ),
+      }) satisfies CommerceProviderTaxonomy)
+    : unavailableCommerceField<CommerceProviderTaxonomy>('not_provided')
   const active = typeof product.active === 'boolean'
     ? product.active
     : typeof product.deleted === 'boolean'
@@ -800,6 +814,7 @@ function normalizeProduct(
         ?? product.category,
       512,
     ),
+    providerTaxonomy,
     lifecycleState,
     active,
     providerCreatedAt: optionalCommerceTimestamp(product.created_at),

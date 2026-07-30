@@ -84,6 +84,9 @@ function loadPersistence() {
 const migration = read(
   'db/migrations/0149_operations_shopify_checkout_rating.sql',
 )
+const packHardeningMigration = read(
+  'db/migrations/0151_operations_product_pack_management_hardening.sql',
+)
 const persistenceSource = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
 )
@@ -98,6 +101,15 @@ includes(migration, [
   'rated_outer_dimension_evidence_reference',
   'rated_outer_dimension_confirmed_at IS NOT NULL',
 ], 'Rated outside dimensions')
+includes(packHardeningMigration, [
+  "planning_method IN ('approved_recipe', 'self_package')",
+  'op_shopify_rate_packages_profile_version_valid',
+  'pack_profile_version_id IS NOT NULL',
+  'self_package_line_key',
+  'profile.package_level = \'case\'',
+  'NEW.quantity <> 1',
+  'Shopify checkout self-package receipt evidence is incomplete',
+], 'Self-package checkout receipt hardening')
 
 const configSchema = section(
   migration,
@@ -522,6 +534,24 @@ const packageOne = {
   ],
   packageSnapshot: { planningMethod: 'approved_recipe' },
 }
+const selfPackage = {
+  packageKey: 'sealed-case-1',
+  packageSequence: 1,
+  planningMethod: 'self_package',
+  packProfileVersionGlobalId: 'gppv0000001',
+  packProfileVersionRowVersion: 3,
+  selfPackageLineKey: 'line-a',
+  ratedOuterDimensionsMm: { length: 279, width: 229, height: 178 },
+  contentWeightGrams: 2268,
+  tareWeightGrams: 0,
+  allocations: [{ lineKey: 'line-a', quantity: 1 }],
+  packageSnapshot: { planningMethod: 'self_package' },
+}
+assert.notEqual(
+  shopifyCheckoutPackagePlanHash({ packages: [packageOne] }),
+  shopifyCheckoutPackagePlanHash({ packages: [selfPackage] }),
+  'Package-plan hashing must retain the self-package planning method and profile',
+)
 assert.equal(
   shopifyCheckoutPackagePlanHash({ packages: [packageOne] }),
   shopifyCheckoutPackagePlanHash({

@@ -26,9 +26,10 @@ import {
 import {
   auditShopifyScopeUpdatePayload,
   auditShopifyScopeRequirements,
+  hasEffectiveShopifyScope,
   SHOPIFY_ADMIN_API_VERSION,
   SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS,
-  SHOPIFY_RECEIPT_PROOF_SCOPES,
+  SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
 } from '@/lib/integrations/commerceCapabilities'
 import {
   normalizeShopifyShopDomain,
@@ -671,7 +672,7 @@ export async function connectShopifyCommerce(input: {
       accessToken: grant.accessToken,
     })
     const scopeAudit = auditShopifyScopeRequirements(
-      SHOPIFY_RECEIPT_PROOF_SCOPES,
+      SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
       probe.grantedScopes,
     )
     const credential: ShopifyCommerceCredential = {
@@ -693,7 +694,7 @@ export async function connectShopifyCommerce(input: {
       tokenAcquisition: 'client_credentials',
       accessTokenLifetimeSeconds: grant.expiresIn,
       accessTokenPersisted: false,
-      scopeProfile: 'receipt_evidence_v1',
+      scopeProfile: 'distributed_operations_v1',
       requestedScopes: scopeAudit.requestedScopes,
       missingScopes: scopeAudit.missingScopes,
       restrictedScopes: scopeAudit.restrictedScopes,
@@ -977,9 +978,10 @@ export async function importShopifyOrderPreview(input: {
         'SHOPIFY_STORE_IDENTITY_CHANGED',
       )
     }
-    const probeScopes = new Set(probe.grantedScopes)
-    const tokenScopes = new Set(grant.grantedScopes)
-    if (!probeScopes.has('read_orders') || !tokenScopes.has('read_orders')) {
+    if (
+      !hasEffectiveShopifyScope(probe.grantedScopes, 'read_orders')
+      || !hasEffectiveShopifyScope(grant.grantedScopes, 'read_orders')
+    ) {
       throw new CommerceIntegrationRequestError(
         'The installed Shopify app has not granted read_orders',
         409,
@@ -1110,7 +1112,7 @@ async function verifyStoredConnection(
       )
     }
     const scopeAudit = auditShopifyScopeRequirements(
-      SHOPIFY_RECEIPT_PROOF_SCOPES,
+      SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
       probe.grantedScopes,
     )
     return {
@@ -1125,7 +1127,7 @@ async function verifyStoredConnection(
         tokenAcquisition: 'client_credentials',
         accessTokenLifetimeSeconds: grant.expiresIn,
         accessTokenPersisted: false,
-        scopeProfile: 'receipt_evidence_v1',
+        scopeProfile: 'distributed_operations_v1',
         requestedScopes: scopeAudit.requestedScopes,
         missingScopes: scopeAudit.missingScopes,
         restrictedScopes: scopeAudit.restrictedScopes,
@@ -1301,7 +1303,7 @@ export async function setCommerceIntegrationEnabled(input: {
         : []
       if (missingScopes.length) {
         throw new CommerceIntegrationRequestError(
-          `Shopify app is missing the receipt-proof scopes: ${missingScopes.join(', ')}`,
+          `Shopify app is missing Distributed Operations scopes: ${missingScopes.join(', ')}`,
           409,
           'SHOPIFY_SCOPE_PROFILE_INCOMPLETE',
         )

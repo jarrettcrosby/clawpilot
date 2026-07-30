@@ -150,6 +150,55 @@ assert.deepEqual(JSON.parse(JSON.stringify({
 })
 assert.equal(ready.plan.recipePackages[0].lineAllocations[0].quantity, 12)
 
+const sealedCase = input()
+sealedCase.lines[0] = {
+  ...sealedCase.lines[0],
+  quantity: 2,
+  unitWeightGrams: 2268,
+  profile: {
+    ...sealedCase.lines[0].profile,
+    packageLevel: 'case',
+    baseEachQuantity: 12,
+    shipsAsOwnPackage: true,
+    outerDimensionsMm: {
+      length: 279,
+      width: 229,
+      height: 178,
+    },
+    grossWeightGrams: 2268,
+  },
+}
+sealedCase.recipes = []
+sealedCase.materials = []
+const oneSealedCase = structuredClone(sealedCase)
+oneSealedCase.lines[0].quantity = 1
+const oneSealedCaseReady =
+  checkout.planShopifyCheckoutPackages(oneSealedCase)
+assert.equal(oneSealedCaseReady.plan.selfPackages.length, 1)
+assert.equal(oneSealedCaseReady.parcels.length, 1)
+const sealedCaseReady = checkout.planShopifyCheckoutPackages(sealedCase)
+assert.equal(sealedCaseReady.plan.recipePackages.length, 0)
+assert.equal(sealedCaseReady.plan.selfPackages.length, 2)
+assert.equal(sealedCaseReady.parcels.length, 2)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(sealedCaseReady.plan.selfPackages.map(
+    (item) => item.lineAllocations[0].quantity,
+  ))),
+  [1, 1],
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    sealedCaseReady.parcels.map((item) => item.description),
+  )),
+  ['ClawPilot sealed case 1', 'ClawPilot sealed case 2'],
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    sealedCaseReady.parcels.map((item) => item.grossPounds),
+  )),
+  [5.1, 5.1],
+)
+
 const fallback = input()
 fallback.lines[0].profile.fitModel = 'rigid_3d'
 fallback.recipes = []

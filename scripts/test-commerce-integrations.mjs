@@ -177,7 +177,9 @@ includes(persistence, [
   'commerce_credential_generation = $3',
   'credential.credential_version = $3',
   'credential.credential_version =\n                 account.commerce_credential_generation',
-  "account.configuration->>'scopeProfile' =",
+  "account.configuration->>'scopeProfile' IN (",
+  "'receipt_evidence_v1',",
+  "'distributed_operations_v1'",
   "account.configuration->'missingScopes' = '[]'::jsonb",
   'FOR UPDATE OF account, credential',
   "effectiveStatus === 'active' ? 'queued' : 'held'",
@@ -193,6 +195,26 @@ includes(persistence, [
   'AND state_hash = $4',
   'AND expires_at > now()',
 ], 'Commerce persistence')
+const commerceEnablePersistence = persistence.slice(
+  persistence.indexOf(
+    'export async function setCommerceIntegrationEnabledInPostgres',
+  ),
+  persistence.indexOf(
+    'export async function disconnectCommerceCredentialInPostgres',
+  ),
+)
+includes(commerceEnablePersistence, [
+  "credential.webhook_verification_status = 'verified'",
+  "account.configuration->>'scopeProfile' IN (",
+  "'receipt_evidence_v1',",
+  "'distributed_operations_v1'",
+  "account.configuration->'missingScopes' = '[]'::jsonb",
+], 'Shopify integration enable readiness')
+assert.doesNotMatch(
+  commerceEnablePersistence,
+  /scopeProfile' =\s*'receipt_evidence_v1'/,
+  'Shopify enablement must not reject the distributed Operations scope profile',
+)
 assert.ok(
   !/console\.(?:log|error|warn)/.test(persistence),
   'Commerce persistence must not log credentials or payloads',
@@ -272,10 +294,10 @@ includes(service, [
   "'faire_brand_token'",
   "'shopify_client_credentials'",
   'await requestShopifyAccessToken',
-  'SHOPIFY_RECEIPT_PROOF_SCOPES',
+  'SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES',
   'auditShopifyScopeRequirements',
   'auditShopifyScopeUpdatePayload',
-  "scopeProfile: 'receipt_evidence_v1'",
+  "scopeProfile: 'distributed_operations_v1'",
   'SHOPIFY_SCOPE_PROFILE_INCOMPLETE',
   "runtime.status === 'error'",
   'verifyShopifyWebhookHmac',
@@ -562,7 +584,7 @@ includes(panel, [
   'Revoke or remove provider-side access separately',
   'Optional signed receipt setup',
   'Copy URL',
-  'Least-privilege receipt profile',
+  'Distributed Operations scope profile',
   "action: 'set-receipt-intake'",
   'Queue signed receipts',
   'Hold signed receipts',
@@ -643,6 +665,23 @@ assert.deepEqual(
   JSON.parse(JSON.stringify(capabilities.SHOPIFY_RECEIPT_PROOF_SCOPES)),
   ['read_products', 'read_inventory'],
 )
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    capabilities.SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
+  )),
+  [
+    'read_all_orders',
+    'read_customers',
+    'write_inventory',
+    'read_locations',
+    'read_markets',
+    'write_merchant_managed_fulfillment_orders',
+    'read_orders',
+    'write_products',
+    'write_publications',
+    'write_shipping',
+  ],
+)
 assert.equal(
   capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING.shopify.developerPortalUrl,
   'https://dev.shopify.com/dashboard',
@@ -708,18 +747,49 @@ assert.deepEqual(
   },
   'Shopify write scopes must satisfy their paired read requirements',
 )
+assert.equal(
+  capabilities.hasEffectiveShopifyScope(
+    ['write_products'],
+    'read_products',
+  ),
+  true,
+  'Shopify capability checks must honor write scope implied read access',
+)
 assert.deepEqual(
   JSON.parse(JSON.stringify(capabilities.auditShopifyScopeUpdatePayload({
-    current: ['write_products'],
-    previous: ['write_products', 'write_inventory'],
+    current: capabilities.SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES.filter(
+      (scope) => scope !== 'write_inventory',
+    ),
+    previous: capabilities.SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
   }))),
   {
-    requestedScopes: ['read_inventory', 'read_products'],
-    grantedScopes: ['write_products'],
-    missingScopes: ['read_inventory'],
-    restrictedScopes: [],
+    requestedScopes: [
+      'read_all_orders',
+      'read_customers',
+      'read_locations',
+      'read_markets',
+      'read_orders',
+      'write_inventory',
+      'write_merchant_managed_fulfillment_orders',
+      'write_products',
+      'write_publications',
+      'write_shipping',
+    ],
+    grantedScopes: [
+      'read_all_orders',
+      'read_customers',
+      'read_locations',
+      'read_markets',
+      'read_orders',
+      'write_merchant_managed_fulfillment_orders',
+      'write_products',
+      'write_publications',
+      'write_shipping',
+    ],
+    missingScopes: ['write_inventory'],
+    restrictedScopes: ['read_all_orders'],
   },
-  'Shopify scope-update events must expose a fail-closed receipt-profile audit',
+  'Shopify scope-update events must expose a fail-closed Operations-profile audit',
 )
 assert.throws(
   () => capabilities.auditShopifyScopeUpdatePayload({
@@ -1901,8 +1971,8 @@ includes(previewServiceSource, [
   "runtime.provider !== 'shopify'",
   "runtime.environment !== 'sandbox'",
   "runtime.verificationStatus !== 'verified'",
-  "probeScopes.has('read_orders')",
-  "tokenScopes.has('read_orders')",
+  "hasEffectiveShopifyScope(probe.grantedScopes, 'read_orders')",
+  "hasEffectiveShopifyScope(grant.grantedScopes, 'read_orders')",
   'await fetchShopifyOrderPreview',
   'testOrdersIncluded: false',
   'includeTestOrders: false',

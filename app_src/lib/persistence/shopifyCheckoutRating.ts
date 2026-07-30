@@ -219,14 +219,9 @@ export type NormalizedShopifyCheckoutReceiptClaimInput =
     lines: NormalizedShopifyCheckoutReceiptLine[]
   }
 
-export type ShopifyCheckoutPackageInput = {
+type ShopifyCheckoutPackageInputBase = {
   packageKey: string
   packageSequence: number
-  materialGlobalId: string
-  materialRowVersion: number
-  materialStockGlobalId: string
-  materialStockRowVersion: number
-  materialStockOnHandQuantity: number
   ratedOuterDimensionsMm: {
     length: number
     width: number
@@ -240,6 +235,30 @@ export type ShopifyCheckoutPackageInput = {
   }>
   packageSnapshot: Record<string, unknown>
 }
+
+export type ShopifyCheckoutPackageInput =
+  | ShopifyCheckoutPackageInputBase & {
+      planningMethod?: 'approved_recipe'
+      materialGlobalId: string
+      materialRowVersion: number
+      materialStockGlobalId: string
+      materialStockRowVersion: number
+      materialStockOnHandQuantity: number
+      packProfileVersionGlobalId?: never
+      packProfileVersionRowVersion?: never
+      selfPackageLineKey?: never
+    }
+  | ShopifyCheckoutPackageInputBase & {
+      planningMethod: 'self_package'
+      materialGlobalId?: never
+      materialRowVersion?: never
+      materialStockGlobalId?: never
+      materialStockRowVersion?: never
+      materialStockOnHandQuantity?: never
+      packProfileVersionGlobalId: string
+      packProfileVersionRowVersion: number
+      selfPackageLineKey: string
+    }
 
 export type ShopifyCheckoutOfferInput = {
   provider: ShopifyCheckoutCarrierProvider
@@ -279,14 +298,9 @@ export type ShopifyCheckoutRateReceiptLine = {
   lineSnapshot: Record<string, unknown>
 }
 
-export type ShopifyCheckoutRateReceiptPackage = {
+type ShopifyCheckoutRateReceiptPackageBase = {
   packageKey: string
   packageSequence: number
-  materialGlobalId: string
-  materialRowVersion: number
-  materialStockGlobalId: string
-  materialStockRowVersion: number
-  materialStockOnHandQuantity: number
   ratedOuterDimensionsMm: {
     length: number
     width: number
@@ -304,6 +318,30 @@ export type ShopifyCheckoutRateReceiptPackage = {
     allocationHash: string
   }>
 }
+
+export type ShopifyCheckoutRateReceiptPackage =
+  | ShopifyCheckoutRateReceiptPackageBase & {
+      planningMethod: 'approved_recipe'
+      materialGlobalId: string
+      materialRowVersion: number
+      materialStockGlobalId: string
+      materialStockRowVersion: number
+      materialStockOnHandQuantity: number
+      packProfileVersionGlobalId: null
+      packProfileVersionRowVersion: null
+      selfPackageLineKey: null
+    }
+  | ShopifyCheckoutRateReceiptPackageBase & {
+      planningMethod: 'self_package'
+      materialGlobalId: null
+      materialRowVersion: null
+      materialStockGlobalId: null
+      materialStockRowVersion: null
+      materialStockOnHandQuantity: null
+      packProfileVersionGlobalId: string
+      packProfileVersionRowVersion: number
+      selfPackageLineKey: string
+    }
 
 export type ShopifyCheckoutRateReceiptOffer = {
   provider: ShopifyCheckoutCarrierProvider
@@ -563,6 +601,7 @@ const RECEIPT_GLOBAL_ID = /^gsqr[0-9]{7}$/
 const WAREHOUSE_GLOBAL_ID = /^gwh[0-9]{7}$/
 const MATERIAL_GLOBAL_ID = /^gmat[0-9]{7}$/
 const PACKAGING_STOCK_GLOBAL_ID = /^gmas[0-9]{7}$/
+const PACK_PROFILE_VERSION_GLOBAL_ID = /^gppv[0-9]{7}$/
 const CARRIER_ACCOUNT_GLOBAL_ID = /^gac[0-9]{7}$/
 const RATE_EVIDENCE_GLOBAL_ID = /^grq[0-9]{7}$/
 const ORDER_CANDIDATE_GLOBAL_ID = /^gcoc[0-9]{7}$/
@@ -1201,17 +1240,45 @@ export function normalizeShopifyCheckoutReceiptClaimInput(
 }
 
 export function shopifyCheckoutPackagePlanHash(input: {
-  packages: ShopifyCheckoutPackageInput[]
+  packages: Array<{
+    packageKey: string
+    packageSequence: number
+    planningMethod?: 'approved_recipe' | 'self_package'
+    materialGlobalId?: string | null
+    materialRowVersion?: number | null
+    materialStockGlobalId?: string | null
+    materialStockRowVersion?: number | null
+    materialStockOnHandQuantity?: number | null
+    packProfileVersionGlobalId?: string | null
+    packProfileVersionRowVersion?: number | null
+    selfPackageLineKey?: string | null
+    ratedOuterDimensionsMm: {
+      length: number
+      width: number
+      height: number
+    }
+    contentWeightGrams: number
+    tareWeightGrams: number
+    allocations: Array<{ lineKey: string; quantity: number }>
+    packageSnapshot: Record<string, unknown>
+  }>
 }) {
   const normalized = input.packages
     .map((item) => ({
       packageKey: item.packageKey,
       packageSequence: item.packageSequence,
-      materialGlobalId: item.materialGlobalId,
-      materialRowVersion: item.materialRowVersion,
-      materialStockGlobalId: item.materialStockGlobalId,
-      materialStockRowVersion: item.materialStockRowVersion,
-      materialStockOnHandQuantity: item.materialStockOnHandQuantity,
+      planningMethod: item.planningMethod ?? 'approved_recipe',
+      materialGlobalId: item.materialGlobalId ?? null,
+      materialRowVersion: item.materialRowVersion ?? null,
+      materialStockGlobalId: item.materialStockGlobalId ?? null,
+      materialStockRowVersion: item.materialStockRowVersion ?? null,
+      materialStockOnHandQuantity:
+        item.materialStockOnHandQuantity ?? null,
+      packProfileVersionGlobalId:
+        item.packProfileVersionGlobalId ?? null,
+      packProfileVersionRowVersion:
+        item.packProfileVersionRowVersion ?? null,
+      selfPackageLineKey: item.selfPackageLineKey ?? null,
       ratedOuterDimensionsMm: item.ratedOuterDimensionsMm,
       contentWeightGrams: item.contentWeightGrams,
       tareWeightGrams: item.tareWeightGrams,
@@ -2249,11 +2316,15 @@ async function readReceiptChildren(
       run<QueryResultRow & {
         package_key: string
         package_sequence: number
-        material_global_id: string
-        packaging_material_row_version: string | number
-        material_stock_global_id: string
-        packaging_material_stock_row_version: string | number
-        packaging_material_stock_on_hand_quantity: number
+        planning_method: 'approved_recipe' | 'self_package'
+        material_global_id: string | null
+        packaging_material_row_version: string | number | null
+        material_stock_global_id: string | null
+        packaging_material_stock_row_version: string | number | null
+        packaging_material_stock_on_hand_quantity: number | null
+        pack_profile_version_global_id: string | null
+        pack_profile_version_row_version: string | number | null
+        self_package_line_key: string | null
         rated_outer_length_mm: number
         rated_outer_width_mm: number
         rated_outer_height_mm: number
@@ -2267,11 +2338,15 @@ async function readReceiptChildren(
         `SELECT
            package.package_key,
            package.package_sequence,
+           package.planning_method,
            material.global_id AS material_global_id,
            package.packaging_material_row_version::text,
            stock.global_id AS material_stock_global_id,
            package.packaging_material_stock_row_version::text,
            package.packaging_material_stock_on_hand_quantity,
+           profile_version.global_id AS pack_profile_version_global_id,
+           package.pack_profile_version_row_version::text,
+           package.self_package_line_key,
            package.rated_outer_length_mm,
            package.rated_outer_width_mm,
            package.rated_outer_height_mm,
@@ -2282,12 +2357,15 @@ async function readReceiptChildren(
            package.package_hash,
            package.package_snapshot
          FROM operations_shopify_checkout_rate_receipt_packages package
-         JOIN operations_packaging_materials material
+         LEFT JOIN operations_packaging_materials material
            ON material.organization_id = package.organization_id
           AND material.id = package.packaging_material_id
-         JOIN operations_packaging_material_stock stock
+         LEFT JOIN operations_packaging_material_stock stock
            ON stock.organization_id = package.organization_id
           AND stock.id = package.packaging_material_stock_id
+         LEFT JOIN operations_product_pack_profile_versions profile_version
+           ON profile_version.organization_id = package.organization_id
+          AND profile_version.id = package.pack_profile_version_id
          WHERE package.organization_id = $1::uuid
            AND package.receipt_id = $2::uuid
          ORDER BY package.package_sequence, package.package_key`,
@@ -2381,17 +2459,10 @@ async function readReceiptChildren(
       lineHash: row.line_hash,
       lineSnapshot: row.line_snapshot,
     })),
-    packages: packageResult.rows.map(
-      (row): ShopifyCheckoutRateReceiptPackage => ({
+    packages: packageResult.rows.map((row): ShopifyCheckoutRateReceiptPackage => {
+      const common = {
         packageKey: row.package_key,
         packageSequence: row.package_sequence,
-        materialGlobalId: row.material_global_id,
-        materialRowVersion: Number(row.packaging_material_row_version),
-        materialStockGlobalId: row.material_stock_global_id,
-        materialStockRowVersion:
-          Number(row.packaging_material_stock_row_version),
-        materialStockOnHandQuantity:
-          row.packaging_material_stock_on_hand_quantity,
         ratedOuterDimensionsMm: {
           length: row.rated_outer_length_mm,
           width: row.rated_outer_width_mm,
@@ -2404,8 +2475,54 @@ async function readReceiptChildren(
         packageHash: row.package_hash,
         packageSnapshot: row.package_snapshot,
         allocations: allocations.get(row.package_key) || [],
-      }),
-    ),
+      }
+      if (row.planning_method === 'self_package') {
+        if (
+          !row.pack_profile_version_global_id
+          || row.pack_profile_version_row_version === null
+          || !row.self_package_line_key
+        ) {
+          throw new Error('Stored self-package evidence is incomplete')
+        }
+        return {
+          ...common,
+          planningMethod: 'self_package',
+          materialGlobalId: null,
+          materialRowVersion: null,
+          materialStockGlobalId: null,
+          materialStockRowVersion: null,
+          materialStockOnHandQuantity: null,
+          packProfileVersionGlobalId:
+            row.pack_profile_version_global_id,
+          packProfileVersionRowVersion:
+            Number(row.pack_profile_version_row_version),
+          selfPackageLineKey: row.self_package_line_key,
+        }
+      }
+      if (
+        !row.material_global_id
+        || row.packaging_material_row_version === null
+        || !row.material_stock_global_id
+        || row.packaging_material_stock_row_version === null
+        || row.packaging_material_stock_on_hand_quantity === null
+      ) {
+        throw new Error('Stored approved-recipe package evidence is incomplete')
+      }
+      return {
+        ...common,
+        planningMethod: 'approved_recipe',
+        materialGlobalId: row.material_global_id,
+        materialRowVersion: Number(row.packaging_material_row_version),
+        materialStockGlobalId: row.material_stock_global_id,
+        materialStockRowVersion:
+          Number(row.packaging_material_stock_row_version),
+        materialStockOnHandQuantity:
+          row.packaging_material_stock_on_hand_quantity,
+        packProfileVersionGlobalId: null,
+        packProfileVersionRowVersion: null,
+        selfPackageLineKey: null,
+      }
+    }),
     offers: offerResult.rows.map(
       (row): ShopifyCheckoutRateReceiptOffer => ({
         provider: row.carrier_provider,
@@ -2993,37 +3110,10 @@ function normalizeCompletion(
       item.packageSnapshot,
       `Package ${packageKey} snapshot`,
     )
-    const normalized = {
+    const planningMethod = item.planningMethod ?? 'approved_recipe'
+    const common = {
       packageKey,
       packageSequence,
-      materialGlobalId: matchValue(
-        item.materialGlobalId,
-        MATERIAL_GLOBAL_ID,
-        'Packaging material Global ID',
-      ),
-      materialRowVersion: integer(
-        item.materialRowVersion,
-        'Packaging material row version',
-        0,
-        Number.MAX_SAFE_INTEGER,
-      ),
-      materialStockGlobalId: matchValue(
-        item.materialStockGlobalId,
-        PACKAGING_STOCK_GLOBAL_ID,
-        'Packaging material stock Global ID',
-      ),
-      materialStockRowVersion: integer(
-        item.materialStockRowVersion,
-        'Packaging material stock row version',
-        0,
-        Number.MAX_SAFE_INTEGER,
-      ),
-      materialStockOnHandQuantity: integer(
-        item.materialStockOnHandQuantity,
-        'Packaging material stock on-hand quantity',
-        1,
-        Number.MAX_SAFE_INTEGER,
-      ),
       ratedOuterDimensionsMm: {
         length: integer(
           item.ratedOuterDimensionsMm?.length,
@@ -3053,11 +3143,86 @@ function normalizeCompletion(
       tareWeightGrams: integer(
         item.tareWeightGrams,
         'Tare weight',
-        1,
+        0,
         1000000,
       ),
       allocations,
       packageSnapshot: item.packageSnapshot,
+    }
+    const normalized = planningMethod === 'self_package'
+      ? {
+          ...common,
+          planningMethod,
+          materialGlobalId: null,
+          materialRowVersion: null,
+          materialStockGlobalId: null,
+          materialStockRowVersion: null,
+          materialStockOnHandQuantity: null,
+          packProfileVersionGlobalId: matchValue(
+            item.packProfileVersionGlobalId,
+            PACK_PROFILE_VERSION_GLOBAL_ID,
+            'Pack profile version Global ID',
+          ),
+          packProfileVersionRowVersion: integer(
+            item.packProfileVersionRowVersion,
+            'Pack profile version row version',
+            0,
+            Number.MAX_SAFE_INTEGER,
+          ),
+          selfPackageLineKey: textValue(
+            item.selfPackageLineKey,
+            'Self-package line key',
+            120,
+          ),
+        }
+      : {
+          ...common,
+          planningMethod: 'approved_recipe' as const,
+          materialGlobalId: matchValue(
+            item.materialGlobalId,
+            MATERIAL_GLOBAL_ID,
+            'Packaging material Global ID',
+          ),
+          materialRowVersion: integer(
+            item.materialRowVersion,
+            'Packaging material row version',
+            0,
+            Number.MAX_SAFE_INTEGER,
+          ),
+          materialStockGlobalId: matchValue(
+            item.materialStockGlobalId,
+            PACKAGING_STOCK_GLOBAL_ID,
+            'Packaging material stock Global ID',
+          ),
+          materialStockRowVersion: integer(
+            item.materialStockRowVersion,
+            'Packaging material stock row version',
+            0,
+            Number.MAX_SAFE_INTEGER,
+          ),
+          materialStockOnHandQuantity: integer(
+            item.materialStockOnHandQuantity,
+            'Packaging material stock on-hand quantity',
+            1,
+            Number.MAX_SAFE_INTEGER,
+          ),
+          packProfileVersionGlobalId: null,
+          packProfileVersionRowVersion: null,
+          selfPackageLineKey: null,
+        }
+    if (
+      planningMethod === 'self_package'
+      && (
+        common.tareWeightGrams !== 0
+        || allocations.length !== 1
+        || allocations[0].lineKey !== normalized.selfPackageLineKey
+        || allocations[0].quantity !== 1
+      )
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_SELF_PACKAGE_SHAPE_INVALID',
+        'Each self-packaged sell unit must be one zero-tare parcel allocated to exactly one line unit',
+      )
     }
     return {
       ...normalized,
@@ -3287,12 +3452,15 @@ export async function completeShopifyCheckoutRateReceiptInPostgres(
       )
     }
     await client.query(
-      `INSERT INTO operations_shopify_checkout_rate_receipt_packages (
+       `INSERT INTO operations_shopify_checkout_rate_receipt_packages (
          organization_id, receipt_id, package_key, package_sequence,
+         planning_method,
          packaging_material_id, packaging_material_row_version,
          packaging_material_stock_id,
          packaging_material_stock_row_version,
          packaging_material_stock_on_hand_quantity,
+         pack_profile_version_id, pack_profile_version_row_version,
+         self_package_line_key,
          rated_outer_length_mm, rated_outer_width_mm,
          rated_outer_height_mm, content_weight_grams, tare_weight_grams,
          gross_weight_grams, allocation_count, package_hash,
@@ -3303,11 +3471,15 @@ export async function completeShopifyCheckoutRateReceiptInPostgres(
          $2::uuid,
          package.package_key,
          package.package_sequence,
+         package.planning_method,
          material.id,
          package.material_row_version,
          stock.id,
          package.material_stock_row_version,
          package.material_stock_on_hand_quantity,
+         profile_version.id,
+         package.pack_profile_version_row_version,
+         package.self_package_line_key,
          package.rated_outer_length_mm,
          package.rated_outer_width_mm,
          package.rated_outer_height_mm,
@@ -3320,11 +3492,15 @@ export async function completeShopifyCheckoutRateReceiptInPostgres(
        FROM jsonb_to_recordset($3::jsonb) AS package(
          package_key text,
          package_sequence integer,
+         planning_method text,
          material_global_id text,
          material_row_version bigint,
          material_stock_global_id text,
          material_stock_row_version bigint,
          material_stock_on_hand_quantity integer,
+         pack_profile_version_global_id text,
+         pack_profile_version_row_version bigint,
+         self_package_line_key text,
          rated_outer_length_mm integer,
          rated_outer_width_mm integer,
          rated_outer_height_mm integer,
@@ -3334,29 +3510,42 @@ export async function completeShopifyCheckoutRateReceiptInPostgres(
          package_hash text,
          package_snapshot jsonb
        )
-       JOIN operations_packaging_materials material
+       LEFT JOIN operations_packaging_materials material
          ON material.organization_id = $1::uuid
         AND material.global_id = package.material_global_id
+        AND package.planning_method = 'approved_recipe'
        JOIN operations_shopify_checkout_rate_receipts receipt
          ON receipt.organization_id = $1::uuid
         AND receipt.id = $2::uuid
-       JOIN operations_packaging_material_stock stock
+       LEFT JOIN operations_packaging_material_stock stock
          ON stock.organization_id = $1::uuid
         AND stock.global_id = package.material_stock_global_id
         AND stock.packaging_material_id = material.id
-        AND stock.warehouse_id = receipt.warehouse_id`,
+        AND stock.warehouse_id = receipt.warehouse_id
+        AND package.planning_method = 'approved_recipe'
+       LEFT JOIN operations_product_pack_profile_versions profile_version
+         ON profile_version.organization_id = $1::uuid
+        AND profile_version.global_id =
+              package.pack_profile_version_global_id
+        AND package.planning_method = 'self_package'`,
       [
         input.organizationId,
         locked.rows[0].id,
         JSON.stringify(input.packages.map((item) => ({
           package_key: item.packageKey,
           package_sequence: item.packageSequence,
+          planning_method: item.planningMethod,
           material_global_id: item.materialGlobalId,
           material_row_version: item.materialRowVersion,
           material_stock_global_id: item.materialStockGlobalId,
           material_stock_row_version: item.materialStockRowVersion,
           material_stock_on_hand_quantity:
             item.materialStockOnHandQuantity,
+          pack_profile_version_global_id:
+            item.packProfileVersionGlobalId,
+          pack_profile_version_row_version:
+            item.packProfileVersionRowVersion,
+          self_package_line_key: item.selfPackageLineKey,
           rated_outer_length_mm: item.ratedOuterDimensionsMm.length,
           rated_outer_width_mm: item.ratedOuterDimensionsMm.width,
           rated_outer_height_mm: item.ratedOuterDimensionsMm.height,
