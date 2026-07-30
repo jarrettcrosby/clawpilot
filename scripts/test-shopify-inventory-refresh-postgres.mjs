@@ -15,9 +15,12 @@ const TRUSTED_PROJECT_ID = 'b5169ebd-8166-4b96-9a81-7cc8adaa9270'
 const TRUSTED_ENVIRONMENT_ID = 'e4abd95f-825c-4242-b37b-825a92597e98'
 const TRUSTED_DATABASE_FINGERPRINT =
   '750aa268-0e31-4065-a99c-4016e4d4fab1'
-const TARGET_MIGRATIONS = [
+const PREREQUISITE_MIGRATIONS = [
   '0169_operations_shopify_inventory_refresh_queue.sql',
   '0171_shopify_active_account_readiness.sql',
+]
+const TARGET_MIGRATIONS = [
+  '0172_operations_commerce_inventory_attempt_lease_renewal.sql',
 ]
 const ZERO_EFFECT_SUMMARY = {
   resource: 'inventory',
@@ -141,6 +144,27 @@ async function durableState(client) {
          FROM operations_commerce_provider_attempts attempt
        ) AS provider_attempts,
        (
+         SELECT COALESCE(
+           jsonb_agg(to_jsonb(job) ORDER BY job.id)::text,
+           '[]'
+         )
+         FROM operations_shopify_inventory_refresh_jobs job
+       ) AS inventory_refresh_jobs,
+       (
+         SELECT count(*)::text
+         FROM operations_commerce_inventory_captures
+       ) AS inventory_capture_count,
+       (
+         SELECT md5(COALESCE(string_agg(
+           capture.id::text || ':' ||
+           capture.provider_attempt_id::text || ':' ||
+           capture.request_hash || ':' ||
+           capture.snapshot_hash,
+           ',' ORDER BY capture.id
+         ), ''))
+         FROM operations_commerce_inventory_captures capture
+       ) AS inventory_capture_hash,
+       (
          SELECT md5(COALESCE(string_agg(
            account.id::text || ':' || account.status,
            ',' ORDER BY account.id
@@ -150,7 +174,21 @@ async function durableState(client) {
        pg_get_functiondef(
          'operations_shopify_carrier_service_config_is_ready(uuid,uuid)'
            ::regprocedure
-       ) AS readiness_function`,
+       ) AS readiness_function,
+       pg_get_functiondef(
+         'protect_operations_commerce_provider_attempt()'
+           ::regprocedure
+       ) AS provider_attempt_protection_function,
+       (
+         SELECT pg_get_triggerdef(trigger.oid) || ':' ||
+                trigger.tgenabled::text
+         FROM pg_trigger trigger
+         WHERE trigger.tgrelid =
+             'operations_commerce_provider_attempts'::regclass
+           AND trigger.tgname =
+             'protect_operations_commerce_provider_attempt_write'
+           AND trigger.tgisinternal = false
+       ) AS provider_attempt_protection_trigger`,
   )
   return {
     ...result.rows[0],
@@ -294,6 +332,528 @@ async function finalizeProviderAttempt(client, id) {
      WHERE id = $1::uuid`,
     [id, JSON.stringify(ZERO_EFFECT_SUMMARY)],
   )
+}
+
+async function rejectWithinSavepoint(
+  client,
+  savepoint,
+  operation,
+  expected,
+) {
+  assert.match(
+    savepoint,
+    /^[a-z][a-z0-9_]*$/,
+    'acceptance savepoint name must be a safe SQL identifier',
+  )
+  await client.query(`SAVEPOINT ${savepoint}`)
+  try {
+    await assert.rejects(operation(), expected)
+  } finally {
+    await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`)
+    await client.query(`RELEASE SAVEPOINT ${savepoint}`)
+  }
+}
+
+async function latestInventoryCapture(client, fixture) {
+  const result = await client.query(
+    `SELECT capture.id::text
+     FROM operations_commerce_inventory_captures capture
+     WHERE capture.organization_id = $1::uuid
+       AND capture.integration_account_id = $2::uuid
+     ORDER BY capture.created_at DESC, capture.id DESC
+     LIMIT 1`,
+    [fixture.organization_id, fixture.integration_account_id],
+  )
+  if (!result.rows[0]?.id) {
+    fail(
+      'A durable Shopify inventory capture is required for lease acceptance.',
+    )
+  }
+  return result.rows[0].id
+}
+
+async function terminalizePreparedInventoryAttempt(client, fixture) {
+  const result = await client.query(
+    `UPDATE operations_commerce_provider_attempts
+     SET state = 'unknown',
+         redacted_response = $3::jsonb,
+         error_code = 'ROLLBACK_ACCEPTANCE_REPLACED',
+         lease_token = NULL,
+         lease_expires_at = NULL,
+         completed_at = clock_timestamp()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND action = 'inventory.levels.read'
+       AND state = 'prepared'
+     RETURNING id::text`,
+    [
+      fixture.organization_id,
+      fixture.integration_account_id,
+      JSON.stringify(ZERO_EFFECT_SUMMARY),
+    ],
+  )
+  return result.rows.map((row) => row.id)
+}
+
+async function insertLeaseFixture(
+  client,
+  fixture,
+  sourceCaptureId,
+  {
+    suffix,
+    action = 'inventory.levels.read',
+    requestHash = suffix.repeat(64).slice(0, 64),
+    captureRequestHash = requestHash,
+    withCapture = true,
+    withLease = true,
+  },
+) {
+  const attempt = await client.query(
+    `INSERT INTO operations_commerce_provider_attempts (
+       organization_id,
+       integration_account_id,
+       action,
+       adapter_version,
+       idempotency_key,
+       request_hash,
+       redacted_request,
+       lease_token,
+       lease_expires_at
+     )
+     VALUES (
+       $1::uuid,
+       $2::uuid,
+       $3,
+       'shopify-inventory-lease-postgres-acceptance-v1',
+       $4,
+       $5,
+       '{"resource":"inventory","readOnly":true}'::jsonb,
+       CASE WHEN $6::boolean THEN gen_random_uuid() ELSE NULL END,
+       CASE
+         WHEN $6::boolean
+         THEN clock_timestamp() - interval '1 second'
+         ELSE NULL
+       END
+     )
+     RETURNING id::text, lease_token::text, request_hash`,
+    [
+      fixture.organization_id,
+      fixture.integration_account_id,
+      action,
+      `rollback-lease-acceptance:${suffix}`,
+      requestHash,
+      withLease,
+    ],
+  )
+  const row = attempt.rows[0]
+  if (withCapture) {
+    await client.query(
+      `INSERT INTO operations_commerce_inventory_captures (
+         organization_id,
+         integration_account_id,
+         provider_attempt_id,
+         warehouse_id,
+         location_id,
+         provider,
+         adapter_version,
+         credential_version,
+         request_hash,
+         snapshot_hash,
+         provider_location_id,
+         provider_fetched_at,
+         level_count,
+         captured_snapshot,
+         snapshot_bytes,
+         created_by
+       )
+       SELECT
+         source.organization_id,
+         source.integration_account_id,
+         $4::uuid,
+         source.warehouse_id,
+         source.location_id,
+         source.provider,
+         source.adapter_version,
+         source.credential_version,
+         $5,
+         source.snapshot_hash,
+         source.provider_location_id,
+         source.provider_fetched_at,
+         source.level_count,
+         source.captured_snapshot,
+         source.snapshot_bytes,
+         source.created_by
+       FROM operations_commerce_inventory_captures source
+       WHERE source.organization_id = $1::uuid
+         AND source.integration_account_id = $2::uuid
+         AND source.id = $3::uuid`,
+      [
+        fixture.organization_id,
+        fixture.integration_account_id,
+        sourceCaptureId,
+        row.id,
+        captureRequestHash,
+      ],
+    )
+  }
+  return row
+}
+
+async function terminalizeLeaseFixture(client, id) {
+  await client.query(
+    `UPDATE operations_commerce_provider_attempts
+     SET state = 'unknown',
+         redacted_response = $2::jsonb,
+         error_code = 'ROLLBACK_ACCEPTANCE_COMPLETE',
+         lease_token = NULL,
+         lease_expires_at = NULL,
+         completed_at = clock_timestamp()
+     WHERE id = $1::uuid
+       AND state = 'prepared'`,
+    [id, JSON.stringify(ZERO_EFFECT_SUMMARY)],
+  )
+}
+
+async function exerciseProviderAttemptLeaseProtection(
+  client,
+  fixture,
+) {
+  const sourceCaptureId = await latestInventoryCapture(client, fixture)
+  await terminalizePreparedInventoryAttempt(client, fixture)
+
+  const captured = await insertLeaseFixture(
+    client,
+    fixture,
+    sourceCaptureId,
+    { suffix: 'lease', requestHash: 'd'.repeat(64) },
+  )
+  const immutableBefore = await client.query(
+    `SELECT (
+       to_jsonb(attempt)
+         - ARRAY['lease_token', 'lease_expires_at']::text[]
+     )::text AS immutable_attempt,
+     (
+       SELECT md5(to_jsonb(capture)::text)
+       FROM operations_commerce_inventory_captures capture
+       WHERE capture.provider_attempt_id = attempt.id
+     ) AS capture_hash
+     FROM operations_commerce_provider_attempts attempt
+     WHERE attempt.id = $1::uuid`,
+    [captured.id],
+  )
+
+  await rejectWithinSavepoint(
+    client,
+    'expired_same_token',
+    () => client.query(
+      `UPDATE operations_commerce_provider_attempts
+       SET lease_expires_at =
+             clock_timestamp() + interval '15 minutes'
+       WHERE id = $1::uuid`,
+      [captured.id],
+    ),
+    /lease renewal must extend one live bounded lease/,
+  )
+
+  const rotated = await client.query(
+    `UPDATE operations_commerce_provider_attempts
+     SET lease_token = gen_random_uuid(),
+         lease_expires_at =
+           clock_timestamp() + interval '15 minutes'
+     WHERE id = $1::uuid
+       AND lease_token = $2::uuid
+       AND lease_expires_at <= clock_timestamp()
+     RETURNING lease_token::text, lease_expires_at`,
+    [captured.id, captured.lease_token],
+  )
+  assert.equal(rotated.rowCount, 1)
+  const liveToken = rotated.rows[0].lease_token
+
+  const secondRotation = await client.query(
+    `UPDATE operations_commerce_provider_attempts
+     SET lease_token = gen_random_uuid(),
+         lease_expires_at =
+           clock_timestamp() + interval '15 minutes'
+     WHERE id = $1::uuid
+       AND lease_token = $2::uuid
+       AND lease_expires_at <= clock_timestamp()
+     RETURNING id`,
+    [captured.id, captured.lease_token],
+  )
+  assert.equal(
+    secondRotation.rowCount,
+    0,
+    'Only one expired-token rotation may win.',
+  )
+
+  const staleTerminalization = await client.query(
+    `UPDATE operations_commerce_provider_attempts
+     SET state = 'succeeded',
+         redacted_response = $3::jsonb,
+         lease_token = NULL,
+         lease_expires_at = NULL,
+         completed_at = clock_timestamp()
+     WHERE id = $1::uuid
+       AND lease_token = $2::uuid
+     RETURNING id`,
+    [
+      captured.id,
+      captured.lease_token,
+      JSON.stringify(ZERO_EFFECT_SUMMARY),
+    ],
+  )
+  assert.equal(staleTerminalization.rowCount, 0)
+
+  await rejectWithinSavepoint(
+    client,
+    'live_token_rotation',
+    () => client.query(
+      `UPDATE operations_commerce_provider_attempts
+       SET lease_token = gen_random_uuid(),
+           lease_expires_at =
+             clock_timestamp() + interval '15 minutes'
+       WHERE id = $1::uuid`,
+      [captured.id],
+    ),
+    /lease rotation requires one expired captured read/,
+  )
+
+  const renewed = await client.query(
+    `UPDATE operations_commerce_provider_attempts
+     SET lease_expires_at =
+           clock_timestamp() + interval '15 minutes'
+     WHERE id = $1::uuid
+       AND lease_token = $2::uuid
+     RETURNING lease_expires_at`,
+    [captured.id, liveToken],
+  )
+  assert.equal(renewed.rowCount, 1)
+
+  await rejectWithinSavepoint(
+    client,
+    'lease_noop',
+    () => client.query(
+      `UPDATE operations_commerce_provider_attempts
+       SET lease_expires_at = lease_expires_at
+       WHERE id = $1::uuid`,
+      [captured.id],
+    ),
+    /lease renewal must extend one live bounded lease/,
+  )
+  await rejectWithinSavepoint(
+    client,
+    'lease_shortening',
+    () => client.query(
+      `UPDATE operations_commerce_provider_attempts
+       SET lease_expires_at = lease_expires_at - interval '1 second'
+       WHERE id = $1::uuid`,
+      [captured.id],
+    ),
+    /lease renewal must extend one live bounded lease/,
+  )
+  await rejectWithinSavepoint(
+    client,
+    'lease_overlong',
+    () => client.query(
+      `UPDATE operations_commerce_provider_attempts
+       SET lease_expires_at =
+             clock_timestamp() + interval '16 minutes'
+       WHERE id = $1::uuid`,
+      [captured.id],
+    ),
+    /lease renewal must extend one live bounded lease/,
+  )
+  await rejectWithinSavepoint(
+    client,
+    'nonlease_mutation',
+    () => client.query(
+      `UPDATE operations_commerce_provider_attempts
+       SET error_code = 'NOT_ALLOWED'
+       WHERE id = $1::uuid`,
+      [captured.id],
+    ),
+    /permit lease-only maintenance/,
+  )
+  await rejectWithinSavepoint(
+    client,
+    'identity_mutation',
+    () => client.query(
+      `UPDATE operations_commerce_provider_attempts
+       SET id = gen_random_uuid()
+       WHERE id = $1::uuid`,
+      [captured.id],
+    ),
+    /identity and request evidence are immutable/,
+  )
+  await rejectWithinSavepoint(
+    client,
+    'terminal_lease_retained',
+    () => client.query(
+      `UPDATE operations_commerce_provider_attempts
+       SET state = 'succeeded',
+           completed_at = clock_timestamp()
+       WHERE id = $1::uuid`,
+      [captured.id],
+    ),
+    /must finalize exactly once/,
+  )
+
+  const immutableAfter = await client.query(
+    `SELECT (
+       to_jsonb(attempt)
+         - ARRAY['lease_token', 'lease_expires_at']::text[]
+     )::text AS immutable_attempt,
+     (
+       SELECT md5(to_jsonb(capture)::text)
+       FROM operations_commerce_inventory_captures capture
+       WHERE capture.provider_attempt_id = attempt.id
+     ) AS capture_hash
+     FROM operations_commerce_provider_attempts attempt
+     WHERE attempt.id = $1::uuid`,
+    [captured.id],
+  )
+  assert.deepEqual(immutableAfter.rows[0], immutableBefore.rows[0])
+
+  const finalized = await client.query(
+    `UPDATE operations_commerce_provider_attempts
+     SET state = 'succeeded',
+         redacted_response = $3::jsonb,
+         lease_token = NULL,
+         lease_expires_at = NULL,
+         completed_at = clock_timestamp()
+     WHERE id = $1::uuid
+       AND lease_token = $2::uuid
+       AND lease_expires_at > clock_timestamp()
+     RETURNING id`,
+    [
+      captured.id,
+      liveToken,
+      JSON.stringify(ZERO_EFFECT_SUMMARY),
+    ],
+  )
+  assert.equal(finalized.rowCount, 1)
+  await rejectWithinSavepoint(
+    client,
+    'second_terminal_update',
+    () => client.query(
+      `UPDATE operations_commerce_provider_attempts
+       SET provider_reference = 'not-allowed'
+       WHERE id = $1::uuid`,
+      [captured.id],
+    ),
+    /Terminal commerce provider attempts are immutable/,
+  )
+  await rejectWithinSavepoint(
+    client,
+    'terminal_delete',
+    () => client.query(
+      `DELETE FROM operations_commerce_provider_attempts
+       WHERE id = $1::uuid`,
+      [captured.id],
+    ),
+    /immutable and cannot be deleted/,
+  )
+
+  const missingCapture = await insertLeaseFixture(
+    client,
+    fixture,
+    sourceCaptureId,
+    {
+      suffix: 'missing',
+      requestHash: 'e'.repeat(64),
+      withCapture: false,
+    },
+  )
+  await rejectWithinSavepoint(
+    client,
+    'missing_capture',
+    () => client.query(
+      `UPDATE operations_commerce_provider_attempts
+       SET lease_token = gen_random_uuid(),
+           lease_expires_at =
+             clock_timestamp() + interval '15 minutes'
+       WHERE id = $1::uuid`,
+      [missingCapture.id],
+    ),
+    /lease rotation requires one expired captured read/,
+  )
+  await terminalizeLeaseFixture(client, missingCapture.id)
+
+  const mismatchedCapture = await insertLeaseFixture(
+    client,
+    fixture,
+    sourceCaptureId,
+    {
+      suffix: 'mismatch',
+      requestHash: 'a'.repeat(64),
+      captureRequestHash: 'b'.repeat(64),
+    },
+  )
+  await rejectWithinSavepoint(
+    client,
+    'mismatched_capture',
+    () => client.query(
+      `UPDATE operations_commerce_provider_attempts
+       SET lease_token = gen_random_uuid(),
+           lease_expires_at =
+             clock_timestamp() + interval '15 minutes'
+       WHERE id = $1::uuid`,
+      [mismatchedCapture.id],
+    ),
+    /lease rotation requires one expired captured read/,
+  )
+  await terminalizeLeaseFixture(client, mismatchedCapture.id)
+
+  const wrongAction = await insertLeaseFixture(
+    client,
+    fixture,
+    sourceCaptureId,
+    {
+      suffix: 'wrong',
+      action: 'catalog.products.read',
+      requestHash: 'c'.repeat(64),
+      withCapture: false,
+    },
+  )
+  await rejectWithinSavepoint(
+    client,
+    'wrong_action',
+    () => client.query(
+      `UPDATE operations_commerce_provider_attempts
+       SET lease_expires_at =
+             clock_timestamp() + interval '15 minutes'
+       WHERE id = $1::uuid`,
+      [wrongAction.id],
+    ),
+    /permit lease-only maintenance/,
+  )
+  await terminalizeLeaseFixture(client, wrongAction.id)
+
+  const nullLease = await insertLeaseFixture(
+    client,
+    fixture,
+    sourceCaptureId,
+    {
+      suffix: 'null',
+      requestHash: 'f'.repeat(64),
+      withCapture: false,
+      withLease: false,
+    },
+  )
+  await rejectWithinSavepoint(
+    client,
+    'null_lease_acquisition',
+    () => client.query(
+      `UPDATE operations_commerce_provider_attempts
+       SET lease_token = gen_random_uuid(),
+           lease_expires_at =
+             clock_timestamp() + interval '15 minutes'
+       WHERE id = $1::uuid`,
+      [nullLease.id],
+    ),
+    /lease rotation requires one expired captured read/,
+  )
+  await terminalizeLeaseFixture(client, nullLease.id)
 }
 
 async function insertJob(client, fixture, maxAttempts = 2) {
@@ -573,6 +1133,13 @@ async function main() {
       TRUSTED_DATABASE_FINGERPRINT,
       'connected database is not the trusted ClawPilot development database',
     )
+    for (const filename of PREREQUISITE_MIGRATIONS) {
+      assert.equal(
+        await migrationApplied(client, filename),
+        true,
+        `${filename} must already be applied`,
+      )
+    }
     for (const filename of TARGET_MIGRATIONS) {
       assert.equal(
         await migrationApplied(client, filename),
@@ -587,7 +1154,10 @@ async function main() {
     await client.query(`SET LOCAL lock_timeout = '15s'`)
     await client.query(
       `SELECT pg_advisory_xact_lock(
-         hashtext('clawpilot-shopify-inventory-refresh-acceptance')
+         hashtextextended(
+           'clawpilot-shopify-inventory-refresh-acceptance',
+           0
+         )
        )`,
     )
     for (const filename of TARGET_MIGRATIONS) {
@@ -613,6 +1183,10 @@ async function main() {
         filename,
         false,
       ])),
+    )
+    assert.match(
+      appliedState.provider_attempt_protection_function,
+      /Prepared inventory attempts permit lease-only maintenance/,
     )
 
     const indexDefinition = await client.query(
@@ -643,6 +1217,34 @@ async function main() {
     )
 
     fixture = await readyFixture(client)
+    await client.query(
+      `SELECT pg_advisory_xact_lock(
+         hashtextextended($1::text, 0)
+       )`,
+      [
+        [
+          'shopify-inventory-read',
+          fixture.organization_id,
+          fixture.integration_account_id,
+        ].join(':'),
+      ],
+    )
+    await client.query(
+      `UPDATE operations_shopify_inventory_refresh_jobs
+       SET status = 'cancelled',
+           cancel_requested = true,
+           locked_at = NULL,
+           locked_by = NULL,
+           lock_token = NULL,
+           lease_expires_at = NULL,
+           last_error_code = 'ROLLBACK_ACCEPTANCE_REPLACED',
+           completed_at = clock_timestamp(),
+           updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND status IN ('pending', 'processing', 'failed')`,
+      [fixture.organization_id, fixture.integration_account_id],
+    )
 
     await client.query(
       `UPDATE operations_integration_accounts
@@ -691,13 +1293,16 @@ async function main() {
     )
     assert.equal(restoredReady.rows[0]?.ready, true)
 
-    const existingProviderAttempt = await activeProviderAttempt(
+    usedExistingProviderRead = Boolean(await activeProviderAttempt(
       client,
       fixture,
-    )
-    usedExistingProviderRead = Boolean(existingProviderAttempt)
-    const firstProviderAttempt = existingProviderAttempt || (
-      await insertProviderAttempt(client, fixture, 'a')
+    ))
+    await exerciseProviderAttemptLeaseProtection(client, fixture)
+
+    const firstProviderAttempt = await insertProviderAttempt(
+      client,
+      fixture,
+      'a',
     )
     await client.query('SAVEPOINT duplicate_provider_read')
     await assert.rejects(
@@ -705,15 +1310,13 @@ async function main() {
       /idx_operations_shopify_inventory_read_singleflight|duplicate key value/,
     )
     await client.query('ROLLBACK TO SAVEPOINT duplicate_provider_read')
-    if (!existingProviderAttempt) {
-      await finalizeProviderAttempt(client, firstProviderAttempt)
-      const nextProviderAttempt = await insertProviderAttempt(
-        client,
-        fixture,
-        'c',
-      )
-      await finalizeProviderAttempt(client, nextProviderAttempt)
-    }
+    await finalizeProviderAttempt(client, firstProviderAttempt)
+    const nextProviderAttempt = await insertProviderAttempt(
+      client,
+      fixture,
+      'c',
+    )
+    await finalizeProviderAttempt(client, nextProviderAttempt)
 
     const successJobId = await insertJob(client, fixture)
     await client.query('SAVEPOINT duplicate_active_job')
@@ -949,6 +1552,10 @@ async function main() {
     tenantAccountActiveJobUnique: true,
     providerReadSingleFlight: true,
     usedExistingProviderRead,
+    providerAttemptLeaseRenewal: true,
+    expiredCapturedLeaseRotation: true,
+    providerAttemptEvidenceImmutable: true,
+    providerAttemptFinalizesOnce: true,
     leasedClaimExclusive: true,
     expiredLeaseRejected: true,
     staleFenceCancelled: true,

@@ -309,6 +309,7 @@ export async function GET() {
           operations_shopify_inventory_refresh_migration_applied: boolean
           operations_shopify_checkout_plan_rate_policy_applied: boolean
           shopify_active_account_readiness_migration_applied: boolean
+          operations_commerce_inventory_attempt_lease_renewal_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -977,6 +978,12 @@ export async function GET() {
                 WHERE filename =
                   '0171_shopify_active_account_readiness.sql'
               ) AS shopify_active_account_readiness_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0172_operations_commerce_inventory_attempt_lease_renewal.sql'
+              ) AS operations_commerce_inventory_attempt_lease_renewal_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1121,6 +1128,7 @@ export async function GET() {
             && row?.operations_shopify_inventory_refresh_migration_applied
             && row?.operations_shopify_checkout_plan_rate_policy_applied
             && row?.shopify_active_account_readiness_migration_applied
+            && row?.operations_commerce_inventory_attempt_lease_renewal_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1257,6 +1265,7 @@ export async function GET() {
           || !row?.operations_shopify_inventory_refresh_migration_applied
           || !row?.operations_shopify_checkout_plan_rate_policy_applied
           || !row?.shopify_active_account_readiness_migration_applied
+          || !row?.operations_commerce_inventory_attempt_lease_renewal_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -1684,6 +1693,7 @@ export async function GET() {
             commerceIntakeRuntimeAvailable()
             && row?.operations_shopify_inventory_refresh_migration_applied
             && row?.shopify_active_account_readiness_migration_applied
+            && row?.operations_commerce_inventory_attempt_lease_renewal_applied
           ) {
             const inventoryHeartbeat =
               await readShopifyInventoryRefreshWorkerHeartbeatFromPostgres()

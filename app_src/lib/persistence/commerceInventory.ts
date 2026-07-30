@@ -364,26 +364,25 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
       request_hash: string
       lease_token: string | null
       lease_expires_at: Date | null
+      lease_is_live: boolean
     }) => {
-      if (
-        attempt.lease_token
-        && attempt.lease_expires_at
-        && attempt.lease_expires_at.getTime() > Date.now()
-      ) {
+      if (attempt.lease_is_live && attempt.lease_token) {
         return attempt.lease_token
       }
       const reacquired = await client.query<{ lease_token: string }>(
         `UPDATE operations_commerce_provider_attempts attempt
          SET lease_token = gen_random_uuid(),
-             lease_expires_at = now() + interval '15 minutes',
-             error_code = NULL,
-             completed_at = NULL
+             lease_expires_at =
+               clock_timestamp() + interval '15 minutes'
          WHERE attempt.organization_id = $1::uuid
            AND attempt.integration_account_id = $2::uuid
            AND attempt.id = $3::uuid
            AND attempt.action = $4
            AND attempt.request_hash = $5
            AND attempt.state = 'prepared'
+           AND attempt.lease_token IS NOT NULL
+           AND attempt.lease_expires_at IS NOT NULL
+           AND attempt.lease_expires_at <= clock_timestamp()
            AND EXISTS (
              SELECT 1
              FROM operations_commerce_inventory_captures capture
@@ -391,6 +390,7 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
                AND capture.integration_account_id =
                    attempt.integration_account_id
                AND capture.provider_attempt_id = attempt.id
+               AND capture.request_hash = attempt.request_hash
            )
          RETURNING attempt.lease_token::text`,
         [
@@ -419,11 +419,17 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
       state: string
       lease_token: string | null
       lease_expires_at: Date | null
+      lease_is_live: boolean
       captured: boolean
     }>(
       `SELECT attempt.id::text, attempt.global_id, attempt.idempotency_key,
               attempt.attempt_number, attempt.request_hash, attempt.state,
               attempt.lease_token::text, attempt.lease_expires_at,
+              (
+                attempt.lease_token IS NOT NULL
+                AND attempt.lease_expires_at IS NOT NULL
+                AND attempt.lease_expires_at > clock_timestamp()
+              ) AS lease_is_live,
               EXISTS (
                 SELECT 1
                 FROM operations_commerce_inventory_captures capture
@@ -506,17 +512,13 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
           leaseToken,
         }
       }
-      if (
-        latest.lease_token
-        && latest.lease_expires_at
-        && latest.lease_expires_at.getTime() > Date.now()
-      ) {
+      if (latest.lease_is_live) {
         persistenceError(
           'SHOPIFY_INVENTORY_SYNC_IN_PROGRESS',
           'This Shopify inventory sync is already in progress',
         )
       }
-      await client.query(
+      const expired = await client.query(
         `UPDATE operations_commerce_provider_attempts
          SET state = 'unknown',
              redacted_response = $4::jsonb,
@@ -527,7 +529,10 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
          WHERE organization_id = $1::uuid
            AND integration_account_id = $2::uuid
            AND id = $3::uuid
-           AND state = 'prepared'`,
+           AND state = 'prepared'
+           AND lease_token = $5::uuid
+           AND lease_expires_at <= clock_timestamp()
+         RETURNING id`,
         [
           input.runtime.organizationId,
           input.runtime.integrationAccountId,
@@ -537,8 +542,15 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
             providerWrites: 0,
             orderQuantityAdjustment: 0,
           }),
+          latest.lease_token,
         ],
       )
+      if (!expired.rowCount) {
+        persistenceError(
+          'SHOPIFY_INVENTORY_SYNC_IN_PROGRESS',
+          'This Shopify inventory sync is already in progress',
+        )
+      }
     }
     const concurrent = await client.query<{
       id: string
@@ -548,12 +560,18 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
       request_hash: string
       lease_token: string | null
       lease_expires_at: Date | null
+      lease_is_live: boolean
       captured: boolean
     }>(
       `SELECT attempt.id::text, attempt.global_id,
               attempt.idempotency_key, attempt.attempt_number,
               attempt.request_hash, attempt.lease_token::text,
               attempt.lease_expires_at,
+              (
+                attempt.lease_token IS NOT NULL
+                AND attempt.lease_expires_at IS NOT NULL
+                AND attempt.lease_expires_at > clock_timestamp()
+              ) AS lease_is_live,
               EXISTS (
                 SELECT 1
                 FROM operations_commerce_inventory_captures capture
@@ -591,17 +609,13 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
           leaseToken,
         }
       }
-      if (
-        active.lease_token
-        && active.lease_expires_at
-        && active.lease_expires_at.getTime() > Date.now()
-      ) {
+      if (active.lease_is_live) {
         persistenceError(
           'SHOPIFY_INVENTORY_SYNC_IN_PROGRESS',
           'Another Shopify inventory sync is already in progress',
         )
       }
-      await client.query(
+      const expired = await client.query(
         `UPDATE operations_commerce_provider_attempts
          SET state = 'unknown',
              redacted_response = $4::jsonb,
@@ -612,7 +626,10 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
          WHERE organization_id = $1::uuid
            AND integration_account_id = $2::uuid
            AND id = $3::uuid
-           AND state = 'prepared'`,
+           AND state = 'prepared'
+           AND lease_token = $6::uuid
+           AND lease_expires_at <= clock_timestamp()
+         RETURNING id`,
         [
           input.runtime.organizationId,
           input.runtime.integrationAccountId,
@@ -625,8 +642,15 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
           active.captured
             ? 'SHOPIFY_INVENTORY_CAPTURE_FENCE_CHANGED'
             : 'SHOPIFY_INVENTORY_READ_LEASE_EXPIRED',
+          active.lease_token,
         ],
       )
+      if (!expired.rowCount) {
+        persistenceError(
+          'SHOPIFY_INVENTORY_SYNC_IN_PROGRESS',
+          'Another Shopify inventory sync is already in progress',
+        )
+      }
     }
     const attemptNumber = (latest?.attempt_number || 0) + 1
     const inserted = await client.query<{
@@ -813,7 +837,7 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
          AND request_hash = $5
          AND state = 'prepared'
          AND lease_token = $6::uuid
-         AND lease_expires_at > now()
+         AND lease_expires_at > clock_timestamp()
        LIMIT 1
        FOR UPDATE`,
       [
@@ -895,7 +919,7 @@ export async function finalizeShopifyInventoryReadFailureInPostgres(input: {
          AND id = $3::uuid
          AND state = 'prepared'
          AND lease_token = $7::uuid
-         AND lease_expires_at > now()
+         AND lease_expires_at > clock_timestamp()
        RETURNING id`,
       [
         input.runtime.organizationId,
@@ -940,14 +964,15 @@ export async function renewShopifyInventoryReadLeaseInPostgres(input: {
   if (!input.attempt.leaseToken) return false
   const renewed = await query(
     `UPDATE operations_commerce_provider_attempts
-     SET lease_expires_at = now() + interval '15 minutes'
+     SET lease_expires_at =
+           clock_timestamp() + interval '15 minutes'
      WHERE organization_id = $1::uuid
        AND integration_account_id = $2::uuid
        AND id = $3::uuid
        AND action = $4
        AND state = 'prepared'
        AND lease_token = $5::uuid
-       AND lease_expires_at > now()
+       AND lease_expires_at > clock_timestamp()
      RETURNING id`,
     [
       input.runtime.organizationId,
@@ -1102,7 +1127,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
            AND job.status = 'processing'
            AND job.cancel_requested = false
            AND job.lock_token = $12::uuid
-           AND job.lease_expires_at > now()
+           AND job.lease_expires_at > clock_timestamp()
            AND (
              (config.registration_state = 'registered'
                AND activation.state IN ('shadow', 'active'))
@@ -1174,6 +1199,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
       adapter_version: string
       lease_token: string | null
       lease_expires_at: Date | null
+      lease_is_live: boolean
       state: string
     }>(
       `SELECT capture.request_hash, capture.snapshot_hash,
@@ -1181,6 +1207,11 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
               capture.warehouse_id::text, capture.location_id::text,
               capture.credential_version, capture.adapter_version,
               attempt.lease_token::text, attempt.lease_expires_at,
+              (
+                attempt.lease_token IS NOT NULL
+                AND attempt.lease_expires_at IS NOT NULL
+                AND attempt.lease_expires_at > clock_timestamp()
+              ) AS lease_is_live,
               attempt.state
        FROM operations_commerce_inventory_captures capture
        JOIN operations_commerce_provider_attempts attempt
@@ -1216,8 +1247,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
       || captured.adapter_version !== SHOPIFY_INVENTORY_ADAPTER_VERSION
       || !input.attempt.leaseToken
       || captured.lease_token !== input.attempt.leaseToken
-      || !captured.lease_expires_at
-      || captured.lease_expires_at.getTime() <= Date.now()
+      || !captured.lease_is_live
     ) {
       persistenceError(
         'SHOPIFY_INVENTORY_CAPTURE_STALE',
@@ -1665,7 +1695,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
          AND id = $3::uuid
          AND state = 'prepared'
          AND lease_token = $6::uuid
-         AND lease_expires_at > now()
+         AND lease_expires_at > clock_timestamp()
        RETURNING id`,
       [
         input.runtime.organizationId,

@@ -80,6 +80,21 @@ includes(activeReadinessMigration, [
   'operations_shopify_carrier_service_config_is_ready',
   "account.status = 'active'",
 ], 'Shopify active-account readiness migration')
+const inventoryAttemptLeaseMigration = read(
+  'db/migrations/0172_operations_commerce_inventory_attempt_lease_renewal.sql',
+)
+includes(inventoryAttemptLeaseMigration, [
+  'CREATE OR REPLACE FUNCTION protect_operations_commerce_provider_attempt()',
+  "OLD.action <> 'inventory.levels.read'",
+  "NEW.action <> 'inventory.levels.read'",
+  "ARRAY['lease_token', 'lease_expires_at']::text[]",
+  'OLD.lease_expires_at <= clock_timestamp()',
+  'OLD.lease_expires_at > clock_timestamp()',
+  "clock_timestamp() + interval '15 minutes'",
+  'capture.provider_attempt_id = OLD.id',
+  'capture.request_hash = OLD.request_hash',
+  'Terminal commerce provider attempts are immutable',
+], 'Shopify inventory attempt lease-renewal migration')
 
 const persistence = read(
   'app_src/lib/persistence/shopifyInventoryRefresh.ts',
@@ -116,15 +131,28 @@ assert.match(
 includes(inventoryPersistence, [
   'SHOPIFY_INVENTORY_SYNC_IN_PROGRESS',
   'SHOPIFY_INVENTORY_CAPTURE_LEASE_REACQUIRE_FAILED',
+  'AS lease_is_live',
   "SET lease_token = gen_random_uuid()",
+  'attempt.lease_expires_at <= clock_timestamp()',
   'capture.provider_attempt_id = attempt.id',
+  'capture.request_hash = attempt.request_hash',
   'renewShopifyInventoryReadLeaseInPostgres',
   'expectedRefreshFence',
   'SHOPIFY_INVENTORY_REFRESH_FENCE_CHANGED',
-  'AND lease_expires_at > now()',
+  'AND lease_expires_at > clock_timestamp()',
   "actor: input.actorEmail || 'system'",
   'isSystem: !input.actorEmail',
 ], 'Shopify inventory single-flight persistence')
+assert.doesNotMatch(
+  inventoryPersistence,
+  /lease_expires_at\.getTime\(\)\s*[<>]=?\s*Date\.now\(\)/,
+  'Inventory lease decisions must use the PostgreSQL wall clock',
+)
+assert.doesNotMatch(
+  inventoryPersistence,
+  /lease_expires_at\s*=\s*\$\d+::timestamptz/,
+  'Inventory lease fences must not round-trip PostgreSQL microseconds through JavaScript Date',
+)
 
 const orchestration = read(
   'app_src/lib/integrations/commerceInventory.ts',
@@ -374,6 +402,7 @@ includes(health, [
   'operations_shopify_inventory_refresh_migration_applied',
   'operations_shopify_checkout_plan_rate_policy_applied',
   'shopify_active_account_readiness_migration_applied',
+  'operations_commerce_inventory_attempt_lease_renewal_applied',
   "operationalStatus: operationalDegraded ? 'degraded' : 'ready'",
   'readShopifyInventoryRefreshHealthFromPostgres',
   'Shopify inventory refresh worker heartbeat is missing or stale.',
@@ -391,6 +420,7 @@ const predeploy = read('scripts/verify-predeploy.mjs')
 includes(predeploy, [
   "'db/migrations/0169_operations_shopify_inventory_refresh_queue.sql'",
   "'db/migrations/0171_shopify_active_account_readiness.sql'",
+  "'db/migrations/0172_operations_commerce_inventory_attempt_lease_renewal.sql'",
   "'scripts/test-shopify-inventory-refresh-worker.mjs'",
   "'scripts/test-shopify-inventory-refresh-postgres.mjs'",
 ], 'Shopify inventory refresh predeploy gate')
