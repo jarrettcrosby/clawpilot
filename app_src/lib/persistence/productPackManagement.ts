@@ -1114,12 +1114,12 @@ async function lockChannelState(
   if (
     row.account_type !== 'commerce'
     || row.account_provider !== row.provider
-    || row.account_status !== 'active'
+    || row.account_status === 'error'
     || row.credential_verification_status !== 'verified'
   ) {
     fail(
       'PRODUCT_PACK_CHANNEL_ACCOUNT_NOT_READY',
-      'The exact commerce connection is not active and verified',
+      'The exact commerce connection is not eligible and verified',
       409,
     )
   }

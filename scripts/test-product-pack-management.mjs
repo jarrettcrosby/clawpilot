@@ -7,17 +7,29 @@ const read = (path) => readFile(new URL(path, root), 'utf8')
 
 const [
   migration,
+  checkoutAccountCorrection,
   domain,
   persistence,
   route,
   panel,
 ] = await Promise.all([
   read('db/migrations/0151_operations_product_pack_management_hardening.sql'),
+  read('db/migrations/0162_operations_shopify_checkout_mapping_account_status.sql'),
   read('app_src/lib/operations/productPackManagement.ts'),
   read('app_src/lib/persistence/productPackManagement.ts'),
   read('app_src/app/api/operations/product-pack-profiles/route.ts'),
   read('app_src/components/crm/ProductPackProfilePanel.tsx'),
 ])
+
+for (const fragment of [
+  "account_status NOT IN ('active', 'disabled')",
+  'validate_operations_commerce_variant_pack_mapping()',
+]) {
+  assert.ok(
+    checkoutAccountCorrection.includes(fragment),
+    `checkout account-status correction is missing ${fragment}`,
+  )
+}
 
 for (const fragment of [
   'validate_operations_product_pack_profile_version()',
@@ -86,6 +98,7 @@ for (const fragment of [
   'state.source_hash',
   'material.rated_outer_length_mm',
   'recordAuditEvent({',
+  "row.account_status === 'error'",
 ]) {
   assert.ok(persistence.includes(fragment), `persistence is missing ${fragment}`)
 }
