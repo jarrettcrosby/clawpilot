@@ -95,6 +95,12 @@ export type HybridCartonizationMaterial = {
   dimensionEvidenceReference: string | null
   dimensionConfirmedAt: string | null
   tareWeightGrams: number | null
+  /**
+   * Optional planning fences supplied by the caller. When present, carton
+   * construction must honor them; they are not post-plan advisory checks.
+   */
+  maximumGrossWeightGrams?: number | null
+  availableQuantity?: number | null
   ratedOuterDimensionsMm: {
     length: number
     width: number
@@ -121,6 +127,7 @@ export type HybridCartonizationBlockerCode =
   | 'RECIPE_CAPACITY_MINIMUM_NOT_MET'
   | 'MATERIAL_EVIDENCE_MISSING'
   | 'MATERIAL_EVIDENCE_STALE'
+  | 'MATERIAL_CAPACITY_UNAVAILABLE'
 
 export type HybridCartonizationBlocker = {
   code: HybridCartonizationBlockerCode
@@ -255,6 +262,13 @@ export type HybridCartonizationResult = {
     evidenceReference: string
   }>
   blockers: HybridCartonizationBlocker[]
+}
+
+export type HybridCartonizationCandidate = {
+  candidateKey: string
+  preferenceMaterialGlobalId: string | null
+  preferenceMaterialGlobalIdsByPool: Record<string, string>
+  plan: HybridCartonizationResult
 }
 
 type ValidRecipeOption = {
@@ -448,6 +462,22 @@ function materialEvidenceProblem(
     || dimensions.width <= 0
     || !Number.isSafeInteger(dimensions.height)
     || dimensions.height <= 0
+    || (
+      material.maximumGrossWeightGrams !== undefined
+      && material.maximumGrossWeightGrams !== null
+      && (
+        !Number.isSafeInteger(material.maximumGrossWeightGrams)
+        || material.maximumGrossWeightGrams <= 0
+      )
+    )
+    || (
+      material.availableQuantity !== undefined
+      && material.availableQuantity !== null
+      && (
+        !Number.isSafeInteger(material.availableQuantity)
+        || material.availableQuantity < 0
+      )
+    )
   ) {
     return 'missing'
   }
@@ -647,7 +677,10 @@ function optionSignature(option: ValidRecipeOption) {
   ].join('|')
 }
 
-function buildSharedOptions(lines: PlannedLine[]): SharedOption[] {
+function buildSharedOptions(
+  lines: PlannedLine[],
+  preferenceMaterialGlobalId: string | null,
+): SharedOption[] {
   const productIds = new Set(
     lines.map(({ line }) => line.productGlobalId),
   )
@@ -696,7 +729,19 @@ function buildSharedOptions(lines: PlannedLine[]): SharedOption[] {
       ))
     ))
     .sort((left, right) => (
-      left.maximumInputQuantity - right.maximumInputQuantity
+      (
+        preferenceMaterialGlobalId === null
+          ? 0
+          : Number(
+            right.packagingMaterialGlobalId
+              === preferenceMaterialGlobalId,
+          )
+            - Number(
+              left.packagingMaterialGlobalId
+                === preferenceMaterialGlobalId,
+            )
+      )
+      || left.maximumInputQuantity - right.maximumInputQuantity
       || recipeTypePriority(left.recipeType)
         - recipeTypePriority(right.recipeType)
       || left.packagingMaterialGlobalId.localeCompare(
@@ -711,6 +756,71 @@ function recipeTypePriority(
   if (recipeType === 'exact_case') return 0
   if (recipeType === 'max_capacity') return 1
   return 2
+}
+
+function remainingMaterialQuantity(
+  material: HybridCartonizationMaterial,
+  materialUsage: Map<string, number>,
+) {
+  if (
+    material.availableQuantity === undefined
+    || material.availableQuantity === null
+  ) {
+    return Number.POSITIVE_INFINITY
+  }
+  return Math.max(
+    0,
+    material.availableQuantity
+      - (materialUsage.get(material.materialGlobalId) || 0),
+  )
+}
+
+/**
+ * Computes the largest deterministic allocation that respects both the
+ * recipe quantity and the material's gross-weight fence. Allocation order is
+ * the same stable line order used by allocatePackage, so feasibility cannot
+ * drift between planning and package construction.
+ */
+function maximumAllocatableQuantity(
+  lines: PlannedLine[],
+  option: SharedOption,
+  requestedMaximum: number,
+) {
+  let quantityRemaining = requestedMaximum
+  let contentWeightGrams = 0
+  let quantity = 0
+  const tareWeightGrams = option.material.tareWeightGrams ?? 0
+  const maximumContentWeightGrams = (
+    option.material.maximumGrossWeightGrams === undefined
+    || option.material.maximumGrossWeightGrams === null
+  )
+    ? Number.POSITIVE_INFINITY
+    : option.material.maximumGrossWeightGrams - tareWeightGrams
+  if (maximumContentWeightGrams <= 0) return 0
+
+  for (const plannedLine of lines) {
+    if (quantityRemaining === 0 || plannedLine.remainingQuantity === 0) {
+      continue
+    }
+    const availableByQuantity = Math.min(
+      plannedLine.remainingQuantity,
+      quantityRemaining,
+    )
+    const availableByWeight = Number.isFinite(maximumContentWeightGrams)
+      ? Math.floor(
+          (maximumContentWeightGrams - contentWeightGrams)
+            / plannedLine.line.unitWeightGrams,
+        )
+      : availableByQuantity
+    const allocated = Math.max(
+      0,
+      Math.min(availableByQuantity, availableByWeight),
+    )
+    quantity += allocated
+    quantityRemaining -= allocated
+    contentWeightGrams += allocated * plannedLine.line.unitWeightGrams
+  }
+  return quantity
 }
 
 function allocatePackage(
@@ -759,6 +869,17 @@ function allocatePackage(
     (total, allocation) => total + allocation.contentWeightGrams,
     0,
   )
+  const ratedWeightGrams = option.material.tareWeightGrams === null
+    ? null
+    : contentWeightGrams + option.material.tareWeightGrams
+  if (
+    ratedWeightGrams !== null
+    && option.material.maximumGrossWeightGrams !== undefined
+    && option.material.maximumGrossWeightGrams !== null
+    && ratedWeightGrams > option.material.maximumGrossWeightGrams
+  ) {
+    throw new Error('Recipe package exceeds the material gross-weight fence')
+  }
   const rateBlockers: HybridRecipePackage['rateReadiness']['blockers'] = []
   if (!option.material.ratedOuterDimensionsMm) {
     rateBlockers.push('RATING_OUTER_DIMENSIONS_MISSING')
@@ -820,9 +941,7 @@ function allocatePackage(
       status: rateBlockers.length === 0 ? 'ready' : 'blocked',
       ratedOuterDimensionsMm: option.material.ratedOuterDimensionsMm,
       tareWeightGrams: option.material.tareWeightGrams,
-      ratedWeightGrams: option.material.tareWeightGrams === null
-        ? null
-        : contentWeightGrams + option.material.tareWeightGrams,
+      ratedWeightGrams,
       blockers: rateBlockers,
     },
     recipeEvidence,
@@ -919,8 +1038,9 @@ function allocateSelfPackages(
  * minimum remains blocked unless a sandbox caller supplies an explicit,
  * retained assumption override.
  */
-export function planHybridCartonization(
+function planHybridCartonizationWithPreference(
   input: HybridCartonizationInput,
+  preferenceMaterialGlobalIdsByPool: Readonly<Record<string, string>>,
 ): HybridCartonizationResult {
   validateOverrides(input)
   assertUniqueIds(
@@ -946,6 +1066,7 @@ export function planHybridCartonization(
     HybridCartonizationResult['assumptions'][number]
   >()
   const plannedLines: PlannedLine[] = []
+  const materialUsage = new Map<string, number>()
 
   for (const line of input.lines) {
     positiveInteger(line.quantity, 'Order-line quantity')
@@ -1166,7 +1287,12 @@ export function planHybridCartonization(
     const lines = [...unsortedLines].sort((left, right) => (
       left.line.lineGlobalId.localeCompare(right.line.lineGlobalId)
     ))
-    const sharedOptions = buildSharedOptions(lines)
+    const preferenceMaterialGlobalId =
+      preferenceMaterialGlobalIdsByPool[identity] ?? null
+    const sharedOptions = buildSharedOptions(
+      lines,
+      preferenceMaterialGlobalId,
+    )
     if (sharedOptions.length === 0) {
       blockers.push({
         code: 'RECIPE_OPTION_NOT_SHARED',
@@ -1189,28 +1315,48 @@ export function planHybridCartonization(
       0,
     )
     while (totalRemaining > 0) {
-      const singlePackage = sharedOptions.find((option) => (
-        totalRemaining >= option.minimumInputQuantity
-        && totalRemaining <= option.maximumInputQuantity
+      const feasibleOptions = sharedOptions.flatMap((option) => {
+        if (remainingMaterialQuantity(option.material, materialUsage) < 1) {
+          return []
+        }
+        const maximumInputQuantity = maximumAllocatableQuantity(
+          lines,
+          option,
+          Math.min(totalRemaining, option.maximumInputQuantity),
+        )
+        if (maximumInputQuantity < option.minimumInputQuantity) return []
+        return [{
+          option,
+          targetQuantity: Math.min(totalRemaining, maximumInputQuantity),
+          completesPool: totalRemaining <= maximumInputQuantity,
+        }]
+      }).sort((left, right) => (
+        Number(right.completesPool) - Number(left.completesPool)
+        || (
+          preferenceMaterialGlobalId === null
+            ? 0
+            : Number(
+              right.option.packagingMaterialGlobalId
+                === preferenceMaterialGlobalId,
+            )
+              - Number(
+                left.option.packagingMaterialGlobalId
+                  === preferenceMaterialGlobalId,
+              )
+        )
+        || (
+          right.targetQuantity - left.targetQuantity
+        )
+        || recipeTypePriority(left.option.recipeType)
+          - recipeTypePriority(right.option.recipeType)
+        || left.option.packagingMaterialGlobalId.localeCompare(
+          right.option.packagingMaterialGlobalId,
+        )
       ))
-      const overflowPackage = [...sharedOptions]
-        .filter((option) => (
-          totalRemaining > option.maximumInputQuantity
-          && option.maximumInputQuantity >= option.minimumInputQuantity
-        ))
-        .sort((left, right) => (
-          right.maximumInputQuantity - left.maximumInputQuantity
-          || recipeTypePriority(left.recipeType)
-            - recipeTypePriority(right.recipeType)
-          || left.packagingMaterialGlobalId.localeCompare(
-            right.packagingMaterialGlobalId,
-          )
-        ))[0]
-      const selectedOption = singlePackage ?? overflowPackage
-      if (!selectedOption) break
-      const targetQuantity = singlePackage
-        ? totalRemaining
-        : selectedOption.maximumInputQuantity
+      const selected = feasibleOptions[0]
+      if (!selected) break
+      const selectedOption = selected.option
+      const targetQuantity = selected.targetQuantity
       const recipePackage = allocatePackage(
         lines,
         selectedOption,
@@ -1218,6 +1364,10 @@ export function planHybridCartonization(
         selfPackages.length + recipePackages.length + 1,
       )
       recipePackages.push(recipePackage)
+      materialUsage.set(
+        selectedOption.packagingMaterialGlobalId,
+        (materialUsage.get(selectedOption.packagingMaterialGlobalId) || 0) + 1,
+      )
       for (const allocation of recipePackage.lineAllocations) {
         const option = selectedOption.recipesByProduct.get(
           allocation.productGlobalId,
@@ -1252,6 +1402,40 @@ export function planHybridCartonization(
     }
 
     if (totalRemaining > 0) {
+      const constrainedMaterialIds = unique(
+        sharedOptions
+          .filter((option) => (
+            remainingMaterialQuantity(option.material, materialUsage) < 1
+            || maximumAllocatableQuantity(
+              lines,
+              option,
+              Math.min(totalRemaining, option.maximumInputQuantity),
+            ) < option.minimumInputQuantity
+          ))
+          .map((option) => option.packagingMaterialGlobalId),
+      )
+      if (constrainedMaterialIds.length > 0) {
+        blockers.push({
+          code: 'MATERIAL_CAPACITY_UNAVAILABLE',
+          detail:
+            `${totalRemaining} unit(s) in compatibility pool ${identity} `
+            + 'cannot be allocated within the retained material stock and '
+            + 'gross-weight limits.',
+          action:
+            'Add compatible packaging stock, raise an evidenced material '
+            + 'weight limit, or confirm another approved recipe.',
+          lineGlobalIds: lines
+            .filter(({ remainingQuantity }) => remainingQuantity > 0)
+            .map(({ line }) => line.lineGlobalId),
+          recipeGlobalIds: unique(lines.flatMap(({ options }) => (
+            options
+              .filter(({ recipe }) => constrainedMaterialIds.includes(
+                recipe.packagingMaterialGlobalId,
+              ))
+              .map(({ recipe }) => recipe.recipeGlobalId)
+          ))),
+        })
+      }
       const recipeOnly = lines.filter(({ line, remainingQuantity }) => (
         remainingQuantity > 0
         && line.profile.fitModel === 'approved_recipe_only'
@@ -1316,9 +1500,207 @@ export function planHybridCartonization(
     resultHash: canonicalHash(resultWithoutHash),
   }
 }
+
+export function planHybridCartonization(
+  input: HybridCartonizationInput,
+): HybridCartonizationResult {
+  return planHybridCartonizationWithPreference(input, {})
+}
+
+function poolMaterialPreferenceChoices(
+  input: HybridCartonizationInput,
+  materialPreferenceOrder: string[],
+) {
+  const lineProfiles = new Set(input.lines.map((line) => (
+    `${line.productGlobalId}|${line.profile.versionGlobalId}`
+  )))
+  const choices = new Map<string, Set<string>>()
+  for (const recipe of input.recipes) {
+    if (!lineProfiles.has(
+      `${recipe.productGlobalId}|${recipe.inputPackProfileVersionGlobalId}`,
+    )) {
+      continue
+    }
+    const identity = recipe.allowsMixedProducts
+      ? `mixed:${recipe.contentCompatibilityKey}`
+      : `exclusive:${recipe.productGlobalId}`
+    const current = choices.get(identity) ?? new Set<string>()
+    current.add(recipe.packagingMaterialGlobalId)
+    choices.set(identity, current)
+  }
+  const order = new Map(
+    materialPreferenceOrder.map((materialGlobalId, index) => [
+      materialGlobalId,
+      index,
+    ]),
+  )
+  return [...choices.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([identity, values]) => ({
+      identity,
+      materialGlobalIds: [...values].sort((left, right) => (
+        (order.get(left) ?? Number.MAX_SAFE_INTEGER)
+          - (order.get(right) ?? Number.MAX_SAFE_INTEGER)
+        || left.localeCompare(right)
+      )),
+    }))
+}
+
+type PoolPreferenceState = {
+  materialIndexes: number[]
+  changedPoolCount: number
+  totalPreferenceRank: number
+  maximumPreferenceRank: number
+  stableKey: string
+}
+
+function poolPreferenceState(materialIndexes: number[]): PoolPreferenceState {
+  const changed = materialIndexes.filter((index) => index > 0)
+  return {
+    materialIndexes,
+    changedPoolCount: changed.length,
+    totalPreferenceRank: changed.reduce((total, index) => total + index, 0),
+    maximumPreferenceRank: changed.length ? Math.max(...changed) : 0,
+    stableKey: materialIndexes.map((index) => (
+      String(index).padStart(4, '0')
+    )).join(':'),
+  }
+}
+
+function comparePoolPreferenceState(
+  left: PoolPreferenceState,
+  right: PoolPreferenceState,
+) {
+  return (
+    left.changedPoolCount - right.changedPoolCount
+    || left.totalPreferenceRank - right.totalPreferenceRank
+    || left.maximumPreferenceRank - right.maximumPreferenceRank
+    || left.stableKey.localeCompare(right.stableKey)
+  )
+}
+
+/**
+ * Builds a deterministic, bounded best-first frontier. Material rank already
+ * reflects the tenant objective proxy supplied by the caller. Expanding from
+ * the all-primary state by one pool at a time guarantees every pool's first
+ * alternative is considered before compounded substitutions, rather than
+ * truncating the Cartesian product in pool order.
+ */
+export function boundedPoolPreferenceFrontier(
+  pools: ReturnType<typeof poolMaterialPreferenceChoices>,
+  limit: number,
+) {
+  if (pools.length === 0 || limit < 1) return []
+  const initial = poolPreferenceState(pools.map(() => 0))
+  const frontier = [initial]
+  const queued = new Set([initial.stableKey])
+  const selected: PoolPreferenceState[] = []
+  while (frontier.length > 0 && selected.length < limit) {
+    frontier.sort(comparePoolPreferenceState)
+    const current = frontier.shift()
+    if (!current) break
+    selected.push(current)
+    for (let poolIndex = 0; poolIndex < pools.length; poolIndex += 1) {
+      const nextMaterialIndex = current.materialIndexes[poolIndex] + 1
+      if (
+        nextMaterialIndex
+          >= pools[poolIndex].materialGlobalIds.length
+      ) {
+        continue
+      }
+      const nextIndexes = [...current.materialIndexes]
+      nextIndexes[poolIndex] = nextMaterialIndex
+      const next = poolPreferenceState(nextIndexes)
+      if (queued.has(next.stableKey)) continue
+      queued.add(next.stableKey)
+      frontier.push(next)
+    }
+  }
+  return selected.map((state) => Object.fromEntries(
+    pools.map((pool, index) => [
+      pool.identity,
+      pool.materialGlobalIds[state.materialIndexes[index]],
+    ]),
+  ))
+}
+
+export function planHybridCartonizationCandidates(
+  input: HybridCartonizationInput,
+  options: {
+    maxCandidates: number
+    materialPreferenceOrder?: string[]
+  },
+): HybridCartonizationCandidate[] {
+  if (
+    !Number.isSafeInteger(options.maxCandidates)
+    || options.maxCandidates < 1
+    || options.maxCandidates > 8
+  ) {
+    throw new RangeError(
+      'Hybrid cartonization candidate count must be between 1 and 8',
+    )
+  }
+  const knownMaterials = new Set(
+    input.materials.map(({ materialGlobalId }) => materialGlobalId),
+  )
+  const preferenceOrder: string[] = []
+  const seenPreferences = new Set<string>()
+  for (const materialGlobalId of [
+    ...(options.materialPreferenceOrder ?? []),
+    ...input.materials
+      .map((material) => material.materialGlobalId)
+      .sort(),
+  ]) {
+    if (
+      knownMaterials.has(materialGlobalId)
+      && !seenPreferences.has(materialGlobalId)
+    ) {
+      seenPreferences.add(materialGlobalId)
+      preferenceOrder.push(materialGlobalId)
+    }
+  }
+  const pools = poolMaterialPreferenceChoices(input, preferenceOrder)
+  const beamLimit = Math.min(64, Math.max(16, options.maxCandidates * 16))
+  const preferences = [
+    {},
+    ...boundedPoolPreferenceFrontier(pools, beamLimit),
+  ]
+  const candidates: HybridCartonizationCandidate[] = []
+  const seen = new Set<string>()
+  for (const preferenceMaterialGlobalIdsByPool of preferences) {
+    const plan = planHybridCartonizationWithPreference(
+      input,
+      preferenceMaterialGlobalIdsByPool,
+    )
+    if (
+      plan.status !== 'ready'
+      || plan.blockers.length > 0
+      || seen.has(plan.resultHash)
+    ) {
+      continue
+    }
+    seen.add(plan.resultHash)
+    const preferredMaterials = unique(
+      Object.values(preferenceMaterialGlobalIdsByPool),
+    )
+    candidates.push({
+      candidateKey: `hcan-${plan.resultHash.slice(0, 20)}`,
+      preferenceMaterialGlobalId:
+        preferredMaterials.length === 1 ? preferredMaterials[0] : null,
+      preferenceMaterialGlobalIdsByPool: {
+        ...preferenceMaterialGlobalIdsByPool,
+      },
+      plan,
+    })
+    if (candidates.length === options.maxCandidates) break
+  }
+  return candidates
+}
 import { createHash } from 'node:crypto'
 
 export const HYBRID_CARTONIZATION_POLICY_VERSION =
   'hybrid-cartonization-recipe-first-v1'
 export const HYBRID_CARTONIZATION_ALGORITHM_VERSION =
-  'hybrid-recipe-pooling-v3'
+  'hybrid-recipe-pooling-v4'
+export const HYBRID_CARTONIZATION_CANDIDATE_POLICY_VERSION =
+  'hybrid-cartonization-bounded-pool-beam-v2'

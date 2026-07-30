@@ -1,0 +1,4 @@
+{
+  "name": "ClawPilot test-rate isolation",
+  "description": "Hides ClawPilot checkout test rates outside an exact authenticated customer cohort."
+}

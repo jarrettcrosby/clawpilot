@@ -12,11 +12,48 @@ import type {
 const {
   HYBRID_CARTONIZATION_ALGORITHM_VERSION,
   HYBRID_CARTONIZATION_POLICY_VERSION,
+  boundedPoolPreferenceFrontier,
   planHybridCartonization,
 } = hybrid
 
 const COMPATIBILITY_KEY = 'ag-alchemy.loose-six-ounce-bags.v1'
 const MATERIAL_ID = 'gmat0000001'
+
+test('bounded preference frontier covers each pool before combinations', () => {
+  const frontier = boundedPoolPreferenceFrontier([
+    {
+      identity: 'pool-a',
+      materialGlobalIds: ['gmat0000001', 'gmat0000002'],
+    },
+    {
+      identity: 'pool-b',
+      materialGlobalIds: ['gmat0000003', 'gmat0000004'],
+    },
+    {
+      identity: 'pool-c',
+      materialGlobalIds: ['gmat0000005', 'gmat0000006'],
+    },
+  ], 4)
+
+  assert.equal(frontier.length, 4)
+  assert.deepEqual(frontier[0], {
+    'pool-a': 'gmat0000001',
+    'pool-b': 'gmat0000003',
+    'pool-c': 'gmat0000005',
+  })
+  for (const [pool, alternative] of [
+    ['pool-a', 'gmat0000002'],
+    ['pool-b', 'gmat0000004'],
+    ['pool-c', 'gmat0000006'],
+  ] as const) {
+    assert.ok(
+      frontier.slice(1).some((preference) => (
+        preference[pool] === alternative
+      )),
+      `${pool} first alternative should not be excluded by pool order`,
+    )
+  }
+})
 
 function line(
   sequence: number,
@@ -126,7 +163,10 @@ test('six mixed 6 oz lines use one AG12V2 only with an explicit sandbox minimum 
   assert.equal(withoutAssumption.recipePackages.length, 0)
   assert.deepEqual(
     withoutAssumption.blockers.map(({ code }) => code),
-    ['RECIPE_CAPACITY_MINIMUM_NOT_MET'],
+    [
+      'MATERIAL_CAPACITY_UNAVAILABLE',
+      'RECIPE_CAPACITY_MINIMUM_NOT_MET',
+    ],
   )
   assert.equal(withoutAssumption.geometryFallbackLines.length, 0)
 

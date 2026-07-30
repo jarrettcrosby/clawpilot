@@ -99,12 +99,17 @@ includes(persistence, [
 
 includes(callback, [
   "version: 'shopify-checkout-idempotency-v2'",
-  "version: 'shopify-checkout-execution-fence-v2'",
+  "version: 'shopify-checkout-execution-fence-v3'",
   "account.environment !== 'sandbox'",
   "carrier.environment === 'sandbox'",
+  'policyRevision: account.policyRevision',
+  'policyHash: account.policyHash',
+  'planRatePolicy,',
   'materialRowVersion: material.rowVersion',
   'stockRowVersion: material.stockRowVersion',
   'stockOnHandQuantity: material.stockOnHandQuantity',
+  'unitCostMinor: material.unitCostMinor',
+  'currency: material.currency',
   'credentialVersion: carrier.credentialVersion',
   'cartonizationInputHash: shopifyCheckoutRatingHash(context.input)',
   'executionFenceHash,',

@@ -15,7 +15,7 @@ app_visible: false
 
 Provide native distributed order management, warehouse execution, carrier shipping, and 3PL billing inside ClawPilot. The module serves 3PL operators, retailers, distributors, manufacturers, and fulfillment operators without creating a second application or duplicating CRM, product, identity, audit, task, document, notification, or accounting masters.
 
-This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, and `0107` through `0168`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; versioned Product each/case profiles and separately evidenced exact-case and loose-each recipes; retained Shopify/Faire channel taxonomy; immutable CRM Product image assets; an exact resource-scoped Shadow Shopify image-publish command; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion; a bounded, manager-triggered, read-only Shopify inventory reconciliation for one eligible location and warehouse; a strict development-only Shopify cartonization preview; a recipe-first, assumption-watermarked sandbox package-and-rate evidence workflow; an executable development-only two-pass pack-and-rate replay workbench; and active-workspace measurement-presentation and product-currency defaults. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, continuous or production provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or production fulfillment-optimizer activation.
+This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, and `0107` through `0171`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; versioned Product each/case profiles and separately evidenced exact-case and loose-each recipes; retained Shopify/Faire channel taxonomy; immutable CRM Product image assets; an exact resource-scoped Shadow Shopify image-publish command; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion; a bounded development-only, leased, automatically scheduled, read-only Shopify inventory reconciliation for one eligible account/location/warehouse with the manager command retained as manual recovery; a strict development-only Shopify cartonization preview; a recipe-first, assumption-watermarked sandbox package-and-rate evidence workflow; an executable development-only two-pass pack-and-rate replay workbench; and active-workspace measurement-presentation and product-currency defaults. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, production or bidirectional provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or production fulfillment-optimizer activation.
 
 Migrations `0128` through `0145` extend this slice with the pack hierarchy,
 CRM CSV transfer evidence, durable sales-channel lifecycle and offer
@@ -221,7 +221,7 @@ The implemented slice provides:
 - a Shopify Dev Dashboard client-credentials exchange for an installed same-organization store, with 24-hour access tokens acquired only when needed and never persisted; an Admin GraphQL client pinned to `2026-07`; strict canonical `*.myshopify.com` endpoints; bounded requests/responses; reported-scope inspection; raw-body HMAC verification; a narrowly public account-specific receipt URL; event-ID deduplication; encrypted webhook bodies; durable cursor/retry/dead-letter structures; and an explicit receipt-intake-only activation label;
 - a feature-gated, manager-triggered Shopify held-order preview for a configured and verified `sandbox` store: it reads at most the newest 25 non-test orders, retains only minimized diagnostic fields for no more than 24 hours, compares line SKUs with existing local product mappings and package-profile readiness, and records explicit zero canonical-order, zero Shopify-write, and no-cursor-advance evidence;
 - separate feature-gated Shopify/Faire catalog and operational-order workflows for configured and verified accounts: each provider read first persists a fixed idempotent intent, bounded product pages stage map/create/exclude candidates, bounded nonterminal order pages stage resolve/validate/promote candidates, continuations are encrypted and resource scoped, Shopify pages are time-fenced, Faire order candidates require exact refresh, and every rejection exposes exact order retry or audited exclusion; a leased development-only order worker automatically stages current order pages under the same read/capture/normalize path without canonical promotion, inventory mutation, shipment creation, cursor advance, or provider write;
-- a feature-gated, manager-triggered Shopify inventory reconciliation for a configured and verified account with `read_inventory`, `read_locations`, and `read_products`: it durably prepares the provider read, captures the bounded complete response before applying it, maps one eligible Shopify location to the workspace's one active warehouse and selected reserve/storage location, retains all eight requested Shopify quantity states and operational product facts, projects only exact product mappings into Shopify-authoritative Operations balances, and performs no provider write, order mutation, shipment creation, or fulfillment export;
+- a feature-gated Shopify inventory reconciliation for a configured and verified account with `read_inventory`, `read_locations`, and `read_products`: a leased development worker automatically refreshes one eligible account/location/warehouse before checkout evidence reaches half its configured maximum age, while the manager command remains a recovery control. Both paths durably prepare the provider read, capture the bounded complete response before applying it, map one eligible Shopify location to the workspace's one active warehouse and selected reserve/storage location, retain all eight requested Shopify quantity states and operational product facts, project only exact product mappings into Shopify-authoritative Operations balances, and perform no provider write, order mutation, shipment creation, or fulfillment export;
 - a manager-triggered, development-only Shopify cartonization preview that requires the exact current order-candidate revision, one active warehouse, account-bound inventory evidence captured from Shopify within 24 hours, exact product mappings and package measurements, explicit per-line committed-quantity assumptions, and one to eight active, priced, positively stocked packaging materials; inventory-run completion remains separate evidence and cannot make a replayed stale provider capture fresh; it calls only the authenticated OR-Tools service, uses fixed-axis conservative fit, excludes transport and handling costs, and returns a point-in-time in-memory fit/material recommendation with explicit zero database, provider, rate, label, and shipment writes; product-level committed attribution is displayed once and remains ineligible while more than one current inventory position exists; each optimizer package is surfaced as one planned shipment, but the preview cannot accept or persist that split, allocate durable package contents, or generate the future shipment-partitioned packing documents; Faire remains blocked until account-bound inventory reconciliation exists;
 - a canonical **Operations > Commerce imports** submodule at `#operations/imports`, also available from the collapsed-navigation flyout, that selects a configured and verified active-workspace Shopify/Faire account and opens the same Overview/Products/Orders/Issues workbench as the compact Settings launcher; product decision CSV is account/candidate/row-version fenced, while order and issue exports are sanitized and no CSV order import or provider-write path exists;
 - a canonical **Operations > Pack & rate replay** submodule at `#operations/replays` that lets a manager execute and reload sanitized historical scenarios across checkout quote, post-intake CRM resolution, fulfillment rerun, checkout-to-pre-label estimated variance, recorded label finalization, and tracking-gated package documents. It retains immutable checkout and fulfillment runs, exact line-to-package quantity conservation, all bounded recorded UPS/FedEx whole-shipment choices, one selected service for the complete package set, the unchanged checkout shipping charge, the separate checkout and pre-label carrier estimates, their signed estimated variances, and zero provider, postage, label, inventory, order, or commerce writes. It never calls an estimated replay delta a MUD and cannot establish carrier-billed actual cost. A successful fulfillment run may remain pre-label; finalized replay packages use recorded tracking facts and create one real immutable, downloadable PDF packing-slip artifact whose bytes and render snapshot are database-bound to that package's exact allocation. Shopify scenarios replay a recorded callback fixture without making a live callback, while Faire scenarios begin from a captured marketplace checkout shipping estimate and never claim that Faire called ClawPilot;
@@ -233,7 +233,7 @@ The implemented slice provides:
 - an in-module guide that directs carrier sandbox testing to **Settings > Integrations > Shipping** and identifies deterministic mocks as automated-test-only;
 - disposable PostgreSQL acceptance coverage that applies the full migration chain and validates atomic writes, replay, rollback, append-only evidence, money totals, and cross-workspace isolation.
 
-Production domain activation remains out of scope until later delivery gates verify provider credentials, processed webhook and polling imports, canonical mappings, provider attempts, reconciliation/replay, complete operational health, recovery commands, and an explicitly approved integration and warehouse cohort. Enabling Shopify signed receipt intake still accepts only its enumerated receipt topics; order and customer webhook topics remain rejected until their retention/privacy lifecycle and canonical processor exist. The separately gated held-order preview can inspect minimized recent order facts while the `sandbox` account remains receipt-disabled, but it does not import an order, create or change a customer, product, or mapping, reserve or export inventory, export a fulfillment, register webhooks, advance a cursor, or authorize any provider write. A verified product-readable Shopify or Faire connection authorizes the distinct development-only catalog worker without a second user approval and initializes its policy as resumed in an eligible runtime. A verified order-readable connection separately authorizes the development-only current-order staging worker when Operations is `shadow` or `active`; that worker follows bounded encrypted pages and creates held candidates or rejections only. Catalog policy initialization does not prove queueing, and neither worker is production enabled. The catalog worker may create ClawPilot product masters and exact mappings but never reads or changes orders or inventory and never writes to the provider. The order worker never creates canonical orders, customers, products, reservations, packages, shipments, inventory changes, or provider writes. Interactive commerce intake may separately promote a manager-reviewed ready order; promotion itself does not alter provider inventory or deduct order demand from a separately reconciled Shopify-authoritative balance. The manager-triggered Shopify inventory command is an independent read-only development control, not a production or unattended worker. Sandbox rating and label evidence do not authorize production rating, label creation, pickup scheduling, shipment confirmation, or inventory consumption. `app_documents` is not used as a substitute for logistics artifacts.
+Production domain activation remains out of scope until later delivery gates verify provider credentials, processed webhook and polling imports, canonical mappings, provider attempts, reconciliation/replay, complete operational health, recovery commands, and an explicitly approved integration and warehouse cohort. Enabling Shopify signed receipt intake still accepts only its enumerated receipt topics; order and customer webhook topics remain rejected until their retention/privacy lifecycle and canonical processor exist. The separately gated held-order preview can inspect minimized recent order facts while the `sandbox` account remains receipt-disabled, but it does not import an order, create or change a customer, product, or mapping, reserve or export inventory, export a fulfillment, register webhooks, advance a cursor, or authorize any provider write. A verified product-readable Shopify or Faire connection authorizes the distinct development-only catalog worker without a second user approval and initializes its policy as resumed in an eligible runtime. A verified order-readable connection separately authorizes the development-only current-order staging worker when Operations is `shadow` or `active`; that worker follows bounded encrypted pages and creates held candidates or rejections only. Catalog policy initialization does not prove queueing, and neither worker is production enabled. The catalog worker may create ClawPilot product masters and exact mappings but never reads or changes orders or inventory and never writes to the provider. The order worker never creates canonical orders, customers, products, reservations, packages, shipments, inventory changes, or provider writes. Interactive commerce intake may separately promote a manager-reviewed ready order; promotion itself does not alter provider inventory or deduct order demand from a separately reconciled Shopify-authoritative balance. The automatic Shopify inventory worker and manager recovery command share the same read-only development reconciliation boundary; neither is production inventory synchronization. Sandbox rating and label evidence do not authorize production rating, label creation, pickup scheduling, shipment confirmation, or inventory consumption. `app_documents` is not used as a substitute for logistics artifacts.
 
 ### Product And Package Catalog Workflow
 
@@ -697,8 +697,61 @@ quantity, destination, inventory, configuration, activation, package fact, or
 credential generation cannot join that in-flight result. Deadline or request
 abort remains fail-closed and never changes the owner receipt.
 
+Migration `0170` makes the checkout carton-plan/rate objective an explicit
+tenant-owned fact inside the existing organization/account configuration,
+which is already bound to one warehouse. Existing configurations are
+backfilled with the versioned default, including an explicit ISO-4217 handling
+currency taken from that tenant's workspace preference. If a legacy
+configuration has no preference row, migration `0170` first creates the
+application's existing imperial/USD workspace default for that organization;
+it never overwrites an existing tenant currency. Their policy hash and
+revision are refreshed, and future callbacks
+fail closed when the persisted policy is missing or malformed; a process-local
+fallback is not configuration authority. The setup API returns the exact
+resolved policy and accepts owner/admin changes to its bounded candidate count,
+objective priority, per-package handling cost, and handling currency. In
+Operations Shadow, a dedicated optimistic policy-only command remains usable
+after CarrierService registration: it increments only the policy and row
+revisions and cannot change the provider registration, service GID, callback
+token, warehouse, material bindings, or carrier bindings. Explicit JSON null
+is invalid and never resets an existing policy. For the current AG/default
+policy, hard fit, stock, weight, and currency feasibility apply first. The
+handling currency must match the cart currency, and materials plus recipes in
+another currency are removed before the bounded candidate frontier is built,
+so they cannot consume its candidate budget. ClawPilot then ranks the bounded,
+deterministically generated feasible complete-shipment candidates by lowest
+whole-shipment landed cost
+(carrier charge plus configured material and handling cost), fewer packages,
+least unused cube (highest utilization), and stable candidate/carrier/service
+identifiers. The deterministic best-first frontier considers each independent
+compatibility pool's first alternative before compounded substitutions, using
+the tenant objective's material ordering as its proxy; a pool earlier in stable
+sort order cannot consume the frontier by itself. This is the best
+whole-shipment price among the bounded generated feasible candidates, not a
+claim of mathematical global optimality. Material
+gross-weight and available-stock fences participate in plan construction, and
+the bounded search can select different materials for independent
+compatibility pools. Each candidate is sent to each required carrier once as
+its full ordered package array; one returned service covers every package and
+per-package service stitching is forbidden. The authoritative baseline must
+rate successfully from every required carrier. Later candidates are
+best-effort under a separate bounded deadline; a failed optional candidate is
+retained as degraded evidence and cannot invalidate the complete baseline.
+The receipt retains each candidate input/result hash, algorithm and policy
+version, material and stock revisions, costs/currency, recipe/profile
+revisions, tare/content/rated weights, allocations, package facts, all
+successful offers and carrier evidence, or the explicit degraded code. A
+provider-successful alternative whose local objective evaluation fails is
+retained as degraded evidence and cannot invalidate the complete baseline.
+Material and handling costs select the carton plan but do not silently
+increase the carrier amount returned to Shopify. No checkout delivery-SLA rule
+is claimed until a versioned tenant promise is durably configured. This
+checkout deadline policy is distinct from the broader fulfillment-optimizer
+objective contract below, which may consider warehouse splits and other
+fulfillment costs after order intake.
+
 `npm run test:shopify-carrier-service-postgres` is the rollback-only database
-acceptance for migrations `0164` and `0165` before permanent development
+acceptance for migrations `0164`, `0165`, and `0170` before permanent development
 application. The `0164` acceptance
 requires the explicitly trusted Railway development database fingerprint,
 applies the parcel-evidence correction inside one transaction, projects both
@@ -720,6 +773,12 @@ CarrierService mutation history. Its persistence queries use the
 PostgreSQL-safe `authorized_mutation` alias; setup-load failure is reported as
 an error and must never be rendered as a false owner/administrator-permission
 denial.
+The `0170` acceptance backfills every current tenant CarrierService
+configuration inside one transaction, proves each stored policy matches its
+canonical policy hash, rejects a missing policy at the table boundary, proves
+organization-scoped mutation cannot cross the tenant fence, persists a
+different accepted priority without code changes, and rolls the entire
+exercise back.
 
 The active commerce-fulfillment continuation uses
 `Jarrett+warehouse@episcs.com` as the sole test-customer identity.
@@ -795,6 +854,26 @@ unless the authenticated buyer GID is the configured test customer before
 this proof can remain enabled for an extended period. Until that provider-side
 guard is accepted, the live proof is a bounded operator test rather than a
 generally enabled production-store rate.
+The current Pro Bakery Bites store is verified as Shopify Advanced. Shopify
+permits a custom app containing a Function only on Shopify Plus, so the
+custom-distributed EPISHIP app cannot activate that Delivery Customization on
+the current plan. The repository retains a staged Function package and
+provider-verification contract for a future Plus or eligible public-App-Store
+distribution, but variant-only callback fallback remains disabled. The current
+Advanced-plan proof therefore continues to require the exact test customer and
+exact Test Product variant at the callback, automatic fresh inventory, and a
+bounded operator test window; it does not claim general customer-isolated
+production activation.
+That customer-and-variant allowlist belongs only to the resource-scoped
+`shadow` proof. After an explicitly authorized promotion to `active`, the
+CarrierService callback must evaluate every eligible shippable cart for the
+store, including authenticated repeat customers, first-time customers, and
+guest checkouts. Checkout rating must not depend on a pre-existing CRM customer
+record: the callback uses the cart lines, destination rate zone, tenant
+inventory, package policy, warehouse origin, and carrier configuration, while
+later order intake performs customer identity resolution and CRM projection.
+An `active` connection therefore removes the Shadow allowlist rather than
+expanding it one buyer at a time.
 The operator-triggered Shopify checkout acceptance uses one deliberately
 zero-priced but shippable test product. A zero merchandise subtotal is valid
 and must not suppress, zero, or otherwise change ClawPilot shipping-rate
@@ -858,7 +937,7 @@ The `0111` through `0115` control plane, Faire OAuth staging, Shopify diagnostic
 | Account path | Dev Dashboard client ID and secret for one installed same-organization shop; ClawPilot exchanges them for a 24-hour token when needed; multi-merchant OAuth is planned | Organization-supplied Custom App credentials with an OAuth authorization-code flow for one verified brand; a shared multi-brand installation is planned | Candidate identity is verified before encrypted persistence; short-lived Shopify tokens are not persisted; the integration Global ID is permanently bound to that shop/brand in this slice |
 | Environment | Development/test store may be classified as `sandbox`; production store is separate | Production only; no public sandbox | No arbitrary provider host can be supplied |
 | Change intake | Signed webhooks plus scheduled reconciliation are provider-available | Cursor/high-water polling; no public webhooks | Shopify accepts only enumerated non-customer control-plane webhook evidence. Development-gated catalog and current-order workers run from verified read scopes without another authorization when Operations is eligible. Shopify current-order staging stays inside one 60-day time-fenced session; Faire follows a bounded encrypted live cursor and still requires exact-record refresh plus **Check for newer orders** before validation. Production workers remain inactive |
-| Catalog/inventory/orders | GraphQL capabilities are scope-dependent, including protected/restricted scopes | Public brand scopes cover product, inventory, order, shipment, retailer, and review reads/writes as documented | Separate bounded catalog reads stage provider product/variant mapping candidates; separate bounded order reads stage nonterminal orders. A distinct development-only command reads and reconciles one complete eligible Shopify location into exact mapped-product balances. The CRM catalog remains authoritative, Faire inventory is not synchronized, closed history is not imported, and no provider write path exists |
+| Catalog/inventory/orders | GraphQL capabilities are scope-dependent, including protected/restricted scopes | Public brand scopes cover product, inventory, order, shipment, retailer, and review reads/writes as documented | Separate bounded catalog reads stage provider product/variant mapping candidates; separate bounded order reads stage nonterminal orders. A distinct development-only leased worker and its manager recovery command read and reconcile one complete eligible Shopify location into exact mapped-product balances. The CRM catalog remains authoritative, Faire inventory is not synchronized, closed history is not imported, and the refresh path performs no provider write |
 | Returns/refunds | Shopify Return objects require their own read scope; order access alone is insufficient | Order item states may expose return outcomes, but no public return/RMA/refund write contract is claimed | The preview does not request Return objects; no canonical returns or refund worker is implemented |
 | Fulfillment/tracking | Fulfillment Orders and related scopes are resource-assignment-specific | Documented order shipment writes are available | Merchant-managed fulfillment-order access alone does not cover assigned or third-party fulfillment orders; no authorized fulfillment-export dispatcher invokes provider clients |
 
@@ -874,7 +953,7 @@ Preview runs and rows cannot be updated and expire no later than 24 hours. One h
 
 ### Shopify Inventory Reconciliation
 
-Migration `0124` adds a separate development-only, manager-triggered Shopify inventory boundary. It requires Postgres, the commerce-intake feature gate, a configured and verified Shopify account, the exact `read_inventory`, `read_locations`, and `read_products` grant, one active ClawPilot warehouse, and one uniquely eligible active physical Shopify location. An existing location mapping must still resolve to that same eligible provider location. The command cannot create a warehouse, select an arbitrary provider host, register a webhook, advance an order cursor, or make a Shopify mutation.
+Migration `0124` adds a separate development-only Shopify inventory boundary. It requires Postgres, the commerce-intake feature gate, a configured and verified Shopify account, the effective `read_inventory`, `read_locations`, and `read_products` grant, one active ClawPilot warehouse, and one uniquely eligible active physical Shopify location. An existing location mapping must still resolve to that same eligible provider location. The manager command and the automatic worker share this exact reconciliation boundary; neither can create a warehouse, select an arbitrary provider host, register a webhook, advance an order cursor, or make a Shopify mutation.
 The inventory command uses the shared Shopify effective-scope projection:
 provider-reported `write_inventory` and `write_products` satisfy their paired
 read requirements, while `read_locations` remains independently required.
@@ -885,17 +964,45 @@ The adapter reads every bounded page for the selected location and requests `ava
 
 The provider response is durably captured before projection, and a successful run retains its request and snapshot hashes, account and credential generation, selected provider and ClawPilot locations, mapping result, quantities, product evidence, projection disposition, and immutable run identity. Unmapped items, untracked items, negative available-to-promise, protected-state anomalies, and quantity-equation mismatches remain held evidence and do not create a favorable balance. Only an exact account-scoped product mapping can project a position.
 
-Shopify is the source authority for projected positions in this slice. For a consistent level, ClawPilot projects `on hand = available + committed`, `reserved = committed`, and `available = Shopify available`. Imported or staged order demand is not subtracted again because Shopify's committed state already represents allocated demand. Shopify-authoritative positions and ledger rows are fenced from ordinary ClawPilot reservation and adjustment paths; only the reconciliation transaction may replace their balances. This command is a point-in-time read and reconciliation, not continuous synchronization, multi-location allocation, an inventory adjustment/export path, a Faire inventory import, or production activation.
+Shopify is the source authority for projected positions in this slice. For a consistent level, ClawPilot projects `on hand = available + committed`, `reserved = committed`, and `available = Shopify available`. Imported or staged order demand is not subtracted again because Shopify's committed state already represents allocated demand. Shopify-authoritative positions and ledger rows are fenced from ordinary ClawPilot reservation and adjustment paths; only the reconciliation transaction may replace their balances. Each worker execution is one point-in-time read and reconciliation; automatic scheduling does not make this multi-location allocation, an inventory adjustment/export path, a Faire inventory import, bidirectional synchronization, or production activation.
 
 The public Shopify checkout callback never fetches inventory from Shopify. It
 uses only the latest completed account-bound reconciliation and fails closed
 when that evidence is older than the CarrierService configuration's maximum
-inventory age. The current recovery is the manager-triggered **Sync inventory**
-command in Operations commerce imports; generic account activation and
-migration `0168` do not schedule or refresh inventory. Production checkout
-readiness therefore still requires a durable leased refresh queue and worker
-with bounded retry, fencing, and health evidence so inventory remains fresh
-outside an open browser session.
+inventory age. Migration `0169` adds a tenant/account-scoped leased refresh
+queue to the existing Railway poller. An exact ready configuration becomes due
+at half its maximum inventory age, and claim/completion recheck the current
+account, credential generation, activation revision, configuration row,
+policy, warehouse, scopes, and readiness predicate. A partial unique provider
+attempt index plus an account advisory lock prevent the manager and worker from
+reading the same Shopify account concurrently under different idempotency keys.
+The worker claims one job at a time, renews both the job and provider-read
+leases at bounded provider phases and every inventory page, and passes the
+claimed configuration fence into the same transaction that mutates the local
+projection. A captured provider response whose projection lease expires
+reacquires a new fenced lease on that same immutable capture; it does not call
+Shopify again or become permanently unrecoverable. Captured manager/worker
+overlap completes against the effective
+provider attempt's exact idempotency key and run Global ID rather than the
+caller's proposed key. It uses a nullable system actor, captures provider
+evidence before projection, retries bounded transient failures, dead-letters
+terminal failures, and reports worker-loop liveness separately from
+stale-account, retry, lease, overdue, and dead-job operational degradation.
+Only a missing or stale loop heartbeat makes the global health endpoint
+unavailable; tenant/account queue failures remain visible warnings. Every result asserts `providerWrites = 0` and
+`orderQuantityAdjustment = 0`; the manager-triggered **Sync inventory** command
+remains the explicit recovery path. This is development-only automatic
+freshness maintenance, not production or bidirectional inventory sync.
+`npm run test:shopify-inventory-refresh-postgres` is the explicit,
+trusted-development acceptance for this boundary. It applies migrations `0169`
+and `0171` inside one transaction. Migration `0171` replaces the already-applied
+readiness function so only an exactly `active` commerce account is eligible.
+The acceptance proves disabled-account exclusion, account-level queue and
+provider-read single-flight, unexpired completion/failure leases,
+mid-flight fence cancellation, bounded retry/dead-letter, and zero-write result
+semantics, rolls back, then uses a second connection to verify that no schema,
+function definition, account state, or provider-attempt change remains. It is
+intentionally not part of the default commerce suite.
 
 ### Commerce Normalization, Resolution, And Promotion
 
@@ -1636,7 +1743,7 @@ The adapter reads approved immutable billable facts and credits, produces a vers
 
 ## Foundation Limitations
 
-Before this contract can become active, implementation must close the blockers in the [integration and gap map](../maps/distributed-operations-integration-gap-map.md), especially fine-grained permissions, canonical commerce receipt/poll processing, leased reconciliation and replay commands, tracking ingestion, commerce-export dispatch, queue/throughput health, quote and optimizer snapshots, split-plan representation, advanced inventory dimensions, billable lifecycle separation, and shared-service adapters. `0111` and `0112` close bounded credential, OAuth-staging, signed-receipt, cursor, and evidence-schema portions. `0113` adds only a disposable Shopify diagnostic preview. `0114` and `0115` close the bounded manager-driven catalog-mapping and operational-order workflow through durable pre-call read intent, resource-scoped pagination, row-versioned rejection disposition, explicit resolution, exact Faire order refresh, canonical-money reconciliation, and promotion. `0124` adds only the bounded manager-triggered development Shopify location mapping, provider capture, all-state inventory evidence, and source-authority projection described above. `0125` adds only the tenant-safe organization/user preference store, optimistic organization-default command, pure conversion/formatting boundary, and application provider; it does not convert stored domain facts or claim every Operations surface has completed its display migration. `0127` adds the organization ISO 4217 default, guarded update and SuiteCRM Product currency projection; it does not invent exchange rates, convert existing amounts, assign currency to currency-less historical records, or change provider-owned money. These migrations do not close historical import, continuous or multi-location provider inventory synchronization, unattended inventory/receipt/poll workers, Faire inventory reconciliation, provider inventory writes, returns or full fulfillment-order coverage, recurring reconciliation and recovery operations, or production activation.
+Before this contract can become active, implementation must close the blockers in the [integration and gap map](../maps/distributed-operations-integration-gap-map.md), especially fine-grained permissions, canonical commerce receipt/poll processing, leased reconciliation and replay commands, tracking ingestion, commerce-export dispatch, queue/throughput health, quote and optimizer snapshots, split-plan representation, advanced inventory dimensions, billable lifecycle separation, and shared-service adapters. `0111` and `0112` close bounded credential, OAuth-staging, signed-receipt, cursor, and evidence-schema portions. `0113` adds only a disposable Shopify diagnostic preview. `0114` and `0115` close the bounded manager-driven catalog-mapping and operational-order workflow through durable pre-call read intent, resource-scoped pagination, row-versioned rejection disposition, explicit resolution, exact Faire order refresh, canonical-money reconciliation, and promotion. `0124` adds the bounded development Shopify location mapping, provider capture, all-state inventory evidence, and source-authority projection described above; `0169` and `0171` add only its single-account, single-location, read-only automatic freshness worker and recovery/health fences. `0125` adds only the tenant-safe organization/user preference store, optimistic organization-default command, pure conversion/formatting boundary, and application provider; it does not convert stored domain facts or claim every Operations surface has completed its display migration. `0127` adds the organization ISO 4217 default, guarded update and SuiteCRM Product currency projection; it does not invent exchange rates, convert existing amounts, assign currency to currency-less historical records, or change provider-owned money. These migrations do not close historical import, continuous multi-location or production provider inventory synchronization, unattended receipt/poll processing beyond the explicitly named development catalog, order-staging, and inventory workers, Faire inventory reconciliation, provider inventory writes, returns or full fulfillment-order coverage, general recurring reconciliation and recovery operations, or production activation.
 
 Migration `0126` changes no measurement fact and does not activate any starter
 material; it only removes an imperial-only label from untouched starter rows.

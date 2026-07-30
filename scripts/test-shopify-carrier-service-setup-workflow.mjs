@@ -22,6 +22,9 @@ const commercePanel = read(
 const setupPersistence = read(
   'app_src/lib/persistence/shopifyCarrierServiceSetup.ts',
 )
+const checkoutRatingPersistence = read(
+  'app_src/lib/persistence/shopifyCheckoutRating.ts',
+)
 const commerceIntegrations = read(
   'app_src/lib/integrations/commerceIntegrations.ts',
 )
@@ -99,7 +102,8 @@ assert.equal(
 )
 
 const actions = [
-  ['save-config', 'save-name-preference'],
+  ['save-config', 'save-plan-rate-policy'],
+  ['save-plan-rate-policy', 'save-name-preference'],
   ['save-name-preference', 'simulate-registration'],
   ['simulate-registration', 'simulate-name-alignment'],
   ['simulate-name-alignment', 'align-registration-name'],
@@ -126,6 +130,7 @@ const providerMutation = setupRoute.slice(
 )
 for (const action of [
   'save-config',
+  'save-plan-rate-policy',
   'save-name-preference',
   'simulate-registration',
   'simulate-name-alignment',
@@ -138,13 +143,85 @@ for (const action of [
   )
 }
 
-const saveConfig = actionBranch('save-config', 'save-name-preference')
+const saveConfig = actionBranch('save-config', 'save-plan-rate-policy')
 requireAll(saveConfig, [
   'requireActivator(context.capabilities.canActivate)',
+  'normalizeShopifyCheckoutPlanRatePolicy(',
+  'body.planRateOptimization',
+  "Object.prototype.hasOwnProperty.call(\n        body,\n        'planRateOptimization',",
+  'current.config.planRateOptimization',
+  'const planRateOptimization',
   'upsertShopifyCarrierServiceConfigInPostgres({',
   'callbackTokenHash: tokenHash(token)',
   'actorEmail: context.actor.email',
 ], 'save-config action')
+
+const savePlanRatePolicy = actionBranch(
+  'save-plan-rate-policy',
+  'save-name-preference',
+)
+requireAll(savePlanRatePolicy, [
+  'requireActivator(context.capabilities.canActivate)',
+  "current.reference.activation.state !== 'shadow'",
+  "Object.prototype.hasOwnProperty.call(\n          body,\n          'planRateOptimization',",
+  'normalizeShopifyCheckoutPlanRatePolicy(',
+  'updateShopifyCarrierServicePlanRatePolicyInPostgres({',
+  'expectedRowVersion: current.config.rowVersion',
+  'actorEmail: context.actor.email',
+], 'registered-safe plan-rate policy action')
+
+requireAll(checkoutRatingPersistence, [
+  'updateShopifyCarrierServicePlanRatePolicyInPostgres(',
+  'policy_revision = policy_revision + 1',
+  'policy_hash = $3',
+  'policy_snapshot = $4::jsonb',
+  'row_version = row_version + 1',
+  'providerRegistrationRetained: true',
+  'callbackTokenVersionRetained:',
+], 'policy-only optimistic persistence')
+const policyOnlyPersistenceStart = checkoutRatingPersistence.indexOf(
+  'export async function updateShopifyCarrierServicePlanRatePolicyInPostgres(',
+)
+const policyOnlyPersistenceEnd = checkoutRatingPersistence.indexOf(
+  'export async function finalizeShopifyCarrierServiceRegistrationInPostgres(',
+  policyOnlyPersistenceStart,
+)
+assert.ok(
+  policyOnlyPersistenceStart >= 0
+    && policyOnlyPersistenceEnd > policyOnlyPersistenceStart,
+  'policy-only persistence function boundary is invalid',
+)
+const policyOnlyPersistence = checkoutRatingPersistence.slice(
+  policyOnlyPersistenceStart,
+  policyOnlyPersistenceEnd,
+)
+for (const forbiddenMutation of [
+  'service_gid =',
+  'registration_state =',
+  'callback_token_version =',
+  'callback_token_hash =',
+  'warehouse_id =',
+]) {
+  assert.equal(
+    policyOnlyPersistence.includes(forbiddenMutation),
+    false,
+    `policy-only persistence must not mutate ${forbiddenMutation}`,
+  )
+}
+
+requireAll(setupPanel, [
+  'planRateOptimization: PlanRateOptimization',
+  'setPlanRateOptimization({',
+  'next.config?.planRateOptimization',
+  'planRateOptimization,',
+  'Whole-shipment carton and rate objective',
+  'Optimization priority',
+  'Candidate plan limit',
+  'Handling cost per package (minor units)',
+  'Handling cost currency (ISO 4217)',
+  "'save-plan-rate-policy'",
+  'Save rate objective only',
+], 'checkout plan-rate policy UI round trip')
 
 const saveNamePreference = actionBranch(
   'save-name-preference',

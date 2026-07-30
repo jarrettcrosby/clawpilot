@@ -64,6 +64,46 @@ function loadPersistence() {
       if (specifier === '@/lib/auditWriter') {
         return { recordAuditEvent: async () => {} }
       }
+      if (
+        specifier
+        === '@/lib/operations/shopifyCheckoutPlanRatePolicy'
+      ) {
+        const policyPath =
+          'app_src/lib/operations/shopifyCheckoutPlanRatePolicy.ts'
+        const policyOutput = ts.transpileModule(read(policyPath), {
+          compilerOptions: {
+            module: ts.ModuleKind.CommonJS,
+            target: ts.ScriptTarget.ES2022,
+            esModuleInterop: true,
+          },
+          fileName: policyPath,
+        }).outputText
+        const policyModule = { exports: {} }
+        vm.runInNewContext(policyOutput, {
+          Array,
+          Error,
+          Number,
+          Object,
+          Set,
+          String,
+          exports: policyModule.exports,
+          module: policyModule,
+          require(policySpecifier) {
+            if (policySpecifier === '../currency.ts') {
+              return {
+                DEFAULT_WORKSPACE_CURRENCY_CODE: 'USD',
+                isIso4217CurrencyCode: (value) => (
+                  typeof value === 'string'
+                  && /^[A-Z]{3}$/.test(value)
+                  && value !== 'ZZZ'
+                ),
+              }
+            }
+            return requireFromApp(policySpecifier)
+          },
+        }, { filename: policyPath })
+        return policyModule.exports
+      }
       if (specifier === '@/lib/persistence/postgres') {
         return {
           acquireTransactionAdvisoryLock: async () => {},
@@ -95,6 +135,9 @@ const offerParcelEvidenceMigration = read(
 )
 const nameAlignmentMigration = read(
   'db/migrations/0166_shopify_carrier_service_name_alignment.sql',
+)
+const planRatePolicyMigration = read(
+  'db/migrations/0170_operations_shopify_checkout_plan_rate_policy.sql',
 )
 const persistenceSource = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
@@ -167,6 +210,10 @@ includes(configSchema, [
   'policy_revision bigint NOT NULL',
   'policy_hash text NOT NULL',
   'policy_snapshot jsonb NOT NULL',
+  'UNIQUE (organization_id, integration_account_id)',
+  'UNIQUE (organization_id, id)',
+  'REFERENCES operations_warehouses(organization_id, id)',
+  'operations_shopify_carrier_service_configs_policy_redacted',
   'inventory_max_age_seconds integer NOT NULL',
   'quote_ttl_seconds integer NOT NULL',
   'quote_ttl_seconds <= inventory_max_age_seconds',
@@ -206,6 +253,25 @@ includes(nameAlignmentMigration, [
   "registered_service_name !~ '[[:cntrl:]]'",
   'Provider-confirmed name currently applied to the exact registered Shopify CarrierService',
 ], 'Optional audited checkout-name override schema')
+includes(planRatePolicyMigration, [
+  'operations_shopify_checkout_plan_rate_policy_is_valid',
+  "'shopify-checkout-plan-rate-objective-v2'",
+  "'maxCandidates', 4",
+  "'landed_price'",
+  "'package_count'",
+  "'unused_cube'",
+  "'handlingCostMinorPerPackage', 0",
+  "'handlingCostCurrency', upper(preference.currency_code)",
+  'INSERT INTO workspace_organization_preferences',
+  'WHERE preference.organization_id IS NULL',
+  'JOIN workspace_organization_preferences preference',
+  'canonical_operations_shopify_checkout_policy_jsonb',
+  'policy_revision = config.policy_revision + 1',
+  'policy_hash = encode(',
+  'row_version = config.row_version + 1',
+  'operations_shopify_configs_plan_rate_policy_valid',
+  "policy_snapshot -> 'planRateOptimization'",
+], 'Persisted tenant checkout plan-rate policy migration')
 
 const receiptSchema = section(
   migration,

@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://clawpilot.example/contracts/shopify-test-rate-isolation-readiness.schema.json",
+  "title": "Shopify strict test-rate isolation readiness",
+  "description": "Durable provider-verification authority required before the CarrierService callback may fall back to variant-only gating.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "provider",
+    "status",
+    "clawpilotAccountId",
+    "shopDomain",
+    "deliveryCustomizationGid",
+    "functionHandle",
+    "functionTarget",
+    "customerGids",
+    "rateTitlePrefixes",
+    "allowedVariantGids",
+    "configurationSha256",
+    "shopifyAppVersion",
+    "verifiedAt",
+    "verificationExpiresAt"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "provider": {
+      "const": "shopify"
+    },
+    "status": {
+      "const": "active"
+    },
+    "clawpilotAccountId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "shopDomain": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*\\.myshopify\\.com$"
+    },
+    "deliveryCustomizationGid": {
+      "type": "string",
+      "pattern": "^gid://shopify/DeliveryCustomization/[1-9][0-9]*$"
+    },
+    "functionHandle": {
+      "const": "clawpilot-test-rate-isolation"
+    },
+    "functionTarget": {
+      "const": "cart.delivery-options.transform.run"
+    },
+    "customerGids": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 50,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^gid://shopify/Customer/[1-9][0-9]*$"
+      }
+    },
+    "rateTitlePrefixes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 160
+      }
+    },
+    "allowedVariantGids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^gid://shopify/ProductVariant/[1-9][0-9]*$"
+      }
+    },
+    "configurationSha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "shopifyAppVersion": {
+      "type": "string",
+      "minLength": 1
+    },
+    "verifiedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "verificationExpiresAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "graphqlRequestId": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

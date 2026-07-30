@@ -1,5 +1,6 @@
 import {
   planHybridCartonization,
+  planHybridCartonizationCandidates,
   type HybridCartonizationInput,
   type HybridCartonizationResult,
 } from '@/lib/operations/hybridCartonization'
@@ -129,24 +130,10 @@ function assertAllocationConservation(
   }
 }
 
-/**
- * Converts fully evidenced self-packaged cases and approved-recipe cartons
- * into the one package array used for both UPS and FedEx. Geometry fallback
- * is never treated as a shippable checkout quote.
- */
-export function planShopifyCheckoutPackages(
+function readyPlanPackages(
   input: HybridCartonizationInput,
-): {
-  plan: HybridCartonizationResult
-  parcels: CheckoutRateParcel[]
-} {
-  if (input.mode !== 'production') {
-    checkoutError(
-      'SHOPIFY_CHECKOUT_PRODUCTION_EVIDENCE_REQUIRED',
-      'Shopify checkout rating requires production evidence mode',
-    )
-  }
-  const plan = planHybridCartonization(input)
+  plan: HybridCartonizationResult,
+) {
   if (plan.status !== 'ready' || plan.blockers.length) {
     checkoutError(
       'SHOPIFY_CHECKOUT_CARTONIZATION_BLOCKED',
@@ -170,8 +157,156 @@ export function planShopifyCheckoutPackages(
     )
   }
   assertAllocationConservation(input, plan)
+  return plannedPackages
+}
+
+function productionInput(input: HybridCartonizationInput) {
+  if (input.mode !== 'production') {
+    checkoutError(
+      'SHOPIFY_CHECKOUT_PRODUCTION_EVIDENCE_REQUIRED',
+      'Shopify checkout rating requires production evidence mode',
+    )
+  }
+}
+
+function cubeMm3(dimensions: {
+  length: number
+  width: number
+  height: number
+}) {
+  const cube = dimensions.length * dimensions.width * dimensions.height
+  if (!Number.isSafeInteger(cube) || cube < 1) {
+    checkoutError(
+      'SHOPIFY_CHECKOUT_PACKAGE_CUBE_INVALID',
+      'Package volume exceeds the supported exact range',
+    )
+  }
+  return cube
+}
+
+function contentCubeMm3(input: HybridCartonizationInput) {
+  let total = 0
+  for (const line of input.lines) {
+    const dimensions = line.profile.outerDimensionsMm
+    if (!dimensions) return null
+    const lineCube = cubeMm3(dimensions) * line.quantity
+    if (!Number.isSafeInteger(lineCube) || lineCube < 1) {
+      checkoutError(
+        'SHOPIFY_CHECKOUT_CONTENT_CUBE_INVALID',
+        'Content volume exceeds the supported exact range',
+      )
+    }
+    total += lineCube
+    if (!Number.isSafeInteger(total)) {
+      checkoutError(
+        'SHOPIFY_CHECKOUT_CONTENT_CUBE_INVALID',
+        'Content volume exceeds the supported exact range',
+      )
+    }
+  }
+  return total
+}
+
+export type ShopifyCheckoutPackageCandidate = {
+  candidateKey: string
+  preferenceMaterialGlobalId: string | null
+  preferenceMaterialGlobalIdsByPool: Record<string, string>
+  plan: HybridCartonizationResult
+  parcels: CheckoutRateParcel[]
+  packageOuterCubeMm3: number
+  unusedCubeMm3: number
+  cubeBasis: 'content_subtracted' | 'outer_cube_proxy'
+}
+
+/**
+ * Converts fully evidenced self-packaged cases and approved-recipe cartons
+ * into the one package array used for both UPS and FedEx. Geometry fallback
+ * is never treated as a shippable checkout quote.
+ */
+export function planShopifyCheckoutPackages(
+  input: HybridCartonizationInput,
+): {
+  plan: HybridCartonizationResult
+  parcels: CheckoutRateParcel[]
+} {
+  productionInput(input)
+  const plan = planHybridCartonization(input)
+  const plannedPackages = readyPlanPackages(input, plan)
   return {
     plan,
     parcels: plannedPackages.map(packageParcel),
   }
+}
+
+/**
+ * Produces a bounded, deterministic set of fully feasible alternatives. The
+ * carrier layer rates every alternative as one complete multi-package
+ * shipment before applying the tenant-owned objective.
+ */
+export function planShopifyCheckoutPackageCandidates(
+  input: HybridCartonizationInput,
+  options: {
+    maxCandidates: number
+    materialPreferenceOrder?: string[]
+  },
+): ShopifyCheckoutPackageCandidate[] {
+  productionInput(input)
+  if (
+    !Number.isSafeInteger(options.maxCandidates)
+    || options.maxCandidates < 1
+    || options.maxCandidates > 4
+  ) {
+    checkoutError(
+      'SHOPIFY_CHECKOUT_CANDIDATE_COUNT_INVALID',
+      'Shopify checkout supports between 1 and 4 carton candidates',
+    )
+  }
+  const candidates = planHybridCartonizationCandidates(input, options)
+  if (!candidates.length) {
+    checkoutError(
+      'SHOPIFY_CHECKOUT_CARTONIZATION_BLOCKED',
+      'Approved cartonization evidence is incomplete or stale',
+    )
+  }
+  const contentCube = contentCubeMm3(input)
+  return candidates.map((candidate) => {
+    const plannedPackages = readyPlanPackages(input, candidate.plan)
+    const packageOuterCubeMm3 = plannedPackages.reduce(
+      (total, plannedPackage) => {
+        const dimensions =
+          plannedPackage.rateReadiness.ratedOuterDimensionsMm
+        if (!dimensions) {
+          checkoutError(
+            'SHOPIFY_CHECKOUT_PACKAGE_RATE_EVIDENCE_MISSING',
+            `Package ${plannedPackage.packageKey} lacks rating dimensions`,
+          )
+        }
+        const next = total + cubeMm3(dimensions)
+        if (!Number.isSafeInteger(next)) {
+          checkoutError(
+            'SHOPIFY_CHECKOUT_PACKAGE_CUBE_INVALID',
+            'Package volume exceeds the supported exact range',
+          )
+        }
+        return next
+      },
+      0,
+    )
+    return {
+      candidateKey: candidate.candidateKey,
+      preferenceMaterialGlobalId:
+        candidate.preferenceMaterialGlobalId,
+      preferenceMaterialGlobalIdsByPool:
+        candidate.preferenceMaterialGlobalIdsByPool,
+      plan: candidate.plan,
+      parcels: plannedPackages.map(packageParcel),
+      packageOuterCubeMm3,
+      unusedCubeMm3: contentCube === null
+        ? packageOuterCubeMm3
+        : Math.max(0, packageOuterCubeMm3 - contentCube),
+      cubeBasis: contentCube === null
+        ? 'outer_cube_proxy'
+        : 'content_subtracted',
+    }
+  })
 }

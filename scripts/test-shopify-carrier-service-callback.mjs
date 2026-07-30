@@ -91,14 +91,29 @@ for (const required of [
   'expectedConfigRowVersion: account.configRowVersion',
   'expectedActivationState: account.activationState',
   'expectedActivationRevision: account.activationRevision',
-  'planShopifyCheckoutPackages(context.input)',
-  'rateCheckoutShipment({',
+  'planShopifyCheckoutPackageCandidates(',
+  'rateOptimizedCheckoutPlans({',
+  'readShopifyCheckoutPlanRatePolicy(',
+  'checkoutContextForCurrency(',
+  'planRatePolicy.handlingCostCurrency !== request.currency',
+  'materialPreferenceOrder(',
+  'feasibleRateCandidate(',
+  'candidatePlanEvidence(',
   'testCarrierSandboxShipmentRate({',
   'completeShopifyCheckoutRateReceiptInPostgres({',
   'failShopifyCheckoutRateReceiptInPostgres({',
   'customerChargeMinor: offer.amountMinor',
   'carrierAccountGlobalId: offer.carrierAccountGlobalId',
   'rateEvidenceGlobalId: offer.evidenceGlobalId',
+  'candidateAttempts: candidateDecisionEvidence',
+  'planResultHash: candidate.plan.resultHash',
+  'preferenceMaterialGlobalIdsByPool:',
+  'materialStockRowVersion:',
+  'recipeEvidence:',
+  'planInputHash:',
+  'carrierAccountGlobalId: offer.carrierAccountGlobalId',
+  'evidenceGlobalId: offer.evidenceGlobalId',
+  'failureCode:',
   'shopifyServiceCode: stableShopifyCarrierServiceCode(',
   'CALLBACK_RESPONSE_TIMEOUT_MS',
   'const workController = new AbortController()',
@@ -115,6 +130,25 @@ for (const required of [
     `callback is missing required contract: ${required}`,
   )
 }
+
+for (const required of [
+  'candidateAttempts: CheckoutPlanRateCandidateAttempt[]',
+  'const baselineCandidate = candidates[0]',
+  'alternativeBudgetMs',
+  'Promise.allSettled(alternatives.map(',
+  "failureCode: alternativeFailureCode(error)",
+  "'CHECKOUT_RATE_ALTERNATIVE_BUDGET_EXHAUSTED'",
+]) {
+  assert.ok(
+    checkoutRate.includes(required),
+    `bounded best-effort rate optimizer is missing: ${required}`,
+  )
+}
+assert.equal(
+  checkoutRate.includes('offerEligible'),
+  false,
+  'checkout rating must not claim an unpersisted delivery-promise filter',
+)
 
 for (const required of [
   'SHOPIFY_CARRIER_DISPLAY_NAMES',
@@ -216,10 +250,10 @@ assert.ok(
       'claimShopifyCheckoutRateReceiptInPostgres({',
     )
     && shadowGuard < authenticatedExecution.indexOf(
-      'planShopifyCheckoutPackages(context.input)',
+      'planShopifyCheckoutPackageCandidates(',
     )
     && shadowGuard < authenticatedExecution.indexOf(
-      'rateCheckoutShipment({',
+      'rateOptimizedCheckoutPlans({',
     ),
   'Shadow customer and variant allowlist must run before fingerprints, persistence, cartonization, or carrier calls',
 )
@@ -239,7 +273,7 @@ assert.ok(
 )
 assert.ok(
   callback.indexOf("if (claim.kind === 'in_progress')")
-    < callback.indexOf('planShopifyCheckoutPackages(context.input)'),
+    < callback.indexOf('planShopifyCheckoutPackageCandidates('),
   'an in-progress duplicate must wait for the durable receipt before cartonization or carrier calls',
 )
 const inProgressBranch = callback.slice(
@@ -282,6 +316,9 @@ for (const required of [
   "row.status !== 'active'",
   'config.row_version = $3',
   'inventorySnapshotHash',
+  'material.unit_cost_minor::text',
+  'material.currency',
+  'unitCostMinor',
 ]) {
   assert.ok(
     context.includes(required),

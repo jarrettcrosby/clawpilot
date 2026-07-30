@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "provider": "shopify",
+  "status": "active",
+  "clawpilotAccountId": "REPLACE_WITH_CLAWPILOT_ACCOUNT_ID",
+  "shopDomain": "replace-with-shop.myshopify.com",
+  "deliveryCustomizationGid": "gid://shopify/DeliveryCustomization/1234567890",
+  "functionHandle": "clawpilot-test-rate-isolation",
+  "functionTarget": "cart.delivery-options.transform.run",
+  "customerGids": [
+    "gid://shopify/Customer/1234567890"
+  ],
+  "rateTitlePrefixes": [
+    "Pro Bakery Bites · "
+  ],
+  "allowedVariantGids": [
+    "gid://shopify/ProductVariant/1234567890"
+  ],
+  "configurationSha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "shopifyAppVersion": "REPLACE_WITH_RELEASED_APP_VERSION",
+  "verifiedAt": "2026-07-30T00:00:00.000Z",
+  "verificationExpiresAt": "2026-07-30T00:15:00.000Z",
+  "graphqlRequestId": "REPLACE_WITH_SHOPIFY_REQUEST_ID"
+}

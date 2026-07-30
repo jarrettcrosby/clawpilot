@@ -1,0 +1,25 @@
+query CartDeliveryOptionsTransformRunInput {
+  cart {
+    buyerIdentity {
+      isAuthenticated
+      customer {
+        id
+      }
+    }
+    deliveryGroups {
+      deliveryOptions {
+        handle
+        title
+        deliveryMethodType
+      }
+    }
+  }
+  deliveryCustomization {
+    metafield(
+      namespace: "$app:clawpilot-test-rate-isolation"
+      key: "function-configuration"
+    ) {
+      jsonValue
+    }
+  }
+}

@@ -22,6 +22,11 @@ import {
 } from '@/lib/integrations/commerceIntegrations'
 import { HYBRID_CARTONIZATION_ALGORITHM_VERSION } from '@/lib/operations/hybridCartonization'
 import {
+  normalizeShopifyCheckoutPlanRatePolicy,
+  readShopifyCheckoutPlanRatePolicy,
+  ShopifyCheckoutPlanRatePolicyError,
+} from '@/lib/operations/shopifyCheckoutPlanRatePolicy'
+import {
   activeOperationsOrganizationId,
   operationsCapabilities,
 } from '@/lib/operations/authorization'
@@ -39,6 +44,7 @@ import {
   shopifyCheckoutRatingHash,
   ShopifyCheckoutRatingPersistenceError,
   updateShopifyCarrierServiceBrandNameOverrideInPostgres,
+  updateShopifyCarrierServicePlanRatePolicyInPostgres,
   upsertShopifyCarrierServiceConfigInPostgres,
   type ShopifyCarrierServiceConfig,
   type ShopifyCheckoutCarrierProvider,
@@ -110,6 +116,12 @@ function errorResponse(error: unknown) {
     return json(
       { ok: false, error: error.message, code: error.code },
       error.status,
+    )
+  }
+  if (error instanceof ShopifyCheckoutPlanRatePolicyError) {
+    return json(
+      { ok: false, error: error.message, code: error.code },
+      400,
     )
   }
   if (error instanceof ShopifyCarrierServiceRegistrationError) {
@@ -349,6 +361,9 @@ function publicCarrierServiceConfig(
     callbackTokenVersion: config.callbackTokenVersion,
     policyRevision: config.policyRevision,
     policyHash: config.policyHash,
+    planRateOptimization: readShopifyCheckoutPlanRatePolicy(
+      config.policySnapshot,
+    ),
     inventoryMaxAgeSeconds: config.inventoryMaxAgeSeconds,
     quoteTtlSeconds: config.quoteTtlSeconds,
     orderReconciliationWindowSeconds:
@@ -1159,15 +1174,29 @@ export async function POST(req: NextRequest) {
       const policyRevision = current.config
         ? current.config.policyRevision + 1
         : 1
+      const planRateOptimization = Object.prototype.hasOwnProperty.call(
+        body,
+        'planRateOptimization',
+      )
+        ? normalizeShopifyCheckoutPlanRatePolicy(
+            body.planRateOptimization,
+          )
+        : current.config
+          ? normalizeShopifyCheckoutPlanRatePolicy(
+              current.config.planRateOptimization,
+            )
+          : normalizeShopifyCheckoutPlanRatePolicy(undefined)
       const policySnapshot = {
         version: 'shopify-checkout-rating-policy-v1',
         ratingMode: 'whole_shipment',
         inventoryPolicy: 'fresh_atp_fail_closed',
         materialPolicy: 'revision_fenced_rated_outer_dimensions',
         carrierPolicy: 'all_configured_providers_once',
-        pricingPolicy: 'carrier_cost_without_effective_directive',
+        pricingPolicy:
+          'carton_selection_uses_landed_cost_customer_charge_is_carrier_cost',
         servicePolicy: 'one_service_for_every_package',
         algorithmVersion: HYBRID_CARTONIZATION_ALGORITHM_VERSION,
+        planRateOptimization,
       }
       const token = shopifyCarrierServiceCallbackToken({
         organizationId: context.organizationId,
@@ -1208,6 +1237,43 @@ export async function POST(req: NextRequest) {
           172800,
         ),
         algorithmVersion: HYBRID_CARTONIZATION_ALGORITHM_VERSION,
+        actorEmail: context.actor.email,
+      })
+    } else if (action === 'save-plan-rate-policy') {
+      requireActivator(context.capabilities.canActivate)
+      if (!current.config) {
+        fail(
+          'SHOPIFY_CARRIER_SERVICE_CONFIG_REQUIRED',
+          'Save the Shopify checkout-rating configuration first',
+          404,
+        )
+      }
+      if (current.reference.activation.state !== 'shadow') {
+        fail(
+          'SHOPIFY_CHECKOUT_POLICY_SHADOW_REQUIRED',
+          'Set Operations to Shadow before changing the checkout rate objective',
+          409,
+        )
+      }
+      if (
+        !Object.prototype.hasOwnProperty.call(
+          body,
+          'planRateOptimization',
+        )
+      ) {
+        fail(
+          'SHOPIFY_CHECKOUT_PLAN_RATE_POLICY_REQUIRED',
+          'Checkout plan-rate policy is required',
+          400,
+        )
+      }
+      await updateShopifyCarrierServicePlanRatePolicyInPostgres({
+        organizationId: context.organizationId,
+        accountGlobalId: accountId,
+        expectedRowVersion: current.config.rowVersion,
+        planRateOptimization: normalizeShopifyCheckoutPlanRatePolicy(
+          body.planRateOptimization,
+        ),
         actorEmail: context.actor.email,
       })
     } else if (action === 'save-name-preference') {

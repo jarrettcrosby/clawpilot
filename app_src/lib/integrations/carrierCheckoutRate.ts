@@ -70,6 +70,54 @@ export type CheckoutShipmentRateResult = {
   completedAt: string
 }
 
+export type CheckoutPlanRateCandidate = {
+  candidateKey: string
+  parcels: CheckoutRateParcel[]
+  materialCostMinor: number
+  unusedCubeMm3: number
+}
+
+export type CheckoutPlanRateObjective =
+  | 'landed_price'
+  | 'package_count'
+  | 'unused_cube'
+
+export type CheckoutPlanRateObjectivePolicy = {
+  version: string
+  maxCandidates: number
+  objectivePriority: CheckoutPlanRateObjective[]
+  handlingCostMinorPerPackage: number
+  handlingCostCurrency: string
+}
+
+export type CheckoutPlanRateEvaluation = {
+  candidateKey: string
+  packageCount: number
+  materialCostMinor: number
+  handlingCostMinor: number
+  unusedCubeMm3: number
+  offer: CheckoutRateOffer
+  landedPriceMinor: number
+}
+
+export type CheckoutPlanRateCandidateAttempt = {
+  candidate: CheckoutPlanRateCandidate
+  status: 'succeeded' | 'degraded'
+  result: CheckoutShipmentRateResult | null
+  evaluation: CheckoutPlanRateEvaluation | null
+  failureCode: string | null
+}
+
+export type OptimizedCheckoutPlanRateResult = {
+  objectiveVersion: string
+  selectedCandidate: CheckoutPlanRateCandidate
+  selectedOffer: CheckoutRateOffer
+  selectedRateResult: CheckoutShipmentRateResult
+  selectedEvaluation: CheckoutPlanRateEvaluation
+  candidateEvaluations: CheckoutPlanRateEvaluation[]
+  candidateAttempts: CheckoutPlanRateCandidateAttempt[]
+}
+
 export class CheckoutShipmentRateError extends Error {
   readonly code: string
   readonly provider: CheckoutRateCarrierProvider | null
@@ -92,6 +140,7 @@ const SERVICE_CODE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/
 const EVIDENCE_GLOBAL_ID = /^[a-z]{2,4}[0-9]{7}$/
 const CURRENCY = /^[A-Z]{3}$/
 const DECIMAL_MONEY = /^(?:0|[1-9][0-9]{0,12})(?:\.[0-9]{1,2})?$/
+export const CHECKOUT_RATE_ALTERNATIVE_BUDGET_MS = 1_000
 
 function rateError(
   code: string,
@@ -414,5 +463,344 @@ export async function rateCheckoutShipment(input: {
       input.signal?.removeEventListener('abort', abortFromCaller)
     }
     controller.abort()
+  }
+}
+
+function exactNonnegative(value: unknown, label: string) {
+  if (
+    !Number.isSafeInteger(value)
+    || Number(value) < 0
+    || Number(value) > Number.MAX_SAFE_INTEGER
+  ) {
+    rateError(
+      'CHECKOUT_RATE_OPTIMIZER_INPUT_INVALID',
+      `${label} must be an exact nonnegative integer`,
+    )
+  }
+  return Number(value)
+}
+
+function comparePlanRateEvaluation(
+  left: CheckoutPlanRateEvaluation,
+  right: CheckoutPlanRateEvaluation,
+  objectivePriority: CheckoutPlanRateObjective[],
+) {
+  for (const objective of objectivePriority) {
+    const compared = objective === 'landed_price'
+      ? left.landedPriceMinor - right.landedPriceMinor
+      : objective === 'package_count'
+        ? left.packageCount - right.packageCount
+        : left.unusedCubeMm3 - right.unusedCubeMm3
+    if (compared !== 0) return compared
+  }
+  return (
+    left.candidateKey.localeCompare(right.candidateKey)
+    || left.offer.carrierCode.localeCompare(right.offer.carrierCode)
+    || left.offer.serviceLevelCode.localeCompare(
+      right.offer.serviceLevelCode,
+    )
+  )
+}
+
+function evaluateCandidateRate(
+  candidate: CheckoutPlanRateCandidate,
+  result: CheckoutShipmentRateResult,
+  policy: CheckoutPlanRateObjectivePolicy,
+  handlingCostMinorPerPackage: number,
+) {
+  const handlingCostMinor =
+    handlingCostMinorPerPackage * result.packageCount
+  if (!Number.isSafeInteger(handlingCostMinor)) {
+    rateError(
+      'CHECKOUT_RATE_OPTIMIZER_INPUT_INVALID',
+      'Handling cost exceeds the supported exact range',
+    )
+  }
+  const evaluations = result.offers.map((offer) => {
+    const landedPriceMinor =
+      offer.amountMinor
+      + candidate.materialCostMinor
+      + handlingCostMinor
+    if (!Number.isSafeInteger(landedPriceMinor)) {
+      rateError(
+        'CHECKOUT_RATE_OPTIMIZER_INPUT_INVALID',
+        'Landed price exceeds the supported exact range',
+      )
+    }
+    return {
+      candidateKey: candidate.candidateKey,
+      packageCount: result.packageCount,
+      materialCostMinor: candidate.materialCostMinor,
+      handlingCostMinor,
+      unusedCubeMm3: candidate.unusedCubeMm3,
+      offer,
+      landedPriceMinor,
+    } satisfies CheckoutPlanRateEvaluation
+  }).sort((left, right) => comparePlanRateEvaluation(
+    left,
+    right,
+    policy.objectivePriority,
+  ))
+  if (!evaluations[0]) {
+    rateError(
+      'CHECKOUT_RATE_OPTIMIZER_RESULT_INVALID',
+      'A successful whole-shipment candidate returned no offers',
+    )
+  }
+  return evaluations[0]
+}
+
+function alternativeFailureCode(error: unknown) {
+  const code = error && typeof error === 'object'
+    ? (error as { code?: unknown }).code
+    : null
+  return typeof code === 'string' && /^[A-Z0-9_]{3,100}$/.test(code)
+    ? code
+    : 'CHECKOUT_RATE_ALTERNATIVE_FAILED'
+}
+
+/**
+ * Rates the first feasible plan as the authoritative baseline. Optional
+ * bounded alternatives are then rated best-effort under a separate deadline.
+ * Every successful candidate is still one complete multi-package shipment:
+ * provider services are never stitched package-by-package. Baseline failure
+ * (including a missing required carrier) fails closed; an optional candidate
+ * failure is retained as degraded decision evidence.
+ */
+export async function rateOptimizedCheckoutPlans(input: {
+  destination: CheckoutRateDestination
+  candidates: CheckoutPlanRateCandidate[]
+  carriers: CheckoutRateCarrierSelection[]
+  currency: string
+  deadlineAt: number
+  policy: CheckoutPlanRateObjectivePolicy
+  signal?: AbortSignal
+  alternativeBudgetMs?: number
+  invoke: (
+    selection: CheckoutRateCarrierSelection,
+    request: {
+      destination: CheckoutRateDestination
+      parcels: CheckoutRateCarrierParcel[]
+      signal: AbortSignal
+    },
+  ) => Promise<CheckoutRateProviderResult>
+  now?: () => number
+}): Promise<OptimizedCheckoutPlanRateResult> {
+  if (
+    !Array.isArray(input.candidates)
+    || input.candidates.length < 1
+    || input.candidates.length > 4
+    || input.candidates.length > input.policy.maxCandidates
+  ) {
+    rateError(
+      'CHECKOUT_RATE_OPTIMIZER_INPUT_INVALID',
+      'Checkout optimization requires a bounded candidate set',
+    )
+  }
+  const expectedObjectives: CheckoutPlanRateObjective[] = [
+    'landed_price',
+    'package_count',
+    'unused_cube',
+  ]
+  if (
+    typeof input.policy.version !== 'string'
+    || !input.policy.version.trim()
+    || !Number.isSafeInteger(input.policy.maxCandidates)
+    || input.policy.maxCandidates < 1
+    || input.policy.maxCandidates > 4
+    || !Array.isArray(input.policy.objectivePriority)
+    || input.policy.objectivePriority.length !== expectedObjectives.length
+    || new Set(input.policy.objectivePriority).size
+      !== expectedObjectives.length
+    || input.policy.objectivePriority.some(
+      (objective) => !expectedObjectives.includes(objective),
+    )
+    || !CURRENCY.test(input.policy.handlingCostCurrency)
+  ) {
+    rateError(
+      'CHECKOUT_RATE_OPTIMIZER_POLICY_INVALID',
+      'Checkout optimization policy is invalid',
+    )
+  }
+  const handlingCostMinorPerPackage = exactNonnegative(
+    input.policy.handlingCostMinorPerPackage,
+    'Handling cost per package',
+  )
+  if (input.policy.handlingCostCurrency !== input.currency) {
+    rateError(
+      'CHECKOUT_RATE_OPTIMIZER_CURRENCY_MISMATCH',
+      'Handling cost currency must match the checkout rating currency',
+    )
+  }
+  const candidateKeys = new Set<string>()
+  const candidates = input.candidates.map((candidate) => {
+    if (
+      !candidate
+      || !PACKAGE_KEY.test(candidate.candidateKey)
+      || candidateKeys.has(candidate.candidateKey)
+    ) {
+      rateError(
+        'CHECKOUT_RATE_OPTIMIZER_INPUT_INVALID',
+        'Checkout carton candidates require unique stable keys',
+      )
+    }
+    candidateKeys.add(candidate.candidateKey)
+    return {
+      ...candidate,
+      materialCostMinor: exactNonnegative(
+        candidate.materialCostMinor,
+        'Material cost',
+      ),
+      unusedCubeMm3: exactNonnegative(
+        candidate.unusedCubeMm3,
+        'Unused package cube',
+      ),
+    }
+  })
+  const alternativeBudgetMs =
+    input.alternativeBudgetMs ?? CHECKOUT_RATE_ALTERNATIVE_BUDGET_MS
+  if (
+    !Number.isSafeInteger(alternativeBudgetMs)
+    || alternativeBudgetMs < 10
+    || alternativeBudgetMs > 5_000
+  ) {
+    rateError(
+      'CHECKOUT_RATE_OPTIMIZER_INPUT_INVALID',
+      'Alternative rating budget must be between 10 and 5000 milliseconds',
+    )
+  }
+  const now = input.now ?? Date.now
+  const baselineCandidate = candidates[0]
+  const baselineResult = await rateCheckoutShipment({
+    destination: input.destination,
+    parcels: baselineCandidate.parcels,
+    carriers: input.carriers,
+    currency: input.currency,
+    deadlineAt: input.deadlineAt,
+    signal: input.signal,
+    invoke: input.invoke,
+    now: input.now,
+  })
+  const baselineEvaluation = evaluateCandidateRate(
+    baselineCandidate,
+    baselineResult,
+    input.policy,
+    handlingCostMinorPerPackage,
+  )
+  const candidateAttempts: CheckoutPlanRateCandidateAttempt[] = [{
+    candidate: baselineCandidate,
+    status: 'succeeded',
+    result: baselineResult,
+    evaluation: baselineEvaluation,
+    failureCode: null,
+  }]
+  const rated: Array<{
+    candidate: CheckoutPlanRateCandidate
+    result: CheckoutShipmentRateResult
+  }> = [{
+    candidate: baselineCandidate,
+    result: baselineResult,
+  }]
+  const alternatives = candidates.slice(1)
+  if (alternatives.length) {
+    const remainingAtStart = input.deadlineAt - now()
+    const alternativeDeadlineAt = Math.min(
+      input.deadlineAt,
+      now() + alternativeBudgetMs,
+    )
+    if (remainingAtStart <= 0 || alternativeDeadlineAt <= now()) {
+      for (const candidate of alternatives) {
+        candidateAttempts.push({
+          candidate,
+          status: 'degraded',
+          result: null,
+          evaluation: null,
+          failureCode: 'CHECKOUT_RATE_ALTERNATIVE_BUDGET_EXHAUSTED',
+        })
+      }
+    } else {
+      const settled = await Promise.allSettled(alternatives.map(
+        async (candidate) => ({
+          candidate,
+          result: await rateCheckoutShipment({
+            destination: input.destination,
+            parcels: candidate.parcels,
+            carriers: input.carriers,
+            currency: input.currency,
+            deadlineAt: alternativeDeadlineAt,
+            signal: input.signal,
+            invoke: input.invoke,
+            now: input.now,
+          }),
+        }),
+      ))
+      settled.forEach((outcome, index) => {
+        const candidate = alternatives[index]
+        if (outcome.status === 'rejected') {
+          candidateAttempts.push({
+            candidate,
+            status: 'degraded',
+            result: null,
+            evaluation: null,
+            failureCode: alternativeFailureCode(outcome.reason),
+          })
+          return
+        }
+        try {
+          const evaluation = evaluateCandidateRate(
+            candidate,
+            outcome.value.result,
+            input.policy,
+            handlingCostMinorPerPackage,
+          )
+          rated.push(outcome.value)
+          candidateAttempts.push({
+            candidate,
+            status: 'succeeded',
+            result: outcome.value.result,
+            evaluation,
+            failureCode: null,
+          })
+        } catch (error) {
+          candidateAttempts.push({
+            candidate,
+            status: 'degraded',
+            result: outcome.value.result,
+            evaluation: null,
+            failureCode: alternativeFailureCode(error),
+          })
+        }
+      })
+    }
+  }
+  const candidateEvaluations = candidateAttempts
+    .flatMap((attempt) => attempt.evaluation ? [attempt.evaluation] : [])
+    .sort((left, right) => (
+    comparePlanRateEvaluation(
+      left,
+      right,
+      input.policy.objectivePriority,
+    )
+  ))
+  const selectedEvaluation = candidateEvaluations[0]
+  const selected = rated.find(
+    ({ candidate }) => (
+      candidate.candidateKey === selectedEvaluation.candidateKey
+    ),
+  )
+  if (!selected) {
+    rateError(
+      'CHECKOUT_RATE_OPTIMIZER_RESULT_INVALID',
+      'Selected checkout carton plan is unavailable',
+    )
+  }
+  return {
+    objectiveVersion: input.policy.version,
+    selectedCandidate: selected.candidate,
+    selectedOffer: selectedEvaluation.offer,
+    selectedRateResult: selected.result,
+    selectedEvaluation,
+    candidateEvaluations,
+    candidateAttempts,
   }
 }

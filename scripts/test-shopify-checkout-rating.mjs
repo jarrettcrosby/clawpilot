@@ -150,6 +150,165 @@ assert.deepEqual(JSON.parse(JSON.stringify({
 })
 assert.equal(ready.plan.recipePackages[0].lineAllocations[0].quantity, 12)
 
+const alternatives = input()
+alternatives.lines[0].quantity = 20
+alternatives.materials.push({
+  ...structuredClone(alternatives.materials[0]),
+  materialGlobalId: 'gpkm0000002',
+  ratedOuterDimensionsMm: {
+    length: 240,
+    width: 180,
+    height: 120,
+  },
+})
+alternatives.recipes.push({
+  ...structuredClone(alternatives.recipes[0]),
+  recipeGlobalId: 'gpre0000002',
+  packagingMaterialGlobalId: 'gpkm0000002',
+  recipeType: 'max_capacity',
+  maximumInputQuantity: 6,
+  minimumInputQuantity: 1,
+})
+const bounded = checkout.planShopifyCheckoutPackageCandidates(
+  alternatives,
+  {
+    maxCandidates: 4,
+    materialPreferenceOrder: ['gpkm0000001', 'gpkm0000002'],
+  },
+)
+assert.equal(bounded.length, 2)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(bounded.map((candidate) => (
+    candidate.parcels.length
+  )))),
+  [3, 4],
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(bounded.map((candidate) => (
+    candidate.candidateKey
+  )))),
+  JSON.parse(JSON.stringify(
+    checkout.planShopifyCheckoutPackageCandidates(
+      alternatives,
+      {
+        maxCandidates: 4,
+        materialPreferenceOrder: ['gpkm0000001', 'gpkm0000002'],
+      },
+    ).map((candidate) => candidate.candidateKey),
+  )),
+)
+assert.equal(
+  checkout.planShopifyCheckoutPackageCandidates(
+    alternatives,
+    { maxCandidates: 1 },
+  ).length,
+  1,
+)
+
+const weightConstrained = input()
+weightConstrained.lines[0].quantity = 20
+weightConstrained.recipes[0].recipeType = 'max_capacity'
+weightConstrained.recipes[0].maximumInputQuantity = 20
+weightConstrained.recipes[0].minimumInputQuantity = 1
+weightConstrained.materials[0].maximumGrossWeightGrams =
+  weightConstrained.materials[0].tareWeightGrams
+  + (10 * weightConstrained.lines[0].unitWeightGrams)
+weightConstrained.materials[0].availableQuantity = 2
+const weightConstrainedReady =
+  checkout.planShopifyCheckoutPackages(weightConstrained)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    weightConstrainedReady.plan.recipePackages.map(
+      (plannedPackage) => plannedPackage.totalInputQuantity,
+    ),
+  )),
+  [10, 10],
+  'an evidenced gross-weight limit must split an overweight carton during planning',
+)
+
+const stockConstrained = input()
+stockConstrained.lines[0].quantity = 20
+stockConstrained.recipes[0].recipeType = 'max_capacity'
+stockConstrained.recipes[0].minimumInputQuantity = 1
+stockConstrained.materials[0].availableQuantity = 1
+stockConstrained.materials.push({
+  ...structuredClone(stockConstrained.materials[0]),
+  materialGlobalId: 'gpkm0000002',
+  availableQuantity: 2,
+})
+stockConstrained.recipes.push({
+  ...structuredClone(stockConstrained.recipes[0]),
+  recipeGlobalId: 'gpre0000002',
+  packagingMaterialGlobalId: 'gpkm0000002',
+  maximumInputQuantity: 6,
+})
+const stockConstrainedReady =
+  checkout.planShopifyCheckoutPackages(stockConstrained)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    stockConstrainedReady.plan.recipePackages.map(
+      (plannedPackage) => plannedPackage.packagingMaterialGlobalId,
+    ),
+  )),
+  ['gpkm0000001', 'gpkm0000002', 'gpkm0000002'],
+  'material stock must cause a feasible mixed-material plan instead of a post-plan rejection',
+)
+
+const independentPools = input()
+independentPools.materials.push({
+  ...structuredClone(independentPools.materials[0]),
+  materialGlobalId: 'gpkm0000002',
+})
+independentPools.recipes.push({
+  ...structuredClone(independentPools.recipes[0]),
+  recipeGlobalId: 'gpre0000002',
+  packagingMaterialGlobalId: 'gpkm0000002',
+})
+independentPools.lines.push({
+  ...structuredClone(independentPools.lines[0]),
+  lineGlobalId: 'line-2',
+  productGlobalId: 'gp0000002',
+  title: 'Bacon Bites 6 oz',
+  profile: {
+    ...structuredClone(independentPools.lines[0].profile),
+    versionGlobalId: 'gppv0000003',
+  },
+})
+independentPools.recipes.push(
+  {
+    ...structuredClone(independentPools.recipes[0]),
+    recipeGlobalId: 'gpre0000003',
+    productGlobalId: 'gp0000002',
+    inputPackProfileVersionGlobalId: 'gppv0000003',
+  },
+  {
+    ...structuredClone(independentPools.recipes[1]),
+    recipeGlobalId: 'gpre0000004',
+    productGlobalId: 'gp0000002',
+    inputPackProfileVersionGlobalId: 'gppv0000003',
+  },
+)
+const mixedPoolCandidates = checkout.planShopifyCheckoutPackageCandidates(
+  independentPools,
+  {
+    maxCandidates: 4,
+    materialPreferenceOrder: ['gpkm0000001', 'gpkm0000002'],
+  },
+)
+const mixedPoolMaterialChoices = mixedPoolCandidates.map((candidate) => (
+  candidate.plan.recipePackages
+    .map((plannedPackage) => plannedPackage.packagingMaterialGlobalId)
+    .join('|')
+))
+assert.ok(
+  mixedPoolMaterialChoices.includes('gpkm0000001|gpkm0000002'),
+  'bounded search must generate mixed choices across independent pools',
+)
+assert.ok(
+  mixedPoolMaterialChoices.includes('gpkm0000002|gpkm0000001'),
+  'bounded search must explore the inverse independent-pool choice',
+)
+
 const sealedCase = input()
 sealedCase.lines[0] = {
   ...sealedCase.lines[0],

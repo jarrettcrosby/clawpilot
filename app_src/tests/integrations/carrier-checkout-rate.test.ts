@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   CheckoutShipmentRateError,
   rateCheckoutShipment,
+  rateOptimizedCheckoutPlans,
   type CheckoutRateCarrierSelection,
   type CheckoutRateProviderResult,
 } from '../../lib/integrations/carrierCheckoutRate.ts'
@@ -135,6 +136,532 @@ test('rates the complete package set exactly once per required carrier', async (
     [
       { carrierCode: 'fedex', amountMinor: 3962 },
       { carrierCode: 'ups', amountMinor: 4285 },
+    ],
+  )
+})
+
+function optimizedResult(
+  selection: CheckoutRateCarrierSelection,
+  packageCount: number,
+  amount: string,
+): CheckoutRateProviderResult {
+  return {
+    ...result(selection, amount),
+    packageCount,
+  }
+}
+
+const priceFirstPolicy = {
+  version: 'tenant-policy-v1',
+  maxCandidates: 4,
+  objectivePriority: [
+    'landed_price',
+    'package_count',
+    'unused_cube',
+  ] as const,
+  handlingCostMinorPerPackage: 0,
+  handlingCostCurrency: 'USD',
+}
+
+test('selects the lowest whole-shipment landed price across carton plans', async () => {
+  const response = await rateOptimizedCheckoutPlans({
+    destination,
+    candidates: [
+      {
+        candidateKey: 'candidate-dense',
+        parcels: [parcels[0]],
+        materialCostMinor: 500,
+        unusedCubeMm3: 100,
+      },
+      {
+        candidateKey: 'candidate-cheap',
+        parcels,
+        materialCostMinor: 10,
+        unusedCubeMm3: 200,
+      },
+    ],
+    carriers,
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    policy: {
+      ...priceFirstPolicy,
+      objectivePriority: [...priceFirstPolicy.objectivePriority],
+    },
+    invoke: async (selection, request) => optimizedResult(
+      selection,
+      request.parcels.length,
+      request.parcels.length === 1 ? '10.00' : '12.00',
+    ),
+  })
+
+  assert.equal(response.selectedCandidate.candidateKey, 'candidate-cheap')
+  assert.equal(response.selectedEvaluation.landedPriceMinor, 1210)
+  assert.equal(response.selectedRateResult.packageCount, 2)
+})
+
+test('uses least unused cube when whole-shipment landed price ties', async () => {
+  const response = await rateOptimizedCheckoutPlans({
+    destination,
+    candidates: [
+      {
+        candidateKey: 'candidate-loose',
+        parcels: [parcels[0]],
+        materialCostMinor: 25,
+        unusedCubeMm3: 500,
+      },
+      {
+        candidateKey: 'candidate-dense',
+        parcels: [parcels[0]],
+        materialCostMinor: 25,
+        unusedCubeMm3: 100,
+      },
+    ],
+    carriers,
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    policy: {
+      ...priceFirstPolicy,
+      objectivePriority: [...priceFirstPolicy.objectivePriority],
+    },
+    invoke: async (selection, request) => optimizedResult(
+      selection,
+      request.parcels.length,
+      '10.00',
+    ),
+  })
+
+  assert.equal(response.selectedCandidate.candidateKey, 'candidate-dense')
+})
+
+test('uses fewer packages before cube when landed price ties', async () => {
+  const response = await rateOptimizedCheckoutPlans({
+    destination,
+    candidates: [
+      {
+        candidateKey: 'candidate-one-package',
+        parcels: [parcels[0]],
+        materialCostMinor: 25,
+        unusedCubeMm3: 500,
+      },
+      {
+        candidateKey: 'candidate-two-packages',
+        parcels,
+        materialCostMinor: 25,
+        unusedCubeMm3: 100,
+      },
+    ],
+    carriers,
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    policy: {
+      ...priceFirstPolicy,
+      objectivePriority: [...priceFirstPolicy.objectivePriority],
+    },
+    invoke: async (selection, request) => optimizedResult(
+      selection,
+      request.parcels.length,
+      '10.00',
+    ),
+  })
+
+  assert.equal(
+    response.selectedCandidate.candidateKey,
+    'candidate-one-package',
+  )
+})
+
+test('stable candidate and service identifiers resolve exact ties', async () => {
+  const response = await rateOptimizedCheckoutPlans({
+    destination,
+    candidates: [
+      {
+        candidateKey: 'candidate-z',
+        parcels: [parcels[0]],
+        materialCostMinor: 25,
+        unusedCubeMm3: 100,
+      },
+      {
+        candidateKey: 'candidate-a',
+        parcels: [parcels[0]],
+        materialCostMinor: 25,
+        unusedCubeMm3: 100,
+      },
+    ],
+    carriers,
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    policy: {
+      ...priceFirstPolicy,
+      objectivePriority: [...priceFirstPolicy.objectivePriority],
+    },
+    invoke: async (selection, request) => optimizedResult(
+      selection,
+      request.parcels.length,
+      '10.00',
+    ),
+  })
+
+  assert.equal(response.selectedCandidate.candidateKey, 'candidate-a')
+  assert.equal(response.selectedOffer.carrierCode, 'fedex')
+})
+
+test('stored objective priority changes selection without changing code', async () => {
+  const candidates = [
+    {
+      candidateKey: 'candidate-low-price',
+      parcels,
+      materialCostMinor: 0,
+      unusedCubeMm3: 500,
+    },
+    {
+      candidateKey: 'candidate-dense',
+      parcels: [parcels[0]],
+      materialCostMinor: 0,
+      unusedCubeMm3: 100,
+    },
+  ]
+  const invoke = async (
+    selection: CheckoutRateCarrierSelection,
+    request: { parcels: Array<unknown> },
+  ) => optimizedResult(
+    selection,
+    request.parcels.length,
+    request.parcels.length === 2 ? '8.00' : '10.00',
+  )
+  const priceFirst = await rateOptimizedCheckoutPlans({
+    destination,
+    candidates,
+    carriers,
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    policy: {
+      ...priceFirstPolicy,
+      objectivePriority: [...priceFirstPolicy.objectivePriority],
+    },
+    invoke,
+  })
+  const cubeFirst = await rateOptimizedCheckoutPlans({
+    destination,
+    candidates,
+    carriers,
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    policy: {
+      ...priceFirstPolicy,
+      objectivePriority: [
+        'unused_cube',
+        'landed_price',
+        'package_count',
+      ],
+    },
+    invoke,
+  })
+
+  assert.equal(
+    priceFirst.selectedCandidate.candidateKey,
+    'candidate-low-price',
+  )
+  assert.equal(cubeFirst.selectedCandidate.candidateKey, 'candidate-dense')
+})
+
+test('rates every candidate with one service covering its full package set', async () => {
+  const calls: Array<{ candidate: string; provider: string; count: number }> = []
+  const candidates = [
+    {
+      candidateKey: 'candidate-two',
+      parcels,
+      materialCostMinor: 0,
+      unusedCubeMm3: 200,
+    },
+    {
+      candidateKey: 'candidate-one',
+      parcels: [parcels[0]],
+      materialCostMinor: 0,
+      unusedCubeMm3: 100,
+    },
+  ]
+  await rateOptimizedCheckoutPlans({
+    destination,
+    candidates,
+    carriers,
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    policy: {
+      ...priceFirstPolicy,
+      objectivePriority: [...priceFirstPolicy.objectivePriority],
+    },
+    invoke: async (selection, request) => {
+      calls.push({
+        candidate: request.parcels.length === 2
+          ? 'candidate-two'
+          : 'candidate-one',
+        provider: selection.provider,
+        count: request.parcels.length,
+      })
+      return optimizedResult(
+        selection,
+        request.parcels.length,
+        '10.00',
+      )
+    },
+  })
+
+  assert.deepEqual(calls.sort((left, right) => (
+    left.candidate.localeCompare(right.candidate)
+    || left.provider.localeCompare(right.provider)
+  )), [
+    { candidate: 'candidate-one', provider: 'fedex_rest', count: 1 },
+    { candidate: 'candidate-one', provider: 'ups_rest', count: 1 },
+    { candidate: 'candidate-two', provider: 'fedex_rest', count: 2 },
+    { candidate: 'candidate-two', provider: 'ups_rest', count: 2 },
+  ])
+})
+
+test('fails closed when the authoritative baseline loses a required carrier', async () => {
+  let alternativeCalls = 0
+  await assert.rejects(
+    rateOptimizedCheckoutPlans({
+      destination,
+      candidates: [
+        {
+          candidateKey: 'candidate-baseline',
+          parcels: [parcels[0]],
+          materialCostMinor: 0,
+          unusedCubeMm3: 100,
+        },
+        {
+          candidateKey: 'candidate-alternative',
+          parcels,
+          materialCostMinor: 0,
+          unusedCubeMm3: 50,
+        },
+      ],
+      carriers,
+      currency: 'USD',
+      deadlineAt: Date.now() + 5_000,
+      policy: {
+        ...priceFirstPolicy,
+        objectivePriority: [...priceFirstPolicy.objectivePriority],
+      },
+      invoke: async (selection, request) => {
+        if (request.parcels.length > 1) alternativeCalls += 1
+        if (selection.provider === 'fedex_rest') {
+          throw new Error('baseline provider unavailable')
+        }
+        return optimizedResult(
+          selection,
+          request.parcels.length,
+          '10.00',
+        )
+      },
+    }),
+    (error: unknown) => (
+      error instanceof CheckoutShipmentRateError
+      && error.code === 'CHECKOUT_RATE_REQUIRED_CARRIER_FAILED'
+      && error.provider === 'fedex_rest'
+    ),
+  )
+  assert.equal(alternativeCalls, 0)
+})
+
+test('retains a complete baseline when an optional candidate loses a carrier', async () => {
+  const response = await rateOptimizedCheckoutPlans({
+    destination,
+    candidates: [
+      {
+        candidateKey: 'candidate-baseline',
+        parcels: [parcels[0]],
+        materialCostMinor: 0,
+        unusedCubeMm3: 100,
+      },
+      {
+        candidateKey: 'candidate-alternative',
+        parcels,
+        materialCostMinor: 0,
+        unusedCubeMm3: 50,
+      },
+    ],
+    carriers,
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    policy: {
+      ...priceFirstPolicy,
+      objectivePriority: [...priceFirstPolicy.objectivePriority],
+    },
+    invoke: async (selection, request) => {
+      if (
+        request.parcels.length === 2
+        && selection.provider === 'fedex_rest'
+      ) {
+        throw new Error('alternative provider unavailable')
+      }
+      return optimizedResult(
+        selection,
+        request.parcels.length,
+        '10.00',
+      )
+    },
+  })
+
+  assert.equal(response.selectedCandidate.candidateKey, 'candidate-baseline')
+  assert.deepEqual(
+    response.candidateAttempts.map((attempt) => ({
+      key: attempt.candidate.candidateKey,
+      status: attempt.status,
+      failureCode: attempt.failureCode,
+      offers: attempt.result?.offers.length ?? 0,
+    })),
+    [
+      {
+        key: 'candidate-baseline',
+        status: 'succeeded',
+        failureCode: null,
+        offers: 2,
+      },
+      {
+        key: 'candidate-alternative',
+        status: 'degraded',
+        failureCode: 'CHECKOUT_RATE_REQUIRED_CARRIER_FAILED',
+        offers: 0,
+      },
+    ],
+  )
+})
+
+test('bounds optional candidate latency and records timeout evidence', async () => {
+  let alternativeAborts = 0
+  const startedAt = Date.now()
+  const response = await rateOptimizedCheckoutPlans({
+    destination,
+    candidates: [
+      {
+        candidateKey: 'candidate-baseline',
+        parcels: [parcels[0]],
+        materialCostMinor: 0,
+        unusedCubeMm3: 100,
+      },
+      {
+        candidateKey: 'candidate-slow',
+        parcels,
+        materialCostMinor: 0,
+        unusedCubeMm3: 50,
+      },
+    ],
+    carriers,
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    alternativeBudgetMs: 25,
+    policy: {
+      ...priceFirstPolicy,
+      objectivePriority: [...priceFirstPolicy.objectivePriority],
+    },
+    invoke: async (selection, request) => {
+      if (request.parcels.length === 1) {
+        return optimizedResult(selection, 1, '10.00')
+      }
+      return new Promise((_resolve, reject) => {
+        request.signal.addEventListener('abort', () => {
+          alternativeAborts += 1
+          reject(new Error('alternative aborted'))
+        }, { once: true })
+      })
+    },
+  })
+
+  assert.ok(Date.now() - startedAt < 500)
+  assert.equal(alternativeAborts, 2)
+  assert.equal(response.selectedCandidate.candidateKey, 'candidate-baseline')
+  assert.deepEqual(
+    response.candidateAttempts.map((attempt) => (
+      attempt.failureCode
+    )),
+    [null, 'CHECKOUT_RATE_DEADLINE_EXCEEDED'],
+  )
+})
+
+test('rejects a handling cost whose currency differs from checkout', async () => {
+  await assert.rejects(
+    rateOptimizedCheckoutPlans({
+      destination,
+      candidates: [{
+        candidateKey: 'candidate-baseline',
+        parcels: [parcels[0]],
+        materialCostMinor: 0,
+        unusedCubeMm3: 100,
+      }],
+      carriers,
+      currency: 'USD',
+      deadlineAt: Date.now() + 5_000,
+      policy: {
+        ...priceFirstPolicy,
+        handlingCostCurrency: 'CAD',
+        objectivePriority: [...priceFirstPolicy.objectivePriority],
+      },
+      invoke: async (selection) => optimizedResult(
+        selection,
+        1,
+        '10.00',
+      ),
+    }),
+    (error: unknown) => (
+      error instanceof CheckoutShipmentRateError
+      && error.code === 'CHECKOUT_RATE_OPTIMIZER_CURRENCY_MISMATCH'
+    ),
+  )
+})
+
+test('degrades an alternative evaluation error without losing baseline', async () => {
+  const response = await rateOptimizedCheckoutPlans({
+    destination,
+    candidates: [
+      {
+        candidateKey: 'candidate-baseline',
+        parcels: [parcels[0]],
+        materialCostMinor: 0,
+        unusedCubeMm3: 100,
+      },
+      {
+        candidateKey: 'candidate-overflow',
+        parcels,
+        materialCostMinor: Number.MAX_SAFE_INTEGER,
+        unusedCubeMm3: 50,
+      },
+    ],
+    carriers,
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    policy: {
+      ...priceFirstPolicy,
+      objectivePriority: [...priceFirstPolicy.objectivePriority],
+    },
+    invoke: async (selection, request) => optimizedResult(
+      selection,
+      request.parcels.length,
+      '10.00',
+    ),
+  })
+
+  assert.equal(response.selectedCandidate.candidateKey, 'candidate-baseline')
+  assert.deepEqual(
+    response.candidateAttempts.map((attempt) => ({
+      key: attempt.candidate.candidateKey,
+      status: attempt.status,
+      failureCode: attempt.failureCode,
+      offers: attempt.result?.offers.length ?? 0,
+    })),
+    [
+      {
+        key: 'candidate-baseline',
+        status: 'succeeded',
+        failureCode: null,
+        offers: 2,
+      },
+      {
+        key: 'candidate-overflow',
+        status: 'degraded',
+        failureCode: 'CHECKOUT_RATE_OPTIMIZER_INPUT_INVALID',
+        offers: 2,
+      },
     ],
   )
 })

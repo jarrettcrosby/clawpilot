@@ -427,11 +427,18 @@ async function verifyShipmentCompletion(databaseUrl) {
         '@/lib/persistence/postgres': postgres,
       },
     })
+    const currency = loadTypeScriptModule('app_src/lib/currency.ts')
+    const shopifyCheckoutPlanRatePolicy = loadTypeScriptModule(
+      'app_src/lib/operations/shopifyCheckoutPlanRatePolicy.ts',
+      { mocks: { '../currency.ts': currency } },
+    )
     const shopifyCheckoutRating = loadTypeScriptModule(
       'app_src/lib/persistence/shopifyCheckoutRating.ts',
       {
         mocks: {
           '@/lib/auditWriter': auditWriter,
+          '@/lib/operations/shopifyCheckoutPlanRatePolicy':
+            shopifyCheckoutPlanRatePolicy,
           '@/lib/persistence/postgres': postgres,
         },
       },

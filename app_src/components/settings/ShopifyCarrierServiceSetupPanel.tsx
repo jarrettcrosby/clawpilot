@@ -21,6 +21,17 @@ import IntegrationSetupJourney, {
 } from '@/components/settings/IntegrationSetupJourney'
 
 type Provider = 'ups_rest' | 'fedex_rest'
+type PlanRateObjective =
+  | 'landed_price'
+  | 'package_count'
+  | 'unused_cube'
+type PlanRateOptimization = {
+  version: 'shopify-checkout-plan-rate-objective-v2'
+  maxCandidates: number
+  objectivePriority: PlanRateObjective[]
+  handlingCostMinorPerPackage: number
+  handlingCostCurrency: string
+}
 type ActivationState =
   | 'missing'
   | 'disabled'
@@ -28,6 +39,48 @@ type ActivationState =
   | 'read_only'
   | 'active'
   | 'frozen'
+
+const DEFAULT_PLAN_RATE_OPTIMIZATION: PlanRateOptimization = {
+  version: 'shopify-checkout-plan-rate-objective-v2',
+  maxCandidates: 4,
+  objectivePriority: [
+    'landed_price',
+    'package_count',
+    'unused_cube',
+  ],
+  handlingCostMinorPerPackage: 0,
+  handlingCostCurrency: 'USD',
+}
+
+const OBJECTIVE_PRESETS: Array<{
+  value: string
+  label: string
+}> = [
+  {
+    value: 'landed_price,package_count,unused_cube',
+    label: 'Lowest landed price, then fewer packages, then cube',
+  },
+  {
+    value: 'landed_price,unused_cube,package_count',
+    label: 'Lowest landed price, then cube, then fewer packages',
+  },
+  {
+    value: 'package_count,landed_price,unused_cube',
+    label: 'Fewest packages, then landed price, then cube',
+  },
+  {
+    value: 'package_count,unused_cube,landed_price',
+    label: 'Fewest packages, then cube, then landed price',
+  },
+  {
+    value: 'unused_cube,landed_price,package_count',
+    label: 'Best cube use, then landed price, then fewer packages',
+  },
+  {
+    value: 'unused_cube,package_count,landed_price',
+    label: 'Best cube use, then fewer packages, then landed price',
+  },
+]
 
 type SetupPayload = {
   ok?: boolean
@@ -61,6 +114,9 @@ type ShopifyCarrierServiceSetup = {
     credentialGeneration: number
     activationRevision: number
     callbackTokenVersion: number
+    policyRevision: number
+    policyHash: string
+    planRateOptimization: PlanRateOptimization
     rowVersion: number
     ready: boolean
     checkoutBrandNameOverride: string | null
@@ -308,6 +364,13 @@ export default function ShopifyCarrierServiceSetupPanel({
     checkoutBrandNameOverride,
     setCheckoutBrandNameOverride,
   ] = useState('')
+  const [planRateOptimization, setPlanRateOptimization] =
+    useState<PlanRateOptimization>({
+      ...DEFAULT_PLAN_RATE_OPTIMIZATION,
+      objectivePriority: [
+        ...DEFAULT_PLAN_RATE_OPTIMIZATION.objectivePriority,
+      ],
+    })
   const [confirmWrite, setConfirmWrite] = useState(false)
   const [confirmNameAlignment, setConfirmNameAlignment] = useState(false)
   const [confirmRemove, setConfirmRemove] = useState(false)
@@ -335,6 +398,12 @@ export default function ShopifyCarrierServiceSetupPanel({
       )?.carrierAccountGlobalId || '',
     })
     setCheckoutBrandNameOverride(next.namePreference.overrideName || '')
+    const nextPlanRateOptimization =
+      next.config?.planRateOptimization ?? DEFAULT_PLAN_RATE_OPTIMIZATION
+    setPlanRateOptimization({
+      ...nextPlanRateOptimization,
+      objectivePriority: [...nextPlanRateOptimization.objectivePriority],
+    })
   }, [])
 
   const load = useCallback(async () => {
@@ -443,6 +512,8 @@ export default function ShopifyCarrierServiceSetupPanel({
     && carrierAccounts.fedex_rest
   )
   const registered = setup?.config?.registrationState === 'registered'
+  const planRatePolicyEditable =
+    setup?.reference.activation.state === 'shadow' && !busy
   const nameAlignment = registered ? setup?.nameAlignment || null : null
   const savedCheckoutBrandNameOverride =
     setup?.namePreference.overrideName || ''
@@ -536,7 +607,11 @@ export default function ShopifyCarrierServiceSetupPanel({
     inventoryMaxAgeSeconds: 900,
     quoteTtlSeconds: 900,
     orderReconciliationWindowSeconds: 86400,
+    planRateOptimization,
   }, 'The exact warehouse, package, carrier, and inventory policy was saved.')
+  const savePlanRatePolicy = () => run('save-plan-rate-policy', {
+    planRateOptimization,
+  }, 'The tenant carton-plan and rate objective was saved without changing the registered Shopify service.')
 
   if (loading && !setup) {
     return (
@@ -654,6 +729,111 @@ export default function ShopifyCarrierServiceSetupPanel({
           </FormControl>
         ))}
       </Stack>
+      <Box>
+        <Typography variant="body2" fontWeight={700}>
+          Whole-shipment carton and rate objective
+        </Typography>
+        <Typography variant="caption" color="text.secondary">
+          Every generated carton plan is rated as one complete shipment. The
+          default minimizes landed price first, then package count, then unused
+          cube. Stable IDs resolve an exact tie.
+        </Typography>
+        <Stack spacing={1} sx={{ mt: 1 }}>
+          <FormControl size="small" fullWidth>
+            <InputLabel id={`shopify-plan-objective-${accountGlobalId}`}>
+              Optimization priority
+            </InputLabel>
+            <Select
+              labelId={`shopify-plan-objective-${accountGlobalId}`}
+              label="Optimization priority"
+              value={planRateOptimization.objectivePriority.join(',')}
+              disabled={!planRatePolicyEditable}
+              onChange={(event) => setPlanRateOptimization((current) => ({
+                ...current,
+                objectivePriority: event.target.value.split(
+                  ',',
+                ) as PlanRateObjective[],
+              }))}
+            >
+              {OBJECTIVE_PRESETS.map((preset) => (
+                <MenuItem key={preset.value} value={preset.value}>
+                  {preset.label}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+            <TextField
+              size="small"
+              fullWidth
+              type="number"
+              label="Candidate plan limit"
+              value={planRateOptimization.maxCandidates}
+              disabled={!planRatePolicyEditable}
+              inputProps={{ min: 1, max: 4, step: 1 }}
+              helperText="Bounded to 1–4 deterministic feasible plans."
+              onChange={(event) => setPlanRateOptimization((current) => ({
+                ...current,
+                maxCandidates: Math.min(
+                  4,
+                  Math.max(1, Number(event.target.value) || 1),
+                ),
+              }))}
+            />
+            <TextField
+              size="small"
+              fullWidth
+              type="number"
+              label="Handling cost per package (minor units)"
+              value={planRateOptimization.handlingCostMinorPerPackage}
+              disabled={!planRatePolicyEditable}
+              inputProps={{ min: 0, max: 1_000_000, step: 1 }}
+              helperText={`In ${planRateOptimization.handlingCostCurrency}; 100 minor units normally equals one major unit for two-decimal currencies.`}
+              onChange={(event) => setPlanRateOptimization((current) => ({
+                ...current,
+                handlingCostMinorPerPackage: Math.min(
+                  1_000_000,
+                  Math.max(0, Number(event.target.value) || 0),
+                ),
+              }))}
+            />
+            <TextField
+              size="small"
+              fullWidth
+              label="Handling cost currency (ISO 4217)"
+              value={planRateOptimization.handlingCostCurrency}
+              disabled={!planRatePolicyEditable}
+              inputProps={{ minLength: 3, maxLength: 3 }}
+              helperText="Must match the checkout cart currency."
+              onChange={(event) => setPlanRateOptimization((current) => ({
+                ...current,
+                handlingCostCurrency: event.target.value
+                  .trim()
+                  .toUpperCase()
+                  .slice(0, 3),
+              }))}
+            />
+          </Stack>
+          {setup?.config ? (
+            <Typography variant="caption" color="text.secondary">
+              Saved policy revision {setup.config.policyRevision} · hash{' '}
+              {setup.config.policyHash.slice(0, 12)}…
+            </Typography>
+          ) : null}
+          {registered ? (
+            <Button
+              size="small"
+              variant="outlined"
+              disabled={!planRatePolicyEditable}
+              onClick={() => void savePlanRatePolicy()}
+            >
+              {busy === 'save-plan-rate-policy'
+                ? 'Saving objective…'
+                : 'Save rate objective only'}
+            </Button>
+          ) : null}
+        </Stack>
+      </Box>
       <Button
         variant="contained"
         disabled={!bindingsReady || Boolean(busy) || Boolean(registered)}

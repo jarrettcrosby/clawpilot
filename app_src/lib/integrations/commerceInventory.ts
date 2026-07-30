@@ -33,6 +33,8 @@ import {
   readShopifyInventoryCaptureFromPostgres,
   readShopifyInventoryStateFromPostgres,
   readShopifyInventoryTargetFromPostgres,
+  renewShopifyInventoryReadLeaseInPostgres,
+  type ShopifyInventoryRefreshExpectedFence,
   type ShopifyInventoryTarget,
 } from '@/lib/persistence/commerceInventory'
 import {
@@ -119,7 +121,7 @@ async function runtime(input: {
   }
   if (
     stored.verificationStatus !== 'verified'
-    || stored.status === 'error'
+    || stored.status !== 'active'
   ) {
     throw new CommerceIntegrationRequestError(
       'Reconnect and verify Shopify before syncing inventory',
@@ -294,10 +296,16 @@ export async function syncShopifyInventory(input: {
   organizationId: unknown
   accountGlobalId: unknown
   idempotencyKey: unknown
-  actorEmail: string
+  actorEmail?: string | null
+  expectedRefreshFence?: ShopifyInventoryRefreshExpectedFence | null
+  onProgress?: (progress: {
+    phase: string
+    pageCount?: number
+  }) => Promise<void>
 }) {
   assertShopifyInventoryRuntime()
   const idempotencyKey = normalizeIdempotencyKey(input.idempotencyKey)
+  const actorEmail = input.actorEmail || null
   let stored: CommerceRuntimeCredentialRecord | null = null
   let attempt: Awaited<
     ReturnType<typeof prepareShopifyInventoryReadInPostgres>
@@ -313,22 +321,49 @@ export async function syncShopifyInventory(input: {
       target,
       idempotencyKey,
       requestHash: hash,
-      actorEmail: input.actorEmail,
+      actorEmail,
     })
     if (attempt.replayed) {
+      if (!attempt.runGlobalId) {
+        throw new CommerceInventoryPersistenceError(
+          'SHOPIFY_INVENTORY_EVIDENCE_INCOMPLETE',
+          'The replayed Shopify inventory read has no committed run evidence',
+        )
+      }
       return {
         replayed: true,
+        effectiveIdempotencyKey: attempt.idempotencyKey,
+        inventoryRunGlobalId: attempt.runGlobalId,
         inventory: await readShopifyInventoryStateFromPostgres({
           organizationId: stored.organizationId,
           accountGlobalId: stored.globalId,
         }),
       }
     }
+    const progress = async (details: {
+      phase: string
+      pageCount?: number
+    }) => {
+      const providerLeaseCurrent =
+        await renewShopifyInventoryReadLeaseInPostgres({
+          runtime: stored as CommerceRuntimeCredentialRecord,
+          attempt: attempt as NonNullable<typeof attempt>,
+        })
+      if (!providerLeaseCurrent) {
+        throw new CommerceInventoryPersistenceError(
+          'SHOPIFY_INVENTORY_READ_LEASE_LOST',
+          'The Shopify inventory provider-read lease ended during refresh',
+        )
+      }
+      await input.onProgress?.(details)
+    }
+    await progress({ phase: 'prepared' })
     let capture
     let mappingMethod:
       | 'automatic_single_location'
       | 'automatic_exact_address'
     if (attempt.captured) {
+      await progress({ phase: 'captured' })
       capture = await readShopifyInventoryCaptureFromPostgres({
         runtime: stored,
         attempt,
@@ -340,6 +375,7 @@ export async function syncShopifyInventory(input: {
         ? 'automatic_exact_address'
         : 'automatic_single_location'
     } else {
+      await progress({ phase: 'credential' })
       const credential = decryptCommerceCredential(
         stored.encrypted,
         stored.organizationId,
@@ -390,22 +426,34 @@ export async function syncShopifyInventory(input: {
         shopDomain,
         accessToken: grant.accessToken,
       }
+      await progress({ phase: 'authorized' })
       const locations = await listShopifyInventoryLocations(
         providerCredential,
       )
+      await progress({ phase: 'locations' })
       const selected = selectLocation(target, locations)
       mappingMethod = selected.method
       const snapshot = await fetchShopifyInventorySnapshot(
         providerCredential,
         selected.location,
+        {
+          onProgress: async (current) => progress({
+            phase: current.phase,
+            pageCount: current.pageCount,
+          }),
+        },
       )
+      await progress({
+        phase: 'snapshot',
+        pageCount: snapshot.pageCount,
+      })
       capture = await captureShopifyInventorySnapshotInPostgres({
         runtime: stored,
         target,
         attempt,
         requestHash: hash,
         snapshot,
-        actorEmail: input.actorEmail,
+        actorEmail,
       })
     }
     const applied = await applyShopifyInventorySnapshotInPostgres({
@@ -415,12 +463,15 @@ export async function syncShopifyInventory(input: {
       capture,
       providerLocation: capture.snapshot.location,
       mappingMethod,
-      idempotencyKey,
+      idempotencyKey: attempt.idempotencyKey,
       requestHash: hash,
-      actorEmail: input.actorEmail,
+      actorEmail,
+      expectedRefreshFence: input.expectedRefreshFence,
     })
     return {
       replayed: applied.replayed,
+      effectiveIdempotencyKey: attempt.idempotencyKey,
+      inventoryRunGlobalId: applied.runGlobalId,
       inventory: await readShopifyInventoryStateFromPostgres({
         organizationId: stored.organizationId,
         accountGlobalId: stored.globalId,
@@ -434,7 +485,7 @@ export async function syncShopifyInventory(input: {
         attempt,
         state: failureState(error),
         errorCode: sanitized.code,
-        actorEmail: input.actorEmail,
+        actorEmail,
       }).catch(() => undefined)
     }
     throw sanitized

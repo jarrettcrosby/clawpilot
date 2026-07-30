@@ -14,8 +14,10 @@ const researchIntervalMs = Math.max(5000, Math.min(Number(process.env.AGENT_RESE
 const toastIntervalMs = Math.max(5000, Math.min(Number(process.env.TOAST_SYNC_POLL_MS || 15000), 300000))
 const quickBooksIntervalMs = Math.max(5000, Math.min(Number(process.env.QUICKBOOKS_SYNC_POLL_MS || 30000), 300000))
 const commerceCatalogIntervalMs = Math.max(5000, Math.min(Number(process.env.COMMERCE_CATALOG_SYNC_POLL_MS || 10000), 300000))
+const shopifyInventoryRefreshIntervalMs = Math.max(5000, Math.min(Number(process.env.SHOPIFY_INVENTORY_REFRESH_POLL_MS || 10000), 300000))
 const commerceOrderReconciliationIntervalMs = Math.max(5000, Math.min(Number(process.env.COMMERCE_ORDER_RECONCILIATION_POLL_MS || 60000), 300000))
 const commerceCatalogEnabled = String(process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED || '0') === '1'
+const shopifyInventoryRefreshEnabled = commerceCatalogEnabled
 const commerceOrderReconciliationEnabled = commerceCatalogEnabled
 const repositoryIntervalMs = Math.max(1000, Math.min(Number(process.env.REPOSITORY_RUNNER_POLL_MS || 5000), 300000))
 const repositoryRunnerEnabled = String(process.env.CLAWPILOT_REPOSITORY_RUNNER_ENABLED || '0') === '1'
@@ -73,6 +75,9 @@ await Promise.all([
   runLoop('quickbooks-sync', '/api/integrations/quickbooks/process', 2, quickBooksIntervalMs),
   ...(commerceCatalogEnabled
     ? [runLoop('commerce-catalog', '/api/integrations/commerce/catalog/process', 2, commerceCatalogIntervalMs)]
+    : []),
+  ...(shopifyInventoryRefreshEnabled
+    ? [runLoop('shopify-inventory-refresh', '/api/integrations/commerce/inventory/process', 2, shopifyInventoryRefreshIntervalMs)]
     : []),
   ...(commerceOrderReconciliationEnabled
     ? [runLoop('commerce-order-reconciliation', '/api/integrations/commerce/orders/process', 1, commerceOrderReconciliationIntervalMs)]

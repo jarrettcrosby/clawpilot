@@ -101,6 +101,15 @@ export type ShopifyInventorySnapshot = {
   snapshotHash: string
 }
 
+export type ShopifyInventoryFetchProgress = {
+  phase: 'dimensions' | 'inventory_page'
+  pageCount: number
+}
+
+export type ShopifyInventoryFetchOptions = ShopifyCommerceClientOptions & {
+  onProgress?: (progress: ShopifyInventoryFetchProgress) => Promise<void>
+}
+
 const LOCATIONS_QUERY = `query ClawPilotInventoryLocations(
   $first: Int!
   $after: String
@@ -1118,9 +1127,13 @@ async function retryableInventoryGraphql<T>(
 export async function fetchShopifyInventorySnapshot(
   credential: ShopifyCommerceRuntimeCredential,
   location: ShopifyInventoryLocation,
-  options: ShopifyCommerceClientOptions = {},
+  options: ShopifyInventoryFetchOptions = {},
 ): Promise<ShopifyInventorySnapshot> {
   const dimensionKeys = await discoverDimensionKeys(credential, options)
+  await options.onProgress?.({
+    phase: 'dimensions',
+    pageCount: 0,
+  })
   const variantDimensionKeys = Object.values(dimensionKeys.variant)
   const productDimensionKeys = Object.values(dimensionKeys.product)
   const levels: ShopifyInventoryLevel[] = []
@@ -1184,6 +1197,10 @@ export async function fetchShopifyInventorySnapshot(
       if (parsed) levels.push(parsed)
     }
     pageCount += 1
+    await options.onProgress?.({
+      phase: 'inventory_page',
+      pageCount,
+    })
     if (!pageData.hasNextPage) {
       const fetchedAt = new Date().toISOString()
       const hashPayload = {

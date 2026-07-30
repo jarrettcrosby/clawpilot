@@ -13,6 +13,10 @@ import { readQuickBooksWorkerHeartbeatFromPostgres } from '@/lib/persistence/qui
 import {
   readCommerceCatalogWorkerHeartbeatFromPostgres,
 } from '@/lib/persistence/commerceCatalogSync'
+import {
+  readShopifyInventoryRefreshHealthFromPostgres,
+  readShopifyInventoryRefreshWorkerHeartbeatFromPostgres,
+} from '@/lib/persistence/shopifyInventoryRefresh'
 import { commerceIntakeRuntimeAvailable } from '@/lib/integrations/commerceIntake'
 import { effectiveDocumentEmbeddingConfiguration } from '@/lib/documentEmbeddings'
 import { validateShortLinkConfiguration } from '@/lib/shortlinks'
@@ -77,6 +81,9 @@ export async function GET() {
     let toastWorker: Record<string, unknown> = { status: 'not-owned' }
     let quickBooksWorker: Record<string, unknown> = { status: 'not-owned' }
     let commerceCatalogWorker: Record<string, unknown> = {
+      status: 'disabled',
+    }
+    let shopifyInventoryRefreshWorker: Record<string, unknown> = {
       status: 'disabled',
     }
     let integrationQueues: Record<string, unknown> = { status: 'not-configured' }
@@ -299,6 +306,9 @@ export async function GET() {
           operations_two_pass_pack_rate_runs_applied: boolean
           operations_pack_rate_pricing_semantics_applied: boolean
           operations_carrier_billing_mud_applied: boolean
+          operations_shopify_inventory_refresh_migration_applied: boolean
+          operations_shopify_checkout_plan_rate_policy_applied: boolean
+          shopify_active_account_readiness_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -949,6 +959,24 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0147_operations_carrier_billing_mud.sql'
               ) AS operations_carrier_billing_mud_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0169_operations_shopify_inventory_refresh_queue.sql'
+              ) AS operations_shopify_inventory_refresh_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0170_operations_shopify_checkout_plan_rate_policy.sql'
+              ) AS operations_shopify_checkout_plan_rate_policy_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0171_shopify_active_account_readiness.sql'
+              ) AS shopify_active_account_readiness_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1090,6 +1118,9 @@ export async function GET() {
             && row?.operations_two_pass_pack_rate_runs_applied
             && row?.operations_pack_rate_pricing_semantics_applied
             && row?.operations_carrier_billing_mud_applied
+            && row?.operations_shopify_inventory_refresh_migration_applied
+            && row?.operations_shopify_checkout_plan_rate_policy_applied
+            && row?.shopify_active_account_readiness_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1223,6 +1254,9 @@ export async function GET() {
           || !row?.operations_two_pass_pack_rate_runs_applied
           || !row?.operations_pack_rate_pricing_semantics_applied
           || !row?.operations_carrier_billing_mud_applied
+          || !row?.operations_shopify_inventory_refresh_migration_applied
+          || !row?.operations_shopify_checkout_plan_rate_policy_applied
+          || !row?.shopify_active_account_readiness_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -1646,6 +1680,91 @@ export async function GET() {
             }
           }
 
+          if (
+            commerceIntakeRuntimeAvailable()
+            && row?.operations_shopify_inventory_refresh_migration_applied
+            && row?.shopify_active_account_readiness_migration_applied
+          ) {
+            const inventoryHeartbeat =
+              await readShopifyInventoryRefreshWorkerHeartbeatFromPostgres()
+            const inventoryHeartbeatAt = Date.parse(
+              String(inventoryHeartbeat?.checkedAt || ''),
+            )
+            const inventoryPollMs = Math.max(
+              5_000,
+              Math.min(
+                Number(
+                  process.env.SHOPIFY_INVENTORY_REFRESH_POLL_MS || 10_000,
+                ),
+                300_000,
+              ),
+            )
+            const maxInventoryHeartbeatAgeMs = Math.max(
+              180_000,
+              inventoryPollMs * 3,
+            )
+            const inventoryAgeMs = Number.isFinite(inventoryHeartbeatAt)
+              ? checkedAt - inventoryHeartbeatAt
+              : null
+            const inventoryQueue =
+              await readShopifyInventoryRefreshHealthFromPostgres()
+            const loopReachable = (
+              inventoryAgeMs !== null
+              && inventoryAgeMs <= maxInventoryHeartbeatAgeMs
+            )
+            const operationalDegraded = (
+              inventoryQueue.currentDead > 0
+              || inventoryQueue.staleProcessing > 0
+              || inventoryQueue.overdue > 0
+              || inventoryQueue.staleAccounts > 0
+              || inventoryQueue.retrying > 0
+            )
+            shopifyInventoryRefreshWorker = {
+              status: loopReachable
+                ? (operationalDegraded ? 'degraded' : 'reachable')
+                : 'stale',
+              livenessStatus: loopReachable ? 'reachable' : 'stale',
+              operationalStatus: operationalDegraded ? 'degraded' : 'ready',
+              heartbeatAt: inventoryHeartbeat?.checkedAt || null,
+              phase: inventoryHeartbeat?.phase || null,
+              ageMs: inventoryAgeMs,
+              ...inventoryQueue,
+            }
+            if (
+              inventoryAgeMs === null
+              || inventoryAgeMs > maxInventoryHeartbeatAgeMs
+            ) {
+              errors.push(
+                'Shopify inventory refresh worker heartbeat is missing or stale.',
+              )
+            }
+            if (inventoryQueue.currentDead > 0) {
+              warnings.push(
+                'Shopify inventory refresh queue has terminal failed jobs.',
+              )
+            }
+            if (inventoryQueue.staleProcessing > 0) {
+              warnings.push(
+                'Shopify inventory refresh queue has stale processing jobs.',
+              )
+            }
+            if (inventoryQueue.overdue > 0) {
+              warnings.push(
+                'Shopify inventory refresh queue has overdue jobs.',
+              )
+            }
+            if (inventoryQueue.staleAccounts > 0) {
+              warnings.push(
+                'Checkout-ready Shopify accounts have stale inventory evidence.',
+              )
+            }
+            if (inventoryQueue.retrying > 0) {
+              warnings.push(
+                'Shopify inventory refresh jobs are retrying.',
+              )
+            }
+          }
+
           const knowledgeResult = await query<{
             worker_name: string
             checked_at: string
@@ -1717,6 +1836,7 @@ export async function GET() {
       toastWorker,
       quickBooksWorker,
       commerceCatalogWorker,
+      shopifyInventoryRefreshWorker,
       integrationQueues,
       operationsCommands,
       crm,

@@ -1,0 +1,29 @@
+mutation ClawPilotCreateTestRateIsolation(
+  $deliveryCustomization: DeliveryCustomizationInput!
+) {
+  deliveryCustomizationCreate(
+    deliveryCustomization: $deliveryCustomization
+  ) {
+    deliveryCustomization {
+      id
+      title
+      enabled
+      functionId
+      metafield(
+        namespace: "$app:clawpilot-test-rate-isolation"
+        key: "function-configuration"
+      ) {
+        id
+        namespace
+        key
+        type
+        jsonValue
+      }
+    }
+    userErrors {
+      field
+      message
+      code
+    }
+  }
+}

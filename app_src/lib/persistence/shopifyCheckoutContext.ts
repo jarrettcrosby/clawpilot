@@ -48,6 +48,8 @@ export type ShopifyCheckoutContextResult = {
     stockRowVersion: number
     maxWeightGrams: number
     stockOnHandQuantity: number
+    unitCostMinor: number
+    currency: string
   }>
 }
 
@@ -151,6 +153,8 @@ type MaterialRow = QueryResultRow & {
   rated_outer_height_mm: number | null
   tare_weight_grams: number | null
   max_weight_grams: number | null
+  unit_cost_minor: string | number | null
+  currency: string | null
   stock_global_id: string
   stock_row_version: string | number
   stock_is_available: boolean | null
@@ -453,6 +457,8 @@ async function readMaterials(
        material.rated_outer_height_mm,
        material.tare_weight_grams,
        material.max_weight_grams,
+       material.unit_cost_minor::text,
+       material.currency,
        stock.global_id AS stock_global_id,
        stock.row_version::text AS stock_row_version,
        stock.is_available AS stock_is_available,
@@ -509,6 +515,9 @@ function mapMaterials(rows: MaterialRow[]) {
       || !row.dimension_evidence_reference
       || row.dimension_confirmed_at === null
       || row.stock_is_available !== true
+      || row.unit_cost_minor === null
+      || !row.currency
+      || !/^[A-Z]{3}$/.test(row.currency)
       || integer(
         row.stock_on_hand_quantity,
         `${row.material_global_id} stock`,
@@ -563,6 +572,11 @@ function mapMaterials(rows: MaterialRow[]) {
       `${row.material_global_id} maximum weight`,
       1,
     )
+    const unitCostMinor = integer(
+      row.unit_cost_minor,
+      `${row.material_global_id} unit cost`,
+      1,
+    )
     const stockOnHandQuantity = integer(
       row.stock_on_hand_quantity,
       `${row.material_global_id} stock`,
@@ -589,6 +603,8 @@ function mapMaterials(rows: MaterialRow[]) {
           `${row.material_global_id} dimension confirmation`,
         ),
         tareWeightGrams,
+        maximumGrossWeightGrams: maxWeightGrams,
+        availableQuantity: stockOnHandQuantity,
         ratedOuterDimensionsMm: ratedOuter,
       } satisfies HybridCartonizationMaterial,
       evidence: {
@@ -598,6 +614,8 @@ function mapMaterials(rows: MaterialRow[]) {
         stockRowVersion,
         maxWeightGrams,
         stockOnHandQuantity,
+        unitCostMinor,
+        currency: row.currency,
       },
     }
   })
