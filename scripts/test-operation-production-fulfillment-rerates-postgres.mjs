@@ -15,6 +15,7 @@ const requireFromApp = createRequire(
 const { Pool } = requireFromApp('pg')
 const ts = requireFromApp('typescript')
 const root = process.cwd()
+const actorEmail = 'production-rerate-operator@example.com'
 const HASH = Object.freeze({
   account: 'a'.repeat(64),
   registeredOrigin: 'b'.repeat(64),
@@ -202,9 +203,51 @@ async function expectDatabaseError(client, label, pattern, operation) {
   assert.match(errorMessage(caught), pattern, `${label} rejected incorrectly`)
 }
 
+async function expectServiceError(
+  client,
+  label,
+  expectedCode,
+  expectedStatus,
+  operation,
+) {
+  const savepoint = `rerate_service_${label.replaceAll(/[^a-z0-9_]/giu, '_')}`
+  await client.query(`SAVEPOINT ${savepoint}`)
+  let caught = null
+  try {
+    await operation()
+  } catch (error) {
+    caught = error
+  }
+  await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`)
+  await client.query(`RELEASE SAVEPOINT ${savepoint}`)
+  await client.query('SET CONSTRAINTS ALL DEFERRED')
+  assert.ok(caught, `${label} unexpectedly succeeded`)
+  assert.equal(caught.code, expectedCode, `${label} returned an unstable code`)
+  assert.equal(caught.status, expectedStatus, `${label} returned an unstable status`)
+}
+
+async function expectRowLockTimeout(client, label, sql, parameters) {
+  await client.query('BEGIN')
+  await client.query("SET LOCAL lock_timeout = '250ms'")
+  let caught = null
+  try {
+    await client.query(sql, parameters)
+  } catch (error) {
+    caught = error
+  }
+  await client.query('ROLLBACK')
+  assert.ok(caught, `${label} was not protected by the selection transaction`)
+  assert.equal(caught.code, '55P03', `${label} did not fail on a row-lock timeout`)
+}
+
 async function seedPrerequisiteLineage(client, ids) {
   await client.query('SET LOCAL session_replication_role = replica')
   try {
+    await client.query(
+      `INSERT INTO app_users (email, role, status)
+       VALUES ($1, 'owner', 'active')`,
+      [actorEmail],
+    )
     await client.query(
       `INSERT INTO workspace_organizations (
          id, name, organization_type, reference_code
@@ -370,10 +413,12 @@ async function seedPrerequisiteLineage(client, ids) {
       `INSERT INTO operations_active_fulfillment_executions (
          id, global_id, organization_id, shadow_fulfillment_execution_id,
          order_id, plan_id, warehouse_id, authority_mode, state,
-         activation_revision, idempotency_key, request_hash
+         activation_revision, expected_order_row_version, reason,
+         idempotency_key, request_hash
        ) VALUES (
          $1, 'gaex0009001', $2, $3, $4, $5, $6, 'active',
-         'prepared', 7, 'active-rerate-execution-1', $7
+         'prepared', 7, 0, 'Production rerate test fixture',
+         'active-rerate-execution-1', $7
        )`,
       [
         ids.activeExecution,
@@ -472,7 +517,7 @@ async function seedPrerequisiteLineage(client, ids) {
       [ids.organization, ids.carrierIntegration],
     )
   } finally {
-    await client.query('SET LOCAL session_replication_role = origin')
+    await client.query('SET LOCAL session_replication_role = origin').catch(() => {})
   }
 }
 
@@ -1096,6 +1141,151 @@ async function verifyAcceptance(databaseUrl) {
         expiresAt,
       ],
     )
+    const selectableReferences = await client.query(
+      `SELECT run.global_id AS run_global_id,
+              offer.global_id AS offer_global_id
+       FROM operations_production_fulfillment_rerate_runs run
+       JOIN operations_production_fulfillment_rerate_offers offer
+         ON offer.organization_id = run.organization_id
+        AND offer.rerate_run_id = run.id
+       WHERE run.organization_id = $1::uuid
+         AND run.id = $2::uuid
+         AND offer.id = $3::uuid`,
+      [ids.organization, successRun, offerId],
+    )
+    const rerateRunGlobalId = selectableReferences.rows[0].run_global_id
+    const offerGlobalId = selectableReferences.rows[0].offer_global_id
+    await expectServiceError(
+      client,
+      'cross_tenant_offer_selection',
+      'OPERATIONS_PRODUCTION_RERATE_OFFER_NOT_FOUND',
+      404,
+      () => productionRerates.selectProductionFulfillmentRerateOfferInPostgres({
+        organizationId: ids.otherOrganization,
+        rerateRunGlobalId,
+        offerGlobalId,
+        selectionReason: 'Cross-tenant offer must remain inaccessible',
+        idempotencyKey: 'cross-tenant-selection-command-1',
+        selectedBy: actorEmail,
+      }, client),
+    )
+    await expectServiceError(
+      client,
+      'missing_offer_selection',
+      'OPERATIONS_PRODUCTION_RERATE_OFFER_NOT_FOUND',
+      404,
+      () => productionRerates.selectProductionFulfillmentRerateOfferInPostgres({
+        organizationId: ids.organization,
+        rerateRunGlobalId,
+        offerGlobalId: 'garo9999999',
+        selectionReason: 'Missing offer must remain inaccessible',
+        idempotencyKey: 'missing-offer-selection-command-1',
+        selectedBy: actorEmail,
+      }, client),
+    )
+    await expectServiceError(
+      client,
+      'expired_offer_selection',
+      'OPERATIONS_PRODUCTION_RERATE_OFFER_INELIGIBLE',
+      409,
+      () => productionRerates.selectProductionFulfillmentRerateOfferInPostgres({
+        organizationId: ids.organization,
+        rerateRunGlobalId: delayedReplay.rerateRunGlobalId,
+        offerGlobalId: delayedReplay.offers[0].globalId,
+        selectionReason: 'Expired offer must not become dispatch authority',
+        idempotencyKey: 'expired-offer-selection-command-1',
+        selectedBy: actorEmail,
+      }, client),
+    )
+    const expiredSelectionLineage = await client.query(
+      `SELECT run.id::text AS run_id,
+              attempt.id::text AS attempt_id,
+              result.id::text AS result_id,
+              offer.id::text AS offer_id
+       FROM operations_production_fulfillment_rerate_runs run
+       JOIN operations_production_fulfillment_rerate_attempts attempt
+         ON attempt.organization_id = run.organization_id
+        AND attempt.rerate_run_id = run.id
+       JOIN operations_production_fulfillment_rerate_results result
+         ON result.organization_id = run.organization_id
+        AND result.rerate_run_id = run.id
+        AND result.attempt_id = attempt.id
+       JOIN operations_production_fulfillment_rerate_offers offer
+         ON offer.organization_id = run.organization_id
+        AND offer.rerate_run_id = run.id
+        AND offer.attempt_id = attempt.id
+        AND offer.result_id = result.id
+       WHERE run.organization_id = $1::uuid
+         AND run.global_id = $2
+         AND offer.global_id = $3`,
+      [
+        ids.organization,
+        delayedReplay.rerateRunGlobalId,
+        delayedReplay.offers[0].globalId,
+      ],
+    )
+    const historicalSelectionId = randomUUID()
+    await client.query('SET LOCAL session_replication_role = replica')
+    await insertSelection(client, ids, {
+      selectionId: historicalSelectionId,
+      runId: expiredSelectionLineage.rows[0].run_id,
+      attemptId: expiredSelectionLineage.rows[0].attempt_id,
+      resultId: expiredSelectionLineage.rows[0].result_id,
+      offerId: expiredSelectionLineage.rows[0].offer_id,
+      expiresAt: agedExpiresAt,
+      selectedAt: agedCompletedAt,
+    })
+    await client.query('SET LOCAL session_replication_role = origin')
+    await client.query('SAVEPOINT historical_selection_replay')
+    await client.query('SET LOCAL session_replication_role = replica')
+    await client.query(
+      `UPDATE operations_orders
+       SET currency = 'EUR'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [ids.organization, ids.order],
+    )
+    await client.query(
+      `UPDATE operations_integration_accounts
+       SET status = 'disabled'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [ids.organization, ids.carrierIntegration],
+    )
+    await client.query('SET LOCAL session_replication_role = origin')
+    const historicalReplay = await productionRerates
+      .selectProductionFulfillmentRerateOfferInPostgres({
+        organizationId: ids.organization,
+        rerateRunGlobalId: delayedReplay.rerateRunGlobalId,
+        offerGlobalId: delayedReplay.offers[0].globalId,
+        selectionReason: 'A new command replays the prior immutable choice',
+        idempotencyKey: 'historical-selection-command-replay-1',
+        selectedBy: actorEmail,
+      }, client)
+    assert.equal(historicalReplay.id, historicalSelectionId)
+    assert.equal(historicalReplay.replayed, true)
+    assert.ok(
+      Date.parse(historicalReplay.expiresAt) < Date.now(),
+      'Historical replay must not be presented as fresh dispatch authority',
+    )
+    assert.equal(
+      historicalReplay.selectionReason,
+      'lowest valid whole-shipment cost',
+      'Historical replay must preserve the original immutable reason',
+    )
+    const historicalReceipt = await client.query(
+      `SELECT status, result_global_id
+       FROM operations_command_receipts
+       WHERE organization_id = $1::uuid
+         AND command_type = 'select-production-rerate-offer'
+         AND idempotency_key = 'historical-selection-command-replay-1'`,
+      [ids.organization],
+    )
+    assert.deepEqual(historicalReceipt.rows[0], {
+      status: 'succeeded',
+      result_global_id: historicalReplay.globalId,
+    })
+    await client.query('ROLLBACK TO SAVEPOINT historical_selection_replay')
+    await client.query('RELEASE SAVEPOINT historical_selection_replay')
+    await client.query('SET CONSTRAINTS ALL DEFERRED')
     await expectDatabaseError(
       client,
       'future_selection',
@@ -1133,15 +1323,109 @@ async function verifyAcceptance(databaseUrl) {
         })
       },
     )
-    const selectionId = randomUUID()
-    await insertSelection(client, ids, {
-      selectionId,
-      runId: successRun,
-      attemptId: successAttempt,
-      resultId,
-      offerId,
-      expiresAt,
+    await expectServiceError(
+      client,
+      'selection_currency_stale',
+      'OPERATIONS_PRODUCTION_RERATE_SELECTION_DESTINATION_OR_CURRENCY_STALE',
+      409,
+      async () => {
+        await client.query('SET LOCAL session_replication_role = replica')
+        await client.query(
+          `UPDATE operations_orders
+           SET currency = 'EUR'
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [ids.organization, ids.order],
+        )
+        await client.query('SET LOCAL session_replication_role = origin')
+        return productionRerates.selectProductionFulfillmentRerateOfferInPostgres({
+          organizationId: ids.organization,
+          rerateRunGlobalId,
+          offerGlobalId,
+          selectionReason: 'Reject a stale order currency binding',
+          idempotencyKey: 'stale-currency-selection-command-1',
+          selectedBy: actorEmail,
+        }, client)
+      },
+    )
+    await expectServiceError(
+      client,
+      'selection_authority_stale',
+      'OPERATIONS_PRODUCTION_RERATE_SELECTION_AUTHORITY_STALE',
+      409,
+      async () => {
+        await client.query('SET LOCAL session_replication_role = replica')
+        await client.query(
+          `UPDATE operations_integration_accounts
+           SET status = 'disabled'
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [ids.organization, ids.carrierIntegration],
+        )
+        await client.query('SET LOCAL session_replication_role = origin')
+        return productionRerates.selectProductionFulfillmentRerateOfferInPostgres({
+          organizationId: ids.organization,
+          rerateRunGlobalId,
+          offerGlobalId,
+          selectionReason: 'Reject stale production carrier authority',
+          idempotencyKey: 'stale-authority-selection-command-1',
+          selectedBy: actorEmail,
+        }, client)
+      },
+    )
+
+    const selectionInput = Object.freeze({
+      organizationId: ids.organization,
+      rerateRunGlobalId,
+      offerGlobalId,
+      selectionReason: 'Lowest valid whole-shipment cost',
+      idempotencyKey: 'successful-selection-command-1',
+      selectedBy: actorEmail,
     })
+    const firstSelection = await productionRerates
+      .selectProductionFulfillmentRerateOfferInPostgres(selectionInput, client)
+    assert.equal(firstSelection.replayed, false)
+    assert.equal(firstSelection.rerateRunGlobalId, rerateRunGlobalId)
+    assert.equal(firstSelection.offerGlobalId, offerGlobalId)
+    assert.equal(firstSelection.selectionReason, selectionInput.selectionReason)
+    const selectionId = firstSelection.id
+
+    const selectionReceipt = await client.query(
+      `SELECT request_hash, status, result_global_id,
+              result_payload->>'globalId' AS payload_global_id
+       FROM operations_command_receipts
+       WHERE organization_id = $1::uuid
+         AND command_type = 'select-production-rerate-offer'
+         AND idempotency_key = $2`,
+      [ids.organization, selectionInput.idempotencyKey],
+    )
+    assert.deepEqual(selectionReceipt.rows[0], {
+      request_hash: fingerprint(
+        'production-fulfillment-rerate-selection-command-v1',
+        {
+          rerateRunGlobalId,
+          offerGlobalId,
+          selectionReason: selectionInput.selectionReason,
+        },
+      ),
+      status: 'succeeded',
+      result_global_id: firstSelection.globalId,
+      payload_global_id: firstSelection.globalId,
+    })
+
+    const replayedSelection = await productionRerates
+      .selectProductionFulfillmentRerateOfferInPostgres(selectionInput, client)
+    assert.equal(replayedSelection.replayed, true)
+    assert.equal(replayedSelection.globalId, firstSelection.globalId)
+    assert.equal(replayedSelection.id, firstSelection.id)
+    await expectServiceError(
+      client,
+      'changed_selection_payload_same_key',
+      'OPERATIONS_PRODUCTION_RERATE_SELECTION_IDEMPOTENCY_CONFLICT',
+      409,
+      () => productionRerates.selectProductionFulfillmentRerateOfferInPostgres({
+        ...selectionInput,
+        selectionReason: 'Changed reason must conflict with the original receipt',
+      }, client),
+    )
     await expectDatabaseError(
       client,
       'second_selection',
@@ -1234,6 +1518,162 @@ async function verifyAcceptance(databaseUrl) {
   }
 }
 
+async function verifySelectionAuthorityLocks(databaseUrl) {
+  const pool = new Pool({
+    connectionString: databaseUrl,
+    application_name: 'clawpilot-production-rerate-selection-locks',
+    max: 3,
+  })
+  const setup = await pool.connect()
+  const selector = await pool.connect()
+  const updater = await pool.connect()
+  const ids = {
+    organization: randomUUID(),
+    otherOrganization: randomUUID(),
+    pipeline: randomUUID(),
+    otherPipeline: randomUUID(),
+    customer: randomUUID(),
+    commerceIntegration: randomUUID(),
+    order: randomUUID(),
+    warehouse: randomUUID(),
+    plan: randomUUID(),
+    sourceRun: randomUUID(),
+    shadowExecution: randomUUID(),
+    shadowGroup: randomUUID(),
+    activeExecution: randomUUID(),
+    activeGroup: randomUUID(),
+    packages: [randomUUID(), randomUUID()],
+    carrierIntegration: randomUUID(),
+    carrierAccount: randomUUID(),
+  }
+  try {
+    await setup.query('BEGIN')
+    await seedPrerequisiteLineage(setup, ids)
+    const runId = randomUUID()
+    const attemptId = randomUUID()
+    const resultId = randomUUID()
+    const offerId = randomUUID()
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000)
+    await insertRun(setup, ids, runId, 'authority-lock-rerate-run')
+    await insertRunPackages(setup, ids, runId)
+    await insertAttempt(setup, ids, {
+      runId,
+      attemptId,
+      attemptNumber: 1,
+      idempotencyKey: 'authority-lock-attempt-1',
+    })
+    await setup.query(
+      `INSERT INTO operations_production_fulfillment_rerate_results (
+         id, organization_id, rerate_run_id, attempt_id, state,
+         provider_reference, result_hash, redacted_response, completed_at,
+         expires_at
+       ) VALUES (
+         $1, $2, $3, $4, 'succeeded', 'UPS-LOCK-RATE', $5,
+         '{"offerCount":1}'::jsonb, now(), $6
+       )`,
+      [resultId, ids.organization, runId, attemptId, HASH.result, expiresAt],
+    )
+    await setup.query(
+      `INSERT INTO operations_production_fulfillment_rerate_offers (
+         id, organization_id, rerate_run_id, attempt_id, result_id,
+         provider, service_code, service_name, amount_minor, currency,
+         transit_days, offer_hash, normalized_offer, expires_at
+       ) VALUES (
+         $1, $2, $3, $4, $5, 'ups_rest', '03', 'UPS Ground',
+         1800, 'USD', 3, $6, '{"packageCount":2}'::jsonb, $7
+       )`,
+      [
+        offerId,
+        ids.organization,
+        runId,
+        attemptId,
+        resultId,
+        HASH.offer,
+        expiresAt,
+      ],
+    )
+    await setup.query('SET CONSTRAINTS ALL IMMEDIATE')
+    const references = await setup.query(
+      `SELECT run.global_id AS run_global_id,
+              offer.global_id AS offer_global_id
+       FROM operations_production_fulfillment_rerate_runs run
+       JOIN operations_production_fulfillment_rerate_offers offer
+         ON offer.organization_id = run.organization_id
+        AND offer.rerate_run_id = run.id
+       WHERE run.organization_id = $1::uuid
+         AND run.id = $2::uuid
+         AND offer.id = $3::uuid`,
+      [ids.organization, runId, offerId],
+    )
+    await setup.query('COMMIT')
+
+    await selector.query('BEGIN')
+    const selection = await productionRerates
+      .selectProductionFulfillmentRerateOfferInPostgres({
+        organizationId: ids.organization,
+        rerateRunGlobalId: references.rows[0].run_global_id,
+        offerGlobalId: references.rows[0].offer_global_id,
+        selectionReason: 'Hold current authority through immutable selection',
+        idempotencyKey: 'authority-lock-selection-command-1',
+        selectedBy: actorEmail,
+      }, selector)
+    assert.equal(selection.replayed, false)
+
+    const lockedUpdates = [
+      [
+        'activation authority',
+        `UPDATE operations_activation_scopes
+         SET updated_at = updated_at
+         WHERE organization_id = $1::uuid`,
+        [ids.organization],
+      ],
+      [
+        'order destination and currency authority',
+        `UPDATE operations_orders
+         SET updated_at = updated_at
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [ids.organization, ids.order],
+      ],
+      [
+        'carrier integration authority',
+        `UPDATE operations_integration_accounts
+         SET updated_at = updated_at
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [ids.organization, ids.carrierIntegration],
+      ],
+      [
+        'carrier account configuration authority',
+        `UPDATE operations_carrier_accounts
+         SET updated_at = updated_at
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [ids.organization, ids.carrierAccount],
+      ],
+      [
+        'carrier credential authority',
+        `UPDATE operations_carrier_credentials
+         SET updated_at = updated_at
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid`,
+        [ids.organization, ids.carrierIntegration],
+      ],
+    ]
+    for (const [label, sql, parameters] of lockedUpdates) {
+      await expectRowLockTimeout(updater, label, sql, parameters)
+    }
+    await selector.query('ROLLBACK')
+  } catch (error) {
+    await setup.query('ROLLBACK').catch(() => {})
+    await selector.query('ROLLBACK').catch(() => {})
+    await updater.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    setup.release()
+    selector.release()
+    updater.release()
+    await pool.end()
+  }
+}
+
 async function main() {
   command('docker', ['info'], { timeout: 30_000 })
   const container = (
@@ -1260,6 +1700,7 @@ async function main() {
       timeout: 180_000,
     })
     await verifyAcceptance(databaseUrl)
+    await verifySelectionAuthorityLocks(databaseUrl)
   } finally {
     spawnSync('docker', ['stop', '-t', '1', container], {
       cwd: root,

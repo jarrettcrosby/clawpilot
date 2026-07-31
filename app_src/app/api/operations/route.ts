@@ -54,7 +54,12 @@ import {
 } from '@/lib/operations/productionFulfillmentRerateExecution'
 import {
   ProductionFulfillmentReratePersistenceError,
+  selectProductionFulfillmentRerateOfferInPostgres,
 } from '@/lib/operations/productionFulfillmentRerates'
+import {
+  ActiveFulfillmentExecutionPreparationError,
+  prepareActiveFulfillmentExecutionFromShadowInPostgres,
+} from '@/lib/operations/activeFulfillmentExecutionPreparation'
 import type { ActiveCarrierDispatchAddressSnapshot } from '@/lib/operations/activeCarrierDispatchSnapshot'
 import { requireRequestUser } from '@/lib/requestUser'
 
@@ -79,8 +84,11 @@ const RECEIPT_GLOBAL_ID = /^grc\d{7}$/
 const RECEIPT_LINE_GLOBAL_ID = /^grcl\d{7}$/
 const INTEGRATION_ACCOUNT_GLOBAL_ID = /^gia\d{7}$/
 const COMMERCE_ACTIVE_PREPARATION_GLOBAL_ID = /^gcap\d{7}$/
+const SHADOW_EXECUTION_GLOBAL_ID = /^gofe\d{7}$/
 const ACTIVE_EXECUTION_GLOBAL_ID = /^gaex\d{7}$/
 const ACTIVE_SHIPMENT_GROUP_GLOBAL_ID = /^gash\d{7}$/
+const PRODUCTION_RERATE_RUN_GLOBAL_ID = /^gafr\d{7}$/
+const PRODUCTION_RERATE_OFFER_GLOBAL_ID = /^garo\d{7}$/
 const SHA256 = /^[a-f0-9]{64}$/
 const ORDER_STATUSES = new Set<OperationsOrderStatus>([
   'imported', 'validated', 'held', 'promised', 'reserved', 'planned',
@@ -646,6 +654,7 @@ function errorResponse(error: unknown) {
   }
   if (
     error instanceof CarrierIntegrationRequestError
+    || error instanceof ActiveFulfillmentExecutionPreparationError
     || error instanceof ProductionFulfillmentReratePersistenceError
     || error instanceof ProductionFulfillmentRerateExecutionError
   ) {
@@ -1182,6 +1191,59 @@ export async function POST(req: NextRequest) {
         result.replayed ? 200 : 201,
       )
     }
+    if (action === 'prepare-active-fulfillment-execution') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to prepare Active fulfillment execution',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'shadowExecutionGlobalId',
+          'expectedActivationRevision',
+          'expectedOrderRowVersion',
+          'reason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result =
+        await prepareActiveFulfillmentExecutionFromShadowInPostgres({
+          organizationId: activeOperationsOrganizationId(actor),
+          shadowExecutionGlobalId: globalIdValue(
+            body.shadowExecutionGlobalId,
+            'Shadow fulfillment execution',
+            SHADOW_EXECUTION_GLOBAL_ID,
+          ),
+          expectedActivationRevision: integerValue(
+            body.expectedActivationRevision,
+            'Expected activation revision',
+            1,
+            2_147_483_647,
+          ),
+          expectedOrderRowVersion: integerValue(
+            body.expectedOrderRowVersion,
+            'Expected order row version',
+            0,
+            2_147_483_647,
+          ),
+          reason: textValue(
+            body.reason,
+            'Active fulfillment-preparation reason',
+            500,
+          ),
+          idempotencyKey: idempotencyKeyValue(req),
+          actorEmail: actor.email,
+        })
+      return json(
+        { ok: true, capabilities, result },
+        result.replayed ? 200 : 201,
+      )
+    }
     if (action === 'execute-production-rerate') {
       if (!capabilities.canManage || !capabilities.canExecute) {
         return json({
@@ -1280,6 +1342,50 @@ export async function POST(req: NextRequest) {
         actorEmail: actor.email,
       })
       return json({ ok: true, capabilities, result }, 201)
+    }
+    if (action === 'select-production-rerate-offer') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to select a production carrier service',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'rerateRunGlobalId',
+          'offerGlobalId',
+          'selectionReason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await selectProductionFulfillmentRerateOfferInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        rerateRunGlobalId: globalIdValue(
+          body.rerateRunGlobalId,
+          'Production rerate run',
+          PRODUCTION_RERATE_RUN_GLOBAL_ID,
+        ),
+        offerGlobalId: globalIdValue(
+          body.offerGlobalId,
+          'Production rerate offer',
+          PRODUCTION_RERATE_OFFER_GLOBAL_ID,
+        ),
+        selectionReason: textValue(
+          body.selectionReason,
+          'Production carrier service selection reason',
+          500,
+        ),
+        idempotencyKey: idempotencyKeyValue(req),
+        selectedBy: actor.email,
+      })
+      return json(
+        { ok: true, capabilities, result },
+        result.replayed ? 200 : 201,
+      )
     }
     if (action === 'generate-packing-slip') {
       if (!capabilities.canManage || !capabilities.canExecute) {

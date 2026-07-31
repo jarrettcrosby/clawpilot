@@ -414,4 +414,75 @@ assertIncludes(operationsRoute, [
   'idempotencyKey: idempotencyKeyValue(req)',
 ], 'Authenticated Operations production-rerate route')
 
+assertIncludes(operationsRoute, [
+  'selectProductionFulfillmentRerateOfferInPostgres,',
+  'const PRODUCTION_RERATE_RUN_GLOBAL_ID = /^gafr\\d{7}$/',
+  'const PRODUCTION_RERATE_OFFER_GLOBAL_ID = /^garo\\d{7}$/',
+  "if (action === 'select-production-rerate-offer')",
+  '!capabilities.canManage || !capabilities.canExecute',
+  "code: 'OPERATIONS_EXECUTE_REQUIRED'",
+  "'rerateRunGlobalId'",
+  "'offerGlobalId'",
+  "'selectionReason'",
+  'selectProductionFulfillmentRerateOfferInPostgres({',
+  'organizationId: activeOperationsOrganizationId(actor)',
+  'idempotencyKey: idempotencyKeyValue(req)',
+  'selectedBy: actor.email',
+  'result.replayed ? 200 : 201',
+], 'Authenticated immutable production-rerate offer-selection route')
+
+assertIncludes(application, [
+  'idempotencyKey: unknown',
+  "const commandType = 'select-production-rerate-offer'",
+  "'production-fulfillment-rerate-selection-command-v1'",
+  'FROM operations_command_receipts',
+  'INSERT INTO operations_command_receipts',
+  'UPDATE operations_command_receipts',
+  "'OPERATIONS_PRODUCTION_RERATE_SELECTION_IDEMPOTENCY_CONFLICT'",
+  "'OPERATIONS_PRODUCTION_RERATE_SELECTION_DESTINATION_OR_CURRENCY_STALE'",
+  "'OPERATIONS_PRODUCTION_RERATE_SELECTION_AUTHORITY_STALE'",
+  'result_global_id = $2',
+  'This is a historical command replay, not fresh dispatch authority.',
+  'Lock every mutable row used as current selection authority in one',
+  'FROM operations_activation_scopes',
+  'FROM operations_orders orders',
+  'FROM operations_integration_accounts',
+  'FROM operations_carrier_accounts',
+  'FROM operations_carrier_credentials',
+], 'Durable idempotent production-rerate offer selection')
+
+const selectionImplementation = application.slice(
+  application.indexOf(
+    'export async function selectProductionFulfillmentRerateOfferInPostgres',
+  ),
+  application.indexOf('type DispatchSelectionRow'),
+)
+assert.ok(
+  selectionImplementation.indexOf(
+    'FROM operations_production_fulfillment_rerate_selections selection',
+  ) < selectionImplementation.indexOf(
+    'const candidateResult = await client.query<SelectableOfferRow>',
+  ),
+  'Same-offer immutable replay must precede expiration and current-authority validation',
+)
+const mutableAuthorityLockOrder = [
+  'FROM operations_activation_scopes',
+  'FROM operations_orders orders',
+  'FROM operations_integration_accounts',
+  'FROM operations_carrier_accounts',
+  'FROM operations_carrier_credentials',
+]
+for (let index = 1; index < mutableAuthorityLockOrder.length; index += 1) {
+  assert.ok(
+    selectionImplementation.indexOf(mutableAuthorityLockOrder[index - 1])
+      < selectionImplementation.indexOf(mutableAuthorityLockOrder[index]),
+    'Mutable selection-authority rows must be locked in stable table order',
+  )
+}
+assert.equal(
+  (selectionImplementation.match(/LIMIT 1\n         FOR SHARE/g) || []).length,
+  7,
+  'Selection must lock historical/candidate evidence plus all five mutable authority rows',
+)
+
 console.log('Production fulfillment rerate static contracts passed')

@@ -13,13 +13,13 @@ app_visible: false
 
 ## Status And Scope
 
-This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed order workbench, explicit single-warehouse fulfillment-plan acceptance, warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders, a shared product/default-package import workflow, an audited exception queue, organization-scoped activation, direct carrier credential administration, UPS and FedEx sandbox rating and label execution against a fixed synthetic fixture, append-only redacted provider evidence, durable print delivery, a working-tree packing-slip/artifact and shipment-completion evidence contract, horizontally scrollable mobile Operations subpanel navigation, command-receipt health, and disposable PostgreSQL acceptance. Deterministic mock flows are automated-test evidence only and cannot be launched from the hosted workbench. This runbook remains `draft` until the module has a hosted production shipment-confirmation command, complete reconciliation and adapter health, tested production adapters, integration/warehouse activation subscopes, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
+This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed order workbench, explicit single-warehouse fulfillment-plan acceptance, warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders, a shared product/default-package import workflow, an audited exception queue, organization-scoped activation, direct carrier credential administration, UPS and FedEx sandbox rating and label execution against a fixed synthetic fixture, an authenticated idempotent Shadow-to-Active execution-preparation command, an Active-only read-only UPS/FedEx production whole-shipment rerate command, a separate manual local one-service whole-shipment selection command, append-only redacted provider evidence, durable print delivery, a working-tree packing-slip/artifact and shipment-completion evidence contract, horizontally scrollable mobile Operations subpanel navigation, command-receipt health, and disposable PostgreSQL acceptance. Deterministic mock flows are automated-test evidence only and cannot be launched from the hosted workbench. Active preparation and local selection perform no provider I/O; production rerating is read-only; none creates carrier labels, tracking, shipments, inventory consumption, final packing slips, or commerce writes. This runbook remains `draft` until the module has a hosted production shipment-confirmation command, complete reconciliation and adapter health, tested production mutation adapters, integration/warehouse activation subscopes, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
 
 - [ClawPilot Environments and Deployment](clawpilot-environments.md)
 - [Railway Postgres Backups](railway-postgres-backups.md)
 - [Agent Security and Integration Isolation](agent-security-and-isolation.md)
 
-Operations migrations `0081` through `0094`, `0097` through `0099`, `0101`, and `0111` through `0178` are bounded development evidence only. Migrations `0089` and `0090` establish delegated rate paths, multi-account carrier billing, GL Coding, reconciliation, and settlement foundations. Migration `0091` adds capability-aware printer profiles and routing defaults. Migration `0092` hardens carrier-account, charge, match, assignment, GL-run, reconciliation, and settlement provenance. Migration `0093` adds direct checksum-bound carrier CSV import and immutable financial review evidence. Migration `0094` adds enrolled local print agents, leased delivery attempts, fallback routing, and controlled reprints. Migration `0097` enforces append-only settlement transitions and current-status projections. Migration `0098` adds immutable carrier-label attempts, one-active-label enforcement, exact carrier-account evidence, sandbox create/void finalization. Migration `0099` adds immutable packing-slip payloads, append-only `gto` tracking observations, and durable `gfe` commerce-fulfillment export intents. Migration `0101` adds facility classification, editable hierarchical warehouse locations, capacity limits, product-location placement rules, and receiving data foundations. Migrations `0111` through `0115` establish commerce credentials/evidence, a disposable preview, bounded product-mapping and operational-order candidates, durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and explicit canonical promotion. Migrations `0119` and `0120` add the versioned product-intake pause/resume policy plus the leased, product-only, full-catalog reconciliation queue; they do not establish historical closed-order import, provider inventory synchronization, or unattended order processing. Migration `0116` adds durable rate-selected sandbox test-label attempts and decoded bytes plus a no-order print-artifact source. Migration `0117` gives each local print agent explicit format, media, and document capabilities, requires bound printer profiles to be a subset, and fences claims against the runtime-declared capability profile. Migration `0169` adds the separate leased development-only Shopify inventory refresh queue, account-level provider-read single-flight fence, bounded retry/dead-letter state, and worker health projection; it authorizes no Shopify write and no order quantity adjustment. Migration `0171` replaces the shared Shopify CarrierService readiness function so only an exactly active commerce account is eligible. Migration `0172` permits only bounded same-token renewal for live inventory-read leases and expired-token rotation for immutable captured reads; all non-lease attempt evidence and terminal rows remain immutable. Migration `0176` adds immutable accepted-plan/package evidence links, explicit local-balance versus Shopify provider-commitment reservation authority, and database guards that prevent provider-authoritative inventory from receiving a second local balance or ledger mutation. Migration `0177` adds immutable Shadow-only checkout-versus-fulfillment package/rate evidence, whole-shipment UPS/FedEx sandbox attempts, mandatory estimated variance, and explicit zero-write lineage without creating a shipment, label, tracking number, final packing slip, or commerce fulfillment. These migrations do not by themselves expose or authorize production shipment confirmation or directed putaway. Do not use this document as evidence that a production commerce or carrier adapter, checkout callback, accounting export, invoice/AR workflow, payment adapter, directed putaway worker, or live warehouse worker is deployed. Migration `0088` archives legacy mock orders, releases their reservations, hides them from active workbench projections, disables mock integration/facility records, and retains immutable evidence rather than deleting it.
+Operations migrations `0081` through `0094`, `0097` through `0099`, `0101`, and `0111` through `0182` are bounded development evidence only. Migrations `0089` and `0090` establish delegated rate paths, multi-account carrier billing, GL Coding, reconciliation, and settlement foundations. Migration `0091` adds capability-aware printer profiles and routing defaults. Migration `0092` hardens carrier-account, charge, match, assignment, GL-run, reconciliation, and settlement provenance. Migration `0093` adds direct checksum-bound carrier CSV import and immutable financial review evidence. Migration `0094` adds enrolled local print agents, leased delivery attempts, fallback routing, and controlled reprints. Migration `0097` enforces append-only settlement transitions and current-status projections. Migration `0098` adds immutable carrier-label attempts, one-active-label enforcement, exact carrier-account evidence, sandbox create/void finalization. Migration `0099` adds immutable packing-slip payloads, append-only `gto` tracking observations, and durable `gfe` commerce-fulfillment export intents. Migration `0101` adds facility classification, editable hierarchical warehouse locations, capacity limits, product-location placement rules, and receiving data foundations. Migrations `0111` through `0115` establish commerce credentials/evidence, a disposable preview, bounded product-mapping and operational-order candidates, durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and explicit canonical promotion. Migrations `0119` and `0120` add the versioned product-intake pause/resume policy plus the leased, product-only, full-catalog reconciliation queue; they do not establish historical closed-order import, provider inventory synchronization, or unattended order processing. Migration `0116` adds durable rate-selected sandbox test-label attempts and decoded bytes plus a no-order print-artifact source. Migration `0117` gives each local print agent explicit format, media, and document capabilities, requires bound printer profiles to be a subset, and fences claims against the runtime-declared capability profile. Migration `0169` adds the separate leased development-only Shopify inventory refresh queue, account-level provider-read single-flight fence, bounded retry/dead-letter state, and worker health projection; it authorizes no Shopify write and no order quantity adjustment. Migration `0171` replaces the shared Shopify CarrierService readiness function so only an exactly active commerce account is eligible. Migration `0172` permits only bounded same-token renewal for live inventory-read leases and expired-token rotation for immutable captured reads; all non-lease attempt evidence and terminal rows remain immutable. Migration `0176` adds immutable accepted-plan/package evidence links, explicit local-balance versus Shopify provider-commitment reservation authority, and database guards that prevent provider-authoritative inventory from receiving a second local balance or ledger mutation. Migration `0177` adds immutable Shadow-only checkout-versus-fulfillment package/rate evidence, whole-shipment UPS/FedEx sandbox attempts, mandatory estimated variance, and explicit zero-write lineage without creating a shipment, label, tracking number, final packing slip, or commerce fulfillment. These migrations do not by themselves expose or authorize production shipment confirmation or directed putaway. Do not use this document as evidence that a production commerce mutation or carrier shipment/label adapter, accounting export, invoice/AR workflow, payment adapter, directed putaway worker, or live warehouse worker is deployed. Migration `0088` archives legacy mock orders, releases their reservations, hides them from active workbench projections, disables mock integration/facility records, and retains immutable evidence rather than deleting it.
 
 Migration `0178` adds one tenant- and Shopify-account-scoped row per exact
 Customer GID for checkout audience intent, optimistic row-version fences,
@@ -27,6 +27,25 @@ paginated reads without a customer-count cap, zero-write Shadow state,
 explicit Active provider-write blockers, and auditable removal tombstones. It
 does not activate a Shopify Delivery Customization or write a customer
 metafield.
+
+Migration `0179` defines the exact Active execution, single-warehouse shipment
+group, ordered package set, and carrier-dispatch lineage. Migration `0180`
+adds the append-only production rerate run, prepared attempt, terminal result,
+normalized offer, and single immutable selection authority without rewriting
+the Shadow estimate. The deployed `execute-production-rerate` command performs
+only the bounded read-only UPS/FedEx token and whole-shipment rate calls. The
+separate `select-production-rerate-offer` command records an authorized
+operator's exact unexpired offer and reason locally; it selects one service for
+every package in the group, performs no network call, and cannot be changed to
+a different offer later. Migration `0181` adds the explicit Shadow-policy
+`timed` versus `until_turned_off` lifetime mode and does not weaken any Shadow
+provider-write fence.
+
+Migration `0182` adds the expected order row version and specific operator
+reason to each immutable Active preparation. The preparation command locks and
+rechecks that order version, fails closed on an open high or critical order
+exception, and requires every current physical package's sequence, dimensions,
+and weight to match the immutable Shadow rate-run package evidence exactly.
 
 Run `npm run test:shopify-customer-rate-policies-postgres` with Docker
 available to apply the complete migration chain to an isolated PostgreSQL 16
@@ -49,7 +68,7 @@ Enrollment, claim fencing, retry, fallback, and reprint procedures are in [Local
 8. Rotate by entering the full replacement credential and selecting **Save and verify**. The previous ciphertext is replaced only after the candidate verifies, and the audit log records rotation metadata without a secret.
 9. Use **Disconnect** only after confirming the organization, provider, and environment. Disconnect deletes encrypted credential material and disables the integration metadata; it does not delete immutable historical shipment evidence.
 
-Credential verification is not shipping certification. The only currently authorized provider calls are the fixed UPS or FedEx sandbox rate test and the bounded sandbox label create/void procedure below. Do not activate production rating, label purchase, void, manifest, pickup, tracking, or any carrier side effect until the corresponding adapter, provider attempts, unknown-outcome reconciliation, and authorized smoke test pass the release gate in the [small parcel architecture](../architecture/small-parcel-carrier-adapters.md).
+Credential verification is not shipping certification. The currently implemented carrier calls are the fixed UPS or FedEx sandbox rate test, the bounded sandbox label create/void procedure below, and the Active-only read-only production UPS/FedEx whole-shipment rerate. The separate production-offer selection is local Postgres authority and makes no provider call. Do not activate a production label purchase, void, manifest, pickup, tracking, or any other carrier mutation until the corresponding adapter, provider attempts, unknown-outcome reconciliation, and authorized smoke test pass the release gate in the [small parcel architecture](../architecture/small-parcel-carrier-adapters.md).
 
 ### AG Alchemy Development Sandbox-Rate Delegation
 
@@ -177,7 +196,7 @@ This runbook is implementation and local/development acceptance guidance only. D
 ### Shopify Saved-Address Rate Cache Preparation
 
 1. Use this workflow only for the development Shadow proof while Operations is in `shadow`, the Shopify integration is a verified active `sandbox` account, and the exact test variant is configured. Do not place email addresses, GIDs, names, or raw configuration values in screenshots or logs.
-2. Complete the setup journey's **Checkout audience** prerequisite before saved-address cache preparation or live-cart proof. Search Shopify by the customer's name or email, verify the intended result, and save a Shadow policy for that exact Customer GID. Choose either a whole-number timed duration from 15 through 240 minutes, with a default of 60 minutes, or explicitly select **Until turned off**. Saving or renewing a timed policy starts a new bounded window. **Until turned off** remains eligible until an authorized administrator edits or removes the policy; a null expiry alone never grants indefinite eligibility unless that explicit lifetime mode is stored. An expired timed row remains visible as audit evidence but fails closed. The display label helps selection but is not runtime authority. For the current Shadow proof, use a non-`hide_all` policy to allow the complete customer-neutral ClawPilot service set or `hide_all` to deny it. `include_only` and `exclude` remain saved future intent and do not filter live Shadow services until an eligible Delivery Customization and customer metafield writes are applied and provider-verified. The journey status comes from the tenant/account policy summary; generic setup copy must not contain a selected customer's email or other PII. Customer policies are paginated rows rather than one bounded array; add any number of customers. Missing, malformed, expired, removed, hidden, or nonmatching Shadow policy fails closed.
+2. Complete the setup journey's **Checkout audience** prerequisite before saved-address cache preparation or live-cart proof. Search Shopify by the customer's name or email, verify the intended result, and save a Shadow policy for that exact Customer GID. Choose either a whole-number timed duration from 15 through 240 minutes, with a default of 60 minutes, or explicitly select **Until turned off**. Saving or renewing a timed policy starts a new bounded window. **Until turned off** remains eligible until an authorized administrator edits or removes the policy; a null expiry alone never grants indefinite eligibility unless that explicit lifetime mode is stored. Shopify can reuse a successful CarrierService response for as long as 15 minutes after a policy is edited or removed, so turning it off changes ClawPilot authorization immediately but is not a Shopify cache purge. An expired timed row remains visible as audit evidence but fails closed. The display label helps selection but is not runtime authority. For the current Shadow proof, use a non-`hide_all` policy to allow the complete customer-neutral ClawPilot service set or `hide_all` to deny it. `include_only` and `exclude` remain saved future intent and do not filter live Shadow services until an eligible Delivery Customization and customer metafield writes are applied and provider-verified. The journey status comes from the tenant/account customer-policy summary; generic setup copy must not contain a selected customer's email or other PII. Customer policies are paginated rows rather than one bounded array; add any number of customers. Missing, malformed, expired, removed, hidden, or nonmatching Shadow policy fails closed.
 3. Confirm the theme app embed is deployed and enabled on the exact Online Store theme used by the test customer. The browser integration runs on a Shopify storefront page with that customer's cart session; it does not run as a durable ClawPilot worker and cannot fabricate a checkout session from the server.
 4. Sign in as the selected test customer, add only the allowlisted test variant, and change the cart. The app proxy validates the signed shop, timestamp, and numeric customer identity, pages every saved address through a fixed 250-address safety bound, and returns only `address1`, `address2`, `city`, `province`, `country`, and `zip`. Different streets in the same ZIP remain distinct; only canonical exact duplicates collapse. A result beyond the bound fails closed rather than processing a partial address book.
 5. Confirm the extension invokes Shopify's locale-aware prepare and asynchronous shipping-rate endpoints for every eligible United States destination with bounded concurrency. It aborts queued and in-flight work when the cart fingerprint changes. Non-U.S. and incomplete addresses are reported only as aggregate unsupported or invalid counts.
@@ -253,6 +272,69 @@ The current warehouse screen establishes editable facility, operating-profile, h
 21. If the order matches the fixed sandbox fixture, follow the separate sandbox label create-and-void procedure. Label execution is not available for an arbitrary address, product, package, production credential, or production order.
 22. If the screen reports a stale version, reload and re-review the current evidence before issuing a new command. Never change the idempotency key merely to bypass an uncertain result.
 23. When shipment confirmation is reached through an eligible production label path, a Shopify provider commitment moves to `consumed` without mutating the Shopify-projected local position or ledger; the queued commerce fulfillment export remains the provider-write path. A terminal provider commitment cannot be reactivated. This slice does not yet expose the plan-cancellation command that releases abandoned inventory and packaging claims; do not cancel accepted real work by direct SQL. The next implementation boundary for an accepted real plan is that guarded cancellation/release path plus Active-mode arbitrary multi-package label/tracking and post-label packing-slip creation and dispatched Shopify/Faire fulfillment export. Multi-warehouse splitting, pickup scheduling, manifests, production carrier actions, scanner claims, per-task scans, and short-pick recovery remain separate later slices.
+
+## Production Rerate And Manual Service Selection
+
+This is development authority evidence, not a complete hosted fulfillment
+workflow. No workbench control currently exposes Active preparation or
+dispatches a production label. Use the authenticated preparation action only
+against exact retained Shadow evidence; never manufacture missing rows with
+direct SQL in a real workflow.
+
+1. Require **Manage operations** and **Execute operations**, the current
+   Operations `active` revision, one exact zero-write `gofe` Shadow execution,
+   one packed Shopify order at its exact current row version, no open high or
+   critical order exception, one released single-warehouse plan, one active
+   warehouse, no linked label attempt, label, or shipment, and the exact
+   contiguous packed package set from the Shadow rate run. Each physical
+   package must still match the immutable source sequence, dimensions, and
+   gross weight.
+2. Call `prepare-active-fulfillment-execution` with that exact `gofe`, expected
+   Active revision, expected order row version, a specific 1-through-500
+   character control-free operator reason, and a stable `Idempotency-Key`.
+   Exact replay returns the same `gaex` execution, `gash` shipment group, and
+   ordered package edges.
+   Changed evidence under the key, a stale activation or order version, tenant
+   mismatch, blocking exception, altered package sequence/dimensions/weight, or
+   a second command for the same Shadow execution fails closed. The inherited
+   service and amount are planning evidence only.
+3. Resolve the intended production `gia` integration and `gca` carrier account,
+   exact account-derived origin, order destination, and one currency. Call the
+   authenticated `execute-production-rerate` action once with a stable
+   `Idempotency-Key`. Every UPS or FedEx attempt covers the shipment group's
+   complete ordered package array with one service. A prepared or unknown
+   attempt is reconciliation-required and must never be retried blindly.
+4. Review only a succeeded rerate's normalized, unexpired offers. An offer is a
+   read-only carrier estimate; it is not billed actual, MUD, postage purchase,
+   tracking, or proof of shipment.
+5. Call `select-production-rerate-offer` with the exact `gafr` run, exact `garo`
+   offer, a stable `Idempotency-Key`, and a specific operator reason. The action
+   records one immutable ClawPilot-local selection and exact command receipt in
+   one transaction. A newly created selection must belong to the same tenant
+   and run, remain unexpired, match the current order destination/currency,
+   current production
+   integration/account/credential binding, and current Active revision, and
+   cover the complete package set with one provider service.
+6. Repeating the same key and exact normalized command returns the receipt's
+   existing selection. Changed command data under that key conflicts. A new key
+   for the same run and offer also returns the existing immutable selection as
+   historical evidence, even after expiration or current-authority drift; it is
+   not fresh dispatch authority. Selecting a different offer for that run
+   conflicts. Any later dispatch must independently revalidate expiration and
+   every current authority fence. On a stale destination,
+   currency, integration, carrier account, or credential error, reload and
+   rerate instead of editing rows or changing the idempotency key.
+7. Stop after local selection. Preparation and selection perform no carrier
+   call; production rerating performs only bounded read-only carrier calls. None
+   creates a shipment, label, void, tracking fact, inventory consumption, final packing
+   slip, print job, commerce fulfillment, Shopify/Faire writeback, or other
+   provider effect. A later Active dispatch must separately consume the exact
+   still-current selection and pass its own mutation and reconciliation gates.
+
+Shadow is not an alternate path into these commands. Its retained sandbox
+estimate, carton allocation, variance, and **Until turned off** audience policy
+remain zero-provider-write evidence and cannot authorize a production rerate,
+selection, label, or commerce mutation.
 
 ## Mobile Operations Subpanel Navigation
 

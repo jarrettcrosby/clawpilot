@@ -173,6 +173,8 @@ requireAll(panel, [
   'Saving or renewing starts a new bounded window; expiration fails closed.',
   'Until turned off has no automatic expiry.',
   'an administrator must edit or remove this',
+  'successful rate response for up to 15 minutes after the policy',
+  'disabling the policy is not an immediate cache',
   'policy.shadowExpired',
   'Shadow expired · fails closed',
   'policy.shadowExpiresAt',

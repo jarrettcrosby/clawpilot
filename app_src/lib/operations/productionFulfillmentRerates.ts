@@ -171,6 +171,7 @@ export type SelectProductionFulfillmentRerateOfferInput = {
   rerateRunGlobalId: unknown
   offerGlobalId: unknown
   selectionReason: unknown
+  idempotencyKey: unknown
   selectedBy: unknown
 }
 
@@ -504,6 +505,20 @@ async function runInTransaction<T>(
 function postgresConflict(error: unknown, fallbackCode: string): never {
   if (error instanceof ProductionFulfillmentReratePersistenceError) throw error
   const message = error instanceof Error ? error.message : String(error)
+  if (/production fulfillment rerate selection destination or currency is stale/iu.test(message)) {
+    fail(
+      'OPERATIONS_PRODUCTION_RERATE_SELECTION_DESTINATION_OR_CURRENCY_STALE',
+      'The order destination or currency changed after production rerating',
+      409,
+    )
+  }
+  if (/production fulfillment rerate selection integration, account, or credential revision is stale/iu.test(message)) {
+    fail(
+      'OPERATIONS_PRODUCTION_RERATE_SELECTION_AUTHORITY_STALE',
+      'The production carrier integration, account, or credential changed after rerating',
+      409,
+    )
+  }
   if (/duplicate key|unique constraint|immutable|mismatch|requires|expired/iu.test(message)) {
     fail(fallbackCode, message, 409)
   }
@@ -2419,6 +2434,7 @@ type SelectableOfferRow = QueryResultRow & {
   offer_id: string
   offer_global_id: string
   rerate_run_id: string
+  order_id: string
   active_fulfillment_execution_id: string
   active_shipment_group_id: string
   attempt_id: string
@@ -2443,11 +2459,10 @@ type SelectableOfferRow = QueryResultRow & {
   destination_fingerprint: string
   billing_fingerprint: string
   ordered_package_set_fingerprint: string
+  destination_snapshot: JsonObject
   expires_at: Date | string
   result_state: RerateTerminalState
   activation_revision: number
-  current_activation_state: string
-  current_activation_revision: number
 }
 
 export async function selectProductionFulfillmentRerateOfferInPostgres(
@@ -2469,18 +2484,155 @@ export async function selectProductionFulfillmentRerateOfferInPostgres(
   if (selectionReason.length < 3) {
     fail('OPERATIONS_PRODUCTION_RERATE_SELECTION_INVALID', 'Selection reason is too short', 400)
   }
+  const requestIdempotencyKey = idempotencyKey(input.idempotencyKey)
   const selectedBy = actorEmail(input.selectedBy)
+  const commandType = 'select-production-rerate-offer'
+  const requestHash = fingerprint(
+    'production-fulfillment-rerate-selection-command-v1',
+    {
+      rerateRunGlobalId,
+      offerGlobalId,
+      selectionReason,
+    },
+  )
 
   try {
     return await runInTransaction(suppliedClient, async (client) => {
       await acquireTransactionAdvisoryLock(
         client,
+        `operations:production-rerate-selection-command:${organizationId}:${requestIdempotencyKey}`,
+      )
+      const priorReceipt = await client.query<{
+        request_hash: string
+        status: 'processing' | 'succeeded' | 'failed'
+        result_global_id: string | null
+      }>(
+        `SELECT request_hash, status, result_global_id
+         FROM operations_command_receipts
+         WHERE organization_id = $1::uuid
+           AND command_type = $2
+           AND idempotency_key = $3
+         LIMIT 1
+         FOR UPDATE`,
+        [organizationId, commandType, requestIdempotencyKey],
+      )
+      const receipt = priorReceipt.rows[0]
+      if (receipt) {
+        if (receipt.request_hash !== requestHash) {
+          fail(
+            'OPERATIONS_PRODUCTION_RERATE_SELECTION_IDEMPOTENCY_CONFLICT',
+            'This idempotency key was already used for a different production rerate selection',
+            409,
+          )
+        }
+        if (receipt.status === 'succeeded' && receipt.result_global_id) {
+          const priorSelection = await client.query<{ id: string }>(
+            `SELECT id::text
+             FROM operations_production_fulfillment_rerate_selections
+             WHERE organization_id = $1::uuid
+               AND global_id = $2
+             LIMIT 1
+             FOR SHARE`,
+            [organizationId, receipt.result_global_id],
+          )
+          if (!priorSelection.rows[0]) {
+            fail(
+              'OPERATIONS_PRODUCTION_RERATE_SELECTION_RECEIPT_INVALID',
+              'The completed selection receipt no longer resolves to its immutable result',
+              409,
+            )
+          }
+          return loadRerateSelection(
+            client,
+            organizationId,
+            priorSelection.rows[0].id,
+            true,
+          )
+        }
+        fail(
+          'OPERATIONS_PRODUCTION_RERATE_SELECTION_COMMAND_IN_PROGRESS',
+          'This production rerate selection command is already being processed',
+          409,
+        )
+      }
+      const createdReceipt = await client.query<{ id: string }>(
+        `INSERT INTO operations_command_receipts (
+           organization_id, command_type, idempotency_key, request_hash,
+           actor_email, status, correlation_id
+         ) VALUES (
+           $1::uuid, $2, $3, $4, $5, 'processing', gen_random_uuid()
+         )
+         RETURNING id::text`,
+        [
+          organizationId,
+          commandType,
+          requestIdempotencyKey,
+          requestHash,
+          selectedBy,
+        ],
+      )
+      await acquireTransactionAdvisoryLock(
+        client,
         `operations:production-rerate-select:${organizationId}:${rerateRunGlobalId}`,
       )
+      const existing = await client.query<{
+        id: string
+        offer_global_id: string
+      }>(
+        `SELECT selection.id::text,
+                offer.global_id AS offer_global_id
+         FROM operations_production_fulfillment_rerate_selections selection
+         JOIN operations_production_fulfillment_rerate_runs run
+           ON run.organization_id = selection.organization_id
+          AND run.id = selection.rerate_run_id
+         JOIN operations_production_fulfillment_rerate_offers offer
+           ON offer.organization_id = selection.organization_id
+          AND offer.id = selection.offer_id
+         WHERE selection.organization_id = $1::uuid
+           AND run.global_id = $2
+         LIMIT 1
+         FOR SHARE OF selection, run, offer`,
+        [organizationId, rerateRunGlobalId],
+      )
+      if (existing.rows[0]) {
+        if (existing.rows[0].offer_global_id !== offerGlobalId) {
+          fail(
+            'OPERATIONS_PRODUCTION_RERATE_SELECTION_CONFLICT',
+            'Rerate run already selected a different immutable offer',
+          )
+        }
+        // This is a historical command replay, not fresh dispatch authority.
+        // Dispatch resolution independently revalidates expiration, Active
+        // revision, destination, and provider configuration before any write.
+        const selection = await loadRerateSelection(
+          client,
+          organizationId,
+          existing.rows[0].id,
+          true,
+        )
+        await client.query(
+          `UPDATE operations_command_receipts
+           SET status = 'succeeded',
+               result_global_id = $2,
+               result_payload = $3::jsonb,
+               error_code = NULL,
+               error_message = NULL,
+               completed_at = now(),
+               updated_at = now()
+           WHERE id = $1::uuid`,
+          [
+            createdReceipt.rows[0].id,
+            selection.globalId,
+            JSON.stringify(selection),
+          ],
+        )
+        return selection
+      }
       const candidateResult = await client.query<SelectableOfferRow>(
         `SELECT clock_timestamp() AS server_now,
                 offer.id::text AS offer_id, offer.global_id AS offer_global_id,
                 run.id::text AS rerate_run_id,
+                run.order_id::text,
                 run.active_fulfillment_execution_id::text,
                 run.active_shipment_group_id::text,
                 attempt.id::text AS attempt_id,
@@ -2498,10 +2650,9 @@ export async function selectProductionFulfillmentRerateOfferInPostgres(
                 attempt.origin_fingerprint, run.destination_fingerprint,
                 attempt.billing_fingerprint,
                 run.ordered_package_set_fingerprint,
+                run.destination_snapshot,
                 offer.expires_at, result.state AS result_state,
-                run.activation_revision,
-                activation.state AS current_activation_state,
-                activation.revision AS current_activation_revision
+                run.activation_revision
          FROM operations_production_fulfillment_rerate_offers offer
          JOIN operations_production_fulfillment_rerate_results result
            ON result.organization_id = offer.organization_id
@@ -2512,13 +2663,11 @@ export async function selectProductionFulfillmentRerateOfferInPostgres(
          JOIN operations_production_fulfillment_rerate_runs run
            ON run.organization_id = offer.organization_id
           AND run.id = offer.rerate_run_id
-         JOIN operations_activation_scopes activation
-           ON activation.organization_id = offer.organization_id
          WHERE offer.organization_id = $1::uuid
            AND offer.global_id = $2
            AND run.global_id = $3
          LIMIT 1
-         FOR SHARE OF offer, result, attempt, run, activation`,
+         FOR SHARE OF offer, result, attempt, run`,
         [organizationId, offerGlobalId, rerateRunGlobalId],
       )
       const candidate = candidateResult.rows[0]
@@ -2532,9 +2681,6 @@ export async function selectProductionFulfillmentRerateOfferInPostgres(
       if (
         candidate.result_state !== 'succeeded'
         || !candidate.provider_reference
-        || candidate.current_activation_state !== 'active'
-        || Number(candidate.current_activation_revision)
-          !== Number(candidate.activation_revision)
         || Date.parse(new Date(candidate.expires_at).toISOString())
           <= Date.parse(new Date(candidate.server_now).toISOString())
       ) {
@@ -2544,26 +2690,141 @@ export async function selectProductionFulfillmentRerateOfferInPostgres(
         )
       }
 
-      const existing = await client.query<{
-        id: string
-        offer_id: string
+      // Lock every mutable row used as current selection authority in one
+      // stable order. These SHARE locks remain held through the insert and its
+      // database trigger, so a concurrent order, activation, account, or
+      // credential update cannot invalidate evidence between validation and
+      // commit.
+      const activationResult = await client.query<{
+        state: string
+        revision: number
       }>(
-        `SELECT id::text, offer_id::text
-         FROM operations_production_fulfillment_rerate_selections
+        `SELECT state, revision
+         FROM operations_activation_scopes
          WHERE organization_id = $1::uuid
-           AND rerate_run_id = $2::uuid
          LIMIT 1
          FOR SHARE`,
-        [organizationId, candidate.rerate_run_id],
+        [organizationId],
       )
-      if (existing.rows[0]) {
-        if (existing.rows[0].offer_id !== candidate.offer_id) {
-          fail(
-            'OPERATIONS_PRODUCTION_RERATE_SELECTION_CONFLICT',
-            'Rerate run already selected a different immutable offer',
-          )
-        }
-        return loadRerateSelection(client, organizationId, existing.rows[0].id, true)
+      const activation = activationResult.rows[0]
+      if (
+        !activation
+        || activation.state !== 'active'
+        || Number(activation.revision) !== Number(candidate.activation_revision)
+      ) {
+        fail(
+          'OPERATIONS_PRODUCTION_RERATE_OFFER_INELIGIBLE',
+          'Only one currently unexpired offer from the current Active revision may be selected',
+        )
+      }
+      const orderResult = await client.query<{
+        currency: string
+        destination_matches: boolean
+      }>(
+        `SELECT orders.currency,
+                operations_dispatch_address_matches_core(
+                  $3::jsonb,
+                  orders.ship_to
+                ) AS destination_matches
+         FROM operations_orders orders
+         WHERE orders.organization_id = $1::uuid
+           AND orders.id = $2::uuid
+         LIMIT 1
+         FOR SHARE`,
+        [
+          organizationId,
+          candidate.order_id,
+          JSON.stringify(candidate.destination_snapshot),
+        ],
+      )
+      const currentOrder = orderResult.rows[0]
+      if (
+        !currentOrder
+        || currency(currentOrder.currency) !== currency(candidate.currency)
+        || currentOrder.destination_matches !== true
+      ) {
+        fail(
+          'OPERATIONS_PRODUCTION_RERATE_SELECTION_DESTINATION_OR_CURRENCY_STALE',
+          'The order destination or currency changed after production rerating',
+          409,
+        )
+      }
+      const integrationResult = await client.query<{
+        integration_type: string
+        provider: string
+        environment: string
+        status: string
+      }>(
+        `SELECT integration_type, provider, environment, status
+         FROM operations_integration_accounts
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+         LIMIT 1
+         FOR SHARE`,
+        [organizationId, candidate.integration_account_id],
+      )
+      const integration = integrationResult.rows[0]
+      const carrierAccountResult = await client.query<{
+        status: string
+        configuration_revision: number
+        account_number_fingerprint: string
+        registered_address_fingerprint: string
+      }>(
+        `SELECT status, configuration_revision,
+                account_number_fingerprint, registered_address_fingerprint
+         FROM operations_carrier_accounts
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND id = $3::uuid
+         LIMIT 1
+         FOR SHARE`,
+        [
+          organizationId,
+          candidate.integration_account_id,
+          candidate.carrier_account_id,
+        ],
+      )
+      const carrierAccount = carrierAccountResult.rows[0]
+      const credentialResult = await client.query<{
+        verification_status: string
+        credential_version: number
+        credential_fingerprint: string
+      }>(
+        `SELECT verification_status, credential_version,
+                credential_fingerprint
+         FROM operations_carrier_credentials
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+         LIMIT 1
+         FOR SHARE`,
+        [organizationId, candidate.integration_account_id],
+      )
+      const credential = credentialResult.rows[0]
+      if (
+        !integration
+        || integration.integration_type !== 'carrier'
+        || integration.provider !== candidate.provider
+        || integration.environment !== 'production'
+        || integration.status !== 'active'
+        || !carrierAccount
+        || carrierAccount.status !== 'active'
+        || Number(carrierAccount.configuration_revision)
+          !== Number(candidate.carrier_account_configuration_revision)
+        || carrierAccount.account_number_fingerprint
+          !== candidate.account_number_fingerprint
+        || carrierAccount.registered_address_fingerprint
+          !== candidate.registered_origin_fingerprint
+        || !credential
+        || credential.verification_status !== 'verified'
+        || Number(credential.credential_version)
+          !== Number(candidate.credential_revision)
+        || credential.credential_fingerprint !== candidate.credential_fingerprint
+      ) {
+        fail(
+          'OPERATIONS_PRODUCTION_RERATE_SELECTION_AUTHORITY_STALE',
+          'The production carrier integration, account, or credential changed after rerating',
+          409,
+        )
       }
 
       const inserted = await client.query<{ id: string }>(
@@ -2622,7 +2883,29 @@ export async function selectProductionFulfillmentRerateOfferInPostgres(
           selectedBy,
         ],
       )
-      return loadRerateSelection(client, organizationId, inserted.rows[0].id, false)
+      const selection = await loadRerateSelection(
+        client,
+        organizationId,
+        inserted.rows[0].id,
+        false,
+      )
+      await client.query(
+        `UPDATE operations_command_receipts
+         SET status = 'succeeded',
+             result_global_id = $2,
+             result_payload = $3::jsonb,
+             error_code = NULL,
+             error_message = NULL,
+             completed_at = now(),
+             updated_at = now()
+         WHERE id = $1::uuid`,
+        [
+          createdReceipt.rows[0].id,
+          selection.globalId,
+          JSON.stringify(selection),
+        ],
+      )
+      return selection
     })
   } catch (error) {
     postgresConflict(error, 'OPERATIONS_PRODUCTION_RERATE_SELECTION_CONFLICT')

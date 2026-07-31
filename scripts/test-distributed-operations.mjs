@@ -1197,6 +1197,13 @@ async function verifyRouteBehavior() {
       this.attemptGlobalId = attemptGlobalId
     }
   }
+  class ActiveFulfillmentExecutionPreparationError extends Error {
+    constructor(code, message, status = 409) {
+      super(message)
+      this.code = code
+      this.status = status
+    }
+  }
   const calls = {
     reads: [],
     proofs: [],
@@ -1250,6 +1257,12 @@ async function verifyRouteBehavior() {
       },
       '@/lib/operations/productionFulfillmentRerates': {
         ProductionFulfillmentReratePersistenceError,
+      },
+      '@/lib/operations/activeFulfillmentExecutionPreparation': {
+        ActiveFulfillmentExecutionPreparationError,
+        prepareActiveFulfillmentExecutionFromShadowInPostgres: async () => {
+          throw new Error('Active preparation is covered by its focused route contract')
+        },
       },
       '@/lib/persistence/commerceActiveTransitionAuthorization': {
         CommerceActiveTransitionPersistenceError,

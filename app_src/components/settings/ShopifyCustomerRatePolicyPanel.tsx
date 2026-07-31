@@ -1044,7 +1044,10 @@ export default function ShopifyCustomerRatePolicyPanel({
                 Until turned off has no automatic expiry. The exact Customer
                 GID and test-variant gates still apply, every Shopify write
                 remains blocked, and an administrator must edit or remove this
-                policy to turn it off.
+                policy to turn it off. Shopify may reuse a previously
+                successful rate response for up to 15 minutes after the policy
+                changes, so disabling the policy is not an immediate cache
+                purge.
               </Alert>
             ) : null}
             <FormControl size="small" fullWidth>

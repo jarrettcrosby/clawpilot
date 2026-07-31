@@ -8,6 +8,9 @@ const read = (relative) => fs.readFileSync(path.join(root, relative), 'utf8')
 const callback = read(
   'app_src/lib/integrations/shopifyCarrierServiceCallback.ts',
 )
+const shadowGuardModule = read(
+  'app_src/lib/integrations/shopifyShadowCheckoutGuard.ts',
+)
 const branding = read(
   'app_src/lib/integrations/shopifyCarrierServiceBranding.ts',
 )
@@ -37,7 +40,9 @@ for (const required of [
   'allowShadowSimulation: false',
   'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS',
   'readActiveShopifyCustomerRatePolicyFromPostgres({',
-  "customerPolicy.mode !== 'hide_all'",
+  'evaluateShopifyShadowCheckoutPrePolicy({',
+  'evaluateShopifyShadowCheckoutPolicy(customerPolicy)',
+  "'[shopify checkout rating] shadow guard denied'",
   'buildShopifyStoreEntityRateResponse({',
   'storeEntityName: account.storeEntityName',
   "protocolVersion: 'shopify-carrier-service-response-v3'",
@@ -192,6 +197,35 @@ assert.equal(
   false,
   'callback failure logs must not include raw provider payloads',
 )
+const shadowGuardLogger = callback.slice(
+  callback.indexOf('function recordShadowCheckoutGuardDenial('),
+  callback.indexOf('function deliveryTimestamp('),
+)
+for (const required of [
+  'accountGlobalId: string',
+  'reasonCode: ShopifyShadowCheckoutGuardDenialReason',
+  'shopifyShadowCheckoutGuardDenialTelemetry(input)',
+]) {
+  assert.ok(
+    shadowGuardLogger.includes(required),
+    `Shadow denial telemetry is missing safe field: ${required}`,
+  )
+}
+for (const forbidden of [
+  'customerId:',
+  'variantId:',
+  'address:',
+  'payload:',
+  'request:',
+  'receiptClaimed:',
+  'protocolPath:',
+]) {
+  assert.equal(
+    shadowGuardLogger.includes(forbidden),
+    false,
+    `Shadow denial telemetry must not include unsafe field: ${forbidden}`,
+  )
+}
 assert.ok(
   callback.includes('name: null')
     && callback.includes('line1: null')
@@ -277,9 +311,13 @@ assert.ok(
 assert.ok(
   authenticatedExecution.includes(
     'if (!shadowGuard.allowed) {\n'
+      + '      recordShadowCheckoutGuardDenial({\n'
+      + '        accountGlobalId: account.accountGlobalId,\n'
+      + '        reasonCode: shadowGuard.reasonCode,\n'
+      + '      })\n'
       + '      return authenticatedResult(EMPTY_RATE_RESPONSE, 200)',
   ),
-  'a denied Shadow test request must return authenticated HTTP 200 empty rates',
+  'a denied Shadow test request must log safe telemetry and return authenticated HTTP 200 empty rates',
 )
 const shadowGuardFunction = callback.slice(
   callback.indexOf('async function shadowCheckoutRequestGuard('),
@@ -287,12 +325,14 @@ const shadowGuardFunction = callback.slice(
 )
 for (const required of [
   "account.activationState !== 'shadow'",
-  'const customerId = request.customer?.id',
-  '!customerId',
-  '!variantIds',
-  'shippableItems.some((item) => !variantIds.has(item.variantId))',
-  'shopifyCustomerGid: customerId',
-  "customerPolicy.mode !== 'hide_all'",
+  'evaluateShopifyShadowCheckoutPrePolicy({',
+  'customerId: request.customer?.id',
+  'configuredVariantIds: configuredShopifyNumericIdentifierSet(',
+  'items: request.items',
+  'if (!prePolicy.ready)',
+  'reasonCode: prePolicy.reasonCode',
+  'shopifyCustomerGid: prePolicy.customerId',
+  'evaluateShopifyShadowCheckoutPolicy(customerPolicy)',
 ]) {
   assert.ok(
     shadowGuardFunction.includes(required),
@@ -300,12 +340,28 @@ for (const required of [
   )
 }
 assert.ok(
-  shadowGuardFunction.indexOf('!customerId')
+  shadowGuardFunction.indexOf('if (!prePolicy.ready)')
     < shadowGuardFunction.indexOf(
       'readActiveShopifyCustomerRatePolicyFromPostgres({',
     ),
   'guest or customer-omitted Shadow callbacks must fail closed before policy lookup',
 )
+for (const required of [
+  "MissingCustomer: 'SHOPIFY_SHADOW_GUARD_MISSING_CUSTOMER'",
+  "'SHOPIFY_SHADOW_GUARD_MISSING_VARIANT_CONFIGURATION'",
+  "NoShippableItems: 'SHOPIFY_SHADOW_GUARD_NO_SHIPPABLE_ITEMS'",
+  "UnallowlistedVariant: 'SHOPIFY_SHADOW_GUARD_UNALLOWLISTED_VARIANT'",
+  "'SHOPIFY_SHADOW_GUARD_POLICY_ABSENT_OR_INELIGIBLE'",
+  "HideAll: 'SHOPIFY_SHADOW_GUARD_HIDE_ALL'",
+  'shopifyShadowCheckoutGuardDenialTelemetry',
+  "stage: 'shadow_guard' as const",
+  "checkpoint: 'request_parsed' as const",
+]) {
+  assert.ok(
+    shadowGuardModule.includes(required),
+    `Shadow denial telemetry is missing stable reason: ${required}`,
+  )
+}
 assert.ok(
   callback.indexOf('readShopifyCheckoutContextFromPostgres({')
     < callback.indexOf(

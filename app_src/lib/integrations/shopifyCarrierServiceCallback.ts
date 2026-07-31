@@ -61,6 +61,13 @@ import {
 import {
   createShopifyCheckoutReceiptKeys,
 } from '@/lib/integrations/shopifyCheckoutReceiptKeys'
+import {
+  evaluateShopifyShadowCheckoutPolicy,
+  evaluateShopifyShadowCheckoutPrePolicy,
+  shopifyShadowCheckoutGuardDenialTelemetry,
+  type ShopifyShadowCheckoutGuardDecision,
+  type ShopifyShadowCheckoutGuardDenialReason,
+} from '@/lib/integrations/shopifyShadowCheckoutGuard'
 
 const ACCOUNT_GLOBAL_ID = /^gia[0-9]{7}$/
 const CALLBACK_TOKEN = /^[A-Za-z0-9_-]{43}$/
@@ -215,39 +222,33 @@ function sandboxCheckoutAccountIsReady(
   )
 }
 
-type ShadowCheckoutGuard =
-  | { allowed: false }
-  | { allowed: true }
-
 async function shadowCheckoutRequestGuard(
   account: ShopifyCheckoutRatingAccount,
   request: ShopifyCarrierServiceRateRequest,
-): Promise<ShadowCheckoutGuard> {
+): Promise<ShopifyShadowCheckoutGuardDecision> {
   if (account.activationState !== 'shadow') {
     return { allowed: true }
   }
-  const variantIds = configuredShopifyNumericIdentifierSet(
-    'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS',
-  )
-  const customerId = request.customer?.id
-  const shippableItems = request.items.filter((item) => item.requiresShipping)
-  if (
-    !customerId
-    || !variantIds
-    || shippableItems.length < 1
-    || shippableItems.some((item) => !variantIds.has(item.variantId))
-  ) {
-    return { allowed: false }
+  const prePolicy = evaluateShopifyShadowCheckoutPrePolicy({
+    customerId: request.customer?.id,
+    configuredVariantIds: configuredShopifyNumericIdentifierSet(
+      'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS',
+    ),
+    items: request.items,
+  })
+  if (!prePolicy.ready) {
+    return {
+      allowed: false,
+      reasonCode: prePolicy.reasonCode,
+    }
   }
   const customerPolicy =
     await readActiveShopifyCustomerRatePolicyFromPostgres({
       organizationId: account.organizationId,
       accountGlobalId: account.accountGlobalId,
-      shopifyCustomerGid: customerId,
+      shopifyCustomerGid: prePolicy.customerId,
     })
-  return customerPolicy && customerPolicy.mode !== 'hide_all'
-    ? { allowed: true }
-    : { allowed: false }
+  return evaluateShopifyShadowCheckoutPolicy(customerPolicy)
 }
 
 function checkoutExecutionFenceHash(
@@ -953,6 +954,16 @@ function recordCheckoutFailure(input: {
   })
 }
 
+function recordShadowCheckoutGuardDenial(input: {
+  accountGlobalId: string
+  reasonCode: ShopifyShadowCheckoutGuardDenialReason
+}) {
+  console.warn(
+    '[shopify checkout rating] shadow guard denied',
+    shopifyShadowCheckoutGuardDenialTelemetry(input),
+  )
+}
+
 function deliveryTimestamp(value: string | null) {
   return value ? `${value}T23:59:59.000Z` : null
 }
@@ -1120,6 +1131,10 @@ export async function executeShopifyCarrierServiceCallback(input: {
       workController.signal,
     )
     if (!shadowGuard.allowed) {
+      recordShadowCheckoutGuardDenial({
+        accountGlobalId: account.accountGlobalId,
+        reasonCode: shadowGuard.reasonCode,
+      })
       return authenticatedResult(EMPTY_RATE_RESPONSE, 200)
     }
     checkpoint = 'shadow_authorized'
