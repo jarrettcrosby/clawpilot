@@ -1024,6 +1024,16 @@ checkpoint, and a safe reason code with the account Global ID. The checkpoint
 identifies only a code-owned boundary such as request parsing, line validation,
 context loading, or receipt claim; it never includes payload values. Callback
 tokens, request bodies, addresses, and customer facts are never logged.
+The receipt claim transaction gives each PostgreSQL statement at most 750ms and
+may replay the entire idempotent claim once, within the unchanged callback
+deadline, only for serialization failure, deadlock, lock timeout, or statement
+timeout SQLSTATEs. Each replay reacquires the transaction advisory lock and
+revalidates configuration, activation, inventory, policy, and idempotency
+fences; it does not bypass Shadow authorization or repeat a carrier request.
+An exhausted retry maps the SQLSTATE to a fixed ClawPilot reason code and never
+logs the database message, query text, request values, or customer facts. The
+deadline remains authoritative and produces the existing deadline-exceeded
+failure instead of extending Shopify's response budget.
 Shopify decimal identifiers and exact
 `gid://shopify/Customer/<decimal>`, `gid://shopify/Product/<decimal>`, and
 `gid://shopify/ProductVariant/<decimal>` resource GIDs normalize to the same

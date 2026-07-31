@@ -20,6 +20,14 @@ export const MAX_SHOPIFY_CHECKOUT_LINES = 500
 export const MAX_SHOPIFY_CHECKOUT_PACKAGES = 50
 export const MAX_SHOPIFY_CHECKOUT_OFFERS = 100
 export const MAX_SHOPIFY_CHECKOUT_PROVIDER_ATTEMPTS = 2
+const SHOPIFY_CHECKOUT_PERSISTENCE_STATEMENT_TIMEOUT_MS = 750
+const SHOPIFY_CHECKOUT_RECEIPT_CLAIM_MAX_ATTEMPTS = 2
+const SHOPIFY_CHECKOUT_TRANSIENT_CLAIM_SQLSTATES = new Set([
+  '40001',
+  '40P01',
+  '55P03',
+  '57014',
+])
 
 export type ShopifyCheckoutCarrierProvider = 'ups_rest' | 'fedex_rest'
 export type ShopifyCarrierServiceRegistrationState =
@@ -863,7 +871,13 @@ async function withShopifyCheckoutDeadlineTransaction<T>(
     const remainingMs = Date.parse(deadlineAt) - Date.now()
     await client.query(
       `SELECT set_config('statement_timeout', $1, true)`,
-      [`${Math.max(1, Math.min(remainingMs, 500))}ms`],
+      [`${Math.max(
+        1,
+        Math.min(
+          remainingMs,
+          SHOPIFY_CHECKOUT_PERSISTENCE_STATEMENT_TIMEOUT_MS,
+        ),
+      )}ms`],
     )
     const result = await callback(deadlineFencedClient(client, deadlineAt))
     requirePersistenceDeadline(deadlineAt)
@@ -880,6 +894,77 @@ async function withShopifyCheckoutDeadlineTransaction<T>(
     }
     return result
   })
+}
+
+function postgresSqlState(error: unknown) {
+  const candidate = error && typeof error === 'object'
+    ? (error as { code?: unknown }).code
+    : null
+  return typeof candidate === 'string' && /^[0-9A-Z]{5}$/.test(candidate)
+    ? candidate
+    : null
+}
+
+export function shopifyCheckoutReceiptClaimRetryDisposition(input: {
+  error: unknown
+  attempt: number
+  deadlineAt: string | null
+  nowMs?: number
+}) {
+  if (
+    input.deadlineAt
+    && (input.nowMs ?? Date.now()) >= Date.parse(input.deadlineAt)
+  ) {
+    return {
+      retry: false,
+      reasonCode: 'SHOPIFY_CHECKOUT_CALLBACK_DEADLINE_EXCEEDED',
+      message: 'Shopify checkout persistence exceeded the callback deadline',
+      status: 504,
+    } as const
+  }
+  const sqlState = postgresSqlState(input.error)
+  if (
+    sqlState !== null
+    && SHOPIFY_CHECKOUT_TRANSIENT_CLAIM_SQLSTATES.has(sqlState)
+    && input.attempt < SHOPIFY_CHECKOUT_RECEIPT_CLAIM_MAX_ATTEMPTS
+  ) {
+    return {
+      retry: true,
+      reasonCode: null,
+      message: null,
+      status: null,
+    } as const
+  }
+  if (sqlState === '57014') {
+    return {
+      retry: false,
+      reasonCode: 'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_DB_TIMEOUT',
+      message: 'Shopify checkout receipt claim timed out',
+      status: 503,
+    } as const
+  }
+  if (sqlState === '55P03') {
+    return {
+      retry: false,
+      reasonCode: 'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_LOCK_TIMEOUT',
+      message: 'Shopify checkout receipt claim could not acquire its lock',
+      status: 503,
+    } as const
+  }
+  if (sqlState === '40001' || sqlState === '40P01') {
+    return {
+      retry: false,
+      reasonCode: 'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_RETRY_EXHAUSTED',
+      message: 'Shopify checkout receipt claim exhausted its safe database retry',
+      status: 503,
+    } as const
+  }
+  return {
+    retry: false,
+    reasonCode: null,
+    message: null,
+    status: null,
+  } as const
 }
 
 function canonicalize(value: unknown): unknown {
@@ -3511,10 +3596,9 @@ function assertIdempotentReceipt(
   }
 }
 
-export async function claimShopifyCheckoutRateReceiptInPostgres(
-  rawInput: ShopifyCheckoutReceiptClaimInput,
+async function claimShopifyCheckoutRateReceiptOnceInPostgres(
+  input: NormalizedShopifyCheckoutReceiptClaimInput,
 ): Promise<ShopifyCheckoutRateReceiptClaim> {
-  const input = normalizeShopifyCheckoutReceiptClaimInput(rawInput)
   return withShopifyCheckoutDeadlineTransaction(
     input.deadlineAt,
     async (client) => {
@@ -3882,6 +3966,47 @@ export async function claimShopifyCheckoutRateReceiptInPostgres(
       leaseToken,
     }
     },
+  )
+}
+
+export async function claimShopifyCheckoutRateReceiptInPostgres(
+  rawInput: ShopifyCheckoutReceiptClaimInput,
+): Promise<ShopifyCheckoutRateReceiptClaim> {
+  const input = normalizeShopifyCheckoutReceiptClaimInput(rawInput)
+  for (
+    let attempt = 1;
+    attempt <= SHOPIFY_CHECKOUT_RECEIPT_CLAIM_MAX_ATTEMPTS;
+    attempt += 1
+  ) {
+    try {
+      return await claimShopifyCheckoutRateReceiptOnceInPostgres(input)
+    } catch (error) {
+      const disposition = shopifyCheckoutReceiptClaimRetryDisposition({
+        error,
+        attempt,
+        deadlineAt: input.deadlineAt,
+      })
+      if (!disposition.retry) {
+        if (
+          disposition.reasonCode
+          && disposition.message
+          && disposition.status
+        ) {
+          fail(
+            disposition.reasonCode,
+            disposition.message,
+            disposition.status,
+          )
+        }
+        throw error
+      }
+      if (input.deadlineAt) requirePersistenceDeadline(input.deadlineAt)
+    }
+  }
+  fail(
+    'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_RETRY_EXHAUSTED',
+    'Shopify checkout receipt claim exhausted its safe database retry',
+    503,
   )
 }
 

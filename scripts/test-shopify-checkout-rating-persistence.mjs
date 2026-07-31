@@ -567,9 +567,15 @@ includes(receiptHydration, [
 
 const receiptClaim = section(
   persistenceSource,
+  'async function claimShopifyCheckoutRateReceiptOnceInPostgres',
+  'export async function claimShopifyCheckoutRateReceiptInPostgres',
+  'single checkout receipt claim transaction',
+)
+const receiptClaimRetry = section(
+  persistenceSource,
   'export async function claimShopifyCheckoutRateReceiptInPostgres',
   'function normalizeCompletion(',
-  'checkout receipt claim',
+  'checkout receipt claim retry wrapper',
 )
 includes(receiptClaim, [
   'readConfigRowWithClient(client, input)',
@@ -587,6 +593,24 @@ assert.equal(
   false,
   'new and reclaimed receipt claims must not hydrate terminal receipt children',
 )
+includes(persistenceSource, [
+  'SHOPIFY_CHECKOUT_PERSISTENCE_STATEMENT_TIMEOUT_MS = 750',
+  'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_MAX_ATTEMPTS = 2',
+  "'40001'",
+  "'40P01'",
+  "'55P03'",
+  "'57014'",
+  "'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_DB_TIMEOUT'",
+  "'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_LOCK_TIMEOUT'",
+  "'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_RETRY_EXHAUSTED'",
+], 'bounded checkout receipt claim database retry policy')
+includes(receiptClaimRetry, [
+  'normalizeShopifyCheckoutReceiptClaimInput(rawInput)',
+  'claimShopifyCheckoutRateReceiptOnceInPostgres(input)',
+  'shopifyCheckoutReceiptClaimRetryDisposition({',
+  'if (!disposition.retry)',
+  'requirePersistenceDeadline(input.deadlineAt)',
+], 'deadline-fenced checkout receipt claim retry')
 
 const configProjection = section(
   persistenceSource,
@@ -675,9 +699,72 @@ const {
   shopifyCheckoutRateLineageIsRequired,
   shopifyCheckoutRateOutcomeAllowsFulfillment,
   shopifyCheckoutPackagePlanHash,
+  shopifyCheckoutReceiptClaimRetryDisposition,
   shopifyCheckoutLineQuantityFingerprint,
   shopifyCheckoutRatingHash,
 } = persistence
+
+const claimDeadline = '2026-07-31T22:00:08.250Z'
+assert.equal(
+  shopifyCheckoutReceiptClaimRetryDisposition({
+    error: { code: '57014' },
+    attempt: 1,
+    deadlineAt: claimDeadline,
+    nowMs: Date.parse('2026-07-31T22:00:01.000Z'),
+  }).retry,
+  true,
+  'A first statement timeout receives one bounded receipt-claim retry',
+)
+assert.equal(
+  shopifyCheckoutReceiptClaimRetryDisposition({
+    error: { code: '57014' },
+    attempt: 2,
+    deadlineAt: claimDeadline,
+    nowMs: Date.parse('2026-07-31T22:00:02.000Z'),
+  }).reasonCode,
+  'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_DB_TIMEOUT',
+  'An exhausted statement timeout maps to a safe fixed reason',
+)
+assert.equal(
+  shopifyCheckoutReceiptClaimRetryDisposition({
+    error: { code: '55P03' },
+    attempt: 2,
+    deadlineAt: claimDeadline,
+    nowMs: Date.parse('2026-07-31T22:00:02.000Z'),
+  }).reasonCode,
+  'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_LOCK_TIMEOUT',
+  'An exhausted lock timeout maps to a safe fixed reason',
+)
+assert.equal(
+  shopifyCheckoutReceiptClaimRetryDisposition({
+    error: { code: '40001' },
+    attempt: 2,
+    deadlineAt: claimDeadline,
+    nowMs: Date.parse('2026-07-31T22:00:02.000Z'),
+  }).reasonCode,
+  'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_RETRY_EXHAUSTED',
+  'An exhausted serialization retry maps to a safe fixed reason',
+)
+assert.equal(
+  shopifyCheckoutReceiptClaimRetryDisposition({
+    error: { code: '57014' },
+    attempt: 1,
+    deadlineAt: claimDeadline,
+    nowMs: Date.parse(claimDeadline),
+  }).reasonCode,
+  'SHOPIFY_CHECKOUT_CALLBACK_DEADLINE_EXCEEDED',
+  'The callback deadline always wins over a database retry',
+)
+assert.equal(
+  shopifyCheckoutReceiptClaimRetryDisposition({
+    error: { code: 'SHOPIFY_CHECKOUT_CONTEXT_STALE' },
+    attempt: 1,
+    deadlineAt: claimDeadline,
+    nowMs: Date.parse('2026-07-31T22:00:02.000Z'),
+  }).reasonCode,
+  null,
+  'Application and unknown errors are never retried as database contention',
+)
 
 assert.equal(
   classifyShopifyCheckoutRateReconciliationOutcome({
