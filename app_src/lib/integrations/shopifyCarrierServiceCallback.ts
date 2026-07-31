@@ -1239,6 +1239,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
         claimedBy: SHOPIFY_CARRIER_SERVICE_CALLBACK_ACTOR,
         leaseSeconds: CALLBACK_LEASE_SECONDS,
         deadlineAt: new Date(successPersistenceDeadlineAt).toISOString(),
+        signal: workController.signal,
         redactedRequestSnapshot: {
           protocolVersion: 'shopify-carrier-service-request-v1',
           requestFingerprint,

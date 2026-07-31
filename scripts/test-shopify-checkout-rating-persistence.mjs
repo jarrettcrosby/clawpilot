@@ -583,6 +583,20 @@ includes(receiptClaim, [
   'receiptGlobalId: reclaimed.rows[0].global_id',
   'receiptGlobalId: inserted.rows[0].global_id',
 ], 'latency-bounded checkout receipt claim')
+includes(receiptClaim, [
+  'statementTimeoutMs: SHOPIFY_CHECKOUT_CLAIM_STATEMENT_TIMEOUT_MS',
+  'signal: input.signal',
+], 'claim-only persistence deadline options')
+assert.equal(
+  section(
+    persistenceSource,
+    'export async function completeShopifyCheckoutRateReceiptInPostgres',
+    'export async function failShopifyCheckoutRateReceiptInPostgres',
+    'checkout receipt completion transaction',
+  ).includes('SHOPIFY_CHECKOUT_CLAIM_STATEMENT_TIMEOUT_MS'),
+  false,
+  'Receipt completion must retain the default persistence statement timeout',
+)
 assert.equal(
   receiptClaim.includes('readConfigWithClient(client, input)'),
   false,
@@ -594,22 +608,47 @@ assert.equal(
   'new and reclaimed receipt claims must not hydrate terminal receipt children',
 )
 includes(persistenceSource, [
-  'SHOPIFY_CHECKOUT_PERSISTENCE_STATEMENT_TIMEOUT_MS = 750',
+  'SHOPIFY_CHECKOUT_PERSISTENCE_STATEMENT_TIMEOUT_MS = 500',
+  'SHOPIFY_CHECKOUT_CLAIM_STATEMENT_TIMEOUT_MS = 750',
   'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_MAX_ATTEMPTS = 2',
   "'40001'",
   "'40P01'",
   "'55P03'",
   "'57014'",
   "'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_DB_TIMEOUT'",
+  "'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_CANCELLED'",
   "'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_LOCK_TIMEOUT'",
   "'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_RETRY_EXHAUSTED'",
 ], 'bounded checkout receipt claim database retry policy')
+const deadlineTransaction = section(
+  persistenceSource,
+  'async function acquireShopifyCheckoutClient(',
+  'function postgresSqlState(',
+  'checkout deadline transaction',
+)
+includes(deadlineTransaction, [
+  'Promise.race([connection, fence])',
+  'lateClient.release()',
+  "await client.query('BEGIN')",
+  "await client.query('COMMIT')",
+  "await client.query('ROLLBACK')",
+  'commitBufferMs: 25',
+], 'bounded checkout claim transaction lifecycle')
+assert.equal(
+  section(
+    deadlineTransaction,
+    "await client.query('COMMIT')",
+    'return result',
+    'committed checkout claim return',
+  ).includes('requirePersistenceAvailable'),
+  false,
+  'A resolved COMMIT must return its durable claim without a late deadline error',
+)
 includes(receiptClaimRetry, [
   'normalizeShopifyCheckoutReceiptClaimInput(rawInput)',
   'claimShopifyCheckoutRateReceiptOnceInPostgres(input)',
-  'shopifyCheckoutReceiptClaimRetryDisposition({',
-  'if (!disposition.retry)',
-  'requirePersistenceDeadline(input.deadlineAt)',
+  'executeShopifyCheckoutReceiptClaimWithRetry({',
+  'signal: input.signal',
 ], 'deadline-fenced checkout receipt claim retry')
 
 const configProjection = section(
@@ -692,6 +731,7 @@ assert.ok(
 
 const {
   ShopifyCheckoutRatingPersistenceError,
+  executeShopifyCheckoutReceiptClaimWithRetry,
   normalizeShopifyCarrierServiceConfigInput,
   normalizeShopifyCheckoutReceiptClaimInput,
   classifyShopifyCheckoutRateReconciliationOutcome,
@@ -707,7 +747,10 @@ const {
 const claimDeadline = '2026-07-31T22:00:08.250Z'
 assert.equal(
   shopifyCheckoutReceiptClaimRetryDisposition({
-    error: { code: '57014' },
+    error: {
+      code: '57014',
+      message: 'canceling statement due to statement timeout',
+    },
     attempt: 1,
     deadlineAt: claimDeadline,
     nowMs: Date.parse('2026-07-31T22:00:01.000Z'),
@@ -717,7 +760,10 @@ assert.equal(
 )
 assert.equal(
   shopifyCheckoutReceiptClaimRetryDisposition({
-    error: { code: '57014' },
+    error: {
+      code: '57014',
+      message: 'canceling statement due to statement timeout',
+    },
     attempt: 2,
     deadlineAt: claimDeadline,
     nowMs: Date.parse('2026-07-31T22:00:02.000Z'),
@@ -747,13 +793,29 @@ assert.equal(
 )
 assert.equal(
   shopifyCheckoutReceiptClaimRetryDisposition({
-    error: { code: '57014' },
+    error: {
+      code: '57014',
+      message: 'canceling statement due to statement timeout',
+    },
     attempt: 1,
     deadlineAt: claimDeadline,
     nowMs: Date.parse(claimDeadline),
   }).reasonCode,
   'SHOPIFY_CHECKOUT_CALLBACK_DEADLINE_EXCEEDED',
   'The callback deadline always wins over a database retry',
+)
+assert.equal(
+  shopifyCheckoutReceiptClaimRetryDisposition({
+    error: {
+      code: '57014',
+      message: 'canceling statement due to user request',
+    },
+    attempt: 1,
+    deadlineAt: claimDeadline,
+    nowMs: Date.parse('2026-07-31T22:00:02.000Z'),
+  }).reasonCode,
+  'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_CANCELLED',
+  'An external query cancellation is classified without replay',
 )
 assert.equal(
   shopifyCheckoutReceiptClaimRetryDisposition({
@@ -764,6 +826,49 @@ assert.equal(
   }).reasonCode,
   null,
   'Application and unknown errors are never retried as database contention',
+)
+
+let transientClaimAttempts = 0
+assert.equal(
+  await executeShopifyCheckoutReceiptClaimWithRetry({
+    deadlineAt: '2099-07-31T22:00:08.250Z',
+    executeAttempt: async () => {
+      transientClaimAttempts += 1
+      if (transientClaimAttempts === 1) {
+        throw Object.assign(
+          new Error('canceling statement due to statement timeout'),
+          { code: '57014' },
+        )
+      }
+      return 'claimed'
+    },
+  }),
+  'claimed',
+  'A transient first receipt-claim transaction is replayed exactly once',
+)
+assert.equal(
+  transientClaimAttempts,
+  2,
+  'The recovered receipt claim executes exactly two whole transactions',
+)
+let nonTransientClaimAttempts = 0
+await assert.rejects(
+  executeShopifyCheckoutReceiptClaimWithRetry({
+    deadlineAt: '2099-07-31T22:00:08.250Z',
+    executeAttempt: async () => {
+      nonTransientClaimAttempts += 1
+      throw Object.assign(new Error('stale'), {
+        code: 'SHOPIFY_CHECKOUT_CONTEXT_STALE',
+      })
+    },
+  }),
+  (error) => error.code === 'SHOPIFY_CHECKOUT_CONTEXT_STALE',
+  'A non-transient claim error is returned without replay',
+)
+assert.equal(
+  nonTransientClaimAttempts,
+  1,
+  'A non-transient receipt claim executes only one transaction',
 )
 
 assert.equal(

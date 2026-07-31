@@ -248,9 +248,18 @@ assert.equal(
 
 for (const required of [
   'withShopifyCheckoutDeadlineTransaction',
+  'acquireShopifyCheckoutClient',
+  'getPostgresPool().connect()',
+  'Promise.race([connection, fence])',
+  'lateClient.release()',
+  "client.query('BEGIN')",
+  "client.query('COMMIT')",
+  "client.query('ROLLBACK')",
+  'requirePersistenceAvailable(deadlineAt, options?.signal)',
+  'commitBufferMs: 25',
   "set_config('statement_timeout', $1, true)",
   'clock_timestamp() < $1::timestamptz AS within_deadline',
-  'deadlineFencedClient(client, deadlineAt)',
+  'deadlineFencedClient(',
   "'SHOPIFY_CHECKOUT_CALLBACK_DEADLINE_EXCEEDED'",
 ]) {
   assert.ok(
@@ -258,6 +267,10 @@ for (const required of [
     `callback persistence is missing deadline fence: ${required}`,
   )
 }
+assert.ok(
+  callback.includes('signal: workController.signal'),
+  'receipt claiming must carry callback cancellation through the commit fence',
+)
 assert.match(
   callback,
   /CALLBACK_CARRIER_DEADLINE_MS = 6_500[\s\S]*CALLBACK_SUCCESS_PERSISTENCE_DEADLINE_MS = 8_250[\s\S]*CALLBACK_WORK_ABORT_MS = 8_700[\s\S]*CALLBACK_FAILURE_PERSISTENCE_DEADLINE_MS = 8_950[\s\S]*CALLBACK_RESPONSE_TIMEOUT_MS = 9_250/,

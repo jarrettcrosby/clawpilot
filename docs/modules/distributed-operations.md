@@ -1024,16 +1024,26 @@ checkpoint, and a safe reason code with the account Global ID. The checkpoint
 identifies only a code-owned boundary such as request parsing, line validation,
 context loading, or receipt claim; it never includes payload values. Callback
 tokens, request bodies, addresses, and customer facts are never logged.
-The receipt claim transaction gives each PostgreSQL statement at most 750ms and
-may replay the entire idempotent claim once, within the unchanged callback
-deadline, only for serialization failure, deadlock, lock timeout, or statement
-timeout SQLSTATEs. Each replay reacquires the transaction advisory lock and
-revalidates configuration, activation, inventory, policy, and idempotency
-fences; it does not bypass Shadow authorization or repeat a carrier request.
-An exhausted retry maps the SQLSTATE to a fixed ClawPilot reason code and never
-logs the database message, query text, request values, or customer facts. The
-deadline remains authoritative and produces the existing deadline-exceeded
-failure instead of extending Shopify's response budget.
+The receipt claim transaction gives each PostgreSQL statement at most 750ms;
+completion and failure retention keep their separate 500ms bound. Pool
+acquisition is raced against the callback cancellation signal and absolute
+deadline, and a late connection is released without starting a transaction.
+Transaction start and every subsequent query are cooperatively checked before
+and after execution, while the server-side statement timeout bounds database
+work. Commit receives a freshly reduced server-side timeout with a final safety
+buffer; once commit resolves, its durable result is returned rather than
+reclassified as a late failure. A transaction that cannot reach commit inside
+the fence rolls back. The claim may replay the entire idempotent transaction
+once only for serialization failure, deadlock, lock timeout, or an exact locally
+generated PostgreSQL statement-timeout cancellation. External or
+request-driven query cancellation is classified but never retried. Each replay
+reacquires the transaction advisory lock and revalidates configuration,
+activation, inventory, policy, and idempotency fences; it does not bypass Shadow
+authorization or repeat a carrier request. An exhausted retry maps the SQLSTATE
+to a fixed ClawPilot reason code and never logs the database message, query text,
+request values, or customer facts. The deadline remains authoritative and
+produces the existing deadline-exceeded failure instead of extending Shopify's
+response budget.
 Shopify decimal identifiers and exact
 `gid://shopify/Customer/<decimal>`, `gid://shopify/Product/<decimal>`, and
 `gid://shopify/ProductVariant/<decimal>` resource GIDs normalize to the same

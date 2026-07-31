@@ -11,6 +11,7 @@ import {
 } from '@/lib/operations/shopifyCheckoutRateWarmPolicy'
 import {
   acquireTransactionAdvisoryLock,
+  getPostgresPool,
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
@@ -20,13 +21,13 @@ export const MAX_SHOPIFY_CHECKOUT_LINES = 500
 export const MAX_SHOPIFY_CHECKOUT_PACKAGES = 50
 export const MAX_SHOPIFY_CHECKOUT_OFFERS = 100
 export const MAX_SHOPIFY_CHECKOUT_PROVIDER_ATTEMPTS = 2
-const SHOPIFY_CHECKOUT_PERSISTENCE_STATEMENT_TIMEOUT_MS = 750
+const SHOPIFY_CHECKOUT_PERSISTENCE_STATEMENT_TIMEOUT_MS = 500
+const SHOPIFY_CHECKOUT_CLAIM_STATEMENT_TIMEOUT_MS = 750
 const SHOPIFY_CHECKOUT_RECEIPT_CLAIM_MAX_ATTEMPTS = 2
 const SHOPIFY_CHECKOUT_TRANSIENT_CLAIM_SQLSTATES = new Set([
   '40001',
   '40P01',
   '55P03',
-  '57014',
 ])
 
 export type ShopifyCheckoutCarrierProvider = 'ups_rest' | 'fedex_rest'
@@ -238,6 +239,7 @@ export type ShopifyCheckoutReceiptClaimInput = {
   claimedBy: string
   leaseSeconds?: number
   deadlineAt?: string | Date | null
+  signal?: AbortSignal
   lines: ShopifyCheckoutReceiptLineInput[]
 }
 
@@ -846,41 +848,136 @@ function requirePersistenceDeadline(deadlineAt: string) {
   }
 }
 
+function requirePersistenceAvailable(
+  deadlineAt: string,
+  signal?: AbortSignal,
+) {
+  if (signal?.aborted) {
+    fail(
+      'SHOPIFY_CHECKOUT_CALLBACK_DEADLINE_EXCEEDED',
+      'Shopify checkout persistence was cancelled',
+      504,
+    )
+  }
+  requirePersistenceDeadline(deadlineAt)
+}
+
 function deadlineFencedClient(
   client: PoolClient,
   deadlineAt: string,
+  signal?: AbortSignal,
 ): PoolClient {
   return new Proxy(client, {
     get(target, property) {
       if (property !== 'query') return Reflect.get(target, property, target)
       return (...args: unknown[]) => {
-        requirePersistenceDeadline(deadlineAt)
+        requirePersistenceAvailable(deadlineAt, signal)
         return Reflect.apply(target.query, target, args)
       }
     },
   }) as PoolClient
 }
 
+async function configureCheckoutStatementTimeout(input: {
+  client: PoolClient
+  deadlineAt: string
+  maximumMs: number
+  signal?: AbortSignal
+  commitBufferMs?: number
+}) {
+  requirePersistenceAvailable(input.deadlineAt, input.signal)
+  const remainingMs = Date.parse(input.deadlineAt) - Date.now()
+    - (input.commitBufferMs ?? 0)
+  if (remainingMs < 1) {
+    requirePersistenceAvailable(input.deadlineAt, input.signal)
+    fail(
+      'SHOPIFY_CHECKOUT_CALLBACK_DEADLINE_EXCEEDED',
+      'Shopify checkout persistence exceeded the callback deadline',
+      504,
+    )
+  }
+  await input.client.query(
+    `SELECT set_config('statement_timeout', $1, true)`,
+    [`${Math.max(1, Math.min(remainingMs, input.maximumMs))}ms`],
+  )
+  requirePersistenceAvailable(input.deadlineAt, input.signal)
+}
+
+async function acquireShopifyCheckoutClient(
+  deadlineAt: string,
+  signal?: AbortSignal,
+) {
+  requirePersistenceAvailable(deadlineAt, signal)
+  const connection = getPostgresPool().connect()
+  let deadlineTimer: ReturnType<typeof setTimeout> | null = null
+  let abortListener: (() => void) | null = null
+  const fence = new Promise<null>((resolve) => {
+    const remainingMs = Math.max(1, Date.parse(deadlineAt) - Date.now())
+    deadlineTimer = setTimeout(() => resolve(null), remainingMs)
+    if (signal) {
+      abortListener = () => resolve(null)
+      signal.addEventListener('abort', abortListener, { once: true })
+    }
+  })
+  try {
+    const client = await Promise.race([connection, fence])
+    if (client === null) {
+      void connection.then((lateClient) => lateClient.release()).catch(() => null)
+      requirePersistenceAvailable(deadlineAt, signal)
+      fail(
+        'SHOPIFY_CHECKOUT_CALLBACK_DEADLINE_EXCEEDED',
+        'Shopify checkout persistence exceeded the callback deadline',
+        504,
+      )
+    }
+    try {
+      requirePersistenceAvailable(deadlineAt, signal)
+    } catch (error) {
+      client.release()
+      throw error
+    }
+    return client
+  } finally {
+    if (deadlineTimer) clearTimeout(deadlineTimer)
+    if (signal && abortListener) {
+      signal.removeEventListener('abort', abortListener)
+    }
+  }
+}
+
 async function withShopifyCheckoutDeadlineTransaction<T>(
   deadlineAt: string | null,
   callback: (client: PoolClient) => Promise<T>,
+  options?: {
+    signal?: AbortSignal
+    statementTimeoutMs?: number
+  },
 ) {
   if (!deadlineAt) return withTransaction(callback)
-  return withTransaction(async (client) => {
-    requirePersistenceDeadline(deadlineAt)
-    const remainingMs = Date.parse(deadlineAt) - Date.now()
-    await client.query(
-      `SELECT set_config('statement_timeout', $1, true)`,
-      [`${Math.max(
-        1,
-        Math.min(
-          remainingMs,
-          SHOPIFY_CHECKOUT_PERSISTENCE_STATEMENT_TIMEOUT_MS,
-        ),
-      )}ms`],
-    )
-    const result = await callback(deadlineFencedClient(client, deadlineAt))
-    requirePersistenceDeadline(deadlineAt)
+  const client = await acquireShopifyCheckoutClient(
+    deadlineAt,
+    options?.signal,
+  )
+  let transactionStarted = false
+  let transactionCommitted = false
+  try {
+    requirePersistenceAvailable(deadlineAt, options?.signal)
+    await client.query('BEGIN')
+    transactionStarted = true
+    requirePersistenceAvailable(deadlineAt, options?.signal)
+    await configureCheckoutStatementTimeout({
+      client,
+      deadlineAt,
+      maximumMs: options?.statementTimeoutMs
+        ?? SHOPIFY_CHECKOUT_PERSISTENCE_STATEMENT_TIMEOUT_MS,
+      signal: options?.signal,
+    })
+    const result = await callback(deadlineFencedClient(
+      client,
+      deadlineAt,
+      options?.signal,
+    ))
+    requirePersistenceAvailable(deadlineAt, options?.signal)
     const deadline = await client.query<{ within_deadline: boolean }>(
       `SELECT clock_timestamp() < $1::timestamptz AS within_deadline`,
       [deadlineAt],
@@ -892,8 +989,26 @@ async function withShopifyCheckoutDeadlineTransaction<T>(
         504,
       )
     }
+    await configureCheckoutStatementTimeout({
+      client,
+      deadlineAt,
+      maximumMs: options?.statementTimeoutMs
+        ?? SHOPIFY_CHECKOUT_PERSISTENCE_STATEMENT_TIMEOUT_MS,
+      signal: options?.signal,
+      commitBufferMs: 25,
+    })
+    await client.query('COMMIT')
+    transactionCommitted = true
     return result
-  })
+  } catch (error) {
+    if (transactionStarted && !transactionCommitted) {
+      await client.query('ROLLBACK').catch(() => null)
+    }
+    requirePersistenceAvailable(deadlineAt, options?.signal)
+    throw error
+  } finally {
+    client.release()
+  }
 }
 
 function postgresSqlState(error: unknown) {
@@ -903,6 +1018,14 @@ function postgresSqlState(error: unknown) {
   return typeof candidate === 'string' && /^[0-9A-Z]{5}$/.test(candidate)
     ? candidate
     : null
+}
+
+function locallyTimedOutShopifyCheckoutStatement(error: unknown) {
+  const message = error && typeof error === 'object'
+    ? (error as { message?: unknown }).message
+    : null
+  return postgresSqlState(error) === '57014'
+    && message === 'canceling statement due to statement timeout'
 }
 
 export function shopifyCheckoutReceiptClaimRetryDisposition(input: {
@@ -924,22 +1047,36 @@ export function shopifyCheckoutReceiptClaimRetryDisposition(input: {
   }
   const sqlState = postgresSqlState(input.error)
   if (
-    sqlState !== null
-    && SHOPIFY_CHECKOUT_TRANSIENT_CLAIM_SQLSTATES.has(sqlState)
-    && input.attempt < SHOPIFY_CHECKOUT_RECEIPT_CLAIM_MAX_ATTEMPTS
+    (
+      sqlState !== null
+      && SHOPIFY_CHECKOUT_TRANSIENT_CLAIM_SQLSTATES.has(sqlState)
+    )
+    || locallyTimedOutShopifyCheckoutStatement(input.error)
   ) {
+    if (
+      input.attempt < SHOPIFY_CHECKOUT_RECEIPT_CLAIM_MAX_ATTEMPTS
+    ) {
+      return {
+        retry: true,
+        reasonCode: null,
+        message: null,
+        status: null,
+      } as const
+    }
+  }
+  if (locallyTimedOutShopifyCheckoutStatement(input.error)) {
     return {
-      retry: true,
-      reasonCode: null,
-      message: null,
-      status: null,
+      retry: false,
+      reasonCode: 'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_DB_TIMEOUT',
+      message: 'Shopify checkout receipt claim timed out',
+      status: 503,
     } as const
   }
   if (sqlState === '57014') {
     return {
       retry: false,
-      reasonCode: 'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_DB_TIMEOUT',
-      message: 'Shopify checkout receipt claim timed out',
+      reasonCode: 'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_CANCELLED',
+      message: 'Shopify checkout receipt claim was cancelled',
       status: 503,
     } as const
   }
@@ -965,6 +1102,50 @@ export function shopifyCheckoutReceiptClaimRetryDisposition(input: {
     message: null,
     status: null,
   } as const
+}
+
+export async function executeShopifyCheckoutReceiptClaimWithRetry<T>(input: {
+  deadlineAt: string | null
+  signal?: AbortSignal
+  executeAttempt: (attempt: number) => Promise<T>
+}): Promise<T> {
+  for (
+    let attempt = 1;
+    attempt <= SHOPIFY_CHECKOUT_RECEIPT_CLAIM_MAX_ATTEMPTS;
+    attempt += 1
+  ) {
+    try {
+      return await input.executeAttempt(attempt)
+    } catch (error) {
+      const disposition = shopifyCheckoutReceiptClaimRetryDisposition({
+        error,
+        attempt,
+        deadlineAt: input.deadlineAt,
+      })
+      if (!disposition.retry) {
+        if (
+          disposition.reasonCode
+          && disposition.message
+          && disposition.status
+        ) {
+          fail(
+            disposition.reasonCode,
+            disposition.message,
+            disposition.status,
+          )
+        }
+        throw error
+      }
+      if (input.deadlineAt) {
+        requirePersistenceAvailable(input.deadlineAt, input.signal)
+      }
+    }
+  }
+  fail(
+    'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_RETRY_EXHAUSTED',
+    'Shopify checkout receipt claim exhausted its safe database retry',
+    503,
+  )
 }
 
 function canonicalize(value: unknown): unknown {
@@ -3966,6 +4147,10 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
       leaseToken,
     }
     },
+    {
+      signal: input.signal,
+      statementTimeoutMs: SHOPIFY_CHECKOUT_CLAIM_STATEMENT_TIMEOUT_MS,
+    },
   )
 }
 
@@ -3973,41 +4158,13 @@ export async function claimShopifyCheckoutRateReceiptInPostgres(
   rawInput: ShopifyCheckoutReceiptClaimInput,
 ): Promise<ShopifyCheckoutRateReceiptClaim> {
   const input = normalizeShopifyCheckoutReceiptClaimInput(rawInput)
-  for (
-    let attempt = 1;
-    attempt <= SHOPIFY_CHECKOUT_RECEIPT_CLAIM_MAX_ATTEMPTS;
-    attempt += 1
-  ) {
-    try {
-      return await claimShopifyCheckoutRateReceiptOnceInPostgres(input)
-    } catch (error) {
-      const disposition = shopifyCheckoutReceiptClaimRetryDisposition({
-        error,
-        attempt,
-        deadlineAt: input.deadlineAt,
-      })
-      if (!disposition.retry) {
-        if (
-          disposition.reasonCode
-          && disposition.message
-          && disposition.status
-        ) {
-          fail(
-            disposition.reasonCode,
-            disposition.message,
-            disposition.status,
-          )
-        }
-        throw error
-      }
-      if (input.deadlineAt) requirePersistenceDeadline(input.deadlineAt)
-    }
-  }
-  fail(
-    'SHOPIFY_CHECKOUT_RECEIPT_CLAIM_RETRY_EXHAUSTED',
-    'Shopify checkout receipt claim exhausted its safe database retry',
-    503,
-  )
+  return executeShopifyCheckoutReceiptClaimWithRetry({
+    deadlineAt: input.deadlineAt,
+    signal: input.signal,
+    executeAttempt: () => (
+      claimShopifyCheckoutRateReceiptOnceInPostgres(input)
+    ),
+  })
 }
 
 function normalizeCompletion(
