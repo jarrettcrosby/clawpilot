@@ -1241,7 +1241,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
     }
     claimed = {
       organizationId: account.organizationId,
-      receiptGlobalId: claim.receipt.globalId,
+      receiptGlobalId: claim.receiptGlobalId,
       leaseToken: claim.leaseToken,
     }
     checkpoint = 'receipt_claimed'

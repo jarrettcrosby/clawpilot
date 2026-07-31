@@ -418,6 +418,65 @@ includes(persistenceSource, [
   'AS store_entity_name',
 ], 'Checkout persistence exports and guards')
 
+const hydrationRunner = section(
+  persistenceSource,
+  'async function runHydrationQueries',
+  'async function readConfigChildren(',
+  'child hydration query runner',
+)
+includes(hydrationRunner, [
+  'if (!client)',
+  'Promise.all(runnable.map((task) => task()))',
+  'for (const task of runnable)',
+  'results.push(await task())',
+], 'pool-parallel and transaction-serialized child hydration')
+
+const configHydration = section(
+  persistenceSource,
+  'async function readConfigChildren(',
+  'async function readConfigRowWithClient(',
+  'CarrierService config child hydration',
+)
+includes(configHydration, [
+  'runHydrationQueries(client, [',
+  '() => run<MaterialRow>(',
+  '() => run<CarrierBindingRow>(',
+], 'transaction-safe CarrierService config child hydration')
+
+const receiptHydration = section(
+  persistenceSource,
+  'async function readReceiptChildren(',
+  'async function receiptFromRow(',
+  'checkout receipt child hydration',
+)
+includes(receiptHydration, [
+  'runHydrationQueries(client, [',
+  '() => run<QueryResultRow & {',
+], 'transaction-safe checkout receipt child hydration')
+
+const receiptClaim = section(
+  persistenceSource,
+  'export async function claimShopifyCheckoutRateReceiptInPostgres',
+  'function normalizeCompletion(',
+  'checkout receipt claim',
+)
+includes(receiptClaim, [
+  'readConfigRowWithClient(client, input)',
+  'checkoutReceiptClaimConfig(configRow)',
+  'receiptGlobalId: reclaimed.rows[0].global_id',
+  'receiptGlobalId: inserted.rows[0].global_id',
+], 'latency-bounded checkout receipt claim')
+assert.equal(
+  receiptClaim.includes('readConfigWithClient(client, input)'),
+  false,
+  'receipt claim must not hydrate configuration children',
+)
+assert.equal(
+  receiptClaim.includes('readReceiptByGlobalId(client, {'),
+  false,
+  'new and reclaimed receipt claims must not hydrate terminal receipt children',
+)
+
 const configProjection = section(
   persistenceSource,
   'const CONFIG_SELECT = `SELECT',

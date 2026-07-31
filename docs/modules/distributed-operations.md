@@ -681,6 +681,17 @@ fails closed by 9.25 seconds, preserving explicit persistence and cancellation
 buffers inside Shopify's 10-second low-volume CarrierService ceiling. Shopify's
 documented 5- and 3-second high-volume ceilings remain a separate performance
 gate; this sandbox proof does not claim readiness at those request rates.
+The latency-sensitive new-claim and expired-lease reclaim paths return only the
+durable receipt Global ID plus the exact lease token needed by the callback;
+they do not hydrate terminal package, allocation, or offer evidence that cannot
+exist yet. The claim reads only the scalar CarrierService configuration fence
+required to establish authority. Cached, terminal-replay, and in-progress
+follower paths still hydrate the complete typed receipt. Child hydration may
+run in parallel through independent pool connections, but reads on one
+transaction client are serialized; concurrent `PoolClient.query()` calls are
+not a supported performance mechanism. These query-shape rules preserve the
+existing absolute 8-second carrier and 9.25-second response deadlines rather
+than extending Shopify's callback budget.
 Shopify may submit the same normalized checkout request more than once while
 the first callback is still processing. Exactly matching duplicates coalesce
 only on the full execution fence: organization, commerce account, request

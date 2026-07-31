@@ -433,7 +433,7 @@ export type ShopifyCheckoutRateReceipt = {
 export type ShopifyCheckoutRateReceiptClaim =
   | {
       kind: 'claimed'
-      receipt: ShopifyCheckoutRateReceipt
+      receiptGlobalId: string
       leaseToken: string
     }
   | {
@@ -1463,6 +1463,21 @@ const CONFIG_SELECT = `SELECT
     ON warehouse.organization_id = config.organization_id
    AND warehouse.id = config.warehouse_id`
 
+async function runHydrationQueries<T extends readonly unknown[]>(
+  client: PoolClient | null,
+  tasks: { [K in keyof T]: () => Promise<T[K]> },
+): Promise<T> {
+  const runnable = tasks as readonly (() => Promise<unknown>)[]
+  if (!client) {
+    return Promise.all(runnable.map((task) => task())) as unknown as Promise<T>
+  }
+  const results: unknown[] = []
+  for (const task of runnable) {
+    results.push(await task())
+  }
+  return results as unknown as T
+}
+
 async function readConfigChildren(
   client: PoolClient | null,
   input: { organizationId: string; configId: string },
@@ -1470,8 +1485,8 @@ async function readConfigChildren(
   const run = <T extends QueryResultRow>(sql: string, values: unknown[]) => (
     client ? client.query<T>(sql, values) : query<T>(sql, values)
   )
-  const [materials, carriers] = await Promise.all([
-    run<MaterialRow>(
+  const [materials, carriers] = await runHydrationQueries(client, [
+    () => run<MaterialRow>(
       `SELECT
          selected.selection_sequence,
          material.id::text AS material_id,
@@ -1511,7 +1526,7 @@ async function readConfigChildren(
        ORDER BY selected.selection_sequence`,
       [input.organizationId, input.configId],
     ),
-    run<CarrierBindingRow>(
+    () => run<CarrierBindingRow>(
       `SELECT
          selected.carrier_provider,
          carrier_account.id::text AS carrier_account_id,
@@ -1536,17 +1551,17 @@ async function readConfigChildren(
        ORDER BY selected.carrier_provider`,
       [input.organizationId, input.configId],
     ),
-  ])
+  ] as const)
   return {
     materials: materials.rows.map(material),
     carriers: carriers.rows.map(carrierBinding),
   }
 }
 
-async function readConfigWithClient(
+async function readConfigRowWithClient(
   client: PoolClient | null,
   input: { organizationId: string; accountGlobalId: string },
-): Promise<ShopifyCarrierServiceConfig | null> {
+): Promise<ConfigRow | null> {
   const result = client
     ? await client.query<ConfigRow>(
         `${CONFIG_SELECT}
@@ -1560,7 +1575,30 @@ async function readConfigWithClient(
            AND account.global_id = $2`,
         [input.organizationId, input.accountGlobalId],
       )
-  const row = result.rows[0]
+  return result.rows[0] || null
+}
+
+function checkoutReceiptClaimConfig(row: ConfigRow) {
+  return {
+    id: row.id,
+    integrationAccountId: row.integration_account_id,
+    warehouseId: row.warehouse_id,
+    registrationState: row.registration_state,
+    credentialGeneration: row.credential_generation,
+    policyRevision: Number(row.policy_revision),
+    policyHash: row.policy_hash,
+    inventoryMaxAgeSeconds: row.inventory_max_age_seconds,
+    algorithmVersion: row.algorithm_version,
+    rowVersion: Number(row.row_version),
+    ready: row.ready,
+  }
+}
+
+async function readConfigWithClient(
+  client: PoolClient | null,
+  input: { organizationId: string; accountGlobalId: string },
+): Promise<ShopifyCarrierServiceConfig | null> {
+  const row = await readConfigRowWithClient(client, input)
   if (!row) return null
   const children = await readConfigChildren(client, {
     organizationId: input.organizationId,
@@ -2821,8 +2859,8 @@ async function readReceiptChildren(
     client ? client.query<T>(sql, values) : query<T>(sql, values)
   )
   const [lineResult, packageResult, allocationResult, offerResult] =
-    await Promise.all([
-      run<QueryResultRow & {
+    await runHydrationQueries(client, [
+      () => run<QueryResultRow & {
         line_key: string
         provider_variant_id: string
         sku: string | null
@@ -2840,7 +2878,7 @@ async function readReceiptChildren(
          ORDER BY line_key`,
         [input.organizationId, input.receiptId],
       ),
-      run<QueryResultRow & {
+      () => run<QueryResultRow & {
         package_key: string
         package_sequence: number
         planning_method: 'approved_recipe' | 'self_package'
@@ -2898,7 +2936,7 @@ async function readReceiptChildren(
          ORDER BY package.package_sequence, package.package_key`,
         [input.organizationId, input.receiptId],
       ),
-      run<QueryResultRow & {
+      () => run<QueryResultRow & {
         package_key: string
         line_key: string
         quantity: number
@@ -2910,7 +2948,7 @@ async function readReceiptChildren(
          ORDER BY package_key, line_key`,
         [input.organizationId, input.receiptId],
       ),
-      run<QueryResultRow & {
+      () => run<QueryResultRow & {
         carrier_provider: ShopifyCheckoutCarrierProvider
         carrier_account_global_id: string
         credential_version: number
@@ -2960,7 +2998,7 @@ async function readReceiptChildren(
          ORDER BY offer.carrier_provider, offer.service_code`,
         [input.organizationId, input.receiptId],
       ),
-    ])
+    ] as const)
   const allocations = new Map<string, Array<{
     lineKey: string
     quantity: number
@@ -3190,7 +3228,10 @@ export async function claimShopifyCheckoutRateReceiptInPostgres(
       client,
       `shopify-checkout-receipt:${input.organizationId}:${input.accountGlobalId}:${input.requestFingerprint}`,
     )
-    const config = await readConfigWithClient(client, input)
+    const configRow = await readConfigRowWithClient(client, input)
+    const config = configRow
+      ? checkoutReceiptClaimConfig(configRow)
+      : null
     if (
       !config
       || !config.ready
@@ -3358,13 +3399,9 @@ export async function claimShopifyCheckoutRateReceiptInPostgres(
           409,
         )
       }
-      const receipt = await readReceiptByGlobalId(client, {
-        organizationId: input.organizationId,
-        receiptGlobalId: reclaimed.rows[0].global_id,
-      })
       return {
         kind: 'claimed',
-        receipt: receipt as ShopifyCheckoutRateReceipt,
+        receiptGlobalId: reclaimed.rows[0].global_id,
         leaseToken,
       }
     }
@@ -3443,13 +3480,9 @@ export async function claimShopifyCheckoutRateReceiptInPostgres(
           409,
         )
       }
-      const receipt = await readReceiptByGlobalId(client, {
-        organizationId: input.organizationId,
-        receiptGlobalId: reclaimed.rows[0].global_id,
-      })
       return {
         kind: 'claimed',
-        receipt: receipt as ShopifyCheckoutRateReceipt,
+        receiptGlobalId: reclaimed.rows[0].global_id,
         leaseToken,
       }
     }
@@ -3540,13 +3573,9 @@ export async function claimShopifyCheckoutRateReceiptInPostgres(
         }))),
       ],
     )
-    const receipt = await readReceiptByGlobalId(client, {
-      organizationId: input.organizationId,
-      receiptGlobalId: inserted.rows[0].global_id,
-    })
     return {
       kind: 'claimed',
-      receipt: receipt as ShopifyCheckoutRateReceipt,
+      receiptGlobalId: inserted.rows[0].global_id,
       leaseToken,
     }
     },

@@ -88,6 +88,7 @@ for (const required of [
   'readCachedShopifyCheckoutRateReceiptInPostgres(cacheLookup)',
   'waitForShopifyCheckoutReceiptCompletion({',
   'claimShopifyCheckoutRateReceiptInPostgres({',
+  'receiptGlobalId: claim.receiptGlobalId',
   'expectedConfigRowVersion: account.configRowVersion',
   'expectedActivationState: account.activationState',
   'expectedActivationRevision: account.activationRevision',
@@ -130,6 +131,11 @@ for (const required of [
     `callback is missing required contract: ${required}`,
   )
 }
+assert.equal(
+  callback.includes('receiptGlobalId: claim.receipt.globalId'),
+  false,
+  'a new receipt claim must not hydrate terminal receipt children before carrier rating',
+)
 
 for (const required of [
   'candidateAttempts: CheckoutPlanRateCandidateAttempt[]',
