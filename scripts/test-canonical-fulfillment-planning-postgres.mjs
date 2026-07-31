@@ -281,6 +281,62 @@ async function seedCanonicalPlanningFixture(
      RETURNING id::text`,
     [organizationId, email],
   )
+  async function createCarrierAccount({
+    integrationAccountId,
+    provider,
+    displayName,
+    lastFour,
+  }) {
+    const registeredAddress = {
+      name: 'Canonical warehouse',
+      line1: '7009 S 108th St',
+      city: 'La Vista',
+      region: 'NE',
+      postalCode: '68128',
+      countryCode: 'US',
+    }
+    const result = await pool.query(
+      `INSERT INTO operations_carrier_accounts (
+         organization_id, integration_account_id, display_name, sender_name,
+         account_number_ciphertext, account_number_iv, account_number_tag,
+         account_number_last_four, account_number_fingerprint,
+         registered_address, registered_address_fingerprint,
+         address_verification, status, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, 'Canonical warehouse',
+         $4, $5, $6, $7, $8,
+         $9::jsonb, $10,
+         'operator_attested', 'active', $11, $11
+       )
+       RETURNING id::text`,
+      [
+        organizationId,
+        integrationAccountId,
+        displayName,
+        `canonical-${provider}-ciphertext-${suffix}`,
+        `canonical-${provider}-iv-${suffix}`,
+        `canonical-${provider}-tag-${suffix}`,
+        lastFour,
+        sha(`canonical-${provider}-account-${suffix}`),
+        JSON.stringify(registeredAddress),
+        sha(JSON.stringify(registeredAddress)),
+        email,
+      ],
+    )
+    return result.rows[0]
+  }
+  const upsCarrierAccount = await createCarrierAccount({
+    integrationAccountId: upsAccountResult.rows[0].id,
+    provider: 'ups_rest',
+    displayName: 'Canonical UPS account',
+    lastFour: '1001',
+  })
+  const fedexCarrierAccount = await createCarrierAccount({
+    integrationAccountId: fedexAccountResult.rows[0].id,
+    provider: 'fedex_rest',
+    displayName: 'Canonical FedEx account',
+    lastFour: '2002',
+  })
   const warehouseResult = await pool.query(
     `INSERT INTO operations_warehouses (
        organization_id, code, name, timezone, address, status,
@@ -893,6 +949,7 @@ async function seedCanonicalPlanningFixture(
   for (const rate of [{
     provider: 'ups_rest',
     accountId: upsAccountResult.rows[0].id,
+    carrierAccountId: upsCarrierAccount.id,
     rates: [{
       serviceCode: 'ground',
       serviceName: 'UPS Ground',
@@ -905,6 +962,7 @@ async function seedCanonicalPlanningFixture(
   }, {
     provider: 'fedex_rest',
     accountId: fedexAccountResult.rows[0].id,
+    carrierAccountId: fedexCarrierAccount.id,
     rates: [{
       serviceCode: 'fedex_ground',
       serviceName: 'FedEx Ground',
@@ -918,20 +976,21 @@ async function seedCanonicalPlanningFixture(
     const requestHash = sha(`${rate.provider}-request-${suffix}`)
     const result = await pool.query(
       `INSERT INTO operations_carrier_rate_requests (
-         organization_id, integration_account_id, provider,
+         organization_id, integration_account_id, carrier_account_id, provider,
          environment, purpose, adapter_version, credential_version,
          request_hash, redacted_request, redacted_response,
          status, actor_email, requested_at, completed_at
        ) VALUES (
-         $1::uuid, $2::uuid, $3,
+         $1::uuid, $2::uuid, $3::uuid, $4,
          'sandbox', 'cartonization_shipment_rate',
-         'canonical-test-v1', 1, $4, $5::jsonb, $6::jsonb,
-         'succeeded', $7, now() - interval '1 second', now()
+         'canonical-test-v1', 1, $5, $6::jsonb, $7::jsonb,
+         'succeeded', $8, now() - interval '1 second', now()
        )
        RETURNING id::text, global_id`,
       [
         organizationId,
         rate.accountId,
+        rate.carrierAccountId,
         rate.provider,
         requestHash,
         JSON.stringify({
