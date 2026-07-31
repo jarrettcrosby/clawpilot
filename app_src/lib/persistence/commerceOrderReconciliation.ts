@@ -43,9 +43,34 @@ function safeErrorCode(error: unknown) {
   )
     ? String((error as { code?: unknown }).code || '')
     : ''
-  return /^[A-Z][A-Z0-9_]{2,127}$/.test(candidate)
-    ? candidate
-    : 'COMMERCE_ORDER_RECONCILIATION_FAILED'
+  if (/^[A-Z][A-Z0-9_]{2,127}$/.test(candidate)) return candidate
+  const constraint = (
+    error
+    && typeof error === 'object'
+    && 'constraint' in error
+  )
+    ? String((error as { constraint?: unknown }).constraint || '')
+    : ''
+  // PostgreSQL SQLSTATE values are deliberately collapsed to stable,
+  // operator-safe categories. Only an allowlisted constraint gets a specific
+  // code; raw constraint names, values, and provider/customer data must not
+  // leak into the cursor or worker response.
+  if (candidate === '23514') {
+    if (
+      constraint
+      === 'operations_commerce_order_candidates_checkout_service_valid'
+    ) {
+      return 'COMMERCE_ORDER_CHECKOUT_SERVICE_CODE_INVALID'
+    }
+    return 'COMMERCE_ORDER_RECONCILIATION_CHECK_CONSTRAINT_FAILED'
+  }
+  if (candidate === '23505') {
+    return 'COMMERCE_ORDER_RECONCILIATION_UNIQUE_CONSTRAINT_FAILED'
+  }
+  if (candidate === '23503') {
+    return 'COMMERCE_ORDER_RECONCILIATION_REFERENCE_CONSTRAINT_FAILED'
+  }
+  return 'COMMERCE_ORDER_RECONCILIATION_FAILED'
 }
 
 /**

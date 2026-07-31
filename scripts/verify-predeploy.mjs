@@ -280,6 +280,7 @@ for (const requiredPath of [
   'db/migrations/0170_operations_shopify_checkout_plan_rate_policy.sql',
   'db/migrations/0171_shopify_active_account_readiness.sql',
   'db/migrations/0172_operations_commerce_inventory_attempt_lease_renewal.sql',
+  'db/migrations/0173_operations_shopify_shipping_service_codes.sql',
   'app_src/app/api/crm/products/[productId]/images/route.ts',
   'app_src/app/api/crm/products/[productId]/images/[assetId]/route.ts',
   'app_src/app/api/crm/products/[productId]/shopify-product-image/route.ts',

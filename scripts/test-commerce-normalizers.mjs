@@ -180,7 +180,7 @@ const shopifySource = {
       email: 'ada@example.test',
       phone: '+15555550100',
       shippingLine: {
-        code: 'GROUND',
+        code: '03',
         title: 'Ground shipping',
         deliveryCategory: 'SHIPPING',
       },
@@ -1082,7 +1082,7 @@ assert.deepEqual(
 assert.deepEqual(
   clone(shopifyNormalized.orders[0].providerFacts.shippingService),
   {
-    code: 'GROUND',
+    code: '03',
     title: 'Ground shipping',
     deliveryCategory: 'SHIPPING',
   },

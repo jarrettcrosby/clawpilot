@@ -310,6 +310,7 @@ export async function GET() {
           operations_shopify_checkout_plan_rate_policy_applied: boolean
           shopify_active_account_readiness_migration_applied: boolean
           operations_commerce_inventory_attempt_lease_renewal_applied: boolean
+          operations_shopify_shipping_service_codes_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -984,6 +985,12 @@ export async function GET() {
                 WHERE filename =
                   '0172_operations_commerce_inventory_attempt_lease_renewal.sql'
               ) AS operations_commerce_inventory_attempt_lease_renewal_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0173_operations_shopify_shipping_service_codes.sql'
+              ) AS operations_shopify_shipping_service_codes_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1129,6 +1136,7 @@ export async function GET() {
             && row?.operations_shopify_checkout_plan_rate_policy_applied
             && row?.shopify_active_account_readiness_migration_applied
             && row?.operations_commerce_inventory_attempt_lease_renewal_applied
+            && row?.operations_shopify_shipping_service_codes_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1266,6 +1274,7 @@ export async function GET() {
           || !row?.operations_shopify_checkout_plan_rate_policy_applied
           || !row?.shopify_active_account_readiness_migration_applied
           || !row?.operations_commerce_inventory_attempt_lease_renewal_applied
+          || !row?.operations_shopify_shipping_service_codes_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

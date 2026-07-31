@@ -139,6 +139,9 @@ const nameAlignmentMigration = read(
 const planRatePolicyMigration = read(
   'db/migrations/0170_operations_shopify_checkout_plan_rate_policy.sql',
 )
+const shippingServiceCodeMigration = read(
+  'db/migrations/0173_operations_shopify_shipping_service_codes.sql',
+)
 const persistenceSource = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
 )
@@ -184,6 +187,15 @@ includes(offerParcelEvidenceMigration, [
   "rate_evidence.redacted_request #> '{shipment,parcels}'",
   'operations_shopify_checkout_carrier_rate_matches',
 ], 'Checkout offer carrier parcel evidence')
+includes(shippingServiceCodeMigration, [
+  'operations_commerce_order_candidates_checkout_service_valid',
+  'BETWEEN 1 AND 255',
+  "checkout_shipping_service_code !~ '[[:cntrl:]]'",
+], 'Shopify opaque shipping-service-code boundary')
+assert.ok(
+  !shippingServiceCodeMigration.includes('BETWEEN 3 AND 80'),
+  'Order intake must retain valid two-character Shopify shipping method codes',
+)
 assert.doesNotMatch(
   offerParcelEvidenceMigration,
   /package\.carrier_parcel_snapshot/,

@@ -79,6 +79,7 @@ export async function processCommerceOrderReconciliation(input: {
       providerWrites: 0,
       canonicalOrderWrites: 0,
       inventoryWrites: 0,
+      failureCodes: {},
     }
   }
   const targets = await claimCommerceOrderReconciliationTargetsInPostgres({
@@ -90,6 +91,7 @@ export async function processCommerceOrderReconciliation(input: {
   let leaseLost = 0
   let pagesRead = 0
   let resumable = 0
+  const failureCodes: Record<string, number> = {}
   for (const target of targets) {
     try {
       let continuationRunGlobalId = target.continuationRunGlobalId
@@ -155,7 +157,11 @@ export async function processCommerceOrderReconciliation(input: {
         error,
       })
       if (failure.leaseLost) leaseLost += 1
-      else failed += 1
+      else {
+        failed += 1
+        failureCodes[failure.errorCode] =
+          (failureCodes[failure.errorCode] || 0) + 1
+      }
     }
   }
   return {
@@ -172,5 +178,6 @@ export async function processCommerceOrderReconciliation(input: {
     providerWrites: 0,
     canonicalOrderWrites: 0,
     inventoryWrites: 0,
+    failureCodes,
   }
 }

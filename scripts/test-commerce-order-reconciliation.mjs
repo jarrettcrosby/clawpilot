@@ -56,6 +56,9 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
 }
 
 const persistence = read('app_src/lib/persistence/commerceOrderReconciliation.ts')
+const shippingServiceCodeMigration = read(
+  'db/migrations/0173_operations_shopify_shipping_service_codes.sql',
+)
 includes(persistence, [
   "const ORDER_RECONCILIATION_INTERVAL = '30 minutes'",
   "const ORDER_RECONCILIATION_LEASE = '10 minutes'",
@@ -82,6 +85,16 @@ includes(persistence, [
   'canonicalOrderWrites: 0',
   'inventoryWrites: 0',
 ], 'Order reconciliation persistence')
+includes(shippingServiceCodeMigration, [
+  'operations_commerce_order_candidates_checkout_service_valid',
+  'BETWEEN 1 AND 255',
+  "checkout_shipping_service_code !~ '[[:cntrl:]]'",
+  'Opaque Shopify ShippingLine.code',
+], 'Shopify shipping-service-code migration')
+assert.ok(
+  !shippingServiceCodeMigration.includes('BETWEEN 3 AND 80'),
+  'Shopify opaque shipping method codes must not inherit ClawPilot service-code length rules',
+)
 assert.ok(!persistence.includes('provider_cursor ='), 'Order reconciliation must not persist a provider cursor')
 assert.ok(!persistence.includes("? 'read_all_orders'"), 'Current automatic order reconciliation must not require historical-order scope')
 assert.ok(
@@ -137,6 +150,73 @@ assert.equal(
   claimStartedAt.toISOString(),
   'Claim mapping must use last_started_at returned by the sync cursor',
 )
+
+const persistedFailureCodes = []
+const failurePersistenceModule = loadTypeScriptModule(
+  'app_src/lib/persistence/commerceOrderReconciliation.ts',
+  {
+    mocks: {
+      '@/lib/auditWriter': {
+        async recordAuditEvent() {},
+      },
+      '@/lib/persistence/postgres': {
+        async withTransaction(callback) {
+          return callback({
+            async query(_sql, values) {
+              persistedFailureCodes.push(values[3])
+              return {
+                rowCount: 1,
+                rows: [{
+                  organization_id:
+                    '11111111-1111-4111-8111-111111111111',
+                }],
+              }
+            },
+          })
+        },
+      },
+    },
+  },
+)
+const failureTarget = {
+  organizationId: '11111111-1111-4111-8111-111111111111',
+  integrationAccountId: '22222222-2222-4222-8222-222222222222',
+  accountGlobalId: 'gca0000001',
+  provider: 'shopify',
+  credentialVersion: 1,
+  startedAt: '2026-07-27T12:00:00.000Z',
+  continuationRunGlobalId: null,
+}
+const knownConstraintFailure = await failurePersistenceModule
+  .failCommerceOrderReconciliationInPostgres({
+    target: failureTarget,
+    error: {
+      code: '23514',
+      constraint:
+        'operations_commerce_order_candidates_checkout_service_valid',
+    },
+  })
+assert.equal(
+  knownConstraintFailure.errorCode,
+  'COMMERCE_ORDER_CHECKOUT_SERVICE_CODE_INVALID',
+)
+const unknownConstraintFailure = await failurePersistenceModule
+  .failCommerceOrderReconciliationInPostgres({
+    target: failureTarget,
+    error: {
+      code: '23514',
+      constraint: 'provider_or_customer_data_must_not_escape',
+    },
+  })
+assert.equal(
+  unknownConstraintFailure.errorCode,
+  'COMMERCE_ORDER_RECONCILIATION_CHECK_CONSTRAINT_FAILED',
+)
+assert.deepEqual(persistedFailureCodes, [
+  'COMMERCE_ORDER_CHECKOUT_SERVICE_CODE_INVALID',
+  'COMMERCE_ORDER_RECONCILIATION_CHECK_CONSTRAINT_FAILED',
+])
+
 const workerSource = read('app_src/lib/commerceOrderReconciliationWorker.ts')
 assert.ok(
   workerSource.includes('never promotes canonical orders, derives packages or shipments'),
@@ -249,6 +329,49 @@ assert.equal(trace.complete.length, 1)
 assert.equal(trace.complete[0].pagesRead, 2)
 assert.equal(trace.complete[0].hasNextBatch, false)
 assert.equal(trace.failed.length, 0)
+assert.deepEqual(
+  { ...completed.failureCodes },
+  {},
+  'Successful order reconciliation must report no failure categories',
+)
+
+const failedWorker = loadTypeScriptModule(
+  'app_src/lib/commerceOrderReconciliationWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceIntake': {
+        commerceIntakeRuntimeAvailable: () => true,
+        async executeCommerceOrderPage() {
+          const error = new Error('sensitive provider response omitted')
+          error.code = '23514'
+          throw error
+        },
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async claimCommerceOrderReconciliationTargetsInPostgres() {
+          return [failureTarget]
+        },
+        async completeCommerceOrderReconciliationInPostgres() {
+          throw new Error('completion must not run after failure')
+        },
+        async failCommerceOrderReconciliationInPostgres() {
+          return {
+            leaseLost: false,
+            errorCode: 'COMMERCE_ORDER_CHECKOUT_SERVICE_CODE_INVALID',
+          }
+        },
+      },
+    },
+  },
+)
+const failedSummary = await failedWorker
+  .processCommerceOrderReconciliation({ limit: 1 })
+assert.equal(failedSummary.failed, 1)
+assert.deepEqual(
+  { ...failedSummary.failureCodes },
+  { COMMERCE_ORDER_CHECKOUT_SERVICE_CODE_INVALID: 1 },
+  'Worker summary must expose only the stable allowlisted failure category',
+)
 
 const route = read('app_src/app/api/integrations/commerce/orders/process/route.ts')
 includes(route, [
@@ -270,10 +393,13 @@ const health = read('app_src/app/api/health/route.ts')
 includes(health, [
   "WHERE filename = '0122_operations_commerce_incomplete_header_money.sql'",
   'row?.operations_commerce_incomplete_header_money_migration_applied',
+  "'0173_operations_shopify_shipping_service_codes.sql'",
+  'row?.operations_shopify_shipping_service_codes_applied',
 ], 'Order reconciliation health migration gate')
 const predeploy = read('scripts/verify-predeploy.mjs')
 includes(predeploy, [
   "'db/migrations/0122_operations_commerce_incomplete_header_money.sql'",
+  "'db/migrations/0173_operations_shopify_shipping_service_codes.sql'",
   "'scripts/test-commerce-order-reconciliation.mjs'",
 ], 'Order reconciliation predeploy gate')
 
