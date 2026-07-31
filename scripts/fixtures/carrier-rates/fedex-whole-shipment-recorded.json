@@ -1,0 +1,49 @@
+{
+  "transactionId": "recorded-fedex-rate-001",
+  "output": {
+    "rateReplyDetails": [
+      {
+        "serviceType": "FEDEX_GROUND",
+        "serviceName": "FedEx Ground",
+        "ratedShipmentDetails": [
+          {
+            "rateType": "ACCOUNT_PACKAGE",
+            "totalNetCharge": "22.10",
+            "currency": "USD"
+          },
+          {
+            "rateType": "LIST",
+            "totalNetCharge": "25.30",
+            "currency": "USD"
+          },
+          {
+            "rateType": "ACCOUNT",
+            "totalNetCharge": "19.62",
+            "currency": "USD"
+          }
+        ],
+        "operationalDetail": {
+          "transitTime": "THREE_DAYS",
+          "deliveryDate": "2026-08-03"
+        }
+      },
+      {
+        "serviceType": "FEDEX_2_DAY",
+        "serviceName": "FedEx 2Day",
+        "ratedShipmentDetails": [
+          {
+            "rateType": "ACCOUNT",
+            "totalNetCharge": {
+              "amount": "47.80",
+              "currency": "USD"
+            }
+          }
+        ],
+        "operationalDetail": {
+          "transitTime": "TWO_DAYS",
+          "deliveryDate": "2026-08-02"
+        }
+      }
+    ]
+  }
+}
