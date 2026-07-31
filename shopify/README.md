@@ -157,3 +157,16 @@ Official references:
 - <https://shopify.dev/docs/apps/launch/distribution/select-distribution-method>
 - <https://shopify.dev/docs/apps/build/cli-for-apps/manage-app-config-files>
 - <https://shopify.dev/docs/apps/launch/deployment/deploy-app-versions>
+
+## Saved-address checkout rate warmer
+
+The theme app extension in
+`extensions/clawpilot-checkout-rate-warmer` can warm Shopify Ajax shipping-rate
+requests for the normalized saved-address rate zones returned by ClawPilot.
+It is disabled by default and is a separate surface from the Delivery
+Customization Function above.
+
+Its exact app-proxy path, required scopes, staging boundary, and root validation
+gate are documented in
+`contracts/checkout-rate-warmer-deployment.md`. Do not release the extension or
+enable a tenant warm-up policy solely because the extension asset builds.

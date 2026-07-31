@@ -32,6 +32,17 @@ type PlanRateOptimization = {
   handlingCostMinorPerPackage: number
   handlingCostCurrency: string
 }
+type CheckoutRateWarmPolicy = {
+  version: 'shopify-checkout-rate-warm-v1'
+  enabled: boolean
+  mode: 'hosted_ajax'
+  zoneScope: 'all_saved_rate_zones'
+  concurrency: number
+  debounceMs: number
+  minIntervalMs: number
+  supportedCountries: ['US']
+  staleCartAbort: true
+}
 type ActivationState =
   | 'missing'
   | 'disabled'
@@ -50,6 +61,18 @@ const DEFAULT_PLAN_RATE_OPTIMIZATION: PlanRateOptimization = {
   ],
   handlingCostMinorPerPackage: 0,
   handlingCostCurrency: 'USD',
+}
+
+const DEFAULT_CHECKOUT_RATE_WARM: CheckoutRateWarmPolicy = {
+  version: 'shopify-checkout-rate-warm-v1',
+  enabled: false,
+  mode: 'hosted_ajax',
+  zoneScope: 'all_saved_rate_zones',
+  concurrency: 2,
+  debounceMs: 350,
+  minIntervalMs: 1_000,
+  supportedCountries: ['US'],
+  staleCartAbort: true,
 }
 
 const OBJECTIVE_PRESETS: Array<{
@@ -117,6 +140,7 @@ type ShopifyCarrierServiceSetup = {
     policyRevision: number
     policyHash: string
     planRateOptimization: PlanRateOptimization
+    checkoutRateWarm: CheckoutRateWarmPolicy
     rowVersion: number
     ready: boolean
     checkoutBrandNameOverride: string | null
@@ -131,6 +155,11 @@ type ShopifyCarrierServiceSetup = {
       carrierAccountGlobalId: string
     }>
   } | null
+  rateWarmReadiness: {
+    deliveryCustomizationDurable: boolean
+    activationAllowed: boolean
+    reason: string
+  }
   shadowSimulation: {
     globalId: string
     operation: 'create' | 'delete'
@@ -371,6 +400,11 @@ export default function ShopifyCarrierServiceSetupPanel({
         ...DEFAULT_PLAN_RATE_OPTIMIZATION.objectivePriority,
       ],
     })
+  const [checkoutRateWarm, setCheckoutRateWarm] =
+    useState<CheckoutRateWarmPolicy>({
+      ...DEFAULT_CHECKOUT_RATE_WARM,
+      supportedCountries: ['US'],
+    })
   const [confirmWrite, setConfirmWrite] = useState(false)
   const [confirmNameAlignment, setConfirmNameAlignment] = useState(false)
   const [confirmRemove, setConfirmRemove] = useState(false)
@@ -403,6 +437,12 @@ export default function ShopifyCarrierServiceSetupPanel({
     setPlanRateOptimization({
       ...nextPlanRateOptimization,
       objectivePriority: [...nextPlanRateOptimization.objectivePriority],
+    })
+    const nextCheckoutRateWarm =
+      next.config?.checkoutRateWarm ?? DEFAULT_CHECKOUT_RATE_WARM
+    setCheckoutRateWarm({
+      ...nextCheckoutRateWarm,
+      supportedCountries: ['US'],
     })
   }, [])
 
@@ -514,6 +554,8 @@ export default function ShopifyCarrierServiceSetupPanel({
   const registered = setup?.config?.registrationState === 'registered'
   const planRatePolicyEditable =
     setup?.reference.activation.state === 'shadow' && !busy
+  const rateWarmPolicyEditable =
+    setup?.reference.activation.state === 'shadow' && !busy
   const nameAlignment = registered ? setup?.nameAlignment || null : null
   const savedCheckoutBrandNameOverride =
     setup?.namePreference.overrideName || ''
@@ -608,10 +650,14 @@ export default function ShopifyCarrierServiceSetupPanel({
     quoteTtlSeconds: 900,
     orderReconciliationWindowSeconds: 86400,
     planRateOptimization,
+    checkoutRateWarm,
   }, 'The exact warehouse, package, carrier, and inventory policy was saved.')
   const savePlanRatePolicy = () => run('save-plan-rate-policy', {
     planRateOptimization,
   }, 'The tenant carton-plan and rate objective was saved without changing the registered Shopify service.')
+  const saveRateWarmPolicy = () => run('save-rate-warm-policy', {
+    checkoutRateWarm,
+  }, 'The disabled tenant checkout rate-warming policy was saved without changing the registered Shopify service.')
 
   if (loading && !setup) {
     return (
@@ -830,6 +876,143 @@ export default function ShopifyCarrierServiceSetupPanel({
               {busy === 'save-plan-rate-policy'
                 ? 'Saving objective…'
                 : 'Save rate objective only'}
+            </Button>
+          ) : null}
+        </Stack>
+      </Box>
+      <Box>
+        <Typography variant="body2" fontWeight={700}>
+          Checkout rate warming
+        </Typography>
+        <Typography variant="caption" color="text.secondary">
+          Prepares customer-neutral checkout quotes for every saved rate zone.
+          No customer ID or destination address is stored in this policy.
+        </Typography>
+        <Alert severity="info" sx={{ mt: 1 }}>
+          {setup?.rateWarmReadiness.reason
+            || 'Checkout rate warming remains disabled until durable Shopify Delivery Customization readiness is available.'}
+        </Alert>
+        <Stack spacing={1} sx={{ mt: 1 }}>
+          <FormControlLabel
+            control={(
+              <Checkbox
+                size="small"
+                checked={checkoutRateWarm.enabled}
+                disabled={
+                  !rateWarmPolicyEditable
+                  || setup?.rateWarmReadiness.activationAllowed !== true
+                }
+                onChange={(event) => setCheckoutRateWarm((current) => ({
+                  ...current,
+                  enabled: event.target.checked,
+                }))}
+              />
+            )}
+            label="Enable storefront checkout rate warming"
+          />
+          <TextField
+            size="small"
+            fullWidth
+            label="Storefront mode (v1)"
+            value="Shopify hosted AJAX"
+            disabled
+            helperText="Version 1 warms rates through Shopify hosted Online Store AJAX endpoints."
+          />
+          <TextField
+            size="small"
+            fullWidth
+            label="Rate-zone scope"
+            value={checkoutRateWarm.zoneScope}
+            disabled
+            helperText="Version 1 always processes all saved rate zones; zones are never silently truncated."
+          />
+          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+            <TextField
+              size="small"
+              fullWidth
+              type="number"
+              label="Concurrency"
+              value={checkoutRateWarm.concurrency}
+              disabled={!rateWarmPolicyEditable}
+              inputProps={{ min: 1, max: 8, step: 1 }}
+              helperText="Bounded to 1–8 concurrent requests."
+              onChange={(event) => setCheckoutRateWarm((current) => ({
+                ...current,
+                concurrency: Math.min(
+                  8,
+                  Math.max(1, Number(event.target.value) || 1),
+                ),
+              }))}
+            />
+            <TextField
+              size="small"
+              fullWidth
+              type="number"
+              label="Debounce (ms)"
+              value={checkoutRateWarm.debounceMs}
+              disabled={!rateWarmPolicyEditable}
+              inputProps={{ min: 0, max: 5_000, step: 50 }}
+              helperText="Bounded to 0–5,000 ms."
+              onChange={(event) => setCheckoutRateWarm((current) => ({
+                ...current,
+                debounceMs: Math.min(
+                  5_000,
+                  Math.max(0, Number(event.target.value) || 0),
+                ),
+              }))}
+            />
+            <TextField
+              size="small"
+              fullWidth
+              type="number"
+              label="Minimum interval (ms)"
+              value={checkoutRateWarm.minIntervalMs}
+              disabled={!rateWarmPolicyEditable}
+              inputProps={{ min: 250, max: 60_000, step: 250 }}
+              helperText="Bounded to 250–60,000 ms."
+              onChange={(event) => setCheckoutRateWarm((current) => ({
+                ...current,
+                minIntervalMs: Math.min(
+                  60_000,
+                  Math.max(250, Number(event.target.value) || 250),
+                ),
+              }))}
+            />
+          </Stack>
+          <TextField
+            size="small"
+            fullWidth
+            label="Supported country (v1)"
+            value="United States (US)"
+            disabled
+            helperText="Version 1 supports United States rate zones only."
+          />
+          <FormControlLabel
+            control={(
+              <Checkbox
+                size="small"
+                checked={checkoutRateWarm.staleCartAbort}
+                disabled
+              />
+            )}
+            label="Abort queued work when the cart changes (required)"
+          />
+          {setup?.config ? (
+            <Typography variant="caption" color="text.secondary">
+              Saved policy revision {setup.config.policyRevision}; changing
+              this policy invalidates prior checkout cache and retry fences.
+            </Typography>
+          ) : null}
+          {registered ? (
+            <Button
+              size="small"
+              variant="outlined"
+              disabled={!rateWarmPolicyEditable}
+              onClick={() => void saveRateWarmPolicy()}
+            >
+              {busy === 'save-rate-warm-policy'
+                ? 'Saving warming policy…'
+                : 'Save warming policy only'}
             </Button>
           ) : null}
         </Stack>

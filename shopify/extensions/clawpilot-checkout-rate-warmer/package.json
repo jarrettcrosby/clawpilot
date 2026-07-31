@@ -1,0 +1,14 @@
+{
+  "name": "@clawpilot/shopify-checkout-rate-warmer",
+  "version": "0.0.1",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/index.js --bundle --format=iife --minify --target=es2020 --outfile=assets/clawpilot-checkout-rate-warmer.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1"
+  }
+}

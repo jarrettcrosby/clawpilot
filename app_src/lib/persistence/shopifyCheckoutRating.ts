@@ -6,6 +6,10 @@ import {
   type ShopifyCheckoutPlanRatePolicy,
 } from '@/lib/operations/shopifyCheckoutPlanRatePolicy'
 import {
+  normalizeShopifyCheckoutRateWarmPolicy,
+  type ShopifyCheckoutRateWarmPolicy,
+} from '@/lib/operations/shopifyCheckoutRateWarmPolicy'
+import {
   acquireTransactionAdvisoryLock,
   query,
   withTransaction,
@@ -87,6 +91,14 @@ export type ShopifyCarrierServicePlanRatePolicyWriteInput = {
   accountGlobalId: string
   expectedRowVersion: number
   planRateOptimization: ShopifyCheckoutPlanRatePolicy
+  actorEmail: string
+}
+
+export type ShopifyCarrierServiceRateWarmPolicyWriteInput = {
+  organizationId: string
+  accountGlobalId: string
+  expectedRowVersion: number
+  checkoutRateWarm: ShopifyCheckoutRateWarmPolicy
   actorEmail: string
 }
 
@@ -2446,6 +2458,196 @@ export async function updateShopifyCarrierServicePlanRatePolicyInPostgres(
         policyRevision: Number(updated.rows[0].policy_revision),
         priorPolicyHash: current.policy_hash,
         policyHash,
+        registrationState: current.registration_state,
+        providerRegistrationRetained: true,
+        serviceGidRetained: current.service_gid,
+        callbackTokenVersionRetained: current.callback_token_version,
+        callbackTokenHashRetained: true,
+        rowVersion: Number(updated.rows[0].row_version),
+      },
+    }, client)
+    return readConfigWithClient(client, input)
+  })
+}
+
+/**
+ * Updates only the customer-neutral tenant rate-warming policy. Until a
+ * durable Delivery Customization readiness record exists, this command
+ * persists disabled policy changes only and fails closed on activation.
+ */
+export async function updateShopifyCarrierServiceRateWarmPolicyInPostgres(
+  rawInput: ShopifyCarrierServiceRateWarmPolicyWriteInput,
+) {
+  const input = {
+    organizationId: matchValue(
+      rawInput.organizationId,
+      UUID,
+      'Organization ID',
+    ),
+    accountGlobalId: matchValue(
+      rawInput.accountGlobalId,
+      ACCOUNT_GLOBAL_ID,
+      'Shopify account Global ID',
+    ),
+    expectedRowVersion: integer(
+      rawInput.expectedRowVersion,
+      'Configuration row version',
+      0,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    checkoutRateWarm: normalizeShopifyCheckoutRateWarmPolicy(
+      rawInput.checkoutRateWarm,
+    ),
+    actorEmail: textValue(rawInput.actorEmail, 'Actor email', 320),
+  }
+  if (input.checkoutRateWarm.enabled) {
+    fail(
+      'SHOPIFY_CHECKOUT_RATE_WARM_DELIVERY_CUSTOMIZATION_REQUIRED',
+      'Checkout rate warming remains disabled until durable Shopify Delivery Customization readiness is available',
+      409,
+    )
+  }
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shopify-carrier-service-config:${input.organizationId}:${input.accountGlobalId}`,
+    )
+    const currentResult = await client.query<{
+      id: string
+      global_id: string
+      row_version: string
+      policy_revision: string
+      policy_hash: string
+      policy_snapshot: Record<string, unknown>
+      registration_state: ShopifyCarrierServiceRegistrationState
+      service_gid: string | null
+      callback_token_version: number
+      activation_state: string
+      account_environment: string
+      account_status: string
+      credential_generation: number
+      credential_version: number | null
+      verification_status: string | null
+    }>(
+      `SELECT
+         config.id::text,
+         config.global_id,
+         config.row_version::text,
+         config.policy_revision::text,
+         config.policy_hash,
+         config.policy_snapshot,
+         config.registration_state,
+         config.service_gid,
+         config.callback_token_version,
+         activation.state AS activation_state,
+         account.environment AS account_environment,
+         account.status AS account_status,
+         account.commerce_credential_generation AS credential_generation,
+         credential.credential_version,
+         credential.verification_status
+       FROM operations_shopify_carrier_service_configs config
+       JOIN operations_integration_accounts account
+         ON account.organization_id = config.organization_id
+        AND account.id = config.integration_account_id
+       JOIN operations_activation_scopes activation
+         ON activation.organization_id = config.organization_id
+       LEFT JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+       WHERE config.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND account.integration_type = 'commerce'
+         AND account.provider = 'shopify'
+       FOR UPDATE OF config, account, activation`,
+      [input.organizationId, input.accountGlobalId],
+    )
+    const current = currentResult.rows[0]
+    if (!current) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_CONFIG_REQUIRED',
+        'Save the Shopify checkout-rating configuration first',
+        404,
+      )
+    }
+    if (Number(current.row_version) !== input.expectedRowVersion) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_VERSION_CONFLICT',
+        'CarrierService configuration changed. Refresh and try again.',
+        409,
+      )
+    }
+    if (
+      current.activation_state !== 'shadow'
+      || current.account_environment !== 'sandbox'
+      || current.account_status !== 'active'
+      || current.verification_status !== 'verified'
+      || current.credential_version !== current.credential_generation
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_RATE_WARM_POLICY_SHADOW_REQUIRED',
+        'A verified sandbox Shopify account in Operations Shadow is required',
+        409,
+      )
+    }
+    const policySnapshot = {
+      ...current.policy_snapshot,
+      checkoutRateWarm: input.checkoutRateWarm,
+    }
+    assertShopifyCheckoutCustomerNeutralEvidence(
+      policySnapshot,
+      'CarrierService policy snapshot',
+    )
+    const policyHash = shopifyCheckoutRatingHash(policySnapshot)
+    const updated = await client.query<{
+      global_id: string
+      row_version: string
+      policy_revision: string
+    }>(
+      `UPDATE operations_shopify_carrier_service_configs
+       SET policy_revision = policy_revision + 1,
+           policy_hash = $3,
+           policy_snapshot = $4::jsonb,
+           row_version = row_version + 1,
+           updated_by = $5,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND row_version = $6
+       RETURNING global_id, row_version::text, policy_revision::text`,
+      [
+        input.organizationId,
+        current.id,
+        policyHash,
+        JSON.stringify(policySnapshot),
+        input.actorEmail,
+        input.expectedRowVersion,
+      ],
+    )
+    if (!updated.rows[0]) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_VERSION_CONFLICT',
+        'CarrierService configuration changed. Refresh and try again.',
+        409,
+      )
+    }
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType:
+        'operations.shopify_carrier_service.rate_warm_policy_updated',
+      aggregateType: 'operations.shopify_carrier_service_config',
+      aggregateId: current.global_id,
+      subject: input.accountGlobalId,
+      organizationId: input.organizationId,
+      eventKey:
+        `operations:shopify-carrier-service:${current.global_id}:`
+        + `rate-warm-policy:${updated.rows[0].policy_revision}`,
+      payload: {
+        accountGlobalId: input.accountGlobalId,
+        priorPolicyRevision: Number(current.policy_revision),
+        policyRevision: Number(updated.rows[0].policy_revision),
+        priorPolicyHash: current.policy_hash,
+        policyHash,
+        enabled: input.checkoutRateWarm.enabled,
         registrationState: current.registration_state,
         providerRegistrationRetained: true,
         serviceGidRetained: current.service_gid,

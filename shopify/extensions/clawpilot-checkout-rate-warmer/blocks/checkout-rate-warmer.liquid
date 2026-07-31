@@ -1,0 +1,22 @@
+<div
+  data-clawpilot-checkout-rate-warmer
+  data-app-proxy-path="{{ block.settings.app_proxy_path | escape }}"
+  hidden
+></div>
+
+{% schema %}
+{
+  "name": "Checkout rate warmer",
+  "target": "body",
+  "javascript": "clawpilot-checkout-rate-warmer.js",
+  "settings": [
+    {
+      "type": "text",
+      "id": "app_proxy_path",
+      "label": "ClawPilot app proxy path",
+      "default": "/apps/clawpilot/checkout-rate-warmer",
+      "info": "Change this only when the Shopify app proxy configuration uses a different path."
+    }
+  ]
+}
+{% endschema %}

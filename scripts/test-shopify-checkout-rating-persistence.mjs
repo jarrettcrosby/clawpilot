@@ -104,6 +104,33 @@ function loadPersistence() {
         }, { filename: policyPath })
         return policyModule.exports
       }
+      if (
+        specifier
+        === '@/lib/operations/shopifyCheckoutRateWarmPolicy'
+      ) {
+        const policyPath =
+          'app_src/lib/operations/shopifyCheckoutRateWarmPolicy.ts'
+        const policyOutput = ts.transpileModule(read(policyPath), {
+          compilerOptions: {
+            module: ts.ModuleKind.CommonJS,
+            target: ts.ScriptTarget.ES2022,
+            esModuleInterop: true,
+          },
+          fileName: policyPath,
+        }).outputText
+        const policyModule = { exports: {} }
+        vm.runInNewContext(policyOutput, {
+          Array,
+          Error,
+          Number,
+          Object,
+          Set,
+          String,
+          exports: policyModule.exports,
+          module: policyModule,
+        }, { filename: policyPath })
+        return policyModule.exports
+      }
       if (specifier === '@/lib/persistence/postgres') {
         return {
           acquireTransactionAdvisoryLock: async () => {},
@@ -144,6 +171,9 @@ const shippingServiceCodeMigration = read(
 )
 const providerAttemptMigration = read(
   'db/migrations/0174_operations_shopify_checkout_provider_attempts.sql',
+)
+const rateWarmPolicyMigration = read(
+  'db/migrations/0175_operations_shopify_checkout_rate_warm_policy.sql',
 )
 const persistenceSource = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
@@ -309,6 +339,32 @@ includes(planRatePolicyMigration, [
   'operations_shopify_configs_plan_rate_policy_valid',
   "policy_snapshot -> 'planRateOptimization'",
 ], 'Persisted tenant checkout plan-rate policy migration')
+includes(rateWarmPolicyMigration, [
+  'operations_shopify_checkout_rate_warm_policy_is_valid',
+  "'shopify-checkout-rate-warm-v1'",
+  "'enabled', false",
+  "'mode', 'hosted_ajax'",
+  "'zoneScope', 'all_saved_rate_zones'",
+  "'concurrency', 2",
+  "'debounceMs', 350",
+  "'minIntervalMs', 1000",
+  "'supportedCountries', jsonb_build_array('US')",
+  "input_policy ->> 'mode' IS DISTINCT FROM 'hosted_ajax'",
+  "countries IS DISTINCT FROM jsonb_build_array('US')",
+  "'staleCartAbort', true",
+  "input_policy -> 'staleCartAbort' IS DISTINCT FROM 'true'::jsonb",
+  'canonical_operations_shopify_checkout_policy_jsonb',
+  'policy_revision = config.policy_revision + 1',
+  'policy_hash = encode(',
+  'row_version = config.row_version + 1',
+  'operations_shopify_configs_rate_warm_policy_valid',
+  "policy_snapshot -> 'checkoutRateWarm'",
+], 'Persisted tenant checkout rate-warm policy migration')
+assert.equal(
+  rateWarmPolicyMigration.includes("'headless_storefront'"),
+  false,
+  'checkout rate-warm v1 migration must reject unimplemented headless mode',
+)
 
 const receiptSchema = section(
   migration,
@@ -410,6 +466,7 @@ includes(persistenceSource, [
   'shopifyCheckoutPackagePlanHash',
   'readShopifyCarrierServiceConfigFromPostgres',
   'updateShopifyCarrierServiceBrandNameOverrideInPostgres',
+  'updateShopifyCarrierServiceRateWarmPolicyInPostgres',
   'upsertShopifyCarrierServiceConfigInPostgres',
   'finalizeShopifyCarrierServiceRegistrationInPostgres',
   'lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres',

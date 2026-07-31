@@ -153,6 +153,8 @@ export const SHOPIFY_ACCESS_SCOPES = [
   'write_fulfillments',
   'read_shipping',
   'write_shipping',
+  'read_app_proxy',
+  'write_app_proxy',
   'read_returns',
   'write_returns',
   'read_markets',
@@ -270,6 +272,7 @@ export const SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES = [
   'write_products',
   'write_publications',
   'write_shipping',
+  'write_app_proxy',
 ] as const satisfies readonly ShopifyAccessScope[]
 
 export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {

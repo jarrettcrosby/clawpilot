@@ -131,6 +131,7 @@ const providerMutation = setupRoute.slice(
 for (const action of [
   'save-config',
   'save-plan-rate-policy',
+  'save-rate-warm-policy',
   'save-name-preference',
   'simulate-registration',
   'simulate-name-alignment',
@@ -158,7 +159,7 @@ requireAll(saveConfig, [
 
 const savePlanRatePolicy = actionBranch(
   'save-plan-rate-policy',
-  'save-name-preference',
+  'save-rate-warm-policy',
 )
 requireAll(savePlanRatePolicy, [
   'requireActivator(context.capabilities.canActivate)',
@@ -169,6 +170,20 @@ requireAll(savePlanRatePolicy, [
   'expectedRowVersion: current.config.rowVersion',
   'actorEmail: context.actor.email',
 ], 'registered-safe plan-rate policy action')
+
+const saveRateWarmPolicy = actionBranch(
+  'save-rate-warm-policy',
+  'save-name-preference',
+)
+requireAll(saveRateWarmPolicy, [
+  'requireActivator(context.capabilities.canActivate)',
+  "current.reference.activation.state !== 'shadow'",
+  "Object.prototype.hasOwnProperty.call(\n          body,\n          'checkoutRateWarm',",
+  'normalizeShopifyCheckoutRateWarmPolicy(',
+  'updateShopifyCarrierServiceRateWarmPolicyInPostgres({',
+  'expectedRowVersion: current.config.rowVersion',
+  'actorEmail: context.actor.email',
+], 'registered-safe rate-warm policy action')
 
 requireAll(checkoutRatingPersistence, [
   'updateShopifyCarrierServicePlanRatePolicyInPostgres(',
@@ -183,7 +198,7 @@ const policyOnlyPersistenceStart = checkoutRatingPersistence.indexOf(
   'export async function updateShopifyCarrierServicePlanRatePolicyInPostgres(',
 )
 const policyOnlyPersistenceEnd = checkoutRatingPersistence.indexOf(
-  'export async function finalizeShopifyCarrierServiceRegistrationInPostgres(',
+  'export async function updateShopifyCarrierServiceRateWarmPolicyInPostgres(',
   policyOnlyPersistenceStart,
 )
 assert.ok(
@@ -209,6 +224,16 @@ for (const forbiddenMutation of [
   )
 }
 
+requireAll(checkoutRatingPersistence, [
+  'updateShopifyCarrierServiceRateWarmPolicyInPostgres(',
+  "'SHOPIFY_CHECKOUT_RATE_WARM_DELIVERY_CUSTOMIZATION_REQUIRED'",
+  'checkoutRateWarm: input.checkoutRateWarm',
+  'policy_revision = policy_revision + 1',
+  'policy_hash = $3',
+  'row_version = row_version + 1',
+  'providerRegistrationRetained: true',
+], 'disabled rate-warm policy optimistic persistence')
+
 requireAll(setupPanel, [
   'planRateOptimization: PlanRateOptimization',
   'setPlanRateOptimization({',
@@ -222,6 +247,39 @@ requireAll(setupPanel, [
   "'save-plan-rate-policy'",
   'Save rate objective only',
 ], 'checkout plan-rate policy UI round trip')
+
+requireAll(setupRoute, [
+  'checkoutRateWarm: readShopifyCheckoutRateWarmPolicy(',
+  'rateWarmReadiness: {',
+  'deliveryCustomizationDurable: false',
+  'activationAllowed: false',
+], 'public rate-warm policy and truthful readiness')
+
+requireAll(setupPanel, [
+  'checkoutRateWarm: CheckoutRateWarmPolicy',
+  'next.config?.checkoutRateWarm',
+  'Checkout rate warming',
+  'Storefront mode (v1)',
+  'Shopify hosted AJAX',
+  'Version 1 warms rates through Shopify hosted Online Store AJAX endpoints.',
+  'all_saved_rate_zones',
+  'Supported country (v1)',
+  'United States (US)',
+  'Version 1 supports United States rate zones only.',
+  'Abort queued work when the cart changes (required)',
+  "'save-rate-warm-policy'",
+  'Save warming policy only',
+], 'checkout rate-warm policy UI round trip')
+assert.equal(
+  setupPanel.includes('Headless Storefront API'),
+  false,
+  'checkout rate-warm v1 UI must not advertise unimplemented headless warming',
+)
+assert.equal(
+  setupPanel.includes('label="Supported countries"'),
+  false,
+  'checkout rate-warm v1 UI must not expose unsupported country editing',
+)
 
 const saveNamePreference = actionBranch(
   'save-name-preference',

@@ -1,0 +1,6 @@
+api_version = "2026-04"
+
+[[extensions]]
+name = "ClawPilot checkout rate warmer"
+handle = "clawpilot-checkout-rate-warmer"
+type = "theme"

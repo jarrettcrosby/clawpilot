@@ -27,6 +27,11 @@ import {
   ShopifyCheckoutPlanRatePolicyError,
 } from '@/lib/operations/shopifyCheckoutPlanRatePolicy'
 import {
+  normalizeShopifyCheckoutRateWarmPolicy,
+  readShopifyCheckoutRateWarmPolicy,
+  ShopifyCheckoutRateWarmPolicyError,
+} from '@/lib/operations/shopifyCheckoutRateWarmPolicy'
+import {
   activeOperationsOrganizationId,
   operationsCapabilities,
 } from '@/lib/operations/authorization'
@@ -45,6 +50,7 @@ import {
   ShopifyCheckoutRatingPersistenceError,
   updateShopifyCarrierServiceBrandNameOverrideInPostgres,
   updateShopifyCarrierServicePlanRatePolicyInPostgres,
+  updateShopifyCarrierServiceRateWarmPolicyInPostgres,
   upsertShopifyCarrierServiceConfigInPostgres,
   type ShopifyCarrierServiceConfig,
   type ShopifyCheckoutCarrierProvider,
@@ -119,6 +125,12 @@ function errorResponse(error: unknown) {
     )
   }
   if (error instanceof ShopifyCheckoutPlanRatePolicyError) {
+    return json(
+      { ok: false, error: error.message, code: error.code },
+      400,
+    )
+  }
+  if (error instanceof ShopifyCheckoutRateWarmPolicyError) {
     return json(
       { ok: false, error: error.message, code: error.code },
       400,
@@ -362,6 +374,9 @@ function publicCarrierServiceConfig(
     policyRevision: config.policyRevision,
     policyHash: config.policyHash,
     planRateOptimization: readShopifyCheckoutPlanRatePolicy(
+      config.policySnapshot,
+    ),
+    checkoutRateWarm: readShopifyCheckoutRateWarmPolicy(
       config.policySnapshot,
     ),
     inventoryMaxAgeSeconds: config.inventoryMaxAgeSeconds,
@@ -740,6 +755,12 @@ async function setupState(input: {
     ),
     callbackUrl: publicCallbackUrl,
     canActivate: input.canActivate,
+    rateWarmReadiness: {
+      deliveryCustomizationDurable: false,
+      activationAllowed: false,
+      reason:
+        'Durable Shopify Delivery Customization readiness is not available; checkout rate warming remains disabled.',
+    },
     boundaries: {
       checkoutCustomerFieldsPersisted: false,
       providerWritesDuringCallback: 0,
@@ -1186,6 +1207,23 @@ export async function POST(req: NextRequest) {
               current.config.planRateOptimization,
             )
           : normalizeShopifyCheckoutPlanRatePolicy(undefined)
+      const checkoutRateWarm = Object.prototype.hasOwnProperty.call(
+        body,
+        'checkoutRateWarm',
+      )
+        ? normalizeShopifyCheckoutRateWarmPolicy(body.checkoutRateWarm)
+        : current.config
+          ? normalizeShopifyCheckoutRateWarmPolicy(
+              current.config.checkoutRateWarm,
+            )
+          : normalizeShopifyCheckoutRateWarmPolicy(undefined)
+      if (checkoutRateWarm.enabled) {
+        fail(
+          'SHOPIFY_CHECKOUT_RATE_WARM_DELIVERY_CUSTOMIZATION_REQUIRED',
+          'Checkout rate warming remains disabled until durable Shopify Delivery Customization readiness is available',
+          409,
+        )
+      }
       const policySnapshot = {
         version: 'shopify-checkout-rating-policy-v1',
         ratingMode: 'whole_shipment',
@@ -1197,6 +1235,7 @@ export async function POST(req: NextRequest) {
         servicePolicy: 'one_service_for_every_package',
         algorithmVersion: HYBRID_CARTONIZATION_ALGORITHM_VERSION,
         planRateOptimization,
+        checkoutRateWarm,
       }
       const token = shopifyCarrierServiceCallbackToken({
         organizationId: context.organizationId,
@@ -1274,6 +1313,51 @@ export async function POST(req: NextRequest) {
         planRateOptimization: normalizeShopifyCheckoutPlanRatePolicy(
           body.planRateOptimization,
         ),
+        actorEmail: context.actor.email,
+      })
+    } else if (action === 'save-rate-warm-policy') {
+      requireActivator(context.capabilities.canActivate)
+      if (!current.config) {
+        fail(
+          'SHOPIFY_CARRIER_SERVICE_CONFIG_REQUIRED',
+          'Save the Shopify checkout-rating configuration first',
+          404,
+        )
+      }
+      if (current.reference.activation.state !== 'shadow') {
+        fail(
+          'SHOPIFY_CHECKOUT_RATE_WARM_POLICY_SHADOW_REQUIRED',
+          'Set Operations to Shadow before changing checkout rate warming',
+          409,
+        )
+      }
+      if (
+        !Object.prototype.hasOwnProperty.call(
+          body,
+          'checkoutRateWarm',
+        )
+      ) {
+        fail(
+          'SHOPIFY_CHECKOUT_RATE_WARM_POLICY_REQUIRED',
+          'Checkout rate-warming policy is required',
+          400,
+        )
+      }
+      const checkoutRateWarm = normalizeShopifyCheckoutRateWarmPolicy(
+        body.checkoutRateWarm,
+      )
+      if (checkoutRateWarm.enabled) {
+        fail(
+          'SHOPIFY_CHECKOUT_RATE_WARM_DELIVERY_CUSTOMIZATION_REQUIRED',
+          'Checkout rate warming remains disabled until durable Shopify Delivery Customization readiness is available',
+          409,
+        )
+      }
+      await updateShopifyCarrierServiceRateWarmPolicyInPostgres({
+        organizationId: context.organizationId,
+        accountGlobalId: accountId,
+        expectedRowVersion: current.config.rowVersion,
+        checkoutRateWarm,
         actorEmail: context.actor.email,
       })
     } else if (action === 'save-name-preference') {

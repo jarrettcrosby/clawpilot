@@ -722,16 +722,63 @@ abort remains fail-closed and never changes the owner receipt.
 Proactive checkout warming is a separate, tenant-configurable workflow rather
 than a relaxation of the callback fence. When an authenticated storefront
 supplies the exact current cart plus the customer's saved delivery addresses,
-ClawPilot may cartonize once and enqueue bounded, deduplicated rate requests
-for each address. Every warmed result is keyed by the complete cart, inventory,
-warehouse, policy, carton plan, carrier credentials, and exact address
-fingerprint. A cart, inventory, configuration, or address change invalidates
-the affected result. Checkout may reuse only the unexpired result for its
-selected exact address and must otherwise execute the authoritative live
-callback. Guest checkout cannot prewarm until it supplies an address. The
-CarrierService callback alone does not constitute an early storefront cart
-signal; hosted-store proactive warming therefore requires an explicit
-storefront cart integration before this workflow can be activated.
+ClawPilot may request bounded destination-specific work for every distinct
+supported rate zone represented by those addresses. Each zone flows through
+Shopify's authoritative CarrierService callback and therefore runs the same
+carton-plan and whole-shipment carrier selection used by checkout; v1 does not
+claim a destination-neutral carton plan that is computed once and reused
+across different zones. The current v2 callback defines a rate zone as the
+normalized country and postal code, so multiple saved street addresses in the
+same zone deduplicate before any carrier work. Province remains only a
+deterministically selected Shopify Ajax request hint and is not part of the
+rate-zone identity. Every warmed result is keyed by the complete cart,
+inventory, warehouse, policy, carton plan, carrier credentials, and exact
+normalized rate-zone fingerprint. A cart, inventory, configuration,
+credential, or rate-zone change invalidates the affected result. Checkout may
+reuse only the unexpired result for its selected exact rate zone and must
+otherwise execute the authoritative live callback. Work runs in bounded
+batches and emits count-only aggregate coverage and per-zone outcome totals;
+one zone's failure does not discard successful zones and no address or rate
+fact enters that browser status event. Guest checkout cannot prewarm until it
+supplies an address. The CarrierService callback alone does not constitute an
+early storefront cart signal; hosted-store proactive warming therefore
+requires an explicit storefront cart integration before this workflow can be
+activated.
+
+For Shopify's hosted Online Store, the storefront browser owns the cart
+session and therefore owns the warm-up calls. A theme app embed observes the
+standard Shopify cart-line update event, reads the locale-aware Ajax cart,
+obtains only HMAC-authenticated, minimized saved-address rate zones through an
+app proxy, and invokes Shopify's locale-aware
+`cart/prepare_shipping_rates.json` plus
+`cart/async_shipping_rates.json` endpoints for those zones. This preserves the
+normal Shopify CarrierService callback, cartonization, provider evidence, and
+receipt lineage. The app proxy must validate its signature, timestamp, shop,
+and logged-in numeric customer identity, and its Admin API read may return only
+normalized country, province, and postal facts to the storefront. Names,
+street lines, email, phone, Admin tokens, and the complete saved-address
+payload are neither returned nor stored. App-proxy requests do not carry the
+storefront cart cookie to ClawPilot, so the server must never fabricate a
+CarrierService receipt or perform a substitute session-cart calculation.
+Warm-up is best-effort browser work while that storefront page remains open;
+navigation or process termination does not create a durable browser-work
+continuation. The selected-address checkout callback remains authoritative.
+
+Warming is disabled by default and belongs to the organization, Shopify
+integration account, and CarrierService warehouse configuration. Its policy
+v1 fixes the storefront mode to Shopify hosted Ajax, fixes support to United
+States rate zones, and owns all-saved-rate-zones behavior, bounded concurrency,
+debounce/minimum interval, and required stale-cart abort. Policy changes
+advance an optimistic revision and invalidate prior warmed authority. The
+browser must stop queued work when the cart fingerprint changes, process each
+remaining zone through Shopify, and treat the live selected-zone checkout
+callback as authoritative. Migration `0175` backfills this strict policy in
+the disabled state and enforces its versioned shape. The extension, app-proxy
+mapping, tenant policy, and durable customer-isolation readiness are separate
+activation gates; a deployed application route alone does not activate
+warming. Headless-store warming is a future contract that must use Storefront
+Cart buyer identity, delivery-address mutations, and delivery groups rather
+than this v1 hosted Ajax/app-proxy path.
 
 Migration `0170` makes the checkout carton-plan/rate objective an explicit
 tenant-owned fact inside the existing organization/account configuration,

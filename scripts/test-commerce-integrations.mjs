@@ -709,6 +709,7 @@ assert.deepEqual(
     'write_products',
     'write_publications',
     'write_shipping',
+    'write_app_proxy',
   ],
 )
 assert.equal(
@@ -798,6 +799,7 @@ assert.deepEqual(
       'read_locations',
       'read_markets',
       'read_orders',
+      'write_app_proxy',
       'write_inventory',
       'write_merchant_managed_fulfillment_orders',
       'write_products',
@@ -810,6 +812,7 @@ assert.deepEqual(
       'read_locations',
       'read_markets',
       'read_orders',
+      'write_app_proxy',
       'write_merchant_managed_fulfillment_orders',
       'write_products',
       'write_publications',

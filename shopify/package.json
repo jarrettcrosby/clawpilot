@@ -10,7 +10,7 @@
     "config:link": "shopify app config link",
     "deploy:staged": "shopify app deploy --no-release",
     "shopify": "shopify",
-    "test": "npm --workspace @clawpilot/shopify-test-rate-isolation test"
+    "test": "npm --workspaces --if-present test"
   },
   "devDependencies": {
     "@shopify/cli": "4.5.2"
