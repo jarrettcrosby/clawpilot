@@ -471,6 +471,25 @@ export const CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION = {
   test_environment: 'not_implemented',
 } as const satisfies Record<CommerceCapability, ClawPilotCapabilityImplementationState>
 
+export type CommerceCapabilityProvider = 'shopify' | 'faire'
+
+export function commerceCapabilityImplementationState(
+  provider: CommerceCapabilityProvider,
+  capability: CommerceCapability,
+): ClawPilotCapabilityImplementationState {
+  return provider === 'shopify'
+    ? CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION[capability]
+    : CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION[capability]
+}
+
+export function isClawPilotCommerceCapabilityImplemented(
+  provider: CommerceCapabilityProvider,
+  capability: CommerceCapability,
+) {
+  return commerceCapabilityImplementationState(provider, capability)
+    === 'control_plane_implemented'
+}
+
 const SHOPIFY_PROVIDER_CAPABILITY_SET = new Set<CommerceCapability>(SHOPIFY_PROVIDER_AVAILABLE_CAPABILITIES)
 const SHOPIFY_SCOPED_CAPABILITY_SET = new Set<CommerceCapability>(
   Object.keys(SHOPIFY_CAPABILITY_SCOPES) as ShopifyScopedCapability[],

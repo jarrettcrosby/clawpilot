@@ -121,6 +121,9 @@ function verifySourceContracts() {
     'consumeCommerceActiveTransitionAuthorizationInPostgres',
     'readCommerceActiveCapabilityClaimInPostgres',
     'requireCommerceActiveCapabilityClaimInPostgres',
+    'isClawPilotCommerceCapabilityImplemented',
+    'COMMERCE_ACTIVE_CAPABILITY_NOT_IMPLEMENTED',
+    'requireImplementedCohort',
     'commerceActiveCohortHash',
     'providerWrites: 0',
     'credentialDecryptions: 0',
@@ -142,6 +145,36 @@ function verifySourceContracts() {
     assert.ok(
       !persistence.includes(forbidden),
       `Commerce Active preparation must not access ${forbidden}`,
+    )
+  }
+
+  const capabilityCatalog = read(
+    'app_src/lib/integrations/commerceCapabilities.ts',
+  )
+  for (const fragment of [
+    'commerceCapabilityImplementationState',
+    'isClawPilotCommerceCapabilityImplemented',
+    "=== 'control_plane_implemented'",
+  ]) {
+    assert.ok(
+      capabilityCatalog.includes(fragment),
+      `Commerce capability registry missing ${fragment}`,
+    )
+  }
+
+  const operationsUi = read(
+    'app_src/components/operations/OperationsSection.tsx',
+  )
+  for (const fragment of [
+    'implementation?: Record<',
+    'selectable: implemented && scopeEligible',
+    'disabled={!option.selectable}',
+    "option.unavailableReason === 'not_implemented'",
+    'Provider-supported capabilities remain',
+  ]) {
+    assert.ok(
+      operationsUi.includes(fragment),
+      `Commerce Active UI truthfulness guard missing ${fragment}`,
     )
   }
 }
@@ -301,6 +334,7 @@ async function seedWorkspace(pool) {
           'read_locations',
           'write_inventory',
           'write_merchant_managed_fulfillment_orders',
+          'write_shipping',
         ],
       }),
       JSON.stringify({
@@ -456,6 +490,9 @@ async function verifyDisposablePostgres() {
       },
     }
     const auditEvents = []
+    const capabilityCatalog = loadTypeScriptModule(
+      'app_src/lib/integrations/commerceCapabilities.ts',
+    )
     const persistence = loadTypeScriptModule(
       'app_src/lib/persistence/commerceActiveTransitionAuthorization.ts',
       {
@@ -465,6 +502,7 @@ async function verifyDisposablePostgres() {
               auditEvents.push(event)
             },
           },
+          '@/lib/integrations/commerceCapabilities': capabilityCatalog,
           '@/lib/persistence/postgres': postgresMock,
         },
       },
@@ -474,16 +512,10 @@ async function verifyDisposablePostgres() {
     assert.ok(accounts.faire)
     assert.ok(accounts.otherShopify)
 
-    const selectedAccounts = [
-      {
-        accountGlobalId: accounts.faire.global_id,
-        capabilities: ['tracking_export', 'inventory_export'],
-      },
-      {
-        accountGlobalId: accounts.shopify.global_id,
-        capabilities: ['inventory_export', 'fulfillment_export'],
-      },
-    ]
+    const selectedAccounts = [{
+      accountGlobalId: accounts.shopify.global_id,
+      capabilities: ['shipping_rate_callbacks'],
+    }]
     const prepared = await persistence
       .prepareCommerceActiveTransitionInPostgres({
         organizationId,
@@ -494,7 +526,7 @@ async function verifyDisposablePostgres() {
         idempotencyKey: 'prepare-main',
       })
     assert.equal(prepared.replayed, false)
-    assert.equal(prepared.accounts.length, 2)
+    assert.equal(prepared.accounts.length, 1)
     assert.deepEqual(
       [...prepared.accounts.map((account) => account.accountGlobalId)],
       [...prepared.accounts.map((account) => account.accountGlobalId)].sort(),
@@ -559,12 +591,62 @@ async function verifyDisposablePostgres() {
         expectedActivationState: 'shadow',
         expectedActivationRevision: 1,
         selectedAccounts: [{
+          accountGlobalId: accounts.faire.global_id,
+          capabilities: ['tracking_export'],
+        }],
+        idempotencyKey: 'faire-not-implemented',
+      }),
+      'COMMERCE_ACTIVE_CAPABILITY_NOT_IMPLEMENTED',
+    )
+    await expectCode(
+      persistence.prepareCommerceActiveTransitionInPostgres({
+        organizationId,
+        actorEmail: ownerEmail,
+        expectedActivationState: 'shadow',
+        expectedActivationRevision: 1,
+        selectedAccounts: [{
           accountGlobalId: accounts.shopify.global_id,
-          capabilities: ['order_edit'],
+          capabilities: ['inventory_export'],
+        }],
+        idempotencyKey: 'shopify-not-implemented',
+      }),
+      'COMMERCE_ACTIVE_CAPABILITY_NOT_IMPLEMENTED',
+    )
+    await pool.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = jsonb_set(
+         configuration,
+         '{grantedScopes}',
+         (configuration->'grantedScopes') - 'write_shipping'
+       )
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [organizationId, accounts.shopify.global_id],
+    )
+    await expectCode(
+      persistence.prepareCommerceActiveTransitionInPostgres({
+        organizationId,
+        actorEmail: ownerEmail,
+        expectedActivationState: 'shadow',
+        expectedActivationRevision: 1,
+        selectedAccounts: [{
+          accountGlobalId: accounts.shopify.global_id,
+          capabilities: ['shipping_rate_callbacks'],
         }],
         idempotencyKey: 'missing-scope',
       }),
       'COMMERCE_ACTIVE_SCOPE_MISSING',
+    )
+    await pool.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = jsonb_set(
+         configuration,
+         '{grantedScopes}',
+         (configuration->'grantedScopes') || '"write_shipping"'::jsonb
+       )
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [organizationId, accounts.shopify.global_id],
     )
 
     const authorizedForDrift = await persistence
@@ -595,7 +677,7 @@ async function verifyDisposablePostgres() {
        SET configuration = jsonb_set(
          configuration,
          '{grantedScopes}',
-         (configuration->'grantedScopes') - 'write_inventory'
+         (configuration->'grantedScopes') - 'write_shipping'
        )
        WHERE organization_id = $1::uuid
          AND global_id = $2`,
@@ -638,7 +720,7 @@ async function verifyDisposablePostgres() {
        SET configuration = jsonb_set(
          configuration,
          '{grantedScopes}',
-         (configuration->'grantedScopes') || '"write_inventory"'::jsonb
+         (configuration->'grantedScopes') || '"write_shipping"'::jsonb
        )
        WHERE organization_id = $1::uuid
          AND global_id = $2`,
@@ -722,13 +804,13 @@ async function verifyDisposablePostgres() {
         authorizationGlobalId: authorized.authorizationGlobalId,
         expectedCohortHash: preparedForExpiry.cohortHash,
         idempotencyKey: 'consume-main',
-        reason: 'Activate exact verified Shopify and Faire cohort',
+        reason: 'Activate exact verified commerce cohort',
       })
     assert.equal(activated.replayed, false)
     assert.equal(activated.state, 'active')
     assert.equal(activated.revision, 2)
-    assert.equal(activated.accountCount, 2)
-    assert.equal(activated.capabilityCount, 4)
+    assert.equal(activated.accountCount, 1)
+    assert.equal(activated.capabilityCount, 1)
     const activatedReplay = await persistence
       .consumeCommerceActiveTransitionAuthorizationInPostgres({
         organizationId,
@@ -736,7 +818,7 @@ async function verifyDisposablePostgres() {
         authorizationGlobalId: authorized.authorizationGlobalId,
         expectedCohortHash: preparedForExpiry.cohortHash,
         idempotencyKey: 'consume-main',
-        reason: 'Activate exact verified Shopify and Faire cohort',
+        reason: 'Activate exact verified commerce cohort',
       })
     assert.equal(activatedReplay.replayed, true)
     assert.equal(
@@ -750,7 +832,7 @@ async function verifyDisposablePostgres() {
         authorizationGlobalId: authorized.authorizationGlobalId,
         expectedCohortHash: preparedForExpiry.cohortHash,
         idempotencyKey: 'consume-second-time',
-        reason: 'Activate exact verified Shopify and Faire cohort',
+        reason: 'Activate exact verified commerce cohort',
       }),
       'COMMERCE_ACTIVE_CONSUMPTION_IDEMPOTENCY_CONFLICT',
     )
@@ -759,7 +841,7 @@ async function verifyDisposablePostgres() {
       .readCommerceActiveCapabilityClaimInPostgres({
         organizationId,
         accountGlobalId: accounts.shopify.global_id,
-        capability: 'inventory_export',
+        capability: 'shipping_rate_callbacks',
         expectedActivationRevision: 2,
       })
     assert.ok(claim)
@@ -769,7 +851,7 @@ async function verifyDisposablePostgres() {
       await persistence.readCommerceActiveCapabilityClaimInPostgres({
         organizationId: otherOrganizationId,
         accountGlobalId: accounts.shopify.global_id,
-        capability: 'inventory_export',
+        capability: 'shipping_rate_callbacks',
       }),
       null,
     )
@@ -779,7 +861,7 @@ async function verifyDisposablePostgres() {
        SET configuration = jsonb_set(
          configuration,
          '{grantedScopes}',
-         (configuration->'grantedScopes') - 'write_inventory'
+         (configuration->'grantedScopes') - 'write_shipping'
        )
        WHERE organization_id = $1::uuid
          AND global_id = $2`,
@@ -789,7 +871,7 @@ async function verifyDisposablePostgres() {
       await persistence.readCommerceActiveCapabilityClaimInPostgres({
         organizationId,
         accountGlobalId: accounts.shopify.global_id,
-        capability: 'inventory_export',
+        capability: 'shipping_rate_callbacks',
       }),
       null,
     )

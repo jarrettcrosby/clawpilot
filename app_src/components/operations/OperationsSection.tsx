@@ -146,7 +146,11 @@ type CommerceActiveAccountOption = {
   displayName: string
   provider: 'shopify' | 'faire'
   environment: 'sandbox' | 'production'
-  eligibleCapabilities: CommerceActiveWriteCapability[]
+  capabilities: Array<{
+    capability: CommerceActiveWriteCapability
+    selectable: boolean
+    unavailableReason: 'not_implemented' | 'missing_scope' | null
+  }>
 }
 
 type CommerceActiveCatalogPayload = {
@@ -167,7 +171,13 @@ type CommerceActiveCatalogPayload = {
   catalog?: {
     providers?: Partial<Record<
       'shopify' | 'faire',
-      { capabilityScopes?: Record<string, readonly string[]> }
+      {
+        capabilityScopes?: Record<string, readonly string[]>
+        implementation?: Record<
+          string,
+          'control_plane_implemented' | 'not_implemented'
+        >
+      }
     >>
   }
 }
@@ -282,24 +292,36 @@ function commerceActiveAccountOptions(
       return []
     }
     const grantedScopes = new Set(stringValues(account.configuration.grantedScopes))
-    const capabilityScopes = providers[account.provider]?.capabilityScopes || {}
-    const eligibleCapabilities = COMMERCE_ACTIVE_WRITE_CAPABILITIES[
+    const provider = providers[account.provider]
+    const capabilityScopes = provider?.capabilityScopes || {}
+    const implementation = provider?.implementation || {}
+    const capabilities = COMMERCE_ACTIVE_WRITE_CAPABILITIES[
       account.provider
-    ].filter((capability) => {
+    ].map((capability) => {
       const requiredScopes = capabilityScopes[capability]
-      return Boolean(
+      const implemented =
+        implementation[capability] === 'control_plane_implemented'
+      const scopeEligible = Boolean(
         requiredScopes?.length
         && requiredScopes.every((scope) => grantedScopes.has(scope)),
       )
+      return {
+        capability,
+        selectable: implemented && scopeEligible,
+        unavailableReason: !implemented
+          ? 'not_implemented' as const
+          : !scopeEligible
+            ? 'missing_scope' as const
+            : null,
+      }
     })
-    if (eligibleCapabilities.length === 0) return []
 
     return [{
       accountGlobalId: account.globalId,
       displayName: account.displayName,
       provider: account.provider,
       environment: account.environment,
-      eligibleCapabilities,
+      capabilities,
     }]
   }).sort((left, right) => (
     left.provider.localeCompare(right.provider)
@@ -1839,14 +1861,16 @@ export default function OperationsSection({
       const accounts = commerceActiveAccountOptions(payload)
       if (accounts.length === 0) {
         throw new Error(
-          'No verified Shopify or Faire account has a complete provider-write scope cohort.',
+          'No verified Shopify or Faire account is available for provider-write review.',
         )
       }
       setCommerceActiveAccounts(accounts)
       setCommerceActiveSelections(Object.fromEntries(
         accounts.map((account) => [
           account.accountGlobalId,
-          [...account.eligibleCapabilities],
+          account.capabilities
+            .filter((option) => option.selectable)
+            .map((option) => option.capability),
         ]),
       ))
     } catch (caught) {
@@ -2507,8 +2531,9 @@ export default function OperationsSection({
                 <Box>
                   <Typography fontWeight={700}>1. Select the exact write cohort</Typography>
                   <Typography variant="body2" color="text.secondary">
-                    Only verified accounts and capabilities covered by their provider-reported
-                    scopes are available. Clear every capability for an account to exclude it.
+                    A capability is selectable only when ClawPilot implements its provider-write
+                    effect and the verified account retains every required provider scope. Clear
+                    every capability for an account to exclude it.
                   </Typography>
                 </Box>
                 {commerceActiveAccounts.map((account) => (
@@ -2547,29 +2572,55 @@ export default function OperationsSection({
                         columnGap: 2,
                       }}
                     >
-                      {account.eligibleCapabilities.map((capability) => (
+                      {account.capabilities.map((option) => (
                         <FormControlLabel
-                          key={capability}
+                          key={option.capability}
+                          disabled={!option.selectable}
                           control={(
                             <Checkbox
+                              disabled={!option.selectable}
                               checked={
                                 commerceActiveSelections[
                                   account.accountGlobalId
-                                ]?.includes(capability) || false
+                                ]?.includes(option.capability) || false
                               }
                               onChange={(event) => editCommerceActiveSelection(
                                 account.accountGlobalId,
-                                capability,
+                                option.capability,
                                 event.target.checked,
                               )}
                             />
                           )}
-                          label={displayStatus(capability)}
+                          label={(
+                            <Stack direction="row" spacing={1} alignItems="center">
+                              <span>{displayStatus(option.capability)}</span>
+                              {option.unavailableReason && (
+                                <Chip
+                                  size="small"
+                                  variant="outlined"
+                                  label={
+                                    option.unavailableReason === 'not_implemented'
+                                      ? 'Not implemented'
+                                      : 'Missing scope'
+                                  }
+                                />
+                              )}
+                            </Stack>
+                          )}
                         />
                       ))}
                     </Box>
                   </Box>
                 ))}
+                {commerceActiveAccounts.every((account) => (
+                  account.capabilities.every((option) => !option.selectable)
+                )) && (
+                  <Alert severity="warning">
+                    These verified accounts currently have no ClawPilot-implemented provider
+                    writes with a complete scope grant. Provider-supported capabilities remain
+                    visible for planning, but cannot be selected or authorized.
+                  </Alert>
+                )}
                 <Alert severity="info">
                   Preparing this review performs no credential decryption, provider request, or
                   provider write. It records the exact accounts, credential generations, granted

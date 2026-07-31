@@ -2,6 +2,9 @@ import { createHash } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
+  isClawPilotCommerceCapabilityImplemented,
+} from '@/lib/integrations/commerceCapabilities'
+import {
   acquireTransactionAdvisoryLock,
   query,
   withTransaction,
@@ -464,6 +467,36 @@ function providerCapabilityScopes(
   return providerCapabilities[capability] || null
 }
 
+function implementedProviderCapabilityScopes(
+  provider: CommerceActiveProvider,
+  capability: CommerceActiveWriteCapability,
+) {
+  const requiredScopes = providerCapabilityScopes(provider, capability)
+  if (!requiredScopes) {
+    fail(
+      'COMMERCE_ACTIVE_CAPABILITY_UNSUPPORTED',
+      `${provider} does not support the selected ${capability} write capability`,
+    )
+  }
+  if (!isClawPilotCommerceCapabilityImplemented(provider, capability)) {
+    fail(
+      'COMMERCE_ACTIVE_CAPABILITY_NOT_IMPLEMENTED',
+      `${provider} supports ${capability}, but ClawPilot has not implemented its provider-write effect`,
+    )
+  }
+  return requiredScopes
+}
+
+function requireImplementedCohort(
+  cohort: readonly CommerceActiveCohortAccount[],
+) {
+  for (const account of cohort) {
+    for (const capability of account.writeCapabilities) {
+      implementedProviderCapabilityScopes(account.provider, capability)
+    }
+  }
+}
+
 export function isCommerceActiveWriteCapability(
   provider: CommerceActiveProvider,
   value: unknown,
@@ -820,16 +853,10 @@ export async function prepareCommerceActiveTransitionInPostgres(
         account.configuration?.grantedScopes,
       )
       for (const capability of requested.capabilities) {
-        const requiredScopes = providerCapabilityScopes(
+        const requiredScopes = implementedProviderCapabilityScopes(
           account.provider,
           capability,
         )
-        if (!requiredScopes) {
-          fail(
-            'COMMERCE_ACTIVE_CAPABILITY_UNSUPPORTED',
-            `${account.provider} does not support the selected ${capability} write capability`,
-          )
-        }
         const missing = requiredScopes.filter(
           (scope) => !grantedScopes.includes(scope),
         )
@@ -1021,6 +1048,7 @@ export async function authorizeCommerceActiveTransitionInPostgres(
         'Commerce Active cohort changed after it was reviewed',
       )
     }
+    requireImplementedCohort(prepared.cohort)
     const confirmationHash = createHash('sha256').update(
       [
         COMMERCE_ACTIVE_CONFIRMATION_STATEMENT_VERSION,
@@ -1304,6 +1332,7 @@ export async function consumeCommerceActiveTransitionAuthorizationInPostgres(
         'Commerce Active authorization expired before it was consumed',
       )
     }
+    requireImplementedCohort(authorized.cohort)
     const role = await requireActorRole(client, {
       organizationId: scopedOrganizationId,
       actorEmail: activatedBy,
@@ -1596,7 +1625,13 @@ export async function readCommerceActiveCapabilityClaimInPostgres(input: {
   )
   const row = result.rows[0]
   if (!row) return null
-  if (!isCommerceActiveWriteCapability(row.member.provider, capability)) {
+  if (
+    !isCommerceActiveWriteCapability(row.member.provider, capability)
+    || !isClawPilotCommerceCapabilityImplemented(
+      row.member.provider,
+      capability as CommerceActiveWriteCapability,
+    )
+  ) {
     return null
   }
   return {
