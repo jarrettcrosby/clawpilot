@@ -1886,6 +1886,20 @@ async function verifyCanonicalPlanning(databaseUrl) {
         mocks: {
           '@/lib/auditWriter': auditWriter,
           '@/lib/crm/stableId': stableId,
+          '@/lib/integrations/carrierCheckoutRate': {
+            rateCheckoutShipment: async () => {
+              throw new Error(
+                'Canonical planning acceptance does not call carrier rates',
+              )
+            },
+          },
+          '@/lib/integrations/carrierIntegrations': {
+            testCarrierSandboxShipmentRate: async () => {
+              throw new Error(
+                'Canonical planning acceptance does not call carrier sandboxes',
+              )
+            },
+          },
           '@/lib/operations/adapters': adapters,
           '@/lib/operations/canonicalFulfillmentPlanning':
             canonicalPlanning,
@@ -1904,6 +1918,13 @@ async function verifyCanonicalPlanning(databaseUrl) {
             enqueueOperationsPrintJobInPostgres: async () => {
               throw new Error(
                 'Canonical planning must not enqueue a print job',
+              )
+            },
+          },
+          '@/lib/persistence/operationShadowFulfillmentPreparation': {
+            readShadowFulfillmentPreparation: async () => {
+              throw new Error(
+                'Canonical planning acceptance does not read Shadow execution evidence',
               )
             },
           },

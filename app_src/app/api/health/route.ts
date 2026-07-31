@@ -314,6 +314,8 @@ export async function GET() {
           operations_shopify_checkout_provider_attempts_applied: boolean
           operations_shopify_checkout_rate_warm_policy_applied: boolean
           operations_canonical_fulfillment_planning_applied: boolean
+          operations_fulfillment_executions_applied: boolean
+          operations_shopify_customer_rate_policies_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -1012,6 +1014,18 @@ export async function GET() {
                 WHERE filename =
                   '0176_operations_canonical_fulfillment_planning.sql'
               ) AS operations_canonical_fulfillment_planning_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0177_operations_fulfillment_executions.sql'
+              ) AS operations_fulfillment_executions_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0178_operations_shopify_customer_rate_policies.sql'
+              ) AS operations_shopify_customer_rate_policies_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1161,6 +1175,8 @@ export async function GET() {
             && row?.operations_shopify_checkout_provider_attempts_applied
             && row?.operations_shopify_checkout_rate_warm_policy_applied
             && row?.operations_canonical_fulfillment_planning_applied
+            && row?.operations_fulfillment_executions_applied
+            && row?.operations_shopify_customer_rate_policies_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1302,6 +1318,8 @@ export async function GET() {
           || !row?.operations_shopify_checkout_provider_attempts_applied
           || !row?.operations_shopify_checkout_rate_warm_policy_applied
           || !row?.operations_canonical_fulfillment_planning_applied
+          || !row?.operations_fulfillment_executions_applied
+          || !row?.operations_shopify_customer_rate_policies_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

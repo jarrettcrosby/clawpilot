@@ -1,0 +1,24 @@
+mutation ClawPilotSetCustomerRatePolicy(
+  $metafields: [MetafieldsSetInput!]!
+) {
+  metafieldsSet(metafields: $metafields) {
+    metafields {
+      id
+      namespace
+      key
+      type
+      jsonValue
+      updatedAt
+      owner {
+        ... on Customer {
+          id
+        }
+      }
+    }
+    userErrors {
+      field
+      message
+      code
+    }
+  }
+}

@@ -7,7 +7,7 @@ import {
   verifyShopifyAppProxyRequest,
 } from '../../lib/integrations/shopifyAppProxy.ts'
 import {
-  readShopifyCustomerRateZones,
+  readShopifyCustomerRateDestinations,
   ShopifyCustomerRateZoneError,
 } from '../../lib/integrations/shopifyCustomerRateZones.ts'
 import {
@@ -17,6 +17,9 @@ import {
 import {
   readShopifyCheckoutRateWarmPolicy,
 } from '../../lib/operations/shopifyCheckoutRateWarmPolicy.ts'
+import {
+  configuredShopifyNumericIdentifierSet,
+} from '../../lib/integrations/shopifyShadowCheckoutAllowlist.ts'
 
 const SECRET = 'test-only-shopify-app-proxy-secret-0000000001'
 const SHOP = 'ag-alchemy.myshopify.com'
@@ -29,6 +32,7 @@ const PROXY_DEPENDENCIES = {
   },
   verifyProxy: verifyShopifyAppProxyRequest,
   readPolicy: readShopifyCheckoutRateWarmPolicy,
+  isShadowCustomerAllowed: () => false,
 }
 
 function signedParameters(input: {
@@ -65,6 +69,37 @@ function hasZoneCode(error: unknown, code: string) {
   return error instanceof ShopifyCustomerRateZoneError
     && error.code === code
 }
+
+test('Shadow variant allowlist fails closed when absent or malformed', () => {
+  const prior = process.env.SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS
+  try {
+    delete process.env.SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS
+    assert.equal(configuredShopifyNumericIdentifierSet(
+      'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS',
+    ), null)
+
+    process.env.SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS =
+      '123456789,not-a-shopify-id'
+    assert.equal(configuredShopifyNumericIdentifierSet(
+      'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS',
+    ), null)
+
+    process.env.SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS =
+      '123456789,987654321'
+    assert.deepEqual(
+      [...(configuredShopifyNumericIdentifierSet(
+        'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS',
+      ) || [])],
+      ['123456789', '987654321'],
+    )
+  } finally {
+    if (prior === undefined) {
+      delete process.env.SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS
+    } else {
+      process.env.SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS = prior
+    }
+  }
+})
 
 test('verifies Shopify app-proxy HMAC with repeated parameter values', () => {
   const parameters = signedParameters({
@@ -158,7 +193,7 @@ test('rejects invalid, stale, wrong-shop, and guest app-proxy requests', () => {
   )
 })
 
-test('paginates, normalizes, deduplicates, and redacts saved address zones', async () => {
+test('paginates every distinct full destination and redacts non-address facts', async () => {
   const requests: Array<Record<string, unknown>> = []
   const pages = [
     {
@@ -171,13 +206,17 @@ test('paginates, normalizes, deduplicates, and redacts saved address zones', asy
               id: 'gid://shopify/MailingAddress/1',
               firstName: 'Private',
               address1: '100 Private Street',
+              address2: '',
+              city: 'Beverly Hills',
               phone: '555-555-0100',
-              countryCodeV2: 'us',
-              provinceCode: 'ny',
-              zip: ' 90210 ',
+              countryCodeV2: 'US',
+              provinceCode: 'CA',
+              zip: '90210',
             },
             {
               address1: 'Different private street',
+              address2: 'Suite 2',
+              city: 'Beverly Hills',
               countryCodeV2: 'US',
               provinceCode: 'CA',
               zip: '90210',
@@ -193,12 +232,25 @@ test('paginates, normalizes, deduplicates, and redacts saved address zones', asy
         addressesV2: {
           nodes: [
             {
-              address1: '200 Private Avenue',
-              countryCodeV2: 'ca',
-              provinceCode: 'on',
-              zip: ' k1a   0b1 ',
+              address1: '100  PRIVATE street',
+              address2: '',
+              city: 'BEVERLY HILLS',
+              countryCodeV2: 'US',
+              provinceCode: 'CA',
+              zip: '90210',
             },
             {
+              address1: '200 Private Avenue',
+              address2: '',
+              city: 'Ottawa',
+              countryCodeV2: 'CA',
+              provinceCode: 'ON',
+              zip: 'K1A 0B1',
+            },
+            {
+              address1: 'Missing Postal',
+              address2: '',
+              city: 'New York',
               countryCodeV2: 'US',
               provinceCode: 'NY',
               zip: '',
@@ -209,7 +261,7 @@ test('paginates, normalizes, deduplicates, and redacts saved address zones', asy
       },
     },
   ]
-  const result = await readShopifyCustomerRateZones({
+  const result = await readShopifyCustomerRateDestinations({
     customerId: '123456789',
     credential: { shopDomain: SHOP, accessToken: 'test-access-token' },
     grantedScopes: ['read_customers'],
@@ -220,15 +272,37 @@ test('paginates, normalizes, deduplicates, and redacts saved address zones', asy
   })
 
   assert.deepEqual(result, {
-    zones: [
-      { countryCode: 'CA', provinceCode: 'ON', postalCode: 'K1A 0B1' },
-      { countryCode: 'US', provinceCode: 'CA', postalCode: '90210' },
+    destinations: [
+      {
+        address1: '200 Private Avenue',
+        address2: '',
+        city: 'Ottawa',
+        province: 'ON',
+        country: 'CA',
+        zip: 'K1A 0B1',
+      },
+      {
+        address1: '100 Private Street',
+        address2: '',
+        city: 'Beverly Hills',
+        province: 'CA',
+        country: 'US',
+        zip: '90210',
+      },
+      {
+        address1: 'Different private street',
+        address2: 'Suite 2',
+        city: 'Beverly Hills',
+        province: 'CA',
+        country: 'US',
+        zip: '90210',
+      },
     ],
-    counts: { scanned: 4, eligible: 2, duplicate: 1, skipped: 1 },
+    counts: { scanned: 5, eligible: 3, duplicate: 1, skipped: 1 },
   })
   assert.equal(requests[1]?.after, 'cursor-1')
   const serialized = JSON.stringify(result)
-  assert.equal(serialized.includes('Private'), false)
+  assert.equal(serialized.includes('firstName'), false)
   assert.equal(serialized.includes('customer@example.com'), false)
   assert.equal(serialized.includes('MailingAddress'), false)
   assert.equal(serialized.includes('555-555-0100'), false)
@@ -237,7 +311,7 @@ test('paginates, normalizes, deduplicates, and redacts saved address zones', asy
 test('refuses missing scope before reading customer data', async () => {
   let called = false
   await assert.rejects(
-    readShopifyCustomerRateZones({
+    readShopifyCustomerRateDestinations({
       customerId: '123456789',
       credential: { shopDomain: SHOP, accessToken: 'test-access-token' },
       grantedScopes: ['read_orders'],
@@ -257,7 +331,7 @@ test('refuses missing scope before reading customer data', async () => {
 test('fails closed when customer pagination exceeds the bound', async () => {
   let called = 0
   await assert.rejects(
-    readShopifyCustomerRateZones({
+    readShopifyCustomerRateDestinations({
       customerId: '123456789',
       credential: { shopDomain: SHOP, accessToken: 'test-access-token' },
       grantedScopes: ['read_customers'],
@@ -270,8 +344,22 @@ test('fails closed when customer pagination exceeds the bound', async () => {
             id: 'gid://shopify/Customer/123456789',
             addressesV2: {
               nodes: [
-                { countryCodeV2: 'US', provinceCode: 'CA', zip: '90210' },
-                { countryCodeV2: 'US', provinceCode: 'CT', zip: '06103' },
+                {
+                  address1: '100 Main Street',
+                  address2: '',
+                  city: 'Beverly Hills',
+                  countryCodeV2: 'US',
+                  provinceCode: 'CA',
+                  zip: '90210',
+                },
+                {
+                  address1: '35 Saxony Drive',
+                  address2: '',
+                  city: 'Trumbull',
+                  countryCodeV2: 'US',
+                  provinceCode: 'CT',
+                  zip: '06103',
+                },
               ],
               pageInfo: {
                 hasNextPage: true,
@@ -293,17 +381,20 @@ test('fails closed when customer pagination exceeds the bound', async () => {
 function tenant(input: {
   shopDomain?: string
   activationState?: 'shadow' | 'active'
+  environment?: 'sandbox' | 'production'
+  policyEnabled?: boolean
 } = {}): ShopifyRateWarmTenant {
   return {
     organizationId: '11111111-1111-4111-8111-111111111111',
     accountGlobalId: 'gia0000001',
     shopDomain: input.shopDomain || SHOP,
     activationState: input.activationState || 'active',
+    environment: input.environment || 'sandbox',
     policyRevision: 7,
     policySnapshot: {
       checkoutRateWarm: {
         version: 'shopify-checkout-rate-warm-v1',
-        enabled: true,
+        enabled: input.policyEnabled ?? true,
         mode: 'hosted_ajax',
         zoneScope: 'all_saved_rate_zones',
         concurrency: 3,
@@ -318,7 +409,7 @@ function tenant(input: {
   }
 }
 
-test('returns exact hosted contract and only tenant-supported zones', async () => {
+test('returns exact hosted contract and only tenant-supported destinations', async () => {
   const result = await loadShopifyRateWarmResponse({
     parameters: signedParameters(),
     nowSeconds: NOW,
@@ -334,12 +425,26 @@ test('returns exact hosted contract and only tenant-supported zones', async () =
           grantedScopes: ['read_customers'],
         }
       },
-      async readCustomerRateZones(input) {
+      async readCustomerRateDestinations(input) {
         assert.equal(input.customerId, '123456789')
         return {
-          zones: [
-            { countryCode: 'US', provinceCode: 'CA', postalCode: '90210' },
-            { countryCode: 'GB', provinceCode: null, postalCode: 'SW1A 1AA' },
+          destinations: [
+            {
+              address1: '100 Main Street',
+              address2: '',
+              city: 'Beverly Hills',
+              province: 'CA',
+              country: 'US',
+              zip: '90210',
+            },
+            {
+              address1: '10 Downing Street',
+              address2: '',
+              city: 'London',
+              province: '',
+              country: 'GB',
+              zip: 'SW1A 1AA',
+            },
           ],
           counts: { scanned: 2, eligible: 2, duplicate: 0, skipped: 0 },
         }
@@ -357,8 +462,15 @@ test('returns exact hosted contract and only tenant-supported zones', async () =
     debounceMs: 400,
     minIntervalMs: 1_200,
     staleCartAbort: true,
-    zones: [
-      { countryCode: 'US', provinceCode: 'CA', postalCode: '90210' },
+    destinations: [
+      {
+        address1: '100 Main Street',
+        address2: '',
+        city: 'Beverly Hills',
+        province: 'CA',
+        country: 'US',
+        zip: '90210',
+      },
     ],
     coverage: {
       scanned: 2,
@@ -374,7 +486,7 @@ test('returns exact hosted contract and only tenant-supported zones', async () =
   assert.equal(serialized.includes('123456789'), false)
 })
 
-test('shadow mode returns no zones and never reads Shopify Admin', async () => {
+test('disabled policy returns no destinations and never reads Shopify Admin', async () => {
   let tokenRequested = false
   let addressesRead = false
   const result = await loadShopifyRateWarmResponse({
@@ -383,25 +495,86 @@ test('shadow mode returns no zones and never reads Shopify Admin', async () => {
     dependencies: {
       ...PROXY_DEPENDENCIES,
       async resolveTenant() {
-        return tenant({ activationState: 'shadow' })
+        return tenant({ policyEnabled: false })
       },
       async requestAccessToken() {
         tokenRequested = true
         return { accessToken: 'test', grantedScopes: ['read_customers'] }
       },
-      async readCustomerRateZones() {
+      async readCustomerRateDestinations() {
         addressesRead = true
         return {
-          zones: [],
+          destinations: [],
           counts: { scanned: 0, eligible: 0, duplicate: 0, skipped: 0 },
         }
       },
     },
   })
   assert.equal(result.enabled, false)
-  assert.deepEqual(result.zones, [])
+  assert.deepEqual(result.destinations, [])
   assert.equal(tokenRequested, false)
   assert.equal(addressesRead, false)
+})
+
+test('Shadow sandbox warms only a signed customer with an active policy', async () => {
+  let tokenRequests = 0
+  let addressReads = 0
+  const dependencies = {
+    ...PROXY_DEPENDENCIES,
+    async resolveTenant() {
+      return tenant({
+        activationState: 'shadow',
+        environment: 'sandbox',
+      })
+    },
+    async requestAccessToken() {
+      tokenRequests += 1
+      return {
+        accessToken: 'test-access-token',
+        grantedScopes: ['read_customers'],
+      }
+    },
+    async readCustomerRateDestinations() {
+      addressReads += 1
+      return {
+        destinations: [{
+          address1: '35 Saxony Drive',
+          address2: '',
+          city: 'Trumbull',
+          province: 'CT',
+          country: 'US',
+          zip: '06611',
+        }],
+        counts: { scanned: 1, eligible: 1, duplicate: 0, skipped: 0 },
+      }
+    },
+  }
+  const denied = await loadShopifyRateWarmResponse({
+    parameters: signedParameters(),
+    nowSeconds: NOW,
+    dependencies,
+  })
+  assert.equal(denied.enabled, false)
+  assert.deepEqual(denied.destinations, [])
+  assert.equal(tokenRequests, 0)
+  assert.equal(addressReads, 0)
+
+  const allowed = await loadShopifyRateWarmResponse({
+    parameters: signedParameters(),
+    nowSeconds: NOW,
+    dependencies: {
+      ...dependencies,
+      isShadowCustomerAllowed: async (
+        customerId: string,
+        resolvedTenant: ShopifyRateWarmTenant,
+      ) => customerId === '123456789'
+        && resolvedTenant.accountGlobalId === 'gia0000001',
+    },
+  })
+  assert.equal(allowed.enabled, true)
+  assert.equal(allowed.destinations.length, 1)
+  assert.equal(tokenRequests, 1)
+  assert.equal(addressReads, 1)
 })
 
 test('refuses cross-tenant shop binding before token acquisition', async () => {
@@ -419,7 +592,7 @@ test('refuses cross-tenant shop binding before token acquisition', async () => {
           tokenRequested = true
           return { accessToken: 'test', grantedScopes: ['read_customers'] }
         },
-        async readCustomerRateZones() {
+        async readCustomerRateDestinations() {
           throw new Error('must not read')
         },
       },

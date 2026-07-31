@@ -5,15 +5,15 @@ import {
   RATE_WARM_STATUS_EVENT,
   cartUrl,
   createDebouncer,
-  dedupeZones,
+  dedupeDestinations,
   dispatchRateWarmStatus,
   fetchWarmPolicy,
   normalizePolicy,
-  processZones,
+  processDestinations,
   proxyPolicyUrl,
   shippingRateUrl,
-  warmAllZones,
-  warmShippingZone,
+  warmAllDestinations,
+  warmShippingDestination,
 } from '../src/rate-warmer.js'
 
 const FINGERPRINT = 'a'.repeat(64)
@@ -29,8 +29,15 @@ function policy(overrides = {}) {
     debounceMs: 350,
     minIntervalMs: 1_000,
     staleCartAbort: true,
-    zones: [
-      { countryCode: 'US', provinceCode: 'CT', postalCode: '06611' },
+    destinations: [
+      {
+        address1: '35 Saxony Drive',
+        address2: '',
+        city: 'Trumbull',
+        province: 'CT',
+        country: 'US',
+        zip: '06611',
+      },
     ],
     coverage: {
       scanned: 4,
@@ -71,29 +78,43 @@ test('debouncer executes only the latest scheduled callback', () => {
   assert.deepEqual(calls, ['second'])
 })
 
-test('cart fingerprint change aborts before another zone begins', async () => {
+test('cart fingerprint change aborts before another destination begins', async () => {
   const controller = new AbortController()
   let fingerprintReads = 0
   const started = []
-  const twoZones = policy({
+  const twoDestinations = policy({
     concurrency: 1,
-    zones: [
-      { countryCode: 'US', provinceCode: 'CT', postalCode: '06611' },
-      { countryCode: 'US', provinceCode: 'CA', postalCode: '92647' },
+    destinations: [
+      {
+        address1: '35 Saxony Drive',
+        address2: '',
+        city: 'Trumbull',
+        province: 'CT',
+        country: 'US',
+        zip: '06611',
+      },
+      {
+        address1: '16691 Gothard Street',
+        address2: 'Suite Q',
+        city: 'Huntington Beach',
+        province: 'CA',
+        country: 'US',
+        zip: '92647',
+      },
     ],
   })
 
   await assert.rejects(
-    warmAllZones({
-      policy: twoZones,
+    warmAllDestinations({
+      policy: twoDestinations,
       expectedFingerprint: FINGERPRINT,
       controller,
       readFingerprint: async () => {
         fingerprintReads += 1
         return fingerprintReads === 1 ? FINGERPRINT : 'b'.repeat(64)
       },
-      warmZone: async ({ zone, guard }) => {
-        started.push(zone.postalCode)
+      warmDestination: async ({ destination, guard }) => {
+        started.push(destination.zip)
         await guard()
         await guard()
       },
@@ -105,20 +126,54 @@ test('cart fingerprint change aborts before another zone begins', async () => {
   assert.deepEqual(started, ['06611'])
 })
 
-test('all deduplicated zones run and an ordinary zone error is isolated', async () => {
+test('all full destinations run and an ordinary address error is isolated', async () => {
   const seen = []
-  const zones = [
-    { countryCode: 'us', provinceCode: 'ct', postalCode: ' 06611 ' },
-    { countryCode: 'US', provinceCode: 'CT', postalCode: '06611' },
-    { countryCode: 'US', provinceCode: 'CA', postalCode: '92647' },
-    { countryCode: 'CA', provinceCode: 'ON', postalCode: 'm5v 2t6' },
+  const destinations = [
+    {
+      address1: '35 Saxony Drive',
+      address2: '',
+      city: 'Trumbull',
+      province: 'CT',
+      country: 'US',
+      zip: '06611',
+    },
+    {
+      address1: '35  SAXONY drive',
+      address2: '',
+      city: 'TRUMBULL',
+      province: 'CT',
+      country: 'US',
+      zip: '06611',
+    },
+    {
+      address1: '16691 Gothard Street',
+      address2: 'Suite Q',
+      city: 'Huntington Beach',
+      province: 'CA',
+      country: 'US',
+      zip: '92647',
+    },
+    {
+      address1: '100 King Street West',
+      address2: '',
+      city: 'Toronto',
+      province: 'ON',
+      country: 'CA',
+      zip: 'M5V 2T6',
+    },
   ]
 
-  const results = await processZones(zones, 2, async (zone) => {
-    seen.push(`${zone.countryCode}:${zone.postalCode}`)
-    if (zone.postalCode === '92647') throw new Error('zone unavailable')
-    return zone.postalCode
-  })
+  const results = await processDestinations(
+    destinations,
+    2,
+    async (destination) => {
+      seen.push(`${destination.country}:${destination.zip}`)
+      if (destination.zip === '92647') {
+        throw new Error('destination unavailable')
+      }
+      return destination.zip
+    },
+  )
 
   assert.deepEqual(seen.sort(), [
     'CA:M5V 2T6',
@@ -130,61 +185,101 @@ test('all deduplicated zones run and an ordinary zone error is isolated', async 
   assert.equal(results.filter((result) => !result.ok).length, 1)
 })
 
-test('zone identity is country plus postal with deterministic province hint', () => {
+test('full destination identity retains different streets in one ZIP', () => {
   const values = [
-    { countryCode: 'US', provinceCode: 'NY', postalCode: '90210' },
-    { countryCode: 'us', provinceCode: 'CA', postalCode: ' 90210 ' },
-  ]
-  const expected = [
-    { countryCode: 'US', provinceCode: 'CA', postalCode: '90210' },
+    {
+      address1: '100 Main Street',
+      address2: '',
+      city: 'Beverly Hills',
+      province: 'CA',
+      country: 'US',
+      zip: '90210',
+    },
+    {
+      address1: '200 Main Street',
+      address2: '',
+      city: 'Beverly Hills',
+      province: 'CA',
+      country: 'US',
+      zip: '90210',
+    },
+    {
+      address1: '100  MAIN street',
+      address2: '',
+      city: 'BEVERLY HILLS',
+      province: 'CA',
+      country: 'US',
+      zip: '90210',
+    },
   ]
 
-  assert.deepEqual(dedupeZones(values), expected)
-  assert.deepEqual(dedupeZones([...values].reverse()), expected)
+  assert.deepEqual(dedupeDestinations(values), values.slice(0, 2))
 })
 
-test('bounded workers process every returned zone without slicing', async () => {
-  const zones = Array.from({ length: 300 }, (_, index) => ({
-    countryCode: 'US',
-    provinceCode: 'CT',
-    postalCode: `ZONE-${String(index).padStart(3, '0')}`,
+test('bounded workers process every returned destination without slicing', async () => {
+  const destinations = Array.from({ length: 250 }, (_, index) => ({
+    address1: `${index + 1} Test Street`,
+    address2: '',
+    city: 'Trumbull',
+    province: 'CT',
+    country: 'US',
+    zip: '06611',
   }))
   const seen = new Set()
   let active = 0
   let maximumActive = 0
-  const results = await processZones(zones, 4, async (zone) => {
-    active += 1
-    maximumActive = Math.max(maximumActive, active)
-    seen.add(zone.postalCode)
-    await Promise.resolve()
-    active -= 1
-  })
+  const results = await processDestinations(
+    destinations,
+    4,
+    async (destination) => {
+      active += 1
+      maximumActive = Math.max(maximumActive, active)
+      seen.add(destination.address1)
+      await Promise.resolve()
+      active -= 1
+    },
+  )
 
-  assert.equal(results.length, 300)
-  assert.equal(seen.size, 300)
+  assert.equal(results.length, 250)
+  assert.equal(seen.size, 250)
   assert.equal(maximumActive, 4)
 })
 
-test('locale-aware cart and shipping-rate URLs use Shopify Ajax fields', () => {
+test('locale-aware cart and shipping-rate URLs use the full Shopify address', () => {
   assert.equal(cartUrl('/fr-ca/'), '/fr-ca/cart.js')
   const prepare = new URL(
     shippingRateUrl('/fr-ca/', 'prepare', {
-      countryCode: 'ca',
-      provinceCode: 'qc',
-      postalCode: 'h2x 1y4',
+      address1: '500 Rue Saint-Jacques',
+      address2: 'Bureau 200',
+      city: 'Montréal',
+      province: 'QC',
+      country: 'CA',
+      zip: 'H2Y 1S1',
     }),
     'https://store.example',
   )
   assert.equal(prepare.pathname, '/fr-ca/cart/prepare_shipping_rates.json')
+  assert.equal(
+    prepare.searchParams.get('shipping_address[address1]'),
+    '500 Rue Saint-Jacques',
+  )
+  assert.equal(
+    prepare.searchParams.get('shipping_address[address2]'),
+    'Bureau 200',
+  )
+  assert.equal(prepare.searchParams.get('shipping_address[city]'), 'Montréal')
   assert.equal(prepare.searchParams.get('shipping_address[country]'), 'CA')
   assert.equal(prepare.searchParams.get('shipping_address[province]'), 'QC')
-  assert.equal(prepare.searchParams.get('shipping_address[zip]'), 'H2X 1Y4')
+  assert.equal(prepare.searchParams.get('shipping_address[zip]'), 'H2Y 1S1')
 
   const asynchronous = new URL(
     shippingRateUrl('/', 'async', {
-      countryCode: 'US',
-      provinceCode: null,
-      postalCode: '06611',
+      address1: '35 Saxony Drive',
+      address2: '',
+      city: 'Trumbull',
+      province: '',
+      country: 'US',
+      zip: '06611',
     }),
     'https://store.example',
   )
@@ -238,7 +333,7 @@ test('policy responses fail closed on disabled or mismatched state', () => {
   )
   assert.equal(normalizePolicy(policy({ coverage: undefined }), FINGERPRINT), null)
   const normalized = normalizePolicy(policy(), FINGERPRINT)
-  assert.equal(normalized?.zones.length, 1)
+  assert.equal(normalized?.destinations.length, 1)
   assert.deepEqual(normalized?.coverage, {
     scanned: 4,
     eligible: 3,
@@ -248,7 +343,7 @@ test('policy responses fail closed on disabled or mismatched state', () => {
   })
 })
 
-test('aggregate status event exposes counts without zones or private facts', () => {
+test('aggregate status event exposes counts without destinations or private facts', () => {
   const events = []
   class TestCustomEvent {
     constructor(type, options) {
@@ -265,12 +360,26 @@ test('aggregate status event exposes counts without zones or private facts', () 
   const results = [
     {
       ok: true,
-      zone: { countryCode: 'US', provinceCode: 'CT', postalCode: '06611' },
+      destination: {
+        address1: '35 Saxony Drive',
+        address2: '',
+        city: 'Trumbull',
+        province: 'CT',
+        country: 'US',
+        zip: '06611',
+      },
       value: [{ name: 'Private carrier fact' }],
     },
     {
       ok: false,
-      zone: { countryCode: 'US', provinceCode: 'CA', postalCode: '90210' },
+      destination: {
+        address1: '100 Private Street',
+        address2: '',
+        city: 'Beverly Hills',
+        province: 'CA',
+        country: 'US',
+        zip: '90210',
+      },
       error: new Error('Private provider failure'),
     },
   ]
@@ -291,12 +400,14 @@ test('aggregate status event exposes counts without zones or private facts', () 
       invalid: 0,
       unsupported: 0,
     },
-    zones: { attempted: 2, succeeded: 1, failed: 1 },
+    destinations: { attempted: 2, succeeded: 1, failed: 1 },
     runs: { completed: 1, failed: 0, aborted: 0 },
   })
   const serialized = JSON.stringify(events[0].detail)
   assert.equal(serialized.includes('06611'), false)
   assert.equal(serialized.includes('90210'), false)
+  assert.equal(serialized.includes('Saxony'), false)
+  assert.equal(serialized.includes('Beverly'), false)
   assert.equal(serialized.includes('Private'), false)
   assert.equal(dispatchRateWarmStatus(windowObject, {
     status: 'completed',
@@ -323,8 +434,8 @@ test('non-success proxy responses return no policy', async () => {
 test('shipping-rate polling tolerates late completion inside the 12 second window', async () => {
   let asyncReads = 0
   const methods = []
-  const rates = await warmShippingZone({
-    zone: { countryCode: 'US', provinceCode: 'CT', postalCode: '06611' },
+  const rates = await warmShippingDestination({
+    destination: policy().destinations[0],
     routesRoot: '/en/',
     guard: async () => {},
     signal: new AbortController().signal,
@@ -355,8 +466,8 @@ test('shipping-rate polling tolerates late completion inside the 12 second windo
 test('shipping-rate polling has a deterministic bounded timeout', async () => {
   let asyncReads = 0
   await assert.rejects(
-    warmShippingZone({
-      zone: { countryCode: 'US', provinceCode: 'CT', postalCode: '06611' },
+    warmShippingDestination({
+      destination: policy().destinations[0],
       routesRoot: '/',
       guard: async () => {},
       signal: new AbortController().signal,
@@ -384,8 +495,8 @@ test('aborting the shared controller stops an in-flight Ajax request', async () 
   const started = new Promise((resolve) => {
     requestStarted = resolve
   })
-  const pending = warmShippingZone({
-    zone: { countryCode: 'US', provinceCode: 'CT', postalCode: '06611' },
+  const pending = warmShippingDestination({
+    destination: policy().destinations[0],
     routesRoot: '/',
     guard: async () => {},
     signal: controller.signal,

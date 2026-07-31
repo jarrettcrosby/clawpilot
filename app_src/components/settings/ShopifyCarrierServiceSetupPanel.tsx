@@ -19,6 +19,8 @@ import IntegrationSetupJourney, {
   type IntegrationSetupStep,
   type IntegrationSetupStepState,
 } from '@/components/settings/IntegrationSetupJourney'
+import ShopifyCustomerRatePolicyPanel
+  from '@/components/settings/ShopifyCustomerRatePolicyPanel'
 
 type Provider = 'ups_rest' | 'fedex_rest'
 type PlanRateObjective =
@@ -160,6 +162,29 @@ type ShopifyCarrierServiceSetup = {
     activationAllowed: boolean
     reason: string
   }
+  checkoutAudience: {
+    state:
+      | 'shadow_binary_ready'
+      | 'shadow_customer_required'
+      | 'active_default_ready_provider_overrides_blocked'
+      | 'inactive'
+    defaultPolicy: 'show_all' | 'hide_all'
+    policyCount: number
+    unexpiredShadowPolicyCount: number
+    shadowAllowedCustomerCount: number
+    expiredShadowPolicyCount: number
+    blockedPolicyCount: number
+    enforcedPolicyCount: number
+    earliestShadowExpiresAt: string | null
+    shadowBinaryTestReady: boolean
+    providerEnforcementState:
+      | 'shadow_simulated'
+      | 'active_blocked'
+      | 'inactive_blocked'
+    providerEnforcementAvailable: false
+    providerWritesPerformed: 0
+    providerEnforcementRequirement: string
+  }
   shadowSimulation: {
     globalId: string
     operation: 'create' | 'delete'
@@ -293,6 +318,7 @@ type ShopifyCarrierServiceSetup = {
   }
   callbackUrl: string | null
   canActivate: boolean
+  canManage: boolean
   boundaries: {
     checkoutCustomerFieldsPersisted: false
     providerWritesDuringCallback: 0
@@ -630,6 +656,17 @@ export default function ShopifyCarrierServiceSetupPanel({
   ) || null
   const evidenceComplete =
     (setup?.reference.evidence.succeededReceipts || 0) > 0
+  const checkoutAudience = setup?.checkoutAudience || null
+  const shadowAudienceReady = Boolean(
+    checkoutAudience?.shadowBinaryTestReady,
+  )
+  const activeAudienceReady =
+    setup?.reference.activation.state === 'active'
+  const checkoutAudienceReady = shadowAudienceReady || activeAudienceReady
+  const rateWarmConfigured = Boolean(
+    setup?.config?.checkoutRateWarm.enabled
+    && setup.rateWarmReadiness.activationAllowed,
+  )
 
   const saveConfig = () => run('save-config', {
     warehouseGlobalId,
@@ -657,7 +694,7 @@ export default function ShopifyCarrierServiceSetupPanel({
   }, 'The tenant carton-plan and rate objective was saved without changing the registered Shopify service.')
   const saveRateWarmPolicy = () => run('save-rate-warm-policy', {
     checkoutRateWarm,
-  }, 'The disabled tenant checkout rate-warming policy was saved without changing the registered Shopify service.')
+  }, 'The disabled saved-address rate cache-preparation policy was saved without changing the registered Shopify service.')
 
   if (loading && !setup) {
     return (
@@ -880,143 +917,6 @@ export default function ShopifyCarrierServiceSetupPanel({
           ) : null}
         </Stack>
       </Box>
-      <Box>
-        <Typography variant="body2" fontWeight={700}>
-          Checkout rate warming
-        </Typography>
-        <Typography variant="caption" color="text.secondary">
-          Prepares customer-neutral checkout quotes for every saved rate zone.
-          No customer ID or destination address is stored in this policy.
-        </Typography>
-        <Alert severity="info" sx={{ mt: 1 }}>
-          {setup?.rateWarmReadiness.reason
-            || 'Checkout rate warming remains disabled until durable Shopify Delivery Customization readiness is available.'}
-        </Alert>
-        <Stack spacing={1} sx={{ mt: 1 }}>
-          <FormControlLabel
-            control={(
-              <Checkbox
-                size="small"
-                checked={checkoutRateWarm.enabled}
-                disabled={
-                  !rateWarmPolicyEditable
-                  || setup?.rateWarmReadiness.activationAllowed !== true
-                }
-                onChange={(event) => setCheckoutRateWarm((current) => ({
-                  ...current,
-                  enabled: event.target.checked,
-                }))}
-              />
-            )}
-            label="Enable storefront checkout rate warming"
-          />
-          <TextField
-            size="small"
-            fullWidth
-            label="Storefront mode (v1)"
-            value="Shopify hosted AJAX"
-            disabled
-            helperText="Version 1 warms rates through Shopify hosted Online Store AJAX endpoints."
-          />
-          <TextField
-            size="small"
-            fullWidth
-            label="Rate-zone scope"
-            value={checkoutRateWarm.zoneScope}
-            disabled
-            helperText="Version 1 always processes all saved rate zones; zones are never silently truncated."
-          />
-          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
-            <TextField
-              size="small"
-              fullWidth
-              type="number"
-              label="Concurrency"
-              value={checkoutRateWarm.concurrency}
-              disabled={!rateWarmPolicyEditable}
-              inputProps={{ min: 1, max: 8, step: 1 }}
-              helperText="Bounded to 1–8 concurrent requests."
-              onChange={(event) => setCheckoutRateWarm((current) => ({
-                ...current,
-                concurrency: Math.min(
-                  8,
-                  Math.max(1, Number(event.target.value) || 1),
-                ),
-              }))}
-            />
-            <TextField
-              size="small"
-              fullWidth
-              type="number"
-              label="Debounce (ms)"
-              value={checkoutRateWarm.debounceMs}
-              disabled={!rateWarmPolicyEditable}
-              inputProps={{ min: 0, max: 5_000, step: 50 }}
-              helperText="Bounded to 0–5,000 ms."
-              onChange={(event) => setCheckoutRateWarm((current) => ({
-                ...current,
-                debounceMs: Math.min(
-                  5_000,
-                  Math.max(0, Number(event.target.value) || 0),
-                ),
-              }))}
-            />
-            <TextField
-              size="small"
-              fullWidth
-              type="number"
-              label="Minimum interval (ms)"
-              value={checkoutRateWarm.minIntervalMs}
-              disabled={!rateWarmPolicyEditable}
-              inputProps={{ min: 250, max: 60_000, step: 250 }}
-              helperText="Bounded to 250–60,000 ms."
-              onChange={(event) => setCheckoutRateWarm((current) => ({
-                ...current,
-                minIntervalMs: Math.min(
-                  60_000,
-                  Math.max(250, Number(event.target.value) || 250),
-                ),
-              }))}
-            />
-          </Stack>
-          <TextField
-            size="small"
-            fullWidth
-            label="Supported country (v1)"
-            value="United States (US)"
-            disabled
-            helperText="Version 1 supports United States rate zones only."
-          />
-          <FormControlLabel
-            control={(
-              <Checkbox
-                size="small"
-                checked={checkoutRateWarm.staleCartAbort}
-                disabled
-              />
-            )}
-            label="Abort queued work when the cart changes (required)"
-          />
-          {setup?.config ? (
-            <Typography variant="caption" color="text.secondary">
-              Saved policy revision {setup.config.policyRevision}; changing
-              this policy invalidates prior checkout cache and retry fences.
-            </Typography>
-          ) : null}
-          {registered ? (
-            <Button
-              size="small"
-              variant="outlined"
-              disabled={!rateWarmPolicyEditable}
-              onClick={() => void saveRateWarmPolicy()}
-            >
-              {busy === 'save-rate-warm-policy'
-                ? 'Saving warming policy…'
-                : 'Save warming policy only'}
-            </Button>
-          ) : null}
-        </Stack>
-      </Box>
       <Button
         variant="contained"
         disabled={!bindingsReady || Boolean(busy) || Boolean(registered)}
@@ -1025,6 +925,157 @@ export default function ShopifyCarrierServiceSetupPanel({
         {busy === 'save-config' ? 'Saving…' : 'Save exact callback setup'}
       </Button>
     </Stack>
+  )
+
+  const rateWarmAction = (
+    <Box>
+      <Typography variant="body2" fontWeight={700}>
+        Saved-address rate cache preparation
+      </Typography>
+      <Typography variant="caption" color="text.secondary">
+        Processes every distinct complete U.S. saved destination in the
+        background to prime Shopify&apos;s checkout-rate cache.
+        Carrier-relevant address fields are used only for Shopify&apos;s Ajax
+        request; the browser emits aggregate counts only.
+      </Typography>
+      <Alert severity="info" sx={{ mt: 1 }}>
+        {setup?.rateWarmReadiness.reason
+          || 'A verified sandbox Shopify account in Operations Shadow is required.'}
+      </Alert>
+      <Alert severity="warning" sx={{ mt: 1 }}>
+        This is only a bounded, isolated allowlisted test-variant proof.
+        Shopify does not
+        guarantee Customer GID in a CarrierService callback, and its
+        successful-rate cache is customer-neutral. Cache preparation is not
+        an order quote, does not select a service, and must not be treated as
+        deterministic customer enforcement. An unidentified or expired
+        Shadow callback fails closed.
+      </Alert>
+      <Stack spacing={1} sx={{ mt: 1 }}>
+        <FormControlLabel
+          control={(
+            <Checkbox
+              size="small"
+              checked={checkoutRateWarm.enabled}
+              disabled={
+                !rateWarmPolicyEditable
+                || setup?.rateWarmReadiness.activationAllowed !== true
+              }
+              onChange={(event) => setCheckoutRateWarm((current) => ({
+                ...current,
+                enabled: event.target.checked,
+              }))}
+            />
+          )}
+          label="Enable saved-address rate cache preparation"
+        />
+        <TextField
+          size="small"
+          fullWidth
+          label="Storefront mode (v1)"
+          value="Shopify hosted AJAX"
+          disabled
+          helperText="Version 1 warms rates through Shopify hosted Online Store AJAX endpoints."
+        />
+        <TextField
+          size="small"
+          fullWidth
+          label="Saved-address scope"
+          value={checkoutRateWarm.zoneScope}
+          disabled
+          helperText="Version 1 processes every distinct complete U.S. saved destination in the background; addresses are never silently truncated."
+        />
+        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+          <TextField
+            size="small"
+            fullWidth
+            type="number"
+            label="Concurrency"
+            value={checkoutRateWarm.concurrency}
+            disabled={!rateWarmPolicyEditable}
+            inputProps={{ min: 1, max: 8, step: 1 }}
+            helperText="Bounded to 1–8 concurrent requests."
+            onChange={(event) => setCheckoutRateWarm((current) => ({
+              ...current,
+              concurrency: Math.min(
+                8,
+                Math.max(1, Number(event.target.value) || 1),
+              ),
+            }))}
+          />
+          <TextField
+            size="small"
+            fullWidth
+            type="number"
+            label="Debounce (ms)"
+            value={checkoutRateWarm.debounceMs}
+            disabled={!rateWarmPolicyEditable}
+            inputProps={{ min: 0, max: 5_000, step: 50 }}
+            helperText="Bounded to 0–5,000 ms."
+            onChange={(event) => setCheckoutRateWarm((current) => ({
+              ...current,
+              debounceMs: Math.min(
+                5_000,
+                Math.max(0, Number(event.target.value) || 0),
+              ),
+            }))}
+          />
+          <TextField
+            size="small"
+            fullWidth
+            type="number"
+            label="Minimum interval (ms)"
+            value={checkoutRateWarm.minIntervalMs}
+            disabled={!rateWarmPolicyEditable}
+            inputProps={{ min: 250, max: 60_000, step: 250 }}
+            helperText="Bounded to 250–60,000 ms."
+            onChange={(event) => setCheckoutRateWarm((current) => ({
+              ...current,
+              minIntervalMs: Math.min(
+                60_000,
+                Math.max(250, Number(event.target.value) || 250),
+              ),
+            }))}
+          />
+        </Stack>
+        <TextField
+          size="small"
+          fullWidth
+          label="Supported country (v1)"
+          value="United States (US)"
+          disabled
+          helperText="Version 1 supports United States destinations only."
+        />
+        <FormControlLabel
+          control={(
+            <Checkbox
+              size="small"
+              checked={checkoutRateWarm.staleCartAbort}
+              disabled
+            />
+          )}
+          label="Abort queued work when the cart changes (required)"
+        />
+        {setup?.config ? (
+          <Typography variant="caption" color="text.secondary">
+            Saved policy revision {setup.config.policyRevision}; changing this
+            policy invalidates prior checkout cache and retry fences.
+          </Typography>
+        ) : null}
+        {registered ? (
+          <Button
+            size="small"
+            variant="outlined"
+            disabled={!rateWarmPolicyEditable}
+            onClick={() => void saveRateWarmPolicy()}
+          >
+            {busy === 'save-rate-warm-policy'
+              ? 'Saving cache-preparation policy…'
+              : 'Save cache-preparation policy only'}
+          </Button>
+        ) : null}
+      </Stack>
+    </Box>
   )
 
   const steps: IntegrationSetupStep[] = [
@@ -1575,13 +1626,128 @@ export default function ShopifyCarrierServiceSetupPanel({
       ),
     },
     {
+      key: 'audience',
+      label: setup?.reference.activation.state === 'shadow'
+        ? 'Select the Shadow checkout audience'
+        : 'Confirm the checkout audience',
+      description: setup?.reference.activation.state === 'shadow'
+        ? 'Select at least one exact authenticated Shopify customer before cache preparation or live-cart proof. Shadow can test binary allow or hide only; it does not provide live per-service filtering.'
+        : setup?.reference.activation.state === 'active'
+          ? 'Active defaults to the complete eligible customer-neutral service set for guests and authenticated customers. Customer-specific and per-service provider enforcement remains blocked.'
+          : 'Checkout-audience changes require Operations Shadow or Active.',
+      state: stepState(
+        Boolean(setup?.config && checkoutAudienceReady),
+        Boolean(setup?.config),
+        Boolean(
+          setup?.config
+          && setup.reference.activation.state === 'shadow'
+          && !shadowAudienceReady,
+        ),
+      ),
+      facts: [
+        {
+          label: 'Default audience policy',
+          value: checkoutAudience?.defaultPolicy === 'show_all'
+            ? 'Show all eligible rates'
+            : 'Hide all ClawPilot rates',
+        },
+        {
+          label: 'Saved customer policies',
+          value: String(checkoutAudience?.policyCount || 0),
+        },
+        {
+          label: 'Unexpired Shadow allow customers',
+          value: String(
+            checkoutAudience?.shadowAllowedCustomerCount || 0,
+          ),
+        },
+        {
+          label: 'Provider enforcement',
+          value: checkoutAudience?.providerEnforcementAvailable
+            ? 'Available'
+            : 'Blocked',
+        },
+      ],
+      action: setup ? (
+        <Stack spacing={1}>
+          <Alert severity={shadowAudienceReady ? 'info' : 'warning'}>
+            {setup.reference.activation.state === 'shadow'
+              ? 'Only binary allow or hide is testable in Shadow. Any unexpired non-hide policy admits the complete customer-neutral ClawPilot service set; hide-all denies it. Include-only and exclude selections remain saved intent and do not filter live services.'
+              : setup.reference.activation.state === 'active'
+                ? 'Active serves the complete eligible customer-neutral service set by default. Saved customer-specific and per-service policies are not live provider enforcement.'
+                : 'Customer-rate policies are review-only in the current Operations mode.'}
+          </Alert>
+          <Alert severity="warning">
+            {checkoutAudience?.providerEnforcementRequirement
+              || 'Customer-specific and per-service Shopify enforcement requires an eligible Delivery Customization delivered by a limited-visibility public app or a custom app on Shopify Plus, followed by provider activation and verification.'}
+          </Alert>
+          <ShopifyCustomerRatePolicyPanel
+            accountGlobalId={accountGlobalId}
+            activationState={setup.reference.activation.state}
+            canManage={setup.canManage}
+          />
+          <Button
+            size="small"
+            variant="outlined"
+            disabled={loading || Boolean(busy)}
+            onClick={() => void load()}
+          >
+            {loading
+              ? 'Refreshing audience status…'
+              : 'Refresh checkout-audience status'}
+          </Button>
+        </Stack>
+      ) : null,
+    },
+    {
+      key: 'rate-warm',
+      label: 'Prepare saved-address rate cache',
+      description:
+        'Optional best-effort cache preparation follows customer selection. It never replaces the authoritative live checkout callback and does not prove customer-specific enforcement.',
+      optional: true,
+      state: stepState(
+        rateWarmConfigured,
+        Boolean(shadowRegistered && shadowAudienceReady),
+        Boolean(
+          setup?.config?.checkoutRateWarm.enabled
+          && setup.rateWarmReadiness.activationAllowed !== true,
+        ),
+      ),
+      facts: [
+        {
+          label: 'Audience prerequisite',
+          value: shadowAudienceReady ? 'Ready' : 'Select an allowed customer',
+        },
+        {
+          label: 'Cache preparation',
+          value: setup?.config?.checkoutRateWarm.enabled
+            ? 'Enabled'
+            : 'Disabled',
+        },
+      ],
+      action: rateWarmAction,
+    },
+    {
       key: 'evidence',
       label: 'Prove a live cart request',
-      description:
-        'Create a cart for Jarrett+warehouse@episcs.com. ClawPilot should retain a customer-neutral receipt, inventory-aware package plan, and whole-shipment carrier offers with zero provider writes.',
+      description: setup?.reference.activation.state === 'active'
+        ? 'Create any eligible cart. ClawPilot should retain a customer-neutral receipt, inventory-aware package plan, and whole-shipment carrier offers with zero callback provider writes.'
+        : 'Use a signed-in Shopify customer covered by an unexpired Checkout audience allow policy and the isolated allowlisted test item. ClawPilot should retain a customer-neutral receipt, inventory-aware package plan, and whole-shipment carrier offers with zero callback provider writes.',
       state: stepState(
         evidenceComplete,
-        Boolean(shadowRegistered),
+        Boolean(
+          (shadowRegistered && shadowAudienceReady)
+          || (
+            activeAudienceReady
+            && registered
+            && setup?.config?.ready === true
+          ),
+        ),
+        Boolean(
+          shadowRegistered
+          && setup?.reference.activation.state === 'shadow'
+          && !shadowAudienceReady,
+        ),
       ),
       facts: [
         {

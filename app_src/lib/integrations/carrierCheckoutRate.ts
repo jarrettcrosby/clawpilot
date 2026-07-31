@@ -745,8 +745,9 @@ function alternativeFailureCode(error: unknown) {
  * Rates the first feasible plan as the authoritative baseline. Optional
  * bounded alternatives are then rated best-effort under a separate deadline.
  * Every successful candidate is still one complete multi-package shipment:
- * provider services are never stitched package-by-package. Baseline failure
- * (including a missing required carrier) fails closed; an optional candidate
+ * provider services are never stitched package-by-package. A baseline fails
+ * closed when no provider succeeds or degraded-provider evidence is missing.
+ * Otherwise partial provider success remains eligible; an optional candidate
  * failure is retained as degraded decision evidence.
  */
 export async function rateOptimizedCheckoutPlans(input: {

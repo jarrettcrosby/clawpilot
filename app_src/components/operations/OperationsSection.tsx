@@ -66,6 +66,9 @@ import type {
   OperationsOrderStatus,
   OperationsPackingSlipCommandResult,
   OperationsSandboxLabelCommandResult,
+  OperationsShadowFulfillmentExecutionResult,
+  OperationsShadowFulfillmentPreparation,
+  OperationsShadowFulfillmentPreparationStage,
   OperationsShipmentCommandResult,
   OperationsWorkspace,
 } from '@/lib/operations/types'
@@ -94,6 +97,7 @@ type OperationsPayload = {
     | OperationsOrderCommandResult
     | OperationsPackingSlipCommandResult
     | OperationsSandboxLabelCommandResult
+    | OperationsShadowFulfillmentExecutionResult
     | OperationsShipmentCommandResult
 }
 
@@ -391,9 +395,332 @@ function DetailSection({ title, children }: { title: string; children: React.Rea
   )
 }
 
+function shadowProviderName(provider: 'ups_rest' | 'fedex_rest') {
+  return provider === 'ups_rest' ? 'UPS' : 'FedEx'
+}
+
+function ShadowPreparationStageCard({
+  title,
+  stage,
+}: {
+  title: string
+  stage: OperationsShadowFulfillmentPreparationStage
+}) {
+  const { measurementSystem } = useMeasurementSystem()
+  return (
+    <Box
+      sx={{
+        minWidth: 0,
+        p: 1.5,
+        border: '1px solid rgba(255,255,255,0.12)',
+        borderRadius: '8px',
+      }}
+    >
+      <Typography fontWeight={700}>{title}</Typography>
+      <Typography
+        variant="caption"
+        color="text.secondary"
+        sx={{ overflowWrap: 'anywhere' }}
+      >
+        {stage.runGlobalId} · {stage.packageCount}{' '}
+        {stage.packageCount === 1 ? 'package' : 'packages'}
+      </Typography>
+      <Box sx={{ mt: 1.25 }}>
+        <Typography variant="caption" color="text.secondary">
+          Selected whole-shipment rate
+        </Typography>
+        <Typography fontWeight={600} sx={{ overflowWrap: 'anywhere' }}>
+          {shadowProviderName(stage.selectedRate.provider)} ·{' '}
+          {stage.selectedRate.serviceName}
+        </Typography>
+        <Typography variant="body2" color="text.secondary">
+          Carrier estimate {money(
+            stage.selectedRate.carrierCostMinor,
+            stage.selectedRate.currency,
+          )} · Customer charge {money(
+            stage.selectedRate.customerChargeMinor,
+            stage.selectedRate.currency,
+          )}
+        </Typography>
+      </Box>
+      <Stack spacing={1} sx={{ mt: 1.5 }}>
+        {stage.packages.map((item) => (
+          <Box
+            key={item.packageKey}
+            sx={{
+              minWidth: 0,
+              p: 1.25,
+              backgroundColor: 'rgba(255,255,255,0.035)',
+              borderRadius: '6px',
+            }}
+          >
+            <Stack
+              direction={{ xs: 'column', sm: 'row' }}
+              justifyContent="space-between"
+              gap={0.5}
+            >
+              <Box sx={{ minWidth: 0 }}>
+                <Typography variant="body2" fontWeight={700}>
+                  Package {item.sequence}: {item.materialName}
+                </Typography>
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  sx={{ overflowWrap: 'anywhere' }}
+                >
+                  {item.packageKey} · {item.materialCode}
+                </Typography>
+              </Box>
+              <Box sx={{ minWidth: 0, textAlign: { sm: 'right' } }}>
+                <Typography variant="body2">
+                  {formatGrams(item.grossWeightGrams, measurementSystem, {
+                    maximumFractionDigits: 3,
+                  })}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {formatDimensionsMm({
+                    lengthMm: item.dimensionsMm.length,
+                    widthMm: item.dimensionsMm.width,
+                    heightMm: item.dimensionsMm.height,
+                  }, measurementSystem, { maximumFractionDigits: 3 })}
+                </Typography>
+              </Box>
+            </Stack>
+            <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.75 }}>
+              Content {formatGrams(item.contentWeightGrams, measurementSystem)} ·
+              {' '}Tare {formatGrams(item.tareWeightGrams, measurementSystem)}
+            </Typography>
+            <Stack divider={<Divider flexItem />} sx={{ mt: 0.75 }}>
+              {item.allocations.map((allocation) => (
+                <Box
+                  key={`${allocation.lineKey}:${allocation.productGlobalId}`}
+                  sx={{
+                    py: 0.5,
+                    display: 'grid',
+                    gridTemplateColumns: 'minmax(0, 1fr) auto',
+                    gap: 1,
+                  }}
+                >
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography variant="caption" fontWeight={600}>
+                      {allocation.title}
+                    </Typography>
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      display="block"
+                      sx={{ overflowWrap: 'anywhere' }}
+                    >
+                      Provider variant {allocation.providerVariantId} ·{' '}
+                      Stage product {allocation.productGlobalId} ·{' '}
+                      {allocation.lineKey}
+                    </Typography>
+                  </Box>
+                  <Typography variant="caption">{allocation.quantity} units</Typography>
+                </Box>
+              ))}
+            </Stack>
+          </Box>
+        ))}
+      </Stack>
+    </Box>
+  )
+}
+
+function ShadowFulfillmentPreparationPanel({
+  preparation,
+}: {
+  preparation: OperationsShadowFulfillmentPreparation
+}) {
+  const dateTime = useUserDateTime()
+  const effects = [
+    ['Provider writes', preparation.effects.providerWriteCount],
+    ['Postage purchases', preparation.effects.postagePurchaseCount],
+    ['Label writes', preparation.effects.labelWriteCount],
+    ['Commerce writes', preparation.effects.commerceWriteCount],
+  ] as const
+  return (
+    <Stack spacing={1.5} data-testid="shadow-fulfillment-preparation">
+      <Alert severity="success">
+        Shadow preparation is durable. No shipment, tracking number, carrier
+        label, postage purchase, commerce write, or final packing slip exists.
+      </Alert>
+      <Box
+        sx={{
+          display: 'grid',
+          gridTemplateColumns: { xs: 'minmax(0, 1fr)', sm: 'repeat(2, minmax(0, 1fr))' },
+          gap: 1,
+        }}
+      >
+        <Box sx={{ minWidth: 0 }}>
+          <Typography variant="caption" color="text.secondary">Execution</Typography>
+          <Typography sx={{ overflowWrap: 'anywhere' }}>
+            {preparation.executionGlobalId}
+          </Typography>
+        </Box>
+        <Box sx={{ minWidth: 0 }}>
+          <Typography variant="caption" color="text.secondary">Shipment group</Typography>
+          <Typography sx={{ overflowWrap: 'anywhere' }}>
+            {preparation.shipmentGroupGlobalId}
+          </Typography>
+        </Box>
+        <Box sx={{ minWidth: 0 }}>
+          <Typography variant="caption" color="text.secondary">Checkout receipt</Typography>
+          <Typography sx={{ overflowWrap: 'anywhere' }}>
+            {preparation.checkoutRateReceiptGlobalId}
+          </Typography>
+        </Box>
+        <Box sx={{ minWidth: 0 }}>
+          <Typography variant="caption" color="text.secondary">Prepared</Typography>
+          <Typography>
+            {formatUserDateTime(preparation.preparedAt, dateTime, {
+              year: 'numeric',
+              month: 'short',
+              day: 'numeric',
+              hour: 'numeric',
+              minute: '2-digit',
+              fallback: 'Unknown',
+            })}
+          </Typography>
+        </Box>
+      </Box>
+      <Box
+        sx={{
+          display: 'grid',
+          gridTemplateColumns: { xs: 'minmax(0, 1fr)', lg: 'repeat(2, minmax(0, 1fr))' },
+          gap: 1.5,
+        }}
+      >
+        <ShadowPreparationStageCard title="Checkout evidence" stage={preparation.checkout} />
+        <ShadowPreparationStageCard
+          title="Pre-label fulfillment evidence"
+          stage={preparation.fulfillment}
+        />
+      </Box>
+      <Box
+        sx={{
+          minWidth: 0,
+          p: 1.5,
+          border: '1px solid rgba(255,255,255,0.12)',
+          borderRadius: '8px',
+        }}
+      >
+        <Typography fontWeight={700}>Estimated variance</Typography>
+        <Box
+          sx={{
+            mt: 1,
+            display: 'grid',
+            gridTemplateColumns: { xs: 'minmax(0, 1fr)', sm: 'repeat(2, minmax(0, 1fr))' },
+            gap: 1,
+          }}
+        >
+          <Box>
+            <Typography variant="caption" color="text.secondary">Package-count change</Typography>
+            <Typography>{preparation.variance.packageCountDelta}</Typography>
+          </Box>
+          <Box>
+            <Typography variant="caption" color="text.secondary">Estimated carrier-cost change</Typography>
+            <Typography>{money(
+              preparation.variance.carrierCostVarianceMinor,
+              preparation.fulfillment.selectedRate.currency,
+            )}</Typography>
+          </Box>
+          <Box>
+            <Typography variant="caption" color="text.secondary">Estimated checkout-charge variance</Typography>
+            <Typography>{money(
+              preparation.variance.estimatedCheckoutVarianceMinor,
+              preparation.fulfillment.selectedRate.currency,
+            )}</Typography>
+          </Box>
+          <Box>
+            <Typography variant="caption" color="text.secondary">Changed evidence</Typography>
+            <Typography variant="body2">
+              {[
+                preparation.variance.allocationChanged ? 'allocations' : '',
+                preparation.variance.materialChanged ? 'materials' : '',
+                preparation.variance.serviceChanged ? 'service' : '',
+              ].filter(Boolean).join(', ') || 'None'}
+            </Typography>
+          </Box>
+        </Box>
+        {preparation.variance.causes.length > 0 && (
+          <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1, overflowWrap: 'anywhere' }}>
+            Evidence causes: {preparation.variance.causes.join(', ')}
+          </Typography>
+        )}
+      </Box>
+      <Box>
+        <Typography fontWeight={700}>Sandbox carrier attempts</Typography>
+        <Stack spacing={0.75} sx={{ mt: 0.75 }}>
+          {preparation.providerAttempts.map((attempt) => (
+            <Box
+              key={attempt.provider}
+              sx={{
+                minWidth: 0,
+                p: 1.25,
+                display: 'grid',
+                gridTemplateColumns: 'minmax(0, 1fr) auto',
+                gap: 1,
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: '6px',
+              }}
+            >
+              <Box sx={{ minWidth: 0 }}>
+                <Typography variant="body2" fontWeight={700}>
+                  {shadowProviderName(attempt.provider)} · {attempt.carrierAccountName}
+                </Typography>
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  sx={{ overflowWrap: 'anywhere' }}
+                >
+                  {attempt.carrierAccountGlobalId} · {attempt.rateEvidenceGlobalId}
+                  {attempt.failureCode ? ` · ${attempt.failureCode}` : ''}
+                </Typography>
+              </Box>
+              <Stack alignItems="flex-end" spacing={0.5}>
+                <Chip
+                  size="small"
+                  label={attempt.status}
+                  color={attempt.status === 'succeeded' ? 'success' : 'warning'}
+                />
+                {attempt.selected && <Chip size="small" label="Selected" variant="outlined" />}
+              </Stack>
+            </Box>
+          ))}
+        </Stack>
+      </Box>
+      <Box
+        sx={{
+          display: 'grid',
+          gridTemplateColumns: { xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(4, minmax(0, 1fr))' },
+          gap: 1,
+        }}
+      >
+        {effects.map(([label, count]) => (
+          <Box
+            key={label}
+            sx={{
+              minWidth: 0,
+              p: 1,
+              textAlign: 'center',
+              border: '1px solid rgba(255,255,255,0.12)',
+              borderRadius: '6px',
+            }}
+          >
+            <Typography fontWeight={700}>{count}</Typography>
+            <Typography variant="caption" color="text.secondary">{label}</Typography>
+          </Box>
+        ))}
+      </Box>
+    </Stack>
+  )
+}
+
 function OrderDetailDrawer({
   order,
   sandboxCarrierAccounts,
+  activationState,
   canExecute,
   open,
   busy,
@@ -402,6 +729,7 @@ function OrderDetailDrawer({
   onRelease,
   onConfirmPicks,
   onVerifyPack,
+  onPrepareFulfillment,
   onGeneratePackingSlip,
   onPrintPackingSlip,
   onConfirmShipment,
@@ -412,6 +740,7 @@ function OrderDetailDrawer({
 }: {
   order: OperationsOrderDetail | null
   sandboxCarrierAccounts: OperationsWorkspace['shipping']['sandboxCarrierAccounts']
+  activationState: OperationsActivationState
   canExecute: boolean
   open: boolean
   busy: boolean
@@ -420,6 +749,7 @@ function OrderDetailDrawer({
   onRelease: () => void
   onConfirmPicks: () => void
   onVerifyPack: () => void
+  onPrepareFulfillment: () => void
   onGeneratePackingSlip: (packageGlobalId: string) => void
   onPrintPackingSlip: (artifactGlobalId: string) => void
   onConfirmShipment: () => void
@@ -435,6 +765,7 @@ function OrderDetailDrawer({
   const releaseAction = order?.availableActions?.find((item) => item.action === 'release_to_warehouse')
   const confirmPicksAction = order?.availableActions?.find((item) => item.action === 'confirm_picks')
   const verifyPackAction = order?.availableActions?.find((item) => item.action === 'verify_pack')
+  const prepareFulfillmentAction = order?.availableActions?.find((item) => item.action === 'prepare_fulfillment')
   const confirmShipmentAction = order?.availableActions?.find((item) => item.action === 'confirm_shipment')
   const canPlanImportedOrder = Boolean(
     order?.status === 'imported'
@@ -448,12 +779,15 @@ function OrderDetailDrawer({
       : order?.status === 'picking'
         ? verifyPackAction
         : order?.status === 'packed'
-          ? confirmShipmentAction
+          ? activationState === 'shadow'
+            ? prepareFulfillmentAction
+            : confirmShipmentAction
           : order && !['shipped', 'cancelled'].includes(order.status)
             ? releaseAction
             : undefined
   const confirmingPicks = primaryAction?.action === 'confirm_picks'
   const verifyingPack = primaryAction?.action === 'verify_pack'
+  const preparingFulfillment = primaryAction?.action === 'prepare_fulfillment'
   const confirmingShipment = primaryAction?.action === 'confirm_shipment'
   const shipments = order?.shipments || []
   const trackingObservations = order?.trackingObservations || []
@@ -471,21 +805,31 @@ function OrderDetailDrawer({
   const unresolvedAttempt = labelAttempts.find(
     (attempt) => attempt.state === 'prepared' || attempt.state === 'unknown',
   ) || null
-  const createBlockedReason = !canExecute
-    ? 'You do not have permission to purchase carrier labels.'
-    : order?.status !== 'packed'
-      ? 'Verify package packing before creating a label.'
-      : activeLabel
-        ? 'Void the active label before creating another.'
-        : unresolvedAttempt
-          ? `Attempt ${unresolvedAttempt.globalId} requires reconciliation before another carrier command.`
-          : !selectedRate
-            ? 'Select a carrier rate before creating a label.'
-            : !selectedProvider
-              ? `${selectedRate.carrier} does not have a direct sandbox label adapter.`
-              : eligibleCarrierAccounts.length === 0
-                ? `Connect and verify a sandbox ${selectedRate.carrier} account first.`
-                : null
+  const activeExecutionRequiredReason = activationState !== 'active'
+    ? 'Carrier label create and void actions require Operations Active mode.'
+    : null
+  const createBlockedReason = activeExecutionRequiredReason
+    || (!canExecute
+      ? 'You do not have permission to purchase carrier labels.'
+      : order?.status !== 'packed'
+        ? 'Verify package packing before creating a label.'
+        : activeLabel
+          ? 'Void the active label before creating another.'
+          : unresolvedAttempt
+            ? `Attempt ${unresolvedAttempt.globalId} requires reconciliation before another carrier command.`
+            : !selectedRate
+              ? 'Select a carrier rate before creating a label.'
+              : !selectedProvider
+                ? `${selectedRate.carrier} does not have a direct sandbox label adapter.`
+                : eligibleCarrierAccounts.length === 0
+                  ? `Connect and verify a sandbox ${selectedRate.carrier} account first.`
+                  : null)
+  const voidBlockedReason = activeExecutionRequiredReason
+    || (!canExecute
+      ? 'You do not have permission to void carrier labels.'
+      : unresolvedAttempt
+        ? `Attempt ${unresolvedAttempt.globalId} requires reconciliation before a carrier command.`
+        : null)
 
   return (
     <Drawer
@@ -520,7 +864,14 @@ function OrderDetailDrawer({
       {!order ? (
         <Box sx={{ p: 4, display: 'flex', justifyContent: 'center' }}><CircularProgress size={28} /></Box>
       ) : (
-        <Box sx={{ px: { xs: 2, sm: 3 }, py: 2.5, pb: 5, overflowY: 'auto' }}>
+        <Box sx={{
+          minWidth: 0,
+          px: { xs: 2, sm: 3 },
+          py: 2.5,
+          pb: 5,
+          overflowX: 'hidden',
+          overflowY: 'auto',
+        }}>
           <Stack spacing={3}>
             <DetailSection title="Overview">
               <Box sx={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 1.5 }}>
@@ -582,9 +933,11 @@ function OrderDetailDrawer({
                   ? 'Confirm every ready pick task and complete the released wave'
                   : verifyingPack
                     ? 'Verify the carton plan and record package-level billing evidence'
-                    : confirmingShipment
-                      ? 'Consume reserved inventory, create the shipment and packing slip, seed tracking, and export fulfillment'
-                    : 'Create a released warehouse wave and ready pick tasks')}>
+                    : preparingFulfillment
+                      ? 'Rerate the exact sealed packages with UPS and FedEx and store zero-write Shadow evidence'
+                      : confirmingShipment
+                        ? 'Consume reserved inventory, create the shipment and packing slip, seed tracking, and export fulfillment'
+                        : 'Create a released warehouse wave and ready pick tasks')}>
                   <span>
                     <Button
                       fullWidth
@@ -595,26 +948,32 @@ function OrderDetailDrawer({
                           ? <TaskAltRounded />
                           : verifyingPack
                             ? <Inventory2Rounded />
-                            : confirmingShipment
-                              ? <LocalShippingRounded />
-                              : <WarehouseRounded />}
+                            : preparingFulfillment
+                              ? <ScienceRounded />
+                              : confirmingShipment
+                                ? <LocalShippingRounded />
+                                : <WarehouseRounded />}
                       disabled={!primaryAction.enabled || busy}
                       onClick={confirmingPicks
                         ? onConfirmPicks
                         : verifyingPack
                           ? onVerifyPack
-                          : confirmingShipment
-                            ? onConfirmShipment
-                            : onRelease}
+                          : preparingFulfillment
+                            ? onPrepareFulfillment
+                            : confirmingShipment
+                              ? onConfirmShipment
+                              : onRelease}
                     >
                       {busy
                         ? confirmingPicks
                           ? 'Confirming picks'
                           : verifyingPack
                             ? 'Verifying packages'
-                            : confirmingShipment
-                              ? 'Confirming shipment'
-                              : 'Releasing'
+                            : preparingFulfillment
+                              ? 'Preparing shipment'
+                              : confirmingShipment
+                                ? 'Confirming shipment'
+                                : 'Releasing'
                         : primaryAction.label}
                     </Button>
                   </span>
@@ -645,14 +1004,17 @@ function OrderDetailDrawer({
                   {order.packages.map((item) => {
                     const artifact = printArtifacts.find(
                       (candidate) => (
-                        candidate.documentType === 'packing_slip'
+                        candidate.documentKind === 'pack_work_instruction'
                         && candidate.packageGlobalId === item.globalId
                         && !candidate.shipmentGlobalId
                       ),
-                    ) || printArtifacts.find(
+                    )
+                    const legacyArtifact = printArtifacts.find(
                       (candidate) => (
-                        candidate.documentType === 'packing_slip'
+                        candidate.documentKind
+                          === 'legacy_prelabel_packing_list'
                         && candidate.packageGlobalId === item.globalId
+                        && !candidate.shipmentGlobalId
                       ),
                     )
                     const canGenerate = (
@@ -743,12 +1105,17 @@ function OrderDetailDrawer({
                             </Stack>
                           ) : (
                             <Alert severity="warning" sx={{ mt: 0.75 }}>
-                              Exact carton allocation is unavailable. Packing-list generation is blocked so ClawPilot cannot produce an incomplete document.
+                              Exact carton allocation is unavailable. Pack Work Instruction generation is blocked so ClawPilot cannot produce an incomplete warehouse instruction.
                             </Alert>
                           )}
                         </Box>
 
                         <Box sx={{ mt: 1.5 }}>
+                          {legacyArtifact && (
+                            <Alert severity="warning" sx={{ mb: 1 }}>
+                              Legacy pre-label packing list {legacyArtifact.globalId} is retained for audit only. It is not a warned Pack Work Instruction or a final tracking-bound packing slip.
+                            </Alert>
+                          )}
                           {artifact ? (
                             <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
                               {artifact.contentUrl && (
@@ -760,7 +1127,7 @@ function OrderDetailDrawer({
                                   variant="outlined"
                                   startIcon={<OpenInNewRounded />}
                                 >
-                                  Download PDF
+                                  Download Pack Work Instruction
                                 </Button>
                               )}
                               <Button
@@ -772,14 +1139,14 @@ function OrderDetailDrawer({
                                 disabled={busy || printing || !canExecute || !order.warehouseId}
                                 onClick={() => onPrintPackingSlip(artifact.globalId)}
                               >
-                                {printing ? 'Queueing' : 'Print packing list'}
+                                {printing ? 'Queueing' : 'Print Pack Work Instruction'}
                               </Button>
                             </Stack>
                           ) : (
                             <Tooltip
                               title={canGenerate
-                                ? 'Create a package-specific PDF without purchasing postage or calling a carrier'
-                                : 'Verify packing and exact package contents before generating this document'}
+                                ? 'Create a provisional package-specific warehouse instruction without purchasing postage or calling a carrier'
+                                : 'Verify packing and exact package contents before generating this Pack Work Instruction'}
                             >
                               <span>
                                 <Button
@@ -791,7 +1158,7 @@ function OrderDetailDrawer({
                                   disabled={busy || generating || !canGenerate}
                                   onClick={() => onGeneratePackingSlip(item.globalId)}
                                 >
-                                  {generating ? 'Generating' : 'Generate packing list'}
+                                  {generating ? 'Generating' : 'Generate Pack Work Instruction'}
                                 </Button>
                               </span>
                             </Tooltip>
@@ -802,7 +1169,7 @@ function OrderDetailDrawer({
                             display="block"
                             sx={{ mt: 0.75 }}
                           >
-                            One document for this physical package only. This action does not rate, purchase, void, or update a carrier.
+                            Provisional pre-label instruction for this physical package only. It is not a final packing slip and has no carrier label or tracking number.
                           </Typography>
                         </Box>
                       </Box>
@@ -815,6 +1182,24 @@ function OrderDetailDrawer({
                 </Typography>
               )}
             </DetailSection>
+
+            {(activationState === 'shadow' || order.fulfillmentPreparation) && (
+              <DetailSection title="Shadow shipment preparation">
+                {order.fulfillmentPreparation ? (
+                  <ShadowFulfillmentPreparationPanel
+                    preparation={order.fulfillmentPreparation}
+                  />
+                ) : (
+                  <Alert severity="info">
+                    No durable pre-label shipment preparation exists yet. When
+                    eligible, use Prepare shipment in Shadow to rerate the exact
+                    sealed packages with UPS and FedEx without creating a
+                    shipment, tracking number, carrier label, postage purchase,
+                    commerce write, or final packing slip.
+                  </Alert>
+                )}
+              </DetailSection>
+            )}
 
             <DetailSection title="Carrier rates">
               {order.rates.length ? <Stack divider={<Divider flexItem />}>
@@ -830,6 +1215,14 @@ function OrderDetailDrawer({
 
             <DetailSection title="Shipping execution">
               <Stack spacing={1.5}>
+                {activeExecutionRequiredReason && (
+                  <Alert
+                    severity="info"
+                    data-testid="carrier-label-active-mode-required"
+                  >
+                    {activeExecutionRequiredReason}
+                  </Alert>
+                )}
                 {unresolvedAttempt && (
                   <Alert severity="error">
                     Carrier attempt {unresolvedAttempt.globalId} is {unresolvedAttempt.state}. Do not retry this
@@ -851,14 +1244,14 @@ function OrderDetailDrawer({
                           {activeLabel.createAttemptGlobalId ? ` · Purchase ${activeLabel.createAttemptGlobalId}` : ''}
                         </Typography>
                       </Box>
-                      <Tooltip title="Void through the same sandbox account used to purchase this label">
+                      <Tooltip title={voidBlockedReason || 'Void through the same sandbox account used to purchase this label'}>
                         <span>
                           <Button
                             color="error"
                             variant="outlined"
                             size="small"
                             startIcon={<CancelRounded />}
-                            disabled={busy || !canExecute || Boolean(unresolvedAttempt)}
+                            disabled={busy || Boolean(voidBlockedReason)}
                             onClick={onVoidSandboxLabel}
                           >
                             Void
@@ -867,12 +1260,12 @@ function OrderDetailDrawer({
                       </Tooltip>
                     </Stack>
                   </Box>
-                ) : (
+                ) : !activeExecutionRequiredReason ? (
                   <Alert severity={createBlockedReason ? 'info' : 'warning'}>
                     {createBlockedReason
                       || 'Sandbox execution uses the fixed John Doe test shipment. Create the label, inspect the print evidence, then void it immediately.'}
                   </Alert>
-                )}
+                ) : null}
                 {!activeLabel && (
                   <Tooltip title={createBlockedReason || 'Purchase a sandbox label and route its print job'}>
                     <span>
@@ -994,7 +1387,14 @@ function OrderDetailDrawer({
                             >
                               <Box sx={{ minWidth: 0 }}>
                                 <Typography fontWeight={600}>
-                                  {displayStatus(artifact.documentType)}
+                                  {artifact.documentKind === 'final_packing_slip'
+                                    ? 'Final tracking-bound packing slip'
+                                    : artifact.documentKind === 'pack_work_instruction'
+                                      ? 'Pack Work Instruction'
+                                      : artifact.documentKind
+                                          === 'legacy_prelabel_packing_list'
+                                        ? 'Legacy pre-label packing list'
+                                        : displayStatus(artifact.documentType)}
                                 </Typography>
                                 <Typography variant="caption" color="text.secondary">
                                   {artifact.globalId} · {artifact.format} · {displayStatus(artifact.media)}
@@ -1341,6 +1741,15 @@ export default function OperationsSection({
   const [verifyPackReason, setVerifyPackReason] = useState('Verify the carton plan after all warehouse picks are complete')
   const [verifyPackIdempotencyKey, setVerifyPackIdempotencyKey] = useState('')
   const [verifyingPack, setVerifyingPack] = useState(false)
+  const [prepareFulfillmentOpen, setPrepareFulfillmentOpen] = useState(false)
+  const [prepareFulfillmentReason, setPrepareFulfillmentReason] = useState(
+    'Rerate the exact sealed packages and retain zero-write Shadow evidence',
+  )
+  const [
+    prepareFulfillmentIdempotencyKey,
+    setPrepareFulfillmentIdempotencyKey,
+  ] = useState('')
+  const [preparingFulfillment, setPreparingFulfillment] = useState(false)
   const [confirmShipmentOpen, setConfirmShipmentOpen] = useState(false)
   const [confirmShipmentReason, setConfirmShipmentReason] = useState(
     'Confirm the packed order and create shipment evidence',
@@ -1703,6 +2112,76 @@ export default function OperationsSection({
     }
   }
 
+  const openPrepareFulfillment = () => {
+    setPrepareFulfillmentReason(
+      'Rerate the exact sealed packages and retain zero-write Shadow evidence',
+    )
+    setPrepareFulfillmentIdempotencyKey(
+      `operations-shadow-fulfillment:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+    )
+    setPrepareFulfillmentOpen(true)
+  }
+
+  const closePrepareFulfillment = () => {
+    if (preparingFulfillment) return
+    setPrepareFulfillmentOpen(false)
+    setPrepareFulfillmentIdempotencyKey('')
+  }
+
+  const prepareFulfillment = async (event: FormEvent) => {
+    event.preventDefault()
+    if (
+      !detail
+      || !prepareFulfillmentReason.trim()
+      || !prepareFulfillmentIdempotencyKey
+    ) return
+    setPreparingFulfillment(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': prepareFulfillmentIdempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'prepare-shipment-execution',
+          orderGlobalId: detail.globalId,
+          expectedRowVersion: detail.rowVersion,
+          reason: prepareFulfillmentReason.trim(),
+        }),
+      })
+      const payload = await response.json() as OperationsPayload
+      if (
+        !response.ok
+        || !payload.result
+        || !('fulfillmentExecutionGlobalId' in payload.result)
+        || !('shipmentGroupGlobalId' in payload.result)
+      ) {
+        throw new Error(payload.error || 'Shadow shipment preparation failed')
+      }
+      const result = payload.result
+      setPrepareFulfillmentOpen(false)
+      setPrepareFulfillmentIdempotencyKey('')
+      setNotice(
+        `Shadow preparation ${result.fulfillmentExecutionGlobalId} stored `
+        + `${result.packageCount} exact package${result.packageCount === 1 ? '' : 's'} `
+        + `and ${result.providerAttempts.length} carrier attempt${result.providerAttempts.length === 1 ? '' : 's'}. `
+        + 'No shipment, tracking number, label, postage, commerce write, or final packing slip was created.',
+      )
+      await loadWorkspace(result.orderGlobalId)
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'Shadow shipment preparation failed',
+      )
+    } finally {
+      setPreparingFulfillment(false)
+    }
+  }
+
   const generatePackingSlip = async (packageGlobalId: string) => {
     if (!detail || generatingPackingSlipPackageId) return
     setGeneratingPackingSlipPackageId(packageGlobalId)
@@ -1714,7 +2193,7 @@ export default function OperationsSection({
         headers: {
           'Content-Type': 'application/json',
           'Idempotency-Key': (
-            `operations-package-packing-list:${detail.globalId}:${packageGlobalId}:${detail.rowVersion}`
+            `operations-package-work-instruction-v1:${detail.globalId}:${packageGlobalId}:${detail.rowVersion}`
           ),
         },
         body: JSON.stringify({
@@ -1731,18 +2210,18 @@ export default function OperationsSection({
         || !('packingSlipArtifactGlobalId' in payload.result)
         || !('packageGlobalId' in payload.result)
       ) {
-        throw new Error(payload.error || 'Package packing list could not be generated')
+        throw new Error(payload.error || 'Pack Work Instruction could not be generated')
       }
       const result = payload.result
-      setNotice(
-        `Packing list ${result.packingSlipArtifactGlobalId} was generated for package ${result.packageNumber}. No carrier action was performed.`,
-      )
+      setNotice(result.documentKind === 'pack_work_instruction'
+        ? `Pack Work Instruction ${result.packingSlipArtifactGlobalId} was generated for package ${result.packageNumber}. It is provisional and no carrier action was performed.`
+        : `Legacy pre-label packing list ${result.packingSlipArtifactGlobalId} was replayed for package ${result.packageNumber}. Generate the warned Pack Work Instruction with the current workflow.`)
       await loadWorkspace(result.orderGlobalId)
     } catch (caught) {
       setError(
         caught instanceof Error
           ? caught.message
-          : 'Package packing list could not be generated',
+          : 'Pack Work Instruction could not be generated',
       )
     } finally {
       setGeneratingPackingSlipPackageId(null)
@@ -1773,16 +2252,16 @@ export default function OperationsSection({
         job?: { globalId?: string }
       }
       if (!response.ok || !payload.job?.globalId) {
-        throw new Error(payload.error || 'Packing list could not be queued for printing')
+        throw new Error(payload.error || 'Pack Work Instruction could not be queued for printing')
       }
       setNotice(
-        `Packing list ${artifactGlobalId} was queued as print job ${payload.job.globalId}.`,
+        `Pack Work Instruction ${artifactGlobalId} was queued as print job ${payload.job.globalId}.`,
       )
     } catch (caught) {
       setError(
         caught instanceof Error
           ? caught.message
-          : 'Packing list could not be queued for printing',
+          : 'Pack Work Instruction could not be queued for printing',
       )
     } finally {
       setPrintingPackingSlipArtifactId(null)
@@ -2647,6 +3126,7 @@ export default function OperationsSection({
       <OrderDetailDrawer
         order={detail}
         sandboxCarrierAccounts={workspace?.shipping?.sandboxCarrierAccounts || []}
+        activationState={workspace?.activation.state || 'disabled'}
         canExecute={Boolean(capabilities?.canManage && capabilities.canExecute)}
         open={drawerOpen}
         busy={
@@ -2654,6 +3134,7 @@ export default function OperationsSection({
           || releasingOrder
           || confirmingPicks
           || verifyingPack
+          || preparingFulfillment
           || confirmingShipment
           || creatingLabel
           || voidingLabel
@@ -2665,6 +3146,7 @@ export default function OperationsSection({
         onRelease={openRelease}
         onConfirmPicks={openConfirmPicks}
         onVerifyPack={openVerifyPack}
+        onPrepareFulfillment={openPrepareFulfillment}
         onGeneratePackingSlip={(packageGlobalId) => {
           void generatePackingSlip(packageGlobalId)
         }}
@@ -3187,6 +3669,65 @@ export default function OperationsSection({
               startIcon={verifyingPack ? <CircularProgress size={16} /> : <Inventory2Rounded />}
             >
               {verifyingPack ? 'Verifying packages' : 'Confirm package verification'}
+            </Button>
+          </DialogActions>
+        </Box>
+      </Dialog>
+
+      <Dialog
+        open={prepareFulfillmentOpen}
+        onClose={closePrepareFulfillment}
+        fullWidth
+        maxWidth="sm"
+      >
+        <Box component="form" onSubmit={prepareFulfillment}>
+          <DialogTitle>Prepare shipment in Shadow</DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <Alert severity="warning">
+                This rerates every exact sealed package as one shipment with the
+                configured UPS and FedEx sandbox accounts. It stores immutable
+                checkout, pre-label fulfillment, variance, and carrier-attempt
+                evidence only.
+              </Alert>
+              <Alert severity="info">
+                No shipment, tracking number, carrier label, postage purchase,
+                commerce write, or final packing slip will be created.
+              </Alert>
+              <TextField
+                required
+                autoFocus
+                multiline
+                minRows={3}
+                label="Shadow preparation reason"
+                value={prepareFulfillmentReason}
+                onChange={(event) => setPrepareFulfillmentReason(event.target.value)}
+                inputProps={{ maxLength: 500 }}
+                helperText={`${prepareFulfillmentReason.trim().length}/500 · Recorded in the audit history`}
+              />
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button
+              onClick={closePrepareFulfillment}
+              disabled={preparingFulfillment}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              variant="contained"
+              disabled={
+                preparingFulfillment
+                || !prepareFulfillmentReason.trim()
+              }
+              startIcon={
+                preparingFulfillment
+                  ? <CircularProgress size={16} />
+                  : <ScienceRounded />
+              }
+            >
+              {preparingFulfillment ? 'Preparing shipment' : 'Prepare in Shadow'}
             </Button>
           </DialogActions>
         </Box>

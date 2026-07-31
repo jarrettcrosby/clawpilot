@@ -1,7 +1,5 @@
-const CUSTOMER_GID = /^gid:\/\/shopify\/Customer\/[1-9]\d*$/u;
-const MAX_COHORT_SIZE = 50;
-const MAX_TITLE_PREFIXES = 10;
-const MAX_TITLE_PREFIX_LENGTH = 160;
+const CLAWPILOT_RATE_CODE = /^clawpilot:[a-z0-9](?:[a-z0-9_-]{0,31}):[a-z0-9](?:[a-z0-9_-]{0,31})$/u;
+const MAX_SERVICE_CODES = 50;
 
 const NO_CHANGES = Object.freeze({
   operations: [],
@@ -21,59 +19,67 @@ function uniqueStrings(values) {
 }
 
 /**
- * Strictly validates the app-owned configuration. Returning null preserves
- * native checkout options; provider readiness must then remain fail-closed.
+ * Strictly validates the app-owned configuration. A null result causes every
+ * positively identified ClawPilot option to be hidden.
  *
  * @param {unknown} value
  * @returns {{
- *   allowedCustomerGids: Set<string>,
- *   rateTitlePrefixes: string[],
+ *   defaultPolicy: "show_all" | "hide_all",
  * } | null}
  */
 export function parseIsolationConfiguration(value) {
-  if (!isPlainObject(value) || value.version !== 1) {
-    return null;
-  }
-
-  const customerGids = value.allowedCustomerGids;
-  const titlePrefixes = value.rateTitlePrefixes;
-
   if (
-    !Array.isArray(customerGids) ||
-    customerGids.length < 1 ||
-    customerGids.length > MAX_COHORT_SIZE ||
-    customerGids.some(
-      (customerGid) =>
-        typeof customerGid !== "string" || !CUSTOMER_GID.test(customerGid),
-    )
-  ) {
-    return null;
-  }
-
-  if (
-    !Array.isArray(titlePrefixes) ||
-    titlePrefixes.length < 1 ||
-    titlePrefixes.length > MAX_TITLE_PREFIXES ||
-    titlePrefixes.some(
-      (prefix) =>
-        typeof prefix !== "string" ||
-        prefix.trim().length === 0 ||
-        prefix.length > MAX_TITLE_PREFIX_LENGTH ||
-        /[\u0000-\u001f\u007f]/u.test(prefix),
-    )
+    !isPlainObject(value)
+    || value.version !== 2
+    || !["show_all", "hide_all"].includes(value.defaultPolicy)
   ) {
     return null;
   }
 
   return {
-    allowedCustomerGids: new Set(uniqueStrings(customerGids)),
-    rateTitlePrefixes: uniqueStrings(titlePrefixes),
+    defaultPolicy: value.defaultPolicy,
+  };
+}
+
+/**
+ * A policy is stored on the Shopify Customer resource, so the number of
+ * customers is not bounded by one Delivery Customization configuration.
+ *
+ * @param {unknown} value
+ * @returns {{
+ *   mode: "show_all" | "hide_all" | "include_only" | "exclude",
+ *   serviceCodes: Set<string>,
+ * } | null}
+ */
+export function parseCustomerRatePolicy(value) {
+  if (!isPlainObject(value) || value.version !== 1) {
+    return null;
+  }
+  const mode = value.mode;
+  if (!["show_all", "hide_all", "include_only", "exclude"].includes(mode)) {
+    return null;
+  }
+  const rawCodes = value.serviceCodes ?? [];
+  if (
+    !Array.isArray(rawCodes)
+    || rawCodes.length > MAX_SERVICE_CODES
+    || rawCodes.some(
+      (code) => typeof code !== "string" || !CLAWPILOT_RATE_CODE.test(code),
+    )
+    || (["include_only", "exclude"].includes(mode) && rawCodes.length === 0)
+    || (["show_all", "hide_all"].includes(mode) && rawCodes.length !== 0)
+  ) {
+    return null;
+  }
+  return {
+    mode,
+    serviceCodes: new Set(uniqueStrings(rawCodes)),
   };
 }
 
 /**
  * @param {unknown} input
- * @returns {Array<{handle: string, title: string | null, deliveryMethodType: string}>}
+ * @returns {Array<{handle: string, code: string | null, title: string | null, deliveryMethodType: string}>}
  */
 function collectDeliveryOptions(input) {
   const groups = input?.cart?.deliveryGroups;
@@ -94,6 +100,14 @@ function collectDeliveryOptions(input) {
         typeof option.deliveryMethodType === "string",
     );
   });
+}
+
+function isClawPilotRate(option) {
+  return (
+    option.deliveryMethodType === "SHIPPING"
+    && typeof option.code === "string"
+    && CLAWPILOT_RATE_CODE.test(option.code)
+  );
 }
 
 function hideOptions(options, predicate) {
@@ -128,27 +142,33 @@ export function cartDeliveryOptionsTransformRun(input) {
   const configuration = parseIsolationConfiguration(rawConfiguration);
 
   if (!configuration) {
-    return NO_CHANGES;
+    return hideOptions(options, isClawPilotRate);
   }
 
   const buyerIdentity = input?.cart?.buyerIdentity;
-  const customerGid = buyerIdentity?.customer?.id;
-  const isAllowedCustomer =
+  const customerPolicy =
     buyerIdentity?.isAuthenticated === true &&
-    typeof customerGid === "string" &&
-    configuration.allowedCustomerGids.has(customerGid);
+    typeof buyerIdentity?.customer?.id === "string"
+      ? parseCustomerRatePolicy(
+          buyerIdentity.customer.clawpilotRatePolicy?.jsonValue,
+        )
+      : null;
 
-  if (isAllowedCustomer) {
+  const effectiveMode = customerPolicy?.mode ?? configuration.defaultPolicy;
+
+  if (effectiveMode === "show_all") {
     return NO_CHANGES;
   }
 
   return hideOptions(
     options,
-    (option) =>
-      option.deliveryMethodType === "SHIPPING" &&
-      typeof option.title === "string" &&
-      configuration.rateTitlePrefixes.some((prefix) =>
-        option.title.startsWith(prefix),
-      ),
+    (option) => {
+      if (!isClawPilotRate(option)) return false;
+      if (effectiveMode === "hide_all") return true;
+      if (effectiveMode === "include_only") {
+        return !customerPolicy.serviceCodes.has(option.code);
+      }
+      return customerPolicy.serviceCodes.has(option.code);
+    },
   );
 }

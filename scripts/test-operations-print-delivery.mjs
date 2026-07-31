@@ -235,7 +235,7 @@ function verifySourceContracts() {
     'sourceArtifactGlobalId',
     'assertPackingSlipArtifactCanBeEnqueued',
     'OPERATIONS_PRINT_PACKING_SLIP_ALREADY_ENQUEUED',
-    'Packing-list content failed integrity validation',
+    'Pack Work Instruction content failed integrity validation',
   ]) {
     assert.ok(
       persistence.includes(fragment),

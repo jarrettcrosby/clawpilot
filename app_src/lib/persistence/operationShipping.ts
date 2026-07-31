@@ -438,10 +438,10 @@ async function assertNoUnresolvedAttempt(
 }
 
 function assertCreateContext(context: ShippingContext, expectedRowVersion: number) {
-  if (!['shadow', 'active'].includes(context.order.activation_state)) {
+  if (context.order.activation_state !== 'active') {
     throw new OperationsRequestError(
-      'OPERATIONS_EXECUTION_DISABLED',
-      'Operations must be in shadow or active mode to create sandbox labels',
+      'OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED',
+      'Operations must be active before creating a sandbox carrier label; Shadow mode never calls carrier label APIs',
       409,
     )
   }
@@ -514,10 +514,10 @@ function assertCreateContext(context: ShippingContext, expectedRowVersion: numbe
 }
 
 function assertVoidContext(context: ShippingContext, expectedRowVersion: number) {
-  if (!['shadow', 'active'].includes(context.order.activation_state)) {
+  if (context.order.activation_state !== 'active') {
     throw new OperationsRequestError(
-      'OPERATIONS_EXECUTION_DISABLED',
-      'Operations must be in shadow or active mode to void sandbox labels',
+      'OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED',
+      'Operations must be active before voiding a sandbox carrier label; Shadow mode never calls carrier void APIs',
       409,
     )
   }

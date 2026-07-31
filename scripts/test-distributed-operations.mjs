@@ -532,7 +532,13 @@ function verifySourceContracts() {
     "eventType: 'operations.order.pack_verified'",
     'generateOperationsPackagePackingSlipInPostgres',
     "commandType: 'generate_operations_package_packing_slip'",
-    "eventType: 'operations.package.packing_list_generated'",
+    "eventType: 'operations.package.pack_work_instruction_generated'",
+    "documentKind: 'pack_work_instruction'",
+    "documentStage: 'pre_label_pack_work_instruction'",
+    'finalPackingSlip: false',
+    "'legacy_prelabel_packing_list'",
+    'PACKAGE_PACK_WORK_INSTRUCTION_TEMPLATE_VERSION',
+    "storage_reference LIKE",
     'OPERATIONS_PACKAGE_CONTENTS_INCOMPLETE',
     'source_package_id',
     'readDefaultProductPackagingWithClient',
@@ -814,18 +820,26 @@ function verifySourceContracts() {
   )
   for (const fragment of [
     'Exact contents',
-    'Generate packing list',
-    'Download PDF',
-    'Print packing list',
+    'Generate Pack Work Instruction',
+    'Download Pack Work Instruction',
+    'Print Pack Work Instruction',
+    'Legacy pre-label packing list',
+    'retained for audit only',
+    'operations-package-work-instruction-v1:',
+    'It is not a final packing slip and has no carrier label or tracking number.',
     "action: 'generate-packing-slip'",
     "action: 'enqueue-packing-slip-artifact'",
-    'does not rate, purchase, void, or update a carrier',
   ]) {
     assert.ok(
       operationsSection.includes(fragment),
-      `Package packing-list UI missing ${fragment}`,
+      `Package Pack Work Instruction UI missing ${fragment}`,
     )
   }
+  assert.ok(
+    !operationsSection.includes('Generate packing list')
+      && !operationsSection.includes('Print packing list'),
+    'Pre-label package actions must not be presented as packing-list actions',
+  )
   for (const fragment of [
     "action: 'prepare-commerce-active-authorization'",
     "action: 'activate-commerce-with-authorization'",
@@ -2792,6 +2806,20 @@ async function verifyPostgresAcceptance(databaseUrl) {
       mocks: {
         '@/lib/auditWriter': auditWriter,
         '@/lib/crm/stableId': stableId,
+        '@/lib/integrations/carrierCheckoutRate': {
+          rateCheckoutShipment: async () => {
+            throw new Error(
+              'Distributed Operations acceptance does not call checkout carriers',
+            )
+          },
+        },
+        '@/lib/integrations/carrierIntegrations': {
+          testCarrierSandboxShipmentRate: async () => {
+            throw new Error(
+              'Distributed Operations acceptance does not call sandbox carriers',
+            )
+          },
+        },
         '@/lib/operations/adapters': adapters,
         '@/lib/operations/canonicalFulfillmentPlanning':
           canonicalFulfillmentPlanning,
@@ -2808,6 +2836,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
             printJobStatus: null,
             printWarning: 'No printer configured in distributed operations acceptance.',
           }),
+        },
+        '@/lib/persistence/operationShadowFulfillmentPreparation': {
+          readShadowFulfillmentPreparation: async () => null,
         },
         '@/lib/persistence/postgres': postgres,
         '@/lib/persistence/productPackaging': productPackaging,

@@ -856,29 +856,43 @@ test('returns FedEx offers when UPS times out with durable evidence', async () =
   ])
 })
 
-test('rejects partial rates when failed-provider evidence is missing', async () => {
-  await assert.rejects(
-    rateCheckoutShipment({
-      destination,
-      parcels,
-      carriers,
-      currency: 'USD',
-      deadlineAt: Date.now() + 5_000,
-      invoke: async (selection) => {
-        if (selection.provider === 'fedex_rest') {
-          throw Object.assign(new Error('timeout'), {
-            code: 'CARRIER_PROVIDER_TIMEOUT',
-          })
-        }
-        return result(selection, '42.85')
+for (const timedOutProvider of ['ups_rest', 'fedex_rest'] as const) {
+  for (const configuredCarriers of [
+    carriers,
+    [...carriers].reverse(),
+  ]) {
+    const configuredOrder = configuredCarriers
+      .map(({ provider }) => provider)
+      .join(', ')
+    test(
+      `rejects partial rates when ${timedOutProvider} has no evidence `
+        + `with configured order ${configuredOrder}`,
+      async () => {
+        await assert.rejects(
+          rateCheckoutShipment({
+            destination,
+            parcels,
+            carriers: configuredCarriers,
+            currency: 'USD',
+            deadlineAt: Date.now() + 5_000,
+            invoke: async (selection) => {
+              if (selection.provider === timedOutProvider) {
+                throw Object.assign(new Error('timeout'), {
+                  code: 'CARRIER_PROVIDER_TIMEOUT',
+                })
+              }
+              return result(selection, '42.85')
+            },
+          }),
+          (error: unknown) =>
+            error instanceof CheckoutShipmentRateError
+            && error.code === 'CHECKOUT_RATE_PROVIDER_EVIDENCE_REQUIRED'
+            && error.provider === timedOutProvider,
+        )
       },
-    }),
-    (error: unknown) =>
-      error instanceof CheckoutShipmentRateError
-      && error.code === 'CHECKOUT_RATE_PROVIDER_EVIDENCE_REQUIRED'
-      && error.provider === 'fedex_rest',
-  )
-})
+    )
+  }
+}
 
 test('fails the entire quote when every configured carrier fails', async () => {
   await assert.rejects(
@@ -899,7 +913,7 @@ test('fails the entire quote when every configured carrier fails', async () => {
   )
 })
 
-test('returns a completed provider when another remains pending at deadline', async () => {
+test('returns UPS offers when FedEx times out with durable evidence', async () => {
   let aborted = 0
   const startedAt = Date.now()
   const response = await rateCheckoutShipment({
@@ -933,6 +947,10 @@ test('returns a completed provider when another remains pending at deadline', as
     'checkout must await the aborted provider failure-evidence write',
   )
   assert.deepEqual(response.successfulProviders, ['ups_rest'])
+  assert.deepEqual(
+    response.offers.map((offer) => offer.carrierCode),
+    ['ups'],
+  )
   assert.deepEqual(response.providerAttempts, [
     {
       provider: 'ups_rest',

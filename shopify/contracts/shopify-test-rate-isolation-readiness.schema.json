@@ -14,8 +14,10 @@
     "deliveryCustomizationGid",
     "functionHandle",
     "functionTarget",
-    "customerGids",
-    "rateTitlePrefixes",
+    "defaultPolicy",
+    "rateCodePrefix",
+    "customerPolicyNamespace",
+    "customerPolicyKey",
     "allowedVariantGids",
     "configurationSha256",
     "shopifyAppVersion",
@@ -24,7 +26,7 @@
   ],
   "properties": {
     "version": {
-      "const": 1
+      "const": 2
     },
     "provider": {
       "const": "shopify"
@@ -50,26 +52,17 @@
     "functionTarget": {
       "const": "cart.delivery-options.transform.run"
     },
-    "customerGids": {
-      "type": "array",
-      "minItems": 1,
-      "maxItems": 50,
-      "uniqueItems": true,
-      "items": {
-        "type": "string",
-        "pattern": "^gid://shopify/Customer/[1-9][0-9]*$"
-      }
+    "defaultPolicy": {
+      "enum": ["show_all", "hide_all"]
     },
-    "rateTitlePrefixes": {
-      "type": "array",
-      "minItems": 1,
-      "maxItems": 10,
-      "uniqueItems": true,
-      "items": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 160
-      }
+    "rateCodePrefix": {
+      "const": "clawpilot:"
+    },
+    "customerPolicyNamespace": {
+      "const": "$app:clawpilot-test-rate-isolation"
+    },
+    "customerPolicyKey": {
+      "const": "customer-rate-policy"
     },
     "allowedVariantGids": {
       "type": "array",

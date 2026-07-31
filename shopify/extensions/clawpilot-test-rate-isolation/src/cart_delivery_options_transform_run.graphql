@@ -4,11 +4,18 @@ query CartDeliveryOptionsTransformRunInput {
       isAuthenticated
       customer {
         id
+        clawpilotRatePolicy: metafield(
+          namespace: "$app:clawpilot-test-rate-isolation"
+          key: "customer-rate-policy"
+        ) {
+          jsonValue
+        }
       }
     }
     deliveryGroups {
       deliveryOptions {
         handle
+        code
         title
         deliveryMethodType
       }

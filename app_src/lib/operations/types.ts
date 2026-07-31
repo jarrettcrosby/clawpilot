@@ -43,6 +43,7 @@ export type OperationsOrderAction =
   | 'release_to_warehouse'
   | 'confirm_picks'
   | 'verify_pack'
+  | 'prepare_fulfillment'
   | 'confirm_shipment'
 
 export type OperationsOrderActionAvailability = {
@@ -88,6 +89,11 @@ export type OperationsPackingSlipCommandResult = {
   rowVersion: number
   packageGlobalId: string
   packageNumber: number
+  documentKind: 'pack_work_instruction' | 'legacy_prelabel_packing_list'
+  documentStage:
+    | 'pre_label_pack_work_instruction'
+    | 'legacy_prelabel_packing_list'
+  finalPackingSlip: false
   packingSlipArtifactGlobalId: string
   contentUrl: string
   replayed: boolean
@@ -587,6 +593,74 @@ export type OperationsExceptionListItem = {
   resolvedAt: string | null
 }
 
+export type OperationsShadowFulfillmentPreparationPackage = {
+  packageKey: string
+  sequence: number
+  materialCode: string
+  materialName: string
+  dimensionsMm: Millimeters
+  contentWeightGrams: number
+  tareWeightGrams: number
+  grossWeightGrams: number
+  allocations: Array<{
+    lineKey: string
+    productGlobalId: string
+    providerVariantId: string
+    title: string
+    quantity: number
+  }>
+}
+
+export type OperationsShadowFulfillmentPreparationStage = {
+  runGlobalId: string
+  packageCount: number
+  packages: OperationsShadowFulfillmentPreparationPackage[]
+  selectedRate: {
+    provider: 'ups_rest' | 'fedex_rest'
+    serviceCode: string
+    serviceName: string
+    carrierCostMinor: string
+    customerChargeMinor: string
+    currency: string
+  }
+}
+
+export type OperationsShadowFulfillmentPreparation = {
+  executionGlobalId: string
+  shipmentGroupGlobalId: string
+  reconciliationGlobalId: string | null
+  checkoutRateReceiptGlobalId: string
+  preparedAt: string
+  checkout: OperationsShadowFulfillmentPreparationStage
+  fulfillment: OperationsShadowFulfillmentPreparationStage
+  variance: {
+    globalId: string
+    packageCountDelta: number
+    carrierCostVarianceMinor: string
+    estimatedCheckoutVarianceMinor: string
+    allocationChanged: boolean
+    materialChanged: boolean
+    serviceChanged: boolean
+    causes: string[]
+  }
+  providerAttempts: Array<{
+    provider: 'ups_rest' | 'fedex_rest'
+    carrierAccountGlobalId: string
+    carrierAccountName: string
+    rateEvidenceGlobalId: string
+    environment: 'sandbox'
+    status: 'succeeded' | 'degraded'
+    failureCode: string | null
+    selected: boolean
+  }>
+  effects: {
+    providerWriteCount: 0
+    postagePurchaseCount: 0
+    labelWriteCount: 0
+    commerceWriteCount: 0
+  }
+}
+
 export type OperationsOrderDetail = OperationsOrderListItem & {
   externalOrderId: string
   currency: string
@@ -601,6 +675,7 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
   plannedPackageCount: number
   packedPackageCount: number
   availableActions: OperationsOrderActionAvailability[]
+  fulfillmentPreparation: OperationsShadowFulfillmentPreparation | null
   shipTo: Address
   lines: Array<{
     globalId: string
@@ -688,6 +763,11 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     packageGlobalId: string | null
     shipmentGlobalId: string | null
     documentType: 'shipping_label' | 'packing_slip'
+    documentKind:
+      | 'shipping_label'
+      | 'final_packing_slip'
+      | 'pack_work_instruction'
+      | 'legacy_prelabel_packing_list'
     format: 'ZPL' | 'PDF' | 'PNG'
     media: 'label_4x6' | 'label_4x8' | 'letter' | 'a4'
     filename: string | null
@@ -996,6 +1076,40 @@ export type OperationsPlanCommandResult = OperationsOrderCommandResult & {
   currency: string
   checkoutShippingChargeMinor: number | null
   checkoutVarianceMinor: number | null
+}
+
+export type OperationsShadowFulfillmentExecutionResult = {
+  orderGlobalId: string
+  orderStatus: 'packed'
+  rowVersion: number
+  fulfillmentExecutionGlobalId: string
+  shipmentGroupGlobalId: string
+  checkoutRateReceiptGlobalId: string
+  checkoutPackRateRunGlobalId: string
+  fulfillmentPackRateRunGlobalId: string
+  varianceGlobalId: string
+  packageCount: number
+  carrier: 'UPS' | 'FedEx'
+  provider: 'ups_rest' | 'fedex_rest'
+  serviceCode: string
+  serviceName: string
+  carrierCostMinor: number
+  checkoutShippingChargeMinor: number
+  carrierCostVarianceMinor: number
+  estimatedCheckoutVarianceMinor: number
+  currency: string
+  providerAttempts: Array<{
+    provider: 'ups_rest' | 'fedex_rest'
+    carrierAccountGlobalId: string
+    status: 'succeeded' | 'degraded'
+    failureCode: string | null
+    rateEvidenceGlobalId: string
+  }>
+  providerWriteCount: 0
+  postagePurchaseCount: 0
+  labelWriteCount: 0
+  commerceWriteCount: 0
+  replayed: boolean
 }
 
 export type OperationsExceptionUpdateResult = {

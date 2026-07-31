@@ -1,7 +1,10 @@
 # Shopify checkout test-rate isolation
 
-This package contains the Shopify-hosted guard that makes ClawPilot checkout
-rates visible only to an exact, authenticated Shopify customer cohort.
+This package contains the Shopify-hosted customer-rate policy guard. In
+Shadow, the default is to hide ClawPilot rates and selected authenticated
+customers receive an explicit policy. In Active, the default is to show
+ClawPilot rates to every eligible cart, including guests, while optional
+per-customer policies can filter the available ClawPilot services.
 
 The CarrierService callback cannot provide strict customer isolation by itself.
 Shopify doesn't guarantee customer identity in the callback request, and its
@@ -13,33 +16,45 @@ check after Shopify has assembled the checkout delivery options.
 
 The two controls are complementary:
 
-1. The ClawPilot CarrierService callback only rates exact, tenant-configured test
-   variants. If customer identity is present, it also requires the exact
-   tenant-configured customer identity.
-2. This Function hides every ClawPilot-prefixed rate unless
-   `cart.buyerIdentity.isAuthenticated` is true and the exact Shopify Customer
-   GID is in the Function's app-owned configuration.
+1. The ClawPilot CarrierService callback returns a customer-neutral superset of
+   eligible services. The bounded Shadow proof additionally rates only exact,
+   tenant-configured test variants.
+2. This Function recognizes ClawPilot options by their stable
+   `clawpilot:<carrier>:<service>` code and applies the policy stored on the
+   authenticated Shopify Customer resource after Shopify assembles checkout
+   delivery options.
 
-Never use an email address as the authorization key. The configured value must
-look like `gid://shopify/Customer/1234567890`.
+Never use an email address, cookie, browser session, or checkout URL as the
+authorization key. The administrator may search by email in ClawPilot, but the
+saved assignment must target the resolved
+`gid://shopify/Customer/<numeric-id>` resource.
 
-The Function uses the checkout-visible rate title because the Delivery
-Customization input does not expose the originating CarrierService ID or
-CarrierService `service_code`. ClawPilot must continue returning titles in this
-format:
+Customer assignments are not stored in one capped cohort array. Each Shopify
+Customer owns one app-reserved `customer-rate-policy` metafield, so ClawPilot
+does not impose a limit on how many customers can receive a policy. A single
+customer policy is bounded to the 50 services that the CarrierService response
+itself supports.
+
+ClawPilot continues returning customer-facing titles in this format:
 
 ```text
 <store entity name> · <carrier name> · <service name>
 ```
 
-For the current test store, the configured prefix should therefore be:
+The store entity name is tenant configuration. It is not used as the security
+identifier, so an administrator can rename it without breaking customer-rate
+policy enforcement.
 
-```text
-Pro Bakery Bites ·
-```
+The global Function configuration has two modes:
 
-The store entity prefix is tenant configuration. It is not hard-coded into the
-Function.
+- `hide_all`: Shadow default. Guests and customers without a valid explicit
+  policy do not see ClawPilot rates.
+- `show_all`: Active default. Every eligible cart sees the customer-neutral
+  ClawPilot service set, whether the buyer is authenticated or a guest.
+
+An authenticated customer policy can use `show_all`, `hide_all`,
+`include_only`, or `exclude`. An anonymous checkout always receives the global
+default because Shopify has no durable customer identity to personalize.
 
 ## Required eligibility and scopes
 
@@ -94,12 +109,16 @@ After the extension version is released, use the app's authenticated Admin
 GraphQL client to run:
 
 - `admin-graphql/create-test-rate-isolation.graphql`
-- `admin-graphql/create-test-rate-isolation.variables.example.json`, after
-  replacing both placeholders with the exact values for this store
+- `admin-graphql/create-test-rate-isolation.variables.example.json`
+- `admin-graphql/set-customer-rate-policy.graphql`
+- `admin-graphql/set-customer-rate-policy.variables.example.json`, after
+  replacing the placeholder with the exact resolved Customer GID
 
-The mutation creates the customization and its configuration together. The
-namespace is app-owned, so another app can't silently rewrite the authorization
-cohort.
+The first mutation creates the customization and its default policy together.
+The second assigns a policy to one Customer resource. Both namespaces are
+app-owned, so another app can't silently rewrite the policy. Repeat the
+customer-policy mutation for any number of customers; there is no central
+cohort-size limit.
 
 Then run `admin-graphql/verify-test-rate-isolation.graphql` with the returned
 DeliveryCustomization GID. Persist the verified result using
@@ -111,8 +130,8 @@ record is active, unexpired, and still matches all of the following:
 - shop domain and ClawPilot tenant/account;
 - enabled DeliveryCustomization GID;
 - Function handle and target;
-- exact allowed Customer GID set;
-- exact rate-title prefix set;
+- global default policy and stable `clawpilot:` rate-code prefix;
+- app-owned customer-policy namespace and key;
 - exact allowed variant GID set;
 - digest of the app-owned Function configuration.
 
@@ -120,10 +139,10 @@ An environment flag alone is not authority to weaken the callback.
 
 ## Configuration failure behavior
 
-Missing or malformed Function configuration returns no customization
-operations. This preserves native carrier options and avoids stranding every
-customer's checkout when the Function can't safely identify the ClawPilot
-option.
+Missing or malformed Function configuration hides every option positively
+identified by the stable `clawpilot:` service-code prefix. Native carrier and
+merchant rates remain untouched. A malformed customer policy falls back to the
+valid global default.
 
 That behavior is not proof of isolation. Activation and provider verification
 must therefore fail closed: an invalid or absent app-owned configuration can
@@ -137,15 +156,23 @@ the durable readiness record, then write and re-verify the provider resource.
 Test all cases from fresh checkouts, not by repeatedly refreshing one cached
 checkout:
 
-1. Authenticated allowed Customer GID + allowed variant: ClawPilot rates appear.
-2. Authenticated different Customer GID + allowed variant: ClawPilot rates do
-   not appear.
-3. Guest checkout + allowed variant: ClawPilot rates do not appear.
-4. Allowed customer + non-allowed variant: callback returns no ClawPilot rates.
-5. A non-ClawPilot UPS/USPS option remains visible for denied customers.
-6. Multiple delivery groups are all filtered.
-7. After the durable readiness record expires, callback fallback closes until a
-   new provider verification succeeds.
+1. Shadow `hide_all` + authenticated `show_all` customer policy + allowed
+   variant: ClawPilot rates appear.
+2. Shadow `hide_all` + authenticated customer without a policy: ClawPilot rates
+   do not appear.
+3. Shadow `hide_all` + guest checkout: ClawPilot rates do not appear.
+4. Active `show_all` + guest or authenticated customer without a policy:
+   ClawPilot rates appear.
+5. Active `show_all` + `include_only` or `exclude` customer policy: only the
+   configured stable service codes remain.
+6. Allowed customer + non-allowed Shadow variant: callback returns no
+   ClawPilot rates.
+7. A non-ClawPilot UPS/USPS option remains visible for every policy.
+8. Five concurrent authenticated sessions for one Customer GID produce the
+   same policy result.
+9. Multiple delivery groups are all filtered.
+10. After durable readiness expires, callback fallback closes until a new
+   provider verification succeeds.
 
 Official references:
 

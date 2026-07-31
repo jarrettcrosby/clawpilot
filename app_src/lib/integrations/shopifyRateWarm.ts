@@ -1,11 +1,14 @@
-export type ShopifyCustomerRateZone = {
-  countryCode: string
-  provinceCode: string | null
-  postalCode: string
+export type ShopifyCustomerRateDestination = {
+  address1: string
+  address2: string
+  city: string
+  province: string
+  country: string
+  zip: string
 }
 
-export type ShopifyCustomerRateZoneResult = {
-  zones: ShopifyCustomerRateZone[]
+export type ShopifyCustomerRateDestinationResult = {
+  destinations: ShopifyCustomerRateDestination[]
   counts: {
     scanned: number
     eligible: number
@@ -19,6 +22,7 @@ export type ShopifyRateWarmTenant = {
   accountGlobalId: string
   shopDomain: string
   activationState: 'shadow' | 'active'
+  environment: 'sandbox' | 'production'
   policyRevision: number
   policySnapshot: Record<string, unknown>
   clientId: string
@@ -35,7 +39,7 @@ export type ShopifyRateWarmResponse = {
   debounceMs: number
   minIntervalMs: number
   staleCartAbort: true
-  zones: ShopifyCustomerRateZone[]
+  destinations: ShopifyCustomerRateDestination[]
   coverage: {
     scanned: number
     eligible: number
@@ -65,15 +69,19 @@ export type ShopifyRateWarmDependencies = {
     accessToken: string
     grantedScopes: string[]
   }>
-  readCustomerRateZones: (input: {
+  readCustomerRateDestinations: (input: {
     customerId: string
     shopDomain: string
     accessToken: string
     grantedScopes: string[]
-  }) => Promise<ShopifyCustomerRateZoneResult>
+  }) => Promise<ShopifyCustomerRateDestinationResult>
   readPolicy: (
     policySnapshot: Record<string, unknown>,
   ) => ShopifyRateWarmPolicy
+  isShadowCustomerAllowed: (
+    customerId: string,
+    tenant: ShopifyRateWarmTenant,
+  ) => boolean | Promise<boolean>
 }
 
 export type ShopifyRateWarmPolicy = {
@@ -134,7 +142,7 @@ function response(input: {
   tenant: ShopifyRateWarmTenant
   policy: ShopifyRateWarmPolicy
   cartFingerprint: string
-  zones?: ShopifyCustomerRateZone[]
+  destinations?: ShopifyCustomerRateDestination[]
   coverage?: ShopifyRateWarmResponse['coverage']
 }): ShopifyRateWarmResponse {
   return {
@@ -150,7 +158,7 @@ function response(input: {
     debounceMs: input.policy.debounceMs,
     minIntervalMs: input.policy.minIntervalMs,
     staleCartAbort: true,
-    zones: input.zones || [],
+    destinations: input.destinations || [],
     coverage: input.coverage || {
       scanned: 0,
       eligible: 0,
@@ -192,10 +200,23 @@ export async function loadShopifyRateWarmResponse(input: {
   }
 
   const policy = tenantPolicy(tenant, input.dependencies)
+  const shadowCustomerAllowed = tenant.activationState === 'shadow'
+    ? await input.dependencies.isShadowCustomerAllowed(
+        identity.customerId,
+        tenant,
+      )
+    : false
   const enabled = (
-    tenant.activationState === 'active'
-    && policy.enabled
+    policy.enabled
     && policy.mode === 'hosted_ajax'
+    && (
+      tenant.activationState === 'active'
+      || (
+        tenant.activationState === 'shadow'
+        && tenant.environment === 'sandbox'
+        && shadowCustomerAllowed
+      )
+    )
   )
   if (!enabled) {
     return response({
@@ -207,7 +228,7 @@ export async function loadShopifyRateWarmResponse(input: {
   }
 
   const grant = await input.dependencies.requestAccessToken(tenant)
-  const result = await input.dependencies.readCustomerRateZones({
+  const result = await input.dependencies.readCustomerRateDestinations({
     customerId: identity.customerId,
     shopDomain: tenant.shopDomain,
     accessToken: grant.accessToken,
@@ -216,18 +237,18 @@ export async function loadShopifyRateWarmResponse(input: {
   const supportedCountries: ReadonlySet<string> = new Set(
     policy.supportedCountries,
   )
-  const unsupported = result.zones.filter((zone) => (
-    !supportedCountries.has(zone.countryCode)
+  const unsupported = result.destinations.filter((destination) => (
+    !supportedCountries.has(destination.country)
   )).length
-  const zones = result.zones.filter((zone) => (
-    supportedCountries.has(zone.countryCode)
+  const destinations = result.destinations.filter((destination) => (
+    supportedCountries.has(destination.country)
   ))
   return response({
     enabled: true,
     tenant,
     policy,
     cartFingerprint: identity.cartFingerprint,
-    zones,
+    destinations,
     coverage: {
       scanned: result.counts.scanned,
       eligible: result.counts.eligible,

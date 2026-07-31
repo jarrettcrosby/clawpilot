@@ -281,13 +281,13 @@ export async function POST(req: NextRequest) {
     } else if (command.action === 'enqueue-packing-slip-artifact') {
       const sourceArtifactGlobalId = text(
         command.value.sourceArtifactGlobalId,
-        'Packing-list artifact',
+        'Pack Work Instruction artifact',
         16,
       )
       if (!ARTIFACT_GLOBAL_ID.test(sourceArtifactGlobalId)) {
         fail(
           'OPERATIONS_PRINT_JOB_REQUEST_INVALID',
-          'Packing-list artifact is invalid',
+          'Pack Work Instruction artifact is invalid',
         )
       }
       enqueue = {

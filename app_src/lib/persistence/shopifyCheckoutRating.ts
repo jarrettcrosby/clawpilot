@@ -2471,9 +2471,10 @@ export async function updateShopifyCarrierServicePlanRatePolicyInPostgres(
 }
 
 /**
- * Updates only the customer-neutral tenant rate-warming policy. Until a
- * durable Delivery Customization readiness record exists, this command
- * persists disabled policy changes only and fails closed on activation.
+ * Updates only the customer-neutral tenant rate-warming policy. Enabling is
+ * constrained below to a verified sandbox account while Operations is in
+ * Shadow; the storefront app proxy separately restricts reads to an exact
+ * Shopify Customer GID with a simulated Checkout audience policy.
  */
 export async function updateShopifyCarrierServiceRateWarmPolicyInPostgres(
   rawInput: ShopifyCarrierServiceRateWarmPolicyWriteInput,
@@ -2499,13 +2500,6 @@ export async function updateShopifyCarrierServiceRateWarmPolicyInPostgres(
       rawInput.checkoutRateWarm,
     ),
     actorEmail: textValue(rawInput.actorEmail, 'Actor email', 320),
-  }
-  if (input.checkoutRateWarm.enabled) {
-    fail(
-      'SHOPIFY_CHECKOUT_RATE_WARM_DELIVERY_CUSTOMIZATION_REQUIRED',
-      'Checkout rate warming remains disabled until durable Shopify Delivery Customization readiness is available',
-      409,
-    )
   }
   return withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(

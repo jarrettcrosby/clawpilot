@@ -8,7 +8,7 @@ import {
   shopifyAdminGraphql,
 } from '@/lib/integrations/shopifyCommerceClient'
 import {
-  readShopifyCustomerRateZones,
+  readShopifyCustomerRateDestinations,
 } from '@/lib/integrations/shopifyCustomerRateZones'
 import {
   readShopifyAppProxyShopHint,
@@ -26,6 +26,9 @@ import {
 import {
   readShopifyRateWarmRuntimeByShopFromPostgres,
 } from '@/lib/persistence/shopifyRateWarm'
+import {
+  readActiveShopifyCustomerRatePolicyFromPostgres,
+} from '@/lib/persistence/shopifyCustomerRatePolicies'
 
 function decryptedShopifyCredential(
   record: Awaited<
@@ -55,6 +58,15 @@ const DEFAULT_DEPENDENCIES: ShopifyRateWarmDependencies = {
   readShopHint: readShopifyAppProxyShopHint,
   verifyProxy: verifyShopifyAppProxyRequest,
   readPolicy: readShopifyCheckoutRateWarmPolicy,
+  async isShadowCustomerAllowed(customerId, tenant) {
+    const customerPolicy =
+      await readActiveShopifyCustomerRatePolicyFromPostgres({
+        organizationId: tenant.organizationId,
+        accountGlobalId: tenant.accountGlobalId,
+        shopifyCustomerGid: customerId,
+      })
+    return customerPolicy !== null && customerPolicy.mode !== 'hide_all'
+  },
   async resolveTenant(shopDomain) {
     const record = await readShopifyRateWarmRuntimeByShopFromPostgres(
       shopDomain,
@@ -70,6 +82,7 @@ const DEFAULT_DEPENDENCIES: ShopifyRateWarmDependencies = {
       accountGlobalId: record.runtime.globalId,
       shopDomain: configuredShopDomain,
       activationState: record.activationState,
+      environment: record.runtime.environment,
       policyRevision: record.policyRevision,
       policySnapshot: record.policySnapshot,
       clientId: credential.clientId,
@@ -87,8 +100,8 @@ const DEFAULT_DEPENDENCIES: ShopifyRateWarmDependencies = {
       grantedScopes: grant.grantedScopes,
     }
   },
-  async readCustomerRateZones(input) {
-    return readShopifyCustomerRateZones({
+  async readCustomerRateDestinations(input) {
+    return readShopifyCustomerRateDestinations({
       customerId: input.customerId,
       credential: {
         shopDomain: input.shopDomain,

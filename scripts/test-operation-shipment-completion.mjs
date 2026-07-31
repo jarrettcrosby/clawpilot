@@ -8,6 +8,7 @@ import { resolve } from 'node:path'
 import vm from 'node:vm'
 
 const root = process.cwd()
+const contractsOnly = process.argv.includes('--contracts-only')
 const nodeRequire = createRequire(import.meta.url)
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
 const ts = requireFromApp('typescript')
@@ -565,6 +566,20 @@ async function verifyShipmentCompletion(databaseUrl) {
       mocks: {
         '@/lib/auditWriter': auditWriter,
         '@/lib/crm/stableId': stableId,
+        '@/lib/integrations/carrierCheckoutRate': {
+          rateCheckoutShipment: async () => {
+            throw new Error(
+              'Shipment completion acceptance does not call checkout rates',
+            )
+          },
+        },
+        '@/lib/integrations/carrierIntegrations': {
+          testCarrierSandboxShipmentRate: async () => {
+            throw new Error(
+              'Shipment completion acceptance does not call carrier sandboxes',
+            )
+          },
+        },
         '@/lib/operations/adapters': adapters,
         '@/lib/operations/canonicalFulfillmentPlanning':
           canonicalPlanning,
@@ -584,6 +599,9 @@ async function verifyShipmentCompletion(databaseUrl) {
             printJobStatus: null,
             printWarning: 'No printer configured in focused shipment completion acceptance.',
           }),
+        },
+        '@/lib/persistence/operationShadowFulfillmentPreparation': {
+          readShadowFulfillmentPreparation: async () => null,
         },
         '@/lib/persistence/postgres': postgres,
         '@/lib/persistence/productPackaging': productPackaging,
@@ -679,6 +697,12 @@ async function verifyShipmentCompletion(databaseUrl) {
       generatedPackingList.packageGlobalId,
       packingListPackage.rows[0].global_id,
     )
+    assert.equal(generatedPackingList.documentKind, 'pack_work_instruction')
+    assert.equal(
+      generatedPackingList.documentStage,
+      'pre_label_pack_work_instruction',
+    )
+    assert.equal(generatedPackingList.finalPackingSlip, false)
     assert.match(generatedPackingList.packingSlipArtifactGlobalId, /^gpf\d{7}$/)
     assert.equal(
       generatedPackingList.contentUrl,
@@ -722,7 +746,19 @@ async function verifyShipmentCompletion(databaseUrl) {
     assert.equal(packageArtifact.rows[0].has_no_shipment, true)
     assert.equal(
       packageArtifact.rows[0].template_version,
-      packingSlip.PACKAGE_PACKING_LIST_TEMPLATE_VERSION,
+      packingSlip.PACKAGE_PACK_WORK_INSTRUCTION_TEMPLATE_VERSION,
+    )
+    assert.equal(
+      packageArtifact.rows[0].render_snapshot.documentKind,
+      'pack_work_instruction',
+    )
+    assert.equal(
+      packageArtifact.rows[0].render_snapshot.documentStage,
+      'pre_label_pack_work_instruction',
+    )
+    assert.equal(
+      packageArtifact.rows[0].render_snapshot.finalPackingSlip,
+      false,
     )
     assert.deepEqual(
       packageArtifact.rows[0].render_snapshot.lines.map((line) => ({
@@ -1012,8 +1048,10 @@ async function main() {
   const packingSlip = loadTypeScriptModule(
     'app_src/lib/operations/packingSlip.ts',
   )
-  const paginated = packingSlip.renderPackagePackingList({
-    documentStage: 'warehouse_packing',
+  const paginated = packingSlip.renderPackagePackWorkInstruction({
+    documentKind: 'pack_work_instruction',
+    documentStage: 'pre_label_pack_work_instruction',
+    finalPackingSlip: false,
     orderGlobalId: 'gor0000001',
     orderNumber: 'PAGINATION-ACCEPTANCE',
     customerName: 'Pagination Customer',
@@ -1052,7 +1090,23 @@ async function main() {
   )
   assert.ok(
     paginatedSource.includes('Page 3 of 3'),
-    'The final package packing-list page must be numbered',
+    'The final package Pack Work Instruction page must be numbered',
+  )
+  assert.ok(
+    paginatedSource.includes('ClawPilot Pack Work Instruction')
+      && paginatedSource.includes('PRE-LABEL - NOT A FINAL PACKING SLIP')
+      && paginatedSource.includes(
+        'Provisional warehouse instruction only. No label, tracking number, or shipment confirmation exists.',
+      ),
+    'The pre-label document must identify itself as a provisional Pack Work Instruction',
+  )
+  assert.equal(
+    paginated.templateVersion,
+    'pack-work-instruction-package-letter-v1',
+  )
+  assert.match(
+    paginated.filename,
+    /-pack-work-instruction\.pdf$/,
   )
   const shipmentPackingSlip = packingSlip.renderPackingSlip({
     orderGlobalId: 'gor0000001',
@@ -1097,6 +1151,19 @@ async function main() {
     shipmentPackingSource.includes('Page 3 of 3'),
     'The final shipment packing-slip page must be numbered',
   )
+  assert.ok(
+    shipmentPackingSource.includes('ClawPilot Packing Slip'),
+    'The tracking-bound final shipment document must remain a packing slip',
+  )
+  assert.ok(
+    !shipmentPackingSource.includes('Pack Work Instruction'),
+    'The tracking-bound final packing slip must not be relabeled as a work instruction',
+  )
+
+  if (contractsOnly) {
+    console.log('Operations shipment document contracts passed')
+    return
+  }
 
   command('docker', ['info'], { timeout: 30_000 })
   const container = `clawpilot-shipment-completion-${process.pid}-${randomUUID().slice(0, 8)}`

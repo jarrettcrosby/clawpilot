@@ -111,6 +111,30 @@ assertIncludes(unresolvedGuard, [
   'must be reconciled before another carrier command',
 ], 'Unresolved-attempt guard')
 
+const createContextGuard = section(
+  persistence,
+  'function assertCreateContext(',
+  'function assertVoidContext(',
+  'Create-label activation guard',
+)
+assertIncludes(createContextGuard, [
+  "context.order.activation_state !== 'active'",
+  "'OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED'",
+  'Operations must be active before creating a sandbox carrier label; Shadow mode never calls carrier label APIs',
+], 'Create-label activation guard')
+
+const voidContextGuard = section(
+  persistence,
+  'function assertVoidContext(',
+  'function commandHash(',
+  'Void-label activation guard',
+)
+assertIncludes(voidContextGuard, [
+  "context.order.activation_state !== 'active'",
+  "'OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED'",
+  'Operations must be active before voiding a sandbox carrier label; Shadow mode never calls carrier void APIs',
+], 'Void-label activation guard')
+
 const replay = section(
   persistence,
   'async function replayResult(',

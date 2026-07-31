@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto'
 
 export const PACKING_SLIP_TEMPLATE_VERSION = 'packing-slip-letter-v2'
-export const PACKAGE_PACKING_LIST_TEMPLATE_VERSION =
-  'packing-list-package-letter-v1'
+export const PACKAGE_PACK_WORK_INSTRUCTION_TEMPLATE_VERSION =
+  'pack-work-instruction-package-letter-v1'
 
 export type PackingSlipSnapshot = {
   documentTitle?: string
@@ -44,8 +44,10 @@ export type RenderedPackingSlip = {
   templateVersion: typeof PACKING_SLIP_TEMPLATE_VERSION
 }
 
-export type PackagePackingListSnapshot = {
-  documentStage: 'warehouse_packing'
+export type PackagePackWorkInstructionSnapshot = {
+  documentKind: 'pack_work_instruction'
+  documentStage: 'pre_label_pack_work_instruction'
+  finalPackingSlip: false
   orderGlobalId: string
   orderNumber: string
   customerName: string
@@ -61,11 +63,11 @@ export type PackagePackingListSnapshot = {
   lines: PackingSlipSnapshot['lines']
 }
 
-export type RenderedPackagePackingList = Omit<
+export type RenderedPackagePackWorkInstruction = Omit<
   RenderedPackingSlip,
   'templateVersion'
 > & {
-  templateVersion: typeof PACKAGE_PACKING_LIST_TEMPLATE_VERSION
+  templateVersion: typeof PACKAGE_PACK_WORK_INSTRUCTION_TEMPLATE_VERSION
 }
 
 function printable(value: unknown) {
@@ -254,9 +256,9 @@ export function renderPackingSlip(snapshot: PackingSlipSnapshot): RenderedPackin
   }
 }
 
-export function renderPackagePackingList(
-  snapshot: PackagePackingListSnapshot,
-): RenderedPackagePackingList {
+export function renderPackagePackWorkInstruction(
+  snapshot: PackagePackWorkInstructionSnapshot,
+): RenderedPackagePackWorkInstruction {
   const linesPerPage = 14
   const pageCount = Math.max(1, Math.ceil(snapshot.lines.length / linesPerPage))
   const pages = Array.from({ length: pageCount }, (_, pageIndex) => {
@@ -274,12 +276,13 @@ export function renderPackagePackingList(
     }
     const line = (y: number) => commands.push(`0.75 w 48 ${y} m 564 ${y} l S`)
 
-    text('ClawPilot Packing List', 48, 744, 18, true)
+    text('ClawPilot Pack Work Instruction', 48, 744, 18, true)
     text(`Order ${snapshot.orderNumber}`, 48, 718, 12, true)
     text(snapshot.orderGlobalId, 390, 718, 9)
     line(704)
 
-    text('Ship to', 48, 682, 10, true)
+    text('PRE-LABEL - NOT A FINAL PACKING SLIP', 48, 688, 10, true)
+    text('Ship to', 48, 666, 10, true)
     const addressLines = [
       snapshot.shipTo.name,
       snapshot.shipTo.line1,
@@ -287,27 +290,27 @@ export function renderPackagePackingList(
       `${snapshot.shipTo.city}, ${snapshot.shipTo.region} ${snapshot.shipTo.postalCode}`,
       snapshot.shipTo.country,
     ].filter(Boolean)
-    addressLines.forEach((value, index) => text(value, 48, 664 - index * 14, 10))
+    addressLines.forEach((value, index) => text(value, 48, 648 - index * 14, 10))
 
-    text('Physical package', 330, 682, 10, true)
+    text('Physical package', 330, 666, 10, true)
     text(
       `Package ${snapshot.packageNumber} of ${snapshot.packageCount}`,
       330,
-      664,
+      648,
       11,
       true,
     )
-    text(snapshot.packageGlobalId, 330, 648, 9)
-    text(snapshot.warehouseName, 330, 632, 9)
-    text(snapshot.warehouseGlobalId, 330, 616, 9)
+    text(snapshot.packageGlobalId, 330, 632, 9)
+    text(snapshot.warehouseName, 330, 616, 9)
+    text(snapshot.warehouseGlobalId, 330, 600, 9)
 
-    line(592)
-    text('Qty', 48, 574, 9, true)
-    text('Product', 88, 574, 9, true)
-    text('SKU', 420, 574, 9, true)
-    line(566)
+    line(576)
+    text('Qty', 48, 558, 9, true)
+    text('Product', 88, 558, 9, true)
+    text('SKU', 420, 558, 9, true)
+    line(550)
 
-    let y = 548
+    let y = 532
     const pageLines = snapshot.lines.slice(
       pageIndex * linesPerPage,
       (pageIndex + 1) * linesPerPage,
@@ -332,7 +335,7 @@ export function renderPackagePackingList(
       8,
     )
     text(
-      'Generated from immutable package-content allocation. No carrier action performed.',
+      'Provisional warehouse instruction only. No label, tracking number, or shipment confirmation exists.',
       48,
       56,
       8,
@@ -348,9 +351,9 @@ export function renderPackagePackingList(
     byteLength: payload.byteLength,
     filename: safeDocumentFilename(
       `${snapshot.orderNumber}-package-${snapshot.packageNumber}`,
-      'packing-list',
+      'pack-work-instruction',
     ),
     mimeType: 'application/pdf',
-    templateVersion: PACKAGE_PACKING_LIST_TEMPLATE_VERSION,
+    templateVersion: PACKAGE_PACK_WORK_INSTRUCTION_TEMPLATE_VERSION,
   }
 }

@@ -3,7 +3,6 @@ import {
   fingerprintShopifyCarrierServiceRateRequest,
   readShopifyCarrierServiceRateRequest,
   safeShopifyCarrierServiceProtocolErrorPath,
-  shopifyCarrierServiceRequestMatchesTestAllowlist,
   stableShopifyCarrierServiceCode,
   type ShopifyCarrierServiceRateResponse,
   type ShopifyCarrierServiceRateRequest,
@@ -28,6 +27,12 @@ import {
   type ShopifyCheckoutPlanRatePolicy,
 } from '@/lib/operations/shopifyCheckoutPlanRatePolicy'
 import { shopifyCheckoutDestinationFingerprint } from '@/lib/integrations/commerceCredentialCrypto'
+import {
+  configuredShopifyNumericIdentifierSet,
+} from '@/lib/integrations/shopifyShadowCheckoutAllowlist'
+import {
+  readActiveShopifyCustomerRatePolicyFromPostgres,
+} from '@/lib/persistence/shopifyCustomerRatePolicies'
 import {
   claimShopifyCheckoutRateReceiptInPostgres,
   completeShopifyCheckoutRateReceiptInPostgres,
@@ -68,7 +73,6 @@ const CALLBACK_LEASE_SECONDS = 20
 const MAX_PERSISTED_LINE_QUANTITY = 100_000
 const MAX_PERSISTED_UNIT_WEIGHT_GRAMS = 1_000_000
 const EMPTY_RATE_RESPONSE: ShopifyCarrierServiceRateResponse = { rates: [] }
-const SHOPIFY_NUMERIC_ID = /^[1-9][0-9]{0,19}$/
 
 export const SHOPIFY_CARRIER_SERVICE_CALLBACK_ACTOR =
   'system:shopify-carrier-service'
@@ -212,66 +216,38 @@ function sandboxCheckoutAccountIsReady(
 }
 
 type ShadowCheckoutGuard =
-  | { allowed: false; customerLabel: null }
-  | { allowed: true; customerLabel: string | null }
+  | { allowed: false }
+  | { allowed: true }
 
-function configuredIdentifierSet(
-  environmentName: string,
-): ReadonlySet<string> | null {
-  const raw = String(process.env[environmentName] || '').trim()
-  if (!raw) return null
-  const identifiers = raw.split(',').map((entry) => entry.trim())
-  if (
-    identifiers.length < 1
-    || identifiers.some((identifier) => !SHOPIFY_NUMERIC_ID.test(identifier))
-  ) {
-    return null
-  }
-  return new Set(identifiers)
-}
-
-function configuredShadowCustomerLabel(): string | null {
-  const label = String(
-    process.env.SHOPIFY_CHECKOUT_SHADOW_CUSTOMER_LABEL || '',
-  )
-    .normalize('NFKC')
-    .replace(/\s+/g, ' ')
-    .trim()
-  return (
-    label
-    && label.length <= 80
-    && !/[\u0000-\u001f\u007f]/.test(label)
-  )
-    ? label
-    : null
-}
-
-function shadowCheckoutRequestGuard(
+async function shadowCheckoutRequestGuard(
   account: ShopifyCheckoutRatingAccount,
   request: ShopifyCarrierServiceRateRequest,
-): ShadowCheckoutGuard {
+): Promise<ShadowCheckoutGuard> {
   if (account.activationState !== 'shadow') {
-    return { allowed: true, customerLabel: null }
+    return { allowed: true }
   }
-  const customerIds = configuredIdentifierSet(
-    'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_CUSTOMER_IDS',
-  )
-  const variantIds = configuredIdentifierSet(
+  const variantIds = configuredShopifyNumericIdentifierSet(
     'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS',
   )
-  const customerLabel = configuredShadowCustomerLabel()
+  const customerId = request.customer?.id
+  const shippableItems = request.items.filter((item) => item.requiresShipping)
   if (
-    !customerIds
+    !customerId
     || !variantIds
-    || !customerLabel
-    || !shopifyCarrierServiceRequestMatchesTestAllowlist(request, {
-      customerIds,
-      variantIds,
-    })
+    || shippableItems.length < 1
+    || shippableItems.some((item) => !variantIds.has(item.variantId))
   ) {
-    return { allowed: false, customerLabel: null }
+    return { allowed: false }
   }
-  return { allowed: true, customerLabel }
+  const customerPolicy =
+    await readActiveShopifyCustomerRatePolicyFromPostgres({
+      organizationId: account.organizationId,
+      accountGlobalId: account.accountGlobalId,
+      shopifyCustomerGid: customerId,
+    })
+  return customerPolicy && customerPolicy.mode !== 'hide_all'
+    ? { allowed: true }
+    : { allowed: false }
 }
 
 function checkoutExecutionFenceHash(
@@ -1139,7 +1115,10 @@ export async function executeShopifyCarrierServiceCallback(input: {
     )
     checkpoint = 'request_parsed'
     attemptedStage = 'shadow_guard'
-    const shadowGuard = shadowCheckoutRequestGuard(account, request)
+    const shadowGuard = await awaitCallbackWork(
+      shadowCheckoutRequestGuard(account, request),
+      workController.signal,
+    )
     if (!shadowGuard.allowed) {
       return authenticatedResult(EMPTY_RATE_RESPONSE, 200)
     }

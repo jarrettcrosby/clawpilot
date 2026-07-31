@@ -8,7 +8,7 @@
         "namespace": "$app:clawpilot-test-rate-isolation",
         "key": "function-configuration",
         "type": "json",
-        "value": "{\"version\":1,\"allowedCustomerGids\":[\"gid://shopify/Customer/REPLACE_WITH_EXACT_NUMERIC_ID\"],\"rateTitlePrefixes\":[\"REPLACE_WITH_STORE_ENTITY_NAME · \"]}"
+        "value": "{\"version\":2,\"defaultPolicy\":\"hide_all\"}"
       }
     ]
   }

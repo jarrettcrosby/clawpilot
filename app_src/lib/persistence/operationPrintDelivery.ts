@@ -1941,7 +1941,7 @@ async function insertArtifact(
     if (!ARTIFACT_GLOBAL_ID.test(input.document.sourceArtifactGlobalId)) {
       throw new OperationsRequestError(
         'OPERATIONS_PRINT_ARTIFACT_INVALID',
-        'Packing-list artifact reference is invalid',
+        'Pack Work Instruction artifact reference is invalid',
       )
     }
     const artifactResult = await client.query<{
@@ -2004,7 +2004,7 @@ async function insertArtifact(
     if (!artifact || artifact.warehouse_id !== input.warehouseId) {
       throw new OperationsRequestError(
         'OPERATIONS_PRINT_ARTIFACT_INVALID',
-        'Packing list was not found in the selected warehouse',
+        'Pack Work Instruction was not found in the selected warehouse',
         404,
       )
     }
@@ -2016,7 +2016,7 @@ async function insertArtifact(
     ) {
       throw new OperationsRequestError(
         'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
-        'Packing-list content failed integrity validation',
+        'Pack Work Instruction content failed integrity validation',
         500,
       )
     }
@@ -2296,11 +2296,11 @@ async function assertPackingSlipArtifactCanBeEnqueued(input: {
     : job.status === 'failed'
       ? 'Use the retry action after resolving the printer route.'
       : job.status === 'cancelled'
-        ? 'Generate a replacement packing list only if the package allocation changes.'
+        ? 'Generate a replacement Pack Work Instruction only if the package allocation changes.'
         : 'Wait for or manage the existing print job.'
   throw new OperationsRequestError(
     'OPERATIONS_PRINT_PACKING_SLIP_ALREADY_ENQUEUED',
-    `Packing list already has original print job ${job.global_id} (${job.status}). ${nextStep}`,
+    `Pack Work Instruction already has original print job ${job.global_id} (${job.status}). ${nextStep}`,
     409,
   )
 }

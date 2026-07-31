@@ -226,7 +226,9 @@ for (const forbiddenMutation of [
 
 requireAll(checkoutRatingPersistence, [
   'updateShopifyCarrierServiceRateWarmPolicyInPostgres(',
-  "'SHOPIFY_CHECKOUT_RATE_WARM_DELIVERY_CUSTOMIZATION_REQUIRED'",
+  "'SHOPIFY_CHECKOUT_RATE_WARM_POLICY_SHADOW_REQUIRED'",
+  "current.activation_state !== 'shadow'",
+  "current.account_environment !== 'sandbox'",
   'checkoutRateWarm: input.checkoutRateWarm',
   'policy_revision = policy_revision + 1',
   'policy_hash = $3',
@@ -252,24 +254,85 @@ requireAll(setupRoute, [
   'checkoutRateWarm: readShopifyCheckoutRateWarmPolicy(',
   'rateWarmReadiness: {',
   'deliveryCustomizationDurable: false',
-  'activationAllowed: false',
+  'activationAllowed: shadowSandboxRateWarmReady',
+  'readShopifyCustomerRatePolicySummaryFromPostgres({',
+  'customerPolicySummary.shadowAllowedCount < 1',
+  'at least one unexpired allow policy in Checkout audience',
+  'customerPolicySummary.earliestShadowExpiresAt',
+  'Bounded Shadow cache preparation is available only for the isolated allowlisted test-variant proof',
+  'Shopify does not guarantee Customer GID in CarrierService callbacks',
+  'successful-rate cache is customer-neutral',
+  'not deterministic customer enforcement',
+  'hasValidShopifyShadowVariantAllowlist()',
+  'shadowCheckoutIsolationBlockers.join',
 ], 'public rate-warm policy and truthful readiness')
+
+requireAll(setupRoute, [
+  'checkoutAudience: {',
+  "'shadow_binary_ready'",
+  "'shadow_customer_required'",
+  "'active_default_ready_provider_overrides_blocked'",
+  'shadowAllowedCustomerCount: customerPolicySummary.shadowAllowedCount',
+  "shadowBinaryTestReady: reference.activation.state === 'shadow'",
+  'providerEnforcementAvailable:',
+  'limited-visibility public app or a custom app on Shopify Plus',
+], 'checkout-audience readiness projection')
 
 requireAll(setupPanel, [
   'checkoutRateWarm: CheckoutRateWarmPolicy',
   'next.config?.checkoutRateWarm',
-  'Checkout rate warming',
+  'Saved-address rate cache preparation',
+  'Processes every distinct complete U.S. saved destination in the',
+  'background to prime Shopify&apos;s checkout-rate cache.',
+  'browser emits aggregate counts only.',
+  'This is only a bounded, isolated allowlisted test-variant proof.',
+  'Shopify does not',
+  'guarantee Customer GID in a CarrierService callback',
+  'successful-rate cache is customer-neutral.',
+  'deterministic customer enforcement. An unidentified or expired',
+  'Shadow callback fails closed.',
+  'Enable saved-address rate cache preparation',
   'Storefront mode (v1)',
   'Shopify hosted AJAX',
   'Version 1 warms rates through Shopify hosted Online Store AJAX endpoints.',
   'all_saved_rate_zones',
+  'Version 1 processes every distinct complete U.S. saved destination in the background; addresses are never silently truncated.',
   'Supported country (v1)',
   'United States (US)',
-  'Version 1 supports United States rate zones only.',
+  'Version 1 supports United States destinations only.',
   'Abort queued work when the cart changes (required)',
   "'save-rate-warm-policy'",
-  'Save warming policy only',
+  'Save cache-preparation policy only',
 ], 'checkout rate-warm policy UI round trip')
+requireAll(setupPanel, [
+  "key: 'audience'",
+  'Select the Shadow checkout audience',
+  'Unexpired Shadow allow customers',
+  'Only binary allow or hide is testable in Shadow.',
+  'Include-only and exclude selections remain saved intent',
+  'limited-visibility public app or a custom app on Shopify Plus',
+  'Refresh checkout-audience status',
+  "key: 'rate-warm'",
+  "key: 'evidence'",
+  'Use a signed-in Shopify customer covered by an unexpired Checkout audience allow policy',
+], 'ordered checkout-audience prerequisite')
+requireOrder(
+  setupPanel,
+  "key: 'audience'",
+  "key: 'rate-warm'",
+  'checkout setup journey',
+)
+requireOrder(
+  setupPanel,
+  "key: 'rate-warm'",
+  "key: 'evidence'",
+  'checkout setup journey',
+)
+assert.equal(
+  /[A-Z0-9._%+-]+@episcs\.com/iu.test(setupPanel),
+  false,
+  'generic Shopify setup copy must not contain tenant customer email addresses',
+)
 assert.equal(
   setupPanel.includes('Headless Storefront API'),
   false,
@@ -896,12 +959,12 @@ requireAll(setupPanel, [
   'zero Shopify network calls',
   'Do not retry.',
   'Open Packaging Materials',
-  'Create a cart for Jarrett+warehouse@episcs.com.',
+  'Use a signed-in Shopify customer covered by an unexpired Checkout audience allow policy',
 ], 'customer-facing setup panel')
 assert.equal(
-  setupPanel.includes('Jarrett+warehouse@gmail.com'),
+  /[A-Z0-9._%+-]+@(?:episcs\.com|gmail\.com)/iu.test(setupPanel),
   false,
-  'obsolete Gmail test identity must not appear in the setup panel',
+  'tenant test identities must not appear in the generic setup panel',
 )
 assert.equal(
   /\b(?:window|globalThis)\.(?:alert|confirm|prompt)\s*\(/.test(setupPanel),

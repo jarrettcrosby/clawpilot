@@ -33,6 +33,7 @@ import {
   generateOperationsPackagePackingSlipInPostgres,
   OperationsRequestError,
   planOperationsOrderFromPostgres,
+  prepareOperationsShipmentExecutionFromPostgres,
   readOperationsWorkspaceFromPostgres,
   releaseOperationsOrderFromPostgres,
   runMockOperationsProofFromPostgres,
@@ -1056,11 +1057,51 @@ export async function POST(req: NextRequest) {
       })
       return json({ ok: true, capabilities, result })
     }
+    if (action === 'prepare-shipment-execution') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to prepare Shadow shipment execution',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set(['action', 'orderGlobalId', 'expectedRowVersion', 'reason']),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await prepareOperationsShipmentExecutionFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+        expectedRowVersion: integerValue(
+          body.expectedRowVersion,
+          'Order version',
+          0,
+          2_147_483_647,
+        ),
+        reason: textValue(
+          body.reason,
+          'Shadow shipment-preparation reason',
+          500,
+        ),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json(
+        { ok: true, capabilities, result },
+        result.replayed ? 200 : 201,
+      )
+    }
     if (action === 'generate-packing-slip') {
       if (!capabilities.canManage || !capabilities.canExecute) {
         return json({
           ok: false,
-          error: 'You do not have permission to generate warehouse packing lists',
+          error: 'You do not have permission to generate Pack Work Instructions',
           code: 'OPERATIONS_EXECUTE_REQUIRED',
         }, 403)
       }

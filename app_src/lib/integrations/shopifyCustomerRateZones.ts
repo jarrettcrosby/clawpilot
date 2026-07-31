@@ -3,17 +3,22 @@ const CUSTOMER_GID_PATTERN = /^gid:\/\/shopify\/Customer\/[1-9][0-9]{0,19}$/
 const COUNTRY_CODE_PATTERN = /^[A-Z]{2}$/
 const PROVINCE_CODE_PATTERN = /^[A-Z0-9][A-Z0-9-]{0,15}$/
 const MAX_POSTAL_CODE_LENGTH = 32
+const MAX_ADDRESS_LINE_LENGTH = 255
+const MAX_CITY_LENGTH = 255
 const DEFAULT_PAGE_SIZE = 100
 const DEFAULT_MAX_ADDRESSES = 250
 
-export type ShopifyCustomerRateZone = {
-  countryCode: string
-  provinceCode: string | null
-  postalCode: string
+export type ShopifyCustomerRateDestination = {
+  address1: string
+  address2: string
+  city: string
+  province: string
+  country: string
+  zip: string
 }
 
-export type ShopifyCustomerRateZoneResult = {
-  zones: ShopifyCustomerRateZone[]
+export type ShopifyCustomerRateDestinationResult = {
+  destinations: ShopifyCustomerRateDestination[]
   counts: {
     scanned: number
     eligible: number
@@ -46,7 +51,7 @@ export class ShopifyCustomerRateZoneError extends Error {
   }
 }
 
-const CUSTOMER_ADDRESSES_QUERY = `query ClawPilotCustomerRateZones(
+const CUSTOMER_ADDRESSES_QUERY = `query ClawPilotCustomerRateDestinations(
   $customerId: ID!
   $first: Int!
   $after: String
@@ -55,6 +60,9 @@ const CUSTOMER_ADDRESSES_QUERY = `query ClawPilotCustomerRateZones(
     id
     addressesV2(first: $first, after: $after) {
       nodes {
+        address1
+        address2
+        city
         countryCodeV2
         provinceCode
         zip
@@ -73,15 +81,10 @@ function record(value: unknown): Record<string, unknown> | null {
     : null
 }
 
-function normalizedPostalCode(value: unknown): string | null {
-  if (typeof value !== 'string') return null
-  const postalCode = value
-    .normalize('NFKC')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toUpperCase()
+function storedPostalCode(value: unknown): string | null {
+  const postalCode = typeof value === 'string' ? value : ''
   return (
-    postalCode.length >= 1
+    postalCode.trim().length >= 1
     && postalCode.length <= MAX_POSTAL_CODE_LENGTH
     && !/[\u0000-\u001f\u007f]/.test(postalCode)
   )
@@ -89,31 +92,82 @@ function normalizedPostalCode(value: unknown): string | null {
     : null
 }
 
-function normalizedCountryCode(value: unknown): string | null {
-  const countryCode = typeof value === 'string'
-    ? value.trim().toUpperCase()
-    : ''
+function storedCountryCode(value: unknown): string | null {
+  const countryCode = typeof value === 'string' ? value : ''
   return COUNTRY_CODE_PATTERN.test(countryCode) ? countryCode : null
 }
 
-function normalizedProvinceCode(value: unknown): string | null | undefined {
+function storedProvinceCode(value: unknown): string | null | undefined {
   if (value === null || value === undefined || value === '') return null
-  const provinceCode = typeof value === 'string'
-    ? value.normalize('NFKC').trim().toUpperCase()
-    : ''
+  const provinceCode = typeof value === 'string' ? value : ''
   return PROVINCE_CODE_PATTERN.test(provinceCode)
     ? provinceCode
     : undefined
 }
 
-function normalizedZone(value: unknown): ShopifyCustomerRateZone | null {
+function storedRequiredText(
+  value: unknown,
+  maximumLength: number,
+): string | null {
+  if (typeof value !== 'string') return null
+  return (
+    value.trim().length >= 1
+    && value.length <= maximumLength
+    && !/[\u0000-\u001f\u007f]/.test(value)
+  )
+    ? value
+    : null
+}
+
+function storedOptionalText(
+  value: unknown,
+  maximumLength: number,
+): string | null {
+  if (value === null || value === undefined || value === '') return ''
+  return storedRequiredText(value, maximumLength)
+}
+
+function canonicalDestinationPart(value: string) {
+  return value
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLocaleUpperCase('en-US')
+}
+
+function storedDestination(
+  value: unknown,
+): ShopifyCustomerRateDestination | null {
   const address = record(value)
   if (!address) return null
-  const countryCode = normalizedCountryCode(address.countryCodeV2)
-  const provinceCode = normalizedProvinceCode(address.provinceCode)
-  const postalCode = normalizedPostalCode(address.zip)
-  if (!countryCode || provinceCode === undefined || !postalCode) return null
-  return { countryCode, provinceCode, postalCode }
+  const address1 = storedRequiredText(
+    address.address1,
+    MAX_ADDRESS_LINE_LENGTH,
+  )
+  const address2 = storedOptionalText(
+    address.address2,
+    MAX_ADDRESS_LINE_LENGTH,
+  )
+  const city = storedRequiredText(address.city, MAX_CITY_LENGTH)
+  const province = storedProvinceCode(address.provinceCode)
+  const country = storedCountryCode(address.countryCodeV2)
+  const zip = storedPostalCode(address.zip)
+  if (
+    !address1
+    || address2 === null
+    || !city
+    || province === undefined
+    || !country
+    || !zip
+  ) return null
+  return {
+    address1,
+    address2,
+    city,
+    province: province || '',
+    country,
+    zip,
+  }
 }
 
 function hasCustomerReadScope(scopes: readonly string[]) {
@@ -141,7 +195,7 @@ function boundedInteger(
   return candidate
 }
 
-export async function readShopifyCustomerRateZones(input: {
+export async function readShopifyCustomerRateDestinations(input: {
   customerId: string
   credential: {
     shopDomain: string
@@ -151,7 +205,7 @@ export async function readShopifyCustomerRateZones(input: {
   graphql: ShopifyCustomerAddressGraphql
   pageSize?: number
   maxAddresses?: number
-}): Promise<ShopifyCustomerRateZoneResult> {
+}): Promise<ShopifyCustomerRateDestinationResult> {
   if (!CUSTOMER_ID_PATTERN.test(input.customerId)) {
     throw new ShopifyCustomerRateZoneError(
       'SHOPIFY_CUSTOMER_ID_INVALID',
@@ -162,7 +216,7 @@ export async function readShopifyCustomerRateZones(input: {
   if (!hasCustomerReadScope(input.grantedScopes)) {
     throw new ShopifyCustomerRateZoneError(
       'SHOPIFY_READ_CUSTOMERS_SCOPE_REQUIRED',
-      'Shopify read_customers scope is required for saved rate zones',
+      'Shopify read_customers scope is required for saved destinations',
       409,
     )
   }
@@ -180,7 +234,10 @@ export async function readShopifyCustomerRateZones(input: {
     250,
   )
   const customerGid = `gid://shopify/Customer/${input.customerId}`
-  const zonesByKey = new Map<string, ShopifyCustomerRateZone>()
+  const destinationsByKey = new Map<
+    string,
+    ShopifyCustomerRateDestination
+  >()
   const seenCursors = new Set<string>()
   let cursor: string | null = null
   let scanned = 0
@@ -199,7 +256,7 @@ export async function readShopifyCustomerRateZones(input: {
           first: Math.min(pageSize, maxAddresses - scanned),
           after: cursor,
         },
-        operationName: 'ClawPilotCustomerRateZones',
+        operationName: 'ClawPilotCustomerRateDestinations',
       },
     )
     const customer = record(data.customer)
@@ -237,32 +294,26 @@ export async function readShopifyCustomerRateZones(input: {
     }
     for (const node of nodes) {
       scanned += 1
-      const zone = normalizedZone(node)
-      if (!zone) {
+      const destination = storedDestination(node)
+      if (!destination) {
         skipped += 1
         continue
       }
       const key = [
-        zone.countryCode,
-        zone.postalCode,
-      ].join('\u001f')
-      const existing = zonesByKey.get(key)
-      if (existing) {
+        destination.address1,
+        destination.address2,
+        destination.city,
+        destination.province,
+        destination.country,
+        destination.zip,
+      ]
+        .map(canonicalDestinationPart)
+        .join('\u001f')
+      if (destinationsByKey.has(key)) {
         duplicate += 1
-        const provinceCode = [
-          existing.provinceCode,
-          zone.provinceCode,
-        ]
-          .filter((value): value is string => Boolean(value))
-          .sort((left, right) => left.localeCompare(right))[0] || null
-        zonesByKey.set(key, {
-          countryCode: zone.countryCode,
-          provinceCode,
-          postalCode: zone.postalCode,
-        })
         continue
       }
-      zonesByKey.set(key, zone)
+      destinationsByKey.set(key, destination)
     }
     if (!pageInfo.hasNextPage) break
     if (scanned >= maxAddresses) {
@@ -287,18 +338,19 @@ export async function readShopifyCustomerRateZones(input: {
     cursor = nextCursor
   }
 
-  const zones = [...zonesByKey.values()].sort((left, right) => (
-    left.countryCode.localeCompare(right.countryCode)
-    || left.postalCode.localeCompare(right.postalCode)
-    || String(left.provinceCode || '').localeCompare(
-      String(right.provinceCode || ''),
-    )
+  const destinations = [...destinationsByKey.values()].sort((left, right) => (
+    left.country.localeCompare(right.country)
+    || left.zip.localeCompare(right.zip)
+    || left.province.localeCompare(right.province)
+    || left.city.localeCompare(right.city)
+    || left.address1.localeCompare(right.address1)
+    || left.address2.localeCompare(right.address2)
   ))
   return {
-    zones,
+    destinations,
     counts: {
       scanned,
-      eligible: zones.length,
+      eligible: destinations.length,
       duplicate,
       skipped,
     },

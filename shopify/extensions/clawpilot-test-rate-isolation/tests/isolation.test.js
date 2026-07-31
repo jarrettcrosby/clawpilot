@@ -3,24 +3,32 @@ import test from "node:test";
 
 import {
   cartDeliveryOptionsTransformRun,
+  parseCustomerRatePolicy,
   parseIsolationConfiguration,
 } from "../src/cart_delivery_options_transform_run.js";
 
-const ALLOWED_CUSTOMER_GID = "gid://shopify/Customer/1234567890";
-const OTHER_CUSTOMER_GID = "gid://shopify/Customer/9876543210";
-const RATE_PREFIX = "Pro Bakery Bites · ";
+const CUSTOMER_GID = "gid://shopify/Customer/1234567890";
+const UPS_GROUND = "clawpilot:ups_rest:03";
+const FEDEX_GROUND = "clawpilot:fedex_rest:fedex_ground";
 
-function configuration(overrides = {}) {
+function configuration(defaultPolicy = "hide_all") {
+  return {
+    version: 2,
+    defaultPolicy,
+  };
+}
+
+function policy(mode, serviceCodes = []) {
   return {
     version: 1,
-    allowedCustomerGids: [ALLOWED_CUSTOMER_GID],
-    rateTitlePrefixes: [RATE_PREFIX],
-    ...overrides,
+    mode,
+    serviceCodes,
   };
 }
 
 function input({
-  customerGid = ALLOWED_CUSTOMER_GID,
+  customerGid = CUSTOMER_GID,
+  customerPolicy = policy("show_all"),
   isAuthenticated = true,
   config = configuration(),
   groups,
@@ -29,7 +37,14 @@ function input({
     cart: {
       buyerIdentity: {
         isAuthenticated,
-        customer: customerGid ? { id: customerGid } : null,
+        customer: customerGid
+          ? {
+              id: customerGid,
+              clawpilotRatePolicy: customerPolicy
+                ? { jsonValue: customerPolicy }
+                : null,
+            }
+          : null,
       },
       deliveryGroups:
         groups ??
@@ -38,16 +53,19 @@ function input({
             deliveryOptions: [
               {
                 handle: "clawpilot-ground",
+                code: UPS_GROUND,
                 title: "Pro Bakery Bites · UPS · Ground",
                 deliveryMethodType: "SHIPPING",
               },
               {
                 handle: "native-ground",
+                code: "shopify:ups:ground",
                 title: "UPS Ground",
                 deliveryMethodType: "SHIPPING",
               },
               {
                 handle: "store-pickup",
+                code: null,
                 title: "Store pickup",
                 deliveryMethodType: "PICK_UP",
               },
@@ -69,29 +87,74 @@ function hiddenHandles(result) {
   );
 }
 
-test("allows exact authenticated customer GID", () => {
+test("Shadow default hides rates unless the customer policy allows them", () => {
   assert.deepEqual(cartDeliveryOptionsTransformRun(input()), {
     operations: [],
   });
+  assert.deepEqual(
+    hiddenHandles(cartDeliveryOptionsTransformRun(input({ customerPolicy: null }))),
+    ["clawpilot-ground"],
+  );
 });
 
-test("hides only ClawPilot-prefixed rates from a different customer", () => {
+test("Active default shows rates to authenticated customers and guests", () => {
+  const activeConfig = configuration("show_all");
+  for (const fixture of [
+    input({ config: activeConfig, customerPolicy: null }),
+    input({
+      config: activeConfig,
+      customerGid: null,
+      customerPolicy: null,
+      isAuthenticated: false,
+    }),
+  ]) {
+    assert.deepEqual(cartDeliveryOptionsTransformRun(fixture), {
+      operations: [],
+    });
+  }
+});
+
+test("customer policy can include only selected ClawPilot service codes", () => {
   const result = cartDeliveryOptionsTransformRun(
-    input({ customerGid: OTHER_CUSTOMER_GID }),
+    input({
+      config: configuration("show_all"),
+      customerPolicy: policy("include_only", [UPS_GROUND]),
+      groups: [
+        {
+          deliveryOptions: [
+            {
+              handle: "clawpilot-ups-ground",
+              code: UPS_GROUND,
+              title: "Store · UPS · Ground",
+              deliveryMethodType: "SHIPPING",
+            },
+            {
+              handle: "clawpilot-fedex-ground",
+              code: FEDEX_GROUND,
+              title: "Store · FedEx · Ground",
+              deliveryMethodType: "SHIPPING",
+            },
+          ],
+        },
+      ],
+    }),
+  );
+
+  assert.deepEqual(hiddenHandles(result), ["clawpilot-fedex-ground"]);
+});
+
+test("customer policy can exclude selected ClawPilot service codes", () => {
+  const result = cartDeliveryOptionsTransformRun(
+    input({
+      config: configuration("show_all"),
+      customerPolicy: policy("exclude", [UPS_GROUND]),
+    }),
   );
 
   assert.deepEqual(hiddenHandles(result), ["clawpilot-ground"]);
 });
 
-test("hides ClawPilot-prefixed rates from guest checkout", () => {
-  const result = cartDeliveryOptionsTransformRun(
-    input({ customerGid: null, isAuthenticated: false }),
-  );
-
-  assert.deepEqual(hiddenHandles(result), ["clawpilot-ground"]);
-});
-
-test("requires authentication even if a customer GID is present", () => {
+test("an unauthenticated cart never inherits a supplied customer policy", () => {
   const result = cartDeliveryOptionsTransformRun(
     input({ isAuthenticated: false }),
   );
@@ -102,12 +165,13 @@ test("requires authentication even if a customer GID is present", () => {
 test("filters all delivery groups and deduplicates repeated handles", () => {
   const repeatedOption = {
     handle: "clawpilot-ground",
-    title: "Pro Bakery Bites · UPS · Ground",
+    code: UPS_GROUND,
+    title: "Any mutable store title",
     deliveryMethodType: "SHIPPING",
   };
   const result = cartDeliveryOptionsTransformRun(
     input({
-      customerGid: OTHER_CUSTOMER_GID,
+      customerPolicy: policy("hide_all"),
       groups: [
         { deliveryOptions: [repeatedOption] },
         {
@@ -115,7 +179,8 @@ test("filters all delivery groups and deduplicates repeated handles", () => {
             repeatedOption,
             {
               handle: "clawpilot-air",
-              title: "Pro Bakery Bites · FedEx · 2Day",
+              code: FEDEX_GROUND,
+              title: "A different mutable title",
               deliveryMethodType: "SHIPPING",
             },
           ],
@@ -130,16 +195,23 @@ test("filters all delivery groups and deduplicates repeated handles", () => {
   ]);
 });
 
-test("does not treat a middle-of-title match as a ClawPilot rate", () => {
+test("identifies ClawPilot options by stable service code, not display title", () => {
   const result = cartDeliveryOptionsTransformRun(
     input({
-      customerGid: OTHER_CUSTOMER_GID,
+      customerPolicy: policy("hide_all"),
       groups: [
         {
           deliveryOptions: [
             {
-              handle: "merchant-rate",
-              title: `Standard ${RATE_PREFIX}UPS · Ground`,
+              handle: "clawpilot-renamed",
+              code: UPS_GROUND,
+              title: "A completely renamed rate",
+              deliveryMethodType: "SHIPPING",
+            },
+            {
+              handle: "merchant-similar-title",
+              code: "merchant:ground",
+              title: "Pro Bakery Bites · UPS · Ground",
               deliveryMethodType: "SHIPPING",
             },
           ],
@@ -148,44 +220,74 @@ test("does not treat a middle-of-title match as a ClawPilot rate", () => {
     }),
   );
 
-  assert.deepEqual(result, { operations: [] });
+  assert.deepEqual(hiddenHandles(result), ["clawpilot-renamed"]);
 });
 
-test("missing configuration preserves native checkout options", () => {
-  const fixture = input();
-  fixture.deliveryCustomization.metafield = null;
-  const result = cartDeliveryOptionsTransformRun(fixture);
+test("missing or malformed global configuration fails closed for ClawPilot rates", () => {
+  const missing = input();
+  missing.deliveryCustomization.metafield = null;
+  assert.deepEqual(hiddenHandles(cartDeliveryOptionsTransformRun(missing)), [
+    "clawpilot-ground",
+  ]);
 
-  assert.deepEqual(result, { operations: [] });
+  assert.deepEqual(
+    hiddenHandles(
+      cartDeliveryOptionsTransformRun(
+        input({ config: { version: 2, defaultPolicy: "unknown" } }),
+      ),
+    ),
+    ["clawpilot-ground"],
+  );
 });
 
-test("malformed configuration preserves native checkout options", () => {
+test("malformed customer policy falls back to the configured default", () => {
   const result = cartDeliveryOptionsTransformRun(
     input({
-      config: configuration({
-        allowedCustomerGids: ["not-a-shopify-customer-gid@example.invalid"],
-      }),
+      customerPolicy: policy("include_only", ["not-a-clawpilot-code"]),
     }),
   );
 
-  assert.deepEqual(result, { operations: [] });
+  assert.deepEqual(hiddenHandles(result), ["clawpilot-ground"]);
 });
 
-test("configuration requires exact Shopify Customer GIDs", () => {
+test("five concurrent entry paths for one authenticated customer are deterministic", async () => {
+  const fixtures = Array.from({ length: 5 }, (_, index) =>
+    input({
+      groups: [
+        {
+          deliveryOptions: [
+            {
+              handle: `clawpilot-ground-${index}`,
+              code: UPS_GROUND,
+              title: `Device ${index + 1} display title`,
+              deliveryMethodType: "SHIPPING",
+            },
+          ],
+        },
+      ],
+    }),
+  );
+
+  const results = await Promise.all(
+    fixtures.map(async (fixture) => cartDeliveryOptionsTransformRun(fixture)),
+  );
+  assert.deepEqual(results, Array.from({ length: 5 }, () => ({ operations: [] })));
+});
+
+test("customer policies are strict and have no central customer-count limit", () => {
+  assert.deepEqual(parseIsolationConfiguration(configuration("show_all")), {
+    defaultPolicy: "show_all",
+  });
   assert.equal(
-    parseIsolationConfiguration(
-      configuration({
-        allowedCustomerGids: ["gid://shopify/Customer/0"],
-      }),
-    ),
+    parseIsolationConfiguration({ version: 2, defaultPolicy: "unknown" }),
     null,
   );
   assert.equal(
-    parseIsolationConfiguration(
-      configuration({
-        rateTitlePrefixes: [""],
-      }),
-    ),
+    parseCustomerRatePolicy(policy("include_only", [])),
+    null,
+  );
+  assert.equal(
+    parseCustomerRatePolicy(policy("show_all", [UPS_GROUND])),
     null,
   );
 });

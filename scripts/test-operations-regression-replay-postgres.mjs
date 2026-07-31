@@ -372,21 +372,23 @@ async function insertRunChildren(client, input) {
         packageKey: item.packageKey,
         lineKey: allocation.lineKey,
         productKey: allocation.productKey,
+        comparisonProductKey: allocation.productKey,
         title: allocation.title,
         quantity: allocation.quantity,
       }
       await client.query(
         `INSERT INTO operations_pack_rate_run_allocations (
            organization_id, run_id, package_key, line_key, product_key,
-           title, quantity, allocation_hash
+           comparison_product_key, title, quantity, allocation_hash
          ) VALUES (
-           $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8
+           $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9
          )`,
         [
           input.organizationId,
           input.runId,
           item.packageKey,
           allocation.lineKey,
+          allocation.productKey,
           allocation.productKey,
           allocation.title,
           allocation.quantity,

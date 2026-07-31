@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://clawpilot.example/contracts/shopify-customer-rate-policy.schema.json",
+  "title": "Shopify customer checkout-rate policy",
+  "description": "A policy stored on one Shopify Customer resource. Customer scale is not bounded by a central cohort array.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "mode", "serviceCodes"],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "mode": {
+      "enum": ["show_all", "hide_all", "include_only", "exclude"]
+    },
+    "serviceCodes": {
+      "type": "array",
+      "maxItems": 50,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^clawpilot:[a-z0-9](?:[a-z0-9_-]{0,31}):[a-z0-9](?:[a-z0-9_-]{0,31})$"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "enum": ["show_all", "hide_all"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "serviceCodes": {
+            "maxItems": 0
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "serviceCodes": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ]
+}

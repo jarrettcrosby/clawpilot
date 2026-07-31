@@ -28,6 +28,7 @@ import type {
 
 export function availableOperationsOrderActions(input: {
   status: OperationsOrderStatus
+  sourceProvider?: string
   activationState: OperationsActivationState
   canExecute: boolean
   planStatus: string | null
@@ -41,7 +42,10 @@ export function availableOperationsOrderActions(input: {
   packageCount: number
   plannedPackageCount: number
   packedPackageCount: number
+  openExceptionCount?: number
   blockingExceptionCount: number
+  shadowPreparationReady?: boolean
+  shadowPreparationBlockedReason?: string | null
   activeLabelCount?: number
   shippableLabelCount?: number
   sandboxLabelCount?: number
@@ -108,8 +112,8 @@ export function availableOperationsOrderActions(input: {
   let shipmentBlockedReason: string | null = null
   if (!input.canExecute) {
     shipmentBlockedReason = 'Operations execute permission is required.'
-  } else if (!['shadow', 'active'].includes(input.activationState)) {
-    shipmentBlockedReason = 'Set Operations to Shadow or Active before confirming a shipment.'
+  } else if (input.activationState !== 'active') {
+    shipmentBlockedReason = 'Set Operations to Active before confirming a shipment.'
   } else if ((input.existingShipmentCount || 0) > 0 || input.status === 'shipped') {
     shipmentBlockedReason = 'This order already has a confirmed shipment.'
   } else if (input.status !== 'packed') {
@@ -130,6 +134,29 @@ export function availableOperationsOrderActions(input: {
     shipmentBlockedReason = 'Resolve high or critical order exceptions before confirming shipment.'
   }
 
+  let preparationBlockedReason: string | null = null
+  if (!input.canExecute) {
+    preparationBlockedReason = 'Operations execute permission is required.'
+  } else if (input.activationState !== 'shadow') {
+    preparationBlockedReason = 'Shipment preparation is available only in Operations Shadow.'
+  } else if (input.sourceProvider !== 'shopify') {
+    preparationBlockedReason = 'Shadow shipment preparation currently requires a Shopify order.'
+  } else if (input.status !== 'packed') {
+    preparationBlockedReason = 'Verify every package before preparing shipment execution.'
+  } else if (input.planStatus !== 'released') {
+    preparationBlockedReason = 'The latest fulfillment plan must remain released.'
+  } else if (
+    input.packageCount < 1
+    || input.packedPackageCount !== input.packageCount
+  ) {
+    preparationBlockedReason = 'Every physical package must be packed.'
+  } else if ((input.openExceptionCount || 0) > 0) {
+    preparationBlockedReason = 'Resolve all order exceptions before preparing shipment execution.'
+  } else if (input.shadowPreparationReady !== true) {
+    preparationBlockedReason = input.shadowPreparationBlockedReason
+      || 'Exact checkout, carton, allocation, and UPS/FedEx sandbox evidence is required.'
+  }
+
   return [
     {
       action: 'release_to_warehouse',
@@ -148,6 +175,12 @@ export function availableOperationsOrderActions(input: {
       label: 'Verify packages',
       enabled: packBlockedReason === null,
       blockedReason: packBlockedReason,
+    },
+    {
+      action: 'prepare_fulfillment',
+      label: 'Prepare shipment in Shadow',
+      enabled: preparationBlockedReason === null,
+      blockedReason: preparationBlockedReason,
     },
     {
       action: 'confirm_shipment',

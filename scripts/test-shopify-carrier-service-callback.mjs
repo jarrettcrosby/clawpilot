@@ -35,10 +35,9 @@ const checkoutPersistence = read(
 for (const required of [
   'readShopifyCarrierServiceRateRequest(input.request, {',
   'allowShadowSimulation: false',
-  'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_CUSTOMER_IDS',
   'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS',
-  'SHOPIFY_CHECKOUT_SHADOW_CUSTOMER_LABEL',
-  'shopifyCarrierServiceRequestMatchesTestAllowlist(request, {',
+  'readActiveShopifyCustomerRatePolicyFromPostgres({',
+  "customerPolicy.mode !== 'hide_all'",
   'buildShopifyStoreEntityRateResponse({',
   'storeEntityName: account.storeEntityName',
   "protocolVersion: 'shopify-carrier-service-response-v3'",
@@ -250,10 +249,14 @@ const authenticatedExecution = callback.slice(
   callback.indexOf('const authenticatedExecution'),
 )
 const shadowGuard = authenticatedExecution.indexOf(
-  'const shadowGuard = shadowCheckoutRequestGuard(account, request)',
+  'const shadowGuard = await awaitCallbackWork(',
 )
 assert.ok(
   shadowGuard >= 0
+    && authenticatedExecution.indexOf(
+      'shadowCheckoutRequestGuard(account, request),',
+      shadowGuard,
+    ) > shadowGuard
     && shadowGuard < authenticatedExecution.indexOf(
       'persistedRequestFingerprint(',
     )

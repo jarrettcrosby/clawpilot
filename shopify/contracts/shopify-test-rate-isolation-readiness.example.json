@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "provider": "shopify",
   "status": "active",
   "clawpilotAccountId": "REPLACE_WITH_CLAWPILOT_ACCOUNT_ID",
@@ -7,12 +7,10 @@
   "deliveryCustomizationGid": "gid://shopify/DeliveryCustomization/1234567890",
   "functionHandle": "clawpilot-test-rate-isolation",
   "functionTarget": "cart.delivery-options.transform.run",
-  "customerGids": [
-    "gid://shopify/Customer/1234567890"
-  ],
-  "rateTitlePrefixes": [
-    "Pro Bakery Bites · "
-  ],
+  "defaultPolicy": "hide_all",
+  "rateCodePrefix": "clawpilot:",
+  "customerPolicyNamespace": "$app:clawpilot-test-rate-isolation",
+  "customerPolicyKey": "customer-rate-policy",
   "allowedVariantGids": [
     "gid://shopify/ProductVariant/1234567890"
   ],

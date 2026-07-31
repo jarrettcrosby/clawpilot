@@ -3,6 +3,8 @@ const COUNTRY_CODE_PATTERN = /^[A-Z]{2}$/
 const PROVINCE_CODE_PATTERN = /^[A-Z0-9][A-Z0-9-]{0,15}$/
 const CURRENCY_PATTERN = /^[A-Z]{3}$/
 const MAX_POSTAL_CODE_LENGTH = 32
+const MAX_ADDRESS_LINE_LENGTH = 255
+const MAX_CITY_LENGTH = 255
 const DEFAULT_DEBOUNCE_MS = 350
 const DEFAULT_POLL_INTERVAL_MS = 300
 const DEFAULT_POLL_ATTEMPTS = 40
@@ -119,82 +121,111 @@ export function cartUrl(routesRoot) {
   return `${normalizeRoutesRoot(routesRoot)}cart.js`
 }
 
-function normalizeCountryCode(value) {
-  const result = typeof value === 'string'
-    ? value.trim().toUpperCase()
-    : ''
+function storedCountryCode(value) {
+  const result = typeof value === 'string' ? value : ''
   return COUNTRY_CODE_PATTERN.test(result) ? result : null
 }
 
-function normalizeProvinceCode(value) {
+function storedProvinceCode(value) {
   if (value === null || value === undefined || value === '') return null
-  const result = typeof value === 'string'
-    ? value.normalize('NFKC').trim().toUpperCase()
-    : ''
+  const result = typeof value === 'string' ? value : ''
   return PROVINCE_CODE_PATTERN.test(result) ? result : undefined
 }
 
-function normalizePostalCode(value) {
+function storedPostalCode(value) {
   if (typeof value !== 'string') return null
-  const result = value
+  return (
+    value.trim().length >= 1
+    && value.length <= MAX_POSTAL_CODE_LENGTH
+    && !/[\u0000-\u001f\u007f]/.test(value)
+  ) ? value : null
+}
+
+function storedRequiredText(value, maximumLength) {
+  if (typeof value !== 'string') return null
+  return (
+    value.trim().length >= 1
+    && value.length <= maximumLength
+    && !/[\u0000-\u001f\u007f]/.test(value)
+  ) ? value : null
+}
+
+function storedOptionalText(value, maximumLength) {
+  if (value === null || value === undefined || value === '') return ''
+  return storedRequiredText(value, maximumLength)
+}
+
+function canonicalDestinationPart(value) {
+  return value
     .normalize('NFKC')
     .replace(/\s+/g, ' ')
     .trim()
-    .toUpperCase()
-  return (
-    result.length >= 1
-    && result.length <= MAX_POSTAL_CODE_LENGTH
-    && !/[\u0000-\u001f\u007f]/.test(result)
-  ) ? result : null
+    .toLocaleUpperCase('en-US')
 }
 
-export function normalizeZone(value) {
+export function normalizeDestination(value) {
   const candidate = record(value)
   if (!candidate) return null
-  const countryCode = normalizeCountryCode(candidate.countryCode)
-  const provinceCode = normalizeProvinceCode(candidate.provinceCode)
-  const postalCode = normalizePostalCode(candidate.postalCode)
-  if (!countryCode || provinceCode === undefined || !postalCode) return null
-  return { countryCode, provinceCode, postalCode }
-}
-
-function zoneKey(zone) {
-  return [zone.countryCode, zone.postalCode].join('|')
-}
-
-function preferredProvinceCode(left, right) {
-  return [left, right]
-    .filter((value) => Boolean(value))
-    .sort((first, second) => first.localeCompare(second))[0] || null
-}
-
-export function dedupeZones(values) {
-  if (!Array.isArray(values)) return []
-  const zonesByKey = new Map()
-  for (const value of values) {
-    const zone = normalizeZone(value)
-    if (!zone) return []
-    const key = zoneKey(zone)
-    const existing = zonesByKey.get(key)
-    if (existing) {
-      zonesByKey.set(key, {
-        countryCode: zone.countryCode,
-        provinceCode: preferredProvinceCode(
-          existing.provinceCode,
-          zone.provinceCode,
-        ),
-        postalCode: zone.postalCode,
-      })
-      continue
-    }
-    zonesByKey.set(key, zone)
+  const address1 = storedRequiredText(
+    candidate.address1,
+    MAX_ADDRESS_LINE_LENGTH,
+  )
+  const address2 = storedOptionalText(
+    candidate.address2,
+    MAX_ADDRESS_LINE_LENGTH,
+  )
+  const city = storedRequiredText(candidate.city, MAX_CITY_LENGTH)
+  const province = storedProvinceCode(candidate.province)
+  const country = storedCountryCode(candidate.country)
+  const zip = storedPostalCode(candidate.zip)
+  if (
+    !address1
+    || address2 === null
+    || !city
+    || province === undefined
+    || !country
+    || !zip
+  ) return null
+  return {
+    address1,
+    address2,
+    city,
+    province: province || '',
+    country,
+    zip,
   }
-  return [...zonesByKey.values()]
+}
+
+function destinationKey(destination) {
+  return [
+    destination.address1,
+    destination.address2,
+    destination.city,
+    destination.province,
+    destination.country,
+    destination.zip,
+  ]
+    .map(canonicalDestinationPart)
+    .join('|')
+}
+
+export function dedupeDestinations(values) {
+  if (!Array.isArray(values)) return []
+  const destinationsByKey = new Map()
+  for (const value of values) {
+    const destination = normalizeDestination(value)
+    if (!destination) return []
+    const key = destinationKey(destination)
+    if (!destinationsByKey.has(key)) {
+      destinationsByKey.set(key, destination)
+    }
+  }
+  return [...destinationsByKey.values()]
 }
 
 export function shippingRateUrl(routesRoot, operation, value) {
-  const zone = normalizeZone(value)
-  if (!zone) throw new Error('Shipping rate zone is invalid')
+  const destination = normalizeDestination(value)
+  if (!destination) throw new Error('Shipping rate destination is invalid')
   const filename = operation === 'prepare'
     ? 'prepare_shipping_rates.json'
     : operation === 'async'
@@ -202,11 +233,14 @@ export function shippingRateUrl(routesRoot, operation, value) {
       : null
   if (!filename) throw new Error('Shipping rate operation is invalid')
   const query = new URLSearchParams()
-  query.set('shipping_address[country]', zone.countryCode)
-  if (zone.provinceCode) {
-    query.set('shipping_address[province]', zone.provinceCode)
+  query.set('shipping_address[address1]', destination.address1)
+  query.set('shipping_address[address2]', destination.address2)
+  query.set('shipping_address[city]', destination.city)
+  if (destination.province) {
+    query.set('shipping_address[province]', destination.province)
   }
-  query.set('shipping_address[zip]', zone.postalCode)
+  query.set('shipping_address[country]', destination.country)
+  query.set('shipping_address[zip]', destination.zip)
   return `${normalizeRoutesRoot(routesRoot)}cart/${filename}?${query}`
 }
 
@@ -265,7 +299,7 @@ export function normalizePolicy(value, expectedFingerprint) {
   const concurrency = boundedInteger(candidate.concurrency, 1, 8)
   const debounceMs = boundedInteger(candidate.debounceMs, 0, 5_000)
   const minIntervalMs = boundedInteger(candidate.minIntervalMs, 250, 60_000)
-  const zones = dedupeZones(candidate.zones)
+  const destinations = dedupeDestinations(candidate.destinations)
   const coverageCandidate = record(candidate.coverage)
   const coverage = coverageCandidate && {
     scanned: boundedInteger(coverageCandidate.scanned, 0, 250),
@@ -279,8 +313,8 @@ export function normalizePolicy(value, expectedFingerprint) {
     || concurrency === null
     || debounceMs === null
     || minIntervalMs === null
-    || !Array.isArray(candidate.zones)
-    || zones.length < 1
+    || !Array.isArray(candidate.destinations)
+    || destinations.length < 1
     || !coverage
     || Object.values(coverage).some((count) => count === null)
   ) return null
@@ -294,7 +328,7 @@ export function normalizePolicy(value, expectedFingerprint) {
     debounceMs,
     minIntervalMs,
     staleCartAbort: true,
-    zones,
+    destinations,
     coverage,
   }
 }
@@ -328,7 +362,7 @@ export function dispatchRateWarmStatus(
     version: 1,
     status,
     coverage: normalizedCoverage,
-    zones: {
+    destinations: {
       attempted: results.length,
       succeeded,
       failed,
@@ -376,29 +410,29 @@ function isFatalError(error) {
     || error?.code === 'CART_CHANGED'
 }
 
-export async function processZones(values, concurrency, task) {
-  const zones = dedupeZones(values)
+export async function processDestinations(values, concurrency, task) {
+  const destinations = dedupeDestinations(values)
   const workerCount = Math.min(
     boundedInteger(concurrency, 1, 8) || 1,
-    zones.length,
+    destinations.length,
   )
   const results = []
   let index = 0
   let fatalError = null
 
   async function worker() {
-    while (index < zones.length && !fatalError) {
-      const zone = zones[index]
+    while (index < destinations.length && !fatalError) {
+      const destination = destinations[index]
       index += 1
       try {
-        const value = await task(zone)
-        results.push({ zone, ok: true, value })
+        const value = await task(destination)
+        results.push({ destination, ok: true, value })
       } catch (error) {
         if (isFatalError(error)) {
           fatalError = error
           throw error
         }
-        results.push({ zone, ok: false, error })
+        results.push({ destination, ok: false, error })
       }
     }
   }
@@ -433,8 +467,8 @@ async function responseJson(response) {
   }
 }
 
-export async function warmShippingZone({
-  zone,
+export async function warmShippingDestination({
+  destination,
   routesRoot,
   fetchImpl,
   guard,
@@ -445,7 +479,7 @@ export async function warmShippingZone({
 }) {
   await guard()
   const prepared = await fetchImpl(
-    shippingRateUrl(routesRoot, 'prepare', zone),
+    shippingRateUrl(routesRoot, 'prepare', destination),
     {
       method: 'POST',
       credentials: 'same-origin',
@@ -461,7 +495,7 @@ export async function warmShippingZone({
     await sleepImpl(pollIntervalMs, signal)
     await guard()
     const response = await fetchImpl(
-      shippingRateUrl(routesRoot, 'async', zone),
+      shippingRateUrl(routesRoot, 'async', destination),
       {
         method: 'GET',
         credentials: 'same-origin',
@@ -484,12 +518,12 @@ export async function warmShippingZone({
   throw new Error('Shipping rate polling timed out')
 }
 
-export async function warmAllZones({
+export async function warmAllDestinations({
   policy,
   expectedFingerprint,
   controller,
   readFingerprint,
-  warmZone,
+  warmDestination,
 }) {
   const guard = async () => {
     if (controller.signal.aborted) {
@@ -502,9 +536,13 @@ export async function warmAllZones({
       throw error
     }
   }
-  return processZones(policy.zones, policy.concurrency, (zone) => (
-    warmZone({ zone, guard, signal: controller.signal })
-  ))
+  return processDestinations(
+    policy.destinations,
+    policy.concurrency,
+    (destination) => (
+      warmDestination({ destination, guard, signal: controller.signal })
+    ),
+  )
 }
 
 export async function readCart({
@@ -654,15 +692,19 @@ export function createCheckoutRateWarmer({
       debounceMs = policy.debounceMs
       const lastRun = lastWarmAt.get(current.fingerprint) || 0
       if (now() - lastRun < policy.minIntervalMs) return
-      const results = await warmAllZones({
+      const results = await warmAllDestinations({
         policy,
         expectedFingerprint: current.fingerprint,
         controller,
         readFingerprint: async (signal) => (
           (await readCurrent(signal)).fingerprint
         ),
-        warmZone: ({ zone, guard, signal }) => warmShippingZone({
-          zone,
+        warmDestination: ({
+          destination,
+          guard,
+          signal,
+        }) => warmShippingDestination({
+          destination,
           routesRoot,
           fetchImpl,
           guard,
