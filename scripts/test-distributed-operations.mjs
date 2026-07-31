@@ -539,6 +539,34 @@ function verifySourceContracts() {
     'orders.archived_at IS NULL',
     "warehouse.code <> 'MOCK-01'",
   ]) assert.ok(persistence.includes(fragment), `Operations persistence missing ${fragment}`)
+  const transpiledPersistence = ts.transpileModule(persistence, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+    fileName: 'app_src/lib/persistence/operations.ts',
+  }).outputText
+  const runtimeAliasImports = [
+    ...new Set(
+      [...transpiledPersistence.matchAll(
+        /require\(["'](@\/[^"']+)["']\)/g,
+      )].map((match) => match[1]),
+    ),
+  ]
+  const acceptanceHarness = read(
+    'scripts/test-distributed-operations.mjs',
+  ).slice(
+    read('scripts/test-distributed-operations.mjs').indexOf(
+      'async function verifyPostgresAcceptance',
+    ),
+  )
+  for (const specifier of runtimeAliasImports) {
+    assert.ok(
+      acceptanceHarness.includes(`'${specifier}'`),
+      `Operations PostgreSQL harness must map runtime alias ${specifier}`,
+    )
+  }
   assert.match(
     persistence,
     /INSERT INTO operations_order_lines[\s\S]*?RETURNING id::text, global_id, external_line_id/,
@@ -1960,6 +1988,7 @@ async function verifyRouteBehavior() {
 function postgresMock(pool) {
   return {
     query: (sql, params = []) => pool.query(sql, params),
+    getPostgresPool: () => pool,
     acquireTransactionAdvisoryLock: (client, key) => client.query(
       'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
       [key],
@@ -2715,6 +2744,30 @@ async function verifyPostgresAcceptance(databaseUrl) {
       'app_src/lib/operations/canonicalFulfillmentPlanning.ts',
       { mocks: { '../currency.ts': currency } },
     )
+    const cartonizationRateEvidence = loadTypeScriptModule(
+      'app_src/lib/persistence/cartonizationRateEvidence.ts',
+      {
+        mocks: {
+          '@/lib/auditWriter': auditWriter,
+          '@/lib/integrations/commerceCredentialCrypto': {
+            decryptCommerceCandidateSnapshot: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not decrypt provider data',
+              )
+            },
+          },
+          '@/lib/integrations/carrierSandboxRate': {
+            carrierSandboxPartyFingerprint: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not rate carrier parties',
+              )
+            },
+            normalizeCarrierSandboxParty: (value) => value,
+          },
+          '@/lib/persistence/postgres': postgres,
+        },
+      },
+    )
     const shopifyCheckoutPlanRatePolicy = loadTypeScriptModule(
       'app_src/lib/operations/shopifyCheckoutPlanRatePolicy.ts',
       { mocks: { '../currency.ts': currency } },
@@ -2744,6 +2797,8 @@ async function verifyPostgresAcceptance(databaseUrl) {
           canonicalFulfillmentPlanning,
         '@/lib/operations/domain': domain,
         '@/lib/operations/packingSlip': packingSlip,
+        '@/lib/persistence/cartonizationRateEvidence':
+          cartonizationRateEvidence,
         '@/lib/persistence/crm': {
           stageCrmRecordWithClient: stageCommerceCustomerForAcceptance,
         },
