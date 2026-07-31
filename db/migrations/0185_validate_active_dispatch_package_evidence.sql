@@ -1,0 +1,2 @@
+ALTER TABLE operations_active_carrier_package_results
+  VALIDATE CONSTRAINT operations_active_carrier_package_evidence_redacted;

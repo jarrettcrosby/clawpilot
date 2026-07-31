@@ -1,0 +1,2 @@
+ALTER TABLE operations_labels
+  VALIDATE CONSTRAINT operations_active_label_evidence_redacted;

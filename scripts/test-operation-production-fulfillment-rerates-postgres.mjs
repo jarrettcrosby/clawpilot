@@ -121,24 +121,47 @@ function fingerprint(kind, value) {
     .digest('hex')
 }
 
+function registeredOriginFingerprintForFixture() {
+  return createHash('sha256')
+    .update(JSON.stringify({
+      line1: origin.line1.toLowerCase(),
+      line2: null,
+      city: origin.city.toLowerCase(),
+      region: origin.region.toLowerCase(),
+      postalCode: origin.postalCode.toLowerCase().replace(/[\s-]/gu, ''),
+      countryCode: origin.countryCode,
+    }), 'utf8')
+    .digest('hex')
+}
+
+const activeDispatchSnapshot = loadTypeScriptModule(
+  'app_src/lib/operations/activeCarrierDispatchSnapshot.ts',
+)
+const providerBoundaryCallCount = { value: 0 }
+let activeDispatchTransactionPool = null
+
 const productionRerates = loadTypeScriptModule(
   'app_src/lib/operations/productionFulfillmentRerates.ts',
   {
     '@/lib/integrations/carrierWholeShipmentRateFoundation': {
       carrierWholeShipmentRateAddressFingerprints() {
+        providerBoundaryCallCount.value += 1
         throw new Error('Unexpected rate-address preparation in finalizer test')
       },
       sealPreparedCarrierWholeShipmentRateRequest() {
+        providerBoundaryCallCount.value += 1
         throw new Error('Unexpected rate-request preparation in finalizer test')
       },
     },
     '@/lib/integrations/carrierCredentialCrypto': {
       carrierAccountNumberFingerprint() {
+        providerBoundaryCallCount.value += 1
         throw new Error('Unexpected account fingerprinting in finalizer test')
       },
     },
     '@/lib/operations/activeCarrierDispatchSnapshot': {
       createActiveCarrierDispatchRerateBinding() {
+        providerBoundaryCallCount.value += 1
         throw new Error('Unexpected dispatch binding in finalizer test')
       },
     },
@@ -153,6 +176,120 @@ const productionRerates = loadTypeScriptModule(
     },
   },
 )
+
+const productionReratesForDispatch = loadTypeScriptModule(
+  'app_src/lib/operations/productionFulfillmentRerates.ts',
+  {
+    '@/lib/integrations/carrierWholeShipmentRateFoundation': {
+      carrierWholeShipmentRateAddressFingerprints() {
+        providerBoundaryCallCount.value += 1
+        throw new Error('Dispatch preparation must not prepare a new rate address')
+      },
+      sealPreparedCarrierWholeShipmentRateRequest() {
+        providerBoundaryCallCount.value += 1
+        throw new Error('Dispatch preparation must not prepare a new rate request')
+      },
+    },
+    '@/lib/integrations/carrierCredentialCrypto': {
+      carrierAccountNumberFingerprint() {
+        providerBoundaryCallCount.value += 1
+        throw new Error('Dispatch preparation must not read a raw account number')
+      },
+    },
+    '@/lib/operations/activeCarrierDispatchSnapshot': activeDispatchSnapshot,
+    '@/lib/persistence/postgres': {
+      acquireTransactionAdvisoryLock: (client, key) => client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
+        [key],
+      ),
+      withTransaction() {
+        throw new Error(
+          'Dispatch-context acceptance must use the supplied transaction',
+        )
+      },
+    },
+  },
+)
+
+const activeDispatchPersistence = loadTypeScriptModule(
+  'app_src/lib/operations/activeCarrierDispatchPersistence.ts',
+  {
+    '@/lib/operations/activeCarrierDispatchSnapshot': activeDispatchSnapshot,
+    '@/lib/operations/productionFulfillmentRerates': productionReratesForDispatch,
+    '@/lib/persistence/postgres': {
+      acquireTransactionAdvisoryLock: (client, key) => client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
+        [key],
+      ),
+      async withTransaction(callback) {
+        if (!activeDispatchTransactionPool) {
+          throw new Error('Active dispatch transaction pool is not configured')
+        }
+        const client = await activeDispatchTransactionPool.connect()
+        try {
+          await client.query('BEGIN')
+          const result = await callback(client)
+          await client.query('COMMIT')
+          return result
+        } catch (error) {
+          await client.query('ROLLBACK').catch(() => {})
+          throw error
+        } finally {
+          client.release()
+        }
+      },
+    },
+  },
+)
+
+function dispatchBinding(ids) {
+  return activeDispatchSnapshot.createActiveCarrierDispatchRerateBinding({
+    organization: { id: ids.organization, globalId: 'ga0009001' },
+    order: { id: ids.order, globalId: 'gor0009001' },
+    plan: { id: ids.plan, globalId: 'gfp0009001' },
+    warehouse: { id: ids.warehouse, globalId: 'gwh0009001' },
+    origin: {
+      contactName: origin.contactName,
+      companyName: origin.companyName,
+      phone: origin.phone,
+      email: null,
+      line1: origin.line1,
+      line2: null,
+      line3: null,
+      city: origin.city,
+      region: origin.region,
+      postalCode: origin.postalCode,
+      countryCode: origin.countryCode,
+      residential: origin.residential,
+    },
+    destination: {
+      contactName: destination.contactName,
+      companyName: null,
+      phone: null,
+      email: null,
+      line1: destination.line1,
+      line2: null,
+      line3: null,
+      city: destination.city,
+      region: destination.region,
+      postalCode: destination.postalCode,
+      countryCode: destination.countryCode,
+      residential: destination.residential,
+    },
+    billing,
+    packages: ids.packages.map((packageId, index) => ({
+      packageId,
+      packageGlobalId: `gpa000900${index + 1}`,
+      packageNumber: index + 1,
+      dimensionsMm: {
+        length: index === 0 ? 279 : 432,
+        width: 229,
+        height: 178,
+      },
+      weightGrams: index === 0 ? 2500 : 5000,
+    })),
+  })
+}
 
 function command(file, args, options = {}) {
   return execFileSync(file, args, {
@@ -181,6 +318,25 @@ async function waitForPostgres(databaseUrl) {
     }
   }
   throw new Error('Disposable PostgreSQL did not become ready')
+}
+
+async function createDisposablePostgresDatabase(databaseUrl, databaseName) {
+  assert.match(databaseName, /^[a-z0-9_]+$/u)
+  const adminUrl = new URL(databaseUrl)
+  adminUrl.pathname = '/postgres'
+  const pool = new Pool({
+    connectionString: adminUrl.toString(),
+    application_name: 'clawpilot-production-rerate-db-create',
+    max: 1,
+  })
+  try {
+    await pool.query(`CREATE DATABASE "${databaseName}"`)
+  } finally {
+    await pool.end()
+  }
+  const createdUrl = new URL(databaseUrl)
+  createdUrl.pathname = `/${databaseName}`
+  return createdUrl.toString()
 }
 
 function errorMessage(error) {
@@ -226,6 +382,23 @@ async function expectServiceError(
   assert.equal(caught.status, expectedStatus, `${label} returned an unstable status`)
 }
 
+async function expectIndependentServiceError(
+  label,
+  expectedCode,
+  expectedStatus,
+  operation,
+) {
+  let caught = null
+  try {
+    await operation()
+  } catch (error) {
+    caught = error
+  }
+  assert.ok(caught, `${label} unexpectedly succeeded`)
+  assert.equal(caught.code, expectedCode, `${label} returned an unstable code`)
+  assert.equal(caught.status, expectedStatus, `${label} returned an unstable status`)
+}
+
 async function expectRowLockTimeout(client, label, sql, parameters) {
   await client.query('BEGIN')
   await client.query("SET LOCAL lock_timeout = '250ms'")
@@ -245,7 +418,8 @@ async function seedPrerequisiteLineage(client, ids) {
   try {
     await client.query(
       `INSERT INTO app_users (email, role, status)
-       VALUES ($1, 'owner', 'active')`,
+       VALUES ($1, 'owner', 'active')
+       ON CONFLICT (email) DO NOTHING`,
       [actorEmail],
     )
     await client.query(
@@ -497,7 +671,7 @@ async function seedPrerequisiteLineage(client, ids) {
         ids.carrierIntegration,
         HASH.account,
         JSON.stringify(registeredOrigin),
-        HASH.registeredOrigin,
+        registeredOriginFingerprintForFixture(),
       ],
     )
     await client.query(
@@ -522,6 +696,7 @@ async function seedPrerequisiteLineage(client, ids) {
 }
 
 async function insertRun(client, ids, runId, idempotencyKey) {
+  const binding = dispatchBinding(ids)
   await client.query(
     `INSERT INTO operations_production_fulfillment_rerate_runs (
        id, organization_id, active_fulfillment_execution_id,
@@ -544,8 +719,8 @@ async function insertRun(client, ids, runId, idempotencyKey) {
       ids.sourceRun,
       HASH.input,
       JSON.stringify(destination),
-      HASH.destination,
-      HASH.packageSet,
+      binding.destinationFingerprint,
+      binding.orderedPackageSetFingerprint,
       idempotencyKey,
     ],
   )
@@ -591,6 +766,7 @@ async function credentialFingerprint(client, ids) {
 
 async function insertAttempt(client, ids, options) {
   const credential = await credentialFingerprint(client, ids)
+  const binding = dispatchBinding(ids)
   await client.query(
     `INSERT INTO operations_production_fulfillment_rerate_attempts (
        id, organization_id, rerate_run_id, attempt_number, provider,
@@ -618,12 +794,12 @@ async function insertAttempt(client, ids, options) {
       ids.carrierAccount,
       options.configurationRevision ?? 1,
       HASH.account,
-      HASH.registeredOrigin,
+      registeredOriginFingerprintForFixture(),
       credential,
       JSON.stringify(origin),
-      HASH.origin,
+      binding.originFingerprint,
       JSON.stringify(billing),
-      HASH.billing,
+      binding.billingFingerprint,
       options.idempotencyKey,
       HASH.request,
       JSON.stringify(options.redactedRequest ?? { packageCount: 2 }),
@@ -633,6 +809,7 @@ async function insertAttempt(client, ids, options) {
 
 async function insertSelection(client, ids, options) {
   const credential = await credentialFingerprint(client, ids)
+  const binding = dispatchBinding(ids)
   await client.query(
     `INSERT INTO operations_production_fulfillment_rerate_selections (
        id, organization_id, rerate_run_id,
@@ -665,14 +842,14 @@ async function insertSelection(client, ids, options) {
       ids.carrierIntegration,
       ids.carrierAccount,
       HASH.account,
-      HASH.registeredOrigin,
+      registeredOriginFingerprintForFixture(),
       credential,
       HASH.input,
       HASH.result,
-      HASH.origin,
-      HASH.destination,
-      HASH.billing,
-      HASH.packageSet,
+      binding.originFingerprint,
+      binding.destinationFingerprint,
+      binding.billingFingerprint,
+      binding.orderedPackageSetFingerprint,
       options.expiresAt,
       options.selectedAt ?? null,
     ],
@@ -683,8 +860,9 @@ async function verifyAcceptance(databaseUrl) {
   const pool = new Pool({
     connectionString: databaseUrl,
     application_name: 'clawpilot-production-rerate-acceptance',
-    max: 1,
+    max: 2,
   })
+  activeDispatchTransactionPool = pool
   const client = await pool.connect()
   const ids = {
     organization: randomUUID(),
@@ -708,6 +886,104 @@ async function verifyAcceptance(databaseUrl) {
   try {
     await client.query('BEGIN')
     await seedPrerequisiteLineage(client, ids)
+
+    const activeDispatchSafetyConstraintNames = [
+      'operations_active_carrier_attempt_safety_valid',
+      'operations_active_carrier_package_evidence_redacted',
+      'operations_active_label_attempt_evidence_redacted',
+      'operations_active_label_evidence_redacted',
+    ]
+    const validatedActiveDispatchSafetyConstraints = await client.query(
+      `SELECT conname, convalidated
+       FROM pg_constraint
+       WHERE conname = ANY($1::text[])
+       ORDER BY conname`,
+      [activeDispatchSafetyConstraintNames],
+    )
+    assert.deepEqual(
+      validatedActiveDispatchSafetyConstraints.rows,
+      [...activeDispatchSafetyConstraintNames]
+        .sort()
+        .map((conname) => ({ conname, convalidated: true })),
+    )
+
+    const directTerminalAttempts = [
+      {
+        state: 'failed',
+        providerReference: null,
+        errorCode: 'PROVIDER_REJECTED',
+        diagnostic: {
+          diagnosticVersion: 1,
+          providerStatus: 'provider_rejected',
+          shipmentOutcome: 'not_created',
+          retryable: true,
+          requestMayHaveReachedProvider: true,
+          responseReceived: true,
+        },
+      },
+      {
+        state: 'unknown',
+        providerReference: null,
+        errorCode: 'AMBIGUOUS_OUTCOME',
+        diagnostic: {
+          diagnosticVersion: 1,
+          providerStatus: 'timeout',
+          shipmentOutcome: 'unknown',
+          retryable: false,
+          requestMayHaveReachedProvider: true,
+          responseReceived: false,
+        },
+      },
+      {
+        state: 'succeeded',
+        providerReference: 'provider-shipment-direct-terminal',
+        errorCode: null,
+        diagnostic: {
+          diagnosticVersion: 1,
+          providerStatus: 'succeeded',
+          shipmentOutcome: 'created',
+          retryable: false,
+          requestMayHaveReachedProvider: true,
+          responseReceived: true,
+        },
+      },
+    ]
+
+    for (const terminalAttempt of directTerminalAttempts) {
+      await expectDatabaseError(
+        client,
+        `direct_${terminalAttempt.state}_attempt_without_prepare`,
+        /insert requires prepared state/,
+        () => client.query(
+          `INSERT INTO operations_active_carrier_group_attempts (
+             organization_id, active_fulfillment_execution_id,
+             active_shipment_group_id, production_rerate_selection_id,
+             attempt_number, state, environment, selected_provider,
+             selected_service_code, selected_service_name, package_count,
+             adapter_version, idempotency_key, request_hash, redacted_request,
+             redacted_response, provider_reference, error_code,
+             dispatched_at, completed_at
+           ) VALUES (
+             $1, $2, $3, gen_random_uuid(), 1, $5, 'production',
+             'ups_rest', '02', 'UPS 2nd Day Air', 2,
+             'direct-terminal-test-v1', $6,
+             $4, '{}'::jsonb, $7::jsonb, $8, $9,
+             clock_timestamp(), clock_timestamp()
+           )`,
+          [
+            ids.organization,
+            ids.activeExecution,
+            ids.activeGroup,
+            HASH.request,
+            terminalAttempt.state,
+            `direct-${terminalAttempt.state}-without-prepare`,
+            JSON.stringify(terminalAttempt.diagnostic),
+            terminalAttempt.providerReference,
+            terminalAttempt.errorCode,
+          ],
+        ),
+      )
+    }
 
     await expectDatabaseError(
       client,
@@ -1477,26 +1753,452 @@ async function verifyAcceptance(databaseUrl) {
         ],
       ),
     )
-    await client.query(
-      `INSERT INTO operations_active_carrier_group_attempts (
-         organization_id, active_fulfillment_execution_id,
-         active_shipment_group_id, production_rerate_selection_id,
-         attempt_number, state, environment, selected_provider,
-         selected_service_code, selected_service_name, package_count,
-         adapter_version, idempotency_key, request_hash, redacted_request
-       ) VALUES (
-         $1, $2, $3, $4, 1, 'prepared', 'production', 'ups_rest',
-         '02', 'UPS 2nd Day Air', 2, 'ups-label-v1',
-         'valid-production-dispatch', $5, '{}'::jsonb
-       )`,
-      [
-        ids.organization,
-        ids.activeExecution,
-        ids.activeGroup,
-        selectionId,
-        HASH.request,
-      ],
+    await client.query('COMMIT')
+    const preparedDispatch = await activeDispatchPersistence
+      .prepareActiveCarrierDispatchAttemptInPostgres({
+        organizationId: ids.organization,
+        productionRerateSelectionGlobalId: firstSelection.globalId,
+        actorEmail,
+      })
+    assert.equal(preparedDispatch.dispatchOwner, true)
+    assert.equal(preparedDispatch.replayed, false)
+    assert.equal(preparedDispatch.state, 'prepared')
+    assert.equal(preparedDispatch.attemptNumber, 1)
+    assert.equal(preparedDispatch.provider, 'ups_rest')
+    assert.equal(preparedDispatch.serviceCode, '02')
+    assert.equal(preparedDispatch.serviceName, 'UPS 2nd Day Air')
+    assert.equal(preparedDispatch.packageCount, 2)
+    assert.equal(
+      preparedDispatch.requestHash,
+      preparedDispatch.requestSnapshot.snapshotHash,
     )
+    assert.equal(
+      preparedDispatch.providerIdempotencyIdentity,
+      preparedDispatch.requestSnapshot.providerIdempotencyIdentity,
+    )
+    const preparedRequestRedaction = await client.query(
+      `SELECT operations_active_provider_evidence_is_redacted($1::jsonb)
+                AS request_is_redacted`,
+      [JSON.stringify(preparedDispatch.requestSnapshot)],
+    )
+    assert.equal(preparedRequestRedaction.rows[0].request_is_redacted, true)
+
+    await client.query('BEGIN')
+    const unsafeActiveProviderEvidence = {
+      headers: [['Authorization', 'Bearer must-not-persist']],
+    }
+    await expectDatabaseError(
+      client,
+      'unsafe_active_package_result_evidence',
+      /operations_active_carrier_package_evidence_redacted/,
+      async () => {
+        await client.query('SET LOCAL session_replication_role = replica')
+        await client.query(
+          `INSERT INTO operations_active_carrier_package_results (
+             organization_id, carrier_group_attempt_id,
+             active_fulfillment_execution_id, active_shipment_group_id,
+             package_id, package_number, state,
+             redacted_provider_evidence
+           ) VALUES (
+             $1, $2, $3, $4, $5, 1, 'unknown', $6::jsonb
+           )`,
+          [
+            ids.organization,
+            preparedDispatch.id,
+            ids.activeExecution,
+            ids.activeGroup,
+            ids.packages[0],
+            JSON.stringify(unsafeActiveProviderEvidence),
+          ],
+        )
+      },
+    )
+    await expectDatabaseError(
+      client,
+      'unsafe_active_label_attempt_evidence',
+      /operations_active_label_attempt_evidence_redacted/,
+      async () => {
+        await client.query('SET LOCAL session_replication_role = replica')
+        await client.query(
+          `INSERT INTO operations_label_attempts (
+             organization_id, order_id, package_id, carrier_rate_id,
+             integration_account_id, carrier_account_id, action, state,
+             environment, provider, adapter_version, idempotency_key,
+             request_hash, redacted_request, redacted_response,
+             active_fulfillment_execution_id, active_shipment_group_id,
+             active_carrier_group_attempt_id
+           ) VALUES (
+             $1, $2, $3, gen_random_uuid(), $4, $5, 'create', 'prepared',
+             'production', 'ups_rest', 'ups-label-v1',
+             'unsafe-active-label-attempt', $6, $7::jsonb, '{}'::jsonb,
+             $8, $9, $10
+           )`,
+          [
+            ids.organization,
+            ids.order,
+            ids.packages[0],
+            ids.carrierIntegration,
+            ids.carrierAccount,
+            HASH.request,
+            JSON.stringify(unsafeActiveProviderEvidence),
+            ids.activeExecution,
+            ids.activeGroup,
+            preparedDispatch.id,
+          ],
+        )
+      },
+    )
+    await expectDatabaseError(
+      client,
+      'unsafe_active_label_evidence',
+      /operations_active_label_evidence_redacted/,
+      async () => {
+        await client.query('SET LOCAL session_replication_role = replica')
+        await client.query(
+          `INSERT INTO operations_labels (
+             organization_id, package_id, carrier_rate_id, carrier,
+             service_code, tracking_number, format, label_payload,
+             provider_label_id, idempotency_key, status, environment,
+             redacted_provider_evidence, active_fulfillment_execution_id,
+             active_shipment_group_id, active_carrier_group_attempt_id
+           ) VALUES (
+             $1, $2, gen_random_uuid(), 'UPS', '02',
+             'UNSAFE-ACTIVE-TRACKING', 'ZPL', '^XA^XZ',
+             'unsafe-active-provider-label', 'unsafe-active-label',
+             'created', 'production', $3::jsonb, $4, $5, $6
+           )`,
+          [
+            ids.organization,
+            ids.packages[0],
+            JSON.stringify(unsafeActiveProviderEvidence),
+            ids.activeExecution,
+            ids.activeGroup,
+            preparedDispatch.id,
+          ],
+        )
+      },
+    )
+    await client.query('COMMIT')
+
+    const replayedPreparedDispatch = await activeDispatchPersistence
+      .prepareActiveCarrierDispatchAttemptInPostgres({
+        organizationId: ids.organization,
+        productionRerateSelectionGlobalId: firstSelection.globalId,
+        actorEmail,
+      })
+    assert.equal(replayedPreparedDispatch.globalId, preparedDispatch.globalId)
+    assert.equal(replayedPreparedDispatch.dispatchOwner, false)
+    assert.equal(replayedPreparedDispatch.replayed, true)
+
+    const noEffectsBeforeDispatch = await client.query(
+      `SELECT
+         (SELECT count(*)::int FROM operations_label_attempts
+          WHERE organization_id = $1) AS label_attempts,
+         (SELECT count(*)::int FROM operations_labels
+          WHERE organization_id = $1) AS labels,
+         (SELECT count(*)::int FROM operations_shipments
+          WHERE organization_id = $1) AS shipments,
+         (SELECT count(*)::int FROM operations_inventory_ledger
+          WHERE organization_id = $1) AS inventory_ledger,
+         (SELECT count(*)::int FROM operations_print_artifacts
+          WHERE organization_id = $1
+            AND document_type = 'packing_slip') AS packing_slips,
+         (SELECT count(*)::int FROM operations_print_jobs
+          WHERE organization_id = $1) AS print_jobs,
+         (SELECT count(*)::int FROM operations_active_carrier_package_results
+          WHERE organization_id = $1) AS active_package_results,
+         (SELECT count(*)::int FROM operations_commerce_fulfillment_exports
+          WHERE organization_id = $1) AS fulfillment_exports`,
+      [ids.organization],
+    )
+    assert.deepEqual(noEffectsBeforeDispatch.rows[0], {
+      label_attempts: 0,
+      labels: 0,
+      shipments: 0,
+      inventory_ledger: 0,
+      packing_slips: 0,
+      print_jobs: 0,
+      active_package_results: 0,
+      fulfillment_exports: 0,
+    })
+
+    for (const unsafeDiagnostics of [
+      { token: 'must-not-persist' },
+      { bearerToken: 'must-not-persist' },
+      { oauthToken: 'must-not-persist' },
+      { body: '<AccessToken>must-not-persist</AccessToken>' },
+      { headers: [['Authorization', 'Bearer must-not-persist']] },
+    ]) {
+      assert.throws(
+        () => activeDispatchPersistence
+          .createActiveCarrierDispatchTerminalDiagnostics(unsafeDiagnostics),
+        (error) => error?.code
+          === 'OPERATIONS_ACTIVE_DISPATCH_TERMINAL_DIAGNOSTICS_INVALID',
+      )
+      const databaseRedaction = await client.query(
+        `SELECT
+           operations_active_provider_evidence_is_redacted($1::jsonb)
+             AS generic_safe,
+           operations_active_dispatch_terminal_diagnostic_is_safe($1::jsonb)
+             AS terminal_safe`,
+        [JSON.stringify(unsafeDiagnostics)],
+      )
+      assert.equal(databaseRedaction.rows[0].generic_safe, false)
+      assert.equal(databaseRedaction.rows[0].terminal_safe, false)
+    }
+
+    const dispatchedAt = new Date(
+      Math.max(Date.now(), Date.parse(preparedDispatch.persistedAt)),
+    ).toISOString()
+    const completedAt = dispatchedAt
+    const failureDiagnostics = {
+      diagnosticVersion: 1,
+      providerStatus: 'timeout',
+      shipmentOutcome: 'not_created',
+      retryable: true,
+      requestMayHaveReachedProvider: false,
+      responseReceived: false,
+      providerCode: 'ETIMEDOUT',
+    }
+    await expectIndependentServiceError(
+      'unsupported_dispatch_success',
+      'OPERATIONS_ACTIVE_DISPATCH_SUCCESS_MATERIALIZATION_NOT_IMPLEMENTED',
+      501,
+      () => activeDispatchPersistence
+        .finalizeActiveCarrierDispatchAttemptInPostgres({
+          organizationId: ids.organization,
+          attemptGlobalId: preparedDispatch.globalId,
+          outcome: {
+            state: 'succeeded',
+            dispatchedAt,
+            completedAt,
+            redactedResponse: {},
+          },
+        }),
+    )
+    await expectIndependentServiceError(
+      'dispatch_before_durable_prepare',
+      'OPERATIONS_ACTIVE_DISPATCH_TIMESTAMP_INVALID',
+      409,
+      () => activeDispatchPersistence
+        .finalizeActiveCarrierDispatchFailureInPostgres({
+          organizationId: ids.organization,
+          attemptGlobalId: preparedDispatch.globalId,
+          outcome: {
+            dispatchedAt: new Date(
+              Date.parse(preparedDispatch.persistedAt) - 1,
+            ).toISOString(),
+            completedAt,
+            errorCode: 'CARRIER_TIMEOUT',
+            redactedResponse: failureDiagnostics,
+          },
+        }),
+    )
+    await expectIndependentServiceError(
+      'future_dated_dispatch_terminal_evidence',
+      'OPERATIONS_ACTIVE_DISPATCH_TIMESTAMP_INVALID',
+      409,
+      () => activeDispatchPersistence
+        .finalizeActiveCarrierDispatchFailureInPostgres({
+          organizationId: ids.organization,
+          attemptGlobalId: preparedDispatch.globalId,
+          outcome: {
+            dispatchedAt: new Date(Date.now() + 60_000).toISOString(),
+            completedAt: new Date(Date.now() + 60_000).toISOString(),
+            errorCode: 'CARRIER_TIMEOUT',
+            redactedResponse: failureDiagnostics,
+          },
+        }),
+    )
+    const concurrentFailures = await Promise.all([
+      activeDispatchPersistence.finalizeActiveCarrierDispatchFailureInPostgres({
+        organizationId: ids.organization,
+        attemptGlobalId: preparedDispatch.globalId,
+        outcome: {
+          dispatchedAt,
+          completedAt,
+          errorCode: 'CARRIER_TIMEOUT',
+          redactedResponse: failureDiagnostics,
+        },
+      }),
+      activeDispatchPersistence.finalizeActiveCarrierDispatchFailureInPostgres({
+        organizationId: ids.organization,
+        attemptGlobalId: preparedDispatch.globalId,
+        outcome: {
+          dispatchedAt,
+          completedAt,
+          errorCode: 'CARRIER_TIMEOUT',
+          redactedResponse: failureDiagnostics,
+        },
+      }),
+    ])
+    const failedDispatch = concurrentFailures.find((attempt) => !attempt.replayed)
+    const concurrentFailureReplay = concurrentFailures.find(
+      (attempt) => attempt.replayed,
+    )
+    assert.ok(failedDispatch, 'Concurrent finalization did not assign one writer')
+    assert.ok(
+      concurrentFailureReplay,
+      'Concurrent finalization did not return one exact replay',
+    )
+    assert.equal(failedDispatch.state, 'failed')
+    assert.equal(failedDispatch.replayed, false)
+    assert.equal(concurrentFailureReplay.globalId, failedDispatch.globalId)
+
+    const replayedFailure = await activeDispatchPersistence
+      .finalizeActiveCarrierDispatchFailureInPostgres({
+        organizationId: ids.organization,
+        attemptGlobalId: preparedDispatch.globalId,
+        outcome: {
+          dispatchedAt,
+          completedAt,
+          errorCode: 'CARRIER_TIMEOUT',
+          redactedResponse: failureDiagnostics,
+        },
+      })
+    assert.equal(replayedFailure.replayed, true)
+    await expectIndependentServiceError(
+      'changed_terminal_dispatch_evidence',
+      'OPERATIONS_ACTIVE_DISPATCH_FINALIZATION_CONFLICT',
+      409,
+      () => activeDispatchPersistence
+        .finalizeActiveCarrierDispatchFailureInPostgres({
+          organizationId: ids.organization,
+          attemptGlobalId: preparedDispatch.globalId,
+          outcome: {
+            dispatchedAt,
+            completedAt,
+            errorCode: 'CHANGED_FAILURE',
+            redactedResponse: failureDiagnostics,
+          },
+        }),
+    )
+
+    await client.query('BEGIN')
+    await expectDatabaseError(
+      client,
+      'changed_direct_retry_lineage',
+      /must retain its exact provider, service, and package count/,
+      async () => {
+        await client.query('SET LOCAL session_replication_role = replica')
+        await client.query(
+          `UPDATE operations_active_carrier_group_attempts
+           SET selected_service_code = '03',
+               selected_service_name = 'UPS Ground'
+           WHERE organization_id = $1 AND id = $2`,
+          [ids.organization, preparedDispatch.id],
+        )
+        await client.query('SET LOCAL session_replication_role = origin')
+        await client.query(
+          `INSERT INTO operations_active_carrier_group_attempts (
+             organization_id, active_fulfillment_execution_id,
+             active_shipment_group_id, production_rerate_selection_id,
+             attempt_number, state, environment, selected_provider,
+             selected_service_code, selected_service_name, package_count,
+             adapter_version, idempotency_key, request_hash,
+             redacted_request, actor_email, persisted_at
+           )
+           SELECT organization_id, active_fulfillment_execution_id,
+                  active_shipment_group_id, production_rerate_selection_id,
+                  2, 'prepared', environment, selected_provider,
+                  '02', 'UPS 2nd Day Air', package_count, adapter_version,
+                  'changed-direct-retry-lineage', request_hash,
+                  redacted_request, actor_email, clock_timestamp()
+           FROM operations_active_carrier_group_attempts
+           WHERE organization_id = $1 AND id = $2`,
+          [ids.organization, preparedDispatch.id],
+        )
+      },
+    )
+    await client.query('COMMIT')
+
+    const retryDispatch = await activeDispatchPersistence
+      .prepareActiveCarrierDispatchAttemptInPostgres({
+        organizationId: ids.organization,
+        productionRerateSelectionGlobalId: firstSelection.globalId,
+        actorEmail,
+      })
+    assert.equal(retryDispatch.dispatchOwner, true)
+    assert.equal(retryDispatch.attemptNumber, 2)
+    assert.notEqual(retryDispatch.globalId, preparedDispatch.globalId)
+    assert.notEqual(
+      retryDispatch.providerIdempotencyIdentity,
+      preparedDispatch.providerIdempotencyIdentity,
+    )
+
+    const unknownDispatchedAt = new Date(
+      Math.max(Date.now(), Date.parse(retryDispatch.persistedAt)),
+    ).toISOString()
+    const unknownCompletedAt = unknownDispatchedAt
+    const unknownDispatch = await activeDispatchPersistence
+      .finalizeActiveCarrierDispatchFailureInPostgres({
+        organizationId: ids.organization,
+        attemptGlobalId: retryDispatch.globalId,
+        outcome: {
+          dispatchedAt: unknownDispatchedAt,
+          completedAt: unknownCompletedAt,
+          errorCode: 'CARRIER_TIMEOUT',
+          redactedResponse: {
+            diagnosticVersion: 1,
+            providerStatus: 'timeout',
+            shipmentOutcome: 'unknown',
+            retryable: false,
+            requestMayHaveReachedProvider: true,
+            responseReceived: false,
+          },
+        },
+      })
+    assert.equal(unknownDispatch.state, 'unknown')
+    assert.equal(
+      unknownDispatch.errorCode,
+      'UNSAFE_PROVIDER_EVIDENCE_REJECTED',
+    )
+    assert.deepEqual(unknownDispatch.redactedResponse, {
+      diagnosticVersion: 1,
+      providerStatus: 'safety_evidence_rejected',
+      shipmentOutcome: 'unknown',
+      retryable: false,
+      requestMayHaveReachedProvider: true,
+      responseReceived: false,
+    })
+    const blockedUnknownReplay = await activeDispatchPersistence
+      .prepareActiveCarrierDispatchAttemptInPostgres({
+        organizationId: ids.organization,
+        productionRerateSelectionGlobalId: firstSelection.globalId,
+        actorEmail,
+      })
+    assert.equal(blockedUnknownReplay.globalId, retryDispatch.globalId)
+    assert.equal(blockedUnknownReplay.dispatchOwner, false)
+    assert.equal(blockedUnknownReplay.replayed, true)
+    assert.equal(blockedUnknownReplay.state, 'unknown')
+
+    const noEffectsAfterTerminalEvidence = await client.query(
+      `SELECT
+         (SELECT count(*)::int FROM operations_label_attempts
+          WHERE organization_id = $1) AS label_attempts,
+         (SELECT count(*)::int FROM operations_labels
+          WHERE organization_id = $1) AS labels,
+         (SELECT count(*)::int FROM operations_shipments
+          WHERE organization_id = $1) AS shipments,
+         (SELECT count(*)::int FROM operations_inventory_ledger
+          WHERE organization_id = $1) AS inventory_ledger,
+         (SELECT count(*)::int FROM operations_print_artifacts
+          WHERE organization_id = $1
+            AND document_type = 'packing_slip') AS packing_slips,
+         (SELECT count(*)::int FROM operations_print_jobs
+          WHERE organization_id = $1) AS print_jobs,
+         (SELECT count(*)::int FROM operations_active_carrier_package_results
+          WHERE organization_id = $1) AS active_package_results,
+         (SELECT count(*)::int FROM operations_commerce_fulfillment_exports
+          WHERE organization_id = $1) AS fulfillment_exports`,
+      [ids.organization],
+    )
+    assert.deepEqual(
+      noEffectsAfterTerminalEvidence.rows[0],
+      noEffectsBeforeDispatch.rows[0],
+    )
+    assert.equal(providerBoundaryCallCount.value, 0)
+    await client.query('BEGIN')
     await client.query('SET CONSTRAINTS ALL IMMEDIATE')
     await expectDatabaseError(
       client,
@@ -1513,6 +2215,7 @@ async function verifyAcceptance(databaseUrl) {
     await client.query('ROLLBACK').catch(() => {})
     throw error
   } finally {
+    activeDispatchTransactionPool = null
     client.release()
     await pool.end()
   }
@@ -1522,8 +2225,9 @@ async function verifySelectionAuthorityLocks(databaseUrl) {
   const pool = new Pool({
     connectionString: databaseUrl,
     application_name: 'clawpilot-production-rerate-selection-locks',
-    max: 3,
+    max: 5,
   })
+  activeDispatchTransactionPool = pool
   const setup = await pool.connect()
   const selector = await pool.connect()
   const updater = await pool.connect()
@@ -1660,13 +2364,48 @@ async function verifySelectionAuthorityLocks(databaseUrl) {
     for (const [label, sql, parameters] of lockedUpdates) {
       await expectRowLockTimeout(updater, label, sql, parameters)
     }
-    await selector.query('ROLLBACK')
+    await selector.query('COMMIT')
+
+    const concurrentDispatches = await Promise.all([
+      activeDispatchPersistence.prepareActiveCarrierDispatchAttemptInPostgres({
+        organizationId: ids.organization,
+        productionRerateSelectionGlobalId: selection.globalId,
+        actorEmail,
+      }),
+      activeDispatchPersistence.prepareActiveCarrierDispatchAttemptInPostgres({
+        organizationId: ids.organization,
+        productionRerateSelectionGlobalId: selection.globalId,
+        actorEmail,
+      }),
+    ])
+    const dispatchOwner = concurrentDispatches.find(
+      (attempt) => attempt.dispatchOwner,
+    )
+    const dispatchReplay = concurrentDispatches.find(
+      (attempt) => !attempt.dispatchOwner,
+    )
+    assert.ok(dispatchOwner, 'Concurrent prepare did not assign one owner')
+    assert.ok(dispatchReplay, 'Concurrent prepare did not return one replay')
+    assert.equal(dispatchOwner.replayed, false)
+    assert.equal(dispatchReplay.globalId, dispatchOwner.globalId)
+    assert.equal(dispatchReplay.dispatchOwner, false)
+    assert.equal(dispatchReplay.replayed, true)
+
+    const oneDurableOwner = await setup.query(
+      `SELECT count(*)::int AS attempt_count
+       FROM operations_active_carrier_group_attempts
+       WHERE organization_id = $1::uuid
+         AND active_shipment_group_id = $2::uuid`,
+      [ids.organization, ids.activeGroup],
+    )
+    assert.equal(oneDurableOwner.rows[0].attempt_count, 1)
   } catch (error) {
     await setup.query('ROLLBACK').catch(() => {})
     await selector.query('ROLLBACK').catch(() => {})
     await updater.query('ROLLBACK').catch(() => {})
     throw error
   } finally {
+    activeDispatchTransactionPool = null
     setup.release()
     selector.release()
     updater.release()
@@ -1700,7 +2439,19 @@ async function main() {
       timeout: 180_000,
     })
     await verifyAcceptance(databaseUrl)
-    await verifySelectionAuthorityLocks(databaseUrl)
+    const authorityDatabaseUrl = await createDisposablePostgresDatabase(
+      databaseUrl,
+      `clawpilot_rerate_authority_${randomUUID().replaceAll('-', '')}`,
+    )
+    command('node', ['scripts/db-migrate.mjs'], {
+      env: {
+        ...process.env,
+        DATABASE_URL: authorityDatabaseUrl,
+        PGSSLMODE: 'disable',
+      },
+      timeout: 180_000,
+    })
+    await verifySelectionAuthorityLocks(authorityDatabaseUrl)
   } finally {
     spawnSync('docker', ['stop', '-t', '1', container], {
       cwd: root,

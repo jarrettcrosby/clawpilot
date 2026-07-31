@@ -13,13 +13,13 @@ app_visible: false
 
 ## Status And Scope
 
-This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed order workbench, explicit single-warehouse fulfillment-plan acceptance, warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders, a shared product/default-package import workflow, an audited exception queue, organization-scoped activation, direct carrier credential administration, UPS and FedEx sandbox rating and label execution against a fixed synthetic fixture, an authenticated idempotent Shadow-to-Active execution-preparation command, an Active-only read-only UPS/FedEx production whole-shipment rerate command, a separate manual local one-service whole-shipment selection command, append-only redacted provider evidence, durable print delivery, a working-tree packing-slip/artifact and shipment-completion evidence contract, horizontally scrollable mobile Operations subpanel navigation, command-receipt health, and disposable PostgreSQL acceptance. Deterministic mock flows are automated-test evidence only and cannot be launched from the hosted workbench. Active preparation and local selection perform no provider I/O; production rerating is read-only; none creates carrier labels, tracking, shipments, inventory consumption, final packing slips, or commerce writes. This runbook remains `draft` until the module has a hosted production shipment-confirmation command, complete reconciliation and adapter health, tested production mutation adapters, integration/warehouse activation subscopes, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
+This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed order workbench, explicit single-warehouse fulfillment-plan acceptance, warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders, a shared product/default-package import workflow, an audited exception queue, organization-scoped activation, direct carrier credential administration, UPS and FedEx sandbox rating and label execution against a fixed synthetic fixture, an authenticated idempotent Shadow-to-Active execution-preparation command, an Active-only read-only UPS/FedEx production whole-shipment rerate command, a separate manual local one-service whole-shipment selection command, a persistence-only Active dispatch-attempt boundary with one durable owner plus failed/unknown finalization, append-only redacted provider evidence, durable print delivery, a working-tree packing-slip/artifact and shipment-completion evidence contract, horizontally scrollable mobile Operations subpanel navigation, command-receipt health, and disposable PostgreSQL acceptance. Deterministic mock flows are automated-test evidence only and cannot be launched from the hosted workbench. Active preparation and local selection perform no provider I/O; production rerating is read-only; Active dispatch persistence has no command/public route and performs no provider call; none creates production carrier labels, tracking, shipments, inventory consumption, final packing slips, or commerce writes. This runbook remains `draft` until the module has a hosted production shipment-confirmation command, complete reconciliation and adapter health, tested production mutation adapters, integration/warehouse activation subscopes, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
 
 - [ClawPilot Environments and Deployment](clawpilot-environments.md)
 - [Railway Postgres Backups](railway-postgres-backups.md)
 - [Agent Security and Integration Isolation](agent-security-and-isolation.md)
 
-Operations migrations `0081` through `0094`, `0097` through `0099`, `0101`, and `0111` through `0182` are bounded development evidence only. Migrations `0089` and `0090` establish delegated rate paths, multi-account carrier billing, GL Coding, reconciliation, and settlement foundations. Migration `0091` adds capability-aware printer profiles and routing defaults. Migration `0092` hardens carrier-account, charge, match, assignment, GL-run, reconciliation, and settlement provenance. Migration `0093` adds direct checksum-bound carrier CSV import and immutable financial review evidence. Migration `0094` adds enrolled local print agents, leased delivery attempts, fallback routing, and controlled reprints. Migration `0097` enforces append-only settlement transitions and current-status projections. Migration `0098` adds immutable carrier-label attempts, one-active-label enforcement, exact carrier-account evidence, sandbox create/void finalization. Migration `0099` adds immutable packing-slip payloads, append-only `gto` tracking observations, and durable `gfe` commerce-fulfillment export intents. Migration `0101` adds facility classification, editable hierarchical warehouse locations, capacity limits, product-location placement rules, and receiving data foundations. Migrations `0111` through `0115` establish commerce credentials/evidence, a disposable preview, bounded product-mapping and operational-order candidates, durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and explicit canonical promotion. Migrations `0119` and `0120` add the versioned product-intake pause/resume policy plus the leased, product-only, full-catalog reconciliation queue; they do not establish historical closed-order import, provider inventory synchronization, or unattended order processing. Migration `0116` adds durable rate-selected sandbox test-label attempts and decoded bytes plus a no-order print-artifact source. Migration `0117` gives each local print agent explicit format, media, and document capabilities, requires bound printer profiles to be a subset, and fences claims against the runtime-declared capability profile. Migration `0169` adds the separate leased development-only Shopify inventory refresh queue, account-level provider-read single-flight fence, bounded retry/dead-letter state, and worker health projection; it authorizes no Shopify write and no order quantity adjustment. Migration `0171` replaces the shared Shopify CarrierService readiness function so only an exactly active commerce account is eligible. Migration `0172` permits only bounded same-token renewal for live inventory-read leases and expired-token rotation for immutable captured reads; all non-lease attempt evidence and terminal rows remain immutable. Migration `0176` adds immutable accepted-plan/package evidence links, explicit local-balance versus Shopify provider-commitment reservation authority, and database guards that prevent provider-authoritative inventory from receiving a second local balance or ledger mutation. Migration `0177` adds immutable Shadow-only checkout-versus-fulfillment package/rate evidence, whole-shipment UPS/FedEx sandbox attempts, mandatory estimated variance, and explicit zero-write lineage without creating a shipment, label, tracking number, final packing slip, or commerce fulfillment. These migrations do not by themselves expose or authorize production shipment confirmation or directed putaway. Do not use this document as evidence that a production commerce mutation or carrier shipment/label adapter, accounting export, invoice/AR workflow, payment adapter, directed putaway worker, or live warehouse worker is deployed. Migration `0088` archives legacy mock orders, releases their reservations, hides them from active workbench projections, disables mock integration/facility records, and retains immutable evidence rather than deleting it.
+Operations migrations `0081` through `0094`, `0097` through `0099`, `0101`, and `0111` through `0187` are bounded development evidence only. Migrations `0089` and `0090` establish delegated rate paths, multi-account carrier billing, GL Coding, reconciliation, and settlement foundations. Migration `0091` adds capability-aware printer profiles and routing defaults. Migration `0092` hardens carrier-account, charge, match, assignment, GL-run, reconciliation, and settlement provenance. Migration `0093` adds direct checksum-bound carrier CSV import and immutable financial review evidence. Migration `0094` adds enrolled local print agents, leased delivery attempts, fallback routing, and controlled reprints. Migration `0097` enforces append-only settlement transitions and current-status projections. Migration `0098` adds immutable carrier-label attempts, one-active-label enforcement, exact carrier-account evidence, sandbox create/void finalization. Migration `0099` adds immutable packing-slip payloads, append-only `gto` tracking observations, and durable `gfe` commerce-fulfillment export intents. Migration `0101` adds facility classification, editable hierarchical warehouse locations, capacity limits, product-location placement rules, and receiving data foundations. Migrations `0111` through `0115` establish commerce credentials/evidence, a disposable preview, bounded product-mapping and operational-order candidates, durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and explicit canonical promotion. Migrations `0119` and `0120` add the versioned product-intake pause/resume policy plus the leased, product-only, full-catalog reconciliation queue; they do not establish historical closed-order import, provider inventory synchronization, or unattended order processing. Migration `0116` adds durable rate-selected sandbox test-label attempts and decoded bytes plus a no-order print-artifact source. Migration `0117` gives each local print agent explicit format, media, and document capabilities, requires bound printer profiles to be a subset, and fences claims against the runtime-declared capability profile. Migration `0169` adds the separate leased development-only Shopify inventory refresh queue, account-level provider-read single-flight fence, bounded retry/dead-letter state, and worker health projection; it authorizes no Shopify write and no order quantity adjustment. Migration `0171` replaces the shared Shopify CarrierService readiness function so only an exactly active commerce account is eligible. Migration `0172` permits only bounded same-token renewal for live inventory-read leases and expired-token rotation for immutable captured reads; all non-lease attempt evidence and terminal rows remain immutable. Migration `0176` adds immutable accepted-plan/package evidence links, explicit local-balance versus Shopify provider-commitment reservation authority, and database guards that prevent provider-authoritative inventory from receiving a second local balance or ledger mutation. Migration `0177` adds immutable Shadow-only checkout-versus-fulfillment package/rate evidence, whole-shipment UPS/FedEx sandbox attempts, mandatory estimated variance, and explicit zero-write lineage without creating a shipment, label, tracking number, final packing slip, or commerce fulfillment. These migrations do not by themselves expose or authorize production shipment confirmation or directed putaway. Do not use this document as evidence that a production commerce mutation or carrier shipment/label adapter, accounting export, invoice/AR workflow, payment adapter, directed putaway worker, or live warehouse worker is deployed. Migration `0088` archives legacy mock orders, releases their reservations, hides them from active workbench projections, disables mock integration/facility records, and retains immutable evidence rather than deleting it.
 
 Migration `0178` adds one tenant- and Shopify-account-scoped row per exact
 Customer GID for checkout audience intent, optimistic row-version fences,
@@ -46,6 +46,67 @@ reason to each immutable Active preparation. The preparation command locks and
 rechecks that order version, fails closed on an open high or critical order
 exception, and requires every current physical package's sequence, dimensions,
 and weight to match the immutable Shadow rate-run package evidence exactly.
+
+Migrations `0183` through `0187` apply stricter production carrier-evidence redaction guards
+to the immutable Active dispatch request, terminal diagnostics, Active-linked
+label evidence, and package-result evidence. Terminal diagnostics are a small
+application-generated allowlist; arbitrary bodies, headers, and token aliases
+are rejected, and unsafe terminal evidence is recorded as unknown with only a
+constant-safe diagnostic. The companion
+persistence service is not an executor: it exposes no command/public route and
+performs zero token, HTTP, or carrier adapter calls. It prepares one exact
+selection-backed attempt under transaction locks, returns dispatch ownership
+to one caller, and returns the same durable attempt without ownership on exact
+replay. Retry requires a terminal failed diagnostic with `retryable: true`,
+`shipmentOutcome: 'not_created'`, and either proof that the request never
+reached the provider or a received `provider_rejected` response. The retry
+retains the provider, service, and package group and receives the next
+consecutive attempt and a fresh provider idempotency identity. The prepare
+transaction commits before ownership is returned. Dispatch cannot predate
+durable preparation, completion cannot predate dispatch, terminal timestamps
+cannot exceed the database clock by more than five seconds, and retry prepare
+chronology cannot predate the prior completion. Safe known-failure and unknown
+outcomes finalize exactly once; ambiguous or unsafe failure evidence is
+converted to constant-safe unknown. Unknown and
+prepared outcomes block another dispatch and require reconciliation rather
+than blind retry. Successful finalization is intentionally blocked until the
+application can atomically materialize all package labels, shipments, tracking
+facts, inventory effects, and completion artifacts. Migration `0183` installs
+four new-write constraints as `NOT VALID`; migrations `0184` through `0187`
+then validate the populated group-attempt, package-result, Active-linked
+label-attempt, and Active-linked label tables in separate migrations so each
+table scan owns its own validation
+transaction.
+
+### Active Dispatch Persistence State Handling
+
+1. Treat `dispatchOwner: true` as ownership of the durable prepared attempt,
+   not as proof that a carrier call occurred. The current persistence slice has
+   no route or executor that can make that call.
+2. Treat an exact replay with `dispatchOwner: false` as read-only recovery of
+   the existing attempt. Do not call the carrier again.
+3. Retry only after a terminal `failed` diagnostic proves all of the following:
+   `retryable: true`, `shipmentOutcome: 'not_created'`, and either
+   `requestMayHaveReachedProvider: false` or a received `provider_rejected`
+   response. Retain the same provider, service, and package group; allocate the
+   next consecutive attempt and a fresh provider idempotency identity.
+4. Stop on `prepared` or `unknown`. A timeout, missing response, unsafe
+   diagnostic, or otherwise ambiguous failed result becomes constant-safe
+   unknown evidence and requires reconciliation; never infer nonshipment.
+5. Enforce chronology against the database clock: dispatch is at or after
+   durable prepare, completion is at or after dispatch, terminal timestamps
+   are no more than five seconds in the future, and a retry prepare is at or
+   after the preceding attempt's completion.
+6. Persist only bounded, redacted request and terminal diagnostic objects. Raw
+   credentials, tokens, authorization headers, account numbers, provider
+   request/response bodies, and label bytes do not belong in these JSON fields.
+   The group-attempt, package-result, Active-linked label-attempt, and
+   Active-linked label constraints are separately validated by migrations
+   `0184` through `0187`.
+7. Do not attempt a `succeeded` finalization. That state remains deliberately
+   unavailable until package-level labels, shipments, tracking, inventory,
+   packing artifacts, and commerce-export intent share one certified atomic
+   materialization boundary.
 
 Run `npm run test:shopify-customer-rate-policies-postgres` with Docker
 available to apply the complete migration chain to an isolated PostgreSQL 16
