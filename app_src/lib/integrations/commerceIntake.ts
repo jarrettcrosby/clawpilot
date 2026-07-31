@@ -72,7 +72,7 @@ import {
   type CommerceIntakeReadIntentTarget,
 } from '@/lib/persistence/commerceIntake'
 
-const INTAKE_POLICY_VERSION = 'commerce-intake-resolution-v1'
+const INTAKE_POLICY_VERSION = 'commerce-intake-resolution-v2'
 const INTAKE_RETENTION_DAYS = 30
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i

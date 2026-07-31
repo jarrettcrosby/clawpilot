@@ -26,6 +26,10 @@ import {
   resolveCommerceRuntimePack,
   type CommerceRuntimePackMapping,
 } from '@/lib/integrations/commercePackRuntime'
+import {
+  resolveCommerceOrderLineProviderPrice,
+  storableCommerceOrderLineProviderMoney,
+} from '@/lib/integrations/commerceOrderStaging'
 import type { CommerceRuntimeCredentialRecord } from '@/lib/persistence/commerceIntegrations'
 import {
   commerceCurrencyMinorUnit,
@@ -58,7 +62,7 @@ import {
   type ShopifyCheckoutRateReconciliationOutcome,
 } from '@/lib/persistence/shopifyCheckoutRating'
 
-const POLICY_VERSION = 'commerce-intake-resolution-v1'
+const POLICY_VERSION = 'commerce-intake-resolution-v2'
 const PRODUCT_INTAKE_POLICY_VERSION = 'commerce-product-intake-policy-v1'
 const DEFAULT_SLA_POLICY_VERSION = 'commerce-default-sla-v1'
 const DEFAULT_SLA_DAYS = 7
@@ -1809,6 +1813,46 @@ function dynamicCandidateBlockingCodes(
     for (const code of dynamicLineBlockingCodes(line)) codes.add(code)
   }
   return [...codes].sort()
+}
+
+async function reconcileFreshCandidateBlockers(
+  client: PoolClient,
+  candidateId: string,
+  actorEmail: string,
+) {
+  const selected = await client.query<CandidateRow>(
+    `${CANDIDATE_SELECT}
+     WHERE candidate.id = $1::uuid
+     FOR UPDATE OF candidate`,
+    [candidateId],
+  )
+  const candidate = selected.rows[0]
+  if (!candidate) {
+    intakeError(
+      'COMMERCE_INTAKE_CANDIDATE_MISSING',
+      'The freshly staged order candidate is unavailable',
+      409,
+    )
+  }
+  const lines = await candidateLines(client, candidate, true)
+  const blockingCodes = dynamicCandidateBlockingCodes(candidate, lines)
+  const updated = await client.query(
+    `UPDATE operations_commerce_order_candidates
+     SET blocking_codes = $2::text[],
+         row_version = row_version + 1,
+         updated_by = $3,
+         updated_at = now()
+     WHERE id = $1::uuid
+       AND workflow_state = 'held'`,
+    [candidateId, blockingCodes, actorEmail],
+  )
+  if (updated.rowCount !== 1) {
+    intakeError(
+      'COMMERCE_INTAKE_CANDIDATE_STATE_CONFLICT',
+      'The freshly staged order candidate changed state before reconciliation',
+      409,
+    )
+  }
 }
 
 function shopifyCandidateQuantitiesAreExact(lines: CandidateLineRow[]) {
@@ -4813,6 +4857,12 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         const lineSubtotal = optionalMoney(line.lineSubtotal)
         const lineDiscount = optionalMoney(line.lineDiscount)
         const lineTax = optionalMoney(line.lineTax)
+        const providerLineMoney = storableCommerceOrderLineProviderMoney({
+          unitPrice,
+          subtotal: lineSubtotal,
+          discount: lineDiscount,
+          tax: lineTax,
+        })
         const packaging = availableValue(line.packaging)
         const runtimePack = resolveCommerceRuntimePack({
           mapping: line.requiresShipping && identity
@@ -4842,9 +4892,18 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         const packagingState = line.requiresShipping
           ? (resolvedPackaging ? 'resolved' : 'unresolved')
           : 'not_required'
+        const providerPriceResolution = resolveCommerceOrderLineProviderPrice({
+          orderCurrency: order.currency,
+          unitPrice,
+          unfulfilledQuantity: quantity.unfulfilled,
+        })
         const codes = lineBlockingCodes(line).filter((code) => {
           if (code === 'product_mapping_required' && mapping) return false
           if (code === 'packaging_required' && resolvedPackaging) return false
+          if (
+            code === 'line_price_required'
+            && !providerPriceResolution.requiresOperatorResolution
+          ) return false
           return true
         })
         if (
@@ -4856,7 +4915,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           codes.sort()
         }
         if (
-          quantity.unfulfilled > 0
+          providerPriceResolution.requiresOperatorResolution
           && !codes.includes('line_price_required')
         ) {
           codes.push('line_price_required')
@@ -4874,7 +4933,8 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
              unit_multiplier, physical_quantity, currency_code,
              unit_price_minor, subtotal_minor, discount_minor,
              brand_discount_minor, tax_minor, other_adjustment_minor,
-             total_minor, price_resolution_state, requires_shipping,
+             total_minor, price_resolution_state, resolved_currency_code,
+             resolved_unit_price_minor, requires_shipping,
              mapping_state, product_id, product_mapping_id, packaging_state,
              package_profile_id, commerce_variant_pack_mapping_id,
              commerce_variant_pack_mapping_row_version,
@@ -4889,7 +4949,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
              $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid,
              $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
              $17, $18, $19, $20, $21, 0, $22, $23, $24, $25, $26,
-             $27, NULL, $28, NULL, NULL, 'unresolved', $29, $30,
+             $27, NULL, $28, NULL, NULL, $54, $55, $56::bigint, $29, $30,
              $31::uuid, $32::uuid, $33, NULL, $34::uuid, $35,
              $36::uuid, $37, $38, $39, $40, $41, $42, $43, $44, $45,
              $46::timestamptz, $47, $48, $49, $50, 'held', $51::text[],
@@ -4923,11 +4983,19 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
             quantity.unfulfilled,
             line.unitMultiplier || 1,
             line.physicalUnitQuantity,
-            unitPrice?.currency || null,
-            unitPrice ? bigintString(unitPrice.amountMinor) : null,
-            lineSubtotal ? bigintString(lineSubtotal.amountMinor) : null,
-            lineDiscount ? bigintString(lineDiscount.amountMinor) : null,
-            lineTax ? bigintString(lineTax.amountMinor) : null,
+            providerLineMoney.currencyCode,
+            providerLineMoney.unitPriceMinor === null
+              ? null
+              : bigintString(providerLineMoney.unitPriceMinor),
+            providerLineMoney.subtotalMinor === null
+              ? null
+              : bigintString(providerLineMoney.subtotalMinor),
+            providerLineMoney.discountMinor === null
+              ? null
+              : bigintString(providerLineMoney.discountMinor),
+            providerLineMoney.taxMinor === null
+              ? null
+              : bigintString(providerLineMoney.taxMinor),
             line.requiresShipping,
             mappingState,
             mapping?.product_id || null,
@@ -4967,9 +5035,19 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
             codes,
             input.actorEmail,
             input.envelope.retentionExpiresAt,
+            providerPriceResolution.state,
+            providerPriceResolution.resolvedCurrencyCode,
+            providerPriceResolution.resolvedUnitPriceMinor === null
+              ? null
+              : bigintString(providerPriceResolution.resolvedUnitPriceMinor),
           ],
         )
       }
+      await reconcileFreshCandidateBlockers(
+        client,
+        candidateId,
+        input.actorEmail,
+      )
       ordersStaged += 1
     }
 

@@ -1067,8 +1067,12 @@ includes(persistenceSource, [
   "'excluded_no_unfulfilled_quantity'",
   'line.unfulfilled_quantity,',
   "'no_unfulfilled_quantity'",
-  'quantity.unfulfilled > 0',
-  "&& !codes.includes('line_price_required')",
+  'resolveCommerceOrderLineProviderPrice({',
+  'storableCommerceOrderLineProviderMoney({',
+  'providerPriceResolution.requiresOperatorResolution',
+  'providerPriceResolution.resolvedCurrencyCode',
+  'providerPriceResolution.resolvedUnitPriceMinor',
+  'reconcileFreshCandidateBlockers(',
   'PRODUCT_CANDIDATE_SELECT',
   'SELECT DISTINCT ON (selected.external_variant_id)',
   'latest_unexpired_per_account_provider_variant',
@@ -1217,6 +1221,9 @@ const commerceProductChannelOffersModule = loadTypeScriptModule(
 const commercePackRuntimeModule = loadTypeScriptModule(
   'app_src/lib/integrations/commercePackRuntime.ts',
 )
+const commerceOrderStagingModule = loadTypeScriptModule(
+  'app_src/lib/integrations/commerceOrderStaging.ts',
+)
 const productIdentityLocks = []
 const automaticProductResolutionModule = loadTypeScriptModule(
   'app_src/lib/persistence/commerceIntake.ts',
@@ -1238,6 +1245,8 @@ const automaticProductResolutionModule = loadTypeScriptModule(
         commerceProductChannelOffersModule,
       '@/lib/integrations/commercePackRuntime':
         commercePackRuntimeModule,
+      '@/lib/integrations/commerceOrderStaging':
+        commerceOrderStagingModule,
       '@/lib/operations/commerceNormalization': {
         commerceCurrencyMinorUnit: () => 2,
       },
@@ -1781,6 +1790,8 @@ const customerIdentityPersistence = loadTypeScriptModule(
         commerceProductChannelOffersModule,
       '@/lib/integrations/commercePackRuntime':
         commercePackRuntimeModule,
+      '@/lib/integrations/commerceOrderStaging':
+        commerceOrderStagingModule,
       '@/lib/operations/commerceNormalization': {
         commerceCurrencyMinorUnit() { return 2 },
       },
