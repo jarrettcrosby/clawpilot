@@ -291,6 +291,10 @@ for (const fragment of [
   'requireUserManagedCarrierConnection',
   "'CARRIER_DELEGATION_SOURCE_MANAGED'",
   "sanitized.code !== 'CARRIER_DELEGATION_SOURCE_MANAGED'",
+  'rateEvidenceGlobalId',
+  'requireFailureEvidence',
+  "'CARRIER_RATE_EVIDENCE_PERSISTENCE_FAILED'",
+  "'system:shopify-carrier-service'",
 ]) {
   assert.ok(service.includes(fragment), `Carrier service contract missing ${fragment}`)
 }
@@ -703,8 +707,16 @@ assert.throws(
 let delegatedRevealAuditCount = 0
 let delegatedCredentialVerificationCount = 0
 let delegatedRateEvidenceCount = 0
+let delegatedRateEvidenceWriteFailure = false
 const delegatedRateEvidenceInputs = []
 const delegatedMutationCalls = []
+class DelegatedCarrierCredentialClientError extends Error {
+  constructor(message, status, code) {
+    super(message)
+    this.status = status
+    this.code = code
+  }
+}
 let delegatedConfiguration = {
   authorizationScope: 'sandbox_rating_only',
   allowedCapabilities: ['sandbox_rate'],
@@ -717,7 +729,7 @@ const delegatedCarrierServiceModule = loadTypeScriptModule(
   {
     mocks: {
       '@/lib/integrations/carrierCredentialClient': {
-        CarrierCredentialClientError: Error,
+        CarrierCredentialClientError: DelegatedCarrierCredentialClientError,
         verifyCarrierCredential: async () => {
           delegatedCredentialVerificationCount += 1
           return {}
@@ -753,7 +765,24 @@ const delegatedCarrierServiceModule = loadTypeScriptModule(
             weightUnit: 'LB',
           },
         }),
+        buildCarrierSandboxShipmentRateFixture: ({
+          senderName,
+          registeredAddress,
+          destination,
+          parcels,
+        }) => ({
+          origin: { name: senderName, ...registeredAddress },
+          destination,
+          parcels,
+        }),
         carrierSandboxRateRequestEvidence: () => ({}),
+        carrierSandboxShipmentRateRequestEvidence: (_provider, fixture) => ({
+          requestHash: 'd'.repeat(64),
+          redactedRequest: {
+            rateScope: 'multi_package_shipment',
+            packageCount: fixture.parcels.length,
+          },
+        }),
         requestCarrierSandboxRates: async () => ({
           result: {
             provider: 'ups_rest',
@@ -778,6 +807,13 @@ const delegatedCarrierServiceModule = loadTypeScriptModule(
             completedAt: '2026-07-27T12:00:01.000Z',
           },
         }),
+        requestCarrierSandboxShipmentRates: async () => {
+          throw new DelegatedCarrierCredentialClientError(
+            'Carrier request timed out',
+            504,
+            'CARRIER_PROVIDER_TIMEOUT',
+          )
+        },
       },
       '@/lib/integrations/carrierCredentialCrypto': cryptoModule,
       '@/lib/persistence/carrierIntegrations': {
@@ -820,6 +856,9 @@ const delegatedCarrierServiceModule = loadTypeScriptModule(
           delegatedRevealAuditCount += 1
         },
         writeCarrierSandboxRateEvidenceInPostgres: async (input) => {
+          if (delegatedRateEvidenceWriteFailure) {
+            throw new Error('rate evidence database unavailable')
+          }
           delegatedRateEvidenceCount += 1
           delegatedRateEvidenceInputs.push(input)
           return 'grq1234567'
@@ -999,6 +1038,102 @@ assert.equal(
   'cartonization_package_rate',
 )
 
+await assert.rejects(
+  delegatedCarrierServiceModule.testCarrierSandboxShipmentRate({
+    organizationId,
+    provider: 'ups_rest',
+    environment: 'sandbox',
+    carrierAccountGlobalId,
+    destination: {
+      name: 'John Doe',
+      line1: '101 Academy Drive',
+      line2: null,
+      city: 'Buzzards Bay',
+      region: 'MA',
+      postalCode: '02532',
+      countryCode: 'US',
+    },
+    parcels: [{
+      description: 'AG12V2 optimized carton',
+      exteriorInches: { length: 11, width: 9, height: 7 },
+      grossPounds: 2.498,
+    }],
+    actorEmail: 'system:shopify-carrier-service',
+  }),
+  (error) => (
+    error.code === 'CARRIER_PROVIDER_TIMEOUT'
+    && error.status === 504
+    && error.rateEvidenceGlobalId === 'grq1234567'
+  ),
+  'A failed checkout carrier call must return its durable failure evidence ID',
+)
+assert.equal(delegatedRateEvidenceCount, 3)
+assert.equal(delegatedRateEvidenceInputs[2].status, 'failed')
+assert.equal(
+  delegatedRateEvidenceInputs[2].errorCode,
+  'CARRIER_PROVIDER_TIMEOUT',
+)
+
+delegatedRateEvidenceWriteFailure = true
+await assert.rejects(
+  delegatedCarrierServiceModule.testCarrierSandboxShipmentRate({
+    organizationId,
+    provider: 'ups_rest',
+    environment: 'sandbox',
+    carrierAccountGlobalId,
+    destination: {
+      name: 'John Doe',
+      line1: '101 Academy Drive',
+      line2: null,
+      city: 'Buzzards Bay',
+      region: 'MA',
+      postalCode: '02532',
+      countryCode: 'US',
+    },
+    parcels: [{
+      description: 'AG12V2 optimized carton',
+      exteriorInches: { length: 11, width: 9, height: 7 },
+      grossPounds: 2.498,
+    }],
+    actorEmail: 'system:shopify-carrier-service',
+  }),
+  (error) => (
+    error.code === 'CARRIER_RATE_EVIDENCE_PERSISTENCE_FAILED'
+    && error.status === 503
+    && error.rateEvidenceGlobalId === null
+  ),
+  'Checkout must fail closed when provider-failure evidence cannot be stored',
+)
+await assert.rejects(
+  delegatedCarrierServiceModule.testCarrierSandboxShipmentRate({
+    organizationId,
+    provider: 'ups_rest',
+    environment: 'sandbox',
+    carrierAccountGlobalId,
+    destination: {
+      name: 'John Doe',
+      line1: '101 Academy Drive',
+      line2: null,
+      city: 'Buzzards Bay',
+      region: 'MA',
+      postalCode: '02532',
+      countryCode: 'US',
+    },
+    parcels: [{
+      description: 'AG12V2 optimized carton',
+      exteriorInches: { length: 11, width: 9, height: 7 },
+      grossPounds: 2.498,
+    }],
+    actorEmail: 'owner@example.com',
+  }),
+  (error) => (
+    error.code === 'CARRIER_PROVIDER_TIMEOUT'
+    && error.rateEvidenceGlobalId === null
+  ),
+  'Non-checkout diagnostics must retain the original provider failure',
+)
+delegatedRateEvidenceWriteFailure = false
+
 delegatedConfiguration = {
   authorizationScope: 'sandbox_rating_only',
   allowedCapabilities: ['sandbox_rate', 'sandbox_label'],
@@ -1048,7 +1183,7 @@ for (const driftedAction of [
 }
 assert.equal(
   delegatedRateEvidenceCount,
-  2,
+  3,
   'A drifted source-managed connection must not write rate evidence',
 )
 

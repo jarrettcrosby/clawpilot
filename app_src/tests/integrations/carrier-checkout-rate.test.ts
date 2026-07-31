@@ -63,7 +63,18 @@ function result(
   }
 }
 
-test('rates the complete package set exactly once per required carrier', async () => {
+function providerFailure(
+  code = 'CARRIER_PROVIDER_TIMEOUT',
+  rateEvidenceGlobalId = 'grq0000002',
+  message = 'provider unavailable',
+) {
+  return Object.assign(new Error(message), {
+    code,
+    rateEvidenceGlobalId,
+  })
+}
+
+test('rates the complete package set exactly once per configured carrier', async () => {
   const calls: Array<{
     provider: string
     parcels: Array<Record<string, unknown>>
@@ -128,6 +139,24 @@ test('rates the complete package set exactly once per required carrier', async (
   )
   assert.equal(response.packageCount, 2)
   assert.equal(response.offers.length, 2)
+  assert.deepEqual(response.configuredProviders, ['ups_rest', 'fedex_rest'])
+  assert.deepEqual(response.successfulProviders, ['ups_rest', 'fedex_rest'])
+  assert.deepEqual(response.providerAttempts, [
+    {
+      provider: 'ups_rest',
+      carrierAccountGlobalId: 'gac0000001',
+      status: 'succeeded',
+      failureCode: null,
+      rateEvidenceGlobalId: 'grq0000001',
+    },
+    {
+      provider: 'fedex_rest',
+      carrierAccountGlobalId: 'gac0000002',
+      status: 'succeeded',
+      failureCode: null,
+      rateEvidenceGlobalId: 'grq0000002',
+    },
+  ])
   assert.deepEqual(
     response.offers.map(({ carrierCode, amountMinor }) => ({
       carrierCode,
@@ -417,54 +446,71 @@ test('rates every candidate with one service covering its full package set', asy
   ])
 })
 
-test('fails closed when the authoritative baseline loses a required carrier', async () => {
+test('retains an authoritative baseline when one provider is unavailable', async () => {
   let alternativeCalls = 0
-  await assert.rejects(
-    rateOptimizedCheckoutPlans({
-      destination,
-      candidates: [
-        {
-          candidateKey: 'candidate-baseline',
-          parcels: [parcels[0]],
-          materialCostMinor: 0,
-          unusedCubeMm3: 100,
-        },
-        {
-          candidateKey: 'candidate-alternative',
-          parcels,
-          materialCostMinor: 0,
-          unusedCubeMm3: 50,
-        },
-      ],
-      carriers,
-      currency: 'USD',
-      deadlineAt: Date.now() + 5_000,
-      policy: {
-        ...priceFirstPolicy,
-        objectivePriority: [...priceFirstPolicy.objectivePriority],
+  const response = await rateOptimizedCheckoutPlans({
+    destination,
+    candidates: [
+      {
+        candidateKey: 'candidate-baseline',
+        parcels: [parcels[0]],
+        materialCostMinor: 0,
+        unusedCubeMm3: 100,
       },
-      invoke: async (selection, request) => {
-        if (request.parcels.length > 1) alternativeCalls += 1
-        if (selection.provider === 'fedex_rest') {
-          throw new Error('baseline provider unavailable')
-        }
-        return optimizedResult(
-          selection,
-          request.parcels.length,
-          '10.00',
-        )
+      {
+        candidateKey: 'candidate-alternative',
+        parcels,
+        materialCostMinor: 0,
+        unusedCubeMm3: 50,
       },
-    }),
-    (error: unknown) => (
-      error instanceof CheckoutShipmentRateError
-      && error.code === 'CHECKOUT_RATE_REQUIRED_CARRIER_FAILED'
-      && error.provider === 'fedex_rest'
-    ),
+    ],
+    carriers,
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    policy: {
+      ...priceFirstPolicy,
+      objectivePriority: [...priceFirstPolicy.objectivePriority],
+    },
+    invoke: async (selection, request) => {
+      if (request.parcels.length > 1) alternativeCalls += 1
+      if (selection.provider === 'fedex_rest') {
+        throw providerFailure()
+      }
+      return optimizedResult(
+        selection,
+        request.parcels.length,
+        '10.00',
+      )
+    },
+  })
+  assert.equal(response.selectedCandidate.candidateKey, 'candidate-baseline')
+  assert.equal(response.selectedRateResult.offers.length, 1)
+  assert.equal(response.candidateAttempts[0]?.status, 'degraded')
+  assert.equal(
+    response.candidateAttempts[0]?.failureCode,
+    'CARRIER_PROVIDER_TIMEOUT',
   )
-  assert.equal(alternativeCalls, 0)
+  assert.ok(response.candidateAttempts[0]?.evaluation)
+  assert.deepEqual(response.selectedRateResult.providerAttempts, [
+    {
+      provider: 'ups_rest',
+      carrierAccountGlobalId: 'gac0000001',
+      status: 'succeeded',
+      failureCode: null,
+      rateEvidenceGlobalId: 'grq0000001',
+    },
+    {
+      provider: 'fedex_rest',
+      carrierAccountGlobalId: 'gac0000002',
+      status: 'degraded',
+      failureCode: 'CARRIER_PROVIDER_TIMEOUT',
+      rateEvidenceGlobalId: 'grq0000002',
+    },
+  ])
+  assert.equal(alternativeCalls, 2)
 })
 
-test('retains a complete baseline when an optional candidate loses a carrier', async () => {
+test('retains an optional candidate when one provider is unavailable', async () => {
   const response = await rateOptimizedCheckoutPlans({
     destination,
     candidates: [
@@ -493,7 +539,11 @@ test('retains a complete baseline when an optional candidate loses a carrier', a
         request.parcels.length === 2
         && selection.provider === 'fedex_rest'
       ) {
-        throw new Error('alternative provider unavailable')
+        throw providerFailure(
+          'CHECKOUT_RATE_PROVIDER_FAILED',
+          'grq0000002',
+          'alternative provider unavailable',
+        )
       }
       return optimizedResult(
         selection,
@@ -521,8 +571,27 @@ test('retains a complete baseline when an optional candidate loses a carrier', a
       {
         key: 'candidate-alternative',
         status: 'degraded',
-        failureCode: 'CHECKOUT_RATE_REQUIRED_CARRIER_FAILED',
-        offers: 0,
+        failureCode: 'CHECKOUT_RATE_PROVIDER_FAILED',
+        offers: 1,
+      },
+    ],
+  )
+  assert.deepEqual(
+    response.candidateAttempts[1]?.result?.providerAttempts,
+    [
+      {
+        provider: 'ups_rest',
+        carrierAccountGlobalId: 'gac0000001',
+        status: 'succeeded',
+        failureCode: null,
+        rateEvidenceGlobalId: 'grq0000001',
+      },
+      {
+        provider: 'fedex_rest',
+        carrierAccountGlobalId: 'gac0000002',
+        status: 'degraded',
+        failureCode: 'CHECKOUT_RATE_PROVIDER_FAILED',
+        rateEvidenceGlobalId: 'grq0000002',
       },
     ],
   )
@@ -694,7 +763,100 @@ test('passes a ZIP-only rate destination to each carrier adapter', async () => {
   ])
 })
 
-test('fails the entire quote when a required carrier fails', async () => {
+test('returns usable offers when one configured carrier fails', async () => {
+  const response = await rateCheckoutShipment({
+    destination,
+    parcels,
+    carriers,
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    invoke: async (selection) => {
+      if (selection.provider === 'fedex_rest') {
+        throw providerFailure(
+          'CARRIER_PROVIDER_TIMEOUT',
+          'grq0000002',
+          'timeout',
+        )
+      }
+      return result(selection, '42.85')
+    },
+  })
+
+  assert.deepEqual(response.successfulProviders, ['ups_rest'])
+  assert.deepEqual(
+    response.offers.map((offer) => offer.carrierCode),
+    ['ups'],
+  )
+  assert.deepEqual(response.providerAttempts, [
+    {
+      provider: 'ups_rest',
+      carrierAccountGlobalId: 'gac0000001',
+      status: 'succeeded',
+      failureCode: null,
+      rateEvidenceGlobalId: 'grq0000001',
+    },
+    {
+      provider: 'fedex_rest',
+      carrierAccountGlobalId: 'gac0000002',
+      status: 'degraded',
+      failureCode: 'CARRIER_PROVIDER_TIMEOUT',
+      rateEvidenceGlobalId: 'grq0000002',
+    },
+  ])
+})
+
+test('returns FedEx offers when UPS times out with durable evidence', async () => {
+  let aborted = 0
+  const response = await rateCheckoutShipment({
+    destination,
+    parcels,
+    carriers,
+    currency: 'USD',
+    deadlineAt: Date.now() + 25,
+    invoke: async (selection, request) => {
+      if (selection.provider === 'fedex_rest') {
+        return result(selection, '39.62')
+      }
+      return new Promise((_resolve, reject) => {
+        request.signal.addEventListener('abort', () => {
+          aborted += 1
+          setTimeout(() => {
+            reject(providerFailure(
+              'CARRIER_PROVIDER_TIMEOUT',
+              'grq0000001',
+              'UPS timed out',
+            ))
+          }, 10)
+        }, { once: true })
+      })
+    },
+  })
+
+  assert.equal(aborted, 1)
+  assert.deepEqual(response.successfulProviders, ['fedex_rest'])
+  assert.deepEqual(
+    response.offers.map((offer) => offer.carrierCode),
+    ['fedex'],
+  )
+  assert.deepEqual(response.providerAttempts, [
+    {
+      provider: 'ups_rest',
+      carrierAccountGlobalId: 'gac0000001',
+      status: 'degraded',
+      failureCode: 'CARRIER_PROVIDER_TIMEOUT',
+      rateEvidenceGlobalId: 'grq0000001',
+    },
+    {
+      provider: 'fedex_rest',
+      carrierAccountGlobalId: 'gac0000002',
+      status: 'succeeded',
+      failureCode: null,
+      rateEvidenceGlobalId: 'grq0000002',
+    },
+  ])
+})
+
+test('rejects partial rates when failed-provider evidence is missing', async () => {
   await assert.rejects(
     rateCheckoutShipment({
       destination,
@@ -703,15 +865,90 @@ test('fails the entire quote when a required carrier fails', async () => {
       currency: 'USD',
       deadlineAt: Date.now() + 5_000,
       invoke: async (selection) => {
-        if (selection.provider === 'fedex_rest') throw new Error('timeout')
+        if (selection.provider === 'fedex_rest') {
+          throw Object.assign(new Error('timeout'), {
+            code: 'CARRIER_PROVIDER_TIMEOUT',
+          })
+        }
         return result(selection, '42.85')
       },
     }),
     (error: unknown) =>
       error instanceof CheckoutShipmentRateError
-      && error.code === 'CHECKOUT_RATE_REQUIRED_CARRIER_FAILED'
+      && error.code === 'CHECKOUT_RATE_PROVIDER_EVIDENCE_REQUIRED'
       && error.provider === 'fedex_rest',
   )
+})
+
+test('fails the entire quote when every configured carrier fails', async () => {
+  await assert.rejects(
+    rateCheckoutShipment({
+      destination,
+      parcels,
+      carriers,
+      currency: 'USD',
+      deadlineAt: Date.now() + 5_000,
+      invoke: async () => {
+        throw new Error('provider unavailable')
+      },
+    }),
+    (error: unknown) =>
+      error instanceof CheckoutShipmentRateError
+      && error.code === 'CHECKOUT_RATE_ALL_PROVIDERS_FAILED'
+      && error.provider === null,
+  )
+})
+
+test('returns a completed provider when another remains pending at deadline', async () => {
+  let aborted = 0
+  const startedAt = Date.now()
+  const response = await rateCheckoutShipment({
+    destination,
+    parcels,
+    carriers,
+    currency: 'USD',
+    deadlineAt: Date.now() + 25,
+    invoke: async (selection, request) => {
+      if (selection.provider === 'ups_rest') {
+        return result(selection, '42.85')
+      }
+      return new Promise((_resolve, reject) => {
+        request.signal.addEventListener('abort', () => {
+          aborted += 1
+          setTimeout(() => {
+            reject(providerFailure(
+              'CARRIER_PROVIDER_TIMEOUT',
+              'grq0000002',
+              'aborted',
+            ))
+          }, 10)
+        }, { once: true })
+      })
+    },
+  })
+
+  assert.equal(aborted, 1)
+  assert.ok(
+    Date.now() - startedAt >= 30,
+    'checkout must await the aborted provider failure-evidence write',
+  )
+  assert.deepEqual(response.successfulProviders, ['ups_rest'])
+  assert.deepEqual(response.providerAttempts, [
+    {
+      provider: 'ups_rest',
+      carrierAccountGlobalId: 'gac0000001',
+      status: 'succeeded',
+      failureCode: null,
+      rateEvidenceGlobalId: 'grq0000001',
+    },
+    {
+      provider: 'fedex_rest',
+      carrierAccountGlobalId: 'gac0000002',
+      status: 'degraded',
+      failureCode: 'CARRIER_PROVIDER_TIMEOUT',
+      rateEvidenceGlobalId: 'grq0000002',
+    },
+  ])
 })
 
 test('aborts all provider work when the checkout deadline expires', async () => {
@@ -821,6 +1058,13 @@ test('rejects provider package drift, currency mismatch, and duplicate services'
   })
   await invalid((response) => {
     response.rates.push({ ...response.rates[0]! })
+  })
+  await invalid((response) => {
+    response.rates.push({
+      ...response.rates[0]!,
+      serviceCode: '02',
+      evidenceGlobalId: 'grq0000009',
+    })
   })
 })
 

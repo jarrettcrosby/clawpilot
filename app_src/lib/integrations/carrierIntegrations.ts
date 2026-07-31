@@ -59,12 +59,19 @@ const AG_ALCHEMY_RATING_ORIGIN_WAREHOUSE = 'gwh5366613'
 export class CarrierIntegrationRequestError extends Error {
   readonly status: number
   readonly code: string
+  readonly rateEvidenceGlobalId: string | null
 
-  constructor(message: string, status = 400, code = 'CARRIER_REQUEST_INVALID') {
+  constructor(
+    message: string,
+    status = 400,
+    code = 'CARRIER_REQUEST_INVALID',
+    rateEvidenceGlobalId: string | null = null,
+  ) {
     super(message)
     this.name = 'CarrierIntegrationRequestError'
     this.status = status
     this.code = code
+    this.rateEvidenceGlobalId = rateEvidenceGlobalId
   }
 }
 
@@ -943,6 +950,7 @@ export async function testCarrierSandboxShipmentRate(input: {
   actorEmail: string
   timeoutMs?: number
   signal?: AbortSignal
+  requireFailureEvidence?: boolean
 }) {
   const requestedAt = new Date().toISOString()
   const purpose = 'cartonization_shipment_rate' as const
@@ -1047,6 +1055,7 @@ export async function testCarrierSandboxShipmentRate(input: {
     }
   } catch (error) {
     const sanitized = sanitize(error)
+    let rateEvidenceGlobalId: string | null = null
     if (
       runtime
       && selection
@@ -1060,43 +1069,60 @@ export async function testCarrierSandboxShipmentRate(input: {
       const billingSelectionSnapshot =
         redactedSandboxRateBillingSelection(selection)
       try {
-        await writeCarrierSandboxRateEvidenceInPostgres({
-          organizationId: runtime.organizationId,
-          integrationAccountId: runtime.integrationAccountId,
-          integrationGlobalId: runtime.integrationGlobalId,
-          carrierAccountId: selection.account.id,
-          carrierAccountGlobalId: selection.account.globalId,
-          billingRelationship: selection.relationship,
-          billingSelectionSnapshot,
-          provider: runtime.provider,
-          purpose,
-          credentialVersion: runtime.credentialVersion,
-          adapterVersion: CARRIER_SANDBOX_SHIPMENT_RATE_ADAPTER_VERSION,
-          requestHash: carrierSandboxRateSelectionRequestHash(
-            safeRequest.requestHash,
-            selection,
-          ),
-          redactedRequest: {
-            ...safeRequest.redactedRequest,
-            billingSelection: billingSelectionSnapshot,
-          },
-          redactedResponse: {
-            rateScope: 'multi_package_shipment',
-            packageCount: fixture.parcels.length,
+        rateEvidenceGlobalId =
+          await writeCarrierSandboxRateEvidenceInPostgres({
+            organizationId: runtime.organizationId,
+            integrationAccountId: runtime.integrationAccountId,
+            integrationGlobalId: runtime.integrationGlobalId,
+            carrierAccountId: selection.account.id,
+            carrierAccountGlobalId: selection.account.globalId,
+            billingRelationship: selection.relationship,
+            billingSelectionSnapshot,
+            provider: runtime.provider,
+            purpose,
+            credentialVersion: runtime.credentialVersion,
+            adapterVersion: CARRIER_SANDBOX_SHIPMENT_RATE_ADAPTER_VERSION,
+            requestHash: carrierSandboxRateSelectionRequestHash(
+              safeRequest.requestHash,
+              selection,
+            ),
+            redactedRequest: {
+              ...safeRequest.redactedRequest,
+              billingSelection: billingSelectionSnapshot,
+            },
+            redactedResponse: {
+              rateScope: 'multi_package_shipment',
+              packageCount: fixture.parcels.length,
+              errorCode: sanitized.code,
+            },
+            status: 'failed',
+            providerReference: null,
             errorCode: sanitized.code,
-          },
-          status: 'failed',
-          providerReference: null,
-          errorCode: sanitized.code,
-          actorEmail: input.actorEmail,
-          requestedAt,
-          completedAt: new Date().toISOString(),
-        })
+            actorEmail: input.actorEmail,
+            requestedAt,
+            completedAt: new Date().toISOString(),
+          })
       } catch {
-        // The original carrier error remains authoritative if evidence storage fails.
+        if (
+          input.requireFailureEvidence === true
+          || input.actorEmail === 'system:shopify-carrier-service'
+        ) {
+          throw new CarrierIntegrationRequestError(
+            'Carrier shipment-rate failure evidence could not be persisted',
+            503,
+            'CARRIER_RATE_EVIDENCE_PERSISTENCE_FAILED',
+          )
+        }
+        // Diagnostic callers retain the original provider error when evidence
+        // storage is not contractually required.
       }
     }
-    throw sanitized
+    throw new CarrierIntegrationRequestError(
+      sanitized.message,
+      sanitized.status,
+      sanitized.code,
+      rateEvidenceGlobalId,
+    )
   }
 }
 

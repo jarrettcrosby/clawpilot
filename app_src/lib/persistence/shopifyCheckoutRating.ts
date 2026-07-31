@@ -15,6 +15,7 @@ export const MAX_SHOPIFY_CHECKOUT_MATERIALS = 8
 export const MAX_SHOPIFY_CHECKOUT_LINES = 500
 export const MAX_SHOPIFY_CHECKOUT_PACKAGES = 50
 export const MAX_SHOPIFY_CHECKOUT_OFFERS = 100
+export const MAX_SHOPIFY_CHECKOUT_PROVIDER_ATTEMPTS = 2
 
 export type ShopifyCheckoutCarrierProvider = 'ups_rest' | 'fedex_rest'
 export type ShopifyCarrierServiceRegistrationState =
@@ -210,6 +211,7 @@ export type ShopifyCheckoutReceiptClaimInput = {
   carrierDestinationFingerprint: string
   redactedRequestSnapshot: Record<string, unknown>
   currency: string
+  cacheKey?: string
   idempotencyKey: string
   inventorySnapshotHash: string
   inventorySnapshotAt: string
@@ -226,7 +228,11 @@ export type NormalizedShopifyCheckoutReceiptLine =
   }
 
 export type NormalizedShopifyCheckoutReceiptClaimInput =
-  Omit<ShopifyCheckoutReceiptClaimInput, 'leaseSeconds' | 'lines'> & {
+  Omit<
+    ShopifyCheckoutReceiptClaimInput,
+    'cacheKey' | 'leaseSeconds' | 'lines'
+  > & {
+    cacheKey: string
     leaseSeconds: number
     deadlineAt: string | null
     requestEvidenceHash: string
@@ -291,6 +297,15 @@ export type ShopifyCheckoutOfferInput = {
   offerSnapshot: Record<string, unknown>
 }
 
+export type ShopifyCheckoutProviderAttemptInput = {
+  provider: ShopifyCheckoutCarrierProvider
+  carrierAccountGlobalId: string
+  rateEvidenceGlobalId: string
+  status: 'succeeded' | 'degraded'
+  failureCode: string | null
+  attemptSnapshot: Record<string, unknown>
+}
+
 export type CompleteShopifyCheckoutRateReceiptInput = {
   organizationId: string
   receiptGlobalId: string
@@ -299,6 +314,7 @@ export type CompleteShopifyCheckoutRateReceiptInput = {
   resultSnapshot: Record<string, unknown>
   deadlineAt?: string | Date | null
   packages: ShopifyCheckoutPackageInput[]
+  providerAttempts: ShopifyCheckoutProviderAttemptInput[]
   offers: ShopifyCheckoutOfferInput[]
 }
 
@@ -382,6 +398,18 @@ export type ShopifyCheckoutRateReceiptOffer = {
   offerSnapshot: Record<string, unknown>
 }
 
+export type ShopifyCheckoutRateReceiptProviderAttempt = {
+  provider: ShopifyCheckoutCarrierProvider
+  carrierAccountGlobalId: string
+  credentialVersion: number
+  rateEvidenceGlobalId: string
+  carrierRequestHash: string
+  status: 'succeeded' | 'degraded'
+  failureCode: string | null
+  attemptHash: string
+  attemptSnapshot: Record<string, unknown>
+}
+
 export type ShopifyCheckoutRateReceipt = {
   id: string
   globalId: string
@@ -427,6 +455,7 @@ export type ShopifyCheckoutRateReceipt = {
   updatedAt: string
   lines: ShopifyCheckoutRateReceiptLine[]
   packages: ShopifyCheckoutRateReceiptPackage[]
+  providerAttempts: ShopifyCheckoutRateReceiptProviderAttempt[]
   offers: ShopifyCheckoutRateReceiptOffer[]
 }
 
@@ -1255,6 +1284,25 @@ export function normalizeShopifyCheckoutReceiptClaimInput(
     request: input.redactedRequestSnapshot,
     lines,
   })
+  const idempotencyKey = textValue(
+    input.idempotencyKey,
+    'Idempotency key',
+    200,
+  )
+  const cacheKey = textValue(
+    input.cacheKey ?? idempotencyKey,
+    'Checkout cache key',
+    200,
+  )
+  if (
+    idempotencyKey !== cacheKey
+    && !idempotencyKey.startsWith(`${cacheKey}:attempt:`)
+  ) {
+    fail(
+      'SHOPIFY_CHECKOUT_ATTEMPT_KEY_INVALID',
+      'Checkout attempt key must remain within its stable cache fence',
+    )
+  }
   return {
     ...input,
     organizationId: matchValue(
@@ -1277,11 +1325,8 @@ export function normalizeShopifyCheckoutReceiptClaimInput(
     requestEvidenceHash,
     lineQuantityFingerprint,
     currency,
-    idempotencyKey: textValue(
-      input.idempotencyKey,
-      'Idempotency key',
-      200,
-    ),
+    cacheKey,
+    idempotencyKey,
     inventorySnapshotAt: inventorySnapshotAt.toISOString(),
     claimedBy: textValue(input.claimedBy, 'Claimed by', 200),
     deadlineAt: optionalDeadline(
@@ -2858,8 +2903,13 @@ async function readReceiptChildren(
   const run = <T extends QueryResultRow>(sql: string, values: unknown[]) => (
     client ? client.query<T>(sql, values) : query<T>(sql, values)
   )
-  const [lineResult, packageResult, allocationResult, offerResult] =
-    await runHydrationQueries(client, [
+  const [
+    lineResult,
+    packageResult,
+    allocationResult,
+    offerResult,
+    providerAttemptResult,
+  ] = await runHydrationQueries(client, [
       () => run<QueryResultRow & {
         line_key: string
         provider_variant_id: string
@@ -2998,6 +3048,41 @@ async function readReceiptChildren(
          ORDER BY offer.carrier_provider, offer.service_code`,
         [input.organizationId, input.receiptId],
       ),
+      () => run<QueryResultRow & {
+        carrier_provider: ShopifyCheckoutCarrierProvider
+        carrier_account_global_id: string
+        credential_version: number
+        rate_evidence_global_id: string
+        carrier_request_hash: string
+        attempt_status: 'succeeded' | 'degraded'
+        failure_code: string | null
+        attempt_hash: string
+        attempt_snapshot: Record<string, unknown>
+      }>(
+        `SELECT
+           attempt.carrier_provider,
+           carrier_account.global_id AS carrier_account_global_id,
+           rate_evidence.credential_version,
+           rate_evidence.global_id AS rate_evidence_global_id,
+           attempt.carrier_request_hash,
+           attempt.attempt_status,
+           attempt.failure_code,
+           attempt.attempt_hash,
+           attempt.attempt_snapshot
+         FROM
+           operations_shopify_checkout_rate_receipt_provider_attempts
+             attempt
+         JOIN operations_carrier_accounts carrier_account
+           ON carrier_account.organization_id = attempt.organization_id
+          AND carrier_account.id = attempt.carrier_account_id
+         JOIN operations_carrier_rate_requests rate_evidence
+           ON rate_evidence.organization_id = attempt.organization_id
+          AND rate_evidence.id = attempt.carrier_rate_request_id
+         WHERE attempt.organization_id = $1::uuid
+           AND attempt.receipt_id = $2::uuid
+         ORDER BY attempt.carrier_provider`,
+        [input.organizationId, input.receiptId],
+      ),
     ] as const)
   const allocations = new Map<string, Array<{
     lineKey: string
@@ -3088,6 +3173,19 @@ async function readReceiptChildren(
         selfPackageLineKey: null,
       }
     }),
+    providerAttempts: providerAttemptResult.rows.map(
+      (row): ShopifyCheckoutRateReceiptProviderAttempt => ({
+        provider: row.carrier_provider,
+        carrierAccountGlobalId: row.carrier_account_global_id,
+        credentialVersion: row.credential_version,
+        rateEvidenceGlobalId: row.rate_evidence_global_id,
+        carrierRequestHash: row.carrier_request_hash,
+        status: row.attempt_status,
+        failureCode: row.failure_code,
+        attemptHash: row.attempt_hash,
+        attemptSnapshot: row.attempt_snapshot,
+      }),
+    ),
     offers: offerResult.rows.map(
       (row): ShopifyCheckoutRateReceiptOffer => ({
         provider: row.carrier_provider,
@@ -3293,7 +3391,11 @@ export async function claimShopifyCheckoutRateReceiptInPostgres(
          AND receipt.inventory_snapshot_at >= now() - make_interval(secs => $8)
          AND receipt.activation_revision = $9
          AND receipt.activation_state = $10
-         AND receipt.idempotency_key = $11
+         AND (
+           receipt.idempotency_key = $11
+           OR left(receipt.idempotency_key, length($11) + 9)
+             = $11 || ':attempt:'
+         )
          AND receipt.status IN ('succeeded', 'failed')
          AND receipt.expires_at > now()
        ORDER BY receipt.completed_at DESC, receipt.id
@@ -3310,7 +3412,7 @@ export async function claimShopifyCheckoutRateReceiptInPostgres(
         config.inventoryMaxAgeSeconds,
         activation.revision,
         activation.state,
-        input.idempotencyKey,
+        input.cacheKey,
       ],
     )
     if (cached.rows[0]) {
@@ -3416,8 +3518,13 @@ export async function claimShopifyCheckoutRateReceiptInPostgres(
          AND receipt.inventory_snapshot_hash = $7
          AND receipt.activation_revision = $8
          AND receipt.activation_state = $9
-         AND receipt.idempotency_key = $10
+         AND (
+           receipt.idempotency_key = $10
+           OR left(receipt.idempotency_key, length($10) + 9)
+             = $10 || ':attempt:'
+         )
          AND receipt.status = 'processing'
+       ORDER BY receipt.created_at DESC, receipt.id DESC
        LIMIT 1
        FOR UPDATE OF receipt`,
       [
@@ -3430,7 +3537,7 @@ export async function claimShopifyCheckoutRateReceiptInPostgres(
         input.inventorySnapshotHash,
         activation.revision,
         activation.state,
-        input.idempotencyKey,
+        input.cacheKey,
       ],
     )
     if (inProgress.rows[0]) {
@@ -3924,6 +4031,133 @@ function normalizeCompletion(
     left.provider.localeCompare(right.provider)
     || left.serviceCode.localeCompare(right.serviceCode)
   ))
+  if (
+    !Array.isArray(input.providerAttempts)
+    || input.providerAttempts.length
+      !== MAX_SHOPIFY_CHECKOUT_PROVIDER_ATTEMPTS
+  ) {
+    fail(
+      'SHOPIFY_CHECKOUT_PROVIDER_ATTEMPT_COUNT_INVALID',
+      `Checkout result requires exactly ${MAX_SHOPIFY_CHECKOUT_PROVIDER_ATTEMPTS} carrier attempts`,
+    )
+  }
+  const attemptProviders = new Set<string>()
+  const attemptAccounts = new Set<string>()
+  const providerAttempts = input.providerAttempts.map((attempt) => {
+    const provider = attempt.provider
+    if (!['ups_rest', 'fedex_rest'].includes(provider)) {
+      fail(
+        'SHOPIFY_CHECKOUT_PROVIDER_ATTEMPT_PROVIDER_INVALID',
+        'Checkout provider attempts support UPS and FedEx only',
+      )
+    }
+    const carrierAccountGlobalId = matchValue(
+      attempt.carrierAccountGlobalId,
+      CARRIER_ACCOUNT_GLOBAL_ID,
+      'Carrier account Global ID',
+    )
+    if (
+      attemptProviders.has(provider)
+      || attemptAccounts.has(carrierAccountGlobalId)
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_PROVIDER_ATTEMPT_DUPLICATE',
+        'Checkout provider attempts must use unique carriers and accounts',
+      )
+    }
+    attemptProviders.add(provider)
+    attemptAccounts.add(carrierAccountGlobalId)
+    const rateEvidenceGlobalId = matchValue(
+      attempt.rateEvidenceGlobalId,
+      RATE_EVIDENCE_GLOBAL_ID,
+      'Carrier rate evidence Global ID',
+    )
+    if (!['succeeded', 'degraded'].includes(attempt.status)) {
+      fail(
+        'SHOPIFY_CHECKOUT_PROVIDER_ATTEMPT_STATUS_INVALID',
+        'Checkout provider attempt status is invalid',
+      )
+    }
+    const failureCode = attempt.status === 'degraded'
+      ? textValue(
+          attempt.failureCode,
+          'Provider failure code',
+          128,
+        )
+      : null
+    if (
+      attempt.status === 'succeeded'
+      && attempt.failureCode !== null
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_PROVIDER_ATTEMPT_FAILURE_INVALID',
+        'Successful provider attempts cannot retain a failure code',
+      )
+    }
+    if (
+      failureCode !== null
+      && (
+        failureCode.length < 3
+        || !/^[A-Z0-9_]+$/.test(failureCode)
+      )
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_PROVIDER_ATTEMPT_FAILURE_INVALID',
+        'Degraded provider attempts require a stable failure code',
+      )
+    }
+    assertShopifyCheckoutCustomerNeutralEvidence(
+      attempt.attemptSnapshot,
+      `${provider} provider attempt snapshot`,
+    )
+    const normalized = {
+      provider,
+      carrierAccountGlobalId,
+      rateEvidenceGlobalId,
+      status: attempt.status,
+      failureCode,
+      attemptSnapshot: attempt.attemptSnapshot,
+    }
+    return {
+      ...normalized,
+      attemptHash: shopifyCheckoutRatingHash(normalized),
+    }
+  }).sort((left, right) => left.provider.localeCompare(right.provider))
+  if (!providerAttempts.some((attempt) => attempt.status === 'succeeded')) {
+    fail(
+      'SHOPIFY_CHECKOUT_PROVIDER_ATTEMPT_SUCCESS_REQUIRED',
+      'A successful checkout receipt requires at least one carrier offer',
+    )
+  }
+  for (const attempt of providerAttempts) {
+    const matchingOffers = offers.filter((offer) => (
+      offer.provider === attempt.provider
+      && offer.carrierAccountGlobalId
+        === attempt.carrierAccountGlobalId
+      && offer.rateEvidenceGlobalId === attempt.rateEvidenceGlobalId
+    ))
+    if (
+      (attempt.status === 'succeeded' && matchingOffers.length < 1)
+      || (attempt.status === 'degraded' && matchingOffers.length > 0)
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_PROVIDER_ATTEMPT_OFFER_MISMATCH',
+        'Checkout offers must map exactly to successful carrier attempts',
+      )
+    }
+  }
+  if (offers.some((offer) => !providerAttempts.some((attempt) => (
+    attempt.status === 'succeeded'
+    && attempt.provider === offer.provider
+    && attempt.carrierAccountGlobalId
+      === offer.carrierAccountGlobalId
+    && attempt.rateEvidenceGlobalId === offer.rateEvidenceGlobalId
+  )))) {
+    fail(
+      'SHOPIFY_CHECKOUT_PROVIDER_ATTEMPT_OFFER_MISMATCH',
+      'Every checkout offer requires matching successful carrier evidence',
+    )
+  }
   assertShopifyCheckoutCustomerNeutralEvidence(
     input.resultSnapshot,
     'Checkout result snapshot',
@@ -3948,6 +4182,7 @@ function normalizeCompletion(
       'Checkout completion deadline',
     ),
     packages,
+    providerAttempts,
     offers,
   }
 }
@@ -4140,6 +4375,50 @@ export async function completeShopifyCheckoutRateReceiptInPostgres(
         input.organizationId,
         locked.rows[0].id,
         JSON.stringify(allocations),
+      ],
+    )
+    await client.query(
+      `INSERT INTO
+         operations_shopify_checkout_rate_receipt_provider_attempts (
+           organization_id, receipt_id, carrier_provider,
+           carrier_account_id, carrier_rate_request_id,
+           carrier_rate_purpose, carrier_request_hash,
+           attempt_status, failure_code, attempt_hash, attempt_snapshot
+         )
+       SELECT
+         $1::uuid, $2::uuid, attempt.provider,
+         carrier_account.id, rate_evidence.id,
+         'cartonization_shipment_rate', rate_evidence.request_hash,
+         attempt.attempt_status, attempt.failure_code,
+         attempt.attempt_hash, attempt.attempt_snapshot
+       FROM jsonb_to_recordset($3::jsonb) AS attempt(
+         provider text,
+         carrier_account_global_id text,
+         rate_evidence_global_id text,
+         attempt_status text,
+         failure_code text,
+         attempt_hash text,
+         attempt_snapshot jsonb
+       )
+       JOIN operations_carrier_accounts carrier_account
+         ON carrier_account.organization_id = $1::uuid
+        AND carrier_account.global_id =
+              attempt.carrier_account_global_id
+       JOIN operations_carrier_rate_requests rate_evidence
+         ON rate_evidence.organization_id = $1::uuid
+        AND rate_evidence.global_id = attempt.rate_evidence_global_id`,
+      [
+        input.organizationId,
+        locked.rows[0].id,
+        JSON.stringify(input.providerAttempts.map((attempt) => ({
+          provider: attempt.provider,
+          carrier_account_global_id: attempt.carrierAccountGlobalId,
+          rate_evidence_global_id: attempt.rateEvidenceGlobalId,
+          attempt_status: attempt.status,
+          failure_code: attempt.failureCode,
+          attempt_hash: attempt.attemptHash,
+          attempt_snapshot: attempt.attemptSnapshot,
+        }))),
       ],
     )
     await client.query(
@@ -4389,7 +4668,8 @@ export async function readCachedShopifyCheckoutRateReceiptInPostgres(
     accountGlobalId: string
     requestFingerprint: string
     inventorySnapshotHash: string
-    idempotencyKey: string
+    cacheKey?: string
+    idempotencyKey?: string
   },
 ) {
   const input = {
@@ -4413,9 +4693,9 @@ export async function readCachedShopifyCheckoutRateReceiptInPostgres(
       SHA256,
       'Inventory snapshot hash',
     ),
-    idempotencyKey: textValue(
-      rawInput.idempotencyKey,
-      'Idempotency key',
+    cacheKey: textValue(
+      rawInput.cacheKey ?? rawInput.idempotencyKey,
+      'Checkout cache key',
       200,
     ),
   }
@@ -4431,7 +4711,11 @@ export async function readCachedShopifyCheckoutRateReceiptInPostgres(
        AND account.global_id = $2
        AND receipt.request_fingerprint = $3
        AND receipt.inventory_snapshot_hash = $4
-       AND receipt.idempotency_key = $5
+       AND (
+         receipt.idempotency_key = $5
+         OR left(receipt.idempotency_key, length($5) + 9)
+           = $5 || ':attempt:'
+       )
        AND receipt.status IN ('succeeded', 'failed')
        AND receipt.expires_at > now()
        AND receipt.inventory_snapshot_at >= now() - make_interval(
@@ -4452,7 +4736,7 @@ export async function readCachedShopifyCheckoutRateReceiptInPostgres(
       input.accountGlobalId,
       input.requestFingerprint,
       input.inventorySnapshotHash,
-      input.idempotencyKey,
+      input.cacheKey,
     ],
   )
   return result.rows[0] ? receiptFromRow(null, result.rows[0]) : null

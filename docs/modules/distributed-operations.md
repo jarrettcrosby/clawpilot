@@ -79,7 +79,11 @@ actor-role, account, credential, identity, scope, capability, or activation
 drift fails closed. The immutable transition is only a capability-claim root:
 each provider effect still requires implemented capability support plus its own
 exact claim/effect fence, and this migration itself invokes no provider client
-or worker.
+or worker. Active preparation, authorization, consumption, and claim lookup
+all consult the same ClawPilot implementation registry: a provider-supported
+capability marked `not_implemented` remains visible but disabled in the
+operator review and cannot be selected, authorized, consumed, or returned as a
+current capability claim.
 
 Migration `0168` makes generic commerce-account status describe eligibility
 for verified provider reads and registered callback computation. A successful
@@ -676,9 +680,12 @@ the actor resolves to a real ClawPilot user. Automated Shopify callbacks retain
 `actor_email = NULL` while the audit event records the explicit
 `system:shopify-carrier-service` actor. A system callback must not lose an
 otherwise valid UPS or FedEx result merely because it has no app-user row.
-The callback reserves 8 seconds for the paired carrier calls and returns or
-fails closed by 9.25 seconds, preserving explicit persistence and cancellation
-buffers inside Shopify's 10-second low-volume CarrierService ceiling. Shopify's
+The callback cuts all configured carrier network work off at 6.5 seconds,
+then permits at most 750 milliseconds for any aborted provider to persist its
+sanitized failure evidence. Successful receipt persistence must begin before 8.25
+seconds, and the callback returns or fails closed by 9.25 seconds. These
+explicit evidence, persistence, and cancellation buffers remain inside
+Shopify's 10-second low-volume CarrierService ceiling. Shopify's
 documented 5- and 3-second high-volume ceilings remain a separate performance
 gate; this sandbox proof does not claim readiness at those request rates.
 The latency-sensitive new-claim and expired-lease reclaim paths return only the
@@ -690,15 +697,19 @@ follower paths still hydrate the complete typed receipt. Child hydration may
 run in parallel through independent pool connections, but reads on one
 transaction client are serialized; concurrent `PoolClient.query()` calls are
 not a supported performance mechanism. These query-shape rules preserve the
-existing absolute 8-second carrier and 9.25-second response deadlines rather
+absolute 6.5-second carrier and 9.25-second response deadlines rather
 than extending Shopify's callback budget.
 Shopify may submit the same normalized checkout request more than once while
 the first callback is still processing. Exactly matching duplicates coalesce
 only on the full execution fence: organization, commerce account, request
 fingerprint, inventory snapshot hash, configuration and activation revision,
 the complete normalized cartonization input, packaging and stock revisions,
-carrier credential generations, and idempotency key. The receipt lease owner
-alone cartonizes, calls UPS and FedEx,
+carrier credential generations, and stable cache key. A separate 30-second
+attempt-bucket suffix preserves duplicate coalescence during Shopify's
+failed-response cache window. Once that failed receipt expires, the same
+stable execution fence receives a fresh attempt key instead of replaying a
+terminal failure forever; a successful receipt remains cacheable across later
+attempt buckets. The receipt lease owner alone cartonizes, calls UPS and FedEx,
 and completes or fails the receipt. A follower waits within the same bounded
 callback deadline for that exact durable receipt to become terminal and then
 replays its typed package and offer evidence; it must not run a second
@@ -707,6 +718,20 @@ create another receipt/package/offer lineage. A changed customer, product,
 quantity, destination, inventory, configuration, activation, package fact, or
 credential generation cannot join that in-flight result. Deadline or request
 abort remains fail-closed and never changes the owner receipt.
+
+Proactive checkout warming is a separate, tenant-configurable workflow rather
+than a relaxation of the callback fence. When an authenticated storefront
+supplies the exact current cart plus the customer's saved delivery addresses,
+ClawPilot may cartonize once and enqueue bounded, deduplicated rate requests
+for each address. Every warmed result is keyed by the complete cart, inventory,
+warehouse, policy, carton plan, carrier credentials, and exact address
+fingerprint. A cart, inventory, configuration, or address change invalidates
+the affected result. Checkout may reuse only the unexpired result for its
+selected exact address and must otherwise execute the authoritative live
+callback. Guest checkout cannot prewarm until it supplies an address. The
+CarrierService callback alone does not constitute an early storefront cart
+signal; hosted-store proactive warming therefore requires an explicit
+storefront cart integration before this workflow can be activated.
 
 Migration `0170` makes the checkout carton-plan/rate objective an explicit
 tenant-owned fact inside the existing organization/account configuration,
@@ -742,18 +767,27 @@ whole-shipment price among the bounded generated feasible candidates, not a
 claim of mathematical global optimality. Material
 gross-weight and available-stock fences participate in plan construction, and
 the bounded search can select different materials for independent
-compatibility pools. Each candidate is sent to each required carrier once as
+compatibility pools. Each candidate is sent to each configured carrier once as
 its full ordered package array; one returned service covers every package and
-per-package service stitching is forbidden. The authoritative baseline must
-rate successfully from every required carrier. Later candidates are
-best-effort under a separate bounded deadline; a failed optional candidate is
-retained as degraded evidence and cannot invalidate the complete baseline.
-The receipt retains each candidate input/result hash, algorithm and policy
-version, material and stock revisions, costs/currency, recipe/profile
+per-package service stitching is forbidden. One provider timeout or sanitized
+failure cannot erase another provider's usable whole-shipment offers. A
+partially successful baseline remains selection-eligible only when the failed
+provider's exact durable rate-request evidence and stable failure code were
+persisted; no-provider success or missing failure evidence still fails the
+quote closed. Later candidates are best-effort under a separate bounded
+deadline; a failed optional candidate is retained as degraded evidence and
+cannot invalidate a usable baseline.
+Receipt response protocol `v3` retains exactly one typed provider-attempt row
+for every configured carrier. Each successful attempt owns at least one offer;
+each degraded attempt owns no offer and references exact failed carrier
+evidence with the same stable failure code. Legacy `v2` receipts remain
+replayable only through their pre-existing immutable package and offer
+evidence. The receipt retains each candidate input/result hash, algorithm and
+policy version, material and stock revisions, costs/currency, recipe/profile
 revisions, tare/content/rated weights, allocations, package facts, all
 successful offers and carrier evidence, or the explicit degraded code. A
 provider-successful alternative whose local objective evaluation fails is
-retained as degraded evidence and cannot invalidate the complete baseline.
+retained as degraded evidence and cannot invalidate the usable baseline.
 Material and handling costs select the carton plan but do not silently
 increase the carrier amount returned to Shopify. No checkout delivery-SLA rule
 is claimed until a versioned tenant promise is durably configured. This
@@ -762,8 +796,8 @@ objective contract below, which may consider warehouse splits and other
 fulfillment costs after order intake.
 
 `npm run test:shopify-carrier-service-postgres` is the rollback-only database
-acceptance for migrations `0164`, `0165`, and `0170` before permanent development
-application. The `0164` acceptance
+acceptance for migrations `0164`, `0165`, `0170`, and `0174` before permanent
+development application. The `0164` acceptance
 requires the explicitly trusted Railway development database fingerprint,
 applies the parcel-evidence correction inside one transaction, projects both
 an approved-recipe carton and a self-packaged case into the exact provider
@@ -790,6 +824,13 @@ canonical policy hash, rejects a missing policy at the table boundary, proves
 organization-scoped mutation cannot cross the tenant fence, persists a
 different accepted priority without code changes, and rolls the entire
 exercise back.
+The `0174` acceptance applies typed per-carrier checkout attempts and its
+schema-history row inside one transaction. It proves a receipt may finish with
+exact UPS success plus exact FedEx degradation, while a missing attempt,
+mismatched failure evidence, or an offer linked to a degraded attempt fails
+closed. The transaction rolls back, and a second connection proves no `0174`
+schema object, migration-history row, receipt, carrier evidence, or test data
+remains.
 
 The active commerce-fulfillment continuation uses
 `Jarrett+warehouse@episcs.com` as the sole test-customer identity.

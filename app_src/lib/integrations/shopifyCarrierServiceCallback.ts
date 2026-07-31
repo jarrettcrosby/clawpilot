@@ -53,11 +53,14 @@ import {
   normalizeShopifyStoreEntityName,
   type ShopifyStoreEntityRateOffer,
 } from '@/lib/integrations/shopifyCarrierServiceBranding'
+import {
+  createShopifyCheckoutReceiptKeys,
+} from '@/lib/integrations/shopifyCheckoutReceiptKeys'
 
 const ACCOUNT_GLOBAL_ID = /^gia[0-9]{7}$/
 const CALLBACK_TOKEN = /^[A-Za-z0-9_-]{43}$/
-const CALLBACK_CARRIER_DEADLINE_MS = 8_000
-const CALLBACK_SUCCESS_PERSISTENCE_DEADLINE_MS = 8_400
+const CALLBACK_CARRIER_DEADLINE_MS = 6_500
+const CALLBACK_SUCCESS_PERSISTENCE_DEADLINE_MS = 8_250
 const CALLBACK_WORK_ABORT_MS = 8_700
 const CALLBACK_FAILURE_PERSISTENCE_DEADLINE_MS = 8_950
 const CALLBACK_RESPONSE_TIMEOUT_MS = 9_250
@@ -162,7 +165,7 @@ function persistedRequestFingerprint(protocolDigest: string) {
     .digest('hex')
 }
 
-function fencedIdempotencyKey(input: {
+function fencedCacheKey(input: {
   requestFingerprint: string
   configRowVersion: number
   activationState: 'shadow' | 'active'
@@ -713,11 +716,15 @@ function responseFromTypedReceipt(
     return null
   }
   const resultSnapshot = receipt.resultSnapshot
+  const responseProtocolVersion = resultSnapshot?.protocolVersion
   if (
     !receipt.resultHash
     || !resultSnapshot
-    || resultSnapshot.protocolVersion
-      !== 'shopify-carrier-service-response-v2'
+    || (
+      responseProtocolVersion !== 'shopify-carrier-service-response-v2'
+      && responseProtocolVersion
+        !== 'shopify-carrier-service-response-v3'
+    )
     || shopifyCheckoutRatingHash(resultSnapshot) !== receipt.resultHash
     || resultSnapshot.packagePlanHash !== receipt.packagePlanHash
     || resultSnapshot.inventorySnapshotHash
@@ -796,6 +803,62 @@ function responseFromTypedReceipt(
   const carrierByProvider = new Map(
     account.carriers.map((carrier) => [carrier.provider, carrier]),
   )
+  if (responseProtocolVersion === 'shopify-carrier-service-response-v2') {
+    if (receipt.providerAttempts.length !== 0) {
+      throw new Error(
+        'Legacy Shopify checkout receipt retained unexpected provider-attempt evidence',
+      )
+    }
+  } else {
+    const providerAttempts = receipt.providerAttempts.map((attempt) => {
+      const carrier = carrierByProvider.get(attempt.provider)
+      if (
+        !carrier
+        || carrier.carrierAccountGlobalId
+          !== attempt.carrierAccountGlobalId
+        || carrier.credentialVersion !== attempt.credentialVersion
+        || shopifyCheckoutRatingHash({
+          provider: attempt.provider,
+          carrierAccountGlobalId: attempt.carrierAccountGlobalId,
+          rateEvidenceGlobalId: attempt.rateEvidenceGlobalId,
+          status: attempt.status,
+          failureCode: attempt.failureCode,
+          attemptSnapshot: attempt.attemptSnapshot,
+        }) !== attempt.attemptHash
+      ) {
+        throw new Error(
+          'Typed Shopify checkout provider-attempt evidence failed replay validation',
+        )
+      }
+      return {
+        provider: attempt.provider,
+        carrierAccountGlobalId: attempt.carrierAccountGlobalId,
+        rateEvidenceGlobalId: attempt.rateEvidenceGlobalId,
+        status: attempt.status,
+        failureCode: attempt.failureCode,
+      }
+    }).sort((left, right) => left.provider.localeCompare(right.provider))
+    const configuredProviders = [...carrierByProvider.keys()].sort()
+    const successfulProviders = providerAttempts.flatMap((attempt) => (
+      attempt.status === 'succeeded' ? [attempt.provider] : []
+    ))
+    if (
+      providerAttempts.length !== carrierByProvider.size
+      || shopifyCheckoutRatingHash(
+        resultSnapshot.configuredProviders,
+      ) !== shopifyCheckoutRatingHash(configuredProviders)
+      || shopifyCheckoutRatingHash(
+        resultSnapshot.successfulProviders,
+      ) !== shopifyCheckoutRatingHash(successfulProviders)
+      || shopifyCheckoutRatingHash(
+        resultSnapshot.providerAttempts,
+      ) !== shopifyCheckoutRatingHash(providerAttempts)
+    ) {
+      throw new Error(
+        'Shopify checkout provider-attempt snapshot failed immutable replay validation',
+      )
+    }
+  }
   const serviceCodes = new Set<string>()
   const typedOffers: ShopifyStoreEntityRateOffer[] =
     receipt.offers.map((offer) => {
@@ -1123,7 +1186,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
     checkpoint = 'context_loaded'
     attemptedStage = 'execution_fence'
     const executionFenceHash = checkoutExecutionFenceHash(account, context)
-    const idempotencyKey = fencedIdempotencyKey({
+    const stableCacheKey = fencedCacheKey({
       requestFingerprint,
       configRowVersion: account.configRowVersion,
       activationState: account.activationState,
@@ -1131,13 +1194,17 @@ export async function executeShopifyCarrierServiceCallback(input: {
       inventorySnapshotHash: context.inventorySnapshotHash,
       executionFenceHash,
     })
+    const { idempotencyKey } = createShopifyCheckoutReceiptKeys({
+      stableCacheKey,
+      attemptedAtMs: startedAt,
+    })
     checkpoint = 'execution_fenced'
     const cacheLookup = {
       organizationId: account.organizationId,
       accountGlobalId: account.accountGlobalId,
       requestFingerprint,
       inventorySnapshotHash: context.inventorySnapshotHash,
-      idempotencyKey,
+      cacheKey: stableCacheKey,
     }
     attemptedStage = 'receipt_cache'
     requireCallbackTime(workDeadlineAt, workController.signal)
@@ -1173,6 +1240,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
         inventorySnapshotHash: context.inventorySnapshotHash,
         inventorySnapshotAt: context.inventorySnapshotAt,
         currency: request.currency,
+        cacheKey: stableCacheKey,
         idempotencyKey,
         claimedBy: SHOPIFY_CARRIER_SERVICE_CALLBACK_ACTOR,
         leaseSeconds: CALLBACK_LEASE_SECONDS,
@@ -1331,6 +1399,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
             actorEmail: SHOPIFY_CARRIER_SERVICE_CALLBACK_ACTOR,
             timeoutMs: remaining,
             signal: carrierRequest.signal,
+            requireFailureEvidence: true,
           })
           return {
             provider: selection.provider,
@@ -1406,6 +1475,17 @@ export async function executeShopifyCarrierServiceCallback(input: {
           deliveryDate: offer.deliveryDate,
           evidenceGlobalId: offer.evidenceGlobalId,
         })) ?? [],
+        providerAttempts: attempt?.result?.providerAttempts.map(
+          (providerAttempt) => ({
+            provider: providerAttempt.provider,
+            carrierAccountGlobalId:
+              providerAttempt.carrierAccountGlobalId,
+            rateEvidenceGlobalId:
+              providerAttempt.rateEvidenceGlobalId,
+            status: providerAttempt.status,
+            failureCode: providerAttempt.failureCode,
+          }),
+        ) ?? [],
       }
     })
     requireCallbackTime(
@@ -1538,6 +1618,20 @@ export async function executeShopifyCarrierServiceCallback(input: {
         packagePlanHash,
         deadlineAt: new Date(successPersistenceDeadlineAt).toISOString(),
         packages,
+        providerAttempts: rated.providerAttempts.map((attempt) => ({
+          provider: attempt.provider,
+          carrierAccountGlobalId: attempt.carrierAccountGlobalId,
+          rateEvidenceGlobalId: attempt.rateEvidenceGlobalId,
+          status: attempt.status,
+          failureCode: attempt.failureCode,
+          attemptSnapshot: {
+            rateScope: rated.rateScope,
+            packageCount: rated.packageCount,
+            planCandidateKey:
+              optimized.selectedCandidate.candidateKey,
+            objectiveVersion: optimized.objectiveVersion,
+          },
+        })),
         offers: rated.offers.map((offer) => ({
           provider: offer.provider,
           carrierAccountGlobalId: offer.carrierAccountGlobalId,
@@ -1566,7 +1660,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
           },
         })),
         resultSnapshot: {
-          protocolVersion: 'shopify-carrier-service-response-v2',
+          protocolVersion: 'shopify-carrier-service-response-v3',
           storeEntityName: normalizeShopifyStoreEntityName(
             account.storeEntityName,
           ),
@@ -1576,6 +1670,21 @@ export async function executeShopifyCarrierServiceCallback(input: {
           rateScope: rated.rateScope,
           packageCount: rated.packageCount,
           completedAt: rated.completedAt,
+          configuredProviders: [...rated.configuredProviders].sort(),
+          successfulProviders: [...rated.successfulProviders].sort(),
+          providerAttempts: [...rated.providerAttempts]
+            .sort((left, right) => (
+              left.provider.localeCompare(right.provider)
+            ))
+            .map((attempt) => ({
+              provider: attempt.provider,
+              carrierAccountGlobalId:
+                attempt.carrierAccountGlobalId,
+              rateEvidenceGlobalId:
+                attempt.rateEvidenceGlobalId,
+              status: attempt.status,
+              failureCode: attempt.failureCode,
+            })),
           planRateOptimization: {
             objectiveVersion: optimized.objectiveVersion,
             policyRevision: account.policyRevision,

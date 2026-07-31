@@ -62,10 +62,20 @@ export type CheckoutRateOffer = {
   evidenceGlobalId: string
 }
 
+export type CheckoutRateProviderAttempt = {
+  provider: CheckoutRateCarrierProvider
+  carrierAccountGlobalId: string
+  status: 'succeeded' | 'degraded'
+  failureCode: string | null
+  rateEvidenceGlobalId: string
+}
+
 export type CheckoutShipmentRateResult = {
   rateScope: 'multi_package_shipment'
   packageCount: number
-  requiredProviders: CheckoutRateCarrierProvider[]
+  configuredProviders: CheckoutRateCarrierProvider[]
+  successfulProviders: CheckoutRateCarrierProvider[]
+  providerAttempts: CheckoutRateProviderAttempt[]
   offers: CheckoutRateOffer[]
   completedAt: string
 }
@@ -137,10 +147,11 @@ export class CheckoutShipmentRateError extends Error {
 const ACCOUNT_GLOBAL_ID = /^gac[0-9]{7}$/
 const PACKAGE_KEY = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/
 const SERVICE_CODE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/
-const EVIDENCE_GLOBAL_ID = /^[a-z]{2,4}[0-9]{7}$/
+const EVIDENCE_GLOBAL_ID = /^grq[0-9]{7}$/
 const CURRENCY = /^[A-Z]{3}$/
 const DECIMAL_MONEY = /^(?:0|[1-9][0-9]{0,12})(?:\.[0-9]{1,2})?$/
 export const CHECKOUT_RATE_ALTERNATIVE_BUDGET_MS = 1_000
+const CHECKOUT_RATE_EVIDENCE_GRACE_MS = 750
 
 function rateError(
   code: string,
@@ -328,10 +339,63 @@ function normalizeProviderResult(
   })
 }
 
+function safeProviderFailureCode(error: unknown) {
+  const code = error && typeof error === 'object'
+    ? (error as { code?: unknown }).code
+    : null
+  return typeof code === 'string' && /^[A-Z0-9_]{3,100}$/.test(code)
+    ? code
+    : 'CHECKOUT_RATE_PROVIDER_FAILED'
+}
+
+function safeProviderRateEvidenceGlobalId(error: unknown) {
+  const globalId = error && typeof error === 'object'
+    ? (error as { rateEvidenceGlobalId?: unknown }).rateEvidenceGlobalId
+    : null
+  return typeof globalId === 'string' && EVIDENCE_GLOBAL_ID.test(globalId)
+    ? globalId
+    : null
+}
+
+function providerResultRateEvidenceGlobalId(
+  offers: CheckoutRateOffer[],
+  provider: CheckoutRateCarrierProvider,
+) {
+  const evidenceGlobalIds = new Set(
+    offers.map(({ evidenceGlobalId }) => evidenceGlobalId),
+  )
+  if (evidenceGlobalIds.size !== 1) {
+    rateError(
+      'CHECKOUT_RATE_PROVIDER_RESPONSE_INVALID',
+      'Carrier services must share one durable whole-shipment rate evidence record',
+      provider,
+    )
+  }
+  return offers[0]!.evidenceGlobalId
+}
+
+async function providerOutcomesWithin<T>(
+  pending: Promise<T>,
+  timeoutMs: number,
+): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 /**
- * Calls every required carrier exactly once with the complete package array.
- * A partial carrier result is never returned to Shopify because a missing
- * required carrier would make checkout behavior depend on a transient failure.
+ * Calls every configured carrier exactly once with the complete package array.
+ * A transient provider failure is retained as degraded evidence and cannot
+ * suppress another provider's usable whole-shipment offers. The shipment quote
+ * fails when no provider succeeds or a degraded attempt lacks durable evidence.
  */
 export async function rateCheckoutShipment(input: {
   destination: CheckoutRateDestination
@@ -393,63 +457,175 @@ export async function rateCheckoutShipment(input: {
   const controller = new AbortController()
   let timer: ReturnType<typeof setTimeout> | null = null
   let abortFromCaller: (() => void) | null = null
+  let internalDeadlineExpired = false
+  type ProviderAttemptOutcome = Omit<
+    CheckoutRateProviderAttempt,
+    'rateEvidenceGlobalId'
+  > & {
+    rateEvidenceGlobalId: string | null
+  }
+  type ProviderOutcome = {
+    attempt: ProviderAttemptOutcome
+    offers: CheckoutRateOffer[]
+    error: unknown
+  }
+  const settledByProvider = new Map<
+    CheckoutRateCarrierProvider,
+    ProviderOutcome
+  >()
+  let providerWork: Promise<ProviderOutcome[]> | null = null
 
-  const timeout = new Promise<never>((_resolve, reject) => {
-    const rejectForDeadline = () => {
+  const timeout = new Promise<ProviderOutcome[]>((resolve, reject) => {
+    const rejectForCallerAbort = () => {
       controller.abort()
       reject(new CheckoutShipmentRateError(
         'CHECKOUT_RATE_DEADLINE_EXCEEDED',
         'Required carrier rating exceeded the checkout deadline',
       ))
     }
-    abortFromCaller = rejectForDeadline
-    if (input.signal?.aborted) rejectForDeadline()
+    const finishAtDeadline = async () => {
+      internalDeadlineExpired = true
+      controller.abort()
+      const completedOutcomes = providerWork
+        ? await providerOutcomesWithin(
+            providerWork,
+            CHECKOUT_RATE_EVIDENCE_GRACE_MS,
+          )
+        : null
+      const outcomes = completedOutcomes ?? carriers.map((selection) => (
+        settledByProvider.get(selection.provider) ?? {
+          attempt: {
+            provider: selection.provider,
+            carrierAccountGlobalId: selection.carrierAccountGlobalId,
+            status: 'degraded' as const,
+            failureCode: 'CHECKOUT_RATE_DEADLINE_EXCEEDED',
+            rateEvidenceGlobalId: null,
+          },
+          offers: [],
+          error: null,
+        }
+      ))
+      if (outcomes.some((outcome) => outcome.attempt.status === 'succeeded')) {
+        resolve(outcomes)
+        return
+      }
+      reject(new CheckoutShipmentRateError(
+        'CHECKOUT_RATE_DEADLINE_EXCEEDED',
+        'Configured carrier rating exceeded the checkout deadline',
+      ))
+    }
+    abortFromCaller = rejectForCallerAbort
+    if (input.signal?.aborted) rejectForCallerAbort()
     else input.signal?.addEventListener(
       'abort',
-      rejectForDeadline,
+      rejectForCallerAbort,
       { once: true },
     )
     timer = setTimeout(
-      rejectForDeadline,
+      () => {
+        void finishAtDeadline()
+      },
       Math.max(1, input.deadlineAt - startedAt),
     )
   })
 
   try {
-    const pending = Promise.all(carriers.map(async (selection) => {
-      if (controller.signal.aborted) {
-        throw new CheckoutShipmentRateError(
-          'CHECKOUT_RATE_DEADLINE_EXCEEDED',
-          'Required carrier rating exceeded the checkout deadline',
-        )
-      }
-      let result: CheckoutRateProviderResult
+    providerWork = Promise.all(carriers.map(async (
+      selection,
+    ): Promise<ProviderOutcome> => {
       try {
-        result = await input.invoke(selection, {
+        if (controller.signal.aborted) {
+          throw new CheckoutShipmentRateError(
+            'CHECKOUT_RATE_DEADLINE_EXCEEDED',
+            'Required carrier rating exceeded the checkout deadline',
+          )
+        }
+        const result = await input.invoke(selection, {
           destination: input.destination,
           parcels: carrierParcels,
           signal: controller.signal,
         })
+        const offers = normalizeProviderResult(
+          result,
+          selection,
+          parcels.length,
+          input.currency,
+        )
+        const outcome = {
+          attempt: {
+            provider: selection.provider,
+            carrierAccountGlobalId: selection.carrierAccountGlobalId,
+            status: 'succeeded' as const,
+            failureCode: null,
+            rateEvidenceGlobalId: providerResultRateEvidenceGlobalId(
+              offers,
+              selection.provider,
+            ),
+          },
+          offers,
+          error: null,
+        }
+        settledByProvider.set(selection.provider, outcome)
+        return outcome
       } catch (error) {
-        if (controller.signal.aborted) throw error
+        const outcome = {
+          attempt: {
+            provider: selection.provider,
+            carrierAccountGlobalId: selection.carrierAccountGlobalId,
+            status: 'degraded' as const,
+            failureCode: safeProviderFailureCode(error),
+            rateEvidenceGlobalId: safeProviderRateEvidenceGlobalId(error),
+          },
+          offers: [],
+          error,
+        }
+        settledByProvider.set(selection.provider, outcome)
+        return outcome
+      }
+    }))
+    const outcomes = await Promise.race([providerWork, timeout])
+    const offers = outcomes.flatMap((outcome) => outcome.offers)
+    if (!offers.length) {
+      if (internalDeadlineExpired) {
         throw new CheckoutShipmentRateError(
-          'CHECKOUT_RATE_REQUIRED_CARRIER_FAILED',
-          `${selection.provider} did not return a usable whole-shipment rate`,
-          selection.provider,
+          'CHECKOUT_RATE_DEADLINE_EXCEEDED',
+          'Configured carrier rating exceeded the checkout deadline',
         )
       }
-      return normalizeProviderResult(
-        result,
-        selection,
-        parcels.length,
-        input.currency,
+      const onlyFailure = outcomes.length === 1
+        ? outcomes[0]?.error
+        : null
+      if (onlyFailure instanceof CheckoutShipmentRateError) {
+        throw onlyFailure
+      }
+      throw new CheckoutShipmentRateError(
+        'CHECKOUT_RATE_ALL_PROVIDERS_FAILED',
+        'No configured carrier returned a usable whole-shipment rate',
       )
-    }))
-    const offers = (await Promise.race([pending, timeout])).flat()
+    }
+    const providerAttempts = outcomes.map((outcome) => {
+      if (!outcome.attempt.rateEvidenceGlobalId) {
+        throw new CheckoutShipmentRateError(
+          'CHECKOUT_RATE_PROVIDER_EVIDENCE_REQUIRED',
+          `${outcome.attempt.provider} did not retain durable rate evidence`,
+          outcome.attempt.provider,
+        )
+      }
+      return {
+        ...outcome.attempt,
+        rateEvidenceGlobalId: outcome.attempt.rateEvidenceGlobalId,
+      } satisfies CheckoutRateProviderAttempt
+    })
     return {
       rateScope: 'multi_package_shipment',
       packageCount: parcels.length,
-      requiredProviders: carriers.map(({ provider }) => provider),
+      configuredProviders: carriers.map(({ provider }) => provider),
+      successfulProviders: outcomes.flatMap((outcome) => (
+        outcome.attempt.status === 'succeeded'
+          ? [outcome.attempt.provider]
+          : []
+      )),
+      providerAttempts,
       offers: offers.sort((left, right) => (
         left.amountMinor - right.amountMinor
         || left.carrierCode.localeCompare(right.carrierCode)
@@ -548,6 +724,12 @@ function evaluateCandidateRate(
     )
   }
   return evaluations[0]
+}
+
+function degradedProviderFailureCode(result: CheckoutShipmentRateResult) {
+  return result.providerAttempts.find(
+    (attempt) => attempt.status === 'degraded',
+  )?.failureCode ?? null
 }
 
 function alternativeFailureCode(error: unknown) {
@@ -687,12 +869,13 @@ export async function rateOptimizedCheckoutPlans(input: {
     input.policy,
     handlingCostMinorPerPackage,
   )
+  const baselineFailureCode = degradedProviderFailureCode(baselineResult)
   const candidateAttempts: CheckoutPlanRateCandidateAttempt[] = [{
     candidate: baselineCandidate,
-    status: 'succeeded',
+    status: baselineFailureCode ? 'degraded' : 'succeeded',
     result: baselineResult,
     evaluation: baselineEvaluation,
-    failureCode: null,
+    failureCode: baselineFailureCode,
   }]
   const rated: Array<{
     candidate: CheckoutPlanRateCandidate
@@ -754,12 +937,15 @@ export async function rateOptimizedCheckoutPlans(input: {
             handlingCostMinorPerPackage,
           )
           rated.push(outcome.value)
+          const providerFailureCode = degradedProviderFailureCode(
+            outcome.value.result,
+          )
           candidateAttempts.push({
             candidate,
-            status: 'succeeded',
+            status: providerFailureCode ? 'degraded' : 'succeeded',
             result: outcome.value.result,
             evaluation,
-            failureCode: null,
+            failureCode: providerFailureCode,
           })
         } catch (error) {
           candidateAttempts.push({

@@ -142,6 +142,9 @@ const planRatePolicyMigration = read(
 const shippingServiceCodeMigration = read(
   'db/migrations/0173_operations_shopify_shipping_service_codes.sql',
 )
+const providerAttemptMigration = read(
+  'db/migrations/0174_operations_shopify_checkout_provider_attempts.sql',
+)
 const persistenceSource = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
 )
@@ -201,6 +204,28 @@ assert.doesNotMatch(
   /package\.carrier_parcel_snapshot/,
   'Provider parcel evidence must not compare against the internal package-key snapshot',
 )
+includes(providerAttemptMigration, [
+  'operations_shopify_checkout_rate_receipt_provider_attempts',
+  "carrier_provider IN ('ups_rest', 'fedex_rest')",
+  "carrier_rate_purpose = 'cartonization_shipment_rate'",
+  "attempt_status IN ('succeeded', 'degraded')",
+  'failure_code IS NOT NULL',
+  'op_shopify_checkout_provider_attempts_rate_fkey',
+  'operations_shopify_checkout_json_is_customer_neutral(',
+  'protect_op_shopify_checkout_provider_attempt',
+  "rate_evidence.status = 'succeeded'",
+  "rate_evidence.status = 'failed'",
+  'rate_evidence.error_code = NEW.failure_code',
+  "'{shipment,destinationFingerprint}'",
+  "'{shipment,parcels}'",
+  'operations_shopify_checkout_carrier_parcels_match',
+  'successful_attempt_without_offer_count',
+  'degraded_attempt_with_offer_count',
+  'retained_attempt_count <> expected_provider_count',
+  'successful_attempt_count < 1',
+  'offer.carrier_rate_request_id =',
+  'Shopify checkout receipt provider-attempt evidence is incomplete',
+], 'Shopify checkout provider-attempt evidence')
 
 const configSchema = section(
   migration,
@@ -377,6 +402,10 @@ assert.doesNotMatch(
 includes(persistenceSource, [
   'normalizeShopifyCarrierServiceConfigInput',
   'normalizeShopifyCheckoutReceiptClaimInput',
+  "'SHOPIFY_CHECKOUT_ATTEMPT_KEY_INVALID'",
+  "left(receipt.idempotency_key, length($11) + 9)",
+  "left(receipt.idempotency_key, length($10) + 9)",
+  "left(receipt.idempotency_key, length($5) + 9)",
   'shopifyCheckoutRatingHash',
   'shopifyCheckoutPackagePlanHash',
   'readShopifyCarrierServiceConfigFromPostgres',
@@ -428,6 +457,16 @@ includes(persistenceSource, [
   'config.registration_state = \'shadow_simulated\'',
   "account.configuration ->> 'accountName'",
   'AS store_entity_name',
+  'MAX_SHOPIFY_CHECKOUT_PROVIDER_ATTEMPTS',
+  'ShopifyCheckoutProviderAttemptInput',
+  'ShopifyCheckoutRateReceiptProviderAttempt',
+  'providerAttempts: ShopifyCheckoutProviderAttemptInput[]',
+  'providerAttempts: ShopifyCheckoutRateReceiptProviderAttempt[]',
+  'operations_shopify_checkout_rate_receipt_provider_attempts',
+  'SHOPIFY_CHECKOUT_PROVIDER_ATTEMPT_COUNT_INVALID',
+  'SHOPIFY_CHECKOUT_PROVIDER_ATTEMPT_OFFER_MISMATCH',
+  'attemptHash: shopifyCheckoutRatingHash(normalized)',
+  'JSON.stringify(input.providerAttempts.map((attempt) => ({',
 ], 'Checkout persistence exports and guards')
 
 const hydrationRunner = section(
@@ -464,6 +503,9 @@ const receiptHydration = section(
 includes(receiptHydration, [
   'runHydrationQueries(client, [',
   '() => run<QueryResultRow & {',
+  'providerAttemptResult',
+  'operations_shopify_checkout_rate_receipt_provider_attempts',
+  'providerAttempts: providerAttemptResult.rows.map(',
 ], 'transaction-safe checkout receipt child hydration')
 
 const receiptClaim = section(
@@ -1050,6 +1092,28 @@ const validClaim = {
 }
 const normalizedClaim = normalizeShopifyCheckoutReceiptClaimInput(validClaim)
 assert.equal(normalizedClaim.currency, 'USD')
+const retryCacheKey = `shopify-rate:${'a'.repeat(64)}`
+const normalizedRetryClaim = normalizeShopifyCheckoutReceiptClaimInput({
+  ...validClaim,
+  cacheKey: retryCacheKey,
+  idempotencyKey: `${retryCacheKey}:attempt:42`,
+})
+assert.equal(normalizedRetryClaim.cacheKey, retryCacheKey)
+assert.equal(
+  normalizedRetryClaim.idempotencyKey,
+  `${retryCacheKey}:attempt:42`,
+)
+assert.throws(
+  () => normalizeShopifyCheckoutReceiptClaimInput({
+    ...validClaim,
+    cacheKey: retryCacheKey,
+    idempotencyKey: `shopify-rate:${'b'.repeat(64)}:attempt:42`,
+  }),
+  (error) => (
+    error instanceof ShopifyCheckoutRatingPersistenceError
+    && error.code === 'SHOPIFY_CHECKOUT_ATTEMPT_KEY_INVALID'
+  ),
+)
 assert.deepEqual(
   JSON.parse(JSON.stringify(
     normalizedClaim.lines.map((line) => line.lineKey),

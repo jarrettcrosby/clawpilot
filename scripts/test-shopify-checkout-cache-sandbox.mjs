@@ -92,10 +92,13 @@ includes(persistence, [
   "integration.environment = 'sandbox'",
   "AND account.environment = 'sandbox'",
   "'SHOPIFY_CHECKOUT_SANDBOX_REQUIRED'",
+  'cacheKey: string',
   'idempotencyKey: string',
-  'AND receipt.idempotency_key = $5',
-  'AND receipt.idempotency_key = $11',
-], 'Persistence sandbox, credential, and exact-cache fences')
+  'receipt.idempotency_key = $5',
+  'left(receipt.idempotency_key, length($5) + 9)',
+  'receipt.idempotency_key = $11',
+  'left(receipt.idempotency_key, length($11) + 9)',
+], 'Persistence sandbox, credential, and retry-safe cache fences')
 
 includes(callback, [
   "version: 'shopify-checkout-idempotency-v2'",
@@ -113,6 +116,9 @@ includes(callback, [
   'credentialVersion: carrier.credentialVersion',
   'cartonizationInputHash: shopifyCheckoutRatingHash(context.input)',
   'executionFenceHash,',
+  'createShopifyCheckoutReceiptKeys({',
+  'stableCacheKey,',
+  'cacheKey: stableCacheKey',
   'idempotencyKey,',
   'cached,\n      )',
   'claim.receipt,\n      )',
