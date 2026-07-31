@@ -467,6 +467,21 @@ function verifySourceContracts() {
     'Carrier account schema must not persist plaintext account numbers',
   )
 
+  const canonicalPlanningMigration = read(
+    'db/migrations/0176_operations_canonical_fulfillment_planning.sql',
+  )
+  for (const fragment of [
+    'LEFT JOIN operations_cartonization_rate_evidence evidence',
+    'plan.cartonization_evidence_id IS NULL',
+    'Active fulfillment planning requires sealed production carrier-read evidence',
+    'A terminal provider commitment reservation cannot be reactivated',
+  ]) {
+    assert.ok(
+      canonicalPlanningMigration.includes(fragment),
+      `Canonical planning safety migration missing ${fragment}`,
+    )
+  }
+
   const persistence = read('app_src/lib/persistence/operations.ts')
   for (const fragment of [
     'readOperationsWorkspaceFromPostgres',
@@ -509,7 +524,8 @@ function verifySourceContracts() {
     "'operations.location.deleted'",
     "'operations.location.retired'",
     'operations_location_product_rules',
-    'row_number() OVER (ORDER BY location.pick_sequence, allocation.id)::integer',
+    'ORDER BY location.pick_sequence, position.global_id,',
+    'allocation.id',
     'SAVEPOINT delete_operations_location',
     "commandType: 'verify_operations_order_pack'",
     "eventType: 'operations.package.packed'",
@@ -527,6 +543,105 @@ function verifySourceContracts() {
     persistence,
     /INSERT INTO operations_order_lines[\s\S]*?RETURNING id::text, global_id, external_line_id/,
     'Proof-order package validation must retain the persisted external line ID',
+  )
+  assert.match(
+    persistence,
+    /async function revalidateProviderCommitmentsForPlan[\s\S]*?SET status = status[\s\S]*?reservation_authority = 'provider_commitment'/,
+    'Warehouse release must re-run database authority validation for every active Shopify provider commitment',
+  )
+  assert.match(
+    persistence,
+    /'shopify-inventory-apply'[\s\S]*?revalidateProviderCommitmentsForPlan/,
+    'Warehouse release must serialize provider-commitment revalidation with Shopify inventory application',
+  )
+  assert.match(
+    persistence,
+    /LEFT JOIN operations_cartonization_rate_evidence evidence[\s\S]*?plan\.cartonization_evidence_id IS NULL[\s\S]*?carrierReadEnvironment'[\s\S]*?IS DISTINCT FROM 'production'/,
+    'Active activation must fail closed for both missing and non-production plan evidence',
+  )
+  assert.match(
+    persistence,
+    /activation\.state === 'active'[\s\S]*?!plan\.cartonization_evidence_id[\s\S]*?plan\.carrier_read_environment !== 'production'[\s\S]*?OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION/,
+    'Warehouse release must fail closed when active planning evidence is missing or non-production',
+  )
+  assert.match(
+    persistence,
+    /if \(pick\.source_authority === 'shopify'\) \{[\s\S]*?continue[\s\S]*?INSERT INTO operations_inventory_ledger/,
+    'Shopify-authoritative picks must not append a local inventory-ledger movement',
+  )
+  assert.match(
+    persistence,
+    /reservation\.status AS reservation_status[\s\S]*?pick\.reservation_status !== 'active'/,
+    'Pick confirmation must fail closed when either reservation authority is no longer active',
+  )
+  assert.match(
+    persistence,
+    /async function consumeProviderCommitment[\s\S]*?SET status = 'consumed'[\s\S]*?reservation_authority = 'provider_commitment'/,
+    'Shipment confirmation must consume the provider commitment without changing a local inventory balance',
+  )
+  const providerCommitmentConsumer = persistence.match(
+    /async function consumeProviderCommitment[\s\S]*?(?=\nfunction providerCommitmentValidationFailed)/,
+  )?.[0]
+  assert.ok(
+    providerCommitmentConsumer,
+    'Provider commitment consumption helper must remain available',
+  )
+  assert.doesNotMatch(
+    providerCommitmentConsumer,
+    /operations_inventory_(?:positions|ledger)/,
+    'Provider commitment consumption must not mutate local positions or ledger rows',
+  )
+  assert.match(
+    persistence,
+    /allocation\.source_authority === 'shopify'[\s\S]*?consumeProviderCommitment[\s\S]*?continue[\s\S]*?consumeReservedInventory/,
+    'Shipment confirmation must branch provider commitments away from local inventory consumption',
+  )
+  const canonicalPlanningRegion = persistence.match(
+    /type PlanningPositionRow[\s\S]*?(?=\n      const actualCheckoutCharge)/,
+  )?.[0]
+  assert.ok(
+    canonicalPlanningRegion,
+    'Canonical planning inventory allocation region must remain available',
+  )
+  assert.match(
+    canonicalPlanningRegion,
+    /positionRows\.length !== 1[\s\S]*?OPERATIONS_PROVIDER_INVENTORY_AMBIGUOUS/,
+    'Shopify authority must retain one exact provider inventory level',
+  )
+  assert.match(
+    canonicalPlanningRegion,
+    /floor\([\s\S]*?position\.damaged_quantity[\s\S]*?ORDER BY\s+location\.pick_sequence,\s+position\.global_id[\s\S]*?FOR UPDATE OF position/,
+    'Local planning must lock every usable position in deterministic pick-route and permanent-Global-ID order',
+  )
+  assert.match(
+    canonicalPlanningRegion,
+    /let remainingQuantity = quantity[\s\S]*?for \(const position of positionRows\)[\s\S]*?Math\.min\([\s\S]*?remainingQuantity,[\s\S]*?availableWholeUnits[\s\S]*?remainingQuantity -= allocatedQuantity[\s\S]*?OPERATIONS_INVENTORY_SHORTAGE/,
+    'Local planning must allocate only the remaining whole-unit demand and fail closed on cumulative shortage',
+  )
+  assert.match(
+    canonicalPlanningRegion,
+    /line\.global_id,[\s\S]*?position\.global_id,[\s\S]*?\.join\(':'\)[\s\S]*?reserved_quantity = reserved_quantity \+ \$3[\s\S]*?operations_inventory_ledger/,
+    'Every selected local position must own a stable position-specific reservation and ledger delta',
+  )
+  assert.match(
+    canonicalPlanningRegion,
+    /inventoryAllocations\.reduce\([\s\S]*?\) !== quantity[\s\S]*?OPERATIONS_INVENTORY_ALLOCATION_INCOMPLETE/,
+    'Canonical local allocations must conserve each exact order-line quantity',
+  )
+  assert.match(
+    persistence,
+    /for \(const inventoryAllocation of inventoryAllocations\)[\s\S]*?INSERT INTO operations_fulfillment_allocations[\s\S]*?inventoryAllocation\.quantity/,
+    'Planning must create one fulfillment allocation for every position reservation',
+  )
+  assert.match(
+    persistence,
+    /row_number\(\) OVER \(\s*ORDER BY location\.pick_sequence, position\.global_id,\s*allocation\.id\s*\)::integer/,
+    'Warehouse release must sequence one pick per allocation by route, permanent position Global ID, and allocation identity',
+  )
+  assert.match(
+    persistence,
+    /pickResult\.rows\.length[\s\S]*?allocation_count[\s\S]*?pick\.quantity[\s\S]*?pick\.allocation_quantity[\s\S]*?pick\.reservation_quantity[\s\S]*?pick\.from_location_id !== pick\.position_location_id/,
+    'Pick confirmation must revalidate complete split task count, quantities, and source position',
   )
   assert.ok(!persistence.includes('console.'), 'Operations persistence must not log tenant data')
 

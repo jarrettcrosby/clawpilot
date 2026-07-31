@@ -644,7 +644,7 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     serviceCode: string
     serviceName: string
     internalCostMinor: string
-    customerChargeMinor: string
+    customerChargeMinor: string | null
     estimatedDeliveryAt: string
     meetsPromise: boolean
     selected: boolean
@@ -982,6 +982,20 @@ export type OperationsOrderCommandResult = {
   orderStatus: OperationsOrderStatus
   rowVersion: number
   replayed: boolean
+}
+
+export type OperationsPlanCommandResult = OperationsOrderCommandResult & {
+  orderStatus: 'planned'
+  fulfillmentPlanGlobalId: string
+  cartonizationEvidenceGlobalId: string
+  packageCount: number
+  carrier: string
+  serviceCode: string
+  serviceName: string
+  carrierCostMinor: number
+  currency: string
+  checkoutShippingChargeMinor: number | null
+  checkoutVarianceMinor: number | null
 }
 
 export type OperationsExceptionUpdateResult = {

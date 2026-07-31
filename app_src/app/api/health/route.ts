@@ -311,6 +311,9 @@ export async function GET() {
           shopify_active_account_readiness_migration_applied: boolean
           operations_commerce_inventory_attempt_lease_renewal_applied: boolean
           operations_shopify_shipping_service_codes_applied: boolean
+          operations_shopify_checkout_provider_attempts_applied: boolean
+          operations_shopify_checkout_rate_warm_policy_applied: boolean
+          operations_canonical_fulfillment_planning_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -991,6 +994,24 @@ export async function GET() {
                 WHERE filename =
                   '0173_operations_shopify_shipping_service_codes.sql'
               ) AS operations_shopify_shipping_service_codes_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0174_operations_shopify_checkout_provider_attempts.sql'
+              ) AS operations_shopify_checkout_provider_attempts_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0175_operations_shopify_checkout_rate_warm_policy.sql'
+              ) AS operations_shopify_checkout_rate_warm_policy_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0176_operations_canonical_fulfillment_planning.sql'
+              ) AS operations_canonical_fulfillment_planning_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1137,6 +1158,9 @@ export async function GET() {
             && row?.shopify_active_account_readiness_migration_applied
             && row?.operations_commerce_inventory_attempt_lease_renewal_applied
             && row?.operations_shopify_shipping_service_codes_applied
+            && row?.operations_shopify_checkout_provider_attempts_applied
+            && row?.operations_shopify_checkout_rate_warm_policy_applied
+            && row?.operations_canonical_fulfillment_planning_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1275,6 +1299,9 @@ export async function GET() {
           || !row?.shopify_active_account_readiness_migration_applied
           || !row?.operations_commerce_inventory_attempt_lease_renewal_applied
           || !row?.operations_shopify_shipping_service_codes_applied
+          || !row?.operations_shopify_checkout_provider_attempts_applied
+          || !row?.operations_shopify_checkout_rate_warm_policy_applied
+          || !row?.operations_canonical_fulfillment_planning_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

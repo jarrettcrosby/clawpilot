@@ -565,6 +565,7 @@ type CommerceIntakeWorkflowProps = {
   accountGlobalId: string
   provider: CommerceProvider
   displayName: string
+  canManage: boolean
   canActivate: boolean
   connectionReady?: boolean
 }
@@ -583,6 +584,7 @@ class IntakeRequestError extends Error {
   constructor(
     message: string,
     readonly code = 'COMMERCE_INTAKE_REQUEST_FAILED',
+    readonly preserveIdempotencyKey = false,
   ) {
     super(message)
     this.name = 'IntakeRequestError'
@@ -1125,6 +1127,47 @@ function initialSandboxParcelAssumption(
   }
 }
 
+function operationalPackagingMaterialBlockers(
+  material: PackagingMaterial,
+  warehouseGlobalId: string,
+) {
+  const blockers: string[] = []
+  const ratedOuter = material.ratedOuterDimensionsMm
+  if (material.status !== 'active') blockers.push('material is not active')
+  if (
+    !ratedOuter.length
+    || !ratedOuter.width
+    || !ratedOuter.height
+  ) {
+    blockers.push('rated exterior dimensions are incomplete')
+  }
+  if (
+    !['customer_confirmed', 'measured', 'provider'].includes(
+      material.ratedOuterDimensionEvidenceType || '',
+    )
+    || !material.ratedOuterDimensionEvidenceReference
+    || !material.ratedOuterDimensionConfirmedAt
+  ) {
+    blockers.push('factual rated exterior evidence is incomplete')
+  }
+  if (!material.tareWeightGrams || material.tareWeightGrams <= 0) {
+    blockers.push('tare weight is incomplete')
+  }
+  const stock = material.stock.find((item) => (
+    item.warehouseGlobalId === warehouseGlobalId
+  ))
+  if (
+    !stock
+    || stock.warehouseStatus !== 'active'
+    || !stock.isAvailable
+    || !stock.onHandQuantity
+    || stock.onHandQuantity <= 0
+  ) {
+    blockers.push('available warehouse stock is missing')
+  }
+  return blockers
+}
+
 async function readPayload(response: Response): Promise<IntakePayload> {
   const payload = await response.json().catch(() => ({})) as IntakePayload
   const hasAuthoritativePolicyResult = Boolean(
@@ -1174,6 +1217,7 @@ export default function CommerceIntakeWorkflow({
   accountGlobalId,
   provider,
   displayName,
+  canManage,
   canActivate,
   connectionReady = true,
 }: CommerceIntakeWorkflowProps) {
@@ -1531,6 +1575,18 @@ export default function CommerceIntakeWorkflow({
       )
       return material ? [material] : []
     })
+  const operationalMaterialBlockers = selectedCartonizationMaterials.flatMap(
+    (material) => operationalPackagingMaterialBlockers(
+      material,
+      selectedCartonizationWarehouseGlobalId,
+    ).map((blocker) => `${material.code}: ${blocker}`),
+  )
+  const operationalRateEvidenceReady = (
+    selectedCartonizationMaterials.length > 0
+    && selectedCartonizationMaterials.length
+      === selectedCartonizationMaterialGlobalIds.length
+    && operationalMaterialBlockers.length === 0
+  )
   const cartonizationShipmentServiceOptions = useMemo(
     () => commonShipmentServiceOptions(
       cartonizationRateEvidence?.packages || [],
@@ -2888,7 +2944,7 @@ export default function CommerceIntakeWorkflow({
 
   async function runCartonizationPreview() {
     const candidate = cartonizationCandidate
-    if (!canActivate || !operatorCommandsAllowed) {
+    if (!canManage || !operatorCommandsAllowed) {
       setCartonizationError(
         'Organization manager or administrator permission is required to run a pack-plan preview.',
       )
@@ -2962,7 +3018,7 @@ export default function CommerceIntakeWorkflow({
 
   async function createCartonizationRateEvidence() {
     const candidate = cartonizationCandidate
-    if (!canActivate || !operatorCommandsAllowed) {
+    if (!canManage || !operatorCommandsAllowed) {
       setCartonizationError(
         'Organization manager or administrator permission is required to compare carrier rates.',
       )
@@ -3082,59 +3138,156 @@ export default function CommerceIntakeWorkflow({
     setCartonizationLoading(true)
     setCartonizationError('')
     setCartonizationRateEvidence(null)
+    const command = {
+      evidenceMode: 'assumption_backed_sandbox' as const,
+      accountGlobalId,
+      candidateGlobalId: candidate.globalId,
+      expectedCandidateRowVersion: candidate.rowVersion,
+      warehouseGlobalId: selectedCartonizationWarehouseGlobalId,
+      selectedMaterials: selectedMaterialsWithAssumptions,
+      assumedCommittedQuantities: (candidate.lines || [])
+        .filter((line) => line.requiresShipping && line.quantity > 0)
+        .map((line) => ({
+          lineGlobalId: line.globalId,
+          quantity: Number(assumedCommittedByLine[line.globalId] || 0),
+        })),
+      sandboxAssumptions: {
+        acknowledged: true,
+        reason: assumptionReason,
+        allowUnderMinimum: allowSandboxMinimumOverride,
+        assumedMinimumInputQuantity: allowSandboxMinimumOverride
+          ? 1
+          : null,
+      },
+    }
+    const retryKey =
+      `cartonization-rate-evidence:${JSON.stringify(command)}`
+    const stableIdempotencyKey = retryKeys.current.get(retryKey)
+      || idempotencyKey()
+    retryKeys.current.set(retryKey, stableIdempotencyKey)
     try {
-      const idempotencyKey = [
-        'cartonization-rate',
-        candidate.globalId,
-        candidate.rowVersion,
-        typeof crypto !== 'undefined' && 'randomUUID' in crypto
-          ? crypto.randomUUID()
-          : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-      ].join(':')
       const response = await fetch(
         '/api/integrations/commerce/intake/cartonization-rate-evidence',
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            accountGlobalId,
-            candidateGlobalId: candidate.globalId,
-            expectedCandidateRowVersion: candidate.rowVersion,
-            warehouseGlobalId: selectedCartonizationWarehouseGlobalId,
-            selectedMaterials: selectedMaterialsWithAssumptions,
-            assumedCommittedQuantities: (candidate.lines || [])
-              .filter((line) => line.requiresShipping && line.quantity > 0)
-              .map((line) => ({
-                lineGlobalId: line.globalId,
-                quantity: Number(assumedCommittedByLine[line.globalId] || 0),
-              })),
-            sandboxAssumptions: {
-              acknowledged: true,
-              reason: assumptionReason,
-              allowUnderMinimum: allowSandboxMinimumOverride,
-              assumedMinimumInputQuantity: allowSandboxMinimumOverride
-                ? 1
-                : null,
-            },
-            idempotencyKey,
+            ...command,
+            idempotencyKey: stableIdempotencyKey,
           }),
         },
       )
       const payload = await response.json().catch(() => ({})) as
         CartonizationRateEvidencePayload
       if (!response.ok || !payload.ok || !payload.evidence) {
-        throw new Error(
-          `${payload.error || 'Pack and carrier-rate evidence failed.'}${
-            payload.code ? ` [${payload.code}]` : ''
-          }`,
+        const explicitApplicationFailure =
+          typeof payload.code === 'string' && payload.code.trim().length > 0
+        throw new IntakeRequestError(
+          payload.error || 'Pack and carrier-rate evidence failed.',
+          payload.code,
+          response.status >= 500
+            || !explicitApplicationFailure
+            || payload.code === 'CARTONIZATION_RATE_EVIDENCE_IN_PROGRESS',
         )
       }
+      retryKeys.current.delete(retryKey)
       setCartonizationRateEvidence(payload.evidence)
     } catch (caught) {
+      if (
+        caught instanceof IntakeRequestError
+        && !caught.preserveIdempotencyKey
+      ) {
+        retryKeys.current.delete(retryKey)
+      }
       setCartonizationError(
-        caught instanceof Error
-          ? caught.message
-          : 'Pack and carrier-rate evidence failed.',
+        caught instanceof IntakeRequestError
+          ? `${caught.message} [${caught.code}]`
+          : caught instanceof Error
+            ? caught.message
+            : 'Pack and carrier-rate evidence failed.',
+      )
+    } finally {
+      setCartonizationLoading(false)
+    }
+  }
+
+  async function createOperationalCartonizationRateEvidence() {
+    const candidate = cartonizationCandidate
+    if (!canManage || !operatorCommandsAllowed) {
+      setCartonizationError(
+        'Organization manager or administrator permission is required to save operational pack evidence.',
+      )
+      return
+    }
+    if (!candidate || !selectedCartonizationWarehouseGlobalId) return
+    if (!operationalRateEvidenceReady) {
+      setCartonizationError(
+        operationalMaterialBlockers[0]
+          || 'Select active, stocked packaging with factual rated exterior measurements and tare.',
+      )
+      return
+    }
+    setCartonizationLoading(true)
+    setCartonizationError('')
+    setCartonizationRateEvidence(null)
+    const command = {
+      evidenceMode: 'operational' as const,
+      accountGlobalId,
+      candidateGlobalId: candidate.globalId,
+      expectedCandidateRowVersion: candidate.rowVersion,
+      warehouseGlobalId: selectedCartonizationWarehouseGlobalId,
+      selectedMaterials: selectedCartonizationMaterials.map(
+        (material) => ({
+          materialGlobalId: material.globalId,
+          expectedRowVersion: material.rowVersion,
+        }),
+      ),
+    }
+    const retryKey =
+      `cartonization-rate-evidence:${JSON.stringify(command)}`
+    const stableIdempotencyKey = retryKeys.current.get(retryKey)
+      || idempotencyKey()
+    retryKeys.current.set(retryKey, stableIdempotencyKey)
+    try {
+      const response = await fetch(
+        '/api/integrations/commerce/intake/cartonization-rate-evidence',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...command,
+            idempotencyKey: stableIdempotencyKey,
+          }),
+        },
+      )
+      const payload = await response.json().catch(() => ({})) as
+        CartonizationRateEvidencePayload
+      if (!response.ok || !payload.ok || !payload.evidence) {
+        const explicitApplicationFailure =
+          typeof payload.code === 'string' && payload.code.trim().length > 0
+        throw new IntakeRequestError(
+          payload.error || 'Operational pack and rate evidence failed.',
+          payload.code,
+          response.status >= 500
+            || !explicitApplicationFailure
+            || payload.code === 'CARTONIZATION_RATE_EVIDENCE_IN_PROGRESS',
+        )
+      }
+      retryKeys.current.delete(retryKey)
+      setCartonizationRateEvidence(payload.evidence)
+    } catch (caught) {
+      if (
+        caught instanceof IntakeRequestError
+        && !caught.preserveIdempotencyKey
+      ) {
+        retryKeys.current.delete(retryKey)
+      }
+      setCartonizationError(
+        caught instanceof IntakeRequestError
+          ? `${caught.message} [${caught.code}]`
+          : caught instanceof Error
+            ? caught.message
+            : 'Operational pack and rate evidence failed.',
       )
     } finally {
       setCartonizationLoading(false)
@@ -6562,9 +6715,9 @@ export default function CommerceIntakeWorkflow({
                                 refreshLocked
                                 || Boolean(pendingAction)
                                 || !operatorCommandsAllowed
-                                || !canActivate
+                                || !canManage
                               }
-                              title={!canActivate
+                              title={!canManage
                                 ? 'Organization manager or administrator permission is required to plan packages and compare carrier rates.'
                                 : undefined}
                               onClick={() => {
@@ -6737,7 +6890,7 @@ export default function CommerceIntakeWorkflow({
               shipment rates covering every resulting package. Neither path
               buys postage, creates a shipment, prints, or changes inventory.
             </Alert>
-            {!canActivate ? (
+            {!canManage ? (
               <Alert severity="warning">
                 Organization manager or administrator permission is required
                 to run this preview.
@@ -6948,6 +7101,68 @@ export default function CommerceIntakeWorkflow({
               </Stack>
             </Box>
 
+            <Box
+              component="section"
+              aria-labelledby="operational-rating-title"
+            >
+              <Typography variant="overline" color="text.secondary">
+                Preferred path · Use current operational facts
+              </Typography>
+              <Typography
+                id="operational-rating-title"
+                variant="subtitle2"
+                fontWeight={700}
+                mb={0.5}
+              >
+                Save a factual pack plan with read-only sandbox carrier estimates
+              </Typography>
+              <Alert
+                severity={operationalRateEvidenceReady ? 'success' : 'info'}
+                variant="outlined"
+                sx={{ mb: 1 }}
+              >
+                This path accepts no operator parcel, inventory, or minimum
+                assumptions. It requires active current recipes and packaging,
+                customer-confirmed, measured, or provider-rated exterior
+                measurements, positive tare, and available packaging stock.
+                Shopify orders use the provider commitment as a read-only
+                preflight; the later Plan action locks the exact claim.
+              </Alert>
+              <Alert severity="warning" variant="outlined" sx={{ mb: 1.5 }}>
+                Carrier reads still use UPS and FedEx sandbox accounts. This
+                development/shadow evidence is not an executable production
+                rate, postage purchase, label, shipment, or billed cost.
+              </Alert>
+              {operationalRateEvidenceReady ? (
+                <Typography variant="body2" color="success.main">
+                  The selected warehouse and packaging pass the current
+                  operational-fact preflight.
+                </Typography>
+              ) : operationalMaterialBlockers.length > 0 ? (
+                <Box
+                  component="ul"
+                  aria-label="Operational pack evidence blockers"
+                  sx={{ my: 0, pl: 3 }}
+                >
+                  {operationalMaterialBlockers.map((blocker) => (
+                    <Typography
+                      component="li"
+                      variant="body2"
+                      color="text.secondary"
+                      key={blocker}
+                    >
+                      {blocker}
+                    </Typography>
+                  ))}
+                </Box>
+              ) : (
+                <Typography variant="body2" color="text.secondary">
+                  Select one to eight packaging materials and an active
+                  warehouse to evaluate this path.
+                </Typography>
+              )}
+            </Box>
+
             <Box component="section" aria-labelledby="sandbox-rating-title">
               <Typography variant="overline" color="text.secondary">
                 Step 3 · Compare UPS and FedEx without shipping
@@ -7151,9 +7366,17 @@ export default function CommerceIntakeWorkflow({
 
             {cartonizationRateEvidence ? (
               <Box component="section" aria-label="Saved carrier comparison">
-                <Alert severity="warning" sx={{ mb: 1.5 }}>
-                  ASSUMPTION-BACKED SANDBOX EVIDENCE · NOT EXECUTABLE OR
-                  ACTUAL BILLED COST
+                <Alert
+                  severity={
+                    cartonizationRateEvidence.evidenceMode === 'operational'
+                      ? 'info'
+                      : 'warning'
+                  }
+                  sx={{ mb: 1.5 }}
+                >
+                  {cartonizationRateEvidence.evidenceMode === 'operational'
+                    ? 'OPERATIONAL PACK FACTS · READ-ONLY SANDBOX CARRIER ESTIMATES · DEV/SHADOW ONLY'
+                    : 'ASSUMPTION-BACKED SANDBOX EVIDENCE · NOT EXECUTABLE OR ACTUAL BILLED COST'}
                 </Alert>
                 <Stack
                   direction={{ xs: 'column', sm: 'row' }}
@@ -7814,7 +8037,7 @@ export default function CommerceIntakeWorkflow({
             ) : null}
           </Stack>
         </DialogContent>
-        <DialogActions>
+        <DialogActions sx={{ flexWrap: 'wrap' }}>
           <Button
             onClick={() => setCartonizationCandidate(null)}
             disabled={cartonizationLoading}
@@ -7828,7 +8051,7 @@ export default function CommerceIntakeWorkflow({
               : <Inventory2Rounded />}
             disabled={
               cartonizationLoading
-              || !canActivate
+              || !canManage
               || !operatorCommandsAllowed
               || selectedCartonizationMaterialGlobalIds.length < 1
               || selectedCartonizationMaterialGlobalIds.length > 8
@@ -7840,13 +8063,14 @@ export default function CommerceIntakeWorkflow({
             Run fit-only preview
           </Button>
           <Button
-            variant="contained"
+            variant="outlined"
+            color="warning"
             startIcon={cartonizationLoading
               ? <CircularProgress size={16} color="inherit" />
               : <Inventory2Rounded />}
             disabled={
               cartonizationLoading
-              || !canActivate
+              || !canManage
               || !operatorCommandsAllowed
               || selectedCartonizationMaterialGlobalIds.length < 1
               || selectedCartonizationMaterialGlobalIds.length > 8
@@ -7857,7 +8081,25 @@ export default function CommerceIntakeWorkflow({
               void createCartonizationRateEvidence()
             }}
           >
-            Save & compare UPS + FedEx
+            Save sandbox comparison
+          </Button>
+          <Button
+            variant="contained"
+            startIcon={cartonizationLoading
+              ? <CircularProgress size={16} color="inherit" />
+              : <Inventory2Rounded />}
+            disabled={
+              cartonizationLoading
+              || !canManage
+              || !operatorCommandsAllowed
+              || !selectedCartonizationWarehouseGlobalId
+              || !operationalRateEvidenceReady
+            }
+            onClick={() => {
+              void createOperationalCartonizationRateEvidence()
+            }}
+          >
+            Save operational pack facts
           </Button>
         </DialogActions>
       </Dialog>

@@ -143,6 +143,7 @@ assert.deepEqual(
   {
     productGlobalId: 'gp0000001',
     requiredQuantity: 3,
+    availabilityAuthority: 'operational_available',
     operationalAvailableQuantity: 1,
     providerCommittedQuantity: 2,
     assumedCommittedQuantity: 2,
@@ -178,6 +179,7 @@ assert.deepEqual(
   {
     productGlobalId: 'gp0000001',
     requiredQuantity: 2,
+    availabilityAuthority: 'operational_available',
     operationalAvailableQuantity: 0,
     providerCommittedQuantity: 2,
     assumedCommittedQuantity: 2,
@@ -210,6 +212,68 @@ assert.throws(
     && error.code
       === 'HYBRID_CARTONIZATION_COMMITTED_ASSUMPTION_UNSUPPORTED'
   ),
+)
+
+const shopifyProductionInventory =
+  evaluateHybridCartonizationInventoryAvailability({
+    mode: 'production',
+    provider: 'shopify',
+    lines: [{
+      lineGlobalId: 'gcol0000001',
+      productGlobalId: 'gp0000001',
+      requiredQuantity: 2,
+    }],
+    positions: [{
+      productGlobalId: 'gp0000001',
+      operationalAvailableQuantity: 0,
+      providerCommittedQuantity: 2,
+      sourceLevelGlobalIds: ['giil0000001'],
+      sourceProjectionStates: ['projected'],
+    }],
+    assumedCommittedQuantities: [],
+  })
+assert.deepEqual(
+  JSON.parse(JSON.stringify(shopifyProductionInventory.products[0])),
+  {
+    productGlobalId: 'gp0000001',
+    requiredQuantity: 2,
+    availabilityAuthority: 'shopify_provider_commitment',
+    operationalAvailableQuantity: 0,
+    providerCommittedQuantity: 2,
+    assumedCommittedQuantity: 0,
+    effectiveAvailableQuantity: 2,
+    sourceLevelGlobalIds: ['giil0000001'],
+    sourceProjectionStates: ['projected'],
+  },
+  'Shopify production evidence must use provider commitment without an operator attribution assumption',
+)
+assert.throws(
+  () => evaluateHybridCartonizationInventoryAvailability({
+    mode: 'production',
+    provider: 'shopify',
+    lines: [{
+      lineGlobalId: 'gcol0000001',
+      productGlobalId: 'gp0000001',
+      requiredQuantity: 1,
+    }],
+    positions: [{
+      productGlobalId: 'gp0000001',
+      operationalAvailableQuantity: 1,
+      providerCommittedQuantity: 1,
+      sourceLevelGlobalIds: ['giil0000001'],
+      sourceProjectionStates: ['projected'],
+    }],
+    assumedCommittedQuantities: [{
+      lineGlobalId: 'gcol0000001',
+      quantity: 1,
+    }],
+  }),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code
+      === 'HYBRID_CARTONIZATION_PRODUCTION_ASSUMPTIONS_FORBIDDEN'
+  ),
+  'Production evidence must reject operator-entered committed inventory assumptions',
 )
 assert.throws(
   () => evaluateHybridCartonizationInventoryAvailability({
@@ -256,11 +320,18 @@ for (const contract of [
   'row.current_pack_profile_length_mm === null',
   "row.current_pack_profile_dimension_basis === 'unspecified'",
   'material.row_version::text',
+  'material.rated_outer_length_mm',
+  'ratedOuterDimensionsMm',
+  'maximumGrossWeightGrams',
+  'availableQuantity',
   'recipe.input_pack_profile_version_id',
   'recipe.packaging_material_id = ANY($3::uuid[])',
   'recipe.is_current = true',
   'level.projection_state = ANY($5::text[])',
   'hybridCartonizationInventoryProjectionStates(input.mode)',
+  'provider: account.provider',
+  "'shopify_provider_commitment'",
+  'HYBRID_CARTONIZATION_MATERIAL_RATE_EVIDENCE_REQUIRED',
 ]) {
   assert.ok(source.includes(contract), `Missing persistence contract: ${contract}`)
 }

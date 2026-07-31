@@ -321,6 +321,98 @@ async function addActiveLabel(pool, fixture, orderGlobalId, environment) {
   }
 }
 
+async function addPackagingClaim(pool, fixture, orderGlobalId) {
+  const plan = await pool.query(
+    `SELECT plan.id::text, plan.warehouse_id::text
+     FROM operations_orders source_order
+     JOIN operations_fulfillment_plans plan
+       ON plan.organization_id = source_order.organization_id
+      AND plan.order_id = source_order.id
+     WHERE source_order.organization_id = $1::uuid
+       AND source_order.global_id = $2
+     ORDER BY plan.version_number DESC
+     LIMIT 1`,
+    [fixture.organizationId, orderGlobalId],
+  )
+  assert.equal(plan.rowCount, 1)
+  const code = `SHIP-${randomUUID().slice(0, 8).toUpperCase()}`
+  const material = await pool.query(
+    `INSERT INTO operations_packaging_materials (
+       organization_id, code, name, material_type,
+       inner_length_mm, inner_width_mm, inner_height_mm,
+       tare_weight_grams, max_weight_grams, unit_cost_minor,
+       currency, status, source, created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2, 'Shipment claim carton', 'carton',
+       305, 229, 152, 120, 5000, 55,
+       'USD', 'active', 'manual', $3, $3
+     )
+     RETURNING id::text, global_id`,
+    [fixture.organizationId, code, fixture.email],
+  )
+  const stock = await pool.query(
+    `INSERT INTO operations_packaging_material_stock (
+       organization_id, packaging_material_id, warehouse_id,
+       is_available, on_hand_quantity, reorder_point_quantity,
+       reorder_to_quantity, created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, true, 3, 0, 3, $4, $4
+     )
+     RETURNING id::text, global_id, row_version::text,
+               on_hand_quantity`,
+    [
+      fixture.organizationId,
+      material.rows[0].id,
+      plan.rows[0].warehouse_id,
+      fixture.email,
+    ],
+  )
+  const claim = await pool.query(
+    `INSERT INTO operations_packaging_material_claims (
+       organization_id, plan_id, packaging_material_id, warehouse_id,
+       packaging_material_stock_id, quantity,
+       stock_row_version_at_claim, on_hand_quantity_at_claim,
+       created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+       $5::uuid, 1, $6, $7, $8, $8
+     )
+     RETURNING id::text, global_id, status`,
+    [
+      fixture.organizationId,
+      plan.rows[0].id,
+      material.rows[0].id,
+      plan.rows[0].warehouse_id,
+      stock.rows[0].id,
+      stock.rows[0].row_version,
+      stock.rows[0].on_hand_quantity,
+      fixture.email,
+    ],
+  )
+  return {
+    claim: claim.rows[0],
+    stock: stock.rows[0],
+  }
+}
+
+async function packagingClaimEvidence(pool, fixture, claimFixture) {
+  const result = await pool.query(
+    `SELECT claim.status, claim.consumed_at IS NOT NULL AS consumed,
+            claim.released_at IS NOT NULL AS released,
+            stock.on_hand_quantity,
+            stock.row_version::text
+     FROM operations_packaging_material_claims claim
+     JOIN operations_packaging_material_stock stock
+       ON stock.organization_id = claim.organization_id
+      AND stock.id = claim.packaging_material_stock_id
+     WHERE claim.organization_id = $1::uuid
+       AND claim.id = $2::uuid`,
+    [fixture.organizationId, claimFixture.claim.id],
+  )
+  assert.equal(result.rowCount, 1)
+  return result.rows[0]
+}
+
 async function orderEvidence(pool, fixture, orderGlobalId) {
   const result = await pool.query(
     `SELECT orders.status,
@@ -428,6 +520,10 @@ async function verifyShipmentCompletion(databaseUrl) {
       },
     })
     const currency = loadTypeScriptModule('app_src/lib/currency.ts')
+    const canonicalPlanning = loadTypeScriptModule(
+      'app_src/lib/operations/canonicalFulfillmentPlanning.ts',
+      { mocks: { '../currency.ts': currency } },
+    )
     const shopifyCheckoutPlanRatePolicy = loadTypeScriptModule(
       'app_src/lib/operations/shopifyCheckoutPlanRatePolicy.ts',
       { mocks: { '../currency.ts': currency } },
@@ -453,8 +549,13 @@ async function verifyShipmentCompletion(databaseUrl) {
         '@/lib/auditWriter': auditWriter,
         '@/lib/crm/stableId': stableId,
         '@/lib/operations/adapters': adapters,
+        '@/lib/operations/canonicalFulfillmentPlanning':
+          canonicalPlanning,
         '@/lib/operations/domain': domain,
         '@/lib/operations/packingSlip': packingSlip,
+        '@/lib/persistence/cartonizationRateEvidence': {
+          readCartonizationRateEvidenceByGlobalId: async () => null,
+        },
         '@/lib/persistence/crm': {
           stageCrmRecordWithClient: async () => {
             throw new Error('Shipment completion acceptance does not stage CRM records')
@@ -648,6 +749,11 @@ async function verifyShipmentCompletion(databaseUrl) {
 
     const successFixture = await createFixture('success')
     const successful = await advanceOrderToPacked(persistence, successFixture, 'success')
+    const packagingClaim = await addPackagingClaim(
+      pool,
+      successFixture,
+      successful.planned.orderGlobalId,
+    )
     const mockLabel = await addActiveLabel(
       pool,
       successFixture,
@@ -661,6 +767,16 @@ async function verifyShipmentCompletion(databaseUrl) {
     )
     assert.equal(beforeSuccess.on_hand_quantity, '12.000000')
     assert.equal(beforeSuccess.reserved_quantity, '2.000000')
+    assert.deepEqual(
+      await packagingClaimEvidence(pool, successFixture, packagingClaim),
+      {
+        status: 'active',
+        consumed: false,
+        released: false,
+        on_hand_quantity: 3,
+        row_version: packagingClaim.stock.row_version,
+      },
+    )
     const successInput = {
       organizationId: successFixture.organizationId,
       actorEmail: successFixture.email,
@@ -692,6 +808,18 @@ async function verifyShipmentCompletion(databaseUrl) {
       tracking_observations: 1,
       fulfillment_exports: 1,
       ship_ledger_entries: 1,
+    })
+    const consumedPackaging = await packagingClaimEvidence(
+      pool,
+      successFixture,
+      packagingClaim,
+    )
+    assert.deepEqual(consumedPackaging, {
+      status: 'consumed',
+      consumed: true,
+      released: false,
+      on_hand_quantity: 2,
+      row_version: String(Number(packagingClaim.stock.row_version) + 1),
     })
     const shipment = await pool.query(
       `SELECT shipment.global_id, shipment.tracking_number
@@ -770,6 +898,15 @@ async function verifyShipmentCompletion(databaseUrl) {
       successful.planned.orderGlobalId,
     )
     assert.deepEqual(afterReplay, afterSuccess)
+    assert.deepEqual(
+      await packagingClaimEvidence(
+        pool,
+        successFixture,
+        packagingClaim,
+      ),
+      consumedPackaging,
+      'Shipment replay must not consume packaging stock twice',
+    )
 
     const sandboxFixture = await createFixture('sandbox')
     const sandbox = await advanceOrderToPacked(persistence, sandboxFixture, 'sandbox')

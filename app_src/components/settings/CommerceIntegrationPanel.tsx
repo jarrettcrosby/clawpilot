@@ -484,6 +484,7 @@ export default function CommerceIntegrationPanel() {
     accounts: [],
   })
   const [catalog, setCatalog] = useState<CommerceCatalog | null>(null)
+  const [canManage, setCanManage] = useState(false)
   const [canActivate, setCanActivate] = useState(false)
   const [canRevealCredentials, setCanRevealCredentials] = useState(false)
   const [intakeAvailable, setIntakeAvailable] = useState(false)
@@ -527,6 +528,7 @@ export default function CommerceIntegrationPanel() {
       setIntegrations(payload.integrations)
     }
     if (payload.catalog) setCatalog(payload.catalog)
+    setCanManage(payload.canManage === true)
     setCanActivate(payload.canActivate === true)
     setIntakeAvailable(payload.intakeAvailable === true)
     if (typeof payload.canRevealCredentials === 'boolean') {
@@ -1738,6 +1740,7 @@ export default function CommerceIntegrationPanel() {
                           accountGlobalId={account.globalId}
                           provider={account.provider}
                           displayName={account.displayName}
+                          canManage={canManage}
                           canActivate={canActivate}
                           connectionReady={
                             account.configured

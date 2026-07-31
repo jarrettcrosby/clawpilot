@@ -117,6 +117,9 @@ const persistence = read(
 const route = read(
   'app_src/app/api/integrations/commerce/intake/cartonization-rate-evidence/route.ts',
 )
+const workflow = read(
+  'app_src/components/settings/CommerceIntakeWorkflow.tsx',
+)
 
 assertIncludes(migration, [
   'request_hash text NOT NULL',
@@ -217,6 +220,10 @@ assertIncludes(persistence, [
   'CartonizationRateEvidenceMaterialRateAssumption',
   'assertCartonizationRateEvidenceMaterialAssumptions',
   'materialRateAssumptions',
+  'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_ASSUMPTIONS_FORBIDDEN',
+  'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_RATE_ENVIRONMENT_INVALID',
+  'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_STALE',
+  'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_STOCK_STALE',
   'CARTONIZATION_RATE_EVIDENCE_MATERIAL_ASSUMPTION_MISMATCH',
   'rateContextsByEvidence',
   'export function cartonizationRateEvidenceRequestHash',
@@ -269,11 +276,20 @@ assert.doesNotMatch(
 
 assertIncludes(route, [
   'export async function POST(req: NextRequest)',
+  "version: 'cartonization-rate-evidence-command-v1'",
+  'function cartonizationRateEvidenceCommandHash(',
+  "error.message === 'ACTIVE_ORGANIZATION_REQUIRED'",
   'MAX_SELECTED_MATERIALS = 8',
   'selected.length < 1',
   'selected.length > MAX_SELECTED_MATERIALS',
   'sandboxRateAssumptions',
-  'materialRateAssumptions(request)',
+  'sandboxMaterialRateAssumptions(request)',
+  "request.evidenceMode === 'operational'",
+  "carrierReadEnvironment: 'sandbox'",
+  'operatorSuppliedAssumptions: false',
+  'operationalMaterialFacts',
+  "'shopify_provider_commitment_preflight'",
+  "'transactional_provider_commitment_lock'",
   'rateAssumptionsByMaterial',
   'readHybridCartonizationInputFromPostgres',
   'readCartonizationRateCandidateContext',
@@ -297,6 +313,48 @@ assertIncludes(route, [
   'postagePurchases: 0',
   'providerWrites: 0',
 ], 'Executable package-and-rate workflow')
+assert.ok(
+  route.indexOf('claimCartonizationRateEvidenceCommandInPostgres({')
+    < route.indexOf('readHybridCartonizationInputFromPostgres({'),
+  'The durable idempotency claim must precede database planning and carrier reads',
+)
+const commandHashSection = section(
+  route,
+  'function cartonizationRateEvidenceCommandHash(',
+  'function errorResponse(',
+  'Stable cartonization command hash',
+)
+assert.doesNotMatch(
+  commandHashSection,
+  /readAt|planSnapshot|carrierReadEnvironment/,
+  'The durable command identity must exclude volatile read and plan output',
+)
+assertIncludes(workflow, [
+  'canManage: boolean',
+  'readonly preserveIdempotencyKey = false',
+  "evidenceMode: 'operational'",
+  "evidenceMode: 'assumption_backed_sandbox'",
+  '`cartonization-rate-evidence:${JSON.stringify(command)}`',
+  "'CARTONIZATION_RATE_EVIDENCE_IN_PROGRESS'",
+  'response.status >= 500',
+  '!explicitApplicationFailure',
+  '&& !caught.preserveIdempotencyKey',
+  'createOperationalCartonizationRateEvidence',
+  'operationalRateEvidenceReady',
+  'Save operational pack facts',
+  'Save sandbox comparison',
+  'READ-ONLY SANDBOX CARRIER ESTIMATES',
+], 'Operator evidence-mode workflow')
+assert.equal(
+  workflow.match(/response\.status >= 500/g)?.length,
+  2,
+  'Both evidence modes must preserve retry identity after 5xx responses',
+)
+assert.equal(
+  workflow.match(/&& !caught\.preserveIdempotencyKey/g)?.length,
+  2,
+  'Both evidence modes must rotate retry identity only after terminal responses',
+)
 assert.doesNotMatch(
   route,
   /CARTONIZATION_RATE_EVIDENCE_ONE_MATERIAL_REQUIRED/,
@@ -370,6 +428,7 @@ assert.throws(
 )
 
 const planSnapshot = {
+  carrierReadEnvironment: 'sandbox',
   warehouseGlobalId: 'gwh0000001',
   packages: [{ packageKey: 'package-1' }],
 }
@@ -452,7 +511,9 @@ const request = {
   planInputHash: 'a'.repeat(64),
   planResultHash: cartonizationRateEvidenceHash(planSnapshot),
   planSnapshot,
-  assumptionSnapshot: { materialRateAssumptions },
+  assumptionSnapshot: {
+    operationalMaterialFacts: materialRateAssumptions,
+  },
   status: 'succeeded',
   idempotencyKey: 'cartonization-demo-1',
   actorEmail: 'operator@example.com',
@@ -462,7 +523,45 @@ const request = {
 }
 assert.doesNotThrow(
   () => assertCartonizationRateEvidenceMaterialAssumptions(request),
-  'Every package must match its retained per-material rating assumptions',
+  'Every operational package must match its retained factual material inputs',
+)
+assert.throws(
+  () => assertCartonizationRateEvidenceMaterialAssumptions({
+    ...request,
+    assumptionSnapshot: {
+      operationalMaterialFacts: materialRateAssumptions,
+      materialRateAssumptions,
+    },
+  }),
+  (error) => (
+    error instanceof CartonizationRateEvidencePersistenceError
+    && error.code
+      === 'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_ASSUMPTIONS_FORBIDDEN'
+  ),
+  'Operational evidence must reject a retained sandbox-assumption payload',
+)
+assert.throws(
+  () => assertCartonizationRateEvidenceMaterialAssumptions({
+    ...request,
+    planSnapshot: {
+      ...request.planSnapshot,
+      carrierReadEnvironment: 'production',
+    },
+  }),
+  (error) => (
+    error instanceof CartonizationRateEvidencePersistenceError
+    && error.code
+      === 'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_RATE_ENVIRONMENT_INVALID'
+  ),
+  'Development operational evidence must retain its sandbox carrier environment',
+)
+assert.doesNotThrow(
+  () => assertCartonizationRateEvidenceMaterialAssumptions({
+    ...request,
+    evidenceMode: 'assumption_backed_sandbox',
+    assumptionSnapshot: { materialRateAssumptions },
+  }),
+  'The explicit assumption-backed sandbox path must remain supported',
 )
 assert.equal(
   quotes.length,
@@ -524,7 +623,7 @@ assert.equal(
     packages: [...packages].reverse(),
     quotes: [...quotes].reverse(),
   }),
-  'Semantic request hashing must ignore actor, command key, material order, and edge ordering',
+  'Exact evidence request hashing must ignore actor, command key, material order, and edge ordering',
 )
 assert.notEqual(
   requestHash,

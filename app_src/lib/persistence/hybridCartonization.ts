@@ -38,6 +38,9 @@ export type HybridCartonizationInventoryLineEvidence = {
 export type HybridCartonizationInventoryProductEvidence = {
   productGlobalId: string
   requiredQuantity: number
+  availabilityAuthority:
+    | 'operational_available'
+    | 'shopify_provider_commitment'
   operationalAvailableQuantity: number
   providerCommittedQuantity: number
   assumedCommittedQuantity: number
@@ -81,6 +84,19 @@ export type HybridCartonizationReadResult = {
     rowVersion: number
     status: 'draft' | 'active'
     source: string
+    ratedOuterDimensionsMm: {
+      length: number
+      width: number
+      height: number
+    } | null
+    ratedOuterDimensionEvidenceType:
+      | 'customer_confirmed'
+      | 'measured'
+      | 'provider'
+      | 'legacy'
+      | null
+    ratedOuterDimensionEvidenceReference: string | null
+    ratedOuterDimensionConfirmedAt: string | null
     stock: {
       isAvailable: boolean
       onHandQuantity: number | null
@@ -222,6 +238,17 @@ type MaterialRow = {
   inner_length_mm: number | null
   inner_width_mm: number | null
   inner_height_mm: number | null
+  rated_outer_length_mm: number | null
+  rated_outer_width_mm: number | null
+  rated_outer_height_mm: number | null
+  rated_outer_dimension_evidence_type:
+    | 'customer_confirmed'
+    | 'measured'
+    | 'provider'
+    | 'legacy'
+    | null
+  rated_outer_dimension_evidence_reference: string | null
+  rated_outer_dimension_confirmed_at: Date | string | null
   dimension_basis: 'inner' | 'outer' | 'unspecified'
   dimension_evidence_type:
     | 'unknown'
@@ -501,17 +528,39 @@ export function normalizeHybridCartonizationReadRequest(
 }
 
 export function evaluateHybridCartonizationInventoryAvailability(input: {
+  mode?: HybridCartonizationReadRequest['mode']
+  provider?: HybridCartonizationReadResult['account']['provider']
   lines: InventoryEvaluationLine[]
   positions: InventoryEvaluationPosition[]
   assumedCommittedQuantities: HybridCartonizationCommittedAssumption[]
 }) {
+  if (
+    input.mode === 'production'
+    && input.assumedCommittedQuantities.length > 0
+  ) {
+    fail(
+      'Production cartonization cannot accept operator-entered committed inventory assumptions',
+      400,
+      'HYBRID_CARTONIZATION_PRODUCTION_ASSUMPTIONS_FORBIDDEN',
+    )
+  }
+  if (input.mode === 'production' && !input.provider) {
+    fail(
+      'Production cartonization requires an explicit commerce provider inventory authority',
+      400,
+      'HYBRID_CARTONIZATION_PRODUCTION_PROVIDER_REQUIRED',
+    )
+  }
   const assumptionsByLine = new Map(
     input.assumedCommittedQuantities.map((entry) => [
       entry.lineGlobalId,
       entry.quantity,
     ]),
   )
-  if (assumptionsByLine.size !== input.lines.length) {
+  if (
+    input.mode !== 'production'
+    && assumptionsByLine.size !== input.lines.length
+  ) {
     fail(
       'Record an explicit committed quantity, including zero, for every shipping line',
       422,
@@ -548,7 +597,9 @@ export function evaluateHybridCartonizationInventoryAvailability(input: {
     assumed: number
   }>()
   for (const line of input.lines) {
-    const assumed = assumptionsByLine.get(line.lineGlobalId)
+    const assumed = input.mode === 'production'
+      ? 0
+      : assumptionsByLine.get(line.lineGlobalId)
     if (assumed === undefined) {
       fail(
         `Committed quantity for ${line.lineGlobalId} is missing`,
@@ -592,8 +643,16 @@ export function evaluateHybridCartonizationInventoryAvailability(input: {
         'HYBRID_CARTONIZATION_COMMITTED_ASSUMPTION_UNSUPPORTED',
       )
     }
+    const availabilityAuthority = (
+      input.mode === 'production'
+      && input.provider === 'shopify'
+    )
+      ? 'shopify_provider_commitment'
+      : 'operational_available'
     const effectiveAvailableQuantity =
-      operationalAvailableQuantity + total.assumed
+      availabilityAuthority === 'shopify_provider_commitment'
+        ? providerCommittedQuantity
+        : operationalAvailableQuantity + total.assumed
     if (total.required > effectiveAvailableQuantity) {
       fail(
         `Latest inventory cannot cover ${total.required} unit(s) of ${productGlobalId}`,
@@ -604,6 +663,7 @@ export function evaluateHybridCartonizationInventoryAvailability(input: {
     productEvidence.push({
       productGlobalId,
       requiredQuantity: total.required,
+      availabilityAuthority,
       operationalAvailableQuantity,
       providerCommittedQuantity,
       assumedCommittedQuantity: total.assumed,
@@ -1140,6 +1200,12 @@ async function readSelectedMaterials(
        material.inner_length_mm,
        material.inner_width_mm,
        material.inner_height_mm,
+       material.rated_outer_length_mm,
+       material.rated_outer_width_mm,
+       material.rated_outer_height_mm,
+       material.rated_outer_dimension_evidence_type,
+       material.rated_outer_dimension_evidence_reference,
+       material.rated_outer_dimension_confirmed_at,
        material.dimension_basis,
        material.dimension_evidence_type,
        material.dimension_evidence_reference,
@@ -1248,6 +1314,50 @@ function mapSelectedMaterials(
         'HYBRID_CARTONIZATION_MATERIAL_EVIDENCE_REQUIRED',
       )
     }
+    const ratedOuterDimensionsMm = (
+      row.rated_outer_length_mm === null
+      || row.rated_outer_width_mm === null
+      || row.rated_outer_height_mm === null
+    )
+      ? null
+      : {
+          length: exactInteger(
+            row.rated_outer_length_mm,
+            `${row.global_id} rated exterior length`,
+            1,
+          ),
+          width: exactInteger(
+            row.rated_outer_width_mm,
+            `${row.global_id} rated exterior width`,
+            1,
+          ),
+          height: exactInteger(
+            row.rated_outer_height_mm,
+            `${row.global_id} rated exterior height`,
+            1,
+          ),
+        }
+    const ratedOuterConfirmedAt = timestamp(
+      row.rated_outer_dimension_confirmed_at,
+      `${row.global_id} rated exterior confirmation`,
+    )
+    if (
+      input.mode === 'production'
+      && (
+        !ratedOuterDimensionsMm
+        || !['customer_confirmed', 'measured', 'provider'].includes(
+          row.rated_outer_dimension_evidence_type || '',
+        )
+        || !row.rated_outer_dimension_evidence_reference
+        || !ratedOuterConfirmedAt
+      )
+    ) {
+      fail(
+        `${row.name} has no current factual rated exterior measurement`,
+        422,
+        'HYBRID_CARTONIZATION_MATERIAL_RATE_EVIDENCE_REQUIRED',
+      )
+    }
     const stockRowVersion = row.stock_row_version === null
       ? null
       : exactInteger(
@@ -1284,7 +1394,9 @@ function mapSelectedMaterials(
         dimensionEvidenceReference: row.dimension_evidence_reference,
         dimensionConfirmedAt: confirmedAt,
         tareWeightGrams: row.tare_weight_grams,
-        ratedOuterDimensionsMm: null,
+        maximumGrossWeightGrams: row.max_weight_grams,
+        availableQuantity: row.stock_on_hand_quantity,
+        ratedOuterDimensionsMm,
       },
       evidence: {
         globalId: row.global_id,
@@ -1292,6 +1404,12 @@ function mapSelectedMaterials(
         rowVersion: currentRowVersion,
         status: row.status,
         source: row.source,
+        ratedOuterDimensionsMm,
+        ratedOuterDimensionEvidenceType:
+          row.rated_outer_dimension_evidence_type,
+        ratedOuterDimensionEvidenceReference:
+          row.rated_outer_dimension_evidence_reference,
+        ratedOuterDimensionConfirmedAt: ratedOuterConfirmedAt,
         stock: stockRowVersion === null
           ? null
           : {
@@ -1540,6 +1658,8 @@ export async function readHybridCartonizationInputFromPostgres(
     ])
     const recipes = mapRecipes(recipeRows)
     const inventory = evaluateHybridCartonizationInventoryAvailability({
+      mode: input.mode,
+      provider: account.provider,
       lines: lineEvidence.map((entry) => ({
         lineGlobalId: entry.line.lineGlobalId,
         productGlobalId: entry.line.productGlobalId,

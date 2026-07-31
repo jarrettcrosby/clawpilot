@@ -141,6 +141,8 @@ const ACTIVATION_OPTIONS: Array<{ value: OperationsActivationState; label: strin
   { value: 'frozen', label: 'Frozen' },
 ]
 
+const CARTONIZATION_EVIDENCE_GLOBAL_ID = /^gcte\d{7}$/
+
 type CommerceActiveAccountOption = {
   accountGlobalId: string
   displayName: string
@@ -359,7 +361,10 @@ function severityColor(severity: OperationsExceptionListItem['severity']): 'defa
 }
 
 function money(minor: string | null | undefined, currency = 'USD') {
-  const value = Number(minor || 0) / 100
+  if (minor === null || minor === undefined || minor === '') {
+    return 'Not available'
+  }
+  const value = Number(minor) / 100
   return new Intl.NumberFormat('en-US', {
     style: 'currency',
     currency,
@@ -393,6 +398,7 @@ function OrderDetailDrawer({
   open,
   busy,
   onClose,
+  onPlan,
   onRelease,
   onConfirmPicks,
   onVerifyPack,
@@ -410,6 +416,7 @@ function OrderDetailDrawer({
   open: boolean
   busy: boolean
   onClose: () => void
+  onPlan: () => void
   onRelease: () => void
   onConfirmPicks: () => void
   onVerifyPack: () => void
@@ -429,15 +436,22 @@ function OrderDetailDrawer({
   const confirmPicksAction = order?.availableActions?.find((item) => item.action === 'confirm_picks')
   const verifyPackAction = order?.availableActions?.find((item) => item.action === 'verify_pack')
   const confirmShipmentAction = order?.availableActions?.find((item) => item.action === 'confirm_shipment')
-  const primaryAction = order?.status === 'released'
-    ? confirmPicksAction
-    : order?.status === 'picking'
-      ? verifyPackAction
-      : order?.status === 'packed'
-        ? confirmShipmentAction
-        : order && !['shipped', 'cancelled'].includes(order.status)
-          ? releaseAction
-          : undefined
+  const canPlanImportedOrder = Boolean(
+    order?.status === 'imported'
+    && order.sourceProvider
+    && order.sourceProvider !== 'mock-commerce',
+  )
+  const primaryAction = canPlanImportedOrder
+    ? undefined
+    : order?.status === 'released'
+      ? confirmPicksAction
+      : order?.status === 'picking'
+        ? verifyPackAction
+        : order?.status === 'packed'
+          ? confirmShipmentAction
+          : order && !['shipped', 'cancelled'].includes(order.status)
+            ? releaseAction
+            : undefined
   const confirmingPicks = primaryAction?.action === 'confirm_picks'
   const verifyingPack = primaryAction?.action === 'verify_pack'
   const confirmingShipment = primaryAction?.action === 'confirm_shipment'
@@ -537,6 +551,31 @@ function OrderDetailDrawer({
                 <Box><Typography variant="caption" color="text.secondary">Packages packed</Typography><Typography>{order.packedPackageCount} / {order.packageCount}</Typography></Box>
                 <Box><Typography variant="caption" color="text.secondary">Version</Typography><Typography>{order.rowVersion}</Typography></Box>
               </Box>
+              {canPlanImportedOrder && (
+                <Stack spacing={0.75} sx={{ mb: 1.5 }}>
+                  <Tooltip title={canExecute
+                    ? 'Accept reviewed cartonization evidence into the canonical warehouse plan'
+                    : 'You do not have permission to plan warehouse work'}>
+                    <span>
+                      <Button
+                        fullWidth
+                        variant="contained"
+                        startIcon={busy
+                          ? <CircularProgress size={16} />
+                          : <Inventory2Rounded />}
+                        disabled={!canExecute || busy}
+                        onClick={onPlan}
+                      >
+                        {busy ? 'Planning' : 'Plan order'}
+                      </Button>
+                    </span>
+                  </Tooltip>
+                  <Typography variant="caption" color="text.secondary">
+                    Planning accepts immutable cartonization evidence. It does not
+                    purchase postage, create a label, or confirm a shipment.
+                  </Typography>
+                </Stack>
+              )}
               {primaryAction?.blockedReason && <Alert severity="info" sx={{ mb: 1.5 }}>{primaryAction.blockedReason}</Alert>}
               {primaryAction && (
                 <Tooltip title={primaryAction.blockedReason || (confirmingPicks
@@ -783,7 +822,7 @@ function OrderDetailDrawer({
                   <Box key={rate.globalId} sx={{ py: 1.25, display: 'flex', alignItems: 'center', gap: 1.25 }}>
                     {rate.selected ? <CheckCircleRounded color="success" fontSize="small" /> : <Box sx={{ width: 20 }} />}
                     <Box sx={{ flex: 1, minWidth: 0 }}><Typography fontWeight={rate.selected ? 700 : 500}>{rate.carrier} · {rate.serviceName}</Typography><Typography variant="caption" color="text.secondary">Arrives {formatUserDateTime(rate.estimatedDeliveryAt, dateTime, { year: 'numeric', month: 'short', day: 'numeric', fallback: 'Unknown' })}</Typography></Box>
-                    <Box sx={{ textAlign: 'right' }}><Typography>{money(rate.customerChargeMinor, order.currency)}</Typography><Typography variant="caption" color="text.secondary">Cost {money(rate.internalCostMinor, order.currency)}</Typography></Box>
+                    <Box sx={{ textAlign: 'right' }}><Typography>{rate.customerChargeMinor === null ? 'Checkout charge unknown' : money(rate.customerChargeMinor, order.currency)}</Typography><Typography variant="caption" color="text.secondary">Cost {money(rate.internalCostMinor, order.currency)}</Typography></Box>
                   </Box>
                 ))}
               </Stack> : <Typography variant="body2" color="text.secondary">No carrier rates have been recorded.</Typography>}
@@ -1279,6 +1318,17 @@ export default function OperationsSection({
   )
   const [commerceActivePrepareKey, setCommerceActivePrepareKey] = useState('')
   const [commerceActiveActivateKey, setCommerceActiveActivateKey] = useState('')
+  const [planOpen, setPlanOpen] = useState(false)
+  const [
+    planCartonizationEvidenceGlobalId,
+    setPlanCartonizationEvidenceGlobalId,
+  ] = useState('')
+  const [planReason, setPlanReason] = useState(
+    'Accept the reviewed cartonization evidence as the canonical warehouse plan',
+  )
+  const [planIdempotencyKey, setPlanIdempotencyKey] = useState('')
+  const [planError, setPlanError] = useState('')
+  const [planningOrder, setPlanningOrder] = useState(false)
   const [releaseOpen, setReleaseOpen] = useState(false)
   const [releaseReason, setReleaseReason] = useState('Release the reviewed plan to warehouse execution')
   const [releaseIdempotencyKey, setReleaseIdempotencyKey] = useState('')
@@ -1381,6 +1431,135 @@ export default function OperationsSection({
     setView('orders')
     setSelectedGlobalId(orderGlobalId)
     setDrawerOpen(true)
+  }
+
+  const openPlan = () => {
+    setPlanCartonizationEvidenceGlobalId('')
+    setPlanReason(
+      'Accept the reviewed cartonization evidence as the canonical warehouse plan',
+    )
+    setPlanIdempotencyKey(
+      `operations-plan:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+    )
+    setPlanError('')
+    setPlanOpen(true)
+  }
+
+  const closePlan = () => {
+    if (planningOrder) return
+    setPlanOpen(false)
+    setPlanIdempotencyKey('')
+    setPlanError('')
+  }
+
+  const planOrder = async (event: FormEvent) => {
+    event.preventDefault()
+    const evidenceGlobalId = planCartonizationEvidenceGlobalId.trim().toLowerCase()
+    if (
+      !detail
+      || !CARTONIZATION_EVIDENCE_GLOBAL_ID.test(evidenceGlobalId)
+      || !planReason.trim()
+      || !planIdempotencyKey
+    ) return
+    setPlanningOrder(true)
+    setPlanError('')
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': planIdempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'plan-order',
+          orderGlobalId: detail.globalId,
+          cartonizationEvidenceGlobalId: evidenceGlobalId,
+          expectedRowVersion: detail.rowVersion,
+          reason: planReason.trim(),
+        }),
+      })
+      const payload = await response.json() as OperationsPayload
+      if (
+        !response.ok
+        || !payload.result
+        || !('orderGlobalId' in payload.result)
+        || !('rowVersion' in payload.result)
+        || payload.result.orderStatus !== 'planned'
+      ) {
+        throw new Error(payload.error || 'Order could not be planned')
+      }
+
+      const result = payload.result as OperationsOrderCommandResult & Record<string, unknown>
+      const textResult = (value: unknown) => (
+        typeof value === 'string' && value.trim() ? value.trim() : null
+      )
+      const integerResult = (value: unknown) => {
+        const parsed = Number(value)
+        return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null
+      }
+      const minorResult = (value: unknown) => {
+        if (
+          typeof value === 'number'
+          && Number.isSafeInteger(value)
+        ) return String(value)
+        if (
+          typeof value === 'string'
+          && /^-?\d+$/.test(value.trim())
+        ) return value.trim()
+        return null
+      }
+      const resultEvidenceGlobalId = (
+        textResult(result.cartonizationEvidenceGlobalId) || evidenceGlobalId
+      )
+      const fulfillmentPlanGlobalId = textResult(result.fulfillmentPlanGlobalId)
+      const packageCount = integerResult(result.packageCount)
+      const carrier = textResult(result.carrier)
+      const service = (
+        textResult(result.serviceName)
+        || textResult(result.serviceCode)
+      )
+      const currency = textResult(result.currency) || detail.currency
+      const selectedCostMinor = minorResult(result.carrierCostMinor)
+      const checkoutChargeMinor = minorResult(result.checkoutShippingChargeMinor)
+      const estimatedVarianceMinor = minorResult(result.checkoutVarianceMinor)
+      const evidence: string[] = []
+      if (fulfillmentPlanGlobalId) evidence.push(`plan ${fulfillmentPlanGlobalId}`)
+      if (packageCount !== null) {
+        evidence.push(`${packageCount} ${packageCount === 1 ? 'package' : 'packages'}`)
+      }
+      if (carrier || service) {
+        evidence.push([carrier, service].filter(Boolean).join(' '))
+      }
+      if (selectedCostMinor !== null) {
+        evidence.push(`carrier estimate ${money(selectedCostMinor, currency)}`)
+      }
+      if (checkoutChargeMinor !== null) {
+        evidence.push(`checkout charge ${money(checkoutChargeMinor, currency)}`)
+      }
+      if (estimatedVarianceMinor !== null) {
+        evidence.push(`estimated variance ${money(estimatedVarianceMinor, currency)}`)
+      }
+
+      setPlanOpen(false)
+      setPlanIdempotencyKey('')
+      setPlanError('')
+      setNotice(
+        `Order ${result.orderGlobalId} was planned from ${resultEvidenceGlobalId}`
+        + `${evidence.length ? ` · ${evidence.join(' · ')}` : ''}. `
+        + 'No label or shipment was created.',
+      )
+      await loadWorkspace(result.orderGlobalId)
+    } catch (caught) {
+      const message = caught instanceof Error
+        ? caught.message
+        : 'Order could not be planned'
+      setPlanError(message)
+      setError(message)
+    } finally {
+      setPlanningOrder(false)
+    }
   }
 
   const openRelease = () => {
@@ -2061,6 +2240,9 @@ export default function OperationsSection({
   ).reduce((total, entries) => total + entries.length, 0)
   const capabilities = workspace?.capabilities
   const detail = workspace?.selectedOrder?.globalId === selectedGlobalId ? workspace.selectedOrder : null
+  const planEvidenceValid = CARTONIZATION_EVIDENCE_GLOBAL_ID.test(
+    planCartonizationEvidenceGlobalId.trim().toLowerCase(),
+  )
   const detailSelectedRate = detail?.rates.find((rate) => rate.selected) || null
   const detailSelectedProvider = detailSelectedRate
     ? providerForCarrier(detailSelectedRate.carrier)
@@ -2468,7 +2650,8 @@ export default function OperationsSection({
         canExecute={Boolean(capabilities?.canManage && capabilities.canExecute)}
         open={drawerOpen}
         busy={
-          releasingOrder
+          planningOrder
+          || releasingOrder
           || confirmingPicks
           || verifyingPack
           || confirmingShipment
@@ -2478,6 +2661,7 @@ export default function OperationsSection({
           || Boolean(printingPackingSlipArtifactId)
         }
         onClose={closeDrawer}
+        onPlan={openPlan}
         onRelease={openRelease}
         onConfirmPicks={openConfirmPicks}
         onVerifyPack={openVerifyPack}
@@ -2824,6 +3008,83 @@ export default function OperationsSection({
             </Button>
           )}
         </DialogActions>
+      </Dialog>
+
+      <Dialog open={planOpen} onClose={closePlan} fullWidth maxWidth="sm">
+        <Box component="form" onSubmit={planOrder}>
+          <DialogTitle>Plan imported order</DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <Alert severity="info">
+                Accept reviewed immutable cartonization evidence for{' '}
+                {detail?.orderNumber || 'this imported order'} into its canonical
+                warehouse plan. This command does not purchase postage, create a
+                label, print a packing slip, or confirm a shipment.
+              </Alert>
+              {planError && (
+                <Alert severity="error" onClose={() => setPlanError('')}>
+                  {planError}
+                </Alert>
+              )}
+              <TextField
+                required
+                autoFocus
+                label="Cartonization evidence Global ID"
+                value={planCartonizationEvidenceGlobalId}
+                onChange={(event) => {
+                  setPlanCartonizationEvidenceGlobalId(
+                    event.target.value.toLowerCase(),
+                  )
+                  setPlanError('')
+                }}
+                error={Boolean(
+                  planCartonizationEvidenceGlobalId.trim()
+                  && !planEvidenceValid
+                )}
+                inputProps={{
+                  maxLength: 11,
+                  pattern: 'gcte[0-9]{7}',
+                  autoCapitalize: 'none',
+                  autoCorrect: 'off',
+                  spellCheck: false,
+                }}
+                helperText={planEvidenceValid
+                  ? 'Valid immutable cartonization evidence reference'
+                  : 'Enter a Global ID in the form gcte0000001'}
+              />
+              <TextField
+                required
+                multiline
+                minRows={3}
+                label="Planning reason"
+                value={planReason}
+                onChange={(event) => {
+                  setPlanReason(event.target.value)
+                  setPlanError('')
+                }}
+                inputProps={{ maxLength: 500 }}
+                helperText={`${planReason.trim().length}/500 · Recorded in the audit history`}
+              />
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={closePlan} disabled={planningOrder}>Cancel</Button>
+            <Button
+              type="submit"
+              variant="contained"
+              disabled={
+                planningOrder
+                || !planEvidenceValid
+                || !planReason.trim()
+              }
+              startIcon={planningOrder
+                ? <CircularProgress size={16} />
+                : <Inventory2Rounded />}
+            >
+              {planningOrder ? 'Planning order' : 'Confirm plan'}
+            </Button>
+          </DialogActions>
+        </Box>
       </Dialog>
 
       <Dialog open={releaseOpen} onClose={closeRelease} fullWidth maxWidth="sm">

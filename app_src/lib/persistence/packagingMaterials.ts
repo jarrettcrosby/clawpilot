@@ -859,6 +859,41 @@ export async function savePackagingMaterialStockInPostgres(input: {
         409,
       )
     }
+    if (current) {
+      const claimResult = await client.query<{
+        active_claimed_quantity: string
+      }>(
+        `SELECT COALESCE(sum(quantity), 0)::text
+                  AS active_claimed_quantity
+         FROM operations_packaging_material_claims
+         WHERE organization_id = $1::uuid
+           AND packaging_material_id = $2::uuid
+           AND warehouse_id = $3::uuid
+           AND status = 'active'`,
+        [
+          input.organizationId,
+          material.rows[0].id,
+          input.stock.warehouseId,
+        ],
+      )
+      const activeClaimedQuantity = integer(
+        claimResult.rows[0]?.active_claimed_quantity || '0',
+      )
+      if (
+        activeClaimedQuantity > 0
+        && (
+          input.stock.isAvailable !== true
+          || input.stock.onHandQuantity === null
+          || input.stock.onHandQuantity < activeClaimedQuantity
+        )
+      ) {
+        throw new PackagingMaterialRequestError(
+          'PACKAGING_MATERIAL_STOCK_ACTIVE_CLAIMS_CONFLICT',
+          `Warehouse packaging stock must remain available with at least ${activeClaimedQuantity} unit${activeClaimedQuantity === 1 ? '' : 's'} while accepted fulfillment plans hold active claims`,
+          409,
+        )
+      }
+    }
 
     const saved = current
       ? await client.query<SavedRow>(

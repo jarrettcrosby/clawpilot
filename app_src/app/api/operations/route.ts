@@ -32,6 +32,7 @@ import {
   executeOperationsReplenishmentInPostgres,
   generateOperationsPackagePackingSlipInPostgres,
   OperationsRequestError,
+  planOperationsOrderFromPostgres,
   readOperationsWorkspaceFromPostgres,
   releaseOperationsOrderFromPostgres,
   runMockOperationsProofFromPostgres,
@@ -55,6 +56,7 @@ const MAX_REQUEST_BYTES = 64 * 1024
 const CUSTOMER_GLOBAL_ID = /^ga\d{7}$/
 const PRODUCT_GLOBAL_ID = /^gp\d{7}$/
 const ORDER_GLOBAL_ID = /^gor\d{7}$/
+const CARTONIZATION_EVIDENCE_GLOBAL_ID = /^gcte\d{7}$/
 const PACKAGE_GLOBAL_ID = /^gpa\d{7}$/
 const EXCEPTION_GLOBAL_ID = /^gex\d{7}$/
 const RATE_GLOBAL_ID = /^grt\d{7}$/
@@ -937,6 +939,50 @@ export async function POST(req: NextRequest) {
         proof: proofValue(body.proof),
       })
       return json({ ok: true, capabilities, result }, result.duplicate ? 200 : 201)
+    }
+    if (action === 'plan-order') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to plan warehouse work',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'orderGlobalId',
+          'cartonizationEvidenceGlobalId',
+          'expectedRowVersion',
+          'reason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await planOperationsOrderFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+        cartonizationEvidenceGlobalId: globalIdValue(
+          body.cartonizationEvidenceGlobalId,
+          'Cartonization evidence',
+          CARTONIZATION_EVIDENCE_GLOBAL_ID,
+        ),
+        expectedRowVersion: integerValue(
+          body.expectedRowVersion,
+          'Order version',
+          0,
+          2_147_483_647,
+        ),
+        reason: textValue(body.reason, 'Planning reason', 500),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
     }
     if (action === 'release-order') {
       if (!capabilities.canManage || !capabilities.canExecute) {
