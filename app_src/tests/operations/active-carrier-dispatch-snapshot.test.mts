@@ -139,10 +139,10 @@ function validInput(): ActiveCarrierDispatchSnapshotInput {
     },
     selectedRateEvidence: {
       id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
-      globalId: 'grq0000001',
+      globalId: 'gars0000001',
       rerateRun: {
         id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
-        globalId: 'gprr0000001',
+        globalId: 'gafr0000001',
       },
       rerateInputHash: fingerprintC,
       rerateResultHash: fingerprintD,
@@ -222,8 +222,8 @@ test('seals every production dispatch authority into one deeply immutable snapsh
   assert.equal(snapshot.carrierAccount.configurationRevision, 4)
   assert.equal(snapshot.credential.revision, 7)
   assert.equal(snapshot.billing.relationship, 'sender')
-  assert.equal(snapshot.selectedRateEvidence.globalId, 'grq0000001')
-  assert.equal(snapshot.selectedRateEvidence.rerateRun.globalId, 'gprr0000001')
+  assert.equal(snapshot.selectedRateEvidence.globalId, 'gars0000001')
+  assert.equal(snapshot.selectedRateEvidence.rerateRun.globalId, 'gafr0000001')
   assert.equal(snapshot.selectedRateEvidence.providerReference, 'ups-rate-000001')
   assert.equal(snapshot.service.code, '03')
   assert.equal(snapshot.selectedAmountMinor, 1_962)
@@ -357,7 +357,7 @@ test('canonical normalization is deterministic and every bound authority changes
       selectedRateEvidence: {
         ...baselineInput.selectedRateEvidence,
         id: 'abababab-abab-4aba-8aba-abababababab',
-        globalId: 'grq0000002',
+        globalId: 'gars0000002',
       },
     },
     {
@@ -366,7 +366,7 @@ test('canonical normalization is deterministic and every bound authority changes
         ...baselineInput.selectedRateEvidence,
         rerateRun: {
           id: 'bcbcbcbc-bcbc-4bcb-8bcb-bcbcbcbcbcbc',
-          globalId: 'gprr0000002',
+          globalId: 'gafr0000002',
         },
       },
     },

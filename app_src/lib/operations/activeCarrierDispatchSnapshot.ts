@@ -747,14 +747,14 @@ function selectedRateEvidence(
   const identity = entityReference(
     { id: source.id, globalId: source.globalId },
     'selectedRateEvidence',
-    /^grq[0-9]{7}$/u,
+    /^gars[0-9]{7}$/u,
   )
   return {
     ...identity,
     rerateRun: entityReference(
       source.rerateRun,
       'selectedRateEvidence.rerateRun',
-      /^gprr[0-9]{7}$/u,
+      /^gafr[0-9]{7}$/u,
     ),
     rerateInputHash: fingerprint(
       source.rerateInputHash,

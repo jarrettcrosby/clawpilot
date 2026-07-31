@@ -60,6 +60,9 @@ function loadPolicyModule() {
 const migration = read(
   'db/migrations/0178_operations_shopify_customer_rate_policies.sql',
 )
+const lifetimeMigration = read(
+  'db/migrations/0181_operations_shopify_shadow_policy_lifetime.sql',
+)
 const policyIntegration = read(
   'app_src/lib/integrations/shopifyCustomerRatePolicy.ts',
 )
@@ -99,10 +102,36 @@ assert.equal(
   'migration 0178 must not hard-delete customer policy evidence',
 )
 
+requireAll(lifetimeMigration, [
+  'ADD COLUMN IF NOT EXISTS shadow_lifetime_mode text',
+  "THEN 'timed'",
+  "ELSE 'none'",
+  'SET policy_hash = encode(',
+  "jsonb_agg(code.value ORDER BY code.value)",
+  "WHEN policy.shadow_lifetime_mode = 'none' THEN 'null'",
+  "shadow_lifetime_mode = 'until_turned_off'",
+  'shadow_duration_minutes IS NULL',
+  'shadow_expires_at IS NULL',
+  "shadow_lifetime_mode = 'timed'",
+  'shadow_duration_minutes BETWEEN 15 AND 240',
+  "shadow_lifetime_mode IS DISTINCT FROM 'none'",
+  'must remain provider-write-free',
+  'NULL duration and expiry never imply an indefinite policy',
+], 'migration 0181 explicit Shadow lifetime')
+
+assert.match(
+  lifetimeMigration,
+  /status = 'removed'[\s\S]*provider_state = 'not_written'[\s\S]*shadow_lifetime_mode = 'none'[\s\S]*shadow_duration_minutes IS NULL[\s\S]*shadow_expires_at IS NULL/,
+  'migration 0181 must preserve valid fail-closed 0178 Shadow tombstones',
+)
+
 requireAll(policyIntegration, [
   'normalizeShopifyCustomerGid',
   'normalizeShopifyCustomerRatePolicy',
   'normalizeShopifyShadowPolicyDurationMinutes',
+  'normalizeShopifyShadowPolicyLifetime',
+  "SHOPIFY_SHADOW_POLICY_DEFAULT_LIFETIME_MODE = 'timed'",
+  "'until_turned_off'",
   'SHOPIFY_SHADOW_POLICY_DEFAULT_DURATION_MINUTES = 60',
   'SHOPIFY_SHADOW_POLICY_MIN_DURATION_MINUTES = 15',
   'SHOPIFY_SHADOW_POLICY_MAX_DURATION_MINUTES = 240',
@@ -152,8 +181,11 @@ requireAll(persistence, [
   'providerWriteAvailable: false',
   'providerWritesPerformed: 0',
   'assertMutationActivation(context.activationState)',
-  'normalizeShopifyShadowPolicyDurationMinutes(input.shadowDurationMinutes)',
+  'normalizeShopifyShadowPolicyLifetime({',
+  'shadowLifetimeMode: input.shadowLifetimeMode',
+  'shadow_lifetime_mode',
   'expired_simulated_count',
+  'until_turned_off_simulated_count',
   'shadow_allowed_count',
   "mode <> 'hide_all'",
   'shadowAllowedCount',
@@ -226,6 +258,9 @@ requireAll(route, [
   'availableServices',
   'availableServicesTruncated',
   'shadowDurationMinutes',
+  'shadowLifetimeMode',
+  'supportedLifetimeModes',
+  'untilTurnedOffSimulatedCount',
   'shadowPolicyLimits',
   'expiredSimulatedCount',
   'earliestShadowExpiresAt',
@@ -343,6 +378,7 @@ const policy = loadPolicyModule()
 assert.equal(policy.SHOPIFY_SHADOW_POLICY_DEFAULT_DURATION_MINUTES, 60)
 assert.equal(policy.SHOPIFY_SHADOW_POLICY_MIN_DURATION_MINUTES, 15)
 assert.equal(policy.SHOPIFY_SHADOW_POLICY_MAX_DURATION_MINUTES, 240)
+assert.equal(policy.SHOPIFY_SHADOW_POLICY_DEFAULT_LIFETIME_MODE, 'timed')
 assert.equal(policy.normalizeShopifyShadowPolicyDurationMinutes(undefined), 60)
 assert.equal(policy.normalizeShopifyShadowPolicyDurationMinutes(''), 60)
 assert.equal(policy.normalizeShopifyShadowPolicyDurationMinutes(15), 15)
@@ -351,6 +387,35 @@ for (const invalidDuration of [14, 241, 60.5, 'invalid']) {
   assert.throws(
     () => policy.normalizeShopifyShadowPolicyDurationMinutes(invalidDuration),
     (error) => error.code === 'SHOPIFY_SHADOW_POLICY_DURATION_INVALID',
+  )
+}
+assert.deepEqual(
+  plain(policy.normalizeShopifyShadowPolicyLifetime({})),
+  { shadowLifetimeMode: 'timed', shadowDurationMinutes: 60 },
+)
+assert.deepEqual(
+  plain(policy.normalizeShopifyShadowPolicyLifetime({
+    shadowLifetimeMode: 'timed',
+    shadowDurationMinutes: 15,
+  })),
+  { shadowLifetimeMode: 'timed', shadowDurationMinutes: 15 },
+)
+assert.deepEqual(
+  plain(policy.normalizeShopifyShadowPolicyLifetime({
+    shadowLifetimeMode: 'until_turned_off',
+  })),
+  { shadowLifetimeMode: 'until_turned_off', shadowDurationMinutes: null },
+)
+for (const invalidLifetime of [
+  { shadowLifetimeMode: 'forever' },
+  {
+    shadowLifetimeMode: 'until_turned_off',
+    shadowDurationMinutes: 60,
+  },
+]) {
+  assert.throws(
+    () => policy.normalizeShopifyShadowPolicyLifetime(invalidLifetime),
+    (error) => error.code === 'SHOPIFY_SHADOW_POLICY_LIFETIME_INVALID',
   )
 }
 assert.equal(

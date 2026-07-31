@@ -316,6 +316,9 @@ export async function GET() {
           operations_canonical_fulfillment_planning_applied: boolean
           operations_fulfillment_executions_applied: boolean
           operations_shopify_customer_rate_policies_applied: boolean
+          operations_active_multi_package_execution_applied: boolean
+          operations_production_fulfillment_rerates_applied: boolean
+          operations_shopify_shadow_policy_lifetime_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -1026,6 +1029,24 @@ export async function GET() {
                 WHERE filename =
                   '0178_operations_shopify_customer_rate_policies.sql'
               ) AS operations_shopify_customer_rate_policies_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0179_operations_active_multi_package_execution.sql'
+              ) AS operations_active_multi_package_execution_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0180_operations_production_fulfillment_rerates.sql'
+              ) AS operations_production_fulfillment_rerates_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0181_operations_shopify_shadow_policy_lifetime.sql'
+              ) AS operations_shopify_shadow_policy_lifetime_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1177,6 +1198,9 @@ export async function GET() {
             && row?.operations_canonical_fulfillment_planning_applied
             && row?.operations_fulfillment_executions_applied
             && row?.operations_shopify_customer_rate_policies_applied
+            && row?.operations_active_multi_package_execution_applied
+            && row?.operations_production_fulfillment_rerates_applied
+            && row?.operations_shopify_shadow_policy_lifetime_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1320,6 +1344,9 @@ export async function GET() {
           || !row?.operations_canonical_fulfillment_planning_applied
           || !row?.operations_fulfillment_executions_applied
           || !row?.operations_shopify_customer_rate_policies_applied
+          || !row?.operations_active_multi_package_execution_applied
+          || !row?.operations_production_fulfillment_rerates_applied
+          || !row?.operations_shopify_shadow_policy_lifetime_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

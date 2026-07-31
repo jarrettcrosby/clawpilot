@@ -37,6 +37,7 @@ requireAll(panel, [
   'availableServices?: AvailableService[]',
   'availableServicesTruncated?: boolean',
   'shadowDurationMinutes',
+  'shadowLifetimeMode',
   'shadowPolicyLimits',
   'expiredSimulatedCount',
   'earliestShadowExpiresAt',
@@ -133,7 +134,7 @@ requireAll(panel, [
   'includes guest checkouts',
   'Checkout default unavailable.',
   'Provider enforcement unavailable',
-  'bounded local proof intent only',
+  'explicit local proof intent only',
   'Shopify does not guarantee that',
   'a CarrierService callback contains Customer GID',
   'without that identity fails closed',
@@ -146,8 +147,8 @@ requireAll(panel, [
 ], 'checkout audience semantics')
 
 requireAll(panel, [
-  'a saved policy creates a 15–240 minute local test',
-  'window and performs zero Shopify writes.',
+  'an administrator chooses either a 15–240 minute local',
+  'test window or Until turned off. Both perform zero Shopify writes.',
   'rate cache is customer-neutral.',
   'bounded, isolated allowlisted test-variant proof—not',
   'Delivery Customization is required before customer-specific',
@@ -157,16 +158,27 @@ requireAll(panel, [
 ], 'truthful provider-enforcement boundary')
 
 requireAll(panel, [
+  'Shadow lifetime',
+  'Timed proof window',
+  'Until turned off',
+  "shadowLifetimeMode === 'timed'",
+  "value=\"until_turned_off\"",
+  'shadowPolicyLimits.supportedLifetimeModes',
+  'shadowPolicyLimits.defaultLifetimeMode',
   'Shadow proof duration (minutes)',
   'shadowPolicyLimits.minimumDurationMinutes',
   'shadowPolicyLimits.maximumDurationMinutes',
   'shadowPolicyLimits.defaultDurationMinutes',
   '? { shadowDurationMinutes }',
   'Saving or renewing starts a new bounded window; expiration fails closed.',
+  'Until turned off has no automatic expiry.',
+  'an administrator must edit or remove this',
   'policy.shadowExpired',
   'Shadow expired · fails closed',
   'policy.shadowExpiresAt',
-], 'bounded Shadow proof controls')
+  "policy.shadowLifetimeMode === 'until_turned_off'",
+  'Shadow · Until turned off',
+], 'explicit Shadow lifetime controls')
 
 requireAll(panel, [
   'Search Shopify by customer name, email, or exact Customer GID.',

@@ -2,8 +2,8 @@
 
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { readdirSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
@@ -16,7 +16,7 @@ const requireFromApp = createRequire(
 const ts = requireFromApp('typescript')
 const { Pool } = requireFromApp('pg')
 const TARGET_MIGRATION =
-  '0178_operations_shopify_customer_rate_policies.sql'
+  '0181_operations_shopify_shadow_policy_lifetime.sql'
 
 function read(path) {
   return readFileSync(resolve(root, path), 'utf8')
@@ -55,6 +55,63 @@ async function waitForPostgres(connectionString) {
     await pool.end().catch(() => undefined)
   }
   throw new Error('Disposable PostgreSQL did not become ready')
+}
+
+async function applyMigrationsThrough(databaseUrl, targetMigration) {
+  const pool = new Pool({
+    connectionString: databaseUrl,
+    connectionTimeoutMillis: 5_000,
+    query_timeout: 30_000,
+  })
+  const migrationsDirectory = resolve(root, 'db/migrations')
+  const migrations = readdirSync(migrationsDirectory)
+    .filter((name) => /^\d+_.+\.sql$/u.test(name))
+    .sort((left, right) => left.localeCompare(right))
+    .filter((name) => name.localeCompare(targetMigration) <= 0)
+  assert.ok(
+    migrations.includes(targetMigration),
+    `Missing target migration ${targetMigration}`,
+  )
+  const client = await pool.connect()
+  try {
+    await client.query(`SELECT pg_advisory_lock(hashtext('clawpilot-schema-migrations'))`)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        filename text PRIMARY KEY,
+        checksum text,
+        applied_at timestamptz NOT NULL DEFAULT now()
+      )
+    `)
+    for (const filename of migrations) {
+      const sql = read(`db/migrations/${filename}`)
+      const checksum = createHash('sha256').update(sql).digest('hex')
+      await client.query('BEGIN')
+      try {
+        await client.query(sql)
+        await client.query(
+          `INSERT INTO schema_migrations (filename, checksum)
+           VALUES ($1, $2)`,
+          [filename, checksum],
+        )
+        await client.query('COMMIT')
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      }
+    }
+  } finally {
+    await client.query(
+      `SELECT pg_advisory_unlock(hashtext('clawpilot-schema-migrations'))`,
+    ).catch(() => undefined)
+    client.release()
+    await pool.end()
+  }
+}
+
+function customerPolicyHash(input) {
+  return createHash('sha256')
+    .update(JSON.stringify(input), 'utf8')
+    .digest('hex')
 }
 
 function loadTypeScriptModule(path, { mocks = {} } = {}) {
@@ -198,6 +255,128 @@ async function seedTenant(pool, label) {
   }
 }
 
+async function seedLegacyUpgradeFixtures(databaseUrl) {
+  const pool = new Pool({
+    connectionString: databaseUrl,
+    connectionTimeoutMillis: 5_000,
+    query_timeout: 20_000,
+  })
+  try {
+    const tenant = await seedTenant(pool, 'legacy-upgrade')
+    const tombstoneGid = 'gid://shopify/Customer/9901'
+    const timedGid = 'gid://shopify/Customer/9902'
+    const legacyTimedHash = customerPolicyHash({
+      version: 1,
+      mode: 'show_all',
+      serviceCodes: [],
+      shadowDurationMinutes: 60,
+    })
+    await pool.query(
+      `INSERT INTO operations_shopify_customer_rate_policies (
+         organization_id, integration_account_id, shopify_customer_gid,
+         mode, service_codes, policy_hash, status, provider_state,
+         shadow_duration_minutes, shadow_expires_at, removed_at,
+         created_by, updated_by
+       ) VALUES
+       (
+         $1::uuid, $2::uuid, $3,
+         'show_all', '[]'::jsonb, repeat('c', 64),
+         'removed', 'not_written', NULL, NULL, now(), $5, $5
+       ),
+       (
+         $1::uuid, $2::uuid, $4,
+         'show_all', '[]'::jsonb, $6,
+         'simulated', 'not_written', 60,
+         now() + interval '60 minutes', NULL, $5, $5
+       )`,
+      [
+        tenant.organizationId,
+        tenant.integrationAccountId,
+        tombstoneGid,
+        timedGid,
+        tenant.email,
+        legacyTimedHash,
+      ],
+    )
+    return {
+      tenant,
+      tombstoneGid,
+      timedGid,
+      expectedTombstoneHash: customerPolicyHash({
+        version: 1,
+        mode: 'show_all',
+        serviceCodes: [],
+        shadowLifetimeMode: null,
+        shadowDurationMinutes: null,
+      }),
+      expectedTimedHash: customerPolicyHash({
+        version: 1,
+        mode: 'show_all',
+        serviceCodes: [],
+        shadowLifetimeMode: 'timed',
+        shadowDurationMinutes: 60,
+      }),
+    }
+  } finally {
+    await pool.end()
+  }
+}
+
+async function verifyLegacyUpgradeFixtures(databaseUrl, fixtures) {
+  const pool = new Pool({
+    connectionString: databaseUrl,
+    connectionTimeoutMillis: 5_000,
+    query_timeout: 20_000,
+  })
+  try {
+    const result = await pool.query(
+      `SELECT shopify_customer_gid, status, provider_state,
+              shadow_lifetime_mode, shadow_duration_minutes,
+              shadow_expires_at, policy_hash
+       FROM operations_shopify_customer_rate_policies
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND shopify_customer_gid = ANY($3::text[])
+       ORDER BY shopify_customer_gid`,
+      [
+        fixtures.tenant.organizationId,
+        fixtures.tenant.integrationAccountId,
+        [fixtures.tombstoneGid, fixtures.timedGid],
+      ],
+    )
+    assert.equal(result.rows.length, 2)
+    const [tombstone, timed] = result.rows
+    assert.deepEqual(
+      {
+        customerGid: tombstone.shopify_customer_gid,
+        status: tombstone.status,
+        providerState: tombstone.provider_state,
+        lifetimeMode: tombstone.shadow_lifetime_mode,
+        duration: tombstone.shadow_duration_minutes,
+        expiresAt: tombstone.shadow_expires_at,
+        policyHash: tombstone.policy_hash,
+      },
+      {
+        customerGid: fixtures.tombstoneGid,
+        status: 'removed',
+        providerState: 'not_written',
+        lifetimeMode: 'none',
+        duration: null,
+        expiresAt: null,
+        policyHash: fixtures.expectedTombstoneHash,
+      },
+      '0181 must preserve a valid fail-closed 0178 Shadow tombstone',
+    )
+    assert.equal(timed.shopify_customer_gid, fixtures.timedGid)
+    assert.equal(timed.shadow_lifetime_mode, 'timed')
+    assert.equal(Number(timed.shadow_duration_minutes), 60)
+    assert.ok(timed.shadow_expires_at instanceof Date)
+    assert.equal(timed.policy_hash, fixtures.expectedTimedHash)
+  } finally {
+    await pool.end()
+  }
+}
+
 async function verifyMigrationPresence(pool) {
   const result = await pool.query(
     `SELECT
@@ -235,12 +414,12 @@ async function rawShadowInsert(pool, tenant, input) {
     `INSERT INTO operations_shopify_customer_rate_policies (
        organization_id, integration_account_id, shopify_customer_gid,
        mode, service_codes, policy_hash, status, provider_state,
-       shadow_duration_minutes, shadow_expires_at,
+       shadow_lifetime_mode, shadow_duration_minutes, shadow_expires_at,
        created_by, updated_by
      ) VALUES (
        $1::uuid, $2::uuid, $3,
        'show_all', '[]'::jsonb, repeat('a', 64),
-       'simulated', 'not_written', $4::smallint,
+       'simulated', 'not_written', 'timed', $4::smallint,
        now() + ($4::integer * interval '1 minute'), $5, $5
      ) RETURNING id::text`,
     [
@@ -303,6 +482,11 @@ async function verifyPostgresAcceptance(databaseUrl) {
       { gid: 'gid://shopify/Customer/101', duration: 15 },
       { gid: 'gid://shopify/Customer/102', duration: undefined },
       { gid: 'gid://shopify/Customer/103', duration: 240 },
+      {
+        gid: 'gid://shopify/Customer/104',
+        duration: undefined,
+        lifetime: 'until_turned_off',
+      },
     ]
     const created = []
     for (const fixture of durationFixtures) {
@@ -312,14 +496,20 @@ async function verifyPostgresAcceptance(databaseUrl) {
         customerGid: fixture.gid,
         mode: 'show_all',
         serviceCodes: [],
+        shadowLifetimeMode: fixture.lifetime,
         shadowDurationMinutes: fixture.duration,
         actorEmail: primary.email,
       }))
     }
     assert.deepEqual(
       created.map((entry) => entry.policy.shadowDurationMinutes),
-      [15, 60, 240],
-      'Shadow duration must preserve the 15/60/240 minute contract',
+      [15, 60, 240, null],
+      'Timed Shadow duration and explicit indefinite lifetime must remain distinct',
+    )
+    assert.deepEqual(
+      created.map((entry) => entry.policy.shadowLifetimeMode),
+      ['timed', 'timed', 'timed', 'until_turned_off'],
+      'Shadow lifetime mode must round-trip without inferring forever from NULL',
     )
     const intervals = await pool.query(
       `SELECT
@@ -328,8 +518,35 @@ async function verifyPostgresAcceptance(databaseUrl) {
        FROM operations_shopify_customer_rate_policies
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
+         AND shadow_lifetime_mode = 'timed'
        ORDER BY shopify_customer_gid`,
       [primary.organizationId, primary.integrationAccountId],
+    )
+    const indefinite =
+      await policies.readActiveShopifyCustomerRatePolicyFromPostgres({
+        organizationId: primary.organizationId,
+        accountGlobalId: primary.accountGlobalId,
+        shopifyCustomerGid: durationFixtures[3].gid,
+      })
+    assert.equal(indefinite?.shadowLifetimeMode, 'until_turned_off')
+    assert.equal(indefinite?.shadowDurationMinutes, null)
+    assert.equal(indefinite?.shadowExpiresAt, null)
+
+    await expectRejected(
+      () => pool.query(
+        `INSERT INTO operations_shopify_customer_rate_policies (
+           organization_id, integration_account_id, shopify_customer_gid,
+           mode, service_codes, policy_hash, status, provider_state,
+           created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2::uuid, 'gid://shopify/Customer/105',
+           'show_all', '[]'::jsonb, repeat('b', 64),
+           'simulated', 'not_written', $3, $3
+         )`,
+        [primary.organizationId, primary.integrationAccountId, primary.email],
+      ),
+      (error) => error.code === '23514',
+      'NULL duration and expiry without explicit indefinite mode must fail closed',
     )
     assert.deepEqual(
       intervals.rows,
@@ -446,6 +663,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
         accountGlobalId: primary.accountGlobalId,
       })
     assert.equal(summary.expiredSimulatedCount, 1)
+    assert.equal(summary.untilTurnedOffSimulatedCount, 1)
 
     const guardedGid = durationFixtures[2].gid
     await expectRejected(
@@ -455,6 +673,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
              provider_state = 'applied',
              provider_metafield_gid = 'gid://shopify/Metafield/1',
              provider_metafield_updated_at = now(),
+             shadow_lifetime_mode = 'none',
              shadow_duration_minutes = NULL,
              shadow_expires_at = NULL,
              updated_at = now()
@@ -479,6 +698,28 @@ async function verifyPostgresAcceptance(databaseUrl) {
       status: 'simulated',
       provider_state: 'not_written',
     })
+
+    await pool.query(
+      `UPDATE operations_activation_scopes
+       SET state = 'active', updated_at = now(), updated_by = $2
+       WHERE organization_id = $1::uuid`,
+      [primary.organizationId, primary.email],
+    )
+    const activeBlocked =
+      await policies.upsertShopifyCustomerRatePolicyInPostgres({
+        organizationId: primary.organizationId,
+        accountGlobalId: primary.accountGlobalId,
+        customerGid: 'gid://shopify/Customer/106',
+        mode: 'show_all',
+        serviceCodes: [],
+        actorEmail: primary.email,
+      })
+    assert.equal(activeBlocked.policy.status, 'blocked')
+    assert.equal(activeBlocked.policy.providerState, 'write_blocked')
+    assert.equal(activeBlocked.policy.shadowLifetimeMode, null)
+    assert.equal(activeBlocked.policy.shadowDurationMinutes, null)
+    assert.equal(activeBlocked.policy.shadowExpiresAt, null)
+    assert.equal(activeBlocked.enforcement.providerWritesPerformed, 0)
   } finally {
     await pool.end()
   }
@@ -503,10 +744,16 @@ async function main() {
       `postgresql://postgres:clawpilot_shopify_policy@127.0.0.1:${port}`
       + '/clawpilot_shopify_policy'
     await waitForPostgres(databaseUrl)
+    await applyMigrationsThrough(
+      databaseUrl,
+      '0178_operations_shopify_customer_rate_policies.sql',
+    )
+    const legacyUpgradeFixtures = await seedLegacyUpgradeFixtures(databaseUrl)
     command('node', ['scripts/db-migrate.mjs'], {
       env: { DATABASE_URL: databaseUrl, PGSSLMODE: 'disable' },
       timeout: 180_000,
     })
+    await verifyLegacyUpgradeFixtures(databaseUrl, legacyUpgradeFixtures)
     await verifyPostgresAcceptance(databaseUrl)
     console.log(
       'Shopify customer rate-policy disposable PostgreSQL acceptance passed',

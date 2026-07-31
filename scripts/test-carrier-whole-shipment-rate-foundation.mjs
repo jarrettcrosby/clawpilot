@@ -109,18 +109,22 @@ assert.deepEqual(
   [
     'CARRIER_WHOLE_SHIPMENT_RATE_ENDPOINTS',
     'MAX_CARRIER_WHOLE_SHIPMENT_RATE_PACKAGES',
+    'carrierWholeShipmentRateAddressFingerprints',
     'carrierWholeShipmentRateEndpoint',
     'parseCarrierWholeShipmentRateResponse',
     'prepareCarrierWholeShipmentRateRequest',
+    'sealPreparedCarrierWholeShipmentRateRequest',
   ],
   'The runtime API must expose only pure rate preparation and parsing',
 )
 
 const {
   MAX_CARRIER_WHOLE_SHIPMENT_RATE_PACKAGES,
+  carrierWholeShipmentRateAddressFingerprints,
   carrierWholeShipmentRateEndpoint,
   parseCarrierWholeShipmentRateResponse,
   prepareCarrierWholeShipmentRateRequest,
+  sealPreparedCarrierWholeShipmentRateRequest,
 } = foundation
 
 assert.equal(MAX_CARRIER_WHOLE_SHIPMENT_RATE_PACKAGES, 50)
@@ -213,11 +217,37 @@ const base = {
 
 const upsProduction = prepareCarrierWholeShipmentRateRequest(base)
 const upsProductionAgain = prepareCarrierWholeShipmentRateRequest(clone(base))
+const upsSeal = sealPreparedCarrierWholeShipmentRateRequest(upsProduction)
+const expectedBinding = {
+  origin: base.origin,
+  destination: base.destination,
+  matchesAccountNumber: (candidate) => candidate === accountNumber,
+}
+const boundUpsSeal = sealPreparedCarrierWholeShipmentRateRequest(
+  upsProduction,
+  expectedBinding,
+)
 assert.equal(upsProduction.accessMode, 'rate_read_only')
 assert.equal(upsProduction.providerMutationCount, 0)
 assert.equal(upsProduction.environment, 'production')
 assert.equal(upsProduction.endpointVersion, 'ups-rating-v2409')
 assert.equal(upsProduction.requestHash, upsProductionAgain.requestHash)
+assert.equal(upsSeal.requestHash, upsProduction.requestHash)
+assert.equal(boundUpsSeal.requestHash, upsProduction.requestHash)
+assert.equal(upsSeal.redactedRequest.packageCount, 2)
+assert.equal(upsSeal.body, undefined)
+assertDeepFrozen(upsSeal, 'sealed UPS request evidence')
+assert.deepEqual(
+  plain(carrierWholeShipmentRateAddressFingerprints({
+    origin: base.origin,
+    destination: base.destination,
+  })),
+  {
+    originFingerprint: upsSeal.redactedRequest.shipment.originFingerprint,
+    destinationFingerprint:
+      upsSeal.redactedRequest.shipment.destinationFingerprint,
+  },
+)
 assert.deepEqual(plain(upsProduction.headers), plain(upsProductionAgain.headers))
 assert.match(upsProduction.requestHash, /^[a-f0-9]{64}$/)
 assert.match(upsProduction.headers.transId, /^[a-f0-9-]{36}$/)
@@ -310,6 +340,11 @@ const fedexInput = clone(base)
 fedexInput.binding.provider = 'fedex_rest'
 fedexInput.fedexPickupType = 'USE_SCHEDULED_PICKUP'
 const fedexProduction = prepareCarrierWholeShipmentRateRequest(fedexInput)
+const boundFedexSeal = sealPreparedCarrierWholeShipmentRateRequest(
+  fedexProduction,
+  expectedBinding,
+)
+assert.equal(boundFedexSeal.requestHash, fedexProduction.requestHash)
 assert.equal(fedexProduction.environment, 'production')
 assert.equal(fedexProduction.endpointVersion, 'fedex-rate-v1')
 assert.equal(fedexProduction.headers['x-locale'], 'en_US')
@@ -533,6 +568,55 @@ assert.throws(
 
 const tamperedBody = clone(upsProduction)
 tamperedBody.body.RateRequest.Shipment.Shipper.ShipperNumber = 'ALTERED-ACCOUNT'
+assert.throws(
+  () => sealPreparedCarrierWholeShipmentRateRequest(tamperedBody),
+  /integrity check failed/,
+)
+
+const tamperedHeaders = clone(upsProduction)
+tamperedHeaders.headers.authorization = 'Bearer must-not-persist'
+assert.throws(
+  () => sealPreparedCarrierWholeShipmentRateRequest(tamperedHeaders),
+  /integrity check failed/,
+)
+
+const wrongExpectedOrigin = clone(base)
+wrongExpectedOrigin.origin.line1 = '7001 Different Origin Street'
+const wrongOriginRequest = prepareCarrierWholeShipmentRateRequest(
+  wrongExpectedOrigin,
+)
+assert.throws(
+  () => sealPreparedCarrierWholeShipmentRateRequest(
+    wrongOriginRequest,
+    expectedBinding,
+  ),
+  /integrity check failed/,
+)
+
+const falselyClaimedAccount = clone(base)
+falselyClaimedAccount.binding.accountNumber = 'UNBOUND-ACCOUNT-77'
+falselyClaimedAccount.billing.payerAccountNumber = 'UNBOUND-ACCOUNT-77'
+const falselyClaimedAccountRequest = prepareCarrierWholeShipmentRateRequest(
+  falselyClaimedAccount,
+)
+assert.throws(
+  () => sealPreparedCarrierWholeShipmentRateRequest(
+    falselyClaimedAccountRequest,
+    expectedBinding,
+  ),
+  /integrity check failed/,
+)
+
+const falselyClaimedFedexAccount = clone(falselyClaimedAccount)
+falselyClaimedFedexAccount.binding.provider = 'fedex_rest'
+falselyClaimedFedexAccount.fedexPickupType = 'USE_SCHEDULED_PICKUP'
+assert.throws(
+  () => sealPreparedCarrierWholeShipmentRateRequest(
+    prepareCarrierWholeShipmentRateRequest(falselyClaimedFedexAccount),
+    expectedBinding,
+  ),
+  /integrity check failed/,
+)
 assert.throws(
   () => parseCarrierWholeShipmentRateResponse(tamperedBody, {
     payload: recorded('ups-whole-shipment-recorded.json'),

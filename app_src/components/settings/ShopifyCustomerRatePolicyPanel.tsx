@@ -40,6 +40,8 @@ type CustomerRatePolicyMode =
   | 'include_only'
   | 'exclude'
 
+type ShadowLifetimeMode = 'timed' | 'until_turned_off'
+
 type CustomerRatePolicy = {
   globalId: string
   customerGid: string
@@ -48,6 +50,7 @@ type CustomerRatePolicy = {
   status: string
   providerState: string
   lastErrorCode: string | null
+  shadowLifetimeMode: ShadowLifetimeMode | null
   shadowDurationMinutes: number | null
   shadowExpiresAt: string | null
   shadowExpired: boolean
@@ -105,9 +108,12 @@ type CustomerRatePolicyPayload = {
   enforcement?: CustomerRatePolicyEnforcement
   summary?: {
     expiredSimulatedCount: number
+    untilTurnedOffSimulatedCount: number
     earliestShadowExpiresAt: string | null
   }
   shadowPolicyLimits?: {
+    defaultLifetimeMode: ShadowLifetimeMode
+    supportedLifetimeModes: ShadowLifetimeMode[]
     defaultDurationMinutes: number
     minimumDurationMinutes: number
     maximumDurationMinutes: number
@@ -249,10 +255,17 @@ export default function ShopifyCustomerRatePolicyPanel({
     activationState === 'active' ? 'hide_all' : 'show_all',
   )
   const [serviceCodeInput, setServiceCodeInput] = useState('')
+  const [shadowLifetimeMode, setShadowLifetimeMode] =
+    useState<ShadowLifetimeMode>('timed')
   const [shadowDurationInput, setShadowDurationInput] = useState(
     String(DEFAULT_SHADOW_DURATION_MINUTES),
   )
   const [shadowPolicyLimits, setShadowPolicyLimits] = useState({
+    defaultLifetimeMode: 'timed' as ShadowLifetimeMode,
+    supportedLifetimeModes: [
+      'timed',
+      'until_turned_off',
+    ] as ShadowLifetimeMode[],
     defaultDurationMinutes: DEFAULT_SHADOW_DURATION_MINUTES,
     minimumDurationMinutes: MIN_SHADOW_DURATION_MINUTES,
     maximumDurationMinutes: MAX_SHADOW_DURATION_MINUTES,
@@ -281,7 +294,8 @@ export default function ShopifyCustomerRatePolicyPanel({
   const customerGidError = exactCustomerGid.length > 0
     && !CUSTOMER_GID.test(exactCustomerGid)
   const shadowDurationMinutes = Number(shadowDurationInput)
-  const shadowDurationError = effectiveActivation === 'shadow' && (
+  const shadowDurationError = effectiveActivation === 'shadow'
+    && shadowLifetimeMode === 'timed' && (
     !Number.isSafeInteger(shadowDurationMinutes)
     || shadowDurationMinutes < shadowPolicyLimits.minimumDurationMinutes
     || shadowDurationMinutes > shadowPolicyLimits.maximumDurationMinutes
@@ -299,11 +313,16 @@ export default function ShopifyCustomerRatePolicyPanel({
     setSelectedCustomer(null)
     setMode(recommendedMode(nextDefault))
     setServiceCodeInput('')
+    setShadowLifetimeMode(shadowPolicyLimits.defaultLifetimeMode)
     setShadowDurationInput(String(
       shadowPolicyLimits.defaultDurationMinutes,
     ))
     setEditingPolicy(null)
-  }, [defaultPolicy, shadowPolicyLimits.defaultDurationMinutes])
+  }, [
+    defaultPolicy,
+    shadowPolicyLimits.defaultDurationMinutes,
+    shadowPolicyLimits.defaultLifetimeMode,
+  ])
 
   const loadPolicies = useCallback(async (targetPage: number) => {
     policyListRequest.current?.abort()
@@ -336,14 +355,7 @@ export default function ShopifyCustomerRatePolicyPanel({
       if (payload.enforcement) setEnforcement(payload.enforcement)
       const limits = payload.shadowPolicyLimits
       if (limits) {
-        setShadowPolicyLimits((current) => (
-          current.defaultDurationMinutes
-              === limits.defaultDurationMinutes
-            && current.minimumDurationMinutes
-              === limits.minimumDurationMinutes
-            && current.maximumDurationMinutes
-              === limits.maximumDurationMinutes
-        ) ? current : limits)
+        setShadowPolicyLimits(limits)
       }
       setAvailableServices(payload.availableServices || [])
       setAvailableServicesTruncated(
@@ -490,9 +502,13 @@ export default function ShopifyCustomerRatePolicyPanel({
     setEditingPolicy(existing)
     setMode(existing?.mode || recommendedMode(defaultPolicy))
     setServiceCodeInput(existing?.serviceCodes.join('\n') || '')
+    setShadowLifetimeMode(
+      existing?.shadowLifetimeMode
+        || shadowPolicyLimits.defaultLifetimeMode,
+    )
     setShadowDurationInput(String(
       existing?.shadowDurationMinutes
-        || shadowPolicyLimits.defaultDurationMinutes,
+        ?? shadowPolicyLimits.defaultDurationMinutes,
     ))
     setNotice('')
   }
@@ -591,7 +607,12 @@ export default function ShopifyCustomerRatePolicyPanel({
           mode,
           serviceCodes: filteredMode ? parsedServiceCodes.values : [],
           ...(effectiveActivation === 'shadow'
-            ? { shadowDurationMinutes }
+            ? {
+                shadowLifetimeMode,
+                ...(shadowLifetimeMode === 'timed'
+                  ? { shadowDurationMinutes }
+                  : {}),
+              }
             : {}),
           ...(editingPolicy
             ? { expectedRowVersion: editingPolicy.rowVersion }
@@ -610,11 +631,13 @@ export default function ShopifyCustomerRatePolicyPanel({
       setNotice(
         payload.enforcement?.state === 'active_blocked'
           ? 'The customer policy was saved in ClawPilot. Shopify provider enforcement remains blocked and no live checkout option was changed.'
-          : `The customer policy was saved as a bounded Shadow simulation with zero Shopify writes. It expires ${
-            payload.policy.shadowExpiresAt
-              ? new Date(payload.policy.shadowExpiresAt).toLocaleString()
-              : 'at the configured fail-closed boundary'
-          }.`,
+          : payload.policy.shadowLifetimeMode === 'until_turned_off'
+            ? 'The customer policy was saved as a Shadow simulation with zero Shopify writes. It remains active until an administrator turns it off.'
+            : `The customer policy was saved as a timed Shadow simulation with zero Shopify writes. It expires ${
+              payload.policy.shadowExpiresAt
+                ? new Date(payload.policy.shadowExpiresAt).toLocaleString()
+                : 'at the configured fail-closed boundary'
+            }.`,
       )
       resetEditor(payload.enforcement?.defaultPolicy || defaultPolicy)
       await loadPolicies(pagination.page)
@@ -715,7 +738,7 @@ export default function ShopifyCustomerRatePolicyPanel({
               <strong>Shadow default · hide ClawPilot rates.</strong>{' '}
               Guests and authenticated customers without an explicit policy
               receive this default. A selected, signed-in Shopify customer is
-              bounded local proof intent only: Shopify does not guarantee that
+              explicit local proof intent only: Shopify does not guarantee that
               a CarrierService callback contains Customer GID, so a callback
               without that identity fails closed with no ClawPilot rates.
             </>
@@ -746,8 +769,9 @@ export default function ShopifyCustomerRatePolicyPanel({
                 : 'Provider enforcement simulated only'}
             </Typography>
             <Typography variant="body2">
-              In Shadow, a saved policy creates a 15–240 minute local test
-              window and performs zero Shopify writes. Shopify can omit
+              In Shadow, an administrator chooses either a 15–240 minute local
+              test window or Until turned off. Both perform zero Shopify writes.
+              Shopify can omit
               Customer GID from CarrierService callbacks, and its successful
               rate cache is customer-neutral. Saved-address warming is only a
               bounded, isolated allowlisted test-variant proof—not
@@ -956,6 +980,40 @@ export default function ShopifyCustomerRatePolicyPanel({
               enforcement until Delivery Customization is provider-verified.
             </Alert>
             {effectiveActivation === 'shadow' ? (
+              <FormControl size="small" fullWidth>
+                <InputLabel
+                  id={`shopify-customer-policy-lifetime-${accountGlobalId}`}
+                >
+                  Shadow lifetime
+                </InputLabel>
+                <Select
+                  labelId={`shopify-customer-policy-lifetime-${accountGlobalId}`}
+                  label="Shadow lifetime"
+                  value={shadowLifetimeMode}
+                  disabled={!canChangePolicies || Boolean(busy)}
+                  onChange={(event) => {
+                    setShadowLifetimeMode(
+                      event.target.value as ShadowLifetimeMode,
+                    )
+                  }}
+                >
+                  {shadowPolicyLimits.supportedLifetimeModes.includes('timed')
+                    ? (
+                      <MenuItem value="timed">Timed proof window</MenuItem>
+                    )
+                    : null}
+                  {shadowPolicyLimits.supportedLifetimeModes.includes(
+                    'until_turned_off',
+                  ) ? (
+                    <MenuItem value="until_turned_off">
+                      Until turned off
+                    </MenuItem>
+                  ) : null}
+                </Select>
+              </FormControl>
+            ) : null}
+            {effectiveActivation === 'shadow'
+              && shadowLifetimeMode === 'timed' ? (
               <TextField
                 size="small"
                 fullWidth
@@ -981,6 +1039,13 @@ export default function ShopifyCustomerRatePolicyPanel({
                   setShadowDurationInput(event.target.value)
                 }}
               />
+            ) : effectiveActivation === 'shadow' ? (
+              <Alert severity="warning">
+                Until turned off has no automatic expiry. The exact Customer
+                GID and test-variant gates still apply, every Shopify write
+                remains blocked, and an administrator must edit or remove this
+                policy to turn it off.
+              </Alert>
             ) : null}
             <FormControl size="small" fullWidth>
               <InputLabel id={`shopify-customer-policy-mode-${accountGlobalId}`}>
@@ -1234,6 +1299,13 @@ export default function ShopifyCustomerRatePolicyPanel({
                           label={`Shadow expires ${
                             new Date(policy.shadowExpiresAt).toLocaleString()
                           }`}
+                        />
+                      ) : policy.shadowLifetimeMode === 'until_turned_off' ? (
+                        <Chip
+                          size="small"
+                          color="info"
+                          variant="outlined"
+                          label="Shadow · Until turned off"
                         />
                       ) : null}
                       {policy.lastErrorCode ? (

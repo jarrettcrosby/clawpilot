@@ -154,6 +154,35 @@ export type PreparedCarrierWholeShipmentRateRequest = {
   redactedRequest: CarrierWholeShipmentRateRequestEvidence
 }
 
+/**
+ * Persistence-safe proof that a prepared request passed the foundation's
+ * complete, auth-free request-integrity check. The provider body can contain
+ * account numbers, so callers must persist this seal rather than the prepared
+ * request itself.
+ */
+export type SealedCarrierWholeShipmentRateRequest = {
+  adapterVersion: 'carrier-whole-shipment-rate-v1'
+  accessMode: 'rate_read_only'
+  providerMutationCount: 0
+  provider: CarrierWholeShipmentRateProvider
+  environment: CarrierWholeShipmentRateEnvironment
+  endpoint: string
+  endpointVersion: string
+  requestHash: string
+  redactedRequest: CarrierWholeShipmentRateRequestEvidence
+}
+
+export type CarrierWholeShipmentRateAddressFingerprints = {
+  originFingerprint: string
+  destinationFingerprint: string
+}
+
+export type CarrierWholeShipmentRateExpectedRequestBinding = {
+  origin: CarrierWholeShipmentRateParty
+  destination: CarrierWholeShipmentRateDestination
+  matchesAccountNumber: (accountNumber: string) => boolean
+}
+
 export type CarrierWholeShipmentRateResponseInput = {
   payload: unknown
   requestedAt: string
@@ -445,6 +474,21 @@ function normalizeDestination(
       'Destination residential classification',
     ),
   }
+}
+
+export function carrierWholeShipmentRateAddressFingerprints(input: {
+  origin: CarrierWholeShipmentRateParty
+  destination: CarrierWholeShipmentRateDestination
+}): CarrierWholeShipmentRateAddressFingerprints {
+  const origin = normalizeParty(input.origin)
+  const destination = normalizeDestination(input.destination)
+  return deepFreeze({
+    originFingerprint: hash({ version: 'carrier-rate-origin-v1', origin }),
+    destinationFingerprint: hash({
+      version: 'carrier-rate-destination-v1',
+      destination,
+    }),
+  })
 }
 
 function normalizeParcel(value: unknown): CarrierWholeShipmentRateParcel {
@@ -855,6 +899,10 @@ export function prepareCarrierWholeShipmentRateRequest(
       parcels,
       pickupType!,
     )
+  const addressFingerprints = carrierWholeShipmentRateAddressFingerprints({
+    origin,
+    destination,
+  })
   const redactedRequest: CarrierWholeShipmentRateRequestEvidence = {
     adapterVersion: 'carrier-whole-shipment-rate-v1',
     accessMode: 'rate_read_only',
@@ -870,11 +918,8 @@ export function prepareCarrierWholeShipmentRateRequest(
     binding: safeBinding,
     billing: safeBilling,
     shipment: {
-      originFingerprint: hash({ version: 'carrier-rate-origin-v1', origin }),
-      destinationFingerprint: hash({
-        version: 'carrier-rate-destination-v1',
-        destination,
-      }),
+      originFingerprint: addressFingerprints.originFingerprint,
+      destinationFingerprint: addressFingerprints.destinationFingerprint,
       origin: {
         region: origin.region,
         countryCode: origin.countryCode,
@@ -1141,23 +1186,692 @@ function parseUps(
   })
 }
 
-function assertPreparedRequestIntegrity(
-  prepared: PreparedCarrierWholeShipmentRateRequest,
+function exactObject(
+  value: unknown,
+  expectedKeys: readonly string[],
+  label: string,
+): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`)
+  }
+  const candidate = value as Record<string, unknown>
+  const actualKeys = Object.keys(candidate).sort()
+  const canonicalKeys = [...expectedKeys].sort()
+  if (stable(actualKeys) !== stable(canonicalKeys)) {
+    throw new Error(`${label} contains an unexpected field`)
+  }
+  return candidate
+}
+
+function exactList(value: unknown, label: string): unknown[] {
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`)
+  return value
+}
+
+function upsAddress(
+  value: unknown,
+  label: string,
+  options: { destination: boolean },
 ) {
+  const source = record(value)
+  const expectedKeys = [
+    ...(!options.destination || source.AddressLine !== undefined
+      ? ['AddressLine']
+      : []),
+    ...(!options.destination || source.City !== undefined ? ['City'] : []),
+    ...(!options.destination || source.StateProvinceCode !== undefined
+      ? ['StateProvinceCode']
+      : []),
+    'PostalCode',
+    'CountryCode',
+    ...(source.ResidentialAddressIndicator !== undefined
+      ? ['ResidentialAddressIndicator']
+      : []),
+  ]
+  const address = exactObject(value, expectedKeys, label)
+  if (
+    address.ResidentialAddressIndicator !== undefined
+    && address.ResidentialAddressIndicator !== ''
+  ) {
+    throw new Error(`${label} residential indicator is invalid`)
+  }
+  const lines = address.AddressLine === undefined
+    ? []
+    : exactList(address.AddressLine, `${label} lines`)
+  if (lines.length > 2) throw new Error(`${label} has too many address lines`)
+  return {
+    line1: lines[0] ?? null,
+    line2: lines[1] ?? null,
+    city: address.City ?? null,
+    region: address.StateProvinceCode ?? null,
+    postalCode: address.PostalCode,
+    countryCode: address.CountryCode,
+    residential: address.ResidentialAddressIndicator === '',
+  }
+}
+
+function parcelsFromUpsBody(value: unknown): CarrierWholeShipmentRateParcel[] {
+  return exactList(value, 'UPS packages').map((candidate, index) => {
+    const item = exactObject(
+      candidate,
+      ['PackagingType', 'Description', 'Dimensions', 'PackageWeight'],
+      `UPS package ${index + 1}`,
+    )
+    const packaging = exactObject(
+      item.PackagingType,
+      ['Code', 'Description'],
+      `UPS package ${index + 1} packaging`,
+    )
+    const dimensions = exactObject(
+      item.Dimensions,
+      ['UnitOfMeasurement', 'Length', 'Width', 'Height'],
+      `UPS package ${index + 1} dimensions`,
+    )
+    const dimensionUnit = exactObject(
+      dimensions.UnitOfMeasurement,
+      ['Code'],
+      `UPS package ${index + 1} dimension unit`,
+    )
+    const weight = exactObject(
+      item.PackageWeight,
+      ['UnitOfMeasurement', 'Weight'],
+      `UPS package ${index + 1} weight`,
+    )
+    const weightUnit = exactObject(
+      weight.UnitOfMeasurement,
+      ['Code'],
+      `UPS package ${index + 1} weight unit`,
+    )
+    if (
+      packaging.Code !== '02'
+      || packaging.Description !== 'Customer supplied package'
+      || dimensionUnit.Code !== 'IN'
+      || weightUnit.Code !== 'LBS'
+    ) {
+      throw new Error(`UPS package ${index + 1} contains invalid literals`)
+    }
+    return normalizeParcel({
+      description: item.Description,
+      length: Number(dimensions.Length),
+      width: Number(dimensions.Width),
+      height: Number(dimensions.Height),
+      dimensionUnit: 'IN',
+      weight: Number(weight.Weight),
+      weightUnit: 'LB',
+    })
+  })
+}
+
+function assertUpsBodyIntegrity(
+  bodyValue: unknown,
+  redacted: CarrierWholeShipmentRateRequestEvidence,
+  expectedBinding?: CarrierWholeShipmentRateExpectedRequestBinding,
+) {
+  const body = exactObject(bodyValue, ['RateRequest'], 'UPS request body')
+  const rateRequest = exactObject(
+    body.RateRequest,
+    ['Request', 'Shipment'],
+    'UPS RateRequest',
+  )
+  const request = exactObject(
+    rateRequest.Request,
+    ['RequestOption', 'TransactionReference'],
+    'UPS request metadata',
+  )
+  const transaction = exactObject(
+    request.TransactionReference,
+    ['CustomerContext'],
+    'UPS transaction reference',
+  )
+  if (
+    request.RequestOption !== 'Shop'
+    || transaction.CustomerContext !== 'ClawPilot whole-shipment rate'
+  ) {
+    throw new Error('UPS request metadata is invalid')
+  }
+  const shipment = exactObject(
+    rateRequest.Shipment,
+    [
+      'Shipper',
+      'ShipFrom',
+      'ShipTo',
+      'PaymentDetails',
+      'NumOfPieces',
+      'Package',
+      'ShipmentRatingOptions',
+    ],
+    'UPS shipment',
+  )
+  const shipper = exactObject(
+    shipment.Shipper,
+    ['Name', 'Address', 'ShipperNumber'],
+    'UPS shipper',
+  )
+  const shipFrom = exactObject(
+    shipment.ShipFrom,
+    ['Name', 'Address'],
+    'UPS ship from',
+  )
+  const shipToSource = record(shipment.ShipTo)
+  const shipTo = exactObject(
+    shipment.ShipTo,
+    [...(shipToSource.Name === undefined ? [] : ['Name']), 'Address'],
+    'UPS ship to',
+  )
+  const originAddress = upsAddress(
+    shipFrom.Address,
+    'UPS origin address',
+    { destination: false },
+  )
+  const shipperAddress = upsAddress(
+    shipper.Address,
+    'UPS shipper address',
+    { destination: false },
+  )
+  const destinationAddress = upsAddress(
+    shipTo.Address,
+    'UPS destination address',
+    { destination: true },
+  )
+  const origin = normalizeParty({
+    name: shipFrom.Name,
+    phone: '0000000000',
+    ...originAddress,
+  })
+  const destination = normalizeDestination({
+    name: shipTo.Name ?? null,
+    ...destinationAddress,
+  })
+  const parcels = parcelsFromUpsBody(shipment.Package)
+  const payment = exactObject(
+    shipment.PaymentDetails,
+    ['ShipmentCharge'],
+    'UPS payment details',
+  )
+  const charges = exactList(payment.ShipmentCharge, 'UPS shipment charges')
+  if (charges.length !== 1) throw new Error('UPS requires one shipment charge')
+  const relationship = redacted.billing.relationship
+  const relationshipKey = relationship === 'sender'
+    ? 'BillShipper'
+    : relationship === 'recipient'
+      ? 'BillReceiver'
+      : 'BillThirdParty'
+  const charge = exactObject(
+    charges[0],
+    ['Type', relationshipKey],
+    'UPS shipment charge',
+  )
+  if (charge.Type !== '01') throw new Error('UPS shipment charge type is invalid')
+  const payer = exactObject(
+    charge[relationshipKey],
+    relationship === 'sender' ? ['AccountNumber'] : ['AccountNumber', 'Address'],
+    'UPS payer',
+  )
+  const payerAddress = relationship === 'sender'
+    ? { PostalCode: origin.postalCode, CountryCode: origin.countryCode }
+    : exactObject(payer.Address, ['PostalCode', 'CountryCode'], 'UPS payer address')
+  const billing = normalizeBilling({
+    relationship,
+    payerAccountNumber: plainText(
+      payer.AccountNumber,
+      'UPS payer account number',
+      64,
+    ),
+    payerAccountNumberFingerprint: redacted.billing.payerAccountNumberFingerprint,
+    payerPostalCode: usPostalCode(
+      payerAddress.PostalCode,
+      'UPS payer postal code',
+    ),
+    payerCountryCode: usCountry(
+      payerAddress.CountryCode,
+      'UPS payer country code',
+    ),
+  })
+  const binding: CarrierWholeShipmentRateBindingInput = {
+    ...redacted.binding,
+    accountNumber: plainText(
+      shipper.ShipperNumber,
+      'UPS shipper account number',
+      64,
+    ),
+    provider: 'ups_rest',
+    environment: redacted.environment,
+  }
+  assertBillingContext(binding, billing, origin, destination)
+  const ratingOptions = exactObject(
+    shipment.ShipmentRatingOptions,
+    ['NegotiatedRatesIndicator'],
+    'UPS rating options',
+  )
+  if (ratingOptions.NegotiatedRatesIndicator !== '') {
+    throw new Error('UPS negotiated-rate indicator is invalid')
+  }
+  if (
+    stable(shipperAddress) !== stable(originAddress)
+    || shipper.Name !== shipFrom.Name
+    || shipment.NumOfPieces !== String(parcels.length)
+    || stable(parcels) !== stable(redacted.shipment.parcels)
+    || stable({
+      region: origin.region,
+      countryCode: origin.countryCode,
+      residential: origin.residential,
+    }) !== stable(redacted.shipment.origin)
+    || stable({
+      region: destination.region,
+      countryCode: destination.countryCode,
+      residential: destination.residential,
+    }) !== stable(redacted.shipment.destination)
+    || stable(upsRequest(binding.accountNumber, origin, destination, parcels, billing))
+      !== stable(bodyValue)
+    || redacted.shipment.destinationFingerprint !== hash({
+      version: 'carrier-rate-destination-v1',
+      destination,
+    })
+  ) {
+    throw new Error('UPS request body does not match its redacted evidence')
+  }
+  if (expectedBinding) {
+    const expectedOrigin = normalizeParty(expectedBinding.origin)
+    const expectedDestination = normalizeDestination(expectedBinding.destination)
+    const expectedFingerprints = carrierWholeShipmentRateAddressFingerprints({
+      origin: expectedOrigin,
+      destination: expectedDestination,
+    })
+    if (
+      !expectedBinding.matchesAccountNumber(binding.accountNumber)
+      || !expectedBinding.matchesAccountNumber(billing.payerAccountNumber)
+      || stable(upsParty(expectedOrigin)) !== stable(shipFrom)
+      || stable(upsDestination(expectedDestination)) !== stable(shipTo)
+      || expectedFingerprints.originFingerprint
+        !== redacted.shipment.originFingerprint
+      || expectedFingerprints.destinationFingerprint
+        !== redacted.shipment.destinationFingerprint
+    ) {
+      throw new Error('UPS request body does not match the expected durable binding')
+    }
+  }
+}
+
+function fedexAddress(value: unknown, label: string, destination: boolean) {
+  const source = record(value)
+  const expectedKeys = [
+    ...(source.streetLines === undefined ? [] : ['streetLines']),
+    ...(source.city === undefined ? [] : ['city']),
+    ...(source.stateOrProvinceCode === undefined ? [] : ['stateOrProvinceCode']),
+    'postalCode',
+    'countryCode',
+    'residential',
+  ]
+  const address = exactObject(value, expectedKeys, label)
+  const lines = address.streetLines === undefined
+    ? []
+    : exactList(address.streetLines, `${label} lines`)
+  if ((!destination && lines.length < 1) || lines.length > 2) {
+    throw new Error(`${label} has an invalid address-line count`)
+  }
+  return {
+    line1: lines[0] ?? null,
+    line2: lines[1] ?? null,
+    city: address.city ?? null,
+    region: address.stateOrProvinceCode ?? null,
+    postalCode: address.postalCode,
+    countryCode: address.countryCode,
+    residential: address.residential,
+  }
+}
+
+function parcelsFromFedexBody(value: unknown): CarrierWholeShipmentRateParcel[] {
+  return exactList(value, 'FedEx package lines').map((candidate, index) => {
+    const item = exactObject(
+      candidate,
+      [
+        'sequenceNumber',
+        'groupPackageCount',
+        'itemDescription',
+        'weight',
+        'dimensions',
+      ],
+      `FedEx package ${index + 1}`,
+    )
+    const weight = exactObject(
+      item.weight,
+      ['units', 'value'],
+      `FedEx package ${index + 1} weight`,
+    )
+    const dimensions = exactObject(
+      item.dimensions,
+      ['length', 'width', 'height', 'units'],
+      `FedEx package ${index + 1} dimensions`,
+    )
+    if (
+      item.sequenceNumber !== index + 1
+      || item.groupPackageCount !== 1
+      || weight.units !== 'LB'
+      || dimensions.units !== 'IN'
+    ) {
+      throw new Error(`FedEx package ${index + 1} contains invalid literals`)
+    }
+    return normalizeParcel({
+      description: item.itemDescription,
+      length: dimensions.length,
+      width: dimensions.width,
+      height: dimensions.height,
+      dimensionUnit: dimensions.units,
+      weight: weight.value,
+      weightUnit: weight.units,
+    })
+  })
+}
+
+function assertFedexBodyIntegrity(
+  bodyValue: unknown,
+  redacted: CarrierWholeShipmentRateRequestEvidence,
+  expectedBinding?: CarrierWholeShipmentRateExpectedRequestBinding,
+) {
+  const body = exactObject(
+    bodyValue,
+    ['accountNumber', 'rateRequestControlParameters', 'requestedShipment'],
+    'FedEx request body',
+  )
+  const account = exactObject(body.accountNumber, ['value'], 'FedEx account')
+  const controls = exactObject(
+    body.rateRequestControlParameters,
+    ['returnTransitTimes'],
+    'FedEx rate controls',
+  )
+  if (controls.returnTransitTimes !== true) {
+    throw new Error('FedEx transit-time control is invalid')
+  }
+  const shipment = exactObject(
+    body.requestedShipment,
+    [
+      'shipper',
+      'recipient',
+      'pickupType',
+      'rateRequestType',
+      'packagingType',
+      'totalPackageCount',
+      'requestedPackageLineItems',
+    ],
+    'FedEx requested shipment',
+  )
+  const shipper = exactObject(
+    shipment.shipper,
+    ['contact', 'address'],
+    'FedEx shipper',
+  )
+  const contact = exactObject(
+    shipper.contact,
+    ['personName', 'companyName', 'phoneNumber'],
+    'FedEx shipper contact',
+  )
+  if (contact.personName !== contact.companyName) {
+    throw new Error('FedEx shipper contact names must match')
+  }
+  const origin = normalizeParty({
+    name: contact.personName,
+    phone: contact.phoneNumber,
+    ...fedexAddress(shipper.address, 'FedEx origin address', false),
+  })
+  const recipient = exactObject(
+    shipment.recipient,
+    ['address'],
+    'FedEx recipient',
+  )
+  const destination = normalizeDestination({
+    name: null,
+    ...fedexAddress(recipient.address, 'FedEx destination address', true),
+  })
+  const parcels = parcelsFromFedexBody(shipment.requestedPackageLineItems)
+  const pickupType = fedexPickupType('fedex_rest', shipment.pickupType)
+  const rateTypes = exactList(shipment.rateRequestType, 'FedEx rate request types')
+  if (
+    stable(rateTypes) !== stable(['ACCOUNT', 'LIST'])
+    || shipment.packagingType !== 'YOUR_PACKAGING'
+    || shipment.totalPackageCount !== parcels.length
+    || stable(parcels) !== stable(redacted.shipment.parcels)
+    || stable(fedexRequest(
+      plainText(account.value, 'FedEx payer account number', 64),
+      origin,
+      destination,
+      parcels,
+      pickupType!,
+    )) !== stable(bodyValue)
+  ) {
+    throw new Error('FedEx request body does not match its redacted evidence')
+  }
+  const fingerprints = carrierWholeShipmentRateAddressFingerprints({
+    origin,
+    destination,
+  })
+  if (
+    fingerprints.originFingerprint !== redacted.shipment.originFingerprint
+    || stable({
+      region: destination.region,
+      countryCode: destination.countryCode,
+      residential: destination.residential,
+    }) !== stable(redacted.shipment.destination)
+  ) {
+    throw new Error('FedEx address evidence does not match the request body')
+  }
+  if (expectedBinding) {
+    const expectedOrigin = normalizeParty(expectedBinding.origin)
+    const expectedDestination = normalizeDestination(expectedBinding.destination)
+    const expectedFingerprints = carrierWholeShipmentRateAddressFingerprints({
+      origin: expectedOrigin,
+      destination: expectedDestination,
+    })
+    const payerAccountNumber = plainText(
+      account.value,
+      'FedEx payer account number',
+      64,
+    )
+    if (
+      !expectedBinding.matchesAccountNumber(payerAccountNumber)
+      || stable(fedexRequest(
+        payerAccountNumber,
+        expectedOrigin,
+        expectedDestination,
+        parcels,
+        pickupType!,
+      )) !== stable(bodyValue)
+      || expectedFingerprints.originFingerprint
+        !== redacted.shipment.originFingerprint
+      || expectedFingerprints.destinationFingerprint
+        !== redacted.shipment.destinationFingerprint
+    ) {
+      throw new Error('FedEx request body does not match the expected durable binding')
+    }
+  }
+}
+
+function normalizeRequestEvidence(
+  value: CarrierWholeShipmentRateRequestEvidence,
+  prepared: PreparedCarrierWholeShipmentRateRequest,
+): CarrierWholeShipmentRateRequestEvidence {
+  const bindingSource = exactObject(
+    value.binding,
+    [
+      'organizationId',
+      'carrierAccountId',
+      'integrationAccountId',
+      'credentialRevision',
+      'credentialFingerprint',
+      'accountNumberFingerprint',
+    ],
+    'Carrier request binding evidence',
+  )
+  const billingSource = exactObject(
+    value.billing,
+    [
+      'relationship',
+      'providerMapping',
+      'payerAccountNumberFingerprint',
+      'payerPostalCode',
+      'payerCountryCode',
+    ],
+    'Carrier request billing evidence',
+  )
+  const shipmentSource = exactObject(
+    value.shipment,
+    [
+      'originFingerprint',
+      'destinationFingerprint',
+      'origin',
+      'destination',
+      'fedexPickupType',
+      'parcels',
+    ],
+    'Carrier request shipment evidence',
+  )
+  const originSource = exactObject(
+    shipmentSource.origin,
+    ['region', 'countryCode', 'residential'],
+    'Carrier request origin evidence',
+  )
+  const destinationSource = exactObject(
+    shipmentSource.destination,
+    ['region', 'countryCode', 'residential'],
+    'Carrier request destination evidence',
+  )
+  const relationship = billingSource.relationship
+  if (
+    relationship !== 'sender'
+    && relationship !== 'recipient'
+    && relationship !== 'third_party'
+  ) {
+    throw new Error('Carrier request billing relationship is invalid')
+  }
+  const pickupType = fedexPickupType(prepared.provider, shipmentSource.fedexPickupType)
+  const parcels = exactList(shipmentSource.parcels, 'Carrier request parcels')
+    .map(normalizeParcel)
+  const destinationRegion = destinationSource.region === null
+    ? null
+    : usRegion(destinationSource.region, 'Destination evidence region')
+  const normalized: CarrierWholeShipmentRateRequestEvidence = {
+    adapterVersion: 'carrier-whole-shipment-rate-v1',
+    accessMode: 'rate_read_only',
+    providerMutationCount: 0,
+    provider: prepared.provider,
+    environment: prepared.environment,
+    endpoint: carrierWholeShipmentRateEndpoint(
+      prepared.provider,
+      prepared.environment,
+    ),
+    endpointVersion: ENDPOINT_VERSIONS[prepared.provider],
+    purpose: 'fulfillment_execution',
+    rateScope: 'multi_package_shipment',
+    expectedCurrency: expectedCurrency(value.expectedCurrency),
+    packageCount: parcels.length,
+    binding: {
+      organizationId: canonicalUuid(bindingSource.organizationId, 'Organization ID'),
+      carrierAccountId: canonicalUuid(
+        bindingSource.carrierAccountId,
+        'Carrier account ID',
+      ),
+      integrationAccountId: canonicalUuid(
+        bindingSource.integrationAccountId,
+        'Integration account ID',
+      ),
+      credentialRevision: Number(bindingSource.credentialRevision),
+      credentialFingerprint: canonicalFingerprint(
+        bindingSource.credentialFingerprint,
+        'Credential fingerprint',
+      ),
+      accountNumberFingerprint: canonicalFingerprint(
+        bindingSource.accountNumberFingerprint,
+        'Carrier account-number fingerprint',
+      ),
+    },
+    billing: {
+      relationship,
+      providerMapping: prepared.provider === 'ups_rest'
+        ? 'ups_payment_details'
+        : 'fedex_rate_account_number',
+      payerAccountNumberFingerprint: canonicalFingerprint(
+        billingSource.payerAccountNumberFingerprint,
+        'Payer account-number fingerprint',
+      ),
+      payerPostalCode: usPostalCode(
+        billingSource.payerPostalCode,
+        'Payer postal code',
+      ),
+      payerCountryCode: usCountry(
+        billingSource.payerCountryCode,
+        'Payer country code',
+      ),
+    },
+    shipment: {
+      originFingerprint: canonicalFingerprint(
+        shipmentSource.originFingerprint,
+        'Origin fingerprint',
+      ),
+      destinationFingerprint: canonicalFingerprint(
+        shipmentSource.destinationFingerprint,
+        'Destination fingerprint',
+      ),
+      origin: {
+        region: usRegion(originSource.region, 'Origin evidence region'),
+        countryCode: usCountry(
+          originSource.countryCode,
+          'Origin evidence country code',
+        ),
+        residential: booleanValue(
+          originSource.residential,
+          'Origin evidence residential classification',
+        ),
+      },
+      destination: {
+        region: destinationRegion,
+        countryCode: usCountry(
+          destinationSource.countryCode,
+          'Destination evidence country code',
+        ),
+        residential: booleanValue(
+          destinationSource.residential,
+          'Destination evidence residential classification',
+        ),
+      },
+      fedexPickupType: pickupType,
+      parcels,
+    },
+  }
+  if (
+    !Number.isInteger(bindingSource.credentialRevision)
+    || Number(bindingSource.credentialRevision) < 1
+    || parcels.length < 1
+    || parcels.length > MAX_CARRIER_WHOLE_SHIPMENT_RATE_PACKAGES
+    || value.packageCount !== parcels.length
+    || stable(value) !== stable(normalized)
+  ) {
+    throw new Error('Carrier request redacted evidence is not canonical')
+  }
+  return normalized
+}
+
+function sealPreparedCarrierWholeShipmentRateRequestUnchecked(
+  prepared: PreparedCarrierWholeShipmentRateRequest,
+  expectedBinding?: CarrierWholeShipmentRateExpectedRequestBinding,
+): SealedCarrierWholeShipmentRateRequest {
+  if (!prepared || typeof prepared !== 'object') {
+    throw new Error('Prepared carrier rate request integrity check failed')
+  }
   const expectedEndpoint = carrierWholeShipmentRateEndpoint(
     prepared.provider,
     prepared.environment,
   )
   const expectedEndpointVersion = ENDPOINT_VERSIONS[prepared.provider]
-  const redacted = prepared.redactedRequest
+  const redacted = normalizeRequestEvidence(prepared.redactedRequest, prepared)
+  if (prepared.provider === 'ups_rest') {
+    assertUpsBodyIntegrity(prepared.body, redacted, expectedBinding)
+  } else {
+    assertFedexBodyIntegrity(prepared.body, redacted, expectedBinding)
+  }
   const expectedHash = hash({
     ...redacted,
     providerRequestBodyHash: hash(prepared.body),
   })
   const expectedHeaders = carrierRateHeaders(prepared.provider, expectedHash)
-  const packageCount = Array.isArray(redacted?.shipment?.parcels)
-    ? redacted.shipment.parcels.length
-    : -1
   if (
     prepared.adapterVersion !== 'carrier-whole-shipment-rate-v1'
     || prepared.accessMode !== 'rate_read_only'
@@ -1177,18 +1891,35 @@ function assertPreparedRequestIntegrity(
     || redacted.purpose !== 'fulfillment_execution'
     || redacted.rateScope !== 'multi_package_shipment'
     || redacted.expectedCurrency !== 'USD'
-    || redacted.packageCount !== packageCount
-    || packageCount < 1
-    || packageCount > MAX_CARRIER_WHOLE_SHIPMENT_RATE_PACKAGES
-    || (
-      prepared.provider === 'fedex_rest'
-      && !FEDEX_PICKUP_TYPES.has(redacted.shipment.fedexPickupType!)
-    )
-    || (
-      prepared.provider === 'ups_rest'
-      && redacted.shipment.fedexPickupType !== null
-    )
   ) {
+    throw new Error('Prepared carrier rate request integrity check failed')
+  }
+  const safeEvidence = JSON.parse(
+    JSON.stringify(redacted),
+  ) as CarrierWholeShipmentRateRequestEvidence
+  return deepFreeze({
+    adapterVersion: prepared.adapterVersion,
+    accessMode: prepared.accessMode,
+    providerMutationCount: prepared.providerMutationCount,
+    provider: prepared.provider,
+    environment: prepared.environment,
+    endpoint: prepared.endpoint,
+    endpointVersion: prepared.endpointVersion,
+    requestHash: prepared.requestHash,
+    redactedRequest: safeEvidence,
+  })
+}
+
+export function sealPreparedCarrierWholeShipmentRateRequest(
+  prepared: PreparedCarrierWholeShipmentRateRequest,
+  expectedBinding?: CarrierWholeShipmentRateExpectedRequestBinding,
+): SealedCarrierWholeShipmentRateRequest {
+  try {
+    return sealPreparedCarrierWholeShipmentRateRequestUnchecked(
+      prepared,
+      expectedBinding,
+    )
+  } catch {
     throw new Error('Prepared carrier rate request integrity check failed')
   }
 }
@@ -1197,7 +1928,7 @@ export function parseCarrierWholeShipmentRateResponse(
   prepared: PreparedCarrierWholeShipmentRateRequest,
   input: CarrierWholeShipmentRateResponseInput,
 ): ParsedCarrierWholeShipmentRateResponse {
-  assertPreparedRequestIntegrity(prepared)
+  sealPreparedCarrierWholeShipmentRateRequest(prepared)
   const requestedAt = normalizeInstant(input.requestedAt, 'Requested at')
   const completedAt = normalizeInstant(input.completedAt, 'Completed at')
   if (Date.parse(completedAt) < Date.parse(requestedAt)) {

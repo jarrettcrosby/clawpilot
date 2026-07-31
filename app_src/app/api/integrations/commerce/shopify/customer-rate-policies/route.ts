@@ -13,6 +13,8 @@ import {
   maskShopifyCustomerEmailsInText,
   normalizeShopifyCustomerSearchQuery,
   SHOPIFY_SHADOW_POLICY_DEFAULT_DURATION_MINUTES,
+  SHOPIFY_SHADOW_POLICY_DEFAULT_LIFETIME_MODE,
+  SHOPIFY_SHADOW_POLICY_LIFETIME_MODES,
   SHOPIFY_SHADOW_POLICY_MAX_DURATION_MINUTES,
   SHOPIFY_SHADOW_POLICY_MIN_DURATION_MINUTES,
   searchShopifyCustomers,
@@ -403,6 +405,8 @@ export async function GET(req: NextRequest) {
         policyCount: summary.policyCount,
         removedCount: summary.removedCount,
         simulatedCount: summary.simulatedCount,
+        untilTurnedOffSimulatedCount:
+          summary.untilTurnedOffSimulatedCount,
         expiredSimulatedCount: summary.expiredSimulatedCount,
         blockedCount: summary.blockedCount,
         enforcedCount: summary.enforcedCount,
@@ -410,6 +414,8 @@ export async function GET(req: NextRequest) {
         earliestShadowExpiresAt: summary.earliestShadowExpiresAt,
       },
       shadowPolicyLimits: {
+        defaultLifetimeMode: SHOPIFY_SHADOW_POLICY_DEFAULT_LIFETIME_MODE,
+        supportedLifetimeModes: SHOPIFY_SHADOW_POLICY_LIFETIME_MODES,
         defaultDurationMinutes:
           SHOPIFY_SHADOW_POLICY_DEFAULT_DURATION_MINUTES,
         minimumDurationMinutes: SHOPIFY_SHADOW_POLICY_MIN_DURATION_MINUTES,
@@ -437,6 +443,7 @@ export async function POST(req: NextRequest) {
         'customerGid',
         'mode',
         'serviceCodes',
+        'shadowLifetimeMode',
         'shadowDurationMinutes',
         'expectedRowVersion',
       ])
@@ -446,6 +453,7 @@ export async function POST(req: NextRequest) {
         customerGid: body.customerGid,
         mode: body.mode,
         serviceCodes: body.serviceCodes,
+        shadowLifetimeMode: body.shadowLifetimeMode,
         shadowDurationMinutes: body.shadowDurationMinutes,
         expectedRowVersion: body.expectedRowVersion,
         actorEmail: context.actor.email,

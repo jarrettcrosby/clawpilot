@@ -3,12 +3,13 @@ import type { PoolClient, QueryResultRow } from 'pg'
 import {
   normalizeShopifyCustomerGid,
   normalizeShopifyCustomerRatePolicy,
-  normalizeShopifyShadowPolicyDurationMinutes,
+  normalizeShopifyShadowPolicyLifetime,
   SHOPIFY_SHADOW_POLICY_MAX_DURATION_MINUTES,
   SHOPIFY_SHADOW_POLICY_MIN_DURATION_MINUTES,
   ShopifyCustomerRatePolicyError,
   type NormalizedShopifyCustomerRatePolicy,
   type ShopifyCustomerRatePolicyMode,
+  type ShopifyShadowPolicyLifetimeMode,
 } from '@/lib/integrations/shopifyCustomerRatePolicy'
 import {
   acquireTransactionAdvisoryLock,
@@ -63,6 +64,7 @@ export type ShopifyCustomerRatePolicy = {
   providerMetafieldGid: string | null
   providerMetafieldUpdatedAt: string | null
   lastErrorCode: string | null
+  shadowLifetimeMode: ShopifyShadowPolicyLifetimeMode | null
   shadowDurationMinutes: number | null
   shadowExpiresAt: string | null
   shadowExpired: boolean
@@ -94,6 +96,7 @@ type PolicyRow = QueryResultRow & {
   provider_metafield_gid: string | null
   provider_metafield_updated_at: Date | null
   last_error_code: string | null
+  shadow_lifetime_mode: 'timed' | 'until_turned_off' | 'none'
   shadow_duration_minutes: string | number | null
   shadow_expires_at: Date | null
   shadow_expired: boolean
@@ -112,6 +115,7 @@ type CountRow = QueryResultRow & {
   policy_count: string
   removed_count: string
   simulated_count: string
+  until_turned_off_simulated_count: string
   shadow_allowed_count: string
   expired_simulated_count: string
   blocked_count: string
@@ -140,11 +144,23 @@ const POLICY_SELECT = `SELECT
     policy.provider_metafield_gid,
     policy.provider_metafield_updated_at,
     policy.last_error_code,
+    policy.shadow_lifetime_mode,
     policy.shadow_duration_minutes::text,
     policy.shadow_expires_at,
     (
       policy.status = 'simulated'
-      AND policy.shadow_expires_at <= now()
+      AND NOT (
+        (
+          policy.shadow_lifetime_mode = 'timed'
+          AND policy.shadow_duration_minutes BETWEEN 15 AND 240
+          AND policy.shadow_expires_at > now()
+        )
+        OR (
+          policy.shadow_lifetime_mode = 'until_turned_off'
+          AND policy.shadow_duration_minutes IS NULL
+          AND policy.shadow_expires_at IS NULL
+        )
+      )
     ) AS shadow_expired,
     policy.row_version::text,
     policy.removed_at,
@@ -274,7 +290,35 @@ function storedShadowDurationMinutes(
   return minutes
 }
 
+function storedShadowLifetime(row: PolicyRow) {
+  const lifetimeMode = row.shadow_lifetime_mode
+  const durationMinutes = storedShadowDurationMinutes(
+    row.shadow_duration_minutes,
+  )
+  const expiresAt = iso(row.shadow_expires_at)
+  const valid = lifetimeMode === 'timed'
+    ? durationMinutes !== null && expiresAt !== null
+    : lifetimeMode === 'until_turned_off'
+      ? durationMinutes === null && expiresAt === null
+      : lifetimeMode === 'none'
+        ? durationMinutes === null && expiresAt === null
+        : false
+  if (!valid) {
+    throw new ShopifyCustomerRatePolicyPersistenceError(
+      'SHOPIFY_CUSTOMER_POLICY_STORED_VALUE_INVALID',
+      'Stored Shopify customer rate policy is invalid',
+      500,
+    )
+  }
+  return {
+    lifetimeMode: lifetimeMode === 'none' ? null : lifetimeMode,
+    durationMinutes,
+    expiresAt,
+  }
+}
+
 function policy(row: PolicyRow): ShopifyCustomerRatePolicy {
+  const shadowLifetime = storedShadowLifetime(row)
   return {
     id: row.id,
     globalId: row.global_id,
@@ -289,10 +333,9 @@ function policy(row: PolicyRow): ShopifyCustomerRatePolicy {
     providerMetafieldGid: row.provider_metafield_gid,
     providerMetafieldUpdatedAt: iso(row.provider_metafield_updated_at),
     lastErrorCode: row.last_error_code,
-    shadowDurationMinutes: storedShadowDurationMinutes(
-      row.shadow_duration_minutes,
-    ),
-    shadowExpiresAt: iso(row.shadow_expires_at),
+    shadowLifetimeMode: shadowLifetime.lifetimeMode,
+    shadowDurationMinutes: shadowLifetime.durationMinutes,
+    shadowExpiresAt: shadowLifetime.expiresAt,
     shadowExpired: row.shadow_expired === true,
     rowVersion: safeCount(row.row_version),
     removedAt: iso(row.removed_at),
@@ -303,11 +346,13 @@ function policy(row: PolicyRow): ShopifyCustomerRatePolicy {
 
 function policyHash(
   value: NormalizedShopifyCustomerRatePolicy,
+  shadowLifetimeMode: ShopifyShadowPolicyLifetimeMode | null,
   shadowDurationMinutes: number | null,
 ) {
   return createHash('sha256')
     .update(JSON.stringify({
       ...value,
+      shadowLifetimeMode,
       shadowDurationMinutes,
     }), 'utf8')
     .digest('hex')
@@ -524,6 +569,7 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
   customerGid: unknown
   mode: unknown
   serviceCodes: unknown
+  shadowLifetimeMode?: unknown
   shadowDurationMinutes?: unknown
   expectedRowVersion?: unknown
   actorEmail: unknown
@@ -535,8 +581,10 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
     mode: input.mode,
     serviceCodes: input.serviceCodes,
   })
-  const requestedShadowDurationMinutes =
-    normalizeShopifyShadowPolicyDurationMinutes(input.shadowDurationMinutes)
+  const requestedShadowLifetime = normalizeShopifyShadowPolicyLifetime({
+    shadowLifetimeMode: input.shadowLifetimeMode,
+    shadowDurationMinutes: input.shadowDurationMinutes,
+  })
   const expected = expectedRowVersion(input.expectedRowVersion)
   const actorEmail = normalizedActorEmail(input.actorEmail)
 
@@ -565,10 +613,17 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
     })
 
     const shadow = context.activationState === 'shadow'
-    const shadowDurationMinutes = shadow
-      ? requestedShadowDurationMinutes
+    const shadowLifetimeMode = shadow
+      ? requestedShadowLifetime.shadowLifetimeMode
       : null
-    const hash = policyHash(normalizedPolicy, shadowDurationMinutes)
+    const shadowDurationMinutes = shadow
+      ? requestedShadowLifetime.shadowDurationMinutes
+      : null
+    const hash = policyHash(
+      normalizedPolicy,
+      shadowLifetimeMode,
+      shadowDurationMinutes,
+    )
     const status: ShopifyCustomerRatePolicyStatus = shadow
       ? 'simulated'
       : 'blocked'
@@ -590,19 +645,21 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
              provider_metafield_gid = NULL,
              provider_metafield_updated_at = NULL,
              last_error_code = $9,
-             shadow_duration_minutes = $10::smallint,
+             shadow_lifetime_mode = $10,
+             shadow_duration_minutes = $11::smallint,
              shadow_expires_at = CASE
-               WHEN $10::smallint IS NULL THEN NULL
-               ELSE now() + ($10::integer * interval '1 minute')
+               WHEN $10 = 'timed'
+                 THEN now() + ($11::integer * interval '1 minute')
+               ELSE NULL
              END,
              removed_at = NULL,
              row_version = row_version + 1,
-             updated_by = $11,
+             updated_by = $12,
              updated_at = now()
          WHERE organization_id = $1::uuid
            AND integration_account_id = $2::uuid
            AND shopify_customer_gid = $3
-           AND row_version = $12::bigint
+           AND row_version = $13::bigint
          RETURNING id::text`,
         [
           organizationId,
@@ -614,6 +671,7 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
           status,
           providerState,
           lastErrorCode,
+          shadowLifetimeMode || 'none',
           shadowDurationMinutes,
           actorEmail,
           safeCount(current.row_version),
@@ -625,16 +683,18 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
         `INSERT INTO operations_shopify_customer_rate_policies (
            organization_id, integration_account_id, shopify_customer_gid,
            mode, service_codes, policy_hash, status, provider_state,
-           last_error_code, shadow_duration_minutes, shadow_expires_at,
+           last_error_code, shadow_lifetime_mode,
+           shadow_duration_minutes, shadow_expires_at,
            created_by, updated_by
          ) VALUES (
            $1::uuid, $2::uuid, $3, $4, $5::jsonb, $6, $7, $8, $9,
-           $10::smallint,
+           $10, $11::smallint,
            CASE
-             WHEN $10::smallint IS NULL THEN NULL
-             ELSE now() + ($10::integer * interval '1 minute')
+             WHEN $10 = 'timed'
+               THEN now() + ($11::integer * interval '1 minute')
+             ELSE NULL
            END,
-           $11, $11
+           $12, $12
          )
          RETURNING id::text`,
         [
@@ -647,6 +707,7 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
           status,
           providerState,
           lastErrorCode,
+          shadowLifetimeMode || 'none',
           shadowDurationMinutes,
           actorEmail,
         ],
@@ -742,6 +803,10 @@ export async function removeShopifyCustomerRatePolicyInPostgres(input: {
            provider_metafield_gid = NULL,
            provider_metafield_updated_at = NULL,
            last_error_code = $5,
+           shadow_lifetime_mode = CASE
+             WHEN $4 = 'not_written' THEN shadow_lifetime_mode
+             ELSE 'none'
+           END,
            shadow_duration_minutes = CASE
              WHEN $4 = 'not_written' THEN shadow_duration_minutes
              ELSE NULL
@@ -819,7 +884,18 @@ export async function readActiveShopifyCustomerRatePolicyFromPostgres(input: {
            activation.state = 'shadow'
            AND policy.status = 'simulated'
            AND policy.provider_state = 'not_written'
-           AND policy.shadow_expires_at > now()
+           AND (
+             (
+               policy.shadow_lifetime_mode = 'timed'
+               AND policy.shadow_duration_minutes BETWEEN 15 AND 240
+               AND policy.shadow_expires_at > now()
+             )
+             OR (
+               policy.shadow_lifetime_mode = 'until_turned_off'
+               AND policy.shadow_duration_minutes IS NULL
+               AND policy.shadow_expires_at IS NULL
+             )
+           )
          )
          OR (
            activation.state = 'active'
@@ -849,22 +925,65 @@ export async function readShopifyCustomerRatePolicySummaryFromPostgres(input: {
        count(*) FILTER (WHERE status = 'removed')::text AS removed_count,
        count(*) FILTER (
          WHERE status = 'simulated'
-           AND shadow_expires_at > now()
+           AND provider_state = 'not_written'
+           AND (
+             (
+               shadow_lifetime_mode = 'timed'
+               AND shadow_duration_minutes BETWEEN 15 AND 240
+               AND shadow_expires_at > now()
+             )
+             OR (
+               shadow_lifetime_mode = 'until_turned_off'
+               AND shadow_duration_minutes IS NULL
+               AND shadow_expires_at IS NULL
+             )
+           )
        )::text AS simulated_count,
        count(*) FILTER (
          WHERE status = 'simulated'
-           AND shadow_expires_at > now()
+           AND provider_state = 'not_written'
+           AND shadow_lifetime_mode = 'until_turned_off'
+           AND shadow_duration_minutes IS NULL
+           AND shadow_expires_at IS NULL
+       )::text AS until_turned_off_simulated_count,
+       count(*) FILTER (
+         WHERE status = 'simulated'
+           AND provider_state = 'not_written'
+           AND (
+             (
+               shadow_lifetime_mode = 'timed'
+               AND shadow_duration_minutes BETWEEN 15 AND 240
+               AND shadow_expires_at > now()
+             )
+             OR (
+               shadow_lifetime_mode = 'until_turned_off'
+               AND shadow_duration_minutes IS NULL
+               AND shadow_expires_at IS NULL
+             )
+           )
            AND mode <> 'hide_all'
        )::text AS shadow_allowed_count,
        count(*) FILTER (
          WHERE status = 'simulated'
-           AND shadow_expires_at <= now()
+           AND NOT (
+             (
+               shadow_lifetime_mode = 'timed'
+               AND shadow_duration_minutes BETWEEN 15 AND 240
+               AND shadow_expires_at > now()
+             )
+             OR (
+               shadow_lifetime_mode = 'until_turned_off'
+               AND shadow_duration_minutes IS NULL
+               AND shadow_expires_at IS NULL
+             )
+           )
        )::text AS expired_simulated_count,
        count(*) FILTER (WHERE status = 'blocked')::text AS blocked_count,
        count(*) FILTER (WHERE status = 'enforced')::text AS enforced_count,
        count(*) FILTER (WHERE status = 'error')::text AS error_count,
        min(shadow_expires_at) FILTER (
          WHERE status = 'simulated'
+           AND shadow_lifetime_mode = 'timed'
            AND shadow_expires_at > now()
        ) AS earliest_shadow_expires_at
      FROM operations_shopify_customer_rate_policies
@@ -877,6 +996,9 @@ export async function readShopifyCustomerRatePolicySummaryFromPostgres(input: {
     policyCount: safeCount(row?.policy_count),
     removedCount: safeCount(row?.removed_count),
     simulatedCount: safeCount(row?.simulated_count),
+    untilTurnedOffSimulatedCount: safeCount(
+      row?.until_turned_off_simulated_count,
+    ),
     shadowAllowedCount: safeCount(row?.shadow_allowed_count),
     expiredSimulatedCount: safeCount(row?.expired_simulated_count),
     blockedCount: safeCount(row?.blocked_count),

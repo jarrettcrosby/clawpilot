@@ -15,6 +15,19 @@ const EMAIL_IN_TEXT_PATTERN =
 export const SHOPIFY_SHADOW_POLICY_MIN_DURATION_MINUTES = 15
 export const SHOPIFY_SHADOW_POLICY_DEFAULT_DURATION_MINUTES = 60
 export const SHOPIFY_SHADOW_POLICY_MAX_DURATION_MINUTES = 240
+export const SHOPIFY_SHADOW_POLICY_DEFAULT_LIFETIME_MODE = 'timed' as const
+export const SHOPIFY_SHADOW_POLICY_LIFETIME_MODES = [
+  'timed',
+  'until_turned_off',
+] as const
+
+export type ShopifyShadowPolicyLifetimeMode =
+  typeof SHOPIFY_SHADOW_POLICY_LIFETIME_MODES[number]
+
+export type NormalizedShopifyShadowPolicyLifetime = {
+  shadowLifetimeMode: ShopifyShadowPolicyLifetimeMode
+  shadowDurationMinutes: number | null
+}
 
 export type ShopifyCustomerRatePolicyMode =
   | 'show_all'
@@ -179,6 +192,48 @@ export function normalizeShopifyShadowPolicyDurationMinutes(
     )
   }
   return candidate
+}
+
+export function normalizeShopifyShadowPolicyLifetime(input: {
+  shadowLifetimeMode?: unknown
+  shadowDurationMinutes?: unknown
+}): NormalizedShopifyShadowPolicyLifetime {
+  const shadowLifetimeMode = input.shadowLifetimeMode === undefined
+    || input.shadowLifetimeMode === null
+    || input.shadowLifetimeMode === ''
+    ? SHOPIFY_SHADOW_POLICY_DEFAULT_LIFETIME_MODE
+    : String(input.shadowLifetimeMode).trim()
+  if (
+    shadowLifetimeMode !== 'timed'
+    && shadowLifetimeMode !== 'until_turned_off'
+  ) {
+    throw new ShopifyCustomerRatePolicyError(
+      'SHOPIFY_SHADOW_POLICY_LIFETIME_INVALID',
+      'Shadow lifetime must be timed or until turned off',
+    )
+  }
+  if (shadowLifetimeMode === 'until_turned_off') {
+    if (
+      input.shadowDurationMinutes !== undefined
+      && input.shadowDurationMinutes !== null
+      && input.shadowDurationMinutes !== ''
+    ) {
+      throw new ShopifyCustomerRatePolicyError(
+        'SHOPIFY_SHADOW_POLICY_LIFETIME_INVALID',
+        'Until-turned-off Shadow policies cannot include a duration',
+      )
+    }
+    return {
+      shadowLifetimeMode,
+      shadowDurationMinutes: null,
+    }
+  }
+  return {
+    shadowLifetimeMode,
+    shadowDurationMinutes: normalizeShopifyShadowPolicyDurationMinutes(
+      input.shadowDurationMinutes,
+    ),
+  }
 }
 
 export function normalizeShopifyCustomerRatePolicy(input: {
