@@ -432,6 +432,9 @@ async function verifyShipmentCompletion(databaseUrl) {
       'app_src/lib/operations/shopifyCheckoutPlanRatePolicy.ts',
       { mocks: { '../currency.ts': currency } },
     )
+    const shopifyCheckoutRateWarmPolicy = loadTypeScriptModule(
+      'app_src/lib/operations/shopifyCheckoutRateWarmPolicy.ts',
+    )
     const shopifyCheckoutRating = loadTypeScriptModule(
       'app_src/lib/persistence/shopifyCheckoutRating.ts',
       {
@@ -439,6 +442,8 @@ async function verifyShipmentCompletion(databaseUrl) {
           '@/lib/auditWriter': auditWriter,
           '@/lib/operations/shopifyCheckoutPlanRatePolicy':
             shopifyCheckoutPlanRatePolicy,
+          '@/lib/operations/shopifyCheckoutRateWarmPolicy':
+            shopifyCheckoutRateWarmPolicy,
           '@/lib/persistence/postgres': postgres,
         },
       },
