@@ -1429,6 +1429,7 @@ assert.equal(
 const faireProducts = await faireApi.listProducts({
   cursor: 'faire-products-current-page',
   limit: 50,
+  includeDeleted: true,
 })
 assert.equal(faireProducts.products.length, 1)
 assert.equal(
@@ -1438,8 +1439,13 @@ assert.equal(
 )
 assert.equal(
   faireRequests[3].url,
-  'https://www.faire.com/external-api/v2/products?limit=50&cursor=faire-products-current-page',
-  'The next Faire list request must send the prior response cursor through the cursor query parameter',
+  'https://www.faire.com/external-api/v2/products?limit=50&cursor=faire-products-current-page&include_deleted=true',
+  'Faire catalog reconciliation must retain the cursor and include deleted listings',
+)
+await assert.rejects(
+  faireApi.listProducts({ includeDeleted: 'yes' }),
+  (error) => error.code === 'FAIRE_INCLUDE_DELETED_INVALID',
+  'Faire list requests must reject a non-boolean include-deleted selection',
 )
 await assert.rejects(
   faireApi.listProducts({ cursor: 'x'.repeat(4_097) }),

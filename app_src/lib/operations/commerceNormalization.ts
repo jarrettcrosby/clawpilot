@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 export const COMMERCE_NORMALIZATION_ENVELOPE_VERSION =
   'commerce-normalization-envelope-v1' as const
 export const COMMERCE_NORMALIZED_PRODUCT_VERSION =
-  'commerce-normalized-product-v2' as const
+  'commerce-normalized-product-v3' as const
 export const COMMERCE_NORMALIZED_VARIANT_VERSION =
   'commerce-normalized-variant-v1' as const
 export const COMMERCE_NORMALIZED_ORDER_VERSION =
@@ -188,6 +188,7 @@ export type CommerceNormalizedProduct = Readonly<{
   productType: string | null
   providerTaxonomy: CommerceDataField<CommerceProviderTaxonomy>
   lifecycleState: string | null
+  saleState: string | null
   active: boolean | null
   providerCreatedAt: string | null
   providerUpdatedAt: string | null

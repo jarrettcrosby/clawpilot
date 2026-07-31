@@ -45,7 +45,7 @@ import {
 } from '@/lib/operations/commerceNormalization'
 
 export const SHOPIFY_COMMERCE_NORMALIZER_VERSION =
-  'shopify-commerce-normalizer-v2' as const
+  'shopify-commerce-normalizer-v3' as const
 
 type ShopifySource = Readonly<Record<string, unknown>>
 
@@ -423,6 +423,7 @@ function normalizeProduct(
     productType: optionalCommerceText(product.productType, 512),
     providerTaxonomy,
     lifecycleState,
+    saleState: null,
     active: lifecycleState === null
       ? null
       : lifecycleState.toUpperCase() === 'ACTIVE',

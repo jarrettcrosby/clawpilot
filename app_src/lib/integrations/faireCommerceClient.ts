@@ -95,6 +95,10 @@ export type FaireListOptions = {
   limit?: number | null
 }
 
+export type FaireProductListOptions = FaireListOptions & {
+  includeDeleted?: boolean
+}
+
 export type FaireInventoryQuery =
   | {
       productVariantIds: readonly string[]
@@ -178,7 +182,7 @@ export type FaireOAuthTokenGrant = {
 
 export type FaireCommerceClient = {
   probeBrandProfile: () => Promise<FaireBrandProfile>
-  listProducts: (options?: FaireListOptions) => Promise<FaireProductsPage>
+  listProducts: (options?: FaireProductListOptions) => Promise<FaireProductsPage>
   listOrders: (options?: FaireListOptions) => Promise<FaireOrdersPage>
   getOrder: (orderId: string) => Promise<FaireOrder>
   listInventory: (query: FaireInventoryQuery) => Promise<FaireInventoryResponse>
@@ -431,6 +435,23 @@ function listQuery(options: FaireListOptions = {}) {
     'FAIRE_UPDATED_AT_MIN_INVALID',
   )
   if (updatedAtMin) query.set('updated_at_min', updatedAtMin)
+  return query
+}
+
+function productListQuery(options: FaireProductListOptions = {}) {
+  const query = listQuery(options)
+  if (
+    options.includeDeleted !== undefined
+    && typeof options.includeDeleted !== 'boolean'
+  ) {
+    invalidInput(
+      'Faire include-deleted selection must be true or false',
+      'FAIRE_INCLUDE_DELETED_INVALID',
+    )
+  }
+  if (options.includeDeleted !== undefined) {
+    query.set('include_deleted', String(options.includeDeleted))
+  }
   return query
 }
 
@@ -1129,9 +1150,9 @@ export function createFaireCommerceClient(
     return expectObject(await request('/brands/profile')) as FaireBrandProfile
   }
 
-  async function listProducts(options: FaireListOptions = {}) {
+  async function listProducts(options: FaireProductListOptions = {}) {
     return expectObjectCollection(
-      await request('/products', { query: listQuery(options) }),
+      await request('/products', { query: productListQuery(options) }),
       'products',
     ) as FaireProductsPage
   }
@@ -1262,7 +1283,7 @@ export function probeFaireBrandProfile(options: FaireCommerceClientOptions) {
 
 export function listFaireProducts(
   options: FaireCommerceClientOptions,
-  listOptions?: FaireListOptions,
+  listOptions?: FaireProductListOptions,
 ) {
   return createFaireCommerceClient(options).listProducts(listOptions)
 }

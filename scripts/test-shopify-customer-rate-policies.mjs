@@ -273,6 +273,21 @@ requireAll(customerSearchResponse, [
   'query: maskedSearch',
   'safeCustomerSearchError(error)',
 ], 'read-only POST customer search')
+const emptySearchGuard = customerSearchResponse.indexOf(
+  "if (!normalizedSearch)",
+)
+const providerSearchCall = customerSearchResponse.indexOf(
+  'await providerCustomerSearch({',
+)
+assert.ok(
+  emptySearchGuard >= 0 && providerSearchCall > emptySearchGuard,
+  'empty POST customer search must fail before account/provider lookup',
+)
+assert.equal(
+  customerSearchResponse.includes('queried: false'),
+  false,
+  'empty POST customer search must not return an unscoped success envelope',
+)
 requireAll(route, [
   "value === undefined || value === null || value === ''",
 ], 'optional customer-search integer parsing')

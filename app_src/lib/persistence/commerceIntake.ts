@@ -430,12 +430,16 @@ export function preserveCommerceProductCandidateEvidence(input: {
   priorSourceHash: string
   incomingSourceHash: string
   priorMappingState: 'unresolved' | 'resolved' | 'unsupported'
+  retryUnresolved: boolean
 }) {
   return (
     input.priorCredentialVersion === input.currentCredentialVersion
     && input.priorSourceRevision === input.incomingSourceRevision
     && input.priorSourceHash === input.incomingSourceHash
-    && input.priorMappingState !== 'unresolved'
+    && (
+      input.priorMappingState !== 'unresolved'
+      || !input.retryUnresolved
+    )
   )
 }
 
@@ -4411,6 +4415,10 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           priorSourceHash: prior.source_hash,
           incomingSourceHash: variant.sourceHash,
           priorMappingState: prior.mapping_state,
+          // The post-stage auto-create sweep only selects candidates from the
+          // current run. Restage unresolved evidence so an unchanged listing
+          // can be retried after a transient failure or policy activation.
+          retryUnresolved: true,
         })) {
           productCandidateByVariant.set(
             variant.identity.value,
@@ -5864,13 +5872,16 @@ export async function readCommerceIntakeStateFromPostgres(input: {
                AND latest.workflow_state IN ('held', 'resolving', 'ready')
            )::text AS unresolved,
            count(*) FILTER (
-             WHERE latest.workflow_state IN ('held', 'resolving')
+             WHERE latest.mapping_state <> 'resolved'
+               AND latest.workflow_state IN ('held', 'resolving')
            )::text AS held,
            count(*) FILTER (
-             WHERE latest.workflow_state = 'ready'
+             WHERE latest.mapping_state <> 'resolved'
+               AND latest.workflow_state = 'ready'
            )::text AS ready,
            count(*) FILTER (
-             WHERE latest.workflow_state = 'failed'
+             WHERE latest.mapping_state <> 'resolved'
+               AND latest.workflow_state = 'failed'
            )::text AS excluded
          FROM (
            SELECT DISTINCT ON (selected.external_variant_id)
@@ -6959,6 +6970,9 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
             localSkuOccupied: automaticLocalSkuOmitted,
           })
         }
+        const masterLifecycle = commerceMasterLifecycleForProviderStatus(
+          candidate.normalized_status,
+        )
         const staged = await stageCrmRecordWithClient(client, {
           entity: 'products',
           pipelineId: candidate.pipeline_id,
@@ -6982,6 +6996,8 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
               selectedOptions: candidate.normalized_options,
               sku: candidate.sku_snapshot,
               barcode: candidate.barcode_snapshot,
+              providerStatusRaw: candidate.provider_status_raw,
+              normalizedStatus: candidate.normalized_status,
               providerTaxonomy: candidate.provider_taxonomy_scheme
                 ? {
                     scheme: candidate.provider_taxonomy_scheme,
@@ -7002,6 +7018,7 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
               sku: localProductSku,
               providerSkuOmittedBecauseDuplicate:
                 automaticLocalSkuOmitted,
+              initialLifecycle: masterLifecycle,
             },
           },
           actorEmail: input.actorEmail,
@@ -7015,8 +7032,8 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
             price:
               input.resolution.unitPriceMinor / (10 ** decimals),
             currency,
-            status: 'Active',
-            active: true,
+            status: masterLifecycle.status,
+            active: masterLifecycle.active,
             description:
               `${
                 input.automatic ? 'Automatically' : 'Explicitly'
@@ -7299,6 +7316,16 @@ export function automaticProductResolution(
       currency,
     },
     reason: null,
+  }
+}
+
+export function commerceMasterLifecycleForProviderStatus(
+  normalizedStatus: string,
+) {
+  const active = normalizedStatus === 'active'
+  return {
+    status: active ? 'Active' as const : 'Inactive' as const,
+    active,
   }
 }
 

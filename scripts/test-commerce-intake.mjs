@@ -807,6 +807,17 @@ for (const providerWrite of [
 }
 
 const persistenceSource = read('app_src/lib/persistence/commerceIntake.ts')
+const productChannelStateSource = read(
+  'app_src/lib/persistence/productChannelStates.ts',
+)
+includes(productChannelStateSource, [
+  'ON CONFLICT (',
+  'organization_id, integration_account_id, external_variant_id',
+  'normalized_status = EXCLUDED.normalized_status',
+  'provider_active = EXCLUDED.provider_active',
+  'product_id = COALESCE(',
+  'product_mapping_id = COALESCE(',
+], 'Provider listing lifecycle reconciliation preserves exact product identity')
 includes(persistenceSource, [
   'providerAttemptActorEmail: string | null',
   'input.providerAttemptActorEmail',
@@ -874,6 +885,7 @@ includes(persistenceSource, [
   'priorSourceHash: prior.source_hash',
   'incomingSourceHash: variant.sourceHash',
   'priorMappingState: prior.mapping_state',
+  'retryUnresolved: true',
   'prior.id,',
   'productVariantsPreserved += 1',
   'const recordsStaged = productVariantsStaged + ordersStaged',
@@ -897,6 +909,9 @@ const productCandidateReadSource = persistenceSource.slice(
 includes(productCandidateReadSource, [
   "candidate.mapping_state <> 'resolved'",
   "IN ('held', 'resolving', 'ready')",
+  "WHERE latest.mapping_state <> 'resolved'\n               AND latest.workflow_state IN ('held', 'resolving')",
+  "WHERE latest.mapping_state <> 'resolved'\n               AND latest.workflow_state = 'ready'",
+  "WHERE latest.mapping_state <> 'resolved'\n               AND latest.workflow_state = 'failed'",
   'LIMIT ${COMMERCE_INTAKE_PRODUCT_CANDIDATE_RESPONSE_LIMIT}',
   'unresolved: Number(productCandidateSummary.unresolved)',
   'Number(productCandidateSummary.unresolved)',
@@ -1174,7 +1189,19 @@ includes(productCandidateResolverSource, [
   'providerSkuOmittedBecauseDuplicate:',
   'channelSku: candidate.sku_snapshot || product.sku',
   'automaticLocalSkuOmitted',
+  'await findStableCanonicalProductWithClient(client, {',
+  'commerceMasterLifecycleForProviderStatus(',
+  'status: masterLifecycle.status',
+  'active: masterLifecycle.active',
 ], 'Automatic exact-mapping preservation')
+assert.ok(
+  persistenceSource.indexOf(
+    'await findStableCanonicalProductWithClient(client, {',
+  ) < persistenceSource.indexOf(
+    'const staged = await stageCrmRecordWithClient(client, {',
+  ),
+  'Unique stable provider identity must be reused before creating a Product master',
+)
 const commerceProductNamingModule = loadTypeScriptModule(
   'app_src/lib/integrations/commerceProductNaming.ts',
 )
@@ -1239,6 +1266,7 @@ const longAutomaticProduct = {
   sku_snapshot: 'SKU-THAT-IS-LONGER-THAN-TWENTY-FIVE',
   currency_code: 'usd',
   price_minor: '1250',
+  normalized_status: 'active',
 }
 const boundedAutomaticResolution =
   automaticProductResolutionModule.automaticProductResolution(
@@ -1256,6 +1284,7 @@ assert.equal(
   automaticProductResolutionModule.preserveCommerceProductCandidateEvidence({
     ...unchangedProductEvidence,
     priorMappingState: 'resolved',
+    retryUnresolved: true,
   }),
   true,
   'An unchanged resolved provider variant may reuse its prior candidate evidence',
@@ -1264,6 +1293,7 @@ assert.equal(
   automaticProductResolutionModule.preserveCommerceProductCandidateEvidence({
     ...unchangedProductEvidence,
     priorMappingState: 'unsupported',
+    retryUnresolved: true,
   }),
   true,
   'An unchanged explicitly excluded provider variant must stay excluded',
@@ -1272,6 +1302,7 @@ assert.equal(
   automaticProductResolutionModule.preserveCommerceProductCandidateEvidence({
     ...unchangedProductEvidence,
     priorMappingState: 'unresolved',
+    retryUnresolved: true,
   }),
   false,
   'An unchanged unresolved provider variant must be re-staged for automatic retry',
@@ -1427,6 +1458,32 @@ assert.equal(
   }).reason,
   'product_price_invalid',
   'Automatic creation must still fail closed when exact price is absent',
+)
+const inactiveAutomaticResolution =
+  automaticProductResolutionModule.automaticProductResolution({
+    ...longAutomaticProduct,
+    normalized_status: 'unavailable',
+  })
+assert.ok(
+  inactiveAutomaticResolution.resolution,
+  'An inactive provider listing must remain eligible for a local Product identity',
+)
+assert.equal(inactiveAutomaticResolution.reason, null)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    automaticProductResolutionModule
+      .commerceMasterLifecycleForProviderStatus('unavailable'),
+  )),
+  { status: 'Inactive', active: false },
+  'An inactive provider listing must create an inactive Product master',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    automaticProductResolutionModule
+      .commerceMasterLifecycleForProviderStatus('active'),
+  )),
+  { status: 'Active', active: true },
+  'An active provider listing may create an active Product master',
 )
 const crmPersistenceSource = read('app_src/lib/persistence/crm.ts')
 includes(crmPersistenceSource, [
@@ -1918,6 +1975,11 @@ const service = loadTypeScriptModule(
       '@/lib/integrations/faireCommerceClient': {
         async listFaireProducts(_options, listOptions) {
           providerReads.faireProducts += 1
+          assert.equal(
+            listOptions.includeDeleted,
+            true,
+            'Every Faire product page must include deleted listings for lifecycle reconciliation',
+          )
           return {
             products: [{
               id: listOptions.cursor

@@ -1439,6 +1439,7 @@ async function faireProductEnvelope(
   const providerPage = await listFaireProducts(options, {
     cursor: page.orderCursor,
     limit: FAIRE_PRODUCT_PAGE_SIZE,
+    includeDeleted: true,
   })
   const productNodes = faireCollection(providerPage, 'products')
   const nextProductCursor = nextFaireCursor(

@@ -141,7 +141,13 @@ assert.match(
 )
 assert.match(
   faireClient,
-  /request\('\/products', \{ query: listQuery\(options\) \}\)/,
+  /request\('\/products', \{ query: productListQuery\(options\) \}\)/,
+  'Faire catalog intake must use the product-only lifecycle query',
+)
+assert.match(
+  faireClient,
+  /query\.set\('include_deleted', String\(options\.includeDeleted\)\)/,
+  'Faire product reads must support explicit deleted-listing reconciliation',
 )
 assert.doesNotMatch(
   faireClient,

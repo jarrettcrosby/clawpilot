@@ -244,6 +244,7 @@ const faireSource = {
       name: 'Snack Bars',
     },
     lifecycle_state: 'PUBLISHED',
+    sale_state: 'FOR_SALE',
     active: true,
     currency: 'USD',
     created_at: '2026-07-01T10:00:00Z',
@@ -421,6 +422,10 @@ const fairePageWrapped = faire.normalizeFaireCommerce({
 
 assert.equal(shopifyNormalized.rejections.length, 0)
 assert.equal(faireNormalized.rejections.length, 0)
+assert.equal(shopifyNormalized.products[0].saleState, null)
+assert.equal(faireNormalized.products[0].lifecycleState, 'PUBLISHED')
+assert.equal(faireNormalized.products[0].saleState, 'FOR_SALE')
+assert.equal(faireNormalized.products[0].active, true)
 for (const lifecycle of ['DRAFT', 'ARCHIVED', 'UNLISTED']) {
   const source = clone(shopifySource)
   source.products.nodes[0].status = lifecycle
@@ -443,6 +448,45 @@ for (const lifecycle of ['DRAFT', 'ARCHIVED', 'UNAVAILABLE']) {
   assert.equal(normalized.products.length, 1)
   assert.equal(normalized.products[0].lifecycleState, lifecycle)
   assert.equal(normalized.products[0].active, false)
+}
+for (const productState of [{
+  lifecycleState: 'PUBLISHED',
+  saleState: 'SALES_PAUSED',
+  deleted: false,
+}, {
+  lifecycleState: 'UNPUBLISHED',
+  saleState: 'FOR_SALE',
+  deleted: false,
+}, {
+  lifecycleState: 'DELETED',
+  saleState: 'FOR_SALE',
+  deleted: true,
+}, {
+  lifecycleState: null,
+  saleState: 'SALES_PAUSED',
+  deleted: false,
+}]) {
+  const source = clone(faireSource)
+  source.products[0].lifecycle_state = productState.lifecycleState
+  source.products[0].sale_state = productState.saleState
+  source.products[0].deleted = productState.deleted
+  source.products[0].active = true
+  const normalized = faire.normalizeFaireCommerce(source, {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+  })
+  assert.equal(normalized.products.length, 1)
+  assert.equal(
+    normalized.products[0].lifecycleState,
+    productState.lifecycleState,
+    'Faire lifecycle_state must not be replaced by sale_state',
+  )
+  assert.equal(normalized.products[0].saleState, productState.saleState)
+  assert.equal(
+    normalized.products[0].active,
+    false,
+    'Deleted, unpublished, or sales-paused Faire products must be inactive',
+  )
 }
 for (const normalized of [shopifyNormalized, faireNormalized]) {
   assert.deepEqual(headerMoneyProjection(normalized.orders[0]), {
@@ -597,7 +641,7 @@ assert.deepEqual(
 )
 assert.equal(
   faireExternalOrderV2Normalized.normalizerVersion,
-  'faire-commerce-normalizer-v4',
+  'faire-commerce-normalizer-v5',
 )
 assert.deepEqual(
   headerMoneyProjection(faireExternalOrderV2NormalizedOrder),

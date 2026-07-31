@@ -46,7 +46,7 @@ import {
 } from '@/lib/operations/commerceNormalization'
 
 export const FAIRE_COMMERCE_NORMALIZER_VERSION =
-  'faire-commerce-normalizer-v4' as const
+  'faire-commerce-normalizer-v5' as const
 
 type FaireSource = Readonly<Record<string, unknown>>
 
@@ -762,9 +762,10 @@ function normalizeProduct(
     preferredPriceCurrency,
   ))
   const lifecycleState = optionalCommerceText(
-    product.lifecycle_state ?? product.sale_state ?? product.state,
+    product.lifecycle_state ?? product.state,
     64,
   )
+  const saleState = optionalCommerceText(product.sale_state, 64)
   const taxonomyType = asCommerceRecord(product.taxonomy_type)
   const taxonomyId = optionalCommerceText(taxonomyType?.id, 512)
   const taxonomyName = optionalCommerceText(taxonomyType?.name, 512)
@@ -779,13 +780,26 @@ function normalizeProduct(
         ),
       }) satisfies CommerceProviderTaxonomy)
     : unavailableCommerceField<CommerceProviderTaxonomy>('not_provided')
-  const active = typeof product.active === 'boolean'
-    ? product.active
-    : typeof product.deleted === 'boolean'
-      ? !product.deleted
-      : lifecycleState === null
-        ? null
-        : ['ACTIVE', 'PUBLISHED'].includes(lifecycleState.toUpperCase())
+  const normalizedLifecycle = lifecycleState?.toUpperCase() ?? null
+  const normalizedSaleState = saleState?.toUpperCase() ?? null
+  const inactiveLifecycle = normalizedLifecycle !== null && [
+    'DELETED',
+    'DRAFT',
+    'UNPUBLISHED',
+  ].includes(normalizedLifecycle)
+  const active = product.deleted === true
+    || inactiveLifecycle
+    || normalizedSaleState === 'SALES_PAUSED'
+    || product.active === false
+    ? false
+    : product.active === true
+      || normalizedLifecycle === 'PUBLISHED'
+      || (
+        normalizedLifecycle === null
+        && normalizedSaleState === 'FOR_SALE'
+      )
+      ? true
+      : null
   return Object.freeze({
     schemaVersion: COMMERCE_NORMALIZED_PRODUCT_VERSION,
     identity,
@@ -816,6 +830,7 @@ function normalizeProduct(
     ),
     providerTaxonomy,
     lifecycleState,
+    saleState,
     active,
     providerCreatedAt: optionalCommerceTimestamp(product.created_at),
     providerUpdatedAt: optionalCommerceTimestamp(product.updated_at),

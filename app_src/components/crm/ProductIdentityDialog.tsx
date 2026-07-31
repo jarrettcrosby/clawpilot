@@ -87,6 +87,9 @@ function blockerLabel(code: string) {
   if (code === 'conflicting_barcodes') {
     return 'The matching SKU points to conflicting current barcodes. Review the channel variants instead of combining these products.'
   }
+  if (code === 'ambiguous_exact_identifier') {
+    return 'This identifier belongs to more than one Shopify or Faire Product. Resolve the variant identities before combining products.'
+  }
   return code.replaceAll('_', ' ')
 }
 

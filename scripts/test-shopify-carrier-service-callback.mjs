@@ -281,6 +281,31 @@ assert.ok(
   ),
   'a denied Shadow test request must return authenticated HTTP 200 empty rates',
 )
+const shadowGuardFunction = callback.slice(
+  callback.indexOf('async function shadowCheckoutRequestGuard('),
+  callback.indexOf('function checkoutExecutionFenceHash('),
+)
+for (const required of [
+  "account.activationState !== 'shadow'",
+  'const customerId = request.customer?.id',
+  '!customerId',
+  '!variantIds',
+  'shippableItems.some((item) => !variantIds.has(item.variantId))',
+  'shopifyCustomerGid: customerId',
+  "customerPolicy.mode !== 'hide_all'",
+]) {
+  assert.ok(
+    shadowGuardFunction.includes(required),
+    `Shadow callback targeting is missing fail-closed contract: ${required}`,
+  )
+}
+assert.ok(
+  shadowGuardFunction.indexOf('!customerId')
+    < shadowGuardFunction.indexOf(
+      'readActiveShopifyCustomerRatePolicyFromPostgres({',
+    ),
+  'guest or customer-omitted Shadow callbacks must fail closed before policy lookup',
+)
 assert.ok(
   callback.indexOf('readShopifyCheckoutContextFromPostgres({')
     < callback.indexOf(
