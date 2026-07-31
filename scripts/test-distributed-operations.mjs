@@ -2711,6 +2711,10 @@ async function verifyPostgresAcceptance(databaseUrl) {
       },
     })
     const currency = loadTypeScriptModule('app_src/lib/currency.ts')
+    const canonicalFulfillmentPlanning = loadTypeScriptModule(
+      'app_src/lib/operations/canonicalFulfillmentPlanning.ts',
+      { mocks: { '../currency.ts': currency } },
+    )
     const shopifyCheckoutPlanRatePolicy = loadTypeScriptModule(
       'app_src/lib/operations/shopifyCheckoutPlanRatePolicy.ts',
       { mocks: { '../currency.ts': currency } },
@@ -2736,6 +2740,8 @@ async function verifyPostgresAcceptance(databaseUrl) {
         '@/lib/auditWriter': auditWriter,
         '@/lib/crm/stableId': stableId,
         '@/lib/operations/adapters': adapters,
+        '@/lib/operations/canonicalFulfillmentPlanning':
+          canonicalFulfillmentPlanning,
         '@/lib/operations/domain': domain,
         '@/lib/operations/packingSlip': packingSlip,
         '@/lib/persistence/crm': {
