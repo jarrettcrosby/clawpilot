@@ -28,10 +28,14 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: app_src/package-lock.json
+          cache-dependency-path: |
+            app_src/package-lock.json
+            shopify/package-lock.json
 
       - name: Install
-        run: npm --prefix app_src ci
+        run: |
+          npm --prefix app_src ci
+          npm --prefix shopify ci
 
       - name: Install Playwright Chromium
         run: npm --prefix app_src exec -- playwright install --with-deps chromium
