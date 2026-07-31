@@ -341,14 +341,31 @@ async function addPackagingClaim(pool, fixture, orderGlobalId) {
        organization_id, code, name, material_type,
        inner_length_mm, inner_width_mm, inner_height_mm,
        tare_weight_grams, max_weight_grams, unit_cost_minor,
-       currency, status, source, created_by, updated_by
+       currency, status, source,
+       dimension_basis, dimension_evidence_type,
+       dimension_evidence_reference, dimension_confirmed_at,
+       dimension_confirmed_by,
+       rated_outer_length_mm, rated_outer_width_mm,
+       rated_outer_height_mm, rated_outer_dimension_evidence_type,
+       rated_outer_dimension_evidence_reference,
+       rated_outer_dimension_confirmed_at,
+       rated_outer_dimension_confirmed_by,
+       created_by, updated_by
      ) VALUES (
        $1::uuid, $2, 'Shipment claim carton', 'carton',
        305, 229, 152, 120, 5000, 55,
-       'USD', 'active', 'manual', $3, $3
+       'USD', 'active', 'manual',
+       'inner', 'measured', $3, now(), $4,
+       305, 229, 152, 'measured', $3, now(), $4,
+       $4, $4
      )
      RETURNING id::text, global_id`,
-    [fixture.organizationId, code, fixture.email],
+    [
+      fixture.organizationId,
+      code,
+      `shipment-completion-measurement-${code.toLowerCase()}`,
+      fixture.email,
+    ],
   )
   const stock = await pool.query(
     `INSERT INTO operations_packaging_material_stock (
