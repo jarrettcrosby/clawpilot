@@ -190,6 +190,7 @@ async function storedRuntimeCredential(input: {
   integrationAccountId: string
   integrationGlobalId: string
   credentialVersion: number
+  credentialFingerprint: string
   status: 'active' | 'disabled' | 'error'
   verified: boolean
   configuration: Record<string, unknown>
@@ -216,6 +217,7 @@ async function storedRuntimeCredential(input: {
     integrationAccountId: stored.integrationAccountId,
     integrationGlobalId: stored.globalId,
     credentialVersion: stored.credentialVersion,
+    credentialFingerprint: stored.credentialFingerprint,
     configuration: stored.configuration,
     provider,
     environment,
@@ -291,7 +293,7 @@ export async function revealCarrierCredential(input: {
 
 function requiresConfiguredCapability(
   runtime: Pick<Awaited<ReturnType<typeof storedRuntimeCredential>>, 'configuration'>,
-  capability: 'sandbox_rate' | 'sandbox_label',
+  capability: 'sandbox_rate' | 'sandbox_label' | 'production_rate',
 ) {
   const configured = runtime.configuration.allowedCapabilities
   if (isSourceManagedCarrierConfiguration(runtime.configuration)) {
@@ -309,12 +311,21 @@ function requiresConfiguredCapability(
     }
     return
   }
-  if (!Array.isArray(configured)) return
+  if (!Array.isArray(configured)) {
+    if (capability !== 'production_rate') return
+    throw new CarrierIntegrationRequestError(
+      'This carrier connection is not authorized for production rating',
+      403,
+      'CARRIER_CAPABILITY_NOT_AUTHORIZED',
+    )
+  }
   if (!configured.includes(capability)) {
     throw new CarrierIntegrationRequestError(
       capability === 'sandbox_rate'
         ? 'This carrier connection is not authorized for sandbox rating'
-        : 'This carrier connection is authorized for sandbox rating only',
+        : capability === 'production_rate'
+          ? 'This carrier connection is not authorized for production rating'
+          : 'This carrier connection is authorized for sandbox rating only',
       403,
       'CARRIER_CAPABILITY_NOT_AUTHORIZED',
     )
@@ -588,6 +599,122 @@ export type CarrierSandboxShippingRuntime = {
   accountNumberFingerprint: string
   billingRelationship: SandboxBillingSelection['relationship']
   billingSelectionSnapshot: Record<string, unknown>
+}
+
+export type CarrierProductionRatingRuntime = {
+  organizationId: string
+  integrationAccountId: string
+  integrationGlobalId: string
+  credentialVersion: number
+  credentialFingerprint: string
+  provider: 'ups_rest' | 'fedex_rest'
+  environment: 'production'
+  credential: CarrierRuntimeCredential['credential'] & { accountNumber: string }
+  carrierAccountId: string
+  carrierAccountGlobalId: string
+  carrierAccountDisplayName: string
+  senderName: string
+  registeredAddress: CarrierRuntimeAccountRecord['registeredAddress']
+  registeredAddressFingerprint: string
+  accountNumberLastFour: string
+  accountNumberFingerprint: string
+  billingRelationship: 'sender'
+}
+
+/**
+ * Resolve one exact, active, verified production rating binding. This only
+ * releases credentials to the server-side read-only rerate executor; callers
+ * still must persist and validate a production rerate attempt before I/O.
+ */
+export async function resolveCarrierProductionRatingRuntime(input: {
+  organizationId: unknown
+  provider: unknown
+  integrationAccountGlobalId: unknown
+  carrierAccountGlobalId: unknown
+}): Promise<CarrierProductionRatingRuntime> {
+  try {
+    const organizationId = normalizeCarrierOrganizationId(input.organizationId)
+    const provider = normalizeDirectCarrierProvider(input.provider)
+    if (provider !== 'ups_rest' && provider !== 'fedex_rest') {
+      throw new CarrierIntegrationRequestError(
+        'Production whole-shipment rating is not available for this carrier',
+        409,
+        'CARRIER_PRODUCTION_RATE_UNSUPPORTED',
+      )
+    }
+    const integrationAccountGlobalId = String(
+      input.integrationAccountGlobalId || '',
+    ).trim()
+    const carrierAccountGlobalId = normalizeCarrierAccountGlobalId(
+      input.carrierAccountGlobalId,
+    )
+    const runtime = await storedRuntimeCredential({
+      organizationId,
+      provider,
+      environment: 'production',
+    })
+    if (
+      runtime.integrationGlobalId !== integrationAccountGlobalId
+      || runtime.status !== 'active'
+      || !runtime.verified
+    ) {
+      throw new CarrierIntegrationRequestError(
+        'The selected production carrier credential is not active and verified',
+        409,
+        'CARRIER_CREDENTIAL_INACTIVE',
+      )
+    }
+    requiresConfiguredCapability(runtime, 'production_rate')
+    const accounts = await readActiveCarrierAccountsFromPostgres({
+      organizationId,
+      integrationAccountId: runtime.integrationAccountId,
+    })
+    const account = accounts.find(
+      (candidate) => candidate.globalId === carrierAccountGlobalId,
+    )
+    if (!account) {
+      throw new CarrierIntegrationRequestError(
+        'The selected production carrier account is not active',
+        409,
+        'CARRIER_ACCOUNT_REQUIRED',
+      )
+    }
+    if (!account.allowSenderBilling) {
+      throw new CarrierIntegrationRequestError(
+        'Production whole-shipment rating currently requires sender billing',
+        409,
+        'CARRIER_ACCOUNT_BILLING_NOT_ALLOWED',
+      )
+    }
+    const accountNumber = decryptCarrierAccountNumber(
+      account.encrypted,
+      organizationId,
+      provider,
+      'production',
+      account.globalId,
+    )
+    return {
+      organizationId,
+      integrationAccountId: runtime.integrationAccountId,
+      integrationGlobalId: runtime.integrationGlobalId,
+      credentialVersion: runtime.credentialVersion,
+      credentialFingerprint: runtime.credentialFingerprint,
+      provider,
+      environment: 'production',
+      credential: { ...runtime.credential, accountNumber },
+      carrierAccountId: account.id,
+      carrierAccountGlobalId: account.globalId,
+      carrierAccountDisplayName: account.displayName,
+      senderName: account.senderName,
+      registeredAddress: account.registeredAddress,
+      registeredAddressFingerprint: account.registeredAddressFingerprint,
+      accountNumberLastFour: account.accountNumberLastFour,
+      accountNumberFingerprint: account.accountNumberFingerprint,
+      billingRelationship: 'sender',
+    }
+  } catch (error) {
+    throw sanitize(error)
+  }
 }
 
 const SANDBOX_SENDER_ADDRESS = normalizeCarrierAccountAddress({

@@ -1175,6 +1175,28 @@ async function verifyRouteBehavior() {
       this.status = status
     }
   }
+  class CarrierIntegrationRequestError extends Error {
+    constructor(message, status = 409, code = 'CARRIER_REQUEST_INVALID') {
+      super(message)
+      this.status = status
+      this.code = code
+    }
+  }
+  class ProductionFulfillmentReratePersistenceError extends Error {
+    constructor(code, message, status = 409) {
+      super(message)
+      this.code = code
+      this.status = status
+    }
+  }
+  class ProductionFulfillmentRerateExecutionError extends Error {
+    constructor(code, message, status = 409, attemptGlobalId = null) {
+      super(message)
+      this.code = code
+      this.status = status
+      this.attemptGlobalId = attemptGlobalId
+    }
+  }
   const calls = {
     reads: [],
     proofs: [],
@@ -1188,7 +1210,9 @@ async function verifyRouteBehavior() {
     activePreparations: [],
     activeAuthorizations: [],
     activeTransitions: [],
+    productionRerates: [],
   }
+  let productionRerateError = null
   const route = loadTypeScriptModule('app_src/app/api/operations/route.ts', {
     mocks: {
       'next/server': {
@@ -1209,6 +1233,24 @@ async function verifyRouteBehavior() {
         },
       },
       '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+      '@/lib/integrations/carrierIntegrations': {
+        CarrierIntegrationRequestError,
+      },
+      '@/lib/operations/productionFulfillmentRerateExecution': {
+        ProductionFulfillmentRerateExecutionError,
+        executeProductionFulfillmentRerate: async (input) => {
+          calls.productionRerates.push(input)
+          if (productionRerateError) throw productionRerateError
+          return {
+            run: { globalId: 'gafr1234567', packageCount: 2 },
+            attempt: { globalId: 'gara1234567', replayed: false },
+            result: { globalId: 'garr1234567', state: 'succeeded' },
+          }
+        },
+      },
+      '@/lib/operations/productionFulfillmentRerates': {
+        ProductionFulfillmentReratePersistenceError,
+      },
       '@/lib/persistence/commerceActiveTransitionAuthorization': {
         CommerceActiveTransitionPersistenceError,
         prepareCommerceActiveTransitionInPostgres: async (input) => {
@@ -1639,6 +1681,168 @@ async function verifyRouteBehavior() {
     reason: 'Packer verified the carton',
     idempotencyKey: 'pack-route-proof-1',
   })
+
+  const productionRerateCommand = {
+    action: 'execute-production-rerate',
+    activeExecutionGlobalId: 'gaex1234567',
+    activeShipmentGroupGlobalId: 'gash1234567',
+    expectedActivationRevision: 7,
+    destination: {
+      contactName: 'Test Customer',
+      companyName: null,
+      phone: '2035550100',
+      email: 'customer@example.test',
+      line1: '1 Test Street',
+      line2: null,
+      line3: null,
+      city: 'Hartford',
+      region: 'ct',
+      postalCode: '06103',
+      countryCode: 'us',
+      residential: true,
+    },
+    currency: 'usd',
+    provider: 'fedex_rest',
+    integrationAccountGlobalId: 'gia1234567',
+    carrierAccountGlobalId: 'gac1234567',
+    origin: {
+      contactName: 'AG Alchemy Warehouse',
+      companyName: 'AG Alchemy, LLC',
+      phone: '4025550100',
+      email: 'warehouse@example.test',
+      line1: '7009 S 108th Street',
+      line2: null,
+      line3: null,
+      city: 'La Vista',
+      region: 'ne',
+      postalCode: '68128',
+      countryCode: 'us',
+      residential: false,
+    },
+    fedexPickupType: 'USE_SCHEDULED_PICKUP',
+  }
+  const deniedProductionRerate = await route.POST(request(
+    'http://localhost/api/operations',
+    {
+      actor: {
+        ...actor,
+        capabilities: {
+          canView: true,
+          canManage: true,
+          canExecute: false,
+          canActivate: false,
+        },
+      },
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'production-rerate-denied-1',
+      },
+      body: JSON.stringify(productionRerateCommand),
+    },
+  ))
+  assert.equal(deniedProductionRerate.status, 403)
+  assert.equal(
+    (await payload(deniedProductionRerate)).code,
+    'OPERATIONS_EXECUTE_REQUIRED',
+  )
+  assert.equal(calls.productionRerates.length, 0)
+
+  const invalidProductionRerate = await route.POST(request(
+    'http://localhost/api/operations',
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'production-rerate-invalid-1',
+      },
+      body: JSON.stringify({
+        ...productionRerateCommand,
+        provider: 'usps',
+      }),
+    },
+  ))
+  assert.equal(invalidProductionRerate.status, 400)
+  assert.equal(
+    (await payload(invalidProductionRerate)).code,
+    'OPERATIONS_REQUEST_INVALID',
+  )
+  assert.equal(calls.productionRerates.length, 0)
+
+  const productionRerateWithoutKey = await route.POST(request(
+    'http://localhost/api/operations',
+    {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(productionRerateCommand),
+    },
+  ))
+  assert.equal(productionRerateWithoutKey.status, 400)
+  assert.equal(
+    (await payload(productionRerateWithoutKey)).code,
+    'OPERATIONS_IDEMPOTENCY_KEY_INVALID',
+  )
+  assert.equal(calls.productionRerates.length, 0)
+
+  const validProductionRerate = await route.POST(request(
+    'http://localhost/api/operations',
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'production-rerate-route-1',
+      },
+      body: JSON.stringify(productionRerateCommand),
+    },
+  ))
+  assert.equal(validProductionRerate.status, 201)
+  assert.equal((await payload(validProductionRerate)).result.result.state, 'succeeded')
+  assert.equal(calls.productionRerates.length, 1)
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.productionRerates[0])), {
+    organizationId: actor.organizationId,
+    activeExecutionGlobalId: 'gaex1234567',
+    activeShipmentGroupGlobalId: 'gash1234567',
+    expectedActivationRevision: 7,
+    destination: {
+      ...productionRerateCommand.destination,
+      region: 'CT',
+      countryCode: 'US',
+    },
+    currency: 'USD',
+    provider: 'fedex_rest',
+    integrationAccountGlobalId: 'gia1234567',
+    carrierAccountGlobalId: 'gac1234567',
+    origin: {
+      ...productionRerateCommand.origin,
+      region: 'NE',
+      countryCode: 'US',
+    },
+    fedexPickupType: 'USE_SCHEDULED_PICKUP',
+    idempotencyKey: 'production-rerate-route-1',
+    actorEmail: actor.email,
+  })
+
+  productionRerateError = new ProductionFulfillmentRerateExecutionError(
+    'CARRIER_PRODUCTION_RATE_TIMEOUT',
+    'The carrier request timed out',
+    504,
+    'gara7654321',
+  )
+  const failedProductionRerate = await route.POST(request(
+    'http://localhost/api/operations',
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'production-rerate-route-2',
+      },
+      body: JSON.stringify(productionRerateCommand),
+    },
+  ))
+  assert.equal(failedProductionRerate.status, 504)
+  assert.deepEqual(await payload(failedProductionRerate), {
+    ok: false,
+    error: 'The carrier request timed out',
+    code: 'CARRIER_PRODUCTION_RATE_TIMEOUT',
+    attemptGlobalId: 'gara7654321',
+  })
+  assert.equal(calls.productionRerates.length, 2)
+  productionRerateError = null
 
   const deniedLabelCreate = await route.POST(request('http://localhost/api/operations', {
     actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: false, canActivate: false } },

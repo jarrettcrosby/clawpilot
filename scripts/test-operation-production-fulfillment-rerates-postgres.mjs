@@ -2,13 +2,18 @@
 
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { resolve } from 'node:path'
+import vm from 'node:vm'
 
+const nodeRequire = createRequire(import.meta.url)
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
 )
 const { Pool } = requireFromApp('pg')
+const ts = requireFromApp('typescript')
 const root = process.cwd()
 const HASH = Object.freeze({
   account: 'a'.repeat(64),
@@ -32,6 +37,7 @@ const destination = Object.freeze({
   region: 'CT',
   postalCode: '06103',
   countryCode: 'US',
+  residential: true,
 })
 const registeredOrigin = Object.freeze({
   line1: '7009 S 108th Street',
@@ -43,7 +49,10 @@ const registeredOrigin = Object.freeze({
 const origin = Object.freeze({
   ...registeredOrigin,
   name: 'AG Alchemy, LLC',
+  contactName: 'AG Alchemy Warehouse',
+  companyName: 'AG Alchemy, LLC',
   phone: '4025550100',
+  residential: false,
 })
 const billing = Object.freeze({
   relationship: 'sender',
@@ -51,6 +60,98 @@ const billing = Object.freeze({
   payerCountryCode: 'US',
   payerPostalCode: '68128',
 })
+
+function read(path) {
+  return readFileSync(resolve(root, path), 'utf8')
+}
+
+function loadTypeScriptModule(path, mocks = {}) {
+  const output = ts.transpileModule(read(path), {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+    fileName: path,
+  }).outputText
+  const module = { exports: {} }
+  vm.runInNewContext(output, {
+    BigInt,
+    Buffer,
+    Date,
+    Error,
+    JSON,
+    Map,
+    Math,
+    Number,
+    Object,
+    RegExp,
+    Set,
+    String,
+    console,
+    exports: module.exports,
+    module,
+    process,
+    require(specifier) {
+      if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
+        return mocks[specifier]
+      }
+      return nodeRequire(specifier)
+    },
+  }, { filename: path })
+  return module.exports
+}
+
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, child]) => [key, canonicalize(child)]),
+    )
+  }
+  return value
+}
+
+function fingerprint(kind, value) {
+  return createHash('sha256')
+    .update(JSON.stringify(canonicalize({ kind, value })), 'utf8')
+    .digest('hex')
+}
+
+const productionRerates = loadTypeScriptModule(
+  'app_src/lib/operations/productionFulfillmentRerates.ts',
+  {
+    '@/lib/integrations/carrierWholeShipmentRateFoundation': {
+      carrierWholeShipmentRateAddressFingerprints() {
+        throw new Error('Unexpected rate-address preparation in finalizer test')
+      },
+      sealPreparedCarrierWholeShipmentRateRequest() {
+        throw new Error('Unexpected rate-request preparation in finalizer test')
+      },
+    },
+    '@/lib/integrations/carrierCredentialCrypto': {
+      carrierAccountNumberFingerprint() {
+        throw new Error('Unexpected account fingerprinting in finalizer test')
+      },
+    },
+    '@/lib/operations/activeCarrierDispatchSnapshot': {
+      createActiveCarrierDispatchRerateBinding() {
+        throw new Error('Unexpected dispatch binding in finalizer test')
+      },
+    },
+    '@/lib/persistence/postgres': {
+      acquireTransactionAdvisoryLock: (client, key) => client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
+        [key],
+      ),
+      withTransaction() {
+        throw new Error('Finalizer acceptance must use the supplied transaction')
+      },
+    },
+  },
+)
 
 function command(file, args, options = {}) {
   return execFileSync(file, args, {
@@ -730,6 +831,167 @@ async function verifyAcceptance(databaseUrl) {
         idempotencyKey: 'unknown-attempt-2',
       }),
     )
+
+    const skewRun = randomUUID()
+    await insertRun(client, ids, skewRun, 'database-clock-skew-rerate')
+    await insertRunPackages(client, ids, skewRun)
+    const skewAttempt = randomUUID()
+    const skewRedactedRequest = { packageCount: 2 }
+    await insertAttempt(client, ids, {
+      runId: skewRun,
+      attemptId: skewAttempt,
+      attemptNumber: 1,
+      idempotencyKey: 'database-clock-skew-attempt-1',
+      redactedRequest: skewRedactedRequest,
+    })
+    const skewRate = Object.freeze({
+      serviceCode: '03',
+      serviceName: 'UPS Ground',
+      amount: '12.50',
+      currency: 'USD',
+      rateType: 'negotiated',
+      transitDays: 3,
+      deliveryDate: null,
+    })
+    const skewRedactedResponse = Object.freeze({
+      adapterVersion: 'carrier-whole-shipment-rate-v1',
+      accessMode: 'rate_read_only',
+      providerMutationCount: 0,
+      provider: 'ups_rest',
+      environment: 'production',
+      endpoint: 'https://onlinetools.ups.com/api/rating/v2409/Rate',
+      endpointVersion: 'v2409',
+      purpose: 'fulfillment_execution',
+      rateScope: 'multi_package_shipment',
+      expectedCurrency: 'USD',
+      packageCount: 2,
+      rateCount: 1,
+      rates: [skewRate],
+    })
+    const skewedProviderResponse = Object.freeze({
+      provider: 'ups_rest',
+      environment: 'production',
+      purpose: 'fulfillment_execution',
+      rateScope: 'multi_package_shipment',
+      expectedCurrency: 'USD',
+      packageCount: 2,
+      rates: [skewRate],
+      evidence: {
+        requestHash: HASH.request,
+        providerPayloadHash: '7'.repeat(64),
+        redactedRequest: skewRedactedRequest,
+        redactedResponse: skewRedactedResponse,
+        providerReference: 'UPS-SKEW-RATE',
+        requestedAt: '2099-01-01T00:00:00.000Z',
+        completedAt: '2099-01-01T00:00:01.000Z',
+      },
+    })
+    const skewFirstResult = (
+      await productionRerates
+        .finalizeProductionFulfillmentRerateAttemptInPostgres({
+          organizationId: ids.organization,
+          attemptGlobalId: (
+            await client.query(
+              `SELECT global_id
+               FROM operations_production_fulfillment_rerate_attempts
+               WHERE id = $1`,
+              [skewAttempt],
+            )
+          ).rows[0].global_id,
+          outcome: {
+            state: 'succeeded',
+            parsedResponse: skewedProviderResponse,
+          },
+        }, client)
+    )
+    assert.equal(skewFirstResult.state, 'succeeded')
+    assert.equal(skewFirstResult.replayed, false)
+    assert.equal(skewFirstResult.offers.length, 1)
+    assert.ok(
+      Date.parse(skewFirstResult.completedAt) < Date.parse('2099-01-01T00:00:00Z'),
+      'Provider/app clock skew must not future-date terminal evidence',
+    )
+    assert.equal(
+      Date.parse(skewFirstResult.expiresAt)
+        - Date.parse(skewFirstResult.completedAt),
+      5 * 60 * 1000,
+      'Successful offer lifetime must derive from the database terminal clock',
+    )
+
+    const agedCompletedAt = new Date(Date.now() - 10 * 60 * 1000).toISOString()
+    const agedExpiresAt = new Date(Date.now() - 5 * 60 * 1000).toISOString()
+    const normalizedRateEvidence = {
+      serviceCode: skewRate.serviceCode,
+      serviceName: skewRate.serviceName,
+      amountMinor: 1250,
+      currency: 'USD',
+      rateType: skewRate.rateType,
+      transitDays: skewRate.transitDays,
+      deliveryAt: null,
+    }
+    const agedResultHash = fingerprint(
+      'production-fulfillment-rerate-result-v1',
+      {
+        attemptId: skewAttempt,
+        requestHash: HASH.request,
+        providerPayloadHash: skewedProviderResponse.evidence.providerPayloadHash,
+        providerReference: skewedProviderResponse.evidence.providerReference,
+        completedAt: agedCompletedAt,
+        expiresAt: agedExpiresAt,
+        redactedResponse: skewRedactedResponse,
+        rates: [normalizedRateEvidence],
+      },
+    )
+    const normalizedOffer = canonicalize({
+      ...normalizedRateEvidence,
+      provider: 'ups_rest',
+    })
+    const agedOfferHash = fingerprint(
+      'production-fulfillment-rerate-offer-v1',
+      { resultHash: agedResultHash, offer: normalizedOffer },
+    )
+    await client.query('SET LOCAL session_replication_role = replica')
+    await client.query(
+      `UPDATE operations_production_fulfillment_rerate_results
+       SET result_hash = $2, completed_at = $3::timestamptz,
+           expires_at = $4::timestamptz
+       WHERE id = $1::uuid`,
+      [
+        skewFirstResult.id,
+        agedResultHash,
+        agedCompletedAt,
+        agedExpiresAt,
+      ],
+    )
+    await client.query(
+      `UPDATE operations_production_fulfillment_rerate_offers
+       SET offer_hash = $2, expires_at = $3::timestamptz
+       WHERE result_id = $1::uuid`,
+      [skewFirstResult.id, agedOfferHash, agedExpiresAt],
+    )
+    await client.query('SET LOCAL session_replication_role = origin')
+
+    const delayedReplay = await productionRerates
+      .finalizeProductionFulfillmentRerateAttemptInPostgres({
+        organizationId: ids.organization,
+        attemptGlobalId: skewFirstResult.attemptGlobalId,
+        outcome: {
+          state: 'succeeded',
+          parsedResponse: {
+            ...skewedProviderResponse,
+            evidence: {
+              ...skewedProviderResponse.evidence,
+              requestedAt: '2001-01-01T00:00:00.000Z',
+              completedAt: '2001-01-01T00:00:01.000Z',
+            },
+          },
+        },
+      }, client)
+    assert.equal(delayedReplay.replayed, true)
+    assert.equal(delayedReplay.resultHash, agedResultHash)
+    assert.equal(delayedReplay.completedAt, agedCompletedAt)
+    assert.equal(delayedReplay.expiresAt, agedExpiresAt)
+    assert.equal(delayedReplay.offers[0].offerHash, agedOfferHash)
 
     const successRun = randomUUID()
     await insertRun(client, ids, successRun, 'successful-rerate-run')

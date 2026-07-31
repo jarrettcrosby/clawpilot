@@ -227,6 +227,9 @@ for (const fragment of [
   'senderName',
   'configuration: row.configuration',
   'allowedCapabilities',
+  "allowedCapabilities: input.environment === 'production'",
+  "? ['production_rate']",
+  ": ['sandbox_rate', 'sandbox_label']",
   'credentialRevealAllowed',
   'senderOriginWarehouseGlobalId',
   'CarrierIntegrationSourceManagedError',
@@ -596,6 +599,19 @@ const encryptedAccountNumber = cryptoModule.encryptCarrierAccountNumber(
   'sandbox',
   carrierAccountGlobalId,
 )
+const productionEncrypted = cryptoModule.encryptCarrierCredential(
+  credential,
+  organizationId,
+  'ups_rest',
+  'production',
+)
+const productionEncryptedAccountNumber = cryptoModule.encryptCarrierAccountNumber(
+  credential.accountNumber,
+  organizationId,
+  'ups_rest',
+  'production',
+  carrierAccountGlobalId,
+)
 assert.ok(!encryptedAccountNumber.ciphertext.includes(Buffer.from(credential.accountNumber)))
 assert.equal(
   cryptoModule.decryptCarrierAccountNumber(
@@ -724,6 +740,9 @@ let delegatedConfiguration = {
   managedBy: 'ag-alchemy-episcs-sandbox-rating-delegation',
   senderOriginWarehouseGlobalId: 'gwh5366613',
 }
+let productionConfiguration = {
+  allowedCapabilities: ['production_rate'],
+}
 const delegatedCarrierServiceModule = loadTypeScriptModule(
   'app_src/lib/integrations/carrierIntegrations.ts',
   {
@@ -817,41 +836,54 @@ const delegatedCarrierServiceModule = loadTypeScriptModule(
       },
       '@/lib/integrations/carrierCredentialCrypto': cryptoModule,
       '@/lib/persistence/carrierIntegrations': {
-        readCarrierRuntimeCredentialFromPostgres: async () => ({
-          organizationId,
-          integrationAccountId: '33333333-3333-4333-8333-333333333333',
-          globalId: 'gia1234567',
-          provider: 'ups_rest',
-          environment: 'sandbox',
-          status: 'active',
-          verificationStatus: 'verified',
-          credentialVersion: 1,
-          configuration: delegatedConfiguration,
-          encrypted,
-        }),
-        readActiveCarrierAccountsFromPostgres: async () => [{
-          id: '44444444-4444-4444-8444-444444444444',
-          globalId: carrierAccountGlobalId,
-          integrationAccountId: '33333333-3333-4333-8333-333333333333',
-          displayName: 'UPS sandbox rating account',
-          senderName: 'Ag-Alchemy',
-          accountNumberLastFour: credential.accountNumber.slice(-4),
-          accountNumberFingerprint: 'b'.repeat(64),
-          registeredAddress: {
-            line1: '7009 S 108th St',
-            line2: null,
-            city: 'La Vista',
-            region: 'NE',
-            postalCode: '68128',
-            countryCode: 'US',
-          },
-          registeredAddressFingerprint: 'c'.repeat(64),
-          addressVerification: 'operator_attested',
-          allowSenderBilling: true,
-          allowRecipientBilling: false,
-          allowThirdPartyBilling: false,
-          encrypted: encryptedAccountNumber,
-        }],
+        readCarrierRuntimeCredentialFromPostgres: async (input) => {
+          const production = input.environment === 'production'
+          return {
+            organizationId,
+            integrationAccountId: production
+              ? '55555555-5555-4555-8555-555555555555'
+              : '33333333-3333-4333-8333-333333333333',
+            globalId: production ? 'gia7654321' : 'gia1234567',
+            provider: 'ups_rest',
+            environment: production ? 'production' : 'sandbox',
+            status: 'active',
+            verificationStatus: 'verified',
+            credentialVersion: 1,
+            credentialFingerprint: 'a'.repeat(64),
+            configuration: production ? productionConfiguration : delegatedConfiguration,
+            encrypted: production ? productionEncrypted : encrypted,
+          }
+        },
+        readActiveCarrierAccountsFromPostgres: async (input) => {
+          const production = input.integrationAccountId === '55555555-5555-4555-8555-555555555555'
+          return [{
+            id: production
+              ? '66666666-6666-4666-8666-666666666666'
+              : '44444444-4444-4444-8444-444444444444',
+            globalId: carrierAccountGlobalId,
+            integrationAccountId: input.integrationAccountId,
+            displayName: production
+              ? 'UPS production rating account'
+              : 'UPS sandbox rating account',
+            senderName: 'Ag-Alchemy',
+            accountNumberLastFour: credential.accountNumber.slice(-4),
+            accountNumberFingerprint: 'b'.repeat(64),
+            registeredAddress: {
+              line1: '7009 S 108th St',
+              line2: null,
+              city: 'La Vista',
+              region: 'NE',
+              postalCode: '68128',
+              countryCode: 'US',
+            },
+            registeredAddressFingerprint: 'c'.repeat(64),
+            addressVerification: 'operator_attested',
+            allowSenderBilling: true,
+            allowRecipientBilling: false,
+            allowThirdPartyBilling: false,
+            encrypted: production ? productionEncryptedAccountNumber : encryptedAccountNumber,
+          }]
+        },
         recordCarrierCredentialRevealInPostgres: async () => {
           delegatedRevealAuditCount += 1
         },
@@ -875,6 +907,39 @@ const delegatedCarrierServiceModule = loadTypeScriptModule(
     },
   },
 )
+
+for (const configuration of [
+  {},
+  { allowedCapabilities: 'production_rate' },
+  { allowedCapabilities: ['sandbox_rate'] },
+]) {
+  productionConfiguration = configuration
+  await assert.rejects(
+    delegatedCarrierServiceModule.resolveCarrierProductionRatingRuntime({
+      organizationId,
+      provider: 'ups_rest',
+      integrationAccountGlobalId: 'gia7654321',
+      carrierAccountGlobalId,
+    }),
+    (error) => (
+      error.code === 'CARRIER_CAPABILITY_NOT_AUTHORIZED'
+      && error.status === 403
+    ),
+    'Production rating must require an explicit production_rate capability array',
+  )
+}
+productionConfiguration = { allowedCapabilities: ['production_rate'] }
+const productionRuntime = await delegatedCarrierServiceModule.resolveCarrierProductionRatingRuntime({
+  organizationId,
+  provider: 'ups_rest',
+  integrationAccountGlobalId: 'gia7654321',
+  carrierAccountGlobalId,
+})
+assert.equal(productionRuntime.integrationGlobalId, 'gia7654321')
+assert.equal(productionRuntime.carrierAccountGlobalId, carrierAccountGlobalId)
+assert.equal(productionRuntime.environment, 'production')
+assert.equal(productionRuntime.credential.accountNumber, credential.accountNumber)
+
 await assert.rejects(
   delegatedCarrierServiceModule.revealCarrierCredential({
     organizationId,

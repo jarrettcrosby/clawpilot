@@ -41,6 +41,7 @@ type CarrierConnectionRow = {
   credential_iv: Buffer | null
   credential_tag: Buffer | null
   credential_version: number | null
+  credential_fingerprint: string | null
   client_id_last_four: string | null
   account_number_last_four: string | null
   verification_status: 'unverified' | 'verified' | 'failed' | null
@@ -124,6 +125,7 @@ export type CarrierRuntimeCredentialRecord = {
   status: 'active' | 'disabled' | 'error'
   verificationStatus: 'unverified' | 'verified' | 'failed'
   credentialVersion: number
+  credentialFingerprint: string
   configuration: Record<string, unknown>
   encrypted: EncryptedCarrierCredential
 }
@@ -246,6 +248,7 @@ const CONNECTION_SELECT = `SELECT
     credential.credential_iv,
     credential.credential_tag,
     credential.credential_version,
+    credential.credential_fingerprint,
     credential.client_id_last_four,
     credential.account_number_last_four,
     credential.verification_status,
@@ -337,6 +340,7 @@ export async function readCarrierRuntimeCredentialFromPostgres(input: {
     || !row.credential_iv
     || !row.credential_tag
     || !row.credential_version
+    || !row.credential_fingerprint
   ) return null
   return {
     organizationId: row.organization_id,
@@ -347,6 +351,7 @@ export async function readCarrierRuntimeCredentialFromPostgres(input: {
     status: row.status,
     verificationStatus: row.verification_status || 'unverified',
     credentialVersion: row.credential_version,
+    credentialFingerprint: row.credential_fingerprint,
     configuration: row.configuration,
     encrypted: {
       ciphertext: row.credential_ciphertext,
@@ -851,6 +856,13 @@ export async function writeCarrierCredentialInPostgres(input: {
   accountNumberLastFour: string | null
   actorEmail: string
 }) {
+  const configuration = {
+    authMode: 'oauth_client_credentials',
+    accountOwnerType: 'customer_owned',
+    allowedCapabilities: input.environment === 'production'
+      ? ['production_rate']
+      : ['sandbox_rate', 'sandbox_label'],
+  }
   await withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
       client,
@@ -866,7 +878,7 @@ export async function writeCarrierCredentialInPostgres(input: {
          status, configuration, created_by, updated_by
        ) VALUES (
          $1::uuid, $2, 'carrier', $3, $4, 'disabled',
-         '{"authMode":"oauth_client_credentials","accountOwnerType":"customer_owned"}'::jsonb,
+         $6::jsonb,
          $5, $5
        )
        ON CONFLICT (organization_id, integration_type, provider, environment)
@@ -876,7 +888,14 @@ export async function writeCarrierCredentialInPostgres(input: {
          updated_by = EXCLUDED.updated_by,
          updated_at = now()
        RETURNING id::text, global_id`,
-      [input.organizationId, input.provider, input.environment, input.displayName, input.actorEmail],
+      [
+        input.organizationId,
+        input.provider,
+        input.environment,
+        input.displayName,
+        input.actorEmail,
+        JSON.stringify(configuration),
+      ],
     )
     const account = accountResult.rows[0]
     const previous = await client.query<{ credential_version: number }>(

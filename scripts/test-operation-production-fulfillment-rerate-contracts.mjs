@@ -25,6 +25,21 @@ const application = readFileSync(
   ),
   'utf8',
 )
+const execution = readFileSync(
+  resolve(
+    process.cwd(),
+    'app_src/lib/operations/productionFulfillmentRerateExecution.ts',
+  ),
+  'utf8',
+)
+const operationsRoute = readFileSync(
+  resolve(process.cwd(), 'app_src/app/api/operations/route.ts'),
+  'utf8',
+)
+const carrierIntegrations = readFileSync(
+  resolve(process.cwd(), 'app_src/lib/integrations/carrierIntegrations.ts'),
+  'utf8',
+)
 
 function section(startMarker, endMarker, label) {
   const start = migration.indexOf(startMarker)
@@ -247,6 +262,9 @@ assertIncludes(application, [
   'PRODUCTION_RERATE_RESULT_TTL_MS = 5 * 60 * 1000',
   'PRODUCTION_RERATE_MAX_TTL_MS = 15 * 60 * 1000',
   "'SELECT clock_timestamp() AS server_now'",
+  'const serverTimestamp = new Date(',
+  "'Provider requested at'",
+  "'Provider completed at'",
   'clock_timestamp() AS server_now',
   'orders.currency AS current_order_currency',
   'orders.ship_to AS current_order_ship_to',
@@ -254,9 +272,25 @@ assertIncludes(application, [
 ], 'Application-layer prepared-request, package, TTL, and dispatch authority')
 assert.doesNotMatch(
   application,
-  /\batInput\b|input\.outcome\.expiresAt|input\.outcome\.resultHash/u,
+  /\batInput\b|input\.outcome\.completedAt|input\.outcome\.expiresAt|input\.outcome\.resultHash/u,
   'Production authority must not accept caller-controlled clocks, TTLs, or result hashes',
 )
+const successfulResultHash = application.slice(
+  application.indexOf(
+    "resultHash = fingerprint('production-fulfillment-rerate-result-v1'",
+  ),
+  application.indexOf('normalizedOffers = normalizedRateEvidence.map'),
+)
+assert.doesNotMatch(
+  successfulResultHash,
+  /providerRequestedAt|providerCompletedAt/u,
+  'Transient adapter clocks must not become unreconstructible result identity',
+)
+assertIncludes(successfulResultHash, [
+  'providerPayloadHash',
+  'completedAt',
+  'expiresAt',
+], 'Reconstructible database-clock result identity')
 
 const transpiledApplication = ts.transpileModule(application, {
   compilerOptions: {
@@ -335,5 +369,49 @@ assert.throws(
   }]),
   /ordered contiguously/,
 )
+
+assertIncludes(execution, [
+  'prepareProductionFulfillmentRerateInPostgres({',
+  'resolveCarrierProductionRatingRuntime({',
+  'prepareProductionFulfillmentRerateAttemptInPostgres({',
+  'if (attempt.replayed)',
+  'OPERATIONS_PRODUCTION_RERATE_RECONCILIATION_REQUIRED',
+  'executeCarrierWholeShipmentRateRequest({',
+  'finalizeProductionFulfillmentRerateAttemptInPostgres({',
+  "accessMode: 'rate_read_only'",
+  'providerMutationCount: 0',
+], 'Executable read-only production rerate command')
+assert.ok(
+  execution.indexOf('prepareProductionFulfillmentRerateAttemptInPostgres({')
+    < execution.indexOf('executeCarrierWholeShipmentRateRequest({'),
+  'The durable provider attempt must be committed before carrier network I/O',
+)
+assert.ok(
+  execution.indexOf('if (attempt.replayed)')
+    < execution.indexOf('executeCarrierWholeShipmentRateRequest({'),
+  'A replayed prepared attempt must fail closed before carrier network I/O',
+)
+assert.doesNotMatch(
+  execution,
+  /Date\.now|selectProductionFulfillmentRerateOffer|create.*Label|void.*Label/iu,
+  'The rating command must not select services or mutate carrier shipments',
+)
+
+assertIncludes(carrierIntegrations, [
+  "capability: 'sandbox_rate' | 'sandbox_label' | 'production_rate'",
+  'export async function resolveCarrierProductionRatingRuntime(',
+  "environment: 'production'",
+  "requiresConfiguredCapability(runtime, 'production_rate')",
+  'runtime.integrationGlobalId !== integrationAccountGlobalId',
+  "billingRelationship: 'sender'",
+], 'Exact active production carrier runtime binding')
+
+assertIncludes(operationsRoute, [
+  "if (action === 'execute-production-rerate')",
+  '!capabilities.canManage || !capabilities.canExecute',
+  'executeProductionFulfillmentRerate({',
+  'expectedActivationRevision:',
+  'idempotencyKey: idempotencyKeyValue(req)',
+], 'Authenticated Operations production-rerate route')
 
 console.log('Production fulfillment rerate static contracts passed')

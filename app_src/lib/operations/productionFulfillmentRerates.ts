@@ -122,7 +122,6 @@ export type FailedProductionFulfillmentRerateOutcome = {
   errorCode: unknown
   providerReference?: unknown
   redactedResponse: JsonObject
-  completedAt: unknown
 }
 
 export type SucceededProductionFulfillmentRerateOutcome = {
@@ -664,7 +663,7 @@ export function carrierWholeShipmentRateParcelsFromRunPackages(
   return deepFreeze(converted)
 }
 
-function carrierRatePartyFromActiveOrigin(
+export function carrierRatePartyFromActiveOrigin(
   origin: ActiveCarrierDispatchAddressSnapshot,
 ): CarrierWholeShipmentRateParty {
   if (
@@ -692,7 +691,7 @@ function carrierRatePartyFromActiveOrigin(
   }
 }
 
-function carrierRateDestinationFromActive(
+export function carrierRateDestinationFromActive(
   destination: ActiveCarrierDispatchAddressSnapshot,
 ): CarrierWholeShipmentRateDestination {
   if (
@@ -2027,12 +2026,33 @@ export async function finalizeProductionFulfillmentRerateAttemptInPostgres(
         identity.rerate_run_id,
         false,
       )
+      const existingResult = await client.query<ResultRow>(
+        `SELECT result.id::text, result.global_id,
+                run.global_id AS rerate_run_global_id,
+                attempt.global_id AS attempt_global_id,
+                result.state, result.provider_reference, result.error_code,
+                result.result_hash, result.redacted_response,
+                result.completed_at, result.expires_at
+         FROM operations_production_fulfillment_rerate_results result
+         JOIN operations_production_fulfillment_rerate_runs run
+           ON run.organization_id = result.organization_id
+          AND run.id = result.rerate_run_id
+         JOIN operations_production_fulfillment_rerate_attempts attempt
+           ON attempt.organization_id = result.organization_id
+          AND attempt.id = result.attempt_id
+         WHERE result.organization_id = $1::uuid
+           AND result.attempt_id = $2::uuid
+         LIMIT 1
+         FOR SHARE OF result`,
+        [organizationId, attempt.id],
+      )
+      const existing = existingResult.rows[0]
       const serverClockResult = await client.query<{ server_now: Date | string }>(
         'SELECT clock_timestamp() AS server_now',
       )
-      const serverNow = Date.parse(
-        new Date(serverClockResult.rows[0].server_now).toISOString(),
-      )
+      const serverTimestamp = new Date(
+        serverClockResult.rows[0].server_now,
+      ).toISOString()
 
       let state: RerateTerminalState
       let providerReference: string | null
@@ -2062,14 +2082,28 @@ export async function finalizeProductionFulfillmentRerateAttemptInPostgres(
           200,
         )
         errorCode = null
-        completedAt = requiredInstant(response.evidence.completedAt, 'Completed at')
-        const requestedAt = requiredInstant(
-          response.evidence.requestedAt,
-          'Requested at',
+        const providerCompletedAt = requiredInstant(
+          response.evidence.completedAt,
+          'Provider completed at',
         )
-        expiresAt = new Date(
-          Date.parse(completedAt) + PRODUCTION_RERATE_RESULT_TTL_MS,
-        ).toISOString()
+        const providerRequestedAt = requiredInstant(
+          response.evidence.requestedAt,
+          'Provider requested at',
+        )
+        completedAt = existing
+          ? new Date(existing.completed_at).toISOString()
+          : serverTimestamp
+        if (existing && existing.expires_at === null) {
+          fail(
+            'OPERATIONS_PRODUCTION_RERATE_FINALIZATION_CONFLICT',
+            'Existing successful provider result is missing its immutable expiration',
+          )
+        }
+        expiresAt = existing
+          ? new Date(existing.expires_at as Date | string).toISOString()
+          : new Date(
+              Date.parse(completedAt) + PRODUCTION_RERATE_RESULT_TTL_MS,
+            ).toISOString()
         redactedResponse = assertRedactedEvidence(
           response.evidence.redactedResponse,
           'Redacted response',
@@ -2090,14 +2124,14 @@ export async function finalizeProductionFulfillmentRerateAttemptInPostgres(
           || !exactJson(response.evidence.redactedRequest, attempt.redactedRequest)
           || response.rates.length < 1
           || response.rates.length > 100
-          || Date.parse(requestedAt) < Date.parse(attempt.persistedAt)
-          || Date.parse(requestedAt) > Date.parse(completedAt)
-          || Date.parse(completedAt) < Date.parse(attempt.persistedAt)
-          || Date.parse(completedAt) > serverNow
+          || Date.parse(providerRequestedAt) > Date.parse(providerCompletedAt)
           || Date.parse(expiresAt) <= Date.parse(completedAt)
           || Date.parse(expiresAt) - Date.parse(completedAt)
             > PRODUCTION_RERATE_MAX_TTL_MS
-          || Date.parse(expiresAt) <= serverNow
+          || (
+            !existing
+            && Date.parse(expiresAt) <= Date.parse(serverTimestamp)
+          )
         ) {
           fail(
             'OPERATIONS_PRODUCTION_RERATE_RESULT_BINDING_MISMATCH',
@@ -2143,7 +2177,6 @@ export async function finalizeProductionFulfillmentRerateAttemptInPostgres(
           requestHash: attempt.requestHash,
           providerPayloadHash,
           providerReference,
-          requestedAt,
           completedAt,
           expiresAt,
           redactedResponse,
@@ -2178,17 +2211,10 @@ export async function finalizeProductionFulfillmentRerateAttemptInPostgres(
           input.outcome.redactedResponse,
           'Redacted response',
         )
-        completedAt = requiredInstant(input.outcome.completedAt, 'Completed at')
+        completedAt = existing
+          ? new Date(existing.completed_at).toISOString()
+          : serverTimestamp
         expiresAt = null
-        if (
-          Date.parse(completedAt) < Date.parse(attempt.persistedAt)
-          || Date.parse(completedAt) > serverNow
-        ) {
-          fail(
-            'OPERATIONS_PRODUCTION_RERATE_RESULT_INVALID',
-            'Terminal provider outcome must fall between its durable attempt and server time',
-          )
-        }
         resultHash = fingerprint('production-fulfillment-rerate-result-v1', {
           attemptId: attempt.id,
           requestHash: attempt.requestHash,
@@ -2200,27 +2226,6 @@ export async function finalizeProductionFulfillmentRerateAttemptInPostgres(
         })
       }
 
-      const existingResult = await client.query<ResultRow>(
-        `SELECT result.id::text, result.global_id,
-                run.global_id AS rerate_run_global_id,
-                attempt.global_id AS attempt_global_id,
-                result.state, result.provider_reference, result.error_code,
-                result.result_hash, result.redacted_response,
-                result.completed_at, result.expires_at
-         FROM operations_production_fulfillment_rerate_results result
-         JOIN operations_production_fulfillment_rerate_runs run
-           ON run.organization_id = result.organization_id
-          AND run.id = result.rerate_run_id
-         JOIN operations_production_fulfillment_rerate_attempts attempt
-           ON attempt.organization_id = result.organization_id
-          AND attempt.id = result.attempt_id
-         WHERE result.organization_id = $1::uuid
-           AND result.attempt_id = $2::uuid
-         LIMIT 1
-         FOR SHARE OF result`,
-        [organizationId, attempt.id],
-      )
-      const existing = existingResult.rows[0]
       if (existing) {
         if (
           existing.state !== state

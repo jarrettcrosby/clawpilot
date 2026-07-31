@@ -47,6 +47,15 @@ import {
   createOperationsSandboxLabelInPostgres,
   voidOperationsSandboxLabelInPostgres,
 } from '@/lib/persistence/operationShipping'
+import { CarrierIntegrationRequestError } from '@/lib/integrations/carrierIntegrations'
+import {
+  executeProductionFulfillmentRerate,
+  ProductionFulfillmentRerateExecutionError,
+} from '@/lib/operations/productionFulfillmentRerateExecution'
+import {
+  ProductionFulfillmentReratePersistenceError,
+} from '@/lib/operations/productionFulfillmentRerates'
+import type { ActiveCarrierDispatchAddressSnapshot } from '@/lib/operations/activeCarrierDispatchSnapshot'
 import { requireRequestUser } from '@/lib/requestUser'
 
 export const dynamic = 'force-dynamic'
@@ -70,6 +79,8 @@ const RECEIPT_GLOBAL_ID = /^grc\d{7}$/
 const RECEIPT_LINE_GLOBAL_ID = /^grcl\d{7}$/
 const INTEGRATION_ACCOUNT_GLOBAL_ID = /^gia\d{7}$/
 const COMMERCE_ACTIVE_PREPARATION_GLOBAL_ID = /^gcap\d{7}$/
+const ACTIVE_EXECUTION_GLOBAL_ID = /^gaex\d{7}$/
+const ACTIVE_SHIPMENT_GROUP_GLOBAL_ID = /^gash\d{7}$/
 const SHA256 = /^[a-f0-9]{64}$/
 const ORDER_STATUSES = new Set<OperationsOrderStatus>([
   'imported', 'validated', 'held', 'promised', 'reserved', 'planned',
@@ -87,6 +98,10 @@ const PROOF_FIELDS = new Set([
 ])
 const PROOF_LINE_FIELDS = new Set(['productGlobalId', 'quantity', 'openingQuantity'])
 const ADDRESS_FIELDS = new Set(['name', 'line1', 'line2', 'city', 'region', 'postalCode', 'country'])
+const CARRIER_DISPATCH_ADDRESS_FIELDS = new Set([
+  'contactName', 'companyName', 'phone', 'email', 'line1', 'line2', 'line3',
+  'city', 'region', 'postalCode', 'countryCode', 'residential',
+])
 
 function json(payload: Record<string, unknown>, status = 200) {
   return NextResponse.json(payload, {
@@ -480,6 +495,59 @@ function addressValue(value: unknown): Address {
   }
 }
 
+function carrierDispatchAddressValue(
+  value: unknown,
+  label: string,
+): ActiveCarrierDispatchAddressSnapshot {
+  const input = record(value, 'OPERATIONS_REQUEST_INVALID', label)
+  assertFields(
+    input,
+    CARRIER_DISPATCH_ADDRESS_FIELDS,
+    'OPERATIONS_REQUEST_INVALID',
+    label,
+  )
+  const countryCode = textValue(
+    input.countryCode,
+    `${label} country`,
+    2,
+  ).toUpperCase()
+  if (countryCode !== 'US') {
+    requestError(
+      'OPERATIONS_REQUEST_INVALID',
+      `${label} must use the currently supported US production carrier lane`,
+    )
+  }
+  const region = textValue(input.region, `${label} region`, 2).toUpperCase()
+  if (!/^[A-Z]{2}$/.test(region)) {
+    requestError('OPERATIONS_REQUEST_INVALID', `${label} region is invalid`)
+  }
+  if (typeof input.residential !== 'boolean') {
+    requestError(
+      'OPERATIONS_REQUEST_INVALID',
+      `${label} residential classification is required`,
+    )
+  }
+  return {
+    contactName: textValue(input.contactName, `${label} contact name`, 100),
+    companyName: textValue(
+      input.companyName,
+      `${label} company name`,
+      120,
+      false,
+    ) || null,
+    phone: textValue(input.phone, `${label} phone`, 40, false) || null,
+    email: textValue(input.email, `${label} email`, 254, false) || null,
+    line1: textValue(input.line1, `${label} line 1`, 160),
+    line2: textValue(input.line2, `${label} line 2`, 120, false) || null,
+    line3: textValue(input.line3, `${label} line 3`, 120, false) || null,
+    city: textValue(input.city, `${label} city`, 100),
+    region,
+    postalCode: textValue(input.postalCode, `${label} postal code`, 32),
+    countryCode: 'US',
+    residential: input.residential,
+  }
+}
+
 function proofLinesValue(input: Record<string, unknown>): MockOperationsProofLineInput[] {
   const hasLines = input.lines !== undefined
   const hasLegacyLine = input.productGlobalId !== undefined
@@ -575,6 +643,23 @@ function errorResponse(error: unknown) {
   }
   if (error instanceof CommerceActiveTransitionPersistenceError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
+  if (
+    error instanceof CarrierIntegrationRequestError
+    || error instanceof ProductionFulfillmentReratePersistenceError
+    || error instanceof ProductionFulfillmentRerateExecutionError
+  ) {
+    return json({
+      ok: false,
+      error: error.message,
+      code: error.code,
+      ...(
+        error instanceof ProductionFulfillmentRerateExecutionError
+        && error.attemptGlobalId
+          ? { attemptGlobalId: error.attemptGlobalId }
+          : {}
+      ),
+    }, error.status)
   }
   const code = error instanceof Error && /^OPERATIONS_[A-Z_]+$/.test(error.message)
     ? error.message
@@ -1096,6 +1181,105 @@ export async function POST(req: NextRequest) {
         { ok: true, capabilities, result },
         result.replayed ? 200 : 201,
       )
+    }
+    if (action === 'execute-production-rerate') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to execute production carrier rating',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'activeExecutionGlobalId',
+          'activeShipmentGroupGlobalId',
+          'expectedActivationRevision',
+          'destination',
+          'currency',
+          'provider',
+          'integrationAccountGlobalId',
+          'carrierAccountGlobalId',
+          'origin',
+          'fedexPickupType',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const provider = textValue(body.provider, 'Carrier provider', 20)
+      if (provider !== 'ups_rest' && provider !== 'fedex_rest') {
+        requestError(
+          'OPERATIONS_REQUEST_INVALID',
+          'Carrier provider must be UPS REST or FedEx REST',
+        )
+      }
+      const currency = textValue(body.currency, 'Currency', 3).toUpperCase()
+      if (currency !== 'USD') {
+        requestError(
+          'OPERATIONS_REQUEST_INVALID',
+          'Production carrier rerating currently requires USD',
+        )
+      }
+      const fedexPickupType = textValue(
+        body.fedexPickupType,
+        'FedEx pickup type',
+        40,
+        false,
+      )
+      if (
+        fedexPickupType
+        && ![
+          'DROPOFF_AT_FEDEX_LOCATION',
+          'CONTACT_FEDEX_TO_SCHEDULE',
+          'USE_SCHEDULED_PICKUP',
+        ].includes(fedexPickupType)
+      ) {
+        requestError('OPERATIONS_REQUEST_INVALID', 'FedEx pickup type is invalid')
+      }
+      const result = await executeProductionFulfillmentRerate({
+        organizationId: activeOperationsOrganizationId(actor),
+        activeExecutionGlobalId: globalIdValue(
+          body.activeExecutionGlobalId,
+          'Active fulfillment execution',
+          ACTIVE_EXECUTION_GLOBAL_ID,
+        ),
+        activeShipmentGroupGlobalId: globalIdValue(
+          body.activeShipmentGroupGlobalId,
+          'Active shipment group',
+          ACTIVE_SHIPMENT_GROUP_GLOBAL_ID,
+        ),
+        expectedActivationRevision: integerValue(
+          body.expectedActivationRevision,
+          'Expected activation revision',
+          1,
+          2_147_483_647,
+        ),
+        destination: carrierDispatchAddressValue(body.destination, 'Destination'),
+        currency,
+        provider,
+        integrationAccountGlobalId: globalIdValue(
+          body.integrationAccountGlobalId,
+          'Carrier integration account',
+          INTEGRATION_ACCOUNT_GLOBAL_ID,
+        ),
+        carrierAccountGlobalId: globalIdValue(
+          body.carrierAccountGlobalId,
+          'Carrier account',
+          CARRIER_ACCOUNT_GLOBAL_ID,
+        ),
+        origin: carrierDispatchAddressValue(body.origin, 'Origin'),
+        fedexPickupType: fedexPickupType
+          ? fedexPickupType as
+            | 'DROPOFF_AT_FEDEX_LOCATION'
+            | 'CONTACT_FEDEX_TO_SCHEDULE'
+            | 'USE_SCHEDULED_PICKUP'
+          : null,
+        idempotencyKey: idempotencyKeyValue(req),
+        actorEmail: actor.email,
+      })
+      return json({ ok: true, capabilities, result }, 201)
     }
     if (action === 'generate-packing-slip') {
       if (!capabilities.canManage || !capabilities.canExecute) {
