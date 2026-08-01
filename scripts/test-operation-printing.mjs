@@ -313,6 +313,14 @@ for (const fragment of [
 ]) assert.ok(jobRoute.includes(fragment), `Print-job route missing ${fragment}`)
 
 const panel = read('app_src/components/operations/PrinterConfigurationPanel.tsx')
+assert.ok(
+  panel.includes("agent.status === 'active').length"),
+  'Printing must count only active local agents in the primary Agents tab badge',
+)
+assert.ok(
+  panel.includes('retained below as audit history and cannot claim print jobs'),
+  'Printing must distinguish revoked enrollment history from usable agents',
+)
 for (const fragment of [
   "thermal: 'Thermal'",
   "nonthermal: 'Nonthermal'",

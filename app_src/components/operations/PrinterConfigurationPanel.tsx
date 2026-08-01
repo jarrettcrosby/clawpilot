@@ -458,6 +458,14 @@ export default function PrinterConfigurationPanel() {
     )) || null,
     [agents?.agents, printerForm?.localPrintAgentGlobalId],
   )
+  const activeAgentCount = useMemo(
+    () => agents?.agents.filter((agent) => agent.status === 'active').length || 0,
+    [agents?.agents],
+  )
+  const retiredAgentCount = useMemo(
+    () => agents?.agents.filter((agent) => agent.status === 'revoked').length || 0,
+    [agents?.agents],
+  )
 
   const selectedAgentCompatible = Boolean(
     printerForm
@@ -823,7 +831,7 @@ export default function PrinterConfigurationPanel() {
       >
         <Tab value="jobs" label={`Jobs${jobs ? ` (${jobs.jobs.length})` : ''}`} />
         <Tab value="printers" label={`Printers${printers ? ` (${printers.printers.length})` : ''}`} />
-        <Tab value="agents" label={`Agents${agents ? ` (${agents.agents.length})` : ''}`} />
+        <Tab value="agents" label={`Agents${agents ? ` (${activeAgentCount})` : ''}`} />
       </Tabs>
 
       {loading && !printers ? (
@@ -1029,7 +1037,14 @@ export default function PrinterConfigurationPanel() {
               <Typography fontWeight={700} sx={{ mt: 1 }}>No local print agents</Typography>
             </Box>
           ) : (
-            <Stack divider={<Divider flexItem />} sx={{ mt: 1 }}>
+            <Stack sx={{ mt: 1 }}>
+              {retiredAgentCount > 0 && (
+                <Alert severity="info" sx={{ mb: 1.5 }}>
+                  {activeAgentCount} active local print {activeAgentCount === 1 ? 'agent' : 'agents'}.
+                  {' '}{retiredAgentCount} revoked enrollment {retiredAgentCount === 1 ? 'is' : 'are'} retained below as audit history and cannot claim print jobs.
+                </Alert>
+              )}
+              <Stack divider={<Divider flexItem />}>
               {agents.agents.map((agent) => (
                 <Stack
                   key={agent.globalId}
@@ -1099,6 +1114,7 @@ export default function PrinterConfigurationPanel() {
                   )}
                 </Stack>
               ))}
+              </Stack>
             </Stack>
           )}
         </Box>
