@@ -1214,6 +1214,7 @@ export async function createOperationsSandboxLabelInPostgres(
       organizationId,
       provider,
       carrierAccountGlobalId,
+      senderBillingOnly: Boolean(sandboxE2eAuthorizationGlobalId),
     })
   } catch (error) {
     throw mapCarrierError(error)

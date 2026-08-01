@@ -234,6 +234,9 @@ assertIncludes(createCommand, [
   "'OPERATIONS_LABEL_RECONCILIATION_REQUIRED'",
   'The carrier created a label, but ClawPilot could not finalize it',
 ], 'Create-label uncertain finalization')
+assertIncludes(createCommand, [
+  'senderBillingOnly: Boolean(sandboxE2eAuthorizationGlobalId)',
+], 'Authorized package-label sender billing')
 
 const createFinalizeStart = createCommand.indexOf(
   'result = await withTransaction(async (client) => {',
