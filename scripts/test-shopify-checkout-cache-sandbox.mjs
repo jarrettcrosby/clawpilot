@@ -102,7 +102,7 @@ includes(persistence, [
 
 includes(callback, [
   "version: 'shopify-checkout-idempotency-v2'",
-  "version: 'shopify-checkout-execution-fence-v4'",
+  "version: 'shopify-checkout-execution-fence-v5'",
   "account.environment !== 'sandbox'",
   "carrier.environment === 'sandbox'",
   'policyRevision: account.policyRevision',
@@ -115,6 +115,12 @@ includes(callback, [
   'currency: material.currency',
   'credentialVersion: carrier.credentialVersion',
   'cartonizationInputHash: shopifyCheckoutRatingHash(context.input)',
+  'packLines: [...context.lines]',
+  'packMappingGlobalId: line.packMappingGlobalId',
+  'packMappingRowVersion: line.packMappingRowVersion',
+  'packEvidenceHash: line.packEvidenceHash',
+  'packProfileVersionGlobalId: line.packProfileVersionGlobalId',
+  'line.packProfileVersionRowVersion',
   'executionFenceHash,',
   'createShopifyCheckoutReceiptKeys({',
   'stableCacheKey,',

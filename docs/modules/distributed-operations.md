@@ -1644,18 +1644,45 @@ The resolution API is command-oriented. It exposes separate idempotent commands 
 Promotion is a single organization-scoped PostgreSQL transaction. It locks the candidate, revalidates the credential generation, source revision, mappings, customer, package facts, address, delivery decision, and canonical uniqueness, then creates or replays one `operations_orders` row, its `operations_order_lines`, exact external identifiers, product mappings created by the workflow, first `order.imported` domain event, audit event, and command receipt. Shopify promotion also persists the exact checkout-rate reconciliation in that transaction and returns its Global ID, receipt link, outcome, and fulfillment-eligibility fact; a ClawPilot CarrierService order with ambiguous, expired, rejected, or missing lineage cannot be released to warehouse work. A Shopify order using another shipping method is explicitly not applicable to that guard. The promoted order starts `imported` or `held`; promotion does not reserve inventory, select a facility, plan fulfillment, buy a label, create a shipment, advance a provider cursor, or export a fulfillment. Repeating the same command returns the original result. A newer provider revision after resolution returns a stale-candidate conflict and requires refresh and revalidation.
 
 For a promoted Shopify order with a `matched` checkout-rate reconciliation,
-operational cartonization treats the immutable matched receipt line snapshot as
-the authoritative pack lineage. It resolves each provider variant only through
-the receipt's exact `shopify_checkout` mapping Global ID and pack-profile
-version, proves aggregate variant quantity, product identity, current mapping
-and profile revisions, the immutable pack-evidence fingerprint, package level,
-base-each quantity, and unit weight, then exposes the matched receipt Global ID
-in line evidence. It does not use SKU inference or silently fall back to the
-order candidate's generic catalog mapping. Missing, conflicting, superseded, or
-quantity-drifted checkout pack evidence blocks operational cartonization. New
-checkout receipts also retain the mapping row version; earlier immutable
-receipts remain usable only while their exact versioned mapping Global ID is
-still the current row and every other retained physical pack fence matches.
+operational cartonization uses two distinct authorities. The matched receipt is
+the immutable **checkout baseline**: it proves the exact service reconciliation,
+provider Product and Variant identities, canonical Product, aggregate ordered
+quantity, quoted unit weight, and the pack mapping/profile identifiers and
+versions captured while the cart was rated. It is never joined back to mutable
+mapping or profile rows and never becomes today's fulfillment configuration.
+A later catalog refresh may legitimately retire checkout mapping A; ClawPilot
+retains A as historical evidence and never reactivates or rewrites it.
+
+The second cartonization pass independently resolves the exact-current
+**fulfillment authority** for the same organization, commerce account,
+pipeline, canonical Product, provider Product, and provider Variant. That row
+must have purpose `shopify_checkout`, be the current projection, match the
+current channel-state pack fingerprint, directly prove that the current
+channel row is active, provider-active, and requires shipping, and point to an
+eligible current pack profile. The planner uses this replacement
+mapping/profile B for present-day
+cartonization and rerating. A generic `catalog` mapping, candidate-captured
+mapping, SKU, barcode, or title can never substitute for B. Missing B returns
+`HYBRID_CARTONIZATION_FULFILLMENT_PACK_MAPPING_REQUIRED`; an incomplete or
+stale B returns `HYBRID_CARTONIZATION_FULFILLMENT_PACK_EVIDENCE_INVALID`; and
+conflicting current B rows fail closed. Durable rate evidence retains the
+matched receipt Global ID, immutable checkout baseline A, and the independently
+resolved current fulfillment mapping/profile B so later quote-to-fulfillment
+package and price variance can be explained without mutating either record.
+
+New checkout receipt lines use the explicit
+`shopify-checkout-line-pack-evidence-v1` snapshot version. The callback obtains
+the mapping/channel-state `packEvidenceHash` only after proving the two current
+fingerprints match, includes all physical pack identities and facts in the
+execution fence, and persists their complete normalized snapshot. The claim
+boundary rejects a missing, malformed, or unknown v1 field. Hydration and the
+operational cartonization reader recompute the immutable line hash before
+exposing or trusting the snapshot. Historical immutable rows
+are not backfilled: a missing or unknown snapshot version, mapping row version,
+or hash remains `null` and is never inferred from today's provider state. This
+additive receipt format does not weaken quote-time current mapping, profile,
+weight, inventory, or pack-evidence validation, and neither pass grants a
+provider write in Shadow.
 Receipt quantity reconciliation covers every requires-shipping source line and
 its original ordered quantity, including lines later fulfilled, cancelled, or
 refunded; cartonization demand is then limited to positive current unfulfilled

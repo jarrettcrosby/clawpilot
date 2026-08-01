@@ -106,6 +106,8 @@ mock.module('@/lib/persistence/shopifyCustomerRatePolicies', {
 
 mock.module('@/lib/persistence/shopifyCheckoutRating', {
   namedExports: {
+    SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION:
+      'shopify-checkout-line-pack-evidence-v1',
     async lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres() {
       return account
     },

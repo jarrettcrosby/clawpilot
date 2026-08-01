@@ -39,6 +39,7 @@ import {
   failShopifyCheckoutRateReceiptInPostgres,
   lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres,
   readCachedShopifyCheckoutRateReceiptInPostgres,
+  SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION,
   shopifyCheckoutPackagePlanHash,
   shopifyCheckoutRatingHash,
   type ShopifyCheckoutPackageInput,
@@ -272,7 +273,7 @@ function checkoutExecutionFenceHash(
   )
   return createHash('sha256')
     .update(JSON.stringify({
-      version: 'shopify-checkout-execution-fence-v4',
+      version: 'shopify-checkout-execution-fence-v5',
       accountEnvironment: account.environment,
       storeEntityName: normalizeShopifyStoreEntityName(
         account.storeEntityName,
@@ -285,6 +286,20 @@ function checkoutExecutionFenceHash(
       }),
       planRatePolicy,
       cartonizationInputHash: shopifyCheckoutRatingHash(context.input),
+      packLines: [...context.lines]
+        .sort((left, right) => left.lineKey.localeCompare(right.lineKey))
+        .map((line) => ({
+          lineKey: line.lineKey,
+          productGid: line.productGid,
+          variantGid: line.variantGid,
+          productGlobalId: line.productGlobalId,
+          packMappingGlobalId: line.packMappingGlobalId,
+          packMappingRowVersion: line.packMappingRowVersion,
+          packEvidenceHash: line.packEvidenceHash,
+          packProfileVersionGlobalId: line.packProfileVersionGlobalId,
+          packProfileVersionRowVersion:
+            line.packProfileVersionRowVersion,
+        })),
       materials: [...context.materials]
         .sort((left, right) => (
           left.materialGlobalId.localeCompare(right.materialGlobalId)
@@ -1280,11 +1295,14 @@ export async function executeShopifyCarrierServiceCallback(input: {
           unitWeightGrams: line.unitWeightGrams,
           requiresShipping: true,
           lineSnapshot: {
+            snapshotVersion:
+              SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION,
             productGid: line.productGid,
             variantGid: line.variantGid,
             productGlobalId: line.productGlobalId,
             packMappingGlobalId: line.packMappingGlobalId,
             packMappingRowVersion: line.packMappingRowVersion,
+            packEvidenceHash: line.packEvidenceHash,
             packProfileVersionGlobalId:
               line.packProfileVersionGlobalId,
             packProfileVersionRowVersion:

@@ -96,6 +96,11 @@ for (const required of [
   'readCachedShopifyCheckoutRateReceiptInPostgres(cacheLookup)',
   'waitForShopifyCheckoutReceiptCompletion({',
   'claimShopifyCheckoutRateReceiptInPostgres({',
+  'SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION',
+  'snapshotVersion:',
+  'packEvidenceHash: line.packEvidenceHash',
+  "version: 'shopify-checkout-execution-fence-v5'",
+  'packLines: [...context.lines]',
   'receiptGlobalId: claim.receiptGlobalId',
   'expectedConfigRowVersion: account.configRowVersion',
   'expectedActivationState: account.activationState',
@@ -148,6 +153,19 @@ for (const required of [
   assert.ok(
     callback.includes(required),
     `callback is missing required contract: ${required}`,
+  )
+}
+
+for (const required of [
+  'state.pack_evidence_hash AS state_pack_evidence_hash',
+  'mapping.pack_evidence_hash AS pack_mapping_pack_evidence_hash',
+  '!row.pack_mapping_pack_evidence_hash',
+  'row.pack_mapping_pack_evidence_hash\n        !== row.state_pack_evidence_hash',
+  'packEvidenceHash,',
+]) {
+  assert.ok(
+    context.includes(required),
+    `checkout context is missing current pack-evidence fence: ${required}`,
   )
 }
 assert.equal(
