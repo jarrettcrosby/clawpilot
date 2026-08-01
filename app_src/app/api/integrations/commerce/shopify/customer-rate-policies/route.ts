@@ -445,6 +445,9 @@ export async function POST(req: NextRequest) {
         'serviceCodes',
         'shadowLifetimeMode',
         'shadowDurationMinutes',
+        'shadowTestChargeMode',
+        'shadowTestServiceCode',
+        'shadowTestSubsidyReason',
         'expectedRowVersion',
       ])
       const result = await upsertShopifyCustomerRatePolicyInPostgres({
@@ -455,6 +458,9 @@ export async function POST(req: NextRequest) {
         serviceCodes: body.serviceCodes,
         shadowLifetimeMode: body.shadowLifetimeMode,
         shadowDurationMinutes: body.shadowDurationMinutes,
+        shadowTestChargeMode: body.shadowTestChargeMode,
+        shadowTestServiceCode: body.shadowTestServiceCode,
+        shadowTestSubsidyReason: body.shadowTestSubsidyReason,
         expectedRowVersion: body.expectedRowVersion,
         actorEmail: context.actor.email,
       })

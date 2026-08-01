@@ -38,6 +38,9 @@ requireAll(panel, [
   'availableServicesTruncated?: boolean',
   'shadowDurationMinutes',
   'shadowLifetimeMode',
+  'shadowTestChargeMode',
+  'shadowTestServiceCode',
+  'shadowTestSubsidyReason',
   'shadowPolicyLimits',
   'expiredSimulatedCount',
   'earliestShadowExpiresAt',
@@ -181,6 +184,32 @@ requireAll(panel, [
   "policy.shadowLifetimeMode === 'until_turned_off'",
   'Shadow · Until turned off',
 ], 'explicit Shadow lifetime controls')
+
+requireAll(panel, [
+  "type ShadowTestChargeMode = 'carrier_rate' | 'zero_single_service'",
+  'MIN_SHADOW_TEST_SUBSIDY_REASON_LENGTH = 3',
+  'MAX_SHADOW_TEST_SUBSIDY_REASON_LENGTH = 160',
+  'existing?.shadowTestChargeMode',
+  'existing?.shadowTestServiceCode',
+  'existing?.shadowTestSubsidyReason',
+  "shadowTestChargeMode: effectiveActivation === 'shadow'",
+  'shadowTestServiceCode: zeroChargeTestEnabled',
+  'shadowTestSubsidyReason: zeroChargeTestEnabled',
+  'Return one selected service at $0 for this test',
+  'Shadow test-only subsidy.',
+  'selected Shopify Customer GID and the allowlisted',
+  '<strong>Test Product</strong>',
+  'Shopify&apos;s successful-rate cache is not partitioned',
+  'could receive the cached $0 rate',
+  'about 15 minutes. Keep the product test-only',
+  'Exact $0 test service',
+  'Select one exact stable service retained from a successful',
+  '$0 test subsidy reason',
+  'shadowTestServicePolicyConflict',
+  'Shadow test subsidy · $0',
+  'Shadow test subsidy · Off',
+  'Turn off after the test.',
+], 'tenant-configured Shadow test subsidy controls')
 
 requireAll(panel, [
   'Search Shopify by customer name, email, or exact Customer GID.',

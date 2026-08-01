@@ -25,6 +25,8 @@ const MAX_SERVICE_CODES = 50
 const DEFAULT_SHADOW_DURATION_MINUTES = 60
 const MIN_SHADOW_DURATION_MINUTES = 15
 const MAX_SHADOW_DURATION_MINUTES = 240
+const MIN_SHADOW_TEST_SUBSIDY_REASON_LENGTH = 3
+const MAX_SHADOW_TEST_SUBSIDY_REASON_LENGTH = 160
 
 type ActivationState =
   | 'missing'
@@ -42,6 +44,8 @@ type CustomerRatePolicyMode =
 
 type ShadowLifetimeMode = 'timed' | 'until_turned_off'
 
+type ShadowTestChargeMode = 'carrier_rate' | 'zero_single_service'
+
 type CustomerRatePolicy = {
   globalId: string
   customerGid: string
@@ -54,6 +58,9 @@ type CustomerRatePolicy = {
   shadowDurationMinutes: number | null
   shadowExpiresAt: string | null
   shadowExpired: boolean
+  shadowTestChargeMode: ShadowTestChargeMode
+  shadowTestServiceCode: string | null
+  shadowTestSubsidyReason: string | null
   rowVersion: number
   createdAt: string
   updatedAt: string
@@ -260,6 +267,10 @@ export default function ShopifyCustomerRatePolicyPanel({
   const [shadowDurationInput, setShadowDurationInput] = useState(
     String(DEFAULT_SHADOW_DURATION_MINUTES),
   )
+  const [shadowTestChargeMode, setShadowTestChargeMode] =
+    useState<ShadowTestChargeMode>('carrier_rate')
+  const [shadowTestServiceCode, setShadowTestServiceCode] = useState('')
+  const [shadowTestSubsidyReason, setShadowTestSubsidyReason] = useState('')
   const [shadowPolicyLimits, setShadowPolicyLimits] = useState({
     defaultLifetimeMode: 'timed' as ShadowLifetimeMode,
     supportedLifetimeModes: [
@@ -300,6 +311,36 @@ export default function ShopifyCustomerRatePolicyPanel({
     || shadowDurationMinutes < shadowPolicyLimits.minimumDurationMinutes
     || shadowDurationMinutes > shadowPolicyLimits.maximumDurationMinutes
   )
+  const zeroChargeTestEnabled = effectiveActivation === 'shadow'
+    && shadowTestChargeMode === 'zero_single_service'
+  const normalizedShadowTestServiceCode = shadowTestServiceCode.trim()
+  const normalizedShadowTestSubsidyReason = shadowTestSubsidyReason.trim()
+  const selectedShadowTestService = availableServices.find((service) => (
+    service.shopifyServiceCode === normalizedShadowTestServiceCode
+  ))
+  const savedShadowTestServiceIsStillExact = Boolean(
+    editingPolicy?.shadowTestServiceCode
+    && editingPolicy.shadowTestServiceCode === normalizedShadowTestServiceCode,
+  )
+  const shadowTestServiceError = zeroChargeTestEnabled && (
+    !normalizedShadowTestServiceCode
+    || !SERVICE_CODE.test(normalizedShadowTestServiceCode)
+    || (!selectedShadowTestService && !savedShadowTestServiceIsStillExact)
+  )
+  const shadowTestSubsidyReasonError = zeroChargeTestEnabled && (
+    !normalizedShadowTestSubsidyReason
+    || normalizedShadowTestSubsidyReason.length
+      < MIN_SHADOW_TEST_SUBSIDY_REASON_LENGTH
+    || normalizedShadowTestSubsidyReason.length
+      > MAX_SHADOW_TEST_SUBSIDY_REASON_LENGTH
+  )
+  const shadowTestServicePolicyConflict = zeroChargeTestEnabled && (
+    mode === 'hide_all'
+    || (mode === 'include_only'
+      && !parsedServiceCodes.values.includes(normalizedShadowTestServiceCode))
+    || (mode === 'exclude'
+      && parsedServiceCodes.values.includes(normalizedShadowTestServiceCode))
+  )
   const saveDisabled = !canChangePolicies
     || Boolean(busy)
     || customerGidError
@@ -307,6 +348,9 @@ export default function ShopifyCustomerRatePolicyPanel({
     || (filteredMode && parsedServiceCodes.values.length === 0)
     || parsedServiceCodes.errors.length > 0
     || shadowDurationError
+    || shadowTestServiceError
+    || shadowTestSubsidyReasonError
+    || shadowTestServicePolicyConflict
 
   const resetEditor = useCallback((nextDefault = defaultPolicy) => {
     setCustomerGid('')
@@ -317,6 +361,9 @@ export default function ShopifyCustomerRatePolicyPanel({
     setShadowDurationInput(String(
       shadowPolicyLimits.defaultDurationMinutes,
     ))
+    setShadowTestChargeMode('carrier_rate')
+    setShadowTestServiceCode('')
+    setShadowTestSubsidyReason('')
     setEditingPolicy(null)
   }, [
     defaultPolicy,
@@ -510,6 +557,11 @@ export default function ShopifyCustomerRatePolicyPanel({
       existing?.shadowDurationMinutes
         ?? shadowPolicyLimits.defaultDurationMinutes,
     ))
+    setShadowTestChargeMode(
+      existing?.shadowTestChargeMode || 'carrier_rate',
+    )
+    setShadowTestServiceCode(existing?.shadowTestServiceCode || '')
+    setShadowTestSubsidyReason(existing?.shadowTestSubsidyReason || '')
     setNotice('')
   }
 
@@ -606,6 +658,15 @@ export default function ShopifyCustomerRatePolicyPanel({
           customerGid: exactCustomerGid,
           mode,
           serviceCodes: filteredMode ? parsedServiceCodes.values : [],
+          shadowTestChargeMode: effectiveActivation === 'shadow'
+            ? shadowTestChargeMode
+            : 'carrier_rate',
+          shadowTestServiceCode: zeroChargeTestEnabled
+            ? normalizedShadowTestServiceCode
+            : null,
+          shadowTestSubsidyReason: zeroChargeTestEnabled
+            ? normalizedShadowTestSubsidyReason
+            : null,
           ...(effectiveActivation === 'shadow'
             ? {
                 shadowLifetimeMode,
@@ -628,16 +689,20 @@ export default function ShopifyCustomerRatePolicyPanel({
         throw new Error(payload.error || 'Customer rate policy was not saved')
       }
       if (payload.enforcement) setEnforcement(payload.enforcement)
+      const shadowTestSubsidyNotice =
+        payload.policy.shadowTestChargeMode === 'zero_single_service'
+          ? ' One selected service is configured at $0 for the gated Shadow checkout test. Shopify may reuse that response for about 15 minutes, so keep the Test Product isolated and turn this subsidy off immediately after submitting the test order.'
+          : ''
       setNotice(
         payload.enforcement?.state === 'active_blocked'
           ? 'The customer policy was saved in ClawPilot. Shopify provider enforcement remains blocked and no live checkout option was changed.'
           : payload.policy.shadowLifetimeMode === 'until_turned_off'
-            ? 'The customer policy was saved as a Shadow simulation with zero Shopify writes. It remains active until an administrator turns it off.'
+            ? `The customer policy was saved as a Shadow simulation with zero Shopify writes. It remains active until an administrator turns it off.${shadowTestSubsidyNotice}`
             : `The customer policy was saved as a timed Shadow simulation with zero Shopify writes. It expires ${
               payload.policy.shadowExpiresAt
                 ? new Date(payload.policy.shadowExpiresAt).toLocaleString()
                 : 'at the configured fail-closed boundary'
-            }.`,
+            }.${shadowTestSubsidyNotice}`,
       )
       resetEditor(payload.enforcement?.defaultPolicy || defaultPolicy)
       await loadPolicies(pagination.page)
@@ -1050,6 +1115,147 @@ export default function ShopifyCustomerRatePolicyPanel({
                 purge.
               </Alert>
             ) : null}
+            {effectiveActivation === 'shadow' ? (
+              <Box
+                sx={{
+                  border: 1,
+                  borderColor: zeroChargeTestEnabled
+                    ? 'warning.main'
+                    : 'divider',
+                  borderRadius: 1,
+                  p: 1.25,
+                }}
+              >
+                <Stack spacing={1}>
+                  <FormControlLabel
+                    disabled={!canChangePolicies || Boolean(busy)}
+                    control={(
+                      <Checkbox
+                        checked={zeroChargeTestEnabled}
+                        onChange={(event) => {
+                          setShadowTestChargeMode(event.target.checked
+                            ? 'zero_single_service'
+                            : 'carrier_rate')
+                        }}
+                      />
+                    )}
+                    label="Return one selected service at $0 for this test"
+                  />
+                  <Alert severity="warning">
+                    <strong>Shadow test-only subsidy.</strong> This changes the
+                    checkout charge for exactly one stable service after the
+                    selected Shopify Customer GID and the allowlisted{' '}
+                    <strong>Test Product</strong> pass ClawPilot&apos;s Shadow
+                    gates. Shopify&apos;s successful-rate cache is not partitioned
+                    by customer, so an identical cart and destination using
+                    that Test Product could receive the cached $0 rate for
+                    about 15 minutes. Keep the product test-only, use a short
+                    proof window, and turn this option off immediately after
+                    the test order is submitted.
+                  </Alert>
+                  {zeroChargeTestEnabled ? (
+                    <>
+                      <FormControl
+                        size="small"
+                        fullWidth
+                        error={shadowTestServiceError}
+                      >
+                        <InputLabel
+                          id={`shopify-shadow-test-service-${accountGlobalId}`}
+                        >
+                          Exact $0 test service
+                        </InputLabel>
+                        <Select
+                          labelId={`shopify-shadow-test-service-${accountGlobalId}`}
+                          label="Exact $0 test service"
+                          value={shadowTestServiceCode}
+                          disabled={!canChangePolicies || Boolean(busy)}
+                          onChange={(event) => {
+                            setShadowTestServiceCode(event.target.value)
+                          }}
+                        >
+                          <MenuItem value="" disabled>
+                            Select one retained service
+                          </MenuItem>
+                          {availableServices.map((service) => (
+                            <MenuItem
+                              key={service.shopifyServiceCode}
+                              value={service.shopifyServiceCode}
+                            >
+                              {service.serviceName} ·{' '}
+                              {providerStateLabel(service.provider)} ·{' '}
+                              {service.shopifyServiceCode}
+                            </MenuItem>
+                          ))}
+                          {savedShadowTestServiceIsStillExact
+                            && !selectedShadowTestService ? (
+                              <MenuItem value={normalizedShadowTestServiceCode}>
+                                Saved exact service ·{' '}
+                                {normalizedShadowTestServiceCode}
+                              </MenuItem>
+                            ) : null}
+                        </Select>
+                        <Typography
+                          variant="caption"
+                          color={shadowTestServiceError
+                            ? 'error.main'
+                            : 'text.secondary'}
+                          sx={{ mt: 0.5, mx: 1.75 }}
+                        >
+                          {shadowTestServiceError
+                            ? 'Select one exact stable service retained from a successful whole-shipment quote.'
+                            : 'Only this exact service code is returned with a $0 checkout charge; all other eligible services retain their carrier-derived amount.'}
+                        </Typography>
+                      </FormControl>
+                      {!availableServices.length ? (
+                        <Alert severity="info">
+                          No stable service is available yet. Run and retain a
+                          successful whole-shipment quote before enabling the
+                          $0 test charge.
+                        </Alert>
+                      ) : null}
+                      <TextField
+                        size="small"
+                        fullWidth
+                        multiline
+                        minRows={2}
+                        label="$0 test subsidy reason"
+                        value={shadowTestSubsidyReason}
+                        disabled={!canChangePolicies || Boolean(busy)}
+                        error={shadowTestSubsidyReasonError}
+                        inputProps={{
+                          maxLength: MAX_SHADOW_TEST_SUBSIDY_REASON_LENGTH,
+                        }}
+                        helperText={shadowTestSubsidyReasonError
+                          ? `Enter a reason from ${
+                            MIN_SHADOW_TEST_SUBSIDY_REASON_LENGTH
+                          } to ${
+                            MAX_SHADOW_TEST_SUBSIDY_REASON_LENGTH
+                          } characters.`
+                          : `${shadowTestSubsidyReason.length}/${
+                            MAX_SHADOW_TEST_SUBSIDY_REASON_LENGTH
+                          } characters. This reason is retained with the tenant policy for the checkout-test audit trail.`}
+                        onChange={(event) => {
+                          setShadowTestSubsidyReason(event.target.value)
+                        }}
+                      />
+                      {shadowTestServicePolicyConflict ? (
+                        <Alert severity="error">
+                          The selected $0 service must remain visible under the
+                          customer rate policy below. Use Show all, include the
+                          service in Include only, or remove it from Exclude.
+                        </Alert>
+                      ) : null}
+                    </>
+                  ) : (
+                    <Typography variant="caption" color="text.secondary">
+                      Off · every service keeps its carrier-derived checkout
+                      amount.
+                    </Typography>
+                  )}
+                </Stack>
+              </Box>
+            ) : null}
             <FormControl size="small" fullWidth>
               <InputLabel id={`shopify-customer-policy-mode-${accountGlobalId}`}>
                 Customer rate policy
@@ -1225,6 +1431,9 @@ export default function ShopifyCustomerRatePolicyPanel({
             <Stack spacing={1} sx={{ mt: 1 }}>
               {policies.map((policy) => {
                 const customerLabel = customerLabels[policy.customerGid]
+                const shadowTestService = availableServices.find((service) => (
+                  service.shopifyServiceCode === policy.shadowTestServiceCode
+                ))
                 return (
                   <Box
                   key={policy.globalId}
@@ -1319,7 +1528,29 @@ export default function ShopifyCustomerRatePolicyPanel({
                           label={policy.lastErrorCode}
                         />
                       ) : null}
+                      <Chip
+                        size="small"
+                        color={policy.shadowTestChargeMode
+                          === 'zero_single_service'
+                          ? 'warning'
+                          : 'default'}
+                        variant="outlined"
+                        label={policy.shadowTestChargeMode
+                          === 'zero_single_service'
+                          ? `Shadow test subsidy · $0 · ${
+                            shadowTestService?.serviceName
+                              || policy.shadowTestServiceCode
+                              || 'service unavailable'
+                          }`
+                          : 'Shadow test subsidy · Off'}
+                      />
                     </Stack>
+                    {policy.shadowTestChargeMode === 'zero_single_service' ? (
+                      <Typography variant="caption" color="warning.main">
+                        Test-only reason: {policy.shadowTestSubsidyReason
+                          || 'No reason returned'} · Turn off after the test.
+                      </Typography>
+                    ) : null}
                     {policy.serviceCodes.length ? (
                       <Typography variant="caption" color="text.secondary">
                         {policy.serviceCodes.join(', ')}

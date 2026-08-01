@@ -68,6 +68,11 @@ import {
   type ShopifyShadowCheckoutGuardDecision,
   type ShopifyShadowCheckoutGuardDenialReason,
 } from '@/lib/integrations/shopifyShadowCheckoutGuard'
+import {
+  applyShopifyShadowTestCharge,
+  shopifyShadowTestChargePolicyFence,
+  type ShopifyShadowTestChargePolicy,
+} from '@/lib/integrations/shopifyShadowTestCharge'
 
 const ACCOUNT_GLOBAL_ID = /^gia[0-9]{7}$/
 const CALLBACK_TOKEN = /^[A-Za-z0-9_-]{43}$/
@@ -225,9 +230,11 @@ function sandboxCheckoutAccountIsReady(
 async function shadowCheckoutRequestGuard(
   account: ShopifyCheckoutRatingAccount,
   request: ShopifyCarrierServiceRateRequest,
-): Promise<ShopifyShadowCheckoutGuardDecision> {
+): Promise<ShopifyShadowCheckoutGuardDecision & {
+  customerPolicy: ShopifyShadowTestChargePolicy | null
+}> {
   if (account.activationState !== 'shadow') {
-    return { allowed: true }
+    return { allowed: true, customerPolicy: null }
   }
   const prePolicy = evaluateShopifyShadowCheckoutPrePolicy({
     customerId: request.customer?.id,
@@ -240,6 +247,7 @@ async function shadowCheckoutRequestGuard(
     return {
       allowed: false,
       reasonCode: prePolicy.reasonCode,
+      customerPolicy: null,
     }
   }
   const customerPolicy =
@@ -248,25 +256,33 @@ async function shadowCheckoutRequestGuard(
       accountGlobalId: account.accountGlobalId,
       shopifyCustomerGid: prePolicy.customerId,
     })
-  return evaluateShopifyShadowCheckoutPolicy(customerPolicy)
+  return {
+    ...evaluateShopifyShadowCheckoutPolicy(customerPolicy),
+    customerPolicy,
+  }
 }
 
 function checkoutExecutionFenceHash(
   account: ShopifyCheckoutRatingAccount,
   context: ShopifyCheckoutContextResult,
+  customerPolicy: ShopifyShadowTestChargePolicy | null,
 ) {
   const planRatePolicy = readShopifyCheckoutPlanRatePolicy(
     account.policySnapshot,
   )
   return createHash('sha256')
     .update(JSON.stringify({
-      version: 'shopify-checkout-execution-fence-v3',
+      version: 'shopify-checkout-execution-fence-v4',
       accountEnvironment: account.environment,
       storeEntityName: normalizeShopifyStoreEntityName(
         account.storeEntityName,
       ),
       policyRevision: account.policyRevision,
       policyHash: account.policyHash,
+      shadowTestChargePolicy: shopifyShadowTestChargePolicyFence({
+        activationState: account.activationState,
+        policy: customerPolicy,
+      }),
       planRatePolicy,
       cartonizationInputHash: shopifyCheckoutRatingHash(context.input),
       materials: [...context.materials]
@@ -1179,7 +1195,11 @@ export async function executeShopifyCarrierServiceCallback(input: {
     )
     checkpoint = 'context_loaded'
     attemptedStage = 'execution_fence'
-    const executionFenceHash = checkoutExecutionFenceHash(account, context)
+    const executionFenceHash = checkoutExecutionFenceHash(
+      account,
+      context,
+      shadowGuard.customerPolicy,
+    )
     const stableCacheKey = fencedCacheKey({
       requestFingerprint,
       configRowVersion: account.configRowVersion,
@@ -1487,14 +1507,19 @@ export async function executeShopifyCarrierServiceCallback(input: {
       successPersistenceDeadlineAt,
       workController.signal,
     )
+    const chargedOffers = applyShopifyShadowTestCharge({
+      activationState: account.activationState,
+      policy: shadowGuard.customerPolicy,
+      offers: rated.offers,
+    })
     const { response } = buildShopifyStoreEntityRateResponse({
       storeEntityName: account.storeEntityName,
       packageCount: rated.packageCount,
-      offers: rated.offers.map((offer) => ({
+      offers: chargedOffers.map((offer) => ({
         carrierCode: offer.carrierCode,
         serviceLevelCode: offer.serviceLevelCode,
         providerServiceName: offer.serviceName,
-        amountMinor: offer.amountMinor,
+        amountMinor: offer.customerChargeMinor,
         currency: offer.currency,
         minDeliveryDate: deliveryTimestamp(offer.deliveryDate),
         maxDeliveryDate: deliveryTimestamp(offer.deliveryDate),
@@ -1627,7 +1652,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
             objectiveVersion: optimized.objectiveVersion,
           },
         })),
-        offers: rated.offers.map((offer) => ({
+        offers: chargedOffers.map((offer) => ({
           provider: offer.provider,
           carrierAccountGlobalId: offer.carrierAccountGlobalId,
           rateEvidenceGlobalId: offer.evidenceGlobalId,
@@ -1638,7 +1663,8 @@ export async function executeShopifyCarrierServiceCallback(input: {
           serviceCode: offer.serviceLevelCode,
           serviceName: offer.serviceName,
           carrierCostMinor: offer.amountMinor,
-          customerChargeMinor: offer.amountMinor,
+          customerChargeMinor: offer.customerChargeMinor,
+          subsidyReason: offer.subsidyReason,
           currency: offer.currency,
           minDeliveryDate: offer.deliveryDate,
           maxDeliveryDate: offer.deliveryDate,

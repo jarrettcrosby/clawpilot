@@ -112,7 +112,14 @@ for (const required of [
   'requireFailureEvidence: true',
   'completeShopifyCheckoutRateReceiptInPostgres({',
   'failShopifyCheckoutRateReceiptInPostgres({',
-  'customerChargeMinor: offer.amountMinor',
+  'const chargedOffers = applyShopifyShadowTestCharge({',
+  'policy: shadowGuard.customerPolicy',
+  'offers: chargedOffers.map((offer) => ({',
+  'carrierCostMinor: offer.amountMinor',
+  'customerChargeMinor: offer.customerChargeMinor',
+  'subsidyReason: offer.subsidyReason',
+  'amountMinor: offer.customerChargeMinor',
+  'shadowTestChargePolicy: shopifyShadowTestChargePolicyFence({',
   'carrierAccountGlobalId: offer.carrierAccountGlobalId',
   'rateEvidenceGlobalId: offer.evidenceGlobalId',
   'providerAttempts: rated.providerAttempts.map((attempt) => ({',
@@ -381,6 +388,21 @@ assert.ok(
       'readCachedShopifyCheckoutRateReceiptInPostgres(cacheLookup)',
     ),
   'inventory evidence must fence cache lookup',
+)
+assert.ok(
+  callback.indexOf(
+    'return resultFromTypedReceipt(\n        account,\n        context,\n        cached,',
+  ) < callback.indexOf('const chargedOffers = applyShopifyShadowTestCharge({'),
+  'a cached typed receipt must remain authoritative and bypass live subsidy recalculation',
+)
+const typedReceiptReplay = callback.slice(
+  callback.indexOf('function responseFromTypedReceipt('),
+  callback.indexOf('function resultFromTypedReceipt('),
+)
+assert.equal(
+  typedReceiptReplay.includes('applyShopifyShadowTestCharge('),
+  false,
+  'typed receipt replay must use its persisted customer charge without policy reinterpretation',
 )
 assert.ok(
   callback.indexOf("if (claim.kind === 'in_progress')")

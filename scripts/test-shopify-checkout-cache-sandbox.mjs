@@ -102,7 +102,7 @@ includes(persistence, [
 
 includes(callback, [
   "version: 'shopify-checkout-idempotency-v2'",
-  "version: 'shopify-checkout-execution-fence-v3'",
+  "version: 'shopify-checkout-execution-fence-v4'",
   "account.environment !== 'sandbox'",
   "carrier.environment === 'sandbox'",
   'policyRevision: account.policyRevision',

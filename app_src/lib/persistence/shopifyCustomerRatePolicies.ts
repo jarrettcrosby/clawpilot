@@ -10,6 +10,7 @@ import {
   type NormalizedShopifyCustomerRatePolicy,
   type ShopifyCustomerRatePolicyMode,
   type ShopifyShadowPolicyLifetimeMode,
+  type ShopifyShadowTestChargeMode,
 } from '@/lib/integrations/shopifyCustomerRatePolicy'
 import {
   acquireTransactionAdvisoryLock,
@@ -68,6 +69,9 @@ export type ShopifyCustomerRatePolicy = {
   shadowDurationMinutes: number | null
   shadowExpiresAt: string | null
   shadowExpired: boolean
+  shadowTestChargeMode: ShopifyShadowTestChargeMode
+  shadowTestServiceCode: string | null
+  shadowTestSubsidyReason: string | null
   rowVersion: number
   removedAt: string | null
   createdAt: string
@@ -100,6 +104,9 @@ type PolicyRow = QueryResultRow & {
   shadow_duration_minutes: string | number | null
   shadow_expires_at: Date | null
   shadow_expired: boolean
+  shadow_test_charge_mode: ShopifyShadowTestChargeMode
+  shadow_test_service_code: string | null
+  shadow_test_subsidy_reason: string | null
   row_version: string | number
   removed_at: Date | null
   created_at: Date
@@ -147,6 +154,9 @@ const POLICY_SELECT = `SELECT
     policy.shadow_lifetime_mode,
     policy.shadow_duration_minutes::text,
     policy.shadow_expires_at,
+    policy.shadow_test_charge_mode,
+    policy.shadow_test_service_code,
+    policy.shadow_test_subsidy_reason,
     (
       policy.status = 'simulated'
       AND NOT (
@@ -319,14 +329,30 @@ function storedShadowLifetime(row: PolicyRow) {
 
 function policy(row: PolicyRow): ShopifyCustomerRatePolicy {
   const shadowLifetime = storedShadowLifetime(row)
+  let normalizedPolicy: NormalizedShopifyCustomerRatePolicy
+  try {
+    normalizedPolicy = normalizeShopifyCustomerRatePolicy({
+      mode: row.mode,
+      serviceCodes: serviceCodes(row.service_codes),
+      shadowTestChargeMode: row.shadow_test_charge_mode,
+      shadowTestServiceCode: row.shadow_test_service_code,
+      shadowTestSubsidyReason: row.shadow_test_subsidy_reason,
+    })
+  } catch {
+    throw new ShopifyCustomerRatePolicyPersistenceError(
+      'SHOPIFY_CUSTOMER_POLICY_STORED_VALUE_INVALID',
+      'Stored Shopify customer rate policy is invalid',
+      500,
+    )
+  }
   return {
     id: row.id,
     globalId: row.global_id,
     organizationId: row.organization_id,
     accountGlobalId: row.account_global_id,
     customerGid: row.shopify_customer_gid,
-    mode: row.mode,
-    serviceCodes: serviceCodes(row.service_codes),
+    mode: normalizedPolicy.mode,
+    serviceCodes: normalizedPolicy.serviceCodes,
     policyHash: row.policy_hash,
     status: row.status,
     providerState: row.provider_state,
@@ -337,6 +363,9 @@ function policy(row: PolicyRow): ShopifyCustomerRatePolicy {
     shadowDurationMinutes: shadowLifetime.durationMinutes,
     shadowExpiresAt: shadowLifetime.expiresAt,
     shadowExpired: row.shadow_expired === true,
+    shadowTestChargeMode: normalizedPolicy.shadowTestChargeMode,
+    shadowTestServiceCode: normalizedPolicy.shadowTestServiceCode,
+    shadowTestSubsidyReason: normalizedPolicy.shadowTestSubsidyReason,
     rowVersion: safeCount(row.row_version),
     removedAt: iso(row.removed_at),
     createdAt: new Date(row.created_at).toISOString(),
@@ -351,9 +380,14 @@ function policyHash(
 ) {
   return createHash('sha256')
     .update(JSON.stringify({
-      ...value,
+      version: value.version,
+      mode: value.mode,
+      serviceCodes: value.serviceCodes,
       shadowLifetimeMode,
       shadowDurationMinutes,
+      shadowTestChargeMode: value.shadowTestChargeMode,
+      shadowTestServiceCode: value.shadowTestServiceCode,
+      shadowTestSubsidyReason: value.shadowTestSubsidyReason,
     }), 'utf8')
     .digest('hex')
 }
@@ -571,6 +605,9 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
   serviceCodes: unknown
   shadowLifetimeMode?: unknown
   shadowDurationMinutes?: unknown
+  shadowTestChargeMode?: unknown
+  shadowTestServiceCode?: unknown
+  shadowTestSubsidyReason?: unknown
   expectedRowVersion?: unknown
   actorEmail: unknown
 }) {
@@ -580,6 +617,9 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
   const normalizedPolicy = normalizeShopifyCustomerRatePolicy({
     mode: input.mode,
     serviceCodes: input.serviceCodes,
+    shadowTestChargeMode: input.shadowTestChargeMode,
+    shadowTestServiceCode: input.shadowTestServiceCode,
+    shadowTestSubsidyReason: input.shadowTestSubsidyReason,
   })
   const requestedShadowLifetime = normalizeShopifyShadowPolicyLifetime({
     shadowLifetimeMode: input.shadowLifetimeMode,
@@ -613,6 +653,16 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
     })
 
     const shadow = context.activationState === 'shadow'
+    if (
+      !shadow
+      && normalizedPolicy.shadowTestChargeMode !== 'carrier_rate'
+    ) {
+      throw new ShopifyCustomerRatePolicyPersistenceError(
+        'SHOPIFY_SHADOW_TEST_SUBSIDY_REQUIRES_SHADOW',
+        'A zero checkout test charge is available only in Operations Shadow',
+        409,
+      )
+    }
     const shadowLifetimeMode = shadow
       ? requestedShadowLifetime.shadowLifetimeMode
       : null
@@ -652,14 +702,17 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
                  THEN now() + ($11::integer * interval '1 minute')
                ELSE NULL
              END,
+             shadow_test_charge_mode = $12,
+             shadow_test_service_code = $13,
+             shadow_test_subsidy_reason = $14,
              removed_at = NULL,
              row_version = row_version + 1,
-             updated_by = $12,
+             updated_by = $15,
              updated_at = now()
          WHERE organization_id = $1::uuid
            AND integration_account_id = $2::uuid
            AND shopify_customer_gid = $3
-           AND row_version = $13::bigint
+           AND row_version = $16::bigint
          RETURNING id::text`,
         [
           organizationId,
@@ -673,6 +726,9 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
           lastErrorCode,
           shadowLifetimeMode || 'none',
           shadowDurationMinutes,
+          normalizedPolicy.shadowTestChargeMode,
+          normalizedPolicy.shadowTestServiceCode,
+          normalizedPolicy.shadowTestSubsidyReason,
           actorEmail,
           safeCount(current.row_version),
         ],
@@ -685,6 +741,8 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
            mode, service_codes, policy_hash, status, provider_state,
            last_error_code, shadow_lifetime_mode,
            shadow_duration_minutes, shadow_expires_at,
+           shadow_test_charge_mode, shadow_test_service_code,
+           shadow_test_subsidy_reason,
            created_by, updated_by
          ) VALUES (
            $1::uuid, $2::uuid, $3, $4, $5::jsonb, $6, $7, $8, $9,
@@ -694,7 +752,7 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
                THEN now() + ($11::integer * interval '1 minute')
              ELSE NULL
            END,
-           $12, $12
+           $12, $13, $14, $15, $15
          )
          RETURNING id::text`,
         [
@@ -709,6 +767,9 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
           lastErrorCode,
           shadowLifetimeMode || 'none',
           shadowDurationMinutes,
+          normalizedPolicy.shadowTestChargeMode,
+          normalizedPolicy.shadowTestServiceCode,
+          normalizedPolicy.shadowTestSubsidyReason,
           actorEmail,
         ],
       )
@@ -796,6 +857,19 @@ export async function removeShopifyCustomerRatePolicyInPostgres(input: {
     const lastErrorCode = shadow
       ? null
       : ACTIVE_PROVIDER_DELETE_BLOCKED
+    const currentPolicyValue = policy(current)
+    const removedPolicyHash = policyHash(
+      {
+        version: 2,
+        mode: currentPolicyValue.mode,
+        serviceCodes: currentPolicyValue.serviceCodes,
+        shadowTestChargeMode: 'carrier_rate',
+        shadowTestServiceCode: null,
+        shadowTestSubsidyReason: null,
+      },
+      shadow ? currentPolicyValue.shadowLifetimeMode : null,
+      shadow ? currentPolicyValue.shadowDurationMinutes : null,
+    )
     const result = await client.query<PolicyRow>(
       `UPDATE operations_shopify_customer_rate_policies
        SET status = 'removed',
@@ -815,14 +889,18 @@ export async function removeShopifyCustomerRatePolicyInPostgres(input: {
              WHEN $4 = 'not_written' THEN shadow_expires_at
              ELSE NULL
            END,
+           shadow_test_charge_mode = 'carrier_rate',
+           shadow_test_service_code = NULL,
+           shadow_test_subsidy_reason = NULL,
+           policy_hash = $6,
            removed_at = now(),
            row_version = row_version + 1,
-           updated_by = $6,
+           updated_by = $7,
            updated_at = now()
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
          AND shopify_customer_gid = $3
-         AND row_version = $7::bigint
+         AND row_version = $8::bigint
        RETURNING id::text`,
       [
         organizationId,
@@ -830,6 +908,7 @@ export async function removeShopifyCustomerRatePolicyInPostgres(input: {
         customerGid,
         providerState,
         lastErrorCode,
+        removedPolicyHash,
         actorEmail,
         safeCount(current.row_version),
       ],

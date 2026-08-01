@@ -9,6 +9,8 @@ const MAX_SEARCH_LENGTH = 200
 const MAX_CURSOR_LENGTH = 2_048
 const MAX_CUSTOMER_LABEL_LENGTH = 255
 const MAX_CUSTOMER_EMAIL_LENGTH = 320
+export const SHOPIFY_SHADOW_TEST_SUBSIDY_REASON_MIN_LENGTH = 3
+export const SHOPIFY_SHADOW_TEST_SUBSIDY_REASON_MAX_LENGTH = 160
 const EMAIL_IN_TEXT_PATTERN =
   /([^\s@:<>()\[\]{}"',;]+)@([^\s@<>()\[\]{}"',;]+)/gu
 
@@ -35,10 +37,21 @@ export type ShopifyCustomerRatePolicyMode =
   | 'include_only'
   | 'exclude'
 
+export const SHOPIFY_SHADOW_TEST_CHARGE_MODES = [
+  'carrier_rate',
+  'zero_single_service',
+] as const
+
+export type ShopifyShadowTestChargeMode =
+  typeof SHOPIFY_SHADOW_TEST_CHARGE_MODES[number]
+
 export type NormalizedShopifyCustomerRatePolicy = {
-  version: 1
+  version: 2
   mode: ShopifyCustomerRatePolicyMode
   serviceCodes: string[]
+  shadowTestChargeMode: ShopifyShadowTestChargeMode
+  shadowTestServiceCode: string | null
+  shadowTestSubsidyReason: string | null
 }
 
 export type ShopifyCustomerSearchResult = {
@@ -239,6 +252,9 @@ export function normalizeShopifyShadowPolicyLifetime(input: {
 export function normalizeShopifyCustomerRatePolicy(input: {
   mode: unknown
   serviceCodes: unknown
+  shadowTestChargeMode?: unknown
+  shadowTestServiceCode?: unknown
+  shadowTestSubsidyReason?: unknown
 }): NormalizedShopifyCustomerRatePolicy {
   const mode = String(input.mode || '').trim()
   if (![
@@ -290,10 +306,100 @@ export function normalizeShopifyCustomerRatePolicy(input: {
       'Shopify customer rate policy service codes do not match its mode',
     )
   }
+  const normalizedMode = mode as ShopifyCustomerRatePolicyMode
+  const normalizedServiceCodes = [...serviceCodes].sort()
+  const shadowTestChargeMode = input.shadowTestChargeMode === undefined
+    || input.shadowTestChargeMode === null
+    || input.shadowTestChargeMode === ''
+    ? 'carrier_rate'
+    : String(input.shadowTestChargeMode).trim()
+  if (!SHOPIFY_SHADOW_TEST_CHARGE_MODES.includes(
+    shadowTestChargeMode as ShopifyShadowTestChargeMode,
+  )) {
+    throw new ShopifyCustomerRatePolicyError(
+      'SHOPIFY_SHADOW_TEST_CHARGE_MODE_INVALID',
+      'Shadow test charge mode is invalid',
+    )
+  }
+  const normalizedShadowTestChargeMode =
+    shadowTestChargeMode as ShopifyShadowTestChargeMode
+  const shadowTestServiceCode = typeof input.shadowTestServiceCode === 'string'
+    ? input.shadowTestServiceCode.trim().toLowerCase() || null
+    : input.shadowTestServiceCode === undefined
+      || input.shadowTestServiceCode === null
+      ? null
+      : ''
+  const shadowTestSubsidyReason = boundedText(
+    input.shadowTestSubsidyReason,
+    SHOPIFY_SHADOW_TEST_SUBSIDY_REASON_MAX_LENGTH,
+  )
+  const shadowTestSubsidyReasonProvided =
+    input.shadowTestSubsidyReason !== undefined
+    && input.shadowTestSubsidyReason !== null
+    && (
+      typeof input.shadowTestSubsidyReason !== 'string'
+      || input.shadowTestSubsidyReason.trim() !== ''
+    )
+  if (normalizedShadowTestChargeMode === 'carrier_rate') {
+    if (
+      shadowTestServiceCode !== null
+      || shadowTestSubsidyReasonProvided
+    ) {
+      throw new ShopifyCustomerRatePolicyError(
+        'SHOPIFY_SHADOW_TEST_CHARGE_FIELDS_INVALID',
+        'Normal carrier charge mode cannot include a test service or subsidy reason',
+      )
+    }
+    return {
+      version: 2,
+      mode: normalizedMode,
+      serviceCodes: normalizedServiceCodes,
+      shadowTestChargeMode: normalizedShadowTestChargeMode,
+      shadowTestServiceCode: null,
+      shadowTestSubsidyReason: null,
+    }
+  }
+  if (
+    !shadowTestServiceCode
+    || !SHOPIFY_SERVICE_CODE_PATTERN.test(shadowTestServiceCode)
+  ) {
+    throw new ShopifyCustomerRatePolicyError(
+      'SHOPIFY_SHADOW_TEST_SERVICE_CODE_INVALID',
+      'A valid exact Shopify service code is required for a zero test charge',
+    )
+  }
+  if (
+    !shadowTestSubsidyReason
+    || shadowTestSubsidyReason.length
+      < SHOPIFY_SHADOW_TEST_SUBSIDY_REASON_MIN_LENGTH
+  ) {
+    throw new ShopifyCustomerRatePolicyError(
+      'SHOPIFY_SHADOW_TEST_SUBSIDY_REASON_INVALID',
+      'A specific subsidy reason is required for a zero test charge',
+    )
+  }
+  const serviceVisible = normalizedMode === 'show_all'
+    || (
+      normalizedMode === 'include_only'
+      && normalizedServiceCodes.includes(shadowTestServiceCode)
+    )
+    || (
+      normalizedMode === 'exclude'
+      && !normalizedServiceCodes.includes(shadowTestServiceCode)
+    )
+  if (!serviceVisible) {
+    throw new ShopifyCustomerRatePolicyError(
+      'SHOPIFY_SHADOW_TEST_SERVICE_NOT_VISIBLE',
+      'The zero-charge test service must be visible under the customer policy',
+    )
+  }
   return {
-    version: 1,
-    mode: mode as ShopifyCustomerRatePolicyMode,
-    serviceCodes: [...serviceCodes].sort(),
+    version: 2,
+    mode: normalizedMode,
+    serviceCodes: normalizedServiceCodes,
+    shadowTestChargeMode: normalizedShadowTestChargeMode,
+    shadowTestServiceCode,
+    shadowTestSubsidyReason,
   }
 }
 

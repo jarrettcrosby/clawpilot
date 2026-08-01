@@ -16,7 +16,7 @@ const requireFromApp = createRequire(
 const ts = requireFromApp('typescript')
 const { Pool } = requireFromApp('pg')
 const TARGET_MIGRATION =
-  '0181_operations_shopify_shadow_policy_lifetime.sql'
+  '0188_operations_shopify_shadow_test_subsidy.sql'
 
 function read(path) {
   return readFileSync(resolve(root, path), 'utf8')
@@ -303,18 +303,24 @@ async function seedLegacyUpgradeFixtures(databaseUrl) {
       tombstoneGid,
       timedGid,
       expectedTombstoneHash: customerPolicyHash({
-        version: 1,
+        version: 2,
         mode: 'show_all',
         serviceCodes: [],
         shadowLifetimeMode: null,
         shadowDurationMinutes: null,
+        shadowTestChargeMode: 'carrier_rate',
+        shadowTestServiceCode: null,
+        shadowTestSubsidyReason: null,
       }),
       expectedTimedHash: customerPolicyHash({
-        version: 1,
+        version: 2,
         mode: 'show_all',
         serviceCodes: [],
         shadowLifetimeMode: 'timed',
         shadowDurationMinutes: 60,
+        shadowTestChargeMode: 'carrier_rate',
+        shadowTestServiceCode: null,
+        shadowTestSubsidyReason: null,
       }),
     }
   } finally {
@@ -332,7 +338,9 @@ async function verifyLegacyUpgradeFixtures(databaseUrl, fixtures) {
     const result = await pool.query(
       `SELECT shopify_customer_gid, status, provider_state,
               shadow_lifetime_mode, shadow_duration_minutes,
-              shadow_expires_at, policy_hash
+              shadow_expires_at, policy_hash,
+              shadow_test_charge_mode, shadow_test_service_code,
+              shadow_test_subsidy_reason
        FROM operations_shopify_customer_rate_policies
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
@@ -355,6 +363,9 @@ async function verifyLegacyUpgradeFixtures(databaseUrl, fixtures) {
         duration: tombstone.shadow_duration_minutes,
         expiresAt: tombstone.shadow_expires_at,
         policyHash: tombstone.policy_hash,
+        shadowTestChargeMode: tombstone.shadow_test_charge_mode,
+        shadowTestServiceCode: tombstone.shadow_test_service_code,
+        shadowTestSubsidyReason: tombstone.shadow_test_subsidy_reason,
       },
       {
         customerGid: fixtures.tombstoneGid,
@@ -364,6 +375,9 @@ async function verifyLegacyUpgradeFixtures(databaseUrl, fixtures) {
         duration: null,
         expiresAt: null,
         policyHash: fixtures.expectedTombstoneHash,
+        shadowTestChargeMode: 'carrier_rate',
+        shadowTestServiceCode: null,
+        shadowTestSubsidyReason: null,
       },
       '0181 must preserve a valid fail-closed 0178 Shadow tombstone',
     )
@@ -372,6 +386,9 @@ async function verifyLegacyUpgradeFixtures(databaseUrl, fixtures) {
     assert.equal(Number(timed.shadow_duration_minutes), 60)
     assert.ok(timed.shadow_expires_at instanceof Date)
     assert.equal(timed.policy_hash, fixtures.expectedTimedHash)
+    assert.equal(timed.shadow_test_charge_mode, 'carrier_rate')
+    assert.equal(timed.shadow_test_service_code, null)
+    assert.equal(timed.shadow_test_subsidy_reason, null)
   } finally {
     await pool.end()
   }
@@ -511,6 +528,53 @@ async function verifyPostgresAcceptance(databaseUrl) {
       ['timed', 'timed', 'timed', 'until_turned_off'],
       'Shadow lifetime mode must round-trip without inferring forever from NULL',
     )
+    assert.deepEqual(
+      created.map((entry) => entry.policy.shadowTestChargeMode),
+      ['carrier_rate', 'carrier_rate', 'carrier_rate', 'carrier_rate'],
+      'Normal carrier charging must remain the default',
+    )
+    const subsidyGid = 'gid://shopify/Customer/107'
+    const subsidyReason = 'Operator-authorized zero-dollar checkout proof'
+    const subsidy = await policies.upsertShopifyCustomerRatePolicyInPostgres({
+      organizationId: primary.organizationId,
+      accountGlobalId: primary.accountGlobalId,
+      customerGid: subsidyGid,
+      mode: 'show_all',
+      serviceCodes: [],
+      shadowTestChargeMode: 'zero_single_service',
+      shadowTestServiceCode: 'clawpilot:ups:03',
+      shadowTestSubsidyReason: subsidyReason,
+      actorEmail: primary.email,
+    })
+    assert.equal(subsidy.policy.shadowTestChargeMode, 'zero_single_service')
+    assert.equal(subsidy.policy.shadowTestServiceCode, 'clawpilot:ups:03')
+    assert.equal(subsidy.policy.shadowTestSubsidyReason, subsidyReason)
+    assert.equal(
+      subsidy.policy.policyHash,
+      customerPolicyHash({
+        version: 2,
+        mode: 'show_all',
+        serviceCodes: [],
+        shadowLifetimeMode: 'timed',
+        shadowDurationMinutes: 60,
+        shadowTestChargeMode: 'zero_single_service',
+        shadowTestServiceCode: 'clawpilot:ups:03',
+        shadowTestSubsidyReason: subsidyReason,
+      }),
+      'The semantic policy hash must bind the exact subsidy configuration',
+    )
+    const removedSubsidy =
+      await policies.removeShopifyCustomerRatePolicyInPostgres({
+        organizationId: primary.organizationId,
+        accountGlobalId: primary.accountGlobalId,
+        customerGid: subsidyGid,
+        expectedRowVersion: subsidy.policy.rowVersion,
+        actorEmail: primary.email,
+      })
+    assert.equal(removedSubsidy.policy.status, 'removed')
+    assert.equal(removedSubsidy.policy.shadowTestChargeMode, 'carrier_rate')
+    assert.equal(removedSubsidy.policy.shadowTestServiceCode, null)
+    assert.equal(removedSubsidy.policy.shadowTestSubsidyReason, null)
     const intervals = await pool.query(
       `SELECT
          shopify_customer_gid,
@@ -518,6 +582,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
        FROM operations_shopify_customer_rate_policies
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
+         AND status = 'simulated'
          AND shadow_lifetime_mode = 'timed'
        ORDER BY shopify_customer_gid`,
       [primary.organizationId, primary.integrationAccountId],
@@ -705,6 +770,24 @@ async function verifyPostgresAcceptance(databaseUrl) {
        WHERE organization_id = $1::uuid`,
       [primary.organizationId, primary.email],
     )
+    await expectRejected(
+      () => policies.upsertShopifyCustomerRatePolicyInPostgres({
+        organizationId: primary.organizationId,
+        accountGlobalId: primary.accountGlobalId,
+        customerGid: 'gid://shopify/Customer/108',
+        mode: 'show_all',
+        serviceCodes: [],
+        shadowTestChargeMode: 'zero_single_service',
+        shadowTestServiceCode: 'clawpilot:ups:03',
+        shadowTestSubsidyReason: 'Must remain Shadow-only',
+        actorEmail: primary.email,
+      }),
+      (error) => (
+        error.code === 'SHOPIFY_SHADOW_TEST_SUBSIDY_REQUIRES_SHADOW'
+        && error.status === 409
+      ),
+      'Active mode must reject a zero-charge Shadow test policy',
+    )
     const activeBlocked =
       await policies.upsertShopifyCustomerRatePolicyInPostgres({
         organizationId: primary.organizationId,
@@ -719,7 +802,24 @@ async function verifyPostgresAcceptance(databaseUrl) {
     assert.equal(activeBlocked.policy.shadowLifetimeMode, null)
     assert.equal(activeBlocked.policy.shadowDurationMinutes, null)
     assert.equal(activeBlocked.policy.shadowExpiresAt, null)
+    assert.equal(activeBlocked.policy.shadowTestChargeMode, 'carrier_rate')
+    assert.equal(activeBlocked.policy.shadowTestServiceCode, null)
+    assert.equal(activeBlocked.policy.shadowTestSubsidyReason, null)
     assert.equal(activeBlocked.enforcement.providerWritesPerformed, 0)
+    await expectRejected(
+      () => pool.query(
+        `UPDATE operations_shopify_customer_rate_policies
+         SET shadow_test_charge_mode = 'zero_single_service',
+             shadow_test_service_code = 'clawpilot:ups:03',
+             shadow_test_subsidy_reason = 'Direct Active subsidy is forbidden'
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND shopify_customer_gid = 'gid://shopify/Customer/106'`,
+        [primary.organizationId, primary.integrationAccountId],
+      ),
+      (error) => error.code === '23514' || error.code === 'P0001',
+      'The database must reject a zero-charge subsidy outside simulated Shadow',
+    )
   } finally {
     await pool.end()
   }

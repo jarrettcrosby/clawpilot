@@ -319,6 +319,7 @@ export async function GET() {
           operations_active_multi_package_execution_applied: boolean
           operations_production_fulfillment_rerates_applied: boolean
           operations_shopify_shadow_policy_lifetime_applied: boolean
+          operations_shopify_shadow_test_subsidy_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -1047,6 +1048,12 @@ export async function GET() {
                 WHERE filename =
                   '0181_operations_shopify_shadow_policy_lifetime.sql'
               ) AS operations_shopify_shadow_policy_lifetime_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0188_operations_shopify_shadow_test_subsidy.sql'
+              ) AS operations_shopify_shadow_test_subsidy_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1201,6 +1208,7 @@ export async function GET() {
             && row?.operations_active_multi_package_execution_applied
             && row?.operations_production_fulfillment_rerates_applied
             && row?.operations_shopify_shadow_policy_lifetime_applied
+            && row?.operations_shopify_shadow_test_subsidy_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1347,6 +1355,7 @@ export async function GET() {
           || !row?.operations_active_multi_package_execution_applied
           || !row?.operations_production_fulfillment_rerates_applied
           || !row?.operations_shopify_shadow_policy_lifetime_applied
+          || !row?.operations_shopify_shadow_test_subsidy_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

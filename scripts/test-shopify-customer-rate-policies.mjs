@@ -63,6 +63,9 @@ const migration = read(
 const lifetimeMigration = read(
   'db/migrations/0181_operations_shopify_shadow_policy_lifetime.sql',
 )
+const subsidyMigration = read(
+  'db/migrations/0188_operations_shopify_shadow_test_subsidy.sql',
+)
 const policyIntegration = read(
   'app_src/lib/integrations/shopifyCustomerRatePolicy.ts',
 )
@@ -125,11 +128,32 @@ assert.match(
   'migration 0181 must preserve valid fail-closed 0178 Shadow tombstones',
 )
 
+requireAll(subsidyMigration, [
+  'ADD COLUMN IF NOT EXISTS shadow_test_charge_mode text',
+  'ADD COLUMN IF NOT EXISTS shadow_test_service_code text',
+  'ADD COLUMN IF NOT EXISTS shadow_test_subsidy_reason text',
+  "shadow_test_charge_mode = 'carrier_rate'",
+  "shadow_test_charge_mode = 'zero_single_service'",
+  "status = 'simulated'",
+  "provider_state = 'not_written'",
+  'shadow_test_service_code ~',
+  'length(shadow_test_subsidy_reason) BETWEEN 3 AND 160',
+  "shadow_test_subsidy_reason !~ '[[:cntrl:]]'",
+  'service_codes ? shadow_test_service_code',
+  '{"version":2,"mode":',
+  "NEW.shadow_test_charge_mode IS DISTINCT FROM 'carrier_rate'",
+  'Only Operations Shadow may record a simulated customer rate policy',
+], 'migration 0188 Shadow test subsidy')
+
 requireAll(policyIntegration, [
   'normalizeShopifyCustomerGid',
   'normalizeShopifyCustomerRatePolicy',
   'normalizeShopifyShadowPolicyDurationMinutes',
   'normalizeShopifyShadowPolicyLifetime',
+  'SHOPIFY_SHADOW_TEST_CHARGE_MODES',
+  'SHOPIFY_SHADOW_TEST_SUBSIDY_REASON_MIN_LENGTH = 3',
+  'SHOPIFY_SHADOW_TEST_SUBSIDY_REASON_MAX_LENGTH = 160',
+  "'zero_single_service'",
   "SHOPIFY_SHADOW_POLICY_DEFAULT_LIFETIME_MODE = 'timed'",
   "'until_turned_off'",
   'SHOPIFY_SHADOW_POLICY_DEFAULT_DURATION_MINUTES = 60',
@@ -189,6 +213,10 @@ requireAll(persistence, [
   'shadow_allowed_count',
   "mode <> 'hide_all'",
   'shadowAllowedCount',
+  'shadowTestChargeMode',
+  'shadowTestServiceCode',
+  'shadowTestSubsidyReason',
+  'SHOPIFY_SHADOW_TEST_SUBSIDY_REQUIRES_SHADOW',
   'earliest_shadow_expires_at',
   'LIMIT 101',
 ], 'customer policy persistence')
@@ -259,6 +287,9 @@ requireAll(route, [
   'availableServicesTruncated',
   'shadowDurationMinutes',
   'shadowLifetimeMode',
+  'shadowTestChargeMode',
+  'shadowTestServiceCode',
+  'shadowTestSubsidyReason',
   'supportedLifetimeModes',
   'untilTurnedOffSimulatedCount',
   'shadowPolicyLimits',
@@ -438,7 +469,14 @@ assert.deepEqual(
     mode: 'show_all',
     serviceCodes: [],
   })),
-  { version: 1, mode: 'show_all', serviceCodes: [] },
+  {
+    version: 2,
+    mode: 'show_all',
+    serviceCodes: [],
+    shadowTestChargeMode: 'carrier_rate',
+    shadowTestServiceCode: null,
+    shadowTestSubsidyReason: null,
+  },
 )
 assert.deepEqual(
   plain(policy.normalizeShopifyCustomerRatePolicy({
@@ -449,14 +487,68 @@ assert.deepEqual(
     ],
   })),
   {
-    version: 1,
+    version: 2,
     mode: 'include_only',
     serviceCodes: [
       'clawpilot:fedex:fedex_ground',
       'clawpilot:ups:03',
     ],
+    shadowTestChargeMode: 'carrier_rate',
+    shadowTestServiceCode: null,
+    shadowTestSubsidyReason: null,
   },
 )
+assert.deepEqual(
+  plain(policy.normalizeShopifyCustomerRatePolicy({
+    mode: 'include_only',
+    serviceCodes: ['clawpilot:ups:03'],
+    shadowTestChargeMode: 'zero_single_service',
+    shadowTestServiceCode: ' CLAWPILOT:UPS:03 ',
+    shadowTestSubsidyReason: ' Test checkout without card collection ',
+  })),
+  {
+    version: 2,
+    mode: 'include_only',
+    serviceCodes: ['clawpilot:ups:03'],
+    shadowTestChargeMode: 'zero_single_service',
+    shadowTestServiceCode: 'clawpilot:ups:03',
+    shadowTestSubsidyReason: 'Test checkout without card collection',
+  },
+)
+for (const invalidChargePolicy of [
+  {
+    mode: 'show_all',
+    serviceCodes: [],
+    shadowTestChargeMode: 'carrier_rate',
+    shadowTestServiceCode: 'clawpilot:ups:03',
+  },
+  {
+    mode: 'hide_all',
+    serviceCodes: [],
+    shadowTestChargeMode: 'zero_single_service',
+    shadowTestServiceCode: 'clawpilot:ups:03',
+    shadowTestSubsidyReason: 'Hidden service must not receive a subsidy',
+  },
+  {
+    mode: 'show_all',
+    serviceCodes: [],
+    shadowTestChargeMode: 'zero_single_service',
+    shadowTestServiceCode: 'clawpilot:ups:03',
+    shadowTestSubsidyReason: 'x'.repeat(161),
+  },
+  {
+    mode: 'show_all',
+    serviceCodes: [],
+    shadowTestChargeMode: 'zero_single_service',
+    shadowTestServiceCode: 'clawpilot:ups:03',
+    shadowTestSubsidyReason: 'x',
+  },
+]) {
+  assert.throws(
+    () => policy.normalizeShopifyCustomerRatePolicy(invalidChargePolicy),
+    (error) => String(error.code).startsWith('SHOPIFY_SHADOW_TEST_'),
+  )
+}
 assert.throws(
   () => policy.normalizeShopifyCustomerRatePolicy({
     mode: 'hide_all',
