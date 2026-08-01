@@ -2,9 +2,35 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 // @ts-expect-error Node's strip-types test runner requires the .ts extension.
 import {
+  exactWholeCommerceQuantityFromNumeric,
   resolveCommerceOrderLineProviderPrice,
   storableCommerceOrderLineProviderMoney,
 } from '../../lib/integrations/commerceOrderStaging.ts'
+
+test('accepts PostgreSQL scale-formatted whole commerce quantities', () => {
+  assert.equal(exactWholeCommerceQuantityFromNumeric('50.000000'), 50n)
+  assert.equal(exactWholeCommerceQuantityFromNumeric('1'), 1n)
+  assert.equal(exactWholeCommerceQuantityFromNumeric('0.000000'), 0n)
+
+  for (const value of [
+    '1.500000',
+    '1.000001',
+    '1.0000000',
+    '01.000000',
+    '1.',
+    '.000000',
+    '-1.000000',
+    '+1',
+    '1e2',
+    ' 50.000000 ',
+    'NaN',
+    'Infinity',
+    '   ',
+    '',
+  ]) {
+    assert.equal(exactWholeCommerceQuantityFromNumeric(value), null)
+  }
+})
 
 test('stores one coherent nonnegative provider-money set', () => {
   assert.deepEqual(

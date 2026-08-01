@@ -290,6 +290,7 @@ for (const requiredPath of [
   'db/migrations/0180_operations_production_fulfillment_rerates.sql',
   'db/migrations/0181_operations_shopify_shadow_policy_lifetime.sql',
   'db/migrations/0188_operations_shopify_shadow_test_subsidy.sql',
+  'db/migrations/0189_operations_shopify_checkout_quote_match_families.sql',
   'app_src/app/api/crm/products/[productId]/images/route.ts',
   'app_src/app/api/crm/products/[productId]/images/[assetId]/route.ts',
   'app_src/app/api/crm/products/[productId]/shopify-product-image/route.ts',

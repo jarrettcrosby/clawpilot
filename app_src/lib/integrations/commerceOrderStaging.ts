@@ -19,6 +19,19 @@ export type CommerceOrderLineProviderMoney = Readonly<{
 }>
 
 /**
+ * PostgreSQL returns NUMERIC(20,6) quantities with their declared scale (for
+ * example, `50.000000`). Commerce order demand is still whole sell units, so
+ * accept only canonical nonnegative integers with the table's exact six-zero
+ * fractional suffix. A real fractional quantity, unexpected scale, exponent,
+ * sign, whitespace, or other malformed value remains unavailable and must fail
+ * closed before promotion.
+ */
+export function exactWholeCommerceQuantityFromNumeric(value: string) {
+  const match = /^(0|[1-9][0-9]*)(?:\.0{6})?$/.exec(value)
+  return match ? BigInt(match[1]) : null
+}
+
+/**
  * The intake table stores one coherent, nonnegative provider-money currency
  * per line. Retain every compatible source amount, but represent invalid or
  * mixed-currency fields as unavailable so repairable provider evidence cannot

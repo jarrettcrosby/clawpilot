@@ -130,6 +130,7 @@ function orderFixture(input) {
   const lineHash = hash(`line:${input.key}`)
   const orderHash = hash(`order:${input.key}`)
   const fulfilled = input.unfulfilledQuantity === 0
+  const orderedQuantity = input.orderedQuantity ?? 1
   return Object.freeze({
     schemaVersion: 'commerce-normalized-order-v1',
     identity: Object.freeze({
@@ -192,15 +193,15 @@ function orderFixture(input) {
       titleSnapshot: `PostgreSQL staging ${input.key}`,
       variantTitleSnapshot: 'Default',
       vendorSnapshot: 'ClawPilot acceptance',
-      orderedQuantity: 1,
-      currentQuantity: 1,
+      orderedQuantity,
+      currentQuantity: orderedQuantity,
       cancelledQuantity: 0,
-      fulfilledQuantity: fulfilled ? 1 : 0,
+      fulfilledQuantity: fulfilled ? orderedQuantity : 0,
       unfulfilledQuantity: input.unfulfilledQuantity,
       returnedQuantity: 0,
       removedOrRefundedQuantity: 0,
       unitMultiplier: 1,
-      physicalUnitQuantity: 1,
+      physicalUnitQuantity: orderedQuantity,
       unitPrice: input.unitPrice,
       lineSubtotal: input.lineSubtotal || input.unitPrice,
       lineDiscount: input.lineDiscount || (input.unitPrice.state === 'available'
@@ -292,7 +293,9 @@ function loadCommerceStagingService(pool, counters) {
         exactProductMappingMutation: mustNotRun('exactProductMappingMutation'),
       },
       '@/lib/integrations/commerceProductNaming': {
-        commerceProductDisplayName: mustNotRun('commerceProductDisplayName'),
+        commerceProductDisplayName({ productTitle, variantTitle }) {
+          return [productTitle, variantTitle].filter(Boolean).join(' · ')
+        },
       },
       '@/lib/integrations/commerceProductLifecycle': {
         normalizeCommerceProductChannelStatus: mustNotRun(
@@ -451,6 +454,18 @@ async function seedCapturedRead(client, ids, envelope) {
       [ids.product, ids.pipeline, hash('mapped-product'), actorEmail],
     )
     await client.query(
+      `INSERT INTO crm_organizations (
+         id, pipeline_id, source_key, identity_key, name, relationship_type,
+         source_payload, source_hash, sync_status, created_by, updated_by
+       ) VALUES (
+         $1, $2, 'commerce-promotion-postgres-customer',
+         'customer:commerce-promotion-postgres-customer',
+         'Commerce promotion PostgreSQL customer', 'customer',
+         '{}'::jsonb, $3, 'synced', $4, $4
+       )`,
+      [ids.customer, ids.pipeline, hash('promotion-customer'), actorEmail],
+    )
+    await client.query(
       `INSERT INTO operations_product_mappings (
          id, global_id, organization_id, integration_account_id,
          pipeline_id, product_id, channel_sku, external_product_id,
@@ -527,7 +542,203 @@ async function seedCapturedRead(client, ids, envelope) {
   } finally {
     await client.query('SET session_replication_role = origin')
   }
-  assert.equal(envelope.orders.length, 5)
+  assert.equal(envelope.orders.length, 6)
+}
+
+async function verifyPromotionNumericScaleAcceptance(
+  pool,
+  ids,
+  persistence,
+  counters,
+) {
+  const runtime = {
+    organizationId: ids.organization,
+    integrationAccountId: ids.integrationAccount,
+    globalId: 'gia0009201',
+    provider: 'shopify',
+    credentialVersion: 1,
+    externalAccountId: 'gid://shopify/Shop/9201',
+  }
+  const providerAttemptsBefore = Number((await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_commerce_provider_attempts
+     WHERE organization_id = $1`,
+    [ids.organization],
+  )).rows[0].count)
+
+  const setup = await pool.connect()
+  let exact
+  let fractional
+  try {
+    await setup.query('SET session_replication_role = replica')
+    const candidates = await setup.query(
+      `UPDATE operations_commerce_order_candidates candidate
+       SET customer_resolution_state = 'resolved',
+           customer_match_method = 'manual',
+           customer_id = $2,
+           delivery_resolution_state = 'not_required',
+           workflow_state = 'ready',
+           blocking_codes = '{}'::text[],
+           row_version = row_version + 1,
+           updated_by = $3,
+           updated_at = now()
+       WHERE candidate.organization_id = $1
+         AND candidate.external_order_id IN (
+           'gid://shopify/Order/mapped-zero',
+           'gid://shopify/Order/mapped-fractional'
+         )
+       RETURNING candidate.id::text, candidate.external_order_id,
+                 candidate.global_id,
+                 candidate.row_version::text`,
+      [ids.organization, ids.customer, actorEmail],
+    )
+    assert.equal(candidates.rowCount, 2)
+    exact = candidates.rows.find((row) => (
+      row.external_order_id === 'gid://shopify/Order/mapped-zero'
+    ))
+    fractional = candidates.rows.find((row) => (
+      row.external_order_id === 'gid://shopify/Order/mapped-fractional'
+    ))
+    assert.ok(exact)
+    assert.ok(fractional)
+    const lines = await setup.query(
+      `UPDATE operations_commerce_order_candidate_lines line
+       SET workflow_state = 'ready',
+           blocking_codes = '{}'::text[],
+           row_version = line.row_version + 1,
+           updated_by = $3,
+           updated_at = now()
+       FROM operations_commerce_order_candidates candidate
+       WHERE line.organization_id = $1
+         AND candidate.organization_id = line.organization_id
+         AND candidate.id = line.order_candidate_id
+         AND candidate.id = ANY($2::uuid[])
+       RETURNING line.id::text`,
+      [ids.organization, [exact.id, fractional.id], actorEmail],
+    )
+    assert.equal(lines.rowCount, 2)
+  } finally {
+    await setup.query('SET session_replication_role = origin').catch(() => {})
+    setup.release()
+  }
+
+  const promotion = await persistence.promoteCommerceCandidateInPostgres({
+    runtime,
+    actorEmail,
+    idempotencyKey: 'commerce-promotion-scaled-whole-zero-price',
+    candidateGlobalId: exact.global_id,
+    candidateRowVersion: Number(exact.row_version),
+    requestHash: hash('commerce-promotion-scaled-whole-zero-price'),
+  })
+  assert.equal(promotion.replayed, false)
+  assert.equal(promotion.providerWrites, 0)
+  assert.equal(promotion.inventoryWrites, 0)
+  assert.equal(promotion.reservationWrites, 0)
+  assert.equal(promotion.fulfillmentWrites, 0)
+  assert.equal(promotion.shipmentWrites, 0)
+  assert.match(promotion.canonicalOrderGlobalId, /^gor[0-9]{7}$/)
+  assert.equal(promotion.canonicalLineGlobalIds.length, 1)
+
+  const exactEvidence = await pool.query(
+    `SELECT
+       canonical.global_id,
+       canonical.merchandise_total_minor::text,
+       canonical.source_payload #>> '{monetaryReconciliation,canonicalMerchandiseTotalMinor}'
+         AS reconciled_merchandise_total_minor,
+       canonical.source_payload ->> 'providerWrites' AS provider_writes,
+       line.quantity::text,
+       line.unit_price_minor::text,
+       candidate.workflow_state AS candidate_state,
+       candidate_line.workflow_state AS line_state,
+       event.payload ->> 'providerWrites' AS event_provider_writes
+     FROM operations_orders canonical
+     JOIN operations_order_lines line
+       ON line.organization_id = canonical.organization_id
+      AND line.order_id = canonical.id
+     JOIN operations_commerce_order_candidates candidate
+       ON candidate.organization_id = canonical.organization_id
+      AND candidate.canonical_order_id = canonical.id
+     JOIN operations_commerce_order_candidate_lines candidate_line
+       ON candidate_line.organization_id = candidate.organization_id
+      AND candidate_line.order_candidate_id = candidate.id
+      AND candidate_line.canonical_order_line_id = line.id
+     JOIN operations_domain_events event
+       ON event.organization_id = canonical.organization_id
+      AND event.aggregate_id = canonical.id
+      AND event.event_type = 'operations.order.imported'
+     WHERE canonical.organization_id = $1
+       AND canonical.external_order_id =
+           'gid://shopify/Order/mapped-zero'`,
+    [ids.organization],
+  )
+  assert.equal(exactEvidence.rowCount, 1)
+  assert.deepEqual(exactEvidence.rows[0], {
+    global_id: promotion.canonicalOrderGlobalId,
+    merchandise_total_minor: '0',
+    reconciled_merchandise_total_minor: '0',
+    provider_writes: '0',
+    quantity: '50.000000',
+    unit_price_minor: '0',
+    candidate_state: 'promoted',
+    line_state: 'promoted',
+    event_provider_writes: '0',
+  })
+
+  await assert.rejects(
+    persistence.promoteCommerceCandidateInPostgres({
+      runtime,
+      actorEmail,
+      idempotencyKey: 'commerce-promotion-fractional-zero-price',
+      candidateGlobalId: fractional.global_id,
+      candidateRowVersion: Number(fractional.row_version),
+      requestHash: hash('commerce-promotion-fractional-zero-price'),
+    }),
+    (error) => (
+      error.code === 'COMMERCE_INTAKE_MONEY_RECONCILIATION_REQUIRED'
+    ),
+  )
+  const fractionalEvidence = await pool.query(
+    `SELECT
+       candidate.workflow_state,
+       candidate.canonical_order_id::text,
+       line.workflow_state AS line_state,
+       line.canonical_order_line_id::text,
+       (SELECT count(*)::integer
+        FROM operations_orders canonical
+        WHERE canonical.organization_id = candidate.organization_id
+          AND canonical.external_order_id = candidate.external_order_id)
+         AS canonical_order_count,
+       (SELECT count(*)::integer
+        FROM operations_command_receipts receipt
+        WHERE receipt.organization_id = candidate.organization_id
+          AND receipt.idempotency_key =
+              'commerce-promotion-fractional-zero-price') AS receipt_count
+     FROM operations_commerce_order_candidates candidate
+     JOIN operations_commerce_order_candidate_lines line
+       ON line.organization_id = candidate.organization_id
+      AND line.order_candidate_id = candidate.id
+     WHERE candidate.organization_id = $1
+       AND candidate.external_order_id =
+           'gid://shopify/Order/mapped-fractional'`,
+    [ids.organization],
+  )
+  assert.deepEqual(fractionalEvidence.rows[0], {
+    workflow_state: 'ready',
+    canonical_order_id: null,
+    line_state: 'ready',
+    canonical_order_line_id: null,
+    canonical_order_count: 0,
+    receipt_count: 0,
+  })
+
+  const providerAttemptsAfter = Number((await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_commerce_provider_attempts
+     WHERE organization_id = $1`,
+    [ids.organization],
+  )).rows[0].count)
+  assert.equal(providerAttemptsAfter, providerAttemptsBefore)
+  assert.equal(counters.fetchCalls, 0)
 }
 
 async function verifyAcceptance(databaseUrl) {
@@ -540,6 +751,7 @@ async function verifyAcceptance(databaseUrl) {
     organization: randomUUID(),
     pipeline: randomUUID(),
     integrationAccount: randomUUID(),
+    customer: randomUUID(),
     product: randomUUID(),
     productMapping: randomUUID(),
     providerAttempt: randomUUID(),
@@ -568,7 +780,15 @@ async function verifyAcceptance(databaseUrl) {
         key: 'mapped-zero',
         variantId: ids.mappedVariant,
         unitPrice: money(0, 'USD'),
-        unfulfilledQuantity: 1,
+        orderedQuantity: 50,
+        unfulfilledQuantity: 50,
+      }),
+      orderFixture({
+        key: 'mapped-fractional',
+        variantId: ids.mappedVariant,
+        unitPrice: money(0, 'USD'),
+        orderedQuantity: 1.5,
+        unfulfilledQuantity: 1.5,
       }),
       orderFixture({
         key: 'missing-positive',
@@ -630,8 +850,8 @@ async function verifyAcceptance(databaseUrl) {
       windowEnd: observedAt,
       queryHash: ids.queryHash,
       nextOrderCursor: null,
-      providerRowsSeen: 5,
-      eligibleOrdersSeen: 5,
+      providerRowsSeen: 6,
+      eligibleOrdersSeen: 6,
     },
     refreshCandidateGlobalId: null,
     retryRejectionGlobalId: null,
@@ -639,8 +859,8 @@ async function verifyAcceptance(databaseUrl) {
     capturedResponseHash: ids.responseHash,
   })
   assert.equal(result.replayed, false)
-  assert.equal(result.ordersStaged, 5)
-  assert.equal(result.recordsStaged, 5)
+  assert.equal(result.ordersStaged, 6)
+  assert.equal(result.recordsStaged, 6)
   assert.equal(result.providerWrites, 0)
   assert.equal(result.syncCursorAdvanced, false)
   assert.equal(counters.fetchCalls, 0)
@@ -651,7 +871,7 @@ async function verifyAcceptance(databaseUrl) {
        candidate.external_order_id,
        candidate.blocking_codes AS candidate_blocking_codes,
        line.mapping_state,
-       line.unfulfilled_quantity::integer,
+       line.unfulfilled_quantity::text,
        line.currency_code,
        line.unit_price_minor::text,
        line.subtotal_minor::text,
@@ -671,7 +891,7 @@ async function verifyAcceptance(databaseUrl) {
      ORDER BY candidate.order_number_snapshot`,
     [ids.organization],
   )
-  assert.equal(evidence.rowCount, 5)
+  assert.equal(evidence.rowCount, 6)
   const byOrder = new Map(evidence.rows.map((row) => [
     row.external_order_id.split('/').at(-1),
     row,
@@ -684,10 +904,18 @@ async function verifyAcceptance(databaseUrl) {
   assert.equal(exact.price_resolution_state, 'provider')
   assert.equal(exact.resolved_currency_code, 'USD')
   assert.equal(exact.resolved_unit_price_minor, '0')
+  assert.equal(exact.unfulfilled_quantity, '50.000000')
   assert.ok(!exact.line_blocking_codes.includes('line_price_required'))
   assert.ok(!exact.candidate_blocking_codes.includes('line_price_required'))
   assert.ok(!exact.line_blocking_codes.includes('product_mapping_required'))
   assert.ok(!exact.candidate_blocking_codes.includes('product_mapping_required'))
+
+  const fractional = byOrder.get('mapped-fractional')
+  assert.equal(fractional.mapping_state, 'resolved')
+  assert.equal(fractional.price_resolution_state, 'provider')
+  assert.equal(fractional.resolved_currency_code, 'USD')
+  assert.equal(fractional.resolved_unit_price_minor, '0')
+  assert.equal(fractional.unfulfilled_quantity, '1.500000')
 
   for (const key of [
     'missing-positive',
@@ -726,7 +954,7 @@ async function verifyAcceptance(databaseUrl) {
   assert.equal(byOrder.get('negative-positive').tax_minor, '0')
 
   const fulfilled = byOrder.get('fulfilled-missing')
-  assert.equal(fulfilled.unfulfilled_quantity, 0)
+  assert.equal(fulfilled.unfulfilled_quantity, '0.000000')
   assert.equal(fulfilled.price_resolution_state, 'unresolved')
   assert.ok(!fulfilled.line_blocking_codes.includes('line_price_required'))
   assert.ok(!fulfilled.candidate_blocking_codes.includes('line_price_required'))
@@ -1214,6 +1442,12 @@ async function verifyAcceptance(databaseUrl) {
     0,
     'Policy-drift recovery must not call the provider',
   )
+  await verifyPromotionNumericScaleAcceptance(
+    pool,
+    ids,
+    persistence,
+    counters,
+  )
   await pool.end()
 }
 
@@ -1251,8 +1485,9 @@ async function main() {
     })
   }
   console.log(
-    'Commerce intake fresh-staging, captured-continuation, and policy-drift '
-      + 'recovery disposable-PostgreSQL acceptance passed',
+    'Commerce intake staging, scaled-whole zero-price promotion, fractional '
+      + 'rollback, and policy-drift recovery disposable-PostgreSQL '
+      + 'acceptance passed',
   )
 }
 

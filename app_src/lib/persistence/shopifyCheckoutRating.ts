@@ -5514,18 +5514,41 @@ reconcileShopifyCheckoutRateForOrderCandidateWithClient(
     const selected = exactCandidateCount === 1
       ? exactMatches.rows[0]
       : null
+    const equivalentReceiptGlobalIds = selected
+      ? (await client.query<{ receipt_global_id: string }>(
+          `SELECT receipt_global_id
+           FROM operations_shopify_checkout_rate_match_family_members(
+             $1::uuid, $2::uuid, $3::uuid, true
+           )`,
+          [input.organizationId, candidate.id, selected.receipt_id],
+        )).rows.map((row) => row.receipt_global_id)
+      : []
+    if (
+      selected
+      && !equivalentReceiptGlobalIds.includes(selected.receipt_global_id)
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_MATCH_FAMILY_INVALID',
+        'Shopify checkout match-family evidence is invalid',
+        500,
+      )
+    }
     const outcome = classifyShopifyCheckoutRateReconciliationOutcome({
       exactCandidateCount,
       potentialCandidateCount,
     })
     const evidence = {
-      version: 'shopify-exact-rate-reconciliation-v1',
+      version: 'shopify-exact-rate-reconciliation-v2-match-family',
+      matchFamilyVersion: 'shopify-material-equivalence-v1',
       orderCandidateGlobalId: input.orderCandidateGlobalId,
       accountGlobalId: candidate.account_global_id,
       exactCandidateCount,
       potentialCandidateCount,
       candidateSetHash,
       matchedReceiptGlobalId: selected?.receipt_global_id || null,
+      equivalentReceiptGlobalIds,
+      equivalentReceiptCount: equivalentReceiptGlobalIds.length,
+      canonicalReceiptSelection: selected ? 'latest_before_order' : null,
       zeroValueMerchandiseAllowed:
         Number(candidate.subtotal_minor || 0) === 0,
       providerWrites: 0,

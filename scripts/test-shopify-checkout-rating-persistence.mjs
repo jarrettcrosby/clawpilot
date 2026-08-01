@@ -175,6 +175,9 @@ const providerAttemptMigration = read(
 const rateWarmPolicyMigration = read(
   'db/migrations/0175_operations_shopify_checkout_rate_warm_policy.sql',
 )
+const quoteMatchFamiliesMigration = read(
+  'db/migrations/0189_operations_shopify_checkout_quote_match_families.sql',
+)
 const persistenceSource = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
 )
@@ -1034,8 +1037,18 @@ async function reconcileWithFakeTransaction({
     },
     { rows: exactMatches, rowCount: exactMatches.length },
     { rows: [{ candidate_count: potentialCandidateCount }] },
-    { rows: [insertedRow] },
   ]
+  const equivalentReceiptGlobalIds = selected
+    ? [selected.receipt_global_id, 'gsqr9999999']
+    : []
+  if (selected) {
+    responses.push({
+      rows: equivalentReceiptGlobalIds.map((receiptGlobalId) => ({
+        receipt_global_id: receiptGlobalId,
+      })),
+    })
+  }
+  responses.push({ rows: [insertedRow] })
   const queries = []
   const client = {
     async query(sql, values) {
@@ -1059,16 +1072,27 @@ async function reconcileWithFakeTransaction({
   assert.equal(reconciliation.outcome, expectedOutcome)
   assert.equal(reconciliation.providerWriteCount, 0)
   assert.equal(reconciliation.supersedesReconciliationGlobalId, null)
-  assert.equal(queries.length, 5)
+  assert.equal(queries.length, selected ? 6 : 5)
   assert.match(
     queries[0].sql,
     /operations_shopify_checkout_rate_current_reconciliations/,
   )
+  if (selected) {
+    assert.match(
+      queries[4].sql,
+      /operations_shopify_checkout_rate_match_family_members/,
+    )
+  }
+  const insertQuery = queries.at(-1)
   assert.match(
-    queries[4].sql,
+    insertQuery.sql,
     /INSERT INTO operations_shopify_checkout_rate_reconciliations/,
   )
-  assert.equal(queries[4].values[20], expectedOutcome)
+  assert.equal(insertQuery.values[20], expectedOutcome)
+  assert.deepEqual(
+    JSON.parse(insertQuery.values[22]).equivalentReceiptGlobalIds,
+    equivalentReceiptGlobalIds,
+  )
   assert.equal(responses.length, 0)
 }
 
@@ -1509,6 +1533,13 @@ includes(persistenceSource, [
   'zeroValueMerchandiseAllowed',
   'candidate.subtotal_minor',
 ], 'Zero-value Shopify order reconciliation')
+includes(persistenceSource, [
+  'operations_shopify_checkout_rate_match_family_members',
+  'equivalentReceiptGlobalIds',
+  "'shopify-exact-rate-reconciliation-v2-match-family'",
+  "'shopify-material-equivalence-v1'",
+  "'latest_before_order'",
+], 'Repeated Shopify callback reconciliation evidence')
 assert.doesNotMatch(
   section(
     migration,
@@ -1556,10 +1587,65 @@ includes(persistenceSource, [
   'operations_shopify_checkout_rate_current_reconciliations',
 ], 'Current Shopify reconciliation projection')
 
+const quoteMatchFamilyFacts = section(
+  quoteMatchFamiliesMigration,
+  'CREATE OR REPLACE FUNCTION\n  operations_shopify_checkout_rate_match_candidate_facts',
+  'CREATE OR REPLACE FUNCTION\n  operations_shopify_checkout_rate_match_candidates',
+  'Shopify checkout quote match-family facts',
+)
+includes(quoteMatchFamilyFacts, [
+  "'requestFingerprint', receipt.request_fingerprint",
+  "'redactedRequestSnapshot', receipt.redacted_request_snapshot",
+  "'configId', receipt.config_id::text",
+  "'configRowVersion', receipt.config_row_version",
+  "'credentialGeneration', receipt.credential_generation",
+  "'activationRevision', receipt.activation_revision",
+  "'activationState', receipt.activation_state",
+  "'policyRevision', receipt.policy_revision",
+  "'policyHash', receipt.policy_hash",
+  "'warehouseId', receipt.warehouse_id::text",
+  "'algorithmVersion', receipt.algorithm_version",
+  "'receiptPackagePlanHash', receipt.package_plan_hash",
+  "'carrierProvider', offer.carrier_provider",
+  "'carrierAccountId', offer.carrier_account_id::text",
+  "'carrierRequestHash', offer.carrier_request_hash",
+  "'carrierResponseRateHash', offer.carrier_response_rate_hash",
+  "'shopifyServiceCode', offer.shopify_service_code",
+  "'serviceCode', offer.service_code",
+  "'carrierCostMinor', offer.carrier_cost_minor",
+  "'customerChargeMinor', offer.customer_charge_minor",
+  "'checkoutAdjustmentMinor', offer.checkout_adjustment_minor",
+  "'offerCurrency', offer.currency",
+  "'offerPackagePlanHash', offer.package_plan_hash",
+], 'Shopify checkout quote material equivalence fences')
+assert.doesNotMatch(
+  quoteMatchFamilyFacts,
+  /request_evidence_hash|inventory_snapshot_(?:hash|at)/,
+  'Equivalent repeated callbacks may have different receipt-local request evidence and inventory observation identities',
+)
+const quoteMatchFamilyRepresentative = section(
+  quoteMatchFamiliesMigration,
+  'CREATE OR REPLACE FUNCTION\n  operations_shopify_checkout_rate_match_candidates',
+  'CREATE OR REPLACE FUNCTION\n  operations_shopify_checkout_rate_match_family_members',
+  'Shopify checkout quote match-family representative',
+)
+includes(quoteMatchFamilyRepresentative, [
+  'PARTITION BY facts.match_family_key',
+  'facts.receipt_created_at DESC',
+  'WHERE ranked.family_rank = 1',
+], 'Shopify repeated callback family collapse')
+includes(quoteMatchFamiliesMigration, [
+  'operations_shopify_checkout_rate_match_family_members',
+  'requested_representative_receipt_id',
+  'family.match_family_key = facts.match_family_key',
+  'ORDER BY facts.receipt_created_at DESC',
+], 'Shopify repeated callback family evidence')
+
 for (const path of [
   'db/migrations/0148_operations_commerce_external_effects.sql',
   'db/migrations/0149_operations_shopify_checkout_rating.sql',
   'db/migrations/0157_operations_shopify_checkout_receipt_reuse.sql',
+  'db/migrations/0189_operations_shopify_checkout_quote_match_families.sql',
 ]) {
   const overlength = [
     ...new Set(

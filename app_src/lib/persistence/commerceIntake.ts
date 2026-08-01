@@ -27,6 +27,7 @@ import {
   type CommerceRuntimePackMapping,
 } from '@/lib/integrations/commercePackRuntime'
 import {
+  exactWholeCommerceQuantityFromNumeric,
   resolveCommerceOrderLineProviderPrice,
   storableCommerceOrderLineProviderMoney,
 } from '@/lib/integrations/commerceOrderStaging'
@@ -1881,8 +1882,12 @@ function canonicalMerchandiseTotalMinor(
 ) {
   let total = BigInt(0)
   for (const line of operationalLines) {
+    const unfulfilledQuantity = exactWholeCommerceQuantityFromNumeric(
+      line.unfulfilled_quantity,
+    )
     if (
-      !/^[1-9][0-9]*$/.test(line.unfulfilled_quantity)
+      unfulfilledQuantity === null
+      || unfulfilledQuantity <= BigInt(0)
       || line.resolved_unit_price_minor === null
       || !/^[0-9]+$/.test(line.resolved_unit_price_minor)
       || line.resolved_currency_code !== candidate.currency_code
@@ -1893,7 +1898,7 @@ function canonicalMerchandiseTotalMinor(
         422,
       )
     }
-    total += BigInt(line.unfulfilled_quantity)
+    total += unfulfilledQuantity
       * BigInt(line.resolved_unit_price_minor)
   }
   if (!operationalLines.length) {
