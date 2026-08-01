@@ -391,6 +391,10 @@ function listDigest(domain: string, values: readonly string[]) {
     .digest('hex')
 }
 
+function codePointOrder(left: string, right: string) {
+  return left < right ? -1 : left > right ? 1 : 0
+}
+
 export function commerceActiveGrantedScopeDigest(scopes: readonly string[]) {
   return listDigest('commerce-active-scopes-v1', scopes)
 }
@@ -409,11 +413,10 @@ export function commerceActiveCohortHash(input: {
   targetActivationRevision: number
   accounts: readonly CommerceActiveCohortAccount[]
 }) {
-  const accounts = [...input.accounts].sort(
-    (left, right) => left.accountGlobalId.localeCompare(
-      right.accountGlobalId,
-    ),
-  )
+  const accounts = [...input.accounts].sort((left, right) => codePointOrder(
+    left.accountGlobalId,
+    right.accountGlobalId,
+  ))
   const memberEvidence = accounts.map((account) => [
     account.accountId,
     account.accountGlobalId,
@@ -555,11 +558,10 @@ function normalizeRequestedSelection(value: unknown) {
       capabilities: [...new Set(source.capabilities)].sort() as
         CommerceActiveWriteCapability[],
     }
-  }).sort(
-    (left, right) => left.accountGlobalId.localeCompare(
-      right.accountGlobalId,
-    ),
-  )
+  }).sort((left, right) => codePointOrder(
+    left.accountGlobalId,
+    right.accountGlobalId,
+  ))
   if (
     new Set(selected.map((entry) => entry.accountGlobalId)).size
     !== selected.length
@@ -884,11 +886,10 @@ export async function prepareCommerceActiveTransitionInPostgres(
           requested.capabilities,
         ),
       }
-    }).sort(
-      (left, right) => left.accountGlobalId.localeCompare(
-        right.accountGlobalId,
-      ),
-    )
+    }).sort((left, right) => codePointOrder(
+      left.accountGlobalId,
+      right.accountGlobalId,
+    ))
     const cohortHash = commerceActiveCohortHash({
       organizationId: scopedOrganizationId,
       expectedActivationState: 'shadow',

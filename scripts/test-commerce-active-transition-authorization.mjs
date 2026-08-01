@@ -92,6 +92,14 @@ function verifySourceContracts() {
   const migration = read(
     'db/migrations/0167_operations_commerce_active_transition_authorization.sql',
   )
+  const collationRepair = read(
+    'db/migrations/0199_operations_commerce_active_canonical_collation.sql',
+  )
+  assert.match(collationRepair, /COLLATE "C"/)
+  assert.match(
+    collationRepair,
+    /operations_commerce_active_cohort_json_valid/,
+  )
   for (const fragment of [
     'operations_commerce_active_transition_preparations',
     'operations_commerce_active_transition_authorizations',
@@ -470,6 +478,15 @@ async function verifyDisposablePostgres() {
       },
       timeout: 180_000,
     })
+    const canonicalScopeOrder = await pool.query(
+      `SELECT operations_commerce_active_configuration_scopes(
+         '{"grantedScopes":["read_customers","read_custom_fulfillment_services"]}'::jsonb
+       ) AS scopes`,
+    )
+    assert.deepEqual(canonicalScopeOrder.rows[0].scopes, [
+      'read_custom_fulfillment_services',
+      'read_customers',
+    ])
 
     const postgresMock = {
       acquireTransactionAdvisoryLock: async () => undefined,
