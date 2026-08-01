@@ -5780,6 +5780,10 @@ export async function prepareOperationsShipmentExecutionFromPostgres(input: {
            ),
            'shopify-checkout-receipt-v1',
            offer.offer_snapshot
+           || jsonb_build_object(
+             'packagePlanHash', offer.package_plan_hash,
+             'packageCount', offer.package_count
+           )
          FROM operations_shopify_checkout_rate_receipt_offers offer
          WHERE offer.organization_id = $1::uuid
            AND offer.receipt_id = $2::uuid`,

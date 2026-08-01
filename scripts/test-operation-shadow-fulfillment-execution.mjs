@@ -30,6 +30,13 @@ const rateChoicePackageIdentityRepair = readFileSync(
   ),
   'utf8',
 )
+const twoPassPackRateMigration = readFileSync(
+  resolve(
+    root,
+    'db/migrations/0145_operations_two_pass_pack_rate_runs.sql',
+  ),
+  'utf8',
+)
 
 const commandStart = persistence.indexOf(
   'export async function prepareOperationsShipmentExecutionFromPostgres',
@@ -151,6 +158,53 @@ assert.equal(
   false,
   'Fulfillment rate choices must not omit their immutable package-plan identity',
 )
+
+const checkoutRateChoiceInsertStart = command.indexOf(
+  'INSERT INTO operations_pack_rate_run_rate_choices',
+)
+const checkoutRateChoiceInsertEnd = command.indexOf(
+  'const fulfillmentInputSnapshot',
+  checkoutRateChoiceInsertStart,
+)
+assert.ok(
+  checkoutRateChoiceInsertStart >= 0
+    && checkoutRateChoiceInsertEnd > checkoutRateChoiceInsertStart,
+  'Checkout rate-choice reconstruction is missing',
+)
+const checkoutRateChoiceInsert = command.slice(
+  checkoutRateChoiceInsertStart,
+  checkoutRateChoiceInsertEnd,
+)
+for (const fragment of [
+  "'shopify-checkout-receipt-v1'",
+  'offer.offer_snapshot\n           || jsonb_build_object(',
+  "'packagePlanHash', offer.package_plan_hash",
+  "'packageCount', offer.package_count",
+]) {
+  assert.ok(
+    checkoutRateChoiceInsert.includes(fragment),
+    `Checkout rate-choice reconstruction must retain canonical package identity: ${fragment}`,
+  )
+}
+assert.equal(
+  checkoutRateChoiceInsert.includes(
+    "'shopify-checkout-receipt-v1',\n           offer.offer_snapshot\n         FROM",
+  ),
+  false,
+  'Checkout rate-choice reconstruction must not retain the offer snapshot without canonical package identity',
+)
+for (const fragment of [
+  "NEW.normalized_response->>'packagePlanHash'",
+  'IS DISTINCT FROM run_package_plan_hash',
+  "NEW.normalized_response->'packageCount'",
+  'IS DISTINCT FROM to_jsonb(expected_count)',
+  'Recorded carrier choice must reference the exact immutable package plan',
+]) {
+  assert.ok(
+    twoPassPackRateMigration.includes(fragment),
+    `Pack-rate child trigger must reject incomplete package identity: ${fragment}`,
+  )
+}
 
 assert.equal(
   command.includes(

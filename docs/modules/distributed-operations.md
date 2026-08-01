@@ -1488,6 +1488,11 @@ package count alongside one exact retained provider rate inside its normalized
 response. The database rejects a carrier choice whose provider fact differs,
 whose package identity is absent, or whose package identity differs from the
 sealed plan.
+The reconstructed checkout rate choices obey the same package-identity rule:
+their immutable receipt offer snapshot is augmented from the receipt row's
+authoritative package-plan hash and package count, with those canonical columns
+overriding any absent or conflicting snapshot keys. Reconstruction never
+rewrites or backfills the completed checkout receipt.
 Shopify's checkout callback can supply only the destination country and postal
 code, so its keyed carrier destination fingerprint remains checkout-zone
 reconciliation evidence. The later fulfillment rerate independently derives a
