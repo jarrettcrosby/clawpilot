@@ -838,7 +838,7 @@ async function verifyPostgresAcceptance(connectionString) {
         WHERE id = $1`,
       [fixture.agentId],
     )
-    assert.match(credentialRecord.rows[0].global_id, /^gpt\d{7}$/)
+    assert.match(credentialRecord.rows[0].global_id, /^gpt[0-9a-v]{12}$/)
     assert.equal(credentialRecord.rows[0].secret_hash, fixture.secretHash)
     assert.notEqual(credentialRecord.rows[0].secret_hash, fixture.plainSecret)
     assert.equal(credentialRecord.rows[0].credential_version, 1)
@@ -979,9 +979,9 @@ async function verifyPostgresAcceptance(connectionString) {
       hash: 'c'.repeat(64),
       storageReference: `s3://print-delivery/${fixture.suffix}/packing-a4.png`,
     })
-    assert.match(labelArtifact.global_id, /^gpf\d{7}$/)
-    assert.match(packingArtifact.global_id, /^gpf\d{7}$/)
-    assert.match(a4Artifact.global_id, /^gpf\d{7}$/)
+    assert.match(labelArtifact.global_id, /^gpf[0-9a-v]{12}$/)
+    assert.match(packingArtifact.global_id, /^gpf[0-9a-v]{12}$/)
+    assert.match(a4Artifact.global_id, /^gpf[0-9a-v]{12}$/)
     await expectRejected(
       () => createArtifact(pool, fixture, {
         documentType: 'packing_slip',

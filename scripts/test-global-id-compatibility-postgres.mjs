@@ -93,8 +93,33 @@ async function seedGrandfatheredDuplicate(client) {
   }
 }
 
+async function verifyDeploymentAAllocator(client) {
+  const definition = await client.query(`
+    SELECT pg_get_functiondef(procedure.oid) AS definition
+    FROM pg_proc procedure
+    JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+    WHERE namespace.nspname = current_schema()
+      AND procedure.proname = 'allocate_global_reference'
+      AND pg_get_function_identity_arguments(procedure.oid) =
+        'requested_prefix text'
+  `)
+  assert.equal(definition.rowCount, 1)
+  assert.match(definition.rows[0].definition, /1000000 \+ floor\(random\(\) \* 9000000\)/)
+  assert.doesNotMatch(definition.rows[0].definition, /gen_random_bytes/)
+
+  await client.query('BEGIN')
+  try {
+    const allocated = await client.query(
+      `SELECT allocate_global_reference('ga') AS reference_code`,
+    )
+    assert.match(allocated.rows[0].reference_code, /^ga[0-9]{7}$/)
+  } finally {
+    await client.query('ROLLBACK')
+  }
+}
+
 async function verifyCompatibility(databaseUrl) {
-  const pool = new Pool({ connectionString: databaseUrl, max: 2 })
+  const pool = new Pool({ connectionString: databaseUrl, max: 8 })
   const client = await pool.connect()
   try {
     const duplicate = await client.query(`
@@ -151,12 +176,131 @@ async function verifyCompatibility(databaseUrl) {
     `)
     assert.equal(unvalidated.rows[0].count, 0)
 
-    await client.query('BEGIN')
-    const allocated = await client.query(
-      `SELECT allocate_global_reference('ga') AS reference_code`,
+    const allocatorDefinition = await client.query(`
+      SELECT pg_get_functiondef(procedure.oid) AS definition
+      FROM pg_proc procedure
+      JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+      WHERE namespace.nspname = current_schema()
+        AND procedure.proname = 'allocate_global_reference'
+        AND pg_get_function_identity_arguments(procedure.oid) =
+          'requested_prefix text'
+    `)
+    assert.equal(allocatorDefinition.rowCount, 1)
+    assert.match(allocatorDefinition.rows[0].definition, /gen_random_bytes\(12\)/)
+    assert.match(
+      allocatorDefinition.rows[0].definition,
+      /0123456789abcdefghijklmnopqrstuv/,
     )
-    assert.match(allocated.rows[0].reference_code, /^ga[0-9]{7}$/)
-    await client.query('ROLLBACK')
+    assert.match(allocatorDefinition.rows[0].definition, /FOR attempt IN 1\.\.32 LOOP/)
+    assert.doesNotMatch(
+      allocatorDefinition.rows[0].definition,
+      /1000000 \+ floor\(random\(\) \* 9000000\)/,
+    )
+
+    const countsBeforeRollback = await client.query(`
+      SELECT
+        (SELECT count(*)::integer FROM crm_reference_number_registry) AS suffixes,
+        (SELECT count(*)::integer FROM crm_reference_registry) AS references
+    `)
+    await client.query('BEGIN')
+    try {
+      const allocated = await client.query(
+        `SELECT allocate_global_reference('ga') AS reference_code`,
+      )
+      const referenceCode = allocated.rows[0].reference_code
+      const suffix = referenceCode.slice(2)
+      assert.match(referenceCode, /^ga[0-9a-v]{12}$/)
+
+      const reserved = await client.query(
+        `SELECT EXISTS (
+           SELECT 1 FROM crm_reference_number_registry WHERE number_value = $1
+         ) AS found`,
+        [suffix],
+      )
+      assert.equal(reserved.rows[0].found, true)
+      const registered = await client.query(
+        `SELECT EXISTS (
+           SELECT 1
+           FROM crm_reference_registry
+           WHERE reference_code = $1
+             AND prefix = 'ga'
+             AND canonical_code = $1
+             AND entity_type = 'crm.organization'
+         ) AS found`,
+        [referenceCode],
+      )
+      assert.equal(registered.rows[0].found, true)
+    } finally {
+      await client.query('ROLLBACK')
+    }
+    const countsAfterRollback = await client.query(`
+      SELECT
+        (SELECT count(*)::integer FROM crm_reference_number_registry) AS suffixes,
+        (SELECT count(*)::integer FROM crm_reference_registry) AS references
+    `)
+    assert.deepEqual(
+      countsAfterRollback.rows[0],
+      countsBeforeRollback.rows[0],
+      'Rolling back an allocation must release both registry inserts',
+    )
+
+    await client.query('BEGIN')
+    try {
+      await expectRejected(
+        client,
+        `SELECT allocate_global_reference('gzz')`,
+        /Unsupported Global ID prefix/,
+      )
+    } finally {
+      await client.query('ROLLBACK')
+    }
+
+    const prefixes = Array.from({ length: 96 }, (_, index) => (
+      index % 2 === 0 ? 'ga' : 'gc'
+    ))
+    const concurrentAllocations = await Promise.all(prefixes.map(async (prefix) => {
+      const result = await pool.query(
+        `SELECT allocate_global_reference($1) AS reference_code`,
+        [prefix],
+      )
+      return { prefix, referenceCode: result.rows[0].reference_code }
+    }))
+    const wrapperAllocation = await client.query(
+      `SELECT allocate_crm_reference('ga') AS reference_code`,
+    )
+    concurrentAllocations.push({
+      prefix: 'ga',
+      referenceCode: wrapperAllocation.rows[0].reference_code,
+    })
+
+    const allocatedCodes = concurrentAllocations.map(({ prefix, referenceCode }) => {
+      assert.match(referenceCode, new RegExp(`^${prefix}[0-9a-v]{12}$`))
+      return referenceCode
+    })
+    const allocatedSuffixes = concurrentAllocations.map(
+      ({ prefix, referenceCode }) => referenceCode.slice(prefix.length),
+    )
+    assert.equal(new Set(allocatedCodes).size, allocatedCodes.length)
+    assert.equal(
+      new Set(allocatedSuffixes).size,
+      allocatedSuffixes.length,
+      'New suffixes must be globally unique across prefixes',
+    )
+
+    const durableAllocationRows = await client.query(
+      `SELECT
+         (SELECT count(*)::integer
+          FROM crm_reference_registry
+          WHERE reference_code = ANY($1::text[])) AS references,
+         (SELECT count(*)::integer
+          FROM crm_reference_number_registry
+          WHERE number_value = ANY($2::text[])) AS suffixes`,
+      [allocatedCodes, allocatedSuffixes],
+    )
+    assert.deepEqual(durableAllocationRows.rows[0], {
+      references: allocatedCodes.length,
+      suffixes: allocatedSuffixes.length,
+    })
 
     await client.query('BEGIN')
     try {
@@ -207,6 +351,26 @@ async function verifyCompatibility(databaseUrl) {
          VALUES ('00000000000w')`,
         /crm_reference_number_registry_valid/,
       )
+      await client.query(`
+        INSERT INTO crm_reference_number_registry (number_value)
+        VALUES ('vvvvvvvvvvvv')
+      `)
+      await client.query(`
+        INSERT INTO crm_reference_registry (
+          reference_code, prefix, canonical_code, status, entity_type
+        )
+        SELECT 'gavvvvvvvvvvvv', 'ga', 'gavvvvvvvvvvvv', 'active', entity_type
+        FROM global_reference_entity_types WHERE prefix = 'ga'
+      `)
+      await expectRejected(
+        client,
+        `INSERT INTO crm_reference_registry (
+           reference_code, prefix, canonical_code, status, entity_type
+         )
+         SELECT 'gcvvvvvvvvvvvv', 'gc', 'gcvvvvvvvvvvvv', 'active', entity_type
+         FROM global_reference_entity_types WHERE prefix = 'gc'`,
+        /suffix is already allocated/,
+      )
     } finally {
       await client.query('ROLLBACK')
     }
@@ -238,10 +402,14 @@ async function main() {
     try {
       const files = migrationFiles()
       const deploymentAIndex = files.findIndex((file) => file.startsWith('0202_'))
+      const deploymentBIndex = files.findIndex((file) => file.startsWith('0219_'))
       assert.ok(deploymentAIndex > 0, '0202 Deployment A migration is missing')
+      assert.ok(deploymentBIndex > deploymentAIndex, '0219 Deployment B migration is missing')
       await applyMigrations(client, files.slice(0, deploymentAIndex))
       await seedGrandfatheredDuplicate(client)
-      await applyMigrations(client, files.slice(deploymentAIndex))
+      await applyMigrations(client, files.slice(deploymentAIndex, deploymentBIndex))
+      await verifyDeploymentAAllocator(client)
+      await applyMigrations(client, files.slice(deploymentBIndex))
     } finally {
       client.release()
       await pool.end()

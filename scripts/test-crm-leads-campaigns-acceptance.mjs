@@ -482,7 +482,7 @@ async function runApiAcceptance(baseUrl, token, pool) {
     ['interactions', callInteraction, 'gi'], ['interactions', inPersonInteraction, 'gi'],
     ['interactions', linkedMeetingInteraction, 'gi'],
   ]) {
-    assert.match(record.referenceCode, new RegExp(`^${prefix}[0-9]{7}$`), `${entity} Global ID`)
+    assert.match(record.referenceCode, new RegExp(`^${prefix}[0-9a-v]{12}$`), `${entity} Global ID`)
     assert.equal(record.shortUrl, `${shortLinkOrigin}/s/${record.referenceCode}`)
   }
 
@@ -540,9 +540,9 @@ async function runApiAcceptance(baseUrl, token, pool) {
     }),
   })
   assert.equal(conversion.result.created, true)
-  assert.match(conversion.result.accountReferenceCode, /^ga[0-9]{7}$/)
-  assert.match(conversion.result.contactReferenceCode, /^gc[0-9]{7}$/)
-  assert.match(conversion.result.opportunityReferenceCode, /^go[0-9]{7}$/)
+  assert.match(conversion.result.accountReferenceCode, /^ga[0-9a-v]{12}$/)
+  assert.match(conversion.result.contactReferenceCode, /^gc[0-9a-v]{12}$/)
+  assert.match(conversion.result.opportunityReferenceCode, /^go[0-9a-v]{12}$/)
   const replayedConversion = await apiJson(baseUrl, token, '/api/crm', {
     method: 'PATCH',
     body: JSON.stringify({ action: 'convert-lead', entity: 'leads', id: lead.id, fields: {} }),
@@ -685,7 +685,7 @@ async function runApiAcceptance(baseUrl, token, pool) {
     [lead.id],
   )
   assert.equal(ownerProof.rows[0].owner_email, actorEmail)
-  assert.match(ownerProof.rows[0].owner_user_reference_code, /^gu[0-9]{7}$/)
+  assert.match(ownerProof.rows[0].owner_user_reference_code, /^gu[0-9a-v]{12}$/)
   assert.equal(ownerProof.rows[0].owner_name, actorEmail)
   assert.equal(ownerProof.rows[0].linked_contact_id, convertedLead.convertedContactId)
 

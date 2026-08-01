@@ -319,6 +319,7 @@ for (const requiredPath of [
   'db/migrations/0216_global_id_alphanumeric_expand_121_130.sql',
   'db/migrations/0217_global_id_alphanumeric_expand_131_140.sql',
   'db/migrations/0218_global_id_alphanumeric_expand_141_149_and_catalog_gate.sql',
+  'db/migrations/0219_global_id_base32hex_allocator.sql',
   'app_src/app/api/crm/products/[productId]/images/route.ts',
   'app_src/app/api/crm/products/[productId]/images/[assetId]/route.ts',
   'app_src/app/api/crm/products/[productId]/shopify-product-image/route.ts',

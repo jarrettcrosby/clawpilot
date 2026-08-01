@@ -340,6 +340,7 @@ export async function GET() {
           operations_sandbox_commerce_e2e_active_guards_applied: boolean
           operations_fulfillment_notification_policy_applied: boolean
           global_id_alphanumeric_compatibility_applied: boolean
+          global_id_base32hex_allocator_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -1152,6 +1153,53 @@ export async function GET() {
                 WHERE filename =
                   '0218_global_id_alphanumeric_expand_141_149_and_catalog_gate.sql'
               ) AS global_id_alphanumeric_compatibility_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0219_global_id_base32hex_allocator.sql'
+              ) AND EXISTS (
+                SELECT 1
+                FROM pg_proc procedure
+                JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+                WHERE namespace.nspname = current_schema()
+                  AND procedure.proname = 'allocate_global_reference'
+                  AND pg_get_function_identity_arguments(procedure.oid) =
+                    'requested_prefix text'
+                  AND position(
+                    'gen_random_bytes(12)'
+                    IN pg_get_functiondef(procedure.oid)
+                  ) > 0
+                  AND position(
+                    '0123456789abcdefghijklmnopqrstuv'
+                    IN pg_get_functiondef(procedure.oid)
+                  ) > 0
+                  AND position(
+                    'FOR attempt IN 1..32 LOOP'
+                    IN pg_get_functiondef(procedure.oid)
+                  ) > 0
+                  AND position(
+                    '1000000 + floor(random() * 9000000)'
+                    IN pg_get_functiondef(procedure.oid)
+                  ) = 0
+              ) AND EXISTS (
+                SELECT 1
+                FROM pg_index index_row
+                WHERE index_row.indexrelid = to_regclass(
+                    'crm_reference_registry_base32hex_suffix_unique_idx'
+                  )
+                  AND index_row.indisunique
+                  AND index_row.indisvalid
+                  AND index_row.indisready
+                  AND position(
+                    'global_reference_suffix'
+                    IN pg_get_indexdef(index_row.indexrelid)
+                  ) > 0
+                  AND position(
+                    '= 12'
+                    IN pg_get_indexdef(index_row.indexrelid)
+                  ) > 0
+              ) AS global_id_base32hex_allocator_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1320,6 +1368,7 @@ export async function GET() {
             && row?.operations_sandbox_commerce_e2e_active_guards_applied
             && row?.operations_fulfillment_notification_policy_applied
             && row?.global_id_alphanumeric_compatibility_applied
+            && row?.global_id_base32hex_allocator_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1480,6 +1529,7 @@ export async function GET() {
           || !row?.operations_sandbox_commerce_e2e_active_guards_applied
           || !row?.operations_fulfillment_notification_policy_applied
           || !row?.global_id_alphanumeric_compatibility_applied
+          || !row?.global_id_base32hex_allocator_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

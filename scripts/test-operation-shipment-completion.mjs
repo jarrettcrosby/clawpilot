@@ -988,7 +988,7 @@ async function verifyShipmentCompletion(databaseUrl) {
       'pre_label_pack_work_instruction',
     )
     assert.equal(generatedPackingList.finalPackingSlip, false)
-    assert.match(generatedPackingList.packingSlipArtifactGlobalId, /^gpf\d{7}$/)
+    assert.match(generatedPackingList.packingSlipArtifactGlobalId, /^gpf[0-9a-v]{12}$/)
     assert.equal(
       generatedPackingList.contentUrl,
       `/api/operations/artifacts/${generatedPackingList.packingSlipArtifactGlobalId}`,
@@ -1178,7 +1178,7 @@ async function verifyShipmentCompletion(databaseUrl) {
       [successFixture.organizationId, successful.planned.orderGlobalId],
     )
     assert.equal(shipment.rowCount, 1)
-    assert.match(shipment.rows[0].global_id, /^gsh\d{7}$/)
+    assert.match(shipment.rows[0].global_id, /^gsh[0-9a-v]{12}$/)
     assert.equal(shipment.rows[0].tracking_number, mockLabel.trackingNumber)
     const artifact = await pool.query(
       `SELECT artifact.global_id,
@@ -1202,7 +1202,7 @@ async function verifyShipmentCompletion(databaseUrl) {
       [successFixture.organizationId, successful.planned.orderGlobalId],
     )
     assert.equal(artifact.rowCount, 1)
-    assert.match(artifact.rows[0].global_id, /^gpf\d{7}$/)
+    assert.match(artifact.rows[0].global_id, /^gpf[0-9a-v]{12}$/)
     assert.equal(artifact.rows[0].has_shipment, true)
     assert.equal(artifact.rows[0].format, 'PDF')
     assert.equal(artifact.rows[0].media_size, 'letter')
@@ -1232,7 +1232,7 @@ async function verifyShipmentCompletion(databaseUrl) {
       status: 'confirmed',
       source: 'shipment_confirmation',
     }])
-    assert.match(observation.rows[0].global_id, /^gto\d{7}$/)
+    assert.match(observation.rows[0].global_id, /^gto[0-9a-v]{12}$/)
 
     const replayed = await persistence.confirmOperationsOrderShipmentFromPostgres(successInput)
     assert.equal(replayed.replayed, true)
@@ -1453,7 +1453,7 @@ async function verifyShipmentCompletion(databaseUrl) {
       lifetimeMinutes: 30,
     })
     assert.equal(authorization.state, 'active')
-    assert.match(authorization.authorizationGlobalId, /^gsea\d{7}$/)
+    assert.match(authorization.authorizationGlobalId, /^gsea[0-9a-v]{12}$/)
     const authorizationReplay = await sandboxAuthorization
       .authorizeSandboxCommerceE2eInPostgres({
         organizationId: authorizedFixture.organizationId,

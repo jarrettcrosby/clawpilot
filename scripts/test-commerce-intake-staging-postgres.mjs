@@ -668,7 +668,7 @@ async function verifyPromotionNumericScaleAcceptance(
   assert.equal(promotion.reservationWrites, 0)
   assert.equal(promotion.fulfillmentWrites, 0)
   assert.equal(promotion.shipmentWrites, 0)
-  assert.match(promotion.canonicalOrderGlobalId, /^gor[0-9]{7}$/)
+  assert.match(promotion.canonicalOrderGlobalId, /^gor[0-9a-v]{12}$/)
   assert.equal(promotion.canonicalLineGlobalIds.length, 1)
 
   const exactEvidence = await pool.query(

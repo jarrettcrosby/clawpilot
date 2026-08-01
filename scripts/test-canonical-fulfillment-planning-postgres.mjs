@@ -2588,7 +2588,7 @@ async function verifyCanonicalPlanning(databaseUrl) {
       result.cartonizationEvidenceGlobalId,
       fixture.evidence.global_id,
     )
-    assert.match(result.fulfillmentPlanGlobalId, /^gfp\d{7}$/)
+    assert.match(result.fulfillmentPlanGlobalId, /^gfp[0-9a-v]{12}$/)
     assert.equal(result.carrier, 'UPS')
     assert.equal(result.serviceCode, 'ground')
     assert.equal(result.serviceName, 'UPS Ground')

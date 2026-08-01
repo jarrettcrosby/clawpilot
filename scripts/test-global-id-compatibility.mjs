@@ -85,6 +85,41 @@ const healthRoute = readFileSync(resolve('app_src/app/api/health/route.ts'), 'ut
 assert.match(healthRoute, new RegExp(finalMigration.replaceAll('.', '\\.')))
 assert.match(healthRoute, /row\?\.global_id_alphanumeric_compatibility_applied/)
 const predeploy = readFileSync(resolve('scripts/verify-predeploy.mjs'), 'utf8')
+const allocatorMigrationName = '0219_global_id_base32hex_allocator.sql'
+const allocatorMigration = readFileSync(
+  resolve('db/migrations', allocatorMigrationName),
+  'utf8',
+)
+for (const fragment of [
+  "SET LOCAL lock_timeout = '5s';",
+  "SET LOCAL statement_timeout = '25s';",
+  'gen_random_bytes(12)',
+  '0123456789abcdefghijklmnopqrstuv',
+  'FOR attempt IN 1..32 LOOP',
+  'ON CONFLICT (number_value) DO NOTHING',
+  'PARALLEL UNSAFE',
+  'SECURITY INVOKER',
+  'SET search_path = pg_catalog, public',
+  'numeric-only Global ID CHECK',
+  'unvalidated Global ID CHECK',
+  'duplicate base32hex Global ID suffixes',
+  'enforce_crm_reference_number_exclusive_insert',
+  'CREATE UNIQUE INDEX crm_reference_registry_base32hex_suffix_unique_idx',
+]) {
+  assert.ok(allocatorMigration.includes(fragment), `Allocator migration is missing ${fragment}`)
+}
+assert.doesNotMatch(allocatorMigration, /candidate_number := \(1000000/)
+assert.match(healthRoute, new RegExp(allocatorMigrationName.replaceAll('.', '\\.')))
+assert.match(healthRoute, /row\?\.global_id_base32hex_allocator_applied/)
+assert.match(healthRoute, /pg_get_functiondef\(procedure\.oid\)/)
+assert.match(healthRoute, /gen_random_bytes\(12\)/)
+assert.match(healthRoute, /crm_reference_registry_base32hex_suffix_unique_idx/)
+assert.match(healthRoute, /index_row\.indisvalid/)
+assert.match(healthRoute, /index_row\.indisready/)
+assert.match(
+  predeploy,
+  new RegExp(`db/migrations/${allocatorMigrationName.replaceAll('.', '\\.')}`),
+)
 const operationsSection = readFileSync(
   resolve('app_src/components/operations/OperationsSection.tsx'),
   'utf8',

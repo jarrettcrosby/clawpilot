@@ -2520,7 +2520,7 @@ async function verifyInboundReceivingAcceptance(pool, persistence, fixture) {
     cutoffTime: '16:00',
     createStarterLocations: false,
   })
-  assert.match(warehouse.warehouseGlobalId, /^gwh\d{7}$/)
+  assert.match(warehouse.warehouseGlobalId, /^gwh[0-9a-v]{12}$/)
   assert.equal(warehouse.locationGlobalIds.length, 0)
 
   const location = await persistence.createOperationsLocationInPostgres({
@@ -2542,7 +2542,7 @@ async function verifyInboundReceivingAcceptance(pool, persistence, fixture) {
       maxQuantity: 4,
     }],
   })
-  assert.match(location.locationGlobalId, /^gwl\d{7}$/)
+  assert.match(location.locationGlobalId, /^gwl[0-9a-v]{12}$/)
 
   const poolResult = await pool.query(
     `INSERT INTO operations_inventory_pools (
@@ -2559,7 +2559,7 @@ async function verifyInboundReceivingAcceptance(pool, persistence, fixture) {
     ],
   )
   const inventoryPoolGlobalId = poolResult.rows[0].global_id
-  assert.match(inventoryPoolGlobalId, /^gip\d{7}$/)
+  assert.match(inventoryPoolGlobalId, /^gip[0-9a-v]{12}$/)
 
   const referenceNumber = `RECEIPT-${randomUUID()}`
   const expectedAt = new Date(Date.now() + 86_400_000).toISOString()
@@ -2581,7 +2581,7 @@ async function verifyInboundReceivingAcceptance(pool, persistence, fixture) {
       }],
     },
   })
-  assert.match(created.receiptGlobalId, /^grc\d{7}$/)
+  assert.match(created.receiptGlobalId, /^grc[0-9a-v]{12}$/)
   assert.equal(created.status, 'expected')
   assert.equal(created.rowVersion, 0)
   assert.equal(created.expectedQuantity, 2)
@@ -2905,7 +2905,7 @@ async function verifyReplenishmentExecutionAcceptance(pool, persistence, fixture
       quantity: 8,
     },
   })
-  assert.match(moved.replenishmentTaskGlobalId, /^grpl\d{7}$/)
+  assert.match(moved.replenishmentTaskGlobalId, /^grpl[0-9a-v]{12}$/)
   assert.equal(moved.status, 'completed')
   assert.equal(moved.movedQuantity, 8)
   assert.equal(moved.sourceAvailableAfter, 12)
@@ -3203,7 +3203,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
         },
       })
     ))
-    assert.match(firstPackageProfile.globalId, /^gpp\d{7}$/)
+    assert.match(firstPackageProfile.globalId, /^gpp[0-9a-v]{12}$/)
     assert.equal(firstPackageProfile.rowVersion, 0)
     assert.equal(firstPackageProfile.source, 'csv_import')
     assert.equal(firstPackageProfile.measurementSystem, 'metric')
@@ -3276,7 +3276,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
       actorEmail: primary.email,
       proof: primaryProof,
     })
-    assert.match(first.orderGlobalId, /^gor\d{7}$/)
+    assert.match(first.orderGlobalId, /^gor[0-9a-v]{12}$/)
     assert.equal(first.orderStatus, 'shipped')
     assert.equal(first.duplicate, false)
     assert.match(first.trackingNumber, /^MOCK[A-F0-9]{18}$/)
@@ -3347,7 +3347,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
     })
     assert.equal(createdCustomer.status, 'created')
     assert.equal(createdCustomer.method, 'created')
-    assert.match(createdCustomer.customer.globalId, /^ga\d{7}$/)
+    assert.match(createdCustomer.customer.globalId, /^ga[0-9a-v]{12}$/)
     const createdAgain = await persistence.resolveCommerceCustomerInPostgres({
       organizationId: primary.organizationId,
       integrationAccountGlobalId: commerceIntegration.rows[0].global_id,
@@ -3940,7 +3940,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
         primary.email,
       ],
     )
-    assert.match(exceptionSeed.rows[0].global_id, /^gex\d{7}$/)
+    assert.match(exceptionSeed.rows[0].global_id, /^gex[0-9a-v]{12}$/)
     const exceptionWorkspace = await persistence.readOperationsWorkspaceFromPostgres({
       organizationId: primary.organizationId,
       capabilities: { canView: true, canManage: true, canExecute: true },
