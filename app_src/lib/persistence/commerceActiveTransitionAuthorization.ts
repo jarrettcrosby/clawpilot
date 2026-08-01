@@ -897,6 +897,45 @@ export async function prepareCommerceActiveTransitionInPostgres(
       targetActivationRevision: activationRevision + 1,
       accounts,
     })
+    const databasePreflight = await client.query<{
+      cohort_valid: boolean
+      cohort_hash: string
+      matches_current: boolean
+    }>(
+      `SELECT
+         operations_commerce_active_cohort_json_valid($2::jsonb) AS cohort_valid,
+         operations_commerce_active_cohort_hash(
+           $1::uuid, 'shadow', $3, 'active', $4, $2::jsonb
+         ) AS cohort_hash,
+         operations_commerce_active_cohort_matches_current(
+           $1::uuid, $2::jsonb, 'shadow', $3, 'priorAccountStatus'
+         ) AS matches_current`,
+      [
+        scopedOrganizationId,
+        JSON.stringify(accounts),
+        activationRevision,
+        activationRevision + 1,
+      ],
+    )
+    const databaseEvidence = databasePreflight.rows[0]
+    if (!databaseEvidence?.cohort_valid) {
+      fail(
+        'COMMERCE_ACTIVE_COHORT_SCHEMA_MISMATCH',
+        'The exact provider-write cohort does not satisfy the database evidence schema',
+      )
+    }
+    if (databaseEvidence.cohort_hash !== cohortHash) {
+      fail(
+        'COMMERCE_ACTIVE_COHORT_HASH_MISMATCH',
+        'The application and database disagree on the exact provider-write cohort hash',
+      )
+    }
+    if (!databaseEvidence.matches_current) {
+      fail(
+        'COMMERCE_ACTIVE_ACCOUNT_EVIDENCE_DRIFT',
+        'The selected commerce account or credential evidence changed during Active review preparation',
+      )
+    }
     const inserted = await client.query<PreparationRow>(
       `INSERT INTO
          operations_commerce_active_transition_preparations (

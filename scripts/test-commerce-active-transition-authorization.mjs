@@ -514,7 +514,11 @@ async function verifyDisposablePostgres() {
 
     const selectedAccounts = [{
       accountGlobalId: accounts.shopify.global_id,
-      capabilities: ['shipping_rate_callbacks'],
+      capabilities: [
+        'fulfillment_export',
+        'shipping_rate_callbacks',
+        'tracking_export',
+      ],
     }]
     const prepared = await persistence
       .prepareCommerceActiveTransitionInPostgres({
@@ -810,7 +814,7 @@ async function verifyDisposablePostgres() {
     assert.equal(activated.state, 'active')
     assert.equal(activated.revision, 2)
     assert.equal(activated.accountCount, 1)
-    assert.equal(activated.capabilityCount, 1)
+    assert.equal(activated.capabilityCount, 3)
     const activatedReplay = await persistence
       .consumeCommerceActiveTransitionAuthorizationInPostgres({
         organizationId,
