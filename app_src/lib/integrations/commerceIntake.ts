@@ -56,6 +56,7 @@ import {
   promoteCommerceCandidateInPostgres,
   reconcilePromotedCommerceCandidateCheckoutRateInPostgres,
   readCommerceIntakeRejectionTargetFromPostgres,
+  readAutomaticCommerceCustomerTargetsForRunInPostgres,
   readCommerceIntakeRefreshTargetFromPostgres,
   readCommerceIntakeStateFromPostgres,
   readCommerceIntakeStageReplayFromPostgres,
@@ -71,6 +72,7 @@ import {
   type CommerceIntakeReadIntentAction,
   type CommerceIntakeReadIntentTarget,
 } from '@/lib/persistence/commerceIntake'
+import { resolveCommerceCustomerInPostgres } from '@/lib/persistence/operations'
 
 const INTAKE_POLICY_VERSION = 'commerce-intake-resolution-v2'
 const INTAKE_RETENTION_DAYS = 30
@@ -1621,6 +1623,123 @@ async function withAutomaticProductCreation(
   }
 }
 
+function deterministicCustomerCommandUuid(parts: readonly string[]) {
+  const hex = createHash('sha256')
+    .update(parts.join('\0'))
+    .digest('hex')
+    .slice(0, 32)
+    .split('')
+  hex[12] = '5'
+  hex[16] = ['8', '9', 'a', 'b'][parseInt(hex[16], 16) % 4]
+  const value = hex.join('')
+  return [
+    value.slice(0, 8),
+    value.slice(8, 12),
+    value.slice(12, 16),
+    value.slice(16, 20),
+    value.slice(20),
+  ].join('-')
+}
+
+async function withAutomaticCustomerResolution(
+  command: Record<string, unknown>,
+  input: {
+    runtime: CommerceRuntimeCredentialRecord
+    actorEmail: string
+    action: IntakeCommandAction
+  },
+) {
+  if (
+    input.action !== 'fetch'
+    && input.action !== 'fetch-next'
+    && input.action !== 'refresh'
+    && input.action !== 'retry-rejection'
+  ) return command
+  const runGlobalId = typeof command.runGlobalId === 'string'
+    ? command.runGlobalId
+    : ''
+  if (!RUN_PATTERN.test(runGlobalId)) return command
+  const targets = await readAutomaticCommerceCustomerTargetsForRunInPostgres({
+    runtime: input.runtime,
+    runGlobalId,
+  })
+  let matched = 0
+  let created = 0
+  let ambiguous = 0
+  let skipped = 0
+  let failed = 0
+  const failedByCode: Record<string, number> = {}
+  for (const target of targets) {
+    if (!target.externalCustomerId || !target.companyName) {
+      skipped += 1
+      continue
+    }
+    try {
+      const resolution = await resolveCommerceCustomerInPostgres({
+        organizationId: input.runtime.organizationId,
+        integrationAccountGlobalId: input.runtime.globalId,
+        actorEmail: input.actorEmail,
+        identity: {
+          provider: target.provider,
+          externalCustomerId: target.externalCustomerId,
+          companyName: target.companyName,
+          email: target.email,
+          phone: target.phone,
+          address: target.address,
+          city: target.city,
+          region: target.region,
+          postalCode: target.postalCode,
+          country: target.country,
+        },
+      })
+      if (resolution.status === 'ambiguous' || !resolution.customer) {
+        ambiguous += 1
+        continue
+      }
+      await resolveCommerceCandidateCustomerInPostgres({
+        runtime: input.runtime,
+        actorEmail: input.actorEmail,
+        idempotencyKey: deterministicCustomerCommandUuid([
+          'commerce-intake-auto-customer-v1',
+          input.runtime.globalId,
+          runGlobalId,
+          target.candidateGlobalId,
+          resolution.customer.globalId,
+        ]),
+        candidateGlobalId: target.candidateGlobalId,
+        candidateRowVersion: target.candidateRowVersion,
+        customer: {
+          mode: 'existing',
+          customerGlobalId: resolution.customer.globalId,
+        },
+      })
+      if (resolution.status === 'created') created += 1
+      else matched += 1
+    } catch (error) {
+      failed += 1
+      const code = error instanceof CommerceIntegrationRequestError
+        ? error.code
+        : 'COMMERCE_CUSTOMER_AUTO_RESOLUTION_FAILED'
+      failedByCode[code] = (failedByCode[code] || 0) + 1
+    }
+  }
+  return {
+    ...command,
+    automaticCustomerResolution: {
+      runGlobalId,
+      candidatesFound: targets.length,
+      matched,
+      created,
+      ambiguous,
+      skipped,
+      failed,
+      failedByCode,
+      providerWrites: 0,
+      syncCursorAdvanced: false,
+    },
+  }
+}
+
 type ExecuteCommerceIntakeInput = {
   organizationId: unknown
   actorEmail: string
@@ -1769,8 +1888,16 @@ async function executeCommerceIntakeCommandInternal(
       target: replayTarget,
     })
     if (replay) {
-      const command = await withAutomaticProductCreation(
+      const commandWithProducts = await withAutomaticProductCreation(
         replay as Record<string, unknown>,
+        {
+          runtime,
+          actorEmail: input.actorEmail,
+          action: commandAction,
+        },
+      )
+      const command = await withAutomaticCustomerResolution(
+        commandWithProducts,
         {
           runtime,
           actorEmail: input.actorEmail,
@@ -2013,8 +2140,17 @@ async function executeCommerceIntakeCommandInternal(
         action: commandAction,
       },
     )
+    const commandWithAutomaticResolution =
+      await withAutomaticCustomerResolution(
+        commandWithAutomaticCreation,
+        {
+          runtime,
+          actorEmail: input.actorEmail,
+          action: commandAction,
+        },
+      )
     return {
-      command: commandWithAutomaticCreation,
+      command: commandWithAutomaticResolution,
       intake: options.includeIntakeState
         ? await readCommerceIntakeStateFromPostgres({
             organizationId: runtime.organizationId,

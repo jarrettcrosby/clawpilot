@@ -770,17 +770,17 @@ function blocker(code: string) {
     terminal: boolean
   }> = {
     customer_resolution_required: {
-      label: 'Choose or create the CRM customer',
+      label: 'Review the unresolved CRM customer identity',
       action: 'resolve-customer',
       terminal: false,
     },
     customer_redacted: {
-      label: 'Enter or choose the CRM customer',
+      label: 'Enter the provider-redacted CRM customer identity',
       action: 'resolve-customer',
       terminal: false,
     },
     customer_unavailable: {
-      label: 'Enter or choose the CRM customer',
+      label: 'Enter the unavailable CRM customer identity',
       action: 'resolve-customer',
       terminal: false,
     },
@@ -8511,6 +8511,84 @@ export async function resolveCommerceCandidateCustomerInPostgres(input: {
       result,
     )
     return result
+  })
+}
+
+export async function readAutomaticCommerceCustomerTargetsForRunInPostgres(
+  input: {
+    runtime: CommerceRuntimeCredentialRecord
+    runGlobalId: string
+  },
+) {
+  return withTransaction(async (client) => {
+    const account = await resolveAccount(client, {
+      organizationId: input.runtime.organizationId,
+      accountGlobalId: input.runtime.globalId,
+    })
+    const result = await client.query<CandidateRow>(
+      `${CANDIDATE_SELECT}
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.integration_account_id = $2::uuid
+         AND run.global_id = $3
+         AND run.credential_version = $4::integer
+         AND run.resource = 'orders'
+         AND candidate.expires_at > now()
+         AND candidate.workflow_state IN ('held', 'resolving')
+         AND candidate.customer_resolution_state = 'unresolved'
+       ORDER BY candidate.created_at, candidate.id`,
+      [
+        account.organization_id,
+        account.id,
+        input.runGlobalId,
+        input.runtime.credentialVersion,
+      ],
+    )
+    return result.rows.map((candidate) => {
+      let party: Record<string, unknown> | null = null
+      let address: Record<string, unknown> | null = null
+      try {
+        party = encryptedSnapshot(candidate, input.runtime.globalId, 'party')
+      } catch {
+        party = null
+      }
+      try {
+        address = encryptedSnapshot(candidate, input.runtime.globalId, 'ship_to')
+      } catch {
+        address = null
+      }
+      const externalIdentity = party?.externalIdentity
+      const externalCustomerId = externalIdentity
+        && typeof externalIdentity === 'object'
+        && !Array.isArray(externalIdentity)
+        && typeof (externalIdentity as Record<string, unknown>).value === 'string'
+        ? String((externalIdentity as Record<string, unknown>).value).trim()
+          || null
+        : null
+      const companyName = String(
+        party?.organizationName
+        || party?.contactName
+        || address?.organizationName
+        || address?.name
+        || party?.email
+        || '',
+      ).trim() || null
+      return {
+        candidateGlobalId: candidate.global_id,
+        candidateRowVersion: Number(candidate.row_version),
+        provider: candidate.provider,
+        externalCustomerId,
+        companyName,
+        email: String(party?.email || '').trim() || null,
+        phone: String(party?.phone || address?.phone || '').trim() || null,
+        address: String(address?.line1 || '').trim() || null,
+        city: String(address?.city || '').trim() || null,
+        region: String(address?.regionCode || address?.region || '').trim()
+          || null,
+        postalCode: String(address?.postalCode || '').trim() || null,
+        country: String(address?.countryCode || address?.country || '').trim()
+          || null,
+      }
+    })
   })
 }
 

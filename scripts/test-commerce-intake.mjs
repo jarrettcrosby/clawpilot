@@ -1593,6 +1593,21 @@ assert.ok(
     < persistenceSource.indexOf('customerResolutionMethod = \'created\''),
   'Commerce customer creation must bind its scoped identity before reporting creation',
 )
+includes(serviceSource, [
+  'withAutomaticCustomerResolution',
+  'readAutomaticCommerceCustomerTargetsForRunInPostgres',
+  'resolveCommerceCustomerInPostgres',
+  "resolution.status === 'ambiguous'",
+  "mode: 'existing'",
+  'automaticCustomerResolution',
+  'providerWrites: 0',
+], 'Automatic commerce customer resolution')
+includes(persistenceSource, [
+  "run.resource = 'orders'",
+  "candidate.customer_resolution_state = 'unresolved'",
+  "candidate.workflow_state IN ('held', 'resolving')",
+  "encryptedSnapshot(candidate, input.runtime.globalId, 'party')",
+], 'Automatic customer targets remain run and credential scoped')
 assert.ok(
   !persistenceSource.includes('records_failed AS records_rejected'),
   'Normalization rejection counts must come from stage audit evidence',
@@ -2345,6 +2360,9 @@ const service = loadTypeScriptModule(
         },
       },
       '@/lib/persistence/commerceIntake': {
+        async readAutomaticCommerceCustomerTargetsForRunInPostgres() {
+          return []
+        },
         async autoCreateCommerceProductsForRunInPostgres(input) {
           automaticProductSweeps.push(input)
           return {
@@ -2589,6 +2607,11 @@ const service = loadTypeScriptModule(
           }
         },
         validateCommerceCandidateInPostgres: persistenceCommand('validate'),
+      },
+      '@/lib/persistence/operations': {
+        async resolveCommerceCustomerInPostgres() {
+          throw new Error('Unexpected customer resolver call in this fixture')
+        },
       },
     },
   },
