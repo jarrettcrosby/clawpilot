@@ -6,6 +6,49 @@
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '25s';
 
+-- PostgreSQL 18 resolves nested SQL-function calls used by expression indexes
+-- under the function's configured search path. Deployment A intentionally did
+-- not pin that path because it only expanded read compatibility. Pin and
+-- schema-qualify the two dependent helpers before the v2 uniqueness index is
+-- built so the migration behaves identically for hardened roles and across
+-- supported PostgreSQL versions.
+CREATE OR REPLACE FUNCTION public.global_reference_code_is_valid(
+  value text,
+  expected_prefix text
+)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+STRICT
+SECURITY INVOKER
+SET search_path = pg_catalog, public
+AS $$
+  SELECT public.global_reference_prefix_is_valid(expected_prefix)
+    AND value ~ (
+      '^' || expected_prefix || '([0-9]{7}|[0-9a-v]{12})$'
+    )
+$$;
+
+CREATE OR REPLACE FUNCTION public.global_reference_suffix(
+  value text,
+  expected_prefix text
+)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+STRICT
+SECURITY INVOKER
+SET search_path = pg_catalog, public
+AS $$
+  SELECT CASE
+    WHEN public.global_reference_code_is_valid(value, expected_prefix)
+      THEN substring(value FROM char_length(expected_prefix) + 1)
+    ELSE NULL
+  END
+$$;
+
 DO $$
 DECLARE
   allocator_definition text;
@@ -15,8 +58,8 @@ BEGIN
     RAISE EXCEPTION 'Deployment B requires pgcrypto gen_random_bytes(integer)';
   END IF;
 
-  IF NOT global_reference_code_is_valid('ga1234567', 'ga')
-    OR NOT global_reference_code_is_valid('ga0123456789av', 'ga')
+  IF NOT public.global_reference_code_is_valid('ga1234567', 'ga')
+    OR NOT public.global_reference_code_is_valid('ga0123456789av', 'ga')
   THEN
     RAISE EXCEPTION 'Deployment B requires dual-format Global ID compatibility';
   END IF;

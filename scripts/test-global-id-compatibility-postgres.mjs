@@ -145,6 +145,52 @@ async function verifyCompatibility(databaseUrl) {
       uppercase_leak: false,
     })
 
+    const hardenedHelpers = await client.query(`
+      SELECT procedure.proname,
+             procedure.proconfig,
+             pg_get_functiondef(procedure.oid) AS definition
+      FROM pg_proc procedure
+      JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+      WHERE namespace.nspname = 'public'
+        AND procedure.proname IN (
+          'global_reference_code_is_valid',
+          'global_reference_suffix'
+        )
+      ORDER BY procedure.proname
+    `)
+    assert.equal(hardenedHelpers.rowCount, 2)
+    for (const helper of hardenedHelpers.rows) {
+      assert.ok(
+        helper.proconfig?.includes('search_path=pg_catalog, public'),
+        `${helper.proname} must pin its search path`,
+      )
+    }
+    assert.match(
+      hardenedHelpers.rows.find((row) => (
+        row.proname === 'global_reference_code_is_valid'
+      )).definition,
+      /public\.global_reference_prefix_is_valid/,
+    )
+    assert.match(
+      hardenedHelpers.rows.find((row) => (
+        row.proname === 'global_reference_suffix'
+      )).definition,
+      /public\.global_reference_code_is_valid/,
+    )
+
+    await client.query('BEGIN')
+    try {
+      await client.query(`SET LOCAL search_path = pg_catalog`)
+      const hardenedCall = await client.query(`
+        SELECT public.global_reference_suffix(
+          'ga0123456789av', 'ga'
+        ) AS suffix
+      `)
+      assert.equal(hardenedCall.rows[0].suffix, '0123456789av')
+    } finally {
+      await client.query('ROLLBACK')
+    }
+
     const numericOnlyChecks = await client.query(`
       SELECT count(*)::integer AS count
       FROM pg_constraint constraint_row
