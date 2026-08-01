@@ -154,7 +154,7 @@ function global_id_definition_is_current(array $definition, bool $unifiedSearch 
         && !empty($fullText['enabled']);
 }
 
-function refresh_and_verify_global_id_field(string $module, bool $unifiedSearch): void
+function refresh_and_verify_global_id_field(string $module): void
 {
     $objectName = BeanFactory::getObjectName($module);
     if (!is_string($objectName) || $objectName === '') {
@@ -190,10 +190,10 @@ function refresh_and_verify_global_id_field(string $module, bool $unifiedSearch)
         && is_array($freshBean->field_defs[CLAWPILOT_GLOBAL_ID_FIELD])
         ? $freshBean->field_defs[CLAWPILOT_GLOBAL_ID_FIELD]
         : [];
-    if (!global_id_definition_is_current($definition, $unifiedSearch)) {
-        $length = (int) ($definition['len'] ?? 0);
+    $definitionLength = (int) ($definition['len'] ?? 0);
+    if ($definitionLength < CLAWPILOT_GLOBAL_ID_MIN_LENGTH) {
         throw new RuntimeException(
-            "Global ID vardef for {$module} is stale after refresh (length {$length})"
+            "Global ID vardef for {$module} is stale after refresh (length {$definitionLength})"
         );
     }
 
@@ -270,7 +270,7 @@ function ensure_global_id_field(string $module, bool $unifiedSearch = true): voi
         $field->save($dynamic);
     }
 
-    refresh_and_verify_global_id_field($module, $unifiedSearch);
+    refresh_and_verify_global_id_field($module);
     $dynamic->setLabel('en_us', CLAWPILOT_GLOBAL_ID_LABEL, 'Global ID');
     if ($unifiedSearch) {
         ensure_global_id_search_field($module);

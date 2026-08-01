@@ -52,7 +52,8 @@ assertOrdered(refresh, [
   'VardefManager::refreshVardefs($module, $objectName);',
   "$GLOBALS['reload_vardefs'] = true;",
   '$freshBean = BeanFactory::newBean($module);',
-  'global_id_definition_is_current($definition, $unifiedSearch)',
+  '$definitionLength = (int) ($definition[\'len\'] ?? 0);',
+  '$definitionLength < CLAWPILOT_GLOBAL_ID_MIN_LENGTH',
   '$persisted = $dynamic->getFieldWidget($module, CLAWPILOT_GLOBAL_ID_FIELD);',
   'DBManagerFactory::getInstance()->get_columns($tableName);',
 ], 'SuiteCRM stale-vardef repair')
@@ -88,7 +89,7 @@ assert.match(
 )
 assertOrdered(ensure, [
   '$field->save($dynamic);',
-  'refresh_and_verify_global_id_field($module, $unifiedSearch);',
+  'refresh_and_verify_global_id_field($module);',
   "$dynamic->setLabel('en_us', CLAWPILOT_GLOBAL_ID_LABEL, 'Global ID');",
 ], 'SuiteCRM field save and refresh')
 
