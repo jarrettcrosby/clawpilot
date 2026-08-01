@@ -3,6 +3,10 @@ import {
   activeOperationsOrganizationId,
   operationsCapabilities,
 } from '@/lib/operations/authorization'
+import {
+  assertCarrierRateTestArtifactCapability,
+  CarrierIntegrationRequestError,
+} from '@/lib/integrations/carrierIntegrations'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   readOperationsPrintArtifactPayloadInPostgres,
@@ -61,6 +65,9 @@ function errorResponse(error: unknown) {
   if (error instanceof OperationsRequestError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
+  if (error instanceof CarrierIntegrationRequestError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
   return json({
     ok: false,
     error: 'Print artifact request failed',
@@ -81,7 +88,8 @@ export async function GET(
       }, 503)
     }
     const actor = await requireRequestUser(req)
-    if (!operationsCapabilities(actor).canView) {
+    const capabilities = operationsCapabilities(actor)
+    if (!capabilities.canView) {
       return json({
         ok: false,
         error: 'You do not have permission to view print artifacts',
@@ -93,6 +101,32 @@ export async function GET(
       organizationId: activeOperationsOrganizationId(actor),
       artifactGlobalId: globalId,
     })
+    if (
+      artifact.sourceRateTestProvider
+      && artifact.sourceRateTestIntegrationAccountId
+    ) {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        throw new CarrierIntegrationRequestError(
+          'Operations-management and warehouse-execution permissions are required to download sandbox label artifacts',
+          403,
+          'CARRIER_EXECUTE_REQUIRED',
+        )
+      }
+      await assertCarrierRateTestArtifactCapability({
+        organizationId: activeOperationsOrganizationId(actor),
+        integrationAccountId: artifact.sourceRateTestIntegrationAccountId,
+        provider: artifact.sourceRateTestProvider,
+      })
+    } else if (
+      artifact.sourceRateTestProvider
+      || artifact.sourceRateTestIntegrationAccountId
+    ) {
+      throw new CarrierIntegrationRequestError(
+        'The carrier connection that created this test label is unavailable',
+        403,
+        'CARRIER_CAPABILITY_NOT_AUTHORIZED',
+      )
+    }
     const etag = `"${artifact.contentSha256}"`
     const filename = safeArtifactFilename(
       artifact.filename,

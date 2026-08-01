@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
-import { query, withTransaction } from '@/lib/persistence/postgres'
+import {
+  acquireTransactionAdvisoryLock,
+  query,
+  withTransaction,
+} from '@/lib/persistence/postgres'
 
 const WORKER_HEARTBEAT_KEY =
   'commerce.shopify_inventory_refresh.worker.heartbeat'
@@ -27,10 +31,153 @@ export type ShopifyInventoryRefreshJob = {
   policyRevision: number
   policyHash: string
   inventoryMaxAgeSeconds: number
+  requestedDirtyVersion: number
   attemptCount: number
   maxAttempts: number
   lockToken: string
   startedAt: string
+}
+
+export async function signalShopifyInventoryRefreshWithClient(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    integrationAccountId: string
+    credentialGeneration: number
+    receiptGlobalId: string
+    providerTriggeredAt: string | null
+  },
+) {
+  await acquireTransactionAdvisoryLock(
+    client,
+    `shopify-inventory-watermark:${input.organizationId}:${input.integrationAccountId}`,
+  )
+  const signaled = await client.query<{
+    dirty_version: string
+    reconciled_version: string
+  }>(
+    `INSERT INTO operations_shopify_inventory_refresh_watermarks (
+       organization_id,
+       integration_account_id,
+       credential_generation,
+       dirty_version,
+       reconciled_version,
+       last_receipt_global_id,
+       last_provider_triggered_at,
+       last_received_at,
+       last_signaled_at
+     ) VALUES (
+       $1::uuid,
+       $2::uuid,
+       $3::integer,
+       1,
+       0,
+       $4,
+       $5::timestamptz,
+       clock_timestamp(),
+       clock_timestamp()
+     )
+     ON CONFLICT (organization_id, integration_account_id)
+     DO UPDATE SET
+       credential_generation = EXCLUDED.credential_generation,
+       dirty_version =
+         operations_shopify_inventory_refresh_watermarks.dirty_version + 1,
+       last_receipt_global_id = EXCLUDED.last_receipt_global_id,
+       last_provider_triggered_at = CASE
+         WHEN EXCLUDED.last_provider_triggered_at IS NULL THEN
+           operations_shopify_inventory_refresh_watermarks
+             .last_provider_triggered_at
+         WHEN operations_shopify_inventory_refresh_watermarks
+                .last_provider_triggered_at IS NULL THEN
+           EXCLUDED.last_provider_triggered_at
+         ELSE GREATEST(
+           operations_shopify_inventory_refresh_watermarks
+             .last_provider_triggered_at,
+           EXCLUDED.last_provider_triggered_at
+         )
+       END,
+       last_received_at = EXCLUDED.last_received_at,
+       last_signaled_at = EXCLUDED.last_signaled_at,
+       updated_at = clock_timestamp()
+     RETURNING dirty_version::text, reconciled_version::text`,
+    [
+      input.organizationId,
+      input.integrationAccountId,
+      input.credentialGeneration,
+      input.receiptGlobalId,
+      input.providerTriggeredAt,
+    ],
+  )
+  const row = signaled.rows[0]
+  if (!row) {
+    throw new Error('Shopify inventory refresh watermark was not recorded')
+  }
+  return {
+    dirtyVersion: Number(row.dirty_version),
+    reconciledVersion: Number(row.reconciled_version),
+  }
+}
+
+export async function readShopifyInventoryRefreshDirtyVersionInPostgres(
+  input: {
+    organizationId: string
+    integrationAccountId: string
+  },
+) {
+  const result = await query<{ dirty_version: string }>(
+    `SELECT dirty_version::text
+     FROM operations_shopify_inventory_refresh_watermarks
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+     LIMIT 1`,
+    [input.organizationId, input.integrationAccountId],
+  )
+  return Number(result.rows[0]?.dirty_version || 0)
+}
+
+export async function acknowledgeManualShopifyInventoryRefreshInPostgres(
+  input: {
+    organizationId: string
+    integrationAccountId: string
+    credentialGeneration: number
+    requestedDirtyVersion: number
+    inventoryRunGlobalId: string
+  },
+) {
+  if (input.requestedDirtyVersion <= 0) return false
+  const result = await query(
+    `UPDATE operations_shopify_inventory_refresh_watermarks
+     SET reconciled_version = GREATEST(
+           reconciled_version,
+           $4::bigint
+         ),
+         credential_generation = GREATEST(
+           credential_generation,
+           $3::integer
+         ),
+         last_reconciled_at = clock_timestamp(),
+         last_reconciled_run_global_id = $5,
+         updated_at = clock_timestamp()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND credential_generation <= $3::integer
+       AND dirty_version >= $4::bigint`,
+    [
+      input.organizationId,
+      input.integrationAccountId,
+      input.credentialGeneration,
+      input.requestedDirtyVersion,
+      input.inventoryRunGlobalId,
+    ],
+  )
+  if (result.rowCount !== 1) {
+    const incomplete = new Error(
+      'Manual Shopify inventory refresh did not acknowledge its dirty watermark',
+    ) as Error & { code?: string }
+    incomplete.code = 'SHOPIFY_INVENTORY_REFRESH_WATERMARK_REQUIRED'
+    throw incomplete
+  }
+  return true
 }
 
 const PERMANENT_ERROR_CODES = new Set([
@@ -162,12 +309,12 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
          )`,
     )
     const queued = await client.query(
-      `INSERT INTO operations_shopify_inventory_refresh_jobs (
+       `INSERT INTO operations_shopify_inventory_refresh_jobs (
          organization_id, integration_account_id,
          carrier_service_config_id, warehouse_id,
          credential_generation, activation_revision,
          config_row_version, policy_revision, policy_hash,
-         inventory_max_age_seconds
+         inventory_max_age_seconds, requested_dirty_version
        )
        SELECT
          config.organization_id,
@@ -179,7 +326,8 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
          config.row_version,
          config.policy_revision,
          config.policy_hash,
-         config.inventory_max_age_seconds
+         config.inventory_max_age_seconds,
+         COALESCE(watermark.dirty_version, 0)
        FROM operations_shopify_carrier_service_configs config
        JOIN operations_integration_accounts account
          ON account.organization_id = config.organization_id
@@ -189,6 +337,10 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
         AND credential.integration_account_id = account.id
        JOIN operations_activation_scopes activation
          ON activation.organization_id = config.organization_id
+       LEFT JOIN operations_shopify_inventory_refresh_watermarks watermark
+         ON watermark.organization_id = config.organization_id
+        AND watermark.integration_account_id =
+            config.integration_account_id
        WHERE config.registration_state IN (
            'shadow_simulated', 'registered'
          )
@@ -211,14 +363,6 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
          AND ${INVENTORY_READABLE_CONNECTION_SQL}
          AND operations_shopify_carrier_service_config_is_ready(
            config.organization_id, config.id
-         )
-         AND NOT EXISTS (
-           SELECT 1
-           FROM operations_shopify_inventory_refresh_jobs active
-           WHERE active.organization_id = config.organization_id
-             AND active.integration_account_id =
-                 config.integration_account_id
-             AND active.status IN ('pending', 'processing', 'failed')
          )
          AND NOT EXISTS (
            SELECT 1
@@ -245,25 +389,55 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
                  AND recovered.completed_at > dead.completed_at
              )
          )
-         AND NOT EXISTS (
-           SELECT 1
-           FROM operations_commerce_inventory_sync_runs recent
-           WHERE recent.organization_id = config.organization_id
-             AND recent.integration_account_id =
-                 config.integration_account_id
-             AND recent.warehouse_id = config.warehouse_id
-             AND recent.status = 'succeeded'
-             AND recent.provider_fetched_at > now() - make_interval(
-               secs => GREATEST(
-                 15,
-                 floor(config.inventory_max_age_seconds / 2.0)::integer
+         AND (
+           COALESCE(watermark.dirty_version, 0)
+             > COALESCE(watermark.reconciled_version, 0)
+           OR NOT EXISTS (
+             SELECT 1
+             FROM operations_commerce_inventory_sync_runs recent
+             WHERE recent.organization_id = config.organization_id
+               AND recent.integration_account_id =
+                   config.integration_account_id
+               AND recent.warehouse_id = config.warehouse_id
+               AND recent.status = 'succeeded'
+               AND recent.provider_fetched_at > now() - make_interval(
+                 secs => GREATEST(
+                   15,
+                   floor(config.inventory_max_age_seconds / 2.0)::integer
+                 )
                )
-             )
+           )
          )
        ON CONFLICT (
          organization_id, integration_account_id
        ) WHERE status IN ('pending', 'processing', 'failed')
-       DO NOTHING`,
+       DO UPDATE SET
+         requested_dirty_version = GREATEST(
+           operations_shopify_inventory_refresh_jobs
+             .requested_dirty_version,
+           EXCLUDED.requested_dirty_version
+         ),
+         status = CASE
+           WHEN operations_shopify_inventory_refresh_jobs.status = 'failed'
+             THEN 'pending'
+           ELSE operations_shopify_inventory_refresh_jobs.status
+         END,
+         available_at = CASE
+           WHEN operations_shopify_inventory_refresh_jobs.status IN (
+             'pending', 'failed'
+           ) THEN now()
+           ELSE operations_shopify_inventory_refresh_jobs.available_at
+         END,
+         last_error_code = CASE
+           WHEN operations_shopify_inventory_refresh_jobs.status IN (
+             'pending', 'failed'
+           ) THEN NULL
+           ELSE operations_shopify_inventory_refresh_jobs.last_error_code
+         END,
+         updated_at = now()
+       WHERE operations_shopify_inventory_refresh_jobs.status IN (
+         'pending', 'failed'
+       )`,
     )
     return {
       queued: queued.rowCount || 0,
@@ -316,6 +490,7 @@ export async function claimShopifyInventoryRefreshJobsInPostgres(input: {
       policy_revision: string
       policy_hash: string
       inventory_max_age_seconds: number
+      requested_dirty_version: string
       attempt_count: number
       max_attempts: number
       lock_token: string
@@ -343,7 +518,7 @@ export async function claimShopifyInventoryRefreshJobsInPostgres(input: {
            locked_by = $2,
            lock_token = gen_random_uuid(),
            lease_expires_at = now() + interval '20 minutes',
-           started_at = COALESCE(job.started_at, now()),
+           started_at = now(),
            last_error_code = NULL,
            updated_at = now()
        FROM candidates, operations_integration_accounts account
@@ -363,6 +538,7 @@ export async function claimShopifyInventoryRefreshJobsInPostgres(input: {
          job.policy_revision::text,
          job.policy_hash,
          job.inventory_max_age_seconds,
+         job.requested_dirty_version::text,
          job.attempt_count,
          job.max_attempts,
          job.lock_token::text,
@@ -385,6 +561,7 @@ export async function claimShopifyInventoryRefreshJobsInPostgres(input: {
       policyRevision: Number(row.policy_revision),
       policyHash: row.policy_hash,
       inventoryMaxAgeSeconds: row.inventory_max_age_seconds,
+      requestedDirtyVersion: Number(row.requested_dirty_version),
       attemptCount: row.attempt_count,
       maxAttempts: row.max_attempts,
       lockToken: row.lock_token,
@@ -406,6 +583,7 @@ async function currentJobFence(
        AND job.integration_account_id = $3::uuid
        AND job.status = 'processing'
        AND job.lock_token = $4::uuid
+       AND job.requested_dirty_version = $5::bigint
        AND job.lease_expires_at > now()
        AND job.cancel_requested = false
        AND ${INVENTORY_READABLE_CONNECTION_SQL}
@@ -418,6 +596,7 @@ async function currentJobFence(
       job.organizationId,
       job.integrationAccountId,
       job.lockToken,
+      job.requestedDirtyVersion,
     ],
   )
   return current.rowCount === 1
@@ -487,24 +666,39 @@ export async function completeShopifyInventoryRefreshJobInPostgres(input: {
       return { status: 'cancelled' as const }
     }
     const evidence = await client.query<{
+      id: string
       global_id: string
       provider_fetched_at: Date | string
+      provider_attempt_created_at: Date | string
+      provider_capture_created_at: Date | string
       completed_at: Date | string
       levels_seen: number
       levels_projected: number
       provider_writes: number
       order_quantity_adjustment: string
     }>(
-      `SELECT global_id, provider_fetched_at, completed_at,
-              levels_seen, levels_projected, provider_writes,
-              order_quantity_adjustment::text
-       FROM operations_commerce_inventory_sync_runs
-       WHERE organization_id = $1::uuid
-         AND integration_account_id = $2::uuid
-         AND warehouse_id = $3::uuid
-         AND global_id = $4
-         AND idempotency_key = $5
-         AND status = 'succeeded'
+      `SELECT run.id::text, run.global_id, run.provider_fetched_at,
+              run.completed_at,
+              attempt.created_at AS provider_attempt_created_at,
+              capture.created_at AS provider_capture_created_at,
+              run.levels_seen, run.levels_projected, run.provider_writes,
+              run.order_quantity_adjustment::text
+       FROM operations_commerce_inventory_sync_runs run
+       JOIN operations_commerce_provider_attempts attempt
+        ON attempt.organization_id = run.organization_id
+       AND attempt.integration_account_id = run.integration_account_id
+       AND attempt.id = run.provider_attempt_id
+       JOIN operations_commerce_inventory_captures capture
+         ON capture.organization_id = run.organization_id
+        AND capture.integration_account_id = run.integration_account_id
+        AND capture.provider_attempt_id = run.provider_attempt_id
+        AND capture.id = run.capture_id
+       WHERE run.organization_id = $1::uuid
+         AND run.integration_account_id = $2::uuid
+         AND run.warehouse_id = $3::uuid
+         AND run.global_id = $4
+         AND run.idempotency_key = $5
+         AND run.status = 'succeeded'
        LIMIT 1`,
       [
         input.job.organizationId,
@@ -533,7 +727,8 @@ export async function completeShopifyInventoryRefreshJobInPostgres(input: {
              'inventoryRunGlobalId', $5::text,
              'providerFetchedAt', $6::text,
              'levelsSeen', $7::integer,
-             'levelsProjected', $8::integer
+             'levelsProjected', $8::integer,
+             'requestedDirtyVersion', $9::bigint
            ),
            completed_at = now(),
            locked_at = NULL,
@@ -555,16 +750,103 @@ export async function completeShopifyInventoryRefreshJobInPostgres(input: {
         new Date(run.provider_fetched_at).toISOString(),
         run.levels_seen,
         run.levels_projected,
+        input.job.requestedDirtyVersion,
       ],
     )
-    return completed.rowCount === 1
-      ? {
-          status: 'succeeded' as const,
-          inventoryRunGlobalId: run.global_id,
-          providerFetchedAt:
+    if (completed.rowCount !== 1) {
+      return { status: 'lease_lost' as const }
+    }
+    let currentDirtyVersion = input.job.requestedDirtyVersion
+    let reconciledDirtyVersion = input.job.requestedDirtyVersion
+    if (input.job.requestedDirtyVersion > 0) {
+      const providerAttemptBeganAfterClaim = (
+        Date.parse(new Date(run.provider_attempt_created_at).toISOString())
+          >= Date.parse(input.job.startedAt)
+      )
+      const providerEvidenceCapturedAfterClaim = (
+        Date.parse(new Date(run.provider_capture_created_at).toISOString())
+          >= Date.parse(input.job.startedAt)
+      )
+      const acknowledgementEligible = (
+        providerAttemptBeganAfterClaim
+        && providerEvidenceCapturedAfterClaim
+      )
+      const acknowledgementSql = acknowledgementEligible
+        ? `UPDATE operations_shopify_inventory_refresh_watermarks
+           SET reconciled_version = GREATEST(
+                 reconciled_version,
+                 $4::bigint
+               ),
+               credential_generation = GREATEST(
+                 credential_generation,
+                 $3::integer
+               ),
+               last_reconciled_at = clock_timestamp(),
+               last_reconciled_run_global_id = $5,
+               updated_at = clock_timestamp()
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+             AND credential_generation <= $3::integer
+             AND dirty_version = $4::bigint
+             AND last_signaled_at IS NOT NULL
+             AND $6::timestamptz >= last_signaled_at
+           RETURNING dirty_version::text, reconciled_version::text`
+        : `SELECT dirty_version::text, reconciled_version::text
+           FROM operations_shopify_inventory_refresh_watermarks
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+           LIMIT 1`
+      const acknowledgementValues = acknowledgementEligible
+        ? [
+            input.job.organizationId,
+            input.job.integrationAccountId,
+            input.job.credentialGeneration,
+            input.job.requestedDirtyVersion,
+            run.global_id,
             new Date(run.provider_fetched_at).toISOString(),
-        }
-      : { status: 'lease_lost' as const }
+          ]
+        : [
+            input.job.organizationId,
+            input.job.integrationAccountId,
+          ]
+      let acknowledged = await client.query<{
+        dirty_version: string
+        reconciled_version: string
+      }>(acknowledgementSql, acknowledgementValues)
+      if (acknowledgementEligible && !acknowledged.rows[0]) {
+        acknowledged = await client.query<{
+          dirty_version: string
+          reconciled_version: string
+        }>(
+          `SELECT dirty_version::text, reconciled_version::text
+           FROM operations_shopify_inventory_refresh_watermarks
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+           LIMIT 1`,
+          [input.job.organizationId, input.job.integrationAccountId],
+        )
+      }
+      const watermark = acknowledged.rows[0]
+      if (!watermark) {
+        const incomplete = new Error(
+          'Shopify inventory refresh completed without its dirty watermark',
+        ) as Error & { code?: string }
+        incomplete.code = 'SHOPIFY_INVENTORY_REFRESH_WATERMARK_REQUIRED'
+        throw incomplete
+      }
+      currentDirtyVersion = Number(watermark.dirty_version)
+      reconciledDirtyVersion = Number(watermark.reconciled_version)
+    }
+    return {
+      status: 'succeeded' as const,
+      inventoryRunGlobalId: run.global_id,
+      providerFetchedAt:
+        new Date(run.provider_fetched_at).toISOString(),
+      requestedDirtyVersion: input.job.requestedDirtyVersion,
+      currentDirtyVersion,
+      reconciledDirtyVersion,
+      followUpRequired: currentDirtyVersion > reconciledDirtyVersion,
+    }
   })
 }
 
@@ -696,6 +978,7 @@ export async function readShopifyInventoryRefreshHealthFromPostgres() {
   const result = await query<{
     eligible_accounts: string
     stale_accounts: string
+    dirty_accounts: string
     queued: string
     processing: string
     retrying: string
@@ -797,6 +1080,15 @@ export async function readShopifyInventoryRefreshHealthFromPostgres() {
               secs => ready.inventory_max_age_seconds
             )
        )::text AS stale_accounts,
+       (
+         SELECT count(*)
+         FROM eligible ready
+         JOIN operations_shopify_inventory_refresh_watermarks watermark
+           ON watermark.organization_id = ready.organization_id
+          AND watermark.integration_account_id =
+              ready.integration_account_id
+         WHERE watermark.dirty_version > watermark.reconciled_version
+       )::text AS dirty_accounts,
        count(*) FILTER (WHERE job.status = 'pending')::text AS queued,
        count(*) FILTER (WHERE job.status = 'processing')::text AS processing,
        count(*) FILTER (WHERE job.status = 'failed')::text AS retrying,
@@ -843,6 +1135,7 @@ export async function readShopifyInventoryRefreshHealthFromPostgres() {
   return {
     eligibleAccounts: Number(row?.eligible_accounts || 0),
     staleAccounts: Number(row?.stale_accounts || 0),
+    dirtyAccounts: Number(row?.dirty_accounts || 0),
     queued: Number(row?.queued || 0),
     processing: Number(row?.processing || 0),
     retrying: Number(row?.retrying || 0),

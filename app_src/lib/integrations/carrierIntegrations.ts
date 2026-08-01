@@ -5,6 +5,12 @@ import {
   type CarrierRuntimeCredential,
 } from '@/lib/integrations/carrierCredentialClient'
 import {
+  carrierConfigurationAllowsSandboxLabel,
+  isSourceManagedCarrierConfiguration,
+  managedCarrierDelegationAllows,
+  managedCarrierDelegationProfile,
+} from '@/lib/integrations/carrierManagedDelegation'
+import {
   CARRIER_SANDBOX_RATE_FIXTURE,
   buildCarrierSandboxRateFixture,
   buildCarrierSandboxShipmentRateFixture,
@@ -39,6 +45,7 @@ import {
   markCarrierCredentialVerificationInPostgres,
   recordCarrierCredentialRevealInPostgres,
   readActiveCarrierAccountsFromPostgres,
+  readCarrierConnectionAuthorizationFromPostgres,
   readCarrierIntegrationsStateFromPostgres,
   readCarrierRuntimeCredentialFromPostgres,
   setCarrierAccountStatusInPostgres,
@@ -52,10 +59,6 @@ import {
 const CARRIER_SANDBOX_RATE_ADAPTER_VERSION = 'direct-rest-v3'
 const CARRIER_SANDBOX_SHIPMENT_RATE_ADAPTER_VERSION =
   'direct-rest-multi-package-v1'
-const AG_ALCHEMY_EPISCS_RATING_DELEGATION =
-  'ag-alchemy-episcs-sandbox-rating-delegation'
-const AG_ALCHEMY_RATING_ORIGIN_WAREHOUSE = 'gwh5366613'
-
 export class CarrierIntegrationRequestError extends Error {
   readonly status: number
   readonly code: string
@@ -151,34 +154,6 @@ function sanitize(error: unknown): CarrierIntegrationRequestError {
 
 export function sanitizedCarrierIntegrationError(error: unknown) {
   return sanitize(error)
-}
-
-function isSourceManagedCarrierConfiguration(
-  configuration: Record<string, unknown>,
-) {
-  return (
-    configuration.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION
-    || (
-      configuration.authorizationScope === 'sandbox_rating_only'
-      && configuration.credentialRevealAllowed === false
-    )
-  )
-}
-
-function isExactAgAlchemyRatingDelegation(
-  configuration: Record<string, unknown>,
-) {
-  const capabilities = configuration.allowedCapabilities
-  return (
-    configuration.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION
-    && configuration.authorizationScope === 'sandbox_rating_only'
-    && configuration.credentialRevealAllowed === false
-    && configuration.senderOriginWarehouseGlobalId
-      === AG_ALCHEMY_RATING_ORIGIN_WAREHOUSE
-    && Array.isArray(capabilities)
-    && capabilities.length === 1
-    && capabilities[0] === 'sandbox_rate'
-  )
 }
 
 async function storedRuntimeCredential(input: {
@@ -297,14 +272,14 @@ function requiresConfiguredCapability(
 ) {
   const configured = runtime.configuration.allowedCapabilities
   if (isSourceManagedCarrierConfiguration(runtime.configuration)) {
-    if (
-      capability !== 'sandbox_rate'
-      || !isExactAgAlchemyRatingDelegation(runtime.configuration)
-    ) {
+    if (!managedCarrierDelegationAllows(runtime.configuration, capability)) {
+      const profile = managedCarrierDelegationProfile(runtime.configuration)
       throw new CarrierIntegrationRequestError(
-        capability === 'sandbox_rate'
+        profile === 'drifted'
           ? 'This managed carrier rating connection requires repair'
-          : 'This carrier connection is authorized for sandbox rating only',
+          : capability === 'production_rate'
+            ? 'This managed carrier connection is not authorized for production rating'
+            : 'This carrier connection is authorized for sandbox rating only',
         403,
         'CARRIER_CAPABILITY_NOT_AUTHORIZED',
       )
@@ -329,6 +304,55 @@ function requiresConfiguredCapability(
       403,
       'CARRIER_CAPABILITY_NOT_AUTHORIZED',
     )
+  }
+}
+
+export async function assertCarrierRateTestArtifactCapability(input: {
+  organizationId: unknown
+  integrationAccountId: unknown
+  provider: unknown
+}) {
+  try {
+    const organizationId = normalizeCarrierOrganizationId(input.organizationId)
+    const integrationAccountId = String(input.integrationAccountId || '').trim()
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      integrationAccountId,
+    )) {
+      throw new CarrierIntegrationRequestError(
+        'The carrier connection that created this test label is unavailable',
+        403,
+        'CARRIER_CAPABILITY_NOT_AUTHORIZED',
+      )
+    }
+    const provider = normalizeDirectCarrierProvider(input.provider)
+    const stored = await readCarrierConnectionAuthorizationFromPostgres({
+      organizationId,
+      integrationAccountId,
+    })
+    if (
+      !stored
+      || stored.provider !== provider
+      || stored.environment !== 'sandbox'
+      || stored.status !== 'active'
+    ) {
+      throw new CarrierIntegrationRequestError(
+        'The carrier connection that created this test label is unavailable',
+        403,
+        'CARRIER_CAPABILITY_NOT_AUTHORIZED',
+      )
+    }
+    if (!carrierConfigurationAllowsSandboxLabel(stored.configuration)) {
+      throw new CarrierIntegrationRequestError(
+        isSourceManagedCarrierConfiguration(stored.configuration)
+          && managedCarrierDelegationProfile(stored.configuration) === 'drifted'
+          ? 'This managed carrier connection requires repair'
+          : 'This carrier connection is authorized for sandbox rating only',
+        403,
+        'CARRIER_CAPABILITY_NOT_AUTHORIZED',
+      )
+    }
+  } catch (error) {
+    throw sanitize(error)
   }
 }
 

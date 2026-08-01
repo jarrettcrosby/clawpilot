@@ -53,13 +53,13 @@ import {
 } from '@/lib/measurements'
 import { formatUserDateTime } from '@/lib/userDateTime'
 import IntegrationSetupJourney from '@/components/settings/IntegrationSetupJourney'
+import {
+  isSourceManagedCarrierConfiguration,
+  managedCarrierDelegationProfile,
+} from '@/lib/integrations/carrierManagedDelegation'
 
 type CarrierProvider = 'ups_rest' | 'fedex_rest' | 'usps_rest'
 type CarrierEnvironment = 'sandbox' | 'production'
-
-const AG_ALCHEMY_EPISCS_RATING_DELEGATION =
-  'ag-alchemy-episcs-sandbox-rating-delegation'
-const AG_ALCHEMY_RATING_ORIGIN_WAREHOUSE = 'gwh5366613'
 
 type CarrierAddress = {
   line1: string
@@ -492,26 +492,25 @@ export default function CarrierIntegrationPanel() {
     () => (account?.carrierAccounts || []).filter((entry) => entry.status === 'active'),
     [account?.carrierAccounts],
   )
-  const sourceManagedDelegation = (
-    account?.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION
-    || (
-      account?.authorizationScope === 'sandbox_rating_only'
-      && account.credentialRevealAllowed === false
-    )
-  )
-  const ratingOnlyDelegation = Boolean(
-    sourceManagedDelegation
-    && account
-    && account.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION
-    && account.authorizationScope === 'sandbox_rating_only'
-    && account.credentialRevealAllowed === false
-    && account.senderOriginWarehouseGlobalId
-      === AG_ALCHEMY_RATING_ORIGIN_WAREHOUSE
-    && account.allowedCapabilities.length === 1
-    && account.allowedCapabilities[0] === 'sandbox_rate',
-  )
-  const managedDelegationDrift = sourceManagedDelegation
-    && !ratingOnlyDelegation
+  const carrierConfiguration = account ? {
+    managedBy: account.managedBy,
+    authorizationScope: account.authorizationScope,
+    credentialRevealAllowed: account.credentialRevealAllowed,
+    senderOriginWarehouseGlobalId: account.senderOriginWarehouseGlobalId,
+    allowedCapabilities: account.allowedCapabilities,
+  } : null
+  const sourceManagedDelegation = carrierConfiguration
+    ? isSourceManagedCarrierConfiguration(carrierConfiguration)
+    : false
+  const delegationProfile = carrierConfiguration
+    ? managedCarrierDelegationProfile(carrierConfiguration)
+    : null
+  const ratingOnlyDelegation = delegationProfile === 'rating_only'
+  const managedSandboxFulfillmentDelegation =
+    delegationProfile === 'sandbox_fulfillment_diagnostic'
+  const managedDelegationDrift = delegationProfile === 'drifted'
+  const labelWorkflowAuthorized =
+    !sourceManagedDelegation || managedSandboxFulfillmentDelegation
   const explicitCarrierAccountGlobalId = selectedCarrierAccounts[key] || ''
   const selectedCarrierAccountGlobalId = activeCarrierAccounts.some(
     (entry) => entry.globalId === explicitCarrierAccountGlobalId,
@@ -1115,6 +1114,61 @@ export default function CarrierIntegrationPanel() {
               },
             ]}
           />
+        ) : managedSandboxFulfillmentDelegation ? (
+          <IntegrationSetupJourney
+            description="The EPISCS-managed sandbox diagnostic lane is ready. Rate a destination, create one sandbox label from an exact returned rate, then download or test-print the stored bytes and void the sample."
+            steps={[
+              {
+                key: 'carrier-delegation-ready',
+                label: 'Managed sandbox diagnostics are ready',
+                state: 'complete',
+                description:
+                  'EPISCS owns and verifies the credential. ClawPilot keeps the AG-scoped projection encrypted and never reveals or changes its credential or billing identity here.',
+                facts: [
+                  { label: 'Provider', value: providerLabel(provider) },
+                  {
+                    label: 'ClawPilot integration ID',
+                    value: account?.globalId || 'Not allocated',
+                    copyable: Boolean(account?.globalId),
+                  },
+                  {
+                    label: 'Sender warehouse',
+                    value: account?.senderOriginWarehouseGlobalId || 'Not bound',
+                    copyable: Boolean(account?.senderOriginWarehouseGlobalId),
+                  },
+                  { label: 'Authorized capability', value: 'Sandbox rate and label diagnostics' },
+                ],
+              },
+              {
+                key: 'carrier-delegation-rate',
+                label: 'Rate the test parcel',
+                state: rateTest?.provider === provider ? 'complete' : 'current',
+                description:
+                  'Edit the destination and request sandbox prices. Select one exact returned service before label creation.',
+              },
+              {
+                key: 'carrier-delegation-label',
+                label: 'Create and inspect one sandbox label',
+                state: selectedRateTestLabel ? 'complete' : rateTest ? 'current' : 'pending',
+                description:
+                  'Create one provider sandbox sample, then download its stored PDF, PNG, or ZPL bytes or route those same bytes to a compatible test printer.',
+                facts: [{
+                  label: 'Stored sample label',
+                  value: selectedRateTestLabel?.globalId || 'Not created',
+                  copyable: Boolean(selectedRateTestLabel?.globalId),
+                }],
+              },
+              {
+                key: 'carrier-delegation-close',
+                label: 'Void or close the sample',
+                state: selectedRateTestLabel?.status === 'voided'
+                  ? 'complete'
+                  : selectedRateTestLabel ? 'current' : 'pending',
+                description:
+                  'Void a real provider sandbox sample. UPS CIE samples, which never become provider shipments, are explicitly closed in ClawPilot instead.',
+              },
+            ]}
+          />
         ) : (
           <IntegrationSetupJourney
             description="Scope the provider lane, verify its credential, bind a billing identity, and activate only after the safe test boundary is ready."
@@ -1285,14 +1339,27 @@ export default function CarrierIntegrationPanel() {
         </Alert>
       ) : null}
 
+      {managedSandboxFulfillmentDelegation ? (
+        <Alert severity="info" sx={{ mb: 2, borderRadius: '8px' }}>
+          <Typography variant="body2" fontWeight={700}>
+            EPISCS-managed sandbox fulfillment diagnostics
+          </Typography>
+          <Typography variant="body2">
+            This connection can request sandbox rates and create, download, test-print, and void sandbox
+            sample labels. Credentials and the full billing identity remain concealed. Production labels,
+            pickups, manifests, and shipments are not authorized.
+          </Typography>
+        </Alert>
+      ) : null}
+
       {managedDelegationDrift ? (
         <Alert severity="error" sx={{ mb: 2, borderRadius: '8px' }}>
           <Typography variant="body2" fontWeight={700}>
-            Managed sandbox rating needs repair
+            Managed sandbox delegation needs repair
           </Typography>
           <Typography variant="body2">
             The EPISCS-managed connection no longer matches its approved AG Alchemy warehouse,
-            scope, or no-reveal policy. Rating and all carrier-management actions are disabled
+            scope, capability set, or no-reveal policy. Rating and all carrier-management actions are disabled
             until the platform operator restores the exact delegated configuration.
           </Typography>
         </Alert>
@@ -1758,17 +1825,23 @@ export default function CarrierIntegrationPanel() {
         <Box sx={{ mt: 2, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
           <Typography variant="subtitle2" fontWeight={700}>
             {sourceManagedDelegation
-              ? ratingOnlyDelegation ? 'Sandbox rate test' : 'Managed sandbox rating'
+              ? ratingOnlyDelegation
+                ? 'Sandbox rate test'
+                : managedSandboxFulfillmentDelegation
+                  ? 'Managed sandbox label test workflow'
+                  : 'Managed sandbox diagnostics'
               : 'Sandbox label test workflow'}
           </Typography>
           <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
             {sourceManagedDelegation
               ? ratingOnlyDelegation
                 ? 'Rate an editable US destination from the AG Alchemy warehouse. No carrier mutation follows the quote.'
-                : 'This managed lane is disabled until its exact AG Alchemy rating policy is restored.'
+                : managedSandboxFulfillmentDelegation
+                  ? 'Rate an editable US destination, choose one exact returned service, create one provider sandbox sample, then download or test-print its stored bytes and void or close it.'
+                  : 'This managed lane is disabled until its exact AG Alchemy delegation policy is restored.'
               : 'Rate an editable US destination, choose one exact returned service, create a sandbox label, print its stored bytes, and void it when the test is complete.'}
           </Typography>
-          {!sourceManagedDelegation ? (
+          {labelWorkflowAuthorized ? (
             <Stepper
               activeStep={labelWorkflowStep}
               alternativeLabel
@@ -1779,10 +1852,10 @@ export default function CarrierIntegrationPanel() {
               ))}
             </Stepper>
           ) : null}
-          {!sourceManagedDelegation && !canExecute ? (
+          {labelWorkflowAuthorized && !canExecute ? (
             <Alert severity="info" sx={{ mb: 2, borderRadius: '8px' }}>
-              You can review and run rating diagnostics, but creating, printing, or voiding a label also
-              requires warehouse-execution permission.
+              You can review and run rating diagnostics, but creating, downloading, printing, or voiding a
+              label also requires warehouse-execution permission.
             </Alert>
           ) : null}
           <Typography variant="overline" color="text.disabled">Step 1 · Rate</Typography>
@@ -2000,7 +2073,7 @@ export default function CarrierIntegrationPanel() {
             </Stack>
           ) : null}
 
-          {!sourceManagedDelegation ? (
+          {labelWorkflowAuthorized ? (
             <>
           <Box sx={{ mt: 3, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
             <Typography variant="overline" color="text.disabled">Step 2 · Create label</Typography>
@@ -2375,7 +2448,7 @@ export default function CarrierIntegrationPanel() {
                     {selectedRateTestLabel.contentSha256.slice(0, 16)}…
                   </Typography>
                 </Box>
-                {(selectedRateTestLabel.printArtifactGlobalId
+                {canExecute && (selectedRateTestLabel.printArtifactGlobalId
                   || (
                     rateTestPrintJob?.sourceLabelGlobalId === selectedRateTestLabel.globalId
                       ? rateTestPrintJob.artifactGlobalId

@@ -7,6 +7,9 @@ import type {
   EncryptedCommerceValue,
 } from '@/lib/integrations/commerceCredentialCrypto'
 import {
+  SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
+} from '@/lib/integrations/commerceCapabilities'
+import {
   acquireTransactionAdvisoryLock,
   query,
   withTransaction,
@@ -14,6 +17,9 @@ import {
 import {
   ensureAutomaticCommerceCatalogIntakeWithClient,
 } from '@/lib/persistence/commerceCatalogSync'
+import {
+  signalShopifyInventoryRefreshWithClient,
+} from '@/lib/persistence/shopifyInventoryRefresh'
 
 type TimestampValue = string | Date
 
@@ -1478,6 +1484,62 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
       ],
     )
     const globalId = inserted.rows[0].global_id
+    let inventoryRefreshSignal: {
+      dirtyVersion: number
+      reconciledVersion: number
+    } | null = null
+    if (
+      receiptState === 'queued'
+      && SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS.some(
+        (topic) => topic === input.topic,
+      )
+    ) {
+      inventoryRefreshSignal =
+        await signalShopifyInventoryRefreshWithClient(client, {
+          organizationId: input.runtime.organizationId,
+          integrationAccountId: input.runtime.integrationAccountId,
+          credentialGeneration: input.runtime.credentialVersion,
+          receiptGlobalId: globalId,
+          providerTriggeredAt: input.providerTriggeredAt,
+        })
+      const finalized = await client.query(
+        `UPDATE operations_commerce_webhook_receipts
+         SET state = 'succeeded',
+             attempts = attempts + 1,
+             processed_at = clock_timestamp(),
+             updated_at = clock_timestamp()
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND global_id = $3
+           AND state = 'queued'`,
+        [
+          input.runtime.organizationId,
+          input.runtime.integrationAccountId,
+          globalId,
+        ],
+      )
+      if (finalized.rowCount !== 1) {
+        throw new Error(
+          'Shopify inventory webhook receipt could not be finalized',
+        )
+      }
+      await auditCommerce(client, {
+        actorEmail: null,
+        organizationId: input.runtime.organizationId,
+        eventType: 'commerce.inventory.refresh_signaled',
+        globalId: input.runtime.globalId,
+        provider: 'shopify',
+        environment: input.runtime.environment,
+        isSystem: true,
+        payload: {
+          receiptGlobalId: globalId,
+          topic: input.topic,
+          dirtyVersion: inventoryRefreshSignal.dirtyVersion,
+          reconciledVersion: inventoryRefreshSignal.reconciledVersion,
+          webhookQuantityApplied: false,
+        },
+      })
+    }
     await auditCommerce(client, {
       actorEmail: null,
       organizationId: input.runtime.organizationId,
@@ -1491,6 +1553,7 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
         topic: input.topic,
         providerEventId: input.providerEventId,
         credentialVersion: input.runtime.credentialVersion,
+        inventoryRefreshSignaled: Boolean(inventoryRefreshSignal),
       },
     })
     return { globalId, duplicate: false }

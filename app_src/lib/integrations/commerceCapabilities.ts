@@ -4,10 +4,14 @@ export const SHOPIFY_API_VERSION = SHOPIFY_ADMIN_API_VERSION
 // The current control plane retains encrypted payload evidence without a
 // retention/purge worker. Keep intake limited to non-customer operational
 // topics until that privacy lifecycle and canonical processors exist.
-export const SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS = [
-  'app/scopes_update',
+export const SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS = [
   'inventory_items/update',
   'inventory_levels/update',
+] as const
+
+export const SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS = [
+  'app/scopes_update',
+  ...SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
   'products/create',
   'products/delete',
   'products/update',

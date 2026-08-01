@@ -927,6 +927,7 @@ async function loadCurrentChannelStates(client, target, product) {
             state.external_product_id, state.external_variant_id,
             state.normalized_status, state.provider_updated_at::text,
             state.observed_at::text, state.source_revision, state.source_hash,
+            state.pack_evidence_hash,
             state.product_mapping_id::text,
             mapping.global_id AS product_mapping_global_id
      FROM operations_product_channel_states state
@@ -1052,10 +1053,8 @@ export function providerPackMappingMatches(existing, expected) {
     && existing.provider_lifecycle_state
       === expected.channelState.normalized_status
     && existing.projection_state === 'current'
-    && existing.source_revision === expected.channelState.source_revision
-    && existing.source_hash === expected.channelState.source_hash
-    && existing.provider_updated_at
-      === expected.channelState.provider_updated_at
+    && existing.pack_evidence_hash
+      === expected.channelState.pack_evidence_hash
   )
 }
 
@@ -1642,6 +1641,7 @@ async function stageProviderPackMapping(
             default_pack_profile_version_id::text,
             provider_lifecycle_state, projection_state,
             mapping_purpose, source_revision, source_hash,
+            pack_evidence_hash,
             provider_updated_at::text, observed_at::text,
             row_version::text
      FROM operations_commerce_variant_pack_mappings
@@ -1736,11 +1736,12 @@ async function stageProviderPackMapping(
        provider, external_product_id, external_variant_id,
        default_pack_profile_version_id, provider_lifecycle_state,
        projection_state, mapping_purpose, source_revision, source_hash,
-       provider_updated_at, observed_at, is_current, created_by, updated_by
+       pack_evidence_hash, provider_updated_at, observed_at, is_current,
+       created_by, updated_by
      ) VALUES (
        $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8::uuid,
-       $9, 'current', $10, $11, $12, $13::timestamptz, $14::timestamptz,
-       true, $15, $15
+       $9, 'current', $10, $11, $12, $13, $14::timestamptz,
+       $15::timestamptz, true, $16, $16
      )
      RETURNING id::text, global_id`,
     [
@@ -1756,6 +1757,7 @@ async function stageProviderPackMapping(
       mappingPurpose,
       channelState.source_revision,
       channelState.source_hash,
+      channelState.pack_evidence_hash,
       channelState.provider_updated_at,
       channelState.observed_at,
       target.actorEmail,
@@ -2808,6 +2810,7 @@ function selfTest() {
       normalized_status: 'active',
       source_revision: 'revision-1',
       source_hash: 'c'.repeat(64),
+      pack_evidence_hash: 'e'.repeat(64),
       provider_updated_at: '2026-07-28 00:00:00+00',
     },
   }
@@ -2820,12 +2823,17 @@ function selfTest() {
     projection_state: 'current',
     source_revision: mappingExpected.channelState.source_revision,
     source_hash: mappingExpected.channelState.source_hash,
+    pack_evidence_hash: mappingExpected.channelState.pack_evidence_hash,
     provider_updated_at: mappingExpected.channelState.provider_updated_at,
   }
   assert.equal(providerPackMappingMatches(mappingRow, mappingExpected), true)
   assert.equal(providerPackMappingMatches({
     ...mappingRow,
     source_hash: 'd'.repeat(64),
+  }, mappingExpected), true)
+  assert.equal(providerPackMappingMatches({
+    ...mappingRow,
+    pack_evidence_hash: 'd'.repeat(64),
   }, mappingExpected), false)
   assert.equal(providerPackMappingMatches({
     ...mappingRow,

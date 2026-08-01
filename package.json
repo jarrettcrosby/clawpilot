@@ -23,7 +23,7 @@
     "test:operations-regression-artifacts": "node scripts/test-operations-regression-artifacts.mjs",
     "test:operations-regression-replay": "node scripts/test-operations-regression-replay.mjs",
     "test:operations-regression-postgres": "node scripts/test-operations-regression-replay-postgres.mjs",
-    "test:product-pack-management": "node --experimental-strip-types --test app_src/tests/operations/product-pack-management.test.mts && node scripts/test-product-pack-management.mjs",
+    "test:product-pack-management": "node --experimental-strip-types --test app_src/tests/operations/product-pack-management.test.mts app_src/tests/operations/commerce-pack-evidence.test.mts && node scripts/test-product-pack-management.mjs",
     "test:ag-pack-hierarchy": "node scripts/stage-ag-alchemy-pack-hierarchy.mjs --self-test",
     "test:case-pack-planning": "node --experimental-strip-types --test app_src/tests/operations/case-pack-planning.test.mts",
     "test:hybrid-cartonization": "node --experimental-strip-types --test app_src/tests/operations/hybrid-cartonization.test.mts",

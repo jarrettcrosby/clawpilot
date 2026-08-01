@@ -1,5 +1,6 @@
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
+import { isSourceManagedCarrierConfiguration } from '@/lib/integrations/carrierManagedDelegation'
 import type {
   CarrierAccountAddress,
   CarrierEnvironment,
@@ -14,9 +15,6 @@ import {
 import { acquireTransactionAdvisoryLock, query, withTransaction } from '@/lib/persistence/postgres'
 
 type TimestampValue = string | Date
-
-const AG_ALCHEMY_EPISCS_RATING_DELEGATION =
-  'ag-alchemy-episcs-sandbox-rating-delegation'
 
 export class CarrierIntegrationSourceManagedError extends Error {
   readonly status = 403
@@ -128,6 +126,16 @@ export type CarrierRuntimeCredentialRecord = {
   credentialFingerprint: string
   configuration: Record<string, unknown>
   encrypted: EncryptedCarrierCredential
+}
+
+export type CarrierConnectionAuthorizationRecord = {
+  organizationId: string
+  integrationAccountId: string
+  globalId: string
+  provider: DirectCarrierProvider
+  environment: CarrierEnvironment
+  status: 'active' | 'disabled' | 'error'
+  configuration: Record<string, unknown>
 }
 
 export type CarrierRuntimeAccountRecord = {
@@ -361,6 +369,59 @@ export async function readCarrierRuntimeCredentialFromPostgres(input: {
   }
 }
 
+export async function readCarrierConnectionAuthorizationFromPostgres(input: {
+  organizationId: string
+  integrationAccountId: string
+}, client?: PoolClient): Promise<CarrierConnectionAuthorizationRecord | null> {
+  const sql = `SELECT
+      account.organization_id::text,
+      account.id::text,
+      account.global_id,
+      account.provider,
+      account.environment,
+      account.status,
+      account.configuration
+    FROM operations_integration_accounts account
+    WHERE account.organization_id = $1::uuid
+      AND account.id = $2::uuid
+      AND account.integration_type = 'carrier'
+      AND account.provider IN ('ups_rest', 'fedex_rest', 'usps_rest')
+      AND account.environment IN ('sandbox', 'production')
+    LIMIT 1`
+  const values = [input.organizationId, input.integrationAccountId]
+  const result = client
+    ? await client.query<{
+      organization_id: string
+      id: string
+      global_id: string
+      provider: DirectCarrierProvider
+      environment: CarrierEnvironment
+      status: 'active' | 'disabled' | 'error'
+      configuration: Record<string, unknown>
+    }>(sql, values)
+    : await query<{
+      organization_id: string
+      id: string
+      global_id: string
+      provider: DirectCarrierProvider
+      environment: CarrierEnvironment
+      status: 'active' | 'disabled' | 'error'
+      configuration: Record<string, unknown>
+    }>(sql, values)
+  const row = result.rows[0]
+  return row
+    ? {
+      organizationId: row.organization_id,
+      integrationAccountId: row.id,
+      globalId: row.global_id,
+      provider: row.provider,
+      environment: row.environment,
+      status: row.status,
+      configuration: row.configuration,
+    }
+    : null
+}
+
 export async function recordCarrierCredentialRevealInPostgres(input: {
   organizationId: string
   provider: DirectCarrierProvider
@@ -463,13 +524,7 @@ function carrierAccountPersistenceError(error: unknown): never {
 function assertUserManagedCarrierConnection(
   configuration: Record<string, unknown>,
 ) {
-  if (
-    configuration.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION
-    || (
-      configuration.authorizationScope === 'sandbox_rating_only'
-      && configuration.credentialRevealAllowed === false
-    )
-  ) {
+  if (isSourceManagedCarrierConfiguration(configuration)) {
     throw new CarrierIntegrationSourceManagedError()
   }
 }

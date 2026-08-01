@@ -41,6 +41,10 @@ import {
   readCommerceRuntimeCredentialFromPostgres,
   type CommerceRuntimeCredentialRecord,
 } from '@/lib/persistence/commerceIntegrations'
+import {
+  acknowledgeManualShopifyInventoryRefreshInPostgres,
+  readShopifyInventoryRefreshDirtyVersionInPostgres,
+} from '@/lib/persistence/shopifyInventoryRefresh'
 
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$/
 const REQUIRED_SCOPES = Object.freeze([
@@ -310,8 +314,16 @@ export async function syncShopifyInventory(input: {
   let attempt: Awaited<
     ReturnType<typeof prepareShopifyInventoryReadInPostgres>
   > | null = null
+  let requestedDirtyVersion = 0
   try {
     stored = await runtime(input)
+    if (!input.expectedRefreshFence) {
+      requestedDirtyVersion =
+        await readShopifyInventoryRefreshDirtyVersionInPostgres({
+          organizationId: stored.organizationId,
+          integrationAccountId: stored.integrationAccountId,
+        })
+    }
     const target = await readShopifyInventoryTargetFromPostgres({
       runtime: stored,
     })
@@ -468,6 +480,20 @@ export async function syncShopifyInventory(input: {
       actorEmail,
       expectedRefreshFence: input.expectedRefreshFence,
     })
+    if (
+      !input.expectedRefreshFence
+      && requestedDirtyVersion > 0
+      && !attempt.captured
+      && !applied.replayed
+    ) {
+      await acknowledgeManualShopifyInventoryRefreshInPostgres({
+        organizationId: stored.organizationId,
+        integrationAccountId: stored.integrationAccountId,
+        credentialGeneration: stored.credentialVersion,
+        requestedDirtyVersion,
+        inventoryRunGlobalId: applied.runGlobalId,
+      })
+    }
     return {
       replayed: applied.replayed,
       effectiveIdempotencyKey: attempt.idempotencyKey,

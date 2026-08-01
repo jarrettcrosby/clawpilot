@@ -17,6 +17,7 @@ export async function processShopifyInventoryRefreshOutbox(input: {
   workerId: string
 }) {
   const automatic = await queueAutomaticShopifyInventoryRefreshesInPostgres()
+  let followUpQueued = 0
   const requestedLimit = Math.max(
     1,
     Math.min(Number(input.limit || 2), 10),
@@ -44,6 +45,7 @@ export async function processShopifyInventoryRefreshOutbox(input: {
       policyRevision: job.policyRevision,
       policyHash: job.policyHash,
       inventoryMaxAgeSeconds: job.inventoryMaxAgeSeconds,
+      requestedDirtyVersion: job.requestedDirtyVersion,
       lockToken: job.lockToken,
     }
     try {
@@ -86,8 +88,14 @@ export async function processShopifyInventoryRefreshOutbox(input: {
           effectiveIdempotencyKey: synced.effectiveIdempotencyKey,
           inventoryRunGlobalId: synced.inventoryRunGlobalId,
         })
-      if (completion.status === 'succeeded') completed += 1
-      else cancelled += 1
+      if (completion.status === 'succeeded') {
+        completed += 1
+        if (completion.followUpRequired) {
+          const followUp =
+            await queueAutomaticShopifyInventoryRefreshesInPostgres()
+          followUpQueued += followUp.queued
+        }
+      } else cancelled += 1
     } catch (error) {
       const failure = await failShopifyInventoryRefreshJobInPostgres({
         job,
@@ -99,7 +107,7 @@ export async function processShopifyInventoryRefreshOutbox(input: {
     }
   }
   return {
-    autoQueued: automatic.queued,
+    autoQueued: automatic.queued + followUpQueued,
     autoCancelled: automatic.cancelled,
     claimed,
     completed,

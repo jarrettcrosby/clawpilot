@@ -596,6 +596,36 @@ async function verifyPostgresAcceptance(databaseUrl) {
     assert.equal(indefinite?.shadowLifetimeMode, 'until_turned_off')
     assert.equal(indefinite?.shadowDurationMinutes, null)
     assert.equal(indefinite?.shadowExpiresAt, null)
+    await expectRejected(
+      () => policies.upsertShopifyCustomerRatePolicyInPostgres({
+        organizationId: primary.organizationId,
+        accountGlobalId: primary.accountGlobalId,
+        customerGid: durationFixtures[3].gid,
+        mode: 'show_all',
+        serviceCodes: [],
+        expectedRowVersion: created[3].policy.rowVersion,
+        actorEmail: primary.email,
+      }),
+      (error) => error.code === 'SHOPIFY_SHADOW_POLICY_LIFETIME_REQUIRED'
+        && error.status === 400,
+      'An existing Shadow policy update must not silently replace its lifetime',
+    )
+    const indefiniteAfterRejectedUpdate =
+      await policies.readShopifyCustomerRatePolicyFromPostgres({
+        organizationId: primary.organizationId,
+        accountGlobalId: primary.accountGlobalId,
+        customerGid: durationFixtures[3].gid,
+      })
+    assert.equal(
+      indefiniteAfterRejectedUpdate.rowVersion,
+      created[3].policy.rowVersion,
+    )
+    assert.equal(
+      indefiniteAfterRejectedUpdate.shadowLifetimeMode,
+      'until_turned_off',
+    )
+    assert.equal(indefiniteAfterRejectedUpdate.shadowDurationMinutes, null)
+    assert.equal(indefiniteAfterRejectedUpdate.shadowExpiresAt, null)
 
     await expectRejected(
       () => pool.query(
@@ -646,6 +676,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
       customerGid: durationFixtures[0].gid,
       mode: 'hide_all',
       serviceCodes: [],
+      shadowLifetimeMode: 'timed',
       shadowDurationMinutes: 15,
       expectedRowVersion: firstVersion,
       actorEmail: primary.email,
@@ -658,6 +689,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
         customerGid: durationFixtures[0].gid,
         mode: 'show_all',
         serviceCodes: [],
+        shadowLifetimeMode: 'timed',
         shadowDurationMinutes: 15,
         expectedRowVersion: firstVersion,
         actorEmail: primary.email,
@@ -729,6 +761,31 @@ async function verifyPostgresAcceptance(databaseUrl) {
       })
     assert.equal(summary.expiredSimulatedCount, 1)
     assert.equal(summary.untilTurnedOffSimulatedCount, 1)
+    const reactivatedIndefinite =
+      await policies.upsertShopifyCustomerRatePolicyInPostgres({
+        organizationId: primary.organizationId,
+        accountGlobalId: primary.accountGlobalId,
+        customerGid: expiringGid,
+        mode: 'show_all',
+        serviceCodes: [],
+        shadowLifetimeMode: 'until_turned_off',
+        expectedRowVersion: created[1].policy.rowVersion,
+        actorEmail: primary.email,
+      })
+    assert.equal(
+      reactivatedIndefinite.policy.shadowLifetimeMode,
+      'until_turned_off',
+    )
+    assert.equal(reactivatedIndefinite.policy.shadowDurationMinutes, null)
+    assert.equal(reactivatedIndefinite.policy.shadowExpiresAt, null)
+    assert.ok(
+      await policies.readActiveShopifyCustomerRatePolicyFromPostgres({
+        organizationId: primary.organizationId,
+        accountGlobalId: primary.accountGlobalId,
+        shopifyCustomerGid: expiringGid,
+      }),
+      'An explicitly until-turned-off update must reactivate an expired timed policy',
+    )
 
     const guardedGid = durationFixtures[2].gid
     await expectRejected(

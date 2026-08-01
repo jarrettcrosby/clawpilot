@@ -120,6 +120,7 @@ type ChannelStateRow = QueryResultRow & {
   observed_at: Date | string
   source_revision: string
   source_hash: string
+  pack_evidence_hash: string
   requires_shipping: boolean | null
   weight_grams: number | null
   row_version: string | number
@@ -144,6 +145,7 @@ type MappingRow = QueryResultRow & {
   mapping_purpose: 'catalog' | 'shopify_checkout'
   source_revision: string | null
   source_hash: string | null
+  pack_evidence_hash: string | null
   is_current: boolean
   row_version: string | number
   updated_at: Date | string
@@ -414,6 +416,7 @@ async function lockProviderWeightEvidence(
        state.observed_at,
        state.source_revision,
        state.source_hash,
+       state.pack_evidence_hash,
        state.requires_shipping,
        state.weight_grams,
        state.row_version::text,
@@ -1071,6 +1074,7 @@ async function lockChannelState(
        state.observed_at,
        state.source_revision,
        state.source_hash,
+       state.pack_evidence_hash,
        state.requires_shipping,
        state.weight_grams,
        state.row_version::text,
@@ -1400,6 +1404,7 @@ export async function saveCommerceVariantPackMappingInPostgres(input: {
          mapping_purpose,
          source_revision,
          source_hash,
+         pack_evidence_hash,
          is_current,
          row_version::text,
          updated_at
@@ -1503,6 +1508,7 @@ export async function saveCommerceVariantPackMappingInPostgres(input: {
          mapping_purpose,
          source_revision,
          source_hash,
+         pack_evidence_hash,
          provider_updated_at,
          observed_at,
          is_current,
@@ -1522,6 +1528,7 @@ export async function saveCommerceVariantPackMappingInPostgres(input: {
          $15,
          $10,
          $11,
+         $16,
          $12::timestamptz,
          $13::timestamptz,
          true,
@@ -1541,6 +1548,7 @@ export async function saveCommerceVariantPackMappingInPostgres(input: {
          mapping_purpose,
          source_revision,
          source_hash,
+         pack_evidence_hash,
          is_current,
          row_version::text,
          updated_at`,
@@ -1560,6 +1568,7 @@ export async function saveCommerceVariantPackMappingInPostgres(input: {
         state.observed_at,
         input.actorEmail,
         input.mapping.purpose,
+        state.pack_evidence_hash,
       ],
     )
     const mapping = inserted.rows[0]
@@ -2193,6 +2202,7 @@ export async function readProductPackManagementStateInPostgres(input: {
          state.observed_at,
          state.source_revision,
          state.source_hash,
+         state.pack_evidence_hash,
          state.requires_shipping,
          state.weight_grams,
          state.row_version::text,
@@ -2233,6 +2243,7 @@ export async function readProductPackManagementStateInPostgres(input: {
          mapping.mapping_purpose,
          mapping.source_revision,
          mapping.source_hash,
+         mapping.pack_evidence_hash,
          mapping.is_current,
          mapping.row_version::text,
          mapping.updated_at,

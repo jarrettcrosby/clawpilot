@@ -10,6 +10,11 @@ const { Pool } = requireFromApp('pg')
 export const SCRIPT_VERSION = 'ag-alchemy-carrier-sandbox-v1'
 export const MANAGED_BY = 'ag-alchemy-episcs-sandbox-rating-delegation'
 export const EXECUTION_CONFIRMATION = 'establish-ag-alchemy-carrier-sandbox-v1'
+export const SANDBOX_FULFILLMENT_EXECUTION_CONFIRMATION =
+  'enable-ag-alchemy-carrier-sandbox-fulfillment-diagnostics-v1'
+export const RATING_ONLY_PROFILE = 'rating_only'
+export const SANDBOX_FULFILLMENT_PROFILE =
+  'sandbox_fulfillment_diagnostic'
 export const TRUSTED_RAILWAY_PROJECT_ID =
   'b5169ebd-8166-4b96-9a81-7cc8adaa9270'
 export const TRUSTED_RAILWAY_DEVELOPMENT_ENVIRONMENT_ID =
@@ -262,12 +267,31 @@ function sameAddress(left, right) {
   return addressFingerprint(left) === addressFingerprint(right)
 }
 
-function expectedConfiguration(source, target) {
+function profilePolicy(profile) {
+  if (profile === RATING_ONLY_PROFILE) {
+    return {
+      authorizationScope: 'sandbox_rating_only',
+      allowedCapabilities: ['sandbox_rate'],
+      purpose: 'sandbox rating',
+    }
+  }
+  if (profile === SANDBOX_FULFILLMENT_PROFILE) {
+    return {
+      authorizationScope: 'sandbox_fulfillment_diagnostic',
+      allowedCapabilities: ['sandbox_rate', 'sandbox_label'],
+      purpose: 'sandbox fulfillment diagnostics',
+    }
+  }
+  fail('Managed carrier delegation profile is invalid')
+}
+
+function expectedConfiguration(source, target, profile) {
+  const policy = profilePolicy(profile)
   return {
     authMode: 'oauth_client_credentials',
     accountOwnerType: 'operator_owned',
-    authorizationScope: 'sandbox_rating_only',
-    allowedCapabilities: ['sandbox_rate'],
+    authorizationScope: policy.authorizationScope,
+    allowedCapabilities: policy.allowedCapabilities,
     credentialRevealAllowed: false,
     managedBy: MANAGED_BY,
     delegatedFromOrganizationReferenceCode:
@@ -658,7 +682,7 @@ async function loadTargetConnections(client, organizationId, lock = false) {
   return providers
 }
 
-function targetDisposition(source, target, targetContext) {
+function targetDisposition(source, target, targetContext, profile) {
   if (!target) {
     return {
       action: 'create',
@@ -679,7 +703,7 @@ function targetDisposition(source, target, targetContext) {
   const targetCredential = decryptTargetCredential(target)
   const expectedAccountNumber = source.accountNumber
   const targetAccountNumber = decryptTargetAccountNumber(target)
-  const expectedConfig = expectedConfiguration(source, targetContext)
+  const expectedConfig = expectedConfiguration(source, targetContext, profile)
   const exact = (
     target.integration_status === 'active'
     && target.verification_status === 'verified'
@@ -703,6 +727,7 @@ function targetDisposition(source, target, targetContext) {
 }
 
 async function auditDelegation(client, input) {
+  const policy = profilePolicy(input.profile)
   await client.query(
     `INSERT INTO audit_events (
        actor, event_type, aggregate_type, aggregate_id, payload, event_key,
@@ -725,24 +750,27 @@ async function auditDelegation(client, input) {
           input.source.carrier_account_global_id,
         senderOriginWarehouseGlobalId:
           input.target.warehouse.global_id,
-        allowedCapabilities: ['sandbox_rate'],
+        authorizationScope: policy.authorizationScope,
+        allowedCapabilities: policy.allowedCapabilities,
         credentialRevealAllowed: false,
         scriptVersion: SCRIPT_VERSION,
       }),
       [
         'carrier-sandbox-delegation',
         input.targetIntegrationGlobalId,
+        input.profile,
         input.source.credential_version,
         addressFingerprint(input.target.origin),
       ].join(':'),
-      `${PROVIDER_LABELS[input.source.provider]} sandbox rating`,
+      `${PROVIDER_LABELS[input.source.provider]} ${policy.purpose}`,
       input.target.organization.id,
     ],
   )
 }
 
-async function createTargetConnection(client, source, target) {
-  const configuration = expectedConfiguration(source, target)
+async function createTargetConnection(client, source, target, profile) {
+  const policy = profilePolicy(profile)
+  const configuration = expectedConfiguration(source, target, profile)
   const integration = await client.query(
     `INSERT INTO operations_integration_accounts (
        organization_id, provider, integration_type, environment, display_name,
@@ -754,7 +782,7 @@ async function createTargetConnection(client, source, target) {
     [
       target.organization.id,
       source.provider,
-      `${PROVIDER_LABELS[source.provider]} sandbox rating via EPISCS`,
+      `${PROVIDER_LABELS[source.provider]} ${policy.purpose} via EPISCS`,
       JSON.stringify(configuration),
       target.actorEmail,
     ],
@@ -826,7 +854,7 @@ async function createTargetConnection(client, source, target) {
       carrierGlobalId,
       target.organization.id,
       integrationRow.id,
-      `${PROVIDER_LABELS[source.provider]} sandbox rating account`,
+      `${PROVIDER_LABELS[source.provider]} ${policy.purpose} account`,
       target.warehouse.name,
       encryptedAccount.ciphertext.toString('base64'),
       encryptedAccount.iv.toString('base64'),
@@ -847,12 +875,14 @@ async function createTargetConnection(client, source, target) {
     eventType: 'carrier.sandbox_rating_delegation.created',
     source,
     target,
+    profile,
     targetIntegrationGlobalId: integrationRow.global_id,
   })
 }
 
-async function updateTargetConnection(client, source, target, existing) {
-  const configuration = expectedConfiguration(source, target)
+async function updateTargetConnection(client, source, target, existing, profile) {
+  const policy = profilePolicy(profile)
+  const configuration = expectedConfiguration(source, target, profile)
   const targetCredential = decryptTargetCredential(existing)
   const credentialChanged = (
     targetCredential.clientId !== source.credential.clientId
@@ -907,7 +937,7 @@ async function updateTargetConnection(client, source, target, existing) {
     [
       target.organization.id,
       existing.integration_account_id,
-      `${PROVIDER_LABELS[source.provider]} sandbox rating via EPISCS`,
+      `${PROVIDER_LABELS[source.provider]} ${policy.purpose} via EPISCS`,
       JSON.stringify(configuration),
       `carrier-credential:${existing.integration_account_id}:v${credentialVersion}`,
       target.actorEmail,
@@ -951,7 +981,7 @@ async function updateTargetConnection(client, source, target, existing) {
     [
       target.organization.id,
       existing.carrier_account_id,
-      `${PROVIDER_LABELS[source.provider]} sandbox rating account`,
+      `${PROVIDER_LABELS[source.provider]} ${policy.purpose} account`,
       target.warehouse.name,
       encryptedAccount?.ciphertext.toString('base64') || null,
       encryptedAccount?.iv.toString('base64') || null,
@@ -972,18 +1002,19 @@ async function updateTargetConnection(client, source, target, existing) {
     eventType: 'carrier.sandbox_rating_delegation.updated',
     source,
     target,
+    profile,
     targetIntegrationGlobalId: existing.integration_global_id,
   })
 }
 
-async function provision(client, sourceRows, target, apply) {
+async function provision(client, sourceRows, target, apply, profile) {
   const existing = await loadTargetConnections(
     client,
     target.organization.id,
   )
   const planned = sourceRows.map((source) => ({
     source,
-    ...targetDisposition(source, existing.get(source.provider), target),
+    ...targetDisposition(source, existing.get(source.provider), target, profile),
   }))
   if (!apply) {
     return planned
@@ -1021,15 +1052,21 @@ async function provision(client, sourceRows, target, apply) {
     )
     for (const source of lockedSourceRows) {
       const locked = lockedExisting.get(source.provider)
-      const disposition = targetDisposition(source, locked, lockedTarget)
+      const disposition = targetDisposition(
+        source,
+        locked,
+        lockedTarget,
+        profile,
+      )
       if (disposition.action === 'create') {
-        await createTargetConnection(client, source, lockedTarget)
+        await createTargetConnection(client, source, lockedTarget, profile)
       } else if (disposition.action === 'update') {
         await updateTargetConnection(
           client,
           source,
           lockedTarget,
           locked,
+          profile,
         )
       }
     }
@@ -1045,7 +1082,7 @@ async function provision(client, sourceRows, target, apply) {
   )
   return sourceRows.map((source) => {
     const row = postflight.get(source.provider)
-    const disposition = targetDisposition(source, row, target)
+    const disposition = targetDisposition(source, row, target, profile)
     if (disposition.action !== 'noop') {
       fail(`AG Alchemy ${source.provider} sandbox postflight failed`)
     }
@@ -1060,7 +1097,12 @@ async function provision(client, sourceRows, target, apply) {
   })
 }
 
-export async function run({ apply = false, pool = null } = {}) {
+export async function run({
+  apply = false,
+  pool = null,
+  profile = RATING_ONLY_PROFILE,
+} = {}) {
+  const policy = profilePolicy(profile)
   requireTrustedDevelopmentEnvironment()
   const databaseUrl = environmentValue('DATABASE_URL')
   if (!databaseUrl) fail('DATABASE_URL is required')
@@ -1083,7 +1125,7 @@ export async function run({ apply = false, pool = null } = {}) {
     await Promise.all(sourceRows.map((source) => (
       verifySandboxCredential(source.provider, source.credential)
     )))
-    const result = await provision(client, sourceRows, target, apply)
+    const result = await provision(client, sourceRows, target, apply, profile)
     const sourceAfter = sourceSnapshotDigest(await loadSource(client))
     if (sourceAfter !== sourceBefore) {
       fail('EPISCS source carrier records changed during delegation')
@@ -1092,6 +1134,7 @@ export async function run({ apply = false, pool = null } = {}) {
       ok: true,
       scriptVersion: SCRIPT_VERSION,
       mode: apply ? 'apply' : 'plan',
+      profile,
       database: {
         fingerprint: database.database_fingerprint,
         trustedDevelopmentDatabase: true,
@@ -1126,7 +1169,8 @@ export async function run({ apply = false, pool = null } = {}) {
           entry.targetCarrierAccountGlobalId,
         action: entry.action,
         credentialVerified: true,
-        allowedCapabilities: ['sandbox_rate'],
+        authorizationScope: policy.authorizationScope,
+        allowedCapabilities: policy.allowedCapabilities,
         credentialRevealAllowed: false,
       })),
       providerWrites: 0,
@@ -1217,7 +1261,8 @@ function selfTest() {
     ok: true,
     scriptVersion: SCRIPT_VERSION,
     providers: [...EXPECTED_PROVIDERS],
-    allowedCapabilities: ['sandbox_rate'],
+    ratingOnlyPolicy: profilePolicy(RATING_ONLY_PROFILE),
+    sandboxFulfillmentPolicy: profilePolicy(SANDBOX_FULFILLMENT_PROFILE),
     credentialRevealAllowed: false,
     oneWarehouseRequired: true,
   }
@@ -1229,14 +1274,20 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     console.log(JSON.stringify(selfTest(), null, 2))
   } else {
     const apply = process.argv.includes('--apply')
+    const profile = process.argv.includes('--enable-sandbox-fulfillment')
+      ? SANDBOX_FULFILLMENT_PROFILE
+      : RATING_ONLY_PROFILE
     if (apply) {
       const confirmation = process.argv.find((value) => (
         value.startsWith('--confirm=')
       ))?.slice('--confirm='.length)
-      if (confirmation !== EXECUTION_CONFIRMATION) {
-        fail(`Apply requires --confirm=${EXECUTION_CONFIRMATION}`)
+      const requiredConfirmation = profile === SANDBOX_FULFILLMENT_PROFILE
+        ? SANDBOX_FULFILLMENT_EXECUTION_CONFIRMATION
+        : EXECUTION_CONFIRMATION
+      if (confirmation !== requiredConfirmation) {
+        fail(`Apply requires --confirm=${requiredConfirmation}`)
       }
     }
-    console.log(JSON.stringify(await run({ apply }), null, 2))
+    console.log(JSON.stringify(await run({ apply, profile }), null, 2))
   }
 }

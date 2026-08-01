@@ -95,6 +95,20 @@ includes(inventoryAttemptLeaseMigration, [
   'capture.request_hash = OLD.request_hash',
   'Terminal commerce provider attempts are immutable',
 ], 'Shopify inventory attempt lease-renewal migration')
+const inventoryWebhookRefreshMigration = read(
+  'db/migrations/0190_operations_shopify_inventory_webhook_refresh.sql',
+)
+includes(inventoryWebhookRefreshMigration, [
+  'operations_shopify_inventory_refresh_watermarks',
+  'dirty_version bigint NOT NULL DEFAULT 0',
+  'reconciled_version bigint NOT NULL DEFAULT 0',
+  'dirty_version > reconciled_version',
+  'protect_operations_shopify_inventory_refresh_watermark',
+  'watermark versions are monotonic',
+  'requested_dirty_version bigint NOT NULL DEFAULT 0',
+  'inventory_refresh_version bigint NOT NULL DEFAULT 0',
+  'acknowledges only this version',
+], 'Shopify inventory webhook refresh migration')
 
 const persistence = read(
   'app_src/lib/persistence/shopifyInventoryRefresh.ts',
@@ -115,11 +129,145 @@ includes(persistence, [
   'readShopifyInventoryRefreshHealthFromPostgres',
   'readShopifyInventoryRefreshWorkerHeartbeatFromPostgres',
   'renewShopifyInventoryRefreshJobLeaseInPostgres',
+  'signalShopifyInventoryRefreshWithClient',
+  'dirty_version =',
+  'reconciled_version',
+  'requested_dirty_version',
+  'followUpRequired',
+  'started_at = now()',
+  'provider_attempt_created_at',
+  'provider_capture_created_at',
+  'providerAttemptBeganAfterClaim',
+  'providerEvidenceCapturedAfterClaim',
+  'dirty_version = $4::bigint',
+  '$6::timestamptz >= last_signaled_at',
   'job.lease_expires_at > now()',
   "'inventoryRunGlobalId', $5::text",
   'providerWrites: 0',
   'orderQuantityAdjustment: 0',
 ], 'Shopify inventory refresh persistence')
+
+const signalQueries = []
+const refreshPersistence = loadTypeScriptModule(
+  'app_src/lib/persistence/shopifyInventoryRefresh.ts',
+  {
+    mocks: {
+      '@/lib/auditWriter': {
+        async recordAuditEvent() {},
+      },
+      '@/lib/persistence/postgres': {
+        async acquireTransactionAdvisoryLock(client) {
+          await client.query('SELECT pg_advisory_xact_lock(1)')
+        },
+        async query() {
+          return { rows: [] }
+        },
+        async withTransaction(callback) {
+          return callback({
+            async query(sql) {
+              signalQueries.push(sql)
+              return {
+                rowCount: 1,
+                rows: [{ dirty_version: '2', reconciled_version: '1' }],
+              }
+            },
+          })
+        },
+      },
+    },
+  },
+)
+const signaled = await refreshPersistence
+  .signalShopifyInventoryRefreshWithClient(
+    {
+      async query(sql) {
+        signalQueries.push(sql)
+        return {
+          rowCount: 1,
+          rows: [{ dirty_version: '6', reconciled_version: '4' }],
+        }
+      },
+    },
+    {
+      organizationId: '11111111-1111-4111-8111-111111111111',
+      integrationAccountId: '33333333-3333-4333-8333-333333333333',
+      credentialGeneration: 2,
+      receiptGlobalId: 'gcw1234567',
+      providerTriggeredAt: '2026-07-30T12:00:00.000Z',
+    },
+  )
+assert.deepEqual(
+  JSON.parse(JSON.stringify(signaled)),
+  { dirtyVersion: 6, reconciledVersion: 4 },
+)
+const signalUpsert = signalQueries.find((sql) => (
+  sql.includes('INSERT INTO operations_shopify_inventory_refresh_watermarks')
+))
+assert.ok(signalUpsert, 'Shopify inventory webhook dirty signal was not issued')
+includes(signalUpsert, [
+  'ON CONFLICT (organization_id, integration_account_id)',
+  '.dirty_version + 1',
+  'RETURNING dirty_version::text, reconciled_version::text',
+], 'Shopify inventory webhook dirty signal')
+
+const completionQueries = []
+const completionPersistence = loadTypeScriptModule(
+  'app_src/lib/persistence/shopifyInventoryRefresh.ts',
+  {
+    mocks: {
+      '@/lib/auditWriter': {
+        async recordAuditEvent() {},
+      },
+      '@/lib/persistence/postgres': {
+        async acquireTransactionAdvisoryLock(client) {
+          await client.query('SELECT pg_advisory_xact_lock(1)')
+        },
+        async query() {
+          return { rows: [] }
+        },
+        async withTransaction(callback) {
+          return callback({
+            async query(sql) {
+              completionQueries.push(sql)
+              if (sql.includes('SELECT 1')) {
+                return { rowCount: 1, rows: [{ '?column?': 1 }] }
+              }
+              if (sql.includes('inventory_sync_runs')) {
+                return {
+                  rowCount: 1,
+                  rows: [{
+                    id: '77777777-7777-4777-8777-777777777777',
+                    global_id: 'gisr1234567',
+                    provider_fetched_at: '2026-07-30T12:01:00.000Z',
+                    provider_attempt_created_at:
+                      '2026-07-30T12:00:30.000Z',
+                    provider_capture_created_at:
+                      '2026-07-30T12:01:00.000Z',
+                    completed_at: '2026-07-30T12:01:01.000Z',
+                    levels_seen: 1,
+                    levels_projected: 1,
+                    provider_writes: 0,
+                    order_quantity_adjustment: '0',
+                  }],
+                }
+              }
+              if (sql.includes('UPDATE operations_shopify_inventory_refresh_jobs')) {
+                return { rowCount: 1, rows: [] }
+              }
+              if (sql.includes('SELECT dirty_version::text')) {
+                return {
+                  rowCount: 1,
+                  rows: [{ dirty_version: '6', reconciled_version: '5' }],
+                }
+              }
+              assert.fail(`Unexpected completion query: ${sql}`)
+            },
+          })
+        },
+      },
+    },
+  },
+)
 
 const inventoryPersistence = read(
   'app_src/lib/persistence/commerceInventory.ts',
@@ -181,11 +329,32 @@ const job = {
   policyRevision: 8,
   policyHash: 'a'.repeat(64),
   inventoryMaxAgeSeconds: 900,
-  attemptCount: 1,
+  requestedDirtyVersion: 6,
+  attemptCount: 2,
   maxAttempts: 8,
   lockToken: '66666666-6666-4666-8666-666666666666',
-  startedAt: '2026-07-30T12:00:00.000Z',
+  // The first provider attempt succeeded at 12:01, then the worker failed.
+  // A webhook dirtied version 6 before this retry claimed a new attempt window.
+  startedAt: '2026-07-30T12:02:00.000Z',
 }
+const lostWakeupCompletion = await completionPersistence
+  .completeShopifyInventoryRefreshJobInPostgres({
+    job,
+    effectiveIdempotencyKey: 'shopify-inventory-refresh:watermark-proof',
+    inventoryRunGlobalId: 'gisr1234567',
+  })
+assert.equal(lostWakeupCompletion.status, 'succeeded')
+assert.equal(lostWakeupCompletion.requestedDirtyVersion, 6)
+assert.equal(lostWakeupCompletion.currentDirtyVersion, 6)
+assert.equal(lostWakeupCompletion.reconciledDirtyVersion, 5)
+assert.equal(lostWakeupCompletion.followUpRequired, true)
+assert.equal(
+  completionQueries.some((sql) => (
+    sql.includes('UPDATE operations_shopify_inventory_refresh_watermarks')
+  )),
+  false,
+  'A replayed pre-claim provider capture must not acknowledge a newer webhook dirty version',
+)
 const trace = {
   claim: [],
   renew: [],
@@ -275,6 +444,7 @@ assert.deepEqual(
     policyRevision: job.policyRevision,
     policyHash: job.policyHash,
     inventoryMaxAgeSeconds: job.inventoryMaxAgeSeconds,
+    requestedDirtyVersion: job.requestedDirtyVersion,
     lockToken: job.lockToken,
   },
 )
@@ -401,6 +571,7 @@ includes(
 const health = read('app_src/app/api/health/route.ts')
 includes(health, [
   'operations_shopify_inventory_refresh_migration_applied',
+  'operations_shopify_inventory_webhook_refresh_applied',
   'operations_shopify_checkout_plan_rate_policy_applied',
   'shopify_active_account_readiness_migration_applied',
   'operations_commerce_inventory_attempt_lease_renewal_applied',
@@ -415,6 +586,8 @@ const checkoutContext = read(
 includes(checkoutContext, [
   'SHOPIFY_CHECKOUT_INVENTORY_SYNC_REQUIRED',
   'SHOPIFY_CHECKOUT_INVENTORY_STALE',
+  'SHOPIFY_CHECKOUT_INVENTORY_REFRESH_PENDING',
+  'dirty_version::text, reconciled_version::text',
   'account.inventoryMaxAgeSeconds * 1_000',
 ], 'Shopify checkout inventory freshness gate')
 const predeploy = read('scripts/verify-predeploy.mjs')
@@ -422,6 +595,7 @@ includes(predeploy, [
   "'db/migrations/0169_operations_shopify_inventory_refresh_queue.sql'",
   "'db/migrations/0171_shopify_active_account_readiness.sql'",
   "'db/migrations/0172_operations_commerce_inventory_attempt_lease_renewal.sql'",
+  "'db/migrations/0190_operations_shopify_inventory_webhook_refresh.sql'",
   "'scripts/test-shopify-inventory-refresh-worker.mjs'",
   "'scripts/test-shopify-inventory-refresh-postgres.mjs'",
 ], 'Shopify inventory refresh predeploy gate')

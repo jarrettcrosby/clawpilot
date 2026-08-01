@@ -307,6 +307,8 @@ export async function GET() {
           operations_pack_rate_pricing_semantics_applied: boolean
           operations_carrier_billing_mud_applied: boolean
           operations_shopify_inventory_refresh_migration_applied: boolean
+          operations_shopify_inventory_webhook_refresh_applied: boolean
+          operations_commerce_pack_evidence_fingerprint_applied: boolean
           operations_shopify_checkout_plan_rate_policy_applied: boolean
           shopify_active_account_readiness_migration_applied: boolean
           operations_commerce_inventory_attempt_lease_renewal_applied: boolean
@@ -981,6 +983,18 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename =
+                  '0190_operations_shopify_inventory_webhook_refresh.sql'
+              ) AS operations_shopify_inventory_webhook_refresh_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0191_operations_commerce_pack_evidence_fingerprint.sql'
+              ) AS operations_commerce_pack_evidence_fingerprint_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
                   '0170_operations_shopify_checkout_plan_rate_policy.sql'
               ) AS operations_shopify_checkout_plan_rate_policy_applied,
               EXISTS (
@@ -1203,6 +1217,8 @@ export async function GET() {
             && row?.operations_pack_rate_pricing_semantics_applied
             && row?.operations_carrier_billing_mud_applied
             && row?.operations_shopify_inventory_refresh_migration_applied
+            && row?.operations_shopify_inventory_webhook_refresh_applied
+            && row?.operations_commerce_pack_evidence_fingerprint_applied
             && row?.operations_shopify_checkout_plan_rate_policy_applied
             && row?.shopify_active_account_readiness_migration_applied
             && row?.operations_commerce_inventory_attempt_lease_renewal_applied
@@ -1351,6 +1367,8 @@ export async function GET() {
           || !row?.operations_pack_rate_pricing_semantics_applied
           || !row?.operations_carrier_billing_mud_applied
           || !row?.operations_shopify_inventory_refresh_migration_applied
+          || !row?.operations_shopify_inventory_webhook_refresh_applied
+          || !row?.operations_commerce_pack_evidence_fingerprint_applied
           || !row?.operations_shopify_checkout_plan_rate_policy_applied
           || !row?.shopify_active_account_readiness_migration_applied
           || !row?.operations_commerce_inventory_attempt_lease_renewal_applied
@@ -1791,6 +1809,8 @@ export async function GET() {
           if (
             commerceIntakeRuntimeAvailable()
             && row?.operations_shopify_inventory_refresh_migration_applied
+            && row?.operations_shopify_inventory_webhook_refresh_applied
+            && row?.operations_commerce_pack_evidence_fingerprint_applied
             && row?.shopify_active_account_readiness_migration_applied
             && row?.operations_commerce_inventory_attempt_lease_renewal_applied
           ) {

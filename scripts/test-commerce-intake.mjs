@@ -830,9 +830,15 @@ includes(persistenceSource, [
   'operations_product_pack_profile_versions profile_version',
   'profile_version.fit_model',
   'operations_product_channel_states channel_state',
-  'pack_mapping.source_revision =',
-  'channel_state.source_revision',
-  'pack_mapping.source_hash = channel_state.source_hash',
+  'pack_mapping.pack_evidence_hash,',
+  'channel_state.pack_evidence_hash AS channel_pack_evidence_hash',
+  'const channelStateEvidence =',
+  'runtimePackMapping.channelPackEvidenceHash =',
+  'channelStateEvidence.packEvidenceHash',
+  'runtimePackMapping.channelWeightGrams =',
+  'channelStateEvidence.weightGrams',
+  'pack_mapping.pack_evidence_hash =',
+  'channel_state.pack_evidence_hash',
   'commerce_variant_pack_mapping_id',
   'commerce_variant_pack_mapping_row_version',
   'pack_profile_version_id',
@@ -847,7 +853,85 @@ includes(persistenceSource, [
   "codes.push('packaging_required')",
   "'variant_pack_mapping'",
   'COMMERCE_INTAKE_PACK_MAPPING_STALE',
-], 'Exact-source provider pack resolution and promotion fencing')
+], 'Exact physical-pack provider resolution and promotion fencing')
+
+const retainedPackEvidenceHash = 'b'.repeat(64)
+const retainedPackWeightGrams = 172
+const productChannelStatePersistenceModule = loadTypeScriptModule(
+  'app_src/lib/persistence/productChannelStates.ts',
+  {
+    mocks: {
+      '@/lib/operations/commercePackEvidence': {
+        commercePackEvidenceHash() {
+          return 'a'.repeat(64)
+        },
+      },
+      '@/lib/persistence/postgres': { query() {} },
+    },
+  },
+)
+const retainedPackQueries = []
+const retainedPackEvidence = await productChannelStatePersistenceModule
+  .upsertProductChannelStateWithClient(
+    {
+      async query(sql, parameters) {
+        retainedPackQueries.push({ sql, parameters })
+        if (sql.includes('INSERT INTO operations_product_channel_states')) {
+          return { rows: [] }
+        }
+        if (sql.includes('SELECT pack_evidence_hash, weight_grams')) {
+          return {
+            rows: [{
+              pack_evidence_hash: retainedPackEvidenceHash,
+              weight_grams: retainedPackWeightGrams,
+            }],
+          }
+        }
+        throw new Error(`Unexpected product-channel-state query: ${sql}`)
+      },
+    },
+    {
+      organizationId: '11111111-1111-4111-8111-111111111111',
+      integrationAccountId: '22222222-2222-4222-8222-222222222222',
+      pipelineId: '33333333-3333-4333-8333-333333333333',
+      provider: 'shopify',
+      externalProductId: 'gid://shopify/Product/1',
+      externalVariantId: 'gid://shopify/ProductVariant/1',
+      externalInventoryItemId: 'gid://shopify/InventoryItem/1',
+      providerProductTitle: 'Stale product observation',
+      providerVariantTitle: 'Default Title',
+      providerSku: 'STALE-1',
+      providerBarcode: null,
+      providerTaxonomyScheme: null,
+      providerCategoryId: null,
+      providerCategoryName: null,
+      providerCategoryFullName: null,
+      providerCategoryPaths: [],
+      wholesaleCurrencyCode: null,
+      wholesalePriceMinor: null,
+      retailCurrencyCode: 'USD',
+      retailPriceMinor: '0',
+      compareAtCurrencyCode: null,
+      compareAtPriceMinor: null,
+      taxable: false,
+      requiresShipping: true,
+      weightGrams: 999,
+      productId: null,
+      productMappingId: null,
+      providerStatusRaw: 'active',
+      normalizedStatus: 'active',
+      providerActive: true,
+      providerUpdatedAt: '2026-07-29T00:00:00.000Z',
+      observedAt: '2026-07-29T00:00:01.000Z',
+      sourceRevision: 'stale-source-revision',
+      sourceHash: 'stale-source-hash',
+      actorEmail: 'test@example.com',
+    },
+  )
+assert.equal(retainedPackQueries.length, 2)
+assert.equal(retainedPackEvidence.packEvidenceHash, retainedPackEvidenceHash)
+assert.equal(retainedPackEvidence.weightGrams, retainedPackWeightGrams)
+
 const manualPackageResolutionSource = persistenceSource.slice(
   persistenceSource.indexOf(
     'export async function resolveCommerceCandidatePackageInPostgres',

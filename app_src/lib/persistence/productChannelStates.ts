@@ -5,6 +5,7 @@ import type {
 import type {
   ProductSalesChannelState,
 } from '@/lib/crm/types'
+import { commercePackEvidenceHash } from '@/lib/operations/commercePackEvidence'
 import { query } from '@/lib/persistence/postgres'
 
 export type ProductChannelStateObservation = {
@@ -52,7 +53,11 @@ export async function upsertProductChannelStateWithClient(
   client: PoolClient,
   input: ProductChannelStateObservation,
 ) {
-  await client.query(
+  const packEvidenceHash = commercePackEvidenceHash(input)
+  const written = await client.query<{
+    pack_evidence_hash: string
+    weight_grams: number | null
+  }>(
     `INSERT INTO operations_product_channel_states (
        organization_id, integration_account_id, pipeline_id, provider,
        external_product_id, external_variant_id, external_inventory_item_id,
@@ -65,13 +70,14 @@ export async function upsertProductChannelStateWithClient(
        requires_shipping, weight_grams,
        product_id, product_mapping_id, provider_status_raw,
        normalized_status, provider_active, provider_updated_at, observed_at,
-       source_revision, source_hash, created_by, updated_by
+       source_revision, source_hash, pack_evidence_hash,
+       created_by, updated_by
      ) VALUES (
        $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7,
        $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb,
        $17, $18::bigint, $19, $20::bigint, $21, $22::bigint,
        $23, $24, $25, $26::uuid, $27::uuid, $28, $29, $30,
-       $31::timestamptz, $32::timestamptz, $33, $34, $35, $35
+       $31::timestamptz, $32::timestamptz, $33, $34, $35, $36, $36
      )
      ON CONFLICT (
        organization_id, integration_account_id, external_variant_id
@@ -104,6 +110,7 @@ export async function upsertProductChannelStateWithClient(
        observed_at = EXCLUDED.observed_at,
        source_revision = EXCLUDED.source_revision,
        source_hash = EXCLUDED.source_hash,
+       pack_evidence_hash = EXCLUDED.pack_evidence_hash,
        product_id = COALESCE(
          EXCLUDED.product_id,
          operations_product_channel_states.product_id
@@ -121,7 +128,8 @@ export async function upsertProductChannelStateWithClient(
      ) >= COALESCE(
        operations_product_channel_states.provider_updated_at,
        operations_product_channel_states.observed_at
-     )`,
+     )
+     RETURNING pack_evidence_hash, weight_grams`,
     [
       input.organizationId,
       input.integrationAccountId,
@@ -157,9 +165,44 @@ export async function upsertProductChannelStateWithClient(
       input.observedAt,
       input.sourceRevision,
       input.sourceHash,
+      packEvidenceHash,
       input.actorEmail,
     ],
   )
+  if (written.rows[0]) {
+    if (written.rows[0].pack_evidence_hash !== packEvidenceHash) {
+      throw new Error(
+        'Database pack evidence derivation disagrees with application digest',
+      )
+    }
+    return {
+      packEvidenceHash: written.rows[0].pack_evidence_hash,
+      weightGrams: written.rows[0].weight_grams,
+    }
+  }
+  const retained = await client.query<{
+    pack_evidence_hash: string
+    weight_grams: number | null
+  }>(
+    `SELECT pack_evidence_hash, weight_grams
+     FROM operations_product_channel_states
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_variant_id = $3
+     LIMIT 1`,
+    [
+      input.organizationId,
+      input.integrationAccountId,
+      input.externalVariantId,
+    ],
+  )
+  if (!retained.rows[0]) {
+    throw new Error('Product channel state upsert retained no evidence row')
+  }
+  return {
+    packEvidenceHash: retained.rows[0].pack_evidence_hash,
+    weightGrams: retained.rows[0].weight_grams,
+  }
 }
 
 export async function linkProductChannelStateWithClient(

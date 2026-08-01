@@ -92,6 +92,7 @@ export type ShopifyInventoryRefreshExpectedFence = {
   policyRevision: number
   policyHash: string
   inventoryMaxAgeSeconds: number
+  requestedDirtyVersion: number
   lockToken: string
 }
 
@@ -1127,6 +1128,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
            AND job.status = 'processing'
            AND job.cancel_requested = false
            AND job.lock_token = $12::uuid
+           AND job.requested_dirty_version = $13::bigint
            AND job.lease_expires_at > clock_timestamp()
            AND (
              (config.registration_state = 'registered'
@@ -1154,6 +1156,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
           expected.policyHash,
           expected.inventoryMaxAgeSeconds,
           expected.lockToken,
+          expected.requestedDirtyVersion,
         ],
       )
       if (!refreshFence.rowCount) {

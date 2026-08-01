@@ -625,6 +625,9 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
     shadowLifetimeMode: input.shadowLifetimeMode,
     shadowDurationMinutes: input.shadowDurationMinutes,
   })
+  const shadowLifetimeIsExplicit = input.shadowLifetimeMode !== undefined
+    && input.shadowLifetimeMode !== null
+    && input.shadowLifetimeMode !== ''
   const expected = expectedRowVersion(input.expectedRowVersion)
   const actorEmail = normalizedActorEmail(input.actorEmail)
 
@@ -653,6 +656,12 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
     })
 
     const shadow = context.activationState === 'shadow'
+    if (shadow && current && !shadowLifetimeIsExplicit) {
+      throw new ShopifyCustomerRatePolicyPersistenceError(
+        'SHOPIFY_SHADOW_POLICY_LIFETIME_REQUIRED',
+        'Choose timed or until turned off when updating an existing Shadow customer policy',
+      )
+    }
     if (
       !shadow
       && normalizedPolicy.shadowTestChargeMode !== 'carrier_rate'

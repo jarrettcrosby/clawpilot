@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import {
+  assertCarrierRateTestArtifactCapability,
   carrierSandboxRateSelectionRequestHash,
   resolveCarrierSandboxShippingRuntime,
   sanitizedCarrierIntegrationError,
@@ -498,6 +499,15 @@ export async function voidCarrierRateTestLabel(input: {
     organizationId: input.organizationId,
     labelGlobalId: input.labelGlobalId,
   })
+  try {
+    await assertCarrierRateTestArtifactCapability({
+      organizationId: input.organizationId,
+      integrationAccountId: label.integrationAccountId,
+      provider: label.provider,
+    })
+  } catch (error) {
+    throw carrierActionError(error)
+  }
   if (
     carrierSandboxLabelLifecycleMode(
       label.provider,
@@ -616,6 +626,15 @@ export async function closeCarrierRateTestSampleLabel(input: {
     organizationId: input.organizationId,
     labelGlobalId: input.labelGlobalId,
   })
+  try {
+    await assertCarrierRateTestArtifactCapability({
+      organizationId: input.organizationId,
+      integrationAccountId: label.integrationAccountId,
+      provider: label.provider,
+    })
+  } catch (error) {
+    throw carrierActionError(error)
+  }
   if (
     carrierSandboxLabelLifecycleMode(
       label.provider,
@@ -657,6 +676,19 @@ export async function printCarrierRateTestLabel(input: {
   preferredPrinterGlobalId: string
   idempotencyKey: string
 }) {
+  const label = await readCarrierRateTestLabelProviderContextInPostgres({
+    organizationId: input.organizationId,
+    labelGlobalId: input.labelGlobalId,
+  })
+  try {
+    await assertCarrierRateTestArtifactCapability({
+      organizationId: input.organizationId,
+      integrationAccountId: label.integrationAccountId,
+      provider: label.provider,
+    })
+  } catch (error) {
+    throw carrierActionError(error)
+  }
   return queueCarrierRateTestLabelPrintInPostgres(input)
 }
 

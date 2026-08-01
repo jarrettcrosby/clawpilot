@@ -329,6 +329,7 @@ type RuntimePackMappingRow = {
   is_current: boolean
   source_revision: string | null
   source_hash: string | null
+  pack_evidence_hash: string | null
   profile_version_id: string
   profile_version_global_id: string
   profile_version_row_version: string
@@ -347,6 +348,7 @@ type RuntimePackMappingRow = {
   evidence_type: string
   channel_source_revision: string | null
   channel_source_hash: string | null
+  channel_pack_evidence_hash: string | null
   channel_weight_grams: number | null
 }
 
@@ -4321,6 +4323,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
          pack_mapping.is_current,
          pack_mapping.source_revision,
          pack_mapping.source_hash,
+         pack_mapping.pack_evidence_hash,
          profile_version.id::text AS profile_version_id,
          profile_version.global_id AS profile_version_global_id,
          profile_version.row_version::text
@@ -4340,6 +4343,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
          profile_version.evidence_type,
          channel_state.source_revision AS channel_source_revision,
          channel_state.source_hash AS channel_source_hash,
+         channel_state.pack_evidence_hash AS channel_pack_evidence_hash,
          channel_state.weight_grams AS channel_weight_grams
        FROM operations_commerce_variant_pack_mappings pack_mapping
        JOIN operations_product_mappings product_mapping
@@ -4403,6 +4407,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           isCurrent: row.is_current,
           sourceRevision: row.source_revision,
           sourceHash: row.source_hash,
+          packEvidenceHash: row.pack_evidence_hash,
           profileVersionId: row.profile_version_id,
           profileVersionGlobalId: row.profile_version_global_id,
           profileVersionRowVersion: Number(
@@ -4423,6 +4428,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           evidenceType: row.evidence_type,
           channelSourceRevision: row.channel_source_revision,
           channelSourceHash: row.channel_source_hash,
+          channelPackEvidenceHash: row.channel_pack_evidence_hash,
           channelWeightGrams: row.channel_weight_grams,
         } satisfies CommerceRuntimePackMapping,
       ]),
@@ -4449,7 +4455,8 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           variant.inventoryItemIdentity,
         )
         const mapping = mappingByVariant.get(variant.identity.value)
-        await upsertProductChannelStateWithClient(client, {
+        const channelStateEvidence =
+          await upsertProductChannelStateWithClient(client, {
           organizationId: account.organization_id,
           integrationAccountId: account.id,
           pipelineId: account.pipeline_id,
@@ -4492,6 +4499,15 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           sourceHash: variant.sourceHash,
           actorEmail: input.actorEmail,
         })
+        const runtimePackMapping = runtimePackMappingByVariant.get(
+          variant.identity.value,
+        )
+        if (runtimePackMapping) {
+          runtimePackMapping.channelPackEvidenceHash =
+            channelStateEvidence.packEvidenceHash
+          runtimePackMapping.channelWeightGrams =
+            channelStateEvidence.weightGrams
+        }
         const prior = latestProductEvidenceByVariant.get(
           variant.identity.value,
         )
@@ -9416,9 +9432,8 @@ export async function promoteCommerceCandidateInPostgres(input: {
              AND pack_mapping.is_current = true
              AND pack_mapping.projection_state = 'current'
              AND pack_mapping.row_version = $8::bigint
-             AND pack_mapping.source_revision =
-                  channel_state.source_revision
-             AND pack_mapping.source_hash = channel_state.source_hash
+             AND pack_mapping.pack_evidence_hash =
+                  channel_state.pack_evidence_hash
              AND profile_version.id = $9::uuid
              AND profile_version.row_version = $10::bigint
              AND profile_version.is_current = true

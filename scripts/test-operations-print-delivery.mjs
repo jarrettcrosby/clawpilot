@@ -98,6 +98,13 @@ function loadPersistenceHelpers() {
     if (specifier === '@/lib/auditWriter') {
       return { recordAuditEvent: async () => undefined }
     }
+    if (specifier === '@/lib/integrations/carrierManagedDelegation') {
+      return {
+        carrierConfigurationAllowsSandboxLabel: () => true,
+        isSourceManagedCarrierConfiguration: () => false,
+        managedCarrierDelegationProfile: () => null,
+      }
+    }
     if (specifier === '@/lib/operations/printing') return {}
     if (specifier === '@/lib/persistence/operationPrinting') return {}
     if (specifier === '@/lib/persistence/operations') {
@@ -225,6 +232,13 @@ function verifySourceContracts() {
     'strictBase64Bytes',
     'rate_test_label.label_payload AS rate_test_label_payload',
     'cancelVoidedRateTestLabelJobs',
+    'cancelUnauthorizedRateTestLabelJobs',
+    'assertRateTestLabelPrintCapability',
+    'carrierConfigurationAllowsSandboxLabel',
+    'sandbox_label_revoked',
+    "jsonb_typeof(connection.configuration->'allowedCapabilities')",
+    'rate_test_label.integration_account_id::text',
+    "'sandbox_label'",
     'artifact.source_rate_test_label_id IS NULL',
     'original.rate_test_label_id',
     'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
@@ -242,6 +256,10 @@ function verifySourceContracts() {
       `Missing print-delivery persistence contract: ${fragment}`,
     )
   }
+  assert.ok(
+    (persistence.match(/assertRateTestLabelPrintCapability\(/g) || []).length >= 5,
+    'Enqueue, claim, claim replay, retry, and reprint must recheck sandbox-label capability',
+  )
   assert.ok(
     !/\b(?:createLabel|purchaseLabel|buyLabel|carrierClient)\s*\(/.test(persistence),
     'Print delivery persistence must not purchase labels or call carrier APIs',

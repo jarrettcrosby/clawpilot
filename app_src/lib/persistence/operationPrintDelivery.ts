@@ -2,6 +2,14 @@ import crypto from 'crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
+  AG_ALCHEMY_CARRIER_ORIGIN_WAREHOUSE,
+  AG_ALCHEMY_EPISCS_CARRIER_DELEGATION,
+  MANAGED_SANDBOX_FULFILLMENT_SCOPE,
+  MANAGED_SANDBOX_RATING_SCOPE,
+  carrierConfigurationAllowsSandboxLabel,
+  managedCarrierDelegationProfile,
+} from '@/lib/integrations/carrierManagedDelegation'
+import {
   DEFAULT_PRINT_AGENT_CAPABILITIES,
   PRINT_DOCUMENT_TYPES,
   PRINT_FORMATS,
@@ -163,6 +171,15 @@ type LockedPrintJobRow = {
   claim_expires_at: TimestampValue | null
 }
 
+type RateTestLabelPrintAuthorizationRow = {
+  integration_account_id: string
+  label_provider: 'ups_rest' | 'fedex_rest'
+  connection_provider: string
+  connection_environment: string
+  connection_status: string
+  configuration: Record<string, unknown>
+}
+
 type PrintClaimRow = {
   claim_token: string
   claim_expires_at: TimestampValue
@@ -176,6 +193,7 @@ type PrintClaimRow = {
   byte_length: string
   storage_reference: string
   label_payload: string | null
+  rate_test_label_id: string | null
   rate_test_label_payload: Buffer | null
   artifact_payload: Buffer | null
   printer_global_id: string
@@ -198,6 +216,8 @@ type PrintArtifactPayloadRow = {
   source_label_format: PrintFormat | null
   source_label_payload: string | null
   rate_test_label_global_id: string | null
+  rate_test_label_integration_account_id: string | null
+  rate_test_label_provider: 'ups_rest' | 'fedex_rest' | 'usps_rest' | null
   rate_test_label_format: PrintFormat | null
   rate_test_label_payload: Buffer | null
   created_at: TimestampValue
@@ -974,6 +994,9 @@ export async function readOperationsPrintArtifactPayloadInPostgres(input: {
        source_label.format AS source_label_format,
        source_label.label_payload AS source_label_payload,
        rate_test_label.global_id AS rate_test_label_global_id,
+       rate_test_label.integration_account_id::text
+         AS rate_test_label_integration_account_id,
+       rate_test_label.provider AS rate_test_label_provider,
        rate_test_label.format AS rate_test_label_format,
        rate_test_label.label_payload AS rate_test_label_payload,
        COALESCE(
@@ -1106,6 +1129,12 @@ export async function readOperationsPrintArtifactPayloadInPostgres(input: {
     filename,
     payload,
     templateVersion,
+    sourceRateTestProvider: artifact.rate_test_label_global_id
+      ? artifact.rate_test_label_provider
+      : null,
+    sourceRateTestIntegrationAccountId: artifact.rate_test_label_global_id
+      ? artifact.rate_test_label_integration_account_id
+      : null,
     createdAt: iso(artifact.created_at) as string,
   }
 }
@@ -2559,6 +2588,58 @@ async function lockedJob(
   return result.rows[0]
 }
 
+function carrierRateTestPrintCapabilityError(
+  authorization: RateTestLabelPrintAuthorizationRow | null,
+) {
+  const profile = authorization
+    ? managedCarrierDelegationProfile(authorization.configuration)
+    : null
+  return new OperationsRequestError(
+    'CARRIER_CAPABILITY_NOT_AUTHORIZED',
+    profile === 'drifted'
+      ? 'This managed carrier connection requires repair'
+      : 'This carrier connection is not authorized to release sandbox label bytes',
+    403,
+  )
+}
+
+async function assertRateTestLabelPrintCapability(
+  client: PoolClient,
+  organizationId: string,
+  rateTestLabelId: string,
+) {
+  const result = await client.query<RateTestLabelPrintAuthorizationRow>(
+    `SELECT
+       label.integration_account_id::text,
+       label.provider AS label_provider,
+       connection.provider AS connection_provider,
+       connection.environment AS connection_environment,
+       connection.status AS connection_status,
+       connection.configuration
+     FROM operations_carrier_rate_test_labels label
+     JOIN operations_integration_accounts connection
+       ON connection.organization_id = label.organization_id
+      AND connection.id = label.integration_account_id
+      AND connection.integration_type = 'carrier'
+     WHERE label.organization_id = $1::uuid
+       AND label.id = $2::uuid
+     FOR SHARE OF label, connection`,
+    [organizationId, rateTestLabelId],
+  )
+  const authorization = result.rows[0] || null
+  if (
+    !authorization
+    || authorization.connection_provider !== authorization.label_provider
+    || authorization.connection_environment !== 'sandbox'
+    || authorization.connection_status !== 'active'
+  ) {
+    throw carrierRateTestPrintCapabilityError(authorization)
+  }
+  if (!carrierConfigurationAllowsSandboxLabel(authorization.configuration)) {
+    throw carrierRateTestPrintCapabilityError(authorization)
+  }
+}
+
 async function attemptReplay(input: {
   client: PoolClient
   organizationId: string
@@ -3011,6 +3092,141 @@ async function cancelVoidedRateTestLabelJobs(
   }
 }
 
+async function cancelUnauthorizedRateTestLabelJobs(
+  client: PoolClient,
+  agent: OperationsPrintAgentContext,
+) {
+  const candidates = await client.query<{
+    id: string
+    global_id: string
+    printer_id: string
+    label_provider: 'ups_rest' | 'fedex_rest'
+    connection_provider: string | null
+    connection_environment: string | null
+    connection_status: string | null
+    configuration: Record<string, unknown> | null
+  }>(
+    `SELECT
+       job.id::text,
+       job.global_id,
+       job.printer_id::text,
+       label.provider AS label_provider,
+       connection.provider AS connection_provider,
+       connection.environment AS connection_environment,
+       connection.status AS connection_status,
+       connection.configuration
+     FROM operations_print_jobs job
+     JOIN operations_print_artifacts artifact
+       ON artifact.organization_id = job.organization_id
+      AND artifact.id = job.artifact_id
+     JOIN operations_carrier_rate_test_labels label
+       ON label.organization_id = artifact.organization_id
+      AND label.id = artifact.source_rate_test_label_id
+     JOIN operations_printers printer
+       ON printer.organization_id = job.organization_id
+      AND printer.id = job.printer_id
+     LEFT JOIN operations_integration_accounts connection
+       ON connection.organization_id = label.organization_id
+      AND connection.id = label.integration_account_id
+      AND connection.integration_type = 'carrier'
+     WHERE job.organization_id = $1::uuid
+       AND printer.warehouse_id = $2::uuid
+       AND job.status = 'queued'
+       AND label.status = 'created'
+       AND NOT (
+         connection.id IS NOT NULL
+         AND connection.provider = label.provider
+         AND connection.environment = 'sandbox'
+         AND connection.status = 'active'
+         AND (
+           (
+             COALESCE(
+               connection.configuration->>'managedBy' = $3
+               OR (
+                 connection.configuration->>'authorizationScope' IN ($4, $5)
+                 AND connection.configuration->'credentialRevealAllowed'
+                   = 'false'::jsonb
+               ),
+               false
+             )
+             AND connection.configuration->>'managedBy' = $3
+             AND connection.configuration->>'authorizationScope' = $5
+             AND connection.configuration->'credentialRevealAllowed'
+               = 'false'::jsonb
+             AND connection.configuration->>'senderOriginWarehouseGlobalId'
+               = $6
+             AND connection.configuration->'allowedCapabilities'
+               = $7::jsonb
+           )
+           OR (
+             NOT COALESCE(
+               connection.configuration->>'managedBy' = $3
+               OR (
+                 connection.configuration->>'authorizationScope' IN ($4, $5)
+                 AND connection.configuration->'credentialRevealAllowed'
+                   = 'false'::jsonb
+               ),
+               false
+             )
+             AND (
+               COALESCE(
+                 jsonb_typeof(connection.configuration->'allowedCapabilities'),
+                 'missing'
+               ) <> 'array'
+               OR connection.configuration->'allowedCapabilities' ? 'sandbox_label'
+             )
+           )
+         )
+       )
+     ORDER BY job.created_at, job.id
+     FOR UPDATE OF job SKIP LOCKED
+     LIMIT 25`,
+    [
+      agent.organizationId,
+      agent.warehouseId,
+      AG_ALCHEMY_EPISCS_CARRIER_DELEGATION,
+      MANAGED_SANDBOX_RATING_SCOPE,
+      MANAGED_SANDBOX_FULFILLMENT_SCOPE,
+      AG_ALCHEMY_CARRIER_ORIGIN_WAREHOUSE,
+      JSON.stringify(['sandbox_rate', 'sandbox_label']),
+    ],
+  )
+  let cancelled = 0
+  for (const job of candidates.rows) {
+    const authorized = (
+      job.configuration
+      && job.connection_provider === job.label_provider
+      && job.connection_environment === 'sandbox'
+      && job.connection_status === 'active'
+      && carrierConfigurationAllowsSandboxLabel(job.configuration)
+    )
+    if (authorized) continue
+    await client.query(
+      `INSERT INTO operations_print_delivery_attempts (
+         organization_id, print_job_id, printer_id,
+         state, actor_type, idempotency_key, request_fingerprint, detail
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid,
+         'cancelled', 'system', $4, $5,
+         'Carrier sandbox-label authorization is no longer active'
+       )`,
+      [
+        agent.organizationId,
+        job.id,
+        job.printer_id,
+        `print-job:${job.global_id}:sandbox-label-revoked`,
+        fingerprint({
+          state: 'cancelled',
+          jobGlobalId: job.global_id,
+          reason: 'sandbox_label_revoked',
+        }),
+      ],
+    )
+    cancelled += 1
+  }
+  return cancelled
+}
+
 async function claimedJobs(
   client: PoolClient,
   agent: OperationsPrintAgentContext,
@@ -3031,6 +3247,7 @@ async function claimedJobs(
        artifact.byte_length::text,
        artifact.storage_reference,
        label.label_payload,
+       rate_test_label.id::text AS rate_test_label_id,
        rate_test_label.label_payload AS rate_test_label_payload,
        payload.payload AS artifact_payload,
        printer.global_id AS printer_global_id,
@@ -3070,6 +3287,15 @@ async function claimedJobs(
       'Claim replay could not resolve every claimed print job',
       409,
     )
+  }
+  for (const row of result.rows) {
+    if (row.rate_test_label_id) {
+      await assertRateTestLabelPrintCapability(
+        client,
+        agent.organizationId,
+        row.rate_test_label_id,
+      )
+    }
   }
   return result.rows.map((row) => {
     const encodedPayload = encodeOperationsPrintClaimPayload({
@@ -3227,6 +3453,11 @@ export async function claimOperationsPrintJobsInPostgres(input: {
     await recoverExpiredClaims(client, input.agent)
     await cancelVoidedLabelJobs(client, input.agent)
     await cancelVoidedRateTestLabelJobs(client, input.agent)
+    while (
+      (await cancelUnauthorizedRateTestLabelJobs(client, input.agent)) === 25
+    ) {
+      // Drain a leading revoked batch so it cannot starve eligible print jobs.
+    }
     await rerouteUnavailableQueuedJobs({
       client,
       organizationId: input.agent.organizationId,
@@ -3247,6 +3478,7 @@ export async function claimOperationsPrintJobsInPostgres(input: {
       byte_length: string
       storage_reference: string
       label_payload: string | null
+      rate_test_label_id: string | null
       printer_id: string
       printer_global_id: string
       printer_code: string
@@ -3272,6 +3504,7 @@ export async function claimOperationsPrintJobsInPostgres(input: {
          artifact.byte_length::text,
          artifact.storage_reference,
          label.label_payload,
+         rate_test_label.id::text AS rate_test_label_id,
          printer.id::text AS printer_id,
          printer.global_id AS printer_global_id,
          printer.code AS printer_code,
@@ -3332,6 +3565,13 @@ export async function claimOperationsPrintJobsInPostgres(input: {
     )
     const claimAttemptIds: string[] = []
     for (const [index, job] of candidates.rows.entries()) {
+      if (job.rate_test_label_id) {
+        await assertRateTestLabelPrintCapability(
+          client,
+          input.agent.organizationId,
+          job.rate_test_label_id,
+        )
+      }
       const claim = await client.query<{
         id: string
         claim_expires_at: TimestampValue
@@ -3728,6 +3968,14 @@ export async function retryOperationsPrintJobInPostgres(input: {
       client,
       `operations:print-attempt:${organizationId}:${idempotencyKey}`,
     )
+    const job = await lockedJob(client, organizationId, input.jobGlobalId)
+    if (job.rate_test_label_id) {
+      await assertRateTestLabelPrintCapability(
+        client,
+        organizationId,
+        job.rate_test_label_id,
+      )
+    }
     const replay = await attemptReplay({
       client,
       organizationId,
@@ -3735,7 +3983,6 @@ export async function retryOperationsPrintJobInPostgres(input: {
       requestFingerprint,
     })
     if (replay) return oneJob(organizationId, input.jobGlobalId, client)
-    const job = await lockedJob(client, organizationId, input.jobGlobalId)
     if (job.status !== 'failed') {
       throw new OperationsRequestError(
         'OPERATIONS_PRINT_RETRY_INVALID',
@@ -3893,6 +4140,14 @@ export async function reprintOperationsPrintJobInPostgres(input: {
       client,
       `operations:print-reprint:${organizationId}:${callerKey}`,
     )
+    const original = await lockedJob(client, organizationId, input.jobGlobalId)
+    if (original.rate_test_label_id) {
+      await assertRateTestLabelPrintCapability(
+        client,
+        organizationId,
+        original.rate_test_label_id,
+      )
+    }
     const replay = await client.query<{
       global_id: string
       request_fingerprint: string
@@ -3914,7 +4169,6 @@ export async function reprintOperationsPrintJobInPostgres(input: {
       }
       return oneJob(organizationId, replay.rows[0].global_id, client)
     }
-    const original = await lockedJob(client, organizationId, input.jobGlobalId)
     if (original.status !== 'delivered') {
       throw new OperationsRequestError(
         'OPERATIONS_PRINT_REPRINT_INVALID',

@@ -104,12 +104,14 @@ type LineRow = QueryResultRow & {
   state_provider_active: boolean | null
   state_source_revision: string
   state_source_hash: string
+  state_pack_evidence_hash: string
   pack_mapping_global_id: string
   pack_mapping_row_version: string | number
   pack_mapping_projection_state: string
   pack_mapping_provider_lifecycle_state: string
   pack_mapping_source_revision: string | null
   pack_mapping_source_hash: string | null
+  pack_mapping_pack_evidence_hash: string | null
   profile_version_id: string
   profile_version_global_id: string
   profile_version_row_version: string | number
@@ -221,6 +223,7 @@ async function readLines(
        state.provider_active AS state_provider_active,
        state.source_revision AS state_source_revision,
        state.source_hash AS state_source_hash,
+       state.pack_evidence_hash AS state_pack_evidence_hash,
        mapping.global_id AS pack_mapping_global_id,
        mapping.row_version::text AS pack_mapping_row_version,
        mapping.projection_state AS pack_mapping_projection_state,
@@ -228,6 +231,7 @@ async function readLines(
          AS pack_mapping_provider_lifecycle_state,
        mapping.source_revision AS pack_mapping_source_revision,
        mapping.source_hash AS pack_mapping_source_hash,
+       mapping.pack_evidence_hash AS pack_mapping_pack_evidence_hash,
        version.id::text AS profile_version_id,
        version.global_id AS profile_version_global_id,
        version.row_version::text AS profile_version_row_version,
@@ -314,8 +318,9 @@ function mapLines(
       || row.state_requires_shipping !== true
       || row.pack_mapping_projection_state !== 'current'
       || row.pack_mapping_provider_lifecycle_state !== 'active'
-      || row.pack_mapping_source_revision !== row.state_source_revision
-      || row.pack_mapping_source_hash !== row.state_source_hash
+      || !row.pack_mapping_pack_evidence_hash
+      || row.pack_mapping_pack_evidence_hash
+        !== row.state_pack_evidence_hash
       || row.profile_version_is_current !== true
       || row.profile_version_lifecycle_state !== 'active'
       || row.profile_status !== 'active'
@@ -741,6 +746,28 @@ async function readLatestInventory(
     evidence: ShopifyCheckoutContextResult['lines'][number]
   }>,
 ) {
+  const watermarkResult = await client.query<{
+    dirty_version: string
+    reconciled_version: string
+  }>(
+    `SELECT dirty_version::text, reconciled_version::text
+     FROM operations_shopify_inventory_refresh_watermarks
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+     LIMIT 1`,
+    [account.organizationId, account.integrationAccountId],
+  )
+  const watermark = watermarkResult.rows[0]
+  if (
+    watermark
+    && BigInt(watermark.dirty_version)
+      > BigInt(watermark.reconciled_version)
+  ) {
+    fail(
+      'SHOPIFY_CHECKOUT_INVENTORY_REFRESH_PENDING',
+      'Shopify reported an inventory change that is awaiting authoritative reconciliation',
+    )
+  }
   const runResult = await client.query<{
     id: string
     global_id: string

@@ -585,16 +585,26 @@ async function createPool(connectionString) {
   })
 }
 
-function exactRatingConfiguration(configuration) {
-  return (
-    configuration?.managedBy === MANAGED_BY
-    && configuration?.authorizationScope === 'sandbox_rating_only'
-    && configuration?.credentialRevealAllowed === false
-    && configuration?.senderOriginWarehouseGlobalId
-      === TARGET_WAREHOUSE_GLOBAL_ID
+function exactManagedRatingConfiguration(configuration) {
+  const exactRatingOnly = (
+    configuration?.authorizationScope === 'sandbox_rating_only'
     && Array.isArray(configuration?.allowedCapabilities)
     && configuration.allowedCapabilities.length === 1
     && configuration.allowedCapabilities[0] === 'sandbox_rate'
+  )
+  const exactSandboxFulfillment = (
+    configuration?.authorizationScope === 'sandbox_fulfillment_diagnostic'
+    && Array.isArray(configuration?.allowedCapabilities)
+    && configuration.allowedCapabilities.length === 2
+    && configuration.allowedCapabilities[0] === 'sandbox_rate'
+    && configuration.allowedCapabilities[1] === 'sandbox_label'
+  )
+  return (
+    configuration?.managedBy === MANAGED_BY
+    && configuration?.credentialRevealAllowed === false
+    && configuration?.senderOriginWarehouseGlobalId
+      === TARGET_WAREHOUSE_GLOBAL_ID
+    && (exactRatingOnly || exactSandboxFulfillment)
   )
 }
 
@@ -665,7 +675,7 @@ async function loadDatabaseCarrierAccounts(client, organizationId) {
       || integration.environment !== 'sandbox'
       || integration.integration_status !== 'active'
       || integration.verification_status !== 'verified'
-      || !exactRatingConfiguration(integration.configuration)
+      || !exactManagedRatingConfiguration(integration.configuration)
       || activeAccounts.length !== 1
       || !/^gac[0-9]{7}$/.test(carrierAccount.carrier_account_global_id)
       || carrierAccount.sender_name !== warehouse.warehouse_name
@@ -732,14 +742,7 @@ async function resolveApiCarrierAccounts(
       connections.length !== 1
       || connection.status !== 'active'
       || connection.verificationStatus !== 'verified'
-      || connection.managedBy !== MANAGED_BY
-      || connection.authorizationScope !== 'sandbox_rating_only'
-      || connection.senderOriginWarehouseGlobalId
-        !== TARGET_WAREHOUSE_GLOBAL_ID
-      || connection.credentialRevealAllowed !== false
-      || !Array.isArray(connection.allowedCapabilities)
-      || connection.allowedCapabilities.length !== 1
-      || connection.allowedCapabilities[0] !== 'sandbox_rate'
+      || !exactManagedRatingConfiguration(connection)
       || activeAccounts.length !== 1
       || carrierAccount.allowSenderBilling !== true
       || carrierAccount.allowRecipientBilling !== false

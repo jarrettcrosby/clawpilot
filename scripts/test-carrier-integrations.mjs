@@ -235,8 +235,7 @@ for (const fragment of [
   'CarrierIntegrationSourceManagedError',
   'lockedUserManagedCarrierConnection',
   'FOR UPDATE OF account',
-  "configuration.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION",
-  "configuration.authorizationScope === 'sandbox_rating_only'",
+  'isSourceManagedCarrierConfiguration(configuration)',
 ]) {
   assert.ok(persistence.includes(fragment), `Carrier persistence contract missing ${fragment}`)
 }
@@ -285,7 +284,12 @@ for (const fragment of [
   'redactedSandboxRateBillingSelection',
   'requiresConfiguredCapability',
   'isSourceManagedCarrierConfiguration',
-  'isExactAgAlchemyRatingDelegation',
+  'managedCarrierDelegationAllows',
+  'managedCarrierDelegationProfile',
+  'carrierConfigurationAllowsSandboxLabel',
+  'assertCarrierRateTestArtifactCapability',
+  'readCarrierConnectionAuthorizationFromPostgres',
+  'integrationAccountId: unknown',
   "'CARRIER_CAPABILITY_NOT_AUTHORIZED'",
   "runtime.configuration.credentialRevealAllowed === false",
   "'CARRIER_CREDENTIAL_REVEAL_NOT_ALLOWED'",
@@ -358,6 +362,32 @@ for (const fragment of [
   assert.ok(route.includes(fragment), `Carrier API contract missing ${fragment}`)
 }
 assert.ok(!route.includes('permissions.manageUserAccess'), 'Carrier management must use operations permission')
+const rateTestLabelActions = read(
+  'app_src/lib/integrations/carrierRateTestLabelActions.ts',
+)
+assert.ok(
+  (rateTestLabelActions.match(/assertCarrierRateTestArtifactCapability\(/g) || []).length >= 3,
+  'Stored sandbox label print, void, and local sample close must enforce the managed capability profile',
+)
+assert.ok(
+  (rateTestLabelActions.match(/integrationAccountId: label\.integrationAccountId/g) || []).length >= 3,
+  'Stored sandbox label authorization must use the immutable creating integration account',
+)
+const printArtifactRoute = read(
+  'app_src/app/api/operations/artifacts/[globalId]/route.ts',
+)
+for (const fragment of [
+  'artifact.sourceRateTestProvider',
+  'artifact.sourceRateTestIntegrationAccountId',
+  'integrationAccountId: artifact.sourceRateTestIntegrationAccountId',
+  'assertCarrierRateTestArtifactCapability',
+  'CarrierIntegrationRequestError',
+]) {
+  assert.ok(
+    printArtifactRoute.includes(fragment),
+    `Rate-test label download enforcement is missing ${fragment}`,
+  )
+}
 const safeRateTestPrinterMapper = route.slice(
   route.indexOf('function safeRateTestPrinter'),
   route.indexOf('export async function GET'),
@@ -451,18 +481,22 @@ for (const fragment of [
   'Label bytes and internal database identifiers',
   'Printing queues the label bytes already stored in ClawPilot.',
   'It does not call the carrier,',
+  'creating, downloading, printing, or voiding a',
+  'canExecute && (selectedRateTestLabel.printArtifactGlobalId',
   "entry.connectionMode === 'local_agent'",
   "entry.localPrintAgentStatus === 'active'",
   "entry.supportedDocumentTypes.includes('shipping_label')",
   'EPISCS-managed sandbox rating',
+  'EPISCS-managed sandbox fulfillment diagnostics',
   'ratingOnlyDelegation',
+  'managedSandboxFulfillmentDelegation',
+  'labelWorkflowAuthorized',
   'sourceManagedDelegation',
   'managedDelegationDrift',
-  'Managed sandbox rating needs repair',
-  'AG_ALCHEMY_EPISCS_RATING_DELEGATION',
-  'account.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION',
-  "account?.authorizationScope === 'sandbox_rating_only'",
-  "account.allowedCapabilities[0] === 'sandbox_rate'",
+  'Managed sandbox delegation needs repair',
+  'managedCarrierDelegationProfile(carrierConfiguration)',
+  "delegationProfile === 'rating_only'",
+  "delegationProfile === 'sandbox_fulfillment_diagnostic'",
   "account?.credentialRevealAllowed !== false",
   'Credentials, billing identity, labels, voids,',
 ]) {
@@ -659,6 +693,64 @@ assert.notEqual(
   'account number fingerprints must be tenant scoped',
 )
 
+const carrierManagedDelegationModule = loadTypeScriptModule(
+  'app_src/lib/integrations/carrierManagedDelegation.ts',
+)
+const exactManagedSandboxFulfillment = {
+  authorizationScope: 'sandbox_fulfillment_diagnostic',
+  allowedCapabilities: ['sandbox_rate', 'sandbox_label'],
+  credentialRevealAllowed: false,
+  managedBy: 'ag-alchemy-episcs-sandbox-rating-delegation',
+  senderOriginWarehouseGlobalId: 'gwh5366613',
+}
+assert.equal(
+  carrierManagedDelegationModule.managedCarrierDelegationAllows(
+    exactManagedSandboxFulfillment,
+    'sandbox_rate',
+  ),
+  true,
+)
+assert.equal(
+  carrierManagedDelegationModule.managedCarrierDelegationAllows(
+    exactManagedSandboxFulfillment,
+    'sandbox_label',
+  ),
+  true,
+)
+assert.equal(
+  carrierManagedDelegationModule.managedCarrierDelegationAllows(
+    exactManagedSandboxFulfillment,
+    'production_rate',
+  ),
+  false,
+  'Managed sandbox fulfillment diagnostics must never grant production rating or execution',
+)
+assert.equal(
+  carrierManagedDelegationModule.carrierConfigurationAllowsSandboxLabel({}),
+  true,
+  'A legacy user-managed connection without capability metadata must retain sandbox-label access',
+)
+assert.equal(
+  carrierManagedDelegationModule.carrierConfigurationAllowsSandboxLabel({
+    allowedCapabilities: 'legacy-sandbox-policy',
+  }),
+  true,
+  'Legacy non-array capability metadata must retain sandbox-label access',
+)
+assert.equal(
+  carrierManagedDelegationModule.carrierConfigurationAllowsSandboxLabel({
+    allowedCapabilities: ['sandbox_rate'],
+  }),
+  false,
+  'An explicit capability list must include sandbox_label',
+)
+assert.equal(
+  carrierManagedDelegationModule.carrierConfigurationAllowsSandboxLabel({
+    allowedCapabilities: ['sandbox_rate', 'sandbox_label'],
+  }),
+  true,
+)
+
 const carrierServiceModule = loadTypeScriptModule('app_src/lib/integrations/carrierIntegrations.ts', {
   mocks: {
     '@/lib/integrations/carrierCredentialClient': {
@@ -686,6 +778,7 @@ const carrierServiceModule = loadTypeScriptModule('app_src/lib/integrations/carr
       requestCarrierSandboxRates: async () => ({}),
     },
     '@/lib/integrations/carrierCredentialCrypto': cryptoModule,
+    '@/lib/integrations/carrierManagedDelegation': carrierManagedDelegationModule,
     '@/lib/persistence/carrierIntegrations': {},
   },
 })
@@ -740,6 +833,7 @@ let delegatedConfiguration = {
   managedBy: 'ag-alchemy-episcs-sandbox-rating-delegation',
   senderOriginWarehouseGlobalId: 'gwh5366613',
 }
+let delegatedConnectionStatus = 'active'
 let productionConfiguration = {
   allowedCapabilities: ['production_rate'],
 }
@@ -835,6 +929,7 @@ const delegatedCarrierServiceModule = loadTypeScriptModule(
         },
       },
       '@/lib/integrations/carrierCredentialCrypto': cryptoModule,
+      '@/lib/integrations/carrierManagedDelegation': carrierManagedDelegationModule,
       '@/lib/persistence/carrierIntegrations': {
         readCarrierRuntimeCredentialFromPostgres: async (input) => {
           const production = input.environment === 'production'
@@ -846,12 +941,26 @@ const delegatedCarrierServiceModule = loadTypeScriptModule(
             globalId: production ? 'gia7654321' : 'gia1234567',
             provider: 'ups_rest',
             environment: production ? 'production' : 'sandbox',
-            status: 'active',
+            status: delegatedConnectionStatus,
             verificationStatus: 'verified',
             credentialVersion: 1,
             credentialFingerprint: 'a'.repeat(64),
             configuration: production ? productionConfiguration : delegatedConfiguration,
             encrypted: production ? productionEncrypted : encrypted,
+          }
+        },
+        readCarrierConnectionAuthorizationFromPostgres: async (input) => {
+          if (input.integrationAccountId !== '33333333-3333-4333-8333-333333333333') {
+            return null
+          }
+          return {
+            organizationId,
+            integrationAccountId: input.integrationAccountId,
+            globalId: 'gia1234567',
+            provider: 'ups_rest',
+            environment: 'sandbox',
+            status: delegatedConnectionStatus,
+            configuration: delegatedConfiguration,
           }
         },
         readActiveCarrierAccountsFromPostgres: async (input) => {
@@ -969,6 +1078,116 @@ await assert.rejects(
   ),
   'A rating-only delegated credential must not create or void sandbox labels',
 )
+await assert.rejects(
+  delegatedCarrierServiceModule.assertCarrierRateTestArtifactCapability({
+    organizationId,
+    integrationAccountId: '33333333-3333-4333-8333-333333333333',
+    provider: 'ups_rest',
+  }),
+  (error) => (
+    error.code === 'CARRIER_CAPABILITY_NOT_AUTHORIZED'
+    && error.status === 403
+  ),
+  'A rating-only delegated credential must not download or print stored sandbox labels',
+)
+delegatedConfiguration = {
+  authorizationScope: 'sandbox_fulfillment_diagnostic',
+  allowedCapabilities: ['sandbox_rate', 'sandbox_label'],
+  credentialRevealAllowed: false,
+  managedBy: 'ag-alchemy-episcs-sandbox-rating-delegation',
+  senderOriginWarehouseGlobalId: 'gwh5366613',
+}
+const managedSandboxShippingRuntime = await delegatedCarrierServiceModule
+  .resolveCarrierSandboxShippingRuntime({
+    organizationId,
+    provider: 'ups_rest',
+    senderBillingOnly: true,
+  })
+assert.equal(managedSandboxShippingRuntime.environment, 'sandbox')
+assert.equal(managedSandboxShippingRuntime.integrationGlobalId, 'gia1234567')
+await delegatedCarrierServiceModule.assertCarrierRateTestArtifactCapability({
+  organizationId,
+  integrationAccountId: '33333333-3333-4333-8333-333333333333',
+  provider: 'ups_rest',
+})
+delegatedConnectionStatus = 'disabled'
+await assert.rejects(
+  delegatedCarrierServiceModule.assertCarrierRateTestArtifactCapability({
+    organizationId,
+    integrationAccountId: '33333333-3333-4333-8333-333333333333',
+    provider: 'ups_rest',
+  }),
+  (error) => (
+    error.code === 'CARRIER_CAPABILITY_NOT_AUTHORIZED'
+    && error.status === 403
+  ),
+  'A disabled immutable carrier origin must fail closed',
+)
+delegatedConnectionStatus = 'active'
+await assert.rejects(
+  delegatedCarrierServiceModule.assertCarrierRateTestArtifactCapability({
+    organizationId,
+    integrationAccountId: '77777777-7777-4777-8777-777777777777',
+    provider: 'ups_rest',
+  }),
+  (error) => (
+    error.code === 'CARRIER_CAPABILITY_NOT_AUTHORIZED'
+    && error.status === 403
+  ),
+  'A missing immutable carrier origin must fail closed',
+)
+delegatedConfiguration = { allowedCapabilities: [] }
+await assert.rejects(
+  delegatedCarrierServiceModule.assertCarrierRateTestArtifactCapability({
+    organizationId,
+    integrationAccountId: '33333333-3333-4333-8333-333333333333',
+    provider: 'ups_rest',
+  }),
+  (error) => (
+    error.code === 'CARRIER_CAPABILITY_NOT_AUTHORIZED'
+    && error.status === 403
+  ),
+  'An explicit user-managed capability list without sandbox_label must revoke stored-label access',
+)
+delegatedConfiguration = {}
+await delegatedCarrierServiceModule.assertCarrierRateTestArtifactCapability({
+  organizationId,
+  integrationAccountId: '33333333-3333-4333-8333-333333333333',
+  provider: 'ups_rest',
+})
+delegatedConfiguration = { allowedCapabilities: 'legacy-sandbox-policy' }
+await delegatedCarrierServiceModule.assertCarrierRateTestArtifactCapability({
+  organizationId,
+  integrationAccountId: '33333333-3333-4333-8333-333333333333',
+  provider: 'ups_rest',
+})
+delegatedConfiguration = {
+  authorizationScope: 'sandbox_fulfillment_diagnostic',
+  allowedCapabilities: ['sandbox_rate', 'sandbox_label'],
+  credentialRevealAllowed: false,
+  managedBy: 'ag-alchemy-episcs-sandbox-rating-delegation',
+  senderOriginWarehouseGlobalId: 'gwh5366613',
+}
+await assert.rejects(
+  delegatedCarrierServiceModule.revealCarrierCredential({
+    organizationId,
+    provider: 'ups_rest',
+    environment: 'sandbox',
+    actorEmail: 'owner@example.com',
+  }),
+  (error) => (
+    error.code === 'CARRIER_CREDENTIAL_REVEAL_NOT_ALLOWED'
+    && error.status === 403
+  ),
+  'Managed sandbox fulfillment diagnostics must not reveal the delegated credential',
+)
+delegatedConfiguration = {
+  authorizationScope: 'sandbox_rating_only',
+  allowedCapabilities: ['sandbox_rate'],
+  credentialRevealAllowed: false,
+  managedBy: 'ag-alchemy-episcs-sandbox-rating-delegation',
+  senderOriginWarehouseGlobalId: 'gwh5366613',
+}
 for (const action of [
   () => delegatedCarrierServiceModule.testCarrierCredential({
     organizationId,

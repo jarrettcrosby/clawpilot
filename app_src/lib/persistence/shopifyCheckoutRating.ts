@@ -469,6 +469,7 @@ export type ShopifyCheckoutRateReceipt = {
   providerWriteCount: 0
   inventorySnapshotHash: string
   inventorySnapshotAt: string
+  inventoryRefreshVersion: number
   reconciliationWindowSeconds: number
   reconciliationDeadlineAt: string
   expiresAt: string | null
@@ -689,6 +690,7 @@ type ReceiptRow = QueryResultRow & {
   provider_write_count: 0
   inventory_snapshot_hash: string
   inventory_snapshot_at: TimestampValue
+  inventory_refresh_version: string | number
   reconciliation_window_seconds: number
   reconciliation_deadline_at: TimestampValue
   expires_at: TimestampValue | null
@@ -3341,6 +3343,7 @@ const RECEIPT_SELECT = `SELECT
     receipt.provider_write_count,
     receipt.inventory_snapshot_hash,
     receipt.inventory_snapshot_at,
+    receipt.inventory_refresh_version::text,
     receipt.reconciliation_window_seconds,
     receipt.reconciliation_deadline_at,
     receipt.expires_at,
@@ -3722,6 +3725,7 @@ async function receiptFromRow(
     providerWriteCount: 0,
     inventorySnapshotHash: row.inventory_snapshot_hash,
     inventorySnapshotAt: iso(row.inventory_snapshot_at) as string,
+    inventoryRefreshVersion: Number(row.inventory_refresh_version),
     reconciliationWindowSeconds: row.reconciliation_window_seconds,
     reconciliationDeadlineAt:
       iso(row.reconciliation_deadline_at) as string,
@@ -3775,6 +3779,44 @@ function assertIdempotentReceipt(
       409,
     )
   }
+}
+
+async function lockCleanShopifyInventoryRefreshVersion(
+  client: PoolClient,
+  input: { organizationId: string; integrationAccountId: string },
+) {
+  await acquireTransactionAdvisoryLock(
+    client,
+    `shopify-inventory-watermark:${input.organizationId}:${input.integrationAccountId}`,
+  )
+  const result = await client.query<{
+    dirty_version: string
+    reconciled_version: string
+  }>(
+    `SELECT dirty_version::text, reconciled_version::text
+     FROM operations_shopify_inventory_refresh_watermarks
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+     LIMIT 1
+     FOR SHARE`,
+    [input.organizationId, input.integrationAccountId],
+  )
+  const row = result.rows[0]
+  if (!row) return 0
+  const dirtyVersion = Number(row.dirty_version)
+  const reconciledVersion = Number(row.reconciled_version)
+  if (
+    !Number.isSafeInteger(dirtyVersion)
+    || !Number.isSafeInteger(reconciledVersion)
+    || dirtyVersion !== reconciledVersion
+  ) {
+    fail(
+      'SHOPIFY_CHECKOUT_INVENTORY_REFRESH_PENDING',
+      'Shopify inventory changed and authoritative reconciliation is pending',
+      409,
+    )
+  }
+  return dirtyVersion
 }
 
 async function claimShopifyCheckoutRateReceiptOnceInPostgres(
@@ -3840,6 +3882,11 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
         409,
       )
     }
+    const inventoryRefreshVersion =
+      await lockCleanShopifyInventoryRefreshVersion(client, {
+        organizationId: input.organizationId,
+        integrationAccountId: config.integrationAccountId,
+      })
     const cached = await client.query<ReceiptRow>(
       `${RECEIPT_SELECT}
        WHERE receipt.organization_id = $1::uuid
@@ -3852,6 +3899,7 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
          AND receipt.inventory_snapshot_at >= now() - make_interval(secs => $8)
          AND receipt.activation_revision = $9
          AND receipt.activation_state = $10
+         AND receipt.inventory_refresh_version = $12::bigint
          AND (
            receipt.idempotency_key = $11
            OR left(receipt.idempotency_key, length($11) + 9)
@@ -3874,6 +3922,7 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
         activation.revision,
         activation.state,
         input.cacheKey,
+        inventoryRefreshVersion,
       ],
     )
     if (cached.rows[0]) {
@@ -3903,6 +3952,8 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
         || existing.rows[0].policy_hash !== config.policyHash
         || existing.rows[0].activation_revision !== activation.revision
         || existing.rows[0].activation_state !== activation.state
+        || Number(existing.rows[0].inventory_refresh_version)
+          !== inventoryRefreshVersion
       ) {
         fail(
           'SHOPIFY_CHECKOUT_IDEMPOTENCY_FENCE_STALE',
@@ -3979,6 +4030,7 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
          AND receipt.inventory_snapshot_hash = $7
          AND receipt.activation_revision = $8
          AND receipt.activation_state = $9
+         AND receipt.inventory_refresh_version = $11::bigint
          AND (
            receipt.idempotency_key = $10
            OR left(receipt.idempotency_key, length($10) + 9)
@@ -3999,6 +4051,7 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
         activation.revision,
         activation.state,
         input.cacheKey,
+        inventoryRefreshVersion,
       ],
     )
     if (inProgress.rows[0]) {
@@ -4069,13 +4122,14 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
          redacted_request_snapshot, currency,
          idempotency_key, status, lease_token, lease_expires_at,
          claimed_by, line_count, inventory_snapshot_hash,
-         inventory_snapshot_at, carrier_destination_fingerprint
+         inventory_snapshot_at, carrier_destination_fingerprint,
+         inventory_refresh_version
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9,
          $10::uuid, $11, $12, $13, $14, $15, $16::jsonb, $17, $18,
          'processing', $19::uuid,
          now() + make_interval(secs => $20), $21, $22, $23,
-         $24::timestamptz, $25
+         $24::timestamptz, $25, $26::bigint
        )
        RETURNING id::text, global_id`,
       [
@@ -4104,6 +4158,7 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
         input.inventorySnapshotHash,
         input.inventorySnapshotAt,
         input.carrierDestinationFingerprint,
+        inventoryRefreshVersion,
       ],
     )
     await client.query(
@@ -4672,11 +4727,36 @@ export async function completeShopifyCheckoutRateReceiptInPostgres(
   return withShopifyCheckoutDeadlineTransaction(
     input.deadlineAt,
     async (client) => {
+    const receiptScope = await client.query<{
+      integration_account_id: string
+    }>(
+      `SELECT integration_account_id::text
+       FROM operations_shopify_checkout_rate_receipts
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+       LIMIT 1`,
+      [input.organizationId, input.receiptGlobalId],
+    )
+    if (!receiptScope.rows[0]) {
+      fail(
+        'SHOPIFY_CHECKOUT_RECEIPT_LEASE_STALE',
+        'Checkout receipt lease expired or was already finalized',
+        409,
+      )
+    }
+    const inventoryRefreshVersion =
+      await lockCleanShopifyInventoryRefreshVersion(client, {
+        organizationId: input.organizationId,
+        integrationAccountId:
+          receiptScope.rows[0].integration_account_id,
+      })
     const locked = await client.query<{
       id: string
       currency: string
+      inventory_refresh_version: string | number
     }>(
-      `SELECT receipt.id::text, receipt.currency
+      `SELECT receipt.id::text, receipt.currency,
+              receipt.inventory_refresh_version::text
        FROM operations_shopify_checkout_rate_receipts receipt
        JOIN operations_shopify_carrier_service_configs config
          ON config.organization_id = receipt.organization_id
@@ -4709,6 +4789,16 @@ export async function completeShopifyCheckoutRateReceiptInPostgres(
       fail(
         'SHOPIFY_CHECKOUT_RECEIPT_LEASE_STALE',
         'Checkout receipt lease expired or was already finalized',
+        409,
+      )
+    }
+    if (
+      Number(locked.rows[0].inventory_refresh_version)
+        !== inventoryRefreshVersion
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_INVENTORY_REFRESH_VERSION_STALE',
+        'Shopify inventory changed after this checkout request was claimed',
         409,
       )
     }
@@ -5098,6 +5188,41 @@ export async function failShopifyCheckoutRateReceiptInPostgres(rawInput: {
   return withShopifyCheckoutDeadlineTransaction(
     input.deadlineAt,
     async (client) => {
+    const receiptScope = await client.query<{
+      integration_account_id: string
+      inventory_refresh_version: string | number
+    }>(
+      `SELECT integration_account_id::text,
+              inventory_refresh_version::text
+       FROM operations_shopify_checkout_rate_receipts
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+       LIMIT 1`,
+      [input.organizationId, input.receiptGlobalId],
+    )
+    if (!receiptScope.rows[0]) {
+      fail(
+        'SHOPIFY_CHECKOUT_RECEIPT_LEASE_STALE',
+        'Checkout receipt lease expired or was already finalized',
+        409,
+      )
+    }
+    const inventoryRefreshVersion =
+      await lockCleanShopifyInventoryRefreshVersion(client, {
+        organizationId: input.organizationId,
+        integrationAccountId:
+          receiptScope.rows[0].integration_account_id,
+      })
+    if (
+      Number(receiptScope.rows[0].inventory_refresh_version)
+        !== inventoryRefreshVersion
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_INVENTORY_REFRESH_VERSION_STALE',
+        'Shopify inventory changed after this checkout request was claimed',
+        409,
+      )
+    }
     const updated = await client.query<{ global_id: string }>(
       `UPDATE operations_shopify_checkout_rate_receipts
        SET status = 'failed',
@@ -5177,8 +5302,25 @@ export async function readCachedShopifyCheckoutRateReceiptInPostgres(
       200,
     ),
   }
-  const result = await query<ReceiptRow>(
-    `${RECEIPT_SELECT}
+  return withTransaction(async (client) => {
+    const account = await client.query<{ id: string }>(
+      `SELECT id::text
+       FROM operations_integration_accounts
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+         AND provider = 'shopify'
+         AND integration_type = 'commerce'
+       LIMIT 1`,
+      [input.organizationId, input.accountGlobalId],
+    )
+    if (!account.rows[0]) return null
+    const inventoryRefreshVersion =
+      await lockCleanShopifyInventoryRefreshVersion(client, {
+        organizationId: input.organizationId,
+        integrationAccountId: account.rows[0].id,
+      })
+    const result = await client.query<ReceiptRow>(
+      `${RECEIPT_SELECT}
      JOIN operations_shopify_carrier_service_configs current_config
        ON current_config.organization_id = receipt.organization_id
       AND current_config.integration_account_id
@@ -5204,6 +5346,7 @@ export async function readCachedShopifyCheckoutRateReceiptInPostgres(
        AND receipt.policy_hash = current_config.policy_hash
        AND receipt.activation_revision = current_activation.revision
        AND receipt.activation_state = current_activation.state
+       AND receipt.inventory_refresh_version = $6::bigint
        AND operations_shopify_carrier_service_config_is_ready(
          current_config.organization_id, current_config.id
        )
@@ -5215,9 +5358,11 @@ export async function readCachedShopifyCheckoutRateReceiptInPostgres(
       input.requestFingerprint,
       input.inventorySnapshotHash,
       input.cacheKey,
+      inventoryRefreshVersion,
     ],
   )
-  return result.rows[0] ? receiptFromRow(null, result.rows[0]) : null
+    return result.rows[0] ? receiptFromRow(client, result.rows[0]) : null
+  })
 }
 
 type ReconciliationRow = QueryResultRow & {

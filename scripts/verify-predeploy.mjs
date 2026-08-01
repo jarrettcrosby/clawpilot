@@ -291,6 +291,8 @@ for (const requiredPath of [
   'db/migrations/0181_operations_shopify_shadow_policy_lifetime.sql',
   'db/migrations/0188_operations_shopify_shadow_test_subsidy.sql',
   'db/migrations/0189_operations_shopify_checkout_quote_match_families.sql',
+  'db/migrations/0190_operations_shopify_inventory_webhook_refresh.sql',
+  'db/migrations/0191_operations_commerce_pack_evidence_fingerprint.sql',
   'app_src/app/api/crm/products/[productId]/images/route.ts',
   'app_src/app/api/crm/products/[productId]/images/[assetId]/route.ts',
   'app_src/app/api/crm/products/[productId]/shopify-product-image/route.ts',

@@ -7,6 +7,7 @@ const read = (path) => readFile(new URL(path, root), 'utf8')
 
 const [
   migration,
+  packEvidenceMigration,
   checkoutAccountCorrection,
   domain,
   persistence,
@@ -14,12 +15,54 @@ const [
   panel,
 ] = await Promise.all([
   read('db/migrations/0151_operations_product_pack_management_hardening.sql'),
+  read('db/migrations/0191_operations_commerce_pack_evidence_fingerprint.sql'),
   read('db/migrations/0162_operations_shopify_checkout_mapping_account_status.sql'),
   read('app_src/lib/operations/productPackManagement.ts'),
   read('app_src/lib/persistence/productPackManagement.ts'),
   read('app_src/app/api/operations/product-pack-profiles/route.ts'),
   read('app_src/components/crm/ProductPackProfilePanel.tsx'),
 ])
+
+for (const fragment of [
+  'operations_commerce_pack_evidence_hash(',
+  'ADD COLUMN IF NOT EXISTS pack_evidence_hash text',
+  'SET pack_evidence_hash = state.pack_evidence_hash',
+  'set_operations_product_channel_pack_evidence_hash()',
+  'Current pack evidence is immutable; retire and create a new mapping',
+  "account_status NOT IN ('active', 'disabled')",
+  'mapping.pack_evidence_hash = state.pack_evidence_hash',
+  'NEW.pack_evidence_hash',
+  'channel_state.pack_evidence_hash',
+  'Full source_revision/source_hash remain catalog audit evidence',
+]) {
+  assert.ok(
+    packEvidenceMigration.includes(fragment),
+    `pack evidence migration is missing ${fragment}`,
+  )
+}
+for (const excluded of [
+  'inventory_quantity',
+  'provider_updated_at',
+  'provider_product_title',
+  'provider_variant_title',
+  'provider_sku',
+  'provider_barcode',
+  'provider_category_id',
+  'retail_price_minor',
+]) {
+  const fingerprintFunction = packEvidenceMigration.slice(
+    packEvidenceMigration.indexOf(
+      'CREATE OR REPLACE FUNCTION operations_commerce_pack_evidence_hash',
+    ),
+    packEvidenceMigration.indexOf(
+      'ALTER TABLE operations_product_channel_states',
+    ),
+  )
+  assert.ok(
+    !fingerprintFunction.includes(excluded),
+    `pack evidence fingerprint must exclude ${excluded}`,
+  )
+}
 
 for (const fragment of [
   "account_status NOT IN ('active', 'disabled')",
@@ -96,6 +139,7 @@ for (const fragment of [
   'packagingMaterials: materials.rows.map',
   'state.source_revision',
   'state.source_hash',
+  'state.pack_evidence_hash',
   'material.rated_outer_length_mm',
   'recordAuditEvent({',
   "row.account_status === 'error'",

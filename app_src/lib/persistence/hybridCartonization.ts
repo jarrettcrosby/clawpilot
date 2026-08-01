@@ -229,8 +229,10 @@ type CandidateLineRow = {
   pack_mapping_projection_state: string | null
   pack_mapping_source_revision: string | null
   pack_mapping_source_hash: string | null
+  pack_mapping_pack_evidence_hash: string | null
   channel_source_revision: string | null
   channel_source_hash: string | null
+  channel_pack_evidence_hash: string | null
   channel_weight_grams: number | null
   pack_profile_version_id: string | null
   pack_profile_version_global_id: string | null
@@ -304,9 +306,11 @@ type MatchedCheckoutReceiptLineRow = {
   pack_mapping_is_current: boolean | null
   pack_mapping_source_revision: string | null
   pack_mapping_source_hash: string | null
+  pack_mapping_pack_evidence_hash: string | null
   product_global_id: string | null
   channel_source_revision: string | null
   channel_source_hash: string | null
+  channel_pack_evidence_hash: string | null
   channel_weight_grams: number | null
   pack_profile_version_id: string | null
   pack_profile_version_global_id: string | null
@@ -686,10 +690,9 @@ export function assertMatchedShopifyCheckoutPackLineage(input: {
     || row.pack_mapping_purpose !== 'shopify_checkout'
     || row.pack_mapping_projection_state !== 'current'
     || row.pack_mapping_is_current !== true
-    || !row.pack_mapping_source_revision
-    || !row.pack_mapping_source_hash
-    || row.pack_mapping_source_revision !== row.channel_source_revision
-    || row.pack_mapping_source_hash !== row.channel_source_hash
+    || !row.pack_mapping_pack_evidence_hash
+    || row.pack_mapping_pack_evidence_hash
+      !== row.channel_pack_evidence_hash
     || row.product_global_id !== snapshotProductGlobalId
     || row.pack_profile_version_global_id !== snapshotProfileGlobalId
     || snapshotProfileRowVersion !== currentProfileRowVersion
@@ -1252,9 +1255,12 @@ async function readMatchedCheckoutPackLineage(
        pack_mapping.is_current AS pack_mapping_is_current,
        pack_mapping.source_revision AS pack_mapping_source_revision,
        pack_mapping.source_hash AS pack_mapping_source_hash,
+       pack_mapping.pack_evidence_hash
+         AS pack_mapping_pack_evidence_hash,
        product.reference_code AS product_global_id,
        channel_state.source_revision AS channel_source_revision,
        channel_state.source_hash AS channel_source_hash,
+       channel_state.pack_evidence_hash AS channel_pack_evidence_hash,
        channel_state.weight_grams AS channel_weight_grams,
        pack_version.id::text AS pack_profile_version_id,
        pack_version.global_id AS pack_profile_version_global_id,
@@ -1488,8 +1494,11 @@ function applyMatchedCheckoutPackLineage(
       pack_mapping_projection_state: receipt.pack_mapping_projection_state,
       pack_mapping_source_revision: receipt.pack_mapping_source_revision,
       pack_mapping_source_hash: receipt.pack_mapping_source_hash,
+      pack_mapping_pack_evidence_hash:
+        receipt.pack_mapping_pack_evidence_hash,
       channel_source_revision: receipt.channel_source_revision,
       channel_source_hash: receipt.channel_source_hash,
+      channel_pack_evidence_hash: receipt.channel_pack_evidence_hash,
       channel_weight_grams: receipt.channel_weight_grams,
       pack_profile_version_id: receipt.pack_profile_version_id,
       pack_profile_version_global_id:
@@ -1556,8 +1565,11 @@ async function readCandidateLines(
        pack_mapping.projection_state AS pack_mapping_projection_state,
        pack_mapping.source_revision AS pack_mapping_source_revision,
        pack_mapping.source_hash AS pack_mapping_source_hash,
+       pack_mapping.pack_evidence_hash
+         AS pack_mapping_pack_evidence_hash,
        channel_state.source_revision AS channel_source_revision,
        channel_state.source_hash AS channel_source_hash,
+       channel_state.pack_evidence_hash AS channel_pack_evidence_hash,
        channel_state.weight_grams AS channel_weight_grams,
        pack_version.id::text AS pack_profile_version_id,
        pack_version.global_id AS pack_profile_version_global_id,
@@ -1699,8 +1711,8 @@ function mapCandidateLines(
       || row.current_pack_mapping_row_version === null
       || row.pack_mapping_is_current !== true
       || row.pack_mapping_projection_state !== 'current'
-      || !row.pack_mapping_source_revision
-      || !row.pack_mapping_source_hash
+      || !row.pack_mapping_pack_evidence_hash
+      || !row.channel_pack_evidence_hash
       || !row.channel_source_revision
       || !row.channel_source_hash
       || !row.pack_profile_version_id
@@ -1753,8 +1765,8 @@ function mapCandidateLines(
       )
     }
     if (
-      row.pack_mapping_source_revision !== row.channel_source_revision
-      || row.pack_mapping_source_hash !== row.channel_source_hash
+      row.pack_mapping_pack_evidence_hash
+        !== row.channel_pack_evidence_hash
     ) {
       fail(
         `${row.product_title_snapshot} channel-pack evidence is stale`,
