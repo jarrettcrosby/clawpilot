@@ -15,6 +15,13 @@ const validatorUnionRepair = readFileSync(
   ),
   'utf8',
 )
+const validatorParcelRepair = readFileSync(
+  resolve(
+    root,
+    'db/migrations/0195_operations_fulfillment_rate_parcel_evidence.sql',
+  ),
+  'utf8',
+)
 
 function section(startMarker, endMarker, label) {
   const start = migration.indexOf(startMarker)
@@ -226,6 +233,26 @@ const checks = [
       validatorUnionRepair,
       /COMMENT ON FUNCTION validate_operations_fulfillment_execution\(\)[\s\S]*complete fulfillment-address fingerprint[\s\S]*exact package-plan hash and package count/,
       'Forward repair must retain the 0192/0193 invariant contract in the function comment',
+    )
+
+    assertIncludes(validatorParcelRepair, [
+      "'validate_operations_fulfillment_execution()'::regprocedure",
+      'provider_parcel_repair constant text := $parcel$',
+      'operations_shopify_checkout_carrier_request_parcel_snapshot(',
+      "'approved_recipe'",
+      'package.package_sequence',
+      'package.gross_weight_grams',
+      "length(current_parcel_comparison) = 522",
+      "= 'd4b3fc3616b0e31c9d12c02ce8d0170b'",
+      'Unexpected fulfillment carrier parcel comparison state; refusing to overwrite function drift',
+      'exact provider request parcel shape',
+    ], 'Fulfillment provider parcel-shape repair')
+    assert.equal(
+      validatorParcelRepair.includes(
+        "operations_shopify_checkout_carrier_request_parcel_snapshot(\n+      evidence_package.planning_method",
+      ),
+      false,
+      'Fulfillment provider parcels must not derive checkout-only planning methods from cartonization evidence',
     )
   }],
 

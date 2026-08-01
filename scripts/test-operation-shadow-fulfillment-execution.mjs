@@ -37,6 +37,13 @@ const fulfillmentValidatorUnionRepair = readFileSync(
   ),
   'utf8',
 )
+const fulfillmentRateParcelRepair = readFileSync(
+  resolve(
+    root,
+    'db/migrations/0195_operations_fulfillment_rate_parcel_evidence.sql',
+  ),
+  'utf8',
+)
 const twoPassPackRateMigration = readFileSync(
   resolve(
     root,
@@ -68,6 +75,22 @@ for (const fragment of [
   assert.ok(
     persistence.includes(fragment),
     `Canonical provider-variant resolution is missing ${fragment}`,
+  )
+}
+
+for (const fragment of [
+  "'validate_operations_fulfillment_execution()'::regprocedure",
+  'provider_parcel_repair constant text := $parcel$',
+  'operations_shopify_checkout_carrier_request_parcel_snapshot(',
+  "'approved_recipe'",
+  "length(current_parcel_comparison) = 522",
+  "= 'd4b3fc3616b0e31c9d12c02ce8d0170b'",
+  'Unexpected fulfillment carrier parcel comparison state; refusing to overwrite function drift',
+  'exact provider request parcel shape',
+]) {
+  assert.ok(
+    fulfillmentRateParcelRepair.includes(fragment),
+    `Fulfillment carrier parcel-evidence repair is missing ${fragment}`,
   )
 }
 

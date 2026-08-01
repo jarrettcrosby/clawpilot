@@ -15,13 +15,26 @@ const { Pool } = requireFromApp('pg')
 const root = process.cwd()
 const suppliedDatabaseUrl = String(process.env.DATABASE_URL || '').trim()
 
-const migrationPath = fileURLToPath(
+const unionRepairMigrationPath = fileURLToPath(
   new URL(
     '../db/migrations/0194_operations_fulfillment_execution_union_repair.sql',
     import.meta.url,
   ),
 )
-const migrationSql = readFileSync(migrationPath, 'utf8')
+const parcelRepairMigrationPath = fileURLToPath(
+  new URL(
+    '../db/migrations/0195_operations_fulfillment_rate_parcel_evidence.sql',
+    import.meta.url,
+  ),
+)
+const unionRepairMigrationSql = readFileSync(
+  unionRepairMigrationPath,
+  'utf8',
+)
+const parcelRepairMigrationSql = readFileSync(
+  parcelRepairMigrationPath,
+  'utf8',
+)
 
 function template(source, startMarker, endMarker, label) {
   const start = source.indexOf(startMarker)
@@ -33,16 +46,22 @@ function template(source, startMarker, endMarker, label) {
 }
 
 const lineRepair = template(
-  migrationSql,
+  unionRepairMigrationSql,
   'line_repair constant text := $line$',
   '$line$;',
   'Line repair template',
 )
 const packageRepair = template(
-  migrationSql,
+  unionRepairMigrationSql,
   'package_repair constant text := $package$',
   '$package$;',
   'Package repair template',
+)
+const providerParcelRepair = template(
+  parcelRepairMigrationSql,
+  'provider_parcel_repair constant text := $parcel$',
+  '$parcel$;',
+  'Provider parcel repair template',
 )
 
 function command(file, args, options = {}) {
@@ -95,7 +114,8 @@ async function verifyRepair(databaseUrl) {
        )`,
     )
 
-    await client.query(migrationSql)
+    await client.query(unionRepairMigrationSql)
+    await client.query(parcelRepairMigrationSql)
 
     const firstDefinitionResult = await client.query(
       `SELECT pg_get_functiondef(
@@ -106,7 +126,8 @@ async function verifyRepair(databaseUrl) {
       firstDefinitionResult.rows[0]?.definition || '',
     )
 
-    await client.query(migrationSql)
+    await client.query(unionRepairMigrationSql)
+    await client.query(parcelRepairMigrationSql)
     const secondDefinitionResult = await client.query(
       `SELECT pg_get_functiondef(
          'validate_operations_fulfillment_execution()'::regprocedure
@@ -129,6 +150,8 @@ async function verifyRepair(databaseUrl) {
       "max(run.input_snapshot->>'carrierDestinationFingerprint')",
       "'packagePlanHash', run.result_snapshot->>'packagePlanHash'",
       "'packageCount', run.package_count",
+      'operations_shopify_checkout_carrier_request_parcel_snapshot(',
+      "'approved_recipe'",
     ]) {
       assert.ok(
         definition.includes(fragment),
@@ -146,6 +169,13 @@ async function verifyRepair(databaseUrl) {
       ),
       false,
       'Repaired validator must retain the exact package-identity rate-choice repair',
+    )
+    assert.equal(
+      definition.includes(
+        'operations_shopify_checkout_carrier_parcel_snapshot(\n      package.package_key',
+      ),
+      false,
+      'Repaired validator must not compare provider evidence with the internal package-key parcel shape',
     )
 
     await client.query(`
@@ -313,6 +343,7 @@ async function verifyRepair(databaseUrl) {
         group_row record;
         line_mismatch_count bigint;
         package_mismatch_count bigint;
+        ordered_fulfillment_parcels jsonb;
       BEGIN
         SELECT
           '00000000-0000-0000-0000-000000000001'::uuid AS id,
@@ -331,6 +362,30 @@ async function verifyRepair(databaseUrl) {
         IF line_mismatch_count <> 0 OR package_mismatch_count <> 0 THEN
           RAISE EXCEPTION
             'Matching repair proof unexpectedly produced lineage mismatches';
+        END IF;
+
+        ${providerParcelRepair}
+        IF ordered_fulfillment_parcels IS DISTINCT FROM
+          '[{
+            "description": "ClawPilot carton 1",
+            "length": 4,
+            "width": 4,
+            "height": 4,
+            "dimensionUnit": "IN",
+            "weight": 2.3,
+            "weightUnit": "LB"
+          }]'::jsonb
+        THEN
+          RAISE EXCEPTION
+            'Provider parcel repair emitted an unexpected request shape: %',
+            ordered_fulfillment_parcels;
+        END IF;
+        IF ordered_fulfillment_parcels->0 ? 'packageKey'
+           OR ordered_fulfillment_parcels->0 ? 'exteriorInches'
+           OR ordered_fulfillment_parcels->0 ? 'grossPounds'
+        THEN
+          RAISE EXCEPTION
+            'Provider parcel repair leaked internal package fields';
         END IF;
 
         UPDATE operations_pack_rate_run_lines

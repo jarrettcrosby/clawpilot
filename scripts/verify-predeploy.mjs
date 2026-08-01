@@ -296,6 +296,7 @@ for (const requiredPath of [
   'db/migrations/0192_operations_shadow_fulfillment_destination_fingerprint.sql',
   'db/migrations/0193_operations_shadow_rate_choice_package_identity.sql',
   'db/migrations/0194_operations_fulfillment_execution_union_repair.sql',
+  'db/migrations/0195_operations_fulfillment_rate_parcel_evidence.sql',
   'app_src/app/api/crm/products/[productId]/images/route.ts',
   'app_src/app/api/crm/products/[productId]/images/[assetId]/route.ts',
   'app_src/app/api/crm/products/[productId]/shopify-product-image/route.ts',
