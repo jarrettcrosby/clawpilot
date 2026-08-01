@@ -702,6 +702,26 @@ function stableShippableLines(
   })
 }
 
+function checkoutRatePackageSummary(packages: ReadonlyArray<{
+  packageSequence: number
+  contentWeightGrams: number
+  tareWeightGrams: number
+  grossWeightGrams?: number
+  allocations: Array<{ quantity: number }>
+}>) {
+  return packages.map((item) => ({
+    packageSequence: item.packageSequence,
+    itemCount: item.allocations.reduce(
+      (total, allocation) => total + allocation.quantity,
+      0,
+    ),
+    contentWeightGrams: item.contentWeightGrams,
+    tareWeightGrams: item.tareWeightGrams,
+    grossWeightGrams: item.grossWeightGrams
+      ?? item.contentWeightGrams + item.tareWeightGrams,
+  }))
+}
+
 type TypedReceiptResponse = {
   response: ShopifyCarrierServiceRateResponse
 }
@@ -732,6 +752,8 @@ function responseFromTypedReceipt(
       responseProtocolVersion !== 'shopify-carrier-service-response-v2'
       && responseProtocolVersion
         !== 'shopify-carrier-service-response-v3'
+      && responseProtocolVersion
+        !== 'shopify-carrier-service-response-v4'
     )
     || shopifyCheckoutRatingHash(resultSnapshot) !== receipt.resultHash
     || resultSnapshot.packagePlanHash !== receipt.packagePlanHash
@@ -905,6 +927,9 @@ function responseFromTypedReceipt(
   const rebuilt = buildShopifyStoreEntityRateResponse({
     storeEntityName,
     packageCount: receipt.packages.length,
+    ...(responseProtocolVersion === 'shopify-carrier-service-response-v4'
+      ? { packages: checkoutRatePackageSummary(receipt.packages) }
+      : {}),
     offers: typedOffers,
   })
   const expectedResponse = rebuilt.response
@@ -1531,19 +1556,6 @@ export async function executeShopifyCarrierServiceCallback(input: {
       policy: shadowGuard.customerPolicy,
       offers: rated.offers,
     })
-    const { response } = buildShopifyStoreEntityRateResponse({
-      storeEntityName: account.storeEntityName,
-      packageCount: rated.packageCount,
-      offers: chargedOffers.map((offer) => ({
-        carrierCode: offer.carrierCode,
-        serviceLevelCode: offer.serviceLevelCode,
-        providerServiceName: offer.serviceName,
-        amountMinor: offer.customerChargeMinor,
-        currency: offer.currency,
-        minDeliveryDate: deliveryTimestamp(offer.deliveryDate),
-        maxDeliveryDate: deliveryTimestamp(offer.deliveryDate),
-      })),
-    })
     const recipePackages: ShopifyCheckoutPackageInput[] =
       plan.recipePackages.map((recipePackage) => {
         const ratedOuterDimensionsMm =
@@ -1646,6 +1658,20 @@ export async function executeShopifyCarrierServiceCallback(input: {
       left.packageSequence - right.packageSequence
       || left.packageKey.localeCompare(right.packageKey)
     ))
+    const { response } = buildShopifyStoreEntityRateResponse({
+      storeEntityName: account.storeEntityName,
+      packageCount: rated.packageCount,
+      packages: checkoutRatePackageSummary(packages),
+      offers: chargedOffers.map((offer) => ({
+        carrierCode: offer.carrierCode,
+        serviceLevelCode: offer.serviceLevelCode,
+        providerServiceName: offer.serviceName,
+        amountMinor: offer.customerChargeMinor,
+        currency: offer.currency,
+        minDeliveryDate: deliveryTimestamp(offer.deliveryDate),
+        maxDeliveryDate: deliveryTimestamp(offer.deliveryDate),
+      })),
+    })
     const packagePlanHash = shopifyCheckoutPackagePlanHash({ packages })
     requireCallbackTime(
       successPersistenceDeadlineAt,
@@ -1700,7 +1726,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
           },
         })),
         resultSnapshot: {
-          protocolVersion: 'shopify-carrier-service-response-v3',
+          protocolVersion: 'shopify-carrier-service-response-v4',
           storeEntityName: normalizeShopifyStoreEntityName(
             account.storeEntityName,
           ),
