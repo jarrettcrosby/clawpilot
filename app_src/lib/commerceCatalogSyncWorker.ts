@@ -133,8 +133,9 @@ export async function processCommerceCatalogSyncOutbox(input: {
       }
     }
   }
+  const followUpQueued = await queueAutomaticCommerceCatalogSyncsInPostgres()
   return {
-    autoQueued,
+    autoQueued: autoQueued + followUpQueued,
     claimed: jobs.length,
     pagesCompleted,
     jobsCompleted,

@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
-import { query, withTransaction } from '@/lib/persistence/postgres'
+import {
+  acquireTransactionAdvisoryLock,
+  query,
+  withTransaction,
+} from '@/lib/persistence/postgres'
 
 const CATALOG_SYNC_POLICY_VERSION = 'commerce-product-intake-policy-v1'
 const CATALOG_RECONCILIATION_INTERVAL = '6 hours'
@@ -37,6 +41,7 @@ export type CommerceCatalogSyncJob = {
   policyRevision: number
   requestedBy: string
   continuationRunGlobalId: string | null
+  targetDirtyVersion: number
   readGeneration: number
   pageCount: number
   attemptCount: number
@@ -104,6 +109,10 @@ async function cancelCommerceCatalogSyncJobsWithClient(
     errorCode: string
   },
 ) {
+  await acquireTransactionAdvisoryLock(
+    client,
+    `shopify-catalog-watermark:${input.organizationId}:${input.integrationAccountId}`,
+  )
   const cancelled = await client.query(
     `UPDATE operations_commerce_catalog_sync_jobs
      SET status = CASE
@@ -192,7 +201,8 @@ export async function applyCommerceCatalogSyncPolicyWithClient(
   const queued = await client.query(
     `INSERT INTO operations_commerce_catalog_sync_jobs (
        organization_id, integration_account_id, provider,
-       credential_version, policy_revision, requested_by
+       credential_version, policy_revision, requested_by,
+       target_dirty_version
      )
      SELECT
        account.organization_id,
@@ -200,13 +210,18 @@ export async function applyCommerceCatalogSyncPolicyWithClient(
        account.provider,
        account.commerce_credential_generation,
        $5,
-       $6
+       $6,
+       COALESCE(refresh.dirty_version, 0)
      FROM operations_integration_accounts account
      JOIN operations_commerce_credentials credential
        ON credential.organization_id = account.organization_id
       AND credential.integration_account_id = account.id
      JOIN operations_activation_scopes activation
        ON activation.organization_id = account.organization_id
+     LEFT JOIN operations_shopify_catalog_refresh_states refresh
+       ON refresh.organization_id = account.organization_id
+      AND refresh.integration_account_id = account.id
+      AND refresh.credential_generation = account.commerce_credential_generation
      WHERE account.organization_id = $1::uuid
        AND account.id = $2::uuid
        AND account.integration_type = 'commerce'
@@ -258,6 +273,55 @@ export function automaticCommerceCatalogRuntimeAvailable() {
     || '',
   ).trim().toLowerCase()
   return ['dev', 'development', 'local', 'preview'].includes(lane)
+}
+
+export async function signalShopifyCatalogRefreshWithClient(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    integrationAccountId: string
+    credentialGeneration: number
+    receiptGlobalId: string
+    providerTriggeredAt: string | null
+  },
+) {
+  await acquireTransactionAdvisoryLock(
+    client,
+    `shopify-catalog-watermark:${input.organizationId}:${input.integrationAccountId}`,
+  )
+  const signaled = await client.query<{
+    dirty_version: string
+    reconciled_version: string
+  }>(
+    `INSERT INTO operations_shopify_catalog_refresh_states (
+       organization_id, integration_account_id, credential_generation,
+       dirty_version, reconciled_version, last_receipt_global_id,
+       last_provider_triggered_at, last_signaled_at
+     ) VALUES (
+       $1::uuid, $2::uuid, $3, 1, 0, $4, $5::timestamptz, now()
+     )
+     ON CONFLICT (organization_id, integration_account_id)
+     DO UPDATE SET
+       credential_generation = EXCLUDED.credential_generation,
+       dirty_version =
+         operations_shopify_catalog_refresh_states.dirty_version + 1,
+       last_receipt_global_id = EXCLUDED.last_receipt_global_id,
+       last_provider_triggered_at = EXCLUDED.last_provider_triggered_at,
+       last_signaled_at = now(),
+       updated_at = now()
+     RETURNING dirty_version::text, reconciled_version::text`,
+    [
+      input.organizationId,
+      input.integrationAccountId,
+      input.credentialGeneration,
+      input.receiptGlobalId,
+      input.providerTriggeredAt,
+    ],
+  )
+  return {
+    dirtyVersion: Number(signaled.rows[0].dirty_version),
+    reconciledVersion: Number(signaled.rows[0].reconciled_version),
+  }
 }
 
 export function commerceCatalogCredentialSupportsProducts(input: {
@@ -596,7 +660,8 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
     const queued = await client.query(
       `INSERT INTO operations_commerce_catalog_sync_jobs (
          organization_id, integration_account_id, provider,
-         credential_version, policy_revision, requested_by
+         credential_version, policy_revision, requested_by,
+         target_dirty_version
        )
        SELECT
          account.organization_id,
@@ -604,7 +669,8 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
          account.provider,
          account.commerce_credential_generation,
          policy.revision,
-         COALESCE(policy.updated_by, policy.created_by)
+         COALESCE(policy.updated_by, policy.created_by),
+         COALESCE(refresh.dirty_version, 0)
        FROM operations_commerce_product_intake_policies policy
        JOIN operations_integration_accounts account
          ON account.organization_id = policy.organization_id
@@ -614,6 +680,10 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
         AND credential.integration_account_id = account.id
        JOIN operations_activation_scopes activation
          ON activation.organization_id = account.organization_id
+       LEFT JOIN operations_shopify_catalog_refresh_states refresh
+         ON refresh.organization_id = account.organization_id
+        AND refresh.integration_account_id = account.id
+        AND refresh.credential_generation = account.commerce_credential_generation
        WHERE policy.policy_version = $1
          AND policy.unmatched_action = 'auto_create'
          AND account.integration_type = 'commerce'
@@ -633,7 +703,10 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
              AND active.integration_account_id = account.id
              AND active.status IN ('pending', 'processing', 'failed')
          )
-         AND NOT EXISTS (
+         AND (
+           COALESCE(refresh.dirty_version, 0)
+             > COALESCE(refresh.reconciled_version, 0)
+           OR NOT EXISTS (
            SELECT 1
            FROM operations_commerce_catalog_sync_jobs recent
            WHERE recent.organization_id = account.organization_id
@@ -644,6 +717,7 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
              AND recent.policy_revision = policy.revision
              AND recent.status IN ('succeeded', 'dead')
              AND recent.updated_at >= now() - interval '${CATALOG_RECONCILIATION_INTERVAL}'
+           )
          )
        ON CONFLICT (
          organization_id, integration_account_id
@@ -682,6 +756,7 @@ export async function claimCommerceCatalogSyncJobsInPostgres(input: {
       policy_revision: number
       requested_by: string
       continuation_run_global_id: string | null
+      target_dirty_version: string
       read_generation: number
       page_count: number
       attempt_count: number
@@ -744,6 +819,7 @@ export async function claimCommerceCatalogSyncJobsInPostgres(input: {
          job.policy_revision,
          job.requested_by,
          job.continuation_run_global_id,
+         job.target_dirty_version::text,
          job.read_generation,
          job.page_count,
          job.attempt_count,
@@ -765,6 +841,7 @@ export async function claimCommerceCatalogSyncJobsInPostgres(input: {
       policyRevision: row.policy_revision,
       requestedBy: row.requested_by,
       continuationRunGlobalId: row.continuation_run_global_id,
+      targetDirtyVersion: Number(row.target_dirty_version),
       readGeneration: row.read_generation,
       pageCount: row.page_count,
       attemptCount: row.attempt_count,
@@ -961,6 +1038,26 @@ export async function completeCommerceCatalogSyncPageInPostgres(input: {
       ],
     )
     if (!hasNext) {
+      if (input.job.provider === 'shopify' && input.job.targetDirtyVersion > 0) {
+        await client.query(
+          `UPDATE operations_shopify_catalog_refresh_states
+           SET reconciled_version = GREATEST(
+                 reconciled_version,
+                 LEAST(dirty_version, $4::bigint)
+               ),
+               last_reconciled_at = now(),
+               updated_at = now()
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+             AND credential_generation = $3`,
+          [
+            input.job.organizationId,
+            input.job.integrationAccountId,
+            input.job.credentialVersion,
+            input.job.targetDirtyVersion,
+          ],
+        )
+      }
       await recordAuditEvent({
         actor: 'system',
         eventType: 'commerce.catalog.sync.succeeded',
@@ -973,6 +1070,7 @@ export async function completeCommerceCatalogSyncPageInPostgres(input: {
           provider: input.job.provider,
           credentialVersion: input.job.credentialVersion,
           policyRevision: input.job.policyRevision,
+          targetDirtyVersion: input.job.targetDirtyVersion,
           pageCount: nextPageCount,
           providerRecordsSeen: Number(totals.provider_records_seen),
           productsCreated: Number(totals.products_created),

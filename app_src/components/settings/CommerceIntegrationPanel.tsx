@@ -861,6 +861,22 @@ export default function CommerceIntegrationPanel() {
     )
   }
 
+  async function registerCatalogWebhooks(account: CommerceAccount) {
+    if (!canActivate || pendingAction) return
+    if (!window.confirm(
+      `Register the product create, update, and delete webhook topics for ${account.displayName}? Product events will trigger a read-only catalog reconciliation in Shadow.`,
+    )) return
+    await action(
+      `register-catalog-webhooks:${account.globalId}`,
+      {
+        action: 'register-shopify-catalog-webhooks',
+        accountGlobalId: account.globalId,
+        confirmProviderWrites: true,
+      },
+      `${account.displayName} catalog webhook subscriptions registered and verified.`,
+    )
+  }
+
   async function revealCredential(account: CommerceAccount) {
     if (!account.configured || pendingAction) return
     const revealOrganizationId = organizationIdRef.current
@@ -1884,14 +1900,24 @@ export default function CommerceIntegrationPanel() {
                               Copy URL
                             </Button>
                             {canActivate ? (
-                              <Button
-                                variant="contained"
-                                disabled={pendingAction !== '' || !account.configured}
-                                onClick={() => registerInventoryWebhooks(account)}
-                                sx={actionButtonSx}
-                              >
-                                Register inventory webhooks
-                              </Button>
+                              <>
+                                <Button
+                                  variant="contained"
+                                  disabled={pendingAction !== '' || !account.configured}
+                                  onClick={() => registerInventoryWebhooks(account)}
+                                  sx={actionButtonSx}
+                                >
+                                  Register inventory webhooks
+                                </Button>
+                                <Button
+                                  variant="contained"
+                                  disabled={pendingAction !== '' || !account.configured}
+                                  onClick={() => registerCatalogWebhooks(account)}
+                                  sx={actionButtonSx}
+                                >
+                                  Register catalog webhooks
+                                </Button>
+                              </>
                             ) : null}
                           </Stack>
                           {catalog ? (

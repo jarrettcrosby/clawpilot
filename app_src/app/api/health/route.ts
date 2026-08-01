@@ -308,6 +308,7 @@ export async function GET() {
           operations_carrier_billing_mud_applied: boolean
           operations_shopify_inventory_refresh_migration_applied: boolean
           operations_shopify_inventory_webhook_refresh_applied: boolean
+          operations_shopify_catalog_webhook_refresh_applied: boolean
           operations_commerce_pack_evidence_fingerprint_applied: boolean
           operations_shadow_fulfillment_destination_repair_applied: boolean
           operations_shadow_rate_choice_package_identity_repair_applied: boolean
@@ -993,6 +994,12 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename =
+                  '0197_operations_shopify_catalog_webhook_refresh.sql'
+              ) AS operations_shopify_catalog_webhook_refresh_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
                   '0191_operations_commerce_pack_evidence_fingerprint.sql'
               ) AS operations_commerce_pack_evidence_fingerprint_applied,
               EXISTS (
@@ -1246,6 +1253,7 @@ export async function GET() {
             && row?.operations_carrier_billing_mud_applied
             && row?.operations_shopify_inventory_refresh_migration_applied
             && row?.operations_shopify_inventory_webhook_refresh_applied
+            && row?.operations_shopify_catalog_webhook_refresh_applied
             && row?.operations_commerce_pack_evidence_fingerprint_applied
             && row?.operations_shadow_fulfillment_destination_repair_applied
             && row?.operations_shadow_rate_choice_package_identity_repair_applied
@@ -1400,6 +1408,7 @@ export async function GET() {
           || !row?.operations_carrier_billing_mud_applied
           || !row?.operations_shopify_inventory_refresh_migration_applied
           || !row?.operations_shopify_inventory_webhook_refresh_applied
+          || !row?.operations_shopify_catalog_webhook_refresh_applied
           || !row?.operations_commerce_pack_evidence_fingerprint_applied
           || !row?.operations_shadow_fulfillment_destination_repair_applied
           || !row?.operations_shadow_rate_choice_package_identity_repair_applied
@@ -1846,6 +1855,7 @@ export async function GET() {
             commerceIntakeRuntimeAvailable()
             && row?.operations_shopify_inventory_refresh_migration_applied
             && row?.operations_shopify_inventory_webhook_refresh_applied
+            && row?.operations_shopify_catalog_webhook_refresh_applied
             && row?.operations_commerce_pack_evidence_fingerprint_applied
             && row?.shopify_active_account_readiness_migration_applied
             && row?.operations_commerce_inventory_attempt_lease_renewal_applied

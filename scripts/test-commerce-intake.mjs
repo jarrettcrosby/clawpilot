@@ -226,6 +226,7 @@ const catalogCredentialPolicyModule = loadTypeScriptModule(
         async recordAuditEvent() {},
       },
       '@/lib/persistence/postgres': {
+        async acquireTransactionAdvisoryLock() {},
         async query() {
           throw new Error('Unexpected database query')
         },
@@ -328,6 +329,7 @@ const automaticIntakeModule = loadTypeScriptModule(
         },
       },
       '@/lib/persistence/postgres': {
+        async acquireTransactionAdvisoryLock() {},
         async query() {
           throw new Error('Unexpected database query')
         },

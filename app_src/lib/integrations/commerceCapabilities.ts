@@ -9,12 +9,16 @@ export const SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS = [
   'inventory_levels/update',
 ] as const
 
-export const SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS = [
-  'app/scopes_update',
-  ...SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
+export const SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS = [
   'products/create',
   'products/delete',
   'products/update',
+] as const
+
+export const SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS = [
+  'app/scopes_update',
+  ...SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
+  ...SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS,
 ] as const
 
 export const COMMERCE_CAPABILITIES = [
@@ -311,10 +315,10 @@ export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
       {
         key: 'catalog',
         label: 'Product catalog',
-        topics: ['products/create', 'products/update', 'products/delete'],
+        topics: SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS,
         requiredScopes: ['read_products'],
-        state: 'processor_pending',
-        behavior: 'Product events will trigger an exact catalog refresh; the catalog worker currently reconciles changes without relying on these subscriptions.',
+        state: 'available',
+        behavior: 'Signals an immediate read-only full catalog reconciliation through a lossless monotonic watermark; scheduled reconciliation remains the backstop.',
       },
       {
         key: 'customers',

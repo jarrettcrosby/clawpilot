@@ -28,6 +28,7 @@ import {
   auditShopifyScopeRequirements,
   hasEffectiveShopifyScope,
   SHOPIFY_ADMIN_API_VERSION,
+  SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS,
   SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS,
   SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
   SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
@@ -1137,6 +1138,13 @@ async function verifyStoredConnection(
         topics: SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
       },
     )
+    const catalogWebhookSubscriptions = await discoverShopifyWebhookSubscriptions(
+      { shopDomain, accessToken: grant.accessToken },
+      {
+        desiredUri: webhookUrl(runtime.globalId),
+        topics: SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS,
+      },
+    )
     return {
       configuration: {
         ...runtime.configuration,
@@ -1166,6 +1174,20 @@ async function verifyStoredConnection(
           observedAt: new Date().toISOString(),
           providerWrites: 0,
         },
+        catalogWebhookSubscriptions: {
+          desiredUri: catalogWebhookSubscriptions.desiredUri,
+          requiredTopics: catalogWebhookSubscriptions.requiredTopics,
+          observedCount: catalogWebhookSubscriptions.subscriptions.length,
+          matchingCount: catalogWebhookSubscriptions.subscriptions.filter(
+            (subscription) => subscription.uri
+              === catalogWebhookSubscriptions.desiredUri,
+          ).length,
+          missingTopics: catalogWebhookSubscriptions.missingTopics,
+          conflictingTopics: catalogWebhookSubscriptions.conflictingTopics,
+          ready: catalogWebhookSubscriptions.ready,
+          observedAt: new Date().toISOString(),
+          providerWrites: 0,
+        },
         lastVerifiedAt: new Date().toISOString(),
         domainWorkersActivated: false,
       },
@@ -1179,6 +1201,11 @@ async function verifyStoredConnection(
         webhookSubscriptionObservedCount: webhookSubscriptions.subscriptions.length,
         webhookSubscriptionMissingCount: webhookSubscriptions.missingTopics.length,
         webhookSubscriptionConflictingCount: webhookSubscriptions.conflictingTopics.length,
+        catalogWebhookSubscriptionReady: catalogWebhookSubscriptions.ready,
+        catalogWebhookSubscriptionObservedCount:
+          catalogWebhookSubscriptions.subscriptions.length,
+        catalogWebhookSubscriptionMissingCount:
+          catalogWebhookSubscriptions.missingTopics.length,
         providerWrites: 0,
       },
     }
@@ -1305,10 +1332,11 @@ export async function testCommerceConnection(input: {
   }
 }
 
-export async function registerShopifyInventoryWebhookSubscriptions(input: {
+async function registerShopifyWebhookSubscriptionGroup(input: {
   organizationId: unknown
   accountGlobalId: unknown
   actorEmail: string
+  group: 'inventory' | 'catalog'
 }) {
   let runtime: CommerceRuntimeCredentialRecord | null = null
   const requestedAt = new Date()
@@ -1317,14 +1345,14 @@ export async function registerShopifyInventoryWebhookSubscriptions(input: {
     runtime = await storedRuntime(input)
     if (runtime.provider !== 'shopify') {
       throw new CommerceIntegrationRequestError(
-        'Inventory webhook registration requires a Shopify sales channel',
+        'Webhook registration requires a Shopify sales channel',
         400,
         'SHOPIFY_WEBHOOK_PROVIDER_REQUIRED',
       )
     }
     if (runtime.verificationStatus !== 'verified' || runtime.status !== 'active') {
       throw new CommerceIntegrationRequestError(
-        'Verify and enable the Shopify connection before registering inventory webhooks',
+        'Verify and enable the Shopify connection before registering webhooks',
         409,
         'SHOPIFY_WEBHOOK_VERIFICATION_REQUIRED',
       )
@@ -1339,8 +1367,11 @@ export async function registerShopifyInventoryWebhookSubscriptions(input: {
     })
     const providerCredential = { shopDomain, accessToken: grant.accessToken }
     const desiredUri = webhookUrl(runtime.globalId)
+    const topics = input.group === 'inventory'
+      ? SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS
+      : SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS
     const created = []
-    for (const topic of SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS) {
+    for (const topic of topics) {
       created.push(await createShopifyWebhookSubscription(
         providerCredential,
         { uri: desiredUri, topic },
@@ -1348,11 +1379,11 @@ export async function registerShopifyInventoryWebhookSubscriptions(input: {
     }
     const readiness = await discoverShopifyWebhookSubscriptions(
       providerCredential,
-      { desiredUri, topics: SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS },
+      { desiredUri, topics },
     )
     if (!readiness.ready) {
       throw new CommerceIntegrationRequestError(
-        'Shopify inventory webhook registration could not be verified',
+        `Shopify ${input.group} webhook registration could not be verified`,
         502,
         'SHOPIFY_WEBHOOK_REGISTRATION_UNVERIFIED',
       )
@@ -1360,18 +1391,18 @@ export async function registerShopifyInventoryWebhookSubscriptions(input: {
     await recordCommerceProviderAttemptInPostgres({
       organizationId: runtime.organizationId,
       accountGlobalId: runtime.globalId,
-      action: 'webhooks.inventory.register',
+      action: `webhooks.${input.group}.register`,
       adapterVersion: SHOPIFY_ADAPTER_VERSION,
       idempotencyKey,
       requestHash: createHash('sha256').update(JSON.stringify({
         accountGlobalId: runtime.globalId,
         credentialVersion: runtime.credentialVersion,
         desiredUri,
-        topics: SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
+        topics,
       })).digest('hex'),
       redactedRequest: {
         credentialVersion: runtime.credentialVersion,
-        topics: SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
+        topics,
       },
       redactedResponse: {
         ready: true,
@@ -1389,6 +1420,22 @@ export async function registerShopifyInventoryWebhookSubscriptions(input: {
   } catch (error) {
     throw sanitize(error)
   }
+}
+
+export function registerShopifyInventoryWebhookSubscriptions(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  actorEmail: string
+}) {
+  return registerShopifyWebhookSubscriptionGroup({ ...input, group: 'inventory' })
+}
+
+export function registerShopifyCatalogWebhookSubscriptions(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  actorEmail: string
+}) {
+  return registerShopifyWebhookSubscriptionGroup({ ...input, group: 'catalog' })
 }
 
 export async function setCommerceIntegrationEnabled(input: {
