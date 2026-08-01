@@ -176,6 +176,24 @@ type InventoryState = {
   providerLocation?: InventoryLocation
   enrichment?: InventoryEnrichment
   warnings?: string[]
+  refreshRecovery?: {
+    status:
+      | 'idle'
+      | 'pending'
+      | 'processing'
+      | 'failed'
+      | 'succeeded'
+      | 'cancelled'
+      | 'dead'
+    automaticSchedulingBlocked: boolean
+    managerRecoveryRequired: boolean
+    recoveredAfterDead: boolean
+    lastErrorCode: string | null
+    attemptCount: number
+    maxAttempts: number
+    availableAt: string | null
+    completedAt: string | null
+  }
 }
 
 type InventoryPayload = {
@@ -738,6 +756,25 @@ export default function ShopifyInventoryPanel({
   }
 
   const run = inventory?.latestRun
+  const refreshRecovery = inventory?.refreshRecovery
+  const automaticRefreshBusy = (
+    refreshRecovery?.status === 'pending'
+    || refreshRecovery?.status === 'processing'
+    || refreshRecovery?.status === 'failed'
+  )
+  useEffect(() => {
+    if (!automaticRefreshBusy) return
+    const interval = window.setInterval(() => {
+      void load().catch((caught) => {
+        setError(
+          caught instanceof Error
+            ? caught.message
+            : 'Shopify inventory status could not be refreshed.',
+        )
+      })
+    }, 5_000)
+    return () => window.clearInterval(interval)
+  }, [automaticRefreshBusy, load])
   const providerLocation =
     inventory?.providerLocation || run?.providerLocation
   const enrichment = inventory?.enrichment || run?.enrichment
@@ -851,11 +888,17 @@ export default function ShopifyInventoryPanel({
                 startIcon={syncing
                   ? <CircularProgress size={16} color="inherit" />
                   : <RefreshRounded />}
-                disabled={loading || syncing}
+                disabled={loading || syncing || automaticRefreshBusy}
                 onClick={() => { void sync() }}
                 sx={{ minHeight: 40, flexShrink: 0 }}
               >
-                {syncing ? 'Syncing inventory…' : 'Sync inventory'}
+                {syncing
+                  ? 'Syncing inventory…'
+                  : refreshRecovery?.managerRecoveryRequired
+                    ? 'Retry inventory sync'
+                    : automaticRefreshBusy
+                      ? 'Automatic sync in progress'
+                      : 'Sync inventory'}
               </Button>
             </Stack>
           </Stack>
@@ -866,6 +909,29 @@ export default function ShopifyInventoryPanel({
             does not subtract imported orders again. This workflow is
             read-only and performs zero Shopify writes.
           </Alert>
+
+          {refreshRecovery?.managerRecoveryRequired ? (
+            <Alert severity="error">
+              Automatic Shopify inventory refresh is paused for this
+              connection after {refreshRecovery.attemptCount} of{' '}
+              {refreshRecovery.maxAttempts} attempts
+              {refreshRecovery.lastErrorCode
+                ? ` (${refreshRecovery.lastErrorCode})`
+                : ''}. Correct the connection, scope, location, or warehouse
+              blocker, then choose <strong>Retry inventory sync</strong>.
+              The failed job remains preserved as audit evidence.
+            </Alert>
+          ) : automaticRefreshBusy ? (
+            <Alert severity="info">
+              Shopify inventory refresh is queued or retrying automatically.
+              Wait for that bounded attempt instead of starting another read.
+            </Alert>
+          ) : refreshRecovery?.recoveredAfterDead ? (
+            <Alert severity="success">
+              Inventory recovery succeeded. The prior dead job remains audit
+              evidence and automatic scheduling is eligible again.
+            </Alert>
+          ) : null}
 
           {error ? <Alert severity="error">{error}</Alert> : null}
           {measurementPreferenceError ? (

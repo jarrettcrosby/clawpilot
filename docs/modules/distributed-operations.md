@@ -1351,6 +1351,17 @@ unavailable; tenant/account queue failures remain visible warnings. Every result
 `orderQuantityAdjustment = 0`; the manager-triggered **Sync inventory** command
 remains the explicit recovery path. This is development-only automatic
 freshness maintenance, not production or bidirectional inventory sync.
+The authenticated inventory state also projects the latest job on the exact
+current account/configuration fence. A current unrecovered dead job is rendered
+as an account-scoped recovery requirement with only its safe error code and
+bounded attempt count; the action becomes **Retry inventory sync**. Pending,
+processing, and retrying jobs disable the manual action so an operator does not
+start a competing read. A later fresh successful manager read clears the
+scheduler's operational dead fence without editing or deleting the terminal
+job, and the panel records that automatic scheduling is eligible again. This
+projection exposes no provider payload, internal database identifier, or
+credential and does not weaken the manager permission, account single-flight,
+stable-idempotency, zero-provider-write, or zero-order-adjustment boundaries.
 Migration `0172` replaces the original provider-attempt protection function
 without replacing its trigger. A prepared `inventory.levels.read` attempt may
 extend only a still-live lease with the same token. It may rotate an expired

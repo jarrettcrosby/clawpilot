@@ -837,6 +837,22 @@ export default function CommerceIntegrationPanel() {
     }
   }
 
+  async function registerInventoryWebhooks(account: CommerceAccount) {
+    if (!canActivate || pendingAction) return
+    if (!window.confirm(
+      `Register the inventory item and inventory level webhook topics for ${account.displayName}? This creates only the two exact Shopify subscriptions shown in this workflow.`,
+    )) return
+    await action(
+      `register-inventory-webhooks:${account.globalId}`,
+      {
+        action: 'register-shopify-inventory-webhooks',
+        accountGlobalId: account.globalId,
+        confirmProviderWrites: true,
+      },
+      `${account.displayName} inventory webhook subscriptions registered and verified.`,
+    )
+  }
+
   async function revealCredential(account: CommerceAccount) {
     if (!account.configured || pendingAction) return
     const revealOrganizationId = organizationIdRef.current
@@ -1767,12 +1783,36 @@ export default function CommerceIntegrationPanel() {
                             sx={{ mb: 1 }}
                           >
                             Use the account-specific URL below for shop-specific
-                            webhook subscriptions. ClawPilot does not register
-                            provider subscriptions in this slice. One valid
-                            signed allowed-topic delivery verifies the stored
-                            app secret; synthetic CLI delivery proves signing
-                            only, not that a real subscription exists.
+                            webhook subscriptions. Test connection performs a
+                            live, read-only discovery and reports whether every
+                            required subscription points to this exact URL. One
+                            valid signed delivery separately verifies the stored
+                            app secret; neither check writes to Shopify.
                           </Typography>
+                          {(() => {
+                            const subscription = account.configuration.webhookSubscriptions
+                            if (!subscription || typeof subscription !== 'object' || Array.isArray(subscription)) {
+                              return (
+                                <Alert severity="warning" sx={{ mb: 1 }}>
+                                  Test the Shopify connection to discover subscription readiness.
+                                </Alert>
+                              )
+                            }
+                            const state = subscription as Record<string, unknown>
+                            const missingTopics = Array.isArray(state.missingTopics)
+                              ? state.missingTopics.filter((topic): topic is string => typeof topic === 'string')
+                              : []
+                            const conflictingTopics = Array.isArray(state.conflictingTopics)
+                              ? state.conflictingTopics.filter((topic): topic is string => typeof topic === 'string')
+                              : []
+                            return (
+                              <Alert severity={state.ready === true ? 'success' : 'warning'} sx={{ mb: 1 }}>
+                                {state.ready === true
+                                  ? 'Shopify subscription discovery is ready for every required topic.'
+                                  : `Shopify subscription discovery found ${missingTopics.length} missing and ${conflictingTopics.length} conflicting topic${missingTopics.length + conflictingTopics.length === 1 ? '' : 's'}. No provider writes were made.`}
+                              </Alert>
+                            )
+                          })()}
                           <Stack
                             direction={{ xs: 'column', sm: 'row' }}
                             spacing={1}
@@ -1794,6 +1834,16 @@ export default function CommerceIntegrationPanel() {
                             >
                               Copy URL
                             </Button>
+                            {canActivate ? (
+                              <Button
+                                variant="contained"
+                                disabled={pendingAction !== '' || !account.configured}
+                                onClick={() => registerInventoryWebhooks(account)}
+                                sx={actionButtonSx}
+                              >
+                                Register inventory webhooks
+                              </Button>
+                            ) : null}
                           </Stack>
                           {catalog ? (
                             <>

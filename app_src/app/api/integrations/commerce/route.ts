@@ -7,6 +7,7 @@ import {
   faireOAuthCallbackUrl,
   getCommerceIntegrationsState,
   revealCommerceCredential,
+  registerShopifyInventoryWebhookSubscriptions,
   sanitizedCommerceIntegrationError,
   setCommerceIntegrationEnabled,
   startFaireOAuthCommerce,
@@ -337,6 +338,30 @@ export async function PATCH(req: NextRequest) {
         ok: true,
         canManage: true,
         canActivate: operationsCapabilities(actor).canActivate,
+        integrations,
+        catalog: capabilityCatalog(),
+      })
+    }
+
+    if (action === 'register-shopify-inventory-webhooks') {
+      only(body, ['action', 'accountGlobalId', 'confirmProviderWrites'])
+      requireActivator(actor)
+      if (body.confirmProviderWrites !== true) {
+        throw new CommerceIntegrationRequestError(
+          'Confirm the exact Shopify inventory webhook registrations',
+          400,
+          'COMMERCE_PROVIDER_WRITE_CONFIRMATION_REQUIRED',
+        )
+      }
+      const integrations = await registerShopifyInventoryWebhookSubscriptions({
+        organizationId: organization,
+        accountGlobalId: body.accountGlobalId,
+        actorEmail: actor.email,
+      })
+      return json({
+        ok: true,
+        canManage: true,
+        canActivate: true,
         integrations,
         catalog: capabilityCatalog(),
       })

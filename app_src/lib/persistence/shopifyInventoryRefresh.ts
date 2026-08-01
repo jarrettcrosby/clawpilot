@@ -38,6 +38,133 @@ export type ShopifyInventoryRefreshJob = {
   startedAt: string
 }
 
+export type ShopifyInventoryRefreshRecoveryState = {
+  status:
+    | 'idle'
+    | 'pending'
+    | 'processing'
+    | 'failed'
+    | 'succeeded'
+    | 'cancelled'
+    | 'dead'
+  automaticSchedulingBlocked: boolean
+  managerRecoveryRequired: boolean
+  recoveredAfterDead: boolean
+  lastErrorCode: string | null
+  attemptCount: number
+  maxAttempts: number
+  availableAt: string | null
+  completedAt: string | null
+}
+
+function refreshTimestamp(value: Date | string | null | undefined) {
+  return value ? new Date(value).toISOString() : null
+}
+
+function projectedRefreshErrorCode(value: string | null | undefined) {
+  if (!value) return null
+  return /^[A-Z][A-Z0-9_]{2,127}$/.test(value)
+    ? value
+    : 'SHOPIFY_INVENTORY_REFRESH_FAILED'
+}
+
+export async function readShopifyInventoryRefreshRecoveryStateFromPostgres(
+  input: {
+    organizationId: string
+    accountGlobalId: string
+  },
+): Promise<ShopifyInventoryRefreshRecoveryState> {
+  const result = await query<{
+    status: ShopifyInventoryRefreshRecoveryState['status'] | null
+    last_error_code: string | null
+    attempt_count: number | null
+    max_attempts: number | null
+    available_at: Date | string | null
+    completed_at: Date | string | null
+    recovered_after_dead: boolean | null
+  }>(
+    `WITH current_config AS (
+       SELECT
+         config.organization_id,
+         config.integration_account_id,
+         config.id AS carrier_service_config_id,
+         config.warehouse_id,
+         config.credential_generation,
+         config.activation_revision,
+         config.row_version,
+         config.policy_revision,
+         config.policy_hash,
+         config.inventory_max_age_seconds
+       FROM operations_integration_accounts account
+       JOIN operations_shopify_carrier_service_configs config
+         ON config.organization_id = account.organization_id
+        AND config.integration_account_id = account.id
+       WHERE account.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND account.integration_type = 'commerce'
+         AND account.provider = 'shopify'
+       LIMIT 1
+     )
+     SELECT
+       COALESCE(job.status, 'idle') AS status,
+       job.last_error_code,
+       job.attempt_count,
+       job.max_attempts,
+       job.available_at,
+       job.completed_at,
+       CASE
+         WHEN job.status <> 'dead' THEN false
+         ELSE EXISTS (
+           SELECT 1
+           FROM operations_commerce_inventory_sync_runs recovered
+           WHERE recovered.organization_id = current.organization_id
+             AND recovered.integration_account_id =
+                 current.integration_account_id
+             AND recovered.warehouse_id = current.warehouse_id
+             AND recovered.status = 'succeeded'
+             AND recovered.completed_at > job.completed_at
+         )
+       END AS recovered_after_dead
+     FROM current_config current
+     LEFT JOIN LATERAL (
+       SELECT job.*
+       FROM operations_shopify_inventory_refresh_jobs job
+       WHERE job.organization_id = current.organization_id
+         AND job.integration_account_id = current.integration_account_id
+         AND job.carrier_service_config_id =
+             current.carrier_service_config_id
+         AND job.warehouse_id = current.warehouse_id
+         AND job.credential_generation = current.credential_generation
+         AND job.activation_revision = current.activation_revision
+         AND job.config_row_version = current.row_version
+         AND job.policy_revision = current.policy_revision
+         AND job.policy_hash = current.policy_hash
+         AND job.inventory_max_age_seconds =
+             current.inventory_max_age_seconds
+       ORDER BY job.created_at DESC, job.id DESC
+       LIMIT 1
+     ) job ON true`,
+    [input.organizationId, input.accountGlobalId],
+  )
+  const row = result.rows[0]
+  const status = row?.status || 'idle'
+  const recoveredAfterDead = row?.recovered_after_dead === true
+  const managerRecoveryRequired = (
+    status === 'dead' && !recoveredAfterDead
+  )
+  return {
+    status,
+    automaticSchedulingBlocked: managerRecoveryRequired,
+    managerRecoveryRequired,
+    recoveredAfterDead,
+    lastErrorCode: projectedRefreshErrorCode(row?.last_error_code),
+    attemptCount: Number(row?.attempt_count || 0),
+    maxAttempts: Number(row?.max_attempts || 0),
+    availableAt: refreshTimestamp(row?.available_at),
+    completedAt: refreshTimestamp(row?.completed_at),
+  }
+}
+
 export async function signalShopifyInventoryRefreshWithClient(
   client: PoolClient,
   input: {

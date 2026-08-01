@@ -351,7 +351,7 @@ export type ClawPilotCapabilityImplementationState = 'control_plane_implemented'
 export const CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION = {
   oauth_authentication: 'not_implemented',
   api_authentication: 'control_plane_implemented',
-  webhook_registration: 'not_implemented',
+  webhook_registration: 'control_plane_implemented',
   webhook_verification: 'control_plane_implemented',
   webhook_idempotency: 'control_plane_implemented',
   product_synchronization: 'control_plane_implemented',

@@ -44,6 +44,7 @@ import {
 import {
   acknowledgeManualShopifyInventoryRefreshInPostgres,
   readShopifyInventoryRefreshDirtyVersionInPostgres,
+  readShopifyInventoryRefreshRecoveryStateFromPostgres,
 } from '@/lib/persistence/shopifyInventoryRefresh'
 
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$/
@@ -287,13 +288,24 @@ export async function getShopifyInventoryState(input: {
   try {
     assertShopifyInventoryRuntime()
     const stored = await runtime(input)
-    return await readShopifyInventoryStateFromPostgres({
-      organizationId: stored.organizationId,
-      accountGlobalId: stored.globalId,
-    })
+    return await inventoryState(stored)
   } catch (error) {
     throw inventoryError(error)
   }
+}
+
+async function inventoryState(stored: CommerceRuntimeCredentialRecord) {
+  const [inventory, refreshRecovery] = await Promise.all([
+    readShopifyInventoryStateFromPostgres({
+      organizationId: stored.organizationId,
+      accountGlobalId: stored.globalId,
+    }),
+    readShopifyInventoryRefreshRecoveryStateFromPostgres({
+      organizationId: stored.organizationId,
+      accountGlobalId: stored.globalId,
+    }),
+  ])
+  return { ...inventory, refreshRecovery }
 }
 
 export async function syncShopifyInventory(input: {
@@ -346,10 +358,7 @@ export async function syncShopifyInventory(input: {
         replayed: true,
         effectiveIdempotencyKey: attempt.idempotencyKey,
         inventoryRunGlobalId: attempt.runGlobalId,
-        inventory: await readShopifyInventoryStateFromPostgres({
-          organizationId: stored.organizationId,
-          accountGlobalId: stored.globalId,
-        }),
+        inventory: await inventoryState(stored),
       }
     }
     const progress = async (details: {
@@ -498,10 +507,7 @@ export async function syncShopifyInventory(input: {
       replayed: applied.replayed,
       effectiveIdempotencyKey: attempt.idempotencyKey,
       inventoryRunGlobalId: applied.runGlobalId,
-      inventory: await readShopifyInventoryStateFromPostgres({
-        organizationId: stored.organizationId,
-        accountGlobalId: stored.globalId,
-      }),
+      inventory: await inventoryState(stored),
     }
   } catch (error) {
     const sanitized = inventoryError(error)

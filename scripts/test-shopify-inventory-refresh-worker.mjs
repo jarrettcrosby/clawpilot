@@ -115,6 +115,7 @@ const persistence = read(
 )
 includes(persistence, [
   'queueAutomaticShopifyInventoryRefreshesInPostgres',
+  'readShopifyInventoryRefreshRecoveryStateFromPostgres',
   'claimShopifyInventoryRefreshJobsInPostgres',
   'completeShopifyInventoryRefreshJobInPostgres',
   'failShopifyInventoryRefreshJobInPostgres',
@@ -143,10 +144,98 @@ includes(persistence, [
   'dirty_version = $4::bigint',
   '$6::timestamptz >= last_signaled_at',
   'job.lease_expires_at > now()',
+  'recovered.completed_at > dead.completed_at',
+  'automaticSchedulingBlocked',
+  'managerRecoveryRequired',
+  'recoveredAfterDead',
+  'projectedRefreshErrorCode',
   "'inventoryRunGlobalId', $5::text",
   'providerWrites: 0',
   'orderQuantityAdjustment: 0',
 ], 'Shopify inventory refresh persistence')
+
+let recoveryRow = {
+  status: 'dead',
+  last_error_code: 'SHOPIFY_INVENTORY_REFRESH_FAILED',
+  attempt_count: 8,
+  max_attempts: 8,
+  available_at: '2026-08-01T12:00:00.000Z',
+  completed_at: '2026-08-01T12:05:00.000Z',
+  recovered_after_dead: false,
+}
+const recoveryQueries = []
+const recoveryPersistence = loadTypeScriptModule(
+  'app_src/lib/persistence/shopifyInventoryRefresh.ts',
+  {
+    mocks: {
+      '@/lib/auditWriter': {
+        async recordAuditEvent() {},
+      },
+      '@/lib/persistence/postgres': {
+        async acquireTransactionAdvisoryLock() {},
+        async query(sql, values) {
+          recoveryQueries.push({ sql, values })
+          return { rows: [recoveryRow] }
+        },
+        async withTransaction() {
+          assert.fail('Recovery projection must remain read-only')
+        },
+      },
+    },
+  },
+)
+const recoveryInput = {
+  organizationId: '11111111-1111-4111-8111-111111111111',
+  accountGlobalId: 'gia0000001',
+}
+const deadRecovery = await recoveryPersistence
+  .readShopifyInventoryRefreshRecoveryStateFromPostgres(recoveryInput)
+assert.deepEqual(JSON.parse(JSON.stringify(deadRecovery)), {
+  status: 'dead',
+  automaticSchedulingBlocked: true,
+  managerRecoveryRequired: true,
+  recoveredAfterDead: false,
+  lastErrorCode: 'SHOPIFY_INVENTORY_REFRESH_FAILED',
+  attemptCount: 8,
+  maxAttempts: 8,
+  availableAt: '2026-08-01T12:00:00.000Z',
+  completedAt: '2026-08-01T12:05:00.000Z',
+})
+assert.equal(recoveryQueries.length, 1)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(recoveryQueries[0].values)),
+  [recoveryInput.organizationId, recoveryInput.accountGlobalId],
+)
+includes(recoveryQueries[0].sql, [
+  'account.organization_id = $1::uuid',
+  'account.global_id = $2',
+  'job.carrier_service_config_id =',
+  'job.credential_generation = current.credential_generation',
+  'job.activation_revision = current.activation_revision',
+  'job.config_row_version = current.row_version',
+  'job.policy_revision = current.policy_revision',
+  'job.policy_hash = current.policy_hash',
+  'job.inventory_max_age_seconds =',
+  "job.status <> 'dead'",
+  "recovered.status = 'succeeded'",
+  'recovered.completed_at > job.completed_at',
+], 'Tenant-scoped Shopify inventory dead-fence recovery projection')
+assert.doesNotMatch(
+  recoveryQueries[0].sql,
+  /\b(?:INSERT|UPDATE|DELETE)\b/i,
+  'Recovery projection must not mutate queue or inventory evidence',
+)
+
+recoveryRow = {
+  ...recoveryRow,
+  recovered_after_dead: true,
+}
+const recoveredState = await recoveryPersistence
+  .readShopifyInventoryRefreshRecoveryStateFromPostgres(recoveryInput)
+assert.equal(recoveredState.status, 'dead')
+assert.equal(recoveredState.recoveredAfterDead, true)
+assert.equal(recoveredState.managerRecoveryRequired, false)
+assert.equal(recoveredState.automaticSchedulingBlocked, false)
 
 const signalQueries = []
 const refreshPersistence = loadTypeScriptModule(
@@ -329,7 +418,32 @@ includes(orchestration, [
   'inventoryRunGlobalId: applied.runGlobalId',
   'expectedRefreshFence: input.expectedRefreshFence',
   'onProgress: async (current)',
+  'readShopifyInventoryRefreshRecoveryStateFromPostgres',
+  'return { ...inventory, refreshRecovery }',
 ], 'Shopify inventory orchestration')
+
+const inventoryRoute = read(
+  'app_src/app/api/integrations/commerce/inventory/route.ts',
+)
+includes(inventoryRoute, [
+  'requireRequestUser(req)',
+  'operationsCapabilities(user).canManage',
+  'SHOPIFY_INVENTORY_MANAGER_REQUIRED',
+  "body.action !== 'sync'",
+  'actorEmail: user.email',
+], 'Authenticated Shopify inventory manager recovery route')
+
+const inventoryPanel = read(
+  'app_src/components/operations/ShopifyInventoryPanel.tsx',
+)
+includes(inventoryPanel, [
+  'refreshRecovery?.managerRecoveryRequired',
+  'Retry inventory sync',
+  'Automatic sync in progress',
+  'window.setInterval',
+  'automatic scheduling is eligible again',
+  'The failed job remains preserved as audit evidence.',
+], 'Shopify inventory recovery user experience')
 
 const job = {
   id: '22222222-2222-4222-8222-222222222222',
