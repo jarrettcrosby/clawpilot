@@ -1275,6 +1275,50 @@ export async function readCommerceCatalogSyncStateWithClient(
     integrationAccountId: string
   },
 ) {
+  const catalogRefresh = (
+    await client.query<{
+      provider: 'shopify' | 'faire'
+      dirty_version: string | null
+      reconciled_version: string | null
+    }>(
+      `SELECT
+         account.provider,
+         CASE
+           WHEN account.provider = 'shopify'
+             THEN COALESCE(refresh.dirty_version, 0)::text
+           ELSE NULL
+         END AS dirty_version,
+         CASE
+           WHEN account.provider = 'shopify'
+             THEN COALESCE(refresh.reconciled_version, 0)::text
+           ELSE NULL
+         END AS reconciled_version
+       FROM operations_integration_accounts account
+       LEFT JOIN operations_shopify_catalog_refresh_states refresh
+         ON refresh.organization_id = account.organization_id
+        AND refresh.integration_account_id = account.id
+        AND refresh.credential_generation
+          = account.commerce_credential_generation
+       WHERE account.organization_id = $1::uuid
+         AND account.id = $2::uuid
+         AND account.integration_type = 'commerce'
+         AND account.provider IN ('shopify', 'faire')
+       LIMIT 1`,
+      [input.organizationId, input.integrationAccountId],
+    )
+  ).rows[0]
+  const dirtyVersion = catalogRefresh?.provider === 'shopify'
+    ? boundedCount(catalogRefresh.dirty_version)
+    : null
+  const reconciledVersion = catalogRefresh?.provider === 'shopify'
+    ? boundedCount(catalogRefresh.reconciled_version)
+    : null
+  const pendingRefreshSignals = (
+    dirtyVersion !== null
+    && reconciledVersion !== null
+  )
+    ? Math.max(0, dirtyVersion - reconciledVersion)
+    : null
   const result = await client.query<{
     status: string
     provider: 'shopify' | 'faire'
@@ -1360,6 +1404,9 @@ export async function readCommerceCatalogSyncStateWithClient(
       providerWrites: 0,
       ordersTouched: 0,
       inventoryTouched: 0,
+      dirtyVersion,
+      reconciledVersion,
+      pendingRefreshSignals,
       terminalRecoveryRequired: false,
       historicalTerminalEvidence: false,
     }
@@ -1429,6 +1476,9 @@ export async function readCommerceCatalogSyncStateWithClient(
     providerWrites: 0,
     ordersTouched: 0,
     inventoryTouched: 0,
+    dirtyVersion,
+    reconciledVersion,
+    pendingRefreshSignals,
     terminalRecoveryRequired: (
       status === 'dead'
       && row.unmatched_action === 'auto_create'

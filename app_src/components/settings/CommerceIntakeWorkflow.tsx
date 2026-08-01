@@ -321,6 +321,9 @@ type ProductCatalogSync = {
   providerWrites?: number
   ordersTouched?: number
   inventoryTouched?: number
+  dirtyVersion?: number | null
+  reconciledVersion?: number | null
+  pendingRefreshSignals?: number | null
   terminalRecoveryRequired?: boolean
   recoveryMode?: 'operator_policy_revision' | null
   deadEvidencePreserved?: boolean
@@ -1618,9 +1621,23 @@ export default function CommerceIntakeWorkflow({
   )
     ? productIntakePolicy.revision
     : 0
+  const pendingCatalogRefreshSignals = (
+    provider === 'shopify'
+    && typeof productCatalogSync?.pendingRefreshSignals === 'number'
+    && Number.isSafeInteger(productCatalogSync.pendingRefreshSignals)
+    && productCatalogSync.pendingRefreshSignals > 0
+  )
+    ? productCatalogSync.pendingRefreshSignals
+    : 0
   const futureProductBehaviorMessage = automaticProductCreationEnabled
     ? 'Catalog sync is resumed. When product-read access, the development runtime, and the Operations product target are eligible, ClawPilot reconciles the catalog automatically. Eligible unmatched products are created and mapped; incomplete or unsafe products remain in review.'
-    : 'Catalog sync is paused. Existing products and mappings remain unchanged, and no new provider pages are read until sync is resumed.'
+    : pendingCatalogRefreshSignals > 0
+      ? `${pendingCatalogRefreshSignals} catalog change notification${
+          pendingCatalogRefreshSignals === 1 ? ' is' : 's are'
+        } waiting while synchronization is paused. Resume synchronization to run a full read-only reconciliation; existing products and mappings remain unchanged until then.`
+      : provider === 'faire'
+        ? 'Catalog sync is paused. Faire does not currently provide catalog webhooks, so pending changes are discovered by the next full read-only reconciliation after synchronization resumes. Existing products and mappings remain unchanged.'
+        : 'Catalog sync is paused. Existing products and mappings remain unchanged, and no new provider pages are read until sync is resumed.'
   useEffect(() => {
     if (
       !workbenchOpen

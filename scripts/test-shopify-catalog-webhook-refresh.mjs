@@ -105,6 +105,11 @@ const catalogPersistence = read(
 includes(catalogPersistence, [
   'signalShopifyCatalogRefreshWithClient',
   'shopify-catalog-watermark:',
+  'pendingRefreshSignals',
+  "catalogRefresh?.provider === 'shopify'",
+  "account.provider = 'shopify'",
+  'refresh.credential_generation',
+  '= account.commerce_credential_generation',
   'target_dirty_version',
   'COALESCE(refresh.dirty_version, 0)',
   'COALESCE(refresh.dirty_version, 0)',
@@ -169,6 +174,81 @@ includes(signalUpsert.sql, [
   'RETURNING dirty_version::text, reconciled_version::text',
 ], 'Shopify catalog dirty signal')
 
+const latestCatalogJob = {
+  status: 'succeeded',
+  provider: 'shopify',
+  credential_version: 1,
+  policy_revision: 4,
+  continuation_run_global_id: null,
+  page_count: 5,
+  provider_records_seen: '240',
+  products_created: '0',
+  products_mapped: '0',
+  products_unchanged: '240',
+  products_skipped: '0',
+  products_failed: '0',
+  attempt_count: 0,
+  result_summary: {},
+  max_attempts: 8,
+  available_at: '2026-08-01T14:43:49.000Z',
+  last_error_code: null,
+  started_at: '2026-08-01T14:42:00.000Z',
+  completed_at: '2026-08-01T14:43:49.000Z',
+  updated_at: '2026-08-01T14:43:49.000Z',
+  active_backlog: '0',
+  unmatched_action: 'review',
+  current_credential_version: 1,
+  current_policy_revision: 4,
+  current_policy_version: 'commerce-product-intake-policy-v1',
+  current_provider: 'shopify',
+  last_success_at: '2026-08-01T14:43:49.000Z',
+}
+async function catalogState(provider, dirtyVersion, reconciledVersion) {
+  return persistence.readCommerceCatalogSyncStateWithClient(
+    {
+      async query(sql) {
+        if (sql.includes(
+          'LEFT JOIN operations_shopify_catalog_refresh_states refresh',
+        )) {
+          return {
+            rows: [{
+              provider,
+              dirty_version: dirtyVersion,
+              reconciled_version: reconciledVersion,
+            }],
+          }
+        }
+        if (sql.includes('FROM operations_commerce_catalog_sync_jobs job')) {
+          return {
+            rows: [{
+              ...latestCatalogJob,
+              provider,
+              current_provider: provider,
+            }],
+          }
+        }
+        throw new Error(`Unexpected catalog-state query: ${sql}`)
+      },
+    },
+    {
+      organizationId: '11111111-1111-4111-8111-111111111111',
+      integrationAccountId: '22222222-2222-4222-8222-222222222222',
+    },
+  )
+}
+const pausedShopifyState = await catalogState('shopify', '36', '0')
+assert.equal(pausedShopifyState.status, 'paused')
+assert.equal(pausedShopifyState.rawStatus, 'succeeded')
+assert.equal(pausedShopifyState.dirtyVersion, 36)
+assert.equal(pausedShopifyState.reconciledVersion, 0)
+assert.equal(pausedShopifyState.pendingRefreshSignals, 36)
+
+const pausedFaireState = await catalogState('faire', null, null)
+assert.equal(pausedFaireState.status, 'paused')
+assert.equal(pausedFaireState.dirtyVersion, null)
+assert.equal(pausedFaireState.reconciledVersion, null)
+assert.equal(pausedFaireState.pendingRefreshSignals, null)
+
 const integrationService = read(
   'app_src/lib/integrations/commerceIntegrations.ts',
 )
@@ -199,6 +279,34 @@ includes(
   'Shopify catalog webhook registration UI',
 )
 
+includes(
+  read('app_src/components/settings/CommerceIntakeWorkflow.tsx'),
+  [
+    'pendingRefreshSignals?: number | null',
+    'pendingCatalogRefreshSignals',
+    'catalog change notification${',
+    'waiting while synchronization is paused',
+    'Faire does not currently provide catalog webhooks',
+  ],
+  'Paused catalog refresh observability UI',
+)
+includes(
+  read('app_src/lib/persistence/commerceIntake.ts'),
+  [
+    'const productCatalogSync = await readCommerceCatalogSyncStateWithClient(',
+    'productCatalogSync,',
+  ],
+  'Commerce intake catalog-sync state projection',
+)
+includes(
+  read('app_src/app/api/integrations/commerce/intake/route.ts'),
+  [
+    'const intake = await getCommerceIntake({',
+    'return json({ ok: true, intake })',
+  ],
+  'Commerce intake API state response',
+)
+
 const worker = read('app_src/lib/commerceCatalogSyncWorker.ts')
 includes(worker, [
   'const followUpQueued = await queueAutomaticCommerceCatalogSyncsInPostgres()',
@@ -217,5 +325,6 @@ includes(
 console.log(
   'Shopify catalog webhook refresh tests passed '
   + '(registration, signed receipt signal, monotonic watermark, follow-up '
-  + 'scheduling, read-only boundary, and zero provider writes).',
+  + 'scheduling, paused-state observability, Faire null semantics, read-only '
+  + 'boundary, and zero provider writes).',
 )
