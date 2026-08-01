@@ -26,7 +26,7 @@ export const runtime = 'nodejs'
 
 const MAX_REQUEST_BYTES = 8 * 1024
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const AGENT_GLOBAL_ID = /^gpt\d{7}$/
+const AGENT_GLOBAL_ID = /^gpt(?:[0-9]{7}|[0-9a-v]{12})$/
 const ACTION_FIELDS: Record<string, Set<string>> = {
   'enroll-agent': new Set([
     'action',

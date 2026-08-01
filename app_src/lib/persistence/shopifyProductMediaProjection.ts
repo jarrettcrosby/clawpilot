@@ -27,14 +27,14 @@ import {
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-const PRODUCT_REFERENCE_PATTERN = /^gp[0-9]{7}$/
-const ACCOUNT_GLOBAL_PATTERN = /^gia[0-9]{7}$/
-const CHANNEL_GLOBAL_PATTERN = /^gpcs[0-9]{7}$/
+const PRODUCT_REFERENCE_PATTERN = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/
+const ACCOUNT_GLOBAL_PATTERN = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
+const CHANNEL_GLOBAL_PATTERN = /^gpcs(?:[0-9]{7}|[0-9a-v]{12})$/
 const PRODUCT_GID_PATTERN = /^gid:\/\/shopify\/Product\/[1-9][0-9]*$/
 const VARIANT_GID_PATTERN =
   /^gid:\/\/shopify\/ProductVariant\/[1-9][0-9]*$/
 const SHA256_PATTERN = /^[0-9a-f]{64}$/
-const EFFECT_GLOBAL_PATTERN = /^gcef[0-9]{7}$/
+const EFFECT_GLOBAL_PATTERN = /^gcef(?:[0-9]{7}|[0-9a-v]{12})$/
 const ACTIVE_DELIVERY_TTL_SECONDS = 15 * 60
 const AUTHORIZATION_TTL_SECONDS = 5 * 60
 const SHADOW_TTL_SECONDS = 60
@@ -270,7 +270,7 @@ function reconciliationContext(
   if (
     !UUID_PATTERN.test(row.delivery_grant_id)
     || !UUID_PATTERN.test(row.external_effect_id)
-    || !/^gcef[0-9]{7}$/.test(row.external_effect_global_id)
+    || !/^gcef(?:[0-9]{7}|[0-9a-v]{12})$/.test(row.external_effect_global_id)
     || !['pending', 'claimed', 'succeeded', 'failed', 'unknown']
       .includes(state)
     || !ACCOUNT_GLOBAL_PATTERN.test(row.integration_account_global_id)

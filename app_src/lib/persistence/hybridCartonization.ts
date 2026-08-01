@@ -700,7 +700,7 @@ function checkoutSnapshotInventoryLevelGlobalIds(
     || value.length > 500
     || value.some((entry) => (
       typeof entry !== 'string'
-      || !/^giil[0-9]{7}$/.test(entry)
+      || !/^giil(?:[0-9]{7}|[0-9a-v]{12})$/.test(entry)
     ))
   ) {
     fail(
@@ -1106,17 +1106,17 @@ export function normalizeHybridCartonizationReadRequest(
   }
   const accountGlobalId = exactReference(
     input.accountGlobalId,
-    /^gia[0-9]{7}$/,
+    /^gia(?:[0-9]{7}|[0-9a-v]{12})$/,
     'Commerce account Global ID',
   )
   const candidateGlobalId = exactReference(
     input.candidateGlobalId,
-    /^gcoc[0-9]{7}$/,
+    /^gcoc(?:[0-9]{7}|[0-9a-v]{12})$/,
     'Order candidate Global ID',
   )
   const warehouseGlobalId = exactReference(
     input.warehouseGlobalId,
-    /^gwh[0-9]{7}$/,
+    /^gwh(?:[0-9]{7}|[0-9a-v]{12})$/,
     'Warehouse Global ID',
   )
   const expectedCandidateRowVersion = inputInteger(
@@ -1145,7 +1145,7 @@ export function normalizeHybridCartonizationReadRequest(
   const selectedMaterials = input.selectedMaterials.map((selection, index) => {
     const materialGlobalId = exactReference(
       selection?.materialGlobalId,
-      /^gmat[0-9]{7}$/,
+      /^gmat(?:[0-9]{7}|[0-9a-v]{12})$/,
       `Selected material ${index + 1} Global ID`,
     )
     if (materialIds.has(materialGlobalId)) {
@@ -1176,7 +1176,7 @@ export function normalizeHybridCartonizationReadRequest(
     (assumption, index) => {
       const lineGlobalId = exactReference(
         assumption?.lineGlobalId,
-        /^gcol[0-9]{7}$/,
+        /^gcol(?:[0-9]{7}|[0-9a-v]{12})$/,
         `Committed assumption ${index + 1} line Global ID`,
       )
       if (lineIds.has(lineGlobalId)) {

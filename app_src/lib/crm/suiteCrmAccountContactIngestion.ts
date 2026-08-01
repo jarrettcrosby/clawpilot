@@ -238,7 +238,9 @@ async function writeCursor(document: CursorDocument): Promise<void> {
 
 function globalId(snapshot: SuiteCrmRecordSnapshot, moduleName: SuiteCrmAccountContactModule): string | null {
   const value = String(snapshot.attributes.global_id_c ?? '').trim().toLowerCase()
-  const pattern = moduleName === 'Accounts' ? /^ga[0-9]{7}$/ : /^gc[0-9]{7}$/
+  const pattern = moduleName === 'Accounts'
+    ? /^ga(?:[0-9]{7}|[0-9a-v]{12})$/
+    : /^gc(?:[0-9]{7}|[0-9a-v]{12})$/
   return pattern.test(value) ? value : null
 }
 

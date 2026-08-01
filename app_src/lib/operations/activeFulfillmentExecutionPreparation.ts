@@ -14,7 +14,7 @@ import {
 const COMMAND_TYPE = 'prepare-active-fulfillment-execution'
 const UUID =
   /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u
-const SHADOW_EXECUTION_GLOBAL_ID = /^gofe[0-9]{7}$/u
+const SHADOW_EXECUTION_GLOBAL_ID = /^gofe(?:[0-9]{7}|[0-9a-v]{12})$/u
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u
 
 export class ActiveFulfillmentExecutionPreparationError extends Error {

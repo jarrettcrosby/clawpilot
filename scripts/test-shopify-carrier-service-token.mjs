@@ -5,6 +5,8 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
 
+import * as globalIds from '../app_src/lib/globalIds.mjs'
+
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
 const requireFromApp = createRequire(
@@ -44,6 +46,9 @@ const sandbox = {
   exports: module.exports,
   process: processMock,
   require(specifier) {
+    if (specifier === '@/lib/globalIds.mjs') {
+      return globalIds
+    }
     if (specifier === '@/lib/persistence/config') {
       return { isHostedRuntime: () => false }
     }

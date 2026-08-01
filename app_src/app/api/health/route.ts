@@ -338,6 +338,8 @@ export async function GET() {
           operations_sandbox_commerce_e2e_authorization_applied: boolean
           operations_commerce_active_canonical_collation_applied: boolean
           operations_sandbox_commerce_e2e_active_guards_applied: boolean
+          operations_fulfillment_notification_policy_applied: boolean
+          global_id_alphanumeric_compatibility_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -1138,6 +1140,18 @@ export async function GET() {
                 WHERE filename =
                   '0200_operations_sandbox_commerce_e2e_active_guards.sql'
               ) AS operations_sandbox_commerce_e2e_active_guards_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0201_operations_fulfillment_notification_policy.sql'
+              ) AS operations_fulfillment_notification_policy_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0218_global_id_alphanumeric_expand_141_149_and_catalog_gate.sql'
+              ) AS global_id_alphanumeric_compatibility_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1304,6 +1318,8 @@ export async function GET() {
             && row?.operations_sandbox_commerce_e2e_authorization_applied
             && row?.operations_commerce_active_canonical_collation_applied
             && row?.operations_sandbox_commerce_e2e_active_guards_applied
+            && row?.operations_fulfillment_notification_policy_applied
+            && row?.global_id_alphanumeric_compatibility_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1462,6 +1478,8 @@ export async function GET() {
           || !row?.operations_sandbox_commerce_e2e_authorization_applied
           || !row?.operations_commerce_active_canonical_collation_applied
           || !row?.operations_sandbox_commerce_e2e_active_guards_applied
+          || !row?.operations_fulfillment_notification_policy_applied
+          || !row?.global_id_alphanumeric_compatibility_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

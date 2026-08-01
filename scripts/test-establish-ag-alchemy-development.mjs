@@ -4,6 +4,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as globalIds from '../app_src/lib/globalIds.mjs'
 import {
   APPROVED_SHOPIFY_READ_SCOPES,
   DISPOSABLE_REHEARSAL_CONFIRMATION,
@@ -55,6 +56,9 @@ function loadCommerceCrypto() {
     module,
     process,
     require(specifier) {
+      if (specifier === '@/lib/globalIds.mjs') {
+        return globalIds
+      }
       if (specifier === '@/lib/persistence/config') {
         return { isHostedRuntime: () => true }
       }

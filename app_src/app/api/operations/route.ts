@@ -40,6 +40,7 @@ import {
   prepareOperationsShipmentExecutionFromPostgres,
   readOperationsWorkspaceFromPostgres,
   releaseOperationsOrderFromPostgres,
+  retryOperationsCommerceFulfillmentExportFromPostgres,
   runMockOperationsProofFromPostgres,
   updateOperationsActivationInPostgres,
   updateOperationsExceptionInPostgres,
@@ -72,27 +73,27 @@ export const revalidate = 0
 export const runtime = 'nodejs'
 
 const MAX_REQUEST_BYTES = 64 * 1024
-const CUSTOMER_GLOBAL_ID = /^ga\d{7}$/
-const PRODUCT_GLOBAL_ID = /^gp\d{7}$/
-const ORDER_GLOBAL_ID = /^gor\d{7}$/
-const CARTONIZATION_EVIDENCE_GLOBAL_ID = /^gcte\d{7}$/
-const PACKAGE_GLOBAL_ID = /^gpa\d{7}$/
-const EXCEPTION_GLOBAL_ID = /^gex\d{7}$/
-const RATE_GLOBAL_ID = /^grt\d{7}$/
-const CARRIER_ACCOUNT_GLOBAL_ID = /^gac\d{7}$/
-const PRINTER_GLOBAL_ID = /^gpr\d{7}$/
-const WAREHOUSE_GLOBAL_ID = /^gwh\d{7}$/
-const LOCATION_GLOBAL_ID = /^gwl\d{7}$/
-const INVENTORY_POOL_GLOBAL_ID = /^gip\d{7}$/
-const RECEIPT_GLOBAL_ID = /^grc\d{7}$/
-const RECEIPT_LINE_GLOBAL_ID = /^grcl\d{7}$/
-const INTEGRATION_ACCOUNT_GLOBAL_ID = /^gia\d{7}$/
-const COMMERCE_ACTIVE_PREPARATION_GLOBAL_ID = /^gcap\d{7}$/
-const SHADOW_EXECUTION_GLOBAL_ID = /^gofe\d{7}$/
-const ACTIVE_EXECUTION_GLOBAL_ID = /^gaex\d{7}$/
-const ACTIVE_SHIPMENT_GROUP_GLOBAL_ID = /^gash\d{7}$/
-const PRODUCTION_RERATE_RUN_GLOBAL_ID = /^gafr\d{7}$/
-const PRODUCTION_RERATE_OFFER_GLOBAL_ID = /^garo\d{7}$/
+const CUSTOMER_GLOBAL_ID = /^ga(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRODUCT_GLOBAL_ID = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/
+const ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/
+const CARTONIZATION_EVIDENCE_GLOBAL_ID = /^gcte(?:[0-9]{7}|[0-9a-v]{12})$/
+const PACKAGE_GLOBAL_ID = /^gpa(?:[0-9]{7}|[0-9a-v]{12})$/
+const EXCEPTION_GLOBAL_ID = /^gex(?:[0-9]{7}|[0-9a-v]{12})$/
+const RATE_GLOBAL_ID = /^grt(?:[0-9]{7}|[0-9a-v]{12})$/
+const CARRIER_ACCOUNT_GLOBAL_ID = /^gac(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRINTER_GLOBAL_ID = /^gpr(?:[0-9]{7}|[0-9a-v]{12})$/
+const WAREHOUSE_GLOBAL_ID = /^gwh(?:[0-9]{7}|[0-9a-v]{12})$/
+const LOCATION_GLOBAL_ID = /^gwl(?:[0-9]{7}|[0-9a-v]{12})$/
+const INVENTORY_POOL_GLOBAL_ID = /^gip(?:[0-9]{7}|[0-9a-v]{12})$/
+const RECEIPT_GLOBAL_ID = /^grc(?:[0-9]{7}|[0-9a-v]{12})$/
+const RECEIPT_LINE_GLOBAL_ID = /^grcl(?:[0-9]{7}|[0-9a-v]{12})$/
+const INTEGRATION_ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
+const COMMERCE_ACTIVE_PREPARATION_GLOBAL_ID = /^gcap(?:[0-9]{7}|[0-9a-v]{12})$/
+const SHADOW_EXECUTION_GLOBAL_ID = /^gofe(?:[0-9]{7}|[0-9a-v]{12})$/
+const ACTIVE_EXECUTION_GLOBAL_ID = /^gaex(?:[0-9]{7}|[0-9a-v]{12})$/
+const ACTIVE_SHIPMENT_GROUP_GLOBAL_ID = /^gash(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRODUCTION_RERATE_RUN_GLOBAL_ID = /^gafr(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRODUCTION_RERATE_OFFER_GLOBAL_ID = /^garo(?:[0-9]{7}|[0-9a-v]{12})$/
 const SHA256 = /^[a-f0-9]{64}$/
 const ORDER_STATUSES = new Set<OperationsOrderStatus>([
   'imported', 'validated', 'held', 'promised', 'reserved', 'planned',
@@ -301,6 +302,14 @@ function operatingDaysValue(value: unknown): number[] {
 
 function booleanValue(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback
+}
+
+function optionalBooleanValue(value: unknown, label: string): boolean | null {
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'boolean') {
+    requestError('OPERATIONS_REQUEST_INVALID', `${label} must be true or false`)
+  }
+  return value
 }
 
 function carrierCutoffsValue(value: unknown): Record<string, string> {
@@ -1494,6 +1503,9 @@ export async function POST(req: NextRequest) {
           'reason',
           'preferredPrinterGlobalId',
           'sandboxE2eAuthorizationGlobalId',
+          'expectedNotificationPolicyRevision',
+          'customerNotificationOverride',
+          'customerNotificationOverrideReason',
         ]),
         'OPERATIONS_REQUEST_INVALID',
         'Operations command',
@@ -1512,8 +1524,57 @@ export async function POST(req: NextRequest) {
         sandboxE2eAuthorizationGlobalId: optionalGlobalIdValue(
           body.sandboxE2eAuthorizationGlobalId,
           'Sandbox E2E authorization',
-          /^gsea\d{7}$/,
+          /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
         ),
+        expectedNotificationPolicyRevision:
+          body.expectedNotificationPolicyRevision === undefined
+            || body.expectedNotificationPolicyRevision === null
+            ? null
+            : integerValue(
+                body.expectedNotificationPolicyRevision,
+                'Fulfillment notification policy revision',
+                0,
+                2_147_483_647,
+              ),
+        customerNotificationOverride: optionalBooleanValue(
+          body.customerNotificationOverride,
+          'Customer notification override',
+        ),
+        customerNotificationOverrideReason: body.customerNotificationOverrideReason
+          === undefined || body.customerNotificationOverrideReason === null
+          ? null
+          : textValue(
+              body.customerNotificationOverrideReason,
+              'Customer notification exception reason',
+              500,
+            ),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'retry-commerce-fulfillment-export') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to retry commerce fulfillment exports',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set(['action', 'commerceExportGlobalId', 'reason']),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await retryOperationsCommerceFulfillmentExportFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        commerceExportGlobalId: globalIdValue(
+          body.commerceExportGlobalId,
+          'Commerce fulfillment export',
+          /^gfe(?:[0-9]{7}|[0-9a-v]{12})$/,
+        ),
+        reason: textValue(body.reason, 'Commerce fulfillment retry reason', 500),
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })
@@ -1567,7 +1628,7 @@ export async function POST(req: NextRequest) {
         sandboxE2eAuthorizationGlobalId: optionalGlobalIdValue(
           body.sandboxE2eAuthorizationGlobalId,
           'Sandbox E2E authorization',
-          /^gsea\d{7}$/,
+          /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
         ),
         idempotencyKey: idempotencyKeyValue(req),
       })

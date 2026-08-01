@@ -175,9 +175,14 @@ for (const fragment of [
 
 assert.match(
   route,
-  /const PRODUCT_GLOBAL_ID = \/\^gp\\d\{7\}\$\//,
+  /const PRODUCT_GLOBAL_ID = \/\^gp\(\?:\[0-9\]\{7\}\|\[0-9a-v\]\{12\}\)\$\//,
   'route must accept only public Product Global IDs',
 )
+const productGlobalIdPattern = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/
+assert.match('gp1234567', productGlobalIdPattern)
+assert.match('gp0123456789av', productGlobalIdPattern)
+assert.doesNotMatch('ga1234567', productGlobalIdPattern)
+assert.doesNotMatch('gp0123456789aw', productGlobalIdPattern)
 assert.doesNotMatch(
   route,
   /credential|secret|accessToken|refreshToken/i,

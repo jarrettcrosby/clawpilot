@@ -11,6 +11,7 @@ import {
   registerShopifyInventoryWebhookSubscriptions,
   sanitizedCommerceIntegrationError,
   setCommerceIntegrationEnabled,
+  setShopifyFulfillmentNotificationPolicy,
   startFaireOAuthCommerce,
   testCommerceConnection,
 } from '@/lib/integrations/commerceIntegrations'
@@ -485,6 +486,35 @@ export async function PATCH(req: NextRequest) {
         ok: true,
         canManage: true,
         canActivate: operationsCapabilities(actor).canActivate,
+        integrations,
+        catalog: capabilityCatalog(),
+      })
+    }
+
+    if (action === 'set-shopify-fulfillment-notification-policy') {
+      only(body, [
+        'action',
+        'accountGlobalId',
+        'expectedRevision',
+        'notifyCustomerDefault',
+        'reason',
+        'confirmCustomerNotifications',
+      ])
+      requireActivator(actor)
+      const integrations = await setShopifyFulfillmentNotificationPolicy({
+        organizationId: organization,
+        accountGlobalId: body.accountGlobalId,
+        expectedRevision: body.expectedRevision,
+        notifyCustomerDefault: body.notifyCustomerDefault,
+        reason: body.reason,
+        confirmCustomerNotifications: body.confirmCustomerNotifications,
+        actorEmail: actor.email,
+      })
+      return json({
+        ok: true,
+        canManage: true,
+        canActivate: true,
+        canRevealCredentials: canRevealCredential(actor),
         integrations,
         catalog: capabilityCatalog(),
       })

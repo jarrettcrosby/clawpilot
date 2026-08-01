@@ -76,6 +76,10 @@ import {
   readShopifyOrderPreviewStateFromPostgres,
   storeShopifyOrderPreviewInPostgres,
 } from '@/lib/persistence/commerceOrderPreviews'
+import {
+  ShopifyFulfillmentNotificationPolicyError,
+  updateShopifyFulfillmentNotificationPolicyInPostgres,
+} from '@/lib/persistence/shopifyFulfillmentNotifications'
 import { appPublicUrl } from '@/lib/publicUrl'
 
 const SHOPIFY_ADAPTER_VERSION = `shopify-graphql-${SHOPIFY_ADMIN_API_VERSION}-control-v1`
@@ -119,6 +123,13 @@ export class CommerceIntegrationRequestError extends Error {
 
 function sanitize(error: unknown): CommerceIntegrationRequestError {
   if (error instanceof CommerceIntegrationRequestError) return error
+  if (error instanceof ShopifyFulfillmentNotificationPolicyError) {
+    return new CommerceIntegrationRequestError(
+      error.message,
+      error.status,
+      error.code,
+    )
+  }
   if (error instanceof ShopifyCommerceClientError) {
     return new CommerceIntegrationRequestError(
       error.message,
@@ -1493,6 +1504,72 @@ export async function setCommerceIntegrationEnabled(input: {
       )
     }
     return result.state
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
+export async function setShopifyFulfillmentNotificationPolicy(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  expectedRevision: unknown
+  notifyCustomerDefault: unknown
+  reason: unknown
+  confirmCustomerNotifications: unknown
+  actorEmail: string
+}) {
+  try {
+    const organizationId = normalizeCommerceOrganizationId(input.organizationId)
+    const accountGlobalId = normalizeCommerceAccountGlobalId(input.accountGlobalId)
+    if (
+      typeof input.expectedRevision !== 'number'
+      || !Number.isSafeInteger(input.expectedRevision)
+      || input.expectedRevision < 0
+    ) {
+      throw new CommerceIntegrationRequestError(
+        'A valid fulfillment notification policy revision is required',
+        400,
+        'SHOPIFY_FULFILLMENT_NOTIFICATION_REVISION_INVALID',
+      )
+    }
+    if (typeof input.notifyCustomerDefault !== 'boolean') {
+      throw new CommerceIntegrationRequestError(
+        'Shopify customer notification default must be true or false',
+        400,
+        'SHOPIFY_FULFILLMENT_NOTIFICATION_DEFAULT_INVALID',
+      )
+    }
+    const reason = String(input.reason || '').trim()
+    if (
+      reason.length < 10
+      || reason.length > 500
+      || /[\u0000-\u001f\u007f]/.test(reason)
+    ) {
+      throw new CommerceIntegrationRequestError(
+        'A fulfillment notification policy reason of 10-500 characters is required',
+        400,
+        'SHOPIFY_FULFILLMENT_NOTIFICATION_REASON_REQUIRED',
+      )
+    }
+    if (
+      input.notifyCustomerDefault
+      && input.confirmCustomerNotifications !== true
+    ) {
+      throw new CommerceIntegrationRequestError(
+        'Confirm that future Shopify fulfillment confirmations may email customers',
+        400,
+        'SHOPIFY_FULFILLMENT_NOTIFICATION_CONFIRMATION_REQUIRED',
+      )
+    }
+    await updateShopifyFulfillmentNotificationPolicyInPostgres({
+      organizationId,
+      accountGlobalId,
+      actorEmail: input.actorEmail,
+      expectedRevision: input.expectedRevision,
+      notifyCustomerDefault: input.notifyCustomerDefault,
+      reason,
+    })
+    return getCommerceIntegrationsState(organizationId)
   } catch (error) {
     throw sanitize(error)
   }

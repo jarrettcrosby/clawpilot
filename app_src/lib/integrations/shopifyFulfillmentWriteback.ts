@@ -24,6 +24,10 @@ const SHOPIFY_ORDER_GID = /^gid:\/\/shopify\/Order\/[1-9][0-9]*$/
 const SHOPIFY_FULFILLMENT_GID = /^gid:\/\/shopify\/Fulfillment\/[1-9][0-9]*$/
 const SHOPIFY_FULFILLMENT_ORDER_GID =
   /^gid:\/\/shopify\/FulfillmentOrder\/[1-9][0-9]*$/
+const SHOPIFY_FULFILLMENT_ORDER_LINE_ITEM_GID =
+  /^gid:\/\/shopify\/FulfillmentOrderLineItem\/[1-9][0-9]*$/
+const SHOPIFY_LINE_ITEM_GID = /^gid:\/\/shopify\/LineItem\/[1-9][0-9]*$/
+const SHOPIFY_LOCATION_GID = /^gid:\/\/shopify\/Location\/[1-9][0-9]*$/
 const REQUIRED_SCOPE = 'write_merchant_managed_fulfillment_orders'
 
 export type ShopifyFulfillmentWritebackInput = {
@@ -33,7 +37,35 @@ export type ShopifyFulfillmentWritebackInput = {
   trackingNumber?: unknown
   trackingNumbers?: unknown
   carrier: unknown
-  notifyCustomer?: boolean
+  notifyCustomer: unknown
+  expectedLineItems: unknown
+  attemptSignature?: unknown
+}
+
+export type ShopifyFulfillmentAttemptSignature = {
+  version: 1
+  externalOrderId: string
+  fulfillmentOrders: Array<{
+    fulfillmentOrderId: string
+    locationId: string
+    lineItems: Array<{
+      fulfillmentOrderLineItemId: string
+      lineItemId: string
+      quantity: number
+    }>
+  }>
+  lineItems: Array<{
+    lineItemId: string
+    quantity: number
+  }>
+  carrier: string
+  trackingNumbers: string[]
+  notifyCustomer: boolean
+}
+
+export type ShopifyFulfillmentWritebackPreparation = {
+  signature: ShopifyFulfillmentAttemptSignature
+  existing: ShopifyFulfillmentWritebackResult | null
 }
 
 export type ShopifyFulfillmentWritebackResult = {
@@ -48,6 +80,7 @@ export class ShopifyFulfillmentWritebackError extends Error {
     readonly code: string,
     message: string,
     readonly retryable = false,
+    readonly outcomeUnknown = false,
   ) {
     super(message)
     this.name = 'ShopifyFulfillmentWritebackError'
@@ -60,6 +93,7 @@ type ShopifyFulfillmentWritebackDependencies = {
   decryptCredential: typeof decryptCommerceCredential
   requestAccessToken: typeof requestShopifyAccessToken
   probeConnection: typeof probeShopifyConnection
+  readFulfillment: typeof readShopifyFulfillment
   writeFulfillment: typeof writeShopifyFulfillment
 }
 
@@ -69,6 +103,7 @@ const DEFAULT_DEPENDENCIES: ShopifyFulfillmentWritebackDependencies = {
   decryptCredential: decryptCommerceCredential,
   requestAccessToken: requestShopifyAccessToken,
   probeConnection: probeShopifyConnection,
+  readFulfillment: readShopifyFulfillment,
   writeFulfillment: writeShopifyFulfillment,
 }
 
@@ -108,10 +143,10 @@ function normalizedTrackingNumbers(single: unknown, multiple: unknown) {
   return normalized
 }
 
-export async function executeShopifyFulfillmentWriteback(
+async function authorizedShopifyFulfillmentWriteback(
   input: ShopifyFulfillmentWritebackInput,
-  dependencies: ShopifyFulfillmentWritebackDependencies = DEFAULT_DEPENDENCIES,
-): Promise<ShopifyFulfillmentWritebackResult> {
+  dependencies: ShopifyFulfillmentWritebackDependencies,
+) {
   const organizationId = normalizeCommerceOrganizationId(input.organizationId)
   const accountGlobalId = normalizeCommerceAccountGlobalId(input.accountGlobalId)
   const externalOrderId = orderGid(input.externalOrderId)
@@ -120,6 +155,14 @@ export async function executeShopifyFulfillmentWriteback(
     input.trackingNumbers,
   )
   const carrier = clean(input.carrier, 'Carrier', 64)
+  if (typeof input.notifyCustomer !== 'boolean') {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_NOTIFICATION_DECISION_REQUIRED',
+      'An explicit Shopify customer notification decision is required',
+    )
+  }
+  const notifyCustomer = input.notifyCustomer
+  const expectedLineItems = normalizeExpectedLineItems(input.expectedLineItems)
 
   const [fulfillmentClaim, trackingClaim, runtime] = await Promise.all([
     dependencies.requireCapability({
@@ -189,23 +232,120 @@ export async function executeShopifyFulfillmentWriteback(
       `Shopify must grant ${REQUIRED_SCOPE}`,
     )
   }
-  return dependencies.writeFulfillment(
-    { shopDomain, accessToken: grant.accessToken },
-    {
+  return {
+    credential: { shopDomain, accessToken: grant.accessToken },
+    providerInput: {
       externalOrderId,
       trackingNumbers,
       carrier,
-      notifyCustomer: Boolean(input.notifyCustomer),
+      notifyCustomer,
+      expectedLineItems,
     },
+  }
+}
+
+export async function executeShopifyFulfillmentWriteback(
+  input: ShopifyFulfillmentWritebackInput,
+  dependencies: ShopifyFulfillmentWritebackDependencies = DEFAULT_DEPENDENCIES,
+): Promise<ShopifyFulfillmentWritebackResult> {
+  const authorized = await authorizedShopifyFulfillmentWriteback(
+    input,
+    dependencies,
+  )
+  return dependencies.writeFulfillment(
+    authorized.credential,
+    authorized.providerInput,
+    input.attemptSignature,
+  )
+}
+
+/**
+ * Authorizes the provider connection and snapshots the exact Shopify work that
+ * a later mutation is allowed to perform. The returned signature is safe to
+ * persist as JSON and must be supplied to unknown-outcome reconciliation.
+ */
+export async function prepareShopifyFulfillmentWriteback(
+  input: ShopifyFulfillmentWritebackInput,
+  dependencies: ShopifyFulfillmentWritebackDependencies = DEFAULT_DEPENDENCIES,
+): Promise<ShopifyFulfillmentWritebackPreparation> {
+  const authorized = await authorizedShopifyFulfillmentWriteback(
+    input,
+    dependencies,
+  )
+  const inspection = await inspectShopifyFulfillment(
+    authorized.credential,
+    authorized.providerInput,
+  )
+  const plan = deriveOpenFulfillmentPlan(
+    inspection.order,
+    authorized.providerInput,
+  )
+  requirePlanMatchesExpectedLines(plan, authorized.providerInput)
+  return {
+    signature: plan.signature,
+    existing: findExactExistingFulfillment(
+      inspection.fulfillments,
+      plan.signature,
+      authorized.providerInput,
+    ),
+  }
+}
+
+/**
+ * Reconciles an unknown Shopify fulfillment outcome without issuing a provider
+ * mutation. A stale export lease must use this path before it can become
+ * retryable, preventing lease recovery from racing a delayed customer-emailing
+ * fulfillment mutation.
+ */
+export async function reconcileShopifyFulfillmentWriteback(
+  input: ShopifyFulfillmentWritebackInput,
+  dependencies: ShopifyFulfillmentWritebackDependencies = DEFAULT_DEPENDENCIES,
+): Promise<ShopifyFulfillmentWritebackResult | null> {
+  if (input.attemptSignature === undefined) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_SIGNATURE_REQUIRED',
+      'Shopify fulfillment reconciliation requires the prepared attempt signature',
+    )
+  }
+  const authorized = await authorizedShopifyFulfillmentWriteback(
+    input,
+    dependencies,
+  )
+  return dependencies.readFulfillment(
+    authorized.credential,
+    authorized.providerInput,
+    input.attemptSignature,
   )
 }
 
 const ORDER_FULFILLMENT_QUERY = `query ClawPilotOrderFulfillment($id: ID!) {
   order(id: $id) {
     id
-    fulfillments(first: 250) { id status trackingInfo(first: 10) { number } }
+    canNotifyCustomer
+    fulfillments(first: 250) {
+      id
+      status
+      fulfillmentOrders(first: 100) {
+        nodes { id assignedLocation { location { id } } }
+        pageInfo { hasNextPage }
+      }
+      fulfillmentLineItems(first: 250) {
+        nodes { lineItem { id } quantity }
+        pageInfo { hasNextPage }
+      }
+      trackingInfo(first: 11) { company number }
+    }
     fulfillmentOrders(first: 100) {
-      nodes { id status requestStatus assignedLocation { location { id } } lineItems(first: 250) { nodes { id remainingQuantity } pageInfo { hasNextPage } } }
+      nodes {
+        id
+        status
+        requestStatus
+        assignedLocation { location { id } }
+        lineItems(first: 250) {
+          nodes { id lineItem { id } remainingQuantity }
+          pageInfo { hasNextPage }
+        }
+      }
       pageInfo { hasNextPage }
     }
   }
@@ -223,33 +363,720 @@ type ProviderWriteInput = {
   trackingNumbers: string[]
   carrier: string
   notifyCustomer: boolean
+  expectedLineItems: Array<{ lineItemId: string; quantity: number }>
 }
 
-function records(value: unknown): Record<string, unknown>[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is Record<string, unknown> => (
-        Boolean(item) && typeof item === 'object' && !Array.isArray(item)
-      ))
-    : []
+type ObservedFulfillment = {
+  providerReference: string
+  status: string
+  matchShape: ObservedFulfillmentMatchShape | null
 }
 
-function nodes(connection: unknown) {
-  if (!connection || typeof connection !== 'object' || Array.isArray(connection)) return []
-  return records((connection as Record<string, unknown>).nodes)
+type ObservedFulfillmentMatchShape = {
+  externalOrderId: string
+  fulfillmentOrders: Array<{
+    fulfillmentOrderId: string
+    locationId: string
+  }>
+  lineItems: Array<{ lineItemId: string; quantity: number }>
+  carrier: string
+  trackingNumbers: string[]
 }
 
-function hasNextPage(connection: unknown) {
-  if (!connection || typeof connection !== 'object' || Array.isArray(connection)) return false
-  const pageInfo = (connection as Record<string, unknown>).pageInfo
-  return Boolean(pageInfo && typeof pageInfo === 'object'
-    && !Array.isArray(pageInfo)
-    && (pageInfo as Record<string, unknown>).hasNextPage)
+type ShopifyFulfillmentInspection = {
+  order: Record<string, unknown>
+  fulfillments: ObservedFulfillment[]
+}
+
+type OpenFulfillmentPlan = {
+  signature: ShopifyFulfillmentAttemptSignature
+  lineItemsByFulfillmentOrder: Array<{
+    fulfillmentOrderId: string
+    fulfillmentOrderLineItems: Array<{ id: string; quantity: number }>
+  }>
+}
+
+function providerShapeError(message: string): never {
+  throw new ShopifyFulfillmentWritebackError(
+    'SHOPIFY_FULFILLMENT_RESPONSE_INVALID',
+    message,
+    true,
+  )
+}
+
+function providerRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return providerShapeError(`Shopify returned malformed ${label}`)
+  }
+  return value as Record<string, unknown>
+}
+
+function providerRecords(value: unknown, label: string): Record<string, unknown>[] {
+  if (!Array.isArray(value)) {
+    return providerShapeError(`Shopify returned malformed ${label}`)
+  }
+  return value.map((item, index) => providerRecord(item, `${label}[${index}]`))
+}
+
+function providerText(value: unknown, label: string, max = 255) {
+  if (typeof value !== 'string') {
+    return providerShapeError(`Shopify returned malformed ${label}`)
+  }
+  const normalized = value.trim()
+  if (!normalized || normalized.length > max || /[\u0000-\u001f\u007f]/.test(normalized)) {
+    return providerShapeError(`Shopify returned malformed ${label}`)
+  }
+  return normalized
+}
+
+function providerInteger(value: unknown, label: string, minimum: number) {
+  if (!Number.isSafeInteger(value) || Number(value) < minimum) {
+    return providerShapeError(`Shopify returned malformed ${label}`)
+  }
+  return Number(value)
+}
+
+function pagedNodes(
+  value: unknown,
+  label: string,
+  paginationCode: string,
+  paginationMessage: string,
+) {
+  const connection = providerRecord(value, label)
+  const pageInfo = providerRecord(connection.pageInfo, `${label}.pageInfo`)
+  if (typeof pageInfo.hasNextPage !== 'boolean') {
+    return providerShapeError(`Shopify returned malformed ${label}.pageInfo.hasNextPage`)
+  }
+  if (pageInfo.hasNextPage) {
+    throw new ShopifyFulfillmentWritebackError(
+      paginationCode,
+      paginationMessage,
+    )
+  }
+  return providerRecords(connection.nodes, `${label}.nodes`)
+}
+
+function sortedUnique(values: string[]) {
+  return [...new Set(values)].sort((left, right) => left.localeCompare(right))
+}
+
+function addLineQuantity(
+  aggregate: Map<string, number>,
+  lineItemId: string,
+  quantity: number,
+) {
+  const next = (aggregate.get(lineItemId) || 0) + quantity
+  if (!Number.isSafeInteger(next) || next < 1) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_SIGNATURE_INVALID',
+      'Shopify fulfillment line-item quantity is outside the supported range',
+    )
+  }
+  aggregate.set(lineItemId, next)
+}
+
+function lineItemsFromAggregate(aggregate: Map<string, number>) {
+  return [...aggregate.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([lineItemId, quantity]) => ({ lineItemId, quantity }))
+}
+
+function signatureInvalid(message: string): never {
+  throw new ShopifyFulfillmentWritebackError(
+    'SHOPIFY_FULFILLMENT_SIGNATURE_INVALID',
+    message,
+  )
+}
+
+function normalizeExpectedLineItems(
+  value: unknown,
+): Array<{ lineItemId: string; quantity: number }> {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 25_000) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_EXPECTED_LINES_REQUIRED',
+      'Shopify fulfillment requires the packaged Shopify line-item IDs and quantities',
+    )
+  }
+  const aggregate = new Map<string, number>()
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      return signatureInvalid('Shopify expected line-item input is invalid')
+    }
+    const line = item as Record<string, unknown>
+    if (line.lineItemId != null && line.externalLineId != null
+        && String(line.lineItemId).trim() !== String(line.externalLineId).trim()) {
+      return signatureInvalid('Shopify expected line-item aliases disagree')
+    }
+    const lineItemId = clean(
+      line.lineItemId ?? line.externalLineId,
+      'Shopify line item ID',
+      128,
+    )
+    if (!SHOPIFY_LINE_ITEM_GID.test(lineItemId)
+        || !Number.isSafeInteger(line.quantity)
+        || Number(line.quantity) < 1) {
+      return signatureInvalid('Shopify expected line-item input is invalid')
+    }
+    addLineQuantity(aggregate, lineItemId, Number(line.quantity))
+  }
+  return lineItemsFromAggregate(aggregate)
+}
+
+type SignatureFulfillmentOrder = ShopifyFulfillmentAttemptSignature['fulfillmentOrders'][number]
+
+function canonicalSignature(input: {
+  externalOrderId: string
+  fulfillmentOrders: SignatureFulfillmentOrder[]
+  carrier: string
+  trackingNumbers: string[]
+  notifyCustomer: boolean
+}): ShopifyFulfillmentAttemptSignature {
+  const fulfillmentOrders = input.fulfillmentOrders
+    .map((fulfillmentOrder) => ({
+      ...fulfillmentOrder,
+      lineItems: [...fulfillmentOrder.lineItems].sort((left, right) => (
+        left.fulfillmentOrderLineItemId.localeCompare(right.fulfillmentOrderLineItemId)
+      )),
+    }))
+    .sort((left, right) => (
+      left.fulfillmentOrderId.localeCompare(right.fulfillmentOrderId)
+    ))
+  const lineAggregate = new Map<string, number>()
+  for (const fulfillmentOrder of fulfillmentOrders) {
+    for (const line of fulfillmentOrder.lineItems) {
+      addLineQuantity(lineAggregate, line.lineItemId, line.quantity)
+    }
+  }
+  return {
+    version: 1,
+    externalOrderId: input.externalOrderId,
+    fulfillmentOrders,
+    lineItems: lineItemsFromAggregate(lineAggregate),
+    carrier: input.carrier,
+    trackingNumbers: sortedUnique(input.trackingNumbers),
+    notifyCustomer: input.notifyCustomer,
+  }
+}
+
+function normalizeAttemptSignature(
+  value: unknown,
+): ShopifyFulfillmentAttemptSignature {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return signatureInvalid('Shopify fulfillment attempt signature is invalid')
+  }
+  const signature = value as Record<string, unknown>
+  if (signature.version !== 1) {
+    return signatureInvalid('Shopify fulfillment attempt signature version is invalid')
+  }
+  const externalOrderId = orderGid(signature.externalOrderId)
+  if (!Array.isArray(signature.fulfillmentOrders)
+      || signature.fulfillmentOrders.length < 1
+      || signature.fulfillmentOrders.length > 100) {
+    return signatureInvalid('Shopify fulfillment-order signature set is invalid')
+  }
+  const seenFulfillmentOrderIds = new Set<string>()
+  const seenFulfillmentOrderLineItemIds = new Set<string>()
+  const fulfillmentOrders: SignatureFulfillmentOrder[] = []
+  for (const value of signature.fulfillmentOrders) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return signatureInvalid('Shopify fulfillment-order signature set is invalid')
+    }
+    const fulfillmentOrder = value as Record<string, unknown>
+    const fulfillmentOrderId = clean(
+      fulfillmentOrder.fulfillmentOrderId,
+      'Shopify fulfillment order ID',
+      128,
+    )
+    const locationId = clean(fulfillmentOrder.locationId, 'Shopify location ID', 128)
+    if (!SHOPIFY_FULFILLMENT_ORDER_GID.test(fulfillmentOrderId)
+        || !SHOPIFY_LOCATION_GID.test(locationId)
+        || seenFulfillmentOrderIds.has(fulfillmentOrderId)
+        || !Array.isArray(fulfillmentOrder.lineItems)
+        || fulfillmentOrder.lineItems.length < 1
+        || fulfillmentOrder.lineItems.length > 512) {
+      return signatureInvalid('Shopify fulfillment-order signature set is invalid')
+    }
+    seenFulfillmentOrderIds.add(fulfillmentOrderId)
+    const lineItems: SignatureFulfillmentOrder['lineItems'] = []
+    for (const lineValue of fulfillmentOrder.lineItems) {
+      if (!lineValue || typeof lineValue !== 'object' || Array.isArray(lineValue)) {
+        return signatureInvalid('Shopify fulfillment-order line-item signature is invalid')
+      }
+      const line = lineValue as Record<string, unknown>
+      const fulfillmentOrderLineItemId = clean(
+        line.fulfillmentOrderLineItemId,
+        'Shopify fulfillment order line item ID',
+        128,
+      )
+      const lineItemId = clean(line.lineItemId, 'Shopify line item ID', 128)
+      if (!SHOPIFY_FULFILLMENT_ORDER_LINE_ITEM_GID.test(fulfillmentOrderLineItemId)
+          || !SHOPIFY_LINE_ITEM_GID.test(lineItemId)
+          || seenFulfillmentOrderLineItemIds.has(fulfillmentOrderLineItemId)
+          || !Number.isSafeInteger(line.quantity)
+          || Number(line.quantity) < 1) {
+        return signatureInvalid('Shopify fulfillment-order line-item signature is invalid')
+      }
+      seenFulfillmentOrderLineItemIds.add(fulfillmentOrderLineItemId)
+      lineItems.push({
+        fulfillmentOrderLineItemId,
+        lineItemId,
+        quantity: Number(line.quantity),
+      })
+    }
+    fulfillmentOrders.push({ fulfillmentOrderId, locationId, lineItems })
+  }
+  const carrier = clean(signature.carrier, 'Carrier', 64)
+  if (!Array.isArray(signature.trackingNumbers)) {
+    return signatureInvalid('Shopify fulfillment tracking signature is invalid')
+  }
+  const trackingNumbers = normalizedTrackingNumbers(
+    undefined,
+    signature.trackingNumbers,
+  )
+  if (typeof signature.notifyCustomer !== 'boolean') {
+    return signatureInvalid('Shopify fulfillment notification signature is invalid')
+  }
+  const normalized = canonicalSignature({
+    externalOrderId,
+    fulfillmentOrders,
+    carrier,
+    trackingNumbers,
+    notifyCustomer: signature.notifyCustomer,
+  })
+  const suppliedLineItems = normalizeExpectedLineItems(signature.lineItems)
+  if (JSON.stringify(normalized.lineItems) !== JSON.stringify(suppliedLineItems)) {
+    return signatureInvalid('Shopify fulfillment aggregate line-item signature is invalid')
+  }
+  return normalized
+}
+
+function signaturesEqual(
+  left: ShopifyFulfillmentAttemptSignature,
+  right: ShopifyFulfillmentAttemptSignature,
+) {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
+function requireSignatureMatchesInput(
+  signature: ShopifyFulfillmentAttemptSignature,
+  input: ProviderWriteInput,
+) {
+  const requestShape = {
+    externalOrderId: input.externalOrderId,
+    carrier: input.carrier,
+    trackingNumbers: sortedUnique(input.trackingNumbers),
+    lineItems: input.expectedLineItems,
+    notifyCustomer: input.notifyCustomer,
+  }
+  if (
+    signature.externalOrderId !== requestShape.externalOrderId
+    || signature.carrier !== requestShape.carrier
+    || JSON.stringify(signature.trackingNumbers) !== JSON.stringify(requestShape.trackingNumbers)
+    || JSON.stringify(signature.lineItems) !== JSON.stringify(requestShape.lineItems)
+    || signature.notifyCustomer !== requestShape.notifyCustomer
+  ) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_SIGNATURE_INPUT_MISMATCH',
+      'Shopify fulfillment attempt signature does not match the requested order, packaged lines, carrier, and tracking set',
+    )
+  }
+}
+
+function deriveOpenFulfillmentPlan(
+  order: Record<string, unknown>,
+  input: ProviderWriteInput,
+): OpenFulfillmentPlan {
+  if (typeof order.canNotifyCustomer !== 'boolean') {
+    return providerShapeError('Shopify returned malformed order.canNotifyCustomer')
+  }
+  if (input.notifyCustomer && !order.canNotifyCustomer) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_CUSTOMER_NOTIFICATION_UNAVAILABLE',
+      'Shopify reports that this order cannot receive a fulfillment notification',
+    )
+  }
+  const fulfillmentOrders = pagedNodes(
+    order.fulfillmentOrders,
+    'order.fulfillmentOrders',
+    'SHOPIFY_FULFILLMENT_PAGINATION_REQUIRED',
+    'Shopify order exceeds the bounded fulfillment read; manual review is required',
+  )
+  const seenOrderIds = new Set<string>()
+  const seenOrderLineItemIds = new Set<string>()
+  const assignedLocations = new Set<string>()
+  const selectedOrders: SignatureFulfillmentOrder[] = []
+
+  for (const fulfillmentOrder of fulfillmentOrders) {
+    const id = providerText(fulfillmentOrder.id, 'fulfillment order ID', 128)
+    if (!SHOPIFY_FULFILLMENT_ORDER_GID.test(id) || seenOrderIds.has(id)) {
+      return providerShapeError('Shopify returned malformed fulfillment-order IDs')
+    }
+    seenOrderIds.add(id)
+    const status = providerText(fulfillmentOrder.status, 'fulfillment order status', 64)
+    const lines = pagedNodes(
+      fulfillmentOrder.lineItems,
+      `fulfillment order ${id} lineItems`,
+      'SHOPIFY_FULFILLMENT_LINE_PAGINATION_REQUIRED',
+      'Shopify fulfillment order exceeds the bounded line read; manual review is required',
+    )
+    const eligible = !['CANCELLED', 'CLOSED'].includes(status)
+    let remaining = 0
+    const orderLines: SignatureFulfillmentOrder['lineItems'] = []
+    for (const line of lines) {
+      const fulfillmentOrderLineItemId = providerText(
+        line.id,
+        `fulfillment order ${id} line item ID`,
+        128,
+      )
+      if (!SHOPIFY_FULFILLMENT_ORDER_LINE_ITEM_GID.test(fulfillmentOrderLineItemId)
+          || seenOrderLineItemIds.has(fulfillmentOrderLineItemId)) {
+        return providerShapeError('Shopify returned malformed fulfillment-order line-item IDs')
+      }
+      seenOrderLineItemIds.add(fulfillmentOrderLineItemId)
+      const lineItem = providerRecord(line.lineItem, `fulfillment order ${id} lineItem`)
+      const lineItemId = providerText(lineItem.id, 'Shopify line item ID', 128)
+      if (!SHOPIFY_LINE_ITEM_GID.test(lineItemId)) {
+        return providerShapeError('Shopify returned malformed line-item IDs')
+      }
+      const quantity = providerInteger(
+        line.remainingQuantity,
+        `fulfillment order ${id} remainingQuantity`,
+        0,
+      )
+      if (quantity > 0) {
+        remaining += quantity
+        if (!Number.isSafeInteger(remaining)) {
+          return providerShapeError('Shopify returned an unsupported remaining quantity')
+        }
+        orderLines.push({
+          fulfillmentOrderLineItemId,
+          lineItemId,
+          quantity,
+        })
+      }
+    }
+    if (!eligible || remaining === 0) continue
+
+    const assignedLocation = providerRecord(
+      fulfillmentOrder.assignedLocation,
+      `fulfillment order ${id} assignedLocation`,
+    )
+    const location = providerRecord(
+      assignedLocation.location,
+      `fulfillment order ${id} assignedLocation.location`,
+    )
+    const locationId = providerText(location.id, 'Shopify location ID', 128)
+    if (!SHOPIFY_LOCATION_GID.test(locationId)) {
+      return providerShapeError('Shopify returned malformed location IDs')
+    }
+    assignedLocations.add(locationId)
+    selectedOrders.push({
+      fulfillmentOrderId: id,
+      locationId,
+      lineItems: orderLines,
+    })
+  }
+
+  if (selectedOrders.length === 0) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_NOT_OPEN',
+      'Shopify has no open merchant-managed fulfillment order to fulfill',
+    )
+  }
+  if (assignedLocations.size !== 1) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_MULTIPLE_LOCATIONS',
+      'Shopify fulfillment orders span multiple locations; split fulfillment is required',
+    )
+  }
+  const signature = canonicalSignature({
+    externalOrderId: input.externalOrderId,
+    fulfillmentOrders: selectedOrders,
+    carrier: input.carrier,
+    trackingNumbers: input.trackingNumbers,
+    notifyCustomer: input.notifyCustomer,
+  })
+  return {
+    signature,
+    lineItemsByFulfillmentOrder: signature.fulfillmentOrders.map((fulfillmentOrder) => ({
+      fulfillmentOrderId: fulfillmentOrder.fulfillmentOrderId,
+      fulfillmentOrderLineItems: fulfillmentOrder.lineItems.map((line) => ({
+        id: line.fulfillmentOrderLineItemId,
+        quantity: line.quantity,
+      })),
+    })),
+  }
+}
+
+function requirePlanMatchesExpectedLines(
+  plan: OpenFulfillmentPlan,
+  input: ProviderWriteInput,
+) {
+  if (JSON.stringify(plan.signature.lineItems) !== JSON.stringify(input.expectedLineItems)) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_EXPECTED_LINES_MISMATCH',
+      'Shopify open fulfillment lines do not exactly match the packaged Shopify line items; refresh the order before fulfilling',
+    )
+  }
+}
+
+function observedFulfillmentMatchShape(
+  fulfillment: Record<string, unknown>,
+  externalOrderId: string,
+): ObservedFulfillmentMatchShape | null {
+  const fulfillmentOrders = pagedNodes(
+    fulfillment.fulfillmentOrders,
+    'fulfillment.fulfillmentOrders',
+    'SHOPIFY_FULFILLMENT_RECONCILIATION_PAGINATION_REQUIRED',
+    'Shopify fulfillment-order readback is paginated; manual review is required',
+  )
+  const observedOrders = fulfillmentOrders.map((fulfillmentOrder) => {
+    const fulfillmentOrderId = providerText(
+      fulfillmentOrder.id,
+      'observed fulfillment order ID',
+      128,
+    )
+    if (!SHOPIFY_FULFILLMENT_ORDER_GID.test(fulfillmentOrderId)) {
+      return providerShapeError('Shopify returned malformed observed fulfillment-order IDs')
+    }
+    const assignedLocation = providerRecord(
+      fulfillmentOrder.assignedLocation,
+      `observed fulfillment order ${fulfillmentOrderId} assignedLocation`,
+    )
+    const location = providerRecord(
+      assignedLocation.location,
+      `observed fulfillment order ${fulfillmentOrderId} assignedLocation.location`,
+    )
+    const locationId = providerText(location.id, 'observed Shopify location ID', 128)
+    if (!SHOPIFY_LOCATION_GID.test(locationId)) {
+      return providerShapeError('Shopify returned malformed observed location IDs')
+    }
+    return { fulfillmentOrderId, locationId }
+  }).sort((left, right) => left.fulfillmentOrderId.localeCompare(right.fulfillmentOrderId))
+  if (new Set(observedOrders.map((item) => item.fulfillmentOrderId)).size
+      !== observedOrders.length) {
+    return providerShapeError('Shopify returned duplicate observed fulfillment-order IDs')
+  }
+
+  const lineAggregate = new Map<string, number>()
+  for (const line of pagedNodes(
+    fulfillment.fulfillmentLineItems,
+    'fulfillment.fulfillmentLineItems',
+    'SHOPIFY_FULFILLMENT_RECONCILIATION_PAGINATION_REQUIRED',
+    'Shopify fulfillment line-item readback is paginated; manual review is required',
+  )) {
+    const lineItem = providerRecord(line.lineItem, 'observed fulfillment lineItem')
+    const lineItemId = providerText(lineItem.id, 'observed Shopify line item ID', 128)
+    if (!SHOPIFY_LINE_ITEM_GID.test(lineItemId)) {
+      return providerShapeError('Shopify returned malformed observed line-item IDs')
+    }
+    addLineQuantity(
+      lineAggregate,
+      lineItemId,
+      providerInteger(line.quantity, 'observed fulfillment line-item quantity', 1),
+    )
+  }
+
+  const trackingInfo = providerRecords(
+    fulfillment.trackingInfo,
+    'fulfillment.trackingInfo',
+  )
+  if (trackingInfo.length > 10) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_RECONCILIATION_PAGINATION_REQUIRED',
+      'Shopify tracking readback exceeds the bounded tracking set; manual review is required',
+    )
+  }
+  const carriers = new Set<string>()
+  const trackingNumbers: string[] = []
+  for (const tracking of trackingInfo) {
+    if (tracking.company == null || tracking.number == null) return null
+    const company = providerText(tracking.company, 'tracking company', 64)
+    const number = providerText(tracking.number, 'tracking number', 128)
+    carriers.add(company)
+    trackingNumbers.push(number)
+  }
+  if (
+    observedOrders.length === 0
+    || lineAggregate.size === 0
+    || trackingNumbers.length === 0
+    || carriers.size !== 1
+  ) return null
+
+  return {
+    externalOrderId,
+    fulfillmentOrders: observedOrders,
+    lineItems: lineItemsFromAggregate(lineAggregate),
+    carrier: [...carriers][0],
+    trackingNumbers: sortedUnique(trackingNumbers),
+  }
+}
+
+function observedMatchesSignature(
+  observed: ObservedFulfillmentMatchShape,
+  signature: ShopifyFulfillmentAttemptSignature,
+) {
+  const expectedOrders = signature.fulfillmentOrders.map((fulfillmentOrder) => ({
+    fulfillmentOrderId: fulfillmentOrder.fulfillmentOrderId,
+    locationId: fulfillmentOrder.locationId,
+  }))
+  return (
+    observed.externalOrderId === signature.externalOrderId
+    && JSON.stringify(observed.fulfillmentOrders) === JSON.stringify(expectedOrders)
+    && JSON.stringify(observed.lineItems) === JSON.stringify(signature.lineItems)
+    && observed.carrier === signature.carrier
+    && JSON.stringify(observed.trackingNumbers) === JSON.stringify(signature.trackingNumbers)
+  )
+}
+
+function findExactExistingFulfillment(
+  fulfillments: ObservedFulfillment[],
+  signature: ShopifyFulfillmentAttemptSignature,
+  input: ProviderWriteInput,
+): ShopifyFulfillmentWritebackResult | null {
+  const matches = fulfillments.filter((fulfillment) => (
+    fulfillment.status === 'SUCCESS'
+    && fulfillment.matchShape !== null
+    && observedMatchesSignature(fulfillment.matchShape, signature)
+  ))
+  if (matches.length > 1) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_RECONCILIATION_AMBIGUOUS',
+      'Shopify returned multiple fulfillments for the same exact attempt signature; manual review is required',
+    )
+  }
+  if (matches.length === 0) return null
+  return {
+    providerReference: matches[0].providerReference,
+    trackingNumber: input.trackingNumbers[0],
+    trackingNumbers: input.trackingNumbers,
+    replayed: true,
+  }
 }
 
 export async function writeShopifyFulfillment(
   credential: ShopifyCommerceRuntimeCredential,
   input: ProviderWriteInput,
+  attemptSignature?: unknown,
 ): Promise<ShopifyFulfillmentWritebackResult> {
+  const suppliedSignature = attemptSignature === undefined
+    ? null
+    : normalizeAttemptSignature(attemptSignature)
+  if (suppliedSignature) requireSignatureMatchesInput(suppliedSignature, input)
+  const inspection = await inspectShopifyFulfillment(credential, input)
+
+  if (suppliedSignature) {
+    const existing = findExactExistingFulfillment(
+      inspection.fulfillments,
+      suppliedSignature,
+      input,
+    )
+    if (existing) return existing
+  }
+
+  const plan = deriveOpenFulfillmentPlan(inspection.order, input)
+  if (suppliedSignature && !signaturesEqual(plan.signature, suppliedSignature)) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_PLAN_CHANGED',
+      'Shopify fulfillment orders or remaining line quantities changed after the attempt was prepared; prepare a new attempt',
+    )
+  }
+  requirePlanMatchesExpectedLines(plan, input)
+  if (!suppliedSignature) {
+    const existing = findExactExistingFulfillment(
+      inspection.fulfillments,
+      plan.signature,
+      input,
+    )
+    if (existing) return existing
+  }
+  type FulfillmentCreateResponse = {
+    fulfillmentCreate?: {
+      fulfillment?: Record<string, unknown> | null
+      userErrors?: Array<{ field?: unknown; message?: unknown }>
+    }
+  }
+  let mutation: FulfillmentCreateResponse
+  try {
+    mutation = await shopifyAdminGraphql<FulfillmentCreateResponse>(credential, {
+      query: FULFILLMENT_CREATE_MUTATION,
+      operationName: 'ClawPilotFulfillmentCreate',
+      variables: {
+        fulfillment: {
+          lineItemsByFulfillmentOrder: plan.lineItemsByFulfillmentOrder,
+          notifyCustomer: input.notifyCustomer,
+          trackingInfo: {
+            ...(input.trackingNumbers.length === 1
+              ? { number: input.trackingNumbers[0] }
+              : { numbers: input.trackingNumbers }),
+            company: input.carrier,
+          },
+        },
+      },
+    })
+  } catch {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_OUTCOME_UNKNOWN',
+      'Shopify fulfillment dispatch did not return a verifiable outcome; reconcile the prepared attempt before any further write',
+      true,
+      true,
+    )
+  }
+
+  const payload = mutation.fulfillmentCreate
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+      || !Array.isArray(payload.userErrors)) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_OUTCOME_UNKNOWN',
+      'Shopify fulfillment dispatch returned an unverifiable response; reconcile the prepared attempt before any further write',
+      true,
+      true,
+    )
+  }
+  const errors = payload.userErrors
+  if (errors.some((error) => (
+    !error
+    || typeof error !== 'object'
+    || Array.isArray(error)
+    || typeof error.message !== 'string'
+    || !error.message.trim()
+  ))) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_OUTCOME_UNKNOWN',
+      'Shopify fulfillment dispatch returned malformed user errors; reconcile the prepared attempt before any further write',
+      true,
+      true,
+    )
+  }
+  if (errors.length > 0) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_REJECTED',
+      errors.map((error) => String(error.message || 'Shopify rejected fulfillment')).join('; ').slice(0, 500),
+    )
+  }
+  const providerReference = String(payload?.fulfillment?.id || '')
+  const fulfillmentStatus = String(payload?.fulfillment?.status || '')
+  if (!SHOPIFY_FULFILLMENT_GID.test(providerReference)
+      || fulfillmentStatus !== 'SUCCESS') {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_OUTCOME_UNKNOWN',
+      'Shopify fulfillment dispatch returned no valid fulfillment ID; reconcile the prepared attempt before any further write',
+      true,
+      true,
+    )
+  }
+  return {
+    providerReference,
+    trackingNumber: input.trackingNumbers[0],
+    trackingNumbers: input.trackingNumbers,
+    replayed: false,
+  }
+}
+
+async function inspectShopifyFulfillment(
+  credential: ShopifyCommerceRuntimeCredential,
+  input: ProviderWriteInput,
+): Promise<ShopifyFulfillmentInspection> {
   const data = await shopifyAdminGraphql<{ order?: unknown }>(credential, {
     query: ORDER_FULFILLMENT_QUERY,
     operationName: 'ClawPilotOrderFulfillment',
@@ -262,121 +1089,78 @@ export async function writeShopifyFulfillment(
     )
   }
   const order = data.order as Record<string, unknown>
-  if (hasNextPage(order.fulfillmentOrders)) {
+  const observedOrderId = providerText(order.id, 'order ID', 128)
+  if (observedOrderId !== input.externalOrderId) {
     throw new ShopifyFulfillmentWritebackError(
-      'SHOPIFY_FULFILLMENT_PAGINATION_REQUIRED',
-      'Shopify order exceeds the bounded fulfillment read; manual review is required',
-    )
-  }
-  for (const fulfillment of records(order.fulfillments)) {
-    const observed = new Set(records(fulfillment.trackingInfo)
-      .map((tracking) => String(tracking.number || '').trim())
-      .filter(Boolean))
-    const match = input.trackingNumbers.every(
-      (trackingNumber) => observed.has(trackingNumber),
-    )
-    if (match && typeof fulfillment.id === 'string'
-        && SHOPIFY_FULFILLMENT_GID.test(fulfillment.id)) {
-      return {
-        providerReference: fulfillment.id,
-        trackingNumber: input.trackingNumbers[0],
-        trackingNumbers: input.trackingNumbers,
-        replayed: true,
-      }
-    }
-  }
-  const lineItemsByFulfillmentOrder: Array<Record<string, unknown>> = []
-  const assignedLocations = new Set<string>()
-  for (const fulfillmentOrder of nodes(order.fulfillmentOrders)) {
-    if (hasNextPage(fulfillmentOrder.lineItems)) {
-      throw new ShopifyFulfillmentWritebackError(
-        'SHOPIFY_FULFILLMENT_LINE_PAGINATION_REQUIRED',
-        'Shopify fulfillment order exceeds the bounded line read; manual review is required',
-      )
-    }
-    const remaining = nodes(fulfillmentOrder.lineItems).reduce(
-      (total, line) => total + Number(line.remainingQuantity || 0),
-      0,
-    )
-    if (
-      remaining > 0
-      && typeof fulfillmentOrder.id === 'string'
-      && SHOPIFY_FULFILLMENT_ORDER_GID.test(fulfillmentOrder.id)
-      && !['CANCELLED', 'CLOSED'].includes(String(fulfillmentOrder.status || ''))
-    ) {
-      const assignedLocation = fulfillmentOrder.assignedLocation
-      const location = assignedLocation && typeof assignedLocation === 'object'
-        && !Array.isArray(assignedLocation)
-        ? (assignedLocation as Record<string, unknown>).location
-        : null
-      const locationId = location && typeof location === 'object' && !Array.isArray(location)
-        ? String((location as Record<string, unknown>).id || '')
-        : ''
-      if (!locationId) {
-        throw new ShopifyFulfillmentWritebackError(
-          'SHOPIFY_FULFILLMENT_LOCATION_REQUIRED',
-          'Shopify fulfillment order has no assigned location',
-        )
-      }
-      assignedLocations.add(locationId)
-      lineItemsByFulfillmentOrder.push({
-        fulfillmentOrderId: fulfillmentOrder.id,
-      })
-    }
-  }
-  if (lineItemsByFulfillmentOrder.length === 0) {
-    throw new ShopifyFulfillmentWritebackError(
-      'SHOPIFY_FULFILLMENT_NOT_OPEN',
-      'Shopify has no open merchant-managed fulfillment order to fulfill',
-    )
-  }
-  if (assignedLocations.size !== 1) {
-    throw new ShopifyFulfillmentWritebackError(
-      'SHOPIFY_FULFILLMENT_MULTIPLE_LOCATIONS',
-      'Shopify fulfillment orders span multiple locations; split fulfillment is required',
-    )
-  }
-  const mutation = await shopifyAdminGraphql<{
-    fulfillmentCreate?: {
-      fulfillment?: Record<string, unknown> | null
-      userErrors?: Array<{ field?: unknown; message?: unknown }>
-    }
-  }>(credential, {
-    query: FULFILLMENT_CREATE_MUTATION,
-    operationName: 'ClawPilotFulfillmentCreate',
-    variables: {
-      fulfillment: {
-        lineItemsByFulfillmentOrder,
-        notifyCustomer: input.notifyCustomer,
-        trackingInfo: {
-          ...(input.trackingNumbers.length === 1
-            ? { number: input.trackingNumbers[0] }
-            : { numbers: input.trackingNumbers }),
-          company: input.carrier,
-        },
-      },
-    },
-  })
-  const payload = mutation.fulfillmentCreate
-  const errors = Array.isArray(payload?.userErrors) ? payload.userErrors : []
-  if (errors.length > 0) {
-    throw new ShopifyFulfillmentWritebackError(
-      'SHOPIFY_FULFILLMENT_REJECTED',
-      errors.map((error) => String(error.message || 'Shopify rejected fulfillment')).join('; ').slice(0, 500),
-    )
-  }
-  const providerReference = String(payload?.fulfillment?.id || '')
-  if (!SHOPIFY_FULFILLMENT_GID.test(providerReference)) {
-    throw new ShopifyFulfillmentWritebackError(
-      'SHOPIFY_FULFILLMENT_RESPONSE_INVALID',
-      'Shopify returned an invalid fulfillment response',
+      'SHOPIFY_FULFILLMENT_ORDER_MISMATCH',
+      'Shopify returned a different order than the requested order',
       true,
     )
   }
-  return {
-    providerReference,
-    trackingNumber: input.trackingNumbers[0],
-    trackingNumbers: input.trackingNumbers,
-    replayed: false,
+  if (typeof order.canNotifyCustomer !== 'boolean') {
+    return providerShapeError('Shopify returned malformed order.canNotifyCustomer')
   }
+  const currentFulfillmentOrders = pagedNodes(
+    order.fulfillmentOrders,
+    'order.fulfillmentOrders',
+    'SHOPIFY_FULFILLMENT_PAGINATION_REQUIRED',
+    'Shopify order exceeds the bounded fulfillment read; manual review is required',
+  )
+  for (const fulfillmentOrder of currentFulfillmentOrders) {
+    const id = providerText(fulfillmentOrder.id, 'fulfillment order ID', 128)
+    if (!SHOPIFY_FULFILLMENT_ORDER_GID.test(id)) {
+      return providerShapeError('Shopify returned malformed fulfillment-order IDs')
+    }
+    pagedNodes(
+      fulfillmentOrder.lineItems,
+      `fulfillment order ${id} lineItems`,
+      'SHOPIFY_FULFILLMENT_LINE_PAGINATION_REQUIRED',
+      'Shopify fulfillment order exceeds the bounded line read; manual review is required',
+    )
+  }
+
+  const fulfillments = providerRecords(order.fulfillments, 'order.fulfillments')
+  if (fulfillments.length >= 250) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_RECONCILIATION_PAGINATION_REQUIRED',
+      'Shopify order reached the bounded fulfillment read; manual review is required',
+    )
+  }
+  const observedFulfillments = fulfillments.map((fulfillment) => {
+    const providerReference = providerText(fulfillment.id, 'fulfillment ID', 128)
+    if (!SHOPIFY_FULFILLMENT_GID.test(providerReference)) {
+      return providerShapeError('Shopify returned malformed fulfillment IDs')
+    }
+    const status = providerText(fulfillment.status, 'fulfillment status', 64)
+    return {
+      providerReference,
+      status,
+      matchShape: observedFulfillmentMatchShape(fulfillment, observedOrderId),
+    }
+  })
+  return {
+    order,
+    fulfillments: observedFulfillments,
+  }
+}
+
+export async function readShopifyFulfillment(
+  credential: ShopifyCommerceRuntimeCredential,
+  input: ProviderWriteInput,
+  attemptSignature: unknown,
+): Promise<ShopifyFulfillmentWritebackResult | null> {
+  if (attemptSignature === undefined) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_SIGNATURE_REQUIRED',
+      'Shopify fulfillment reconciliation requires the prepared attempt signature',
+    )
+  }
+  const signature = normalizeAttemptSignature(attemptSignature)
+  requireSignatureMatchesInput(signature, input)
+  const inspection = await inspectShopifyFulfillment(credential, input)
+  return findExactExistingFulfillment(
+    inspection.fulfillments,
+    signature,
+    input,
+  )
 }

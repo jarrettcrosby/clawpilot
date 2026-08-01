@@ -882,7 +882,8 @@ assertIncludes(crmIntegrationActions, 'senderEmail', 'audited selected Gmail sen
 const crmEmailIngestion = read('app_src/lib/crm/emailIngestion.ts')
 assertIncludes(crmEmailIngestion, 'export function truncateEmailImportContent', 'email import boundary')
 assertIncludes(crmEmailIngestion, 'content.search(/%xx/i)', 'case-insensitive email import boundary')
-assertIncludes(crmEmailIngestion, '/%gslt(g[aciklmo][0-9]{7})(?![A-Za-z0-9_])/gi', 'exact inbound CRM marker syntax')
+assertIncludes(crmEmailIngestion, "globalIdFragment(['ga', 'gc', 'gi', 'gk', 'gl', 'gm', 'go'])", 'dual-format inbound CRM marker syntax')
+assertIncludes(crmEmailIngestion, '(?![A-Za-z0-9_])', 'inbound CRM marker boundary')
 assertIncludes(crmEmailIngestion, 'if (seen.has(reference)) continue', 'quoted-thread marker deduplication')
 assertIncludes(crmEmailIngestion, 'ON CONFLICT (owner_email, external_message_id) DO NOTHING', 'Gmail message deduplication')
 assertIncludes(crmEmailIngestion, 'ownedPipelines', 'cross-owned-pipeline marker resolution')
@@ -968,7 +969,7 @@ assertIncludes(crmReferenceRoute, 'resolveCrmReferenceRoute', 'legacy CRM refere
 assertIncludes(crmReferenceRoute, 'resolved.pipelineId', 'CRM reference inferred owning pipeline handoff')
 assertIncludes(crmReferenceRoute, "destination.searchParams.set('pipeline', pipelineId)", 'CRM reference owning pipeline handoff')
 assertIncludes(crmReferenceRoute, "crmAction', 'compose-email'", 'CRM email action deep link')
-assertIncludes(crmReferenceRoute, "|p)[0-9]{7}$", 'product Global ID deep link')
+assertIncludes(crmReferenceRoute, "globalIdPattern(['ga', 'gc', 'gi', 'gk', 'gl', 'gm', 'go', 'gp'])", 'dual-format product Global ID deep link')
 
 const crmReferenceQuarantineMigration = read('db/migrations/0103_pipeline_crm_reference_quarantine.sql')
 assertIncludes(
@@ -1024,7 +1025,8 @@ assertIncludes(organizationsAdapter, 'retireUnusedWorkspaceOrganization', 'faile
 const shortLinks = read('app_src/lib/shortlinks.ts')
 assertIncludes(shortLinks, 'normalizeSlug(input.slug, { allowCrmReference: true })', 'public CRM short-link resolution')
 assertIncludes(shortLinks, '!options.allowCrmReference && (CRM_REFERENCE_SLUG_PATTERN.test(slug) || CRM_ACTION_SLUG_PATTERN.test(slug))', 'creation-only CRM slug reservation')
-assertIncludes(shortLinks, 'g[aciklmop][0-9]{7}', 'product Global ID short-link reservation')
+assertIncludes(shortLinks, 'globalIdPattern(CRM_REFERENCE_PREFIXES)', 'dual-format product Global ID short-link reservation')
+assertIncludes(shortLinks, "globalIdFragment(['ga', 'gc'])", 'dual-format CRM action short-link reservation')
 
 const zonedDateTime = read('app_src/lib/zonedDateTime.ts')
 assertIncludes(zonedDateTime, 'export function zonedDateTimeToIso', 'timezone-aware CRM meeting conversion')
@@ -1576,6 +1578,7 @@ assertIncludes(healthRoute, '0195_operations_fulfillment_rate_parcel_evidence.sq
 assertIncludes(healthRoute, '0198_operations_sandbox_commerce_e2e_authorization.sql', 'hosted sandbox commerce E2E authorization migration health')
 assertIncludes(healthRoute, '0199_operations_commerce_active_canonical_collation.sql', 'hosted commerce Active canonical collation migration health')
 assertIncludes(healthRoute, '0200_operations_sandbox_commerce_e2e_active_guards.sql', 'hosted sandbox commerce E2E Active guards migration health')
+assertIncludes(healthRoute, '0218_global_id_alphanumeric_expand_141_149_and_catalog_gate.sql', 'hosted Global ID alphanumeric compatibility migration health')
 for (const [, alias] of healthRoute.matchAll(/\)\s+AS\s+([a-z0-9_]+)\s*,?/gi)) {
   assert.ok(
     alias.length <= 63,

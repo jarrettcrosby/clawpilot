@@ -13,8 +13,8 @@ export {
 } from '@/lib/operations/sandboxCommerceE2e'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const ORDER_GLOBAL_ID = /^gor[0-9]{7}$/
-const AUTHORIZATION_GLOBAL_ID = /^gsea[0-9]{7}$/
+const ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/
+const AUTHORIZATION_GLOBAL_ID = /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/
 
 export class SandboxCommerceE2eAuthorizationError extends Error {
   constructor(

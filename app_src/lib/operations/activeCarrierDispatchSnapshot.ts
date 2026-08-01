@@ -390,7 +390,7 @@ function attemptReference(
   const identity = entityReference(
     { id: source.id, globalId: source.globalId },
     'carrierAttempt',
-    /^gaca[0-9]{7}$/u,
+    /^gaca(?:[0-9]{7}|[0-9a-v]{12})$/u,
   )
   return {
     ...identity,
@@ -574,7 +574,7 @@ function packageSnapshot(
     packageGlobalId: globalId(
       source.packageGlobalId,
       `${field}.packageGlobalId`,
-      /^gpa[0-9]{7}$/u,
+      /^gpa(?:[0-9]{7}|[0-9a-v]{12})$/u,
     ),
     packageNumber: positiveInteger(
       source.packageNumber,
@@ -652,22 +652,22 @@ function rerateDispatchBinding(
     organization: entityReference(
       source.organization,
       `${field}.organization`,
-      /^ga[0-9]{7}$/u,
+      /^ga(?:[0-9]{7}|[0-9a-v]{12})$/u,
     ),
     order: entityReference(
       source.order,
       `${field}.order`,
-      /^gor[0-9]{7}$/u,
+      /^gor(?:[0-9]{7}|[0-9a-v]{12})$/u,
     ),
     plan: entityReference(
       source.plan,
       `${field}.plan`,
-      /^gfp[0-9]{7}$/u,
+      /^gfp(?:[0-9]{7}|[0-9a-v]{12})$/u,
     ),
     warehouse: entityReference(
       source.warehouse,
       `${field}.warehouse`,
-      /^gwh[0-9]{7}$/u,
+      /^gwh(?:[0-9]{7}|[0-9a-v]{12})$/u,
     ),
     originFingerprint: fingerprint(
       source.originFingerprint,
@@ -747,14 +747,14 @@ function selectedRateEvidence(
   const identity = entityReference(
     { id: source.id, globalId: source.globalId },
     'selectedRateEvidence',
-    /^gars[0-9]{7}$/u,
+    /^gars(?:[0-9]{7}|[0-9a-v]{12})$/u,
   )
   return {
     ...identity,
     rerateRun: entityReference(
       source.rerateRun,
       'selectedRateEvidence.rerateRun',
-      /^gafr[0-9]{7}$/u,
+      /^gafr(?:[0-9]{7}|[0-9a-v]{12})$/u,
     ),
     rerateInputHash: fingerprint(
       source.rerateInputHash,
@@ -885,22 +885,22 @@ export function createActiveCarrierDispatchRerateBinding(
     organization: entityReference(
       source.organization,
       'rerateDispatchBinding.organization',
-      /^ga[0-9]{7}$/u,
+      /^ga(?:[0-9]{7}|[0-9a-v]{12})$/u,
     ),
     order: entityReference(
       source.order,
       'rerateDispatchBinding.order',
-      /^gor[0-9]{7}$/u,
+      /^gor(?:[0-9]{7}|[0-9a-v]{12})$/u,
     ),
     plan: entityReference(
       source.plan,
       'rerateDispatchBinding.plan',
-      /^gfp[0-9]{7}$/u,
+      /^gfp(?:[0-9]{7}|[0-9a-v]{12})$/u,
     ),
     warehouse: entityReference(
       source.warehouse,
       'rerateDispatchBinding.warehouse',
-      /^gwh[0-9]{7}$/u,
+      /^gwh(?:[0-9]{7}|[0-9a-v]{12})$/u,
     ),
     origin: addressSnapshot(source.origin, 'origin'),
     destination: addressSnapshot(source.destination, 'destination'),
@@ -995,20 +995,20 @@ export function createActiveCarrierDispatchSnapshot(
   const organization = entityReference(
     source.organization,
     'organization',
-    /^ga[0-9]{7}$/u,
+    /^ga(?:[0-9]{7}|[0-9a-v]{12})$/u,
   )
-  const order = entityReference(source.order, 'order', /^gor[0-9]{7}$/u)
-  const plan = entityReference(source.plan, 'plan', /^gfp[0-9]{7}$/u)
+  const order = entityReference(source.order, 'order', /^gor(?:[0-9]{7}|[0-9a-v]{12})$/u)
+  const plan = entityReference(source.plan, 'plan', /^gfp(?:[0-9]{7}|[0-9a-v]{12})$/u)
   const warehouse = entityReference(
     source.warehouse,
     'warehouse',
-    /^gwh[0-9]{7}$/u,
+    /^gwh(?:[0-9]{7}|[0-9a-v]{12})$/u,
   )
   const carrierAttempt = attemptReference(source.carrierAttempt)
   const integrationAccount = entityReference(
     source.integrationAccount,
     'integrationAccount',
-    /^gia[0-9]{7}$/u,
+    /^gia(?:[0-9]{7}|[0-9a-v]{12})$/u,
   )
 
   const carrierSource = record(source.carrierAccount, 'carrierAccount')
@@ -1023,7 +1023,7 @@ export function createActiveCarrierDispatchSnapshot(
   const carrierReference = entityReference(
     { id: carrierSource.id, globalId: carrierSource.globalId },
     'carrierAccount',
-    /^gac[0-9]{7}$/u,
+    /^gac(?:[0-9]{7}|[0-9a-v]{12})$/u,
   )
   const carrierAccount: ActiveCarrierDispatchCarrierAccountReference = {
     ...carrierReference,

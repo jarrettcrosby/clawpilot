@@ -29,7 +29,7 @@ export const MAX_CARRIER_BILLING_CSV_BYTES = 10 * 1024 * 1024
 
 const IMPORT_SCHEMA_VERSION = 1
 const INSERT_CHUNK_SIZE = 500
-const RATE_NETWORK_GLOBAL_ID = /^grn\d{7}$/
+const RATE_NETWORK_GLOBAL_ID = /^grn(?:[0-9]{7}|[0-9a-v]{12})$/
 
 type CarrierBillingResolutionDecision = 'matched' | 'unmatched' | 'ambiguous'
 

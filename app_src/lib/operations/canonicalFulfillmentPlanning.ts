@@ -22,7 +22,7 @@ const MAX_OFFERS = 100
 const HASH = /^[a-f0-9]{64}$/
 const PACKAGE_KEY = /^[A-Za-z0-9][A-Za-z0-9_.:#-]{0,127}$/
 const SERVICE_CODE = /^[A-Za-z0-9][A-Za-z0-9_.:#-]{0,127}$/
-const RATE_EVIDENCE_GLOBAL_ID = /^grq[0-9]{7}$/
+const RATE_EVIDENCE_GLOBAL_ID = /^grq(?:[0-9]{7}|[0-9a-v]{12})$/
 const ISO_TIMESTAMP =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/
 

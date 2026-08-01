@@ -22,7 +22,7 @@ export { normalizeShopifyCustomerGid }
 
 const ORGANIZATION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const ACCOUNT_GLOBAL_ID_PATTERN = /^gia[0-9]{7}$/
+const ACCOUNT_GLOBAL_ID_PATTERN = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
 const ACTOR_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const ACTIVE_PROVIDER_WRITE_BLOCKED =
   'SHOPIFY_CUSTOMER_POLICY_PROVIDER_WRITE_UNAVAILABLE'

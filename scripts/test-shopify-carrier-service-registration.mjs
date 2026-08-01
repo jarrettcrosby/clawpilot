@@ -116,7 +116,7 @@ function loadRegistrationModule() {
           decryptCommerceCredential: unavailable,
           normalizeCommerceAccountGlobalId(value) {
             const normalized = String(value || '').trim().toLowerCase()
-            if (!/^gia[0-9]{7}$/.test(normalized)) {
+            if (!/^gia(?:[0-9]{7}|[0-9a-v]{12})$/.test(normalized)) {
               throw new Error('invalid account')
             }
             return normalized

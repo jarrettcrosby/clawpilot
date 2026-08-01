@@ -2,11 +2,12 @@
 
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
+import { globalIdPattern } from '../app_src/lib/globalIds.mjs'
 
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
 const { Pool } = requireFromApp('pg')
 
-const CONTACT_REFERENCE = /^gc[0-9]{7}$/
+const CONTACT_REFERENCE = globalIdPattern('gc')
 const DEFAULT_REASON = 'Consolidate a duplicate CRM Contact while preserving its source and public identities'
 
 function usage() {

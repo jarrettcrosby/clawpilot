@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
+import { globalIdPattern } from '../app_src/lib/globalIds.mjs'
 
 export const SCRIPT_VERSION = 'ag-alchemy-carrier-sandbox-rating-proof-v1'
 export const EXECUTION_CONFIRMATION =
@@ -20,7 +21,7 @@ export const EXPECTED_PROVIDERS = Object.freeze(['fedex_rest', 'ups_rest'])
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const RATE_EVIDENCE_PATTERN = /^grq[0-9]{7}$/
+const RATE_EVIDENCE_PATTERN = globalIdPattern('grq')
 const SESSION_COOKIE_NAMES = new Set([
   '__Host-clawpilot_session',
   'clawpilot_session',
@@ -677,7 +678,7 @@ async function loadDatabaseCarrierAccounts(client, organizationId) {
       || integration.verification_status !== 'verified'
       || !exactManagedRatingConfiguration(integration.configuration)
       || activeAccounts.length !== 1
-      || !/^gac[0-9]{7}$/.test(carrierAccount.carrier_account_global_id)
+      || !globalIdPattern('gac').test(carrierAccount.carrier_account_global_id)
       || carrierAccount.sender_name !== warehouse.warehouse_name
       || JSON.stringify(normalizedCarrierAddress(
         carrierAccount.registered_address,

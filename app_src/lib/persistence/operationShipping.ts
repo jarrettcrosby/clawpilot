@@ -137,12 +137,12 @@ type VoidSandboxLabelInput = {
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const ORDER_GLOBAL_ID = /^gor\d{7}$/
-const RATE_GLOBAL_ID = /^grt\d{7}$/
-const CARRIER_ACCOUNT_GLOBAL_ID = /^gac\d{7}$/
-const PRINTER_GLOBAL_ID = /^gpr\d{7}$/
-const PACKAGE_GLOBAL_ID = /^gpa\d{7}$/
-const SANDBOX_E2E_AUTHORIZATION_GLOBAL_ID = /^gsea\d{7}$/
+const ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/
+const RATE_GLOBAL_ID = /^grt(?:[0-9]{7}|[0-9a-v]{12})$/
+const CARRIER_ACCOUNT_GLOBAL_ID = /^gac(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRINTER_GLOBAL_ID = /^gpr(?:[0-9]{7}|[0-9a-v]{12})$/
+const PACKAGE_GLOBAL_ID = /^gpa(?:[0-9]{7}|[0-9a-v]{12})$/
+const SANDBOX_E2E_AUTHORIZATION_GLOBAL_ID = /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/
 
 function stable(value: unknown): string {

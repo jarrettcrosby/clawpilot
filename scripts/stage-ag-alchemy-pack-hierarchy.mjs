@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { globalIdPattern } from '../app_src/lib/globalIds.mjs'
 
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
@@ -24,7 +25,7 @@ const STARTER_EVIDENCE_REFERENCE =
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const PRODUCT_GLOBAL_ID_PATTERN = /^gp\d{7}$/
+const PRODUCT_GLOBAL_ID_PATTERN = globalIdPattern('gp')
 const PROFILE_KEY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,79}$/
 const COMPATIBILITY_KEY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,119}$/
 const MAX_ASSIGNED_PRODUCTS = 250

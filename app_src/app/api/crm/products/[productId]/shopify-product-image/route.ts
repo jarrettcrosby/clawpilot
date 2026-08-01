@@ -31,7 +31,7 @@ export const runtime = 'nodejs'
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const CHANNEL_GLOBAL_PATTERN = /^gpcs[0-9]{7}$/
+const CHANNEL_GLOBAL_PATTERN = /^gpcs(?:[0-9]{7}|[0-9a-v]{12})$/
 const MAX_COMMAND_BYTES = 4 * 1024
 const NO_STORE_HEADERS = {
   'Cache-Control': 'private, no-store, max-age=0',
@@ -226,7 +226,7 @@ export async function POST(
       const allowed = ['action', 'externalEffectGlobalId']
       if (
         Object.keys(body).some((field) => !allowed.includes(field))
-        || !/^gcef[0-9]{7}$/.test(
+        || !/^gcef(?:[0-9]{7}|[0-9a-v]{12})$/.test(
           String(body.externalEffectGlobalId || '')
             .trim()
             .toLowerCase(),
@@ -250,7 +250,7 @@ export async function POST(
       const allowed = ['action', 'externalEffectGlobalId']
       if (
         Object.keys(body).some((field) => !allowed.includes(field))
-        || !/^gcef[0-9]{7}$/.test(
+        || !/^gcef(?:[0-9]{7}|[0-9a-v]{12})$/.test(
           String(body.externalEffectGlobalId || '')
             .trim()
             .toLowerCase(),

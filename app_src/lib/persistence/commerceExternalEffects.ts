@@ -1256,7 +1256,7 @@ export async function claimCommerceExternalEffectsInPostgres(input: {
   }
   if (
     input.globalId
-    && !/^gcef[0-9]{7}$/.test(input.globalId)
+    && !/^gcef(?:[0-9]{7}|[0-9a-v]{12})$/.test(input.globalId)
   ) {
     externalEffectError(
       'COMMERCE_EXTERNAL_EFFECT_GLOBAL_ID_INVALID',

@@ -416,8 +416,8 @@ assertIncludes(operationsRoute, [
 
 assertIncludes(operationsRoute, [
   'selectProductionFulfillmentRerateOfferInPostgres,',
-  'const PRODUCTION_RERATE_RUN_GLOBAL_ID = /^gafr\\d{7}$/',
-  'const PRODUCTION_RERATE_OFFER_GLOBAL_ID = /^garo\\d{7}$/',
+  'const PRODUCTION_RERATE_RUN_GLOBAL_ID = /^gafr(?:[0-9]{7}|[0-9a-v]{12})$/',
+  'const PRODUCTION_RERATE_OFFER_GLOBAL_ID = /^garo(?:[0-9]{7}|[0-9a-v]{12})$/',
   "if (action === 'select-production-rerate-offer')",
   '!capabilities.canManage || !capabilities.canExecute',
   "code: 'OPERATIONS_EXECUTE_REQUIRED'",

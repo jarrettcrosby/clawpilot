@@ -48,7 +48,7 @@ export const revalidate = 0
 export const runtime = 'nodejs'
 export const maxDuration = 60
 
-const EVIDENCE_GLOBAL_ID = /^gcte[0-9]{7}$/
+const EVIDENCE_GLOBAL_ID = /^gcte(?:[0-9]{7}|[0-9a-v]{12})$/
 const MAX_REQUEST_BYTES = 32 * 1024
 const MAX_SELECTED_MATERIALS = 8
 const MILLIMETERS_PER_INCH = 25.4
@@ -239,7 +239,7 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
     const item = record(entry, `Selected material ${index + 1}`)
     const materialGlobalId = exactReference(
       item.materialGlobalId,
-      /^gmat[0-9]{7}$/,
+      /^gmat(?:[0-9]{7}|[0-9a-v]{12})$/,
       `Selected material ${index + 1} Global ID`,
     )
     if (materialGlobalIds.has(materialGlobalId)) {
@@ -306,12 +306,12 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
   const base = {
     accountGlobalId: exactReference(
       input.accountGlobalId,
-      /^gia[0-9]{7}$/,
+      /^gia(?:[0-9]{7}|[0-9a-v]{12})$/,
       'Commerce account Global ID',
     ),
     candidateGlobalId: exactReference(
       input.candidateGlobalId,
-      /^gcoc[0-9]{7}$/,
+      /^gcoc(?:[0-9]{7}|[0-9a-v]{12})$/,
       'Order candidate Global ID',
     ),
     expectedCandidateRowVersion: exactInteger(
@@ -320,7 +320,7 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
     ),
     warehouseGlobalId: exactReference(
       input.warehouseGlobalId,
-      /^gwh[0-9]{7}$/,
+      /^gwh(?:[0-9]{7}|[0-9a-v]{12})$/,
       'Warehouse Global ID',
     ),
     idempotencyKey: plainText(
@@ -355,7 +355,7 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
       return {
         lineGlobalId: exactReference(
           item.lineGlobalId,
-          /^gcol[0-9]{7}$/,
+          /^gcol(?:[0-9]{7}|[0-9a-v]{12})$/,
           `Committed inventory assumption ${index + 1} line`,
         ),
         quantity: exactInteger(

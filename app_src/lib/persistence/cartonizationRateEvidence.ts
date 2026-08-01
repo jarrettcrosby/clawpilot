@@ -445,7 +445,7 @@ export function assertCartonizationRateEvidenceMaterialAssumptions(
   >()
   for (const assumption of input.materialRateAssumptions) {
     if (
-      !/^gmat[0-9]{7}$/.test(assumption?.materialGlobalId || '')
+      !/^gmat(?:[0-9]{7}|[0-9a-v]{12})$/.test(assumption?.materialGlobalId || '')
       || !Number.isSafeInteger(assumption?.expectedRowVersion)
       || assumption.expectedRowVersion < 0
       || !exactMaterialRateDimensions(

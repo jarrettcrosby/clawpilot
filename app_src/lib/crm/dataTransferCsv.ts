@@ -215,14 +215,14 @@ const CRM_DATA_TRANSFER_HEADERS: Record<CrmTransferEntity, readonly string[]> = 
 }
 
 const GLOBAL_ID_PATTERNS: Record<CrmTransferEntity, RegExp> = {
-  organizations: /^ga[0-9]{7}$/,
-  contacts: /^gc[0-9]{7}$/,
-  products: /^gp[0-9]{7}$/,
-  leads: /^gl[0-9]{7}$/,
-  opportunities: /^go[0-9]{7}$/,
-  meetings: /^gm[0-9]{7}$/,
-  interactions: /^gi[0-9]{7}$/,
-  campaigns: /^gk[0-9]{7}$/,
+  organizations: /^ga(?:[0-9]{7}|[0-9a-v]{12})$/,
+  contacts: /^gc(?:[0-9]{7}|[0-9a-v]{12})$/,
+  products: /^gp(?:[0-9]{7}|[0-9a-v]{12})$/,
+  leads: /^gl(?:[0-9]{7}|[0-9a-v]{12})$/,
+  opportunities: /^go(?:[0-9]{7}|[0-9a-v]{12})$/,
+  meetings: /^gm(?:[0-9]{7}|[0-9a-v]{12})$/,
+  interactions: /^gi(?:[0-9]{7}|[0-9a-v]{12})$/,
+  campaigns: /^gk(?:[0-9]{7}|[0-9a-v]{12})$/,
 }
 
 const RELATIONSHIP_PATTERNS: Record<string, RegExp> = {

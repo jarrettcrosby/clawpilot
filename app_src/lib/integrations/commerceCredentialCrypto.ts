@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { normalizeGlobalId } from '@/lib/globalIds.mjs'
 import { isHostedRuntime } from '@/lib/persistence/config'
 
 export type CommerceProvider = 'shopify' | 'faire'
@@ -92,8 +93,8 @@ export function normalizeCommerceEnvironment(
 }
 
 export function normalizeCommerceAccountGlobalId(value: unknown) {
-  const globalId = String(value || '').trim().toLowerCase()
-  if (!/^gia[0-9]{7}$/.test(globalId)) {
+  const globalId = normalizeGlobalId(value, 'gia')
+  if (!globalId) {
     throw new Error('A valid commerce account Global ID is required')
   }
   return globalId

@@ -194,11 +194,11 @@ const THREE_DECIMAL_CURRENCIES = new Set([
 ])
 
 const FOUR_DECIMAL_CURRENCIES = new Set(['CLF', 'UYW'])
-const ACCOUNT_GLOBAL_ID_PATTERN = /^gia[0-9]{7}$/
-const PRODUCT_CANDIDATE_GLOBAL_ID_PATTERN = /^gcpc[0-9]{7}$/
-const ORDER_CANDIDATE_GLOBAL_ID_PATTERN = /^gcoc[0-9]{7}$/
-const REJECTION_GLOBAL_ID_PATTERN = /^gcrj[0-9]{7}$/
-const PRODUCT_GLOBAL_ID_PATTERN = /^gp[0-9]{7}$/
+const ACCOUNT_GLOBAL_ID_PATTERN = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRODUCT_CANDIDATE_GLOBAL_ID_PATTERN = /^gcpc(?:[0-9]{7}|[0-9a-v]{12})$/
+const ORDER_CANDIDATE_GLOBAL_ID_PATTERN = /^gcoc(?:[0-9]{7}|[0-9a-v]{12})$/
+const REJECTION_GLOBAL_ID_PATTERN = /^gcrj(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRODUCT_GLOBAL_ID_PATTERN = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/
 const CURRENCY_PATTERN = /^[A-Z]{3}$/
 const CONTROL_CHARACTER_PATTERN = /[\p{C}]/u
 const SPREADSHEET_FORMULA_PATTERN =

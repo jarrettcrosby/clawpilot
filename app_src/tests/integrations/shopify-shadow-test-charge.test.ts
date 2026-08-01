@@ -8,8 +8,9 @@ const appSourceUrl = new URL('../../', import.meta.url)
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier.startsWith('@/')) {
+      const appPath = specifier.slice(2)
       return nextResolve(
-        new URL(`${specifier.slice(2)}.ts`, appSourceUrl).href,
+        new URL(appPath.endsWith('.mjs') ? appPath : `${appPath}.ts`, appSourceUrl).href,
         context,
       )
     }

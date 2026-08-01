@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import type { NextRequest } from 'next/server'
 import type { QueryResultRow } from 'pg'
+import { globalIdFragment, globalIdPattern } from '@/lib/globalIds.mjs'
 import { getStorageDriver } from '@/lib/persistence/config'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { requireRequestUser } from '@/lib/requestUser'
@@ -8,8 +9,9 @@ import { effectiveAuthorizationRole, effectiveUserPermissions, normalizeUserEmai
 import { requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
 
 const SLUG_PATTERN = /^[a-z0-9][a-z0-9_-]{2,63}$/
-const CRM_REFERENCE_SLUG_PATTERN = /^g[aciklmop][0-9]{7}$/
-const CRM_ACTION_SLUG_PATTERN = /^mail-g[ac][0-9]{7}$/
+const CRM_REFERENCE_PREFIXES = ['ga', 'gc', 'gi', 'gk', 'gl', 'gm', 'go', 'gp']
+const CRM_REFERENCE_SLUG_PATTERN = globalIdPattern(CRM_REFERENCE_PREFIXES)
+const CRM_ACTION_SLUG_PATTERN = new RegExp(`^mail-${globalIdFragment(['ga', 'gc'])}$`)
 const SOURCE_PATTERN = /^[a-z][a-z0-9-]{1,39}$/
 const SLUG_ALPHABET = '23456789abcdefghjkmnpqrstuvwxyz'
 const RESERVED_SLUGS = new Set(['admin', 'api', 'app', 'auth', 'new', 'privacy', 'settings'])

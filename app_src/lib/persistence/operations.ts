@@ -4,6 +4,8 @@ import { recordAuditEvent } from '@/lib/auditWriter'
 import { normalizedCrmIdentityText } from '@/lib/crm/stableId'
 import {
   executeShopifyFulfillmentWriteback,
+  prepareShopifyFulfillmentWriteback,
+  reconcileShopifyFulfillmentWriteback,
 } from '@/lib/integrations/shopifyFulfillmentWriteback'
 import {
   consumeSandboxCommerceE2eAuthorization,
@@ -58,6 +60,8 @@ import type {
   MockOperationsProofResult,
   OperationsActivationState,
   OperationsActivationUpdateResult,
+  OperationsCommerceFulfillmentRetryResult,
+  OperationsCustomerNotificationDecision,
   OperationsExceptionListItem,
   OperationsExceptionStatus,
   OperationsExceptionUpdateResult,
@@ -422,6 +426,75 @@ function json(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {}
+}
+
+function customerNotificationDecision(
+  value: unknown,
+): OperationsCustomerNotificationDecision {
+  const source = json(value)
+  if (
+    source.mode === 'provider_managed'
+    && source.source === 'provider_managed'
+  ) {
+    return {
+      mode: 'provider_managed',
+      notifyCustomer: null,
+      source: 'provider_managed',
+      accountPolicyRevision: null,
+      overrideReason: null,
+      decidedBy: typeof source.decidedBy === 'string'
+        ? source.decidedBy
+        : null,
+    }
+  }
+  const explicitSources = [
+    'account_default',
+    'order_override',
+    'sandbox_e2e_suppression',
+    'legacy_safe_default',
+  ] as const
+  const sourceName = String(source.source || '')
+  const explicitDecision = (
+    source.mode === 'clawpilot_explicit'
+    && explicitSources.includes(
+      sourceName as typeof explicitSources[number],
+    )
+    && typeof source.notifyCustomer === 'boolean'
+    && !(
+      sourceName === 'sandbox_e2e_suppression'
+      && source.notifyCustomer === true
+    )
+    && !(
+      sourceName === 'legacy_safe_default'
+      && source.notifyCustomer === true
+    )
+  )
+  if (!explicitDecision) {
+    return {
+      mode: 'clawpilot_explicit',
+      notifyCustomer: false,
+      source: 'legacy_safe_default',
+      accountPolicyRevision: null,
+      overrideReason: null,
+      decidedBy: null,
+    }
+  }
+  return {
+    mode: 'clawpilot_explicit',
+    notifyCustomer: source.notifyCustomer as boolean,
+    source: sourceName as OperationsCustomerNotificationDecision['source'],
+    accountPolicyRevision: source.accountPolicyRevision !== null
+      && source.accountPolicyRevision !== undefined
+      && Number.isSafeInteger(Number(source.accountPolicyRevision))
+      ? Number(source.accountPolicyRevision)
+      : null,
+    overrideReason: typeof source.overrideReason === 'string'
+      ? source.overrideReason
+      : null,
+    decidedBy: typeof source.decidedBy === 'string'
+      ? source.decidedBy
+      : null,
+  }
 }
 
 function address(value: unknown): Address {
@@ -1899,6 +1972,9 @@ async function readOrderDetail(
     customer_name: string
     customer_global_id: string
     source_provider: string
+    integration_account_id: string
+    notify_customer_default: boolean | null
+    notification_policy_revision: string | number | null
     status: OperationsOrderStatus
     currency: string
     row_version: string
@@ -1934,7 +2010,10 @@ async function readOrderDetail(
     `SELECT
        orders.id::text, orders.global_id, orders.order_number, orders.external_order_id,
        customer.name AS customer_name, customer.reference_code AS customer_global_id,
-       orders.source_provider, orders.status, orders.currency, orders.ship_to,
+       orders.source_provider, orders.integration_account_id::text,
+       notification_policy.notify_customer_default,
+       notification_policy.revision::text AS notification_policy_revision,
+       orders.status, orders.currency, orders.ship_to,
        orders.row_version::text, plan.id::text AS plan_id,
        plan.warehouse_id::text AS warehouse_id,
        plan.status AS plan_status, wave.status AS wave_status,
@@ -2021,6 +2100,9 @@ async function readOrderDetail(
        shipment.tracking_number, orders.updated_at
      FROM operations_orders orders
      JOIN crm_organizations customer ON customer.id = orders.customer_id AND customer.pipeline_id = orders.pipeline_id
+     LEFT JOIN operations_shopify_fulfillment_notification_policies notification_policy
+       ON notification_policy.organization_id = orders.organization_id
+      AND notification_policy.integration_account_id = orders.integration_account_id
      LEFT JOIN LATERAL (
        SELECT candidate.* FROM operations_fulfillment_plans candidate
        WHERE candidate.order_id = orders.id ORDER BY candidate.version_number DESC LIMIT 1
@@ -2332,6 +2414,8 @@ async function readOrderDetail(
       shipment_global_id: string
       provider: string
       state: 'queued' | 'processing' | 'succeeded' | 'failed' | 'unsupported'
+      attempts: number
+      payload_snapshot: Record<string, unknown>
       provider_reference: string | null
       error_code: string | null
       error_message: string | null
@@ -2340,7 +2424,8 @@ async function readOrderDetail(
     }>(
       `SELECT export.global_id,
               shipment.global_id AS shipment_global_id,
-              export.provider, export.state, export.provider_reference,
+              export.provider, export.state, export.attempts,
+              export.payload_snapshot, export.provider_reference,
               export.error_code, export.error_message,
               export.requested_at, export.completed_at
        FROM operations_commerce_fulfillment_exports export
@@ -2450,6 +2535,23 @@ async function readOrderDetail(
         }
       : null,
     fulfillmentPreparation,
+    fulfillmentNotificationPolicy: row.source_provider === 'shopify'
+      ? {
+          mode: 'clawpilot_explicit',
+          notifyCustomerDefault: row.notify_customer_default === true,
+          revision: numberValue(row.notification_policy_revision),
+        }
+      : row.source_provider === 'faire'
+        ? {
+            mode: 'provider_managed',
+            notifyCustomerDefault: null,
+            revision: 0,
+          }
+        : {
+            mode: 'unavailable',
+            notifyCustomerDefault: null,
+            revision: 0,
+          },
     warehouseName: row.warehouse_name,
     promisedDeliveryAt: row.promised_delivery_at?.toISOString() || null,
     lineCount: Number(row.line_count),
@@ -2573,11 +2675,15 @@ async function readOrderDetail(
       shipmentGlobalId: item.shipment_global_id,
       provider: item.provider,
       state: item.state,
+      attempts: item.attempts,
       providerReference: item.provider_reference,
       errorCode: item.error_code,
       errorMessage: item.error_message,
       requestedAt: item.requested_at.toISOString(),
       completedAt: item.completed_at?.toISOString() || null,
+      customerNotification: customerNotificationDecision(
+        json(item.payload_snapshot).customerNotification,
+      ),
     })),
     events: eventResult.rows.map((item) => ({
       globalId: item.global_id,
@@ -3457,7 +3563,7 @@ function validateLocationMutation(input: OperationsLocationMutationInput) {
   const code = trimmed(input.code, 40).toUpperCase()
   const zone = trimmed(input.zone, 80).toUpperCase()
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
-  if (!/^gwh\d{7}$/.test(input.warehouseGlobalId)) {
+  if (!/^gwh(?:[0-9]{7}|[0-9a-v]{12})$/.test(input.warehouseGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_WAREHOUSE_INVALID', 'Warehouse is invalid')
   }
   if (!code || !/^[A-Z0-9][A-Z0-9_-]*$/.test(code)) {
@@ -3483,7 +3589,7 @@ function validateLocationMutation(input: OperationsLocationMutationInput) {
   }
   const uniqueProducts = new Set<string>()
   for (const rule of rules) {
-    if (!/^gp\d{7}$/.test(rule.productGlobalId) || !LOCATION_PRODUCT_RULE_TYPES.has(rule.ruleType)) {
+    if (!/^gp(?:[0-9]{7}|[0-9a-v]{12})$/.test(rule.productGlobalId) || !LOCATION_PRODUCT_RULE_TYPES.has(rule.ruleType)) {
       throw new OperationsRequestError('OPERATIONS_LOCATION_RULE_INVALID', 'A location product rule is invalid')
     }
     if (uniqueProducts.has(rule.productGlobalId)) {
@@ -3502,7 +3608,7 @@ function validateLocationMutation(input: OperationsLocationMutationInput) {
       replenishmentMode !== 'disabled'
       && (
         !sourceGlobalId
-        || !/^gwl\d{7}$/.test(sourceGlobalId)
+        || !/^gwl(?:[0-9]{7}|[0-9a-v]{12})$/.test(sourceGlobalId)
         || targetQuantity === null
         || (replenishmentMode === 'min_max' && minQuantity === null)
       )
@@ -3555,7 +3661,7 @@ async function resolveLocationParent(
   currentLocationId?: string,
 ): Promise<string | null> {
   if (!parentGlobalId) return null
-  if (!/^gwl\d{7}$/.test(parentGlobalId)) {
+  if (!/^gwl(?:[0-9]{7}|[0-9a-v]{12})$/.test(parentGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_LOCATION_PARENT_INVALID', 'Parent location is invalid')
   }
   const parentResult = await client.query<IdRow>(
@@ -3931,7 +4037,7 @@ export async function updateOperationsWarehouseInPostgres(input: {
   const cutoffTime = trimmed(input.cutoffTime, 8) || null
   const operatingProfile = validateWarehouseOperatingProfile(input)
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
-  if (!/^gwh\d{7}$/.test(input.warehouseGlobalId) || !name) {
+  if (!/^gwh(?:[0-9]{7}|[0-9a-v]{12})$/.test(input.warehouseGlobalId) || !name) {
     throw new OperationsRequestError('OPERATIONS_WAREHOUSE_INVALID', 'Warehouse is invalid')
   }
   if (!WAREHOUSE_FACILITY_TYPES.has(input.facilityType) || !['active', 'inactive'].includes(input.status)) {
@@ -4004,7 +4110,7 @@ export async function updateOperationsLocationInPostgres(
 ): Promise<{ locationGlobalId: string; rowVersion: number }> {
   const organizationId = requireOrganizationId(input.organizationId)
   const normalized = validateLocationMutation(input)
-  if (!/^gwl\d{7}$/.test(input.locationGlobalId)) {
+  if (!/^gwl(?:[0-9]{7}|[0-9a-v]{12})$/.test(input.locationGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_LOCATION_INVALID', 'Location is invalid')
   }
   return withTransaction(async (client) => {
@@ -4104,7 +4210,7 @@ export async function deleteOperationsLocationInPostgres(input: {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
-  if (!/^gwl\d{7}$/.test(input.locationGlobalId)) {
+  if (!/^gwl(?:[0-9]{7}|[0-9a-v]{12})$/.test(input.locationGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_LOCATION_INVALID', 'Location is invalid')
   }
   return withTransaction(async (client) => {
@@ -5442,7 +5548,7 @@ export async function prepareOperationsShipmentExecutionFromPostgres(input: {
       401,
     )
   }
-  if (!/^gor\d{7}$/.test(orderGlobalId)) {
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError(
       'OPERATIONS_ORDER_INVALID',
       'Order is invalid',
@@ -8122,7 +8228,8 @@ async function completedShipmentCommandResult(
     && typeof payload.trackingNumber === 'string'
     && typeof payload.packingSlipArtifactGlobalId === 'string'
     && typeof payload.commerceExportGlobalId === 'string'
-    && ['succeeded', 'unsupported', 'failed'].includes(String(payload.commerceExportState))) {
+    && ['succeeded', 'unsupported', 'failed']
+      .includes(String(payload.commerceExportState))) {
     return {
       orderGlobalId: payload.orderGlobalId,
       orderStatus: 'shipped',
@@ -8132,6 +8239,9 @@ async function completedShipmentCommandResult(
       packingSlipArtifactGlobalId: payload.packingSlipArtifactGlobalId,
       commerceExportGlobalId: payload.commerceExportGlobalId,
       commerceExportState: payload.commerceExportState as OperationsShipmentCommandResult['commerceExportState'],
+      customerNotification: customerNotificationDecision(
+        payload.customerNotification,
+      ),
       replayed: true,
       printJobGlobalId: typeof payload.printJobGlobalId === 'string'
         ? payload.printJobGlobalId
@@ -8158,6 +8268,7 @@ async function completedShipmentCommandResult(
     artifact_global_id: string
     export_global_id: string
     export_state: string
+    export_payload_snapshot: Record<string, unknown>
     print_job_global_id: string | null
   }>(
     `SELECT source_order.global_id AS order_global_id,
@@ -8168,6 +8279,7 @@ async function completedShipmentCommandResult(
             artifact.global_id AS artifact_global_id,
             fulfillment_export.global_id AS export_global_id,
             fulfillment_export.state AS export_state,
+            fulfillment_export.payload_snapshot AS export_payload_snapshot,
             print_job.global_id AS print_job_global_id
      FROM operations_orders source_order
      JOIN LATERAL (
@@ -8206,7 +8318,8 @@ async function completedShipmentCommandResult(
       409,
     )
   }
-  const exportState = ['succeeded', 'unsupported', 'failed'].includes(row.export_state)
+  const exportState = ['succeeded', 'unsupported', 'failed']
+    .includes(row.export_state)
     ? row.export_state as OperationsShipmentCommandResult['commerceExportState']
     : 'failed'
   return {
@@ -8218,6 +8331,9 @@ async function completedShipmentCommandResult(
     packingSlipArtifactGlobalId: row.artifact_global_id,
     commerceExportGlobalId: row.export_global_id,
     commerceExportState: exportState,
+    customerNotification: customerNotificationDecision(
+      json(row.export_payload_snapshot).customerNotification,
+    ),
     replayed: true,
     printJobGlobalId: row.print_job_global_id,
     printWarning: exportState === 'failed' && row.export_state !== 'failed'
@@ -8243,7 +8359,7 @@ function canonicalProofLines(proof: MockOperationsProofInput): MockOperationsPro
   const seen = new Set<string>()
   return suppliedLines.map((line) => {
     const productGlobalId = String(line.productGlobalId || '').trim()
-    if (!/^gp\d{7}$/.test(productGlobalId)) {
+    if (!/^gp(?:[0-9]{7}|[0-9a-v]{12})$/.test(productGlobalId)) {
       throw new OperationsRequestError('OPERATIONS_PRODUCT_NOT_FOUND', 'Select an active CRM product from the active workspace', 404)
     }
     if (seen.has(productGlobalId)) {
@@ -9354,13 +9470,13 @@ export async function planOperationsOrderFromPostgres(input: {
       401,
     )
   }
-  if (!/^gor\d{7}$/.test(orderGlobalId)) {
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError(
       'OPERATIONS_ORDER_INVALID',
       'Order is invalid',
     )
   }
-  if (!/^gcte\d{7}$/.test(evidenceGlobalId)) {
+  if (!/^gcte(?:[0-9]{7}|[0-9a-v]{12})$/.test(evidenceGlobalId)) {
     throw new OperationsRequestError(
       'OPERATIONS_CARTONIZATION_EVIDENCE_INVALID',
       'Cartonization evidence is invalid',
@@ -10737,7 +10853,7 @@ export async function releaseOperationsOrderFromPostgres(input: {
   const reason = String(input.reason || '').trim()
   const idempotencyKey = String(input.idempotencyKey || '').trim()
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
-  if (!/^gor\d{7}$/.test(orderGlobalId)) {
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
   }
   if (!Number.isSafeInteger(input.expectedRowVersion) || input.expectedRowVersion < 0) {
@@ -11134,7 +11250,7 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
   const reason = String(input.reason || '').trim()
   const idempotencyKey = String(input.idempotencyKey || '').trim()
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
-  if (!/^gor\d{7}$/.test(orderGlobalId)) {
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
   }
   if (!Number.isSafeInteger(input.expectedRowVersion) || input.expectedRowVersion < 0) {
@@ -11519,7 +11635,7 @@ export async function verifyOperationsOrderPackFromPostgres(input: {
   const reason = String(input.reason || '').trim()
   const idempotencyKey = String(input.idempotencyKey || '').trim()
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
-  if (!/^gor\d{7}$/.test(orderGlobalId)) {
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
   }
   if (!Number.isSafeInteger(input.expectedRowVersion) || input.expectedRowVersion < 0) {
@@ -11863,13 +11979,13 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
       401,
     )
   }
-  if (!/^gor\d{7}$/.test(orderGlobalId)) {
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError(
       'OPERATIONS_ORDER_INVALID',
       'Order is invalid',
     )
   }
-  if (!/^gpa\d{7}$/.test(packageGlobalId)) {
+  if (!/^gpa(?:[0-9]{7}|[0-9a-v]{12})$/.test(packageGlobalId)) {
     throw new OperationsRequestError(
       'OPERATIONS_PACKAGE_INVALID',
       'Package is invalid',
@@ -12280,6 +12396,710 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
   }
 }
 
+type CommerceFulfillmentExportExecutionRow = QueryResultRow & {
+  global_id: string
+  provider: string
+  state: 'queued' | 'processing' | 'succeeded' | 'failed' | 'unsupported'
+  external_order_id: string
+  payload_snapshot: Record<string, unknown>
+  idempotency_key: string
+  attempts: number
+  provider_reference: string | null
+  error_code: string | null
+  error_message: string | null
+  updated_at: Date
+  integration_account_id: string | null
+  account_global_id: string | null
+  provider_attempt_id: string | null
+  provider_attempt_global_id: string | null
+  provider_attempt_state: string | null
+  provider_attempt_number: number | null
+  provider_attempt_request: Record<string, unknown> | null
+}
+
+const SHOPIFY_FULFILLMENT_PROVIDER_ATTEMPT_ACTION =
+  'shopify.fulfillment.create'
+const SHOPIFY_FULFILLMENT_PROVIDER_ATTEMPT_ADAPTER =
+  'shopify-fulfillment-writeback-v2'
+
+async function registerShopifyFulfillmentProviderAttempt(input: {
+  organizationId: string
+  actorEmail: string
+  commerceExportGlobalId: string
+  integrationAccountId: string
+  exportIdempotencyKey: string
+  exportAttempt: number
+  preparedRequest: unknown
+}) {
+  if (
+    !input.preparedRequest
+    || typeof input.preparedRequest !== 'object'
+    || Array.isArray(input.preparedRequest)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_SHOPIFY_FULFILLMENT_SIGNATURE_INVALID',
+      'Shopify fulfillment preparation returned an invalid durable signature',
+      409,
+    )
+  }
+  const serializedRequest = JSON.stringify(input.preparedRequest)
+  const requestHash = createHash('sha256')
+    .update(serializedRequest)
+    .digest('hex')
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:commerce-fulfillment-export:${input.organizationId}:${input.commerceExportGlobalId}`,
+    )
+    const guardedExport = await client.query(
+      `SELECT id
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+         AND state = 'processing'
+         AND attempts = $3
+       FOR UPDATE`,
+      [
+        input.organizationId,
+        input.commerceExportGlobalId,
+        input.exportAttempt,
+      ],
+    )
+    if (guardedExport.rowCount !== 1) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_EXPORT_CHANGED',
+        'Commerce fulfillment export changed before the provider attempt was registered',
+        409,
+      )
+    }
+    const existing = await client.query(
+      `SELECT global_id
+       FROM operations_commerce_provider_attempts
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND action = $3
+         AND external_object_id = $4
+       LIMIT 1`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        SHOPIFY_FULFILLMENT_PROVIDER_ATTEMPT_ACTION,
+        input.commerceExportGlobalId,
+      ],
+    )
+    if (existing.rowCount) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED',
+        'A durable Shopify provider attempt already exists; only read-only reconciliation is safe',
+        409,
+      )
+    }
+    const attempt = await client.query<{
+      id: string
+      global_id: string
+    }>(
+      `INSERT INTO operations_commerce_provider_attempts (
+         organization_id, integration_account_id, action, adapter_version,
+         external_object_id, idempotency_key, request_hash,
+         redacted_request, redacted_response, state, attempt_number,
+         lease_token, lease_expires_at, requested_at, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, $4,
+         $5, $6, $7, $8::jsonb, '{}'::jsonb, 'prepared', $9,
+         $10::uuid, now() + interval '5 minutes', now(), $11
+       )
+       RETURNING id::text, global_id`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        SHOPIFY_FULFILLMENT_PROVIDER_ATTEMPT_ACTION,
+        SHOPIFY_FULFILLMENT_PROVIDER_ATTEMPT_ADAPTER,
+        input.commerceExportGlobalId,
+        input.exportIdempotencyKey,
+        requestHash,
+        serializedRequest,
+        input.exportAttempt,
+        randomUUID(),
+        input.actorEmail,
+      ],
+    )
+    return {
+      id: attempt.rows[0].id,
+      globalId: attempt.rows[0].global_id,
+      requestHash,
+    }
+  })
+}
+
+async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  commerceExportGlobalId: string
+  reason: string
+  auditEventKey: string
+}): Promise<OperationsCommerceFulfillmentRetryResult> {
+  const claimed = await withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:commerce-fulfillment-export:${input.organizationId}:${input.commerceExportGlobalId}`,
+    )
+    const result = await client.query<CommerceFulfillmentExportExecutionRow>(
+      `SELECT fulfillment_export.global_id, fulfillment_export.provider,
+              fulfillment_export.state, fulfillment_export.external_order_id,
+              fulfillment_export.payload_snapshot,
+              fulfillment_export.idempotency_key,
+              fulfillment_export.attempts,
+              fulfillment_export.provider_reference,
+              fulfillment_export.error_code,
+              fulfillment_export.error_message,
+              fulfillment_export.updated_at,
+              integration.id::text AS integration_account_id,
+              integration.global_id AS account_global_id,
+              provider_attempt.id::text AS provider_attempt_id,
+              provider_attempt.global_id AS provider_attempt_global_id,
+              provider_attempt.state AS provider_attempt_state,
+              provider_attempt.attempt_number AS provider_attempt_number,
+              provider_attempt.redacted_request AS provider_attempt_request
+       FROM operations_commerce_fulfillment_exports fulfillment_export
+       JOIN operations_orders source_order
+         ON source_order.organization_id = fulfillment_export.organization_id
+        AND source_order.id = fulfillment_export.order_id
+       LEFT JOIN operations_integration_accounts integration
+         ON integration.organization_id = source_order.organization_id
+        AND integration.id = source_order.integration_account_id
+       LEFT JOIN LATERAL (
+         SELECT attempt.id, attempt.global_id, attempt.state,
+                attempt.attempt_number, attempt.redacted_request,
+                attempt.requested_at
+         FROM operations_commerce_provider_attempts attempt
+         WHERE attempt.organization_id = fulfillment_export.organization_id
+           AND attempt.integration_account_id = integration.id
+           AND attempt.action = 'shopify.fulfillment.create'
+           AND attempt.external_object_id = fulfillment_export.global_id
+         ORDER BY attempt.attempt_number DESC, attempt.requested_at DESC,
+                  attempt.id DESC
+         LIMIT 1
+       ) provider_attempt ON true
+       WHERE fulfillment_export.organization_id = $1::uuid
+         AND fulfillment_export.global_id = $2
+       LIMIT 1
+       FOR UPDATE OF fulfillment_export`,
+      [input.organizationId, input.commerceExportGlobalId],
+    )
+    const row = result.rows[0]
+    if (!row) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_EXPORT_NOT_FOUND',
+        'Commerce fulfillment export was not found',
+        404,
+      )
+    }
+    const decision = customerNotificationDecision(
+      json(row.payload_snapshot).customerNotification,
+    )
+    if (['succeeded', 'unsupported'].includes(row.state)) {
+      return { row, decision, terminal: true as const }
+    }
+    if (
+      row.state === 'processing'
+      && Date.now() - row.updated_at.getTime() < 5 * 60_000
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_EXPORT_IN_PROGRESS',
+        'This commerce fulfillment export is already being processed',
+        409,
+      )
+    }
+    const exportSnapshot = json(row.payload_snapshot)
+    const usesSafeShopifyAttemptProtocol = (
+      exportSnapshot.providerWriteProtocol
+      === 'shopify-fulfillment-attempt-v2'
+    )
+    let recoveryMode: 'execute' | 'reconcile_only' = 'execute'
+    if (row.provider === 'shopify') {
+      if (
+        row.provider_attempt_global_id
+        || (
+          row.state === 'processing'
+          && !usesSafeShopifyAttemptProtocol
+        )
+        || (
+          row.state === 'failed'
+          && (
+            row.error_code ===
+              'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
+            || !usesSafeShopifyAttemptProtocol
+          )
+        )
+      ) {
+        recoveryMode = 'reconcile_only'
+      }
+    } else if (
+      row.state === 'processing'
+      || (
+        row.state === 'failed'
+        && row.error_code ===
+          'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
+      )
+    ) {
+      recoveryMode = 'reconcile_only'
+    }
+    const updated = await client.query<CommerceFulfillmentExportExecutionRow>(
+      `UPDATE operations_commerce_fulfillment_exports
+       SET state = 'processing', attempts = attempts + 1,
+           provider_reference = NULL, error_code = NULL, error_message = NULL,
+           completed_at = NULL, updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+         AND attempts = $3
+         AND state = $4
+       RETURNING global_id, provider, state, external_order_id,
+                 payload_snapshot, idempotency_key, attempts,
+                 provider_reference, error_code, error_message, updated_at,
+                 NULL::text AS integration_account_id,
+                 NULL::text AS account_global_id,
+                 NULL::text AS provider_attempt_id,
+                 NULL::text AS provider_attempt_global_id,
+                 NULL::text AS provider_attempt_state,
+                 NULL::integer AS provider_attempt_number,
+                 NULL::jsonb AS provider_attempt_request`,
+      [
+        input.organizationId,
+        input.commerceExportGlobalId,
+        row.attempts,
+        row.state,
+      ],
+    )
+    if (updated.rowCount !== 1) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_EXPORT_CHANGED',
+        'Commerce fulfillment export changed before it could be retried',
+        409,
+      )
+    }
+    const claimedRow = {
+      ...updated.rows[0],
+      integration_account_id: row.integration_account_id,
+      account_global_id: row.account_global_id,
+      provider_attempt_id: row.provider_attempt_id,
+      provider_attempt_global_id: row.provider_attempt_global_id,
+      provider_attempt_state: row.provider_attempt_state,
+      provider_attempt_number: row.provider_attempt_number,
+      provider_attempt_request: row.provider_attempt_request,
+    }
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'operations.commerce_fulfillment.attempted',
+      aggregateType: 'operations.commerce_fulfillment_export',
+      aggregateId: row.global_id,
+      subject: `Commerce fulfillment export ${row.global_id}`,
+      organizationId: input.organizationId,
+      eventKey: input.auditEventKey,
+      payload: {
+        provider: row.provider,
+        attempt: claimedRow.attempts,
+        priorState: row.state,
+        recoveryMode,
+        reason: input.reason,
+        customerNotification: decision,
+      },
+    }, client)
+    return {
+      row: claimedRow,
+      decision,
+      recoveryMode,
+      terminal: false as const,
+    }
+  })
+
+  if (claimed.terminal) {
+    return {
+      commerceExportGlobalId: claimed.row.global_id,
+      state: claimed.row.state as OperationsCommerceFulfillmentRetryResult['state'],
+      providerReference: claimed.row.provider_reference,
+      errorCode: claimed.row.error_code,
+      errorMessage: claimed.row.error_message,
+      customerNotification: claimed.decision,
+      replayed: true,
+    }
+  }
+
+  const snapshot = json(claimed.row.payload_snapshot)
+  const trackingNumbers = Array.isArray(snapshot.trackingNumbers)
+    ? [...new Set(snapshot.trackingNumbers
+        .filter((value): value is string => typeof value === 'string')
+        .map((value) => value.trim())
+        .filter(Boolean))]
+    : typeof snapshot.trackingNumber === 'string'
+      ? [snapshot.trackingNumber.trim()].filter(Boolean)
+      : []
+  const carrier = typeof snapshot.carrier === 'string'
+    ? snapshot.carrier.trim()
+    : ''
+  const shippedAt = typeof snapshot.shippedAt === 'string'
+    ? snapshot.shippedAt
+    : ''
+  let state: OperationsCommerceFulfillmentRetryResult['state'] = 'failed'
+  let providerReference: string | null = null
+  let errorCode: string | null = null
+  let errorMessage: string | null = null
+  let registeredProviderAttempt: {
+    id: string
+    globalId: string
+    requestHash: string
+  } | null = null
+  try {
+    if (!carrier || trackingNumbers.length === 0) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_EXPORT_SNAPSHOT_INVALID',
+        'Commerce fulfillment export tracking evidence is incomplete',
+        409,
+      )
+    }
+    if (claimed.row.provider === 'mock-commerce') {
+      if (claimed.recoveryMode === 'reconcile_only') {
+        errorCode = 'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
+        errorMessage = (
+          'A stale fulfillment export was fenced. Repeated recovery remains '
+          + 'read-only until provider state is unambiguous.'
+        )
+      } else {
+        const commerceAdapter = new MockCommerceAdapter()
+        const result = await commerceAdapter.updateFulfillment({
+          externalOrderId: claimed.row.external_order_id,
+          trackingNumber: trackingNumbers[0],
+          carrier,
+          shippedAt,
+          idempotencyKey: claimed.row.idempotency_key,
+        })
+        state = result.accepted ? 'succeeded' : 'failed'
+        providerReference = result.providerReference || null
+        if (!result.accepted) {
+          errorCode = 'OPERATIONS_COMMERCE_EXPORT_REJECTED'
+          errorMessage = 'The commerce provider rejected the fulfillment export.'
+        }
+      }
+    } else if (claimed.row.provider === 'shopify') {
+      if (
+        !claimed.row.account_global_id
+        || !claimed.row.integration_account_id
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PROVIDER_ACCOUNT_REQUIRED',
+          'The Shopify fulfillment export is missing its integration account',
+          409,
+        )
+      }
+      if (!Array.isArray(snapshot.shippedLines)) {
+        throw new OperationsRequestError(
+          'OPERATIONS_SHOPIFY_FULFILLMENT_SIGNATURE_REQUIRED',
+          'The Shopify fulfillment export lacks exact packaged line evidence and requires manual review',
+          409,
+        )
+      }
+      const writebackInput = {
+        organizationId: input.organizationId,
+        accountGlobalId: claimed.row.account_global_id,
+        externalOrderId: claimed.row.external_order_id,
+        trackingNumbers,
+        carrier,
+        notifyCustomer: claimed.decision.notifyCustomer === true,
+        expectedLineItems: snapshot.shippedLines,
+      }
+      if (claimed.recoveryMode === 'reconcile_only') {
+        if (!claimed.row.provider_attempt_request) {
+          throw new OperationsRequestError(
+            'OPERATIONS_SHOPIFY_FULFILLMENT_SIGNATURE_REQUIRED',
+            'The prior Shopify attempt predates durable exact signatures and cannot be replayed safely',
+            409,
+          )
+        }
+        const observed = await reconcileShopifyFulfillmentWriteback(
+          {
+            ...writebackInput,
+            attemptSignature: claimed.row.provider_attempt_request,
+          },
+        )
+        if (observed) {
+          state = 'succeeded'
+          providerReference = observed.providerReference
+        } else {
+          errorCode = 'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
+          errorMessage = (
+            'The durable Shopify attempt has no exact matching fulfillment yet. '
+            + 'No provider write was made; later retries remain read-only.'
+          )
+        }
+      } else {
+        const prepared = await prepareShopifyFulfillmentWriteback(writebackInput)
+        if (prepared.existing) {
+          state = 'succeeded'
+          providerReference = prepared.existing.providerReference
+        } else {
+          registeredProviderAttempt =
+            await registerShopifyFulfillmentProviderAttempt({
+              organizationId: input.organizationId,
+              actorEmail: input.actorEmail,
+              commerceExportGlobalId: input.commerceExportGlobalId,
+              integrationAccountId: claimed.row.integration_account_id,
+              exportIdempotencyKey: claimed.row.idempotency_key,
+              exportAttempt: claimed.row.attempts,
+              preparedRequest: prepared.signature,
+            })
+          const result = await executeShopifyFulfillmentWriteback({
+            ...writebackInput,
+            attemptSignature: prepared.signature,
+          })
+          state = 'succeeded'
+          providerReference = result.providerReference
+        }
+      }
+    } else if (claimed.row.provider === 'faire') {
+      errorCode = 'OPERATIONS_FAIRE_FULFILLMENT_EXPORT_NOT_IMPLEMENTED'
+      errorMessage = (
+        'Faire shipment/tracking export is not implemented. Provider-managed '
+        + 'retailer notification does not replace the required shipment submission.'
+      )
+    } else {
+      state = 'unsupported'
+      errorCode = 'OPERATIONS_COMMERCE_PROVIDER_UNSUPPORTED'
+      errorMessage = (
+        `Fulfillment export adapter for ${claimed.row.provider} is not configured.`
+      )
+    }
+  } catch (error) {
+    state = 'failed'
+    const providerOutcomeUnknown = (
+      claimed.row.provider === 'shopify'
+      && (
+        claimed.recoveryMode === 'reconcile_only'
+        || (
+          error
+          && typeof error === 'object'
+          && (
+            ('outcomeUnknown' in error && error.outcomeUnknown === true)
+            || ('retryable' in error && error.retryable === true)
+          )
+        )
+      )
+    )
+    errorCode = providerOutcomeUnknown
+      ? 'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
+      : error && typeof error === 'object' && 'code' in error
+        ? String(error.code).slice(0, 128)
+        : 'OPERATIONS_COMMERCE_EXPORT_FAILED'
+    errorMessage = error instanceof Error
+      ? error.message.slice(0, 500)
+      : 'Commerce fulfillment export failed'
+  }
+
+  const providerAttemptToFinalize = registeredProviderAttempt
+  await withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:commerce-fulfillment-export:${input.organizationId}:${input.commerceExportGlobalId}`,
+    )
+    if (providerAttemptToFinalize) {
+      const providerAttemptState = state === 'succeeded'
+        ? 'succeeded'
+        : errorCode ===
+            'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
+          ? 'unknown'
+          : 'failed'
+      const finalizedProviderAttempt = await client.query(
+        `UPDATE operations_commerce_provider_attempts
+         SET state = $3, redacted_response = $4::jsonb,
+             provider_reference = $5, error_code = $6,
+             next_attempt_at = CASE WHEN $3 = 'unknown' THEN now() ELSE NULL END,
+             lease_token = NULL, lease_expires_at = NULL,
+             completed_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND state = 'prepared'`,
+        [
+          input.organizationId,
+          providerAttemptToFinalize.id,
+          providerAttemptState,
+          JSON.stringify({
+            commerceExportState: state,
+            providerReference,
+            errorCode,
+            errorMessage,
+          }),
+          providerReference,
+          errorCode,
+        ],
+      )
+      if (finalizedProviderAttempt.rowCount !== 1) {
+        throw new OperationsRequestError(
+          'OPERATIONS_COMMERCE_EXPORT_CHANGED',
+          'The durable Shopify provider attempt changed before finalization',
+          409,
+        )
+      }
+    }
+    const updated = await client.query(
+      `UPDATE operations_commerce_fulfillment_exports
+       SET state = $3, provider_reference = $4,
+           error_code = $5, error_message = $6,
+           completed_at = now(), updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+         AND state = 'processing'
+         AND attempts = $7`,
+      [
+        input.organizationId,
+        input.commerceExportGlobalId,
+        state,
+        providerReference,
+        errorCode,
+        errorMessage,
+        claimed.row.attempts,
+      ],
+    )
+    if (updated.rowCount !== 1) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_EXPORT_CHANGED',
+        'Commerce fulfillment export changed while the provider attempt was running',
+        409,
+      )
+    }
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: `operations.commerce_fulfillment.${state}`,
+      aggregateType: 'operations.commerce_fulfillment_export',
+      aggregateId: input.commerceExportGlobalId,
+      subject: `Commerce fulfillment export ${input.commerceExportGlobalId}`,
+      organizationId: input.organizationId,
+      eventKey: `${input.auditEventKey}:outcome`,
+      payload: {
+        provider: claimed.row.provider,
+        attempt: claimed.row.attempts,
+        recoveryMode: claimed.recoveryMode,
+        state,
+        providerReference,
+        errorCode,
+        errorMessage,
+        customerNotification: claimed.decision,
+        providerAttemptGlobalId:
+          providerAttemptToFinalize?.globalId
+          || claimed.row.provider_attempt_global_id,
+        providerAttemptRequestHash:
+          providerAttemptToFinalize?.requestHash
+          || null,
+      },
+    }, client)
+  })
+  return {
+    commerceExportGlobalId: input.commerceExportGlobalId,
+    state,
+    providerReference,
+    errorCode,
+    errorMessage,
+    customerNotification: claimed.decision,
+    replayed: false,
+  }
+}
+
+export async function retryOperationsCommerceFulfillmentExportFromPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  commerceExportGlobalId: string
+  reason: string
+  idempotencyKey: string
+}): Promise<OperationsCommerceFulfillmentRetryResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
+  const commerceExportGlobalId = String(input.commerceExportGlobalId || '').trim()
+  const reason = String(input.reason || '').trim()
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  if (!actorEmail) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ACTOR_REQUIRED',
+      'A signed-in user is required',
+      401,
+    )
+  }
+  if (!/^gfe(?:[0-9]{7}|[0-9a-v]{12})$/.test(commerceExportGlobalId)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_COMMERCE_EXPORT_INVALID',
+      'Commerce fulfillment export is invalid',
+    )
+  }
+  if (
+    reason.length < 10
+    || reason.length > 500
+    || /[\u0000-\u001f\u007f]/.test(reason)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_COMMERCE_EXPORT_RETRY_REASON_REQUIRED',
+      'A commerce fulfillment retry reason of 10-500 characters is required',
+    )
+  }
+  if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_IDEMPOTENCY_KEY_INVALID',
+      'A valid idempotency key is required',
+    )
+  }
+  const command = await prepareCommandReceipt({
+    organizationId,
+    commandType: 'retry_operations_commerce_fulfillment_export',
+    idempotencyKey,
+    requestHash: commandRequestHash({ commerceExportGlobalId, reason }),
+    actorEmail,
+  })
+  if (command.completed) {
+    const payload = command.receipt.result_payload
+    if (
+      payload
+      && payload.commerceExportGlobalId === commerceExportGlobalId
+      && ['succeeded', 'unsupported', 'failed']
+        .includes(String(payload.state))
+    ) {
+      return {
+        commerceExportGlobalId,
+        state: payload.state as OperationsCommerceFulfillmentRetryResult['state'],
+        providerReference: typeof payload.providerReference === 'string'
+          ? payload.providerReference
+          : null,
+        errorCode: typeof payload.errorCode === 'string' ? payload.errorCode : null,
+        errorMessage: typeof payload.errorMessage === 'string'
+          ? payload.errorMessage
+          : null,
+        customerNotification: customerNotificationDecision(
+          payload.customerNotification,
+        ),
+        replayed: true,
+      }
+    }
+    throw new OperationsRequestError(
+      'OPERATIONS_COMMAND_RECEIPT_INVALID',
+      'Completed fulfillment export retry result is unavailable',
+      409,
+    )
+  }
+  try {
+    const result = await executeOperationsCommerceFulfillmentExportFromPostgres({
+      organizationId,
+      actorEmail,
+      commerceExportGlobalId,
+      reason,
+      auditEventKey: `operations:commerce-fulfillment-retry:${command.receipt.id}`,
+    })
+    await withTransaction((client) => completeCommandReceipt(
+      client,
+      command.receipt.id,
+      commerceExportGlobalId,
+      result as unknown as Record<string, unknown>,
+    ))
+    return result
+  } catch (error) {
+    await failCommandReceipt(command.receipt.id, error)
+    throw error
+  }
+}
+
 export async function confirmOperationsOrderShipmentFromPostgres(input: {
   organizationId: string
   actorEmail: string
@@ -12289,6 +13109,9 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
   reason: string
   idempotencyKey: string
   sandboxE2eAuthorizationGlobalId?: string | null
+  expectedNotificationPolicyRevision?: number | null
+  customerNotificationOverride?: boolean | null
+  customerNotificationOverrideReason?: string | null
 }): Promise<OperationsShipmentCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
@@ -12299,13 +13122,67 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
   const sandboxE2eAuthorizationGlobalId = String(
     input.sandboxE2eAuthorizationGlobalId || '',
   ).trim() || null
+  const expectedNotificationPolicyRevision =
+    input.expectedNotificationPolicyRevision ?? null
+  if (
+    expectedNotificationPolicyRevision !== null
+    && (
+      !Number.isSafeInteger(expectedNotificationPolicyRevision)
+      || expectedNotificationPolicyRevision < 0
+    )
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_NOTIFICATION_POLICY_REVISION_INVALID',
+      'A valid fulfillment notification policy revision is required',
+    )
+  }
+  if (
+    input.customerNotificationOverride !== undefined
+    && input.customerNotificationOverride !== null
+    && typeof input.customerNotificationOverride !== 'boolean'
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_NOTIFICATION_OVERRIDE_INVALID',
+      'Customer notification override must be true or false',
+    )
+  }
+  const customerNotificationOverride =
+    typeof input.customerNotificationOverride === 'boolean'
+      ? input.customerNotificationOverride
+      : null
+  const customerNotificationOverrideReason = String(
+    input.customerNotificationOverrideReason || '',
+  ).trim() || null
+  if (
+    customerNotificationOverride !== null
+    && (
+      !customerNotificationOverrideReason
+      || customerNotificationOverrideReason.length < 10
+      || customerNotificationOverrideReason.length > 500
+      || /[\u0000-\u001f\u007f]/.test(customerNotificationOverrideReason)
+    )
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_NOTIFICATION_OVERRIDE_REASON_REQUIRED',
+      'A customer notification exception reason of 10-500 characters is required',
+    )
+  }
+  if (
+    customerNotificationOverride === null
+    && customerNotificationOverrideReason
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_NOTIFICATION_OVERRIDE_REASON_INVALID',
+      'A customer notification exception reason requires an explicit override',
+    )
+  }
   if (!actorEmail) {
     throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
   }
-  if (!/^gor\d{7}$/.test(orderGlobalId)) {
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
   }
-  if (preferredPrinterGlobalId && !/^gpr\d{7}$/.test(preferredPrinterGlobalId)) {
+  if (preferredPrinterGlobalId && !/^gpr(?:[0-9]{7}|[0-9a-v]{12})$/.test(preferredPrinterGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_PRINTER_INVALID', 'Preferred printer is invalid')
   }
   if (!Number.isSafeInteger(input.expectedRowVersion) || input.expectedRowVersion < 0) {
@@ -12325,7 +13202,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
   }
   if (
     sandboxE2eAuthorizationGlobalId
-    && !/^gsea\d{7}$/.test(sandboxE2eAuthorizationGlobalId)
+    && !/^gsea(?:[0-9]{7}|[0-9a-v]{12})$/.test(sandboxE2eAuthorizationGlobalId)
   ) {
     throw new OperationsRequestError(
       'OPERATIONS_SANDBOX_E2E_AUTHORIZATION_INVALID',
@@ -12343,6 +13220,9 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
       expectedRowVersion: input.expectedRowVersion,
       reason,
       sandboxE2eAuthorizationGlobalId,
+      expectedNotificationPolicyRevision,
+      customerNotificationOverride,
+      customerNotificationOverrideReason,
     }),
     actorEmail,
   })
@@ -12352,12 +13232,6 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
 
   type ShipmentCommitContext = {
     result: OperationsShipmentCommandResult
-    sourceProvider: string
-    commerceAccountGlobalId: string
-    externalOrderId: string
-    carrier: string
-    trackingNumbers: string[]
-    shippedAt: string
     warehouseId: string
     storageReference: string
     renderedPackingSlip: ReturnType<typeof renderPackingSlip>
@@ -12442,6 +13316,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           409,
         )
       }
+      let resolvedCustomerNotification: OperationsCustomerNotificationDecision
       if (sandboxE2eAuthorizationGlobalId) {
         await requireActiveSandboxCommerceE2eAuthorization(client, {
           organizationId,
@@ -12466,6 +13341,106 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
             order.integration_account_id,
           ].join(':'),
         )
+        await acquireTransactionAdvisoryLock(
+          client,
+          [
+            'commerce',
+            'shopify-fulfillment-notification-policy',
+            organizationId,
+            order.integration_account_id,
+          ].join(':'),
+        )
+        const policyResult = await client.query<{
+          notify_customer_default: boolean
+          revision: string | number
+        }>(
+          `SELECT notify_customer_default, revision::text
+           FROM operations_shopify_fulfillment_notification_policies
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+           FOR UPDATE`,
+          [organizationId, order.integration_account_id],
+        )
+        const policy = policyResult.rows[0] || null
+        const policyRevision = policy ? Number(policy.revision) : 0
+        const policyDefault = policy?.notify_customer_default === true
+        if (
+          expectedNotificationPolicyRevision === null
+          || expectedNotificationPolicyRevision !== policyRevision
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_NOTIFICATION_POLICY_REVISION_CONFLICT',
+            'The Shopify fulfillment notification policy changed. Refresh the order before confirming shipment.',
+            409,
+          )
+        }
+        if (sandboxE2eAuthorizationGlobalId) {
+          if (customerNotificationOverride === true) {
+            throw new OperationsRequestError(
+              'OPERATIONS_SANDBOX_NOTIFICATION_BLOCKED',
+              'Sandbox E2E shipments cannot notify Shopify customers',
+              409,
+            )
+          }
+          resolvedCustomerNotification = {
+            mode: 'clawpilot_explicit',
+            notifyCustomer: false,
+            source: 'sandbox_e2e_suppression',
+            accountPolicyRevision: policyRevision,
+            overrideReason: null,
+            decidedBy: actorEmail,
+          }
+        } else if (customerNotificationOverride !== null) {
+          if (customerNotificationOverride === policyDefault) {
+            throw new OperationsRequestError(
+              'OPERATIONS_NOTIFICATION_OVERRIDE_NOT_EXCEPTION',
+              'The requested customer notification value matches the Shopify account default',
+              409,
+            )
+          }
+          resolvedCustomerNotification = {
+            mode: 'clawpilot_explicit',
+            notifyCustomer: customerNotificationOverride,
+            source: 'order_override',
+            accountPolicyRevision: policyRevision,
+            overrideReason: customerNotificationOverrideReason,
+            decidedBy: actorEmail,
+          }
+        } else {
+          resolvedCustomerNotification = {
+            mode: 'clawpilot_explicit',
+            notifyCustomer: policyDefault,
+            source: 'account_default',
+            accountPolicyRevision: policyRevision,
+            overrideReason: null,
+            decidedBy: actorEmail,
+          }
+        }
+      } else if (order.source_provider === 'faire') {
+        if (customerNotificationOverride !== null) {
+          throw new OperationsRequestError(
+            'OPERATIONS_NOTIFICATION_PROVIDER_MANAGED',
+            'Faire manages retailer shipment notifications and does not accept a ClawPilot override',
+            409,
+          )
+        }
+        resolvedCustomerNotification = {
+          mode: 'provider_managed',
+          notifyCustomer: null,
+          source: 'provider_managed',
+          accountPolicyRevision: null,
+          overrideReason: null,
+          decidedBy: actorEmail,
+        }
+      } else {
+        resolvedCustomerNotification = {
+          mode: 'clawpilot_explicit',
+          notifyCustomer: false,
+          source: 'legacy_safe_default',
+          accountPolicyRevision: null,
+          overrideReason: null,
+          decidedBy: actorEmail,
+        }
       }
 
       const planResult = await client.query<QueryResultRow & {
@@ -12603,7 +13578,6 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           409,
         )
       }
-      const label = labelResult.rows[0]
       if (
         labelResult.rows.some((item) => item.environment === 'sandbox')
         && !sandboxE2eAuthorizationGlobalId
@@ -12894,12 +13868,14 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
 
       const packageContentResult = await client.query<{
         package_id: string
+        external_line_id: string
         product_global_id: string
         product_name: string
         channel_sku: string
         quantity: string
       }>(
-        `SELECT content.package_id::text, product.reference_code AS product_global_id,
+        `SELECT content.package_id::text, source_line.external_line_id,
+                product.reference_code AS product_global_id,
                 product.name AS product_name, source_line.channel_sku,
                 content.quantity::text
          FROM operations_package_contents content
@@ -13008,6 +13984,28 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
       const renderedPackingSlip = artifactContexts[0].renderedPackingSlip
       const storageReference = artifactContexts[0].storageReference
 
+      const shippedLineQuantities = new Map<string, number>()
+      for (const line of packageContentResult.rows) {
+        const quantity = numberValue(line.quantity)
+        if (
+          order.source_provider === 'shopify'
+          && (!Number.isSafeInteger(quantity) || quantity <= 0)
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_SHOPIFY_FULFILLMENT_LINE_INVALID',
+            'Shopify fulfillment requires positive whole-unit packaged quantities',
+            409,
+          )
+        }
+        shippedLineQuantities.set(
+          line.external_line_id,
+          (shippedLineQuantities.get(line.external_line_id) || 0) + quantity,
+        )
+      }
+      const shippedLines = [...shippedLineQuantities]
+        .map(([externalLineId, quantity]) => ({ externalLineId, quantity }))
+        .sort((left, right) => left.externalLineId.localeCompare(right.externalLineId))
+
       const exportSnapshot = {
         orderGlobalId: order.global_id,
         shipmentGlobalId: shipment.global_id,
@@ -13018,14 +14016,23 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         serviceCode: shipment.service_code,
         shippedAt,
         sandboxE2eAuthorizationGlobalId,
+        customerNotification: resolvedCustomerNotification,
+        ...(order.source_provider === 'shopify'
+          ? {
+              providerWriteProtocol: 'shopify-fulfillment-attempt-v2',
+              shippedLines,
+            }
+          : {}),
       }
+      const initialExportState = 'queued'
       const exportResult = await client.query<IdRow>(
         `INSERT INTO operations_commerce_fulfillment_exports (
            organization_id, order_id, shipment_id, provider,
-           external_order_id, state, payload_snapshot, idempotency_key
+           external_order_id, state, payload_snapshot, idempotency_key,
+           completed_at
          ) VALUES (
            $1::uuid, $2::uuid, $3::uuid, $4, $5,
-           'queued', $6::jsonb, $7
+           $6, $7::jsonb, $8, NULL
          )
          RETURNING id::text, global_id`,
         [
@@ -13034,6 +14041,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           shipment.id,
           order.source_provider,
           order.external_order_id,
+          initialExportState,
           JSON.stringify(exportSnapshot),
           `${shipment.global_id}:commerce-fulfillment`,
         ],
@@ -13125,6 +14133,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
             (item) => item.artifact.global_id,
           ),
           commerceExportGlobalId: fulfillmentExport.global_id,
+          customerNotification: resolvedCustomerNotification,
           providerCommitmentsRevalidated:
             providerCommitmentRevalidation.count,
           providerCommitmentInventorySyncRunGlobalIds:
@@ -13176,7 +14185,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         eventType: 'operations.commerce_fulfillment.queued',
         actorEmail,
         correlationId: command.receipt.correlation_id,
-        idempotencyKey: `${fulfillmentExport.global_id}:queued`,
+        idempotencyKey: `${fulfillmentExport.global_id}:${initialExportState}`,
         payload: exportSnapshot,
       })
       await recordAuditEvent({
@@ -13205,6 +14214,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
             (item) => item.artifact.global_id,
           ),
           commerceExportGlobalId: fulfillmentExport.global_id,
+          customerNotification: resolvedCustomerNotification,
           providerCommitmentsRevalidated:
             providerCommitmentRevalidation.count,
           providerCommitmentInventorySyncRunGlobalIds:
@@ -13227,6 +14237,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         packingSlipArtifactGlobalId: artifact.global_id,
         commerceExportGlobalId: fulfillmentExport.global_id,
         commerceExportState: 'failed',
+        customerNotification: resolvedCustomerNotification,
         replayed: false,
         printJobGlobalId: null,
         printWarning: 'Shipment committed; print and commerce post-processing are pending.',
@@ -13235,12 +14246,6 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
 
       return {
         result,
-        sourceProvider: order.source_provider,
-        commerceAccountGlobalId: order.integration_account_global_id,
-        externalOrderId: order.external_order_id,
-        carrier: label.carrier,
-        trackingNumbers: shipments.map((item) => item.tracking_number),
-        shippedAt,
         warehouseId: plan.warehouse_id,
         storageReference,
         renderedPackingSlip,
@@ -13289,83 +14294,20 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         : 'Packing slip is available, but automatic printing was not queued.'
     }
 
-    let commerceExportState: OperationsShipmentCommandResult['commerceExportState']
-    let providerReference: string | null = null
-    let exportErrorCode: string | null = null
-    let exportErrorMessage: string | null = null
-    if (context.sourceProvider === 'mock-commerce') {
-      try {
-        const commerceAdapter = new MockCommerceAdapter()
-        const exportResult = await commerceAdapter.updateFulfillment({
-          externalOrderId: context.externalOrderId,
-          trackingNumber: context.result.trackingNumber,
-          carrier: context.carrier,
-          shippedAt: context.shippedAt,
-          idempotencyKey: `${context.result.shipmentGlobalId}:commerce-fulfillment`,
-        })
-        commerceExportState = exportResult.accepted ? 'succeeded' : 'failed'
-        providerReference = exportResult.providerReference || null
-        if (!exportResult.accepted) {
-          exportErrorCode = 'OPERATIONS_COMMERCE_EXPORT_REJECTED'
-          exportErrorMessage = 'The commerce provider rejected the fulfillment export.'
-        }
-      } catch (error) {
-        commerceExportState = 'failed'
-        exportErrorCode = 'OPERATIONS_COMMERCE_EXPORT_FAILED'
-        exportErrorMessage = error instanceof Error
-          ? error.message.slice(0, 500)
-          : 'Commerce fulfillment export failed'
-      }
-    } else if (context.sourceProvider === 'shopify') {
-      try {
-        const exportResult = await executeShopifyFulfillmentWriteback({
-          organizationId,
-          accountGlobalId: context.commerceAccountGlobalId,
-          externalOrderId: context.externalOrderId,
-          trackingNumbers: context.trackingNumbers,
-          carrier: context.carrier,
-          notifyCustomer: false,
-        })
-        commerceExportState = 'succeeded'
-        providerReference = exportResult.providerReference
-      } catch (error) {
-        commerceExportState = 'failed'
-        exportErrorCode = error && typeof error === 'object' && 'code' in error
-          ? String(error.code).slice(0, 128)
-          : 'OPERATIONS_COMMERCE_EXPORT_FAILED'
-        exportErrorMessage = error instanceof Error
-          ? error.message.slice(0, 500)
-          : 'Shopify fulfillment export failed'
-      }
-    } else {
-      commerceExportState = 'unsupported'
-      exportErrorCode = 'OPERATIONS_COMMERCE_PROVIDER_UNSUPPORTED'
-      exportErrorMessage = (
-        `Fulfillment export adapter for ${context.sourceProvider} is not configured.`
-      )
-    }
-
-    await query(
-      `UPDATE operations_commerce_fulfillment_exports
-       SET state = $3, attempts = attempts + 1,
-           provider_reference = $4, error_code = $5, error_message = $6,
-           completed_at = now(), updated_at = now()
-       WHERE organization_id = $1::uuid
-         AND global_id = $2
-         AND state IN ('queued', 'processing')`,
-      [
+    const commerceExport =
+      await executeOperationsCommerceFulfillmentExportFromPostgres({
         organizationId,
-        context.result.commerceExportGlobalId,
-        commerceExportState,
-        providerReference,
-        exportErrorCode,
-        exportErrorMessage,
-      ],
-    )
+        actorEmail,
+        commerceExportGlobalId: context.result.commerceExportGlobalId,
+        reason: 'Automatic post-shipment fulfillment export',
+        auditEventKey:
+          `operations:commerce-fulfillment:${context.result.commerceExportGlobalId}:initial`,
+      })
 
     const result: OperationsShipmentCommandResult = {
       ...context.result,
-      commerceExportState,
+      commerceExportState: commerceExport.state,
+      customerNotification: commerceExport.customerNotification,
       printJobGlobalId,
       printWarning,
     }

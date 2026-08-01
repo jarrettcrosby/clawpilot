@@ -2430,7 +2430,7 @@ export default function CrmSection() {
                 />
               </>
             ) : null}
-            {editorRecord && /^gp\d{7}$/.test(
+            {editorRecord && /^gp(?:[0-9]{7}|[0-9a-v]{12})$/.test(
               textValue(editorRecord, 'referenceCode'),
             ) ? (
               <>

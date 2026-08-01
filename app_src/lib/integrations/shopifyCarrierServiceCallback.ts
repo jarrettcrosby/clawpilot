@@ -75,7 +75,7 @@ import {
   type ShopifyShadowTestChargePolicy,
 } from '@/lib/integrations/shopifyShadowTestCharge'
 
-const ACCOUNT_GLOBAL_ID = /^gia[0-9]{7}$/
+const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
 const CALLBACK_TOKEN = /^[A-Za-z0-9_-]{43}$/
 const CALLBACK_CARRIER_DEADLINE_MS = 6_500
 const CALLBACK_SUCCESS_PERSISTENCE_DEADLINE_MS = 8_250

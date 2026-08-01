@@ -23,8 +23,8 @@ type ActiveCarrierDispatchAttemptState =
 
 const UUID =
   /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u
-const SELECTION_GLOBAL_ID = /^gars[0-9]{7}$/u
-const ATTEMPT_GLOBAL_ID = /^gaca[0-9]{7}$/u
+const SELECTION_GLOBAL_ID = /^gars(?:[0-9]{7}|[0-9a-v]{12})$/u
+const ATTEMPT_GLOBAL_ID = /^gaca(?:[0-9]{7}|[0-9a-v]{12})$/u
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u
 const ERROR_CODE = /^[A-Z0-9_]+$/u
 const PROVIDER_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/u

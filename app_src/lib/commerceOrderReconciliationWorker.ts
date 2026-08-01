@@ -295,7 +295,7 @@ export async function processCommerceOrderReconciliation(input: {
         const stagedRunGlobalId = typeof pagination.runGlobalId === 'string'
           ? pagination.runGlobalId
           : ''
-        if (!/^gcir[0-9]{7}$/u.test(stagedRunGlobalId)) {
+        if (!/^gcir(?:[0-9]{7}|[0-9a-v]{12})$/u.test(stagedRunGlobalId)) {
           throw reconciliationError(
             'COMMERCE_ORDER_RECONCILIATION_PAGE_SEQUENCE_INVALID',
             'Order reconciliation staged page identity is invalid',

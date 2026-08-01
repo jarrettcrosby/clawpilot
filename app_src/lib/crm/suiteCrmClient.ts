@@ -248,7 +248,7 @@ export async function findSuiteCrmUser(input: {
 }, fetchImpl: typeof fetch = fetch): Promise<SuiteCrmUserMatch | null> {
   const email = String(input.email || '').trim().toLowerCase()
   const globalId = String(input.globalId || '').trim().toLowerCase()
-  if (globalId && !/^gu[0-9]{7}$/.test(globalId)) throw new Error('SuiteCRM user Global ID is invalid')
+  if (globalId && !/^gu(?:[0-9]{7}|[0-9a-v]{12})$/.test(globalId)) throw new Error('SuiteCRM user Global ID is invalid')
   if (!globalId && (!email || email.length > 254)) throw new Error('SuiteCRM user email is invalid')
   const field = globalId ? 'global_id_c' : 'email1'
   const value = globalId || email
@@ -459,7 +459,7 @@ export async function upsertSuiteCrmUserIdentity(
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(suiteCrmUserId)) {
     throw new Error('SuiteCRM user identity has an invalid record ID')
   }
-  if (!/^gu[0-9]{7}$/.test(referenceCode)) {
+  if (!/^gu(?:[0-9]{7}|[0-9a-v]{12})$/.test(referenceCode)) {
     throw new Error('SuiteCRM user identity has an invalid Global ID')
   }
   if (username !== referenceCode) {

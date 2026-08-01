@@ -209,7 +209,7 @@ async function writeCursor(document: CursorDocument): Promise<void> {
 
 export function suiteCrmCallGlobalId(snapshot: SuiteCrmCallSnapshot): string | null {
   const value = String(snapshot.attributes.global_id_c ?? '').trim().toLowerCase()
-  return /^gi[0-9]{7}$/.test(value) ? value : null
+  return /^gi(?:[0-9]{7}|[0-9a-v]{12})$/.test(value) ? value : null
 }
 
 export function parseSuiteCrmCallParent(

@@ -40,13 +40,13 @@ export const revalidate = 0
 export const runtime = 'nodejs'
 
 const MAX_REQUEST_BYTES = 32 * 1024
-const PRODUCT_GLOBAL_ID = /^gp\d{7}$/
-const PROFILE_GLOBAL_ID = /^gpph\d{7}$/
-const VERSION_GLOBAL_ID = /^gppv\d{7}$/
-const CHANNEL_STATE_GLOBAL_ID = /^gpcs\d{7}$/
-const MAPPING_GLOBAL_ID = /^gcvm\d{7}$/
-const RECIPE_GLOBAL_ID = /^gpre\d{7}$/
-const MATERIAL_GLOBAL_ID = /^gmat\d{7}$/
+const PRODUCT_GLOBAL_ID = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/
+const PROFILE_GLOBAL_ID = /^gpph(?:[0-9]{7}|[0-9a-v]{12})$/
+const VERSION_GLOBAL_ID = /^gppv(?:[0-9]{7}|[0-9a-v]{12})$/
+const CHANNEL_STATE_GLOBAL_ID = /^gpcs(?:[0-9]{7}|[0-9a-v]{12})$/
+const MAPPING_GLOBAL_ID = /^gcvm(?:[0-9]{7}|[0-9a-v]{12})$/
+const RECIPE_GLOBAL_ID = /^gpre(?:[0-9]{7}|[0-9a-v]{12})$/
+const MATERIAL_GLOBAL_ID = /^gmat(?:[0-9]{7}|[0-9a-v]{12})$/
 const PROFILE_FIELDS = new Set([
   'action',
   'productGlobalId',

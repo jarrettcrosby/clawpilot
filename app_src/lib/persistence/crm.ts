@@ -818,7 +818,7 @@ async function applyWorkspaceOrganizationIdentity(
   referenceCode: string | null | undefined,
 ) {
   if (!referenceCode) return row
-  if (!/^ga[0-9]{7}$/.test(referenceCode)) throw new Error('Workspace organization reference is invalid')
+  if (!/^ga(?:[0-9]{7}|[0-9a-v]{12})$/.test(referenceCode)) throw new Error('Workspace organization reference is invalid')
   const result = await client.query<{ id: string; suitecrm_id: string; reference_code: string }>(
     `UPDATE crm_organizations
      SET reference_code = $2, updated_at = now()
@@ -836,7 +836,7 @@ async function applyAppUserContactIdentity(
   referenceCode: string | null | undefined,
 ) {
   if (!email && !referenceCode) return row
-  if (!email || !referenceCode || !/^gc[0-9]{7}$/.test(referenceCode)) {
+  if (!email || !referenceCode || !/^gc(?:[0-9]{7}|[0-9a-v]{12})$/.test(referenceCode)) {
     throw new Error('App user contact identity is invalid')
   }
   const result = await client.query<{ id: string; suitecrm_id: string; reference_code: string }>(
@@ -1639,7 +1639,7 @@ async function currentCrmContactOwner(
   const referenceCode = clean(row?.owner_user_reference_code).toLowerCase()
   const email = clean(row?.owner_email).toLowerCase()
   const displayName = clean(row?.owner_display_name)
-  if (!/^gu[0-9]{7}$/.test(referenceCode) || !email || !displayName) return null
+  if (!/^gu(?:[0-9]{7}|[0-9a-v]{12})$/.test(referenceCode) || !email || !displayName) return null
   return {
     referenceCode,
     email,
@@ -1717,7 +1717,7 @@ async function normalizeStageContactOwner(
         },
       }
     }
-    if (!/^gu[0-9]{7}$/.test(requestedReference)) throw new Error('Contact owner identity is invalid')
+    if (!/^gu(?:[0-9]{7}|[0-9a-v]{12})$/.test(requestedReference)) throw new Error('Contact owner identity is invalid')
     const [owner] = await activeCrmContactOwners(client, {
       pipelineId: input.pipelineId,
       referenceCode: requestedReference,
@@ -4870,7 +4870,7 @@ export function crmEntityForReferenceCode(referenceValue: unknown): CrmEntity | 
 
 export async function resolveCrmReferenceCode(referenceValue: unknown): Promise<string> {
   const referenceCode = clean(referenceValue).toLowerCase()
-  if (!/^g[aciklmop][0-9]{7}$/.test(referenceCode)) throw new Error('CRM reference is invalid')
+  if (!/^g[aciklmop](?:[0-9]{7}|[0-9a-v]{12})$/.test(referenceCode)) throw new Error('CRM reference is invalid')
   if (!isPostgresStorageEnabled()) return referenceCode
   try {
     const result = await query<{ canonical_code: string }>(
@@ -4954,7 +4954,7 @@ export async function readCrmRecordByReference(input: {
 }) {
   const referenceCode = await resolveCrmReferenceCode(input.referenceCode)
   const entity = crmEntityForReferenceCode(referenceCode)
-  if (!entity || !/^g[aciklmop][0-9]{7}$/.test(referenceCode)) throw new Error('CRM reference is invalid')
+  if (!entity || !/^g[aciklmop](?:[0-9]{7}|[0-9a-v]{12})$/.test(referenceCode)) throw new Error('CRM reference is invalid')
   const table = ENTITY_TABLE[entity]
   const result = await query<{ id: string }>(
     `SELECT id::text FROM ${table} record

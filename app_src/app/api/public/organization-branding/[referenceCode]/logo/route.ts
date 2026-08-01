@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { globalIdPattern } from '@/lib/globalIds.mjs'
 import { query } from '@/lib/persistence/postgres'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-const REFERENCE_PATTERN = /^ga[0-9]{7}$/
+const REFERENCE_PATTERN = globalIdPattern('ga')
 
 export async function GET(
   req: NextRequest,

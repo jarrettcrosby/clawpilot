@@ -77,10 +77,38 @@ export type OperationsShipmentCommandResult = {
   trackingNumber: string
   packingSlipArtifactGlobalId: string
   commerceExportGlobalId: string
-  commerceExportState: 'succeeded' | 'unsupported' | 'failed'
+  commerceExportState:
+    | 'succeeded'
+    | 'unsupported'
+    | 'failed'
+  customerNotification: OperationsCustomerNotificationDecision
   replayed: boolean
   printJobGlobalId: string | null
   printWarning: string | null
+}
+
+export type OperationsCustomerNotificationDecision = {
+  mode: 'clawpilot_explicit' | 'provider_managed'
+  notifyCustomer: boolean | null
+  source:
+    | 'account_default'
+    | 'order_override'
+    | 'sandbox_e2e_suppression'
+    | 'legacy_safe_default'
+    | 'provider_managed'
+  accountPolicyRevision: number | null
+  overrideReason: string | null
+  decidedBy: string | null
+}
+
+export type OperationsCommerceFulfillmentRetryResult = {
+  commerceExportGlobalId: string
+  state: 'succeeded' | 'unsupported' | 'failed'
+  providerReference: string | null
+  errorCode: string | null
+  errorMessage: string | null
+  customerNotification: OperationsCustomerNotificationDecision
+  replayed: boolean
 }
 
 export type OperationsPackingSlipCommandResult = {
@@ -681,6 +709,22 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     expiresAt: string
   } | null
   fulfillmentPreparation: OperationsShadowFulfillmentPreparation | null
+  fulfillmentNotificationPolicy:
+    | {
+      mode: 'clawpilot_explicit'
+      notifyCustomerDefault: boolean
+      revision: number
+    }
+    | {
+      mode: 'provider_managed'
+      notifyCustomerDefault: null
+      revision: 0
+    }
+    | {
+      mode: 'unavailable'
+      notifyCustomerDefault: null
+      revision: 0
+    }
   shipTo: Address
   lines: Array<{
     globalId: string
@@ -783,12 +827,19 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     globalId: string
     shipmentGlobalId: string
     provider: string
-    state: 'queued' | 'processing' | 'succeeded' | 'failed' | 'unsupported'
+    state:
+      | 'queued'
+      | 'processing'
+      | 'succeeded'
+      | 'failed'
+      | 'unsupported'
+    attempts: number
     providerReference: string | null
     errorCode: string | null
     errorMessage: string | null
     requestedAt: string
     completedAt: string | null
+    customerNotification: OperationsCustomerNotificationDecision
   }>
   events: Array<{
     globalId: string

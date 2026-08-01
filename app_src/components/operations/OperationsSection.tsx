@@ -57,6 +57,7 @@ import type {
   OperationsActivationUpdateResult,
   OperationsCommerceActivePreparationResult,
   OperationsCommerceActiveTransitionResult,
+  OperationsCommerceFulfillmentRetryResult,
   OperationsExceptionListItem,
   OperationsExceptionStatus,
   OperationsExceptionUpdateResult,
@@ -114,6 +115,7 @@ type OperationsPayload = {
     | SandboxCommerceE2eAuthorizationResult
     | OperationsShadowFulfillmentExecutionResult
     | OperationsShipmentCommandResult
+    | OperationsCommerceFulfillmentRetryResult
 }
 
 export type OperationsView =
@@ -160,7 +162,7 @@ const ACTIVATION_OPTIONS: Array<{ value: OperationsActivationState; label: strin
   { value: 'frozen', label: 'Frozen' },
 ]
 
-const CARTONIZATION_EVIDENCE_GLOBAL_ID = /^gcte\d{7}$/
+const CARTONIZATION_EVIDENCE_GLOBAL_ID = /^gcte(?:[0-9]{7}|[0-9a-v]{12})$/
 
 type CommerceActiveAccountOption = {
   accountGlobalId: string
@@ -749,6 +751,7 @@ function OrderDetailDrawer({
   onGeneratePackingSlip,
   onPrintPackingSlip,
   onConfirmShipment,
+  onRetryCommerceExport,
   onAuthorizeSandboxE2e,
   onCreateSandboxLabel,
   onVoidSandboxLabel,
@@ -771,6 +774,7 @@ function OrderDetailDrawer({
   onGeneratePackingSlip: (packageGlobalId: string) => void
   onPrintPackingSlip: (artifactGlobalId: string) => void
   onConfirmShipment: () => void
+  onRetryCommerceExport: (commerceExportGlobalId: string) => void
   onAuthorizeSandboxE2e: () => void
   onCreateSandboxLabel: (packageGlobalId?: string) => void
   onVoidSandboxLabel: () => void
@@ -1659,6 +1663,14 @@ function OrderDetailDrawer({
                                     ? ` · ${fulfillmentExport.providerReference}`
                                     : ''}
                                 </Typography>
+                                <Typography variant="caption" color="text.secondary" display="block">
+                                  {fulfillmentExport.customerNotification.mode === 'provider_managed'
+                                    ? 'Retailer notification is provider-managed.'
+                                    : fulfillmentExport.customerNotification.notifyCustomer
+                                      ? `Customer email enabled · ${displayStatus(fulfillmentExport.customerNotification.source)}`
+                                      : `Customer email disabled · ${displayStatus(fulfillmentExport.customerNotification.source)}`}
+                                  {' '}· {fulfillmentExport.attempts} provider attempt{fulfillmentExport.attempts === 1 ? '' : 's'}
+                                </Typography>
                                 {(fulfillmentExport.errorCode || fulfillmentExport.errorMessage) && (
                                   <Typography variant="caption" color="error.main" display="block">
                                     {[fulfillmentExport.errorCode, fulfillmentExport.errorMessage]
@@ -1667,17 +1679,34 @@ function OrderDetailDrawer({
                                   </Typography>
                                 )}
                               </Box>
-                              <Chip
-                                size="small"
-                                label={displayStatus(fulfillmentExport.state)}
-                                color={fulfillmentExport.state === 'succeeded'
-                                  ? 'success'
-                                  : fulfillmentExport.state === 'failed'
-                                    ? 'error'
-                                    : fulfillmentExport.state === 'unsupported'
-                                      ? 'default'
-                                      : 'warning'}
-                              />
+                              <Stack spacing={0.75} alignItems="flex-end">
+                                <Chip
+                                  size="small"
+                                  label={displayStatus(fulfillmentExport.state)}
+                                  color={fulfillmentExport.state === 'succeeded'
+                                    ? 'success'
+                                    : fulfillmentExport.state === 'failed'
+                                      ? 'error'
+                                      : fulfillmentExport.state === 'unsupported'
+                                        ? 'default'
+                                        : 'warning'}
+                                />
+                                {['queued', 'processing', 'failed'].includes(
+                                  fulfillmentExport.state,
+                                ) ? (
+                                  <Button
+                                    size="small"
+                                    variant="outlined"
+                                    startIcon={<ReplayRounded />}
+                                    disabled={busy || !canExecute}
+                                    onClick={() => onRetryCommerceExport(
+                                      fulfillmentExport.globalId,
+                                    )}
+                                  >
+                                    Retry / reconcile
+                                  </Button>
+                                ) : null}
+                              </Stack>
                             </Box>
                           ))}
                         </Stack>
@@ -1940,6 +1969,18 @@ export default function OperationsSection({
   )
   const [confirmShipmentIdempotencyKey, setConfirmShipmentIdempotencyKey] = useState('')
   const [confirmingShipment, setConfirmingShipment] = useState(false)
+  const [customerNotificationOverride, setCustomerNotificationOverride] =
+    useState<boolean | null>(null)
+  const [customerNotificationOverrideReason, setCustomerNotificationOverrideReason] =
+    useState('')
+  const [commerceExportRetryOpen, setCommerceExportRetryOpen] = useState(false)
+  const [commerceExportRetryGlobalId, setCommerceExportRetryGlobalId] = useState('')
+  const [commerceExportRetryReason, setCommerceExportRetryReason] = useState(
+    'Retry the same immutable commerce fulfillment export after operator review',
+  )
+  const [commerceExportRetryIdempotencyKey, setCommerceExportRetryIdempotencyKey] =
+    useState('')
+  const [retryingCommerceExport, setRetryingCommerceExport] = useState(false)
   const [sandboxE2eAuthorizationOpen, setSandboxE2eAuthorizationOpen] = useState(false)
   const [sandboxE2eAuthorizationConfirmed, setSandboxE2eAuthorizationConfirmed] = useState(false)
   const [sandboxE2eAuthorizationReason, setSandboxE2eAuthorizationReason] = useState(
@@ -2461,6 +2502,8 @@ export default function OperationsSection({
 
   const openConfirmShipment = () => {
     setConfirmShipmentReason('Confirm the packed order and create shipment evidence')
+    setCustomerNotificationOverride(null)
+    setCustomerNotificationOverrideReason('')
     setConfirmShipmentIdempotencyKey(
       `operations-shipment:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
     )
@@ -2471,6 +2514,8 @@ export default function OperationsSection({
     if (confirmingShipment) return
     setConfirmShipmentOpen(false)
     setConfirmShipmentIdempotencyKey('')
+    setCustomerNotificationOverride(null)
+    setCustomerNotificationOverrideReason('')
   }
 
   const confirmShipment = async (event: FormEvent) => {
@@ -2493,6 +2538,18 @@ export default function OperationsSection({
           reason: confirmShipmentReason.trim(),
           sandboxE2eAuthorizationGlobalId:
             detail.sandboxCommerceE2eAuthorization?.authorizationGlobalId,
+          expectedNotificationPolicyRevision:
+            detail.fulfillmentNotificationPolicy.mode === 'clawpilot_explicit'
+              ? detail.fulfillmentNotificationPolicy.revision
+              : undefined,
+          customerNotificationOverride:
+            customerNotificationOverride === null
+              ? undefined
+              : customerNotificationOverride,
+          customerNotificationOverrideReason:
+            customerNotificationOverride === null
+              ? undefined
+              : customerNotificationOverrideReason.trim(),
         }),
       })
       const payload = await response.json() as OperationsPayload
@@ -2521,6 +2578,76 @@ export default function OperationsSection({
       setError(caught instanceof Error ? caught.message : 'Shipment could not be confirmed')
     } finally {
       setConfirmingShipment(false)
+    }
+  }
+
+  const openCommerceExportRetry = (commerceExportGlobalId: string) => {
+    setCommerceExportRetryGlobalId(commerceExportGlobalId)
+    setCommerceExportRetryReason(
+      'Retry the same immutable commerce fulfillment export after operator review',
+    )
+    setCommerceExportRetryIdempotencyKey(
+      `operations-commerce-export-retry:${commerceExportGlobalId}:${crypto.randomUUID()}`,
+    )
+    setCommerceExportRetryOpen(true)
+  }
+
+  const closeCommerceExportRetry = () => {
+    if (retryingCommerceExport) return
+    setCommerceExportRetryOpen(false)
+    setCommerceExportRetryGlobalId('')
+    setCommerceExportRetryIdempotencyKey('')
+  }
+
+  const retryCommerceExport = async (event: FormEvent) => {
+    event.preventDefault()
+    if (
+      !detail
+      || !commerceExportRetryGlobalId
+      || commerceExportRetryReason.trim().length < 10
+      || !commerceExportRetryIdempotencyKey
+    ) return
+    setRetryingCommerceExport(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': commerceExportRetryIdempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'retry-commerce-fulfillment-export',
+          commerceExportGlobalId: commerceExportRetryGlobalId,
+          reason: commerceExportRetryReason.trim(),
+        }),
+      })
+      const payload = await response.json() as OperationsPayload
+      if (
+        !response.ok
+        || !payload.result
+        || !('commerceExportGlobalId' in payload.result)
+        || !('state' in payload.result)
+      ) {
+        throw new Error(payload.error || 'Commerce fulfillment export could not be retried')
+      }
+      const result = payload.result as OperationsCommerceFulfillmentRetryResult
+      setCommerceExportRetryOpen(false)
+      setCommerceExportRetryGlobalId('')
+      setCommerceExportRetryIdempotencyKey('')
+      setNotice(
+        `Commerce fulfillment export ${result.commerceExportGlobalId} finished with ${
+          displayStatus(result.state)
+        }. The original immutable notification decision was preserved.`,
+      )
+      await loadWorkspace(detail.globalId)
+    } catch (caught) {
+      setError(caught instanceof Error
+        ? caught.message
+        : 'Commerce fulfillment export could not be retried')
+    } finally {
+      setRetryingCommerceExport(false)
     }
   }
 
@@ -3411,6 +3538,7 @@ export default function OperationsSection({
           || verifyingPack
           || preparingFulfillment
           || confirmingShipment
+          || retryingCommerceExport
           || authorizingSandboxE2e
           || creatingLabel
           || voidingLabel
@@ -3430,6 +3558,7 @@ export default function OperationsSection({
           void printPackingSlip(artifactGlobalId)
         }}
         onConfirmShipment={openConfirmShipment}
+        onRetryCommerceExport={openCommerceExportRetry}
         onAuthorizeSandboxE2e={openSandboxE2eAuthorization}
         onCreateSandboxLabel={openCreateLabel}
         onVoidSandboxLabel={openVoidLabel}
@@ -3801,15 +3930,15 @@ export default function OperationsSection({
                   && !planEvidenceValid
                 )}
                 inputProps={{
-                  maxLength: 11,
-                  pattern: 'gcte[0-9]{7}',
+                  maxLength: 16,
+                  pattern: 'gcte(?:[0-9]{7}|[0-9a-v]{12})',
                   autoCapitalize: 'none',
                   autoCorrect: 'off',
                   spellCheck: false,
                 }}
                 helperText={planEvidenceValid
                   ? 'Valid immutable cartonization evidence reference'
-                  : 'Enter a Global ID in the form gcte0000001'}
+                  : 'Enter gcte0000001 or a compact 12-character suffix'}
               />
               <TextField
                 required
@@ -4108,9 +4237,71 @@ export default function OperationsSection({
                   {detail.sandboxCommerceE2eAuthorization.authorizationGlobalId}.
                   Confirming will consume that one-time authorization and send
                   every package&apos;s sandbox tracking number to Shopify even though
-                  those labels will not track with the carrier.
+                  those labels will not track with the carrier. Shopify customer
+                  notification is forcibly disabled for this test and cannot be overridden.
                 </Alert>
               )}
+              {detail?.fulfillmentNotificationPolicy.mode === 'provider_managed' ? (
+                <Alert severity="info">
+                  Faire manages retailer notifications after shipment and tracking are submitted.
+                  ClawPilot will attempt the separate fulfillment export, but does not expose a
+                  retailer-notification override.
+                </Alert>
+              ) : detail?.fulfillmentNotificationPolicy.mode === 'unavailable' ? (
+                <Alert severity="info">
+                  This commerce provider does not expose a ClawPilot customer-notification
+                  policy. Shipment confirmation remains fail-closed and will not request a
+                  customer notification.
+                </Alert>
+              ) : detail?.sandboxCommerceE2eAuthorization ? null : detail ? (
+                <>
+                  <TextField
+                    select
+                    label="Shopify customer notification"
+                    value={customerNotificationOverride === null ? 'default' : 'override'}
+                    onChange={(event) => {
+                      if (event.target.value === 'default') {
+                        setCustomerNotificationOverride(null)
+                        setCustomerNotificationOverrideReason('')
+                      } else {
+                        setCustomerNotificationOverride(
+                          !detail.fulfillmentNotificationPolicy.notifyCustomerDefault,
+                        )
+                        setCustomerNotificationOverrideReason('')
+                      }
+                    }}
+                  >
+                    <MenuItem value="default">
+                      Use account default — {detail.fulfillmentNotificationPolicy.notifyCustomerDefault
+                        ? 'email customer'
+                        : 'do not email customer'}
+                    </MenuItem>
+                    <MenuItem value="override">
+                      Per-order exception — {detail.fulfillmentNotificationPolicy.notifyCustomerDefault
+                        ? 'do not email customer'
+                        : 'email customer'}
+                    </MenuItem>
+                  </TextField>
+                  {customerNotificationOverride !== null ? (
+                    <TextField
+                      required
+                      multiline
+                      minRows={2}
+                      label="Customer notification exception reason"
+                      value={customerNotificationOverrideReason}
+                      onChange={(event) => (
+                        setCustomerNotificationOverrideReason(event.target.value)
+                      )}
+                      inputProps={{ maxLength: 500 }}
+                      helperText={`${customerNotificationOverrideReason.trim().length}/500 · Audited with this order only`}
+                    />
+                  ) : null}
+                  <Typography variant="caption" color="text.secondary">
+                    Account policy revision {detail.fulfillmentNotificationPolicy.revision} is
+                    rechecked transactionally and frozen into the immutable export.
+                  </Typography>
+                </>
+              ) : null}
               <Alert severity="info">
                 Packing-slip printing uses the active configured printer route and its approved
                 fallback automatically. A print warning will be recorded without rolling back a
@@ -4134,10 +4325,69 @@ export default function OperationsSection({
             <Button
               type="submit"
               variant="contained"
-              disabled={confirmingShipment || !confirmShipmentReason.trim()}
+              disabled={
+                confirmingShipment
+                || !confirmShipmentReason.trim()
+                || (
+                  customerNotificationOverride !== null
+                  && customerNotificationOverrideReason.trim().length < 10
+                )
+              }
               startIcon={confirmingShipment ? <CircularProgress size={16} /> : <LocalShippingRounded />}
             >
               {confirmingShipment ? 'Confirming shipment' : 'Confirm shipment'}
+            </Button>
+          </DialogActions>
+        </Box>
+      </Dialog>
+
+      <Dialog
+        open={commerceExportRetryOpen}
+        onClose={closeCommerceExportRetry}
+        fullWidth
+        maxWidth="sm"
+      >
+        <Box component="form" onSubmit={retryCommerceExport}>
+          <DialogTitle>Retry commerce fulfillment export</DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <Alert severity="warning">
+                This retries export {commerceExportRetryGlobalId || 'evidence'} in place. It does
+                not create another shipment or export, and it reuses the immutable customer
+                notification decision captured at shipment confirmation. A recent processing
+                attempt must age out before it can be reclaimed safely. Once a durable Shopify
+                provider attempt exists, every retry is read-only and cannot send a second
+                fulfillment or customer notification.
+              </Alert>
+              <TextField
+                required
+                autoFocus
+                multiline
+                minRows={3}
+                label="Retry reason"
+                value={commerceExportRetryReason}
+                onChange={(event) => setCommerceExportRetryReason(event.target.value)}
+                inputProps={{ maxLength: 500 }}
+                helperText={`${commerceExportRetryReason.trim().length}/500 · Recorded in audit history`}
+              />
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={closeCommerceExportRetry} disabled={retryingCommerceExport}>
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              variant="contained"
+              disabled={
+                retryingCommerceExport
+                || commerceExportRetryReason.trim().length < 10
+              }
+              startIcon={retryingCommerceExport
+                ? <CircularProgress size={16} />
+                : <ReplayRounded />}
+            >
+              {retryingCommerceExport ? 'Checking export' : 'Retry / reconcile export'}
             </Button>
           </DialogActions>
         </Box>

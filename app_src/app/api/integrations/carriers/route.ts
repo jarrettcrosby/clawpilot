@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { globalIdPattern } from '@/lib/globalIds.mjs'
 import {
   CarrierIntegrationRequestError,
   createCarrierAccount,
@@ -198,7 +199,7 @@ function globalReference(
   label: string,
 ) {
   const normalized = String(value || '').trim()
-  if (!new RegExp(`^${prefix}[0-9]{7}$`).test(normalized)) {
+  if (!globalIdPattern(prefix).test(normalized)) {
     throw new CarrierIntegrationRequestError(
       `${label} is invalid`,
       400,

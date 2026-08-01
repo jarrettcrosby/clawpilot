@@ -88,6 +88,21 @@ type CommerceAccount = {
   webhookVerificationStatus: 'not_applicable' | 'unverified' | 'verified'
   webhookVerifiedAt: string | null
   configuration: Record<string, unknown>
+  fulfillmentNotificationPolicy:
+    | {
+      mode: 'clawpilot_explicit'
+      notifyCustomerDefault: boolean
+      revision: number
+      changeReason: string
+      updatedAt: string
+    }
+    | {
+      mode: 'provider_managed'
+      notifyCustomerDefault: null
+      revision: 0
+      changeReason: null
+      updatedAt: null
+    }
   syncCursors: SyncCursor[]
   evidence: {
     webhookReceipts: number
@@ -498,6 +513,13 @@ export default function CommerceIntegrationPanel() {
   const [intakeAvailable, setIntakeAvailable] = useState(false)
   const [loading, setLoading] = useState(true)
   const [pendingAction, setPendingAction] = useState('')
+  const [notificationPolicyDrafts, setNotificationPolicyDrafts] = useState<
+    Record<string, {
+      notifyCustomerDefault: boolean
+      reason: string
+      confirmed: boolean
+    }>
+  >({})
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [revealedCredential, setRevealedCredential] =
@@ -643,6 +665,38 @@ export default function CommerceIntegrationPanel() {
       return false
     } finally {
       setPendingAction('')
+    }
+  }
+
+  async function saveFulfillmentNotificationPolicy(
+    account: CommerceAccount,
+  ) {
+    if (account.fulfillmentNotificationPolicy.mode !== 'clawpilot_explicit') {
+      return
+    }
+    const draft = notificationPolicyDrafts[account.globalId]
+    if (!draft) return
+    const saved = await action(
+      `fulfillment-notifications:${account.globalId}`,
+      {
+        action: 'set-shopify-fulfillment-notification-policy',
+        accountGlobalId: account.globalId,
+        expectedRevision: account.fulfillmentNotificationPolicy.revision,
+        notifyCustomerDefault: draft.notifyCustomerDefault,
+        reason: draft.reason.trim(),
+        confirmCustomerNotifications:
+          draft.notifyCustomerDefault ? draft.confirmed : false,
+      },
+      `Shopify fulfillment notifications now default to ${
+        draft.notifyCustomerDefault ? 'on' : 'off'
+      } for future orders.`,
+    )
+    if (saved) {
+      setNotificationPolicyDrafts((current) => {
+        const next = { ...current }
+        delete next[account.globalId]
+        return next
+      })
     }
   }
 
@@ -1696,6 +1750,20 @@ export default function CommerceIntegrationPanel() {
                       : []),
                   ]
                 : []
+              const notificationPolicy = account.fulfillmentNotificationPolicy
+              const notificationDraft = notificationPolicyDrafts[account.globalId]
+              const notificationDefault = notificationDraft
+                ? notificationDraft.notifyCustomerDefault
+                : notificationPolicy.notifyCustomerDefault === true
+              const notificationReason = notificationDraft?.reason || ''
+              const notificationConfirmation = notificationDraft?.confirmed === true
+              const notificationChanged = Boolean(
+                notificationDraft
+                && notificationDefault
+                  !== (notificationPolicy.notifyCustomerDefault === true),
+              )
+              const notificationPending = pendingAction
+                === `fulfillment-notifications:${account.globalId}`
               return (
                 <Card key={account.globalId} variant="outlined">
                   <CardContent>
@@ -1792,6 +1860,120 @@ export default function CommerceIntegrationPanel() {
                           }
                         />
                       ) : null}
+
+                      <Box>
+                        <Typography variant="subtitle2" fontWeight={700}>
+                          Fulfillment &amp; tracking
+                        </Typography>
+                        {account.provider === 'shopify'
+                          && notificationPolicy.mode === 'clawpilot_explicit' ? (
+                            <Stack spacing={1.25} sx={{ mt: 1 }}>
+                              <Alert severity={notificationDefault ? 'warning' : 'info'}>
+                                Customer notifications are an explicit Shopify-account default.
+                                The resolved choice is frozen into each fulfillment export, so
+                                changing this setting never emails customers for prior shipments.
+                                Operators may record a reasoned per-order exception when confirming
+                                a future shipment.
+                              </Alert>
+                              <FormControlLabel
+                                control={(
+                                  <Checkbox
+                                    checked={notificationDefault}
+                                    disabled={!canActivate || notificationPending}
+                                    onChange={(event) => {
+                                      const nextDefault = event.target.checked
+                                      setNotificationPolicyDrafts((current) => ({
+                                        ...current,
+                                        [account.globalId]: {
+                                          notifyCustomerDefault: nextDefault,
+                                          reason: nextDefault
+                                            ? 'Enable Shopify customer notifications for future fulfillment confirmations'
+                                            : 'Disable Shopify customer notifications for future fulfillment confirmations',
+                                          confirmed: false,
+                                        },
+                                      }))
+                                    }}
+                                  />
+                                )}
+                                label={notificationDefault
+                                  ? 'Email customers when future Shopify fulfillments are created'
+                                  : 'Do not email customers when future Shopify fulfillments are created'}
+                              />
+                              <TextField
+                                label="Policy change reason"
+                                value={notificationReason}
+                                disabled={!canActivate || notificationPending || !notificationChanged}
+                                onChange={(event) => {
+                                  setNotificationPolicyDrafts((current) => ({
+                                    ...current,
+                                    [account.globalId]: {
+                                      notifyCustomerDefault: notificationDefault,
+                                      reason: event.target.value,
+                                      confirmed: notificationConfirmation,
+                                    },
+                                  }))
+                                }}
+                                inputProps={{ maxLength: 500 }}
+                                helperText={`Revision ${notificationPolicy.revision} · ${
+                                  notificationReason.trim().length
+                                }/500 · audited`}
+                              />
+                              {notificationDefault && notificationChanged ? (
+                                <FormControlLabel
+                                  control={(
+                                    <Checkbox
+                                      checked={notificationConfirmation}
+                                      disabled={!canActivate || notificationPending}
+                                      onChange={(event) => {
+                                        setNotificationPolicyDrafts((current) => ({
+                                          ...current,
+                                          [account.globalId]: {
+                                            notifyCustomerDefault: notificationDefault,
+                                            reason: notificationReason,
+                                            confirmed: event.target.checked,
+                                          },
+                                        }))
+                                      }}
+                                    />
+                                  )}
+                                  label="I confirm future Shopify fulfillment confirmations may email customers"
+                                />
+                              ) : null}
+                              <Stack direction="row" spacing={1} alignItems="center">
+                                <Button
+                                  size="small"
+                                  variant="outlined"
+                                  disabled={
+                                    !canActivate
+                                    || notificationPending
+                                    || !notificationChanged
+                                    || notificationReason.trim().length < 10
+                                    || (notificationDefault && !notificationConfirmation)
+                                  }
+                                  startIcon={notificationPending
+                                    ? <CircularProgress size={16} />
+                                    : undefined}
+                                  onClick={() => {
+                                    void saveFulfillmentNotificationPolicy(account)
+                                  }}
+                                >
+                                  {notificationPending ? 'Saving' : 'Save notification default'}
+                                </Button>
+                                {!canActivate ? (
+                                  <Typography variant="caption" color="text.secondary">
+                                    Owner or operations-administrator access is required.
+                                  </Typography>
+                                ) : null}
+                              </Stack>
+                            </Stack>
+                          ) : (
+                            <Alert severity="info" sx={{ mt: 1 }}>
+                              Faire manages retailer notifications after shipment and tracking are
+                              submitted. ClawPilot therefore does not expose a notification toggle;
+                              fulfillment export readiness is tracked separately.
+                            </Alert>
+                          )}
+                      </Box>
 
                       {account.provider === 'shopify' ? (
                         <ShopifyCarrierServiceSetupPanel

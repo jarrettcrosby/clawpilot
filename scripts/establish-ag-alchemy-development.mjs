@@ -4,6 +4,7 @@ import crypto from 'node:crypto'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { globalIdPattern } from '../app_src/lib/globalIds.mjs'
 
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
@@ -117,7 +118,7 @@ function normalizedEmail(value, label) {
 
 function reference(value, prefix, label) {
   const normalized = normalizedText(value).toLowerCase()
-  if (!new RegExp(`^${prefix}[0-9]{7}$`).test(normalized)) {
+  if (!globalIdPattern(prefix).test(normalized)) {
     fail(`${label} must be a ${prefix} Global ID`)
   }
   return normalized

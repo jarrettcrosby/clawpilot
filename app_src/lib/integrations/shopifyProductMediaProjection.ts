@@ -33,9 +33,9 @@ import {
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-const CHANNEL_GLOBAL_PATTERN = /^gpcs[0-9]{7}$/
-const PRODUCT_REFERENCE_PATTERN = /^gp[0-9]{7}$/
-const EFFECT_GLOBAL_PATTERN = /^gcef[0-9]{7}$/
+const CHANNEL_GLOBAL_PATTERN = /^gpcs(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRODUCT_REFERENCE_PATTERN = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/
+const EFFECT_GLOBAL_PATTERN = /^gcef(?:[0-9]{7}|[0-9a-v]{12})$/
 const SHA256_PATTERN = /^[0-9a-f]{64}$/
 const SAFE_IDENTIFIER_PATTERN = /^[\x20-\x7e]+$/
 const PUBLIC_MEDIA_PATH =
@@ -706,7 +706,7 @@ export async function reconcileShopifyProductImagePublish(
     ).trim().toLowerCase(),
     actorEmail: rawInput.actorEmail,
   }
-  if (!/^gcef[0-9]{7}$/.test(input.externalEffectGlobalId)) {
+  if (!/^gcef(?:[0-9]{7}|[0-9a-v]{12})$/.test(input.externalEffectGlobalId)) {
     fail(
       'SHOPIFY_PRODUCT_MEDIA_EFFECT_INVALID',
       'Shopify Product-image publication evidence is invalid',

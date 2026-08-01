@@ -265,9 +265,9 @@ export class CommerceActiveTransitionPersistenceError extends Error {
 
 const UUID =
   /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/
-const ACCOUNT_GLOBAL_ID = /^gia[0-9]{7}$/
-const PREPARATION_GLOBAL_ID = /^gcap[0-9]{7}$/
-const AUTHORIZATION_GLOBAL_ID = /^gcaa[0-9]{7}$/
+const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
+const PREPARATION_GLOBAL_ID = /^gcap(?:[0-9]{7}|[0-9a-v]{12})$/
+const AUTHORIZATION_GLOBAL_ID = /^gcaa(?:[0-9]{7}|[0-9a-v]{12})$/
 const SHA256 = /^[a-f0-9]{64}$/
 const SAFE_KEY = /^[^\u0000-\u001f\u007f]{1,255}$/
 const SAFE_SCOPE = /^[A-Za-z][A-Za-z0-9_]{0,127}$/

@@ -22,6 +22,10 @@ import {
 import {
   signalShopifyInventoryRefreshWithClient,
 } from '@/lib/persistence/shopifyInventoryRefresh'
+import {
+  ensureShopifyFulfillmentNotificationPolicyWithClient,
+  type ShopifyFulfillmentNotificationPolicyState,
+} from '@/lib/persistence/shopifyFulfillmentNotifications'
 
 type TimestampValue = string | Date
 
@@ -124,6 +128,15 @@ export type CommerceIntegrationAccountState = {
   webhookVerificationStatus: 'not_applicable' | 'unverified' | 'verified'
   webhookVerifiedAt: string | null
   configuration: Record<string, unknown>
+  fulfillmentNotificationPolicy:
+    | ShopifyFulfillmentNotificationPolicyState
+    | {
+      mode: 'provider_managed'
+      notifyCustomerDefault: null
+      revision: 0
+      changeReason: null
+      updatedAt: null
+    }
   syncCursors: CommerceSyncCursorState[]
   evidence: {
     webhookReceipts: number
@@ -233,6 +246,12 @@ function accountState(
   row: CommerceConnectionRow,
   cursors: CommerceSyncCursorState[],
   evidence?: CommerceEvidenceSummaryRow,
+  notificationPolicy?: {
+    notify_customer_default: boolean
+    revision: string | number
+    change_reason: string
+    updated_at: TimestampValue
+  },
 ): CommerceIntegrationAccountState {
   return {
     globalId: row.global_id,
@@ -258,6 +277,24 @@ function accountState(
       row.webhook_verification_status || 'not_applicable',
     webhookVerifiedAt: iso(row.webhook_verified_at),
     configuration: row.configuration || {},
+    fulfillmentNotificationPolicy: row.provider === 'shopify'
+      ? {
+          mode: 'clawpilot_explicit',
+          notifyCustomerDefault:
+            notificationPolicy?.notify_customer_default === true,
+          revision: numberValue(notificationPolicy?.revision),
+          changeReason: notificationPolicy?.change_reason
+            || 'Safe default: customer notifications are off',
+          updatedAt: iso(notificationPolicy?.updated_at)
+            || new Date(0).toISOString(),
+        }
+      : {
+          mode: 'provider_managed',
+          notifyCustomerDefault: null,
+          revision: 0,
+          changeReason: null,
+          updatedAt: null,
+        },
     syncCursors: cursors,
     evidence: {
       webhookReceipts: numberValue(evidence?.webhook_receipts),
@@ -277,8 +314,9 @@ export async function readCommerceIntegrationsStateFromPostgres(
   organizationId: string,
 ): Promise<CommerceIntegrationsState> {
   await purgeExpiredFaireOAuthInstallationsInPostgres()
-  const [connections, cursorRows, evidenceRows] = await Promise.all([
-    query<CommerceConnectionRow>(
+  const [connections, cursorRows, evidenceRows, notificationPolicyRows] =
+    await Promise.all([
+      query<CommerceConnectionRow>(
       `${CONNECTION_SELECT}
        WHERE account.organization_id = $1::uuid
          AND account.integration_type = 'commerce'
@@ -286,7 +324,7 @@ export async function readCommerceIntegrationsStateFromPostgres(
        ORDER BY account.provider, account.display_name, account.global_id`,
       [organizationId],
     ),
-    query<CommerceCursorRow>(
+      query<CommerceCursorRow>(
       `SELECT
          integration_account_id::text,
          resource,
@@ -306,7 +344,7 @@ export async function readCommerceIntegrationsStateFromPostgres(
        ORDER BY integration_account_id, resource`,
       [organizationId],
     ),
-    query<CommerceEvidenceSummaryRow>(
+      query<CommerceEvidenceSummaryRow>(
       `SELECT
          account.id::text AS integration_account_id,
          COALESCE(webhook.receipts, 0) AS webhook_receipts,
@@ -343,7 +381,20 @@ export async function readCommerceIntegrationsStateFromPostgres(
          AND account.provider IN ('shopify', 'faire')`,
       [organizationId],
     ),
-  ])
+      query<{
+        integration_account_id: string
+        notify_customer_default: boolean
+        revision: string | number
+        change_reason: string
+        updated_at: TimestampValue
+      }>(
+        `SELECT integration_account_id::text, notify_customer_default,
+                revision::text, change_reason, updated_at
+         FROM operations_shopify_fulfillment_notification_policies
+         WHERE organization_id = $1::uuid`,
+        [organizationId],
+      ),
+    ])
 
   const cursors = new Map<string, CommerceSyncCursorState[]>()
   for (const row of cursorRows.rows) {
@@ -354,12 +405,16 @@ export async function readCommerceIntegrationsStateFromPostgres(
   const evidence = new Map(
     evidenceRows.rows.map((row) => [row.integration_account_id, row]),
   )
+  const notificationPolicies = new Map(
+    notificationPolicyRows.rows.map((row) => [row.integration_account_id, row]),
+  )
   return {
     organizationId,
     accounts: connections.rows.map((row) => accountState(
       row,
       cursors.get(row.id) || [],
       evidence.get(row.id),
+      notificationPolicies.get(row.id),
     )),
   }
 }
@@ -743,6 +798,13 @@ export async function writeCommerceCredentialInPostgres(input: {
       ],
     )
     const account = accountResult.rows[0]
+    if (input.provider === 'shopify') {
+      await ensureShopifyFulfillmentNotificationPolicyWithClient(client, {
+        organizationId: input.organizationId,
+        integrationAccountId: account.id,
+        actorEmail: input.actorEmail,
+      })
+    }
     const previous = await client.query<{
       credential_version: number
       external_account_id: string

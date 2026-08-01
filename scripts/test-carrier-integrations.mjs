@@ -4,6 +4,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as globalIds from '../app_src/lib/globalIds.mjs'
 
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
@@ -567,7 +568,10 @@ assert.ok(
 
 process.env.INTEGRATION_CREDENTIAL_ENCRYPTION_KEY = 'carrier-test-encryption-key-0123456789abcdef'
 const cryptoModule = loadTypeScriptModule('app_src/lib/integrations/carrierCredentialCrypto.ts', {
-  mocks: { '@/lib/persistence/config': { isHostedRuntime: () => false } },
+  mocks: {
+    '@/lib/globalIds.mjs': globalIds,
+    '@/lib/persistence/config': { isHostedRuntime: () => false },
+  },
 })
 const credential = {
   clientId: 'carrier-client-id-1234',

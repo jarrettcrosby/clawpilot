@@ -113,14 +113,16 @@ function recipe(
   sourceLine: HybridCartonizationLine,
   overrides: Partial<HybridCartonizationRecipe> = {},
 ): HybridCartonizationRecipe {
+  const sourceSuffix = sourceLine.lineGlobalId.replace(/^gcol/, '')
+  assert.match(sourceSuffix, /^(?:[0-9]{7}|[0-9a-v]{12})$/)
+  const alternateSuffix = `${sourceSuffix.length === 7 ? '9' : 'v'}${sourceSuffix.slice(1)}`
   return {
-    recipeGlobalId:
-      `gpre${sourceLine.lineGlobalId.slice(-7)}`,
+    recipeGlobalId: `gpre${sourceSuffix}`,
     productGlobalId: sourceLine.productGlobalId,
     inputPackProfileVersionGlobalId:
       sourceLine.profile.versionGlobalId,
     outputPackProfileVersionGlobalId:
-      `gppv9${sourceLine.lineGlobalId.slice(-6)}`,
+      `gppv${alternateSuffix}`,
     packagingMaterialGlobalId: MATERIAL_ID,
     recipeType: 'max_capacity',
     maximumInputQuantity: 18,
@@ -138,6 +140,24 @@ function recipe(
     ...overrides,
   }
 }
+
+test('fixture builders preserve future-format Global ID suffixes', () => {
+  const legacyRecipe = recipe(line(1))
+  assert.equal(legacyRecipe.recipeGlobalId, 'gpre0000001')
+  assert.equal(legacyRecipe.outputPackProfileVersionGlobalId, 'gppv9000001')
+
+  const futureLine = line(1, {
+    lineGlobalId: 'gcol0123456789av',
+    productGlobalId: 'gp0123456789av',
+    profile: {
+      ...line(1).profile,
+      versionGlobalId: 'gppv0123456789av',
+    },
+  })
+  const futureRecipe = recipe(futureLine)
+  assert.equal(futureRecipe.recipeGlobalId, 'gpre0123456789av')
+  assert.equal(futureRecipe.outputPackProfileVersionGlobalId, 'gppvv123456789av')
+})
 
 function input(
   lines: HybridCartonizationLine[],

@@ -646,6 +646,15 @@ async function verifyShipmentCompletion(databaseUrl) {
   try {
     const postgres = postgresMock(pool)
     const auditWriter = auditWriterMock()
+    const fulfillmentNotificationPolicy = loadTypeScriptModule(
+      'app_src/lib/persistence/shopifyFulfillmentNotifications.ts',
+      {
+        mocks: {
+          '@/lib/auditWriter': auditWriter,
+          '@/lib/persistence/postgres': postgres,
+        },
+      },
+    )
     const sandboxCommerceE2e = loadTypeScriptModule(
       'app_src/lib/operations/sandboxCommerceE2e.ts',
     )
@@ -696,6 +705,11 @@ async function verifyShipmentCompletion(databaseUrl) {
         },
       },
     )
+    let shopifyFulfillmentPreparationCalls = 0
+    let shopifyFulfillmentPreparationHook = null
+    let shopifyFulfillmentExecutionCalls = 0
+    let shopifyFulfillmentReconciliationCalls = 0
+    let shopifyFulfillmentReconciliationResult = null
     const persistence = loadTypeScriptModule('app_src/lib/persistence/operations.ts', {
       mocks: {
         '@/lib/auditWriter': auditWriter,
@@ -715,9 +729,49 @@ async function verifyShipmentCompletion(databaseUrl) {
           },
         },
         '@/lib/integrations/shopifyFulfillmentWriteback': {
-          executeShopifyFulfillmentWriteback: async () => ({
-            providerReference: 'shopify-focused-fulfillment-reference',
-          }),
+          prepareShopifyFulfillmentWriteback: async (input) => {
+            shopifyFulfillmentPreparationCalls += 1
+            if (shopifyFulfillmentPreparationHook) {
+              await shopifyFulfillmentPreparationHook(input)
+            }
+            const lineItems = Array.isArray(input.expectedLineItems)
+              ? input.expectedLineItems.map((line) => ({
+                  lineItemId: String(line.externalLineId || line.lineItemId),
+                  quantity: Number(line.quantity),
+                }))
+              : []
+            return {
+              signature: {
+                version: 1,
+                externalOrderId: input.externalOrderId,
+                fulfillmentOrders: [{
+                  fulfillmentOrderId: 'gid://shopify/FulfillmentOrder/456',
+                  locationId: 'gid://shopify/Location/321',
+                  lineItems: lineItems.map((line, index) => ({
+                    fulfillmentOrderLineItemId:
+                      `gid://shopify/FulfillmentOrderLineItem/${789 + index}`,
+                    lineItemId: line.lineItemId,
+                    quantity: line.quantity,
+                  })),
+                }],
+                lineItems,
+                carrier: input.carrier,
+                trackingNumbers: input.trackingNumbers,
+                notifyCustomer: input.notifyCustomer,
+              },
+              existing: null,
+            }
+          },
+          executeShopifyFulfillmentWriteback: async () => {
+            shopifyFulfillmentExecutionCalls += 1
+            return {
+              providerReference: 'shopify-focused-fulfillment-reference',
+            }
+          },
+          reconcileShopifyFulfillmentWriteback: async () => {
+            shopifyFulfillmentReconciliationCalls += 1
+            return shopifyFulfillmentReconciliationResult
+          },
         },
         '@/lib/operations/adapters': adapters,
         '@/lib/operations/canonicalFulfillmentPlanning':
@@ -784,6 +838,97 @@ async function verifyShipmentCompletion(databaseUrl) {
       ))
       return fixture
     }
+
+    const policyFixture = await seedWorkspace(pool, 'notification-policy')
+    const shopifyAccount = await pool.query(
+      `INSERT INTO operations_integration_accounts (
+         organization_id, provider, integration_type, environment,
+         external_account_id, display_name, configuration, created_by, updated_by
+       ) VALUES (
+         $1::uuid, 'shopify', 'commerce', 'sandbox',
+         'gid://shopify/Shop/6567', 'Policy acceptance Shopify',
+         '{"shopDomain":"policy-acceptance.myshopify.com"}'::jsonb, $2, $2
+       ) RETURNING id::text, global_id`,
+      [policyFixture.organizationId, policyFixture.email],
+    )
+    await postgres.withTransaction((client) => (
+      fulfillmentNotificationPolicy
+        .ensureShopifyFulfillmentNotificationPolicyWithClient(client, {
+          organizationId: policyFixture.organizationId,
+          integrationAccountId: shopifyAccount.rows[0].id,
+          actorEmail: policyFixture.email,
+        })
+    ))
+    const safePolicy = await pool.query(
+      `SELECT notify_customer_default, revision::text
+       FROM operations_shopify_fulfillment_notification_policies
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+      [policyFixture.organizationId, shopifyAccount.rows[0].id],
+    )
+    assert.deepEqual(safePolicy.rows[0], {
+      notify_customer_default: false,
+      revision: '1',
+    })
+    const enabledPolicy = await fulfillmentNotificationPolicy
+      .updateShopifyFulfillmentNotificationPolicyInPostgres({
+        organizationId: policyFixture.organizationId,
+        accountGlobalId: shopifyAccount.rows[0].global_id,
+        actorEmail: policyFixture.email,
+        expectedRevision: 1,
+        notifyCustomerDefault: true,
+        reason: 'Enable customer notifications for future acceptance shipments',
+      })
+    assert.equal(enabledPolicy.notifyCustomerDefault, true)
+    assert.equal(enabledPolicy.revision, 2)
+    await assert.rejects(
+      () => fulfillmentNotificationPolicy
+        .updateShopifyFulfillmentNotificationPolicyInPostgres({
+          organizationId: policyFixture.organizationId,
+          accountGlobalId: shopifyAccount.rows[0].global_id,
+          actorEmail: policyFixture.email,
+          expectedRevision: 1,
+          notifyCustomerDefault: false,
+          reason: 'Reject a stale policy revision during acceptance',
+        }),
+      (error) => error?.code === 'SHOPIFY_FULFILLMENT_NOTIFICATION_REVISION_CONFLICT',
+    )
+    await pool.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = '{"shopDomain":"reconnected.myshopify.com"}'::jsonb
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [policyFixture.organizationId, shopifyAccount.rows[0].id],
+    )
+    const preservedPolicy = await pool.query(
+      `SELECT notify_customer_default, revision::text
+       FROM operations_shopify_fulfillment_notification_policies
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+      [policyFixture.organizationId, shopifyAccount.rows[0].id],
+    )
+    assert.deepEqual(preservedPolicy.rows[0], {
+      notify_customer_default: true,
+      revision: '2',
+    })
+    const faireAccount = await pool.query(
+      `INSERT INTO operations_integration_accounts (
+         organization_id, provider, integration_type, environment,
+         external_account_id, display_name, configuration, created_by, updated_by
+       ) VALUES (
+         $1::uuid, 'faire', 'commerce', 'production',
+         'faire-policy-acceptance', 'Policy acceptance Faire', '{}'::jsonb, $2, $2
+       ) RETURNING id::text`,
+      [policyFixture.organizationId, policyFixture.email],
+    )
+    await assert.rejects(
+      () => pool.query(
+        `INSERT INTO operations_shopify_fulfillment_notification_policies (
+           organization_id, integration_account_id, notify_customer_default,
+           revision, change_reason, created_by, updated_by
+         ) VALUES ($1::uuid, $2::uuid, false, 1,
+           'This invalid Faire policy must be rejected', $3, $3)`,
+        [policyFixture.organizationId, faireAccount.rows[0].id, policyFixture.email],
+      ),
+      /Shopify-commerce-only/,
+    )
 
     const packingListFixture = await createFixture('package-packing-list')
     const packingListOrder = await advanceOrderToPacked(
@@ -983,6 +1128,14 @@ async function verifyShipmentCompletion(databaseUrl) {
     assert.equal(confirmed.orderStatus, 'shipped')
     assert.equal(confirmed.rowVersion, successful.packed.rowVersion + 1)
     assert.equal(confirmed.replayed, false)
+    assert.deepEqual(JSON.parse(JSON.stringify(confirmed.customerNotification)), {
+      mode: 'clawpilot_explicit',
+      notifyCustomer: false,
+      source: 'legacy_safe_default',
+      accountPolicyRevision: null,
+      overrideReason: null,
+      decidedBy: successFixture.email,
+    })
 
     const afterSuccess = await orderEvidence(
       pool,
@@ -1099,6 +1252,122 @@ async function verifyShipmentCompletion(databaseUrl) {
       ),
       consumedPackaging,
       'Shipment replay must not consume packaging stock twice',
+    )
+    const strandedExport = await pool.query(
+      `INSERT INTO operations_commerce_fulfillment_exports (
+         organization_id, order_id, shipment_id, provider, external_order_id,
+         state, payload_snapshot, idempotency_key
+       )
+       SELECT organization_id, order_id, shipment_id, provider, external_order_id,
+              'queued', payload_snapshot - 'customerNotification',
+              idempotency_key || ':stranded-acceptance'
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2
+       RETURNING global_id`,
+      [successFixture.organizationId, confirmed.commerceExportGlobalId],
+    )
+    const exportCountBeforeRetry = await pool.query(
+      `SELECT count(*)::int AS count
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid`,
+      [successFixture.organizationId],
+    )
+    const retriedExport = await persistence
+      .retryOperationsCommerceFulfillmentExportFromPostgres({
+        organizationId: successFixture.organizationId,
+        actorEmail: successFixture.email,
+        commerceExportGlobalId: strandedExport.rows[0].global_id,
+        reason: 'Recover the stranded immutable export in focused acceptance',
+        idempotencyKey: `retry-stranded-export-${randomUUID()}`,
+      })
+    assert.equal(retriedExport.state, 'succeeded')
+    assert.equal(retriedExport.replayed, false)
+    assert.equal(retriedExport.customerNotification.notifyCustomer, false)
+    assert.equal(
+      retriedExport.customerNotification.source,
+      'legacy_safe_default',
+    )
+    const exportCountAfterRetry = await pool.query(
+      `SELECT count(*)::int AS count
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid`,
+      [successFixture.organizationId],
+    )
+    assert.equal(
+      exportCountAfterRetry.rows[0].count,
+      exportCountBeforeRetry.rows[0].count,
+      'Retry must reuse the same export rather than creating another row',
+    )
+    const retriedExportEvidence = await pool.query(
+      `SELECT state, attempts
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [successFixture.organizationId, strandedExport.rows[0].global_id],
+    )
+    assert.deepEqual(retriedExportEvidence.rows[0], {
+      state: 'succeeded',
+      attempts: 1,
+    })
+
+    const faireFixture = await createFixture('faire-export-pending')
+    const faireOrder = await advanceOrderToPacked(
+      persistence,
+      faireFixture,
+      'faire-export-pending',
+    )
+    await addActiveLabel(
+      pool,
+      faireFixture,
+      faireOrder.planned.orderGlobalId,
+      'mock',
+    )
+    await pool.query(
+      `UPDATE operations_orders
+       SET source_provider = 'faire'
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [faireFixture.organizationId, faireOrder.planned.orderGlobalId],
+    )
+    const faireConfirmed = await persistence
+      .confirmOperationsOrderShipmentFromPostgres({
+        organizationId: faireFixture.organizationId,
+        actorEmail: faireFixture.email,
+        orderGlobalId: faireOrder.planned.orderGlobalId,
+        expectedRowVersion: faireOrder.packed.rowVersion,
+        reason: 'Confirm Faire shipment while export adapter remains explicit',
+        idempotencyKey: `confirm-faire-export-pending-${randomUUID()}`,
+      })
+    assert.equal(faireConfirmed.commerceExportState, 'failed')
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(faireConfirmed.customerNotification)),
+      {
+        mode: 'provider_managed',
+        notifyCustomer: null,
+        source: 'provider_managed',
+        accountPolicyRevision: null,
+        overrideReason: null,
+        decidedBy: faireFixture.email,
+      },
+    )
+    const faireExport = await pool.query(
+      `SELECT state, attempts, payload_snapshot, error_code, error_message
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [faireFixture.organizationId, faireConfirmed.commerceExportGlobalId],
+    )
+    assert.equal(faireExport.rows[0].state, 'failed')
+    assert.equal(faireExport.rows[0].attempts, 1)
+    assert.equal(
+      faireExport.rows[0].error_code,
+      'OPERATIONS_FAIRE_FULFILLMENT_EXPORT_NOT_IMPLEMENTED',
+    )
+    assert.match(
+      faireExport.rows[0].error_message,
+      /does not replace the required shipment submission/,
+    )
+    assert.deepEqual(
+      faireExport.rows[0].payload_snapshot.customerNotification,
+      JSON.parse(JSON.stringify(faireConfirmed.customerNotification)),
     )
 
     const sandboxFixture = await createFixture('sandbox')
@@ -1260,12 +1529,48 @@ async function verifyShipmentCompletion(databaseUrl) {
       reason: 'Authorized multi-package sandbox E2E acceptance',
       idempotencyKey: `confirm-authorized-sandbox-${randomUUID()}`,
       sandboxE2eAuthorizationGlobalId: authorizationGlobalId,
+      expectedNotificationPolicyRevision: 0,
     }
     const authorizedResult = await persistence.confirmOperationsOrderShipmentFromPostgres(
       authorizedInput,
     )
     assert.equal(authorizedResult.orderStatus, 'shipped')
     assert.equal(authorizedResult.replayed, false)
+    assert.equal(shopifyFulfillmentPreparationCalls, 1)
+    assert.equal(shopifyFulfillmentExecutionCalls, 1)
+    const authorizedProviderAttempt = await pool.query(
+      `SELECT state, attempt_number, external_object_id, redacted_request,
+              provider_reference, error_code
+       FROM operations_commerce_provider_attempts
+       WHERE organization_id = $1::uuid
+         AND external_object_id = $2
+         AND action = 'shopify.fulfillment.create'`,
+      [authorizedFixture.organizationId, authorizedResult.commerceExportGlobalId],
+    )
+    assert.equal(authorizedProviderAttempt.rowCount, 1)
+    assert.equal(authorizedProviderAttempt.rows[0].state, 'succeeded')
+    assert.equal(authorizedProviderAttempt.rows[0].attempt_number, 1)
+    assert.equal(
+      authorizedProviderAttempt.rows[0].provider_reference,
+      'shopify-focused-fulfillment-reference',
+    )
+    assert.equal(authorizedProviderAttempt.rows[0].error_code, null)
+    assert.equal(authorizedProviderAttempt.rows[0].redacted_request.version, 1)
+    assert.equal(
+      authorizedProviderAttempt.rows[0].redacted_request.notifyCustomer,
+      false,
+    )
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(authorizedResult.customerNotification)),
+      {
+        mode: 'clawpilot_explicit',
+        notifyCustomer: false,
+        source: 'sandbox_e2e_suppression',
+        accountPolicyRevision: 0,
+        overrideReason: null,
+        decidedBy: authorizedFixture.email,
+      },
+    )
     const authorizedEvidence = await orderEvidence(
       pool,
       authorizedFixture,
@@ -1368,6 +1673,277 @@ async function verifyShipmentCompletion(databaseUrl) {
     assert.equal(replayedAuthorization.state, 'consumed')
     assert.equal(replayedAuthorization.consumedAt, consumedAuthorization.consumedAt)
 
+    const interleavedShopifyExport = await pool.query(
+      `INSERT INTO operations_commerce_fulfillment_exports (
+         organization_id, order_id, shipment_id, provider, external_order_id,
+         state, attempts, payload_snapshot, idempotency_key
+       )
+       SELECT organization_id, order_id, shipment_id, provider, external_order_id,
+              'queued', 0, payload_snapshot,
+              idempotency_key || ':interleaved-shopify-attempt'
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2
+       RETURNING global_id`,
+      [authorizedFixture.organizationId, authorizedResult.commerceExportGlobalId],
+    )
+    assert.equal(interleavedShopifyExport.rowCount, 1)
+    let releaseFirstPreparation
+    let markFirstPreparationEntered
+    const firstPreparationEntered = new Promise((resolvePromise) => {
+      markFirstPreparationEntered = resolvePromise
+    })
+    const releaseFirstPreparationPromise = new Promise((resolvePromise) => {
+      releaseFirstPreparation = resolvePromise
+    })
+    let firstPreparationHeld = false
+    shopifyFulfillmentPreparationHook = async () => {
+      if (firstPreparationHeld) return
+      firstPreparationHeld = true
+      markFirstPreparationEntered()
+      await releaseFirstPreparationPromise
+    }
+    const preparationCallsBeforeInterleaving = shopifyFulfillmentPreparationCalls
+    const executionCallsBeforeInterleaving = shopifyFulfillmentExecutionCalls
+    const firstInterleavedAttempt = persistence
+      .retryOperationsCommerceFulfillmentExportFromPostgres({
+        organizationId: authorizedFixture.organizationId,
+        actorEmail: authorizedFixture.email,
+        commerceExportGlobalId: interleavedShopifyExport.rows[0].global_id,
+        reason: 'Hold the first Shopify preparation to prove stale-attempt fencing',
+        idempotencyKey: `retry-interleaved-shopify-first-${randomUUID()}`,
+      })
+    await firstPreparationEntered
+    await pool.query(
+      `UPDATE operations_commerce_fulfillment_exports
+       SET updated_at = now() - interval '6 minutes'
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [authorizedFixture.organizationId, interleavedShopifyExport.rows[0].global_id],
+    )
+    const secondInterleavedAttempt = await persistence
+      .retryOperationsCommerceFulfillmentExportFromPostgres({
+        organizationId: authorizedFixture.organizationId,
+        actorEmail: authorizedFixture.email,
+        commerceExportGlobalId: interleavedShopifyExport.rows[0].global_id,
+        reason: 'Supersede the stale pre-registration Shopify worker safely',
+        idempotencyKey: `retry-interleaved-shopify-second-${randomUUID()}`,
+      })
+    assert.equal(secondInterleavedAttempt.state, 'succeeded')
+    releaseFirstPreparation()
+    await assert.rejects(
+      firstInterleavedAttempt,
+      (error) => error?.code === 'OPERATIONS_COMMERCE_EXPORT_CHANGED',
+    )
+    shopifyFulfillmentPreparationHook = null
+    assert.equal(
+      shopifyFulfillmentPreparationCalls,
+      preparationCallsBeforeInterleaving + 2,
+    )
+    assert.equal(
+      shopifyFulfillmentExecutionCalls,
+      executionCallsBeforeInterleaving + 1,
+      'The superseded worker must fail its exact-attempt CAS before calling Shopify',
+    )
+    const interleavedProviderAttempts = await pool.query(
+      `SELECT state, attempt_number
+       FROM operations_commerce_provider_attempts
+       WHERE organization_id = $1::uuid
+         AND external_object_id = $2
+         AND action = 'shopify.fulfillment.create'`,
+      [
+        authorizedFixture.organizationId,
+        interleavedShopifyExport.rows[0].global_id,
+      ],
+    )
+    assert.deepEqual(interleavedProviderAttempts.rows, [{
+      state: 'succeeded',
+      attempt_number: 2,
+    }])
+
+    const staleShopifyExport = await pool.query(
+      `INSERT INTO operations_commerce_fulfillment_exports (
+         organization_id, order_id, shipment_id, provider, external_order_id,
+         state, attempts, payload_snapshot, idempotency_key, updated_at
+       )
+       SELECT organization_id, order_id, shipment_id, provider, external_order_id,
+              'processing', 1,
+              jsonb_set(
+                payload_snapshot,
+                '{customerNotification}',
+                '{"notifyCustomer":true}'::jsonb,
+                true
+              ),
+              idempotency_key || ':stale-shopify-recovery',
+              now() - interval '6 minutes'
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2
+       RETURNING global_id`,
+      [authorizedFixture.organizationId, authorizedResult.commerceExportGlobalId],
+    )
+    assert.equal(staleShopifyExport.rowCount, 1)
+    const staleShopifyProviderAttempt = await pool.query(
+      `INSERT INTO operations_commerce_provider_attempts (
+         organization_id, integration_account_id, action, adapter_version,
+         external_object_id, idempotency_key, request_hash,
+         redacted_request, redacted_response, state, attempt_number,
+         requested_at, created_by
+       )
+       SELECT attempt.organization_id, attempt.integration_account_id,
+              attempt.action, attempt.adapter_version,
+              $3, attempt.idempotency_key || ':stale-shopify-recovery',
+              attempt.request_hash, attempt.redacted_request, '{}'::jsonb,
+              'prepared', 1, now() - interval '6 minutes', attempt.created_by
+       FROM operations_commerce_provider_attempts attempt
+       WHERE attempt.organization_id = $1::uuid
+         AND attempt.external_object_id = $2
+         AND attempt.action = 'shopify.fulfillment.create'
+       ORDER BY attempt.requested_at DESC
+       LIMIT 1
+       RETURNING global_id`,
+      [
+        authorizedFixture.organizationId,
+        authorizedResult.commerceExportGlobalId,
+        staleShopifyExport.rows[0].global_id,
+      ],
+    )
+    assert.equal(staleShopifyProviderAttempt.rowCount, 1)
+    const preparationCallsBeforeStaleRecovery =
+      shopifyFulfillmentPreparationCalls
+    const executionCallsBeforeStaleRecovery = shopifyFulfillmentExecutionCalls
+    const reconciliationCallsBeforeStaleRecovery =
+      shopifyFulfillmentReconciliationCalls
+    const fencedStaleShopifyExport = await persistence
+      .retryOperationsCommerceFulfillmentExportFromPostgres({
+        organizationId: authorizedFixture.organizationId,
+        actorEmail: authorizedFixture.email,
+        commerceExportGlobalId: staleShopifyExport.rows[0].global_id,
+        reason: 'Fence the stale Shopify attempt before any provider replay',
+        idempotencyKey: `retry-stale-shopify-fence-${randomUUID()}`,
+      })
+    assert.equal(fencedStaleShopifyExport.state, 'failed')
+    assert.equal(fencedStaleShopifyExport.providerReference, null)
+    assert.equal(
+      fencedStaleShopifyExport.errorCode,
+      'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED',
+    )
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(fencedStaleShopifyExport.customerNotification)),
+      {
+        mode: 'clawpilot_explicit',
+        notifyCustomer: false,
+        source: 'legacy_safe_default',
+        accountPolicyRevision: null,
+        overrideReason: null,
+        decidedBy: null,
+      },
+    )
+    assert.equal(
+      shopifyFulfillmentPreparationCalls,
+      preparationCallsBeforeStaleRecovery,
+      'A durable prior attempt must not be prepared again',
+    )
+    assert.equal(
+      shopifyFulfillmentExecutionCalls,
+      executionCallsBeforeStaleRecovery,
+      'The first stale recovery must not repeat the Shopify mutation',
+    )
+    assert.equal(
+      shopifyFulfillmentReconciliationCalls,
+      reconciliationCallsBeforeStaleRecovery + 1,
+      'The first stale recovery must perform exactly one read-only reconciliation',
+    )
+    const fencedStaleShopifyEvidence = await pool.query(
+      `SELECT state, attempts, error_code
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [authorizedFixture.organizationId, staleShopifyExport.rows[0].global_id],
+    )
+    assert.deepEqual(fencedStaleShopifyEvidence.rows[0], {
+      state: 'failed',
+      attempts: 2,
+      error_code: 'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED',
+    })
+
+    const unresolvedStaleShopifyExport = await persistence
+      .retryOperationsCommerceFulfillmentExportFromPostgres({
+        organizationId: authorizedFixture.organizationId,
+        actorEmail: authorizedFixture.email,
+        commerceExportGlobalId: staleShopifyExport.rows[0].global_id,
+        reason: 'Reconcile the durable Shopify attempt again without another write',
+        idempotencyKey: `retry-stale-shopify-reconcile-${randomUUID()}`,
+      })
+    assert.equal(unresolvedStaleShopifyExport.state, 'failed')
+    assert.equal(
+      unresolvedStaleShopifyExport.errorCode,
+      'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED',
+    )
+    assert.equal(
+      shopifyFulfillmentPreparationCalls,
+      preparationCallsBeforeStaleRecovery,
+      'Repeated unknown-outcome recovery must not prepare another write',
+    )
+    assert.equal(
+      shopifyFulfillmentExecutionCalls,
+      executionCallsBeforeStaleRecovery,
+      'Repeated unknown-outcome recovery must never repeat the Shopify mutation',
+    )
+    assert.equal(
+      shopifyFulfillmentReconciliationCalls,
+      reconciliationCallsBeforeStaleRecovery + 2,
+      'Repeated unknown-outcome recovery must remain read-only',
+    )
+    const unresolvedStaleShopifyEvidence = await pool.query(
+      `SELECT state, attempts, error_code
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [authorizedFixture.organizationId, staleShopifyExport.rows[0].global_id],
+    )
+    assert.deepEqual(unresolvedStaleShopifyEvidence.rows[0], {
+      state: 'failed',
+      attempts: 3,
+      error_code: 'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED',
+    })
+
+    shopifyFulfillmentReconciliationResult = {
+      providerReference: 'shopify-reconciled-fulfillment-reference',
+      trackingNumber: authorizedTrackingNumbers[0],
+      trackingNumbers: authorizedTrackingNumbers,
+      replayed: true,
+    }
+    const reconciledStaleShopifyExport = await persistence
+      .retryOperationsCommerceFulfillmentExportFromPostgres({
+        organizationId: authorizedFixture.organizationId,
+        actorEmail: authorizedFixture.email,
+        commerceExportGlobalId: staleShopifyExport.rows[0].global_id,
+        reason: 'Record the exact Shopify fulfillment observed by read-only reconciliation',
+        idempotencyKey: `retry-stale-shopify-observed-${randomUUID()}`,
+      })
+    assert.equal(reconciledStaleShopifyExport.state, 'succeeded')
+    assert.equal(
+      reconciledStaleShopifyExport.providerReference,
+      'shopify-reconciled-fulfillment-reference',
+    )
+    assert.equal(
+      shopifyFulfillmentExecutionCalls,
+      executionCallsBeforeStaleRecovery,
+      'Exact reconciliation success must not repeat the Shopify mutation',
+    )
+    assert.equal(
+      shopifyFulfillmentReconciliationCalls,
+      reconciliationCallsBeforeStaleRecovery + 3,
+    )
+    const reconciledStaleShopifyEvidence = await pool.query(
+      `SELECT state, attempts, error_code
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [authorizedFixture.organizationId, staleShopifyExport.rows[0].global_id],
+    )
+    assert.deepEqual(reconciledStaleShopifyEvidence.rows[0], {
+      state: 'succeeded',
+      attempts: 4,
+      error_code: null,
+    })
+    shopifyFulfillmentReconciliationResult = null
+
     const staleFixture = await createFixture('stale')
     const stale = await advanceOrderToPacked(persistence, staleFixture, 'stale')
     await addActiveLabel(pool, staleFixture, stale.planned.orderGlobalId, 'mock')
@@ -1403,6 +1979,86 @@ async function main() {
     'UNIQUE (organization_id, idempotency_key)',
   ]) {
     assert.ok(migration.includes(fragment), `Shipment completion migration is missing ${fragment}`)
+  }
+  const notificationMigration = read(
+    'db/migrations/0201_operations_fulfillment_notification_policy.sql',
+  )
+  for (const fragment of [
+    "SET LOCAL lock_timeout = '5s'",
+    "SET LOCAL statement_timeout = '25s'",
+    'operations_shopify_fulfillment_notification_policies',
+    'notify_customer_default boolean NOT NULL DEFAULT false',
+    "policy_version = 'shopify-fulfillment-notification-v1'",
+    'Fulfillment notification policy is Shopify-commerce-only',
+  ]) {
+    assert.ok(
+      notificationMigration.includes(fragment),
+      `Fulfillment notification migration is missing ${fragment}`,
+    )
+  }
+  assert.ok(
+    !notificationMigration.includes("'provider_managed'"),
+    'Notification policy migration must not add a provider-managed fulfillment-export terminal state',
+  )
+  const operationsSource = read('app_src/lib/persistence/operations.ts')
+  for (const fragment of [
+    'sandbox_e2e_suppression',
+    'retryOperationsCommerceFulfillmentExportFromPostgres',
+    "commandType: 'retry_operations_commerce_fulfillment_export'",
+    "AND attempts = $7",
+    "let recoveryMode: 'execute' | 'reconcile_only'",
+    'registerShopifyFulfillmentProviderAttempt',
+    'operations_commerce_provider_attempts',
+    "'shopify.fulfillment.create'",
+    "providerWriteProtocol: 'shopify-fulfillment-attempt-v2'",
+    'reconcileShopifyFulfillmentWriteback',
+    'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED',
+    "mode: 'unavailable'",
+    'customerNotification: resolvedCustomerNotification',
+    'OPERATIONS_FAIRE_FULFILLMENT_EXPORT_NOT_IMPLEMENTED',
+  ]) {
+    assert.ok(
+      operationsSource.includes(fragment),
+      `Shipment completion persistence is missing ${fragment}`,
+    )
+  }
+  const commerceRoute = read('app_src/app/api/integrations/commerce/route.ts')
+  for (const fragment of [
+    "action === 'set-shopify-fulfillment-notification-policy'",
+    'requireActivator(actor)',
+    'setShopifyFulfillmentNotificationPolicy',
+  ]) {
+    assert.ok(
+      commerceRoute.includes(fragment),
+      `Commerce policy API is missing ${fragment}`,
+    )
+  }
+  const commercePanel = read('app_src/components/settings/CommerceIntegrationPanel.tsx')
+  for (const fragment of [
+    'Fulfillment &amp; tracking',
+    'Save notification default',
+    'changing this setting never emails customers for prior shipments',
+  ]) {
+    assert.ok(
+      commercePanel.includes(fragment),
+      `Commerce policy settings UI is missing ${fragment}`,
+    )
+  }
+  const operationsPanel = read('app_src/components/operations/OperationsSection.tsx')
+  assert.ok(
+    operationsPanel.includes('This commerce provider does not expose a ClawPilot customer-notification'),
+    'Operations UI must not describe every non-Shopify provider as Faire',
+  )
+  const operationsRoute = read('app_src/app/api/operations/route.ts')
+  for (const fragment of [
+    "action === 'retry-commerce-fulfillment-export'",
+    'retryOperationsCommerceFulfillmentExportFromPostgres',
+    'Customer notification exception reason',
+  ]) {
+    assert.ok(
+      operationsRoute.includes(fragment),
+      `Operations fulfillment API is missing ${fragment}`,
+    )
   }
   const packageAllocationMigration = read(
     'db/migrations/0121_operations_package_contents.sql',

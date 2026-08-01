@@ -79,14 +79,14 @@ const INTAKE_POLICY_VERSION = 'commerce-intake-resolution-v2'
 const INTAKE_RETENTION_DAYS = 30
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const RUN_PATTERN = /^gcir[0-9]{7}$/
-const CANDIDATE_PATTERN = /^gcoc[0-9]{7}$/
-const REJECTION_PATTERN = /^gcrj[0-9]{7}$/
-const PRODUCT_CANDIDATE_PATTERN = /^gcpc[0-9]{7}$/
-const LINE_PATTERN = /^gcol[0-9]{7}$/
-const PRODUCT_PATTERN = /^gp[0-9]{7}$/
-const CUSTOMER_PATTERN = /^ga[0-9]{7}$/
-const PACKAGE_PROFILE_PATTERN = /^gpp[0-9]{7}$/
+const RUN_PATTERN = /^gcir(?:[0-9]{7}|[0-9a-v]{12})$/
+const CANDIDATE_PATTERN = /^gcoc(?:[0-9]{7}|[0-9a-v]{12})$/
+const REJECTION_PATTERN = /^gcrj(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRODUCT_CANDIDATE_PATTERN = /^gcpc(?:[0-9]{7}|[0-9a-v]{12})$/
+const LINE_PATTERN = /^gcol(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRODUCT_PATTERN = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/
+const CUSTOMER_PATTERN = /^ga(?:[0-9]{7}|[0-9a-v]{12})$/
+const PACKAGE_PROFILE_PATTERN = /^gpp(?:[0-9]{7}|[0-9a-v]{12})$/
 
 const SHOPIFY_ORDER_PAGE_SIZE = 25
 const SHOPIFY_PRODUCT_VARIANT_PAGE_SIZE = 50

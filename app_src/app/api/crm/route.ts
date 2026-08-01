@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
+import { GLOBAL_ID_MAX_LENGTH } from '@/lib/globalIds.mjs'
 import {
   CRM_ENTITIES,
   type CrmActivityStatus,
@@ -296,7 +297,7 @@ export async function POST(req: NextRequest) {
           priority: stringValue(fields.priority, 50), contactType: stringValue(fields.contactType, 100),
           accountManager: stringValue(fields.accountManager, 200),
           ...(fields.ownerUserReferenceCode === undefined ? {} : {
-            ownerUserReferenceCode: stringValue(fields.ownerUserReferenceCode, 9).toLowerCase() || null,
+            ownerUserReferenceCode: stringValue(fields.ownerUserReferenceCode, GLOBAL_ID_MAX_LENGTH).toLowerCase() || null,
           }),
           jobTitle: stringValue(fields.jobTitle, 250),
           email: validEmail(fields.email), linkedinUrl: stringValue(fields.linkedinUrl, 500),

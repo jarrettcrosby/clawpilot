@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import type { CrmMeeting } from '@/lib/crm/types'
+import { globalIdFragment, globalIdPattern } from '@/lib/globalIds.mjs'
 import { matonFetch } from '@/lib/maton'
 import {
   stageCrmRecordInPostgres,
@@ -19,10 +20,13 @@ const MAX_DESCRIPTION_CHARS = 50_000
 const MAX_LOCATION_CHARS = 1_000
 const MAX_ATTENDEES = 100
 const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
-const MEETING_REFERENCE_PATTERN = /^gm[0-9]{7}$/
+const MEETING_REFERENCE_PATTERN = globalIdPattern('gm')
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/
 const MANAGED_DESCRIPTION_BOUNDARY = '\n\n---\nClawPilot meeting:'
-const MANAGED_DESCRIPTION_ONLY_PATTERN = /^ClawPilot meeting:\s*https:\/\/[^\n]+\nClawPilot ID:\s*gm[0-9]{7}\s*$/i
+const MANAGED_DESCRIPTION_ONLY_PATTERN = new RegExp(
+  `^ClawPilot meeting:\\s*https:\\/\\/[^\\n]+\\nClawPilot ID:\\s*${globalIdFragment('gm')}\\s*$`,
+  'i',
+)
 
 type JsonObject = Record<string, unknown>
 type TimestampValue = string | Date

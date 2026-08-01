@@ -524,7 +524,7 @@ assert.ok(
   'carrier rate calls must propagate the checkout abort signal',
 )
 assert.ok(
-  checkoutRate.includes("const ACCOUNT_GLOBAL_ID = /^gac[0-9]{7}$/"),
+  checkoutRate.includes("const ACCOUNT_GLOBAL_ID = /^gac(?:[0-9]{7}|[0-9a-v]{12})$/"),
   'checkout rating must accept canonical carrier-account Global IDs',
 )
 assert.ok(

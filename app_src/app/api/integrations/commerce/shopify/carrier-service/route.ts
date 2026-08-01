@@ -90,8 +90,8 @@ export const runtime = 'nodejs'
 export const maxDuration = 60
 
 const MAX_REQUEST_BYTES = 32 * 1024
-const ACCOUNT_GLOBAL_ID = /^gia[0-9]{7}$/
-const MUTATION_AUTHORIZATION_GLOBAL_ID = /^gsca[0-9]{7}$/
+const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
+const MUTATION_AUTHORIZATION_GLOBAL_ID = /^gsca(?:[0-9]{7}|[0-9a-v]{12})$/
 const CONFIRMATION_REQUEST_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 

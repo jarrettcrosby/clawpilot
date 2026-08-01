@@ -178,13 +178,13 @@ export class ShopifyCarrierServiceMutationAuthorizationError
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const SHA256 = /^[a-f0-9]{64}$/
-const ACCOUNT_GLOBAL_ID = /^gia[0-9]{7}$/
-const CONFIG_GLOBAL_ID = /^gscf[0-9]{7}$/
-const EFFECT_GLOBAL_ID = /^gcef[0-9]{7}$/
-const AUTHORIZATION_GLOBAL_ID = /^gsca[0-9]{7}$/
-const ATTEMPT_GLOBAL_ID = /^gscm[0-9]{7}$/
-const OUTCOME_GLOBAL_ID = /^gsco[0-9]{7}$/
-const RESOLUTION_GLOBAL_ID = /^gscr[0-9]{7}$/
+const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
+const CONFIG_GLOBAL_ID = /^gscf(?:[0-9]{7}|[0-9a-v]{12})$/
+const EFFECT_GLOBAL_ID = /^gcef(?:[0-9]{7}|[0-9a-v]{12})$/
+const AUTHORIZATION_GLOBAL_ID = /^gsca(?:[0-9]{7}|[0-9a-v]{12})$/
+const ATTEMPT_GLOBAL_ID = /^gscm(?:[0-9]{7}|[0-9a-v]{12})$/
+const OUTCOME_GLOBAL_ID = /^gsco(?:[0-9]{7}|[0-9a-v]{12})$/
+const RESOLUTION_GLOBAL_ID = /^gscr(?:[0-9]{7}|[0-9a-v]{12})$/
 const SHOPIFY_SERVICE_GID =
   /^gid:\/\/shopify\/DeliveryCarrierService\/[0-9]+$/
 const ERROR_CODE = /^[A-Z][A-Z0-9_]{1,127}$/
@@ -1681,7 +1681,7 @@ export async function finalizeShopifyCarrierServiceNameAlignmentInPostgres(
     ),
     evidenceGlobalId: identifier(
       rawInput.evidenceGlobalId,
-      /^(?:gsco|gscr)[0-9]{7}$/,
+      /^(?:gsco|gscr)(?:[0-9]{7}|[0-9a-v]{12})$/,
       'Applied mutation evidence Global ID',
     ),
     actorEmail: actorEmail(rawInput.actorEmail),
@@ -1999,7 +1999,7 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
     ),
     evidenceGlobalId: identifier(
       rawInput.evidenceGlobalId,
-      /^(?:gsco|gscr)[0-9]{7}$/,
+      /^(?:gsco|gscr)(?:[0-9]{7}|[0-9a-v]{12})$/,
       'Applied mutation evidence Global ID',
     ),
     actorEmail: actorEmail(rawInput.actorEmail),

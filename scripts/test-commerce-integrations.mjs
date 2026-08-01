@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as globalIds from '../app_src/lib/globalIds.mjs'
 
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
@@ -905,6 +906,7 @@ const cryptoModule = loadTypeScriptModule(
   'app_src/lib/integrations/commerceCredentialCrypto.ts',
   {
     mocks: {
+      '@/lib/globalIds.mjs': globalIds,
       '@/lib/persistence/config': { isHostedRuntime: () => false },
     },
   },

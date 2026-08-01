@@ -27,7 +27,7 @@ export const revalidate = 0
 export const runtime = 'nodejs'
 
 const MAX_REQUEST_BYTES = 16 * 1024
-const MATERIAL_GLOBAL_ID = /^gmat\d{7}$/
+const MATERIAL_GLOBAL_ID = /^gmat(?:[0-9]{7}|[0-9a-v]{12})$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const MATERIAL_FIELDS = new Set([
   'action',

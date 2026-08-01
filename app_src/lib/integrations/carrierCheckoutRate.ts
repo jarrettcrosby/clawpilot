@@ -144,10 +144,10 @@ export class CheckoutShipmentRateError extends Error {
   }
 }
 
-const ACCOUNT_GLOBAL_ID = /^gac[0-9]{7}$/
+const ACCOUNT_GLOBAL_ID = /^gac(?:[0-9]{7}|[0-9a-v]{12})$/
 const PACKAGE_KEY = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/
 const SERVICE_CODE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/
-const EVIDENCE_GLOBAL_ID = /^grq[0-9]{7}$/
+const EVIDENCE_GLOBAL_ID = /^grq(?:[0-9]{7}|[0-9a-v]{12})$/
 const CURRENCY = /^[A-Z]{3}$/
 const DECIMAL_MONEY = /^(?:0|[1-9][0-9]{0,12})(?:\.[0-9]{1,2})?$/
 export const CHECKOUT_RATE_ALTERNATIVE_BUDGET_MS = 1_000

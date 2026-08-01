@@ -141,7 +141,7 @@ function global_id_definition_is_current(array $definition, bool $unifiedSearch 
 {
     $fullText = $definition['full_text_search'] ?? null;
     $base = ($definition['vname'] ?? '') === CLAWPILOT_GLOBAL_ID_LABEL
-        && (int) ($definition['len'] ?? 0) === 9
+        && (int) ($definition['len'] ?? 0) >= 17
         && !empty($definition['audited'])
         && !empty($definition['reportable']);
     if (!$base || !$unifiedSearch) {
@@ -173,8 +173,8 @@ function ensure_global_id_field(string $module, bool $unifiedSearch = true): voi
         $field->label = CLAWPILOT_GLOBAL_ID_LABEL;
         $field->vname = CLAWPILOT_GLOBAL_ID_LABEL;
         $field->label_value = 'Global ID';
-        $field->len = '9';
-        $field->size = '12';
+        $field->len = '32';
+        $field->size = '32';
         $field->required = false;
         $field->default = null;
         $field->default_value = null;
