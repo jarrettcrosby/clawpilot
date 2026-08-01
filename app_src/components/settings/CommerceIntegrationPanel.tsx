@@ -141,6 +141,14 @@ type CommerceCatalog = {
       requiredBeforeConnect: readonly string[]
       receiptProofScopes: readonly string[]
       acceptedReceiptTopics: readonly string[]
+      webhookSetupGroups: readonly {
+        key: string
+        label: string
+        topics: readonly string[]
+        requiredScopes: readonly string[]
+        state: 'available' | 'processor_pending' | 'privacy_lifecycle_pending'
+        behavior: string
+      }[]
       unsupportedCredentialMode: string
     }
     faire: {
@@ -1813,6 +1821,43 @@ export default function CommerceIntegrationPanel() {
                               </Alert>
                             )
                           })()}
+                          <Accordion disableGutters sx={{ mb: 1 }}>
+                            <AccordionSummary expandIcon={<ExpandMoreRounded />}>
+                              <Box>
+                                <Typography variant="subtitle2" fontWeight={700}>
+                                  Webhook setup plan
+                                </Typography>
+                                <Typography variant="caption" color="text.secondary">
+                                  Provider registration and ClawPilot processing readiness are tracked separately.
+                                </Typography>
+                              </Box>
+                            </AccordionSummary>
+                            <AccordionDetails>
+                              <Stack spacing={1}>
+                                {catalog?.onboarding.shopify.webhookSetupGroups.map((group) => (
+                                  <Alert
+                                    key={group.key}
+                                    severity={group.state === 'available' ? 'success' : 'info'}
+                                  >
+                                    <Typography variant="body2" fontWeight={700}>
+                                      {group.label} · {group.state === 'available'
+                                        ? 'Ready to register'
+                                        : group.state === 'privacy_lifecycle_pending'
+                                          ? 'Privacy lifecycle required'
+                                          : 'Processor pending'}
+                                    </Typography>
+                                    <Typography variant="body2">{group.behavior}</Typography>
+                                    <Typography variant="caption" display="block" sx={{ mt: 0.5 }}>
+                                      Topics: {group.topics.join(', ')}
+                                    </Typography>
+                                    <Typography variant="caption" display="block">
+                                      Scopes: {group.requiredScopes.join(', ')}
+                                    </Typography>
+                                  </Alert>
+                                ))}
+                              </Stack>
+                            </AccordionDetails>
+                          </Accordion>
                           <Stack
                             direction={{ xs: 'column', sm: 'row' }}
                             spacing={1}
