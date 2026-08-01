@@ -283,6 +283,49 @@ assert.ok(
 )
 
 const carrierApi = read('app_src/app/api/integrations/carriers/route.ts')
+const safePrinterProjection = carrierApi.slice(
+  carrierApi.indexOf('function safeRateTestPrinter('),
+  carrierApi.indexOf('function safeRateTestLabel('),
+)
+for (const fragment of [
+  'globalId: printer.globalId',
+  'warehouseGlobalId: printer.warehouseGlobalId',
+  'connectionMode: printer.connectionMode',
+  'supportedFormats: printer.supportedFormats',
+  'supportedMedia: printer.supportedMedia',
+  'supportedDocumentTypes: printer.supportedDocumentTypes',
+  'localPrintAgentStatus: printer.localPrintAgentStatus',
+  'status: printer.status',
+]) {
+  assert.ok(
+    safePrinterProjection.includes(fragment),
+    `Browser-safe printer readiness projection missing: ${fragment}`,
+  )
+}
+for (const forbidden of [
+  'id: printer.id',
+  'warehouseId: printer.warehouseId',
+  'localPrintAgentGlobalId: printer.localPrintAgentGlobalId',
+]) {
+  assert.ok(
+    !safePrinterProjection.includes(forbidden),
+    `Browser-safe printer readiness projection must not expose internal identity: ${forbidden}`,
+  )
+}
+const carrierGet = carrierApi.slice(
+  carrierApi.indexOf('export async function GET('),
+  carrierApi.indexOf('export async function PATCH('),
+)
+for (const fragment of [
+  'const organization = organizationId(actor)',
+  'listOperationsPrinterProfilesInPostgres(organization)',
+  'rateTestPrinters: printers.map(safeRateTestPrinter)',
+]) {
+  assert.ok(
+    carrierGet.includes(fragment),
+    `Carrier GET printer readiness must remain organization-scoped and browser-safe: ${fragment}`,
+  )
+}
 for (const fragment of [
   'rateTestLabelOutputs',
   "carrierSandboxLabelOutputOptions('ups_rest')",
@@ -332,10 +375,74 @@ for (const fragment of [
   'Close UPS sample without carrier call',
   "'close-rate-test-sample-label'",
   'provider code',
+  'Step 3 · Print stored label',
+  'Create a sandbox label or select one from Stored test labels before printing.',
+  'Warehouse-execution permission is required to test print stored labels.',
+  'No available printer profiles are configured in an active warehouse for this organization.',
+  'Printer profiles are configured, but none supports shipping labels in',
+  'An exact-compatible printer profile exists, but none is online.',
+  'An online exact-compatible printer exists, but none is bound to an active enrolled local print',
+  'Select one compatible printer to enable the test print.',
+  'disabled={busy || !testPrintEligible}',
+  "aria-describedby={printReadinessBlocker ? 'rate-test-print-readiness-message' : undefined}",
 ]) {
   assert.ok(
     carrierUi.includes(fragment),
     `Missing carrier label output UI contract: ${fragment}`,
+  )
+}
+
+const printStepIndex = carrierUi.indexOf('Step 3 · Print stored label')
+const printWorkflowGateIndex = carrierUi.lastIndexOf(
+  '{labelWorkflowAuthorized ? (',
+  printStepIndex,
+)
+const selectedLabelGateIndex = carrierUi.lastIndexOf(
+  '{selectedRateTestLabel ? (',
+  printStepIndex,
+)
+assert.ok(
+  printWorkflowGateIndex > selectedLabelGateIndex,
+  'Authorized label workflows must render Step 3 before a stored label is selected',
+)
+
+const printReadinessPriority = carrierUi.slice(
+  carrierUi.indexOf('const printReadinessBlocker ='),
+  carrierUi.indexOf('const testPrintEligible ='),
+)
+const labelRequiredIndex = printReadinessPriority.indexOf("'label_required'")
+const executionPermissionIndex = printReadinessPriority.indexOf("'execution_permission_required'")
+const printerProfileIndex = printReadinessPriority.indexOf("'printer_profile_required'")
+const exactCapabilityIndex = printReadinessPriority.indexOf("'exact_printer_capability_required'")
+const compatiblePrinterOfflineIndex = printReadinessPriority.indexOf("'compatible_printer_offline'")
+const activeLocalAgentIndex = printReadinessPriority.indexOf("'active_local_agent_required'")
+const printerSelectionIndex = printReadinessPriority.indexOf("'printer_selection_required'")
+assert.ok(
+  labelRequiredIndex !== -1
+    && executionPermissionIndex > labelRequiredIndex
+    && printerProfileIndex > executionPermissionIndex
+    && exactCapabilityIndex > printerProfileIndex
+    && compatiblePrinterOfflineIndex > exactCapabilityIndex
+    && activeLocalAgentIndex > compatiblePrinterOfflineIndex
+    && printerSelectionIndex > activeLocalAgentIndex,
+  'Print readiness must deterministically distinguish profile, capability, online, active-agent, and selection blockers',
+)
+
+const exactCapabilityFilters = carrierUi.slice(
+  carrierUi.indexOf('const exactCapabilityRateTestPrinters ='),
+  carrierUi.indexOf('const effectiveRateTestPrinterGlobalId ='),
+)
+for (const fragment of [
+  "entry.supportedDocumentTypes.includes('shipping_label')",
+  'entry.supportedFormats.includes(selectedRateTestLabel.format)',
+  'entry.supportedMedia.includes(selectedRateTestLabel.mediaSize)',
+  "entry.status === 'online'",
+  "entry.connectionMode === 'local_agent'",
+  "entry.localPrintAgentStatus === 'active'",
+]) {
+  assert.ok(
+    exactCapabilityFilters.includes(fragment),
+    `Print readiness exact-route filter missing: ${fragment}`,
   )
 }
 

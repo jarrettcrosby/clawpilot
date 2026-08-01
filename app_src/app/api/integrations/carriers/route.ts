@@ -425,16 +425,7 @@ export async function GET(req: NextRequest) {
       integrations,
       rateTestLabels: rateTestLabels.map(safeRateTestLabel),
       rateTestAttempts: rateTestAttempts.map(safeRateTestLabelAttempt),
-      rateTestPrinters: printers
-        .filter((printer) => (
-          printer.status === 'online'
-          && printer.connectionMode === 'local_agent'
-          && printer.localPrintAgentStatus === 'active'
-          && printer.supportedDocumentTypes.includes('shipping_label')
-          && printer.supportedFormats.length > 0
-          && printer.supportedMedia.some((media) => media === 'label_4x6' || media === 'label_4x8')
-        ))
-        .map(safeRateTestPrinter),
+      rateTestPrinters: printers.map(safeRateTestPrinter),
       rateTestLabelOutputs: {
         ups_rest: carrierSandboxLabelOutputOptions('ups_rest'),
         fedex_rest: carrierSandboxLabelOutputOptions('fedex_rest'),

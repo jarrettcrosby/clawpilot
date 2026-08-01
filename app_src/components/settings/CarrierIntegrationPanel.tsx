@@ -596,18 +596,26 @@ export default function CarrierIntegrationPanel() {
   const selectedReconciliationAttempt = visibleReconciliationAttempts.find(
     (entry) => entry.globalId === reconciliationAttemptGlobalId,
   ) || null
-  const compatibleRateTestPrinters = useMemo(
+  const exactCapabilityRateTestPrinters = useMemo(
     () => !selectedRateTestLabel
       ? []
       : rateTestPrinters.filter((entry) => (
-          entry.status === 'online'
-          && entry.connectionMode === 'local_agent'
-          && entry.localPrintAgentStatus === 'active'
-          && entry.supportedDocumentTypes.includes('shipping_label')
+          entry.supportedDocumentTypes.includes('shipping_label')
           && entry.supportedFormats.includes(selectedRateTestLabel.format)
           && entry.supportedMedia.includes(selectedRateTestLabel.mediaSize)
         )),
     [rateTestPrinters, selectedRateTestLabel],
+  )
+  const onlineExactCapabilityRateTestPrinters = useMemo(
+    () => exactCapabilityRateTestPrinters.filter((entry) => entry.status === 'online'),
+    [exactCapabilityRateTestPrinters],
+  )
+  const compatibleRateTestPrinters = useMemo(
+    () => onlineExactCapabilityRateTestPrinters.filter((entry) => (
+      entry.connectionMode === 'local_agent'
+      && entry.localPrintAgentStatus === 'active'
+    )),
+    [onlineExactCapabilityRateTestPrinters],
   )
   const effectiveRateTestPrinterGlobalId = compatibleRateTestPrinters.some(
     (entry) => entry.globalId === selectedRateTestPrinterGlobalId,
@@ -617,6 +625,24 @@ export default function CarrierIntegrationPanel() {
   const selectedRateTestPrinter = compatibleRateTestPrinters.find(
     (entry) => entry.globalId === effectiveRateTestPrinterGlobalId,
   ) || null
+  const printReadinessBlocker = !selectedRateTestLabel
+    ? 'label_required'
+    : !canExecute
+      ? 'execution_permission_required'
+      : selectedRateTestLabel.status === 'voided'
+        ? 'label_voided'
+        : !rateTestPrinters.length
+          ? 'printer_profile_required'
+          : !exactCapabilityRateTestPrinters.length
+            ? 'exact_printer_capability_required'
+            : !onlineExactCapabilityRateTestPrinters.length
+              ? 'compatible_printer_offline'
+              : !compatibleRateTestPrinters.length
+                ? 'active_local_agent_required'
+                : !selectedRateTestPrinter
+                  ? 'printer_selection_required'
+                  : null
+  const testPrintEligible = printReadinessBlocker === null
   const labelWorkflowStep = selectedRateTestLabel?.status === 'voided'
     ? 4
     : selectedRateTestLabel
@@ -2417,13 +2443,15 @@ export default function CarrierIntegrationPanel() {
             </Box>
           ) : null}
 
-          {selectedRateTestLabel ? (
-            <>
-              <Box sx={{ mt: 3, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
-                <Typography variant="overline" color="text.disabled">Step 3 · Print stored label</Typography>
-                <Typography variant="subtitle2" fontWeight={700}>
-                  Route {selectedRateTestLabel.globalId} to a compatible printer
-                </Typography>
+          <Box sx={{ mt: 3, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
+            <Typography variant="overline" color="text.disabled">Step 3 · Print stored label</Typography>
+            <Typography variant="subtitle2" fontWeight={700}>
+              {selectedRateTestLabel
+                ? `Route ${selectedRateTestLabel.globalId} to a compatible printer`
+                : 'Print readiness'}
+            </Typography>
+            {selectedRateTestLabel ? (
+              <>
                 <Alert severity="info" sx={{ mt: 1.5, borderRadius: '8px' }}>
                   Printing queues the label bytes already stored in ClawPilot. It does not call the carrier,
                   buy postage, create another label, or change the tracking number.
@@ -2471,69 +2499,134 @@ export default function CarrierIntegrationPanel() {
                     </Button>
                   </Box>
                 ) : null}
-                {selectedRateTestLabel.status === 'voided' ? (
-                  <Alert severity="warning" sx={{ mt: 1.5, borderRadius: '8px' }}>
-                    This label is voided and cannot be queued for a new test print.
-                  </Alert>
-                ) : compatibleRateTestPrinters.length ? (
-                  <Stack spacing={1.5} sx={{ mt: 1.5 }}>
-                    <FormControl fullWidth size="small">
-                      <InputLabel id="rate-test-printer-label">Compatible printer</InputLabel>
-                      <Select
-                        labelId="rate-test-printer-label"
-                        label="Compatible printer"
-                        value={effectiveRateTestPrinterGlobalId}
-                        onChange={(event) => {
-                          setSelectedRateTestPrinterGlobalId(event.target.value)
-                          setPrintLabelIdempotencyKey('')
-                        }}
-                        disabled={busy}
-                      >
-                        {compatibleRateTestPrinters.map((entry) => (
-                          <MenuItem key={entry.globalId} value={entry.globalId}>
-                            {entry.name} · {entry.warehouseName} · {entry.connectionMode.replace('_', ' ')}
-                          </MenuItem>
-                        ))}
-                      </Select>
-                    </FormControl>
-                    <Box>
-                      <Button
-                        variant="contained"
-                        startIcon={pendingAction === 'print-rate-test-label'
-                          ? <CircularProgress size={16} color="inherit" />
-                          : <PrintRounded />}
-                        disabled={busy || !canExecute || !selectedRateTestPrinter}
-                        onClick={() => void printRateTestLabel()}
-                        sx={buttonSx}
-                      >
-                        Test print stored label
-                      </Button>
-                    </Box>
-                    {rateTestPrintJob?.sourceLabelGlobalId === selectedRateTestLabel.globalId ? (
-                      <>
-                        <Alert
-                          severity={rateTestPrintJob.status === 'failed' ? 'warning' : 'success'}
-                          sx={{ borderRadius: '8px' }}
-                        >
-                          Print job {rateTestPrintJob.globalId} is {rateTestPrintJob.status} for{' '}
-                          {rateTestPrintJob.printerName}. Retry and controlled reprint remain available in
-                          Operations print jobs and reuse the same stored label bytes.
-                        </Alert>
-                      </>
-                    ) : null}
-                  </Stack>
-                ) : (
-                  <Alert severity="warning" sx={{ mt: 1.5, borderRadius: '8px' }}>
-                    No online local-agent printer supports shipping labels in {selectedRateTestLabel.format}{' '}
-                    on {selectedRateTestLabel.mediaSize}.{' '}
-                    {selectedRateTestLabel.format === 'PDF'
-                      ? 'This existing provider PDF remains immutable. Void it below, run a new sandbox rate, and create a new provider-native thermal ZPL label for a ZPL printer; or configure a PDF-capable local print service.'
-                      : 'Configure a printer that explicitly supports this exact format and media before printing.'}
-                  </Alert>
-                )}
-              </Box>
+              </>
+            ) : null}
+            {printReadinessBlocker === 'label_required' ? (
+              <Alert
+                id="rate-test-print-readiness-message"
+                severity="info"
+                sx={{ mt: 1.5, borderRadius: '8px' }}
+              >
+                Create a sandbox label or select one from Stored test labels before printing.
+              </Alert>
+            ) : printReadinessBlocker === 'execution_permission_required' ? (
+              <Alert
+                id="rate-test-print-readiness-message"
+                severity="warning"
+                sx={{ mt: 1.5, borderRadius: '8px' }}
+              >
+                Warehouse-execution permission is required to test print stored labels.
+              </Alert>
+            ) : printReadinessBlocker === 'label_voided' ? (
+              <Alert
+                id="rate-test-print-readiness-message"
+                severity="warning"
+                sx={{ mt: 1.5, borderRadius: '8px' }}
+              >
+                This label is voided and cannot be queued for a new test print.
+              </Alert>
+            ) : printReadinessBlocker === 'printer_profile_required' ? (
+              <Alert
+                id="rate-test-print-readiness-message"
+                severity="warning"
+                sx={{ mt: 1.5, borderRadius: '8px' }}
+              >
+                No available printer profiles are configured in an active warehouse for this organization.
+                Configure a shipping-label printer profile before printing.
+              </Alert>
+            ) : printReadinessBlocker === 'exact_printer_capability_required' && selectedRateTestLabel ? (
+              <Alert
+                id="rate-test-print-readiness-message"
+                severity="warning"
+                sx={{ mt: 1.5, borderRadius: '8px' }}
+              >
+                Printer profiles are configured, but none supports shipping labels in{' '}
+                {selectedRateTestLabel.format} on {selectedRateTestLabel.mediaSize}.{' '}
+                {selectedRateTestLabel.format === 'PDF'
+                  ? 'This existing provider PDF remains immutable. Void it below, run a new sandbox rate, and create a new provider-native thermal ZPL label for a ZPL printer; or configure a PDF-capable local print service.'
+                  : 'Configure a printer that explicitly supports this exact format and media before printing.'}
+              </Alert>
+            ) : printReadinessBlocker === 'compatible_printer_offline' ? (
+              <Alert
+                id="rate-test-print-readiness-message"
+                severity="warning"
+                sx={{ mt: 1.5, borderRadius: '8px' }}
+              >
+                An exact-compatible printer profile exists, but none is online. Bring one online or re-enable
+                a disabled compatible profile before printing.
+              </Alert>
+            ) : printReadinessBlocker === 'active_local_agent_required' ? (
+              <Alert
+                id="rate-test-print-readiness-message"
+                severity="warning"
+                sx={{ mt: 1.5, borderRadius: '8px' }}
+              >
+                An online exact-compatible printer exists, but none is bound to an active enrolled local print
+                agent. Bind or reactivate its agent, or switch the printer to local-agent delivery, before
+                printing.
+              </Alert>
+            ) : printReadinessBlocker === 'printer_selection_required' ? (
+              <Alert
+                id="rate-test-print-readiness-message"
+                severity="info"
+                sx={{ mt: 1.5, borderRadius: '8px' }}
+              >
+                Select one compatible printer to enable the test print.
+              </Alert>
+            ) : null}
+            {selectedRateTestLabel
+              && canExecute
+              && selectedRateTestLabel.status !== 'voided'
+              && compatibleRateTestPrinters.length ? (
+              <FormControl fullWidth size="small" sx={{ mt: 1.5 }}>
+                <InputLabel id="rate-test-printer-label">Compatible printer</InputLabel>
+                <Select
+                  labelId="rate-test-printer-label"
+                  label="Compatible printer"
+                  value={effectiveRateTestPrinterGlobalId}
+                  onChange={(event) => {
+                    setSelectedRateTestPrinterGlobalId(event.target.value)
+                    setPrintLabelIdempotencyKey('')
+                  }}
+                  disabled={busy}
+                >
+                  {compatibleRateTestPrinters.map((entry) => (
+                    <MenuItem key={entry.globalId} value={entry.globalId}>
+                      {entry.name} · {entry.warehouseName} · {entry.connectionMode.replace('_', ' ')}
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            ) : null}
+            <Box sx={{ mt: 1.5 }}>
+              <Button
+                variant="contained"
+                startIcon={pendingAction === 'print-rate-test-label'
+                  ? <CircularProgress size={16} color="inherit" />
+                  : <PrintRounded />}
+                disabled={busy || !testPrintEligible}
+                aria-describedby={printReadinessBlocker ? 'rate-test-print-readiness-message' : undefined}
+                onClick={() => void printRateTestLabel()}
+                sx={buttonSx}
+              >
+                Test print stored label
+              </Button>
+            </Box>
+            {selectedRateTestLabel
+              && rateTestPrintJob?.sourceLabelGlobalId === selectedRateTestLabel.globalId ? (
+                <Alert
+                  severity={rateTestPrintJob.status === 'failed' ? 'warning' : 'success'}
+                  sx={{ mt: 1.5, borderRadius: '8px' }}
+                >
+                  Print job {rateTestPrintJob.globalId} is {rateTestPrintJob.status} for{' '}
+                  {rateTestPrintJob.printerName}. Retry and controlled reprint remain available in
+                  Operations print jobs and reuse the same stored label bytes.
+                </Alert>
+              ) : null}
+          </Box>
 
-              <Box sx={{ mt: 3, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
+          {selectedRateTestLabel ? (
+            <Box sx={{ mt: 3, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
                 <Typography variant="overline" color="text.disabled">
                   Step 4 · {selectedRateTestLabel.lifecycleMode === 'close_sample'
                     ? 'Close sample'
@@ -2652,8 +2745,7 @@ export default function CarrierIntegrationPanel() {
                     </Box>
                   </Stack>
                 )}
-              </Box>
-            </>
+            </Box>
           ) : null}
             </>
           ) : null}
