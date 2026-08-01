@@ -51,11 +51,190 @@ vm.runInNewContext(output, {
 }, { filename: sourcePath })
 
 const {
+  assertMatchedShopifyCheckoutPackLineage,
+  assertHybridCartonizationCandidateEligible,
   HybridCartonizationPersistenceError,
   evaluateHybridCartonizationInventoryAvailability,
   hybridCartonizationInventoryProjectionStates,
   normalizeHybridCartonizationReadRequest,
+  resolveOperationalShopifyCheckoutReconciliation,
 } = module.exports
+
+const matchedCheckoutDecision = {
+  outcome: 'matched',
+  source_shopify_service_code: 'clawpilot:ups:03',
+  receipt_id: '00000000-0000-4000-8000-000000000040',
+  receipt_global_id: 'gsqr0000001',
+  receipt_status: 'succeeded',
+}
+assert.equal(
+  resolveOperationalShopifyCheckoutReconciliation({
+    candidateServiceCode: 'clawpilot:ups:03',
+    rows: [matchedCheckoutDecision],
+  }).receipt_global_id,
+  'gsqr0000001',
+  'A ClawPilot checkout must resolve only its exact current matched succeeded receipt',
+)
+for (const rows of [
+  [],
+  [{ ...matchedCheckoutDecision, outcome: 'rejected', receipt_id: null }],
+  [{ ...matchedCheckoutDecision, receipt_status: 'failed' }],
+]) {
+  assert.throws(
+    () => resolveOperationalShopifyCheckoutReconciliation({
+      candidateServiceCode: 'clawpilot:ups:03',
+      rows,
+    }),
+    (error) => (
+      error instanceof HybridCartonizationPersistenceError
+      && error.code
+        === 'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID'
+    ),
+    'A ClawPilot checkout must fail closed without one current matched succeeded receipt',
+  )
+}
+assert.equal(
+  resolveOperationalShopifyCheckoutReconciliation({
+    candidateServiceCode: 'shopify-standard',
+    rows: [],
+  }),
+  null,
+  'A genuinely non-ClawPilot Shopify shipping method may use candidate-captured pack facts',
+)
+
+const matchedCheckoutLineage = {
+  candidateLineGlobalId: 'gcol0000001',
+  candidateProductId: '00000000-0000-4000-8000-000000000010',
+  candidateProductGlobalId: 'gp0000001',
+  candidateExternalProductId: 'gid://shopify/Product/10',
+  candidateExternalVariantId: 'gid://shopify/ProductVariant/20',
+  receiptLine: {
+    receipt_global_id: 'gsqr0000001',
+    line_key: 'checkout-line-1',
+    provider_variant_id: 'gid://shopify/ProductVariant/20',
+    quantity: 50,
+    unit_weight_grams: 170,
+    line_snapshot: {
+      productGid: 'gid://shopify/Product/10',
+      variantGid: 'gid://shopify/ProductVariant/20',
+      productGlobalId: 'gp0000001',
+      packMappingGlobalId: 'gcvm0000001',
+      packMappingRowVersion: 4,
+      packProfileVersionGlobalId: 'gppv0000001',
+      packProfileVersionRowVersion: 2,
+      packageLevel: 'each',
+      baseEachQuantity: 1,
+      quantity: 50,
+      unitWeightGrams: 170,
+    },
+    pack_mapping_id: '00000000-0000-4000-8000-000000000020',
+    pack_mapping_global_id: 'gcvm0000001',
+    pack_mapping_row_version: '4',
+    pack_mapping_product_id: '00000000-0000-4000-8000-000000000010',
+    pack_mapping_external_product_id: 'gid://shopify/Product/10',
+    pack_mapping_external_variant_id: 'gid://shopify/ProductVariant/20',
+    pack_mapping_purpose: 'shopify_checkout',
+    pack_mapping_projection_state: 'current',
+    pack_mapping_is_current: true,
+    pack_mapping_source_revision: 'source-revision-1',
+    pack_mapping_source_hash: 'source-hash-1',
+    product_global_id: 'gp0000001',
+    channel_source_revision: 'source-revision-1',
+    channel_source_hash: 'source-hash-1',
+    channel_weight_grams: 170,
+    pack_profile_version_id: '00000000-0000-4000-8000-000000000030',
+    pack_profile_version_global_id: 'gppv0000001',
+    pack_profile_version_row_version: '2',
+    pack_profile_is_current: true,
+    pack_profile_lifecycle_state: 'active',
+    pack_profile_fit_model: 'approved_recipe_only',
+    pack_profile_evidence_type: 'customer_confirmed',
+    pack_profile_evidence_reference: 'customer-dimensions',
+    pack_profile_confirmed_at: '2026-07-30T00:00:00.000Z',
+    pack_profile_status: 'active',
+    pack_profile_package_level: 'each',
+    pack_profile_base_each_quantity: 1,
+    pack_profile_length_mm: null,
+    pack_profile_width_mm: null,
+    pack_profile_height_mm: null,
+    pack_profile_dimension_basis: 'unspecified',
+    pack_profile_gross_weight_grams: null,
+    pack_profile_weight_basis: 'unspecified',
+  },
+}
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    assertMatchedShopifyCheckoutPackLineage(matchedCheckoutLineage),
+  )),
+  { mappingRowVersion: 4, profileRowVersion: 2 },
+  'Operational cartonization must accept the exact checkout mapping/profile captured by the matched receipt',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(assertMatchedShopifyCheckoutPackLineage({
+    ...matchedCheckoutLineage,
+    receiptLine: {
+      ...matchedCheckoutLineage.receiptLine,
+      line_snapshot: {
+        ...matchedCheckoutLineage.receiptLine.line_snapshot,
+        packMappingRowVersion: undefined,
+      },
+    },
+  }))),
+  { mappingRowVersion: 4, profileRowVersion: 2 },
+  'A legacy immutable receipt still binds by exact mapping Global ID and current versioned mapping row',
+)
+assert.throws(
+  () => assertMatchedShopifyCheckoutPackLineage({
+    ...matchedCheckoutLineage,
+    receiptLine: {
+      ...matchedCheckoutLineage.receiptLine,
+      pack_profile_version_global_id: 'gppv0000002',
+    },
+  }),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code
+      === 'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID'
+  ),
+  'Operational cartonization must not fall back when checkout profile lineage conflicts',
+)
+
+const candidateEligibilityNow = new Date('2026-07-31T12:00:00.000Z')
+assert.doesNotThrow(
+  () => assertHybridCartonizationCandidateEligible({
+    mode: 'production',
+    workflowState: 'promoted',
+    expiresAt: '2026-07-01T12:00:00.000Z',
+    now: candidateEligibilityNow,
+  }),
+  'A promoted candidate is durable canonical lineage for operational planning even after its review window',
+)
+assert.throws(
+  () => assertHybridCartonizationCandidateEligible({
+    mode: 'sandbox_demo',
+    workflowState: 'promoted',
+    expiresAt: '2026-08-01T12:00:00.000Z',
+    now: candidateEligibilityNow,
+  }),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code === 'HYBRID_CARTONIZATION_CANDIDATE_STATE_INVALID'
+  ),
+  'A promoted candidate must never re-enter the assumption-backed sandbox path',
+)
+assert.throws(
+  () => assertHybridCartonizationCandidateEligible({
+    mode: 'production',
+    workflowState: 'ready',
+    expiresAt: '2026-07-01T12:00:00.000Z',
+    now: candidateEligibilityNow,
+  }),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code === 'HYBRID_CARTONIZATION_CANDIDATE_EXPIRED'
+  ),
+  'An unpromoted candidate remains bounded by its intake review window',
+)
 
 assert.deepEqual(
   JSON.parse(JSON.stringify(
@@ -332,8 +511,33 @@ for (const contract of [
   'provider: account.provider',
   "'shopify_provider_commitment'",
   'HYBRID_CARTONIZATION_MATERIAL_RATE_EVIDENCE_REQUIRED',
+  'candidate.checkout_shipping_service_code',
+  'reconciliation.outcome,',
+  'operations_shopify_checkout_rate_current_reconciliations',
+  'line.ordered_quantity::text',
+  'row.ordered_quantity',
+  'const activeCandidateLines = candidateLines.filter',
+  'const unfulfilledRows = lineageRows.filter',
+  "receipt_line.line_snapshot ->> 'packMappingGlobalId'",
+  "receipt_line.line_snapshot ->> 'packProfileVersionGlobalId'",
+  "pack_mapping.mapping_purpose AS pack_mapping_purpose",
+  'applyMatchedCheckoutPackLineage',
+  "packLineageSource: row.pack_lineage_source",
+  'checkoutReceiptGlobalId: row.checkout_receipt_global_id',
+  'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID',
 ]) {
   assert.ok(source.includes(contract), `Missing persistence contract: ${contract}`)
 }
+
+assert.doesNotMatch(
+  source,
+  /AND reconciliation\.outcome = 'matched'/,
+  'Operational planning must inspect and fail closed on non-matched ClawPilot checkout decisions',
+)
+assert.doesNotMatch(
+  source,
+  /AND line\.unfulfilled_quantity > 0/,
+  'Checkout lineage must include fulfilled and cancelled shippable source lines before remaining work is filtered',
+)
 
 console.log('Hybrid cartonization persistence contract passed')

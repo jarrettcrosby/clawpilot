@@ -30,6 +30,7 @@ export type ShopifyCheckoutContextResult = {
     variantGid: string
     productGlobalId: string
     packMappingGlobalId: string
+    packMappingRowVersion: number
     packProfileVersionGlobalId: string
     packProfileVersionRowVersion: number
     packageLevel: 'each' | 'inner_pack' | 'case' | 'pallet'
@@ -349,6 +350,10 @@ function mapLines(
       row.profile_version_row_version,
       `${row.variant_gid} pack profile row version`,
     )
+    const mappingRowVersion = integer(
+      row.pack_mapping_row_version,
+      `${row.variant_gid} pack mapping row version`,
+    )
     const baseEachQuantity = integer(
       row.profile_base_each_quantity,
       `${row.variant_gid} base-each quantity`,
@@ -418,6 +423,7 @@ function mapLines(
         variantGid: input.variantGid,
         productGlobalId: row.product_global_id,
         packMappingGlobalId: row.pack_mapping_global_id,
+        packMappingRowVersion: mappingRowVersion,
         packProfileVersionGlobalId: row.profile_version_global_id,
         packProfileVersionRowVersion: rowVersion,
         packageLevel: row.profile_package_level,

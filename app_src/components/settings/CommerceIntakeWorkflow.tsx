@@ -1575,6 +1575,8 @@ export default function CommerceIntakeWorkflow({
       )
       return material ? [material] : []
     })
+  const promotedWarehousePlanning =
+    cartonizationCandidate?.state === 'promoted'
   const operationalMaterialBlockers = selectedCartonizationMaterials.flatMap(
     (material) => operationalPackagingMaterialBlockers(
       material,
@@ -2879,6 +2881,10 @@ export default function CommerceIntakeWorkflow({
         throw new Error(payload.error || 'Packaging materials could not be loaded.')
       }
       const materials = payload.packagingMaterials.materials
+      const activeWarehouseGlobalId =
+        payload.packagingMaterials.warehouses.find(
+          (warehouse) => warehouse.status === 'active',
+        )?.globalId || ''
       const eligible = materials.filter(
         (material) => material.readiness.eligibleForCartonization,
       )
@@ -2895,19 +2901,33 @@ export default function CommerceIntakeWorkflow({
         && material.innerDimensionsMm.width
         && material.innerDimensionsMm.height
       ))
+      const operationalMaterials = activeWarehouseGlobalId
+        ? materials.filter((material) => (
+            operationalPackagingMaterialBlockers(
+              material,
+              activeWarehouseGlobalId,
+            ).length === 0
+          ))
+        : []
+      const operationalAg12v2Material = operationalMaterials.find(
+        (material) => material.code.trim().toUpperCase() === 'AG12V2',
+      )
       const recommendedMaterial = (
-        ag12v2Material
-        || completeCustomerMaterial
-        || eligible[0]
-        || null
+        candidate.state === 'promoted'
+          ? operationalAg12v2Material
+            || operationalMaterials[0]
+            || eligible[0]
+            || ag12v2Material
+            || completeCustomerMaterial
+            || null
+          : ag12v2Material
+            || completeCustomerMaterial
+            || eligible[0]
+            || null
       )
       setCartonizationMaterials(materials)
       setCartonizationWarehouses(payload.packagingMaterials.warehouses)
-      setSelectedCartonizationWarehouseGlobalId(
-        payload.packagingMaterials.warehouses.find(
-          (warehouse) => warehouse.status === 'active',
-        )?.globalId || '',
-      )
+      setSelectedCartonizationWarehouseGlobalId(activeWarehouseGlobalId)
       setSelectedCartonizationMaterialGlobalIds(
         recommendedMaterial ? [recommendedMaterial.globalId] : [],
       )
@@ -2947,6 +2967,12 @@ export default function CommerceIntakeWorkflow({
     if (!canManage || !operatorCommandsAllowed) {
       setCartonizationError(
         'Organization manager or administrator permission is required to run a pack-plan preview.',
+      )
+      return
+    }
+    if (candidate?.state === 'promoted') {
+      setCartonizationError(
+        'Fit-only preview is unavailable after an order is added to ClawPilot. Select current factual warehouse and packaging data, then use Save operational pack facts for warehouse planning.',
       )
       return
     }
@@ -3021,6 +3047,12 @@ export default function CommerceIntakeWorkflow({
     if (!canManage || !operatorCommandsAllowed) {
       setCartonizationError(
         'Organization manager or administrator permission is required to compare carrier rates.',
+      )
+      return
+    }
+    if (candidate?.state === 'promoted') {
+      setCartonizationError(
+        'Assumption-backed sandbox comparison is unavailable after an order is added to ClawPilot. Correct the warehouse, product packing profile, or packaging material master data, then use Save operational pack facts.',
       )
       return
     }
@@ -5506,6 +5538,11 @@ export default function CommerceIntakeWorkflow({
                   || candidate.state === 'promoted'
                   || candidate.state === 'expired'
                 )
+                const packPlanningLocked = (
+                  !Number.isInteger(candidate.rowVersion)
+                  || candidate.state === 'failed'
+                  || candidate.state === 'expired'
+                )
                 const address = candidate.shipTo?.address
                 const manualAddress = addressDraft(candidate)
                 const addressComplete = [
@@ -6712,14 +6749,16 @@ export default function CommerceIntakeWorkflow({
                               variant="outlined"
                               startIcon={<Inventory2Rounded />}
                               disabled={
-                                refreshLocked
+                                packPlanningLocked
                                 || Boolean(pendingAction)
                                 || !operatorCommandsAllowed
                                 || !canManage
                               }
                               title={!canManage
                                 ? 'Organization manager or administrator permission is required to plan packages and compare carrier rates.'
-                                : undefined}
+                                : candidate.state === 'promoted'
+                                  ? 'Use current factual warehouse and packaging data to save operational pack facts for this ClawPilot order.'
+                                  : undefined}
                               onClick={() => {
                                 void openCartonizationPreview(candidate)
                               }}
@@ -6884,16 +6923,19 @@ export default function CommerceIntakeWorkflow({
         <DialogContent dividers>
           <Stack spacing={2}>
             <Alert severity="info">
-              Start with the exact order, warehouse, inventory snapshot, and
-              customer packaging recipe. You can run a fit-only preview or
-              save a reloadable, read-only comparison of UPS and FedEx sandbox
-              shipment rates covering every resulting package. Neither path
-              buys postage, creates a shipment, prints, or changes inventory.
+              {promotedWarehousePlanning
+                ? `This order is already in ClawPilot as ${
+                    cartonizationCandidate?.canonicalOrderGlobalId
+                      || 'a canonical order'
+                  }. Select its exact warehouse and current factual packaging, then save operational pack facts for warehouse planning. ClawPilot records reloadable plan evidence and read-only UPS and FedEx sandbox estimates; it does not buy postage, create a shipment, print, reserve inventory, or change Shopify.`
+                : 'Start with the exact order, warehouse, inventory snapshot, and customer packaging recipe. You can run a fit-only preview or save a reloadable, read-only comparison of UPS and FedEx sandbox shipment rates covering every resulting package. Neither path buys postage, creates a shipment, prints, or changes inventory.'}
             </Alert>
             {!canManage ? (
               <Alert severity="warning">
                 Organization manager or administrator permission is required
-                to run this preview.
+                {promotedWarehousePlanning
+                  ? ' to save operational warehouse-planning evidence.'
+                  : ' to run this preview.'}
               </Alert>
             ) : null}
 
@@ -7015,13 +7057,13 @@ export default function CommerceIntakeWorkflow({
                 })}
               </Select>
               <FormHelperText>
-                Draft, uncosted, or out-of-stock materials remain selectable so
-                the fit preview can return the exact corrective blocker.
-                Reloadable rate evidence supports one to eight materials and
-                binds each material to its own exterior dimensions and tare.
+                {promotedWarehousePlanning
+                  ? 'Select one to eight materials. Saving operational facts requires each material to be active, stocked at this warehouse, and supported by factual exterior dimensions and tare.'
+                  : 'Draft, uncosted, or out-of-stock materials remain selectable so the fit preview can return the exact corrective blocker. Reloadable rate evidence supports one to eight materials and binds each material to its own exterior dimensions and tare.'}
               </FormHelperText>
             </FormControl>
 
+            {!promotedWarehousePlanning ? (
             <Box component="section" aria-labelledby="committed-inventory-title">
               <Typography variant="overline" color="text.secondary">
                 Step 2 · Confirm inventory attribution
@@ -7100,13 +7142,16 @@ export default function CommerceIntakeWorkflow({
                   ))}
               </Stack>
             </Box>
+            ) : null}
 
             <Box
               component="section"
               aria-labelledby="operational-rating-title"
             >
               <Typography variant="overline" color="text.secondary">
-                Preferred path · Use current operational facts
+                {promotedWarehousePlanning
+                  ? 'Step 2 · Save warehouse planning evidence'
+                  : 'Preferred path · Use current operational facts'}
               </Typography>
               <Typography
                 id="operational-rating-title"
@@ -7163,6 +7208,7 @@ export default function CommerceIntakeWorkflow({
               )}
             </Box>
 
+            {!promotedWarehousePlanning ? (
             <Box component="section" aria-labelledby="sandbox-rating-title">
               <Typography variant="overline" color="text.secondary">
                 Step 3 · Compare UPS and FedEx without shipping
@@ -7353,6 +7399,16 @@ export default function CommerceIntakeWorkflow({
                 label="I understand this is assumption-backed sandbox evidence, not executable shipping cost, postage, or approved packaging master data."
               />
             </Box>
+            ) : (
+              <Alert severity="warning" variant="outlined">
+                Fit-only preview and assumption-backed sandbox comparison are
+                unavailable after promotion. Warehouse planning must use the
+                current provider inventory, product packing profiles, and
+                factual packaging master data. Correct those records if needed,
+                reopen this order, and select <strong>Save operational pack
+                facts</strong>.
+              </Alert>
+            )}
 
             {cartonizationLoading ? (
               <Stack direction="row" spacing={1} alignItems="center">
@@ -8046,11 +8102,15 @@ export default function CommerceIntakeWorkflow({
           </Button>
           <Button
             variant="outlined"
+            title={promotedWarehousePlanning
+              ? 'Fit-only preview is unavailable after promotion; use factual operational pack facts.'
+              : undefined}
             startIcon={cartonizationLoading
               ? <CircularProgress size={16} color="inherit" />
               : <Inventory2Rounded />}
             disabled={
-              cartonizationLoading
+              promotedWarehousePlanning
+              || cartonizationLoading
               || !canManage
               || !operatorCommandsAllowed
               || selectedCartonizationMaterialGlobalIds.length < 1
@@ -8065,11 +8125,15 @@ export default function CommerceIntakeWorkflow({
           <Button
             variant="outlined"
             color="warning"
+            title={promotedWarehousePlanning
+              ? 'Assumption-backed sandbox comparison is unavailable after promotion; correct master data and save operational pack facts.'
+              : undefined}
             startIcon={cartonizationLoading
               ? <CircularProgress size={16} color="inherit" />
               : <Inventory2Rounded />}
             disabled={
-              cartonizationLoading
+              promotedWarehousePlanning
+              || cartonizationLoading
               || !canManage
               || !operatorCommandsAllowed
               || selectedCartonizationMaterialGlobalIds.length < 1

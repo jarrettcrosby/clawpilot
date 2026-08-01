@@ -126,6 +126,10 @@ export type HybridCartonizationReadResult = {
     weightGrams: number
     channelSourceRevision: string
     channelSourceHash: string
+    packLineageSource:
+      | 'order_candidate_capture'
+      | 'matched_shopify_checkout_receipt'
+    checkoutReceiptGlobalId: string | null
   }>
   input: HybridCartonizationInput
 }
@@ -145,6 +149,47 @@ type CandidateRow = {
   source_hash: string
   workflow_state: string
   expires_at: Date | string
+  checkout_shipping_service_code: string | null
+}
+
+export function assertHybridCartonizationCandidateEligible(input: {
+  mode: HybridCartonizationInput['mode']
+  workflowState: string
+  expiresAt: Date | string
+  now?: Date
+}) {
+  const prePromotionState = ['held', 'resolving', 'ready'].includes(
+    input.workflowState,
+  )
+  const promotedOperationalState = (
+    input.mode === 'production'
+    && input.workflowState === 'promoted'
+  )
+  if (!prePromotionState && !promotedOperationalState) {
+    fail(
+      input.workflowState === 'promoted'
+        ? 'A promoted order candidate can use only operational cartonization'
+        : 'The order candidate is not eligible for cartonization',
+      422,
+      'HYBRID_CARTONIZATION_CANDIDATE_STATE_INVALID',
+    )
+  }
+
+  // Promotion turns the candidate into durable source lineage for the
+  // canonical order. Its review-window expiry no longer governs warehouse
+  // planning, while every pre-promotion preview/evidence path remains bounded
+  // by that window.
+  if (input.workflowState === 'promoted') return
+
+  const expiresAt = new Date(input.expiresAt)
+  const now = input.now || new Date()
+  if (!Number.isFinite(expiresAt.getTime()) || expiresAt <= now) {
+    fail(
+      'The order candidate expired; refresh it before cartonization',
+      409,
+      'HYBRID_CARTONIZATION_CANDIDATE_EXPIRED',
+    )
+  }
 }
 
 type WarehouseRow = {
@@ -169,6 +214,7 @@ type CandidateLineRow = {
   external_product_id: string | null
   external_variant_id: string | null
   requires_shipping: boolean
+  ordered_quantity: string
   unfulfilled_quantity: string
   mapping_state: string
   packaging_state: string
@@ -226,6 +272,148 @@ type CandidateLineRow = {
     | null
   current_pack_profile_gross_weight_grams: number | null
   current_pack_profile_weight_basis: string | null
+  pack_lineage_source:
+    | 'order_candidate_capture'
+    | 'matched_shopify_checkout_receipt'
+  checkout_receipt_global_id: string | null
+}
+
+type MatchedCheckoutReconciliationRow = {
+  outcome: 'matched' | 'ambiguous' | 'rejected' | 'expired'
+  source_shopify_service_code: string | null
+  receipt_id: string | null
+  receipt_global_id: string | null
+  receipt_status: string | null
+}
+
+type MatchedCheckoutReceiptLineRow = {
+  receipt_global_id: string
+  line_key: string
+  provider_variant_id: string
+  quantity: number
+  unit_weight_grams: number
+  line_snapshot: Record<string, unknown>
+  pack_mapping_id: string | null
+  pack_mapping_global_id: string | null
+  pack_mapping_row_version: string | null
+  pack_mapping_product_id: string | null
+  pack_mapping_external_product_id: string | null
+  pack_mapping_external_variant_id: string | null
+  pack_mapping_purpose: string | null
+  pack_mapping_projection_state: string | null
+  pack_mapping_is_current: boolean | null
+  pack_mapping_source_revision: string | null
+  pack_mapping_source_hash: string | null
+  product_global_id: string | null
+  channel_source_revision: string | null
+  channel_source_hash: string | null
+  channel_weight_grams: number | null
+  pack_profile_version_id: string | null
+  pack_profile_version_global_id: string | null
+  pack_profile_version_row_version: string | null
+  pack_profile_is_current: boolean | null
+  pack_profile_lifecycle_state:
+    | 'draft'
+    | 'customer_confirmed'
+    | 'active'
+    | 'superseded'
+    | 'retired'
+    | null
+  pack_profile_fit_model:
+    | 'rigid_3d'
+    | 'compressible'
+    | 'approved_recipe_only'
+    | null
+  pack_profile_evidence_type:
+    | 'unknown'
+    | 'customer_confirmed'
+    | 'measured'
+    | 'provider'
+    | 'derived'
+    | 'legacy'
+    | null
+  pack_profile_evidence_reference: string | null
+  pack_profile_confirmed_at: Date | string | null
+  pack_profile_status: string | null
+  pack_profile_package_level:
+    | 'each'
+    | 'inner_pack'
+    | 'case'
+    | 'pallet'
+    | null
+  pack_profile_base_each_quantity: number | null
+  pack_profile_length_mm: number | null
+  pack_profile_width_mm: number | null
+  pack_profile_height_mm: number | null
+  pack_profile_dimension_basis:
+    | 'inner'
+    | 'outer'
+    | 'unspecified'
+    | null
+  pack_profile_gross_weight_grams: number | null
+  pack_profile_weight_basis: string | null
+}
+
+export function resolveOperationalShopifyCheckoutReconciliation(input: {
+  candidateServiceCode: string | null
+  rows: MatchedCheckoutReconciliationRow[]
+}): (MatchedCheckoutReconciliationRow & {
+  outcome: 'matched'
+  source_shopify_service_code: string
+  receipt_id: string
+  receipt_global_id: string
+  receipt_status: 'succeeded'
+}) | null {
+  const clawPilotCheckout =
+    input.candidateServiceCode?.startsWith('clawpilot:') === true
+  if (input.rows.length === 0) {
+    if (clawPilotCheckout) {
+      fail(
+        'The promoted ClawPilot checkout has no current Shopify rate reconciliation',
+        409,
+        'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID',
+      )
+    }
+    return null
+  }
+  if (input.rows.length !== 1) {
+    fail(
+      'The promoted order has conflicting Shopify checkout rate reconciliations',
+      409,
+      'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID',
+    )
+  }
+  const matched = input.rows[0]
+  if (matched.outcome !== 'matched') {
+    if (clawPilotCheckout) {
+      fail(
+        `The promoted ClawPilot checkout rate reconciliation is ${matched.outcome}`,
+        409,
+        'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID',
+      )
+    }
+    return null
+  }
+  if (
+    !clawPilotCheckout
+    || matched.source_shopify_service_code !== input.candidateServiceCode
+    || !matched.receipt_id
+    || !matched.receipt_global_id
+    || matched.receipt_status !== 'succeeded'
+  ) {
+    fail(
+      'The matched Shopify checkout decision has no valid succeeded receipt',
+      409,
+      'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID',
+    )
+  }
+  return matched as MatchedCheckoutReconciliationRow & {
+    outcome: 'matched'
+    source_shopify_service_code: string
+    receipt_id: string
+    receipt_global_id: string
+    receipt_status: 'succeeded'
+  }
 }
 
 type MaterialRow = {
@@ -365,6 +553,174 @@ function exactInteger(
     )
   }
   return result
+}
+
+function checkoutSnapshotText(
+  snapshot: Record<string, unknown>,
+  key: string,
+  label: string,
+) {
+  const value = snapshot[key]
+  if (typeof value !== 'string' || value.trim() === '') {
+    fail(
+      `${label} is missing from matched checkout evidence`,
+      409,
+      'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID',
+    )
+  }
+  return value.trim()
+}
+
+function checkoutSnapshotInteger(
+  snapshot: Record<string, unknown>,
+  key: string,
+  label: string,
+) {
+  const value = snapshot[key]
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    fail(
+      `${label} is invalid in matched checkout evidence`,
+      409,
+      'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID',
+    )
+  }
+  return Number(value)
+}
+
+export function assertMatchedShopifyCheckoutPackLineage(input: {
+  candidateLineGlobalId: string
+  candidateProductId: string | null
+  candidateProductGlobalId: string | null
+  candidateExternalProductId: string | null
+  candidateExternalVariantId: string | null
+  receiptLine: MatchedCheckoutReceiptLineRow
+}) {
+  const { receiptLine: row } = input
+  const label = `${input.candidateLineGlobalId} matched checkout pack lineage`
+  const snapshot = row.line_snapshot
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+    fail(
+      `${label} has no immutable line snapshot`,
+      409,
+      'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID',
+    )
+  }
+  const snapshotVariantId = checkoutSnapshotText(
+    snapshot,
+    'variantGid',
+    `${label} variant`,
+  )
+  const snapshotProductId = checkoutSnapshotText(
+    snapshot,
+    'productGid',
+    `${label} provider product`,
+  )
+  const snapshotProductGlobalId = checkoutSnapshotText(
+    snapshot,
+    'productGlobalId',
+    `${label} CRM product`,
+  )
+  const snapshotMappingGlobalId = checkoutSnapshotText(
+    snapshot,
+    'packMappingGlobalId',
+    `${label} mapping`,
+  )
+  const snapshotProfileGlobalId = checkoutSnapshotText(
+    snapshot,
+    'packProfileVersionGlobalId',
+    `${label} profile version`,
+  )
+  const snapshotProfileRowVersion = checkoutSnapshotInteger(
+    snapshot,
+    'packProfileVersionRowVersion',
+    `${label} profile row version`,
+  )
+  const snapshotQuantity = checkoutSnapshotInteger(
+    snapshot,
+    'quantity',
+    `${label} quantity`,
+  )
+  const snapshotUnitWeightGrams = checkoutSnapshotInteger(
+    snapshot,
+    'unitWeightGrams',
+    `${label} unit weight`,
+  )
+  const snapshotBaseEachQuantity = checkoutSnapshotInteger(
+    snapshot,
+    'baseEachQuantity',
+    `${label} base-each quantity`,
+  )
+  const snapshotPackageLevel = checkoutSnapshotText(
+    snapshot,
+    'packageLevel',
+    `${label} package level`,
+  )
+  const snapshotMappingRowVersion = snapshot.packMappingRowVersion === undefined
+    ? null
+    : checkoutSnapshotInteger(
+        snapshot,
+        'packMappingRowVersion',
+        `${label} mapping row version`,
+      )
+  const currentMappingRowVersion = exactInteger(
+    row.pack_mapping_row_version,
+    `${label} current mapping row version`,
+  )
+  const currentProfileRowVersion = exactInteger(
+    row.pack_profile_version_row_version,
+    `${label} current profile row version`,
+  )
+  if (
+    !input.candidateProductId
+    || !input.candidateProductGlobalId
+    || !input.candidateExternalProductId
+    || !input.candidateExternalVariantId
+    || snapshotVariantId !== row.provider_variant_id
+    || snapshotVariantId !== input.candidateExternalVariantId
+    || snapshotProductId !== input.candidateExternalProductId
+    || snapshotProductGlobalId !== input.candidateProductGlobalId
+    || row.pack_mapping_product_id !== input.candidateProductId
+    || row.pack_mapping_external_product_id !== snapshotProductId
+    || row.pack_mapping_external_variant_id !== snapshotVariantId
+    || row.pack_mapping_global_id !== snapshotMappingGlobalId
+    || row.pack_mapping_purpose !== 'shopify_checkout'
+    || row.pack_mapping_projection_state !== 'current'
+    || row.pack_mapping_is_current !== true
+    || !row.pack_mapping_source_revision
+    || !row.pack_mapping_source_hash
+    || row.pack_mapping_source_revision !== row.channel_source_revision
+    || row.pack_mapping_source_hash !== row.channel_source_hash
+    || row.product_global_id !== snapshotProductGlobalId
+    || row.pack_profile_version_global_id !== snapshotProfileGlobalId
+    || snapshotProfileRowVersion !== currentProfileRowVersion
+    || (
+      snapshotMappingRowVersion !== null
+      && snapshotMappingRowVersion !== currentMappingRowVersion
+    )
+    || row.pack_profile_is_current !== true
+    || row.pack_profile_lifecycle_state !== 'active'
+    || row.pack_profile_status !== 'active'
+    || row.pack_profile_package_level !== snapshotPackageLevel
+    || row.pack_profile_base_each_quantity !== snapshotBaseEachQuantity
+    || snapshotQuantity !== row.quantity
+    || snapshotUnitWeightGrams !== row.unit_weight_grams
+    || row.channel_weight_grams !== row.unit_weight_grams
+    || (
+      row.pack_profile_gross_weight_grams !== null
+      && row.pack_profile_gross_weight_grams !== row.unit_weight_grams
+    )
+  ) {
+    fail(
+      `${label} no longer matches its exact Shopify checkout mapping and profile`,
+      409,
+      'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID',
+    )
+  }
+  return {
+    mappingRowVersion: snapshotMappingRowVersion
+      ?? currentMappingRowVersion,
+    profileRowVersion: snapshotProfileRowVersion,
+  }
 }
 
 function inputInteger(
@@ -744,7 +1100,8 @@ async function readCandidate(
        candidate.row_version::text,
        candidate.source_hash,
        candidate.workflow_state,
-       candidate.expires_at
+       candidate.expires_at,
+       candidate.checkout_shipping_service_code
      FROM operations_commerce_order_candidates candidate
      WHERE candidate.organization_id = $1::uuid
        AND candidate.integration_account_id = $2::uuid
@@ -771,21 +1128,11 @@ async function readCandidate(
       'HYBRID_CARTONIZATION_CANDIDATE_REVISION_CONFLICT',
     )
   }
-  if (!['held', 'resolving', 'ready'].includes(row.workflow_state)) {
-    fail(
-      'The order candidate is not eligible for cartonization',
-      422,
-      'HYBRID_CARTONIZATION_CANDIDATE_STATE_INVALID',
-    )
-  }
-  const expiresAt = new Date(row.expires_at)
-  if (!Number.isFinite(expiresAt.getTime()) || expiresAt <= new Date()) {
-    fail(
-      'The order candidate expired; refresh it before cartonization',
-      409,
-      'HYBRID_CARTONIZATION_CANDIDATE_EXPIRED',
-    )
-  }
+  assertHybridCartonizationCandidateEligible({
+    mode: input.mode,
+    workflowState: row.workflow_state,
+    expiresAt: row.expires_at,
+  })
   return { row, rowVersion }
 }
 
@@ -848,6 +1195,334 @@ async function readLatestInventoryRun(
   return row
 }
 
+async function readMatchedCheckoutPackLineage(
+  client: PoolClient,
+  input: HybridCartonizationReadRequest,
+  account: AccountRow,
+  candidate: CandidateRow,
+) {
+  if (
+    input.mode !== 'production'
+    || account.provider !== 'shopify'
+    || candidate.workflow_state !== 'promoted'
+  ) return null
+
+  const reconciliation = await client.query<MatchedCheckoutReconciliationRow>(
+     `SELECT
+       reconciliation.outcome,
+       reconciliation.source_shopify_service_code,
+       reconciliation.receipt_id::text,
+       receipt.global_id AS receipt_global_id,
+       receipt.status AS receipt_status
+     FROM operations_shopify_checkout_rate_current_reconciliations
+            reconciliation
+     LEFT JOIN operations_shopify_checkout_rate_receipts receipt
+       ON receipt.organization_id = reconciliation.organization_id
+      AND receipt.id = reconciliation.receipt_id
+      AND receipt.integration_account_id = $2::uuid
+     WHERE reconciliation.organization_id = $1::uuid
+       AND reconciliation.integration_account_id = $2::uuid
+       AND reconciliation.order_candidate_id = $3::uuid
+     ORDER BY reconciliation.created_at, reconciliation.id`,
+    [input.organizationId, account.id, candidate.id],
+  )
+  const matched = resolveOperationalShopifyCheckoutReconciliation({
+    candidateServiceCode: candidate.checkout_shipping_service_code,
+    rows: reconciliation.rows,
+  })
+  if (!matched) return null
+  const lines = await client.query<MatchedCheckoutReceiptLineRow>(
+    `SELECT
+       receipt.global_id AS receipt_global_id,
+       receipt_line.line_key,
+       receipt_line.provider_variant_id,
+       receipt_line.quantity,
+       receipt_line.unit_weight_grams,
+       receipt_line.line_snapshot,
+       pack_mapping.id::text AS pack_mapping_id,
+       pack_mapping.global_id AS pack_mapping_global_id,
+       pack_mapping.row_version::text AS pack_mapping_row_version,
+       pack_mapping.product_id::text AS pack_mapping_product_id,
+       pack_mapping.external_product_id
+         AS pack_mapping_external_product_id,
+       pack_mapping.external_variant_id
+         AS pack_mapping_external_variant_id,
+       pack_mapping.mapping_purpose AS pack_mapping_purpose,
+       pack_mapping.projection_state AS pack_mapping_projection_state,
+       pack_mapping.is_current AS pack_mapping_is_current,
+       pack_mapping.source_revision AS pack_mapping_source_revision,
+       pack_mapping.source_hash AS pack_mapping_source_hash,
+       product.reference_code AS product_global_id,
+       channel_state.source_revision AS channel_source_revision,
+       channel_state.source_hash AS channel_source_hash,
+       channel_state.weight_grams AS channel_weight_grams,
+       pack_version.id::text AS pack_profile_version_id,
+       pack_version.global_id AS pack_profile_version_global_id,
+       pack_version.row_version::text AS pack_profile_version_row_version,
+       pack_version.is_current AS pack_profile_is_current,
+       pack_version.lifecycle_state AS pack_profile_lifecycle_state,
+       pack_version.fit_model AS pack_profile_fit_model,
+       pack_version.evidence_type AS pack_profile_evidence_type,
+       pack_version.evidence_reference
+         AS pack_profile_evidence_reference,
+       pack_version.confirmed_at AS pack_profile_confirmed_at,
+       pack_profile.status AS pack_profile_status,
+       pack_profile.package_level AS pack_profile_package_level,
+       pack_version.base_each_quantity
+         AS pack_profile_base_each_quantity,
+       pack_version.length_mm AS pack_profile_length_mm,
+       pack_version.width_mm AS pack_profile_width_mm,
+       pack_version.height_mm AS pack_profile_height_mm,
+       pack_version.dimension_basis AS pack_profile_dimension_basis,
+       pack_version.gross_weight_grams
+         AS pack_profile_gross_weight_grams,
+       pack_version.weight_basis AS pack_profile_weight_basis
+     FROM operations_shopify_checkout_rate_receipts receipt
+     JOIN operations_shopify_checkout_rate_receipt_lines receipt_line
+       ON receipt_line.organization_id = receipt.organization_id
+      AND receipt_line.receipt_id = receipt.id
+     LEFT JOIN operations_commerce_variant_pack_mappings pack_mapping
+       ON pack_mapping.organization_id = receipt.organization_id
+      AND pack_mapping.integration_account_id =
+            receipt.integration_account_id
+      AND pack_mapping.provider = 'shopify'
+      AND pack_mapping.external_variant_id =
+            receipt_line.provider_variant_id
+      AND pack_mapping.global_id =
+            receipt_line.line_snapshot ->> 'packMappingGlobalId'
+     LEFT JOIN crm_products product
+       ON product.pipeline_id = pack_mapping.pipeline_id
+      AND product.id = pack_mapping.product_id
+     LEFT JOIN operations_product_channel_states channel_state
+       ON channel_state.organization_id = pack_mapping.organization_id
+      AND channel_state.integration_account_id =
+            pack_mapping.integration_account_id
+      AND channel_state.pipeline_id = pack_mapping.pipeline_id
+      AND channel_state.provider = pack_mapping.provider
+      AND channel_state.external_product_id =
+            pack_mapping.external_product_id
+      AND channel_state.external_variant_id =
+            pack_mapping.external_variant_id
+      AND channel_state.product_id = pack_mapping.product_id
+     LEFT JOIN operations_product_pack_profile_versions pack_version
+       ON pack_version.organization_id = pack_mapping.organization_id
+      AND pack_version.pipeline_id = pack_mapping.pipeline_id
+      AND pack_version.product_id = pack_mapping.product_id
+      AND pack_version.id = pack_mapping.default_pack_profile_version_id
+      AND pack_version.global_id =
+            receipt_line.line_snapshot ->> 'packProfileVersionGlobalId'
+     LEFT JOIN operations_product_pack_profiles pack_profile
+       ON pack_profile.organization_id = pack_version.organization_id
+      AND pack_profile.pipeline_id = pack_version.pipeline_id
+      AND pack_profile.product_id = pack_version.product_id
+      AND pack_profile.id = pack_version.profile_id
+     WHERE receipt.organization_id = $1::uuid
+       AND receipt.integration_account_id = $2::uuid
+       AND receipt.id = $3::uuid
+     ORDER BY receipt_line.provider_variant_id, receipt_line.line_key`,
+    [input.organizationId, account.id, matched.receipt_id],
+  )
+  if (lines.rows.length === 0) {
+    fail(
+      'The matched Shopify checkout receipt has no retained line evidence',
+      409,
+      'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID',
+    )
+  }
+  return { receiptGlobalId: matched.receipt_global_id, lines: lines.rows }
+}
+
+function applyMatchedCheckoutPackLineage(
+  candidateRows: CandidateLineRow[],
+  matched: {
+    receiptGlobalId: string
+    lines: MatchedCheckoutReceiptLineRow[]
+  },
+) {
+  const candidateByVariant = new Map<string, CandidateLineRow[]>()
+  for (const row of candidateRows) {
+    if (!row.external_variant_id) {
+      fail(
+        `${row.product_title_snapshot} has no Shopify variant identity for its matched checkout quote`,
+        409,
+        'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID',
+      )
+    }
+    const grouped = candidateByVariant.get(row.external_variant_id) || []
+    grouped.push(row)
+    candidateByVariant.set(row.external_variant_id, grouped)
+  }
+  const receiptByVariant = new Map<string, MatchedCheckoutReceiptLineRow[]>()
+  for (const row of matched.lines) {
+    const grouped = receiptByVariant.get(row.provider_variant_id) || []
+    grouped.push(row)
+    receiptByVariant.set(row.provider_variant_id, grouped)
+  }
+  if (
+    candidateByVariant.size !== receiptByVariant.size
+    || [...candidateByVariant.keys()].some(
+      (variantId) => !receiptByVariant.has(variantId),
+    )
+    || [...receiptByVariant.keys()].some(
+      (variantId) => !candidateByVariant.has(variantId),
+    )
+  ) {
+    fail(
+      'The promoted order lines no longer match the exact Shopify checkout variants',
+      409,
+      'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID',
+    )
+  }
+  const effectiveByVariant = new Map<string, {
+    row: MatchedCheckoutReceiptLineRow
+    mappingRowVersion: number
+    profileRowVersion: number
+  }>()
+  for (const [variantId, candidateLines] of candidateByVariant) {
+    const receiptLines = receiptByVariant.get(variantId) || []
+    const candidateQuantity = candidateLines.reduce((total, row) => (
+      total + exactInteger(
+        row.ordered_quantity,
+        `${row.global_id} ordered quantity`,
+        1,
+      )
+    ), 0)
+    const receiptQuantity = receiptLines.reduce((total, row) => (
+      total + exactInteger(
+        row.quantity,
+        `${row.line_key} checkout quantity`,
+        1,
+      )
+    ), 0)
+    if (candidateQuantity !== receiptQuantity) {
+      fail(
+        `Shopify variant ${variantId} ordered quantity no longer matches checkout rating`,
+        409,
+        'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID',
+      )
+    }
+    const activeCandidateLines = candidateLines.filter((row) => (
+      exactInteger(
+        row.unfulfilled_quantity,
+        `${row.global_id} unfulfilled quantity`,
+        0,
+      ) > 0
+    ))
+    if (activeCandidateLines.length === 0) continue
+    const candidateLine = activeCandidateLines[0]
+    const receiptLine = receiptLines[0]
+    const captured = assertMatchedShopifyCheckoutPackLineage({
+      candidateLineGlobalId: candidateLine.global_id,
+      candidateProductId: candidateLine.product_id,
+      candidateProductGlobalId: candidateLine.product_global_id,
+      candidateExternalProductId: candidateLine.external_product_id,
+      candidateExternalVariantId: candidateLine.external_variant_id,
+      receiptLine,
+    })
+    for (const comparedLine of receiptLines.slice(1)) {
+      const compared = assertMatchedShopifyCheckoutPackLineage({
+        candidateLineGlobalId: candidateLine.global_id,
+        candidateProductId: candidateLine.product_id,
+        candidateProductGlobalId: candidateLine.product_global_id,
+        candidateExternalProductId: candidateLine.external_product_id,
+        candidateExternalVariantId: candidateLine.external_variant_id,
+        receiptLine: comparedLine,
+      })
+      if (
+        comparedLine.pack_mapping_global_id
+          !== receiptLine.pack_mapping_global_id
+        || comparedLine.pack_profile_version_global_id
+          !== receiptLine.pack_profile_version_global_id
+        || compared.mappingRowVersion !== captured.mappingRowVersion
+        || compared.profileRowVersion !== captured.profileRowVersion
+      ) {
+        fail(
+          `Shopify variant ${variantId} has conflicting checkout pack lineage`,
+          409,
+          'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID',
+        )
+      }
+    }
+    for (const comparedLine of activeCandidateLines.slice(1)) {
+      assertMatchedShopifyCheckoutPackLineage({
+        candidateLineGlobalId: comparedLine.global_id,
+        candidateProductId: comparedLine.product_id,
+        candidateProductGlobalId: comparedLine.product_global_id,
+        candidateExternalProductId: comparedLine.external_product_id,
+        candidateExternalVariantId: comparedLine.external_variant_id,
+        receiptLine,
+      })
+    }
+    effectiveByVariant.set(variantId, { row: receiptLine, ...captured })
+  }
+  return candidateRows.filter((row) => (
+    exactInteger(
+      row.unfulfilled_quantity,
+      `${row.global_id} unfulfilled quantity`,
+      0,
+    ) > 0
+  )).map((row): CandidateLineRow => {
+    const effective = effectiveByVariant.get(row.external_variant_id || '')
+    if (!effective) {
+      fail(
+        `${row.product_title_snapshot} has no exact matched checkout pack lineage`,
+        409,
+        'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID',
+      )
+    }
+    const receipt = effective.row
+    const recipeOnly =
+      receipt.pack_profile_fit_model === 'approved_recipe_only'
+    return {
+      ...row,
+      mapping_state: 'resolved',
+      packaging_state: recipeOnly ? 'unresolved' : 'resolved',
+      packaging_source: 'variant_pack_mapping',
+      packaging_weight_source: recipeOnly ? null : 'provider_catalog',
+      weight_grams: recipeOnly ? null : receipt.unit_weight_grams,
+      pack_mapping_id: receipt.pack_mapping_id,
+      pack_mapping_global_id: receipt.pack_mapping_global_id,
+      captured_pack_mapping_row_version: String(effective.mappingRowVersion),
+      current_pack_mapping_row_version: receipt.pack_mapping_row_version,
+      pack_mapping_is_current: receipt.pack_mapping_is_current,
+      pack_mapping_projection_state: receipt.pack_mapping_projection_state,
+      pack_mapping_source_revision: receipt.pack_mapping_source_revision,
+      pack_mapping_source_hash: receipt.pack_mapping_source_hash,
+      channel_source_revision: receipt.channel_source_revision,
+      channel_source_hash: receipt.channel_source_hash,
+      channel_weight_grams: receipt.channel_weight_grams,
+      pack_profile_version_id: receipt.pack_profile_version_id,
+      pack_profile_version_global_id:
+        receipt.pack_profile_version_global_id,
+      captured_pack_profile_row_version: String(effective.profileRowVersion),
+      current_pack_profile_row_version:
+        receipt.pack_profile_version_row_version,
+      pack_profile_is_current: receipt.pack_profile_is_current,
+      pack_profile_lifecycle_state: receipt.pack_profile_lifecycle_state,
+      pack_profile_fit_model: receipt.pack_profile_fit_model,
+      pack_profile_evidence_type: receipt.pack_profile_evidence_type,
+      pack_profile_evidence_reference:
+        receipt.pack_profile_evidence_reference,
+      pack_profile_confirmed_at: receipt.pack_profile_confirmed_at,
+      pack_profile_status: receipt.pack_profile_status,
+      pack_profile_base_each_quantity:
+        receipt.pack_profile_base_each_quantity,
+      current_pack_profile_base_each_quantity:
+        receipt.pack_profile_base_each_quantity,
+      current_pack_profile_length_mm: receipt.pack_profile_length_mm,
+      current_pack_profile_width_mm: receipt.pack_profile_width_mm,
+      current_pack_profile_height_mm: receipt.pack_profile_height_mm,
+      current_pack_profile_dimension_basis:
+        receipt.pack_profile_dimension_basis,
+      current_pack_profile_gross_weight_grams:
+        receipt.pack_profile_gross_weight_grams,
+      current_pack_profile_weight_basis: receipt.pack_profile_weight_basis,
+      pack_lineage_source: 'matched_shopify_checkout_receipt',
+      checkout_receipt_global_id: matched.receiptGlobalId,
+    }
+  })
+}
+
 async function readCandidateLines(
   client: PoolClient,
   input: HybridCartonizationReadRequest,
@@ -864,6 +1539,7 @@ async function readCandidateLines(
        line.external_product_id,
        line.external_variant_id,
        line.requires_shipping,
+       line.ordered_quantity::text,
        line.unfulfilled_quantity::text,
        line.mapping_state,
        line.packaging_state,
@@ -906,7 +1582,9 @@ async function readCandidateLines(
          AS current_pack_profile_dimension_basis,
        pack_version.gross_weight_grams
          AS current_pack_profile_gross_weight_grams,
-       pack_version.weight_basis AS current_pack_profile_weight_basis
+       pack_version.weight_basis AS current_pack_profile_weight_basis,
+       'order_candidate_capture'::text AS pack_lineage_source,
+       NULL::text AS checkout_receipt_global_id
      FROM operations_commerce_order_candidate_lines line
      LEFT JOIN crm_products product
        ON product.pipeline_id = line.pipeline_id
@@ -944,7 +1622,6 @@ async function readCandidateLines(
        AND line.integration_account_id = $2::uuid
        AND line.order_candidate_id = $3::uuid
        AND line.requires_shipping = true
-       AND line.unfulfilled_quantity > 0
      ORDER BY line.created_at, line.id`,
     [input.organizationId, account.id, candidate.id],
   )
@@ -955,7 +1632,30 @@ async function readCandidateLines(
       'HYBRID_CARTONIZATION_LINES_REQUIRED',
     )
   }
-  return result.rows
+  const matched = await readMatchedCheckoutPackLineage(
+    client,
+    input,
+    account,
+    candidate,
+  )
+  const lineageRows = matched
+    ? applyMatchedCheckoutPackLineage(result.rows, matched)
+    : result.rows
+  const unfulfilledRows = lineageRows.filter((row) => (
+    exactInteger(
+      row.unfulfilled_quantity,
+      `${row.global_id} unfulfilled quantity`,
+      0,
+    ) > 0
+  ))
+  if (unfulfilledRows.length === 0) {
+    fail(
+      'The order has no unfulfilled shipping lines to cartonize',
+      422,
+      'HYBRID_CARTONIZATION_LINES_REQUIRED',
+    )
+  }
+  return unfulfilledRows
 }
 
 function mapCandidateLines(
@@ -1179,6 +1879,8 @@ function mapCandidateLines(
         weightGrams: unitWeightGrams,
         channelSourceRevision: row.channel_source_revision,
         channelSourceHash: row.channel_source_hash,
+        packLineageSource: row.pack_lineage_source,
+        checkoutReceiptGlobalId: row.checkout_receipt_global_id,
       },
     }
   })

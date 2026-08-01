@@ -355,6 +355,77 @@ assert.equal(
   2,
   'Both evidence modes must rotate retry identity only after terminal responses',
 )
+const packPlanningLock = section(
+  workflow,
+  'const packPlanningLocked = (',
+  'const address = candidate.shipTo?.address',
+  'Promoted-order pack-planning lock',
+)
+assert.doesNotMatch(
+  packPlanningLock,
+  /candidate\.state === 'promoted'/,
+  'Promotion must not lock the factual warehouse-planning workflow',
+)
+const promotedMaterialDefault = section(
+  workflow,
+  'const operationalMaterials = activeWarehouseGlobalId',
+  'setCartonizationMaterials(materials)',
+  'Promoted-order material default',
+)
+assertIncludes(promotedMaterialDefault, [
+  'operationalPackagingMaterialBlockers(',
+  "candidate.state === 'promoted'",
+  'operationalAg12v2Material',
+  'operationalMaterials[0]',
+  'eligible[0]',
+], 'Promoted-order operational material preference')
+assert.ok(
+  promotedMaterialDefault.indexOf('operationalMaterials[0]')
+    < promotedMaterialDefault.lastIndexOf('eligible[0]'),
+  'Promoted-order defaults must prefer operational material before a generic optimizer-ready fallback',
+)
+const fitPreviewHandler = section(
+  workflow,
+  'async function runCartonizationPreview()',
+  'async function createCartonizationRateEvidence()',
+  'Fit-only preview handler',
+)
+assertIncludes(fitPreviewHandler, [
+  "candidate?.state === 'promoted'",
+  'Fit-only preview is unavailable after an order is added to ClawPilot.',
+  'Save operational pack facts for warehouse planning.',
+], 'Promoted-order fit-preview guard')
+const assumptionBackedHandler = section(
+  workflow,
+  'async function createCartonizationRateEvidence()',
+  'async function createOperationalCartonizationRateEvidence()',
+  'Assumption-backed comparison handler',
+)
+assertIncludes(assumptionBackedHandler, [
+  "candidate?.state === 'promoted'",
+  'Assumption-backed sandbox comparison is unavailable after an order is added to ClawPilot.',
+  'Correct the warehouse, product packing profile, or packaging material master data',
+], 'Promoted-order sandbox-comparison guard')
+assertIncludes(workflow, [
+  "cartonizationCandidate?.state === 'promoted'",
+  'Step 2 · Save warehouse planning evidence',
+  'Warehouse planning must use the',
+  'current provider inventory, product packing profiles, and',
+  'factual packaging master data.',
+], 'Promoted-order warehouse-planning UI')
+const dialogActions = section(
+  workflow,
+  'aria-labelledby="cartonization-preview-title"',
+  '</DialogActions>',
+  'Pack-and-rate dialog actions',
+)
+assertIncludes(dialogActions, [
+  'title={promotedWarehousePlanning',
+  'disabled={\n              promotedWarehousePlanning',
+  'Run fit-only preview',
+  'Save sandbox comparison',
+  'Save operational pack facts',
+], 'Promoted-order action visibility')
 assert.doesNotMatch(
   route,
   /CARTONIZATION_RATE_EVIDENCE_ONE_MATERIAL_REQUIRED/,

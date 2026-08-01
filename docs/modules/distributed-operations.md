@@ -1385,6 +1385,17 @@ stale material/recipe/profile inputs, ambiguous or insufficient inventory, a
 stale Shopify inventory run, a currency/package mismatch, or carrier offers
 that do not cover the complete ordered package array.
 
+Operational cartonization/rate evidence may be sealed either before promotion
+or from the exact promoted candidate after canonical import. The latter uses
+the promoted candidate's current row version and immutable source hash plus
+current provider inventory, packaging-material, recipe, and product-pack
+facts. Promotion makes that candidate durable canonical-order lineage, so its
+former intake review-window expiry does not prevent later warehouse planning.
+This exception is operational-only: a promoted candidate cannot re-enter the
+assumption-backed sandbox comparison or the zero-write cartonization preview,
+and neither path can be used to manufacture executable evidence after
+promotion.
+
 The accepted plan owns an immutable link to that evidence and every physical
 package owns its exact evidence package key, dimensions, weight, sequence, and
 line quantities. Rate selection is whole-shipment only: one UPS or FedEx
@@ -1599,6 +1610,28 @@ Candidate workflow state is one of `held`, `resolving`, `ready`, `promoted`, `fa
 The resolution API is command-oriented. It exposes separate idempotent commands for order and catalog fetch/continuation, catalog product resolution, exact order-rejection retry, audited rejection exclusion, order-line product binding or explicit product creation, customer binding or explicit customer creation, address confirmation, delivery-policy selection, package resolution, exact-candidate refresh, validation, unsupported acknowledgement, and promotion. Every row-backed decision supplies the current Global ID and row version; every command supplies a stable idempotency key and receives an exact-result receipt. Explicit commerce customer creation uses an opaque organization-, integration-account-, provider-, and external-customer-scoped CRM identity (or a candidate-scoped identity when the provider supplies no customer ID) and create-only persistence. It can reuse only a previously created record carrying the same commerce scope evidence; it never name-upserts or changes an unrelated same-name CRM master.
 
 Promotion is a single organization-scoped PostgreSQL transaction. It locks the candidate, revalidates the credential generation, source revision, mappings, customer, package facts, address, delivery decision, and canonical uniqueness, then creates or replays one `operations_orders` row, its `operations_order_lines`, exact external identifiers, product mappings created by the workflow, first `order.imported` domain event, audit event, and command receipt. Shopify promotion also persists the exact checkout-rate reconciliation in that transaction and returns its Global ID, receipt link, outcome, and fulfillment-eligibility fact; a ClawPilot CarrierService order with ambiguous, expired, rejected, or missing lineage cannot be released to warehouse work. A Shopify order using another shipping method is explicitly not applicable to that guard. The promoted order starts `imported` or `held`; promotion does not reserve inventory, select a facility, plan fulfillment, buy a label, create a shipment, advance a provider cursor, or export a fulfillment. Repeating the same command returns the original result. A newer provider revision after resolution returns a stale-candidate conflict and requires refresh and revalidation.
+
+For a promoted Shopify order with a `matched` checkout-rate reconciliation,
+operational cartonization treats the immutable matched receipt line snapshot as
+the authoritative pack lineage. It resolves each provider variant only through
+the receipt's exact `shopify_checkout` mapping Global ID and pack-profile
+version, proves aggregate variant quantity, product identity, current mapping
+and profile revisions, channel source revision/hash, package level,
+base-each quantity, and unit weight, then exposes the matched receipt Global ID
+in line evidence. It does not use SKU inference or silently fall back to the
+order candidate's generic catalog mapping. Missing, conflicting, superseded, or
+quantity-drifted checkout pack evidence blocks operational cartonization. New
+checkout receipts also retain the mapping row version; earlier immutable
+receipts remain usable only while their exact versioned mapping Global ID is
+still the current row and every other retained profile/source fence matches.
+Receipt quantity reconciliation covers every requires-shipping source line and
+its original ordered quantity, including lines later fulfilled, cancelled, or
+refunded; cartonization demand is then limited to positive current unfulfilled
+quantity. A promoted order whose Shopify shipping code begins `clawpilot:` must
+have exactly one current `matched` reconciliation backed by a succeeded
+receipt. Missing, rejected, ambiguous, expired, failed, or service-code-drifted
+lineage blocks operational evidence. Generic candidate-captured pack facts are
+available only to genuinely non-ClawPilot Shopify shipping methods.
 
 For a partially fulfilled Shopify order, promotion creates canonical lines only for positive `unfulfilledQuantity` and makes that remaining quantity the canonical work quantity, so ClawPilot cannot fulfill units Shopify already fulfilled. Completed or removed/refunded source lines are excluded from canonical work while every source line's ordered, current, fulfilled, unfulfilled, removed-or-refunded, and returned-quantity availability is retained in the canonical order source payload with the source revision and hash. Shopify's `quantity - currentQuantity` delta is deliberately recorded as removed-or-refunded evidence rather than asserted to be a pure cancellation. Exact per-line returned quantity remains unavailable in this read path and is retained as unknown; adding it requires an authorized Return-data workflow rather than inference from order status.
 

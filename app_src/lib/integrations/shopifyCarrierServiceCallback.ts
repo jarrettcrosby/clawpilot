@@ -1284,6 +1284,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
             variantGid: line.variantGid,
             productGlobalId: line.productGlobalId,
             packMappingGlobalId: line.packMappingGlobalId,
+            packMappingRowVersion: line.packMappingRowVersion,
             packProfileVersionGlobalId:
               line.packProfileVersionGlobalId,
             packProfileVersionRowVersion:

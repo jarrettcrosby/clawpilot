@@ -340,6 +340,28 @@ assert.deepEqual(
     rotationPolicy: 'fixed_axes_conservative',
   },
 )
+let promotedPreviewOptimizerCalled = false
+const promotedPreview = await createCartonizationPreview({
+  request: normalized,
+  snapshot: {
+    ...snapshot,
+    candidate: {
+      ...snapshot.candidate,
+      workflowState: 'promoted',
+    },
+  },
+  optimizer: {
+    async optimize(input, options) {
+      promotedPreviewOptimizerCalled = true
+      return validOptimizerResult(input, options)
+    },
+  },
+})
+assert.equal(promotedPreview.status, 'blocked')
+assert.equal(promotedPreviewOptimizerCalled, false)
+assert.ok(promotedPreview.blockers.some((item) => (
+  item.code === 'CARTONIZATION_CANDIDATE_NOT_PREVIEWABLE'
+)))
 assert.equal(capturedOptimizerInput.orderRevision, 4)
 assert.equal(capturedOptimizerInput.lines[0].rotationAllowed, false)
 assert.equal(capturedOptimizerInput.lines[0].unitWeightGrams, 200)
