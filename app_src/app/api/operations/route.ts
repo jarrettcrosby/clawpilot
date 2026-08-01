@@ -681,6 +681,13 @@ function errorResponse(error: unknown) {
     ? error.message
     : 'OPERATIONS_REQUEST_FAILED'
   const status = code === 'OPERATIONS_REQUEST_FAILED' ? 500 : 400
+  if (status === 500) {
+    console.error('[operations] unhandled request failure', {
+      name: error instanceof Error ? error.name : typeof error,
+      message: error instanceof Error ? error.message : 'Unknown error',
+      stack: error instanceof Error ? error.stack : undefined,
+    })
+  }
   return json({ ok: false, error: status === 500 ? 'Operations request failed' : code, code }, status)
 }
 
