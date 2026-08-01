@@ -6053,6 +6053,11 @@ export async function prepareOperationsShipmentExecutionFromPostgres(input: {
             409,
           )
         }
+        const normalizedResponse = {
+          ...responseRates[0] as Record<string, unknown>,
+          packagePlanHash: current.packagePlanHash,
+          packageCount: current.packages.length,
+        }
         await client.query(
           `INSERT INTO operations_pack_rate_run_rate_choices (
              organization_id, run_id, provider, service_code,
@@ -6072,7 +6077,7 @@ export async function prepareOperationsShipmentExecutionFromPostgres(input: {
             offer.currency,
             offer.provider === selected.carrierProvider
               && offer.serviceLevelCode === selected.serviceCode,
-            JSON.stringify(responseRates[0]),
+            JSON.stringify(normalizedResponse),
           ],
         )
       }

@@ -1483,6 +1483,11 @@ attempted once with the same complete package array. Finalization then rechecks
 drift, selects one successful carrier/service for the entire shipment, records
 the fulfillment-time rerate, and persists the mandatory estimated
 checkout-to-fulfillment variance plus immutable attempt and package lineage.
+Every retained fulfillment rate choice repeats the exact package-plan hash and
+package count alongside one exact retained provider rate inside its normalized
+response. The database rejects a carrier choice whose provider fact differs,
+whose package identity is absent, or whose package identity differs from the
+sealed plan.
 Shopify's checkout callback can supply only the destination country and postal
 code, so its keyed carrier destination fingerprint remains checkout-zone
 reconciliation evidence. The later fulfillment rerate independently derives a

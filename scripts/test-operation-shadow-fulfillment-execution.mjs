@@ -23,6 +23,13 @@ const destinationRepair = readFileSync(
   ),
   'utf8',
 )
+const rateChoicePackageIdentityRepair = readFileSync(
+  resolve(
+    root,
+    'db/migrations/0193_operations_shadow_rate_choice_package_identity.sql',
+  ),
+  'utf8',
+)
 
 const commandStart = persistence.indexOf(
   'export async function prepareOperationsShipmentExecutionFromPostgres',
@@ -47,6 +54,22 @@ for (const fragment of [
   assert.ok(
     persistence.includes(fragment),
     `Canonical provider-variant resolution is missing ${fragment}`,
+  )
+}
+
+for (const fragment of [
+  "'validate_operations_fulfillment_execution()'::regprocedure",
+  "'WHERE response_rate.value = choice.normalized_response'",
+  'WHERE choice.normalized_response = (',
+  'response_rate.value',
+  "''packagePlanHash'', run.result_snapshot->>''packagePlanHash''",
+  "''packageCount'', run.package_count",
+  'revised_definition = current_definition',
+  'EXECUTE revised_definition',
+]) {
+  assert.ok(
+    rateChoicePackageIdentityRepair.includes(fragment),
+    `Rate-choice package-identity repair migration is missing ${fragment}`,
   )
 }
 
@@ -103,7 +126,10 @@ for (const fragment of [
   'operations_fulfillment_execution_packages',
   'operations_fulfillment_execution_rate_attempts',
   'responseRates.length !== 1',
-  'JSON.stringify(responseRates[0])',
+  'const normalizedResponse = {',
+  'packagePlanHash: current.packagePlanHash',
+  'packageCount: current.packages.length',
+  'JSON.stringify(normalizedResponse)',
   "'cartonization_shipment_rate'",
   "'sandbox'",
   'shipment.destinationFingerprint\n            !== current.fulfillmentCarrierDestinationFingerprint',
@@ -119,6 +145,12 @@ for (const fragment of [
 ]) {
   assert.ok(command.includes(fragment), `Command is missing ${fragment}`)
 }
+
+assert.equal(
+  command.includes('JSON.stringify(responseRates[0])'),
+  false,
+  'Fulfillment rate choices must not omit their immutable package-plan identity',
+)
 
 assert.equal(
   command.includes(
