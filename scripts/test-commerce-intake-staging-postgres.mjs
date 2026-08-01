@@ -94,6 +94,21 @@ function hash(value) {
   return createHash('sha256').update(value).digest('hex')
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => (
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    )).join(',')}}`
+  }
+  if (typeof value === 'bigint') return JSON.stringify(value.toString())
+  return JSON.stringify(value) ?? 'null'
+}
+
+function commandHash(value) {
+  return hash(canonicalJson(value))
+}
+
 function available(value) {
   return Object.freeze({ state: 'available', value })
 }
@@ -251,9 +266,9 @@ function loadCommerceStagingService(pool, counters) {
         decryptCommerceIntakeReadResult: mustNotRun(
           'decryptCommerceIntakeReadResult',
         ),
-        decryptCommerceIntakeContinuation: mustNotRun(
-          'decryptCommerceIntakeContinuation',
-        ),
+        decryptCommerceIntakeContinuation() {
+          return { orderCursor: 'commerce-staging-recovery-cursor' }
+        },
         decryptCommerceCandidateSnapshot: mustNotRun(
           'decryptCommerceCandidateSnapshot',
         ),
@@ -778,7 +793,36 @@ async function verifyAcceptance(databaseUrl) {
   )
   assert.equal(continuationEvidence.rowCount, 1)
   const continuation = continuationEvidence.rows[0]
-  const cursorHash = hash('commerce-staging-recovery-cursor')
+  const cursorHash = hash(JSON.stringify({
+    orderCursor: 'commerce-staging-recovery-cursor',
+  }))
+  const policyDriftRequest = (policyVersion) => commandHash({
+    policyVersion,
+    accountGlobalId: 'gia0009201',
+    credentialVersion: 1,
+    action: 'fetch-next',
+    resource: 'orders',
+    target: {
+      kind: 'continuation',
+      globalId: continuation.global_id,
+      sourceHash: null,
+      externalIdHash: null,
+      continuationId: continuation.id,
+      continuationCursorHash: cursorHash,
+      continuationRowVersion: Number(continuation.row_version),
+    },
+    pageSize: 25,
+    readOnly: true,
+    providerWrites: 0,
+    syncCursorAdvance: false,
+  })
+  const legacyRequestHash = policyDriftRequest(
+    'commerce-intake-resolution-v1',
+  )
+  const currentRequestHash = policyDriftRequest(
+    'commerce-intake-resolution-v2',
+  )
+  assert.notEqual(legacyRequestHash, currentRequestHash)
   const clientForRecovery = await pool.connect()
   try {
     await clientForRecovery.query('SET session_replication_role = replica')
@@ -851,7 +895,7 @@ async function verifyAcceptance(databaseUrl) {
         ids.organization,
         ids.integrationAccount,
         recoveryKey,
-        hash('commerce-staging-recovery-attempt'),
+        legacyRequestHash,
         actorEmail,
       ],
     )
@@ -879,7 +923,7 @@ async function verifyAcceptance(databaseUrl) {
         ids.integrationAccount,
         ids.pipeline,
         recoveryKey,
-        hash('commerce-staging-recovery-intent'),
+        legacyRequestHash,
         continuation.global_id,
         continuation.id,
         cursorHash,
@@ -913,6 +957,263 @@ async function verifyAcceptance(databaseUrl) {
     continuation.global_id,
   )
   assert.equal(recoveryTargets[0].continuationIdempotencyKey, recoveryKey)
+
+  const recoveryRuntime = {
+    organizationId: ids.organization,
+    globalId: 'gia0009201',
+    provider: 'shopify',
+    credentialVersion: 1,
+    externalAccountId: 'gid://shopify/Shop/9201',
+  }
+  const mismatchClient = await pool.connect()
+  try {
+    await mismatchClient.query('SET session_replication_role = replica')
+    await mismatchClient.query(
+      `UPDATE operations_commerce_intake_read_intents
+       SET target_global_id = 'gcir9999999'
+       WHERE id = $1`,
+      [recoveryIntent],
+    )
+  } finally {
+    await mismatchClient.query('SET session_replication_role = origin')
+      .catch(() => {})
+    mismatchClient.release()
+  }
+  await assert.rejects(
+    persistence.prepareCommerceIntakeReadIntentInPostgres({
+      runtime: recoveryRuntime,
+      actorEmail: 'system:commerce-order-reconciliation',
+      idempotencyKey: recoveryKey,
+      action: 'fetch-next',
+      resource: 'orders',
+      target: { kind: 'none' },
+      continuationRunGlobalId: continuation.global_id,
+      pageSize: 25,
+    }),
+    (error) => error.code === 'COMMERCE_INTAKE_IDEMPOTENCY_CONFLICT',
+  )
+  const restoredClient = await pool.connect()
+  try {
+    await restoredClient.query('SET session_replication_role = replica')
+    await restoredClient.query(
+      `UPDATE operations_commerce_intake_read_intents
+       SET target_global_id = $2
+       WHERE id = $1`,
+      [recoveryIntent, continuation.global_id],
+    )
+  } finally {
+    await restoredClient.query('SET session_replication_role = origin')
+      .catch(() => {})
+    restoredClient.release()
+  }
+
+  const preparedMismatchClient = await pool.connect()
+  try {
+    await preparedMismatchClient.query('SET session_replication_role = replica')
+    await preparedMismatchClient.query(
+      `UPDATE operations_commerce_intake_read_intents
+       SET intent_state = 'prepared',
+           provider_attempt_id = NULL,
+           lease_token = NULL,
+           lease_expires_at = NULL,
+           response_ciphertext = NULL,
+           response_iv = NULL,
+           response_tag = NULL,
+           response_hash = NULL,
+           response_bytes = NULL,
+           response_encryption_version = NULL
+       WHERE id = $1`,
+      [recoveryIntent],
+    )
+  } finally {
+    await preparedMismatchClient.query('SET session_replication_role = origin')
+      .catch(() => {})
+    preparedMismatchClient.release()
+  }
+  await assert.rejects(
+    persistence.prepareCommerceIntakeReadIntentInPostgres({
+      runtime: recoveryRuntime,
+      actorEmail: 'system:commerce-order-reconciliation',
+      idempotencyKey: recoveryKey,
+      action: 'fetch-next',
+      resource: 'orders',
+      target: { kind: 'none' },
+      continuationRunGlobalId: continuation.global_id,
+      pageSize: 25,
+    }),
+    (error) => error.code === 'COMMERCE_INTAKE_IDEMPOTENCY_CONFLICT',
+  )
+  const capturedRestoreClient = await pool.connect()
+  try {
+    await capturedRestoreClient.query('SET session_replication_role = replica')
+    await capturedRestoreClient.query(
+      `UPDATE operations_commerce_intake_read_intents
+       SET intent_state = 'captured',
+           provider_attempt_id = $2::uuid,
+           response_ciphertext = $3,
+           response_iv = $4,
+           response_tag = $5,
+           response_hash = $6,
+           response_bytes = 2,
+           response_encryption_version = 1
+       WHERE id = $1`,
+      [
+        recoveryIntent,
+        recoveryAttempt,
+        Buffer.from('[]'),
+        Buffer.alloc(12, 7),
+        Buffer.alloc(16, 8),
+        hash('commerce-staging-recovery-response'),
+      ],
+    )
+  } finally {
+    await capturedRestoreClient.query('SET session_replication_role = origin')
+      .catch(() => {})
+    capturedRestoreClient.release()
+  }
+  const recoveredIntent =
+    await persistence.prepareCommerceIntakeReadIntentInPostgres({
+      runtime: recoveryRuntime,
+      actorEmail: 'system:commerce-order-reconciliation',
+      idempotencyKey: recoveryKey,
+      action: 'fetch-next',
+      resource: 'orders',
+      target: { kind: 'none' },
+      continuationRunGlobalId: continuation.global_id,
+      pageSize: 25,
+    })
+  assert.equal(recoveredIntent.id, recoveryIntent)
+
+  const activeLeaseToken = randomUUID()
+  const activeLeaseClient = await pool.connect()
+  try {
+    await activeLeaseClient.query('SET session_replication_role = replica')
+    await activeLeaseClient.query(
+      `UPDATE operations_commerce_provider_attempts
+       SET state = 'prepared',
+           completed_at = NULL,
+           lease_token = $2,
+           lease_expires_at = now() + interval '10 minutes'
+       WHERE id = $1`,
+      [recoveryAttempt, activeLeaseToken],
+    )
+    await activeLeaseClient.query(
+      `UPDATE operations_commerce_intake_read_intents
+       SET intent_state = 'reading',
+           lease_token = $2,
+           lease_expires_at = now() + interval '10 minutes',
+           response_ciphertext = NULL,
+           response_iv = NULL,
+           response_tag = NULL,
+           response_hash = NULL,
+           response_bytes = NULL,
+           response_encryption_version = NULL
+       WHERE id = $1`,
+      [recoveryIntent, activeLeaseToken],
+    )
+  } finally {
+    await activeLeaseClient.query('SET session_replication_role = origin')
+      .catch(() => {})
+    activeLeaseClient.release()
+  }
+  const recoveredReadingIntent =
+    await persistence.prepareCommerceIntakeReadIntentInPostgres({
+      runtime: recoveryRuntime,
+      actorEmail: 'system:commerce-order-reconciliation',
+      idempotencyKey: recoveryKey,
+      action: 'fetch-next',
+      resource: 'orders',
+      target: { kind: 'none' },
+      continuationRunGlobalId: continuation.global_id,
+      pageSize: 25,
+    })
+  assert.equal(recoveredReadingIntent.id, recoveryIntent)
+  await assert.rejects(
+    persistence.reserveCommerceIntakeProviderReadInPostgres({
+      runtime: recoveryRuntime,
+      actorEmail: 'system:commerce-order-reconciliation',
+      providerAttemptActorEmail: null,
+      idempotencyKey: recoveryKey,
+      readIntentId: recoveryIntent,
+      adapterVersion: 'commerce-staging-postgres-v2',
+      redactedRequest: {
+        resource: 'orders',
+        readOnly: true,
+        providerWrites: 0,
+      },
+    }),
+    (error) => error.code === 'COMMERCE_INTAKE_READ_IN_PROGRESS',
+  )
+
+  const expiredLeaseClient = await pool.connect()
+  try {
+    await expiredLeaseClient.query('SET session_replication_role = replica')
+    await expiredLeaseClient.query(
+      `UPDATE operations_commerce_provider_attempts
+       SET lease_expires_at = now() - interval '1 minute'
+       WHERE id = $1`,
+      [recoveryAttempt],
+    )
+    await expiredLeaseClient.query(
+      `UPDATE operations_commerce_intake_read_intents
+       SET lease_expires_at = now() - interval '1 minute'
+       WHERE id = $1`,
+      [recoveryIntent],
+    )
+  } finally {
+    await expiredLeaseClient.query('SET session_replication_role = origin')
+      .catch(() => {})
+    expiredLeaseClient.release()
+  }
+  const recoveredExpiredReadingIntent =
+    await persistence.prepareCommerceIntakeReadIntentInPostgres({
+      runtime: recoveryRuntime,
+      actorEmail: 'system:commerce-order-reconciliation',
+      idempotencyKey: recoveryKey,
+      action: 'fetch-next',
+      resource: 'orders',
+      target: { kind: 'none' },
+      continuationRunGlobalId: continuation.global_id,
+      pageSize: 25,
+    })
+  assert.equal(recoveredExpiredReadingIntent.id, recoveryIntent)
+  await assert.rejects(
+    persistence.reserveCommerceIntakeProviderReadInPostgres({
+      runtime: recoveryRuntime,
+      actorEmail: 'system:commerce-order-reconciliation',
+      providerAttemptActorEmail: null,
+      idempotencyKey: recoveryKey,
+      readIntentId: recoveryIntent,
+      adapterVersion: 'commerce-staging-postgres-v2',
+      redactedRequest: {
+        resource: 'orders',
+        readOnly: true,
+        providerWrites: 0,
+      },
+    }),
+    (error) => error.code === 'COMMERCE_INTAKE_READ_RESTART_REQUIRED',
+  )
+  const recoveredState = await pool.query(
+    `SELECT intent.intent_state, attempt.state AS attempt_state,
+            saved.cursor_state
+     FROM operations_commerce_intake_read_intents intent
+     JOIN operations_commerce_provider_attempts attempt
+       ON attempt.id = intent.provider_attempt_id
+     JOIN operations_commerce_intake_continuations saved
+       ON saved.id = intent.continuation_id
+     WHERE intent.id = $1`,
+    [recoveryIntent],
+  )
+  assert.deepEqual(recoveredState.rows[0], {
+    intent_state: 'uncertain',
+    attempt_state: 'unknown',
+    cursor_state: 'invalid',
+  })
+  assert.equal(
+    counters.fetchCalls,
+    0,
+    'Policy-drift recovery must not call the provider',
+  )
   await pool.end()
 }
 
@@ -950,8 +1251,8 @@ async function main() {
     })
   }
   console.log(
-    'Commerce intake fresh-staging and captured-continuation recovery '
-      + 'disposable-PostgreSQL acceptance passed',
+    'Commerce intake fresh-staging, captured-continuation, and policy-drift '
+      + 'recovery disposable-PostgreSQL acceptance passed',
   )
 }
 

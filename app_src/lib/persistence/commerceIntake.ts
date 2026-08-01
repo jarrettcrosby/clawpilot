@@ -2765,6 +2765,9 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
     const existing = await client.query<{
       id: string
       request_hash: string
+      provider: 'shopify' | 'faire'
+      resource: 'orders' | 'products'
+      credential_version: number
       intent_state:
         | 'prepared'
         | 'reading'
@@ -2778,11 +2781,19 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
       window_end: Date
       query_hash: string
       provider_attempt_id: string | null
+      target_kind: 'none' | 'candidate' | 'rejection' | 'continuation'
+      target_global_id: string | null
+      continuation_id: string | null
+      continuation_cursor_hash: string | null
+      continuation_row_version: string | null
       expires_at: Date
     }>(
-      `SELECT id::text, request_hash, intent_state, session_id::text,
+      `SELECT id::text, request_hash, provider, resource,
+              credential_version, intent_state, session_id::text,
               batch_number, window_start, window_end, query_hash,
-              provider_attempt_id::text, expires_at
+              provider_attempt_id::text, target_kind, target_global_id,
+              continuation_id::text, continuation_cursor_hash,
+              continuation_row_version::text, expires_at
        FROM operations_commerce_intake_read_intents
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
@@ -2798,7 +2809,35 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
     )
     const prior = existing.rows[0]
     if (prior) {
-      if (prior.request_hash !== requestHash) {
+      // A captured response or an already-reserved read can outlive the
+      // request-policy version that originally hashed it. Reuse remains safe
+      // only when every durable continuation identity fence still matches;
+      // the stored request hash continues to bind the provider attempt and
+      // captured response. Prepared intents are deliberately excluded because
+      // no provider request is yet bound to their historical request shape.
+      const compatibleContinuationRecovery = Boolean(
+        continuation
+        && ['reading', 'captured'].includes(prior.intent_state)
+        && prior.provider_attempt_id
+        && prior.provider === account.provider
+        && prior.resource === input.resource
+        && prior.credential_version === account.credential_version
+        && prior.target_kind === 'continuation'
+        && prior.target_global_id === continuation.run_global_id
+        && prior.continuation_id === continuation.id
+        && prior.continuation_cursor_hash === continuation.cursor_hash
+        && Number(prior.continuation_row_version)
+          === Number(continuation.row_version)
+        && prior.session_id === continuation.session_id
+        && prior.batch_number === continuation.batch_number + 1
+        && iso(prior.window_start) === iso(continuation.window_start)
+        && iso(prior.window_end) === iso(continuation.window_end)
+        && prior.query_hash === continuation.query_hash
+      )
+      if (
+        prior.request_hash !== requestHash
+        && !compatibleContinuationRecovery
+      ) {
         intakeError(
           'COMMERCE_INTAKE_IDEMPOTENCY_CONFLICT',
           'This retry key belongs to a different provider-read target. Reload the workflow and retry the intended action.',
