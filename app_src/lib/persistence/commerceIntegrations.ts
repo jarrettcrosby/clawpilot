@@ -1488,12 +1488,9 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
       dirtyVersion: number
       reconciledVersion: number
     } | null = null
-    if (
-      receiptState === 'queued'
-      && SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS.some(
-        (topic) => topic === input.topic,
-      )
-    ) {
+    if (SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS.some(
+      (topic) => topic === input.topic,
+    )) {
       inventoryRefreshSignal =
         await signalShopifyInventoryRefreshWithClient(client, {
           organizationId: input.runtime.organizationId,
@@ -1502,26 +1499,28 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
           receiptGlobalId: globalId,
           providerTriggeredAt: input.providerTriggeredAt,
         })
-      const finalized = await client.query(
-        `UPDATE operations_commerce_webhook_receipts
-         SET state = 'succeeded',
-             attempts = attempts + 1,
-             processed_at = clock_timestamp(),
-             updated_at = clock_timestamp()
-         WHERE organization_id = $1::uuid
-           AND integration_account_id = $2::uuid
-           AND global_id = $3
-           AND state = 'queued'`,
-        [
-          input.runtime.organizationId,
-          input.runtime.integrationAccountId,
-          globalId,
-        ],
-      )
-      if (finalized.rowCount !== 1) {
-        throw new Error(
-          'Shopify inventory webhook receipt could not be finalized',
+      if (receiptState === 'queued') {
+        const finalized = await client.query(
+          `UPDATE operations_commerce_webhook_receipts
+           SET state = 'succeeded',
+               attempts = attempts + 1,
+               processed_at = clock_timestamp(),
+               updated_at = clock_timestamp()
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+             AND global_id = $3
+             AND state = 'queued'`,
+          [
+            input.runtime.organizationId,
+            input.runtime.integrationAccountId,
+            globalId,
+          ],
         )
+        if (finalized.rowCount !== 1) {
+          throw new Error(
+            'Shopify inventory webhook receipt could not be finalized',
+          )
+        }
       }
       await auditCommerce(client, {
         actorEmail: null,

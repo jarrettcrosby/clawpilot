@@ -110,6 +110,20 @@ includes(inventoryWebhookRefreshMigration, [
   'acknowledges only this version',
 ], 'Shopify inventory webhook refresh migration')
 
+const commerceIntegrationPersistence = read(
+  'app_src/lib/persistence/commerceIntegrations.ts',
+)
+assert.match(
+  commerceIntegrationPersistence,
+  /if \(SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS\.some\([\s\S]+?signalShopifyInventoryRefreshWithClient/,
+  'Inventory webhook topics must signal refresh even while signed receipt intake is held',
+)
+assert.doesNotMatch(
+  commerceIntegrationPersistence,
+  /receiptState === 'queued'[\s\S]{0,160}SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS/,
+  'Held inventory receipts must not suppress the read-only refresh signal',
+)
+
 const persistence = read(
   'app_src/lib/persistence/shopifyInventoryRefresh.ts',
 )
