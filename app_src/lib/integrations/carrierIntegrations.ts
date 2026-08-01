@@ -22,6 +22,7 @@ import {
   type CarrierSandboxRatePurpose,
   type CarrierSandboxShipmentRateFixture,
 } from '@/lib/integrations/carrierSandboxRate'
+export { carrierSandboxRateDestinationFingerprint } from '@/lib/integrations/carrierSandboxRate'
 import {
   carrierAccountAddressFingerprint,
   decryptCarrierAccountNumber,

@@ -16,6 +16,13 @@ const types = readFileSync(
   resolve(root, 'app_src/lib/operations/types.ts'),
   'utf8',
 )
+const destinationRepair = readFileSync(
+  resolve(
+    root,
+    'db/migrations/0192_operations_shadow_fulfillment_destination_fingerprint.sql',
+  ),
+  'utf8',
+)
 
 const commandStart = persistence.indexOf(
   'export async function prepareOperationsShipmentExecutionFromPostgres',
@@ -29,6 +36,8 @@ assert.notEqual(commandEnd, -1, 'Shadow execution command boundary is missing')
 const command = persistence.slice(commandStart, commandEnd)
 
 for (const fragment of [
+  'carrierSandboxRateDestinationFingerprint',
+  'fulfillmentCarrierDestinationFingerprint',
   'providerVariantId: line.provider_variant_id',
   'operations_commerce_order_candidates candidate',
   'operations_commerce_order_candidate_lines candidate_line',
@@ -97,6 +106,9 @@ for (const fragment of [
   'JSON.stringify(responseRates[0])',
   "'cartonization_shipment_rate'",
   "'sandbox'",
+  'shipment.destinationFingerprint\n            !== current.fulfillmentCarrierDestinationFingerprint',
+  'checkoutCarrierDestinationFingerprint:',
+  'carrierDestinationFingerprint:\n          current.fulfillmentCarrierDestinationFingerprint',
   "authority_mode, state",
   "'shadow', 'shadow_prepared'",
   'providerWriteCount: 0',
@@ -106,6 +118,27 @@ for (const fragment of [
   'completeCommandReceipt',
 ]) {
   assert.ok(command.includes(fragment), `Command is missing ${fragment}`)
+}
+
+assert.equal(
+  command.includes(
+    'shipment.destinationFingerprint\n            !== current.receiptCarrierDestinationFingerprint',
+  ),
+  false,
+  'Fulfillment carrier evidence must not be compared to the sparse checkout destination fingerprint',
+)
+
+for (const fragment of [
+  "'validate_operations_fulfillment_execution()'::regprocedure",
+  "'max(receipt.carrier_destination_fingerprint)'",
+  "'max(run.input_snapshot->>''carrierDestinationFingerprint'')'",
+  'revised_definition = current_definition',
+  'EXECUTE revised_definition',
+]) {
+  assert.ok(
+    destinationRepair.includes(fragment),
+    `Destination-fingerprint repair migration is missing ${fragment}`,
+  )
 }
 
 const comparisonStart = command.indexOf(

@@ -35,7 +35,10 @@ import {
   type CheckoutRateCarrierProvider,
   type CheckoutShipmentRateResult,
 } from '@/lib/integrations/carrierCheckoutRate'
-import { testCarrierSandboxShipmentRate } from '@/lib/integrations/carrierIntegrations'
+import {
+  carrierSandboxRateDestinationFingerprint,
+  testCarrierSandboxShipmentRate,
+} from '@/lib/integrations/carrierIntegrations'
 import type { OperationsCapabilities } from '@/lib/operations/authorization'
 import type {
   Address,
@@ -4498,6 +4501,7 @@ type ShadowExecutionContext = {
   receiptPolicyHash: string
   receiptAlgorithmVersion: string
   receiptCarrierDestinationFingerprint: string
+  fulfillmentCarrierDestinationFingerprint: string
   checkoutProvider: CheckoutRateCarrierProvider
   checkoutServiceCode: string
   checkoutServiceName: string
@@ -4549,6 +4553,8 @@ function shadowExecutionDriftHash(input: Omit<
     reconciliationId: input.reconciliationId,
     receiptId: input.receiptId,
     receiptResultHash: input.receiptResultHash,
+    fulfillmentCarrierDestinationFingerprint:
+      input.fulfillmentCarrierDestinationFingerprint,
     carriers: input.carriers,
     lines: input.lines,
     packages: input.packages,
@@ -5110,6 +5116,10 @@ async function readShadowExecutionContext(
       reconciliation.receipt_algorithm_version,
     receiptCarrierDestinationFingerprint:
       reconciliation.receipt_carrier_destination_fingerprint,
+    fulfillmentCarrierDestinationFingerprint:
+      carrierSandboxRateDestinationFingerprint(
+        shadowExecutionDestination(order.ship_to),
+      ),
     checkoutProvider:
       reconciliation.selected_carrier_provider,
     checkoutServiceCode: reconciliation.selected_service_code,
@@ -5488,7 +5498,7 @@ export async function prepareOperationsShipmentExecutionFromPostgres(input: {
           || evidence.environment !== 'sandbox'
           || evidence.purpose !== 'cartonization_shipment_rate'
           || shipment.destinationFingerprint
-            !== current.receiptCarrierDestinationFingerprint
+            !== current.fulfillmentCarrierDestinationFingerprint
           || shipment.rateScope !== 'multi_package_shipment'
           || Number(shipment.packageCount) !== current.packages.length
           || (
@@ -5783,8 +5793,10 @@ export async function prepareOperationsShipmentExecutionFromPostgres(input: {
       )
 
       const fulfillmentInputSnapshot = {
-        carrierDestinationFingerprint:
+        checkoutCarrierDestinationFingerprint:
           current.receiptCarrierDestinationFingerprint,
+        carrierDestinationFingerprint:
+          current.fulfillmentCarrierDestinationFingerprint,
         configuredCarriers: current.carriers.map((carrier) => ({
           provider: carrier.provider,
           carrierAccountId: carrier.carrierAccountId,

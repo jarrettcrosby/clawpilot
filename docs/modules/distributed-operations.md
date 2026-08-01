@@ -1483,6 +1483,14 @@ attempted once with the same complete package array. Finalization then rechecks
 drift, selects one successful carrier/service for the entire shipment, records
 the fulfillment-time rerate, and persists the mandatory estimated
 checkout-to-fulfillment variance plus immutable attempt and package lineage.
+Shopify's checkout callback can supply only the destination country and postal
+code, so its keyed carrier destination fingerprint remains checkout-zone
+reconciliation evidence. The later fulfillment rerate independently derives a
+complete carrier destination fingerprint from the canonical order ship-to and
+requires every UPS/FedEx attempt to match that full address. These fingerprints
+are retained as separate facts; a sparse checkout fingerprint is never treated
+as the full fulfillment address, and the full address check is never dropped to
+make checkout lineage pass.
 The canonical order can own only one durable Shadow fulfillment preparation;
 changing the client idempotency key cannot create a competing execution after
 the first preparation commits, and concurrent attempts serialize on the order
