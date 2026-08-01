@@ -141,6 +141,27 @@ function verifySourceContracts() {
     )
   }
 
+  const sandboxCommerceE2eActiveGuardMigration = read(
+    'db/migrations/0200_operations_sandbox_commerce_e2e_active_guards.sql',
+  )
+  for (const fragment of [
+    'CREATE OR REPLACE FUNCTION validate_ops_plan_cartonization_evidence()',
+    'CREATE OR REPLACE FUNCTION validate_ops_activation_canonical_plans()',
+    'operations_sandbox_commerce_e2e_authorizations sandbox_auth',
+    "sandbox_auth.state = 'active'",
+    'sandbox_auth.expires_at > statement_timestamp()',
+    "authorized_order.status = 'packed'",
+    "authorized_order.source_provider = 'shopify'",
+    'sandbox_auth.external_order_id = authorized_order.external_order_id',
+    "OLD.status IN ('planned', 'released')",
+    "NEW.status = 'fulfilled'",
+  ]) {
+    assert.ok(
+      sandboxCommerceE2eActiveGuardMigration.includes(fragment),
+      `Sandbox commerce E2E Active guard migration missing ${fragment}`,
+    )
+  }
+
   const packagingMigration = read('db/migrations/0086_product_packaging_profiles.sql')
   for (const fragment of [
     "('gpp', 'operations.product_package_profile'",
@@ -1553,6 +1574,7 @@ async function verifyRouteBehavior() {
   assert.equal(calls.reads.length, 1)
   assert.deepEqual(JSON.parse(JSON.stringify(calls.reads[0])), {
     organizationId: actor.organizationId,
+    actorEmail: actor.email,
     capabilities: actor.capabilities,
     search: 'proof',
     status: 'shipped',

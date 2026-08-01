@@ -646,11 +646,15 @@ async function verifyShipmentCompletion(databaseUrl) {
   try {
     const postgres = postgresMock(pool)
     const auditWriter = auditWriterMock()
+    const sandboxCommerceE2e = loadTypeScriptModule(
+      'app_src/lib/operations/sandboxCommerceE2e.ts',
+    )
     const sandboxAuthorization = loadTypeScriptModule(
       'app_src/lib/persistence/sandboxCommerceE2eAuthorization.ts',
       {
         mocks: {
           '@/lib/auditWriter': auditWriter,
+          '@/lib/operations/sandboxCommerceE2e': sandboxCommerceE2e,
           '@/lib/persistence/postgres': postgres,
         },
       },
@@ -711,11 +715,9 @@ async function verifyShipmentCompletion(databaseUrl) {
           },
         },
         '@/lib/integrations/shopifyFulfillmentWriteback': {
-          executeShopifyFulfillmentWriteback: async () => {
-            throw new Error(
-              'Shipment completion acceptance does not write Shopify fulfillment',
-            )
-          },
+          executeShopifyFulfillmentWriteback: async () => ({
+            providerReference: 'shopify-focused-fulfillment-reference',
+          }),
         },
         '@/lib/operations/adapters': adapters,
         '@/lib/operations/canonicalFulfillmentPlanning':
@@ -1162,6 +1164,17 @@ async function verifyShipmentCompletion(databaseUrl) {
        WHERE organization_id = $1::uuid AND global_id = $2`,
       [authorizedFixture.organizationId, authorized.planned.orderGlobalId],
     )
+    await assert.rejects(
+      () => pool.query(
+        `UPDATE operations_activation_scopes
+         SET state = 'active', revision = revision + 1,
+             reason = 'Reject unauthorized sandbox plan',
+             updated_by = $2, updated_at = now()
+         WHERE organization_id = $1::uuid`,
+        [authorizedFixture.organizationId, authorizedFixture.email],
+      ),
+      /Active Operations cannot retain missing or non-production carrier-read plan/,
+    )
     const authorization = await sandboxAuthorization.authorizeSandboxCommerceE2eInPostgres({
       organizationId: authorizedFixture.organizationId,
       actorEmail: authorizedFixture.email,
@@ -1172,13 +1185,73 @@ async function verifyShipmentCompletion(databaseUrl) {
     })
     assert.equal(authorization.state, 'active')
     assert.match(authorization.authorizationGlobalId, /^gsea\d{7}$/)
-    await pool.query(
-      `UPDATE operations_orders
-       SET source_provider = 'mock-commerce'
-       WHERE organization_id = $1::uuid AND global_id = $2`,
-      [authorizedFixture.organizationId, authorized.planned.orderGlobalId],
+    const authorizationReplay = await sandboxAuthorization
+      .authorizeSandboxCommerceE2eInPostgres({
+        organizationId: authorizedFixture.organizationId,
+        actorEmail: authorizedFixture.email,
+        orderGlobalId: authorized.planned.orderGlobalId,
+        confirmationStatement: sandboxAuthorization.SANDBOX_COMMERCE_E2E_CONFIRMATION,
+        reason: 'Authorized multi-package sandbox E2E acceptance',
+        lifetimeMinutes: 30,
+      })
+    assert.equal(
+      authorizationReplay.authorizationGlobalId,
+      authorization.authorizationGlobalId,
+    )
+    assert.equal(authorizationReplay.expiresAt, authorization.expiresAt)
+    await assert.rejects(
+      () => sandboxAuthorization.authorizeSandboxCommerceE2eInPostgres({
+        organizationId: authorizedFixture.organizationId,
+        actorEmail: authorizedFixture.email,
+        orderGlobalId: authorized.planned.orderGlobalId,
+        confirmationStatement: sandboxAuthorization.SANDBOX_COMMERCE_E2E_CONFIRMATION,
+        reason: 'A different active authorization reason is rejected',
+        lifetimeMinutes: 30,
+      }),
+      (error) => error?.code === 'SANDBOX_E2E_AUTHORIZATION_ALREADY_ACTIVE',
+    )
+    assert.equal(
+      await sandboxAuthorization
+        .readActiveSandboxCommerceE2eAuthorizationForOrderInPostgres({
+          organizationId: authorizedFixture.organizationId,
+          orderGlobalId: authorized.planned.orderGlobalId,
+          actorEmail: 'different-operator@example.com',
+        }),
+      null,
     )
     const authorizationGlobalId = authorization.authorizationGlobalId
+    const activationResult = await pool.query(
+      `UPDATE operations_activation_scopes
+       SET state = 'active', revision = revision + 1,
+           reason = 'Authorized exact-order sandbox E2E guard acceptance',
+           updated_by = $2, updated_at = now()
+       WHERE organization_id = $1::uuid
+       RETURNING state, revision`,
+      [authorizedFixture.organizationId, authorizedFixture.email],
+    )
+    assert.equal(activationResult.rows[0]?.state, 'active')
+    const authorizedWorkspace = await persistence.readOperationsWorkspaceFromPostgres({
+      organizationId: authorizedFixture.organizationId,
+      actorEmail: authorizedFixture.email,
+      capabilities: {
+        canView: true,
+        canManage: true,
+        canExecute: true,
+        canActivate: true,
+      },
+      selectedOrderGlobalId: authorized.planned.orderGlobalId,
+    })
+    assert.equal(
+      authorizedWorkspace.selectedOrder?.sandboxCommerceE2eAuthorization
+        ?.authorizationGlobalId,
+      authorizationGlobalId,
+    )
+    assert.equal(
+      authorizedWorkspace.selectedOrder?.availableActions.find(
+        (action) => action.action === 'confirm_shipment',
+      )?.enabled,
+      true,
+    )
     const authorizedInput = {
       organizationId: authorizedFixture.organizationId,
       actorEmail: authorizedFixture.email,
@@ -1247,6 +1320,34 @@ async function verifyShipmentCompletion(databaseUrl) {
       })
     assert.equal(consumedAuthorization.state, 'consumed')
     assert.equal(consumedAuthorization.consumedBy, authorizedFixture.email)
+    const fulfilledPlan = await pool.query(
+      `SELECT plan.status
+       FROM operations_fulfillment_plans plan
+       JOIN operations_orders source_order
+         ON source_order.organization_id = plan.organization_id
+        AND source_order.id = plan.order_id
+       WHERE source_order.organization_id = $1::uuid
+         AND source_order.global_id = $2
+       ORDER BY plan.version_number DESC
+       LIMIT 1`,
+      [authorizedFixture.organizationId, authorized.planned.orderGlobalId],
+    )
+    assert.equal(fulfilledPlan.rows[0]?.status, 'fulfilled')
+    const consumedWorkspace = await persistence.readOperationsWorkspaceFromPostgres({
+      organizationId: authorizedFixture.organizationId,
+      actorEmail: authorizedFixture.email,
+      capabilities: {
+        canView: true,
+        canManage: true,
+        canExecute: true,
+        canActivate: true,
+      },
+      selectedOrderGlobalId: authorized.planned.orderGlobalId,
+    })
+    assert.equal(
+      consumedWorkspace.selectedOrder?.sandboxCommerceE2eAuthorization,
+      null,
+    )
     const authorizedReplay = await persistence.confirmOperationsOrderShipmentFromPostgres(
       authorizedInput,
     )

@@ -721,6 +721,7 @@ export async function GET(req: NextRequest) {
     }
     const operations = await readOperationsWorkspaceFromPostgres({
       organizationId: activeOperationsOrganizationId(actor),
+      actorEmail: actor.email,
       capabilities,
       search,
       status: statusValue || null,

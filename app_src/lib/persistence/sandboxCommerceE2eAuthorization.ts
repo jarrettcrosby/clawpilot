@@ -1,12 +1,16 @@
 import { createHash } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
+import {
+  SANDBOX_COMMERCE_E2E_CONFIRMATION,
+  SANDBOX_COMMERCE_E2E_CONFIRMATION_VERSION,
+} from '@/lib/operations/sandboxCommerceE2e'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 
-export const SANDBOX_COMMERCE_E2E_CONFIRMATION_VERSION =
-  'sandbox-commerce-e2e-v1' as const
-export const SANDBOX_COMMERCE_E2E_CONFIRMATION =
-  'I authorize this exact test order to create non-tracking sandbox labels, consume its reserved ClawPilot inventory, and write fulfillment and tracking to its commerce provider.' as const
+export {
+  SANDBOX_COMMERCE_E2E_CONFIRMATION,
+  SANDBOX_COMMERCE_E2E_CONFIRMATION_VERSION,
+} from '@/lib/operations/sandboxCommerceE2e'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const ORDER_GLOBAL_ID = /^gor[0-9]{7}$/
@@ -154,6 +158,28 @@ export async function authorizeSandboxCommerceE2eInPostgres(input: {
          AND state = 'active' AND expires_at <= now()`,
       [scopedOrganizationId, order.id],
     )
+    const existingResult = await client.query<AuthorizationRow>(
+      `${SELECT}
+       WHERE auth.organization_id = $1::uuid
+         AND auth.order_id = $2::uuid
+         AND auth.state = 'active'
+         AND auth.expires_at > now()
+       FOR UPDATE OF auth`,
+      [scopedOrganizationId, order.id],
+    )
+    const existing = existingResult.rows[0]
+    if (existing) {
+      if (
+        existing.authorized_by === actorEmail
+        && existing.reason === authorizationReason
+      ) {
+        return map(existing)
+      }
+      fail(
+        'SANDBOX_E2E_AUTHORIZATION_ALREADY_ACTIVE',
+        'A different active sandbox E2E authorization already exists for this order',
+      )
+    }
     const confirmationHash = createHash('sha256').update(JSON.stringify({
       version: SANDBOX_COMMERCE_E2E_CONFIRMATION_VERSION,
       statement: SANDBOX_COMMERCE_E2E_CONFIRMATION,
@@ -286,6 +312,31 @@ export async function readSandboxCommerceE2eAuthorizationInPostgres(input: {
      WHERE auth.organization_id = $1::uuid
        AND auth.global_id = $2`,
     [scopedOrganizationId, authorizationGlobalId],
+  )
+  return result.rows[0] ? map(result.rows[0]) : null
+}
+
+export async function readActiveSandboxCommerceE2eAuthorizationForOrderInPostgres(input: {
+  organizationId: unknown
+  orderGlobalId: unknown
+  actorEmail: unknown
+}) {
+  const scopedOrganizationId = organizationId(input.organizationId)
+  const orderGlobalId = String(input.orderGlobalId || '').trim()
+  const actorEmail = email(input.actorEmail)
+  if (!ORDER_GLOBAL_ID.test(orderGlobalId)) {
+    fail('SANDBOX_E2E_ORDER_INVALID', 'Operations order is invalid', 400)
+  }
+  const result = await query<AuthorizationRow>(
+    `${SELECT}
+     WHERE auth.organization_id = $1::uuid
+       AND source_order.global_id = $2
+       AND auth.authorized_by = $3
+       AND auth.state = 'active'
+       AND auth.expires_at > now()
+     ORDER BY auth.authorized_at DESC, auth.id DESC
+     LIMIT 1`,
+    [scopedOrganizationId, orderGlobalId, actorEmail],
   )
   return result.rows[0] ? map(result.rows[0]) : null
 }

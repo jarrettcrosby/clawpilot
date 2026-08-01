@@ -335,6 +335,9 @@ export async function GET() {
           operations_shopify_shadow_policy_lifetime_applied: boolean
           operations_shopify_shadow_test_subsidy_applied: boolean
           operations_shopify_quote_match_families_applied: boolean
+          operations_sandbox_commerce_e2e_authorization_applied: boolean
+          operations_commerce_active_canonical_collation_applied: boolean
+          operations_sandbox_commerce_e2e_active_guards_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -1117,6 +1120,24 @@ export async function GET() {
                 WHERE filename =
                   '0189_operations_shopify_checkout_quote_match_families.sql'
               ) AS operations_shopify_quote_match_families_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0198_operations_sandbox_commerce_e2e_authorization.sql'
+              ) AS operations_sandbox_commerce_e2e_authorization_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0199_operations_commerce_active_canonical_collation.sql'
+              ) AS operations_commerce_active_canonical_collation_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0200_operations_sandbox_commerce_e2e_active_guards.sql'
+              ) AS operations_sandbox_commerce_e2e_active_guards_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1280,6 +1301,9 @@ export async function GET() {
             && row?.operations_shopify_shadow_policy_lifetime_applied
             && row?.operations_shopify_shadow_test_subsidy_applied
             && row?.operations_shopify_quote_match_families_applied
+            && row?.operations_sandbox_commerce_e2e_authorization_applied
+            && row?.operations_commerce_active_canonical_collation_applied
+            && row?.operations_sandbox_commerce_e2e_active_guards_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1435,6 +1459,9 @@ export async function GET() {
           || !row?.operations_shopify_shadow_policy_lifetime_applied
           || !row?.operations_shopify_shadow_test_subsidy_applied
           || !row?.operations_shopify_quote_match_families_applied
+          || !row?.operations_sandbox_commerce_e2e_authorization_applied
+          || !row?.operations_commerce_active_canonical_collation_applied
+          || !row?.operations_sandbox_commerce_e2e_active_guards_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

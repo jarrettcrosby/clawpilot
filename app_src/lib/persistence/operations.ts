@@ -7,6 +7,7 @@ import {
 } from '@/lib/integrations/shopifyFulfillmentWriteback'
 import {
   consumeSandboxCommerceE2eAuthorization,
+  readActiveSandboxCommerceE2eAuthorizationForOrderInPostgres,
   requireActiveSandboxCommerceE2eAuthorization,
 } from '@/lib/persistence/sandboxCommerceE2eAuthorization'
 import {
@@ -1883,7 +1884,12 @@ async function revalidateProviderCommitmentsForPlan(
 async function readOrderDetail(
   organizationId: string,
   orderGlobalId: string,
-  context: { activationState: OperationsActivationState; canExecute: boolean },
+  context: {
+    activationState: OperationsActivationState
+    canExecute: boolean
+    actorEmail: string | null
+    canAuthorizeSandboxCommerceE2e: boolean
+  },
 ): Promise<OperationsOrderDetail | null> {
   const orderResult = await query<QueryResultRow & {
     id: string
@@ -2052,6 +2058,7 @@ async function readOrderDetail(
     commerceExportResult,
     eventResult,
     fulfillmentPreparation,
+    sandboxCommerceE2eAuthorization,
   ] = await Promise.all([
     query<QueryResultRow & {
       global_id: string
@@ -2353,6 +2360,13 @@ async function readOrderDetail(
       [organizationId, row.id],
     ),
     readShadowFulfillmentPreparation(organizationId, row.id),
+    context.actorEmail && context.canAuthorizeSandboxCommerceE2e
+      ? readActiveSandboxCommerceE2eAuthorizationForOrderInPostgres({
+          organizationId,
+          orderGlobalId,
+          actorEmail: context.actorEmail,
+        })
+      : Promise.resolve(null),
   ])
 
   let shadowPreparationReady = false
@@ -2425,7 +2439,16 @@ async function readOrderDetail(
       sandboxLabelCount: Number(row.sandbox_label_count),
       unresolvedLabelAttemptCount: Number(row.unresolved_label_attempt_count),
       existingShipmentCount: Number(row.existing_shipment_count),
+      sandboxE2eAuthorized: Boolean(sandboxCommerceE2eAuthorization),
     }),
+    sandboxCommerceE2eAuthorization: sandboxCommerceE2eAuthorization
+      ? {
+          authorizationGlobalId:
+            sandboxCommerceE2eAuthorization.authorizationGlobalId,
+          authorizedAt: sandboxCommerceE2eAuthorization.authorizedAt,
+          expiresAt: sandboxCommerceE2eAuthorization.expiresAt,
+        }
+      : null,
     fulfillmentPreparation,
     warehouseName: row.warehouse_name,
     promisedDeliveryAt: row.promised_delivery_at?.toISOString() || null,
@@ -2567,6 +2590,7 @@ async function readOrderDetail(
 
 export async function readOperationsWorkspaceFromPostgres(input: {
   organizationId: string
+  actorEmail?: string | null
   capabilities: OperationsCapabilities
   search?: string
   status?: string | null
@@ -3107,6 +3131,12 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     selectedOrder: selectedGlobalId ? await readOrderDetail(organizationId, selectedGlobalId, {
       activationState: activation.state,
       canExecute: input.capabilities.canExecute,
+      actorEmail: input.actorEmail || null,
+      canAuthorizeSandboxCommerceE2e: Boolean(
+        input.capabilities.canActivate
+        && input.capabilities.canManage
+        && input.capabilities.canExecute
+      ),
     }) : null,
     warehouses: warehouseResult.rows.map((row) => ({
       id: row.id,
@@ -4210,6 +4240,17 @@ export async function updateOperationsActivationInPostgres(input: {
              plan.cartonization_evidence_id IS NULL
              OR evidence.plan_snapshot->>'carrierReadEnvironment'
                   IS DISTINCT FROM 'production'
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM operations_sandbox_commerce_e2e_authorizations sandbox_auth
+             WHERE sandbox_auth.organization_id = plan.organization_id
+               AND sandbox_auth.order_id = plan.order_id
+               AND sandbox_auth.state = 'active'
+               AND sandbox_auth.expires_at > statement_timestamp()
+               AND source_order.status = 'packed'
+               AND source_order.source_provider = 'shopify'
+               AND sandbox_auth.external_order_id = source_order.external_order_id
            )
          ORDER BY plan.created_at, plan.id
          LIMIT 1`,

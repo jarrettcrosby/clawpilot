@@ -104,6 +104,14 @@ for (const fragment of [
   'data-testid="carrier-label-active-mode-required"',
   "!activeLabel && (",
   "!activeExecutionRequiredReason ? (",
+  'sandboxCommerceE2eAuthorization',
+  "action: 'authorize-sandbox-commerce-e2e'",
+  'confirmationStatement: SANDBOX_COMMERCE_E2E_CONFIRMATION',
+  'packageGlobalId: createLabelPackageGlobalId || undefined',
+  'sandboxE2eAuthorizationGlobalId: createLabelPackageGlobalId',
+  'detail.sandboxCommerceE2eAuthorization?.authorizationGlobalId',
+  'onClick={() => onCreateSandboxLabel(item.globalId)}',
+  'onClick={() => onCreateSandboxLabel()}',
   'disabled={busy || Boolean(voidBlockedReason)}',
   "gridTemplateColumns: { xs: 'minmax(0, 1fr)'",
   "overflowWrap: 'anywhere'",
@@ -138,16 +146,21 @@ const activeModeAlert = uiSource.indexOf(
   shippingExecution,
 )
 const voidButton = uiSource.indexOf('onClick={onVoidSandboxLabel}', shippingExecution)
+const authorizedCreateButton = uiSource.indexOf(
+  'onClick={() => onCreateSandboxLabel(item.globalId)}',
+  shippingExecution,
+)
 const createButton = uiSource.indexOf(
-  'onClick={onCreateSandboxLabel}',
+  'onClick={() => onCreateSandboxLabel()}',
   shippingExecution,
 )
 assert.ok(
   shippingExecution >= 0
     && activeModeAlert > shippingExecution
-    && voidButton > activeModeAlert
+    && authorizedCreateButton > activeModeAlert
+    && voidButton > authorizedCreateButton
     && createButton > voidButton,
-  'the visible Active-mode explanation must precede both label actions',
+  'the visible Active-mode explanation must precede authorized and legacy label actions',
 )
 
 const shadowEvidenceCondition =

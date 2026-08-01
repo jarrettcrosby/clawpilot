@@ -675,6 +675,11 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
   plannedPackageCount: number
   packedPackageCount: number
   availableActions: OperationsOrderActionAvailability[]
+  sandboxCommerceE2eAuthorization: {
+    authorizationGlobalId: string
+    authorizedAt: string
+    expiresAt: string
+  } | null
   fulfillmentPreparation: OperationsShadowFulfillmentPreparation | null
   shipTo: Address
   lines: Array<{

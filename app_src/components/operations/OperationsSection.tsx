@@ -82,7 +82,21 @@ import WarehouseSetupPanel from '@/components/operations/WarehouseSetupPanel'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatDimensionsMm, formatGrams } from '@/lib/measurements'
+import { SANDBOX_COMMERCE_E2E_CONFIRMATION } from '@/lib/operations/sandboxCommerceE2e'
 import { formatUserDateTime } from '@/lib/userDateTime'
+
+type SandboxCommerceE2eAuthorizationResult = {
+  authorizationGlobalId: string
+  orderGlobalId: string
+  externalOrderId: string
+  state: 'active' | 'consumed' | 'revoked' | 'expired'
+  reason: string
+  authorizedBy: string
+  authorizedAt: string
+  expiresAt: string
+  consumedAt: string | null
+  consumedBy: string | null
+}
 
 type OperationsPayload = {
   ok?: boolean
@@ -97,6 +111,7 @@ type OperationsPayload = {
     | OperationsOrderCommandResult
     | OperationsPackingSlipCommandResult
     | OperationsSandboxLabelCommandResult
+    | SandboxCommerceE2eAuthorizationResult
     | OperationsShadowFulfillmentExecutionResult
     | OperationsShipmentCommandResult
 }
@@ -722,6 +737,7 @@ function OrderDetailDrawer({
   sandboxCarrierAccounts,
   activationState,
   canExecute,
+  canAuthorizeSandboxE2e,
   open,
   busy,
   onClose,
@@ -733,6 +749,7 @@ function OrderDetailDrawer({
   onGeneratePackingSlip,
   onPrintPackingSlip,
   onConfirmShipment,
+  onAuthorizeSandboxE2e,
   onCreateSandboxLabel,
   onVoidSandboxLabel,
   generatingPackingSlipPackageId,
@@ -742,6 +759,7 @@ function OrderDetailDrawer({
   sandboxCarrierAccounts: OperationsWorkspace['shipping']['sandboxCarrierAccounts']
   activationState: OperationsActivationState
   canExecute: boolean
+  canAuthorizeSandboxE2e: boolean
   open: boolean
   busy: boolean
   onClose: () => void
@@ -753,7 +771,8 @@ function OrderDetailDrawer({
   onGeneratePackingSlip: (packageGlobalId: string) => void
   onPrintPackingSlip: (artifactGlobalId: string) => void
   onConfirmShipment: () => void
-  onCreateSandboxLabel: () => void
+  onAuthorizeSandboxE2e: () => void
+  onCreateSandboxLabel: (packageGlobalId?: string) => void
   onVoidSandboxLabel: () => void
   generatingPackingSlipPackageId: string | null
   printingPackingSlipArtifactId: string | null
@@ -802,6 +821,7 @@ function OrderDetailDrawer({
   const activeLabel = order?.packages
     .map((item) => item.latestLabel)
     .find((label) => label?.status === 'created') || null
+  const sandboxE2eAuthorization = order?.sandboxCommerceE2eAuthorization || null
   const unresolvedAttempt = labelAttempts.find(
     (attempt) => attempt.state === 'prepared' || attempt.state === 'unknown',
   ) || null
@@ -824,6 +844,31 @@ function OrderDetailDrawer({
                 : eligibleCarrierAccounts.length === 0
                   ? `Connect and verify a sandbox ${selectedRate.carrier} account first.`
                   : null)
+  const authorizedPackageCreateBlockedReason = activeExecutionRequiredReason
+    || (!canExecute
+      ? 'You do not have permission to purchase carrier labels.'
+      : !sandboxE2eAuthorization
+        ? 'Authorize this exact Shopify test order before creating package-specific sandbox labels.'
+        : order?.status !== 'packed'
+          ? 'Verify every package before creating labels.'
+          : unresolvedAttempt
+            ? `Attempt ${unresolvedAttempt.globalId} requires reconciliation before another carrier command.`
+            : !selectedRate
+              ? 'Select a carrier rate before creating labels.'
+              : !selectedProvider
+                ? `${selectedRate.carrier} does not have a direct sandbox label adapter.`
+                : eligibleCarrierAccounts.length === 0
+                  ? `Connect and verify a sandbox ${selectedRate.carrier} account first.`
+                  : null)
+  const authorizeSandboxE2eBlockedReason = !canAuthorizeSandboxE2e
+    ? 'Only an authorized organization owner or administrator may authorize this test.'
+    : order?.sourceProvider !== 'shopify'
+      ? 'Sandbox commerce E2E authorization currently requires a Shopify order.'
+      : order.status !== 'packed'
+        ? 'Verify every package before authorizing the test.'
+        : shipments.length > 0
+          ? 'This order already has shipment evidence.'
+          : null
   const voidBlockedReason = activeExecutionRequiredReason
     || (!canExecute
       ? 'You do not have permission to void carrier labels.'
@@ -1213,6 +1258,61 @@ function OrderDetailDrawer({
               </Stack> : <Typography variant="body2" color="text.secondary">No carrier rates have been recorded.</Typography>}
             </DetailSection>
 
+            {order.sourceProvider === 'shopify' && order.status === 'packed' && (
+              <DetailSection title="Authorized sandbox commerce E2E">
+                {sandboxE2eAuthorization ? (
+                  <Alert
+                    severity="success"
+                    data-testid="sandbox-commerce-e2e-authorization-active"
+                  >
+                    Exact-order authorization{' '}
+                    {sandboxE2eAuthorization.authorizationGlobalId} is active until{' '}
+                    {formatUserDateTime(
+                      sandboxE2eAuthorization.expiresAt,
+                      dateTime,
+                      {
+                        year: 'numeric',
+                        month: 'short',
+                        day: 'numeric',
+                        hour: 'numeric',
+                        minute: '2-digit',
+                        fallback: sandboxE2eAuthorization.expiresAt,
+                      },
+                    )}. It permits only this order&apos;s package-specific sandbox
+                    labels, reserved-inventory consumption, and Shopify
+                    fulfillment/tracking writeback.
+                  </Alert>
+                ) : (
+                  <Stack spacing={1.25}>
+                    <Alert severity="warning">
+                      This test path creates non-tracking sandbox labels and then
+                      performs real ClawPilot inventory and Shopify fulfillment
+                      writes for this exact order. It does not authorize any
+                      other order or production carrier purchase.
+                    </Alert>
+                    <Tooltip
+                      title={authorizeSandboxE2eBlockedReason
+                        || 'Review and authorize this exact Shopify test order'}
+                    >
+                      <span>
+                        <Button
+                          fullWidth
+                          variant="outlined"
+                          color="warning"
+                          startIcon={<WarningAmberRounded />}
+                          disabled={busy || Boolean(authorizeSandboxE2eBlockedReason)}
+                          onClick={onAuthorizeSandboxE2e}
+                          data-testid="authorize-sandbox-commerce-e2e"
+                        >
+                          Authorize exact-order E2E test
+                        </Button>
+                      </span>
+                    </Tooltip>
+                  </Stack>
+                )}
+              </DetailSection>
+            )}
+
             <DetailSection title="Shipping execution">
               <Stack spacing={1.5}>
                 {activeExecutionRequiredReason && (
@@ -1229,57 +1329,141 @@ function OrderDetailDrawer({
                     purchase or void. Reconcile the carrier result first so ClawPilot cannot create a duplicate label.
                   </Alert>
                 )}
-                {activeLabel ? (
-                  <Box sx={{ p: 1.5, border: '1px solid rgba(129,199,132,0.35)', borderRadius: '8px' }}>
-                    <Stack direction="row" justifyContent="space-between" alignItems="flex-start" gap={1.5}>
-                      <Box sx={{ minWidth: 0 }}>
-                        <Stack direction="row" spacing={1} alignItems="center" sx={{ flexWrap: 'wrap', rowGap: 0.75 }}>
-                          <Typography fontWeight={700}>{activeLabel.carrier} {activeLabel.serviceCode}</Typography>
-                          <Chip size="small" color="success" label="Active label" />
-                          <Chip size="small" variant="outlined" label={displayStatus(activeLabel.environment)} />
+                {sandboxE2eAuthorization ? (
+                  <Stack spacing={1.25} data-testid="sandbox-commerce-e2e-packages">
+                    <Alert severity="info">
+                      Create one sandbox label for each exact package. When all{' '}
+                      {order.packages.length} packages are labeled, Confirm shipment
+                      will consume the reserved inventory and write every tracking
+                      number to Shopify under authorization{' '}
+                      {sandboxE2eAuthorization.authorizationGlobalId}.
+                    </Alert>
+                    {order.packages.map((item) => {
+                      const packageLabel = item.latestLabel?.status === 'created'
+                        ? item.latestLabel
+                        : null
+                      return (
+                        <Box
+                          key={item.globalId}
+                          sx={{
+                            p: 1.5,
+                            border: packageLabel
+                              ? '1px solid rgba(129,199,132,0.35)'
+                              : '1px solid rgba(255,255,255,0.12)',
+                            borderRadius: '8px',
+                          }}
+                        >
+                          <Stack spacing={1.25}>
+                            <Stack
+                              direction="row"
+                              justifyContent="space-between"
+                              alignItems="flex-start"
+                              gap={1.5}
+                            >
+                              <Box sx={{ minWidth: 0 }}>
+                                <Typography fontWeight={700}>
+                                  Package {item.packageNumber} of {order.packages.length}
+                                </Typography>
+                                <Typography variant="caption" color="text.secondary">
+                                  {item.globalId}
+                                </Typography>
+                              </Box>
+                              <Chip
+                                size="small"
+                                color={packageLabel ? 'success' : 'default'}
+                                label={packageLabel ? 'Sandbox label ready' : 'Label required'}
+                              />
+                            </Stack>
+                            {packageLabel ? (
+                              <Box>
+                                <Typography sx={{ overflowWrap: 'anywhere' }}>
+                                  {packageLabel.trackingNumber}
+                                </Typography>
+                                <Typography variant="caption" color="text.secondary">
+                                  {packageLabel.carrier} {packageLabel.serviceCode}
+                                  {' · '}{packageLabel.globalId}
+                                </Typography>
+                              </Box>
+                            ) : (
+                              <Tooltip
+                                title={authorizedPackageCreateBlockedReason
+                                  || `Create the sandbox label for package ${item.packageNumber}`}
+                              >
+                                <span>
+                                  <Button
+                                    fullWidth
+                                    variant="contained"
+                                    size="small"
+                                    startIcon={<LocalShippingRounded />}
+                                    disabled={busy || Boolean(authorizedPackageCreateBlockedReason)}
+                                    onClick={() => onCreateSandboxLabel(item.globalId)}
+                                    data-testid={`create-sandbox-label-${item.globalId}`}
+                                  >
+                                    Create package {item.packageNumber} sandbox label
+                                  </Button>
+                                </span>
+                              </Tooltip>
+                            )}
+                          </Stack>
+                        </Box>
+                      )
+                    })}
+                  </Stack>
+                ) : (
+                  <>
+                    {activeLabel ? (
+                      <Box sx={{ p: 1.5, border: '1px solid rgba(129,199,132,0.35)', borderRadius: '8px' }}>
+                        <Stack direction="row" justifyContent="space-between" alignItems="flex-start" gap={1.5}>
+                          <Box sx={{ minWidth: 0 }}>
+                            <Stack direction="row" spacing={1} alignItems="center" sx={{ flexWrap: 'wrap', rowGap: 0.75 }}>
+                              <Typography fontWeight={700}>{activeLabel.carrier} {activeLabel.serviceCode}</Typography>
+                              <Chip size="small" color="success" label="Active label" />
+                              <Chip size="small" variant="outlined" label={displayStatus(activeLabel.environment)} />
+                            </Stack>
+                            <Typography sx={{ mt: 0.75, overflowWrap: 'anywhere' }}>{activeLabel.trackingNumber}</Typography>
+                            <Typography variant="caption" color="text.secondary">
+                              {activeLabel.globalId}
+                              {activeLabel.createAttemptGlobalId ? ` · Purchase ${activeLabel.createAttemptGlobalId}` : ''}
+                            </Typography>
+                          </Box>
+                          <Tooltip title={voidBlockedReason || 'Void through the same sandbox account used to purchase this label'}>
+                            <span>
+                              <Button
+                                color="error"
+                                variant="outlined"
+                                size="small"
+                                startIcon={<CancelRounded />}
+                                disabled={busy || Boolean(voidBlockedReason)}
+                                onClick={onVoidSandboxLabel}
+                              >
+                                Void
+                              </Button>
+                            </span>
+                          </Tooltip>
                         </Stack>
-                        <Typography sx={{ mt: 0.75, overflowWrap: 'anywhere' }}>{activeLabel.trackingNumber}</Typography>
-                        <Typography variant="caption" color="text.secondary">
-                          {activeLabel.globalId}
-                          {activeLabel.createAttemptGlobalId ? ` · Purchase ${activeLabel.createAttemptGlobalId}` : ''}
-                        </Typography>
                       </Box>
-                      <Tooltip title={voidBlockedReason || 'Void through the same sandbox account used to purchase this label'}>
+                    ) : !activeExecutionRequiredReason ? (
+                      <Alert severity={createBlockedReason ? 'info' : 'warning'}>
+                        {createBlockedReason
+                          || 'Sandbox execution uses the fixed John Doe test shipment. Create the label, inspect the print evidence, then void it immediately.'}
+                      </Alert>
+                    ) : null}
+                    {!activeLabel && (
+                      <Tooltip title={createBlockedReason || 'Purchase a sandbox label and route its print job'}>
                         <span>
                           <Button
-                            color="error"
-                            variant="outlined"
-                            size="small"
-                            startIcon={<CancelRounded />}
-                            disabled={busy || Boolean(voidBlockedReason)}
-                            onClick={onVoidSandboxLabel}
+                            fullWidth
+                            variant="contained"
+                            startIcon={<LocalShippingRounded />}
+                            disabled={busy || Boolean(createBlockedReason)}
+                            onClick={() => onCreateSandboxLabel()}
                           >
-                            Void
+                            Create sandbox label
                           </Button>
                         </span>
                       </Tooltip>
-                    </Stack>
-                  </Box>
-                ) : !activeExecutionRequiredReason ? (
-                  <Alert severity={createBlockedReason ? 'info' : 'warning'}>
-                    {createBlockedReason
-                      || 'Sandbox execution uses the fixed John Doe test shipment. Create the label, inspect the print evidence, then void it immediately.'}
-                  </Alert>
-                ) : null}
-                {!activeLabel && (
-                  <Tooltip title={createBlockedReason || 'Purchase a sandbox label and route its print job'}>
-                    <span>
-                      <Button
-                        fullWidth
-                        variant="contained"
-                        startIcon={<LocalShippingRounded />}
-                        disabled={busy || Boolean(createBlockedReason)}
-                        onClick={onCreateSandboxLabel}
-                      >
-                        Create sandbox label
-                      </Button>
-                    </span>
-                  </Tooltip>
+                    )}
+                  </>
                 )}
                 {labelAttempts.length > 0 && (
                   <Box>
@@ -1756,10 +1940,17 @@ export default function OperationsSection({
   )
   const [confirmShipmentIdempotencyKey, setConfirmShipmentIdempotencyKey] = useState('')
   const [confirmingShipment, setConfirmingShipment] = useState(false)
+  const [sandboxE2eAuthorizationOpen, setSandboxE2eAuthorizationOpen] = useState(false)
+  const [sandboxE2eAuthorizationConfirmed, setSandboxE2eAuthorizationConfirmed] = useState(false)
+  const [sandboxE2eAuthorizationReason, setSandboxE2eAuthorizationReason] = useState(
+    'Authorized end-to-end validation for this exact Shopify test order',
+  )
+  const [authorizingSandboxE2e, setAuthorizingSandboxE2e] = useState(false)
   const [createLabelOpen, setCreateLabelOpen] = useState(false)
   const [createLabelReason, setCreateLabelReason] = useState('Purchase a sandbox label for pack-to-ship validation')
   const [createLabelIdempotencyKey, setCreateLabelIdempotencyKey] = useState('')
   const [carrierAccountGlobalId, setCarrierAccountGlobalId] = useState('')
+  const [createLabelPackageGlobalId, setCreateLabelPackageGlobalId] = useState('')
   const [creatingLabel, setCreatingLabel] = useState(false)
   const [voidLabelOpen, setVoidLabelOpen] = useState(false)
   const [voidLabelReason, setVoidLabelReason] = useState('Void the sandbox label after validation')
@@ -2300,6 +2491,8 @@ export default function OperationsSection({
           orderGlobalId: detail.globalId,
           expectedRowVersion: detail.rowVersion,
           reason: confirmShipmentReason.trim(),
+          sandboxE2eAuthorizationGlobalId:
+            detail.sandboxCommerceE2eAuthorization?.authorizationGlobalId,
         }),
       })
       const payload = await response.json() as OperationsPayload
@@ -2331,15 +2524,81 @@ export default function OperationsSection({
     }
   }
 
-  const openCreateLabel = () => {
+  const openSandboxE2eAuthorization = () => {
+    if (!detail) return
+    setSandboxE2eAuthorizationConfirmed(false)
+    setSandboxE2eAuthorizationReason(
+      `Authorized end-to-end validation for Shopify test order ${detail.orderNumber}`,
+    )
+    setSandboxE2eAuthorizationOpen(true)
+  }
+
+  const closeSandboxE2eAuthorization = () => {
+    if (authorizingSandboxE2e) return
+    setSandboxE2eAuthorizationOpen(false)
+    setSandboxE2eAuthorizationConfirmed(false)
+  }
+
+  const authorizeSandboxE2e = async (event: FormEvent) => {
+    event.preventDefault()
+    if (
+      !detail
+      || !sandboxE2eAuthorizationConfirmed
+      || !sandboxE2eAuthorizationReason.trim()
+    ) return
+    setAuthorizingSandboxE2e(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'authorize-sandbox-commerce-e2e',
+          orderGlobalId: detail.globalId,
+          confirmationStatement: SANDBOX_COMMERCE_E2E_CONFIRMATION,
+          reason: sandboxE2eAuthorizationReason.trim(),
+          lifetimeMinutes: 120,
+        }),
+      })
+      const payload = await response.json() as OperationsPayload
+      if (
+        !response.ok
+        || !payload.result
+        || !('authorizationGlobalId' in payload.result)
+      ) {
+        throw new Error(payload.error || 'Sandbox commerce E2E authorization failed')
+      }
+      const result = payload.result
+      setSandboxE2eAuthorizationOpen(false)
+      setSandboxE2eAuthorizationConfirmed(false)
+      setNotice(
+        `Exact-order sandbox E2E authorization ${result.authorizationGlobalId} is active until ${result.expiresAt}.`,
+      )
+      await loadWorkspace(result.orderGlobalId)
+    } catch (caught) {
+      setError(caught instanceof Error
+        ? caught.message
+        : 'Sandbox commerce E2E authorization failed')
+    } finally {
+      setAuthorizingSandboxE2e(false)
+    }
+  }
+
+  const openCreateLabel = (packageGlobalId?: string) => {
     const selectedRate = detail?.rates.find((rate) => rate.selected)
     const provider = selectedRate ? providerForCarrier(selectedRate.carrier) : null
     const account = workspace?.shipping?.sandboxCarrierAccounts.find(
       (item) => item.provider === provider,
     )
     setCarrierAccountGlobalId(account?.globalId || '')
-    setCreateLabelReason('Purchase a sandbox label for pack-to-ship validation')
-    setCreateLabelIdempotencyKey(`operations-label-create:${detail?.globalId || 'order'}:${crypto.randomUUID()}`)
+    setCreateLabelPackageGlobalId(packageGlobalId || '')
+    setCreateLabelReason(packageGlobalId
+      ? `Create the authorized sandbox E2E label for package ${packageGlobalId}`
+      : 'Purchase a sandbox label for pack-to-ship validation')
+    setCreateLabelIdempotencyKey(
+      `operations-label-create:${detail?.globalId || 'order'}:${packageGlobalId || 'single'}:${crypto.randomUUID()}`,
+    )
     setCreateLabelOpen(true)
   }
 
@@ -2348,6 +2607,7 @@ export default function OperationsSection({
     setCreateLabelOpen(false)
     setCreateLabelIdempotencyKey('')
     setCarrierAccountGlobalId('')
+    setCreateLabelPackageGlobalId('')
   }
 
   const createSandboxLabel = async (event: FormEvent) => {
@@ -2359,6 +2619,8 @@ export default function OperationsSection({
       || !createLabelReason.trim()
       || !createLabelIdempotencyKey
       || !carrierAccountGlobalId
+      || (createLabelPackageGlobalId
+        && !detail.sandboxCommerceE2eAuthorization)
     ) return
     setCreatingLabel(true)
     setError('')
@@ -2377,6 +2639,10 @@ export default function OperationsSection({
           reason: createLabelReason.trim(),
           carrierRateGlobalId: selectedRate.globalId,
           carrierAccountGlobalId,
+          packageGlobalId: createLabelPackageGlobalId || undefined,
+          sandboxE2eAuthorizationGlobalId: createLabelPackageGlobalId
+            ? detail.sandboxCommerceE2eAuthorization?.authorizationGlobalId
+            : undefined,
         }),
       })
       const payload = await response.json() as OperationsPayload
@@ -2387,6 +2653,7 @@ export default function OperationsSection({
       setCreateLabelOpen(false)
       setCreateLabelIdempotencyKey('')
       setCarrierAccountGlobalId('')
+      setCreateLabelPackageGlobalId('')
       setNotice(
         result.printWarning
           ? `Sandbox label ${result.labelGlobalId} was created with tracking ${result.trackingNumber}. ${result.printWarning}`
@@ -2723,6 +2990,9 @@ export default function OperationsSection({
     planCartonizationEvidenceGlobalId.trim().toLowerCase(),
   )
   const detailSelectedRate = detail?.rates.find((rate) => rate.selected) || null
+  const detailCreateLabelPackage = detail?.packages.find(
+    (item) => item.globalId === createLabelPackageGlobalId,
+  ) || null
   const detailSelectedProvider = detailSelectedRate
     ? providerForCarrier(detailSelectedRate.carrier)
     : null
@@ -3128,6 +3398,11 @@ export default function OperationsSection({
         sandboxCarrierAccounts={workspace?.shipping?.sandboxCarrierAccounts || []}
         activationState={workspace?.activation.state || 'disabled'}
         canExecute={Boolean(capabilities?.canManage && capabilities.canExecute)}
+        canAuthorizeSandboxE2e={Boolean(
+          capabilities?.canActivate
+          && capabilities.canManage
+          && capabilities.canExecute
+        )}
         open={drawerOpen}
         busy={
           planningOrder
@@ -3136,6 +3411,7 @@ export default function OperationsSection({
           || verifyingPack
           || preparingFulfillment
           || confirmingShipment
+          || authorizingSandboxE2e
           || creatingLabel
           || voidingLabel
           || Boolean(generatingPackingSlipPackageId)
@@ -3154,6 +3430,7 @@ export default function OperationsSection({
           void printPackingSlip(artifactGlobalId)
         }}
         onConfirmShipment={openConfirmShipment}
+        onAuthorizeSandboxE2e={openSandboxE2eAuthorization}
         onCreateSandboxLabel={openCreateLabel}
         onVoidSandboxLabel={openVoidLabel}
         generatingPackingSlipPackageId={generatingPackingSlipPackageId}
@@ -3733,6 +4010,86 @@ export default function OperationsSection({
         </Box>
       </Dialog>
 
+      <Dialog
+        open={sandboxE2eAuthorizationOpen}
+        onClose={closeSandboxE2eAuthorization}
+        fullWidth
+        maxWidth="sm"
+      >
+        <Box component="form" onSubmit={authorizeSandboxE2e}>
+          <DialogTitle>Authorize exact-order sandbox E2E test</DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <Alert severity="error">
+                This authority is limited to Shopify order{' '}
+                {detail?.orderNumber || 'this order'} ({detail?.globalId || 'unknown'}).
+                It permits non-tracking sandbox labels followed by real reserved
+                inventory consumption and Shopify fulfillment/tracking writeback.
+                The authorization expires after two hours and is consumed by a
+                successful shipment confirmation.
+              </Alert>
+              <Box
+                sx={{
+                  p: 1.5,
+                  border: '1px solid rgba(255,255,255,0.16)',
+                  borderRadius: '8px',
+                }}
+              >
+                <Typography variant="body2">
+                  {SANDBOX_COMMERCE_E2E_CONFIRMATION}
+                </Typography>
+              </Box>
+              <FormControlLabel
+                control={(
+                  <Checkbox
+                    checked={sandboxE2eAuthorizationConfirmed}
+                    onChange={(event) => {
+                      setSandboxE2eAuthorizationConfirmed(event.target.checked)
+                    }}
+                    data-testid="sandbox-commerce-e2e-confirmation"
+                  />
+                )}
+                label="I understand and explicitly authorize this exact order-bound test."
+              />
+              <TextField
+                required
+                multiline
+                minRows={3}
+                label="Authorization reason"
+                value={sandboxE2eAuthorizationReason}
+                onChange={(event) => setSandboxE2eAuthorizationReason(event.target.value)}
+                inputProps={{ maxLength: 500 }}
+                helperText={`${sandboxE2eAuthorizationReason.trim().length}/500 · Recorded with the exact authorization`}
+              />
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button
+              onClick={closeSandboxE2eAuthorization}
+              disabled={authorizingSandboxE2e}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              variant="contained"
+              color="warning"
+              disabled={
+                authorizingSandboxE2e
+                || !sandboxE2eAuthorizationConfirmed
+                || !sandboxE2eAuthorizationReason.trim()
+              }
+              startIcon={authorizingSandboxE2e
+                ? <CircularProgress size={16} />
+                : <WarningAmberRounded />}
+              data-testid="confirm-sandbox-commerce-e2e-authorization"
+            >
+              {authorizingSandboxE2e ? 'Authorizing test' : 'Authorize this exact order'}
+            </Button>
+          </DialogActions>
+        </Box>
+      </Dialog>
+
       <Dialog open={confirmShipmentOpen} onClose={closeConfirmShipment} fullWidth maxWidth="sm">
         <Box component="form" onSubmit={confirmShipment}>
           <DialogTitle>Confirm shipment</DialogTitle>
@@ -3745,6 +4102,15 @@ export default function OperationsSection({
                 {' '}{detail?.orderNumber || 'this order'}. The order version and shipment
                 readiness checks are repeated when you confirm.
               </Alert>
+              {detail?.sandboxCommerceE2eAuthorization && (
+                <Alert severity="error" data-testid="sandbox-commerce-e2e-confirm-shipment-warning">
+                  Authorized sandbox E2E execution is active under{' '}
+                  {detail.sandboxCommerceE2eAuthorization.authorizationGlobalId}.
+                  Confirming will consume that one-time authorization and send
+                  every package&apos;s sandbox tracking number to Shopify even though
+                  those labels will not track with the carrier.
+                </Alert>
+              )}
               <Alert severity="info">
                 Packing-slip printing uses the active configured printer route and its approved
                 fallback automatically. A print warning will be recorded without rolling back a
@@ -3779,14 +4145,39 @@ export default function OperationsSection({
 
       <Dialog open={createLabelOpen} onClose={closeCreateLabel} fullWidth maxWidth="sm">
         <Box component="form" onSubmit={createSandboxLabel}>
-          <DialogTitle>Create sandbox carrier label</DialogTitle>
+          <DialogTitle>
+            {detailCreateLabelPackage
+              ? `Create package ${detailCreateLabelPackage.packageNumber} sandbox label`
+              : 'Create sandbox carrier label'}
+          </DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2}>
-              <Alert severity="warning">
-                Sandbox only. ClawPilot will use John Doe, Test Product, 101 Jegs Place in Delaware,
-                Ohio, and Massachusetts Maritime Academy in Buzzards Bay. Inspect the label and
-                print evidence, then void it immediately.
-              </Alert>
+              {detailCreateLabelPackage ? (
+                <Alert severity="error">
+                  Authorized E2E test package only. ClawPilot will create a
+                  non-tracking sandbox label for {detailCreateLabelPackage.globalId}
+                  using the exact order allocation. Do not void it: after every
+                  package is labeled, shipment confirmation will consume the
+                  reservation and write all tracking numbers to Shopify.
+                </Alert>
+              ) : (
+                <Alert severity="warning">
+                  Sandbox only. ClawPilot will use John Doe, Test Product, 101 Jegs Place in Delaware,
+                  Ohio, and Massachusetts Maritime Academy in Buzzards Bay. Inspect the label and
+                  print evidence, then void it immediately.
+                </Alert>
+              )}
+              {detailCreateLabelPackage && (
+                <Box>
+                  <Typography variant="caption" color="text.secondary">
+                    Exact package
+                  </Typography>
+                  <Typography>
+                    Package {detailCreateLabelPackage.packageNumber} of{' '}
+                    {detail?.packages.length || 0} · {detailCreateLabelPackage.globalId}
+                  </Typography>
+                </Box>
+              )}
               <Box>
                 <Typography variant="caption" color="text.secondary">Selected service</Typography>
                 <Typography>
@@ -3831,6 +4222,10 @@ export default function OperationsSection({
                 || !createLabelReason.trim()
                 || !carrierAccountGlobalId
                 || !detailSelectedRate
+                || Boolean(
+                  detailCreateLabelPackage
+                  && !detail?.sandboxCommerceE2eAuthorization,
+                )
               }
               startIcon={creatingLabel ? <CircularProgress size={16} /> : <LocalShippingRounded />}
             >
