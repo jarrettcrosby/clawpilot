@@ -75,6 +75,7 @@ export type ShopifyWebhookSubscriptionCreateResult = {
   providerId: string
   topic: string
   uri: string
+  created: boolean
 }
 
 export class ShopifyCommerceClientError extends Error {
@@ -601,7 +602,7 @@ export async function createShopifyWebhookSubscription(
   )
   const existing = readiness.subscriptions.find((subscription) =>
     subscription.topic === input.topic && subscription.uri === readiness.desiredUri)
-  if (existing) return existing
+  if (existing) return { ...existing, created: false }
   const data = await shopifyAdminGraphql<{
     webhookSubscriptionCreate?: {
       webhookSubscription?: unknown
@@ -637,7 +638,7 @@ export async function createShopifyWebhookSubscription(
       'SHOPIFY_WEBHOOK_SUBSCRIPTION_RESPONSE_INVALID',
     )
   }
-  return { providerId: node.id, topic: input.topic, uri: node.uri }
+  return { providerId: node.id, topic: input.topic, uri: node.uri, created: true }
 }
 
 export async function discoverShopifyWebhookSubscriptions(

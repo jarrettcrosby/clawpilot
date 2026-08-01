@@ -311,6 +311,8 @@ includes(service, [
   'encryptCommerceWebhookPayload',
   'recordShopifyWebhookReceiptInPostgres',
   'SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPIC_SET.has(topic)',
+  'topics: SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS',
+  'created.filter((subscription) => subscription.created).length',
   "topic === 'app/scopes_update'",
   'SHOPIFY_WEBHOOK_TOPIC_UNSUPPORTED',
   'Faire does not use Shopify signed-receipt intake',

@@ -1134,7 +1134,7 @@ async function verifyStoredConnection(
       { shopDomain, accessToken: grant.accessToken },
       {
         desiredUri: webhookUrl(runtime.globalId),
-        topics: SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS,
+        topics: SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
       },
     )
     return {
@@ -1376,7 +1376,7 @@ export async function registerShopifyInventoryWebhookSubscriptions(input: {
       redactedResponse: {
         ready: true,
         subscriptionCount: readiness.subscriptions.length,
-        providerWrites: created.length,
+        providerWrites: created.filter((subscription) => subscription.created).length,
       },
       state: 'succeeded',
       providerReference: runtime.externalAccountId,
