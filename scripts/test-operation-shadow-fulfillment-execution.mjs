@@ -30,6 +30,13 @@ const rateChoicePackageIdentityRepair = readFileSync(
   ),
   'utf8',
 )
+const fulfillmentValidatorUnionRepair = readFileSync(
+  resolve(
+    root,
+    'db/migrations/0194_operations_fulfillment_execution_union_repair.sql',
+  ),
+  'utf8',
+)
 const twoPassPackRateMigration = readFileSync(
   resolve(
     root,
@@ -61,6 +68,24 @@ for (const fragment of [
   assert.ok(
     persistence.includes(fragment),
     `Canonical provider-variant resolution is missing ${fragment}`,
+  )
+}
+
+for (const fragment of [
+  "'validate_operations_fulfillment_execution()'::regprocedure",
+  'canonical_line_mismatch',
+  'execution_line_mismatch',
+  'canonical_package_mismatch',
+  'execution_package_mismatch',
+  'Fulfillment line comparison marker is ambiguous',
+  'Fulfillment package comparison marker is ambiguous',
+  'EXECUTE revised_definition',
+  'complete fulfillment-address fingerprint',
+  'exact package-plan hash and package count',
+]) {
+  assert.ok(
+    fulfillmentValidatorUnionRepair.includes(fragment),
+    `Fulfillment-validator comparison repair migration is missing ${fragment}`,
   )
 }
 

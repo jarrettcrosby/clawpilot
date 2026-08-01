@@ -1569,6 +1569,9 @@ assertIncludes(healthRoute, '0177_operations_fulfillment_executions.sql', 'hoste
 assertIncludes(healthRoute, '0178_operations_shopify_customer_rate_policies.sql', 'hosted Shopify customer-rate policy migration health')
 assertIncludes(healthRoute, '0188_operations_shopify_shadow_test_subsidy.sql', 'hosted Shopify Shadow test-subsidy migration health')
 assertIncludes(healthRoute, '0189_operations_shopify_checkout_quote_match_families.sql', 'hosted Shopify quote match-family migration health')
+assertIncludes(healthRoute, '0192_operations_shadow_fulfillment_destination_fingerprint.sql', 'hosted Shadow fulfillment destination-repair migration health')
+assertIncludes(healthRoute, '0193_operations_shadow_rate_choice_package_identity.sql', 'hosted Shadow rate-choice package-identity repair migration health')
+assertIncludes(healthRoute, '0194_operations_fulfillment_execution_union_repair.sql', 'hosted fulfillment-validator UNION repair migration health')
 for (const [, alias] of healthRoute.matchAll(/\)\s+AS\s+([a-z0-9_]+)\s*,?/gi)) {
   assert.ok(
     alias.length <= 63,

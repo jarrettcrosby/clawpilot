@@ -309,6 +309,9 @@ export async function GET() {
           operations_shopify_inventory_refresh_migration_applied: boolean
           operations_shopify_inventory_webhook_refresh_applied: boolean
           operations_commerce_pack_evidence_fingerprint_applied: boolean
+          operations_shadow_fulfillment_destination_repair_applied: boolean
+          operations_shadow_rate_choice_package_identity_repair_applied: boolean
+          operations_fulfillment_execution_union_repair_applied: boolean
           operations_shopify_checkout_plan_rate_policy_applied: boolean
           shopify_active_account_readiness_migration_applied: boolean
           operations_commerce_inventory_attempt_lease_renewal_applied: boolean
@@ -995,6 +998,24 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename =
+                  '0192_operations_shadow_fulfillment_destination_fingerprint.sql'
+              ) AS operations_shadow_fulfillment_destination_repair_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0193_operations_shadow_rate_choice_package_identity.sql'
+              ) AS operations_shadow_rate_choice_package_identity_repair_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0194_operations_fulfillment_execution_union_repair.sql'
+              ) AS operations_fulfillment_execution_union_repair_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
                   '0170_operations_shopify_checkout_plan_rate_policy.sql'
               ) AS operations_shopify_checkout_plan_rate_policy_applied,
               EXISTS (
@@ -1219,6 +1240,9 @@ export async function GET() {
             && row?.operations_shopify_inventory_refresh_migration_applied
             && row?.operations_shopify_inventory_webhook_refresh_applied
             && row?.operations_commerce_pack_evidence_fingerprint_applied
+            && row?.operations_shadow_fulfillment_destination_repair_applied
+            && row?.operations_shadow_rate_choice_package_identity_repair_applied
+            && row?.operations_fulfillment_execution_union_repair_applied
             && row?.operations_shopify_checkout_plan_rate_policy_applied
             && row?.shopify_active_account_readiness_migration_applied
             && row?.operations_commerce_inventory_attempt_lease_renewal_applied
@@ -1369,6 +1393,9 @@ export async function GET() {
           || !row?.operations_shopify_inventory_refresh_migration_applied
           || !row?.operations_shopify_inventory_webhook_refresh_applied
           || !row?.operations_commerce_pack_evidence_fingerprint_applied
+          || !row?.operations_shadow_fulfillment_destination_repair_applied
+          || !row?.operations_shadow_rate_choice_package_identity_repair_applied
+          || !row?.operations_fulfillment_execution_union_repair_applied
           || !row?.operations_shopify_checkout_plan_rate_policy_applied
           || !row?.shopify_active_account_readiness_migration_applied
           || !row?.operations_commerce_inventory_attempt_lease_renewal_applied

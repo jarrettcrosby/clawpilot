@@ -8,6 +8,13 @@ const migration = readFileSync(
   resolve(root, 'db/migrations/0177_operations_fulfillment_executions.sql'),
   'utf8',
 )
+const validatorUnionRepair = readFileSync(
+  resolve(
+    root,
+    'db/migrations/0194_operations_fulfillment_execution_union_repair.sql',
+  ),
+  'utf8',
+)
 
 function section(startMarker, endMarker, label) {
   const start = migration.indexOf(startMarker)
@@ -23,6 +30,99 @@ function assertIncludes(source, fragments, label) {
   for (const fragment of fragments) {
     assert.ok(source.includes(fragment), `${label} is missing ${fragment}`)
   }
+}
+
+function repairTemplate(startMarker, endMarker, label) {
+  const start = validatorUnionRepair.indexOf(startMarker)
+  assert.notEqual(start, -1, `${label} is missing ${startMarker}`)
+  const contentStart = start + startMarker.length
+  const end = validatorUnionRepair.indexOf(endMarker, contentStart)
+  assert.notEqual(end, -1, `${label} is missing ${endMarker}`)
+  return validatorUnionRepair.slice(contentStart, end)
+}
+
+function selectedProjectionArities(source) {
+  const arities = []
+  const selectPattern = /\bSELECT\s+([\s\S]*?)\n\s+FROM\b/g
+  for (const match of source.matchAll(selectPattern)) {
+    const projection = match[1].trim()
+    if (
+      projection.includes('count(*)')
+      || projection === '1 AS mismatch'
+    ) {
+      continue
+    }
+    arities.push(projection.split(',').length)
+  }
+  return arities
+}
+
+function namedComparisonFamily(source, alias, label) {
+  const endMarker = `) ${alias}`
+  const end = source.indexOf(endMarker)
+  assert.notEqual(end, -1, `${label} is missing ${endMarker}`)
+  const wrapperStartMarker = 'SELECT 1 AS mismatch\n    FROM ('
+  const wrapperStart = source.lastIndexOf(wrapperStartMarker, end)
+  assert.notEqual(
+    wrapperStart,
+    -1,
+    `${label} is missing its one-column mismatch projection`,
+  )
+  const contentStart = wrapperStart + wrapperStartMarker.length
+  return {
+    source: source.slice(contentStart, end),
+    wrapperStart,
+    wrapperEnd: end + endMarker.length,
+  }
+}
+
+function assertComparisonTemplate({
+  source,
+  canonicalAlias,
+  canonicalArities,
+  executionAlias,
+  executionArities,
+  label,
+}) {
+  const canonical = namedComparisonFamily(source, canonicalAlias, label)
+  const execution = namedComparisonFamily(source, executionAlias, label)
+
+  assert.deepEqual(
+    selectedProjectionArities(canonical.source),
+    canonicalArities,
+    `${label} canonical/run comparisons must retain compatible projections`,
+  )
+  assert.deepEqual(
+    selectedProjectionArities(execution.source),
+    executionArities,
+    `${label} execution-edge comparisons must retain compatible projections`,
+  )
+
+  for (const [familyLabel, family] of [
+    ['canonical/run', canonical.source],
+    ['execution-edge', execution.source],
+  ]) {
+    assert.equal(
+      (family.match(/\bEXCEPT\b/g) || []).length,
+      2,
+      `${label} ${familyLabel} family must retain both sides of its symmetric difference`,
+    )
+    assert.equal(
+      (family.match(/\bUNION ALL\b/g) || []).length,
+      1,
+      `${label} ${familyLabel} family must combine only compatible projections`,
+    )
+  }
+
+  assert.ok(
+    canonical.wrapperEnd < execution.wrapperStart,
+    `${label} comparison families must remain independently wrapped`,
+  )
+  assert.match(
+    source.slice(canonical.wrapperEnd, execution.wrapperStart),
+    /^\s*UNION ALL\s*$/,
+    `${label} comparison families must bridge only their one-column sentinels`,
+  )
 }
 
 const executionTable = section(
@@ -75,8 +175,60 @@ const validation = section(
   'CREATE CONSTRAINT TRIGGER validate_operations_fulfillment_execution_deferred',
   'Fulfillment-execution validator',
 )
+const repairedLineValidation = repairTemplate(
+  'line_repair constant text := $line$',
+  '$line$;',
+  'Fulfillment line-comparison repair',
+)
+const repairedPackageValidation = repairTemplate(
+  'package_repair constant text := $package$',
+  '$package$;',
+  'Fulfillment package-comparison repair',
+)
 
 const checks = [
+  ['forward repair preserves compatible exact mismatch comparisons', () => {
+    assertIncludes(validatorUnionRepair, [
+      "'validate_operations_fulfillment_execution()'::regprocedure",
+      "E'  SELECT count(*) INTO line_mismatch_count\\n'",
+      "E'  SELECT count(*) INTO package_mismatch_count\\n'",
+      "E'  SELECT count(*) INTO allocation_mismatch_count\\n'",
+      'Fulfillment line comparison marker is ambiguous',
+      'Fulfillment package comparison marker is ambiguous',
+      'Fulfillment comparison arity repair was incomplete',
+      'current_line_comparison = line_repair',
+      "md5(current_line_comparison)\n          = '726cd3ef3667f7ffb812cdbd5ebca5c4'",
+      'Unexpected fulfillment line comparison state; refusing to overwrite function drift',
+      'current_package_comparison = package_repair',
+      "md5(current_package_comparison)\n          = 'f8e5abb38a0c1f056fa8aa4a7cf5ffbb'",
+      'Unexpected fulfillment package comparison state; refusing to overwrite function drift',
+      'EXECUTE revised_definition',
+    ], 'Fulfillment validator forward repair')
+
+    assertComparisonTemplate({
+      source: repairedLineValidation,
+      canonicalAlias: 'canonical_line_mismatch',
+      canonicalArities: [3, 3, 3, 3],
+      executionAlias: 'execution_line_mismatch',
+      executionArities: [4, 4, 4, 4],
+      label: 'Line comparison repair',
+    })
+    assertComparisonTemplate({
+      source: repairedPackageValidation,
+      canonicalAlias: 'canonical_package_mismatch',
+      canonicalArities: [10, 10, 10, 10],
+      executionAlias: 'execution_package_mismatch',
+      executionArities: [2, 2, 2, 2],
+      label: 'Package comparison repair',
+    })
+
+    assert.match(
+      validatorUnionRepair,
+      /COMMENT ON FUNCTION validate_operations_fulfillment_execution\(\)[\s\S]*complete fulfillment-address fingerprint[\s\S]*exact package-plan hash and package count/,
+      'Forward repair must retain the 0192/0193 invariant contract in the function comment',
+    )
+  }],
+
   ['required durable tables', () => {
     assert.match(
       migration,
