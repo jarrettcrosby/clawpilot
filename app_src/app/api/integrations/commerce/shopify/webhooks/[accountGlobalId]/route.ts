@@ -61,6 +61,8 @@ export async function POST(
   req: NextRequest,
   context: { params: Promise<{ accountGlobalId: string }> },
 ) {
+  let accountGlobalId: string | null = null
+  const topic = req.headers.get('x-shopify-topic')
   try {
     if (!isPostgresStorageEnabled()) {
       throw new CommerceIntegrationRequestError(
@@ -70,7 +72,6 @@ export async function POST(
       )
     }
     const { accountGlobalId: rawAccountGlobalId } = await context.params
-    let accountGlobalId: string
     try {
       accountGlobalId = normalizeCommerceAccountGlobalId(rawAccountGlobalId)
     } catch {
@@ -102,8 +103,23 @@ export async function POST(
       providerApiVersion: req.headers.get('x-shopify-api-version'),
       providerTriggeredAt: req.headers.get('x-shopify-triggered-at'),
     })
+    console.info('[shopify-webhook-ingress]', JSON.stringify({
+      ok: true,
+      accountGlobalId,
+      topic,
+      duplicate: result.duplicate,
+      payloadBytes: bytes.byteLength,
+    }))
     return json({ ok: true, duplicate: result.duplicate })
   } catch (error) {
+    const sanitized = sanitizedCommerceIntegrationError(error)
+    console.warn('[shopify-webhook-ingress]', JSON.stringify({
+      ok: false,
+      accountGlobalId,
+      topic,
+      code: sanitized.code,
+      status: sanitized.status,
+    }))
     return errorResponse(error)
   }
 }

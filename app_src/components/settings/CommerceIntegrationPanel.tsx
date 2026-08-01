@@ -1640,6 +1640,10 @@ export default function CommerceIntegrationPanel() {
               const missingScopes = valueStrings(
                 account.configuration.missingScopes,
               )
+              const missingReceiptProofScopes = account.provider === 'shopify'
+                ? valueStrings(catalog?.onboarding.shopify.receiptProofScopes)
+                  .filter((scope) => !grantedScopes.includes(scope))
+                : []
               const preview = shopifyPreviews[account.globalId]
               const revealed = revealedCredential?.accountGlobalId
                 === account.globalId
@@ -1668,8 +1672,8 @@ export default function CommerceIntegrationPanel() {
                     ...(!canActivate
                       ? ['Owner or operations-administrator access is required.']
                       : []),
-                    ...(missingScopes.length
-                      ? [`Add and approve these app scopes: ${missingScopes.join(', ')}.`]
+                    ...(missingReceiptProofScopes.length
+                      ? [`Add and approve these app scopes: ${missingReceiptProofScopes.join(', ')}.`]
                       : []),
                     ...(account.webhookVerificationStatus !== 'verified'
                       ? ['Send one valid signed allowed-topic delivery to the callback URL.']
@@ -2377,7 +2381,7 @@ export default function CommerceIntegrationPanel() {
                               disabled={
                                 pendingAction !== ''
                                 || !canActivate
-                                || missingScopes.length > 0
+                                || missingReceiptProofScopes.length > 0
                                 || account.webhookVerificationStatus !== 'verified'
                               }
                               onClick={() => action(
