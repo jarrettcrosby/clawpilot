@@ -2643,6 +2643,23 @@ try {
     readsAfterDurableCapture,
     'Retry after durable capture must stage the identical response without another provider read',
   )
+  const shopifyContinuationKey = nextKey()
+  failStageOnceForKey = shopifyContinuationKey
+  await assert.rejects(
+    service.executeCommerceIntakeCommand({
+      organizationId,
+      actorEmail,
+      body: {
+        action: 'fetch-next',
+        accountGlobalId: shopifyRuntime.globalId,
+        continuationRunGlobalId: firstShopify.command.runGlobalId,
+        confirmReadOnly: true,
+        idempotencyKey: shopifyContinuationKey,
+      },
+    }),
+    /simulated crash after durable provider capture/,
+  )
+  const readsAfterContinuationCapture = { ...providerReads }
   await service.executeCommerceIntakeCommand({
     organizationId,
     actorEmail,
@@ -2651,9 +2668,14 @@ try {
       accountGlobalId: shopifyRuntime.globalId,
       continuationRunGlobalId: firstShopify.command.runGlobalId,
       confirmReadOnly: true,
-      idempotencyKey: nextKey(),
+      idempotencyKey: shopifyContinuationKey,
     },
   })
+  assert.deepEqual(
+    providerReads,
+    readsAfterContinuationCapture,
+    'Continuation retry after durable capture must stage the identical page without another provider read',
+  )
   const shopifyProductsKey = nextKey()
   const firstShopifyProducts = await service.executeCommerceIntakeCommand({
     organizationId,
@@ -2852,7 +2874,7 @@ try {
     -2,
   )
   assert.equal(providerAttempts.length, 11)
-  assert.equal(providerReservations.length, 12)
+  assert.equal(providerReservations.length, 13)
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'faire'
@@ -2869,7 +2891,7 @@ try {
   )
   assert.equal(capturedReads.size, 11)
   assert.equal(uncertainReads.length, 0)
-  assert.equal(stageAttempts.length, 12)
+  assert.equal(stageAttempts.length, 13)
   for (const attempt of providerAttempts) {
     assert.equal(attempt.action, 'commerce.intake.read')
     assert.equal(attempt.redactedRequest.readOnly, true)

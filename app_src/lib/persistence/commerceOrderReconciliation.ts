@@ -28,6 +28,7 @@ export type CommerceOrderReconciliationTarget = {
   credentialVersion: number
   startedAt: string
   continuationRunGlobalId: string | null
+  continuationIdempotencyKey: string | null
 }
 
 function boundedCount(value: unknown) {
@@ -90,6 +91,7 @@ export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
       provider: 'shopify' | 'faire'
       credential_version: number
       continuation_run_global_id: string | null
+      continuation_idempotency_key: string | null
       last_started_at: Date
     }>(
       `WITH candidates AS (
@@ -99,7 +101,8 @@ export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
            account.global_id AS account_global_id,
            account.provider,
            account.commerce_credential_generation AS credential_version,
-           continuation.run_global_id AS continuation_run_global_id
+           continuation.run_global_id AS continuation_run_global_id,
+           continuation.idempotency_key AS continuation_idempotency_key
          FROM operations_integration_accounts account
          JOIN operations_commerce_credentials credential
            ON credential.organization_id = account.organization_id
@@ -111,12 +114,20 @@ export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
           AND cursor.integration_account_id = account.id
           AND cursor.resource = 'orders'
          LEFT JOIN LATERAL (
-           SELECT run.global_id AS run_global_id
+           SELECT run.global_id AS run_global_id,
+                  active_intent.idempotency_key
            FROM operations_commerce_intake_continuations continuation
            JOIN operations_commerce_intake_runs run
              ON run.organization_id = continuation.organization_id
             AND run.integration_account_id = continuation.integration_account_id
             AND run.id = continuation.run_id
+           LEFT JOIN operations_commerce_intake_read_intents active_intent
+             ON active_intent.organization_id = continuation.organization_id
+            AND active_intent.integration_account_id
+                = continuation.integration_account_id
+            AND active_intent.continuation_id = continuation.id
+            AND active_intent.intent_state
+                IN ('prepared', 'reading', 'captured')
            WHERE continuation.organization_id = account.organization_id
              AND continuation.integration_account_id = account.id
              AND continuation.provider = account.provider
@@ -244,6 +255,13 @@ export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
              AND candidate.integration_account_id
                  = operations_commerce_sync_cursors.integration_account_id
            LIMIT 1) AS continuation_run_global_id,
+         (SELECT candidate.continuation_idempotency_key
+            FROM candidates candidate
+           WHERE candidate.organization_id
+                 = operations_commerce_sync_cursors.organization_id
+             AND candidate.integration_account_id
+                 = operations_commerce_sync_cursors.integration_account_id
+           LIMIT 1) AS continuation_idempotency_key,
          last_started_at`,
       [Math.max(1, Math.min(Number(input.limit || 1), 5))],
     )
@@ -260,6 +278,8 @@ export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
         credentialVersion: Number(row.credential_version),
         startedAt: row.last_started_at.toISOString(),
         continuationRunGlobalId: row.continuation_run_global_id || null,
+        continuationIdempotencyKey:
+          row.continuation_idempotency_key || null,
       }))
   })
 }

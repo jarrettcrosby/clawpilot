@@ -357,6 +357,33 @@ function loadCommerceStagingService(pool, counters) {
   )
 }
 
+function loadCommerceOrderReconciliationPersistence(pool) {
+  return loadTypeScriptModule(
+    'app_src/lib/persistence/commerceOrderReconciliation.ts',
+    {
+      '@/lib/auditWriter': {
+        async recordAuditEvent() {},
+      },
+      '@/lib/persistence/postgres': {
+        async withTransaction(operation) {
+          const client = await pool.connect()
+          try {
+            await client.query('BEGIN')
+            const result = await operation(client)
+            await client.query('COMMIT')
+            return result
+          } catch (error) {
+            await client.query('ROLLBACK').catch(() => {})
+            throw error
+          } finally {
+            client.release()
+          }
+        },
+      },
+    },
+  )
+}
+
 async function seedCapturedRead(client, ids, envelope) {
   await client.query('SET session_replication_role = replica')
   try {
@@ -731,6 +758,161 @@ async function verifyAcceptance(databaseUrl) {
     state: 'succeeded',
     intent_state: 'staged',
   })
+
+  const recoveryKey = 'commerce-staging-postgres-recovery-key'
+  const recoveryAttempt = randomUUID()
+  const recoveryIntent = randomUUID()
+  const continuationEvidence = await pool.query(
+    `SELECT continuation.id::text, continuation.session_id::text,
+            continuation.batch_number, continuation.query_hash,
+            continuation.row_version::text, run.global_id,
+            continuation.window_start, continuation.window_end
+     FROM operations_commerce_intake_continuations continuation
+     JOIN operations_commerce_intake_runs run
+       ON run.organization_id = continuation.organization_id
+      AND run.integration_account_id = continuation.integration_account_id
+      AND run.id = continuation.run_id
+     WHERE continuation.organization_id = $1
+     LIMIT 1`,
+    [ids.organization],
+  )
+  assert.equal(continuationEvidence.rowCount, 1)
+  const continuation = continuationEvidence.rows[0]
+  const cursorHash = hash('commerce-staging-recovery-cursor')
+  const clientForRecovery = await pool.connect()
+  try {
+    await clientForRecovery.query('SET session_replication_role = replica')
+    await clientForRecovery.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = jsonb_build_object(
+             'grantedScopes', jsonb_build_array('read_orders')
+           )
+       WHERE organization_id = $1 AND id = $2`,
+      [ids.organization, ids.integrationAccount],
+    )
+    await clientForRecovery.query(
+      `INSERT INTO operations_commerce_credentials (
+         organization_id, integration_account_id, external_account_id,
+         auth_mode, credential_ciphertext, credential_iv, credential_tag,
+         credential_version, credential_identifier_last_four,
+         verification_status, verified_at, webhook_verification_status,
+         created_by, updated_by
+       ) VALUES (
+         $1, $2, 'gid://shopify/Shop/9201',
+         'shopify_client_credentials', $3, $4, $5, 1, '9201',
+         'verified', now(), 'unverified', $6, $6
+       )`,
+      [
+        ids.organization,
+        ids.integrationAccount,
+        Buffer.from('encrypted'),
+        Buffer.alloc(12, 3),
+        Buffer.alloc(16, 4),
+        actorEmail,
+      ],
+    )
+    await clientForRecovery.query(
+      `UPDATE operations_commerce_intake_runs
+       SET created_by = 'system:commerce-order-reconciliation'
+       WHERE organization_id = $1 AND global_id = $2`,
+      [ids.organization, continuation.global_id],
+    )
+    await clientForRecovery.query(
+      `UPDATE operations_commerce_intake_continuations
+       SET cursor_state = 'available',
+           cursor_ciphertext = $2,
+           cursor_iv = $3,
+           cursor_tag = $4,
+           cursor_hash = $5,
+           encryption_version = 1
+       WHERE id = $1`,
+      [
+        continuation.id,
+        Buffer.from('encrypted-cursor'),
+        Buffer.alloc(12, 5),
+        Buffer.alloc(16, 6),
+        cursorHash,
+      ],
+    )
+    await clientForRecovery.query(
+      `INSERT INTO operations_commerce_provider_attempts (
+         id, global_id, organization_id, integration_account_id,
+         action, adapter_version, idempotency_key, request_hash,
+         redacted_request, redacted_response, state, completed_at,
+         created_by
+       ) VALUES (
+         $1, 'gxa0009202', $2, $3, 'commerce.intake.read',
+         'commerce-staging-postgres-v1', $4, $5, '{}'::jsonb,
+         '{}'::jsonb, 'succeeded', now(),
+         $6
+       )`,
+      [
+        recoveryAttempt,
+        ids.organization,
+        ids.integrationAccount,
+        recoveryKey,
+        hash('commerce-staging-recovery-attempt'),
+        actorEmail,
+      ],
+    )
+    await clientForRecovery.query(
+      `INSERT INTO operations_commerce_intake_read_intents (
+         id, organization_id, integration_account_id, pipeline_id,
+         provider, resource, intake_action, idempotency_key, request_hash,
+         credential_version, target_kind, target_global_id,
+         continuation_id, continuation_cursor_hash,
+         continuation_row_version, session_id, batch_number, window_start,
+         window_end, query_hash, intent_state, provider_attempt_id,
+         response_ciphertext, response_iv, response_tag, response_hash,
+         response_bytes, response_encryption_version, created_by, updated_by,
+         expires_at
+       ) VALUES (
+         $1, $2, $3, $4, 'shopify', 'orders', 'fetch-next', $5, $6,
+         1, 'continuation', $7, $8, $9, $10, $11, $12,
+         $13::timestamptz, $14::timestamptz, $15, 'captured', $16,
+         $17, $18, $19, $20, 2, 1,
+         $21, $21, $22::timestamptz
+       )`,
+      [
+        recoveryIntent,
+        ids.organization,
+        ids.integrationAccount,
+        ids.pipeline,
+        recoveryKey,
+        hash('commerce-staging-recovery-intent'),
+        continuation.global_id,
+        continuation.id,
+        cursorHash,
+        continuation.row_version,
+        continuation.session_id,
+        continuation.batch_number + 1,
+        continuation.window_start,
+        continuation.window_end,
+        continuation.query_hash,
+        recoveryAttempt,
+        Buffer.from('[]'),
+        Buffer.alloc(12, 7),
+        Buffer.alloc(16, 8),
+        hash('commerce-staging-recovery-response'),
+        actorEmail,
+        retentionExpiresAt,
+      ],
+    )
+  } finally {
+    await clientForRecovery.query('SET session_replication_role = origin')
+      .catch(() => {})
+    clientForRecovery.release()
+  }
+
+  const recoveryPersistence = loadCommerceOrderReconciliationPersistence(pool)
+  const recoveryTargets = await recoveryPersistence
+    .claimCommerceOrderReconciliationTargetsInPostgres({ limit: 1 })
+  assert.equal(recoveryTargets.length, 1)
+  assert.equal(
+    recoveryTargets[0].continuationRunGlobalId,
+    continuation.global_id,
+  )
+  assert.equal(recoveryTargets[0].continuationIdempotencyKey, recoveryKey)
   await pool.end()
 }
 
@@ -768,7 +950,8 @@ async function main() {
     })
   }
   console.log(
-    'Commerce intake fresh-staging disposable-PostgreSQL acceptance passed',
+    'Commerce intake fresh-staging and captured-continuation recovery '
+      + 'disposable-PostgreSQL acceptance passed',
   )
 }
 

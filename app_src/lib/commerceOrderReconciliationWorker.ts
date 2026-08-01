@@ -27,6 +27,20 @@ function deterministicRunUuid(input: {
   ].join('-')
 }
 
+function deterministicContinuationUuid(input: {
+  organizationId: string
+  accountGlobalId: string
+  credentialVersion: number
+  continuationRunGlobalId: string
+}) {
+  return deterministicRunUuid({
+    organizationId: input.organizationId,
+    accountGlobalId: input.accountGlobalId,
+    credentialVersion: input.credentialVersion,
+    startedAt: `continuation:${input.continuationRunGlobalId}`,
+  })
+}
+
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -95,6 +109,7 @@ export async function processCommerceOrderReconciliation(input: {
   for (const target of targets) {
     try {
       let continuationRunGlobalId = target.continuationRunGlobalId
+      let continuationIdempotencyKey = target.continuationIdempotencyKey
       let targetPagesRead = 0
       let targetProviderRecordsSeen = 0
       let targetOrdersHeld = 0
@@ -105,12 +120,22 @@ export async function processCommerceOrderReconciliation(input: {
           organizationId: target.organizationId,
           accountGlobalId: target.accountGlobalId,
           actorEmail: 'system:commerce-order-reconciliation',
-          idempotencyKey: deterministicRunUuid({
-            organizationId: target.organizationId,
-            accountGlobalId: target.accountGlobalId,
-            credentialVersion: target.credentialVersion,
-            startedAt: `${target.startedAt}:${targetPagesRead}:${continuationRunGlobalId || 'first'}`,
-          }),
+          idempotencyKey: continuationRunGlobalId
+            ? (
+                continuationIdempotencyKey
+                || deterministicContinuationUuid({
+                  organizationId: target.organizationId,
+                  accountGlobalId: target.accountGlobalId,
+                  credentialVersion: target.credentialVersion,
+                  continuationRunGlobalId,
+                })
+              )
+            : deterministicRunUuid({
+                organizationId: target.organizationId,
+                accountGlobalId: target.accountGlobalId,
+                credentialVersion: target.credentialVersion,
+                startedAt: `${target.startedAt}:${targetPagesRead}:first`,
+              }),
           continuationRunGlobalId,
         })
         const command = record(response.command)
@@ -134,6 +159,10 @@ export async function processCommerceOrderReconciliation(input: {
           throw error
         }
         continuationRunGlobalId = next
+        // A new continuation has no prior read intent. Its deterministic key
+        // remains stable across worker claims; a later claim instead receives
+        // the exact original key when a captured read still needs staging.
+        continuationIdempotencyKey = null
       }
       const completion = await completeCommerceOrderReconciliationInPostgres({
         target,

@@ -77,6 +77,8 @@ includes(persistence, [
   'continuation.credential_version',
   "run.created_by = 'system:commerce-order-reconciliation'",
   'continuation_run_global_id',
+  'continuation_idempotency_key',
+  "active_intent.intent_state",
   'THEN 0',
   'ELSE operations_commerce_sync_cursors.records_seen',
   'ELSE operations_commerce_sync_cursors.records_held',
@@ -127,6 +129,7 @@ const persistenceModule = loadTypeScriptModule(
                   provider: 'faire',
                   credential_version: 2,
                   continuation_run_global_id: null,
+                  continuation_idempotency_key: null,
                   last_started_at: claimStartedAt,
                 }],
               }
@@ -186,6 +189,7 @@ const failureTarget = {
   credentialVersion: 1,
   startedAt: '2026-07-27T12:00:00.000Z',
   continuationRunGlobalId: null,
+  continuationIdempotencyKey: null,
 }
 const knownConstraintFailure = await failurePersistenceModule
   .failCommerceOrderReconciliationInPostgres({
@@ -302,6 +306,7 @@ const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWork
           credentialVersion: 1,
           startedAt: '2026-07-27T12:00:00.000Z',
           continuationRunGlobalId: null,
+          continuationIdempotencyKey: null,
         }]
       },
       async completeCommerceOrderReconciliationInPostgres(input) {
@@ -334,6 +339,62 @@ assert.deepEqual(
   {},
   'Successful order reconciliation must report no failure categories',
 )
+
+const recoveredIntentKey = '018f0f50-28ec-7af5-a3fb-9bcbe43ea204'
+const recoveredTrace = { requestedKeys: [], complete: 0, failed: 0 }
+const recoveredWorker = loadTypeScriptModule(
+  'app_src/lib/commerceOrderReconciliationWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceIntake': {
+        commerceIntakeRuntimeAvailable: () => true,
+        async executeCommerceOrderPage(input) {
+          recoveredTrace.requestedKeys.push(input.idempotencyKey)
+          assert.equal(input.continuationRunGlobalId, 'gcir0000099')
+          return {
+            command: {
+              providerWrites: 0,
+              syncCursorAdvanced: false,
+              ordersStaged: 1,
+              recordsRejected: 0,
+              pagination: {
+                providerRowsSeen: 1,
+                hasNextBatch: false,
+              },
+            },
+          }
+        },
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async claimCommerceOrderReconciliationTargetsInPostgres() {
+          return [{
+            ...failureTarget,
+            continuationRunGlobalId: 'gcir0000099',
+            continuationIdempotencyKey: recoveredIntentKey,
+          }]
+        },
+        async completeCommerceOrderReconciliationInPostgres() {
+          recoveredTrace.complete += 1
+          return { leaseLost: false }
+        },
+        async failCommerceOrderReconciliationInPostgres() {
+          recoveredTrace.failed += 1
+          return {
+            leaseLost: false,
+            errorCode: 'COMMERCE_ORDER_RECONCILIATION_FAILED',
+          }
+        },
+      },
+    },
+  },
+)
+const recovered = await recoveredWorker
+  .processCommerceOrderReconciliation({ limit: 1 })
+assert.deepEqual(recoveredTrace.requestedKeys, [recoveredIntentKey])
+assert.equal(recoveredTrace.complete, 1)
+assert.equal(recoveredTrace.failed, 0)
+assert.equal(recovered.staged, 1)
+assert.equal(recovered.providerWrites, 0)
 
 const failedWorker = loadTypeScriptModule(
   'app_src/lib/commerceOrderReconciliationWorker.ts',
