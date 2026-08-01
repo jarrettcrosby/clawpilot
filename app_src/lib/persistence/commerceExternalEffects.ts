@@ -1208,6 +1208,7 @@ function claimabilitySql(alias = 'intent') {
   return `(
     ${alias}.state = 'pending'
     AND ${alias}.desired_mode = 'active'
+    AND ${alias}.faire_provider_write_authorization_id IS NULL
     AND (
       account.status = 'active'
       OR (
@@ -1660,6 +1661,8 @@ export async function readCommerceExternalEffectsStateFromPostgres(input: {
            THEN 'claim_lease_expired_reconciliation_required'
          WHEN intent.state <> 'pending' THEN NULL
          WHEN intent.desired_mode <> 'active' THEN 'shadow_not_claimable'
+         WHEN intent.faire_provider_write_authorization_id IS NOT NULL
+           THEN 'faire_authorization_requires_dedicated_claim'
          WHEN account.status <> 'active'
               OR account.integration_type <> 'commerce'
               OR account.provider <> intent.provider

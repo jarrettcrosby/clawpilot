@@ -144,11 +144,7 @@ function normalizedAuthority(input: FaireFulfillmentWritebackInput) {
     || !authorization
     || authorization.provider !== 'faire'
     || authorization.environment !== 'production'
-    || ![
-      'oauth_grant',
-      'provider_confirmation',
-      'successful_provider_effect',
-    ].includes(String(authorization.scopeVerificationSource || ''))
+    || authorization.scopeVerificationSource !== 'oauth_grant'
   ) {
     throw new FaireFulfillmentWritebackError(
       'FAIRE_FULFILLMENT_AUTHORIZATION_INVALID',

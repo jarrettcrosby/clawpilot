@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
-import { generateKeyPairSync } from 'node:crypto'
+import { createHash, generateKeyPairSync } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -13,6 +13,25 @@ function read(relativePath) {
 
 function assertIncludes(source, needle, label) {
   assert.ok(source.includes(needle), `${label} missing ${needle}`)
+}
+
+function normalizedPgProcBodyFromMigration(source, functionName) {
+  const declaration = source.indexOf(functionName)
+  assert.notEqual(declaration, -1, `migration missing function ${functionName}`)
+  const bodyMarker = 'AS $$'
+  const bodyStart = source.indexOf(bodyMarker, declaration)
+  assert.notEqual(bodyStart, -1, `${functionName} missing ${bodyMarker}`)
+  const bodyEnd = source.indexOf('$$;', bodyStart + bodyMarker.length)
+  assert.notEqual(bodyEnd, -1, `${functionName} missing function-body terminator`)
+  return source
+    .slice(bodyStart + bodyMarker.length, bodyEnd)
+    .replace(/(^|[\r\n])[\t ]*--[^\r\n]*/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim()
+}
+
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex')
 }
 
 const migration = read('db/migrations/0001_initial_railway_postgres.sql')
@@ -1502,6 +1521,64 @@ assertIncludes(tenancyDataVerifier, 'count(DISTINCT projection.pipeline_id) <> 1
 const dispatchBridge = read('app_src/lib/dispatchBridge.ts')
 assertIncludes(dispatchBridge, 'execution succeeded but completion telemetry could not be persisted', 'dispatch replay guard')
 
+const faireProviderWriteAuthorizationMigration = read(
+  'db/migrations/0220_operations_faire_provider_write_authorizations.sql',
+)
+for (const fragment of [
+  'CREATE TABLE IF NOT EXISTS operations_faire_provider_write_scope_evidence',
+  'CREATE TABLE IF NOT EXISTS operations_faire_provider_write_authorizations',
+  'operations_faire_write_scope_list_valid',
+  'operations_faire_write_capability_list_valid',
+  'operations_faire_provider_write_canonical_jsonb',
+  'operations_faire_provider_write_request_hash',
+  'operations_faire_provider_write_json_is_redacted',
+  'operations_faire_provider_write_scope_evidence_is_current',
+  'operations_faire_provider_write_fence_hash',
+  'protect_operations_faire_scope_evidence_write',
+  'protect_operations_faire_write_authorization_write',
+  'operations_faire_provider_write_authority_is_current',
+  'operations_faire_write_auth_active_aggregate_idx',
+  'operations_faire_write_auth_effect_tombstone_idx',
+  'operations_commerce_effect_faire_auth_unique',
+  'operations_faire_scope_evidence_attempt_fkey',
+  'operations_faire_write_auth_scope_evidence_fkey',
+  'operations_faire_write_auth_attempt_fkey',
+  'operations_commerce_effect_faire_auth_fkey',
+]) {
+  assertIncludes(
+    faireProviderWriteAuthorizationMigration,
+    fragment,
+    'Faire provider-write authorization migration',
+  )
+}
+const faireScopeCurrentProsrcSha256 =
+  'a93f6fb2233dc30abe9e8db212692c61f1098b4c5e2f0e7c8801f600a06956c3'
+const faireScopeTriggerProsrcSha256 =
+  'abc99a1fdfcef78542ab5df2ac3af8b2eef934f38d70780156e133a74b01e73d'
+const faireScopeCurrentBody = normalizedPgProcBodyFromMigration(
+  faireProviderWriteAuthorizationMigration,
+  'operations_faire_provider_write_scope_evidence_is_current',
+)
+const faireScopeTriggerBody = normalizedPgProcBodyFromMigration(
+  faireProviderWriteAuthorizationMigration,
+  'protect_operations_faire_scope_evidence',
+)
+assert.equal(
+  faireScopeCurrentBody,
+  'SELECT false',
+  'Faire production scope-evidence helper must remain unconditionally closed',
+)
+assert.equal(
+  sha256(faireScopeCurrentBody),
+  faireScopeCurrentProsrcSha256,
+  'Faire production scope-evidence helper normalized prosrc changed',
+)
+assert.equal(
+  sha256(faireScopeTriggerBody),
+  faireScopeTriggerProsrcSha256,
+  'Faire scope-evidence protection trigger normalized prosrc changed',
+)
+
 const healthRoute = read('app_src/app/api/health/route.ts')
 assertIncludes(healthRoute, 'readPipelineOutboxWorkerHeartbeatFromPostgres', 'hosted worker health')
 assertIncludes(healthRoute, '0002_pipeline_outbox_worker.sql', 'hosted migration health')
@@ -1580,6 +1657,117 @@ assertIncludes(healthRoute, '0199_operations_commerce_active_canonical_collation
 assertIncludes(healthRoute, '0200_operations_sandbox_commerce_e2e_active_guards.sql', 'hosted sandbox commerce E2E Active guards migration health')
 assertIncludes(healthRoute, '0218_global_id_alphanumeric_expand_141_149_and_catalog_gate.sql', 'hosted Global ID alphanumeric compatibility migration health')
 assertIncludes(healthRoute, '0219_global_id_base32hex_allocator.sql', 'hosted Global ID base32hex allocator migration health')
+for (const fragment of [
+  '0220_operations_faire_provider_write_authorizations.sql',
+  'operations_faire_provider_write_scope_evidence',
+  'operations_faire_provider_write_authorizations',
+  'operations_faire_write_scope_list_valid(text[])',
+  'operations_faire_write_capability_list_valid(text[])',
+  'operations_faire_provider_write_canonical_jsonb(jsonb)',
+  'operations_faire_provider_write_request_hash(jsonb)',
+  'operations_faire_provider_write_json_is_redacted(jsonb)',
+  'operations_faire_provider_write_scope_evidence_is_current(uuid,uuid,uuid,integer)',
+  'operations_faire_provider_write_fence_hash',
+  'protect_operations_faire_scope_evidence_write',
+  'protect_operations_faire_write_authorization_write',
+  'protect_operations_commerce_external_effect_intent_write',
+  'operations_faire_provider_write_authority_is_current',
+  'operations_faire_write_auth_active_aggregate_idx',
+  'operations_faire_write_auth_effect_tombstone_idx',
+  'operations_commerce_effect_faire_auth_unique',
+  'operations_faire_scope_evidence_attempt_fkey',
+  'operations_faire_write_auth_scope_evidence_fkey',
+  'operations_faire_write_auth_attempt_fkey',
+  'operations_commerce_effect_faire_auth_fkey',
+]) {
+  assertIncludes(healthRoute, fragment, 'hosted Faire provider-write readiness')
+}
+for (const fragment of [
+  'SHA-256 over pg_proc.prosrc after removing full-line -- comments',
+  faireScopeCurrentProsrcSha256,
+  faireScopeTriggerProsrcSha256,
+  'procedure.prosrc',
+  "E'(^|[\\\\n\\\\r])[[:blank:]]*--[^\\\\n\\\\r]*'",
+  "'[[:space:]]+'",
+  ") = 'SELECT false'",
+  "= '${FAIRE_SCOPE_CURRENT_PROSRC_SHA256}'",
+  "= '${FAIRE_SCOPE_TRIGGER_PROSRC_SHA256}'",
+]) {
+  assertIncludes(healthRoute, fragment, 'hosted Faire fail-closed body hash')
+}
+assert.equal(
+  (healthRoute.match(/FAIRE_SCOPE_CURRENT_PROSRC_SHA256/g) || []).length,
+  2,
+  'Faire current-scope prosrc hash must be declared and enforced exactly once',
+)
+assert.equal(
+  (healthRoute.match(/FAIRE_SCOPE_TRIGGER_PROSRC_SHA256/g) || []).length,
+  2,
+  'Faire scope trigger prosrc hash must be declared and enforced exactly once',
+)
+const faireScopeTriggerHealthStart = healthRoute.indexOf(
+  "'protect_operations_faire_scope_evidence_write'",
+)
+const faireScopeTriggerHealthEnd = healthRoute.indexOf(
+  "'protect_operations_commerce_external_effect_intent_write'",
+  faireScopeTriggerHealthStart,
+)
+assert.ok(
+  faireScopeTriggerHealthStart >= 0
+    && faireScopeTriggerHealthEnd > faireScopeTriggerHealthStart,
+  'hosted Faire scope trigger health block is missing',
+)
+const faireScopeTriggerHealth = healthRoute.slice(
+  faireScopeTriggerHealthStart,
+  faireScopeTriggerHealthEnd,
+)
+for (const fragment of [
+  "trg.tgfoid = to_regprocedure(",
+  "'protect_operations_faire_scope_evidence()'",
+  "trg.tgenabled = 'O'",
+  'trg.tgtype = 31',
+  'NOT trg.tgisinternal',
+]) {
+  assertIncludes(faireScopeTriggerHealth, fragment, 'exact Faire scope trigger health')
+}
+const faireTombstoneHealthStart = healthRoute.indexOf(
+  "'operations_faire_write_auth_effect_tombstone_idx'",
+)
+const faireTombstoneHealthEnd = healthRoute.indexOf(
+  "'operations_commerce_effect_faire_auth_unique'",
+  faireTombstoneHealthStart,
+)
+assert.ok(
+  faireTombstoneHealthStart >= 0
+    && faireTombstoneHealthEnd > faireTombstoneHealthStart,
+  'hosted Faire tombstone-index health block is missing',
+)
+const faireTombstoneHealth = healthRoute.slice(
+  faireTombstoneHealthStart,
+  faireTombstoneHealthEnd,
+)
+for (const fragment of [
+  "'operations_faire_provider_write_authorizations'",
+  'idx.indisunique',
+  'idx.indisvalid',
+  'idx.indisready',
+  'idx.indpred IS NULL',
+  'idx.indexprs IS NULL',
+  'idx.indnkeyatts = 6',
+  'idx.indnatts = 6',
+  "'organization_id'",
+  "'integration_account_id'",
+  "'action'",
+  "'aggregate_type'",
+  "'aggregate_id'",
+  "'aggregate_revision'",
+]) {
+  assertIncludes(faireTombstoneHealth, fragment, 'exact Faire tombstone index health')
+}
+assert.ok(
+  (healthRoute.match(/faire_provider_write_auth_applied/g) || []).length >= 4,
+  'Faire provider-write readiness must gate both migrationsCurrent and health errors',
+)
 for (const [, alias] of healthRoute.matchAll(/\)\s+AS\s+([a-z0-9_]+)\s*,?/gi)) {
   assert.ok(
     alias.length <= 63,

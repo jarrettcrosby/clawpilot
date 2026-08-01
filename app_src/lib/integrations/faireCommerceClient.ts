@@ -152,10 +152,7 @@ export type FaireProviderWriteAuthorization = {
   authorizationRevision: number
   capabilities: readonly FaireProviderWriteCapability[]
   verifiedWriteScopes: readonly FaireProviderWriteScope[]
-  scopeVerificationSource:
-    | 'oauth_grant'
-    | 'provider_confirmation'
-    | 'successful_provider_effect'
+  scopeVerificationSource: 'oauth_grant'
 }
 
 export type FaireProductImageInput = {
@@ -682,12 +679,7 @@ function normalizeWriteAuthorization(
     || !binding
     || authorization.provider !== 'faire'
     || authorization.environment !== 'production'
-    || authorization.scopeVerificationSource === 'advertised_scope'
-    || ![
-      'oauth_grant',
-      'provider_confirmation',
-      'successful_provider_effect',
-    ].includes(String(authorization.scopeVerificationSource || ''))
+    || authorization.scopeVerificationSource !== 'oauth_grant'
   ) {
     invalidInput(
       'Verified Faire provider-write authorization is required',

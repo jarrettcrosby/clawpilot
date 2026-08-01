@@ -298,6 +298,19 @@ includes(prepare, [
   'simulationHash',
 ], 'External-effect preparation')
 
+const claimability = section(
+  persistence,
+  'function claimabilitySql',
+  'export async function claimCommerceExternalEffectsInPostgres',
+  'External-effect claimability',
+)
+includes(claimability, [
+  '${alias}.faire_provider_write_authorization_id IS NULL',
+], 'Generic external-effect claim authorization boundary')
+includes(persistence, [
+  'faire_authorization_requires_dedicated_claim',
+], 'Authorization-bound Faire claim observability')
+
 const claim = section(
   persistence,
   'export async function claimCommerceExternalEffectsInPostgres',

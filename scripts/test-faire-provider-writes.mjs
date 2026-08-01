@@ -84,7 +84,7 @@ const authorization = {
     'WRITE_INVENTORIES',
     'WRITE_ORDERS',
   ],
-  scopeVerificationSource: 'provider_confirmation',
+  scopeVerificationSource: 'oauth_grant',
 }
 
 let unauthorizedFetches = 0
@@ -113,6 +113,23 @@ assert.throws(
   (error) => error?.code === 'FAIRE_WRITE_AUTHORIZATION_INVALID',
   'advertised provider scope vocabulary must never authorize a write',
 )
+for (const scopeVerificationSource of [
+  'provider_confirmation',
+  'successful_provider_effect',
+]) {
+  assert.throws(
+    () => faire.createFaireCommerceClient({
+      accessToken: `faire-test-token-${scopeVerificationSource}`,
+      credentialBinding: binding,
+      writeAuthorization: {
+        ...authorization,
+        scopeVerificationSource,
+      },
+    }),
+    (error) => error?.code === 'FAIRE_WRITE_AUTHORIZATION_INVALID',
+    `${scopeVerificationSource} must never authorize a provider write`,
+  )
+}
 
 let wrongBrandMutations = 0
 const wrongBrandClient = faire.createFaireCommerceClient({
@@ -701,5 +718,29 @@ await assert.rejects(
   (error) => error?.code === 'FAIRE_FULFILLMENT_AUTHORIZATION_STALE',
 )
 assert.equal(unauthorizedClientCreations, 0)
+
+for (const scopeVerificationSource of [
+  'provider_confirmation',
+  'successful_provider_effect',
+]) {
+  let selfAssertedClientCreations = 0
+  await assert.rejects(
+    () => writeback.executeFaireFulfillmentWriteback({
+      ...writebackInput,
+      authorization: {
+        ...writebackInput.authorization,
+        scopeVerificationSource,
+      },
+    }, {
+      createClient: () => {
+        selfAssertedClientCreations += 1
+        return unknownClient
+      },
+    }),
+    (error) => error?.code === 'FAIRE_FULFILLMENT_AUTHORIZATION_INVALID',
+    `${scopeVerificationSource} must fail before Faire client creation`,
+  )
+  assert.equal(selfAssertedClientCreations, 0)
+}
 
 console.log('Faire provider-write foundation tests passed')

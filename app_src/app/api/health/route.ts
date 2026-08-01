@@ -32,6 +32,12 @@ const FALLBACK_LOG_PATH = '/tmp/clawd-app.log'
 const ERROR_PATTERNS = [/⨯/, /Error:/, /error TS/, /TypeError/, /ReferenceError/, /SyntaxError/, /Unhandled/, /ENOENT/, /500/]
 const WINDOW_MS = 5 * 60 * 1000 // last 5 minutes
 const MAX_BYTES_TO_SCAN = 256 * 1024
+// SHA-256 over pg_proc.prosrc after removing full-line -- comments, collapsing
+// whitespace, and trimming. These pin the audited Faire fail-closed bodies.
+const FAIRE_SCOPE_CURRENT_PROSRC_SHA256 =
+  'a93f6fb2233dc30abe9e8db212692c61f1098b4c5e2f0e7c8801f600a06956c3'
+const FAIRE_SCOPE_TRIGGER_PROSRC_SHA256 =
+  'abc99a1fdfcef78542ab5df2ac3af8b2eef934f38d70780156e133a74b01e73d'
 
 function resolveLogPath(): { path: string; expectedDevLogPresent: boolean; usedFallback: boolean } {
   const expectedDevLogPresent = fs.existsSync(DEV_LOG_PATH)
@@ -341,6 +347,7 @@ export async function GET() {
           operations_fulfillment_notification_policy_applied: boolean
           global_id_alphanumeric_compatibility_applied: boolean
           global_id_base32hex_allocator_applied: boolean
+          faire_provider_write_auth_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -1200,6 +1207,282 @@ export async function GET() {
                     IN pg_get_indexdef(index_row.indexrelid)
                   ) > 0
               ) AS global_id_base32hex_allocator_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0220_operations_faire_provider_write_authorizations.sql'
+              )
+              AND to_regclass(
+                'operations_faire_provider_write_scope_evidence'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_faire_provider_write_authorizations'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_write_scope_list_valid(text[])'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_write_capability_list_valid(text[])'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_provider_write_canonical_jsonb(jsonb)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_provider_write_request_hash(jsonb)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_provider_write_json_is_redacted(jsonb)'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_proc procedure
+                JOIN pg_namespace namespace
+                  ON namespace.oid = procedure.pronamespace
+                WHERE namespace.nspname = current_schema()
+                  AND procedure.oid = to_regprocedure(
+                    'operations_faire_provider_write_scope_evidence_is_current(uuid,uuid,uuid,integer)'
+                  )::oid
+                  AND btrim(
+                    regexp_replace(
+                      regexp_replace(
+                        procedure.prosrc,
+                        E'(^|[\\n\\r])[[:blank:]]*--[^\\n\\r]*',
+                        ' ',
+                        'g'
+                      ),
+                      '[[:space:]]+',
+                      ' ',
+                      'g'
+                    )
+                  ) = 'SELECT false'
+                  AND encode(
+                    digest(
+                      convert_to(
+                        btrim(
+                          regexp_replace(
+                            regexp_replace(
+                              procedure.prosrc,
+                              E'(^|[\\n\\r])[[:blank:]]*--[^\\n\\r]*',
+                              ' ',
+                              'g'
+                            ),
+                            '[[:space:]]+',
+                            ' ',
+                            'g'
+                          )
+                        ),
+                        'UTF8'
+                      ),
+                      'sha256'
+                    ),
+                    'hex'
+                  ) = '${FAIRE_SCOPE_CURRENT_PROSRC_SHA256}'
+              )
+              AND to_regprocedure(
+                'operations_faire_provider_write_fence_hash(uuid,uuid,uuid,text,integer,integer,text,text,text,bigint,text,text,text,text[],text[],text)'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_proc procedure
+                JOIN pg_namespace namespace
+                  ON namespace.oid = procedure.pronamespace
+                WHERE namespace.nspname = current_schema()
+                  AND procedure.oid = to_regprocedure(
+                    'protect_operations_faire_scope_evidence()'
+                  )::oid
+                  AND encode(
+                    digest(
+                      convert_to(
+                        btrim(
+                          regexp_replace(
+                            regexp_replace(
+                              procedure.prosrc,
+                              E'(^|[\\n\\r])[[:blank:]]*--[^\\n\\r]*',
+                              ' ',
+                              'g'
+                            ),
+                            '[[:space:]]+',
+                            ' ',
+                            'g'
+                          )
+                        ),
+                        'UTF8'
+                      ),
+                      'sha256'
+                    ),
+                    'hex'
+                  ) = '${FAIRE_SCOPE_TRIGGER_PROSRC_SHA256}'
+              )
+              AND to_regprocedure(
+                'protect_operations_faire_write_authorization()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_provider_write_authority_is_current(uuid,uuid,uuid,text,integer,integer,text,text,text,bigint,text,text,text,jsonb,uuid)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_operations_commerce_external_effect_intent()'
+              ) IS NOT NULL
+              AND position(
+                'operations_faire_provider_write_authority_is_current'
+                IN pg_get_functiondef(
+                  to_regprocedure(
+                    'protect_operations_commerce_external_effect_intent()'
+                  )::oid
+                )
+              ) > 0
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trg
+                WHERE trg.tgrelid = to_regclass(
+                    'operations_faire_provider_write_scope_evidence'
+                  )
+                  AND trg.tgname =
+                    'protect_operations_faire_scope_evidence_write'
+                  AND trg.tgfoid = to_regprocedure(
+                    'protect_operations_faire_scope_evidence()'
+                  )::oid
+                  AND trg.tgenabled = 'O'
+                  AND trg.tgtype = 31
+                  AND NOT trg.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trg
+                WHERE trg.tgrelid = to_regclass(
+                    'operations_commerce_external_effect_intents'
+                  )
+                  AND trg.tgname =
+                    'protect_operations_commerce_external_effect_intent_write'
+                  AND trg.tgfoid = to_regprocedure(
+                    'protect_operations_commerce_external_effect_intent()'
+                  )::oid
+                  AND trg.tgenabled <> 'D'
+                  AND NOT trg.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trg
+                WHERE trg.tgrelid = to_regclass(
+                    'operations_faire_provider_write_authorizations'
+                  )
+                  AND trg.tgname =
+                    'protect_operations_faire_write_authorization_write'
+                  AND trg.tgfoid = to_regprocedure(
+                    'protect_operations_faire_write_authorization()'
+                  )::oid
+                  AND trg.tgenabled <> 'D'
+                  AND NOT trg.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_index idx
+                WHERE idx.indexrelid = to_regclass(
+                    'operations_faire_write_auth_active_aggregate_idx'
+                  )
+                  AND idx.indisunique
+                  AND idx.indisvalid
+                  AND idx.indisready
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_index idx
+                WHERE idx.indexrelid = to_regclass(
+                    'operations_faire_write_auth_effect_tombstone_idx'
+                  )
+                  AND idx.indrelid = to_regclass(
+                    'operations_faire_provider_write_authorizations'
+                  )
+                  AND idx.indisunique
+                  AND idx.indisvalid
+                  AND idx.indisready
+                  AND idx.indpred IS NULL
+                  AND idx.indexprs IS NULL
+                  AND idx.indnkeyatts = 6
+                  AND idx.indnatts = 6
+                  AND ARRAY(
+                    SELECT attribute.attname::text
+                    FROM unnest(idx.indkey) WITH ORDINALITY
+                      key_column(attnum, ordinality)
+                    JOIN pg_attribute attribute
+                      ON attribute.attrelid = idx.indrelid
+                     AND attribute.attnum = key_column.attnum
+                    ORDER BY key_column.ordinality
+                  ) = ARRAY[
+                    'organization_id',
+                    'integration_account_id',
+                    'action',
+                    'aggregate_type',
+                    'aggregate_id',
+                    'aggregate_revision'
+                  ]::text[]
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_index idx
+                WHERE idx.indexrelid = to_regclass(
+                    'operations_commerce_effect_faire_auth_unique'
+                  )
+                  AND idx.indisunique
+                  AND idx.indisvalid
+                  AND idx.indisready
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint fk
+                WHERE fk.conrelid = to_regclass(
+                    'operations_faire_provider_write_scope_evidence'
+                  )
+                  AND fk.confrelid = to_regclass(
+                    'operations_commerce_provider_attempts'
+                  )
+                  AND fk.conname =
+                    'operations_faire_scope_evidence_attempt_fkey'
+                  AND fk.contype = 'f'
+                  AND fk.convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint fk
+                WHERE fk.conrelid = to_regclass(
+                    'operations_faire_provider_write_authorizations'
+                  )
+                  AND fk.confrelid = to_regclass(
+                    'operations_faire_provider_write_scope_evidence'
+                  )
+                  AND fk.conname =
+                    'operations_faire_write_auth_scope_evidence_fkey'
+                  AND fk.contype = 'f'
+                  AND fk.convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint fk
+                WHERE fk.conrelid = to_regclass(
+                    'operations_faire_provider_write_authorizations'
+                  )
+                  AND fk.confrelid = to_regclass(
+                    'operations_commerce_provider_attempts'
+                  )
+                  AND fk.conname =
+                    'operations_faire_write_auth_attempt_fkey'
+                  AND fk.contype = 'f'
+                  AND fk.convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint fk
+                WHERE fk.conrelid = to_regclass(
+                    'operations_commerce_external_effect_intents'
+                  )
+                  AND fk.confrelid = to_regclass(
+                    'operations_faire_provider_write_authorizations'
+                  )
+                  AND fk.conname =
+                    'operations_commerce_effect_faire_auth_fkey'
+                  AND fk.contype = 'f'
+                  AND fk.convalidated
+              ) AS faire_provider_write_auth_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1369,6 +1652,7 @@ export async function GET() {
             && row?.operations_fulfillment_notification_policy_applied
             && row?.global_id_alphanumeric_compatibility_applied
             && row?.global_id_base32hex_allocator_applied
+            && row?.faire_provider_write_auth_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1530,6 +1814,7 @@ export async function GET() {
           || !row?.operations_fulfillment_notification_policy_applied
           || !row?.global_id_alphanumeric_compatibility_applied
           || !row?.global_id_base32hex_allocator_applied
+          || !row?.faire_provider_write_auth_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
