@@ -3,6 +3,13 @@ import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { normalizedCrmIdentityText } from '@/lib/crm/stableId'
 import {
+  executeShopifyFulfillmentWriteback,
+} from '@/lib/integrations/shopifyFulfillmentWriteback'
+import {
+  consumeSandboxCommerceE2eAuthorization,
+  requireActiveSandboxCommerceE2eAuthorization,
+} from '@/lib/persistence/sandboxCommerceE2eAuthorization'
+import {
   MockCarrierAdapter,
   MockCommerceAdapter,
   MockPrintAdapter,
@@ -12240,6 +12247,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
   expectedRowVersion: number
   reason: string
   idempotencyKey: string
+  sandboxE2eAuthorizationGlobalId?: string | null
 }): Promise<OperationsShipmentCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
@@ -12247,6 +12255,9 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
   const preferredPrinterGlobalId = String(input.preferredPrinterGlobalId || '').trim() || null
   const reason = String(input.reason || '').trim()
   const idempotencyKey = String(input.idempotencyKey || '').trim()
+  const sandboxE2eAuthorizationGlobalId = String(
+    input.sandboxE2eAuthorizationGlobalId || '',
+  ).trim() || null
   if (!actorEmail) {
     throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
   }
@@ -12271,6 +12282,15 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
       'A valid idempotency key is required',
     )
   }
+  if (
+    sandboxE2eAuthorizationGlobalId
+    && !/^gsea\d{7}$/.test(sandboxE2eAuthorizationGlobalId)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_SANDBOX_E2E_AUTHORIZATION_INVALID',
+      'Sandbox E2E authorization is invalid',
+    )
+  }
 
   const command = await prepareCommandReceipt({
     organizationId,
@@ -12281,6 +12301,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
       preferredPrinterGlobalId,
       expectedRowVersion: input.expectedRowVersion,
       reason,
+      sandboxE2eAuthorizationGlobalId,
     }),
     actorEmail,
   })
@@ -12291,8 +12312,10 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
   type ShipmentCommitContext = {
     result: OperationsShipmentCommandResult
     sourceProvider: string
+    commerceAccountGlobalId: string
     externalOrderId: string
     carrier: string
+    trackingNumbers: string[]
     shippedAt: string
     warehouseId: string
     storageReference: string
@@ -12322,6 +12345,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         customer_name: string
         source_provider: string
         integration_account_id: string | null
+        integration_account_global_id: string
         external_order_id: string
         order_number: string
         currency: string
@@ -12335,6 +12359,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
                 customer.name AS customer_name,
                 source_order.source_provider,
                 source_order.integration_account_id::text,
+                integration.global_id AS integration_account_global_id,
                 source_order.external_order_id,
                 source_order.order_number, source_order.currency,
                 source_order.ship_to,
@@ -12346,6 +12371,9 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
          JOIN crm_organizations customer
            ON customer.pipeline_id = source_order.pipeline_id
           AND customer.id = source_order.customer_id
+         JOIN operations_integration_accounts integration
+           ON integration.organization_id = source_order.organization_id
+          AND integration.id = source_order.integration_account_id
          WHERE source_order.organization_id = $1::uuid
            AND source_order.global_id = $2
          FOR UPDATE OF source_order`,
@@ -12372,6 +12400,14 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           `Shipment cannot be confirmed from ${order.status}`,
           409,
         )
+      }
+      if (sandboxE2eAuthorizationGlobalId) {
+        await requireActiveSandboxCommerceE2eAuthorization(client, {
+          organizationId,
+          authorizationGlobalId: sandboxE2eAuthorizationGlobalId,
+          orderGlobalId,
+          actorEmail,
+        })
       }
       if (order.source_provider === 'shopify') {
         if (!order.integration_account_id) {
@@ -12452,15 +12488,19 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
          FOR UPDATE`,
         [organizationId, plan.id],
       )
-      if (packageResult.rows.length !== 1 || packageResult.rows[0].status !== 'labeled') {
+      if (
+        packageResult.rows.length < 1
+        || packageResult.rows.some((item) => item.status !== 'labeled')
+        || (!sandboxE2eAuthorizationGlobalId && packageResult.rows.length !== 1)
+      ) {
         throw new OperationsRequestError(
           'OPERATIONS_SHIPMENT_PACKAGE_INVALID',
-          'Shipment confirmation currently requires exactly one verified, labeled package',
+          sandboxE2eAuthorizationGlobalId
+            ? 'Authorized sandbox E2E completion requires every package to have a verified label'
+            : 'Shipment confirmation currently requires exactly one verified, labeled package',
           409,
         )
       }
-      const sourcePackage = packageResult.rows[0]
-
       const unresolvedAttempts = await client.query<QueryResultRow & {
         id: string
         state: string
@@ -12489,40 +12529,71 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         carrier: string
         service_code: string
         internal_cost_minor: string
+        package_id: string
+        package_global_id: string
       }>(
         `SELECT label.id::text, label.global_id, label.environment,
                 label.tracking_number, label.carrier, label.service_code,
-                rate.internal_cost_minor::text
+                rate.internal_cost_minor::text,
+                package.id::text AS package_id,
+                package.global_id AS package_global_id
          FROM operations_labels label
+         JOIN operations_packages package
+           ON package.organization_id = label.organization_id
+          AND package.id = label.package_id
          JOIN operations_carrier_rates rate
            ON rate.organization_id = label.organization_id
           AND rate.id = label.carrier_rate_id
          WHERE label.organization_id = $1::uuid
-           AND label.package_id = $2::uuid
+           AND package.plan_id = $2::uuid
            AND label.status = 'created'
-         ORDER BY label.created_at DESC, label.id DESC
+         ORDER BY package.package_number, label.created_at DESC, label.id DESC
          FOR UPDATE OF label`,
-        [organizationId, sourcePackage.id],
+        [organizationId, plan.id],
       )
-      if (labelResult.rows.length !== 1) {
+      if (
+        labelResult.rows.length !== packageResult.rows.length
+        || new Set(labelResult.rows.map((item) => item.package_id)).size
+          !== packageResult.rows.length
+      ) {
         throw new OperationsRequestError(
           'OPERATIONS_ACTIVE_LABEL_INVALID',
-          'Exactly one active carrier label is required before confirming shipment',
+          'Exactly one active carrier label is required for every package before confirming shipment',
           409,
         )
       }
       const label = labelResult.rows[0]
-      if (label.environment === 'sandbox') {
+      if (
+        labelResult.rows.some((item) => item.environment === 'sandbox')
+        && !sandboxE2eAuthorizationGlobalId
+      ) {
         throw new OperationsRequestError(
           'OPERATIONS_SANDBOX_LABEL_CANNOT_SHIP',
           'Sandbox labels are test evidence only. Void the sandbox label; it cannot confirm shipment or consume inventory.',
           409,
         )
       }
-      if (!['mock', 'production'].includes(label.environment)) {
+      const allowedLabelEnvironments = sandboxE2eAuthorizationGlobalId
+        ? ['sandbox']
+        : ['mock', 'production']
+      if (labelResult.rows.some((item) => (
+        !allowedLabelEnvironments.includes(item.environment)
+      ))) {
         throw new OperationsRequestError(
           'OPERATIONS_LABEL_ENVIRONMENT_INVALID',
-          'Only mock or production label evidence may confirm a shipment',
+          sandboxE2eAuthorizationGlobalId
+            ? 'Authorized sandbox E2E completion requires sandbox labels only'
+            : 'Only mock or production label evidence may confirm a shipment',
+          409,
+        )
+      }
+      if (
+        new Set(labelResult.rows.map((item) => item.carrier)).size !== 1
+        || new Set(labelResult.rows.map((item) => item.service_code)).size !== 1
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_LABEL_SERVICE_MISMATCH',
+          'Every package must use the same carrier and service',
           409,
         )
       }
@@ -12690,27 +12761,56 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           actorEmail,
         })
 
-      const shipmentResult = await client.query<IdRow & { shipped_at: Date }>(
-        `INSERT INTO operations_shipments (
-           organization_id, order_id, plan_id, package_id, label_id, status,
-           tracking_number, shipped_at, quoted_carrier_cost_minor, confirmed_by
-         ) VALUES (
-           $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 'confirmed',
-           $6, now(), $7, $8
-         )
-         RETURNING id::text, global_id, shipped_at`,
-        [
-          organizationId,
-          order.id,
-          plan.id,
-          sourcePackage.id,
-          label.id,
-          label.tracking_number,
-          label.internal_cost_minor,
-          actorEmail,
-        ],
-      )
-      const shipment = shipmentResult.rows[0]
+      const shipments: Array<IdRow & {
+        shipped_at: Date
+        package_id: string
+        package_global_id: string
+        label_id: string
+        label_global_id: string
+        tracking_number: string
+        carrier: string
+        service_code: string
+        environment: 'mock' | 'sandbox' | 'production'
+      }> = []
+      for (const packageRow of packageResult.rows) {
+        const packageLabel = labelResult.rows.find(
+          (item) => item.package_id === packageRow.id,
+        )!
+        const shipmentResult = await client.query<IdRow & { shipped_at: Date }>(
+          `INSERT INTO operations_shipments (
+             organization_id, order_id, plan_id, package_id, label_id, status,
+             tracking_number, shipped_at, quoted_carrier_cost_minor, confirmed_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 'confirmed',
+             $6, now(), $7, $8
+           )
+           RETURNING id::text, global_id, shipped_at`,
+          [
+            organizationId,
+            order.id,
+            plan.id,
+            packageRow.id,
+            packageLabel.id,
+            packageLabel.tracking_number,
+            sandboxE2eAuthorizationGlobalId
+              ? 0
+              : packageLabel.internal_cost_minor,
+            actorEmail,
+          ],
+        )
+        shipments.push({
+          ...shipmentResult.rows[0],
+          package_id: packageRow.id,
+          package_global_id: packageRow.global_id,
+          label_id: packageLabel.id,
+          label_global_id: packageLabel.global_id,
+          tracking_number: packageLabel.tracking_number,
+          carrier: packageLabel.carrier,
+          service_code: packageLabel.service_code,
+          environment: packageLabel.environment,
+        })
+      }
+      const shipment = shipments[0]
       const shippedAt = shipment.shipped_at.toISOString()
 
       let localInventoryConsumptionCount = 0
@@ -12751,104 +12851,132 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         localInventoryConsumptionCount += 1
       }
 
-      const packingLines = [...new Map(allocations.map((allocation) => [
-        allocation.line_id,
-        {
-          productGlobalId: allocation.product_global_id,
-          productName: allocation.product_name,
-          channelSku: allocation.channel_sku,
-          quantity: numberValue(allocation.line_quantity),
-        },
-      ])).values()]
-      const packingSnapshot = {
-        orderGlobalId: order.global_id,
-        orderNumber: order.order_number,
-        customerName: order.customer_name,
-        customerGlobalId: order.customer_global_id,
-        shipmentGlobalId: shipment.global_id,
-        trackingNumber: label.tracking_number,
-        carrier: label.carrier,
-        serviceCode: label.service_code,
-        shippedAt,
-        shipTo: address(order.ship_to),
-        lines: packingLines,
+      const packageContentResult = await client.query<{
+        package_id: string
+        product_global_id: string
+        product_name: string
+        channel_sku: string
+        quantity: string
+      }>(
+        `SELECT content.package_id::text, product.reference_code AS product_global_id,
+                product.name AS product_name, source_line.channel_sku,
+                content.quantity::text
+         FROM operations_package_contents content
+         JOIN operations_order_lines source_line
+           ON source_line.organization_id = content.organization_id
+          AND source_line.id = content.order_line_id
+         JOIN crm_products product
+           ON product.pipeline_id = source_line.pipeline_id
+          AND product.id = source_line.product_id
+         WHERE content.organization_id = $1::uuid
+           AND content.plan_id = $2::uuid
+         ORDER BY content.package_id, source_line.created_at, source_line.id`,
+        [organizationId, plan.id],
+      )
+      const artifactContexts: Array<{
+        artifact: IdRow
+        shipment: typeof shipments[number]
+        storageReference: string
+        renderedPackingSlip: ReturnType<typeof renderPackingSlip>
+      }> = []
+      for (const packageShipment of shipments) {
+        const packingSnapshot = {
+          orderGlobalId: order.global_id,
+          orderNumber: order.order_number,
+          customerName: order.customer_name,
+          customerGlobalId: order.customer_global_id,
+          shipmentGlobalId: packageShipment.global_id,
+          trackingNumber: packageShipment.tracking_number,
+          carrier: packageShipment.carrier,
+          serviceCode: packageShipment.service_code,
+          shippedAt: packageShipment.shipped_at.toISOString(),
+          shipTo: address(order.ship_to),
+          lines: packageContentResult.rows
+            .filter((line) => line.package_id === packageShipment.package_id)
+            .map((line) => ({
+              productGlobalId: line.product_global_id,
+              productName: line.product_name,
+              channelSku: line.channel_sku,
+              quantity: numberValue(line.quantity),
+            })),
+        }
+        if (packingSnapshot.lines.length < 1) {
+          throw new OperationsRequestError(
+            'OPERATIONS_PACKAGE_CONTENTS_INCOMPLETE',
+            'Every shipment package requires exact contents before confirmation',
+            409,
+          )
+        }
+        const renderedPackingSlip = renderPackingSlip(packingSnapshot)
+        const storageReference = (
+          `clawpilot-document:${packageShipment.global_id}:packing-slip:${renderedPackingSlip.contentSha256}`
+        )
+        const artifactResult = await client.query<IdRow>(
+          `INSERT INTO operations_print_artifacts (
+             organization_id, source_order_id, source_shipment_id, source_package_id,
+             document_type, format, media_size, content_sha256,
+             byte_length, storage_reference, created_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+             'packing_slip', 'PDF', 'letter', $5, $6, $7, $8
+           )
+           RETURNING id::text, global_id`,
+          [
+            organizationId, order.id, packageShipment.id,
+            packageShipment.package_id, renderedPackingSlip.contentSha256,
+            renderedPackingSlip.byteLength, storageReference, actorEmail,
+          ],
+        )
+        const artifact = artifactResult.rows[0]
+        await client.query(
+          `INSERT INTO operations_print_artifact_payloads (
+             artifact_id, organization_id, mime_type, filename, payload,
+             template_version, render_snapshot
+           ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7::jsonb)`,
+          [
+            artifact.id, organizationId, renderedPackingSlip.mimeType,
+            renderedPackingSlip.filename, renderedPackingSlip.payload,
+            PACKING_SLIP_TEMPLATE_VERSION, JSON.stringify(packingSnapshot),
+          ],
+        )
+        await client.query(
+          `INSERT INTO operations_tracking_observations (
+             organization_id, shipment_id, status, provider, location,
+             observed_at, source, raw_snapshot, idempotency_key, actor_email
+           ) VALUES (
+             $1::uuid, $2::uuid, 'confirmed', $3, NULL,
+             $4::timestamptz, 'shipment_confirmation', $5::jsonb, $6, $7
+           )`,
+          [
+            organizationId, packageShipment.id, packageShipment.carrier,
+            packageShipment.shipped_at.toISOString(), JSON.stringify({
+              shipmentGlobalId: packageShipment.global_id,
+              labelGlobalId: packageShipment.label_global_id,
+              trackingNumber: packageShipment.tracking_number,
+              environment: packageShipment.environment,
+              sandboxE2eAuthorizationGlobalId,
+            }), `${packageShipment.global_id}:tracking:confirmed`, actorEmail,
+          ],
+        )
+        artifactContexts.push({
+          artifact, shipment: packageShipment, storageReference,
+          renderedPackingSlip,
+        })
       }
-      const renderedPackingSlip = renderPackingSlip(packingSnapshot)
-      const storageReference = (
-        `clawpilot-document:${shipment.global_id}:packing-slip:${renderedPackingSlip.contentSha256}`
-      )
-      const artifactResult = await client.query<IdRow>(
-        `INSERT INTO operations_print_artifacts (
-           organization_id, source_order_id, source_shipment_id, source_package_id,
-           document_type, format, media_size, content_sha256,
-           byte_length, storage_reference, created_by
-         ) VALUES (
-           $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-           'packing_slip', 'PDF', 'letter', $5, $6, $7, $8
-         )
-         RETURNING id::text, global_id`,
-        [
-          organizationId,
-          order.id,
-          shipment.id,
-          sourcePackage.id,
-          renderedPackingSlip.contentSha256,
-          renderedPackingSlip.byteLength,
-          storageReference,
-          actorEmail,
-        ],
-      )
-      const artifact = artifactResult.rows[0]
-      await client.query(
-        `INSERT INTO operations_print_artifact_payloads (
-           artifact_id, organization_id, mime_type, filename, payload,
-           template_version, render_snapshot
-         ) VALUES (
-           $1::uuid, $2::uuid, $3, $4, $5, $6, $7::jsonb
-         )`,
-        [
-          artifact.id,
-          organizationId,
-          renderedPackingSlip.mimeType,
-          renderedPackingSlip.filename,
-          renderedPackingSlip.payload,
-          PACKING_SLIP_TEMPLATE_VERSION,
-          JSON.stringify(packingSnapshot),
-        ],
-      )
-
-      await client.query(
-        `INSERT INTO operations_tracking_observations (
-           organization_id, shipment_id, status, provider, location,
-           observed_at, source, raw_snapshot, idempotency_key, actor_email
-         ) VALUES (
-           $1::uuid, $2::uuid, 'confirmed', $3, NULL,
-           $4::timestamptz, 'shipment_confirmation', $5::jsonb, $6, $7
-         )`,
-        [
-          organizationId,
-          shipment.id,
-          label.carrier,
-          shippedAt,
-          JSON.stringify({
-            shipmentGlobalId: shipment.global_id,
-            labelGlobalId: label.global_id,
-            trackingNumber: label.tracking_number,
-            environment: label.environment,
-          }),
-          `${shipment.global_id}:tracking:confirmed`,
-          actorEmail,
-        ],
-      )
+      const artifact = artifactContexts[0].artifact
+      const renderedPackingSlip = artifactContexts[0].renderedPackingSlip
+      const storageReference = artifactContexts[0].storageReference
 
       const exportSnapshot = {
         orderGlobalId: order.global_id,
         shipmentGlobalId: shipment.global_id,
         externalOrderId: order.external_order_id,
-        trackingNumber: label.tracking_number,
-        carrier: label.carrier,
-        serviceCode: label.service_code,
+        trackingNumber: shipment.tracking_number,
+        trackingNumbers: shipments.map((item) => item.tracking_number),
+        carrier: shipment.carrier,
+        serviceCode: shipment.service_code,
         shippedAt,
+        sandboxE2eAuthorizationGlobalId,
       }
       const exportResult = await client.query<IdRow>(
         `INSERT INTO operations_commerce_fulfillment_exports (
@@ -12875,12 +13003,12 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         `UPDATE operations_packages
          SET status = 'shipped'
          WHERE organization_id = $1::uuid
-           AND id = $2::uuid
+           AND plan_id = $2::uuid
            AND status = 'labeled'
          RETURNING id`,
-        [organizationId, sourcePackage.id],
+        [organizationId, plan.id],
       )
-      if (updatedPackage.rowCount !== 1) {
+      if (updatedPackage.rowCount !== packageResult.rows.length) {
         throw new OperationsRequestError(
           'OPERATIONS_PACKAGE_CHANGED',
           'The package changed before shipment confirmation. Refresh and try again.',
@@ -12922,6 +13050,14 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           409,
         )
       }
+      if (sandboxE2eAuthorizationGlobalId) {
+        await consumeSandboxCommerceE2eAuthorization(client, {
+          organizationId,
+          authorizationGlobalId: sandboxE2eAuthorizationGlobalId,
+          orderGlobalId,
+          actorEmail,
+        })
+      }
 
       await appendDomainEvent(client, {
         organizationId,
@@ -12934,12 +13070,19 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         idempotencyKey: `${shipment.global_id}:confirmed`,
         payload: {
           shipmentGlobalId: shipment.global_id,
-          labelGlobalId: label.global_id,
-          trackingNumber: label.tracking_number,
-          carrier: label.carrier,
-          serviceCode: label.service_code,
-          labelEnvironment: label.environment,
+          shipmentGlobalIds: shipments.map((item) => item.global_id),
+          labelGlobalId: shipment.label_global_id,
+          labelGlobalIds: shipments.map((item) => item.label_global_id),
+          trackingNumber: shipment.tracking_number,
+          trackingNumbers: shipments.map((item) => item.tracking_number),
+          carrier: shipment.carrier,
+          serviceCode: shipment.service_code,
+          labelEnvironment: shipment.environment,
+          sandboxE2eAuthorizationGlobalId,
           packingSlipArtifactGlobalId: artifact.global_id,
+          packingSlipArtifactGlobalIds: artifactContexts.map(
+            (item) => item.artifact.global_id,
+          ),
           commerceExportGlobalId: fulfillmentExport.global_id,
           providerCommitmentsRevalidated:
             providerCommitmentRevalidation.count,
@@ -12964,6 +13107,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         idempotencyKey: `${shipment.global_id}:inventory-consumed`,
         payload: {
           shipmentGlobalId: shipment.global_id,
+          shipmentGlobalIds: shipments.map((item) => item.global_id),
           allocations: allocations.map((allocation) => ({
             inventoryPositionGlobalId: allocation.position_global_id,
             productGlobalId: allocation.product_global_id,
@@ -13008,10 +13152,17 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           previousRowVersion: input.expectedRowVersion,
           rowVersion: Number(shippedOrder.row_version),
           shipmentGlobalId: shipment.global_id,
-          labelGlobalId: label.global_id,
-          labelEnvironment: label.environment,
-          trackingNumber: label.tracking_number,
+          shipmentGlobalIds: shipments.map((item) => item.global_id),
+          labelGlobalId: shipment.label_global_id,
+          labelGlobalIds: shipments.map((item) => item.label_global_id),
+          labelEnvironment: shipment.environment,
+          trackingNumber: shipment.tracking_number,
+          trackingNumbers: shipments.map((item) => item.tracking_number),
+          sandboxE2eAuthorizationGlobalId,
           packingSlipArtifactGlobalId: artifact.global_id,
+          packingSlipArtifactGlobalIds: artifactContexts.map(
+            (item) => item.artifact.global_id,
+          ),
           commerceExportGlobalId: fulfillmentExport.global_id,
           providerCommitmentsRevalidated:
             providerCommitmentRevalidation.count,
@@ -13031,7 +13182,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         orderStatus: 'shipped',
         rowVersion: Number(shippedOrder.row_version),
         shipmentGlobalId: shipment.global_id,
-        trackingNumber: label.tracking_number,
+        trackingNumber: shipment.tracking_number,
         packingSlipArtifactGlobalId: artifact.global_id,
         commerceExportGlobalId: fulfillmentExport.global_id,
         commerceExportState: 'failed',
@@ -13044,8 +13195,10 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
       return {
         result,
         sourceProvider: order.source_provider,
+        commerceAccountGlobalId: order.integration_account_global_id,
         externalOrderId: order.external_order_id,
         carrier: label.carrier,
+        trackingNumbers: shipments.map((item) => item.tracking_number),
         shippedAt,
         warehouseId: plan.warehouse_id,
         storageReference,
@@ -13121,6 +13274,27 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         exportErrorMessage = error instanceof Error
           ? error.message.slice(0, 500)
           : 'Commerce fulfillment export failed'
+      }
+    } else if (context.sourceProvider === 'shopify') {
+      try {
+        const exportResult = await executeShopifyFulfillmentWriteback({
+          organizationId,
+          accountGlobalId: context.commerceAccountGlobalId,
+          externalOrderId: context.externalOrderId,
+          trackingNumbers: context.trackingNumbers,
+          carrier: context.carrier,
+          notifyCustomer: false,
+        })
+        commerceExportState = 'succeeded'
+        providerReference = exportResult.providerReference
+      } catch (error) {
+        commerceExportState = 'failed'
+        exportErrorCode = error && typeof error === 'object' && 'code' in error
+          ? String(error.code).slice(0, 128)
+          : 'OPERATIONS_COMMERCE_EXPORT_FAILED'
+        exportErrorMessage = error instanceof Error
+          ? error.message.slice(0, 500)
+          : 'Shopify fulfillment export failed'
       }
     } else {
       commerceExportState = 'unsupported'

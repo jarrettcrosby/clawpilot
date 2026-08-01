@@ -14,6 +14,10 @@ import {
   readCommerceCatalogWorkerHeartbeatFromPostgres,
 } from '@/lib/persistence/commerceCatalogSync'
 import {
+  readCommerceOrderReconciliationHealthFromPostgres,
+  readCommerceOrderReconciliationWorkerHeartbeatFromPostgres,
+} from '@/lib/persistence/commerceOrderReconciliation'
+import {
   readShopifyInventoryRefreshHealthFromPostgres,
   readShopifyInventoryRefreshWorkerHeartbeatFromPostgres,
 } from '@/lib/persistence/shopifyInventoryRefresh'
@@ -81,6 +85,9 @@ export async function GET() {
     let toastWorker: Record<string, unknown> = { status: 'not-owned' }
     let quickBooksWorker: Record<string, unknown> = { status: 'not-owned' }
     let commerceCatalogWorker: Record<string, unknown> = {
+      status: 'disabled',
+    }
+    let commerceOrderReconciliationWorker: Record<string, unknown> = {
       status: 'disabled',
     }
     let shopifyInventoryRefreshWorker: Record<string, unknown> = {
@@ -1853,6 +1860,73 @@ export async function GET() {
 
           if (
             commerceIntakeRuntimeAvailable()
+            && row?.operations_commerce_continuations_migration_applied
+            && row?.operations_commerce_normalization_migration_applied
+          ) {
+            const orderHeartbeat =
+              await readCommerceOrderReconciliationWorkerHeartbeatFromPostgres()
+            const orderHeartbeatAt = Date.parse(
+              String(orderHeartbeat?.checkedAt || ''),
+            )
+            const orderPollMs = Math.max(
+              5_000,
+              Math.min(
+                Number(
+                  process.env.COMMERCE_ORDER_RECONCILIATION_POLL_MS || 60_000,
+                ),
+                300_000,
+              ),
+            )
+            const maxOrderHeartbeatAgeMs = Math.max(180_000, orderPollMs * 3)
+            const orderAgeMs = Number.isFinite(orderHeartbeatAt)
+              ? checkedAt - orderHeartbeatAt
+              : null
+            const orderState =
+              await readCommerceOrderReconciliationHealthFromPostgres()
+            const loopReachable = (
+              orderAgeMs !== null
+              && orderAgeMs <= maxOrderHeartbeatAgeMs
+            )
+            const operationalDegraded = (
+              orderState.failed > 0
+              || orderState.staleProcessing > 0
+              || orderState.overdue > 0
+            )
+            commerceOrderReconciliationWorker = {
+              status: loopReachable
+                ? (operationalDegraded ? 'degraded' : 'reachable')
+                : 'stale',
+              livenessStatus: loopReachable ? 'reachable' : 'stale',
+              operationalStatus: operationalDegraded ? 'degraded' : 'ready',
+              heartbeatAt: orderHeartbeat?.checkedAt || null,
+              phase: orderHeartbeat?.phase || null,
+              ageMs: orderAgeMs,
+              ...orderState,
+            }
+            if (!loopReachable) {
+              errors.push(
+                'Commerce order reconciliation worker heartbeat is missing or stale.',
+              )
+            }
+            if (orderState.failed > 0) {
+              warnings.push(
+                'Commerce order reconciliation has failed accounts.',
+              )
+            }
+            if (orderState.staleProcessing > 0) {
+              warnings.push(
+                'Commerce order reconciliation has stale processing accounts.',
+              )
+            }
+            if (orderState.overdue > 0) {
+              warnings.push(
+                'Commerce order reconciliation has overdue accounts.',
+              )
+            }
+          }
+
+          if (
+            commerceIntakeRuntimeAvailable()
             && row?.operations_shopify_inventory_refresh_migration_applied
             && row?.operations_shopify_inventory_webhook_refresh_applied
             && row?.operations_shopify_catalog_webhook_refresh_applied
@@ -2011,6 +2085,7 @@ export async function GET() {
       toastWorker,
       quickBooksWorker,
       commerceCatalogWorker,
+      commerceOrderReconciliationWorker,
       shopifyInventoryRefreshWorker,
       integrationQueues,
       operationsCommands,

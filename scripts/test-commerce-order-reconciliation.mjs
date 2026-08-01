@@ -154,6 +154,86 @@ assert.equal(
   'Claim mapping must use last_started_at returned by the sync cursor',
 )
 
+const healthQueries = []
+const healthPersistenceModule = loadTypeScriptModule(
+  'app_src/lib/persistence/commerceOrderReconciliation.ts',
+  {
+    mocks: {
+      '@/lib/auditWriter': {
+        async recordAuditEvent() {},
+      },
+      '@/lib/persistence/postgres': {
+        async query(sql, values) {
+          healthQueries.push({ sql, values })
+          if (sql.includes('SELECT value FROM app_settings')) {
+            return {
+              rows: [{
+                value: {
+                  checkedAt: '2026-08-01T16:30:00.000Z',
+                  phase: 'completed',
+                },
+              }],
+            }
+          }
+          if (sql.includes('WITH eligible AS')) {
+            return {
+              rows: [{
+                eligible_accounts: '2',
+                shopify_accounts: '1',
+                faire_accounts: '1',
+                never_run: '0',
+                running: '0',
+                failed: '1',
+                stale_processing: '0',
+                overdue: '1',
+                resumable: '1',
+                last_success_at: '2026-08-01T16:20:00.000Z',
+              }],
+            }
+          }
+          return { rows: [] }
+        },
+        async withTransaction() {
+          throw new Error('Health reads must not open a transaction')
+        },
+      },
+    },
+  },
+)
+const orderHealth = await healthPersistenceModule
+  .readCommerceOrderReconciliationHealthFromPostgres()
+assert.deepEqual(JSON.parse(JSON.stringify(orderHealth)), {
+  eligibleAccounts: 2,
+  providerAccounts: { shopify: 1, faire: 1 },
+  neverRun: 0,
+  running: 0,
+  failed: 1,
+  staleProcessing: 0,
+  overdue: 1,
+  resumable: 1,
+  lastSuccessAt: '2026-08-01T16:20:00.000Z',
+  resource: 'orders',
+})
+const heartbeat = await healthPersistenceModule
+  .readCommerceOrderReconciliationWorkerHeartbeatFromPostgres()
+assert.equal(heartbeat.phase, 'completed')
+const recordedHeartbeat = await healthPersistenceModule
+  .recordCommerceOrderReconciliationWorkerHeartbeatInPostgres({
+    phase: 'started',
+    workerId: 'worker-test',
+    providerWrites: 0,
+  })
+assert.equal(recordedHeartbeat.resource, 'orders')
+assert.equal(recordedHeartbeat.providerWrites, 0)
+assert.ok(
+  healthQueries.some(({ sql }) => sql.includes("account.provider IN ('shopify', 'faire')")),
+  'Durable health must cover both Shopify and Faire order-readable accounts',
+)
+assert.ok(
+  healthQueries.some(({ sql }) => sql.includes('INSERT INTO app_settings')),
+  'Order-worker heartbeat must be durable',
+)
+
 const persistedFailureCodes = []
 const failurePersistenceModule = loadTypeScriptModule(
   'app_src/lib/persistence/commerceOrderReconciliation.ts',
@@ -269,6 +349,16 @@ const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWork
               syncCursorAdvanced: false,
               ordersStaged: 3,
               recordsRejected: 1,
+              automaticCustomerResolution: {
+                matched: 2,
+                created: 1,
+                ambiguous: 1,
+                skipped: 0,
+                failed: 0,
+                failedByCode: {},
+                providerWrites: 0,
+                syncCursorAdvanced: false,
+              },
               pagination: {
                 providerRowsSeen: 4,
                 hasNextBatch: true,
@@ -286,6 +376,18 @@ const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWork
             syncCursorAdvanced: false,
             ordersStaged: 2,
             recordsRejected: 0,
+            automaticCustomerResolution: {
+              matched: 1,
+              created: 0,
+              ambiguous: 0,
+              skipped: 1,
+              failed: 1,
+              failedByCode: {
+                COMMERCE_CUSTOMER_AUTO_RESOLUTION_FAILED: 1,
+              },
+              providerWrites: 0,
+              syncCursorAdvanced: false,
+            },
             pagination: {
               providerRowsSeen: 2,
               hasNextBatch: false,
@@ -330,9 +432,34 @@ assert.equal(completed.rejected, 1)
 assert.equal(completed.providerWrites, 0)
 assert.equal(completed.canonicalOrderWrites, 0)
 assert.equal(completed.inventoryWrites, 0)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(completed.automaticCustomerResolution)),
+  {
+    matched: 3,
+    created: 1,
+    ambiguous: 1,
+    skipped: 1,
+    failed: 1,
+    failedByCode: {
+      COMMERCE_CUSTOMER_AUTO_RESOLUTION_FAILED: 1,
+    },
+    operatorReviewRequired: 3,
+    providerWrites: 0,
+    syncCursorAdvanced: false,
+  },
+)
 assert.equal(trace.complete.length, 1)
 assert.equal(trace.complete[0].pagesRead, 2)
 assert.equal(trace.complete[0].hasNextBatch, false)
+assert.equal(trace.complete[0].customersMatched, 3)
+assert.equal(trace.complete[0].customersCreated, 1)
+assert.equal(trace.complete[0].customersAmbiguous, 1)
+assert.equal(trace.complete[0].customersSkipped, 1)
+assert.equal(trace.complete[0].customerResolutionFailed, 1)
+assert.deepEqual(
+  { ...trace.complete[0].customerResolutionFailureCodes },
+  { COMMERCE_CUSTOMER_AUTO_RESOLUTION_FAILED: 1 },
+)
 assert.equal(trace.failed.length, 0)
 assert.deepEqual(
   { ...completed.failureCodes },
@@ -441,6 +568,10 @@ includes(route, [
   'commerceIntakeRuntimeAvailable()',
   'isPostgresStorageEnabled()',
   'processCommerceOrderReconciliation',
+  'recordCommerceOrderReconciliationWorkerHeartbeatInPostgres',
+  "phase: 'started'",
+  "phase: 'completed'",
+  "phase: 'failed'",
 ], 'Order reconciliation route')
 const poller = read('scripts/pipeline-outbox-poller.mjs')
 includes(poller, [
@@ -456,7 +587,22 @@ includes(health, [
   'row?.operations_commerce_incomplete_header_money_migration_applied',
   "'0173_operations_shopify_shipping_service_codes.sql'",
   'row?.operations_shopify_shipping_service_codes_applied',
+  'commerceOrderReconciliationWorker',
+  'readCommerceOrderReconciliationHealthFromPostgres',
+  'Commerce order reconciliation worker heartbeat is missing or stale.',
 ], 'Order reconciliation health migration gate')
+const reconciliationPersistence = read(
+  'app_src/lib/persistence/commerceOrderReconciliation.ts',
+)
+includes(reconciliationPersistence, [
+  'commerce_order_reconciliation_worker_heartbeat',
+  'readCommerceOrderReconciliationHealthFromPostgres',
+  "account.provider IN ('shopify', 'faire')",
+  "cursor.resource = 'orders'",
+  'stale_processing',
+  'overdue',
+  'providerAccounts',
+], 'Order reconciliation durable health')
 const predeploy = read('scripts/verify-predeploy.mjs')
 includes(predeploy, [
   "'db/migrations/0122_operations_commerce_incomplete_header_money.sql'",

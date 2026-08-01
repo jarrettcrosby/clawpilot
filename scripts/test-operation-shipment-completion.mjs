@@ -322,6 +322,127 @@ async function addActiveLabel(pool, fixture, orderGlobalId, environment) {
   }
 }
 
+async function splitPackedOrderIntoTwoPackagesForFixture(pool, fixture, orderGlobalId) {
+  const source = await pool.query(
+    `SELECT package.id::text AS package_id, package.plan_id::text,
+            package.length_mm, package.width_mm, package.height_mm,
+            package.weight_grams, package.packed_by, package.packed_at,
+            content.id::text AS content_id,
+            content.order_id::text, content.order_line_id::text
+     FROM operations_orders source_order
+     JOIN operations_fulfillment_plans plan
+       ON plan.organization_id = source_order.organization_id
+      AND plan.order_id = source_order.id
+     JOIN operations_packages package
+       ON package.organization_id = plan.organization_id
+      AND package.plan_id = plan.id
+     JOIN operations_package_contents content
+       ON content.organization_id = package.organization_id
+      AND content.package_id = package.id
+     WHERE source_order.organization_id = $1::uuid
+       AND source_order.global_id = $2`,
+    [fixture.organizationId, orderGlobalId],
+  )
+  assert.equal(source.rowCount, 1)
+  const row = source.rows[0]
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(
+      'ALTER TABLE operations_package_contents DISABLE TRIGGER protect_operations_package_content_write',
+    )
+    await client.query(
+      `UPDATE operations_package_contents SET quantity = 1
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixture.organizationId, row.content_id],
+    )
+    const second = await client.query(
+      `INSERT INTO operations_packages (
+         organization_id, plan_id, package_number,
+         length_mm, width_mm, height_mm, weight_grams,
+         status, packed_by, packed_at
+       ) VALUES ($1::uuid, $2::uuid, 2, $3, $4, $5, $6, 'packed', $7, $8)
+       RETURNING id::text`,
+      [
+        fixture.organizationId, row.plan_id, row.length_mm, row.width_mm,
+        row.height_mm, Math.max(1, Math.floor(row.weight_grams / 2)),
+        row.packed_by, row.packed_at,
+      ],
+    )
+    await client.query(
+      `INSERT INTO operations_package_contents (
+         organization_id, plan_id, order_id, package_id,
+         order_line_id, quantity, created_by
+       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 1, $6)`,
+      [
+        fixture.organizationId, row.plan_id, row.order_id, second.rows[0].id,
+        row.order_line_id, fixture.email,
+      ],
+    )
+    await client.query(
+      'ALTER TABLE operations_package_contents ENABLE TRIGGER protect_operations_package_content_write',
+    )
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+async function addSandboxLabelsForAllPackages(pool, fixture, orderGlobalId) {
+  const context = await pool.query(
+    `SELECT package.id::text AS package_id, package.global_id AS package_global_id,
+            rate.id::text AS rate_id, rate.carrier, rate.service_code
+     FROM operations_orders source_order
+     JOIN operations_fulfillment_plans plan
+       ON plan.organization_id = source_order.organization_id
+      AND plan.order_id = source_order.id
+     JOIN operations_packages package
+       ON package.organization_id = plan.organization_id
+      AND package.plan_id = plan.id
+     JOIN operations_carrier_rates rate
+       ON rate.organization_id = plan.organization_id
+      AND rate.plan_id = plan.id AND rate.selected = true
+     WHERE source_order.organization_id = $1::uuid
+       AND source_order.global_id = $2
+     ORDER BY package.package_number`,
+    [fixture.organizationId, orderGlobalId],
+  )
+  assert.equal(context.rowCount, 2)
+  const trackingNumbers = []
+  for (const [index, row] of context.rows.entries()) {
+    const trackingNumber = `SANDBOXE2E${index + 1}${randomUUID()
+      .replaceAll('-', '').slice(0, 16).toUpperCase()}`
+    await pool.query(
+      `INSERT INTO operations_labels (
+         organization_id, package_id, carrier_rate_id, carrier, service_code,
+         tracking_number, format, label_payload, provider_label_id,
+         idempotency_key, status, environment, redacted_provider_evidence
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4, $5,
+         $6, 'PDF', $7, $8, $9, 'created', 'sandbox', $10::jsonb
+       )`,
+      [
+        fixture.organizationId, row.package_id, row.rate_id, row.carrier,
+        row.service_code, trackingNumber,
+        Buffer.from(`%PDF-1.4 sandbox E2E package ${index + 1}`).toString('base64'),
+        `sandbox-e2e-provider-${randomUUID()}`,
+        `sandbox-e2e-label-${randomUUID()}`,
+        JSON.stringify({ environment: 'sandbox', packageGlobalId: row.package_global_id }),
+      ],
+    )
+    await pool.query(
+      `UPDATE operations_packages SET status = 'labeled'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixture.organizationId, row.package_id],
+    )
+    trackingNumbers.push(trackingNumber)
+  }
+  return trackingNumbers
+}
+
 async function addPackagingClaim(pool, fixture, orderGlobalId) {
   const plan = await pool.query(
     `SELECT plan.id::text, plan.warehouse_id::text
@@ -525,6 +646,15 @@ async function verifyShipmentCompletion(databaseUrl) {
   try {
     const postgres = postgresMock(pool)
     const auditWriter = auditWriterMock()
+    const sandboxAuthorization = loadTypeScriptModule(
+      'app_src/lib/persistence/sandboxCommerceE2eAuthorization.ts',
+      {
+        mocks: {
+          '@/lib/auditWriter': auditWriter,
+          '@/lib/persistence/postgres': postgres,
+        },
+      },
+    )
     const domain = loadTypeScriptModule('app_src/lib/operations/domain.ts')
     const adapters = loadTypeScriptModule('app_src/lib/operations/adapters.ts', {
       mocks: { '@/lib/operations/domain': domain },
@@ -580,6 +710,13 @@ async function verifyShipmentCompletion(databaseUrl) {
             )
           },
         },
+        '@/lib/integrations/shopifyFulfillmentWriteback': {
+          executeShopifyFulfillmentWriteback: async () => {
+            throw new Error(
+              'Shipment completion acceptance does not write Shopify fulfillment',
+            )
+          },
+        },
         '@/lib/operations/adapters': adapters,
         '@/lib/operations/canonicalFulfillmentPlanning':
           canonicalPlanning,
@@ -603,6 +740,7 @@ async function verifyShipmentCompletion(databaseUrl) {
         '@/lib/persistence/operationShadowFulfillmentPreparation': {
           readShadowFulfillmentPreparation: async () => null,
         },
+        '@/lib/persistence/sandboxCommerceE2eAuthorization': sandboxAuthorization,
         '@/lib/persistence/postgres': postgres,
         '@/lib/persistence/productPackaging': productPackaging,
         '@/lib/persistence/shopifyCheckoutRating': shopifyCheckoutRating,
@@ -619,7 +757,7 @@ async function verifyShipmentCompletion(databaseUrl) {
       'generateOperationsPackagePackingSlipInPostgres must be exported',
     )
 
-    const createFixture = async (scenario) => {
+    const createFixture = async (scenario, { unitsPerPackage = 2 } = {}) => {
       const fixture = await seedWorkspace(pool, scenario)
       await postgres.withTransaction((client) => (
         productPackaging.upsertProductPackagingProfileWithClient(client, {
@@ -631,7 +769,7 @@ async function verifyShipmentCompletion(databaseUrl) {
             profileName: `Shipment completion ${scenario} package`,
             packageType: 'carton',
             unitOfMeasure: 'each',
-            unitsPerPackage: 2,
+            unitsPerPackage,
             measurementSystem: 'imperial',
             lengthMm: 305,
             widthMm: 229,
@@ -993,6 +1131,141 @@ async function verifyShipmentCompletion(databaseUrl) {
     assert.equal(afterSandbox.status, 'packed')
     assert.equal(afterSandbox.on_hand_quantity, '12.000000')
     assert.equal(afterSandbox.reserved_quantity, '2.000000')
+
+    const authorizedFixture = await createFixture(
+      'authorized-multi-package-sandbox',
+      { unitsPerPackage: 1 },
+    )
+    const authorized = await advanceOrderToPacked(
+      persistence,
+      authorizedFixture,
+      'authorized-multi-package-sandbox',
+    )
+    await splitPackedOrderIntoTwoPackagesForFixture(
+      pool,
+      authorizedFixture,
+      authorized.planned.orderGlobalId,
+    )
+    const authorizedPackagingClaim = await addPackagingClaim(
+      pool,
+      authorizedFixture,
+      authorized.planned.orderGlobalId,
+    )
+    const authorizedTrackingNumbers = await addSandboxLabelsForAllPackages(
+      pool,
+      authorizedFixture,
+      authorized.planned.orderGlobalId,
+    )
+    await pool.query(
+      `UPDATE operations_orders
+       SET source_provider = 'shopify'
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [authorizedFixture.organizationId, authorized.planned.orderGlobalId],
+    )
+    const authorization = await sandboxAuthorization.authorizeSandboxCommerceE2eInPostgres({
+      organizationId: authorizedFixture.organizationId,
+      actorEmail: authorizedFixture.email,
+      orderGlobalId: authorized.planned.orderGlobalId,
+      confirmationStatement: sandboxAuthorization.SANDBOX_COMMERCE_E2E_CONFIRMATION,
+      reason: 'Authorized multi-package sandbox E2E acceptance',
+      lifetimeMinutes: 30,
+    })
+    assert.equal(authorization.state, 'active')
+    assert.match(authorization.authorizationGlobalId, /^gsea\d{7}$/)
+    await pool.query(
+      `UPDATE operations_orders
+       SET source_provider = 'mock-commerce'
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [authorizedFixture.organizationId, authorized.planned.orderGlobalId],
+    )
+    const authorizationGlobalId = authorization.authorizationGlobalId
+    const authorizedInput = {
+      organizationId: authorizedFixture.organizationId,
+      actorEmail: authorizedFixture.email,
+      orderGlobalId: authorized.planned.orderGlobalId,
+      expectedRowVersion: authorized.packed.rowVersion,
+      reason: 'Authorized multi-package sandbox E2E acceptance',
+      idempotencyKey: `confirm-authorized-sandbox-${randomUUID()}`,
+      sandboxE2eAuthorizationGlobalId: authorizationGlobalId,
+    }
+    const authorizedResult = await persistence.confirmOperationsOrderShipmentFromPostgres(
+      authorizedInput,
+    )
+    assert.equal(authorizedResult.orderStatus, 'shipped')
+    assert.equal(authorizedResult.replayed, false)
+    const authorizedEvidence = await orderEvidence(
+      pool,
+      authorizedFixture,
+      authorized.planned.orderGlobalId,
+    )
+    assert.deepEqual(authorizedEvidence, {
+      status: 'shipped',
+      row_version: authorized.packed.rowVersion + 1,
+      on_hand_quantity: '10.000000',
+      reserved_quantity: '0.000000',
+      consumed_reservations: 1,
+      shipments: 2,
+      packing_slips: 2,
+      packing_slip_payloads: 2,
+      tracking_observations: 2,
+      fulfillment_exports: 1,
+      ship_ledger_entries: 1,
+    })
+    const persistedTracking = await pool.query(
+      `SELECT shipment.tracking_number
+       FROM operations_shipments shipment
+       JOIN operations_orders orders
+         ON orders.organization_id = shipment.organization_id
+        AND orders.id = shipment.order_id
+       WHERE orders.organization_id = $1::uuid
+         AND orders.global_id = $2
+       ORDER BY shipment.tracking_number`,
+      [authorizedFixture.organizationId, authorized.planned.orderGlobalId],
+    )
+    assert.deepEqual(
+      persistedTracking.rows.map((row) => row.tracking_number),
+      [...authorizedTrackingNumbers].sort(),
+    )
+    assert.deepEqual(
+      await packagingClaimEvidence(
+        pool,
+        authorizedFixture,
+        authorizedPackagingClaim,
+      ),
+      {
+        status: 'consumed',
+        consumed: true,
+        released: false,
+        on_hand_quantity: 2,
+        row_version: String(Number(authorizedPackagingClaim.stock.row_version) + 1),
+      },
+    )
+    const consumedAuthorization = await sandboxAuthorization
+      .readSandboxCommerceE2eAuthorizationInPostgres({
+        organizationId: authorizedFixture.organizationId,
+        authorizationGlobalId,
+      })
+    assert.equal(consumedAuthorization.state, 'consumed')
+    assert.equal(consumedAuthorization.consumedBy, authorizedFixture.email)
+    const authorizedReplay = await persistence.confirmOperationsOrderShipmentFromPostgres(
+      authorizedInput,
+    )
+    assert.equal(authorizedReplay.replayed, true)
+    assert.deepEqual(
+      await orderEvidence(
+        pool,
+        authorizedFixture,
+        authorized.planned.orderGlobalId,
+      ),
+      authorizedEvidence,
+    )
+    const replayedAuthorization = await sandboxAuthorization
+      .readSandboxCommerceE2eAuthorizationInPostgres({
+        organizationId: authorizedFixture.organizationId,
+        authorizationGlobalId,
+      })
+    assert.equal(replayedAuthorization.state, 'consumed')
+    assert.equal(replayedAuthorization.consumedAt, consumedAuthorization.consumedAt)
 
     const staleFixture = await createFixture('stale')
     const stale = await advanceOrderToPacked(persistence, staleFixture, 'stale')

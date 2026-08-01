@@ -855,6 +855,14 @@ assert.equal(
   'control_plane_implemented',
 )
 assert.equal(
+  capabilities.CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION.fulfillment_export,
+  'control_plane_implemented',
+)
+assert.equal(
+  capabilities.CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION.tracking_export,
+  'control_plane_implemented',
+)
+assert.equal(
   capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION.order_import,
   'control_plane_implemented',
 )

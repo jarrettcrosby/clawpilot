@@ -383,6 +383,9 @@ function loadCommerceOrderReconciliationPersistence(pool) {
         async recordAuditEvent() {},
       },
       '@/lib/persistence/postgres': {
+        async query(sql, values) {
+          return pool.query(sql, values)
+        },
         async withTransaction(operation) {
           const client = await pool.connect()
           try {
@@ -1177,6 +1180,26 @@ async function verifyAcceptance(databaseUrl) {
   }
 
   const recoveryPersistence = loadCommerceOrderReconciliationPersistence(pool)
+  const durableOrderHealth = await recoveryPersistence
+    .readCommerceOrderReconciliationHealthFromPostgres()
+  assert.equal(durableOrderHealth.eligibleAccounts, 1)
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(durableOrderHealth.providerAccounts)),
+    { shopify: 1, faire: 0 },
+  )
+  assert.equal(durableOrderHealth.resource, 'orders')
+  const writtenOrderHeartbeat = await recoveryPersistence
+    .recordCommerceOrderReconciliationWorkerHeartbeatInPostgres({
+      phase: 'completed',
+      workerId: 'commerce-staging-postgres-test',
+      claimed: 1,
+      providerWrites: 0,
+    })
+  const durableOrderHeartbeat = await recoveryPersistence
+    .readCommerceOrderReconciliationWorkerHeartbeatFromPostgres()
+  assert.equal(durableOrderHeartbeat.checkedAt, writtenOrderHeartbeat.checkedAt)
+  assert.equal(durableOrderHeartbeat.phase, 'completed')
+  assert.equal(durableOrderHeartbeat.providerWrites, 0)
   const recoveryTargets = await recoveryPersistence
     .claimCommerceOrderReconciliationTargetsInPostgres({ limit: 1 })
   assert.equal(recoveryTargets.length, 1)

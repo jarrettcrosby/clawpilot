@@ -22,6 +22,10 @@ import {
   prepareCommerceActiveTransitionInPostgres,
 } from '@/lib/persistence/commerceActiveTransitionAuthorization'
 import {
+  authorizeSandboxCommerceE2eInPostgres,
+  SandboxCommerceE2eAuthorizationError,
+} from '@/lib/persistence/sandboxCommerceE2eAuthorization'
+import {
   confirmOperationsOrderShipmentFromPostgres,
   confirmOperationsOrderPicksFromPostgres,
   completeOperationsInboundReceiptInPostgres,
@@ -652,6 +656,9 @@ function errorResponse(error: unknown) {
   if (error instanceof CommerceActiveTransitionPersistenceError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
+  if (error instanceof SandboxCommerceE2eAuthorizationError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
   if (
     error instanceof CarrierIntegrationRequestError
     || error instanceof ActiveFulfillmentExecutionPreparationError
@@ -1151,6 +1158,39 @@ export async function POST(req: NextRequest) {
       })
       return json({ ok: true, capabilities, result })
     }
+    if (action === 'authorize-sandbox-commerce-e2e') {
+      if (!capabilities.canActivate || !capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'Only an authorized organization owner or administrator may authorize a sandbox commerce E2E test',
+          code: 'OPERATIONS_ACTIVATION_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action', 'orderGlobalId', 'confirmationStatement', 'reason',
+          'lifetimeMinutes',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await authorizeSandboxCommerceE2eInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+        confirmationStatement: body.confirmationStatement,
+        reason: textValue(body.reason, 'Sandbox E2E authorization reason', 500),
+        lifetimeMinutes: body.lifetimeMinutes === undefined
+          ? undefined
+          : integerValue(body.lifetimeMinutes, 'Authorization lifetime', 5, 1_440),
+      })
+      return json({ ok: true, capabilities, result }, 201)
+    }
     if (action === 'prepare-shipment-execution') {
       if (!capabilities.canManage || !capabilities.canExecute) {
         return json({
@@ -1445,6 +1485,7 @@ export async function POST(req: NextRequest) {
           'expectedRowVersion',
           'reason',
           'preferredPrinterGlobalId',
+          'sandboxE2eAuthorizationGlobalId',
         ]),
         'OPERATIONS_REQUEST_INVALID',
         'Operations command',
@@ -1459,6 +1500,11 @@ export async function POST(req: NextRequest) {
           body.preferredPrinterGlobalId,
           'Preferred printer',
           PRINTER_GLOBAL_ID,
+        ),
+        sandboxE2eAuthorizationGlobalId: optionalGlobalIdValue(
+          body.sandboxE2eAuthorizationGlobalId,
+          'Sandbox E2E authorization',
+          /^gsea\d{7}$/,
         ),
         idempotencyKey: idempotencyKeyValue(req),
       })
@@ -1482,6 +1528,8 @@ export async function POST(req: NextRequest) {
           'carrierRateGlobalId',
           'carrierAccountGlobalId',
           'preferredPrinterGlobalId',
+          'packageGlobalId',
+          'sandboxE2eAuthorizationGlobalId',
         ]),
         'OPERATIONS_REQUEST_INVALID',
         'Operations command',
@@ -1502,6 +1550,16 @@ export async function POST(req: NextRequest) {
           body.preferredPrinterGlobalId,
           'Preferred printer',
           PRINTER_GLOBAL_ID,
+        ),
+        packageGlobalId: optionalGlobalIdValue(
+          body.packageGlobalId,
+          'Package',
+          PACKAGE_GLOBAL_ID,
+        ),
+        sandboxE2eAuthorizationGlobalId: optionalGlobalIdValue(
+          body.sandboxE2eAuthorizationGlobalId,
+          'Sandbox E2E authorization',
+          /^gsea\d{7}$/,
         ),
         idempotencyKey: idempotencyKeyValue(req),
       })

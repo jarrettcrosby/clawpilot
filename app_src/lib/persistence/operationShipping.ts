@@ -12,12 +12,16 @@ import {
   carrierSandboxLabelRequestEvidence,
   carrierSandboxVoidRequestEvidence,
   createCarrierSandboxLabel,
+  type CarrierSandboxLabelShipmentFixture,
   voidCarrierSandboxLabel,
 } from '@/lib/integrations/carrierSandboxLabel'
 import { CARRIER_SANDBOX_RATE_FIXTURE } from '@/lib/integrations/carrierSandboxRate'
 import type { OperationsSandboxLabelCommandResult } from '@/lib/operations/types'
 import { enqueueOperationsPrintJobInPostgres } from '@/lib/persistence/operationPrintDelivery'
 import { OperationsRequestError } from '@/lib/persistence/operations'
+import {
+  requireActiveSandboxCommerceE2eAuthorization,
+} from '@/lib/persistence/sandboxCommerceE2eAuthorization'
 import {
   acquireTransactionAdvisoryLock,
   query,
@@ -116,6 +120,8 @@ type CreateSandboxLabelInput = {
   carrierRateGlobalId?: string | null
   carrierAccountGlobalId?: string | null
   preferredPrinterGlobalId?: string | null
+  packageGlobalId?: string | null
+  sandboxE2eAuthorizationGlobalId?: string | null
   expectedRowVersion: number
   reason: string
   idempotencyKey: string
@@ -135,6 +141,8 @@ const ORDER_GLOBAL_ID = /^gor\d{7}$/
 const RATE_GLOBAL_ID = /^grt\d{7}$/
 const CARRIER_ACCOUNT_GLOBAL_ID = /^gac\d{7}$/
 const PRINTER_GLOBAL_ID = /^gpr\d{7}$/
+const PACKAGE_GLOBAL_ID = /^gpa\d{7}$/
+const SANDBOX_E2E_AUTHORIZATION_GLOBAL_ID = /^gsea\d{7}$/
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/
 
 function stable(value: unknown): string {
@@ -271,6 +279,7 @@ async function readShippingContext(
   organizationId: string,
   orderGlobalId: string,
   carrierRateGlobalId: string | null,
+  packageGlobalId: string | null,
   client: PoolClient | null,
   lock: boolean,
 ): Promise<ShippingContext> {
@@ -323,9 +332,10 @@ async function readShippingContext(
     `SELECT id::text, global_id, status, length_mm, width_mm, height_mm, weight_grams
      FROM operations_packages
      WHERE organization_id = $1::uuid AND plan_id = $2::uuid
+       AND ($3::text IS NULL OR global_id = $3)
      ORDER BY package_number
      ${lock ? 'FOR UPDATE' : ''}`,
-    [organizationId, order.plan_id],
+    [organizationId, order.plan_id, packageGlobalId],
   )
   const rateResult = await dbQuery<RateRow>(
     client,
@@ -379,17 +389,20 @@ async function readShippingContext(
       AND void_attempt.id = label.void_attempt_id
      WHERE label.organization_id = $1::uuid
        AND package.plan_id = $2::uuid
+       AND ($3::text IS NULL OR package.global_id = $3)
        AND label.status = 'created'
      ORDER BY label.created_at DESC, label.id DESC
      LIMIT 1
      ${lock ? 'FOR SHARE OF label, package' : ''}`,
-    [organizationId, order.plan_id],
+    [organizationId, order.plan_id, packageGlobalId],
   )
 
   if (packageResult.rows.length !== 1) {
     throw new OperationsRequestError(
       'OPERATIONS_LABEL_SINGLE_PACKAGE_REQUIRED',
-      'Sandbox label execution requires exactly one package',
+      packageGlobalId
+        ? 'The selected sandbox E2E package is unavailable'
+        : 'Sandbox label execution requires exactly one package',
       409,
     )
   }
@@ -437,7 +450,11 @@ async function assertNoUnresolvedAttempt(
   }
 }
 
-function assertCreateContext(context: ShippingContext, expectedRowVersion: number) {
+function assertCreateContext(
+  context: ShippingContext,
+  expectedRowVersion: number,
+  authorizedSandboxE2e = false,
+) {
   if (context.order.activation_state !== 'active') {
     throw new OperationsRequestError(
       'OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED',
@@ -473,6 +490,7 @@ function assertCreateContext(context: ShippingContext, expectedRowVersion: numbe
       409,
     )
   }
+  if (authorizedSandboxE2e) return
   if (
     context.package.length_mm !== 305
     || context.package.width_mm !== 254
@@ -545,6 +563,48 @@ function assertVoidContext(context: ShippingContext, expectedRowVersion: number)
       'The package does not have an active sandbox label to void',
       409,
     )
+  }
+}
+
+function sandboxE2eShipmentFixture(
+  context: ShippingContext,
+): CarrierSandboxLabelShipmentFixture {
+  const party = (
+    value: Record<string, unknown> | null,
+    fallbackName: string,
+  ) => {
+    const source = value || {}
+    return {
+      name: String(source.name || fallbackName).trim(),
+      line1: String(source.line1 || source.street || '').trim(),
+      line2: String(source.line2 || '').trim() || null,
+      city: String(source.city || '').trim(),
+      region: String(source.region || source.state || '').trim().toUpperCase(),
+      postalCode: String(source.postalCode || source.postal_code || '').trim(),
+      countryCode: String(
+        source.countryCode || source.country || '',
+      ).trim().toUpperCase() as 'US',
+    }
+  }
+  const inches = (millimeters: number) => (
+    Math.round((Number(millimeters) / 25.4) * 1_000) / 1_000
+  )
+  const pounds = Math.round(
+    (Number(context.package.weight_grams) / 453.59237) * 1_000,
+  ) / 1_000
+  return {
+    origin: party(context.order.warehouse_address, 'ClawPilot Warehouse'),
+    destination: party(context.order.ship_to, 'Commerce customer'),
+    parcel: {
+      description: context.lines.map((line) => line.product_name || line.description)
+        .filter(Boolean).join(', ').slice(0, 200) || 'Commerce test order',
+      length: inches(context.package.length_mm),
+      width: inches(context.package.width_mm),
+      height: inches(context.package.height_mm),
+      dimensionUnit: 'IN',
+      weight: pounds,
+      weightUnit: 'LB',
+    },
   }
 }
 
@@ -682,6 +742,8 @@ function assertAttemptInputMatches(
     reason: string
     carrierRateGlobalId?: string | null
     carrierAccountGlobalId?: string | null
+    packageGlobalId?: string | null
+    sandboxE2eAuthorizationGlobalId?: string | null
     provider?: DirectCarrierProvider | null
   },
 ) {
@@ -696,6 +758,15 @@ function assertAttemptInputMatches(
     || (
       input.carrierAccountGlobalId
       && evidence.carrierAccountGlobalId !== input.carrierAccountGlobalId
+    )
+    || (
+      input.packageGlobalId
+      && evidence.packageGlobalId !== input.packageGlobalId
+    )
+    || (
+      input.sandboxE2eAuthorizationGlobalId
+      && evidence.sandboxE2eAuthorizationGlobalId
+        !== input.sandboxE2eAuthorizationGlobalId
     )
     || (input.provider && evidence.provider !== input.provider)
   )
@@ -742,6 +813,8 @@ async function replayExistingAttempt(input: {
   reason: string
   carrierRateGlobalId?: string | null
   carrierAccountGlobalId?: string | null
+  packageGlobalId?: string | null
+  sandboxE2eAuthorizationGlobalId?: string | null
 }) {
   return withTransaction(async (client) => {
     const attempt = await findExistingAttempt(client, input)
@@ -757,6 +830,8 @@ async function prepareAttempt(input: {
   actorEmail: string
   orderGlobalId: string
   carrierRateGlobalId: string | null
+  packageGlobalId: string | null
+  sandboxE2eAuthorizationGlobalId: string | null
   expectedRowVersion: number
   reason: string
   idempotencyKey: string
@@ -793,11 +868,24 @@ async function prepareAttempt(input: {
       input.organizationId,
       input.orderGlobalId,
       input.carrierRateGlobalId,
+      input.packageGlobalId,
       client,
       true,
     )
     if (input.action === 'create') {
-      assertCreateContext(context, input.expectedRowVersion)
+      if (input.sandboxE2eAuthorizationGlobalId) {
+        await requireActiveSandboxCommerceE2eAuthorization(client, {
+          organizationId: input.organizationId,
+          authorizationGlobalId: input.sandboxE2eAuthorizationGlobalId,
+          orderGlobalId: input.orderGlobalId,
+          actorEmail: input.actorEmail,
+        })
+      }
+      assertCreateContext(
+        context,
+        input.expectedRowVersion,
+        Boolean(input.sandboxE2eAuthorizationGlobalId),
+      )
     } else {
       assertVoidContext(context, input.expectedRowVersion)
     }
@@ -814,6 +902,10 @@ async function prepareAttempt(input: {
         input.runtime.provider,
         context.rate.service_code,
         input.runtime.billingRelationship,
+        undefined,
+        input.sandboxE2eAuthorizationGlobalId
+          ? sandboxE2eShipmentFixture(context)
+          : undefined,
       )
       : carrierSandboxVoidRequestEvidence(
         input.runtime.provider,
@@ -868,6 +960,8 @@ async function prepareAttempt(input: {
           billingRelationship: input.runtime.billingRelationship,
           billingSelection: input.runtime.billingSelectionSnapshot,
           reason: input.reason,
+          sandboxE2eAuthorizationGlobalId:
+            input.sandboxE2eAuthorizationGlobalId,
         }),
         input.actorEmail,
       ],
@@ -1062,6 +1156,23 @@ export async function createOperationsSandboxLabelInPostgres(
     'Preferred printer',
     PRINTER_GLOBAL_ID,
   )
+  const packageGlobalId = optionalGlobalId(
+    rawInput.packageGlobalId,
+    'Package',
+    PACKAGE_GLOBAL_ID,
+  )
+  const sandboxE2eAuthorizationGlobalId = optionalGlobalId(
+    rawInput.sandboxE2eAuthorizationGlobalId,
+    'Sandbox E2E authorization',
+    SANDBOX_E2E_AUTHORIZATION_GLOBAL_ID,
+  )
+  if (Boolean(packageGlobalId) !== Boolean(sandboxE2eAuthorizationGlobalId)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_SANDBOX_E2E_AUTHORIZATION_REQUIRED',
+      'Package-specific sandbox labels require the exact sandbox E2E authorization',
+      403,
+    )
+  }
   const expectedRowVersion = requiredVersion(rawInput.expectedRowVersion)
   const reason = requiredText(rawInput.reason, 'Label creation reason', 500)
   const idempotencyKey = requiredIdempotencyKey(rawInput.idempotencyKey)
@@ -1074,6 +1185,8 @@ export async function createOperationsSandboxLabelInPostgres(
     reason,
     carrierRateGlobalId,
     carrierAccountGlobalId,
+    packageGlobalId,
+    sandboxE2eAuthorizationGlobalId,
   })
   if (replay) {
     return recoverCreateReplayPrint({
@@ -1092,6 +1205,7 @@ export async function createOperationsSandboxLabelInPostgres(
       organizationId,
       orderGlobalId,
       carrierRateGlobalId,
+      packageGlobalId,
       null,
       false,
     )
@@ -1111,6 +1225,8 @@ export async function createOperationsSandboxLabelInPostgres(
     actorEmail,
     orderGlobalId,
     carrierRateGlobalId,
+    packageGlobalId,
+    sandboxE2eAuthorizationGlobalId,
     expectedRowVersion,
     reason,
     idempotencyKey,
@@ -1131,6 +1247,9 @@ export async function createOperationsSandboxLabelInPostgres(
     providerResult = await createCarrierSandboxLabel({
       ...runtime,
       serviceCode: prepared.context.rate.service_code,
+      ...(sandboxE2eAuthorizationGlobalId
+        ? { shipmentFixture: sandboxE2eShipmentFixture(prepared.context) }
+        : {}),
     })
   } catch (error) {
     const carrierError = error instanceof CarrierSandboxLabelError
@@ -1337,7 +1456,14 @@ export async function voidOperationsSandboxLabelInPostgres(
   let initial: ShippingContext
   let runtime: CarrierSandboxShippingRuntime
   try {
-    initial = await readShippingContext(organizationId, orderGlobalId, null, null, false)
+    initial = await readShippingContext(
+      organizationId,
+      orderGlobalId,
+      null,
+      null,
+      null,
+      false,
+    )
     if (!initial.activeLabel) {
       throw new OperationsRequestError(
         'OPERATIONS_LABEL_VOID_UNAVAILABLE',
@@ -1360,6 +1486,8 @@ export async function voidOperationsSandboxLabelInPostgres(
     actorEmail,
     orderGlobalId,
     carrierRateGlobalId: initial.activeLabel.carrier_rate_global_id,
+    packageGlobalId: null,
+    sandboxE2eAuthorizationGlobalId: null,
     expectedRowVersion,
     reason,
     idempotencyKey,

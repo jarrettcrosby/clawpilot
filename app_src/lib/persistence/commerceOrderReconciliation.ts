@@ -1,8 +1,10 @@
+import { randomUUID } from 'node:crypto'
 import { recordAuditEvent } from '@/lib/auditWriter'
-import { withTransaction } from '@/lib/persistence/postgres'
+import { query, withTransaction } from '@/lib/persistence/postgres'
 
 const ORDER_RECONCILIATION_INTERVAL = '30 minutes'
 const ORDER_RECONCILIATION_LEASE = '10 minutes'
+const WORKER_HEARTBEAT_KEY = 'commerce_order_reconciliation_worker_heartbeat'
 
 const ORDER_READABLE_CONNECTION_SQL = `(
   (
@@ -72,6 +74,125 @@ function safeErrorCode(error: unknown) {
     return 'COMMERCE_ORDER_RECONCILIATION_REFERENCE_CONSTRAINT_FAILED'
   }
   return 'COMMERCE_ORDER_RECONCILIATION_FAILED'
+}
+
+export async function recordCommerceOrderReconciliationWorkerHeartbeatInPostgres(
+  details: Record<string, unknown>,
+) {
+  const payload = {
+    checkedAt: new Date().toISOString(),
+    workerId: String(
+      process.env.RAILWAY_REPLICA_ID
+      || process.env.HOSTNAME
+      || randomUUID(),
+    ).slice(0, 200),
+    resource: 'orders',
+    ...details,
+  }
+  await query(
+    `INSERT INTO app_settings (key, value, updated_at)
+     VALUES ($1, $2::jsonb, now())
+     ON CONFLICT (key)
+     DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+    [WORKER_HEARTBEAT_KEY, JSON.stringify(payload)],
+  )
+  return payload
+}
+
+export async function readCommerceOrderReconciliationWorkerHeartbeatFromPostgres() {
+  const result = await query<{ value: Record<string, unknown> }>(
+    'SELECT value FROM app_settings WHERE key = $1 LIMIT 1',
+    [WORKER_HEARTBEAT_KEY],
+  )
+  return result.rows[0]?.value || null
+}
+
+export async function readCommerceOrderReconciliationHealthFromPostgres() {
+  const result = await query<{
+    eligible_accounts: string
+    shopify_accounts: string
+    faire_accounts: string
+    never_run: string
+    running: string
+    failed: string
+    stale_processing: string
+    overdue: string
+    resumable: string
+    last_success_at: Date | string | null
+  }>(
+    `WITH eligible AS (
+       SELECT account.organization_id, account.id AS integration_account_id,
+              account.provider
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+       JOIN operations_activation_scopes activation
+         ON activation.organization_id = account.organization_id
+       WHERE account.integration_type = 'commerce'
+         AND account.provider IN ('shopify', 'faire')
+         AND account.status <> 'error'
+         AND account.commerce_credential_generation > 0
+         AND credential.credential_version =
+             account.commerce_credential_generation
+         AND credential.verification_status = 'verified'
+         AND activation.state IN ('shadow', 'active')
+         AND ${ORDER_READABLE_CONNECTION_SQL}
+     ),
+     state AS (
+       SELECT eligible.*, cursor.reconciliation_status,
+              cursor.last_started_at, cursor.last_completed_at
+       FROM eligible
+       LEFT JOIN operations_commerce_sync_cursors cursor
+         ON cursor.organization_id = eligible.organization_id
+        AND cursor.integration_account_id = eligible.integration_account_id
+        AND cursor.resource = 'orders'
+     )
+     SELECT
+       count(*)::text AS eligible_accounts,
+       count(*) FILTER (WHERE provider = 'shopify')::text AS shopify_accounts,
+       count(*) FILTER (WHERE provider = 'faire')::text AS faire_accounts,
+       count(*) FILTER (WHERE last_started_at IS NULL)::text AS never_run,
+       count(*) FILTER (WHERE reconciliation_status = 'running')::text AS running,
+       count(*) FILTER (WHERE reconciliation_status = 'failed')::text AS failed,
+       count(*) FILTER (
+         WHERE reconciliation_status = 'running'
+           AND last_started_at < now() - interval '${ORDER_RECONCILIATION_LEASE}'
+       )::text AS stale_processing,
+       count(*) FILTER (
+         WHERE last_started_at IS NULL
+            OR last_started_at < now() - interval '${ORDER_RECONCILIATION_INTERVAL}'
+       )::text AS overdue,
+       (
+         SELECT count(*)
+         FROM operations_commerce_intake_continuations continuation
+         JOIN eligible target
+           ON target.organization_id = continuation.organization_id
+          AND target.integration_account_id = continuation.integration_account_id
+         WHERE continuation.resource = 'orders'
+           AND continuation.cursor_state = 'available'
+       )::text AS resumable,
+       max(last_completed_at) AS last_success_at
+     FROM state`,
+  )
+  const row = result.rows[0]
+  return {
+    eligibleAccounts: Number(row?.eligible_accounts || 0),
+    providerAccounts: {
+      shopify: Number(row?.shopify_accounts || 0),
+      faire: Number(row?.faire_accounts || 0),
+    },
+    neverRun: Number(row?.never_run || 0),
+    running: Number(row?.running || 0),
+    failed: Number(row?.failed || 0),
+    staleProcessing: Number(row?.stale_processing || 0),
+    overdue: Number(row?.overdue || 0),
+    resumable: Number(row?.resumable || 0),
+    lastSuccessAt: row?.last_success_at
+      ? new Date(row.last_success_at).toISOString()
+      : null,
+    resource: 'orders',
+  }
 }
 
 /**
@@ -291,12 +412,30 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
   recordsRejected: unknown
   pagesRead: unknown
   hasNextBatch: boolean
+  customersMatched: unknown
+  customersCreated: unknown
+  customersAmbiguous: unknown
+  customersSkipped: unknown
+  customerResolutionFailed: unknown
+  customerResolutionFailureCodes: Record<string, number>
 }) {
   return withTransaction(async (client) => {
     const providerRecordsSeen = boundedCount(input.providerRecordsSeen)
     const ordersHeld = boundedCount(input.ordersHeld)
     const recordsRejected = boundedCount(input.recordsRejected)
     const pagesRead = boundedCount(input.pagesRead)
+    const customersMatched = boundedCount(input.customersMatched)
+    const customersCreated = boundedCount(input.customersCreated)
+    const customersAmbiguous = boundedCount(input.customersAmbiguous)
+    const customersSkipped = boundedCount(input.customersSkipped)
+    const customerResolutionFailed = boundedCount(
+      input.customerResolutionFailed,
+    )
+    const customerResolutionFailureCodes = Object.fromEntries(
+      Object.entries(input.customerResolutionFailureCodes)
+        .filter(([code]) => /^[A-Z][A-Z0-9_]{2,127}$/u.test(code))
+        .map(([code, value]) => [code, boundedCount(value)]),
+    )
     const completed = await client.query(
       `UPDATE operations_commerce_sync_cursors
        SET reconciliation_status = 'succeeded',
@@ -342,6 +481,16 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
         recordsRejected,
         pagesRead,
         hasNextBatch: input.hasNextBatch,
+        automaticCustomerResolution: {
+          matched: customersMatched,
+          created: customersCreated,
+          ambiguous: customersAmbiguous,
+          skipped: customersSkipped,
+          failed: customerResolutionFailed,
+          failedByCode: customerResolutionFailureCodes,
+          operatorReviewRequired:
+            customersAmbiguous + customersSkipped + customerResolutionFailed,
+        },
         resumed: Boolean(input.target.continuationRunGlobalId),
         readOnly: true,
         providerWrites: 0,

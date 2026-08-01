@@ -53,11 +53,21 @@ function count(value: unknown) {
 }
 
 function assertReadOnly(command: Record<string, unknown>) {
+  const automaticCustomerResolution = record(
+    command.automaticCustomerResolution,
+  )
   if (
     command.providerWrites !== 0
     || command.syncCursorAdvanced !== false
     || count(command.canonicalOrdersCreated) !== 0
     || count(command.inventoryTouched) !== 0
+    || (
+      Object.keys(automaticCustomerResolution).length > 0
+      && (
+        automaticCustomerResolution.providerWrites !== 0
+        || automaticCustomerResolution.syncCursorAdvanced !== false
+      )
+    )
   ) {
     const error = new Error('Commerce order reconciliation crossed a read-only fence') as Error & { code?: string }
     error.code = 'COMMERCE_ORDER_RECONCILIATION_WRITE_FENCE'
@@ -93,6 +103,17 @@ export async function processCommerceOrderReconciliation(input: {
       providerWrites: 0,
       canonicalOrderWrites: 0,
       inventoryWrites: 0,
+      automaticCustomerResolution: {
+        matched: 0,
+        created: 0,
+        ambiguous: 0,
+        skipped: 0,
+        failed: 0,
+        failedByCode: {},
+        operatorReviewRequired: 0,
+        providerWrites: 0,
+        syncCursorAdvanced: false,
+      },
       failureCodes: {},
     }
   }
@@ -105,6 +126,12 @@ export async function processCommerceOrderReconciliation(input: {
   let leaseLost = 0
   let pagesRead = 0
   let resumable = 0
+  let customersMatched = 0
+  let customersCreated = 0
+  let customersAmbiguous = 0
+  let customersSkipped = 0
+  let customerResolutionFailed = 0
+  const customerResolutionFailureCodes: Record<string, number> = {}
   const failureCodes: Record<string, number> = {}
   for (const target of targets) {
     try {
@@ -114,6 +141,12 @@ export async function processCommerceOrderReconciliation(input: {
       let targetProviderRecordsSeen = 0
       let targetOrdersHeld = 0
       let targetRecordsRejected = 0
+      let targetCustomersMatched = 0
+      let targetCustomersCreated = 0
+      let targetCustomersAmbiguous = 0
+      let targetCustomersSkipped = 0
+      let targetCustomerResolutionFailed = 0
+      const targetCustomerResolutionFailureCodes: Record<string, number> = {}
       let hasNextBatch = false
       while (targetPagesRead < MAX_PAGES_PER_RECONCILIATION) {
         const response = await executeCommerceOrderPage({
@@ -141,9 +174,26 @@ export async function processCommerceOrderReconciliation(input: {
         const command = record(response.command)
         assertReadOnly(command)
         const pagination = record(command.pagination)
+        const automaticCustomerResolution = record(
+          command.automaticCustomerResolution,
+        )
         targetProviderRecordsSeen += count(pagination.providerRowsSeen)
         targetOrdersHeld += count(command.ordersStaged)
         targetRecordsRejected += count(command.recordsRejected)
+        targetCustomersMatched += count(automaticCustomerResolution.matched)
+        targetCustomersCreated += count(automaticCustomerResolution.created)
+        targetCustomersAmbiguous += count(automaticCustomerResolution.ambiguous)
+        targetCustomersSkipped += count(automaticCustomerResolution.skipped)
+        targetCustomerResolutionFailed += count(
+          automaticCustomerResolution.failed,
+        )
+        const failedByCode = record(automaticCustomerResolution.failedByCode)
+        for (const [code, value] of Object.entries(failedByCode)) {
+          if (!/^[A-Z][A-Z0-9_]{2,127}$/u.test(code)) continue
+          targetCustomerResolutionFailureCodes[code] = (
+            targetCustomerResolutionFailureCodes[code] || 0
+          ) + count(value)
+        }
         targetPagesRead += 1
         hasNextBatch = pagination.hasNextBatch === true
         const next = typeof pagination.continuationRunGlobalId === 'string'
@@ -171,6 +221,12 @@ export async function processCommerceOrderReconciliation(input: {
         recordsRejected: targetRecordsRejected,
         pagesRead: targetPagesRead,
         hasNextBatch,
+        customersMatched: targetCustomersMatched,
+        customersCreated: targetCustomersCreated,
+        customersAmbiguous: targetCustomersAmbiguous,
+        customersSkipped: targetCustomersSkipped,
+        customerResolutionFailed: targetCustomerResolutionFailed,
+        customerResolutionFailureCodes: targetCustomerResolutionFailureCodes,
       })
       if (completion.leaseLost) {
         leaseLost += 1
@@ -178,6 +234,19 @@ export async function processCommerceOrderReconciliation(input: {
         pagesRead += targetPagesRead
         staged += targetOrdersHeld
         rejected += targetRecordsRejected
+        customersMatched += targetCustomersMatched
+        customersCreated += targetCustomersCreated
+        customersAmbiguous += targetCustomersAmbiguous
+        customersSkipped += targetCustomersSkipped
+        customerResolutionFailed += targetCustomerResolutionFailed
+        for (
+          const [code, value]
+          of Object.entries(targetCustomerResolutionFailureCodes)
+        ) {
+          customerResolutionFailureCodes[code] = (
+            customerResolutionFailureCodes[code] || 0
+          ) + value
+        }
         if (hasNextBatch) resumable += 1
       }
     } catch (error) {
@@ -207,6 +276,18 @@ export async function processCommerceOrderReconciliation(input: {
     providerWrites: 0,
     canonicalOrderWrites: 0,
     inventoryWrites: 0,
+    automaticCustomerResolution: {
+      matched: customersMatched,
+      created: customersCreated,
+      ambiguous: customersAmbiguous,
+      skipped: customersSkipped,
+      failed: customerResolutionFailed,
+      failedByCode: customerResolutionFailureCodes,
+      operatorReviewRequired:
+        customersAmbiguous + customersSkipped + customerResolutionFailed,
+      providerWrites: 0,
+      syncCursorAdvanced: false,
+    },
     failureCodes,
   }
 }

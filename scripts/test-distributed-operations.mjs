@@ -1404,6 +1404,14 @@ async function verifyRouteBehavior() {
           }
         },
       },
+      '@/lib/persistence/sandboxCommerceE2eAuthorization': {
+        SandboxCommerceE2eAuthorizationError: class extends Error {},
+        authorizeSandboxCommerceE2eInPostgres: async (input) => ({
+          authorizationGlobalId: 'gsea1234567',
+          orderGlobalId: input.orderGlobalId,
+          state: 'active',
+        }),
+      },
       '@/lib/persistence/operations': {
         OperationsRequestError,
         readOperationsWorkspaceFromPostgres: async (input) => {
@@ -1977,6 +1985,8 @@ async function verifyRouteBehavior() {
     carrierRateGlobalId: 'grt1234567',
     carrierAccountGlobalId: 'gac1234567',
     preferredPrinterGlobalId: 'gpr1234567',
+    packageGlobalId: null,
+    sandboxE2eAuthorizationGlobalId: null,
     idempotencyKey: 'label-create-route-proof-1',
   })
 
@@ -3104,6 +3114,13 @@ async function verifyPostgresAcceptance(databaseUrl) {
             )
           },
         },
+        '@/lib/integrations/shopifyFulfillmentWriteback': {
+          executeShopifyFulfillmentWriteback: async () => {
+            throw new Error(
+              'Distributed Operations acceptance does not write Shopify fulfillment',
+            )
+          },
+        },
         '@/lib/operations/adapters': adapters,
         '@/lib/operations/canonicalFulfillmentPlanning':
           canonicalFulfillmentPlanning,
@@ -3123,6 +3140,18 @@ async function verifyPostgresAcceptance(databaseUrl) {
         },
         '@/lib/persistence/operationShadowFulfillmentPreparation': {
           readShadowFulfillmentPreparation: async () => null,
+        },
+        '@/lib/persistence/sandboxCommerceE2eAuthorization': {
+          requireActiveSandboxCommerceE2eAuthorization: async () => {
+            throw new Error(
+              'Distributed Operations acceptance has no sandbox E2E authorization',
+            )
+          },
+          consumeSandboxCommerceE2eAuthorization: async () => {
+            throw new Error(
+              'Distributed Operations acceptance has no sandbox E2E authorization',
+            )
+          },
         },
         '@/lib/persistence/postgres': postgres,
         '@/lib/persistence/productPackaging': productPackaging,
