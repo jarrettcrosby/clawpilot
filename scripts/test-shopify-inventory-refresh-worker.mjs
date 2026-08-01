@@ -290,9 +290,23 @@ includes(inventoryPersistence, [
   'expectedRefreshFence',
   'SHOPIFY_INVENTORY_REFRESH_FENCE_CHANGED',
   'AND lease_expires_at > clock_timestamp()',
+  "'operations:inventory-reservation'",
+  "reservation.reservation_authority = 'local_balance'",
+  "reservation.reservation_authority = 'provider_commitment'",
+  'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT',
   "actor: input.actorEmail || 'system'",
   'isSystem: !input.actorEmail',
 ], 'Shopify inventory single-flight persistence')
+assert.match(
+  inventoryPersistence,
+  /const reservedLocally = await client\.query\([\s\S]*?reservation\.status = 'active'[\s\S]*?reservation\.reservation_authority = 'local_balance'[\s\S]*?SHOPIFY_INVENTORY_LOCAL_RESERVATION_CONFLICT/,
+  'Shopify refresh must ignore provider-commitment claims already represented in Shopify committed quantity',
+)
+assert.match(
+  inventoryPersistence,
+  /const activeProviderCommitments = await client\.query[\s\S]*?reservation\.reservation_authority = 'provider_commitment'[\s\S]*?projectedByProduct\.get\(claim\.product_id\)[\s\S]*?SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT/,
+  'Shopify refresh must fail closed when current committed quantity cannot cover active provider commitments',
+)
 assert.doesNotMatch(
   inventoryPersistence,
   /lease_expires_at\.getTime\(\)\s*[<>]=?\s*Date\.now\(\)/,

@@ -1181,6 +1181,262 @@ async function seedCanonicalPlanningFixture(
   }
 }
 
+async function appendShopifyInventoryReconciliation(
+  pool,
+  fixture,
+  {
+    availableQuantity = 8,
+    committedQuantity = 2,
+  } = {},
+) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const sourceResult = await client.query(
+      `SELECT
+         run.integration_account_id::text,
+         run.location_mapping_id::text,
+         run.warehouse_id::text,
+         run.location_id::text,
+         run.inventory_pool_id::text,
+         run.provider_location_id,
+         run.provider_location_name,
+         run.adapter_version,
+         run.credential_version,
+         run.completed_at,
+         level.pipeline_id::text,
+         level.product_id::text,
+         level.inventory_position_id::text,
+         level.external_inventory_item_id,
+         level.sku,
+         level.provider_weight_grams,
+         level.provider_dimensions_mm,
+         level.product_snapshot
+       FROM operations_commerce_inventory_sync_runs run
+       JOIN operations_commerce_inventory_levels level
+         ON level.organization_id = run.organization_id
+        AND level.integration_account_id = run.integration_account_id
+        AND level.sync_run_id = run.id
+       WHERE run.organization_id = $1::uuid
+         AND run.id = $2::uuid
+         AND level.id = $3::uuid
+         AND level.inventory_position_id = $4::uuid`,
+      [
+        fixture.organizationId,
+        fixture.inventoryRun.id,
+        fixture.inventoryLevel.id,
+        fixture.inventoryPosition.id,
+      ],
+    )
+    assert.equal(sourceResult.rowCount, 1)
+    const source = sourceResult.rows[0]
+    const suffix = randomUUID().slice(0, 8)
+    const evidenceTimestamp = new Date(
+      new Date(source.completed_at).getTime() + 1000,
+    ).toISOString()
+    const onHandQuantity = availableQuantity + committedQuantity
+
+    const attemptResult = await client.query(
+      `INSERT INTO operations_commerce_provider_attempts (
+         organization_id, integration_account_id, action, adapter_version,
+         external_object_id, idempotency_key, request_hash,
+         redacted_request, redacted_response, state,
+         completed_at, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, 'inventory_read', $3,
+         $4, $5, $6, '{}'::jsonb, '{}'::jsonb, 'succeeded',
+         $7::timestamptz, $8
+       )
+       RETURNING id::text`,
+      [
+        fixture.organizationId,
+        source.integration_account_id,
+        source.adapter_version,
+        source.provider_location_id,
+        `inventory-attempt-latest-${suffix}`,
+        sha(`inventory-attempt-latest-${suffix}`),
+        evidenceTimestamp,
+        fixture.email,
+      ],
+    )
+    const providerAttemptId = attemptResult.rows[0].id
+    const snapshotHash = sha(`inventory-snapshot-latest-${suffix}`)
+    const capturedSnapshot = JSON.stringify({
+      fixture: 'canonical-latest-provider-commitment',
+      availableQuantity,
+      committedQuantity,
+      onHandQuantity,
+    })
+    const captureResult = await client.query(
+      `INSERT INTO operations_commerce_inventory_captures (
+         organization_id, integration_account_id, provider_attempt_id,
+         warehouse_id, location_id, provider, adapter_version,
+         credential_version, request_hash, snapshot_hash,
+         provider_location_id, provider_fetched_at, level_count,
+         captured_snapshot, snapshot_bytes, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+         'shopify', $6, $7, $8, $9,
+         $10, $11::timestamptz, 1, $12::jsonb, $13, $14
+       )
+       RETURNING id::text`,
+      [
+        fixture.organizationId,
+        source.integration_account_id,
+        providerAttemptId,
+        source.warehouse_id,
+        source.location_id,
+        source.adapter_version,
+        source.credential_version,
+        sha(`inventory-request-latest-${suffix}`),
+        snapshotHash,
+        source.provider_location_id,
+        evidenceTimestamp,
+        capturedSnapshot,
+        Buffer.byteLength(capturedSnapshot, 'utf8'),
+        fixture.email,
+      ],
+    )
+
+    await client.query(
+      `SELECT set_config('clawpilot.shopify_inventory_sync', 'on', true)`,
+    )
+    const positionResult = await client.query(
+      `UPDATE operations_inventory_positions
+       SET on_hand_quantity = $3,
+           reserved_quantity = $4,
+           version = version + 1,
+           updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+       RETURNING on_hand_quantity::text, reserved_quantity::text`,
+      [
+        fixture.organizationId,
+        fixture.inventoryPosition.id,
+        onHandQuantity,
+        committedQuantity,
+      ],
+    )
+    assert.deepEqual(positionResult.rows[0], {
+      on_hand_quantity: `${onHandQuantity}.000000`,
+      reserved_quantity: `${committedQuantity}.000000`,
+    })
+
+    const runResult = await client.query(
+      `INSERT INTO operations_commerce_inventory_sync_runs (
+         organization_id, integration_account_id, provider_attempt_id,
+         capture_id, location_mapping_id, warehouse_id, location_id,
+         inventory_pool_id, provider, adapter_version, credential_version,
+         idempotency_key, request_hash, snapshot_hash, status,
+         provider_location_id, provider_location_name, provider_fetched_at,
+         levels_seen, levels_mapped, levels_projected, levels_unmapped,
+         levels_untracked, negative_available_levels,
+         equation_mismatch_levels, provider_available_quantity,
+         provider_committed_quantity, provider_on_hand_quantity,
+         operational_available_quantity, positions_created,
+         positions_updated, positions_zeroed, created_by, completed_at
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+         $6::uuid, $7::uuid, $8::uuid,
+         'shopify', $9, $10,
+         $11, $12, $13, 'succeeded',
+         $14, $15, $16::timestamptz,
+         1, 1, 1, 0, 0, 0, 0,
+         $17, $18, $19, $17, 0, 1, 0, $20, $16::timestamptz
+       )
+       RETURNING id::text, global_id`,
+      [
+        fixture.organizationId,
+        source.integration_account_id,
+        providerAttemptId,
+        captureResult.rows[0].id,
+        source.location_mapping_id,
+        source.warehouse_id,
+        source.location_id,
+        source.inventory_pool_id,
+        source.adapter_version,
+        source.credential_version,
+        `inventory-run-latest-${suffix}`,
+        sha(`inventory-run-request-latest-${suffix}`),
+        snapshotHash,
+        source.provider_location_id,
+        source.provider_location_name,
+        evidenceTimestamp,
+        availableQuantity,
+        committedQuantity,
+        onHandQuantity,
+        fixture.email,
+      ],
+    )
+    const run = runResult.rows[0]
+    const levelResult = await client.query(
+      `INSERT INTO operations_commerce_inventory_levels (
+         organization_id, sync_run_id, integration_account_id,
+         location_mapping_id, warehouse_id, location_id, inventory_pool_id,
+         pipeline_id, product_id, inventory_position_id,
+         provider_location_id, external_inventory_item_id, sku,
+         tracked, mapping_state, projection_state,
+         provider_available_quantity, provider_incoming_quantity,
+         provider_committed_quantity, provider_damaged_quantity,
+         provider_on_hand_quantity, provider_quality_control_quantity,
+         provider_reserved_quantity, provider_safety_stock_quantity,
+         provider_quantity_evidence, operational_available_quantity,
+         equation_matches, provider_weight_grams, provider_dimensions_mm,
+         product_snapshot, source_hash
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid,
+         $4::uuid, $5::uuid, $6::uuid, $7::uuid,
+         $8::uuid, $9::uuid, $10::uuid,
+         $11, $12, $13,
+         true, 'mapped', 'projected',
+         $14, 0, $15, 0, $16, 0, 0, 0,
+         $17::jsonb, $14, true, $18, $19::jsonb,
+         $20::jsonb, $21
+       )
+       RETURNING id::text, global_id`,
+      [
+        fixture.organizationId,
+        run.id,
+        source.integration_account_id,
+        source.location_mapping_id,
+        source.warehouse_id,
+        source.location_id,
+        source.inventory_pool_id,
+        source.pipeline_id,
+        source.product_id,
+        source.inventory_position_id,
+        source.provider_location_id,
+        source.external_inventory_item_id,
+        source.sku,
+        availableQuantity,
+        committedQuantity,
+        onHandQuantity,
+        JSON.stringify({
+          available: availableQuantity,
+          committed: committedQuantity,
+          onHand: onHandQuantity,
+        }),
+        source.provider_weight_grams,
+        JSON.stringify(source.provider_dimensions_mm),
+        JSON.stringify(source.product_snapshot),
+        sha(`inventory-level-latest-${suffix}`),
+      ],
+    )
+    await client.query('COMMIT')
+    return {
+      run,
+      level: levelResult.rows[0],
+      onHandQuantity,
+      committedQuantity,
+    }
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined)
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
 async function canonicalPlanningState(pool, fixture) {
   const result = await pool.query(
     `SELECT
@@ -1304,6 +1560,221 @@ async function canonicalPlanningState(pool, fixture) {
   )
   assert.equal(result.rowCount, 1)
   return result.rows[0]
+}
+
+async function verifyLatestProviderCommitmentRelease(pool, operations) {
+  const fixture = await seedCanonicalPlanningFixture(pool)
+  const planned = await operations.planOperationsOrderFromPostgres({
+    organizationId: fixture.organizationId,
+    actorEmail: fixture.email,
+    orderGlobalId: fixture.order.global_id,
+    cartonizationEvidenceGlobalId: fixture.evidence.global_id,
+    expectedRowVersion: Number(fixture.order.row_version),
+    reason: 'Plan against immutable provider commitment evidence',
+    idempotencyKey: `canonical-latest-plan-${randomUUID()}`,
+  })
+  const originalState = await canonicalPlanningState(pool, fixture)
+  assert.equal(originalState.reservation_authority, 'provider_commitment')
+  assert.equal(
+    originalState.reservation_inventory_run_id,
+    fixture.inventoryRun.id,
+  )
+  assert.equal(
+    originalState.reservation_inventory_level_id,
+    fixture.inventoryLevel.id,
+  )
+  const beforeCounts = await pool.query(
+    `SELECT
+       count(DISTINCT reservation.id)::int AS reservations,
+       count(DISTINCT allocation.id)::int AS allocations,
+       count(ledger.id) FILTER (
+         WHERE ledger.source_authority = 'clawpilot'
+       )::int AS local_ledger_rows,
+       COALESCE(sum(ledger.reserved_delta) FILTER (
+         WHERE ledger.source_authority = 'clawpilot'
+       ), 0)::text AS local_reserved_delta
+     FROM operations_fulfillment_plans plan
+     JOIN operations_fulfillment_allocations allocation
+       ON allocation.organization_id = plan.organization_id
+      AND allocation.plan_id = plan.id
+     JOIN operations_reservations reservation
+       ON reservation.organization_id = allocation.organization_id
+      AND reservation.id = allocation.reservation_id
+     LEFT JOIN operations_inventory_ledger ledger
+       ON ledger.organization_id = reservation.organization_id
+      AND ledger.position_id = reservation.position_id
+     WHERE plan.organization_id = $1::uuid
+       AND plan.global_id = $2`,
+    [fixture.organizationId, planned.fulfillmentPlanGlobalId],
+  )
+  assert.deepEqual(beforeCounts.rows[0], {
+    reservations: 1,
+    allocations: 1,
+    local_ledger_rows: 0,
+    local_reserved_delta: '0',
+  })
+
+  const latest = await appendShopifyInventoryReconciliation(pool, fixture)
+  const supportResult = await pool.query(
+    `SELECT reservation.id::text AS reservation_id,
+            support.supported,
+            support.reason_code,
+            support.latest_inventory_sync_run_global_id
+              AS latest_sync_run_global_id
+     FROM operations_reservations reservation
+     CROSS JOIN LATERAL operations_provider_commitment_current_support(
+       reservation.organization_id,
+       reservation.id
+     ) support
+     WHERE reservation.organization_id = $1::uuid
+       AND reservation.order_id = $2::uuid
+       AND reservation.reservation_authority = 'provider_commitment'`,
+    [fixture.organizationId, fixture.order.id],
+  )
+  assert.equal(supportResult.rowCount, 1)
+  assert.equal(supportResult.rows[0].supported, true)
+  assert.equal(supportResult.rows[0].reason_code, 'OK')
+  assert.equal(
+    supportResult.rows[0].latest_sync_run_global_id,
+    latest.run.global_id,
+  )
+
+  const released = await operations.releaseOperationsOrderFromPostgres({
+    organizationId: fixture.organizationId,
+    actorEmail: fixture.email,
+    orderGlobalId: fixture.order.global_id,
+    expectedRowVersion: planned.rowVersion,
+    reason: 'Release with sufficient current provider commitment support',
+    idempotencyKey: `canonical-latest-release-${randomUUID()}`,
+  })
+  assert.equal(released.orderStatus, 'released')
+  const after = await pool.query(
+    `SELECT
+       count(DISTINCT reservation.id)::int AS reservations,
+       count(DISTINCT allocation.id)::int AS allocations,
+       min(reservation.status) AS reservation_status,
+       min(reservation.provider_inventory_sync_run_id::text)
+         AS reservation_inventory_run_id,
+       min(reservation.provider_inventory_level_id::text)
+         AS reservation_inventory_level_id,
+       min(position.on_hand_quantity)::text AS on_hand_quantity,
+       min(position.reserved_quantity)::text AS reserved_quantity,
+       count(ledger.id) FILTER (
+         WHERE ledger.source_authority = 'clawpilot'
+       )::int AS local_ledger_rows,
+       COALESCE(sum(ledger.reserved_delta) FILTER (
+         WHERE ledger.source_authority = 'clawpilot'
+       ), 0)::text AS local_reserved_delta
+     FROM operations_fulfillment_plans plan
+     JOIN operations_fulfillment_allocations allocation
+       ON allocation.organization_id = plan.organization_id
+      AND allocation.plan_id = plan.id
+     JOIN operations_reservations reservation
+       ON reservation.organization_id = allocation.organization_id
+      AND reservation.id = allocation.reservation_id
+     JOIN operations_inventory_positions position
+       ON position.organization_id = reservation.organization_id
+      AND position.id = reservation.position_id
+     LEFT JOIN operations_inventory_ledger ledger
+       ON ledger.organization_id = reservation.organization_id
+      AND ledger.position_id = reservation.position_id
+     WHERE plan.organization_id = $1::uuid
+       AND plan.global_id = $2`,
+    [fixture.organizationId, planned.fulfillmentPlanGlobalId],
+  )
+  assert.deepEqual(after.rows[0], {
+    reservations: 1,
+    allocations: 1,
+    reservation_status: 'active',
+    reservation_inventory_run_id: fixture.inventoryRun.id,
+    reservation_inventory_level_id: fixture.inventoryLevel.id,
+    on_hand_quantity: `${latest.onHandQuantity}.000000`,
+    reserved_quantity: `${latest.committedQuantity}.000000`,
+    local_ledger_rows: 0,
+    local_reserved_delta: '0',
+  })
+  const releaseEvent = await pool.query(
+    `SELECT payload
+     FROM operations_domain_events
+     WHERE organization_id = $1::uuid
+       AND aggregate_id = $2::uuid
+       AND event_type = 'operations.wave.released'
+     ORDER BY occurred_at DESC, id DESC
+     LIMIT 1`,
+    [fixture.organizationId, fixture.order.id],
+  )
+  assert.equal(releaseEvent.rowCount, 1)
+  assert.equal(
+    releaseEvent.rows[0].payload.providerCommitmentsRevalidated,
+    1,
+  )
+  assert.deepEqual(
+    releaseEvent.rows[0].payload
+      .providerCommitmentInventorySyncRunGlobalIds,
+    [latest.run.global_id],
+  )
+
+  const undercoveredFixture = await seedCanonicalPlanningFixture(pool)
+  await operations.planOperationsOrderFromPostgres({
+    organizationId: undercoveredFixture.organizationId,
+    actorEmail: undercoveredFixture.email,
+    orderGlobalId: undercoveredFixture.order.global_id,
+    cartonizationEvidenceGlobalId: undercoveredFixture.evidence.global_id,
+    expectedRowVersion: Number(undercoveredFixture.order.row_version),
+    reason: 'Exercise the provider commitment undercoverage guard',
+    idempotencyKey: `canonical-undercoverage-plan-${randomUUID()}`,
+  })
+  const undercoverageClient = await pool.connect()
+  try {
+    await undercoverageClient.query('BEGIN')
+    await undercoverageClient.query(
+      `SELECT set_config(
+         'clawpilot.shopify_inventory_sync',
+         'on',
+         true
+       )`,
+    )
+    await undercoverageClient.query('SAVEPOINT provider_undercoverage')
+    await assert.rejects(
+      () => undercoverageClient.query(
+        `UPDATE operations_inventory_positions
+         SET on_hand_quantity = 9,
+             reserved_quantity = 1,
+             version = version + 1,
+             updated_at = clock_timestamp()
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid`,
+        [
+          undercoveredFixture.organizationId,
+          undercoveredFixture.inventoryPosition.id,
+        ],
+      ),
+      /provider commitment|Shopify committed|active provider/i,
+    )
+    await undercoverageClient.query(
+      'ROLLBACK TO SAVEPOINT provider_undercoverage',
+    )
+    const protectedPosition = await undercoverageClient.query(
+      `SELECT on_hand_quantity::text, reserved_quantity::text
+       FROM operations_inventory_positions
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [
+        undercoveredFixture.organizationId,
+        undercoveredFixture.inventoryPosition.id,
+      ],
+    )
+    assert.deepEqual(protectedPosition.rows[0], {
+      on_hand_quantity: '10.000000',
+      reserved_quantity: '2.000000',
+    })
+    await undercoverageClient.query('ROLLBACK')
+  } catch (error) {
+    await undercoverageClient.query('ROLLBACK').catch(() => undefined)
+    throw error
+  } finally {
+    undercoverageClient.release()
+  }
 }
 
 async function verifyPackagingClaimConcurrency(pool) {
@@ -2661,6 +3132,7 @@ async function verifyCanonicalPlanning(databaseUrl) {
       /Fulfillment allocation identity and quantity are immutable/,
     )
 
+    await verifyLatestProviderCommitmentRelease(pool, operations)
     await verifyLocalSplitPlanning(pool, operations)
     await verifyPackagingClaimConcurrency(pool)
   } finally {

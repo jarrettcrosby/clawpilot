@@ -1727,7 +1727,31 @@ async function revalidateProviderCommitmentsForPlan(
     organizationId: string
     planId: string
   },
-) {
+): Promise<{
+  count: number
+  latestInventorySyncRunGlobalIds: string[]
+}> {
+  const positionResult = await client.query<QueryResultRow & {
+    position_id: string
+  }>(
+    `SELECT DISTINCT allocation.position_id::text AS position_id
+     FROM operations_fulfillment_allocations allocation
+     WHERE allocation.organization_id = $1::uuid
+       AND allocation.plan_id = $2::uuid
+     ORDER BY allocation.position_id::text`,
+    [input.organizationId, input.planId],
+  )
+  for (const position of positionResult.rows) {
+    await acquireTransactionAdvisoryLock(
+      client,
+      [
+        'operations:inventory-reservation',
+        input.organizationId,
+        position.position_id,
+      ].join(':'),
+    )
+  }
+
   const authorityResult = await client.query<QueryResultRow & {
     source_authority: 'clawpilot' | 'shopify'
     reservation_authority: 'local_balance' | 'provider_commitment'
@@ -1754,7 +1778,12 @@ async function revalidateProviderCommitmentsForPlan(
   const providerAllocations = authorityResult.rows.filter(
     (row) => row.source_authority === 'shopify',
   )
-  if (providerAllocations.length < 1) return 0
+  if (providerAllocations.length < 1) {
+    return {
+      count: 0,
+      latestInventorySyncRunGlobalIds: [],
+    }
+  }
   if (providerAllocations.some((row) => (
     row.reservation_authority !== 'provider_commitment'
     || row.reservation_status !== 'active'
@@ -1791,14 +1820,57 @@ async function revalidateProviderCommitmentsForPlan(
     if (error instanceof OperationsRequestError) throw error
     if (providerCommitmentValidationFailed(error)) {
       throw new OperationsRequestError(
-        'OPERATIONS_PROVIDER_COMMITMENT_STALE',
-        'Shopify inventory changed after this plan was accepted. Refresh inventory and replan the order before warehouse release.',
+        'OPERATIONS_PROVIDER_COMMITMENT_CHANGED',
+        'Shopify inventory no longer supports this fulfillment plan. Refresh inventory and replan the order.',
         409,
       )
     }
     throw error
   }
-  return reservationIds.length
+
+  const supportResult = await client.query<QueryResultRow & {
+    reservation_id: string
+    supported: boolean
+    reason_code: string
+    latest_sync_run_global_id: string | null
+  }>(
+    `WITH target_reservations AS (
+       SELECT unnest($2::uuid[]) AS reservation_id
+     )
+     SELECT support.reservation_id::text,
+            support.supported,
+            support.reason_code,
+            support.latest_inventory_sync_run_global_id
+              AS latest_sync_run_global_id
+     FROM target_reservations target
+     CROSS JOIN LATERAL operations_provider_commitment_current_support(
+       $1::uuid,
+       target.reservation_id
+     ) support
+     ORDER BY support.reservation_id`,
+    [input.organizationId, reservationIds],
+  )
+  if (
+    supportResult.rows.length !== reservationIds.length
+    || supportResult.rows.some((row) => (
+      !row.supported || !row.latest_sync_run_global_id
+    ))
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PROVIDER_COMMITMENT_CHANGED',
+      'Shopify inventory no longer supports this fulfillment plan. Refresh inventory and replan the order.',
+      409,
+    )
+  }
+
+  return {
+    count: reservationIds.length,
+    latestInventorySyncRunGlobalIds: [
+      ...new Set(supportResult.rows.map(
+        (row) => row.latest_sync_run_global_id as string,
+      )),
+    ].sort(),
+  }
 }
 
 async function readOrderDetail(
@@ -10848,13 +10920,14 @@ export async function releaseOperationsOrderFromPostgres(input: {
           409,
         )
       }
-      const providerCommitmentCount = await revalidateProviderCommitmentsForPlan(
-        client,
-        {
-          organizationId,
-          planId: plan.id,
-        },
-      )
+      const providerCommitmentRevalidation =
+        await revalidateProviderCommitmentsForPlan(
+          client,
+          {
+            organizationId,
+            planId: plan.id,
+          },
+        )
 
       const blockingResult = await client.query<QueryResultRow & { count: string }>(
         `SELECT count(*)::text AS count
@@ -10952,7 +11025,11 @@ export async function releaseOperationsOrderFromPostgres(input: {
           planGlobalId: plan.global_id,
           waveGlobalId: wave.global_id,
           pickTaskGlobalIds: pickResult.rows.map((row) => row.global_id),
-          providerCommitmentsRevalidated: providerCommitmentCount,
+          providerCommitmentsRevalidated:
+            providerCommitmentRevalidation.count,
+          providerCommitmentInventorySyncRunGlobalIds:
+            providerCommitmentRevalidation
+              .latestInventorySyncRunGlobalIds,
           reason,
         },
       })
@@ -10971,7 +11048,11 @@ export async function releaseOperationsOrderFromPostgres(input: {
           rowVersion: Number(released.row_version),
           planGlobalId: plan.global_id,
           waveGlobalId: wave.global_id,
-          providerCommitmentsRevalidated: providerCommitmentCount,
+          providerCommitmentsRevalidated:
+            providerCommitmentRevalidation.count,
+          providerCommitmentInventorySyncRunGlobalIds:
+            providerCommitmentRevalidation
+              .latestInventorySyncRunGlobalIds,
           reason,
         },
       }, client)
@@ -12240,6 +12321,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         customer_global_id: string
         customer_name: string
         source_provider: string
+        integration_account_id: string | null
         external_order_id: string
         order_number: string
         currency: string
@@ -12251,7 +12333,9 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
                 source_order.customer_id::text,
                 customer.reference_code AS customer_global_id,
                 customer.name AS customer_name,
-                source_order.source_provider, source_order.external_order_id,
+                source_order.source_provider,
+                source_order.integration_account_id::text,
+                source_order.external_order_id,
                 source_order.order_number, source_order.currency,
                 source_order.ship_to,
                 (SELECT count(*)::text
@@ -12287,6 +12371,23 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           'OPERATIONS_ORDER_TRANSITION_INVALID',
           `Shipment cannot be confirmed from ${order.status}`,
           409,
+        )
+      }
+      if (order.source_provider === 'shopify') {
+        if (!order.integration_account_id) {
+          throw new OperationsRequestError(
+            'OPERATIONS_PROVIDER_ACCOUNT_REQUIRED',
+            'The Shopify order is missing its integration account. Reconcile the order before confirming shipment.',
+            409,
+          )
+        }
+        await acquireTransactionAdvisoryLock(
+          client,
+          [
+            'shopify-inventory-apply',
+            organizationId,
+            order.integration_account_id,
+          ].join(':'),
         )
       }
 
@@ -12572,6 +12673,15 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         )
       }
 
+      const providerCommitmentRevalidation =
+        await revalidateProviderCommitmentsForPlan(
+          client,
+          {
+            organizationId,
+            planId: plan.id,
+          },
+        )
+
       const packagingConsumption =
         await consumePackagingMaterialClaimsForPlan(client, {
           organizationId,
@@ -12831,6 +12941,11 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           labelEnvironment: label.environment,
           packingSlipArtifactGlobalId: artifact.global_id,
           commerceExportGlobalId: fulfillmentExport.global_id,
+          providerCommitmentsRevalidated:
+            providerCommitmentRevalidation.count,
+          providerCommitmentInventorySyncRunGlobalIds:
+            providerCommitmentRevalidation
+              .latestInventorySyncRunGlobalIds,
           packagingMaterialClaimsConsumed:
             packagingConsumption.claimCount,
           packagingMaterialQuantityConsumed:
@@ -12857,6 +12972,11 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           })),
           localInventoryConsumptionCount,
           providerCommitmentConsumptionCount,
+          providerCommitmentsRevalidated:
+            providerCommitmentRevalidation.count,
+          providerCommitmentInventorySyncRunGlobalIds:
+            providerCommitmentRevalidation
+              .latestInventorySyncRunGlobalIds,
           packagingMaterialClaimsConsumed:
             packagingConsumption.claimCount,
           packagingMaterialQuantityConsumed:
@@ -12893,6 +13013,11 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           trackingNumber: label.tracking_number,
           packingSlipArtifactGlobalId: artifact.global_id,
           commerceExportGlobalId: fulfillmentExport.global_id,
+          providerCommitmentsRevalidated:
+            providerCommitmentRevalidation.count,
+          providerCommitmentInventorySyncRunGlobalIds:
+            providerCommitmentRevalidation
+              .latestInventorySyncRunGlobalIds,
           packagingMaterialClaimsConsumed:
             packagingConsumption.claimCount,
           packagingMaterialQuantityConsumed:

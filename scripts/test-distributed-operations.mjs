@@ -583,10 +583,55 @@ function verifySourceContracts() {
     /async function revalidateProviderCommitmentsForPlan[\s\S]*?SET status = status[\s\S]*?reservation_authority = 'provider_commitment'/,
     'Warehouse release must re-run database authority validation for every active Shopify provider commitment',
   )
+  const providerCommitmentRevalidation = persistence.match(
+    /async function revalidateProviderCommitmentsForPlan[\s\S]*?(?=\nasync function readOrderDetail)/,
+  )?.[0]
+  assert.ok(
+    providerCommitmentRevalidation,
+    'Provider commitment current-support revalidation helper must remain available',
+  )
+  assert.match(
+    providerCommitmentRevalidation,
+    /SELECT DISTINCT allocation\.position_id::text[\s\S]*?ORDER BY allocation\.position_id::text[\s\S]*?'operations:inventory-reservation'[\s\S]*?const authorityResult[\s\S]*?FOR UPDATE OF position, reservation/,
+    'Provider commitment revalidation must take sorted position advisory locks before row locks',
+  )
+  for (const fragment of [
+    'operations_provider_commitment_current_support',
+    'support.supported',
+    'support.reason_code',
+    'support.latest_inventory_sync_run_global_id',
+  ]) {
+    assert.ok(
+      providerCommitmentRevalidation.includes(fragment),
+      `Provider commitment current-support query missing ${fragment}`,
+    )
+  }
+  assert.match(
+    providerCommitmentRevalidation,
+    /!row\.supported \|\| !row\.latest_sync_run_global_id[\s\S]*?OPERATIONS_PROVIDER_COMMITMENT_CHANGED/,
+    'Unsupported or missing current Shopify evidence must fail with the stable provider-commitment conflict code',
+  )
+  assert.match(
+    providerCommitmentRevalidation,
+    /count: reservationIds\.length[\s\S]*?latestInventorySyncRunGlobalIds/,
+    'Provider commitment revalidation must return immutable current-sync evidence for audit payloads',
+  )
   assert.match(
     persistence,
     /'shopify-inventory-apply'[\s\S]*?revalidateProviderCommitmentsForPlan/,
     'Warehouse release must serialize provider-commitment revalidation with Shopify inventory application',
+  )
+  const warehouseReleaseRegion = persistence.match(
+    /export async function releaseOperationsOrderFromPostgres[\s\S]*?(?=\nexport async function)/,
+  )?.[0]
+  assert.ok(
+    warehouseReleaseRegion,
+    'Warehouse-release implementation must remain available',
+  )
+  assert.match(
+    warehouseReleaseRegion,
+    /providerCommitmentsRevalidated:[\s\S]*?providerCommitmentInventorySyncRunGlobalIds:[\s\S]*?operations\.order\.released[\s\S]*?providerCommitmentsRevalidated:[\s\S]*?providerCommitmentInventorySyncRunGlobalIds:/,
+    'Warehouse release domain and audit evidence must record the latest current Shopify inventory sync runs',
   )
   assert.match(
     persistence,
@@ -629,6 +674,28 @@ function verifySourceContracts() {
     persistence,
     /allocation\.source_authority === 'shopify'[\s\S]*?consumeProviderCommitment[\s\S]*?continue[\s\S]*?consumeReservedInventory/,
     'Shipment confirmation must branch provider commitments away from local inventory consumption',
+  )
+  const shipmentConfirmationRegion = persistence.match(
+    /export async function confirmOperationsOrderShipmentFromPostgres[\s\S]*$/,
+  )?.[0]
+  assert.ok(
+    shipmentConfirmationRegion,
+    'Shipment-confirmation implementation must remain available',
+  )
+  assert.match(
+    shipmentConfirmationRegion,
+    /'shopify-inventory-apply'[\s\S]*?const planResult[\s\S]*?FOR UPDATE/,
+    'Shipment confirmation must serialize with Shopify inventory application before locking fulfillment rows',
+  )
+  assert.match(
+    shipmentConfirmationRegion,
+    /OPERATIONS_ALLOCATION_INCOMPLETE[\s\S]*?revalidateProviderCommitmentsForPlan[\s\S]*?consumePackagingMaterialClaimsForPlan[\s\S]*?INSERT INTO operations_shipments/,
+    'Shipment confirmation must revalidate current Shopify support immediately before transactional shipment mutations',
+  )
+  assert.match(
+    shipmentConfirmationRegion,
+    /operations\.shipment\.confirmed[\s\S]*?providerCommitmentsRevalidated:[\s\S]*?providerCommitmentInventorySyncRunGlobalIds:[\s\S]*?operations\.order\.shipment_confirmed[\s\S]*?providerCommitmentsRevalidated:[\s\S]*?providerCommitmentInventorySyncRunGlobalIds:/,
+    'Shipment domain and audit evidence must record the latest current Shopify inventory sync runs',
   )
   const canonicalPlanningRegion = persistence.match(
     /type PlanningPositionRow[\s\S]*?(?=\n      const actualCheckoutCharge)/,

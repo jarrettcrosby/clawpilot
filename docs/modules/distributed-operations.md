@@ -306,7 +306,7 @@ The implemented slice provides:
 - CRM organization and `gp` product resolution without cloning customer or catalog masters;
 - one explicit CRM data pipeline per workspace, deduplicated customer and product catalogs by permanent Global ID, and deterministic provider-customer matching with review-required staging for ambiguous or unmatched identities;
 - an internal test-only deterministic order, reservation, planning, cartonization, carrier, and print harness that cannot create hosted workspace records without an explicit automated-test feature flag;
-- operator-controlled warehouse release with exact-version concurrency, readiness and exception checks, transactionally serialized revalidation of every active Shopify provider commitment against its still-latest exact successful inventory projection, one released wave, ready pick tasks, domain event, audit evidence, and replay-safe command receipts;
+- operator-controlled warehouse release with exact-version concurrency, readiness and exception checks, transactionally serialized revalidation of every active Shopify provider commitment against the newest sufficient successful inventory projection while preserving its original acceptance evidence, one released wave, ready pick tasks, domain event, audit evidence, and replay-safe command receipts;
 - operator-controlled bulk pick confirmation with exact-version concurrency, affected-position locks, all-ready validation, one completed wave, picked tasks, retained reservations, immutable local-authority pick-ledger evidence, no second local ledger movement for Shopify-authoritative picks, domain event, audit evidence, and replay-safe exact result payloads;
 - operator-controlled pack verification with exact-version concurrency, released-plan and completed-pick validation, one packed package, retained reservations for shipment consumption, immutable pack-fee evidence, domain event, audit evidence, and replay-safe exact result payloads;
 - a shared CRM product catalog that authorized pipeline editors can maintain individually or import from CSV, with a permanent `gp` product identity, duplicate prevention by SKU or case-insensitive name, per-row validation, and bounded partial-import results;
@@ -1407,6 +1407,30 @@ allowlisted code, while unknown constraints remain generic. This keeps a cursor
 and worker response diagnosable without persisting raw constraint names,
 provider values, or customer data.
 
+The automatic Shopify inventory projection distinguishes reservation
+authority and serializes each affected position with the same advisory lock as
+fulfillment planning. An active `local_balance` reservation blocks
+reconciliation because applying a provider snapshot over a ClawPilot-owned
+reservation would overwrite local balance authority. A
+`provider_commitment` claim is already represented in Shopify's committed
+quantity, so it creates no second balance or ledger delta and does not by
+itself block a fresher read-only projection. The complete projection must still
+cover the sum of every active provider commitment on the position. Missing,
+unmapped, inconsistent, or undercommitted current evidence supplies zero
+support and aborts the whole projection with
+`SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT`; it never silently releases a
+claim or partially advances inventory. Released and consumed claims are
+terminal and no longer count against current committed support.
+
+Each provider commitment retains the exact successful sync run and level that
+authorized its creation. A newer sufficient Shopify snapshot does not rewrite
+that historical evidence. Instead, warehouse release and shipment confirmation
+both resolve the newest successful mapped, tracked, equation-valid snapshot,
+revalidate the active claim total against its committed quantity, and persist
+the current inventory-sync Global IDs in domain and audit evidence. Either
+transition fails closed with `OPERATIONS_PROVIDER_COMMITMENT_CHANGED` when the
+current snapshot no longer supports the plan.
+
 Migration `0176` closes the next local boundary after canonical promotion
 without expanding provider authority. A manager supplies one imported order's
 exact row version, one sealed `operational` cartonization/rate evidence Global
@@ -1450,19 +1474,23 @@ resolves to eligible ClawPilot-authoritative inventory.
 Warehouse release acquires the same account-scoped transaction advisory lock
 as Shopify inventory application and deliberately re-runs the reservation
 authority trigger for every active provider claim before it creates a wave.
-A stale sync reference, changed exact projected balance, or overclaimed
-committed quantity therefore fails closed and requires inventory refresh plus
-replanning. Pick confirmation records the pick task and domain/audit evidence
-but never appends a local inventory-ledger movement for Shopify authority.
-Shipment confirmation changes that provider claim from `active` to `consumed`
-without changing the projected position; the existing queued Shopify
-fulfillment export remains the sole provider-write path. Consumed or released
-provider commitments are terminal and cannot become active again. Active mode
-also rejects any planned or released order whose sealed production
-cartonization/rate evidence link is missing. The current slice does not expose
-the guarded plan-cancellation command needed to release abandoned inventory and
-packaging claims, so accepted real plans must not be cancelled through direct
-SQL.
+The claim's original sync-run and level references remain immutable acceptance
+evidence, while the release event records the newest current supporting
+sync-run Global IDs. Missing or invalid current product evidence, a projected
+position mismatch, or aggregate active claims above current committed quantity
+fails closed and requires inventory reconciliation plus replanning. Pick
+confirmation records the pick task and domain/audit evidence but never appends
+a local inventory-ledger movement for Shopify authority. Shipment confirmation
+serializes with inventory refresh and repeats the same current-support check
+immediately before any packaging, shipment, or inventory mutation; only then
+does it change the provider claim from `active` to `consumed` without changing
+the projected position. The existing queued Shopify fulfillment export remains
+the sole provider-write path. Consumed or released provider commitments are
+terminal and cannot become active again. Active mode also rejects any planned
+or released order whose sealed production cartonization/rate evidence link is
+missing. The current slice does not expose the guarded plan-cancellation
+command needed to release abandoned inventory and packaging claims, so
+accepted real plans must not be cancelled through direct SQL.
 
 The selected carrier estimate, the immutable amount actually charged at
 checkout when available, and their signed variance remain separate facts.

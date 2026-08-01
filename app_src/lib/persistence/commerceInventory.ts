@@ -1532,6 +1532,33 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
     const projectedProductIds = projectedProducts.map(
       (level) => level.productId,
     )
+    const positionLockCandidates = await client.query<{ id: string }>(
+      `SELECT position.id::text
+       FROM operations_inventory_positions position
+       WHERE position.organization_id = $1::uuid
+         AND position.warehouse_id = $2::uuid
+         AND position.location_id = $3::uuid
+         AND position.pool_id = $4::uuid
+         AND position.lot_code = $5
+       ORDER BY position.id`,
+      [
+        input.runtime.organizationId,
+        input.target.warehouse.id,
+        input.target.location.id,
+        pool.rows[0].id,
+        INVENTORY_LOT_CODE,
+      ],
+    )
+    for (const position of positionLockCandidates.rows) {
+      await acquireTransactionAdvisoryLock(
+        client,
+        [
+          'operations:inventory-reservation',
+          input.runtime.organizationId,
+          position.id,
+        ].join(':'),
+      )
+    }
     const existing = await client.query<ExistingPositionRow>(
       `SELECT position.id::text, position.global_id,
               position.product_id::text,
@@ -1602,6 +1629,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
         AND position.id = reservation.position_id
        WHERE reservation.organization_id = $1::uuid
          AND reservation.status = 'active'
+         AND reservation.reservation_authority = 'local_balance'
          AND position.warehouse_id = $2::uuid
          AND position.location_id = $3::uuid
          AND position.pool_id = $4::uuid
@@ -1619,6 +1647,50 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
       persistenceError(
         'SHOPIFY_INVENTORY_LOCAL_RESERVATION_CONFLICT',
         'Shopify inventory cannot be reconciled while a ClawPilot reservation is active against the provider-owned balance',
+      )
+    }
+    const activeProviderCommitments = await client.query<{
+      position_id: string
+      product_id: string
+      active_claimed_quantity: string
+    }>(
+      `SELECT reservation.position_id::text,
+              position.product_id::text,
+              sum(reservation.quantity)::text AS active_claimed_quantity
+       FROM operations_reservations reservation
+       JOIN operations_inventory_positions position
+         ON position.organization_id = reservation.organization_id
+        AND position.id = reservation.position_id
+       WHERE reservation.organization_id = $1::uuid
+         AND reservation.status = 'active'
+         AND reservation.reservation_authority = 'provider_commitment'
+         AND position.warehouse_id = $2::uuid
+         AND position.location_id = $3::uuid
+         AND position.pool_id = $4::uuid
+         AND position.lot_code = $5
+       GROUP BY reservation.position_id, position.product_id
+       ORDER BY reservation.position_id`,
+      [
+        input.runtime.organizationId,
+        input.target.warehouse.id,
+        input.target.location.id,
+        pool.rows[0].id,
+        INVENTORY_LOT_CODE,
+      ],
+    )
+    const unsupportedProviderCommitment =
+      activeProviderCommitments.rows.find((claim) => (
+        decimal(claim.active_claimed_quantity)
+          > (
+            projectedByProduct.get(claim.product_id)
+              ?.operationalCommitted || 0
+          )
+      ))
+    if (unsupportedProviderCommitment) {
+      persistenceError(
+        'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT',
+        'The latest Shopify committed quantity does not cover active fulfillment commitments. Reconcile the affected order plans before retrying inventory sync.',
+        409,
       )
     }
     const existingByProduct = new Map(
