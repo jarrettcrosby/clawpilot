@@ -679,7 +679,7 @@ export async function completeShopifyInventoryRefreshJobInPostgres(input: {
     }>(
       `SELECT run.id::text, run.global_id, run.provider_fetched_at,
               run.completed_at,
-              attempt.created_at AS provider_attempt_created_at,
+              attempt.requested_at AS provider_attempt_created_at,
               capture.created_at AS provider_capture_created_at,
               run.levels_seen, run.levels_projected, run.provider_writes,
               run.order_quantity_adjustment::text

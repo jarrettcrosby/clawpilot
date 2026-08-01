@@ -136,6 +136,7 @@ includes(persistence, [
   'followUpRequired',
   'started_at = now()',
   'provider_attempt_created_at',
+  'attempt.requested_at AS provider_attempt_created_at',
   'provider_capture_created_at',
   'providerAttemptBeganAfterClaim',
   'providerEvidenceCapturedAfterClaim',
