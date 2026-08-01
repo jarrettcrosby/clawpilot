@@ -10,10 +10,12 @@ require_once 'modules/DynamicFields/DynamicField.php';
 require_once 'modules/DynamicFields/FieldCases.php';
 require_once 'modules/ModuleBuilder/parsers/ParserFactory.php';
 require_once 'modules/ModuleBuilder/parsers/parser.searchfields.php';
+require_once 'include/SugarObjects/VardefManager.php';
 require_once 'lib/Search/SearchModules.php';
 
 const CLAWPILOT_GLOBAL_ID_FIELD = 'global_id_c';
 const CLAWPILOT_GLOBAL_ID_LABEL = 'LBL_GLOBAL_ID';
+const CLAWPILOT_GLOBAL_ID_MIN_LENGTH = 32;
 const CLAWPILOT_NOTE_OCCURRED_AT_FIELD = 'occurred_at_c';
 const CLAWPILOT_NOTE_OCCURRED_AT_LABEL = 'LBL_OCCURRED_AT';
 const CLAWPILOT_PRODUCT_MODULE = 'AOS_Products';
@@ -141,7 +143,7 @@ function global_id_definition_is_current(array $definition, bool $unifiedSearch 
 {
     $fullText = $definition['full_text_search'] ?? null;
     $base = ($definition['vname'] ?? '') === CLAWPILOT_GLOBAL_ID_LABEL
-        && (int) ($definition['len'] ?? 0) >= 17
+        && (int) ($definition['len'] ?? 0) >= CLAWPILOT_GLOBAL_ID_MIN_LENGTH
         && !empty($definition['audited'])
         && !empty($definition['reportable']);
     if (!$base || !$unifiedSearch) {
@@ -150,6 +152,75 @@ function global_id_definition_is_current(array $definition, bool $unifiedSearch 
     return !empty($definition['unified_search'])
         && is_array($fullText)
         && !empty($fullText['enabled']);
+}
+
+function refresh_and_verify_global_id_field(string $module, bool $unifiedSearch): void
+{
+    $objectName = BeanFactory::getObjectName($module);
+    if (!is_string($objectName) || $objectName === '') {
+        throw new RuntimeException("SuiteCRM object name for {$module} is unavailable");
+    }
+
+    // DynamicField::addFieldObject() persists fields_meta_data and alters the
+    // custom table, then calls buildCache(). SuiteCRM's buildCache() only fills
+    // vardef keys that are not already present in this process. Without a full
+    // refresh, an older cached len therefore survives the successful ALTER and
+    // is written back to the vardef cache consumed by Api/V8/meta/fields.
+    VardefManager::clearVardef($module, $objectName);
+    unset($GLOBALS['dictionary'][$objectName]);
+    VardefManager::refreshVardefs($module, $objectName);
+
+    $hadReloadVardefs = array_key_exists('reload_vardefs', $GLOBALS);
+    $previousReloadVardefs = $GLOBALS['reload_vardefs'] ?? null;
+    $GLOBALS['reload_vardefs'] = true;
+    try {
+        $freshBean = BeanFactory::newBean($module);
+    } finally {
+        if ($hadReloadVardefs) {
+            $GLOBALS['reload_vardefs'] = $previousReloadVardefs;
+        } else {
+            unset($GLOBALS['reload_vardefs']);
+        }
+    }
+    if (!$freshBean) {
+        throw new RuntimeException("SuiteCRM module {$module} is unavailable after vardef refresh");
+    }
+
+    $definition = isset($freshBean->field_defs[CLAWPILOT_GLOBAL_ID_FIELD])
+        && is_array($freshBean->field_defs[CLAWPILOT_GLOBAL_ID_FIELD])
+        ? $freshBean->field_defs[CLAWPILOT_GLOBAL_ID_FIELD]
+        : [];
+    if (!global_id_definition_is_current($definition, $unifiedSearch)) {
+        $length = (int) ($definition['len'] ?? 0);
+        throw new RuntimeException(
+            "Global ID vardef for {$module} is stale after refresh (length {$length})"
+        );
+    }
+
+    $dynamic = new DynamicField($module);
+    $dynamic->setup($freshBean);
+    $persisted = $dynamic->getFieldWidget($module, CLAWPILOT_GLOBAL_ID_FIELD);
+    $persistedLength = $persisted ? (int) ($persisted->len ?? 0) : 0;
+    if (!$persisted || $persistedLength < CLAWPILOT_GLOBAL_ID_MIN_LENGTH) {
+        throw new RuntimeException(
+            "Global ID metadata for {$module} is not widened (length {$persistedLength})"
+        );
+    }
+
+    $tableName = $freshBean->table_name . '_cstm';
+    $columns = DBManagerFactory::getInstance()->get_columns($tableName);
+    $column = $columns[strtolower(CLAWPILOT_GLOBAL_ID_FIELD)] ?? [];
+    $columnLength = is_array($column) ? (int) ($column['len'] ?? 0) : 0;
+    if (
+        !is_array($column)
+        || !in_array(strtolower((string) ($column['type'] ?? '')), ['varchar', 'char'], true)
+        || $columnLength < CLAWPILOT_GLOBAL_ID_MIN_LENGTH
+    ) {
+        throw new RuntimeException(
+            "Global ID database column {$tableName}." . CLAWPILOT_GLOBAL_ID_FIELD
+            . " is not widened (length {$columnLength})"
+        );
+    }
 }
 
 function ensure_global_id_field(string $module, bool $unifiedSearch = true): void
@@ -167,14 +238,23 @@ function ensure_global_id_field(string $module, bool $unifiedSearch = true): voi
         : [];
     $existing = $dynamic->getFieldWidget($module, CLAWPILOT_GLOBAL_ID_FIELD);
 
-    if (!$existing || !global_id_definition_is_current($definition, $unifiedSearch)) {
+    if (
+        !$existing
+        || (int) ($existing->len ?? 0) < CLAWPILOT_GLOBAL_ID_MIN_LENGTH
+        || !global_id_definition_is_current($definition, $unifiedSearch)
+    ) {
         $field = $existing ?: get_widget('varchar');
+        $fieldLength = max(
+            CLAWPILOT_GLOBAL_ID_MIN_LENGTH,
+            (int) ($field->len ?? 0),
+            (int) ($definition['len'] ?? 0)
+        );
         $field->name = $existing ? CLAWPILOT_GLOBAL_ID_FIELD : 'global_id';
         $field->label = CLAWPILOT_GLOBAL_ID_LABEL;
         $field->vname = CLAWPILOT_GLOBAL_ID_LABEL;
         $field->label_value = 'Global ID';
-        $field->len = '32';
-        $field->size = '32';
+        $field->len = (string) $fieldLength;
+        $field->size = (string) $fieldLength;
         $field->required = false;
         $field->default = null;
         $field->default_value = null;
@@ -190,6 +270,7 @@ function ensure_global_id_field(string $module, bool $unifiedSearch = true): voi
         $field->save($dynamic);
     }
 
+    refresh_and_verify_global_id_field($module, $unifiedSearch);
     $dynamic->setLabel('en_us', CLAWPILOT_GLOBAL_ID_LABEL, 'Global ID');
     if ($unifiedSearch) {
         ensure_global_id_search_field($module);
