@@ -1813,10 +1813,64 @@ export async function GET() {
                 queued: number
                 retrying: number
                 dead: number
+                historical_dead: number
                 stale_processing: number
                 overdue: number
               }>(
-                `SELECT
+                `WITH catalog_jobs AS (
+                   SELECT job.*,
+                          EXISTS (
+                            SELECT 1
+                            FROM operations_integration_accounts account
+                            JOIN operations_commerce_credentials credential
+                              ON credential.organization_id = account.organization_id
+                             AND credential.integration_account_id = account.id
+                            JOIN operations_commerce_product_intake_policies policy
+                              ON policy.organization_id = account.organization_id
+                             AND policy.integration_account_id = account.id
+                            JOIN operations_activation_scopes activation
+                              ON activation.organization_id = account.organization_id
+                            WHERE account.organization_id = job.organization_id
+                              AND account.id = job.integration_account_id
+                              AND account.integration_type = 'commerce'
+                              AND account.provider = job.provider
+                              AND account.status <> 'error'
+                              AND account.commerce_credential_generation
+                                = job.credential_version
+                              AND credential.credential_version
+                                = job.credential_version
+                              AND credential.verification_status = 'verified'
+                              AND policy.policy_version
+                                = 'commerce-product-intake-policy-v1'
+                              AND policy.unmatched_action = 'auto_create'
+                              AND policy.revision = job.policy_revision
+                              AND activation.state IN ('shadow', 'active')
+                              AND (
+                                (
+                                  account.provider = 'shopify'
+                                  AND COALESCE(
+                                    account.configuration->'grantedScopes',
+                                    '[]'::jsonb
+                                  ) ?| ARRAY[
+                                    'read_products',
+                                    'write_products'
+                                  ]
+                                )
+                                OR (
+                                  account.provider = 'faire'
+                                  AND (
+                                    credential.auth_mode = 'faire_brand_token'
+                                    OR COALESCE(
+                                      account.configuration->'requestedScopes',
+                                      '[]'::jsonb
+                                    ) ? 'READ_PRODUCTS'
+                                  )
+                                )
+                              )
+                          ) AS authoritative
+                   FROM operations_commerce_catalog_sync_jobs job
+                 )
+                 SELECT
                    count(*) FILTER (
                      WHERE status = 'pending'
                    )::integer AS queued,
@@ -1824,8 +1878,11 @@ export async function GET() {
                      WHERE status = 'failed'
                    )::integer AS retrying,
                    count(*) FILTER (
-                     WHERE status = 'dead'
+                     WHERE status = 'dead' AND authoritative
                    )::integer AS dead,
+                   count(*) FILTER (
+                     WHERE status = 'dead'
+                   )::integer AS historical_dead,
                    count(*) FILTER (
                      WHERE status = 'processing'
                        AND locked_at < now() - interval '10 minutes'
@@ -1834,7 +1891,7 @@ export async function GET() {
                      WHERE status IN ('pending', 'failed')
                        AND available_at < now() - interval '5 minutes'
                    )::integer AS overdue
-                 FROM operations_commerce_catalog_sync_jobs`,
+                 FROM catalog_jobs`,
               )
             ).rows[0]
             const dead = Number(commerceQueue?.dead || 0)
@@ -1857,6 +1914,7 @@ export async function GET() {
               queued: Number(commerceQueue?.queued || 0),
               retrying: Number(commerceQueue?.retrying || 0),
               dead,
+              historicalDead: Number(commerceQueue?.historical_dead || 0),
               staleProcessing: stale,
               overdue,
             }

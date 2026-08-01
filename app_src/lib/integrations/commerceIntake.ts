@@ -43,6 +43,7 @@ import {
 } from '@/lib/persistence/commerceIntegrations'
 import {
   readCommerceOrderReconciliationStateInPostgres,
+  resetCommerceOrderReconciliationInPostgres,
 } from '@/lib/persistence/commerceOrderReconciliation'
 import {
   autoCreateCommerceProductsForRunInPostgres,
@@ -384,6 +385,7 @@ type IntakeCommandAction =
   | 'promote'
   | 'reconcile-checkout-rate'
   | 'refresh'
+  | 'reset-order-reconciliation'
   | 'retry-rejection'
   | 'resolve-catalog-product'
   | 'resolve-customer'
@@ -576,6 +578,7 @@ function action(value: unknown): IntakeCommandAction {
     'promote',
     'reconcile-checkout-rate',
     'refresh',
+    'reset-order-reconciliation',
     'retry-rejection',
     'resolve-catalog-product',
     'resolve-customer',
@@ -1759,6 +1762,73 @@ async function executeCommerceIntakeCommandInternal(
   assertCommerceIntakeRuntime()
   const commandAction = action(input.body.action)
   const key = idempotencyKey(input.body.idempotencyKey)
+  if (commandAction === 'reset-order-reconciliation') {
+    const organizationId = normalizeCommerceOrganizationId(
+      input.organizationId,
+    )
+    const accountGlobalId = normalizeCommerceAccountGlobalId(
+      input.body.accountGlobalId,
+    )
+    if (input.body.confirmResetOrderReconciliation !== true) {
+      throw new CommerceIntegrationRequestError(
+        'Confirm that the terminal order session will be retired before restarting',
+        400,
+        'COMMERCE_ORDER_RECONCILIATION_RESET_CONFIRMATION_REQUIRED',
+      )
+    }
+    const reason = optionalText(
+      input.body.orderReconciliationResetReason,
+      'Order reconciliation reset reason',
+      500,
+    )
+    if (!reason || reason.length < 10) {
+      throw new CommerceIntegrationRequestError(
+        'An order reconciliation reset reason of at least 10 characters is required',
+        400,
+        'COMMERCE_ORDER_RECONCILIATION_RESET_REASON_REQUIRED',
+      )
+    }
+    const expectedLastErrorCode = text(
+      input.body.expectedLastErrorCode,
+      'Expected order reconciliation error code',
+      128,
+    )
+    if (!/^[A-Z][A-Z0-9_]{2,127}$/u.test(expectedLastErrorCode)) {
+      throw new CommerceIntegrationRequestError(
+        'Expected order reconciliation error code is invalid',
+        400,
+        'COMMERCE_INTAKE_COMMAND_INVALID',
+      )
+    }
+    const expectedLastStartedAt = timestamp(
+      input.body.expectedLastStartedAt,
+      'Expected order reconciliation start time',
+    )
+    const command = await resetCommerceOrderReconciliationInPostgres({
+      organizationId,
+      accountGlobalId,
+      actorEmail: input.actorEmail,
+      idempotencyKey: key,
+      expectedLastErrorCode,
+      expectedLastStartedAt,
+      reason,
+      confirmReset: true,
+    })
+    const [intake, orderReconciliation] = await Promise.all([
+      readCommerceIntakeStateFromPostgres({
+        organizationId,
+        accountGlobalId,
+      }).catch(() => null),
+      readCommerceOrderReconciliationStateInPostgres({
+        organizationId,
+        accountGlobalId,
+      }).catch(() => null),
+    ])
+    return {
+      command,
+      intake: intake ? { ...intake, orderReconciliation } : null,
+    }
+  }
   if (commandAction === 'set-product-intake-policy') {
     const organizationId = normalizeCommerceOrganizationId(
       input.organizationId,
@@ -1788,6 +1858,40 @@ async function executeCommerceIntakeCommandInternal(
         'COMMERCE_PRODUCT_AUTO_CREATE_CONFIRMATION_REQUIRED',
       )
     }
+    const catalogSyncResetRequested = (
+      input.body.confirmCatalogSyncReset === true
+      || input.body.catalogSyncResetReason !== undefined
+    )
+    let catalogSyncResetReason: string | null = null
+    if (catalogSyncResetRequested) {
+      if (unmatchedAction !== 'auto_create') {
+        throw new CommerceIntegrationRequestError(
+          'A terminal catalog sync can only be restarted while automatic product creation remains on',
+          400,
+          'COMMERCE_CATALOG_SYNC_RESET_INVALID',
+        )
+      }
+      if (input.body.confirmCatalogSyncReset !== true) {
+        throw new CommerceIntegrationRequestError(
+          'Confirm that the terminal catalog evidence will be preserved and a fresh root reconciliation will start',
+          400,
+          'COMMERCE_CATALOG_SYNC_RESET_CONFIRMATION_REQUIRED',
+        )
+      }
+      const resetReason = optionalText(
+        input.body.catalogSyncResetReason,
+        'Catalog sync reset reason',
+        500,
+      )
+      if (!resetReason || resetReason.length < 10) {
+        throw new CommerceIntegrationRequestError(
+          'A catalog sync reset reason of at least 10 characters is required',
+          400,
+          'COMMERCE_CATALOG_SYNC_RESET_REASON_REQUIRED',
+        )
+      }
+      catalogSyncResetReason = resetReason
+    }
     const command = await updateCommerceProductIntakePolicyInPostgres({
       organizationId,
       accountGlobalId,
@@ -1799,6 +1903,9 @@ async function executeCommerceIntakeCommandInternal(
       unmatchedAction: unmatchedAction as 'review' | 'auto_create',
       confirmAutoCreateProducts:
         input.body.confirmAutoCreateProducts === true,
+      confirmCatalogSyncReset:
+        input.body.confirmCatalogSyncReset === true,
+      catalogSyncResetReason,
     })
     const intake = await readCommerceIntakeStateFromPostgres({
       organizationId,

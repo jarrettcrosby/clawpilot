@@ -307,6 +307,7 @@ type ProductCatalogSync = {
   productsSkipped?: number
   productsFailed?: number
   attemptCount?: number
+  sweepFailureCount?: number
   maxAttempts?: number
   availableAt?: string | null
   lastErrorCode?: string | null
@@ -320,6 +321,10 @@ type ProductCatalogSync = {
   providerWrites?: number
   ordersTouched?: number
   inventoryTouched?: number
+  terminalRecoveryRequired?: boolean
+  recoveryMode?: 'operator_policy_revision' | null
+  deadEvidencePreserved?: boolean
+  historicalTerminalEvidence?: boolean
 }
 
 type CommerceIntake = {
@@ -405,6 +410,7 @@ type CommerceIntake = {
     lastStartedAt: string | null
     lastCompletedAt: string | null
     resumable: boolean
+    resetRequired: boolean
     providerWrites: 0
     canonicalOrderWrites: 0
     inventoryWrites: 0
@@ -790,6 +796,9 @@ function catalogSyncDescription(
   provider: CommerceProvider,
 ) {
   if (!sync || sync.status === 'idle') {
+    if (sync?.historicalTerminalEvidence) {
+      return 'A previous terminal catalog failure remains retained as historical evidence. Its credential or policy fence is no longer current, so it does not block the current eligible reconciliation.'
+    }
     return 'This verified connection authorizes automatic read-only catalog sync. The initial backfill queues when product-read access, the development runtime, and the Operations product target are eligible; no second approval is required.'
   }
   if (sync.status === 'queued') {
@@ -827,9 +836,9 @@ function catalogSyncDescription(
     }.`
   }
   if (sync.status === 'dead') {
-    return `Automatic catalog sync stopped after repeated or permanent connection errors${
+    return `Automatic catalog sync is terminal after repeated or permanent errors${
       sync.lastErrorCode ? ` (${sync.lastErrorCode})` : ''
-    }. Repair the sales-channel connection. While sync remains resumed, ClawPilot rechecks eligibility and queues a fresh reconciliation when every worker fence passes.`
+    }. ClawPilot will not retry the same continuation. Repair the sales-channel connection or Operations eligibility if needed, then an authorized operator must explicitly start a fresh reconciliation. The terminal job and its error evidence remain preserved.`
   }
   return 'Automatic catalog sync is paused. Existing ClawPilot products and provider mappings are unchanged.'
 }
@@ -2383,6 +2392,43 @@ export default function CommerceIntakeWorkflow({
     )
   }
 
+  async function resetTerminalProductCatalogSync() {
+    if (
+      pendingAction
+      || !operatorCommandsAllowed
+      || !connectionReady
+      || !automaticProductCreationEnabled
+      || productCatalogSync?.status !== 'dead'
+      || productCatalogSync.terminalRecoveryRequired !== true
+    ) return
+    const errorCode = productCatalogSync.lastErrorCode || 'unknown error'
+    const confirmed = window.confirm(
+      `Start a fresh read-only ${providerLabel(provider)} catalog reconciliation after terminal error ${errorCode}? The failed job and its evidence will be preserved, and ClawPilot will start at the catalog root instead of retrying the old continuation.`,
+    )
+    if (!confirmed) return
+    const resetReason = window.prompt(
+      'Enter the audit reason for superseding this terminal catalog sweep.',
+      `Reviewed terminal catalog sync error ${errorCode}; eligibility is repaired and a fresh root reconciliation is authorized.`,
+    )?.trim()
+    if (!resetReason) return
+    if (resetReason.length < 10 || resetReason.length > 500) {
+      setError('Enter an audit reason between 10 and 500 characters.')
+      return
+    }
+    await postCommand(
+      'set-product-intake-policy',
+      `reset-product-catalog-sync:${productIntakePolicyRevision}:${errorCode}`,
+      {
+        expectedPolicyRevision: productIntakePolicyRevision,
+        unmatchedAction: 'auto_create',
+        confirmAutoCreateProducts: true,
+        confirmCatalogSyncReset: true,
+        catalogSyncResetReason: resetReason,
+      },
+      `A fresh read-only catalog reconciliation was queued for ${displayName}. The terminal job and its evidence were preserved; no order, inventory, or ${providerLabel(provider)} record was changed.`,
+    )
+  }
+
   async function createAllNewCatalogProducts() {
     if (
       pendingAction
@@ -3634,7 +3680,9 @@ export default function CommerceIntakeWorkflow({
                               orderReconciliation.lastErrorCode
                                 ? ` (${orderReconciliation.lastErrorCode})`
                                 : ''
-                            }. Review the verified connection and order-read scope, then return here; ClawPilot retries automatically.`
+                            }. ${orderReconciliation.resetRequired
+                              ? 'Review the connection and error, then explicitly restart automatic staging below. ClawPilot will not reuse the terminal continuation.'
+                              : 'ClawPilot will retry automatically after its bounded backoff; only persistent failures require operator action.'}`
                             : `ClawPilot is ready to check current ${providerLabel(provider)} orders automatically when the verified order-read scope and Operations Shadow or Active mode are available.`}
                     </Typography>
                   </Box>
@@ -3683,7 +3731,44 @@ export default function CommerceIntakeWorkflow({
                   create a shipment, or write back to the provider.
                 </Typography>
                 {orderReconciliation?.status === 'failed' ? (
-                  <Stack direction="row" spacing={1}>
+                  <Stack
+                    direction={{ xs: 'column', sm: 'row' }}
+                    spacing={1}
+                  >
+                    {orderReconciliation.resetRequired
+                      && orderReconciliation.lastErrorCode
+                      && orderReconciliation.lastStartedAt ? (
+                        <Button
+                          size="small"
+                          variant="contained"
+                          disabled={
+                            Boolean(pendingAction)
+                            || !operatorCommandsAllowed
+                          }
+                          onClick={() => void postCommand(
+                            'reset-order-reconciliation',
+                            `reset-order-reconciliation:${
+                              orderReconciliation.lastStartedAt
+                            }:${orderReconciliation.lastErrorCode}`,
+                            {
+                              confirmResetOrderReconciliation: true,
+                              expectedLastErrorCode:
+                                orderReconciliation.lastErrorCode,
+                              expectedLastStartedAt:
+                                orderReconciliation.lastStartedAt,
+                              orderReconciliationResetReason:
+                                'Operator reviewed the terminal read-only order staging failure and requested a fresh root session.',
+                            },
+                            'Automatic order staging was restarted with a fresh root session.',
+                          )}
+                        >
+                          {pendingAction.startsWith(
+                            'reset-order-reconciliation:',
+                          )
+                            ? 'Restarting…'
+                            : 'Restart automatic staging'}
+                        </Button>
+                      ) : null}
                     <Button
                       size="small"
                       variant="outlined"
@@ -4628,8 +4713,11 @@ export default function CommerceIntakeWorkflow({
                         reconciliation. Pause stops future provider reads and
                         automatic creation; resume makes the connection
                         eligible to queue again. Existing products and mappings
-                        remain unchanged while paused. ClawPilot never writes
-                        to {providerLabel(provider)} or changes an order.
+                        remain unchanged while paused. A terminal sweep is not
+                        retried by repairing eligibility alone; an authorized
+                        operator must explicitly start a fresh reconciliation.
+                        ClawPilot never writes to {providerLabel(provider)} or
+                        changes an order.
                       </Typography>
                       <Typography
                         variant="caption"
@@ -4689,6 +4777,47 @@ export default function CommerceIntakeWorkflow({
                     ? catalogSyncDescription(productCatalogSync, provider)
                     : futureProductBehaviorMessage}
                 </Alert>
+                {automaticProductCreationEnabled
+                && productCatalogSync?.terminalRecoveryRequired ? (
+                  <Stack
+                    direction={{ xs: 'column', sm: 'row' }}
+                    alignItems={{ sm: 'center' }}
+                    spacing={1}
+                  >
+                    <Button
+                      variant="contained"
+                      color="error"
+                      startIcon={(
+                        pendingAction.startsWith(
+                          'reset-product-catalog-sync:',
+                        )
+                          ? <CircularProgress size={16} color="inherit" />
+                          : <RefreshRounded />
+                      )}
+                      disabled={
+                        Boolean(pendingAction)
+                        || !operatorCommandsAllowed
+                        || !connectionReady
+                      }
+                      onClick={() => {
+                        void resetTerminalProductCatalogSync()
+                      }}
+                    >
+                      {pendingAction.startsWith(
+                        'reset-product-catalog-sync:',
+                      )
+                        ? 'Starting fresh…'
+                        : 'Start fresh reconciliation'}
+                    </Button>
+                    <Typography variant="caption" color="text.secondary">
+                      {!connectionReady
+                        ? `Reconnect and verify ${providerLabel(provider)} first. Repairing the connection does not itself restart this terminal sweep.`
+                        : !operatorCommandsAllowed
+                          ? 'Set Operations to Shadow or Active first. Repairing eligibility does not itself restart this terminal sweep.'
+                          : 'This confirmed action advances the policy fence, queues a new root read, and retains the terminal job as evidence.'}
+                    </Typography>
+                  </Stack>
+                  ) : null}
                 {automaticProductCreationEnabled && productCatalogSync ? (
                   <Stack direction="row" gap={0.75} flexWrap="wrap">
                     <Chip
@@ -4716,6 +4845,16 @@ export default function CommerceIntakeWorkflow({
                       variant="outlined"
                       label={`${productCatalogSync.productsUnchanged || 0} unchanged`}
                     />
+                    {productCatalogSync.status === 'dead' ? (
+                      <Chip
+                        size="small"
+                        color="error"
+                        variant="outlined"
+                        label={`Terminal failures ${
+                          productCatalogSync.sweepFailureCount || 0
+                        }/${productCatalogSync.maxAttempts || 0}`}
+                      />
+                    ) : null}
                     <Chip
                       size="small"
                       variant="outlined"

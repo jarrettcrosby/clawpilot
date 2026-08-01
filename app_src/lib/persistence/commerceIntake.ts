@@ -5502,7 +5502,45 @@ export async function updateCommerceProductIntakePolicyInPostgres(input: {
   expectedPolicyRevision: number
   unmatchedAction: 'review' | 'auto_create'
   confirmAutoCreateProducts: boolean
+  confirmCatalogSyncReset?: boolean
+  catalogSyncResetReason?: string | null
 }) {
+  const catalogSyncResetReason = typeof input.catalogSyncResetReason === 'string'
+    ? input.catalogSyncResetReason.trim()
+    : null
+  const catalogSyncResetRequested = (
+    input.confirmCatalogSyncReset === true
+    || input.catalogSyncResetReason !== null
+      && input.catalogSyncResetReason !== undefined
+  )
+  if (catalogSyncResetRequested) {
+    if (input.unmatchedAction !== 'auto_create') {
+      intakeError(
+        'COMMERCE_CATALOG_SYNC_RESET_INVALID',
+        'A terminal catalog sync can only be restarted while automatic product creation remains on',
+        400,
+      )
+    }
+    if (input.confirmCatalogSyncReset !== true) {
+      intakeError(
+        'COMMERCE_CATALOG_SYNC_RESET_CONFIRMATION_REQUIRED',
+        'Confirm that the terminal catalog evidence will be preserved and a fresh root reconciliation will start',
+        400,
+      )
+    }
+    if (
+      !catalogSyncResetReason
+      || catalogSyncResetReason.length < 10
+      || catalogSyncResetReason.length > 500
+      || /[\u0000-\u001f\u007f]/.test(catalogSyncResetReason)
+    ) {
+      intakeError(
+        'COMMERCE_CATALOG_SYNC_RESET_REASON_REQUIRED',
+        'A catalog sync reset reason of at least 10 characters is required',
+        400,
+      )
+    }
+  }
   return withTransaction(async (client) => {
     const accountResult = await client.query<{
       id: string
@@ -5536,6 +5574,8 @@ export async function updateCommerceProductIntakePolicyInPostgres(input: {
       expectedPolicyRevision: input.expectedPolicyRevision,
       unmatchedAction: input.unmatchedAction,
       confirmAutoCreateProducts: input.confirmAutoCreateProducts,
+      confirmCatalogSyncReset: input.confirmCatalogSyncReset === true,
+      catalogSyncResetReason,
     })
     const prepared = await prepareReceipt(client, {
       organizationId: input.organizationId,
@@ -5569,6 +5609,77 @@ export async function updateCommerceProductIntakePolicyInPostgres(input: {
         'The automatic product policy changed. Reload before saving it again.',
         409,
       )
+    }
+    const sameAction = Boolean(
+      currentPolicy
+      && currentPolicy.unmatched_action === input.unmatchedAction,
+    )
+    if (sameAction && !catalogSyncResetRequested) {
+      intakeError(
+        'COMMERCE_PRODUCT_INTAKE_POLICY_UNCHANGED',
+        'The automatic product policy is already set to that value',
+        409,
+      )
+    }
+    let terminalCatalogSync: {
+      id: string
+      last_error_code: string | null
+      continuation_run_global_id: string | null
+    } | null = null
+    if (catalogSyncResetRequested) {
+      if (
+        !sameAction
+        || currentPolicy?.unmatched_action !== 'auto_create'
+      ) {
+        intakeError(
+          'COMMERCE_CATALOG_SYNC_RESET_NOT_REQUIRED',
+          'There is no terminal catalog sync under the current automatic-product policy fence',
+          409,
+        )
+      }
+      terminalCatalogSync = (
+        await client.query<{
+          id: string
+          last_error_code: string | null
+          continuation_run_global_id: string | null
+        }>(
+          `SELECT job.id::text, job.last_error_code,
+                  job.continuation_run_global_id
+           FROM operations_commerce_catalog_sync_jobs job
+           WHERE job.organization_id = $1::uuid
+             AND job.integration_account_id = $2::uuid
+             AND job.provider = $3
+             AND job.credential_version = $4::integer
+             AND job.policy_revision = $5::integer
+             AND job.status = 'dead'
+             AND NOT EXISTS (
+               SELECT 1
+               FROM operations_commerce_catalog_sync_jobs active
+               WHERE active.organization_id = job.organization_id
+                 AND active.integration_account_id
+                   = job.integration_account_id
+                 AND active.status IN ('pending', 'processing', 'failed')
+             )
+           ORDER BY job.completed_at DESC NULLS LAST,
+                    job.created_at DESC, job.id DESC
+           LIMIT 1
+           FOR UPDATE OF job`,
+          [
+            input.organizationId,
+            account.id,
+            account.provider,
+            account.commerce_credential_generation,
+            currentRevision,
+          ],
+        )
+      ).rows[0] || null
+      if (!terminalCatalogSync) {
+        intakeError(
+          'COMMERCE_CATALOG_SYNC_RESET_NOT_REQUIRED',
+          'There is no terminal catalog sync under the current credential and policy fence',
+          409,
+        )
+      }
     }
     if (
       input.unmatchedAction === 'auto_create'
@@ -5669,11 +5780,30 @@ export async function updateCommerceProductIntakePolicyInPostgres(input: {
         actorEmail: input.actorEmail,
       },
     )
+    if (catalogSyncResetRequested && catalogSync.queued !== 1) {
+      intakeError(
+        'COMMERCE_CATALOG_SYNC_RESET_QUEUE_FAILED',
+        'Repair product-read access and Operations eligibility before starting a fresh catalog reconciliation',
+        409,
+      )
+    }
+    const catalogSyncReset = terminalCatalogSync
+      ? {
+          performed: true,
+          reason: catalogSyncResetReason,
+          previousErrorCode: terminalCatalogSync.last_error_code,
+          previousPolicyRevision: currentRevision,
+          policyRevision: nextRevision,
+          deadEvidencePreserved: true,
+          freshRootSession: true,
+        }
+      : null
     const result = {
       action: 'set-product-intake-policy',
       accountGlobalId: account.global_id,
       productIntake: policy,
       catalogSync,
+      catalogSyncReset,
       providerWrites: 0,
       syncCursorAdvanced: false,
       replayed: false,
@@ -5701,10 +5831,41 @@ export async function updateCommerceProductIntakePolicyInPostgres(input: {
         revision: nextRevision,
         catalogSyncQueued: catalogSync.queued,
         catalogSyncCancelled: catalogSync.cancelled,
+        catalogSyncReset: Boolean(catalogSyncReset),
+        deadEvidencePreserved: Boolean(catalogSyncReset),
         providerWrites: 0,
         syncCursorAdvanced: false,
       },
     }, client)
+    if (terminalCatalogSync && catalogSyncResetReason) {
+      await recordAuditEvent({
+        actor: input.actorEmail,
+        eventType: 'commerce.catalog.sync.reset',
+        aggregateType: 'operations.integration_account',
+        aggregateId: account.global_id,
+        organizationId: input.organizationId,
+        eventKey:
+          `commerce-catalog-sync-reset:${account.global_id}:${input.idempotencyKey}`,
+        payload: {
+          provider: account.provider,
+          credentialVersion: account.commerce_credential_generation,
+          previousPolicyRevision: currentRevision,
+          policyRevision: nextRevision,
+          terminalJobId: terminalCatalogSync.id,
+          previousErrorCode: terminalCatalogSync.last_error_code,
+          reason: catalogSyncResetReason,
+          deadEvidencePreserved: true,
+          previousContinuationPreserved: Boolean(
+            terminalCatalogSync.continuation_run_global_id,
+          ),
+          freshRootSession: true,
+          catalogSyncQueued: catalogSync.queued,
+          providerWrites: 0,
+          ordersTouched: 0,
+          inventoryTouched: 0,
+        },
+      }, client)
+    }
     return result
   })
 }

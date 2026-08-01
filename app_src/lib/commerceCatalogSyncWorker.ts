@@ -5,7 +5,12 @@ import {
   completeCommerceCatalogSyncPageInPostgres,
   failCommerceCatalogSyncJobInPostgres,
   queueAutomaticCommerceCatalogSyncsInPostgres,
+  type CommerceCatalogSyncJob,
 } from '@/lib/persistence/commerceCatalogSync'
+
+const MAX_CATALOG_SWEEP_PAGES = 1_000
+const MAX_CATALOG_SWEEP_PROVIDER_RECORDS = 50_000
+const MAX_CATALOG_SWEEP_DURATION_MS = 2 * 60 * 60 * 1_000
 
 function deterministicPageUuid(input: {
   jobId: string
@@ -41,6 +46,99 @@ function count(value: unknown) {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0
 }
 
+function catalogSweepError(code: string, message: string) {
+  const error = new Error(message) as Error & { code?: string }
+  error.code = code
+  return error
+}
+
+function sweepStartedAtMs(job: CommerceCatalogSyncJob) {
+  const startedAt = Date.parse(job.startedAt)
+  if (!Number.isFinite(startedAt)) {
+    throw catalogSweepError(
+      'COMMERCE_CATALOG_SYNC_STATE_INVALID',
+      'Catalog sweep start time is invalid',
+    )
+  }
+  return startedAt
+}
+
+export function assertCommerceCatalogSweepCanRead(
+  job: CommerceCatalogSyncJob,
+  nowMs = Date.now(),
+) {
+  if (job.pageCount >= MAX_CATALOG_SWEEP_PAGES) {
+    throw catalogSweepError(
+      'COMMERCE_CATALOG_SYNC_PAGE_LIMIT_EXCEEDED',
+      'Catalog sweep page limit was reached',
+    )
+  }
+  if (job.providerRecordsSeen >= MAX_CATALOG_SWEEP_PROVIDER_RECORDS) {
+    throw catalogSweepError(
+      'COMMERCE_CATALOG_SYNC_RECORD_LIMIT_EXCEEDED',
+      'Catalog sweep provider-record limit was reached',
+    )
+  }
+  if (nowMs - sweepStartedAtMs(job) >= MAX_CATALOG_SWEEP_DURATION_MS) {
+    throw catalogSweepError(
+      'COMMERCE_CATALOG_SYNC_DURATION_LIMIT_EXCEEDED',
+      'Catalog sweep duration limit was reached',
+    )
+  }
+}
+
+export function assertCommerceCatalogSweepPageWithinLimits(input: {
+  job: CommerceCatalogSyncJob
+  continuationRunGlobalId: string | null
+  hasNextBatch: boolean
+  providerRecordsSeen: number
+  nowMs?: number
+}) {
+  const nextPageCount = input.job.pageCount + 1
+  const nextProviderRecordsSeen = input.job.providerRecordsSeen
+    + count(input.providerRecordsSeen)
+  if (
+    nextPageCount > MAX_CATALOG_SWEEP_PAGES
+    || (input.hasNextBatch && nextPageCount >= MAX_CATALOG_SWEEP_PAGES)
+  ) {
+    throw catalogSweepError(
+      'COMMERCE_CATALOG_SYNC_PAGE_LIMIT_EXCEEDED',
+      'Catalog sweep cannot continue past its page limit',
+    )
+  }
+  if (
+    nextProviderRecordsSeen > MAX_CATALOG_SWEEP_PROVIDER_RECORDS
+    || (
+      input.hasNextBatch
+      && nextProviderRecordsSeen >= MAX_CATALOG_SWEEP_PROVIDER_RECORDS
+    )
+  ) {
+    throw catalogSweepError(
+      'COMMERCE_CATALOG_SYNC_RECORD_LIMIT_EXCEEDED',
+      'Catalog sweep cannot continue past its provider-record limit',
+    )
+  }
+  if (
+    (input.nowMs ?? Date.now()) - sweepStartedAtMs(input.job)
+      >= MAX_CATALOG_SWEEP_DURATION_MS
+  ) {
+    throw catalogSweepError(
+      'COMMERCE_CATALOG_SYNC_DURATION_LIMIT_EXCEEDED',
+      'Catalog sweep duration limit was reached',
+    )
+  }
+  if (
+    input.hasNextBatch
+    && input.continuationRunGlobalId
+    && input.continuationRunGlobalId === input.job.continuationRunGlobalId
+  ) {
+    throw catalogSweepError(
+      'COMMERCE_CATALOG_SYNC_CONTINUATION_REPEATED',
+      'Catalog sweep returned its current continuation handle',
+    )
+  }
+}
+
 export async function processCommerceCatalogSyncOutbox(input: {
   limit?: number
   workerId: string
@@ -58,6 +156,7 @@ export async function processCommerceCatalogSyncOutbox(input: {
   let jobsCancelled = 0
   for (const job of jobs) {
     try {
+      assertCommerceCatalogSweepCanRead(job)
       const response = await executeCommerceCatalogProductPage({
         organizationId: job.organizationId,
         accountGlobalId: job.accountGlobalId,
@@ -99,12 +198,19 @@ export async function processCommerceCatalogSyncOutbox(input: {
         invalid.code = 'COMMERCE_CATALOG_SYNC_CONTINUATION_MISSING'
         throw invalid
       }
+      const providerRecordsSeen = count(pagination.providerRowsSeen)
+      assertCommerceCatalogSweepPageWithinLimits({
+        job,
+        continuationRunGlobalId,
+        hasNextBatch,
+        providerRecordsSeen,
+      })
       const completion = await completeCommerceCatalogSyncPageInPostgres({
         job,
         continuationRunGlobalId,
         hasNextBatch,
         totals: {
-          providerRecordsSeen: count(pagination.providerRowsSeen),
+          providerRecordsSeen,
           productsCreated: count(automatic.created),
           productsMapped: count(automatic.mappedExisting),
           productsUnchanged: count(command.productVariantsPreserved),

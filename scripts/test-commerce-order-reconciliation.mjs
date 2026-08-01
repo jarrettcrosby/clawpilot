@@ -48,6 +48,17 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
     ...globals,
     require(specifier) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) return mocks[specifier]
+      if (specifier === '@/lib/integrations/commerceIntegrations') {
+        return {
+          CommerceIntegrationRequestError: class CommerceIntegrationRequestError extends Error {
+            constructor(message, status = 400, code = 'COMMERCE_REQUEST_INVALID') {
+              super(message)
+              this.status = status
+              this.code = code
+            }
+          },
+        }
+      }
       return nodeRequire(specifier)
     },
   }
@@ -78,11 +89,26 @@ includes(persistence, [
   "run.created_by = 'system:commerce-order-reconciliation'",
   'continuation_run_global_id',
   'continuation_idempotency_key',
+  'continuation_batch_number',
+  'records_seen',
+  'records_held',
+  "date_trunc('milliseconds', clock_timestamp())",
+  'projectCommerceOrderReconciliationPageInPostgres',
+  "run.created_by = 'system:commerce-order-reconciliation'",
+  'cursor.last_started_at = $3::timestamptz',
+  "cursor.last_started_at + interval '1 millisecond'",
+  'prior_intent.continuation_cursor_hash',
+  'COMMERCE_ORDER_RECONCILIATION_SESSION_RECORD_BUDGET_EXCEEDED',
+  'COMMERCE_ORDER_RECONCILIATION_RETRY_LIMIT_EXCEEDED',
+  'COMMERCE_INTAKE_READ_RESTART_REQUIRED',
+  "cursor.reconciliation_status IS DISTINCT FROM 'failed'",
   "active_intent.intent_state",
   'THEN 0',
-  'ELSE operations_commerce_sync_cursors.records_seen',
-  'ELSE operations_commerce_sync_cursors.records_held',
+  'durable_records_seen',
+  'durable_records_held',
   'readCommerceOrderReconciliationStateInPostgres',
+  'resetCommerceOrderReconciliationInPostgres',
+  "eventType: 'commerce.orders.reconciliation.reset'",
   'providerWrites: 0',
   'canonicalOrderWrites: 0',
   'inventoryWrites: 0',
@@ -130,7 +156,10 @@ const persistenceModule = loadTypeScriptModule(
                   credential_version: 2,
                   continuation_run_global_id: null,
                   continuation_idempotency_key: null,
+                  continuation_batch_number: null,
                   last_started_at: claimStartedAt,
+                  records_seen: '0',
+                  records_held: '0',
                 }],
               }
             },
@@ -152,6 +181,54 @@ assert.equal(
   claimedTargets[0].startedAt,
   claimStartedAt.toISOString(),
   'Claim mapping must use last_started_at returned by the sync cursor',
+)
+assert.equal(claimedTargets[0].recordsSeen, 0)
+assert.equal(claimedTargets[0].recordsHeld, 0)
+assert.equal(claimedTargets[0].continuationBatchNumber, null)
+
+let projectionSql = ''
+const renewedAt = new Date('2026-07-28T14:16:00.123Z')
+const projectionPersistenceModule = loadTypeScriptModule(
+  'app_src/lib/persistence/commerceOrderReconciliation.ts',
+  {
+    mocks: {
+      '@/lib/auditWriter': {
+        async recordAuditEvent() {},
+      },
+      '@/lib/persistence/postgres': {
+        async query(sql) {
+          projectionSql = sql
+          return {
+            rows: [{
+              last_started_at: renewedAt,
+              records_seen: '42',
+              records_held: '7',
+              batch_number: 3,
+              provider_cursor_repeated: false,
+            }],
+          }
+        },
+        async withTransaction() {
+          throw new Error('Page projection must be one compare-and-swap query')
+        },
+      },
+    },
+  },
+)
+const projectedPage = await projectionPersistenceModule
+  .projectCommerceOrderReconciliationPageInPostgres({
+    target: claimedTargets[0],
+    runGlobalId: 'gcir0000003',
+  })
+assert.equal(projectedPage.leaseLost, false)
+assert.equal(projectedPage.startedAt, renewedAt.toISOString())
+assert.equal(projectedPage.recordsSeen, 42)
+assert.equal(projectedPage.recordsHeld, 7)
+assert.equal(projectedPage.continuationBatchNumber, 3)
+assert.match(
+  projectionSql,
+  /run\.global_id = \$4[\s\S]*reconciliation_status = 'running'[\s\S]*last_started_at = \$3::timestamptz[\s\S]*last_started_at > clock_timestamp\(\)/,
+  'Durable page projection must compare-and-swap the exact still-live claim',
 )
 
 const healthQueries = []
@@ -250,8 +327,8 @@ const failurePersistenceModule = loadTypeScriptModule(
               return {
                 rowCount: 1,
                 rows: [{
-                  organization_id:
-                    '11111111-1111-4111-8111-111111111111',
+                  consecutive_failures: 1,
+                  last_error_code: values[3],
                 }],
               }
             },
@@ -268,6 +345,9 @@ const failureTarget = {
   provider: 'shopify',
   credentialVersion: 1,
   startedAt: '2026-07-27T12:00:00.000Z',
+  recordsSeen: 0,
+  recordsHeld: 0,
+  continuationBatchNumber: null,
   continuationRunGlobalId: null,
   continuationIdempotencyKey: null,
 }
@@ -301,7 +381,93 @@ assert.deepEqual(persistedFailureCodes, [
   'COMMERCE_ORDER_RECONCILIATION_CHECK_CONSTRAINT_FAILED',
 ])
 
+const terminalQueries = []
+const terminalAudits = []
+const terminalPersistenceModule = loadTypeScriptModule(
+  'app_src/lib/persistence/commerceOrderReconciliation.ts',
+  {
+    mocks: {
+      '@/lib/auditWriter': {
+        async recordAuditEvent(event) {
+          terminalAudits.push(event)
+        },
+      },
+      '@/lib/persistence/postgres': {
+        async withTransaction(callback) {
+          return callback({
+            async query(sql, values) {
+              terminalQueries.push({ sql, values })
+              if (sql.includes('UPDATE operations_commerce_sync_cursors')) {
+                return {
+                  rowCount: 1,
+                  rows: [{
+                    consecutive_failures: 1,
+                    last_error_code:
+                      'COMMERCE_ORDER_RECONCILIATION_PROVIDER_CURSOR_REPEATED',
+                  }],
+                }
+              }
+              if (sql.includes('UPDATE operations_commerce_intake_continuations')) {
+                return {
+                  rowCount: 1,
+                  rows: [{
+                    id: '33333333-3333-4333-8333-333333333333',
+                    session_id: '44444444-4444-4444-8444-444444444444',
+                    batch_number: 2,
+                  }],
+                }
+              }
+              throw new Error(`Unexpected terminal SQL: ${sql}`)
+            },
+          })
+        },
+      },
+    },
+  },
+)
+const terminalFailure = await terminalPersistenceModule
+  .failCommerceOrderReconciliationInPostgres({
+    target: failureTarget,
+    error: {
+      code: 'COMMERCE_ORDER_RECONCILIATION_PROVIDER_CURSOR_REPEATED',
+    },
+  })
+assert.equal(terminalFailure.terminal, true)
+assert.equal(terminalFailure.continuationTransition, 'invalid')
+assert.equal(terminalFailure.continuationsRetired, 1)
+const retirementQuery = terminalQueries.find(({ sql }) => (
+  sql.includes('UPDATE operations_commerce_intake_continuations')
+))
+assert.deepEqual(JSON.parse(JSON.stringify(retirementQuery.values)), [
+  failureTarget.organizationId,
+  failureTarget.integrationAccountId,
+  1,
+  'shopify',
+  'invalid',
+])
+assert.match(retirementQuery.sql, /cursor_state = \$5/)
+assert.match(retirementQuery.sql, /continuation\.provider = \$4/)
+assert.match(retirementQuery.sql, /credential_version = \$3::integer/)
+assert.equal(terminalAudits.length, 1)
+assert.equal(
+  terminalAudits[0].eventType,
+  'commerce.orders.reconciliation.terminal',
+)
+
 const workerSource = read('app_src/lib/commerceOrderReconciliationWorker.ts')
+includes(workerSource, [
+  'MAX_PAGES_PER_RECONCILIATION = 5',
+  "'CLAWPILOT_COMMERCE_ORDER_MAX_SESSION_PAGES'",
+  '2_000',
+  'MAX_PROVIDER_RECORDS_PER_RECONCILIATION = 250',
+  "'CLAWPILOT_COMMERCE_ORDER_MAX_SESSION_RECORDS'",
+  '100_000',
+  'MAX_RECONCILIATION_RUNTIME_MS = 180_000',
+  'COMMERCE_ORDER_RECONCILIATION_CONTINUATION_REPEATED',
+  'COMMERCE_ORDER_RECONCILIATION_PROVIDER_CURSOR_REPEATED',
+  'COMMERCE_ORDER_RECONCILIATION_PAGE_SEQUENCE_INVALID',
+  'projectCommerceOrderReconciliationPageInPostgres',
+], 'Bounded order reconciliation worker')
 assert.ok(
   workerSource.includes('never promotes canonical orders, derives packages or shipments'),
   'Order reconciliation must remain package-agnostic and preserve held source quantities',
@@ -312,7 +478,21 @@ includes(intakeSource, [
   "action: input.continuationRunGlobalId ? 'fetch-next' : 'fetch'",
   'includeIntakeState: false',
   'hydrateProductInventory: false',
+  "| 'reset-order-reconciliation'",
+  'confirmResetOrderReconciliation',
+  'expectedLastErrorCode',
+  'expectedLastStartedAt',
+  'resetCommerceOrderReconciliationInPostgres',
 ], 'Order-page execution path')
+const intakeWorkflowSource = read(
+  'app_src/components/settings/CommerceIntakeWorkflow.tsx',
+)
+includes(intakeWorkflowSource, [
+  'resetRequired: boolean',
+  "'reset-order-reconciliation'",
+  'Restart automatic staging',
+  'ClawPilot will not reuse the terminal continuation.',
+], 'Order-reconciliation operator recovery')
 assert.ok(
   !intakeSource.includes('updatedAtMin: page.windowStart')
     && !intakeSource.includes('initialWindowStart'),
@@ -360,6 +540,8 @@ const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWork
                 syncCursorAdvanced: false,
               },
               pagination: {
+                batchNumber: 1,
+                runGlobalId: 'gcir0000001',
                 providerRowsSeen: 4,
                 hasNextBatch: true,
                 continuationRunGlobalId: 'gcir0000001',
@@ -389,6 +571,8 @@ const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWork
               syncCursorAdvanced: false,
             },
             pagination: {
+              batchNumber: 2,
+              runGlobalId: 'gcir0000002',
               providerRowsSeen: 2,
               hasNextBatch: false,
               windowEnd: '2026-07-27T12:00:01.000Z',
@@ -407,6 +591,9 @@ const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWork
           provider: 'faire',
           credentialVersion: 1,
           startedAt: '2026-07-27T12:00:00.000Z',
+          recordsSeen: 0,
+          recordsHeld: 0,
+          continuationBatchNumber: null,
           continuationRunGlobalId: null,
           continuationIdempotencyKey: null,
         }]
@@ -414,6 +601,18 @@ const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWork
       async completeCommerceOrderReconciliationInPostgres(input) {
         trace.complete.push(input)
         return { leaseLost: false }
+      },
+      async projectCommerceOrderReconciliationPageInPostgres({ target }) {
+        return {
+          leaseLost: false,
+          startedAt: new Date(
+            Date.parse(target.startedAt) + 1_000,
+          ).toISOString(),
+          recordsSeen: page === 1 ? 4 : 6,
+          recordsHeld: page === 1 ? 4 : 6,
+          continuationBatchNumber: page,
+          providerCursorRepeated: false,
+        }
       },
       async failCommerceOrderReconciliationInPostgres(input) {
         trace.failed.push(input)
@@ -485,6 +684,8 @@ const recoveredWorker = loadTypeScriptModule(
               ordersStaged: 1,
               recordsRejected: 0,
               pagination: {
+                batchNumber: 2,
+                runGlobalId: 'gcir0000100',
                 providerRowsSeen: 1,
                 hasNextBatch: false,
               },
@@ -496,6 +697,7 @@ const recoveredWorker = loadTypeScriptModule(
         async claimCommerceOrderReconciliationTargetsInPostgres() {
           return [{
             ...failureTarget,
+            continuationBatchNumber: 1,
             continuationRunGlobalId: 'gcir0000099',
             continuationIdempotencyKey: recoveredIntentKey,
           }]
@@ -503,6 +705,18 @@ const recoveredWorker = loadTypeScriptModule(
         async completeCommerceOrderReconciliationInPostgres() {
           recoveredTrace.complete += 1
           return { leaseLost: false }
+        },
+        async projectCommerceOrderReconciliationPageInPostgres({ target }) {
+          return {
+            leaseLost: false,
+            startedAt: new Date(
+              Date.parse(target.startedAt) + 1_000,
+            ).toISOString(),
+            recordsSeen: 1,
+            recordsHeld: 1,
+            continuationBatchNumber: 2,
+            providerCursorRepeated: false,
+          }
         },
         async failCommerceOrderReconciliationInPostgres() {
           recoveredTrace.failed += 1
@@ -522,6 +736,247 @@ assert.equal(recoveredTrace.complete, 1)
 assert.equal(recoveredTrace.failed, 0)
 assert.equal(recovered.staged, 1)
 assert.equal(recovered.providerWrites, 0)
+
+const boundedTrace = { pages: 0, complete: [], failed: [] }
+const boundedWorker = loadTypeScriptModule(
+  'app_src/lib/commerceOrderReconciliationWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceIntake': {
+        commerceIntakeRuntimeAvailable: () => true,
+        async executeCommerceOrderPage() {
+          boundedTrace.pages += 1
+          const batchNumber = boundedTrace.pages
+          return {
+            command: {
+              providerWrites: 0,
+              syncCursorAdvanced: false,
+              ordersStaged: 0,
+              recordsRejected: 0,
+              pagination: {
+                batchNumber,
+                runGlobalId: `gcir00001${String(batchNumber).padStart(2, '0')}`,
+                providerRowsSeen: 50,
+                hasNextBatch: true,
+                continuationRunGlobalId:
+                  `gcir00001${String(batchNumber).padStart(2, '0')}`,
+              },
+            },
+          }
+        },
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async claimCommerceOrderReconciliationTargetsInPostgres() {
+          return [{ ...failureTarget, provider: 'faire' }]
+        },
+        async projectCommerceOrderReconciliationPageInPostgres({ target }) {
+          return {
+            leaseLost: false,
+            startedAt: new Date(
+              Date.parse(target.startedAt) + 1_000,
+            ).toISOString(),
+            recordsSeen: boundedTrace.pages * 50,
+            recordsHeld: 0,
+            continuationBatchNumber: boundedTrace.pages,
+            providerCursorRepeated: false,
+          }
+        },
+        async completeCommerceOrderReconciliationInPostgres(input) {
+          boundedTrace.complete.push(input)
+          return { leaseLost: false }
+        },
+        async failCommerceOrderReconciliationInPostgres(input) {
+          boundedTrace.failed.push(input)
+          return { leaseLost: false, errorCode: input.error.code }
+        },
+      },
+    },
+  },
+)
+const boundedSummary = await boundedWorker
+  .processCommerceOrderReconciliation({ limit: 1 })
+assert.equal(boundedTrace.pages, 5)
+assert.equal(boundedTrace.complete.length, 1)
+assert.equal(boundedTrace.complete[0].hasNextBatch, true)
+assert.equal(boundedTrace.failed.length, 0)
+assert.equal(boundedSummary.pagesRead, 5)
+assert.equal(boundedSummary.resumable, 1)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(boundedSummary.budgetStops)),
+  { pages: 1, records: 0, time: 0 },
+  'A long chain must yield its encrypted continuation at the page budget',
+)
+
+const timeTrace = { pages: 0, complete: [] }
+const timeWorker = loadTypeScriptModule(
+  'app_src/lib/commerceOrderReconciliationWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceIntake': {
+        commerceIntakeRuntimeAvailable: () => true,
+        async executeCommerceOrderPage() {
+          timeTrace.pages += 1
+          return {
+            command: {
+              providerWrites: 0,
+              syncCursorAdvanced: false,
+              ordersStaged: 0,
+              recordsRejected: 0,
+              pagination: {
+                batchNumber: 1,
+                runGlobalId: 'gcir0000201',
+                providerRowsSeen: 1,
+                hasNextBatch: true,
+                continuationRunGlobalId: 'gcir0000201',
+              },
+            },
+          }
+        },
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async claimCommerceOrderReconciliationTargetsInPostgres() {
+          return [{ ...failureTarget, provider: 'faire' }]
+        },
+        async projectCommerceOrderReconciliationPageInPostgres() {
+          return {
+            leaseLost: false,
+            startedAt: '2026-07-27T12:00:01.000Z',
+            recordsSeen: 1,
+            recordsHeld: 0,
+            continuationBatchNumber: 1,
+            providerCursorRepeated: false,
+          }
+        },
+        async completeCommerceOrderReconciliationInPostgres(input) {
+          timeTrace.complete.push(input)
+          return { leaseLost: false }
+        },
+        async failCommerceOrderReconciliationInPostgres(input) {
+          return { leaseLost: false, errorCode: input.error.code }
+        },
+      },
+    },
+  },
+)
+let clockCalls = 0
+const timeSummary = await timeWorker.processCommerceOrderReconciliation({
+  limit: 1,
+  clock: () => clockCalls++ === 0 ? 0 : 150_000,
+})
+assert.equal(timeTrace.pages, 1)
+assert.equal(timeTrace.complete[0].hasNextBatch, true)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(timeSummary.budgetStops)),
+  { pages: 0, records: 0, time: 1 },
+  'A near-deadline worker must persist its continuation without another read',
+)
+
+const repeatedTrace = { pages: 0, failureCode: null }
+const repeatedWorker = loadTypeScriptModule(
+  'app_src/lib/commerceOrderReconciliationWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceIntake': {
+        commerceIntakeRuntimeAvailable: () => true,
+        async executeCommerceOrderPage() {
+          repeatedTrace.pages += 1
+          const first = repeatedTrace.pages === 1
+          return {
+            command: {
+              providerWrites: 0,
+              syncCursorAdvanced: false,
+              ordersStaged: 0,
+              recordsRejected: 0,
+              pagination: {
+                batchNumber: first ? 1 : 2,
+                runGlobalId: first ? 'gcir0000301' : 'gcir0000302',
+                providerRowsSeen: 1,
+                hasNextBatch: true,
+                continuationRunGlobalId: 'gcir0000301',
+              },
+            },
+          }
+        },
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async claimCommerceOrderReconciliationTargetsInPostgres() {
+          return [{ ...failureTarget, provider: 'faire' }]
+        },
+        async projectCommerceOrderReconciliationPageInPostgres({ target }) {
+          return {
+            leaseLost: false,
+            startedAt: new Date(
+              Date.parse(target.startedAt) + 1_000,
+            ).toISOString(),
+            recordsSeen: repeatedTrace.pages,
+            recordsHeld: 0,
+            continuationBatchNumber: repeatedTrace.pages,
+            providerCursorRepeated: false,
+          }
+        },
+        async completeCommerceOrderReconciliationInPostgres() {
+          throw new Error('Repeated continuation must fail closed')
+        },
+        async failCommerceOrderReconciliationInPostgres(input) {
+          repeatedTrace.failureCode = input.error.code
+          return { leaseLost: false, errorCode: input.error.code }
+        },
+      },
+    },
+  },
+)
+const repeatedSummary = await repeatedWorker
+  .processCommerceOrderReconciliation({ limit: 1 })
+assert.equal(repeatedTrace.pages, 2)
+assert.equal(
+  repeatedTrace.failureCode,
+  'COMMERCE_ORDER_RECONCILIATION_CONTINUATION_REPEATED',
+)
+assert.deepEqual(
+  { ...repeatedSummary.failureCodes },
+  { COMMERCE_ORDER_RECONCILIATION_CONTINUATION_REPEATED: 1 },
+)
+
+let oversizedProviderCalls = 0
+const oversizedWorker = loadTypeScriptModule(
+  'app_src/lib/commerceOrderReconciliationWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceIntake': {
+        commerceIntakeRuntimeAvailable: () => true,
+        async executeCommerceOrderPage() {
+          oversizedProviderCalls += 1
+          throw new Error('The terminal budget must stop before provider I/O')
+        },
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async claimCommerceOrderReconciliationTargetsInPostgres() {
+          return [{
+            ...failureTarget,
+            provider: 'faire',
+            recordsSeen: 100_000,
+            continuationBatchNumber: 1_999,
+            continuationRunGlobalId: 'gcir0000405',
+          }]
+        },
+        async completeCommerceOrderReconciliationInPostgres() {
+          throw new Error('Terminal session budget must not complete')
+        },
+        async failCommerceOrderReconciliationInPostgres(input) {
+          return { leaseLost: false, errorCode: input.error.code }
+        },
+      },
+    },
+  },
+)
+const oversizedSummary = await oversizedWorker
+  .processCommerceOrderReconciliation({ limit: 1 })
+assert.equal(oversizedProviderCalls, 0)
+assert.deepEqual(
+  { ...oversizedSummary.failureCodes },
+  { COMMERCE_ORDER_RECONCILIATION_SESSION_RECORD_BUDGET_EXCEEDED: 1 },
+  'An oversized session must enter a deterministic terminal state',
+)
 
 const failedWorker = loadTypeScriptModule(
   'app_src/lib/commerceOrderReconciliationWorker.ts',

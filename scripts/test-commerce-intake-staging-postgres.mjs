@@ -380,9 +380,38 @@ function loadCommerceOrderReconciliationPersistence(pool) {
     'app_src/lib/persistence/commerceOrderReconciliation.ts',
     {
       '@/lib/auditWriter': {
-        async recordAuditEvent() {},
+        async recordAuditEvent(input, client) {
+          assert.ok(client, 'Reconciliation audit must share its transaction')
+          await client.query(
+            `INSERT INTO audit_events (
+               actor, event_type, aggregate_type, aggregate_id, payload,
+               event_key, subject, organization_id, is_system
+             ) VALUES (
+               $1, $2, $3, $4, $5::jsonb, $6, $7, $8::uuid, $9
+             )
+             ON CONFLICT (event_key) WHERE event_key IS NOT NULL DO NOTHING`,
+            [
+              input.actor || null,
+              input.eventType,
+              input.aggregateType || null,
+              input.aggregateId || null,
+              JSON.stringify(input.payload || {}),
+              input.eventKey || null,
+              input.subject || input.actor || null,
+              input.organizationId || null,
+              input.isSystem === true,
+            ],
+          )
+        },
+      },
+      '@/lib/integrations/commerceIntegrations': {
+        CommerceIntegrationRequestError,
       },
       '@/lib/persistence/postgres': {
+        acquireTransactionAdvisoryLock: (client, key) => client.query(
+          'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
+          [key],
+        ),
         async query(sql, values) {
           return pool.query(sql, values)
         },
@@ -1208,6 +1237,24 @@ async function verifyAcceptance(databaseUrl) {
     continuation.global_id,
   )
   assert.equal(recoveryTargets[0].continuationIdempotencyKey, recoveryKey)
+  assert.equal(
+    recoveryTargets[0].recordsSeen,
+    6,
+    'Crash recovery must derive records seen from immutable session pages',
+  )
+  assert.equal(
+    recoveryTargets[0].recordsHeld,
+    6,
+    'Crash recovery must derive held records from staged session evidence',
+  )
+  assert.equal(recoveryTargets[0].continuationBatchNumber, 1)
+  const competingTargets = await recoveryPersistence
+    .claimCommerceOrderReconciliationTargetsInPostgres({ limit: 1 })
+  assert.equal(
+    competingTargets.length,
+    0,
+    'A second worker must not steal a live reconciliation lease',
+  )
 
   const recoveryRuntime = {
     organizationId: ids.organization,
@@ -1465,6 +1512,215 @@ async function verifyAcceptance(databaseUrl) {
     0,
     'Policy-drift recovery must not call the provider',
   )
+
+  const projectedRecoveryPage = await recoveryPersistence
+    .projectCommerceOrderReconciliationPageInPostgres({
+      target: recoveryTargets[0],
+      runGlobalId: continuation.global_id,
+    })
+  assert.equal(projectedRecoveryPage.leaseLost, false)
+  assert.equal(projectedRecoveryPage.recordsSeen, 6)
+  assert.equal(projectedRecoveryPage.recordsHeld, 6)
+  assert.equal(projectedRecoveryPage.continuationBatchNumber, 1)
+  assert.equal(projectedRecoveryPage.providerCursorRepeated, false)
+  assert.ok(
+    projectedRecoveryPage.startedAt > recoveryTargets[0].startedAt,
+    'Page projection must advance the exact lease token monotonically',
+  )
+  const staleProjection = await recoveryPersistence
+    .projectCommerceOrderReconciliationPageInPostgres({
+      target: recoveryTargets[0],
+      runGlobalId: continuation.global_id,
+    })
+  assert.equal(
+    staleProjection.leaseLost,
+    true,
+    'The pre-projection lease owner must lose its stale compare-and-swap',
+  )
+
+  const terminalPreparationClient = await pool.connect()
+  try {
+    await terminalPreparationClient.query(
+      'SET session_replication_role = replica',
+    )
+    await terminalPreparationClient.query(
+      `INSERT INTO crm_reference_registry (
+         reference_code, prefix, canonical_code, status, entity_type
+       ) VALUES (
+         'gia0009201', 'gia', 'gia0009201', 'active',
+         'operations.integration_account'
+       ) ON CONFLICT (reference_code) DO NOTHING`,
+    )
+    await terminalPreparationClient.query(
+      `UPDATE operations_commerce_intake_continuations
+       SET cursor_state = 'available',
+           cursor_ciphertext = $2,
+           cursor_iv = $3,
+           cursor_tag = $4,
+           cursor_hash = $5,
+           encryption_version = 1
+       WHERE id = $1`,
+      [
+        continuation.id,
+        Buffer.from('terminal-cursor'),
+        Buffer.alloc(12, 9),
+        Buffer.alloc(16, 10),
+        cursorHash,
+      ],
+    )
+    await terminalPreparationClient.query(
+      `UPDATE operations_commerce_sync_cursors
+       SET consecutive_failures = 7
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND resource = 'orders'`,
+      [ids.organization, ids.integrationAccount],
+    )
+  } finally {
+    await terminalPreparationClient.query(
+      'SET session_replication_role = origin',
+    ).catch(() => {})
+    terminalPreparationClient.release()
+  }
+
+  const projectedTarget = {
+    ...recoveryTargets[0],
+    startedAt: projectedRecoveryPage.startedAt,
+    recordsSeen: projectedRecoveryPage.recordsSeen,
+    recordsHeld: projectedRecoveryPage.recordsHeld,
+    continuationBatchNumber:
+      projectedRecoveryPage.continuationBatchNumber,
+  }
+  const terminalFailure = await recoveryPersistence
+    .failCommerceOrderReconciliationInPostgres({
+      target: projectedTarget,
+      error: { code: 'COMMERCE_ORDER_RECONCILIATION_FAILED' },
+    })
+  assert.equal(terminalFailure.leaseLost, false)
+  assert.equal(terminalFailure.terminal, true)
+  assert.equal(
+    terminalFailure.errorCode,
+    'COMMERCE_ORDER_RECONCILIATION_RETRY_LIMIT_EXCEEDED',
+  )
+  assert.equal(terminalFailure.consecutiveFailures, 8)
+  assert.equal(terminalFailure.continuationTransition, 'superseded')
+  assert.equal(terminalFailure.continuationsRetired, 1)
+  const terminalEvidence = await pool.query(
+    `SELECT
+       cursor.reconciliation_status, cursor.records_seen::text,
+       cursor.records_held::text, cursor.consecutive_failures,
+       cursor.last_error_code,
+       continuation.cursor_state,
+       continuation.cursor_ciphertext IS NULL AS cursor_ciphertext_cleared,
+       continuation.cursor_hash IS NULL AS cursor_hash_cleared,
+       (SELECT count(*)::integer
+        FROM audit_events audit
+        WHERE audit.organization_id = cursor.organization_id
+          AND audit.event_type =
+              'commerce.orders.reconciliation.terminal') AS audit_count
+     FROM operations_commerce_sync_cursors cursor
+     JOIN operations_commerce_intake_continuations continuation
+       ON continuation.organization_id = cursor.organization_id
+      AND continuation.integration_account_id
+          = cursor.integration_account_id
+      AND continuation.id = $3::uuid
+     WHERE cursor.organization_id = $1::uuid
+       AND cursor.integration_account_id = $2::uuid
+       AND cursor.resource = 'orders'`,
+    [ids.organization, ids.integrationAccount, continuation.id],
+  )
+  assert.deepEqual(terminalEvidence.rows[0], {
+    reconciliation_status: 'failed',
+    records_seen: '6',
+    records_held: '6',
+    consecutive_failures: 8,
+    last_error_code: 'COMMERCE_ORDER_RECONCILIATION_RETRY_LIMIT_EXCEEDED',
+    cursor_state: 'superseded',
+    cursor_ciphertext_cleared: true,
+    cursor_hash_cleared: true,
+    audit_count: 1,
+  })
+
+  const resetKey = randomUUID()
+  const resetReason = (
+    'Acceptance operator reviewed the terminal order read and requested '
+    + 'a fresh root session.'
+  )
+  const resetResult = await recoveryPersistence
+    .resetCommerceOrderReconciliationInPostgres({
+      organizationId: ids.organization,
+      accountGlobalId: 'gia0009201',
+      actorEmail,
+      idempotencyKey: resetKey,
+      expectedLastErrorCode:
+        'COMMERCE_ORDER_RECONCILIATION_RETRY_LIMIT_EXCEEDED',
+      expectedLastStartedAt: projectedRecoveryPage.startedAt,
+      reason: resetReason,
+      confirmReset: true,
+    })
+  assert.equal(resetResult.replayed, false)
+  assert.equal(resetResult.status, 'idle')
+  assert.equal(resetResult.freshRootSession, true)
+  assert.equal(resetResult.previousRecordsSeen, 6)
+  assert.equal(resetResult.previousRecordsHeld, 6)
+  assert.equal(resetResult.previousConsecutiveFailures, 8)
+  const resetReplay = await recoveryPersistence
+    .resetCommerceOrderReconciliationInPostgres({
+      organizationId: ids.organization,
+      accountGlobalId: 'gia0009201',
+      actorEmail,
+      idempotencyKey: resetKey,
+      expectedLastErrorCode:
+        'COMMERCE_ORDER_RECONCILIATION_RETRY_LIMIT_EXCEEDED',
+      expectedLastStartedAt: projectedRecoveryPage.startedAt,
+      reason: resetReason,
+      confirmReset: true,
+    })
+  assert.equal(resetReplay.replayed, true)
+  const resetEvidence = await pool.query(
+    `SELECT
+       cursor.reconciliation_status, cursor.records_seen::text,
+       cursor.records_held::text, cursor.consecutive_failures,
+       cursor.last_error_code, cursor.last_started_at,
+       receipt.status AS receipt_status, receipt.attempts,
+       audit.actor, audit.payload->>'reason' AS reason,
+       audit.payload->>'previousErrorCode' AS previous_error_code
+     FROM operations_commerce_sync_cursors cursor
+     JOIN operations_command_receipts receipt
+       ON receipt.organization_id = cursor.organization_id
+      AND receipt.command_type =
+          'commerce.orders.reconciliation.reset'
+      AND receipt.idempotency_key = $3
+     JOIN audit_events audit
+       ON audit.organization_id = cursor.organization_id
+      AND audit.event_type = 'commerce.orders.reconciliation.reset'
+     WHERE cursor.organization_id = $1::uuid
+       AND cursor.integration_account_id = $2::uuid
+       AND cursor.resource = 'orders'`,
+    [ids.organization, ids.integrationAccount, resetKey],
+  )
+  assert.deepEqual(resetEvidence.rows[0], {
+    reconciliation_status: 'idle',
+    records_seen: '0',
+    records_held: '0',
+    consecutive_failures: 0,
+    last_error_code: null,
+    last_started_at: null,
+    receipt_status: 'succeeded',
+    attempts: 1,
+    actor: actorEmail,
+    reason: resetReason,
+    previous_error_code:
+      'COMMERCE_ORDER_RECONCILIATION_RETRY_LIMIT_EXCEEDED',
+  })
+  const freshRootTargets = await recoveryPersistence
+    .claimCommerceOrderReconciliationTargetsInPostgres({ limit: 1 })
+  assert.equal(freshRootTargets.length, 1)
+  assert.equal(freshRootTargets[0].continuationRunGlobalId, null)
+  assert.equal(freshRootTargets[0].continuationBatchNumber, null)
+  assert.equal(freshRootTargets[0].recordsSeen, 0)
+  assert.equal(freshRootTargets[0].recordsHeld, 0)
+
   await verifyPromotionNumericScaleAcceptance(
     pool,
     ids,

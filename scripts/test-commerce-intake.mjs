@@ -193,6 +193,14 @@ includes(catalogSyncPersistenceSource, [
   'FOR UPDATE OF job SKIP LOCKED',
   "const CATALOG_SYNC_LEASE = '10 minutes'",
   'attempt_count = 0',
+  'sweepFailureCount',
+  'commerceCatalogSweepFailureState',
+  'COMMERCE_CATALOG_SYNC_PAGE_LIMIT_EXCEEDED',
+  'COMMERCE_CATALOG_SYNC_RECORD_LIMIT_EXCEEDED',
+  'COMMERCE_CATALOG_SYNC_DURATION_LIMIT_EXCEEDED',
+  'COMMERCE_CATALOG_SYNC_CONTINUATION_REPEATED',
+  "terminal.status = 'dead'",
+  "recent.status = 'succeeded'",
   'read_generation = read_generation',
   'products_unchanged = products_unchanged',
   'power(2, LEAST(attempt_count, 8))',
@@ -204,10 +212,25 @@ includes(catalogSyncPersistenceSource, [
   'dead',
   'lastSuccessAt',
   'nextRunAt',
+  'terminalRecoveryRequired',
+  "recoveryMode: status === 'dead'",
+  "'operator_policy_revision'",
+  'deadEvidencePreserved',
+  'historicalTerminalEvidence',
+  'authoritativeFence',
   'providerWrites: 0',
   'ordersTouched: 0',
   'inventoryTouched: 0',
 ], 'Commerce catalog-sync persistence')
+assert.equal(
+  (
+    catalogSyncPersistenceSource.match(/terminal\.status = 'dead'/g)
+    || []
+  ).length,
+  2,
+  'Policy application and recurring queueing must not resurrect a dead sweep '
+    + 'under the same credential and policy fence',
+)
 assert.equal(
   (
     catalogSyncPersistenceSource.match(
@@ -217,6 +240,24 @@ assert.equal(
   6,
   'Product-read eligibility must gate policy application, stale-job fencing, '
     + 'recurring queueing, claiming, and the completion fence',
+)
+const catalogPolicyApplicationSource = catalogSyncPersistenceSource.slice(
+  catalogSyncPersistenceSource.indexOf(
+    'export async function applyCommerceCatalogSyncPolicyWithClient',
+  ),
+  catalogSyncPersistenceSource.indexOf(
+    'export function automaticCommerceCatalogRuntimeAvailable',
+  ),
+)
+includes(catalogPolicyApplicationSource, [
+  'INSERT INTO operations_commerce_catalog_sync_jobs (',
+  'credential_version, policy_revision, requested_by,',
+  'target_dirty_version',
+], 'Fresh catalog-sync policy queue')
+assert.doesNotMatch(
+  catalogPolicyApplicationSource,
+  /INSERT INTO operations_commerce_catalog_sync_jobs \([\s\S]{0,300}continuation_run_global_id/,
+  'A policy supersession must queue a new root sweep without copying the dead continuation',
 )
 const catalogCredentialPolicyModule = loadTypeScriptModule(
   'app_src/lib/persistence/commerceCatalogSync.ts',
@@ -285,6 +326,58 @@ assert.equal(
     configuration: { requestedScopes: ['READ_BRAND'] },
   }),
   false,
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    catalogCredentialPolicyModule.commerceCatalogSweepFailureState({
+      code: 'COMMERCE_INTAKE_READ_RESTART_REQUIRED',
+      attemptCount: 1,
+      sweepFailureCount: 0,
+      maxAttempts: 8,
+    }),
+  )),
+  {
+    sweepFailureCount: 1,
+    permanent: false,
+    dead: false,
+  },
+  'A restart failure must consume one sweep-level failure attempt',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    catalogCredentialPolicyModule.commerceCatalogSweepFailureState({
+      code: 'COMMERCE_INTAKE_READ_RESTART_REQUIRED',
+      attemptCount: 1,
+      sweepFailureCount: 7,
+      maxAttempts: 8,
+    }),
+  )),
+  {
+    sweepFailureCount: 8,
+    permanent: false,
+    dead: true,
+  },
+  'Successful prefix pages must not reset the sweep failure budget',
+)
+assert.equal(
+  catalogCredentialPolicyModule.commerceCatalogSweepFailureState({
+    code: 'COMMERCE_INTAKE_READ_RESTART_REQUIRED',
+    attemptCount: 8,
+    sweepFailureCount: 0,
+    maxAttempts: 8,
+  }).dead,
+  true,
+  'A legacy in-flight retry must retain its consecutive failure budget',
+)
+assert.equal(
+  catalogCredentialPolicyModule.commerceCatalogSweepFailureState({
+    code: 'COMMERCE_CATALOG_SYNC_PAGE_LIMIT_EXCEEDED',
+    attemptCount: 1,
+    sweepFailureCount: 0,
+    maxAttempts: 8,
+  }).dead,
+  true,
+  'A sweep limit failure must dead-letter immediately',
 )
 const automaticIntakeAudit = []
 function automaticIntakeClient({
@@ -489,10 +582,6 @@ if (savedAutomaticCatalogRuntime.lane === undefined) {
 } else {
   process.env.CLAWPILOT_ENV = savedAutomaticCatalogRuntime.lane
 }
-assert.ok(
-  !catalogSyncPersistenceSource.includes('MAX_CATALOG_PAGES'),
-  'Successful 50-row catalog pages must continue until provider exhaustion',
-)
 const catalogSyncWorkerSource = read(
   'app_src/lib/commerceCatalogSyncWorker.ts',
 )
@@ -504,6 +593,12 @@ includes(catalogSyncWorkerSource, [
   'failCommerceCatalogSyncJobInPostgres',
   'if (automatic.failed === true)',
   'COMMERCE_PRODUCT_AUTO_CREATE_SWEEP_FAILED',
+  'MAX_CATALOG_SWEEP_PAGES = 1_000',
+  'MAX_CATALOG_SWEEP_PROVIDER_RECORDS = 50_000',
+  'MAX_CATALOG_SWEEP_DURATION_MS = 2 * 60 * 60 * 1_000',
+  'assertCommerceCatalogSweepCanRead(job)',
+  'assertCommerceCatalogSweepPageWithinLimits',
+  'COMMERCE_CATALOG_SYNC_CONTINUATION_REPEATED',
   'pageCount: job.pageCount',
   'readGeneration: job.readGeneration',
   "resource: 'products'",
@@ -521,6 +616,19 @@ includes(catalogSyncRouteSource, [
   'processCommerceCatalogSyncOutbox',
   'recordCommerceCatalogWorkerHeartbeatInPostgres',
 ], 'Commerce catalog-sync worker route')
+includes(read('app_src/app/api/health/route.ts'), [
+  'FROM operations_commerce_catalog_sync_jobs',
+  "WHERE status = 'dead' AND authoritative",
+  ')::integer AS historical_dead',
+  'historicalDead: Number(commerceQueue?.historical_dead || 0)',
+  'account.commerce_credential_generation',
+  '= job.credential_version',
+  "policy.policy_version\n                                = 'commerce-product-intake-policy-v1'",
+  "policy.unmatched_action = 'auto_create'",
+  'policy.revision = job.policy_revision',
+  "activation.state IN ('shadow', 'active')",
+  'Commerce catalog queue has terminal failed jobs.',
+], 'Authoritative commerce catalog terminal-failure health projection')
 const runtimePollerSource = read('scripts/pipeline-outbox-poller.mjs')
 includes(runtimePollerSource, [
   'CLAWPILOT_COMMERCE_INTAKE_ENABLED',
@@ -580,8 +688,11 @@ const catalogWorkerModule = loadTypeScriptModule(
             continuationRunGlobalId: null,
             readGeneration: 0,
             pageCount: 125,
+            providerRecordsSeen: 6_250,
             attemptCount: 1,
+            sweepFailureCount: 2,
             maxAttempts: 8,
+            startedAt: new Date(Date.now() - 1_000).toISOString(),
             lockToken: '44444444-4444-4444-8444-444444444444',
           }]
         },
@@ -619,6 +730,94 @@ assert.equal(
   125,
   'Successful page count must be independent from retry attempts',
 )
+const guardedCatalogJob = {
+  ...catalogWorkerTrace.completions[0].job,
+  continuationRunGlobalId: 'gcir0000001',
+  startedAt: '2026-08-01T12:00:00.000Z',
+}
+assert.throws(
+  () => catalogWorkerModule.assertCommerceCatalogSweepCanRead({
+    ...guardedCatalogJob,
+    pageCount: 1_000,
+  }, Date.parse('2026-08-01T12:01:00.000Z')),
+  (error) => error.code === 'COMMERCE_CATALOG_SYNC_PAGE_LIMIT_EXCEEDED',
+  'A catalog sweep at its page limit must not make another provider request',
+)
+assert.throws(
+  () => catalogWorkerModule.assertCommerceCatalogSweepCanRead({
+    ...guardedCatalogJob,
+    providerRecordsSeen: 50_000,
+  }, Date.parse('2026-08-01T12:01:00.000Z')),
+  (error) => error.code === 'COMMERCE_CATALOG_SYNC_RECORD_LIMIT_EXCEEDED',
+  'A catalog sweep at its record limit must not make another provider request',
+)
+assert.throws(
+  () => catalogWorkerModule.assertCommerceCatalogSweepCanRead(
+    guardedCatalogJob,
+    Date.parse('2026-08-01T14:00:00.000Z'),
+  ),
+  (error) => error.code === 'COMMERCE_CATALOG_SYNC_DURATION_LIMIT_EXCEEDED',
+  'A two-hour catalog sweep must not make another provider request',
+)
+assert.throws(
+  () => catalogWorkerModule.assertCommerceCatalogSweepPageWithinLimits({
+    job: guardedCatalogJob,
+    continuationRunGlobalId: 'gcir0000001',
+    hasNextBatch: true,
+    providerRecordsSeen: 50,
+    nowMs: Date.parse('2026-08-01T12:01:00.000Z'),
+  }),
+  (error) => error.code === 'COMMERCE_CATALOG_SYNC_CONTINUATION_REPEATED',
+  'A provider page must not reuse the current continuation handle',
+)
+const limitedCatalogTrace = {
+  providerCalls: 0,
+  failures: [],
+}
+const limitedCatalogWorkerModule = loadTypeScriptModule(
+  'app_src/lib/commerceCatalogSyncWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceIntake': {
+        async executeCommerceCatalogProductPage() {
+          limitedCatalogTrace.providerCalls += 1
+          throw new Error('Provider read must not run for an over-limit sweep')
+        },
+      },
+      '@/lib/persistence/commerceCatalogSync': {
+        async queueAutomaticCommerceCatalogSyncsInPostgres() {
+          return 0
+        },
+        async claimCommerceCatalogSyncJobsInPostgres() {
+          return [{
+            ...guardedCatalogJob,
+            pageCount: 1_000,
+            startedAt: new Date(Date.now() - 1_000).toISOString(),
+          }]
+        },
+        async completeCommerceCatalogSyncPageInPostgres() {
+          assert.fail('An over-limit sweep must not complete another page')
+        },
+        async failCommerceCatalogSyncJobInPostgres(input) {
+          limitedCatalogTrace.failures.push(input)
+          return { dead: true, leaseLost: false }
+        },
+      },
+    },
+  },
+)
+const limitedCatalogResult =
+  await limitedCatalogWorkerModule.processCommerceCatalogSyncOutbox({
+    limit: 1,
+    workerId: 'limit-test-worker',
+  })
+assert.equal(limitedCatalogTrace.providerCalls, 0)
+assert.equal(limitedCatalogTrace.failures.length, 1)
+assert.equal(
+  limitedCatalogTrace.failures[0].error.code,
+  'COMMERCE_CATALOG_SYNC_PAGE_LIMIT_EXCEEDED',
+)
+assert.equal(limitedCatalogResult.jobsDead, 1)
 const mappingPolicy = loadTypeScriptModule(
   'app_src/lib/integrations/commerceProductMappingPolicy.ts',
 )
@@ -789,6 +988,10 @@ includes(serviceSource, [
   'SHOPIFY_COMMERCE_NORMALIZER_VERSION',
   'FAIRE_COMMERCE_NORMALIZER_VERSION',
   'confirmAutoCreateProducts',
+  'confirmCatalogSyncReset',
+  'catalogSyncResetReason',
+  'COMMERCE_CATALOG_SYNC_RESET_CONFIRMATION_REQUIRED',
+  'COMMERCE_CATALOG_SYNC_RESET_REASON_REQUIRED',
   'expectedPolicyRevision',
   'const organizationId = normalizeCommerceOrganizationId(input.organizationId)',
   'const accountGlobalId = normalizeCommerceAccountGlobalId(',
@@ -1056,6 +1259,22 @@ for (const exportName of [
     `Commerce intake persistence must export ${exportName}`,
   )
 }
+includes(persistenceSource, [
+  'catalogSyncResetRequested',
+  'COMMERCE_PRODUCT_INTAKE_POLICY_UNCHANGED',
+  'COMMERCE_CATALOG_SYNC_RESET_NOT_REQUIRED',
+  "job.status = 'dead'",
+  "active.status IN ('pending', 'processing', 'failed')",
+  'FOR UPDATE OF job',
+  'COMMERCE_CATALOG_SYNC_RESET_QUEUE_FAILED',
+  'catalogSync.queued !== 1',
+  "eventType: 'commerce.catalog.sync.reset'",
+  'terminalJobId: terminalCatalogSync.id',
+  'reason: catalogSyncResetReason',
+  'deadEvidencePreserved: true',
+  'previousContinuationPreserved',
+  'freshRootSession: true',
+], 'Explicit terminal catalog-sync operator recovery')
 const checkoutReconciliationCommandSource = persistenceSource.slice(
   persistenceSource.indexOf(
     'reconcilePromotedCommerceCandidateCheckoutRateInPostgres',
@@ -1743,6 +1962,14 @@ includes(workflowSource, [
   'productIntake: committedPolicy',
   '!connectionReady',
   'Reconnect and verify ${providerLabel(provider)}',
+  'Start fresh reconciliation',
+  'resetTerminalProductCatalogSync',
+  'window.prompt(',
+  'Enter the audit reason for superseding this terminal catalog sweep.',
+  'confirmCatalogSyncReset: true',
+  'catalogSyncResetReason: resetReason',
+  'Repairing the connection does not itself restart this terminal sweep.',
+  'The terminal job and its error evidence remain preserved.',
 ], 'Durable future-product policy controls')
 assert.ok(
   !workflowSource.includes('Turn on automatic product sync for ${displayName}?'),
@@ -3100,9 +3327,71 @@ try {
       idempotencyKey: nextKey(),
     },
   })
+  await assert.rejects(
+    service.executeCommerceIntakeCommand({
+      organizationId,
+      actorEmail,
+      body: {
+        action: 'set-product-intake-policy',
+        accountGlobalId: shopifyRuntime.globalId,
+        unmatchedAction: 'auto_create',
+        expectedPolicyRevision: 1,
+        confirmAutoCreateProducts: true,
+        catalogSyncResetReason:
+          'Operator reviewed the terminal catalog failure.',
+        idempotencyKey: nextKey(),
+      },
+    }),
+    (error) => (
+      error.code === 'COMMERCE_CATALOG_SYNC_RESET_CONFIRMATION_REQUIRED'
+    ),
+  )
+  await assert.rejects(
+    service.executeCommerceIntakeCommand({
+      organizationId,
+      actorEmail,
+      body: {
+        action: 'set-product-intake-policy',
+        accountGlobalId: shopifyRuntime.globalId,
+        unmatchedAction: 'auto_create',
+        expectedPolicyRevision: 1,
+        confirmAutoCreateProducts: true,
+        confirmCatalogSyncReset: true,
+        idempotencyKey: nextKey(),
+      },
+    }),
+    (error) => (
+      error.code === 'COMMERCE_CATALOG_SYNC_RESET_REASON_REQUIRED'
+    ),
+  )
+  const resetReason =
+    'Operator reviewed terminal catalog evidence and authorized a fresh root reconciliation.'
+  const resetPolicy = await service.executeCommerceIntakeCommand({
+    organizationId,
+    actorEmail,
+    body: {
+      action: 'set-product-intake-policy',
+      accountGlobalId: shopifyRuntime.globalId,
+      unmatchedAction: 'auto_create',
+      expectedPolicyRevision: 1,
+      confirmAutoCreateProducts: true,
+      confirmCatalogSyncReset: true,
+      catalogSyncResetReason: resetReason,
+      idempotencyKey: nextKey(),
+    },
+  })
+  assert.equal(resetPolicy.command.productIntake.revision, 2)
   assert.deepEqual(
     productPolicyUpdates.map((update) => update.unmatchedAction),
-    ['review', 'auto_create'],
+    ['review', 'auto_create', 'auto_create'],
+  )
+  assert.equal(
+    productPolicyUpdates.at(-1).confirmCatalogSyncReset,
+    true,
+  )
+  assert.equal(
+    productPolicyUpdates.at(-1).catalogSyncResetReason,
+    resetReason,
   )
 
   const localCommands = [

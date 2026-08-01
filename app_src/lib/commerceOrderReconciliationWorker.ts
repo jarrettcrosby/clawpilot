@@ -4,6 +4,7 @@ import {
   claimCommerceOrderReconciliationTargetsInPostgres,
   completeCommerceOrderReconciliationInPostgres,
   failCommerceOrderReconciliationInPostgres,
+  projectCommerceOrderReconciliationPageInPostgres,
 } from '@/lib/persistence/commerceOrderReconciliation'
 
 function deterministicRunUuid(input: {
@@ -75,12 +76,55 @@ function assertReadOnly(command: Record<string, unknown>) {
   }
 }
 
-const MAX_PAGES_PER_RECONCILIATION = 10
+const MAX_PAGES_PER_RECONCILIATION = 5
+const MAX_PROVIDER_RECORDS_PER_RECONCILIATION = 250
+const MAX_RECONCILIATION_RUNTIME_MS = 180_000
+const MIN_REMAINING_RUNTIME_FOR_PAGE_MS = 30_000
+const PROVIDER_PAGE_RECORD_LIMIT = {
+  shopify: 25,
+  faire: 50,
+} as const
+
+function configuredInteger(
+  name: string,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+) {
+  const raw = String(process.env[name] || '').trim()
+  if (!raw) return fallback
+  const parsed = Number(raw)
+  return Number.isSafeInteger(parsed)
+    ? Math.max(minimum, Math.min(parsed, maximum))
+    : fallback
+}
+
+// Faire does not expose a safe immutable order timestamp fence equivalent to
+// Shopify's query window. Keep a high emergency ceiling for malformed/live
+// cursor chains while valid large catalogs continue across bounded invocations.
+const MAX_PAGES_PER_SESSION = configuredInteger(
+  'CLAWPILOT_COMMERCE_ORDER_MAX_SESSION_PAGES',
+  2_000,
+  100,
+  10_000,
+)
+const MAX_PROVIDER_RECORDS_PER_SESSION = configuredInteger(
+  'CLAWPILOT_COMMERCE_ORDER_MAX_SESSION_RECORDS',
+  100_000,
+  5_000,
+  1_000_000,
+)
+
+function reconciliationError(code: string, message: string) {
+  const error = new Error(message) as Error & { code?: string }
+  error.code = code
+  return error
+}
 
 /**
- * Follows the encrypted continuation chain to exhaustion. When a particularly
- * large account reaches the per-invocation page budget, its stored encrypted
- * continuation is claimed on the next poll instead of starting over.
+ * Follows the encrypted continuation chain within strict invocation and
+ * session budgets. A bounded invocation stores its continuation for the next
+ * poll; a session that is too large fails closed for operator review.
  * It deliberately stages held candidates and normalization rejections;
  * it never promotes canonical orders, derives packages or shipments, changes
  * inventory, or calls a provider write API. Exact source-line quantities remain
@@ -89,6 +133,8 @@ const MAX_PAGES_PER_RECONCILIATION = 10
  */
 export async function processCommerceOrderReconciliation(input: {
   limit?: number
+  /** Deterministic test seam; API callers never supply this. */
+  clock?: () => number
 }) {
   if (!commerceIntakeRuntimeAvailable()) {
     return {
@@ -126,6 +172,9 @@ export async function processCommerceOrderReconciliation(input: {
   let leaseLost = 0
   let pagesRead = 0
   let resumable = 0
+  let pageBudgetStops = 0
+  let recordBudgetStops = 0
+  let timeBudgetStops = 0
   let customersMatched = 0
   let customersCreated = 0
   let customersAmbiguous = 0
@@ -133,8 +182,11 @@ export async function processCommerceOrderReconciliation(input: {
   let customerResolutionFailed = 0
   const customerResolutionFailureCodes: Record<string, number> = {}
   const failureCodes: Record<string, number> = {}
-  for (const target of targets) {
+  const clock = input.clock || Date.now
+  for (const claimedTarget of targets) {
+    let target = claimedTarget
     try {
+      const targetStartedAtMs = clock()
       let continuationRunGlobalId = target.continuationRunGlobalId
       let continuationIdempotencyKey = target.continuationIdempotencyKey
       let targetPagesRead = 0
@@ -148,7 +200,52 @@ export async function processCommerceOrderReconciliation(input: {
       let targetCustomerResolutionFailed = 0
       const targetCustomerResolutionFailureCodes: Record<string, number> = {}
       let hasNextBatch = false
-      while (targetPagesRead < MAX_PAGES_PER_RECONCILIATION) {
+      let budgetStopReason: 'page' | 'records' | 'time' | null = null
+      let priorBatchNumber = target.continuationBatchNumber
+      const seenRunGlobalIds = new Set<string>()
+      if (continuationRunGlobalId) {
+        seenRunGlobalIds.add(continuationRunGlobalId)
+      }
+      if (
+        target.recordsSeen >= MAX_PROVIDER_RECORDS_PER_SESSION
+        && continuationRunGlobalId
+      ) {
+        throw reconciliationError(
+          'COMMERCE_ORDER_RECONCILIATION_SESSION_RECORD_BUDGET_EXCEEDED',
+          'Order reconciliation session reached its provider-record budget',
+        )
+      }
+      if (
+        priorBatchNumber !== null
+        && priorBatchNumber >= MAX_PAGES_PER_SESSION
+      ) {
+        throw reconciliationError(
+          'COMMERCE_ORDER_RECONCILIATION_SESSION_PAGE_BUDGET_EXCEEDED',
+          'Order reconciliation session reached its provider-page budget',
+        )
+      }
+      while (true) {
+        if (targetPagesRead >= MAX_PAGES_PER_RECONCILIATION) {
+          budgetStopReason = 'page'
+          break
+        }
+        const maximumNextPageRecords = PROVIDER_PAGE_RECORD_LIMIT[target.provider]
+        if (
+          targetProviderRecordsSeen + maximumNextPageRecords
+          > MAX_PROVIDER_RECORDS_PER_RECONCILIATION
+        ) {
+          budgetStopReason = 'records'
+          break
+        }
+        if (
+          targetPagesRead > 0
+          && clock() - targetStartedAtMs
+            >= MAX_RECONCILIATION_RUNTIME_MS
+              - MIN_REMAINING_RUNTIME_FOR_PAGE_MS
+        ) {
+          budgetStopReason = 'time'
+          break
+        }
         const response = await executeCommerceOrderPage({
           organizationId: target.organizationId,
           accountGlobalId: target.accountGlobalId,
@@ -172,12 +269,12 @@ export async function processCommerceOrderReconciliation(input: {
           continuationRunGlobalId,
         })
         const command = record(response.command)
-        assertReadOnly(command)
         const pagination = record(command.pagination)
         const automaticCustomerResolution = record(
           command.automaticCustomerResolution,
         )
-        targetProviderRecordsSeen += count(pagination.providerRowsSeen)
+        const pageProviderRecordsSeen = count(pagination.providerRowsSeen)
+        targetProviderRecordsSeen += pageProviderRecordsSeen
         targetOrdersHeld += count(command.ordersStaged)
         targetRecordsRejected += count(command.recordsRejected)
         targetCustomersMatched += count(automaticCustomerResolution.matched)
@@ -195,7 +292,66 @@ export async function processCommerceOrderReconciliation(input: {
           ) + count(value)
         }
         targetPagesRead += 1
+        const stagedRunGlobalId = typeof pagination.runGlobalId === 'string'
+          ? pagination.runGlobalId
+          : ''
+        if (!/^gcir[0-9]{7}$/u.test(stagedRunGlobalId)) {
+          throw reconciliationError(
+            'COMMERCE_ORDER_RECONCILIATION_PAGE_SEQUENCE_INVALID',
+            'Order reconciliation staged page identity is invalid',
+          )
+        }
+        const projection =
+          await projectCommerceOrderReconciliationPageInPostgres({
+            target,
+            runGlobalId: stagedRunGlobalId,
+          })
+        if (projection.leaseLost || !projection.startedAt) {
+          throw reconciliationError(
+            'COMMERCE_ORDER_RECONCILIATION_LEASE_LOST',
+            'Order reconciliation lease was lost during the provider read',
+          )
+        }
+        target = {
+          ...target,
+          startedAt: projection.startedAt,
+          recordsSeen: projection.recordsSeen,
+          recordsHeld: projection.recordsHeld,
+          continuationBatchNumber: projection.continuationBatchNumber,
+        }
+        assertReadOnly(command)
+        if (pageProviderRecordsSeen > maximumNextPageRecords) {
+          throw reconciliationError(
+            'COMMERCE_ORDER_RECONCILIATION_PAGE_RECORD_LIMIT_EXCEEDED',
+            'Order reconciliation provider page exceeded its record limit',
+          )
+        }
+        if (projection.providerCursorRepeated) {
+          throw reconciliationError(
+            'COMMERCE_ORDER_RECONCILIATION_PROVIDER_CURSOR_REPEATED',
+            'Order reconciliation provider repeated a pagination cursor',
+          )
+        }
         hasNextBatch = pagination.hasNextBatch === true
+        const batchNumber = count(pagination.batchNumber)
+        if (
+          batchNumber < 1
+          || projection.continuationBatchNumber !== batchNumber
+          || (
+            priorBatchNumber === null
+              ? (
+                  target.continuationRunGlobalId === null
+                  && batchNumber !== 1
+                )
+              : batchNumber !== priorBatchNumber + 1
+          )
+        ) {
+          throw reconciliationError(
+            'COMMERCE_ORDER_RECONCILIATION_PAGE_SEQUENCE_INVALID',
+            'Order reconciliation provider pages were not sequential',
+          )
+        }
+        priorBatchNumber = batchNumber
         const next = typeof pagination.continuationRunGlobalId === 'string'
           ? pagination.continuationRunGlobalId
           : null
@@ -207,6 +363,25 @@ export async function processCommerceOrderReconciliation(input: {
           const error = new Error('Order page did not return a continuation handle') as Error & { code?: string }
           error.code = 'COMMERCE_ORDER_RECONCILIATION_CONTINUATION_MISSING'
           throw error
+        }
+        if (seenRunGlobalIds.has(next)) {
+          throw reconciliationError(
+            'COMMERCE_ORDER_RECONCILIATION_CONTINUATION_REPEATED',
+            'Order reconciliation repeated a continuation handle',
+          )
+        }
+        seenRunGlobalIds.add(next)
+        if (batchNumber >= MAX_PAGES_PER_SESSION) {
+          throw reconciliationError(
+            'COMMERCE_ORDER_RECONCILIATION_SESSION_PAGE_BUDGET_EXCEEDED',
+            'Order reconciliation session reached its provider-page budget',
+          )
+        }
+        if (target.recordsSeen >= MAX_PROVIDER_RECORDS_PER_SESSION) {
+          throw reconciliationError(
+            'COMMERCE_ORDER_RECONCILIATION_SESSION_RECORD_BUDGET_EXCEEDED',
+            'Order reconciliation session reached its provider-record budget',
+          )
         }
         continuationRunGlobalId = next
         // A new continuation has no prior read intent. Its deterministic key
@@ -248,6 +423,9 @@ export async function processCommerceOrderReconciliation(input: {
           ) + value
         }
         if (hasNextBatch) resumable += 1
+        if (budgetStopReason === 'page') pageBudgetStops += 1
+        if (budgetStopReason === 'records') recordBudgetStops += 1
+        if (budgetStopReason === 'time') timeBudgetStops += 1
       }
     } catch (error) {
       const failure = await failCommerceOrderReconciliationInPostgres({
@@ -272,6 +450,16 @@ export async function processCommerceOrderReconciliation(input: {
     pagesRead,
     resumable,
     maxPagesPerReconciliation: MAX_PAGES_PER_RECONCILIATION,
+    maxPagesPerSession: MAX_PAGES_PER_SESSION,
+    maxProviderRecordsPerReconciliation:
+      MAX_PROVIDER_RECORDS_PER_RECONCILIATION,
+    maxProviderRecordsPerSession: MAX_PROVIDER_RECORDS_PER_SESSION,
+    maxReconciliationRuntimeMs: MAX_RECONCILIATION_RUNTIME_MS,
+    budgetStops: {
+      pages: pageBudgetStops,
+      records: recordBudgetStops,
+      time: timeBudgetStops,
+    },
     resource: 'orders',
     providerWrites: 0,
     canonicalOrderWrites: 0,
