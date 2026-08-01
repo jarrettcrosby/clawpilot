@@ -2371,6 +2371,13 @@ async function verifyCanonicalPlanning(databaseUrl) {
               )
             },
           },
+          '@/lib/integrations/shopifyFulfillmentWriteback': {
+            executeShopifyFulfillmentWriteback: async () => {
+              throw new Error(
+                'Canonical planning acceptance does not write Shopify fulfillment',
+              )
+            },
+          },
           '@/lib/operations/adapters': adapters,
           '@/lib/operations/canonicalFulfillmentPlanning':
             canonicalPlanning,
@@ -2396,6 +2403,18 @@ async function verifyCanonicalPlanning(databaseUrl) {
             readShadowFulfillmentPreparation: async () => {
               throw new Error(
                 'Canonical planning acceptance does not read Shadow execution evidence',
+              )
+            },
+          },
+          '@/lib/persistence/sandboxCommerceE2eAuthorization': {
+            requireActiveSandboxCommerceE2eAuthorization: async () => {
+              throw new Error(
+                'Canonical planning acceptance has no sandbox E2E authorization',
+              )
+            },
+            consumeSandboxCommerceE2eAuthorization: async () => {
+              throw new Error(
+                'Canonical planning acceptance has no sandbox E2E authorization',
               )
             },
           },
