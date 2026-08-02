@@ -12553,6 +12553,33 @@ function normalizeFaireFulfillmentAttemptRequest(
   }
 }
 
+function faireFulfillmentAttemptRequestHash(
+  request: FaireFulfillmentAttemptRequest,
+) {
+  return createHash('sha256')
+    .update(JSON.stringify(request))
+    .digest('hex')
+}
+
+function requireFaireFulfillmentAttemptRequestHash(
+  request: FaireFulfillmentAttemptRequest,
+  expectedHash: unknown,
+) {
+  const normalizedExpectedHash = String(expectedHash || '')
+    .trim()
+    .toLowerCase()
+  if (
+    !/^[a-f0-9]{64}$/.test(normalizedExpectedHash)
+    || faireFulfillmentAttemptRequestHash(request) !== normalizedExpectedHash
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_FAIRE_FULFILLMENT_SIGNATURE_INVALID',
+      'The durable Faire fulfillment attempt request failed its integrity check',
+      409,
+    )
+  }
+}
+
 async function registerShopifyFulfillmentProviderAttempt(input: {
   organizationId: string
   actorEmail: string
@@ -12672,9 +12699,9 @@ async function registerFaireFulfillmentProviderAttempt(input: {
   preparedRequest: FaireFulfillmentAttemptRequest
 }) {
   const serializedRequest = JSON.stringify(input.preparedRequest)
-  const requestHash = createHash('sha256')
-    .update(serializedRequest)
-    .digest('hex')
+  const requestHash = faireFulfillmentAttemptRequestHash(
+    input.preparedRequest,
+  )
   return withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
       client,
@@ -13142,6 +13169,10 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
           claimed.row.provider_attempt_request,
           claimed.row.external_order_id,
         )
+        requireFaireFulfillmentAttemptRequestHash(
+          attemptRequest,
+          claimed.row.provider_attempt_request_hash,
+        )
         mode = 'reconcile_unknown'
         writeAttempt = {
           attemptId: claimed.row.provider_attempt_global_id,
@@ -13227,6 +13258,13 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
     }
   } catch (error) {
     state = 'failed'
+    const faireAttemptIntegrityFailure = (
+      claimed.row.provider === 'faire'
+      && error
+      && typeof error === 'object'
+      && 'code' in error
+      && error.code === 'OPERATIONS_FAIRE_FULFILLMENT_SIGNATURE_INVALID'
+    )
     const providerOutcomeUnknown = (
       (
         claimed.row.provider === 'shopify'
@@ -13244,6 +13282,7 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
       )
       || (
         claimed.row.provider === 'faire'
+        && !faireAttemptIntegrityFailure
         && (
           Boolean(registeredProviderAttempt)
           || Boolean(claimed.row.provider_attempt_global_id)
