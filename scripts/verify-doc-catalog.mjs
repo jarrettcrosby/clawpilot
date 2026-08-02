@@ -33,6 +33,7 @@ const requiredCurrentDocuments = [
   'docs/modules/toast-and-accounting.md',
   'docs/modules/quickbooks-accounting.md',
   'docs/operations/clawpilot-environments.md',
+  'docs/operations/infrastructure-and-cost-control-register.md',
   'docs/operations/public-demo-environment.md',
   'docs/operations/agent-security-and-isolation.md',
   'docs/operations/knowledge-vault-organization.md',

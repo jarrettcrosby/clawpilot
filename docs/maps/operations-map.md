@@ -20,6 +20,7 @@ app_visible: true
 
 ## Provider Runbooks
 
+- [Infrastructure and Cost Control Register](../operations/infrastructure-and-cost-control-register.md): live topology baseline, spending controls, recovery policy, review cadence, and approved change history.
 - [Google Workspace Integration](../operations/google-workspace-integration.md): service account, Shared Drive, managed folders, and credential rotation.
 - [SuiteCRM Railway Runbook](../operations/suitecrm.md): service topology, Global ID fields, scheduler, upgrades, and rollback.
 - [Sales Pipeline EPISCS Migration](../operations/sales-pipeline-episcs-migration.md): guarded ownership transfer for the established Sales CRM graph and workbook.
