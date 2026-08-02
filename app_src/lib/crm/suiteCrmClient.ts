@@ -1,6 +1,7 @@
 import type { CrmEntity, SuiteCrmOutboxRecord, SuiteCrmUserIdentityOutboxRecord } from '@/lib/crm/types'
 import { isIso4217CurrencyCode } from '@/lib/currency'
 import { publicCrmProductImageUrl } from '@/lib/crm/productImagePublic'
+import { projectSuiteCrmNativeProductImage } from '@/lib/crm/suiteCrmNativeProductImageClient'
 import { appPublicUrl } from '@/lib/publicUrl'
 
 type SuiteCrmRecordModule =
@@ -434,6 +435,9 @@ export async function upsertSuiteCrmRecord(
   }, fetchImpl) as JsonApiResponse
   const id = String(response?.data?.id || record.suiteCrmId)
   if (id !== record.suiteCrmId) throw new Error('SuiteCRM returned an unexpected record ID')
+  if (record.productImage !== undefined) {
+    await projectSuiteCrmNativeProductImage(record, fetchImpl)
+  }
   for (const relationship of record.relationships || []) {
     const linkFieldName = relationship.linkFieldName
     if (!['accounts', 'contact', 'contacts', 'leads', 'opportunity'].includes(linkFieldName)) {

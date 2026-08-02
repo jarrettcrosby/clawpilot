@@ -13,13 +13,13 @@ app_visible: false
 
 ## Topology
 
-Each Railway environment has a `suitecrm` service, a dedicated MariaDB service, and a SuiteCRM volume mounted at `/var/lib/suitecrm`. SuiteCRM does not share ClawPilot's Postgres database. The ClawPilot service reaches the API through the private `http://suitecrm.railway.internal:<port>` base URL and OAuth2 client credentials. Owner/admin browser access uses SuiteCRM's separate public HTTPS origin.
+Each Railway environment has a `suitecrm` service, a dedicated MariaDB service, and a SuiteCRM volume mounted at `/var/lib/suitecrm`. SuiteCRM does not share ClawPilot's Postgres database. The ClawPilot service reaches the V8 API through the private `http://suitecrm.railway.internal:<port>` base URL and OAuth2 client credentials. SuiteCRM 8 native media is not exposed by V8, so the optional native Product-image projection uses a separate least-privilege SuiteCRM user and the same cookie-session plus CSRF flow used by SuiteCRM's own UI. Owner/admin browser access uses SuiteCRM's separate public HTTPS origin.
 
 `SUITECRM_BASE_URL` is backend-only and must remain on Railway's private network. Never place it in a browser response or public environment variable. `SUITECRM_PUBLIC_URL` is the only browser destination and must be the exact canonical origin, with no trailing slash, path, credentials, query, or fragment. ClawPilot uses `https://crm.eigenracing.com` in production and `https://dev.crm.eigenracing.com` in development. SuiteCRM is a standalone service and must not be nested under the ClawPilot `aiapp` hostname.
 
 The image is built from `services/suitecrm/`. It verifies the official SuiteCRM 8.10.1 release digest, serves `public/` with Apache, runs the legacy scheduler every minute, and continuously restarts the Symfony Messenger worker.
 
-Container boot also idempotently installs the ClawPilot `Global ID` custom field on Accounts, Contacts, AOS Products, Leads, Opportunities, Meetings, Calls, Notes, Campaigns, and Users. The field is named `global_id_c` in SuiteCRM metadata, labeled `Global ID`, and added to native detail and list layouts. Business-record modules are available to reporting and unified search; boot fails if any managed module or its Global ID search field remains unavailable. AOS Products is also kept enabled in SuiteCRM's persisted global-search module selection so Product Global ID lookup works without an administrator repair, while other module visibility remains administrator-controlled. Users retain their administrator-module search boundary. Notes also receive a reportable, audited `Occurred At` DateTime field named `occurred_at_c` on native edit, detail, and list layouts; it stores the interaction's business timestamp separately from SuiteCRM's system creation time.
+Container boot also idempotently installs the ClawPilot `Global ID` custom field on Accounts, Contacts, AOS Products, Leads, Opportunities, Meetings, Calls, Notes, Campaigns, and Users. The field is named `global_id_c` in SuiteCRM metadata, labeled `Global ID`, and added to native detail and list layouts. Business-record modules are available to reporting and unified search; boot fails if any managed module or its Global ID search field remains unavailable. AOS Products is also kept enabled in SuiteCRM's persisted global-search module selection so Product Global ID lookup works without an administrator repair, while other module visibility remains administrator-controlled. Users retain their administrator-module search boundary. Notes also receive a reportable, audited `Occurred At` DateTime field named `occurred_at_c` on native edit, detail, and list layouts; it stores the interaction's business timestamp separately from SuiteCRM's system creation time. AOS Products receive the native non-database image field `clawpilot_image_c`, backed by SuiteCRM's `private-images` media store and shown on native detail and edit layouts. Boot verifies the field type, storage metadata, 2 MiB limit, thumbnail configuration, and layout placement before reporting readiness.
 
 ClawPilot does not project AOS Quotes or AOS Products Quotes. Container boot therefore removes the stock AOS Product **Purchases** subpanel instead of presenting an empty query as though it were canonical order history. A future owned relationship must use canonical Operations order/shipment identities and its own contract before that layout can return.
 
@@ -43,8 +43,11 @@ ClawPilot service:
 - the same `SUITECRM_ADMIN_USER`
 - `SUITECRM_ADMIN_PORTAL_URL`, pointing to that environment's Railway `suitecrm` Variables page
 - the same `SUITECRM_CLIENT_ID` and `SUITECRM_CLIENT_SECRET`
+- `SUITECRM_NATIVE_PRODUCT_IMAGE_PROJECTION_ENABLED=1`, only after the native-media user and permissions below are ready
+- `SUITECRM_MEDIA_USERNAME`, for a dedicated non-admin native-media user
+- `SUITECRM_MEDIA_PASSWORD`, for that dedicated user
 
-Credentials must remain Railway secrets. The container hashes the OAuth client secret before upserting it into SuiteCRM and never prints the secret.
+Credentials must remain Railway secrets. Native Product-image projection is disabled unless `SUITECRM_NATIVE_PRODUCT_IMAGE_PROJECTION_ENABLED` equals exactly `1`. While disabled, the existing content-addressed legacy Product image URL is still projected through V8 and SuiteCRM outbox rows do not require media credentials. When enabled, the media username must be an active SuiteCRM user with `ROLE_USER` plus AOS Products view/edit and image-upload access; it must not reuse `SUITECRM_ADMIN_USER`, `SUITECRM_ADMIN_PASSWORD`, the installer account, or OAuth client credentials. The enabled path fails closed rather than falling back to those broader credentials when media credentials are missing. The container hashes the OAuth client secret before upserting it into SuiteCRM and never prints the secret.
 
 ## Organization Hierarchy
 
@@ -83,9 +86,10 @@ ClawPilot Product projections include SuiteCRM's native `currency_id`. USD resol
 2. Attach the SuiteCRM volume at `/var/lib/suitecrm` before the first deployment.
 3. Create the SuiteCRM public Railway domain, set its exact HTTPS origin as `SUITECRM_PUBLIC_URL` on both services, and set the private service URL only as ClawPilot's `SUITECRM_BASE_URL`.
 4. Deploy and verify the public SuiteCRM root, private token endpoint, scheduler, Messenger logs, and persisted runtime override.
-5. Enable CRM variables on the ClawPilot development service and apply migration `0020_crm_gateway_and_reporting.sql`.
-6. Inspect and import the source workbook, drain the SuiteCRM and Google outboxes, then compare entity counts and pipeline totals before projecting the controlled workbook.
-7. Repeat in production only after development reconciliation succeeds.
+5. Create the dedicated non-admin native-media user, grant only AOS Products view/edit and image-upload access, set `SUITECRM_MEDIA_USERNAME` and `SUITECRM_MEDIA_PASSWORD` on every ClawPilot runtime that can drain the SuiteCRM outbox, then explicitly set `SUITECRM_NATIVE_PRODUCT_IMAGE_PROJECTION_ENABLED=1`.
+6. Enable the remaining CRM variables on the ClawPilot development service and apply migration `0020_crm_gateway_and_reporting.sql`.
+7. Inspect and import the source workbook, drain the SuiteCRM and Google outboxes, then compare entity counts and pipeline totals before projecting the controlled workbook.
+8. Repeat in production only after development reconciliation succeeds.
 
 After the Global ID metadata is live, refresh historical records and meeting subpanel links from each environment's ClawPilot service shell:
 
