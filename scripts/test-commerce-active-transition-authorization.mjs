@@ -678,7 +678,7 @@ async function verifyDisposablePostgres() {
         expectedActivationRevision: 1,
         selectedAccounts: [{
           accountGlobalId: accounts.faire.global_id,
-          capabilities: ['tracking_export'],
+          capabilities: ['order_update'],
         }],
         idempotencyKey: 'faire-not-implemented',
       }),

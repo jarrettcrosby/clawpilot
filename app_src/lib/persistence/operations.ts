@@ -8,6 +8,10 @@ import {
   reconcileShopifyFulfillmentWriteback,
 } from '@/lib/integrations/shopifyFulfillmentWriteback'
 import {
+  executeCurrentFaireFulfillmentWriteback,
+  prepareCurrentFaireFulfillmentAuthority,
+} from '@/lib/integrations/faireFulfillmentRuntime'
+import {
   consumeSandboxCommerceE2eAuthorization,
   readActiveSandboxCommerceE2eAuthorizationForOrderInPostgres,
   requireActiveSandboxCommerceE2eAuthorization,
@@ -12451,6 +12455,7 @@ type CommerceFulfillmentExportExecutionRow = QueryResultRow & {
   provider_attempt_global_id: string | null
   provider_attempt_state: string | null
   provider_attempt_number: number | null
+  provider_attempt_request_hash: string | null
   provider_attempt_request: Record<string, unknown> | null
 }
 
@@ -12458,6 +12463,95 @@ const SHOPIFY_FULFILLMENT_PROVIDER_ATTEMPT_ACTION =
   'shopify.fulfillment.create'
 const SHOPIFY_FULFILLMENT_PROVIDER_ATTEMPT_ADAPTER =
   'shopify-fulfillment-writeback-v2'
+const FAIRE_FULFILLMENT_PROVIDER_ATTEMPT_ACTION =
+  'faire.fulfillment.shipments.create'
+const FAIRE_FULFILLMENT_PROVIDER_ATTEMPT_ADAPTER =
+  'faire-fulfillment-writeback-v1'
+const FAIRE_FULFILLMENT_PROVIDER_WRITE_PROTOCOL =
+  'faire-fulfillment-attempt-v1'
+
+type FaireFulfillmentAttemptRequest = {
+  version: 1
+  externalOrderId: string
+  expectedShipDate: string
+  authorizationRevision: number
+  packages: Array<{
+    packageReference: string
+    carrier: string
+    trackingCode: string
+  }>
+}
+
+function normalizeFaireFulfillmentPackages(value: unknown) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 100) {
+    throw new OperationsRequestError(
+      'OPERATIONS_FAIRE_FULFILLMENT_PACKAGES_INVALID',
+      'Faire fulfillment requires exact evidence for every physical package',
+      409,
+    )
+  }
+  const packageReferences = new Set<string>()
+  const trackingCodes = new Set<string>()
+  return value.map((candidate) => {
+    const packageSnapshot = json(candidate)
+    const packageReference = String(
+      packageSnapshot.packageReference || '',
+    ).trim()
+    const carrier = String(packageSnapshot.carrier || '').trim()
+    const trackingCode = String(packageSnapshot.trackingCode || '').trim()
+    if (
+      !/^gpa(?:[0-9]{7}|[0-9a-v]{12})$/.test(packageReference)
+      || !carrier
+      || carrier.length > 80
+      || !trackingCode
+      || trackingCode.length > 255
+      || /[\u0000-\u001f\u007f]/.test(`${carrier}${trackingCode}`)
+      || packageReferences.has(packageReference)
+      || trackingCodes.has(trackingCode)
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_FAIRE_FULFILLMENT_PACKAGES_INVALID',
+        'Faire package carrier and tracking evidence is invalid or duplicated',
+        409,
+      )
+    }
+    packageReferences.add(packageReference)
+    trackingCodes.add(trackingCode)
+    return { packageReference, carrier, trackingCode }
+  })
+}
+
+function normalizeFaireFulfillmentAttemptRequest(
+  value: unknown,
+  expectedExternalOrderId: string,
+): FaireFulfillmentAttemptRequest {
+  const request = json(value)
+  const externalOrderId = String(request.externalOrderId || '').trim()
+  const expectedShipDate = String(request.expectedShipDate || '').trim()
+  const authorizationRevision = Number(request.authorizationRevision)
+  const parsedShipDate = new Date(expectedShipDate)
+  if (
+    request.version !== 1
+    || externalOrderId !== expectedExternalOrderId
+    || !/^bo_[A-Za-z0-9_-]+$/.test(externalOrderId)
+    || !Number.isFinite(parsedShipDate.getTime())
+    || !Number.isSafeInteger(authorizationRevision)
+    || authorizationRevision < 1
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_FAIRE_FULFILLMENT_SIGNATURE_INVALID',
+      'The durable Faire fulfillment attempt signature is invalid or stale',
+      409,
+    )
+  }
+  return {
+    version: 1,
+    externalOrderId,
+    expectedShipDate: parsedShipDate.toISOString(),
+    authorizationRevision,
+    packages: normalizeFaireFulfillmentPackages(request.packages),
+  }
+}
 
 async function registerShopifyFulfillmentProviderAttempt(input: {
   organizationId: string
@@ -12568,6 +12662,104 @@ async function registerShopifyFulfillmentProviderAttempt(input: {
   })
 }
 
+async function registerFaireFulfillmentProviderAttempt(input: {
+  organizationId: string
+  actorEmail: string
+  commerceExportGlobalId: string
+  integrationAccountId: string
+  exportIdempotencyKey: string
+  exportAttempt: number
+  preparedRequest: FaireFulfillmentAttemptRequest
+}) {
+  const serializedRequest = JSON.stringify(input.preparedRequest)
+  const requestHash = createHash('sha256')
+    .update(serializedRequest)
+    .digest('hex')
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:commerce-fulfillment-export:${input.organizationId}:${input.commerceExportGlobalId}`,
+    )
+    const guardedExport = await client.query(
+      `SELECT id
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+         AND state = 'processing'
+         AND attempts = $3
+       FOR UPDATE`,
+      [
+        input.organizationId,
+        input.commerceExportGlobalId,
+        input.exportAttempt,
+      ],
+    )
+    if (guardedExport.rowCount !== 1) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_EXPORT_CHANGED',
+        'Commerce fulfillment export changed before the Faire attempt was registered',
+        409,
+      )
+    }
+    const existing = await client.query(
+      `SELECT global_id
+       FROM operations_commerce_provider_attempts
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND action = $3
+         AND external_object_id = $4
+       LIMIT 1`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        FAIRE_FULFILLMENT_PROVIDER_ATTEMPT_ACTION,
+        input.commerceExportGlobalId,
+      ],
+    )
+    if (existing.rowCount) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED',
+        'A durable Faire fulfillment attempt already exists; only read-only reconciliation is safe',
+        409,
+      )
+    }
+    const attempt = await client.query<{
+      id: string
+      global_id: string
+    }>(
+      `INSERT INTO operations_commerce_provider_attempts (
+         organization_id, integration_account_id, action, adapter_version,
+         external_object_id, idempotency_key, request_hash,
+         redacted_request, redacted_response, state, attempt_number,
+         lease_token, lease_expires_at, requested_at, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, $4,
+         $5, $6, $7, $8::jsonb, '{}'::jsonb, 'prepared', $9,
+         $10::uuid, now() + interval '5 minutes', now(), $11
+       )
+       RETURNING id::text, global_id`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        FAIRE_FULFILLMENT_PROVIDER_ATTEMPT_ACTION,
+        FAIRE_FULFILLMENT_PROVIDER_ATTEMPT_ADAPTER,
+        input.commerceExportGlobalId,
+        input.exportIdempotencyKey,
+        requestHash,
+        serializedRequest,
+        input.exportAttempt,
+        randomUUID(),
+        input.actorEmail,
+      ],
+    )
+    return {
+      id: attempt.rows[0].id,
+      globalId: attempt.rows[0].global_id,
+      requestHash,
+    }
+  })
+}
+
 async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
   organizationId: string
   actorEmail: string
@@ -12596,6 +12788,7 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
               provider_attempt.global_id AS provider_attempt_global_id,
               provider_attempt.state AS provider_attempt_state,
               provider_attempt.attempt_number AS provider_attempt_number,
+              provider_attempt.request_hash AS provider_attempt_request_hash,
               provider_attempt.redacted_request AS provider_attempt_request
        FROM operations_commerce_fulfillment_exports fulfillment_export
        JOIN operations_orders source_order
@@ -12606,12 +12799,17 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
         AND integration.id = source_order.integration_account_id
        LEFT JOIN LATERAL (
          SELECT attempt.id, attempt.global_id, attempt.state,
-                attempt.attempt_number, attempt.redacted_request,
+                attempt.attempt_number, attempt.request_hash,
+                attempt.redacted_request,
                 attempt.requested_at
          FROM operations_commerce_provider_attempts attempt
          WHERE attempt.organization_id = fulfillment_export.organization_id
            AND attempt.integration_account_id = integration.id
-           AND attempt.action = 'shopify.fulfillment.create'
+           AND attempt.action = CASE fulfillment_export.provider
+             WHEN 'shopify' THEN 'shopify.fulfillment.create'
+             WHEN 'faire' THEN 'faire.fulfillment.shipments.create'
+             ELSE ''
+           END
            AND attempt.external_object_id = fulfillment_export.global_id
          ORDER BY attempt.attempt_number DESC, attempt.requested_at DESC,
                   attempt.id DESC
@@ -12652,6 +12850,10 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
       exportSnapshot.providerWriteProtocol
       === 'shopify-fulfillment-attempt-v2'
     )
+    const usesSafeFaireAttemptProtocol = (
+      exportSnapshot.providerWriteProtocol
+      === FAIRE_FULFILLMENT_PROVIDER_WRITE_PROTOCOL
+    )
     let recoveryMode: 'execute' | 'reconcile_only' = 'execute'
     if (row.provider === 'shopify') {
       if (
@@ -12667,6 +12869,19 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
               'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
             || !usesSafeShopifyAttemptProtocol
           )
+        )
+      ) {
+        recoveryMode = 'reconcile_only'
+      }
+    } else if (row.provider === 'faire') {
+      if (
+        row.provider_attempt_global_id
+        || !usesSafeFaireAttemptProtocol
+        || row.state === 'processing'
+        || (
+          row.state === 'failed'
+          && row.error_code ===
+            'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
         )
       ) {
         recoveryMode = 'reconcile_only'
@@ -12699,6 +12914,7 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
                  NULL::text AS provider_attempt_global_id,
                  NULL::text AS provider_attempt_state,
                  NULL::integer AS provider_attempt_number,
+                 NULL::text AS provider_attempt_request_hash,
                  NULL::jsonb AS provider_attempt_request`,
       [
         input.organizationId,
@@ -12722,6 +12938,7 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
       provider_attempt_global_id: row.provider_attempt_global_id,
       provider_attempt_state: row.provider_attempt_state,
       provider_attempt_number: row.provider_attempt_number,
+      provider_attempt_request_hash: row.provider_attempt_request_hash,
       provider_attempt_request: row.provider_attempt_request,
     }
     await recordAuditEvent({
@@ -12785,6 +13002,7 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
     globalId: string
     requestHash: string
   } | null = null
+  let providerAttemptResponse: Record<string, unknown> | null = null
   try {
     if (!carrier || trackingNumbers.length === 0) {
       throw new OperationsRequestError(
@@ -12892,11 +13110,114 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
         }
       }
     } else if (claimed.row.provider === 'faire') {
-      errorCode = 'OPERATIONS_FAIRE_FULFILLMENT_EXPORT_NOT_IMPLEMENTED'
-      errorMessage = (
-        'Faire shipment/tracking export is not implemented. Provider-managed '
-        + 'retailer notification does not replace the required shipment submission.'
-      )
+      if (
+        !claimed.row.account_global_id
+        || !claimed.row.integration_account_id
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PROVIDER_ACCOUNT_REQUIRED',
+          'The Faire fulfillment export is missing its integration account',
+          409,
+        )
+      }
+      let attemptRequest: FaireFulfillmentAttemptRequest
+      let mode: 'execute' | 'reconcile_unknown'
+      let writeAttempt: {
+        attemptId: string
+        authorizationRevision: number
+        state: 'authorized' | 'outcome_unknown'
+      }
+      if (claimed.recoveryMode === 'reconcile_only') {
+        if (
+          !claimed.row.provider_attempt_global_id
+          || !claimed.row.provider_attempt_request
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_FAIRE_FULFILLMENT_SIGNATURE_REQUIRED',
+            'The Faire export predates exact durable package evidence and cannot be submitted safely',
+            409,
+          )
+        }
+        attemptRequest = normalizeFaireFulfillmentAttemptRequest(
+          claimed.row.provider_attempt_request,
+          claimed.row.external_order_id,
+        )
+        mode = 'reconcile_unknown'
+        writeAttempt = {
+          attemptId: claimed.row.provider_attempt_global_id,
+          authorizationRevision: attemptRequest.authorizationRevision,
+          state: 'outcome_unknown',
+        }
+        if (
+          claimed.row.provider_attempt_state === 'prepared'
+          && claimed.row.provider_attempt_id
+          && claimed.row.provider_attempt_request_hash
+        ) {
+          registeredProviderAttempt = {
+            id: claimed.row.provider_attempt_id,
+            globalId: claimed.row.provider_attempt_global_id,
+            requestHash: claimed.row.provider_attempt_request_hash,
+          }
+        }
+      } else {
+        const packages = normalizeFaireFulfillmentPackages(snapshot.packages)
+        const authority = await prepareCurrentFaireFulfillmentAuthority({
+          organizationId: input.organizationId,
+          accountGlobalId: claimed.row.account_global_id,
+        })
+        attemptRequest = normalizeFaireFulfillmentAttemptRequest({
+          version: 1,
+          externalOrderId: claimed.row.external_order_id,
+          expectedShipDate: shippedAt,
+          authorizationRevision: authority.authorizationRevision,
+          packages,
+        }, claimed.row.external_order_id)
+        registeredProviderAttempt =
+          await registerFaireFulfillmentProviderAttempt({
+            organizationId: input.organizationId,
+            actorEmail: input.actorEmail,
+            commerceExportGlobalId: input.commerceExportGlobalId,
+            integrationAccountId: claimed.row.integration_account_id,
+            exportIdempotencyKey: claimed.row.idempotency_key,
+            exportAttempt: claimed.row.attempts,
+            preparedRequest: attemptRequest,
+          })
+        mode = 'execute'
+        writeAttempt = {
+          attemptId: registeredProviderAttempt.globalId,
+          authorizationRevision: attemptRequest.authorizationRevision,
+          state: 'authorized',
+        }
+      }
+      const result = await executeCurrentFaireFulfillmentWriteback({
+        organizationId: input.organizationId,
+        accountGlobalId: claimed.row.account_global_id,
+        mode,
+        writeAttempt,
+        externalOrderId: attemptRequest.externalOrderId,
+        expectedShipDate: attemptRequest.expectedShipDate,
+        packages: attemptRequest.packages,
+      })
+      providerAttemptResponse = {
+        outcome: result.outcome,
+        providerOrderId: result.providerOrderId,
+        providerState: result.providerState,
+        providerShipmentReferences: result.providerShipmentReferences,
+        trackingCodes: result.trackingCodes,
+        replayed: result.replayed,
+        reconciledUnknownOutcome: result.reconciledUnknownOutcome,
+        ...(result.outcome === 'unknown' ? { reason: result.reason } : {}),
+      }
+      if (result.outcome === 'succeeded') {
+        state = 'succeeded'
+        providerReference = result.providerOrderId
+      } else {
+        errorCode = 'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
+        errorMessage = (
+          'The one-shot Faire shipment outcome is unknown. '
+          + 'Later retries remain read-only until exact package tracking is observed.'
+        )
+      }
     } else {
       state = 'unsupported'
       errorCode = 'OPERATIONS_COMMERCE_PROVIDER_UNSUPPORTED'
@@ -12907,16 +13228,25 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
   } catch (error) {
     state = 'failed'
     const providerOutcomeUnknown = (
-      claimed.row.provider === 'shopify'
-      && (
-        claimed.recoveryMode === 'reconcile_only'
-        || (
-          error
-          && typeof error === 'object'
-          && (
-            ('outcomeUnknown' in error && error.outcomeUnknown === true)
-            || ('retryable' in error && error.retryable === true)
+      (
+        claimed.row.provider === 'shopify'
+        && (
+          claimed.recoveryMode === 'reconcile_only'
+          || (
+            error
+            && typeof error === 'object'
+            && (
+              ('outcomeUnknown' in error && error.outcomeUnknown === true)
+              || ('retryable' in error && error.retryable === true)
+            )
           )
+        )
+      )
+      || (
+        claimed.row.provider === 'faire'
+        && (
+          Boolean(registeredProviderAttempt)
+          || Boolean(claimed.row.provider_attempt_global_id)
         )
       )
     )
@@ -12962,6 +13292,9 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
             providerReference,
             errorCode,
             errorMessage,
+            ...(providerAttemptResponse
+              ? { providerResult: providerAttemptResponse }
+              : {}),
           }),
           providerReference,
           errorCode,
@@ -12970,7 +13303,7 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
       if (finalizedProviderAttempt.rowCount !== 1) {
         throw new OperationsRequestError(
           'OPERATIONS_COMMERCE_EXPORT_CHANGED',
-          'The durable Shopify provider attempt changed before finalization',
+          'The durable commerce provider attempt changed before finalization',
           409,
         )
       }
@@ -13544,13 +13877,17 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
       if (
         packageResult.rows.length < 1
         || packageResult.rows.some((item) => item.status !== 'labeled')
-        || (!sandboxE2eAuthorizationGlobalId && packageResult.rows.length !== 1)
+        || (
+          !sandboxE2eAuthorizationGlobalId
+          && order.source_provider !== 'faire'
+          && packageResult.rows.length !== 1
+        )
       ) {
         throw new OperationsRequestError(
           'OPERATIONS_SHIPMENT_PACKAGE_INVALID',
           sandboxE2eAuthorizationGlobalId
             ? 'Authorized sandbox E2E completion requires every package to have a verified label'
-            : 'Shipment confirmation currently requires exactly one verified, labeled package',
+            : 'Shipment confirmation requires a supported package set with every package verified and labeled',
           409,
         )
       }
@@ -14059,7 +14396,17 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
               providerWriteProtocol: 'shopify-fulfillment-attempt-v2',
               shippedLines,
             }
-          : {}),
+          : order.source_provider === 'faire'
+            ? {
+                providerWriteProtocol:
+                  FAIRE_FULFILLMENT_PROVIDER_WRITE_PROTOCOL,
+                packages: shipments.map((item) => ({
+                  packageReference: item.package_global_id,
+                  carrier: item.carrier,
+                  trackingCode: item.tracking_number,
+                })),
+              }
+            : {}),
       }
       const initialExportState = 'queued'
       const exportResult = await client.query<IdRow>(

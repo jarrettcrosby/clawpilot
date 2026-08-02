@@ -743,4 +743,190 @@ for (const scopeVerificationSource of [
   assert.equal(selfAssertedClientCreations, 0)
 }
 
+const runtime = load(
+  'app_src/lib/integrations/faireFulfillmentRuntime.ts',
+  {
+    '@/lib/integrations/commerceCredentialCrypto': {
+      decryptCommerceCredential: () => {
+        throw new Error('default decryptor must be replaced in this test')
+      },
+      normalizeCommerceAccountGlobalId: (value) => String(value).trim(),
+      normalizeCommerceOrganizationId: (value) => String(value).trim(),
+    },
+    '@/lib/integrations/faireFulfillmentWriteback': {
+      executeFaireFulfillmentWriteback: async () => {
+        throw new Error('default executor must be replaced in this test')
+      },
+    },
+    '@/lib/persistence/commerceIntegrations': {
+      readCommerceRuntimeCredentialFromPostgres: async () => null,
+    },
+    '@/lib/persistence/commerceActiveTransitionAuthorization': {
+      requireCommerceActiveCapabilityClaimInPostgres: async () => {
+        throw new Error('default capability reader must be replaced in this test')
+      },
+    },
+  },
+)
+const runtimeAccountGlobalId = 'gia1234567'
+const runtimeOrganizationId = '11111111-1111-4111-8111-111111111111'
+const runtimeExternalAccountId = 'b_brand123'
+const runtimeCredential = {
+  organizationId: runtimeOrganizationId,
+  integrationAccountId: '22222222-2222-4222-8222-222222222222',
+  globalId: runtimeAccountGlobalId,
+  provider: 'faire',
+  environment: 'production',
+  externalAccountId: runtimeExternalAccountId,
+  status: 'active',
+  verificationStatus: 'verified',
+  credentialVersion: 9,
+  authMode: 'faire_oauth',
+  configuration: {},
+  encrypted: {},
+}
+const runtimeClaim = (capability) => ({
+  transitionGlobalId: 'gcat1234567',
+  authorizationGlobalId: 'gcaa1234567',
+  preparationGlobalId: 'gcap1234567',
+  cohortHash: 'a'.repeat(64),
+  activationRevision: 6,
+  accountGlobalId: runtimeAccountGlobalId,
+  provider: 'faire',
+  environment: 'production',
+  externalAccountId: runtimeExternalAccountId,
+  credentialGeneration: 9,
+  grantedScopeDigest: 'b'.repeat(64),
+  capability,
+  capabilityDigest: 'c'.repeat(64),
+  authorizedBy: 'owner@example.com',
+  authorizedRole: 'owner',
+  activatedAt: new Date().toISOString(),
+})
+let runtimeExecutions = 0
+let runtimeExecutionInput = null
+const runtimeDependencies = {
+  readRuntimeCredential: async () => runtimeCredential,
+  requireCapability: async ({ capability }) => runtimeClaim(capability),
+  decryptCredential: () => ({
+    provider: 'faire',
+    authMode: 'faire_oauth',
+    applicationId: 'app-id-for-runtime-acceptance',
+    applicationSecret: 'application-secret-for-runtime-acceptance',
+    accessToken: 'oauth-access-token-for-runtime-acceptance',
+    scopes: ['READ_SHIPMENTS', 'WRITE_ORDERS'],
+  }),
+  executeWriteback: async (input) => {
+    runtimeExecutions += 1
+    runtimeExecutionInput = input
+    return {
+      outcome: 'succeeded',
+      writeAttempt: { ...input.writeAttempt, state: 'succeeded' },
+      providerOrderId: input.externalOrderId,
+      providerState: 'PRE_TRANSIT',
+      providerShipmentReferences: ['s_runtime1'],
+      trackingCodes: input.packages.map((item) => item.trackingCode),
+      replayed: false,
+      reconciledUnknownOutcome: false,
+    }
+  },
+}
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    await runtime.prepareCurrentFaireFulfillmentAuthority({
+      organizationId: runtimeOrganizationId,
+      accountGlobalId: runtimeAccountGlobalId,
+    }, runtimeDependencies),
+  )),
+  {
+    authorizationRevision: 6,
+    credentialGeneration: 9,
+    externalAccountId: runtimeExternalAccountId,
+  },
+)
+await runtime.executeCurrentFaireFulfillmentWriteback({
+  organizationId: runtimeOrganizationId,
+  accountGlobalId: runtimeAccountGlobalId,
+  mode: 'execute',
+  writeAttempt: {
+    attemptId: 'gxa1234567',
+    authorizationRevision: 6,
+    state: 'authorized',
+  },
+  externalOrderId: 'bo_runtime123',
+  expectedShipDate: '2026-08-02T12:00:00.000Z',
+  packages: [{
+    packageReference: 'gpa1234567',
+    carrier: 'UPS',
+    trackingCode: '1ZRUNTIME',
+  }],
+}, runtimeDependencies)
+assert.equal(runtimeExecutions, 1)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(runtimeExecutionInput.authorization)),
+  {
+    provider: 'faire',
+    environment: 'production',
+    accountGlobalId: runtimeAccountGlobalId,
+    externalAccountId: runtimeExternalAccountId,
+    credentialVersion: 9,
+    authorizationRevision: 6,
+    capabilities: [
+      'order_processing',
+      'fulfillment_export',
+      'tracking_export',
+    ],
+    verifiedWriteScopes: ['WRITE_ORDERS'],
+    scopeVerificationSource: 'oauth_grant',
+  },
+)
+assert.equal(runtimeExecutionInput.credential.binding.verificationStatus, 'verified')
+
+await assert.rejects(
+  () => runtime.executeCurrentFaireFulfillmentWriteback({
+    organizationId: runtimeOrganizationId,
+    accountGlobalId: runtimeAccountGlobalId,
+    mode: 'execute',
+    writeAttempt: {
+      attemptId: 'gxa1234568',
+      authorizationRevision: 6,
+      state: 'authorized',
+    },
+    externalOrderId: 'bo_runtime124',
+    packages: [{
+      packageReference: 'gpa1234568',
+      carrier: 'FEDEX',
+      trackingCode: 'RUNTIME2',
+    }],
+  }, {
+    ...runtimeDependencies,
+    readRuntimeCredential: async () => ({
+      ...runtimeCredential,
+      authMode: 'faire_brand_token',
+    }),
+  }),
+  (error) => error?.code === 'FAIRE_FULFILLMENT_CONNECTION_INVALID',
+  'Direct Faire brand tokens must not authorize fulfillment writes',
+)
+assert.equal(runtimeExecutions, 1)
+
+await assert.rejects(
+  () => runtime.prepareCurrentFaireFulfillmentAuthority({
+    organizationId: runtimeOrganizationId,
+    accountGlobalId: runtimeAccountGlobalId,
+  }, {
+    ...runtimeDependencies,
+    decryptCredential: () => ({
+      provider: 'faire',
+      authMode: 'faire_oauth',
+      applicationId: 'app-id-for-runtime-acceptance',
+      applicationSecret: 'application-secret-for-runtime-acceptance',
+      accessToken: 'oauth-access-token-for-runtime-acceptance',
+      scopes: ['WRITE_ORDERS'],
+    }),
+  }),
+  (error) => error?.code === 'FAIRE_FULFILLMENT_OAUTH_SCOPE_REQUIRED',
+)
+assert.equal(runtimeExecutions, 1)
+
 console.log('Faire provider-write foundation tests passed')

@@ -391,7 +391,12 @@ async function splitPackedOrderIntoTwoPackagesForFixture(pool, fixture, orderGlo
   }
 }
 
-async function addSandboxLabelsForAllPackages(pool, fixture, orderGlobalId) {
+async function addSandboxLabelsForAllPackages(
+  pool,
+  fixture,
+  orderGlobalId,
+  environment = 'sandbox',
+) {
   const context = await pool.query(
     `SELECT package.id::text AS package_id, package.global_id AS package_global_id,
             rate.id::text AS rate_id, rate.carrier, rate.service_code
@@ -413,7 +418,7 @@ async function addSandboxLabelsForAllPackages(pool, fixture, orderGlobalId) {
   assert.equal(context.rowCount, 2)
   const trackingNumbers = []
   for (const [index, row] of context.rows.entries()) {
-    const trackingNumber = `SANDBOXE2E${index + 1}${randomUUID()
+    const trackingNumber = `${environment.toUpperCase()}E2E${index + 1}${randomUUID()
       .replaceAll('-', '').slice(0, 16).toUpperCase()}`
     await pool.query(
       `INSERT INTO operations_labels (
@@ -422,7 +427,7 @@ async function addSandboxLabelsForAllPackages(pool, fixture, orderGlobalId) {
          idempotency_key, status, environment, redacted_provider_evidence
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4, $5,
-         $6, 'PDF', $7, $8, $9, 'created', 'sandbox', $10::jsonb
+         $6, 'PDF', $7, $8, $9, 'created', $10, $11::jsonb
        )`,
       [
         fixture.organizationId, row.package_id, row.rate_id, row.carrier,
@@ -430,7 +435,8 @@ async function addSandboxLabelsForAllPackages(pool, fixture, orderGlobalId) {
         Buffer.from(`%PDF-1.4 sandbox E2E package ${index + 1}`).toString('base64'),
         `sandbox-e2e-provider-${randomUUID()}`,
         `sandbox-e2e-label-${randomUUID()}`,
-        JSON.stringify({ environment: 'sandbox', packageGlobalId: row.package_global_id }),
+        environment,
+        JSON.stringify({ environment, packageGlobalId: row.package_global_id }),
       ],
     )
     await pool.query(
@@ -710,6 +716,9 @@ async function verifyShipmentCompletion(databaseUrl) {
     let shopifyFulfillmentExecutionCalls = 0
     let shopifyFulfillmentReconciliationCalls = 0
     let shopifyFulfillmentReconciliationResult = null
+    let faireFulfillmentPreparationCalls = 0
+    let faireFulfillmentExecutionCalls = 0
+    const faireFulfillmentInputs = []
     const persistence = loadTypeScriptModule('app_src/lib/persistence/operations.ts', {
       mocks: {
         '@/lib/auditWriter': auditWriter,
@@ -771,6 +780,34 @@ async function verifyShipmentCompletion(databaseUrl) {
           reconcileShopifyFulfillmentWriteback: async () => {
             shopifyFulfillmentReconciliationCalls += 1
             return shopifyFulfillmentReconciliationResult
+          },
+        },
+        '@/lib/integrations/faireFulfillmentRuntime': {
+          prepareCurrentFaireFulfillmentAuthority: async () => {
+            faireFulfillmentPreparationCalls += 1
+            return {
+              authorizationRevision: 4,
+              credentialGeneration: 2,
+              externalAccountId: 'b_faire-shipment-acceptance',
+            }
+          },
+          executeCurrentFaireFulfillmentWriteback: async (input) => {
+            faireFulfillmentExecutionCalls += 1
+            faireFulfillmentInputs.push(JSON.parse(JSON.stringify(input)))
+            return {
+              outcome: 'succeeded',
+              writeAttempt: { ...input.writeAttempt, state: 'succeeded' },
+              providerOrderId: input.externalOrderId,
+              providerState: 'PRE_TRANSIT',
+              providerShipmentReferences: input.packages.map(
+                (_item, index) => `s_faireacceptance${index + 1}`,
+              ),
+              trackingCodes: input.packages.map(
+                (item) => item.trackingCode,
+              ),
+              replayed: input.mode === 'reconcile_unknown',
+              reconciledUnknownOutcome: input.mode === 'reconcile_unknown',
+            }
           },
         },
         '@/lib/operations/adapters': adapters,
@@ -1309,21 +1346,47 @@ async function verifyShipmentCompletion(databaseUrl) {
       attempts: 1,
     })
 
-    const faireFixture = await createFixture('faire-export-pending')
+    const faireFixture = await createFixture(
+      'faire-export-writeback',
+      { unitsPerPackage: 1 },
+    )
     const faireOrder = await advanceOrderToPacked(
       persistence,
       faireFixture,
-      'faire-export-pending',
+      'faire-export-writeback',
     )
-    await addActiveLabel(
+    await splitPackedOrderIntoTwoPackagesForFixture(
+      pool,
+      faireFixture,
+      faireOrder.planned.orderGlobalId,
+    )
+    await addPackagingClaim(
+      pool,
+      faireFixture,
+      faireOrder.planned.orderGlobalId,
+    )
+    const faireTrackingNumbers = await addSandboxLabelsForAllPackages(
       pool,
       faireFixture,
       faireOrder.planned.orderGlobalId,
       'mock',
     )
     await pool.query(
+      `UPDATE operations_integration_accounts integration
+       SET provider = 'faire', environment = 'production',
+           external_account_id = 'b_faire-shipment-acceptance',
+           configuration = '{"grantedScopes":["READ_SHIPMENTS","WRITE_ORDERS"]}'::jsonb
+       FROM operations_orders source_order
+       WHERE source_order.organization_id = $1::uuid
+         AND source_order.global_id = $2
+         AND integration.organization_id = source_order.organization_id
+         AND integration.id = source_order.integration_account_id`,
+      [faireFixture.organizationId, faireOrder.planned.orderGlobalId],
+    )
+    await pool.query(
       `UPDATE operations_orders
-       SET source_provider = 'faire'
+       SET source_provider = 'faire',
+           external_order_id = 'bo_faire_shipment_acceptance'
        WHERE organization_id = $1::uuid AND global_id = $2`,
       [faireFixture.organizationId, faireOrder.planned.orderGlobalId],
     )
@@ -1333,10 +1396,12 @@ async function verifyShipmentCompletion(databaseUrl) {
         actorEmail: faireFixture.email,
         orderGlobalId: faireOrder.planned.orderGlobalId,
         expectedRowVersion: faireOrder.packed.rowVersion,
-        reason: 'Confirm Faire shipment while export adapter remains explicit',
-        idempotencyKey: `confirm-faire-export-pending-${randomUUID()}`,
+        reason: 'Confirm exact multi-package Faire fulfillment writeback',
+        idempotencyKey: `confirm-faire-export-writeback-${randomUUID()}`,
       })
-    assert.equal(faireConfirmed.commerceExportState, 'failed')
+    assert.equal(faireConfirmed.commerceExportState, 'succeeded')
+    assert.equal(faireFulfillmentPreparationCalls, 1)
+    assert.equal(faireFulfillmentExecutionCalls, 1)
     assert.deepEqual(
       JSON.parse(JSON.stringify(faireConfirmed.customerNotification)),
       {
@@ -1349,26 +1414,132 @@ async function verifyShipmentCompletion(databaseUrl) {
       },
     )
     const faireExport = await pool.query(
-      `SELECT state, attempts, payload_snapshot, error_code, error_message
+      `SELECT state, attempts, payload_snapshot, error_code, error_message,
+              provider_reference
        FROM operations_commerce_fulfillment_exports
        WHERE organization_id = $1::uuid
          AND global_id = $2`,
       [faireFixture.organizationId, faireConfirmed.commerceExportGlobalId],
     )
-    assert.equal(faireExport.rows[0].state, 'failed')
+    assert.equal(faireExport.rows[0].state, 'succeeded')
     assert.equal(faireExport.rows[0].attempts, 1)
+    assert.equal(faireExport.rows[0].error_code, null)
+    assert.equal(faireExport.rows[0].error_message, null)
     assert.equal(
-      faireExport.rows[0].error_code,
-      'OPERATIONS_FAIRE_FULFILLMENT_EXPORT_NOT_IMPLEMENTED',
+      faireExport.rows[0].provider_reference,
+      'bo_faire_shipment_acceptance',
     )
-    assert.match(
-      faireExport.rows[0].error_message,
-      /does not replace the required shipment submission/,
+    assert.equal(
+      faireExport.rows[0].payload_snapshot.providerWriteProtocol,
+      'faire-fulfillment-attempt-v1',
     )
+    assert.equal(faireExport.rows[0].payload_snapshot.packages.length, 2)
     assert.deepEqual(
       faireExport.rows[0].payload_snapshot.customerNotification,
       JSON.parse(JSON.stringify(faireConfirmed.customerNotification)),
     )
+    assert.equal(faireFulfillmentInputs[0].mode, 'execute')
+    assert.equal(faireFulfillmentInputs[0].writeAttempt.state, 'authorized')
+    assert.equal(faireFulfillmentInputs[0].packages.length, 2)
+    assert.deepEqual(
+      faireFulfillmentInputs[0].packages.map((item) => item.trackingCode).sort(),
+      [...faireTrackingNumbers].sort(),
+    )
+    assert.ok(faireFulfillmentInputs[0].packages.every(
+      (item) => /^gpa[0-9a-v]{12}$/.test(item.packageReference),
+    ))
+    const faireProviderAttempt = await pool.query(
+      `SELECT id::text, global_id, state, attempt_number, action,
+              adapter_version, redacted_request, redacted_response,
+              provider_reference, error_code
+       FROM operations_commerce_provider_attempts
+       WHERE organization_id = $1::uuid
+         AND external_object_id = $2
+         AND action = 'faire.fulfillment.shipments.create'`,
+      [faireFixture.organizationId, faireConfirmed.commerceExportGlobalId],
+    )
+    assert.equal(faireProviderAttempt.rowCount, 1)
+    assert.equal(faireProviderAttempt.rows[0].state, 'succeeded')
+    assert.equal(faireProviderAttempt.rows[0].attempt_number, 1)
+    assert.equal(
+      faireProviderAttempt.rows[0].adapter_version,
+      'faire-fulfillment-writeback-v1',
+    )
+    assert.equal(
+      faireProviderAttempt.rows[0].redacted_request.authorizationRevision,
+      4,
+    )
+    assert.equal(
+      faireProviderAttempt.rows[0].redacted_response.providerResult.outcome,
+      'succeeded',
+    )
+    assert.equal(faireProviderAttempt.rows[0].error_code, null)
+
+    const unknownFaireExport = await pool.query(
+      `INSERT INTO operations_commerce_fulfillment_exports (
+         organization_id, order_id, shipment_id, provider, external_order_id,
+         state, attempts, payload_snapshot, idempotency_key,
+         error_code, error_message, completed_at, updated_at
+       )
+       SELECT organization_id, order_id, shipment_id, provider,
+              external_order_id, 'failed', 1, payload_snapshot,
+              idempotency_key || ':unknown-reconciliation',
+              'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED',
+              'Unknown Faire shipment outcome', now(), now()
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2
+       RETURNING global_id, idempotency_key`,
+      [faireFixture.organizationId, faireConfirmed.commerceExportGlobalId],
+    )
+    assert.equal(unknownFaireExport.rowCount, 1)
+    await pool.query(
+      `INSERT INTO operations_commerce_provider_attempts (
+         organization_id, integration_account_id, action, adapter_version,
+         external_object_id, idempotency_key, request_hash,
+         redacted_request, redacted_response, state, attempt_number,
+         requested_at, completed_at, created_by
+       )
+       SELECT attempt.organization_id, attempt.integration_account_id,
+              attempt.action, attempt.adapter_version, $3,
+              $4, attempt.request_hash, attempt.redacted_request,
+              '{"outcome":"unknown"}'::jsonb, 'unknown', 1,
+              now(), now(), attempt.created_by
+       FROM operations_commerce_provider_attempts attempt
+       WHERE attempt.organization_id = $1::uuid
+         AND attempt.external_object_id = $2
+         AND attempt.action = 'faire.fulfillment.shipments.create'`,
+      [
+        faireFixture.organizationId,
+        faireConfirmed.commerceExportGlobalId,
+        unknownFaireExport.rows[0].global_id,
+        unknownFaireExport.rows[0].idempotency_key,
+      ],
+    )
+    const reconciledFaire = await persistence
+      .retryOperationsCommerceFulfillmentExportFromPostgres({
+        organizationId: faireFixture.organizationId,
+        actorEmail: faireFixture.email,
+        commerceExportGlobalId: unknownFaireExport.rows[0].global_id,
+        reason: 'Reconcile the unknown Faire shipment without another write',
+        idempotencyKey: `retry-faire-unknown-${randomUUID()}`,
+      })
+    assert.equal(reconciledFaire.state, 'succeeded')
+    assert.equal(faireFulfillmentPreparationCalls, 1)
+    assert.equal(faireFulfillmentExecutionCalls, 2)
+    assert.equal(faireFulfillmentInputs[1].mode, 'reconcile_unknown')
+    assert.equal(
+      faireFulfillmentInputs[1].writeAttempt.state,
+      'outcome_unknown',
+    )
+    const unknownFaireAttempts = await pool.query(
+      `SELECT count(*)::int AS count
+       FROM operations_commerce_provider_attempts
+       WHERE organization_id = $1::uuid
+         AND external_object_id = $2
+         AND action = 'faire.fulfillment.shipments.create'`,
+      [faireFixture.organizationId, unknownFaireExport.rows[0].global_id],
+    )
+    assert.equal(unknownFaireAttempts.rows[0].count, 1)
 
     const sandboxFixture = await createFixture('sandbox')
     const sandbox = await advanceOrderToPacked(persistence, sandboxFixture, 'sandbox')
@@ -2008,14 +2179,19 @@ async function main() {
     "AND attempts = $7",
     "let recoveryMode: 'execute' | 'reconcile_only'",
     'registerShopifyFulfillmentProviderAttempt',
+    'registerFaireFulfillmentProviderAttempt',
     'operations_commerce_provider_attempts',
     "'shopify.fulfillment.create'",
+    "'faire.fulfillment.shipments.create'",
     "providerWriteProtocol: 'shopify-fulfillment-attempt-v2'",
+    "'faire-fulfillment-attempt-v1'",
     'reconcileShopifyFulfillmentWriteback',
+    'executeCurrentFaireFulfillmentWriteback',
+    'prepareCurrentFaireFulfillmentAuthority',
     'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED',
     "mode: 'unavailable'",
     'customerNotification: resolvedCustomerNotification',
-    'OPERATIONS_FAIRE_FULFILLMENT_EXPORT_NOT_IMPLEMENTED',
+    'OPERATIONS_FAIRE_FULFILLMENT_SIGNATURE_REQUIRED',
   ]) {
     assert.ok(
       operationsSource.includes(fragment),

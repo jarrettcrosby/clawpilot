@@ -879,6 +879,14 @@ assert.equal(
   capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION.oauth_authentication,
   'control_plane_implemented',
 )
+assert.equal(
+  capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION.fulfillment_export,
+  'control_plane_implemented',
+)
+assert.equal(
+  capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION.tracking_export,
+  'control_plane_implemented',
+)
 assert.ok(
   capabilities.SHOPIFY_PROVIDER_AVAILABLE_CAPABILITIES.includes('order_import'),
 )
