@@ -2317,6 +2317,7 @@ const providerReads = {
   faireOrder: 0,
   faireProfile: 0,
 }
+const faireProductListOptions = []
 const providerAttempts = []
 const providerReservations = []
 const capturedReads = new Map()
@@ -2416,11 +2417,11 @@ const service = loadTypeScriptModule(
         },
         async listFaireProducts(_options, listOptions) {
           providerReads.faireProducts += 1
-          assert.equal(
-            listOptions.includeDeleted,
-            true,
-            'Every Faire product page must include deleted listings for lifecycle reconciliation',
-          )
+          faireProductListOptions.push({
+            cursor: listOptions.cursor ?? null,
+            limit: listOptions.limit,
+            includeDeleted: listOptions.includeDeleted,
+          })
           return {
             products: [{
               id: listOptions.cursor
@@ -3294,6 +3295,18 @@ try {
       idempotencyKey: nextKey(),
     },
   })
+  assert.deepEqual(
+    faireProductListOptions,
+    [
+      { cursor: null, limit: 50, includeDeleted: true },
+      {
+        cursor: 'faire-products-page-2',
+        limit: 50,
+        includeDeleted: undefined,
+      },
+    ],
+    'Faire catalog roots must request deleted lifecycle evidence while cursor continuations omit the rejected include-deleted filter',
+  )
   const firstFaire = await service.executeCommerceIntakeCommand({
     organizationId,
     actorEmail,

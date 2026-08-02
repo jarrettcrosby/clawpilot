@@ -1543,7 +1543,7 @@ async function faireProductEnvelope(
   const providerPage = await listFaireProducts(options, {
     cursor: page.orderCursor,
     limit: FAIRE_PRODUCT_PAGE_SIZE,
-    includeDeleted: true,
+    ...(page.orderCursor ? {} : { includeDeleted: true }),
   })
   const productNodes = faireCollection(providerPage, 'products')
   assertFaireRecordBrandScope(productNodes, runtime.externalAccountId)
