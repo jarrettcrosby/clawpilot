@@ -8842,7 +8842,7 @@ export async function readAutomaticCommerceCustomerTargetsForRunInPostgres(
          AND candidate.integration_account_id = $2::uuid
          AND run.global_id = $3
          AND run.credential_version = $4::integer
-         AND run.resource = 'orders'
+         AND run.resource = 'products_and_orders'
          AND candidate.expires_at > now()
          AND candidate.workflow_state IN ('held', 'resolving')
          AND candidate.customer_resolution_state = 'unresolved'

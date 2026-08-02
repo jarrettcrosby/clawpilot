@@ -85,6 +85,10 @@ for (const contract of [
   "'crm.product_image.uploaded'",
   "'crm.product_image.primary_changed'",
   'CRM_PRODUCT_IMAGE_REVISION_CONFLICT',
+  'readPublicCrmProductImageAssetBytesInPostgres',
+  'asset.content_sha256 = $2',
+  'CRM_PRODUCT_IMAGE_EVIDENCE_CORRUPT',
+  'enqueueSuiteCrmProductImageProjectionWithClient',
 ]) {
   assert.ok(
     persistence.includes(contract),
@@ -94,6 +98,65 @@ for (const contract of [
 assert.doesNotMatch(persistence, /shopify/i)
 assert.doesNotMatch(persistence, /\bfetch\s*\(/)
 assert.doesNotMatch(persistence, /DELETE FROM crm_product_image_assets/i)
+
+const publicUrl = read(
+  'app_src/lib/crm/productImagePublic.ts',
+)
+for (const contract of [
+  "globalIdPattern('gp')",
+  '/^[0-9a-f]{64}$/',
+  'url.protocol',
+  'url.username',
+  'url.password',
+  'url.pathname',
+  'SUITECRM_PRODUCT_IMAGE_MAX_URL_LENGTH = 255',
+  '/api/public/crm-product-images/',
+]) {
+  assert.ok(
+    publicUrl.includes(contract),
+    `public Product image URL must include ${contract}`,
+  )
+}
+
+const projection = read(
+  'app_src/lib/persistence/suiteCrmProductImageProjection.ts',
+)
+for (const contract of [
+  'enqueueSuiteCrmProductImageProjectionWithClient',
+  'asset.is_primary = true',
+  'image_asset.asset_revision',
+  'image_asset.row_version',
+  'image_asset.content_sha256',
+  'crm:products:image:v1:',
+  'INSERT INTO sync_outbox',
+  "target_system, payload",
+  "'suitecrm'",
+  'productImage:',
+  "'crm.product_image.suitecrm_queued'",
+  "projection: row.image_asset_id ? 'set' : 'clear'",
+]) {
+  assert.ok(
+    projection.includes(contract),
+    `SuiteCRM Product image projection must include ${contract}`,
+  )
+}
+
+const suiteCrmClient = read(
+  'app_src/lib/crm/suiteCrmClient.ts',
+)
+for (const contract of [
+  'record.productImage === null',
+  "attributes.product_image = ''",
+  'record.productImage !== undefined',
+  'publicCrmProductImageUrl',
+  'record.productImage.referenceCode',
+  'record.productImage.contentSha256',
+]) {
+  assert.ok(
+    suiteCrmClient.includes(contract),
+    `SuiteCRM Product image transport must include ${contract}`,
+  )
+}
 
 const route = read(
   'app_src/app/api/crm/products/[productId]/images/route.ts',
@@ -148,5 +211,44 @@ for (const contract of [
 }
 assert.doesNotMatch(previewRoute, /body\.organizationId/)
 assert.doesNotMatch(previewRoute, /\bfetch\s*\(/)
+
+const publicRoute = read(
+  'app_src/app/api/public/crm-product-images/[referenceCode]/[contentSha256]/route.ts',
+)
+for (const contract of [
+  'readPublicCrmProductImageAssetBytesInPostgres',
+  'CRM_PRODUCT_IMAGE_PUBLIC_REFERENCE_PATTERN',
+  'CRM_PRODUCT_IMAGE_PUBLIC_CONTENT_SHA256_PATTERN',
+  "'Cache-Control': 'public, max-age=31536000, immutable'",
+  "'Cross-Origin-Resource-Policy': 'cross-origin'",
+  "'X-Content-Type-Options': 'nosniff'",
+  "'Content-Disposition': 'inline'",
+  "req.headers.get('if-none-match')",
+  'status: 304',
+  'status: 404',
+]) {
+  assert.ok(
+    publicRoute.includes(contract),
+    `public Product image route must include ${contract}`,
+  )
+}
+assert.doesNotMatch(publicRoute, /requireRequestUser/)
+assert.doesNotMatch(publicRoute, /shopify/i)
+
+const providerImport = read(
+  'app_src/lib/persistence/commerceProductImageImports.ts',
+)
+for (const contract of [
+  'Promise<boolean>',
+  'const primaryChanged = await electCurrentProviderImagePrimary',
+  'const priorPrimaryChanged = await electCurrentProviderImagePrimary',
+  'const currentPrimaryChanged = await electCurrentProviderImagePrimary',
+  'enqueueSuiteCrmProductImageProjectionWithClient',
+]) {
+  assert.ok(
+    providerImport.includes(contract),
+    `provider primary projection must include ${contract}`,
+  )
+}
 
 console.log('CRM Product image asset contract checks passed')

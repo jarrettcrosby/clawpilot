@@ -190,12 +190,14 @@ function shippingSummary(
       `${pounds(contentWeightGrams)} lb items`,
       `${pounds(tareWeightGrams)} lb tare`,
     ].join(RATE_NAME_SEPARATOR),
-    packageDetail: packages.map((item) => (
-      `P${item.packageSequence}: ${item.itemCount} `
-      + `${item.itemCount === 1 ? 'item' : 'items'}, `
-      + `${pounds(item.grossWeightGrams)} lb gross, `
-      + `${pounds(item.tareWeightGrams)} lb tare`
-    )).join('; '),
+    packageDetail: packages.length > 1
+      ? packages.map((item) => (
+        `P${item.packageSequence}: ${item.itemCount} `
+        + `${item.itemCount === 1 ? 'item' : 'items'}, `
+        + `${pounds(item.grossWeightGrams)} lb gross, `
+        + `${pounds(item.tareWeightGrams)} lb tare`
+      )).join('; ')
+      : '',
   }
 }
 

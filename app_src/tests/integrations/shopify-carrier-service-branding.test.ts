@@ -99,6 +99,25 @@ test('adds exact package totals and complete compact package detail', () => {
   )
 })
 
+test('does not repeat the only package as P1', () => {
+  assert.equal(
+    shopifyStoreEntityRateName({
+      storeEntityName: 'Pro Bakery Bites',
+      carrierCode: 'fedex',
+      providerServiceName: 'FedEx Ground®',
+      packages: [{
+        packageSequence: 1,
+        itemCount: 5,
+        contentWeightGrams: 848,
+        tareWeightGrams: 91,
+        grossWeightGrams: 939,
+      }],
+    }),
+    'Pro Bakery Bites · FedEx · Ground® · 1 package · 5 items'
+      + ' · 2.07 lb gross · 1.87 lb items · 0.20 lb tare',
+  )
+})
+
 test('shows each package tare independently from its gross weight', () => {
   const value = shopifyStoreEntityRateName({
     storeEntityName: 'Pro Bakery Bites',

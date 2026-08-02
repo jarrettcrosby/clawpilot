@@ -1883,7 +1883,7 @@ includes(serviceSource, [
   'providerWrites: 0',
 ], 'Automatic commerce customer resolution')
 includes(persistenceSource, [
-  "run.resource = 'orders'",
+  "run.resource = 'products_and_orders'",
   "candidate.customer_resolution_state = 'unresolved'",
   "candidate.workflow_state IN ('held', 'resolving')",
   "encryptedSnapshot(candidate, input.runtime.globalId, 'party')",
@@ -2301,6 +2301,8 @@ const readIntents = new Map()
 const invalidContinuations = []
 const stageAttempts = []
 const automaticProductSweeps = []
+let automaticCustomerTargets = []
+const automaticCustomerResolverCalls = []
 const productPolicyUpdates = []
 let failStageOnceForKey = null
 let failReadIntentPreparationForKey = null
@@ -2716,7 +2718,9 @@ const service = loadTypeScriptModule(
       },
       '@/lib/persistence/commerceIntake': {
         async readAutomaticCommerceCustomerTargetsForRunInPostgres() {
-          return []
+          const targets = automaticCustomerTargets
+          automaticCustomerTargets = []
+          return targets
         },
         async autoCreateCommerceProductsForRunInPostgres(input) {
           automaticProductSweeps.push(input)
@@ -2976,8 +2980,29 @@ const service = loadTypeScriptModule(
         validateCommerceCandidateInPostgres: persistenceCommand('validate'),
       },
       '@/lib/persistence/operations': {
-        async resolveCommerceCustomerInPostgres() {
-          throw new Error('Unexpected customer resolver call in this fixture')
+        async resolveCommerceCustomerInPostgres(input) {
+          automaticCustomerResolverCalls.push(input)
+          const externalCustomerId = input.identity.externalCustomerId
+          if (externalCustomerId === 'customer-existing') {
+            return {
+              status: 'matched',
+              customer: { globalId: 'ga0000001' },
+            }
+          }
+          if (externalCustomerId === 'customer-new') {
+            return {
+              status: 'created',
+              customer: { globalId: 'ga0000002' },
+            }
+          }
+          if (externalCustomerId === 'customer-ambiguous') {
+            return { status: 'ambiguous', customer: null }
+          }
+          throw new MockCommerceIntegrationRequestError(
+            'Simulated customer resolver failure',
+            422,
+            'COMMERCE_CUSTOMER_IDENTITY_INVALID',
+          )
         },
       },
     },
@@ -3257,7 +3282,44 @@ try {
     },
   })
   const refreshKey = nextKey()
-  await service.executeCommerceIntakeCommand({
+  automaticCustomerTargets = [
+    {
+      candidateGlobalId: 'gcoc0000001',
+      candidateRowVersion: 1,
+      provider: 'shopify',
+      externalCustomerId: 'customer-existing',
+      companyName: 'Existing Customer',
+    },
+    {
+      candidateGlobalId: 'gcoc0000002',
+      candidateRowVersion: 2,
+      provider: 'shopify',
+      externalCustomerId: 'customer-new',
+      companyName: 'New Customer',
+    },
+    {
+      candidateGlobalId: 'gcoc0000003',
+      candidateRowVersion: 3,
+      provider: 'shopify',
+      externalCustomerId: 'customer-ambiguous',
+      companyName: 'Ambiguous Customer',
+    },
+    {
+      candidateGlobalId: 'gcoc0000004',
+      candidateRowVersion: 4,
+      provider: 'shopify',
+      externalCustomerId: null,
+      companyName: 'Missing Provider Identity',
+    },
+    {
+      candidateGlobalId: 'gcoc0000005',
+      candidateRowVersion: 5,
+      provider: 'shopify',
+      externalCustomerId: 'customer-error',
+      companyName: 'Invalid Customer',
+    },
+  ]
+  const automaticCustomerRefresh = await service.executeCommerceIntakeCommand({
     organizationId,
     actorEmail,
     body: {
@@ -3268,6 +3330,59 @@ try {
       idempotencyKey: refreshKey,
     },
   })
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      automaticCustomerRefresh.command.automaticCustomerResolution,
+    )),
+    {
+      runGlobalId: automaticCustomerRefresh.command.runGlobalId,
+      candidatesFound: 5,
+      matched: 1,
+      created: 1,
+      ambiguous: 1,
+      skipped: 1,
+      failed: 1,
+      failedByCode: { COMMERCE_CUSTOMER_IDENTITY_INVALID: 1 },
+      providerWrites: 0,
+      syncCursorAdvanced: false,
+    },
+  )
+  assert.deepEqual(
+    automaticCustomerResolverCalls.map(
+      (call) => call.identity.externalCustomerId,
+    ),
+    [
+      'customer-existing',
+      'customer-new',
+      'customer-ambiguous',
+      'customer-error',
+    ],
+  )
+  const automaticBindings = persistenceCommands.filter(
+    (entry) => entry.name === 'resolve-customer'
+      && ['gcoc0000001', 'gcoc0000002'].includes(
+        entry.input.candidateGlobalId,
+      ),
+  )
+  assert.deepEqual(
+    automaticBindings.map((entry) => ({
+      candidateGlobalId: entry.input.candidateGlobalId,
+      mode: entry.input.customer.mode,
+      customerGlobalId: entry.input.customer.customerGlobalId,
+    })),
+    [
+      {
+        candidateGlobalId: 'gcoc0000001',
+        mode: 'existing',
+        customerGlobalId: 'ga0000001',
+      },
+      {
+        candidateGlobalId: 'gcoc0000002',
+        mode: 'existing',
+        customerGlobalId: 'ga0000002',
+      },
+    ],
+  )
   await assert.rejects(
     service.executeCommerceIntakeCommand({
       organizationId,

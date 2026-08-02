@@ -1,5 +1,7 @@
 import type { CrmEntity, SuiteCrmOutboxRecord, SuiteCrmUserIdentityOutboxRecord } from '@/lib/crm/types'
 import { isIso4217CurrencyCode } from '@/lib/currency'
+import { publicCrmProductImageUrl } from '@/lib/crm/productImagePublic'
+import { appPublicUrl } from '@/lib/publicUrl'
 
 type SuiteCrmRecordModule =
   | 'Accounts'
@@ -407,13 +409,23 @@ export async function upsertSuiteCrmRecord(
   const currencyId = record.currencyCode
     ? await resolveSuiteCrmCurrencyId(record.currencyCode, fetchImpl)
     : null
+  const attributes = { ...record.attributes }
+  if (record.productImage === null) {
+    attributes.product_image = ''
+  } else if (record.productImage !== undefined) {
+    attributes.product_image = publicCrmProductImageUrl({
+      publicOrigin: appPublicUrl(),
+      productReferenceCode: record.productImage.referenceCode,
+      contentSha256: record.productImage.contentSha256,
+    })
+  }
   const body = {
     data: {
       type: moduleName,
       id: record.suiteCrmId,
       attributes: currencyId
-        ? { ...record.attributes, currency_id: currencyId }
-        : record.attributes,
+        ? { ...attributes, currency_id: currencyId }
+        : attributes,
     },
   }
   const response = await request('/Api/V8/module', {

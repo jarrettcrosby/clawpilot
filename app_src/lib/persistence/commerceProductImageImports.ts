@@ -9,6 +9,9 @@ import {
   acquireTransactionAdvisoryLock,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  enqueueSuiteCrmProductImageProjectionWithClient,
+} from '@/lib/persistence/suiteCrmProductImageProjection'
 
 export type CommerceProductImageProvider = 'shopify' | 'faire'
 export type CommerceProductImageLifecycle = 'active' | 'removed'
@@ -1404,7 +1407,7 @@ async function electCurrentProviderImagePrimary(
     actorEmail: string
     auditFence: string
   },
-): Promise<void> {
+): Promise<boolean> {
   await acquireTransactionAdvisoryLock(
     client,
     `crm-product-images:${input.organizationId}:${input.productId}`,
@@ -1520,7 +1523,7 @@ async function electCurrentProviderImagePrimary(
     )
     promoted = promotedResult.rows[0] || null
   }
-  if (demoted.rows.length === 0 && !promoted) return
+  if (demoted.rows.length === 0 && !promoted) return false
   await recordAuditEvent({
     actor: input.actorEmail,
     eventType: 'crm.product_image.provider_primary_reconciled',
@@ -1543,6 +1546,7 @@ async function electCurrentProviderImagePrimary(
       selection: 'active_provider_sequence',
     },
   }, client)
+  return true
 }
 
 async function inactivateCommerceProductImageBindingForObservation(
@@ -1685,13 +1689,21 @@ async function inactivateCommerceProductImageBindingForObservation(
       providerWrites: 0,
     },
   }, client)
-  await electCurrentProviderImagePrimary(client, {
+  const primaryChanged = await electCurrentProviderImagePrimary(client, {
     organizationId: saved.organization_id,
     pipelineId: saved.pipeline_id,
     productId: saved.product_id,
     actorEmail,
     auditFence: `${saved.global_id}:${rowVersion}`,
   })
+  if (primaryChanged) {
+    await enqueueSuiteCrmProductImageProjectionWithClient(client, {
+      organizationId: saved.organization_id,
+      pipelineId: saved.pipeline_id,
+      productId: saved.product_id,
+      actorEmail,
+    })
+  }
 }
 
 async function activateCommerceProductImageBinding(
@@ -1888,21 +1900,37 @@ async function activateCommerceProductImageBinding(
     prior.rows[0].pipeline_id !== saved.pipeline_id
     || prior.rows[0].product_id !== saved.product_id
   )) {
-    await electCurrentProviderImagePrimary(client, {
+    const priorPrimaryChanged = await electCurrentProviderImagePrimary(client, {
       organizationId: saved.organization_id,
       pipelineId: prior.rows[0].pipeline_id,
       productId: prior.rows[0].product_id,
       actorEmail: input.actorEmail,
       auditFence: `${saved.global_id}:${rowVersion}:prior-product`,
     })
+    if (priorPrimaryChanged) {
+      await enqueueSuiteCrmProductImageProjectionWithClient(client, {
+        organizationId: saved.organization_id,
+        pipelineId: prior.rows[0].pipeline_id,
+        productId: prior.rows[0].product_id,
+        actorEmail: input.actorEmail,
+      })
+    }
   }
-  await electCurrentProviderImagePrimary(client, {
+  const currentPrimaryChanged = await electCurrentProviderImagePrimary(client, {
     organizationId: saved.organization_id,
     pipelineId: saved.pipeline_id,
     productId: saved.product_id,
     actorEmail: input.actorEmail,
     auditFence: `${saved.global_id}:${rowVersion}`,
   })
+  if (currentPrimaryChanged) {
+    await enqueueSuiteCrmProductImageProjectionWithClient(client, {
+      organizationId: saved.organization_id,
+      pipelineId: saved.pipeline_id,
+      productId: saved.product_id,
+      actorEmail: input.actorEmail,
+    })
+  }
   const primary = await client.query<{ is_primary: boolean }>(
     `SELECT asset.is_primary
      FROM crm_product_image_assets asset

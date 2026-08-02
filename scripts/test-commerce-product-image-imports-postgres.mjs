@@ -170,6 +170,14 @@ const auditWriterMock = {
   },
 }
 
+const suiteCrmProductImageProjection = loadTypeScriptModule(
+  'app_src/lib/persistence/suiteCrmProductImageProjection.ts',
+  {
+    '@/lib/auditWriter': auditWriterMock,
+    '@/lib/persistence/postgres': persistenceMock,
+  },
+)
+
 const productImageAssets = loadTypeScriptModule(
   'app_src/lib/crm/productImageAssets.ts',
 )
@@ -179,6 +187,8 @@ const imageImports = loadTypeScriptModule(
     '@/lib/auditWriter': auditWriterMock,
     '@/lib/crm/productImageAssets': productImageAssets,
     '@/lib/persistence/postgres': persistenceMock,
+    '@/lib/persistence/suiteCrmProductImageProjection':
+      suiteCrmProductImageProjection,
   },
 )
 const crmImageAssets = loadTypeScriptModule(
@@ -187,6 +197,8 @@ const crmImageAssets = loadTypeScriptModule(
     '@/lib/auditWriter': auditWriterMock,
     '@/lib/crm/productImageAssets': productImageAssets,
     '@/lib/persistence/postgres': persistenceMock,
+    '@/lib/persistence/suiteCrmProductImageProjection':
+      suiteCrmProductImageProjection,
   },
 )
 
@@ -537,6 +549,12 @@ async function verifyImports(pool) {
       'gid://shopify/ProductVariant/102',
     ],
   })
+  await pool.query(
+    `UPDATE crm_products
+     SET suitecrm_id = 'suitecrm-catalog-image-acceptance'
+     WHERE pipeline_id = $1::uuid AND id = $2::uuid`,
+    [alpha.pipelineId, catalog.id],
+  )
   const manual = await addProduct(pool, alpha, {
     key: 'manual',
     name: 'Manual-primary product',
@@ -665,6 +683,31 @@ async function verifyImports(pool) {
   assert.equal(firstCompletion.isPrimary, true)
   assert.match(firstCompletion.provenanceGlobalId, /^gcip[0-9a-v]{12}$/u)
   assert.equal(firstCompletion.provenanceGlobalId.length, 16)
+  const firstSuiteCrmProjection = await pool.query(
+    `SELECT payload, idempotency_key, status
+     FROM sync_outbox
+     WHERE aggregate_type = 'crm_products'
+       AND aggregate_id = $1
+       AND target_system = 'suitecrm'
+     ORDER BY created_at, id`,
+    [catalog.id],
+  )
+  assert.equal(firstSuiteCrmProjection.rows.length, 1)
+  assert.equal(firstSuiteCrmProjection.rows[0].status, 'queued')
+  assert.equal(
+    firstSuiteCrmProjection.rows[0].payload.productImage.referenceCode,
+    catalog.referenceCode,
+  )
+  assert.equal(
+    firstSuiteCrmProjection.rows[0].payload.productImage.contentSha256,
+    firstCompletion.assetContentSha256,
+  )
+  assert.ok(firstSuiteCrmProjection.rows[0].idempotency_key.startsWith(
+    `crm:products:image:v1:${catalog.id}:${firstCompletion.assetId}:1:`,
+  ))
+  assert.ok(firstSuiteCrmProjection.rows[0].idempotency_key.endsWith(
+    `:${firstCompletion.assetContentSha256}`,
+  ))
   const firstBinding = await pool.query(
     `SELECT
        global_id, lifecycle_state, row_version, provider_sequence,
@@ -818,6 +861,16 @@ async function verifyImports(pool) {
   assert.equal(changedCompletion.reusedAsset, false)
   assert.equal(changedCompletion.assetRevision, 2)
   assert.equal(changedCompletion.isPrimary, true)
+  const setProjectionCount = await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM sync_outbox
+     WHERE aggregate_type = 'crm_products'
+       AND aggregate_id = $1
+       AND target_system = 'suitecrm'
+       AND payload->'productImage' IS NOT NULL`,
+    [catalog.id],
+  )
+  assert.equal(setProjectionCount.rows[0].count, 2)
   const catalogAfterByteChange = await crmImageAssets
     .listCrmProductImageAssetsInPostgres({
       organizationId: alpha.organizationId,
@@ -1505,6 +1558,21 @@ async function verifyImports(pool) {
       productId: catalog.id,
     })
   assert.equal(hiddenAfterRemoval.assets.length, 0)
+  const clearProjection = await pool.query(
+    `SELECT payload, idempotency_key, status
+     FROM sync_outbox
+     WHERE aggregate_type = 'crm_products'
+       AND aggregate_id = $1
+       AND target_system = 'suitecrm'
+       AND payload->'productImage' = 'null'::jsonb
+     ORDER BY created_at DESC, id DESC
+     LIMIT 1`,
+    [catalog.id],
+  )
+  assert.equal(clearProjection.rows.length, 1)
+  assert.equal(clearProjection.rows[0].status, 'queued')
+  assert.equal(clearProjection.rows[0].payload.productImage, null)
+  assert.ok(clearProjection.rows[0].idempotency_key.endsWith(':none'))
   await assertImportCode(
     crmImageAssets.readCrmProductImageAssetBytesInPostgres({
       organizationId: alpha.organizationId,

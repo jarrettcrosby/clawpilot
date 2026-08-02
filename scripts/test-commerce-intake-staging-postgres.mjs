@@ -1202,6 +1202,21 @@ async function verifyAcceptance(databaseUrl) {
   assert.equal(counters.fetchCalls, 0)
   assert.equal(counters.auditEvents, 1)
 
+  const automaticCustomerTargets = await persistence
+    .readAutomaticCommerceCustomerTargetsForRunInPostgres({
+      runtime: stageInput.runtime,
+      runGlobalId: result.runGlobalId,
+    })
+  assert.equal(
+    automaticCustomerTargets.length,
+    6,
+    'Order candidates must remain discoverable through their internal products-and-orders intake run',
+  )
+  assert.deepEqual(
+    automaticCustomerTargets.map((target) => target.provider),
+    Array(6).fill('shopify'),
+  )
+
   const imageCallsBeforeDirectReplay = counters.imageReconcileCalls.length
   const replay = await persistence.stageCommerceNormalizationEnvelopeInPostgres(
     stageInput,

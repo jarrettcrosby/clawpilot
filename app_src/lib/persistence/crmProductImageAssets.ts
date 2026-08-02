@@ -13,6 +13,9 @@ import {
   acquireTransactionAdvisoryLock,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  enqueueSuiteCrmProductImageProjectionWithClient,
+} from '@/lib/persistence/suiteCrmProductImageProjection'
 
 export type CrmProductImageAssetSource =
   | 'manual_upload'
@@ -465,6 +468,67 @@ export async function readCrmProductImageAssetBytesInPostgres(input: {
   })
 }
 
+export async function readPublicCrmProductImageAssetBytesInPostgres(input: {
+  productReferenceCode: string
+  contentSha256: string
+}): Promise<CrmProductImageAssetBytes | null> {
+  return withTransaction(async (client) => {
+    const result = await client.query<{
+      content_bytes: Buffer
+      mime_type: string
+      content_sha256: string
+      byte_length: number
+      pixel_width: number
+      pixel_height: number
+      alt_text: string
+    }>(
+      `SELECT
+         asset.content_bytes,
+         asset.mime_type,
+         asset.content_sha256,
+         asset.byte_length,
+         asset.pixel_width,
+         asset.pixel_height,
+         asset.alt_text
+       FROM crm_products product
+       JOIN crm_product_image_assets asset
+         ON asset.pipeline_id = product.pipeline_id
+        AND asset.product_id = product.id
+       WHERE product.reference_code = $1
+         AND asset.content_sha256 = $2
+       LIMIT 1
+       FOR SHARE OF product, asset`,
+      [input.productReferenceCode, input.contentSha256],
+    )
+    const row = result.rows[0]
+    if (!row || !Buffer.isBuffer(row.content_bytes)) return null
+    const validated = validateCrmProductImage({
+      bytes: new Uint8Array(row.content_bytes),
+      declaredMimeType: row.mime_type,
+      altText: row.alt_text,
+    })
+    if (
+      validated.contentSha256 !== row.content_sha256
+      || validated.byteLength !== row.byte_length
+      || validated.pixelWidth !== row.pixel_width
+      || validated.pixelHeight !== row.pixel_height
+    ) {
+      fail(
+        'CRM_PRODUCT_IMAGE_EVIDENCE_CORRUPT',
+        'Stored Product image bytes do not match their immutable evidence',
+        500,
+      )
+    }
+    return {
+      bytes: validated.bytes,
+      mimeType: validated.mimeType,
+      contentSha256: validated.contentSha256,
+      byteLength: validated.byteLength,
+      altText: validated.altText,
+    }
+  })
+}
+
 export async function uploadCrmProductImageAssetInPostgres(input: {
   organizationId: string
   productId: string
@@ -677,6 +741,14 @@ export async function uploadCrmProductImageAssetInPostgres(input: {
         previousPrimaryAssetIds,
       },
     }, client)
+    if (makePrimary) {
+      await enqueueSuiteCrmProductImageProjectionWithClient(client, {
+        organizationId: input.organizationId,
+        pipelineId: product.pipeline_id,
+        productId: product.id,
+        actorEmail: input.actorEmail,
+      })
+    }
     return state(client, input.organizationId, product)
   })
 }
@@ -843,6 +915,12 @@ export async function setPrimaryCrmProductImageAssetInPostgres(input: {
         previousPrimaryAssetIds: demoted.rows.map((row) => row.id),
       },
     }, client)
+    await enqueueSuiteCrmProductImageProjectionWithClient(client, {
+      organizationId: input.organizationId,
+      pipelineId: product.pipeline_id,
+      productId: product.id,
+      actorEmail: input.actorEmail,
+    })
     return state(client, input.organizationId, product)
   })
 }
