@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
+  CRM_PRODUCT_IMAGE_MAX_BYTES,
   validateCrmProductImage,
   type CrmProductImageMimeType,
 } from '@/lib/crm/productImageAssets'
@@ -110,6 +111,7 @@ export type CommerceProductImageImportCompletion = {
   provenanceGlobalId: string
   reusedAsset: boolean
   isPrimary: boolean
+  targetCount: number
   replayed: boolean
 }
 
@@ -199,6 +201,28 @@ type MappingResolutionRow = QueryResultRow & {
   product_name: string | null
 }
 
+type MappingTargetRow = QueryResultRow & {
+  pipeline_id: string
+  product_id: string
+  canonical_product_mapping_id: string
+  target_mapping_count: number
+  target_mapping_fingerprint_sha256: string
+  activation_revision: number
+  product_name: string
+  mapping_count: number
+  mapping_fingerprint_sha256: string
+}
+
+type CommerceProductImageMappingTarget = {
+  pipelineId: string
+  productId: string
+  productMappingId: string
+  targetMappingCount: number
+  targetMappingFingerprintSha256: string
+  activationRevision: number
+  assetAltText: string
+}
+
 type ImageBindingRow = QueryResultRow & {
   id: string
   global_id: string
@@ -227,6 +251,16 @@ type ImageBindingRow = QueryResultRow & {
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/
 const ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{2,99}$/
+const COMMERCE_PROVIDER_IMAGE_SOURCE_MAX_BYTES = 16 * 1024 * 1024
+const MAX_EXACT_IMAGE_FANOUT_TARGETS = 50
+const COMMERCE_PROVIDER_IMAGE_NORMALIZATION_PATTERN =
+  /^sharp-0\.35\.3-webp-auto-orient-v1-q(?:82|72|62|52|42|32)$/
+
+type CommerceProviderImageSourceEvidence = {
+  sourceByteLength: number
+  sourceContentSha256: string
+  normalizationVersion: string
+}
 
 function fail(code: string, message: string, status = 400): never {
   throw new CommerceProductImageImportError(code, message, status)
@@ -284,6 +318,50 @@ function requiredHash(value: unknown, label: string): string {
     fail('COMMERCE_PRODUCT_IMAGE_INPUT_INVALID', `${label} must be a lowercase SHA-256 digest`)
   }
   return value
+}
+
+function validatedSourceEvidence(
+  input: {
+    sourceByteLength: unknown
+    sourceContentSha256: unknown
+    normalizationVersion: unknown
+  },
+  image: ReturnType<typeof validateCrmProductImage>,
+): CommerceProviderImageSourceEvidence {
+  const sourceByteLength = Number(input.sourceByteLength)
+  const sourceContentSha256 = requiredHash(
+    input.sourceContentSha256,
+    'Provider source content hash',
+  )
+  const normalizationVersion = requiredTrimmed(
+    input.normalizationVersion,
+    'Provider image normalization version',
+    64,
+  )
+  const sourceLengthValid = Number.isSafeInteger(sourceByteLength)
+    && sourceByteLength >= 1
+    && sourceByteLength <= COMMERCE_PROVIDER_IMAGE_SOURCE_MAX_BYTES
+  const identity = normalizationVersion === 'identity-v1'
+    && sourceByteLength === image.byteLength
+    && sourceContentSha256 === image.contentSha256
+  const normalized = COMMERCE_PROVIDER_IMAGE_NORMALIZATION_PATTERN.test(
+    normalizationVersion,
+  )
+    && sourceByteLength > CRM_PRODUCT_IMAGE_MAX_BYTES
+    && sourceContentSha256 !== image.contentSha256
+    && image.mimeType === 'image/webp'
+  if (!sourceLengthValid || (!identity && !normalized)) {
+    fail(
+      'COMMERCE_PRODUCT_IMAGE_SOURCE_EVIDENCE_INVALID',
+      'Provider image source and stored-content evidence do not match',
+      409,
+    )
+  }
+  return {
+    sourceByteLength,
+    sourceContentSha256,
+    normalizationVersion,
+  }
 }
 
 function optionalInteger(value: unknown, label: string): number | null {
@@ -463,6 +541,123 @@ function mappedJobValues(
     ),
     assetAltText: observation.alt_text?.trim() || fallbackAlt,
   }
+}
+
+async function currentMappingTargets(
+  client: PoolClient,
+  job: JobRow,
+  observation: Pick<ObservationRow, 'alt_text'>,
+): Promise<CommerceProductImageMappingTarget[]> {
+  if (
+    !job.pipeline_id
+    || !job.product_id
+    || !job.product_mapping_id
+    || !job.mapping_count
+    || !job.mapping_fingerprint_sha256
+    || !job.activation_revision
+  ) {
+    fail(
+      'COMMERCE_PRODUCT_IMAGE_MAPPING_EVIDENCE_CORRUPT',
+      'Mapped commerce product image job is incomplete',
+      500,
+    )
+  }
+  const result = await client.query<MappingTargetRow>(
+    `SELECT
+       target.pipeline_id::text,
+       target.product_id::text,
+       target.canonical_product_mapping_id::text,
+       target.target_mapping_count,
+       target.target_mapping_fingerprint_sha256,
+       target.activation_revision,
+       target.product_name,
+       target.mapping_count,
+       target.mapping_fingerprint_sha256
+     FROM operations_commerce_product_image_mapping_targets(
+       $1::uuid, $2::uuid, $3, $4
+     ) target
+     WHERE target.pipeline_id = $5::uuid
+       AND target.activation_revision = $6
+       AND target.mapping_count = $7
+       AND target.mapping_fingerprint_sha256 = $8
+     ORDER BY
+       target.product_id::text,
+       target.canonical_product_mapping_id::text
+     LIMIT $9`,
+    [
+      job.organization_id,
+      job.integration_account_id,
+      job.provider,
+      job.external_product_id,
+      job.pipeline_id,
+      job.activation_revision,
+      job.mapping_count,
+      job.mapping_fingerprint_sha256,
+      MAX_EXACT_IMAGE_FANOUT_TARGETS + 1,
+    ],
+  )
+  if (result.rows.length > MAX_EXACT_IMAGE_FANOUT_TARGETS) {
+    fail(
+      'COMMERCE_PRODUCT_IMAGE_FANOUT_REVIEW_REQUIRED',
+      `Product image fan-out exceeds the ${MAX_EXACT_IMAGE_FANOUT_TARGETS}-Product safety limit`,
+      409,
+    )
+  }
+  if (result.rows.length === 0 || result.rows.length > job.mapping_count) {
+    fail(
+      'COMMERCE_PRODUCT_IMAGE_MAPPING_EVIDENCE_CORRUPT',
+      'Exact commerce product image fan-out targets are incomplete',
+      500,
+    )
+  }
+  const targets = result.rows.map((row) => {
+    if (
+      row.pipeline_id !== job.pipeline_id
+      || row.mapping_count !== job.mapping_count
+      || row.mapping_fingerprint_sha256 !== job.mapping_fingerprint_sha256
+      || row.activation_revision !== job.activation_revision
+      || !row.product_id
+      || !row.canonical_product_mapping_id
+      || !Number.isSafeInteger(row.target_mapping_count)
+      || row.target_mapping_count < 1
+      || !HASH_PATTERN.test(row.target_mapping_fingerprint_sha256)
+      || !row.product_name?.trim()
+    ) {
+      fail(
+        'COMMERCE_PRODUCT_IMAGE_MAPPING_EVIDENCE_CORRUPT',
+        'Exact commerce product image fan-out target is invalid',
+        500,
+      )
+    }
+    return {
+      pipelineId: row.pipeline_id,
+      productId: row.product_id,
+      productMappingId: row.canonical_product_mapping_id,
+      targetMappingCount: row.target_mapping_count,
+      targetMappingFingerprintSha256:
+        row.target_mapping_fingerprint_sha256,
+      activationRevision: row.activation_revision,
+      assetAltText: observation.alt_text?.trim()
+        || row.product_name.trim().slice(0, 500),
+    }
+  })
+  const productIds = new Set(targets.map((target) => target.productId))
+  if (
+    productIds.size !== targets.length
+    || targets[0]?.productId !== job.product_id
+    || targets[0]?.productMappingId !== job.product_mapping_id
+    || targets.reduce(
+      (total, target) => total + target.targetMappingCount,
+      0,
+    ) !== job.mapping_count
+  ) {
+    fail(
+      'COMMERCE_PRODUCT_IMAGE_MAPPING_EVIDENCE_CORRUPT',
+      'Exact commerce product image fan-out does not match the canonical job fence',
+      500,
+    )
+  }
+  return targets
 }
 
 async function selectObservation(
@@ -1438,7 +1633,6 @@ async function electCurrentProviderImagePrimary(
          AND binding.pipeline_id = $2::uuid
          AND binding.product_id = $3::uuid
          AND binding.lifecycle_state = 'active'
-         AND asset.source = 'provider_import'
          AND operations_commerce_product_image_observation_is_current_active(
            binding.organization_id,
            binding.latest_observation_id
@@ -1483,7 +1677,13 @@ async function electCurrentProviderImagePrimary(
      WHERE asset.organization_id = $1::uuid
        AND asset.pipeline_id = $2::uuid
        AND asset.product_id = $3::uuid
-       AND asset.source = 'provider_import'
+       AND (
+         (
+           $4::uuid IS NOT NULL
+           AND asset.source NOT IN ('manual_upload', 'migration')
+         )
+         OR ($4::uuid IS NULL AND asset.source = 'provider_import')
+       )
        AND asset.is_primary = true
        AND ($4::uuid IS NULL OR asset.id <> $4::uuid)
      RETURNING asset.id::text, asset.row_version::text`,
@@ -1510,7 +1710,6 @@ async function electCurrentProviderImagePrimary(
          AND asset.pipeline_id = $2::uuid
          AND asset.product_id = $3::uuid
          AND asset.id = $4::uuid
-         AND asset.source = 'provider_import'
          AND asset.is_primary = false
        RETURNING asset.id::text, asset.row_version::text`,
       [
@@ -1554,7 +1753,7 @@ async function inactivateCommerceProductImageBindingForObservation(
   observation: ObservationRow,
   actorEmail: string,
 ): Promise<void> {
-  const lookup = await client.query<Pick<
+  const lookups = await client.query<Pick<
     ImageBindingRow,
     'pipeline_id' | 'product_id'
   >>(
@@ -1566,7 +1765,7 @@ async function inactivateCommerceProductImageBindingForObservation(
        AND binding.credential_generation = $4
        AND binding.external_product_id = $5
        AND binding.image_identity_sha256 = $6
-     LIMIT 1`,
+     ORDER BY binding.pipeline_id::text, binding.product_id::text`,
     [
       observation.organization_id,
       observation.integration_account_id,
@@ -1576,133 +1775,134 @@ async function inactivateCommerceProductImageBindingForObservation(
       observation.image_identity_sha256,
     ],
   )
-  if (!lookup.rows[0]) return
-  await acquireTransactionAdvisoryLock(
-    client,
-    `crm-product-images:${observation.organization_id}:${lookup.rows[0].product_id}`,
-  )
-  const current = await client.query<ImageBindingRow>(
-    `SELECT binding.*
-     FROM operations_commerce_product_image_bindings binding
-     WHERE binding.organization_id = $1::uuid
-       AND binding.integration_account_id = $2::uuid
-       AND binding.provider = $3
-       AND binding.credential_generation = $4
-       AND binding.external_product_id = $5
-       AND binding.image_identity_sha256 = $6
-     LIMIT 1
-     FOR UPDATE`,
-    [
-      observation.organization_id,
-      observation.integration_account_id,
-      observation.provider,
-      observation.credential_generation,
-      observation.external_product_id,
-      observation.image_identity_sha256,
-    ],
-  )
-  const binding = current.rows[0]
-  if (!binding) return
-  if (binding.product_id !== lookup.rows[0].product_id) {
-    fail(
-      'COMMERCE_PRODUCT_IMAGE_BINDING_PRODUCT_CONFLICT',
-      'Commerce product image binding changed Product scope during removal',
-      409,
-    )
-  }
   const observationRevision = positiveInteger(
     observation.observation_revision,
     'removal observation revision',
   )
-  if (positiveInteger(
-    binding.latest_observation_revision,
-    'binding observation revision',
-  ) >= observationRevision) return
-  const updated = await client.query<ImageBindingRow>(
-    `UPDATE operations_commerce_product_image_bindings
-     SET provider_image_id = $7,
-         locator_sha256 = $8,
-         latest_observation_id = $9::uuid,
-         latest_observation_revision = $10,
-         latest_observation_set_id = $11::uuid,
-         provider_sequence = $12,
-         effective_alt_text = COALESCE($13, effective_alt_text),
-         lifecycle_state = 'inactive',
-         row_version = row_version + 1,
-         inactivated_at = clock_timestamp(),
-         updated_by = $14,
-         updated_at = clock_timestamp()
-     WHERE organization_id = $1::uuid
-       AND integration_account_id = $2::uuid
-       AND provider = $3
-       AND credential_generation = $4
-       AND external_product_id = $5
-       AND image_identity_sha256 = $6
-     RETURNING *`,
-    [
-      observation.organization_id,
-      observation.integration_account_id,
-      observation.provider,
-      observation.credential_generation,
-      observation.external_product_id,
-      observation.image_identity_sha256,
-      observation.provider_image_id,
-      observation.locator_sha256,
-      observation.id,
-      observationRevision,
-      observation.observation_set_id,
-      observation.image_sequence,
-      observation.alt_text,
-      actorEmail,
-    ],
-  )
-  const saved = updated.rows[0]
-  if (!saved) {
-    fail(
-      'COMMERCE_PRODUCT_IMAGE_BINDING_SAVE_FAILED',
-      'Commerce product image binding could not be inactivated',
-      500,
+  for (const lookup of lookups.rows) {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `crm-product-images:${observation.organization_id}:${lookup.product_id}`,
     )
-  }
-  const rowVersion = positiveInteger(saved.row_version, 'binding row version')
-  await recordAuditEvent({
-    actor: actorEmail,
-    eventType: 'operations.commerce_product_image_binding.inactivated',
-    aggregateType: 'operations_commerce_product_image_binding',
-    aggregateId: saved.global_id,
-    organizationId: saved.organization_id,
-    eventKey: `commerce-product-image-binding:${saved.global_id}:${rowVersion}`,
-    payload: {
-      bindingGlobalId: saved.global_id,
-      rowVersion,
-      provider: saved.provider,
-      integrationAccountId: saved.integration_account_id,
-      credentialGeneration: saved.credential_generation,
-      externalProductId: saved.external_product_id,
-      imageIdentitySha256: saved.image_identity_sha256,
-      latestObservationId: saved.latest_observation_id,
-      latestObservationRevision: observationRevision,
-      pipelineId: saved.pipeline_id,
-      productId: saved.product_id,
-      assetId: saved.asset_id,
-      lifecycleState: 'inactive',
-      providerWrites: 0,
-    },
-  }, client)
-  const primaryChanged = await electCurrentProviderImagePrimary(client, {
-    organizationId: saved.organization_id,
-    pipelineId: saved.pipeline_id,
-    productId: saved.product_id,
-    actorEmail,
-    auditFence: `${saved.global_id}:${rowVersion}`,
-  })
-  if (primaryChanged) {
-    await enqueueSuiteCrmProductImageProjectionWithClient(client, {
+    const current = await client.query<ImageBindingRow>(
+      `SELECT binding.*
+       FROM operations_commerce_product_image_bindings binding
+       WHERE binding.organization_id = $1::uuid
+         AND binding.integration_account_id = $2::uuid
+         AND binding.provider = $3
+         AND binding.credential_generation = $4
+         AND binding.external_product_id = $5
+         AND binding.image_identity_sha256 = $6
+         AND binding.pipeline_id = $7::uuid
+         AND binding.product_id = $8::uuid
+       LIMIT 1
+       FOR UPDATE`,
+      [
+        observation.organization_id,
+        observation.integration_account_id,
+        observation.provider,
+        observation.credential_generation,
+        observation.external_product_id,
+        observation.image_identity_sha256,
+        lookup.pipeline_id,
+        lookup.product_id,
+      ],
+    )
+    const binding = current.rows[0]
+    if (!binding || positiveInteger(
+      binding.latest_observation_revision,
+      'binding observation revision',
+    ) >= observationRevision) continue
+    const updated = await client.query<ImageBindingRow>(
+      `UPDATE operations_commerce_product_image_bindings
+       SET provider_image_id = $9,
+           locator_sha256 = $10,
+           latest_observation_id = $11::uuid,
+           latest_observation_revision = $12,
+           latest_observation_set_id = $13::uuid,
+           provider_sequence = $14,
+           effective_alt_text = COALESCE($15, effective_alt_text),
+           lifecycle_state = 'inactive',
+           row_version = row_version + 1,
+           inactivated_at = clock_timestamp(),
+           updated_by = $16,
+           updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND provider = $3
+         AND credential_generation = $4
+         AND external_product_id = $5
+         AND image_identity_sha256 = $6
+         AND pipeline_id = $7::uuid
+         AND product_id = $8::uuid
+       RETURNING *`,
+      [
+        observation.organization_id,
+        observation.integration_account_id,
+        observation.provider,
+        observation.credential_generation,
+        observation.external_product_id,
+        observation.image_identity_sha256,
+        lookup.pipeline_id,
+        lookup.product_id,
+        observation.provider_image_id,
+        observation.locator_sha256,
+        observation.id,
+        observationRevision,
+        observation.observation_set_id,
+        observation.image_sequence,
+        observation.alt_text,
+        actorEmail,
+      ],
+    )
+    const saved = updated.rows[0]
+    if (!saved) {
+      fail(
+        'COMMERCE_PRODUCT_IMAGE_BINDING_SAVE_FAILED',
+        'Commerce product image fan-out binding could not be inactivated',
+        500,
+      )
+    }
+    const rowVersion = positiveInteger(saved.row_version, 'binding row version')
+    await recordAuditEvent({
+      actor: actorEmail,
+      eventType: 'operations.commerce_product_image_binding.inactivated',
+      aggregateType: 'operations_commerce_product_image_binding',
+      aggregateId: saved.global_id,
+      organizationId: saved.organization_id,
+      eventKey: `commerce-product-image-binding:${saved.global_id}:${rowVersion}`,
+      payload: {
+        bindingGlobalId: saved.global_id,
+        rowVersion,
+        provider: saved.provider,
+        integrationAccountId: saved.integration_account_id,
+        credentialGeneration: saved.credential_generation,
+        externalProductId: saved.external_product_id,
+        imageIdentitySha256: saved.image_identity_sha256,
+        latestObservationId: saved.latest_observation_id,
+        latestObservationRevision: observationRevision,
+        pipelineId: saved.pipeline_id,
+        productId: saved.product_id,
+        assetId: saved.asset_id,
+        lifecycleState: 'inactive',
+        providerWrites: 0,
+      },
+    }, client)
+    const primaryChanged = await electCurrentProviderImagePrimary(client, {
       organizationId: saved.organization_id,
       pipelineId: saved.pipeline_id,
       productId: saved.product_id,
       actorEmail,
+      auditFence: `${saved.global_id}:${rowVersion}`,
     })
+    if (primaryChanged) {
+      await enqueueSuiteCrmProductImageProjectionWithClient(client, {
+        organizationId: saved.organization_id,
+        pipelineId: saved.pipeline_id,
+        productId: saved.product_id,
+        actorEmail,
+      })
+    }
   }
 }
 
@@ -1711,15 +1911,14 @@ async function activateCommerceProductImageBinding(
   input: {
     job: JobRow
     observation: ObservationRow
+    target: CommerceProductImageMappingTarget
     assetId: string
     actorEmail: string
   },
 ): Promise<{ binding: ImageBindingRow; isPrimary: boolean }> {
-  const { job, observation } = input
+  const { job, observation, target } = input
   if (
-    !job.pipeline_id
-    || !job.product_id
-    || !job.activation_revision
+    !job.activation_revision
     || !job.asset_alt_text
   ) {
     fail(
@@ -1730,30 +1929,7 @@ async function activateCommerceProductImageBinding(
   }
   await acquireTransactionAdvisoryLock(
     client,
-    `crm-product-images:${job.organization_id}:${job.product_id}`,
-  )
-  const prior = await client.query<Pick<
-    ImageBindingRow,
-    'pipeline_id' | 'product_id'
-  >>(
-    `SELECT binding.pipeline_id::text, binding.product_id::text
-     FROM operations_commerce_product_image_bindings binding
-     WHERE binding.organization_id = $1::uuid
-       AND binding.integration_account_id = $2::uuid
-       AND binding.provider = $3
-       AND binding.credential_generation = $4
-       AND binding.external_product_id = $5
-       AND binding.image_identity_sha256 = $6
-     LIMIT 1
-     FOR UPDATE`,
-    [
-      job.organization_id,
-      job.integration_account_id,
-      job.provider,
-      job.credential_generation,
-      job.external_product_id,
-      job.image_identity_sha256,
-    ],
+    `crm-product-images:${job.organization_id}:${target.productId}`,
   )
   const savedResult = await client.query<ImageBindingRow>(
     `INSERT INTO operations_commerce_product_image_bindings (
@@ -1793,7 +1969,8 @@ async function activateCommerceProductImageBinding(
        provider,
        credential_generation,
        external_product_id,
-       image_identity_sha256
+       image_identity_sha256,
+       product_id
      ) DO UPDATE SET
        provider_image_id = EXCLUDED.provider_image_id,
        locator_sha256 = EXCLUDED.locator_sha256,
@@ -1841,10 +2018,10 @@ async function activateCommerceProductImageBinding(
       job.id,
       positiveInteger(job.job_generation, 'job generation'),
       observation.image_sequence,
-      job.asset_alt_text,
-      job.pipeline_id,
-      job.product_id,
-      positiveInteger(job.activation_revision, 'activation revision'),
+      target.assetAltText,
+      target.pipelineId,
+      target.productId,
+      positiveInteger(target.activationRevision, 'activation revision'),
       input.assetId,
       input.actorEmail,
     ],
@@ -1891,31 +2068,16 @@ async function activateCommerceProductImageBinding(
         saved.activation_revision,
         'binding activation revision',
       ),
+      mappingCount: job.mapping_count,
+      mappingFingerprintSha256: job.mapping_fingerprint_sha256,
+      targetMappingCount: target.targetMappingCount,
+      targetMappingFingerprintSha256:
+        target.targetMappingFingerprintSha256,
       assetId: saved.asset_id,
       lifecycleState: 'active',
       providerWrites: 0,
     },
   }, client)
-  if (prior.rows[0] && (
-    prior.rows[0].pipeline_id !== saved.pipeline_id
-    || prior.rows[0].product_id !== saved.product_id
-  )) {
-    const priorPrimaryChanged = await electCurrentProviderImagePrimary(client, {
-      organizationId: saved.organization_id,
-      pipelineId: prior.rows[0].pipeline_id,
-      productId: prior.rows[0].product_id,
-      actorEmail: input.actorEmail,
-      auditFence: `${saved.global_id}:${rowVersion}:prior-product`,
-    })
-    if (priorPrimaryChanged) {
-      await enqueueSuiteCrmProductImageProjectionWithClient(client, {
-        organizationId: saved.organization_id,
-        pipelineId: prior.rows[0].pipeline_id,
-        productId: prior.rows[0].product_id,
-        actorEmail: input.actorEmail,
-      })
-    }
-  }
   const currentPrimaryChanged = await electCurrentProviderImagePrimary(client, {
     organizationId: saved.organization_id,
     pipelineId: saved.pipeline_id,
@@ -2833,6 +2995,217 @@ export async function failCommerceProductImageImportJobInPostgres(input: {
   })
 }
 
+type PersistedCommerceProductImageFanoutTarget = {
+  target: CommerceProductImageMappingTarget
+  asset: {
+    id: string
+    asset_revision: string
+    is_primary: boolean
+  }
+  provenance: {
+    id: string
+    global_id: string
+  }
+  reusedAsset: boolean
+}
+
+async function persistCommerceProductImageFanoutTarget(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    job: JobRow
+    target: CommerceProductImageMappingTarget
+    image: ReturnType<typeof validateCrmProductImage>
+    sourceEvidence: CommerceProviderImageSourceEvidence
+    actorEmail: string
+  },
+): Promise<PersistedCommerceProductImageFanoutTarget> {
+  const {
+    organizationId,
+    job,
+    target,
+    image,
+    sourceEvidence,
+    actorEmail,
+  } = input
+  const product = await client.query<{ id: string }>(
+    `SELECT product.id::text
+     FROM crm_products product
+     JOIN pipeline_spaces pipeline
+       ON pipeline.id = product.pipeline_id
+      AND pipeline.workspace_organization_id = $1::uuid
+     WHERE product.pipeline_id = $2::uuid
+       AND product.id = $3::uuid
+     LIMIT 1
+     FOR UPDATE OF product`,
+    [organizationId, target.pipelineId, target.productId],
+  )
+  if (!product.rows[0]) {
+    fail(
+      'COMMERCE_PRODUCT_IMAGE_PRODUCT_NOT_FOUND',
+      'Exact fan-out Product was not found in the active organization',
+      409,
+    )
+  }
+  const existing = await client.query<{
+    id: string
+    asset_revision: string
+    is_primary: boolean
+  }>(
+    `SELECT id::text, asset_revision::text, is_primary
+     FROM crm_product_image_assets
+     WHERE organization_id = $1::uuid
+       AND pipeline_id = $2::uuid
+       AND product_id = $3::uuid
+       AND content_sha256 = $4
+     LIMIT 1
+     FOR SHARE`,
+    [organizationId, target.pipelineId, target.productId, image.contentSha256],
+  )
+  let asset = existing.rows[0]
+  const reusedAsset = Boolean(asset)
+  if (!asset) {
+    const next = await client.query<{ next_revision: string }>(
+      `SELECT
+         (COALESCE(max(asset_revision), 0) + 1)::text AS next_revision
+       FROM crm_product_image_assets
+       WHERE organization_id = $1::uuid
+         AND pipeline_id = $2::uuid
+         AND product_id = $3::uuid`,
+      [organizationId, target.pipelineId, target.productId],
+    )
+    const revision = positiveInteger(
+      next.rows[0]?.next_revision || 1,
+      'next asset revision',
+    )
+    const inserted = await client.query<{
+      id: string
+      asset_revision: string
+      is_primary: boolean
+    }>(
+      `INSERT INTO crm_product_image_assets (
+         organization_id,
+         pipeline_id,
+         product_id,
+         asset_revision,
+         content_bytes,
+         mime_type,
+         content_sha256,
+         byte_length,
+         pixel_width,
+         pixel_height,
+         alt_text,
+         source,
+         is_primary,
+         row_version,
+         created_by,
+         updated_by,
+         created_at,
+         updated_at
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4, $5::bytea, $6, $7,
+         $8, $9, $10, $11, 'provider_import', false, 1, $12, $12,
+         clock_timestamp(), clock_timestamp()
+       )
+       RETURNING id::text, asset_revision::text, is_primary`,
+      [
+        organizationId,
+        target.pipelineId,
+        target.productId,
+        revision,
+        Buffer.from(image.bytes),
+        image.mimeType,
+        image.contentSha256,
+        image.byteLength,
+        image.pixelWidth,
+        image.pixelHeight,
+        target.assetAltText,
+        actorEmail,
+      ],
+    )
+    asset = inserted.rows[0]
+  }
+  if (!asset) {
+    fail(
+      'COMMERCE_PRODUCT_IMAGE_ASSET_SAVE_FAILED',
+      'Validated commerce product image fan-out asset could not be saved',
+      500,
+    )
+  }
+  const provenance = await client.query<{ id: string; global_id: string }>(
+    `INSERT INTO operations_commerce_product_image_asset_provenance (
+       organization_id,
+       integration_account_id,
+       provider,
+       credential_generation,
+       observation_id,
+       import_job_id,
+       import_job_generation,
+       external_product_id,
+       image_identity_sha256,
+       locator_sha256,
+       observation_source_hash,
+       pipeline_id,
+       product_id,
+       product_mapping_id,
+       mapping_count,
+       mapping_fingerprint_sha256,
+       activation_revision,
+       asset_id,
+       asset_revision,
+       asset_content_sha256,
+       source_content_sha256,
+       source_byte_length,
+       normalization_version,
+       imported_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3, $4, $5::uuid, $6::uuid, $7, $8, $9,
+       $10, $11, $12::uuid, $13::uuid, $14::uuid, $15, $16, $17,
+       $18::uuid, $19::bigint, $20, $21, $22, $23, $24
+     )
+     RETURNING id::text, global_id`,
+    [
+      organizationId,
+      job.integration_account_id,
+      job.provider,
+      job.credential_generation,
+      job.observation_id,
+      job.id,
+      positiveInteger(job.job_generation, 'job generation'),
+      job.external_product_id,
+      job.image_identity_sha256,
+      job.locator_sha256,
+      job.observation_source_hash,
+      target.pipelineId,
+      target.productId,
+      target.productMappingId,
+      job.mapping_count,
+      job.mapping_fingerprint_sha256,
+      target.activationRevision,
+      asset.id,
+      asset.asset_revision,
+      image.contentSha256,
+      sourceEvidence.sourceContentSha256,
+      sourceEvidence.sourceByteLength,
+      sourceEvidence.normalizationVersion,
+      actorEmail,
+    ],
+  )
+  if (!provenance.rows[0]) {
+    fail(
+      'COMMERCE_PRODUCT_IMAGE_PROVENANCE_SAVE_FAILED',
+      'Commerce product image fan-out provenance could not be saved',
+      500,
+    )
+  }
+  return {
+    target,
+    asset,
+    provenance: provenance.rows[0],
+    reusedAsset,
+  }
+}
+
 export async function completeCommerceProductImageImportJobInPostgres(input: {
   organizationId: string
   jobId: string
@@ -2840,6 +3213,9 @@ export async function completeCommerceProductImageImportJobInPostgres(input: {
   actorEmail: string
   bytes: Uint8Array
   declaredMimeType: unknown
+  sourceByteLength: unknown
+  sourceContentSha256: unknown
+  normalizationVersion: unknown
 }): Promise<CommerceProductImageImportCompletion> {
   const organizationId = requiredTrimmed(input.organizationId, 'Organization ID', 64)
   const jobId = requiredTrimmed(input.jobId, 'Import job ID', 64)
@@ -2860,6 +3236,7 @@ export async function completeCommerceProductImageImportJobInPostgres(input: {
         declaredMimeType: input.declaredMimeType,
         altText: job.asset_alt_text,
       })
+      const sourceEvidence = validatedSourceEvidence(input, image)
       if (!job.result_asset_id || job.result_content_sha256 !== image.contentSha256) {
         fail(
           'COMMERCE_PRODUCT_IMAGE_COMPLETION_CONFLICT',
@@ -2872,12 +3249,25 @@ export async function completeCommerceProductImageImportJobInPostgres(input: {
         is_primary: boolean
         provenance_id: string
         provenance_global_id: string
+        source_byte_length: string
+        source_content_sha256: string
+        normalization_version: string
+        target_count: string
       }>(
         `SELECT
            asset.asset_revision::text,
            asset.is_primary,
            provenance.id::text AS provenance_id,
-           provenance.global_id AS provenance_global_id
+           provenance.global_id AS provenance_global_id,
+           provenance.source_byte_length::text,
+           provenance.source_content_sha256,
+           provenance.normalization_version,
+           (
+             SELECT count(*)::text
+             FROM operations_commerce_product_image_asset_provenance target
+             WHERE target.organization_id = provenance.organization_id
+               AND target.import_job_id = provenance.import_job_id
+           ) AS target_count
          FROM crm_product_image_assets asset
          JOIN operations_commerce_product_image_asset_provenance provenance
            ON provenance.organization_id = asset.organization_id
@@ -2898,6 +3288,22 @@ export async function completeCommerceProductImageImportJobInPostgres(input: {
           500,
         )
       }
+      if (
+        positiveInteger(
+          replay.source_byte_length,
+          'source byte length',
+        ) !== sourceEvidence.sourceByteLength
+        || replay.source_content_sha256
+          !== sourceEvidence.sourceContentSha256
+        || replay.normalization_version
+          !== sourceEvidence.normalizationVersion
+      ) {
+        fail(
+          'COMMERCE_PRODUCT_IMAGE_COMPLETION_CONFLICT',
+          'Completed image import does not match this provider source evidence',
+          409,
+        )
+      }
       return {
         jobId: job.id,
         jobGlobalId: job.global_id,
@@ -2908,6 +3314,7 @@ export async function completeCommerceProductImageImportJobInPostgres(input: {
         provenanceGlobalId: replay.provenance_global_id,
         reusedAsset: true,
         isPrimary: replay.is_primary,
+        targetCount: positiveInteger(replay.target_count, 'fan-out target count'),
         replayed: true,
       }
     }
@@ -2942,6 +3349,7 @@ export async function completeCommerceProductImageImportJobInPostgres(input: {
       declaredMimeType: input.declaredMimeType,
       altText: job.asset_alt_text,
     })
+    const sourceEvidence = validatedSourceEvidence(input, image)
     const observation = await selectObservation(client, job.observation_id)
     if (
       (observation.pixel_width !== null
@@ -2956,10 +3364,16 @@ export async function completeCommerceProductImageImportJobInPostgres(input: {
       )
     }
 
-    const priorBindingScope = await client.query<{
+    const targets = await currentMappingTargets(client, job, observation)
+    const priorBindingScopes = await client.query<{
+      pipeline_id: string
       product_id: string
+      global_id: string
     }>(
-      `SELECT binding.product_id::text
+      `SELECT
+         binding.pipeline_id::text,
+         binding.product_id::text,
+         binding.global_id
        FROM operations_commerce_product_image_bindings binding
        WHERE binding.organization_id = $1::uuid
          AND binding.integration_account_id = $2::uuid
@@ -2967,7 +3381,7 @@ export async function completeCommerceProductImageImportJobInPostgres(input: {
          AND binding.credential_generation = $4
          AND binding.external_product_id = $5
          AND binding.image_identity_sha256 = $6
-       LIMIT 1`,
+       ORDER BY binding.pipeline_id::text, binding.product_id::text`,
       [
         organizationId,
         job.integration_account_id,
@@ -2978,184 +3392,37 @@ export async function completeCommerceProductImageImportJobInPostgres(input: {
       ],
     )
     const productLockIds = new Set([
-      job.product_id,
-      priorBindingScope.rows[0]?.product_id,
-    ].filter((value): value is string => Boolean(value)))
+      ...targets.map((target) => target.productId),
+      ...priorBindingScopes.rows.map((scope) => scope.product_id),
+    ])
     for (const productId of [...productLockIds].sort()) {
       await acquireTransactionAdvisoryLock(
         client,
         `crm-product-images:${organizationId}:${productId}`,
       )
     }
-    const product = await client.query<{ id: string }>(
-      `SELECT product.id::text
-       FROM crm_products product
-       JOIN pipeline_spaces pipeline
-         ON pipeline.id = product.pipeline_id
-        AND pipeline.workspace_organization_id = $1::uuid
-       WHERE product.pipeline_id = $2::uuid
-         AND product.id = $3::uuid
-       LIMIT 1
-       FOR UPDATE OF product`,
-      [organizationId, job.pipeline_id, job.product_id],
-    )
-    if (!product.rows[0]) {
-      fail(
-        'COMMERCE_PRODUCT_IMAGE_PRODUCT_NOT_FOUND',
-        'Mapped Product was not found in the active organization',
-        409,
-      )
-    }
-
-    const existing = await client.query<{
-      id: string
-      asset_revision: string
-      is_primary: boolean
-    }>(
-      `SELECT id::text, asset_revision::text, is_primary
-       FROM crm_product_image_assets
-       WHERE organization_id = $1::uuid
-         AND pipeline_id = $2::uuid
-         AND product_id = $3::uuid
-         AND content_sha256 = $4
-       LIMIT 1
-       FOR SHARE`,
-      [organizationId, job.pipeline_id, job.product_id, image.contentSha256],
-    )
-    let asset = existing.rows[0]
-    const reusedAsset = Boolean(asset)
-    if (!asset) {
-      const next = await client.query<{
-        next_revision: string
-      }>(
-        `SELECT
-           (COALESCE(max(asset_revision), 0) + 1)::text AS next_revision
-         FROM crm_product_image_assets
-         WHERE organization_id = $1::uuid
-           AND pipeline_id = $2::uuid
-           AND product_id = $3::uuid`,
-        [organizationId, job.pipeline_id, job.product_id],
-      )
-      const revision = positiveInteger(
-        next.rows[0]?.next_revision || 1,
-        'next asset revision',
-      )
-      const inserted = await client.query<{
-        id: string
-        asset_revision: string
-        is_primary: boolean
-      }>(
-        `INSERT INTO crm_product_image_assets (
-           organization_id,
-           pipeline_id,
-           product_id,
-           asset_revision,
-           content_bytes,
-           mime_type,
-           content_sha256,
-           byte_length,
-           pixel_width,
-           pixel_height,
-           alt_text,
-           source,
-           is_primary,
-           row_version,
-           created_by,
-           updated_by,
-           created_at,
-           updated_at
-         ) VALUES (
-           $1::uuid, $2::uuid, $3::uuid, $4, $5::bytea, $6, $7,
-           $8, $9, $10, $11, 'provider_import', $12, 1, $13, $13,
-           clock_timestamp(), clock_timestamp()
-         )
-         RETURNING id::text, asset_revision::text, is_primary`,
-        [
+    const persistedTargets: PersistedCommerceProductImageFanoutTarget[] = []
+    for (const target of targets) {
+      persistedTargets.push(await persistCommerceProductImageFanoutTarget(
+        client,
+        {
           organizationId,
-          job.pipeline_id,
-          job.product_id,
-          revision,
-          Buffer.from(image.bytes),
-          image.mimeType,
-          image.contentSha256,
-          image.byteLength,
-          image.pixelWidth,
-          image.pixelHeight,
-          image.altText,
-          false,
+          job,
+          target,
+          image,
+          sourceEvidence,
           actorEmail,
-        ],
-      )
-      asset = inserted.rows[0]
+        },
+      ))
     }
-    if (!asset) {
+    const canonical = persistedTargets.find((entry) => (
+      entry.target.productId === job.product_id
+      && entry.target.productMappingId === job.product_mapping_id
+    ))
+    if (!canonical) {
       fail(
-        'COMMERCE_PRODUCT_IMAGE_ASSET_SAVE_FAILED',
-        'Validated commerce product image asset could not be saved',
-        500,
-      )
-    }
-
-    const provenance = await client.query<{
-      id: string
-      global_id: string
-    }>(
-      `INSERT INTO operations_commerce_product_image_asset_provenance (
-         organization_id,
-         integration_account_id,
-         provider,
-         credential_generation,
-         observation_id,
-         import_job_id,
-         import_job_generation,
-         external_product_id,
-         image_identity_sha256,
-         locator_sha256,
-         observation_source_hash,
-         pipeline_id,
-         product_id,
-         product_mapping_id,
-         mapping_count,
-         mapping_fingerprint_sha256,
-         activation_revision,
-         asset_id,
-         asset_revision,
-         asset_content_sha256,
-         imported_by
-       ) VALUES (
-         $1::uuid, $2::uuid, $3, $4, $5::uuid, $6::uuid, $7, $8, $9,
-         $10, $11, $12::uuid, $13::uuid, $14::uuid, $15, $16, $17,
-         $18::uuid, $19::bigint, $20, $21
-       )
-       RETURNING id::text, global_id`,
-      [
-        organizationId,
-        job.integration_account_id,
-        job.provider,
-        job.credential_generation,
-        job.observation_id,
-        job.id,
-        positiveInteger(job.job_generation, 'job generation'),
-        job.external_product_id,
-        job.image_identity_sha256,
-        job.locator_sha256,
-        job.observation_source_hash,
-        job.pipeline_id,
-        job.product_id,
-        job.product_mapping_id,
-        job.mapping_count,
-        job.mapping_fingerprint_sha256,
-        job.activation_revision,
-        asset.id,
-        asset.asset_revision,
-        image.contentSha256,
-        actorEmail,
-      ],
-    )
-    if (!provenance.rows[0]) {
-      fail(
-        'COMMERCE_PRODUCT_IMAGE_PROVENANCE_SAVE_FAILED',
-        'Commerce product image provenance could not be saved',
+        'COMMERCE_PRODUCT_IMAGE_MAPPING_EVIDENCE_CORRUPT',
+        'Canonical commerce product image fan-out target is missing',
         500,
       )
     }
@@ -3172,24 +3439,115 @@ export async function completeCommerceProductImageImportJobInPostgres(input: {
            completed_at = clock_timestamp(),
            updated_by = $5
       WHERE organization_id = $1::uuid AND id = $2::uuid`,
-      [organizationId, job.id, asset.id, image.contentSha256, actorEmail],
+      [
+        organizationId,
+        job.id,
+        canonical.asset.id,
+        image.contentSha256,
+        actorEmail,
+      ],
     )
-    const activeBinding = await activateCommerceProductImageBinding(client, {
-      job,
-      observation,
-      assetId: asset.id,
-      actorEmail,
-    })
+    const activeBindings = []
+    for (const persisted of persistedTargets) {
+      activeBindings.push(await activateCommerceProductImageBinding(client, {
+        job,
+        observation,
+        target: persisted.target,
+        assetId: persisted.asset.id,
+        actorEmail,
+      }))
+    }
+    const currentTargetKeys = new Set(targets.map((target) => (
+      `${target.pipelineId}:${target.productId}`
+    )))
+    for (const prior of priorBindingScopes.rows) {
+      if (currentTargetKeys.has(`${prior.pipeline_id}:${prior.product_id}`)) {
+        continue
+      }
+      const primaryChanged = await electCurrentProviderImagePrimary(client, {
+        organizationId,
+        pipelineId: prior.pipeline_id,
+        productId: prior.product_id,
+        actorEmail,
+        auditFence: `${job.global_id}:${prior.global_id}:fanout-target-removed`,
+      })
+      if (primaryChanged) {
+        await enqueueSuiteCrmProductImageProjectionWithClient(client, {
+          organizationId,
+          pipelineId: prior.pipeline_id,
+          productId: prior.product_id,
+          actorEmail,
+        })
+      }
+    }
+    await recordAuditEvent({
+      actor: actorEmail,
+      eventType: 'operations.commerce_product_image_import.fanout_completed',
+      aggregateType: 'operations_commerce_product_image_import_job',
+      aggregateId: job.global_id,
+      organizationId,
+      eventKey: `commerce-product-image-fanout:${job.global_id}`,
+      payload: {
+        jobGlobalId: job.global_id,
+        observationId: job.observation_id,
+        provider: job.provider,
+        integrationAccountId: job.integration_account_id,
+        credentialGeneration: job.credential_generation,
+        externalProductId: job.external_product_id,
+        imageIdentitySha256: job.image_identity_sha256,
+        mappingCount: job.mapping_count,
+        mappingFingerprintSha256: job.mapping_fingerprint_sha256,
+        activationRevision: job.activation_revision,
+        targetCount: persistedTargets.length,
+        storedByteLength: image.byteLength,
+        storedContentSha256: image.contentSha256,
+        storedMimeType: image.mimeType,
+        sourceByteLength: sourceEvidence.sourceByteLength,
+        sourceContentSha256: sourceEvidence.sourceContentSha256,
+        normalizationVersion: sourceEvidence.normalizationVersion,
+        targets: persistedTargets.map((entry) => ({
+          pipelineId: entry.target.pipelineId,
+          productId: entry.target.productId,
+          productMappingId: entry.target.productMappingId,
+          targetMappingCount: entry.target.targetMappingCount,
+          targetMappingFingerprintSha256:
+            entry.target.targetMappingFingerprintSha256,
+          assetId: entry.asset.id,
+          assetRevision: positiveInteger(
+            entry.asset.asset_revision,
+            'fan-out asset revision',
+          ),
+          assetContentSha256: image.contentSha256,
+          provenanceGlobalId: entry.provenance.global_id,
+          reusedAsset: entry.reusedAsset,
+        })),
+        providerWrites: 0,
+      },
+    }, client)
+    const canonicalBinding = activeBindings[
+      persistedTargets.indexOf(canonical)
+    ]
+    if (!canonicalBinding) {
+      fail(
+        'COMMERCE_PRODUCT_IMAGE_BINDING_SAVE_FAILED',
+        'Canonical commerce product image fan-out binding is missing',
+        500,
+      )
+    }
     return {
       jobId: job.id,
       jobGlobalId: job.global_id,
-      assetId: asset.id,
-      assetRevision: positiveInteger(asset.asset_revision, 'asset revision'),
+      assetId: canonical.asset.id,
+      assetRevision: positiveInteger(
+        canonical.asset.asset_revision,
+        'asset revision',
+      ),
       assetContentSha256: image.contentSha256,
-      provenanceId: provenance.rows[0].id,
-      provenanceGlobalId: provenance.rows[0].global_id,
-      reusedAsset,
-      isPrimary: activeBinding.isPrimary,
+      provenanceId: canonical.provenance.id,
+      provenanceGlobalId: canonical.provenance.global_id,
+      reusedAsset: canonical.reusedAsset,
+      isPrimary: canonicalBinding.isPrimary,
+      targetCount: persistedTargets.length,
       replayed: false,
     }
   })

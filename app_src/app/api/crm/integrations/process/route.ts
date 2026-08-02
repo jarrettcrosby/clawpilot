@@ -7,6 +7,7 @@ import { processSuiteCrmAccountContactIngestion } from '@/lib/crm/suiteCrmAccoun
 import { processSuiteCrmCallIngestion } from '@/lib/crm/suiteCrmCallIngestion'
 import { processSuiteCrmInteractionIngestion } from '@/lib/crm/suiteCrmInteractionIngestion'
 import { processSuiteCrmMeetingIngestion } from '@/lib/crm/suiteCrmMeetingIngestion'
+import { processSuiteCrmProductImageIngestion } from '@/lib/crm/suiteCrmProductImageIngestion'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 
 export const dynamic = 'force-dynamic'
@@ -45,6 +46,8 @@ export async function POST(req: NextRequest) {
     const suiteCrmMeetingIngestion = await processSuiteCrmMeetingIngestion()
     const suiteCrmCallIngestion = await processSuiteCrmCallIngestion()
     const suiteCrmInteractionIngestion = await processSuiteCrmInteractionIngestion()
+    const suiteCrmProductImageIngestion =
+      await processSuiteCrmProductImageIngestion()
     const results = await processDueCrmIntegrationActions({ limit: boundedLimit(body.limit) })
     const actions = {
       claimed: results.length,
@@ -65,6 +68,7 @@ export async function POST(req: NextRequest) {
       suiteCrmMeetingIngestion,
       suiteCrmCallIngestion,
       suiteCrmInteractionIngestion,
+      suiteCrmProductImageIngestion,
     })
   } catch {
     return NextResponse.json(

@@ -79,6 +79,7 @@ const providerImages = loadTypeScriptModule(
 
 const {
   COMMERCE_PROVIDER_IMAGE_MAX_REDIRECTS,
+  COMMERCE_PROVIDER_IMAGE_SOURCE_MAX_BYTES,
   fetchCommerceProviderImage,
 } = providerImages
 const { CRM_PRODUCT_IMAGE_MAX_BYTES } = productImageAssets
@@ -289,16 +290,22 @@ test('prefers public IPv4 from dual-stack DNS and returns validated bytes only',
     'bytes',
     'contentSha256',
     'mediaType',
+    'normalizationVersion',
     'pixelHeight',
     'pixelWidth',
+    'sourceByteLength',
+    'sourceContentSha256',
   ])
   assert.deepEqual(result.bytes, ONE_PIXEL_PNG)
   assert.equal(result.byteLength, ONE_PIXEL_PNG.byteLength)
   assert.equal(result.contentSha256, createHash('sha256')
     .update(ONE_PIXEL_PNG).digest('hex'))
   assert.equal(result.mediaType, 'image/png')
+  assert.equal(result.normalizationVersion, 'identity-v1')
   assert.equal(result.pixelWidth, 1)
   assert.equal(result.pixelHeight, 1)
+  assert.equal(result.sourceByteLength, ONE_PIXEL_PNG.byteLength)
+  assert.equal(result.sourceContentSha256, result.contentSha256)
 })
 
 test('default DNS resolution selects IPv4 while retaining IPv6-only support', async () => {
@@ -712,11 +719,11 @@ test('enforces the redirect limit and requires a valid redirect location', async
   assert.equal(missing.state.cancelled, true)
 })
 
-test('enforces the streamed 2 MiB cap without trusting Content-Length', async () => {
+test('enforces the streamed 16 MiB source cap without trusting Content-Length', async () => {
   const oversized = response({
     headers: { 'content-type': 'image/png' },
     chunks: [
-      new Uint8Array(CRM_PRODUCT_IMAGE_MAX_BYTES),
+      new Uint8Array(COMMERCE_PROVIDER_IMAGE_SOURCE_MAX_BYTES),
       Uint8Array.of(0),
     ],
   })
@@ -725,6 +732,95 @@ test('enforces the streamed 2 MiB cap without trusting Content-Length', async ()
     safeDependencies({ fetch: async () => oversized.response }),
   ), 'COMMERCE_PROVIDER_IMAGE_SIZE_INVALID')
   assert.equal(oversized.state.cancelled, true)
+})
+
+test('normalizes a fully decoded oversized source and retains source evidence', async () => {
+  const width = 1_600
+  const height = 1_600
+  const pixels = Buffer.alloc(width * height * 3)
+  let random = 0x12345678
+  for (let index = 0; index < pixels.byteLength; index += 1) {
+    random = ((random * 1_664_525) + 1_013_904_223) >>> 0
+    pixels[index] = random >>> 24
+  }
+  const source = await sharpModule(pixels, {
+    raw: { channels: 3, height, width },
+  }).png({ compressionLevel: 0 }).toBuffer()
+  assert.ok(source.byteLength > CRM_PRODUCT_IMAGE_MAX_BYTES)
+  assert.ok(source.byteLength < COMMERCE_PROVIDER_IMAGE_SOURCE_MAX_BYTES)
+
+  const result = await fetchCommerceProviderImage(
+    { url: 'https://images.vendor.com/oversized-valid.png' },
+    safeDependencies({
+      async fetch() {
+        return response({
+          chunks: [source],
+          headers: {
+            'content-length': String(source.byteLength),
+            'content-type': 'image/png',
+          },
+        }).response
+      },
+    }),
+  )
+  assert.ok(result.byteLength <= CRM_PRODUCT_IMAGE_MAX_BYTES)
+  assert.equal(result.mediaType, 'image/webp')
+  assert.match(
+    result.normalizationVersion,
+    /^sharp-0\.35\.3-webp-auto-orient-v1-q\d+$/,
+  )
+  assert.equal(result.pixelWidth, width)
+  assert.equal(result.pixelHeight, height)
+  assert.equal(result.sourceByteLength, source.byteLength)
+  assert.equal(result.sourceContentSha256, createHash('sha256')
+    .update(source).digest('hex'))
+  assert.notEqual(result.contentSha256, result.sourceContentSha256)
+  assert.deepEqual(await sharpModule(result.bytes).metadata().then((metadata) => ({
+    format: metadata.format,
+    height: metadata.height,
+    width: metadata.width,
+  })), { format: 'webp', height, width })
+})
+
+test('auto-orients an oversized JPEG before stripping EXIF metadata', async () => {
+  const width = 1_400
+  const height = 1_200
+  const pixels = Buffer.alloc(width * height * 3)
+  let random = 0x9abcdef0
+  for (let index = 0; index < pixels.byteLength; index += 1) {
+    random = ((random * 1_664_525) + 1_013_904_223) >>> 0
+    pixels[index] = random >>> 24
+  }
+  const source = await sharpModule(pixels, {
+    raw: { channels: 3, height, width },
+  }).jpeg({
+    chromaSubsampling: '4:4:4',
+    quality: 100,
+  }).withMetadata({ orientation: 6 }).toBuffer()
+  assert.ok(source.byteLength > CRM_PRODUCT_IMAGE_MAX_BYTES)
+
+  const result = await fetchCommerceProviderImage(
+    { url: 'https://images.vendor.com/oriented-oversized.jpg' },
+    safeDependencies({
+      async fetch() {
+        return response({
+          chunks: [source],
+          headers: {
+            'content-length': String(source.byteLength),
+            'content-type': 'image/jpeg',
+          },
+        }).response
+      },
+    }),
+  )
+  assert.equal(result.mediaType, 'image/webp')
+  assert.equal(result.pixelWidth, height)
+  assert.equal(result.pixelHeight, width)
+  const metadata = await sharpModule(result.bytes).metadata()
+  assert.equal(metadata.format, 'webp')
+  assert.equal(metadata.width, height)
+  assert.equal(metadata.height, width)
+  assert.equal(metadata.orientation, undefined)
 })
 
 test('uses bounded storage for thousands of tiny chunks and rejects empty chunks', async () => {
@@ -762,7 +858,7 @@ test('uses bounded storage for thousands of tiny chunks and rejects empty chunks
 
 test('fails closed on oversized, malformed, and mismatched Content-Length', async () => {
   for (const [contentLength, expectedCode] of [
-    [String(CRM_PRODUCT_IMAGE_MAX_BYTES + 1), 'COMMERCE_PROVIDER_IMAGE_SIZE_INVALID'],
+    [String(COMMERCE_PROVIDER_IMAGE_SOURCE_MAX_BYTES + 1), 'COMMERCE_PROVIDER_IMAGE_SIZE_INVALID'],
     ['1.5', 'COMMERCE_PROVIDER_IMAGE_CONTENT_LENGTH_INVALID'],
     [String(ONE_PIXEL_PNG.byteLength + 1), 'COMMERCE_PROVIDER_IMAGE_CONTENT_LENGTH_INVALID'],
   ]) {

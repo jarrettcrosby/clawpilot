@@ -922,6 +922,7 @@ assertIncludes(crmIntegrationWorkerRoute, 'processCalendarIngestion', 'Google Ca
 assertIncludes(crmIntegrationWorkerRoute, 'processSuiteCrmAccountContactIngestion', 'SuiteCRM account/contact reconciliation worker')
 assertIncludes(crmIntegrationWorkerRoute, 'processSuiteCrmMeetingIngestion', 'SuiteCRM meeting reconciliation worker')
 assertIncludes(crmIntegrationWorkerRoute, 'processSuiteCrmCallIngestion', 'SuiteCRM native Call reconciliation worker')
+assertIncludes(crmIntegrationWorkerRoute, 'processSuiteCrmProductImageIngestion', 'SuiteCRM Product image reverse-ingestion worker')
 
 const crmCalendarIngestion = read('app_src/lib/crm/calendarIngestion.ts')
 assertIncludes(crmCalendarIngestion, 'clawpilotMeetingReference', 'Calendar meeting reference correlation')
@@ -1851,6 +1852,90 @@ for (const fragment of [
 const commerceProductImageImportPersistence = read(
   'app_src/lib/persistence/commerceProductImageImports.ts',
 )
+const commerceProductImageFanoutMigration = read(
+  'db/migrations/0225_operations_commerce_product_image_exact_fanout.sql',
+)
+for (const fragment of [
+  'operations_commerce_product_image_mapping_targets',
+  'target_mapping_fingerprint_sha256',
+  'ops_commerce_image_provenance_job_product_unique',
+  'ops_commerce_image_binding_exact_product_unique',
+  'guard_operations_commerce_product_image_asset_provenance()',
+  'guard_operations_commerce_product_image_binding()',
+]) {
+  assertIncludes(
+    commerceProductImageFanoutMigration,
+    fragment,
+    'exact commerce product image fan-out database authority',
+  )
+}
+const suiteCrmProductImageReverseMigration = read(
+  'db/migrations/0226_suitecrm_product_image_reverse_ingestion.sql',
+)
+for (const fragment of [
+  'crm_suitecrm_product_image_observations',
+  'crm_suitecrm_product_image_snapshot_fences',
+  'crm_suitecrm_product_image_asset_provenance',
+  'crm_suitecrm_product_image_ingestion_worker_heartbeat',
+  'provider_write_count integer NOT NULL DEFAULT 0',
+  'guard_crm_suitecrm_product_image_observation_write',
+  'guard_crm_suitecrm_product_image_provenance_write',
+  'guard_crm_suitecrm_product_image_snapshot_fence_write',
+  'guard_crm_suitecrm_image_fence_initial_revision_write',
+  'crm_suitecrm_product_image_observation_provider_writes_zero',
+  'crm_suitecrm_product_image_observation_timestamp_valid',
+  'crm_suitecrm_product_image_provenance_provider_writes_zero',
+  'crm_suitecrm_product_image_snapshot_fence_provenance_fkey',
+]) {
+  assertIncludes(
+    suiteCrmProductImageReverseMigration,
+    fragment,
+    'SuiteCRM Product image reverse-ingestion database authority',
+  )
+}
+const commerceProductImageSourceNormalizationMigration = read(
+  'db/migrations/0227_operations_commerce_product_image_source_normalization.sql',
+)
+for (const fragment of [
+  'source_content_sha256',
+  'source_byte_length',
+  'normalization_version',
+  'ops_commerce_image_provenance_source_evidence_valid',
+  'guard_operations_commerce_product_image_source_evidence_write',
+]) {
+  assertIncludes(
+    commerceProductImageSourceNormalizationMigration,
+    fragment,
+    'commerce product image source-normalization evidence authority',
+  )
+}
+for (const fragment of [
+  'guard_operations_commerce_product_image_source_evidence()',
+  'guard_operations_commerce_product_image_asset_provenance()',
+  'guard_crm_suitecrm_image_fence_initial_revision()',
+  'crm_suitecrm_product_image_snapshot_fence_provenance_fkey',
+  'trigger_row.tgfoid = to_regprocedure',
+  'trigger_row.tgtype = 31',
+  "trigger_row.tgenabled = 'O'",
+]) {
+  assertIncludes(
+    healthRoute,
+    fragment,
+    'Product image health database-authority verification',
+  )
+}
+for (const fragment of [
+  'currentMappingTargets',
+  'persistCommerceProductImageFanoutTarget',
+  'operations.commerce_product_image_import.fanout_completed',
+  'targetCount: persistedTargets.length',
+]) {
+  assertIncludes(
+    commerceProductImageImportPersistence,
+    fragment,
+    'exact commerce product image fan-out persistence',
+  )
+}
 assertIncludes(
   commerceProductImageImportPersistence,
   'export async function readCommerceProductImageImportQueueHealthInPostgres',
@@ -1908,6 +1993,26 @@ assert.ok(
     || []
   ).length >= 4,
   'Commerce product image readiness must gate migrations, health, and worker checks',
+)
+assert.ok(
+  (
+    healthRoute.match(/operations_commerce_product_image_fanout_applied/g)
+    || []
+  ).length >= 4,
+  'Commerce product image fan-out readiness must gate migrations, health, and worker checks',
+)
+assert.ok(
+  (
+    healthRoute.match(
+      /operations_commerce_product_image_source_normalization_applied/g,
+    ) || []
+  ).length >= 4,
+  'Commerce product image source-normalization readiness must gate migrations, health, and worker checks',
+)
+assertIncludes(
+  healthRoute,
+  "trigger_row.tgenabled = 'O'",
+  'commerce product image source-evidence readiness requires enabled triggers',
 )
 for (const [, alias] of healthRoute.matchAll(/\)\s+AS\s+([a-z0-9_]+)\s*,?/gi)) {
   assert.ok(

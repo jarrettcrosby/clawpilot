@@ -20,6 +20,7 @@ import {
 export type CrmProductImageAssetSource =
   | 'manual_upload'
   | 'provider_import'
+  | 'suitecrm_import'
   | 'migration'
 
 export type CrmProductImageAsset = {
@@ -205,7 +206,12 @@ function toAsset(row: AssetRow): CrmProductImageAsset {
     || row.pixel_height > CRM_PRODUCT_IMAGE_MAX_DIMENSION
     || row.pixel_width * row.pixel_height > CRM_PRODUCT_IMAGE_MAX_PIXELS
     || !row.alt_text.trim()
-    || !['manual_upload', 'provider_import', 'migration'].includes(row.source)
+    || ![
+      'manual_upload',
+      'provider_import',
+      'suitecrm_import',
+      'migration',
+    ].includes(row.source)
     || (
       row.source === 'provider_import'
       && (

@@ -111,6 +111,12 @@ async function applyMigrations(client) {
     files.includes('0221_operations_commerce_product_image_imports.sql'),
     'commerce image import migration is missing',
   )
+  assert.ok(
+    files.includes(
+      '0225_operations_commerce_product_image_exact_fanout.sql',
+    ),
+    'exact commerce image fan-out migration is missing',
+  )
   for (const file of files) {
     await client.query('BEGIN')
     try {
@@ -339,6 +345,8 @@ async function addProduct(pool, tenant, input) {
   const productId = product.rows[0].id
   const mappings = []
   for (const [index, externalVariantId] of input.variants.entries()) {
+    const mappingExternalVariantId = input.mappingVariants?.[index]
+      ?? externalVariantId
     const mapping = await pool.query(
       `INSERT INTO operations_product_mappings (
          organization_id, integration_account_id, pipeline_id, product_id,
@@ -355,7 +363,7 @@ async function addProduct(pool, tenant, input) {
         productId,
         `SKU-${input.key}-${index}`,
         input.externalProductId,
-        externalVariantId,
+        mappingExternalVariantId,
         `mapping-${input.key}-${index}`,
         tenant.actorEmail,
       ],
@@ -473,7 +481,7 @@ async function claimOne(organizationId, workerId = 'image-import-acceptance') {
   return claims[0]
 }
 
-async function completeClaim(claim, bytes, mimeType) {
+async function completeClaim(claim, bytes, mimeType, sourceEvidence = {}) {
   return imageImports.completeCommerceProductImageImportJobInPostgres({
     organizationId: claim.organizationId,
     jobId: claim.jobId,
@@ -481,6 +489,9 @@ async function completeClaim(claim, bytes, mimeType) {
     actorEmail: claim.actorEmail,
     bytes,
     declaredMimeType: mimeType,
+    sourceByteLength: sourceEvidence.sourceByteLength ?? bytes.byteLength,
+    sourceContentSha256: sourceEvidence.sourceContentSha256 ?? sha256(bytes),
+    normalizationVersion: sourceEvidence.normalizationVersion ?? 'identity-v1',
   })
 }
 
@@ -514,6 +525,9 @@ async function verifySchemaSafety(pool) {
   const migration = read(
     'db/migrations/0221_operations_commerce_product_image_imports.sql',
   )
+  const fanoutMigration = read(
+    'db/migrations/0225_operations_commerce_product_image_exact_fanout.sql',
+  )
   assert.doesNotMatch(source, /\bfetch\s*\(/u)
   assert.doesNotMatch(source, /provider_write_count/u)
   assert.match(source, /imageSetComplete/u)
@@ -531,6 +545,22 @@ async function verifySchemaSafety(pool) {
   assert.match(
     migration,
     /operations_commerce_product_image_job_fences_are_current\(/u,
+  )
+  assert.match(
+    fanoutMigration,
+    /operations_commerce_product_image_mapping_targets\(/u,
+  )
+  assert.match(
+    fanoutMigration,
+    /ops_commerce_image_provenance_job_product_unique/u,
+  )
+  assert.match(
+    fanoutMigration,
+    /ops_commerce_image_binding_exact_product_unique/u,
+  )
+  assert.match(
+    source,
+    /operations\.commerce_product_image_import\.fanout_completed/u,
   )
 }
 
@@ -573,6 +603,13 @@ async function verifyImports(pool) {
     externalProductId: 'gid://shopify/Product/300',
     variants: ['gid://shopify/ProductVariant/302'],
   })
+  await pool.query(
+    `UPDATE crm_products
+     SET suitecrm_id = concat('suitecrm-exact-fanout-', id::text)
+     WHERE pipeline_id = $1::uuid
+       AND id = ANY($2::uuid[])`,
+    [alpha.pipelineId, [ambiguousA.id, ambiguousB.id]],
+  )
   const leaseProduct = await addProduct(pool, beta, {
     key: 'lease',
     name: 'Lease image product',
@@ -671,6 +708,9 @@ async function verifyImports(pool) {
       actorEmail: beta.actorEmail,
       bytes: ONE_PIXEL_PNG,
       declaredMimeType: 'image/png',
+      sourceByteLength: ONE_PIXEL_PNG.byteLength,
+      sourceContentSha256: sha256(ONE_PIXEL_PNG),
+      normalizationVersion: 'identity-v1',
     }),
     'COMMERCE_PRODUCT_IMAGE_ACTOR_FENCE_MISMATCH',
   )
@@ -889,14 +929,36 @@ async function verifyImports(pool) {
       sourceHash: sha256('image-source-v3'),
     })
   assert.equal(changedBytes.observationRevision, 3)
+  const normalizedSourceHash = sha256('oversized-provider-source-v1')
   const changedCompletion = await completeClaim(
     await claimOne(alpha.organizationId),
     FOUR_BY_FIVE_WEBP,
     'image/webp',
+    {
+      sourceByteLength: (2 * 1024 * 1024) + 1,
+      sourceContentSha256: normalizedSourceHash,
+      normalizationVersion: 'sharp-0.35.3-webp-auto-orient-v1-q82',
+    },
   )
   assert.equal(changedCompletion.reusedAsset, false)
   assert.equal(changedCompletion.assetRevision, 2)
   assert.equal(changedCompletion.isPrimary, true)
+  const normalizedProvenance = await pool.query(
+    `SELECT
+       source_byte_length,
+       source_content_sha256,
+       normalization_version,
+       asset_content_sha256
+     FROM operations_commerce_product_image_asset_provenance
+     WHERE id = $1::uuid`,
+    [changedCompletion.provenanceId],
+  )
+  assert.deepEqual(normalizedProvenance.rows[0], {
+    source_byte_length: (2 * 1024 * 1024) + 1,
+    source_content_sha256: normalizedSourceHash,
+    normalization_version: 'sharp-0.35.3-webp-auto-orient-v1-q82',
+    asset_content_sha256: sha256(FOUR_BY_FIVE_WEBP),
+  })
   const setProjectionCount = await pool.query(
     `SELECT count(*)::integer AS count
      FROM sync_outbox
@@ -1031,6 +1093,163 @@ async function verifyImports(pool) {
     manualAsset.rows[0].id,
   )
   assert.equal(manualPrimaryAfterProviderRemoval.assets[0].isPrimary, true)
+
+  const suiteCrmPrecedenceProduct = await addProduct(pool, alpha, {
+    key: 'suitecrm-primary-precedence',
+    name: 'SuiteCRM primary precedence',
+    externalProductId: 'gid://shopify/Product/210',
+    variants: ['gid://shopify/ProductVariant/211'],
+  })
+  const suiteCrmPrimaryImage = productImageAssets.validateCrmProductImage({
+    bytes: ONE_PIXEL_PNG,
+    declaredMimeType: 'image/png',
+    altText: 'SuiteCRM-origin primary',
+  })
+  const suiteCrmPrimary = await pool.query(
+    `INSERT INTO crm_product_image_assets (
+       organization_id, pipeline_id, product_id, asset_revision,
+       content_bytes, mime_type, content_sha256, byte_length,
+       pixel_width, pixel_height, alt_text, source, is_primary,
+       created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, 1, $4::bytea, $5, $6, $7,
+       $8, $9, $10, 'suitecrm_import', true, $11, $11
+     ) RETURNING id::text`,
+    [
+      alpha.organizationId,
+      alpha.pipelineId,
+      suiteCrmPrecedenceProduct.id,
+      Buffer.from(suiteCrmPrimaryImage.bytes),
+      suiteCrmPrimaryImage.mimeType,
+      suiteCrmPrimaryImage.contentSha256,
+      suiteCrmPrimaryImage.byteLength,
+      suiteCrmPrimaryImage.pixelWidth,
+      suiteCrmPrimaryImage.pixelHeight,
+      suiteCrmPrimaryImage.altText,
+      alpha.actorEmail,
+    ],
+  )
+  await recordObservation(alpha, {
+    externalProductId: 'gid://shopify/Product/210',
+    providerImageId: 'provider-supersedes-suitecrm-primary',
+    locatorSha256: sha256('provider-supersedes-suitecrm-primary-locator'),
+    sourceHash: sha256('provider-supersedes-suitecrm-primary-source'),
+  })
+  const providerAfterSuiteCrm = await completeClaim(
+    await claimOne(alpha.organizationId),
+    FOUR_BY_FIVE_WEBP,
+    'image/webp',
+  )
+  assert.equal(providerAfterSuiteCrm.isPrimary, true)
+  const providerPrecedence = await pool.query(
+    `SELECT id::text, source, is_primary
+     FROM crm_product_image_assets
+     WHERE organization_id = $1::uuid AND product_id = $2::uuid
+     ORDER BY asset_revision`,
+    [alpha.organizationId, suiteCrmPrecedenceProduct.id],
+  )
+  assert.deepEqual(providerPrecedence.rows, [
+    {
+      id: suiteCrmPrimary.rows[0].id,
+      source: 'suitecrm_import',
+      is_primary: false,
+    },
+    {
+      id: providerAfterSuiteCrm.assetId,
+      source: 'provider_import',
+      is_primary: true,
+    },
+  ])
+
+  const suiteCrmDedupeProduct = await addProduct(pool, alpha, {
+    key: 'suitecrm-provider-dedupe',
+    name: 'SuiteCRM provider dedupe',
+    externalProductId: 'gid://shopify/Product/220',
+    variants: ['gid://shopify/ProductVariant/221'],
+  })
+  const suiteCrmDedupeAsset = await pool.query(
+    `INSERT INTO crm_product_image_assets (
+       organization_id, pipeline_id, product_id, asset_revision,
+       content_bytes, mime_type, content_sha256, byte_length,
+       pixel_width, pixel_height, alt_text, source, is_primary,
+       created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, 1, $4::bytea, $5, $6, $7,
+       $8, $9, $10, 'suitecrm_import', true, $11, $11
+     ) RETURNING id::text`,
+    [
+      alpha.organizationId,
+      alpha.pipelineId,
+      suiteCrmDedupeProduct.id,
+      Buffer.from(suiteCrmPrimaryImage.bytes),
+      suiteCrmPrimaryImage.mimeType,
+      suiteCrmPrimaryImage.contentSha256,
+      suiteCrmPrimaryImage.byteLength,
+      suiteCrmPrimaryImage.pixelWidth,
+      suiteCrmPrimaryImage.pixelHeight,
+      'SuiteCRM same-content primary',
+      alpha.actorEmail,
+    ],
+  )
+  await recordObservation(alpha, {
+    externalProductId: 'gid://shopify/Product/220',
+    providerImageId: 'provider-matches-suitecrm-primary',
+    locatorSha256: sha256('provider-matches-suitecrm-primary-locator'),
+    sourceHash: sha256('provider-matches-suitecrm-primary-source'),
+  })
+  const providerSuiteCrmDedupe = await completeClaim(
+    await claimOne(alpha.organizationId),
+    ONE_PIXEL_PNG,
+    'image/png',
+  )
+  assert.equal(providerSuiteCrmDedupe.reusedAsset, true)
+  assert.equal(providerSuiteCrmDedupe.assetId, suiteCrmDedupeAsset.rows[0].id)
+  assert.equal(providerSuiteCrmDedupe.isPrimary, true)
+  const crossSourceBinding = await pool.query(
+    `SELECT binding.asset_id::text, asset.source, asset.is_primary
+     FROM operations_commerce_product_image_bindings binding
+     JOIN crm_product_image_assets asset
+       ON asset.organization_id = binding.organization_id
+      AND asset.pipeline_id = binding.pipeline_id
+      AND asset.product_id = binding.product_id
+      AND asset.id = binding.asset_id
+     WHERE binding.organization_id = $1::uuid
+       AND binding.product_id = $2::uuid
+       AND binding.lifecycle_state = 'active'`,
+    [alpha.organizationId, suiteCrmDedupeProduct.id],
+  )
+  assert.deepEqual(crossSourceBinding.rows, [{
+    asset_id: suiteCrmDedupeAsset.rows[0].id,
+    source: 'suitecrm_import',
+    is_primary: true,
+  }])
+  const removedCrossSourceBinding = await imageImports
+    .reconcileCommerceProductImageSetInPostgres({
+      organizationId: alpha.organizationId,
+      integrationAccountId: alpha.accountId,
+      provider: 'shopify',
+      credentialGeneration: 1,
+      externalProductId: 'gid://shopify/Product/220',
+      productSourceHash: sha256('provider-matches-suitecrm-primary-removed'),
+      imageSetComplete: true,
+      observedAt: nextObservationTimestamp(),
+      actorEmail: alpha.actorEmail,
+      images: [],
+    })
+  assert.equal(removedCrossSourceBinding.removed.length, 1)
+  const suiteCrmPrimaryAfterProviderRemoval = await pool.query(
+    `SELECT id::text, source, is_primary
+     FROM crm_product_image_assets
+     WHERE organization_id = $1::uuid
+       AND product_id = $2::uuid
+       AND is_primary = true`,
+    [alpha.organizationId, suiteCrmDedupeProduct.id],
+  )
+  assert.deepEqual(suiteCrmPrimaryAfterProviderRemoval.rows, [{
+    id: suiteCrmDedupeAsset.rows[0].id,
+    source: 'suitecrm_import',
+    is_primary: true,
+  }])
 
   const ordered = await addProduct(pool, alpha, {
     key: 'provider-ordering',
@@ -1774,36 +1993,186 @@ async function verifyImports(pool) {
     'image/png',
   )
 
-  const ambiguous = await recordObservation(alpha, {
-      externalProductId: 'gid://shopify/Product/300',
-      providerImageId: 'ambiguous-image',
-      locatorSha256: sha256('ambiguous-locator'),
-      sourceHash: sha256('ambiguous-source'),
-    })
-  assert.equal(ambiguous.jobState, 'waiting_mapping')
-  assert.equal(ambiguous.waitReason, 'ambiguous_mapping')
+  await addProduct(pool, alpha, {
+    key: 'mismatched-variant-fence',
+    name: 'Mismatched variant fence',
+    externalProductId: 'gid://shopify/Product/550',
+    variants: ['gid://shopify/ProductVariant/551'],
+    mappingVariants: ['gid://shopify/ProductVariant/552'],
+  })
+  const mismatchedVariant = await recordObservation(alpha, {
+    externalProductId: 'gid://shopify/Product/550',
+    providerImageId: 'mismatched-variant-image',
+    locatorSha256: sha256('mismatched-variant-locator'),
+    sourceHash: sha256('mismatched-variant-source'),
+  })
+  assert.equal(mismatchedVariant.jobState, 'waiting_mapping')
+  assert.equal(mismatchedVariant.waitReason, 'unmapped')
+
+  await addProduct(pool, alpha, {
+    key: 'mixed-mismatched-variant-fence',
+    name: 'Mixed mismatched variant fence',
+    externalProductId: 'gid://shopify/Product/560',
+    variants: [
+      'gid://shopify/ProductVariant/561',
+      'gid://shopify/ProductVariant/562',
+    ],
+    mappingVariants: [
+      'gid://shopify/ProductVariant/561',
+      'gid://shopify/ProductVariant/563',
+    ],
+  })
+  const mixedMismatchedVariant = await recordObservation(alpha, {
+    externalProductId: 'gid://shopify/Product/560',
+    providerImageId: 'mixed-mismatched-variant-image',
+    locatorSha256: sha256('mixed-mismatched-variant-locator'),
+    sourceHash: sha256('mixed-mismatched-variant-source'),
+  })
+  assert.equal(mixedMismatchedVariant.jobState, 'waiting_mapping')
+  assert.equal(mixedMismatchedVariant.waitReason, 'unmapped')
+
+  const exactFanoutInput = imageSetInput(alpha, {
+    externalProductId: 'gid://shopify/Product/300',
+    providerImageId: 'exact-fanout-image',
+    locatorSha256: sha256('exact-fanout-locator'),
+    altText: 'Exact product-level fan-out',
+    sourceHash: sha256('exact-fanout-source'),
+  })
+  const exactFanoutResult = await imageImports
+    .reconcileCommerceProductImageSetInPostgres(exactFanoutInput)
+  const exactFanout = exactFanoutResult.active[0]
+  assert.ok(exactFanout)
+  assert.equal(exactFanout.jobState, 'queued')
+  assert.equal(exactFanout.waitReason, null)
+  assert.ok([
+    ambiguousA.id,
+    ambiguousB.id,
+  ].includes(exactFanout.productId))
+  const exactFanoutClaim = await claimOne(alpha.organizationId)
+  assert.equal(exactFanoutClaim.mappingCount, 2)
+  const exactFanoutCompletion = await completeClaim(
+    exactFanoutClaim,
+    ONE_PIXEL_PNG,
+    'image/png',
+  )
+  assert.equal(exactFanoutCompletion.targetCount, 2)
+  const exactFanoutEvidence = await pool.query(
+    `SELECT
+       count(DISTINCT provenance.product_id)::integer AS provenance_targets,
+       count(DISTINCT binding.product_id)::integer AS binding_targets,
+       count(DISTINCT asset.product_id)::integer AS asset_targets,
+       count(DISTINCT projection.aggregate_id)::integer AS projection_targets,
+       count(DISTINCT event.id)::integer AS completion_audits
+     FROM operations_commerce_product_image_asset_provenance provenance
+     JOIN operations_commerce_product_image_bindings binding
+       ON binding.organization_id = provenance.organization_id
+      AND binding.integration_account_id = provenance.integration_account_id
+      AND binding.external_product_id = provenance.external_product_id
+      AND binding.image_identity_sha256 = provenance.image_identity_sha256
+      AND binding.product_id = provenance.product_id
+      AND binding.latest_import_job_id = provenance.import_job_id
+     JOIN crm_product_image_assets asset
+       ON asset.organization_id = provenance.organization_id
+      AND asset.pipeline_id = provenance.pipeline_id
+      AND asset.product_id = provenance.product_id
+      AND asset.id = provenance.asset_id
+     LEFT JOIN sync_outbox projection
+       ON projection.aggregate_type = 'crm_products'
+      AND projection.aggregate_id = provenance.product_id::text
+      AND projection.target_system = 'suitecrm'
+      AND projection.payload->'productImage' IS NOT NULL
+     LEFT JOIN audit_events event
+       ON event.organization_id = provenance.organization_id
+      AND event.event_type =
+            'operations.commerce_product_image_import.fanout_completed'
+      AND event.aggregate_id = $2
+     WHERE provenance.organization_id = $1::uuid
+       AND provenance.import_job_id = $3::uuid`,
+    [alpha.organizationId, exactFanout.jobGlobalId, exactFanout.jobId],
+  )
+  assert.deepEqual(exactFanoutEvidence.rows[0], {
+    provenance_targets: 2,
+    binding_targets: 2,
+    asset_targets: 2,
+    projection_targets: 2,
+    completion_audits: 1,
+  })
+  const fanoutReplay = await completeClaim(
+    exactFanoutClaim,
+    ONE_PIXEL_PNG,
+    'image/png',
+  )
+  assert.equal(fanoutReplay.replayed, true)
+  assert.equal(fanoutReplay.targetCount, 2)
   await pool.query(
     `UPDATE operations_product_mappings
      SET active = false, updated_at = clock_timestamp()
      WHERE organization_id = $1::uuid AND id = $2::uuid`,
     [alpha.organizationId, ambiguousB.mappingIds[0]],
   )
-  const scopedResolved = await imageImports
-    .resolveWaitingCommerceProductImageImportJobsInPostgres({
-      organizationId: alpha.organizationId,
-      updatedBy: 'scoped-image-resolver',
-      limit: 10,
-    })
-  assert.ok(scopedResolved.some((job) => (
-    job.jobId === ambiguous.jobId
-    && job.state === 'queued'
-    && job.productId === ambiguousA.id
-  )))
-  await completeClaim(
+  const narrowedFanout = await imageImports
+    .reconcileCommerceProductImageSetInPostgres(exactFanoutInput)
+  assert.equal(narrowedFanout.active[0].jobState, 'queued')
+  assert.equal(narrowedFanout.active[0].productId, ambiguousA.id)
+  const narrowedCompletion = await completeClaim(
     await claimOne(alpha.organizationId),
     ONE_PIXEL_PNG,
     'image/png',
   )
+  assert.equal(narrowedCompletion.targetCount, 1)
+  const removedFanoutTarget = await crmImageAssets
+    .listCrmProductImageAssetsInPostgres({
+      organizationId: alpha.organizationId,
+      productId: ambiguousB.id,
+    })
+  assert.equal(removedFanoutTarget.assets.length, 0)
+
+  const boundedFanoutExternalProductId = 'gid://shopify/Product/390'
+  for (let index = 0; index < 51; index += 1) {
+    await addProduct(pool, alpha, {
+      key: `bounded-fanout-${index}`,
+      name: `Bounded fan-out ${index}`,
+      externalProductId: boundedFanoutExternalProductId,
+      variants: [`gid://shopify/ProductVariant/${390_000 + index}`],
+    })
+  }
+  const boundedFanout = await recordObservation(alpha, {
+    externalProductId: boundedFanoutExternalProductId,
+    providerImageId: 'bounded-fanout-image',
+    locatorSha256: sha256('bounded-fanout-locator'),
+    sourceHash: sha256('bounded-fanout-source'),
+  })
+  assert.equal(boundedFanout.jobState, 'queued')
+  const boundedFanoutClaim = await claimOne(
+    alpha.organizationId,
+    'bounded-fanout-worker',
+  )
+  assert.equal(boundedFanoutClaim.mappingCount, 51)
+  await assertImportCode(
+    completeClaim(boundedFanoutClaim, ONE_PIXEL_PNG, 'image/png'),
+    'COMMERCE_PRODUCT_IMAGE_FANOUT_REVIEW_REQUIRED',
+  )
+  const boundedFanoutFailure = await imageImports
+    .failCommerceProductImageImportJobInPostgres({
+      organizationId: alpha.organizationId,
+      jobId: boundedFanoutClaim.jobId,
+      leaseToken: boundedFanoutClaim.leaseToken,
+      workerId: 'bounded-fanout-worker',
+      errorCode: 'COMMERCE_PRODUCT_IMAGE_FANOUT_REVIEW_REQUIRED',
+      retryable: false,
+    })
+  assert.equal(boundedFanoutFailure.state, 'dead')
+  const boundedFanoutWrites = await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM crm_product_image_assets asset
+     JOIN operations_product_mappings mapping
+       ON mapping.pipeline_id = asset.pipeline_id
+      AND mapping.product_id = asset.product_id
+     WHERE asset.organization_id = $1::uuid
+       AND mapping.external_product_id = $2`,
+    [alpha.organizationId, boundedFanoutExternalProductId],
+  )
+  assert.equal(boundedFanoutWrites.rows[0].count, 0)
 
   const setProduct = await addProduct(pool, alpha, {
     key: 'set-reconcile',
@@ -2493,7 +2862,9 @@ async function verifyImports(pool) {
             latest_import_job_generation, lifecycle_state
      FROM operations_commerce_product_image_bindings
      WHERE organization_id = $1::uuid
-       AND external_product_id = 'gid://shopify/Product/960'`,
+       AND external_product_id = 'gid://shopify/Product/960'
+     ORDER BY latest_import_job_generation DESC
+     LIMIT 1`,
     [gamma.organizationId],
   )
   assert.deepEqual(remappedBinding.rows[0], {
@@ -2911,7 +3282,7 @@ async function verifyImports(pool) {
     })
   const finalHealth = await imageImports
     .readCommerceProductImageImportQueueHealthInPostgres()
-  assert.equal(finalHealth.deadCount, 2)
+  assert.equal(finalHealth.deadCount, 3)
   assert.equal(finalHealth.staleLeaseCount, 0)
   assert.equal(finalHealth.overdueCount, 0)
   assert.equal(finalHealth.heartbeat.phase, 'completed')
@@ -3121,8 +3492,8 @@ async function verifyImports(pool) {
   assert.ok(evidence.rows[0].observations >= 10)
   assert.equal(
     evidence.rows[0].jobs,
-    evidence.rows[0].observations + 4,
-    'only exhausted remap, two remap-after-success paths, and explicit dead retry add job generations',
+    evidence.rows[0].observations + 5,
+    'only exact fan-out narrowing, exhausted remap, two remap-after-success paths, and explicit dead retry add job generations',
   )
   assert.ok(evidence.rows[0].provenance >= 7)
   assert.ok(evidence.rows[0].imported_assets >= 6)

@@ -282,8 +282,9 @@ const providerImport = read(
 for (const contract of [
   'Promise<boolean>',
   'const primaryChanged = await electCurrentProviderImagePrimary',
-  'const priorPrimaryChanged = await electCurrentProviderImagePrimary',
   'const currentPrimaryChanged = await electCurrentProviderImagePrimary',
+  'priorBindingScopes.rows',
+  'operations.commerce_product_image_import.fanout_completed',
   'enqueueSuiteCrmProductImageProjectionWithClient',
 ]) {
   assert.ok(

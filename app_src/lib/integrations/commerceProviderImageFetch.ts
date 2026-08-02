@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { Resolver } from 'node:dns/promises'
 import type { IncomingMessage } from 'node:http'
 import https from 'node:https'
@@ -6,6 +7,7 @@ import type { LookupFunction } from 'node:net'
 import sharp from 'sharp'
 import {
   CRM_PRODUCT_IMAGE_MAX_BYTES,
+  CRM_PRODUCT_IMAGE_MAX_DIMENSION,
   CRM_PRODUCT_IMAGE_MAX_PIXELS,
   CrmProductImageAssetError,
   validateCrmProductImage,
@@ -14,6 +16,12 @@ import {
 
 export const COMMERCE_PROVIDER_IMAGE_FETCH_TIMEOUT_MS = 15_000
 export const COMMERCE_PROVIDER_IMAGE_MAX_REDIRECTS = 3
+export const COMMERCE_PROVIDER_IMAGE_SOURCE_MAX_BYTES = 16 * 1024 * 1024
+
+const IDENTITY_NORMALIZATION_VERSION = 'identity-v1'
+const WEBP_NORMALIZATION_VERSION =
+  'sharp-0.35.3-webp-auto-orient-v1'
+const WEBP_QUALITY_LADDER = Object.freeze([82, 72, 62, 52, 42, 32])
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
 const SUPPORTED_MEDIA_TYPES = new Set<CrmProductImageMimeType>([
@@ -110,8 +118,11 @@ export type ValidatedCommerceProviderImage = {
   byteLength: number
   contentSha256: string
   mediaType: CrmProductImageMimeType
+  normalizationVersion: string
   pixelWidth: number
   pixelHeight: number
+  sourceByteLength: number
+  sourceContentSha256: string
 }
 
 class FetchAborted extends Error {}
@@ -519,11 +530,11 @@ function declaredContentLength(response: CommerceProviderImageHttpResponse) {
       502,
     )
   }
-  if (length > CRM_PRODUCT_IMAGE_MAX_BYTES) {
+  if (length > COMMERCE_PROVIDER_IMAGE_SOURCE_MAX_BYTES) {
     cancelResponse(response)
     fail(
       'COMMERCE_PROVIDER_IMAGE_SIZE_INVALID',
-      `Provider images must be no larger than ${CRM_PRODUCT_IMAGE_MAX_BYTES} bytes`,
+      `Provider image sources must be no larger than ${COMMERCE_PROVIDER_IMAGE_SOURCE_MAX_BYTES} bytes`,
       413,
     )
   }
@@ -543,7 +554,7 @@ async function readBoundedImage(
       422,
     )
   }
-  const bytes = new Uint8Array(CRM_PRODUCT_IMAGE_MAX_BYTES)
+  const bytes = new Uint8Array(COMMERCE_PROVIDER_IMAGE_SOURCE_MAX_BYTES)
   let byteLength = 0
   const iterator = response.body[Symbol.asyncIterator]()
   try {
@@ -568,11 +579,14 @@ async function readBoundedImage(
           422,
         )
       }
-      if (chunk.byteLength > CRM_PRODUCT_IMAGE_MAX_BYTES - byteLength) {
+      if (
+        chunk.byteLength
+          > COMMERCE_PROVIDER_IMAGE_SOURCE_MAX_BYTES - byteLength
+      ) {
         cancelResponse(response)
         fail(
           'COMMERCE_PROVIDER_IMAGE_SIZE_INVALID',
-          `Provider images must be no larger than ${CRM_PRODUCT_IMAGE_MAX_BYTES} bytes`,
+          `Provider image sources must be no larger than ${COMMERCE_PROVIDER_IMAGE_SOURCE_MAX_BYTES} bytes`,
           413,
         )
       }
@@ -663,6 +677,154 @@ async function validateDecodedImage(
     signal.removeEventListener('abort', cancel)
     decoder.destroy()
   }
+}
+
+async function inspectOversizedSource(
+  bytes: Uint8Array,
+  mediaType: CrmProductImageMimeType,
+  signal: AbortSignal,
+) {
+  const source = Buffer.from(
+    bytes.buffer as ArrayBuffer,
+    bytes.byteOffset,
+    bytes.byteLength,
+  )
+  const metadataDecoder = sharp(source, {
+    failOn: 'warning',
+    limitInputPixels: false,
+    sequentialRead: true,
+  })
+  const cancelMetadata = () => metadataDecoder.destroy()
+  signal.addEventListener('abort', cancelMetadata, { once: true })
+  let pixelWidth = 0
+  let pixelHeight = 0
+  try {
+    const metadata = await abortable(metadataDecoder.metadata(), signal)
+    if (metadata.format !== SHARP_FORMAT_BY_MIME_TYPE[mediaType]) {
+      fail(
+        'COMMERCE_PROVIDER_IMAGE_MIME_MISMATCH',
+        'Provider image MIME type does not match its file content',
+        415,
+      )
+    }
+    if ((metadata.pages ?? 1) !== 1) {
+      fail(
+        'COMMERCE_PROVIDER_IMAGE_CONTENT_INVALID',
+        'Provider image response did not contain valid image bytes',
+        422,
+      )
+    }
+    pixelWidth = Number(metadata.autoOrient?.width ?? metadata.width)
+    pixelHeight = Number(metadata.autoOrient?.height ?? metadata.height)
+    if (
+      !Number.isSafeInteger(pixelWidth)
+      || !Number.isSafeInteger(pixelHeight)
+      || pixelWidth < 1
+      || pixelHeight < 1
+      || pixelWidth > CRM_PRODUCT_IMAGE_MAX_DIMENSION
+      || pixelHeight > CRM_PRODUCT_IMAGE_MAX_DIMENSION
+      || pixelWidth * pixelHeight > CRM_PRODUCT_IMAGE_MAX_PIXELS
+    ) {
+      fail(
+        'COMMERCE_PROVIDER_IMAGE_DIMENSIONS_INVALID',
+        'Provider image dimensions exceed the supported limit',
+        422,
+      )
+    }
+  } catch (error) {
+    if (
+      error instanceof FetchAborted
+      || error instanceof CommerceProviderImageFetchError
+    ) throw error
+    if (signal.aborted) throw new FetchAborted()
+    fail(
+      'COMMERCE_PROVIDER_IMAGE_CONTENT_INVALID',
+      'Provider image response did not contain valid image bytes',
+      422,
+    )
+  } finally {
+    signal.removeEventListener('abort', cancelMetadata)
+    metadataDecoder.destroy()
+  }
+
+  const decoder = sharp(source, {
+    failOn: 'warning',
+    limitInputPixels: CRM_PRODUCT_IMAGE_MAX_PIXELS,
+    sequentialRead: true,
+  })
+  const cancelDecode = () => decoder.destroy()
+  signal.addEventListener('abort', cancelDecode, { once: true })
+  try {
+    await abortable(decoder.stats(), signal)
+  } catch (error) {
+    if (
+      error instanceof FetchAborted
+      || error instanceof CommerceProviderImageFetchError
+    ) throw error
+    if (signal.aborted) throw new FetchAborted()
+    fail(
+      'COMMERCE_PROVIDER_IMAGE_CONTENT_INVALID',
+      'Provider image response did not contain valid image bytes',
+      422,
+    )
+  } finally {
+    signal.removeEventListener('abort', cancelDecode)
+    decoder.destroy()
+  }
+  return { pixelWidth, pixelHeight }
+}
+
+async function normalizeOversizedSource(
+  bytes: Uint8Array,
+  signal: AbortSignal,
+) {
+  const source = Buffer.from(
+    bytes.buffer as ArrayBuffer,
+    bytes.byteOffset,
+    bytes.byteLength,
+  )
+  for (const quality of WEBP_QUALITY_LADDER) {
+    const encoder = sharp(source, {
+      failOn: 'warning',
+      limitInputPixels: CRM_PRODUCT_IMAGE_MAX_PIXELS,
+      sequentialRead: true,
+    }).autoOrient().webp({
+      alphaQuality: 100,
+      effort: 4,
+      quality,
+      smartSubsample: true,
+    })
+    const cancel = () => encoder.destroy()
+    signal.addEventListener('abort', cancel, { once: true })
+    try {
+      const normalized = await abortable(encoder.toBuffer(), signal)
+      if (normalized.byteLength <= CRM_PRODUCT_IMAGE_MAX_BYTES) {
+        return {
+          bytes: Uint8Array.from(normalized),
+          normalizationVersion: `${WEBP_NORMALIZATION_VERSION}-q${quality}`,
+        }
+      }
+    } catch (error) {
+      if (
+        error instanceof FetchAborted
+        || error instanceof CommerceProviderImageFetchError
+      ) throw error
+      if (signal.aborted) throw new FetchAborted()
+      fail(
+        'COMMERCE_PROVIDER_IMAGE_CONTENT_INVALID',
+        'Provider image response did not contain valid image bytes',
+        422,
+      )
+    } finally {
+      signal.removeEventListener('abort', cancel)
+      encoder.destroy()
+    }
+  }
+  fail(
+    'COMMERCE_PROVIDER_IMAGE_SIZE_INVALID',
+    `Provider image could not be normalized below ${CRM_PRODUCT_IMAGE_MAX_BYTES} bytes`,
+    413,
+  )
 }
 
 function validationFailure(error: CrmProductImageAssetError): never {
@@ -821,10 +983,53 @@ export async function fetchCommerceProviderImage(
         )
       }
       const mediaType = normalizedContentType(response)
-      const bytes = await readBoundedImage(response, controller.signal)
+      const sourceBytes = await readBoundedImage(response, controller.signal)
+      const sourceByteLength = sourceBytes.byteLength
+      const sourceContentSha256 = createHash('sha256')
+        .update(sourceBytes)
+        .digest('hex')
       try {
+        if (sourceByteLength > CRM_PRODUCT_IMAGE_MAX_BYTES) {
+          const sourceDimensions = await inspectOversizedSource(
+            sourceBytes,
+            mediaType,
+            controller.signal,
+          )
+          const normalized = await normalizeOversizedSource(
+            sourceBytes,
+            controller.signal,
+          )
+          const validated = validateCrmProductImage({
+            bytes: normalized.bytes,
+            declaredMimeType: 'image/webp',
+            altText: 'Provider product image',
+          })
+          const image = {
+            bytes: validated.bytes,
+            byteLength: validated.byteLength,
+            contentSha256: validated.contentSha256,
+            mediaType: validated.mimeType,
+            normalizationVersion: normalized.normalizationVersion,
+            pixelWidth: validated.pixelWidth,
+            pixelHeight: validated.pixelHeight,
+            sourceByteLength,
+            sourceContentSha256,
+          }
+          if (
+            image.pixelWidth !== sourceDimensions.pixelWidth
+            || image.pixelHeight !== sourceDimensions.pixelHeight
+          ) {
+            fail(
+              'COMMERCE_PROVIDER_IMAGE_CONTENT_INVALID',
+              'Normalized provider image dimensions changed unexpectedly',
+              422,
+            )
+          }
+          await validateDecodedImage(image, controller.signal)
+          return image
+        }
         const validated = validateCrmProductImage({
-          bytes,
+          bytes: sourceBytes,
           declaredMimeType: mediaType,
           altText: 'Provider product image',
         })
@@ -833,8 +1038,11 @@ export async function fetchCommerceProviderImage(
           byteLength: validated.byteLength,
           contentSha256: validated.contentSha256,
           mediaType: validated.mimeType,
+          normalizationVersion: IDENTITY_NORMALIZATION_VERSION,
           pixelWidth: validated.pixelWidth,
           pixelHeight: validated.pixelHeight,
+          sourceByteLength,
+          sourceContentSha256,
         }
         await validateDecodedImage(image, controller.signal)
         return image

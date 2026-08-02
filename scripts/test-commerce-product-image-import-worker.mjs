@@ -182,8 +182,11 @@ function fixture(input = {}) {
         byteLength: BYTES.length,
         contentSha256: 'f'.repeat(64),
         mediaType: 'image/png',
+        normalizationVersion: 'identity-v1',
         pixelWidth: 1,
         pixelHeight: 1,
+        sourceByteLength: BYTES.length,
+        sourceContentSha256: 'f'.repeat(64),
       }
     },
     async complete(args) {
@@ -259,6 +262,9 @@ test('imports sequential claims and reuses one exact product source read', async
   assert.ok(run.state.claims.every((entry) => entry.leaseSeconds === 120))
   assert.equal(run.state.completions[0].actorEmail, 'operator@example.com')
   assert.equal(run.state.completions[0].bytes, BYTES)
+  assert.equal(run.state.completions[0].sourceByteLength, BYTES.length)
+  assert.equal(run.state.completions[0].sourceContentSha256, 'f'.repeat(64))
+  assert.equal(run.state.completions[0].normalizationVersion, 'identity-v1')
   assert.equal(run.state.heartbeats.map((entry) => entry.phase).join(','), 'starting,completed')
   assert.ok(!JSON.stringify(result).includes(SOURCE_SECRET))
   assert.ok(!JSON.stringify(result).includes('operator@example.com'))
@@ -372,6 +378,27 @@ test('invalid image content is permanently dead', async () => {
 
   assert.equal(result.dead, 1)
   assert.equal(run.state.failures[0].retryable, false)
+})
+
+test('oversized exact fan-out is a permanent visible review failure', async () => {
+  const run = fixture({
+    completeError: codedError(
+      'COMMERCE_PRODUCT_IMAGE_FANOUT_REVIEW_REQUIRED',
+      409,
+    ),
+  })
+  const result = await worker.processCommerceProductImageImports(
+    { workerId: 'image-worker-test' },
+    run.dependencies,
+  )
+
+  assert.equal(result.dead, 1)
+  assert.equal(result.retried, 0)
+  assert.equal(run.state.failures[0].retryable, false)
+  assert.equal(
+    run.state.failures[0].errorCode,
+    'COMMERCE_PRODUCT_IMAGE_FANOUT_REVIEW_REQUIRED',
+  )
 })
 
 test('lease loss never attempts a second state transition', async () => {

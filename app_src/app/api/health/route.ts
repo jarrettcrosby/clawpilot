@@ -33,6 +33,12 @@ import { effectiveDocumentEmbeddingConfiguration } from '@/lib/documentEmbedding
 import { validateShortLinkConfiguration } from '@/lib/shortlinks'
 import { readSuiteCrmWorkerHeartbeat } from '@/lib/persistence/crm'
 import { suiteCrmBaseUrl } from '@/lib/crm/suiteCrmClient'
+import {
+  suiteCrmProductImageReadConfiguration,
+} from '@/lib/crm/suiteCrmProductImageReadClient'
+import {
+  readSuiteCrmProductImageIngestionHealthInPostgres,
+} from '@/lib/persistence/suiteCrmProductImageIngestion'
 
 const DEV_LOG_PATH = '/tmp/clawd-app-dev.log'
 const FALLBACK_LOG_PATH = '/tmp/clawd-app.log'
@@ -111,6 +117,22 @@ export async function GET() {
     }
     let commerceProductImageImportWorker: Record<string, unknown> = {
       status: 'disabled',
+    }
+    const suiteCrmProductImageConfiguration =
+      suiteCrmProductImageReadConfiguration()
+    let suiteCrmProductImageIngestion: Record<string, unknown> = {
+      status: suiteCrmProductImageConfiguration.enabled
+        ? 'unavailable'
+        : 'disabled',
+      enabled: suiteCrmProductImageConfiguration.enabled,
+      ready: suiteCrmProductImageConfiguration.ready,
+      missing: suiteCrmProductImageConfiguration.missing,
+      invalid: suiteCrmProductImageConfiguration.invalid,
+      credentialConflicts:
+        suiteCrmProductImageConfiguration.credentialConflicts,
+      aclAttestation: suiteCrmProductImageConfiguration.aclAttestation,
+      requiredAcl: suiteCrmProductImageConfiguration.acl,
+      providerWrites: 0,
     }
     let integrationQueues: Record<string, unknown> = { status: 'not-configured' }
     let operationsCommands: Record<string, unknown> = { status: 'not-configured' }
@@ -363,7 +385,10 @@ export async function GET() {
           faire_provider_write_auth_applied: boolean
           faire_fulfillment_authority_applied: boolean
           operations_commerce_product_image_imports_applied: boolean
+          operations_commerce_product_image_fanout_applied: boolean
+          operations_commerce_product_image_source_normalization_applied: boolean
           operations_faire_inventory_polling_applied: boolean
+          suitecrm_product_image_reverse_ingestion_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -1790,6 +1815,84 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename =
+                  '0225_operations_commerce_product_image_exact_fanout.sql'
+              )
+              AND to_regprocedure(
+                'operations_commerce_product_image_mapping_targets(uuid,uuid,text,text)'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'operations_commerce_product_image_asset_provenance'
+                  )
+                  AND constraint_row.conname =
+                    'ops_commerce_image_provenance_job_product_unique'
+                  AND constraint_row.contype = 'u'
+                  AND constraint_row.convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'operations_commerce_product_image_bindings'
+                  )
+                  AND constraint_row.conname =
+                    'ops_commerce_image_binding_exact_product_unique'
+                  AND constraint_row.contype = 'u'
+                  AND constraint_row.convalidated
+              ) AS operations_commerce_product_image_fanout_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0227_operations_commerce_product_image_source_normalization.sql'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'operations_commerce_product_image_asset_provenance'
+                  )
+                  AND constraint_row.conname =
+                    'ops_commerce_image_provenance_source_evidence_valid'
+                  AND constraint_row.contype = 'c'
+                  AND constraint_row.convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_asset_provenance'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_source_evidence_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_source_evidence()'
+                  )
+                  AND trigger_row.tgtype = 31
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_asset_provenance'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_provenance_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_asset_provenance()'
+                  )
+                  AND trigger_row.tgtype = 31
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              ) AS operations_commerce_product_image_source_normalization_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
                   '0223_operations_faire_inventory_observation_polling.sql'
               )
               AND to_regclass(
@@ -1811,6 +1914,125 @@ export async function GET() {
                     'protect_operations_faire_inventory_observation'
                   AND NOT trigger_row.tgisinternal
               ) AS operations_faire_inventory_polling_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0226_suitecrm_product_image_reverse_ingestion.sql'
+              )
+              AND to_regclass(
+                'crm_suitecrm_product_image_observations'
+              ) IS NOT NULL
+              AND to_regclass(
+                'crm_suitecrm_product_image_snapshot_fences'
+              ) IS NOT NULL
+              AND to_regclass(
+                'crm_suitecrm_product_image_asset_provenance'
+              ) IS NOT NULL
+              AND to_regclass(
+                'crm_suitecrm_product_image_ingestion_worker_heartbeat'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'crm_suitecrm_product_image_observations'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_crm_suitecrm_product_image_observation_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_crm_suitecrm_product_image_observation()'
+                  )
+                  AND trigger_row.tgtype = 31
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'crm_suitecrm_product_image_asset_provenance'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_crm_suitecrm_product_image_provenance_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_crm_suitecrm_product_image_provenance()'
+                  )
+                  AND trigger_row.tgtype = 31
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'crm_suitecrm_product_image_snapshot_fences'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_crm_suitecrm_product_image_snapshot_fence_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_crm_suitecrm_product_image_snapshot_fence()'
+                  )
+                  AND trigger_row.tgtype = 31
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'crm_suitecrm_product_image_snapshot_fences'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_crm_suitecrm_image_fence_initial_revision_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_crm_suitecrm_image_fence_initial_revision()'
+                  )
+                  AND trigger_row.tgtype = 5
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND (
+                SELECT count(*) = 5
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'crm_suitecrm_product_image_observations'
+                  )
+                  AND constraint_row.conname IN (
+                    'crm_suitecrm_product_image_observation_provider_writes_zero',
+                    'crm_suitecrm_product_image_observation_correlation_valid',
+                    'crm_suitecrm_product_image_observation_media_valid',
+                    'crm_suitecrm_product_image_observation_primary_valid',
+                    'crm_suitecrm_product_image_observation_timestamp_valid'
+                  )
+                  AND constraint_row.convalidated
+              )
+              AND (
+                SELECT count(*) = 5
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'crm_suitecrm_product_image_asset_provenance'
+                  )
+                  AND constraint_row.conname IN (
+                    'crm_suitecrm_product_image_provenance_provider_writes_zero',
+                    'crm_suitecrm_product_image_provenance_scope_valid',
+                    'crm_suitecrm_product_image_provenance_primary_before_valid',
+                    'crm_suitecrm_product_image_provenance_result_valid',
+                    'crm_suitecrm_product_image_provenance_resolution_valid'
+                  )
+                  AND constraint_row.convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'crm_suitecrm_product_image_snapshot_fences'
+                  )
+                  AND constraint_row.conname =
+                    'crm_suitecrm_product_image_snapshot_fence_provenance_fkey'
+                  AND constraint_row.contype = 'f'
+                  AND constraint_row.convalidated
+              ) AS suitecrm_product_image_reverse_ingestion_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1983,7 +2205,10 @@ export async function GET() {
             && row?.faire_provider_write_auth_applied
             && row?.faire_fulfillment_authority_applied
             && row?.operations_commerce_product_image_imports_applied
+            && row?.operations_commerce_product_image_fanout_applied
+            && row?.operations_commerce_product_image_source_normalization_applied
             && row?.operations_faire_inventory_polling_applied
+            && row?.suitecrm_product_image_reverse_ingestion_applied
             && row?.migration_checksums_present
           ),
         }
@@ -2148,7 +2373,10 @@ export async function GET() {
           || !row?.faire_provider_write_auth_applied
           || !row?.faire_fulfillment_authority_applied
           || !row?.operations_commerce_product_image_imports_applied
+          || !row?.operations_commerce_product_image_fanout_applied
+          || !row?.operations_commerce_product_image_source_normalization_applied
           || !row?.operations_faire_inventory_polling_applied
+          || !row?.suitecrm_product_image_reverse_ingestion_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -2991,6 +3219,8 @@ export async function GET() {
           if (
             commerceIntakeRuntimeAvailable()
             && row?.operations_commerce_product_image_imports_applied
+            && row?.operations_commerce_product_image_fanout_applied
+            && row?.operations_commerce_product_image_source_normalization_applied
           ) {
             const imageQueue =
               await readCommerceProductImageImportQueueHealthInPostgres()
@@ -3073,6 +3303,83 @@ export async function GET() {
             }
           }
 
+          if (row?.suitecrm_product_image_reverse_ingestion_applied) {
+            if (
+              suiteCrmProductImageConfiguration.enabled
+              && !suiteCrmProductImageConfiguration.ready
+            ) {
+              suiteCrmProductImageIngestion = {
+                ...suiteCrmProductImageIngestion,
+                status: 'unavailable',
+              }
+              warnings.push(
+                'SuiteCRM Product image reverse ingestion is enabled but its dedicated read-only credentials or ACL attestation are incomplete or invalid.',
+              )
+            } else if (suiteCrmProductImageConfiguration.enabled) {
+              const imageIngestion =
+                await readSuiteCrmProductImageIngestionHealthInPostgres()
+              const imageIngestionHeartbeatAt = Date.parse(
+                String(imageIngestion.heartbeat?.checkedAt || ''),
+              )
+              const imageIngestionPollMs = Math.max(
+                5_000,
+                Math.min(
+                  Number(process.env.CRM_INTEGRATION_POLL_MS || 30_000),
+                  300_000,
+                ),
+              )
+              const imageIngestionAgeMs = Number.isFinite(
+                imageIngestionHeartbeatAt,
+              ) ? checkedAt - imageIngestionHeartbeatAt : null
+              const imageIngestionReachable = (
+                imageIngestionAgeMs !== null
+                && imageIngestionAgeMs <= Math.max(
+                  180_000,
+                  imageIngestionPollMs * 3,
+                )
+              )
+              const imageIngestionDegraded = (
+                imageIngestion.heartbeat?.phase === 'degraded'
+              )
+              suiteCrmProductImageIngestion = {
+                status: imageIngestionReachable
+                  ? (imageIngestionDegraded ? 'degraded' : 'reachable')
+                  : 'unavailable',
+                enabled: true,
+                ready: true,
+                missing: [],
+                invalid: [],
+                credentialConflicts: [],
+                aclAttestation:
+                  suiteCrmProductImageConfiguration.aclAttestation,
+                requiredAcl: suiteCrmProductImageConfiguration.acl,
+                heartbeatAt: imageIngestion.heartbeat?.checkedAt || null,
+                phase: imageIngestion.heartbeat?.phase || null,
+                currentPass: imageIngestion.heartbeat?.details || {},
+                ageMs: imageIngestionAgeMs,
+                observations: imageIngestion.observations,
+                importedPrimary: imageIngestion.importedPrimary,
+                importedSecondary: imageIngestion.importedSecondary,
+                echoesSuppressed: imageIngestion.echoesSuppressed,
+                identityConflicts: imageIngestion.identityConflicts,
+                mediaIntegrityConflicts:
+                  imageIngestion.mediaIntegrityConflicts,
+                lastObservedAt: imageIngestion.lastObservedAt,
+                providerWrites: imageIngestion.providerWrites,
+              }
+              if (!imageIngestionReachable) {
+                warnings.push(
+                  'SuiteCRM Product image reverse ingestion is unavailable because its worker heartbeat is missing or stale.',
+                )
+              }
+              if (imageIngestionDegraded) {
+                warnings.push(
+                  'SuiteCRM Product image reverse ingestion has a current sweep error or conflict for review.',
+                )
+              }
+            }
+          }
+
           const knowledgeResult = await query<{
             worker_name: string
             checked_at: string
@@ -3148,6 +3455,7 @@ export async function GET() {
       shopifyInventoryRefreshWorker,
       faireInventoryPollWorker,
       commerceProductImageImportWorker,
+      suiteCrmProductImageIngestion,
       integrationQueues,
       operationsCommands,
       crm,

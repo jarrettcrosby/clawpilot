@@ -64,6 +64,8 @@ const PERMANENT_ERROR_CODES = new Set([
   'COMMERCE_PROVIDER_IMAGE_CONTENT_INVALID',
   'COMMERCE_PROVIDER_IMAGE_DIMENSIONS_INVALID',
   'COMMERCE_PRODUCT_IMAGE_DIMENSIONS_MISMATCH',
+  'COMMERCE_PRODUCT_IMAGE_FANOUT_REVIEW_REQUIRED',
+  'COMMERCE_PRODUCT_IMAGE_SOURCE_EVIDENCE_INVALID',
   'COMMERCE_PRODUCT_IMAGE_FENCE_STALE',
   'COMMERCE_PRODUCT_IMAGE_ACTOR_FENCE_MISMATCH',
   'COMMERCE_PRODUCT_IMAGE_PRODUCT_NOT_FOUND',
@@ -268,6 +270,9 @@ async function processBoundedCommerceProductImageImports(
         actorEmail: claim.actorEmail,
         bytes: image.bytes,
         declaredMimeType: image.mediaType,
+        sourceByteLength: image.sourceByteLength,
+        sourceContentSha256: image.sourceContentSha256,
+        normalizationVersion: image.normalizationVersion,
       })
       result.succeeded += 1
     } catch (error) {
