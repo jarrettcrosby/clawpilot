@@ -249,7 +249,7 @@ async function expectCode(promise, code, secrets = []) {
   })
 }
 
-test('fetches through a pinned public address and returns validated bytes only', async () => {
+test('prefers public IPv4 from dual-stack DNS and returns validated bytes only', async () => {
   const requests = []
   const lookups = []
   const result = await fetchCommerceProviderImage(
@@ -278,8 +278,8 @@ test('fetches through a pinned public address and returns validated bytes only',
   assert.deepEqual(lookups, ['images.vendor.com'])
   assert.equal(requests.length, 1)
   assert.deepEqual(requests[0].address, {
-    address: '2606:4700:4700::1111',
-    family: 6,
+    address: '93.184.216.34',
+    family: 4,
   })
   assert.equal(requests[0].url.hostname, 'images.vendor.com')
   assert.equal(requests[0].headers.Authorization, undefined)
@@ -299,6 +299,59 @@ test('fetches through a pinned public address and returns validated bytes only',
   assert.equal(result.mediaType, 'image/png')
   assert.equal(result.pixelWidth, 1)
   assert.equal(result.pixelHeight, 1)
+})
+
+test('default DNS resolution selects IPv4 while retaining IPv6-only support', async () => {
+  const requests = []
+  const resolverCalls = []
+  const run = async ({ ipv4, ipv6 }) => fetchCommerceProviderImage(
+    { url: 'https://images.vendor.com/item.png' },
+    {
+      clearScheduledTimeout() {},
+      createResolver() {
+        return {
+          cancel() {},
+          async resolve4(hostname) {
+            resolverCalls.push(['resolve4', hostname])
+            return ipv4
+          },
+          async resolve6(hostname) {
+            resolverCalls.push(['resolve6', hostname])
+            return ipv6
+          },
+        }
+      },
+      async fetch(request) {
+        requests.push(request)
+        return response({ headers: { 'content-type': 'image/png' } }).response
+      },
+      now: () => 0,
+      scheduleTimeout: () => Symbol('timer'),
+    },
+  )
+
+  await run({
+    ipv4: ['93.184.216.34'],
+    ipv6: ['2606:4700:4700::1111'],
+  })
+  await run({
+    ipv4: [],
+    ipv6: ['2606:4700:4700::1111'],
+  })
+
+  assert.deepEqual(requests.map((request) => ({
+    address: request.address.address,
+    family: request.address.family,
+  })), [
+    { address: '93.184.216.34', family: 4 },
+    { address: '2606:4700:4700::1111', family: 6 },
+  ])
+  assert.deepEqual(resolverCalls, [
+    ['resolve6', 'images.vendor.com'],
+    ['resolve4', 'images.vendor.com'],
+    ['resolve6', 'images.vendor.com'],
+    ['resolve4', 'images.vendor.com'],
+  ])
 })
 
 test('native HTTPS transport preserves authority while using only the pinned address', async () => {

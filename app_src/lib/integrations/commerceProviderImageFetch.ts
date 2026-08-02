@@ -475,7 +475,13 @@ async function resolvePinnedAddress(
       'Provider image host resolves to a non-public address',
     )
   }
-  return classified[0]!.answer
+  // Railway can resolve both families while its outbound network supports
+  // IPv4 only. Keep validating the complete answer set before preferring a
+  // public IPv4 address, and retain IPv6 for hosts that have no IPv4 answer.
+  return (
+    classified.find((entry) => entry.answer.family === 4)
+    || classified[0]!
+  ).answer
 }
 
 function normalizedContentType(response: CommerceProviderImageHttpResponse) {
