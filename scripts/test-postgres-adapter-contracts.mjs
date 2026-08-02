@@ -1970,6 +1970,7 @@ const commerceProductImageWorkerHealth = healthRoute.slice(
 )
 for (const fragment of [
   'await readCommerceProductImageImportQueueHealthInPostgres()',
+  'historicalDead: imageQueue.historicalDeadCount',
   'if (!loopReachable)',
   "errors.push(\n                'Commerce product image import worker heartbeat is missing or stale.'",
   'if (imageQueue.deadCount > 0)',
@@ -1987,6 +1988,13 @@ for (const fragment of [
     'commerce product image worker health semantics',
   )
 }
+assert.equal(
+  commerceProductImageWorkerHealth.includes(
+    'imageQueue.historicalDeadCount > 0',
+  ),
+  false,
+  'Historical commerce product image failures must not degrade current health',
+)
 assert.ok(
   (
     healthRoute.match(/operations_commerce_product_image_imports_applied/g)

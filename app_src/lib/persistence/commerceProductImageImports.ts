@@ -126,6 +126,7 @@ export type CommerceProductImageImportQueueHealth = {
   retryCount: number
   claimedCount: number
   deadCount: number
+  historicalDeadCount: number
   staleLeaseCount: number
   overdueCount: number
   heartbeat: {
@@ -3613,6 +3614,7 @@ Promise<CommerceProductImageImportQueueHealth> {
       retry_count: string
       claimed_count: string
       dead_count: string
+      historical_dead_count: string
       stale_lease_count: string
       overdue_count: string
     }>(
@@ -3622,7 +3624,26 @@ Promise<CommerceProductImageImportQueueHealth> {
          count(*) FILTER (WHERE state = 'queued')::text AS queued_count,
          count(*) FILTER (WHERE state = 'retry')::text AS retry_count,
          count(*) FILTER (WHERE state = 'claimed')::text AS claimed_count,
-         count(*) FILTER (WHERE state = 'dead')::text AS dead_count,
+         count(*) FILTER (
+           WHERE job.state = 'dead'
+             AND NOT EXISTS (
+               SELECT 1
+               FROM operations_commerce_product_image_import_jobs newer
+               WHERE newer.organization_id = job.organization_id
+                 AND newer.observation_id = job.observation_id
+                 AND newer.job_generation > job.job_generation
+             )
+         )::text AS dead_count,
+         count(*) FILTER (
+           WHERE job.state = 'dead'
+             AND EXISTS (
+               SELECT 1
+               FROM operations_commerce_product_image_import_jobs newer
+               WHERE newer.organization_id = job.organization_id
+                 AND newer.observation_id = job.observation_id
+                 AND newer.job_generation > job.job_generation
+             )
+         )::text AS historical_dead_count,
          count(*) FILTER (
            WHERE state = 'claimed'
              AND lease_expires_at <= statement_timestamp()
@@ -3632,7 +3653,7 @@ Promise<CommerceProductImageImportQueueHealth> {
              AND available_at <=
                    statement_timestamp() - interval '5 minutes'
          )::text AS overdue_count
-       FROM operations_commerce_product_image_import_jobs`,
+       FROM operations_commerce_product_image_import_jobs job`,
     )
     const heartbeat = await client.query<{
       phase: CommerceProductImageImportWorkerPhase
@@ -3660,6 +3681,10 @@ Promise<CommerceProductImageImportQueueHealth> {
       retryCount: nonnegativeInteger(row.retry_count, 'retry count'),
       claimedCount: nonnegativeInteger(row.claimed_count, 'claimed count'),
       deadCount: nonnegativeInteger(row.dead_count, 'dead count'),
+      historicalDeadCount: nonnegativeInteger(
+        row.historical_dead_count,
+        'historical dead count',
+      ),
       staleLeaseCount: nonnegativeInteger(
         row.stale_lease_count,
         'stale lease count',

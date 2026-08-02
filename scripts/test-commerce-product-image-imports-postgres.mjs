@@ -2924,6 +2924,10 @@ async function verifyImports(pool) {
     { ...terminalFailure },
     { state: 'dead', attemptCount: 1 },
   )
+  const currentDeadHealth = await imageImports
+    .readCommerceProductImageImportQueueHealthInPostgres()
+  assert.equal(currentDeadHealth.deadCount, 2)
+  assert.equal(currentDeadHealth.historicalDeadCount, 0)
   const ordinaryDeadReplay = await imageImports
     .reconcileCommerceProductImageSetInPostgres(deadInput)
   assert.equal(ordinaryDeadReplay.active[0].jobId, deadReceipt.jobId)
@@ -2947,6 +2951,10 @@ async function verifyImports(pool) {
   assert.equal(deadSuccessor.jobGeneration, 2)
   assert.equal(deadSuccessor.state, 'queued')
   assert.equal(deadSuccessor.productId, deadProduct.id)
+  const retriedDeadHealth = await imageImports
+    .readCommerceProductImageImportQueueHealthInPostgres()
+  assert.equal(retriedDeadHealth.deadCount, 1)
+  assert.equal(retriedDeadHealth.historicalDeadCount, 1)
   await completeClaim(
     await claimOne(gamma.organizationId, 'operator-retry-worker'),
     FOUR_BY_FIVE_WEBP,
@@ -2983,6 +2991,10 @@ async function verifyImports(pool) {
     immutable_inputs: 1,
     retry_audits: 1,
   })
+  const supersededDeadHealth = await imageImports
+    .readCommerceProductImageImportQueueHealthInPostgres()
+  assert.equal(supersededDeadHealth.deadCount, 1)
+  assert.equal(supersededDeadHealth.historicalDeadCount, 1)
 
   const expiredProduct = await addProduct(pool, gammaThird, {
     key: 'expired-mapping-recovery',
@@ -3282,7 +3294,8 @@ async function verifyImports(pool) {
     })
   const finalHealth = await imageImports
     .readCommerceProductImageImportQueueHealthInPostgres()
-  assert.equal(finalHealth.deadCount, 3)
+  assert.equal(finalHealth.deadCount, 2)
+  assert.equal(finalHealth.historicalDeadCount, 1)
   assert.equal(finalHealth.staleLeaseCount, 0)
   assert.equal(finalHealth.overdueCount, 0)
   assert.equal(finalHealth.heartbeat.phase, 'completed')

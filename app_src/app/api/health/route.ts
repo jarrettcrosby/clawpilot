@@ -3268,6 +3268,7 @@ export async function GET() {
               retrying: imageQueue.retryCount,
               claimed: imageQueue.claimedCount,
               dead: imageQueue.deadCount,
+              historicalDead: imageQueue.historicalDeadCount,
               staleLeases: imageQueue.staleLeaseCount,
               overdue: imageQueue.overdueCount,
             }
