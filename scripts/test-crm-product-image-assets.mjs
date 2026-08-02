@@ -259,6 +259,14 @@ for (const contract of [
 assert.doesNotMatch(publicRoute, /requireRequestUser/)
 assert.doesNotMatch(publicRoute, /shopify/i)
 
+const authProxy = read('app_src/proxy.ts')
+assert.ok(
+  authProxy.includes(
+    "normalizedPath.startsWith('/api/public/crm-product-images/')",
+  ),
+  'content-addressed CRM Product images must bypass browser authentication',
+)
+
 const providerImport = read(
   'app_src/lib/persistence/commerceProductImageImports.ts',
 )
