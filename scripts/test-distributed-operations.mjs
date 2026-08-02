@@ -515,6 +515,10 @@ function verifySourceContracts() {
     'operations_command_receipts',
     'OPERATIONS_IDEMPOTENCY_CONFLICT',
     'operations.customer_resolution.review_required',
+    'DO UPDATE SET status = \'active\'',
+    'RETURNING entity_global_id',
+    'OPERATIONS_CUSTOMER_IDENTITY_CONFLICT',
+    'trimmed(input.identity.externalCustomerId, 512)',
     "status: 'ambiguous'",
     'uniqueReferenceRows',
     'operations:exception:',
@@ -3349,6 +3353,37 @@ async function verifyPostgresAcceptance(databaseUrl) {
     assert.equal(matchedAgain.status, 'matched')
     assert.equal(matchedAgain.method, 'external_id')
     assert.equal(matchedAgain.customer.globalId, primary.customer.reference_code)
+    const preservedCustomerBinding = await pool.query(
+      `SELECT external_id.entity_global_id, external_id.match_method,
+              external_id.match_evidence
+       FROM operations_external_identifiers external_id
+       JOIN operations_integration_accounts account
+         ON account.organization_id = external_id.organization_id
+        AND account.id = external_id.integration_account_id
+       WHERE external_id.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND external_id.entity_type = 'crm.organization'
+         AND external_id.external_id = $3`,
+      [
+        primary.organizationId,
+        commerceIntegration.rows[0].global_id,
+        existingExternalId,
+      ],
+    )
+    assert.equal(
+      preservedCustomerBinding.rows[0].entity_global_id,
+      primary.customer.reference_code,
+    )
+    assert.equal(
+      preservedCustomerBinding.rows[0].match_method,
+      'email',
+      'An external-ID replay must preserve the original evidence method',
+    )
+    assert.equal(
+      preservedCustomerBinding.rows[0].match_evidence.matchedBy,
+      'email',
+      'An external-ID replay must preserve the original match evidence',
+    )
 
     const createdExternalId = `new-customer-${randomUUID()}`
     const createdCustomer = await persistence.resolveCommerceCustomerInPostgres({

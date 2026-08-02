@@ -2,6 +2,7 @@ import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import type { SuiteCrmOutboxRecord } from '@/lib/crm/types'
 import {
+  query,
   withTransaction,
 } from '@/lib/persistence/postgres'
 
@@ -219,4 +220,86 @@ export async function enqueueSuiteCrmProductImageProjectionInPostgres(input: {
   return withTransaction((client) => (
     enqueueSuiteCrmProductImageProjectionWithClient(client, input)
   ))
+}
+
+export async function readSuiteCrmNativeProductImageProjectionHealthInPostgres() {
+  const result = await query<{
+    queued: string
+    retrying: string
+    processing: string
+    dead: string
+    latest_result: Record<string, unknown> | null
+    latest_result_at: string | null
+  }>(
+    `WITH current_projections AS (
+       SELECT
+         product.id::text AS product_id,
+         asset.content_sha256,
+         CASE
+           WHEN asset.id IS NULL
+             THEN 'crm:products:image:v1:' || product.id::text || ':none'
+           ELSE 'crm:products:image:v1:' || product.id::text || ':'
+             || asset.id::text || ':' || asset.asset_revision::text || ':'
+             || asset.row_version::text || ':' || asset.content_sha256
+         END
+           AS idempotency_key
+       FROM crm_products product
+       JOIN pipeline_spaces pipeline ON pipeline.id = product.pipeline_id
+       LEFT JOIN workspace_organizations organization
+         ON organization.id = pipeline.workspace_organization_id
+       LEFT JOIN LATERAL (
+         SELECT primary_asset.id, primary_asset.asset_revision,
+           primary_asset.row_version, primary_asset.content_sha256
+         FROM crm_product_image_assets primary_asset
+         WHERE primary_asset.organization_id
+               = pipeline.workspace_organization_id
+           AND primary_asset.pipeline_id = product.pipeline_id
+           AND primary_asset.product_id = product.id
+           AND primary_asset.is_primary = true
+         ORDER BY primary_asset.asset_revision, primary_asset.id
+         LIMIT 1
+       ) asset ON true
+       WHERE product.suitecrm_id IS NOT NULL
+         AND COALESCE(organization.is_demo, false) = false
+     ), queue AS (
+       SELECT
+         count(*) FILTER (WHERE outbox.status = 'queued')::text AS queued,
+         count(*) FILTER (WHERE outbox.status = 'failed')::text AS retrying,
+         count(*) FILTER (WHERE outbox.status = 'processing')::text AS processing,
+         count(*) FILTER (WHERE outbox.status = 'dead')::text AS dead
+       FROM current_projections image
+       JOIN sync_outbox outbox
+         ON outbox.target_system = 'suitecrm'
+        AND outbox.idempotency_key = image.idempotency_key
+       WHERE outbox.target_system = 'suitecrm'
+         AND outbox.aggregate_type = 'crm_products'
+         AND outbox.operation = 'upsert_record'
+         AND outbox.payload ? 'productImage'
+     ), latest AS (
+       SELECT event.payload, event.created_at
+       FROM audit_events event
+       JOIN current_projections image
+         ON event.aggregate_id = image.product_id
+        AND event.payload->>'imageContentSha256'
+              IS NOT DISTINCT FROM image.content_sha256
+       WHERE event.event_type =
+         'crm.product_image.suitecrm_native_projection_completed'
+       ORDER BY event.created_at DESC, event.id DESC
+       LIMIT 1
+     )
+     SELECT queue.*,
+       latest.payload AS latest_result,
+       latest.created_at::text AS latest_result_at
+     FROM queue
+     LEFT JOIN latest ON true`,
+  )
+  const row = result.rows[0]
+  return {
+    queued: Number(row?.queued || 0),
+    retrying: Number(row?.retrying || 0),
+    processing: Number(row?.processing || 0),
+    dead: Number(row?.dead || 0),
+    latestResult: row?.latest_result || null,
+    latestResultAt: row?.latest_result_at || null,
+  }
 }

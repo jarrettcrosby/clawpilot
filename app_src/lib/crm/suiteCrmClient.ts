@@ -1,7 +1,10 @@
 import type { CrmEntity, SuiteCrmOutboxRecord, SuiteCrmUserIdentityOutboxRecord } from '@/lib/crm/types'
 import { isIso4217CurrencyCode } from '@/lib/currency'
 import { publicCrmProductImageUrl } from '@/lib/crm/productImagePublic'
-import { projectSuiteCrmNativeProductImage } from '@/lib/crm/suiteCrmNativeProductImageClient'
+import {
+  projectSuiteCrmNativeProductImage,
+  type SuiteCrmNativeProductImageResult,
+} from '@/lib/crm/suiteCrmNativeProductImageClient'
 import { appPublicUrl } from '@/lib/publicUrl'
 
 type SuiteCrmRecordModule =
@@ -396,10 +399,15 @@ function suiteCrmRecordModule(record: SuiteCrmOutboxRecord): SuiteCrmRecordModul
   return canonicalModule
 }
 
-export async function upsertSuiteCrmRecord(
+export type SuiteCrmUpsertResult = {
+  suiteCrmId: string
+  productImageProjection: SuiteCrmNativeProductImageResult | null
+}
+
+export async function upsertSuiteCrmRecordWithResult(
   record: SuiteCrmOutboxRecord,
   fetchImpl: typeof fetch = fetch,
-) {
+): Promise<SuiteCrmUpsertResult> {
   const moduleName = suiteCrmRecordModule(record)
   const existing = await request(
     `/Api/V8/module/${moduleName}/${encodeURIComponent(record.suiteCrmId)}`,
@@ -435,9 +443,9 @@ export async function upsertSuiteCrmRecord(
   }, fetchImpl) as JsonApiResponse
   const id = String(response?.data?.id || record.suiteCrmId)
   if (id !== record.suiteCrmId) throw new Error('SuiteCRM returned an unexpected record ID')
-  if (record.productImage !== undefined) {
-    await projectSuiteCrmNativeProductImage(record, fetchImpl)
-  }
+  const productImageProjection = record.productImage !== undefined
+    ? await projectSuiteCrmNativeProductImage(record, fetchImpl)
+    : null
   for (const relationship of record.relationships || []) {
     const linkFieldName = relationship.linkFieldName
     if (!['accounts', 'contact', 'contacts', 'leads', 'opportunity'].includes(linkFieldName)) {
@@ -462,7 +470,14 @@ export async function upsertSuiteCrmRecord(
       }),
     }, fetchImpl)
   }
-  return id
+  return { suiteCrmId: id, productImageProjection }
+}
+
+export async function upsertSuiteCrmRecord(
+  record: SuiteCrmOutboxRecord,
+  fetchImpl: typeof fetch = fetch,
+) {
+  return (await upsertSuiteCrmRecordWithResult(record, fetchImpl)).suiteCrmId
 }
 
 export async function upsertSuiteCrmUserIdentity(

@@ -56,6 +56,23 @@ const client = await importClient()
 delete process.env.SUITECRM_NATIVE_PRODUCT_IMAGE_PROJECTION_ENABLED
 delete process.env.SUITECRM_MEDIA_USERNAME
 delete process.env.SUITECRM_MEDIA_PASSWORD
+delete process.env.SUITECRM_ADMIN_USER
+delete process.env.SUITECRM_ADMIN_USERNAME
+delete process.env.SUITECRM_ADMIN_PASSWORD
+delete process.env.SUITECRM_CLIENT_ID
+delete process.env.SUITECRM_CLIENT_SECRET
+delete process.env.SUITECRM_PRODUCT_IMAGE_READ_CLIENT_ID
+delete process.env.SUITECRM_PRODUCT_IMAGE_READ_CLIENT_SECRET
+delete process.env.SUITECRM_PRODUCT_IMAGE_READ_USERNAME
+delete process.env.SUITECRM_PRODUCT_IMAGE_READ_PASSWORD
+assert.deepEqual(client.suiteCrmNativeProductImageProjectionConfiguration(), {
+  enabled: false,
+  ready: false,
+  missing: ['SUITECRM_MEDIA_USERNAME', 'SUITECRM_MEDIA_PASSWORD'],
+  invalid: [],
+  credentialConflicts: [],
+  credentialSeparationVerified: false,
+})
 let disabledFetches = 0
 assert.deepEqual(
   await client.projectSuiteCrmNativeProductImage(record({
@@ -68,10 +85,37 @@ assert.deepEqual(
   { action: 'disabled', mediaId: null },
 )
 assert.equal(disabledFetches, 0)
+await assert.rejects(
+  client.projectSuiteCrmNativeProductImage({
+    ...record({
+      referenceCode: PRODUCT_REFERENCE,
+      contentSha256: IMAGE_SHA256,
+    }),
+    productImageProjectionRequired: true,
+  }, async () => {
+    throw new Error('required disabled projection must not reach the network')
+  }),
+  /required but disabled/u,
+)
 
 process.env.SUITECRM_NATIVE_PRODUCT_IMAGE_PROJECTION_ENABLED = '1'
 process.env.SUITECRM_MEDIA_USERNAME = 'clawpilot-media'
 process.env.SUITECRM_MEDIA_PASSWORD = 'dedicated-media-password'
+assert.deepEqual(client.suiteCrmNativeProductImageProjectionConfiguration(), {
+  enabled: true,
+  ready: true,
+  missing: [],
+  invalid: [],
+  credentialConflicts: [],
+  credentialSeparationVerified: true,
+})
+process.env.SUITECRM_ADMIN_USER = 'CLAWPILOT-MEDIA'
+assert.deepEqual(
+  client.suiteCrmNativeProductImageProjectionConfiguration()
+    .credentialConflicts,
+  ['SUITECRM_MEDIA_USERNAME:SUITECRM_ADMIN_USER'],
+)
+delete process.env.SUITECRM_ADMIN_USER
 
 function jsonResponse(value, status = 200, headers = {}) {
   return new Response(JSON.stringify(value), {
@@ -382,6 +426,13 @@ const suiteCrmClientSource = readFileSync(
   new URL('../app_src/lib/crm/suiteCrmClient.ts', import.meta.url),
   'utf8',
 )
+const nativeProjectionPersistenceSource = readFileSync(
+  new URL(
+    '../app_src/lib/persistence/suiteCrmProductImageProjection.ts',
+    import.meta.url,
+  ),
+  'utf8',
+)
 for (const contract of [
   'publicCrmProductImageUrl',
   'attributes.product_image',
@@ -396,5 +447,16 @@ assert.ok(
     < suiteCrmClientSource.indexOf('await projectSuiteCrmNativeProductImage(record, fetchImpl)'),
   'the existing V8 Product projection must complete before native media association',
 )
+for (const contract of [
+  'WITH current_projections AS',
+  "THEN 'crm:products:image:v1:' || product.id::text || ':none'",
+  'LEFT JOIN LATERAL',
+  'IS NOT DISTINCT FROM image.content_sha256',
+]) {
+  assert.ok(
+    nativeProjectionPersistenceSource.includes(contract),
+    `Native projection health must include current clear-image work: ${contract}`,
+  )
+}
 
 console.log('SuiteCRM native Product image client contract passed')

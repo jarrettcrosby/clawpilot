@@ -82,6 +82,14 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
       }
+      if (
+        specifier
+        === '@/lib/integrations/commerceFaireAutomaticPromotion'
+      ) {
+        return loadTypeScriptModule(
+          'app_src/lib/integrations/commerceFaireAutomaticPromotion.ts',
+        )
+      }
       return nodeRequire(specifier)
     },
   }
@@ -993,6 +1001,9 @@ assert.doesNotMatch(
 
 includes(serviceSource, [
   'getFaireOrder',
+  'COMMERCE_INTAKE_EXACT_ORDER_ID_INVALID',
+  'COMMERCE_INTAKE_EXACT_ORDER_ACTION_INVALID',
+  'exactExternalOrderIdHash',
   'listFaireOrders',
   'listFaireProducts',
   'listFaireInventory',
@@ -1080,6 +1091,12 @@ includes(productChannelStateSource, [
 includes(persistenceSource, [
   'providerAttemptActorEmail: string | null',
   'input.providerAttemptActorEmail',
+  "attempt.redacted_request->>'targetHash'",
+  'exactExternalOrderIdHash',
+  'exactOrderTargetHash',
+  'envelopeMatchesExactOrderTarget',
+  'returnedOrderIdentities.length === 1',
+  'COMMERCE_INTAKE_EXACT_ORDER_TARGET_MISMATCH',
   "SET disposition = 'retried'",
   'retry_run_id = $2::uuid',
 ], 'Successful exact-order retry closes the matching legacy rejection')
@@ -1505,11 +1522,15 @@ includes(persistenceSource, [
   'header_money_gaps',
   'order.headerMoney.fulfillmentDemandEligible',
   "expectedHeaderMoneyState === 'complete'",
+  'commerceCustomerChargeEligible(',
+  "provider === 'shopify' && headerMoneyState === 'complete'",
+  'latestCandidate.normalizerVersion',
+  '=== input.envelope.normalizerVersion',
   'shipping === null ? null : bigintString(shipping)',
   'otherAdjustment === null ? null : bigintString(otherAdjustment)',
   "fulfillmentDemandUse: 'exact_lines_only'",
   "accountingUse: candidate.header_money_state === 'complete'",
-  "customerChargeUse: candidate.header_money_state === 'complete'",
+  'customerChargeUse: commerceCustomerChargeEligible(',
 ], 'Commerce intake continuity')
 const productCandidateResolverSource = persistenceSource.slice(
   persistenceSource.indexOf(
@@ -1903,6 +1924,36 @@ includes(serviceSource, [
   'automaticCustomerResolution',
   'providerWrites: 0',
 ], 'Automatic commerce customer resolution')
+includes(serviceSource, [
+  'withAutomaticFaireOrderPromotion',
+  'readAutomaticFaireOrderPromotionTargetsForRunInPostgres',
+  "input.runtime.provider !== 'faire'",
+  'confirmCommerceCandidateAddressInPostgres',
+  'resolveCommerceCandidateDeliveryInPostgres',
+  'validateCommerceCandidateInPostgres',
+  'promoteCommerceCandidateInPostgres',
+  'automaticFaireOrderPromotion',
+  'operatorReviewRequired: held + failed',
+  'canonicalOrderWrites: promoted',
+], 'Conservative automatic Faire order promotion orchestration')
+includes(serviceSource, [
+  "'plan-customer-binding'",
+  "'confirm-customer-binding'",
+  'planCommerceCustomerPrefetchBindingInPostgres',
+  'confirmCommerceCustomerPrefetchBindingInPostgres',
+  'confirmCustomerBinding',
+], 'Plan-first Faire retailer pre-fetch binding commands')
+includes(persistenceSource, [
+  'commerce-customer-prefetch-binding-v1',
+  'commerceCustomerEvidenceFingerprint',
+  'deterministicCustomerPrefetchBindingUuid',
+  "'COMMERCE_CUSTOMER_PREFETCH_PLAN_STALE'",
+  "'COMMERCE_CUSTOMER_PREFETCH_IDENTITY_CONFLICT'",
+  "bindingOutcome = plan.existingBindingStatus === 'active'",
+  'confirmedBeforeProviderRead: true',
+  'providerReads: 0',
+  'providerWrites: 0',
+], 'Audited deterministic Faire retailer pre-fetch binding persistence')
 includes(persistenceSource, [
   'WITH anchor_run AS',
   "run.resource = 'products_and_orders'",
@@ -1911,7 +1962,26 @@ includes(persistenceSource, [
   'CASE WHEN run.global_id = $3 THEN 0 ELSE 1 END',
   'LIMIT 100',
   "encryptedSnapshot(candidate, input.runtime.globalId, 'party')",
+  'party?.organizationName\n        || address?.organizationName\n        || party?.contactName',
 ], 'Automatic customer targets include a bounded account backlog behind a validated run anchor')
+includes(persistenceSource, [
+  'readAutomaticFaireOrderPromotionTargetsForRunInPostgres',
+  "run.global_id = $3",
+  "run.provider = 'faire'",
+  "candidate.provider = 'faire'",
+  "candidate.workflow_state IN ('held', 'resolving', 'ready')",
+  'prior.run_id <> $5::uuid',
+  'prior_candidate_requires_review',
+  'source_age_requires_review',
+  "candidate.normalized_order_status !== 'open'",
+  "candidate.normalized_fulfillment_status !== 'unfulfilled'",
+  'line_quantity_requires_review',
+  'mapping.external_variant_id !== line.external_variant_id',
+  "(mapping.channel_sku?.trim() || '') !== sku",
+  'product_sku_or_pack_mapping_requires_review',
+  'ship_to_requires_review',
+  'delivery_date_requires_review',
+], 'Fresh-run Faire promotion eligibility and retained-order hold fences')
 assert.ok(
   !persistenceSource.includes('records_failed AS records_rejected'),
   'Normalization rejection counts must come from stage audit evidence',
@@ -1947,6 +2017,11 @@ includes(credentialCryptoSource, [
   "typeof item === 'bigint'",
   '8_388_608',
 ], 'Encrypted commerce read replay evidence')
+includes(credentialCryptoSource, [
+  'commerceCustomerEvidenceFingerprint',
+  ".createHmac('sha256', encryptionKey())",
+  'clawpilot:commerce:customer-evidence:v1',
+], 'Keyed commerce customer evidence fingerprints')
 const workflowSource = read(
   'app_src/components/settings/CommerceIntakeWorkflow.tsx',
 )
@@ -1995,6 +2070,19 @@ includes(operationsPersistenceSource, [
   'row.revision === input.expectedCurrentRevision',
   "'OPERATIONS_ACTIVATION_STATE_CONFLICT'",
 ], 'Activation recovery state fencing')
+includes(operationsPersistenceSource, [
+  'operations:commerce-customer:',
+  'DO UPDATE SET status = \'active\'',
+  'RETURNING entity_global_id',
+  "'OPERATIONS_CUSTOMER_IDENTITY_CONFLICT'",
+  'trimmed(input.identity.externalCustomerId, 512)',
+], 'Conflict-preserving commerce customer identity binding')
+assert.ok(
+  !operationsPersistenceSource.includes(
+    'DO UPDATE SET entity_global_id = EXCLUDED.entity_global_id',
+  ),
+  'Automatic customer resolution must never rebind an existing provider identity',
+)
 includes(workflowSource, [
   "'fetch-products'",
   "'fetch-next-products'",
@@ -2019,6 +2107,14 @@ includes(workflowSource, [
   'Retry all exact orders',
   "'bulk-retry-order-money'",
   "'bulk-retry-rejection'",
+  'Find one exact Faire order',
+  'Bind a Faire retailer before the first order read',
+  "'plan-customer-binding'",
+  "'confirm-customer-binding'",
+  'confirmCustomerBinding: true',
+  'Faire provider order ID',
+  'externalOrderId: normalizedExactFaireOrderId',
+  'creates no provider, inventory, or',
   'Download review CSV',
   'Import decisions',
   'parseCommerceProductReviewCsv',
@@ -2085,6 +2181,9 @@ includes(workflowSource, [
   'Paid-shipping records can stage',
   'Missing shipping and total remain unavailable',
   'Header total unavailable',
+  'Brand-side amount',
+  'retailer-funded credits or tender charges',
+  'labeled as what the retailer paid',
   'blocked from',
   'accounting and customer-charge use',
 ], 'Current Faire money retry guidance')
@@ -2327,12 +2426,16 @@ const stateReads = []
 const stageReplays = new Map()
 const continuations = new Map()
 const readIntents = new Map()
+const readIntentPreparations = []
 const invalidContinuations = []
 const stageAttempts = []
 const automaticProductSweeps = []
 let automaticCustomerTargets = []
 const automaticCustomerResolverCalls = []
+let automaticFairePromotionTargets = []
 const productPolicyUpdates = []
+const customerBindingPlanCalls = []
+const customerBindingConfirmCalls = []
 let failStageOnceForKey = null
 let failReadIntentPreparationForKey = null
 const refreshTargets = new Map([
@@ -2369,7 +2472,15 @@ function envelope(provider, orderIds) {
 function persistenceCommand(name) {
   return async (input) => {
     persistenceCommands.push({ name, input })
-    return { action: name, replayed: false }
+    return {
+      action: name,
+      replayed: false,
+      rowVersion: Number(input.candidateRowVersion || 0) + 1,
+      ...(name === 'validate' ? { ready: true } : {}),
+      ...(name === 'promote'
+        ? { canonicalOrderGlobalId: 'go0000001' }
+        : {}),
+    }
   }
 }
 
@@ -2491,7 +2602,7 @@ const service = loadTypeScriptModule(
       },
       '@/lib/integrations/faireCommerceNormalizer': {
         FAIRE_COMMERCE_NORMALIZER_VERSION:
-          'faire-commerce-normalizer-v6',
+          'faire-commerce-normalizer-v7',
         normalizeFaireCommerce(source) {
           normalizedSources.faire = source
           if (source.inventories) {
@@ -2746,6 +2857,61 @@ const service = loadTypeScriptModule(
         },
       },
       '@/lib/persistence/commerceIntake': {
+        async planCommerceCustomerPrefetchBindingInPostgres(input) {
+          customerBindingPlanCalls.push(input)
+          if (input.runtime.provider !== 'faire') {
+            throw new MockCommerceIntegrationRequestError(
+              'Pre-fetch retailer binding is available only for Faire',
+              409,
+              'COMMERCE_CUSTOMER_PREFETCH_FAIRE_REQUIRED',
+            )
+          }
+          return {
+            action: 'plan-customer-binding',
+            policyVersion: 'commerce-customer-prefetch-binding-v1',
+            accountGlobalId: input.runtime.globalId,
+            provider: 'faire',
+            customerGlobalId: input.customerGlobalId,
+            customerName: 'Warehouse Warehouse',
+            externalCustomerIdHash: 'a'.repeat(64),
+            evidenceEmailHash: 'b'.repeat(64),
+            matchMethod: 'email',
+            planHash: 'c'.repeat(64),
+            confirmationIdempotencyKey:
+              '99999999-9999-5999-8999-999999999999',
+            alreadyBound: false,
+            existingBindingStatus: null,
+            requiresConfirmation: true,
+            providerReads: 0,
+            providerWrites: 0,
+            databaseWrites: 0,
+            syncCursorAdvanced: false,
+          }
+        },
+        async confirmCommerceCustomerPrefetchBindingInPostgres(input) {
+          customerBindingConfirmCalls.push(input)
+          if (!input.confirmed) {
+            throw new MockCommerceIntegrationRequestError(
+              'Confirm the reviewed binding',
+              400,
+              'COMMERCE_CUSTOMER_PREFETCH_CONFIRMATION_REQUIRED',
+            )
+          }
+          return {
+            action: 'confirm-customer-binding',
+            customerGlobalId: input.customerGlobalId,
+            bindingOutcome: 'created',
+            providerReads: 0,
+            providerWrites: 0,
+            databaseWrites: 4,
+            replayed: false,
+          }
+        },
+        async readAutomaticFaireOrderPromotionTargetsForRunInPostgres() {
+          const targets = automaticFairePromotionTargets
+          automaticFairePromotionTargets = []
+          return targets
+        },
         async readAutomaticCommerceCustomerTargetsForRunInPostgres() {
           const targets = automaticCustomerTargets
           automaticCustomerTargets = []
@@ -2786,6 +2952,11 @@ const service = loadTypeScriptModule(
             && (
               replay.target.kind !== input.target.kind
               || replay.target.globalId !== input.target.globalId
+              || (
+                input.exactExternalOrderIdHash !== undefined
+                && replay.exactExternalOrderIdHash
+                  !== input.exactExternalOrderIdHash
+              )
             )
           ) {
             const error = new Error(
@@ -2797,6 +2968,7 @@ const service = loadTypeScriptModule(
           return replay?.result || null
         },
         async prepareCommerceIntakeReadIntentInPostgres(input) {
+          readIntentPreparations.push(input)
           if (
             input.idempotencyKey === failReadIntentPreparationForKey
           ) {
@@ -2985,6 +3157,8 @@ const service = loadTypeScriptModule(
                       }
                     : { kind: 'none', globalId: null },
               result: { ...result, replayed: true },
+              exactExternalOrderIdHash:
+                input.exactExternalOrderIdHash ?? null,
             },
           )
           return result
@@ -3328,6 +3502,203 @@ try {
       idempotencyKey: nextKey(),
     },
   })
+  const readsBeforeCustomerBinding = { ...providerReads }
+  const customerBindingPlan = await service.executeCommerceIntakeCommand({
+    organizationId,
+    actorEmail,
+    body: {
+      action: 'plan-customer-binding',
+      accountGlobalId: faireRuntime.globalId,
+      externalCustomerId: 'retailer-300',
+      customerGlobalId: 'ga5649471',
+      evidenceEmail: 'JARRETT+WAREHOUSE@EPISCS.COM',
+      idempotencyKey: nextKey(),
+    },
+  })
+  assert.equal(customerBindingPlan.command.action, 'plan-customer-binding')
+  assert.equal(customerBindingPlan.command.providerReads, 0)
+  assert.equal(customerBindingPlan.command.providerWrites, 0)
+  assert.equal(customerBindingPlan.command.databaseWrites, 0)
+  assert.equal(
+    customerBindingPlanCalls.at(-1).evidenceEmail,
+    'jarrett+warehouse@episcs.com',
+  )
+  assert.deepEqual(
+    providerReads,
+    readsBeforeCustomerBinding,
+    'Customer binding review must not call either provider',
+  )
+  await assert.rejects(
+    service.executeCommerceIntakeCommand({
+      organizationId,
+      actorEmail,
+      body: {
+        action: 'confirm-customer-binding',
+        accountGlobalId: faireRuntime.globalId,
+        externalCustomerId: 'retailer-300',
+        customerGlobalId: 'ga5649471',
+        evidenceEmail: 'jarrett+warehouse@episcs.com',
+        bindingPlanHash: customerBindingPlan.command.planHash,
+        idempotencyKey:
+          customerBindingPlan.command.confirmationIdempotencyKey,
+      },
+    }),
+    (error) => (
+      error.code === 'COMMERCE_CUSTOMER_PREFETCH_CONFIRMATION_REQUIRED'
+    ),
+  )
+  const confirmedCustomerBinding =
+    await service.executeCommerceIntakeCommand({
+      organizationId,
+      actorEmail,
+      body: {
+        action: 'confirm-customer-binding',
+        accountGlobalId: faireRuntime.globalId,
+        externalCustomerId: 'retailer-300',
+        customerGlobalId: 'ga5649471',
+        evidenceEmail: 'jarrett+warehouse@episcs.com',
+        bindingPlanHash: customerBindingPlan.command.planHash,
+        confirmCustomerBinding: true,
+        idempotencyKey:
+          customerBindingPlan.command.confirmationIdempotencyKey,
+      },
+    })
+  assert.equal(confirmedCustomerBinding.command.bindingOutcome, 'created')
+  assert.equal(confirmedCustomerBinding.command.providerReads, 0)
+  assert.equal(confirmedCustomerBinding.command.providerWrites, 0)
+  assert.equal(customerBindingConfirmCalls.at(-1).confirmed, true)
+  assert.deepEqual(
+    providerReads,
+    readsBeforeCustomerBinding,
+    'Customer binding confirmation must not call either provider',
+  )
+  await assert.rejects(
+    service.executeCommerceIntakeCommand({
+      organizationId,
+      actorEmail,
+      body: {
+        action: 'plan-customer-binding',
+        accountGlobalId: shopifyRuntime.globalId,
+        externalCustomerId: 'retailer-300',
+        customerGlobalId: 'ga5649471',
+        evidenceEmail: 'jarrett+warehouse@episcs.com',
+        idempotencyKey: nextKey(),
+      },
+    }),
+    (error) => error.code === 'COMMERCE_CUSTOMER_PREFETCH_FAIRE_REQUIRED',
+  )
+  const exactFaireOrderId = 'bo_b78sny28px'
+  const exactFaireKey = nextKey()
+  const exactFaireRead = await service.executeCommerceIntakeCommand({
+    organizationId,
+    actorEmail,
+    body: {
+      action: 'fetch',
+      accountGlobalId: faireRuntime.globalId,
+      externalOrderId: exactFaireOrderId,
+      confirmReadOnly: true,
+      idempotencyKey: exactFaireKey,
+    },
+  })
+  assert.equal(exactFaireRead.command.providerWrites, 0)
+  assert.equal(exactFaireRead.command.syncCursorAdvanced, false)
+  const exactPreparation = readIntentPreparations.find(
+    (input) => input.idempotencyKey === exactFaireKey,
+  )
+  assert.ok(exactPreparation)
+  assert.equal(exactPreparation.action, 'fetch')
+  assert.equal(exactPreparation.resource, 'orders')
+  assert.equal(exactPreparation.target.kind, 'none')
+  assert.equal(exactPreparation.pageSize, 1)
+  assert.match(exactPreparation.exactExternalOrderIdHash, /^[a-f0-9]{64}$/)
+  const exactReservation = providerReservations.find(
+    (input) => input.idempotencyKey === exactFaireKey,
+  )
+  assert.ok(exactReservation)
+  assert.equal(exactReservation.redactedRequest.targetedRead, true)
+  assert.equal(exactReservation.redactedRequest.pageSize, 1)
+  assert.equal(exactReservation.redactedRequest.oneRootPage, false)
+  assert.equal(
+    exactReservation.redactedRequest.targetHash,
+    exactPreparation.exactExternalOrderIdHash,
+  )
+  assert.doesNotMatch(
+    JSON.stringify(exactReservation.redactedRequest),
+    new RegExp(exactFaireOrderId, 'i'),
+    'Exact provider-read evidence must retain only the order-ID hash',
+  )
+  const exactStage = stageAttempts.find(
+    (input) => input.idempotencyKey === exactFaireKey,
+  )
+  assert.ok(exactStage)
+  assert.equal(exactStage.stageAction, 'fetch')
+  assert.equal(exactStage.page.resource, 'orders')
+  assert.equal(exactStage.page.nextOrderCursor, null)
+  assert.equal(
+    exactStage.envelope.orders[0].identity.value,
+    exactFaireOrderId,
+  )
+  assert.equal(
+    exactStage.exactExternalOrderIdHash,
+    exactPreparation.exactExternalOrderIdHash,
+  )
+  await assert.rejects(
+    service.executeCommerceIntakeCommand({
+      organizationId,
+      actorEmail,
+      body: {
+        action: 'fetch',
+        accountGlobalId: faireRuntime.globalId,
+        externalOrderId: 'bo_different_order',
+        confirmReadOnly: true,
+        idempotencyKey: exactFaireKey,
+      },
+    }),
+    (error) => error.code === 'COMMERCE_INTAKE_IDEMPOTENCY_CONFLICT',
+    'An exact-order retry key must remain bound to the original hashed provider ID',
+  )
+  await assert.rejects(
+    service.executeCommerceIntakeCommand({
+      organizationId,
+      actorEmail,
+      body: {
+        action: 'fetch',
+        accountGlobalId: faireRuntime.globalId,
+        confirmReadOnly: true,
+        idempotencyKey: exactFaireKey,
+      },
+    }),
+    (error) => error.code === 'COMMERCE_INTAKE_IDEMPOTENCY_CONFLICT',
+    'Removing the exact-order target must not turn the same retry key into a root fetch',
+  )
+  await assert.rejects(
+    service.executeCommerceIntakeCommand({
+      organizationId,
+      actorEmail,
+      body: {
+        action: 'fetch',
+        accountGlobalId: shopifyRuntime.globalId,
+        externalOrderId: exactFaireOrderId,
+        confirmReadOnly: true,
+        idempotencyKey: nextKey(),
+      },
+    }),
+    (error) => error.code === 'COMMERCE_INTAKE_EXACT_ORDER_ACTION_INVALID',
+  )
+  await assert.rejects(
+    service.executeCommerceIntakeCommand({
+      organizationId,
+      actorEmail,
+      body: {
+        action: 'fetch',
+        accountGlobalId: faireRuntime.globalId,
+        externalOrderId: '../orders/other',
+        confirmReadOnly: true,
+        idempotencyKey: nextKey(),
+      },
+    }),
+    (error) => error.code === 'COMMERCE_INTAKE_EXACT_ORDER_ID_INVALID',
+  )
   const refreshKey = nextKey()
   automaticCustomerTargets = [
     {
@@ -3433,6 +3804,99 @@ try {
       },
     ],
   )
+  const automaticFaireCommandStart = persistenceCommands.length
+  automaticFairePromotionTargets = [
+    {
+      eligible: true,
+      reason: null,
+      candidateGlobalId: 'gcoc0000010',
+      candidateRowVersion: 10,
+      providerAddress: {
+        name: 'Controlled Faire Retailer',
+        line1: '100 Test Way',
+        line2: null,
+        city: 'Huntington Beach',
+        region: 'CA',
+        postalCode: '92647',
+        country: 'US',
+      },
+      deliveryMode: 'provider',
+    },
+    {
+      eligible: false,
+      reason: 'customer_resolution_required',
+      candidateGlobalId: 'gcoc0000011',
+      candidateRowVersion: 11,
+      providerAddress: null,
+      deliveryMode: null,
+    },
+    {
+      eligible: false,
+      reason: 'product_sku_or_pack_mapping_requires_review',
+      candidateGlobalId: 'gcoc0000012',
+      candidateRowVersion: 12,
+      providerAddress: null,
+      deliveryMode: null,
+    },
+  ]
+  const automaticFaireFetch = await service.executeCommerceIntakeCommand({
+    organizationId,
+    actorEmail,
+    body: {
+      action: 'fetch',
+      accountGlobalId: faireRuntime.globalId,
+      confirmReadOnly: true,
+      idempotencyKey: nextKey(),
+    },
+  })
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      automaticFaireFetch.command.automaticFaireOrderPromotion,
+    )),
+    {
+      policyVersion: 'commerce-faire-order-auto-promotion-v1',
+      runGlobalId: automaticFaireFetch.command.runGlobalId,
+      candidatesFound: 3,
+      eligible: 1,
+      promoted: 1,
+      held: 2,
+      heldByReason: {
+        customer_resolution_required: 1,
+        product_sku_or_pack_mapping_requires_review: 1,
+      },
+      failed: 0,
+      failedByCode: {},
+      operatorReviewRequired: 2,
+      providerWrites: 0,
+      canonicalOrderWrites: 1,
+      inventoryWrites: 0,
+      syncCursorAdvanced: false,
+    },
+    'One exact Faire order must promote without routine confirmation while ambiguous/error candidates remain held',
+  )
+  const automaticFaireCommands = persistenceCommands
+    .slice(automaticFaireCommandStart)
+    .filter((entry) => entry.input.candidateGlobalId === 'gcoc0000010')
+  assert.deepEqual(
+    automaticFaireCommands.map((entry) => ({
+      action: entry.name,
+      rowVersion: entry.input.candidateRowVersion,
+    })),
+    [
+      { action: 'confirm-address', rowVersion: 10 },
+      { action: 'resolve-delivery', rowVersion: 11 },
+      { action: 'validate', rowVersion: 12 },
+      { action: 'promote', rowVersion: 13 },
+    ],
+    'Faire happy-path promotion must advance exact row versions through provider address, delivery, validation, and local promotion',
+  )
+  assert.equal(
+    new Set(automaticFaireCommands.map(
+      (entry) => entry.input.idempotencyKey,
+    )).size,
+    4,
+    'Each automatic Faire command must have a distinct deterministic receipt key',
+  )
   await assert.rejects(
     service.executeCommerceIntakeCommand({
       organizationId,
@@ -3508,9 +3972,9 @@ try {
     shopifyGraphql: 7,
     faireProducts: 2,
     faireInventory: 3,
-    faireOrders: 2,
-    faireOrder: 1,
-    faireProfile: 5,
+    faireOrders: 3,
+    faireOrder: 2,
+    faireProfile: 7,
   })
   assert.equal(normalizedSources.shopify.data.products.nodes.length, 0)
   assert.equal(normalizedSources.shopify.data.orders.nodes.length, 1)
@@ -3538,12 +4002,12 @@ try {
       .available_quantity.quantity,
     -2,
   )
-  assert.equal(providerAttempts.length, 11)
-  assert.equal(providerReservations.length, 14)
+  assert.equal(providerAttempts.length, 13)
+  assert.equal(providerReservations.length, 16)
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'faire'
-      && reservation.adapterVersion === 'faire-commerce-normalizer-v6'
+      && reservation.adapterVersion === 'faire-commerce-normalizer-v7'
     )),
     'Faire provider-attempt evidence must record the current normalizer',
   )
@@ -3554,9 +4018,9 @@ try {
     )),
     'Shopify provider-attempt evidence must record its current normalizer',
   )
-  assert.equal(capturedReads.size, 11)
+  assert.equal(capturedReads.size, 13)
   assert.equal(uncertainReads.length, 0)
-  assert.equal(stageAttempts.length, 14)
+  assert.equal(stageAttempts.length, 16)
   for (const attempt of providerAttempts) {
     assert.equal(attempt.action, 'commerce.intake.read')
     assert.equal(attempt.redactedRequest.readOnly, true)
@@ -3565,7 +4029,7 @@ try {
   }
   assert.equal(
     persistenceCommands.filter(({ name }) => name === 'stage-envelope').length,
-    11,
+    13,
   )
   const staged = persistenceCommands.filter(
     ({ name }) => name === 'stage-envelope',
@@ -3605,7 +4069,9 @@ try {
       'fetch-next-products',
       'fetch',
       'fetch-next',
+      'fetch',
       'refresh',
+      'fetch',
       'retry-rejection',
       'retry-rejection',
     ],
@@ -3616,11 +4082,11 @@ try {
   assert.equal(staged[1].input.page.nextOrderCursor, null)
   assert.equal(staged[2].input.page.resource, 'products')
   assert.equal(staged[3].input.page.resource, 'products')
-  assert.equal(staged[8].input.page, null)
   assert.equal(staged[9].input.page, null)
-  assert.equal(staged[10].input.page, null)
+  assert.equal(staged[11].input.page, null)
+  assert.equal(staged[12].input.page, null)
   assert.equal(
-    staged[10].input.envelope.orders[0].identity.value,
+    staged[12].input.envelope.orders[0].identity.value,
     'faire-order-rejected-1',
     'Faire exact-order retry must stage the identity read by getFaireOrder',
   )
@@ -3891,9 +4357,9 @@ try {
     shopifyGraphql: 7,
     faireProducts: 2,
     faireInventory: 3,
-    faireOrders: 2,
-    faireOrder: 1,
-    faireProfile: 5,
+    faireOrders: 3,
+    faireOrder: 2,
+    faireProfile: 7,
   }, 'Resolution, validation, and promotion must not call providers')
   const promotion = persistenceCommands.find(({ name }) => name === 'promote')
   assert.match(promotion.input.requestHash, /^[a-f0-9]{64}$/)

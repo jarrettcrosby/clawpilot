@@ -5,6 +5,9 @@ import { getRepositoryRunnerConfiguration } from '@/lib/agents/repositoryRunnerC
 import { getStorageDriver, isHostedRuntime } from '@/lib/persistence/config'
 import { query as queryAgentCredentials } from '@/lib/persistence/agentCredentials'
 import { query } from '@/lib/persistence/postgres'
+import {
+  OPERATIONS_COMMAND_RECEIPT_HEALTH_QUERY,
+} from '@/lib/persistence/operationsCommandReceiptHealth'
 import { readPipelineOutboxWorkerHeartbeatFromPostgres } from '@/lib/persistence/pipeline'
 import { readAgentDispatchWorkerHeartbeatFromPostgres } from '@/lib/persistence/agentDispatch'
 import { readAgentResearchWorkerHeartbeatFromPostgres } from '@/lib/persistence/agentResearch'
@@ -37,8 +40,14 @@ import {
   suiteCrmProductImageReadConfiguration,
 } from '@/lib/crm/suiteCrmProductImageReadClient'
 import {
+  suiteCrmNativeProductImageProjectionConfiguration,
+} from '@/lib/crm/suiteCrmNativeProductImageClient'
+import {
   readSuiteCrmProductImageIngestionHealthInPostgres,
 } from '@/lib/persistence/suiteCrmProductImageIngestion'
+import {
+  readSuiteCrmNativeProductImageProjectionHealthInPostgres,
+} from '@/lib/persistence/suiteCrmProductImageProjection'
 
 const DEV_LOG_PATH = '/tmp/clawd-app-dev.log'
 const FALLBACK_LOG_PATH = '/tmp/clawd-app.log'
@@ -120,6 +129,16 @@ export async function GET() {
     }
     const suiteCrmProductImageConfiguration =
       suiteCrmProductImageReadConfiguration()
+    const suiteCrmNativeProductImageConfiguration =
+      suiteCrmNativeProductImageProjectionConfiguration()
+    let suiteCrmNativeProductImageProjection: Record<string, unknown> = {
+      status: suiteCrmNativeProductImageConfiguration.enabled
+        ? 'unavailable'
+        : 'disabled',
+      ...suiteCrmNativeProductImageConfiguration,
+      latestResult: null,
+      latestResultAt: null,
+    }
     let suiteCrmProductImageIngestion: Record<string, unknown> = {
       status: suiteCrmProductImageConfiguration.enabled
         ? 'unavailable'
@@ -2442,37 +2461,43 @@ export async function GET() {
             processing: number
             failed: number
             stale_processing: number
+            policy_rejected: number
+            superseded: number
+            actionable_failed: number
             active_organizations: number
             shadow_organizations: number
-          }>(
-            `SELECT
-               count(*) FILTER (WHERE receipt.status = 'processing')::integer AS processing,
-               count(*) FILTER (WHERE receipt.status = 'failed')::integer AS failed,
-               count(*) FILTER (
-                 WHERE receipt.status = 'processing'
-                   AND receipt.updated_at < now() - interval '15 minutes'
-               )::integer AS stale_processing,
-               (SELECT count(*)::integer FROM operations_activation_scopes WHERE state = 'active') AS active_organizations,
-               (SELECT count(*)::integer FROM operations_activation_scopes WHERE state = 'shadow') AS shadow_organizations
-             FROM operations_command_receipts receipt
-             JOIN workspace_organizations organization ON organization.id = receipt.organization_id
-             WHERE organization.is_demo = false`,
-          )
+          }>(OPERATIONS_COMMAND_RECEIPT_HEALTH_QUERY)
           const commands = commandResult.rows[0]
           const staleProcessing = Number(commands?.stale_processing || 0)
           const failed = Number(commands?.failed || 0)
+          const policyRejected = Number(commands?.policy_rejected || 0)
+          const superseded = Number(commands?.superseded || 0)
+          const actionableFailed = Number(commands?.actionable_failed || 0)
           operationsCommands = {
-            status: staleProcessing > 0 ? 'error' : failed > 0 ? 'degraded' : 'healthy',
+            status: staleProcessing > 0
+              ? 'error'
+              : actionableFailed > 0
+                ? 'degraded'
+                : 'healthy',
             processing: Number(commands?.processing || 0),
             failed,
+            policyRejected,
+            superseded,
+            actionableFailed,
             staleProcessing,
             activation: {
               activeOrganizations: Number(commands?.active_organizations || 0),
               shadowOrganizations: Number(commands?.shadow_organizations || 0),
             },
           }
-          if (staleProcessing > 0) errors.push('Operations command queue has stale processing commands.')
-          if (failed > 0) warnings.push('Operations command queue has failed commands available for review or retry.')
+          if (staleProcessing > 0) {
+            errors.push('Operations command receipts have stale processing commands.')
+          }
+          if (actionableFailed > 0) {
+            warnings.push(
+              'Operations command receipts have actionable failures available for review or retry.',
+            )
+          }
         }
 
         if (
@@ -2690,6 +2715,34 @@ export async function GET() {
             }
             if (crmAgeMs === null || crmAgeMs > maxHeartbeatAgeMs) {
               errors.push('SuiteCRM outbox worker heartbeat is missing or stale.')
+            }
+            if (
+              suiteCrmNativeProductImageConfiguration.enabled
+              && !suiteCrmNativeProductImageConfiguration.ready
+            ) {
+              warnings.push(
+                'SuiteCRM native Product image projection is enabled but its dedicated media credentials, URLs, or credential separation are incomplete or invalid.',
+              )
+            } else if (suiteCrmNativeProductImageConfiguration.enabled) {
+              const nativeImageProjection =
+                await readSuiteCrmNativeProductImageProjectionHealthInPostgres()
+              const projectionDegraded = nativeImageProjection.dead > 0
+                || nativeImageProjection.retrying > 0
+              suiteCrmNativeProductImageProjection = {
+                status: projectionDegraded ? 'degraded' : 'ready',
+                ...suiteCrmNativeProductImageConfiguration,
+                ...nativeImageProjection,
+              }
+              if (nativeImageProjection.dead > 0) {
+                warnings.push(
+                  'SuiteCRM native Product image projection has terminal failed outbox work.',
+                )
+              }
+              if (nativeImageProjection.retrying > 0) {
+                warnings.push(
+                  'SuiteCRM native Product image projection has retrying outbox work.',
+                )
+              }
             }
           }
 
@@ -3066,6 +3119,7 @@ export async function GET() {
             )
             const operationalDegraded = (
               orderState.failed > 0
+              || orderState.promotionAttentionRequired > 0
               || orderState.staleProcessing > 0
               || orderState.overdue > 0
             )
@@ -3088,6 +3142,11 @@ export async function GET() {
             if (orderState.failed > 0) {
               warnings.push(
                 'Commerce order reconciliation has failed accounts.',
+              )
+            }
+            if (orderState.promotionAttentionRequired > 0) {
+              warnings.push(
+                'Faire provider reads completed, but automatic local order promotion needs operator attention.',
               )
             }
             if (orderState.staleProcessing > 0) {
@@ -3511,6 +3570,7 @@ export async function GET() {
       shopifyInventoryRefreshWorker,
       faireInventoryPollWorker,
       commerceProductImageImportWorker,
+      suiteCrmNativeProductImageProjection,
       suiteCrmProductImageIngestion,
       integrationQueues,
       operationsCommands,

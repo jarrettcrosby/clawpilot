@@ -410,12 +410,13 @@ type CommerceIntake = {
     recordsHeld: number
     consecutiveFailures: number
     lastErrorCode: string | null
+    automaticPromotionAttentionRequired: boolean
     lastStartedAt: string | null
     lastCompletedAt: string | null
     resumable: boolean
     resetRequired: boolean
     providerWrites: 0
-    canonicalOrderWrites: 0
+    canonicalOrderWrites: number
     inventoryWrites: 0
   } | null
 }
@@ -440,7 +441,7 @@ type IntakePayload = {
     result?: unknown
     automaticProductCreation?: AutomaticProductCreationSummary
     productIntake?: ProductIntakePolicy
-  }
+  } & Partial<CustomerPrefetchBindingPlan>
 }
 
 type CartonizationMaterialsPayload = {
@@ -544,6 +545,24 @@ type CustomerDraft = {
   name: string
   email: string
   phone: string
+}
+
+type CustomerPrefetchBindingPlan = {
+  action: 'plan-customer-binding'
+  policyVersion: string
+  customerGlobalId: string
+  customerName: string
+  externalCustomerIdHash: string
+  evidenceEmailHash: string
+  matchMethod: 'email'
+  planHash: string
+  confirmationIdempotencyKey: string
+  alreadyBound: boolean
+  existingBindingStatus: 'active' | 'stale' | 'retired' | null
+  requiresConfirmation: true
+  providerReads: 0
+  providerWrites: 0
+  databaseWrites: 0
 }
 
 type AddressDraft = {
@@ -1242,6 +1261,14 @@ export default function CommerceIntakeWorkflow({
     useState<WorkbenchTab>('overview')
   const [productSearch, setProductSearch] = useState('')
   const [orderSearch, setOrderSearch] = useState('')
+  const [exactFaireOrderId, setExactFaireOrderId] = useState('')
+  const [faireRetailerId, setFaireRetailerId] = useState('')
+  const [faireRetailerEvidenceEmail, setFaireRetailerEvidenceEmail] =
+    useState('')
+  const [faireRetailerCustomerGlobalId, setFaireRetailerCustomerGlobalId] =
+    useState('')
+  const [faireCustomerBindingPlan, setFaireCustomerBindingPlan] =
+    useState<CustomerPrefetchBindingPlan | null>(null)
   const [issueSearch, setIssueSearch] = useState('')
   const [productFilter, setProductFilter] =
     useState<ProductReviewFilter>('all')
@@ -1351,6 +1378,7 @@ export default function CommerceIntakeWorkflow({
     setWorkbenchTab('overview')
     setProductSearch('')
     setOrderSearch('')
+    setExactFaireOrderId('')
     setIssueSearch('')
     setProductFilter('all')
     setOrderFilter('all')
@@ -1362,6 +1390,10 @@ export default function CommerceIntakeWorkflow({
     setBulkProductProgress(null)
     setBulkRetryProgress(null)
     retryKeys.current.clear()
+    setFaireRetailerId('')
+    setFaireRetailerEvidenceEmail('')
+    setFaireRetailerCustomerGlobalId('')
+    setFaireCustomerBindingPlan(null)
     setProductDrafts({})
     setCatalogProductDrafts({})
     setRejectionReasons({})
@@ -1474,6 +1506,107 @@ export default function CommerceIntakeWorkflow({
     }
   }, [accountGlobalId, loadIntake, pendingAction])
 
+  async function reviewFaireCustomerBinding() {
+    if (pendingAction || !faireRetailerBindingInputValid) return
+    setPendingAction('plan-customer-binding')
+    setError('')
+    setErrorCode('')
+    setNotice('')
+    setFaireCustomerBindingPlan(null)
+    try {
+      const response = await fetch('/api/integrations/commerce/intake', {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accountGlobalId,
+          action: 'plan-customer-binding',
+          idempotencyKey: idempotencyKey(),
+          externalCustomerId: normalizedFaireRetailerId,
+          evidenceEmail: normalizedFaireRetailerEvidenceEmail,
+          customerGlobalId: faireRetailerCustomerGlobalId,
+        }),
+      })
+      const payload = await readPayload(response)
+      const command = payload.command
+      if (
+        command?.action !== 'plan-customer-binding'
+        || typeof command.planHash !== 'string'
+        || typeof command.confirmationIdempotencyKey !== 'string'
+        || typeof command.customerGlobalId !== 'string'
+        || typeof command.customerName !== 'string'
+      ) {
+        throw new Error('ClawPilot did not return a valid binding plan.')
+      }
+      setIntake(payload.intake || null)
+      setFaireCustomerBindingPlan(command as CustomerPrefetchBindingPlan)
+      setNotice(
+        'Binding review completed without reading or writing Faire. Confirm the exact retailer and CRM customer below.',
+      )
+    } catch (requestError) {
+      setError(safeError(requestError))
+      setErrorCode(
+        requestError instanceof IntakeRequestError
+          ? requestError.code
+          : '',
+      )
+    } finally {
+      setPendingAction('')
+    }
+  }
+
+  async function confirmFaireCustomerBinding() {
+    const plan = faireCustomerBindingPlan
+    if (pendingAction || !plan) return
+    if (
+      !window.confirm(
+        `Bind Faire retailer ${normalizedFaireRetailerId} to ${plan.customerName} (${plan.customerGlobalId})? This creates only an audited ClawPilot identity binding and does not read or write Faire.`,
+      )
+    ) return
+    setPendingAction('confirm-customer-binding')
+    setError('')
+    setErrorCode('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/integrations/commerce/intake', {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accountGlobalId,
+          action: 'confirm-customer-binding',
+          idempotencyKey: plan.confirmationIdempotencyKey,
+          externalCustomerId: normalizedFaireRetailerId,
+          evidenceEmail: normalizedFaireRetailerEvidenceEmail,
+          customerGlobalId: plan.customerGlobalId,
+          bindingPlanHash: plan.planHash,
+          confirmCustomerBinding: true,
+        }),
+      })
+      const payload = await readPayload(response)
+      setIntake(payload.intake || null)
+      setFaireCustomerBindingPlan(null)
+      setNotice(
+        'The Faire retailer is now bound to the selected CRM customer. You can safely fetch the exact Faire order.',
+      )
+    } catch (requestError) {
+      if (
+        requestError instanceof IntakeRequestError
+        && requestError.code === 'COMMERCE_CUSTOMER_PREFETCH_PLAN_STALE'
+      ) {
+        setFaireCustomerBindingPlan(null)
+      }
+      setError(safeError(requestError))
+      setErrorCode(
+        requestError instanceof IntakeRequestError
+          ? requestError.code
+          : '',
+      )
+    } finally {
+      setPendingAction('')
+    }
+  }
+
   async function reloadWorkflow() {
     if (pendingAction) return
     setPendingAction('reload')
@@ -1572,6 +1705,26 @@ export default function CommerceIntakeWorkflow({
     || (latestPagination?.resource === 'products' ? latestPagination : null)
   const operatorCommandsAllowed =
     intake?.policy?.operatorCommandsAllowed === true
+  const normalizedExactFaireOrderId = exactFaireOrderId.trim()
+  const exactFaireOrderIdValid = (
+    normalizedExactFaireOrderId.length > 0
+    && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(
+      normalizedExactFaireOrderId,
+    )
+  )
+  const normalizedFaireRetailerId = faireRetailerId.trim()
+  const normalizedFaireRetailerEvidenceEmail =
+    faireRetailerEvidenceEmail.trim().toLowerCase()
+  const faireRetailerBindingInputValid = (
+    normalizedFaireRetailerId.length > 0
+    && normalizedFaireRetailerId.length <= 512
+    && !/[\u0000-\u001f\u007f]/u.test(normalizedFaireRetailerId)
+    && normalizedFaireRetailerEvidenceEmail.length <= 320
+    && /^[^@\s]+@[^@\s]+\.[^@\s]+$/u.test(
+      normalizedFaireRetailerEvidenceEmail,
+    )
+    && Boolean(faireRetailerCustomerGlobalId)
+  )
   const cartonizationEvidenceSafe = Boolean(
     cartonizationPreview?.readOnly === true
     && cartonizationPreview.evidence.databaseWrites === 0
@@ -3685,19 +3838,26 @@ export default function CommerceIntakeWorkflow({
                 >
                   <Box>
                     <Typography variant="subtitle2" fontWeight={700}>
-                      Automatic current-order staging
+                      Automatic current-order intake
                     </Typography>
                     <Typography variant="body2" color="text.secondary">
                       {orderReconciliation?.status === 'running'
                         ? `ClawPilot is reading current ${providerLabel(provider)} orders now.`
                         : orderReconciliation?.status === 'succeeded'
-                          ? `The latest read-only order check completed${
-                            orderReconciliation.lastCompletedAt
-                              ? ` ${formatDate(
-                                orderReconciliation.lastCompletedAt,
-                              )}`
-                              : ''
-                          }.`
+                          ? orderReconciliation
+                            .automaticPromotionAttentionRequired
+                            ? `The provider read completed, but automatic local Faire order promotion needs attention${
+                              orderReconciliation.lastErrorCode
+                                ? ` (${orderReconciliation.lastErrorCode})`
+                                : ''
+                            }.`
+                            : `The latest provider-read order check completed${
+                              orderReconciliation.lastCompletedAt
+                                ? ` ${formatDate(
+                                  orderReconciliation.lastCompletedAt,
+                                )}`
+                                : ''
+                            }.`
                           : orderReconciliation?.status === 'failed'
                             ? `The latest read-only order check failed${
                               orderReconciliation.lastErrorCode
@@ -3713,6 +3873,8 @@ export default function CommerceIntakeWorkflow({
                     size="small"
                     color={
                       orderReconciliation?.status === 'failed'
+                      || orderReconciliation
+                        ?.automaticPromotionAttentionRequired
                         ? 'warning'
                         : orderReconciliation?.status === 'running'
                           ? 'info'
@@ -3736,6 +3898,15 @@ export default function CommerceIntakeWorkflow({
                       orderReconciliation?.recordsHeld || 0
                     } held or rejected for review`}
                   />
+                  {orderReconciliation?.canonicalOrderWrites ? (
+                    <Chip
+                      size="small"
+                      color="success"
+                      label={`${
+                        orderReconciliation.canonicalOrderWrites
+                      } orders promoted automatically`}
+                    />
+                  ) : null}
                   {orderReconciliation?.resumable ? (
                     <Chip
                       size="small"
@@ -3749,10 +3920,20 @@ export default function CommerceIntakeWorkflow({
                   />
                 </Stack>
                 <Typography variant="caption" color="text.secondary">
-                  Staging preserves source order facts for review. It does not
-                  create a ClawPilot order, reserve inventory, select packaging,
-                  create a shipment, or write back to the provider.
+                  Provider reads remain read-only. Fresh, unambiguous Faire
+                  orders may be promoted locally into ClawPilot automatically;
+                  held records remain available for review. This step does not
+                  reserve inventory, create shipments, or write back to the
+                  provider.
                 </Typography>
+                {orderReconciliation
+                  ?.automaticPromotionAttentionRequired ? (
+                    <Alert severity="warning">
+                      The provider read succeeded, but at least one automatic
+                      Faire order promotion failed. Review the held order and
+                      its error before fulfillment.
+                    </Alert>
+                  ) : null}
                 {orderReconciliation?.status === 'failed' ? (
                   <Stack
                     direction={{ xs: 'column', sm: 'row' }}
@@ -5660,11 +5841,213 @@ export default function CommerceIntakeWorkflow({
             </Stack>
           </Stack>
 
+          {provider === 'faire' ? (
+            <Card variant="outlined">
+              <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+                <Stack spacing={1.5}>
+                  <Box>
+                    <Typography fontWeight={700}>
+                      Bind a Faire retailer before the first order read
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      Use this when Faire omits the retailer email from the
+                      order payload. Review verifies the supplied evidence
+                      against exactly one active CRM customer without reading
+                      or writing Faire. Confirmation creates only an audited
+                      ClawPilot identity binding.
+                    </Typography>
+                  </Box>
+                  <Stack
+                    direction={{ xs: 'column', md: 'row' }}
+                    spacing={1}
+                    alignItems={{ md: 'flex-start' }}
+                  >
+                    <TextField
+                      label="Faire retailer ID"
+                      value={faireRetailerId}
+                      onChange={(event) => {
+                        setFaireRetailerId(event.target.value.slice(0, 512))
+                        setFaireCustomerBindingPlan(null)
+                      }}
+                      placeholder="r_ngjpc26v9m"
+                      helperText="Use the immutable retailer identity returned by Faire."
+                      inputProps={{ maxLength: 512 }}
+                      sx={{ ...fieldSx, flex: 1 }}
+                    />
+                    <TextField
+                      label="Retailer evidence email"
+                      type="email"
+                      value={faireRetailerEvidenceEmail}
+                      onChange={(event) => {
+                        setFaireRetailerEvidenceEmail(
+                          event.target.value.slice(0, 320),
+                        )
+                        setFaireCustomerBindingPlan(null)
+                      }}
+                      helperText="Enter the exact email shown in trusted retailer evidence."
+                      inputProps={{ maxLength: 320 }}
+                      sx={{ ...fieldSx, flex: 1 }}
+                    />
+                    <FormControl sx={{ ...fieldSx, flex: 1 }}>
+                      <InputLabel>Existing CRM customer</InputLabel>
+                      <Select
+                        label="Existing CRM customer"
+                        value={faireRetailerCustomerGlobalId}
+                        onChange={(event) => {
+                          setFaireRetailerCustomerGlobalId(event.target.value)
+                          setFaireCustomerBindingPlan(null)
+                        }}
+                      >
+                        <MenuItem value="">Select a customer</MenuItem>
+                        {customerCatalog.map((entry) => (
+                          <MenuItem key={entry.globalId} value={entry.globalId}>
+                            {entry.name}
+                            {entry.email ? ` · ${entry.email}` : ''}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    <Button
+                      variant="outlined"
+                      disabled={
+                        Boolean(pendingAction)
+                        || !canManage
+                        || !operatorCommandsAllowed
+                        || !faireRetailerBindingInputValid
+                      }
+                      onClick={() => void reviewFaireCustomerBinding()}
+                      sx={actionButtonSx}
+                    >
+                      {pendingAction === 'plan-customer-binding'
+                        ? 'Reviewing…'
+                        : 'Review binding'}
+                    </Button>
+                  </Stack>
+                  {faireCustomerBindingPlan ? (
+                    <Alert
+                      severity={
+                        faireCustomerBindingPlan.alreadyBound
+                          ? 'success'
+                          : 'warning'
+                      }
+                    >
+                      <Stack spacing={1}>
+                        <Typography variant="body2">
+                          Faire retailer evidence resolves uniquely to{' '}
+                          <strong>
+                            {faireCustomerBindingPlan.customerName}
+                          </strong>{' '}
+                          ({faireCustomerBindingPlan.customerGlobalId}).
+                          Provider reads: 0; provider writes: 0; database
+                          writes during review: 0.
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          Review fingerprint{' '}
+                          {faireCustomerBindingPlan.planHash.slice(0, 12)}…
+                        </Typography>
+                        <Box>
+                          <Button
+                            variant="contained"
+                            disabled={
+                              Boolean(pendingAction)
+                              || !canManage
+                              || !operatorCommandsAllowed
+                            }
+                            onClick={() => {
+                              void confirmFaireCustomerBinding()
+                            }}
+                            sx={actionButtonSx}
+                          >
+                            {pendingAction === 'confirm-customer-binding'
+                              ? 'Confirming…'
+                              : faireCustomerBindingPlan.alreadyBound
+                                ? 'Verify exact binding'
+                                : 'Confirm exact binding'}
+                          </Button>
+                        </Box>
+                      </Stack>
+                    </Alert>
+                  ) : null}
+                </Stack>
+              </CardContent>
+            </Card>
+          ) : null}
+
+          {provider === 'faire' ? (
+            <Card variant="outlined">
+              <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+                <Stack spacing={1.25}>
+                  <Box>
+                    <Typography fontWeight={700}>
+                      Find one exact Faire order
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      Use the immutable provider ID from the Faire order URL
+                      (for example, bo_b78sny28px). ClawPilot performs one
+                      read-only lookup and creates no provider, inventory, or
+                      fulfillment writes.
+                    </Typography>
+                  </Box>
+                  <Stack
+                    direction={{ xs: 'column', sm: 'row' }}
+                    spacing={1}
+                    alignItems={{ sm: 'flex-start' }}
+                  >
+                    <TextField
+                      label="Faire provider order ID"
+                      value={exactFaireOrderId}
+                      onChange={(event) => {
+                        setExactFaireOrderId(event.target.value.slice(0, 128))
+                      }}
+                      placeholder="bo_b78sny28px"
+                      helperText="This is the bo_… ID in the brand-portal order URL, not the display order number."
+                      inputProps={{ maxLength: 128 }}
+                      sx={{ ...fieldSx, flex: 1 }}
+                    />
+                    <Button
+                      variant="outlined"
+                      startIcon={<CloudDownloadRounded />}
+                      disabled={
+                        Boolean(pendingAction)
+                        || !operatorCommandsAllowed
+                        || !exactFaireOrderIdValid
+                      }
+                      onClick={() => {
+                        setOrderSearch(normalizedExactFaireOrderId)
+                        setOrderFilter('all')
+                        setOrderPage(0)
+                        void postCommand(
+                          'fetch',
+                          `fetch-exact-faire-order:${
+                            normalizedExactFaireOrderId
+                          }`,
+                          {
+                            confirmReadOnly: true,
+                            externalOrderId: normalizedExactFaireOrderId,
+                          },
+                          'The exact Faire order was read. A fresh, unambiguous order is added to ClawPilot automatically; otherwise review its held result below.',
+                        )
+                      }}
+                      sx={actionButtonSx}
+                    >
+                      {pendingAction === `fetch-exact-faire-order:${
+                        normalizedExactFaireOrderId
+                      }`
+                        ? 'Finding…'
+                        : 'Find exact order'}
+                    </Button>
+                  </Stack>
+                </Stack>
+              </CardContent>
+            </Card>
+          ) : null}
+
           {!orderPagination && candidates.length === 0 ? (
             <Alert severity="info">
               Select <strong>Fetch operational orders</strong> to find orders
-              for review. Nothing is added to ClawPilot until a ready order is
-              explicitly approved.
+              for intake. Provider reads are read-only. Fresh, unambiguous
+              Faire orders may be added to ClawPilot automatically; other
+              records remain held for review.
             </Alert>
           ) : candidates.length === 0 ? (
             <Alert severity="info">
@@ -5766,10 +6149,15 @@ export default function CommerceIntakeWorkflow({
                               label={candidate.headerMoney?.unavailableFields
                                 .includes('total')
                                 ? 'Header total unavailable'
-                                : formatMoney(
-                                  candidate.totalMinor,
-                                  candidate.currency,
-                                )}
+                                : provider === 'faire'
+                                  ? `Brand-side amount ${formatMoney(
+                                    candidate.totalMinor,
+                                    candidate.currency,
+                                  )}`
+                                  : formatMoney(
+                                    candidate.totalMinor,
+                                    candidate.currency,
+                                  )}
                             />
                             {candidate.headerMoney?.unavailableFields
                               .includes('shipping') ? (
@@ -5906,6 +6294,17 @@ export default function CommerceIntakeWorkflow({
                             order-time line prices. This order is blocked from
                             accounting and customer-charge use; missing
                             shipping or totals are never estimated.
+                          </Alert>
+                          ) : null}
+                        {provider === 'faire'
+                        && candidate.headerMoney?.state === 'complete'
+                        && candidate.headerMoney.customerChargeEligible
+                          === false ? (
+                          <Alert severity="info">
+                            Faire exposes brand-side order and payout facts, but
+                            not retailer-funded credits or tender charges. The
+                            amount above and a Paid status are therefore not
+                            labeled as what the retailer paid.
                           </Alert>
                           ) : null}
 

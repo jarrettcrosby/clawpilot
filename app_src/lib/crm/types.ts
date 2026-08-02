@@ -409,6 +409,7 @@ export type SuiteCrmOutboxRecord = {
     referenceCode: string
     contentSha256: string
   } | null
+  productImageProjectionRequired?: boolean
   relationships?: Array<{
     linkFieldName: 'accounts' | 'contact' | 'contacts' | 'leads' | 'opportunity'
     relatedModuleName: 'Accounts' | 'Contacts' | 'Leads' | 'Opportunities'

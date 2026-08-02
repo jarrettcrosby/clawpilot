@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
+  commerceCustomerEvidenceFingerprint,
   decryptCommerceIntakeReadResult,
   decryptCommerceIntakeContinuation,
   decryptCommerceCandidateSnapshot,
@@ -31,6 +32,9 @@ import {
   resolveCommerceOrderLineProviderPrice,
   storableCommerceOrderLineProviderMoney,
 } from '@/lib/integrations/commerceOrderStaging'
+import {
+  automaticFaireOrderSourceIsFresh,
+} from '@/lib/integrations/commerceFaireAutomaticPromotion'
 import type { CommerceRuntimeCredentialRecord } from '@/lib/persistence/commerceIntegrations'
 import {
   commerceCurrencyMinorUnit,
@@ -74,6 +78,8 @@ const DEFAULT_SLA_POLICY_VERSION = 'commerce-default-sla-v1'
 const DEFAULT_SLA_DAYS = 7
 const COMMERCE_INTAKE_READ_LEASE_MS = 2 * 60 * 1_000
 const COMMERCE_INTAKE_PRODUCT_CANDIDATE_RESPONSE_LIMIT = 500
+const CUSTOMER_PREFETCH_BINDING_POLICY_VERSION =
+  'commerce-customer-prefetch-binding-v1'
 
 type CandidateAddress = {
   name: string
@@ -180,6 +186,27 @@ type IntakeAccountRow = {
     | 'active'
     | 'frozen'
   activation_revision: number
+}
+
+export type CommerceCustomerPrefetchBindingPlan = {
+  action: 'plan-customer-binding'
+  policyVersion: typeof CUSTOMER_PREFETCH_BINDING_POLICY_VERSION
+  accountGlobalId: string
+  provider: 'faire'
+  customerGlobalId: string
+  customerName: string
+  externalCustomerIdHash: string
+  evidenceEmailHash: string
+  matchMethod: 'email'
+  planHash: string
+  confirmationIdempotencyKey: string
+  alreadyBound: boolean
+  existingBindingStatus: 'active' | 'stale' | 'retired' | null
+  requiresConfirmation: true
+  providerReads: 0
+  providerWrites: 0
+  databaseWrites: 0
+  syncCursorAdvanced: false
 }
 
 type ProductIntakePolicyRow = {
@@ -471,6 +498,16 @@ function presentmentMoney(field: CommerceDataField<CommerceMoneySet>) {
 
 function bigintString(value: bigint | null | undefined, fallback = BigInt(0)) {
   return (value ?? fallback).toString()
+}
+
+function commerceCustomerChargeEligible(
+  provider: 'shopify' | 'faire',
+  headerMoneyState: 'complete' | 'operational_incomplete',
+) {
+  // Faire's brand API omits retailer-funded credits and tender evidence.
+  // A complete Faire header is exact brand-side order arithmetic, not proof
+  // of what the retailer was charged.
+  return provider === 'shopify' && headerMoneyState === 'complete'
 }
 
 export function commerceCustomerIdentityKey(input: {
@@ -768,6 +805,468 @@ async function resolveAccount(
   return row
 }
 
+function normalizedCustomerPrefetchEmail(value: unknown) {
+  const email = String(value ?? '').trim().toLowerCase()
+  if (
+    email.length < 3
+    || email.length > 320
+    || /[\s\u0000-\u001f\u007f]/u.test(email)
+    || !/^[^@]+@[^@]+\.[^@]+$/u.test(email)
+  ) {
+    intakeError(
+      'COMMERCE_CUSTOMER_PREFETCH_EMAIL_INVALID',
+      'Enter the exact retailer email shown in the provider evidence',
+      400,
+    )
+  }
+  return email
+}
+
+function normalizedFaireRetailerId(value: unknown) {
+  const externalCustomerId = String(value ?? '').trim()
+  if (
+    externalCustomerId.length < 1
+    || externalCustomerId.length > 512
+    || /[\u0000-\u001f\u007f]/u.test(externalCustomerId)
+  ) {
+    intakeError(
+      'COMMERCE_CUSTOMER_PREFETCH_RETAILER_ID_INVALID',
+      'Enter the immutable retailer ID returned by Faire',
+      400,
+    )
+  }
+  return externalCustomerId
+}
+
+type CustomerPrefetchBindingRow = {
+  id: string
+  reference_code: string
+  name: string
+  email: string | null
+  updated_at: string | Date
+}
+
+type CustomerPrefetchExternalIdentifierRow = {
+  entity_global_id: string
+  status: 'active' | 'stale' | 'retired'
+}
+
+async function customerPrefetchBindingPlanWithClient(
+  client: PoolClient,
+  input: {
+    runtime: CommerceRuntimeCredentialRecord
+    externalCustomerId: string
+    customerGlobalId: string
+    evidenceEmail: string
+    lock: boolean
+  },
+): Promise<CommerceCustomerPrefetchBindingPlan> {
+  const externalCustomerId = normalizedFaireRetailerId(
+    input.externalCustomerId,
+  )
+  const evidenceEmail = normalizedCustomerPrefetchEmail(input.evidenceEmail)
+  const account = await resolveAccount(client, {
+    organizationId: input.runtime.organizationId,
+    accountGlobalId: input.runtime.globalId,
+    forUpdate: input.lock,
+  })
+  if (account.provider !== 'faire' || input.runtime.provider !== 'faire') {
+    intakeError(
+      'COMMERCE_CUSTOMER_PREFETCH_FAIRE_REQUIRED',
+      'Pre-fetch retailer binding is available only for a Faire connection',
+      409,
+    )
+  }
+  if (!['shadow', 'active'].includes(account.activation_state)) {
+    intakeError(
+      'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
+      'Open Operations and set Activation to Shadow or Active before binding a Faire retailer',
+    )
+  }
+  if (input.lock) {
+    await acquireTransactionAdvisoryLock(
+      client,
+      [
+        'operations:commerce-customer',
+        account.organization_id,
+        account.global_id,
+        externalCustomerId,
+      ].join(':'),
+    )
+  }
+
+  const target = (
+    await client.query<CustomerPrefetchBindingRow>(
+      `SELECT id::text, reference_code, name, email, updated_at
+       FROM crm_organizations
+       WHERE pipeline_id = $1::uuid
+         AND reference_code = $2
+         AND relationship_type = 'customer'
+         AND COALESCE(lower(source_payload->>'archived'), 'false')
+             NOT IN ('true', '1', 'yes')
+       LIMIT 1
+       ${input.lock ? 'FOR UPDATE' : ''}`,
+      [account.pipeline_id, input.customerGlobalId],
+    )
+  ).rows[0]
+  if (!target) {
+    intakeError(
+      'COMMERCE_CUSTOMER_PREFETCH_TARGET_NOT_FOUND',
+      'Select an active CRM customer organization for the retailer binding',
+      404,
+    )
+  }
+  const organizationEmailMatches = await client.query<{
+    reference_code: string
+  }>(
+    `SELECT organization.reference_code
+     FROM crm_organizations organization
+     WHERE organization.pipeline_id = $1::uuid
+       AND organization.relationship_type = 'customer'
+       AND lower(btrim(organization.email)) = $2
+       AND COALESCE(lower(organization.source_payload->>'archived'), 'false')
+           NOT IN ('true', '1', 'yes')
+     ORDER BY organization.reference_code
+     ${input.lock ? 'FOR UPDATE OF organization' : ''}`,
+    [account.pipeline_id, evidenceEmail],
+  )
+  const contactEmailMatches = await client.query<{
+    reference_code: string
+  }>(
+    `SELECT organization.reference_code
+     FROM crm_contacts contact
+     JOIN crm_organizations organization
+       ON organization.pipeline_id = contact.pipeline_id
+      AND organization.id = contact.organization_id
+     WHERE organization.pipeline_id = $1::uuid
+       AND organization.relationship_type = 'customer'
+       AND lower(btrim(contact.email)) = $2
+       AND COALESCE(lower(organization.source_payload->>'archived'), 'false')
+           NOT IN ('true', '1', 'yes')
+       AND COALESCE(lower(contact.source_payload->>'archived'), 'false')
+           NOT IN ('true', '1', 'yes')
+     ORDER BY organization.reference_code
+     ${input.lock ? 'FOR UPDATE OF contact, organization' : ''}`,
+    [account.pipeline_id, evidenceEmail],
+  )
+  const emailMatches = Array.from(new Set([
+    ...organizationEmailMatches.rows.map((row) => row.reference_code),
+    ...contactEmailMatches.rows.map((row) => row.reference_code),
+  ])).sort()
+  if (
+    emailMatches.length !== 1
+    || emailMatches[0] !== target.reference_code
+  ) {
+    intakeError(
+      emailMatches.length === 0
+        ? 'COMMERCE_CUSTOMER_PREFETCH_EMAIL_MISMATCH'
+        : 'COMMERCE_CUSTOMER_PREFETCH_EMAIL_AMBIGUOUS',
+      emailMatches.length === 0
+        ? 'The supplied retailer email does not match the selected CRM customer or one of its active contacts'
+        : 'The retailer email must identify exactly one active CRM customer before it can be bound',
+      409,
+    )
+  }
+
+  const existingBinding = (
+    await client.query<CustomerPrefetchExternalIdentifierRow>(
+      `SELECT entity_global_id, status
+       FROM operations_external_identifiers
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND entity_type = 'crm.organization'
+         AND external_id = $3
+       LIMIT 1
+       ${input.lock ? 'FOR UPDATE' : ''}`,
+      [account.organization_id, account.id, externalCustomerId],
+    )
+  ).rows[0] || null
+  if (
+    existingBinding
+    && existingBinding.entity_global_id !== target.reference_code
+  ) {
+    intakeError(
+      'COMMERCE_CUSTOMER_PREFETCH_IDENTITY_CONFLICT',
+      'This Faire retailer ID is already bound to a different CRM customer',
+      409,
+    )
+  }
+
+  const externalCustomerIdHash = commerceCustomerEvidenceFingerprint({
+    organizationId: account.organization_id,
+    accountGlobalId: account.global_id,
+    kind: 'external_customer_id',
+    value: externalCustomerId,
+  })
+  const evidenceEmailHash = commerceCustomerEvidenceFingerprint({
+    organizationId: account.organization_id,
+    accountGlobalId: account.global_id,
+    kind: 'email',
+    value: evidenceEmail,
+  })
+  const alreadyBound = existingBinding?.status === 'active'
+  const planHash = commandHash({
+    policyVersion: CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+    accountGlobalId: account.global_id,
+    credentialVersion: account.credential_version,
+    activationRevision: account.activation_revision,
+    customerGlobalId: target.reference_code,
+    customerUpdatedAt: iso(target.updated_at),
+    externalCustomerIdHash,
+    evidenceEmailHash,
+    matchMethod: 'email',
+    existingBindingStatus: existingBinding?.status || null,
+  })
+  const confirmationIdempotencyKey = deterministicCustomerPrefetchBindingUuid([
+    CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+    account.organization_id,
+    account.global_id,
+    target.reference_code,
+    externalCustomerIdHash,
+    planHash,
+  ])
+  return {
+    action: 'plan-customer-binding',
+    policyVersion: CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+    accountGlobalId: account.global_id,
+    provider: 'faire',
+    customerGlobalId: target.reference_code,
+    customerName: target.name,
+    externalCustomerIdHash,
+    evidenceEmailHash,
+    matchMethod: 'email',
+    planHash,
+    confirmationIdempotencyKey,
+    alreadyBound,
+    existingBindingStatus: existingBinding?.status || null,
+    requiresConfirmation: true,
+    providerReads: 0,
+    providerWrites: 0,
+    databaseWrites: 0,
+    syncCursorAdvanced: false,
+  }
+}
+
+export async function planCommerceCustomerPrefetchBindingInPostgres(input: {
+  runtime: CommerceRuntimeCredentialRecord
+  externalCustomerId: string
+  customerGlobalId: string
+  evidenceEmail: string
+}) {
+  return withTransaction((client) => customerPrefetchBindingPlanWithClient(
+    client,
+    { ...input, lock: false },
+  ))
+}
+
+export async function confirmCommerceCustomerPrefetchBindingInPostgres(input: {
+  runtime: CommerceRuntimeCredentialRecord
+  actorEmail: string
+  externalCustomerId: string
+  customerGlobalId: string
+  evidenceEmail: string
+  planHash: string
+  confirmed: boolean
+}) {
+  const externalCustomerId = normalizedFaireRetailerId(
+    input.externalCustomerId,
+  )
+  const evidenceEmail = normalizedCustomerPrefetchEmail(input.evidenceEmail)
+  if (!/^[a-f0-9]{64}$/u.test(input.planHash)) {
+    intakeError(
+      'COMMERCE_CUSTOMER_PREFETCH_PLAN_INVALID',
+      'Review the current retailer binding before confirming it',
+      400,
+    )
+  }
+  if (!input.confirmed) {
+    intakeError(
+      'COMMERCE_CUSTOMER_PREFETCH_CONFIRMATION_REQUIRED',
+      'Confirm the reviewed Faire retailer and CRM customer binding',
+      400,
+    )
+  }
+  return withTransaction(async (client) => {
+    const account = await resolveAccount(client, {
+      organizationId: input.runtime.organizationId,
+      accountGlobalId: input.runtime.globalId,
+      forUpdate: true,
+    })
+    if (account.provider !== 'faire' || input.runtime.provider !== 'faire') {
+      intakeError(
+        'COMMERCE_CUSTOMER_PREFETCH_FAIRE_REQUIRED',
+        'Pre-fetch retailer binding is available only for a Faire connection',
+        409,
+      )
+    }
+    if (!['shadow', 'active'].includes(account.activation_state)) {
+      intakeError(
+        'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
+        'Open Operations and set Activation to Shadow or Active before binding a Faire retailer',
+      )
+    }
+    const requestHash = commandHash({
+      policyVersion: CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+      accountGlobalId: account.global_id,
+      customerGlobalId: input.customerGlobalId,
+      externalCustomerIdHash: commerceCustomerEvidenceFingerprint({
+        organizationId: account.organization_id,
+        accountGlobalId: account.global_id,
+        kind: 'external_customer_id',
+        value: externalCustomerId,
+      }),
+      evidenceEmailHash: commerceCustomerEvidenceFingerprint({
+        organizationId: account.organization_id,
+        accountGlobalId: account.global_id,
+        kind: 'email',
+        value: evidenceEmail,
+      }),
+      planHash: input.planHash,
+      confirmed: true,
+    })
+    const prepared = await prepareReceipt(client, {
+      organizationId: account.organization_id,
+      commandType: 'commerce.intake.confirm_customer_prefetch_binding',
+      idempotencyKey: deterministicCustomerPrefetchBindingUuid([
+        CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+        account.organization_id,
+        account.global_id,
+        input.customerGlobalId,
+        commerceCustomerEvidenceFingerprint({
+          organizationId: account.organization_id,
+          accountGlobalId: account.global_id,
+          kind: 'external_customer_id',
+          value: externalCustomerId,
+        }),
+        input.planHash,
+      ]),
+      requestHash,
+      actorEmail: input.actorEmail,
+    })
+    if (prepared.replayed) return replayPayload(prepared.receipt)
+
+    const plan = await customerPrefetchBindingPlanWithClient(client, {
+      runtime: input.runtime,
+      externalCustomerId,
+      customerGlobalId: input.customerGlobalId,
+      evidenceEmail,
+      lock: true,
+    })
+    if (plan.planHash !== input.planHash) {
+      intakeError(
+        'COMMERCE_CUSTOMER_PREFETCH_PLAN_STALE',
+        'The retailer binding changed after review. Create a new plan before confirming it',
+        409,
+      )
+    }
+
+    const matchEvidence = {
+      schema: CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+      provider: 'faire',
+      evidenceType: 'operator_confirmed_email',
+      externalCustomerIdHash: plan.externalCustomerIdHash,
+      evidenceEmailHash: plan.evidenceEmailHash,
+      planHash: plan.planHash,
+      confirmedBeforeProviderRead: true,
+    }
+    const boundIdentity = await client.query<{ entity_global_id: string }>(
+      `INSERT INTO operations_external_identifiers (
+         organization_id, integration_account_id, entity_type,
+         entity_global_id, external_id, status, match_method,
+         match_evidence, last_verified_at
+       ) VALUES (
+         $1::uuid, $2::uuid, 'crm.organization', $3, $4,
+         'active', 'email', $5::jsonb, now()
+       )
+       ON CONFLICT (
+         organization_id, integration_account_id, entity_type, external_id
+       ) DO UPDATE SET
+         status = 'active',
+         match_method = 'email',
+         match_evidence = EXCLUDED.match_evidence,
+         last_verified_at = now()
+       RETURNING entity_global_id`,
+      [
+        account.organization_id,
+        account.id,
+        plan.customerGlobalId,
+        externalCustomerId,
+        safeJson(matchEvidence),
+      ],
+    )
+    if (boundIdentity.rows[0]?.entity_global_id !== plan.customerGlobalId) {
+      intakeError(
+        'COMMERCE_CUSTOMER_PREFETCH_IDENTITY_CONFLICT',
+        'This Faire retailer ID was bound concurrently to a different CRM customer',
+        409,
+      )
+    }
+    const bindingOutcome = plan.existingBindingStatus === 'active'
+      ? 'verified_existing' as const
+      : plan.existingBindingStatus
+        ? 'reactivated' as const
+        : 'created' as const
+    const result = {
+      action: 'confirm-customer-binding',
+      policyVersion: CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+      accountGlobalId: account.global_id,
+      provider: 'faire' as const,
+      customerGlobalId: plan.customerGlobalId,
+      customerName: plan.customerName,
+      externalCustomerIdHash: plan.externalCustomerIdHash,
+      evidenceEmailHash: plan.evidenceEmailHash,
+      matchMethod: 'email' as const,
+      planHash: plan.planHash,
+      bindingOutcome,
+      identityWrites: 1 as const,
+      receiptWrites: 2 as const,
+      auditWrites: 1 as const,
+      providerReads: 0 as const,
+      providerWrites: 0 as const,
+      databaseWrites: 4 as const,
+      syncCursorAdvanced: false as const,
+      replayed: false,
+    }
+    await completeReceipt(
+      client,
+      prepared.receipt.id,
+      plan.customerGlobalId,
+      result,
+    )
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'commerce.intake.customer_identity.prebound',
+      aggregateType: 'operations.integration_account',
+      aggregateId: account.global_id,
+      subject: plan.customerName,
+      organizationId: account.organization_id,
+      eventKey:
+        `commerce-customer-prefetch-binding:${account.global_id}:${
+          plan.confirmationIdempotencyKey
+        }`,
+      payload: {
+        policyVersion: CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+        provider: 'faire',
+        customerGlobalId: plan.customerGlobalId,
+        externalCustomerIdHash: plan.externalCustomerIdHash,
+        evidenceEmailHash: plan.evidenceEmailHash,
+        matchMethod: plan.matchMethod,
+        planHash: plan.planHash,
+        bindingOutcome,
+        identityWrites: 1,
+        receiptWrites: 2,
+        auditWrites: 1,
+        confirmedBeforeProviderRead: true,
+        providerReads: 0,
+        providerWrites: 0,
+        databaseWrites: 4,
+        syncCursorAdvanced: false,
+      },
+    }, client)
+    return result
+  })
+}
+
 function blocker(code: string) {
   const definitions: Record<string, {
     label: string
@@ -915,6 +1414,41 @@ function canonicalJson(value: unknown): string {
 
 function commandHash(value: unknown) {
   return createHash('sha256').update(canonicalJson(value)).digest('hex')
+}
+
+function deterministicCustomerPrefetchBindingUuid(parts: readonly string[]) {
+  const hex = createHash('sha256')
+    .update(parts.join('\0'))
+    .digest('hex')
+    .slice(0, 32)
+    .split('')
+  hex[12] = '5'
+  hex[16] = ['8', '9', 'a', 'b'][parseInt(hex[16], 16) % 4]
+  const value = hex.join('')
+  return [
+    value.slice(0, 8),
+    value.slice(8, 12),
+    value.slice(12, 16),
+    value.slice(16, 20),
+    value.slice(20),
+  ].join('-')
+}
+
+function envelopeMatchesExactOrderTarget(
+  envelope: CommerceNormalizationEnvelope,
+  exactExternalOrderIdHash: string,
+) {
+  const returnedOrderIdentities = [
+    ...envelope.orders.map((order) => order.identity.value),
+    ...envelope.rejections
+      .filter((rejection) => rejection.resourceType === 'order')
+      .map((rejection) => rejection.externalId),
+  ]
+  return (
+    returnedOrderIdentities.length === 1
+    && commandHash(returnedOrderIdentities[0])
+      === exactExternalOrderIdHash
+  )
 }
 
 async function reconcileStagedCommerceProductImages(
@@ -2528,6 +3062,7 @@ export async function markCommerceIntakeContinuationInvalidInPostgres(input: {
 type CommerceIntakeStageReplayLookup = {
   idempotencyKey: string
   action: CommerceIntakeStageAction
+  exactExternalOrderIdHash?: string | null
   target: {
     kind: 'none' | 'candidate' | 'rejection' | 'continuation'
     globalId: string | null
@@ -2549,6 +3084,7 @@ async function readCommerceIntakeStageReplayWithClient(
       intent_action: CommerceIntakeReadIntentAction
       target_kind: 'none' | 'candidate' | 'rejection' | 'continuation'
       target_global_id: string | null
+      provider_target_hash: string | null
   }>(
       `SELECT
          run.global_id,
@@ -2559,7 +3095,16 @@ async function readCommerceIntakeStageReplayWithClient(
          audit.payload->'stageResult' AS stage_result,
          intent.intake_action AS intent_action,
          intent.target_kind,
-         intent.target_global_id
+         intent.target_global_id,
+         (
+           SELECT attempt.redacted_request->>'targetHash'
+           FROM operations_commerce_provider_attempts attempt
+           WHERE attempt.organization_id = intent.organization_id
+             AND attempt.integration_account_id
+                 = intent.integration_account_id
+             AND attempt.id = intent.provider_attempt_id
+           LIMIT 1
+         ) AS provider_target_hash
        FROM operations_commerce_intake_runs run
        JOIN operations_commerce_intake_read_intents intent
          ON intent.organization_id = run.organization_id
@@ -2599,6 +3144,10 @@ async function readCommerceIntakeStageReplayWithClient(
     || (row.staged_action && row.staged_action !== input.action)
     || row.target_kind !== input.target.kind
     || row.target_global_id !== input.target.globalId
+    || (
+      input.exactExternalOrderIdHash !== undefined
+      && row.provider_target_hash !== input.exactExternalOrderIdHash
+    )
   ) {
     intakeError(
       'COMMERCE_INTAKE_IDEMPOTENCY_CONFLICT',
@@ -2648,6 +3197,7 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
   action: CommerceIntakeReadIntentAction
   resource: 'orders' | 'products'
   target: CommerceIntakeReadIntentTarget
+  exactExternalOrderIdHash?: string | null
   continuationRunGlobalId: string | null
   pageSize: number
 }) {
@@ -2680,6 +3230,16 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
       || (
         input.target.kind === 'rejection'
         && input.action !== 'retry-rejection'
+      )
+      || (
+        input.exactExternalOrderIdHash
+        && (
+          input.action !== 'fetch'
+          || input.resource !== 'orders'
+          || input.target.kind !== 'none'
+          || input.continuationRunGlobalId !== null
+          || !/^[a-f0-9]{64}$/.test(input.exactExternalOrderIdHash)
+        )
       )
     ) {
       intakeError(
@@ -2869,6 +3429,9 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
       action: input.action,
       resource: input.resource,
       target,
+      ...(input.exactExternalOrderIdHash
+        ? { exactExternalOrderIdHash: input.exactExternalOrderIdHash }
+        : {}),
       pageSize: input.pageSize,
       readOnly: true,
       providerWrites: 0,
@@ -3088,6 +3651,9 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
         windowStart,
         windowEnd,
         pageSize: input.pageSize,
+        ...(input.exactExternalOrderIdHash
+          ? { exactExternalOrderIdHash: input.exactExternalOrderIdHash }
+          : {}),
         productsFetched: input.resource === 'products',
         oneRootPage: true,
       })
@@ -3771,6 +4337,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
   retryRejectionGlobalId: string | null
   readIntentId: string
   capturedResponseHash: string
+  exactExternalOrderIdHash?: string | null
 }) {
   return withTransaction(async (client) => {
     const account = await resolveAccount(client, {
@@ -3857,6 +4424,14 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         (input.stageAction === 'refresh')
         !== Boolean(input.refreshCandidateGlobalId)
       )
+      || (
+        input.exactExternalOrderIdHash
+        && (
+          input.stageAction !== 'fetch'
+          || input.page?.resource !== 'orders'
+          || !/^[a-f0-9]{64}$/.test(input.exactExternalOrderIdHash)
+        )
+      )
     ) {
       intakeError(
         'COMMERCE_INTAKE_CONTINUATION_INVALID',
@@ -3894,6 +4469,9 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         : null,
       refreshCandidateGlobalId: input.refreshCandidateGlobalId,
       retryRejectionGlobalId: input.retryRejectionGlobalId,
+      ...(input.exactExternalOrderIdHash
+        ? { exactExternalOrderIdHash: input.exactExternalOrderIdHash }
+        : {}),
       readIntentId: input.readIntentId,
       capturedResponseHash: input.capturedResponseHash,
     })
@@ -3953,6 +4531,12 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           idempotencyKey: input.idempotencyKey,
           action: input.stageAction,
           target: replayTarget,
+          ...(input.stageAction === 'fetch'
+            ? {
+                exactExternalOrderIdHash:
+                  input.exactExternalOrderIdHash ?? null,
+              }
+            : {}),
         },
       )
       if (
@@ -3982,6 +4566,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
             target_global_id: string | null
             target_source_hash: string | null
             target_external_id_hash: string | null
+            provider_target_hash: string | null
             session_id: string
             window_start: Date | null
             window_end: Date
@@ -4002,7 +4587,19 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           }>(
             `SELECT id::text, resource, intake_action, credential_version,
                     target_kind, target_global_id, target_source_hash,
-                    target_external_id_hash, session_id::text,
+                    target_external_id_hash,
+                    (
+                      SELECT attempt.redacted_request->>'targetHash'
+                      FROM operations_commerce_provider_attempts attempt
+                      WHERE attempt.organization_id
+                          = operations_commerce_intake_read_intents.organization_id
+                        AND attempt.integration_account_id
+                          = operations_commerce_intake_read_intents.integration_account_id
+                        AND attempt.id
+                          = operations_commerce_intake_read_intents.provider_attempt_id
+                      LIMIT 1
+                    ) AS provider_target_hash,
+                    session_id::text,
                     window_start, window_end, query_hash, intent_state,
                     provider_attempt_id::text, response_hash,
                     continuation_id::text, continuation_cursor_hash,
@@ -4031,6 +4628,11 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         || readIntent.credential_version !== account.credential_version
         || readIntent.response_hash !== input.capturedResponseHash
         || !readIntent.provider_attempt_id
+        || (
+          input.exactExternalOrderIdHash !== undefined
+          && readIntent.provider_target_hash
+            !== input.exactExternalOrderIdHash
+        )
         || (
           input.page
           && (
@@ -4074,6 +4676,19 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       intakeError(
         'COMMERCE_INTAKE_INTENT_INVALID',
         'The provider-read evidence no longer matches this staging command. Reload and retry the workflow action.',
+        409,
+      )
+    }
+    if (
+      input.exactExternalOrderIdHash
+      && !envelopeMatchesExactOrderTarget(
+        input.envelope,
+        input.exactExternalOrderIdHash,
+      )
+    ) {
+      intakeError(
+        'COMMERCE_INTAKE_EXACT_ORDER_TARGET_MISMATCH',
+        'The exact provider read returned a different or ambiguous order identity. No provider data was staged.',
         409,
       )
     }
@@ -4300,6 +4915,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       workflowState: string
       customerResolutionState: string
       credentialVersion: number
+      normalizerVersion: string
     }>()
     if (externalOrderIds.length) {
       const canonicalOrders = await client.query<{
@@ -4341,6 +4957,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         workflow_state: string
         customer_resolution_state: string
         credential_version: number
+        normalizer_version: string
       }>(
         `SELECT DISTINCT ON (candidate.external_order_id)
            candidate.external_order_id,
@@ -4348,6 +4965,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
            candidate.source_hash,
            candidate.workflow_state,
            candidate.customer_resolution_state,
+           candidate.normalizer_version,
            run.credential_version
          FROM operations_commerce_order_candidates candidate
          JOIN operations_commerce_intake_runs run
@@ -4375,6 +4993,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           workflowState: row.workflow_state,
           customerResolutionState: row.customer_resolution_state,
           credentialVersion: row.credential_version,
+          normalizerVersion: row.normalizer_version,
         })
       }
     }
@@ -4789,6 +5408,8 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         )
         && latestCandidate.customerResolutionState !== 'unsupported'
         && latestCandidate.credentialVersion === account.credential_version
+        && latestCandidate.normalizerVersion
+          === input.envelope.normalizerVersion
         && latestCandidate.sourceRevision === incomingSourceRevision
         && latestCandidate.sourceHash === order.sourceHash
       ) {
@@ -4815,7 +5436,10 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         || order.headerMoney.accountingEligible
           !== (expectedHeaderMoneyState === 'complete')
         || order.headerMoney.customerChargeEligible
-          !== (expectedHeaderMoneyState === 'complete')
+          !== commerceCustomerChargeEligible(
+            order.providerFacts.provider,
+            expectedHeaderMoneyState,
+          )
       ) {
         intakeError(
           'COMMERCE_NORMALIZATION_MONEY_INCOMPLETE',
@@ -5623,6 +6247,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         normalizationRejections,
         productImageImports,
         action: stageResult.action,
+        exactOrderTargetHash: input.exactExternalOrderIdHash,
         pagination,
         stageResult,
         providerWrites: 0,
@@ -6538,7 +7163,10 @@ export async function readCommerceIntakeStateFromPostgres(input: {
           unavailableFields: candidate.header_money_gaps,
           accountingEligible: candidate.header_money_state === 'complete',
           customerChargeEligible:
-            candidate.header_money_state === 'complete',
+            commerceCustomerChargeEligible(
+              candidate.provider,
+              candidate.header_money_state,
+            ),
         },
         requiresShipping: candidate.requires_shipping,
         sourceUpdatedAt: iso(candidate.provider_updated_at)
@@ -8885,8 +9513,8 @@ export async function readAutomaticCommerceCustomerTargetsForRunInPostgres(
         : null
       const companyName = String(
         party?.organizationName
-        || party?.contactName
         || address?.organizationName
+        || party?.contactName
         || address?.name
         || party?.email
         || '',
@@ -8908,6 +9536,330 @@ export async function readAutomaticCommerceCustomerTargetsForRunInPostgres(
           || null,
       }
     })
+  })
+}
+
+type AutomaticFaireProductMappingRow = {
+  id: string
+  product_id: string
+  external_variant_id: string | null
+  channel_sku: string | null
+}
+
+type AutomaticFairePromotionTarget = {
+  eligible: true
+  reason: null
+  candidateGlobalId: string
+  candidateRowVersion: number
+  providerAddress: CandidateAddress | null
+  deliveryMode: 'provider' | 'default_sla' | null
+} | {
+  eligible: false
+  reason: string
+  candidateGlobalId: string
+  candidateRowVersion: number
+  providerAddress: null
+  deliveryMode: null
+}
+
+function heldAutomaticFairePromotionTarget(
+  candidate: CandidateRow,
+  reason: string,
+): AutomaticFairePromotionTarget {
+  return {
+    eligible: false,
+    reason,
+    candidateGlobalId: candidate.global_id,
+    candidateRowVersion: Number(candidate.row_version),
+    providerAddress: null,
+    deliveryMode: null,
+  }
+}
+
+/**
+ * Selects only newly staged Faire orders whose current provider evidence is
+ * sufficient for a deterministic local promotion. The run equality and prior
+ * candidate guard deliberately leave retained real-order holds untouched.
+ * Provider writes, inventory, fulfillment, and shipment work are outside this
+ * selector and remain zero during intake promotion.
+ */
+export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
+  input: {
+    runtime: CommerceRuntimeCredentialRecord
+    runGlobalId: string
+  },
+) {
+  return withTransaction(async (client) => {
+    const account = await resolveAccount(client, {
+      organizationId: input.runtime.organizationId,
+      accountGlobalId: input.runtime.globalId,
+    })
+    if (account.provider !== 'faire') return []
+    const candidates = (
+      await client.query<CandidateRow>(
+        `${CANDIDATE_SELECT}
+         WHERE candidate.organization_id = $1::uuid
+           AND candidate.integration_account_id = $2::uuid
+           AND run.global_id = $3
+           AND run.credential_version = $4::integer
+           AND run.resource = 'products_and_orders'
+           AND run.provider = 'faire'
+           AND run.expires_at > now()
+           AND run.workflow_state <> 'expired'
+           AND candidate.provider = 'faire'
+           AND candidate.expires_at > now()
+           AND candidate.workflow_state IN ('held', 'resolving', 'ready')
+         ORDER BY candidate.created_at, candidate.id
+         LIMIT 50`,
+        [
+          account.organization_id,
+          account.id,
+          input.runGlobalId,
+          input.runtime.credentialVersion,
+        ],
+      )
+    ).rows
+    const targets: AutomaticFairePromotionTarget[] = []
+    for (const candidate of candidates) {
+      const [lines, priorOrCanonical] = await Promise.all([
+        candidateLines(client, candidate),
+        client.query<{ prior_candidate: boolean; canonical_order: boolean }>(
+          `SELECT
+             EXISTS (
+               SELECT 1
+               FROM operations_commerce_order_candidates prior
+               WHERE prior.organization_id = $1::uuid
+                 AND prior.integration_account_id = $2::uuid
+                 AND prior.external_order_id = $3
+                 AND prior.id <> $4::uuid
+                 AND prior.run_id <> $5::uuid
+             ) AS prior_candidate,
+             EXISTS (
+               SELECT 1
+               FROM operations_orders canonical
+               WHERE canonical.organization_id = $1::uuid
+                 AND canonical.integration_account_id = $2::uuid
+                 AND canonical.external_order_id = $3
+             ) AS canonical_order`,
+          [
+            candidate.organization_id,
+            candidate.integration_account_id,
+            candidate.external_order_id,
+            candidate.id,
+            candidate.run_id,
+          ],
+        ),
+      ])
+      if (priorOrCanonical.rows[0]?.canonical_order) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'canonical_order_exists',
+        ))
+        continue
+      }
+      if (priorOrCanonical.rows[0]?.prior_candidate) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'prior_candidate_requires_review',
+        ))
+        continue
+      }
+      if (!automaticFaireOrderSourceIsFresh({
+        providerCreatedAt: candidate.provider_created_at,
+        observedAt: candidate.observed_at,
+      })) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'source_age_requires_review',
+        ))
+        continue
+      }
+      if (
+        candidate.normalized_order_status !== 'open'
+        || candidate.normalized_fulfillment_status !== 'unfulfilled'
+      ) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'order_state_requires_review',
+        ))
+        continue
+      }
+      if (
+        candidate.customer_resolution_state !== 'resolved'
+        || !candidate.customer_id
+        || !candidate.customer_match_method
+      ) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'customer_resolution_required',
+        ))
+        continue
+      }
+      const operationalLines = lines.filter((line) => (
+        Number(line.unfulfilled_quantity) > 0
+      ))
+      if (!operationalLines.length) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'line_items_empty',
+        ))
+        continue
+      }
+      if (operationalLines.some((line) => {
+        const quantity = exactWholeCommerceQuantityFromNumeric(
+          line.unfulfilled_quantity,
+        )
+        return quantity === null || quantity <= BigInt(0)
+      })) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'line_quantity_requires_review',
+        ))
+        continue
+      }
+      const productMappingIds = [...new Set(
+        operationalLines
+          .map((line) => line.product_mapping_id)
+          .filter((value): value is string => Boolean(value)),
+      )]
+      const mappings = productMappingIds.length
+        ? (
+            await client.query<AutomaticFaireProductMappingRow>(
+              `SELECT id::text, product_id::text, external_variant_id,
+                      channel_sku
+               FROM operations_product_mappings
+               WHERE organization_id = $1::uuid
+                 AND integration_account_id = $2::uuid
+                 AND pipeline_id = $3::uuid
+                 AND id = ANY($4::uuid[])
+                 AND active = true`,
+              [
+                candidate.organization_id,
+                candidate.integration_account_id,
+                candidate.pipeline_id,
+                productMappingIds,
+              ],
+            )
+          ).rows
+        : []
+      const mappingById = new Map(mappings.map((mapping) => [
+        mapping.id,
+        mapping,
+      ]))
+      const invalidLineMapping = operationalLines.some((line) => {
+        const sku = line.sku_snapshot?.trim() || ''
+        const mapping = line.product_mapping_id
+          ? mappingById.get(line.product_mapping_id)
+          : null
+        return (
+          !sku
+          || /[\p{C}]/u.test(sku)
+          || line.mapping_state !== 'resolved'
+          || !line.product_id
+          || !line.external_variant_id
+          || !mapping
+          || mapping.product_id !== line.product_id
+          || mapping.external_variant_id !== line.external_variant_id
+          || (mapping.channel_sku?.trim() || '') !== sku
+          || !['provider', 'manual'].includes(line.price_resolution_state)
+          || line.resolved_unit_price_minor === null
+          || !/^[0-9]+$/u.test(line.resolved_unit_price_minor)
+          || line.resolved_currency_code !== candidate.currency_code
+          || (
+            line.requires_shipping
+            && line.packaging_state !== 'resolved'
+          )
+        )
+      })
+      if (invalidLineMapping) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'product_sku_or_pack_mapping_requires_review',
+        ))
+        continue
+      }
+      const blockers = dynamicCandidateBlockingCodes(candidate, lines)
+      const automaticBlockers = new Set([
+        'ship_to_confirmation_required',
+        'delivery_decision_required',
+      ])
+      if (blockers.some((code) => !automaticBlockers.has(code))) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'candidate_blockers_require_review',
+        ))
+        continue
+      }
+      const requiresShipping = candidate.requires_shipping
+        && operationalLines.some((line) => line.requires_shipping)
+      let providerAddress: CandidateAddress | null = null
+      if (requiresShipping) {
+        let snapshot: Record<string, unknown> | null = null
+        try {
+          snapshot = encryptedSnapshot(
+            candidate,
+            input.runtime.globalId,
+            'ship_to',
+          )
+        } catch {
+          snapshot = null
+        }
+        if (!snapshot || !completeAddress(snapshot)) {
+          targets.push(heldAutomaticFairePromotionTarget(
+            candidate,
+            'ship_to_requires_review',
+          ))
+          continue
+        }
+        if (candidate.ship_to_snapshot_state === 'protected') {
+          providerAddress = normalizedAddress(snapshot)
+        } else if (candidate.ship_to_snapshot_state !== 'confirmed') {
+          targets.push(heldAutomaticFairePromotionTarget(
+            candidate,
+            'ship_to_requires_review',
+          ))
+          continue
+        }
+      }
+      let deliveryMode: 'provider' | 'default_sla' | null = null
+      if (requiresShipping && candidate.delivery_resolution_state === 'unresolved') {
+        deliveryMode = candidate.provider_requested_delivery_at
+          ? 'provider'
+          : candidate.provider_created_at
+            ? 'default_sla'
+            : null
+        if (!deliveryMode) {
+          targets.push(heldAutomaticFairePromotionTarget(
+            candidate,
+            'delivery_date_requires_review',
+          ))
+          continue
+        }
+      } else if (
+        requiresShipping
+        && (
+          !['provider', 'manual', 'policy'].includes(
+            candidate.delivery_resolution_state,
+          )
+          || !candidate.requested_delivery_at
+        )
+      ) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'delivery_date_requires_review',
+        ))
+        continue
+      }
+      targets.push({
+        eligible: true,
+        reason: null,
+        candidateGlobalId: candidate.global_id,
+        candidateRowVersion: Number(candidate.row_version),
+        providerAddress,
+        deliveryMode,
+      })
+    }
+    return targets
   })
 }
 
@@ -10011,7 +10963,10 @@ export async function promoteCommerceCandidateInPostgres(input: {
             accountingUse: candidate.header_money_state === 'complete'
               ? 'eligible'
               : 'blocked',
-            customerChargeUse: candidate.header_money_state === 'complete'
+            customerChargeUse: commerceCustomerChargeEligible(
+              candidate.provider,
+              candidate.header_money_state,
+            )
               ? 'eligible'
               : 'blocked',
           },

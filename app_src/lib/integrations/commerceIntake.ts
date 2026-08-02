@@ -49,15 +49,18 @@ import {
 import {
   autoCreateCommerceProductsForRunInPostgres,
   captureCommerceIntakeProviderReadInPostgres,
+  confirmCommerceCustomerPrefetchBindingInPostgres,
   confirmCommerceCandidateAddressInPostgres,
   excludeCommerceIntakeRejectionInPostgres,
   markCommerceIntakeProviderReadUncertainInPostgres,
   markCommerceCandidateUnsupportedInPostgres,
   markCommerceIntakeContinuationInvalidInPostgres,
   prepareCommerceIntakeReadIntentInPostgres,
+  planCommerceCustomerPrefetchBindingInPostgres,
   promoteCommerceCandidateInPostgres,
   reconcilePromotedCommerceCandidateCheckoutRateInPostgres,
   readCommerceIntakeRejectionTargetFromPostgres,
+  readAutomaticFaireOrderPromotionTargetsForRunInPostgres,
   readAutomaticCommerceCustomerTargetsForRunInPostgres,
   readCommerceIntakeRefreshTargetFromPostgres,
   readCommerceIntakeStateFromPostgres,
@@ -395,6 +398,7 @@ function shopifyProductVariantsQuery(includeInventory: boolean) {
 }
 
 type IntakeCommandAction =
+  | 'confirm-customer-binding'
   | 'confirm-address'
   | 'exclude-rejection'
   | 'fetch'
@@ -402,6 +406,7 @@ type IntakeCommandAction =
   | 'fetch-next-products'
   | 'fetch-products'
   | 'mark-unsupported'
+  | 'plan-customer-binding'
   | 'promote'
   | 'reconcile-checkout-rate'
   | 'refresh'
@@ -588,6 +593,7 @@ function dimensions(value: unknown) {
 function action(value: unknown): IntakeCommandAction {
   const result = String(value || '').trim() as IntakeCommandAction
   const allowed: IntakeCommandAction[] = [
+    'confirm-customer-binding',
     'confirm-address',
     'exclude-rejection',
     'fetch',
@@ -595,6 +601,7 @@ function action(value: unknown): IntakeCommandAction {
     'fetch-next-products',
     'fetch-products',
     'mark-unsupported',
+    'plan-customer-binding',
     'promote',
     'reconcile-checkout-rate',
     'refresh',
@@ -613,6 +620,57 @@ function action(value: unknown): IntakeCommandAction {
       'Commerce intake action is invalid',
       400,
       'COMMERCE_INTAKE_COMMAND_INVALID',
+    )
+  }
+  return result
+}
+
+function faireOrderId(value: unknown) {
+  const result = text(value, 'Faire provider order ID', 128)
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(result)) {
+    throw new CommerceIntegrationRequestError(
+      'Faire provider order ID is invalid',
+      400,
+      'COMMERCE_INTAKE_EXACT_ORDER_ID_INVALID',
+    )
+  }
+  return result
+}
+
+function faireRetailerId(value: unknown) {
+  const result = text(value, 'Faire retailer ID', 512)
+  if (/[\u0000-\u001f\u007f]/u.test(result)) {
+    throw new CommerceIntegrationRequestError(
+      'Faire retailer ID is invalid',
+      400,
+      'COMMERCE_CUSTOMER_PREFETCH_RETAILER_ID_INVALID',
+    )
+  }
+  return result
+}
+
+function customerEvidenceEmail(value: unknown) {
+  const result = text(value, 'Retailer evidence email', 320).toLowerCase()
+  if (
+    /\s/u.test(result)
+    || !/^[^@]+@[^@]+\.[^@]+$/u.test(result)
+  ) {
+    throw new CommerceIntegrationRequestError(
+      'Retailer evidence email is invalid',
+      400,
+      'COMMERCE_CUSTOMER_PREFETCH_EMAIL_INVALID',
+    )
+  }
+  return result
+}
+
+function sha256Hash(value: unknown, label: string) {
+  const result = text(value, label, 64)
+  if (!/^[a-f0-9]{64}$/u.test(result)) {
+    throw new CommerceIntegrationRequestError(
+      `${label} is invalid`,
+      400,
+      'COMMERCE_CUSTOMER_PREFETCH_PLAN_INVALID',
     )
   }
   return result
@@ -1847,6 +1905,195 @@ async function withAutomaticCustomerResolution(
   }
 }
 
+function automaticFairePromotionFailureCode(error: unknown) {
+  const code = error instanceof CommerceIntegrationRequestError
+    ? error.code
+    : ''
+  return /^[A-Z][A-Z0-9_]{2,127}$/u.test(code)
+    ? code
+    : 'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_FAILED'
+}
+
+function automaticFaireCommandKey(parts: readonly string[]) {
+  return deterministicCustomerCommandUuid([
+    'commerce-faire-order-auto-promotion-v1',
+    ...parts,
+  ])
+}
+
+async function withAutomaticFaireOrderPromotion(
+  command: Record<string, unknown>,
+  input: {
+    runtime: CommerceRuntimeCredentialRecord
+    actorEmail: string
+    action: IntakeCommandAction
+  },
+) {
+  if (
+    input.runtime.provider !== 'faire'
+    || (
+      input.action !== 'fetch'
+      && input.action !== 'fetch-next'
+      && input.action !== 'refresh'
+      && input.action !== 'retry-rejection'
+    )
+  ) return command
+  const runGlobalId = typeof command.runGlobalId === 'string'
+    ? command.runGlobalId
+    : ''
+  if (!RUN_PATTERN.test(runGlobalId)) return command
+  let targets: Awaited<ReturnType<
+    typeof readAutomaticFaireOrderPromotionTargetsForRunInPostgres
+  >>
+  try {
+    targets = await readAutomaticFaireOrderPromotionTargetsForRunInPostgres({
+      runtime: input.runtime,
+      runGlobalId,
+    })
+  } catch {
+    return {
+      ...command,
+      automaticFaireOrderPromotion: {
+        policyVersion: 'commerce-faire-order-auto-promotion-v1',
+        runGlobalId,
+        candidatesFound: 0,
+        eligible: 0,
+        promoted: 0,
+        held: 0,
+        heldByReason: {},
+        failed: 1,
+        failedByCode: {
+          COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_SELECTION_FAILED: 1,
+        },
+        operatorReviewRequired: 1,
+        providerWrites: 0,
+        canonicalOrderWrites: 0,
+        inventoryWrites: 0,
+        syncCursorAdvanced: false,
+      },
+    }
+  }
+  let eligible = 0
+  let promoted = 0
+  let held = 0
+  let failed = 0
+  const heldByReason: Record<string, number> = {}
+  const failedByCode: Record<string, number> = {}
+  for (const target of targets) {
+    if (!target.eligible) {
+      held += 1
+      heldByReason[target.reason] = (heldByReason[target.reason] || 0) + 1
+      continue
+    }
+    eligible += 1
+    let rowVersion = target.candidateRowVersion
+    try {
+      if (target.providerAddress) {
+        const addressResult = await confirmCommerceCandidateAddressInPostgres({
+          runtime: input.runtime,
+          actorEmail: input.actorEmail,
+          idempotencyKey: automaticFaireCommandKey([
+            input.runtime.globalId,
+            runGlobalId,
+            target.candidateGlobalId,
+            String(rowVersion),
+            'provider-address',
+          ]),
+          candidateGlobalId: target.candidateGlobalId,
+          candidateRowVersion: rowVersion,
+          address: target.providerAddress,
+        }) as { rowVersion?: number }
+        rowVersion = Number(addressResult.rowVersion)
+      }
+      if (target.deliveryMode) {
+        const deliveryResult = await resolveCommerceCandidateDeliveryInPostgres({
+          runtime: input.runtime,
+          actorEmail: input.actorEmail,
+          idempotencyKey: automaticFaireCommandKey([
+            input.runtime.globalId,
+            runGlobalId,
+            target.candidateGlobalId,
+            String(rowVersion),
+            `delivery:${target.deliveryMode}`,
+          ]),
+          candidateGlobalId: target.candidateGlobalId,
+          candidateRowVersion: rowVersion,
+          decision: {
+            mode: target.deliveryMode,
+            requestedDeliveryAt: null,
+          },
+        }) as { rowVersion?: number }
+        rowVersion = Number(deliveryResult.rowVersion)
+      }
+      const validation = await validateCommerceCandidateInPostgres({
+        runtime: input.runtime,
+        actorEmail: input.actorEmail,
+        idempotencyKey: automaticFaireCommandKey([
+          input.runtime.globalId,
+          runGlobalId,
+          target.candidateGlobalId,
+          String(rowVersion),
+          'validate',
+        ]),
+        candidateGlobalId: target.candidateGlobalId,
+        candidateRowVersion: rowVersion,
+      }) as { ready?: boolean; rowVersion?: number }
+      rowVersion = Number(validation.rowVersion)
+      if (validation.ready !== true) {
+        held += 1
+        heldByReason.validation_blocked =
+          (heldByReason.validation_blocked || 0) + 1
+        continue
+      }
+      await promoteCommerceCandidateInPostgres({
+        runtime: input.runtime,
+        actorEmail: input.actorEmail,
+        idempotencyKey: automaticFaireCommandKey([
+          input.runtime.globalId,
+          runGlobalId,
+          target.candidateGlobalId,
+          String(rowVersion),
+          'promote',
+        ]),
+        candidateGlobalId: target.candidateGlobalId,
+        candidateRowVersion: rowVersion,
+        requestHash: requestHash({
+          policyVersion: 'commerce-faire-order-auto-promotion-v1',
+          accountGlobalId: input.runtime.globalId,
+          runGlobalId,
+          candidateGlobalId: target.candidateGlobalId,
+          candidateRowVersion: rowVersion,
+          providerWrites: 0,
+        }),
+      })
+      promoted += 1
+    } catch (error) {
+      failed += 1
+      const code = automaticFairePromotionFailureCode(error)
+      failedByCode[code] = (failedByCode[code] || 0) + 1
+    }
+  }
+  return {
+    ...command,
+    automaticFaireOrderPromotion: {
+      policyVersion: 'commerce-faire-order-auto-promotion-v1',
+      runGlobalId,
+      candidatesFound: targets.length,
+      eligible,
+      promoted,
+      held,
+      heldByReason,
+      failed,
+      failedByCode,
+      operatorReviewRequired: held + failed,
+      providerWrites: 0,
+      canonicalOrderWrites: promoted,
+      inventoryWrites: 0,
+      syncCursorAdvanced: false,
+    },
+  }
+}
+
 type ExecuteCommerceIntakeInput = {
   organizationId: unknown
   actorEmail: string
@@ -2021,6 +2268,49 @@ async function executeCommerceIntakeCommandInternal(
   }
 
   if (
+    commandAction === 'plan-customer-binding'
+    || commandAction === 'confirm-customer-binding'
+  ) {
+    const externalCustomerId = faireRetailerId(
+      input.body.externalCustomerId,
+    )
+    const customerGlobalId = globalId(
+      input.body.customerGlobalId,
+      CUSTOMER_PATTERN,
+      'Customer Global ID',
+    )
+    const evidenceEmail = customerEvidenceEmail(
+      input.body.evidenceEmail,
+    )
+    const command = commandAction === 'plan-customer-binding'
+      ? await planCommerceCustomerPrefetchBindingInPostgres({
+          runtime,
+          externalCustomerId,
+          customerGlobalId,
+          evidenceEmail,
+        })
+      : await confirmCommerceCustomerPrefetchBindingInPostgres({
+          runtime,
+          actorEmail: input.actorEmail,
+          externalCustomerId,
+          customerGlobalId,
+          evidenceEmail,
+          planHash: sha256Hash(
+            input.body.bindingPlanHash,
+            'Customer binding plan hash',
+          ),
+          confirmed: input.body.confirmCustomerBinding === true,
+        })
+    return {
+      command,
+      intake: await readCommerceIntakeStateFromPostgres({
+        organizationId: runtime.organizationId,
+        accountGlobalId: runtime.globalId,
+      }),
+    }
+  }
+
+  if (
     commandAction === 'fetch'
     || commandAction === 'fetch-next'
     || commandAction === 'fetch-products'
@@ -2041,6 +2331,20 @@ async function executeCommerceIntakeCommandInternal(
     )
       ? 'products'
       : 'orders'
+    const exactExternalOrderId = input.body.externalOrderId === undefined
+      ? null
+      : commandAction === 'fetch' && runtime.provider === 'faire'
+        ? faireOrderId(input.body.externalOrderId)
+        : (() => {
+            throw new CommerceIntegrationRequestError(
+              'Exact order discovery is available only for a root Faire order fetch',
+              400,
+              'COMMERCE_INTAKE_EXACT_ORDER_ACTION_INVALID',
+            )
+          })()
+    const exactExternalOrderIdHash = exactExternalOrderId
+      ? requestHash(exactExternalOrderId)
+      : null
     const refreshCandidateGlobalId = commandAction === 'refresh'
       ? globalId(
         input.body.candidateGlobalId,
@@ -2090,6 +2394,9 @@ async function executeCommerceIntakeCommandInternal(
       idempotencyKey: key,
       action: commandAction,
       target: replayTarget,
+      ...(commandAction === 'fetch'
+        ? { exactExternalOrderIdHash }
+        : {}),
     })
     if (replay) {
       const commandWithProducts = await withAutomaticProductCreation(
@@ -2100,8 +2407,16 @@ async function executeCommerceIntakeCommandInternal(
           action: commandAction,
         },
       )
-      const command = await withAutomaticCustomerResolution(
+      const commandWithCustomers = await withAutomaticCustomerResolution(
         commandWithProducts,
+        {
+          runtime,
+          actorEmail: input.actorEmail,
+          action: commandAction,
+        },
+      )
+      const command = await withAutomaticFaireOrderPromotion(
+        commandWithCustomers,
         {
           runtime,
           actorEmail: input.actorEmail,
@@ -2171,9 +2486,10 @@ async function executeCommerceIntakeCommandInternal(
         action: intentAction,
         resource,
         target,
+        exactExternalOrderIdHash,
         continuationRunGlobalId,
         pageSize: (
-          refreshTarget || rejectionTarget
+          exactExternalOrderId || refreshTarget || rejectionTarget
             ? 1
             : resource === 'products'
               ? runtime.provider === 'shopify'
@@ -2214,7 +2530,8 @@ async function executeCommerceIntakeCommandInternal(
       }
       throw error
     }
-    const targetExternalOrderId = refreshTarget?.external_order_id
+    const targetExternalOrderId = exactExternalOrderId
+      || refreshTarget?.external_order_id
       || rejectionTarget?.external_id
       || null
     const pageSize = targetExternalOrderId
@@ -2335,6 +2652,9 @@ async function executeCommerceIntakeCommandInternal(
       retryRejectionGlobalId,
       readIntentId,
       capturedResponseHash: captured.responseHash,
+      ...(commandAction === 'fetch'
+        ? { exactExternalOrderIdHash }
+        : {}),
     })
     const commandWithAutomaticCreation = await withAutomaticProductCreation(
       command as Record<string, unknown>,
@@ -2353,8 +2673,17 @@ async function executeCommerceIntakeCommandInternal(
           action: commandAction,
         },
       )
+    const commandWithAutomaticPromotion =
+      await withAutomaticFaireOrderPromotion(
+        commandWithAutomaticResolution,
+        {
+          runtime,
+          actorEmail: input.actorEmail,
+          action: commandAction,
+        },
+      )
     return {
-      command: commandWithAutomaticResolution,
+      command: commandWithAutomaticPromotion,
       intake: options.includeIntakeState
         ? await readCommerceIntakeStateFromPostgres({
             organizationId: runtime.organizationId,

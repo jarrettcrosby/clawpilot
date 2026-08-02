@@ -269,7 +269,9 @@ export type CommerceOrderHeaderMoneyField =
  * discount, and tax evidence exists, but a provider did not return exact
  * shipping and/or header total. Those orders may stage exact fulfillment
  * demand from confirmed line quantities and prices, but cannot be used for
- * accounting or customer charges.
+ * accounting or customer charges. A complete header describes amount
+ * availability only; provider adapters may still block customer-charge use
+ * when the provider omits credits or tender evidence.
  */
 export type CommerceOrderHeaderMoneyState = Readonly<{
   state: 'complete' | 'operational_incomplete'

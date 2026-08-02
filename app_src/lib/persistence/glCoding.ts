@@ -191,6 +191,7 @@ type ReviewableRunItemRow = QueryResultRow & {
   statement_lineage_key: string
   commerce_order_candidate_id: string | null
   commerce_order_candidate_global_id: string | null
+  candidate_provider: string | null
   candidate_currency: string | null
   candidate_shipping_minor: string | null
   candidate_payment_status: string | null
@@ -982,7 +983,8 @@ async function persistApprovedBillingMudCalculations(
     if (candidateCurrencyMatches) {
       commerceOrderCandidateId = first.commerce_order_candidate_id
       if (
-        first.candidate_header_money_state === 'complete'
+        first.candidate_provider === 'shopify'
+        && first.candidate_header_money_state === 'complete'
         && first.candidate_payment_status === 'paid'
         && first.candidate_shipping_minor !== null
       ) {
@@ -1181,6 +1183,9 @@ async function persistApprovedBillingMudCalculations(
             : null,
         paymentStatus: commerceOrderCandidateId
           ? first.candidate_payment_status
+          : null,
+        provider: commerceOrderCandidateId
+          ? first.candidate_provider
           : null,
         headerMoneyState: commerceOrderCandidateId
           ? first.candidate_header_money_state
@@ -2504,6 +2509,7 @@ export async function reviewGlCodingRunInPostgres(input: {
               commerce_candidate.id::text AS commerce_order_candidate_id,
               commerce_candidate.global_id
                 AS commerce_order_candidate_global_id,
+              commerce_candidate.provider AS candidate_provider,
               commerce_candidate.currency_code AS candidate_currency,
               commerce_candidate.shipping_minor::text
                 AS candidate_shipping_minor,

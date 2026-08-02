@@ -897,18 +897,16 @@ async function bindCommerceCustomerExternalId(
     evidence: Record<string, unknown>
   },
 ) {
-  await client.query(
+  const result = await client.query<{ entity_global_id: string }>(
     `INSERT INTO operations_external_identifiers (
        organization_id, integration_account_id, entity_type, entity_global_id,
        external_id, status, match_method, match_evidence, last_verified_at
      ) VALUES ($1::uuid, $2::uuid, 'crm.organization', $3, $4,
        'active', $5, $6::jsonb, now())
      ON CONFLICT (organization_id, integration_account_id, entity_type, external_id)
-     DO UPDATE SET entity_global_id = EXCLUDED.entity_global_id,
-                   status = 'active',
-                   match_method = EXCLUDED.match_method,
-                   match_evidence = EXCLUDED.match_evidence,
-                   last_verified_at = now()`,
+     DO UPDATE SET status = 'active',
+                   last_verified_at = now()
+     RETURNING entity_global_id`,
     [
       input.organizationId,
       input.integrationAccountId,
@@ -918,6 +916,13 @@ async function bindCommerceCustomerExternalId(
       JSON.stringify(input.evidence),
     ],
   )
+  if (result.rows[0]?.entity_global_id !== input.customer.globalId) {
+    throw new OperationsRequestError(
+      'OPERATIONS_CUSTOMER_IDENTITY_CONFLICT',
+      'This provider customer is already bound to a different CRM customer',
+      409,
+    )
+  }
 }
 
 export async function resolveCommerceCustomerInPostgres(input: {
@@ -930,7 +935,7 @@ export async function resolveCommerceCustomerInPostgres(input: {
   const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
   const integrationAccountGlobalId = trimmed(input.integrationAccountGlobalId, 20)
   const provider = trimmed(input.identity.provider, 100).toLowerCase()
-  const externalCustomerId = trimmed(input.identity.externalCustomerId, 300)
+  const externalCustomerId = trimmed(input.identity.externalCustomerId, 512)
   const companyName = trimmed(input.identity.companyName, 200)
   if (!actorEmail || !integrationAccountGlobalId || !provider || !externalCustomerId || !companyName) {
     throw new OperationsRequestError('OPERATIONS_CUSTOMER_IDENTITY_INVALID', 'Commerce customer identity is incomplete')

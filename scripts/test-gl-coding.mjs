@@ -302,6 +302,8 @@ for (const fragment of [
   'directiveCandidateSnapshot',
   'directiveCandidates: directiveCandidateSnapshot',
   'child.effective_from <= $6::timestamptz',
+  'commerce_candidate.provider AS candidate_provider',
+  "first.candidate_provider === 'shopify'",
 ]) {
   assert.ok(persistence.includes(fragment), `Missing GL Coding persistence contract: ${fragment}`)
 }

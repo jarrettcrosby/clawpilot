@@ -268,6 +268,39 @@ function normalizedCheckoutDestinationPart(
     : normalized.toLowerCase()
 }
 
+export function commerceCustomerEvidenceFingerprint(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  kind: 'external_customer_id' | 'email'
+  value: unknown
+}) {
+  const organizationId = normalizeCommerceOrganizationId(
+    input.organizationId,
+  )
+  const accountGlobalId = normalizeCommerceAccountGlobalId(
+    input.accountGlobalId,
+  )
+  const value = String(input.value ?? '').normalize('NFKC').trim()
+  if (
+    value.length < 1
+    || value.length > 512
+    || /[\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    throw new Error('Commerce customer evidence is invalid')
+  }
+  return crypto
+    .createHmac('sha256', encryptionKey())
+    .update('clawpilot:commerce:customer-evidence:v1\0', 'utf8')
+    .update(organizationId, 'utf8')
+    .update('\0', 'utf8')
+    .update(accountGlobalId, 'utf8')
+    .update('\0', 'utf8')
+    .update(input.kind, 'utf8')
+    .update('\0', 'utf8')
+    .update(value, 'utf8')
+    .digest('hex')
+}
+
 /**
  * Produces the customer-neutral rate-zone identity shared by the live
  * CarrierService callback and the later Shopify order-intake record. Shopify

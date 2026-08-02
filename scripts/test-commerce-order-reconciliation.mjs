@@ -67,6 +67,38 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
 }
 
 const persistence = read('app_src/lib/persistence/commerceOrderReconciliation.ts')
+const fairePromotionPolicy = loadTypeScriptModule(
+  'app_src/lib/integrations/commerceFaireAutomaticPromotion.ts',
+)
+const freshProviderCreatedAt = Date.parse('2026-08-01T12:00:00.000Z')
+const freshObservedAt = freshProviderCreatedAt + 5 * 60_000
+assert.equal(
+  fairePromotionPolicy.automaticFaireOrderSourceIsFresh({
+    providerCreatedAt: new Date(freshProviderCreatedAt),
+    observedAt: new Date(freshObservedAt),
+    nowMs: freshProviderCreatedAt + 48 * 60 * 60 * 1_000,
+  }),
+  true,
+  'Exact 48-hour provider evidence remains eligible',
+)
+assert.equal(
+  fairePromotionPolicy.automaticFaireOrderSourceIsFresh({
+    providerCreatedAt: new Date(freshProviderCreatedAt),
+    observedAt: new Date(freshObservedAt),
+    nowMs: freshObservedAt + 48 * 60 * 60 * 1_000 + 1,
+  }),
+  false,
+  'A retained intake replay after 48 hours must not promote stale Faire evidence',
+)
+assert.equal(
+  fairePromotionPolicy.automaticFaireOrderSourceIsFresh({
+    providerCreatedAt: new Date(freshObservedAt),
+    observedAt: new Date(freshProviderCreatedAt),
+    nowMs: freshObservedAt,
+  }),
+  false,
+  'Faire provider creation must not postdate the captured observation',
+)
 const shippingServiceCodeMigration = read(
   'db/migrations/0173_operations_shopify_shipping_service_codes.sql',
 )
@@ -262,6 +294,7 @@ const healthPersistenceModule = loadTypeScriptModule(
                 running: '0',
                 failed: '1',
                 stale_processing: '0',
+                promotion_attention_required: '1',
                 overdue: '1',
                 resumable: '1',
                 last_success_at: '2026-08-01T16:20:00.000Z',
@@ -286,6 +319,7 @@ assert.deepEqual(JSON.parse(JSON.stringify(orderHealth)), {
   running: 0,
   failed: 1,
   staleProcessing: 0,
+  promotionAttentionRequired: 1,
   overdue: 1,
   resumable: 1,
   lastSuccessAt: '2026-08-01T16:20:00.000Z',
@@ -351,6 +385,68 @@ const failureTarget = {
   continuationRunGlobalId: null,
   continuationIdempotencyKey: null,
 }
+const promotionCompletionQueries = []
+const promotionCompletionAudits = []
+const promotionCompletionModule = loadTypeScriptModule(
+  'app_src/lib/persistence/commerceOrderReconciliation.ts',
+  {
+    mocks: {
+      '@/lib/auditWriter': {
+        async recordAuditEvent(event) {
+          promotionCompletionAudits.push(event)
+        },
+      },
+      '@/lib/persistence/postgres': {
+        async withTransaction(callback) {
+          return callback({
+            async query(sql, values) {
+              promotionCompletionQueries.push({ sql, values })
+              return {
+                rowCount: 1,
+                rows: [{ organization_id: failureTarget.organizationId }],
+              }
+            },
+          })
+        },
+      },
+    },
+  },
+)
+const promotionCompletion = await promotionCompletionModule
+  .completeCommerceOrderReconciliationInPostgres({
+    target: { ...failureTarget, provider: 'faire' },
+    providerRecordsSeen: 1,
+    ordersHeld: 1,
+    recordsRejected: 0,
+    pagesRead: 1,
+    hasNextBatch: false,
+    customersMatched: 1,
+    customersCreated: 0,
+    customersAmbiguous: 0,
+    customersSkipped: 0,
+    customerResolutionFailed: 0,
+    customerResolutionFailureCodes: {},
+    faireOrdersPromoted: 0,
+    faireOrdersHeld: 0,
+    fairePromotionFailed: 1,
+    fairePromotionFailureCodes: {
+      COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_FAILED: 1,
+    },
+  })
+assert.equal(promotionCompletion.leaseLost, false)
+assert.equal(promotionCompletionQueries.length, 1)
+assert.match(
+  promotionCompletionQueries[0].sql,
+  /COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED/u,
+  'Successful provider reads must durably retain local-promotion attention',
+)
+assert.equal(promotionCompletionQueries[0].values[5], 1)
+assert.equal(promotionCompletionQueries[0].values[6], false)
+assert.equal(
+  promotionCompletionAudits[0].payload
+    .automaticFaireOrderPromotion.failed,
+  1,
+)
 const knownConstraintFailure = await failurePersistenceModule
   .failCommerceOrderReconciliationInPostgres({
     target: failureTarget,
@@ -469,8 +565,10 @@ includes(workerSource, [
   'projectCommerceOrderReconciliationPageInPostgres',
 ], 'Bounded order reconciliation worker')
 assert.ok(
-  workerSource.includes('never promotes canonical orders, derives packages or shipments'),
-  'Order reconciliation must remain package-agnostic and preserve held source quantities',
+  workerSource.includes('permits a bounded')
+    && workerSource.includes('local-only Faire promotion')
+    && workerSource.includes('never derives packages or shipments'),
+  'Order reconciliation must permit only bounded local Faire promotion while remaining package, shipment, inventory, and provider-write fenced',
 )
 const intakeSource = read('app_src/lib/integrations/commerceIntake.ts')
 includes(intakeSource, [
@@ -489,6 +587,9 @@ const intakeWorkflowSource = read(
 )
 includes(intakeWorkflowSource, [
   'resetRequired: boolean',
+  'automaticPromotionAttentionRequired: boolean',
+  'automatic local Faire order promotion needs attention',
+  'Provider reads remain read-only.',
   "'reset-order-reconciliation'",
   'Restart automatic staging',
   'ClawPilot will not reuse the terminal continuation.',
@@ -539,6 +640,16 @@ const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWork
                 providerWrites: 0,
                 syncCursorAdvanced: false,
               },
+              automaticFaireOrderPromotion: {
+                promoted: 1,
+                held: 1,
+                failed: 0,
+                failedByCode: {},
+                providerWrites: 0,
+                canonicalOrderWrites: 1,
+                inventoryWrites: 0,
+                syncCursorAdvanced: false,
+              },
               pagination: {
                 batchNumber: 1,
                 runGlobalId: 'gcir0000001',
@@ -568,6 +679,18 @@ const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWork
                 COMMERCE_CUSTOMER_AUTO_RESOLUTION_FAILED: 1,
               },
               providerWrites: 0,
+              syncCursorAdvanced: false,
+            },
+            automaticFaireOrderPromotion: {
+              promoted: 0,
+              held: 1,
+              failed: 1,
+              failedByCode: {
+                COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_FAILED: 1,
+              },
+              providerWrites: 0,
+              canonicalOrderWrites: 0,
+              inventoryWrites: 0,
               syncCursorAdvanced: false,
             },
             pagination: {
@@ -629,7 +752,7 @@ assert.equal(completed.pagesRead, 2)
 assert.equal(completed.staged, 5)
 assert.equal(completed.rejected, 1)
 assert.equal(completed.providerWrites, 0)
-assert.equal(completed.canonicalOrderWrites, 0)
+assert.equal(completed.canonicalOrderWrites, 1)
 assert.equal(completed.inventoryWrites, 0)
 assert.deepEqual(
   JSON.parse(JSON.stringify(completed.automaticCustomerResolution)),
@@ -647,6 +770,22 @@ assert.deepEqual(
     syncCursorAdvanced: false,
   },
 )
+assert.deepEqual(
+  JSON.parse(JSON.stringify(completed.automaticFaireOrderPromotion)),
+  {
+    promoted: 1,
+    held: 2,
+    failed: 1,
+    failedByCode: {
+      COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_FAILED: 1,
+    },
+    operatorReviewRequired: 3,
+    providerWrites: 0,
+    canonicalOrderWrites: 1,
+    inventoryWrites: 0,
+    syncCursorAdvanced: false,
+  },
+)
 assert.equal(trace.complete.length, 1)
 assert.equal(trace.complete[0].pagesRead, 2)
 assert.equal(trace.complete[0].hasNextBatch, false)
@@ -655,6 +794,13 @@ assert.equal(trace.complete[0].customersCreated, 1)
 assert.equal(trace.complete[0].customersAmbiguous, 1)
 assert.equal(trace.complete[0].customersSkipped, 1)
 assert.equal(trace.complete[0].customerResolutionFailed, 1)
+assert.equal(trace.complete[0].faireOrdersPromoted, 1)
+assert.equal(trace.complete[0].faireOrdersHeld, 2)
+assert.equal(trace.complete[0].fairePromotionFailed, 1)
+assert.deepEqual(
+  { ...trace.complete[0].fairePromotionFailureCodes },
+  { COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_FAILED: 1 },
+)
 assert.deepEqual(
   { ...trace.complete[0].customerResolutionFailureCodes },
   { COMMERCE_CUSTOMER_AUTO_RESOLUTION_FAILED: 1 },
@@ -1027,7 +1173,13 @@ includes(route, [
   "phase: 'started'",
   "phase: 'completed'",
   "phase: 'failed'",
+  'providerReadOnly: true',
+  'localCanonicalOrderWritesPossible: true',
 ], 'Order reconciliation route')
+assert.ok(
+  !route.includes('readOnly: true'),
+  'The order worker must not claim that local canonical promotion is read-only',
+)
 const poller = read('scripts/pipeline-outbox-poller.mjs')
 includes(poller, [
   'commerceOrderReconciliationEnabled',
@@ -1045,6 +1197,8 @@ includes(health, [
   'commerceOrderReconciliationWorker',
   'readCommerceOrderReconciliationHealthFromPostgres',
   'Commerce order reconciliation worker heartbeat is missing or stale.',
+  'orderState.promotionAttentionRequired > 0',
+  'automatic local order promotion needs operator attention',
 ], 'Order reconciliation health migration gate')
 const reconciliationPersistence = read(
   'app_src/lib/persistence/commerceOrderReconciliation.ts',
@@ -1055,8 +1209,11 @@ includes(reconciliationPersistence, [
   "account.provider IN ('shopify', 'faire')",
   "cursor.resource = 'orders'",
   'stale_processing',
+  'promotion_attention_required',
   'overdue',
   'providerAccounts',
+  'promotionAttentionRequired',
+  'automaticPromotionAttentionRequired',
 ], 'Order reconciliation durable health')
 const predeploy = read('scripts/verify-predeploy.mjs')
 includes(predeploy, [

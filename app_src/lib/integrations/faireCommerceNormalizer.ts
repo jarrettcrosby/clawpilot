@@ -48,7 +48,7 @@ import {
 } from '@/lib/operations/commerceNormalization'
 
 export const FAIRE_COMMERCE_NORMALIZER_VERSION =
-  'faire-commerce-normalizer-v6' as const
+  'faire-commerce-normalizer-v7' as const
 
 type FaireSource = Readonly<Record<string, unknown>>
 
@@ -1433,13 +1433,21 @@ function normalizeOrder(
     explicitTotal,
     exactOrderTotal(subtotal, discount, shipping, tax),
   )
-  const headerMoney = commerceOrderHeaderMoneyState({
+  const brandSideHeaderMoney = commerceOrderHeaderMoneyState({
     currency,
     subtotal,
     shipping,
     tax,
     discount,
     total,
+  })
+  // Faire's brand-order API exposes brand discounts and settlement/payout
+  // facts, but not retailer-funded credits or the retailer's tender charge.
+  // Complete brand-side arithmetic therefore must never be promoted as exact
+  // customer-charge evidence.
+  const headerMoney = Object.freeze({
+    ...brandSideHeaderMoney,
+    customerChargeEligible: false,
   })
   return Object.freeze({
     schemaVersion: COMMERCE_NORMALIZED_ORDER_VERSION,

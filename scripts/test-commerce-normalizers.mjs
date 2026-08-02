@@ -529,15 +529,24 @@ for (const productState of [{
     'Deleted, unpublished, or sales-paused Faire products must be inactive',
   )
 }
-for (const normalized of [shopifyNormalized, faireNormalized]) {
-  assert.deepEqual(headerMoneyProjection(normalized.orders[0]), {
+assert.deepEqual(headerMoneyProjection(shopifyNormalized.orders[0]), {
+  state: 'complete',
+  unavailableFields: [],
+  fulfillmentDemandEligible: true,
+  accountingEligible: true,
+  customerChargeEligible: true,
+})
+assert.deepEqual(
+  headerMoneyProjection(faireNormalized.orders[0]),
+  {
     state: 'complete',
     unavailableFields: [],
     fulfillmentDemandEligible: true,
     accountingEligible: true,
-    customerChargeEligible: true,
-  })
-}
+    customerChargeEligible: false,
+  },
+  'Faire complete header money is brand-side evidence, not retailer-charge evidence',
+)
 
 function availableValue(field) {
   assert.equal(field.state, 'available')
@@ -682,7 +691,7 @@ assert.deepEqual(
 )
 assert.equal(
   faireExternalOrderV2Normalized.normalizerVersion,
-  'faire-commerce-normalizer-v6',
+  'faire-commerce-normalizer-v7',
 )
 assert.deepEqual(
   headerMoneyProjection(faireExternalOrderV2NormalizedOrder),
@@ -691,8 +700,78 @@ assert.deepEqual(
     unavailableFields: [],
     fulfillmentDemandEligible: true,
     accountingEligible: true,
-    customerChargeEligible: true,
+    customerChargeEligible: false,
   },
+)
+
+const faireRetailerCreditSource = clone(faireExternalOrderV2Source)
+const faireRetailerCreditOrder = faireRetailerCreditSource.orders[0]
+faireRetailerCreditOrder.id = 'order-v2-retailer-credit'
+faireRetailerCreditOrder.display_id = 'B78SNY28PX'
+faireRetailerCreditOrder.items[0].quantity = 1
+faireRetailerCreditOrder.items[0].price = {
+  amount_minor: 100,
+  currency: 'USD',
+}
+faireRetailerCreditOrder.items[0].discounts = []
+faireRetailerCreditOrder.payout_costs = {
+  subtotal_after_brand_discounts: {
+    amount_minor: 50,
+    currency: 'USD',
+  },
+  total_brand_discounts: {
+    amount_minor: 50,
+    currency: 'USD',
+  },
+  net_tax: {
+    amount_minor: 0,
+    currency: 'USD',
+  },
+  total_payout: {
+    amount_minor: 0,
+    currency: 'USD',
+  },
+}
+const faireRetailerCredit = faire.normalizeFaireCommerce(
+  faireRetailerCreditSource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+const faireRetailerCreditNormalizedOrder = faireRetailerCredit.orders[0]
+assert.deepEqual(
+  {
+    subtotal: moneyValue(faireRetailerCreditNormalizedOrder.subtotal),
+    discount: moneyValue(faireRetailerCreditNormalizedOrder.discount),
+    brandDiscount: moneyValue(
+      faireRetailerCreditNormalizedOrder.providerFacts.brandDiscount,
+    ),
+    brandSideTotal: moneyValue(faireRetailerCreditNormalizedOrder.total),
+    merchantPayout: moneyValue(
+      faireRetailerCreditNormalizedOrder.providerFacts.payoutAmount,
+    ),
+  },
+  {
+    subtotal: '100:USD',
+    discount: '50:USD',
+    brandDiscount: '50:USD',
+    brandSideTotal: '50:USD',
+    merchantPayout: '0:USD',
+  },
+  'Faire retailer credits are absent from brand-side order and payout facts',
+)
+assert.deepEqual(
+  headerMoneyProjection(faireRetailerCreditNormalizedOrder),
+  {
+    state: 'complete',
+    unavailableFields: [],
+    fulfillmentDemandEligible: true,
+    accountingEligible: true,
+    customerChargeEligible: false,
+  },
+  'A Faire brand-side total must not be eligible as the retailer charge',
 )
 
 const faireExternalOrderV2TesterSource = clone(faireExternalOrderV2Source)

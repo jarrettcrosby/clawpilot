@@ -46,7 +46,8 @@ export async function POST(req: NextRequest) {
   await recordCommerceOrderReconciliationWorkerHeartbeatInPostgres({
     phase: 'started',
     workerId,
-    readOnly: true,
+    providerReadOnly: true,
+    localCanonicalOrderWritesPossible: true,
     providerWrites: 0,
   })
   try {
@@ -66,7 +67,8 @@ export async function POST(req: NextRequest) {
     await recordCommerceOrderReconciliationWorkerHeartbeatInPostgres({
       phase: 'failed',
       workerId,
-      readOnly: true,
+      providerReadOnly: true,
+      localCanonicalOrderWritesPossible: true,
       providerWrites: 0,
     }).catch(() => undefined)
     throw error

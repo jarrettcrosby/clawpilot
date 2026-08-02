@@ -54,6 +54,14 @@ function loadTypeScriptModule(path, mocks = {}, globals = {}) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
       }
+      if (
+        specifier
+        === '@/lib/integrations/commerceFaireAutomaticPromotion'
+      ) {
+        return loadTypeScriptModule(
+          'app_src/lib/integrations/commerceFaireAutomaticPromotion.ts',
+        )
+      }
       return nodeRequire(specifier)
     },
     ...globals,
@@ -406,6 +414,15 @@ function loadCommerceStagingService(pool, counters) {
         },
       },
       '@/lib/integrations/commerceCredentialCrypto': {
+        commerceCustomerEvidenceFingerprint(input) {
+          return hash([
+            'test-only-keyed-customer-evidence',
+            input.organizationId,
+            input.accountGlobalId,
+            input.kind,
+            input.value,
+          ].join('\0'))
+        },
         decryptCommerceIntakeReadResult: mustNotRun(
           'decryptCommerceIntakeReadResult',
         ),
@@ -738,6 +755,19 @@ async function seedCapturedRead(client, ids, envelope) {
       [ids.integrationAccount, ids.organization, actorEmail],
     )
     await client.query(
+      `INSERT INTO operations_integration_accounts (
+         id, global_id, organization_id, provider, integration_type,
+         environment, display_name, status, configuration,
+         external_account_id, commerce_credential_generation,
+         created_by, updated_by
+       ) VALUES (
+         $1, 'gia0009202', $2, 'faire', 'commerce', 'production',
+         'Faire pre-fetch binding acceptance', 'active', '{}'::jsonb,
+         'brand-9202', 1, $3, $3
+       )`,
+      [ids.faireIntegrationAccount, ids.organization, actorEmail],
+    )
+    await client.query(
       `INSERT INTO crm_products (
          id, pipeline_id, source_key, reference_code, name, sku,
          status, price, cost, currency, source_hash, sync_status,
@@ -752,14 +782,21 @@ async function seedCapturedRead(client, ids, envelope) {
     await client.query(
       `INSERT INTO crm_organizations (
          id, pipeline_id, source_key, identity_key, name, relationship_type,
-         source_payload, source_hash, sync_status, created_by, updated_by
+         email, source_payload, source_hash, sync_status, created_by,
+         updated_by
        ) VALUES (
          $1, $2, 'commerce-promotion-postgres-customer',
          'customer:commerce-promotion-postgres-customer',
-         'Commerce promotion PostgreSQL customer', 'customer',
-         '{}'::jsonb, $3, 'synced', $4, $4
+         'Commerce promotion PostgreSQL customer', 'customer', $3,
+         '{}'::jsonb, $4, 'synced', $5, $5
        )`,
-      [ids.customer, ids.pipeline, hash('promotion-customer'), actorEmail],
+      [
+        ids.customer,
+        ids.pipeline,
+        'jarrett+warehouse@episcs.com',
+        hash('promotion-customer'),
+        actorEmail,
+      ],
     )
     await client.query(
       `INSERT INTO operations_product_mappings (
@@ -851,8 +888,8 @@ async function seedAdditionalCapturedRead(client, ids, input) {
          redacted_request, redacted_response, state, completed_at, created_by
        ) VALUES (
          $1, $2, $3, $4, 'commerce.intake.read',
-         'commerce-staging-postgres-v1', $5, $6, '{}'::jsonb, '{}'::jsonb,
-         'succeeded', now(), $7
+         'commerce-staging-postgres-v1', $5, $6, $7::jsonb, '{}'::jsonb,
+         'succeeded', now(), $8
        )`,
       [
         input.providerAttemptId,
@@ -861,6 +898,7 @@ async function seedAdditionalCapturedRead(client, ids, input) {
         ids.integrationAccount,
         input.idempotencyKey,
         hash(`${input.idempotencyKey}:provider-read-request`),
+        JSON.stringify(input.redactedRequest || {}),
         actorEmail,
       ],
     )
@@ -900,6 +938,264 @@ async function seedAdditionalCapturedRead(client, ids, input) {
   } finally {
     await client.query('SET session_replication_role = origin')
   }
+}
+
+async function verifyCustomerPrefetchBinding(
+  pool,
+  ids,
+  persistence,
+  counters,
+) {
+  const retailerId = 'retailer-300'
+  const evidenceEmail = 'jarrett+warehouse@episcs.com'
+  const customer = (await pool.query(
+    `SELECT reference_code, name
+     FROM crm_organizations
+     WHERE id = $1::uuid`,
+    [ids.customer],
+  )).rows[0]
+  assert.ok(customer?.reference_code)
+  const runtime = {
+    organizationId: ids.organization,
+    globalId: 'gia0009202',
+    provider: 'faire',
+    credentialVersion: 1,
+  }
+  const durableCounts = async () => (await pool.query(
+    `SELECT
+       (SELECT count(*)::integer
+        FROM operations_external_identifiers
+        WHERE organization_id = $1::uuid
+          AND integration_account_id = $2::uuid) AS identities,
+       (SELECT count(*)::integer
+        FROM operations_command_receipts
+        WHERE organization_id = $1::uuid
+          AND command_type =
+              'commerce.intake.confirm_customer_prefetch_binding') AS receipts,
+       (SELECT count(*)::integer
+        FROM audit_events
+        WHERE organization_id = $1::uuid
+          AND event_type =
+              'commerce.intake.customer_identity.prebound') AS audits,
+       (SELECT count(*)::integer
+        FROM operations_commerce_provider_attempts
+        WHERE organization_id = $1::uuid) AS provider_attempts,
+       (SELECT count(*)::integer
+        FROM operations_commerce_intake_runs
+        WHERE organization_id = $1::uuid) AS intake_runs,
+       (SELECT count(*)::integer
+        FROM operations_orders
+        WHERE organization_id = $1::uuid) AS orders,
+       (SELECT count(*)::integer
+        FROM operations_fulfillment_plans
+        WHERE organization_id = $1::uuid) AS fulfillment_plans,
+       (SELECT count(*)::integer
+        FROM operations_shipments
+        WHERE organization_id = $1::uuid) AS shipments`,
+    [ids.organization, ids.faireIntegrationAccount],
+  )).rows[0]
+  const beforePlan = await durableCounts()
+  const plan = await persistence
+    .planCommerceCustomerPrefetchBindingInPostgres({
+      runtime,
+      externalCustomerId: retailerId,
+      customerGlobalId: customer.reference_code,
+      evidenceEmail,
+    })
+  assert.equal(plan.action, 'plan-customer-binding')
+  assert.equal(plan.customerGlobalId, customer.reference_code)
+  assert.equal(plan.customerName, customer.name)
+  assert.equal(plan.requiresConfirmation, true)
+  assert.equal(plan.providerReads, 0)
+  assert.equal(plan.providerWrites, 0)
+  assert.equal(plan.databaseWrites, 0)
+  assert.match(plan.planHash, /^[a-f0-9]{64}$/u)
+  assert.match(
+    plan.confirmationIdempotencyKey,
+    /^[a-f0-9]{8}-[a-f0-9]{4}-5[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u,
+  )
+  assert.notEqual(plan.evidenceEmailHash, hash(evidenceEmail))
+  assert.deepEqual(
+    await durableCounts(),
+    beforePlan,
+    'Binding review must not create any durable rows',
+  )
+  const boundaryPlan = await persistence
+    .planCommerceCustomerPrefetchBindingInPostgres({
+      runtime,
+      externalCustomerId: 'x'.repeat(512),
+      customerGlobalId: customer.reference_code,
+      evidenceEmail,
+    })
+  assert.equal(boundaryPlan.providerReads, 0)
+  assert.equal(boundaryPlan.databaseWrites, 0)
+
+  await pool.query(
+    `UPDATE crm_organizations
+     SET updated_at = updated_at + interval '1 second'
+     WHERE id = $1::uuid`,
+    [ids.customer],
+  )
+  await assert.rejects(
+    persistence.confirmCommerceCustomerPrefetchBindingInPostgres({
+      runtime,
+      actorEmail,
+      externalCustomerId: retailerId,
+      customerGlobalId: customer.reference_code,
+      evidenceEmail,
+      planHash: plan.planHash,
+      confirmed: true,
+    }),
+    (error) => error?.code === 'COMMERCE_CUSTOMER_PREFETCH_PLAN_STALE',
+  )
+  assert.deepEqual(
+    await durableCounts(),
+    beforePlan,
+    'A stale binding plan must roll back its command receipt',
+  )
+  const currentPlan = await persistence
+    .planCommerceCustomerPrefetchBindingInPostgres({
+      runtime,
+      externalCustomerId: retailerId,
+      customerGlobalId: customer.reference_code,
+      evidenceEmail,
+    })
+  const confirmed = await persistence
+    .confirmCommerceCustomerPrefetchBindingInPostgres({
+      runtime,
+      actorEmail,
+      externalCustomerId: retailerId,
+      customerGlobalId: customer.reference_code,
+      evidenceEmail,
+      planHash: currentPlan.planHash,
+      confirmed: true,
+    })
+  assert.equal(confirmed.bindingOutcome, 'created')
+  assert.equal(confirmed.identityWrites, 1)
+  assert.equal(confirmed.receiptWrites, 2)
+  assert.equal(confirmed.auditWrites, 1)
+  assert.equal(confirmed.databaseWrites, 4)
+  assert.equal(confirmed.providerReads, 0)
+  assert.equal(confirmed.providerWrites, 0)
+  assert.equal(confirmed.replayed, false)
+  const replay = await persistence
+    .confirmCommerceCustomerPrefetchBindingInPostgres({
+      runtime,
+      actorEmail,
+      externalCustomerId: retailerId,
+      customerGlobalId: customer.reference_code,
+      evidenceEmail,
+      planHash: currentPlan.planHash,
+      confirmed: true,
+    })
+  assert.equal(replay.replayed, true)
+
+  const evidence = (await pool.query(
+    `SELECT external_id.entity_global_id, external_id.external_id,
+            external_id.status, external_id.match_method,
+            external_id.match_evidence::text AS match_evidence,
+            receipt.status AS receipt_status,
+            receipt.attempts,
+            receipt.idempotency_key,
+            receipt.result_payload::text AS result_payload,
+            audit.payload::text AS audit_payload
+     FROM operations_external_identifiers external_id
+     JOIN operations_command_receipts receipt
+       ON receipt.organization_id = external_id.organization_id
+      AND receipt.command_type =
+          'commerce.intake.confirm_customer_prefetch_binding'
+     JOIN audit_events audit
+       ON audit.organization_id = external_id.organization_id
+      AND audit.event_type =
+          'commerce.intake.customer_identity.prebound'
+     WHERE external_id.organization_id = $1::uuid
+       AND external_id.integration_account_id = $2::uuid
+       AND external_id.entity_type = 'crm.organization'
+       AND external_id.external_id = $3`,
+    [ids.organization, ids.faireIntegrationAccount, retailerId],
+  )).rows[0]
+  assert.equal(evidence.entity_global_id, customer.reference_code)
+  assert.equal(evidence.external_id, retailerId)
+  assert.equal(evidence.status, 'active')
+  assert.equal(evidence.match_method, 'email')
+  assert.equal(evidence.receipt_status, 'succeeded')
+  assert.equal(evidence.attempts, 1)
+  assert.equal(
+    evidence.idempotency_key,
+    currentPlan.confirmationIdempotencyKey,
+  )
+  const redactedEvidence = [
+    evidence.match_evidence,
+    evidence.result_payload,
+    evidence.audit_payload,
+  ].join('\n')
+  assert.doesNotMatch(redactedEvidence, new RegExp(evidenceEmail, 'iu'))
+  assert.doesNotMatch(redactedEvidence, new RegExp(retailerId, 'iu'))
+  assert.match(redactedEvidence, new RegExp(currentPlan.evidenceEmailHash, 'u'))
+  const afterConfirm = await durableCounts()
+  assert.equal(afterConfirm.identities, beforePlan.identities + 1)
+  assert.equal(afterConfirm.receipts, beforePlan.receipts + 1)
+  assert.equal(afterConfirm.audits, beforePlan.audits + 1)
+  for (const field of [
+    'provider_attempts',
+    'intake_runs',
+    'orders',
+    'fulfillment_plans',
+    'shipments',
+  ]) assert.equal(afterConfirm[field], beforePlan[field])
+  assert.equal(counters.fetchCalls, 0)
+
+  const conflictingCustomer = (await pool.query(
+    `INSERT INTO crm_organizations (
+       pipeline_id, source_key, identity_key, name, relationship_type,
+       email, source_payload, source_hash, sync_status, created_by, updated_by
+     ) VALUES (
+       $1::uuid, 'commerce-prefetch-conflict-customer',
+       'customer:commerce-prefetch-conflict-customer',
+       'Conflicting customer', 'customer', 'other@example.com', '{}'::jsonb,
+       $2, 'synced', $3, $3
+     ) RETURNING reference_code`,
+    [ids.pipeline, hash('prefetch-conflict-customer'), actorEmail],
+  )).rows[0]
+  await pool.query(
+    `INSERT INTO operations_external_identifiers (
+       organization_id, integration_account_id, entity_type,
+       entity_global_id, external_id, status, match_method, match_evidence
+     ) VALUES (
+       $1::uuid, $2::uuid, 'crm.organization', $3, 'retailer-conflict',
+       'active', 'external_id', '{}'::jsonb
+     )`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      conflictingCustomer.reference_code,
+    ],
+  )
+  await assert.rejects(
+    persistence.planCommerceCustomerPrefetchBindingInPostgres({
+      runtime,
+      externalCustomerId: 'retailer-conflict',
+      customerGlobalId: customer.reference_code,
+      evidenceEmail,
+    }),
+    (error) => error?.code === 'COMMERCE_CUSTOMER_PREFETCH_IDENTITY_CONFLICT',
+  )
+  await pool.query(
+    `UPDATE crm_organizations
+     SET email = $2
+     WHERE pipeline_id = $1::uuid
+       AND reference_code = $3`,
+    [ids.pipeline, evidenceEmail, conflictingCustomer.reference_code],
+  )
+  await assert.rejects(
+    persistence.planCommerceCustomerPrefetchBindingInPostgres({
+      runtime,
+      externalCustomerId: 'retailer-ambiguous',
+      customerGlobalId: customer.reference_code,
+      evidenceEmail,
+    }),
+    (error) => error?.code === 'COMMERCE_CUSTOMER_PREFETCH_EMAIL_AMBIGUOUS',
+  )
 }
 
 async function verifyPromotionNumericScaleAcceptance(
@@ -1108,6 +1404,7 @@ async function verifyAcceptance(databaseUrl) {
     organization: randomUUID(),
     pipeline: randomUUID(),
     integrationAccount: randomUUID(),
+    faireIntegrationAccount: randomUUID(),
     customer: randomUUID(),
     product: randomUUID(),
     productMapping: randomUUID(),
@@ -1260,6 +1557,45 @@ async function verifyAcceptance(databaseUrl) {
     idempotencyKey: 'commerce-staging-postgres-intent-invalid',
     readIntentId: randomUUID(),
   }, 'COMMERCE_INTAKE_INTENT_INVALID')
+  const exactMismatchRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009204',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-postgres-exact-order-mismatch',
+    responseHash: hash('commerce-staging-exact-order-mismatch-response'),
+  }
+  const exactMissingOrderHash = hash(JSON.stringify(
+    'gid://shopify/Order/not-returned',
+  ))
+  const exactMismatchSeed = await pool.connect()
+  try {
+    await seedAdditionalCapturedRead(exactMismatchSeed, ids, {
+      ...exactMismatchRead,
+      redactedRequest: { targetHash: exactMissingOrderHash },
+    })
+  } finally {
+    exactMismatchSeed.release()
+  }
+  await expectPreStageRejection({
+    ...stageInput,
+    idempotencyKey: exactMismatchRead.idempotencyKey,
+    envelope: Object.freeze({
+      ...envelope,
+      sourceHash: hash('commerce-staging-exact-order-mismatch-envelope'),
+      products: Object.freeze([]),
+      orders: Object.freeze([envelope.orders[0]]),
+    }),
+    page: {
+      ...stageInput.page,
+      sessionId: exactMismatchRead.sessionId,
+      providerRowsSeen: 1,
+      eligibleOrdersSeen: 1,
+    },
+    readIntentId: exactMismatchRead.readIntentId,
+    capturedResponseHash: exactMismatchRead.responseHash,
+    exactExternalOrderIdHash: exactMissingOrderHash,
+  }, 'COMMERCE_INTAKE_EXACT_ORDER_TARGET_MISMATCH')
 
   counters.expectedImageStage = {
     idempotencyKey: ids.idempotencyKey,
@@ -1472,7 +1808,7 @@ async function verifyAcceptance(databaseUrl) {
     fulfillment_write_count: 0,
     shipment_write_count: 0,
     commerce_export_write_count: 0,
-    attempts: 1,
+    attempts: 2,
     cursors: 0,
   })
   const readEvidence = await pool.query(
@@ -1482,8 +1818,9 @@ async function verifyAcceptance(databaseUrl) {
        ON intent.organization_id = attempt.organization_id
       AND intent.integration_account_id = attempt.integration_account_id
       AND intent.provider_attempt_id = attempt.id
-     WHERE attempt.organization_id = $1`,
-    [ids.organization],
+     WHERE attempt.organization_id = $1
+       AND attempt.id = $2::uuid`,
+    [ids.organization, ids.providerAttempt],
   )
   assert.deepEqual(readEvidence.rows[0], {
     state: 'succeeded',
@@ -2358,6 +2695,7 @@ async function verifyAcceptance(databaseUrl) {
     4,
     'Only still-unresolved prior-run candidates belong in the backlog sweep',
   )
+  await verifyCustomerPrefetchBinding(pool, ids, persistence, counters)
   await pool.end()
 }
 
@@ -2397,7 +2735,7 @@ async function main() {
   console.log(
     'Commerce intake staging, scaled-whole zero-price promotion, fractional '
       + 'rollback, review-mode terminal catalog recovery, and policy-drift '
-      + 'recovery disposable-PostgreSQL '
+      + 'recovery, plus Faire customer pre-fetch binding disposable-PostgreSQL '
       + 'acceptance passed',
   )
 }

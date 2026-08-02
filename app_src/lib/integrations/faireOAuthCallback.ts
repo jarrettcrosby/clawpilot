@@ -5,8 +5,8 @@ const FAIRE_OAUTH_AUTHORIZATION_CODE_PARAMETER_NAMES = Object.freeze([
 ] as const)
 
 /**
- * Faire's live authorization response uses the OAuth-standard `code`
- * parameter, while earlier provider material used `authorizationCode`.
+ * OAuth authorization responses may use the standard `code` parameter,
+ * while earlier Faire provider material used `authorizationCode`.
  * Accept the bounded aliases, but fail closed when the callback supplies
  * conflicting values instead of guessing which credential to exchange.
  */

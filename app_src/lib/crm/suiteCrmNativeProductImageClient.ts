@@ -18,7 +18,10 @@ const MEDIA_EXTENSION: Record<string, string> = {
 
 type NativeProductImageRecord = Pick<
   SuiteCrmOutboxRecord,
-  'entity' | 'suiteCrmId' | 'productImage'
+  | 'entity'
+  | 'suiteCrmId'
+  | 'productImage'
+  | 'productImageProjectionRequired'
 >
 
 type GraphQlRecord = {
@@ -38,8 +41,99 @@ export type SuiteCrmNativeProductImageResult =
   | { action: 'attached'; mediaId: string }
   | { action: 'cleared'; mediaId: null }
 
-function nativeProductImageProjectionEnabled() {
-  return process.env.SUITECRM_NATIVE_PRODUCT_IMAGE_PROJECTION_ENABLED === '1'
+const SUITECRM_NATIVE_PRODUCT_IMAGE_REQUIRED_VARIABLES = Object.freeze([
+  'SUITECRM_BASE_URL',
+  'CLAWPILOT_PUBLIC_URL',
+  'SUITECRM_MEDIA_USERNAME',
+  'SUITECRM_MEDIA_PASSWORD',
+] as const)
+
+const SUITECRM_NATIVE_PRODUCT_IMAGE_OTHER_CREDENTIALS = Object.freeze([
+  'SUITECRM_ADMIN_USER',
+  'SUITECRM_ADMIN_USERNAME',
+  'SUITECRM_ADMIN_PASSWORD',
+  'SUITECRM_CLIENT_ID',
+  'SUITECRM_CLIENT_SECRET',
+  'SUITECRM_PRODUCT_IMAGE_READ_CLIENT_ID',
+  'SUITECRM_PRODUCT_IMAGE_READ_CLIENT_SECRET',
+  'SUITECRM_PRODUCT_IMAGE_READ_USERNAME',
+  'SUITECRM_PRODUCT_IMAGE_READ_PASSWORD',
+] as const)
+
+function comparableCredential(name: string, value: string) {
+  if (name.endsWith('_USERNAME') || name.endsWith('_USER')) {
+    return value.trim().toLowerCase()
+  }
+  return value
+}
+
+export function suiteCrmNativeProductImageProjectionConfiguration() {
+  const enabled =
+    process.env.SUITECRM_NATIVE_PRODUCT_IMAGE_PROJECTION_ENABLED === '1'
+  const missing = SUITECRM_NATIVE_PRODUCT_IMAGE_REQUIRED_VARIABLES.filter(
+    (name) => !String(process.env[name] ?? '').trim(),
+  )
+  const invalid: string[] = []
+  if (!missing.includes('SUITECRM_BASE_URL')) {
+    try {
+      suiteCrmNativeBaseUrl()
+    } catch {
+      invalid.push('SUITECRM_BASE_URL')
+    }
+  }
+  if (!missing.includes('CLAWPILOT_PUBLIC_URL')) {
+    try {
+      const publicUrl = new URL(String(process.env.CLAWPILOT_PUBLIC_URL || ''))
+      const local = publicUrl.hostname === 'localhost'
+        || publicUrl.hostname === '127.0.0.1'
+      if (
+        (publicUrl.protocol !== 'https:' && !(local && publicUrl.protocol === 'http:'))
+        || publicUrl.username
+        || publicUrl.password
+        || publicUrl.pathname !== '/'
+        || publicUrl.search
+        || publicUrl.hash
+      ) throw new Error('unsafe URL')
+    } catch {
+      invalid.push('CLAWPILOT_PUBLIC_URL')
+    }
+  }
+  for (const name of ['SUITECRM_MEDIA_USERNAME', 'SUITECRM_MEDIA_PASSWORD'] as const) {
+    if (missing.includes(name)) continue
+    try {
+      requiredMediaCredential(name)
+    } catch {
+      invalid.push(name)
+    }
+  }
+  const mediaCredentials = (
+    ['SUITECRM_MEDIA_USERNAME', 'SUITECRM_MEDIA_PASSWORD'] as const
+  ).map((name) => ({
+    name,
+    value: comparableCredential(name, String(process.env[name] ?? '')),
+  })).filter((entry) => entry.value.length > 0)
+  const otherCredentials = SUITECRM_NATIVE_PRODUCT_IMAGE_OTHER_CREDENTIALS
+    .map((name) => ({
+      name,
+      value: comparableCredential(name, String(process.env[name] ?? '')),
+    }))
+    .filter((entry) => entry.value.length > 0)
+  const credentialConflicts = mediaCredentials.flatMap((media) => (
+    otherCredentials
+      .filter((other) => media.value === other.value)
+      .map((other) => `${media.name}:${other.name}`)
+  ))
+  return {
+    enabled,
+    ready: missing.length === 0
+      && invalid.length === 0
+      && credentialConflicts.length === 0,
+    missing,
+    invalid,
+    credentialConflicts,
+    credentialSeparationVerified: missing.length === 0
+      && credentialConflicts.length === 0,
+  }
 }
 
 function suiteCrmNativeBaseUrl(value = process.env.SUITECRM_BASE_URL) {
@@ -486,8 +580,27 @@ export async function projectSuiteCrmNativeProductImage(
   if (record.productImage === undefined) {
     return { action: 'unchanged', mediaId: null }
   }
-  if (!nativeProductImageProjectionEnabled()) {
+  const configuration = suiteCrmNativeProductImageProjectionConfiguration()
+  if (!configuration.enabled) {
+    if (record.productImageProjectionRequired === true) {
+      throw new Error('SuiteCRM native Product image projection is required but disabled')
+    }
     return { action: 'disabled', mediaId: null }
+  }
+  if (!configuration.ready) {
+    if (
+      configuration.missing.includes('SUITECRM_MEDIA_USERNAME')
+      || configuration.invalid.includes('SUITECRM_MEDIA_USERNAME')
+    ) requiredMediaCredential('SUITECRM_MEDIA_USERNAME')
+    if (
+      configuration.missing.includes('SUITECRM_MEDIA_PASSWORD')
+      || configuration.invalid.includes('SUITECRM_MEDIA_PASSWORD')
+    ) requiredMediaCredential('SUITECRM_MEDIA_PASSWORD')
+    if (
+      configuration.missing.includes('SUITECRM_BASE_URL')
+      || configuration.invalid.includes('SUITECRM_BASE_URL')
+    ) suiteCrmNativeBaseUrl()
+    throw new Error('SuiteCRM native Product image projection configuration is incomplete or invalid')
   }
   const suiteCrmId = safeSuiteCrmId(record.suiteCrmId)
   const session = new SuiteCrmSession(suiteCrmNativeBaseUrl(), fetchImpl)

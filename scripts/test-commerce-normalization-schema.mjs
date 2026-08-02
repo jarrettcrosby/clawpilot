@@ -95,7 +95,7 @@ includesAllIn(shopifyNormalizer, [
   'shopifyProductSourceEvidence',
 ], 'Shopify product-image normalizer')
 includesAllIn(faireNormalizer, [
-  "'faire-commerce-normalizer-v6'",
+  "'faire-commerce-normalizer-v7'",
   'faireProductImages',
   'faireProductSourceEvidence',
   'optionalFaireSemanticText',

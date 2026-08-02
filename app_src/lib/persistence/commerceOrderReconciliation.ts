@@ -10,6 +10,8 @@ import {
 const ORDER_RECONCILIATION_INTERVAL = '30 minutes'
 const ORDER_RECONCILIATION_LEASE = '10 minutes'
 const WORKER_HEARTBEAT_KEY = 'commerce_order_reconciliation_worker_heartbeat'
+export const FAIRE_AUTO_PROMOTION_ATTENTION_CODE =
+  'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED'
 
 const ORDER_RECONCILIATION_TERMINAL_FAILURE_CODES = [
   'COMMERCE_ORDER_RECONCILIATION_SESSION_RECORD_BUDGET_EXCEEDED',
@@ -180,6 +182,7 @@ export async function readCommerceOrderReconciliationHealthFromPostgres() {
     running: string
     failed: string
     stale_processing: string
+    promotion_attention_required: string
     overdue: string
     resumable: string
     last_success_at: Date | string | null
@@ -205,6 +208,7 @@ export async function readCommerceOrderReconciliationHealthFromPostgres() {
      ),
      state AS (
        SELECT eligible.*, cursor.reconciliation_status,
+              cursor.last_error_code,
               cursor.last_started_at, cursor.last_completed_at
        FROM eligible
        LEFT JOIN operations_commerce_sync_cursors cursor
@@ -219,6 +223,9 @@ export async function readCommerceOrderReconciliationHealthFromPostgres() {
        count(*) FILTER (WHERE last_started_at IS NULL)::text AS never_run,
        count(*) FILTER (WHERE reconciliation_status = 'running')::text AS running,
        count(*) FILTER (WHERE reconciliation_status = 'failed')::text AS failed,
+       count(*) FILTER (
+         WHERE last_error_code = '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}'
+       )::text AS promotion_attention_required,
        count(*) FILTER (
          WHERE reconciliation_status = 'running'
            AND last_started_at < now() - interval '${ORDER_RECONCILIATION_LEASE}'
@@ -249,6 +256,9 @@ export async function readCommerceOrderReconciliationHealthFromPostgres() {
     neverRun: Number(row?.never_run || 0),
     running: Number(row?.running || 0),
     failed: Number(row?.failed || 0),
+    promotionAttentionRequired: Number(
+      row?.promotion_attention_required || 0,
+    ),
     staleProcessing: Number(row?.stale_processing || 0),
     overdue: Number(row?.overdue || 0),
     resumable: Number(row?.resumable || 0),
@@ -262,8 +272,9 @@ export async function readCommerceOrderReconciliationHealthFromPostgres() {
 /**
  * Claims only connections whose existing integration authorization already
  * covers an order read. The claim is a local lease; provider cursors are never
- * persisted here, and the worker stages held candidates only. The existing
- * encrypted continuation is referenced by run ID, never read or copied here.
+ * persisted here. Fresh, unambiguous Faire candidates may be promoted locally,
+ * while all provider/customer ambiguity remains held. The existing encrypted
+ * continuation is referenced by run ID, never read or copied here.
  */
 export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
   limit: number
@@ -457,7 +468,18 @@ export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
                  = operations_commerce_sync_cursors.integration_account_id
            LIMIT 1
          ),
-         last_error_code = NULL,
+         last_error_code = CASE
+           WHEN (
+             SELECT candidate.continuation_run_global_id
+             FROM candidates candidate
+             WHERE candidate.organization_id
+                   = operations_commerce_sync_cursors.organization_id
+               AND candidate.integration_account_id
+                   = operations_commerce_sync_cursors.integration_account_id
+             LIMIT 1
+           ) IS NULL THEN NULL
+           ELSE operations_commerce_sync_cursors.last_error_code
+         END,
          last_started_at = date_trunc('milliseconds', clock_timestamp()),
          updated_at = now()
        WHERE operations_commerce_sync_cursors.reconciliation_status <> 'running'
@@ -685,6 +707,10 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
   customersSkipped: unknown
   customerResolutionFailed: unknown
   customerResolutionFailureCodes: Record<string, number>
+  faireOrdersPromoted: unknown
+  faireOrdersHeld: unknown
+  fairePromotionFailed: unknown
+  fairePromotionFailureCodes: Record<string, number>
 }) {
   return withTransaction(async (client) => {
     const providerRecordsSeen = boundedCount(input.providerRecordsSeen)
@@ -698,20 +724,35 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
     const customerResolutionFailed = boundedCount(
       input.customerResolutionFailed,
     )
+    const faireOrdersPromoted = boundedCount(input.faireOrdersPromoted)
+    const faireOrdersHeld = boundedCount(input.faireOrdersHeld)
+    const fairePromotionFailed = boundedCount(input.fairePromotionFailed)
     const customerResolutionFailureCodes = Object.fromEntries(
       Object.entries(input.customerResolutionFailureCodes)
+        .filter(([code]) => /^[A-Z][A-Z0-9_]{2,127}$/u.test(code))
+        .map(([code, value]) => [code, boundedCount(value)]),
+    )
+    const fairePromotionFailureCodes = Object.fromEntries(
+      Object.entries(input.fairePromotionFailureCodes)
         .filter(([code]) => /^[A-Z][A-Z0-9_]{2,127}$/u.test(code))
         .map(([code, value]) => [code, boundedCount(value)]),
     )
     const completed = await client.query(
       `UPDATE operations_commerce_sync_cursors
        SET reconciliation_status = 'succeeded',
-           records_applied = records_applied,
+           records_applied = records_applied + $5::bigint,
            consecutive_failures = CASE
              WHEN $4::boolean THEN consecutive_failures
              ELSE 0
            END,
-           last_error_code = NULL,
+           last_error_code = CASE
+             WHEN $6::bigint > 0
+               THEN '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}'
+             WHEN $7::boolean
+               AND last_error_code = '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}'
+               THEN last_error_code
+             ELSE NULL
+           END,
            last_completed_at = now(),
            updated_at = now()
        WHERE organization_id = $1::uuid
@@ -725,6 +766,9 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
         input.target.integrationAccountId,
         input.target.startedAt,
         input.hasNextBatch,
+        faireOrdersPromoted,
+        fairePromotionFailed,
+        Boolean(input.target.continuationRunGlobalId),
       ],
     )
     if (completed.rowCount !== 1) return { leaseLost: true as const }
@@ -754,10 +798,17 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
           operatorReviewRequired:
             customersAmbiguous + customersSkipped + customerResolutionFailed,
         },
+        automaticFaireOrderPromotion: {
+          promoted: faireOrdersPromoted,
+          held: faireOrdersHeld,
+          failed: fairePromotionFailed,
+          failedByCode: fairePromotionFailureCodes,
+          operatorReviewRequired: faireOrdersHeld + fairePromotionFailed,
+        },
         resumed: Boolean(input.target.continuationRunGlobalId),
-        readOnly: true,
+        providerReadOnly: true,
         providerWrites: 0,
-        canonicalOrderWrites: 0,
+        canonicalOrderWrites: faireOrdersPromoted,
         inventoryWrites: 0,
       },
     }, client)
@@ -778,6 +829,7 @@ export async function readCommerceOrderReconciliationStateInPostgres(input: {
     const result = await client.query<{
       status: 'idle' | 'running' | 'succeeded' | 'failed' | null
       records_seen: string | number | null
+      records_applied: string | number | null
       records_held: string | number | null
       consecutive_failures: number | null
       last_error_code: string | null
@@ -788,6 +840,7 @@ export async function readCommerceOrderReconciliationStateInPostgres(input: {
       `SELECT
          cursor.reconciliation_status AS status,
          cursor.records_seen,
+         cursor.records_applied,
          cursor.records_held,
          cursor.consecutive_failures,
          cursor.last_error_code,
@@ -828,9 +881,14 @@ export async function readCommerceOrderReconciliationStateInPostgres(input: {
     return {
       status: row.status || 'idle',
       recordsSeen: boundedCount(row.records_seen),
-      recordsHeld: boundedCount(row.records_held),
+      recordsHeld: Math.max(
+        boundedCount(row.records_held) - boundedCount(row.records_applied),
+        0,
+      ),
       consecutiveFailures: boundedCount(row.consecutive_failures),
       lastErrorCode: row.last_error_code,
+      automaticPromotionAttentionRequired:
+        row.last_error_code === FAIRE_AUTO_PROMOTION_ATTENTION_CODE,
       lastStartedAt: row.last_started_at?.toISOString() || null,
       lastCompletedAt: row.last_completed_at?.toISOString() || null,
       resumable: row.resumable,
@@ -842,7 +900,7 @@ export async function readCommerceOrderReconciliationStateInPostgres(input: {
         )
       ),
       providerWrites: 0,
-      canonicalOrderWrites: 0,
+      canonicalOrderWrites: boundedCount(row.records_applied),
       inventoryWrites: 0,
     }
   })

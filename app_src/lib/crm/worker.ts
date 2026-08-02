@@ -1,4 +1,11 @@
-import { deleteSuiteCrmRecord, upsertSuiteCrmRecord, upsertSuiteCrmUserIdentity } from '@/lib/crm/suiteCrmClient'
+import {
+  deleteSuiteCrmRecord,
+  upsertSuiteCrmRecordWithResult,
+  upsertSuiteCrmUserIdentity,
+} from '@/lib/crm/suiteCrmClient'
+import type {
+  SuiteCrmNativeProductImageResult,
+} from '@/lib/crm/suiteCrmNativeProductImageClient'
 import {
   claimSuiteCrmOutboxInPostgres,
   completeSuiteCrmOutboxInPostgres,
@@ -18,6 +25,7 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
   for (const item of items) {
     try {
       if (!item.payload || item.payload.localId !== item.aggregateId) throw new Error('SuiteCRM outbox payload is invalid')
+      let productImageProjection: SuiteCrmNativeProductImageResult | null = null
       if (item.operation === 'upsert_user_identity') await upsertSuiteCrmUserIdentity(item.payload)
       else if (item.operation === 'delete_record') await deleteSuiteCrmRecord(item.payload)
       else if (item.operation === 'reproject_record') {
@@ -30,10 +38,20 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
             relationships: undefined,
           })
         }
-        if (item.payload.suiteCrmModule) await upsertSuiteCrmRecord(item.payload)
+        if (item.payload.suiteCrmModule) {
+          productImageProjection = (
+            await upsertSuiteCrmRecordWithResult(item.payload)
+          ).productImageProjection
+        }
       }
-      else await upsertSuiteCrmRecord(item.payload)
-      await completeSuiteCrmOutboxInPostgres(item)
+      else {
+        productImageProjection = (
+          await upsertSuiteCrmRecordWithResult(item.payload)
+        ).productImageProjection
+      }
+      await completeSuiteCrmOutboxInPostgres(item, {
+        productImageProjection,
+      })
       if (item.operation !== 'upsert_user_identity') projectedPipelines.set(item.payload.pipelineId, item.id)
       results.push({ id: item.id, status: 'succeeded' })
     } catch (error) {

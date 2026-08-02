@@ -53,9 +53,12 @@ function count(value: unknown) {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0
 }
 
-function assertReadOnly(command: Record<string, unknown>) {
+function assertReconciliationFence(command: Record<string, unknown>) {
   const automaticCustomerResolution = record(
     command.automaticCustomerResolution,
+  )
+  const automaticFaireOrderPromotion = record(
+    command.automaticFaireOrderPromotion,
   )
   if (
     command.providerWrites !== 0
@@ -69,8 +72,18 @@ function assertReadOnly(command: Record<string, unknown>) {
         || automaticCustomerResolution.syncCursorAdvanced !== false
       )
     )
+    || (
+      Object.keys(automaticFaireOrderPromotion).length > 0
+      && (
+        automaticFaireOrderPromotion.providerWrites !== 0
+        || automaticFaireOrderPromotion.inventoryWrites !== 0
+        || automaticFaireOrderPromotion.syncCursorAdvanced !== false
+        || count(automaticFaireOrderPromotion.canonicalOrderWrites)
+          !== count(automaticFaireOrderPromotion.promoted)
+      )
+    )
   ) {
-    const error = new Error('Commerce order reconciliation crossed a read-only fence') as Error & { code?: string }
+    const error = new Error('Commerce order reconciliation crossed its external-write fence') as Error & { code?: string }
     error.code = 'COMMERCE_ORDER_RECONCILIATION_WRITE_FENCE'
     throw error
   }
@@ -125,11 +138,12 @@ function reconciliationError(code: string, message: string) {
  * Follows the encrypted continuation chain within strict invocation and
  * session budgets. A bounded invocation stores its continuation for the next
  * poll; a session that is too large fails closed for operator review.
- * It deliberately stages held candidates and normalization rejections;
- * it never promotes canonical orders, derives packages or shipments, changes
- * inventory, or calls a provider write API. Exact source-line quantities remain
- * in the held candidate for later cartonization. Historical backfill and
- * continuation remain explicit workflows.
+ * It stages candidates and normalization rejections, then permits a bounded
+ * local-only Faire promotion for a newly observed order whose customer,
+ * provider variant/SKU, quantity, address, delivery, and packaging evidence is
+ * unambiguous. It never derives packages or shipments, changes inventory, or
+ * calls a provider write API. Existing held orders and any ambiguous/error
+ * candidates remain held for operator review.
  */
 export async function processCommerceOrderReconciliation(input: {
   limit?: number
@@ -149,6 +163,17 @@ export async function processCommerceOrderReconciliation(input: {
       providerWrites: 0,
       canonicalOrderWrites: 0,
       inventoryWrites: 0,
+      automaticFaireOrderPromotion: {
+        promoted: 0,
+        held: 0,
+        failed: 0,
+        failedByCode: {},
+        operatorReviewRequired: 0,
+        providerWrites: 0,
+        canonicalOrderWrites: 0,
+        inventoryWrites: 0,
+        syncCursorAdvanced: false,
+      },
       automaticCustomerResolution: {
         matched: 0,
         created: 0,
@@ -180,6 +205,10 @@ export async function processCommerceOrderReconciliation(input: {
   let customersAmbiguous = 0
   let customersSkipped = 0
   let customerResolutionFailed = 0
+  let faireOrdersPromoted = 0
+  let faireOrdersHeld = 0
+  let fairePromotionFailed = 0
+  const fairePromotionFailureCodes: Record<string, number> = {}
   const customerResolutionFailureCodes: Record<string, number> = {}
   const failureCodes: Record<string, number> = {}
   const clock = input.clock || Date.now
@@ -198,6 +227,10 @@ export async function processCommerceOrderReconciliation(input: {
       let targetCustomersAmbiguous = 0
       let targetCustomersSkipped = 0
       let targetCustomerResolutionFailed = 0
+      let targetFaireOrdersPromoted = 0
+      let targetFaireOrdersHeld = 0
+      let targetFairePromotionFailed = 0
+      const targetFairePromotionFailureCodes: Record<string, number> = {}
       const targetCustomerResolutionFailureCodes: Record<string, number> = {}
       let hasNextBatch = false
       let budgetStopReason: 'page' | 'records' | 'time' | null = null
@@ -273,6 +306,9 @@ export async function processCommerceOrderReconciliation(input: {
         const automaticCustomerResolution = record(
           command.automaticCustomerResolution,
         )
+        const automaticFaireOrderPromotion = record(
+          command.automaticFaireOrderPromotion,
+        )
         const pageProviderRecordsSeen = count(pagination.providerRowsSeen)
         targetProviderRecordsSeen += pageProviderRecordsSeen
         targetOrdersHeld += count(command.ordersStaged)
@@ -284,11 +320,27 @@ export async function processCommerceOrderReconciliation(input: {
         targetCustomerResolutionFailed += count(
           automaticCustomerResolution.failed,
         )
+        targetFaireOrdersPromoted += count(
+          automaticFaireOrderPromotion.promoted,
+        )
+        targetFaireOrdersHeld += count(automaticFaireOrderPromotion.held)
+        targetFairePromotionFailed += count(
+          automaticFaireOrderPromotion.failed,
+        )
         const failedByCode = record(automaticCustomerResolution.failedByCode)
         for (const [code, value] of Object.entries(failedByCode)) {
           if (!/^[A-Z][A-Z0-9_]{2,127}$/u.test(code)) continue
           targetCustomerResolutionFailureCodes[code] = (
             targetCustomerResolutionFailureCodes[code] || 0
+          ) + count(value)
+        }
+        const promotionFailedByCode = record(
+          automaticFaireOrderPromotion.failedByCode,
+        )
+        for (const [code, value] of Object.entries(promotionFailedByCode)) {
+          if (!/^[A-Z][A-Z0-9_]{2,127}$/u.test(code)) continue
+          targetFairePromotionFailureCodes[code] = (
+            targetFairePromotionFailureCodes[code] || 0
           ) + count(value)
         }
         targetPagesRead += 1
@@ -319,7 +371,7 @@ export async function processCommerceOrderReconciliation(input: {
           recordsHeld: projection.recordsHeld,
           continuationBatchNumber: projection.continuationBatchNumber,
         }
-        assertReadOnly(command)
+        assertReconciliationFence(command)
         if (pageProviderRecordsSeen > maximumNextPageRecords) {
           throw reconciliationError(
             'COMMERCE_ORDER_RECONCILIATION_PAGE_RECORD_LIMIT_EXCEEDED',
@@ -402,6 +454,10 @@ export async function processCommerceOrderReconciliation(input: {
         customersSkipped: targetCustomersSkipped,
         customerResolutionFailed: targetCustomerResolutionFailed,
         customerResolutionFailureCodes: targetCustomerResolutionFailureCodes,
+        faireOrdersPromoted: targetFaireOrdersPromoted,
+        faireOrdersHeld: targetFaireOrdersHeld,
+        fairePromotionFailed: targetFairePromotionFailed,
+        fairePromotionFailureCodes: targetFairePromotionFailureCodes,
       })
       if (completion.leaseLost) {
         leaseLost += 1
@@ -414,12 +470,23 @@ export async function processCommerceOrderReconciliation(input: {
         customersAmbiguous += targetCustomersAmbiguous
         customersSkipped += targetCustomersSkipped
         customerResolutionFailed += targetCustomerResolutionFailed
+        faireOrdersPromoted += targetFaireOrdersPromoted
+        faireOrdersHeld += targetFaireOrdersHeld
+        fairePromotionFailed += targetFairePromotionFailed
         for (
           const [code, value]
           of Object.entries(targetCustomerResolutionFailureCodes)
         ) {
           customerResolutionFailureCodes[code] = (
             customerResolutionFailureCodes[code] || 0
+          ) + value
+        }
+        for (
+          const [code, value]
+          of Object.entries(targetFairePromotionFailureCodes)
+        ) {
+          fairePromotionFailureCodes[code] = (
+            fairePromotionFailureCodes[code] || 0
           ) + value
         }
         if (hasNextBatch) resumable += 1
@@ -462,7 +529,7 @@ export async function processCommerceOrderReconciliation(input: {
     },
     resource: 'orders',
     providerWrites: 0,
-    canonicalOrderWrites: 0,
+    canonicalOrderWrites: faireOrdersPromoted,
     inventoryWrites: 0,
     automaticCustomerResolution: {
       matched: customersMatched,
@@ -474,6 +541,17 @@ export async function processCommerceOrderReconciliation(input: {
       operatorReviewRequired:
         customersAmbiguous + customersSkipped + customerResolutionFailed,
       providerWrites: 0,
+      syncCursorAdvanced: false,
+    },
+    automaticFaireOrderPromotion: {
+      promoted: faireOrdersPromoted,
+      held: faireOrdersHeld,
+      failed: fairePromotionFailed,
+      failedByCode: fairePromotionFailureCodes,
+      operatorReviewRequired: faireOrdersHeld + fairePromotionFailed,
+      providerWrites: 0,
+      canonicalOrderWrites: faireOrdersPromoted,
+      inventoryWrites: 0,
       syncCursorAdvanced: false,
     },
     failureCodes,

@@ -46,8 +46,18 @@ ClawPilot service:
 - `SUITECRM_NATIVE_PRODUCT_IMAGE_PROJECTION_ENABLED=1`, only after the native-media user and permissions below are ready
 - `SUITECRM_MEDIA_USERNAME`, for a dedicated non-admin native-media user
 - `SUITECRM_MEDIA_PASSWORD`, for that dedicated user
+- `SUITECRM_PRODUCT_IMAGE_REVERSE_INGESTION_ENABLED=1`, only after the separate read principal, client, and ACL attestation below are ready
+- `SUITECRM_PRODUCT_IMAGE_READ_CLIENT_ID` and `SUITECRM_PRODUCT_IMAGE_READ_CLIENT_SECRET`, for a dedicated read-only OAuth client
+- `SUITECRM_PRODUCT_IMAGE_READ_USERNAME` and `SUITECRM_PRODUCT_IMAGE_READ_PASSWORD`, for a dedicated read-only SuiteCRM user
+- `SUITECRM_PRODUCT_IMAGE_READ_ACL_ATTESTED=1`
+- `SUITECRM_PRODUCT_IMAGE_READ_ACL_ATTESTATION_VERSION=suitecrm-product-image-read-acl-v2`
+- `SUITECRM_PRODUCT_IMAGE_READ_ACL_ATTESTED_USERNAME`, exactly matching `SUITECRM_PRODUCT_IMAGE_READ_USERNAME`
+- `SUITECRM_PRODUCT_IMAGE_READ_ACL_ATTESTED_CLIENT_ID`, exactly matching `SUITECRM_PRODUCT_IMAGE_READ_CLIENT_ID`
+- `SUITECRM_PRODUCT_IMAGE_READ_ACL_ATTESTED_OAUTH_USERNAME`, exactly matching `SUITECRM_PRODUCT_IMAGE_READ_USERNAME`
 
-Credentials must remain Railway secrets. Native Product-image projection is disabled unless `SUITECRM_NATIVE_PRODUCT_IMAGE_PROJECTION_ENABLED` equals exactly `1`. While disabled, the existing content-addressed legacy Product image URL is still projected through V8 and SuiteCRM outbox rows do not require media credentials. When enabled, the media username must be an active SuiteCRM user with `ROLE_USER` plus AOS Products view/edit and image-upload access; it must not reuse `SUITECRM_ADMIN_USER`, `SUITECRM_ADMIN_PASSWORD`, the installer account, or OAuth client credentials. The enabled path fails closed rather than falling back to those broader credentials when media credentials are missing. The container hashes the OAuth client secret before upserting it into SuiteCRM and never prints the secret.
+Credentials must remain Railway secrets. Native Product-image projection is disabled unless `SUITECRM_NATIVE_PRODUCT_IMAGE_PROJECTION_ENABLED` equals exactly `1`. While disabled, the existing content-addressed legacy Product image URL is still projected through V8 and SuiteCRM outbox rows do not require media credentials. When enabled, the media username must be an active SuiteCRM user with `ROLE_USER` plus AOS Products view/edit and image-upload access; it must not reuse `SUITECRM_ADMIN_USER`, `SUITECRM_ADMIN_PASSWORD`, the installer account, OAuth client credentials, or the reverse-ingestion read credentials. The enabled path fails closed rather than falling back to those broader credentials when media credentials are missing or reused. `/api/health` reports native projection enablement, missing or invalid variables, credential conflicts, queue state, and the latest completed result including SuiteCRM's returned native media ID. The container hashes the OAuth client secret before upserting it into SuiteCRM and never prints the secret.
+
+Reverse Product-image ingestion is independently disabled unless `SUITECRM_PRODUCT_IMAGE_REVERSE_INGESTION_ENABLED` equals exactly `1`. Its dedicated OAuth client and SuiteCRM user may have only `list` and `view` on `AOS_Products`, view access to `clawpilot_image_c`, and view access to the private media object. Explicitly deny create, edit, delete, import, export, and mass-update. The read user/client/password/secret must differ from the administrator, general V8 client, and forward native-media credentials. After reviewing that ACL, bind the attestation variables to the exact username and client ID. Any missing value, stale attestation version, mismatched binding, or credential reuse makes the health readiness false and prevents the ingestion worker from reading SuiteCRM. The reverse worker writes only immutable ClawPilot observations, provenance, and snapshot fences; its database constraints keep `providerWrites=0`.
 
 ## Organization Hierarchy
 
@@ -87,9 +97,30 @@ ClawPilot Product projections include SuiteCRM's native `currency_id`. USD resol
 3. Create the SuiteCRM public Railway domain, set its exact HTTPS origin as `SUITECRM_PUBLIC_URL` on both services, and set the private service URL only as ClawPilot's `SUITECRM_BASE_URL`.
 4. Deploy and verify the public SuiteCRM root, private token endpoint, scheduler, Messenger logs, and persisted runtime override.
 5. Create the dedicated non-admin native-media user, grant only AOS Products view/edit and image-upload access, set `SUITECRM_MEDIA_USERNAME` and `SUITECRM_MEDIA_PASSWORD` on every ClawPilot runtime that can drain the SuiteCRM outbox, then explicitly set `SUITECRM_NATIVE_PRODUCT_IMAGE_PROJECTION_ENABLED=1`.
-6. Enable the remaining CRM variables on the ClawPilot development service and apply migration `0020_crm_gateway_and_reporting.sql`.
-7. Inspect and import the source workbook, drain the SuiteCRM and Google outboxes, then compare entity counts and pipeline totals before projecting the controlled workbook.
-8. Repeat in production only after development reconciliation succeeds.
+6. Create the separate Product-image reader and OAuth client, apply the exact read-only ACL described above, set and bind every `SUITECRM_PRODUCT_IMAGE_READ_*` attestation variable, then explicitly set `SUITECRM_PRODUCT_IMAGE_REVERSE_INGESTION_ENABLED=1`.
+7. Enable the remaining CRM variables on the ClawPilot development service and apply migration `0020_crm_gateway_and_reporting.sql`.
+8. Inspect and import the source workbook, drain the SuiteCRM and Google outboxes, then compare entity counts and pipeline totals before projecting the controlled workbook.
+9. Repeat in production only after development reconciliation succeeds.
+
+### Native Product-image activation and proof
+
+Enabling the forward native-media variables does not silently replay historical Product images. Queue one reviewed current primary image by permanent Product Global ID. The command is plan-first and binds approval to the exact Product, SuiteCRM record, asset revision, row version, and content SHA-256:
+
+```bash
+npm run crm:reproject-suitecrm-product-image -- --product gp0123456
+
+CLAWPILOT_SUITECRM_IMAGE_REPROJECT_ACTOR=owner@example.com \
+CLAWPILOT_SUITECRM_IMAGE_REPROJECT_CONFIRM='copy-the-exact-confirmation-from-the-plan' \
+npm run crm:reproject-suitecrm-product-image -- \
+  --product gp0123456 \
+  --apply
+```
+
+The apply path requires an active owner or administrator in the Product's organization. It reuses the content-addressed image outbox identity, never races a processing lease, and is idempotent when the same work is already queued or when a completed native result already identifies the same media. Its outbox payload marks native projection as required, so disabled or invalid native configuration fails the job instead of recording a false success. The operator queue event and system completion event preserve the exact image fence, outbox attempt, action, and returned native media ID. Neither command performs a commerce-provider write.
+
+After apply, let the normal SuiteCRM outbox poller drain the item. Check `/api/health` at `suiteCrmNativeProductImageProjection`: `status` must be `ready`, `dead` and `retrying` must be zero, and `latestResult.mediaId` must be a UUID with `action` equal to `attached` or `unchanged`. Open the same Product in native SuiteCRM and visually confirm the image. A rerun of the plan must report `alreadyProjected: true` for the same content hash.
+
+For the reverse proof, confirm `/api/health` at `suiteCrmProductImageIngestion` reports `enabled: true`, `ready: true`, a current `completed` heartbeat, and `providerWrites: 0`. Change the test Product image in native SuiteCRM, let `/api/crm/integrations/process` complete the bounded discover/verify sweep, and verify a new immutable observation and provenance row appears with `importedPrimary` or `importedSecondary` incremented. Re-reading an unchanged image must increment neither import count nor provider writes; a deterministic ClawPilot filename is echo-suppressed.
 
 After the Global ID metadata is live, refresh historical records and meeting subpanel links from each environment's ClawPilot service shell:
 
