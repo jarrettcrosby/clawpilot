@@ -132,6 +132,14 @@ function verifySourceContracts() {
     'isClawPilotCommerceCapabilityImplemented',
     'COMMERCE_ACTIVE_CAPABILITY_NOT_IMPLEMENTED',
     'requireImplementedCohort',
+    'lockShopifyCarrierServiceConfigurationWriters',
+    'registeredShopifyCarrierServiceRebindings',
+    'applyRegisteredShopifyCarrierServiceRebindings',
+    "writeCapabilities.includes('shipping_rate_callbacks')",
+    'operations_shopify_carrier_service_config_is_ready(',
+    "'COMMERCE_ACTIVE_SHOPIFY_CALLBACK_MUTATION_UNRESOLVED'",
+    'operations.shopify_carrier_service.activation_revision_rebound',
+    'callbackTokenRotations: 0',
     'commerceActiveCohortHash',
     'providerWrites: 0',
     'credentialDecryptions: 0',
@@ -153,6 +161,32 @@ function verifySourceContracts() {
     assert.ok(
       !persistence.includes(forbidden),
       `Commerce Active preparation must not access ${forbidden}`,
+    )
+  }
+  const rebindStart = persistence.indexOf(
+    'async function applyRegisteredShopifyCarrierServiceRebindings(',
+  )
+  const rebindEnd = persistence.indexOf(
+    'export async function consumeCommerceActiveTransitionAuthorizationInPostgres(',
+    rebindStart,
+  )
+  assert.ok(
+    rebindStart >= 0 && rebindEnd > rebindStart,
+    'Commerce Active CarrierService rebind boundary is invalid',
+  )
+  const rebind = persistence.slice(rebindStart, rebindEnd)
+  for (const forbiddenMutation of [
+    'SET service_gid =',
+    'SET callback_token_version =',
+    'SET callback_token_hash =',
+    'SET registered_service_name =',
+    'SET policy_snapshot =',
+    'SET warehouse_id =',
+  ]) {
+    assert.equal(
+      rebind.includes(forbiddenMutation),
+      false,
+      `Commerce Active rebind must not mutate ${forbiddenMutation}`,
     )
   }
 

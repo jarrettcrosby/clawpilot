@@ -578,6 +578,13 @@ export default function ShopifyCarrierServiceSetupPanel({
     && carrierAccounts.fedex_rest
   )
   const registered = setup?.config?.registrationState === 'registered'
+  const activeRevisionBindingRequired = Boolean(
+    registered
+    && setup?.reference.activation.state === 'active'
+    && setup.reference.activation.revision !== null
+    && setup.config?.activationRevision
+      !== setup.reference.activation.revision,
+  )
   const planRatePolicyEditable =
     setup?.reference.activation.state === 'shadow' && !busy
   const rateWarmPolicyEditable =
@@ -1805,6 +1812,36 @@ export default function ShopifyCarrierServiceSetupPanel({
         <Alert severity="info">
           Owner or authorized administrator permission is required to view the
           callback URL or change registration state.
+        </Alert>
+      ) : null}
+      {activeRevisionBindingRequired ? (
+        <Alert severity="error">
+          <Stack spacing={1}>
+            <Typography variant="body2">
+              ClawPilot checkout rates are paused because this registered
+              Shopify service is bound to an older Operations activation
+              revision. Refreshing authority preserves the exact Shopify
+              service, callback token, name, policy, warehouse, packages, and
+              carriers; it performs no Shopify write.
+            </Typography>
+            <Box>
+              <Button
+                size="small"
+                variant="contained"
+                color="error"
+                disabled={!setup?.canActivate || Boolean(busy)}
+                onClick={() => void run(
+                  'repair-activation-revision-binding',
+                  {},
+                  'Active checkout authority was refreshed locally with zero Shopify writes and no callback-token rotation.',
+                )}
+              >
+                {busy === 'repair-activation-revision-binding'
+                  ? 'Refreshing authority…'
+                  : 'Refresh Active checkout authority'}
+              </Button>
+            </Box>
+          </Stack>
         </Alert>
       ) : null}
       <IntegrationSetupJourney

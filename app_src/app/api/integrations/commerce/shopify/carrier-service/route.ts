@@ -52,6 +52,7 @@ import {
 import {
   finalizeShopifyCarrierServiceRegistrationInPostgres,
   readShopifyCarrierServiceConfigFromPostgres,
+  repairShopifyCarrierServiceActiveRevisionBindingInPostgres,
   shopifyCheckoutRatingHash,
   ShopifyCheckoutRatingPersistenceError,
   updateShopifyCarrierServiceBrandNameOverrideInPostgres,
@@ -1216,7 +1217,29 @@ export async function POST(req: NextRequest) {
       })
     }
 
-    if (action === 'save-config') {
+    if (action === 'repair-activation-revision-binding') {
+      requireActivator(context.capabilities.canActivate)
+      if (
+        !current.config
+        || current.config.registrationState !== 'registered'
+        || current.reference.activation.state !== 'active'
+        || current.reference.activation.revision === null
+      ) {
+        fail(
+          'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_NOT_REQUIRED',
+          'An exact registered Shopify CarrierService in Operations Active is required',
+          409,
+        )
+      }
+      await repairShopifyCarrierServiceActiveRevisionBindingInPostgres({
+        organizationId: context.organizationId,
+        accountGlobalId: accountId,
+        expectedRowVersion: current.config.rowVersion,
+        expectedActivationRevision:
+          current.reference.activation.revision,
+        actorEmail: context.actor.email,
+      })
+    } else if (action === 'save-config') {
       requireActivator(context.capabilities.canActivate)
       if (
         !current.account.configured

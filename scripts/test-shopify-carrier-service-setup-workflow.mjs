@@ -102,6 +102,7 @@ assert.equal(
 )
 
 const actions = [
+  ['repair-activation-revision-binding', 'save-config'],
   ['save-config', 'save-plan-rate-policy'],
   ['save-plan-rate-policy', 'save-name-preference'],
   ['save-name-preference', 'simulate-registration'],
@@ -129,6 +130,7 @@ const providerMutation = setupRoute.slice(
   providerMutationEnd,
 )
 for (const action of [
+  'repair-activation-revision-binding',
   'save-config',
   'save-plan-rate-policy',
   'save-rate-warm-policy',
@@ -143,6 +145,84 @@ for (const action of [
     `setup panel is not wired to the ${action} action`,
   )
 }
+
+const repairActivationRevision = actionBranch(
+  'repair-activation-revision-binding',
+  'save-config',
+)
+requireAll(repairActivationRevision, [
+  'requireActivator(context.capabilities.canActivate)',
+  "current.config.registrationState !== 'registered'",
+  "current.reference.activation.state !== 'active'",
+  'repairShopifyCarrierServiceActiveRevisionBindingInPostgres({',
+  'expectedRowVersion: current.config.rowVersion',
+  'current.reference.activation.revision',
+  'actorEmail: context.actor.email',
+], 'authenticated local Active callback repair')
+for (const forbiddenRepairEffect of [
+  'refreshShopifyIdentity()',
+  'testCommerceConnection({',
+  'shopifyCarrierServiceCallbackToken({',
+  'executeResourceScopedCarrierServiceMutation({',
+  'executeShopifyCarrierServiceRegistration({',
+  'upsertShopifyCarrierServiceConfigInPostgres({',
+]) {
+  assert.equal(
+    repairActivationRevision.includes(forbiddenRepairEffect),
+    false,
+    `Active callback repair must not use ${forbiddenRepairEffect}`,
+  )
+}
+
+const repairPersistenceStart = checkoutRatingPersistence.indexOf(
+  'export async function repairShopifyCarrierServiceActiveRevisionBindingInPostgres(',
+)
+const repairPersistenceEnd = checkoutRatingPersistence.indexOf(
+  'export async function upsertShopifyCarrierServiceConfigInPostgres(',
+  repairPersistenceStart,
+)
+assert.ok(
+  repairPersistenceStart >= 0 && repairPersistenceEnd > repairPersistenceStart,
+  'Active callback repair persistence boundary is invalid',
+)
+const repairPersistence = checkoutRatingPersistence.slice(
+  repairPersistenceStart,
+  repairPersistenceEnd,
+)
+requireAll(repairPersistence, [
+  'operations_commerce_active_capability_claim_is_current(',
+  "? 'shipping_rate_callbacks'",
+  'operations_shopify_carrier_service_config_is_ready(',
+  'activation_revision = $3',
+  'row_version = row_version + 1',
+  "'operations.shopify_carrier_service.activation_revision_rebound'",
+  'callbackTokenVersionRetained:',
+  'providerWrites: 0',
+  'callbackTokenRotations: 0',
+], 'transition-proven local Active callback repair persistence')
+for (const forbiddenRepairMutation of [
+  'SET service_gid =',
+  'SET callback_token_version =',
+  'SET callback_token_hash =',
+  'SET registered_service_name =',
+  'SET policy_snapshot =',
+  'SET warehouse_id =',
+  'fetch(',
+]) {
+  assert.equal(
+    repairPersistence.includes(forbiddenRepairMutation),
+    false,
+    `Active callback repair must not mutate or call ${forbiddenRepairMutation}`,
+  )
+}
+requireAll(setupPanel, [
+  'const activeRevisionBindingRequired = Boolean(',
+  "setup?.reference.activation.state === 'active'",
+  'setup.config?.activationRevision',
+  "'repair-activation-revision-binding'",
+  'Refresh Active checkout authority',
+  'it performs no Shopify write',
+], 'fail-closed Active callback repair UI')
 
 const saveConfig = actionBranch('save-config', 'save-plan-rate-policy')
 requireAll(saveConfig, [

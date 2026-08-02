@@ -2438,11 +2438,365 @@ export async function updateShopifyCarrierServiceBrandNameOverrideInPostgres(
   })
 }
 
+/**
+ * Repair only the local activation-revision fence for a registered Shopify
+ * CarrierService after an exact, immutable Shadow-to-Active transition. No
+ * Shopify request or callback-token rotation occurs in this transaction.
+ */
+export async function repairShopifyCarrierServiceActiveRevisionBindingInPostgres(
+  rawInput: {
+    organizationId: string
+    accountGlobalId: string
+    expectedRowVersion: number
+    expectedActivationRevision: number
+    actorEmail: string
+  },
+) {
+  const input = {
+    organizationId: matchValue(
+      rawInput.organizationId,
+      UUID,
+      'Organization ID',
+    ),
+    accountGlobalId: matchValue(
+      rawInput.accountGlobalId,
+      ACCOUNT_GLOBAL_ID,
+      'Shopify account Global ID',
+    ),
+    expectedRowVersion: integer(
+      rawInput.expectedRowVersion,
+      'Configuration row version',
+      0,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    expectedActivationRevision: integer(
+      rawInput.expectedActivationRevision,
+      'Active Operations revision',
+      1,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    actorEmail: textValue(rawInput.actorEmail, 'Actor email', 320),
+  }
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      'commerce-active-transition:' + input.organizationId,
+    )
+    const identity = await client.query<{ id: string }>(
+      `SELECT config.id::text
+       FROM operations_shopify_carrier_service_configs config
+       JOIN operations_integration_accounts account
+         ON account.organization_id = config.organization_id
+        AND account.id = config.integration_account_id
+       WHERE config.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND account.integration_type = 'commerce'
+         AND account.provider = 'shopify'`,
+      [input.organizationId, input.accountGlobalId],
+    )
+    if (!identity.rows[0]) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_CONFIG_NOT_FOUND',
+        'Registered Shopify CarrierService configuration was not found',
+        404,
+      )
+    }
+    await acquireTransactionAdvisoryLock(
+      client,
+      'shopify-carrier-service-authorization:'
+        + input.organizationId + ':' + identity.rows[0].id,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      'shopify-carrier-service-config:'
+        + input.organizationId + ':' + input.accountGlobalId,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      'shopify-carrier-service-config-mutation:'
+        + input.organizationId + ':' + input.accountGlobalId,
+    )
+    const facts = await client.query<{
+      config_id: string
+      config_global_id: string
+      integration_account_id: string
+      registration_state: ShopifyCarrierServiceRegistrationState
+      service_gid: string | null
+      credential_generation: number
+      config_activation_revision: number
+      callback_token_version: number
+      row_version: string
+      account_environment: string
+      account_status: string
+      account_credential_generation: number
+      credential_version: number | null
+      verification_status: string | null
+      activation_state: string
+      activation_revision: number
+      callback_ready: boolean
+    }>(
+      `SELECT
+         config.id::text AS config_id,
+         config.global_id AS config_global_id,
+         config.integration_account_id::text,
+         config.registration_state,
+         config.service_gid,
+         config.credential_generation,
+         config.activation_revision AS config_activation_revision,
+         config.callback_token_version,
+         config.row_version::text,
+         account.environment AS account_environment,
+         account.status AS account_status,
+         account.commerce_credential_generation
+           AS account_credential_generation,
+         credential.credential_version,
+         credential.verification_status,
+         activation.state AS activation_state,
+         activation.revision AS activation_revision,
+         operations_shopify_carrier_service_config_is_ready(
+           config.organization_id,
+           config.id
+         ) AS callback_ready
+       FROM operations_shopify_carrier_service_configs config
+       JOIN operations_integration_accounts account
+         ON account.organization_id = config.organization_id
+        AND account.id = config.integration_account_id
+       JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+       JOIN operations_activation_scopes activation
+         ON activation.organization_id = config.organization_id
+       WHERE config.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND account.integration_type = 'commerce'
+         AND account.provider = 'shopify'
+       FOR UPDATE OF config, account, credential, activation`,
+      [input.organizationId, input.accountGlobalId],
+    )
+    const current = facts.rows[0]
+    if (!current) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_CONFIG_NOT_FOUND',
+        'Registered Shopify CarrierService configuration was not found',
+        404,
+      )
+    }
+    if (Number(current.row_version) !== input.expectedRowVersion) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_VERSION_CONFLICT',
+        'CarrierService configuration changed. Refresh and try again.',
+        409,
+      )
+    }
+    if (
+      current.activation_state !== 'active'
+      || current.activation_revision !== input.expectedActivationRevision
+    ) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_ACTIVATION_DRIFT',
+        'Operations Active authority changed. Refresh and review the current state.',
+        409,
+      )
+    }
+    if (
+      current.registration_state !== 'registered'
+      || !current.service_gid
+      || !SHOPIFY_SERVICE_GID.test(current.service_gid)
+      || current.account_environment !== 'sandbox'
+      || current.account_status !== 'active'
+      || current.verification_status !== 'verified'
+      || current.credential_generation
+        !== current.account_credential_generation
+      || current.credential_generation !== current.credential_version
+    ) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_NOT_ELIGIBLE',
+        'The exact registered and verified Shopify CarrierService is not eligible for a local authority repair',
+        409,
+      )
+    }
+    if (
+      current.config_activation_revision === current.activation_revision
+    ) {
+      if (current.callback_ready !== true) {
+        fail(
+          'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_READINESS_FAILED',
+          'The Shopify CarrierService has another callback-readiness error',
+          409,
+        )
+      }
+      return readConfigWithClient(client, input)
+    }
+    const sourceTransition = await client.query<{
+      global_id: string
+    }>(
+      `SELECT transition.global_id
+       FROM operations_commerce_active_transitions transition
+       JOIN operations_commerce_active_transition_preparations prepared
+         ON prepared.organization_id = transition.organization_id
+        AND prepared.id = transition.preparation_id
+       CROSS JOIN LATERAL jsonb_array_elements(prepared.cohort)
+         AS cohort(member)
+       WHERE transition.organization_id = $1::uuid
+         AND transition.from_activation_state = 'shadow'
+         AND transition.to_activation_state = 'active'
+         AND transition.from_activation_revision = $2
+         AND transition.to_activation_revision = $3
+         AND (cohort.member->>'accountId')::uuid = $4::uuid
+         AND cohort.member->>'accountGlobalId' = $5
+         AND cohort.member->>'provider' = 'shopify'
+         AND (cohort.member->>'credentialGeneration')::integer = $6
+         AND cohort.member->'writeCapabilities'
+           ? 'shipping_rate_callbacks'
+         AND operations_commerce_active_capability_claim_is_current(
+           transition.organization_id,
+           transition.id,
+           $5,
+           'shipping_rate_callbacks'
+         )
+       ORDER BY transition.activated_at DESC
+       LIMIT 1`,
+      [
+        input.organizationId,
+        current.config_activation_revision,
+        current.activation_revision,
+        current.integration_account_id,
+        input.accountGlobalId,
+        current.credential_generation,
+      ],
+    )
+    const transition = sourceTransition.rows[0]
+    if (!transition) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_TRANSITION_REQUIRED',
+        'No exact current Active transition authorizes this Shopify callback revision repair',
+        409,
+      )
+    }
+    const unsafeAuthorization = await client.query<{ global_id: string }>(
+      `SELECT authorized_mutation.global_id
+       FROM operations_shopify_carrier_service_mutation_authorizations
+         authorized_mutation
+       LEFT JOIN operations_shopify_carrier_service_mutation_attempts attempt
+         ON attempt.organization_id = authorized_mutation.organization_id
+        AND attempt.authorization_id = authorized_mutation.id
+       LEFT JOIN operations_shopify_carrier_service_mutation_outcomes outcome
+         ON outcome.organization_id = attempt.organization_id
+        AND outcome.attempt_id = attempt.id
+       LEFT JOIN operations_shopify_carrier_service_mutation_resolutions
+         resolution
+         ON resolution.organization_id = attempt.organization_id
+        AND resolution.attempt_id = attempt.id
+       WHERE authorized_mutation.organization_id = $1::uuid
+         AND authorized_mutation.config_id = $2::uuid
+         AND authorized_mutation.config_row_version = $3::bigint
+         AND (
+           (
+             outcome.outcome = 'failed'
+             AND outcome.provider_write_count = 0
+           )
+           OR resolution.disposition = 'confirmed_not_applied'
+           OR (
+             attempt.id IS NULL
+             AND authorized_mutation.expires_at <= now()
+           )
+         ) IS NOT TRUE
+       LIMIT 1`,
+      [input.organizationId, current.config_id, current.row_version],
+    )
+    if (unsafeAuthorization.rows[0]) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_MUTATION_UNRESOLVED',
+        'Resolve the current Shopify CarrierService provider mutation before repairing Active callback authority',
+        409,
+      )
+    }
+    const updated = await client.query<{
+      activation_revision: number
+      row_version: string
+    }>(
+      `UPDATE operations_shopify_carrier_service_configs
+       SET activation_revision = $3,
+           row_version = row_version + 1,
+           updated_by = $4,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND registration_state = 'registered'
+         AND service_gid = $5
+         AND credential_generation = $6
+         AND activation_revision = $7
+         AND callback_token_version = $8
+         AND row_version = $9::bigint
+       RETURNING activation_revision, row_version::text`,
+      [
+        input.organizationId,
+        current.config_id,
+        current.activation_revision,
+        input.actorEmail,
+        current.service_gid,
+        current.credential_generation,
+        current.config_activation_revision,
+        current.callback_token_version,
+        input.expectedRowVersion,
+      ],
+    )
+    if (
+      updated.rows[0]?.activation_revision !== current.activation_revision
+      || Number(updated.rows[0]?.row_version) !== input.expectedRowVersion + 1
+    ) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_VERSION_CONFLICT',
+        'CarrierService configuration changed during Active authority repair',
+        409,
+      )
+    }
+    const rebound = await readConfigWithClient(client, input)
+    if (!rebound?.ready) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_READINESS_FAILED',
+        'The Shopify CarrierService did not become callback-ready after its local authority repair',
+        409,
+      )
+    }
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType:
+        'operations.shopify_carrier_service.activation_revision_rebound',
+      aggregateType: 'operations.shopify_carrier_service_config',
+      aggregateId: current.config_global_id,
+      subject: input.accountGlobalId,
+      organizationId: input.organizationId,
+      eventKey:
+        'operations:shopify-carrier-service:' + current.config_global_id
+        + ':active-revision:' + current.activation_revision,
+      payload: {
+        transitionGlobalId: transition.global_id,
+        accountGlobalId: input.accountGlobalId,
+        serviceGid: current.service_gid,
+        fromActivationRevision: current.config_activation_revision,
+        activationRevision: current.activation_revision,
+        fromRowVersion: input.expectedRowVersion,
+        rowVersion: rebound.rowVersion,
+        callbackTokenVersionRetained: current.callback_token_version,
+        providerWrites: 0,
+        callbackTokenRotations: 0,
+        repair: true,
+      },
+    }, client)
+    return rebound
+  })
+}
+
 export async function upsertShopifyCarrierServiceConfigInPostgres(
   rawInput: ShopifyCarrierServiceConfigWriteInput,
 ) {
   const input = normalizeShopifyCarrierServiceConfigInput(rawInput)
   return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `commerce-active-transition:${input.organizationId}`,
+    )
     await acquireTransactionAdvisoryLock(
       client,
       `shopify-carrier-service-config:${input.organizationId}:${input.accountGlobalId}`,
