@@ -310,6 +310,10 @@ await client.updateInventory({
     sku: 'TEST-SKU-1',
     productVariantId: 'po_variant123',
     onHandQuantity: -3,
+  }, {
+    sku: 'TEST-SKU-2',
+    productVariantId: 'po_variant456',
+    onHandQuantity: 7,
   }],
 })
 const skuInventoryPatch = requests.find((request) => (
@@ -326,11 +330,15 @@ assert.deepEqual(JSON.parse(JSON.stringify(skuInventoryPatch.body)), {
     sku: 'TEST-SKU-1',
     product_variant_id: 'po_variant123',
     on_hand_quantity: -3,
+  }, {
+    sku: 'TEST-SKU-2',
+    product_variant_id: 'po_variant456',
+    on_hand_quantity: 7,
   }],
 })
 assert.equal(
   requests[requests.indexOf(skuInventoryPatch) + 1].url,
-  'https://www.faire.com/external-api/v2/product-inventory/by-skus?skus=TEST-SKU-1',
+  'https://www.faire.com/external-api/v2/product-inventory/by-skus?skus=TEST-SKU-1&skus=TEST-SKU-2',
   'inventory must be read back by the exact requested SKU',
 )
 
@@ -340,6 +348,10 @@ await client.updateInventory({
     productVariantId: 'po_variant123',
     sku: 'TEST-SKU-1',
     onHandQuantity: 0,
+  }, {
+    productVariantId: 'po_variant456',
+    sku: 'TEST-SKU-2',
+    onHandQuantity: 11,
   }],
 })
 const variantInventoryPatch = requests.find((request) => (
@@ -349,7 +361,7 @@ const variantInventoryPatch = requests.find((request) => (
 assert.ok(variantInventoryPatch)
 assert.equal(
   requests[requests.indexOf(variantInventoryPatch) + 1].url,
-  'https://www.faire.com/external-api/v2/product-inventory/by-product-variant-ids?ids=po_variant123',
+  'https://www.faire.com/external-api/v2/product-inventory/by-product-variant-ids?ids=po_variant123&ids=po_variant456',
 )
 
 await client.moveOrderToProcessing('bo_order123')
@@ -472,6 +484,96 @@ await assert.rejects(
   }),
   (error) => error?.code === 'FAIRE_INVENTORY_READBACK_MISMATCH',
 )
+
+const readiness = load(
+  'app_src/lib/integrations/faireFulfillmentReadiness.ts',
+)
+const readinessInput = {
+  authMode: 'faire_oauth',
+  environment: 'production',
+  status: 'active',
+  configured: true,
+  verificationStatus: 'verified',
+  externalIdentityMatches: true,
+  credentialGenerationMatches: true,
+  scopeEvidenceRecorded: false,
+  scopeEvidenceCurrent: false,
+  scopeVerificationSource: 'not_exposed_by_provider',
+  currentCapabilities: [],
+}
+const brandTokenReadiness = readiness.faireFulfillmentWriteReadiness({
+  ...readinessInput,
+  authMode: 'faire_brand_token',
+})
+assert.equal(brandTokenReadiness.ready, false)
+assert.equal(
+  brandTokenReadiness.blockedBy.code,
+  'FAIRE_FULFILLMENT_OAUTH_REQUIRED',
+)
+assert.equal(brandTokenReadiness.providerWrites, 0)
+
+const missingEvidenceReadiness = readiness
+  .faireFulfillmentWriteReadiness(readinessInput)
+assert.equal(missingEvidenceReadiness.ready, false)
+assert.equal(
+  missingEvidenceReadiness.blockedBy.code,
+  'FAIRE_FULFILLMENT_SCOPE_EVIDENCE_UNAVAILABLE',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(missingEvidenceReadiness.requiredScopes)),
+  ['READ_BRAND', 'READ_ORDERS', 'READ_SHIPMENTS', 'WRITE_ORDERS'],
+)
+
+const staleEvidenceReadiness = readiness.faireFulfillmentWriteReadiness({
+  ...readinessInput,
+  scopeEvidenceRecorded: true,
+})
+assert.equal(
+  staleEvidenceReadiness.blockedBy.code,
+  'FAIRE_FULFILLMENT_SCOPE_EVIDENCE_STALE',
+)
+
+const staleBindingReadiness = readiness.faireFulfillmentWriteReadiness({
+  ...readinessInput,
+  externalIdentityMatches: false,
+})
+assert.equal(
+  staleBindingReadiness.blockedBy.code,
+  'FAIRE_FULFILLMENT_CREDENTIAL_BINDING_MISMATCH',
+)
+assert.equal(staleBindingReadiness.credentialBinding.current, false)
+
+const missingClaimsReadiness = readiness.faireFulfillmentWriteReadiness({
+  ...readinessInput,
+  scopeEvidenceRecorded: true,
+  scopeEvidenceCurrent: true,
+  scopeVerificationSource: 'oauth_grant',
+  currentCapabilities: ['fulfillment_export'],
+})
+assert.equal(
+  missingClaimsReadiness.blockedBy.code,
+  'FAIRE_FULFILLMENT_ACTIVE_CAPABILITIES_REQUIRED',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(missingClaimsReadiness.activeCapabilities.missing)),
+  ['order_update', 'tracking_export'],
+)
+
+const readyFulfillment = readiness.faireFulfillmentWriteReadiness({
+  ...readinessInput,
+  scopeEvidenceRecorded: true,
+  scopeEvidenceCurrent: true,
+  scopeVerificationSource: 'oauth_grant',
+  currentCapabilities: [
+    'tracking_export',
+    'order_update',
+    'fulfillment_export',
+  ],
+})
+assert.equal(readyFulfillment.ready, true)
+assert.equal(readyFulfillment.blockedBy, null)
+assert.equal(readyFulfillment.credentialBinding.current, true)
+assert.equal(readyFulfillment.providerWrites, 0)
 
 const writeback = load(
   'app_src/lib/integrations/faireFulfillmentWriteback.ts',

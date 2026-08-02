@@ -200,6 +200,24 @@ includes(persistence, [
   'AND state_hash = $4',
   'AND expires_at > now()',
 ], 'Commerce persistence')
+includes(persistence, [
+  'fulfillmentWriteReadiness',
+  'operations_faire_fulfillment_scope_evidence_is_current',
+  'operations_commerce_active_capability_claim_is_current',
+  'scope_evidence_recorded',
+], 'Faire fulfillment readiness persistence')
+const faireFulfillmentReadiness = read(
+  'app_src/lib/integrations/faireFulfillmentReadiness.ts',
+)
+includes(faireFulfillmentReadiness, [
+  'FAIRE_FULFILLMENT_REQUIRED_OAUTH_SCOPES',
+  "'READ_BRAND'",
+  "'READ_ORDERS'",
+  "'READ_SHIPMENTS'",
+  "'WRITE_ORDERS'",
+  'requested scopes cannot authorize writes',
+  'providerWrites: 0',
+], 'Faire fulfillment readiness diagnostic')
 const commerceEnablePersistence = persistence.slice(
   persistence.indexOf(
     'export async function setCommerceIntegrationEnabledInPostgres',
@@ -645,6 +663,12 @@ includes(panel, [
   "account.authMode !== 'faire_brand_token'",
   'Faire generated API keys are encrypted and',
   'inputProps={{ maxLength: 4096 }}',
+  'Faire fulfillment writes',
+  "account.provider === 'shopify' ? (",
+  "account.provider === 'faire' && fulfillmentReadiness",
+  'Shopify manages customer notifications for this connection',
+  'Required OAuth scopes:',
+  'diagnostic provider writes: 0',
   'useRef(integrations.organizationId)',
   'payload.integrations.organizationId',
   '!== organizationIdRef.current',
@@ -1452,7 +1476,7 @@ assert.equal(
   'faire-brand-token-1234567890',
 )
 const faireInventory = await faireApi.listInventory({
-  productVariantIds: ['product_variant_123'],
+  productVariantIds: ['product_variant_123', 'product_variant_456'],
 })
 assert.deepEqual(
   JSON.parse(JSON.stringify(
@@ -1462,7 +1486,7 @@ assert.deepEqual(
 )
 assert.equal(
   faireRequests[1].url,
-  'https://www.faire.com/external-api/v2/product-inventory/by-product-variant-ids?ids=product_variant_123',
+  'https://www.faire.com/external-api/v2/product-inventory/by-product-variant-ids?ids=product_variant_123&ids=product_variant_456',
 )
 const faireOrder = await faireApi.getOrder('order_123')
 assert.equal(faireOrder.id, 'order_123')

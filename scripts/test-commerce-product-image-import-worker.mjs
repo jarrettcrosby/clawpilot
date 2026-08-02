@@ -331,6 +331,33 @@ test('transport timeout is retried with a bounded durable delay', async () => {
   assert.ok(!JSON.stringify(result).includes(SOURCE_SECRET))
 })
 
+test('transient database conflicts use one sanitized retryable code', async () => {
+  for (const databaseCode of ['40P01', '40001']) {
+    const run = fixture({
+      completeError: codedError(databaseCode, undefined, SOURCE_SECRET),
+    })
+    const result = await worker.processCommerceProductImageImports(
+      { workerId: 'image-worker-test' },
+      run.dependencies,
+    )
+
+    assert.equal(result.retried, 1)
+    assert.equal(result.dead, 0)
+    assert.equal(run.state.failures[0].retryable, true)
+    assert.equal(run.state.failures[0].retryAfterSeconds, 30)
+    assert.equal(
+      run.state.failures[0].errorCode,
+      'COMMERCE_PRODUCT_IMAGE_DATABASE_RETRYABLE',
+    )
+    assert.equal(
+      result.errorCodes.COMMERCE_PRODUCT_IMAGE_DATABASE_RETRYABLE,
+      1,
+    )
+    assert.ok(!JSON.stringify(result).includes(databaseCode))
+    assert.ok(!JSON.stringify(result).includes(SOURCE_SECRET))
+  }
+})
+
 test('invalid image content is permanently dead', async () => {
   const run = fixture({
     fetchError: codedError(

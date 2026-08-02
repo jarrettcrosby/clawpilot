@@ -114,6 +114,30 @@ type CommerceAccount = {
     deadLetterAttempts: number
     lastAttemptAt: string | null
   }
+  fulfillmentWriteReadiness: {
+    ready: boolean
+    authMode: string | null
+    requiredAuthMode: 'faire_oauth'
+    requiredScopes: string[]
+    credentialBinding: {
+      current: boolean
+    }
+    providerScopeEvidence: {
+      recordedForCredentialGeneration: boolean
+      current: boolean
+      verificationSource: string | null
+    }
+    activeCapabilities: {
+      required: string[]
+      current: string[]
+      missing: string[]
+    }
+    blockedBy: {
+      code: string
+      message: string
+    } | null
+    providerWrites: 0
+  } | null
   webhookUrl: string | null
   updatedAt: string
 }
@@ -1764,6 +1788,8 @@ export default function CommerceIntegrationPanel() {
               )
               const notificationPending = pendingAction
                 === `fulfillment-notifications:${account.globalId}`
+              const fulfillmentReadiness =
+                account.fulfillmentWriteReadiness
               return (
                 <Card key={account.globalId} variant="outlined">
                   <CardContent>
@@ -1865,8 +1891,8 @@ export default function CommerceIntegrationPanel() {
                         <Typography variant="subtitle2" fontWeight={700}>
                           Fulfillment &amp; tracking
                         </Typography>
-                        {account.provider === 'shopify'
-                          && notificationPolicy.mode === 'clawpilot_explicit' ? (
+                        {account.provider === 'shopify' ? (
+                          notificationPolicy.mode === 'clawpilot_explicit' ? (
                             <Stack spacing={1.25} sx={{ mt: 1 }}>
                               <Alert severity={notificationDefault ? 'warning' : 'info'}>
                                 Customer notifications are an explicit Shopify-account default.
@@ -1968,11 +1994,60 @@ export default function CommerceIntegrationPanel() {
                             </Stack>
                           ) : (
                             <Alert severity="info" sx={{ mt: 1 }}>
-                              Faire manages retailer notifications after shipment and tracking are
-                              submitted. ClawPilot therefore does not expose a notification toggle;
-                              fulfillment export readiness is tracked separately.
+                              Shopify manages customer notifications for this connection;
+                              ClawPilot exposes no notification override.
                             </Alert>
-                          )}
+                          )
+                        ) : account.provider === 'faire' && fulfillmentReadiness ? (
+                            <Alert
+                              severity={fulfillmentReadiness.ready
+                                ? 'success'
+                                : 'warning'}
+                              sx={{ mt: 1 }}
+                            >
+                              <Typography variant="body2" fontWeight={700}>
+                                Faire fulfillment writes · {fulfillmentReadiness.ready
+                                  ? 'ready'
+                                  : 'blocked'}
+                              </Typography>
+                              <Typography variant="body2">
+                                {fulfillmentReadiness.blockedBy?.message
+                                  || 'Exact OAuth, scope evidence, credential binding, and Active capability claims are current.'}
+                              </Typography>
+                              <Typography variant="caption" display="block" sx={{ mt: 0.5 }}>
+                                Auth: {fulfillmentReadiness.authMode || 'not configured'}
+                                {' · '}binding: {fulfillmentReadiness.credentialBinding.current
+                                  ? 'current'
+                                  : 'not current'}
+                                {' · '}provider scope evidence: {
+                                  fulfillmentReadiness.providerScopeEvidence.current
+                                    ? 'current'
+                                    : fulfillmentReadiness.providerScopeEvidence
+                                      .recordedForCredentialGeneration
+                                      ? 'recorded but not current'
+                                      : 'not recorded'
+                                }
+                              </Typography>
+                              <Typography variant="caption" display="block">
+                                Required OAuth scopes: {
+                                  fulfillmentReadiness.requiredScopes.join(', ')
+                                }
+                              </Typography>
+                              <Typography variant="caption" display="block">
+                                Active claims: {fulfillmentReadiness.activeCapabilities
+                                  .missing.length
+                                  ? `missing ${fulfillmentReadiness.activeCapabilities.missing.join(', ')}`
+                                  : 'current'} · diagnostic provider writes: 0
+                              </Typography>
+                              <Typography variant="caption" display="block" sx={{ mt: 0.5 }}>
+                                Faire manages retailer notifications after shipment and tracking are submitted; ClawPilot exposes no notification toggle.
+                              </Typography>
+                            </Alert>
+                          ) : account.provider === 'faire' ? (
+                            <Alert severity="info" sx={{ mt: 1 }}>
+                              Faire fulfillment write readiness is not available.
+                            </Alert>
+                          ) : null}
                       </Box>
 
                       {account.provider === 'shopify' ? (

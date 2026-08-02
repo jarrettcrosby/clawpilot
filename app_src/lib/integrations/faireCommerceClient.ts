@@ -818,7 +818,7 @@ function inventoryRequest(query: FaireInventoryQuery) {
       productVariantIds,
       'product variant ID',
     )
-    search.set('ids', values.join(','))
+    for (const value of values) search.append('ids', value)
     return {
       pathname: '/product-inventory/by-product-variant-ids',
       query: search,
@@ -826,7 +826,7 @@ function inventoryRequest(query: FaireInventoryQuery) {
   }
 
   const values = normalizeInventorySelectors(skus, 'SKU')
-  search.set('skus', values.join(','))
+  for (const value of values) search.append('skus', value)
   return {
     pathname: '/product-inventory/by-skus',
     query: search,
@@ -1300,13 +1300,14 @@ function normalizeInventoryUpdate(input: FaireInventoryUpdateInput) {
       on_hand_quantity: Number(inventory.onHandQuantity),
     }
   })
+  const query = new URLSearchParams()
+  const queryKey = by === 'skus' ? 'skus' : 'ids'
+  for (const selector of selectors) query.append(queryKey, selector)
   return {
     pathname: by === 'skus'
       ? '/product-inventory/by-skus'
       : '/product-inventory/by-product-variant-ids',
-    query: new URLSearchParams({
-      [by === 'skus' ? 'skus' : 'ids']: [...selectors].join(','),
-    }),
+    query,
     selectors: inventories.map((inventory) => ({
       selector: by === 'skus'
         ? String(inventory.sku)

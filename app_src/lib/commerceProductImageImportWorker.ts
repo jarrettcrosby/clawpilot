@@ -20,7 +20,14 @@ const MAX_JOB_LIMIT = 5
 const JOB_LEASE_SECONDS = 120
 const MAX_WAITING_RESOLUTIONS = 100
 const MAX_RETRY_DELAY_SECONDS = 15 * 60
+const RETRYABLE_DATABASE_ERROR_CODE =
+  'COMMERCE_PRODUCT_IMAGE_DATABASE_RETRYABLE'
+const RETRYABLE_DATABASE_SQLSTATES = new Set([
+  '40001', // serialization_failure
+  '40P01', // deadlock_detected
+])
 const RETRYABLE_ERROR_CODES = new Set([
+  RETRYABLE_DATABASE_ERROR_CODE,
   'COMMERCE_PROVIDER_IMAGE_SOURCE_READ_FAILED',
   'COMMERCE_PROVIDER_IMAGE_DNS_FAILED',
   'COMMERCE_PROVIDER_IMAGE_DNS_EMPTY',
@@ -131,6 +138,10 @@ function safeErrorCode(error: unknown) {
   const candidate = error && typeof error === 'object' && 'code' in error
     ? (error as { code?: unknown }).code
     : null
+  if (
+    typeof candidate === 'string'
+    && RETRYABLE_DATABASE_SQLSTATES.has(candidate)
+  ) return RETRYABLE_DATABASE_ERROR_CODE
   return typeof candidate === 'string' && SAFE_ERROR_CODES.has(candidate)
     ? candidate
     : 'COMMERCE_PRODUCT_IMAGE_IMPORT_FAILED'

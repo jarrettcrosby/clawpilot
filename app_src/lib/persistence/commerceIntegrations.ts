@@ -6,6 +6,10 @@ import {
   SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
 } from '@/lib/integrations/commerceCapabilities'
 import {
+  faireFulfillmentWriteReadiness,
+  type FaireFulfillmentWriteReadiness,
+} from '@/lib/integrations/faireFulfillmentReadiness'
+import {
   decryptCommerceWebhookPayload,
   type CommerceAuthMode,
   type CommerceEnvironment,
@@ -54,6 +58,7 @@ type CommerceConnectionRow = {
   credential_iv: Buffer | null
   credential_tag: Buffer | null
   credential_version: number | null
+  credential_external_account_id: string | null
   auth_mode: CommerceAuthMode | null
   credential_identifier_last_four: string | null
   verification_status: 'unverified' | 'verified' | 'failed' | null
@@ -94,6 +99,13 @@ type CommerceEvidenceSummaryRow = {
   failed_attempts: string | number
   dead_letter_attempts: string | number
   last_attempt_at: TimestampValue | null
+}
+
+type FaireFulfillmentAuthoritySummaryRow = {
+  integration_account_id: string
+  scope_evidence_recorded: boolean
+  scope_evidence_current: boolean
+  current_capabilities: string[]
 }
 
 export type CommerceSyncResource =
@@ -157,6 +169,7 @@ export type CommerceIntegrationAccountState = {
     deadLetterAttempts: number
     lastAttemptAt: string | null
   }
+  fulfillmentWriteReadiness: FaireFulfillmentWriteReadiness | null
   updatedAt: string
 }
 
@@ -218,6 +231,7 @@ const CONNECTION_SELECT = `SELECT
     credential.credential_iv,
     credential.credential_tag,
     credential.credential_version,
+    credential.external_account_id AS credential_external_account_id,
     credential.auth_mode,
     credential.credential_identifier_last_four,
     credential.verification_status,
@@ -251,6 +265,15 @@ function cursorState(row: CommerceCursorRow): CommerceSyncCursorState {
   }
 }
 
+function commerceCredentialConfigured(row: CommerceConnectionRow) {
+  return Boolean(
+    row.credential_ciphertext
+    && row.credential_iv
+    && row.credential_tag
+    && row.credential_version === row.commerce_credential_generation,
+  )
+}
+
 function accountState(
   row: CommerceConnectionRow,
   cursors: CommerceSyncCursorState[],
@@ -261,7 +284,9 @@ function accountState(
     change_reason: string
     updated_at: TimestampValue
   },
+  faireAuthority?: FaireFulfillmentAuthoritySummaryRow,
 ): CommerceIntegrationAccountState {
+  const configured = commerceCredentialConfigured(row)
   return {
     globalId: row.global_id,
     provider: row.provider,
@@ -270,12 +295,7 @@ function accountState(
     displayName: row.display_name,
     status: row.status,
     receiptIntakeEnabled: row.receipt_intake_enabled,
-    configured: Boolean(
-      row.credential_ciphertext
-      && row.credential_iv
-      && row.credential_tag
-      && row.credential_version === row.commerce_credential_generation,
-    ),
+    configured,
     credentialVersion: row.commerce_credential_generation,
     authMode: row.auth_mode,
     credentialIdentifierLastFour: row.credential_identifier_last_four,
@@ -315,6 +335,34 @@ function accountState(
       deadLetterAttempts: numberValue(evidence?.dead_letter_attempts),
       lastAttemptAt: iso(evidence?.last_attempt_at),
     },
+    fulfillmentWriteReadiness: row.provider === 'faire'
+      ? faireFulfillmentWriteReadiness({
+          authMode: row.auth_mode,
+          environment: row.environment,
+          status: row.status,
+          configured,
+          verificationStatus: row.verification_status || 'unverified',
+          externalIdentityMatches: Boolean(
+            row.external_account_id
+            && row.external_account_id
+              === row.credential_external_account_id,
+          ),
+          credentialGenerationMatches: Boolean(
+            row.credential_version
+            && row.credential_version
+              === row.commerce_credential_generation,
+          ),
+          scopeEvidenceRecorded:
+            faireAuthority?.scope_evidence_recorded === true,
+          scopeEvidenceCurrent:
+            faireAuthority?.scope_evidence_current === true,
+          scopeVerificationSource:
+            typeof row.configuration?.scopeVerification === 'string'
+              ? row.configuration.scopeVerification
+              : null,
+          currentCapabilities: faireAuthority?.current_capabilities || [],
+        })
+      : null,
     updatedAt: iso(row.updated_at) as string,
   }
 }
@@ -323,7 +371,13 @@ export async function readCommerceIntegrationsStateFromPostgres(
   organizationId: string,
 ): Promise<CommerceIntegrationsState> {
   await purgeExpiredFaireOAuthInstallationsInPostgres()
-  const [connections, cursorRows, evidenceRows, notificationPolicyRows] =
+  const [
+    connections,
+    cursorRows,
+    evidenceRows,
+    notificationPolicyRows,
+    faireAuthorityRows,
+  ] =
     await Promise.all([
       query<CommerceConnectionRow>(
       `${CONNECTION_SELECT}
@@ -403,6 +457,57 @@ export async function readCommerceIntegrationsStateFromPostgres(
          WHERE organization_id = $1::uuid`,
         [organizationId],
       ),
+      query<FaireFulfillmentAuthoritySummaryRow>(
+        `SELECT
+           account.id::text AS integration_account_id,
+           EXISTS (
+             SELECT 1
+             FROM operations_faire_provider_write_scope_evidence evidence
+             WHERE evidence.organization_id = account.organization_id
+               AND evidence.integration_account_id = account.id
+               AND evidence.credential_generation =
+                 account.commerce_credential_generation
+               AND evidence.verified_write_scopes @>
+                 ARRAY['WRITE_ORDERS']::text[]
+           ) AS scope_evidence_recorded,
+           operations_faire_fulfillment_scope_evidence_is_current(
+             account.organization_id,
+             account.id,
+             account.commerce_credential_generation
+           ) AS scope_evidence_current,
+           ARRAY(
+             SELECT required.capability
+             FROM unnest(ARRAY[
+               'order_update', 'fulfillment_export', 'tracking_export'
+             ]::text[]) AS required(capability)
+             WHERE EXISTS (
+               SELECT 1
+               FROM operations_commerce_active_transitions activated
+               JOIN operations_commerce_active_transition_preparations prepared
+                 ON prepared.organization_id = activated.organization_id
+                AND prepared.id = activated.preparation_id
+               CROSS JOIN LATERAL jsonb_array_elements(
+                 prepared.cohort
+               ) AS cohort(member)
+               WHERE activated.organization_id = account.organization_id
+                 AND cohort.member->>'accountGlobalId' = account.global_id
+                 AND cohort.member->'writeCapabilities'
+                   ? required.capability
+                 AND operations_commerce_active_capability_claim_is_current(
+                   activated.organization_id,
+                   activated.id,
+                   account.global_id,
+                   required.capability
+                 )
+             )
+             ORDER BY required.capability COLLATE "C"
+           ) AS current_capabilities
+         FROM operations_integration_accounts account
+         WHERE account.organization_id = $1::uuid
+           AND account.integration_type = 'commerce'
+           AND account.provider = 'faire'`,
+        [organizationId],
+      ),
     ])
 
   const cursors = new Map<string, CommerceSyncCursorState[]>()
@@ -417,6 +522,9 @@ export async function readCommerceIntegrationsStateFromPostgres(
   const notificationPolicies = new Map(
     notificationPolicyRows.rows.map((row) => [row.integration_account_id, row]),
   )
+  const faireAuthorities = new Map(
+    faireAuthorityRows.rows.map((row) => [row.integration_account_id, row]),
+  )
   return {
     organizationId,
     accounts: connections.rows.map((row) => accountState(
@@ -424,6 +532,7 @@ export async function readCommerceIntegrationsStateFromPostgres(
       cursors.get(row.id) || [],
       evidence.get(row.id),
       notificationPolicies.get(row.id),
+      faireAuthorities.get(row.id),
     )),
   }
 }
