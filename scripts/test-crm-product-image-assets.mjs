@@ -244,6 +244,7 @@ for (const contract of [
   'CRM_PRODUCT_IMAGE_PUBLIC_REFERENCE_PATTERN',
   'CRM_PRODUCT_IMAGE_PUBLIC_CONTENT_SHA256_PATTERN',
   "'Cache-Control': 'public, max-age=31536000, immutable'",
+  "'Access-Control-Allow-Origin': '*'",
   "'Cross-Origin-Resource-Policy': 'cross-origin'",
   "'X-Content-Type-Options': 'nosniff'",
   "'Content-Disposition': 'inline'",
@@ -265,6 +266,14 @@ assert.ok(
     "normalizedPath.startsWith('/api/public/crm-product-images/')",
   ),
   'content-addressed CRM Product images must bypass browser authentication',
+)
+
+const nextConfig = read('app_src/next.config.ts')
+assert.ok(
+  nextConfig.includes(
+    "source: '/((?!_next/static|api/public/crm-product-images/).*)'",
+  ),
+  'the global browser no-store policy must not override immutable public Product images',
 )
 
 const providerImport = read(

@@ -8837,16 +8837,28 @@ export async function readAutomaticCommerceCustomerTargetsForRunInPostgres(
       accountGlobalId: input.runtime.globalId,
     })
     const result = await client.query<CandidateRow>(
-      `${CANDIDATE_SELECT}
+      `WITH anchor_run AS (
+         SELECT 1
+         FROM operations_commerce_intake_runs anchor
+         WHERE anchor.organization_id = $1::uuid
+           AND anchor.integration_account_id = $2::uuid
+           AND anchor.global_id = $3
+           AND anchor.credential_version = $4::integer
+           AND anchor.resource = 'products_and_orders'
+         LIMIT 1
+       )
+       ${CANDIDATE_SELECT}
+       JOIN anchor_run ON true
        WHERE candidate.organization_id = $1::uuid
          AND candidate.integration_account_id = $2::uuid
-         AND run.global_id = $3
          AND run.credential_version = $4::integer
          AND run.resource = 'products_and_orders'
          AND candidate.expires_at > now()
          AND candidate.workflow_state IN ('held', 'resolving')
          AND candidate.customer_resolution_state = 'unresolved'
-       ORDER BY candidate.created_at, candidate.id`,
+       ORDER BY CASE WHEN run.global_id = $3 THEN 0 ELSE 1 END,
+                candidate.created_at, candidate.id
+       LIMIT 100`,
       [
         account.organization_id,
         account.id,

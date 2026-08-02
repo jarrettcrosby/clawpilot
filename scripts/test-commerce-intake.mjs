@@ -1883,11 +1883,14 @@ includes(serviceSource, [
   'providerWrites: 0',
 ], 'Automatic commerce customer resolution')
 includes(persistenceSource, [
+  'WITH anchor_run AS',
   "run.resource = 'products_and_orders'",
   "candidate.customer_resolution_state = 'unresolved'",
   "candidate.workflow_state IN ('held', 'resolving')",
+  'CASE WHEN run.global_id = $3 THEN 0 ELSE 1 END',
+  'LIMIT 100',
   "encryptedSnapshot(candidate, input.runtime.globalId, 'party')",
-], 'Automatic customer targets remain run and credential scoped')
+], 'Automatic customer targets include a bounded account backlog behind a validated run anchor')
 assert.ok(
   !persistenceSource.includes('records_failed AS records_rejected'),
   'Normalization rejection counts must come from stage audit evidence',

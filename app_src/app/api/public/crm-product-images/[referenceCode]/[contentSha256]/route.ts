@@ -12,6 +12,7 @@ export const dynamic = 'force-dynamic'
 export const revalidate = 0
 
 const NOT_FOUND_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
   'Cache-Control': 'public, max-age=30, must-revalidate',
   'Content-Security-Policy': "default-src 'none'",
   'Cross-Origin-Resource-Policy': 'cross-origin',
@@ -59,6 +60,7 @@ export async function GET(
       return new NextResponse(null, {
         status: 304,
         headers: {
+          'Access-Control-Allow-Origin': '*',
           ETag: etag,
           'Cache-Control': 'public, max-age=31536000, immutable',
           'Cross-Origin-Resource-Policy': 'cross-origin',
@@ -69,6 +71,7 @@ export async function GET(
     return new NextResponse(Buffer.from(asset.bytes), {
       status: 200,
       headers: {
+        'Access-Control-Allow-Origin': '*',
         'Content-Type': asset.mimeType,
         'Content-Length': String(asset.byteLength),
         'Content-Disposition': 'inline',

@@ -2182,6 +2182,64 @@ async function verifyAcceptance(databaseUrl) {
     persistence,
     counters,
   )
+
+  const backlogRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009203',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-postgres-customer-backlog',
+    responseHash: hash('commerce-staging-customer-backlog-response'),
+  }
+  const backlogSeed = await pool.connect()
+  try {
+    await seedAdditionalCapturedRead(backlogSeed, ids, backlogRead)
+  } finally {
+    backlogSeed.release()
+  }
+  counters.expectedImageStage = {
+    idempotencyKey: backlogRead.idempotencyKey,
+    readIntentId: backlogRead.readIntentId,
+  }
+  const backlogRun = await persistence.stageCommerceNormalizationEnvelopeInPostgres({
+    ...stageInput,
+    idempotencyKey: backlogRead.idempotencyKey,
+    envelope: Object.freeze({
+      ...envelope,
+      sourceHash: hash('commerce-staging-customer-backlog-envelope'),
+    }),
+    page: {
+      ...stageInput.page,
+      sessionId: backlogRead.sessionId,
+    },
+    readIntentId: backlogRead.readIntentId,
+    capturedResponseHash: backlogRead.responseHash,
+  })
+  const backlogTargets = await persistence
+    .readAutomaticCommerceCustomerTargetsForRunInPostgres({
+      runtime: stageInput.runtime,
+      runGlobalId: backlogRun.runGlobalId,
+    })
+  const originalTargetIds = new Set(
+    automaticCustomerTargets.map((target) => target.candidateGlobalId),
+  )
+  assert.equal(
+    backlogRun.ordersStaged,
+    0,
+    'An unchanged provider page should not duplicate prior order candidates',
+  )
+  assert.equal(
+    backlogTargets.length,
+    4,
+    'A no-change intake page must still discover unresolved prior-run candidates',
+  )
+  assert.equal(
+    backlogTargets.filter(
+      (target) => originalTargetIds.has(target.candidateGlobalId),
+    ).length,
+    4,
+    'Only still-unresolved prior-run candidates belong in the backlog sweep',
+  )
   await pool.end()
 }
 
