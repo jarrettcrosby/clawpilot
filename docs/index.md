@@ -59,6 +59,7 @@ The following set defines the accepted authority boundary and implementation/ope
 ## Active Operating Contracts
 
 - [Environments and deployment](operations/clawpilot-environments.md)
+- [Infrastructure and cost control register](operations/infrastructure-and-cost-control-register.md)
 - [Demo account](operations/public-demo-environment.md)
 - [Agent security and integration isolation](operations/agent-security-and-isolation.md)
 - [Knowledge vault organization](operations/knowledge-vault-organization.md)

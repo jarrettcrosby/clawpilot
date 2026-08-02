@@ -60,6 +60,7 @@ Current product behavior is defined by active module and operating contracts. Op
 - [ChatGPT agent authorization](operations/chatgpt-agent-auth.md)
 - [Repository patch runner](operations/repository-patch-runner.md)
 - [Google Workspace integration](operations/google-workspace-integration.md)
+- [Infrastructure and cost control register](operations/infrastructure-and-cost-control-register.md)
 - [Railway Postgres backups](operations/railway-postgres-backups.md)
 - [SuiteCRM Railway runbook](operations/suitecrm.md)
 - [Sales pipeline EPISCS migration](operations/sales-pipeline-episcs-migration.md)
