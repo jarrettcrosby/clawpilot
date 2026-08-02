@@ -127,6 +127,25 @@ type ShopifyProductImageProjectionPayload = {
   code?: string
 }
 
+type FaireProductImageRefreshPayload = {
+  ok?: boolean
+  refresh?: {
+    productReferenceCode: string
+    channelStateGlobalId: string
+    externalProductId: string
+    externalVariantId: string
+    providerSku: string
+    logicalReadOperations: 1
+    providerRequests: 2
+    providerWrites: 0
+    observedImages: number
+    jobs: Record<string, number>
+    nextAction: 'background_import'
+  }
+  error?: string
+  code?: string
+}
+
 const PRODUCT_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const SUPPORTED_MIME_TYPES = [
@@ -176,10 +195,12 @@ export default function ProductImagePanel({
   productId,
   canManage,
   shopifyChannels,
+  faireChannels,
 }: {
   productId: string
   canManage: boolean
   shopifyChannels: ProductSalesChannelState[]
+  faireChannels: ProductSalesChannelState[]
 }) {
   const fileInput = useRef<HTMLInputElement | null>(null)
   const [state, setState] = useState<ProductImageState | null>(null)
@@ -188,6 +209,7 @@ export default function ProductImagePanel({
   const [setPrimary, setSetPrimary] = useState(true)
   const [selectedShopifyChannel, setSelectedShopifyChannel] = useState('')
   const [selectedShopifyAsset, setSelectedShopifyAsset] = useState('')
+  const [selectedFaireChannel, setSelectedFaireChannel] = useState('')
   const [activePublishConfirmed, setActivePublishConfirmed] = useState(false)
   const [projection, setProjection] =
     useState<ShopifyProductImageProjection | null>(null)
@@ -198,6 +220,7 @@ export default function ProductImagePanel({
   const [loading, setLoading] = useState(canManage)
   const [saving, setSaving] = useState(false)
   const [projecting, setProjecting] = useState(false)
+  const [refreshingFaire, setRefreshingFaire] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
 
@@ -244,6 +267,7 @@ export default function ProductImagePanel({
     setSetPrimary(true)
     setSelectedShopifyChannel('')
     setSelectedShopifyAsset('')
+    setSelectedFaireChannel('')
     setActivePublishConfirmed(false)
     setProjection(null)
     setReconciliation(null)
@@ -266,6 +290,18 @@ export default function ProductImagePanel({
   }, [selectedShopifyChannel, shopifyChannels])
 
   useEffect(() => {
+    if (
+      selectedFaireChannel
+      && faireChannels.some(
+        (channel) => channel.globalId === selectedFaireChannel,
+      )
+    ) {
+      return
+    }
+    setSelectedFaireChannel(faireChannels[0]?.globalId || '')
+  }, [selectedFaireChannel, faireChannels])
+
+  useEffect(() => {
     const assets = state?.assets || []
     if (
       selectedShopifyAsset
@@ -283,6 +319,9 @@ export default function ProductImagePanel({
   ) || null
   const selectedAssetEvidence = state?.assets.find(
     (asset) => asset.id === selectedShopifyAsset,
+  ) || null
+  const selectedFaireChannelEvidence = faireChannels.find(
+    (channel) => channel.globalId === selectedFaireChannel,
   ) || null
   const exactShadowSimulation = projection?.mode === 'shadow'
     && projection.productReferenceCode === state?.product.referenceCode
@@ -562,6 +601,75 @@ export default function ProductImagePanel({
     }
   }
 
+  const refreshFromFaire = async () => {
+    const channel = selectedFaireChannelEvidence
+    if (!channel || !state?.product) {
+      setError('Refresh and choose one exact mapped Faire listing.')
+      return
+    }
+    if (!channel.providerSku) {
+      setError('The selected Faire listing has no exact SKU evidence.')
+      return
+    }
+    setRefreshingFaire(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch(
+        `/api/crm/products/${encodeURIComponent(productId)}/faire-product-images`,
+        {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            action: 'refresh-faire-product-images',
+            channelStateGlobalId: channel.globalId,
+            expectedProductReferenceCode: state.product.referenceCode,
+            expectedIntegrationAccountGlobalId:
+              channel.integrationAccountGlobalId,
+            expectedChannelStateRowVersion: channel.rowVersion,
+            expectedChannelSourceRevision: channel.sourceRevision,
+            expectedExternalProductId: channel.externalProductId,
+            expectedExternalVariantId: channel.externalVariantId,
+            expectedProviderSku: channel.providerSku,
+            confirmReadOnlyProviderRequest: true,
+          }),
+        },
+      )
+      const payload = (
+        await response.json().catch(() => ({}))
+      ) as FaireProductImageRefreshPayload
+      if (!response.ok || payload.ok !== true || !payload.refresh) {
+        throw new Error(
+          payload.error || 'Faire Product images were not refreshed',
+        )
+      }
+      const queued = Number(payload.refresh.jobs.queued || 0)
+      const succeeded = Number(payload.refresh.jobs.succeeded || 0)
+      await load()
+      setNotice(
+        payload.refresh.observedImages === 0
+          ? 'Faire returned no importable images. No removal was inferred and Faire received zero writes.'
+          : queued > 0
+            ? `${payload.refresh.observedImages} current Faire image${payload.refresh.observedImages === 1 ? '' : 's'} observed; ${queued} queued for background import. Faire received zero writes.`
+            : succeeded > 0
+              ? `${succeeded} Faire image import${succeeded === 1 ? '' : 's'} already succeeded. Faire received zero writes.`
+              : `${payload.refresh.observedImages} current Faire image${payload.refresh.observedImages === 1 ? '' : 's'} reconciled. Faire received zero writes.`,
+      )
+    } catch (refreshError) {
+      setError(
+        refreshError instanceof Error
+          ? refreshError.message
+          : 'Faire Product images were not refreshed',
+      )
+    } finally {
+      setRefreshingFaire(false)
+    }
+  }
+
   return (
     <Stack spacing={1.5} data-testid="crm-product-image-panel">
       <Stack
@@ -804,6 +912,73 @@ export default function ProductImagePanel({
               No Product image revisions are stored yet.
             </Typography>
           )}
+
+          <Divider />
+          <Stack spacing={1.25} data-testid="crm-faire-image-import">
+            <Box>
+              <Typography variant="subtitle2" fontWeight={700}>
+                Faire image import
+              </Typography>
+              <Typography variant="caption" color="text.secondary">
+                Re-read one exact mapped Faire Product and queue its current
+                images for ClawPilot import. The bounded operation makes two
+                read-only Faire requests—current brand profile and exact
+                Product—and cannot write to Faire.
+              </Typography>
+            </Box>
+
+            {faireChannels.length === 0 ? (
+              <Alert severity="info">
+                Map this Product to an active Faire listing before importing
+                images.
+              </Alert>
+            ) : null}
+
+            <TextField
+              select
+              fullWidth
+              label="Faire listing"
+              value={selectedFaireChannel}
+              onChange={(event) => setSelectedFaireChannel(event.target.value)}
+              disabled={refreshingFaire || faireChannels.length === 0}
+            >
+              {faireChannels.map((channel) => (
+                <MenuItem key={channel.globalId} value={channel.globalId}>
+                  {channel.integrationAccountName} ·{' '}
+                  {channel.providerProductTitle}
+                  {channel.providerVariantTitle
+                    ? ` · ${channel.providerVariantTitle}`
+                    : ''}
+                  {' · '}
+                  {channel.providerSku || 'No SKU'}
+                </MenuItem>
+              ))}
+            </TextField>
+
+            <Alert severity="info">
+              The server revalidates the Product reference, Faire account,
+              listing, variant, SKU, channel revision, and credential
+              generation before recording any image observation. Missing
+              images are not treated as removals by this targeted refresh.
+            </Alert>
+            <Button
+              variant="outlined"
+              startIcon={refreshingFaire
+                ? <CircularProgress size={16} />
+                : <RefreshRounded />}
+              onClick={() => void refreshFromFaire()}
+              disabled={
+                refreshingFaire
+                || !selectedFaireChannelEvidence
+                || !selectedFaireChannelEvidence.providerSku
+              }
+              sx={{ alignSelf: 'flex-start' }}
+            >
+              {refreshingFaire
+                ? 'Reading exact Faire Product…'
+                : 'Refresh and import from Faire'}
+            </Button>
+          </Stack>
 
           <Divider />
           <Stack spacing={1.25} data-testid="crm-shopify-image-publishing">

@@ -2427,6 +2427,12 @@ export default function CrmSection() {
                       && channel.normalizedStatus === 'active'
                       && channel.providerActive === true,
                   )}
+                  faireChannels={productSalesChannels(editorRecord).filter(
+                    (channel) =>
+                      channel.provider === 'faire'
+                      && channel.normalizedStatus === 'active'
+                      && channel.providerActive === true,
+                  )}
                 />
               </>
             ) : null}
