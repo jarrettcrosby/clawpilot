@@ -641,7 +641,7 @@ includes(faireOauthCallback, [
   'requireRequestUser(req)',
   'operationsCapabilities(actor).canManage',
   "req.nextUrl.searchParams.get('state')",
-  "'authorizationCode'",
+  'readFaireOAuthCallbackAuthorizationCode(',
   "req.nextUrl.searchParams.has('error')",
   'completeFaireOAuthCommerce',
   'purgeExpiredFaireOAuthCommerce',
@@ -661,6 +661,51 @@ assert.ok(
     'if (state) {\n        await discardFaireOAuthCommerce',
   ),
   'Faire denial cleanup must require the returned state before deleting',
+)
+
+const faireOauthCallbackParser = loadTypeScriptModule(
+  'app_src/lib/integrations/faireOAuthCallback.ts',
+)
+for (const parameterName of [
+  'authorizationCode',
+  'authorization_code',
+  'code',
+]) {
+  const params = new URLSearchParams({
+    [parameterName]: 'faire-authorization-code-1234567890',
+  })
+  assert.equal(
+    faireOauthCallbackParser.readFaireOAuthCallbackAuthorizationCode(params),
+    'faire-authorization-code-1234567890',
+    `Faire OAuth callback accepts ${parameterName}`,
+  )
+}
+const repeatedFaireCode = new URLSearchParams()
+repeatedFaireCode.append('authorizationCode', 'same-faire-code')
+repeatedFaireCode.append('code', 'same-faire-code')
+assert.equal(
+  faireOauthCallbackParser.readFaireOAuthCallbackAuthorizationCode(
+    repeatedFaireCode,
+  ),
+  'same-faire-code',
+  'Equivalent Faire OAuth callback aliases remain deterministic',
+)
+const conflictingFaireCode = new URLSearchParams()
+conflictingFaireCode.append('authorizationCode', 'first-faire-code')
+conflictingFaireCode.append('code', 'second-faire-code')
+assert.equal(
+  faireOauthCallbackParser.readFaireOAuthCallbackAuthorizationCode(
+    conflictingFaireCode,
+  ),
+  null,
+  'Conflicting Faire OAuth callback aliases fail closed',
+)
+assert.equal(
+  faireOauthCallbackParser.readFaireOAuthCallbackAuthorizationCode(
+    new URLSearchParams(),
+  ),
+  null,
+  'Missing Faire OAuth callback code fails closed',
 )
 
 const panel = read(
