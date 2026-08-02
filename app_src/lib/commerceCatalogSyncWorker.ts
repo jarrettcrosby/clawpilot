@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto'
 import { executeCommerceCatalogProductPage } from '@/lib/integrations/commerceIntake'
 import {
+  replayHeldShopifyProductDeletionsInPostgres,
+} from '@/lib/persistence/commerceIntegrations'
+import {
   claimCommerceCatalogSyncJobsInPostgres,
   completeCommerceCatalogSyncPageInPostgres,
   failCommerceCatalogSyncJobInPostgres,
@@ -143,6 +146,8 @@ export async function processCommerceCatalogSyncOutbox(input: {
   limit?: number
   workerId: string
 }) {
+  const productDeletionReplay =
+    await replayHeldShopifyProductDeletionsInPostgres({ limit: 25 })
   const autoQueued = await queueAutomaticCommerceCatalogSyncsInPostgres()
   const jobs = await claimCommerceCatalogSyncJobsInPostgres({
     limit: Math.max(1, Math.min(Number(input.limit || 2), 10)),
@@ -249,6 +254,11 @@ export async function processCommerceCatalogSyncOutbox(input: {
     jobsFailed,
     jobsDead,
     jobsCancelled,
+    heldProductDeletionsSelected: productDeletionReplay.selected,
+    heldProductDeletionsReconciled: productDeletionReplay.reconciled,
+    heldProductDeletionsRemaining: productDeletionReplay.held,
+    heldProductDeletionFailures: productDeletionReplay.failed,
+    heldProductDeletionDeadLetters: productDeletionReplay.deadLettered,
     resource: 'products',
     providerWrites: 0,
     ordersTouched: 0,

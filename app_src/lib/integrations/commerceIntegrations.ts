@@ -44,6 +44,9 @@ import {
   verifyShopifyWebhookHmac,
 } from '@/lib/integrations/shopifyCommerceClient'
 import {
+  shopifyDeletedProductEvidence,
+} from '@/lib/integrations/shopifyCatalogWebhook'
+import {
   assertShopifyOrderPreviewRuntime,
   fetchShopifyOrderPreview,
   normalizeShopifyOrderPreviewIdempotencyKey,
@@ -1733,6 +1736,22 @@ export async function receiveShopifyWebhook(input: {
     const payloadHash = createHash('sha256')
       .update(input.rawBody)
       .digest('hex')
+    let productDeletion: ReturnType<
+      typeof shopifyDeletedProductEvidence
+    > = null
+    try {
+      productDeletion = shopifyDeletedProductEvidence({
+        topic,
+        verifiedPayload: payload,
+        verifiedPayloadHash: payloadHash,
+      })
+    } catch {
+      throw new CommerceIntegrationRequestError(
+        'Shopify product-delete payload is invalid',
+        400,
+        'SHOPIFY_WEBHOOK_JSON_INVALID',
+      )
+    }
     const encryptedPayload = encryptCommerceWebhookPayload(
       input.rawBody,
       runtime.globalId,
@@ -1750,6 +1769,7 @@ export async function receiveShopifyWebhook(input: {
       payloadBytes: input.rawBody.byteLength,
       providerTriggeredAt,
       scopeAudit,
+      productDeletion,
     })
     await markShopifyWebhookSecretVerifiedInPostgres({ runtime })
     return receipt

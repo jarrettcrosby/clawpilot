@@ -24,6 +24,18 @@ const developmentSeed = readFileSync(resolve(
   process.cwd(),
   'scripts/seed-wms-development-simulation.mjs',
 ), 'utf8')
+const normalizationContract = readFileSync(resolve(
+  process.cwd(),
+  'app_src/lib/operations/commerceNormalization.ts',
+), 'utf8')
+const shopifyNormalizer = readFileSync(resolve(
+  process.cwd(),
+  'app_src/lib/integrations/shopifyCommerceNormalizer.ts',
+), 'utf8')
+const faireNormalizer = readFileSync(resolve(
+  process.cwd(),
+  'app_src/lib/integrations/faireCommerceNormalizer.ts',
+), 'utf8')
 
 function includesAll(fragments, label) {
   for (const fragment of fragments) {
@@ -50,6 +62,45 @@ function sqlSection(source, startMarker, endMarker, label) {
   assert.notEqual(end, -1, `${label} missing end marker: ${endMarker}`)
   return source.slice(start, end)
 }
+
+includesAllIn(normalizationContract, [
+  "'commerce-normalized-product-v4'",
+  'export type CommerceNormalizedProductImage',
+  'providerImageId: string | null',
+  'locatorFingerprint: string',
+  'sequence: number',
+  'altText: string | null',
+  'widthPixels: number | null',
+  'heightPixels: number | null',
+  'imageSetComplete: boolean',
+  'images: readonly CommerceNormalizedProductImage[]',
+  'commerceProductImageLocatorFingerprint',
+  'normalizeCommerceProductImages',
+  'normalizeCommerceProductImageSet',
+], 'Safe normalized product-image schema')
+const normalizedProductImageType = sqlSection(
+  normalizationContract,
+  'export type CommerceNormalizedProductImage',
+  'export type CommerceProductImageCandidate',
+  'Normalized product-image type',
+)
+assert.doesNotMatch(
+  normalizedProductImageType,
+  /\b(?:url|bytes?|payload)\b/i,
+  'Normalized product-image evidence must not expose provider URLs or bytes',
+)
+includesAllIn(shopifyNormalizer, [
+  "'shopify-commerce-normalizer-v4'",
+  'shopifyProductImages',
+  'shopifyProductSourceEvidence',
+], 'Shopify product-image normalizer')
+includesAllIn(faireNormalizer, [
+  "'faire-commerce-normalizer-v6'",
+  'faireProductImages',
+  'faireProductSourceEvidence',
+  'optionalFaireSemanticText',
+  'requiredFaireSemanticText',
+], 'Faire product-image and semantic-text normalizer')
 
 includesAll([
   "('gcir', 'operations.commerce_intake_run'",

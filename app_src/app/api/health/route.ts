@@ -21,6 +21,9 @@ import {
   readShopifyInventoryRefreshHealthFromPostgres,
   readShopifyInventoryRefreshWorkerHeartbeatFromPostgres,
 } from '@/lib/persistence/shopifyInventoryRefresh'
+import {
+  readCommerceProductImageImportQueueHealthInPostgres,
+} from '@/lib/persistence/commerceProductImageImports'
 import { commerceIntakeRuntimeAvailable } from '@/lib/integrations/commerceIntake'
 import { effectiveDocumentEmbeddingConfiguration } from '@/lib/documentEmbeddings'
 import { validateShortLinkConfiguration } from '@/lib/shortlinks'
@@ -97,6 +100,9 @@ export async function GET() {
       status: 'disabled',
     }
     let shopifyInventoryRefreshWorker: Record<string, unknown> = {
+      status: 'disabled',
+    }
+    let commerceProductImageImportWorker: Record<string, unknown> = {
       status: 'disabled',
     }
     let integrationQueues: Record<string, unknown> = { status: 'not-configured' }
@@ -348,6 +354,7 @@ export async function GET() {
           global_id_alphanumeric_compatibility_applied: boolean
           global_id_base32hex_allocator_applied: boolean
           faire_provider_write_auth_applied: boolean
+          operations_commerce_product_image_imports_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -1483,6 +1490,280 @@ export async function GET() {
                   AND fk.contype = 'f'
                   AND fk.convalidated
               ) AS faire_provider_write_auth_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0221_operations_commerce_product_image_imports.sql'
+              )
+              AND to_regclass(
+                'operations_commerce_product_image_snapshot_fences'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_product_image_observation_sets'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_product_image_observations'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_product_image_observation_set_memberships'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_product_image_import_jobs'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_product_image_import_worker_heartbeat'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_product_image_asset_provenance'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_product_image_bindings'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_commerce_product_image_account_is_current(uuid,uuid,text,integer)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_commerce_product_image_mapping_resolution(uuid,uuid,text,text)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_commerce_product_image_observation_is_current_active(uuid,uuid)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_commerce_product_image_job_fences_are_current(uuid,uuid)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'guard_operations_commerce_product_image_observation_set_membership()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'validate_ops_commerce_image_set_evidence(uuid,uuid,uuid)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'validate_ops_commerce_image_set_row()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'validate_ops_commerce_image_member_row()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'guard_operations_commerce_product_image_binding()'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_attribute attribute
+                WHERE attribute.attrelid = to_regclass(
+                    'operations_commerce_product_image_observations'
+                  )
+                  AND attribute.attname = 'observation_set_id'
+                  AND attribute.attnotnull
+                  AND NOT attribute.attisdropped
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint fk
+                WHERE fk.conrelid = to_regclass(
+                    'operations_commerce_product_image_observations'
+                  )
+                  AND fk.confrelid = to_regclass(
+                    'operations_commerce_product_image_observation_sets'
+                  )
+                  AND fk.conname =
+                    'ops_commerce_image_observation_set_fkey'
+                  AND fk.contype = 'f'
+                  AND fk.convalidated
+                  AND fk.confdeltype = 'r'
+                  AND ARRAY(
+                    SELECT attribute.attname::text
+                    FROM unnest(fk.conkey) WITH ORDINALITY
+                      key_column(attnum, ordinality)
+                    JOIN pg_attribute attribute
+                      ON attribute.attrelid = fk.conrelid
+                     AND attribute.attnum = key_column.attnum
+                    ORDER BY key_column.ordinality
+                  ) = ARRAY[
+                    'organization_id',
+                    'integration_account_id',
+                    'provider',
+                    'credential_generation',
+                    'external_product_id',
+                    'observation_set_id'
+                  ]::text[]
+                  AND ARRAY(
+                    SELECT attribute.attname::text
+                    FROM unnest(fk.confkey) WITH ORDINALITY
+                      key_column(attnum, ordinality)
+                    JOIN pg_attribute attribute
+                      ON attribute.attrelid = fk.confrelid
+                     AND attribute.attnum = key_column.attnum
+                    ORDER BY key_column.ordinality
+                  ) = ARRAY[
+                    'organization_id',
+                    'integration_account_id',
+                    'provider',
+                    'credential_generation',
+                    'external_product_id',
+                    'id'
+                  ]::text[]
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_snapshot_fences'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_snapshot_fence_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_snapshot_fence()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 31
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_observation_set_memberships'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_set_member_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_observation_set_membership()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 31
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_observation_sets'
+                  )
+                  AND trigger_row.tgname =
+                    'validate_operations_commerce_image_set_membership'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'validate_ops_commerce_image_set_row()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 5
+                  AND trigger_row.tgdeferrable
+                  AND trigger_row.tginitdeferred
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_observation_set_memberships'
+                  )
+                  AND trigger_row.tgname =
+                    'validate_operations_commerce_image_set_member_insert'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'validate_ops_commerce_image_member_row()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 5
+                  AND trigger_row.tgdeferrable
+                  AND trigger_row.tginitdeferred
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_observation_sets'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_observation_set_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_observation_set()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 31
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_observations'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_observation_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_observation()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 31
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_import_jobs'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_import_job_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_import_job()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 31
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_asset_provenance'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_provenance_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_asset_provenance()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 31
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_bindings'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_binding_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_binding()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 31
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'operations_commerce_product_image_import_jobs'
+                  )
+                  AND constraint_row.conname =
+                    'ops_commerce_image_job_observation_generation_unique'
+                  AND constraint_row.contype = 'u'
+                  AND constraint_row.convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_index index_row
+                WHERE index_row.indexrelid = to_regclass(
+                    'ops_commerce_image_job_single_flight_idx'
+                  )
+                  AND index_row.indisunique
+                  AND index_row.indisvalid
+                  AND index_row.indisready
+              ) AS operations_commerce_product_image_imports_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1653,6 +1934,7 @@ export async function GET() {
             && row?.global_id_alphanumeric_compatibility_applied
             && row?.global_id_base32hex_allocator_applied
             && row?.faire_provider_write_auth_applied
+            && row?.operations_commerce_product_image_imports_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1815,6 +2097,7 @@ export async function GET() {
           || !row?.global_id_alphanumeric_compatibility_applied
           || !row?.global_id_base32hex_allocator_applied
           || !row?.faire_provider_write_auth_applied
+          || !row?.operations_commerce_product_image_imports_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -2452,6 +2735,91 @@ export async function GET() {
             }
           }
 
+          if (
+            commerceIntakeRuntimeAvailable()
+            && row?.operations_commerce_product_image_imports_applied
+          ) {
+            const imageQueue =
+              await readCommerceProductImageImportQueueHealthInPostgres()
+            const imageHeartbeatAt = Date.parse(
+              String(imageQueue.heartbeat?.checkedAt || ''),
+            )
+            const imagePollMs = Math.max(
+              5_000,
+              Math.min(
+                Number(
+                  process.env.COMMERCE_PRODUCT_IMAGE_IMPORT_POLL_MS || 15_000,
+                ),
+                300_000,
+              ),
+            )
+            const maxImageHeartbeatAgeMs = Math.max(
+              180_000,
+              imagePollMs * 3,
+            )
+            const imageAgeMs = Number.isFinite(imageHeartbeatAt)
+              ? checkedAt - imageHeartbeatAt
+              : null
+            const loopReachable = (
+              imageAgeMs !== null
+              && imageAgeMs <= maxImageHeartbeatAgeMs
+            )
+            const operationalDegraded = (
+              imageQueue.deadCount > 0
+              || imageQueue.staleLeaseCount > 0
+              || imageQueue.overdueCount > 0
+              || imageQueue.retryCount > 0
+              || imageQueue.heartbeat?.phase === 'degraded'
+            )
+            commerceProductImageImportWorker = {
+              status: loopReachable
+                ? (operationalDegraded ? 'degraded' : 'reachable')
+                : 'stale',
+              livenessStatus: loopReachable ? 'reachable' : 'stale',
+              operationalStatus: operationalDegraded ? 'degraded' : 'ready',
+              heartbeatAt: imageQueue.heartbeat?.checkedAt || null,
+              phase: imageQueue.heartbeat?.phase || null,
+              ageMs: imageAgeMs,
+              waitingMapping: imageQueue.waitingMappingCount,
+              queued: imageQueue.queuedCount,
+              retrying: imageQueue.retryCount,
+              claimed: imageQueue.claimedCount,
+              dead: imageQueue.deadCount,
+              staleLeases: imageQueue.staleLeaseCount,
+              overdue: imageQueue.overdueCount,
+            }
+            if (!loopReachable) {
+              errors.push(
+                'Commerce product image import worker heartbeat is missing or stale.',
+              )
+            }
+            if (imageQueue.deadCount > 0) {
+              warnings.push(
+                'Commerce product image import queue has terminal failed jobs.',
+              )
+            }
+            if (imageQueue.staleLeaseCount > 0) {
+              warnings.push(
+                'Commerce product image import queue has stale claimed jobs.',
+              )
+            }
+            if (imageQueue.overdueCount > 0) {
+              warnings.push(
+                'Commerce product image import queue has overdue jobs.',
+              )
+            }
+            if (imageQueue.retryCount > 0) {
+              warnings.push(
+                'Commerce product image import jobs are retrying.',
+              )
+            }
+            if (imageQueue.heartbeat?.phase === 'degraded') {
+              warnings.push(
+                'Commerce product image import worker reported a degraded pass.',
+              )
+            }
+          }
+
           const knowledgeResult = await query<{
             worker_name: string
             checked_at: string
@@ -2525,6 +2893,7 @@ export async function GET() {
       commerceCatalogWorker,
       commerceOrderReconciliationWorker,
       shopifyInventoryRefreshWorker,
+      commerceProductImageImportWorker,
       integrationQueues,
       operationsCommands,
       crm,

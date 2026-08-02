@@ -17,6 +17,7 @@ import {
   createCommerceExternalIdentity,
   createCommerceNormalizationRejection,
   freezeCommerceEnvelope,
+  normalizeCommerceProductImageSet,
   normalizeCommerceCurrency,
   nonnegativeCommerceInteger,
   optionalCommerceText,
@@ -41,24 +42,26 @@ import {
   type CommercePartySnapshot,
   type CommerceProviderTaxonomy,
   type CommerceProviderStates,
+  type CommerceProductImageCandidate,
   type ReadOnlyCommerceNormalizationAdapter,
 } from '@/lib/operations/commerceNormalization'
 
 export const SHOPIFY_COMMERCE_NORMALIZER_VERSION =
-  'shopify-commerce-normalizer-v3' as const
+  'shopify-commerce-normalizer-v4' as const
 
 type ShopifySource = Readonly<Record<string, unknown>>
 
 const GID_PATTERNS = {
   order: /^gid:\/\/shopify\/Order\/[^/?#]+(?:[?#].*)?$/,
   order_line: /^gid:\/\/shopify\/LineItem\/[^/?#]+(?:[?#].*)?$/,
-  product: /^gid:\/\/shopify\/Product\/[^/?#]+(?:[?#].*)?$/,
+  product: /^gid:\/\/shopify\/Product\/[1-9][0-9]*$/,
   variant: /^gid:\/\/shopify\/ProductVariant\/[^/?#]+(?:[?#].*)?$/,
   inventory_item: /^gid:\/\/shopify\/InventoryItem\/[^/?#]+(?:[?#].*)?$/,
   customer: /^gid:\/\/shopify\/Customer\/[^/?#]+(?:[?#].*)?$/,
   company: /^gid:\/\/shopify\/Company\/[^/?#]+(?:[?#].*)?$/,
   company_location: /^gid:\/\/shopify\/CompanyLocation\/[^/?#]+(?:[?#].*)?$/,
   shop: /^gid:\/\/shopify\/Shop\/[^/?#]+(?:[?#].*)?$/,
+  image: /^gid:\/\/shopify\/MediaImage\/[1-9][0-9]*$/,
 } as const
 
 function shopifyIdentity(
@@ -306,10 +309,116 @@ function packaging(
   )
 }
 
+function shopifyProductImageConnection(value: unknown) {
+  if (Array.isArray(value)) {
+    // Legacy/bare arrays can still contribute discovered image evidence, but
+    // they do not attest that Shopify returned the complete GraphQL
+    // connection. Only explicit pageInfo may authorize absence tombstones.
+    return { values: value, structurallyValid: false }
+  }
+  const connection = nodeRecord(value)
+  if (!connection) return { values: [], structurallyValid: false }
+  if (Array.isArray(connection.nodes)) {
+    return { values: connection.nodes, structurallyValid: true }
+  }
+  if (!Array.isArray(connection.edges)) {
+    return { values: [], structurallyValid: false }
+  }
+  let structurallyValid = true
+  const values = connection.edges.map((edge) => {
+    const edgeRecord = nodeRecord(edge)
+    if (!edgeRecord || !Object.hasOwn(edgeRecord, 'node')) {
+      structurallyValid = false
+      return null
+    }
+    return edgeRecord.node
+  })
+  return { values, structurallyValid }
+}
+
+function shopifyProductImages(product: Record<string, unknown>) {
+  const candidates: CommerceProductImageCandidate[] = []
+  const mediaConnection = nodeRecord(product.media)
+  const mediaPageInfo = nodeRecord(mediaConnection?.pageInfo)
+  const mediaShape = shopifyProductImageConnection(product.media)
+  const media = mediaShape.values
+  let invalidRecords = 0
+  for (const [sourceIndex, source] of media.slice(0, 50).entries()) {
+    const mediaImage = nodeRecord(source)
+    if (!mediaImage) {
+      invalidRecords += 1
+      continue
+    }
+    if (
+      mediaImage.mediaContentType !== undefined
+      && mediaImage.mediaContentType !== 'IMAGE'
+    ) {
+      if (typeof mediaImage.mediaContentType !== 'string') {
+        invalidRecords += 1
+      }
+      continue
+    }
+    const image = nodeRecord(mediaImage.image)
+    const providerImageId = mediaImage.id
+    if (
+      providerImageId !== undefined
+      && providerImageId !== null
+      && providerImageId !== ''
+      && (
+        typeof providerImageId !== 'string'
+        || !GID_PATTERNS.image.test(providerImageId)
+      )
+    ) {
+      invalidRecords += 1
+      continue
+    }
+    if (!providerImageId && !image) {
+      invalidRecords += 1
+      continue
+    }
+    candidates.push({
+      providerImageId,
+      locatorUrl: image?.url,
+      providerSequence: sourceIndex,
+      sourceIndex,
+      altText: mediaImage.alt ?? image?.altText,
+      widthPixels: image?.width,
+      heightPixels: image?.height,
+    })
+  }
+  const normalized = normalizeCommerceProductImageSet(candidates)
+  const providerSetComplete = mediaConnection !== null
+    && mediaPageInfo?.hasNextPage === false
+    && media.length <= 50
+  return Object.freeze({
+    images: normalized.images,
+    imageSetComplete: mediaShape.structurallyValid
+      && providerSetComplete
+      && invalidRecords === 0
+      && normalized.rejectedCount === 0,
+  })
+}
+
+function shopifyProductSourceEvidence(
+  product: Record<string, unknown>,
+  images: ReturnType<typeof shopifyProductImages>['images'],
+  imageSetComplete: boolean,
+) {
+  const productEvidence = { ...product }
+  delete productEvidence.media
+  delete productEvidence.images
+  return Object.freeze({
+    ...productEvidence,
+    imageSetComplete,
+    images,
+  })
+}
+
 function normalizeVariant(
   source: unknown,
   productIdentity: CommerceExternalIdentity,
   productRecord: Record<string, unknown>,
+  productSourceEvidence: Record<string, unknown>,
   currencyFallback: unknown,
 ): CommerceNormalizedVariant {
   const variant = nodeRecord(source)
@@ -358,7 +467,7 @@ function normalizeVariant(
       variant.updatedAt ?? productRecord.updatedAt,
     ),
     sourceHash: commerceSourceHash(Object.freeze({
-      product: productRecord,
+      product: productSourceEvidence,
       variant,
     })),
   })
@@ -372,11 +481,19 @@ function normalizeProduct(
   const product = nodeRecord(source)
   if (!product) throw new Error('Shopify returned an invalid product')
   const identity = shopifyIdentity(product.id, 'product')
+  const imageSet = shopifyProductImages(product)
+  const { images, imageSetComplete } = imageSet
+  const productSourceEvidence = shopifyProductSourceEvidence(
+    product,
+    images,
+    imageSetComplete,
+  )
   const variants = commerceConnectionValues(product.variants)
     .map((variant) => normalizeVariant(
       variant,
       identity,
       product,
+      productSourceEvidence,
       product.currencyCode ?? currencyFallback,
     ))
   const lifecycleState = optionalCommerceText(product.status, 64)
@@ -429,8 +546,10 @@ function normalizeProduct(
       : lifecycleState.toUpperCase() === 'ACTIVE',
     providerCreatedAt: optionalCommerceTimestamp(product.createdAt),
     providerUpdatedAt: optionalCommerceTimestamp(product.updatedAt),
+    imageSetComplete,
+    images,
     variants: Object.freeze(variants),
-    sourceHash: commerceSourceHash(source),
+    sourceHash: commerceSourceHash(productSourceEvidence),
   })
 }
 

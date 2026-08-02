@@ -16,6 +16,7 @@ import {
   listFaireInventory,
   listFaireOrders,
   listFaireProducts,
+  probeFaireBrandProfile,
 } from '@/lib/integrations/faireCommerceClient'
 import {
   FAIRE_COMMERCE_NORMALIZER_VERSION,
@@ -90,6 +91,7 @@ const PACKAGE_PROFILE_PATTERN = /^gpp(?:[0-9]{7}|[0-9a-v]{12})$/
 
 const SHOPIFY_ORDER_PAGE_SIZE = 25
 const SHOPIFY_PRODUCT_VARIANT_PAGE_SIZE = 50
+const SHOPIFY_PRODUCT_IMAGE_PAGE_SIZE = 50
 const SHOPIFY_ORDER_LINE_PAGE_SIZE = 250
 const SHOPIFY_MAX_ORDER_LINE_PAGES = 2
 const SHOPIFY_MAX_NESTED_LINE_REQUESTS = 2
@@ -364,6 +366,24 @@ function shopifyProductVariantsQuery(includeInventory: boolean) {
           name
           fullName
         }
+        media(first: ${SHOPIFY_PRODUCT_IMAGE_PAGE_SIZE}) {
+          nodes {
+            mediaContentType
+            ... on MediaImage {
+              id
+              alt
+              image {
+                url
+                altText
+                width
+                height
+              }
+            }
+          }
+          pageInfo {
+            hasNextPage
+          }
+        }
       }
     }
     pageInfo {
@@ -614,6 +634,70 @@ function providerRecord(
     )
   }
   return value as Record<string, unknown>
+}
+
+function exactFaireBrandIdentity(value: unknown, expectedBrandId: string) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new CommerceIntegrationRequestError(
+      'Faire returned an invalid brand identity',
+      502,
+      'COMMERCE_INTAKE_ACCOUNT_CHANGED',
+    )
+  }
+  const profile = value as Record<string, unknown>
+  const identifiers = [profile.id, profile.brand_id, profile.brandId]
+    .filter((candidate) => candidate !== undefined && candidate !== null)
+  if (
+    identifiers.length < 1
+    || identifiers.some((candidate) => (
+      typeof candidate !== 'string'
+      || candidate !== candidate.trim()
+      || candidate.length < 1
+      || candidate.length > 512
+      || /[\u0000-\u001f\u007f]/u.test(candidate)
+      || candidate !== expectedBrandId
+    ))
+  ) {
+    throw new CommerceIntegrationRequestError(
+      'Faire returned a different brand identity',
+      409,
+      'COMMERCE_INTAKE_ACCOUNT_CHANGED',
+    )
+  }
+}
+
+function assertFaireRecordBrandScope(
+  values: readonly unknown[],
+  expectedBrandId: string,
+) {
+  for (const value of values) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+    const record = value as Record<string, unknown>
+    const nestedBrand = record.brand
+      && typeof record.brand === 'object'
+      && !Array.isArray(record.brand)
+      ? record.brand as Record<string, unknown>
+      : null
+    const identifiers = [
+      record.brand_id,
+      record.brandId,
+      nestedBrand?.id,
+    ].filter((candidate) => candidate !== undefined && candidate !== null)
+    if (identifiers.some((candidate) => (
+      typeof candidate !== 'string'
+      || candidate !== candidate.trim()
+      || candidate.length < 1
+      || candidate.length > 512
+      || /[\u0000-\u001f\u007f]/u.test(candidate)
+      || candidate !== expectedBrandId
+    ))) {
+      throw new CommerceIntegrationRequestError(
+        'Faire returned commerce data for a different brand',
+        409,
+        'COMMERCE_INTAKE_ACCOUNT_CHANGED',
+      )
+    }
+  }
 }
 
 function providerNodes(value: unknown, label: string) {
@@ -1195,6 +1279,9 @@ async function shopifyProductEnvelope(
   page: OperationalPageRequest,
   hydrateInventory = true,
 ): Promise<OperationalPageResult> {
+  // Fence the snapshot at read start. A slower, older provider request must
+  // never arrive later and supersede a catalog snapshot that started after it.
+  const context = normalizationContext(runtime)
   const credential = decryptCommerceCredential(
     runtime.encrypted,
     runtime.organizationId,
@@ -1302,7 +1389,7 @@ async function shopifyProductEnvelope(
       orders: completeConnection([]),
     },
     shopDomain,
-  }, normalizationContext(runtime)), {
+  }, context), {
     rejections,
   })
   const normalizedVariants = normalized.products.reduce(
@@ -1363,6 +1450,10 @@ async function faireEnvelope(
         accessToken: credential.accessToken,
         timeoutMs: 15_000,
       }
+  exactFaireBrandIdentity(
+    await probeFaireBrandProfile(options),
+    runtime.externalAccountId,
+  )
   const providerPage = targetExternalOrderId
     ? {
         orders: [await getFaireOrder(options, targetExternalOrderId)],
@@ -1372,6 +1463,7 @@ async function faireEnvelope(
         limit: FAIRE_ORDER_PAGE_SIZE,
       })
   const orderNodes = faireCollection(providerPage, 'orders')
+  assertFaireRecordBrandScope(orderNodes, runtime.externalAccountId)
   const nextOrderCursor = targetExternalOrderId
     ? null
     : nextFaireCursor(providerPage, 'Faire orders', page.orderCursor)
@@ -1410,6 +1502,9 @@ async function faireProductEnvelope(
   page: OperationalPageRequest,
   hydrateInventory = true,
 ): Promise<OperationalPageResult> {
+  // Faire has no catalog webhook cursor, so read-start time is the durable
+  // ordering fence for its bounded reconciliation snapshots.
+  const context = normalizationContext(runtime, 'stale')
   const credential = decryptCommerceCredential(
     runtime.encrypted,
     runtime.organizationId,
@@ -1441,19 +1536,23 @@ async function faireProductEnvelope(
         accessToken: credential.accessToken,
         timeoutMs: 15_000,
       }
+  exactFaireBrandIdentity(
+    await probeFaireBrandProfile(options),
+    runtime.externalAccountId,
+  )
   const providerPage = await listFaireProducts(options, {
     cursor: page.orderCursor,
     limit: FAIRE_PRODUCT_PAGE_SIZE,
     includeDeleted: true,
   })
   const productNodes = faireCollection(providerPage, 'products')
+  assertFaireRecordBrandScope(productNodes, runtime.externalAccountId)
   const nextProductCursor = nextFaireCursor(
     providerPage,
     'Faire products',
     page.orderCursor,
   )
   const bounded = boundedFaireProducts(productNodes)
-  const context = normalizationContext(runtime, 'stale')
   const normalizedSource = {
     brand: { id: runtime.externalAccountId },
     orders: completedFairePage({ orders: [] }, 'orders', []),

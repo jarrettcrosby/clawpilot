@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -83,12 +84,63 @@ includes(capabilities, [
   'lossless monotonic watermark',
 ], 'Shopify product webhook capability')
 
+const deleteEvidence = loadTypeScriptModule(
+  'app_src/lib/integrations/shopifyCatalogWebhook.ts',
+)
+const deletePayloadHash = createHash('sha256')
+  .update('{"id":123456789}')
+  .digest('hex')
+const exactDeletion = deleteEvidence.shopifyDeletedProductEvidence({
+  topic: 'products/delete',
+  verifiedPayload: {
+    id: 123456789,
+    admin_graphql_api_id: 'gid://shopify/Product/123456789',
+    updated_at: '2026-08-01T15:00:00Z',
+    image: 'https://must-not-enter-delete-evidence.example/image.png',
+  },
+  verifiedPayloadHash: deletePayloadHash,
+})
+assert.deepEqual(JSON.parse(JSON.stringify(exactDeletion)), {
+  externalProductId: 'gid://shopify/Product/123456789',
+  productSourceHash: createHash('sha256').update([
+    'shopify-product-delete-v1',
+    deletePayloadHash,
+    'gid://shopify/Product/123456789',
+  ].join('\0')).digest('hex'),
+  providerUpdatedAt: '2026-08-01T15:00:00.000Z',
+})
+assert.doesNotMatch(JSON.stringify(exactDeletion), /https:\/\//)
+assert.equal(deleteEvidence.shopifyDeletedProductEvidence({
+  topic: 'products/update',
+  verifiedPayload: { id: 123456789 },
+  verifiedPayloadHash: deletePayloadHash,
+}), null)
+for (const invalidPayload of [
+  {},
+  { id: 0 },
+  { id: Number.MAX_SAFE_INTEGER + 1 },
+  { id: ' 123456789' },
+  {
+    id: 123456789,
+    admin_graphql_api_id: 'gid://shopify/Product/987654321',
+  },
+]) {
+  assert.throws(
+    () => deleteEvidence.shopifyDeletedProductEvidence({
+      topic: 'products/delete',
+      verifiedPayload: invalidPayload,
+      verifiedPayloadHash: deletePayloadHash,
+    }),
+    /product-delete/u,
+  )
+}
+
 const receiptPersistence = read(
   'app_src/lib/persistence/commerceIntegrations.ts',
 )
 assert.match(
   receiptPersistence,
-  /if \(SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS\.some\([\s\S]+?signalShopifyCatalogRefreshWithClient/,
+  /if \([\s\S]*?SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS\.some\([\s\S]+?signalShopifyCatalogRefreshWithClient/,
   'Product webhook topics must signal catalog reconciliation',
 )
 includes(receiptPersistence, [
@@ -97,7 +149,598 @@ includes(receiptPersistence, [
   'providerWrites: 0',
   'ordersTouched: 0',
   'inventoryTouched: 0',
+  'reconcileCommerceProductImageSetWithClient',
+  "productLifecycle: 'deleted'",
+  'RETURNING global_id, received_at',
+  'existing.rows[0].received_at',
+  'productDeletionReconciled',
 ], 'Shopify product webhook receipt boundary')
+const receiptFunction = receiptPersistence.slice(
+  receiptPersistence.indexOf(
+    'export async function recordShopifyWebhookReceiptInPostgres',
+  ),
+)
+assert.ok(
+  receiptFunction.indexOf('reconcileProductDeletion(')
+    < receiptFunction.indexOf('signalShopifyCatalogRefreshWithClient('),
+  'Signed product deletion must be durable before the dirty watermark advances',
+)
+includes(receiptFunction, [
+  'account.commerce_credential_generation',
+  'credential.credential_version',
+  "account.provider = 'shopify'",
+  'COALESCE(',
+  'account.updated_by',
+  'credential.created_by',
+  "input.topic === 'products/delete'",
+  "provider: 'shopify'",
+  'credentialGeneration: input.runtime.credentialVersion',
+  'externalProductId: input.productDeletion.externalProductId',
+  'productSourceHash: input.productDeletion.productSourceHash',
+  'imageSetComplete: true',
+  'images: []',
+  'observedAt: receivedAt',
+  'providerUpdatedAt: input.productDeletion.providerUpdatedAt',
+  'providerWrites: 0',
+  "receipt.topic = 'products/delete'",
+  "receipt.state = 'held'",
+  'receipt.attempts < receipt.max_attempts',
+  'credential.external_account_id = account.external_account_id',
+  "credential.auth_mode = 'shopify_client_credentials'",
+  "credential.webhook_verification_status = 'verified'",
+  "activation.state IN ('shadow', 'active')",
+  'ORDER BY receipt.received_at, receipt.id',
+  'runtime.credentialVersion !== candidate.credential_version',
+  "current.webhook_verification_status !== 'verified'",
+  "const errorCode = 'SHOPIFY_PRODUCT_DELETE_REPLAY_FAILED'",
+], 'Atomic Shopify delete image reconciliation')
+assert.match(
+  receiptFunction,
+  /If the catalog worker is disabled while activation alone resumes,[\s\S]*?immutable receipt intentionally remains held/,
+  'Worker-disabled activation resume must document the durable safe-hold state',
+)
+
+const receiptTrace = []
+let replayExistingReceipt = false
+let existingReceiptState = 'succeeded'
+let activationState = 'shadow'
+let receiptIntakeEnabled = true
+let heldReplayCandidatesEnabled = false
+let replayDecryptionMode = 'valid'
+let replayFailureState = 'held'
+let replayRuntimeCredentialVersion = 3
+const durableReceiptObservedAt = '2026-08-01T15:01:02.000Z'
+const receiptPersistenceModule = loadTypeScriptModule(
+  'app_src/lib/persistence/commerceIntegrations.ts',
+  {
+    mocks: {
+      '@/lib/auditWriter': {
+        async recordAuditEvent(input) {
+          receiptTrace.push({ kind: 'audit', eventType: input.eventType })
+        },
+      },
+      '@/lib/integrations/commerceCapabilities': {
+        SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS: [
+          'products/create',
+          'products/delete',
+          'products/update',
+        ],
+        SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS: [
+          'inventory_items/update',
+          'inventory_levels/update',
+        ],
+      },
+      '@/lib/integrations/commerceCredentialCrypto': {
+        decryptCommerceWebhookPayload() {
+          if (replayDecryptionMode === 'invalid_auth') {
+            throw new Error(
+              'authentication failed for product 123456789',
+            )
+          }
+          if (replayDecryptionMode === 'hash_mismatch') {
+            return Buffer.from('{"id":987654321}')
+          }
+          return Buffer.from('{"id":123456789}')
+        },
+      },
+      '@/lib/integrations/shopifyCatalogWebhook': {
+        shopifyDeletedProductEvidence:
+          deleteEvidence.shopifyDeletedProductEvidence,
+      },
+      '@/lib/persistence/postgres': {
+        async acquireTransactionAdvisoryLock(_client, key) {
+          receiptTrace.push({ kind: 'lock', key })
+        },
+        async query(sql, values) {
+          if (
+            heldReplayCandidatesEnabled
+            && sql.includes(
+              'FROM operations_commerce_webhook_receipts receipt',
+            )
+          ) {
+            assert.match(sql, /receipt\.topic = 'products\/delete'/)
+            assert.match(sql, /receipt\.state = 'held'/)
+            assert.match(sql, /receipt\.attempts < receipt\.max_attempts/)
+            assert.match(
+              sql,
+              /credential\.external_account_id = account\.external_account_id/,
+            )
+            assert.match(
+              sql,
+              /credential\.webhook_verification_status = 'verified'/,
+            )
+            assert.match(sql, /activation\.state IN \('shadow', 'active'\)/)
+            assert.match(sql, /ORDER BY receipt\.received_at, receipt\.id/)
+            return {
+              rowCount: 1,
+              rows: [{
+                receipt_global_id: 'gcw1234567',
+                organization_id:
+                  '11111111-1111-4111-8111-111111111111',
+                integration_account_id:
+                  '22222222-2222-4222-8222-222222222222',
+                account_global_id: 'gia1234567',
+                credential_version: 3,
+                provider_event_id: 'event-held-intake-paused-123456789',
+                topic: 'products/delete',
+                source_domain: 'example.myshopify.com',
+                provider_api_version: '2026-07',
+                payload_hash: deletePayloadHash,
+                payload_ciphertext: Buffer.from('ciphertext'),
+                payload_iv: Buffer.alloc(12),
+                payload_tag: Buffer.alloc(16),
+                payload_bytes: 16,
+                provider_triggered_at: null,
+              }],
+            }
+          }
+          if (
+            heldReplayCandidatesEnabled
+            && sql.includes('WHERE account.global_id = $1')
+          ) {
+            return {
+              rowCount: 1,
+              rows: [{
+                id: receiptInput.runtime.integrationAccountId,
+                global_id: receiptInput.runtime.globalId,
+                organization_id: receiptInput.runtime.organizationId,
+                provider: 'shopify',
+                environment: 'production',
+                external_account_id: 'gid://shopify/Shop/123456789',
+                display_name: 'Example store',
+                status: 'active',
+                receipt_intake_enabled: true,
+                configuration: {},
+                commerce_credential_generation:
+                  replayRuntimeCredentialVersion,
+                credential_ciphertext: Buffer.from('credential'),
+                credential_iv: Buffer.alloc(12),
+                credential_tag: Buffer.alloc(16),
+                credential_version: replayRuntimeCredentialVersion,
+                auth_mode: 'shopify_client_credentials',
+                credential_identifier_last_four: '7890',
+                verification_status: 'verified',
+                verified_at: durableReceiptObservedAt,
+                last_error_code: null,
+                webhook_verification_status: 'verified',
+                webhook_verified_at: durableReceiptObservedAt,
+                updated_at: durableReceiptObservedAt,
+              }],
+            }
+          }
+          if (
+            heldReplayCandidatesEnabled
+            && sql.includes('UPDATE operations_commerce_webhook_receipts')
+            && sql.includes("ELSE 'held'")
+          ) {
+            receiptTrace.push({
+              kind: 'replay_failure',
+              receiptGlobalId: values?.[0],
+              errorCode: values?.[1],
+            })
+            return {
+              rowCount: 1,
+              rows: [{ state: replayFailureState }],
+            }
+          }
+          return { rows: [] }
+        },
+        async withTransaction(callback) {
+          return callback({
+            async query(sql, values) {
+              if (
+                sql.includes('SELECT')
+                && sql.includes('account.receipt_intake_enabled')
+                && sql.includes('FOR UPDATE OF account, credential')
+              ) {
+                return {
+                  rowCount: 1,
+                  rows: [{
+                    status: 'active',
+                    receipt_intake_enabled: receiptIntakeEnabled,
+                    account_external_account_id:
+                      'gid://shopify/Shop/123456789',
+                    commerce_credential_generation: 3,
+                    credential_external_account_id:
+                      'gid://shopify/Shop/123456789',
+                    credential_version: 3,
+                    auth_mode: 'shopify_client_credentials',
+                    verification_status: 'verified',
+                    webhook_verification_status: 'verified',
+                    configuration: {},
+                    actor_email: 'owner@example.com',
+                  }],
+                }
+              }
+              if (
+                sql.includes('FROM operations_activation_scopes')
+                && sql.includes('FOR SHARE')
+              ) {
+                return {
+                  rowCount: 1,
+                  rows: [{ state: activationState }],
+                }
+              }
+              if (
+                sql.includes(
+                  'SELECT global_id, credential_version, payload_hash, received_at',
+                )
+              ) {
+                return replayExistingReceipt
+                  ? {
+                      rowCount: 1,
+                      rows: [{
+                        global_id: 'gcw1234567',
+                        credential_version: 3,
+                        payload_hash: deletePayloadHash,
+                        received_at: durableReceiptObservedAt,
+                        state: existingReceiptState,
+                      }],
+                    }
+                  : { rowCount: 0, rows: [] }
+              }
+              if (
+                sql.includes('INSERT INTO operations_commerce_webhook_receipts')
+              ) {
+                receiptTrace.push({
+                  kind: 'receipt_insert',
+                  state: values[13],
+                })
+                return {
+                  rowCount: 1,
+                  rows: [{
+                    global_id: 'gcw1234567',
+                    received_at: durableReceiptObservedAt,
+                  }],
+                }
+              }
+              if (
+                sql.includes('UPDATE operations_commerce_webhook_receipts')
+              ) {
+                receiptTrace.push({ kind: 'receipt_finalize' })
+                return { rowCount: 1, rows: [] }
+              }
+              throw new Error(`Unexpected receipt query: ${sql}`)
+            },
+          })
+        },
+      },
+      '@/lib/persistence/commerceCatalogSync': {
+        async ensureAutomaticCommerceCatalogIntakeWithClient() {},
+        async signalShopifyCatalogRefreshWithClient(_client, input) {
+          receiptTrace.push({ kind: 'catalog_signal', input })
+          return { dirtyVersion: 9, reconciledVersion: 8 }
+        },
+      },
+      '@/lib/persistence/shopifyInventoryRefresh': {
+        async signalShopifyInventoryRefreshWithClient() {
+          assert.fail('A product deletion must not mutate inventory')
+        },
+      },
+      '@/lib/persistence/commerceProductImageImports': {
+        async reconcileCommerceProductImageSetWithClient(input) {
+          receiptTrace.push({ kind: 'image_delete', input })
+          return {
+            productSourceHash: input.productSourceHash,
+            productLifecycle: 'deleted',
+            imageSetComplete: true,
+            staleSnapshotIgnored: false,
+            active: [],
+            removed: [{ jobState: 'cancelled' }],
+          }
+        },
+      },
+      '@/lib/persistence/shopifyFulfillmentNotifications': {},
+    },
+  },
+)
+const receiptInput = {
+  runtime: {
+    organizationId: '11111111-1111-4111-8111-111111111111',
+    integrationAccountId: '22222222-2222-4222-8222-222222222222',
+    globalId: 'gia1234567',
+    provider: 'shopify',
+    environment: 'production',
+    externalAccountId: 'gid://shopify/Shop/123456789',
+    credentialVersion: 3,
+  },
+  providerEventId: 'event-delete-123456789',
+  topic: 'products/delete',
+  sourceDomain: 'example.myshopify.com',
+  providerApiVersion: '2026-07',
+  payloadHash: deletePayloadHash,
+  encryptedPayload: {
+    ciphertext: Buffer.from('ciphertext'),
+    iv: Buffer.alloc(12),
+    tag: Buffer.alloc(16),
+  },
+  payloadBytes: 16,
+  providerTriggeredAt: null,
+  productDeletion: exactDeletion,
+}
+const firstReceipt = await receiptPersistenceModule
+  .recordShopifyWebhookReceiptInPostgres(receiptInput)
+assert.equal(firstReceipt.duplicate, false)
+assert.equal(firstReceipt.productDeletionReconciled, true)
+assert.equal(firstReceipt.productImagesInactivated, 1)
+const firstImageDeleteIndex = receiptTrace.findIndex(
+  (entry) => entry.kind === 'image_delete',
+)
+const firstCatalogSignalIndex = receiptTrace.findIndex(
+  (entry) => entry.kind === 'catalog_signal',
+)
+assert.ok(firstImageDeleteIndex > -1)
+assert.ok(firstImageDeleteIndex < firstCatalogSignalIndex)
+const firstImageDelete = receiptTrace[firstImageDeleteIndex].input
+assert.deepEqual(JSON.parse(JSON.stringify(firstImageDelete)), {
+  organizationId: receiptInput.runtime.organizationId,
+  integrationAccountId: receiptInput.runtime.integrationAccountId,
+  provider: 'shopify',
+  credentialGeneration: 3,
+  externalProductId: exactDeletion.externalProductId,
+  productSourceHash: exactDeletion.productSourceHash,
+  productLifecycle: 'deleted',
+  imageSetComplete: true,
+  images: [],
+  observedAt: durableReceiptObservedAt,
+  providerUpdatedAt: exactDeletion.providerUpdatedAt,
+  actorEmail: 'owner@example.com',
+})
+
+replayExistingReceipt = true
+const traceBeforeReplay = receiptTrace.length
+const replayReceipt = await receiptPersistenceModule
+  .recordShopifyWebhookReceiptInPostgres(receiptInput)
+assert.equal(replayReceipt.duplicate, true)
+assert.equal(replayReceipt.productDeletionReconciled, false)
+const replayTrace = receiptTrace.slice(traceBeforeReplay)
+assert.equal(
+  replayTrace.filter((entry) => entry.kind === 'image_delete').length,
+  0,
+  'A succeeded duplicate must not replay the deletion mutation',
+)
+assert.equal(
+  replayTrace.some((entry) => entry.kind === 'catalog_signal'),
+  false,
+  'Duplicate delivery must not increment the catalog dirty watermark again',
+)
+assert.equal(
+  replayTrace.some((entry) => entry.kind === 'receipt_finalize'),
+  false,
+  'A succeeded duplicate must not finalize its receipt twice',
+)
+
+let workerDisabledHeldReceipt = null
+for (const pausedActivation of ['read_only', 'frozen', 'disabled']) {
+  replayExistingReceipt = false
+  activationState = pausedActivation
+  receiptIntakeEnabled = true
+  const traceBeforeHeld = receiptTrace.length
+  const heldReceipt = await receiptPersistenceModule
+    .recordShopifyWebhookReceiptInPostgres({
+      ...receiptInput,
+      providerEventId: `event-held-${pausedActivation}-123456789`,
+    })
+  assert.equal(heldReceipt.duplicate, false)
+  assert.equal(heldReceipt.productDeletionHeld, true)
+  workerDisabledHeldReceipt = heldReceipt
+  const heldTrace = receiptTrace.slice(traceBeforeHeld)
+  assert.equal(
+    heldTrace.find((entry) => entry.kind === 'receipt_insert').state,
+    'held',
+  )
+  assert.equal(
+    heldTrace.some((entry) => entry.kind === 'image_delete'),
+    false,
+    `Activation ${pausedActivation} must not mutate image bindings`,
+  )
+  assert.equal(
+    heldTrace.some((entry) => entry.kind === 'catalog_signal'),
+    false,
+    `Activation ${pausedActivation} must not advance the dirty watermark`,
+  )
+}
+
+const traceAtWorkerDisabledResume = receiptTrace.length
+activationState = 'active'
+assert.equal(workerDisabledHeldReceipt?.productDeletionHeld, true)
+assert.equal(
+  receiptTrace.length,
+  traceAtWorkerDisabledResume,
+  'Activation resume alone cannot consume the held receipt when the catalog worker is disabled',
+)
+
+activationState = 'shadow'
+receiptIntakeEnabled = false
+replayExistingReceipt = false
+const traceBeforeIntakePause = receiptTrace.length
+const intakePausedReceipt = await receiptPersistenceModule
+  .recordShopifyWebhookReceiptInPostgres({
+    ...receiptInput,
+    providerEventId: 'event-held-intake-paused-123456789',
+  })
+assert.equal(intakePausedReceipt.productDeletionHeld, true)
+assert.equal(
+  receiptTrace.slice(traceBeforeIntakePause)
+    .find((entry) => entry.kind === 'receipt_insert').state,
+  'held',
+)
+
+receiptIntakeEnabled = true
+activationState = 'active'
+replayExistingReceipt = true
+existingReceiptState = 'held'
+const traceBeforeHeldReplay = receiptTrace.length
+const heldReplay = await receiptPersistenceModule
+  .recordShopifyWebhookReceiptInPostgres({
+    ...receiptInput,
+    providerEventId: 'event-held-intake-paused-123456789',
+  })
+assert.equal(heldReplay.duplicate, true)
+assert.equal(heldReplay.productDeletionHeld, false)
+assert.equal(heldReplay.productDeletionReconciled, true)
+const heldReplayTrace = receiptTrace.slice(traceBeforeHeldReplay)
+const heldReplayImageIndex = heldReplayTrace.findIndex(
+  (entry) => entry.kind === 'image_delete',
+)
+const heldReplaySignalIndex = heldReplayTrace.findIndex(
+  (entry) => entry.kind === 'catalog_signal',
+)
+assert.ok(heldReplayImageIndex > -1)
+assert.ok(heldReplayImageIndex < heldReplaySignalIndex)
+assert.equal(
+  heldReplayTrace[heldReplayImageIndex].input.observedAt,
+  durableReceiptObservedAt,
+  'Held deletion replay must retain the original receipt-time ordering fence',
+)
+assert.equal(
+  heldReplayTrace.some((entry) => entry.kind === 'receipt_finalize'),
+  true,
+)
+
+heldReplayCandidatesEnabled = true
+existingReceiptState = 'held'
+const traceBeforeWorkerReplay = receiptTrace.length
+const workerReplay = await receiptPersistenceModule
+  .replayHeldShopifyProductDeletionsInPostgres({ limit: 5 })
+assert.deepEqual(JSON.parse(JSON.stringify(workerReplay)), {
+  selected: 1,
+  reconciled: 1,
+  held: 0,
+  failed: 0,
+  deadLettered: 0,
+  providerWrites: 0,
+})
+const workerReplayTrace = receiptTrace.slice(traceBeforeWorkerReplay)
+assert.ok(
+  workerReplayTrace.findIndex((entry) => entry.kind === 'image_delete')
+    < workerReplayTrace.findIndex((entry) => entry.kind === 'catalog_signal'),
+  'Catalog worker replay must persist deletion before advancing its watermark',
+)
+
+replayDecryptionMode = 'hash_mismatch'
+replayFailureState = 'held'
+const traceBeforeHashFailure = receiptTrace.length
+const hashFailure = await receiptPersistenceModule
+  .replayHeldShopifyProductDeletionsInPostgres({ limit: 5 })
+assert.deepEqual(JSON.parse(JSON.stringify(hashFailure)), {
+  selected: 1,
+  reconciled: 0,
+  held: 1,
+  failed: 1,
+  deadLettered: 0,
+  providerWrites: 0,
+})
+const hashFailureTrace = receiptTrace.slice(traceBeforeHashFailure)
+assert.deepEqual(
+  hashFailureTrace.filter((entry) => entry.kind === 'replay_failure'),
+  [{
+    kind: 'replay_failure',
+    receiptGlobalId: 'gcw1234567',
+    errorCode: 'SHOPIFY_PRODUCT_DELETE_REPLAY_FAILED',
+  }],
+  'Hash failure must remain recoverably held with only a fixed safe code',
+)
+assert.doesNotMatch(
+  JSON.stringify(hashFailureTrace),
+  /987654321|gid:\/\/shopify\/Product/,
+  'Replay failure evidence must not expose payload or product identity',
+)
+
+replayDecryptionMode = 'valid'
+const recoveredReplay = await receiptPersistenceModule
+  .replayHeldShopifyProductDeletionsInPostgres({ limit: 5 })
+assert.equal(recoveredReplay.reconciled, 1)
+assert.equal(recoveredReplay.failed, 0)
+
+replayRuntimeCredentialVersion = 4
+const traceBeforeCredentialRotation = receiptTrace.length
+const rotationHeld = await receiptPersistenceModule
+  .replayHeldShopifyProductDeletionsInPostgres({ limit: 5 })
+assert.deepEqual(JSON.parse(JSON.stringify(rotationHeld)), {
+  selected: 1,
+  reconciled: 0,
+  held: 1,
+  failed: 0,
+  deadLettered: 0,
+  providerWrites: 0,
+})
+assert.equal(
+  receiptTrace.slice(traceBeforeCredentialRotation)
+    .some((entry) => entry.kind === 'image_delete'),
+  false,
+  'A receipt selected before credential rotation must remain held',
+)
+replayRuntimeCredentialVersion = 3
+
+replayDecryptionMode = 'invalid_auth'
+replayFailureState = 'dead_letter'
+const traceBeforeAuthFailure = receiptTrace.length
+const authFailure = await receiptPersistenceModule
+  .replayHeldShopifyProductDeletionsInPostgres({ limit: 5 })
+assert.deepEqual(JSON.parse(JSON.stringify(authFailure)), {
+  selected: 1,
+  reconciled: 0,
+  held: 0,
+  failed: 1,
+  deadLettered: 1,
+  providerWrites: 0,
+})
+const authFailureTrace = receiptTrace.slice(traceBeforeAuthFailure)
+assert.doesNotMatch(
+  JSON.stringify(authFailureTrace),
+  /123456789|gid:\/\/shopify\/Product/,
+  'Decrypt/auth failure evidence must not expose payload or product identity',
+)
+assert.equal(
+  authFailureTrace.find((entry) => entry.kind === 'replay_failure')
+    ?.errorCode,
+  'SHOPIFY_PRODUCT_DELETE_REPLAY_FAILED',
+)
+replayDecryptionMode = 'valid'
+replayFailureState = 'held'
+heldReplayCandidatesEnabled = false
+
+const integrationServiceSource = read(
+  'app_src/lib/integrations/commerceIntegrations.ts',
+)
+const receiveWebhookSource = integrationServiceSource.slice(
+  integrationServiceSource.indexOf(
+    'export async function receiveShopifyWebhook',
+  ),
+)
+assert.ok(
+  receiveWebhookSource.indexOf('verifyShopifyWebhookHmac({')
+    < receiveWebhookSource.indexOf('shopifyDeletedProductEvidence({'),
+  'Product identity must not be derived until the raw Shopify body is verified',
+)
+assert.ok(
+  receiveWebhookSource.indexOf('shopifyDeletedProductEvidence({')
+    < receiveWebhookSource.indexOf('encryptCommerceWebhookPayload(')
+    && receiveWebhookSource.indexOf('encryptCommerceWebhookPayload(')
+      < receiveWebhookSource.indexOf('recordShopifyWebhookReceiptInPostgres({'),
+  'The exact delete projection and encrypted receipt must share one persistence call',
+)
 
 const catalogPersistence = read(
   'app_src/lib/persistence/commerceCatalogSync.ts',
@@ -309,6 +952,8 @@ includes(
 
 const worker = read('app_src/lib/commerceCatalogSyncWorker.ts')
 includes(worker, [
+  'replayHeldShopifyProductDeletionsInPostgres',
+  'heldProductDeletionsReconciled',
   'const followUpQueued = await queueAutomaticCommerceCatalogSyncsInPostgres()',
   'autoQueued: autoQueued + followUpQueued',
 ], 'Shopify catalog follow-up scheduling')

@@ -516,6 +516,7 @@ async function main() {
   const client = await pool.connect()
   let transactionOpen = false
   const createdGlobalIds = []
+  let createdGlobalSuffixes = []
   let migrationPreexisting = false
   let databaseName = ''
   let organizationName = ''
@@ -979,6 +980,20 @@ async function main() {
       variances: 1,
     })
 
+    const reservedSuffixes = await client.query(
+      `SELECT global_reference_suffix(reference_code, prefix) AS suffix
+       FROM crm_reference_registry
+       WHERE reference_code = ANY($1::text[])
+       ORDER BY reference_code`,
+      [createdGlobalIds],
+    )
+    createdGlobalSuffixes = reservedSuffixes.rows.map((row) => row.suffix)
+    assert.equal(
+      createdGlobalSuffixes.length,
+      createdGlobalIds.length,
+      'every transaction-local Global ID must have one reserved suffix',
+    )
+
     await client.query('ROLLBACK')
     transactionOpen = false
 
@@ -1008,7 +1023,7 @@ async function main() {
         [
           customerSourceKey,
           createdGlobalIds,
-          createdGlobalIds.map((globalId) => globalId.slice(-7)),
+          createdGlobalSuffixes,
         ],
       )
       assert.deepEqual(durableResidue.rows[0], {

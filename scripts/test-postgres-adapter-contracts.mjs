@@ -1768,6 +1768,147 @@ assert.ok(
   (healthRoute.match(/faire_provider_write_auth_applied/g) || []).length >= 4,
   'Faire provider-write readiness must gate both migrationsCurrent and health errors',
 )
+const commerceProductImageImportMigration = read(
+  'db/migrations/0221_operations_commerce_product_image_imports.sql',
+)
+for (const fragment of [
+  'operations_commerce_product_image_snapshot_fences',
+  'operations_commerce_product_image_observation_sets',
+  'operations_commerce_product_image_observations',
+  'operations_commerce_product_image_observation_set_memberships',
+  'operations_commerce_product_image_import_jobs',
+  'operations_commerce_product_image_import_worker_heartbeat',
+  'operations_commerce_product_image_asset_provenance',
+  'operations_commerce_product_image_bindings',
+  'operations_commerce_product_image_account_is_current',
+  'operations_commerce_product_image_mapping_resolution',
+  'guard_operations_commerce_product_image_snapshot_fence_write',
+  'guard_operations_commerce_product_image_snapshot_fence()',
+  'guard_operations_commerce_product_image_observation_set_write',
+  'guard_operations_commerce_product_image_observation_set()',
+  'guard_operations_commerce_product_image_set_member_write',
+  'guard_operations_commerce_product_image_observation_set_membership()',
+  'validate_operations_commerce_image_set_membership',
+  'validate_operations_commerce_image_set_member_insert',
+  'validate_ops_commerce_image_set_evidence',
+  'validate_ops_commerce_image_set_row()',
+  'validate_ops_commerce_image_member_row()',
+  'guard_operations_commerce_product_image_observation_write',
+  'guard_operations_commerce_product_image_import_job_write',
+  'guard_operations_commerce_product_image_provenance_write',
+  'guard_operations_commerce_product_image_binding_write',
+  'guard_operations_commerce_product_image_binding()',
+  'ops_commerce_image_observation_set_fkey',
+  'ops_commerce_image_job_observation_generation_unique',
+  'ops_commerce_image_job_single_flight_idx',
+]) {
+  assertIncludes(
+    commerceProductImageImportMigration,
+    fragment,
+    'commerce product image import database authority',
+  )
+  assertIncludes(
+    healthRoute,
+    fragment,
+    'hosted commerce product image import health',
+  )
+}
+assertIncludes(
+  commerceProductImageImportMigration,
+  'observation_set_id uuid NOT NULL',
+  'commerce product image observation-set membership',
+)
+for (const fragment of [
+  'job_generation integer NOT NULL',
+  'import_job_generation integer NOT NULL',
+  'latest_import_job_generation integer NOT NULL',
+  "trigger_row.tgtype = 5",
+  'trigger_row.tgdeferrable',
+  'trigger_row.tginitdeferred',
+]) {
+  assertIncludes(
+    fragment.startsWith('trigger_row.')
+      ? healthRoute
+      : commerceProductImageImportMigration,
+    fragment,
+    'commerce product image successor and membership health',
+  )
+}
+for (const fragment of [
+  "attribute.attname = 'observation_set_id'",
+  'attribute.attnotnull',
+  'NOT attribute.attisdropped',
+  "fk.confdeltype = 'r'",
+  "'ops_commerce_image_observation_set_fkey'",
+  "'observation_set_id'",
+]) {
+  assertIncludes(
+    healthRoute,
+    fragment,
+    'commerce product image observation-set structural health',
+  )
+}
+const commerceProductImageImportPersistence = read(
+  'app_src/lib/persistence/commerceProductImageImports.ts',
+)
+assertIncludes(
+  commerceProductImageImportPersistence,
+  'export async function readCommerceProductImageImportQueueHealthInPostgres',
+  'commerce product image import persistence health API',
+)
+assertIncludes(
+  healthRoute,
+  'readCommerceProductImageImportQueueHealthInPostgres',
+  'commerce product image import queue health',
+)
+assertIncludes(
+  healthRoute,
+  'commerceProductImageImportWorker',
+  'commerce product image import worker health response',
+)
+const commerceProductImageWorkerHealthStart = healthRoute.indexOf(
+  'const imageQueue =',
+)
+const commerceProductImageWorkerHealthEnd = healthRoute.indexOf(
+  'const knowledgeResult =',
+  commerceProductImageWorkerHealthStart,
+)
+assert.ok(
+  commerceProductImageWorkerHealthStart >= 0
+    && commerceProductImageWorkerHealthEnd
+      > commerceProductImageWorkerHealthStart,
+  'commerce product image worker health block is missing',
+)
+const commerceProductImageWorkerHealth = healthRoute.slice(
+  commerceProductImageWorkerHealthStart,
+  commerceProductImageWorkerHealthEnd,
+)
+for (const fragment of [
+  'await readCommerceProductImageImportQueueHealthInPostgres()',
+  'if (!loopReachable)',
+  "errors.push(\n                'Commerce product image import worker heartbeat is missing or stale.'",
+  'if (imageQueue.deadCount > 0)',
+  'if (imageQueue.staleLeaseCount > 0)',
+  'if (imageQueue.overdueCount > 0)',
+  'if (imageQueue.retryCount > 0)',
+  "warnings.push(\n                'Commerce product image import queue has terminal failed jobs.'",
+  "warnings.push(\n                'Commerce product image import queue has stale claimed jobs.'",
+  "warnings.push(\n                'Commerce product image import queue has overdue jobs.'",
+  "warnings.push(\n                'Commerce product image import jobs are retrying.'",
+]) {
+  assertIncludes(
+    commerceProductImageWorkerHealth,
+    fragment,
+    'commerce product image worker health semantics',
+  )
+}
+assert.ok(
+  (
+    healthRoute.match(/operations_commerce_product_image_imports_applied/g)
+    || []
+  ).length >= 4,
+  'Commerce product image readiness must gate migrations, health, and worker checks',
+)
 for (const [, alias] of healthRoute.matchAll(/\)\s+AS\s+([a-z0-9_]+)\s*,?/gi)) {
   assert.ok(
     alias.length <= 63,

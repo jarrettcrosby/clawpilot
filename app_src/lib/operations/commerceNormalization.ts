@@ -1,15 +1,21 @@
 import { createHash } from 'node:crypto'
+import { isIP } from 'node:net'
 
 export const COMMERCE_NORMALIZATION_ENVELOPE_VERSION =
   'commerce-normalization-envelope-v1' as const
 export const COMMERCE_NORMALIZED_PRODUCT_VERSION =
-  'commerce-normalized-product-v3' as const
+  'commerce-normalized-product-v4' as const
 export const COMMERCE_NORMALIZED_VARIANT_VERSION =
   'commerce-normalized-variant-v1' as const
 export const COMMERCE_NORMALIZED_ORDER_VERSION =
   'commerce-normalized-order-v1' as const
 export const COMMERCE_NORMALIZED_ORDER_LINE_VERSION =
   'commerce-normalized-order-line-v1' as const
+
+export const COMMERCE_NORMALIZED_PRODUCT_IMAGE_MAX_COUNT = 50
+export const COMMERCE_NORMALIZED_PRODUCT_IMAGE_ALT_TEXT_MAX_LENGTH = 500
+export const COMMERCE_NORMALIZED_PRODUCT_IMAGE_MAX_DIMENSION_PIXELS = 8_192
+export const COMMERCE_NORMALIZED_PRODUCT_IMAGE_MAX_AREA_PIXELS = 40_000_000
 
 export type CommerceNormalizationProvider = 'shopify' | 'faire'
 export type CommerceExternalResourceType =
@@ -156,6 +162,31 @@ export type CommerceProviderTaxonomy = Readonly<{
   marketplacePaths: readonly string[]
 }>
 
+/**
+ * Safe product-image discovery evidence. Provider URLs are used only long
+ * enough to validate the locator and derive a query-free fingerprint; neither
+ * the URL nor image bytes belong in the normalized or durable intake record.
+ * `sequence` is the zero-based ordinal after provider ordering and dedupe.
+ */
+export type CommerceNormalizedProductImage = Readonly<{
+  providerImageId: string | null
+  locatorFingerprint: string
+  sequence: number
+  altText: string | null
+  widthPixels: number | null
+  heightPixels: number | null
+}>
+
+export type CommerceProductImageCandidate = Readonly<{
+  providerImageId: unknown
+  locatorUrl: unknown
+  providerSequence: unknown
+  sourceIndex: number
+  altText: unknown
+  widthPixels: unknown
+  heightPixels: unknown
+}>
+
 export type CommerceNormalizedVariant = Readonly<{
   schemaVersion: typeof COMMERCE_NORMALIZED_VARIANT_VERSION
   identity: CommerceExternalIdentity
@@ -192,6 +223,8 @@ export type CommerceNormalizedProduct = Readonly<{
   active: boolean | null
   providerCreatedAt: string | null
   providerUpdatedAt: string | null
+  imageSetComplete: boolean
+  images: readonly CommerceNormalizedProductImage[]
   variants: readonly CommerceNormalizedVariant[]
   sourceHash: string
 }>
@@ -484,6 +517,297 @@ const COMMERCE_NORMALIZATION_REJECTION_MESSAGES = Object.freeze({
   COMMERCE_PRODUCT_RECORD_INVALID:
     'Provider product record could not be normalized.',
 } satisfies Record<CommerceNormalizationRejectionCode, string>)
+
+function publicIpv4Literal(address: string): boolean {
+  const octets = address.split('.').map(Number)
+  if (octets.length !== 4 || octets.some((value) => (
+    !Number.isInteger(value) || value < 0 || value > 255
+  ))) return false
+  const [a, b, c] = octets
+  return !(
+    a === 0
+    || a === 10
+    || a === 127
+    || (a === 100 && b >= 64 && b <= 127)
+    || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && b === 0 && [0, 2].includes(c))
+    || (a === 192 && b === 168)
+    || (a === 198 && [18, 19].includes(b))
+    || (a === 198 && b === 51 && c === 100)
+    || (a === 203 && b === 0 && c === 113)
+    || a >= 224
+  )
+}
+
+function ipv6LiteralValue(address: string): bigint | null {
+  const [leftValue, rightValue, ...extra] = address.split('::')
+  if (extra.length > 0) return null
+  const left = leftValue ? leftValue.split(':') : []
+  const right = rightValue ? rightValue.split(':') : []
+  const missing = 8 - left.length - right.length
+  if (
+    (address.includes('::') ? missing < 1 : missing !== 0)
+    || [...left, ...right].some((part) => !/^[0-9a-f]{1,4}$/i.test(part))
+  ) return null
+  const groups = [
+    ...left,
+    ...Array.from({ length: missing }, () => '0'),
+    ...right,
+  ]
+  if (groups.length !== 8) return null
+  return groups.reduce(
+    (value, group) => (value << BigInt(16)) | BigInt(`0x${group}`),
+    BigInt(0),
+  )
+}
+
+function ipv6InRange(value: bigint, prefix: bigint, bits: number): boolean {
+  const shift = BigInt(128 - bits)
+  return (value >> shift) === (prefix >> shift)
+}
+
+function publicIpv6Literal(address: string): boolean {
+  const value = ipv6LiteralValue(address)
+  if (value === null) return false
+  return !(
+    ipv6InRange(value, BigInt(0), 96)
+    || ipv6InRange(value, BigInt('0xffff') << BigInt(32), 96)
+    || ipv6InRange(value, BigInt('0x100') << BigInt(112), 64)
+    || ipv6InRange(value, BigInt('0xfc00') << BigInt(112), 7)
+    || ipv6InRange(value, BigInt('0xfe80') << BigInt(112), 10)
+    || ipv6InRange(value, BigInt('0xff00') << BigInt(112), 8)
+    || ipv6InRange(value, BigInt('0x20010002') << BigInt(96), 48)
+    || ipv6InRange(value, BigInt('0x20010010') << BigInt(96), 28)
+    || ipv6InRange(value, BigInt('0x20010020') << BigInt(96), 28)
+    || ipv6InRange(value, BigInt('0x20010db8') << BigInt(96), 32)
+    || ipv6InRange(value, BigInt('0x2002') << BigInt(112), 16)
+    || ipv6InRange(value, BigInt('0x3fff') << BigInt(112), 20)
+  )
+}
+
+function publicProductImageHostname(value: string): boolean {
+  const hostname = value.toLowerCase().replace(/^\[|\]$/g, '')
+  if (
+    !hostname
+    || hostname.length > 253
+    || hostname === 'localhost'
+    || hostname.endsWith('.localhost')
+    || hostname.endsWith('.local')
+    || hostname.endsWith('.internal')
+    || hostname.endsWith('.home.arpa')
+    || hostname.endsWith('.test')
+    || hostname.endsWith('.invalid')
+    || hostname.endsWith('.example')
+    || hostname.endsWith('.onion')
+  ) return false
+  const family = isIP(hostname)
+  if (family === 4) return publicIpv4Literal(hostname)
+  if (family === 6) return publicIpv6Literal(hostname)
+  return hostname.includes('.')
+}
+
+/**
+ * Returns only a one-way locator fingerprint. The validated, query-free URL
+ * intentionally never crosses this normalization boundary.
+ */
+export function commerceProductImageLocatorFingerprint(
+  value: unknown,
+): string | null {
+  if (
+    typeof value !== 'string'
+    || !value
+    || value.length > 4_096
+    || value !== value.trim()
+    || CONTROL_CHARACTER.test(value)
+  ) return null
+  let locator: URL
+  try {
+    locator = new URL(value)
+  } catch {
+    return null
+  }
+  if (
+    locator.protocol !== 'https:'
+    || locator.username
+    || locator.password
+    || !publicProductImageHostname(locator.hostname)
+  ) return null
+  locator.search = ''
+  locator.hash = ''
+  const normalizedLocator = locator.toString()
+  if (normalizedLocator.length > 4_096) return null
+  return createHash('sha256').update(normalizedLocator).digest('hex')
+}
+
+function normalizedProductImageProviderId(value: unknown): string | null {
+  if (value === undefined || value === null || value === '') return null
+  return (
+    typeof value === 'string'
+    && value === value.trim()
+    && value.length <= 512
+    && !CONTROL_CHARACTER.test(value)
+  ) ? value : null
+}
+
+function normalizedProductImageDimension(value: unknown): Readonly<{
+  valid: boolean
+  value: number | null
+}> {
+  if (value === undefined || value === null) {
+    return { valid: true, value: null }
+  }
+  return Number.isSafeInteger(value)
+    && Number(value) > 0
+    && Number(value) <= COMMERCE_NORMALIZED_PRODUCT_IMAGE_MAX_DIMENSION_PIXELS
+    ? { valid: true, value: Number(value) }
+    : { valid: false, value: null }
+}
+
+function normalizedProductImageAltText(value: unknown): string | null {
+  if (value === undefined || value === null || value === '') return null
+  if (typeof value !== 'string' || CONTROL_CHARACTER.test(value)) return null
+  const trimmed = value.trim()
+  return trimmed
+    && trimmed.length <= COMMERCE_NORMALIZED_PRODUCT_IMAGE_ALT_TEXT_MAX_LENGTH
+    ? trimmed
+    : null
+}
+
+function normalizeCommerceProductImageCandidates(
+  candidates: readonly CommerceProductImageCandidate[],
+  maximum = COMMERCE_NORMALIZED_PRODUCT_IMAGE_MAX_COUNT,
+): Readonly<{
+  images: readonly CommerceNormalizedProductImage[]
+  rejectedCount: number
+}> {
+  const boundedMaximum = Number.isSafeInteger(maximum)
+    ? Math.max(0, Math.min(
+        Number(maximum),
+        COMMERCE_NORMALIZED_PRODUCT_IMAGE_MAX_COUNT,
+      ))
+    : 0
+  if (boundedMaximum === 0) {
+    return Object.freeze({
+      images: Object.freeze([]),
+      rejectedCount: candidates.length,
+    })
+  }
+  let rejectedCount = Math.max(0, candidates.length - boundedMaximum)
+  const normalized = candidates.slice(0, boundedMaximum).flatMap(
+    (candidate) => {
+      const providerImageId = normalizedProductImageProviderId(
+        candidate.providerImageId,
+      )
+      if (
+        candidate.providerImageId !== undefined
+        && candidate.providerImageId !== null
+        && candidate.providerImageId !== ''
+        && !providerImageId
+      ) {
+        rejectedCount += 1
+        return []
+      }
+      const hasLocator = !(
+        candidate.locatorUrl === undefined
+        || candidate.locatorUrl === null
+        || candidate.locatorUrl === ''
+      )
+      const locatorFingerprint = hasLocator
+        ? commerceProductImageLocatorFingerprint(candidate.locatorUrl)
+        : null
+      if (!locatorFingerprint) {
+        rejectedCount += 1
+        return []
+      }
+      const width = normalizedProductImageDimension(candidate.widthPixels)
+      const height = normalizedProductImageDimension(candidate.heightPixels)
+      if (
+        !width.valid
+        || !height.valid
+        || ((width.value === null) !== (height.value === null))
+        || (
+          width.value !== null
+          && height.value !== null
+          && width.value * height.value
+            > COMMERCE_NORMALIZED_PRODUCT_IMAGE_MAX_AREA_PIXELS
+        )
+      ) {
+        rejectedCount += 1
+        return []
+      }
+      const providerSequence = candidate.providerSequence === undefined
+        || candidate.providerSequence === null
+        ? candidate.sourceIndex
+        : candidate.providerSequence
+      if (
+        !Number.isSafeInteger(providerSequence)
+        || Number(providerSequence) < 0
+        || Number(providerSequence) > 1_000_000
+        || !Number.isSafeInteger(candidate.sourceIndex)
+        || candidate.sourceIndex < 0
+      ) {
+        rejectedCount += 1
+        return []
+      }
+      return [{
+        providerImageId,
+        locatorFingerprint,
+        providerSequence: Number(providerSequence),
+        sourceIndex: candidate.sourceIndex,
+        altText: normalizedProductImageAltText(candidate.altText),
+        widthPixels: width.value,
+        heightPixels: height.value,
+      }]
+    },
+  )
+  normalized.sort((left, right) => (
+    left.providerSequence - right.providerSequence
+    || left.sourceIndex - right.sourceIndex
+  ))
+  const seen = new Map<string, (typeof normalized)[number]>()
+  const result: CommerceNormalizedProductImage[] = []
+  for (const image of normalized) {
+    const key = image.providerImageId
+      ? `provider:${image.providerImageId}`
+      : `locator:${image.locatorFingerprint}`
+    const prior = seen.get(key)
+    if (prior) {
+      if (
+        image.providerImageId
+        && prior.locatorFingerprint !== image.locatorFingerprint
+      ) rejectedCount += 1
+      continue
+    }
+    seen.set(key, image)
+    result.push(Object.freeze({
+      providerImageId: image.providerImageId,
+      locatorFingerprint: image.locatorFingerprint,
+      sequence: result.length,
+      altText: image.altText,
+      widthPixels: image.widthPixels,
+      heightPixels: image.heightPixels,
+    }))
+  }
+  return Object.freeze({
+    images: Object.freeze(result),
+    rejectedCount,
+  })
+}
+
+export function normalizeCommerceProductImageSet(
+  candidates: readonly CommerceProductImageCandidate[],
+  maximum = COMMERCE_NORMALIZED_PRODUCT_IMAGE_MAX_COUNT,
+) {
+  return normalizeCommerceProductImageCandidates(candidates, maximum)
+}
+
+export function normalizeCommerceProductImages(
+  candidates: readonly CommerceProductImageCandidate[],
+  maximum = COMMERCE_NORMALIZED_PRODUCT_IMAGE_MAX_COUNT,
+): readonly CommerceNormalizedProductImage[] {
+  return normalizeCommerceProductImageCandidates(candidates, maximum).images
+}
 
 export function normalizeCommerceCurrency(value: unknown): string {
   if (typeof value !== 'string') {

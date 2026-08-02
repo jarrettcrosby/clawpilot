@@ -187,7 +187,7 @@ includes(persistence, [
   "'read_products'",
   "'read_inventory'",
   'FOR UPDATE OF account, credential',
-  "receiptIntakeEnabled ? 'queued' : 'held'",
+  "receiptState: 'queued' | 'held'",
   'Shopify webhook credential generation changed before receipt commit',
   'createFaireOAuthInstallationInPostgres',
   'purgeExpiredFaireOAuthInstallationsInPostgres',
@@ -215,6 +215,9 @@ includes(commerceEnablePersistence, [
   "'write_products'",
   "'read_inventory'",
   "'write_inventory'",
+  'replayHeldShopifyProductDeletionsInPostgres({',
+  'organizationId: input.organizationId',
+  'accountGlobalId: input.accountGlobalId',
 ], 'Shopify receipt-intake readiness')
 assert.doesNotMatch(
   commerceEnablePersistence,

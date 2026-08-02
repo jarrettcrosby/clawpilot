@@ -31,6 +31,8 @@ export type CrmProductImageAsset = {
   pixelHeight: number
   altText: string
   source: CrmProductImageAssetSource
+  providerBindingGlobalId: string | null
+  providerSequence: number | null
   isPrimary: boolean
   createdBy: string
   updatedBy: string
@@ -75,6 +77,8 @@ type AssetRow = QueryResultRow & {
   pixel_height: number
   alt_text: string
   source: string
+  provider_binding_global_id: string | null
+  provider_sequence: number | null
   is_primary: boolean
   created_by: string
   updated_by: string
@@ -93,14 +97,61 @@ const ASSET_PROJECTION = `
     asset.byte_length,
     asset.pixel_width,
     asset.pixel_height,
-    asset.alt_text,
+    CASE WHEN asset.source = 'provider_import'
+      THEN current_provider_binding.effective_alt_text
+      ELSE asset.alt_text
+    END AS alt_text,
     asset.source,
+    current_provider_binding.global_id AS provider_binding_global_id,
+    current_provider_binding.provider_sequence,
     asset.is_primary,
     asset.created_by,
     asset.updated_by,
     asset.created_at,
     asset.updated_at
   FROM crm_product_image_assets asset
+  LEFT JOIN LATERAL (
+    SELECT
+      binding.global_id,
+      binding.provider_sequence,
+      binding.effective_alt_text
+    FROM operations_commerce_product_image_bindings binding
+    WHERE binding.organization_id = asset.organization_id
+      AND binding.pipeline_id = asset.pipeline_id
+      AND binding.product_id = asset.product_id
+      AND binding.asset_id = asset.id
+      AND binding.lifecycle_state = 'active'
+      AND operations_commerce_product_image_observation_is_current_active(
+        binding.organization_id,
+        binding.latest_observation_id
+      )
+      AND operations_commerce_product_image_account_is_current(
+        binding.organization_id,
+        binding.integration_account_id,
+        binding.provider,
+        binding.credential_generation
+      )
+      AND operations_commerce_product_image_job_fences_are_current(
+        binding.organization_id,
+        binding.latest_import_job_id
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM operations_activation_scopes activation
+        WHERE activation.organization_id = binding.organization_id
+          AND activation.data_pipeline_id = binding.pipeline_id
+          AND activation.state IN ('shadow', 'active')
+          AND activation.revision = binding.activation_revision
+      )
+    ORDER BY
+      binding.provider_sequence,
+      binding.provider,
+      binding.integration_account_id::text,
+      binding.external_product_id,
+      binding.image_identity_sha256,
+      binding.id
+    LIMIT 1
+  ) current_provider_binding ON asset.source = 'provider_import'
 `
 
 function fail(code: string, message: string, status = 400): never {
@@ -152,6 +203,17 @@ function toAsset(row: AssetRow): CrmProductImageAsset {
     || row.pixel_width * row.pixel_height > CRM_PRODUCT_IMAGE_MAX_PIXELS
     || !row.alt_text.trim()
     || !['manual_upload', 'provider_import', 'migration'].includes(row.source)
+    || (
+      row.source === 'provider_import'
+      && (
+        !row.provider_binding_global_id
+        || !/^gcib[0-9a-v]{12}$/.test(row.provider_binding_global_id)
+        || !Number.isSafeInteger(row.provider_sequence)
+        || row.provider_sequence === null
+        || row.provider_sequence < 0
+        || row.provider_sequence > 10000
+      )
+    )
     || typeof row.created_by !== 'string'
     || !row.created_by.trim()
     || typeof row.updated_by !== 'string'
@@ -175,6 +237,8 @@ function toAsset(row: AssetRow): CrmProductImageAsset {
     pixelHeight: row.pixel_height,
     altText: row.alt_text,
     source: row.source as CrmProductImageAssetSource,
+    providerBindingGlobalId: row.provider_binding_global_id,
+    providerSequence: row.provider_sequence,
     isPrimary: row.is_primary === true,
     createdBy: row.created_by,
     updatedBy: row.updated_by,
@@ -224,7 +288,15 @@ async function listAssets(
      WHERE asset.organization_id = $1::uuid
        AND asset.pipeline_id = $2::uuid
        AND asset.product_id = $3::uuid
-     ORDER BY asset.is_primary DESC, asset.asset_revision, asset.id`,
+       AND (
+         asset.source <> 'provider_import'
+         OR current_provider_binding.global_id IS NOT NULL
+       )
+     ORDER BY
+       asset.is_primary DESC,
+       current_provider_binding.provider_sequence NULLS LAST,
+       asset.asset_revision,
+       asset.id`,
     [organizationId, product.pipeline_id, product.id],
   )
   const assets = result.rows.map(toAsset)
@@ -291,20 +363,66 @@ export async function readCrmProductImageAssetBytesInPostgres(input: {
       alt_text: string
     }>(
       `SELECT
-         content_bytes,
-         mime_type,
-         content_sha256,
-         byte_length,
-         pixel_width,
-         pixel_height,
-         alt_text
-       FROM crm_product_image_assets
-       WHERE organization_id = $1::uuid
-         AND pipeline_id = $2::uuid
-         AND product_id = $3::uuid
-         AND id = $4::uuid
+         asset.content_bytes,
+         asset.mime_type,
+         asset.content_sha256,
+         asset.byte_length,
+         asset.pixel_width,
+         asset.pixel_height,
+         CASE WHEN asset.source = 'provider_import'
+           THEN current_provider_binding.effective_alt_text
+           ELSE asset.alt_text
+         END AS alt_text
+       FROM crm_product_image_assets asset
+       LEFT JOIN LATERAL (
+         SELECT binding.effective_alt_text, binding.global_id
+         FROM operations_commerce_product_image_bindings binding
+         WHERE binding.organization_id = asset.organization_id
+           AND binding.pipeline_id = asset.pipeline_id
+           AND binding.product_id = asset.product_id
+           AND binding.asset_id = asset.id
+           AND binding.lifecycle_state = 'active'
+           AND operations_commerce_product_image_observation_is_current_active(
+             binding.organization_id,
+             binding.latest_observation_id
+           )
+           AND operations_commerce_product_image_account_is_current(
+             binding.organization_id,
+             binding.integration_account_id,
+             binding.provider,
+             binding.credential_generation
+           )
+           AND operations_commerce_product_image_job_fences_are_current(
+             binding.organization_id,
+             binding.latest_import_job_id
+           )
+           AND EXISTS (
+             SELECT 1
+             FROM operations_activation_scopes activation
+             WHERE activation.organization_id = binding.organization_id
+               AND activation.data_pipeline_id = binding.pipeline_id
+               AND activation.state IN ('shadow', 'active')
+               AND activation.revision = binding.activation_revision
+           )
+         ORDER BY
+           binding.provider_sequence,
+           binding.provider,
+           binding.integration_account_id::text,
+           binding.external_product_id,
+           binding.image_identity_sha256,
+           binding.id
+         LIMIT 1
+       ) current_provider_binding ON asset.source = 'provider_import'
+       WHERE asset.organization_id = $1::uuid
+         AND asset.pipeline_id = $2::uuid
+         AND asset.product_id = $3::uuid
+         AND asset.id = $4::uuid
+         AND (
+           asset.source <> 'provider_import'
+           OR current_provider_binding.global_id IS NOT NULL
+       )
        LIMIT 1
-       FOR SHARE`,
+       FOR SHARE OF asset`,
       [
         input.organizationId,
         product.pipeline_id,
@@ -400,7 +518,43 @@ export async function uploadCrmProductImageAssetInPostgres(input: {
     }>(
       `SELECT
          (COALESCE(max(asset_revision), 0) + 1)::text AS next_revision,
-         COALESCE(bool_or(is_primary), false) AS has_primary
+         COALESCE(bool_or(
+           is_primary AND (
+             source <> 'provider_import'
+             OR EXISTS (
+               SELECT 1
+               FROM operations_commerce_product_image_bindings binding
+               WHERE binding.organization_id =
+                     crm_product_image_assets.organization_id
+                 AND binding.pipeline_id = crm_product_image_assets.pipeline_id
+                 AND binding.product_id = crm_product_image_assets.product_id
+                 AND binding.asset_id = crm_product_image_assets.id
+                 AND binding.lifecycle_state = 'active'
+                 AND operations_commerce_product_image_observation_is_current_active(
+                   binding.organization_id,
+                   binding.latest_observation_id
+                 )
+                 AND operations_commerce_product_image_account_is_current(
+                   binding.organization_id,
+                   binding.integration_account_id,
+                   binding.provider,
+                   binding.credential_generation
+                 )
+                 AND operations_commerce_product_image_job_fences_are_current(
+                   binding.organization_id,
+                   binding.latest_import_job_id
+                 )
+                 AND EXISTS (
+                   SELECT 1
+                   FROM operations_activation_scopes activation
+                   WHERE activation.organization_id = binding.organization_id
+                     AND activation.data_pipeline_id = binding.pipeline_id
+                     AND activation.state IN ('shadow', 'active')
+                     AND activation.revision = binding.activation_revision
+                 )
+             )
+           )
+         ), false) AS has_primary
        FROM crm_product_image_assets
        WHERE organization_id = $1::uuid
          AND pipeline_id = $2::uuid
@@ -556,6 +710,41 @@ export async function setPrimaryCrmProductImageAssetInPostgres(input: {
          AND pipeline_id = $2::uuid
          AND product_id = $3::uuid
          AND id = $4::uuid
+         AND (
+           source <> 'provider_import'
+           OR EXISTS (
+             SELECT 1
+             FROM operations_commerce_product_image_bindings binding
+             WHERE binding.organization_id =
+                   crm_product_image_assets.organization_id
+               AND binding.pipeline_id = crm_product_image_assets.pipeline_id
+               AND binding.product_id = crm_product_image_assets.product_id
+               AND binding.asset_id = crm_product_image_assets.id
+               AND binding.lifecycle_state = 'active'
+               AND operations_commerce_product_image_observation_is_current_active(
+                 binding.organization_id,
+                 binding.latest_observation_id
+               )
+               AND operations_commerce_product_image_account_is_current(
+                 binding.organization_id,
+                 binding.integration_account_id,
+                 binding.provider,
+                 binding.credential_generation
+               )
+               AND operations_commerce_product_image_job_fences_are_current(
+                 binding.organization_id,
+                 binding.latest_import_job_id
+               )
+               AND EXISTS (
+                 SELECT 1
+                 FROM operations_activation_scopes activation
+                 WHERE activation.organization_id = binding.organization_id
+                   AND activation.data_pipeline_id = binding.pipeline_id
+                   AND activation.state IN ('shadow', 'active')
+                   AND activation.revision = binding.activation_revision
+               )
+           )
+         )
        LIMIT 1
        FOR UPDATE`,
       [

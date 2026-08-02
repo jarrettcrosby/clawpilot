@@ -233,6 +233,80 @@ function orderFixture(input) {
   })
 }
 
+function productImageFixture() {
+  const providerImageId = 'gid://shopify/MediaImage/9201001'
+  const locatorFingerprint = hash('commerce-staging-product-image-locator')
+  return Object.freeze({
+    product: Object.freeze({
+      schemaVersion: 'commerce-normalized-product-v1',
+      identity: Object.freeze({
+        provider: 'shopify',
+        resourceType: 'product',
+        value: 'gid://shopify/Product/9201001',
+      }),
+      title: 'Commerce staging image-only product',
+      vendor: 'ClawPilot acceptance',
+      productType: 'Test',
+      providerTaxonomy: unavailable(),
+      variants: Object.freeze([]),
+      images: Object.freeze([Object.freeze({
+        providerImageId,
+        locatorFingerprint,
+        sequence: 1,
+        altText: 'Commerce staging image',
+        widthPixels: 640,
+        heightPixels: 480,
+      })]),
+      imageSetComplete: true,
+      providerCreatedAt: observedAt,
+      providerUpdatedAt: observedAt,
+      sourceHash: hash('commerce-staging-product-source'),
+    }),
+    expectedObservation: Object.freeze({
+      providerImageId,
+      locatorSha256: locatorFingerprint,
+      sequence: 1,
+      altText: 'Commerce staging image',
+      pixelWidth: 640,
+      pixelHeight: 480,
+      sourceHash: commandHash({
+        schema: 'commerce-product-image-observation-v1',
+        provider: 'shopify',
+        providerImageId,
+        locatorSha256: locatorFingerprint,
+        sequence: 1,
+        altText: 'Commerce staging image',
+        pixelWidth: 640,
+        pixelHeight: 480,
+      }),
+    }),
+  })
+}
+
+async function assertAccountScopeIsLocked(pool, input) {
+  const probe = await pool.connect()
+  try {
+    await probe.query('BEGIN')
+    await assert.rejects(
+      probe.query(
+        `SELECT account.id
+         FROM operations_integration_accounts account
+         JOIN operations_activation_scopes activation
+           ON activation.organization_id = account.organization_id
+         WHERE account.organization_id = $1::uuid
+           AND account.id = $2::uuid
+         FOR UPDATE OF account, activation NOWAIT`,
+        [input.organizationId, input.integrationAccountId],
+      ),
+      (error) => error?.code === '55P03',
+      'Image reconciliation must run after the account scope is row-locked',
+    )
+  } finally {
+    await probe.query('ROLLBACK').catch(() => {})
+    probe.release()
+  }
+}
+
 class CommerceIntegrationRequestError extends Error {
   constructor(message, status = 400, code = 'COMMERCE_REQUEST_INVALID') {
     super(message)
@@ -255,12 +329,80 @@ function loadCommerceStagingService(pool, counters) {
   const mustNotRun = (name) => () => {
     throw new Error(`${name} must not run during order-only staging acceptance`)
   }
+  const reconcileCommerceProductImageSetWithClient = async (
+    input,
+    client,
+  ) => {
+    const transactionClient = counters.activeTransactionClient
+    counters.imageReconcileCalls.push({
+      client,
+      transactionClient,
+      input: JSON.parse(JSON.stringify(input)),
+    })
+    const expectedStage = counters.expectedImageStage
+    assert.ok(expectedStage, 'Image reconciliation requires stage evidence')
+    assert.strictEqual(
+      client,
+      transactionClient,
+      'Image reconciliation must share the intake-stage transaction client',
+    )
+    await assertAccountScopeIsLocked(pool, input)
+    const stageEvidence = await client.query(
+      `SELECT run.id::text, intent.intent_state, intent.staged_run_id::text
+       FROM operations_commerce_intake_runs run
+       JOIN operations_commerce_intake_read_intents intent
+         ON intent.organization_id = run.organization_id
+        AND intent.integration_account_id = run.integration_account_id
+       WHERE run.organization_id = $1::uuid
+         AND run.integration_account_id = $2::uuid
+         AND run.idempotency_key = $3
+         AND intent.id = $4::uuid`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        expectedStage.idempotencyKey,
+        expectedStage.readIntentId,
+      ],
+    )
+    assert.equal(stageEvidence.rowCount, 1)
+    assert.equal(stageEvidence.rows[0].intent_state, 'captured')
+    assert.equal(stageEvidence.rows[0].staged_run_id, null)
+    if (counters.imageReconcileError) {
+      throw counters.imageReconcileError
+    }
+    return {
+      staleSnapshotIgnored: false,
+      active: input.images.map(() => ({ jobState: 'queued' })),
+      removed: [],
+    }
+  }
   return loadTypeScriptModule(
     'app_src/lib/persistence/commerceIntake.ts',
     {
       '@/lib/auditWriter': {
-        async recordAuditEvent() {
+        async recordAuditEvent(input, client) {
           counters.auditEvents += 1
+          assert.ok(client, 'Commerce intake audit must share its transaction')
+          await client.query(
+            `INSERT INTO audit_events (
+               actor, event_type, aggregate_type, aggregate_id, payload,
+               event_key, subject, organization_id, is_system
+             ) VALUES (
+               $1, $2, $3, $4, $5::jsonb, $6, $7, $8::uuid, $9
+             )
+             ON CONFLICT (event_key) WHERE event_key IS NOT NULL DO NOTHING`,
+            [
+              input.actor || null,
+              input.eventType,
+              input.aggregateType || null,
+              input.aggregateId || null,
+              JSON.stringify(input.payload || {}),
+              input.eventKey || null,
+              input.subject || input.actor || null,
+              input.organizationId || null,
+              input.isSystem === true,
+            ],
+          )
         },
       },
       '@/lib/integrations/commerceCredentialCrypto': {
@@ -298,9 +440,11 @@ function loadCommerceStagingService(pool, counters) {
         },
       },
       '@/lib/integrations/commerceProductLifecycle': {
-        normalizeCommerceProductChannelStatus: mustNotRun(
-          'normalizeCommerceProductChannelStatus',
-        ),
+        normalizeCommerceProductChannelStatus: () => ({
+          raw: 'ACTIVE',
+          normalized: 'active',
+          providerActive: true,
+        }),
       },
       '@/lib/integrations/commerceCanonicalProductIdentity': {
         selectCanonicalCommerceProductIdentity: mustNotRun(
@@ -315,6 +459,9 @@ function loadCommerceStagingService(pool, counters) {
       '@/lib/integrations/commercePackRuntime': packRuntime,
       '@/lib/integrations/commerceOrderStaging': orderStaging,
       '@/lib/persistence/commerceIntegrations': {},
+      '@/lib/persistence/commerceProductImageImports': {
+        reconcileCommerceProductImageSetWithClient,
+      },
       '@/lib/operations/commerceNormalization': normalization,
       '@/lib/persistence/crm': {
         stageCrmRecordWithClient: mustNotRun('stageCrmRecordWithClient'),
@@ -326,6 +473,12 @@ function loadCommerceStagingService(pool, counters) {
         ),
         async withTransaction(operation) {
           const client = await pool.connect()
+          assert.equal(
+            counters.activeTransactionClient,
+            null,
+            'Commerce staging transactions must not overlap in this test',
+          )
+          counters.activeTransactionClient = client
           try {
             await client.query('BEGIN')
             const result = await operation(client)
@@ -335,6 +488,7 @@ function loadCommerceStagingService(pool, counters) {
             await client.query('ROLLBACK').catch(() => {})
             throw error
           } finally {
+            counters.activeTransactionClient = null
             client.release()
           }
         },
@@ -577,6 +731,67 @@ async function seedCapturedRead(client, ids, envelope) {
   assert.equal(envelope.orders.length, 6)
 }
 
+async function seedAdditionalCapturedRead(client, ids, input) {
+  await client.query('SET session_replication_role = replica')
+  try {
+    await client.query(
+      `INSERT INTO operations_commerce_provider_attempts (
+         id, global_id, organization_id, integration_account_id,
+         action, adapter_version, idempotency_key, request_hash,
+         redacted_request, redacted_response, state, completed_at, created_by
+       ) VALUES (
+         $1, $2, $3, $4, 'commerce.intake.read',
+         'commerce-staging-postgres-v1', $5, $6, '{}'::jsonb, '{}'::jsonb,
+         'succeeded', now(), $7
+       )`,
+      [
+        input.providerAttemptId,
+        input.providerAttemptGlobalId,
+        ids.organization,
+        ids.integrationAccount,
+        input.idempotencyKey,
+        hash(`${input.idempotencyKey}:provider-read-request`),
+        actorEmail,
+      ],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_intake_read_intents (
+         id, organization_id, integration_account_id, pipeline_id,
+         provider, resource, intake_action, idempotency_key, request_hash,
+         credential_version, target_kind, session_id, batch_number,
+         window_start, window_end, query_hash, intent_state,
+         provider_attempt_id, response_ciphertext, response_iv, response_tag,
+         response_hash, response_bytes, response_encryption_version,
+         created_by, updated_by, expires_at
+       ) VALUES (
+         $1, $2, $3, $4, 'shopify', 'orders', 'fetch', $5, $6,
+         1, 'none', $7, 1, NULL, $8::timestamptz, $9, 'captured',
+         $10, $11, $12, $13, $14, 2, 1, $15, $15, $16::timestamptz
+       )`,
+      [
+        input.readIntentId,
+        ids.organization,
+        ids.integrationAccount,
+        ids.pipeline,
+        input.idempotencyKey,
+        hash(`${input.idempotencyKey}:read-intent-request`),
+        input.sessionId,
+        observedAt,
+        ids.queryHash,
+        input.providerAttemptId,
+        Buffer.from('[]'),
+        Buffer.alloc(12, 3),
+        Buffer.alloc(16, 4),
+        input.responseHash,
+        actorEmail,
+        retentionExpiresAt,
+      ],
+    )
+  } finally {
+    await client.query('SET session_replication_role = origin')
+  }
+}
+
 async function verifyPromotionNumericScaleAcceptance(
   pool,
   ids,
@@ -794,6 +1009,7 @@ async function verifyAcceptance(databaseUrl) {
     responseHash: hash('commerce-staging-response'),
     mappedVariant: 'gid://shopify/ProductVariant/mapped-zero',
   }
+  const imageFixture = productImageFixture()
   const envelope = Object.freeze({
     schemaVersion: 'commerce-normalization-envelope-v1',
     normalizerVersion: 'commerce-staging-postgres-v1',
@@ -806,7 +1022,7 @@ async function verifyAcceptance(databaseUrl) {
     credentialGeneration: 1,
     retentionExpiresAt,
     sourceHash: hash('commerce-staging-envelope'),
-    products: Object.freeze([]),
+    products: Object.freeze([imageFixture.product]),
     orders: Object.freeze([
       orderFixture({
         key: 'mapped-zero',
@@ -859,9 +1075,16 @@ async function verifyAcceptance(databaseUrl) {
     client.release()
   }
 
-  const counters = { auditEvents: 0, fetchCalls: 0 }
+  const counters = {
+    auditEvents: 0,
+    fetchCalls: 0,
+    activeTransactionClient: null,
+    expectedImageStage: null,
+    imageReconcileCalls: [],
+    imageReconcileError: null,
+  }
   const persistence = loadCommerceStagingService(pool, counters)
-  const result = await persistence.stageCommerceNormalizationEnvelopeInPostgres({
+  const stageInput = {
     runtime: {
       organizationId: ids.organization,
       globalId: 'gia0009201',
@@ -889,13 +1112,113 @@ async function verifyAcceptance(databaseUrl) {
     retryRejectionGlobalId: null,
     readIntentId: ids.readIntent,
     capturedResponseHash: ids.responseHash,
-  })
+  }
+  const expectPreStageRejection = async (input, code) => {
+    const callsBefore = counters.imageReconcileCalls.length
+    await assert.rejects(
+      persistence.stageCommerceNormalizationEnvelopeInPostgres(input),
+      (error) => error?.code === code,
+    )
+    assert.equal(
+      counters.imageReconcileCalls.length,
+      callsBefore,
+      `${code} must reject before product-image reconciliation`,
+    )
+  }
+  await expectPreStageRejection({
+    ...stageInput,
+    envelope: Object.freeze({
+      ...envelope,
+      organizationId: randomUUID(),
+    }),
+  }, 'COMMERCE_NORMALIZATION_SCOPE_MISMATCH')
+  await expectPreStageRejection({
+    ...stageInput,
+    idempotencyKey: 'commerce-staging-postgres-continuation-invalid',
+    page: null,
+  }, 'COMMERCE_INTAKE_CONTINUATION_INVALID')
+  await expectPreStageRejection({
+    ...stageInput,
+    idempotencyKey: 'commerce-staging-postgres-intent-invalid',
+    readIntentId: randomUUID(),
+  }, 'COMMERCE_INTAKE_INTENT_INVALID')
+
+  counters.expectedImageStage = {
+    idempotencyKey: ids.idempotencyKey,
+    readIntentId: ids.readIntent,
+  }
+  const result = await persistence.stageCommerceNormalizationEnvelopeInPostgres(
+    stageInput,
+  )
   assert.equal(result.replayed, false)
   assert.equal(result.ordersStaged, 6)
   assert.equal(result.recordsStaged, 6)
   assert.equal(result.providerWrites, 0)
   assert.equal(result.syncCursorAdvanced, false)
+  assert.deepEqual(JSON.parse(JSON.stringify(result.productImageImports)), {
+    productsObserved: 1,
+    activeImagesObserved: 1,
+    removedImagesObserved: 0,
+    staleSnapshotsIgnored: 0,
+    jobsByState: {
+      waiting_mapping: 0,
+      queued: 1,
+      claimed: 0,
+      retry: 0,
+      succeeded: 0,
+      dead: 0,
+      cancelled: 0,
+    },
+    providerWrites: 0,
+    syncCursorAdvanced: false,
+  })
+  assert.equal(counters.imageReconcileCalls.length, 1)
+  const imageCall = counters.imageReconcileCalls[0]
+  assert.strictEqual(imageCall.client, imageCall.transactionClient)
+  assert.deepEqual(imageCall.input, {
+    organizationId: ids.organization,
+    integrationAccountId: ids.integrationAccount,
+    provider: 'shopify',
+    credentialGeneration: 1,
+    externalProductId: imageFixture.product.identity.value,
+    productSourceHash: imageFixture.product.sourceHash,
+    productLifecycle: 'active',
+    imageSetComplete: true,
+    observedAt,
+    providerUpdatedAt: observedAt,
+    actorEmail,
+    images: [imageFixture.expectedObservation],
+  })
+  assert.doesNotMatch(
+    JSON.stringify(imageCall.input),
+    /https?:\/\//u,
+    'Durable image reconciliation input must remain URL-free',
+  )
+  assert.notEqual(
+    imageCall.input.images[0].sourceHash,
+    imageCall.input.productSourceHash,
+    'Image observation hashes must not churn with the whole product source',
+  )
   assert.equal(counters.fetchCalls, 0)
+  assert.equal(counters.auditEvents, 1)
+
+  const imageCallsBeforeDirectReplay = counters.imageReconcileCalls.length
+  const replay = await persistence.stageCommerceNormalizationEnvelopeInPostgres(
+    stageInput,
+  )
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(replay)),
+    {
+      ...JSON.parse(JSON.stringify(result)),
+      replayed: true,
+    },
+    'A direct same-key stage replay must return the exact committed summary',
+  )
+  assert.equal(
+    counters.imageReconcileCalls.length,
+    imageCallsBeforeDirectReplay,
+    'A stage replay must not reconcile product images twice',
+  )
   assert.equal(counters.auditEvents, 1)
 
   const evidence = await pool.query(
@@ -1033,6 +1356,123 @@ async function verifyAcceptance(databaseUrl) {
     state: 'succeeded',
     intent_state: 'staged',
   })
+
+  const rollbackRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009202',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-postgres-image-rollback',
+    responseHash: hash('commerce-staging-image-rollback-response'),
+  }
+  const rollbackSeed = await pool.connect()
+  try {
+    await seedAdditionalCapturedRead(rollbackSeed, ids, rollbackRead)
+  } finally {
+    rollbackSeed.release()
+  }
+  const stageEffectsBeforeRollback = (
+    await pool.query(
+      `SELECT
+         (SELECT count(*)::integer
+          FROM operations_commerce_intake_runs
+          WHERE organization_id = $1::uuid) AS runs,
+         (SELECT count(*)::integer
+          FROM operations_commerce_order_candidates
+          WHERE organization_id = $1::uuid) AS candidates,
+         (SELECT count(*)::integer
+          FROM operations_commerce_order_candidate_lines
+          WHERE organization_id = $1::uuid) AS candidate_lines,
+         (SELECT count(*)::integer
+          FROM operations_commerce_intake_continuations
+          WHERE organization_id = $1::uuid) AS continuations`,
+      [ids.organization],
+    )
+  ).rows[0]
+  const imageCallsBeforeRollback = counters.imageReconcileCalls.length
+  const auditEventsBeforeRollback = counters.auditEvents
+  counters.expectedImageStage = {
+    idempotencyKey: rollbackRead.idempotencyKey,
+    readIntentId: rollbackRead.readIntentId,
+  }
+  counters.imageReconcileError = new Error(
+    'commerce product image reconcile rollback sentinel',
+  )
+  try {
+    await assert.rejects(
+      persistence.stageCommerceNormalizationEnvelopeInPostgres({
+        ...stageInput,
+        idempotencyKey: rollbackRead.idempotencyKey,
+        envelope: Object.freeze({
+          ...envelope,
+          sourceHash: hash('commerce-staging-image-rollback-envelope'),
+        }),
+        page: {
+          ...stageInput.page,
+          sessionId: rollbackRead.sessionId,
+        },
+        readIntentId: rollbackRead.readIntentId,
+        capturedResponseHash: rollbackRead.responseHash,
+      }),
+      /commerce product image reconcile rollback sentinel/u,
+    )
+  } finally {
+    counters.imageReconcileError = null
+  }
+  assert.equal(
+    counters.imageReconcileCalls.length,
+    imageCallsBeforeRollback + 1,
+  )
+  const rollbackImageCall = counters.imageReconcileCalls.at(-1)
+  assert.strictEqual(
+    rollbackImageCall.client,
+    rollbackImageCall.transactionClient,
+  )
+  const rollbackEvidence = await pool.query(
+    `SELECT
+       intent.intent_state,
+       intent.staged_run_id::text,
+       intent.row_version::text,
+       attempt.state AS attempt_state,
+       (SELECT count(*)::integer
+        FROM operations_commerce_intake_runs run
+        WHERE run.organization_id = intent.organization_id
+          AND run.integration_account_id = intent.integration_account_id
+          AND run.idempotency_key = $2) AS rollback_run_count,
+       (SELECT count(*)::integer
+        FROM operations_commerce_intake_runs
+        WHERE organization_id = $1::uuid) AS runs,
+       (SELECT count(*)::integer
+        FROM operations_commerce_order_candidates
+        WHERE organization_id = $1::uuid) AS candidates,
+       (SELECT count(*)::integer
+        FROM operations_commerce_order_candidate_lines
+        WHERE organization_id = $1::uuid) AS candidate_lines,
+       (SELECT count(*)::integer
+        FROM operations_commerce_intake_continuations
+        WHERE organization_id = $1::uuid) AS continuations
+     FROM operations_commerce_intake_read_intents intent
+     JOIN operations_commerce_provider_attempts attempt
+       ON attempt.organization_id = intent.organization_id
+      AND attempt.integration_account_id = intent.integration_account_id
+      AND attempt.id = intent.provider_attempt_id
+     WHERE intent.organization_id = $1::uuid
+       AND intent.id = $3::uuid`,
+    [
+      ids.organization,
+      rollbackRead.idempotencyKey,
+      rollbackRead.readIntentId,
+    ],
+  )
+  assert.deepEqual(rollbackEvidence.rows[0], {
+    intent_state: 'captured',
+    staged_run_id: null,
+    row_version: '0',
+    attempt_state: 'succeeded',
+    rollback_run_count: 0,
+    ...stageEffectsBeforeRollback,
+  })
+  assert.equal(counters.auditEvents, auditEventsBeforeRollback)
 
   const recoveryKey = 'commerce-staging-postgres-recovery-key'
   const recoveryAttempt = randomUUID()

@@ -57,6 +57,10 @@ import {
   upsertProductChannelStateWithClient,
 } from '@/lib/persistence/productChannelStates'
 import {
+  reconcileCommerceProductImageSetWithClient,
+  type CommerceProductImageImportJobState,
+} from '@/lib/persistence/commerceProductImageImports'
+import {
   reconcileShopifyCheckoutRateForOrderCandidateWithClient,
   shopifyCheckoutRateLineageIsRequired,
   shopifyCheckoutRateOutcomeAllowsFulfillment,
@@ -910,6 +914,88 @@ function canonicalJson(value: unknown): string {
 
 function commandHash(value: unknown) {
   return createHash('sha256').update(canonicalJson(value)).digest('hex')
+}
+
+async function reconcileStagedCommerceProductImages(
+  input: {
+    account: Pick<
+      IntakeAccountRow,
+      'organization_id' | 'id' | 'provider' | 'credential_version'
+    >
+    envelope: CommerceNormalizationEnvelope
+    actorEmail: string
+  },
+  client: PoolClient,
+) {
+  const jobsByState: Record<CommerceProductImageImportJobState, number> = {
+    waiting_mapping: 0,
+    queued: 0,
+    claimed: 0,
+    retry: 0,
+    succeeded: 0,
+    dead: 0,
+    cancelled: 0,
+  }
+  let activeImagesObserved = 0
+  let removedImagesObserved = 0
+  let staleSnapshotsIgnored = 0
+  for (const product of input.envelope.products) {
+    const productLifecycle = (
+      input.account.provider === 'faire'
+      && product.lifecycleState?.toUpperCase() === 'DELETED'
+    )
+      ? 'deleted' as const
+      : 'active' as const
+    const result = await reconcileCommerceProductImageSetWithClient({
+      organizationId: input.account.organization_id,
+      integrationAccountId: input.account.id,
+      provider: input.account.provider,
+      credentialGeneration: input.account.credential_version,
+      externalProductId: product.identity.value,
+      productSourceHash: product.sourceHash,
+      productLifecycle,
+      imageSetComplete: product.imageSetComplete,
+      observedAt: input.envelope.observedAt,
+      providerUpdatedAt: product.providerUpdatedAt,
+      actorEmail: input.actorEmail,
+      images: product.images.map((image) => ({
+        providerImageId: image.providerImageId,
+        locatorSha256: image.locatorFingerprint,
+        sequence: image.sequence,
+        altText: image.altText,
+        pixelWidth: image.widthPixels,
+        pixelHeight: image.heightPixels,
+        // Image observation revisions depend only on safe image evidence.
+        // Unrelated title, inventory, and variant changes may advance the set
+        // snapshot without creating duplicate image jobs.
+        sourceHash: commandHash({
+          schema: 'commerce-product-image-observation-v1',
+          provider: input.account.provider,
+          providerImageId: image.providerImageId,
+          locatorSha256: image.locatorFingerprint,
+          sequence: image.sequence,
+          altText: image.altText,
+          pixelWidth: image.widthPixels,
+          pixelHeight: image.heightPixels,
+        }),
+      })),
+    }, client)
+    if (result.staleSnapshotIgnored) staleSnapshotsIgnored += 1
+    activeImagesObserved += result.active.length
+    removedImagesObserved += result.removed.length
+    for (const observation of [...result.active, ...result.removed]) {
+      jobsByState[observation.jobState] += 1
+    }
+  }
+  return {
+    productsObserved: input.envelope.products.length,
+    activeImagesObserved,
+    removedImagesObserved,
+    staleSnapshotsIgnored,
+    jobsByState,
+    providerWrites: 0 as const,
+    syncCursorAdvanced: false as const,
+  }
 }
 
 function deterministicCommandUuid(value: unknown) {
@@ -2438,35 +2524,36 @@ export async function markCommerceIntakeContinuationInvalidInPostgres(input: {
   })
 }
 
-export async function readCommerceIntakeStageReplayFromPostgres(input: {
-  organizationId: string
-  accountGlobalId: string
+type CommerceIntakeStageReplayLookup = {
   idempotencyKey: string
   action: CommerceIntakeStageAction
   target: {
     kind: 'none' | 'candidate' | 'rejection' | 'continuation'
     globalId: string | null
   }
-}) {
-  return withTransaction(async (client) => {
-    const account = await resolveAccount(client, {
-      organizationId: input.organizationId,
-      accountGlobalId: input.accountGlobalId,
-    })
-    const result = await client.query<{
+}
+
+async function readCommerceIntakeStageReplayWithClient(
+  client: PoolClient,
+  account: IntakeAccountRow,
+  input: CommerceIntakeStageReplayLookup,
+) {
+  const result = await client.query<{
       global_id: string
       workflow_state: string
       records_staged: number
+      request_hash: string
       staged_action: string | null
       stage_result: Record<string, unknown> | null
       intent_action: CommerceIntakeReadIntentAction
       target_kind: 'none' | 'candidate' | 'rejection' | 'continuation'
       target_global_id: string | null
-    }>(
+  }>(
       `SELECT
          run.global_id,
          run.workflow_state,
          run.records_staged,
+         run.request_hash,
          audit.payload->>'action' AS staged_action,
          audit.payload->'stageResult' AS stage_result,
          intent.intake_action AS intent_action,
@@ -2503,21 +2590,24 @@ export async function readCommerceIntakeStageReplayFromPostgres(input: {
           : 'products_and_orders',
         input.idempotencyKey,
       ],
+  )
+  const row = result.rows[0]
+  if (!row) return null
+  if (
+    row.intent_action !== input.action
+    || (row.staged_action && row.staged_action !== input.action)
+    || row.target_kind !== input.target.kind
+    || row.target_global_id !== input.target.globalId
+  ) {
+    intakeError(
+      'COMMERCE_INTAKE_IDEMPOTENCY_CONFLICT',
+      'This idempotency key already completed a different intake action or target',
     )
-    const row = result.rows[0]
-    if (!row) return null
-    if (
-      row.intent_action !== input.action
-      || (row.staged_action && row.staged_action !== input.action)
-      || row.target_kind !== input.target.kind
-      || row.target_global_id !== input.target.globalId
-    ) {
-      intakeError(
-        'COMMERCE_INTAKE_IDEMPOTENCY_CONFLICT',
-        'This idempotency key already completed a different intake action or target',
-      )
-    }
-    return {
+  }
+  return {
+    requestHash: row.request_hash,
+    hasDurableStageResult: Boolean(row.stage_result),
+    stageResult: {
       ...(row.stage_result || {}),
       action: row.staged_action || input.action,
       replayed: true,
@@ -2528,7 +2618,25 @@ export async function readCommerceIntakeStageReplayFromPostgres(input: {
         row.stage_result?.recordsStaged ?? row.records_staged,
       providerWrites: 0,
       syncCursorAdvanced: false,
-    }
+    },
+  }
+}
+
+export async function readCommerceIntakeStageReplayFromPostgres(input: {
+  organizationId: string
+  accountGlobalId: string
+} & CommerceIntakeStageReplayLookup) {
+  return withTransaction(async (client) => {
+    const account = await resolveAccount(client, {
+      organizationId: input.organizationId,
+      accountGlobalId: input.accountGlobalId,
+    })
+    const replay = await readCommerceIntakeStageReplayWithClient(
+      client,
+      account,
+      input,
+    )
+    return replay?.stageResult || null
   })
 }
 
@@ -3818,15 +3926,46 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           'This fetch idempotency key was already used for different provider data',
         )
       }
-      return {
-        action: input.stageAction,
-        replayed: true,
-        runGlobalId: existing.rows[0].global_id,
-        workflowState: existing.rows[0].workflow_state,
-        recordsStaged: existing.rows[0].records_staged,
-        providerWrites: 0,
-        syncCursorAdvanced: false,
+      const replayTarget = input.refreshCandidateGlobalId
+        ? {
+            kind: 'candidate' as const,
+            globalId: input.refreshCandidateGlobalId,
+          }
+        : input.retryRejectionGlobalId
+          ? {
+              kind: 'rejection' as const,
+              globalId: input.retryRejectionGlobalId,
+            }
+          : (
+            input.stageAction === 'fetch-next'
+            || input.stageAction === 'fetch-next-products'
+          )
+            ? {
+                kind: 'continuation' as const,
+                globalId: input.page?.previousRunGlobalId || null,
+              }
+            : { kind: 'none' as const, globalId: null }
+      const replay = await readCommerceIntakeStageReplayWithClient(
+        client,
+        account,
+        {
+          idempotencyKey: input.idempotencyKey,
+          action: input.stageAction,
+          target: replayTarget,
+        },
+      )
+      if (
+        !replay
+        || !replay.hasDurableStageResult
+        || replay.requestHash !== stageRequestHash
+      ) {
+        intakeError(
+          'COMMERCE_INTAKE_REPLAY_EVIDENCE_MISSING',
+          'The committed commerce intake replay evidence is incomplete',
+          500,
+        )
       }
+      return replay.stageResult
     }
     const readIntent = (
       await client.query<{
@@ -5395,6 +5534,15 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         windowEnd: input.page.windowEnd,
       }
     }
+    // This side effect is deliberately inside the intake-stage transaction,
+    // after all connection, activation, read-intent, target, and continuation
+    // fences. A rejected stage leaves no image observation, tombstone, or job;
+    // a committed stage always contains its replayable image summary.
+    const productImageImports = await reconcileStagedCommerceProductImages({
+      account,
+      envelope: input.envelope,
+      actorEmail: input.actorEmail,
+    }, client)
     const stagedIntent = await client.query(
       `UPDATE operations_commerce_intake_read_intents
        SET intent_state = 'staged',
@@ -5448,6 +5596,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       productVariantsPreserved,
       recordsRejected,
       recordsStaged,
+      productImageImports,
       pagination,
       providerWrites: 0,
       syncCursorAdvanced: false,
@@ -5471,6 +5620,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         productVariantsPreserved,
         recordsRejected,
         normalizationRejections,
+        productImageImports,
         action: stageResult.action,
         pagination,
         stageResult,

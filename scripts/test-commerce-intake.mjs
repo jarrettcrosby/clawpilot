@@ -587,6 +587,8 @@ const catalogSyncWorkerSource = read(
 )
 includes(catalogSyncWorkerSource, [
   'executeCommerceCatalogProductPage',
+  'replayHeldShopifyProductDeletionsInPostgres',
+  'heldProductDeletionsReconciled',
   'queueAutomaticCommerceCatalogSyncsInPostgres',
   'claimCommerceCatalogSyncJobsInPostgres',
   'completeCommerceCatalogSyncPageInPostgres',
@@ -649,6 +651,18 @@ const catalogWorkerModule = loadTypeScriptModule(
   'app_src/lib/commerceCatalogSyncWorker.ts',
   {
     mocks: {
+      '@/lib/persistence/commerceIntegrations': {
+        async replayHeldShopifyProductDeletionsInPostgres() {
+          return {
+            selected: 1,
+            reconciled: 1,
+            held: 0,
+            failed: 0,
+            deadLettered: 0,
+            providerWrites: 0,
+          }
+        },
+      },
       '@/lib/integrations/commerceIntake': {
         async executeCommerceCatalogProductPage(input) {
           catalogWorkerTrace.pages.push(input)
@@ -719,6 +733,7 @@ const catalogWorkerResult =
   })
 assert.equal(catalogWorkerResult.pagesCompleted, 1)
 assert.equal(catalogWorkerResult.jobsCompleted, 1)
+assert.equal(catalogWorkerResult.heldProductDeletionsReconciled, 1)
 assert.equal(catalogWorkerTrace.failures.length, 0)
 assert.equal(catalogWorkerTrace.pages[0].continuationRunGlobalId, null)
 assert.equal(catalogWorkerTrace.completions[0].totals.providerRecordsSeen, 50)
@@ -778,6 +793,18 @@ const limitedCatalogWorkerModule = loadTypeScriptModule(
   'app_src/lib/commerceCatalogSyncWorker.ts',
   {
     mocks: {
+      '@/lib/persistence/commerceIntegrations': {
+        async replayHeldShopifyProductDeletionsInPostgres() {
+          return {
+            selected: 0,
+            reconciled: 0,
+            held: 0,
+            failed: 0,
+            deadLettered: 0,
+            providerWrites: 0,
+          }
+        },
+      },
       '@/lib/integrations/commerceIntake': {
         async executeCommerceCatalogProductPage() {
           limitedCatalogTrace.providerCalls += 1
@@ -914,7 +941,29 @@ includes(shopifyQuerySource, [
   'requiresShipping',
   'measurement {',
   'weight {',
+  'media(first: ${SHOPIFY_PRODUCT_IMAGE_PAGE_SIZE})',
+  'mediaContentType',
+  '... on MediaImage',
+  'alt',
+  'image {',
+  'url',
+  'width',
+  'height',
+  'pageInfo {',
+  'hasNextPage',
 ], 'Shopify intake query')
+includes(serviceSource, [
+  'SHOPIFY_PRODUCT_IMAGE_PAGE_SIZE = 50',
+], 'Bounded Shopify product-image intake')
+const shopifyProductQuerySource = serviceSource.slice(
+  serviceSource.indexOf('function shopifyProductVariantsQuery'),
+  serviceSource.indexOf('type IntakeCommandAction'),
+)
+assert.doesNotMatch(
+  shopifyProductQuerySource,
+  /\b(?:originalSource|preview|mimeType|fileErrors|mediaErrors)\b/,
+  'Shopify product-image intake must request only transient locator metadata',
+)
 includes(serviceSource, [
   "hasEffectiveShopifyScope(\n    grant.grantedScopes,\n    'read_customers'",
   "hasEffectiveShopifyScope(\n    probe.grantedScopes,\n    'read_customers'",
@@ -943,6 +992,7 @@ includes(serviceSource, [
   'listFaireOrders',
   'listFaireProducts',
   'listFaireInventory',
+  'probeFaireBrandProfile',
   'product_status:active,archived,draft,unlisted',
   "Shopify's search values are case-sensitive lowercase",
   'SHOPIFY_ORDER_PAGE_SIZE = 25',
@@ -1029,6 +1079,14 @@ includes(persistenceSource, [
   "SET disposition = 'retried'",
   'retry_run_id = $2::uuid',
 ], 'Successful exact-order retry closes the matching legacy rejection')
+includes(persistenceSource, [
+  'reconcileStagedCommerceProductImages',
+  "input.account.provider === 'faire'",
+  "product.lifecycleState?.toUpperCase() === 'DELETED'",
+  "? 'deleted' as const",
+  'productLifecycle,',
+  'reconcileCommerceProductImageSetWithClient({',
+], 'Faire authoritative deletion reaches fenced complete-empty image reconciliation')
 includes(persistenceSource, [
   'resolveCommerceRuntimePack',
   'operations_commerce_variant_pack_mappings pack_mapping',
@@ -1565,6 +1623,9 @@ const automaticProductResolutionModule = loadTypeScriptModule(
       '@/lib/persistence/productChannelStates': {
         async linkProductChannelStateWithClient() {},
         async upsertProductChannelStateWithClient() {},
+      },
+      '@/lib/persistence/commerceProductImageImports': {
+        async reconcileCommerceProductImageSetWithClient() {},
       },
       '@/lib/persistence/shopifyCheckoutRating': {
         async reconcileShopifyCheckoutRateForOrderCandidateWithClient() {},
@@ -2132,6 +2193,9 @@ const customerIdentityPersistence = loadTypeScriptModule(
         async linkProductChannelStateWithClient() {},
         async upsertProductChannelStateWithClient() {},
       },
+      '@/lib/persistence/commerceProductImageImports': {
+        async reconcileCommerceProductImageSetWithClient() {},
+      },
       '@/lib/persistence/shopifyCheckoutRating': {
         async reconcileShopifyCheckoutRateForOrderCandidateWithClient() {},
         shopifyCheckoutRateLineageIsRequired() { return false },
@@ -2209,6 +2273,8 @@ const faireRuntime = {
   externalAccountId: 'brand-123',
   configuration: {},
 }
+let faireProfileId = faireRuntime.externalAccountId
+let faireReturnedBrandId = faireRuntime.externalAccountId
 const runtimes = new Map([
   [shopifyRuntime.globalId, shopifyRuntime],
   [faireRuntime.globalId, faireRuntime],
@@ -2221,6 +2287,7 @@ const providerReads = {
   faireInventory: 0,
   faireOrders: 0,
   faireOrder: 0,
+  faireProfile: 0,
 }
 const providerAttempts = []
 const providerReservations = []
@@ -2255,6 +2322,7 @@ function envelope(provider, orderIds) {
   return {
     provider,
     normalizerVersion: `commerce-normalization-${provider}-v1`,
+    observedAt: '2026-07-26T12:00:00.000Z',
     products: [],
     orders: orderIds.map((identity) => ({
       identity: { value: identity },
@@ -2312,6 +2380,10 @@ const service = loadTypeScriptModule(
         },
       },
       '@/lib/integrations/faireCommerceClient': {
+        async probeFaireBrandProfile() {
+          providerReads.faireProfile += 1
+          return { id: faireProfileId }
+        },
         async listFaireProducts(_options, listOptions) {
           providerReads.faireProducts += 1
           assert.equal(
@@ -2324,6 +2396,14 @@ const service = loadTypeScriptModule(
               id: listOptions.cursor
                 ? 'faire-product-2'
                 : 'faire-product-1',
+              brand_id: faireReturnedBrandId,
+              images: listOptions.cursor
+                ? [{
+                  id: 'faire-image-2',
+                  url: 'https://cdn.faire.com/products/image-2.png?token=FAIRE-INTAKE-TOKEN-SENTINEL',
+                  sequence: 0,
+                }]
+                : [],
               variants: listOptions.cursor
                 ? [{ id: 'faire-variant-2' }]
                 : Array.from({ length: 51 }, (_value, index) => ({
@@ -2360,21 +2440,27 @@ const service = loadTypeScriptModule(
           assert.equal(listOptions.limit, 50)
           if (!listOptions.cursor) {
             return {
-              orders: [{ id: 'faire-order-1' }],
+              orders: [{
+                id: 'faire-order-1',
+                brand_id: faireRuntime.externalAccountId,
+              }],
               next_cursor: 'faire-orders-page-2',
             }
           }
           assert.equal(listOptions.cursor, 'faire-orders-page-2')
-          return { orders: [{ id: 'faire-order-2' }] }
+          return { orders: [{
+            id: 'faire-order-2',
+            brand_id: faireRuntime.externalAccountId,
+          }] }
         },
         async getFaireOrder(_options, orderId) {
           providerReads.faireOrder += 1
-          return { id: orderId }
+          return { id: orderId, brand_id: faireRuntime.externalAccountId }
         },
       },
       '@/lib/integrations/faireCommerceNormalizer': {
         FAIRE_COMMERCE_NORMALIZER_VERSION:
-          'faire-commerce-normalizer-v4',
+          'faire-commerce-normalizer-v6',
         normalizeFaireCommerce(source) {
           normalizedSources.faire = source
           if (source.inventories) {
@@ -2386,6 +2472,19 @@ const service = loadTypeScriptModule(
           )
           result.products = source.products.products.map((product) => ({
             identity: { value: product.id },
+            sourceHash: product.id === 'faire-product-1'
+              ? '1'.repeat(64)
+              : '2'.repeat(64),
+            providerUpdatedAt: '2026-07-26T00:00:00.000Z',
+            imageSetComplete: true,
+            images: (product.images || []).map((image, sequence) => ({
+              providerImageId: image.id || null,
+              locatorFingerprint: 'f'.repeat(64),
+              sequence,
+              altText: null,
+              widthPixels: null,
+              heightPixels: null,
+            })),
             variants: product.variants.map((variant) => ({
               identity: { value: variant.id },
             })),
@@ -2395,7 +2494,7 @@ const service = loadTypeScriptModule(
       },
       '@/lib/integrations/shopifyCommerceNormalizer': {
         SHOPIFY_COMMERCE_NORMALIZER_VERSION:
-          'shopify-commerce-normalizer-v2',
+          'shopify-commerce-normalizer-v4',
         normalizeShopifyCommerce(source) {
           normalizedSources.shopify = source
           const result = envelope(
@@ -2404,6 +2503,20 @@ const service = loadTypeScriptModule(
           )
           result.products = source.data.products.nodes.map((product) => ({
             identity: { value: product.id },
+            sourceHash: product.id.endsWith('/1')
+              ? '3'.repeat(64)
+              : '4'.repeat(64),
+            providerUpdatedAt: product.updatedAt,
+            imageSetComplete:
+              product.media?.pageInfo?.hasNextPage === false,
+            images: (product.media?.nodes || []).map((media, sequence) => ({
+              providerImageId: media.id || null,
+              locatorFingerprint: 'e'.repeat(64),
+              sequence,
+              altText: media.alt || null,
+              widthPixels: media.image?.width || null,
+              heightPixels: media.image?.height || null,
+            })),
             variants: product.variants.nodes.map((variant) => ({
               identity: { value: variant.id },
             })),
@@ -2550,6 +2663,21 @@ const service = loadTypeScriptModule(
                     title: 'Example',
                     status: 'ACTIVE',
                     updatedAt: '2026-07-26T00:00:00.000Z',
+                    media: {
+                      nodes: [{
+                        id: secondPage
+                          ? 'gid://shopify/MediaImage/2'
+                          : 'gid://shopify/MediaImage/1',
+                        mediaContentType: 'IMAGE',
+                        alt: 'Example image',
+                        image: {
+                          url: 'https://cdn.shopify.com/s/files/example.png?token=SHOPIFY-INTAKE-TOKEN-SENTINEL',
+                          width: 640,
+                          height: 480,
+                        },
+                      }],
+                      pageInfo: { hasNextPage: false },
+                    },
                   },
                 }],
                 pageInfo: secondPage
@@ -2772,6 +2900,18 @@ const service = loadTypeScriptModule(
             action,
             replayed: false,
             runGlobalId,
+            productImageImports: {
+              productsObserved: input.envelope.products.length,
+              activeImagesObserved: input.envelope.products.reduce(
+                (count, product) => count + (product.images || []).length,
+                0,
+              ),
+              removedImagesObserved: 0,
+              staleSnapshotsIgnored: 0,
+              jobsByState: {},
+              providerWrites: 0,
+              syncCursorAdvanced: false,
+            },
             providerWrites: 0,
             syncCursorAdvanced: false,
           }
@@ -3013,6 +3153,21 @@ try {
     'Continuation retry after durable capture must stage the identical page without another provider read',
   )
   const shopifyProductsKey = nextKey()
+  failStageOnceForKey = shopifyProductsKey
+  await assert.rejects(
+    service.executeCommerceIntakeCommand({
+      organizationId,
+      actorEmail,
+      body: {
+        action: 'fetch-products',
+        accountGlobalId: shopifyRuntime.globalId,
+        confirmReadOnly: true,
+        idempotencyKey: shopifyProductsKey,
+      },
+    }),
+    /simulated crash after durable provider capture/,
+  )
+  const readsAfterProductCapture = { ...providerReads }
   const firstShopifyProducts = await service.executeCommerceIntakeCommand({
     organizationId,
     actorEmail,
@@ -3023,6 +3178,14 @@ try {
       idempotencyKey: shopifyProductsKey,
     },
   })
+  assert.deepEqual(
+    providerReads,
+    readsAfterProductCapture,
+    'Product-stage retry must replay the captured catalog envelope without another provider read',
+  )
+  assert.equal(firstShopifyProducts.command.productImageImports.productsObserved, 1)
+  assert.equal(firstShopifyProducts.command.productImageImports.activeImagesObserved, 1)
+  assert.equal(firstShopifyProducts.command.productImageImports.providerWrites, 0)
   const replayedShopifyProducts =
     await service.executeCommerceIntakeCommand({
       organizationId,
@@ -3182,6 +3345,7 @@ try {
     faireInventory: 3,
     faireOrders: 2,
     faireOrder: 1,
+    faireProfile: 5,
   })
   assert.equal(normalizedSources.shopify.data.products.nodes.length, 0)
   assert.equal(normalizedSources.shopify.data.orders.nodes.length, 1)
@@ -3210,24 +3374,24 @@ try {
     -2,
   )
   assert.equal(providerAttempts.length, 11)
-  assert.equal(providerReservations.length, 13)
+  assert.equal(providerReservations.length, 14)
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'faire'
-      && reservation.adapterVersion === 'faire-commerce-normalizer-v4'
+      && reservation.adapterVersion === 'faire-commerce-normalizer-v6'
     )),
-    'Faire provider-attempt evidence must record the v3 normalizer',
+    'Faire provider-attempt evidence must record the current normalizer',
   )
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'shopify'
-      && reservation.adapterVersion === 'shopify-commerce-normalizer-v2'
+      && reservation.adapterVersion === 'shopify-commerce-normalizer-v4'
     )),
-    'Shopify provider-attempt evidence must record its actual normalizer',
+    'Shopify provider-attempt evidence must record its current normalizer',
   )
   assert.equal(capturedReads.size, 11)
   assert.equal(uncertainReads.length, 0)
-  assert.equal(stageAttempts.length, 13)
+  assert.equal(stageAttempts.length, 14)
   for (const attempt of providerAttempts) {
     assert.equal(attempt.action, 'commerce.intake.read')
     assert.equal(attempt.redactedRequest.readOnly, true)
@@ -3241,6 +3405,26 @@ try {
   const staged = persistenceCommands.filter(
     ({ name }) => name === 'stage-envelope',
   )
+  const stagedProductReads = staged.filter(
+    ({ input }) => input.page?.resource === 'products',
+  )
+  assert.ok(
+    stagedProductReads.some(({ input }) => (
+      input.envelope.products.some((product) => product.images?.length > 0)
+    )),
+    'Product intake must carry safe normalized image references to staging',
+  )
+  for (const { input } of stagedProductReads) {
+    const durableProductEnvelope = JSON.stringify(input.envelope)
+    assert.doesNotMatch(durableProductEnvelope, /https:\/\//)
+    assert.doesNotMatch(durableProductEnvelope, /INTAKE-TOKEN-SENTINEL/)
+    for (const product of input.envelope.products) {
+      for (const image of product.images || []) {
+        assert.ok(!Object.hasOwn(image, 'url'))
+        assert.ok(!Object.hasOwn(image, 'bytes'))
+      }
+    }
+  }
   for (const { input } of staged) {
     assert.match(input.readIntentId, /^[a-f0-9-]{36}$/)
     assert.match(input.capturedResponseHash, /^[a-f0-9]{64}$/)
@@ -3503,10 +3687,76 @@ try {
     faireInventory: 3,
     faireOrders: 2,
     faireOrder: 1,
+    faireProfile: 5,
   }, 'Resolution, validation, and promotion must not call providers')
   const promotion = persistenceCommands.find(({ name }) => name === 'promote')
   assert.match(promotion.input.requestHash, /^[a-f0-9]{64}$/)
   assert.ok(stateReads.length >= localCommands.length + 2)
+
+  const readsBeforeWrongProfile = { ...providerReads }
+  faireProfileId = 'different-faire-brand'
+  try {
+    await assert.rejects(
+      service.executeCommerceIntakeCommand({
+        organizationId,
+        actorEmail,
+        body: {
+          action: 'fetch-products',
+          accountGlobalId: faireRuntime.globalId,
+          confirmReadOnly: true,
+          idempotencyKey: nextKey(),
+        },
+      }),
+      (error) => error.code === 'COMMERCE_INTAKE_READ_RESTART_REQUIRED',
+    )
+  } finally {
+    faireProfileId = faireRuntime.externalAccountId
+  }
+  assert.equal(
+    providerReads.faireProfile,
+    readsBeforeWrongProfile.faireProfile + 1,
+  )
+  assert.equal(
+    providerReads.faireProducts,
+    readsBeforeWrongProfile.faireProducts,
+    'A wrong live Faire brand must fail before catalog data is read',
+  )
+  assert.equal(
+    uncertainReads.at(-1)?.errorCode,
+    'COMMERCE_INTAKE_ACCOUNT_CHANGED',
+  )
+
+  const readsBeforeWrongProductBrand = { ...providerReads }
+  faireReturnedBrandId = 'different-faire-brand'
+  try {
+    await assert.rejects(
+      service.executeCommerceIntakeCommand({
+        organizationId,
+        actorEmail,
+        body: {
+          action: 'fetch-products',
+          accountGlobalId: faireRuntime.globalId,
+          confirmReadOnly: true,
+          idempotencyKey: nextKey(),
+        },
+      }),
+      (error) => error.code === 'COMMERCE_INTAKE_READ_RESTART_REQUIRED',
+    )
+  } finally {
+    faireReturnedBrandId = faireRuntime.externalAccountId
+  }
+  assert.equal(
+    providerReads.faireProfile,
+    readsBeforeWrongProductBrand.faireProfile + 1,
+  )
+  assert.equal(
+    providerReads.faireProducts,
+    readsBeforeWrongProductBrand.faireProducts + 1,
+  )
+  assert.equal(
+    uncertainReads.at(-1)?.errorCode,
+    'COMMERCE_INTAKE_ACCOUNT_CHANGED',
+  )
 } finally {
   if (savedEnvironment.enabled === undefined) {
     delete process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED
