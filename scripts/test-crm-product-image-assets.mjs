@@ -44,6 +44,30 @@ for (const contract of [
   )
 }
 
+const suiteCrmBackfillMigration = read(
+  'db/migrations/0222_suitecrm_product_image_projection_backfill.sql',
+)
+for (const contract of [
+  'asset.is_primary = true',
+  'product.suitecrm_id IS NOT NULL',
+  'COALESCE(organization.is_demo, false) = false',
+  "'crm:products:image:v1:'",
+  'INSERT INTO sync_outbox',
+  "'upsert_record'",
+  "'suitecrm'",
+  "'productImage'",
+  "'referenceCode'",
+  "'contentSha256'",
+  "'crm.product_image.suitecrm_backfill_queued'",
+  'ON CONFLICT (target_system, idempotency_key)',
+  'ON CONFLICT (event_key)',
+]) {
+  assert.ok(
+    suiteCrmBackfillMigration.includes(contract),
+    `SuiteCRM Product image backfill must include ${contract}`,
+  )
+}
+
 const validation = read(
   'app_src/lib/crm/productImageAssets.ts',
 )

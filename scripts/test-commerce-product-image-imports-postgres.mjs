@@ -708,6 +708,42 @@ async function verifyImports(pool) {
   assert.ok(firstSuiteCrmProjection.rows[0].idempotency_key.endsWith(
     `:${firstCompletion.assetContentSha256}`,
   ))
+  await pool.query(
+    `DELETE FROM sync_outbox
+     WHERE target_system = 'suitecrm' AND idempotency_key = $1`,
+    [firstSuiteCrmProjection.rows[0].idempotency_key],
+  )
+  const suiteCrmImageBackfill = read(
+    'db/migrations/0222_suitecrm_product_image_projection_backfill.sql',
+  )
+  await pool.query(suiteCrmImageBackfill)
+  await pool.query(suiteCrmImageBackfill)
+  const backfilledSuiteCrmProjection = await pool.query(
+    `SELECT payload, idempotency_key, status
+     FROM sync_outbox
+     WHERE aggregate_type = 'crm_products'
+       AND aggregate_id = $1
+       AND target_system = 'suitecrm'`,
+    [catalog.id],
+  )
+  assert.equal(backfilledSuiteCrmProjection.rows.length, 1)
+  assert.equal(backfilledSuiteCrmProjection.rows[0].status, 'queued')
+  assert.deepEqual(
+    backfilledSuiteCrmProjection.rows[0].payload.productImage,
+    firstSuiteCrmProjection.rows[0].payload.productImage,
+  )
+  assert.equal(
+    backfilledSuiteCrmProjection.rows[0].idempotency_key,
+    firstSuiteCrmProjection.rows[0].idempotency_key,
+  )
+  const backfillAudit = await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM audit_events
+     WHERE event_type = 'crm.product_image.suitecrm_backfill_queued'
+       AND aggregate_id = $1`,
+    [catalog.id],
+  )
+  assert.equal(backfillAudit.rows[0].count, 1)
   const firstBinding = await pool.query(
     `SELECT
        global_id, lifecycle_state, row_version, provider_sequence,
