@@ -170,11 +170,42 @@ function verifySourceContracts() {
     'export async function consumeCommerceActiveTransitionAuthorizationInPostgres(',
     rebindStart,
   )
+  const rebindPreflightStart = persistence.indexOf(
+    'async function registeredShopifyCarrierServiceRebindings(',
+  )
+  const rebindPreflight = persistence.slice(
+    rebindPreflightStart,
+    rebindStart,
+  )
+  assert.equal(
+    rebindPreflight.includes('JOIN operations_commerce_credentials'),
+    false,
+    'Active rebind must enumerate every registered CarrierService even when its credential row is missing',
+  )
+  assert.ok(
+    rebindPreflight.includes(
+      'COMMERCE_ACTIVE_SHOPIFY_CALLBACK_CONFIG_MISSING',
+    ),
+    'Active rebind must reject a callback capability claim without a registered CarrierService',
+  )
+  assert.ok(
+    rebindPreflight.includes('matchedCallbackAccountIds'),
+    'Active rebind must prove exact registered-config coverage in both directions',
+  )
+  assert.equal(
+    rebindPreflight.includes('row.callback_ready'),
+    false,
+    'Active rebind preflight must allow an explicitly authorized disabled account to become active before canonical readiness is evaluated',
+  )
   assert.ok(
     rebindStart >= 0 && rebindEnd > rebindStart,
     'Commerce Active CarrierService rebind boundary is invalid',
   )
   const rebind = persistence.slice(rebindStart, rebindEnd)
+  assert.ok(
+    rebind.includes('callback_ready'),
+    'Active rebind must prove canonical callback readiness after account activation and revision rebinding',
+  )
   for (const forbiddenMutation of [
     'SET service_gid =',
     'SET callback_token_version =',
@@ -844,7 +875,7 @@ async function verifyDisposablePostgres() {
       'COMMERCE_ACTIVE_AUTHORIZATION_EXPIRED',
     )
 
-    const authorized = await persistence
+    const authorizedWithoutCarrierService = await persistence
       .authorizeCommerceActiveTransitionInPostgres({
         organizationId,
         actorEmail: ownerEmail,
@@ -852,12 +883,49 @@ async function verifyDisposablePostgres() {
         expectedCohortHash: preparedForExpiry.cohortHash,
         idempotencyKey: 'authorize-main',
       })
+    await expectCode(
+      persistence.consumeCommerceActiveTransitionAuthorizationInPostgres({
+        organizationId,
+        actorEmail: ownerEmail,
+        authorizationGlobalId:
+          authorizedWithoutCarrierService.authorizationGlobalId,
+        expectedCohortHash: preparedForExpiry.cohortHash,
+        idempotencyKey: 'consume-missing-carrier-service',
+        reason: 'Reject callback authority without a registered service',
+      }),
+      'COMMERCE_ACTIVE_SHOPIFY_CALLBACK_CONFIG_MISSING',
+    )
+    const selectedAccountsWithoutCallbacks = [{
+      accountGlobalId: accounts.shopify.global_id,
+      capabilities: [
+        'fulfillment_export',
+        'tracking_export',
+      ],
+    }]
+    const preparedWithoutCallbacks = await persistence
+      .prepareCommerceActiveTransitionInPostgres({
+        organizationId,
+        actorEmail: ownerEmail,
+        expectedActivationState: 'shadow',
+        expectedActivationRevision: 1,
+        selectedAccounts: selectedAccountsWithoutCallbacks,
+        idempotencyKey: 'prepare-without-callbacks',
+      })
+    const authorized = await persistence
+      .authorizeCommerceActiveTransitionInPostgres({
+        organizationId,
+        actorEmail: ownerEmail,
+        preparationGlobalId:
+          preparedWithoutCallbacks.preparationGlobalId,
+        expectedCohortHash: preparedWithoutCallbacks.cohortHash,
+        idempotencyKey: 'authorize-without-callbacks',
+      })
     const activated = await persistence
       .consumeCommerceActiveTransitionAuthorizationInPostgres({
         organizationId,
         actorEmail: ownerEmail,
         authorizationGlobalId: authorized.authorizationGlobalId,
-        expectedCohortHash: preparedForExpiry.cohortHash,
+        expectedCohortHash: preparedWithoutCallbacks.cohortHash,
         idempotencyKey: 'consume-main',
         reason: 'Activate exact verified commerce cohort',
       })
@@ -865,13 +933,13 @@ async function verifyDisposablePostgres() {
     assert.equal(activated.state, 'active')
     assert.equal(activated.revision, 2)
     assert.equal(activated.accountCount, 1)
-    assert.equal(activated.capabilityCount, 3)
+    assert.equal(activated.capabilityCount, 2)
     const activatedReplay = await persistence
       .consumeCommerceActiveTransitionAuthorizationInPostgres({
         organizationId,
         actorEmail: ownerEmail,
         authorizationGlobalId: authorized.authorizationGlobalId,
-        expectedCohortHash: preparedForExpiry.cohortHash,
+        expectedCohortHash: preparedWithoutCallbacks.cohortHash,
         idempotencyKey: 'consume-main',
         reason: 'Activate exact verified commerce cohort',
       })
@@ -885,7 +953,7 @@ async function verifyDisposablePostgres() {
         organizationId,
         actorEmail: ownerEmail,
         authorizationGlobalId: authorized.authorizationGlobalId,
-        expectedCohortHash: preparedForExpiry.cohortHash,
+        expectedCohortHash: preparedWithoutCallbacks.cohortHash,
         idempotencyKey: 'consume-second-time',
         reason: 'Activate exact verified commerce cohort',
       }),
@@ -896,7 +964,7 @@ async function verifyDisposablePostgres() {
       .readCommerceActiveCapabilityClaimInPostgres({
         organizationId,
         accountGlobalId: accounts.shopify.global_id,
-        capability: 'shipping_rate_callbacks',
+        capability: 'tracking_export',
         expectedActivationRevision: 2,
       })
     assert.ok(claim)
@@ -916,7 +984,8 @@ async function verifyDisposablePostgres() {
        SET configuration = jsonb_set(
          configuration,
          '{grantedScopes}',
-         (configuration->'grantedScopes') - 'write_shipping'
+         (configuration->'grantedScopes')
+           - 'write_merchant_managed_fulfillment_orders'
        )
        WHERE organization_id = $1::uuid
          AND global_id = $2`,
@@ -926,7 +995,7 @@ async function verifyDisposablePostgres() {
       await persistence.readCommerceActiveCapabilityClaimInPostgres({
         organizationId,
         accountGlobalId: accounts.shopify.global_id,
-        capability: 'shipping_rate_callbacks',
+        capability: 'tracking_export',
       }),
       null,
     )

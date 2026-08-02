@@ -97,6 +97,8 @@ import {
   withTransaction,
 } from '@/lib/persistence/postgres'
 import {
+  lockShopifyCarrierServiceConfigWritersForActivationWithClient,
+  rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient,
   shopifyCheckoutRateLineageIsRequired,
   shopifyCheckoutRateOutcomeAllowsFulfillment,
   type ShopifyCheckoutRateReconciliationOutcome,
@@ -4304,6 +4306,16 @@ export async function updateOperationsActivationInPostgres(input: {
 
   return withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(client, `operations:activation:${organizationId}`)
+    if (input.state === 'shadow') {
+      await acquireTransactionAdvisoryLock(
+        client,
+        `commerce-active-transition:${organizationId}`,
+      )
+      await lockShopifyCarrierServiceConfigWritersForActivationWithClient(
+        client,
+        organizationId,
+      )
+    }
     if (input.expectedCurrentState !== undefined) {
       const observed = await client.query<{
         state: OperationsActivationState
@@ -4407,6 +4419,16 @@ export async function updateOperationsActivationInPostgres(input: {
       [organizationId, input.state, reason, actorEmail],
     )
     const updated = await resolveActivation(client, organizationId)
+    const shadowCarrierServiceRebindings = input.state === 'shadow'
+      ? await rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient(
+          client,
+          {
+            organizationId,
+            targetActivationRevision: updated.revision,
+            actorEmail,
+          },
+        )
+      : []
     await recordAuditEvent({
       actor: actorEmail,
       eventType: 'operations.activation.updated',
@@ -4421,6 +4443,21 @@ export async function updateOperationsActivationInPostgres(input: {
         revision: updated.revision,
         reason: updated.reason,
         dataPipelineId: updated.data_pipeline_id,
+        carrierServiceRebindings: shadowCarrierServiceRebindings.map(
+          (rebound) => ({
+            configGlobalId: rebound.configGlobalId,
+            accountGlobalId: rebound.accountGlobalId,
+            serviceGid: rebound.serviceGid,
+            fromActivationRevision: rebound.fromActivationRevision,
+            activationRevision: rebound.activationRevision,
+            fromRowVersion: rebound.fromRowVersion,
+            rowVersion: rebound.rowVersion,
+            callbackTokenVersionRetained:
+              rebound.callbackTokenVersion,
+            providerWrites: 0,
+            callbackTokenRotations: 0,
+          }),
+        ),
       },
     }, client)
     return activationPayload(updated)

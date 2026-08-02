@@ -1300,7 +1300,6 @@ async function registeredShopifyCarrierServiceRebindings(
     activation_revision: number
     callback_token_version: number
     row_version: string
-    callback_ready: boolean
     unsafe_authorization_exists: boolean
   }>(
     `SELECT
@@ -1313,10 +1312,6 @@ async function registeredShopifyCarrierServiceRebindings(
        config.activation_revision,
        config.callback_token_version,
        config.row_version::text,
-       operations_shopify_carrier_service_config_is_ready(
-         config.organization_id,
-         config.id
-       ) AS callback_ready,
        EXISTS (
          SELECT 1
          FROM operations_shopify_carrier_service_mutation_authorizations
@@ -1350,35 +1345,40 @@ async function registeredShopifyCarrierServiceRebindings(
      JOIN operations_integration_accounts account
        ON account.organization_id = config.organization_id
       AND account.id = config.integration_account_id
-     JOIN operations_commerce_credentials credential
-       ON credential.organization_id = account.organization_id
-      AND credential.integration_account_id = account.id
      WHERE config.organization_id = $1::uuid
        AND config.registration_state = 'registered'
      ORDER BY config.global_id
      FOR UPDATE OF config`,
     [input.organizationId],
   )
-  const cohortByAccount = new Map(
-    input.cohort.map((account) => [account.accountGlobalId, account]),
+  const callbackClaims = input.cohort.filter(
+    (account) => (
+      account.provider === 'shopify'
+      && account.writeCapabilities.includes('shipping_rate_callbacks')
+    ),
   )
+  const callbackClaimByAccountId = new Map(
+    callbackClaims.map((account) => [account.accountId, account]),
+  )
+  const matchedCallbackAccountIds = new Set<string>()
   const rebindings = rows.rows.map((row) => {
-    const account = cohortByAccount.get(row.account_global_id)
+    const account = callbackClaimByAccountId.get(
+      row.integration_account_id,
+    )
     if (
       !account
-      || account.provider !== 'shopify'
-      || !account.writeCapabilities.includes('shipping_rate_callbacks')
-      || account.accountId !== row.integration_account_id
+      || account.accountGlobalId !== row.account_global_id
       || account.credentialGeneration !== row.credential_generation
+      || matchedCallbackAccountIds.has(row.integration_account_id)
     ) {
       fail(
         'COMMERCE_ACTIVE_SHOPIFY_CALLBACK_AUTHORITY_MISSING',
         'Every registered Shopify CarrierService must be included with shipping-rate callback authority before Operations becomes Active',
       )
     }
+    matchedCallbackAccountIds.add(row.integration_account_id)
     if (
       row.activation_revision !== input.expectedActivationRevision
-      || row.callback_ready !== true
       || !row.service_gid
       || !SHOPIFY_CARRIER_SERVICE_GID.test(row.service_gid)
     ) {
@@ -1405,6 +1405,16 @@ async function registeredShopifyCarrierServiceRebindings(
       rowVersion: Number(row.row_version),
     }
   })
+  if (
+    callbackClaims.some(
+      (account) => !matchedCallbackAccountIds.has(account.accountId),
+    )
+  ) {
+    fail(
+      'COMMERCE_ACTIVE_SHOPIFY_CALLBACK_CONFIG_MISSING',
+      'Every Shopify shipping-rate callback claim requires exactly one registered CarrierService before Operations becomes Active',
+    )
+  }
   return rebindings
 }
 
@@ -1424,6 +1434,7 @@ async function applyRegisteredShopifyCarrierServiceRebindings(
     const updated = await client.query<{
       activation_revision: number
       row_version: string
+      callback_ready: boolean
     }>(
       `UPDATE operations_shopify_carrier_service_configs
        SET activation_revision = $3,
@@ -1438,7 +1449,13 @@ async function applyRegisteredShopifyCarrierServiceRebindings(
          AND activation_revision = $7
          AND callback_token_version = $8
          AND row_version = $9::bigint
-       RETURNING activation_revision, row_version::text`,
+       RETURNING
+         activation_revision,
+         row_version::text,
+         operations_shopify_carrier_service_config_is_ready(
+           organization_id,
+           id
+         ) AS callback_ready`,
       [
         input.organizationId,
         rebinding.id,
@@ -1455,6 +1472,7 @@ async function applyRegisteredShopifyCarrierServiceRebindings(
       Number(updated.rows[0]?.activation_revision)
         !== input.targetActivationRevision
       || Number(updated.rows[0]?.row_version) !== rebinding.rowVersion + 1
+      || updated.rows[0]?.callback_ready !== true
     ) {
       fail(
         'COMMERCE_ACTIVE_SHOPIFY_CALLBACK_CONFIG_DRIFT',

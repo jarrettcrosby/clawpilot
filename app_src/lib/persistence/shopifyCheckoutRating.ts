@@ -2439,6 +2439,257 @@ export async function updateShopifyCarrierServiceBrandNameOverrideInPostgres(
 }
 
 /**
+ * Serialize an Operations activation change against every CarrierService
+ * config writer before the activation row is locked. Callers must already
+ * hold the organization-scoped commerce-active advisory lock.
+ */
+export async function lockShopifyCarrierServiceConfigWritersForActivationWithClient(
+  client: PoolClient,
+  organizationId: string,
+) {
+  const scopedOrganizationId = matchValue(
+    organizationId,
+    UUID,
+    'Organization ID',
+  )
+  const identities = await client.query<{
+    id: string
+    account_global_id: string
+  }>(
+    `SELECT config.id::text, account.global_id AS account_global_id
+     FROM operations_shopify_carrier_service_configs config
+     JOIN operations_integration_accounts account
+       ON account.organization_id = config.organization_id
+      AND account.id = config.integration_account_id
+     WHERE config.organization_id = $1::uuid
+     ORDER BY config.global_id`,
+    [scopedOrganizationId],
+  )
+  for (const identity of identities.rows) {
+    await acquireTransactionAdvisoryLock(
+      client,
+      'shopify-carrier-service-authorization:'
+        + scopedOrganizationId + ':' + identity.id,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      'shopify-carrier-service-config:'
+        + scopedOrganizationId + ':' + identity.account_global_id,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      'shopify-carrier-service-config-mutation:'
+        + scopedOrganizationId + ':' + identity.account_global_id,
+    )
+  }
+}
+
+/**
+ * Rebind registered checkout callbacks when an owner/admin deliberately
+ * enters Shadow. Shadow remains provider-write guarded, while the callback
+ * continues to fail closed unless every canonical readiness fact survives.
+ */
+export async function rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient(
+  client: PoolClient,
+  rawInput: {
+    organizationId: string
+    targetActivationRevision: number
+    actorEmail: string
+  },
+) {
+  const input = {
+    organizationId: matchValue(
+      rawInput.organizationId,
+      UUID,
+      'Organization ID',
+    ),
+    targetActivationRevision: integer(
+      rawInput.targetActivationRevision,
+      'Shadow Operations revision',
+      1,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    actorEmail: textValue(rawInput.actorEmail, 'Actor email', 320),
+  }
+  const rows = await client.query<{
+    id: string
+    global_id: string
+    account_global_id: string
+    service_gid: string | null
+    credential_generation: number
+    activation_revision: number
+    callback_token_version: number
+    row_version: string
+    unsafe_authorization_exists: boolean
+  }>(
+    `SELECT
+       config.id::text,
+       config.global_id,
+       account.global_id AS account_global_id,
+       config.service_gid,
+       config.credential_generation,
+       config.activation_revision,
+       config.callback_token_version,
+       config.row_version::text,
+       EXISTS (
+         SELECT 1
+         FROM operations_shopify_carrier_service_mutation_authorizations
+           authorized_mutation
+         LEFT JOIN operations_shopify_carrier_service_mutation_attempts attempt
+           ON attempt.organization_id = authorized_mutation.organization_id
+          AND attempt.authorization_id = authorized_mutation.id
+         LEFT JOIN operations_shopify_carrier_service_mutation_outcomes outcome
+           ON outcome.organization_id = attempt.organization_id
+          AND outcome.attempt_id = attempt.id
+         LEFT JOIN operations_shopify_carrier_service_mutation_resolutions
+           resolution
+           ON resolution.organization_id = attempt.organization_id
+          AND resolution.attempt_id = attempt.id
+         WHERE authorized_mutation.organization_id = config.organization_id
+           AND authorized_mutation.config_id = config.id
+           AND authorized_mutation.config_row_version = config.row_version
+           AND (
+             (
+               outcome.outcome = 'failed'
+               AND outcome.provider_write_count = 0
+             )
+             OR resolution.disposition = 'confirmed_not_applied'
+             OR (
+               attempt.id IS NULL
+               AND authorized_mutation.expires_at <= now()
+             )
+           ) IS NOT TRUE
+       ) AS unsafe_authorization_exists
+     FROM operations_shopify_carrier_service_configs config
+     JOIN operations_integration_accounts account
+       ON account.organization_id = config.organization_id
+      AND account.id = config.integration_account_id
+     JOIN operations_activation_scopes activation
+       ON activation.organization_id = config.organization_id
+      AND activation.state = 'shadow'
+      AND activation.revision = $2
+     WHERE config.organization_id = $1::uuid
+       AND config.registration_state = 'registered'
+     ORDER BY config.global_id
+     FOR UPDATE OF config, account`,
+    [input.organizationId, input.targetActivationRevision],
+  )
+  const applied: Array<{
+    configGlobalId: string
+    accountGlobalId: string
+    serviceGid: string
+    fromActivationRevision: number
+    activationRevision: number
+    fromRowVersion: number
+    rowVersion: number
+    callbackTokenVersion: number
+  }> = []
+  for (const row of rows.rows) {
+    if (
+      !row.service_gid
+      || !SHOPIFY_SERVICE_GID.test(row.service_gid)
+      || row.unsafe_authorization_exists
+    ) {
+      fail(
+        row.unsafe_authorization_exists
+          ? 'SHOPIFY_CARRIER_SERVICE_SHADOW_REBIND_MUTATION_UNRESOLVED'
+          : 'SHOPIFY_CARRIER_SERVICE_SHADOW_REBIND_NOT_ELIGIBLE',
+        row.unsafe_authorization_exists
+          ? 'Resolve the current Shopify CarrierService provider mutation before entering Shadow'
+          : 'A registered Shopify CarrierService is not eligible for the exact Shadow activation revision',
+        409,
+      )
+    }
+    const priorRowVersion = Number(row.row_version)
+    const updated = await client.query<{
+      activation_revision: number
+      row_version: string
+      callback_ready: boolean
+    }>(
+      `UPDATE operations_shopify_carrier_service_configs config
+       SET activation_revision = $3,
+           row_version = config.row_version + 1,
+           updated_by = $4,
+           updated_at = now()
+       WHERE config.organization_id = $1::uuid
+         AND config.id = $2::uuid
+         AND config.registration_state = 'registered'
+         AND config.service_gid = $5
+         AND config.credential_generation = $6
+         AND config.activation_revision = $7
+         AND config.callback_token_version = $8
+         AND config.row_version = $9::bigint
+       RETURNING
+         config.activation_revision,
+         config.row_version::text,
+         operations_shopify_carrier_service_config_is_ready(
+           config.organization_id,
+           config.id
+         ) AS callback_ready`,
+      [
+        input.organizationId,
+        row.id,
+        input.targetActivationRevision,
+        input.actorEmail,
+        row.service_gid,
+        row.credential_generation,
+        row.activation_revision,
+        row.callback_token_version,
+        priorRowVersion,
+      ],
+    )
+    if (
+      updated.rows[0]?.activation_revision
+        !== input.targetActivationRevision
+      || Number(updated.rows[0]?.row_version) !== priorRowVersion + 1
+      || updated.rows[0]?.callback_ready !== true
+    ) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_SHADOW_REBIND_READINESS_FAILED',
+        'The registered Shopify CarrierService did not remain callback-ready when Operations entered Shadow',
+        409,
+      )
+    }
+    const rebound = {
+      configGlobalId: row.global_id,
+      accountGlobalId: row.account_global_id,
+      serviceGid: row.service_gid,
+      fromActivationRevision: row.activation_revision,
+      activationRevision: input.targetActivationRevision,
+      fromRowVersion: priorRowVersion,
+      rowVersion: priorRowVersion + 1,
+      callbackTokenVersion: row.callback_token_version,
+    }
+    applied.push(rebound)
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType:
+        'operations.shopify_carrier_service.activation_revision_rebound',
+      aggregateType: 'operations.shopify_carrier_service_config',
+      aggregateId: rebound.configGlobalId,
+      subject: rebound.accountGlobalId,
+      organizationId: input.organizationId,
+      eventKey:
+        'operations:shopify-carrier-service:' + rebound.configGlobalId
+        + ':shadow-revision:' + rebound.activationRevision,
+      payload: {
+        accountGlobalId: rebound.accountGlobalId,
+        serviceGid: rebound.serviceGid,
+        activationState: 'shadow',
+        fromActivationRevision: rebound.fromActivationRevision,
+        activationRevision: rebound.activationRevision,
+        fromRowVersion: rebound.fromRowVersion,
+        rowVersion: rebound.rowVersion,
+        callbackTokenVersionRetained: rebound.callbackTokenVersion,
+        providerWrites: 0,
+        callbackTokenRotations: 0,
+      },
+    }, client)
+  }
+  return applied
+}
+
+/**
  * Repair only the local activation-revision fence for a registered Shopify
  * CarrierService after an exact, immutable Shadow-to-Active transition. No
  * Shopify request or callback-token rotation occurs in this transaction.
@@ -2482,6 +2733,27 @@ export async function repairShopifyCarrierServiceActiveRevisionBindingInPostgres
       client,
       'commerce-active-transition:' + input.organizationId,
     )
+    const membership = await client.query<{
+      role: string
+      status: string
+    }>(
+      `SELECT membership.role, membership.status
+       FROM app_user_organization_memberships membership
+       WHERE membership.organization_id = $1::uuid
+         AND membership.user_email = $2
+       FOR SHARE`,
+      [input.organizationId, input.actorEmail],
+    )
+    if (
+      membership.rows[0]?.status !== 'active'
+      || !['owner', 'admin'].includes(membership.rows[0]?.role)
+    ) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_AUTHORIZATION_REQUIRED',
+        'Refreshing Active checkout authority requires an active owner or administrator',
+        403,
+      )
+    }
     const identity = await client.query<{ id: string }>(
       `SELECT config.id::text
        FROM operations_shopify_carrier_service_configs config

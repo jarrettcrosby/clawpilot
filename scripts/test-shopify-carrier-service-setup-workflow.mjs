@@ -25,6 +25,9 @@ const setupPersistence = read(
 const checkoutRatingPersistence = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
 )
+const operationsPersistence = read(
+  'app_src/lib/persistence/operations.ts',
+)
 const commerceIntegrations = read(
   'app_src/lib/integrations/commerceIntegrations.ts',
 )
@@ -190,6 +193,9 @@ const repairPersistence = checkoutRatingPersistence.slice(
   repairPersistenceEnd,
 )
 requireAll(repairPersistence, [
+  'app_user_organization_memberships',
+  'FOR SHARE',
+  "!['owner', 'admin'].includes(membership.rows[0]?.role)",
   'operations_commerce_active_capability_claim_is_current(',
   "? 'shipping_rate_callbacks'",
   'operations_shopify_carrier_service_config_is_ready(',
@@ -200,6 +206,22 @@ requireAll(repairPersistence, [
   'providerWrites: 0',
   'callbackTokenRotations: 0',
 ], 'transition-proven local Active callback repair persistence')
+const shadowRebindStart = checkoutRatingPersistence.indexOf(
+  'export async function rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient(',
+)
+const shadowRebindEnd = checkoutRatingPersistence.indexOf(
+  'export async function repairShopifyCarrierServiceActiveRevisionBindingInPostgres(',
+  shadowRebindStart,
+)
+const shadowRebind = checkoutRatingPersistence.slice(
+  shadowRebindStart,
+  shadowRebindEnd,
+)
+assert.equal(
+  shadowRebind.includes('JOIN operations_commerce_credentials'),
+  false,
+  'Shadow rebind must enumerate every registered CarrierService even when its credential row is missing',
+)
 for (const forbiddenRepairMutation of [
   'SET service_gid =',
   'SET callback_token_version =',
@@ -223,6 +245,40 @@ requireAll(setupPanel, [
   'Refresh Active checkout authority',
   'it performs no Shopify write',
 ], 'fail-closed Active callback repair UI')
+
+requireAll(checkoutRatingPersistence, [
+  'lockShopifyCarrierServiceConfigWritersForActivationWithClient(',
+  'rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient(',
+  "activation.state = 'shadow'",
+  'operations_shopify_carrier_service_config_is_ready(',
+  "'SHOPIFY_CARRIER_SERVICE_SHADOW_REBIND_MUTATION_UNRESOLVED'",
+  "activationState: 'shadow'",
+  'callbackTokenRotations: 0',
+], 'registered CarrierService Shadow revision rebind')
+requireAll(operationsPersistence, [
+  "if (input.state === 'shadow')",
+  '`commerce-active-transition:${organizationId}`',
+  'lockShopifyCarrierServiceConfigWritersForActivationWithClient(',
+  'rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient(',
+  'targetActivationRevision: updated.revision',
+  'carrierServiceRebindings: shadowCarrierServiceRebindings.map(',
+], 'atomic Operations Shadow callback rebind')
+const shadowActivationStart = operationsPersistence.indexOf(
+  'export async function updateOperationsActivationInPostgres(',
+)
+const shadowActivationEnd = operationsPersistence.indexOf(
+  'async function readException(',
+  shadowActivationStart,
+)
+const shadowActivation = operationsPersistence.slice(
+  shadowActivationStart,
+  shadowActivationEnd,
+)
+assert.ok(
+  shadowActivation.indexOf('commerce-active-transition:')
+    < shadowActivation.indexOf('FOR UPDATE'),
+  'Shadow activation must acquire commerce/config serialization before locking activation',
+)
 
 const saveConfig = actionBranch('save-config', 'save-plan-rate-policy')
 requireAll(saveConfig, [
