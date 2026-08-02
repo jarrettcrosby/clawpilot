@@ -601,6 +601,75 @@ assert.equal(replayResult.outcome, 'succeeded')
 assert.equal(replayResult.replayed, true)
 assert.equal(replay.calls.adds, 0, 'replay must not submit another shipment')
 
+const partial = fixtureClient({
+  orders: [{
+    id: 'bo_order123',
+    state: 'PROCESSING',
+    shipments: [shipmentReadback.shipments[0]],
+  }],
+})
+await assert.rejects(
+  () => writeback.executeFaireFulfillmentWriteback(
+    writebackInput,
+    { createClient: () => partial.client },
+  ),
+  (error) => error?.code === 'FAIRE_FULFILLMENT_PARTIAL_MATCH',
+  'partial multi-package provider state must fail closed',
+)
+assert.equal(
+  partial.calls.adds,
+  0,
+  'partial multi-package provider state must never repeat any shipment',
+)
+
+const conflictingShipmentCases = [
+  {
+    label: 'unrelated provider shipment',
+    shipments: [{
+      id: 's_unrelated',
+      carrier: 'UPS',
+      tracking_code: '1ZUNRELATED',
+    }],
+  },
+  {
+    label: 'provider shipment without tracking',
+    shipments: [{ id: 's_missingtracking', carrier: 'UPS' }],
+  },
+  {
+    label: 'provider shipment without carrier',
+    shipments: [{ id: 's_missingcarrier', tracking_code: '1ZMISSINGCARRIER' }],
+  },
+  {
+    label: 'duplicate provider shipment identity',
+    shipments: [
+      shipmentReadback.shipments[0],
+      { ...shipmentReadback.shipments[0] },
+    ],
+  },
+]
+for (const conflict of conflictingShipmentCases) {
+  const fixture = fixtureClient({
+    orders: [{
+      id: 'bo_order123',
+      state: 'PROCESSING',
+      shipments: conflict.shipments,
+    }],
+  })
+  await assert.rejects(
+    () => writeback.executeFaireFulfillmentWriteback(
+      writebackInput,
+      { createClient: () => fixture.client },
+    ),
+    (error) => error?.code === 'FAIRE_FULFILLMENT_PARTIAL_MATCH',
+    `${conflict.label} must fail closed`,
+  )
+  assert.equal(
+    fixture.calls.adds,
+    0,
+    `${conflict.label} must never submit a shipment batch`,
+  )
+}
+
 const timeoutError = new faire.FaireCommerceClientError(
   'timeout',
   504,
@@ -757,6 +826,9 @@ const runtime = load(
       executeFaireFulfillmentWriteback: async () => {
         throw new Error('default executor must be replaced in this test')
       },
+      reconcileFaireFulfillmentWritebackReadOnly: async () => {
+        throw new Error('default reconciler must be replaced in this test')
+      },
     },
     '@/lib/persistence/commerceIntegrations': {
       readCommerceRuntimeCredentialFromPostgres: async () => null,
@@ -764,6 +836,9 @@ const runtime = load(
     '@/lib/persistence/commerceActiveTransitionAuthorization': {
       requireCommerceActiveCapabilityClaimInPostgres: async () => {
         throw new Error('default capability reader must be replaced in this test')
+      },
+      requireCurrentFaireFulfillmentScopeEvidenceInPostgres: async () => {
+        throw new Error('default scope-evidence reader must be replaced in this test')
       },
     },
   },
@@ -805,16 +880,22 @@ const runtimeClaim = (capability) => ({
 })
 let runtimeExecutions = 0
 let runtimeExecutionInput = null
+let runtimeTrustedEvidenceChecks = 0
+let runtimeReadClientOptions = null
+let runtimeReadMutations = 0
 const runtimeDependencies = {
   readRuntimeCredential: async () => runtimeCredential,
   requireCapability: async ({ capability }) => runtimeClaim(capability),
+  requireTrustedScopeEvidence: async () => {
+    runtimeTrustedEvidenceChecks += 1
+  },
   decryptCredential: () => ({
     provider: 'faire',
     authMode: 'faire_oauth',
     applicationId: 'app-id-for-runtime-acceptance',
     applicationSecret: 'application-secret-for-runtime-acceptance',
     accessToken: 'oauth-access-token-for-runtime-acceptance',
-    scopes: ['READ_SHIPMENTS', 'WRITE_ORDERS'],
+    scopes: ['READ_BRAND', 'READ_ORDERS', 'READ_SHIPMENTS', 'WRITE_ORDERS'],
   }),
   executeWriteback: async (input) => {
     runtimeExecutions += 1
@@ -830,6 +911,33 @@ const runtimeDependencies = {
       reconciledUnknownOutcome: false,
     }
   },
+  reconcileReadOnly: (input) => (
+    writeback.reconcileFaireFulfillmentWritebackReadOnly(input, {
+      createClient: (options) => {
+        runtimeReadClientOptions = options
+        return {
+          probeBrandProfile: async () => ({
+            brand_id: runtimeExternalAccountId,
+          }),
+          getOrder: async () => ({
+            id: input.externalOrderId,
+            state: 'PRE_TRANSIT',
+            shipments: [{
+              id: 's_runtime_rotated1',
+              carrier: input.packages[0].carrier,
+              tracking_code: input.packages[0].trackingCode,
+            }],
+          }),
+          moveOrderToProcessing: async () => {
+            runtimeReadMutations += 1
+          },
+          addOrderShipments: async () => {
+            runtimeReadMutations += 1
+          },
+        }
+      },
+    })
+  ),
 }
 assert.deepEqual(
   JSON.parse(JSON.stringify(
@@ -844,6 +952,7 @@ assert.deepEqual(
     externalAccountId: runtimeExternalAccountId,
   },
 )
+assert.equal(runtimeTrustedEvidenceChecks, 1)
 await runtime.executeCurrentFaireFulfillmentWriteback({
   organizationId: runtimeOrganizationId,
   accountGlobalId: runtimeAccountGlobalId,
@@ -862,6 +971,7 @@ await runtime.executeCurrentFaireFulfillmentWriteback({
   }],
 }, runtimeDependencies)
 assert.equal(runtimeExecutions, 1)
+assert.equal(runtimeTrustedEvidenceChecks, 2)
 assert.deepEqual(
   JSON.parse(JSON.stringify(runtimeExecutionInput.authorization)),
   {
@@ -881,6 +991,77 @@ assert.deepEqual(
   },
 )
 assert.equal(runtimeExecutionInput.credential.binding.verificationStatus, 'verified')
+
+const rotatedReconciliation = await runtime
+  .executeCurrentFaireFulfillmentWriteback({
+    organizationId: runtimeOrganizationId,
+    accountGlobalId: runtimeAccountGlobalId,
+    mode: 'reconcile_unknown',
+    writeAttempt: {
+      attemptId: 'gxa1234569',
+      authorizationRevision: 6,
+      state: 'outcome_unknown',
+    },
+    externalOrderId: 'bo_runtime_rotated',
+    packages: [{
+      packageReference: 'gpa1234569',
+      carrier: 'UPS',
+      trackingCode: '1ZROTATED',
+    }],
+  }, {
+    ...runtimeDependencies,
+    readRuntimeCredential: async () => ({
+      ...runtimeCredential,
+      credentialVersion: 10,
+    }),
+    decryptCredential: () => ({
+      provider: 'faire',
+      authMode: 'faire_oauth',
+      applicationId: 'rotated-app-id',
+      applicationSecret: 'rotated-application-secret',
+      accessToken: 'rotated-oauth-access-token',
+      scopes: ['READ_BRAND', 'READ_ORDERS', 'READ_SHIPMENTS'],
+    }),
+    requireCapability: async () => {
+      throw new Error('read-only recovery must not require stale write claims')
+    },
+    requireTrustedScopeEvidence: async () => {
+      throw new Error('read-only recovery must not require write-scope evidence')
+    },
+  })
+assert.equal(rotatedReconciliation.outcome, 'succeeded')
+assert.equal(rotatedReconciliation.reconciledUnknownOutcome, true)
+assert.equal(runtimeReadClientOptions.credentialBinding.credentialVersion, 10)
+assert.equal(
+  Object.prototype.hasOwnProperty.call(
+    runtimeReadClientOptions,
+    'writeAuthorization',
+  ),
+  false,
+  'rotated recovery must construct a client with no POST authority',
+)
+assert.equal(runtimeReadMutations, 0, 'rotated recovery must issue GETs only')
+assert.equal(runtimeExecutions, 1)
+assert.equal(runtimeTrustedEvidenceChecks, 2)
+
+await assert.rejects(
+  () => runtime.prepareCurrentFaireFulfillmentAuthority({
+    organizationId: runtimeOrganizationId,
+    accountGlobalId: runtimeAccountGlobalId,
+  }, {
+    ...runtimeDependencies,
+    requireTrustedScopeEvidence: async () => {
+      const error = new Error('provider-verifiable evidence is unavailable')
+      error.code = 'COMMERCE_ACTIVE_FAIRE_SCOPE_EVIDENCE_REQUIRED'
+      throw error
+    },
+  }),
+  (error) => (
+    error?.code === 'COMMERCE_ACTIVE_FAIRE_SCOPE_EVIDENCE_REQUIRED'
+  ),
+  'requested OAuth scopes must not substitute for trusted grant evidence',
+)
+assert.equal(runtimeExecutions, 1)
 
 await assert.rejects(
   () => runtime.executeCurrentFaireFulfillmentWriteback({
@@ -922,7 +1103,7 @@ await assert.rejects(
       applicationId: 'app-id-for-runtime-acceptance',
       applicationSecret: 'application-secret-for-runtime-acceptance',
       accessToken: 'oauth-access-token-for-runtime-acceptance',
-      scopes: ['WRITE_ORDERS'],
+      scopes: ['READ_BRAND', 'READ_ORDERS', 'WRITE_ORDERS'],
     }),
   }),
   (error) => error?.code === 'FAIRE_FULFILLMENT_OAUTH_SCOPE_REQUIRED',

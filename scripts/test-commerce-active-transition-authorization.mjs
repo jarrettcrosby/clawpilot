@@ -92,6 +92,21 @@ function verifySourceContracts() {
   const migration = read(
     'db/migrations/0167_operations_commerce_active_transition_authorization.sql',
   )
+  const faireFulfillmentAuthority = read(
+    'db/migrations/0224_operations_faire_fulfillment_authority.sql',
+  )
+  const healthRoute = read('app_src/app/api/health/route.ts')
+  const predeploy = read('scripts/verify-predeploy.mjs')
+  assert.match(
+    healthRoute,
+    /faire_fulfillment_authority_applied/,
+    'Health must require the Faire fulfillment authority migration',
+  )
+  assert.match(
+    predeploy,
+    /0224_operations_faire_fulfillment_authority\.sql/,
+    'Predeploy must require the Faire fulfillment authority migration',
+  )
   const collationRepair = read(
     'db/migrations/0199_operations_commerce_active_canonical_collation.sql',
   )
@@ -117,6 +132,21 @@ function verifySourceContracts() {
     assert.ok(
       migration.includes(fragment),
       `Commerce Active migration missing ${fragment}`,
+    )
+  }
+  for (const fragment of [
+    'operations_faire_fulfillment_scope_evidence_is_current',
+    'operations_faire_provider_write_scope_evidence_is_current',
+    "account.configuration->>'scopeVerification' = 'oauth_grant'",
+    "'READ_BRAND', 'READ_ORDERS', 'READ_SHIPMENTS', 'WRITE_ORDERS'",
+    "'order_update', 'fulfillment_export', 'tracking_export'",
+    'ORDER BY (cohort.member->>\'accountGlobalId\') COLLATE "C"',
+    'ORDER BY scope.value COLLATE "C"',
+    'ORDER BY item.value COLLATE "C"',
+  ]) {
+    assert.ok(
+      faireFulfillmentAuthority.includes(fragment),
+      `Faire fulfillment authority migration missing ${fragment}`,
     )
   }
 
@@ -469,7 +499,7 @@ async function seedWorkspace(pool) {
         account.organization_id,
         account.id,
         externalAccountId,
-        isFaire ? 'faire_brand_token' : 'shopify_client_credentials',
+        isFaire ? 'faire_oauth' : 'shopify_client_credentials',
         isFaire ? 'not_applicable' : 'verified',
         isFaire ? null : new Date(),
         actor,
@@ -551,6 +581,17 @@ async function verifyDisposablePostgres() {
     assert.deepEqual(canonicalScopeOrder.rows[0].scopes, [
       'read_custom_fulfillment_services',
       'read_customers',
+    ])
+    const faireScopeMap = await pool.query(
+      `SELECT operations_commerce_active_capability_scopes(
+         'faire', 'fulfillment_export'
+       ) AS scopes`,
+    )
+    assert.deepEqual(faireScopeMap.rows[0].scopes, [
+      'READ_BRAND',
+      'READ_ORDERS',
+      'READ_SHIPMENTS',
+      'WRITE_ORDERS',
     ])
 
     const postgresMock = {
@@ -678,11 +719,120 @@ async function verifyDisposablePostgres() {
         expectedActivationRevision: 1,
         selectedAccounts: [{
           accountGlobalId: accounts.faire.global_id,
-          capabilities: ['order_update'],
+          capabilities: ['inventory_export'],
         }],
         idempotencyKey: 'faire-not-implemented',
       }),
       'COMMERCE_ACTIVE_CAPABILITY_NOT_IMPLEMENTED',
+    )
+    const faireFulfillmentScopes = [
+      'READ_BRAND',
+      'READ_ORDERS',
+      'READ_SHIPMENTS',
+      'WRITE_ORDERS',
+    ]
+    await pool.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = $3::jsonb,
+           updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [
+        organizationId,
+        accounts.faire.id,
+        JSON.stringify({
+          requestedScopes: faireFulfillmentScopes,
+          grantedScopes: null,
+          scopeVerification: 'not_exposed_by_provider',
+        }),
+      ],
+    )
+    await expectCode(
+      persistence.prepareCommerceActiveTransitionInPostgres({
+        organizationId,
+        actorEmail: ownerEmail,
+        expectedActivationState: 'shadow',
+        expectedActivationRevision: 1,
+        selectedAccounts: [{
+          accountGlobalId: accounts.faire.global_id,
+          capabilities: [
+            'order_update',
+            'fulfillment_export',
+            'tracking_export',
+          ],
+        }],
+        idempotencyKey: 'faire-requested-scopes-only',
+      }),
+      'COMMERCE_ACTIVE_SCOPE_MISSING',
+    )
+    await pool.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = $3::jsonb,
+           updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [
+        organizationId,
+        accounts.faire.id,
+        JSON.stringify({
+          requestedScopes: faireFulfillmentScopes,
+          grantedScopes: faireFulfillmentScopes,
+          scopeVerification: 'oauth_grant',
+        }),
+      ],
+    )
+    const forgedFaireCapabilities = [
+      'fulfillment_export',
+      'order_update',
+      'tracking_export',
+    ]
+    const forgedFaireCohort = [{
+      accountId: accounts.faire.id,
+      accountGlobalId: accounts.faire.global_id,
+      provider: 'faire',
+      environment: 'production',
+      externalAccountId: 'faire-brand-ag-alchemy',
+      credentialGeneration: 1,
+      authMode: 'faire_oauth',
+      priorAccountStatus: 'active',
+      targetAccountStatus: 'active',
+      grantedScopes: faireFulfillmentScopes,
+      grantedScopeDigest: persistence.commerceActiveGrantedScopeDigest(
+        faireFulfillmentScopes,
+      ),
+      writeCapabilities: forgedFaireCapabilities,
+      capabilityDigest: persistence.commerceActiveCapabilityDigest(
+        forgedFaireCapabilities,
+      ),
+    }]
+    const forgedFaireDatabaseGate = await pool.query(
+      `SELECT operations_commerce_active_cohort_matches_current(
+         $1::uuid, $2::jsonb, 'shadow', 1, 'priorAccountStatus'
+       ) AS current`,
+      [organizationId, JSON.stringify(forgedFaireCohort)],
+    )
+    assert.equal(
+      forgedFaireDatabaseGate.rows[0].current,
+      false,
+      'database currentness must reject self-asserted Faire grant scopes',
+    )
+    await expectCode(
+      persistence.prepareCommerceActiveTransitionInPostgres({
+        organizationId,
+        actorEmail: ownerEmail,
+        expectedActivationState: 'shadow',
+        expectedActivationRevision: 1,
+        selectedAccounts: [{
+          accountGlobalId: accounts.faire.global_id,
+          capabilities: [
+            'order_update',
+            'fulfillment_export',
+            'tracking_export',
+          ],
+        }],
+        idempotencyKey: 'faire-self-asserted-granted-scopes',
+      }),
+      'COMMERCE_ACTIVE_FAIRE_SCOPE_EVIDENCE_REQUIRED',
     )
     await expectCode(
       persistence.prepareCommerceActiveTransitionInPostgres({

@@ -51,6 +51,13 @@ export type FaireFulfillmentWritebackInput = {
   packages: readonly FaireFulfillmentPackageTracking[]
 }
 
+export type FaireFulfillmentReadOnlyReconciliationInput = Omit<
+  FaireFulfillmentWritebackInput,
+  'authorization' | 'mode'
+> & {
+  mode: 'reconcile_unknown'
+}
+
 export type FaireFulfillmentWritebackSuccess = {
   outcome: 'succeeded'
   writeAttempt: FaireFulfillmentWriteAttemptResult & { state: 'succeeded' }
@@ -195,6 +202,31 @@ function normalizedAuthority(input: FaireFulfillmentWritebackInput) {
   }
 }
 
+function normalizedReadAuthority(
+  input: FaireFulfillmentReadOnlyReconciliationInput,
+) {
+  const credential = record(input?.credential)
+  const binding = record(credential?.binding)
+  if (
+    !credential
+    || !binding
+    || binding.provider !== 'faire'
+    || binding.environment !== 'production'
+    || binding.connectionStatus !== 'active'
+    || binding.verificationStatus !== 'verified'
+  ) {
+    throw new FaireFulfillmentWritebackError(
+      'FAIRE_FULFILLMENT_AUTHORIZATION_INVALID',
+      'A verified active Faire credential is required for read-only reconciliation',
+    )
+  }
+  return {
+    credential: credential as FaireFulfillmentWritebackCredential,
+    binding: binding as FaireVerifiedCredentialBinding,
+    externalAccountId: clean(binding.externalAccountId, 'Faire brand ID', 128),
+  }
+}
+
 function normalizeWriteAttempt(
   input: FaireFulfillmentWritebackInput,
   authorizationRevision: number,
@@ -245,6 +277,36 @@ function normalizeWriteAttempt(
     attemptId,
     authorizationRevision: attemptAuthorizationRevision,
   }
+}
+
+function normalizeReadOnlyWriteAttempt(
+  input: FaireFulfillmentReadOnlyReconciliationInput,
+) {
+  const attempt = record(input?.writeAttempt)
+  if (!attempt) {
+    throw new FaireFulfillmentWritebackError(
+      'FAIRE_FULFILLMENT_ATTEMPT_INVALID',
+      'A persisted Faire fulfillment write attempt is required',
+    )
+  }
+  const attemptId = clean(attempt.attemptId, 'Faire write attempt ID', 128)
+  if (!/^[A-Za-z0-9][A-Za-z0-9:_-]{7,127}$/.test(attemptId)) {
+    throw new FaireFulfillmentWritebackError(
+      'FAIRE_FULFILLMENT_ATTEMPT_INVALID',
+      'Faire write attempt ID is invalid',
+    )
+  }
+  const authorizationRevision = positiveRevision(
+    attempt.authorizationRevision,
+    'Original Faire write attempt authorization revision',
+  )
+  if (attempt.state !== 'outcome_unknown') {
+    throw new FaireFulfillmentWritebackError(
+      'FAIRE_FULFILLMENT_RECONCILIATION_STATE_REQUIRED',
+      'Faire unknown-outcome reconciliation requires persisted unknown state',
+    )
+  }
+  return { attemptId, authorizationRevision }
 }
 
 function normalizePackages(value: unknown) {
@@ -330,21 +392,50 @@ function providerState(order: Record<string, unknown>) {
   return clean(order.state, 'Faire provider order state', 64).toUpperCase()
 }
 
+function shipmentEvidenceConflict(): never {
+  throw new FaireFulfillmentWritebackError(
+    'FAIRE_FULFILLMENT_PARTIAL_MATCH',
+    'Faire already contains shipment evidence that does not exactly match the requested package tracking; manual reconciliation is required',
+  )
+}
+
 function observedShipments(order: Record<string, unknown>) {
-  return Array.isArray(order.shipments)
-    ? order.shipments.flatMap((candidate) => {
-      const shipment = record(candidate)
-      if (!shipment) return []
-      const trackingCode = typeof shipment.tracking_code === 'string'
-        ? shipment.tracking_code.trim()
-        : ''
-      const carrier = typeof shipment.carrier === 'string'
-        ? shipment.carrier.trim()
-        : ''
-      const id = typeof shipment.id === 'string' ? shipment.id.trim() : ''
-      return trackingCode ? [{ trackingCode, carrier, id }] : []
-    })
-    : []
+  if (order.shipments === undefined || order.shipments === null) return []
+  if (!Array.isArray(order.shipments)) shipmentEvidenceConflict()
+
+  const shipmentIds = new Set<string>()
+  const trackingCodes = new Set<string>()
+  const trackingIdentities = new Set<string>()
+  return order.shipments.map((candidate) => {
+    const shipment = record(candidate)
+    if (!shipment) shipmentEvidenceConflict()
+    const trackingCode = typeof shipment.tracking_code === 'string'
+      ? shipment.tracking_code.trim()
+      : ''
+    const carrier = typeof shipment.carrier === 'string'
+      ? shipment.carrier.trim()
+      : ''
+    const id = typeof shipment.id === 'string' ? shipment.id.trim() : ''
+    const identity = `${carrier.toUpperCase()}\n${trackingCode}`
+    if (
+      !FAIRE_SHIPMENT_ID.test(id)
+      || !trackingCode
+      || trackingCode.length > 255
+      || /[\u0000-\u001f\u007f]/.test(trackingCode)
+      || !carrier
+      || carrier.length > 80
+      || /[\u0000-\u001f\u007f]/.test(carrier)
+      || shipmentIds.has(id)
+      || trackingCodes.has(trackingCode)
+      || trackingIdentities.has(identity)
+    ) {
+      shipmentEvidenceConflict()
+    }
+    shipmentIds.add(id)
+    trackingCodes.add(trackingCode)
+    trackingIdentities.add(identity)
+    return { trackingCode, carrier, id }
+  })
 }
 
 function matchedShipments(
@@ -352,19 +443,14 @@ function matchedShipments(
   packages: ReturnType<typeof normalizePackages>,
 ) {
   const observed = observedShipments(order)
+  if (observed.length === 0) return null
+  if (observed.length !== packages.length) shipmentEvidenceConflict()
   const matched = packages.map((item) => observed.find((shipment) => (
     shipment.trackingCode === item.trackingCode
     && shipment.carrier.toUpperCase() === item.carrier.toUpperCase()
   )))
-  if (matched.some((shipment) => !shipment)) return null
-  const references = matched.map((shipment) => shipment?.id || '')
-  if (references.some((id) => !FAIRE_SHIPMENT_ID.test(id))) {
-    throw new FaireFulfillmentWritebackError(
-      'FAIRE_FULFILLMENT_READBACK_INVALID',
-      'Faire tracking readback did not include exact shipment identities',
-    )
-  }
-  return [...new Set(references)]
+  if (matched.some((shipment) => !shipment)) shipmentEvidenceConflict()
+  return matched.map((shipment) => shipment!.id)
 }
 
 function successResult(
@@ -448,6 +534,54 @@ async function reconcileTracking(
       reconciledUnknownOutcome,
     )
     : unknownResult(orderId, writeAttempt, packages, reason, order)
+}
+
+/**
+ * Reconciles an immutable unknown-outcome attempt with provider GETs only.
+ * The client is intentionally constructed without write authorization, so a
+ * credential rotation can restore observation without making the original
+ * one-shot POST authority current again.
+ */
+export async function reconcileFaireFulfillmentWritebackReadOnly(
+  input: FaireFulfillmentReadOnlyReconciliationInput,
+  dependencies: FaireFulfillmentWritebackDependencies = DEFAULT_DEPENDENCIES,
+): Promise<FaireFulfillmentWritebackResult> {
+  if (input?.mode !== 'reconcile_unknown') {
+    throw new FaireFulfillmentWritebackError(
+      'FAIRE_FULFILLMENT_MODE_INVALID',
+      'Faire read-only reconciliation mode must be explicit',
+    )
+  }
+  const authority = normalizedReadAuthority(input)
+  const writeAttempt = normalizeReadOnlyWriteAttempt(input)
+  const orderId = clean(input.externalOrderId, 'Faire order ID', 128)
+  if (!FAIRE_ORDER_ID.test(orderId)) {
+    throw new FaireFulfillmentWritebackError(
+      'FAIRE_FULFILLMENT_ORDER_INVALID',
+      'Faire order ID is invalid',
+    )
+  }
+  const packages = normalizePackages(input.packages)
+  const client = dependencies.createClient({
+    accessToken: authority.credential.accessToken,
+    applicationId: authority.credential.applicationId,
+    applicationSecret: authority.credential.applicationSecret,
+    credentialBinding: authority.binding,
+  })
+  const profile = await client.probeBrandProfile()
+  if (providerBrandId(profile) !== authority.externalAccountId) {
+    throw new FaireFulfillmentWritebackError(
+      'FAIRE_FULFILLMENT_BRAND_CHANGED',
+      'Faire returned a different brand identity',
+    )
+  }
+  return reconcileTracking(
+    client,
+    orderId,
+    writeAttempt,
+    packages,
+    'shipment_write_outcome_unknown',
+  )
 }
 
 /**

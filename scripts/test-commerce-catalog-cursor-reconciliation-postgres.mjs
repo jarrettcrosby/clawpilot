@@ -283,7 +283,7 @@ async function verifyReconciliation(pool) {
       },
     )
     assert.equal(result.cancelled, 1)
-    assert.equal(result.queued, 0)
+    assert.equal(result.queued, 1)
     await client.query('COMMIT')
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {})
@@ -302,13 +302,36 @@ async function verifyReconciliation(pool) {
   assert.deepEqual(cancelledPending, {
     status: 'cancelled',
     cancel_requested: true,
-    last_error_code: 'COMMERCE_CATALOG_SYNC_POLICY_PAUSED',
+    last_error_code: 'COMMERCE_CATALOG_SYNC_FENCE_CHANGED',
+  })
+  const reviewPending = (
+    await pool.query(
+      `SELECT id::text, status, policy_revision, cancel_requested
+       FROM operations_commerce_catalog_sync_jobs
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND policy_revision = 4
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1`,
+      [fixture.organizationId, fixture.integrationAccountId],
+    )
+  ).rows[0]
+  assert.deepEqual(reviewPending, {
+    id: reviewPending.id,
+    status: 'pending',
+    policy_revision: 4,
+    cancel_requested: false,
   })
   assert.deepEqual(await cursorState(pool, fixture), {
-    reconciliation_status: 'idle',
-    last_error_code: 'COMMERCE_CATALOG_SYNC_POLICY_PAUSED',
+    reconciliation_status: 'running',
+    last_error_code: null,
     last_completed_at: null,
   })
+  await pool.query(
+    `DELETE FROM operations_commerce_catalog_sync_jobs
+     WHERE id = $1::uuid`,
+    [reviewPending.id],
+  )
 
   await pool.query(
     `UPDATE operations_commerce_product_intake_policies

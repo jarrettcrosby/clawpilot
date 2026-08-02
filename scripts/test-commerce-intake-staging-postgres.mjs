@@ -494,9 +494,15 @@ function loadCommerceStagingService(pool, counters) {
         },
       },
       '@/lib/persistence/commerceCatalogSync': {
-        applyCommerceCatalogSyncPolicyWithClient: mustNotRun(
-          'applyCommerceCatalogSyncPolicyWithClient',
-        ),
+        async applyCommerceCatalogSyncPolicyWithClient(client, input) {
+          assert.strictEqual(
+            client,
+            counters.activeTransactionClient,
+            'Catalog policy application must share the policy transaction',
+          )
+          counters.catalogPolicyApplications.push({ ...input })
+          return { queued: 1, cancelled: 0 }
+        },
         commerceCatalogCredentialSupportsProducts: mustNotRun(
           'commerceCatalogCredentialSupportsProducts',
         ),
@@ -586,6 +592,110 @@ function loadCommerceOrderReconciliationPersistence(pool) {
       },
     },
   )
+}
+
+async function verifyReviewTerminalCatalogRecovery(input) {
+  const {
+    pool,
+    ids,
+    persistence,
+    counters,
+  } = input
+  const deadJobId = randomUUID()
+  const registryClient = await pool.connect()
+  try {
+    await registryClient.query('SET session_replication_role = replica')
+    await registryClient.query(
+      `INSERT INTO crm_reference_registry (
+         reference_code, prefix, canonical_code, status, entity_type
+       ) VALUES (
+         'gia0009201', 'gia', 'gia0009201', 'active',
+         'operations.integration_account'
+       ) ON CONFLICT (reference_code) DO NOTHING`,
+    )
+  } finally {
+    await registryClient.query(
+      'SET session_replication_role = origin',
+    ).catch(() => {})
+    registryClient.release()
+  }
+  await pool.query(
+    `INSERT INTO operations_commerce_product_intake_policies (
+       organization_id, integration_account_id, policy_version,
+       unmatched_action, revision, created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, 'commerce-product-intake-policy-v1',
+       'review', 1, $3, $3
+     )`,
+    [ids.organization, ids.integrationAccount, actorEmail],
+  )
+  await pool.query(
+    `INSERT INTO operations_commerce_catalog_sync_jobs (
+       id, organization_id, integration_account_id, provider,
+       credential_version, policy_revision, requested_by, status,
+       continuation_run_global_id, last_error_code, completed_at
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, 'shopify', 1, 1, $4, 'dead',
+       'gcir0009201', 'COMMERCE_CATALOG_SYNC_PROVIDER_FAILED', now()
+     )`,
+    [deadJobId, ids.organization, ids.integrationAccount, actorEmail],
+  )
+  const reason = (
+    'Operator reviewed the terminal read-only catalog failure and preserved '
+    + 'review-only unmatched-product authority.'
+  )
+  const result = await persistence.updateCommerceProductIntakePolicyInPostgres({
+    organizationId: ids.organization,
+    accountGlobalId: 'gia0009201',
+    actorEmail,
+    idempotencyKey: randomUUID(),
+    expectedPolicyRevision: 1,
+    unmatchedAction: 'review',
+    confirmAutoCreateProducts: false,
+    confirmCatalogSyncReset: true,
+    catalogSyncResetReason: reason,
+  })
+  assert.equal(result.productIntake.unmatchedAction, 'review')
+  assert.equal(result.productIntake.autoCreateNewProducts, false)
+  assert.equal(result.productIntake.revision, 2)
+  assert.equal(result.catalogSync.queued, 1)
+  assert.equal(result.catalogSyncReset.performed, true)
+  assert.equal(result.catalogSyncReset.previousPolicyRevision, 1)
+  assert.equal(result.catalogSyncReset.policyRevision, 2)
+  assert.equal(result.catalogSyncReset.deadEvidencePreserved, true)
+  assert.equal(result.catalogSyncReset.reason, reason)
+  assert.deepEqual(counters.catalogPolicyApplications.at(-1), {
+    organizationId: ids.organization,
+    integrationAccountId: ids.integrationAccount,
+    provider: 'shopify',
+    credentialVersion: 1,
+    policyRevision: 2,
+    unmatchedAction: 'review',
+    actorEmail,
+  })
+  const policy = (
+    await pool.query(
+      `SELECT unmatched_action, revision
+       FROM operations_commerce_product_intake_policies
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [ids.organization, ids.integrationAccount],
+    )
+  ).rows[0]
+  assert.deepEqual(policy, { unmatched_action: 'review', revision: 2 })
+  const dead = (
+    await pool.query(
+      `SELECT status, last_error_code, continuation_run_global_id
+       FROM operations_commerce_catalog_sync_jobs
+       WHERE id = $1::uuid`,
+      [deadJobId],
+    )
+  ).rows[0]
+  assert.deepEqual(dead, {
+    status: 'dead',
+    last_error_code: 'COMMERCE_CATALOG_SYNC_PROVIDER_FAILED',
+    continuation_run_global_id: 'gcir0009201',
+  })
 }
 
 async function seedCapturedRead(client, ids, envelope) {
@@ -1082,8 +1192,16 @@ async function verifyAcceptance(databaseUrl) {
     expectedImageStage: null,
     imageReconcileCalls: [],
     imageReconcileError: null,
+    catalogPolicyApplications: [],
   }
   const persistence = loadCommerceStagingService(pool, counters)
+  await verifyReviewTerminalCatalogRecovery({
+    pool,
+    ids,
+    persistence,
+    counters,
+  })
+  counters.auditEvents = 0
   const stageInput = {
     runtime: {
       organizationId: ids.organization,
@@ -2278,7 +2396,8 @@ async function main() {
   }
   console.log(
     'Commerce intake staging, scaled-whole zero-price promotion, fractional '
-      + 'rollback, and policy-drift recovery disposable-PostgreSQL '
+      + 'rollback, review-mode terminal catalog recovery, and policy-drift '
+      + 'recovery disposable-PostgreSQL '
       + 'acceptance passed',
   )
 }

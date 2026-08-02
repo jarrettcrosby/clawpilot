@@ -22,6 +22,10 @@ import {
   readShopifyInventoryRefreshWorkerHeartbeatFromPostgres,
 } from '@/lib/persistence/shopifyInventoryRefresh'
 import {
+  readFaireInventoryPollHealthFromPostgres,
+  readFaireInventoryPollWorkerHeartbeatFromPostgres,
+} from '@/lib/persistence/faireInventoryPolling'
+import {
   readCommerceProductImageImportQueueHealthInPostgres,
 } from '@/lib/persistence/commerceProductImageImports'
 import { commerceIntakeRuntimeAvailable } from '@/lib/integrations/commerceIntake'
@@ -100,6 +104,9 @@ export async function GET() {
       status: 'disabled',
     }
     let shopifyInventoryRefreshWorker: Record<string, unknown> = {
+      status: 'disabled',
+    }
+    let faireInventoryPollWorker: Record<string, unknown> = {
       status: 'disabled',
     }
     let commerceProductImageImportWorker: Record<string, unknown> = {
@@ -354,7 +361,9 @@ export async function GET() {
           global_id_alphanumeric_compatibility_applied: boolean
           global_id_base32hex_allocator_applied: boolean
           faire_provider_write_auth_applied: boolean
+          faire_fulfillment_authority_applied: boolean
           operations_commerce_product_image_imports_applied: boolean
+          operations_faire_inventory_polling_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -1494,6 +1503,19 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename =
+                  '0224_operations_faire_fulfillment_authority.sql'
+              )
+              AND to_regprocedure(
+                'operations_faire_fulfillment_scope_evidence_is_current(uuid,uuid,integer)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_commerce_active_cohort_matches_current(uuid,jsonb,text,integer,text)'
+              ) IS NOT NULL
+                AS faire_fulfillment_authority_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
                   '0221_operations_commerce_product_image_imports.sql'
               )
               AND to_regclass(
@@ -1764,6 +1786,31 @@ export async function GET() {
                   AND index_row.indisvalid
                   AND index_row.indisready
               ) AS operations_commerce_product_image_imports_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0223_operations_faire_inventory_observation_polling.sql'
+              )
+              AND to_regclass(
+                'operations_faire_inventory_poll_jobs'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_faire_inventory_observations'
+              ) IS NOT NULL
+              AND to_regclass(
+                'idx_operations_faire_inventory_poll_active_account'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_faire_inventory_observations'
+                  )
+                  AND trigger_row.tgname =
+                    'protect_operations_faire_inventory_observation'
+                  AND NOT trigger_row.tgisinternal
+              ) AS operations_faire_inventory_polling_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1934,7 +1981,9 @@ export async function GET() {
             && row?.global_id_alphanumeric_compatibility_applied
             && row?.global_id_base32hex_allocator_applied
             && row?.faire_provider_write_auth_applied
+            && row?.faire_fulfillment_authority_applied
             && row?.operations_commerce_product_image_imports_applied
+            && row?.operations_faire_inventory_polling_applied
             && row?.migration_checksums_present
           ),
         }
@@ -2097,7 +2146,9 @@ export async function GET() {
           || !row?.global_id_alphanumeric_compatibility_applied
           || !row?.global_id_base32hex_allocator_applied
           || !row?.faire_provider_write_auth_applied
+          || !row?.faire_fulfillment_authority_applied
           || !row?.operations_commerce_product_image_imports_applied
+          || !row?.operations_faire_inventory_polling_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -2453,6 +2504,9 @@ export async function GET() {
                 stale_processing: number
                 overdue: number
                 orphaned_running_cursors: number
+                unreconciled_shopify_accounts: number
+                unreconciled_shopify_signals: string
+                overdue_shopify_refreshes_without_active_job: number
               }>(
                 `WITH catalog_jobs AS (
                    SELECT job.*,
@@ -2479,7 +2533,6 @@ export async function GET() {
                               AND credential.verification_status = 'verified'
                               AND policy.policy_version
                                 = 'commerce-product-intake-policy-v1'
-                              AND policy.unmatched_action = 'auto_create'
                               AND policy.revision = job.policy_revision
                               AND activation.state IN ('shadow', 'active')
                               AND (
@@ -2506,6 +2559,51 @@ export async function GET() {
                               )
                           ) AS authoritative
                    FROM operations_commerce_catalog_sync_jobs job
+                 ),
+                 shopify_refresh AS (
+                   SELECT
+                     refresh.organization_id,
+                     refresh.integration_account_id,
+                     refresh.dirty_version,
+                     refresh.reconciled_version,
+                     refresh.last_signaled_at,
+                     EXISTS (
+                       SELECT 1
+                       FROM operations_commerce_catalog_sync_jobs active
+                       WHERE active.organization_id = refresh.organization_id
+                         AND active.integration_account_id
+                           = refresh.integration_account_id
+                         AND active.status IN (
+                           'pending', 'processing', 'failed'
+                         )
+                     ) AS active_job
+                   FROM operations_shopify_catalog_refresh_states refresh
+                   JOIN operations_integration_accounts account
+                     ON account.organization_id = refresh.organization_id
+                    AND account.id = refresh.integration_account_id
+                   JOIN operations_commerce_credentials credential
+                     ON credential.organization_id = account.organization_id
+                    AND credential.integration_account_id = account.id
+                   JOIN operations_commerce_product_intake_policies policy
+                     ON policy.organization_id = account.organization_id
+                    AND policy.integration_account_id = account.id
+                   JOIN operations_activation_scopes activation
+                     ON activation.organization_id = account.organization_id
+                   WHERE account.integration_type = 'commerce'
+                     AND account.provider = 'shopify'
+                     AND account.status <> 'error'
+                     AND account.commerce_credential_generation
+                       = refresh.credential_generation
+                     AND credential.credential_version
+                       = refresh.credential_generation
+                     AND credential.verification_status = 'verified'
+                     AND policy.policy_version
+                       = 'commerce-product-intake-policy-v1'
+                     AND activation.state IN ('shadow', 'active')
+                     AND COALESCE(
+                       account.configuration->'grantedScopes',
+                       '[]'::jsonb
+                     ) ?| ARRAY['read_products', 'write_products']
                  )
                  SELECT
                    count(*) FILTER (
@@ -2543,7 +2641,30 @@ export async function GET() {
                              'pending', 'processing', 'failed'
                            )
                        )
-                   ) AS orphaned_running_cursors
+                   ) AS orphaned_running_cursors,
+                   (
+                     SELECT count(*)::integer
+                     FROM shopify_refresh refresh
+                     WHERE refresh.dirty_version
+                       > refresh.reconciled_version
+                   ) AS unreconciled_shopify_accounts,
+                   (
+                     SELECT COALESCE(sum(
+                       refresh.dirty_version - refresh.reconciled_version
+                     ), 0)::text
+                     FROM shopify_refresh refresh
+                     WHERE refresh.dirty_version
+                       > refresh.reconciled_version
+                   ) AS unreconciled_shopify_signals,
+                   (
+                     SELECT count(*)::integer
+                     FROM shopify_refresh refresh
+                     WHERE refresh.dirty_version
+                       > refresh.reconciled_version
+                       AND refresh.active_job = false
+                       AND refresh.last_signaled_at
+                         < now() - interval '5 minutes'
+                   ) AS overdue_shopify_refreshes_without_active_job
                  FROM catalog_jobs`,
               )
             ).rows[0]
@@ -2555,16 +2676,33 @@ export async function GET() {
             const orphanedRunningCursors = Number(
               commerceQueue?.orphaned_running_cursors || 0,
             )
-            const healthy = (
+            const unreconciledShopifyAccounts = Number(
+              commerceQueue?.unreconciled_shopify_accounts || 0,
+            )
+            const unreconciledShopifySignals = Number(
+              commerceQueue?.unreconciled_shopify_signals || 0,
+            )
+            const overdueShopifyRefreshesWithoutActiveJob = Number(
+              commerceQueue
+                ?.overdue_shopify_refreshes_without_active_job || 0,
+            )
+            const loopReachable = (
               commerceAgeMs !== null
               && commerceAgeMs <= maxCommerceHeartbeatAgeMs
-              && dead === 0
-              && stale === 0
-              && overdue === 0
-              && orphanedRunningCursors === 0
+            )
+            const operationalDegraded = (
+              dead > 0
+              || stale > 0
+              || overdue > 0
+              || orphanedRunningCursors > 0
+              || overdueShopifyRefreshesWithoutActiveJob > 0
             )
             commerceCatalogWorker = {
-              status: healthy ? 'reachable' : 'stale',
+              status: loopReachable
+                ? (operationalDegraded ? 'degraded' : 'reachable')
+                : 'stale',
+              livenessStatus: loopReachable ? 'reachable' : 'stale',
+              operationalStatus: operationalDegraded ? 'degraded' : 'ready',
               heartbeatAt: commerceHeartbeat?.checkedAt || null,
               phase: commerceHeartbeat?.phase || null,
               ageMs: commerceAgeMs,
@@ -2575,6 +2713,9 @@ export async function GET() {
               staleProcessing: stale,
               overdue,
               orphanedRunningCursors,
+              unreconciledShopifyAccounts,
+              unreconciledShopifySignals,
+              overdueShopifyRefreshesWithoutActiveJob,
             }
             if (
               commerceAgeMs === null
@@ -2602,6 +2743,11 @@ export async function GET() {
             if (orphanedRunningCursors > 0) {
               errors.push(
                 'Commerce catalog sync has running cursors without active jobs.',
+              )
+            }
+            if (overdueShopifyRefreshesWithoutActiveJob > 0) {
+              warnings.push(
+                'Shopify catalog refresh has unreconciled webhook signals without an active reconciliation job.',
               )
             }
           }
@@ -2764,6 +2910,86 @@ export async function GET() {
 
           if (
             commerceIntakeRuntimeAvailable()
+            && row?.operations_faire_inventory_polling_applied
+          ) {
+            const faireHeartbeat =
+              await readFaireInventoryPollWorkerHeartbeatFromPostgres()
+            const faireHeartbeatAt = Date.parse(
+              String(faireHeartbeat?.checkedAt || ''),
+            )
+            const sharedInventoryPollMs = Math.max(
+              5_000,
+              Math.min(
+                Number(
+                  process.env.SHOPIFY_INVENTORY_REFRESH_POLL_MS || 10_000,
+                ),
+                300_000,
+              ),
+            )
+            const maxFaireHeartbeatAgeMs = Math.max(
+              180_000,
+              sharedInventoryPollMs * 3,
+            )
+            const faireAgeMs = Number.isFinite(faireHeartbeatAt)
+              ? checkedAt - faireHeartbeatAt
+              : null
+            const faireQueue =
+              await readFaireInventoryPollHealthFromPostgres()
+            const loopReachable = (
+              faireAgeMs !== null
+              && faireAgeMs <= maxFaireHeartbeatAgeMs
+            )
+            const operationalDegraded = (
+              faireQueue.dead > 0
+              || faireQueue.staleLeases > 0
+              || faireQueue.overdueAccounts > 0
+              || faireQueue.retrying > 0
+            )
+            faireInventoryPollWorker = {
+              status: loopReachable
+                ? (operationalDegraded ? 'degraded' : 'reachable')
+                : 'stale',
+              livenessStatus: loopReachable ? 'reachable' : 'stale',
+              operationalStatus: operationalDegraded ? 'degraded' : 'ready',
+              heartbeatAt: faireHeartbeat?.checkedAt || null,
+              phase: faireHeartbeat?.phase || null,
+              ageMs: faireAgeMs,
+              ...faireQueue,
+            }
+            if (!loopReachable) {
+              errors.push(
+                'Faire inventory observation worker heartbeat is missing or stale.',
+              )
+            }
+            if (faireQueue.dead > 0) {
+              warnings.push(
+                'Faire inventory observation has terminal failed accounts requiring reviewed recovery.',
+              )
+            }
+            if (faireQueue.staleLeases > 0) {
+              warnings.push(
+                'Faire inventory observation has stale processing leases.',
+              )
+            }
+            if (faireQueue.overdueAccounts > 0) {
+              warnings.push(
+                'Faire inventory observations are overdue.',
+              )
+            }
+            if (faireQueue.retrying > 0) {
+              warnings.push(
+                'Faire inventory observation jobs are retrying.',
+              )
+            }
+            if (faireQueue.oauthScopeHintMissingAccounts > 0) {
+              warnings.push(
+                'Faire OAuth accounts that did not request READ_INVENTORIES cannot schedule inventory observation polling.',
+              )
+            }
+          }
+
+          if (
+            commerceIntakeRuntimeAvailable()
             && row?.operations_commerce_product_image_imports_applied
           ) {
             const imageQueue =
@@ -2920,6 +3146,7 @@ export async function GET() {
       commerceCatalogWorker,
       commerceOrderReconciliationWorker,
       shopifyInventoryRefreshWorker,
+      faireInventoryPollWorker,
       commerceProductImageImportWorker,
       integrationQueues,
       operationsCommands,

@@ -255,32 +255,6 @@ export async function applyCommerceCatalogSyncPolicyWithClient(
     actorEmail: string
   },
 ) {
-  if (input.unmatchedAction === 'review') {
-    const cancelled = await client.query(
-      `UPDATE operations_commerce_catalog_sync_jobs
-       SET status = CASE
-             WHEN status = 'processing' THEN status
-             ELSE 'cancelled'
-           END,
-           cancel_requested = true,
-           completed_at = CASE
-             WHEN status = 'processing' THEN completed_at
-             ELSE now()
-           END,
-           last_error_code = 'COMMERCE_CATALOG_SYNC_POLICY_PAUSED',
-           updated_at = now()
-       WHERE organization_id = $1::uuid
-         AND integration_account_id = $2::uuid
-         AND status IN ('pending', 'processing', 'failed')`,
-      [input.organizationId, input.integrationAccountId],
-    )
-    await reconcileOrphanedCommerceCatalogSyncCursorsWithClient(client, {
-      organizationId: input.organizationId,
-      integrationAccountId: input.integrationAccountId,
-    })
-    return { queued: 0, cancelled: cancelled.rowCount || 0 }
-  }
-
   const stale = await client.query(
     `UPDATE operations_commerce_catalog_sync_jobs
      SET status = CASE
@@ -596,18 +570,6 @@ export async function ensureAutomaticCommerceCatalogIntakeWithClient(
       [input.organizationId, input.integrationAccountId],
     )
   ).rows[0] || null
-  if (existing?.unmatched_action === 'review') {
-    return {
-      eligible: true,
-      initialized: false,
-      paused: true,
-      waitingForProductTarget: false,
-      policyRevision: Number(existing.revision),
-      queued: 0,
-      cancelled: 0,
-    }
-  }
-
   let initialized = false
   let policyRevision = Number(existing?.revision || 0)
   if (!existing) {
@@ -638,7 +600,7 @@ export async function ensureAutomaticCommerceCatalogIntakeWithClient(
           provider: account.provider,
           credentialVersion: account.commerce_credential_generation,
           policyRevision,
-          unmatchedAction: 'auto_create',
+          unmatchedAction: existing?.unmatched_action || 'auto_create',
           actorEmail: input.actorEmail || 'system:commerce-catalog',
         },
       )
@@ -677,6 +639,8 @@ export async function ensureAutomaticCommerceCatalogIntakeWithClient(
   return {
     eligible: true,
     initialized,
+    // The review policy only controls unmatched-product creation. It must not
+    // pause provider reads needed to refresh already mapped products.
     paused: false,
     waitingForProductTarget: !account.product_target_ready,
     policyRevision,
@@ -765,7 +729,6 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
              WHERE policy.organization_id = job.organization_id
                AND policy.integration_account_id = job.integration_account_id
                AND policy.policy_version = $1
-               AND policy.unmatched_action = 'auto_create'
                AND policy.revision = job.policy_revision
                AND account.integration_type = 'commerce'
                AND account.provider = job.provider
@@ -809,7 +772,6 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
         AND refresh.integration_account_id = account.id
         AND refresh.credential_generation = account.commerce_credential_generation
        WHERE policy.policy_version = $1
-         AND policy.unmatched_action = 'auto_create'
          AND account.integration_type = 'commerce'
          AND account.provider IN ('shopify', 'faire')
          AND account.status <> 'error'
@@ -920,7 +882,6 @@ export async function claimCommerceCatalogSyncJobsInPostgres(input: {
            AND job.available_at <= now()
            AND job.cancel_requested = false
            AND policy.policy_version = $1
-           AND policy.unmatched_action = 'auto_create'
            AND policy.revision = job.policy_revision
            AND account.integration_type = 'commerce'
            AND account.provider = job.provider
@@ -1031,7 +992,6 @@ async function currentJobFence(
        AND queued.credential_version = $6
        AND queued.policy_revision = $7
        AND policy.policy_version = $8
-       AND policy.unmatched_action = 'auto_create'
        AND policy.revision = queued.policy_revision
        AND account.provider = queued.provider
        AND account.status <> 'error'
@@ -1507,32 +1467,28 @@ export async function readCommerceCatalogSyncStateWithClient(
     && row.policy_revision === row.current_policy_revision
     && row.current_policy_version === CATALOG_SYNC_POLICY_VERSION
   )
-  const status = row.unmatched_action === 'review'
-    ? 'paused'
-    : row.status === 'pending'
-      ? 'queued'
-      : row.status === 'processing'
-        ? 'running'
-        : row.status === 'failed'
-          ? 'retrying'
-          : row.status === 'succeeded'
-            ? 'completed'
-            : row.status === 'dead'
-              ? authoritativeFence
-                ? 'dead'
-                : 'idle'
-              : row.status === 'cancelled'
-                ? 'idle'
-                : 'idle'
-  const nextRunAt = row.unmatched_action === 'review'
-    ? null
-    : ['pending', 'failed'].includes(row.status)
-      ? iso(row.available_at)
-      : row.status === 'succeeded' && row.completed_at
-        ? new Date(
-            new Date(row.completed_at).getTime() + 6 * 60 * 60 * 1_000,
-          ).toISOString()
-        : null
+  const status = row.status === 'pending'
+    ? 'queued'
+    : row.status === 'processing'
+      ? 'running'
+      : row.status === 'failed'
+        ? 'retrying'
+        : row.status === 'succeeded'
+          ? 'completed'
+          : row.status === 'dead'
+            ? authoritativeFence
+              ? 'dead'
+              : 'idle'
+            : row.status === 'cancelled'
+              ? 'idle'
+              : 'idle'
+  const nextRunAt = ['pending', 'failed'].includes(row.status)
+    ? iso(row.available_at)
+    : row.status === 'succeeded' && row.completed_at
+      ? new Date(
+          new Date(row.completed_at).getTime() + 6 * 60 * 60 * 1_000,
+        ).toISOString()
+      : null
   return {
     status,
     rawStatus: row.status,
@@ -1568,7 +1524,6 @@ export async function readCommerceCatalogSyncStateWithClient(
     pendingRefreshSignals,
     terminalRecoveryRequired: (
       status === 'dead'
-      && row.unmatched_action === 'auto_create'
       && authoritativeFence
     ),
     recoveryMode: status === 'dead'

@@ -3143,6 +3143,18 @@ async function verifyPostgresAcceptance(databaseUrl) {
             )
           },
         },
+        '@/lib/integrations/faireFulfillmentRuntime': {
+          prepareCurrentFaireFulfillmentAuthority: async () => {
+            throw new Error(
+              'Distributed Operations acceptance does not authorize Faire fulfillment',
+            )
+          },
+          executeCurrentFaireFulfillmentWriteback: async () => {
+            throw new Error(
+              'Distributed Operations acceptance does not write Faire fulfillment',
+            )
+          },
+        },
         '@/lib/operations/adapters': adapters,
         '@/lib/operations/canonicalFulfillmentPlanning':
           canonicalFulfillmentPlanning,

@@ -26,7 +26,6 @@ includes(persistence, [
   "cursor.reconciliation_status = 'running'",
   "active.status IN ('pending', 'processing', 'failed')",
   'COMMERCE_CATALOG_SYNC_ORPHAN_RECONCILED',
-  'COMMERCE_CATALOG_SYNC_POLICY_PAUSED',
   'await reconcileOrphanedCommerceCatalogSyncCursorsWithClient(client)',
 ], 'Durable orphaned catalog-cursor reconciliation')
 
@@ -49,7 +48,7 @@ includes(health, [
   'orphaned_running_cursors: number',
   ') AS orphaned_running_cursors',
   'orphanedRunningCursors',
-  '&& orphanedRunningCursors === 0',
+  '|| orphanedRunningCursors > 0',
   'Commerce catalog sync has running cursors without active jobs.',
 ], 'Orphaned catalog-cursor health evidence')
 

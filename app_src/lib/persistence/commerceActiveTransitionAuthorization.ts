@@ -45,11 +45,30 @@ export const COMMERCE_ACTIVE_WRITE_CAPABILITY_SCOPES = {
   faire: {
     catalog_publishing: ['WRITE_PRODUCTS'],
     inventory_export: ['WRITE_INVENTORIES'],
-    order_update: ['WRITE_ORDERS'],
-    fulfillment_export: ['WRITE_ORDERS'],
-    tracking_export: ['WRITE_ORDERS', 'READ_SHIPMENTS'],
+    order_update: [
+      'READ_BRAND',
+      'READ_ORDERS',
+      'READ_SHIPMENTS',
+      'WRITE_ORDERS',
+    ],
+    fulfillment_export: [
+      'READ_BRAND',
+      'READ_ORDERS',
+      'READ_SHIPMENTS',
+      'WRITE_ORDERS',
+    ],
+    tracking_export: [
+      'READ_BRAND',
+      'READ_ORDERS',
+      'READ_SHIPMENTS',
+      'WRITE_ORDERS',
+    ],
   },
 } as const
+
+const FAIRE_FULFILLMENT_WRITE_CAPABILITIES = new Set<
+  CommerceActiveWriteCapability
+>(['order_update', 'fulfillment_export', 'tracking_export'])
 
 type ShopifyActiveWriteCapability =
   keyof typeof COMMERCE_ACTIVE_WRITE_CAPABILITY_SCOPES.shopify
@@ -500,6 +519,15 @@ function requireImplementedCohort(
   }
 }
 
+function requestsFaireFulfillmentWrite(
+  account: Pick<CommerceActiveCohortAccount, 'provider' | 'writeCapabilities'>,
+) {
+  return account.provider === 'faire'
+    && account.writeCapabilities.some(
+      (capability) => FAIRE_FULFILLMENT_WRITE_CAPABILITIES.has(capability),
+    )
+}
+
 export function isCommerceActiveWriteCapability(
   provider: CommerceActiveProvider,
   value: unknown,
@@ -890,6 +918,25 @@ export async function prepareCommerceActiveTransitionInPostgres(
       left.accountGlobalId,
       right.accountGlobalId,
     ))
+    for (const account of accounts.filter(requestsFaireFulfillmentWrite)) {
+      const scopeEvidence = await client.query<{ current: boolean }>(
+        `SELECT operations_faire_fulfillment_scope_evidence_is_current(
+           $1::uuid, $2::uuid, $3
+         ) AS current`,
+        [
+          scopedOrganizationId,
+          account.accountId,
+          account.credentialGeneration,
+        ],
+      )
+      if (scopeEvidence.rows[0]?.current !== true) {
+        fail(
+          'COMMERCE_ACTIVE_FAIRE_SCOPE_EVIDENCE_REQUIRED',
+          'Faire fulfillment requires provider-verifiable OAuth grant evidence for READ_BRAND, READ_ORDERS, READ_SHIPMENTS, and WRITE_ORDERS; requested scopes do not qualify',
+          403,
+        )
+      }
+    }
     const cohortHash = commerceActiveCohortHash({
       organizationId: scopedOrganizationId,
       expectedActivationState: 'shadow',
@@ -1912,6 +1959,45 @@ export async function consumeCommerceActiveTransitionAuthorizationInPostgres(
     }
     return transition(row, false)
   })
+}
+
+export async function requireCurrentFaireFulfillmentScopeEvidenceInPostgres(
+  input: {
+    organizationId: unknown
+    accountGlobalId: unknown
+  },
+): Promise<void> {
+  const scopedOrganizationId = organizationId(input.organizationId)
+  const accountGlobalId = String(input.accountGlobalId || '').trim()
+  if (!ACCOUNT_GLOBAL_ID.test(accountGlobalId)) {
+    fail(
+      'COMMERCE_ACTIVE_ACCOUNT_INVALID',
+      'Commerce account is invalid',
+      400,
+    )
+  }
+  const result = await query<{ current: boolean }>(
+    `SELECT COALESCE((
+       SELECT operations_faire_fulfillment_scope_evidence_is_current(
+         account.organization_id,
+         account.id,
+         account.commerce_credential_generation
+       )
+       FROM operations_integration_accounts account
+       WHERE account.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND account.integration_type = 'commerce'
+         AND account.provider = 'faire'
+     ), false) AS current`,
+    [scopedOrganizationId, accountGlobalId],
+  )
+  if (result.rows[0]?.current !== true) {
+    fail(
+      'COMMERCE_ACTIVE_FAIRE_SCOPE_EVIDENCE_REQUIRED',
+      'Faire fulfillment requires current provider-verifiable OAuth grant evidence; requested scopes do not authorize provider writes',
+      403,
+    )
+  }
 }
 
 export async function readCommerceActiveCapabilityClaimInPostgres(input: {

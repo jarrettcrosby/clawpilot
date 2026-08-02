@@ -14016,6 +14016,16 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         )
       }
       if (
+        order.source_provider === 'faire'
+        && labelResult.rows.some((item) => item.environment !== 'production')
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_FAIRE_PRODUCTION_LABEL_REQUIRED',
+          'Faire fulfillment writeback requires a production carrier label for every package',
+          409,
+        )
+      }
+      if (
         new Set(labelResult.rows.map((item) => item.carrier)).size !== 1
         || new Set(labelResult.rows.map((item) => item.service_code)).size !== 1
       ) {

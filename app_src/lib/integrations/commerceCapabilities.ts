@@ -478,10 +478,25 @@ export const FAIRE_CAPABILITY_SCOPES = {
   inventory_export: ['WRITE_INVENTORIES'],
   customer_synchronization: ['READ_RETAILER'],
   order_import: ['READ_ORDERS'],
-  order_update: ['WRITE_ORDERS'],
+  order_update: [
+    'READ_BRAND',
+    'READ_ORDERS',
+    'READ_SHIPMENTS',
+    'WRITE_ORDERS',
+  ],
   cancellation_import: ['READ_ORDERS'],
-  fulfillment_export: ['WRITE_ORDERS'],
-  tracking_export: ['WRITE_ORDERS', 'READ_SHIPMENTS'],
+  fulfillment_export: [
+    'READ_BRAND',
+    'READ_ORDERS',
+    'READ_SHIPMENTS',
+    'WRITE_ORDERS',
+  ],
+  tracking_export: [
+    'READ_BRAND',
+    'READ_ORDERS',
+    'READ_SHIPMENTS',
+    'WRITE_ORDERS',
+  ],
 } as const satisfies Partial<Record<CommerceCapability, readonly string[]>>
 
 // Faire product and variant synchronization use the bounded read-only
@@ -508,7 +523,7 @@ export const CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION = {
   order_import: 'control_plane_implemented',
   historical_order_import: 'not_implemented',
   order_creation: 'not_implemented',
-  order_update: 'not_implemented',
+  order_update: 'control_plane_implemented',
   order_edit: 'not_implemented',
   draft_order_synchronization: 'not_implemented',
   cancellation_import: 'not_implemented',

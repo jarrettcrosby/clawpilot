@@ -760,6 +760,30 @@ includes(catalogPersistence, [
   'LEAST(dirty_version, $4::bigint)',
   'targetDirtyVersion: input.job.targetDirtyVersion',
 ], 'Lossless Shopify catalog reconciliation handoff')
+const recurringCatalogQueue = catalogPersistence.slice(
+  catalogPersistence.indexOf(
+    'export async function queueAutomaticCommerceCatalogSyncsInPostgres',
+  ),
+  catalogPersistence.indexOf(
+    'export async function claimCommerceCatalogSyncJobsInPostgres',
+  ),
+)
+assert.doesNotMatch(
+  recurringCatalogQueue,
+  /policy\.unmatched_action = 'auto_create'/u,
+  'Review-only unmatched-product policy must not pause mapped catalog refresh',
+)
+const claimedCatalogJobs = catalogPersistence.slice(
+  catalogPersistence.indexOf(
+    'export async function claimCommerceCatalogSyncJobsInPostgres',
+  ),
+  catalogPersistence.indexOf('async function currentJobFence'),
+)
+assert.doesNotMatch(
+  claimedCatalogJobs,
+  /policy\.unmatched_action = 'auto_create'/u,
+  'The worker must claim review-policy catalog jobs without auto-creating products',
+)
 
 const signalQueries = []
 const persistence = loadTypeScriptModule(
@@ -879,18 +903,19 @@ async function catalogState(provider, dirtyVersion, reconciledVersion) {
     },
   )
 }
-const pausedShopifyState = await catalogState('shopify', '36', '0')
-assert.equal(pausedShopifyState.status, 'paused')
-assert.equal(pausedShopifyState.rawStatus, 'succeeded')
-assert.equal(pausedShopifyState.dirtyVersion, 36)
-assert.equal(pausedShopifyState.reconciledVersion, 0)
-assert.equal(pausedShopifyState.pendingRefreshSignals, 36)
+const reviewShopifyState = await catalogState('shopify', '36', '0')
+assert.equal(reviewShopifyState.status, 'completed')
+assert.equal(reviewShopifyState.rawStatus, 'succeeded')
+assert.equal(reviewShopifyState.dirtyVersion, 36)
+assert.equal(reviewShopifyState.reconciledVersion, 0)
+assert.equal(reviewShopifyState.pendingRefreshSignals, 36)
+assert.ok(reviewShopifyState.nextRunAt)
 
-const pausedFaireState = await catalogState('faire', null, null)
-assert.equal(pausedFaireState.status, 'paused')
-assert.equal(pausedFaireState.dirtyVersion, null)
-assert.equal(pausedFaireState.reconciledVersion, null)
-assert.equal(pausedFaireState.pendingRefreshSignals, null)
+const reviewFaireState = await catalogState('faire', null, null)
+assert.equal(reviewFaireState.status, 'completed')
+assert.equal(reviewFaireState.dirtyVersion, null)
+assert.equal(reviewFaireState.reconciledVersion, null)
+assert.equal(reviewFaireState.pendingRefreshSignals, null)
 
 const integrationService = read(
   'app_src/lib/integrations/commerceIntegrations.ts',
@@ -928,10 +953,11 @@ includes(
     'pendingRefreshSignals?: number | null',
     'pendingCatalogRefreshSignals',
     'catalog change notification${',
-    'waiting while synchronization is paused',
+    'Existing mapped products will refresh automatically',
+    'Automatically create unmatched provider products',
     'Faire does not currently provide catalog webhooks',
   ],
-  'Paused catalog refresh observability UI',
+  'Review-only catalog refresh observability UI',
 )
 includes(
   read('app_src/lib/persistence/commerceIntake.ts'),
@@ -963,6 +989,10 @@ includes(
   [
     'operations_shopify_catalog_webhook_refresh_applied',
     '0197_operations_shopify_catalog_webhook_refresh.sql',
+    'unreconciled_shopify_accounts',
+    'unreconciled_shopify_signals',
+    'overdue_shopify_refreshes_without_active_job',
+    'unreconciled webhook signals without an active reconciliation job',
   ],
   'Shopify catalog webhook migration health gate',
 )
@@ -970,6 +1000,6 @@ includes(
 console.log(
   'Shopify catalog webhook refresh tests passed '
   + '(registration, signed receipt signal, monotonic watermark, follow-up '
-  + 'scheduling, paused-state observability, Faire null semantics, read-only '
+  + 'scheduling, review-only observability, Faire null semantics, read-only '
   + 'boundary, and zero provider writes).',
 )

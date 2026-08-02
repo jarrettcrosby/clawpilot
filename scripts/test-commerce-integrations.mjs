@@ -880,6 +880,10 @@ assert.equal(
   'control_plane_implemented',
 )
 assert.equal(
+  capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION.order_update,
+  'control_plane_implemented',
+)
+assert.equal(
   capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION.fulfillment_export,
   'control_plane_implemented',
 )
@@ -887,6 +891,18 @@ assert.equal(
   capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION.tracking_export,
   'control_plane_implemented',
 )
+for (const capability of [
+  'order_update',
+  'fulfillment_export',
+  'tracking_export',
+]) {
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      capabilities.FAIRE_CAPABILITY_SCOPES[capability],
+    )),
+    ['READ_BRAND', 'READ_ORDERS', 'READ_SHIPMENTS', 'WRITE_ORDERS'],
+  )
+}
 assert.ok(
   capabilities.SHOPIFY_PROVIDER_AVAILABLE_CAPABILITIES.includes('order_import'),
 )

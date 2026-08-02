@@ -172,7 +172,6 @@ includes(catalogSyncPersistenceSource, [
   'completeCommerceCatalogSyncPageInPostgres',
   'failCommerceCatalogSyncJobInPostgres',
   'readCommerceCatalogSyncStateWithClient',
-  "policy.unmatched_action = 'auto_create'",
   'account.commerce_credential_generation',
   "credential.verification_status = 'verified'",
   'commerceCatalogCredentialSupportsProducts',
@@ -187,7 +186,8 @@ includes(catalogSyncPersistenceSource, [
   'connectionIsAuthorization: true',
   'productTargetReady: account.product_target_ready',
   'waitingForProductTarget',
-  "existing?.unmatched_action === 'review'",
+  "existing?.unmatched_action || 'auto_create'",
+  'review policy only controls unmatched-product creation',
   'COMMERCE_CATALOG_SYNC_FENCE_CHANGED',
   "activation.state IN ('shadow', 'active')",
   'FOR UPDATE OF job SKIP LOCKED',
@@ -519,8 +519,8 @@ const automaticIntakePaused =
       actorEmail: 'operator@example.com',
     },
   )
-assert.equal(automaticIntakePaused.paused, true)
-assert.equal(automaticIntakePaused.queued, 0)
+assert.equal(automaticIntakePaused.paused, false)
+assert.equal(automaticIntakePaused.queued, 1)
 assert.equal(automaticIntakePaused.policyRevision, 4)
 const automaticIntakeScopeLossClient = automaticIntakeClient({
   account: {
@@ -629,9 +629,10 @@ includes(read('app_src/app/api/health/route.ts'), [
   'account.commerce_credential_generation',
   '= job.credential_version',
   "policy.policy_version\n                                = 'commerce-product-intake-policy-v1'",
-  "policy.unmatched_action = 'auto_create'",
   'policy.revision = job.policy_revision',
   "activation.state IN ('shadow', 'active')",
+  'unreconciled_shopify_signals',
+  'overdue_shopify_refreshes_without_active_job',
   'Commerce catalog queue has terminal failed jobs.',
 ], 'Authoritative commerce catalog terminal-failure health projection')
 const runtimePollerSource = read('scripts/pipeline-outbox-poller.mjs')
@@ -1336,6 +1337,23 @@ includes(persistenceSource, [
   'previousContinuationPreserved',
   'freshRootSession: true',
 ], 'Explicit terminal catalog-sync operator recovery')
+const productPolicyUpdateSource = persistenceSource.slice(
+  persistenceSource.indexOf(
+    'export async function updateCommerceProductIntakePolicyInPostgres',
+  ),
+  persistenceSource.indexOf(
+    'export async function readCommerceIntakeStateFromPostgres',
+  ),
+)
+includes(productPolicyUpdateSource, [
+  'if (!sameAction)',
+  'A terminal catalog sync reset must preserve the current unmatched-product policy',
+], 'Terminal catalog recovery preserves review or auto-create policy authority')
+assert.doesNotMatch(
+  productPolicyUpdateSource,
+  /currentPolicy\?\.unmatched_action !== 'auto_create'/u,
+  'Review-mode terminal catalog recovery must not require auto-create authority',
+)
 const checkoutReconciliationCommandSource = persistenceSource.slice(
   persistenceSource.indexOf(
     'reconcilePromotedCommerceCandidateCheckoutRateInPostgres',
@@ -2009,9 +2027,9 @@ includes(workflowSource, [
   'Match checkout quote',
 ], 'Commerce intake executable recovery and catalog workflow')
 includes(workflowSource, [
-  'Pause or resume product catalog sync',
+  'Automatically create unmatched provider products',
   'This verified connection authorizes automatic read-only catalog sync.',
-  'Your verified ${providerLabel(provider)} connection authorizes automatic read-only product synchronization with no second approval.',
+  'automatic read-only product synchronization with no second approval.',
   "'set-product-intake-policy'",
   'expectedPolicyRevision: productIntakePolicyRevision',
   "unmatchedAction: enabled ? 'auto_create' : 'review'",
@@ -2024,6 +2042,8 @@ includes(workflowSource, [
   'Choose product decision',
   'automatic identity across Shopify and Faire',
   'automation never guesses that two source records are',
+  'Catalog reads continue in',
+  'retain unmatched products',
   "'COMMERCE_PRODUCT_INTAKE_POLICY_REVISION_CONFLICT'",
   'payload.command?.productIntake',
   'productIntake: committedPolicy',
@@ -2033,6 +2053,8 @@ includes(workflowSource, [
   'resetTerminalProductCatalogSync',
   'window.prompt(',
   'Enter the audit reason for superseding this terminal catalog sweep.',
+  'unmatchedAction: resetUnmatchedAction',
+  "confirmAutoCreateProducts: resetUnmatchedAction === 'auto_create'",
   'confirmCatalogSyncReset: true',
   'catalogSyncResetReason: resetReason',
   'Repairing the connection does not itself restart this terminal sweep.',
@@ -3619,6 +3641,47 @@ try {
       actorEmail,
       body: {
         action: 'set-product-intake-policy',
+        accountGlobalId: 'gcia0000999',
+        unmatchedAction: 'review',
+        expectedPolicyRevision: 1,
+        catalogSyncResetReason:
+          'Operator reviewed the review-mode terminal catalog failure.',
+        idempotencyKey: nextKey(),
+      },
+    }),
+    (error) => (
+      error.code === 'COMMERCE_CATALOG_SYNC_RESET_CONFIRMATION_REQUIRED'
+    ),
+  )
+  const reviewResetReason =
+    'Operator reviewed terminal catalog evidence and preserved review-only product authority.'
+  const reviewResetPolicy = await service.executeCommerceIntakeCommand({
+    organizationId,
+    actorEmail,
+    body: {
+      action: 'set-product-intake-policy',
+      accountGlobalId: 'gcia0000999',
+      unmatchedAction: 'review',
+      expectedPolicyRevision: 1,
+      confirmCatalogSyncReset: true,
+      catalogSyncResetReason: reviewResetReason,
+      idempotencyKey: nextKey(),
+    },
+  })
+  assert.equal(reviewResetPolicy.command.productIntake.revision, 2)
+  assert.equal(productPolicyUpdates.at(-1).unmatchedAction, 'review')
+  assert.equal(productPolicyUpdates.at(-1).confirmAutoCreateProducts, false)
+  assert.equal(productPolicyUpdates.at(-1).confirmCatalogSyncReset, true)
+  assert.equal(
+    productPolicyUpdates.at(-1).catalogSyncResetReason,
+    reviewResetReason,
+  )
+  await assert.rejects(
+    service.executeCommerceIntakeCommand({
+      organizationId,
+      actorEmail,
+      body: {
+        action: 'set-product-intake-policy',
         accountGlobalId: shopifyRuntime.globalId,
         unmatchedAction: 'auto_create',
         expectedPolicyRevision: 0,
@@ -3697,7 +3760,7 @@ try {
   assert.equal(resetPolicy.command.productIntake.revision, 2)
   assert.deepEqual(
     productPolicyUpdates.map((update) => update.unmatchedAction),
-    ['review', 'auto_create', 'auto_create'],
+    ['review', 'review', 'auto_create', 'auto_create'],
   )
   assert.equal(
     productPolicyUpdates.at(-1).confirmCatalogSyncReset,

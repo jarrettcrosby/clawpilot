@@ -5665,13 +5665,6 @@ export async function updateCommerceProductIntakePolicyInPostgres(input: {
       && input.catalogSyncResetReason !== undefined
   )
   if (catalogSyncResetRequested) {
-    if (input.unmatchedAction !== 'auto_create') {
-      intakeError(
-        'COMMERCE_CATALOG_SYNC_RESET_INVALID',
-        'A terminal catalog sync can only be restarted while automatic product creation remains on',
-        400,
-      )
-    }
     if (input.confirmCatalogSyncReset !== true) {
       intakeError(
         'COMMERCE_CATALOG_SYNC_RESET_CONFIRMATION_REQUIRED',
@@ -5778,13 +5771,10 @@ export async function updateCommerceProductIntakePolicyInPostgres(input: {
       continuation_run_global_id: string | null
     } | null = null
     if (catalogSyncResetRequested) {
-      if (
-        !sameAction
-        || currentPolicy?.unmatched_action !== 'auto_create'
-      ) {
+      if (!sameAction) {
         intakeError(
           'COMMERCE_CATALOG_SYNC_RESET_NOT_REQUIRED',
-          'There is no terminal catalog sync under the current automatic-product policy fence',
+          'A terminal catalog sync reset must preserve the current unmatched-product policy',
           409,
         )
       }

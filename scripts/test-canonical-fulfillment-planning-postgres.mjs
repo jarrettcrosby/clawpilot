@@ -2378,6 +2378,18 @@ async function verifyCanonicalPlanning(databaseUrl) {
               )
             },
           },
+          '@/lib/integrations/faireFulfillmentRuntime': {
+            prepareCurrentFaireFulfillmentAuthority: async () => {
+              throw new Error(
+                'Canonical planning acceptance does not authorize Faire fulfillment',
+              )
+            },
+            executeCurrentFaireFulfillmentWriteback: async () => {
+              throw new Error(
+                'Canonical planning acceptance does not write Faire fulfillment',
+              )
+            },
+          },
           '@/lib/operations/adapters': adapters,
           '@/lib/operations/canonicalFulfillmentPlanning':
             canonicalPlanning,

@@ -8,6 +8,13 @@ import {
   recordShopifyInventoryRefreshWorkerHeartbeatInPostgres,
 } from '@/lib/persistence/shopifyInventoryRefresh'
 import {
+  recordFaireInventoryPollWorkerHeartbeatInPostgres,
+} from '@/lib/persistence/faireInventoryPolling'
+import {
+  faireInventoryPollingRuntimeAvailable,
+  processFaireInventoryPollOutbox,
+} from '@/lib/faireInventoryPollingWorker'
+import {
   processShopifyInventoryRefreshOutbox,
 } from '@/lib/shopifyInventoryRefreshWorker'
 
@@ -27,6 +34,65 @@ function authorized(req: NextRequest) {
   )
 }
 
+async function runShopifyLane(input: {
+  limit?: number
+  workerId: string
+}) {
+  try {
+    await recordShopifyInventoryRefreshWorkerHeartbeatInPostgres({
+      phase: 'started',
+      workerId: input.workerId,
+      resource: 'inventory',
+      readOnly: true,
+      providerWrites: 0,
+      orderQuantityAdjustment: 0,
+    })
+    const result = await processShopifyInventoryRefreshOutbox(input)
+    const heartbeat =
+      await recordShopifyInventoryRefreshWorkerHeartbeatInPostgres({
+        phase: 'completed',
+        workerId: input.workerId,
+        ...result,
+      })
+    return { result, heartbeatAt: heartbeat.checkedAt }
+  } catch (error) {
+    await recordShopifyInventoryRefreshWorkerHeartbeatInPostgres({
+      phase: 'failed',
+      workerId: input.workerId,
+      resource: 'inventory',
+      readOnly: true,
+      providerWrites: 0,
+      orderQuantityAdjustment: 0,
+    }).catch(() => undefined)
+    throw error
+  }
+}
+
+async function runFaireLane(input: {
+  limit?: number
+  workerId: string
+}) {
+  try {
+    await recordFaireInventoryPollWorkerHeartbeatInPostgres({
+      phase: 'started',
+      workerId: input.workerId,
+    })
+    const result = await processFaireInventoryPollOutbox(input)
+    const heartbeat = await recordFaireInventoryPollWorkerHeartbeatInPostgres({
+      phase: 'completed',
+      workerId: input.workerId,
+      ...result,
+    })
+    return { result, heartbeatAt: heartbeat.checkedAt }
+  } catch (error) {
+    await recordFaireInventoryPollWorkerHeartbeatInPostgres({
+      phase: 'failed',
+      workerId: input.workerId,
+    }).catch(() => undefined)
+    throw error
+  }
+}
+
 export async function POST(req: NextRequest) {
   if (!authorized(req)) {
     return NextResponse.json(
@@ -34,7 +100,9 @@ export async function POST(req: NextRequest) {
       { status: 401 },
     )
   }
-  if (!shopifyInventoryRuntimeAvailable()) {
+  const shopifyEnabled = shopifyInventoryRuntimeAvailable()
+  const faireEnabled = faireInventoryPollingRuntimeAvailable()
+  if (!shopifyEnabled && !faireEnabled) {
     return NextResponse.json({
       ok: true,
       skipped: true,
@@ -45,7 +113,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(
       {
         ok: false,
-        error: 'Shopify inventory refresh requires Postgres storage',
+        error: 'Commerce inventory workers require Postgres storage',
       },
       { status: 409 },
     )
@@ -56,39 +124,44 @@ export async function POST(req: NextRequest) {
     || process.env.HOSTNAME
     || crypto.randomUUID(),
   ).slice(0, 200)
-  await recordShopifyInventoryRefreshWorkerHeartbeatInPostgres({
-    phase: 'started',
-    workerId,
-    resource: 'inventory',
-    readOnly: true,
-    providerWrites: 0,
-    orderQuantityAdjustment: 0,
-  })
-  try {
-    const result = await processShopifyInventoryRefreshOutbox({
-      limit: body.limit,
-      workerId,
-    })
-    const heartbeat =
-      await recordShopifyInventoryRefreshWorkerHeartbeatInPostgres({
-        phase: 'completed',
-        workerId,
-        ...result,
-      })
+  const [shopifyLane, faireLane] = await Promise.allSettled([
+    shopifyEnabled
+      ? runShopifyLane({ limit: body.limit, workerId })
+      : Promise.resolve(null),
+    faireEnabled
+      ? runFaireLane({ limit: body.limit, workerId })
+      : Promise.resolve(null),
+  ])
+  // Both bounded lanes always settle before either error is rethrown, so a
+  // provider-specific failure cannot prevent the other provider from working.
+  if (shopifyLane.status === 'rejected') throw shopifyLane.reason
+  if (faireLane.status === 'rejected') throw faireLane.reason
+  const shopify = shopifyLane.value?.result || null
+  const faire = faireLane.value?.result || null
+  if (!shopify && faire) {
     return NextResponse.json({
       ok: true,
-      ...result,
-      heartbeatAt: heartbeat.checkedAt,
+      // The poller reads top-level counters. When only Faire is enabled its
+      // real work must remain observable rather than looking globally skipped.
+      ...faire,
+      shopify: {
+        skipped: true,
+        reason: 'shopify-inventory-disabled',
+      },
+      faire,
+      heartbeatAt: faireLane.value?.heartbeatAt || null,
     })
-  } catch (error) {
-    await recordShopifyInventoryRefreshWorkerHeartbeatInPostgres({
-      phase: 'failed',
-      workerId,
-      resource: 'inventory',
-      readOnly: true,
-      providerWrites: 0,
-      orderQuantityAdjustment: 0,
-    }).catch(() => undefined)
-    throw error
   }
+  return NextResponse.json({
+    ok: true,
+    // Preserve the established Shopify top-level response while adding the
+    // separately bounded Faire observation lane.
+    ...shopify,
+    shopify,
+    faire: faire || {
+      skipped: true,
+      reason: 'faire-inventory-disabled',
+    },
+    heartbeatAt: shopifyLane.value?.heartbeatAt || null,
+  })
 }

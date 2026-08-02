@@ -1968,13 +1968,6 @@ async function executeCommerceIntakeCommandInternal(
     )
     let catalogSyncResetReason: string | null = null
     if (catalogSyncResetRequested) {
-      if (unmatchedAction !== 'auto_create') {
-        throw new CommerceIntegrationRequestError(
-          'A terminal catalog sync can only be restarted while automatic product creation remains on',
-          400,
-          'COMMERCE_CATALOG_SYNC_RESET_INVALID',
-        )
-      }
       if (input.body.confirmCatalogSyncReset !== true) {
         throw new CommerceIntegrationRequestError(
           'Confirm that the terminal catalog evidence will be preserved and a fresh root reconciliation will start',
