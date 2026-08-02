@@ -210,6 +210,9 @@ let replayDecryptionMode = 'valid'
 let replayFailureState = 'held'
 let replayRuntimeCredentialVersion = 3
 const durableReceiptObservedAt = '2026-08-01T15:01:02.000Z'
+const faireFulfillmentReadiness = loadTypeScriptModule(
+  'app_src/lib/integrations/faireFulfillmentReadiness.ts',
+)
 const receiptPersistenceModule = loadTypeScriptModule(
   'app_src/lib/persistence/commerceIntegrations.ts',
   {
@@ -243,6 +246,8 @@ const receiptPersistenceModule = loadTypeScriptModule(
           return Buffer.from('{"id":123456789}')
         },
       },
+      '@/lib/integrations/faireFulfillmentReadiness':
+        faireFulfillmentReadiness,
       '@/lib/integrations/shopifyCatalogWebhook': {
         shopifyDeletedProductEvidence:
           deleteEvidence.shopifyDeletedProductEvidence,
