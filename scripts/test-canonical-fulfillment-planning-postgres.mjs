@@ -2327,6 +2327,9 @@ async function verifyCanonicalPlanning(databaseUrl) {
     const packagingMaterialsDomain = loadTypeScriptModule(
       'app_src/lib/operations/packagingMaterials.ts',
     )
+    const commerceFulfillmentRecoveryPolicy = loadTypeScriptModule(
+      'app_src/lib/commerceFulfillmentRecoveryPolicy.ts',
+    )
     const cartonizationRateEvidence = loadTypeScriptModule(
       'app_src/lib/persistence/cartonizationRateEvidence.ts',
       {
@@ -2390,6 +2393,8 @@ async function verifyCanonicalPlanning(databaseUrl) {
               )
             },
           },
+          '@/lib/commerceFulfillmentRecoveryPolicy':
+            commerceFulfillmentRecoveryPolicy,
           '@/lib/operations/adapters': adapters,
           '@/lib/operations/canonicalFulfillmentPlanning':
             canonicalPlanning,
