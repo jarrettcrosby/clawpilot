@@ -2452,6 +2452,7 @@ export async function GET() {
                 historical_dead: number
                 stale_processing: number
                 overdue: number
+                orphaned_running_cursors: number
               }>(
                 `WITH catalog_jobs AS (
                    SELECT job.*,
@@ -2526,7 +2527,23 @@ export async function GET() {
                    count(*) FILTER (
                      WHERE status IN ('pending', 'failed')
                        AND available_at < now() - interval '5 minutes'
-                   )::integer AS overdue
+                   )::integer AS overdue,
+                   (
+                     SELECT count(*)::integer
+                     FROM operations_commerce_sync_cursors cursor
+                     WHERE cursor.resource = 'products'
+                       AND cursor.reconciliation_status = 'running'
+                       AND NOT EXISTS (
+                         SELECT 1
+                         FROM operations_commerce_catalog_sync_jobs active
+                         WHERE active.organization_id = cursor.organization_id
+                           AND active.integration_account_id
+                             = cursor.integration_account_id
+                           AND active.status IN (
+                             'pending', 'processing', 'failed'
+                           )
+                       )
+                   ) AS orphaned_running_cursors
                  FROM catalog_jobs`,
               )
             ).rows[0]
@@ -2535,12 +2552,16 @@ export async function GET() {
               commerceQueue?.stale_processing || 0,
             )
             const overdue = Number(commerceQueue?.overdue || 0)
+            const orphanedRunningCursors = Number(
+              commerceQueue?.orphaned_running_cursors || 0,
+            )
             const healthy = (
               commerceAgeMs !== null
               && commerceAgeMs <= maxCommerceHeartbeatAgeMs
               && dead === 0
               && stale === 0
               && overdue === 0
+              && orphanedRunningCursors === 0
             )
             commerceCatalogWorker = {
               status: healthy ? 'reachable' : 'stale',
@@ -2553,6 +2574,7 @@ export async function GET() {
               historicalDead: Number(commerceQueue?.historical_dead || 0),
               staleProcessing: stale,
               overdue,
+              orphanedRunningCursors,
             }
             if (
               commerceAgeMs === null
@@ -2575,6 +2597,11 @@ export async function GET() {
             if (overdue > 0) {
               errors.push(
                 'Commerce catalog queue has overdue jobs.',
+              )
+            }
+            if (orphanedRunningCursors > 0) {
+              errors.push(
+                'Commerce catalog sync has running cursors without active jobs.',
               )
             }
           }

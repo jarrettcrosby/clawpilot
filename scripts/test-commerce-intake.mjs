@@ -408,6 +408,9 @@ function automaticIntakeClient({
       if (sql.includes('INSERT INTO operations_commerce_catalog_sync_jobs')) {
         return { rows: [], rowCount: queued }
       }
+      if (sql.includes('UPDATE operations_commerce_sync_cursors cursor')) {
+        return { rows: [], rowCount: 0 }
+      }
       throw new Error(`Unexpected automatic-intake query: ${sql}`)
     },
   }
@@ -2989,17 +2992,23 @@ const service = loadTypeScriptModule(
           if (externalCustomerId === 'customer-existing') {
             return {
               status: 'matched',
+              method: 'email',
               customer: { globalId: 'ga0000001' },
             }
           }
           if (externalCustomerId === 'customer-new') {
             return {
               status: 'created',
+              method: 'created',
               customer: { globalId: 'ga0000002' },
             }
           }
           if (externalCustomerId === 'customer-ambiguous') {
-            return { status: 'ambiguous', customer: null }
+            return {
+              status: 'ambiguous',
+              method: 'ambiguous',
+              customer: null,
+            }
           }
           throw new MockCommerceIntegrationRequestError(
             'Simulated customer resolver failure',
@@ -3372,17 +3381,20 @@ try {
       candidateGlobalId: entry.input.candidateGlobalId,
       mode: entry.input.customer.mode,
       customerGlobalId: entry.input.customer.customerGlobalId,
+      resolutionMethod: entry.input.customer.resolutionMethod,
     })),
     [
       {
         candidateGlobalId: 'gcoc0000001',
         mode: 'existing',
         customerGlobalId: 'ga0000001',
+        resolutionMethod: 'email',
       },
       {
         candidateGlobalId: 'gcoc0000002',
         mode: 'existing',
         customerGlobalId: 'ga0000002',
+        resolutionMethod: 'created',
       },
     ],
   )

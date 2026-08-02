@@ -135,6 +135,73 @@ export function commerceCatalogSweepFailureState(input: {
   }
 }
 
+export async function reconcileOrphanedCommerceCatalogSyncCursorsWithClient(
+  client: PoolClient,
+  input: {
+    organizationId?: string
+    integrationAccountId?: string
+  } = {},
+) {
+  if (
+    Boolean(input.organizationId)
+    !== Boolean(input.integrationAccountId)
+  ) {
+    throw new Error(
+      'Commerce catalog cursor reconciliation requires both account identifiers',
+    )
+  }
+  const reconciled = await client.query<{
+    organization_id: string
+    integration_account_id: string
+    last_error_code: string
+  }>(
+    `UPDATE operations_commerce_sync_cursors cursor
+     SET reconciliation_status = 'idle',
+         last_error_code = COALESCE(
+           (
+             SELECT cancelled.last_error_code
+             FROM operations_commerce_catalog_sync_jobs cancelled
+             WHERE cancelled.organization_id = cursor.organization_id
+               AND cancelled.integration_account_id
+                 = cursor.integration_account_id
+               AND cancelled.status = 'cancelled'
+             ORDER BY cancelled.completed_at DESC NULLS LAST,
+                      cancelled.updated_at DESC,
+                      cancelled.id DESC
+             LIMIT 1
+           ),
+           'COMMERCE_CATALOG_SYNC_ORPHAN_RECONCILED'
+         ),
+         updated_at = now()
+     WHERE cursor.resource = 'products'
+       AND cursor.reconciliation_status = 'running'
+       AND ($1::uuid IS NULL OR cursor.organization_id = $1::uuid)
+       AND ($2::uuid IS NULL OR cursor.integration_account_id = $2::uuid)
+       AND NOT EXISTS (
+         SELECT 1
+         FROM operations_commerce_catalog_sync_jobs active
+         WHERE active.organization_id = cursor.organization_id
+           AND active.integration_account_id = cursor.integration_account_id
+           AND active.status IN ('pending', 'processing', 'failed')
+       )
+     RETURNING cursor.organization_id::text,
+               cursor.integration_account_id::text,
+               cursor.last_error_code`,
+    [
+      input.organizationId || null,
+      input.integrationAccountId || null,
+    ],
+  )
+  return {
+    reconciled: reconciled.rowCount || 0,
+    cursors: reconciled.rows.map((row) => ({
+      organizationId: row.organization_id,
+      integrationAccountId: row.integration_account_id,
+      lastErrorCode: row.last_error_code,
+    })),
+  }
+}
+
 async function cancelCommerceCatalogSyncJobsWithClient(
   client: PoolClient,
   input: {
@@ -169,6 +236,10 @@ async function cancelCommerceCatalogSyncJobsWithClient(
       input.errorCode,
     ],
   )
+  await reconcileOrphanedCommerceCatalogSyncCursorsWithClient(client, {
+    organizationId: input.organizationId,
+    integrationAccountId: input.integrationAccountId,
+  })
   return cancelled.rowCount || 0
 }
 
@@ -196,12 +267,17 @@ export async function applyCommerceCatalogSyncPolicyWithClient(
              WHEN status = 'processing' THEN completed_at
              ELSE now()
            END,
+           last_error_code = 'COMMERCE_CATALOG_SYNC_POLICY_PAUSED',
            updated_at = now()
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
          AND status IN ('pending', 'processing', 'failed')`,
       [input.organizationId, input.integrationAccountId],
     )
+    await reconcileOrphanedCommerceCatalogSyncCursorsWithClient(client, {
+      organizationId: input.organizationId,
+      integrationAccountId: input.integrationAccountId,
+    })
     return { queued: 0, cancelled: cancelled.rowCount || 0 }
   }
 
@@ -296,6 +372,10 @@ export async function applyCommerceCatalogSyncPolicyWithClient(
       input.actorEmail,
     ],
   )
+  await reconcileOrphanedCommerceCatalogSyncCursorsWithClient(client, {
+    organizationId: input.organizationId,
+    integrationAccountId: input.integrationAccountId,
+  })
   return {
     queued: queued.rowCount || 0,
     cancelled: stale.rowCount || 0,
@@ -780,6 +860,7 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
        DO NOTHING`,
       [CATALOG_SYNC_POLICY_VERSION],
     )
+    await reconcileOrphanedCommerceCatalogSyncCursorsWithClient(client)
     return connectedDefaultQueued + (queued.rowCount || 0)
   })
 }
@@ -983,7 +1064,7 @@ export async function completeCommerceCatalogSyncPageInPostgres(input: {
   return withTransaction(async (client) => {
     const fenced = await currentJobFence(client, input.job)
     if (!fenced) {
-      await client.query(
+      const cancelled = await client.query(
         `UPDATE operations_commerce_catalog_sync_jobs
          SET status = 'cancelled',
              cancel_requested = true,
@@ -998,6 +1079,12 @@ export async function completeCommerceCatalogSyncPageInPostgres(input: {
            AND lock_token = $2::uuid`,
         [input.job.id, input.job.lockToken],
       )
+      if (cancelled.rowCount === 1) {
+        await reconcileOrphanedCommerceCatalogSyncCursorsWithClient(client, {
+          organizationId: input.job.organizationId,
+          integrationAccountId: input.job.integrationAccountId,
+        })
+      }
       return { status: 'cancelled' as const }
     }
     const nextPageCount = input.job.pageCount + 1

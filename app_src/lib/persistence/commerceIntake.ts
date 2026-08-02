@@ -42,6 +42,7 @@ import {
   type CommerceNormalizedOrderLine,
   type CommercePartySnapshot,
 } from '@/lib/operations/commerceNormalization'
+import type { CommerceCustomerMatchMethod } from '@/lib/operations/types'
 import { stageCrmRecordWithClient } from '@/lib/persistence/crm'
 import {
   acquireTransactionAdvisoryLock,
@@ -8436,7 +8437,11 @@ export async function resolveCommerceCandidateCustomerInPostgres(input: {
   candidateGlobalId: string
   candidateRowVersion: number
   customer:
-    | { mode: 'existing'; customerGlobalId: string }
+    | {
+        mode: 'existing'
+        customerGlobalId: string
+        resolutionMethod?: CommerceCustomerMatchMethod
+      }
     | {
         mode: 'create'
         name: string
@@ -8473,11 +8478,12 @@ export async function resolveCommerceCandidateCustomerInPostgres(input: {
       name: string
     } | null = null
     let customerResolutionMethod:
-      | 'created'
-      | 'external_id'
+      | CommerceCustomerMatchMethod
       | 'provider_identity'
       | 'manual'
-      = input.customer.mode === 'create' ? 'created' : 'manual'
+      = input.customer.mode === 'create'
+        ? 'created'
+        : input.customer.resolutionMethod || 'manual'
     if (input.customer.mode === 'existing') {
       const selected = await client.query<{
         id: string

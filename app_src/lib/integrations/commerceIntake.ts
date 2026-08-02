@@ -1794,7 +1794,11 @@ async function withAutomaticCustomerResolution(
           country: target.country,
         },
       })
-      if (resolution.status === 'ambiguous' || !resolution.customer) {
+      if (
+        resolution.status === 'ambiguous'
+        || resolution.method === 'ambiguous'
+        || !resolution.customer
+      ) {
         ambiguous += 1
         continue
       }
@@ -1813,6 +1817,7 @@ async function withAutomaticCustomerResolution(
         customer: {
           mode: 'existing',
           customerGlobalId: resolution.customer.globalId,
+          resolutionMethod: resolution.method,
         },
       })
       if (resolution.status === 'created') created += 1
