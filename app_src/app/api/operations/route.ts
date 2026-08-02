@@ -133,6 +133,12 @@ function requirePostgres() {
   }
 }
 
+function commerceFulfillmentRecoveryRuntimeAvailable() {
+  return String(
+    process.env.CLAWPILOT_COMMERCE_FULFILLMENT_RECOVERY_ENABLED || '0',
+  ) === '1'
+}
+
 function requireOperationsProofFixture() {
   if (process.env.CLAWPILOT_OPERATIONS_PROOF_ENABLED !== 'true') {
     requestError(
@@ -737,7 +743,14 @@ export async function GET(req: NextRequest) {
       exceptionStatus: (exceptionStatusValue as OperationsExceptionStatus) || null,
       selectedOrderGlobalId: selectedValue || null,
     })
-    return json({ ok: true, operations })
+    return json({
+      ok: true,
+      operations,
+      runtime: {
+        commerceFulfillmentRecoveryEnabled:
+          commerceFulfillmentRecoveryRuntimeAvailable(),
+      },
+    })
   } catch (error) {
     return errorResponse(error)
   }

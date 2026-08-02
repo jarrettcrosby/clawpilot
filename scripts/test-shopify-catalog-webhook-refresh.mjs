@@ -252,6 +252,9 @@ const receiptPersistenceModule = loadTypeScriptModule(
         shopifyDeletedProductEvidence:
           deleteEvidence.shopifyDeletedProductEvidence,
       },
+      '@/lib/persistence/commerceExternalEffects': {
+        assertRedactedCommerceExternalEffectEvidence() {},
+      },
       '@/lib/persistence/postgres': {
         async acquireTransactionAdvisoryLock(_client, key) {
           receiptTrace.push({ kind: 'lock', key })

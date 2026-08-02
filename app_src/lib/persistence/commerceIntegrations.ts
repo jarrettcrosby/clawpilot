@@ -36,6 +36,9 @@ import {
   reconcileCommerceProductImageSetWithClient,
 } from '@/lib/persistence/commerceProductImageImports'
 import {
+  assertRedactedCommerceExternalEffectEvidence,
+} from '@/lib/persistence/commerceExternalEffects'
+import {
   ensureShopifyFulfillmentNotificationPolicyWithClient,
   type ShopifyFulfillmentNotificationPolicyState,
 } from '@/lib/persistence/shopifyFulfillmentNotifications'
@@ -845,7 +848,83 @@ export async function writeCommerceCredentialInPostgres(input: {
   webhookVerificationStatus: 'not_applicable' | 'unverified'
   resources: CommerceSyncResource[]
   actorEmail: string
+  faireOAuthGrant?: {
+    requestedScopes: string[]
+    tokenType: 'BEARER'
+    credentialFingerprintSha256: string
+    requestedAt: string
+    completedAt: string
+    adapterVersion: string
+  }
 }) {
+  const oauthGrant = input.faireOAuthGrant
+  const requiresOAuthGrant = input.provider === 'faire'
+    && input.authMode === 'faire_oauth'
+  if (requiresOAuthGrant !== Boolean(oauthGrant)) {
+    throw new Error(
+      'Faire OAuth credential persistence requires exact grant evidence',
+    )
+  }
+  const supportedFaireScopes = new Set([
+    'READ_PRODUCTS',
+    'WRITE_PRODUCTS',
+    'READ_ORDERS',
+    'WRITE_ORDERS',
+    'READ_BRAND',
+    'READ_RETAILER',
+    'READ_INVENTORIES',
+    'WRITE_INVENTORIES',
+    'READ_SHIPMENTS',
+    'READ_REVIEWS',
+  ])
+  const oauthGrantRequestedAt = oauthGrant
+    ? Date.parse(oauthGrant.requestedAt)
+    : Number.NaN
+  const oauthGrantCompletedAt = oauthGrant
+    ? Date.parse(oauthGrant.completedAt)
+    : Number.NaN
+  const oauthGrantRecordedAt = Date.now()
+  if (
+    oauthGrant
+    && (
+      oauthGrant.tokenType !== 'BEARER'
+      || oauthGrant.requestedScopes.length < 1
+      || oauthGrant.requestedScopes.length > supportedFaireScopes.size
+      || new Set(oauthGrant.requestedScopes).size
+        !== oauthGrant.requestedScopes.length
+      || oauthGrant.requestedScopes.some(
+        (scope) => !supportedFaireScopes.has(scope),
+      )
+      || !Number.isFinite(oauthGrantRequestedAt)
+      || !Number.isFinite(oauthGrantCompletedAt)
+      || oauthGrantRequestedAt > oauthGrantCompletedAt
+      || oauthGrantCompletedAt - oauthGrantRequestedAt > 60_000
+      || oauthGrantCompletedAt > oauthGrantRecordedAt + 30_000
+      || oauthGrantCompletedAt < oauthGrantRecordedAt - 5 * 60_000
+      || oauthGrant.adapterVersion
+        !== 'faire-external-api-v2-oauth-authorization-code-v1'
+      || !/^[a-f0-9]{64}$/.test(
+        oauthGrant.credentialFingerprintSha256,
+      )
+    )
+  ) {
+    throw new Error('Faire OAuth grant evidence is invalid')
+  }
+  const credentialFingerprintSha256 =
+    oauthGrant?.credentialFingerprintSha256 || null
+  const providerReference = credentialFingerprintSha256
+  const configuration = oauthGrant
+    ? {
+        ...input.configuration,
+        requestedScopes: [...oauthGrant.requestedScopes],
+        grantedScopes: [...oauthGrant.requestedScopes],
+        scopeVerification: 'oauth_grant',
+        oauthGrantTokenType: oauthGrant.tokenType,
+        oauthGrantCredentialFingerprintSha256:
+          credentialFingerprintSha256,
+        scopeProofProviderReference: providerReference,
+      }
+    : input.configuration
   await withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
       client,
@@ -911,7 +990,7 @@ export async function writeCommerceCredentialInPostgres(input: {
         input.environment,
         input.externalAccountId,
         input.displayName,
-        JSON.stringify(input.configuration),
+        JSON.stringify(configuration),
         input.actorEmail,
       ],
     )
@@ -998,6 +1077,120 @@ export async function writeCommerceCredentialInPostgres(input: {
         input.actorEmail,
       ],
     )
+    if (oauthGrant && credentialFingerprintSha256 && providerReference) {
+      const redactedRequest = {
+        provider: 'faire',
+        operation: 'authorizationCodeExchange',
+        grantType: 'AUTHORIZATION_CODE',
+        requestedScopes: [...oauthGrant.requestedScopes],
+        credentialFingerprintSha256,
+        providerWrites: 0,
+      }
+      const redactedEvidence = {
+        provider: 'faire',
+        operation: 'authorizationCodeExchange',
+        grantType: 'AUTHORIZATION_CODE',
+        tokenType: oauthGrant.tokenType,
+        externalAccountId: input.externalAccountId,
+        credentialGeneration: credentialVersion,
+        requestedScopes: [...oauthGrant.requestedScopes],
+        grantedScopes: [...oauthGrant.requestedScopes],
+        credentialFingerprintSha256,
+        providerReference,
+        providerWrites: 0,
+      }
+      assertRedactedCommerceExternalEffectEvidence(redactedRequest)
+      assertRedactedCommerceExternalEffectEvidence(redactedEvidence)
+      const idempotencyKey = [
+        'faire-oauth-grant',
+        credentialVersion,
+        credentialFingerprintSha256,
+      ].join(':')
+      const attempt = await client.query<{
+        id: string
+        global_id: string
+      }>(
+        `INSERT INTO operations_commerce_provider_attempts (
+           organization_id, integration_account_id, action, adapter_version,
+           external_object_id, idempotency_key, request_hash,
+           redacted_request, redacted_response, state, attempt_number,
+           provider_reference, error_code, requested_at, completed_at,
+           created_by
+         ) VALUES (
+           $1::uuid, $2::uuid, 'faire.oauth.authorization_code.exchange',
+           $3, $4, $5,
+           operations_faire_provider_write_request_hash($6::jsonb),
+           $6::jsonb, $7::jsonb, 'succeeded', 1,
+           $8, NULL, $9::timestamptz, $10::timestamptz, $11
+         )
+         RETURNING id::text, global_id`,
+        [
+          input.organizationId,
+          account.id,
+          oauthGrant.adapterVersion,
+          `commerce-credential:${account.id}:v${credentialVersion}`,
+          idempotencyKey,
+          JSON.stringify(redactedRequest),
+          JSON.stringify(redactedEvidence),
+          providerReference,
+          oauthGrant.requestedAt,
+          oauthGrant.completedAt,
+          input.actorEmail,
+        ],
+      )
+      const providerAttempt = attempt.rows[0]
+      await client.query(
+        `UPDATE operations_integration_accounts
+         SET configuration = jsonb_set(
+               configuration,
+               '{scopeProofAttemptGlobalId}',
+               to_jsonb($3::text),
+               true
+             ),
+             updated_by = $4,
+             updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND commerce_credential_generation = $5`,
+        [
+          input.organizationId,
+          account.id,
+          providerAttempt.global_id,
+          input.actorEmail,
+          credentialVersion,
+        ],
+      )
+      const verifiedWriteScopes = oauthGrant.requestedScopes
+        .filter((scope) => scope.startsWith('WRITE_'))
+        .sort()
+      if (verifiedWriteScopes.length > 0) {
+        await client.query(
+          `INSERT INTO operations_faire_provider_write_scope_evidence (
+             organization_id, integration_account_id, provider_attempt_id,
+             external_account_id, credential_generation,
+             verified_write_scopes, verification_source, provider_reference,
+             redacted_evidence, evidence_hash, observed_at, recorded_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, $4, $5, $6::text[],
+             'oauth_grant', $7, $8::jsonb,
+             operations_faire_provider_write_request_hash($8::jsonb),
+             $9::timestamptz, $10
+           )`,
+          [
+            input.organizationId,
+            account.id,
+            providerAttempt.id,
+            input.externalAccountId,
+            credentialVersion,
+            verifiedWriteScopes,
+            providerReference,
+            JSON.stringify(redactedEvidence),
+            oauthGrant.completedAt,
+            input.actorEmail,
+          ],
+        )
+      }
+    }
     for (const resource of input.resources) {
       await client.query(
         `INSERT INTO operations_commerce_sync_cursors (

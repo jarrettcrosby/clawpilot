@@ -250,22 +250,43 @@ async function seedFixture(pool) {
   const simulationHash = commerceExternalEffects.commerceExternalEffectHash(
     simulationResult,
   )
+  const grantedScopes = [
+    'READ_PRODUCTS',
+    'WRITE_PRODUCTS',
+    'READ_ORDERS',
+    'WRITE_ORDERS',
+    'READ_BRAND',
+    'READ_RETAILER',
+    'READ_INVENTORIES',
+    'WRITE_INVENTORIES',
+    'READ_SHIPMENTS',
+    'READ_REVIEWS',
+  ]
+  const verifiedWriteScopes = [
+    'WRITE_INVENTORIES',
+    'WRITE_ORDERS',
+    'WRITE_PRODUCTS',
+  ]
+  const credentialFingerprintSha256 = 'd'.repeat(64)
   const scopeProofRequest = {
     provider: 'faire',
-    operation: 'authorizationScopesVerify',
-    accountGlobalId: null,
-    credentialGeneration: 1,
-    readOnly: true,
+    operation: 'authorizationCodeExchange',
+    grantType: 'AUTHORIZATION_CODE',
+    requestedScopes: grantedScopes,
+    credentialFingerprintSha256,
+    providerWrites: 0,
   }
   const scopeEvidence = {
     provider: 'faire',
-    operation: 'authorizationScopesVerify',
+    operation: 'authorizationCodeExchange',
+    grantType: 'AUTHORIZATION_CODE',
+    tokenType: 'BEARER',
     externalAccountId: 'faire-brand-acceptance',
     credentialGeneration: 1,
-    scopeVerification: 'oauth_grant',
-    providerProofVerified: true,
-    providerReference: 'faire-oauth-scope-proof-acceptance',
-    grantedScopes: ['WRITE_PRODUCTS'],
+    requestedScopes: grantedScopes,
+    grantedScopes,
+    credentialFingerprintSha256,
+    providerReference: credentialFingerprintSha256,
     providerWrites: 0,
   }
 
@@ -317,13 +338,33 @@ async function seedFixture(pool) {
        ) VALUES (
          $1::uuid, 'faire', 'commerce', 'production',
          'Faire production acceptance', 'active',
-         '{"grantedScopes":null,"scopeVerification":"not_exposed_by_provider"}'::jsonb,
+         $3::jsonb,
          'faire-brand-acceptance', 1, $2, $2
        ) RETURNING id::text, global_id`,
-      [organizationId, actorEmail],
+      [
+        organizationId,
+        actorEmail,
+        JSON.stringify({
+          authMode: 'faire_oauth',
+          tokenAcquisition: 'authorization_code',
+          requestedScopes: grantedScopes,
+          grantedScopes: null,
+          scopeVerification: 'requested_only',
+        }),
+      ],
     )
     const accountId = account.rows[0].id
-    scopeProofRequest.accountGlobalId = account.rows[0].global_id
+    await client.query(
+      `UPDATE operations_integration_accounts
+       SET credential_reference = $3
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [
+        organizationId,
+        accountId,
+        `commerce-credential:${accountId}:v1`,
+      ],
+    )
     await client.query(
       `INSERT INTO operations_commerce_credentials (
          organization_id, integration_account_id, external_account_id,
@@ -332,7 +373,7 @@ async function seedFixture(pool) {
          verification_status, verified_at, webhook_verification_status,
          created_by, updated_by
        ) VALUES (
-         $1::uuid, $2::uuid, 'faire-brand-acceptance', 'faire_brand_token',
+         $1::uuid, $2::uuid, 'faire-brand-acceptance', 'faire_oauth',
          decode('01', 'hex'), decode(repeat('00', 12), 'hex'),
          decode(repeat('00', 16), 'hex'), 1, 'TEST', 'verified',
          clock_timestamp(), 'not_applicable', $3, $3
@@ -403,32 +444,29 @@ async function seedFixture(pool) {
     const scopeProofAttempt = await client.query(
       `INSERT INTO operations_commerce_provider_attempts (
          organization_id, integration_account_id, action, adapter_version,
-         idempotency_key, request_hash, redacted_request,
+         external_object_id, idempotency_key, request_hash, redacted_request,
          redacted_response, state, attempt_number, provider_reference,
          completed_at, created_by
        ) VALUES (
-         $1::uuid, $2::uuid, 'faire.oauth.scopes.verify',
-         'disposable-proof-fixture-v1', 'faire-oauth-proof-fixture-v1',
-         $3, $4::jsonb, $5::jsonb, 'succeeded', 1,
-         'faire-oauth-scope-proof-acceptance',
-         date_trunc('milliseconds', clock_timestamp()), $6
+         $1::uuid, $2::uuid, 'faire.oauth.authorization_code.exchange',
+         'faire-external-api-v2-oauth-authorization-code-v1',
+         $6,
+         'faire-oauth-grant:1:${credentialFingerprintSha256}',
+         operations_faire_provider_write_request_hash($3::jsonb),
+         $3::jsonb, $4::jsonb, 'succeeded', 1,
+         '${credentialFingerprintSha256}',
+         date_trunc('milliseconds', clock_timestamp()), $5
        ) RETURNING id::text, global_id, completed_at`,
       [
         organizationId,
         accountId,
-        commerceExternalEffects.commerceExternalEffectHash(scopeProofRequest),
         JSON.stringify(scopeProofRequest),
         JSON.stringify(scopeEvidence),
         actorEmail,
+        `commerce-credential:${accountId}:v1`,
       ],
     )
     const proof = scopeProofAttempt.rows[0]
-    const evidenceHash = await client.query(
-      `SELECT operations_faire_provider_write_request_hash(
-         $1::jsonb
-       ) AS hash`,
-      [JSON.stringify(scopeEvidence)],
-    )
     const evidenceInsert = `INSERT INTO
        operations_faire_provider_write_scope_evidence (
          organization_id, integration_account_id, provider_attempt_id,
@@ -437,48 +475,251 @@ async function seedFixture(pool) {
          evidence_hash, observed_at, recorded_by
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, 'faire-brand-acceptance', 1,
-         ARRAY['WRITE_PRODUCTS']::text[], 'oauth_grant',
-         'faire-oauth-scope-proof-acceptance', $4::jsonb, $5,
-         $6::timestamptz, $7
+         $7::text[], 'oauth_grant',
+         '${credentialFingerprintSha256}', $4::jsonb,
+         operations_faire_provider_write_request_hash($4::jsonb),
+         $5::timestamptz, $6
        ) RETURNING id::text, global_id`
-    await client.query('SAVEPOINT arbitrary_scope_proof')
-    await assert.rejects(
-      client.query(evidenceInsert, [
+    await client.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = $3::jsonb
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [
         organizationId,
         accountId,
-        proof.id,
-        JSON.stringify(scopeEvidence),
-        evidenceHash.rows[0].hash,
-        proof.completed_at,
-        actorEmail,
-      ]),
-      /does not expose provider-verifiable OAuth write-scope proof/,
+        JSON.stringify({
+          authMode: 'faire_oauth',
+          tokenAcquisition: 'authorization_code',
+          requestedScopes: grantedScopes,
+          grantedScopes: null,
+          scopeVerification: 'requested_only',
+          oauthGrantTokenType: 'BEARER',
+          oauthGrantCredentialFingerprintSha256:
+            credentialFingerprintSha256,
+          scopeProofProviderReference: credentialFingerprintSha256,
+          scopeProofAttemptGlobalId: proof.global_id,
+        }),
+      ],
     )
-    await client.query('ROLLBACK TO SAVEPOINT arbitrary_scope_proof')
-    await client.query('RELEASE SAVEPOINT arbitrary_scope_proof')
 
-    // Downstream one-shot controls are tested below with an explicit
-    // disposable-database proof shim. Production migration 0220 never enables
-    // this bypass: its evidence trigger rejects every current Faire scope
-    // assertion because the provider returns no verifiable grant claim.
-    await client.query(`SET LOCAL session_replication_role = replica`)
-    const evidence = await client.query(evidenceInsert, [
+    const evidenceValues = (redactedEvidence = scopeEvidence) => [
       organizationId,
       accountId,
       proof.id,
-      JSON.stringify(scopeEvidence),
-      evidenceHash.rows[0].hash,
+      JSON.stringify(redactedEvidence),
       proof.completed_at,
       actorEmail,
-    ])
-    await client.query(`SET LOCAL session_replication_role = origin`)
+      verifiedWriteScopes,
+    ]
+    await client.query('SAVEPOINT requested_only_scope_proof')
+    await assert.rejects(
+      client.query(evidenceInsert, evidenceValues()),
+      /does not match the current credential grant/,
+    )
+    await client.query('ROLLBACK TO SAVEPOINT requested_only_scope_proof')
+    await client.query('RELEASE SAVEPOINT requested_only_scope_proof')
+
+    const grantConfiguration = {
+      authMode: 'faire_oauth',
+      tokenAcquisition: 'authorization_code',
+      requestedScopes: grantedScopes,
+      grantedScopes,
+      scopeVerification: 'oauth_grant',
+      oauthGrantTokenType: 'BEARER',
+      oauthGrantCredentialFingerprintSha256: credentialFingerprintSha256,
+      scopeProofProviderReference: credentialFingerprintSha256,
+      scopeProofAttemptGlobalId: proof.global_id,
+    }
+    await client.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = $3::jsonb
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [organizationId, accountId, JSON.stringify(grantConfiguration)],
+    )
+
+    for (const [name, malformedEvidence] of [
+      ['non_bearer', { ...scopeEvidence, tokenType: 'MAC' }],
+      ['unsupported_scope', {
+        ...scopeEvidence,
+        requestedScopes: [...grantedScopes, 'WRITE_EVERYTHING'],
+        grantedScopes: [...grantedScopes, 'WRITE_EVERYTHING'],
+      }],
+      ['mismatched_reference', {
+        ...scopeEvidence,
+        credentialFingerprintSha256: 'e'.repeat(64),
+        providerReference: 'e'.repeat(64),
+      }],
+    ]) {
+      await client.query(`SAVEPOINT ${name}`)
+      await assert.rejects(
+        client.query(evidenceInsert, evidenceValues(malformedEvidence)),
+        /does not match the current credential grant/,
+      )
+      await client.query(`ROLLBACK TO SAVEPOINT ${name}`)
+      await client.query(`RELEASE SAVEPOINT ${name}`)
+    }
+
+    const evidence = await client.query(evidenceInsert, evidenceValues())
     const productionGate = await client.query(
       `SELECT operations_faire_provider_write_scope_evidence_is_current(
          $1::uuid, $2::uuid, $3::uuid, 1
        ) AS current`,
       [organizationId, evidence.rows[0].id, accountId],
     )
-    assert.equal(productionGate.rows[0].current, false)
+    assert.equal(productionGate.rows[0].current, true)
+
+    await client.query('SAVEPOINT later_connection_verification')
+    await client.query(
+      `UPDATE operations_commerce_credentials
+       SET verified_at = verified_at + interval '30 days'
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [organizationId, accountId],
+    )
+    const laterVerificationGate = await client.query(
+      `SELECT operations_faire_provider_write_scope_evidence_is_current(
+         $1::uuid, $2::uuid, $3::uuid, 1
+       ) AS current`,
+      [organizationId, evidence.rows[0].id, accountId],
+    )
+    assert.equal(laterVerificationGate.rows[0].current, true)
+    await client.query('ROLLBACK TO SAVEPOINT later_connection_verification')
+    await client.query('RELEASE SAVEPOINT later_connection_verification')
+
+    const scopeCapabilities = await client.query(
+      `SELECT
+         operations_faire_provider_write_scope_evidence_is_current(
+           $1::uuid, $2::uuid, $3::uuid, 1
+         )
+         AND evidence.verified_write_scopes @>
+           ARRAY['WRITE_PRODUCTS']::text[] AS write_products,
+         operations_faire_fulfillment_scope_evidence_is_current(
+           $1::uuid, $3::uuid, 1
+         ) AS write_orders
+       FROM operations_faire_provider_write_scope_evidence evidence
+       WHERE evidence.organization_id = $1::uuid
+         AND evidence.id = $2::uuid
+         AND evidence.integration_account_id = $3::uuid`,
+      [organizationId, evidence.rows[0].id, accountId],
+    )
+    assert.deepEqual(scopeCapabilities.rows[0], {
+      write_products: true,
+      write_orders: true,
+    })
+
+    const verifyMissingGrantScope = async (
+      missingScope,
+      expectedProductWrite,
+      expectedOrderWrite,
+    ) => {
+      const scopedGrant = grantedScopes.filter(
+        (scope) => scope !== missingScope,
+      )
+      const scopedWriteGrant = verifiedWriteScopes.filter(
+        (scope) => scope !== missingScope,
+      )
+      const scopedRequest = {
+        ...scopeProofRequest,
+        requestedScopes: scopedGrant,
+      }
+      const scopedEvidence = {
+        ...scopeEvidence,
+        requestedScopes: scopedGrant,
+        grantedScopes: scopedGrant,
+      }
+      const scopedConfiguration = {
+        ...grantConfiguration,
+        requestedScopes: scopedGrant,
+        grantedScopes: scopedGrant,
+      }
+      const savepoint = `missing_${missingScope.toLowerCase()}`
+      await client.query(`SAVEPOINT ${savepoint}`)
+      await client.query('SET LOCAL session_replication_role = replica')
+      await client.query(
+        `UPDATE operations_integration_accounts
+         SET configuration = $3::jsonb
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [organizationId, accountId, JSON.stringify(scopedConfiguration)],
+      )
+      await client.query(
+        `UPDATE operations_commerce_provider_attempts
+         SET request_hash =
+               operations_faire_provider_write_request_hash($3::jsonb),
+             redacted_request = $3::jsonb,
+             redacted_response = $4::jsonb
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [
+          organizationId,
+          proof.id,
+          JSON.stringify(scopedRequest),
+          JSON.stringify(scopedEvidence),
+        ],
+      )
+      await client.query(
+        `UPDATE operations_faire_provider_write_scope_evidence
+         SET verified_write_scopes = $3::text[],
+             redacted_evidence = $4::jsonb,
+             evidence_hash =
+               operations_faire_provider_write_request_hash($4::jsonb)
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [
+          organizationId,
+          evidence.rows[0].id,
+          scopedWriteGrant,
+          JSON.stringify(scopedEvidence),
+        ],
+      )
+      await client.query('SET LOCAL session_replication_role = origin')
+      const scopedCapabilities = await client.query(
+        `SELECT
+           operations_faire_provider_write_scope_evidence_is_current(
+             $1::uuid, $2::uuid, $3::uuid, 1
+           ) AS evidence_current,
+           operations_faire_provider_write_scope_evidence_is_current(
+             $1::uuid, $2::uuid, $3::uuid, 1
+           )
+           AND evidence.verified_write_scopes @>
+             ARRAY['WRITE_PRODUCTS']::text[] AS write_products,
+           operations_faire_fulfillment_scope_evidence_is_current(
+             $1::uuid, $3::uuid, 1
+           ) AS write_orders
+         FROM operations_faire_provider_write_scope_evidence evidence
+         WHERE evidence.organization_id = $1::uuid
+           AND evidence.id = $2::uuid`,
+        [organizationId, evidence.rows[0].id, accountId],
+      )
+      assert.deepEqual(scopedCapabilities.rows[0], {
+        evidence_current: true,
+        write_products: expectedProductWrite,
+        write_orders: expectedOrderWrite,
+      })
+      await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`)
+      await client.query(`RELEASE SAVEPOINT ${savepoint}`)
+    }
+    await verifyMissingGrantScope('WRITE_PRODUCTS', false, true)
+    await verifyMissingGrantScope('WRITE_ORDERS', true, false)
+
+    await client.query('SAVEPOINT brand_token_is_not_current')
+    await client.query('SET LOCAL session_replication_role = replica')
+    await client.query(
+      `UPDATE operations_commerce_credentials
+       SET auth_mode = 'faire_brand_token'
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [organizationId, accountId],
+    )
+    await client.query('SET LOCAL session_replication_role = origin')
+    const brandTokenGate = await client.query(
+      `SELECT operations_faire_provider_write_scope_evidence_is_current(
+         $1::uuid, $2::uuid, $3::uuid, 1
+       ) AS current`,
+      [organizationId, evidence.rows[0].id, accountId],
+    )
+    assert.equal(brandTokenGate.rows[0].current, false)
+    await client.query('ROLLBACK TO SAVEPOINT brand_token_is_not_current')
+    await client.query('RELEASE SAVEPOINT brand_token_is_not_current')
     await client.query('COMMIT')
     return {
       organizationId,
@@ -489,8 +730,7 @@ async function seedFixture(pool) {
       scopeEvidenceGlobalId: evidence.rows[0].global_id,
       scopeEvidenceId: evidence.rows[0].id,
       scopeProofAttemptGlobalId: proof.global_id,
-      scopeProofProviderReference: 'faire-oauth-scope-proof-acceptance',
-      scopeProofObservedAt: new Date(proof.completed_at).toISOString(),
+      scopeProofProviderReference: credentialFingerprintSha256,
     }
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {})
@@ -498,90 +738,6 @@ async function seedFixture(pool) {
   } finally {
     client.release()
   }
-}
-
-function disposableScopeProofConfiguration(fixture, observedAt) {
-  return {
-    grantedScopes: ['WRITE_PRODUCTS'],
-    scopeVerification: 'oauth_grant',
-    scopeProofAttemptGlobalId: fixture.scopeProofAttemptGlobalId,
-    scopeProofProviderReference: fixture.scopeProofProviderReference,
-    lastScopeVerifiedAt: observedAt,
-    testOnlyDisposableProofShim: true,
-  }
-}
-
-async function setDisposableScopeProofConfiguration(
-  pool,
-  fixture,
-  observedAt = fixture.scopeProofObservedAt,
-) {
-  await pool.query(
-    `UPDATE operations_integration_accounts
-     SET configuration = $3::jsonb,
-         updated_at = clock_timestamp()
-     WHERE organization_id = $1::uuid
-       AND id = $2::uuid`,
-    [
-      fixture.organizationId,
-      fixture.accountId,
-      JSON.stringify(disposableScopeProofConfiguration(fixture, observedAt)),
-    ],
-  )
-}
-
-async function installDisposableScopeProofShim(pool, fixture) {
-  await setDisposableScopeProofConfiguration(pool, fixture)
-  await pool.query(`
-    CREATE OR REPLACE FUNCTION
-      operations_faire_provider_write_scope_evidence_is_current(
-        requested_organization_id uuid,
-        requested_evidence_id uuid,
-        requested_integration_account_id uuid,
-        requested_credential_generation integer
-      )
-    RETURNS boolean
-    LANGUAGE sql
-    STABLE
-    AS $proof_shim$
-      SELECT EXISTS (
-        SELECT 1
-        FROM operations_faire_provider_write_scope_evidence evidence
-        JOIN operations_integration_accounts account
-          ON account.organization_id = evidence.organization_id
-         AND account.id = evidence.integration_account_id
-        JOIN operations_commerce_provider_attempts attempt
-          ON attempt.organization_id = evidence.organization_id
-         AND attempt.id = evidence.provider_attempt_id
-        WHERE evidence.organization_id = requested_organization_id
-          AND evidence.id = requested_evidence_id
-          AND evidence.integration_account_id = requested_integration_account_id
-          AND evidence.credential_generation = requested_credential_generation
-          AND evidence.verification_source = 'oauth_grant'
-          AND evidence.verified_write_scopes = ARRAY['WRITE_PRODUCTS']::text[]
-          AND evidence.observed_at >= statement_timestamp() - interval '15 minutes'
-          AND evidence.evidence_hash =
-            operations_faire_provider_write_request_hash(
-              evidence.redacted_evidence
-            )
-          AND account.configuration->'grantedScopes' =
-            '["WRITE_PRODUCTS"]'::jsonb
-          AND account.configuration->>'scopeVerification' = 'oauth_grant'
-          AND account.configuration->>'scopeProofAttemptGlobalId' =
-            attempt.global_id
-          AND account.configuration->>'scopeProofProviderReference' =
-            evidence.provider_reference
-          AND (account.configuration->>'lastScopeVerifiedAt')::timestamptz =
-            evidence.observed_at
-          AND account.configuration->>'testOnlyDisposableProofShim' = 'true'
-          AND attempt.action = 'faire.oauth.scopes.verify'
-          AND attempt.state = 'succeeded'
-          AND attempt.completed_at = evidence.observed_at
-          AND attempt.provider_reference = evidence.provider_reference
-          AND attempt.redacted_response = evidence.redacted_evidence
-      )
-    $proof_shim$;
-  `)
 }
 
 async function verifyAuthorization(pool) {
@@ -593,13 +749,6 @@ async function verifyAuthorization(pool) {
     actorEmail,
     lifetimeSeconds: 300,
   }
-
-  await expectAuthorizationCode(
-    faireAuthorization.authorizeAndPrepareFaireProviderWriteInPostgres(
-      authorizeInput,
-    ),
-    'FAIRE_PROVIDER_WRITE_AUTHORIZATION_UNAVAILABLE',
-  )
 
   const secretChecks = await pool.query(
     `SELECT
@@ -634,20 +783,13 @@ async function verifyAuthorization(pool) {
     redacted_request: true,
   })
 
-  await installDisposableScopeProofShim(pool, fixture)
-
-  await setDisposableScopeProofConfiguration(
-    pool,
-    fixture,
-    new Date(Date.now() - 16 * 60 * 1000).toISOString(),
+  const staleGenerationGate = await pool.query(
+    `SELECT operations_faire_provider_write_scope_evidence_is_current(
+       $1::uuid, $2::uuid, $3::uuid, 2
+     ) AS current`,
+    [fixture.organizationId, fixture.scopeEvidenceId, fixture.accountId],
   )
-  await expectAuthorizationCode(
-    faireAuthorization.authorizeAndPrepareFaireProviderWriteInPostgres(
-      authorizeInput,
-    ),
-    'FAIRE_PROVIDER_WRITE_AUTHORIZATION_UNAVAILABLE',
-  )
-  await setDisposableScopeProofConfiguration(pool, fixture)
+  assert.equal(staleGenerationGate.rows[0].current, false)
 
   await pool.query(
     `UPDATE operations_commerce_credentials

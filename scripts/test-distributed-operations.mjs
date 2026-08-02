@@ -3070,6 +3070,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
       },
     })
     const currency = loadTypeScriptModule('app_src/lib/currency.ts')
+    const commerceFulfillmentRecoveryPolicy = loadTypeScriptModule(
+      'app_src/lib/commerceFulfillmentRecoveryPolicy.ts',
+    )
     const canonicalFulfillmentPlanning = loadTypeScriptModule(
       'app_src/lib/operations/canonicalFulfillmentPlanning.ts',
       { mocks: { '../currency.ts': currency } },
@@ -3155,6 +3158,8 @@ async function verifyPostgresAcceptance(databaseUrl) {
             )
           },
         },
+        '@/lib/commerceFulfillmentRecoveryPolicy':
+          commerceFulfillmentRecoveryPolicy,
         '@/lib/operations/adapters': adapters,
         '@/lib/operations/canonicalFulfillmentPlanning':
           canonicalFulfillmentPlanning,

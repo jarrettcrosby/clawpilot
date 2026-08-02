@@ -12,6 +12,10 @@ import {
   prepareCurrentFaireFulfillmentAuthority,
 } from '@/lib/integrations/faireFulfillmentRuntime'
 import {
+  commerceFulfillmentRecoveryMode,
+  faireFulfillmentErrorAllowsAutomaticReconciliation,
+} from '@/lib/commerceFulfillmentRecoveryPolicy'
+import {
   consumeSandboxCommerceE2eAuthorization,
   readActiveSandboxCommerceE2eAuthorizationForOrderInPostgres,
   requireActiveSandboxCommerceE2eAuthorization,
@@ -12582,7 +12586,7 @@ function requireFaireFulfillmentAttemptRequestHash(
 
 async function registerShopifyFulfillmentProviderAttempt(input: {
   organizationId: string
-  actorEmail: string
+  actorEmail: string | null
   commerceExportGlobalId: string
   integrationAccountId: string
   exportIdempotencyKey: string
@@ -12691,7 +12695,7 @@ async function registerShopifyFulfillmentProviderAttempt(input: {
 
 async function registerFaireFulfillmentProviderAttempt(input: {
   organizationId: string
-  actorEmail: string
+  actorEmail: string | null
   commerceExportGlobalId: string
   integrationAccountId: string
   exportIdempotencyKey: string
@@ -12787,12 +12791,18 @@ async function registerFaireFulfillmentProviderAttempt(input: {
   })
 }
 
-async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
+export async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
   organizationId: string
-  actorEmail: string
+  actorEmail: string | null
   commerceExportGlobalId: string
   reason: string
   auditEventKey: string
+  preclaimed?: {
+    attempt: number
+    priorState: 'queued' | 'processing' | 'failed'
+    priorErrorCode: string | null
+    workerId: string
+  }
 }): Promise<OperationsCommerceFulfillmentRetryResult> {
   const claimed = await withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
@@ -12863,6 +12873,8 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
       return { row, decision, terminal: true as const }
     }
     if (
+      !input.preclaimed
+      &&
       row.state === 'processing'
       && Date.now() - row.updated_at.getTime() < 5 * 60_000
     ) {
@@ -12881,95 +12893,86 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
       exportSnapshot.providerWriteProtocol
       === FAIRE_FULFILLMENT_PROVIDER_WRITE_PROTOCOL
     )
-    let recoveryMode: 'execute' | 'reconcile_only' = 'execute'
-    if (row.provider === 'shopify') {
-      if (
-        row.provider_attempt_global_id
-        || (
-          row.state === 'processing'
-          && !usesSafeShopifyAttemptProtocol
-        )
-        || (
-          row.state === 'failed'
-          && (
-            row.error_code ===
-              'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
-            || !usesSafeShopifyAttemptProtocol
-          )
-        )
-      ) {
-        recoveryMode = 'reconcile_only'
-      }
-    } else if (row.provider === 'faire') {
-      if (
-        row.provider_attempt_global_id
-        || !usesSafeFaireAttemptProtocol
-        || row.state === 'processing'
-        || (
-          row.state === 'failed'
-          && row.error_code ===
-            'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
-        )
-      ) {
-        recoveryMode = 'reconcile_only'
-      }
-    } else if (
-      row.state === 'processing'
-      || (
-        row.state === 'failed'
-        && row.error_code ===
-          'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
-      )
-    ) {
-      recoveryMode = 'reconcile_only'
-    }
-    const updated = await client.query<CommerceFulfillmentExportExecutionRow>(
-      `UPDATE operations_commerce_fulfillment_exports
-       SET state = 'processing', attempts = attempts + 1,
-           provider_reference = NULL, error_code = NULL, error_message = NULL,
-           completed_at = NULL, updated_at = now()
-       WHERE organization_id = $1::uuid
-         AND global_id = $2
-         AND attempts = $3
-         AND state = $4
-       RETURNING global_id, provider, state, external_order_id,
-                 payload_snapshot, idempotency_key, attempts,
-                 provider_reference, error_code, error_message, updated_at,
-                 NULL::text AS integration_account_id,
-                 NULL::text AS account_global_id,
-                 NULL::text AS provider_attempt_id,
-                 NULL::text AS provider_attempt_global_id,
-                 NULL::text AS provider_attempt_state,
-                 NULL::integer AS provider_attempt_number,
-                 NULL::text AS provider_attempt_request_hash,
-                 NULL::jsonb AS provider_attempt_request`,
-      [
-        input.organizationId,
-        input.commerceExportGlobalId,
-        row.attempts,
-        row.state,
-      ],
+    const priorState: 'queued' | 'processing' | 'failed' = (
+      input.preclaimed?.priorState
+      || (row.state === 'processing' || row.state === 'failed'
+        ? row.state
+        : 'queued')
     )
-    if (updated.rowCount !== 1) {
-      throw new OperationsRequestError(
-        'OPERATIONS_COMMERCE_EXPORT_CHANGED',
-        'Commerce fulfillment export changed before it could be retried',
-        409,
+    const priorErrorCode = input.preclaimed
+      ? input.preclaimed.priorErrorCode
+      : row.error_code
+    const recoveryMode = commerceFulfillmentRecoveryMode({
+      provider: row.provider,
+      priorState,
+      priorErrorCode,
+      hasProviderAttempt: Boolean(row.provider_attempt_global_id),
+      usesSafeShopifyAttemptProtocol,
+      usesSafeFaireAttemptProtocol,
+    })
+    let claimedRow: CommerceFulfillmentExportExecutionRow
+    if (input.preclaimed) {
+      if (
+        row.state !== 'processing'
+        || row.attempts !== input.preclaimed.attempt
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_COMMERCE_EXPORT_CHANGED',
+          'Commerce fulfillment export changed after the recovery worker claim',
+          409,
+        )
+      }
+      claimedRow = row
+    } else {
+      const updated = await client.query<CommerceFulfillmentExportExecutionRow>(
+        `UPDATE operations_commerce_fulfillment_exports
+         SET state = 'processing', attempts = attempts + 1,
+             provider_reference = NULL, error_code = NULL, error_message = NULL,
+             completed_at = NULL, updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND global_id = $2
+           AND attempts = $3
+           AND state = $4
+         RETURNING global_id, provider, state, external_order_id,
+                   payload_snapshot, idempotency_key, attempts,
+                   provider_reference, error_code, error_message, updated_at,
+                   NULL::text AS integration_account_id,
+                   NULL::text AS account_global_id,
+                   NULL::text AS provider_attempt_id,
+                   NULL::text AS provider_attempt_global_id,
+                   NULL::text AS provider_attempt_state,
+                   NULL::integer AS provider_attempt_number,
+                   NULL::text AS provider_attempt_request_hash,
+                   NULL::jsonb AS provider_attempt_request`,
+        [
+          input.organizationId,
+          input.commerceExportGlobalId,
+          row.attempts,
+          row.state,
+        ],
       )
-    }
-    const claimedRow = {
-      ...updated.rows[0],
-      integration_account_id: row.integration_account_id,
-      account_global_id: row.account_global_id,
-      provider_attempt_id: row.provider_attempt_id,
-      provider_attempt_global_id: row.provider_attempt_global_id,
-      provider_attempt_state: row.provider_attempt_state,
-      provider_attempt_number: row.provider_attempt_number,
-      provider_attempt_request_hash: row.provider_attempt_request_hash,
-      provider_attempt_request: row.provider_attempt_request,
+      if (updated.rowCount !== 1) {
+        throw new OperationsRequestError(
+          'OPERATIONS_COMMERCE_EXPORT_CHANGED',
+          'Commerce fulfillment export changed before it could be retried',
+          409,
+        )
+      }
+      claimedRow = {
+        ...updated.rows[0],
+        integration_account_id: row.integration_account_id,
+        account_global_id: row.account_global_id,
+        provider_attempt_id: row.provider_attempt_id,
+        provider_attempt_global_id: row.provider_attempt_global_id,
+        provider_attempt_state: row.provider_attempt_state,
+        provider_attempt_number: row.provider_attempt_number,
+        provider_attempt_request_hash: row.provider_attempt_request_hash,
+        provider_attempt_request: row.provider_attempt_request,
+      }
     }
     await recordAuditEvent({
-      actor: input.actorEmail,
+      actor: input.preclaimed ? 'system' : input.actorEmail,
+      isSystem: Boolean(input.preclaimed),
       eventType: 'operations.commerce_fulfillment.attempted',
       aggregateType: 'operations.commerce_fulfillment_export',
       aggregateId: row.global_id,
@@ -12979,9 +12982,11 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
       payload: {
         provider: row.provider,
         attempt: claimedRow.attempts,
-        priorState: row.state,
+        priorState,
         recoveryMode,
         reason: input.reason,
+        recoveryWorkerId: input.preclaimed?.workerId || null,
+        originalConfirmer: input.preclaimed ? input.actorEmail : null,
         customerNotification: decision,
       },
     }, client)
@@ -13265,6 +13270,10 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
       && 'code' in error
       && error.code === 'OPERATIONS_FAIRE_FULFILLMENT_SIGNATURE_INVALID'
     )
+    const faireRecoveryErrorIsRetryable = (
+      claimed.row.provider === 'faire'
+      && faireFulfillmentErrorAllowsAutomaticReconciliation(error)
+    )
     const providerOutcomeUnknown = (
       (
         claimed.row.provider === 'shopify'
@@ -13283,6 +13292,7 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
       || (
         claimed.row.provider === 'faire'
         && !faireAttemptIntegrityFailure
+        && faireRecoveryErrorIsRetryable
         && (
           Boolean(registeredProviderAttempt)
           || Boolean(claimed.row.provider_attempt_global_id)
@@ -13374,7 +13384,8 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
       )
     }
     await recordAuditEvent({
-      actor: input.actorEmail,
+      actor: input.preclaimed ? 'system' : input.actorEmail,
+      isSystem: Boolean(input.preclaimed),
       eventType: `operations.commerce_fulfillment.${state}`,
       aggregateType: 'operations.commerce_fulfillment_export',
       aggregateId: input.commerceExportGlobalId,
@@ -13396,6 +13407,7 @@ async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
         providerAttemptRequestHash:
           providerAttemptToFinalize?.requestHash
           || null,
+        originalConfirmer: input.preclaimed ? input.actorEmail : null,
       },
     }, client)
   })

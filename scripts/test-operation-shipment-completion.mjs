@@ -675,6 +675,9 @@ async function verifyShipmentCompletion(databaseUrl) {
       },
     )
     const domain = loadTypeScriptModule('app_src/lib/operations/domain.ts')
+    const commerceFulfillmentRecoveryPolicy = loadTypeScriptModule(
+      'app_src/lib/commerceFulfillmentRecoveryPolicy.ts',
+    )
     const adapters = loadTypeScriptModule('app_src/lib/operations/adapters.ts', {
       mocks: { '@/lib/operations/domain': domain },
     })
@@ -810,6 +813,8 @@ async function verifyShipmentCompletion(databaseUrl) {
             }
           },
         },
+        '@/lib/commerceFulfillmentRecoveryPolicy':
+          commerceFulfillmentRecoveryPolicy,
         '@/lib/operations/adapters': adapters,
         '@/lib/operations/canonicalFulfillmentPlanning':
           canonicalPlanning,
@@ -839,6 +844,15 @@ async function verifyShipmentCompletion(databaseUrl) {
         '@/lib/persistence/shopifyCheckoutRating': shopifyCheckoutRating,
       },
     })
+    const commerceFulfillmentRecovery = loadTypeScriptModule(
+      'app_src/lib/persistence/commerceFulfillmentRecovery.ts',
+      {
+        mocks: {
+          '@/lib/auditWriter': auditWriter,
+          '@/lib/persistence/postgres': postgres,
+        },
+      },
+    )
     assert.equal(
       typeof persistence.confirmOperationsOrderShipmentFromPostgres,
       'function',
@@ -1710,6 +1724,263 @@ async function verifyShipmentCompletion(databaseUrl) {
     assert.equal(replayedAuthorization.state, 'consumed')
     assert.equal(replayedAuthorization.consumedAt, consumedAuthorization.consumedAt)
 
+    const cappedProcessingExport = await pool.query(
+      `INSERT INTO operations_commerce_fulfillment_exports (
+         organization_id, order_id, shipment_id, provider, external_order_id,
+         state, attempts, payload_snapshot, idempotency_key, updated_at
+       )
+       SELECT organization_id, order_id, shipment_id, provider, external_order_id,
+              'processing', 8, payload_snapshot,
+              idempotency_key || ':capped-processing-recovery',
+              now() - interval '6 minutes'
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2
+       RETURNING global_id`,
+      [authorizedFixture.organizationId, authorizedResult.commerceExportGlobalId],
+    )
+    const cappedUnknownExport = await pool.query(
+      `INSERT INTO operations_commerce_fulfillment_exports (
+         organization_id, order_id, shipment_id, provider, external_order_id,
+         state, attempts, payload_snapshot, idempotency_key,
+         error_code, error_message, completed_at
+       )
+       SELECT organization_id, order_id, shipment_id, provider, external_order_id,
+              'failed', 8, payload_snapshot,
+              idempotency_key || ':capped-unknown-recovery',
+              'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED',
+              'Unresolved acceptance outcome', now()
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2
+       RETURNING global_id`,
+      [authorizedFixture.organizationId, authorizedResult.commerceExportGlobalId],
+    )
+    assert.equal(cappedProcessingExport.rowCount, 1)
+    assert.equal(cappedUnknownExport.rowCount, 1)
+    const exhaustedCount = await commerceFulfillmentRecovery
+      .finalizeExhaustedCommerceFulfillmentRecoveriesInPostgres({
+        workerId: 'shipment-completion-acceptance',
+        limit: 5,
+      })
+    assert.equal(exhaustedCount, 2)
+    const exhaustedEvidence = await pool.query(
+      `SELECT global_id, state, attempts, error_code,
+              completed_at IS NOT NULL AS completed
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid
+         AND global_id = ANY($2::text[])
+       ORDER BY global_id`,
+      [
+        authorizedFixture.organizationId,
+        [
+          cappedProcessingExport.rows[0].global_id,
+          cappedUnknownExport.rows[0].global_id,
+        ],
+      ],
+    )
+    assert.equal(exhaustedEvidence.rowCount, 2)
+    assert.ok(exhaustedEvidence.rows.every((row) => (
+      row.state === 'failed'
+      && row.attempts === 8
+      && row.error_code ===
+        'OPERATIONS_COMMERCE_EXPORT_AUTOMATIC_RECOVERY_EXHAUSTED'
+      && row.completed === true
+    )))
+    const exhaustionAudits = await pool.query(
+      `SELECT aggregate_id, payload
+       FROM audit_events
+       WHERE organization_id = $1::uuid
+         AND event_type =
+           'operations.commerce_fulfillment.recovery_exhausted'
+       ORDER BY aggregate_id`,
+      [authorizedFixture.organizationId],
+    )
+    assert.equal(exhaustionAudits.rowCount, 2)
+    assert.ok(exhaustionAudits.rows.every((row) => (
+      row.payload.managerRecoveryRequired === true
+      && row.payload.providerIo === false
+    )))
+
+    const fairePreDispatchCrashExport = await pool.query(
+      `INSERT INTO operations_commerce_fulfillment_exports (
+         organization_id, order_id, shipment_id, provider, external_order_id,
+         state, attempts, payload_snapshot, idempotency_key, updated_at
+       )
+       SELECT organization_id, order_id, shipment_id, 'faire',
+              'bo_faire_predispatch_crash_acceptance', 'processing', 1,
+              jsonb_set(
+                jsonb_set(
+                  fulfillment_export.payload_snapshot,
+                  '{providerWriteProtocol}',
+                  '"faire-fulfillment-attempt-v1"'::jsonb,
+                  true
+                ),
+                '{packages}',
+                (
+                  SELECT jsonb_agg(jsonb_build_object(
+                    'packageReference', package.global_id,
+                    'carrier', label.carrier,
+                    'trackingCode', shipment.tracking_number
+                  ) ORDER BY package.global_id)
+                  FROM operations_shipments shipment
+                  JOIN operations_packages package
+                    ON package.organization_id = shipment.organization_id
+                   AND package.id = shipment.package_id
+                  JOIN operations_labels label
+                    ON label.organization_id = shipment.organization_id
+                   AND label.id = shipment.label_id
+                  WHERE shipment.organization_id =
+                    fulfillment_export.organization_id
+                    AND shipment.order_id = fulfillment_export.order_id
+                ),
+                true
+              ),
+              fulfillment_export.idempotency_key
+                || ':faire-predispatch-crash-recovery',
+              now() - interval '6 minutes'
+       FROM operations_commerce_fulfillment_exports fulfillment_export
+       WHERE fulfillment_export.organization_id = $1::uuid
+         AND fulfillment_export.global_id = $2
+       RETURNING global_id`,
+      [authorizedFixture.organizationId, authorizedResult.commerceExportGlobalId],
+    )
+    assert.equal(fairePreDispatchCrashExport.rowCount, 1)
+    const faireCrashClaim = await commerceFulfillmentRecovery
+      .claimCommerceFulfillmentRecoveryInPostgres({
+        workerId: 'shipment-completion-acceptance',
+      })
+    assert.equal(
+      faireCrashClaim.commerceExportGlobalId,
+      fairePreDispatchCrashExport.rows[0].global_id,
+    )
+    assert.equal(faireCrashClaim.priorState, 'processing')
+    assert.equal(faireCrashClaim.attempt, 2)
+    const faireExecutionsBeforeCrashRecovery = faireFulfillmentExecutionCalls
+    const faireCrashRecovery = await persistence
+      .executeOperationsCommerceFulfillmentExportFromPostgres({
+        organizationId: faireCrashClaim.organizationId,
+        actorEmail: faireCrashClaim.actorEmail,
+        commerceExportGlobalId: faireCrashClaim.commerceExportGlobalId,
+        reason: 'Resume the exact-v1 pre-dispatch Faire crash safely',
+        auditEventKey: (
+          `shipment-completion-faire-crash-recovery:`
+          + faireCrashClaim.commerceExportGlobalId
+        ),
+        preclaimed: {
+          attempt: faireCrashClaim.attempt,
+          priorState: faireCrashClaim.priorState,
+          priorErrorCode: faireCrashClaim.priorErrorCode,
+          workerId: 'shipment-completion-acceptance',
+        },
+      })
+    assert.equal(
+      faireCrashRecovery.state,
+      'succeeded',
+      JSON.stringify(faireCrashRecovery),
+    )
+    assert.equal(
+      faireFulfillmentExecutionCalls,
+      faireExecutionsBeforeCrashRecovery + 1,
+    )
+    assert.equal(
+      faireFulfillmentInputs.at(-1).mode,
+      'execute',
+      'No durable provider attempt proves the pre-dispatch crash can execute',
+    )
+    const faireCrashAttempts = await pool.query(
+      `SELECT state, attempt_number
+       FROM operations_commerce_provider_attempts
+       WHERE organization_id = $1::uuid
+         AND external_object_id = $2
+         AND action = 'faire.fulfillment.shipments.create'`,
+      [
+        authorizedFixture.organizationId,
+        fairePreDispatchCrashExport.rows[0].global_id,
+      ],
+    )
+    assert.deepEqual(faireCrashAttempts.rows, [{
+      state: 'succeeded',
+      attempt_number: 2,
+    }])
+
+    await pool.query(
+      `UPDATE operations_shipments shipment
+       SET confirmed_by = NULL
+       FROM operations_commerce_fulfillment_exports fulfillment_export
+       WHERE fulfillment_export.organization_id = $1::uuid
+         AND fulfillment_export.global_id = $2
+         AND shipment.organization_id = fulfillment_export.organization_id
+         AND shipment.id = fulfillment_export.shipment_id`,
+      [authorizedFixture.organizationId, authorizedResult.commerceExportGlobalId],
+    )
+    const deletedConfirmerExport = await pool.query(
+      `INSERT INTO operations_commerce_fulfillment_exports (
+         organization_id, order_id, shipment_id, provider, external_order_id,
+         state, attempts, payload_snapshot, idempotency_key,
+         requested_at, updated_at
+       )
+       SELECT organization_id, order_id, shipment_id, provider, external_order_id,
+              'queued', 0, payload_snapshot,
+              idempotency_key || ':deleted-confirmer-recovery',
+              now() - interval '1 minute', now() - interval '1 minute'
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2
+       RETURNING global_id`,
+      [authorizedFixture.organizationId, authorizedResult.commerceExportGlobalId],
+    )
+    assert.equal(deletedConfirmerExport.rowCount, 1)
+    const deletedConfirmerClaim = await commerceFulfillmentRecovery
+      .claimCommerceFulfillmentRecoveryInPostgres({
+        workerId: 'shipment-completion-acceptance',
+      })
+    assert.equal(
+      deletedConfirmerClaim.commerceExportGlobalId,
+      deletedConfirmerExport.rows[0].global_id,
+    )
+    assert.equal(deletedConfirmerClaim.actorEmail, null)
+    const deletedConfirmerRecovery = await persistence
+      .executeOperationsCommerceFulfillmentExportFromPostgres({
+        organizationId: deletedConfirmerClaim.organizationId,
+        actorEmail: deletedConfirmerClaim.actorEmail,
+        commerceExportGlobalId: deletedConfirmerClaim.commerceExportGlobalId,
+        reason: 'Continue after original shipment confirmer deletion',
+        auditEventKey: (
+          `shipment-completion-deleted-confirmer:`
+          + deletedConfirmerClaim.commerceExportGlobalId
+        ),
+        preclaimed: {
+          attempt: deletedConfirmerClaim.attempt,
+          priorState: deletedConfirmerClaim.priorState,
+          priorErrorCode: deletedConfirmerClaim.priorErrorCode,
+          workerId: 'shipment-completion-acceptance',
+        },
+      })
+    assert.equal(deletedConfirmerRecovery.state, 'succeeded')
+    const deletedConfirmerEvidence = await pool.query(
+      `SELECT attempt.created_by, audit.actor, audit.is_system,
+              audit.payload
+       FROM operations_commerce_provider_attempts attempt
+       JOIN audit_events audit
+         ON audit.organization_id = attempt.organization_id
+        AND audit.aggregate_id = attempt.external_object_id
+        AND audit.event_type =
+          'operations.commerce_fulfillment.attempted'
+       WHERE attempt.organization_id = $1::uuid
+         AND attempt.external_object_id = $2
+         AND attempt.action = 'shopify.fulfillment.create'`,
+      [
+        authorizedFixture.organizationId,
+        deletedConfirmerExport.rows[0].global_id,
+      ],
+    )
+    assert.equal(deletedConfirmerEvidence.rowCount, 1)
+    assert.equal(deletedConfirmerEvidence.rows[0].created_by, null)
+    assert.equal(deletedConfirmerEvidence.rows[0].actor, 'system')
+    assert.equal(deletedConfirmerEvidence.rows[0].is_system, true)
+    assert.equal(
+      deletedConfirmerEvidence.rows[0].payload.originalConfirmer,
+      null,
+    )
+
     const interleavedShopifyExport = await pool.query(
       `INSERT INTO operations_commerce_fulfillment_exports (
          organization_id, order_id, shipment_id, provider, external_order_id,
@@ -2043,7 +2314,7 @@ async function main() {
     'retryOperationsCommerceFulfillmentExportFromPostgres',
     "commandType: 'retry_operations_commerce_fulfillment_export'",
     "AND attempts = $7",
-    "let recoveryMode: 'execute' | 'reconcile_only'",
+    'commerceFulfillmentRecoveryMode({',
     'registerShopifyFulfillmentProviderAttempt',
     'registerFaireFulfillmentProviderAttempt',
     'operations_commerce_provider_attempts',

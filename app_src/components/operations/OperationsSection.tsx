@@ -104,6 +104,9 @@ type OperationsPayload = {
   error?: string
   code?: string
   operations?: OperationsWorkspace
+  runtime?: {
+    commerceFulfillmentRecoveryEnabled: boolean
+  }
   result?:
     | OperationsExceptionUpdateResult
     | OperationsActivationUpdateResult
@@ -163,6 +166,23 @@ const ACTIVATION_OPTIONS: Array<{ value: OperationsActivationState; label: strin
 ]
 
 const CARTONIZATION_EVIDENCE_GLOBAL_ID = /^gcte(?:[0-9]{7}|[0-9a-v]{12})$/
+const COMMERCE_FULFILLMENT_RECONCILIATION_REQUIRED =
+  'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
+const COMMERCE_FULFILLMENT_AUTOMATIC_ATTEMPT_LIMIT = 8
+
+function isCommerceFulfillmentReconciliationPending(input: {
+  provider: string
+  state: string
+  errorCode: string | null
+  attempts: number
+  recoveryRuntimeEnabled: boolean
+}) {
+  return input.recoveryRuntimeEnabled
+    && (input.provider === 'shopify' || input.provider === 'faire')
+    && input.state === 'failed'
+    && input.errorCode === COMMERCE_FULFILLMENT_RECONCILIATION_REQUIRED
+    && input.attempts < COMMERCE_FULFILLMENT_AUTOMATIC_ATTEMPT_LIMIT
+}
 
 type CommerceActiveAccountOption = {
   accountGlobalId: string
@@ -737,6 +757,7 @@ function ShadowFulfillmentPreparationPanel({
 function OrderDetailDrawer({
   order,
   sandboxCarrierAccounts,
+  commerceFulfillmentRecoveryEnabled,
   activationState,
   canExecute,
   canAuthorizeSandboxE2e,
@@ -760,6 +781,7 @@ function OrderDetailDrawer({
 }: {
   order: OperationsOrderDetail | null
   sandboxCarrierAccounts: OperationsWorkspace['shipping']['sandboxCarrierAccounts']
+  commerceFulfillmentRecoveryEnabled: boolean
   activationState: OperationsActivationState
   canExecute: boolean
   canAuthorizeSandboxE2e: boolean
@@ -774,7 +796,10 @@ function OrderDetailDrawer({
   onGeneratePackingSlip: (packageGlobalId: string) => void
   onPrintPackingSlip: (artifactGlobalId: string) => void
   onConfirmShipment: () => void
-  onRetryCommerceExport: (commerceExportGlobalId: string) => void
+  onRetryCommerceExport: (
+    commerceExportGlobalId: string,
+    reconciliationPending: boolean,
+  ) => void
   onAuthorizeSandboxE2e: () => void
   onCreateSandboxLabel: (packageGlobalId?: string) => void
   onVoidSandboxLabel: () => void
@@ -1643,9 +1668,18 @@ function OrderDetailDrawer({
                       <Box>
                         <Typography variant="caption" color="text.secondary">Commerce fulfillment export</Typography>
                         <Stack divider={<Divider flexItem />}>
-                          {commerceExports.map((fulfillmentExport) => (
-                            <Box
+                          {commerceExports.map((fulfillmentExport) => {
+                            const reconciliationPending =
+                              isCommerceFulfillmentReconciliationPending({
+                                ...fulfillmentExport,
+                                recoveryRuntimeEnabled:
+                                  commerceFulfillmentRecoveryEnabled,
+                              })
+                            return <Box
                               key={fulfillmentExport.globalId}
+                              data-testid={reconciliationPending
+                                ? 'commerce-fulfillment-reconciliation-pending'
+                                : undefined}
                               sx={{
                                 py: 1.25,
                                 display: 'grid',
@@ -1669,10 +1703,14 @@ function OrderDetailDrawer({
                                     : fulfillmentExport.customerNotification.notifyCustomer
                                       ? `Customer email enabled · ${displayStatus(fulfillmentExport.customerNotification.source)}`
                                       : `Customer email disabled · ${displayStatus(fulfillmentExport.customerNotification.source)}`}
-                                  {' '}· {fulfillmentExport.attempts} provider attempt{fulfillmentExport.attempts === 1 ? '' : 's'}
+                                  {' '}· {fulfillmentExport.attempts} processing attempt{fulfillmentExport.attempts === 1 ? '' : 's'}
                                 </Typography>
                                 {(fulfillmentExport.errorCode || fulfillmentExport.errorMessage) && (
-                                  <Typography variant="caption" color="error.main" display="block">
+                                  <Typography
+                                    variant="caption"
+                                    color={reconciliationPending ? 'warning.main' : 'error.main'}
+                                    display="block"
+                                  >
                                     {[fulfillmentExport.errorCode, fulfillmentExport.errorMessage]
                                       .filter(Boolean)
                                       .join(' · ')}
@@ -1682,8 +1720,12 @@ function OrderDetailDrawer({
                               <Stack spacing={0.75} alignItems="flex-end">
                                 <Chip
                                   size="small"
-                                  label={displayStatus(fulfillmentExport.state)}
-                                  color={fulfillmentExport.state === 'succeeded'
+                                  label={reconciliationPending
+                                    ? 'Reconciliation pending'
+                                    : displayStatus(fulfillmentExport.state)}
+                                  color={reconciliationPending
+                                    ? 'warning'
+                                    : fulfillmentExport.state === 'succeeded'
                                     ? 'success'
                                     : fulfillmentExport.state === 'failed'
                                       ? 'error'
@@ -1701,14 +1743,15 @@ function OrderDetailDrawer({
                                     disabled={busy || !canExecute}
                                     onClick={() => onRetryCommerceExport(
                                       fulfillmentExport.globalId,
+                                      reconciliationPending,
                                     )}
                                   >
-                                    Retry / reconcile
+                                    {reconciliationPending ? 'Check now' : 'Retry / reconcile'}
                                   </Button>
                                 ) : null}
                               </Stack>
                             </Box>
-                          ))}
+                          })}
                         </Stack>
                       </Box>
                     )}
@@ -1895,6 +1938,8 @@ export default function OperationsSection({
   const mobile = useMediaQuery(theme.breakpoints.down('md'))
   const dateTime = useUserDateTime()
   const [workspace, setWorkspace] = useState<OperationsWorkspace | null>(null)
+  const [commerceFulfillmentRecoveryEnabled, setCommerceFulfillmentRecoveryEnabled] =
+    useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -1978,6 +2023,8 @@ export default function OperationsSection({
   const [commerceExportRetryReason, setCommerceExportRetryReason] = useState(
     'Retry the same immutable commerce fulfillment export after operator review',
   )
+  const [commerceExportReconciliationPending, setCommerceExportReconciliationPending] =
+    useState(false)
   const [commerceExportRetryIdempotencyKey, setCommerceExportRetryIdempotencyKey] =
     useState('')
   const [retryingCommerceExport, setRetryingCommerceExport] = useState(false)
@@ -2028,6 +2075,9 @@ export default function OperationsSection({
       const payload = await response.json() as OperationsPayload
       if (!response.ok || !payload.operations) throw new Error(payload.error || 'Operations data is unavailable')
       setWorkspace(payload.operations)
+      setCommerceFulfillmentRecoveryEnabled(
+        payload.runtime?.commerceFulfillmentRecoveryEnabled === true,
+      )
     } catch (caught) {
       if (caught instanceof DOMException && caught.name === 'AbortError') return
       setError(caught instanceof Error ? caught.message : 'Operations data is unavailable')
@@ -2561,7 +2611,7 @@ export default function OperationsSection({
         ? `Commerce fulfillment export ${result.commerceExportGlobalId} succeeded.`
         : result.commerceExportState === 'unsupported'
           ? `Commerce fulfillment export ${result.commerceExportGlobalId} is unsupported for this provider.`
-          : `Commerce fulfillment export ${result.commerceExportGlobalId} failed and requires review.`
+          : `Commerce fulfillment export ${result.commerceExportGlobalId} did not complete immediately; its current status is shown below.`
       const printSummary = result.printWarning
         ? result.printWarning
         : result.printJobGlobalId
@@ -2581,11 +2631,17 @@ export default function OperationsSection({
     }
   }
 
-  const openCommerceExportRetry = (commerceExportGlobalId: string) => {
+  const openCommerceExportRetry = (
+    commerceExportGlobalId: string,
+    reconciliationPending: boolean,
+  ) => {
     setCommerceExportRetryGlobalId(commerceExportGlobalId)
     setCommerceExportRetryReason(
-      'Retry the same immutable commerce fulfillment export after operator review',
+      reconciliationPending
+        ? 'Check the same immutable commerce fulfillment export while safe reconciliation is pending'
+        : 'Retry the same immutable commerce fulfillment export after operator review',
     )
+    setCommerceExportReconciliationPending(reconciliationPending)
     setCommerceExportRetryIdempotencyKey(
       `operations-commerce-export-retry:${commerceExportGlobalId}:${crypto.randomUUID()}`,
     )
@@ -2597,6 +2653,7 @@ export default function OperationsSection({
     setCommerceExportRetryOpen(false)
     setCommerceExportRetryGlobalId('')
     setCommerceExportRetryIdempotencyKey('')
+    setCommerceExportReconciliationPending(false)
   }
 
   const retryCommerceExport = async (event: FormEvent) => {
@@ -2636,11 +2693,12 @@ export default function OperationsSection({
       setCommerceExportRetryOpen(false)
       setCommerceExportRetryGlobalId('')
       setCommerceExportRetryIdempotencyKey('')
-      setNotice(
-        `Commerce fulfillment export ${result.commerceExportGlobalId} finished with ${
+      setCommerceExportReconciliationPending(false)
+      setNotice(result.errorCode === COMMERCE_FULFILLMENT_RECONCILIATION_REQUIRED
+        ? `Reconciliation remains pending for commerce fulfillment export ${result.commerceExportGlobalId}; its current status is shown below. The original immutable notification decision was preserved.`
+        : `Commerce fulfillment export ${result.commerceExportGlobalId} finished with ${
           displayStatus(result.state)
-        }. The original immutable notification decision was preserved.`,
-      )
+        }. The original immutable notification decision was preserved.`)
       await loadWorkspace(detail.globalId)
     } catch (caught) {
       setError(caught instanceof Error
@@ -3523,6 +3581,7 @@ export default function OperationsSection({
       <OrderDetailDrawer
         order={detail}
         sandboxCarrierAccounts={workspace?.shipping?.sandboxCarrierAccounts || []}
+        commerceFulfillmentRecoveryEnabled={commerceFulfillmentRecoveryEnabled}
         activationState={workspace?.activation.state || 'disabled'}
         canExecute={Boolean(capabilities?.canManage && capabilities.canExecute)}
         canAuthorizeSandboxE2e={Boolean(
@@ -4348,23 +4407,31 @@ export default function OperationsSection({
         maxWidth="sm"
       >
         <Box component="form" onSubmit={retryCommerceExport}>
-          <DialogTitle>Retry commerce fulfillment export</DialogTitle>
+          <DialogTitle>
+            {commerceExportReconciliationPending
+              ? 'Check commerce fulfillment reconciliation'
+              : 'Retry commerce fulfillment export'}
+          </DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2}>
               <Alert severity="warning">
-                This retries export {commerceExportRetryGlobalId || 'evidence'} in place. It does
-                not create another shipment or export, and it reuses the immutable customer
-                notification decision captured at shipment confirmation. A recent processing
-                attempt must age out before it can be reclaimed safely. Once a durable Shopify
-                provider attempt exists, every retry is read-only and cannot send a second
-                fulfillment or customer notification.
+                {commerceExportReconciliationPending
+                  ? `Safe reconciliation is pending for export ${
+                    commerceExportRetryGlobalId || 'evidence'
+                  }. Checking it reuses the existing export and immutable customer-notification decision.`
+                  : `This retries export ${
+                    commerceExportRetryGlobalId || 'evidence'
+                  } in place after operator review. It does not create another shipment or export, and it reuses the immutable customer-notification decision captured at shipment confirmation.`}
+                {' '}A recent processing attempt must age out before it can be reclaimed safely.
+                Once a durable Shopify provider attempt exists, every check is read-only and
+                cannot send a second fulfillment or customer notification.
               </Alert>
               <TextField
                 required
                 autoFocus
                 multiline
                 minRows={3}
-                label="Retry reason"
+                label={commerceExportReconciliationPending ? 'Check reason' : 'Retry reason'}
                 value={commerceExportRetryReason}
                 onChange={(event) => setCommerceExportRetryReason(event.target.value)}
                 inputProps={{ maxLength: 500 }}
@@ -4387,7 +4454,11 @@ export default function OperationsSection({
                 ? <CircularProgress size={16} />
                 : <ReplayRounded />}
             >
-              {retryingCommerceExport ? 'Checking export' : 'Retry / reconcile export'}
+              {retryingCommerceExport
+                ? 'Checking export'
+                : commerceExportReconciliationPending
+                  ? 'Check now'
+                  : 'Retry / reconcile export'}
             </Button>
           </DialogActions>
         </Box>

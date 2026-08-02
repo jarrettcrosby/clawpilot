@@ -46,11 +46,11 @@ const ERROR_PATTERNS = [/⨯/, /Error:/, /error TS/, /TypeError/, /ReferenceErro
 const WINDOW_MS = 5 * 60 * 1000 // last 5 minutes
 const MAX_BYTES_TO_SCAN = 256 * 1024
 // SHA-256 over pg_proc.prosrc after removing full-line -- comments, collapsing
-// whitespace, and trimming. These pin the audited Faire fail-closed bodies.
+// whitespace, and trimming. These pin the audited Faire grant-evidence bodies.
 const FAIRE_SCOPE_CURRENT_PROSRC_SHA256 =
-  'a93f6fb2233dc30abe9e8db212692c61f1098b4c5e2f0e7c8801f600a06956c3'
+  'be9c9d5ce1442cf6c1df2aaffcf1dd075eeb24172fe1f7ec2e6d2002b98bea49'
 const FAIRE_SCOPE_TRIGGER_PROSRC_SHA256 =
-  'abc99a1fdfcef78542ab5df2ac3af8b2eef934f38d70780156e133a74b01e73d'
+  '022f71dfd366bf18bc263d8dcfee07d96e9c4e199f797c25b085403105906a03'
 
 function resolveLogPath(): { path: string; expectedDevLogPresent: boolean; usedFallback: boolean } {
   const expectedDevLogPresent = fs.existsSync(DEV_LOG_PATH)
@@ -384,6 +384,7 @@ export async function GET() {
           global_id_base32hex_allocator_applied: boolean
           faire_provider_write_auth_applied: boolean
           faire_fulfillment_authority_applied: boolean
+          operations_commerce_fulfillment_recovery_applied: boolean
           operations_commerce_product_image_imports_applied: boolean
           operations_commerce_product_image_fanout_applied: boolean
           operations_commerce_product_image_source_normalization_applied: boolean
@@ -1254,6 +1255,12 @@ export async function GET() {
                 WHERE filename =
                   '0220_operations_faire_provider_write_authorizations.sql'
               )
+              AND EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0228_operations_faire_oauth_grant_evidence.sql'
+              )
               AND to_regclass(
                 'operations_faire_provider_write_scope_evidence'
               ) IS NOT NULL
@@ -1275,6 +1282,12 @@ export async function GET() {
               AND to_regprocedure(
                 'operations_faire_provider_write_json_is_redacted(jsonb)'
               ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_oauth_scope_list_valid(text[])'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_oauth_scope_json_valid(jsonb)'
+              ) IS NOT NULL
               AND EXISTS (
                 SELECT 1
                 FROM pg_proc procedure
@@ -1284,19 +1297,6 @@ export async function GET() {
                   AND procedure.oid = to_regprocedure(
                     'operations_faire_provider_write_scope_evidence_is_current(uuid,uuid,uuid,integer)'
                   )::oid
-                  AND btrim(
-                    regexp_replace(
-                      regexp_replace(
-                        procedure.prosrc,
-                        E'(^|[\\n\\r])[[:blank:]]*--[^\\n\\r]*',
-                        ' ',
-                        'g'
-                      ),
-                      '[[:space:]]+',
-                      ' ',
-                      'g'
-                    )
-                  ) = 'SELECT false'
                   AND encode(
                     digest(
                       convert_to(
@@ -1358,9 +1358,28 @@ export async function GET() {
               AND to_regprocedure(
                 'protect_operations_faire_write_authorization()'
               ) IS NOT NULL
+              AND position(
+                'NOT NEW.verified_write_scopes <@ evidence_scopes'
+                IN pg_get_functiondef(
+                  to_regprocedure(
+                    'protect_operations_faire_write_authorization()'
+                  )::oid
+                )
+              ) > 0
+              AND to_regprocedure(
+                'validate_operations_faire_scope_evidence_insert()'
+              ) IS NOT NULL
               AND to_regprocedure(
                 'operations_faire_provider_write_authority_is_current(uuid,uuid,uuid,text,integer,integer,text,text,text,bigint,text,text,text,jsonb,uuid)'
               ) IS NOT NULL
+              AND position(
+                'auth.verified_write_scopes <@ evidence.verified_write_scopes'
+                IN pg_get_functiondef(
+                  to_regprocedure(
+                    'operations_faire_provider_write_authority_is_current(uuid,uuid,uuid,text,integer,integer,text,text,text,bigint,text,text,text,jsonb,uuid)'
+                  )::oid
+                )
+              ) > 0
               AND to_regprocedure(
                 'protect_operations_commerce_external_effect_intent()'
               ) IS NOT NULL
@@ -1385,6 +1404,21 @@ export async function GET() {
                   )::oid
                   AND trg.tgenabled = 'O'
                   AND trg.tgtype = 31
+                  AND NOT trg.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trg
+                WHERE trg.tgrelid = to_regclass(
+                    'operations_faire_provider_write_scope_evidence'
+                  )
+                  AND trg.tgname =
+                    'validate_operations_faire_scope_evidence_insert_write'
+                  AND trg.tgfoid = to_regprocedure(
+                    'validate_operations_faire_scope_evidence_insert()'
+                  )::oid
+                  AND trg.tgenabled = 'O'
+                  AND trg.tgtype = 5
                   AND NOT trg.tgisinternal
               )
               AND EXISTS (
@@ -1537,6 +1571,25 @@ export async function GET() {
                 'operations_commerce_active_cohort_matches_current(uuid,jsonb,text,integer,text)'
               ) IS NOT NULL
                 AS faire_fulfillment_authority_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0229_operations_commerce_fulfillment_recovery.sql'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_index idx
+                WHERE idx.indexrelid = to_regclass(
+                    'operations_commerce_fulfillment_exports_recovery_idx'
+                  )
+                  AND idx.indrelid = to_regclass(
+                    'operations_commerce_fulfillment_exports'
+                  )
+                  AND idx.indisvalid
+                  AND idx.indisready
+                  AND idx.indpred IS NOT NULL
+              ) AS operations_commerce_fulfillment_recovery_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -2204,6 +2257,7 @@ export async function GET() {
             && row?.global_id_base32hex_allocator_applied
             && row?.faire_provider_write_auth_applied
             && row?.faire_fulfillment_authority_applied
+            && row?.operations_commerce_fulfillment_recovery_applied
             && row?.operations_commerce_product_image_imports_applied
             && row?.operations_commerce_product_image_fanout_applied
             && row?.operations_commerce_product_image_source_normalization_applied
@@ -2372,6 +2426,7 @@ export async function GET() {
           || !row?.global_id_base32hex_allocator_applied
           || !row?.faire_provider_write_auth_applied
           || !row?.faire_fulfillment_authority_applied
+          || !row?.operations_commerce_fulfillment_recovery_applied
           || !row?.operations_commerce_product_image_imports_applied
           || !row?.operations_commerce_product_image_fanout_applied
           || !row?.operations_commerce_product_image_source_normalization_applied

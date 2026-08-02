@@ -89,6 +89,8 @@ const SHOPIFY_ADAPTER_VERSION = `shopify-graphql-${SHOPIFY_ADMIN_API_VERSION}-co
 const SHOPIFY_ORDER_PREVIEW_ADAPTER_VERSION =
   `shopify-graphql-${SHOPIFY_ADMIN_API_VERSION}-held-preview-v1`
 const FAIRE_ADAPTER_VERSION = 'faire-external-api-v2-control-v1'
+const FAIRE_OAUTH_GRANT_ADAPTER_VERSION =
+  'faire-external-api-v2-oauth-authorization-code-v1'
 const FAIRE_OAUTH_INSTALLATION_TTL_MS = 15 * 60 * 1000
 const SHOPIFY_ORDER_PREVIEW_PROVIDER_BUDGET_MS = 50_000
 const SHOPIFY_ORDER_PREVIEW_PROVIDER_CALL_TIMEOUT_MS = 10_000
@@ -524,6 +526,7 @@ export async function completeFaireOAuthCommerce(input: {
       pending.browserSessionId,
       pending.stateHash,
     )
+    const exchangeRequestedAt = new Date().toISOString()
     const grant = await exchangeFaireOAuthAuthorizationCode({
       applicationId: application.applicationId,
       applicationSecret: application.applicationSecret,
@@ -532,6 +535,10 @@ export async function completeFaireOAuthCommerce(input: {
       scopes: pending.requestedScopes,
       state,
     })
+    const exchangeCompletedAt = new Date().toISOString()
+    const credentialFingerprintSha256 = createHash('sha256')
+      .update(grant.accessToken)
+      .digest('hex')
     const profile = await probeFaireBrandProfile({
       accessToken: grant.accessToken,
       applicationId: application.applicationId,
@@ -561,8 +568,9 @@ export async function completeFaireOAuthCommerce(input: {
         && pending.requestedScopes[0] === 'READ_BRAND'
         ? 'connection_test'
         : 'distributed_operations',
-      grantedScopes: null,
-      scopeVerification: 'not_exposed_by_provider',
+      grantedScopes: [...pending.requestedScopes],
+      scopeVerification: 'oauth_grant',
+      oauthGrantTokenType: grant.tokenType,
       webhooksAvailable: false,
       sandboxAvailable: false,
       returnWritesAvailable: false,
@@ -587,6 +595,14 @@ export async function completeFaireOAuthCommerce(input: {
       webhookVerificationStatus: 'not_applicable',
       resources: FAIRE_SYNC_RESOURCES,
       actorEmail: input.actorEmail,
+      faireOAuthGrant: {
+        requestedScopes: [...pending.requestedScopes],
+        tokenType: grant.tokenType,
+        credentialFingerprintSha256,
+        requestedAt: exchangeRequestedAt,
+        completedAt: exchangeCompletedAt,
+        adapterVersion: FAIRE_OAUTH_GRANT_ADAPTER_VERSION,
+      },
     })
   } catch (error) {
     throw sanitize(error)
@@ -1244,6 +1260,18 @@ async function verifyStoredConnection(
       'FAIRE_BRAND_IDENTITY_CHANGED',
     )
   }
+  const recordedGrantedScopes = Array.isArray(
+    runtime.configuration.grantedScopes,
+  )
+    ? runtime.configuration.grantedScopes.filter(
+        (scope): scope is string => typeof scope === 'string',
+      )
+    : []
+  const recordedScopeVerification = credential.authMode === 'faire_oauth'
+    && runtime.configuration.scopeVerification === 'oauth_grant'
+    && recordedGrantedScopes.length > 0
+    ? 'oauth_grant'
+    : 'not_exposed_by_provider'
   return {
     configuration: {
       ...runtime.configuration,
@@ -1257,7 +1285,9 @@ async function verifyStoredConnection(
     response: {
       brandId: identity.id,
       brandName: identity.name,
-      scopeVerification: 'not_exposed_by_provider',
+      scopeVerification: recordedScopeVerification,
+      grantedScopeCount: recordedGrantedScopes.length,
+      scopeEvidenceRefreshed: false,
     },
   }
 }

@@ -476,7 +476,7 @@ export async function authorizeAndPrepareFaireProviderWriteInPostgres(input: {
         AND evidence.external_account_id = account.external_account_id
         AND evidence.credential_generation =
               account.commerce_credential_generation
-        AND evidence.verified_write_scopes =
+        AND evidence.verified_write_scopes @>
               ARRAY['WRITE_PRODUCTS']::text[]
         AND operations_faire_provider_write_scope_evidence_is_current(
               account.organization_id,

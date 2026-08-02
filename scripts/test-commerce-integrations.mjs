@@ -78,6 +78,9 @@ function includes(source, fragments, label) {
 
 const migration = read('db/migrations/0111_operations_commerce_integrations.sql')
 const oauthMigration = read('db/migrations/0112_operations_faire_oauth.sql')
+const oauthGrantMigration = read(
+  'db/migrations/0228_operations_faire_oauth_grant_evidence.sql',
+)
 includes(migration, [
   "('gcw', 'operations.commerce_webhook_receipt'",
   "('gxa', 'operations.commerce_provider_attempt'",
@@ -141,6 +144,25 @@ assert.ok(
     && !oauthMigration.includes('application_secret text')
     && !oauthMigration.includes('state text NOT NULL'),
   'Faire OAuth migration must not persist raw state, codes, or plaintext secrets',
+)
+includes(oauthGrantMigration, [
+  'operations_faire_oauth_scope_list_valid',
+  'operations_faire_oauth_scope_json_valid',
+  'validate_operations_faire_scope_evidence_insert',
+  'operations_faire_provider_write_scope_evidence_is_current',
+  "credential.auth_mode = 'faire_oauth'",
+  "attempt.action = 'faire.oauth.authorization_code.exchange'",
+  "attempt.state = 'succeeded'",
+  "'tokenType', 'BEARER'",
+  "'grantType', 'AUTHORIZATION_CODE'",
+  "attempt.completed_at - attempt.requested_at <= interval '60 seconds'",
+  "attempt.completed_at >= evidence.recorded_at - interval '5 minutes'",
+  'auth.verified_write_scopes <@ evidence.verified_write_scopes',
+], 'Faire OAuth grant-evidence migration')
+assert.ok(
+  !/\b(?:access_token|authorization_code|application_secret)\s+(?:text|bytea|jsonb)\b/i
+    .test(oauthGrantMigration),
+  'Faire OAuth grant evidence must not add plaintext token, code, or secret storage',
 )
 
 const persistence = read('app_src/lib/persistence/commerceIntegrations.ts')
@@ -402,6 +424,52 @@ assert.ok(
     < faireOauthCompleteSource.indexOf('encryptCommerceCredential'),
   'Faire OAuth brand identity must be verified before credential persistence',
 )
+includes(faireOauthCompleteSource, [
+  "grantedScopes: [...pending.requestedScopes]",
+  "scopeVerification: 'oauth_grant'",
+  "oauthGrantTokenType: grant.tokenType",
+  ".update(grant.accessToken)",
+  'credentialFingerprintSha256',
+  'faireOAuthGrant:',
+  'requestedAt: exchangeRequestedAt',
+  'completedAt: exchangeCompletedAt',
+], 'Faire OAuth successful grant persistence')
+const credentialWriteSource = persistence.slice(
+  persistence.indexOf(
+    'export async function writeCommerceCredentialInPostgres',
+  ),
+  persistence.indexOf(
+    'export async function markCommerceCredentialVerificationInPostgres',
+  ),
+)
+includes(credentialWriteSource, [
+  'Faire OAuth credential persistence requires exact grant evidence',
+  "oauthGrant.tokenType !== 'BEARER'",
+  '/^[a-f0-9]{64}$/.test(',
+  "'faire.oauth.authorization_code.exchange'",
+  "'succeeded', 1",
+  'scopeProofAttemptGlobalId',
+  'operations_faire_provider_write_scope_evidence',
+  'if (verifiedWriteScopes.length > 0)',
+  'operations_faire_provider_write_request_hash($6::jsonb)',
+  'operations_faire_provider_write_request_hash($8::jsonb)',
+], 'Atomic Faire OAuth credential and grant evidence persistence')
+assert.doesNotMatch(
+  credentialWriteSource,
+  /\b(?:authorizationCode|accessToken|applicationSecret)\b/,
+  'Faire OAuth grant persistence must receive only redacted grant facts',
+)
+const verifyStoredConnectionSource = service.slice(
+  service.indexOf('async function verifyStoredConnection'),
+  service.indexOf('export async function testCommerceConnection'),
+)
+includes(verifyStoredConnectionSource, [
+  "credential.authMode === 'faire_oauth'",
+  "runtime.configuration.scopeVerification === 'oauth_grant'",
+  "? 'oauth_grant'",
+  ": 'not_exposed_by_provider'",
+  'scopeEvidenceRefreshed: false',
+], 'Faire connection-test persisted grant reporting')
 const faireApiKeyConnectSource = service.slice(
   service.indexOf('export async function connectFaireCommerce'),
   service.indexOf('function decryptStoredCredential'),

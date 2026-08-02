@@ -1525,6 +1525,29 @@ assertIncludes(dispatchBridge, 'execution succeeded but completion telemetry cou
 const faireProviderWriteAuthorizationMigration = read(
   'db/migrations/0220_operations_faire_provider_write_authorizations.sql',
 )
+const faireOAuthGrantEvidenceMigration = read(
+  'db/migrations/0228_operations_faire_oauth_grant_evidence.sql',
+)
+const commerceFulfillmentRecoveryMigration = read(
+  'db/migrations/0229_operations_commerce_fulfillment_recovery.sql',
+)
+for (const fragment of [
+  'operations_commerce_fulfillment_exports_recovery_idx',
+  'operations_commerce_fulfillment_exports',
+  'state,',
+  'error_code,',
+  'updated_at,',
+  'attempts,',
+  'id',
+  "provider IN ('shopify', 'faire')",
+  "state IN ('processing', 'failed')",
+]) {
+  assertIncludes(
+    commerceFulfillmentRecoveryMigration,
+    fragment,
+    'Commerce fulfillment recovery migration',
+  )
+}
 for (const fragment of [
   'CREATE TABLE IF NOT EXISTS operations_faire_provider_write_scope_evidence',
   'CREATE TABLE IF NOT EXISTS operations_faire_provider_write_authorizations',
@@ -1553,21 +1576,37 @@ for (const fragment of [
   )
 }
 const faireScopeCurrentProsrcSha256 =
-  'a93f6fb2233dc30abe9e8db212692c61f1098b4c5e2f0e7c8801f600a06956c3'
+  'be9c9d5ce1442cf6c1df2aaffcf1dd075eeb24172fe1f7ec2e6d2002b98bea49'
 const faireScopeTriggerProsrcSha256 =
-  'abc99a1fdfcef78542ab5df2ac3af8b2eef934f38d70780156e133a74b01e73d'
+  '022f71dfd366bf18bc263d8dcfee07d96e9c4e199f797c25b085403105906a03'
 const faireScopeCurrentBody = normalizedPgProcBodyFromMigration(
-  faireProviderWriteAuthorizationMigration,
+  faireOAuthGrantEvidenceMigration,
   'operations_faire_provider_write_scope_evidence_is_current',
 )
 const faireScopeTriggerBody = normalizedPgProcBodyFromMigration(
-  faireProviderWriteAuthorizationMigration,
+  faireOAuthGrantEvidenceMigration,
   'protect_operations_faire_scope_evidence',
 )
-assert.equal(
+for (const fragment of [
+  'operations_faire_oauth_scope_list_valid',
+  'operations_faire_oauth_scope_json_valid',
+  'validate_operations_faire_scope_evidence_insert_write',
+  "credential.auth_mode = 'faire_oauth'",
+  "attempt.action = 'faire.oauth.authorization_code.exchange'",
+  "attempt.state = 'succeeded'",
+  'auth.verified_write_scopes <@ evidence.verified_write_scopes',
+  'NOT NEW.verified_write_scopes <@ evidence_scopes',
+]) {
+  assertIncludes(
+    faireOAuthGrantEvidenceMigration,
+    fragment,
+    'Faire OAuth grant-evidence migration',
+  )
+}
+assert.notEqual(
   faireScopeCurrentBody,
   'SELECT false',
-  'Faire production scope-evidence helper must remain unconditionally closed',
+  'Faire OAuth BEARER grant evidence must replace the 0220 closed stub',
 )
 assert.equal(
   sha256(faireScopeCurrentBody),
@@ -1660,6 +1699,10 @@ assertIncludes(healthRoute, '0218_global_id_alphanumeric_expand_141_149_and_cata
 assertIncludes(healthRoute, '0219_global_id_base32hex_allocator.sql', 'hosted Global ID base32hex allocator migration health')
 for (const fragment of [
   '0220_operations_faire_provider_write_authorizations.sql',
+  '0228_operations_faire_oauth_grant_evidence.sql',
+  '0229_operations_commerce_fulfillment_recovery.sql',
+  'operations_commerce_fulfillment_exports_recovery_idx',
+  'operations_commerce_fulfillment_recovery_applied',
   'operations_faire_provider_write_scope_evidence',
   'operations_faire_provider_write_authorizations',
   'operations_faire_write_scope_list_valid(text[])',
@@ -1667,9 +1710,13 @@ for (const fragment of [
   'operations_faire_provider_write_canonical_jsonb(jsonb)',
   'operations_faire_provider_write_request_hash(jsonb)',
   'operations_faire_provider_write_json_is_redacted(jsonb)',
+  'operations_faire_oauth_scope_list_valid(text[])',
+  'operations_faire_oauth_scope_json_valid(jsonb)',
   'operations_faire_provider_write_scope_evidence_is_current(uuid,uuid,uuid,integer)',
   'operations_faire_provider_write_fence_hash',
   'protect_operations_faire_scope_evidence_write',
+  'validate_operations_faire_scope_evidence_insert_write',
+  'validate_operations_faire_scope_evidence_insert()',
   'protect_operations_faire_write_authorization_write',
   'protect_operations_commerce_external_effect_intent_write',
   'operations_faire_provider_write_authority_is_current',
@@ -1690,11 +1737,10 @@ for (const fragment of [
   'procedure.prosrc',
   "E'(^|[\\\\n\\\\r])[[:blank:]]*--[^\\\\n\\\\r]*'",
   "'[[:space:]]+'",
-  ") = 'SELECT false'",
   "= '${FAIRE_SCOPE_CURRENT_PROSRC_SHA256}'",
   "= '${FAIRE_SCOPE_TRIGGER_PROSRC_SHA256}'",
 ]) {
-  assertIncludes(healthRoute, fragment, 'hosted Faire fail-closed body hash')
+  assertIncludes(healthRoute, fragment, 'hosted Faire grant-evidence body hash')
 }
 assert.equal(
   (healthRoute.match(/FAIRE_SCOPE_CURRENT_PROSRC_SHA256/g) || []).length,
@@ -1725,8 +1771,11 @@ const faireScopeTriggerHealth = healthRoute.slice(
 for (const fragment of [
   "trg.tgfoid = to_regprocedure(",
   "'protect_operations_faire_scope_evidence()'",
+  "'validate_operations_faire_scope_evidence_insert_write'",
+  "'validate_operations_faire_scope_evidence_insert()'",
   "trg.tgenabled = 'O'",
   'trg.tgtype = 31',
+  'trg.tgtype = 5',
   'NOT trg.tgisinternal',
 ]) {
   assertIncludes(faireScopeTriggerHealth, fragment, 'exact Faire scope trigger health')

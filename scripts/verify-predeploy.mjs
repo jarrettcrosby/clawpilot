@@ -327,6 +327,8 @@ for (const requiredPath of [
   'db/migrations/0225_operations_commerce_product_image_exact_fanout.sql',
   'db/migrations/0226_suitecrm_product_image_reverse_ingestion.sql',
   'db/migrations/0227_operations_commerce_product_image_source_normalization.sql',
+  'db/migrations/0228_operations_faire_oauth_grant_evidence.sql',
+  'db/migrations/0229_operations_commerce_fulfillment_recovery.sql',
   'app_src/app/api/crm/products/[productId]/images/route.ts',
   'app_src/app/api/crm/products/[productId]/images/[assetId]/route.ts',
   'app_src/app/api/crm/products/[productId]/shopify-product-image/route.ts',
