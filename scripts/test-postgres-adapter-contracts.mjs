@@ -1528,6 +1528,9 @@ const faireProviderWriteAuthorizationMigration = read(
 const faireOAuthGrantEvidenceMigration = read(
   'db/migrations/0228_operations_faire_oauth_grant_evidence.sql',
 )
+const faireProductImageProjectionMigration = read(
+  'db/migrations/0230_operations_faire_product_image_projection.sql',
+)
 const commerceFulfillmentRecoveryMigration = read(
   'db/migrations/0229_operations_commerce_fulfillment_recovery.sql',
 )
@@ -1620,6 +1623,21 @@ assert.equal(
 )
 
 const healthRoute = read('app_src/app/api/health/route.ts')
+for (const source of [faireProductImageProjectionMigration, healthRoute]) {
+  assertIncludes(
+    source,
+    'evidence.verified_write_scopes @> auth.verified_write_scopes',
+    source === healthRoute
+      ? 'hosted Faire hardened authority-scope guard'
+      : 'Faire Product-image hardened authority-scope guard',
+  )
+}
+assert.ok(
+  !healthRoute.includes(
+    "position(\n                'auth.verified_write_scopes <@ evidence.verified_write_scopes'",
+  ),
+  'hosted health must pin the current 0230 Faire authority-scope expression',
+)
 assertIncludes(healthRoute, 'readPipelineOutboxWorkerHeartbeatFromPostgres', 'hosted worker health')
 assertIncludes(healthRoute, '0002_pipeline_outbox_worker.sql', 'hosted migration health')
 assertIncludes(healthRoute, '0003_auth_magic_codes.sql', 'hosted auth migration health')
@@ -1695,6 +1713,7 @@ assertIncludes(healthRoute, '0195_operations_fulfillment_rate_parcel_evidence.sq
 assertIncludes(healthRoute, '0198_operations_sandbox_commerce_e2e_authorization.sql', 'hosted sandbox commerce E2E authorization migration health')
 assertIncludes(healthRoute, '0199_operations_commerce_active_canonical_collation.sql', 'hosted commerce Active canonical collation migration health')
 assertIncludes(healthRoute, '0200_operations_sandbox_commerce_e2e_active_guards.sql', 'hosted sandbox commerce E2E Active guards migration health')
+assertIncludes(healthRoute, '0231_operations_faire_sandbox_commerce_e2e.sql', 'hosted Faire sandbox commerce E2E migration health')
 assertIncludes(healthRoute, '0218_global_id_alphanumeric_expand_141_149_and_catalog_gate.sql', 'hosted Global ID alphanumeric compatibility migration health')
 assertIncludes(healthRoute, '0219_global_id_base32hex_allocator.sql', 'hosted Global ID base32hex allocator migration health')
 for (const fragment of [

@@ -883,7 +883,7 @@ function OrderDetailDrawer({
     || (!canExecute
       ? 'You do not have permission to purchase carrier labels.'
       : !sandboxE2eAuthorization
-        ? 'Authorize this exact Shopify test order before creating package-specific sandbox labels.'
+        ? 'Authorize this exact commerce test order before creating package-specific sandbox labels.'
         : order?.status !== 'packed'
           ? 'Verify every package before creating labels.'
           : unresolvedAttempt
@@ -897,8 +897,9 @@ function OrderDetailDrawer({
                   : null)
   const authorizeSandboxE2eBlockedReason = !canAuthorizeSandboxE2e
     ? 'Only an authorized organization owner or administrator may authorize this test.'
-    : order?.sourceProvider !== 'shopify'
-      ? 'Sandbox commerce E2E authorization currently requires a Shopify order.'
+    : !order?.sourceProvider
+      || !['shopify', 'faire'].includes(order.sourceProvider)
+      ? 'Sandbox commerce E2E authorization requires a Shopify or Faire order.'
       : order.status !== 'packed'
         ? 'Verify every package before authorizing the test.'
         : shipments.length > 0
@@ -1293,7 +1294,8 @@ function OrderDetailDrawer({
               </Stack> : <Typography variant="body2" color="text.secondary">No carrier rates have been recorded.</Typography>}
             </DetailSection>
 
-            {order.sourceProvider === 'shopify' && order.status === 'packed' && (
+            {['shopify', 'faire'].includes(order.sourceProvider || '')
+              && order.status === 'packed' && (
               <DetailSection title="Authorized sandbox commerce E2E">
                 {sandboxE2eAuthorization ? (
                   <Alert
@@ -1314,20 +1316,24 @@ function OrderDetailDrawer({
                         fallback: sandboxE2eAuthorization.expiresAt,
                       },
                     )}. It permits only this order&apos;s package-specific sandbox
-                    labels, reserved-inventory consumption, and Shopify
+                    labels, reserved-inventory consumption, and {order.sourceProvider === 'faire'
+                      ? 'Faire'
+                      : 'Shopify'}
                     fulfillment/tracking writeback.
                   </Alert>
                 ) : (
                   <Stack spacing={1.25}>
                     <Alert severity="warning">
                       This test path creates non-tracking sandbox labels and then
-                      performs real ClawPilot inventory and Shopify fulfillment
+                      performs real ClawPilot inventory and {order.sourceProvider === 'faire'
+                        ? 'Faire'
+                        : 'Shopify'} fulfillment
                       writes for this exact order. It does not authorize any
                       other order or production carrier purchase.
                     </Alert>
                     <Tooltip
                       title={authorizeSandboxE2eBlockedReason
-                        || 'Review and authorize this exact Shopify test order'}
+                        || 'Review and authorize this exact commerce test order'}
                     >
                       <span>
                         <Button
@@ -1370,7 +1376,9 @@ function OrderDetailDrawer({
                       Create one sandbox label for each exact package. When all{' '}
                       {order.packages.length} packages are labeled, Confirm shipment
                       will consume the reserved inventory and write every tracking
-                      number to Shopify under authorization{' '}
+                      number to {order.sourceProvider === 'faire'
+                        ? 'Faire'
+                        : 'Shopify'} under authorization{' '}
                       {sandboxE2eAuthorization.authorizationGlobalId}.
                     </Alert>
                     {order.packages.map((item) => {
@@ -2043,7 +2051,7 @@ export default function OperationsSection({
   const [sandboxE2eAuthorizationOpen, setSandboxE2eAuthorizationOpen] = useState(false)
   const [sandboxE2eAuthorizationConfirmed, setSandboxE2eAuthorizationConfirmed] = useState(false)
   const [sandboxE2eAuthorizationReason, setSandboxE2eAuthorizationReason] = useState(
-    'Authorized end-to-end validation for this exact Shopify test order',
+    'Authorized end-to-end validation for this exact commerce test order',
   )
   const [authorizingSandboxE2e, setAuthorizingSandboxE2e] = useState(false)
   const [createLabelOpen, setCreateLabelOpen] = useState(false)
@@ -2725,7 +2733,9 @@ export default function OperationsSection({
     if (!detail) return
     setSandboxE2eAuthorizationConfirmed(false)
     setSandboxE2eAuthorizationReason(
-      `Authorized end-to-end validation for Shopify test order ${detail.orderNumber}`,
+      `Authorized end-to-end validation for ${detail.sourceProvider === 'faire'
+        ? 'Faire'
+        : 'Shopify'} test order ${detail.orderNumber}`,
     )
     setSandboxE2eAuthorizationOpen(true)
   }
@@ -4268,10 +4278,14 @@ export default function OperationsSection({
           <DialogContent dividers>
             <Stack spacing={2}>
               <Alert severity="error">
-                This authority is limited to Shopify order{' '}
+                This authority is limited to {detail?.sourceProvider === 'faire'
+                  ? 'Faire'
+                  : 'Shopify'} order{' '}
                 {detail?.orderNumber || 'this order'} ({detail?.globalId || 'unknown'}).
                 It permits non-tracking sandbox labels followed by real reserved
-                inventory consumption and Shopify fulfillment/tracking writeback.
+                inventory consumption and {detail?.sourceProvider === 'faire'
+                  ? 'Faire'
+                  : 'Shopify'} fulfillment/tracking writeback.
                 The authorization expires after two hours and is consumed by a
                 successful shipment confirmation.
               </Alert>
@@ -4354,9 +4368,12 @@ export default function OperationsSection({
                   Authorized sandbox E2E execution is active under{' '}
                   {detail.sandboxCommerceE2eAuthorization.authorizationGlobalId}.
                   Confirming will consume that one-time authorization and send
-                  every package&apos;s sandbox tracking number to Shopify even though
-                  those labels will not track with the carrier. Shopify customer
-                  notification is forcibly disabled for this test and cannot be overridden.
+                  every package&apos;s sandbox tracking number to{' '}
+                  {detail.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} even though
+                  those labels will not track with the carrier.{' '}
+                  {detail.sourceProvider === 'faire'
+                    ? 'Faire manages the retailer notification after writeback.'
+                    : 'Shopify customer notification is forcibly disabled for this test and cannot be overridden.'}
                 </Alert>
               )}
               {detail?.fulfillmentNotificationPolicy.mode === 'provider_managed' ? (
@@ -4538,7 +4555,8 @@ export default function OperationsSection({
                   non-tracking sandbox label for {detailCreateLabelPackage.globalId}
                   using the exact order allocation. Do not void it: after every
                   package is labeled, shipment confirmation will consume the
-                  reservation and write all tracking numbers to Shopify.
+                  reservation and write all tracking numbers to{' '}
+                  {detail?.sourceProvider === 'faire' ? 'Faire' : 'Shopify'}.
                 </Alert>
               ) : (
                 <Alert severity="warning">

@@ -34,6 +34,7 @@ type AuthorizationRow = {
   order_id: string
   order_global_id: string
   external_order_id: string
+  source_provider: string
   state: 'active' | 'consumed' | 'revoked' | 'expired'
   reason: string
   authorized_by: string
@@ -47,6 +48,7 @@ export type SandboxCommerceE2eAuthorization = {
   authorizationGlobalId: string
   orderGlobalId: string
   externalOrderId: string
+  sourceProvider: string
   state: AuthorizationRow['state']
   reason: string
   authorizedBy: string
@@ -87,6 +89,7 @@ function map(row: AuthorizationRow): SandboxCommerceE2eAuthorization {
     authorizationGlobalId: row.global_id,
     orderGlobalId: row.order_global_id,
     externalOrderId: row.external_order_id,
+    sourceProvider: row.source_provider,
     state: row.state,
     reason: row.reason,
     authorizedBy: row.authorized_by,
@@ -100,7 +103,7 @@ function map(row: AuthorizationRow): SandboxCommerceE2eAuthorization {
 const SELECT = `SELECT auth.id::text, auth.global_id,
   auth.organization_id::text, auth.order_id::text,
   source_order.global_id AS order_global_id,
-  auth.external_order_id, auth.state,
+  auth.external_order_id, source_order.source_provider, auth.state,
   auth.reason, auth.authorized_by,
   auth.authorized_at, auth.expires_at,
   auth.consumed_at, auth.consumed_by
@@ -108,6 +111,366 @@ FROM operations_sandbox_commerce_e2e_authorizations auth
 JOIN operations_orders source_order
   ON source_order.organization_id = auth.organization_id
  AND source_order.id = auth.order_id`
+
+type FaireEvidenceRow = {
+  integration_account_id: string
+  pipeline_id: string
+  run_id: string
+  order_candidate_id: string
+  order_candidate_global_id: string
+  order_candidate_row_version: string
+  order_candidate_source_revision: string
+  order_candidate_source_hash: string
+  order_candidate_ship_to_hash: string
+  order_line_candidate_id: string
+  order_line_candidate_global_id: string
+  order_line_candidate_row_version: string
+  order_line_candidate_source_revision: string
+  order_line_candidate_source_hash: string
+  canonical_order_line_id: string
+  variant_pack_mapping_id: string
+  variant_pack_mapping_global_id: string
+  variant_pack_mapping_row_version: string
+  variant_pack_evidence_hash: string
+  pack_profile_version_id: string
+  pack_profile_version_global_id: string
+  pack_profile_version_row_version: string
+  external_product_id: string
+  external_variant_id: string
+  fulfillment_plan_id: string
+  fulfillment_plan_global_id: string
+  fulfillment_plan_version: number
+  warehouse_id: string
+  warehouse_address_hash: string
+  package_id: string
+  package_global_id: string
+  package_content_id: string
+  package_content_global_id: string
+  package_number: number
+  item_quantity: string
+  length_mm: number
+  width_mm: number
+  height_mm: number
+  gross_weight_grams: number
+  ship_to_hash: string
+  destination_region: string
+  destination_country_code: string
+  package_evidence_hash: string
+}
+
+async function readExactFaireEvidence(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    orderId: string
+  },
+) {
+  const result = await client.query<FaireEvidenceRow>(
+    `SELECT
+       candidate.integration_account_id::text,
+       candidate.pipeline_id::text,
+       candidate.run_id::text,
+       candidate.id::text AS order_candidate_id,
+       candidate.global_id AS order_candidate_global_id,
+       candidate.row_version::text AS order_candidate_row_version,
+       candidate.source_revision AS order_candidate_source_revision,
+       candidate.source_hash AS order_candidate_source_hash,
+       candidate.ship_to_snapshot_hash AS order_candidate_ship_to_hash,
+       candidate_line.id::text AS order_line_candidate_id,
+       candidate_line.global_id AS order_line_candidate_global_id,
+       candidate_line.row_version::text AS order_line_candidate_row_version,
+       candidate_line.source_revision AS order_line_candidate_source_revision,
+       candidate_line.source_hash AS order_line_candidate_source_hash,
+       canonical_line.id::text AS canonical_order_line_id,
+       pack_mapping.id::text AS variant_pack_mapping_id,
+       pack_mapping.global_id AS variant_pack_mapping_global_id,
+       pack_mapping.row_version::text AS variant_pack_mapping_row_version,
+       pack_mapping.pack_evidence_hash AS variant_pack_evidence_hash,
+       pack_version.id::text AS pack_profile_version_id,
+       pack_version.global_id AS pack_profile_version_global_id,
+       pack_version.row_version::text AS pack_profile_version_row_version,
+       pack_mapping.external_product_id,
+       pack_mapping.external_variant_id,
+       plan.id::text AS fulfillment_plan_id,
+       plan.global_id AS fulfillment_plan_global_id,
+       plan.version_number AS fulfillment_plan_version,
+       plan.warehouse_id::text,
+       operations_sandbox_commerce_e2e_jsonb_hash(warehouse.address)
+         AS warehouse_address_hash,
+       package.id::text AS package_id,
+       package.global_id AS package_global_id,
+       content.id::text AS package_content_id,
+       content.global_id AS package_content_global_id,
+       package.package_number,
+       content.quantity::text AS item_quantity,
+       package.length_mm,
+       package.width_mm,
+       package.height_mm,
+       package.weight_grams AS gross_weight_grams,
+       operations_sandbox_commerce_e2e_jsonb_hash(source_order.ship_to)
+         AS ship_to_hash,
+       upper(coalesce(
+         source_order.ship_to->>'region', source_order.ship_to->>'state'
+       )) AS destination_region,
+       upper(coalesce(
+         source_order.ship_to->>'countryCode', source_order.ship_to->>'country'
+       )) AS destination_country_code,
+       operations_sandbox_commerce_e2e_jsonb_hash(
+         jsonb_build_object(
+           'packageGlobalId', package.global_id,
+           'contentGlobalId', content.global_id,
+           'orderLineGlobalId', canonical_line.global_id,
+           'quantity', content.quantity,
+           'lengthMm', package.length_mm,
+           'widthMm', package.width_mm,
+           'heightMm', package.height_mm,
+           'grossWeightGrams', package.weight_grams
+         )
+       ) AS package_evidence_hash
+     FROM operations_orders source_order
+     JOIN operations_integration_accounts account
+       ON account.organization_id = source_order.organization_id
+      AND account.id = source_order.integration_account_id
+     JOIN operations_commerce_order_candidates candidate
+       ON candidate.organization_id = source_order.organization_id
+      AND candidate.integration_account_id = account.id
+      AND candidate.canonical_order_id = source_order.id
+     JOIN operations_commerce_order_candidate_lines candidate_line
+       ON candidate_line.organization_id = candidate.organization_id
+      AND candidate_line.integration_account_id = candidate.integration_account_id
+      AND candidate_line.pipeline_id = candidate.pipeline_id
+      AND candidate_line.run_id = candidate.run_id
+      AND candidate_line.order_candidate_id = candidate.id
+     JOIN operations_order_lines canonical_line
+       ON canonical_line.organization_id = source_order.organization_id
+      AND canonical_line.order_id = source_order.id
+      AND canonical_line.id = candidate_line.canonical_order_line_id
+     JOIN operations_commerce_variant_pack_mappings pack_mapping
+       ON pack_mapping.organization_id = candidate_line.organization_id
+      AND pack_mapping.id = candidate_line.commerce_variant_pack_mapping_id
+     JOIN operations_product_pack_profile_versions pack_version
+       ON pack_version.organization_id = pack_mapping.organization_id
+      AND pack_version.id = pack_mapping.default_pack_profile_version_id
+      AND pack_version.id = candidate_line.pack_profile_version_id
+     JOIN operations_fulfillment_plans plan
+       ON plan.organization_id = source_order.organization_id
+      AND plan.order_id = source_order.id
+     JOIN operations_warehouses warehouse
+       ON warehouse.organization_id = plan.organization_id
+      AND warehouse.id = plan.warehouse_id
+     JOIN operations_packages package
+       ON package.organization_id = plan.organization_id
+      AND package.plan_id = plan.id
+     JOIN operations_package_contents content
+       ON content.organization_id = plan.organization_id
+      AND content.plan_id = plan.id
+      AND content.order_id = source_order.id
+      AND content.package_id = package.id
+      AND content.order_line_id = canonical_line.id
+     WHERE source_order.organization_id = $1::uuid
+       AND source_order.id = $2::uuid
+       AND source_order.source_provider = 'faire'
+       AND source_order.status = 'packed'
+       AND account.integration_type = 'commerce'
+       AND account.provider = 'faire'
+       AND candidate.provider = 'faire'
+       AND candidate.workflow_state = 'promoted'
+       AND candidate.ship_to_snapshot_state = 'confirmed'
+       AND candidate.ship_to_snapshot_hash IS NOT NULL
+       AND candidate_line.provider = 'faire'
+       AND candidate_line.workflow_state = 'promoted'
+       AND candidate_line.packaging_source = 'variant_pack_mapping'
+       AND candidate_line.unfulfilled_quantity = 1
+       AND candidate_line.commerce_variant_pack_mapping_row_version =
+             pack_mapping.row_version
+       AND candidate_line.pack_profile_version_row_version =
+             pack_version.row_version
+       AND candidate_line.length_mm = pack_version.length_mm
+       AND candidate_line.width_mm = pack_version.width_mm
+       AND candidate_line.height_mm = pack_version.height_mm
+       AND candidate_line.weight_grams = pack_version.gross_weight_grams
+       AND canonical_line.quantity = 1
+       AND canonical_line.weight_grams = pack_version.gross_weight_grams
+       AND (canonical_line.dimensions_mm->>'length')::integer =
+             pack_version.length_mm
+       AND (canonical_line.dimensions_mm->>'width')::integer =
+             pack_version.width_mm
+       AND (canonical_line.dimensions_mm->>'height')::integer =
+             pack_version.height_mm
+       AND pack_mapping.provider = 'faire'
+       AND pack_mapping.is_current = true
+       AND pack_mapping.projection_state = 'current'
+       AND pack_mapping.pack_evidence_hash IS NOT NULL
+       AND pack_version.is_current = true
+       AND pack_version.lifecycle_state IN ('customer_confirmed', 'active')
+       AND pack_version.base_each_quantity = 1
+       AND pack_version.dimension_basis = 'outer'
+       AND pack_version.length_mm IS NOT NULL
+       AND pack_version.width_mm IS NOT NULL
+       AND pack_version.height_mm IS NOT NULL
+       AND pack_version.gross_weight_grams IS NOT NULL
+       AND plan.status = 'released'
+       AND NOT EXISTS (
+         SELECT 1
+         FROM operations_fulfillment_plans newer_plan
+         WHERE newer_plan.organization_id = plan.organization_id
+           AND newer_plan.order_id = plan.order_id
+           AND (
+             newer_plan.version_number > plan.version_number
+             OR (
+               newer_plan.version_number = plan.version_number
+               AND newer_plan.id > plan.id
+             )
+           )
+       )
+       AND warehouse.address IS NOT NULL
+       AND package.status = 'packed'
+       AND package.length_mm = pack_version.length_mm
+       AND package.width_mm = pack_version.width_mm
+       AND package.height_mm = pack_version.height_mm
+       AND package.weight_grams = pack_version.gross_weight_grams
+       AND content.quantity = 1
+       AND upper(coalesce(
+             source_order.ship_to->>'region', source_order.ship_to->>'state'
+           )) = 'CA'
+       AND upper(coalesce(
+             source_order.ship_to->>'countryCode',
+             source_order.ship_to->>'country'
+           )) = 'US'
+       AND length(btrim(coalesce(source_order.ship_to->>'name', ''))) > 0
+       AND length(btrim(coalesce(
+             source_order.ship_to->>'line1',
+             source_order.ship_to->>'street', ''
+           ))) > 0
+       AND length(btrim(coalesce(source_order.ship_to->>'city', ''))) > 0
+       AND length(btrim(coalesce(
+             source_order.ship_to->>'postalCode',
+             source_order.ship_to->>'postal_code', ''
+           ))) > 0
+       AND NOT EXISTS (
+         SELECT 1
+         FROM operations_commerce_order_candidates other_candidate
+         WHERE other_candidate.organization_id = source_order.organization_id
+           AND other_candidate.canonical_order_id = source_order.id
+           AND other_candidate.id <> candidate.id
+       )
+       AND NOT EXISTS (
+         SELECT 1
+         FROM operations_commerce_order_candidate_lines other_line
+         WHERE other_line.organization_id = candidate.organization_id
+           AND other_line.order_candidate_id = candidate.id
+           AND other_line.unfulfilled_quantity > 0
+           AND other_line.id <> candidate_line.id
+       )
+       AND NOT EXISTS (
+         SELECT 1
+         FROM operations_order_lines other_order_line
+         WHERE other_order_line.organization_id = source_order.organization_id
+           AND other_order_line.order_id = source_order.id
+           AND other_order_line.id <> canonical_line.id
+       )
+       AND NOT EXISTS (
+         SELECT 1
+         FROM operations_packages other_package
+         WHERE other_package.organization_id = plan.organization_id
+           AND other_package.plan_id = plan.id
+           AND other_package.id <> package.id
+       )
+       AND NOT EXISTS (
+         SELECT 1
+         FROM operations_package_contents other_content
+         WHERE other_content.organization_id = package.organization_id
+           AND other_content.package_id = package.id
+           AND other_content.id <> content.id
+       )
+     FOR SHARE OF
+       account, candidate, candidate_line, canonical_line, pack_mapping,
+       pack_version, plan, warehouse, package, content`,
+    [input.organizationId, input.orderId],
+  )
+  if (result.rows.length !== 1) {
+    fail(
+      'SANDBOX_E2E_FAIRE_EVIDENCE_REQUIRED',
+      'Faire authorization requires one promoted line with an exact current versioned pack, one matching packed package, and the confirmed US/CA destination',
+    )
+  }
+  return result.rows[0]
+}
+
+function faireEvidenceHash(row: FaireEvidenceRow) {
+  return createHash('sha256').update(JSON.stringify({
+    candidate: {
+      globalId: row.order_candidate_global_id,
+      rowVersion: row.order_candidate_row_version,
+      sourceRevision: row.order_candidate_source_revision,
+      sourceHash: row.order_candidate_source_hash,
+      shipToHash: row.order_candidate_ship_to_hash,
+    },
+    line: {
+      globalId: row.order_line_candidate_global_id,
+      rowVersion: row.order_line_candidate_row_version,
+      sourceRevision: row.order_line_candidate_source_revision,
+      sourceHash: row.order_line_candidate_source_hash,
+    },
+    variantPack: {
+      globalId: row.variant_pack_mapping_global_id,
+      rowVersion: row.variant_pack_mapping_row_version,
+      evidenceHash: row.variant_pack_evidence_hash,
+      profileVersionGlobalId: row.pack_profile_version_global_id,
+      profileVersionRowVersion: row.pack_profile_version_row_version,
+      externalProductId: row.external_product_id,
+      externalVariantId: row.external_variant_id,
+    },
+    fulfillment: {
+      planGlobalId: row.fulfillment_plan_global_id,
+      planVersion: row.fulfillment_plan_version,
+      warehouseAddressHash: row.warehouse_address_hash,
+      packageGlobalId: row.package_global_id,
+      packageContentGlobalId: row.package_content_global_id,
+      packageEvidenceHash: row.package_evidence_hash,
+    },
+    parcel: {
+      itemQuantity: row.item_quantity,
+      lengthMm: row.length_mm,
+      widthMm: row.width_mm,
+      heightMm: row.height_mm,
+      grossWeightGrams: row.gross_weight_grams,
+    },
+    destination: {
+      shipToHash: row.ship_to_hash,
+      region: row.destination_region,
+      countryCode: row.destination_country_code,
+    },
+  })).digest('hex')
+}
+
+async function currentFaireEvidence(
+  client: PoolClient,
+  row: AuthorizationRow,
+  packageGlobalId?: string | null,
+) {
+  const result = await client.query<{
+    current: boolean
+    package_global_id: string | null
+  }>(
+    `SELECT
+       operations_sandbox_commerce_e2e_authorization_is_current(
+         $1::uuid, $2::uuid, $3::uuid
+       ) AS current,
+       (
+         SELECT evidence.package_global_id
+         FROM operations_sandbox_commerce_e2e_faire_evidence evidence
+         WHERE evidence.organization_id = $1::uuid
+           AND evidence.authorization_id = $2::uuid
+       ) AS package_global_id`,
+    [row.organization_id, row.id, row.order_id],
+  )
+  const evidence = result.rows[0]
+  return Boolean(
+    evidence?.current
+    && (!packageGlobalId || evidence.package_global_id === packageGlobalId),
+  )
+}
 
 export async function authorizeSandboxCommerceE2eInPostgres(input: {
   organizationId: unknown
@@ -148,9 +511,24 @@ export async function authorizeSandboxCommerceE2eInPostgres(input: {
     )
     const order = orderResult.rows[0]
     if (!order) fail('SANDBOX_E2E_ORDER_NOT_FOUND', 'Operations order was not found', 404)
-    if (order.source_provider !== 'shopify' || order.status !== 'packed') {
-      fail('SANDBOX_E2E_ORDER_INELIGIBLE', 'Authorization requires one packed Shopify order')
+    if (
+      !['shopify', 'faire'].includes(order.source_provider)
+      || order.status !== 'packed'
+    ) {
+      fail(
+        'SANDBOX_E2E_ORDER_INELIGIBLE',
+        'Authorization requires one packed Shopify or Faire order',
+      )
     }
+    const faireEvidence = order.source_provider === 'faire'
+      ? await readExactFaireEvidence(client, {
+          organizationId: scopedOrganizationId,
+          orderId: order.id,
+        })
+      : null
+    const exactFaireEvidenceHash = faireEvidence
+      ? faireEvidenceHash(faireEvidence)
+      : null
     await client.query(
       `UPDATE operations_sandbox_commerce_e2e_authorizations
        SET state = 'expired'
@@ -173,6 +551,15 @@ export async function authorizeSandboxCommerceE2eInPostgres(input: {
         existing.authorized_by === actorEmail
         && existing.reason === authorizationReason
       ) {
+        if (
+          existing.source_provider === 'faire'
+          && !(await currentFaireEvidence(client, existing))
+        ) {
+          fail(
+            'SANDBOX_E2E_FAIRE_EVIDENCE_STALE',
+            'The existing Faire authorization no longer matches the exact order, pack, package, or destination evidence',
+          )
+        }
         return map(existing)
       }
       fail(
@@ -188,6 +575,21 @@ export async function authorizeSandboxCommerceE2eInPostgres(input: {
       externalOrderId: order.external_order_id,
       actorEmail,
       reason: authorizationReason,
+      ...(faireEvidence
+        ? {
+            sourceProvider: 'faire',
+            exactFaireEvidenceHash,
+            orderCandidateGlobalId:
+              faireEvidence.order_candidate_global_id,
+            candidateLineGlobalId:
+              faireEvidence.order_line_candidate_global_id,
+            packProfileVersionGlobalId:
+              faireEvidence.pack_profile_version_global_id,
+            packageGlobalId: faireEvidence.package_global_id,
+            packageEvidenceHash: faireEvidence.package_evidence_hash,
+            shipToHash: faireEvidence.ship_to_hash,
+          }
+        : {}),
     })).digest('hex')
     const inserted = await client.query<AuthorizationRow>(
       `WITH created AS (
@@ -205,15 +607,104 @@ export async function authorizeSandboxCommerceE2eInPostgres(input: {
        SELECT created.id::text, created.global_id,
               created.organization_id::text, created.order_id::text,
               $4 AS order_global_id, created.external_order_id, created.state,
+              $9 AS source_provider,
               created.reason, created.authorized_by, created.authorized_at,
               created.expires_at, created.consumed_at, created.consumed_by
        FROM created`,
       [
         scopedOrganizationId, order.id, order.external_order_id, orderGlobalId,
         confirmationHash, authorizationReason, actorEmail, lifetimeMinutes,
+        order.source_provider,
       ],
     )
     const authorization = inserted.rows[0]
+    if (faireEvidence && exactFaireEvidenceHash) {
+      await client.query(
+        `INSERT INTO operations_sandbox_commerce_e2e_faire_evidence (
+           authorization_id, organization_id, confirmation_hash,
+           integration_account_id, pipeline_id, run_id, order_id,
+           order_candidate_id, order_candidate_global_id,
+           order_candidate_row_version, order_candidate_source_revision,
+           order_candidate_source_hash, order_candidate_ship_to_hash,
+           order_line_candidate_id, order_line_candidate_global_id,
+           order_line_candidate_row_version,
+           order_line_candidate_source_revision,
+           order_line_candidate_source_hash, canonical_order_line_id,
+           variant_pack_mapping_id, variant_pack_mapping_global_id,
+           variant_pack_mapping_row_version, variant_pack_evidence_hash,
+           pack_profile_version_id, pack_profile_version_global_id,
+           pack_profile_version_row_version, external_product_id,
+           external_variant_id, fulfillment_plan_id,
+           fulfillment_plan_global_id, fulfillment_plan_version,
+           warehouse_id, warehouse_address_hash, package_id,
+           package_global_id, package_content_id, package_content_global_id,
+           package_number, item_quantity, length_mm, width_mm, height_mm,
+           gross_weight_grams, ship_to_hash, destination_region,
+           destination_country_code, package_evidence_hash, evidence_hash,
+           created_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3, $4::uuid, $5::uuid, $6::uuid, $7::uuid,
+           $8::uuid, $9, $10::bigint, $11, $12, $13,
+           $14::uuid, $15, $16::bigint, $17, $18, $19::uuid,
+           $20::uuid, $21, $22::bigint, $23, $24::uuid, $25, $26::bigint,
+           $27, $28, $29::uuid, $30, $31::integer, $32::uuid, $33,
+           $34::uuid, $35, $36::uuid, $37, $38::integer, $39::numeric,
+           $40::integer, $41::integer, $42::integer, $43::integer,
+           $44, $45, $46, $47, $48, $49
+         )`,
+        [
+          authorization.id,
+          scopedOrganizationId,
+          confirmationHash,
+          faireEvidence.integration_account_id,
+          faireEvidence.pipeline_id,
+          faireEvidence.run_id,
+          order.id,
+          faireEvidence.order_candidate_id,
+          faireEvidence.order_candidate_global_id,
+          faireEvidence.order_candidate_row_version,
+          faireEvidence.order_candidate_source_revision,
+          faireEvidence.order_candidate_source_hash,
+          faireEvidence.order_candidate_ship_to_hash,
+          faireEvidence.order_line_candidate_id,
+          faireEvidence.order_line_candidate_global_id,
+          faireEvidence.order_line_candidate_row_version,
+          faireEvidence.order_line_candidate_source_revision,
+          faireEvidence.order_line_candidate_source_hash,
+          faireEvidence.canonical_order_line_id,
+          faireEvidence.variant_pack_mapping_id,
+          faireEvidence.variant_pack_mapping_global_id,
+          faireEvidence.variant_pack_mapping_row_version,
+          faireEvidence.variant_pack_evidence_hash,
+          faireEvidence.pack_profile_version_id,
+          faireEvidence.pack_profile_version_global_id,
+          faireEvidence.pack_profile_version_row_version,
+          faireEvidence.external_product_id,
+          faireEvidence.external_variant_id,
+          faireEvidence.fulfillment_plan_id,
+          faireEvidence.fulfillment_plan_global_id,
+          faireEvidence.fulfillment_plan_version,
+          faireEvidence.warehouse_id,
+          faireEvidence.warehouse_address_hash,
+          faireEvidence.package_id,
+          faireEvidence.package_global_id,
+          faireEvidence.package_content_id,
+          faireEvidence.package_content_global_id,
+          faireEvidence.package_number,
+          faireEvidence.item_quantity,
+          faireEvidence.length_mm,
+          faireEvidence.width_mm,
+          faireEvidence.height_mm,
+          faireEvidence.gross_weight_grams,
+          faireEvidence.ship_to_hash,
+          faireEvidence.destination_region,
+          faireEvidence.destination_country_code,
+          faireEvidence.package_evidence_hash,
+          exactFaireEvidenceHash,
+          actorEmail,
+        ],
+      )
+    }
     await recordAuditEvent({
       actor: actorEmail,
       eventType: 'operations.sandbox_commerce_e2e.authorized',
@@ -228,6 +719,29 @@ export async function authorizeSandboxCommerceE2eInPostgres(input: {
         expiresAt: new Date(authorization.expires_at).toISOString(),
         confirmationStatementVersion: SANDBOX_COMMERCE_E2E_CONFIRMATION_VERSION,
         reason: authorizationReason,
+        sourceProvider: order.source_provider,
+        ...(faireEvidence
+          ? {
+              orderCandidateGlobalId:
+                faireEvidence.order_candidate_global_id,
+              candidateLineGlobalId:
+                faireEvidence.order_line_candidate_global_id,
+              variantPackMappingGlobalId:
+                faireEvidence.variant_pack_mapping_global_id,
+              packProfileVersionGlobalId:
+                faireEvidence.pack_profile_version_global_id,
+              packageGlobalId: faireEvidence.package_global_id,
+              parcel: {
+                itemQuantity: faireEvidence.item_quantity,
+                lengthMm: faireEvidence.length_mm,
+                widthMm: faireEvidence.width_mm,
+                heightMm: faireEvidence.height_mm,
+                grossWeightGrams: faireEvidence.gross_weight_grams,
+              },
+              shipToHash: faireEvidence.ship_to_hash,
+              evidenceHash: exactFaireEvidenceHash,
+            }
+          : {}),
       },
     }, client)
     return map(authorization)
@@ -241,7 +755,9 @@ export async function requireActiveSandboxCommerceE2eAuthorization(
     authorizationGlobalId: unknown
     orderGlobalId: unknown
     actorEmail: unknown
+    packageGlobalId?: unknown
   },
+  options: { allowCommittedFaireShipment?: boolean } = {},
 ) {
   const scopedOrganizationId = organizationId(input.organizationId)
   const authorizationGlobalId = String(input.authorizationGlobalId || '').trim()
@@ -265,6 +781,21 @@ export async function requireActiveSandboxCommerceE2eAuthorization(
   if (row.state !== 'active' || Date.parse(new Date(row.expires_at).toISOString()) <= Date.now()) {
     fail('SANDBOX_E2E_AUTHORIZATION_EXPIRED', 'Sandbox E2E authorization is no longer active', 403)
   }
+  if (
+    row.source_provider === 'faire'
+    && !options.allowCommittedFaireShipment
+    && !(await currentFaireEvidence(
+      client,
+      row,
+      String(input.packageGlobalId || '').trim() || null,
+    ))
+  ) {
+    fail(
+      'SANDBOX_E2E_FAIRE_EVIDENCE_STALE',
+      'Faire sandbox E2E authority no longer matches the exact candidate, mapped pack, package, origin, or destination',
+      403,
+    )
+  }
   return row
 }
 
@@ -277,7 +808,15 @@ export async function consumeSandboxCommerceE2eAuthorization(
     actorEmail: unknown
   },
 ) {
-  const row = await requireActiveSandboxCommerceE2eAuthorization(client, input)
+  // Shipment confirmation already revalidated the full Faire evidence before
+  // mutating the order, plan, and package to their shipped states. Consumption
+  // still re-locks and verifies the exact actor/order/authorization identity;
+  // it skips only the now-intentionally-obsolete packed-state predicate.
+  const row = await requireActiveSandboxCommerceE2eAuthorization(
+    client,
+    input,
+    { allowCommittedFaireShipment: true },
+  )
   const result = await client.query<AuthorizationRow>(
     `WITH updated AS (
          UPDATE operations_sandbox_commerce_e2e_authorizations
@@ -288,7 +827,8 @@ export async function consumeSandboxCommerceE2eAuthorization(
        SELECT updated.id::text, updated.global_id,
               updated.organization_id::text, updated.order_id::text,
               source_order.global_id AS order_global_id,
-              updated.external_order_id, updated.state, updated.reason,
+              updated.external_order_id, source_order.source_provider,
+              updated.state, updated.reason,
               updated.authorized_by, updated.authorized_at, updated.expires_at,
               updated.consumed_at, updated.consumed_by
        FROM updated
@@ -327,16 +867,25 @@ export async function readActiveSandboxCommerceE2eAuthorizationForOrderInPostgre
   if (!ORDER_GLOBAL_ID.test(orderGlobalId)) {
     fail('SANDBOX_E2E_ORDER_INVALID', 'Operations order is invalid', 400)
   }
-  const result = await query<AuthorizationRow>(
-    `${SELECT}
-     WHERE auth.organization_id = $1::uuid
-       AND source_order.global_id = $2
-       AND auth.authorized_by = $3
-       AND auth.state = 'active'
-       AND auth.expires_at > now()
-     ORDER BY auth.authorized_at DESC, auth.id DESC
-     LIMIT 1`,
-    [scopedOrganizationId, orderGlobalId, actorEmail],
-  )
-  return result.rows[0] ? map(result.rows[0]) : null
+  return withTransaction(async (client) => {
+    const result = await client.query<AuthorizationRow>(
+      `${SELECT}
+       WHERE auth.organization_id = $1::uuid
+         AND source_order.global_id = $2
+         AND auth.authorized_by = $3
+         AND auth.state = 'active'
+         AND auth.expires_at > now()
+       ORDER BY auth.authorized_at DESC, auth.id DESC
+       LIMIT 1
+       FOR SHARE OF auth`,
+      [scopedOrganizationId, orderGlobalId, actorEmail],
+    )
+    const row = result.rows[0]
+    if (!row) return null
+    if (
+      row.source_provider === 'faire'
+      && !(await currentFaireEvidence(client, row))
+    ) return null
+    return map(row)
+  })
 }

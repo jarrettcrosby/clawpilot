@@ -13743,6 +13743,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         )
       }
       let resolvedCustomerNotification: OperationsCustomerNotificationDecision
+      let sandboxE2eAuthorizationValidated = false
       if (sandboxE2eAuthorizationGlobalId) {
         await requireActiveSandboxCommerceE2eAuthorization(client, {
           organizationId,
@@ -13750,6 +13751,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           orderGlobalId,
           actorEmail,
         })
+        sandboxE2eAuthorizationValidated = true
       }
       if (order.source_provider === 'shopify') {
         if (!order.integration_account_id) {
@@ -14035,6 +14037,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
       if (
         order.source_provider === 'faire'
         && labelResult.rows.some((item) => item.environment !== 'production')
+        && !sandboxE2eAuthorizationValidated
       ) {
         throw new OperationsRequestError(
           'OPERATIONS_FAIRE_PRODUCTION_LABEL_REQUIRED',

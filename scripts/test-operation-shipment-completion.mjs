@@ -1421,6 +1421,151 @@ async function verifyShipmentCompletion(databaseUrl) {
     assert.equal(faireFulfillmentExecutionCalls, 0)
     assert.equal(faireFulfillmentInputs.length, 0)
 
+    // Exact Faire candidate/pack/package authority is exercised by the
+    // commerce-intake disposable-PostgreSQL acceptance. This focused fixture
+    // starts at the already-validated authorization boundary so the existing
+    // shipment transaction, one-use consumption, and Faire export cannot
+    // regress back to rejecting authorized sandbox labels.
+    await pool.query(
+      `UPDATE operations_labels label
+       SET environment = 'sandbox'
+       FROM operations_packages package,
+            operations_fulfillment_plans plan,
+            operations_orders source_order
+       WHERE label.organization_id = $1::uuid
+         AND label.organization_id = package.organization_id
+         AND label.package_id = package.id
+         AND package.organization_id = plan.organization_id
+         AND package.plan_id = plan.id
+         AND plan.organization_id = source_order.organization_id
+         AND plan.order_id = source_order.id
+         AND source_order.global_id = $2`,
+      [faireFixture.organizationId, faireOrder.planned.orderGlobalId],
+    )
+    const faireSandboxAuthorization = await pool.query(
+      `INSERT INTO operations_sandbox_commerce_e2e_authorizations (
+         organization_id, order_id, external_order_id,
+         confirmation_statement_version, confirmation_hash, reason,
+         authorized_by, expires_at
+       )
+       SELECT source_order.organization_id, source_order.id,
+              source_order.external_order_id,
+              'sandbox-commerce-e2e-v1', repeat('a', 64),
+              'Focused post-validation Faire sandbox shipment acceptance',
+              $3, now() + interval '30 minutes'
+       FROM operations_orders source_order
+       WHERE source_order.organization_id = $1::uuid
+         AND source_order.global_id = $2
+       RETURNING id::text, global_id`,
+      [
+        faireFixture.organizationId,
+        faireOrder.planned.orderGlobalId,
+        faireFixture.email,
+      ],
+    )
+    assert.equal(faireSandboxAuthorization.rowCount, 1)
+    const originalRequireSandboxAuthorization =
+      sandboxAuthorization.requireActiveSandboxCommerceE2eAuthorization
+    const originalConsumeSandboxAuthorization =
+      sandboxAuthorization.consumeSandboxCommerceE2eAuthorization
+    const requireValidatedFaireSandboxAuthorization = async (client, input) => {
+      const result = await client.query(
+        `SELECT sandbox_auth.id::text, sandbox_auth.organization_id::text,
+                sandbox_auth.order_id::text, sandbox_auth.authorized_by
+         FROM operations_sandbox_commerce_e2e_authorizations sandbox_auth
+         JOIN operations_orders source_order
+           ON source_order.organization_id = sandbox_auth.organization_id
+          AND source_order.id = sandbox_auth.order_id
+         WHERE sandbox_auth.organization_id = $1::uuid
+           AND sandbox_auth.global_id = $2
+           AND source_order.global_id = $3
+           AND sandbox_auth.authorized_by = $4
+           AND sandbox_auth.state = 'active'
+           AND sandbox_auth.expires_at > now()
+           AND sandbox_auth.external_order_id = source_order.external_order_id
+           AND source_order.source_provider = 'faire'
+         FOR UPDATE OF sandbox_auth`,
+        [
+          input.organizationId,
+          input.authorizationGlobalId,
+          input.orderGlobalId,
+          input.actorEmail,
+        ],
+      )
+      if (result.rowCount !== 1) {
+        const error = new Error(
+          'Exact actor/order active sandbox E2E authorization is required',
+        )
+        error.code = 'SANDBOX_E2E_AUTHORIZATION_REQUIRED'
+        error.status = 403
+        throw error
+      }
+      return result.rows[0]
+    }
+    sandboxAuthorization.requireActiveSandboxCommerceE2eAuthorization =
+      requireValidatedFaireSandboxAuthorization
+    sandboxAuthorization.consumeSandboxCommerceE2eAuthorization = async (
+      client,
+      input,
+    ) => {
+      const authorizationRow =
+        await requireValidatedFaireSandboxAuthorization(client, input)
+      const consumed = await client.query(
+        `UPDATE operations_sandbox_commerce_e2e_authorizations
+         SET state = 'consumed', consumed_at = now(), consumed_by = $3
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND state = 'active'
+         RETURNING id`,
+        [input.organizationId, authorizationRow.id, input.actorEmail],
+      )
+      assert.equal(consumed.rowCount, 1)
+      return consumed.rows[0]
+    }
+    let authorizedFaireResult
+    try {
+      authorizedFaireResult =
+        await persistence.confirmOperationsOrderShipmentFromPostgres({
+          organizationId: faireFixture.organizationId,
+          actorEmail: faireFixture.email,
+          orderGlobalId: faireOrder.planned.orderGlobalId,
+          expectedRowVersion: faireOrder.packed.rowVersion,
+          reason: 'Confirm authorized Faire sandbox shipment and writeback',
+          idempotencyKey: `confirm-authorized-faire-sandbox-${randomUUID()}`,
+          sandboxE2eAuthorizationGlobalId:
+            faireSandboxAuthorization.rows[0].global_id,
+        })
+    } finally {
+      sandboxAuthorization.requireActiveSandboxCommerceE2eAuthorization =
+        originalRequireSandboxAuthorization
+      sandboxAuthorization.consumeSandboxCommerceE2eAuthorization =
+        originalConsumeSandboxAuthorization
+    }
+    assert.equal(authorizedFaireResult.orderStatus, 'shipped')
+    assert.equal(authorizedFaireResult.commerceExportState, 'succeeded')
+    assert.equal(faireFulfillmentPreparationCalls, 1)
+    assert.equal(faireFulfillmentExecutionCalls, 1)
+    assert.equal(faireFulfillmentInputs.length, 1)
+    assert.deepEqual(
+      [...faireFulfillmentInputs[0].packages]
+        .map((item) => item.trackingCode)
+        .sort(),
+      [...faireTrackingNumbers].sort(),
+    )
+    const consumedFaireAuthorization = await pool.query(
+      `SELECT state, consumed_by
+       FROM operations_sandbox_commerce_e2e_authorizations
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [
+        faireFixture.organizationId,
+        faireSandboxAuthorization.rows[0].global_id,
+      ],
+    )
+    assert.deepEqual(consumedFaireAuthorization.rows[0], {
+      state: 'consumed',
+      consumed_by: faireFixture.email,
+    })
+
     const sandboxFixture = await createFixture('sandbox')
     const sandbox = await advanceOrderToPacked(persistence, sandboxFixture, 'sandbox')
     await addActiveLabel(pool, sandboxFixture, sandbox.planned.orderGlobalId, 'sandbox')

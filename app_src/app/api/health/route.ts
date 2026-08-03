@@ -405,6 +405,7 @@ export async function GET() {
           operations_sandbox_commerce_e2e_authorization_applied: boolean
           operations_commerce_active_canonical_collation_applied: boolean
           operations_sandbox_commerce_e2e_active_guards_applied: boolean
+          operations_faire_sandbox_commerce_e2e_applied: boolean
           operations_fulfillment_notification_policy_applied: boolean
           global_id_alphanumeric_compatibility_applied: boolean
           global_id_base32hex_allocator_applied: boolean
@@ -1400,7 +1401,7 @@ export async function GET() {
                 'operations_faire_provider_write_authority_is_current(uuid,uuid,uuid,text,integer,integer,text,text,text,bigint,text,text,text,jsonb,uuid)'
               ) IS NOT NULL
               AND position(
-                'auth.verified_write_scopes <@ evidence.verified_write_scopes'
+                'evidence.verified_write_scopes @> auth.verified_write_scopes'
                 IN pg_get_functiondef(
                   to_regprocedure(
                     'operations_faire_provider_write_authority_is_current(uuid,uuid,uuid,text,integer,integer,text,text,text,bigint,text,text,text,jsonb,uuid)'
@@ -2061,6 +2062,35 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename =
+                  '0231_operations_faire_sandbox_commerce_e2e.sql'
+              )
+              AND to_regclass(
+                'operations_sandbox_commerce_e2e_faire_evidence'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_sandbox_commerce_e2e_authorization_is_current(uuid,uuid,uuid)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_sandbox_commerce_e2e_faire_evidence()'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_sandbox_commerce_e2e_faire_evidence'
+                  )
+                  AND trigger_row.tgname =
+                    'protect_sandbox_commerce_e2e_faire_evidence_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'protect_sandbox_commerce_e2e_faire_evidence()'
+                  )
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              ) AS operations_faire_sandbox_commerce_e2e_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
                   '0223_operations_faire_inventory_observation_polling.sql'
               )
               AND to_regclass(
@@ -2367,6 +2397,7 @@ export async function GET() {
             && row?.operations_sandbox_commerce_e2e_authorization_applied
             && row?.operations_commerce_active_canonical_collation_applied
             && row?.operations_sandbox_commerce_e2e_active_guards_applied
+            && row?.operations_faire_sandbox_commerce_e2e_applied
             && row?.operations_fulfillment_notification_policy_applied
             && row?.global_id_alphanumeric_compatibility_applied
             && row?.global_id_base32hex_allocator_applied
@@ -2537,6 +2568,7 @@ export async function GET() {
           || !row?.operations_sandbox_commerce_e2e_authorization_applied
           || !row?.operations_commerce_active_canonical_collation_applied
           || !row?.operations_sandbox_commerce_e2e_active_guards_applied
+          || !row?.operations_faire_sandbox_commerce_e2e_applied
           || !row?.operations_fulfillment_notification_policy_applied
           || !row?.global_id_alphanumeric_compatibility_applied
           || !row?.global_id_base32hex_allocator_applied

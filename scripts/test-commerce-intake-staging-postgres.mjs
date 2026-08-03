@@ -732,6 +732,59 @@ function loadCommerceStagingService(pool, counters) {
   )
 }
 
+function loadSandboxCommerceE2eAuthorization(pool) {
+  const postgres = {
+    query: (sql, params = []) => pool.query(sql, params),
+    async withTransaction(operation) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const result = await operation(client)
+        await client.query('COMMIT')
+        return result
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {})
+        throw error
+      } finally {
+        client.release()
+      }
+    },
+  }
+  return loadTypeScriptModule(
+    'app_src/lib/persistence/sandboxCommerceE2eAuthorization.ts',
+    {
+      '@/lib/auditWriter': {
+        async recordAuditEvent(input, client) {
+          await client.query(
+            `INSERT INTO audit_events (
+               actor, event_type, aggregate_type, aggregate_id, payload,
+               event_key, subject, organization_id, is_system
+             ) VALUES (
+               $1, $2, $3, $4, $5::jsonb, $6, $7, $8::uuid, $9
+             )
+             ON CONFLICT (event_key) WHERE event_key IS NOT NULL DO NOTHING`,
+            [
+              input.actor || null,
+              input.eventType,
+              input.aggregateType || null,
+              input.aggregateId || null,
+              JSON.stringify(input.payload || {}),
+              input.eventKey || null,
+              input.subject || input.actor || null,
+              input.organizationId || null,
+              input.isSystem === true,
+            ],
+          )
+        },
+      },
+      '@/lib/operations/sandboxCommerceE2e': loadTypeScriptModule(
+        'app_src/lib/operations/sandboxCommerceE2e.ts',
+      ),
+      '@/lib/persistence/postgres': postgres,
+    },
+  )
+}
+
 function loadCommerceOrderReconciliationPersistence(pool) {
   return loadTypeScriptModule(
     'app_src/lib/persistence/commerceOrderReconciliation.ts',
@@ -1133,6 +1186,7 @@ async function verifyFaireExactVariantPackBinding(
   ids,
   persistence,
   counters,
+  sandboxAuthorization,
 ) {
   const runtime = {
     organizationId: ids.organization,
@@ -1214,8 +1268,8 @@ async function verifyFaireExactVariantPackBinding(
          evidence_reference, confirmed_at, confirmed_by, created_by
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-         1, 'customer_confirmed', 1, 'each', 120, 80, 60, 'outer',
-         454, 'customer_stated', 'customer_confirmed', 'manual', true,
+         1, 'customer_confirmed', 1, 'each', 203, 152, 51, 'outer',
+         170, 'customer_stated', 'customer_confirmed', 'manual', true,
          'Disposable PostgreSQL exact Faire pack acceptance', now(), $5, $5
        )
        RETURNING id::text, global_id, row_version::integer`,
@@ -1768,6 +1822,395 @@ async function verifyFaireExactVariantPackBinding(
     (error) => error?.code === 'COMMERCE_INTAKE_EXACT_PRODUCT_STATE_REQUIRED',
   )
   await assertRolledBack(staleBefore, staleKey)
+
+  const sideEffectsBeforeAuthorization = (await pool.query(
+    `SELECT
+       (SELECT count(*)::integer
+        FROM operations_commerce_provider_attempts
+        WHERE organization_id = $1::uuid) AS provider_attempts,
+       (SELECT count(*)::integer
+        FROM operations_labels
+        WHERE organization_id = $1::uuid) AS labels,
+       (SELECT count(*)::integer
+        FROM operations_commerce_fulfillment_exports
+        WHERE organization_id = $1::uuid) AS fulfillment_exports`,
+    [ids.organization],
+  )).rows[0]
+
+  const promotionSeed = await pool.connect()
+  let promotableCandidate
+  try {
+    await promotionSeed.query('BEGIN')
+    await promotionSeed.query('SET LOCAL session_replication_role = replica')
+    const candidateUpdate = await promotionSeed.query(
+      `UPDATE operations_commerce_order_candidates
+       SET customer_resolution_state = 'resolved',
+           customer_match_method = 'manual_test_fixture',
+           customer_id = $3::uuid,
+           requires_shipping = false,
+           delivery_resolution_state = 'not_required',
+           requested_delivery_at = NULL,
+           workflow_state = 'ready',
+           blocking_codes = '{}'::text[],
+           row_version = row_version + 1,
+           updated_by = $4,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+       RETURNING global_id, row_version::integer`,
+      [
+        ids.organization,
+        successCandidate.candidate_global_id,
+        ids.customer,
+        actorEmail,
+      ],
+    )
+    assert.equal(candidateUpdate.rowCount, 1)
+    promotableCandidate = candidateUpdate.rows[0]
+    const lineUpdate = await promotionSeed.query(
+      `UPDATE operations_commerce_order_candidate_lines
+       SET workflow_state = 'ready',
+           blocking_codes = '{}'::text[],
+           row_version = row_version + 1,
+           updated_by = $3,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+       RETURNING id`,
+      [ids.organization, successCandidate.line_global_id, actorEmail],
+    )
+    assert.equal(lineUpdate.rowCount, 1)
+    await promotionSeed.query('COMMIT')
+  } catch (error) {
+    await promotionSeed.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    promotionSeed.release()
+  }
+
+  const promoted = await persistence.promoteCommerceCandidateInPostgres({
+    runtime,
+    actorEmail,
+    idempotencyKey: 'commerce-staging-faire-sandbox-e2e-promotion',
+    candidateGlobalId: promotableCandidate.global_id,
+    candidateRowVersion: promotableCandidate.row_version,
+    requestHash: hash('commerce-staging-faire-sandbox-e2e-promotion'),
+  })
+  assert.equal(promoted.providerWrites, 0)
+  assert.equal(promoted.fulfillmentWrites, 0)
+  assert.equal(promoted.shipmentWrites, 0)
+
+  const destination = {
+    name: 'Jarrett Crosby',
+    line1: '16691 Gothard St',
+    line2: 'Suite Q',
+    city: 'Huntington Beach',
+    region: 'CA',
+    postalCode: '92647',
+    country: 'US',
+  }
+  const canonicalSeed = await pool.connect()
+  let packageGlobalId
+  try {
+    await canonicalSeed.query('BEGIN')
+    await canonicalSeed.query('SET LOCAL session_replication_role = replica')
+    const order = await canonicalSeed.query(
+      `UPDATE operations_orders
+       SET status = 'packed', ship_to = $3::jsonb,
+           updated_by = $4, updated_at = now(),
+           row_version = row_version + 1
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+       RETURNING id::text, global_id`,
+      [
+        ids.organization,
+        promoted.canonicalOrderGlobalId,
+        JSON.stringify(destination),
+        actorEmail,
+      ],
+    )
+    assert.equal(order.rowCount, 1)
+    const orderId = order.rows[0].id
+    const candidate = await canonicalSeed.query(
+      `UPDATE operations_commerce_order_candidates
+       SET requires_shipping = true,
+           ship_to_snapshot_state = 'confirmed',
+           ship_to_snapshot_source = 'provider',
+           ship_to_snapshot_ciphertext = decode('0001', 'hex'),
+           ship_to_snapshot_iv = decode(repeat('00', 12), 'hex'),
+           ship_to_snapshot_tag = decode(repeat('00', 16), 'hex'),
+           ship_to_snapshot_hash = $3,
+           ship_to_snapshot_encryption_version = 1,
+           delivery_resolution_state = 'manual',
+           requested_delivery_at = now() + interval '5 days',
+           row_version = row_version + 1,
+           updated_by = $4,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+         AND workflow_state = 'promoted'
+       RETURNING id`,
+      [
+        ids.organization,
+        successCandidate.candidate_global_id,
+        hash(JSON.stringify(destination)),
+        actorEmail,
+      ],
+    )
+    assert.equal(candidate.rowCount, 1)
+    const warehouse = await canonicalSeed.query(
+      `INSERT INTO operations_warehouses (
+         organization_id, code, name, timezone, address,
+         status, created_by, updated_by
+       ) VALUES (
+         $1::uuid, 'FAIRE-E2E', 'Faire sandbox E2E warehouse',
+         'America/Los_Angeles', $2::jsonb, 'active', $3, $3
+       ) RETURNING id::text`,
+      [
+        ids.organization,
+        JSON.stringify({
+          name: 'ClawPilot test warehouse',
+          line1: '16691 Gothard St',
+          line2: 'Suite Q',
+          city: 'Huntington Beach',
+          region: 'CA',
+          postalCode: '92647',
+          country: 'US',
+        }),
+        actorEmail,
+      ],
+    )
+    const plan = await canonicalSeed.query(
+      `INSERT INTO operations_fulfillment_plans (
+         organization_id, order_id, warehouse_id, version_number,
+         status, method, solver_status, promised_delivery_at,
+         explanation, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 1, 'released', 'manual_override',
+         'test_fixture', now() + interval '5 days',
+         '{"carrierReadEnvironment":"sandbox"}'::jsonb, $4
+       ) RETURNING id::text`,
+      [ids.organization, orderId, warehouse.rows[0].id, actorEmail],
+    )
+    const packageRow = await canonicalSeed.query(
+      `INSERT INTO operations_packages (
+         organization_id, plan_id, package_number,
+         length_mm, width_mm, height_mm, weight_grams,
+         status, packed_by, packed_at
+       ) VALUES (
+         $1::uuid, $2::uuid, 1, 203, 152, 51, 170,
+         'packed', $3, now()
+       ) RETURNING id::text, global_id`,
+      [ids.organization, plan.rows[0].id, actorEmail],
+    )
+    packageGlobalId = packageRow.rows[0].global_id
+    const canonicalLine = await canonicalSeed.query(
+      `SELECT id::text
+       FROM operations_order_lines
+       WHERE organization_id = $1::uuid
+         AND order_id = $2::uuid`,
+      [ids.organization, orderId],
+    )
+    assert.equal(canonicalLine.rowCount, 1)
+    await canonicalSeed.query(
+      `INSERT INTO operations_package_contents (
+         organization_id, plan_id, order_id, package_id,
+         order_line_id, quantity, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+         $5::uuid, 1, $6
+       )`,
+      [
+        ids.organization,
+        plan.rows[0].id,
+        orderId,
+        packageRow.rows[0].id,
+        canonicalLine.rows[0].id,
+        actorEmail,
+      ],
+    )
+    await canonicalSeed.query('COMMIT')
+  } catch (error) {
+    await canonicalSeed.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    canonicalSeed.release()
+  }
+
+  const authorizationInput = {
+    organizationId: ids.organization,
+    actorEmail,
+    orderGlobalId: promoted.canonicalOrderGlobalId,
+    confirmationStatement:
+      sandboxAuthorization.SANDBOX_COMMERCE_E2E_CONFIRMATION,
+    reason: 'Authorize exact Faire sandbox E2E disposable PostgreSQL test',
+    lifetimeMinutes: 30,
+  }
+  await assert.rejects(
+    sandboxAuthorization.authorizeSandboxCommerceE2eInPostgres({
+      ...authorizationInput,
+      confirmationStatement: 'not the exact operator confirmation',
+    }),
+    (error) => error?.code === 'SANDBOX_E2E_CONFIRMATION_REQUIRED',
+  )
+  const authorization = await sandboxAuthorization
+    .authorizeSandboxCommerceE2eInPostgres(authorizationInput)
+  assert.equal(authorization.sourceProvider, 'faire')
+  assert.equal(authorization.state, 'active')
+  assert.equal(
+    (await sandboxAuthorization.authorizeSandboxCommerceE2eInPostgres(
+      authorizationInput,
+    )).authorizationGlobalId,
+    authorization.authorizationGlobalId,
+  )
+  const evidence = (await pool.query(
+    `SELECT
+       pack_profile_version_global_id,
+       package_global_id,
+       item_quantity::text,
+       length_mm, width_mm, height_mm, gross_weight_grams,
+       destination_region, destination_country_code,
+       evidence_hash
+     FROM operations_sandbox_commerce_e2e_faire_evidence
+     WHERE organization_id = $1::uuid
+       AND authorization_id = (
+         SELECT id
+         FROM operations_sandbox_commerce_e2e_authorizations
+         WHERE organization_id = $1::uuid AND global_id = $2
+       )`,
+    [ids.organization, authorization.authorizationGlobalId],
+  )).rows[0]
+  assert.deepEqual(evidence, {
+    pack_profile_version_global_id: packVersion.global_id,
+    package_global_id: packageGlobalId,
+    item_quantity: '1.000000',
+    length_mm: 203,
+    width_mm: 152,
+    height_mm: 51,
+    gross_weight_grams: 170,
+    destination_region: 'CA',
+    destination_country_code: 'US',
+    evidence_hash: evidence.evidence_hash,
+  })
+  assert.match(evidence.evidence_hash, /^[a-f0-9]{64}$/u)
+  await assert.rejects(
+    pool.query(
+      `UPDATE operations_sandbox_commerce_e2e_faire_evidence
+       SET gross_weight_grams = 171
+       WHERE organization_id = $1::uuid
+         AND package_global_id = $2`,
+      [ids.organization, packageGlobalId],
+    ),
+    /Faire sandbox commerce E2E evidence is immutable/,
+  )
+
+  const withAuthorizationTransaction = async (operation) => {
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      const result = await operation(client)
+      await client.query('COMMIT')
+      return result
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      client.release()
+    }
+  }
+  await assert.rejects(
+    withAuthorizationTransaction((client) => (
+      sandboxAuthorization.requireActiveSandboxCommerceE2eAuthorization(
+        client,
+        {
+          organizationId: ids.organization,
+          authorizationGlobalId: authorization.authorizationGlobalId,
+          orderGlobalId: promoted.canonicalOrderGlobalId,
+          actorEmail,
+          packageGlobalId: 'gpa000000000000',
+        },
+      )
+    )),
+    (error) => error?.code === 'SANDBOX_E2E_FAIRE_EVIDENCE_STALE',
+  )
+  await pool.query(
+    `UPDATE operations_packages
+     SET weight_grams = 171
+     WHERE organization_id = $1::uuid AND global_id = $2`,
+    [ids.organization, packageGlobalId],
+  )
+  await assert.rejects(
+    withAuthorizationTransaction((client) => (
+      sandboxAuthorization.requireActiveSandboxCommerceE2eAuthorization(
+        client,
+        {
+          organizationId: ids.organization,
+          authorizationGlobalId: authorization.authorizationGlobalId,
+          orderGlobalId: promoted.canonicalOrderGlobalId,
+          actorEmail,
+          packageGlobalId,
+        },
+      )
+    )),
+    (error) => error?.code === 'SANDBOX_E2E_FAIRE_EVIDENCE_STALE',
+  )
+  await pool.query(
+    `UPDATE operations_packages
+     SET weight_grams = 170
+     WHERE organization_id = $1::uuid AND global_id = $2`,
+    [ids.organization, packageGlobalId],
+  )
+  await withAuthorizationTransaction((client) => (
+    sandboxAuthorization.requireActiveSandboxCommerceE2eAuthorization(
+      client,
+      {
+        organizationId: ids.organization,
+        authorizationGlobalId: authorization.authorizationGlobalId,
+        orderGlobalId: promoted.canonicalOrderGlobalId,
+        actorEmail,
+        packageGlobalId,
+      },
+    )
+  ))
+  const consumed = await withAuthorizationTransaction((client) => (
+    sandboxAuthorization.consumeSandboxCommerceE2eAuthorization(
+      client,
+      {
+        organizationId: ids.organization,
+        authorizationGlobalId: authorization.authorizationGlobalId,
+        orderGlobalId: promoted.canonicalOrderGlobalId,
+        actorEmail,
+      },
+    )
+  ))
+  assert.equal(consumed.state, 'consumed')
+  await assert.rejects(
+    withAuthorizationTransaction((client) => (
+      sandboxAuthorization.consumeSandboxCommerceE2eAuthorization(
+        client,
+        {
+          organizationId: ids.organization,
+          authorizationGlobalId: authorization.authorizationGlobalId,
+          orderGlobalId: promoted.canonicalOrderGlobalId,
+          actorEmail,
+        },
+      )
+    )),
+    (error) => error?.code === 'SANDBOX_E2E_AUTHORIZATION_EXPIRED',
+  )
+  assert.deepEqual((await pool.query(
+    `SELECT
+       (SELECT count(*)::integer
+        FROM operations_commerce_provider_attempts
+        WHERE organization_id = $1::uuid) AS provider_attempts,
+       (SELECT count(*)::integer
+        FROM operations_labels
+        WHERE organization_id = $1::uuid) AS labels,
+       (SELECT count(*)::integer
+        FROM operations_commerce_fulfillment_exports
+        WHERE organization_id = $1::uuid) AS fulfillment_exports`,
+    [ids.organization],
+  )).rows[0], sideEffectsBeforeAuthorization)
 }
 
 async function verifyCustomerPrefetchBinding(
@@ -3835,7 +4278,13 @@ async function verifyAcceptance(databaseUrl) {
     4,
     'Only still-unresolved prior-run candidates belong in the backlog sweep',
   )
-  await verifyFaireExactVariantPackBinding(pool, ids, persistence, counters)
+  await verifyFaireExactVariantPackBinding(
+    pool,
+    ids,
+    persistence,
+    counters,
+    loadSandboxCommerceE2eAuthorization(pool),
+  )
   await verifyCustomerPrefetchBinding(pool, ids, persistence, counters)
   await pool.end()
 }

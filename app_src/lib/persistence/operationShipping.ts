@@ -879,6 +879,7 @@ async function prepareAttempt(input: {
           authorizationGlobalId: input.sandboxE2eAuthorizationGlobalId,
           orderGlobalId: input.orderGlobalId,
           actorEmail: input.actorEmail,
+          packageGlobalId: input.packageGlobalId,
         })
       }
       assertCreateContext(
