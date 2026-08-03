@@ -14,6 +14,7 @@ const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
 )
 const { Pool } = requireFromApp('pg')
+const sharp = requireFromApp('sharp')
 const ts = requireFromApp('typescript')
 let runtimePool = null
 
@@ -596,6 +597,62 @@ async function verify(pool) {
   )
   assert.equal(primaryAfterEcho.rows[0].id, second.assetId)
 
+  const transformedProduct = await addProduct(
+    pool,
+    tenant,
+    'transformed-echo',
+    '99999999-9999-4999-8999-999999999999',
+  )
+  const transformedSource = await addManualPrimary(
+    pool,
+    tenant,
+    transformedProduct,
+    FOUR_BY_FIVE_WEBP,
+    'image/webp',
+    'Transformed echo authority',
+  )
+  const transformedPng = await sharp(Buffer.from(FOUR_BY_FIVE_WEBP), {
+    failOn: 'warning',
+    limitInputPixels: 40_000_000,
+  }).rotate().png({
+    compressionLevel: 9,
+    adaptiveFiltering: true,
+  }).toBuffer()
+  const transformedEcho = await ingestion
+    .ingestSuiteCrmProductImageSnapshotInPostgres(
+      imageInput(tenant, transformedProduct, {
+        modifiedAt: '2026-08-02T12:15:00Z',
+        mimeType: 'image/png',
+        bytes: transformedPng,
+        originalName: `${transformedProduct.referenceCode}-${sha256(FOUR_BY_FIVE_WEBP)}-${sha256(transformedPng)}.png`,
+      }),
+    )
+  assert.equal(transformedEcho.resolution, 'echo_suppressed')
+  assert.notEqual(transformedEcho.assetId, transformedSource.id)
+  assert.equal(transformedEcho.contentSha256, sha256(transformedPng))
+  assert.equal(transformedEcho.promotedToPrimary, false)
+  const transformedAssets = await pool.query(
+    `SELECT id::text, source, content_sha256, is_primary
+     FROM crm_product_image_assets
+     WHERE pipeline_id = $1::uuid AND product_id = $2::uuid
+     ORDER BY asset_revision`,
+    [tenant.pipelineId, transformedProduct.id],
+  )
+  assert.deepEqual(transformedAssets.rows, [
+    {
+      id: transformedSource.id,
+      source: 'manual_upload',
+      content_sha256: sha256(FOUR_BY_FIVE_WEBP),
+      is_primary: true,
+    },
+    {
+      id: transformedEcho.assetId,
+      source: 'suitecrm_import',
+      content_sha256: sha256(transformedPng),
+      is_primary: false,
+    },
+  ])
+
   const manualProduct = await addProduct(
     pool,
     tenant,
@@ -662,7 +719,7 @@ async function verify(pool) {
   assert.equal(health.providerWrites, 0)
   assert.equal(health.importedPrimary, 2)
   assert.equal(health.importedSecondary, 1)
-  assert.equal(health.echoesSuppressed, 1)
+  assert.equal(health.echoesSuppressed, 2)
   assert.equal(health.identityConflicts, 1)
   assert.equal(health.mediaIntegrityConflicts, 1)
   assert.equal(health.heartbeat.phase, 'degraded')

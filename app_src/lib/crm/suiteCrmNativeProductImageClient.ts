@@ -663,23 +663,21 @@ export async function projectSuiteCrmNativeProductImage(
     productReferenceCode: referenceCode,
     contentSha256,
   })
-  const extensionFromCurrent = current?.originalName.split('.').at(-1)?.toLowerCase()
-  if (
-    current
-    && extensionFromCurrent
-    && Object.values(MEDIA_EXTENSION).includes(extensionFromCurrent)
-    && current.originalName === `${referenceCode}-${contentSha256}.${extensionFromCurrent}`
-  ) {
-    return { action: 'unchanged', mediaId: current.id }
-  }
-
   const sourceImage = await fetchProductImage(
     imageUrl,
     contentSha256,
     fetchImpl,
   )
   const image = await suiteCrmCompatibleProductImage(sourceImage)
-  const filename = `${referenceCode}-${contentSha256}.${image.extension}`
+  const projectedContentSha256 = createHash('sha256')
+    .update(image.bytes)
+    .digest('hex')
+  const filename = projectedContentSha256 === contentSha256
+    ? `${referenceCode}-${contentSha256}.${image.extension}`
+    : `${referenceCode}-${contentSha256}-${projectedContentSha256}.${image.extension}`
+  if (current?.originalName === filename) {
+    return { action: 'unchanged', mediaId: current.id }
+  }
   const uploaded = await uploadProductImage(session, {
     bytes: image.bytes,
     mimeType: image.mimeType,

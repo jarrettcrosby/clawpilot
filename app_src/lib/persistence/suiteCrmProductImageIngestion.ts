@@ -189,15 +189,22 @@ function safeOriginalName(value: unknown) {
   return originalName
 }
 
-function deterministicClawPilotContentHash(
+function deterministicClawPilotImageIdentity(
   originalName: string,
   referenceCode: string,
 ) {
   const escapedReference = referenceCode.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
   const match = originalName.toLowerCase().match(
-    new RegExp(`^${escapedReference}-([0-9a-f]{64})\\.(?:jpg|jpeg|png|webp)$`, 'u'),
+    new RegExp(
+      `^${escapedReference}-([0-9a-f]{64})(?:-([0-9a-f]{64}))?\\.(?:jpg|jpeg|png|webp)$`,
+      'u',
+    ),
   )
-  return match?.[1] || null
+  if (!match?.[1]) return null
+  return {
+    sourceContentSha256: match[1],
+    mediaContentSha256: match[2] || match[1],
+  }
 }
 
 function evidenceResult(row: EvidenceRow, replayed: boolean): SuiteCrmProductImageIngestionResult {
@@ -638,7 +645,7 @@ export async function ingestSuiteCrmProductImageSnapshotInPostgres(input: {
         removedSuiteCrmImportedPrimary = true
       }
     } else {
-      const deterministicHash = deterministicClawPilotContentHash(
+      const deterministicIdentity = deterministicClawPilotImageIdentity(
         originalName,
         exactProduct.reference_code,
       )
@@ -665,15 +672,102 @@ export async function ingestSuiteCrmProductImageSnapshotInPostgres(input: {
         ],
       )
       const existing = existingResult.rows[0] || null
-      if (deterministicHash && deterministicHash !== image.contentSha256) {
+      const sourceAssetResult = deterministicIdentity
+        && deterministicIdentity.sourceContentSha256
+          !== deterministicIdentity.mediaContentSha256
+        ? await client.query<AssetRow>(
+          `SELECT
+             id::text,
+             asset_revision::text,
+             row_version::text,
+             content_sha256,
+             source,
+             is_primary
+           FROM crm_product_image_assets
+           WHERE organization_id = $1::uuid
+             AND pipeline_id = $2::uuid
+             AND product_id = $3::uuid
+             AND content_sha256 = $4
+           LIMIT 1
+           FOR UPDATE`,
+          [
+            input.organizationId,
+            exactProduct.pipeline_id,
+            exactProduct.product_id,
+            deterministicIdentity.sourceContentSha256,
+          ],
+        )
+        : null
+      const sourceAsset = sourceAssetResult?.rows[0] || null
+      if (
+        deterministicIdentity
+        && deterministicIdentity.mediaContentSha256 !== image.contentSha256
+      ) {
         resolution = 'media_integrity_conflict'
         conflictReason = 'clawpilot_filename_content_mismatch'
-      } else if (deterministicHash && !existing) {
+      } else if (
+        deterministicIdentity
+        && !existing
+        && deterministicIdentity.sourceContentSha256
+          === deterministicIdentity.mediaContentSha256
+      ) {
         resolution = 'media_integrity_conflict'
         conflictReason = 'clawpilot_echo_asset_missing'
-      } else if (deterministicHash && existing) {
+      } else if (deterministicIdentity && !existing && !sourceAsset) {
+        resolution = 'media_integrity_conflict'
+        conflictReason = 'clawpilot_echo_asset_missing'
+      } else if (deterministicIdentity && existing) {
         resolution = 'echo_suppressed'
         resultAsset = existing
+      } else if (deterministicIdentity && sourceAsset) {
+        const nextRevision = await client.query<{ next_revision: string }>(
+          `SELECT (COALESCE(max(asset_revision), 0) + 1)::text AS next_revision
+           FROM crm_product_image_assets
+           WHERE organization_id = $1::uuid
+             AND pipeline_id = $2::uuid
+             AND product_id = $3::uuid`,
+          [input.organizationId, exactProduct.pipeline_id, exactProduct.product_id],
+        )
+        const inserted = await client.query<AssetRow>(
+          `INSERT INTO crm_product_image_assets (
+             organization_id, pipeline_id, product_id, asset_revision,
+             content_bytes, mime_type, content_sha256, byte_length,
+             pixel_width, pixel_height, alt_text, source, is_primary,
+             row_version, created_by, updated_by, created_at, updated_at
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, $4, $5::bytea, $6, $7, $8,
+             $9, $10, $11, 'suitecrm_import', false, 1, $12, $12,
+             clock_timestamp(), clock_timestamp()
+           )
+           RETURNING id::text, asset_revision::text, row_version::text,
+             content_sha256, source, is_primary`,
+          [
+            input.organizationId,
+            exactProduct.pipeline_id,
+            exactProduct.product_id,
+            positiveInteger(
+              nextRevision.rows[0]?.next_revision || 1,
+              'next asset revision',
+            ),
+            Buffer.from(image.bytes),
+            image.mimeType,
+            image.contentSha256,
+            image.byteLength,
+            image.pixelWidth,
+            image.pixelHeight,
+            image.altText,
+            actorEmail,
+          ],
+        )
+        resultAsset = inserted.rows[0] || null
+        if (!resultAsset) {
+          fail(
+            'SUITECRM_PRODUCT_IMAGE_ASSET_SAVE_FAILED',
+            'SuiteCRM transformed Product image evidence could not be saved',
+            500,
+          )
+        }
+        resolution = 'echo_suppressed'
       } else if (existing?.is_primary) {
         resolution = 'echo_suppressed'
         resultAsset = existing

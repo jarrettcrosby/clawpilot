@@ -313,7 +313,10 @@ const SUITECRM_PNG_BYTES = await sharp(WEBP_BYTES, {
   compressionLevel: 9,
   adaptiveFiltering: true,
 }).toBuffer()
-const WEBP_UPLOAD_FILENAME = `${PRODUCT_REFERENCE}-${WEBP_SHA256}.png`
+const SUITECRM_PNG_SHA256 = createHash('sha256')
+  .update(SUITECRM_PNG_BYTES)
+  .digest('hex')
+const WEBP_UPLOAD_FILENAME = `${PRODUCT_REFERENCE}-${WEBP_SHA256}-${SUITECRM_PNG_SHA256}.png`
 const webpMock = mockSuiteCrm({
   imageBytes: WEBP_BYTES,
   mimeType: 'image/webp',
@@ -339,6 +342,18 @@ assert.deepEqual(webpMock.savedFieldValue(), {
     contentUrl: '/api/private-image-media-objects/media',
   },
 })
+assert.deepEqual(
+  await client.projectSuiteCrmNativeProductImage(record({
+    referenceCode: PRODUCT_REFERENCE,
+    contentSha256: WEBP_SHA256,
+  }), webpMock.fetchImpl),
+  { action: 'unchanged', mediaId: MEDIA_ID },
+)
+assert.equal(
+  webpMock.calls.filter(({ url }) => url.pathname === '/api/private-image-media-objects').length,
+  1,
+  'a converted image retry must not upload another media object',
+)
 
 assert.deepEqual(
   await client.projectSuiteCrmNativeProductImage(record({
@@ -398,8 +413,8 @@ assert.deepEqual(
 )
 assert.equal(
   unchangedMock.calls.some(({ url }) => url.origin === 'https://clawpilot.example.test'),
-  false,
-  'an attached deterministic media object must avoid re-fetch and re-upload',
+  true,
+  'an attached deterministic media object must re-fetch its source to verify conversion lineage',
 )
 
 const clearMock = mockSuiteCrm({
