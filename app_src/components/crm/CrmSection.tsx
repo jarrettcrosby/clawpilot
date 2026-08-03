@@ -336,6 +336,21 @@ function productSalesChannels(record: RecordValue) {
   ))
 }
 
+function isFaireProductImageChannel(
+  channel: ProductSalesChannelState,
+) {
+  if (channel.provider !== 'faire') return false
+  const lifecycle = channel.providerStatusRaw.trim().toUpperCase()
+  if (!['DRAFT', 'PUBLISHED', 'ACTIVE'].includes(lifecycle)) return false
+  return (
+    channel.normalizedStatus === 'active'
+    && channel.providerActive === true
+  ) || (
+    channel.normalizedStatus === 'unavailable'
+    && channel.providerActive === false
+  )
+}
+
 function salesChannelStatusLabel(
   status: ProductSalesChannelState['normalizedStatus'],
 ) {
@@ -2428,10 +2443,7 @@ export default function CrmSection() {
                       && channel.providerActive === true,
                   )}
                   faireChannels={productSalesChannels(editorRecord).filter(
-                    (channel) =>
-                      channel.provider === 'faire'
-                      && channel.normalizedStatus === 'active'
-                      && channel.providerActive === true,
+                    isFaireProductImageChannel,
                   )}
                 />
               </>

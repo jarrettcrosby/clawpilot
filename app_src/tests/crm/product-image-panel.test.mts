@@ -55,6 +55,13 @@ test('CRM Product editor integrates the responsive image panel', () => {
     crmSection,
     /shopifyChannels=\{productSalesChannels\(editorRecord\)\.filter/,
   )
+  assert.match(
+    crmSection,
+    /faireChannels=\{productSalesChannels\(editorRecord\)\.filter\(\s*isFaireProductImageChannel/,
+  )
+  assert.match(crmSection, /\['DRAFT', 'PUBLISHED', 'ACTIVE'\]/)
+  assert.match(crmSection, /channel\.normalizedStatus === 'unavailable'/)
+  assert.match(crmSection, /channel\.providerActive === false/)
   assert.match(panel, /direction=\{\{ xs: 'column', sm: 'row' \}\}/)
 })
 
