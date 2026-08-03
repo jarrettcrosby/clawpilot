@@ -312,6 +312,7 @@ for (const missingField of [
 
 const fulfillmentCandidate = {
   global_id: 'gcol0000001',
+  provider: 'shopify',
   product_id: '00000000-0000-4000-8000-000000000010',
   product_global_id: 'gp0000001',
   product_title_snapshot: 'Test Product',
@@ -339,6 +340,7 @@ const fulfillmentCandidate = {
   channel_source_revision: 'source-revision-a',
   channel_source_hash: 'source-hash-a',
   channel_pack_evidence_hash: 'a'.repeat(64),
+  channel_provider_status_raw: 'active',
   channel_weight_grams: 170,
   pack_profile_version_id: '00000000-0000-4000-8000-000000000030',
   pack_profile_version_global_id: 'gppv0000001',
@@ -366,6 +368,42 @@ const fulfillmentCandidate = {
   fulfillment_pack_source: 'candidate_capture',
   checkout_pack_baseline: checkoutPackBaseline,
 }
+
+const publishedFaireSoldOutCandidate = {
+  ...fulfillmentCandidate,
+  provider: 'faire',
+  external_product_id: 'p_testproduct',
+  external_variant_id: 'po_testvariant',
+  pack_mapping_purpose: 'catalog',
+  channel_provider_status_raw: 'PUBLISHED',
+  channel_normalized_status: 'unavailable',
+  channel_provider_active: false,
+  channel_requires_shipping: null,
+  pack_lineage_source: 'order_candidate_capture',
+  checkout_receipt_global_id: null,
+  checkout_pack_baseline: null,
+}
+assert.doesNotThrow(
+  () => mapCandidateLines(
+    { mode: 'production' },
+    [publishedFaireSoldOutCandidate],
+  ),
+  'A published Faire order may retain its exact catalog pack capture after the listing sells out',
+)
+assert.throws(
+  () => mapCandidateLines(
+    { mode: 'production' },
+    [{
+      ...publishedFaireSoldOutCandidate,
+      channel_provider_status_raw: 'DRAFT',
+    }],
+  ),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code === 'HYBRID_CARTONIZATION_PACK_EVIDENCE_REQUIRED'
+  ),
+  'Faire order capture must not waive current-pack checks for nonpublished listings',
+)
 
 const aggregatedCandidateLines = [{
   ...fulfillmentCandidate,

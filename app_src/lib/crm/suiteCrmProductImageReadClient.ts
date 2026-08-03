@@ -481,6 +481,7 @@ function safePage(input: {
 class SuiteCrmProductImageReader implements SuiteCrmProductImageReadClient {
   private accessToken: { value: string; expiresAt: number } | null = null
   private mediaSession: SuiteCrmReadSession | null = null
+  private readonly exactRecordCountBySnapshot = new Map<string, number>()
 
   constructor(
     private readonly baseUrl: string,
@@ -516,6 +517,71 @@ class SuiteCrmProductImageReader implements SuiteCrmProductImageReadClient {
     const ttl = Math.max(60, Math.min(Number(parsed.expires_in) || 3600, 86_400))
     this.accessToken = { value: token, expiresAt: Date.now() + ttl * 1000 }
     return token
+  }
+
+  private async exactRecordCountFromLastPage(input: {
+    token: string
+    parameters: URLSearchParams
+    totalPages: number
+    pageSize: number
+    snapshotKey: string
+  }) {
+    const cached = this.exactRecordCountBySnapshot.get(input.snapshotKey)
+    if (cached !== undefined) return cached
+    const lastPageParameters = new URLSearchParams(input.parameters)
+    lastPageParameters.set('page[number]', String(input.totalPages))
+    const response = await this.fetchImpl(
+      `${this.baseUrl}/Api/V8/module/AOS_Products?${lastPageParameters}`,
+      {
+        method: 'GET',
+        headers: {
+          Accept: 'application/vnd.api+json',
+          Authorization: `Bearer ${input.token}`,
+        },
+        cache: 'no-store',
+        redirect: 'error',
+        signal: AbortSignal.timeout(20_000),
+      },
+    )
+    const parsed = await readBoundedJson(response)
+    if (!response.ok) {
+      const detail = errorDetail(parsed)
+      throw new Error(`SuiteCRM Product image listing failed (${response.status})${
+        detail ? `: ${detail}` : ''
+      }`)
+    }
+    if (!Array.isArray(parsed.data)) {
+      throw new Error('SuiteCRM returned an invalid Product collection')
+    }
+    const lastPageRecords = parsed.data.length
+    const meta = parsed.meta
+    const lastTotalPages = Number(
+      meta && typeof meta === 'object' && !Array.isArray(meta)
+        ? (meta as JsonObject)['total-pages']
+        : undefined,
+    )
+    const recordsOnLastPageRaw = meta
+      && typeof meta === 'object'
+      && !Array.isArray(meta)
+      ? (meta as JsonObject)['records-on-this-page']
+      : undefined
+    if (
+      !Number.isSafeInteger(lastTotalPages)
+      || lastTotalPages !== input.totalPages
+      || lastPageRecords < 1
+      || lastPageRecords > input.pageSize
+      || (
+        recordsOnLastPageRaw !== undefined
+        && Number(recordsOnLastPageRaw) !== lastPageRecords
+      )
+    ) throw new Error('SuiteCRM returned inconsistent Product pagination metadata')
+    const totalRecords = (input.totalPages - 1) * input.pageSize
+      + lastPageRecords
+    if (!Number.isSafeInteger(totalRecords) || totalRecords < 0) {
+      throw new Error('SuiteCRM returned invalid Product record count metadata')
+    }
+    this.exactRecordCountBySnapshot.set(input.snapshotKey, totalRecords)
+    return totalRecords
   }
 
   async listProductsUpdatedSince(input: {
@@ -608,21 +674,44 @@ class SuiteCrmProductImageReader implements SuiteCrmProductImageReadClient {
       || !Number.isSafeInteger(totalPages)
       || totalPages < 0
     ) throw new Error('SuiteCRM returned invalid Product pagination metadata')
+    const normalizedTotalPages = Math.max(1, totalPages)
+    if (
+      cursor.page > normalizedTotalPages
+      || (
+        cursor.page < normalizedTotalPages
+        && products.length !== cursor.pageSize
+      )
+    ) throw new Error('SuiteCRM returned inconsistent Product pagination metadata')
     const rawTotalRecords = meta
       && typeof meta === 'object'
       && !Array.isArray(meta)
       ? (meta as JsonObject)['total-records']
         ?? (meta as JsonObject).totalRecords
       : undefined
-    const totalRecords = Number(rawTotalRecords)
-    if (
-      rawTotalRecords === undefined
+    const totalRecords = rawTotalRecords === undefined
       || rawTotalRecords === null
-      || !Number.isSafeInteger(totalRecords)
+      ? normalizedTotalPages === 1
+        ? products.length
+        : cursor.page === normalizedTotalPages
+          ? (normalizedTotalPages - 1) * cursor.pageSize + products.length
+          : await this.exactRecordCountFromLastPage({
+            token,
+            parameters,
+            totalPages: normalizedTotalPages,
+            pageSize: cursor.pageSize,
+            snapshotKey: [
+              cursor.updatedSince,
+              cursor.updatedBeforeOrAt,
+              cursor.pageSize,
+              normalizedTotalPages,
+            ].join(':'),
+          })
+      : Number(rawTotalRecords)
+    if (
+      !Number.isSafeInteger(totalRecords)
       || totalRecords < 0
       || totalRecords < products.length
     ) throw new Error('SuiteCRM returned invalid Product record count metadata')
-    const normalizedTotalPages = Math.max(1, totalPages)
     if (
       normalizedTotalPages !== Math.max(
         1,

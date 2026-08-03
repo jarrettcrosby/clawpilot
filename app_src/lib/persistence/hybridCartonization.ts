@@ -267,6 +267,7 @@ type InventoryRunRow = {
 
 type CandidateLineRow = {
   global_id: string
+  provider: 'shopify' | 'faire'
   product_id: string | null
   product_global_id: string | null
   product_title_snapshot: string
@@ -294,6 +295,7 @@ type CandidateLineRow = {
   channel_source_revision: string | null
   channel_source_hash: string | null
   channel_pack_evidence_hash: string | null
+  channel_provider_status_raw: string | null
   channel_normalized_status: string | null
   channel_provider_active: boolean | null
   channel_requires_shipping: boolean | null
@@ -2034,6 +2036,7 @@ async function readCandidateLines(
   const result = await client.query<CandidateLineRow>(
     `SELECT
        line.global_id,
+       line.provider,
        line.product_id::text,
        product.reference_code AS product_global_id,
        line.product_title_snapshot,
@@ -2064,6 +2067,7 @@ async function readCandidateLines(
        channel_state.source_revision AS channel_source_revision,
        channel_state.source_hash AS channel_source_hash,
        channel_state.pack_evidence_hash AS channel_pack_evidence_hash,
+       channel_state.provider_status_raw AS channel_provider_status_raw,
        channel_state.normalized_status AS channel_normalized_status,
        channel_state.provider_active AS channel_provider_active,
        channel_state.requires_shipping AS channel_requires_shipping,
@@ -2216,6 +2220,16 @@ export function mapCandidateLines(
       && row.current_pack_profile_height_mm === null
       && row.current_pack_profile_dimension_basis === 'unspecified'
     )
+    const publishedFaireOrderCapture = (
+      row.provider === 'faire'
+      && row.pack_lineage_source === 'order_candidate_capture'
+      && row.pack_mapping_purpose === 'catalog'
+      && row.channel_provider_status_raw?.trim().toUpperCase() === 'PUBLISHED'
+      && row.channel_normalized_status === 'unavailable'
+      && row.channel_provider_active === false
+      && row.channel_requires_shipping === null
+      && row.requires_shipping === true
+    )
     if (
       !row.product_id
       || !row.product_global_id
@@ -2235,9 +2249,18 @@ export function mapCandidateLines(
       || !row.channel_pack_evidence_hash
       || !row.channel_source_revision
       || !row.channel_source_hash
-      || row.channel_normalized_status !== 'active'
-      || row.channel_provider_active !== true
-      || row.channel_requires_shipping !== true
+      || (
+        !publishedFaireOrderCapture
+        && row.channel_normalized_status !== 'active'
+      )
+      || (
+        !publishedFaireOrderCapture
+        && row.channel_provider_active !== true
+      )
+      || (
+        !publishedFaireOrderCapture
+        && row.channel_requires_shipping !== true
+      )
       || !row.pack_profile_version_id
       || !row.pack_profile_version_global_id
       || row.captured_pack_profile_row_version === null

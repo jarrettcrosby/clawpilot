@@ -399,15 +399,68 @@ await assert.rejects(
 )
 contentUrlOverride = null
 omitTotalRecords = true
-await assert.rejects(
-  reader.listProductsUpdatedSince({
+assert.equal(
+  (await reader.listProductsUpdatedSince({
     updatedSince: '2026-08-02T11:00:00Z',
     updatedBeforeOrAt: '2026-08-02T13:00:00Z',
     page: 1,
-  }),
-  /invalid Product record count metadata/u,
+  })).totalRecords,
+  1,
 )
 omitTotalRecords = false
+
+const multiPageCalls = []
+const multiPageFetch = async (input, init = {}) => {
+  const url = new URL(String(input))
+  multiPageCalls.push(url)
+  if (url.pathname === '/Api/access_token') {
+    return jsonResponse({ access_token: 'multi-page-read-token', expires_in: 3600 })
+  }
+  assert.equal(url.pathname, '/Api/V8/module/AOS_Products')
+  assert.equal(String(init.method || 'GET').toUpperCase(), 'GET')
+  const page = Number(url.searchParams.get('page[number]'))
+  const records = page === 1
+    ? [
+      '31111111-1111-4111-8111-111111111111',
+      '32222222-2222-4222-8222-222222222222',
+    ]
+    : page === 3
+      ? ['35555555-5555-4555-8555-555555555555']
+      : []
+  return jsonResponse({
+    data: records.map((id, index) => ({
+      id,
+      type: 'AOS_Products',
+      attributes: {
+        global_id_c: '',
+        name: `Paged Product ${page}-${index + 1}`,
+        date_modified: '2026-08-02T12:00:00Z',
+        deleted: '0',
+      },
+    })),
+    meta: {
+      'total-pages': 3,
+      'records-on-this-page': records.length,
+    },
+  })
+}
+const multiPageReader = readClient.createSuiteCrmProductImageReadClient(
+  multiPageFetch,
+)
+const multiPageResult = await multiPageReader.listProductsUpdatedSince({
+  updatedSince: '2026-08-02T11:00:00Z',
+  updatedBeforeOrAt: '2026-08-02T13:00:00Z',
+  page: 1,
+  pageSize: 2,
+})
+assert.equal(multiPageResult.totalPages, 3)
+assert.equal(multiPageResult.totalRecords, 5)
+assert.deepEqual(
+  multiPageCalls
+    .filter((url) => url.pathname === '/Api/V8/module/AOS_Products')
+    .map((url) => url.searchParams.get('page[number]')),
+  ['1', '3'],
+)
 
 const postPaths = calls
   .filter((call) => call.method === 'POST')
