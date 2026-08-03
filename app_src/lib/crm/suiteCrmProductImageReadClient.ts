@@ -440,11 +440,27 @@ function safeProductName(value: unknown) {
 }
 
 function parsedDate(value: unknown, label: string) {
-  const parsed = new Date(String(value || ''))
+  const raw = String(value || '').trim()
+  const normalized = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?$/u
+    .test(raw)
+    ? `${raw.replace(' ', 'T')}Z`
+    : raw
+  const parsed = new Date(normalized)
   if (!Number.isFinite(parsed.getTime())) {
     throw new Error(`SuiteCRM Product image ${label} is invalid`)
   }
   return parsed.toISOString()
+}
+
+function sameSuiteCrmRevisionAtListPrecision(
+  expectedRevision: string,
+  currentRevision: string,
+) {
+  // SuiteCRM V8 lists Product revisions to the minute, while GraphQL returns
+  // seconds and may omit its UTC suffix. Compare only the precision shared by
+  // both read surfaces so a real later-minute change still fails closed.
+  return Math.floor(Date.parse(expectedRevision) / 60_000)
+    === Math.floor(Date.parse(currentRevision) / 60_000)
 }
 
 function deletedValue(value: unknown) {
@@ -796,7 +812,7 @@ class SuiteCrmProductImageReader implements SuiteCrmProductImageReadClient {
       imageAttributes.date_modified,
       'image record modified timestamp',
     )
-    if (currentRevision !== expectedRevision) {
+    if (!sameSuiteCrmRevisionAtListPrecision(expectedRevision, currentRevision)) {
       throw new Error('SuiteCRM Product image changed during the read')
     }
     const rawMedia = imageAttributes[SUITECRM_NATIVE_PRODUCT_IMAGE_FIELD]

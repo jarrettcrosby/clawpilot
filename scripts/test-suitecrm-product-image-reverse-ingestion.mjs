@@ -386,7 +386,15 @@ assert.equal(media.mediaId, MEDIA_ID)
 assert.equal(media.contentSha256, IMAGE_SHA256)
 assert.deepEqual(Buffer.from(media.bytes), Buffer.from(ONE_PIXEL_PNG))
 
-graphModifiedAt = '2026-08-02T12:00:01Z'
+graphModifiedAt = '2026-08-02 12:00:15'
+const minutePrecisionMedia = await reader.readProductImage(
+  PRODUCT_ID,
+  '2026-08-02T12:00:00Z',
+)
+assert.equal(minutePrecisionMedia.mediaId, MEDIA_ID)
+assert.equal(minutePrecisionMedia.contentSha256, IMAGE_SHA256)
+
+graphModifiedAt = '2026-08-02 12:01:00'
 await assert.rejects(
   reader.readProductImage(PRODUCT_ID, '2026-08-02T12:00:00Z'),
   /changed during the read/u,
@@ -467,7 +475,7 @@ const postPaths = calls
   .map((call) => call.url.pathname)
 assert.equal(postPaths.filter((path) => path === '/Api/access_token').length, 1)
 assert.equal(postPaths.filter((path) => path === '/login').length, 1)
-assert.equal(postPaths.filter((path) => path === '/api/graphql').length, 3)
+assert.equal(postPaths.filter((path) => path === '/api/graphql').length, 4)
 assert.equal(postPaths.every((path) => [
   '/Api/access_token', '/login', '/api/graphql',
 ].includes(path)), true)
