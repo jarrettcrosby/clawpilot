@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import sharp from 'sharp'
 
 import type { SuiteCrmOutboxRecord } from '@/lib/crm/types'
 import { publicCrmProductImageUrl } from '@/lib/crm/productImagePublic'
@@ -519,6 +520,44 @@ async function fetchProductImage(
   return { bytes, mimeType, extension }
 }
 
+async function suiteCrmCompatibleProductImage(input: {
+  bytes: Uint8Array
+  mimeType: string
+  extension: string
+}) {
+  if (input.mimeType !== 'image/webp') return input
+  const source = Buffer.from(input.bytes)
+  const png = await sharp(source, {
+    failOn: 'warning',
+    limitInputPixels: 40_000_000,
+  }).rotate().png({
+    compressionLevel: 9,
+    adaptiveFiltering: true,
+  }).toBuffer()
+  if (png.byteLength <= SUITECRM_MEDIA_MAX_BYTES) {
+    return {
+      bytes: new Uint8Array(png),
+      mimeType: 'image/png',
+      extension: 'png',
+    }
+  }
+  const jpeg = await sharp(source, {
+    failOn: 'warning',
+    limitInputPixels: 40_000_000,
+  }).rotate().flatten({ background: '#ffffff' }).jpeg({
+    quality: 90,
+    mozjpeg: true,
+  }).toBuffer()
+  if (jpeg.byteLength > SUITECRM_MEDIA_MAX_BYTES) {
+    throw new Error('Product image exceeds the SuiteCRM media limit after conversion')
+  }
+  return {
+    bytes: new Uint8Array(jpeg),
+    mimeType: 'image/jpeg',
+    extension: 'jpg',
+  }
+}
+
 async function uploadProductImage(
   session: SuiteCrmSession,
   input: { bytes: Uint8Array; mimeType: string; filename: string },
@@ -634,7 +673,12 @@ export async function projectSuiteCrmNativeProductImage(
     return { action: 'unchanged', mediaId: current.id }
   }
 
-  const image = await fetchProductImage(imageUrl, contentSha256, fetchImpl)
+  const sourceImage = await fetchProductImage(
+    imageUrl,
+    contentSha256,
+    fetchImpl,
+  )
+  const image = await suiteCrmCompatibleProductImage(sourceImage)
   const filename = `${referenceCode}-${contentSha256}.${image.extension}`
   const uploaded = await uploadProductImage(session, {
     bytes: image.bytes,

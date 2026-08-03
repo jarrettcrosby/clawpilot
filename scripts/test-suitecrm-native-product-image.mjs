@@ -7,6 +7,7 @@ import { createRequire } from 'node:module'
 
 const require = createRequire(new URL('../app_src/package.json', import.meta.url))
 const ts = require('typescript')
+const sharp = require('sharp')
 
 async function importClient() {
   const url = new URL(
@@ -24,6 +25,7 @@ async function importClient() {
   output = output.replace(/^import[^\n]+\n/gm, '')
   output = `
 const createHash = globalThis.__suiteCrmNativeImageTest.createHash
+const sharp = globalThis.__suiteCrmNativeImageTest.sharp
 const publicCrmProductImageUrl = globalThis.__suiteCrmNativeImageTest.publicUrl
 const appPublicUrl = globalThis.__suiteCrmNativeImageTest.appPublicUrl
 ${output}`
@@ -43,6 +45,7 @@ const IMAGE_FILENAME = `${PRODUCT_REFERENCE}-${IMAGE_SHA256}.png`
 
 globalThis.__suiteCrmNativeImageTest = {
   createHash,
+  sharp,
   appPublicUrl: () => process.env.CLAWPILOT_PUBLIC_URL,
   publicUrl: ({ publicOrigin, productReferenceCode, contentSha256 }) =>
     `${publicOrigin}/api/public/crm-product-images/${productReferenceCode}/${contentSha256}`,
@@ -141,6 +144,9 @@ function mockSuiteCrm(input = {}) {
   let savedFieldValue = null
   let current = input.current || null
   const saveInputs = []
+  const expectedFilename = input.expectedFilename || IMAGE_FILENAME
+  const expectedUploadMimeType = input.expectedUploadMimeType || 'image/png'
+  const expectedUploadBytes = input.expectedUploadBytes || IMAGE_BYTES
   const fetchImpl = async (rawUrl, init = {}) => {
     const url = new URL(String(rawUrl))
     calls.push({ url, init })
@@ -218,7 +224,7 @@ function mockSuiteCrm(input = {}) {
       saveInputs.push(body.variables.input)
       savedFieldValue = body.variables.input.attributes.clawpilot_image_c
       const savedId = String(savedFieldValue.id || '')
-      current = savedId ? mediaValue(savedId, IMAGE_FILENAME) : null
+      current = savedId ? mediaValue(savedId, expectedFilename) : null
       if (input.hideFirstSavedRecord && saveInputs.length === 1) {
         return jsonResponse({ data: { saveRecord: { record: null } } })
       }
@@ -243,15 +249,18 @@ function mockSuiteCrm(input = {}) {
       assert.equal(init.body.get('parentField'), 'clawpilot_image_c')
       const file = init.body.get('file')
       assert.ok(file instanceof Blob)
-      assert.equal(file.name, IMAGE_FILENAME)
-      assert.equal(file.type, 'image/png')
-      assert.deepEqual(Buffer.from(await file.arrayBuffer()), IMAGE_BYTES)
+      assert.equal(file.name, expectedFilename)
+      assert.equal(file.type, expectedUploadMimeType)
+      assert.deepEqual(
+        Buffer.from(await file.arrayBuffer()),
+        Buffer.from(expectedUploadBytes),
+      )
       return jsonResponse({
         id: MEDIA_ID,
         contentUrl: '/api/private-image-media-objects/media',
-        originalName: IMAGE_FILENAME,
-        mimeType: 'image/png',
-        size: IMAGE_BYTES.byteLength,
+        originalName: expectedFilename,
+        mimeType: expectedUploadMimeType,
+        size: expectedUploadBytes.byteLength,
       }, 201)
     }
     throw new Error(`Unexpected request: ${init.method} ${url}`)
@@ -294,6 +303,43 @@ assert.deepEqual(attachedMock.savedFieldValue(), {
   },
 })
 assert.equal(attachedMock.saveInputs.length, 1)
+
+const WEBP_BYTES = await sharp(IMAGE_BYTES).webp({ lossless: true }).toBuffer()
+const WEBP_SHA256 = createHash('sha256').update(WEBP_BYTES).digest('hex')
+const SUITECRM_PNG_BYTES = await sharp(WEBP_BYTES, {
+  failOn: 'warning',
+  limitInputPixels: 40_000_000,
+}).rotate().png({
+  compressionLevel: 9,
+  adaptiveFiltering: true,
+}).toBuffer()
+const WEBP_UPLOAD_FILENAME = `${PRODUCT_REFERENCE}-${WEBP_SHA256}.png`
+const webpMock = mockSuiteCrm({
+  imageBytes: WEBP_BYTES,
+  mimeType: 'image/webp',
+  expectedFilename: WEBP_UPLOAD_FILENAME,
+  expectedUploadMimeType: 'image/png',
+  expectedUploadBytes: SUITECRM_PNG_BYTES,
+})
+assert.deepEqual(
+  await client.projectSuiteCrmNativeProductImage(record({
+    referenceCode: PRODUCT_REFERENCE,
+    contentSha256: WEBP_SHA256,
+  }), webpMock.fetchImpl),
+  { action: 'attached', mediaId: MEDIA_ID },
+)
+assert.deepEqual(webpMock.savedFieldValue(), {
+  id: MEDIA_ID,
+  module: 'media-objects',
+  attributes: {
+    id: MEDIA_ID,
+    original_name: WEBP_UPLOAD_FILENAME,
+    size: SUITECRM_PNG_BYTES.byteLength,
+    mime_type: 'image/png',
+    contentUrl: '/api/private-image-media-objects/media',
+  },
+})
+
 assert.deepEqual(
   await client.projectSuiteCrmNativeProductImage(record({
     referenceCode: PRODUCT_REFERENCE,
