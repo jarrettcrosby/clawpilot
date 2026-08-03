@@ -187,6 +187,14 @@ function positiveInteger(value: unknown, label: string) {
   return number
 }
 
+function nonNegativeInteger(value: unknown, label: string) {
+  const number = Number(value)
+  if (!Number.isSafeInteger(number) || number < 0) {
+    fail('FAIRE_PRODUCT_IMAGE_SELECTION_INVALID', `${label} is invalid`, 400)
+  }
+  return number
+}
+
 function actorEmail(value: unknown) {
   const email = String(value || '').trim().toLowerCase()
   if (!email || !email.includes('@') || email.length > 320) {
@@ -566,7 +574,7 @@ export async function executeFaireProductImagePublish(
     imageAssetId: stringValue(rawInput.imageAssetId, 'Image asset', 36).toLowerCase(),
     executeProviderWrite: rawInput.executeProviderWrite === true,
     expectedProductReferenceCode: stringValue(rawInput.expectedProductReferenceCode, 'Product reference', 32).toLowerCase(),
-    expectedChannelStateRowVersion: positiveInteger(rawInput.expectedChannelStateRowVersion, 'Channel revision'),
+    expectedChannelStateRowVersion: nonNegativeInteger(rawInput.expectedChannelStateRowVersion, 'Channel revision'),
     expectedChannelSourceRevision: stringValue(rawInput.expectedChannelSourceRevision, 'Channel source revision', 2_048),
     expectedAssetRevision: positiveInteger(rawInput.expectedAssetRevision, 'Asset revision'),
     expectedAssetRowVersion: positiveInteger(rawInput.expectedAssetRowVersion, 'Asset row revision'),

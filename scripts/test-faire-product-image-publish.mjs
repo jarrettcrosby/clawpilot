@@ -104,7 +104,7 @@ const selection = {
   externalProductId: 'p_product123',
   externalVariantId: 'po_variant123',
   productReferenceCode: 'gp0000001',
-  channelStateRowVersion: 4,
+  channelStateRowVersion: 0,
   channelSourceRevision: 'faire-product-revision-4',
   channelSourceHash: hash('channel'),
   assetRevision: 2,
