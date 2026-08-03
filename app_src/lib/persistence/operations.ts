@@ -12463,6 +12463,8 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
 }
 
 type CommerceFulfillmentExportExecutionRow = QueryResultRow & {
+  order_id: string
+  order_currency: string
   global_id: string
   provider: string
   state: 'queued' | 'processing' | 'succeeded' | 'failed' | 'unsupported'
@@ -12491,7 +12493,7 @@ const SHOPIFY_FULFILLMENT_PROVIDER_ATTEMPT_ADAPTER =
 const FAIRE_FULFILLMENT_PROVIDER_ATTEMPT_ACTION =
   'faire.fulfillment.shipments.create'
 const FAIRE_FULFILLMENT_PROVIDER_ATTEMPT_ADAPTER =
-  'faire-fulfillment-writeback-v1'
+  'faire-fulfillment-writeback-v2'
 const FAIRE_FULFILLMENT_PROVIDER_WRITE_PROTOCOL =
   'faire-fulfillment-attempt-v1'
 
@@ -12504,6 +12506,10 @@ type FaireFulfillmentAttemptRequest = {
     packageReference: string
     carrier: string
     trackingCode: string
+    makerCost?: {
+      amountMinor: number
+      currency: string
+    }
   }>
 }
 
@@ -12524,6 +12530,18 @@ function normalizeFaireFulfillmentPackages(value: unknown) {
     ).trim()
     const carrier = String(packageSnapshot.carrier || '').trim()
     const trackingCode = String(packageSnapshot.trackingCode || '').trim()
+    const makerCostSnapshot = packageSnapshot.makerCost === undefined
+      || packageSnapshot.makerCost === null
+      ? null
+      : json(packageSnapshot.makerCost)
+    const makerCost = makerCostSnapshot === null
+      ? null
+      : {
+          amountMinor: Number(makerCostSnapshot.amountMinor),
+          currency: String(makerCostSnapshot.currency || '')
+            .trim()
+            .toUpperCase(),
+        }
     if (
       !/^gpa(?:[0-9]{7}|[0-9a-v]{12})$/.test(packageReference)
       || !carrier
@@ -12531,6 +12549,14 @@ function normalizeFaireFulfillmentPackages(value: unknown) {
       || !trackingCode
       || trackingCode.length > 255
       || /[\u0000-\u001f\u007f]/.test(`${carrier}${trackingCode}`)
+      || (
+        makerCost !== null
+        && (
+          !Number.isSafeInteger(makerCost.amountMinor)
+          || makerCost.amountMinor < 0
+          || !/^[A-Z]{3}$/.test(makerCost.currency)
+        )
+      )
       || packageReferences.has(packageReference)
       || trackingCodes.has(trackingCode)
     ) {
@@ -12542,8 +12568,65 @@ function normalizeFaireFulfillmentPackages(value: unknown) {
     }
     packageReferences.add(packageReference)
     trackingCodes.add(trackingCode)
-    return { packageReference, carrier, trackingCode }
+    return {
+      packageReference,
+      carrier,
+      trackingCode,
+      ...(makerCost === null ? {} : { makerCost }),
+    }
   })
+}
+
+async function requireFaireFulfillmentPackageMakerCosts(input: {
+  organizationId: string
+  orderId: string
+  orderCurrency: string
+  packages: ReturnType<typeof normalizeFaireFulfillmentPackages>
+}) {
+  if (input.packages.every((item) => item.makerCost)) {
+    return input.packages
+  }
+  const references = input.packages.map((item) => item.packageReference)
+  const result = await query<{
+    package_global_id: string
+    quoted_carrier_cost_minor: string
+  }>(
+    `SELECT package.global_id AS package_global_id,
+            shipment.quoted_carrier_cost_minor::text
+     FROM operations_shipments shipment
+     JOIN operations_packages package
+       ON package.organization_id = shipment.organization_id
+      AND package.id = shipment.package_id
+     WHERE shipment.organization_id = $1::uuid
+       AND shipment.order_id = $2::uuid
+       AND package.global_id = ANY($3::text[])
+     ORDER BY package.global_id`,
+    [input.organizationId, input.orderId, references],
+  )
+  const costs = new Map(result.rows.map((row) => [
+    row.package_global_id,
+    Number(row.quoted_carrier_cost_minor),
+  ]))
+  if (
+    costs.size !== references.length
+    || [...costs.values()].some((amountMinor) => (
+      !Number.isSafeInteger(amountMinor) || amountMinor < 0
+    ))
+    || !/^[A-Z]{3}$/.test(input.orderCurrency)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_FAIRE_FULFILLMENT_MAKER_COST_INVALID',
+      'Faire fulfillment requires durable shipping-cost evidence for every package',
+      409,
+    )
+  }
+  return input.packages.map((item) => ({
+    ...item,
+    makerCost: item.makerCost || {
+      amountMinor: costs.get(item.packageReference)!,
+      currency: input.orderCurrency,
+    },
+  }))
 }
 
 function normalizeFaireFulfillmentAttemptRequest(
@@ -12753,13 +12836,20 @@ async function registerFaireFulfillmentProviderAttempt(input: {
         409,
       )
     }
-    const existing = await client.query(
-      `SELECT global_id
+    const existing = await client.query<{
+      global_id: string
+      state: string
+      error_code: string | null
+      request_hash: string
+      redacted_request: Record<string, unknown>
+    }>(
+      `SELECT global_id, state, error_code, request_hash, redacted_request
        FROM operations_commerce_provider_attempts
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
          AND action = $3
          AND external_object_id = $4
+       ORDER BY attempt_number DESC, requested_at DESC, id DESC
        LIMIT 1`,
       [
         input.organizationId,
@@ -12769,11 +12859,24 @@ async function registerFaireFulfillmentProviderAttempt(input: {
       ],
     )
     if (existing.rowCount) {
-      throw new OperationsRequestError(
-        'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED',
-        'A durable Faire fulfillment attempt already exists; only read-only reconciliation is safe',
-        409,
+      const prior = existing.rows[0]
+      const priorRevision = Number(
+        json(prior.redacted_request).authorizationRevision,
       )
+      const revisedKnownRejection = (
+        prior.state === 'failed'
+        && prior.error_code === 'FAIRE_REQUEST_REJECTED'
+        && Number.isSafeInteger(priorRevision)
+        && input.preparedRequest.authorizationRevision > priorRevision
+        && requestHash !== prior.request_hash
+      )
+      if (!revisedKnownRejection) {
+        throw new OperationsRequestError(
+          'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED',
+          'A durable Faire provider attempt already exists; a known rejection requires a newer reviewed authorization before resubmission',
+          409,
+        )
+      }
     }
     const attempt = await client.query<{
       id: string
@@ -12831,7 +12934,9 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
       `operations:commerce-fulfillment-export:${input.organizationId}:${input.commerceExportGlobalId}`,
     )
     const result = await client.query<CommerceFulfillmentExportExecutionRow>(
-      `SELECT fulfillment_export.global_id, fulfillment_export.provider,
+      `SELECT fulfillment_export.order_id::text AS order_id,
+              source_order.currency AS order_currency,
+              fulfillment_export.global_id, fulfillment_export.provider,
               fulfillment_export.state, fulfillment_export.external_order_id,
               fulfillment_export.payload_snapshot,
               fulfillment_export.idempotency_key,
@@ -12928,6 +13033,7 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
       priorState,
       priorErrorCode,
       hasProviderAttempt: Boolean(row.provider_attempt_global_id),
+      providerAttemptState: row.provider_attempt_state,
       usesSafeShopifyAttemptProtocol,
       usesSafeFaireAttemptProtocol,
     })
@@ -12981,6 +13087,8 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
       }
       claimedRow = {
         ...updated.rows[0],
+        order_id: row.order_id,
+        order_currency: row.order_currency,
         integration_account_id: row.integration_account_id,
         account_global_id: row.account_global_id,
         provider_attempt_id: row.provider_attempt_id,
@@ -13217,7 +13325,12 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
           }
         }
       } else {
-        const packages = normalizeFaireFulfillmentPackages(snapshot.packages)
+        const packages = await requireFaireFulfillmentPackageMakerCosts({
+          organizationId: input.organizationId,
+          orderId: claimed.row.order_id,
+          orderCurrency: claimed.row.order_currency,
+          packages: normalizeFaireFulfillmentPackages(snapshot.packages),
+        })
         const authority = await prepareCurrentFaireFulfillmentAuthority({
           organizationId: input.organizationId,
           accountGlobalId: claimed.row.account_global_id,
@@ -14245,6 +14358,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         carrier: string
         service_code: string
         environment: 'mock' | 'sandbox' | 'production'
+        quoted_carrier_cost_minor: number
       }> = []
       for (const packageRow of packageResult.rows) {
         const packageLabel = labelResult.rows.find(
@@ -14282,6 +14396,9 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           carrier: packageLabel.carrier,
           service_code: packageLabel.service_code,
           environment: packageLabel.environment,
+          quoted_carrier_cost_minor: sandboxE2eAuthorizationGlobalId
+            ? 0
+            : Number(packageLabel.internal_cost_minor),
         })
       }
       const shipment = shipments[0]
@@ -14489,6 +14606,10 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
                   packageReference: item.package_global_id,
                   carrier: item.carrier,
                   trackingCode: item.tracking_number,
+                  makerCost: {
+                    amountMinor: item.quoted_carrier_cost_minor,
+                    currency: order.currency,
+                  },
                 })),
               }
             : {}),

@@ -720,6 +720,7 @@ async function verifyShipmentCompletion(databaseUrl) {
     let shopifyFulfillmentReconciliationCalls = 0
     let shopifyFulfillmentReconciliationResult = null
     let faireFulfillmentPreparationCalls = 0
+    let faireFulfillmentAuthorizationRevision = 4
     let faireFulfillmentExecutionCalls = 0
     const faireFulfillmentInputs = []
     const persistence = loadTypeScriptModule('app_src/lib/persistence/operations.ts', {
@@ -789,7 +790,7 @@ async function verifyShipmentCompletion(databaseUrl) {
           prepareCurrentFaireFulfillmentAuthority: async () => {
             faireFulfillmentPreparationCalls += 1
             return {
-              authorizationRevision: 4,
+              authorizationRevision: faireFulfillmentAuthorizationRevision,
               credentialGeneration: 2,
               externalAccountId: 'b_faire-shipment-acceptance',
             }
@@ -1552,6 +1553,13 @@ async function verifyShipmentCompletion(databaseUrl) {
         .sort(),
       [...faireTrackingNumbers].sort(),
     )
+    assert.ok(
+      faireFulfillmentInputs[0].packages.every((item) => (
+        item.makerCost?.amountMinor === 0
+        && item.makerCost?.currency === 'USD'
+      )),
+      'Authorized sandbox Faire fulfillment must publish an explicit zero maker cost',
+    )
     const consumedFaireAuthorization = await pool.query(
       `SELECT state, consumed_by
        FROM operations_sandbox_commerce_e2e_authorizations
@@ -1565,6 +1573,101 @@ async function verifyShipmentCompletion(databaseUrl) {
       state: 'consumed',
       consumed_by: faireFixture.email,
     })
+
+    const rejectedFaireExport = await pool.query(
+      `INSERT INTO operations_commerce_fulfillment_exports (
+         organization_id, order_id, shipment_id, provider, external_order_id,
+         state, attempts, payload_snapshot, idempotency_key,
+         error_code, error_message, completed_at
+       )
+       SELECT organization_id, order_id, shipment_id, provider,
+              external_order_id, 'failed', 1, payload_snapshot,
+              idempotency_key || ':known-rejection-revision',
+              'FAIRE_REQUEST_REJECTED',
+              'Faire rejected the first exact request', now()
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2
+       RETURNING global_id, idempotency_key, external_order_id,
+                 payload_snapshot`,
+      [
+        faireFixture.organizationId,
+        authorizedFaireResult.commerceExportGlobalId,
+      ],
+    )
+    assert.equal(rejectedFaireExport.rowCount, 1)
+    const rejectedExport = rejectedFaireExport.rows[0]
+    await pool.query(
+      `INSERT INTO operations_commerce_provider_attempts (
+         organization_id, integration_account_id, action, adapter_version,
+         external_object_id, idempotency_key, request_hash,
+         redacted_request, redacted_response, state, attempt_number,
+         error_code, requested_at, completed_at, created_by
+       )
+       SELECT source_order.organization_id, source_order.integration_account_id,
+              'faire.fulfillment.shipments.create',
+              'faire-fulfillment-writeback-v1', $3, $4, repeat('a', 64),
+              jsonb_build_object(
+                'version', 1,
+                'externalOrderId', $5::text,
+                'expectedShipDate', $6::jsonb->>'shippedAt',
+                'authorizationRevision', 4,
+                'packages', (
+                  SELECT jsonb_agg(jsonb_build_object(
+                    'packageReference', package->>'packageReference',
+                    'carrier', package->>'carrier',
+                    'trackingCode', package->>'trackingCode'
+                  ))
+                  FROM jsonb_array_elements($6::jsonb->'packages') package
+                )
+              ),
+              '{}'::jsonb, 'failed', 1, 'FAIRE_REQUEST_REJECTED',
+              now(), now(), $7
+       FROM operations_orders source_order
+       WHERE source_order.organization_id = $1::uuid
+         AND source_order.global_id = $2`,
+      [
+        faireFixture.organizationId,
+        faireOrder.planned.orderGlobalId,
+        rejectedExport.global_id,
+        rejectedExport.idempotency_key,
+        rejectedExport.external_order_id,
+        JSON.stringify(rejectedExport.payload_snapshot),
+        faireFixture.email,
+      ],
+    )
+    faireFulfillmentAuthorizationRevision = 5
+    const revisedFaireResult = await persistence
+      .executeOperationsCommerceFulfillmentExportFromPostgres({
+        organizationId: faireFixture.organizationId,
+        actorEmail: faireFixture.email,
+        commerceExportGlobalId: rejectedExport.global_id,
+        reason: 'Retry known Faire rejection after revised operator review',
+        auditEventKey: `faire-known-rejection-retry:${rejectedExport.global_id}`,
+      })
+    assert.equal(
+      revisedFaireResult.state,
+      'succeeded',
+      JSON.stringify(revisedFaireResult),
+    )
+    assert.equal(faireFulfillmentInputs.at(-1).mode, 'execute')
+    assert.equal(
+      faireFulfillmentInputs.at(-1).writeAttempt.authorizationRevision,
+      5,
+    )
+    const revisedAttempts = await pool.query(
+      `SELECT state, attempt_number,
+              redacted_request->>'authorizationRevision' AS revision
+       FROM operations_commerce_provider_attempts
+       WHERE organization_id = $1::uuid
+         AND external_object_id = $2
+         AND action = 'faire.fulfillment.shipments.create'
+       ORDER BY attempt_number`,
+      [faireFixture.organizationId, rejectedExport.global_id],
+    )
+    assert.deepEqual(revisedAttempts.rows, [
+      { state: 'failed', attempt_number: 1, revision: '4' },
+      { state: 'succeeded', attempt_number: 2, revision: '5' },
+    ])
 
     const sandboxFixture = await createFixture('sandbox')
     const sandbox = await advanceOrderToPacked(persistence, sandboxFixture, 'sandbox')

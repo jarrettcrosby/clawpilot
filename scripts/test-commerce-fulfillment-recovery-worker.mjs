@@ -419,6 +419,17 @@ test('restart policy distinguishes pre-dispatch crashes from durable attempts', 
   assert.equal(
     recoveryPolicy.commerceFulfillmentRecoveryMode({
       ...base,
+      priorState: 'failed',
+      priorErrorCode: 'FAIRE_REQUEST_REJECTED',
+      hasProviderAttempt: true,
+      providerAttemptState: 'failed',
+    }),
+    'execute',
+    'A known rejection may be resubmitted through the newer-revision guard',
+  )
+  assert.equal(
+    recoveryPolicy.commerceFulfillmentRecoveryMode({
+      ...base,
       usesSafeFaireAttemptProtocol: false,
     }),
     'reconcile_only',

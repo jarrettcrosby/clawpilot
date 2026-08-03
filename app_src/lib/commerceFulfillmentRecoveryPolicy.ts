@@ -21,6 +21,7 @@ export function commerceFulfillmentRecoveryMode(input: {
   priorState: CommerceFulfillmentRecoveryState
   priorErrorCode: string | null
   hasProviderAttempt: boolean
+  providerAttemptState?: string | null
   usesSafeShopifyAttemptProtocol: boolean
   usesSafeFaireAttemptProtocol: boolean
 }): 'execute' | 'reconcile_only' {
@@ -46,8 +47,13 @@ export function commerceFulfillmentRecoveryMode(input: {
     ) ? 'reconcile_only' : 'execute'
   }
   if (input.provider === 'faire') {
+    const knownRejectedAttempt = (
+      input.priorState === 'failed'
+      && input.priorErrorCode === 'FAIRE_REQUEST_REJECTED'
+      && input.providerAttemptState === 'failed'
+    )
     return (
-      input.hasProviderAttempt
+      (input.hasProviderAttempt && !knownRejectedAttempt)
       || !input.usesSafeFaireAttemptProtocol
       || unresolvedFailure
     ) ? 'reconcile_only' : 'execute'
