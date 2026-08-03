@@ -251,10 +251,23 @@ requireAll(checkoutRatingPersistence, [
   'rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient(',
   "activation.state = 'shadow'",
   'operations_shopify_carrier_service_config_is_ready(',
+  'const readiness = await client.query<{ callback_ready: boolean }>(',
+  'readiness.rows[0]?.callback_ready !== true',
   "'SHOPIFY_CARRIER_SERVICE_SHADOW_REBIND_MUTATION_UNRESOLVED'",
   "activationState: 'shadow'",
   'callbackTokenRotations: 0',
 ], 'registered CarrierService Shadow revision rebind')
+const shadowRebindUpdate = shadowRebind.slice(
+  shadowRebind.indexOf('const updated = await client.query'),
+  shadowRebind.indexOf('const readiness = await client.query'),
+)
+assert.equal(
+  shadowRebindUpdate.includes(
+    'operations_shopify_carrier_service_config_is_ready(',
+  ),
+  false,
+  'Shadow rebind readiness must be checked in a command after UPDATE RETURNING so the STABLE function sees the new activation revision',
+)
 requireAll(operationsPersistence, [
   "if (input.state === 'shadow')",
   '`commerce-active-transition:${organizationId}`',

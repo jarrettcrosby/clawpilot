@@ -52,6 +52,7 @@ import {
   createOperationsSandboxLabelInPostgres,
   voidOperationsSandboxLabelInPostgres,
 } from '@/lib/persistence/operationShipping'
+import { ShopifyCheckoutRatingPersistenceError } from '@/lib/persistence/shopifyCheckoutRating'
 import { CarrierIntegrationRequestError } from '@/lib/integrations/carrierIntegrations'
 import {
   executeProductionFulfillmentRerate,
@@ -666,6 +667,9 @@ function errorResponse(error: unknown) {
     return json({ ok: false, error: 'Select an active organization first', code: error.message }, 409)
   }
   if (error instanceof OperationsRequestError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
+  if (error instanceof ShopifyCheckoutRatingPersistenceError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
   if (error instanceof CommerceActiveTransitionPersistenceError) {

@@ -2604,7 +2604,6 @@ export async function rebindRegisteredShopifyCarrierServicesForShadowActivationW
     const updated = await client.query<{
       activation_revision: number
       row_version: string
-      callback_ready: boolean
     }>(
       `UPDATE operations_shopify_carrier_service_configs config
        SET activation_revision = $3,
@@ -2621,11 +2620,7 @@ export async function rebindRegisteredShopifyCarrierServicesForShadowActivationW
          AND config.row_version = $9::bigint
        RETURNING
          config.activation_revision,
-         config.row_version::text,
-         operations_shopify_carrier_service_config_is_ready(
-           config.organization_id,
-           config.id
-         ) AS callback_ready`,
+         config.row_version::text`,
       [
         input.organizationId,
         row.id,
@@ -2638,11 +2633,22 @@ export async function rebindRegisteredShopifyCarrierServicesForShadowActivationW
         priorRowVersion,
       ],
     )
+    // The readiness function is STABLE and reads the config table. Evaluating
+    // it inside the UPDATE RETURNING list uses that command's snapshot and can
+    // still observe the pre-rebind activation revision. Run it as the next SQL
+    // command so PostgreSQL advances the command counter and sees this update.
+    const readiness = await client.query<{ callback_ready: boolean }>(
+      `SELECT operations_shopify_carrier_service_config_is_ready(
+         $1::uuid,
+         $2::uuid
+       ) AS callback_ready`,
+      [input.organizationId, row.id],
+    )
     if (
       updated.rows[0]?.activation_revision
         !== input.targetActivationRevision
       || Number(updated.rows[0]?.row_version) !== priorRowVersion + 1
-      || updated.rows[0]?.callback_ready !== true
+      || readiness.rows[0]?.callback_ready !== true
     ) {
       fail(
         'SHOPIFY_CARRIER_SERVICE_SHADOW_REBIND_READINESS_FAILED',
