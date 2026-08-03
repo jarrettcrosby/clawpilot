@@ -1128,6 +1128,17 @@ async function run(databaseUrl) {
       ),
       /shadow_grant\.expires_at > clock_timestamp\(\)/,
     )
+    assert.match(
+      readFileSync(
+        resolve(
+          root,
+          'app_src/lib/persistence/faireProductImageProjection.ts',
+        ),
+        'utf8',
+      ),
+      /aggregate_hash, issued_at, expires_at,[\s\S]*statement_timestamp\(\),[\s\S]*statement_timestamp\(\) \+/,
+      'Faire image grants derive issued and expiry timestamps from one stable statement clock',
+    )
     await runOperationalAcceptance({
       pool,
       persistence,

@@ -113,6 +113,10 @@ function canonicalJson(value) {
   return JSON.stringify(value) ?? 'null'
 }
 
+function carrierPartyFingerprint(value) {
+  return hash(canonicalJson(value))
+}
+
 function commandHash(value) {
   return hash(canonicalJson(value))
 }
@@ -785,6 +789,175 @@ function loadSandboxCommerceE2eAuthorization(pool) {
   )
 }
 
+function loadOperationalWarehouseServices(pool) {
+  const mustNotRun = (name) => async () => {
+    throw new Error(`${name} must not run during warehouse-path acceptance`)
+  }
+  const postgres = {
+    query: (sql, params = []) => pool.query(sql, params),
+    getPostgresPool: () => pool,
+    acquireTransactionAdvisoryLock: (client, key) => client.query(
+      'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
+      [key],
+    ),
+    async withTransaction(operation) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const result = await operation(client)
+        await client.query('COMMIT')
+        return result
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {})
+        throw error
+      } finally {
+        client.release()
+      }
+    },
+  }
+  const auditWriter = { recordAuditEvent: async () => {} }
+  const credentialCrypto = {
+    decryptCommerceCandidateSnapshot({ ciphertext }) {
+      return JSON.parse(Buffer.from(ciphertext).toString('utf8'))
+    },
+  }
+  const carrierSandboxRate = {
+    normalizeCarrierSandboxParty: (value) => value,
+    carrierSandboxPartyFingerprint: carrierPartyFingerprint,
+  }
+  const cartonizationRateEvidence = loadTypeScriptModule(
+    'app_src/lib/persistence/cartonizationRateEvidence.ts',
+    {
+      '@/lib/auditWriter': auditWriter,
+      '@/lib/integrations/commerceCredentialCrypto': credentialCrypto,
+      '@/lib/integrations/carrierSandboxRate': carrierSandboxRate,
+      '@/lib/persistence/postgres': postgres,
+    },
+  )
+  const currency = loadTypeScriptModule('app_src/lib/currency.ts')
+  const canonicalPlanning = loadTypeScriptModule(
+    'app_src/lib/operations/canonicalFulfillmentPlanning.ts',
+    { '../currency.ts': currency },
+  )
+  const stableId = loadTypeScriptModule('app_src/lib/crm/stableId.ts')
+  const domain = loadTypeScriptModule('app_src/lib/operations/domain.ts')
+  const adapters = loadTypeScriptModule(
+    'app_src/lib/operations/adapters.ts',
+    { '@/lib/operations/domain': domain },
+  )
+  const packingSlip = loadTypeScriptModule(
+    'app_src/lib/operations/packingSlip.ts',
+  )
+  const commerceFulfillmentRecoveryPolicy = loadTypeScriptModule(
+    'app_src/lib/commerceFulfillmentRecoveryPolicy.ts',
+  )
+  const operations = loadTypeScriptModule(
+    'app_src/lib/persistence/operations.ts',
+    {
+      '@/lib/auditWriter': auditWriter,
+      '@/lib/crm/stableId': stableId,
+      '@/lib/integrations/carrierCheckoutRate': {
+        rateCheckoutShipment: mustNotRun('rateCheckoutShipment'),
+      },
+      '@/lib/integrations/carrierIntegrations': {
+        testCarrierSandboxShipmentRate: mustNotRun(
+          'testCarrierSandboxShipmentRate',
+        ),
+      },
+      '@/lib/integrations/shopifyFulfillmentWriteback': {
+        executeShopifyFulfillmentWriteback: mustNotRun(
+          'executeShopifyFulfillmentWriteback',
+        ),
+        prepareShopifyFulfillmentWriteback: mustNotRun(
+          'prepareShopifyFulfillmentWriteback',
+        ),
+        reconcileShopifyFulfillmentWriteback: mustNotRun(
+          'reconcileShopifyFulfillmentWriteback',
+        ),
+      },
+      '@/lib/integrations/faireFulfillmentRuntime': {
+        prepareCurrentFaireFulfillmentAuthority: mustNotRun(
+          'prepareCurrentFaireFulfillmentAuthority',
+        ),
+        executeCurrentFaireFulfillmentWriteback: mustNotRun(
+          'executeCurrentFaireFulfillmentWriteback',
+        ),
+      },
+      '@/lib/commerceFulfillmentRecoveryPolicy':
+        commerceFulfillmentRecoveryPolicy,
+      '@/lib/operations/adapters': adapters,
+      '@/lib/operations/canonicalFulfillmentPlanning': canonicalPlanning,
+      '@/lib/operations/domain': domain,
+      '@/lib/operations/packingSlip': packingSlip,
+      '@/lib/persistence/cartonizationRateEvidence':
+        cartonizationRateEvidence,
+      '@/lib/persistence/crm': {
+        stageCrmRecordWithClient: mustNotRun('stageCrmRecordWithClient'),
+      },
+      '@/lib/persistence/operationPrintDelivery': {
+        enqueueOperationsPrintJobInPostgres: mustNotRun(
+          'enqueueOperationsPrintJobInPostgres',
+        ),
+      },
+      '@/lib/persistence/operationShadowFulfillmentPreparation': {
+        readShadowFulfillmentPreparation: mustNotRun(
+          'readShadowFulfillmentPreparation',
+        ),
+      },
+      '@/lib/persistence/sandboxCommerceE2eAuthorization': {
+        readActiveSandboxCommerceE2eAuthorizationForOrderInPostgres:
+          mustNotRun(
+            'readActiveSandboxCommerceE2eAuthorizationForOrderInPostgres',
+          ),
+        requireActiveSandboxCommerceE2eAuthorization: mustNotRun(
+          'requireActiveSandboxCommerceE2eAuthorization',
+        ),
+        consumeSandboxCommerceE2eAuthorization: mustNotRun(
+          'consumeSandboxCommerceE2eAuthorization',
+        ),
+      },
+      '@/lib/persistence/postgres': postgres,
+      '@/lib/persistence/productPackaging': {
+        readDefaultProductPackagingWithClient: async () => new Map(),
+      },
+      '@/lib/persistence/shopifyCheckoutRating': {
+        lockShopifyCarrierServiceConfigWritersForActivationWithClient:
+          mustNotRun(
+            'lockShopifyCarrierServiceConfigWritersForActivationWithClient',
+          ),
+        rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient:
+          mustNotRun(
+            'rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient',
+          ),
+        shopifyCheckoutRateLineageIsRequired: () => false,
+        shopifyCheckoutRateOutcomeAllowsFulfillment: () => false,
+      },
+    },
+    {
+      AbortController,
+      AbortSignal,
+      Headers,
+      Request,
+      Response,
+      TextDecoder,
+      TextEncoder,
+      URL,
+      clearTimeout,
+      fetch,
+      setTimeout,
+      structuredClone,
+    },
+  )
+  const hybridCartonization = loadTypeScriptModule(
+    'app_src/lib/operations/hybridCartonization.ts',
+  )
+  return {
+    cartonizationRateEvidence,
+    hybridCartonization,
+    operations,
+  }
+}
+
 function loadCommerceOrderReconciliationPersistence(pool) {
   return loadTypeScriptModule(
     'app_src/lib/persistence/commerceOrderReconciliation.ts',
@@ -1188,6 +1361,7 @@ async function verifyFaireExactVariantPackBinding(
   counters,
   sandboxAuthorization,
 ) {
+  const warehouseServices = loadOperationalWarehouseServices(pool)
   const runtime = {
     organizationId: ids.organization,
     globalId: 'gia0009202',
@@ -1220,6 +1394,7 @@ async function verifyFaireExactVariantPackBinding(
   }
   const setup = await pool.connect()
   let packVersion
+  let cartonPackVersion
   try {
     await setup.query('BEGIN')
     for (const scenario of Object.values(scenarios)) {
@@ -1268,7 +1443,7 @@ async function verifyFaireExactVariantPackBinding(
          evidence_reference, confirmed_at, confirmed_by, created_by
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-         1, 'customer_confirmed', 1, 'each', 203, 152, 51, 'outer',
+         1, 'active', 1, 'each', 203, 152, 51, 'outer',
          170, 'customer_stated', 'customer_confirmed', 'manual', true,
          'Disposable PostgreSQL exact Faire pack acceptance', now(), $5, $5
        )
@@ -1282,6 +1457,42 @@ async function verifyFaireExactVariantPackBinding(
       ],
     )
     packVersion = version.rows[0]
+    const cartonProfile = await setup.query(
+      `INSERT INTO operations_product_pack_profiles (
+         organization_id, pipeline_id, product_id, profile_key, profile_name,
+         package_level, is_default, status, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'faire-exact-carton',
+         'Faire exact shipping carton', 'case', false, 'active', $4, $4
+       )
+       RETURNING id::text`,
+      [ids.organization, ids.pipeline, ids.product, actorEmail],
+    )
+    cartonPackVersion = (await setup.query(
+      `INSERT INTO operations_product_pack_profile_versions (
+         organization_id, pipeline_id, product_id, profile_id,
+         version_number, lifecycle_state, base_each_quantity,
+         unit_of_measure, length_mm, width_mm, height_mm, dimension_basis,
+         gross_weight_grams, weight_basis, fit_model,
+         ships_as_own_package, assembly_policy, evidence_type, source,
+         is_current, evidence_reference, confirmed_at, confirmed_by,
+         created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+         1, 'active', 2, 'case', 230, 180, 80, 'outer',
+         190, 'measured', 'rigid_3d', false, 'never', 'measured',
+         'manual', true, $5, now(), $6, $6
+       )
+       RETURNING id::text, global_id, row_version::integer`,
+      [
+        ids.organization,
+        ids.pipeline,
+        ids.product,
+        cartonProfile.rows[0].id,
+        'Disposable PostgreSQL measured Faire shipping carton',
+        actorEmail,
+      ],
+    )).rows[0]
     await setup.query('COMMIT')
   } catch (error) {
     await setup.query('ROLLBACK').catch(() => {})
@@ -1909,19 +2120,20 @@ async function verifyFaireExactVariantPackBinding(
     postalCode: '92647',
     country: 'US',
   }
-  const canonicalSeed = await pool.connect()
-  let packageGlobalId
+  const operationalSeed = await pool.connect()
+  let operational
   try {
-    await canonicalSeed.query('BEGIN')
-    await canonicalSeed.query('SET LOCAL session_replication_role = replica')
-    const order = await canonicalSeed.query(
+    await operationalSeed.query('BEGIN')
+    const order = await operationalSeed.query(
       `UPDATE operations_orders
-       SET status = 'packed', ship_to = $3::jsonb,
+       SET ship_to = $3::jsonb,
+           requested_delivery_at = now() + interval '5 days',
            updated_by = $4, updated_at = now(),
            row_version = row_version + 1
        WHERE organization_id = $1::uuid
          AND global_id = $2
-       RETURNING id::text, global_id`,
+         AND status = 'imported'
+       RETURNING id::text, global_id, row_version::integer`,
       [
         ids.organization,
         promoted.canonicalOrderGlobalId,
@@ -1931,41 +2143,41 @@ async function verifyFaireExactVariantPackBinding(
     )
     assert.equal(order.rowCount, 1)
     const orderId = order.rows[0].id
-    const candidate = await canonicalSeed.query(
+    const candidate = await operationalSeed.query(
       `UPDATE operations_commerce_order_candidates
-       SET requires_shipping = true,
-           ship_to_snapshot_state = 'confirmed',
+       SET ship_to_snapshot_state = 'confirmed',
            ship_to_snapshot_source = 'provider',
-           ship_to_snapshot_ciphertext = decode('0001', 'hex'),
+           ship_to_snapshot_ciphertext = $3::bytea,
            ship_to_snapshot_iv = decode(repeat('00', 12), 'hex'),
            ship_to_snapshot_tag = decode(repeat('00', 16), 'hex'),
-           ship_to_snapshot_hash = $3,
+           ship_to_snapshot_hash = $4,
            ship_to_snapshot_encryption_version = 1,
            delivery_resolution_state = 'manual',
            requested_delivery_at = now() + interval '5 days',
            row_version = row_version + 1,
-           updated_by = $4,
+           updated_by = $5,
            updated_at = now()
        WHERE organization_id = $1::uuid
          AND global_id = $2
          AND workflow_state = 'promoted'
-       RETURNING id`,
+       RETURNING id::text, global_id, row_version::integer, source_hash`,
       [
         ids.organization,
         successCandidate.candidate_global_id,
-        hash(JSON.stringify(destination)),
+        Buffer.from(JSON.stringify(destination)),
+        hash(canonicalJson(destination)),
         actorEmail,
       ],
     )
     assert.equal(candidate.rowCount, 1)
-    const warehouse = await canonicalSeed.query(
+    const warehouse = await operationalSeed.query(
       `INSERT INTO operations_warehouses (
          organization_id, code, name, timezone, address,
          status, created_by, updated_by
        ) VALUES (
          $1::uuid, 'FAIRE-E2E', 'Faire sandbox E2E warehouse',
          'America/Los_Angeles', $2::jsonb, 'active', $3, $3
-       ) RETURNING id::text`,
+       ) RETURNING id::text, global_id`,
       [
         ids.organization,
         JSON.stringify({
@@ -1980,62 +2192,598 @@ async function verifyFaireExactVariantPackBinding(
         actorEmail,
       ],
     )
-    const plan = await canonicalSeed.query(
-      `INSERT INTO operations_fulfillment_plans (
-         organization_id, order_id, warehouse_id, version_number,
-         status, method, solver_status, promised_delivery_at,
-         explanation, created_by
+    const location = await operationalSeed.query(
+      `INSERT INTO operations_locations (
+         organization_id, warehouse_id, code, zone, location_type,
+         pick_sequence, active, created_by
        ) VALUES (
-         $1::uuid, $2::uuid, $3::uuid, 1, 'released', 'manual_override',
-         'test_fixture', now() + interval '5 days',
-         '{"carrierReadEnvironment":"sandbox"}'::jsonb, $4
-       ) RETURNING id::text`,
-      [ids.organization, orderId, warehouse.rows[0].id, actorEmail],
-    )
-    const packageRow = await canonicalSeed.query(
-      `INSERT INTO operations_packages (
-         organization_id, plan_id, package_number,
-         length_mm, width_mm, height_mm, weight_grams,
-         status, packed_by, packed_at
-       ) VALUES (
-         $1::uuid, $2::uuid, 1, 203, 152, 51, 170,
-         'packed', $3, now()
+         $1::uuid, $2::uuid, 'FAIRE-PICK-01', 'PICK', 'pick',
+         1, true, $3
        ) RETURNING id::text, global_id`,
-      [ids.organization, plan.rows[0].id, actorEmail],
+      [ids.organization, warehouse.rows[0].id, actorEmail],
     )
-    packageGlobalId = packageRow.rows[0].global_id
-    const canonicalLine = await canonicalSeed.query(
-      `SELECT id::text
-       FROM operations_order_lines
-       WHERE organization_id = $1::uuid
-         AND order_id = $2::uuid`,
-      [ids.organization, orderId],
+    const inventoryPool = await operationalSeed.query(
+      `INSERT INTO operations_inventory_pools (
+         organization_id, pipeline_id, name, pool_type,
+         allocation_policy, active, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, 'Faire E2E local inventory',
+         'shared', 'fifo', true, $3
+       ) RETURNING id::text`,
+      [ids.organization, ids.pipeline, actorEmail],
     )
-    assert.equal(canonicalLine.rowCount, 1)
-    await canonicalSeed.query(
-      `INSERT INTO operations_package_contents (
-         organization_id, plan_id, order_id, package_id,
-         order_line_id, quantity, created_by
+    const inventoryPosition = await operationalSeed.query(
+      `INSERT INTO operations_inventory_positions (
+         organization_id, pipeline_id, warehouse_id, location_id,
+         pool_id, product_id, lot_code, on_hand_quantity,
+         reserved_quantity, damaged_quantity, source_authority
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-         $5::uuid, 1, $6
-       )`,
+         $5::uuid, $6::uuid, 'FAIRE-E2E', 1, 0, 0, 'clawpilot'
+       ) RETURNING id::text, global_id`,
       [
         ids.organization,
-        plan.rows[0].id,
-        orderId,
-        packageRow.rows[0].id,
-        canonicalLine.rows[0].id,
+        ids.pipeline,
+        warehouse.rows[0].id,
+        location.rows[0].id,
+        inventoryPool.rows[0].id,
+        ids.product,
+      ],
+    )
+    const material = await operationalSeed.query(
+      `INSERT INTO operations_packaging_materials (
+         organization_id, code, name, material_type,
+         inner_length_mm, inner_width_mm, inner_height_mm,
+         tare_weight_grams, max_weight_grams, unit_cost_minor,
+         currency, status, source,
+         dimension_basis, dimension_evidence_type,
+         dimension_evidence_reference, dimension_confirmed_at,
+         dimension_confirmed_by,
+         rated_outer_length_mm, rated_outer_width_mm,
+         rated_outer_height_mm, rated_outer_dimension_evidence_type,
+         rated_outer_dimension_evidence_reference,
+         rated_outer_dimension_confirmed_at,
+         rated_outer_dimension_confirmed_by,
+         created_by, updated_by
+       ) VALUES (
+         $1::uuid, 'FAIRE-E2E-CARTON', 'Faire E2E measured carton', 'carton',
+         220, 170, 70, 20, 1000, 55,
+         'USD', 'active', 'manual',
+         'inner', 'measured', $2, now(), $3,
+         230, 180, 80, 'measured', $2, now(), $3,
+         $3, $3
+       ) RETURNING id::text, global_id, row_version::integer`,
+      [
+        ids.organization,
+        'Disposable PostgreSQL measured Faire carton',
         actorEmail,
       ],
     )
-    await canonicalSeed.query('COMMIT')
+    const materialStock = await operationalSeed.query(
+      `INSERT INTO operations_packaging_material_stock (
+         organization_id, packaging_material_id, warehouse_id,
+         is_available, on_hand_quantity, reorder_point_quantity,
+         reorder_to_quantity, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid,
+         true, 1, 0, 1, $4, $4
+       ) RETURNING id::text`,
+      [
+        ids.organization,
+        material.rows[0].id,
+        warehouse.rows[0].id,
+        actorEmail,
+      ],
+    )
+    const recipe = await operationalSeed.query(
+      `INSERT INTO operations_approved_pack_recipes (
+         organization_id, pipeline_id, product_id, recipe_key, recipe_name,
+         version_number, input_pack_profile_version_id,
+         output_pack_profile_version_id, packaging_material_id,
+         input_quantity, output_quantity, packaging_material_quantity,
+         recipe_type, fulfillment_policy, remainder_policy,
+         inventory_evidence_requirement, assembly_policy, exclusive_contents,
+         minimum_input_quantity, content_compatibility_key,
+         allows_mixed_products, lifecycle_state, fit_evidence_type,
+         fit_evidence_reference, confirmed_at, confirmed_by, source,
+         is_current, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid,
+         'faire-e2e-exact-carton', 'Faire E2E exact carton',
+         1, $4::uuid, $5::uuid, $6::uuid,
+         2, 1, 1, 'max_capacity', 'case_required', 'block',
+         'each_assembly_allowed', 'allowed', true,
+         1, NULL, false, 'active', 'measured', $7,
+         now(), $8, 'manual', true, $8, $8
+       ) RETURNING id::text, global_id, row_version::integer`,
+      [
+        ids.organization,
+        ids.pipeline,
+        ids.product,
+        packVersion.id,
+        cartonPackVersion.id,
+        material.rows[0].id,
+        'Disposable PostgreSQL exact Faire carton fit',
+        actorEmail,
+      ],
+    )
+    const canonicalLine = await operationalSeed.query(
+      `SELECT line.id::text, line.global_id,
+              product.reference_code AS product_global_id,
+              line.description
+       FROM operations_order_lines
+         line
+       JOIN crm_products product
+         ON product.pipeline_id = line.pipeline_id
+        AND product.id = line.product_id
+       WHERE line.organization_id = $1::uuid
+         AND line.order_id = $2::uuid`,
+      [ids.organization, orderId],
+    )
+    assert.equal(canonicalLine.rowCount, 1)
+    const carrierAccounts = {}
+    for (const carrier of [
+      { provider: 'ups_rest', name: 'Faire E2E UPS', lastFour: '9201' },
+      { provider: 'fedex_rest', name: 'Faire E2E FedEx', lastFour: '9202' },
+    ]) {
+      const connection = await operationalSeed.query(
+        `INSERT INTO operations_integration_accounts (
+           organization_id, provider, integration_type, environment,
+           display_name, status, configuration, created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2, 'carrier', 'sandbox',
+           $3, 'active', '{}'::jsonb, $4, $4
+         ) RETURNING id::text`,
+        [ids.organization, carrier.provider, carrier.name, actorEmail],
+      )
+      const carrierAccount = await operationalSeed.query(
+        `INSERT INTO operations_carrier_accounts (
+           organization_id, integration_account_id, display_name,
+           sender_name, account_number_ciphertext, account_number_iv,
+           account_number_tag, account_number_last_four,
+           account_number_fingerprint, registered_address,
+           registered_address_fingerprint, address_verification,
+           status, created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3,
+           'Faire E2E warehouse', $4, $5, $6, $7, $8,
+           $9::jsonb, $10, 'operator_attested', 'active', $11, $11
+         ) RETURNING id::text`,
+        [
+          ids.organization,
+          connection.rows[0].id,
+          `${carrier.name} account`,
+          `${carrier.provider}-ciphertext`,
+          `${carrier.provider}-iv`,
+          `${carrier.provider}-tag`,
+          carrier.lastFour,
+          hash(`${carrier.provider}:account`),
+          JSON.stringify({
+            name: 'Faire E2E warehouse',
+            line1: '16691 Gothard St',
+            line2: 'Suite Q',
+            city: 'Huntington Beach',
+            region: 'CA',
+            postalCode: '92647',
+            countryCode: 'US',
+          }),
+          hash(`${carrier.provider}:registered-address`),
+          actorEmail,
+        ],
+      )
+      carrierAccounts[carrier.provider] = {
+        integrationAccountId: connection.rows[0].id,
+        carrierAccountId: carrierAccount.rows[0].id,
+      }
+    }
+    operational = {
+      order: order.rows[0],
+      candidate: candidate.rows[0],
+      canonicalLine: canonicalLine.rows[0],
+      warehouse: warehouse.rows[0],
+      location: location.rows[0],
+      inventoryPool: inventoryPool.rows[0],
+      inventoryPosition: inventoryPosition.rows[0],
+      material: material.rows[0],
+      materialStock: materialStock.rows[0],
+      recipe: recipe.rows[0],
+      carrierAccounts,
+    }
+    await operationalSeed.query('COMMIT')
   } catch (error) {
-    await canonicalSeed.query('ROLLBACK').catch(() => {})
+    await operationalSeed.query('ROLLBACK').catch(() => {})
     throw error
   } finally {
-    canonicalSeed.release()
+    operationalSeed.release()
   }
+
+  const candidateContext = await warehouseServices
+    .cartonizationRateEvidence.readCartonizationRateCandidateContext({
+      organizationId: ids.organization,
+      accountGlobalId: runtime.globalId,
+      candidateGlobalId: operational.candidate.global_id,
+      expectedCandidateRowVersion: operational.candidate.row_version,
+    })
+  assert.equal(candidateContext.destination.region, 'CA')
+  assert.equal(candidateContext.destination.countryCode, 'US')
+
+  const cartonizationPlan = warehouseServices.hybridCartonization
+    .planHybridCartonization({
+      mode: 'production',
+      lines: [{
+        lineGlobalId: successCandidate.line_global_id,
+        productGlobalId: operational.canonicalLine.product_global_id,
+        title: operational.canonicalLine.description,
+        quantity: 1,
+        unitWeightGrams: 170,
+        profile: {
+          versionGlobalId: packVersion.global_id,
+          capturedRowVersion: packVersion.row_version,
+          currentRowVersion: packVersion.row_version,
+          isCurrent: true,
+          lifecycleState: 'active',
+          fitModel: 'rigid_3d',
+          evidenceType: 'customer_confirmed',
+          evidenceReference:
+            'Disposable PostgreSQL exact Faire pack acceptance',
+          confirmedAt: observedAt,
+          packageLevel: 'each',
+          baseEachQuantity: 1,
+          shipsAsOwnPackage: false,
+          outerDimensionsMm: { length: 203, width: 152, height: 51 },
+          grossWeightGrams: 170,
+        },
+      }],
+      recipes: [{
+        recipeGlobalId: operational.recipe.global_id,
+        productGlobalId: operational.canonicalLine.product_global_id,
+        inputPackProfileVersionGlobalId: packVersion.global_id,
+        outputPackProfileVersionGlobalId: cartonPackVersion.global_id,
+        packagingMaterialGlobalId: operational.material.global_id,
+        recipeType: 'max_capacity',
+        maximumInputQuantity: 2,
+        minimumInputQuantity: 1,
+        contentCompatibilityKey: null,
+        allowsMixedProducts: false,
+        exclusiveContents: true,
+        capturedRowVersion: operational.recipe.row_version,
+        currentRowVersion: operational.recipe.row_version,
+        isCurrent: true,
+        lifecycleState: 'active',
+        fitEvidenceType: 'measured',
+        fitEvidenceReference:
+          'Disposable PostgreSQL exact Faire carton fit',
+        confirmedAt: observedAt,
+      }],
+      materials: [{
+        materialGlobalId: operational.material.global_id,
+        capturedRowVersion: operational.material.row_version,
+        currentRowVersion: operational.material.row_version,
+        isCurrent: true,
+        status: 'active',
+        innerDimensionsMm: { length: 220, width: 170, height: 70 },
+        dimensionBasis: 'inner',
+        dimensionEvidenceType: 'measured',
+        dimensionEvidenceReference:
+          'Disposable PostgreSQL measured Faire carton',
+        dimensionConfirmedAt: observedAt,
+        tareWeightGrams: 20,
+        maximumGrossWeightGrams: 1000,
+        availableQuantity: 1,
+        ratedOuterDimensionsMm: { length: 230, width: 180, height: 80 },
+      }],
+    })
+  assert.equal(cartonizationPlan.status, 'ready')
+  assert.equal(cartonizationPlan.geometryFallbackLines.length, 0)
+  assert.equal(cartonizationPlan.recipePackages.length, 1)
+  const recipePackage = cartonizationPlan.recipePackages[0]
+  assert.equal(recipePackage.planningMethod, 'approved_recipe')
+  assert.equal(recipePackage.contentWeightGrams, 170)
+  assert.equal(recipePackage.rateReadiness.status, 'ready')
+  assert.equal(recipePackage.rateReadiness.ratedOuterDimensionsMm.length, 230)
+  assert.equal(recipePackage.rateReadiness.ratedOuterDimensionsMm.width, 180)
+  assert.equal(recipePackage.rateReadiness.ratedOuterDimensionsMm.height, 80)
+  assert.equal(recipePackage.rateReadiness.tareWeightGrams, 20)
+  assert.equal(recipePackage.rateReadiness.ratedWeightGrams, 190)
+  assert.equal(recipePackage.rateReadiness.blockers.length, 0)
+  const roundCarrierDecimal = (value) => Math.round(value * 1_000) / 1_000
+  const carrierParcel = {
+    description: 'Operational cartonized Faire E2E order',
+    length: roundCarrierDecimal(230 / 25.4),
+    width: roundCarrierDecimal(180 / 25.4),
+    height: roundCarrierDecimal(80 / 25.4),
+    dimensionUnit: 'IN',
+    weight: roundCarrierDecimal(190 / 453.59237),
+    weightUnit: 'LB',
+  }
+  const rateEvidence = {}
+  for (const [provider, carrier] of Object.entries(
+    operational.carrierAccounts,
+  )) {
+    const requestHash = hash(`faire-e2e-${provider}-shipment-rate`)
+    rateEvidence[provider] = (await pool.query(
+      `INSERT INTO operations_carrier_rate_requests (
+         organization_id, integration_account_id, carrier_account_id,
+         provider, environment, purpose, adapter_version,
+         credential_version, request_hash, redacted_request,
+         redacted_response, status, actor_email, requested_at, completed_at
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid,
+         $4, 'sandbox', 'cartonization_shipment_rate',
+         'faire-e2e-acceptance-v1', 1, $5, $6::jsonb,
+         $7::jsonb, 'succeeded', $8,
+         now() - interval '1 second', now()
+       ) RETURNING id::text, global_id`,
+      [
+        ids.organization,
+        carrier.integrationAccountId,
+        carrier.carrierAccountId,
+        provider,
+        requestHash,
+        JSON.stringify({
+          shipment: {
+            destinationFingerprint:
+              candidateContext.destinationFingerprint,
+            rateScope: 'multi_package_shipment',
+            packageCount: 1,
+            parcels: [carrierParcel],
+          },
+        }),
+        JSON.stringify({
+          rateScope: 'multi_package_shipment',
+          packageCount: 1,
+          rateCount: 1,
+          rates: [{
+            serviceCode: provider === 'ups_rest'
+              ? 'ground'
+              : 'fedex_ground',
+            serviceName: provider === 'ups_rest'
+              ? 'UPS Ground'
+              : 'FedEx Ground',
+            amount: provider === 'ups_rest' ? '12.50' : '13.25',
+            currency: 'USD',
+            rateType: 'account',
+            transitDays: provider === 'ups_rest' ? 3 : 2,
+            deliveryDate: null,
+          }],
+        }),
+        actorEmail,
+      ],
+    )).rows[0]
+  }
+  const recipes = [...new Map(recipePackage.lineAllocations.map(
+    (allocation) => [allocation.recipeGlobalId, {
+      recipeGlobalId: allocation.recipeGlobalId,
+      recipeRowVersion: allocation.recipeRowVersion,
+      productGlobalId: allocation.productGlobalId,
+      inputProfileVersionGlobalId: allocation.profileVersionGlobalId,
+      inputProfileVersionRowVersion: allocation.profileVersionRowVersion,
+    }],
+  )).values()]
+  const packageSnapshot = {
+    packageKey: recipePackage.packageKey,
+    packageSequence: recipePackage.sequence,
+    planningMethod: recipePackage.planningMethod,
+    packagingMaterialGlobalId: recipePackage.packagingMaterialGlobalId,
+    materialRowVersion: recipePackage.packagingMaterialRowVersion,
+    recipes,
+    innerDimensionsMm: recipePackage.materialEvidence.innerDimensionsMm,
+    ratedOuterDimensionsMm:
+      recipePackage.rateReadiness.ratedOuterDimensionsMm,
+    contentWeightGrams: recipePackage.contentWeightGrams,
+    tareWeightGrams: recipePackage.rateReadiness.tareWeightGrams,
+    ratedGrossWeightGrams: recipePackage.rateReadiness.ratedWeightGrams,
+    maxWeightGrams: 1000,
+    allocations: recipePackage.lineAllocations.map((allocation) => ({
+      lineGlobalId: allocation.lineGlobalId,
+      productGlobalId: allocation.productGlobalId,
+      title: allocation.title,
+      quantity: allocation.quantity,
+    })),
+    carrierParcel,
+  }
+  const packageInput = {
+    ...packageSnapshot,
+    packageHash: warehouseServices.cartonizationRateEvidence
+      .cartonizationRateEvidenceHash(packageSnapshot),
+  }
+  const materialFacts = [{
+    materialGlobalId: operational.material.global_id,
+    expectedRowVersion: operational.material.row_version,
+    ratedOuterDimensionsMm: { length: 230, width: 180, height: 80 },
+    tareWeightGrams: 20,
+  }]
+  const planSnapshot = JSON.parse(JSON.stringify({
+    mode: 'production',
+    carrierReadEnvironment: 'sandbox',
+    policyVersion: cartonizationPlan.policyVersion,
+    algorithmVersion: cartonizationPlan.algorithmVersion,
+    inputHash: cartonizationPlan.inputHash,
+    domainResultHash: cartonizationPlan.resultHash,
+    status: cartonizationPlan.status,
+    recipePackages: cartonizationPlan.recipePackages,
+    geometryFallbackLines: cartonizationPlan.geometryFallbackLines,
+    assumptions: cartonizationPlan.assumptions,
+    blockers: cartonizationPlan.blockers,
+  }))
+  const semanticRequestHash = hash('faire-e2e-operational-cartonization')
+  const evidenceIdempotencyKey =
+    'commerce-staging-faire-operational-cartonization'
+  const cartonizationClaim = await warehouseServices.cartonizationRateEvidence
+    .claimCartonizationRateEvidenceCommandInPostgres({
+      organizationId: ids.organization,
+      idempotencyKey: evidenceIdempotencyKey,
+      semanticRequestHash,
+      actorEmail,
+    })
+  assert.equal(cartonizationClaim.state, 'claimed')
+  const cartonizationEvidenceInput = JSON.parse(JSON.stringify({
+      organizationId: ids.organization,
+      accountGlobalId: runtime.globalId,
+      candidateGlobalId: operational.candidate.global_id,
+      candidateRowVersion: operational.candidate.row_version,
+      destinationFingerprint: candidateContext.destinationFingerprint,
+      warehouseGlobalId: operational.warehouse.global_id,
+      inventorySyncRunGlobalId: null,
+      evidenceMode: 'operational',
+      policyVersion: cartonizationPlan.policyVersion,
+      algorithmVersion: cartonizationPlan.algorithmVersion,
+      planInputHash: cartonizationPlan.inputHash,
+      planResultHash: warehouseServices.cartonizationRateEvidence
+        .cartonizationRateEvidenceHash(planSnapshot),
+      planSnapshot,
+      assumptionSnapshot: { operationalMaterialFacts: materialFacts },
+      status: 'succeeded',
+      idempotencyKey: evidenceIdempotencyKey,
+      actorEmail,
+      semanticRequestHash,
+      materialRateAssumptions: materialFacts,
+      packages: [packageInput],
+      quotes: [
+        {
+          packageKey: recipePackage.packageKey,
+          provider: 'ups_rest',
+          rateEvidenceGlobalId: rateEvidence.ups_rest.global_id,
+        },
+        {
+          packageKey: recipePackage.packageKey,
+          provider: 'fedex_rest',
+          rateEvidenceGlobalId: rateEvidence.fedex_rest.global_id,
+        },
+      ],
+    }))
+  for (const field of [
+    'organizationId',
+    'accountGlobalId',
+    'candidateGlobalId',
+    'candidateRowVersion',
+    'destinationFingerprint',
+    'warehouseGlobalId',
+    'inventorySyncRunGlobalId',
+    'evidenceMode',
+    'policyVersion',
+    'algorithmVersion',
+    'planInputHash',
+    'planResultHash',
+    'planSnapshot',
+    'assumptionSnapshot',
+    'status',
+    'idempotencyKey',
+    'actorEmail',
+    'semanticRequestHash',
+    'materialRateAssumptions',
+    'packages',
+    'quotes',
+  ]) {
+    assert.ok(
+      Object.hasOwn(cartonizationEvidenceInput, field),
+      `Faire operational cartonization evidence is missing ${field}`,
+    )
+  }
+  const cartonizationEvidence = await warehouseServices
+    .cartonizationRateEvidence.writeCartonizationRateEvidenceInPostgres(
+      cartonizationEvidenceInput,
+    )
+  assert.equal(cartonizationEvidence.evidenceMode, 'operational')
+  assert.equal(cartonizationEvidence.inventorySyncRunGlobalId, null)
+  assert.equal(cartonizationEvidence.packages.length, 1)
+
+  const planned = await warehouseServices.operations
+    .planOperationsOrderFromPostgres({
+      organizationId: ids.organization,
+      actorEmail,
+      orderGlobalId: promoted.canonicalOrderGlobalId,
+      cartonizationEvidenceGlobalId: cartonizationEvidence.globalId,
+      expectedRowVersion: operational.order.row_version,
+      reason: 'Plan the exact Faire operational carton',
+      idempotencyKey: 'commerce-staging-faire-operational-plan',
+    })
+  assert.equal(planned.orderStatus, 'planned')
+  const released = await warehouseServices.operations
+    .releaseOperationsOrderFromPostgres({
+      organizationId: ids.organization,
+      actorEmail,
+      orderGlobalId: promoted.canonicalOrderGlobalId,
+      expectedRowVersion: planned.rowVersion,
+      reason: 'Release the exact Faire operational carton',
+      idempotencyKey: 'commerce-staging-faire-operational-release',
+    })
+  assert.equal(released.orderStatus, 'released')
+  const picked = await warehouseServices.operations
+    .confirmOperationsOrderPicksFromPostgres({
+      organizationId: ids.organization,
+      actorEmail,
+      orderGlobalId: promoted.canonicalOrderGlobalId,
+      expectedRowVersion: released.rowVersion,
+      reason: 'Confirm the exact Faire operational pick',
+      idempotencyKey: 'commerce-staging-faire-operational-pick',
+    })
+  assert.equal(picked.orderStatus, 'picking')
+  const packed = await warehouseServices.operations
+    .verifyOperationsOrderPackFromPostgres({
+      organizationId: ids.organization,
+      actorEmail,
+      orderGlobalId: promoted.canonicalOrderGlobalId,
+      expectedRowVersion: picked.rowVersion,
+      reason: 'Verify the exact Faire operational parcel',
+      idempotencyKey: 'commerce-staging-faire-operational-pack',
+    })
+  assert.equal(packed.orderStatus, 'packed')
+  const packageState = (await pool.query(
+    `SELECT
+       package.global_id, package.status,
+       package.length_mm, package.width_mm, package.height_mm,
+       package.weight_grams,
+       carton_package.content_weight_grams,
+       carton_package.tare_weight_grams,
+       carton_package.rated_gross_weight_grams,
+       content.quantity::text AS item_quantity,
+       reservation.reservation_authority,
+       pick.status AS pick_status,
+       wave.status AS wave_status
+     FROM operations_fulfillment_plans plan
+     JOIN operations_packages package
+       ON package.organization_id = plan.organization_id
+      AND package.plan_id = plan.id
+     JOIN operations_cartonization_rate_evidence_packages carton_package
+       ON carton_package.organization_id = package.organization_id
+      AND carton_package.evidence_id = package.cartonization_evidence_id
+      AND carton_package.package_key = package.evidence_package_key
+     JOIN operations_package_contents content
+       ON content.organization_id = package.organization_id
+      AND content.package_id = package.id
+     JOIN operations_fulfillment_allocations allocation
+       ON allocation.organization_id = plan.organization_id
+      AND allocation.plan_id = plan.id
+     JOIN operations_reservations reservation
+       ON reservation.organization_id = allocation.organization_id
+      AND reservation.id = allocation.reservation_id
+     JOIN operations_pick_tasks pick
+       ON pick.organization_id = allocation.organization_id
+      AND pick.allocation_id = allocation.id
+     JOIN operations_waves wave
+       ON wave.organization_id = pick.organization_id
+      AND wave.id = pick.wave_id
+     WHERE plan.organization_id = $1::uuid
+       AND plan.global_id = $2`,
+    [ids.organization, planned.fulfillmentPlanGlobalId],
+  )).rows[0]
+  const packageGlobalId = packageState.global_id
+  assert.deepEqual(packageState, {
+    global_id: packageGlobalId,
+    status: 'packed',
+    length_mm: 230,
+    width_mm: 180,
+    height_mm: 80,
+    weight_grams: 190,
+    content_weight_grams: 170,
+    tare_weight_grams: 20,
+    rated_gross_weight_grams: 190,
+    item_quantity: '1.000000',
+    reservation_authority: 'local_balance',
+    pick_status: 'picked',
+    wave_status: 'completed',
+  })
 
   const authorizationInput = {
     organizationId: ids.organization,
@@ -2066,9 +2814,19 @@ async function verifyFaireExactVariantPackBinding(
   const evidence = (await pool.query(
     `SELECT
        pack_profile_version_global_id,
+       item_pack_evidence_hash,
        package_global_id,
        item_quantity::text,
-       length_mm, width_mm, height_mm, gross_weight_grams,
+       item_pack_length_mm, item_pack_width_mm, item_pack_height_mm,
+       item_pack_gross_weight_grams,
+       parcel_inner_dimensions_mm,
+       parcel_length_mm, parcel_width_mm, parcel_height_mm,
+       parcel_content_weight_grams, parcel_tare_weight_grams,
+       parcel_gross_weight_grams,
+       cartonization_evidence_global_id,
+       cartonization_package_key,
+       packaging_material_global_id,
+       approved_pack_recipe_global_id,
        destination_region, destination_country_code,
        evidence_hash
      FROM operations_sandbox_commerce_e2e_faire_evidence
@@ -2082,21 +2840,34 @@ async function verifyFaireExactVariantPackBinding(
   )).rows[0]
   assert.deepEqual(evidence, {
     pack_profile_version_global_id: packVersion.global_id,
+    item_pack_evidence_hash: evidence.item_pack_evidence_hash,
     package_global_id: packageGlobalId,
     item_quantity: '1.000000',
-    length_mm: 203,
-    width_mm: 152,
-    height_mm: 51,
-    gross_weight_grams: 170,
+    item_pack_length_mm: 203,
+    item_pack_width_mm: 152,
+    item_pack_height_mm: 51,
+    item_pack_gross_weight_grams: 170,
+    parcel_inner_dimensions_mm: { length: 220, width: 170, height: 70 },
+    parcel_length_mm: 230,
+    parcel_width_mm: 180,
+    parcel_height_mm: 80,
+    parcel_content_weight_grams: 170,
+    parcel_tare_weight_grams: 20,
+    parcel_gross_weight_grams: 190,
+    cartonization_evidence_global_id: cartonizationEvidence.globalId,
+    cartonization_package_key: recipePackage.packageKey,
+    packaging_material_global_id: operational.material.global_id,
+    approved_pack_recipe_global_id: operational.recipe.global_id,
     destination_region: 'CA',
     destination_country_code: 'US',
     evidence_hash: evidence.evidence_hash,
   })
+  assert.match(evidence.item_pack_evidence_hash, /^[a-f0-9]{64}$/u)
   assert.match(evidence.evidence_hash, /^[a-f0-9]{64}$/u)
   await assert.rejects(
     pool.query(
       `UPDATE operations_sandbox_commerce_e2e_faire_evidence
-       SET gross_weight_grams = 171
+       SET parcel_gross_weight_grams = 191
        WHERE organization_id = $1::uuid
          AND package_global_id = $2`,
       [ids.organization, packageGlobalId],
@@ -2133,32 +2904,14 @@ async function verifyFaireExactVariantPackBinding(
     )),
     (error) => error?.code === 'SANDBOX_E2E_FAIRE_EVIDENCE_STALE',
   )
-  await pool.query(
-    `UPDATE operations_packages
-     SET weight_grams = 171
-     WHERE organization_id = $1::uuid AND global_id = $2`,
-    [ids.organization, packageGlobalId],
-  )
   await assert.rejects(
-    withAuthorizationTransaction((client) => (
-      sandboxAuthorization.requireActiveSandboxCommerceE2eAuthorization(
-        client,
-        {
-          organizationId: ids.organization,
-          authorizationGlobalId: authorization.authorizationGlobalId,
-          orderGlobalId: promoted.canonicalOrderGlobalId,
-          actorEmail,
-          packageGlobalId,
-        },
-      )
-    )),
-    (error) => error?.code === 'SANDBOX_E2E_FAIRE_EVIDENCE_STALE',
-  )
-  await pool.query(
-    `UPDATE operations_packages
-     SET weight_grams = 170
-     WHERE organization_id = $1::uuid AND global_id = $2`,
-    [ids.organization, packageGlobalId],
+    pool.query(
+      `UPDATE operations_packages
+       SET weight_grams = 191
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [ids.organization, packageGlobalId],
+    ),
+    /Physical package dimensions and weight must equal sealed evidence/,
   )
   await withAuthorizationTransaction((client) => (
     sandboxAuthorization.requireActiveSandboxCommerceE2eAuthorization(

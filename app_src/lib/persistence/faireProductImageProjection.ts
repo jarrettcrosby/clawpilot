@@ -733,13 +733,14 @@ export async function prepareFaireProductImageProjectionInPostgres(
          asset_content_sha256, asset_mime_type, asset_byte_length,
          asset_pixel_width, asset_pixel_height, asset_alt_text,
          credential_generation, activation_revision, aggregate_revision,
-         aggregate_hash, expires_at, created_by
+         aggregate_hash, issued_at, expires_at, created_by
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid,
          $7::uuid, $8, $9, $10, $11, $12, $13, $14, $15, $16,
          $17::bigint, $18, $19, 'active', true, $20::bigint, $21::bigint,
          $22, $23, $24, $25, $26, $27, $28, $29, $30::bigint, $31,
-         clock_timestamp() + ($32::text || ' seconds')::interval, $33
+         statement_timestamp(),
+         statement_timestamp() + ($32::text || ' seconds')::interval, $33
        ) RETURNING id`,
       [
         grantId,

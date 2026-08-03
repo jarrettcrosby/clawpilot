@@ -840,6 +840,41 @@ assert.deepEqual(
   },
   'Shopify production evidence must use provider commitment without an operator attribution assumption',
 )
+const faireProductionInventory =
+  evaluateHybridCartonizationInventoryAvailability({
+    mode: 'production',
+    provider: 'faire',
+    lines: [{
+      lineGlobalId: 'gcol0000001',
+      productGlobalId: 'gp0000001',
+      requiredQuantity: 2,
+    }],
+    positions: [{
+      productGlobalId: 'gp0000001',
+      operationalAvailableQuantity: 3,
+      providerCommittedQuantity: 0,
+      sourceLevelGlobalIds: [],
+      sourcePositionGlobalIds: ['giv0000001'],
+      sourceProjectionStates: ['projected'],
+    }],
+    assumedCommittedQuantities: [],
+  })
+assert.deepEqual(
+  JSON.parse(JSON.stringify(faireProductionInventory.products[0])),
+  {
+    productGlobalId: 'gp0000001',
+    requiredQuantity: 2,
+    availabilityAuthority: 'operational_available',
+    operationalAvailableQuantity: 3,
+    providerCommittedQuantity: 0,
+    assumedCommittedQuantity: 0,
+    effectiveAvailableQuantity: 3,
+    sourceLevelGlobalIds: [],
+    sourcePositionGlobalIds: ['giv0000001'],
+    sourceProjectionStates: ['projected'],
+  },
+  'Faire production evidence must use current ClawPilot-local inventory positions',
+)
 assert.throws(
   () => evaluateHybridCartonizationInventoryAvailability({
     mode: 'production',
@@ -900,6 +935,10 @@ for (const contract of [
   'candidate.global_id = $3',
   "warehouse.status = 'active'",
   "run.status = 'succeeded'",
+  "const inventoryRun = account.provider === 'shopify'",
+  "position.source_authority = 'clawpilot'",
+  'sourcePositionGlobalIds',
+  'syncRunGlobalId: inventoryRun?.global_id || null',
   'pack_mapping.row_version::text',
   'pack_mapping.global_id AS pack_mapping_global_id',
   'pack_version.row_version::text',

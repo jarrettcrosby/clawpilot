@@ -47,6 +47,7 @@ export type HybridCartonizationInventoryProductEvidence = {
   assumedCommittedQuantity: number
   effectiveAvailableQuantity: number
   sourceLevelGlobalIds: string[]
+  sourcePositionGlobalIds?: string[]
   sourceProjectionStates: HybridCartonizationInventoryProjectionState[]
 }
 
@@ -73,9 +74,9 @@ export type HybridCartonizationReadResult = {
     name: string
   }
   inventory: {
-    syncRunGlobalId: string
-    providerFetchedAt: string
-    completedAt: string
+    syncRunGlobalId: string | null
+    providerFetchedAt: string | null
+    completedAt: string | null
     lines: HybridCartonizationInventoryLineEvidence[]
     products: HybridCartonizationInventoryProductEvidence[]
   }
@@ -201,6 +202,8 @@ type AccountRow = {
 type CandidateRow = {
   id: string
   global_id: string
+  pipeline_id: string
+  customer_id: string | null
   order_number_snapshot: string
   row_version: string
   source_hash: string
@@ -571,6 +574,7 @@ type InventoryProductRow = {
   operational_available_quantity: string
   provider_committed_quantity: string
   source_level_global_ids: string[]
+  source_position_global_ids?: string[]
   source_projection_states: HybridCartonizationInventoryProjectionState[]
 }
 
@@ -589,6 +593,7 @@ type InventoryEvaluationPosition = {
   operationalAvailableQuantity: number
   providerCommittedQuantity: number
   sourceLevelGlobalIds: string[]
+  sourcePositionGlobalIds?: string[]
   sourceProjectionStates: HybridCartonizationInventoryProjectionState[]
 }
 
@@ -1350,6 +1355,9 @@ export function evaluateHybridCartonizationInventoryAvailability(input: {
       assumedCommittedQuantity: total.assumed,
       effectiveAvailableQuantity,
       sourceLevelGlobalIds: position?.sourceLevelGlobalIds || [],
+      ...(position?.sourcePositionGlobalIds
+        ? { sourcePositionGlobalIds: position.sourcePositionGlobalIds }
+        : {}),
       sourceProjectionStates: position?.sourceProjectionStates || [],
     })
   }
@@ -1421,6 +1429,8 @@ async function readCandidate(
     `SELECT
        candidate.id::text,
        candidate.global_id,
+       candidate.pipeline_id::text,
+       candidate.customer_id::text,
        candidate.order_number_snapshot,
        candidate.row_version::text,
        candidate.source_hash,
@@ -2860,6 +2870,83 @@ async function readInventoryProducts(
   }))
 }
 
+async function readLocalInventoryProducts(
+  client: PoolClient,
+  input: HybridCartonizationReadRequest,
+  candidate: CandidateRow,
+  warehouse: WarehouseRow,
+) {
+  const result = await client.query<InventoryProductRow>(
+    `SELECT
+       position.product_id::text,
+       product.reference_code AS product_global_id,
+       sum(floor(
+         position.on_hand_quantity
+           - position.reserved_quantity
+           - position.damaged_quantity
+       ))::text AS operational_available_quantity,
+       0::text AS provider_committed_quantity,
+       ARRAY[]::text[] AS source_level_global_ids,
+       array_agg(position.global_id ORDER BY position.global_id)
+         AS source_position_global_ids,
+       ARRAY['projected']::text[] AS source_projection_states
+     FROM operations_inventory_positions position
+     JOIN operations_locations location
+       ON location.organization_id = position.organization_id
+      AND location.id = position.location_id
+     JOIN operations_inventory_pools pool
+       ON pool.organization_id = position.organization_id
+      AND pool.id = position.pool_id
+     JOIN crm_products product
+       ON product.pipeline_id = position.pipeline_id
+      AND product.id = position.product_id
+     WHERE position.organization_id = $1::uuid
+       AND position.pipeline_id = $2::uuid
+       AND position.warehouse_id = $3::uuid
+       AND position.source_authority = 'clawpilot'
+       AND location.active = true
+       AND pool.active = true
+       AND (
+         pool.pool_type = 'shared'
+         OR pool.owner_customer_id = $4::uuid
+         OR EXISTS (
+           SELECT 1
+           FROM operations_inventory_pool_customers eligible
+           WHERE eligible.organization_id = pool.organization_id
+             AND eligible.pool_id = pool.id
+             AND eligible.customer_id = $4::uuid
+             AND eligible.effective_from <= now()
+             AND (
+               eligible.effective_to IS NULL
+               OR eligible.effective_to > now()
+             )
+         )
+       )
+       AND position.on_hand_quantity
+             - position.reserved_quantity
+             - position.damaged_quantity > 0
+     GROUP BY position.product_id, product.reference_code
+     ORDER BY product.reference_code`,
+    [
+      input.organizationId,
+      candidate.pipeline_id,
+      warehouse.id,
+      candidate.customer_id,
+    ],
+  )
+  return result.rows.map((row): InventoryEvaluationPosition => ({
+    productGlobalId: row.product_global_id,
+    operationalAvailableQuantity: exactInteger(
+      row.operational_available_quantity,
+      `${row.product_global_id} operational available quantity`,
+    ),
+    providerCommittedQuantity: 0,
+    sourceLevelGlobalIds: [],
+    sourcePositionGlobalIds: row.source_position_global_ids || [],
+    sourceProjectionStates: ['projected'],
+  }))
+}
+
 export async function readHybridCartonizationInputFromPostgres(
   rawInput: HybridCartonizationReadRequest,
 ): Promise<HybridCartonizationReadResult> {
@@ -2885,12 +2972,14 @@ export async function readHybridCartonizationInputFromPostgres(
       account,
     )
     const warehouse = await readWarehouse(client, input)
-    const inventoryRun = await readLatestInventoryRun(
-      client,
-      input,
-      account,
-      warehouse,
-    )
+    const inventoryRun = account.provider === 'shopify'
+      ? await readLatestInventoryRun(
+          client,
+          input,
+          account,
+          warehouse,
+        )
+      : null
     const [candidateRows, materialRows] = await Promise.all([
       readCandidateLines(client, input, account, candidate),
       readSelectedMaterials(client, input, warehouse),
@@ -2904,13 +2993,20 @@ export async function readHybridCartonizationInputFromPostgres(
         lineEvidence,
         selectedMaterials.map((entry) => entry.id),
       ),
-      readInventoryProducts(
-        client,
-        input,
-        account,
-        warehouse,
-        inventoryRun,
-      ),
+      inventoryRun
+        ? readInventoryProducts(
+            client,
+            input,
+            account,
+            warehouse,
+            inventoryRun,
+          )
+        : readLocalInventoryProducts(
+            client,
+            input,
+            candidate,
+            warehouse,
+          ),
     ])
     const recipes = mapRecipes(recipeRows)
     const inventory = evaluateHybridCartonizationInventoryAvailability({
@@ -2946,15 +3042,19 @@ export async function readHybridCartonizationInputFromPostgres(
         name: warehouse.name,
       },
       inventory: {
-        syncRunGlobalId: inventoryRun.global_id,
-        providerFetchedAt: requiredTimestamp(
-          inventoryRun.provider_fetched_at,
-          'Inventory provider fetch timestamp',
-        ),
-        completedAt: requiredTimestamp(
-          inventoryRun.completed_at,
-          'Inventory sync completion timestamp',
-        ),
+        syncRunGlobalId: inventoryRun?.global_id || null,
+        providerFetchedAt: inventoryRun
+          ? requiredTimestamp(
+              inventoryRun.provider_fetched_at,
+              'Inventory provider fetch timestamp',
+            )
+          : null,
+        completedAt: inventoryRun
+          ? requiredTimestamp(
+              inventoryRun.completed_at,
+              'Inventory sync completion timestamp',
+            )
+          : null,
         lines: inventory.lines,
         products: inventory.products,
       },

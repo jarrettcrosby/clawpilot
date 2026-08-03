@@ -425,6 +425,112 @@ async function seedCanonicalPlanningFixture(
     ],
   )
   const productMappingId = mappingResult.rows[0].id
+  let commercePackMapping = null
+  let commercePackVersion = null
+  {
+    const channelRevision = `canonical-${commerceProvider}-pack-${suffix}`
+    const channelHash = sha(channelRevision)
+    const channelStateResult = await pool.query(
+      `INSERT INTO operations_product_channel_states (
+         organization_id, integration_account_id, pipeline_id, provider,
+         external_product_id, external_variant_id,
+         external_inventory_item_id, product_id, product_mapping_id,
+         provider_product_title, provider_variant_title, provider_sku,
+         provider_status_raw, normalized_status, provider_active,
+         requires_shipping, weight_grams, observed_at, source_revision,
+         source_hash, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7,
+         $8::uuid, $9::uuid,
+         'Canonical 6 oz test product', 'Default', $10,
+         'PUBLISHED', 'active', true, true, 170, now(), $11, $12,
+         $13, $13
+       )
+       RETURNING id::text, pack_evidence_hash`,
+      [
+        organizationId,
+        commerceAccount.id,
+        pipelineId,
+        commerceProvider,
+        `gid://shopify/Product/${suffix}`,
+        `gid://shopify/ProductVariant/${suffix}`,
+        `gid://shopify/InventoryItem/${suffix}`,
+        product.id,
+        productMappingId,
+        `CANON-${suffix}`,
+        channelRevision,
+        channelHash,
+        email,
+      ],
+    )
+    const packProfileResult = await pool.query(
+      `INSERT INTO operations_product_pack_profiles (
+         organization_id, pipeline_id, product_id, profile_key,
+         profile_name, package_level, is_default, status,
+         created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'faire-each',
+         'Exact commerce each', 'each', true, 'active', $4, $4
+       )
+       RETURNING id::text`,
+      [organizationId, pipelineId, product.id, email],
+    )
+    const packVersionResult = await pool.query(
+      `INSERT INTO operations_product_pack_profile_versions (
+         organization_id, pipeline_id, product_id, profile_id,
+         version_number, lifecycle_state, base_each_quantity,
+         unit_of_measure, length_mm, width_mm, height_mm, dimension_basis,
+         gross_weight_grams, weight_basis, fit_model,
+         ships_as_own_package, assembly_policy, evidence_type, source,
+         is_current, evidence_reference, confirmed_at, confirmed_by,
+         created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+         1, 'active', 1, 'each', 203, 152, 51, 'outer',
+         170, 'customer_stated', 'rigid_3d', false, 'never',
+         'customer_confirmed', 'manual', true,
+         'Canonical exact commerce item-pack evidence', now(), $5, $5
+       )
+       RETURNING id::text, global_id, row_version::text`,
+      [
+        organizationId,
+        pipelineId,
+        product.id,
+        packProfileResult.rows[0].id,
+        email,
+      ],
+    )
+    commercePackVersion = packVersionResult.rows[0]
+    const packMappingResult = await pool.query(
+      `INSERT INTO operations_commerce_variant_pack_mappings (
+         organization_id, integration_account_id, pipeline_id, product_id,
+         provider, external_product_id, external_variant_id,
+         default_pack_profile_version_id, provider_lifecycle_state,
+         projection_state, mapping_purpose, source_revision, source_hash,
+         pack_evidence_hash, observed_at, is_current, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+         $5, $6, $7, $8::uuid, 'active',
+         'current', 'catalog', $9, $10, $11, now(), true, $12, $12
+       )
+       RETURNING id::text, global_id, row_version::text`,
+      [
+        organizationId,
+        commerceAccount.id,
+        pipelineId,
+        product.id,
+        commerceProvider,
+        `gid://shopify/Product/${suffix}`,
+        `gid://shopify/ProductVariant/${suffix}`,
+        commercePackVersion.id,
+        channelRevision,
+        channelHash,
+        channelStateResult.rows[0].pack_evidence_hash,
+        email,
+      ],
+    )
+    commercePackMapping = packMappingResult.rows[0]
+  }
   const materialResult = await pool.query(
     `INSERT INTO operations_packaging_materials (
        organization_id, code, name, material_type,
@@ -666,6 +772,11 @@ async function seedCanonicalPlanningFixture(
        resolved_other_adjustment_minor, resolved_total_minor,
        taxable, requires_shipping, mapping_state, product_id,
        product_mapping_id, packaging_state, packaging_source,
+       commerce_variant_pack_mapping_id,
+       commerce_variant_pack_mapping_row_version,
+       pack_profile_version_id, pack_profile_version_row_version,
+       pack_profile_package_level, pack_profile_base_each_quantity,
+       packaging_weight_source,
        weight_grams, length_mm, width_mm, height_mm,
        observed_at, source_revision, source_hash,
        provider_api_version, normalizer_version, workflow_state,
@@ -680,11 +791,13 @@ async function seedCanonicalPlanningFixture(
        0, 0, 0, 0, 2000, 'provider',
        'USD', 1000, 2000, 0, 0, 0, 0, 2000,
        true, true, 'resolved', $11::uuid,
-       $12::uuid, 'resolved', 'manual',
+       $12::uuid, 'resolved', $13,
+       $14::uuid, $15::bigint, $16::uuid, $17::bigint,
+       $18, $19::integer, $20,
        170, 203, 152, 51,
-       now(), $13, $14, '2026-07', 'canonical-test-v1',
-       'promoted', '{}'::text[], $15::uuid, now(),
-       1, $16, $16, now() + interval '7 days'
+       now(), $21, $22, '2026-07', 'canonical-test-v1',
+       'promoted', '{}'::text[], $23::uuid, now(),
+       1, $24, $24, now() + interval '7 days'
      )
      RETURNING id::text, global_id`,
     [
@@ -700,6 +813,14 @@ async function seedCanonicalPlanningFixture(
       `CANON-${suffix}`,
       product.id,
       productMappingId,
+      'variant_pack_mapping',
+      commercePackMapping?.id || null,
+      commercePackMapping?.row_version || null,
+      commercePackVersion?.id || null,
+      commercePackVersion?.row_version || null,
+      'each',
+      1,
+      'profile_version',
       `line-revision-${suffix}`,
       sha(`line-${suffix}`),
       orderLine.id,
@@ -2354,6 +2475,19 @@ async function verifyCanonicalPlanning(databaseUrl) {
         },
       },
     )
+    const hybridCartonizationPersistence = loadTypeScriptModule(
+      'app_src/lib/persistence/hybridCartonization.ts',
+      {
+        mocks: {
+          '@/lib/persistence/postgres': postgres,
+          '@/lib/persistence/shopifyCheckoutRating': {
+            shopifyCheckoutRatingHash: (value) => sha(
+              JSON.stringify(value),
+            ),
+          },
+        },
+      },
+    )
     const operations = loadTypeScriptModule(
       'app_src/lib/persistence/operations.ts',
       {
@@ -2477,6 +2611,12 @@ async function verifyCanonicalPlanning(databaseUrl) {
       'function',
       'savePackagingMaterialStockInPostgres must be exported',
     )
+    assert.equal(
+      typeof hybridCartonizationPersistence
+        .readHybridCartonizationInputFromPostgres,
+      'function',
+      'readHybridCartonizationInputFromPostgres must be exported',
+    )
 
     const migrationApplied = await pool.query(
       `SELECT 1
@@ -2488,6 +2628,116 @@ async function verifyCanonicalPlanning(databaseUrl) {
       migrationApplied.rowCount,
       1,
       'Migration 0176 must be applied in disposable PostgreSQL',
+    )
+
+    const faireInventoryFixture = await seedCanonicalPlanningFixture(
+      pool,
+      { inventoryAuthority: 'clawpilot_split' },
+    )
+    const faireAccount = await pool.query(
+      `SELECT global_id
+       FROM operations_integration_accounts
+       WHERE organization_id = $1::uuid
+         AND id = (
+           SELECT integration_account_id
+           FROM operations_commerce_order_candidates
+           WHERE organization_id = $1::uuid
+             AND id = $2::uuid
+         )`,
+      [faireInventoryFixture.organizationId, faireInventoryFixture.candidate.id],
+    )
+    const faireCartonizationInput = await hybridCartonizationPersistence
+      .readHybridCartonizationInputFromPostgres({
+        organizationId: faireInventoryFixture.organizationId,
+        accountGlobalId: faireAccount.rows[0].global_id,
+        candidateGlobalId: faireInventoryFixture.candidate.global_id,
+        expectedCandidateRowVersion: Number(
+          faireInventoryFixture.candidate.row_version,
+        ),
+        warehouseGlobalId: faireInventoryFixture.warehouse.global_id,
+        mode: 'production',
+        selectedMaterials: [{
+          materialGlobalId: faireInventoryFixture.material.global_id,
+          expectedRowVersion: Number(
+            faireInventoryFixture.material.row_version,
+          ),
+        }],
+        assumedCommittedQuantities: [],
+      })
+    assert.equal(faireCartonizationInput.account.provider, 'faire')
+    assert.equal(faireCartonizationInput.inventory.syncRunGlobalId, null)
+    assert.equal(faireCartonizationInput.inventory.providerFetchedAt, null)
+    assert.equal(faireCartonizationInput.inventory.completedAt, null)
+    assert.equal(
+      faireCartonizationInput.inventory.products[0]
+        .availabilityAuthority,
+      'operational_available',
+    )
+    assert.equal(
+      faireCartonizationInput.inventory.products[0]
+        .effectiveAvailableQuantity,
+      4,
+    )
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(
+        faireCartonizationInput.inventory.products[0]
+          .sourceLevelGlobalIds,
+      )),
+      [],
+    )
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(
+        faireCartonizationInput.inventory.products[0]
+          .sourcePositionGlobalIds,
+      )),
+      faireInventoryFixture.splitInventoryPositions
+        .map((position) => position.global_id)
+        .sort(),
+    )
+
+    const shopifyInventoryFixture = await seedCanonicalPlanningFixture(pool)
+    const shopifyAccount = await pool.query(
+      `SELECT global_id
+       FROM operations_integration_accounts
+       WHERE organization_id = $1::uuid
+         AND id = (
+           SELECT integration_account_id
+           FROM operations_commerce_order_candidates
+           WHERE organization_id = $1::uuid
+             AND id = $2::uuid
+         )`,
+      [
+        shopifyInventoryFixture.organizationId,
+        shopifyInventoryFixture.candidate.id,
+      ],
+    )
+    const shopifyCartonizationInput = await hybridCartonizationPersistence
+      .readHybridCartonizationInputFromPostgres({
+        organizationId: shopifyInventoryFixture.organizationId,
+        accountGlobalId: shopifyAccount.rows[0].global_id,
+        candidateGlobalId: shopifyInventoryFixture.candidate.global_id,
+        expectedCandidateRowVersion: Number(
+          shopifyInventoryFixture.candidate.row_version,
+        ),
+        warehouseGlobalId: shopifyInventoryFixture.warehouse.global_id,
+        mode: 'production',
+        selectedMaterials: [{
+          materialGlobalId: shopifyInventoryFixture.material.global_id,
+          expectedRowVersion: Number(
+            shopifyInventoryFixture.material.row_version,
+          ),
+        }],
+        assumedCommittedQuantities: [],
+      })
+    assert.equal(shopifyCartonizationInput.account.provider, 'shopify')
+    assert.equal(
+      shopifyCartonizationInput.inventory.syncRunGlobalId,
+      shopifyInventoryFixture.inventoryRun.global_id,
+    )
+    assert.equal(
+      shopifyCartonizationInput.inventory.products[0]
+        .availabilityAuthority,
+      'shopify_provider_commitment',
     )
 
     const upgradeFixture = await seedCanonicalPlanningFixture(pool)

@@ -142,16 +142,37 @@ type FaireEvidenceRow = {
   fulfillment_plan_version: number
   warehouse_id: string
   warehouse_address_hash: string
+  cartonization_evidence_id: string
+  cartonization_evidence_global_id: string
+  cartonization_request_hash: string
+  cartonization_plan_input_hash: string
+  cartonization_plan_result_hash: string
+  cartonization_package_key: string
+  cartonization_package_hash: string
+  packaging_material_id: string
+  packaging_material_global_id: string
+  packaging_material_row_version: string
+  approved_pack_recipe_id: string
+  approved_pack_recipe_global_id: string
+  approved_pack_recipe_row_version: string
   package_id: string
   package_global_id: string
   package_content_id: string
   package_content_global_id: string
   package_number: number
   item_quantity: string
-  length_mm: number
-  width_mm: number
-  height_mm: number
-  gross_weight_grams: number
+  item_pack_length_mm: number
+  item_pack_width_mm: number
+  item_pack_height_mm: number
+  item_pack_gross_weight_grams: number
+  item_pack_evidence_hash: string
+  parcel_inner_dimensions_mm: Record<string, unknown>
+  parcel_length_mm: number
+  parcel_width_mm: number
+  parcel_height_mm: number
+  parcel_content_weight_grams: number
+  parcel_tare_weight_grams: number
+  parcel_gross_weight_grams: number
   ship_to_hash: string
   destination_region: string
   destination_country_code: string
@@ -197,16 +218,52 @@ async function readExactFaireEvidence(
        plan.warehouse_id::text,
        operations_sandbox_commerce_e2e_jsonb_hash(warehouse.address)
          AS warehouse_address_hash,
+       cartonization.id::text AS cartonization_evidence_id,
+       cartonization.global_id AS cartonization_evidence_global_id,
+       cartonization.request_hash AS cartonization_request_hash,
+       cartonization.plan_input_hash AS cartonization_plan_input_hash,
+       cartonization.plan_result_hash AS cartonization_plan_result_hash,
+       carton_package.package_key AS cartonization_package_key,
+       carton_package.package_hash AS cartonization_package_hash,
+       material.id::text AS packaging_material_id,
+       material.global_id AS packaging_material_global_id,
+       material.row_version::text AS packaging_material_row_version,
+       recipe.id::text AS approved_pack_recipe_id,
+       recipe.global_id AS approved_pack_recipe_global_id,
+       recipe.row_version::text AS approved_pack_recipe_row_version,
        package.id::text AS package_id,
        package.global_id AS package_global_id,
        content.id::text AS package_content_id,
        content.global_id AS package_content_global_id,
        package.package_number,
        content.quantity::text AS item_quantity,
-       package.length_mm,
-       package.width_mm,
-       package.height_mm,
-       package.weight_grams AS gross_weight_grams,
+       pack_version.length_mm AS item_pack_length_mm,
+       pack_version.width_mm AS item_pack_width_mm,
+       pack_version.height_mm AS item_pack_height_mm,
+       pack_version.gross_weight_grams AS item_pack_gross_weight_grams,
+       operations_sandbox_commerce_e2e_jsonb_hash(
+         jsonb_build_object(
+           'candidateLineGlobalId', candidate_line.global_id,
+           'canonicalOrderLineGlobalId', canonical_line.global_id,
+           'packProfileVersionGlobalId', pack_version.global_id,
+           'quantity', content.quantity,
+           'lengthMm', pack_version.length_mm,
+           'widthMm', pack_version.width_mm,
+           'heightMm', pack_version.height_mm,
+           'grossWeightGrams', pack_version.gross_weight_grams
+         )
+       ) AS item_pack_evidence_hash,
+       carton_package.inner_dimensions_mm AS parcel_inner_dimensions_mm,
+       (carton_package.rated_outer_dimensions_mm->>'length')::integer
+         AS parcel_length_mm,
+       (carton_package.rated_outer_dimensions_mm->>'width')::integer
+         AS parcel_width_mm,
+       (carton_package.rated_outer_dimensions_mm->>'height')::integer
+         AS parcel_height_mm,
+       carton_package.content_weight_grams AS parcel_content_weight_grams,
+       carton_package.tare_weight_grams AS parcel_tare_weight_grams,
+       carton_package.rated_gross_weight_grams
+         AS parcel_gross_weight_grams,
        operations_sandbox_commerce_e2e_jsonb_hash(source_order.ship_to)
          AS ship_to_hash,
        upper(coalesce(
@@ -221,10 +278,18 @@ async function readExactFaireEvidence(
            'contentGlobalId', content.global_id,
            'orderLineGlobalId', canonical_line.global_id,
            'quantity', content.quantity,
-           'lengthMm', package.length_mm,
-           'widthMm', package.width_mm,
-           'heightMm', package.height_mm,
-           'grossWeightGrams', package.weight_grams
+           'cartonizationEvidenceGlobalId', cartonization.global_id,
+           'cartonizationPackageKey', carton_package.package_key,
+           'packagingMaterialGlobalId', material.global_id,
+           'packagingMaterialRowVersion', carton_package.material_row_version,
+           'approvedPackRecipeGlobalId', recipe.global_id,
+           'approvedPackRecipeRowVersion', carton_package.recipe_row_version,
+           'innerDimensionsMm', carton_package.inner_dimensions_mm,
+           'ratedOuterDimensionsMm',
+             carton_package.rated_outer_dimensions_mm,
+           'contentWeightGrams', carton_package.content_weight_grams,
+           'tareWeightGrams', carton_package.tare_weight_grams,
+           'grossWeightGrams', carton_package.rated_gross_weight_grams
          )
        ) AS package_evidence_hash
      FROM operations_orders source_order
@@ -258,9 +323,27 @@ async function readExactFaireEvidence(
      JOIN operations_warehouses warehouse
        ON warehouse.organization_id = plan.organization_id
       AND warehouse.id = plan.warehouse_id
+     JOIN operations_cartonization_rate_evidence cartonization
+       ON cartonization.organization_id = plan.organization_id
+      AND cartonization.id = plan.cartonization_evidence_id
+      AND cartonization.order_candidate_id = candidate.id
+      AND cartonization.integration_account_id = account.id
+      AND cartonization.warehouse_id = warehouse.id
      JOIN operations_packages package
        ON package.organization_id = plan.organization_id
       AND package.plan_id = plan.id
+      AND package.cartonization_evidence_id = cartonization.id
+     JOIN operations_cartonization_rate_evidence_packages carton_package
+       ON carton_package.organization_id = package.organization_id
+      AND carton_package.evidence_id = cartonization.id
+      AND carton_package.package_key = package.evidence_package_key
+     JOIN operations_packaging_materials material
+       ON material.organization_id = carton_package.organization_id
+      AND material.id = carton_package.packaging_material_id
+     JOIN operations_approved_pack_recipes recipe
+       ON recipe.organization_id = carton_package.organization_id
+      AND recipe.id = carton_package.approved_pack_recipe_id
+      AND recipe.packaging_material_id = material.id
      JOIN operations_package_contents content
        ON content.organization_id = plan.organization_id
       AND content.plan_id = plan.id
@@ -310,6 +393,32 @@ async function readExactFaireEvidence(
        AND pack_version.height_mm IS NOT NULL
        AND pack_version.gross_weight_grams IS NOT NULL
        AND plan.status = 'released'
+       AND cartonization.evidence_mode = 'operational'
+       AND cartonization.status IN ('succeeded', 'partial')
+       AND cartonization.sealed_at IS NOT NULL
+       AND cartonization.candidate_row_version = candidate.row_version
+       AND cartonization.candidate_source_hash = candidate.source_hash
+       AND carton_package.planning_method = 'approved_recipe'
+       AND jsonb_array_length(carton_package.allocations) = 1
+       AND carton_package.allocations->0->>'lineGlobalId' =
+             candidate_line.global_id
+       AND (carton_package.allocations->0->>'quantity')::numeric = 1
+       AND material.global_id IS NOT NULL
+       AND material.row_version = carton_package.material_row_version
+       AND material.status = 'active'
+       AND material.rated_outer_length_mm =
+             (carton_package.rated_outer_dimensions_mm->>'length')::integer
+       AND material.rated_outer_width_mm =
+             (carton_package.rated_outer_dimensions_mm->>'width')::integer
+       AND material.rated_outer_height_mm =
+             (carton_package.rated_outer_dimensions_mm->>'height')::integer
+       AND material.tare_weight_grams = carton_package.tare_weight_grams
+       AND recipe.global_id IS NOT NULL
+       AND recipe.row_version = carton_package.recipe_row_version
+       AND recipe.is_current = true
+       AND recipe.lifecycle_state IN ('customer_confirmed', 'active')
+       AND recipe.input_pack_profile_version_id = pack_version.id
+       AND recipe.packaging_material_id = material.id
        AND NOT EXISTS (
          SELECT 1
          FROM operations_fulfillment_plans newer_plan
@@ -325,10 +434,19 @@ async function readExactFaireEvidence(
        )
        AND warehouse.address IS NOT NULL
        AND package.status = 'packed'
-       AND package.length_mm = pack_version.length_mm
-       AND package.width_mm = pack_version.width_mm
-       AND package.height_mm = pack_version.height_mm
-       AND package.weight_grams = pack_version.gross_weight_grams
+       AND package.length_mm =
+             (carton_package.rated_outer_dimensions_mm->>'length')::integer
+       AND package.width_mm =
+             (carton_package.rated_outer_dimensions_mm->>'width')::integer
+       AND package.height_mm =
+             (carton_package.rated_outer_dimensions_mm->>'height')::integer
+       AND carton_package.content_weight_grams =
+             pack_version.gross_weight_grams
+       AND carton_package.tare_weight_grams > 0
+       AND carton_package.rated_gross_weight_grams =
+             carton_package.content_weight_grams
+             + carton_package.tare_weight_grams
+       AND package.weight_grams = carton_package.rated_gross_weight_grams
        AND content.quantity = 1
        AND upper(coalesce(
              source_order.ship_to->>'region', source_order.ship_to->>'state'
@@ -385,13 +503,14 @@ async function readExactFaireEvidence(
        )
      FOR SHARE OF
        account, candidate, candidate_line, canonical_line, pack_mapping,
-       pack_version, plan, warehouse, package, content`,
+       pack_version, plan, warehouse, cartonization, carton_package,
+       material, recipe, package, content`,
     [input.organizationId, input.orderId],
   )
   if (result.rows.length !== 1) {
     fail(
       'SANDBOX_E2E_FAIRE_EVIDENCE_REQUIRED',
-      'Faire authorization requires one promoted line with an exact current versioned pack, one matching packed package, and the confirmed US/CA destination',
+      'Faire authorization requires one promoted line with an exact current versioned item pack, one sealed operational shipping parcel, and the confirmed US/CA destination',
     )
   }
   return result.rows[0]
@@ -421,20 +540,42 @@ function faireEvidenceHash(row: FaireEvidenceRow) {
       externalProductId: row.external_product_id,
       externalVariantId: row.external_variant_id,
     },
+    itemPack: {
+      evidenceHash: row.item_pack_evidence_hash,
+      quantity: row.item_quantity,
+      lengthMm: row.item_pack_length_mm,
+      widthMm: row.item_pack_width_mm,
+      heightMm: row.item_pack_height_mm,
+      grossWeightGrams: row.item_pack_gross_weight_grams,
+    },
     fulfillment: {
       planGlobalId: row.fulfillment_plan_global_id,
       planVersion: row.fulfillment_plan_version,
       warehouseAddressHash: row.warehouse_address_hash,
+      cartonizationEvidenceGlobalId:
+        row.cartonization_evidence_global_id,
+      cartonizationRequestHash: row.cartonization_request_hash,
+      cartonizationPlanInputHash: row.cartonization_plan_input_hash,
+      cartonizationPlanResultHash: row.cartonization_plan_result_hash,
+      cartonizationPackageKey: row.cartonization_package_key,
+      cartonizationPackageHash: row.cartonization_package_hash,
+      packagingMaterialGlobalId: row.packaging_material_global_id,
+      packagingMaterialRowVersion: row.packaging_material_row_version,
+      approvedPackRecipeGlobalId: row.approved_pack_recipe_global_id,
+      approvedPackRecipeRowVersion:
+        row.approved_pack_recipe_row_version,
       packageGlobalId: row.package_global_id,
       packageContentGlobalId: row.package_content_global_id,
       packageEvidenceHash: row.package_evidence_hash,
     },
     parcel: {
-      itemQuantity: row.item_quantity,
-      lengthMm: row.length_mm,
-      widthMm: row.width_mm,
-      heightMm: row.height_mm,
-      grossWeightGrams: row.gross_weight_grams,
+      innerDimensionsMm: row.parcel_inner_dimensions_mm,
+      lengthMm: row.parcel_length_mm,
+      widthMm: row.parcel_width_mm,
+      heightMm: row.parcel_height_mm,
+      contentWeightGrams: row.parcel_content_weight_grams,
+      tareWeightGrams: row.parcel_tare_weight_grams,
+      grossWeightGrams: row.parcel_gross_weight_grams,
     },
     destination: {
       shipToHash: row.ship_to_hash,
@@ -557,7 +698,7 @@ export async function authorizeSandboxCommerceE2eInPostgres(input: {
         ) {
           fail(
             'SANDBOX_E2E_FAIRE_EVIDENCE_STALE',
-            'The existing Faire authorization no longer matches the exact order, pack, package, or destination evidence',
+            'The existing Faire authorization no longer matches the exact order, item-pack, sealed parcel, or destination evidence',
           )
         }
         return map(existing)
@@ -585,6 +726,12 @@ export async function authorizeSandboxCommerceE2eInPostgres(input: {
               faireEvidence.order_line_candidate_global_id,
             packProfileVersionGlobalId:
               faireEvidence.pack_profile_version_global_id,
+            itemPackEvidenceHash:
+              faireEvidence.item_pack_evidence_hash,
+            cartonizationEvidenceGlobalId:
+              faireEvidence.cartonization_evidence_global_id,
+            cartonizationPackageKey:
+              faireEvidence.cartonization_package_key,
             packageGlobalId: faireEvidence.package_global_id,
             packageEvidenceHash: faireEvidence.package_evidence_hash,
             shipToHash: faireEvidence.ship_to_hash,
@@ -636,10 +783,21 @@ export async function authorizeSandboxCommerceE2eInPostgres(input: {
            pack_profile_version_row_version, external_product_id,
            external_variant_id, fulfillment_plan_id,
            fulfillment_plan_global_id, fulfillment_plan_version,
-           warehouse_id, warehouse_address_hash, package_id,
-           package_global_id, package_content_id, package_content_global_id,
-           package_number, item_quantity, length_mm, width_mm, height_mm,
-           gross_weight_grams, ship_to_hash, destination_region,
+           warehouse_id, warehouse_address_hash,
+           cartonization_evidence_id, cartonization_evidence_global_id,
+           cartonization_request_hash, cartonization_plan_input_hash,
+           cartonization_plan_result_hash, cartonization_package_key,
+           cartonization_package_hash, packaging_material_id,
+           packaging_material_global_id, packaging_material_row_version,
+           approved_pack_recipe_id, approved_pack_recipe_global_id,
+           approved_pack_recipe_row_version, package_id, package_global_id,
+           package_content_id, package_content_global_id, package_number,
+           item_quantity, item_pack_length_mm, item_pack_width_mm,
+           item_pack_height_mm, item_pack_gross_weight_grams,
+           item_pack_evidence_hash, parcel_inner_dimensions_mm,
+           parcel_length_mm, parcel_width_mm, parcel_height_mm,
+           parcel_content_weight_grams, parcel_tare_weight_grams,
+           parcel_gross_weight_grams, ship_to_hash, destination_region,
            destination_country_code, package_evidence_hash, evidence_hash,
            created_by
          ) VALUES (
@@ -648,9 +806,13 @@ export async function authorizeSandboxCommerceE2eInPostgres(input: {
            $14::uuid, $15, $16::bigint, $17, $18, $19::uuid,
            $20::uuid, $21, $22::bigint, $23, $24::uuid, $25, $26::bigint,
            $27, $28, $29::uuid, $30, $31::integer, $32::uuid, $33,
-           $34::uuid, $35, $36::uuid, $37, $38::integer, $39::numeric,
-           $40::integer, $41::integer, $42::integer, $43::integer,
-           $44, $45, $46, $47, $48, $49
+           $34::uuid, $35, $36, $37, $38, $39, $40,
+           $41::uuid, $42, $43::bigint, $44::uuid, $45, $46::bigint,
+           $47::uuid, $48, $49::uuid, $50, $51::integer, $52::numeric,
+           $53::integer, $54::integer, $55::integer, $56::integer, $57,
+           $58::jsonb, $59::integer, $60::integer, $61::integer,
+           $62::integer, $63::integer, $64::integer, $65, $66, $67,
+           $68, $69, $70
          )`,
         [
           authorization.id,
@@ -686,16 +848,37 @@ export async function authorizeSandboxCommerceE2eInPostgres(input: {
           faireEvidence.fulfillment_plan_version,
           faireEvidence.warehouse_id,
           faireEvidence.warehouse_address_hash,
+          faireEvidence.cartonization_evidence_id,
+          faireEvidence.cartonization_evidence_global_id,
+          faireEvidence.cartonization_request_hash,
+          faireEvidence.cartonization_plan_input_hash,
+          faireEvidence.cartonization_plan_result_hash,
+          faireEvidence.cartonization_package_key,
+          faireEvidence.cartonization_package_hash,
+          faireEvidence.packaging_material_id,
+          faireEvidence.packaging_material_global_id,
+          faireEvidence.packaging_material_row_version,
+          faireEvidence.approved_pack_recipe_id,
+          faireEvidence.approved_pack_recipe_global_id,
+          faireEvidence.approved_pack_recipe_row_version,
           faireEvidence.package_id,
           faireEvidence.package_global_id,
           faireEvidence.package_content_id,
           faireEvidence.package_content_global_id,
           faireEvidence.package_number,
           faireEvidence.item_quantity,
-          faireEvidence.length_mm,
-          faireEvidence.width_mm,
-          faireEvidence.height_mm,
-          faireEvidence.gross_weight_grams,
+          faireEvidence.item_pack_length_mm,
+          faireEvidence.item_pack_width_mm,
+          faireEvidence.item_pack_height_mm,
+          faireEvidence.item_pack_gross_weight_grams,
+          faireEvidence.item_pack_evidence_hash,
+          JSON.stringify(faireEvidence.parcel_inner_dimensions_mm),
+          faireEvidence.parcel_length_mm,
+          faireEvidence.parcel_width_mm,
+          faireEvidence.parcel_height_mm,
+          faireEvidence.parcel_content_weight_grams,
+          faireEvidence.parcel_tare_weight_grams,
+          faireEvidence.parcel_gross_weight_grams,
           faireEvidence.ship_to_hash,
           faireEvidence.destination_region,
           faireEvidence.destination_country_code,
@@ -730,13 +913,36 @@ export async function authorizeSandboxCommerceE2eInPostgres(input: {
                 faireEvidence.variant_pack_mapping_global_id,
               packProfileVersionGlobalId:
                 faireEvidence.pack_profile_version_global_id,
+              itemPack: {
+                quantity: faireEvidence.item_quantity,
+                lengthMm: faireEvidence.item_pack_length_mm,
+                widthMm: faireEvidence.item_pack_width_mm,
+                heightMm: faireEvidence.item_pack_height_mm,
+                grossWeightGrams:
+                  faireEvidence.item_pack_gross_weight_grams,
+                evidenceHash: faireEvidence.item_pack_evidence_hash,
+              },
+              cartonizationEvidenceGlobalId:
+                faireEvidence.cartonization_evidence_global_id,
+              cartonizationPackageKey:
+                faireEvidence.cartonization_package_key,
+              packagingMaterialGlobalId:
+                faireEvidence.packaging_material_global_id,
+              approvedPackRecipeGlobalId:
+                faireEvidence.approved_pack_recipe_global_id,
               packageGlobalId: faireEvidence.package_global_id,
               parcel: {
-                itemQuantity: faireEvidence.item_quantity,
-                lengthMm: faireEvidence.length_mm,
-                widthMm: faireEvidence.width_mm,
-                heightMm: faireEvidence.height_mm,
-                grossWeightGrams: faireEvidence.gross_weight_grams,
+                innerDimensionsMm:
+                  faireEvidence.parcel_inner_dimensions_mm,
+                lengthMm: faireEvidence.parcel_length_mm,
+                widthMm: faireEvidence.parcel_width_mm,
+                heightMm: faireEvidence.parcel_height_mm,
+                contentWeightGrams:
+                  faireEvidence.parcel_content_weight_grams,
+                tareWeightGrams:
+                  faireEvidence.parcel_tare_weight_grams,
+                grossWeightGrams:
+                  faireEvidence.parcel_gross_weight_grams,
               },
               shipToHash: faireEvidence.ship_to_hash,
               evidenceHash: exactFaireEvidenceHash,
@@ -792,7 +998,7 @@ export async function requireActiveSandboxCommerceE2eAuthorization(
   ) {
     fail(
       'SANDBOX_E2E_FAIRE_EVIDENCE_STALE',
-      'Faire sandbox E2E authority no longer matches the exact candidate, mapped pack, package, origin, or destination',
+      'Faire sandbox E2E authority no longer matches the exact candidate, item-pack, sealed parcel, origin, or destination',
       403,
     )
   }
