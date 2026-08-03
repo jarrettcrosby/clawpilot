@@ -608,13 +608,16 @@ class SuiteCrmProductImageReader implements SuiteCrmProductImageReadClient {
   }): Promise<SuiteCrmProductImageListPage> {
     const cursor = safePage(input)
     const token = await this.oauthToken()
+    // The bounded date filters define the incremental snapshot. Order it by
+    // ClawPilot's unique SuiteCRM Global ID because SuiteCRM truncates
+    // date_modified in this collection and tied timestamps paginate unstably.
     const parameters = new URLSearchParams({
       'fields[AOS_Products]': 'global_id_c,name,date_modified,deleted',
       'filter[date_modified][gte]': cursor.updatedSince,
       'filter[date_modified][lte]': cursor.updatedBeforeOrAt,
       'page[number]': String(cursor.page),
       'page[size]': String(cursor.pageSize),
-      sort: 'date_modified',
+      sort: 'global_id_c',
     })
     const response = await this.fetchImpl(
       `${this.baseUrl}/Api/V8/module/AOS_Products?${parameters}`,

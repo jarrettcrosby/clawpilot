@@ -150,7 +150,7 @@ for (const contract of [
   'SUITECRM_PRODUCT_IMAGE_READ_ACL_ATTESTED_OAUTH_USERNAME',
   'credentialConflicts',
   "'filter[date_modified][lte]'",
-  "sort: 'date_modified'",
+  "sort: 'global_id_c'",
   "(meta as JsonObject)['total-records']",
   'SuiteCRM Product image changed during the read',
   'allowedContentPaths',
@@ -159,7 +159,7 @@ for (const contract of [
 ]) {
   assert.ok(readClientSource.includes(contract), `reader must include ${contract}`)
 }
-assert.doesNotMatch(readClientSource, /sort:\s*['"]date_modified,id/iu)
+assert.doesNotMatch(readClientSource, /sort:\s*['"][^'"]*,/iu)
 
 const processRoute = read('app_src/app/api/crm/integrations/process/route.ts')
 assert.ok(processRoute.includes('processSuiteCrmProductImageIngestion'))
@@ -253,7 +253,7 @@ const fetchImpl = async (input, init = {}) => {
     assert.equal(url.searchParams.get('filter[date_modified][lte]'), '2026-08-02T13:00:00.000Z')
     assert.equal(url.searchParams.get('page[number]'), '1')
     assert.equal(url.searchParams.get('page[size]'), '50')
-    assert.equal(url.searchParams.get('sort'), 'date_modified')
+    assert.equal(url.searchParams.get('sort'), 'global_id_c')
     return jsonResponse({
       data: [{
         id: PRODUCT_ID,
