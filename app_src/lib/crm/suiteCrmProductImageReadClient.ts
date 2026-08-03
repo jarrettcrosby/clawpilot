@@ -865,13 +865,17 @@ class SuiteCrmProductImageReader implements SuiteCrmProductImageReadClient {
     try {
       content = new URL(contentUrl, `${this.baseUrl}/`)
       const base = new URL(this.baseUrl)
+      const allowedContentPaths = new Set([
+        `/api/private-image-media-objects/${mediaId}`,
+        `/private/media/images/${mediaId}`,
+      ])
       if (
         content.origin !== base.origin
         || content.username
         || content.password
         || content.search
         || content.hash
-        || content.pathname !== `/api/private-image-media-objects/${mediaId}`
+        || !allowedContentPaths.has(content.pathname)
       ) throw new Error('unsafe content URL')
     } catch {
       throw new Error('SuiteCRM returned an unsafe Product image content URL')

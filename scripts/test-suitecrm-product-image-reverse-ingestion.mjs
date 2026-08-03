@@ -153,7 +153,9 @@ for (const contract of [
   "sort: 'date_modified'",
   "(meta as JsonObject)['total-records']",
   'SuiteCRM Product image changed during the read',
-  'content.pathname !== `/api/private-image-media-objects/${mediaId}`',
+  'allowedContentPaths',
+  '`/api/private-image-media-objects/${mediaId}`',
+  '`/private/media/images/${mediaId}`',
 ]) {
   assert.ok(readClientSource.includes(contract), `reader must include ${contract}`)
 }
@@ -314,7 +316,10 @@ const fetchImpl = async (input, init = {}) => {
       },
     })
   }
-  if (url.pathname === `/api/private-image-media-objects/${MEDIA_ID}`) {
+  if ([
+    `/api/private-image-media-objects/${MEDIA_ID}`,
+    `/private/media/images/${MEDIA_ID}`,
+  ].includes(url.pathname)) {
     assert.equal(method, 'GET')
     return new Response(ONE_PIXEL_PNG, {
       status: 200,
@@ -400,6 +405,14 @@ await assert.rejects(
   /changed during the read/u,
 )
 graphModifiedAt = '2026-08-02T12:00:00Z'
+contentUrlOverride = `/private/media/images/${MEDIA_ID}`
+const currentMediaPathImage = await reader.readProductImage(
+  PRODUCT_ID,
+  '2026-08-02T12:00:00Z',
+)
+assert.equal(currentMediaPathImage.mediaId, MEDIA_ID)
+assert.equal(currentMediaPathImage.contentSha256, IMAGE_SHA256)
+
 contentUrlOverride = `/api/private-image-media-objects/${MEDIA_ID}/extra`
 await assert.rejects(
   reader.readProductImage(PRODUCT_ID, '2026-08-02T12:00:00Z'),
@@ -475,7 +488,7 @@ const postPaths = calls
   .map((call) => call.url.pathname)
 assert.equal(postPaths.filter((path) => path === '/Api/access_token').length, 1)
 assert.equal(postPaths.filter((path) => path === '/login').length, 1)
-assert.equal(postPaths.filter((path) => path === '/api/graphql').length, 4)
+assert.equal(postPaths.filter((path) => path === '/api/graphql').length, 5)
 assert.equal(postPaths.every((path) => [
   '/Api/access_token', '/login', '/api/graphql',
 ].includes(path)), true)
