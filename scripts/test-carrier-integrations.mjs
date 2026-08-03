@@ -4,6 +4,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as globalIds from '../app_src/lib/globalIds.mjs'
 
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
@@ -200,6 +201,7 @@ for (const fragment of [
   'payload: { credentialVersion: row.credential_version }',
   'writeCarrierSandboxRateEvidenceInPostgres',
   'operations_carrier_rate_requests',
+  "WHEN $16 = 'system:shopify-carrier-service' THEN NULL",
   "'carrier.sandbox_rate.succeeded'",
   "'carrier.sandbox_rate.failed'",
   "'carrier.cartonization_package_rate.succeeded'",
@@ -226,13 +228,15 @@ for (const fragment of [
   'senderName',
   'configuration: row.configuration',
   'allowedCapabilities',
+  "allowedCapabilities: input.environment === 'production'",
+  "? ['production_rate']",
+  ": ['sandbox_rate', 'sandbox_label']",
   'credentialRevealAllowed',
   'senderOriginWarehouseGlobalId',
   'CarrierIntegrationSourceManagedError',
   'lockedUserManagedCarrierConnection',
   'FOR UPDATE OF account',
-  "configuration.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION",
-  "configuration.authorizationScope === 'sandbox_rating_only'",
+  'isSourceManagedCarrierConfiguration(configuration)',
 ]) {
   assert.ok(persistence.includes(fragment), `Carrier persistence contract missing ${fragment}`)
 }
@@ -281,7 +285,12 @@ for (const fragment of [
   'redactedSandboxRateBillingSelection',
   'requiresConfiguredCapability',
   'isSourceManagedCarrierConfiguration',
-  'isExactAgAlchemyRatingDelegation',
+  'managedCarrierDelegationAllows',
+  'managedCarrierDelegationProfile',
+  'carrierConfigurationAllowsSandboxLabel',
+  'assertCarrierRateTestArtifactCapability',
+  'readCarrierConnectionAuthorizationFromPostgres',
+  'integrationAccountId: unknown',
   "'CARRIER_CAPABILITY_NOT_AUTHORIZED'",
   "runtime.configuration.credentialRevealAllowed === false",
   "'CARRIER_CREDENTIAL_REVEAL_NOT_ALLOWED'",
@@ -290,6 +299,10 @@ for (const fragment of [
   'requireUserManagedCarrierConnection',
   "'CARRIER_DELEGATION_SOURCE_MANAGED'",
   "sanitized.code !== 'CARRIER_DELEGATION_SOURCE_MANAGED'",
+  'rateEvidenceGlobalId',
+  'requireFailureEvidence',
+  "'CARRIER_RATE_EVIDENCE_PERSISTENCE_FAILED'",
+  "'system:shopify-carrier-service'",
 ]) {
   assert.ok(service.includes(fragment), `Carrier service contract missing ${fragment}`)
 }
@@ -332,9 +345,10 @@ for (const fragment of [
   'safeRateTestPrinter',
   'safeRateTestLabel',
   'error instanceof OperationsRequestError',
-  "printer.connectionMode === 'local_agent'",
-  "printer.localPrintAgentStatus === 'active'",
-  "printer.supportedDocumentTypes.includes('shipping_label')",
+  'rateTestPrinters: printers.map(safeRateTestPrinter)',
+  "printer.connectionMode !== 'local_agent'",
+  "printer.localPrintAgentStatus !== 'active'",
+  "'CARRIER_RATE_TEST_PRINTER_UNAVAILABLE'",
   "'carrierAccountGlobalId'",
   "'destination'",
   "'parcel'",
@@ -350,6 +364,32 @@ for (const fragment of [
   assert.ok(route.includes(fragment), `Carrier API contract missing ${fragment}`)
 }
 assert.ok(!route.includes('permissions.manageUserAccess'), 'Carrier management must use operations permission')
+const rateTestLabelActions = read(
+  'app_src/lib/integrations/carrierRateTestLabelActions.ts',
+)
+assert.ok(
+  (rateTestLabelActions.match(/assertCarrierRateTestArtifactCapability\(/g) || []).length >= 3,
+  'Stored sandbox label print, void, and local sample close must enforce the managed capability profile',
+)
+assert.ok(
+  (rateTestLabelActions.match(/integrationAccountId: label\.integrationAccountId/g) || []).length >= 3,
+  'Stored sandbox label authorization must use the immutable creating integration account',
+)
+const printArtifactRoute = read(
+  'app_src/app/api/operations/artifacts/[globalId]/route.ts',
+)
+for (const fragment of [
+  'artifact.sourceRateTestProvider',
+  'artifact.sourceRateTestIntegrationAccountId',
+  'integrationAccountId: artifact.sourceRateTestIntegrationAccountId',
+  'assertCarrierRateTestArtifactCapability',
+  'CarrierIntegrationRequestError',
+]) {
+  assert.ok(
+    printArtifactRoute.includes(fragment),
+    `Rate-test label download enforcement is missing ${fragment}`,
+  )
+}
 const safeRateTestPrinterMapper = route.slice(
   route.indexOf('function safeRateTestPrinter'),
   route.indexOf('export async function GET'),
@@ -443,18 +483,22 @@ for (const fragment of [
   'Label bytes and internal database identifiers',
   'Printing queues the label bytes already stored in ClawPilot.',
   'It does not call the carrier,',
+  'creating, downloading, printing, or voiding a',
+  'canExecute && (selectedRateTestLabel.printArtifactGlobalId',
   "entry.connectionMode === 'local_agent'",
   "entry.localPrintAgentStatus === 'active'",
   "entry.supportedDocumentTypes.includes('shipping_label')",
   'EPISCS-managed sandbox rating',
+  'EPISCS-managed sandbox fulfillment diagnostics',
   'ratingOnlyDelegation',
+  'managedSandboxFulfillmentDelegation',
+  'labelWorkflowAuthorized',
   'sourceManagedDelegation',
   'managedDelegationDrift',
-  'Managed sandbox rating needs repair',
-  'AG_ALCHEMY_EPISCS_RATING_DELEGATION',
-  'account.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION',
-  "account?.authorizationScope === 'sandbox_rating_only'",
-  "account.allowedCapabilities[0] === 'sandbox_rate'",
+  'Managed sandbox delegation needs repair',
+  'managedCarrierDelegationProfile(carrierConfiguration)',
+  "delegationProfile === 'rating_only'",
+  "delegationProfile === 'sandbox_fulfillment_diagnostic'",
   "account?.credentialRevealAllowed !== false",
   'Credentials, billing identity, labels, voids,',
 ]) {
@@ -524,7 +568,10 @@ assert.ok(
 
 process.env.INTEGRATION_CREDENTIAL_ENCRYPTION_KEY = 'carrier-test-encryption-key-0123456789abcdef'
 const cryptoModule = loadTypeScriptModule('app_src/lib/integrations/carrierCredentialCrypto.ts', {
-  mocks: { '@/lib/persistence/config': { isHostedRuntime: () => false } },
+  mocks: {
+    '@/lib/globalIds.mjs': globalIds,
+    '@/lib/persistence/config': { isHostedRuntime: () => false },
+  },
 })
 const credential = {
   clientId: 'carrier-client-id-1234',
@@ -591,6 +638,19 @@ const encryptedAccountNumber = cryptoModule.encryptCarrierAccountNumber(
   'sandbox',
   carrierAccountGlobalId,
 )
+const productionEncrypted = cryptoModule.encryptCarrierCredential(
+  credential,
+  organizationId,
+  'ups_rest',
+  'production',
+)
+const productionEncryptedAccountNumber = cryptoModule.encryptCarrierAccountNumber(
+  credential.accountNumber,
+  organizationId,
+  'ups_rest',
+  'production',
+  carrierAccountGlobalId,
+)
 assert.ok(!encryptedAccountNumber.ciphertext.includes(Buffer.from(credential.accountNumber)))
 assert.equal(
   cryptoModule.decryptCarrierAccountNumber(
@@ -638,6 +698,64 @@ assert.notEqual(
   'account number fingerprints must be tenant scoped',
 )
 
+const carrierManagedDelegationModule = loadTypeScriptModule(
+  'app_src/lib/integrations/carrierManagedDelegation.ts',
+)
+const exactManagedSandboxFulfillment = {
+  authorizationScope: 'sandbox_fulfillment_diagnostic',
+  allowedCapabilities: ['sandbox_rate', 'sandbox_label'],
+  credentialRevealAllowed: false,
+  managedBy: 'ag-alchemy-episcs-sandbox-rating-delegation',
+  senderOriginWarehouseGlobalId: 'gwh5366613',
+}
+assert.equal(
+  carrierManagedDelegationModule.managedCarrierDelegationAllows(
+    exactManagedSandboxFulfillment,
+    'sandbox_rate',
+  ),
+  true,
+)
+assert.equal(
+  carrierManagedDelegationModule.managedCarrierDelegationAllows(
+    exactManagedSandboxFulfillment,
+    'sandbox_label',
+  ),
+  true,
+)
+assert.equal(
+  carrierManagedDelegationModule.managedCarrierDelegationAllows(
+    exactManagedSandboxFulfillment,
+    'production_rate',
+  ),
+  false,
+  'Managed sandbox fulfillment diagnostics must never grant production rating or execution',
+)
+assert.equal(
+  carrierManagedDelegationModule.carrierConfigurationAllowsSandboxLabel({}),
+  true,
+  'A legacy user-managed connection without capability metadata must retain sandbox-label access',
+)
+assert.equal(
+  carrierManagedDelegationModule.carrierConfigurationAllowsSandboxLabel({
+    allowedCapabilities: 'legacy-sandbox-policy',
+  }),
+  true,
+  'Legacy non-array capability metadata must retain sandbox-label access',
+)
+assert.equal(
+  carrierManagedDelegationModule.carrierConfigurationAllowsSandboxLabel({
+    allowedCapabilities: ['sandbox_rate'],
+  }),
+  false,
+  'An explicit capability list must include sandbox_label',
+)
+assert.equal(
+  carrierManagedDelegationModule.carrierConfigurationAllowsSandboxLabel({
+    allowedCapabilities: ['sandbox_rate', 'sandbox_label'],
+  }),
+  true,
+)
+
 const carrierServiceModule = loadTypeScriptModule('app_src/lib/integrations/carrierIntegrations.ts', {
   mocks: {
     '@/lib/integrations/carrierCredentialClient': {
@@ -665,6 +783,7 @@ const carrierServiceModule = loadTypeScriptModule('app_src/lib/integrations/carr
       requestCarrierSandboxRates: async () => ({}),
     },
     '@/lib/integrations/carrierCredentialCrypto': cryptoModule,
+    '@/lib/integrations/carrierManagedDelegation': carrierManagedDelegationModule,
     '@/lib/persistence/carrierIntegrations': {},
   },
 })
@@ -702,8 +821,16 @@ assert.throws(
 let delegatedRevealAuditCount = 0
 let delegatedCredentialVerificationCount = 0
 let delegatedRateEvidenceCount = 0
+let delegatedRateEvidenceWriteFailure = false
 const delegatedRateEvidenceInputs = []
 const delegatedMutationCalls = []
+class DelegatedCarrierCredentialClientError extends Error {
+  constructor(message, status, code) {
+    super(message)
+    this.status = status
+    this.code = code
+  }
+}
 let delegatedConfiguration = {
   authorizationScope: 'sandbox_rating_only',
   allowedCapabilities: ['sandbox_rate'],
@@ -711,12 +838,16 @@ let delegatedConfiguration = {
   managedBy: 'ag-alchemy-episcs-sandbox-rating-delegation',
   senderOriginWarehouseGlobalId: 'gwh5366613',
 }
+let delegatedConnectionStatus = 'active'
+let productionConfiguration = {
+  allowedCapabilities: ['production_rate'],
+}
 const delegatedCarrierServiceModule = loadTypeScriptModule(
   'app_src/lib/integrations/carrierIntegrations.ts',
   {
     mocks: {
       '@/lib/integrations/carrierCredentialClient': {
-        CarrierCredentialClientError: Error,
+        CarrierCredentialClientError: DelegatedCarrierCredentialClientError,
         verifyCarrierCredential: async () => {
           delegatedCredentialVerificationCount += 1
           return {}
@@ -752,7 +883,24 @@ const delegatedCarrierServiceModule = loadTypeScriptModule(
             weightUnit: 'LB',
           },
         }),
+        buildCarrierSandboxShipmentRateFixture: ({
+          senderName,
+          registeredAddress,
+          destination,
+          parcels,
+        }) => ({
+          origin: { name: senderName, ...registeredAddress },
+          destination,
+          parcels,
+        }),
         carrierSandboxRateRequestEvidence: () => ({}),
+        carrierSandboxShipmentRateRequestEvidence: (_provider, fixture) => ({
+          requestHash: 'd'.repeat(64),
+          redactedRequest: {
+            rateScope: 'multi_package_shipment',
+            packageCount: fixture.parcels.length,
+          },
+        }),
         requestCarrierSandboxRates: async () => ({
           result: {
             provider: 'ups_rest',
@@ -777,48 +925,86 @@ const delegatedCarrierServiceModule = loadTypeScriptModule(
             completedAt: '2026-07-27T12:00:01.000Z',
           },
         }),
+        requestCarrierSandboxShipmentRates: async () => {
+          throw new DelegatedCarrierCredentialClientError(
+            'Carrier request timed out',
+            504,
+            'CARRIER_PROVIDER_TIMEOUT',
+          )
+        },
       },
       '@/lib/integrations/carrierCredentialCrypto': cryptoModule,
+      '@/lib/integrations/carrierManagedDelegation': carrierManagedDelegationModule,
       '@/lib/persistence/carrierIntegrations': {
-        readCarrierRuntimeCredentialFromPostgres: async () => ({
-          organizationId,
-          integrationAccountId: '33333333-3333-4333-8333-333333333333',
-          globalId: 'gia1234567',
-          provider: 'ups_rest',
-          environment: 'sandbox',
-          status: 'active',
-          verificationStatus: 'verified',
-          credentialVersion: 1,
-          configuration: delegatedConfiguration,
-          encrypted,
-        }),
-        readActiveCarrierAccountsFromPostgres: async () => [{
-          id: '44444444-4444-4444-8444-444444444444',
-          globalId: carrierAccountGlobalId,
-          integrationAccountId: '33333333-3333-4333-8333-333333333333',
-          displayName: 'UPS sandbox rating account',
-          senderName: 'Ag-Alchemy',
-          accountNumberLastFour: credential.accountNumber.slice(-4),
-          accountNumberFingerprint: 'b'.repeat(64),
-          registeredAddress: {
-            line1: '7009 S 108th St',
-            line2: null,
-            city: 'La Vista',
-            region: 'NE',
-            postalCode: '68128',
-            countryCode: 'US',
-          },
-          registeredAddressFingerprint: 'c'.repeat(64),
-          addressVerification: 'operator_attested',
-          allowSenderBilling: true,
-          allowRecipientBilling: false,
-          allowThirdPartyBilling: false,
-          encrypted: encryptedAccountNumber,
-        }],
+        readCarrierRuntimeCredentialFromPostgres: async (input) => {
+          const production = input.environment === 'production'
+          return {
+            organizationId,
+            integrationAccountId: production
+              ? '55555555-5555-4555-8555-555555555555'
+              : '33333333-3333-4333-8333-333333333333',
+            globalId: production ? 'gia7654321' : 'gia1234567',
+            provider: 'ups_rest',
+            environment: production ? 'production' : 'sandbox',
+            status: delegatedConnectionStatus,
+            verificationStatus: 'verified',
+            credentialVersion: 1,
+            credentialFingerprint: 'a'.repeat(64),
+            configuration: production ? productionConfiguration : delegatedConfiguration,
+            encrypted: production ? productionEncrypted : encrypted,
+          }
+        },
+        readCarrierConnectionAuthorizationFromPostgres: async (input) => {
+          if (input.integrationAccountId !== '33333333-3333-4333-8333-333333333333') {
+            return null
+          }
+          return {
+            organizationId,
+            integrationAccountId: input.integrationAccountId,
+            globalId: 'gia1234567',
+            provider: 'ups_rest',
+            environment: 'sandbox',
+            status: delegatedConnectionStatus,
+            configuration: delegatedConfiguration,
+          }
+        },
+        readActiveCarrierAccountsFromPostgres: async (input) => {
+          const production = input.integrationAccountId === '55555555-5555-4555-8555-555555555555'
+          return [{
+            id: production
+              ? '66666666-6666-4666-8666-666666666666'
+              : '44444444-4444-4444-8444-444444444444',
+            globalId: carrierAccountGlobalId,
+            integrationAccountId: input.integrationAccountId,
+            displayName: production
+              ? 'UPS production rating account'
+              : 'UPS sandbox rating account',
+            senderName: 'Ag-Alchemy',
+            accountNumberLastFour: credential.accountNumber.slice(-4),
+            accountNumberFingerprint: 'b'.repeat(64),
+            registeredAddress: {
+              line1: '7009 S 108th St',
+              line2: null,
+              city: 'La Vista',
+              region: 'NE',
+              postalCode: '68128',
+              countryCode: 'US',
+            },
+            registeredAddressFingerprint: 'c'.repeat(64),
+            addressVerification: 'operator_attested',
+            allowSenderBilling: true,
+            allowRecipientBilling: false,
+            allowThirdPartyBilling: false,
+            encrypted: production ? productionEncryptedAccountNumber : encryptedAccountNumber,
+          }]
+        },
         recordCarrierCredentialRevealInPostgres: async () => {
           delegatedRevealAuditCount += 1
         },
         writeCarrierSandboxRateEvidenceInPostgres: async (input) => {
+          if (delegatedRateEvidenceWriteFailure) {
+            throw new Error('rate evidence database unavailable')
+          }
           delegatedRateEvidenceCount += 1
           delegatedRateEvidenceInputs.push(input)
           return 'grq1234567'
@@ -835,6 +1021,39 @@ const delegatedCarrierServiceModule = loadTypeScriptModule(
     },
   },
 )
+
+for (const configuration of [
+  {},
+  { allowedCapabilities: 'production_rate' },
+  { allowedCapabilities: ['sandbox_rate'] },
+]) {
+  productionConfiguration = configuration
+  await assert.rejects(
+    delegatedCarrierServiceModule.resolveCarrierProductionRatingRuntime({
+      organizationId,
+      provider: 'ups_rest',
+      integrationAccountGlobalId: 'gia7654321',
+      carrierAccountGlobalId,
+    }),
+    (error) => (
+      error.code === 'CARRIER_CAPABILITY_NOT_AUTHORIZED'
+      && error.status === 403
+    ),
+    'Production rating must require an explicit production_rate capability array',
+  )
+}
+productionConfiguration = { allowedCapabilities: ['production_rate'] }
+const productionRuntime = await delegatedCarrierServiceModule.resolveCarrierProductionRatingRuntime({
+  organizationId,
+  provider: 'ups_rest',
+  integrationAccountGlobalId: 'gia7654321',
+  carrierAccountGlobalId,
+})
+assert.equal(productionRuntime.integrationGlobalId, 'gia7654321')
+assert.equal(productionRuntime.carrierAccountGlobalId, carrierAccountGlobalId)
+assert.equal(productionRuntime.environment, 'production')
+assert.equal(productionRuntime.credential.accountNumber, credential.accountNumber)
+
 await assert.rejects(
   delegatedCarrierServiceModule.revealCarrierCredential({
     organizationId,
@@ -864,6 +1083,116 @@ await assert.rejects(
   ),
   'A rating-only delegated credential must not create or void sandbox labels',
 )
+await assert.rejects(
+  delegatedCarrierServiceModule.assertCarrierRateTestArtifactCapability({
+    organizationId,
+    integrationAccountId: '33333333-3333-4333-8333-333333333333',
+    provider: 'ups_rest',
+  }),
+  (error) => (
+    error.code === 'CARRIER_CAPABILITY_NOT_AUTHORIZED'
+    && error.status === 403
+  ),
+  'A rating-only delegated credential must not download or print stored sandbox labels',
+)
+delegatedConfiguration = {
+  authorizationScope: 'sandbox_fulfillment_diagnostic',
+  allowedCapabilities: ['sandbox_rate', 'sandbox_label'],
+  credentialRevealAllowed: false,
+  managedBy: 'ag-alchemy-episcs-sandbox-rating-delegation',
+  senderOriginWarehouseGlobalId: 'gwh5366613',
+}
+const managedSandboxShippingRuntime = await delegatedCarrierServiceModule
+  .resolveCarrierSandboxShippingRuntime({
+    organizationId,
+    provider: 'ups_rest',
+    senderBillingOnly: true,
+  })
+assert.equal(managedSandboxShippingRuntime.environment, 'sandbox')
+assert.equal(managedSandboxShippingRuntime.integrationGlobalId, 'gia1234567')
+await delegatedCarrierServiceModule.assertCarrierRateTestArtifactCapability({
+  organizationId,
+  integrationAccountId: '33333333-3333-4333-8333-333333333333',
+  provider: 'ups_rest',
+})
+delegatedConnectionStatus = 'disabled'
+await assert.rejects(
+  delegatedCarrierServiceModule.assertCarrierRateTestArtifactCapability({
+    organizationId,
+    integrationAccountId: '33333333-3333-4333-8333-333333333333',
+    provider: 'ups_rest',
+  }),
+  (error) => (
+    error.code === 'CARRIER_CAPABILITY_NOT_AUTHORIZED'
+    && error.status === 403
+  ),
+  'A disabled immutable carrier origin must fail closed',
+)
+delegatedConnectionStatus = 'active'
+await assert.rejects(
+  delegatedCarrierServiceModule.assertCarrierRateTestArtifactCapability({
+    organizationId,
+    integrationAccountId: '77777777-7777-4777-8777-777777777777',
+    provider: 'ups_rest',
+  }),
+  (error) => (
+    error.code === 'CARRIER_CAPABILITY_NOT_AUTHORIZED'
+    && error.status === 403
+  ),
+  'A missing immutable carrier origin must fail closed',
+)
+delegatedConfiguration = { allowedCapabilities: [] }
+await assert.rejects(
+  delegatedCarrierServiceModule.assertCarrierRateTestArtifactCapability({
+    organizationId,
+    integrationAccountId: '33333333-3333-4333-8333-333333333333',
+    provider: 'ups_rest',
+  }),
+  (error) => (
+    error.code === 'CARRIER_CAPABILITY_NOT_AUTHORIZED'
+    && error.status === 403
+  ),
+  'An explicit user-managed capability list without sandbox_label must revoke stored-label access',
+)
+delegatedConfiguration = {}
+await delegatedCarrierServiceModule.assertCarrierRateTestArtifactCapability({
+  organizationId,
+  integrationAccountId: '33333333-3333-4333-8333-333333333333',
+  provider: 'ups_rest',
+})
+delegatedConfiguration = { allowedCapabilities: 'legacy-sandbox-policy' }
+await delegatedCarrierServiceModule.assertCarrierRateTestArtifactCapability({
+  organizationId,
+  integrationAccountId: '33333333-3333-4333-8333-333333333333',
+  provider: 'ups_rest',
+})
+delegatedConfiguration = {
+  authorizationScope: 'sandbox_fulfillment_diagnostic',
+  allowedCapabilities: ['sandbox_rate', 'sandbox_label'],
+  credentialRevealAllowed: false,
+  managedBy: 'ag-alchemy-episcs-sandbox-rating-delegation',
+  senderOriginWarehouseGlobalId: 'gwh5366613',
+}
+await assert.rejects(
+  delegatedCarrierServiceModule.revealCarrierCredential({
+    organizationId,
+    provider: 'ups_rest',
+    environment: 'sandbox',
+    actorEmail: 'owner@example.com',
+  }),
+  (error) => (
+    error.code === 'CARRIER_CREDENTIAL_REVEAL_NOT_ALLOWED'
+    && error.status === 403
+  ),
+  'Managed sandbox fulfillment diagnostics must not reveal the delegated credential',
+)
+delegatedConfiguration = {
+  authorizationScope: 'sandbox_rating_only',
+  allowedCapabilities: ['sandbox_rate'],
+  credentialRevealAllowed: false,
+  managedBy: 'ag-alchemy-episcs-sandbox-rating-delegation',
+  senderOriginWarehouseGlobalId: 'gwh5366613',
+}
 for (const action of [
   () => delegatedCarrierServiceModule.testCarrierCredential({
     organizationId,
@@ -998,6 +1327,102 @@ assert.equal(
   'cartonization_package_rate',
 )
 
+await assert.rejects(
+  delegatedCarrierServiceModule.testCarrierSandboxShipmentRate({
+    organizationId,
+    provider: 'ups_rest',
+    environment: 'sandbox',
+    carrierAccountGlobalId,
+    destination: {
+      name: 'John Doe',
+      line1: '101 Academy Drive',
+      line2: null,
+      city: 'Buzzards Bay',
+      region: 'MA',
+      postalCode: '02532',
+      countryCode: 'US',
+    },
+    parcels: [{
+      description: 'AG12V2 optimized carton',
+      exteriorInches: { length: 11, width: 9, height: 7 },
+      grossPounds: 2.498,
+    }],
+    actorEmail: 'system:shopify-carrier-service',
+  }),
+  (error) => (
+    error.code === 'CARRIER_PROVIDER_TIMEOUT'
+    && error.status === 504
+    && error.rateEvidenceGlobalId === 'grq1234567'
+  ),
+  'A failed checkout carrier call must return its durable failure evidence ID',
+)
+assert.equal(delegatedRateEvidenceCount, 3)
+assert.equal(delegatedRateEvidenceInputs[2].status, 'failed')
+assert.equal(
+  delegatedRateEvidenceInputs[2].errorCode,
+  'CARRIER_PROVIDER_TIMEOUT',
+)
+
+delegatedRateEvidenceWriteFailure = true
+await assert.rejects(
+  delegatedCarrierServiceModule.testCarrierSandboxShipmentRate({
+    organizationId,
+    provider: 'ups_rest',
+    environment: 'sandbox',
+    carrierAccountGlobalId,
+    destination: {
+      name: 'John Doe',
+      line1: '101 Academy Drive',
+      line2: null,
+      city: 'Buzzards Bay',
+      region: 'MA',
+      postalCode: '02532',
+      countryCode: 'US',
+    },
+    parcels: [{
+      description: 'AG12V2 optimized carton',
+      exteriorInches: { length: 11, width: 9, height: 7 },
+      grossPounds: 2.498,
+    }],
+    actorEmail: 'system:shopify-carrier-service',
+  }),
+  (error) => (
+    error.code === 'CARRIER_RATE_EVIDENCE_PERSISTENCE_FAILED'
+    && error.status === 503
+    && error.rateEvidenceGlobalId === null
+  ),
+  'Checkout must fail closed when provider-failure evidence cannot be stored',
+)
+await assert.rejects(
+  delegatedCarrierServiceModule.testCarrierSandboxShipmentRate({
+    organizationId,
+    provider: 'ups_rest',
+    environment: 'sandbox',
+    carrierAccountGlobalId,
+    destination: {
+      name: 'John Doe',
+      line1: '101 Academy Drive',
+      line2: null,
+      city: 'Buzzards Bay',
+      region: 'MA',
+      postalCode: '02532',
+      countryCode: 'US',
+    },
+    parcels: [{
+      description: 'AG12V2 optimized carton',
+      exteriorInches: { length: 11, width: 9, height: 7 },
+      grossPounds: 2.498,
+    }],
+    actorEmail: 'owner@example.com',
+  }),
+  (error) => (
+    error.code === 'CARRIER_PROVIDER_TIMEOUT'
+    && error.rateEvidenceGlobalId === null
+  ),
+  'Non-checkout diagnostics must retain the original provider failure',
+)
+delegatedRateEvidenceWriteFailure = false
+
 delegatedConfiguration = {
   authorizationScope: 'sandbox_rating_only',
   allowedCapabilities: ['sandbox_rate', 'sandbox_label'],
@@ -1047,7 +1472,7 @@ for (const driftedAction of [
 }
 assert.equal(
   delegatedRateEvidenceCount,
-  2,
+  3,
   'A drifted source-managed connection must not write rate evidence',
 )
 
@@ -1295,6 +1720,72 @@ assert.deepEqual(
     },
   ],
   'Multi-package fixtures must retain caller package order',
+)
+const rateOnlyDestination = {
+  name: null,
+  line1: null,
+  line2: null,
+  city: null,
+  region: null,
+  postalCode: '06103',
+  countryCode: 'us',
+}
+const rateOnlyShipmentFixture =
+  sandboxRateModule.buildCarrierSandboxShipmentRateFixture({
+    senderName: 'Jegs Test Sender',
+    registeredAddress: carrierAccountAddress,
+    destination: rateOnlyDestination,
+    parcels: [cartonizationParcel],
+  })
+assert.deepEqual(
+  JSON.parse(JSON.stringify(rateOnlyShipmentFixture.destination)),
+  {
+    name: null,
+    line1: null,
+    line2: null,
+    city: null,
+    region: null,
+    postalCode: '06103',
+    countryCode: 'US',
+  },
+  'rate-only destinations must preserve unavailable optional fields as null',
+)
+const rateOnlyDestinationFingerprint =
+  sandboxRateModule.carrierSandboxRateDestinationFingerprint(
+    rateOnlyShipmentFixture.destination,
+  )
+assert.match(rateOnlyDestinationFingerprint, /^[a-f0-9]{64}$/)
+assert.notEqual(
+  rateOnlyDestinationFingerprint,
+  sandboxRateModule.carrierSandboxRateDestinationFingerprint({
+    ...rateOnlyShipmentFixture.destination,
+    region: 'Connecticut',
+  }),
+  'carrier evidence must distinguish a ZIP-only request from a state-supplied request',
+)
+assert.throws(
+  () => sandboxRateModule.normalizeCarrierSandboxRateDestination({
+    ...rateOnlyDestination,
+    postalCode: null,
+  }),
+  /five or nine digit US ZIP code|must be plain text/,
+  'rate-only destinations must fail closed without a valid ZIP',
+)
+assert.throws(
+  () => sandboxRateModule.normalizeCarrierSandboxRateDestination({
+    ...rateOnlyDestination,
+    region: 'Not a state',
+  }),
+  /recognized US state or territory/,
+  'rate-only destinations must validate a state when Shopify supplies one',
+)
+assert.throws(
+  () => sandboxRateModule.normalizeCarrierSandboxRateDestination({
+    ...rateOnlyDestination,
+    line2: 'Suite 2',
+  }),
+  /line 2 requires address line 1/,
+  'rate-only destinations must reject an orphan second address line',
 )
 assert.equal(
   sandboxRateModule.MAX_CARRIER_SANDBOX_SHIPMENT_PACKAGES,
@@ -1616,6 +2107,14 @@ const fedexShipmentRate =
               totalNetCharge: 31.47,
               currency: 'USD',
             }],
+          }, {
+            serviceType: 'FEDEX_GROUND',
+            serviceName: 'FedEx Ground duplicate commitment',
+            ratedShipmentDetails: [{
+              rateType: 'ACCOUNT',
+              totalNetCharge: 29.84,
+              currency: 'USD',
+            }],
           }],
         },
       }), {
@@ -1657,7 +2156,16 @@ assert.deepEqual(
   'FedEx MPS line items must preserve cartonization package order without grouping',
 )
 assert.equal(fedexShipmentRate.result.packageCount, 2)
-assert.equal(fedexShipmentRate.result.rates[0].amount, '31.47')
+assert.equal(
+  fedexShipmentRate.result.rates.length,
+  1,
+  'FedEx duplicate service commitments must collapse to one Shopify-safe service',
+)
+assert.equal(
+  fedexShipmentRate.result.rates[0].amount,
+  '29.84',
+  'FedEx duplicate service commitments must retain the lowest account rate',
+)
 assert.equal(
   fedexShipmentRate.evidence.redactedResponse.rateScope,
   'multi_package_shipment',
@@ -1706,6 +2214,88 @@ assert.deepEqual(
   ['AG12V2 optimized carton', '20lb optimized carton'],
 )
 assert.equal(upsShipmentRate.result.rates[0].amount, '29.15')
+
+const fedexRateOnly =
+  await sandboxRateModule.requestCarrierSandboxShipmentRates({
+    provider: 'fedex_rest',
+    environment: 'sandbox',
+    credential,
+  }, {
+    fixture: rateOnlyShipmentFixture,
+    fetchImpl: async (url, init) => {
+      rateRequests.push({ url: String(url), init })
+      return new Response(JSON.stringify({
+        output: {
+          rateReplyDetails: [{
+            serviceType: 'FEDEX_GROUND',
+            serviceName: 'FedEx Ground',
+            ratedShipmentDetails: [{
+              rateType: 'ACCOUNT',
+              totalNetCharge: 14.72,
+              currency: 'USD',
+            }],
+          }],
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    },
+  })
+const fedexRateOnlyRequest = JSON.parse(rateRequests[4].init.body)
+const fedexRateOnlyAddress =
+  fedexRateOnlyRequest.requestedShipment.recipient.address
+assert.equal('streetLines' in fedexRateOnlyAddress, false)
+assert.equal('city' in fedexRateOnlyAddress, false)
+assert.deepEqual(fedexRateOnlyAddress, {
+  postalCode: '06103',
+  countryCode: 'US',
+})
+assert.equal(
+  fedexRateOnly.result.destinationFingerprint,
+  rateOnlyDestinationFingerprint,
+)
+
+const upsRateOnly =
+  await sandboxRateModule.requestCarrierSandboxShipmentRates({
+    provider: 'ups_rest',
+    environment: 'sandbox',
+    credential,
+  }, {
+    fixture: rateOnlyShipmentFixture,
+    fetchImpl: async (url, init) => {
+      rateRequests.push({ url: String(url), init })
+      return new Response(JSON.stringify({
+        RateResponse: {
+          RatedShipment: [{
+            Service: { Code: '03' },
+            NegotiatedRateCharges: {
+              TotalCharge: {
+                MonetaryValue: '15.25',
+                CurrencyCode: 'USD',
+              },
+            },
+          }],
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    },
+  })
+const upsRateOnlyRequest = JSON.parse(rateRequests[5].init.body)
+const upsRateOnlyShipTo = upsRateOnlyRequest.RateRequest.Shipment.ShipTo
+assert.equal('Name' in upsRateOnlyShipTo, false)
+assert.equal('AddressLine' in upsRateOnlyShipTo.Address, false)
+assert.equal('City' in upsRateOnlyShipTo.Address, false)
+assert.deepEqual(upsRateOnlyShipTo.Address, {
+  PostalCode: '06103',
+  CountryCode: 'US',
+})
+assert.equal(
+  upsRateOnly.result.destinationFingerprint,
+  rateOnlyDestinationFingerprint,
+)
 for (const value of [
   fedexShipmentRate.evidence.redactedRequest,
   upsShipmentRate.evidence.redactedRequest,
@@ -1725,6 +2315,8 @@ for (const value of [
   upsRate,
   fedexShipmentRate,
   upsShipmentRate,
+  fedexRateOnly,
+  upsRateOnly,
 ]) {
   const serialized = JSON.stringify(value)
   assert.ok(!serialized.includes(credential.accountNumber), 'Rate result/evidence must redact account numbers')

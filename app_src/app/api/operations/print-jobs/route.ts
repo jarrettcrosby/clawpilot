@@ -21,12 +21,12 @@ export const runtime = 'nodejs'
 
 const MAX_REQUEST_BYTES = 12 * 1024
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const PRINTER_GLOBAL_ID = /^gpr\d{7}$/
-const JOB_GLOBAL_ID = /^gpj\d{7}$/
-const LABEL_GLOBAL_ID = /^glb\d{7}$/
-const ORDER_GLOBAL_ID = /^gor\d{7}$/
-const SHIPMENT_GLOBAL_ID = /^gsh\d{7}$/
-const ARTIFACT_GLOBAL_ID = /^gpf\d{7}$/
+const PRINTER_GLOBAL_ID = /^gpr(?:[0-9]{7}|[0-9a-v]{12})$/
+const JOB_GLOBAL_ID = /^gpj(?:[0-9]{7}|[0-9a-v]{12})$/
+const LABEL_GLOBAL_ID = /^glb(?:[0-9]{7}|[0-9a-v]{12})$/
+const ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/
+const SHIPMENT_GLOBAL_ID = /^gsh(?:[0-9]{7}|[0-9a-v]{12})$/
+const ARTIFACT_GLOBAL_ID = /^gpf(?:[0-9]{7}|[0-9a-v]{12})$/
 const SHA256 = /^[a-f0-9]{64}$/
 const ACTION_FIELDS: Record<string, Set<string>> = {
   'enqueue-label': new Set([
@@ -281,13 +281,13 @@ export async function POST(req: NextRequest) {
     } else if (command.action === 'enqueue-packing-slip-artifact') {
       const sourceArtifactGlobalId = text(
         command.value.sourceArtifactGlobalId,
-        'Packing-list artifact',
+        'Pack Work Instruction artifact',
         16,
       )
       if (!ARTIFACT_GLOBAL_ID.test(sourceArtifactGlobalId)) {
         fail(
           'OPERATIONS_PRINT_JOB_REQUEST_INVALID',
-          'Packing-list artifact is invalid',
+          'Pack Work Instruction artifact is invalid',
         )
       }
       enqueue = {

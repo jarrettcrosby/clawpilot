@@ -7,10 +7,13 @@ const read = (path) => readFile(new URL(path, root), 'utf8')
 const [
   migration,
   offerMigration,
+  taxonomyMigration,
+  variantRefreshRecoveryMigration,
   intake,
   shopifyIntake,
   faireClient,
   persistence,
+  shopifyMediaPersistence,
   crmPersistence,
   crmTypes,
   crmUi,
@@ -18,10 +21,13 @@ const [
 ] = await Promise.all([
   read('db/migrations/0130_operations_product_channel_states.sql'),
   read('db/migrations/0132_operations_product_channel_offers.sql'),
+  read('db/migrations/0152_operations_product_channel_taxonomy.sql'),
+  read('db/migrations/0163_shopify_variant_catalog_refresh_recovery.sql'),
   read('app_src/lib/persistence/commerceIntake.ts'),
   read('app_src/lib/integrations/commerceIntake.ts'),
   read('app_src/lib/integrations/faireCommerceClient.ts'),
   read('app_src/lib/persistence/productChannelStates.ts'),
+  read('app_src/lib/persistence/shopifyProductMediaProjection.ts'),
   read('app_src/lib/persistence/crm.ts'),
   read('app_src/lib/crm/types.ts'),
   read('app_src/components/crm/CrmSection.tsx'),
@@ -65,6 +71,53 @@ assert.doesNotMatch(
   'historical candidates are ambiguous money evidence and must not backfill channel offers',
 )
 assert.match(offerMigration, /length\(provider_variant_title\) <= 512/)
+assert.match(
+  taxonomyMigration,
+  /provider_taxonomy_scheme IS NOT NULL[\s\S]*provider_taxonomy_scheme = CASE provider/,
+)
+assert.match(
+  taxonomyMigration,
+  /NOT jsonb_path_exists\([\s\S]*@\.type\(\) != "string"/,
+)
+assert.match(
+  taxonomyMigration,
+  /protect_operations_commerce_product_candidate_taxonomy/,
+)
+assert.match(
+  taxonomyMigration,
+  /Commerce product candidate provider taxonomy is immutable/,
+)
+assert.match(
+  variantRefreshRecoveryMigration,
+  /DROP TRIGGER IF EXISTS[\s\S]*protect_operations_shopify_parent_product_mapping_write/,
+)
+assert.match(
+  variantRefreshRecoveryMigration,
+  /DROP FUNCTION IF EXISTS[\s\S]*protect_operations_shopify_parent_product_mapping/,
+)
+assert.match(
+  variantRefreshRecoveryMigration,
+  /job\.status = 'dead'[\s\S]*job\.provider = 'shopify'[\s\S]*job\.last_error_code = 'P0001'/,
+)
+assert.match(
+  variantRefreshRecoveryMigration,
+  /HAVING count\(DISTINCT state\.product_id\) > 1/,
+)
+assert.match(
+  variantRefreshRecoveryMigration,
+  /recoveredPriorErrorCode[\s\S]*P0001/,
+  'catalog recovery must retain the prior terminal error as evidence',
+)
+assert.match(
+  shopifyMediaPersistence,
+  /conflicting_product_count[\s\S]*more than one ClawPilot Product; no image authority was issued/,
+  'parent-scoped Shopify image preparation must remain fail-closed',
+)
+assert.match(
+  shopifyMediaPersistence,
+  /FROM operations_product_channel_states sibling[\s\S]*sibling\.product_id <> \$4::uuid/,
+  'image authority must retain its purpose-specific sibling ambiguity fence',
+)
 
 assert.match(intake, /upsertProductChannelStateWithClient/)
 assert.match(intake, /linkProductChannelStateWithClient/)
@@ -83,12 +136,18 @@ assert.match(
 
 assert.match(
   shopifyIntake,
-  /product_status:ACTIVE,ARCHIVED,DRAFT,UNLISTED/,
+  /product_status:active,archived,draft,unlisted/,
   'Shopify catalog intake must explicitly include every product lifecycle',
 )
 assert.match(
   faireClient,
-  /request\('\/products', \{ query: listQuery\(options\) \}\)/,
+  /request\('\/products', \{ query: productListQuery\(options\) \}\)/,
+  'Faire catalog intake must use the product-only lifecycle query',
+)
+assert.match(
+  faireClient,
+  /query\.set\('include_deleted', String\(options\.includeDeleted\)\)/,
+  'Faire product reads must support explicit deleted-listing reconciliation',
 )
 assert.doesNotMatch(
   faireClient,

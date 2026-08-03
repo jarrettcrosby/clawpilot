@@ -3,6 +3,9 @@ import { NextRequest, NextResponse } from 'next/server'
 import { commerceIntakeRuntimeAvailable } from '@/lib/integrations/commerceIntake'
 import { processCommerceOrderReconciliation } from '@/lib/commerceOrderReconciliationWorker'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
+import {
+  recordCommerceOrderReconciliationWorkerHeartbeatInPostgres,
+} from '@/lib/persistence/commerceOrderReconciliation'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
@@ -35,6 +38,39 @@ export async function POST(req: NextRequest) {
     )
   }
   const body = await req.json().catch(() => ({})) as { limit?: number }
-  const result = await processCommerceOrderReconciliation({ limit: body.limit })
-  return NextResponse.json({ ok: true, ...result })
+  const workerId = String(
+    process.env.RAILWAY_REPLICA_ID
+    || process.env.HOSTNAME
+    || crypto.randomUUID(),
+  ).slice(0, 200)
+  await recordCommerceOrderReconciliationWorkerHeartbeatInPostgres({
+    phase: 'started',
+    workerId,
+    providerReadOnly: true,
+    localCanonicalOrderWritesPossible: true,
+    providerWrites: 0,
+  })
+  try {
+    const result = await processCommerceOrderReconciliation({ limit: body.limit })
+    const heartbeat =
+      await recordCommerceOrderReconciliationWorkerHeartbeatInPostgres({
+        phase: 'completed',
+        workerId,
+        ...result,
+      })
+    return NextResponse.json({
+      ok: true,
+      ...result,
+      heartbeatAt: heartbeat.checkedAt,
+    })
+  } catch (error) {
+    await recordCommerceOrderReconciliationWorkerHeartbeatInPostgres({
+      phase: 'failed',
+      workerId,
+      providerReadOnly: true,
+      localCanonicalOrderWritesPossible: true,
+      providerWrites: 0,
+    }).catch(() => undefined)
+    throw error
+  }
 }

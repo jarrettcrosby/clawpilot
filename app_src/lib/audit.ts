@@ -216,7 +216,8 @@ function crmAuditRecordMetadata(row: AuditRow): { recordType: string | null; ref
     || crmRecordTypeLabel(row.aggregate_type)
   const payloadReference = [payload.referenceCode, payload.globalId]
     .find((value) => typeof value === 'string' && value.trim())
-  const aggregateReference = typeof row.aggregate_id === 'string' && /^g[a-z][0-9]{7}$/i.test(row.aggregate_id)
+  const aggregateReference = typeof row.aggregate_id === 'string'
+    && /^g[a-z]{1,4}(?:[0-9]{7}|[0-9a-v]{12})$/.test(row.aggregate_id)
     ? row.aggregate_id
     : null
   return {

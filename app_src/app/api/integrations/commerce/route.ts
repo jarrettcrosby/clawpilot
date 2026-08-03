@@ -7,8 +7,11 @@ import {
   faireOAuthCallbackUrl,
   getCommerceIntegrationsState,
   revealCommerceCredential,
+  registerShopifyCatalogWebhookSubscriptions,
+  registerShopifyInventoryWebhookSubscriptions,
   sanitizedCommerceIntegrationError,
   setCommerceIntegrationEnabled,
+  setShopifyFulfillmentNotificationPolicy,
   startFaireOAuthCommerce,
   testCommerceConnection,
 } from '@/lib/integrations/commerceIntegrations'
@@ -103,7 +106,7 @@ function requireManager(actor: AppUser) {
 function requireActivator(actor: AppUser) {
   if (!operationsCapabilities(actor).canActivate) {
     throw new CommerceIntegrationRequestError(
-      'Owner or operations-administrator access is required to enable receipt intake',
+      'Owner or operations-administrator access is required to queue signed receipts for intake',
       403,
       'COMMERCE_ACTIVATOR_REQUIRED',
     )
@@ -342,6 +345,54 @@ export async function PATCH(req: NextRequest) {
       })
     }
 
+    if (action === 'register-shopify-inventory-webhooks') {
+      only(body, ['action', 'accountGlobalId', 'confirmProviderWrites'])
+      requireActivator(actor)
+      if (body.confirmProviderWrites !== true) {
+        throw new CommerceIntegrationRequestError(
+          'Confirm the exact Shopify inventory webhook registrations',
+          400,
+          'COMMERCE_PROVIDER_WRITE_CONFIRMATION_REQUIRED',
+        )
+      }
+      const integrations = await registerShopifyInventoryWebhookSubscriptions({
+        organizationId: organization,
+        accountGlobalId: body.accountGlobalId,
+        actorEmail: actor.email,
+      })
+      return json({
+        ok: true,
+        canManage: true,
+        canActivate: true,
+        integrations,
+        catalog: capabilityCatalog(),
+      })
+    }
+
+    if (action === 'register-shopify-catalog-webhooks') {
+      only(body, ['action', 'accountGlobalId', 'confirmProviderWrites'])
+      requireActivator(actor)
+      if (body.confirmProviderWrites !== true) {
+        throw new CommerceIntegrationRequestError(
+          'Confirm the exact Shopify catalog webhook registrations',
+          400,
+          'COMMERCE_PROVIDER_WRITE_CONFIRMATION_REQUIRED',
+        )
+      }
+      const integrations = await registerShopifyCatalogWebhookSubscriptions({
+        organizationId: organization,
+        accountGlobalId: body.accountGlobalId,
+        actorEmail: actor.email,
+      })
+      return json({
+        ok: true,
+        canManage: true,
+        canActivate: true,
+        integrations,
+        catalog: capabilityCatalog(),
+      })
+    }
+
     if (action === 'start-faire-oauth') {
       only(body, [
         'action',
@@ -419,7 +470,10 @@ export async function PATCH(req: NextRequest) {
       })
     }
 
-    if (action === 'set-enabled') {
+    if (
+      action === 'set-receipt-intake'
+      || action === 'set-enabled'
+    ) {
       only(body, ['action', 'accountGlobalId', 'enabled'])
       if (body.enabled === true) requireActivator(actor)
       const integrations = await setCommerceIntegrationEnabled({
@@ -432,6 +486,35 @@ export async function PATCH(req: NextRequest) {
         ok: true,
         canManage: true,
         canActivate: operationsCapabilities(actor).canActivate,
+        integrations,
+        catalog: capabilityCatalog(),
+      })
+    }
+
+    if (action === 'set-shopify-fulfillment-notification-policy') {
+      only(body, [
+        'action',
+        'accountGlobalId',
+        'expectedRevision',
+        'notifyCustomerDefault',
+        'reason',
+        'confirmCustomerNotifications',
+      ])
+      requireActivator(actor)
+      const integrations = await setShopifyFulfillmentNotificationPolicy({
+        organizationId: organization,
+        accountGlobalId: body.accountGlobalId,
+        expectedRevision: body.expectedRevision,
+        notifyCustomerDefault: body.notifyCustomerDefault,
+        reason: body.reason,
+        confirmCustomerNotifications: body.confirmCustomerNotifications,
+        actorEmail: actor.email,
+      })
+      return json({
+        ok: true,
+        canManage: true,
+        canActivate: true,
+        canRevealCredentials: canRevealCredential(actor),
         integrations,
         catalog: capabilityCatalog(),
       })

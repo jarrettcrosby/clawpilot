@@ -1,0 +1,11 @@
+{
+  "metafields": [
+    {
+      "ownerId": "gid://shopify/Customer/REPLACE_WITH_EXACT_NUMERIC_ID",
+      "namespace": "$app:clawpilot-test-rate-isolation",
+      "key": "customer-rate-policy",
+      "type": "json",
+      "value": "{\"version\":1,\"mode\":\"show_all\",\"serviceCodes\":[]}"
+    }
+  ]
+}

@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import { decodeHtmlEntities } from '@/lib/htmlEntities.mjs'
+import { globalIdFragment } from '@/lib/globalIds.mjs'
 import { matonFetch } from '@/lib/maton'
 import {
   readCrmRecordByReference,
@@ -195,7 +196,11 @@ export function parseCrmMarkerReferences(value: unknown): string[] {
   const references: string[] = []
   const seen = new Set<string>()
 
-  for (const match of searchable.matchAll(/%gslt(g[aciklmo][0-9]{7})(?![A-Za-z0-9_])/gi)) {
+  const markerPattern = new RegExp(
+    `%gslt(${globalIdFragment(['ga', 'gc', 'gi', 'gk', 'gl', 'gm', 'go'])})(?![A-Za-z0-9_])`,
+    'gi',
+  )
+  for (const match of searchable.matchAll(markerPattern)) {
     const reference = match[1].toLowerCase()
     if (seen.has(reference)) continue
     seen.add(reference)

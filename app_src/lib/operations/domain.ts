@@ -28,6 +28,7 @@ import type {
 
 export function availableOperationsOrderActions(input: {
   status: OperationsOrderStatus
+  sourceProvider?: string
   activationState: OperationsActivationState
   canExecute: boolean
   planStatus: string | null
@@ -41,12 +42,16 @@ export function availableOperationsOrderActions(input: {
   packageCount: number
   plannedPackageCount: number
   packedPackageCount: number
+  openExceptionCount?: number
   blockingExceptionCount: number
+  shadowPreparationReady?: boolean
+  shadowPreparationBlockedReason?: string | null
   activeLabelCount?: number
   shippableLabelCount?: number
   sandboxLabelCount?: number
   unresolvedLabelAttemptCount?: number
   existingShipmentCount?: number
+  sandboxE2eAuthorized?: boolean
 }): OperationsOrderActionAvailability[] {
   let releaseBlockedReason: string | null = null
   if (!input.canExecute) {
@@ -108,26 +113,65 @@ export function availableOperationsOrderActions(input: {
   let shipmentBlockedReason: string | null = null
   if (!input.canExecute) {
     shipmentBlockedReason = 'Operations execute permission is required.'
-  } else if (!['shadow', 'active'].includes(input.activationState)) {
-    shipmentBlockedReason = 'Set Operations to Shadow or Active before confirming a shipment.'
+  } else if (input.activationState !== 'active') {
+    shipmentBlockedReason = 'Set Operations to Active before confirming a shipment.'
   } else if ((input.existingShipmentCount || 0) > 0 || input.status === 'shipped') {
     shipmentBlockedReason = 'This order already has a confirmed shipment.'
   } else if (input.status !== 'packed') {
     shipmentBlockedReason = 'Verify the package before confirming shipment.'
   } else if (input.planStatus !== 'released' || input.waveStatus !== 'completed') {
     shipmentBlockedReason = 'The fulfillment plan must be released and its wave completed before shipment.'
-  } else if (input.packageCount !== 1 || input.packedPackageCount !== 1) {
-    shipmentBlockedReason = 'This shipment-completion slice requires exactly one verified package.'
+  } else if (
+    input.sandboxE2eAuthorized
+      ? input.packageCount < 1 || input.packedPackageCount !== input.packageCount
+      : input.packageCount !== 1 || input.packedPackageCount !== 1
+  ) {
+    shipmentBlockedReason = input.sandboxE2eAuthorized
+      ? 'Authorized sandbox E2E completion requires every package to be verified.'
+      : 'This shipment-completion slice requires exactly one verified package.'
   } else if ((input.unresolvedLabelAttemptCount || 0) > 0) {
     shipmentBlockedReason = 'Resolve the pending carrier label attempt before confirming shipment.'
-  } else if ((input.activeLabelCount || 0) !== 1) {
-    shipmentBlockedReason = 'Create exactly one active carrier label before confirming shipment.'
-  } else if ((input.sandboxLabelCount || 0) > 0) {
+  } else if (
+    (input.activeLabelCount || 0)
+      !== (input.sandboxE2eAuthorized ? input.packageCount : 1)
+  ) {
+    shipmentBlockedReason = input.sandboxE2eAuthorized
+      ? 'Create exactly one active sandbox carrier label for every package before confirming shipment.'
+      : 'Create exactly one active carrier label before confirming shipment.'
+  } else if (
+    input.sandboxE2eAuthorized
+    && (input.sandboxLabelCount || 0) !== input.packageCount
+  ) {
+    shipmentBlockedReason = 'Authorized sandbox E2E completion requires sandbox labels for every package.'
+  } else if (!input.sandboxE2eAuthorized && (input.sandboxLabelCount || 0) > 0) {
     shipmentBlockedReason = 'Sandbox labels are test evidence only. Void the label; they cannot confirm shipment.'
-  } else if ((input.shippableLabelCount || 0) !== 1) {
+  } else if (!input.sandboxE2eAuthorized && (input.shippableLabelCount || 0) !== 1) {
     shipmentBlockedReason = 'A mock proof or production carrier label is required before shipment.'
   } else if (input.blockingExceptionCount > 0) {
     shipmentBlockedReason = 'Resolve high or critical order exceptions before confirming shipment.'
+  }
+
+  let preparationBlockedReason: string | null = null
+  if (!input.canExecute) {
+    preparationBlockedReason = 'Operations execute permission is required.'
+  } else if (input.activationState !== 'shadow') {
+    preparationBlockedReason = 'Shipment preparation is available only in Operations Shadow.'
+  } else if (input.sourceProvider !== 'shopify') {
+    preparationBlockedReason = 'Shadow shipment preparation currently requires a Shopify order.'
+  } else if (input.status !== 'packed') {
+    preparationBlockedReason = 'Verify every package before preparing shipment execution.'
+  } else if (input.planStatus !== 'released') {
+    preparationBlockedReason = 'The latest fulfillment plan must remain released.'
+  } else if (
+    input.packageCount < 1
+    || input.packedPackageCount !== input.packageCount
+  ) {
+    preparationBlockedReason = 'Every physical package must be packed.'
+  } else if ((input.openExceptionCount || 0) > 0) {
+    preparationBlockedReason = 'Resolve all order exceptions before preparing shipment execution.'
+  } else if (input.shadowPreparationReady !== true) {
+    preparationBlockedReason = input.shadowPreparationBlockedReason
+      || 'Exact checkout, carton, allocation, and UPS/FedEx sandbox evidence is required.'
   }
 
   return [
@@ -148,6 +192,12 @@ export function availableOperationsOrderActions(input: {
       label: 'Verify packages',
       enabled: packBlockedReason === null,
       blockedReason: packBlockedReason,
+    },
+    {
+      action: 'prepare_fulfillment',
+      label: 'Prepare shipment in Shadow',
+      enabled: preparationBlockedReason === null,
+      blockedReason: preparationBlockedReason,
     },
     {
       action: 'confirm_shipment',

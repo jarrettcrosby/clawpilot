@@ -1,5 +1,8 @@
 import crypto from 'crypto'
 import { SHOPIFY_ADMIN_API_VERSION } from '@/lib/integrations/commerceCapabilities'
+import {
+  normalizeShopifyStoreEntityName,
+} from '@/lib/integrations/shopifyCarrierServiceBranding'
 
 const MAX_QUERY_BYTES = 64 * 1024
 const MAX_VARIABLE_BYTES = 256 * 1024
@@ -51,6 +54,28 @@ export type ShopifyConnectionProbe = {
   shopDomain: string
   shopName: string
   grantedScopes: string[]
+}
+
+export type ShopifyWebhookSubscriptionObservation = {
+  providerId: string
+  topic: string
+  uri: string
+}
+
+export type ShopifyWebhookSubscriptionReadiness = {
+  desiredUri: string
+  requiredTopics: string[]
+  subscriptions: ShopifyWebhookSubscriptionObservation[]
+  missingTopics: string[]
+  conflictingTopics: string[]
+  ready: boolean
+}
+
+export type ShopifyWebhookSubscriptionCreateResult = {
+  providerId: string
+  topic: string
+  uri: string
+  created: boolean
 }
 
 export class ShopifyCommerceClientError extends Error {
@@ -526,6 +551,153 @@ export async function shopifyAdminGraphql<T>(
 
 export const shopifyGraphqlRequest = shopifyAdminGraphql
 
+const SHOPIFY_WEBHOOK_SUBSCRIPTIONS_QUERY = `query ClawPilotWebhookSubscriptions($topics: [WebhookSubscriptionTopic!]) {
+  webhookSubscriptions(first: 100, topics: $topics) {
+    nodes {
+      id
+      topic
+      uri
+    }
+  }
+}`
+
+const SHOPIFY_WEBHOOK_TOPIC_ENUMS = {
+  'app/scopes_update': 'APP_SCOPES_UPDATE',
+  'inventory_items/update': 'INVENTORY_ITEMS_UPDATE',
+  'inventory_levels/update': 'INVENTORY_LEVELS_UPDATE',
+  'products/create': 'PRODUCTS_CREATE',
+  'products/delete': 'PRODUCTS_DELETE',
+  'products/update': 'PRODUCTS_UPDATE',
+} as const
+
+const SHOPIFY_WEBHOOK_SUBSCRIPTION_CREATE_MUTATION = `mutation ClawPilotWebhookSubscriptionCreate(
+  $topic: WebhookSubscriptionTopic!
+  $subscription: WebhookSubscriptionInput!
+) {
+  webhookSubscriptionCreate(topic: $topic, webhookSubscription: $subscription) {
+    webhookSubscription { id topic uri }
+    userErrors { field message }
+  }
+}`
+
+function shopifyWebhookTopicEnum(topic: string) {
+  const providerTopic = SHOPIFY_WEBHOOK_TOPIC_ENUMS[
+    topic as keyof typeof SHOPIFY_WEBHOOK_TOPIC_ENUMS
+  ]
+  if (!providerTopic) {
+    throw invalidInput('Shopify webhook topic is not supported', 'SHOPIFY_WEBHOOK_TOPIC_INVALID')
+  }
+  return providerTopic
+}
+
+export async function createShopifyWebhookSubscription(
+  credential: ShopifyCommerceRuntimeCredential,
+  input: { uri: string; topic: string },
+  options: ShopifyCommerceClientOptions = {},
+): Promise<ShopifyWebhookSubscriptionCreateResult> {
+  const readiness = await discoverShopifyWebhookSubscriptions(
+    credential,
+    { desiredUri: input.uri, topics: [input.topic] },
+    options,
+  )
+  const existing = readiness.subscriptions.find((subscription) =>
+    subscription.topic === input.topic && subscription.uri === readiness.desiredUri)
+  if (existing) return { ...existing, created: false }
+  const data = await shopifyAdminGraphql<{
+    webhookSubscriptionCreate?: {
+      webhookSubscription?: unknown
+      userErrors?: unknown[]
+    }
+  }>(credential, {
+    query: SHOPIFY_WEBHOOK_SUBSCRIPTION_CREATE_MUTATION,
+    operationName: 'ClawPilotWebhookSubscriptionCreate',
+    variables: {
+      topic: shopifyWebhookTopicEnum(input.topic),
+      subscription: { uri: readiness.desiredUri, format: 'JSON' },
+    },
+  }, options)
+  const result = data.webhookSubscriptionCreate
+  if (Array.isArray(result?.userErrors) && result.userErrors.length) {
+    throw new ShopifyCommerceClientError(
+      'Shopify rejected the webhook subscription configuration',
+      422,
+      'SHOPIFY_WEBHOOK_SUBSCRIPTION_REJECTED',
+    )
+  }
+  const node = safeRecord(result?.webhookSubscription)
+  if (
+    !node
+    || typeof node.id !== 'string'
+    || typeof node.topic !== 'string'
+    || typeof node.uri !== 'string'
+    || !/^gid:\/\/shopify\/WebhookSubscription\/[1-9][0-9]*$/.test(node.id)
+  ) {
+    throw new ShopifyCommerceClientError(
+      'Shopify returned invalid webhook subscription evidence',
+      502,
+      'SHOPIFY_WEBHOOK_SUBSCRIPTION_RESPONSE_INVALID',
+    )
+  }
+  return { providerId: node.id, topic: input.topic, uri: node.uri, created: true }
+}
+
+export async function discoverShopifyWebhookSubscriptions(
+  credential: ShopifyCommerceRuntimeCredential,
+  input: { desiredUri: string; topics: readonly string[] },
+  options: ShopifyCommerceClientOptions = {},
+): Promise<ShopifyWebhookSubscriptionReadiness> {
+  let desiredUri: string
+  try {
+    const parsed = new URL(input.desiredUri)
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.hash) {
+      throw new Error('invalid URI')
+    }
+    desiredUri = parsed.toString()
+  } catch {
+    throw invalidInput('A public HTTPS Shopify webhook URI is required', 'SHOPIFY_WEBHOOK_URI_INVALID')
+  }
+  const requiredTopics = [...new Set(input.topics)].sort()
+  const providerTopics = requiredTopics.map(shopifyWebhookTopicEnum)
+  const data = await shopifyAdminGraphql<{
+    webhookSubscriptions?: { nodes?: unknown[] }
+  }>(credential, {
+    query: SHOPIFY_WEBHOOK_SUBSCRIPTIONS_QUERY,
+    operationName: 'ClawPilotWebhookSubscriptions',
+    variables: { topics: providerTopics },
+  }, options)
+  const observations: ShopifyWebhookSubscriptionObservation[] = []
+  for (const value of data.webhookSubscriptions?.nodes || []) {
+    const node = safeRecord(value)
+    if (
+      !node
+      || typeof node.id !== 'string'
+      || typeof node.topic !== 'string'
+      || typeof node.uri !== 'string'
+      || !/^gid:\/\/shopify\/WebhookSubscription\/[1-9][0-9]*$/.test(node.id)
+    ) continue
+    const topic = Object.entries(SHOPIFY_WEBHOOK_TOPIC_ENUMS)
+      .find(([, providerTopic]) => providerTopic === node.topic)?.[0]
+    if (!topic || !requiredTopics.includes(topic)) continue
+    observations.push({ providerId: node.id, topic, uri: node.uri })
+  }
+  observations.sort((left, right) => left.topic.localeCompare(right.topic)
+    || left.providerId.localeCompare(right.providerId))
+  const missingTopics = requiredTopics.filter((topic) =>
+    !observations.some((observation) =>
+      observation.topic === topic && observation.uri === desiredUri))
+  const conflictingTopics = requiredTopics.filter((topic) =>
+    observations.some((observation) =>
+      observation.topic === topic && observation.uri !== desiredUri))
+  return {
+    desiredUri,
+    requiredTopics,
+    subscriptions: observations,
+    missingTopics,
+    conflictingTopics,
+    ready: missingTopics.length === 0 && conflictingTopics.length === 0,
+  }
+}
+
 const SHOPIFY_CONNECTION_PROBE_QUERY = `query ClawPilotShopifyConnectionProbe {
   shop {
     id
@@ -540,25 +712,15 @@ const SHOPIFY_CONNECTION_PROBE_QUERY = `query ClawPilotShopifyConnectionProbe {
 }`
 
 function probeShopName(value: unknown): string {
-  if (typeof value !== 'string') {
+  try {
+    return normalizeShopifyStoreEntityName(value)
+  } catch {
     throw new ShopifyCommerceClientError(
       'Shopify returned invalid store identity data',
       502,
       'SHOPIFY_PROBE_INVALID',
     )
   }
-  const name = value
-    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-  if (!name || name.length > 255) {
-    throw new ShopifyCommerceClientError(
-      'Shopify returned invalid store identity data',
-      502,
-      'SHOPIFY_PROBE_INVALID',
-    )
-  }
-  return name
 }
 
 function probeGrantedScopes(value: unknown): string[] {

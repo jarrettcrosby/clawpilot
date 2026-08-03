@@ -127,6 +127,14 @@ export type ProductSalesChannelState = {
   providerVariantTitle: string | null
   providerSku: string | null
   providerBarcode: string | null
+  providerTaxonomyScheme:
+    | 'shopify_standard_product_taxonomy'
+    | 'faire_product_type'
+    | null
+  providerCategoryId: string | null
+  providerCategoryName: string | null
+  providerCategoryFullName: string | null
+  providerCategoryPaths: string[]
   wholesaleCurrencyCode: string | null
   wholesalePriceMinor: string | null
   retailCurrencyCode: string | null
@@ -397,6 +405,11 @@ export type SuiteCrmOutboxRecord = {
   previousSuiteCrmModule?: SuiteCrmInteractionModule
   attributes: Record<string, unknown>
   currencyCode?: string
+  productImage?: {
+    referenceCode: string
+    contentSha256: string
+  } | null
+  productImageProjectionRequired?: boolean
   relationships?: Array<{
     linkFieldName: 'accounts' | 'contact' | 'contacts' | 'leads' | 'opportunity'
     relatedModuleName: 'Accounts' | 'Contacts' | 'Leads' | 'Opportunities'

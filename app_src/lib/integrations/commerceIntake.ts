@@ -9,10 +9,15 @@ import {
   sanitizedCommerceIntegrationError,
 } from '@/lib/integrations/commerceIntegrations'
 import {
+  hasEffectiveShopifyScope,
+} from '@/lib/integrations/commerceCapabilities'
+import {
+  getFaireProduct,
   getFaireOrder,
   listFaireInventory,
   listFaireOrders,
   listFaireProducts,
+  probeFaireBrandProfile,
 } from '@/lib/integrations/faireCommerceClient'
 import {
   FAIRE_COMMERCE_NORMALIZER_VERSION,
@@ -40,18 +45,24 @@ import {
 } from '@/lib/persistence/commerceIntegrations'
 import {
   readCommerceOrderReconciliationStateInPostgres,
+  resetCommerceOrderReconciliationInPostgres,
 } from '@/lib/persistence/commerceOrderReconciliation'
 import {
   autoCreateCommerceProductsForRunInPostgres,
   captureCommerceIntakeProviderReadInPostgres,
+  confirmCommerceCustomerPrefetchBindingInPostgres,
   confirmCommerceCandidateAddressInPostgres,
   excludeCommerceIntakeRejectionInPostgres,
   markCommerceIntakeProviderReadUncertainInPostgres,
   markCommerceCandidateUnsupportedInPostgres,
   markCommerceIntakeContinuationInvalidInPostgres,
   prepareCommerceIntakeReadIntentInPostgres,
+  planCommerceCustomerPrefetchBindingInPostgres,
   promoteCommerceCandidateInPostgres,
+  reconcilePromotedCommerceCandidateCheckoutRateInPostgres,
   readCommerceIntakeRejectionTargetFromPostgres,
+  readAutomaticFaireOrderPromotionTargetsForRunInPostgres,
+  readAutomaticCommerceCustomerTargetsForRunInPostgres,
   readCommerceIntakeRefreshTargetFromPostgres,
   readCommerceIntakeStateFromPostgres,
   readCommerceIntakeStageReplayFromPostgres,
@@ -67,22 +78,26 @@ import {
   type CommerceIntakeReadIntentAction,
   type CommerceIntakeReadIntentTarget,
 } from '@/lib/persistence/commerceIntake'
+import { resolveCommerceCustomerInPostgres } from '@/lib/persistence/operations'
 
-const INTAKE_POLICY_VERSION = 'commerce-intake-resolution-v1'
+const INTAKE_POLICY_VERSION = 'commerce-intake-resolution-v2'
 const INTAKE_RETENTION_DAYS = 30
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const RUN_PATTERN = /^gcir[0-9]{7}$/
-const CANDIDATE_PATTERN = /^gcoc[0-9]{7}$/
-const REJECTION_PATTERN = /^gcrj[0-9]{7}$/
-const PRODUCT_CANDIDATE_PATTERN = /^gcpc[0-9]{7}$/
-const LINE_PATTERN = /^gcol[0-9]{7}$/
-const PRODUCT_PATTERN = /^gp[0-9]{7}$/
-const CUSTOMER_PATTERN = /^ga[0-9]{7}$/
-const PACKAGE_PROFILE_PATTERN = /^gpp[0-9]{7}$/
+const RUN_PATTERN = /^gcir(?:[0-9]{7}|[0-9a-v]{12})$/
+const CANDIDATE_PATTERN = /^gcoc(?:[0-9]{7}|[0-9a-v]{12})$/
+const REJECTION_PATTERN = /^gcrj(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRODUCT_CANDIDATE_PATTERN = /^gcpc(?:[0-9]{7}|[0-9a-v]{12})$/
+const LINE_PATTERN = /^gcol(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRODUCT_PATTERN = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/
+const CUSTOMER_PATTERN = /^ga(?:[0-9]{7}|[0-9a-v]{12})$/
+const PACKAGE_PROFILE_PATTERN = /^gpp(?:[0-9]{7}|[0-9a-v]{12})$/
+const PACK_PROFILE_VERSION_PATTERN = /^gppv(?:[0-9]{7}|[0-9a-v]{12})$/
+const CHANNEL_STATE_PATTERN = /^gpcs(?:[0-9]{7}|[0-9a-v]{12})$/
 
 const SHOPIFY_ORDER_PAGE_SIZE = 25
 const SHOPIFY_PRODUCT_VARIANT_PAGE_SIZE = 50
+const SHOPIFY_PRODUCT_IMAGE_PAGE_SIZE = 50
 const SHOPIFY_ORDER_LINE_PAGE_SIZE = 250
 const SHOPIFY_MAX_ORDER_LINE_PAGES = 2
 const SHOPIFY_MAX_NESTED_LINE_REQUESTS = 2
@@ -352,6 +367,29 @@ function shopifyProductVariantsQuery(includeInventory: boolean) {
         updatedAt
         vendor
         productType
+        category {
+          id
+          name
+          fullName
+        }
+        media(first: ${SHOPIFY_PRODUCT_IMAGE_PAGE_SIZE}) {
+          nodes {
+            mediaContentType
+            ... on MediaImage {
+              id
+              alt
+              image {
+                url
+                altText
+                width
+                height
+              }
+            }
+          }
+          pageInfo {
+            hasNextPage
+          }
+        }
       }
     }
     pageInfo {
@@ -363,6 +401,7 @@ function shopifyProductVariantsQuery(includeInventory: boolean) {
 }
 
 type IntakeCommandAction =
+  | 'confirm-customer-binding'
   | 'confirm-address'
   | 'exclude-rejection'
   | 'fetch'
@@ -370,8 +409,11 @@ type IntakeCommandAction =
   | 'fetch-next-products'
   | 'fetch-products'
   | 'mark-unsupported'
+  | 'plan-customer-binding'
   | 'promote'
+  | 'reconcile-checkout-rate'
   | 'refresh'
+  | 'reset-order-reconciliation'
   | 'retry-rejection'
   | 'resolve-catalog-product'
   | 'resolve-customer'
@@ -554,6 +596,7 @@ function dimensions(value: unknown) {
 function action(value: unknown): IntakeCommandAction {
   const result = String(value || '').trim() as IntakeCommandAction
   const allowed: IntakeCommandAction[] = [
+    'confirm-customer-binding',
     'confirm-address',
     'exclude-rejection',
     'fetch',
@@ -561,8 +604,11 @@ function action(value: unknown): IntakeCommandAction {
     'fetch-next-products',
     'fetch-products',
     'mark-unsupported',
+    'plan-customer-binding',
     'promote',
+    'reconcile-checkout-rate',
     'refresh',
+    'reset-order-reconciliation',
     'retry-rejection',
     'resolve-catalog-product',
     'resolve-customer',
@@ -582,8 +628,156 @@ function action(value: unknown): IntakeCommandAction {
   return result
 }
 
+function faireOrderId(value: unknown) {
+  const result = text(value, 'Faire provider order ID', 128)
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(result)) {
+    throw new CommerceIntegrationRequestError(
+      'Faire provider order ID is invalid',
+      400,
+      'COMMERCE_INTAKE_EXACT_ORDER_ID_INVALID',
+    )
+  }
+  return result
+}
+
+function faireProductId(value: unknown) {
+  const result = text(value, 'Faire provider product ID', 512)
+  if (!/^p_[A-Za-z0-9][A-Za-z0-9_-]{0,509}$/.test(result)) {
+    throw new CommerceIntegrationRequestError(
+      'Faire provider product ID is invalid',
+      400,
+      'COMMERCE_INTAKE_EXACT_PRODUCT_ID_INVALID',
+    )
+  }
+  return result
+}
+
+function faireVariantId(value: unknown) {
+  const result = text(value, 'Faire provider variant ID', 512)
+  if (!/^po_[A-Za-z0-9][A-Za-z0-9_-]{0,508}$/.test(result)) {
+    throw new CommerceIntegrationRequestError(
+      'Faire provider variant ID is invalid',
+      400,
+      'COMMERCE_INTAKE_EXACT_VARIANT_ID_INVALID',
+    )
+  }
+  return result
+}
+
+function faireRetailerId(value: unknown) {
+  const result = text(value, 'Faire retailer ID', 512)
+  if (/[\u0000-\u001f\u007f]/u.test(result)) {
+    throw new CommerceIntegrationRequestError(
+      'Faire retailer ID is invalid',
+      400,
+      'COMMERCE_CUSTOMER_PREFETCH_RETAILER_ID_INVALID',
+    )
+  }
+  return result
+}
+
+function customerEvidenceEmail(value: unknown) {
+  const result = text(value, 'Retailer evidence email', 320).toLowerCase()
+  if (
+    /\s/u.test(result)
+    || !/^[^@]+@[^@]+\.[^@]+$/u.test(result)
+  ) {
+    throw new CommerceIntegrationRequestError(
+      'Retailer evidence email is invalid',
+      400,
+      'COMMERCE_CUSTOMER_PREFETCH_EMAIL_INVALID',
+    )
+  }
+  return result
+}
+
+function sha256Hash(value: unknown, label: string) {
+  const result = text(value, label, 64)
+  if (!/^[a-f0-9]{64}$/u.test(result)) {
+    throw new CommerceIntegrationRequestError(
+      `${label} is invalid`,
+      400,
+      'COMMERCE_CUSTOMER_PREFETCH_PLAN_INVALID',
+    )
+  }
+  return result
+}
+
 function requestHash(value: unknown) {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex')
+}
+
+function exactProductPackReadEvidence(
+  command: Record<string, unknown>,
+  target: { externalProductId: string; externalVariantId: string },
+) {
+  const invalid = (): never => {
+    throw new CommerceIntegrationRequestError(
+      'The exact Faire product read did not retain staged evidence for the selected variant. Reload and retry without binding a pack.',
+      409,
+      'COMMERCE_INTAKE_EXACT_PRODUCT_EVIDENCE_REQUIRED',
+    )
+  }
+  const runGlobalId = typeof command.runGlobalId === 'string'
+    && RUN_PATTERN.test(command.runGlobalId)
+    ? command.runGlobalId
+    : invalid()
+  const evidence = command.exactProductEvidence
+  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) {
+    return invalid()
+  }
+  const productEvidence = evidence as Record<string, unknown>
+  if (
+    productEvidence.externalProductId !== target.externalProductId
+    || typeof productEvidence.productSourceHash !== 'string'
+    || !/^[a-f0-9]{64}$/.test(productEvidence.productSourceHash)
+    || !Array.isArray(productEvidence.variants)
+  ) return invalid()
+  const matches = productEvidence.variants.filter((value) => (
+    value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && (value as Record<string, unknown>).externalVariantId
+      === target.externalVariantId
+  )) as Record<string, unknown>[]
+  if (matches.length !== 1) return invalid()
+  const variant = matches[0]
+  const validRevision = (value: unknown) => (
+    typeof value === 'string'
+    && value.length >= 1
+    && value.length <= 2_048
+    && !/[\u0000-\u001f\u007f]/.test(value)
+  )
+  const validHash = (value: unknown) => (
+    typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
+  )
+  const channelStateRowVersion = Number(variant.channelStateRowVersion)
+  if (
+    !validRevision(variant.variantSourceRevision)
+    || !validHash(variant.variantSourceHash)
+    || typeof variant.channelStateGlobalId !== 'string'
+    || !CHANNEL_STATE_PATTERN.test(variant.channelStateGlobalId)
+    || !Number.isSafeInteger(channelStateRowVersion)
+    || channelStateRowVersion < 0
+    || !validRevision(variant.channelSourceRevision)
+    || !validHash(variant.channelSourceHash)
+    || !validHash(variant.channelPackEvidenceHash)
+    || variant.channelSourceRevision !== variant.variantSourceRevision
+    || variant.channelSourceHash !== variant.variantSourceHash
+  ) return invalid()
+  return {
+    runGlobalId,
+    externalProductId: target.externalProductId,
+    productSourceHash: productEvidence.productSourceHash as string,
+    externalVariantId: target.externalVariantId,
+    variantSourceRevision: variant.variantSourceRevision as string,
+    variantSourceHash: variant.variantSourceHash as string,
+    channelStateGlobalId: variant.channelStateGlobalId,
+    channelStateRowVersion,
+    channelSourceRevision: variant.channelSourceRevision as string,
+    channelSourceHash: variant.channelSourceHash as string,
+    channelPackEvidenceHash: variant.channelPackEvidenceHash as string,
+  }
 }
 
 function providerRecord(
@@ -598,6 +792,70 @@ function providerRecord(
     )
   }
   return value as Record<string, unknown>
+}
+
+function exactFaireBrandIdentity(value: unknown, expectedBrandId: string) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new CommerceIntegrationRequestError(
+      'Faire returned an invalid brand identity',
+      502,
+      'COMMERCE_INTAKE_ACCOUNT_CHANGED',
+    )
+  }
+  const profile = value as Record<string, unknown>
+  const identifiers = [profile.id, profile.brand_id, profile.brandId]
+    .filter((candidate) => candidate !== undefined && candidate !== null)
+  if (
+    identifiers.length < 1
+    || identifiers.some((candidate) => (
+      typeof candidate !== 'string'
+      || candidate !== candidate.trim()
+      || candidate.length < 1
+      || candidate.length > 512
+      || /[\u0000-\u001f\u007f]/u.test(candidate)
+      || candidate !== expectedBrandId
+    ))
+  ) {
+    throw new CommerceIntegrationRequestError(
+      'Faire returned a different brand identity',
+      409,
+      'COMMERCE_INTAKE_ACCOUNT_CHANGED',
+    )
+  }
+}
+
+function assertFaireRecordBrandScope(
+  values: readonly unknown[],
+  expectedBrandId: string,
+) {
+  for (const value of values) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+    const record = value as Record<string, unknown>
+    const nestedBrand = record.brand
+      && typeof record.brand === 'object'
+      && !Array.isArray(record.brand)
+      ? record.brand as Record<string, unknown>
+      : null
+    const identifiers = [
+      record.brand_id,
+      record.brandId,
+      nestedBrand?.id,
+    ].filter((candidate) => candidate !== undefined && candidate !== null)
+    if (identifiers.some((candidate) => (
+      typeof candidate !== 'string'
+      || candidate !== candidate.trim()
+      || candidate.length < 1
+      || candidate.length > 512
+      || /[\u0000-\u001f\u007f]/u.test(candidate)
+      || candidate !== expectedBrandId
+    ))) {
+      throw new CommerceIntegrationRequestError(
+        'Faire returned commerce data for a different brand',
+        409,
+        'COMMERCE_INTAKE_ACCOUNT_CHANGED',
+      )
+    }
+  }
 }
 
 function providerNodes(value: unknown, label: string) {
@@ -1057,13 +1315,6 @@ async function shopifyEnvelope(
     clientId: credential.clientId,
     clientSecret: credential.clientSecret,
   })
-  if (!grant.grantedScopes.includes('read_orders')) {
-    throw new CommerceIntegrationRequestError(
-      'Shopify must grant read_orders for current operational intake',
-      409,
-      'COMMERCE_INTAKE_SCOPE_REQUIRED',
-    )
-  }
   const probe = await probeShopifyConnection({
     shopDomain,
     accessToken: grant.accessToken,
@@ -1075,8 +1326,24 @@ async function shopifyEnvelope(
       'SHOPIFY_STORE_IDENTITY_CHANGED',
     )
   }
+  if (
+    !hasEffectiveShopifyScope(grant.grantedScopes, 'read_orders')
+    || !hasEffectiveShopifyScope(probe.grantedScopes, 'read_orders')
+  ) {
+    throw new CommerceIntegrationRequestError(
+      'Shopify must grant read_orders for current operational intake',
+      409,
+      'COMMERCE_INTAKE_SCOPE_REQUIRED',
+    )
+  }
   const providerCredential = { shopDomain, accessToken: grant.accessToken }
-  const includeCustomerIdentity = grant.grantedScopes.includes('read_customers')
+  const includeCustomerIdentity = hasEffectiveShopifyScope(
+    grant.grantedScopes,
+    'read_customers',
+  ) && hasEffectiveShopifyScope(
+    probe.grantedScopes,
+    'read_customers',
+  )
   // `read_orders` grants Shopify's current-order window. Keep unattended
   // reads explicitly inside that window; historical backfill is separate and
   // may require `read_all_orders` when introduced as its own workflow.
@@ -1170,6 +1437,9 @@ async function shopifyProductEnvelope(
   page: OperationalPageRequest,
   hydrateInventory = true,
 ): Promise<OperationalPageResult> {
+  // Fence the snapshot at read start. A slower, older provider request must
+  // never arrive later and supersede a catalog snapshot that started after it.
+  const context = normalizationContext(runtime)
   const credential = decryptCommerceCredential(
     runtime.encrypted,
     runtime.organizationId,
@@ -1186,13 +1456,6 @@ async function shopifyProductEnvelope(
     clientId: credential.clientId,
     clientSecret: credential.clientSecret,
   })
-  if (!grant.grantedScopes.includes('read_products')) {
-    throw new CommerceIntegrationRequestError(
-      'Shopify must grant read_products for catalog intake',
-      409,
-      'COMMERCE_INTAKE_SCOPE_REQUIRED',
-    )
-  }
   const probe = await probeShopifyConnection({
     shopDomain,
     accessToken: grant.accessToken,
@@ -1204,6 +1467,19 @@ async function shopifyProductEnvelope(
       'SHOPIFY_STORE_IDENTITY_CHANGED',
     )
   }
+  if (
+    !hasEffectiveShopifyScope(grant.grantedScopes, 'read_products')
+    || !hasEffectiveShopifyScope(probe.grantedScopes, 'read_products')
+  ) {
+    throw new CommerceIntegrationRequestError(
+      'Shopify must grant read_products for catalog intake',
+      409,
+      'COMMERCE_INTAKE_SCOPE_REQUIRED',
+    )
+  }
+  const includeInventory = hydrateInventory
+    && hasEffectiveShopifyScope(grant.grantedScopes, 'read_inventory')
+    && hasEffectiveShopifyScope(probe.grantedScopes, 'read_inventory')
   const data = await shopifyAdminGraphql<Record<string, unknown>>(
     {
       shopDomain,
@@ -1211,13 +1487,14 @@ async function shopifyProductEnvelope(
     },
     {
       query: shopifyProductVariantsQuery(
-        hydrateInventory
-        && grant.grantedScopes.includes('read_inventory'),
+        includeInventory,
       ),
       operationName: 'ClawPilotCommerceProductVariants',
       variables: {
         after: page.orderCursor,
-        query: `updated_at:<='${page.windowEnd}' AND product_status:ACTIVE,ARCHIVED,DRAFT,UNLISTED`,
+        // Shopify's search values are case-sensitive lowercase even though
+        // ProductStatus values in the GraphQL response are uppercase.
+        query: `updated_at:<='${page.windowEnd}' AND product_status:active,archived,draft,unlisted`,
       },
     },
     { timeoutMs: SHOPIFY_GRAPHQL_TIMEOUT_MS },
@@ -1270,7 +1547,7 @@ async function shopifyProductEnvelope(
       orders: completeConnection([]),
     },
     shopDomain,
-  }, normalizationContext(runtime)), {
+  }, context), {
     rejections,
   })
   const normalizedVariants = normalized.products.reduce(
@@ -1331,6 +1608,10 @@ async function faireEnvelope(
         accessToken: credential.accessToken,
         timeoutMs: 15_000,
       }
+  exactFaireBrandIdentity(
+    await probeFaireBrandProfile(options),
+    runtime.externalAccountId,
+  )
   const providerPage = targetExternalOrderId
     ? {
         orders: [await getFaireOrder(options, targetExternalOrderId)],
@@ -1340,6 +1621,7 @@ async function faireEnvelope(
         limit: FAIRE_ORDER_PAGE_SIZE,
       })
   const orderNodes = faireCollection(providerPage, 'orders')
+  assertFaireRecordBrandScope(orderNodes, runtime.externalAccountId)
   const nextOrderCursor = targetExternalOrderId
     ? null
     : nextFaireCursor(providerPage, 'Faire orders', page.orderCursor)
@@ -1377,7 +1659,14 @@ async function faireProductEnvelope(
   runtime: CommerceRuntimeCredentialRecord,
   page: OperationalPageRequest,
   hydrateInventory = true,
+  targetExternalProductId: string | null = null,
 ): Promise<OperationalPageResult> {
+  // Faire has no catalog webhook cursor, so read-start time is the durable
+  // ordering fence for its bounded reconciliation snapshots.
+  const context = normalizationContext(
+    runtime,
+    targetExternalProductId ? 'current' : 'stale',
+  )
   const credential = decryptCommerceCredential(
     runtime.encrypted,
     runtime.organizationId,
@@ -1409,18 +1698,29 @@ async function faireProductEnvelope(
         accessToken: credential.accessToken,
         timeoutMs: 15_000,
       }
-  const providerPage = await listFaireProducts(options, {
-    cursor: page.orderCursor,
-    limit: FAIRE_PRODUCT_PAGE_SIZE,
-  })
-  const productNodes = faireCollection(providerPage, 'products')
-  const nextProductCursor = nextFaireCursor(
-    providerPage,
-    'Faire products',
-    page.orderCursor,
+  exactFaireBrandIdentity(
+    await probeFaireBrandProfile(options),
+    runtime.externalAccountId,
   )
+  const providerPage = targetExternalProductId
+    ? {
+        products: [await getFaireProduct(options, targetExternalProductId)],
+      }
+    : await listFaireProducts(options, {
+        cursor: page.orderCursor,
+        limit: FAIRE_PRODUCT_PAGE_SIZE,
+        ...(page.orderCursor ? {} : { includeDeleted: true }),
+      })
+  const productNodes = faireCollection(providerPage, 'products')
+  assertFaireRecordBrandScope(productNodes, runtime.externalAccountId)
+  const nextProductCursor = targetExternalProductId
+    ? null
+    : nextFaireCursor(
+        providerPage,
+        'Faire products',
+        page.orderCursor,
+      )
   const bounded = boundedFaireProducts(productNodes)
-  const context = normalizationContext(runtime, 'stale')
   const normalizedSource = {
     brand: { id: runtime.externalAccountId },
     orders: completedFairePage({ orders: [] }, 'orders', []),
@@ -1496,7 +1796,10 @@ async function fetchEnvelope(
   runtime: CommerceRuntimeCredentialRecord,
   page: OperationalPageRequest,
   targetExternalOrderId: string | null = null,
-  options: { hydrateProductInventory?: boolean } = {},
+  options: {
+    hydrateProductInventory?: boolean
+    targetExternalProductId?: string | null
+  } = {},
 ): Promise<OperationalPageResult> {
   return page.resource === 'products'
     ? runtime.provider === 'shopify'
@@ -1509,6 +1812,7 @@ async function fetchEnvelope(
           runtime,
           page,
           options.hydrateProductInventory !== false,
+          options.targetExternalProductId || null,
         )
     : runtime.provider === 'shopify'
       ? shopifyEnvelope(runtime, page, targetExternalOrderId)
@@ -1593,6 +1897,317 @@ async function withAutomaticProductCreation(
   }
 }
 
+function deterministicCustomerCommandUuid(parts: readonly string[]) {
+  const hex = createHash('sha256')
+    .update(parts.join('\0'))
+    .digest('hex')
+    .slice(0, 32)
+    .split('')
+  hex[12] = '5'
+  hex[16] = ['8', '9', 'a', 'b'][parseInt(hex[16], 16) % 4]
+  const value = hex.join('')
+  return [
+    value.slice(0, 8),
+    value.slice(8, 12),
+    value.slice(12, 16),
+    value.slice(16, 20),
+    value.slice(20),
+  ].join('-')
+}
+
+async function withAutomaticCustomerResolution(
+  command: Record<string, unknown>,
+  input: {
+    runtime: CommerceRuntimeCredentialRecord
+    actorEmail: string
+    action: IntakeCommandAction
+  },
+) {
+  if (
+    input.action !== 'fetch'
+    && input.action !== 'fetch-next'
+    && input.action !== 'refresh'
+    && input.action !== 'retry-rejection'
+  ) return command
+  const runGlobalId = typeof command.runGlobalId === 'string'
+    ? command.runGlobalId
+    : ''
+  if (!RUN_PATTERN.test(runGlobalId)) return command
+  const targets = await readAutomaticCommerceCustomerTargetsForRunInPostgres({
+    runtime: input.runtime,
+    runGlobalId,
+  })
+  let matched = 0
+  let created = 0
+  let ambiguous = 0
+  let skipped = 0
+  let failed = 0
+  const failedByCode: Record<string, number> = {}
+  for (const target of targets) {
+    if (!target.externalCustomerId || !target.companyName) {
+      skipped += 1
+      continue
+    }
+    try {
+      const resolution = await resolveCommerceCustomerInPostgres({
+        organizationId: input.runtime.organizationId,
+        integrationAccountGlobalId: input.runtime.globalId,
+        actorEmail: input.actorEmail,
+        identity: {
+          provider: target.provider,
+          externalCustomerId: target.externalCustomerId,
+          companyName: target.companyName,
+          email: target.email,
+          phone: target.phone,
+          address: target.address,
+          city: target.city,
+          region: target.region,
+          postalCode: target.postalCode,
+          country: target.country,
+        },
+      })
+      if (
+        resolution.status === 'ambiguous'
+        || resolution.method === 'ambiguous'
+        || !resolution.customer
+      ) {
+        ambiguous += 1
+        continue
+      }
+      await resolveCommerceCandidateCustomerInPostgres({
+        runtime: input.runtime,
+        actorEmail: input.actorEmail,
+        idempotencyKey: deterministicCustomerCommandUuid([
+          'commerce-intake-auto-customer-v1',
+          input.runtime.globalId,
+          runGlobalId,
+          target.candidateGlobalId,
+          resolution.customer.globalId,
+        ]),
+        candidateGlobalId: target.candidateGlobalId,
+        candidateRowVersion: target.candidateRowVersion,
+        customer: {
+          mode: 'existing',
+          customerGlobalId: resolution.customer.globalId,
+          resolutionMethod: resolution.method,
+        },
+      })
+      if (resolution.status === 'created') created += 1
+      else matched += 1
+    } catch (error) {
+      failed += 1
+      const code = error instanceof CommerceIntegrationRequestError
+        ? error.code
+        : 'COMMERCE_CUSTOMER_AUTO_RESOLUTION_FAILED'
+      failedByCode[code] = (failedByCode[code] || 0) + 1
+    }
+  }
+  return {
+    ...command,
+    automaticCustomerResolution: {
+      runGlobalId,
+      candidatesFound: targets.length,
+      matched,
+      created,
+      ambiguous,
+      skipped,
+      failed,
+      failedByCode,
+      providerWrites: 0,
+      syncCursorAdvanced: false,
+    },
+  }
+}
+
+function automaticFairePromotionFailureCode(error: unknown) {
+  const code = error instanceof CommerceIntegrationRequestError
+    ? error.code
+    : ''
+  return /^[A-Z][A-Z0-9_]{2,127}$/u.test(code)
+    ? code
+    : 'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_FAILED'
+}
+
+function automaticFaireCommandKey(parts: readonly string[]) {
+  return deterministicCustomerCommandUuid([
+    'commerce-faire-order-auto-promotion-v1',
+    ...parts,
+  ])
+}
+
+async function withAutomaticFaireOrderPromotion(
+  command: Record<string, unknown>,
+  input: {
+    runtime: CommerceRuntimeCredentialRecord
+    actorEmail: string
+    action: IntakeCommandAction
+  },
+) {
+  if (
+    input.runtime.provider !== 'faire'
+    || (
+      input.action !== 'fetch'
+      && input.action !== 'fetch-next'
+      && input.action !== 'refresh'
+      && input.action !== 'retry-rejection'
+    )
+  ) return command
+  const runGlobalId = typeof command.runGlobalId === 'string'
+    ? command.runGlobalId
+    : ''
+  if (!RUN_PATTERN.test(runGlobalId)) return command
+  let targets: Awaited<ReturnType<
+    typeof readAutomaticFaireOrderPromotionTargetsForRunInPostgres
+  >>
+  try {
+    targets = await readAutomaticFaireOrderPromotionTargetsForRunInPostgres({
+      runtime: input.runtime,
+      runGlobalId,
+    })
+  } catch {
+    return {
+      ...command,
+      automaticFaireOrderPromotion: {
+        policyVersion: 'commerce-faire-order-auto-promotion-v1',
+        runGlobalId,
+        candidatesFound: 0,
+        eligible: 0,
+        promoted: 0,
+        held: 0,
+        heldByReason: {},
+        failed: 1,
+        failedByCode: {
+          COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_SELECTION_FAILED: 1,
+        },
+        operatorReviewRequired: 1,
+        providerWrites: 0,
+        canonicalOrderWrites: 0,
+        inventoryWrites: 0,
+        syncCursorAdvanced: false,
+      },
+    }
+  }
+  let eligible = 0
+  let promoted = 0
+  let held = 0
+  let failed = 0
+  const heldByReason: Record<string, number> = {}
+  const failedByCode: Record<string, number> = {}
+  for (const target of targets) {
+    if (!target.eligible) {
+      held += 1
+      heldByReason[target.reason] = (heldByReason[target.reason] || 0) + 1
+      continue
+    }
+    eligible += 1
+    let rowVersion = target.candidateRowVersion
+    try {
+      if (target.providerAddress) {
+        const addressResult = await confirmCommerceCandidateAddressInPostgres({
+          runtime: input.runtime,
+          actorEmail: input.actorEmail,
+          idempotencyKey: automaticFaireCommandKey([
+            input.runtime.globalId,
+            runGlobalId,
+            target.candidateGlobalId,
+            String(rowVersion),
+            'provider-address',
+          ]),
+          candidateGlobalId: target.candidateGlobalId,
+          candidateRowVersion: rowVersion,
+          address: target.providerAddress,
+        }) as { rowVersion?: number }
+        rowVersion = Number(addressResult.rowVersion)
+      }
+      if (target.deliveryMode) {
+        const deliveryResult = await resolveCommerceCandidateDeliveryInPostgres({
+          runtime: input.runtime,
+          actorEmail: input.actorEmail,
+          idempotencyKey: automaticFaireCommandKey([
+            input.runtime.globalId,
+            runGlobalId,
+            target.candidateGlobalId,
+            String(rowVersion),
+            `delivery:${target.deliveryMode}`,
+          ]),
+          candidateGlobalId: target.candidateGlobalId,
+          candidateRowVersion: rowVersion,
+          decision: {
+            mode: target.deliveryMode,
+            requestedDeliveryAt: null,
+          },
+        }) as { rowVersion?: number }
+        rowVersion = Number(deliveryResult.rowVersion)
+      }
+      const validation = await validateCommerceCandidateInPostgres({
+        runtime: input.runtime,
+        actorEmail: input.actorEmail,
+        idempotencyKey: automaticFaireCommandKey([
+          input.runtime.globalId,
+          runGlobalId,
+          target.candidateGlobalId,
+          String(rowVersion),
+          'validate',
+        ]),
+        candidateGlobalId: target.candidateGlobalId,
+        candidateRowVersion: rowVersion,
+      }) as { ready?: boolean; rowVersion?: number }
+      rowVersion = Number(validation.rowVersion)
+      if (validation.ready !== true) {
+        held += 1
+        heldByReason.validation_blocked =
+          (heldByReason.validation_blocked || 0) + 1
+        continue
+      }
+      await promoteCommerceCandidateInPostgres({
+        runtime: input.runtime,
+        actorEmail: input.actorEmail,
+        idempotencyKey: automaticFaireCommandKey([
+          input.runtime.globalId,
+          runGlobalId,
+          target.candidateGlobalId,
+          String(rowVersion),
+          'promote',
+        ]),
+        candidateGlobalId: target.candidateGlobalId,
+        candidateRowVersion: rowVersion,
+        requestHash: requestHash({
+          policyVersion: 'commerce-faire-order-auto-promotion-v1',
+          accountGlobalId: input.runtime.globalId,
+          runGlobalId,
+          candidateGlobalId: target.candidateGlobalId,
+          candidateRowVersion: rowVersion,
+          providerWrites: 0,
+        }),
+      })
+      promoted += 1
+    } catch (error) {
+      failed += 1
+      const code = automaticFairePromotionFailureCode(error)
+      failedByCode[code] = (failedByCode[code] || 0) + 1
+    }
+  }
+  return {
+    ...command,
+    automaticFaireOrderPromotion: {
+      policyVersion: 'commerce-faire-order-auto-promotion-v1',
+      runGlobalId,
+      candidatesFound: targets.length,
+      eligible,
+      promoted,
+      held,
+      heldByReason,
+      failed,
+      failedByCode,
+      operatorReviewRequired: held + failed,
+      providerWrites: 0,
+      canonicalOrderWrites: promoted,
+      inventoryWrites: 0,
+      syncCursorAdvanced: false,
+    },
+  }
+}
+
 type ExecuteCommerceIntakeInput = {
   organizationId: unknown
   actorEmail: string
@@ -1612,6 +2227,73 @@ async function executeCommerceIntakeCommandInternal(
   assertCommerceIntakeRuntime()
   const commandAction = action(input.body.action)
   const key = idempotencyKey(input.body.idempotencyKey)
+  if (commandAction === 'reset-order-reconciliation') {
+    const organizationId = normalizeCommerceOrganizationId(
+      input.organizationId,
+    )
+    const accountGlobalId = normalizeCommerceAccountGlobalId(
+      input.body.accountGlobalId,
+    )
+    if (input.body.confirmResetOrderReconciliation !== true) {
+      throw new CommerceIntegrationRequestError(
+        'Confirm that the terminal order session will be retired before restarting',
+        400,
+        'COMMERCE_ORDER_RECONCILIATION_RESET_CONFIRMATION_REQUIRED',
+      )
+    }
+    const reason = optionalText(
+      input.body.orderReconciliationResetReason,
+      'Order reconciliation reset reason',
+      500,
+    )
+    if (!reason || reason.length < 10) {
+      throw new CommerceIntegrationRequestError(
+        'An order reconciliation reset reason of at least 10 characters is required',
+        400,
+        'COMMERCE_ORDER_RECONCILIATION_RESET_REASON_REQUIRED',
+      )
+    }
+    const expectedLastErrorCode = text(
+      input.body.expectedLastErrorCode,
+      'Expected order reconciliation error code',
+      128,
+    )
+    if (!/^[A-Z][A-Z0-9_]{2,127}$/u.test(expectedLastErrorCode)) {
+      throw new CommerceIntegrationRequestError(
+        'Expected order reconciliation error code is invalid',
+        400,
+        'COMMERCE_INTAKE_COMMAND_INVALID',
+      )
+    }
+    const expectedLastStartedAt = timestamp(
+      input.body.expectedLastStartedAt,
+      'Expected order reconciliation start time',
+    )
+    const command = await resetCommerceOrderReconciliationInPostgres({
+      organizationId,
+      accountGlobalId,
+      actorEmail: input.actorEmail,
+      idempotencyKey: key,
+      expectedLastErrorCode,
+      expectedLastStartedAt,
+      reason,
+      confirmReset: true,
+    })
+    const [intake, orderReconciliation] = await Promise.all([
+      readCommerceIntakeStateFromPostgres({
+        organizationId,
+        accountGlobalId,
+      }).catch(() => null),
+      readCommerceOrderReconciliationStateInPostgres({
+        organizationId,
+        accountGlobalId,
+      }).catch(() => null),
+    ])
+    return {
+      command,
+      intake: intake ? { ...intake, orderReconciliation } : null,
+    }
+  }
   if (commandAction === 'set-product-intake-policy') {
     const organizationId = normalizeCommerceOrganizationId(
       input.organizationId,
@@ -1641,6 +2323,33 @@ async function executeCommerceIntakeCommandInternal(
         'COMMERCE_PRODUCT_AUTO_CREATE_CONFIRMATION_REQUIRED',
       )
     }
+    const catalogSyncResetRequested = (
+      input.body.confirmCatalogSyncReset === true
+      || input.body.catalogSyncResetReason !== undefined
+    )
+    let catalogSyncResetReason: string | null = null
+    if (catalogSyncResetRequested) {
+      if (input.body.confirmCatalogSyncReset !== true) {
+        throw new CommerceIntegrationRequestError(
+          'Confirm that the terminal catalog evidence will be preserved and a fresh root reconciliation will start',
+          400,
+          'COMMERCE_CATALOG_SYNC_RESET_CONFIRMATION_REQUIRED',
+        )
+      }
+      const resetReason = optionalText(
+        input.body.catalogSyncResetReason,
+        'Catalog sync reset reason',
+        500,
+      )
+      if (!resetReason || resetReason.length < 10) {
+        throw new CommerceIntegrationRequestError(
+          'A catalog sync reset reason of at least 10 characters is required',
+          400,
+          'COMMERCE_CATALOG_SYNC_RESET_REASON_REQUIRED',
+        )
+      }
+      catalogSyncResetReason = resetReason
+    }
     const command = await updateCommerceProductIntakePolicyInPostgres({
       organizationId,
       accountGlobalId,
@@ -1652,6 +2361,9 @@ async function executeCommerceIntakeCommandInternal(
       unmatchedAction: unmatchedAction as 'review' | 'auto_create',
       confirmAutoCreateProducts:
         input.body.confirmAutoCreateProducts === true,
+      confirmCatalogSyncReset:
+        input.body.confirmCatalogSyncReset === true,
+      catalogSyncResetReason,
     })
     const intake = await readCommerceIntakeStateFromPostgres({
       organizationId,
@@ -1667,6 +2379,49 @@ async function executeCommerceIntakeCommandInternal(
     runtime,
     actorEmail: input.actorEmail,
     idempotencyKey: key,
+  }
+
+  if (
+    commandAction === 'plan-customer-binding'
+    || commandAction === 'confirm-customer-binding'
+  ) {
+    const externalCustomerId = faireRetailerId(
+      input.body.externalCustomerId,
+    )
+    const customerGlobalId = globalId(
+      input.body.customerGlobalId,
+      CUSTOMER_PATTERN,
+      'Customer Global ID',
+    )
+    const evidenceEmail = customerEvidenceEmail(
+      input.body.evidenceEmail,
+    )
+    const command = commandAction === 'plan-customer-binding'
+      ? await planCommerceCustomerPrefetchBindingInPostgres({
+          runtime,
+          externalCustomerId,
+          customerGlobalId,
+          evidenceEmail,
+        })
+      : await confirmCommerceCustomerPrefetchBindingInPostgres({
+          runtime,
+          actorEmail: input.actorEmail,
+          externalCustomerId,
+          customerGlobalId,
+          evidenceEmail,
+          planHash: sha256Hash(
+            input.body.bindingPlanHash,
+            'Customer binding plan hash',
+          ),
+          confirmed: input.body.confirmCustomerBinding === true,
+        })
+    return {
+      command,
+      intake: await readCommerceIntakeStateFromPostgres({
+        organizationId: runtime.organizationId,
+        accountGlobalId: runtime.globalId,
+      }),
+    }
   }
 
   if (
@@ -1690,6 +2445,34 @@ async function executeCommerceIntakeCommandInternal(
     )
       ? 'products'
       : 'orders'
+    const exactExternalOrderId = input.body.externalOrderId === undefined
+      ? null
+      : commandAction === 'fetch' && runtime.provider === 'faire'
+        ? faireOrderId(input.body.externalOrderId)
+        : (() => {
+            throw new CommerceIntegrationRequestError(
+              'Exact order discovery is available only for a root Faire order fetch',
+              400,
+              'COMMERCE_INTAKE_EXACT_ORDER_ACTION_INVALID',
+            )
+          })()
+    const exactExternalOrderIdHash = exactExternalOrderId
+      ? requestHash(exactExternalOrderId)
+      : null
+    const exactExternalProductId = input.body.externalProductId === undefined
+      ? null
+      : commandAction === 'fetch-products' && runtime.provider === 'faire'
+        ? faireProductId(input.body.externalProductId)
+        : (() => {
+            throw new CommerceIntegrationRequestError(
+              'Exact product discovery is available only for a root Faire product fetch',
+              400,
+              'COMMERCE_INTAKE_EXACT_PRODUCT_ACTION_INVALID',
+            )
+          })()
+    const exactExternalProductIdHash = exactExternalProductId
+      ? requestHash(exactExternalProductId)
+      : null
     const refreshCandidateGlobalId = commandAction === 'refresh'
       ? globalId(
         input.body.candidateGlobalId,
@@ -1739,10 +2522,32 @@ async function executeCommerceIntakeCommandInternal(
       idempotencyKey: key,
       action: commandAction,
       target: replayTarget,
+      ...(commandAction === 'fetch'
+        ? { exactExternalOrderIdHash }
+        : {}),
+      ...(commandAction === 'fetch-products'
+        ? { exactExternalProductIdHash }
+        : {}),
     })
     if (replay) {
-      const command = await withAutomaticProductCreation(
+      const commandWithProducts = await withAutomaticProductCreation(
         replay as Record<string, unknown>,
+        {
+          runtime,
+          actorEmail: input.actorEmail,
+          action: commandAction,
+        },
+      )
+      const commandWithCustomers = await withAutomaticCustomerResolution(
+        commandWithProducts,
+        {
+          runtime,
+          actorEmail: input.actorEmail,
+          action: commandAction,
+        },
+      )
+      const command = await withAutomaticFaireOrderPromotion(
+        commandWithCustomers,
         {
           runtime,
           actorEmail: input.actorEmail,
@@ -1812,9 +2617,14 @@ async function executeCommerceIntakeCommandInternal(
         action: intentAction,
         resource,
         target,
+        exactExternalOrderIdHash,
+        exactExternalProductIdHash,
         continuationRunGlobalId,
         pageSize: (
-          refreshTarget || rejectionTarget
+          exactExternalOrderId
+          || exactExternalProductId
+          || refreshTarget
+          || rejectionTarget
             ? 1
             : resource === 'products'
               ? runtime.provider === 'shopify'
@@ -1855,10 +2665,11 @@ async function executeCommerceIntakeCommandInternal(
       }
       throw error
     }
-    const targetExternalOrderId = refreshTarget?.external_order_id
+    const targetExternalOrderId = exactExternalOrderId
+      || refreshTarget?.external_order_id
       || rejectionTarget?.external_id
       || null
-    const pageSize = targetExternalOrderId
+    const pageSize = targetExternalOrderId || exactExternalProductId
       ? 1
       : resource === 'products'
         ? runtime.provider === 'shopify'
@@ -1875,13 +2686,15 @@ async function executeCommerceIntakeCommandInternal(
       batchNumber: page.batchNumber,
       continuationPresent: Boolean(page.orderCursor),
       continuationCursorHash: page.cursorHash,
-      targetedRead: Boolean(targetExternalOrderId),
-      targetHash: targetExternalOrderId
-        ? requestHash(targetExternalOrderId)
+      targetedRead: Boolean(
+        targetExternalOrderId || exactExternalProductId,
+      ),
+      targetHash: targetExternalOrderId || exactExternalProductId
+        ? requestHash(targetExternalOrderId || exactExternalProductId)
         : null,
       pageSize,
       productsFetched: page.resource === 'products',
-      oneRootPage: !targetExternalOrderId,
+      oneRootPage: !targetExternalOrderId && !exactExternalProductId,
       readOnly: true,
       providerWrites: 0,
       syncCursorAdvanced: false,
@@ -1915,6 +2728,7 @@ async function executeCommerceIntakeCommandInternal(
           targetExternalOrderId,
           {
             hydrateProductInventory: options.hydrateProductInventory,
+            targetExternalProductId: exactExternalProductId,
           },
         )
         const normalizedVariants = result.envelope.products.reduce(
@@ -1976,6 +2790,12 @@ async function executeCommerceIntakeCommandInternal(
       retryRejectionGlobalId,
       readIntentId,
       capturedResponseHash: captured.responseHash,
+      ...(commandAction === 'fetch'
+        ? { exactExternalOrderIdHash }
+        : {}),
+      ...(commandAction === 'fetch-products'
+        ? { exactExternalProductIdHash }
+        : {}),
     })
     const commandWithAutomaticCreation = await withAutomaticProductCreation(
       command as Record<string, unknown>,
@@ -1985,8 +2805,26 @@ async function executeCommerceIntakeCommandInternal(
         action: commandAction,
       },
     )
+    const commandWithAutomaticResolution =
+      await withAutomaticCustomerResolution(
+        commandWithAutomaticCreation,
+        {
+          runtime,
+          actorEmail: input.actorEmail,
+          action: commandAction,
+        },
+      )
+    const commandWithAutomaticPromotion =
+      await withAutomaticFaireOrderPromotion(
+        commandWithAutomaticResolution,
+        {
+          runtime,
+          actorEmail: input.actorEmail,
+          action: commandAction,
+        },
+      )
     return {
-      command: commandWithAutomaticCreation,
+      command: commandWithAutomaticPromotion,
       intake: options.includeIntakeState
         ? await readCommerceIntakeStateFromPostgres({
             organizationId: runtime.organizationId,
@@ -2202,22 +3040,88 @@ async function executeCommerceIntakeCommandInternal(
   } else if (commandAction === 'resolve-package') {
     const packageInput = record(input.body.package)
     const mode = text(packageInput.mode, 'Package resolution mode', 20)
-    if (mode !== 'profile' && mode !== 'manual') {
+    if (
+      mode !== 'profile'
+      && mode !== 'manual'
+      && mode !== 'variant_mapping'
+    ) {
       throw new CommerceIntegrationRequestError(
-        'Package resolution mode must be profile or manual',
+        'Package resolution mode must be profile, mapped variant, or manual',
         400,
         'COMMERCE_INTAKE_COMMAND_INVALID',
+      )
+    }
+    const lineGlobalId = globalId(
+      input.body.lineGlobalId,
+      LINE_PATTERN,
+      'Candidate line Global ID',
+    )
+    const variantMappingPackage = mode === 'variant_mapping'
+      ? {
+          mode,
+          externalProductId: faireProductId(
+            packageInput.externalProductId,
+          ),
+          externalVariantId: faireVariantId(
+            packageInput.externalVariantId,
+          ),
+          packProfileVersionGlobalId: globalId(
+            packageInput.packProfileVersionGlobalId,
+            PACK_PROFILE_VERSION_PATTERN,
+            'Product pack version Global ID',
+          ),
+          expectedPackProfileVersionRowVersion: rowVersion(
+            packageInput.expectedPackProfileVersionRowVersion,
+          ),
+        } as const
+      : null
+    let exactProductReadEvidence: ReturnType<
+      typeof exactProductPackReadEvidence
+    > | null = null
+    if (variantMappingPackage) {
+      if (runtime.provider !== 'faire') {
+        throw new CommerceIntegrationRequestError(
+          'Order-evidence pack binding is currently available only for Faire',
+          409,
+          'COMMERCE_INTAKE_VARIANT_PACK_PROVIDER_INVALID',
+        )
+      }
+      if (packageInput.confirmExactProductRead !== true) {
+        throw new CommerceIntegrationRequestError(
+          'Confirm the exact read-only Faire product fetch before binding its pack',
+          400,
+          'COMMERCE_INTAKE_READ_CONFIRMATION_REQUIRED',
+        )
+      }
+      const exactProductRead = await executeCommerceIntakeCommandInternal({
+        organizationId: runtime.organizationId,
+        actorEmail: input.actorEmail,
+        body: {
+          accountGlobalId: runtime.globalId,
+          action: 'fetch-products',
+          idempotencyKey: deterministicCustomerCommandUuid([
+            'commerce-intake-exact-product-pack-v1',
+            runtime.globalId,
+            key,
+          ]),
+          confirmReadOnly: true,
+          externalProductId: variantMappingPackage.externalProductId,
+        },
+      }, {
+        includeIntakeState: false,
+        hydrateProductInventory: options.hydrateProductInventory,
+        providerAttemptActorEmail: options.providerAttemptActorEmail,
+      })
+      exactProductReadEvidence = exactProductPackReadEvidence(
+        exactProductRead.command as Record<string, unknown>,
+        variantMappingPackage,
       )
     }
     command = await resolveCommerceCandidatePackageInPostgres({
       ...shared,
       candidateGlobalId,
       candidateRowVersion: version,
-      lineGlobalId: globalId(
-        input.body.lineGlobalId,
-        LINE_PATTERN,
-        'Candidate line Global ID',
-      ),
+      lineGlobalId,
       package: mode === 'profile'
         ? {
             mode,
@@ -2227,8 +3131,13 @@ async function executeCommerceIntakeCommandInternal(
               'Package profile Global ID',
             ),
           } as const
-        : {
-            mode,
+        : variantMappingPackage && exactProductReadEvidence
+          ? {
+              ...variantMappingPackage,
+              exactProductReadEvidence,
+            }
+          : {
+            mode: 'manual',
             weightGrams: positiveInteger(
               packageInput.weightGrams,
               'Package weight',
@@ -2269,6 +3178,13 @@ async function executeCommerceIntakeCommandInternal(
         providerWrites: 0,
       }),
     })
+  } else if (commandAction === 'reconcile-checkout-rate') {
+    command =
+      await reconcilePromotedCommerceCandidateCheckoutRateInPostgres({
+        ...shared,
+        candidateGlobalId,
+        candidateRowVersion: version,
+      })
   }
 
   return {

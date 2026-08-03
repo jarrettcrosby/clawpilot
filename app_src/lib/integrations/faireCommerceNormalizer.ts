@@ -18,6 +18,7 @@ import {
   createCommerceNormalizationRejection,
   freezeCommerceEnvelope,
   integerCommerceMinorUnits,
+  normalizeCommerceProductImageSet,
   normalizeCommerceCurrency,
   nonnegativeCommerceInteger,
   optionalCommerceText,
@@ -40,16 +41,20 @@ import {
   type CommerceNormalizedProduct,
   type CommerceNormalizedVariant,
   type CommercePartySnapshot,
+  type CommerceProviderTaxonomy,
   type CommerceProviderStates,
+  type CommerceProductImageCandidate,
   type ReadOnlyCommerceNormalizationAdapter,
 } from '@/lib/operations/commerceNormalization'
 
 export const FAIRE_COMMERCE_NORMALIZER_VERSION =
-  'faire-commerce-normalizer-v3' as const
+  'faire-commerce-normalizer-v7' as const
 
 type FaireSource = Readonly<Record<string, unknown>>
 
 const FAIRE_ID = /^[^\u0000-\u001f\u007f]{1,512}$/
+const FAIRE_CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/
+const FAIRE_MAX_PRODUCT_IMAGES = 20
 
 function faireIdentity(
   value: unknown,
@@ -92,6 +97,31 @@ function optionalBoolean(value: unknown): boolean | null {
   return typeof value === 'boolean' ? value : null
 }
 
+function faireSemanticTextInput(value: unknown): unknown {
+  return typeof value === 'string' && !FAIRE_CONTROL_CHARACTER.test(value)
+    ? value.trim()
+    : value
+}
+
+function optionalFaireSemanticText(
+  value: unknown,
+  maximum = 4_096,
+): string | null {
+  return optionalCommerceText(faireSemanticTextInput(value), maximum)
+}
+
+function requiredFaireSemanticText(
+  value: unknown,
+  label: string,
+  maximum = 512,
+): string {
+  return requiredCommerceText(
+    faireSemanticTextInput(value),
+    label,
+    maximum,
+  )
+}
+
 function selectedOptions(value: unknown) {
   if (value === null || value === undefined) return Object.freeze([])
   if (!Array.isArray(value) || value.length > 25) {
@@ -103,12 +133,12 @@ function selectedOptions(value: unknown) {
       throw new Error('Faire returned an invalid selected product option')
     }
     return Object.freeze({
-      name: requiredCommerceText(
+      name: requiredFaireSemanticText(
         record.name ?? record.option_name,
         'Faire selected option name',
         255,
       ),
-      value: requiredCommerceText(
+      value: requiredFaireSemanticText(
         record.value ?? record.option_value,
         'Faire selected option value',
         512,
@@ -155,7 +185,7 @@ function faireMeasurements(
       weightGrams: null,
     }
   }
-  const massUnit = optionalCommerceText(measurement.mass_unit, 32)
+  const massUnit = optionalFaireSemanticText(measurement.mass_unit, 32)
     ?.toUpperCase()
   const massMultipliers: Record<string, number> = {
     GRAMS: 1,
@@ -163,7 +193,7 @@ function faireMeasurements(
     OUNCES: 28.349523125,
     POUNDS: 453.59237,
   }
-  const distanceUnit = optionalCommerceText(measurement.distance_unit, 32)
+  const distanceUnit = optionalFaireSemanticText(measurement.distance_unit, 32)
     ?.toUpperCase()
   const distanceMultipliers: Record<string, number> = {
     MILLIMETERS: 1,
@@ -571,7 +601,7 @@ function faireInventoryQuantity(
   if (entry) {
     const available = asCommerceRecord(entry.available_quantity)
     if (!available) return unavailableCommerceField()
-    const type = optionalCommerceText(available.type, 64)?.toUpperCase()
+    const type = optionalFaireSemanticText(available.type, 64)?.toUpperCase()
     if (type === 'UNTRACKED') return unavailableCommerceField('untracked')
     const quantity = Number.isSafeInteger(available.quantity)
       ? Number(available.quantity)
@@ -603,9 +633,104 @@ function faireInventoryQuantity(
   return unavailableCommerceField()
 }
 
+function faireProductImages(product: Record<string, unknown>) {
+  if (!Array.isArray(product.images)) {
+    return Object.freeze({
+      images: Object.freeze([]),
+      imageSetComplete: false,
+    })
+  }
+  const candidates: CommerceProductImageCandidate[] = []
+  let invalidRecords = 0
+  for (const [sourceIndex, source] of product.images
+    .slice(0, FAIRE_MAX_PRODUCT_IMAGES)
+    .entries()) {
+    if (typeof source === 'string') {
+      candidates.push({
+        providerImageId: null,
+        locatorUrl: source,
+        providerSequence: sourceIndex,
+        sourceIndex,
+        altText: null,
+        widthPixels: null,
+        heightPixels: null,
+      })
+      continue
+    }
+    const image = asCommerceRecord(source)
+    if (!image) {
+      invalidRecords += 1
+      continue
+    }
+    const providerImageId = image.id ?? image.image_id ?? image.imageId
+    if (
+      providerImageId !== undefined
+      && providerImageId !== null
+      && providerImageId !== ''
+      && (
+        typeof providerImageId !== 'string'
+        || providerImageId !== providerImageId.trim()
+        || !FAIRE_ID.test(providerImageId)
+      )
+    ) {
+      invalidRecords += 1
+      continue
+    }
+    const providerSequence = image.sequence ?? image.position
+    if (
+      providerSequence !== undefined
+      && providerSequence !== null
+      && (
+        !Number.isSafeInteger(providerSequence)
+        || Number(providerSequence) < 0
+      )
+    ) {
+      invalidRecords += 1
+      continue
+    }
+    candidates.push({
+      providerImageId,
+      locatorUrl: image.url ?? image.image_url ?? image.imageUrl,
+      providerSequence: providerSequence ?? sourceIndex,
+      sourceIndex,
+      altText: optionalFaireSemanticText(
+        image.alt_text ?? image.altText ?? image.alt,
+        2_000,
+      ),
+      widthPixels: image.width ?? image.width_pixels ?? image.widthPixels,
+      heightPixels: image.height ?? image.height_pixels ?? image.heightPixels,
+    })
+  }
+  const normalized = normalizeCommerceProductImageSet(
+    candidates,
+    FAIRE_MAX_PRODUCT_IMAGES,
+  )
+  return Object.freeze({
+    images: normalized.images,
+    imageSetComplete: product.images.length <= FAIRE_MAX_PRODUCT_IMAGES
+      && invalidRecords === 0
+      && normalized.rejectedCount === 0,
+  })
+}
+
+function faireProductSourceEvidence(
+  product: Record<string, unknown>,
+  images: ReturnType<typeof faireProductImages>['images'],
+  imageSetComplete: boolean,
+) {
+  const productEvidence = { ...product }
+  delete productEvidence.images
+  return Object.freeze({
+    ...productEvidence,
+    imageSetComplete,
+    images,
+  })
+}
+
 function normalizeVariant(
   source: unknown,
   product: Record<string, unknown>,
+  productSourceEvidence: Record<string, unknown>,
   productIdentity: CommerceExternalIdentity,
   inventories: Record<string, unknown>,
   currency: string,
@@ -675,13 +800,14 @@ function normalizeVariant(
         ?? inventory?.inventory_id,
       'inventory_item',
     ),
-    // Faire SKUs are case-sensitive matching evidence and stay byte-for-byte.
-    sku: optionalCommerceText(variant.sku, 255),
+    // Faire SKUs remain case-sensitive after harmless boundary whitespace is
+    // removed from the provider's semantic display value.
+    sku: optionalFaireSemanticText(variant.sku, 255),
     barcode: optionalCommerceText(
       variant.gtin ?? variant.barcode ?? variant.upc,
       255,
     ),
-    title: optionalCommerceText(
+    title: optionalFaireSemanticText(
       variant.name ?? variant.title ?? variant.option_name,
       512,
     ),
@@ -726,7 +852,7 @@ function normalizeVariant(
     ),
     sourceHash: commerceSourceHash(Object.freeze({
       inventory,
-      product,
+      product: productSourceEvidence,
       variant,
     })),
   })
@@ -742,6 +868,29 @@ function normalizeProduct(
   const product = asCommerceRecord(source)
   if (!product) throw new Error('Faire returned an invalid product')
   const identity = faireIdentity(product.id ?? product.product_id, 'product')
+  const rawLifecycleState = optionalFaireSemanticText(
+    product.lifecycle_state ?? product.state,
+    64,
+  )
+  const authoritativelyDeleted = (
+    product.deleted === true
+    || rawLifecycleState?.toUpperCase() === 'DELETED'
+  )
+  // Faire's include_deleted catalog response is authoritative lifecycle
+  // evidence. A deleted listing is therefore a complete-empty image set even
+  // when the provider retains stale image fields or omits the collection.
+  const imageSet = authoritativelyDeleted
+    ? Object.freeze({
+        images: Object.freeze([]),
+        imageSetComplete: true,
+      })
+    : faireProductImages(product)
+  const { images, imageSetComplete } = imageSet
+  const productSourceEvidence = faireProductSourceEvidence(
+    product,
+    images,
+    imageSetComplete,
+  )
   const currency = recordCurrency(product, currencyFallback)
   const rawPreferredPriceCurrency = (
     product.currency
@@ -755,23 +904,50 @@ function normalizeProduct(
   const variants = productVariants(product).map((variant) => normalizeVariant(
     variant,
     product,
+    productSourceEvidence,
     identity,
     inventories,
     currency,
     preferredPriceCurrency,
   ))
-  const lifecycleState = optionalCommerceText(
-    product.lifecycle_state ?? product.sale_state ?? product.state,
-    64,
-  )
+  const lifecycleState = authoritativelyDeleted
+    ? 'DELETED'
+    : rawLifecycleState
+  const saleState = optionalFaireSemanticText(product.sale_state, 64)
   const taxonomyType = asCommerceRecord(product.taxonomy_type)
-  const active = typeof product.active === 'boolean'
-    ? product.active
-    : typeof product.deleted === 'boolean'
-      ? !product.deleted
-      : lifecycleState === null
-        ? null
-        : ['ACTIVE', 'PUBLISHED'].includes(lifecycleState.toUpperCase())
+  const taxonomyId = optionalCommerceText(taxonomyType?.id, 512)
+  const taxonomyName = optionalFaireSemanticText(taxonomyType?.name, 512)
+  const providerTaxonomy = taxonomyId || taxonomyName
+    ? availableCommerceField(Object.freeze({
+        scheme: 'faire_product_type',
+        externalId: taxonomyId,
+        name: taxonomyName,
+        fullName: taxonomyName,
+        marketplacePaths: Object.freeze(
+          taxonomyName ? [taxonomyName] : [],
+        ),
+      }) satisfies CommerceProviderTaxonomy)
+    : unavailableCommerceField<CommerceProviderTaxonomy>('not_provided')
+  const normalizedLifecycle = lifecycleState?.toUpperCase() ?? null
+  const normalizedSaleState = saleState?.toUpperCase() ?? null
+  const inactiveLifecycle = normalizedLifecycle !== null && [
+    'DELETED',
+    'DRAFT',
+    'UNPUBLISHED',
+  ].includes(normalizedLifecycle)
+  const active = authoritativelyDeleted
+    || inactiveLifecycle
+    || normalizedSaleState === 'SALES_PAUSED'
+    || product.active === false
+    ? false
+    : product.active === true
+      || normalizedLifecycle === 'PUBLISHED'
+      || (
+        normalizedLifecycle === null
+        && normalizedSaleState === 'FOR_SALE'
+      )
+      ? true
+      : null
   return Object.freeze({
     schemaVersion: COMMERCE_NORMALIZED_PRODUCT_VERSION,
     identity,
@@ -779,20 +955,20 @@ function normalizeProduct(
       product.brand_id ?? brandFallback,
       'brand',
     ),
-    title: requiredCommerceText(
+    title: requiredFaireSemanticText(
       product.name ?? product.title,
       'Faire product title',
       500,
     ),
-    description: optionalCommerceText(
+    description: optionalFaireSemanticText(
       product.description ?? product.short_description,
       20_000,
     ),
-    vendor: optionalCommerceText(
+    vendor: optionalFaireSemanticText(
       product.brand_name ?? product.vendor ?? product.maker_name,
       512,
     ),
-    productType: optionalCommerceText(
+    productType: optionalFaireSemanticText(
       taxonomyType?.name
         ?? taxonomyType?.id
         ?? product.product_type
@@ -800,12 +976,16 @@ function normalizeProduct(
         ?? product.category,
       512,
     ),
+    providerTaxonomy,
     lifecycleState,
+    saleState,
     active,
     providerCreatedAt: optionalCommerceTimestamp(product.created_at),
     providerUpdatedAt: optionalCommerceTimestamp(product.updated_at),
+    imageSetComplete,
+    images,
     variants: Object.freeze(variants),
-    sourceHash: commerceSourceHash(source),
+    sourceHash: commerceSourceHash(productSourceEvidence),
   })
 }
 
@@ -823,11 +1003,11 @@ function partySnapshot(
   const retailer = asCommerceRecord(order.retailer)
   const retailerId = order.retailer_id ?? retailer?.id
   if (!customer && !retailer && !retailerId) return unavailableCommerceField()
-  const firstName = optionalCommerceText(
+  const firstName = optionalFaireSemanticText(
     customer?.first_name ?? retailer?.first_name,
     255,
   )
-  const lastName = optionalCommerceText(
+  const lastName = optionalFaireSemanticText(
     customer?.last_name ?? retailer?.last_name,
     255,
   )
@@ -903,19 +1083,19 @@ function normalizedStates(
   raw: CommerceProviderStates
   canonical: CommerceCanonicalStates
 }> {
-  const rawLifecycle = optionalCommerceText(
+  const rawLifecycle = optionalFaireSemanticText(
     order.state ?? order.status,
     64,
   )
-  const rawPayment = optionalCommerceText(
+  const rawPayment = optionalFaireSemanticText(
     order.payment_state ?? order.financial_status,
     64,
   )
-  const rawFulfillment = optionalCommerceText(
+  const rawFulfillment = optionalFaireSemanticText(
     order.fulfillment_state ?? order.state,
     64,
   )
-  const rawReturns = optionalCommerceText(order.return_state, 64)
+  const rawReturns = optionalFaireSemanticText(order.return_state, 64)
   const state = (rawLifecycle || '').toUpperCase()
   return Object.freeze({
     raw: Object.freeze({
@@ -1055,17 +1235,17 @@ function normalizeLine(
     identity,
     productIdentity,
     variantIdentity,
-    sku: optionalCommerceText(line.sku, 255),
-    titleSnapshot: requiredCommerceText(
+    sku: optionalFaireSemanticText(line.sku, 255),
+    titleSnapshot: requiredFaireSemanticText(
       line.product_name ?? line.name ?? line.title,
       'Faire order-line title',
       512,
     ),
-    variantTitleSnapshot: optionalCommerceText(
+    variantTitleSnapshot: optionalFaireSemanticText(
       line.variant_name ?? line.option_name,
       512,
     ),
-    vendorSnapshot: optionalCommerceText(
+    vendorSnapshot: optionalFaireSemanticText(
       line.brand_name ?? line.vendor,
       512,
     ),
@@ -1253,7 +1433,7 @@ function normalizeOrder(
     explicitTotal,
     exactOrderTotal(subtotal, discount, shipping, tax),
   )
-  const headerMoney = commerceOrderHeaderMoneyState({
+  const brandSideHeaderMoney = commerceOrderHeaderMoneyState({
     currency,
     subtotal,
     shipping,
@@ -1261,10 +1441,18 @@ function normalizeOrder(
     discount,
     total,
   })
+  // Faire's brand-order API exposes brand discounts and settlement/payout
+  // facts, but not retailer-funded credits or the retailer's tender charge.
+  // Complete brand-side arithmetic therefore must never be promoted as exact
+  // customer-charge evidence.
+  const headerMoney = Object.freeze({
+    ...brandSideHeaderMoney,
+    customerChargeEligible: false,
+  })
   return Object.freeze({
     schemaVersion: COMMERCE_NORMALIZED_ORDER_VERSION,
     identity,
-    orderNumber: requiredCommerceText(
+    orderNumber: requiredFaireSemanticText(
       order.display_id ?? order.order_number ?? order.id,
       'Faire order number',
       255,
@@ -1303,7 +1491,7 @@ function normalizeOrder(
       retailerIdentity: optionalFaireIdentity(retailerId, 'retailer'),
       brandDiscount,
       lineDiscountTotal: lineDiscounts,
-      payoutState: optionalCommerceText(
+      payoutState: optionalFaireSemanticText(
         payout?.state ?? payout?.status,
         64,
       ),

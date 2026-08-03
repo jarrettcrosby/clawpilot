@@ -1,0 +1,713 @@
+#!/usr/bin/env node
+import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
+import { createRequire } from 'node:module'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import vm from 'node:vm'
+
+const root = process.cwd()
+const nodeRequire = createRequire(import.meta.url)
+const requireFromApp = createRequire(
+  new URL('../app_src/package.json', import.meta.url),
+)
+const ts = requireFromApp('typescript')
+
+function read(path) {
+  return readFileSync(resolve(root, path), 'utf8')
+}
+
+function includes(source, fragments, label) {
+  for (const fragment of fragments) {
+    assert.ok(source.includes(fragment), `${label} is missing ${fragment}`)
+  }
+}
+
+function canonical(value) {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonical).join(',')}]`
+  }
+  return `{${Object.keys(value).sort().map((key) => (
+    `${JSON.stringify(key)}:${canonical(value[key])}`
+  )).join(',')}}`
+}
+
+function hash(value) {
+  return createHash('sha256').update(canonical(value)).digest('hex')
+}
+
+function loadPersistence() {
+  const path =
+    'app_src/lib/persistence/shopifyCarrierServiceMutationAuthorization.ts'
+  const output = ts.transpileModule(read(path), {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+    fileName: path,
+  }).outputText
+  const module = { exports: {} }
+  vm.runInNewContext(output, {
+    Array,
+    Boolean,
+    Buffer,
+    Date,
+    Error,
+    Map,
+    Math,
+    Number,
+    Object,
+    Promise,
+    RegExp,
+    Set,
+    String,
+    console,
+    exports: module.exports,
+    module,
+    process,
+    require(specifier) {
+      if (specifier === '@/lib/auditWriter') {
+        return { recordAuditEvent: async () => {} }
+      }
+      if (
+        specifier ===
+        '@/lib/persistence/commerceExternalEffects'
+      ) {
+        return {
+          assertRedactedCommerceExternalEffectEvidence: () => {},
+          commerceExternalEffectHash: hash,
+        }
+      }
+      if (specifier === '@/lib/persistence/postgres') {
+        return {
+          acquireTransactionAdvisoryLock: async () => {},
+          query: async () => {
+            throw new Error('database must not be reached by pure tests')
+          },
+          withTransaction: async () => {
+            throw new Error('database must not be reached by pure tests')
+          },
+        }
+      }
+      return nodeRequire(specifier)
+    },
+  }, { filename: path })
+  return module.exports
+}
+
+const migration = read(
+  'db/migrations/0150_operations_shopify_carrier_service_mutation_authorization.sql',
+)
+const activeMigration = read(
+  'db/migrations/0156_operations_shopify_carrier_service_active_authorization.sql',
+)
+const receiptAuthorityMigration = read(
+  'db/migrations/0159_operations_shopify_receipt_and_carrier_authority.sql',
+)
+const nameAlignmentMigration = read(
+  'db/migrations/0166_shopify_carrier_service_name_alignment.sql',
+)
+const persistenceSource = read(
+  'app_src/lib/persistence/shopifyCarrierServiceMutationAuthorization.ts',
+)
+const setupPersistenceSource = read(
+  'app_src/lib/persistence/shopifyCheckoutRating.ts',
+)
+const setupRouteSource = read(
+  'app_src/app/api/integrations/commerce/shopify/carrier-service/route.ts',
+)
+
+includes(migration, [
+  'operations_shopify_carrier_service_mutation_authorizations',
+  'operations_shopify_carrier_service_mutation_attempts',
+  'operations_shopify_carrier_service_mutation_outcomes',
+  'operations_shopify_carrier_service_mutation_resolutions',
+  'redacted_evidence jsonb NOT NULL',
+  'ops_shopify_cs_mut_resolution_redacted',
+  'operations_shopify_carrier_service_config_mutation_links',
+  "operation IN ('create', 'delete')",
+  "account_environment IN ('sandbox', 'production')",
+  "NEW.operation = 'create'",
+  "NEW.account_environment IS DISTINCT FROM 'sandbox'",
+  'production is limited to exact delete reconciliation',
+  "activation_state = 'shadow'",
+  'credential_generation integer NOT NULL',
+  'config_row_version bigint NOT NULL',
+  'activation_revision integer NOT NULL',
+  'aggregate_hash text NOT NULL',
+  'request_hash text NOT NULL',
+  'confirmation_hash text NOT NULL',
+  'authorization_fence_hash text GENERATED ALWAYS AS',
+  "expires_at <= authorized_at + interval '5 minutes'",
+  'UNIQUE (authorization_id)',
+  'mutation attempts are append-only',
+  'mutation outcomes are append-only',
+  'mutation resolutions are append-only',
+  'configuration mutation links are append-only',
+  'operations_shopify_carrier_service_actor_can_authorize',
+  "membership.role = 'owner'",
+  "membership.role = 'admin'",
+  "membership.permissions->>'manageOperations'",
+  "effect.desired_mode",
+  "effect_state IS DISTINCT FROM 'simulated'",
+  "effect_provider_write_count IS DISTINCT FROM 0",
+  'mutation authorization expired or became stale before claim',
+  'mutation_authorizations prior',
+  'prior.idempotency_key IS DISTINCT FROM NEW.idempotency_key',
+  "resolution.disposition = 'confirmed_not_applied'",
+  'mutation evidence',
+  'to_row_version = from_row_version + 1',
+  'cannot be reconciled while its provider-call lease is active',
+  'cannot later receive an outcome',
+  'requires an unknown outcome or an expired incomplete attempt',
+  'registered Shopify CarrierService identity is immutable',
+  'provider state transition requires exact one-time mutation evidence',
+], 'One-time CarrierService authorization schema')
+
+includes(nameAlignmentMigration, [
+  'checkout_brand_name_override text',
+  'registered_service_name text',
+  'operations_shopify_carrier_service_configs_brand_name_valid',
+  'length(btrim(checkout_brand_name_override)) BETWEEN 1 AND 120',
+  'length(btrim(registered_service_name)) BETWEEN 1 AND 255',
+  "registered_service_name !~ '[[:cntrl:]]'",
+  'Provider-confirmed name currently applied to the exact registered Shopify CarrierService',
+  "operation IN ('create', 'update', 'delete')",
+  "operation IN ('update', 'delete')",
+  "'^gid://shopify/DeliveryCarrierService/[0-9]+$'",
+  'protect_ops_shopify_cs_name_update_authorization()',
+  "config.registration_state",
+  'config.service_gid',
+  "config.checkout_brand_name_override",
+  "account.configuration->>'accountName'",
+  "config_state IS DISTINCT FROM 'registered'",
+  'config_service_gid IS DISTINCT FROM NEW.expected_service_gid',
+  'jsonb_object_keys(simulated_mutation)',
+  ') <> 3',
+  "simulated_mutation->>'operation' IS DISTINCT FROM 'update'",
+  "simulated_mutation->>'carrierServiceId' IS DISTINCT FROM",
+  "simulated_mutation->>'serviceName' IS DISTINCT FROM",
+  "WHEN (NEW.operation = 'update')",
+  'protect_ops_shopify_cs_brand_override_update()',
+  'shopify-carrier-service-authorization:',
+  'authorized_mutation.config_row_version = OLD.row_version',
+  "outcome.outcome = 'failed'",
+  'outcome.provider_write_count = 0',
+  "resolution.disposition = 'confirmed_not_applied'",
+  'Shopify CarrierService name cannot change while current-row provider authorization may still apply',
+  'BEFORE UPDATE OF checkout_brand_name_override',
+], 'Name-only CarrierService update authorization schema')
+assert.doesNotMatch(
+  nameAlignmentMigration,
+  /simulated_mutation->>'(?:callbackUrl|active|supportsServiceDiscovery)'/,
+  'name-update authorization must accept only the exact three-field update mutation',
+)
+
+const resolutionTrigger = migration.slice(
+  migration.indexOf(
+    'CREATE OR REPLACE FUNCTION\n  protect_ops_shopify_cs_mut_resolution()',
+  ),
+  migration.indexOf(
+    'DROP TRIGGER IF EXISTS\n  protect_ops_shopify_cs_mut_resolution_write',
+  ),
+)
+includes(resolutionTrigger, [
+  'IF attempt_lease_expires_at > now() THEN',
+  'including an unknown outcome',
+], 'Unknown-outcome provider-call lease fence')
+assert.doesNotMatch(
+  resolutionTrigger,
+  /terminal_outcome IS NULL\s+AND attempt_lease_expires_at > now\(\)/,
+  'Unknown outcomes must remain fenced until their provider-call lease expires',
+)
+
+for (const pattern of [
+  /CONSTRAINT\s+([a-z0-9_]+)/gi,
+  /CREATE(?: UNIQUE)? INDEX IF NOT EXISTS\s+([a-z0-9_]+)/gi,
+  /CREATE OR REPLACE FUNCTION\s+([a-z0-9_]+)/gi,
+  /CREATE TRIGGER\s+([a-z0-9_]+)/gi,
+]) {
+  for (const source of [
+    migration,
+    activeMigration,
+    receiptAuthorityMigration,
+    nameAlignmentMigration,
+  ]) {
+    for (const match of source.matchAll(pattern)) {
+      assert.ok(
+        Buffer.byteLength(match[1], 'utf8') <= 63,
+        `PostgreSQL identifier exceeds 63 bytes: ${match[1]}`,
+      )
+    }
+  }
+}
+
+assert.doesNotMatch(
+  migration,
+  /(?:catalog|inventory|order|printing)\.(?:create|update|delete)/,
+  'Authorization migration must not grant unrelated provider writes',
+)
+assert.doesNotMatch(
+  persistenceSource,
+  /\bfetch\s*\(/,
+  'Authorization persistence must not call Shopify',
+)
+assert.doesNotMatch(
+  persistenceSource,
+  /\bauthorization\./,
+  'Authorization persistence SQL must not use PostgreSQL reserved alias authorization',
+)
+assert.doesNotMatch(
+  persistenceSource,
+  /FOR UPDATE OF authorization\b/,
+  'Authorization persistence locks must use the non-reserved SQL alias',
+)
+assert.match(
+  persistenceSource,
+  /operations_shopify_carrier_service_mutation_authorizations\s+authorized_mutation/,
+  'Authorization persistence must use a PostgreSQL-safe table alias',
+)
+assert.doesNotMatch(
+  persistenceSource,
+  /(?:merchandise|subtotal|unitPrice|productPrice|cartTotal)/,
+  'CarrierService registration must not depend on merchandise price',
+)
+
+includes(persistenceSource, [
+  'authorizeShopifyCarrierServiceMutationInPostgres',
+  'claimShopifyCarrierServiceMutationInPostgres',
+  'finalizeShopifyCarrierServiceMutationInPostgres',
+  'resolveShopifyCarrierServiceMutationInPostgres',
+  'finalizeShopifyCarrierServiceConfigMutationInPostgres',
+  'readShopifyCarrierServiceMutationAuthorizationFromPostgres',
+  'readShopifyCarrierServiceMutationAuthorizationsFromPostgres',
+  'shopifyCarrierServiceMutationConfirmationHash',
+  'shopifyCarrierServiceMutationResolutionConfirmationHash',
+  'SHOPIFY_CARRIER_SERVICE_MUTATION_RECONCILIATION_REQUIRED',
+  'expectedAuthorizationFenceHash',
+  'providerWriteCount !== 1',
+  'providerWriteCount !== 0',
+  'confirmed_applied',
+  'confirmed_not_applied',
+  'SHOPIFY_CARRIER_SERVICE_MUTATION_STILL_IN_FLIGHT',
+  'SHOPIFY_CARRIER_SERVICE_MUTATION_ALREADY_RECONCILED',
+  'link_global_id',
+  'redacted_evidence, resolution_hash',
+  'JSON.stringify(input.resolutionEvidence)',
+  "(!outcome || outcome.state === 'unknown')",
+  'configActivationRevision',
+  'simulationActivationRevision',
+  'providerWriteActivationRevision',
+  'SHOPIFY_CARRIER_SERVICE_LEGACY_SHADOW_AUTHORIZATION_DISABLED',
+  'This transaction is local-only.',
+  'credential rotation/verification change must not strand provider',
+  "| 'update'",
+  "['create', 'update', 'delete'].includes(input.operation)",
+  'Only Shopify CarrierService create, name update, or delete can be authorized',
+  "input.operation !== 'create'",
+  'SHOPIFY_CARRIER_SERVICE_MUTATION_SERVICE_FENCE_INVALID',
+  'finalizeShopifyCarrierServiceNameAlignmentInPostgres',
+  'registered_service_name',
+  'SHOPIFY_CARRIER_SERVICE_NAME_FINALIZER_REQUIRED',
+  'SHOPIFY_CARRIER_SERVICE_REGISTERED_NAME_MISMATCH',
+], 'Authorization persistence')
+
+const nameFinalizer = persistenceSource.slice(
+  persistenceSource.indexOf(
+    'export async function finalizeShopifyCarrierServiceNameAlignmentInPostgres',
+  ),
+  persistenceSource.indexOf(
+    'export async function finalizeShopifyCarrierServiceConfigMutationInPostgres',
+  ),
+)
+includes(nameFinalizer, [
+  'expectedConfigRowVersion: number',
+  'attemptGlobalId: string',
+  'evidenceGlobalId: string',
+  'shopify-carrier-service-authorization:',
+  'config.registered_service_name',
+  "simulation.redacted_request -> 'mutation'",
+  'const appliedName = registeredServiceName(mutation?.serviceName)',
+  "row.operation !== 'update'",
+  "row.registration_state !== 'registered'",
+  'row.expected_service_gid !== row.service_gid',
+  'Number(row.authorization_config_row_version)',
+  '!== input.expectedConfigRowVersion',
+  'Object.keys(mutation).length !== 3',
+  "mutation.operation !== 'update'",
+  'mutation.carrierServiceId !== row.service_gid',
+  'mutation.serviceName !== appliedName',
+  "row.outcome === 'succeeded'",
+  'row.outcome_provider_write_count === 1',
+  'row.outcome_provider_reference === row.service_gid',
+  "row.resolution_disposition === 'confirmed_applied'",
+  'row.resolution_provider_reference === row.service_gid',
+  'row.registered_service_name === appliedName',
+  'alreadyApplied: true',
+  'SET registered_service_name = $3',
+  'row_version = row_version + 1',
+  "'operations.shopify_carrier_service.name_aligned'",
+  'registeredServiceName: appliedName',
+], 'exact idempotent applied-name finalizer')
+assert.doesNotMatch(
+  nameFinalizer,
+  /\b(?:fetch|createCarrierService|updateCarrierService|deleteCarrierService)\b/,
+  'applied-name finalization must remain local-only',
+)
+
+const configMutationFinalizer = persistenceSource.slice(
+  persistenceSource.indexOf(
+    'export async function finalizeShopifyCarrierServiceConfigMutationInPostgres',
+  ),
+  persistenceSource.indexOf(
+    'export async function readShopifyCarrierServiceMutationAuthorizationFromPostgres',
+  ),
+)
+includes(configMutationFinalizer, [
+  "if (row.operation === 'update')",
+  "'SHOPIFY_CARRIER_SERVICE_NAME_FINALIZER_REQUIRED'",
+  "row.operation === 'create'",
+  'registeredServiceName(row.simulation_mutation?.serviceName)',
+  "row.simulation_mutation.operation !== 'create'",
+  'row.simulation_mutation.serviceName',
+  '!== expectedRegisteredServiceName',
+  "row.operation === 'delete'",
+  'row.registered_service_name !== null',
+  'const targetRegisteredServiceName = row.operation === \'create\'',
+  'registered_service_name = $5',
+  'registeredServiceName: targetRegisteredServiceName',
+], 'create/delete applied-name derivation and clearing')
+
+includes(activeMigration, [
+  'simulation_activation_revision integer',
+  'provider_write_activation_revision integer',
+  'operations_shopify_cs_active_authorization_fence_hash',
+  'DROP TRIGGER IF EXISTS',
+  'protect_ops_shopify_cs_mut_auth_write',
+  'UPDATE operations_shopify_carrier_service_mutation_authorizations',
+  'SET simulation_activation_revision = activation_revision',
+  "current_activation_state IS DISTINCT FROM 'active'",
+  'NEW.provider_write_activation_revision',
+  "effect_mode IS DISTINCT FROM 'shadow'",
+  'effect_provider_write_count IS DISTINCT FROM 0',
+  'authorization_provider_write_activation_revision IS NULL',
+  'Legacy Shadow grants remain audit-only and unclaimable',
+], 'Historical Active CarrierService authorization migration')
+includes(receiptAuthorityMigration, [
+  'receipt_intake_enabled boolean NOT NULL DEFAULT false',
+  "current_activation_state IS DISTINCT FROM 'shadow'",
+  "account_status IS DISTINCT FROM 'active'",
+  "account_status IS DISTINCT FROM 'disabled'",
+  'resource-scoped Shadow authorization expired or became stale before claim',
+], 'Current resource-scoped CarrierService authorization migration')
+const activeAttemptTrigger = receiptAuthorityMigration.slice(
+  receiptAuthorityMigration.indexOf(
+    'CREATE OR REPLACE FUNCTION\n  protect_ops_shopify_cs_mut_attempt()',
+  ),
+  receiptAuthorityMigration.indexOf(
+    'CREATE OR REPLACE FUNCTION\n  protect_ops_shopify_cs_config_mut_link()',
+  ),
+)
+includes(activeAttemptTrigger, [
+  "current_activation_state IS DISTINCT FROM 'shadow'",
+  'authorization_provider_write_activation_revision',
+  'current_activation_revision IS DISTINCT FROM',
+  'resource-scoped Shadow authorization expired or became stale before claim',
+], 'Pre-call resource-scoped authorization claim fence')
+const configMutationLinkTrigger = receiptAuthorityMigration.slice(
+  receiptAuthorityMigration.indexOf(
+    'CREATE OR REPLACE FUNCTION\n  protect_ops_shopify_cs_config_mut_link()',
+  ),
+  receiptAuthorityMigration.indexOf(
+    'CREATE OR REPLACE FUNCTION\n  operations_shopify_cs_config_has_exact_finalization_link',
+  ),
+)
+includes(configMutationLinkTrigger, [
+  'exact succeeded provider evidence',
+  'exact applied reconciliation evidence',
+  'config_row_version IS DISTINCT FROM NEW.from_row_version',
+  'auth_provider_write_activation_revision IS NULL',
+], 'Post-provider local-only configuration finalization')
+assert.doesNotMatch(
+  configMutationLinkTrigger,
+  /current_activation_(?:state|revision)|activation\.state|activation\.revision|account_generation|credential_status|operations_commerce_credentials/,
+  'Post-provider local-only finalization must not depend on mutable organization activation or credential state',
+)
+const exactFinalizationLink = receiptAuthorityMigration.slice(
+  receiptAuthorityMigration.indexOf(
+    'CREATE OR REPLACE FUNCTION\n  operations_shopify_cs_config_has_exact_finalization_link',
+  ),
+  receiptAuthorityMigration.indexOf(
+    '-- Ordinary config writes still bind',
+  ),
+)
+includes(exactFinalizationLink, [
+  'authorized_mutation.config_row_version = requested_from_row_version',
+  'authorized_mutation.activation_revision =',
+  'requested_from_activation_revision',
+  'authorized_mutation.provider_write_activation_revision =',
+  'requested_to_activation_revision',
+  'authorized_mutation.credential_generation =',
+  'requested_credential_generation',
+  "authorized_mutation.operation = 'create'",
+  "authorized_mutation.operation = 'delete'",
+], 'Exact local-finalization link predicate')
+const configWriteValidator = receiptAuthorityMigration.slice(
+  receiptAuthorityMigration.indexOf(
+    'CREATE OR REPLACE FUNCTION\n  validate_operations_shopify_carrier_service_config()',
+  ),
+  receiptAuthorityMigration.indexOf(
+    'COMMENT ON TABLE',
+  ),
+)
+includes(configWriteValidator, [
+  'operations_shopify_cs_config_has_exact_finalization_link(',
+  'OLD.activation_revision',
+  'NEW.activation_revision',
+  'IF NOT exact_finalization_link_exists',
+  'account_generation IS DISTINCT FROM NEW.credential_generation',
+  'activation_revision IS DISTINCT FROM NEW.activation_revision',
+  'requires exact resource-scoped one-time mutation evidence',
+], 'Config write exact-finalization exemption')
+const callbackReadyValidator = activeMigration.slice(
+  activeMigration.indexOf(
+    'CREATE OR REPLACE FUNCTION\n  validate_operations_shopify_carrier_service_config_ready()',
+  ),
+  activeMigration.indexOf(
+    'CREATE TRIGGER\n  protect_ops_shopify_cs_mut_auth_write',
+  ),
+)
+includes(callbackReadyValidator, [
+  'operations_shopify_cs_config_has_exact_finalization_link(',
+  'operations_shopify_carrier_service_config_is_ready(',
+  'AND NOT exact_finalization_link_exists',
+  'configuration is not callback-ready',
+], 'Callback-readiness exact-finalization exemption')
+assert.ok(
+  activeMigration.indexOf(
+    'DROP TRIGGER IF EXISTS\n  protect_ops_shopify_cs_mut_auth_write',
+  ) < activeMigration.indexOf(
+    'UPDATE operations_shopify_carrier_service_mutation_authorizations',
+  )
+  && activeMigration.lastIndexOf(
+    'CREATE TRIGGER\n  protect_ops_shopify_cs_mut_auth_write',
+  ) > activeMigration.indexOf(
+    'UPDATE operations_shopify_carrier_service_mutation_authorizations',
+  ),
+  'legacy authorization backfill must run only while the append-only trigger is transactionally replaced',
+)
+
+includes(setupPersistenceSource, [
+  'SHOPIFY_CHECKOUT_SCOPED_MUTATION_FINALIZER_REQUIRED',
+  'Registered or disabled Shopify provider state requires the exact one-time mutation finalizer',
+  "current.registrationState === 'registered'",
+  'current.serviceGid !== null',
+  'SHOPIFY_CHECKOUT_EXACT_DELETE_REQUIRED',
+], 'Generic setup finalizer')
+
+includes(setupRouteSource, [
+  'function publicMutationAuthorization(',
+  'function publicCarrierServiceConfig(',
+  'leaseExpiresAt: authorization.attempt.leaseExpiresAt',
+  "action === 'recover-mutation'",
+  'verifyShopifyCarrierServiceMutationForReconciliation',
+], 'Sanitized setup and recovery route')
+assert.doesNotMatch(
+  setupRouteSource,
+  /providerServiceGid/,
+  'CarrierService create recovery must not require an operator-supplied provider GID',
+)
+
+const publicMapper = setupRouteSource.slice(
+  setupRouteSource.indexOf('function publicMutationAuthorization('),
+  setupRouteSource.indexOf('function mutationAuthorizationGlobalId('),
+)
+assert.doesNotMatch(
+  publicMapper,
+  /\b(?:leaseToken|organizationId|integrationAccountId|configId|attempt\.id|outcome\.id|resolution\.id|redactedEvidence|resolutionEvidence)\b/,
+  'Setup-state mutation DTO must not expose lease tokens or internal UUIDs',
+)
+const publicConfigMapper = setupRouteSource.slice(
+  setupRouteSource.indexOf('function publicCarrierServiceConfig('),
+  setupRouteSource.indexOf('type PublicShopifyCarrierServiceConfig'),
+)
+assert.doesNotMatch(
+  publicConfigMapper,
+  /\b(?:organizationId|integrationAccountId|warehouseId|materialId|carrierAccountId)\s*:/,
+  'Setup-state configuration DTO must not expose internal UUIDs',
+)
+
+const replacementGuard = migration.slice(
+  migration.lastIndexOf(
+    'CREATE OR REPLACE FUNCTION\n  validate_operations_shopify_carrier_service_config()',
+  ),
+)
+includes(replacementGuard, [
+  'operations_shopify_carrier_service_config_mutation_links',
+  "NEW.registration_state IN ('registered', 'disabled')",
+  'requires exact one-time mutation evidence',
+  "OLD.registration_state = 'registered'",
+  "NEW.registration_state NOT IN ('registered', 'disabled')",
+  'NEW.service_gid IS DISTINCT FROM OLD.service_gid',
+], '0150 Shadow registration guard replacement')
+assert.doesNotMatch(
+  replacementGuard,
+  /Registering a Shopify CarrierService requires Active Operations/,
+  '0150 must supersede the broad 0149 Active-only registration guard',
+)
+
+const persistence = loadPersistence()
+const accountGlobalId = 'gia0000001'
+const configGlobalId = 'gscf0000001'
+const requestHash = 'a'.repeat(64)
+const actorEmail = 'Jarrett+warehouse@episcs.com'
+
+assert.equal(
+  persistence.shopifyCarrierServiceMutationConfirmationVersion(
+    'sandbox',
+  ),
+  'shopify-carrier-service-sandbox-provider-write-v1',
+)
+assert.equal(
+  persistence.shopifyCarrierServiceMutationConfirmationVersion(
+    'production',
+  ),
+  'shopify-carrier-service-production-provider-write-v1',
+)
+
+const sandboxHash =
+  persistence.shopifyCarrierServiceMutationConfirmationHash({
+    accountGlobalId,
+    configGlobalId,
+    configRowVersion: 7,
+    operation: 'create',
+    environment: 'sandbox',
+    requestHash,
+    actorEmail,
+    statementVersion:
+      'shopify-carrier-service-sandbox-provider-write-v1',
+  })
+const productionHash =
+  persistence.shopifyCarrierServiceMutationConfirmationHash({
+    accountGlobalId,
+    configGlobalId,
+    configRowVersion: 7,
+    operation: 'create',
+    environment: 'production',
+    requestHash,
+    actorEmail,
+    statementVersion:
+      'shopify-carrier-service-production-provider-write-v1',
+  })
+assert.match(sandboxHash, /^[a-f0-9]{64}$/)
+assert.match(productionHash, /^[a-f0-9]{64}$/)
+assert.notEqual(
+  sandboxHash,
+  productionHash,
+  'Production confirmation must be environment-distinct',
+)
+assert.notEqual(
+  sandboxHash,
+  persistence.shopifyCarrierServiceMutationConfirmationHash({
+    accountGlobalId,
+    configGlobalId,
+    configRowVersion: 7,
+    operation: 'delete',
+    environment: 'sandbox',
+    requestHash,
+    actorEmail,
+    statementVersion:
+      'shopify-carrier-service-sandbox-provider-write-v1',
+  }),
+  'Create confirmation must not authorize delete',
+)
+assert.notEqual(
+  sandboxHash,
+  persistence.shopifyCarrierServiceMutationConfirmationHash({
+    accountGlobalId,
+    configGlobalId,
+    configRowVersion: 7,
+    operation: 'update',
+    environment: 'sandbox',
+    requestHash,
+    actorEmail,
+    statementVersion:
+      'shopify-carrier-service-sandbox-provider-write-v1',
+  }),
+  'Create confirmation must not authorize a name update',
+)
+assert.notEqual(
+  persistence.shopifyCarrierServiceMutationConfirmationHash({
+    accountGlobalId,
+    configGlobalId,
+    configRowVersion: 7,
+    operation: 'update',
+    environment: 'sandbox',
+    requestHash,
+    actorEmail,
+    statementVersion:
+      'shopify-carrier-service-sandbox-provider-write-v1',
+  }),
+  persistence.shopifyCarrierServiceMutationConfirmationHash({
+    accountGlobalId,
+    configGlobalId,
+    configRowVersion: 8,
+    operation: 'update',
+    environment: 'sandbox',
+    requestHash,
+    actorEmail,
+    statementVersion:
+      'shopify-carrier-service-sandbox-provider-write-v1',
+  }),
+  'Name-update confirmation must be fenced to the exact config row version',
+)
+assert.notEqual(
+  persistence.shopifyCarrierServiceMutationConfirmationHash({
+    accountGlobalId,
+    configGlobalId,
+    configRowVersion: 7,
+    operation: 'update',
+    environment: 'sandbox',
+    requestHash,
+    actorEmail,
+    statementVersion:
+      'shopify-carrier-service-sandbox-provider-write-v1',
+  }),
+  persistence.shopifyCarrierServiceMutationConfirmationHash({
+    accountGlobalId,
+    configGlobalId,
+    configRowVersion: 7,
+    operation: 'update',
+    environment: 'sandbox',
+    requestHash: 'b'.repeat(64),
+    actorEmail,
+    statementVersion:
+      'shopify-carrier-service-sandbox-provider-write-v1',
+  }),
+  'Name-update confirmation must be fenced to the exact simulated request hash',
+)
+
+const resolutionEvidenceHash = hash({
+  source: 'shopify_admin_review',
+  outcome: 'service_present',
+})
+const resolutionHash =
+  persistence.shopifyCarrierServiceMutationResolutionConfirmationHash({
+    attemptGlobalId: 'gscm0000001',
+    disposition: 'confirmed_applied',
+    providerReference:
+      'gid://shopify/DeliveryCarrierService/123456',
+    resolutionHash: resolutionEvidenceHash,
+    actorEmail,
+    statementVersion:
+      'shopify-carrier-service-mutation-reconciliation-v1',
+  })
+assert.match(resolutionHash, /^[a-f0-9]{64}$/)
+
+console.log(
+  'Shopify CarrierService Shadow-to-Active authorization contract passed.',
+)

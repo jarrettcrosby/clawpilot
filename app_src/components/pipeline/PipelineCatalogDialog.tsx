@@ -250,6 +250,8 @@ export default function PipelineCatalogDialog({
     loss_reason: '',
   })
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const productEditorRef = useRef<HTMLDivElement | null>(null)
+  const productNameInputRef = useRef<HTMLInputElement | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -307,6 +309,18 @@ export default function PipelineCatalogDialog({
     ) return
     setProductEditorOpen(false)
   }, [currencyPreferenceReady, product.id, productEditorOpen])
+
+  useEffect(() => {
+    if (!productEditorOpen) return
+    const frame = requestAnimationFrame(() => {
+      productEditorRef.current?.scrollIntoView({
+        block: 'start',
+        behavior: 'smooth',
+      })
+      productNameInputRef.current?.focus({ preventScroll: true })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [product.id, productEditorOpen])
 
   const savePerson = async () => {
     if (!person.fullName.trim() || saving) return
@@ -681,11 +695,24 @@ export default function PipelineCatalogDialog({
         ) : null}
 
         {productEditorOpen ? (
-          <Box component="section" aria-label="Product editor" sx={{ mt: 2, pt: 2, borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+          <Box
+            ref={productEditorRef}
+            component="section"
+            aria-label="Product editor"
+            tabIndex={-1}
+            sx={{ mt: 2, pt: 2, borderTop: '1px solid rgba(255,255,255,0.08)', scrollMarginTop: 16 }}
+          >
             <Typography variant="subtitle1" fontWeight={700} mb={1.5}>{product.id ? 'Edit product' : 'Add product'}</Typography>
             <Stack gap={1.5}>
               <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
-                <TextField fullWidth required label="Product name" value={product.name} onChange={(event) => setProduct({ ...product, name: event.target.value })} />
+                <TextField
+                  fullWidth
+                  required
+                  label="Product name"
+                  value={product.name}
+                  inputRef={productNameInputRef}
+                  onChange={(event) => setProduct({ ...product, name: event.target.value })}
+                />
                 <TextField fullWidth label="SKU" value={product.sku} inputProps={{ maxLength: 25 }} onChange={(event) => setProduct({ ...product, sku: event.target.value.slice(0, 25) })} helperText="Up to 25 characters" />
               </Stack>
               <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>

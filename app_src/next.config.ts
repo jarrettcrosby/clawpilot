@@ -27,7 +27,7 @@ const nextConfig: NextConfig = {
   async headers() {
     return [
       {
-        source: '/((?!_next/static).*)',
+        source: '/((?!_next/static|api/public/crm-product-images/).*)',
         headers: [
           { key: 'Cache-Control', value: 'no-store' },
         ],

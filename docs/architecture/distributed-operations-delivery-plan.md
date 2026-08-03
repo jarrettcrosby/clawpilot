@@ -33,7 +33,7 @@ Operations stays fail-closed on file storage. Hosted activation requires Postgre
 
 ## Current Delivery State
 
-As of 2026-07-23, the development environment has completed the bounded Phase 2 shipped mock proof plus an operator-reviewed planned-order path and three explicit warehouse commands. Warehouse release uses an advisory lock, exact row-version check, request-hashed command receipt, complete reservation/allocation validation, blocking-exception validation, and one transaction to release the plan, create the wave and pick tasks, advance the order, and write event/audit evidence. Bulk all-ready pick confirmation locks every affected inventory position, revalidates the released plan, wave, picks, activation, row version, and blocking exceptions, then marks every ready pick `picked`, completes the wave, advances the order to `picking`, and records immutable ledger, event, audit, and exact replay-result evidence in one transaction. Pack verification is a separate replay-safe command that verifies package facts and creates immutable pack-fee evidence without consuming reservations. Durable exception dispositions, one canonical CRM projection per workspace, deterministic provider-customer resolution, team-managed metric/imperial product-package profiles, organization activation state, a provider-neutral small-parcel capability contract, organization-scoped encrypted UPS/FedEx/USPS credential management, carrier-rate delegation and GL Coding foundations, and capability-aware printer configuration also exist. The full migration chain and transaction behavior run against disposable PostgreSQL in the standard Operations test. Credential verification, printer profiles, and billing schema do not advance production-provider certification or mark Phase 4 or Phase 5 complete; scanner claims, short-pick recovery, production label/void/pickup/tracking, provider-specific carrier-bill ingestion, print-agent enrollment and job acknowledgement, settlement approval/export, complete reconciliation health, and live adapters remain open.
+As of 2026-07-29, the development environment has completed the bounded Phase 2 shipped mock proof plus an operator-reviewed planned-order path and three explicit warehouse commands. Warehouse release uses an advisory lock, exact row-version check, request-hashed command receipt, complete reservation/allocation validation, blocking-exception validation, and one transaction to release the plan, create the wave and pick tasks, advance the order, and write event/audit evidence. Bulk all-ready pick confirmation locks every affected inventory position, revalidates the released plan, wave, picks, activation, row version, and blocking exceptions, then marks every ready pick `picked`, completes the wave, advances the order to `picking`, and records immutable ledger, event, audit, and exact replay-result evidence in one transaction. Pack verification is a separate replay-safe command that verifies package facts and creates immutable pack-fee evidence without consuming reservations. Durable exception dispositions, one canonical CRM projection per workspace, deterministic provider-customer resolution, team-managed metric/imperial product-package profiles, organization activation state, a provider-neutral small-parcel capability contract, organization-scoped encrypted UPS/FedEx/USPS credential management, carrier-rate delegation and GL Coding foundations, and capability-aware printer configuration also exist. Additive migrations `0146` and `0147` correct the pack-and-rate replay to preserve checkout shipping charge, checkout carrier estimate, pre-label carrier estimate, and estimated variances as separate facts, then add append-only billing-time MUD evidence sourced only from exactly matched, approved carrier billing. No applicable approved `actual_cost` directive produces `not_configured`, not an inferred markup. The full migration chain and transaction behavior run against disposable PostgreSQL in the standard Operations test. These remain development-only controls: credential verification, printer profiles, replay and billing schema do not advance production-provider certification or mark Phase 4 or Phase 5 complete; scanner claims, short-pick recovery, production label/void/pickup/tracking, provider-specific carrier-bill ingestion, print-agent enrollment and job acknowledgement, production settlement approval/export, complete reconciliation health, and live adapters remain open.
 
 The exception queue deliberately stays separate from Projects tasks. An exception owns operational status and evidence. A later adapter may create or link a Projects task for collaborative work without transferring exception authority to the task module.
 
@@ -106,11 +106,16 @@ This checkpoint posts canonical inventory units only. Case and pallet conversion
 
 **Scope**
 
-- Add immutable checkout quote requests/snapshots, single-warehouse eligibility, expiration, promise explanations, package assignments, and cost/revenue/margin.
+- Add immutable checkout quote requests/snapshots, single-warehouse eligibility,
+  expiration, promise explanations, package assignments, customer-facing
+  checkout shipping charge, checkout carrier estimate, and signed estimated
+  variance.
 - Implement carrier capability discovery, controlled parallel rating, timeout/circuit policy, exact response snapshots, and conservative missing-dimension profiles.
 - Keep direct UPS, FedEx, and USPS adapters plus optional RocketShipIt behind the [provider-neutral small parcel boundary](small-parcel-carrier-adapters.md).
 - Deploy OR-Tools behind the optimizer port; validate result hashes and constraints; retain deterministic fallback and candidate/rejection evidence.
-- Add approved split planning, promise-safe multi-warehouse representation, manual override versioning, and margin-erosion attribution.
+- Add approved split planning, promise-safe multi-warehouse representation,
+  manual override versioning, and estimated cost-variance attribution until
+  carrier billing supplies actual cost.
 
 **Implemented inactive code checkpoint**
 
@@ -136,7 +141,9 @@ This checkpoint posts canonical inventory units only. Case and pallet conversion
 
 - S17-S20 and S25 pass, including carrier/print failure injection.
 - A retry cannot buy a duplicate label, and a print retry cannot invoke a carrier purchase.
-- Package changes invalidate stale rates and recalculate margin before shipment.
+- Package changes invalidate stale rates and record a new pre-label carrier
+  estimate plus signed estimated variance before shipment; they do not create
+  carrier-billed actual or MUD.
 
 **Implemented foundation**
 
@@ -148,20 +155,33 @@ This checkpoint posts canonical inventory units only. Case and pallet conversion
 
 **Scope**
 
-- Implement effective-dated contract versions, approved MUD/pricing directives, precedence, calculation explanations, minimums/caps/tiers, estimate/accrual/final facts, credits, rebills, and disputes.
-- Add order/package/shipment/customer/contract/warehouse margin projections and quoted-to-actual variance.
+- Implement effective-dated contract versions and approved MUD/pricing
+  directives with precedence, calculation explanations, minimums/caps/tiers,
+  estimate/accrual/final facts, credits, rebills, and disputes. The current
+  MUD boundary evaluates only an effective approved `actual_cost` directive
+  after exact imported carrier-billing matches and an approved GL review.
+- Add order/package/shipment/customer/contract/warehouse projections that
+  keep checkout-to-estimate variance separate from checkout-to-carrier-actual
+  and checkout-to-contract-bill variance.
 - Add approved accounting export without transferring calculation authority to QuickBooks.
 
 **Exit**
 
 - S10-S13 pass with exact minor-unit arithmetic and historical version retention.
-- S16 and S25 rerun with final billing and margin projections.
+- S16 and S25 rerun with approved carrier-billed actuals and final billing
+  projections.
 - Re-export and replay are idempotent; corrections are compensating facts.
 
 **Implemented foundation**
 
-- Triangle, Square, and Circle paths retain explicit directive versions and fees, including a zero Triangle fee.
+- Triangle, Square, and Circle paths retain explicit grant and directive
+  versions; quote-time fee evidence remains distinct from billing-time MUD.
 - Carrier account identities, multi-account billing statements, shipment-match evidence, independent shipper assignments, selected-batch GL Coding runs, versioned routing rules, manual orphan resolution, reconciliation snapshots, and append-only settlement structures exist.
+- Additive `0147` retains exact approved charge, statement, shipment, quote,
+  account, grant, contract, directive, calculation, hash, and actor provenance
+  for a calculated billing-time MUD, and records `not_configured` when no
+  effective approved `actual_cost` directive applies. Ambiguous or invalid
+  evidence remains blocked.
 - Provider-specific CSV ingestion, GL dimension bindings, settlement approval/rebill commands, payouts, and accounting export remain open.
 
 ### Phase 6 - Production Commerce And Carrier Adapters
@@ -211,7 +231,9 @@ This checkpoint posts canonical inventory units only. Case and pallet conversion
 **Scope**
 
 - Add customer-portal identities and customer/subaccount field policy.
-- Add operational, service, inventory, carrier, profitability, margin-erosion, unbilled, return, and exception projections.
+- Add operational, service, inventory, carrier, profitability, unbilled,
+  return, and exception projections that label estimate-time and approved
+  billing-time economics separately.
 - Add rule/optimizer simulation, baseline comparison, tuning controls, and read-only AI explanations/recommendations.
 
 **Exit**
@@ -233,8 +255,10 @@ The Phase 2 slice proves the entire authority and adapter chain with mocks befor
 7. Cartonize from versioned product and carton facts.
 8. Rate eligible mock carrier services.
 9. Select a service that meets the promise.
-10. Calculate versioned estimated contract charges.
-11. Persist cost, revenue, margin, package, rate, promise, and decision evidence.
+10. Record the customer-facing checkout shipping charge separately from the
+    selected mock carrier estimate.
+11. Persist checkout charge, carrier estimate, signed estimated variance,
+    package, rate, promise, and decision evidence; do not calculate MUD.
 12. Select the fulfillment plan.
 13. Release a wave after revalidating holds, reservations, cutoff, capacity, and printer route.
 14. Create ordered pick tasks.
@@ -343,26 +367,26 @@ The scenario ID is stable and must appear in the eventual test name, CI output, 
 | S03 | Channel SKUs map to correct global products. | 2 | Adapter contract: each line resolves the expected `gp`; missing/ambiguous mapping holds the order and creates no reservation. |
 | S04 | Checkout quote uses a warehouse that can fulfill the complete order. | 3 | Domain + Postgres: selected warehouse covers every line from eligible inventory; partial warehouses are recorded as rejected. |
 | S05 | Quote cartonizes, rates eligible services, and returns only promise-safe services. | 3 | Service integration: package assignments balance quantities; every returned rate is eligible and meets the stored promise. |
-| S06 | Quote stores internal cost, customer charge, margin, warehouse, package plan, and promise. | 3 | Persistence contract: immutable snapshot contains exact minor-unit arithmetic, versions, input hash, and expiration. |
+| S06 | Quote stores the customer-facing checkout shipping charge separately from the checkout carrier estimate, signed estimated variance, warehouse, package plan, and promise. | 3 | Persistence contract: immutable snapshot contains exact minor-unit arithmetic, versions, input hash, and expiration; the delta is never labeled carrier-billed actual or MUD. |
 | S07 | Dedicated inventory cannot fulfill another customer's order. | 2 | Security/domain negative: reservation fails before quantity mutation; ledger and position remain unchanged; denial is audited safely. |
 | S08 | Approved shared pool follows configured customer priorities. | 2 | Domain + Postgres: effective membership/priority determines allocation; deterministic tie break uses Global IDs. |
 | S09 | Simultaneous orders cannot reserve the same final unit. | 2 | Multi-connection race: exactly one success, one insufficient-inventory result, reserved total equals one, ledger reconciles. |
-| S10 | Fixed per-order MUD calculates correctly. | 5 | Unit + integration: one fact in exact minor units with contract/directive version and explanation. |
-| S11 | Percentage freight-markup MUD calculates correctly. | 5 | Unit property tests: decimal basis, rounding, min/max, currency, and exact snapshot are correct. |
+| S10 | Fixed-amount `actual_cost` MUD calculates correctly only after exact approved carrier billing. | 5 | Unit + integration: the exact imported charges and current shipment match produce one append-only fact in minor units with statement, account, grant, contract, directive version, calculation snapshot, input hash, actor, and explanation; no applicable directive produces `not_configured`. |
+| S11 | Percentage `actual_cost` MUD calculates correctly only after exact approved carrier billing. | 5 | Unit property tests: decimal basis, rounding, min/max, currency, exact charge total, and immutable provenance are correct; replay and pre-label estimates never invoke it. |
 | S12 | Tiered pick fee calculates correctly. | 5 | Boundary tests at every tier: quantity split, precedence, and total are exact and replay-safe. |
 | S13 | Historical charge retains the contract version active at transaction time. | 5 | Postgres integration: publishing a later version does not alter prior fact, amount, directive, or explanation. |
-| S14 | Optimizer selects one warehouse when it meets the promise. | 3 | Optimizer contract: selected candidate is complete/promise-safe; split candidate ranks lower regardless of margin. |
+| S14 | Optimizer selects one warehouse when it meets the promise. | 3 | Optimizer contract: selected candidate is complete/promise-safe; split candidate ranks lower regardless of projected margin. |
 | S15 | Multi-warehouse plan appears only when one location is infeasible or an approved rule allows it. | 3 | Property + integration: split is absent when a complete candidate exists unless versioned policy explicitly permits it. |
-| S16 | Later operational split records incremental cost as margin erosion. | 3 estimate; 5 final | Plan/billing integration: prior quote and plan remain immutable; variance identifies cause, actor/policy, cost, and margin delta. |
+| S16 | Later operational split records incremental estimated cost before billing and realized variance only after approved carrier billing. | 3 estimate; 5 final | Plan/billing integration: prior checkout charge, checkout estimate, and plan remain immutable; pre-label change is estimated, while final variance identifies the exact matched carrier charges, cause, actor/policy, and applicable billing-time MUD status. |
 | S17 | Overnight label routes to Pack Station 1. | 4 | Rule + print integration: matching versioned rule creates one job for the expected printer with explanation. |
 | S18 | Failed printer routes to approved fallback. | 4 | Worker fault injection: fenced failure creates no duplicate job/label; approved fallback receives the rerouted job and reason. |
 | S19 | Carrier timeout uses fallback without duplicate labels. | 4 fixture; 6 provider | Adapter chaos: ambiguous purchase reconciles first; stable provider key yields at most one active label and records fallback/circuit reason. |
 | S20 | Short pick triggers reallocation or an exception. | 4 | Warehouse integration: short quantity is explicit; deterministic eligible reallocation occurs or one owned exception/task is created. |
-| S21 | Manual warehouse override records actor, reason, old/new plans, and financial effect. | 3 | Authorization + persistence: permitted actor creates a new plan version, immutable comparison, margin delta, audit, and event. |
+| S21 | Manual warehouse override records actor, reason, old/new plans, and financial effect. | 3 | Authorization + persistence: permitted actor creates a new plan version, immutable comparison, estimated financial delta, audit, and event; realized variance waits for approved carrier billing. |
 | S22 | Portal user cannot see another customer's orders, inventory, contracts, or charges. | 8 | Independent-session security suite: list, search, detail, export, and guessed Global ID requests return no cross-customer data. |
 | S23 | Ledger reconciliation equals the materialized inventory view. | 2 | Reconciliation/property test: randomized event sequences and production-like fixture aggregate to exact position buckets; drift alerts/freeze. |
 | S24 | Solver timeout uses deterministic fallback and records reason. | 3 | Optimizer chaos: repeated identical inputs yield identical plan/hash/version and explicit timeout reason with no promise violation. |
-| S25 | Pack-station package change re-rates and recalculates margin. | 4 estimate; 5 final | End-to-end: new package version invalidates stale rate/label, stores new rate and exact margin variance, and preserves history. |
+| S25 | Pack-station package change re-rates without inventing carrier actual or MUD. | 4 estimate; 5 final | End-to-end: new package version invalidates stale rate/label, stores a new pre-label carrier estimate and signed estimated variance, preserves history, and later reconciles separately to exactly matched approved carrier billing. |
 | S26 | Shopify and Faire normalize operational orders into the same candidate contract without losing provider semantics. | 6 | Adapter + Postgres integration: equivalent fixtures produce the same canonical semantic fields while Shopify raw/normalized status and money evidence and Faire role, multiplier, discount, payout, and absent-inventory evidence remain separately typed. |
 | S27 | A candidate cannot promote until every product, order-time price, customer, ship-to, delivery, and package resolution validates. | 6 | Command + UI integration: each missing fact exposes an executable bind/create/confirm/manual/refresh/unsupported action, stale row/source evidence fails closed, promotion is disabled before `ready`, terminal candidates restart only through a later fetch, and exact replay returns one canonical order. |
 | S28 | Commerce intake and promotion cannot write to either provider or advance its cursor. | 6 | Database + adapter safety: before/after comparison proves provider writes, durable sync cursors, inventory, reservations, fulfillment, shipment, and export evidence unchanged while the permitted candidate, continuation, canonical order/event/audit/receipt rows are created once. |

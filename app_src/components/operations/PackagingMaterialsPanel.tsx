@@ -74,6 +74,13 @@ type MaterialForm = {
   innerLengthMm: string
   innerWidthMm: string
   innerHeightMm: string
+  ratedOuterLengthMm: string
+  ratedOuterWidthMm: string
+  ratedOuterHeightMm: string
+  ratedOuterDimensionEvidenceType:
+    | Exclude<PackagingDimensionEvidenceType, 'unknown'>
+    | ''
+  ratedOuterDimensionEvidenceReference: string
   dimensionBasis: PackagingDimensionBasis
   dimensionEvidenceType: PackagingDimensionEvidenceType
   dimensionEvidenceReference: string
@@ -88,6 +95,9 @@ type MaterialMeasurementForm = {
   innerLength: string
   innerWidth: string
   innerHeight: string
+  ratedOuterLength: string
+  ratedOuterWidth: string
+  ratedOuterHeight: string
   tareWeight: string
   maxWeight: string
 }
@@ -107,6 +117,11 @@ const emptyMaterial: MaterialForm = {
   innerLengthMm: '',
   innerWidthMm: '',
   innerHeightMm: '',
+  ratedOuterLengthMm: '',
+  ratedOuterWidthMm: '',
+  ratedOuterHeightMm: '',
+  ratedOuterDimensionEvidenceType: '',
+  ratedOuterDimensionEvidenceReference: '',
   dimensionBasis: 'unspecified',
   dimensionEvidenceType: 'unknown',
   dimensionEvidenceReference: '',
@@ -121,6 +136,9 @@ const emptyMaterialMeasurements: MaterialMeasurementForm = {
   innerLength: '',
   innerWidth: '',
   innerHeight: '',
+  ratedOuterLength: '',
+  ratedOuterWidth: '',
+  ratedOuterHeight: '',
   tareWeight: '',
   maxWeight: '',
 }
@@ -230,6 +248,23 @@ function canonicalDimensions(material: PackagingMaterial) {
   ].map((value) => value === null ? 'unknown' : String(value)).join(' × ')
 }
 
+function ratedOuterDimensions(
+  material: PackagingMaterial,
+  system: MeasurementSystem,
+) {
+  const dimensions = material.ratedOuterDimensionsMm
+  if (
+    dimensions.length === null
+    || dimensions.width === null
+    || dimensions.height === null
+  ) return 'Not recorded'
+  return formatDimensionsMm({
+    lengthMm: dimensions.length,
+    widthMm: dimensions.width,
+    heightMm: dimensions.height,
+  }, system)
+}
+
 function optionalWeight(
   grams: number | null,
   system: MeasurementSystem,
@@ -251,7 +286,10 @@ function optionalMeasurementValue(
 function materialMeasurementForm(
   material: Pick<
     PackagingMaterial,
-    'innerDimensionsMm' | 'tareWeightGrams' | 'maxWeightGrams'
+    | 'innerDimensionsMm'
+    | 'ratedOuterDimensionsMm'
+    | 'tareWeightGrams'
+    | 'maxWeightGrams'
   >,
   system: MeasurementSystem,
 ): MaterialMeasurementForm {
@@ -266,6 +304,18 @@ function materialMeasurementForm(
     ),
     innerHeight: optionalMeasurementValue(
       material.innerDimensionsMm.height,
+      (value) => millimetersToDisplayLength(value, system),
+    ),
+    ratedOuterLength: optionalMeasurementValue(
+      material.ratedOuterDimensionsMm.length,
+      (value) => millimetersToDisplayLength(value, system),
+    ),
+    ratedOuterWidth: optionalMeasurementValue(
+      material.ratedOuterDimensionsMm.width,
+      (value) => millimetersToDisplayLength(value, system),
+    ),
+    ratedOuterHeight: optionalMeasurementValue(
+      material.ratedOuterDimensionsMm.height,
       (value) => millimetersToDisplayLength(value, system),
     ),
     tareWeight: optionalMeasurementValue(
@@ -286,6 +336,9 @@ function measurementFormFromCanonical(
   const length = Number(material.innerLengthMm)
   const width = Number(material.innerWidthMm)
   const height = Number(material.innerHeightMm)
+  const ratedOuterLength = Number(material.ratedOuterLengthMm)
+  const ratedOuterWidth = Number(material.ratedOuterWidthMm)
+  const ratedOuterHeight = Number(material.ratedOuterHeightMm)
   const tareWeight = Number(material.tareWeightGrams)
   const maxWeight = Number(material.maxWeightGrams)
   return {
@@ -297,6 +350,24 @@ function measurementFormFromCanonical(
       : '',
     innerHeight: material.innerHeightMm && Number.isFinite(height)
       ? displayMeasurementValue(millimetersToDisplayLength(height, system))
+      : '',
+    ratedOuterLength: material.ratedOuterLengthMm
+      && Number.isFinite(ratedOuterLength)
+      ? displayMeasurementValue(
+        millimetersToDisplayLength(ratedOuterLength, system),
+      )
+      : '',
+    ratedOuterWidth: material.ratedOuterWidthMm
+      && Number.isFinite(ratedOuterWidth)
+      ? displayMeasurementValue(
+        millimetersToDisplayLength(ratedOuterWidth, system),
+      )
+      : '',
+    ratedOuterHeight: material.ratedOuterHeightMm
+      && Number.isFinite(ratedOuterHeight)
+      ? displayMeasurementValue(
+        millimetersToDisplayLength(ratedOuterHeight, system),
+      )
       : '',
     tareWeight: material.tareWeightGrams && Number.isFinite(tareWeight)
       ? displayMeasurementValue(gramsToDisplayWeight(tareWeight, system))
@@ -321,6 +392,19 @@ function materialForm(material: PackagingMaterial): MaterialForm {
     innerHeightMm: material.innerDimensionsMm.height === null
       ? ''
       : String(material.innerDimensionsMm.height),
+    ratedOuterLengthMm: material.ratedOuterDimensionsMm.length === null
+      ? ''
+      : String(material.ratedOuterDimensionsMm.length),
+    ratedOuterWidthMm: material.ratedOuterDimensionsMm.width === null
+      ? ''
+      : String(material.ratedOuterDimensionsMm.width),
+    ratedOuterHeightMm: material.ratedOuterDimensionsMm.height === null
+      ? ''
+      : String(material.ratedOuterDimensionsMm.height),
+    ratedOuterDimensionEvidenceType:
+      material.ratedOuterDimensionEvidenceType || '',
+    ratedOuterDimensionEvidenceReference:
+      material.ratedOuterDimensionEvidenceReference || '',
     dimensionBasis: material.dimensionBasis,
     dimensionEvidenceType: material.dimensionEvidenceType,
     dimensionEvidenceReference: material.dimensionEvidenceReference || '',
@@ -502,6 +586,9 @@ export default function PackagingMaterialsPanel() {
       innerLength: 'innerLengthMm',
       innerWidth: 'innerWidthMm',
       innerHeight: 'innerHeightMm',
+      ratedOuterLength: 'ratedOuterLengthMm',
+      ratedOuterWidth: 'ratedOuterWidthMm',
+      ratedOuterHeight: 'ratedOuterHeightMm',
       tareWeight: 'tareWeightGrams',
       maxWeight: 'maxWeightGrams',
     }[field] as keyof Pick<
@@ -509,13 +596,23 @@ export default function PackagingMaterialsPanel() {
       | 'innerLengthMm'
       | 'innerWidthMm'
       | 'innerHeightMm'
+      | 'ratedOuterLengthMm'
+      | 'ratedOuterWidthMm'
+      | 'ratedOuterHeightMm'
       | 'tareWeightGrams'
       | 'maxWeightGrams'
     >
     let canonical = ''
     if (value.trim() && Number.isFinite(numeric) && numeric > 0) {
       canonical = String(
-        field === 'innerLength' || field === 'innerWidth' || field === 'innerHeight'
+        (
+          field === 'innerLength'
+          || field === 'innerWidth'
+          || field === 'innerHeight'
+          || field === 'ratedOuterLength'
+          || field === 'ratedOuterWidth'
+          || field === 'ratedOuterHeight'
+        )
           ? displayLengthToMillimeters(numeric, measurementSystem)
           : displayWeightToGrams(numeric, measurementSystem),
       )
@@ -543,6 +640,22 @@ export default function PackagingMaterialsPanel() {
       }
       return ''
     }
+    const validateOptional = (
+      displayValue: string,
+      canonicalValue: string,
+      label: string,
+    ) => {
+      if (!displayValue.trim()) return ''
+      const numeric = Number(displayValue)
+      const canonical = Number(canonicalValue)
+      if (!Number.isFinite(numeric) || numeric <= 0) {
+        return `${label} must be greater than zero`
+      }
+      if (!Number.isSafeInteger(canonical) || canonical < 1) {
+        return `${label} is below the supported 1 mm precision`
+      }
+      return ''
+    }
     const errors = {
       innerLength: validate(
         materialMeasurementDraft.innerLength,
@@ -558,6 +671,21 @@ export default function PackagingMaterialsPanel() {
         materialMeasurementDraft.innerHeight,
         materialDraft.innerHeightMm,
         'Inner height',
+      ),
+      ratedOuterLength: validateOptional(
+        materialMeasurementDraft.ratedOuterLength,
+        materialDraft.ratedOuterLengthMm,
+        'Rated outer length',
+      ),
+      ratedOuterWidth: validateOptional(
+        materialMeasurementDraft.ratedOuterWidth,
+        materialDraft.ratedOuterWidthMm,
+        'Rated outer width',
+      ),
+      ratedOuterHeight: validateOptional(
+        materialMeasurementDraft.ratedOuterHeight,
+        materialDraft.ratedOuterHeightMm,
+        'Rated outer height',
       ),
       tareWeight: validate(
         materialMeasurementDraft.tareWeight,
@@ -587,6 +715,34 @@ export default function PackagingMaterialsPanel() {
       && materialDraft.dimensionEvidenceType === 'unknown'
     ) {
       errors.innerWidth = 'Record the dimension evidence before activation'
+    }
+    const outerValues = [
+      materialDraft.ratedOuterLengthMm,
+      materialDraft.ratedOuterWidthMm,
+      materialDraft.ratedOuterHeightMm,
+    ]
+    const hasAnyOuter = outerValues.some(Boolean)
+    const hasAllOuter = outerValues.every(Boolean)
+    if (hasAnyOuter && !hasAllOuter) {
+      if (!materialDraft.ratedOuterLengthMm) {
+        errors.ratedOuterLength = 'Complete all three rated outer dimensions'
+      }
+      if (!materialDraft.ratedOuterWidthMm) {
+        errors.ratedOuterWidth = 'Complete all three rated outer dimensions'
+      }
+      if (!materialDraft.ratedOuterHeightMm) {
+        errors.ratedOuterHeight = 'Complete all three rated outer dimensions'
+      }
+    }
+    if (
+      hasAllOuter
+      && (
+        !materialDraft.ratedOuterDimensionEvidenceType
+        || !materialDraft.ratedOuterDimensionEvidenceReference.trim()
+      )
+    ) {
+      errors.ratedOuterLength =
+        'Select evidence and describe the rated outer measurements'
     }
     return errors
   }, [editingMaterial?.status, materialDraft, materialMeasurementDraft])
@@ -636,6 +792,20 @@ export default function PackagingMaterialsPanel() {
           innerHeightMm: materialDraft.innerHeightMm.trim()
             ? Number(materialDraft.innerHeightMm)
             : null,
+          ratedOuterLengthMm: materialDraft.ratedOuterLengthMm.trim()
+            ? Number(materialDraft.ratedOuterLengthMm)
+            : null,
+          ratedOuterWidthMm: materialDraft.ratedOuterWidthMm.trim()
+            ? Number(materialDraft.ratedOuterWidthMm)
+            : null,
+          ratedOuterHeightMm: materialDraft.ratedOuterHeightMm.trim()
+            ? Number(materialDraft.ratedOuterHeightMm)
+            : null,
+          ratedOuterDimensionEvidenceType:
+            materialDraft.ratedOuterDimensionEvidenceType || null,
+          ratedOuterDimensionEvidenceReference:
+            materialDraft.ratedOuterDimensionEvidenceReference.trim()
+              || null,
           dimensionBasis: materialDraft.dimensionBasis,
           dimensionEvidenceType: materialDraft.dimensionEvidenceType,
           dimensionEvidenceReference:
@@ -754,6 +924,13 @@ export default function PackagingMaterialsPanel() {
           innerLengthMm: material.innerDimensionsMm.length,
           innerWidthMm: material.innerDimensionsMm.width,
           innerHeightMm: material.innerDimensionsMm.height,
+          ratedOuterLengthMm: material.ratedOuterDimensionsMm.length,
+          ratedOuterWidthMm: material.ratedOuterDimensionsMm.width,
+          ratedOuterHeightMm: material.ratedOuterDimensionsMm.height,
+          ratedOuterDimensionEvidenceType:
+            material.ratedOuterDimensionEvidenceType,
+          ratedOuterDimensionEvidenceReference:
+            material.ratedOuterDimensionEvidenceReference,
           dimensionBasis: material.dimensionBasis,
           dimensionEvidenceType: material.dimensionEvidenceType,
           dimensionEvidenceReference: material.dimensionEvidenceReference,
@@ -1027,6 +1204,17 @@ export default function PackagingMaterialsPanel() {
                       {material.readiness.eligibleForCartonization && (
                         <Chip size="small" label="Optimizer eligible" color="info" variant="outlined" />
                       )}
+                      {material.ratedOuterDimensionsMm.length !== null
+                        && material.ratedOuterDimensionsMm.width !== null
+                        && material.ratedOuterDimensionsMm.height !== null
+                        && material.ratedOuterDimensionEvidenceType ? (
+                        <Chip
+                          size="small"
+                          label="Checkout-rated dimensions"
+                          color="secondary"
+                          variant="outlined"
+                        />
+                      ) : null}
                     </Stack>
                     <Typography variant="caption" color="text.secondary">
                       {material.code} · {material.globalId} · {display(material.materialType)}
@@ -1063,6 +1251,17 @@ export default function PackagingMaterialsPanel() {
                     </Typography>
                     <Typography variant="caption" color="text.disabled" display="block">
                       {canonicalDimensions(material)} mm canonical
+                    </Typography>
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      display="block"
+                      sx={{ mt: 0.5 }}
+                    >
+                      Rated outer: {ratedOuterDimensions(
+                        material,
+                        measurementSystem,
+                      )}
                     </Typography>
                   </Box>
                   <Box>
@@ -1195,7 +1394,9 @@ export default function PackagingMaterialsPanel() {
                 Record only the measurements the customer or supplier actually supplied.
                 Incomplete facts remain a safe draft; ClawPilot will not invent envelope
                 depth, tare, capacity, cost, or stock. Activation requires verified usable
-                inner dimensions and every operating fact.
+                inner dimensions and every operating fact. Shopify checkout rating
+                additionally requires evidenced outside dimensions because carriers rate
+                the parcel exterior.
               </Alert>
               <Stack
                 direction={{ xs: 'column', sm: 'row' }}
@@ -1455,6 +1656,125 @@ export default function PackagingMaterialsPanel() {
                   inputProps={{ maxLength: 3 }}
                   disabled={!materialDraft.unitCost.trim()}
                   required={Boolean(materialDraft.unitCost.trim())}
+                />
+              </Box>
+              <Divider />
+              <Box>
+                <Typography fontWeight={700}>
+                  Rated outer shipping dimensions
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Optional for general storage, but required before this
+                  material can be used for live checkout rating. Enter the
+                  outside parcel dimensions the carrier will rate, not the
+                  usable interior.
+                </Typography>
+              </Box>
+              <Box
+                sx={{
+                  display: 'grid',
+                  gridTemplateColumns: { xs: '1fr', sm: 'repeat(3, 1fr)' },
+                  gap: 1.5,
+                }}
+              >
+                <TextField
+                  type="number"
+                  label={`Outer length (${units.length})`}
+                  value={materialMeasurementDraft.ratedOuterLength}
+                  onChange={(event) => updateMaterialMeasurement(
+                    'ratedOuterLength',
+                    event.target.value,
+                  )}
+                  inputProps={{
+                    min: measurementSystem === 'imperial' ? 0.001 : 0.1,
+                    step: measurementSystem === 'imperial' ? 0.001 : 0.1,
+                  }}
+                  error={materialSubmitted && Boolean(
+                    materialMeasurementErrors.ratedOuterLength,
+                  )}
+                  helperText={materialSubmitted
+                    ? materialMeasurementErrors.ratedOuterLength
+                    : 'Leave all three blank if not measured'}
+                />
+                <TextField
+                  type="number"
+                  label={`Outer width (${units.length})`}
+                  value={materialMeasurementDraft.ratedOuterWidth}
+                  onChange={(event) => updateMaterialMeasurement(
+                    'ratedOuterWidth',
+                    event.target.value,
+                  )}
+                  inputProps={{
+                    min: measurementSystem === 'imperial' ? 0.001 : 0.1,
+                    step: measurementSystem === 'imperial' ? 0.001 : 0.1,
+                  }}
+                  error={materialSubmitted && Boolean(
+                    materialMeasurementErrors.ratedOuterWidth,
+                  )}
+                  helperText={materialSubmitted
+                    ? materialMeasurementErrors.ratedOuterWidth
+                    : 'Carrier-rated outside measurement'}
+                />
+                <TextField
+                  type="number"
+                  label={`Outer height (${units.length})`}
+                  value={materialMeasurementDraft.ratedOuterHeight}
+                  onChange={(event) => updateMaterialMeasurement(
+                    'ratedOuterHeight',
+                    event.target.value,
+                  )}
+                  inputProps={{
+                    min: measurementSystem === 'imperial' ? 0.001 : 0.1,
+                    step: measurementSystem === 'imperial' ? 0.001 : 0.1,
+                  }}
+                  error={materialSubmitted && Boolean(
+                    materialMeasurementErrors.ratedOuterHeight,
+                  )}
+                  helperText={materialSubmitted
+                    ? materialMeasurementErrors.ratedOuterHeight
+                    : 'Carrier-rated outside measurement'}
+                />
+              </Box>
+              <Box
+                sx={{
+                  display: 'grid',
+                  gridTemplateColumns: { xs: '1fr', sm: '1fr 2fr' },
+                  gap: 1.5,
+                }}
+              >
+                <TextField
+                  select
+                  label="Outer-dimension evidence"
+                  value={materialDraft.ratedOuterDimensionEvidenceType}
+                  onChange={(event) => setMaterialDraft({
+                    ...materialDraft,
+                    ratedOuterDimensionEvidenceType:
+                      event.target.value as MaterialForm[
+                        'ratedOuterDimensionEvidenceType'
+                      ],
+                  })}
+                  helperText="Required when rated outer dimensions are present"
+                >
+                  <MenuItem value="">Not recorded</MenuItem>
+                  {evidenceTypeOptions
+                    .filter((option) => option.value !== 'unknown')
+                    .map((option) => (
+                      <MenuItem key={option.value} value={option.value}>
+                        {option.label}
+                      </MenuItem>
+                    ))}
+                </TextField>
+                <TextField
+                  label="Outer-dimension evidence reference"
+                  value={
+                    materialDraft.ratedOuterDimensionEvidenceReference
+                  }
+                  onChange={(event) => setMaterialDraft({
+                    ...materialDraft,
+                    ratedOuterDimensionEvidenceReference:
+                      event.target.value,
+                  })}
+                  helperText="For example: customer box specification dated 2026-07-29"
                 />
               </Box>
               {materialMeasurementsValid && (

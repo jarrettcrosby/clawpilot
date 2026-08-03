@@ -218,6 +218,7 @@ for (const fragment of [
   "starterRow.source !== 'starter_assortment'",
   'PACKAGING_MATERIAL_VERSION_CONFLICT',
   'PACKAGING_MATERIAL_STOCK_VERSION_CONFLICT',
+  'PACKAGING_MATERIAL_STOCK_ACTIVE_CLAIMS_CONFLICT',
   'eligible_shipped_demand_sample_count',
   'missing_product_dimension_count',
   'missing_material_cost_count',
@@ -227,12 +228,26 @@ for (const fragment of [
   "warehouse.status = 'active'",
   'dimension_evidence_reference',
   'dimension_confirmed_at',
-  'dimension_evidence_reference IS DISTINCT FROM $11',
-  'THEN $17',
+  'dimension_evidence_reference IS DISTINCT FROM $16',
+  'THEN $22',
   'input.material.dimensionBasis',
   'input.material.source',
 ]) {
   assert.ok(persistence.includes(fragment), `Persistence missing ${fragment}`)
+}
+const canonicalPlanningMigration = read(
+  'db/migrations/0176_operations_canonical_fulfillment_planning.sql',
+)
+for (const fragment of [
+  'validate_ops_packaging_material_claim',
+  'validate_ops_packaging_stock_active_claims',
+  'Packaging material stock cannot fall below active plan claims',
+  'successful shipment confirmation atomically consumes each claim',
+]) {
+  assert.ok(
+    canonicalPlanningMigration.includes(fragment),
+    `Canonical packaging-claim migration missing ${fragment}`,
+  )
 }
 assert.equal(
   persistence.includes('INSERT INTO operations_warehouses'),

@@ -2,12 +2,14 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
+  commerceCustomerEvidenceFingerprint,
   decryptCommerceIntakeReadResult,
   decryptCommerceIntakeContinuation,
   decryptCommerceCandidateSnapshot,
   encryptCommerceCandidateSnapshot,
   encryptCommerceIntakeReadResult,
   encryptCommerceIntakeContinuation,
+  shopifyCheckoutDestinationFingerprint,
 } from '@/lib/integrations/commerceCredentialCrypto'
 import { CommerceIntegrationRequestError } from '@/lib/integrations/commerceIntegrations'
 import { exactProductMappingMutation } from '@/lib/integrations/commerceProductMappingPolicy'
@@ -25,6 +27,14 @@ import {
   resolveCommerceRuntimePack,
   type CommerceRuntimePackMapping,
 } from '@/lib/integrations/commercePackRuntime'
+import {
+  exactWholeCommerceQuantityFromNumeric,
+  resolveCommerceOrderLineProviderPrice,
+  storableCommerceOrderLineProviderMoney,
+} from '@/lib/integrations/commerceOrderStaging'
+import {
+  automaticFaireOrderSourceIsFresh,
+} from '@/lib/integrations/commerceFaireAutomaticPromotion'
 import type { CommerceRuntimeCredentialRecord } from '@/lib/persistence/commerceIntegrations'
 import {
   commerceCurrencyMinorUnit,
@@ -36,6 +46,7 @@ import {
   type CommerceNormalizedOrderLine,
   type CommercePartySnapshot,
 } from '@/lib/operations/commerceNormalization'
+import type { CommerceCustomerMatchMethod } from '@/lib/operations/types'
 import { stageCrmRecordWithClient } from '@/lib/persistence/crm'
 import {
   acquireTransactionAdvisoryLock,
@@ -50,13 +61,25 @@ import {
   linkProductChannelStateWithClient,
   upsertProductChannelStateWithClient,
 } from '@/lib/persistence/productChannelStates'
+import {
+  reconcileCommerceProductImageSetWithClient,
+  type CommerceProductImageImportJobState,
+} from '@/lib/persistence/commerceProductImageImports'
+import {
+  reconcileShopifyCheckoutRateForOrderCandidateWithClient,
+  shopifyCheckoutRateLineageIsRequired,
+  shopifyCheckoutRateOutcomeAllowsFulfillment,
+  type ShopifyCheckoutRateReconciliationOutcome,
+} from '@/lib/persistence/shopifyCheckoutRating'
 
-const POLICY_VERSION = 'commerce-intake-resolution-v1'
+const POLICY_VERSION = 'commerce-intake-resolution-v2'
 const PRODUCT_INTAKE_POLICY_VERSION = 'commerce-product-intake-policy-v1'
 const DEFAULT_SLA_POLICY_VERSION = 'commerce-default-sla-v1'
 const DEFAULT_SLA_DAYS = 7
 const COMMERCE_INTAKE_READ_LEASE_MS = 2 * 60 * 1_000
 const COMMERCE_INTAKE_PRODUCT_CANDIDATE_RESPONSE_LIMIT = 500
+const CUSTOMER_PREFETCH_BINDING_POLICY_VERSION =
+  'commerce-customer-prefetch-binding-v1'
 
 type CandidateAddress = {
   name: string
@@ -165,6 +188,27 @@ type IntakeAccountRow = {
   activation_revision: number
 }
 
+export type CommerceCustomerPrefetchBindingPlan = {
+  action: 'plan-customer-binding'
+  policyVersion: typeof CUSTOMER_PREFETCH_BINDING_POLICY_VERSION
+  accountGlobalId: string
+  provider: 'faire'
+  customerGlobalId: string
+  customerName: string
+  externalCustomerIdHash: string
+  evidenceEmailHash: string
+  matchMethod: 'email'
+  planHash: string
+  confirmationIdempotencyKey: string
+  alreadyBound: boolean
+  existingBindingStatus: 'active' | 'stale' | 'retired' | null
+  requiresConfirmation: true
+  providerReads: 0
+  providerWrites: 0
+  databaseWrites: 0
+  syncCursorAdvanced: false
+}
+
 type ProductIntakePolicyRow = {
   policy_version: string
   unmatched_action: 'review' | 'auto_create'
@@ -203,6 +247,7 @@ type CandidateRow = {
   discount_minor: string
   brand_discount_minor: string
   shipping_minor: string | null
+  checkout_shipping_service_code: string | null
   tax_minor: string
   other_adjustment_minor: string | null
   total_minor: string | null
@@ -230,6 +275,11 @@ type CandidateRow = {
   unsupported_reason_detail: string | null
   canonical_order_id: string | null
   canonical_order_global_id: string | null
+  checkout_rate_reconciliation_global_id: string | null
+  checkout_rate_receipt_global_id: string | null
+  checkout_rate_reconciliation_outcome:
+    | ShopifyCheckoutRateReconciliationOutcome
+    | null
   customer_global_id: string | null
   row_version: string
   observed_at: string | Date
@@ -247,12 +297,15 @@ type CandidateLineRow = {
   sku_snapshot: string | null
   product_title_snapshot: string
   variant_title_snapshot: string | null
+  provider_status_raw: string
+  normalized_status: string
   ordered_quantity: string
   current_quantity: string
   cancelled_quantity: string
   fulfilled_quantity: string
   unfulfilled_quantity: string
   returned_quantity: string
+  unit_multiplier: string
   currency_code: string | null
   unit_price_minor: string | null
   subtotal_minor: string | null
@@ -296,6 +349,7 @@ type CandidateLineRow = {
   blocking_codes: string[]
   source_revision: string
   source_hash: string
+  observed_at: string | Date
   row_version: string
 }
 
@@ -311,6 +365,7 @@ type RuntimePackMappingRow = {
   is_current: boolean
   source_revision: string | null
   source_hash: string | null
+  pack_evidence_hash: string | null
   profile_version_id: string
   profile_version_global_id: string
   profile_version_row_version: string
@@ -329,7 +384,25 @@ type RuntimePackMappingRow = {
   evidence_type: string
   channel_source_revision: string | null
   channel_source_hash: string | null
+  channel_pack_evidence_hash: string | null
   channel_weight_grams: number | null
+}
+
+type ExactProductVariantStageEvidence = {
+  externalVariantId: string
+  variantSourceRevision: string
+  variantSourceHash: string
+  channelStateGlobalId: string
+  channelStateRowVersion: number
+  channelSourceRevision: string
+  channelSourceHash: string
+  channelPackEvidenceHash: string
+}
+
+type ExactProductPackReadEvidence = ExactProductVariantStageEvidence & {
+  runGlobalId: string
+  externalProductId: string
+  productSourceHash: string
 }
 
 type ProductCandidateRow = {
@@ -350,6 +423,14 @@ type ProductCandidateRow = {
   variant_title_snapshot: string | null
   vendor_snapshot: string | null
   product_type_snapshot: string | null
+  provider_taxonomy_scheme:
+    | 'shopify_standard_product_taxonomy'
+    | 'faire_product_type'
+    | null
+  provider_category_id: string | null
+  provider_category_name: string | null
+  provider_category_full_name: string | null
+  provider_category_paths: string[]
   normalized_options: Array<{
     name: string
     value: string
@@ -409,12 +490,16 @@ export function preserveCommerceProductCandidateEvidence(input: {
   priorSourceHash: string
   incomingSourceHash: string
   priorMappingState: 'unresolved' | 'resolved' | 'unsupported'
+  retryUnresolved: boolean
 }) {
   return (
     input.priorCredentialVersion === input.currentCredentialVersion
     && input.priorSourceRevision === input.incomingSourceRevision
     && input.priorSourceHash === input.incomingSourceHash
-    && input.priorMappingState !== 'unresolved'
+    && (
+      input.priorMappingState !== 'unresolved'
+      || !input.retryUnresolved
+    )
   )
 }
 
@@ -434,6 +519,16 @@ function presentmentMoney(field: CommerceDataField<CommerceMoneySet>) {
 
 function bigintString(value: bigint | null | undefined, fallback = BigInt(0)) {
   return (value ?? fallback).toString()
+}
+
+function commerceCustomerChargeEligible(
+  provider: 'shopify' | 'faire',
+  headerMoneyState: 'complete' | 'operational_incomplete',
+) {
+  // Faire's brand API omits retailer-funded credits and tender evidence.
+  // A complete Faire header is exact brand-side order arithmetic, not proof
+  // of what the retailer was charged.
+  return provider === 'shopify' && headerMoneyState === 'complete'
 }
 
 export function commerceCustomerIdentityKey(input: {
@@ -731,6 +826,470 @@ async function resolveAccount(
   return row
 }
 
+function normalizedCustomerPrefetchEmail(value: unknown) {
+  const email = String(value ?? '').trim().toLowerCase()
+  if (
+    email.length < 3
+    || email.length > 320
+    || /[\s\u0000-\u001f\u007f]/u.test(email)
+    || !/^[^@]+@[^@]+\.[^@]+$/u.test(email)
+  ) {
+    intakeError(
+      'COMMERCE_CUSTOMER_PREFETCH_EMAIL_INVALID',
+      'Enter the exact retailer email shown in the provider evidence',
+      400,
+    )
+  }
+  return email
+}
+
+function normalizedFaireRetailerId(value: unknown) {
+  const externalCustomerId = String(value ?? '').trim()
+  if (
+    externalCustomerId.length < 1
+    || externalCustomerId.length > 512
+    || /[\u0000-\u001f\u007f]/u.test(externalCustomerId)
+  ) {
+    intakeError(
+      'COMMERCE_CUSTOMER_PREFETCH_RETAILER_ID_INVALID',
+      'Enter the immutable retailer ID returned by Faire',
+      400,
+    )
+  }
+  return externalCustomerId
+}
+
+type CustomerPrefetchBindingRow = {
+  id: string
+  reference_code: string
+  name: string
+  email: string | null
+  updated_at: string | Date
+}
+
+type CustomerPrefetchExternalIdentifierRow = {
+  entity_global_id: string
+  status: 'active' | 'stale' | 'retired'
+}
+
+async function customerPrefetchBindingPlanWithClient(
+  client: PoolClient,
+  input: {
+    runtime: CommerceRuntimeCredentialRecord
+    externalCustomerId: string
+    customerGlobalId: string
+    evidenceEmail: string
+    lock: boolean
+  },
+): Promise<CommerceCustomerPrefetchBindingPlan> {
+  const externalCustomerId = normalizedFaireRetailerId(
+    input.externalCustomerId,
+  )
+  const evidenceEmail = normalizedCustomerPrefetchEmail(input.evidenceEmail)
+  const account = await resolveAccount(client, {
+    organizationId: input.runtime.organizationId,
+    accountGlobalId: input.runtime.globalId,
+    forUpdate: input.lock,
+  })
+  if (account.provider !== 'faire' || input.runtime.provider !== 'faire') {
+    intakeError(
+      'COMMERCE_CUSTOMER_PREFETCH_FAIRE_REQUIRED',
+      'Pre-fetch retailer binding is available only for a Faire connection',
+      409,
+    )
+  }
+  if (!['shadow', 'active'].includes(account.activation_state)) {
+    intakeError(
+      'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
+      'Open Operations and set Activation to Shadow or Active before binding a Faire retailer',
+    )
+  }
+  if (input.lock) {
+    await acquireTransactionAdvisoryLock(
+      client,
+      [
+        'operations:commerce-customer',
+        account.organization_id,
+        account.global_id,
+        externalCustomerId,
+      ].join(':'),
+    )
+  }
+
+  const target = (
+    await client.query<CustomerPrefetchBindingRow>(
+      `SELECT id::text, reference_code, name, email, updated_at
+       FROM crm_organizations
+       WHERE pipeline_id = $1::uuid
+         AND reference_code = $2
+         AND relationship_type = 'customer'
+         AND COALESCE(lower(source_payload->>'archived'), 'false')
+             NOT IN ('true', '1', 'yes')
+       LIMIT 1
+       ${input.lock ? 'FOR UPDATE' : ''}`,
+      [account.pipeline_id, input.customerGlobalId],
+    )
+  ).rows[0]
+  if (!target) {
+    intakeError(
+      'COMMERCE_CUSTOMER_PREFETCH_TARGET_NOT_FOUND',
+      'Select an active CRM customer organization for the retailer binding',
+      404,
+    )
+  }
+  const organizationEmailMatches = await client.query<{
+    reference_code: string
+  }>(
+    `SELECT organization.reference_code
+     FROM crm_organizations organization
+     WHERE organization.pipeline_id = $1::uuid
+       AND organization.relationship_type = 'customer'
+       AND lower(btrim(organization.email)) = $2
+       AND COALESCE(lower(organization.source_payload->>'archived'), 'false')
+           NOT IN ('true', '1', 'yes')
+     ORDER BY organization.reference_code
+     ${input.lock ? 'FOR UPDATE OF organization' : ''}`,
+    [account.pipeline_id, evidenceEmail],
+  )
+  const contactEmailMatches = await client.query<{
+    reference_code: string
+  }>(
+    `SELECT organization.reference_code
+     FROM crm_contacts contact
+     JOIN crm_organizations organization
+       ON organization.pipeline_id = contact.pipeline_id
+      AND organization.id = contact.organization_id
+     WHERE organization.pipeline_id = $1::uuid
+       AND organization.relationship_type = 'customer'
+       AND lower(btrim(contact.email)) = $2
+       AND COALESCE(lower(organization.source_payload->>'archived'), 'false')
+           NOT IN ('true', '1', 'yes')
+       AND COALESCE(lower(contact.source_payload->>'archived'), 'false')
+           NOT IN ('true', '1', 'yes')
+     ORDER BY organization.reference_code
+     ${input.lock ? 'FOR UPDATE OF contact, organization' : ''}`,
+    [account.pipeline_id, evidenceEmail],
+  )
+  const emailMatches = Array.from(new Set([
+    ...organizationEmailMatches.rows.map((row) => row.reference_code),
+    ...contactEmailMatches.rows.map((row) => row.reference_code),
+  ])).sort()
+  if (
+    emailMatches.length !== 1
+    || emailMatches[0] !== target.reference_code
+  ) {
+    intakeError(
+      emailMatches.length === 0
+        ? 'COMMERCE_CUSTOMER_PREFETCH_EMAIL_MISMATCH'
+        : 'COMMERCE_CUSTOMER_PREFETCH_EMAIL_AMBIGUOUS',
+      emailMatches.length === 0
+        ? 'The supplied retailer email does not match the selected CRM customer or one of its active contacts'
+        : 'The retailer email must identify exactly one active CRM customer before it can be bound',
+      409,
+    )
+  }
+
+  const existingBinding = (
+    await client.query<CustomerPrefetchExternalIdentifierRow>(
+      `SELECT entity_global_id, status
+       FROM operations_external_identifiers
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND entity_type = 'crm.organization'
+         AND external_id = $3
+       LIMIT 1
+       ${input.lock ? 'FOR UPDATE' : ''}`,
+      [account.organization_id, account.id, externalCustomerId],
+    )
+  ).rows[0] || null
+  if (
+    existingBinding
+    && existingBinding.entity_global_id !== target.reference_code
+  ) {
+    intakeError(
+      'COMMERCE_CUSTOMER_PREFETCH_IDENTITY_CONFLICT',
+      'This Faire retailer ID is already bound to a different CRM customer',
+      409,
+    )
+  }
+
+  const externalCustomerIdHash = commerceCustomerEvidenceFingerprint({
+    organizationId: account.organization_id,
+    accountGlobalId: account.global_id,
+    kind: 'external_customer_id',
+    value: externalCustomerId,
+  })
+  const evidenceEmailHash = commerceCustomerEvidenceFingerprint({
+    organizationId: account.organization_id,
+    accountGlobalId: account.global_id,
+    kind: 'email',
+    value: evidenceEmail,
+  })
+  const alreadyBound = existingBinding?.status === 'active'
+  const planHash = commandHash({
+    policyVersion: CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+    accountGlobalId: account.global_id,
+    credentialVersion: account.credential_version,
+    activationRevision: account.activation_revision,
+    customerGlobalId: target.reference_code,
+    customerUpdatedAt: iso(target.updated_at),
+    externalCustomerIdHash,
+    evidenceEmailHash,
+    matchMethod: 'email',
+    existingBindingStatus: existingBinding?.status || null,
+  })
+  const confirmationIdempotencyKey = deterministicCustomerPrefetchBindingUuid([
+    CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+    account.organization_id,
+    account.global_id,
+    target.reference_code,
+    externalCustomerIdHash,
+    planHash,
+  ])
+  return {
+    action: 'plan-customer-binding',
+    policyVersion: CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+    accountGlobalId: account.global_id,
+    provider: 'faire',
+    customerGlobalId: target.reference_code,
+    customerName: target.name,
+    externalCustomerIdHash,
+    evidenceEmailHash,
+    matchMethod: 'email',
+    planHash,
+    confirmationIdempotencyKey,
+    alreadyBound,
+    existingBindingStatus: existingBinding?.status || null,
+    requiresConfirmation: true,
+    providerReads: 0,
+    providerWrites: 0,
+    databaseWrites: 0,
+    syncCursorAdvanced: false,
+  }
+}
+
+export async function planCommerceCustomerPrefetchBindingInPostgres(input: {
+  runtime: CommerceRuntimeCredentialRecord
+  externalCustomerId: string
+  customerGlobalId: string
+  evidenceEmail: string
+}) {
+  return withTransaction((client) => customerPrefetchBindingPlanWithClient(
+    client,
+    { ...input, lock: false },
+  ))
+}
+
+export async function confirmCommerceCustomerPrefetchBindingInPostgres(input: {
+  runtime: CommerceRuntimeCredentialRecord
+  actorEmail: string
+  externalCustomerId: string
+  customerGlobalId: string
+  evidenceEmail: string
+  planHash: string
+  confirmed: boolean
+}) {
+  const externalCustomerId = normalizedFaireRetailerId(
+    input.externalCustomerId,
+  )
+  const evidenceEmail = normalizedCustomerPrefetchEmail(input.evidenceEmail)
+  if (!/^[a-f0-9]{64}$/u.test(input.planHash)) {
+    intakeError(
+      'COMMERCE_CUSTOMER_PREFETCH_PLAN_INVALID',
+      'Review the current retailer binding before confirming it',
+      400,
+    )
+  }
+  if (!input.confirmed) {
+    intakeError(
+      'COMMERCE_CUSTOMER_PREFETCH_CONFIRMATION_REQUIRED',
+      'Confirm the reviewed Faire retailer and CRM customer binding',
+      400,
+    )
+  }
+  return withTransaction(async (client) => {
+    const account = await resolveAccount(client, {
+      organizationId: input.runtime.organizationId,
+      accountGlobalId: input.runtime.globalId,
+      forUpdate: true,
+    })
+    if (account.provider !== 'faire' || input.runtime.provider !== 'faire') {
+      intakeError(
+        'COMMERCE_CUSTOMER_PREFETCH_FAIRE_REQUIRED',
+        'Pre-fetch retailer binding is available only for a Faire connection',
+        409,
+      )
+    }
+    if (!['shadow', 'active'].includes(account.activation_state)) {
+      intakeError(
+        'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
+        'Open Operations and set Activation to Shadow or Active before binding a Faire retailer',
+      )
+    }
+    const requestHash = commandHash({
+      policyVersion: CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+      accountGlobalId: account.global_id,
+      customerGlobalId: input.customerGlobalId,
+      externalCustomerIdHash: commerceCustomerEvidenceFingerprint({
+        organizationId: account.organization_id,
+        accountGlobalId: account.global_id,
+        kind: 'external_customer_id',
+        value: externalCustomerId,
+      }),
+      evidenceEmailHash: commerceCustomerEvidenceFingerprint({
+        organizationId: account.organization_id,
+        accountGlobalId: account.global_id,
+        kind: 'email',
+        value: evidenceEmail,
+      }),
+      planHash: input.planHash,
+      confirmed: true,
+    })
+    const prepared = await prepareReceipt(client, {
+      organizationId: account.organization_id,
+      commandType: 'commerce.intake.confirm_customer_prefetch_binding',
+      idempotencyKey: deterministicCustomerPrefetchBindingUuid([
+        CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+        account.organization_id,
+        account.global_id,
+        input.customerGlobalId,
+        commerceCustomerEvidenceFingerprint({
+          organizationId: account.organization_id,
+          accountGlobalId: account.global_id,
+          kind: 'external_customer_id',
+          value: externalCustomerId,
+        }),
+        input.planHash,
+      ]),
+      requestHash,
+      actorEmail: input.actorEmail,
+    })
+    if (prepared.replayed) return replayPayload(prepared.receipt)
+
+    const plan = await customerPrefetchBindingPlanWithClient(client, {
+      runtime: input.runtime,
+      externalCustomerId,
+      customerGlobalId: input.customerGlobalId,
+      evidenceEmail,
+      lock: true,
+    })
+    if (plan.planHash !== input.planHash) {
+      intakeError(
+        'COMMERCE_CUSTOMER_PREFETCH_PLAN_STALE',
+        'The retailer binding changed after review. Create a new plan before confirming it',
+        409,
+      )
+    }
+
+    const matchEvidence = {
+      schema: CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+      provider: 'faire',
+      evidenceType: 'operator_confirmed_email',
+      externalCustomerIdHash: plan.externalCustomerIdHash,
+      evidenceEmailHash: plan.evidenceEmailHash,
+      planHash: plan.planHash,
+      confirmedBeforeProviderRead: true,
+    }
+    const boundIdentity = await client.query<{ entity_global_id: string }>(
+      `INSERT INTO operations_external_identifiers (
+         organization_id, integration_account_id, entity_type,
+         entity_global_id, external_id, status, match_method,
+         match_evidence, last_verified_at
+       ) VALUES (
+         $1::uuid, $2::uuid, 'crm.organization', $3, $4,
+         'active', 'email', $5::jsonb, now()
+       )
+       ON CONFLICT (
+         organization_id, integration_account_id, entity_type, external_id
+       ) DO UPDATE SET
+         status = 'active',
+         match_method = 'email',
+         match_evidence = EXCLUDED.match_evidence,
+         last_verified_at = now()
+       WHERE operations_external_identifiers.entity_global_id
+             = EXCLUDED.entity_global_id
+       RETURNING entity_global_id`,
+      [
+        account.organization_id,
+        account.id,
+        plan.customerGlobalId,
+        externalCustomerId,
+        safeJson(matchEvidence),
+      ],
+    )
+    if (boundIdentity.rows[0]?.entity_global_id !== plan.customerGlobalId) {
+      intakeError(
+        'COMMERCE_CUSTOMER_PREFETCH_IDENTITY_CONFLICT',
+        'This Faire retailer ID was bound concurrently to a different CRM customer',
+        409,
+      )
+    }
+    const bindingOutcome = plan.existingBindingStatus === 'active'
+      ? 'verified_existing' as const
+      : plan.existingBindingStatus
+        ? 'reactivated' as const
+        : 'created' as const
+    const result = {
+      action: 'confirm-customer-binding',
+      policyVersion: CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+      accountGlobalId: account.global_id,
+      provider: 'faire' as const,
+      customerGlobalId: plan.customerGlobalId,
+      customerName: plan.customerName,
+      externalCustomerIdHash: plan.externalCustomerIdHash,
+      evidenceEmailHash: plan.evidenceEmailHash,
+      matchMethod: 'email' as const,
+      planHash: plan.planHash,
+      bindingOutcome,
+      identityWrites: 1 as const,
+      receiptWrites: 2 as const,
+      auditWrites: 1 as const,
+      providerReads: 0 as const,
+      providerWrites: 0 as const,
+      databaseWrites: 4 as const,
+      syncCursorAdvanced: false as const,
+      replayed: false,
+    }
+    await completeReceipt(
+      client,
+      prepared.receipt.id,
+      plan.customerGlobalId,
+      result,
+    )
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'commerce.intake.customer_identity.prebound',
+      aggregateType: 'operations.integration_account',
+      aggregateId: account.global_id,
+      subject: plan.customerName,
+      organizationId: account.organization_id,
+      eventKey:
+        `commerce-customer-prefetch-binding:${account.global_id}:${
+          plan.confirmationIdempotencyKey
+        }`,
+      payload: {
+        policyVersion: CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+        provider: 'faire',
+        customerGlobalId: plan.customerGlobalId,
+        externalCustomerIdHash: plan.externalCustomerIdHash,
+        evidenceEmailHash: plan.evidenceEmailHash,
+        matchMethod: plan.matchMethod,
+        planHash: plan.planHash,
+        bindingOutcome,
+        identityWrites: 1,
+        receiptWrites: 2,
+        auditWrites: 1,
+        confirmedBeforeProviderRead: true,
+        providerReads: 0,
+        providerWrites: 0,
+        databaseWrites: 4,
+        syncCursorAdvanced: false,
+      },
+    }, client)
+    return result
+  })
+}
+
 function blocker(code: string) {
   const definitions: Record<string, {
     label: string
@@ -738,17 +1297,17 @@ function blocker(code: string) {
     terminal: boolean
   }> = {
     customer_resolution_required: {
-      label: 'Choose or create the CRM customer',
+      label: 'Review the unresolved CRM customer identity',
       action: 'resolve-customer',
       terminal: false,
     },
     customer_redacted: {
-      label: 'Enter or choose the CRM customer',
+      label: 'Enter the provider-redacted CRM customer identity',
       action: 'resolve-customer',
       terminal: false,
     },
     customer_unavailable: {
-      label: 'Enter or choose the CRM customer',
+      label: 'Enter the unavailable CRM customer identity',
       action: 'resolve-customer',
       terminal: false,
     },
@@ -878,6 +1437,169 @@ function canonicalJson(value: unknown): string {
 
 function commandHash(value: unknown) {
   return createHash('sha256').update(canonicalJson(value)).digest('hex')
+}
+
+function deterministicCustomerPrefetchBindingUuid(parts: readonly string[]) {
+  const hex = createHash('sha256')
+    .update(parts.join('\0'))
+    .digest('hex')
+    .slice(0, 32)
+    .split('')
+  hex[12] = '5'
+  hex[16] = ['8', '9', 'a', 'b'][parseInt(hex[16], 16) % 4]
+  const value = hex.join('')
+  return [
+    value.slice(0, 8),
+    value.slice(8, 12),
+    value.slice(12, 16),
+    value.slice(16, 20),
+    value.slice(20),
+  ].join('-')
+}
+
+function envelopeMatchesExactOrderTarget(
+  envelope: CommerceNormalizationEnvelope,
+  exactExternalOrderIdHash: string,
+) {
+  const returnedOrderIdentities = [
+    ...envelope.orders.map((order) => order.identity.value),
+    ...envelope.rejections
+      .filter((rejection) => rejection.resourceType === 'order')
+      .map((rejection) => rejection.externalId),
+  ]
+  return (
+    returnedOrderIdentities.length === 1
+    && commandHash(returnedOrderIdentities[0])
+      === exactExternalOrderIdHash
+  )
+}
+
+function envelopeMatchesExactProductTarget(
+  envelope: CommerceNormalizationEnvelope,
+  exactExternalProductIdHash: string,
+) {
+  const productRejections = envelope.rejections.filter(
+    (rejection) => rejection.resourceType === 'product',
+  )
+  return (
+    envelope.products.length === 1
+    && productRejections.length === 0
+    && commandHash(envelope.products[0].identity.value)
+      === exactExternalProductIdHash
+  )
+}
+
+function exactProductAuditEvidenceMatches(
+  value: unknown,
+  expected: ExactProductPackReadEvidence,
+) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const product = value as Record<string, unknown>
+  if (
+    product.externalProductId !== expected.externalProductId
+    || product.productSourceHash !== expected.productSourceHash
+    || !Array.isArray(product.variants)
+  ) return false
+  const variants = product.variants.filter((entry) => (
+    entry
+    && typeof entry === 'object'
+    && !Array.isArray(entry)
+    && (entry as Record<string, unknown>).externalVariantId
+      === expected.externalVariantId
+  )) as Record<string, unknown>[]
+  if (variants.length !== 1) return false
+  const variant = variants[0]
+  return (
+    variant.variantSourceRevision === expected.variantSourceRevision
+    && variant.variantSourceHash === expected.variantSourceHash
+    && variant.channelStateGlobalId === expected.channelStateGlobalId
+    && variant.channelStateRowVersion === expected.channelStateRowVersion
+    && variant.channelSourceRevision === expected.channelSourceRevision
+    && variant.channelSourceHash === expected.channelSourceHash
+    && variant.channelPackEvidenceHash === expected.channelPackEvidenceHash
+  )
+}
+
+async function reconcileStagedCommerceProductImages(
+  input: {
+    account: Pick<
+      IntakeAccountRow,
+      'organization_id' | 'id' | 'provider' | 'credential_version'
+    >
+    envelope: CommerceNormalizationEnvelope
+    actorEmail: string
+  },
+  client: PoolClient,
+) {
+  const jobsByState: Record<CommerceProductImageImportJobState, number> = {
+    waiting_mapping: 0,
+    queued: 0,
+    claimed: 0,
+    retry: 0,
+    succeeded: 0,
+    dead: 0,
+    cancelled: 0,
+  }
+  let activeImagesObserved = 0
+  let removedImagesObserved = 0
+  let staleSnapshotsIgnored = 0
+  for (const product of input.envelope.products) {
+    const productLifecycle = (
+      input.account.provider === 'faire'
+      && product.lifecycleState?.toUpperCase() === 'DELETED'
+    )
+      ? 'deleted' as const
+      : 'active' as const
+    const result = await reconcileCommerceProductImageSetWithClient({
+      organizationId: input.account.organization_id,
+      integrationAccountId: input.account.id,
+      provider: input.account.provider,
+      credentialGeneration: input.account.credential_version,
+      externalProductId: product.identity.value,
+      productSourceHash: product.sourceHash,
+      productLifecycle,
+      imageSetComplete: product.imageSetComplete,
+      observedAt: input.envelope.observedAt,
+      providerUpdatedAt: product.providerUpdatedAt,
+      actorEmail: input.actorEmail,
+      images: product.images.map((image) => ({
+        providerImageId: image.providerImageId,
+        locatorSha256: image.locatorFingerprint,
+        sequence: image.sequence,
+        altText: image.altText,
+        pixelWidth: image.widthPixels,
+        pixelHeight: image.heightPixels,
+        // Image observation revisions depend only on safe image evidence.
+        // Unrelated title, inventory, and variant changes may advance the set
+        // snapshot without creating duplicate image jobs.
+        sourceHash: commandHash({
+          schema: 'commerce-product-image-observation-v1',
+          provider: input.account.provider,
+          providerImageId: image.providerImageId,
+          locatorSha256: image.locatorFingerprint,
+          sequence: image.sequence,
+          altText: image.altText,
+          pixelWidth: image.widthPixels,
+          pixelHeight: image.heightPixels,
+        }),
+      })),
+    }, client)
+    if (result.staleSnapshotIgnored) staleSnapshotsIgnored += 1
+    activeImagesObserved += result.active.length
+    removedImagesObserved += result.removed.length
+    for (const observation of [...result.active, ...result.removed]) {
+      jobsByState[observation.jobState] += 1
+    }
+  }
+  return {
+    productsObserved: input.envelope.products.length,
+    activeImagesObserved,
+    removedImagesObserved,
+    staleSnapshotsIgnored,
+    jobsByState,
+    providerWrites: 0 as const,
+    syncCursorAdvanced: false as const,
+  }
 }
 
 function deterministicCommandUuid(value: unknown) {
@@ -1143,6 +1865,7 @@ const CANDIDATE_SELECT = `SELECT
   candidate.discount_minor::text,
   candidate.brand_discount_minor::text,
   candidate.shipping_minor::text,
+  candidate.checkout_shipping_service_code,
   candidate.tax_minor::text,
   candidate.other_adjustment_minor::text,
   candidate.total_minor::text,
@@ -1170,6 +1893,11 @@ const CANDIDATE_SELECT = `SELECT
   candidate.unsupported_reason_detail,
   candidate.canonical_order_id::text,
   canonical_order.global_id AS canonical_order_global_id,
+  checkout_reconciliation.global_id
+    AS checkout_rate_reconciliation_global_id,
+  checkout_receipt.global_id AS checkout_rate_receipt_global_id,
+  checkout_reconciliation.outcome
+    AS checkout_rate_reconciliation_outcome,
   customer.reference_code AS customer_global_id,
   candidate.row_version::text,
   candidate.observed_at,
@@ -1183,6 +1911,13 @@ JOIN operations_commerce_intake_runs run
 LEFT JOIN operations_orders canonical_order
   ON canonical_order.organization_id = candidate.organization_id
  AND canonical_order.id = candidate.canonical_order_id
+LEFT JOIN operations_shopify_checkout_rate_current_reconciliations
+    checkout_reconciliation
+  ON checkout_reconciliation.organization_id = candidate.organization_id
+ AND checkout_reconciliation.order_candidate_id = candidate.id
+LEFT JOIN operations_shopify_checkout_rate_receipts checkout_receipt
+  ON checkout_receipt.organization_id = checkout_reconciliation.organization_id
+ AND checkout_receipt.id = checkout_reconciliation.receipt_id
 LEFT JOIN crm_organizations customer
   ON customer.pipeline_id = candidate.pipeline_id
  AND customer.id = candidate.customer_id`
@@ -1198,12 +1933,15 @@ const LINE_SELECT = `SELECT
   line.sku_snapshot,
   line.product_title_snapshot,
   line.variant_title_snapshot,
+  line.provider_status_raw,
+  line.normalized_status,
   line.ordered_quantity::text,
   line.current_quantity::text,
   line.cancelled_quantity::text,
   line.fulfilled_quantity::text,
   line.unfulfilled_quantity::text,
   line.returned_quantity::text,
+  line.unit_multiplier::text,
   line.currency_code,
   line.unit_price_minor::text,
   line.subtotal_minor::text,
@@ -1248,6 +1986,7 @@ const LINE_SELECT = `SELECT
   line.blocking_codes,
   line.source_revision,
   line.source_hash,
+  line.observed_at,
   line.row_version::text
 FROM operations_commerce_order_candidate_lines line
 LEFT JOIN crm_products product
@@ -1281,6 +2020,11 @@ const PRODUCT_CANDIDATE_SELECT = `SELECT
   candidate.variant_title_snapshot,
   candidate.vendor_snapshot,
   candidate.product_type_snapshot,
+  candidate.provider_taxonomy_scheme,
+  candidate.provider_category_id,
+  candidate.provider_category_name,
+  candidate.provider_category_full_name,
+  candidate.provider_category_paths,
   candidate.normalized_options,
   candidate.provider_status_raw,
   candidate.normalized_status,
@@ -1768,6 +2512,46 @@ function dynamicCandidateBlockingCodes(
   return [...codes].sort()
 }
 
+async function reconcileFreshCandidateBlockers(
+  client: PoolClient,
+  candidateId: string,
+  actorEmail: string,
+) {
+  const selected = await client.query<CandidateRow>(
+    `${CANDIDATE_SELECT}
+     WHERE candidate.id = $1::uuid
+     FOR UPDATE OF candidate`,
+    [candidateId],
+  )
+  const candidate = selected.rows[0]
+  if (!candidate) {
+    intakeError(
+      'COMMERCE_INTAKE_CANDIDATE_MISSING',
+      'The freshly staged order candidate is unavailable',
+      409,
+    )
+  }
+  const lines = await candidateLines(client, candidate, true)
+  const blockingCodes = dynamicCandidateBlockingCodes(candidate, lines)
+  const updated = await client.query(
+    `UPDATE operations_commerce_order_candidates
+     SET blocking_codes = $2::text[],
+         row_version = row_version + 1,
+         updated_by = $3,
+         updated_at = now()
+     WHERE id = $1::uuid
+       AND workflow_state = 'held'`,
+    [candidateId, blockingCodes, actorEmail],
+  )
+  if (updated.rowCount !== 1) {
+    intakeError(
+      'COMMERCE_INTAKE_CANDIDATE_STATE_CONFLICT',
+      'The freshly staged order candidate changed state before reconciliation',
+      409,
+    )
+  }
+}
+
 function shopifyCandidateQuantitiesAreExact(lines: CandidateLineRow[]) {
   return lines.length > 0 && lines.every((line) => {
     const ordered = Number(line.ordered_quantity)
@@ -1794,8 +2578,12 @@ function canonicalMerchandiseTotalMinor(
 ) {
   let total = BigInt(0)
   for (const line of operationalLines) {
+    const unfulfilledQuantity = exactWholeCommerceQuantityFromNumeric(
+      line.unfulfilled_quantity,
+    )
     if (
-      !/^[1-9][0-9]*$/.test(line.unfulfilled_quantity)
+      unfulfilledQuantity === null
+      || unfulfilledQuantity <= BigInt(0)
       || line.resolved_unit_price_minor === null
       || !/^[0-9]+$/.test(line.resolved_unit_price_minor)
       || line.resolved_currency_code !== candidate.currency_code
@@ -1806,7 +2594,7 @@ function canonicalMerchandiseTotalMinor(
         422,
       )
     }
-    total += BigInt(line.unfulfilled_quantity)
+    total += unfulfilledQuantity
       * BigInt(line.resolved_unit_price_minor)
   }
   if (!operationalLines.length) {
@@ -2344,40 +3132,53 @@ export async function markCommerceIntakeContinuationInvalidInPostgres(input: {
   })
 }
 
-export async function readCommerceIntakeStageReplayFromPostgres(input: {
-  organizationId: string
-  accountGlobalId: string
+type CommerceIntakeStageReplayLookup = {
   idempotencyKey: string
   action: CommerceIntakeStageAction
+  exactExternalOrderIdHash?: string | null
+  exactExternalProductIdHash?: string | null
   target: {
     kind: 'none' | 'candidate' | 'rejection' | 'continuation'
     globalId: string | null
   }
-}) {
-  return withTransaction(async (client) => {
-    const account = await resolveAccount(client, {
-      organizationId: input.organizationId,
-      accountGlobalId: input.accountGlobalId,
-    })
-    const result = await client.query<{
+}
+
+async function readCommerceIntakeStageReplayWithClient(
+  client: PoolClient,
+  account: IntakeAccountRow,
+  input: CommerceIntakeStageReplayLookup,
+) {
+  const result = await client.query<{
       global_id: string
       workflow_state: string
       records_staged: number
+      request_hash: string
       staged_action: string | null
       stage_result: Record<string, unknown> | null
       intent_action: CommerceIntakeReadIntentAction
       target_kind: 'none' | 'candidate' | 'rejection' | 'continuation'
       target_global_id: string | null
-    }>(
+      provider_target_hash: string | null
+  }>(
       `SELECT
          run.global_id,
          run.workflow_state,
          run.records_staged,
+         run.request_hash,
          audit.payload->>'action' AS staged_action,
          audit.payload->'stageResult' AS stage_result,
          intent.intake_action AS intent_action,
          intent.target_kind,
-         intent.target_global_id
+         intent.target_global_id,
+         (
+           SELECT attempt.redacted_request->>'targetHash'
+           FROM operations_commerce_provider_attempts attempt
+           WHERE attempt.organization_id = intent.organization_id
+             AND attempt.integration_account_id
+                 = intent.integration_account_id
+             AND attempt.id = intent.provider_attempt_id
+           LIMIT 1
+         ) AS provider_target_hash
        FROM operations_commerce_intake_runs run
        JOIN operations_commerce_intake_read_intents intent
          ON intent.organization_id = run.organization_id
@@ -2409,21 +3210,32 @@ export async function readCommerceIntakeStageReplayFromPostgres(input: {
           : 'products_and_orders',
         input.idempotencyKey,
       ],
+  )
+  const row = result.rows[0]
+  if (!row) return null
+  if (
+    row.intent_action !== input.action
+    || (row.staged_action && row.staged_action !== input.action)
+    || row.target_kind !== input.target.kind
+    || row.target_global_id !== input.target.globalId
+    || (
+      input.exactExternalOrderIdHash !== undefined
+      && row.provider_target_hash !== input.exactExternalOrderIdHash
     )
-    const row = result.rows[0]
-    if (!row) return null
-    if (
-      row.intent_action !== input.action
-      || (row.staged_action && row.staged_action !== input.action)
-      || row.target_kind !== input.target.kind
-      || row.target_global_id !== input.target.globalId
-    ) {
-      intakeError(
-        'COMMERCE_INTAKE_IDEMPOTENCY_CONFLICT',
-        'This idempotency key already completed a different intake action or target',
-      )
-    }
-    return {
+    || (
+      input.exactExternalProductIdHash !== undefined
+      && row.provider_target_hash !== input.exactExternalProductIdHash
+    )
+  ) {
+    intakeError(
+      'COMMERCE_INTAKE_IDEMPOTENCY_CONFLICT',
+      'This idempotency key already completed a different intake action or target',
+    )
+  }
+  return {
+    requestHash: row.request_hash,
+    hasDurableStageResult: Boolean(row.stage_result),
+    stageResult: {
       ...(row.stage_result || {}),
       action: row.staged_action || input.action,
       replayed: true,
@@ -2434,7 +3246,25 @@ export async function readCommerceIntakeStageReplayFromPostgres(input: {
         row.stage_result?.recordsStaged ?? row.records_staged,
       providerWrites: 0,
       syncCursorAdvanced: false,
-    }
+    },
+  }
+}
+
+export async function readCommerceIntakeStageReplayFromPostgres(input: {
+  organizationId: string
+  accountGlobalId: string
+} & CommerceIntakeStageReplayLookup) {
+  return withTransaction(async (client) => {
+    const account = await resolveAccount(client, {
+      organizationId: input.organizationId,
+      accountGlobalId: input.accountGlobalId,
+    })
+    const replay = await readCommerceIntakeStageReplayWithClient(
+      client,
+      account,
+      input,
+    )
+    return replay?.stageResult || null
   })
 }
 
@@ -2445,6 +3275,8 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
   action: CommerceIntakeReadIntentAction
   resource: 'orders' | 'products'
   target: CommerceIntakeReadIntentTarget
+  exactExternalOrderIdHash?: string | null
+  exactExternalProductIdHash?: string | null
   continuationRunGlobalId: string | null
   pageSize: number
 }) {
@@ -2477,6 +3309,30 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
       || (
         input.target.kind === 'rejection'
         && input.action !== 'retry-rejection'
+      )
+      || (
+        input.exactExternalOrderIdHash
+        && (
+          input.action !== 'fetch'
+          || input.resource !== 'orders'
+          || input.target.kind !== 'none'
+          || input.continuationRunGlobalId !== null
+          || !/^[a-f0-9]{64}$/.test(input.exactExternalOrderIdHash)
+        )
+      )
+      || (
+        input.exactExternalProductIdHash
+        && (
+          input.action !== 'fetch-products'
+          || input.resource !== 'products'
+          || input.target.kind !== 'none'
+          || input.continuationRunGlobalId !== null
+          || !/^[a-f0-9]{64}$/.test(input.exactExternalProductIdHash)
+        )
+      )
+      || (
+        Boolean(input.exactExternalOrderIdHash)
+        && Boolean(input.exactExternalProductIdHash)
       )
     ) {
       intakeError(
@@ -2666,6 +3522,12 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
       action: input.action,
       resource: input.resource,
       target,
+      ...(input.exactExternalOrderIdHash
+        ? { exactExternalOrderIdHash: input.exactExternalOrderIdHash }
+        : {}),
+      ...(input.exactExternalProductIdHash
+        ? { exactExternalProductIdHash: input.exactExternalProductIdHash }
+        : {}),
       pageSize: input.pageSize,
       readOnly: true,
       providerWrites: 0,
@@ -2678,6 +3540,9 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
     const existing = await client.query<{
       id: string
       request_hash: string
+      provider: 'shopify' | 'faire'
+      resource: 'orders' | 'products'
+      credential_version: number
       intent_state:
         | 'prepared'
         | 'reading'
@@ -2691,11 +3556,19 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
       window_end: Date
       query_hash: string
       provider_attempt_id: string | null
+      target_kind: 'none' | 'candidate' | 'rejection' | 'continuation'
+      target_global_id: string | null
+      continuation_id: string | null
+      continuation_cursor_hash: string | null
+      continuation_row_version: string | null
       expires_at: Date
     }>(
-      `SELECT id::text, request_hash, intent_state, session_id::text,
+      `SELECT id::text, request_hash, provider, resource,
+              credential_version, intent_state, session_id::text,
               batch_number, window_start, window_end, query_hash,
-              provider_attempt_id::text, expires_at
+              provider_attempt_id::text, target_kind, target_global_id,
+              continuation_id::text, continuation_cursor_hash,
+              continuation_row_version::text, expires_at
        FROM operations_commerce_intake_read_intents
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
@@ -2711,7 +3584,35 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
     )
     const prior = existing.rows[0]
     if (prior) {
-      if (prior.request_hash !== requestHash) {
+      // A captured response or an already-reserved read can outlive the
+      // request-policy version that originally hashed it. Reuse remains safe
+      // only when every durable continuation identity fence still matches;
+      // the stored request hash continues to bind the provider attempt and
+      // captured response. Prepared intents are deliberately excluded because
+      // no provider request is yet bound to their historical request shape.
+      const compatibleContinuationRecovery = Boolean(
+        continuation
+        && ['reading', 'captured'].includes(prior.intent_state)
+        && prior.provider_attempt_id
+        && prior.provider === account.provider
+        && prior.resource === input.resource
+        && prior.credential_version === account.credential_version
+        && prior.target_kind === 'continuation'
+        && prior.target_global_id === continuation.run_global_id
+        && prior.continuation_id === continuation.id
+        && prior.continuation_cursor_hash === continuation.cursor_hash
+        && Number(prior.continuation_row_version)
+          === Number(continuation.row_version)
+        && prior.session_id === continuation.session_id
+        && prior.batch_number === continuation.batch_number + 1
+        && iso(prior.window_start) === iso(continuation.window_start)
+        && iso(prior.window_end) === iso(continuation.window_end)
+        && prior.query_hash === continuation.query_hash
+      )
+      if (
+        prior.request_hash !== requestHash
+        && !compatibleContinuationRecovery
+      ) {
         intakeError(
           'COMMERCE_INTAKE_IDEMPOTENCY_CONFLICT',
           'This retry key belongs to a different provider-read target. Reload the workflow and retry the intended action.',
@@ -2846,6 +3747,12 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
         windowStart,
         windowEnd,
         pageSize: input.pageSize,
+        ...(input.exactExternalOrderIdHash
+          ? { exactExternalOrderIdHash: input.exactExternalOrderIdHash }
+          : {}),
+        ...(input.exactExternalProductIdHash
+          ? { exactExternalProductIdHash: input.exactExternalProductIdHash }
+          : {}),
         productsFetched: input.resource === 'products',
         oneRootPage: true,
       })
@@ -3529,6 +4436,8 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
   retryRejectionGlobalId: string | null
   readIntentId: string
   capturedResponseHash: string
+  exactExternalOrderIdHash?: string | null
+  exactExternalProductIdHash?: string | null
 }) {
   return withTransaction(async (client) => {
     const account = await resolveAccount(client, {
@@ -3615,6 +4524,26 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         (input.stageAction === 'refresh')
         !== Boolean(input.refreshCandidateGlobalId)
       )
+      || (
+        input.exactExternalOrderIdHash
+        && (
+          input.stageAction !== 'fetch'
+          || input.page?.resource !== 'orders'
+          || !/^[a-f0-9]{64}$/.test(input.exactExternalOrderIdHash)
+        )
+      )
+      || (
+        input.exactExternalProductIdHash
+        && (
+          input.stageAction !== 'fetch-products'
+          || input.page?.resource !== 'products'
+          || !/^[a-f0-9]{64}$/.test(input.exactExternalProductIdHash)
+        )
+      )
+      || (
+        Boolean(input.exactExternalOrderIdHash)
+        && Boolean(input.exactExternalProductIdHash)
+      )
     ) {
       intakeError(
         'COMMERCE_INTAKE_CONTINUATION_INVALID',
@@ -3652,6 +4581,12 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         : null,
       refreshCandidateGlobalId: input.refreshCandidateGlobalId,
       retryRejectionGlobalId: input.retryRejectionGlobalId,
+      ...(input.exactExternalOrderIdHash
+        ? { exactExternalOrderIdHash: input.exactExternalOrderIdHash }
+        : {}),
+      ...(input.exactExternalProductIdHash
+        ? { exactExternalProductIdHash: input.exactExternalProductIdHash }
+        : {}),
       readIntentId: input.readIntentId,
       capturedResponseHash: input.capturedResponseHash,
     })
@@ -3685,15 +4620,58 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           'This fetch idempotency key was already used for different provider data',
         )
       }
-      return {
-        action: input.stageAction,
-        replayed: true,
-        runGlobalId: existing.rows[0].global_id,
-        workflowState: existing.rows[0].workflow_state,
-        recordsStaged: existing.rows[0].records_staged,
-        providerWrites: 0,
-        syncCursorAdvanced: false,
+      const replayTarget = input.refreshCandidateGlobalId
+        ? {
+            kind: 'candidate' as const,
+            globalId: input.refreshCandidateGlobalId,
+          }
+        : input.retryRejectionGlobalId
+          ? {
+              kind: 'rejection' as const,
+              globalId: input.retryRejectionGlobalId,
+            }
+          : (
+            input.stageAction === 'fetch-next'
+            || input.stageAction === 'fetch-next-products'
+          )
+            ? {
+                kind: 'continuation' as const,
+                globalId: input.page?.previousRunGlobalId || null,
+              }
+            : { kind: 'none' as const, globalId: null }
+      const replay = await readCommerceIntakeStageReplayWithClient(
+        client,
+        account,
+        {
+          idempotencyKey: input.idempotencyKey,
+          action: input.stageAction,
+          target: replayTarget,
+          ...(input.stageAction === 'fetch'
+            ? {
+                exactExternalOrderIdHash:
+                  input.exactExternalOrderIdHash ?? null,
+              }
+            : {}),
+          ...(input.stageAction === 'fetch-products'
+            ? {
+                exactExternalProductIdHash:
+                  input.exactExternalProductIdHash ?? null,
+              }
+            : {}),
+        },
+      )
+      if (
+        !replay
+        || !replay.hasDurableStageResult
+        || replay.requestHash !== stageRequestHash
+      ) {
+        intakeError(
+          'COMMERCE_INTAKE_REPLAY_EVIDENCE_MISSING',
+          'The committed commerce intake replay evidence is incomplete',
+          500,
+        )
       }
+      return replay.stageResult
     }
     const readIntent = (
       await client.query<{
@@ -3709,6 +4687,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
             target_global_id: string | null
             target_source_hash: string | null
             target_external_id_hash: string | null
+            provider_target_hash: string | null
             session_id: string
             window_start: Date | null
             window_end: Date
@@ -3729,7 +4708,19 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           }>(
             `SELECT id::text, resource, intake_action, credential_version,
                     target_kind, target_global_id, target_source_hash,
-                    target_external_id_hash, session_id::text,
+                    target_external_id_hash,
+                    (
+                      SELECT attempt.redacted_request->>'targetHash'
+                      FROM operations_commerce_provider_attempts attempt
+                      WHERE attempt.organization_id
+                          = operations_commerce_intake_read_intents.organization_id
+                        AND attempt.integration_account_id
+                          = operations_commerce_intake_read_intents.integration_account_id
+                        AND attempt.id
+                          = operations_commerce_intake_read_intents.provider_attempt_id
+                      LIMIT 1
+                    ) AS provider_target_hash,
+                    session_id::text,
                     window_start, window_end, query_hash, intent_state,
                     provider_attempt_id::text, response_hash,
                     continuation_id::text, continuation_cursor_hash,
@@ -3758,6 +4749,16 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         || readIntent.credential_version !== account.credential_version
         || readIntent.response_hash !== input.capturedResponseHash
         || !readIntent.provider_attempt_id
+        || (
+          input.exactExternalOrderIdHash !== undefined
+          && readIntent.provider_target_hash
+            !== input.exactExternalOrderIdHash
+        )
+        || (
+          input.exactExternalProductIdHash !== undefined
+          && readIntent.provider_target_hash
+            !== input.exactExternalProductIdHash
+        )
         || (
           input.page
           && (
@@ -3801,6 +4802,32 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       intakeError(
         'COMMERCE_INTAKE_INTENT_INVALID',
         'The provider-read evidence no longer matches this staging command. Reload and retry the workflow action.',
+        409,
+      )
+    }
+    if (
+      input.exactExternalOrderIdHash
+      && !envelopeMatchesExactOrderTarget(
+        input.envelope,
+        input.exactExternalOrderIdHash,
+      )
+    ) {
+      intakeError(
+        'COMMERCE_INTAKE_EXACT_ORDER_TARGET_MISMATCH',
+        'The exact provider read returned a different or ambiguous order identity. No provider data was staged.',
+        409,
+      )
+    }
+    if (
+      input.exactExternalProductIdHash
+      && !envelopeMatchesExactProductTarget(
+        input.envelope,
+        input.exactExternalProductIdHash,
+      )
+    ) {
+      intakeError(
+        'COMMERCE_INTAKE_EXACT_PRODUCT_TARGET_MISMATCH',
+        'The exact provider read returned a different or ambiguous product identity. No provider data was staged.',
         409,
       )
     }
@@ -4027,6 +5054,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       workflowState: string
       customerResolutionState: string
       credentialVersion: number
+      normalizerVersion: string
     }>()
     if (externalOrderIds.length) {
       const canonicalOrders = await client.query<{
@@ -4068,6 +5096,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         workflow_state: string
         customer_resolution_state: string
         credential_version: number
+        normalizer_version: string
       }>(
         `SELECT DISTINCT ON (candidate.external_order_id)
            candidate.external_order_id,
@@ -4075,6 +5104,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
            candidate.source_hash,
            candidate.workflow_state,
            candidate.customer_resolution_state,
+           candidate.normalizer_version,
            run.credential_version
          FROM operations_commerce_order_candidates candidate
          JOIN operations_commerce_intake_runs run
@@ -4102,6 +5132,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           workflowState: row.workflow_state,
           customerResolutionState: row.customer_resolution_state,
           credentialVersion: row.credential_version,
+          normalizerVersion: row.normalizer_version,
         })
       }
     }
@@ -4190,6 +5221,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
          pack_mapping.is_current,
          pack_mapping.source_revision,
          pack_mapping.source_hash,
+         pack_mapping.pack_evidence_hash,
          profile_version.id::text AS profile_version_id,
          profile_version.global_id AS profile_version_global_id,
          profile_version.row_version::text
@@ -4209,6 +5241,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
          profile_version.evidence_type,
          channel_state.source_revision AS channel_source_revision,
          channel_state.source_hash AS channel_source_hash,
+         channel_state.pack_evidence_hash AS channel_pack_evidence_hash,
          channel_state.weight_grams AS channel_weight_grams
        FROM operations_commerce_variant_pack_mappings pack_mapping
        JOIN operations_product_mappings product_mapping
@@ -4272,6 +5305,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           isCurrent: row.is_current,
           sourceRevision: row.source_revision,
           sourceHash: row.source_hash,
+          packEvidenceHash: row.pack_evidence_hash,
           profileVersionId: row.profile_version_id,
           profileVersionGlobalId: row.profile_version_global_id,
           profileVersionRowVersion: Number(
@@ -4292,15 +5326,18 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           evidenceType: row.evidence_type,
           channelSourceRevision: row.channel_source_revision,
           channelSourceHash: row.channel_source_hash,
+          channelPackEvidenceHash: row.channel_pack_evidence_hash,
           channelWeightGrams: row.channel_weight_grams,
         } satisfies CommerceRuntimePackMapping,
       ]),
     )
     const productCandidateByVariant = new Map<string, string>()
+    const exactProductVariantEvidence: ExactProductVariantStageEvidence[] = []
     let productVariantsStaged = 0
     let productVariantsPreserved = 0
     for (const product of input.envelope.products) {
       const status = normalizeCommerceProductChannelStatus(product)
+      const providerTaxonomy = availableValue(product.providerTaxonomy)
       for (const variant of product.variants) {
         const wholesalePrice = optionalMoney(variant.wholesalePrice)
         const retailPrice = optionalMoney(variant.retailPrice)
@@ -4317,7 +5354,8 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           variant.inventoryItemIdentity,
         )
         const mapping = mappingByVariant.get(variant.identity.value)
-        await upsertProductChannelStateWithClient(client, {
+        const channelStateEvidence =
+          await upsertProductChannelStateWithClient(client, {
           organizationId: account.organization_id,
           integrationAccountId: account.id,
           pipelineId: account.pipeline_id,
@@ -4329,6 +5367,11 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           providerVariantTitle: variant.title,
           providerSku: variant.sku,
           providerBarcode: variant.barcode,
+          providerTaxonomyScheme: providerTaxonomy?.scheme || null,
+          providerCategoryId: providerTaxonomy?.externalId || null,
+          providerCategoryName: providerTaxonomy?.name || null,
+          providerCategoryFullName: providerTaxonomy?.fullName || null,
+          providerCategoryPaths: providerTaxonomy?.marketplacePaths || [],
           wholesaleCurrencyCode: channelOffers.wholesale?.currency || null,
           wholesalePriceMinor: channelOffers.wholesale
             ? bigintString(channelOffers.wholesale.amountMinor)
@@ -4355,6 +5398,93 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           sourceHash: variant.sourceHash,
           actorEmail: input.actorEmail,
         })
+        if (input.exactExternalProductIdHash) {
+          const exactChannelState = (
+            await client.query<{
+              global_id: string
+              row_version: string
+              external_product_id: string
+              external_variant_id: string
+              product_id: string | null
+              product_mapping_id: string | null
+              source_revision: string
+              source_hash: string
+              pack_evidence_hash: string
+            }>(
+              `SELECT
+                 global_id,
+                 row_version::text,
+                 external_product_id,
+                 external_variant_id,
+                 product_id::text,
+                 product_mapping_id::text,
+                 source_revision,
+                 source_hash,
+                 pack_evidence_hash
+               FROM operations_product_channel_states
+               WHERE organization_id = $1::uuid
+                 AND integration_account_id = $2::uuid
+                 AND pipeline_id = $3::uuid
+                 AND provider = $4
+                 AND external_product_id = $5
+                 AND external_variant_id = $6
+               LIMIT 1
+               FOR UPDATE`,
+              [
+                account.organization_id,
+                account.id,
+                account.pipeline_id,
+                account.provider,
+                product.identity.value,
+                variant.identity.value,
+              ],
+            )
+          ).rows[0]
+          if (
+            !exactChannelState
+            || exactChannelState.external_product_id
+              !== product.identity.value
+            || exactChannelState.external_variant_id
+              !== variant.identity.value
+            || exactChannelState.source_revision !== incomingSourceRevision
+            || exactChannelState.source_hash !== variant.sourceHash
+            || exactChannelState.pack_evidence_hash
+              !== channelStateEvidence.packEvidenceHash
+            || (
+              mapping
+              && (
+                exactChannelState.product_id !== mapping.product_id
+                || exactChannelState.product_mapping_id !== mapping.id
+              )
+            )
+          ) {
+            intakeError(
+              'COMMERCE_INTAKE_EXACT_PRODUCT_STATE_MISMATCH',
+              'The exact provider product could not be tied to the channel state staged by this read. No provider data was retained.',
+              409,
+            )
+          }
+          exactProductVariantEvidence.push({
+            externalVariantId: exactChannelState.external_variant_id,
+            variantSourceRevision: incomingSourceRevision,
+            variantSourceHash: variant.sourceHash,
+            channelStateGlobalId: exactChannelState.global_id,
+            channelStateRowVersion: Number(exactChannelState.row_version),
+            channelSourceRevision: exactChannelState.source_revision,
+            channelSourceHash: exactChannelState.source_hash,
+            channelPackEvidenceHash:
+              exactChannelState.pack_evidence_hash,
+          })
+        }
+        const runtimePackMapping = runtimePackMappingByVariant.get(
+          variant.identity.value,
+        )
+        if (runtimePackMapping) {
+          runtimePackMapping.channelPackEvidenceHash =
+            channelStateEvidence.packEvidenceHash
+          runtimePackMapping.channelWeightGrams =
+            channelStateEvidence.weightGrams
+        }
         const prior = latestProductEvidenceByVariant.get(
           variant.identity.value,
         )
@@ -4366,6 +5496,10 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           priorSourceHash: prior.source_hash,
           incomingSourceHash: variant.sourceHash,
           priorMappingState: prior.mapping_state,
+          // The post-stage auto-create sweep only selects candidates from the
+          // current run. Restage unresolved evidence so an unchanged listing
+          // can be retried after a transient failure or policy activation.
+          retryUnresolved: true,
         })) {
           productCandidateByVariant.set(
             variant.identity.value,
@@ -4389,7 +5523,10 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
              provider, external_product_id, external_variant_id,
              external_inventory_item_id, sku_snapshot, barcode_snapshot,
              product_title_snapshot, variant_title_snapshot,
-             vendor_snapshot, product_type_snapshot, normalized_options,
+             vendor_snapshot, product_type_snapshot,
+             provider_taxonomy_scheme, provider_category_id,
+             provider_category_name, provider_category_full_name,
+             provider_category_paths, normalized_options,
              provider_status_raw, normalized_status, unit_multiplier,
              currency_code, price_minor, compare_at_price_minor, taxable,
              requires_shipping, inventory_quantity, weight_grams,
@@ -4400,11 +5537,12 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
              expires_at
            ) VALUES (
              $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8,
-             $9, $10, $11, $12, $13, $14, $15::jsonb, $16, $17, $18,
-             $19, $20, $21, $22, $23, $24, $25,
-             $26::timestamptz, $27::timestamptz, $28::timestamptz,
-             $29, $30, $31, $32, 'held', $33, $34::uuid, $35::uuid,
-             $36::text[], $37, $37, $38::timestamptz
+             $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+             $19::jsonb, $20::jsonb, $21, $22, $23, $24, $25, $26,
+             $27, $28, $29, $30,
+             $31::timestamptz, $32::timestamptz, $33::timestamptz,
+             $34, $35, $36, $37, 'held', $38, $39::uuid, $40::uuid,
+             $41::text[], $42, $42, $43::timestamptz
            )
            RETURNING id::text`,
           [
@@ -4422,6 +5560,11 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
             variant.title,
             product.vendor,
             product.productType,
+            providerTaxonomy?.scheme || null,
+            providerTaxonomy?.externalId || null,
+            providerTaxonomy?.name || null,
+            providerTaxonomy?.fullName || null,
+            safeJson(providerTaxonomy?.marketplacePaths || []),
             safeJson(variant.selectedOptions),
             status.raw,
             status.normalized,
@@ -4483,6 +5626,8 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         )
         && latestCandidate.customerResolutionState !== 'unsupported'
         && latestCandidate.credentialVersion === account.credential_version
+        && latestCandidate.normalizerVersion
+          === input.envelope.normalizerVersion
         && latestCandidate.sourceRevision === incomingSourceRevision
         && latestCandidate.sourceHash === order.sourceHash
       ) {
@@ -4509,7 +5654,10 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         || order.headerMoney.accountingEligible
           !== (expectedHeaderMoneyState === 'complete')
         || order.headerMoney.customerChargeEligible
-          !== (expectedHeaderMoneyState === 'complete')
+          !== commerceCustomerChargeEligible(
+            order.providerFacts.provider,
+            expectedHeaderMoneyState,
+          )
       ) {
         intakeError(
           'COMMERCE_NORMALIZATION_MONEY_INCOMPLETE',
@@ -4582,6 +5730,27 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
             'ship_to',
           )
         : null
+      const checkoutDestinationFingerprint = (
+        order.providerFacts.provider === 'shopify'
+        && address
+        && [
+          address.postalCode,
+          address.countryCode || address.country,
+        ].every((value) => typeof value === 'string' && value.trim())
+      )
+        ? shopifyCheckoutDestinationFingerprint({
+            countryCode: address.countryCode || address.country,
+            postalCode: address.postalCode,
+            provinceCode: address.regionCode || address.region,
+            city: address.city,
+            address1: address.line1,
+            address2: address.line2,
+          })
+        : null
+      const checkoutShippingServiceCode =
+        order.providerFacts.provider === 'shopify'
+          ? order.providerFacts.shippingService?.code || null
+          : null
       const requestedDelivery = fieldText(order.requestedDeliveryAt)
       const payout = order.providerFacts.provider === 'faire'
         ? optionalMoney(order.providerFacts.payoutAmount)
@@ -4618,7 +5787,9 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
            provider_processed_at, provider_updated_at, provider_cancelled_at,
            provider_closed_at, observed_at, source_revision, source_hash,
            provider_api_version, normalizer_version, workflow_state,
-           blocking_codes, created_by, updated_by, expires_at
+           blocking_codes, created_by, updated_by, expires_at,
+           checkout_destination_fingerprint,
+           checkout_shipping_service_code
          ) VALUES (
            $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8,
            $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
@@ -4630,7 +5801,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
            $54::timestamptz, $55::timestamptz, $56::timestamptz,
            $57::timestamptz, $58::timestamptz, $59::timestamptz,
            $60, $61, $62, $63, 'held', $64::text[],
-           $65, $65, $66::timestamptz
+           $65, $65, $66::timestamptz, $67, $68
          )
          RETURNING id::text`,
         [
@@ -4712,6 +5883,8 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           initialCodes,
           input.actorEmail,
           input.envelope.retentionExpiresAt,
+          checkoutDestinationFingerprint,
+          checkoutShippingServiceCode,
         ],
       )
       const candidateId = candidateResult.rows[0].id
@@ -4726,6 +5899,12 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         const lineSubtotal = optionalMoney(line.lineSubtotal)
         const lineDiscount = optionalMoney(line.lineDiscount)
         const lineTax = optionalMoney(line.lineTax)
+        const providerLineMoney = storableCommerceOrderLineProviderMoney({
+          unitPrice,
+          subtotal: lineSubtotal,
+          discount: lineDiscount,
+          tax: lineTax,
+        })
         const packaging = availableValue(line.packaging)
         const runtimePack = resolveCommerceRuntimePack({
           mapping: line.requiresShipping && identity
@@ -4755,9 +5934,18 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         const packagingState = line.requiresShipping
           ? (resolvedPackaging ? 'resolved' : 'unresolved')
           : 'not_required'
+        const providerPriceResolution = resolveCommerceOrderLineProviderPrice({
+          orderCurrency: order.currency,
+          unitPrice,
+          unfulfilledQuantity: quantity.unfulfilled,
+        })
         const codes = lineBlockingCodes(line).filter((code) => {
           if (code === 'product_mapping_required' && mapping) return false
           if (code === 'packaging_required' && resolvedPackaging) return false
+          if (
+            code === 'line_price_required'
+            && !providerPriceResolution.requiresOperatorResolution
+          ) return false
           return true
         })
         if (
@@ -4769,7 +5957,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           codes.sort()
         }
         if (
-          quantity.unfulfilled > 0
+          providerPriceResolution.requiresOperatorResolution
           && !codes.includes('line_price_required')
         ) {
           codes.push('line_price_required')
@@ -4787,7 +5975,8 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
              unit_multiplier, physical_quantity, currency_code,
              unit_price_minor, subtotal_minor, discount_minor,
              brand_discount_minor, tax_minor, other_adjustment_minor,
-             total_minor, price_resolution_state, requires_shipping,
+             total_minor, price_resolution_state, resolved_currency_code,
+             resolved_unit_price_minor, requires_shipping,
              mapping_state, product_id, product_mapping_id, packaging_state,
              package_profile_id, commerce_variant_pack_mapping_id,
              commerce_variant_pack_mapping_row_version,
@@ -4802,7 +5991,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
              $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid,
              $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
              $17, $18, $19, $20, $21, 0, $22, $23, $24, $25, $26,
-             $27, NULL, $28, NULL, NULL, 'unresolved', $29, $30,
+             $27, NULL, $28, NULL, NULL, $54, $55, $56::bigint, $29, $30,
              $31::uuid, $32::uuid, $33, NULL, $34::uuid, $35,
              $36::uuid, $37, $38, $39, $40, $41, $42, $43, $44, $45,
              $46::timestamptz, $47, $48, $49, $50, 'held', $51::text[],
@@ -4836,11 +6025,19 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
             quantity.unfulfilled,
             line.unitMultiplier || 1,
             line.physicalUnitQuantity,
-            unitPrice?.currency || null,
-            unitPrice ? bigintString(unitPrice.amountMinor) : null,
-            lineSubtotal ? bigintString(lineSubtotal.amountMinor) : null,
-            lineDiscount ? bigintString(lineDiscount.amountMinor) : null,
-            lineTax ? bigintString(lineTax.amountMinor) : null,
+            providerLineMoney.currencyCode,
+            providerLineMoney.unitPriceMinor === null
+              ? null
+              : bigintString(providerLineMoney.unitPriceMinor),
+            providerLineMoney.subtotalMinor === null
+              ? null
+              : bigintString(providerLineMoney.subtotalMinor),
+            providerLineMoney.discountMinor === null
+              ? null
+              : bigintString(providerLineMoney.discountMinor),
+            providerLineMoney.taxMinor === null
+              ? null
+              : bigintString(providerLineMoney.taxMinor),
             line.requiresShipping,
             mappingState,
             mapping?.product_id || null,
@@ -4880,9 +6077,19 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
             codes,
             input.actorEmail,
             input.envelope.retentionExpiresAt,
+            providerPriceResolution.state,
+            providerPriceResolution.resolvedCurrencyCode,
+            providerPriceResolution.resolvedUnitPriceMinor === null
+              ? null
+              : bigintString(providerPriceResolution.resolvedUnitPriceMinor),
           ],
         )
       }
+      await reconcileFreshCandidateBlockers(
+        client,
+        candidateId,
+        input.actorEmail,
+      )
       ordersStaged += 1
     }
 
@@ -4975,6 +6182,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       state: 'available' | 'exhausted'
       providerRowsSeen: number
       eligibleOrdersSeen: number
+      windowEnd: string
     } | null = null
     if (input.page) {
       let previousRunId: string | null = null
@@ -5166,8 +6374,18 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         state: continuationState,
         providerRowsSeen: input.page.providerRowsSeen,
         eligibleOrdersSeen: input.page.eligibleOrdersSeen,
+        windowEnd: input.page.windowEnd,
       }
     }
+    // This side effect is deliberately inside the intake-stage transaction,
+    // after all connection, activation, read-intent, target, and continuation
+    // fences. A rejected stage leaves no image observation, tombstone, or job;
+    // a committed stage always contains its replayable image summary.
+    const productImageImports = await reconcileStagedCommerceProductImages({
+      account,
+      envelope: input.envelope,
+      actorEmail: input.actorEmail,
+    }, client)
     const stagedIntent = await client.query(
       `UPDATE operations_commerce_intake_read_intents
        SET intent_state = 'staged',
@@ -5221,6 +6439,17 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       productVariantsPreserved,
       recordsRejected,
       recordsStaged,
+      productImageImports,
+      ...(input.exactExternalProductIdHash
+        ? {
+            exactProductEvidence: {
+              externalProductId:
+                input.envelope.products[0].identity.value,
+              productSourceHash: input.envelope.products[0].sourceHash,
+              variants: exactProductVariantEvidence,
+            },
+          }
+        : {}),
       pagination,
       providerWrites: 0,
       syncCursorAdvanced: false,
@@ -5244,7 +6473,10 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         productVariantsPreserved,
         recordsRejected,
         normalizationRejections,
+        productImageImports,
         action: stageResult.action,
+        exactOrderTargetHash: input.exactExternalOrderIdHash,
+        exactProductTargetHash: input.exactExternalProductIdHash,
         pagination,
         stageResult,
         providerWrites: 0,
@@ -5275,7 +6507,38 @@ export async function updateCommerceProductIntakePolicyInPostgres(input: {
   expectedPolicyRevision: number
   unmatchedAction: 'review' | 'auto_create'
   confirmAutoCreateProducts: boolean
+  confirmCatalogSyncReset?: boolean
+  catalogSyncResetReason?: string | null
 }) {
+  const catalogSyncResetReason = typeof input.catalogSyncResetReason === 'string'
+    ? input.catalogSyncResetReason.trim()
+    : null
+  const catalogSyncResetRequested = (
+    input.confirmCatalogSyncReset === true
+    || input.catalogSyncResetReason !== null
+      && input.catalogSyncResetReason !== undefined
+  )
+  if (catalogSyncResetRequested) {
+    if (input.confirmCatalogSyncReset !== true) {
+      intakeError(
+        'COMMERCE_CATALOG_SYNC_RESET_CONFIRMATION_REQUIRED',
+        'Confirm that the terminal catalog evidence will be preserved and a fresh root reconciliation will start',
+        400,
+      )
+    }
+    if (
+      !catalogSyncResetReason
+      || catalogSyncResetReason.length < 10
+      || catalogSyncResetReason.length > 500
+      || /[\u0000-\u001f\u007f]/.test(catalogSyncResetReason)
+    ) {
+      intakeError(
+        'COMMERCE_CATALOG_SYNC_RESET_REASON_REQUIRED',
+        'A catalog sync reset reason of at least 10 characters is required',
+        400,
+      )
+    }
+  }
   return withTransaction(async (client) => {
     const accountResult = await client.query<{
       id: string
@@ -5309,6 +6572,8 @@ export async function updateCommerceProductIntakePolicyInPostgres(input: {
       expectedPolicyRevision: input.expectedPolicyRevision,
       unmatchedAction: input.unmatchedAction,
       confirmAutoCreateProducts: input.confirmAutoCreateProducts,
+      confirmCatalogSyncReset: input.confirmCatalogSyncReset === true,
+      catalogSyncResetReason,
     })
     const prepared = await prepareReceipt(client, {
       organizationId: input.organizationId,
@@ -5342,6 +6607,74 @@ export async function updateCommerceProductIntakePolicyInPostgres(input: {
         'The automatic product policy changed. Reload before saving it again.',
         409,
       )
+    }
+    const sameAction = Boolean(
+      currentPolicy
+      && currentPolicy.unmatched_action === input.unmatchedAction,
+    )
+    if (sameAction && !catalogSyncResetRequested) {
+      intakeError(
+        'COMMERCE_PRODUCT_INTAKE_POLICY_UNCHANGED',
+        'The automatic product policy is already set to that value',
+        409,
+      )
+    }
+    let terminalCatalogSync: {
+      id: string
+      last_error_code: string | null
+      continuation_run_global_id: string | null
+    } | null = null
+    if (catalogSyncResetRequested) {
+      if (!sameAction) {
+        intakeError(
+          'COMMERCE_CATALOG_SYNC_RESET_NOT_REQUIRED',
+          'A terminal catalog sync reset must preserve the current unmatched-product policy',
+          409,
+        )
+      }
+      terminalCatalogSync = (
+        await client.query<{
+          id: string
+          last_error_code: string | null
+          continuation_run_global_id: string | null
+        }>(
+          `SELECT job.id::text, job.last_error_code,
+                  job.continuation_run_global_id
+           FROM operations_commerce_catalog_sync_jobs job
+           WHERE job.organization_id = $1::uuid
+             AND job.integration_account_id = $2::uuid
+             AND job.provider = $3
+             AND job.credential_version = $4::integer
+             AND job.policy_revision = $5::integer
+             AND job.status = 'dead'
+             AND NOT EXISTS (
+               SELECT 1
+               FROM operations_commerce_catalog_sync_jobs active
+               WHERE active.organization_id = job.organization_id
+                 AND active.integration_account_id
+                   = job.integration_account_id
+                 AND active.status IN ('pending', 'processing', 'failed')
+             )
+           ORDER BY job.completed_at DESC NULLS LAST,
+                    job.created_at DESC, job.id DESC
+           LIMIT 1
+           FOR UPDATE OF job`,
+          [
+            input.organizationId,
+            account.id,
+            account.provider,
+            account.commerce_credential_generation,
+            currentRevision,
+          ],
+        )
+      ).rows[0] || null
+      if (!terminalCatalogSync) {
+        intakeError(
+          'COMMERCE_CATALOG_SYNC_RESET_NOT_REQUIRED',
+          'There is no terminal catalog sync under the current credential and policy fence',
+          409,
+        )
+      }
     }
     if (
       input.unmatchedAction === 'auto_create'
@@ -5442,11 +6775,30 @@ export async function updateCommerceProductIntakePolicyInPostgres(input: {
         actorEmail: input.actorEmail,
       },
     )
+    if (catalogSyncResetRequested && catalogSync.queued !== 1) {
+      intakeError(
+        'COMMERCE_CATALOG_SYNC_RESET_QUEUE_FAILED',
+        'Repair product-read access and Operations eligibility before starting a fresh catalog reconciliation',
+        409,
+      )
+    }
+    const catalogSyncReset = terminalCatalogSync
+      ? {
+          performed: true,
+          reason: catalogSyncResetReason,
+          previousErrorCode: terminalCatalogSync.last_error_code,
+          previousPolicyRevision: currentRevision,
+          policyRevision: nextRevision,
+          deadEvidencePreserved: true,
+          freshRootSession: true,
+        }
+      : null
     const result = {
       action: 'set-product-intake-policy',
       accountGlobalId: account.global_id,
       productIntake: policy,
       catalogSync,
+      catalogSyncReset,
       providerWrites: 0,
       syncCursorAdvanced: false,
       replayed: false,
@@ -5474,10 +6826,41 @@ export async function updateCommerceProductIntakePolicyInPostgres(input: {
         revision: nextRevision,
         catalogSyncQueued: catalogSync.queued,
         catalogSyncCancelled: catalogSync.cancelled,
+        catalogSyncReset: Boolean(catalogSyncReset),
+        deadEvidencePreserved: Boolean(catalogSyncReset),
         providerWrites: 0,
         syncCursorAdvanced: false,
       },
     }, client)
+    if (terminalCatalogSync && catalogSyncResetReason) {
+      await recordAuditEvent({
+        actor: input.actorEmail,
+        eventType: 'commerce.catalog.sync.reset',
+        aggregateType: 'operations.integration_account',
+        aggregateId: account.global_id,
+        organizationId: input.organizationId,
+        eventKey:
+          `commerce-catalog-sync-reset:${account.global_id}:${input.idempotencyKey}`,
+        payload: {
+          provider: account.provider,
+          credentialVersion: account.commerce_credential_generation,
+          previousPolicyRevision: currentRevision,
+          policyRevision: nextRevision,
+          terminalJobId: terminalCatalogSync.id,
+          previousErrorCode: terminalCatalogSync.last_error_code,
+          reason: catalogSyncResetReason,
+          deadEvidencePreserved: true,
+          previousContinuationPreserved: Boolean(
+            terminalCatalogSync.continuation_run_global_id,
+          ),
+          freshRootSession: true,
+          catalogSyncQueued: catalogSync.queued,
+          providerWrites: 0,
+          ordersTouched: 0,
+          inventoryTouched: 0,
+        },
+      }, client)
+    }
     return result
   })
 }
@@ -5783,13 +7166,16 @@ export async function readCommerceIntakeStateFromPostgres(input: {
                AND latest.workflow_state IN ('held', 'resolving', 'ready')
            )::text AS unresolved,
            count(*) FILTER (
-             WHERE latest.workflow_state IN ('held', 'resolving')
+             WHERE latest.mapping_state <> 'resolved'
+               AND latest.workflow_state IN ('held', 'resolving')
            )::text AS held,
            count(*) FILTER (
-             WHERE latest.workflow_state = 'ready'
+             WHERE latest.mapping_state <> 'resolved'
+               AND latest.workflow_state = 'ready'
            )::text AS ready,
            count(*) FILTER (
-             WHERE latest.workflow_state = 'failed'
+             WHERE latest.mapping_state <> 'resolved'
+               AND latest.workflow_state = 'failed'
            )::text AS excluded
          FROM (
            SELECT DISTINCT ON (selected.external_variant_id)
@@ -5864,6 +7250,17 @@ export async function readCommerceIntakeStateFromPostgres(input: {
         weightGrams: number
         dimensionsMm: { length: number; width: number; height: number }
       }>
+      packProfileVersions: Array<{
+        globalId: string
+        rowVersion: number
+        label: string
+        packageLevel: 'each' | 'inner_pack' | 'case' | 'pallet'
+        baseEachQuantity: number
+        weightGrams: number
+        dimensionsMm: { length: number; width: number; height: number }
+        evidenceType: 'customer_confirmed' | 'measured' | 'provider'
+        weightBasis: string
+      }>
     }>()
     for (const row of productRows.rows) {
       const product = productCatalogMap.get(row.id) || {
@@ -5871,6 +7268,7 @@ export async function readCommerceIntakeStateFromPostgres(input: {
         name: row.name,
         sku: row.sku,
         packageProfiles: [],
+        packProfileVersions: [],
       }
       if (
         row.profile_global_id
@@ -5892,6 +7290,86 @@ export async function readCommerceIntakeStateFromPostgres(input: {
         })
       }
       productCatalogMap.set(row.id, product)
+    }
+    const packProfileVersionRows = await client.query<{
+      product_id: string
+      global_id: string
+      row_version: string
+      profile_name: string
+      package_level: 'each' | 'inner_pack' | 'case' | 'pallet'
+      base_each_quantity: number
+      gross_weight_grams: number
+      length_mm: number
+      width_mm: number
+      height_mm: number
+      evidence_type: 'customer_confirmed' | 'measured' | 'provider'
+      weight_basis: string
+    }>(
+      `SELECT
+         version.product_id::text,
+         version.global_id,
+         version.row_version::text,
+         profile.profile_name,
+         profile.package_level,
+         version.base_each_quantity,
+         version.gross_weight_grams,
+         version.length_mm,
+         version.width_mm,
+         version.height_mm,
+         version.evidence_type,
+         version.weight_basis
+       FROM operations_product_pack_profile_versions version
+       JOIN operations_product_pack_profiles profile
+         ON profile.organization_id = version.organization_id
+        AND profile.pipeline_id = version.pipeline_id
+        AND profile.product_id = version.product_id
+        AND profile.id = version.profile_id
+       WHERE version.organization_id = $1::uuid
+         AND version.pipeline_id = $2::uuid
+         AND version.is_current = true
+         AND version.lifecycle_state IN ('customer_confirmed', 'active')
+         AND version.dimension_basis = 'outer'
+         AND version.length_mm IS NOT NULL
+         AND version.width_mm IS NOT NULL
+         AND version.height_mm IS NOT NULL
+         AND version.gross_weight_grams IS NOT NULL
+         AND version.weight_basis <> 'unspecified'
+         AND version.evidence_type IN (
+           'customer_confirmed', 'measured', 'provider'
+         )
+         AND profile.status <> 'retired'
+       ORDER BY
+         version.product_id,
+         profile.is_default DESC,
+         CASE profile.package_level
+           WHEN 'each' THEN 1
+           WHEN 'inner_pack' THEN 2
+           WHEN 'case' THEN 3
+           WHEN 'pallet' THEN 4
+         END,
+         lower(profile.profile_name),
+         version.version_number DESC
+       LIMIT 4000`,
+      [account.organization_id, account.pipeline_id],
+    )
+    for (const row of packProfileVersionRows.rows) {
+      const product = productCatalogMap.get(row.product_id)
+      if (!product) continue
+      product.packProfileVersions.push({
+        globalId: row.global_id,
+        rowVersion: Number(row.row_version),
+        label: row.profile_name,
+        packageLevel: row.package_level,
+        baseEachQuantity: row.base_each_quantity,
+        weightGrams: row.gross_weight_grams,
+        dimensionsMm: {
+          length: row.length_mm,
+          width: row.width_mm,
+          height: row.height_mm,
+        },
+        evidenceType: row.evidence_type,
+        weightBasis: row.weight_basis,
+      })
     }
     const customers = await client.query<{
       reference_code: string
@@ -5916,13 +7394,22 @@ export async function readCommerceIntakeStateFromPostgres(input: {
       source_hash: string
       error_code: string
       safe_message: string
+      total_count: string
     }>(
-      `SELECT global_id, row_version::text, resource_type, external_id,
-              source_hash, error_code, safe_message
-       FROM operations_commerce_intake_rejections
-       WHERE organization_id = $1::uuid
-         AND integration_account_id = $2::uuid
-         AND disposition = 'open'
+      `WITH latest_rejections AS (
+         SELECT DISTINCT ON (resource_type, external_id)
+           global_id, row_version, resource_type, external_id, source_hash,
+           error_code, safe_message, disposition, expires_at, created_at, id
+         FROM operations_commerce_intake_rejections
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+         ORDER BY resource_type, external_id, created_at DESC, id DESC
+       )
+       SELECT global_id, row_version::text, resource_type, external_id,
+              source_hash, error_code, safe_message,
+              count(*) OVER()::text AS total_count
+       FROM latest_rejections
+       WHERE disposition = 'open'
          AND expires_at > now()
        ORDER BY created_at DESC, id DESC
        LIMIT 500`,
@@ -5997,7 +7484,10 @@ export async function readCommerceIntakeStateFromPostgres(input: {
           unavailableFields: candidate.header_money_gaps,
           accountingEligible: candidate.header_money_state === 'complete',
           customerChargeEligible:
-            candidate.header_money_state === 'complete',
+            commerceCustomerChargeEligible(
+              candidate.provider,
+              candidate.header_money_state,
+            ),
         },
         requiresShipping: candidate.requires_shipping,
         sourceUpdatedAt: iso(candidate.provider_updated_at)
@@ -6054,6 +7544,7 @@ export async function readCommerceIntakeStateFromPostgres(input: {
           // lifecycle breakdown beside it so the operator can see why a
           // partially fulfilled Shopify line will not be fulfilled twice.
           quantity: safeNumber(line.unfulfilled_quantity),
+          unitMultiplier: safeNumber(line.unit_multiplier),
           orderedQuantity: safeNumber(line.ordered_quantity),
           currentQuantity: safeNumber(line.current_quantity),
           cancelledQuantity: safeNumber(line.cancelled_quantity),
@@ -6099,6 +7590,28 @@ export async function readCommerceIntakeStateFromPostgres(input: {
           blockers: dynamicLineBlockingCodes(line).map(blocker),
         })),
         canonicalOrderGlobalId: candidate.canonical_order_global_id,
+        checkoutRateReconciliation: candidate.provider === 'shopify'
+          ? {
+              globalId:
+                candidate.checkout_rate_reconciliation_global_id,
+              receiptGlobalId: candidate.checkout_rate_receipt_global_id,
+              outcome: shopifyCheckoutRateLineageIsRequired(
+                candidate.checkout_shipping_service_code,
+              )
+                ? candidate.checkout_rate_reconciliation_outcome
+                : 'not_applicable',
+              lineageRequired: shopifyCheckoutRateLineageIsRequired(
+                candidate.checkout_shipping_service_code,
+              ),
+              fulfillmentEligible:
+                !shopifyCheckoutRateLineageIsRequired(
+                  candidate.checkout_shipping_service_code,
+                )
+                || shopifyCheckoutRateOutcomeAllowsFulfillment(
+                  candidate.checkout_rate_reconciliation_outcome,
+                ),
+            }
+          : null,
         unsupportedReason: candidate.unsupported_reason_detail
           || candidate.unsupported_reason_code,
       }
@@ -6115,6 +7628,15 @@ export async function readCommerceIntakeStateFromPostgres(input: {
       variantTitle: candidate.variant_title_snapshot,
       vendor: candidate.vendor_snapshot,
       productType: candidate.product_type_snapshot,
+      providerTaxonomy: candidate.provider_taxonomy_scheme
+        ? {
+            scheme: candidate.provider_taxonomy_scheme,
+            externalId: candidate.provider_category_id,
+            name: candidate.provider_category_name,
+            fullName: candidate.provider_category_full_name,
+            marketplacePaths: candidate.provider_category_paths,
+          }
+        : null,
       selectedOptions: candidate.normalized_options,
       providerStatus: candidate.provider_status_raw,
       normalizedStatus: candidate.normalized_status,
@@ -6247,6 +7769,15 @@ export async function readCommerceIntakeStateFromPostgres(input: {
         unresolvedTruncated:
           Number(productCandidateSummary.unresolved)
           > returnedUnresolvedProductCandidates,
+      },
+      rejectionSummary: {
+        scope: 'latest_open_per_account_resource_external_identity',
+        limit: 500,
+        total: Number(openRejections.rows[0]?.total_count || 0),
+        returned: openRejections.rows.length,
+        truncated:
+          Number(openRejections.rows[0]?.total_count || 0)
+          > openRejections.rows.length,
       },
       rejections: openRejections.rows.map((rejection) => ({
         globalId: rejection.global_id,
@@ -6829,6 +8360,9 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
             localSkuOccupied: automaticLocalSkuOmitted,
           })
         }
+        const masterLifecycle = commerceMasterLifecycleForProviderStatus(
+          candidate.normalized_status,
+        )
         const staged = await stageCrmRecordWithClient(client, {
           entity: 'products',
           pipelineId: candidate.pipeline_id,
@@ -6852,6 +8386,17 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
               selectedOptions: candidate.normalized_options,
               sku: candidate.sku_snapshot,
               barcode: candidate.barcode_snapshot,
+              providerStatusRaw: candidate.provider_status_raw,
+              normalizedStatus: candidate.normalized_status,
+              providerTaxonomy: candidate.provider_taxonomy_scheme
+                ? {
+                    scheme: candidate.provider_taxonomy_scheme,
+                    externalId: candidate.provider_category_id,
+                    name: candidate.provider_category_name,
+                    fullName: candidate.provider_category_full_name,
+                    marketplacePaths: candidate.provider_category_paths,
+                  }
+                : null,
             },
             localCatalog: {
               requestedName: input.resolution.name.trim(),
@@ -6863,17 +8408,22 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
               sku: localProductSku,
               providerSkuOmittedBecauseDuplicate:
                 automaticLocalSkuOmitted,
+              initialLifecycle: masterLifecycle,
             },
           },
           actorEmail: input.actorEmail,
           fields: {
             name: localProductName,
             sku: localProductSku || undefined,
+            productType: candidate.product_type_snapshot || undefined,
+            category: candidate.provider_category_full_name
+              || candidate.provider_category_name
+              || undefined,
             price:
               input.resolution.unitPriceMinor / (10 ** decimals),
             currency,
-            status: 'Active',
-            active: true,
+            status: masterLifecycle.status,
+            active: masterLifecycle.active,
             description:
               `${
                 input.automatic ? 'Automatically' : 'Explicitly'
@@ -7156,6 +8706,16 @@ export function automaticProductResolution(
       currency,
     },
     reason: null,
+  }
+}
+
+export function commerceMasterLifecycleForProviderStatus(
+  normalizedStatus: string,
+) {
+  const active = normalizedStatus === 'active'
+  return {
+    status: active ? 'Active' as const : 'Inactive' as const,
+    active,
   }
 }
 
@@ -7817,7 +9377,11 @@ export async function resolveCommerceCandidateCustomerInPostgres(input: {
   candidateGlobalId: string
   candidateRowVersion: number
   customer:
-    | { mode: 'existing'; customerGlobalId: string }
+    | {
+        mode: 'existing'
+        customerGlobalId: string
+        resolutionMethod?: CommerceCustomerMatchMethod
+      }
     | {
         mode: 'create'
         name: string
@@ -7854,11 +9418,12 @@ export async function resolveCommerceCandidateCustomerInPostgres(input: {
       name: string
     } | null = null
     let customerResolutionMethod:
-      | 'created'
-      | 'external_id'
+      | CommerceCustomerMatchMethod
       | 'provider_identity'
       | 'manual'
-      = input.customer.mode === 'create' ? 'created' : 'manual'
+      = input.customer.mode === 'create'
+        ? 'created'
+        : input.customer.resolutionMethod || 'manual'
     if (input.customer.mode === 'existing') {
       const selected = await client.query<{
         id: string
@@ -8098,15 +9663,33 @@ export async function resolveCommerceCandidateCustomerInPostgres(input: {
          ON CONFLICT (
            organization_id, integration_account_id, entity_type, external_id
          ) DO UPDATE SET
-           entity_global_id = CASE
-             WHEN $7::boolean
-               THEN operations_external_identifiers.entity_global_id
-             ELSE EXCLUDED.entity_global_id
-           END,
            status = 'active',
-           match_method = EXCLUDED.match_method,
-           match_evidence = EXCLUDED.match_evidence,
-           last_verified_at = now()
+           match_method = CASE
+             WHEN operations_external_identifiers.status = 'active'
+              AND operations_external_identifiers.match_method = 'email'
+              AND operations_external_identifiers.match_evidence
+                  @> $7::jsonb
+               THEN operations_external_identifiers.match_method
+             ELSE EXCLUDED.match_method
+           END,
+           match_evidence = CASE
+             WHEN operations_external_identifiers.status = 'active'
+              AND operations_external_identifiers.match_method = 'email'
+              AND operations_external_identifiers.match_evidence
+                  @> $7::jsonb
+               THEN operations_external_identifiers.match_evidence
+             ELSE EXCLUDED.match_evidence
+           END,
+           last_verified_at = CASE
+             WHEN operations_external_identifiers.status = 'active'
+              AND operations_external_identifiers.match_method = 'email'
+              AND operations_external_identifiers.match_evidence
+                  @> $7::jsonb
+               THEN operations_external_identifiers.last_verified_at
+             ELSE now()
+           END
+         WHERE operations_external_identifiers.entity_global_id
+               = EXCLUDED.entity_global_id
          RETURNING entity_global_id`,
         [
           candidate.organization_id,
@@ -8118,7 +9701,12 @@ export async function resolveCommerceCandidateCustomerInPostgres(input: {
             candidateGlobalId: candidate.global_id,
             sourceHash: candidate.source_hash,
           }),
-          input.customer.mode === 'create',
+          JSON.stringify({
+            schema: CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+            provider: 'faire',
+            evidenceType: 'operator_confirmed_email',
+            confirmedBeforeProviderRead: true,
+          }),
         ],
       )
       if (boundIdentity.rows[0]?.entity_global_id !== customer.globalId) {
@@ -8203,6 +9791,420 @@ export async function resolveCommerceCandidateCustomerInPostgres(input: {
       result,
     )
     return result
+  })
+}
+
+export async function readAutomaticCommerceCustomerTargetsForRunInPostgres(
+  input: {
+    runtime: CommerceRuntimeCredentialRecord
+    runGlobalId: string
+  },
+) {
+  return withTransaction(async (client) => {
+    const account = await resolveAccount(client, {
+      organizationId: input.runtime.organizationId,
+      accountGlobalId: input.runtime.globalId,
+    })
+    const result = await client.query<CandidateRow>(
+      `WITH anchor_run AS (
+         SELECT 1
+         FROM operations_commerce_intake_runs anchor
+         WHERE anchor.organization_id = $1::uuid
+           AND anchor.integration_account_id = $2::uuid
+           AND anchor.global_id = $3
+           AND anchor.credential_version = $4::integer
+           AND anchor.resource = 'products_and_orders'
+         LIMIT 1
+       )
+       ${CANDIDATE_SELECT}
+       JOIN anchor_run ON true
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.integration_account_id = $2::uuid
+         AND run.credential_version = $4::integer
+         AND run.resource = 'products_and_orders'
+         AND candidate.expires_at > now()
+         AND candidate.workflow_state IN ('held', 'resolving')
+         AND candidate.customer_resolution_state = 'unresolved'
+       ORDER BY CASE WHEN run.global_id = $3 THEN 0 ELSE 1 END,
+                candidate.created_at, candidate.id
+       LIMIT 100`,
+      [
+        account.organization_id,
+        account.id,
+        input.runGlobalId,
+        input.runtime.credentialVersion,
+      ],
+    )
+    return result.rows.map((candidate) => {
+      let party: Record<string, unknown> | null = null
+      let address: Record<string, unknown> | null = null
+      try {
+        party = encryptedSnapshot(candidate, input.runtime.globalId, 'party')
+      } catch {
+        party = null
+      }
+      try {
+        address = encryptedSnapshot(candidate, input.runtime.globalId, 'ship_to')
+      } catch {
+        address = null
+      }
+      const externalIdentity = party?.externalIdentity
+      const externalCustomerId = externalIdentity
+        && typeof externalIdentity === 'object'
+        && !Array.isArray(externalIdentity)
+        && typeof (externalIdentity as Record<string, unknown>).value === 'string'
+        ? String((externalIdentity as Record<string, unknown>).value).trim()
+          || null
+        : null
+      const companyName = String(
+        party?.organizationName
+        || address?.organizationName
+        || party?.contactName
+        || address?.name
+        || party?.email
+        || '',
+      ).trim() || null
+      return {
+        candidateGlobalId: candidate.global_id,
+        candidateRowVersion: Number(candidate.row_version),
+        provider: candidate.provider,
+        externalCustomerId,
+        companyName,
+        email: String(party?.email || '').trim() || null,
+        phone: String(party?.phone || address?.phone || '').trim() || null,
+        address: String(address?.line1 || '').trim() || null,
+        city: String(address?.city || '').trim() || null,
+        region: String(address?.regionCode || address?.region || '').trim()
+          || null,
+        postalCode: String(address?.postalCode || '').trim() || null,
+        country: String(address?.countryCode || address?.country || '').trim()
+          || null,
+      }
+    })
+  })
+}
+
+type AutomaticFaireProductMappingRow = {
+  id: string
+  product_id: string
+  external_variant_id: string | null
+  channel_sku: string | null
+}
+
+type AutomaticFairePromotionTarget = {
+  eligible: true
+  reason: null
+  candidateGlobalId: string
+  candidateRowVersion: number
+  providerAddress: CandidateAddress | null
+  deliveryMode: 'provider' | 'default_sla' | null
+} | {
+  eligible: false
+  reason: string
+  candidateGlobalId: string
+  candidateRowVersion: number
+  providerAddress: null
+  deliveryMode: null
+}
+
+function heldAutomaticFairePromotionTarget(
+  candidate: CandidateRow,
+  reason: string,
+): AutomaticFairePromotionTarget {
+  return {
+    eligible: false,
+    reason,
+    candidateGlobalId: candidate.global_id,
+    candidateRowVersion: Number(candidate.row_version),
+    providerAddress: null,
+    deliveryMode: null,
+  }
+}
+
+/**
+ * Selects only newly staged Faire orders whose current provider evidence is
+ * sufficient for a deterministic local promotion. The run equality and prior
+ * candidate guard deliberately leave retained real-order holds untouched.
+ * Provider writes, inventory, fulfillment, and shipment work are outside this
+ * selector and remain zero during intake promotion.
+ */
+export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
+  input: {
+    runtime: CommerceRuntimeCredentialRecord
+    runGlobalId: string
+  },
+) {
+  return withTransaction(async (client) => {
+    const account = await resolveAccount(client, {
+      organizationId: input.runtime.organizationId,
+      accountGlobalId: input.runtime.globalId,
+    })
+    if (account.provider !== 'faire') return []
+    const candidates = (
+      await client.query<CandidateRow>(
+        `${CANDIDATE_SELECT}
+         WHERE candidate.organization_id = $1::uuid
+           AND candidate.integration_account_id = $2::uuid
+           AND run.global_id = $3
+           AND run.credential_version = $4::integer
+           AND run.resource = 'products_and_orders'
+           AND run.provider = 'faire'
+           AND run.expires_at > now()
+           AND run.workflow_state <> 'expired'
+           AND candidate.provider = 'faire'
+           AND candidate.expires_at > now()
+           AND candidate.workflow_state IN ('held', 'resolving', 'ready')
+         ORDER BY candidate.created_at, candidate.id
+         LIMIT 50`,
+        [
+          account.organization_id,
+          account.id,
+          input.runGlobalId,
+          input.runtime.credentialVersion,
+        ],
+      )
+    ).rows
+    const targets: AutomaticFairePromotionTarget[] = []
+    for (const candidate of candidates) {
+      const [lines, priorOrCanonical] = await Promise.all([
+        candidateLines(client, candidate),
+        client.query<{ prior_candidate: boolean; canonical_order: boolean }>(
+          `SELECT
+             EXISTS (
+               SELECT 1
+               FROM operations_commerce_order_candidates prior
+               WHERE prior.organization_id = $1::uuid
+                 AND prior.integration_account_id = $2::uuid
+                 AND prior.external_order_id = $3
+                 AND prior.id <> $4::uuid
+                 AND prior.run_id <> $5::uuid
+             ) AS prior_candidate,
+             EXISTS (
+               SELECT 1
+               FROM operations_orders canonical
+               WHERE canonical.organization_id = $1::uuid
+                 AND canonical.integration_account_id = $2::uuid
+                 AND canonical.external_order_id = $3
+             ) AS canonical_order`,
+          [
+            candidate.organization_id,
+            candidate.integration_account_id,
+            candidate.external_order_id,
+            candidate.id,
+            candidate.run_id,
+          ],
+        ),
+      ])
+      if (priorOrCanonical.rows[0]?.canonical_order) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'canonical_order_exists',
+        ))
+        continue
+      }
+      if (priorOrCanonical.rows[0]?.prior_candidate) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'prior_candidate_requires_review',
+        ))
+        continue
+      }
+      if (!automaticFaireOrderSourceIsFresh({
+        providerCreatedAt: candidate.provider_created_at,
+        observedAt: candidate.observed_at,
+      })) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'source_age_requires_review',
+        ))
+        continue
+      }
+      if (
+        candidate.normalized_order_status !== 'open'
+        || candidate.normalized_fulfillment_status !== 'unfulfilled'
+      ) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'order_state_requires_review',
+        ))
+        continue
+      }
+      if (
+        candidate.customer_resolution_state !== 'resolved'
+        || !candidate.customer_id
+        || !candidate.customer_match_method
+      ) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'customer_resolution_required',
+        ))
+        continue
+      }
+      const operationalLines = lines.filter((line) => (
+        Number(line.unfulfilled_quantity) > 0
+      ))
+      if (!operationalLines.length) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'line_items_empty',
+        ))
+        continue
+      }
+      if (operationalLines.some((line) => {
+        const quantity = exactWholeCommerceQuantityFromNumeric(
+          line.unfulfilled_quantity,
+        )
+        return quantity === null || quantity <= BigInt(0)
+      })) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'line_quantity_requires_review',
+        ))
+        continue
+      }
+      const productMappingIds = [...new Set(
+        operationalLines
+          .map((line) => line.product_mapping_id)
+          .filter((value): value is string => Boolean(value)),
+      )]
+      const mappings = productMappingIds.length
+        ? (
+            await client.query<AutomaticFaireProductMappingRow>(
+              `SELECT id::text, product_id::text, external_variant_id,
+                      channel_sku
+               FROM operations_product_mappings
+               WHERE organization_id = $1::uuid
+                 AND integration_account_id = $2::uuid
+                 AND pipeline_id = $3::uuid
+                 AND id = ANY($4::uuid[])
+                 AND active = true`,
+              [
+                candidate.organization_id,
+                candidate.integration_account_id,
+                candidate.pipeline_id,
+                productMappingIds,
+              ],
+            )
+          ).rows
+        : []
+      const mappingById = new Map(mappings.map((mapping) => [
+        mapping.id,
+        mapping,
+      ]))
+      const invalidLineMapping = operationalLines.some((line) => {
+        const sku = line.sku_snapshot?.trim() || ''
+        const mapping = line.product_mapping_id
+          ? mappingById.get(line.product_mapping_id)
+          : null
+        return (
+          !sku
+          || /[\p{C}]/u.test(sku)
+          || line.mapping_state !== 'resolved'
+          || !line.product_id
+          || !line.external_variant_id
+          || !mapping
+          || mapping.product_id !== line.product_id
+          || mapping.external_variant_id !== line.external_variant_id
+          || (mapping.channel_sku?.trim() || '') !== sku
+          || !['provider', 'manual'].includes(line.price_resolution_state)
+          || line.resolved_unit_price_minor === null
+          || !/^[0-9]+$/u.test(line.resolved_unit_price_minor)
+          || line.resolved_currency_code !== candidate.currency_code
+          || (
+            line.requires_shipping
+            && line.packaging_state !== 'resolved'
+          )
+        )
+      })
+      if (invalidLineMapping) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'product_sku_or_pack_mapping_requires_review',
+        ))
+        continue
+      }
+      const blockers = dynamicCandidateBlockingCodes(candidate, lines)
+      const automaticBlockers = new Set([
+        'ship_to_confirmation_required',
+        'delivery_decision_required',
+      ])
+      if (blockers.some((code) => !automaticBlockers.has(code))) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'candidate_blockers_require_review',
+        ))
+        continue
+      }
+      const requiresShipping = candidate.requires_shipping
+        && operationalLines.some((line) => line.requires_shipping)
+      let providerAddress: CandidateAddress | null = null
+      if (requiresShipping) {
+        let snapshot: Record<string, unknown> | null = null
+        try {
+          snapshot = encryptedSnapshot(
+            candidate,
+            input.runtime.globalId,
+            'ship_to',
+          )
+        } catch {
+          snapshot = null
+        }
+        if (!snapshot || !completeAddress(snapshot)) {
+          targets.push(heldAutomaticFairePromotionTarget(
+            candidate,
+            'ship_to_requires_review',
+          ))
+          continue
+        }
+        if (candidate.ship_to_snapshot_state === 'protected') {
+          providerAddress = normalizedAddress(snapshot)
+        } else if (candidate.ship_to_snapshot_state !== 'confirmed') {
+          targets.push(heldAutomaticFairePromotionTarget(
+            candidate,
+            'ship_to_requires_review',
+          ))
+          continue
+        }
+      }
+      let deliveryMode: 'provider' | 'default_sla' | null = null
+      if (requiresShipping && candidate.delivery_resolution_state === 'unresolved') {
+        deliveryMode = candidate.provider_requested_delivery_at
+          ? 'provider'
+          : candidate.provider_created_at
+            ? 'default_sla'
+            : null
+        if (!deliveryMode) {
+          targets.push(heldAutomaticFairePromotionTarget(
+            candidate,
+            'delivery_date_requires_review',
+          ))
+          continue
+        }
+      } else if (
+        requiresShipping
+        && (
+          !['provider', 'manual', 'policy'].includes(
+            candidate.delivery_resolution_state,
+          )
+          || !candidate.requested_delivery_at
+        )
+      ) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'delivery_date_requires_review',
+        ))
+        continue
+      }
+      targets.push({
+        eligible: true,
+        reason: null,
+        candidateGlobalId: candidate.global_id,
+        candidateRowVersion: Number(candidate.row_version),
+        providerAddress,
+        deliveryMode,
+      })
+    }
+    return targets
   })
 }
 
@@ -8495,6 +10497,14 @@ export async function resolveCommerceCandidatePackageInPostgres(input: {
   package:
     | { mode: 'profile'; packageProfileGlobalId: string }
     | {
+        mode: 'variant_mapping'
+        externalProductId: string
+        externalVariantId: string
+        packProfileVersionGlobalId: string
+        expectedPackProfileVersionRowVersion: number
+        exactProductReadEvidence: ExactProductPackReadEvidence
+      }
+    | {
         mode: 'manual'
         weightGrams: number
         dimensionsMm: { length: number; width: number; height: number }
@@ -8540,6 +10550,701 @@ export async function resolveCommerceCandidatePackageInPostgres(input: {
         'This line does not require a package',
         422,
       )
+    }
+    if (input.package.mode === 'variant_mapping') {
+      if (
+        candidate.provider !== 'faire'
+        || started.account.provider !== 'faire'
+      ) {
+        intakeError(
+          'COMMERCE_INTAKE_VARIANT_PACK_PROVIDER_INVALID',
+          'Order-evidence pack binding is currently available only for Faire',
+          409,
+        )
+      }
+      if (candidate.credential_version !== started.account.credential_version) {
+        intakeError(
+          'COMMERCE_INTAKE_CREDENTIAL_GENERATION_STALE',
+          'The provider credential changed after this fetch. Fetch and resolve the order again',
+          422,
+        )
+      }
+      if (
+        line.mapping_state !== 'resolved'
+        || !line.product_id
+        || !line.product_global_id
+        || !line.product_mapping_id
+        || !line.external_product_id
+        || !line.external_variant_id
+        || line.external_product_id !== input.package.externalProductId
+        || line.external_variant_id !== input.package.externalVariantId
+      ) {
+        intakeError(
+          'COMMERCE_INTAKE_VARIANT_PACK_IDENTITY_REQUIRED',
+          'Confirm the exact Faire product and variant mapping before binding a Product pack version',
+          422,
+        )
+      }
+      const newerSource = await client.query<{ global_id: string }>(
+        `SELECT newer.global_id
+         FROM operations_commerce_order_candidates newer
+         WHERE newer.organization_id = $1::uuid
+           AND newer.integration_account_id = $2::uuid
+           AND newer.external_order_id = $3
+           AND newer.id <> $4::uuid
+           AND newer.observed_at > $5::timestamptz
+           AND (
+             newer.source_hash <> $6
+             OR newer.source_revision <> $7
+           )
+         ORDER BY newer.observed_at DESC
+         LIMIT 1`,
+        [
+          candidate.organization_id,
+          candidate.integration_account_id,
+          candidate.external_order_id,
+          candidate.id,
+          iso(candidate.observed_at),
+          candidate.source_hash,
+          candidate.source_revision,
+        ],
+      )
+      if (newerSource.rows[0]) {
+        intakeError(
+          'COMMERCE_INTAKE_SOURCE_REVISION_STALE',
+          `A newer provider revision is held as ${newerSource.rows[0].global_id}. Resolve that revision instead`,
+          422,
+        )
+      }
+      const unitMultiplier = exactWholeCommerceQuantityFromNumeric(
+        line.unit_multiplier,
+      )
+      if (
+        unitMultiplier === null
+        || unitMultiplier < BigInt(1)
+        || unitMultiplier > BigInt(Number.MAX_SAFE_INTEGER)
+      ) {
+        intakeError(
+          'COMMERCE_INTAKE_PACK_UNIT_MULTIPLIER_INVALID',
+          'The provider line unit count is not an exact supported whole number',
+          422,
+        )
+      }
+      const exactRead = input.package.exactProductReadEvidence
+      const exactReadTargetHash = commandHash(input.package.externalProductId)
+      const exactReadResult = await client.query<{
+        run_id: string
+        run_global_id: string
+        exact_product_evidence: unknown
+      }>(
+        `SELECT
+           run.id::text AS run_id,
+           run.global_id AS run_global_id,
+           stage.exact_product_evidence
+         FROM operations_commerce_intake_runs run
+         JOIN operations_commerce_intake_read_intents intent
+           ON intent.organization_id = run.organization_id
+          AND intent.integration_account_id = run.integration_account_id
+          AND intent.pipeline_id = run.pipeline_id
+          AND intent.staged_run_id = run.id
+          AND intent.provider_attempt_id = run.provider_attempt_id
+         JOIN operations_commerce_provider_attempts attempt
+           ON attempt.organization_id = intent.organization_id
+          AND attempt.integration_account_id = intent.integration_account_id
+          AND attempt.id = intent.provider_attempt_id
+         JOIN LATERAL (
+           SELECT
+             event.payload #> '{stageResult,exactProductEvidence}'
+               AS exact_product_evidence
+           FROM audit_events event
+           WHERE event.organization_id = run.organization_id
+             AND event.event_type = 'commerce.intake.staged'
+             AND event.aggregate_type = 'operations.commerce_intake_run'
+             AND event.aggregate_id = run.global_id
+             AND event.payload->>'exactProductTargetHash' = $6
+           ORDER BY event.created_at DESC, event.id DESC
+           LIMIT 1
+         ) stage ON true
+         WHERE run.organization_id = $1::uuid
+           AND run.integration_account_id = $2::uuid
+           AND run.pipeline_id = $3::uuid
+           AND run.provider = 'faire'
+           AND run.resource = 'products'
+           AND run.global_id = $4
+           AND run.credential_version = $5::integer
+           AND run.provider_attempt_id IS NOT NULL
+           AND run.expires_at > now()
+           AND run.workflow_state <> 'expired'
+           AND run.provider_write_count = 0
+           AND run.sync_cursor_advanced = false
+           AND intent.provider = 'faire'
+           AND intent.resource = 'products'
+           AND intent.intake_action = 'fetch-products'
+           AND intent.intent_state = 'staged'
+           AND intent.credential_version = $5::integer
+           AND intent.target_kind = 'none'
+           AND intent.expires_at > now()
+           AND attempt.action = 'commerce.intake.read'
+           AND attempt.state = 'succeeded'
+           AND attempt.redacted_request->>'targetHash' = $6
+           AND attempt.redacted_request->>'targetedRead' = 'true'
+           AND attempt.redacted_request->>'productsFetched' = 'true'
+           AND attempt.redacted_request->>'readOnly' = 'true'
+           AND attempt.redacted_request->>'providerWrites' = '0'
+           AND attempt.redacted_request->>'syncCursorAdvanced' = 'false'
+         LIMIT 1
+         FOR UPDATE OF run, intent, attempt`,
+        [
+          candidate.organization_id,
+          candidate.integration_account_id,
+          candidate.pipeline_id,
+          exactRead.runGlobalId,
+          started.account.credential_version,
+          exactReadTargetHash,
+        ],
+      )
+      const exactReadRun = exactReadResult.rows[0]
+      if (!exactReadRun) {
+        intakeError(
+          'COMMERCE_INTAKE_EXACT_PRODUCT_READ_REQUIRED',
+          'The selected pack is not tied to a current successful exact read-only Faire product run. Reload and retry the exact product read',
+          409,
+        )
+      }
+      if (
+        exactRead.externalProductId !== input.package.externalProductId
+        || exactRead.externalVariantId !== input.package.externalVariantId
+        || !exactProductAuditEvidenceMatches(
+          exactReadRun.exact_product_evidence,
+          exactRead,
+        )
+      ) {
+        intakeError(
+          'COMMERCE_INTAKE_EXACT_PRODUCT_EVIDENCE_REQUIRED',
+          'The exact Faire product run does not contain the staged product and variant evidence selected for this pack. Reload and retry',
+          409,
+        )
+      }
+      await acquireTransactionAdvisoryLock(
+        client,
+        `product-pack:${candidate.organization_id}:${line.product_global_id}`,
+      )
+      const exactProductMapping = await client.query<{
+        id: string
+        global_id: string
+      }>(
+        `SELECT mapping.id::text, mapping.global_id
+         FROM operations_product_mappings mapping
+         JOIN crm_products product
+           ON product.pipeline_id = mapping.pipeline_id
+          AND product.id = mapping.product_id
+         WHERE mapping.organization_id = $1::uuid
+           AND mapping.integration_account_id = $2::uuid
+           AND mapping.pipeline_id = $3::uuid
+           AND mapping.id = $4::uuid
+           AND mapping.product_id = $5::uuid
+           AND mapping.external_product_id = $6
+           AND mapping.external_variant_id = $7
+           AND mapping.active = true
+           AND COALESCE(lower(product.source_payload->>'archived'), 'false')
+               NOT IN ('true', '1', 'yes')
+         LIMIT 1
+         FOR UPDATE OF mapping, product`,
+        [
+          candidate.organization_id,
+          candidate.integration_account_id,
+          candidate.pipeline_id,
+          line.product_mapping_id,
+          line.product_id,
+          line.external_product_id,
+          line.external_variant_id,
+        ],
+      )
+      if (!exactProductMapping.rows[0]) {
+        intakeError(
+          'COMMERCE_INTAKE_PRODUCT_MAPPING_STALE',
+          'The exact Faire product and variant mapping changed. Resolve the product again',
+          409,
+        )
+      }
+      const versionResult = await client.query<{
+        id: string
+        global_id: string
+        row_version: string
+        lifecycle_state: string
+        is_current: boolean
+        base_each_quantity: number
+        length_mm: number | null
+        width_mm: number | null
+        height_mm: number | null
+        dimension_basis: string
+        gross_weight_grams: number | null
+        weight_basis: string
+        evidence_type: string
+        profile_global_id: string
+        profile_name: string
+        package_level: 'each' | 'inner_pack' | 'case' | 'pallet'
+        profile_status: string
+      }>(
+        `SELECT
+           version.id::text,
+           version.global_id,
+           version.row_version::text,
+           version.lifecycle_state,
+           version.is_current,
+           version.base_each_quantity,
+           version.length_mm,
+           version.width_mm,
+           version.height_mm,
+           version.dimension_basis,
+           version.gross_weight_grams,
+           version.weight_basis,
+           version.evidence_type,
+           profile.global_id AS profile_global_id,
+           profile.profile_name,
+           profile.package_level,
+           profile.status AS profile_status
+         FROM operations_product_pack_profile_versions version
+         JOIN operations_product_pack_profiles profile
+           ON profile.organization_id = version.organization_id
+          AND profile.pipeline_id = version.pipeline_id
+          AND profile.product_id = version.product_id
+          AND profile.id = version.profile_id
+         WHERE version.organization_id = $1::uuid
+           AND version.pipeline_id = $2::uuid
+           AND version.product_id = $3::uuid
+           AND version.global_id = $4
+         LIMIT 1
+         FOR UPDATE OF version, profile`,
+        [
+          candidate.organization_id,
+          candidate.pipeline_id,
+          line.product_id,
+          input.package.packProfileVersionGlobalId,
+        ],
+      )
+      const version = versionResult.rows[0]
+      if (!version) {
+        intakeError(
+          'COMMERCE_INTAKE_PACK_PROFILE_VERSION_NOT_FOUND',
+          'Select a current Product pack version for the mapped product',
+          404,
+        )
+      }
+      if (
+        Number(version.row_version)
+          !== input.package.expectedPackProfileVersionRowVersion
+      ) {
+        intakeError(
+          'COMMERCE_INTAKE_PACK_PROFILE_VERSION_CONFLICT',
+          'The Product pack version changed. Reload before binding it',
+          409,
+        )
+      }
+      if (
+        version.is_current !== true
+        || !['customer_confirmed', 'active'].includes(
+          version.lifecycle_state,
+        )
+        || version.profile_status === 'retired'
+        || version.dimension_basis !== 'outer'
+        || !Number.isSafeInteger(version.length_mm)
+        || Number(version.length_mm) < 1
+        || !Number.isSafeInteger(version.width_mm)
+        || Number(version.width_mm) < 1
+        || !Number.isSafeInteger(version.height_mm)
+        || Number(version.height_mm) < 1
+        || !Number.isSafeInteger(version.gross_weight_grams)
+        || Number(version.gross_weight_grams) < 1
+        || version.weight_basis === 'unspecified'
+        || !['customer_confirmed', 'measured', 'provider'].includes(
+          version.evidence_type,
+        )
+      ) {
+        intakeError(
+          'COMMERCE_INTAKE_PACK_PROFILE_VERSION_INELIGIBLE',
+          'The selected Product pack version no longer has eligible current outer dimensions and weight evidence',
+          409,
+        )
+      }
+      if (BigInt(version.base_each_quantity) !== unitMultiplier) {
+        intakeError(
+          'COMMERCE_INTAKE_PACK_UNIT_MULTIPLIER_CONFLICT',
+          `The Faire line represents ${unitMultiplier.toString()} base each, but the selected pack represents ${version.base_each_quantity}`,
+          409,
+        )
+      }
+      const channelStateResult = await client.query<{
+        id: string
+        global_id: string
+        row_version: string
+        product_id: string | null
+        product_mapping_id: string | null
+        provider: string
+        external_product_id: string
+        external_variant_id: string
+        normalized_status: string
+        provider_updated_at: string | Date | null
+        observed_at: string | Date
+        source_revision: string
+        source_hash: string
+        pack_evidence_hash: string
+      }>(
+        `SELECT
+           state.id::text,
+           state.global_id,
+           state.row_version::text,
+           state.product_id::text,
+           state.product_mapping_id::text,
+           state.provider,
+           state.external_product_id,
+           state.external_variant_id,
+           state.normalized_status,
+           state.provider_updated_at,
+           state.observed_at,
+           state.source_revision,
+           state.source_hash,
+           state.pack_evidence_hash
+         FROM operations_product_channel_states state
+         WHERE state.organization_id = $1::uuid
+           AND state.integration_account_id = $2::uuid
+           AND state.pipeline_id = $3::uuid
+           AND state.global_id = $4
+           AND state.provider = 'faire'
+           AND state.external_product_id = $5
+           AND state.external_variant_id = $6
+           AND state.product_id = $7::uuid
+           AND state.product_mapping_id = $8::uuid
+           AND state.row_version = $9::bigint
+           AND state.source_revision = $10
+           AND state.source_hash = $11
+           AND state.pack_evidence_hash = $12
+         LIMIT 1
+         FOR UPDATE OF state`,
+        [
+          candidate.organization_id,
+          candidate.integration_account_id,
+          candidate.pipeline_id,
+          exactRead.channelStateGlobalId,
+          line.external_product_id,
+          line.external_variant_id,
+          line.product_id,
+          line.product_mapping_id,
+          exactRead.channelStateRowVersion,
+          exactRead.channelSourceRevision,
+          exactRead.channelSourceHash,
+          exactRead.channelPackEvidenceHash,
+        ],
+      )
+      const channelState = channelStateResult.rows[0]
+      if (
+        !channelState
+        || channelState.provider !== 'faire'
+        || channelState.external_product_id !== line.external_product_id
+        || channelState.external_variant_id !== line.external_variant_id
+        || channelState.product_id !== line.product_id
+        || channelState.product_mapping_id !== line.product_mapping_id
+        || channelState.source_revision !== exactRead.variantSourceRevision
+        || channelState.source_hash !== exactRead.variantSourceHash
+        || !/^[a-f0-9]{64}$/.test(channelState.source_hash)
+        || !/^[a-f0-9]{64}$/.test(channelState.pack_evidence_hash)
+      ) {
+        intakeError(
+          'COMMERCE_INTAKE_EXACT_PRODUCT_STATE_REQUIRED',
+          'The exact read-only Faire product observation did not produce a current channel state for this mapped variant',
+          409,
+        )
+      }
+      const currentMappingResult = await client.query<{
+        id: string
+        global_id: string
+        row_version: string
+        product_id: string
+        external_product_id: string
+        external_variant_id: string
+        default_pack_profile_version_id: string
+        projection_state: string
+        pack_evidence_hash: string | null
+      }>(
+        `SELECT
+           mapping.id::text,
+           mapping.global_id,
+           mapping.row_version::text,
+           mapping.product_id::text,
+           mapping.external_product_id,
+           mapping.external_variant_id,
+           mapping.default_pack_profile_version_id::text,
+           mapping.projection_state,
+           mapping.pack_evidence_hash
+         FROM operations_commerce_variant_pack_mappings mapping
+         WHERE mapping.organization_id = $1::uuid
+           AND mapping.integration_account_id = $2::uuid
+           AND mapping.provider = 'faire'
+           AND mapping.external_variant_id = $3
+           AND mapping.mapping_purpose = 'catalog'
+           AND mapping.is_current = true
+         LIMIT 2
+         FOR UPDATE OF mapping`,
+        [
+          candidate.organization_id,
+          candidate.integration_account_id,
+          line.external_variant_id,
+        ],
+      )
+      if (currentMappingResult.rows.length > 1) {
+        intakeError(
+          'COMMERCE_INTAKE_PACK_MAPPING_CURRENT_CONFLICT',
+          'This Faire variant has multiple current pack mappings. Resolve the data conflict before continuing',
+          500,
+        )
+      }
+      let packMapping = currentMappingResult.rows[0] || null
+      if (packMapping && (
+        packMapping.product_id !== line.product_id
+        || packMapping.external_product_id !== line.external_product_id
+        || packMapping.external_variant_id !== line.external_variant_id
+        || packMapping.default_pack_profile_version_id !== version.id
+        || packMapping.projection_state !== 'current'
+        || packMapping.pack_evidence_hash !== channelState.pack_evidence_hash
+      )) {
+        intakeError(
+          'COMMERCE_INTAKE_PACK_MAPPING_CONFLICT',
+          'This Faire variant already has a different current Product pack mapping. Reload Product pack rules before replacing it',
+          409,
+        )
+      }
+      let mappingCreated = false
+      if (!packMapping) {
+        const insertedMapping = await client.query<{
+          id: string
+          global_id: string
+          row_version: string
+          product_id: string
+          external_product_id: string
+          external_variant_id: string
+          default_pack_profile_version_id: string
+          projection_state: string
+          pack_evidence_hash: string
+        }>(
+          `INSERT INTO operations_commerce_variant_pack_mappings (
+             organization_id,
+             integration_account_id,
+             pipeline_id,
+             product_id,
+             provider,
+             external_product_id,
+             external_variant_id,
+             default_pack_profile_version_id,
+             provider_lifecycle_state,
+             projection_state,
+             mapping_purpose,
+             source_revision,
+             source_hash,
+             pack_evidence_hash,
+             provider_updated_at,
+             observed_at,
+             is_current,
+             created_by,
+             updated_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'faire', $5, $6,
+             $7::uuid, $8, 'current', 'catalog', $9, $10, $11,
+             $12::timestamptz, $13::timestamptz, true, $14, $14
+           )
+           RETURNING
+             id::text,
+             global_id,
+             row_version::text,
+             product_id::text,
+             external_product_id,
+             external_variant_id,
+             default_pack_profile_version_id::text,
+             projection_state,
+             pack_evidence_hash`,
+          [
+            candidate.organization_id,
+            candidate.integration_account_id,
+            candidate.pipeline_id,
+            line.product_id,
+            line.external_product_id,
+            line.external_variant_id,
+            version.id,
+            channelState.normalized_status,
+            channelState.source_revision,
+            channelState.source_hash,
+            channelState.pack_evidence_hash,
+            iso(channelState.provider_updated_at),
+            iso(channelState.observed_at),
+            input.actorEmail,
+          ],
+        )
+        packMapping = insertedMapping.rows[0]
+        mappingCreated = true
+      }
+      if (!packMapping) {
+        intakeError(
+          'COMMERCE_INTAKE_PACK_MAPPING_CREATE_FAILED',
+          'The exact Faire variant pack mapping was not retained',
+          500,
+        )
+      }
+      const lineUpdate = await client.query(
+        `UPDATE operations_commerce_order_candidate_lines
+         SET packaging_state = 'resolved',
+             package_profile_id = NULL,
+             commerce_variant_pack_mapping_id = $2::uuid,
+             commerce_variant_pack_mapping_row_version = $3::bigint,
+             pack_profile_version_id = $4::uuid,
+             pack_profile_version_row_version = $5::bigint,
+             pack_profile_package_level = $6,
+             pack_profile_base_each_quantity = $7,
+             packaging_source = 'variant_pack_mapping',
+             packaging_weight_source = 'profile_version',
+             weight_grams = $8,
+             length_mm = $9,
+             width_mm = $10,
+             height_mm = $11,
+             workflow_state = 'resolving',
+             blocking_codes = array_remove(
+               blocking_codes, 'packaging_required'
+             ),
+             row_version = row_version + 1,
+             updated_by = $12,
+             updated_at = now()
+         WHERE id = $1::uuid
+           AND row_version = $13::bigint`,
+        [
+          line.id,
+          packMapping.id,
+          Number(packMapping.row_version),
+          version.id,
+          Number(version.row_version),
+          version.package_level,
+          version.base_each_quantity,
+          version.gross_weight_grams,
+          version.length_mm,
+          version.width_mm,
+          version.height_mm,
+          input.actorEmail,
+          Number(line.row_version),
+        ],
+      )
+      if (lineUpdate.rowCount !== 1) {
+        intakeError(
+          'COMMERCE_INTAKE_LINE_VERSION_CONFLICT',
+          'The provider line changed. Reload before binding its Product pack version',
+          409,
+        )
+      }
+      const advanced = await advanceCandidate(
+        client,
+        candidate,
+        input.actorEmail,
+        'resolving',
+      )
+      await recordDecision(client, {
+        candidate,
+        targetType: 'order_candidate_line',
+        targetGlobalId: line.global_id,
+        targetSourceRevision: line.source_revision,
+        targetSourceHash: line.source_hash,
+        decisionType: 'package_resolution',
+        resultingWorkflowState: advanced.candidate.workflow_state,
+        reasonCode: mappingCreated
+          ? 'variant_pack_mapping_created_from_exact_product'
+          : 'current_variant_pack_mapping_reused',
+        receipt: started.receipt,
+        idempotencyKey: input.idempotencyKey,
+        requestHash: started.requestHash,
+        actorEmail: input.actorEmail,
+      })
+      const result = commandResult(
+        advanced.candidate,
+        'resolve-package',
+        {
+          replayed: false,
+          lineGlobalId: line.global_id,
+          packageSource: 'variant_pack_mapping',
+          mappingCreated,
+          variantPackMappingGlobalId: packMapping.global_id,
+          variantPackMappingRowVersion: Number(packMapping.row_version),
+          productMappingGlobalId: exactProductMapping.rows[0].global_id,
+          productGlobalId: line.product_global_id,
+          externalProductId: line.external_product_id,
+          externalVariantId: line.external_variant_id,
+          exactProductRunGlobalId: exactReadRun.run_global_id,
+          exactProductSourceHash: exactRead.productSourceHash,
+          exactProductVariantSourceRevision: exactRead.variantSourceRevision,
+          exactProductVariantSourceHash: exactRead.variantSourceHash,
+          orderSourceRevision: line.source_revision,
+          orderSourceHash: line.source_hash,
+          channelStateGlobalId: channelState.global_id,
+          channelStateRowVersion: Number(channelState.row_version),
+          channelSourceRevision: channelState.source_revision,
+          channelSourceHash: channelState.source_hash,
+          channelPackEvidenceHash: channelState.pack_evidence_hash,
+          packProfileGlobalId: version.profile_global_id,
+          packProfileVersionGlobalId: version.global_id,
+          packProfileVersionRowVersion: Number(version.row_version),
+          packageLevel: version.package_level,
+          baseEachQuantity: version.base_each_quantity,
+          providerUnitMultiplier: Number(unitMultiplier),
+          weightGrams: version.gross_weight_grams,
+          dimensionsMm: {
+            length: version.length_mm,
+            width: version.width_mm,
+            height: version.height_mm,
+          },
+          providerReads: 1,
+          providerWrites: 0,
+          syncCursorAdvanced: false,
+        },
+      )
+      await completeReceipt(
+        client,
+        started.receipt.id,
+        candidate.global_id,
+        result,
+      )
+      await recordAuditEvent({
+        actor: input.actorEmail,
+        eventType: 'commerce.intake.variant_pack_mapping_bound',
+        aggregateType: 'operations.commerce_variant_pack_mapping',
+        aggregateId: packMapping.global_id,
+        subject: line.product_title_snapshot,
+        organizationId: candidate.organization_id,
+        eventKey:
+          `commerce-intake:${candidate.global_id}:${line.global_id}:variant-pack:${started.receipt.id}`,
+        payload: {
+          candidateGlobalId: candidate.global_id,
+          lineGlobalId: line.global_id,
+          provider: 'faire',
+          mappingCreated,
+          productGlobalId: line.product_global_id,
+          productMappingGlobalId: exactProductMapping.rows[0].global_id,
+          externalProductId: line.external_product_id,
+          externalVariantId: line.external_variant_id,
+          exactProductRunGlobalId: exactReadRun.run_global_id,
+          exactProductSourceHash: exactRead.productSourceHash,
+          exactProductVariantSourceRevision: exactRead.variantSourceRevision,
+          exactProductVariantSourceHash: exactRead.variantSourceHash,
+          orderSourceRevision: line.source_revision,
+          orderSourceHash: line.source_hash,
+          channelStateGlobalId: channelState.global_id,
+          channelStateRowVersion: Number(channelState.row_version),
+          channelSourceRevision: channelState.source_revision,
+          channelSourceHash: channelState.source_hash,
+          channelPackEvidenceHash: channelState.pack_evidence_hash,
+          packProfileVersionGlobalId: version.global_id,
+          packProfileVersionRowVersion: Number(version.row_version),
+          baseEachQuantity: version.base_each_quantity,
+          providerUnitMultiplier: Number(unitMultiplier),
+          providerReads: 1,
+          providerWrites: 0,
+          syncCursorAdvanced: false,
+        },
+      }, client)
+      return result
     }
     let packageProfileId: string | null = null
     let packageProfileGlobalId: string | null = null
@@ -9124,9 +11829,8 @@ export async function promoteCommerceCandidateInPostgres(input: {
              AND pack_mapping.is_current = true
              AND pack_mapping.projection_state = 'current'
              AND pack_mapping.row_version = $8::bigint
-             AND pack_mapping.source_revision =
-                  channel_state.source_revision
-             AND pack_mapping.source_hash = channel_state.source_hash
+             AND pack_mapping.pack_evidence_hash =
+                  channel_state.pack_evidence_hash
              AND profile_version.id = $9::uuid
              AND profile_version.row_version = $10::bigint
              AND profile_version.is_current = true
@@ -9307,7 +12011,10 @@ export async function promoteCommerceCandidateInPostgres(input: {
             accountingUse: candidate.header_money_state === 'complete'
               ? 'eligible'
               : 'blocked',
-            customerChargeUse: candidate.header_money_state === 'complete'
+            customerChargeUse: commerceCustomerChargeEligible(
+              candidate.provider,
+              candidate.header_money_state,
+            )
               ? 'eligible'
               : 'blocked',
           },
@@ -9563,6 +12270,22 @@ export async function promoteCommerceCandidateInPostgres(input: {
     candidate.canonical_order_id = order.id
     candidate.canonical_order_global_id = order.global_id
     candidate.row_version = updatedCandidate.rows[0].row_version
+    const checkoutRateLineageRequired = candidate.provider === 'shopify'
+      && shopifyCheckoutRateLineageIsRequired(
+        candidate.checkout_shipping_service_code,
+      )
+    const checkoutRateReconciliation = checkoutRateLineageRequired
+      ? await reconcileShopifyCheckoutRateForOrderCandidateWithClient(
+          client,
+          {
+            organizationId: candidate.organization_id,
+            orderCandidateGlobalId: candidate.global_id,
+            idempotencyKey:
+              `${candidate.global_id}:checkout-rate-reconciliation`,
+            actorEmail: input.actorEmail,
+          },
+        )
+      : null
     await refreshRunCounts(client, candidate, input.actorEmail)
     await recordDecision(client, {
       candidate,
@@ -9591,6 +12314,18 @@ export async function promoteCommerceCandidateInPostgres(input: {
         provider: candidate.provider,
         externalOrderId: candidate.external_order_id,
         canonicalOrderGlobalId: order.global_id,
+        checkoutRateReconciliationGlobalId:
+          checkoutRateReconciliation?.globalId || null,
+        checkoutRateReconciliationOutcome:
+          candidate.provider === 'shopify'
+            ? checkoutRateReconciliation?.outcome || 'not_applicable'
+            : null,
+        checkoutRateLineageRequired,
+        checkoutRateFulfillmentEligible:
+          !checkoutRateLineageRequired
+          || shopifyCheckoutRateOutcomeAllowsFulfillment(
+            checkoutRateReconciliation?.outcome,
+          ),
         lineCount: promotedLines.length,
         providerWrites: 0,
         syncCursorAdvanced: false,
@@ -9605,6 +12340,21 @@ export async function promoteCommerceCandidateInPostgres(input: {
         canonicalLineGlobalIds: promotedLines.map(
           (line) => line.canonicalLineGlobalId,
         ),
+        checkoutRateReconciliation: candidate.provider === 'shopify'
+          ? {
+              globalId: checkoutRateReconciliation?.globalId || null,
+              receiptGlobalId:
+                checkoutRateReconciliation?.receiptGlobalId || null,
+              outcome:
+                checkoutRateReconciliation?.outcome || 'not_applicable',
+              lineageRequired: checkoutRateLineageRequired,
+              fulfillmentEligible:
+                !checkoutRateLineageRequired
+                || shopifyCheckoutRateOutcomeAllowsFulfillment(
+                  checkoutRateReconciliation?.outcome,
+                ),
+            }
+          : null,
         inventoryWrites: 0,
         reservationWrites: 0,
         fulfillmentWrites: 0,
@@ -9615,6 +12365,120 @@ export async function promoteCommerceCandidateInPostgres(input: {
       client,
       started.receipt.id,
       order.global_id,
+      result,
+    )
+    return result
+  })
+}
+
+export async function
+reconcilePromotedCommerceCandidateCheckoutRateInPostgres(input: {
+  runtime: CommerceRuntimeCredentialRecord
+  actorEmail: string
+  idempotencyKey: string
+  candidateGlobalId: string
+  candidateRowVersion: number
+}) {
+  return withTransaction(async (client) => {
+    const started = await commandStart(
+      client,
+      input,
+      'commerce.intake.reconcile_checkout_rate',
+      {
+        policyVersion: POLICY_VERSION,
+        candidateRowVersion: input.candidateRowVersion,
+        recoveryPolicyVersion:
+          'shopify-cached-receipt-reuse-reconciliation-v1',
+      },
+    )
+    if (started.replayed) return replayPayload(started.receipt)
+    const candidateResult = await client.query<{
+      row_version: string
+      provider: string
+      workflow_state: string
+      canonical_order_id: string | null
+      checkout_shipping_service_code: string | null
+    }>(
+      `SELECT
+         candidate.row_version::text,
+         candidate.provider,
+         candidate.workflow_state,
+         candidate.canonical_order_id::text,
+         candidate.checkout_shipping_service_code
+       FROM operations_commerce_order_candidates candidate
+       JOIN operations_integration_accounts account
+         ON account.organization_id = candidate.organization_id
+        AND account.id = candidate.integration_account_id
+       WHERE candidate.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND candidate.global_id = $3
+       FOR UPDATE OF candidate`,
+      [
+        input.runtime.organizationId,
+        input.runtime.globalId,
+        input.candidateGlobalId,
+      ],
+    )
+    const candidate = candidateResult.rows[0]
+    if (!candidate) {
+      intakeError(
+        'COMMERCE_INTAKE_CANDIDATE_NOT_FOUND',
+        'The selected order candidate is unavailable for this connection',
+        404,
+      )
+    }
+    if (Number(candidate.row_version) !== input.candidateRowVersion) {
+      intakeError(
+        'COMMERCE_INTAKE_ROW_VERSION_CONFLICT',
+        'The order changed after it was opened. Reload before matching its checkout quote',
+        409,
+      )
+    }
+    if (
+      candidate.provider !== 'shopify'
+      || candidate.workflow_state !== 'promoted'
+      || !candidate.canonical_order_id
+      || !shopifyCheckoutRateLineageIsRequired(
+        candidate.checkout_shipping_service_code,
+      )
+    ) {
+      intakeError(
+        'COMMERCE_INTAKE_CHECKOUT_RECONCILIATION_NOT_APPLICABLE',
+        'A promoted Shopify order using a ClawPilot shipping service is required',
+        409,
+      )
+    }
+    const reconciliation =
+      await reconcileShopifyCheckoutRateForOrderCandidateWithClient(
+        client,
+        {
+          organizationId: input.runtime.organizationId,
+          orderCandidateGlobalId: input.candidateGlobalId,
+          idempotencyKey:
+            `${input.candidateGlobalId}:checkout-rate-reconciliation`,
+          actorEmail: input.actorEmail,
+        },
+      )
+    const result = {
+      replayed: false,
+      action: 'reconcile-checkout-rate',
+      candidateGlobalId: input.candidateGlobalId,
+      checkoutRateReconciliation: {
+        globalId: reconciliation.globalId,
+        receiptGlobalId: reconciliation.receiptGlobalId,
+        outcome: reconciliation.outcome,
+        fulfillmentEligible:
+          shopifyCheckoutRateOutcomeAllowsFulfillment(
+            reconciliation.outcome,
+          ),
+      },
+      providerWrites: 0,
+      syncCursorAdvanced: false,
+    }
+    await completeReceipt(
+      client,
+      started.receipt.id,
+      reconciliation.globalId,
       result,
     )
     return result

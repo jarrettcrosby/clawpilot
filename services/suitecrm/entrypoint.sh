@@ -179,6 +179,7 @@ chmod 0600 "$KEY_DIR/private.key" "$KEY_DIR/public.key"
 
 php /opt/clawpilot/bootstrap-client.php
 su -s /bin/bash www-data -c "cd '$APP_ROOT/public/legacy' && php /opt/clawpilot/bootstrap-global-id.php"
+su -s /bin/bash www-data -c "cd '$APP_ROOT/public/legacy' && php /opt/clawpilot/bootstrap-image-principals.php"
 su -s /bin/bash www-data -c "cd '$APP_ROOT' && APP_ENV=prod php bin/console cache:clear --no-warmup"
 su -s /bin/bash www-data -c "cd '$APP_ROOT' && APP_ENV=prod php bin/console cache:warmup"
 su -s /bin/bash www-data -c "cd '$APP_ROOT' && php bin/console messenger:setup-transports --no-interaction" || true

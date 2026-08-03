@@ -228,10 +228,14 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: app_src/package-lock.json
+          cache-dependency-path: |
+            app_src/package-lock.json
+            shopify/package-lock.json
 
       - name: Install without lifecycle scripts
-        run: npm --prefix app_src ci --ignore-scripts
+        run: |
+          npm --prefix app_src ci --ignore-scripts
+          npm --prefix shopify ci --ignore-scripts
 
       - name: Validate patch
         run: npm run check

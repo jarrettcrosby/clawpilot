@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { GLOBAL_ID_MAX_LENGTH } from '@/lib/globalIds.mjs'
 import { operationsCapabilities } from '@/lib/operations/authorization'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
@@ -110,8 +111,8 @@ function reconciliationInput(
     throw new Error('Product identity evidence type is invalid')
   }
   return {
-    canonicalGlobalId: stringValue(body.canonicalGlobalId, 9),
-    duplicateGlobalId: stringValue(body.duplicateGlobalId, 9),
+    canonicalGlobalId: stringValue(body.canonicalGlobalId, GLOBAL_ID_MAX_LENGTH),
+    duplicateGlobalId: stringValue(body.duplicateGlobalId, GLOBAL_ID_MAX_LENGTH),
     expectedCanonicalSourceHash: stringValue(
       body.expectedCanonicalSourceHash,
       64,
@@ -163,7 +164,7 @@ export async function GET(req: NextRequest) {
     if (resolveGlobalId) {
       const resolution = await resolveProductIdentityInPostgres({
         pipelineId: pipeline.id,
-        productGlobalId: stringValue(resolveGlobalId, 9),
+        productGlobalId: stringValue(resolveGlobalId, GLOBAL_ID_MAX_LENGTH),
       })
       return NextResponse.json(
         { ok: true, resolution },

@@ -1,0 +1,15 @@
+{
+  "deliveryCustomization": {
+    "title": "ClawPilot checkout test-rate isolation",
+    "functionHandle": "clawpilot-test-rate-isolation",
+    "enabled": true,
+    "metafields": [
+      {
+        "namespace": "$app:clawpilot-test-rate-isolation",
+        "key": "function-configuration",
+        "type": "json",
+        "value": "{\"version\":2,\"defaultPolicy\":\"hide_all\"}"
+      }
+    ]
+  }
+}

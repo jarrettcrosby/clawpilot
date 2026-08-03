@@ -1,0 +1,30 @@
+{
+  "name": "@clawpilot/shopify-test-rate-isolation",
+  "version": "0.0.1",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "scripts": {
+    "build": "npm exec -- shopify app function build",
+    "test": "node --test tests/*.test.js",
+    "typegen": "npm exec -- shopify app function typegen"
+  },
+  "codegen": {
+    "schema": "schema.graphql",
+    "documents": "src/*.graphql",
+    "generates": {
+      "./generated/api.ts": {
+        "plugins": [
+          "typescript",
+          "typescript-operations"
+        ]
+      }
+    },
+    "config": {
+      "omitOperationSuffix": true
+    }
+  },
+  "dependencies": {
+    "@shopify/shopify_function": "2.0.1"
+  }
+}

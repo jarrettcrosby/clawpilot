@@ -23,6 +23,14 @@ class RequestError extends Error {
   }
 }
 
+class CarrierRequestError extends Error {
+  constructor(message, status = 400, code = 'CARRIER_INTEGRATION_REQUEST_FAILED') {
+    super(message)
+    this.code = code
+    this.status = status
+  }
+}
+
 function loadTypeScript(path, mocks, globals = {}) {
   const output = ts.transpileModule(read(path), {
     compilerOptions: {
@@ -89,6 +97,9 @@ function verifyStaticContracts() {
     'artifact.global_id = $2',
     'source_label.label_payload AS source_label_payload',
     'rate_test_label.label_payload AS rate_test_label_payload',
+    'rate_test_label.provider AS rate_test_label_provider',
+    'rate_test_label.integration_account_id::text',
+    'sourceRateTestIntegrationAccountId',
     'payload.payload AS artifact_payload',
     "artifact.document_type !== 'packing_slip'",
     "artifact.document_type !== 'shipping_label'",
@@ -107,7 +118,10 @@ function verifyStaticContracts() {
   for (const fragment of [
     'requireRequestUser',
     'activeOperationsOrganizationId',
-    'operationsCapabilities(actor).canView',
+    'const capabilities = operationsCapabilities(actor)',
+    '!capabilities.canView',
+    '!capabilities.canManage || !capabilities.canExecute',
+    "'CARRIER_EXECUTE_REQUIRED'",
     'Content-Disposition',
     'private, no-cache, max-age=0, must-revalidate',
     'Cross-Origin-Resource-Policy',
@@ -117,6 +131,8 @@ function verifyStaticContracts() {
     "PDF: 'pdf'",
     "PNG: 'png'",
     'new Uint8Array(artifact.payload)',
+    'assertCarrierRateTestArtifactCapability',
+    'integrationAccountId: artifact.sourceRateTestIntegrationAccountId',
   ]) {
     assert.ok(route.includes(fragment), `Missing artifact route contract: ${fragment}`)
   }
@@ -148,6 +164,7 @@ function verifyStaticContracts() {
   const carrierPanel = read('app_src/components/settings/CarrierIntegrationPanel.tsx')
   for (const fragment of [
     'selectedRateTestLabel.printArtifactGlobalId',
+    'canExecute && (selectedRateTestLabel.printArtifactGlobalId',
     'Download stored {selectedRateTestLabel.format}',
   ]) {
     assert.ok(
@@ -211,6 +228,8 @@ async function verifyPersistenceContracts() {
     source_label_format: null,
     source_label_payload: null,
     rate_test_label_global_id: null,
+    rate_test_label_integration_account_id: null,
+    rate_test_label_provider: null,
     rate_test_label_format: null,
     rate_test_label_payload: null,
     created_at: new Date('2026-07-23T12:00:00.000Z'),
@@ -220,6 +239,11 @@ async function verifyPersistenceContracts() {
     {
       crypto: requireFromApp('crypto'),
       '@/lib/auditWriter': { recordAuditEvent: async () => undefined },
+      '@/lib/integrations/carrierManagedDelegation': {
+        isSourceManagedCarrierConfiguration: () => false,
+        managedCarrierDelegationAllows: () => false,
+        managedCarrierDelegationProfile: () => null,
+      },
       '@/lib/operations/printing': {},
       '@/lib/persistence/operationPrinting': {},
       '@/lib/persistence/operations': { OperationsRequestError: RequestError },
@@ -303,6 +327,8 @@ async function verifyPersistenceContracts() {
     artifact_payload: null,
     template_version: null,
     rate_test_label_global_id: 'gsl1000001',
+    rate_test_label_integration_account_id: '33333333-3333-4333-8333-333333333333',
+    rate_test_label_provider: 'ups_rest',
     rate_test_label_format: 'ZPL',
     rate_test_label_payload: zpl,
   }]
@@ -313,6 +339,10 @@ async function verifyPersistenceContracts() {
   assert.deepEqual(Buffer.from(zplArtifact.payload), zpl)
   assert.equal(zplArtifact.mimeType, 'application/vnd.zebra-zpl')
   assert.equal(zplArtifact.filename, 'shipping-label-gsl1000001')
+  assert.equal(
+    zplArtifact.sourceRateTestIntegrationAccountId,
+    '33333333-3333-4333-8333-333333333333',
+  )
 
   const png = Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
@@ -327,6 +357,8 @@ async function verifyPersistenceContracts() {
     source_label_format: 'PNG',
     source_label_payload: png.toString('base64'),
     rate_test_label_global_id: null,
+    rate_test_label_integration_account_id: null,
+    rate_test_label_provider: null,
     rate_test_label_format: null,
     rate_test_label_payload: null,
   }]
@@ -384,8 +416,12 @@ async function verifyRouteContracts() {
   const contentSha256 = createHash('sha256').update(pdf).digest('hex')
   let authenticated = true
   let canView = true
+  let canManage = false
+  let canExecute = false
   let actorOrganizationId = '22222222-2222-4222-8222-222222222222'
   const reads = []
+  const carrierAuthorizations = []
+  let carrierAuthorizationError = null
   let routeArtifact = {
     globalId: 'gpf1000002',
     documentType: 'packing_slip',
@@ -403,12 +439,19 @@ async function verifyRouteContracts() {
     'app_src/app/api/operations/artifacts/[globalId]/route.ts',
     {
       'next/server': { NextRequest: class {}, NextResponse: TestNextResponse },
+      '@/lib/integrations/carrierIntegrations': {
+        assertCarrierRateTestArtifactCapability: async (input) => {
+          carrierAuthorizations.push(input)
+          if (carrierAuthorizationError) throw carrierAuthorizationError
+        },
+        CarrierIntegrationRequestError: CarrierRequestError,
+      },
       '@/lib/operations/authorization': {
         activeOperationsOrganizationId(actor) {
           if (!actor.organizationId) throw new Error('ACTIVE_ORGANIZATION_REQUIRED')
           return actor.organizationId
         },
-        operationsCapabilities: () => ({ canView }),
+        operationsCapabilities: () => ({ canView, canManage, canExecute }),
       },
       '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
       '@/lib/persistence/operationPrintDelivery': {
@@ -468,7 +511,39 @@ async function verifyRouteContracts() {
     filename: '../FedEx label.pdf',
     payload: zpl,
     templateVersion: null,
+    sourceRateTestProvider: 'fedex_rest',
+    sourceRateTestIntegrationAccountId: '33333333-3333-4333-8333-333333333333',
   }
+  const authorizationCountBeforePermissionChecks = carrierAuthorizations.length
+  canManage = true
+  const executionDenied = await route.GET(
+    { headers: new Headers() },
+    { params: Promise.resolve({ globalId: 'gpf1000002' }) },
+  )
+  assert.equal(executionDenied.status, 403)
+  assert.equal((await executionDenied.json()).code, 'CARRIER_EXECUTE_REQUIRED')
+  assert.equal(
+    carrierAuthorizations.length,
+    authorizationCountBeforePermissionChecks,
+    'A manager without warehouse execution must fail before carrier-capability resolution',
+  )
+
+  canManage = false
+  canExecute = true
+  const managementDenied = await route.GET(
+    { headers: new Headers() },
+    { params: Promise.resolve({ globalId: 'gpf1000002' }) },
+  )
+  assert.equal(managementDenied.status, 403)
+  assert.equal((await managementDenied.json()).code, 'CARRIER_EXECUTE_REQUIRED')
+  assert.equal(
+    carrierAuthorizations.length,
+    authorizationCountBeforePermissionChecks,
+    'Warehouse execution without operations management must fail before carrier-capability resolution',
+  )
+
+  canManage = true
+  canExecute = true
   const zplResponse = await route.GET(
     { headers: new Headers() },
     { params: Promise.resolve({ globalId: 'gpf1000002' }) },
@@ -480,6 +555,28 @@ async function verifyRouteContracts() {
     zplResponse.headers.get('content-disposition'),
     'attachment; filename="FedEx-label.zpl"',
   )
+  assert.deepEqual({ ...carrierAuthorizations.at(-1) }, {
+    organizationId: '22222222-2222-4222-8222-222222222222',
+    integrationAccountId: '33333333-3333-4333-8333-333333333333',
+    provider: 'fedex_rest',
+  })
+
+  carrierAuthorizationError = new CarrierRequestError(
+    'Sandbox label authorization was downgraded',
+    403,
+    'CARRIER_CAPABILITY_NOT_AUTHORIZED',
+  )
+  const deniedDownload = await route.GET(
+    { headers: new Headers() },
+    { params: Promise.resolve({ globalId: 'gpf1000002' }) },
+  )
+  assert.equal(deniedDownload.status, 403)
+  assert.equal(
+    (await deniedDownload.json()).code,
+    'CARRIER_CAPABILITY_NOT_AUTHORIZED',
+    'Downgrade must block stored diagnostic-label download',
+  )
+  carrierAuthorizationError = null
 
   const png = Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
@@ -494,6 +591,8 @@ async function verifyRouteContracts() {
     mimeType: 'image/png',
     filename: 'UPS label.zpl',
     payload: png,
+    sourceRateTestProvider: null,
+    sourceRateTestIntegrationAccountId: null,
   }
   const pngResponse = await route.GET(
     { headers: new Headers() },
@@ -518,6 +617,8 @@ async function verifyRouteContracts() {
     filename: 'packing-slip.pdf',
     payload: pdf,
     templateVersion: 'packing-slip-letter-v1',
+    sourceRateTestProvider: null,
+    sourceRateTestIntegrationAccountId: null,
   }
   const readsBeforeRevalidation = reads.length
   const notModified = await route.GET(

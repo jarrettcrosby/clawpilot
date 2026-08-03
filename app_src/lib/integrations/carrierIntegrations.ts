@@ -5,6 +5,12 @@ import {
   type CarrierRuntimeCredential,
 } from '@/lib/integrations/carrierCredentialClient'
 import {
+  carrierConfigurationAllowsSandboxLabel,
+  isSourceManagedCarrierConfiguration,
+  managedCarrierDelegationAllows,
+  managedCarrierDelegationProfile,
+} from '@/lib/integrations/carrierManagedDelegation'
+import {
   CARRIER_SANDBOX_RATE_FIXTURE,
   buildCarrierSandboxRateFixture,
   buildCarrierSandboxShipmentRateFixture,
@@ -16,6 +22,7 @@ import {
   type CarrierSandboxRatePurpose,
   type CarrierSandboxShipmentRateFixture,
 } from '@/lib/integrations/carrierSandboxRate'
+export { carrierSandboxRateDestinationFingerprint } from '@/lib/integrations/carrierSandboxRate'
 import {
   carrierAccountAddressFingerprint,
   decryptCarrierAccountNumber,
@@ -39,6 +46,7 @@ import {
   markCarrierCredentialVerificationInPostgres,
   recordCarrierCredentialRevealInPostgres,
   readActiveCarrierAccountsFromPostgres,
+  readCarrierConnectionAuthorizationFromPostgres,
   readCarrierIntegrationsStateFromPostgres,
   readCarrierRuntimeCredentialFromPostgres,
   setCarrierAccountStatusInPostgres,
@@ -52,19 +60,22 @@ import {
 const CARRIER_SANDBOX_RATE_ADAPTER_VERSION = 'direct-rest-v3'
 const CARRIER_SANDBOX_SHIPMENT_RATE_ADAPTER_VERSION =
   'direct-rest-multi-package-v1'
-const AG_ALCHEMY_EPISCS_RATING_DELEGATION =
-  'ag-alchemy-episcs-sandbox-rating-delegation'
-const AG_ALCHEMY_RATING_ORIGIN_WAREHOUSE = 'gwh5366613'
-
 export class CarrierIntegrationRequestError extends Error {
   readonly status: number
   readonly code: string
+  readonly rateEvidenceGlobalId: string | null
 
-  constructor(message: string, status = 400, code = 'CARRIER_REQUEST_INVALID') {
+  constructor(
+    message: string,
+    status = 400,
+    code = 'CARRIER_REQUEST_INVALID',
+    rateEvidenceGlobalId: string | null = null,
+  ) {
     super(message)
     this.name = 'CarrierIntegrationRequestError'
     this.status = status
     this.code = code
+    this.rateEvidenceGlobalId = rateEvidenceGlobalId
   }
 }
 
@@ -146,34 +157,6 @@ export function sanitizedCarrierIntegrationError(error: unknown) {
   return sanitize(error)
 }
 
-function isSourceManagedCarrierConfiguration(
-  configuration: Record<string, unknown>,
-) {
-  return (
-    configuration.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION
-    || (
-      configuration.authorizationScope === 'sandbox_rating_only'
-      && configuration.credentialRevealAllowed === false
-    )
-  )
-}
-
-function isExactAgAlchemyRatingDelegation(
-  configuration: Record<string, unknown>,
-) {
-  const capabilities = configuration.allowedCapabilities
-  return (
-    configuration.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION
-    && configuration.authorizationScope === 'sandbox_rating_only'
-    && configuration.credentialRevealAllowed === false
-    && configuration.senderOriginWarehouseGlobalId
-      === AG_ALCHEMY_RATING_ORIGIN_WAREHOUSE
-    && Array.isArray(capabilities)
-    && capabilities.length === 1
-    && capabilities[0] === 'sandbox_rate'
-  )
-}
-
 async function storedRuntimeCredential(input: {
   organizationId: unknown
   provider: unknown
@@ -183,6 +166,7 @@ async function storedRuntimeCredential(input: {
   integrationAccountId: string
   integrationGlobalId: string
   credentialVersion: number
+  credentialFingerprint: string
   status: 'active' | 'disabled' | 'error'
   verified: boolean
   configuration: Record<string, unknown>
@@ -209,6 +193,7 @@ async function storedRuntimeCredential(input: {
     integrationAccountId: stored.integrationAccountId,
     integrationGlobalId: stored.globalId,
     credentialVersion: stored.credentialVersion,
+    credentialFingerprint: stored.credentialFingerprint,
     configuration: stored.configuration,
     provider,
     environment,
@@ -284,33 +269,91 @@ export async function revealCarrierCredential(input: {
 
 function requiresConfiguredCapability(
   runtime: Pick<Awaited<ReturnType<typeof storedRuntimeCredential>>, 'configuration'>,
-  capability: 'sandbox_rate' | 'sandbox_label',
+  capability: 'sandbox_rate' | 'sandbox_label' | 'production_rate',
 ) {
   const configured = runtime.configuration.allowedCapabilities
   if (isSourceManagedCarrierConfiguration(runtime.configuration)) {
-    if (
-      capability !== 'sandbox_rate'
-      || !isExactAgAlchemyRatingDelegation(runtime.configuration)
-    ) {
+    if (!managedCarrierDelegationAllows(runtime.configuration, capability)) {
+      const profile = managedCarrierDelegationProfile(runtime.configuration)
       throw new CarrierIntegrationRequestError(
-        capability === 'sandbox_rate'
+        profile === 'drifted'
           ? 'This managed carrier rating connection requires repair'
-          : 'This carrier connection is authorized for sandbox rating only',
+          : capability === 'production_rate'
+            ? 'This managed carrier connection is not authorized for production rating'
+            : 'This carrier connection is authorized for sandbox rating only',
         403,
         'CARRIER_CAPABILITY_NOT_AUTHORIZED',
       )
     }
     return
   }
-  if (!Array.isArray(configured)) return
+  if (!Array.isArray(configured)) {
+    if (capability !== 'production_rate') return
+    throw new CarrierIntegrationRequestError(
+      'This carrier connection is not authorized for production rating',
+      403,
+      'CARRIER_CAPABILITY_NOT_AUTHORIZED',
+    )
+  }
   if (!configured.includes(capability)) {
     throw new CarrierIntegrationRequestError(
       capability === 'sandbox_rate'
         ? 'This carrier connection is not authorized for sandbox rating'
-        : 'This carrier connection is authorized for sandbox rating only',
+        : capability === 'production_rate'
+          ? 'This carrier connection is not authorized for production rating'
+          : 'This carrier connection is authorized for sandbox rating only',
       403,
       'CARRIER_CAPABILITY_NOT_AUTHORIZED',
     )
+  }
+}
+
+export async function assertCarrierRateTestArtifactCapability(input: {
+  organizationId: unknown
+  integrationAccountId: unknown
+  provider: unknown
+}) {
+  try {
+    const organizationId = normalizeCarrierOrganizationId(input.organizationId)
+    const integrationAccountId = String(input.integrationAccountId || '').trim()
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      integrationAccountId,
+    )) {
+      throw new CarrierIntegrationRequestError(
+        'The carrier connection that created this test label is unavailable',
+        403,
+        'CARRIER_CAPABILITY_NOT_AUTHORIZED',
+      )
+    }
+    const provider = normalizeDirectCarrierProvider(input.provider)
+    const stored = await readCarrierConnectionAuthorizationFromPostgres({
+      organizationId,
+      integrationAccountId,
+    })
+    if (
+      !stored
+      || stored.provider !== provider
+      || stored.environment !== 'sandbox'
+      || stored.status !== 'active'
+    ) {
+      throw new CarrierIntegrationRequestError(
+        'The carrier connection that created this test label is unavailable',
+        403,
+        'CARRIER_CAPABILITY_NOT_AUTHORIZED',
+      )
+    }
+    if (!carrierConfigurationAllowsSandboxLabel(stored.configuration)) {
+      throw new CarrierIntegrationRequestError(
+        isSourceManagedCarrierConfiguration(stored.configuration)
+          && managedCarrierDelegationProfile(stored.configuration) === 'drifted'
+          ? 'This managed carrier connection requires repair'
+          : 'This carrier connection is authorized for sandbox rating only',
+        403,
+        'CARRIER_CAPABILITY_NOT_AUTHORIZED',
+      )
+    }
+  } catch (error) {
+    throw sanitize(error)
   }
 }
 
@@ -581,6 +624,122 @@ export type CarrierSandboxShippingRuntime = {
   accountNumberFingerprint: string
   billingRelationship: SandboxBillingSelection['relationship']
   billingSelectionSnapshot: Record<string, unknown>
+}
+
+export type CarrierProductionRatingRuntime = {
+  organizationId: string
+  integrationAccountId: string
+  integrationGlobalId: string
+  credentialVersion: number
+  credentialFingerprint: string
+  provider: 'ups_rest' | 'fedex_rest'
+  environment: 'production'
+  credential: CarrierRuntimeCredential['credential'] & { accountNumber: string }
+  carrierAccountId: string
+  carrierAccountGlobalId: string
+  carrierAccountDisplayName: string
+  senderName: string
+  registeredAddress: CarrierRuntimeAccountRecord['registeredAddress']
+  registeredAddressFingerprint: string
+  accountNumberLastFour: string
+  accountNumberFingerprint: string
+  billingRelationship: 'sender'
+}
+
+/**
+ * Resolve one exact, active, verified production rating binding. This only
+ * releases credentials to the server-side read-only rerate executor; callers
+ * still must persist and validate a production rerate attempt before I/O.
+ */
+export async function resolveCarrierProductionRatingRuntime(input: {
+  organizationId: unknown
+  provider: unknown
+  integrationAccountGlobalId: unknown
+  carrierAccountGlobalId: unknown
+}): Promise<CarrierProductionRatingRuntime> {
+  try {
+    const organizationId = normalizeCarrierOrganizationId(input.organizationId)
+    const provider = normalizeDirectCarrierProvider(input.provider)
+    if (provider !== 'ups_rest' && provider !== 'fedex_rest') {
+      throw new CarrierIntegrationRequestError(
+        'Production whole-shipment rating is not available for this carrier',
+        409,
+        'CARRIER_PRODUCTION_RATE_UNSUPPORTED',
+      )
+    }
+    const integrationAccountGlobalId = String(
+      input.integrationAccountGlobalId || '',
+    ).trim()
+    const carrierAccountGlobalId = normalizeCarrierAccountGlobalId(
+      input.carrierAccountGlobalId,
+    )
+    const runtime = await storedRuntimeCredential({
+      organizationId,
+      provider,
+      environment: 'production',
+    })
+    if (
+      runtime.integrationGlobalId !== integrationAccountGlobalId
+      || runtime.status !== 'active'
+      || !runtime.verified
+    ) {
+      throw new CarrierIntegrationRequestError(
+        'The selected production carrier credential is not active and verified',
+        409,
+        'CARRIER_CREDENTIAL_INACTIVE',
+      )
+    }
+    requiresConfiguredCapability(runtime, 'production_rate')
+    const accounts = await readActiveCarrierAccountsFromPostgres({
+      organizationId,
+      integrationAccountId: runtime.integrationAccountId,
+    })
+    const account = accounts.find(
+      (candidate) => candidate.globalId === carrierAccountGlobalId,
+    )
+    if (!account) {
+      throw new CarrierIntegrationRequestError(
+        'The selected production carrier account is not active',
+        409,
+        'CARRIER_ACCOUNT_REQUIRED',
+      )
+    }
+    if (!account.allowSenderBilling) {
+      throw new CarrierIntegrationRequestError(
+        'Production whole-shipment rating currently requires sender billing',
+        409,
+        'CARRIER_ACCOUNT_BILLING_NOT_ALLOWED',
+      )
+    }
+    const accountNumber = decryptCarrierAccountNumber(
+      account.encrypted,
+      organizationId,
+      provider,
+      'production',
+      account.globalId,
+    )
+    return {
+      organizationId,
+      integrationAccountId: runtime.integrationAccountId,
+      integrationGlobalId: runtime.integrationGlobalId,
+      credentialVersion: runtime.credentialVersion,
+      credentialFingerprint: runtime.credentialFingerprint,
+      provider,
+      environment: 'production',
+      credential: { ...runtime.credential, accountNumber },
+      carrierAccountId: account.id,
+      carrierAccountGlobalId: account.globalId,
+      carrierAccountDisplayName: account.displayName,
+      senderName: account.senderName,
+      registeredAddress: account.registeredAddress,
+      registeredAddressFingerprint: account.registeredAddressFingerprint,
+      accountNumberLastFour: account.accountNumberLastFour,
+      accountNumberFingerprint: account.accountNumberFingerprint,
+      billingRelationship: 'sender',
+    }
+  } catch (error) {
+    throw sanitize(error)
+  }
 }
 
 const SANDBOX_SENDER_ADDRESS = normalizeCarrierAccountAddress({
@@ -941,6 +1100,9 @@ export async function testCarrierSandboxShipmentRate(input: {
   destination: unknown
   parcels: unknown
   actorEmail: string
+  timeoutMs?: number
+  signal?: AbortSignal
+  requireFailureEvidence?: boolean
 }) {
   const requestedAt = new Date().toISOString()
   const purpose = 'cartonization_shipment_rate' as const
@@ -1002,7 +1164,11 @@ export async function testCarrierSandboxShipmentRate(input: {
       provider: runtime.provider,
       environment: runtime.environment,
       credential: { ...runtime.credential, accountNumber },
-    }, { fixture })
+    }, {
+      fixture,
+      timeoutMs: input.timeoutMs,
+      signal: input.signal,
+    })
     const billingSelectionSnapshot =
       redactedSandboxRateBillingSelection(selection)
     const evidenceGlobalId = await writeCarrierSandboxRateEvidenceInPostgres({
@@ -1041,6 +1207,7 @@ export async function testCarrierSandboxShipmentRate(input: {
     }
   } catch (error) {
     const sanitized = sanitize(error)
+    let rateEvidenceGlobalId: string | null = null
     if (
       runtime
       && selection
@@ -1054,43 +1221,60 @@ export async function testCarrierSandboxShipmentRate(input: {
       const billingSelectionSnapshot =
         redactedSandboxRateBillingSelection(selection)
       try {
-        await writeCarrierSandboxRateEvidenceInPostgres({
-          organizationId: runtime.organizationId,
-          integrationAccountId: runtime.integrationAccountId,
-          integrationGlobalId: runtime.integrationGlobalId,
-          carrierAccountId: selection.account.id,
-          carrierAccountGlobalId: selection.account.globalId,
-          billingRelationship: selection.relationship,
-          billingSelectionSnapshot,
-          provider: runtime.provider,
-          purpose,
-          credentialVersion: runtime.credentialVersion,
-          adapterVersion: CARRIER_SANDBOX_SHIPMENT_RATE_ADAPTER_VERSION,
-          requestHash: carrierSandboxRateSelectionRequestHash(
-            safeRequest.requestHash,
-            selection,
-          ),
-          redactedRequest: {
-            ...safeRequest.redactedRequest,
-            billingSelection: billingSelectionSnapshot,
-          },
-          redactedResponse: {
-            rateScope: 'multi_package_shipment',
-            packageCount: fixture.parcels.length,
+        rateEvidenceGlobalId =
+          await writeCarrierSandboxRateEvidenceInPostgres({
+            organizationId: runtime.organizationId,
+            integrationAccountId: runtime.integrationAccountId,
+            integrationGlobalId: runtime.integrationGlobalId,
+            carrierAccountId: selection.account.id,
+            carrierAccountGlobalId: selection.account.globalId,
+            billingRelationship: selection.relationship,
+            billingSelectionSnapshot,
+            provider: runtime.provider,
+            purpose,
+            credentialVersion: runtime.credentialVersion,
+            adapterVersion: CARRIER_SANDBOX_SHIPMENT_RATE_ADAPTER_VERSION,
+            requestHash: carrierSandboxRateSelectionRequestHash(
+              safeRequest.requestHash,
+              selection,
+            ),
+            redactedRequest: {
+              ...safeRequest.redactedRequest,
+              billingSelection: billingSelectionSnapshot,
+            },
+            redactedResponse: {
+              rateScope: 'multi_package_shipment',
+              packageCount: fixture.parcels.length,
+              errorCode: sanitized.code,
+            },
+            status: 'failed',
+            providerReference: null,
             errorCode: sanitized.code,
-          },
-          status: 'failed',
-          providerReference: null,
-          errorCode: sanitized.code,
-          actorEmail: input.actorEmail,
-          requestedAt,
-          completedAt: new Date().toISOString(),
-        })
+            actorEmail: input.actorEmail,
+            requestedAt,
+            completedAt: new Date().toISOString(),
+          })
       } catch {
-        // The original carrier error remains authoritative if evidence storage fails.
+        if (
+          input.requireFailureEvidence === true
+          || input.actorEmail === 'system:shopify-carrier-service'
+        ) {
+          throw new CarrierIntegrationRequestError(
+            'Carrier shipment-rate failure evidence could not be persisted',
+            503,
+            'CARRIER_RATE_EVIDENCE_PERSISTENCE_FAILED',
+          )
+        }
+        // Diagnostic callers retain the original provider error when evidence
+        // storage is not contractually required.
       }
     }
-    throw sanitized
+    throw new CarrierIntegrationRequestError(
+      sanitized.message,
+      sanitized.status,
+      sanitized.code,
+      rateEvidenceGlobalId,
+    )
   }
 }
 

@@ -46,6 +46,15 @@ type MaterialRow = QueryResultRow & {
   inner_length_mm: number | null
   inner_width_mm: number | null
   inner_height_mm: number | null
+  rated_outer_length_mm: number | null
+  rated_outer_width_mm: number | null
+  rated_outer_height_mm: number | null
+  rated_outer_dimension_evidence_type:
+    | Exclude<PackagingMaterial['dimensionEvidenceType'], 'unknown'>
+    | null
+  rated_outer_dimension_evidence_reference: string | null
+  rated_outer_dimension_confirmed_at: Date | null
+  rated_outer_dimension_confirmed_by: string | null
   dimension_basis: PackagingMaterial['dimensionBasis']
   dimension_evidence_type: PackagingMaterial['dimensionEvidenceType']
   dimension_evidence_reference: string | null
@@ -171,6 +180,19 @@ function materialsFromRows(rows: MaterialRow[]): PackagingMaterial[] {
           width: optionalInteger(row.inner_width_mm),
           height: optionalInteger(row.inner_height_mm),
         },
+        ratedOuterDimensionsMm: {
+          length: optionalInteger(row.rated_outer_length_mm),
+          width: optionalInteger(row.rated_outer_width_mm),
+          height: optionalInteger(row.rated_outer_height_mm),
+        },
+        ratedOuterDimensionEvidenceType:
+          row.rated_outer_dimension_evidence_type,
+        ratedOuterDimensionEvidenceReference:
+          row.rated_outer_dimension_evidence_reference,
+        ratedOuterDimensionConfirmedAt:
+          optionalIso(row.rated_outer_dimension_confirmed_at),
+        ratedOuterDimensionConfirmedBy:
+          row.rated_outer_dimension_confirmed_by,
         dimensionBasis: row.dimension_basis,
         dimensionEvidenceType: row.dimension_evidence_type,
         dimensionEvidenceReference: row.dimension_evidence_reference,
@@ -222,6 +244,12 @@ async function materialRows(
   const sql = `SELECT material.id::text, material.global_id, material.code,
       material.name, material.material_type, material.inner_length_mm,
       material.inner_width_mm, material.inner_height_mm,
+      material.rated_outer_length_mm, material.rated_outer_width_mm,
+      material.rated_outer_height_mm,
+      material.rated_outer_dimension_evidence_type,
+      material.rated_outer_dimension_evidence_reference,
+      material.rated_outer_dimension_confirmed_at,
+      material.rated_outer_dimension_confirmed_by,
       material.dimension_basis, material.dimension_evidence_type,
       material.dimension_evidence_reference, material.dimension_confirmed_at,
       material.dimension_confirmed_by,
@@ -526,45 +554,86 @@ export async function savePackagingMaterialInPostgres(input: {
                inner_length_mm = $6,
                inner_width_mm = $7,
                inner_height_mm = $8,
-               dimension_basis = $9,
-               dimension_evidence_type = $10,
-               dimension_evidence_reference = $11,
+               rated_outer_length_mm = $9,
+               rated_outer_width_mm = $10,
+               rated_outer_height_mm = $11,
+               rated_outer_dimension_evidence_type = $12,
+               rated_outer_dimension_evidence_reference = $13,
+               rated_outer_dimension_confirmed_at = CASE
+                 WHEN $12::text IS NOT NULL
+                   THEN CASE
+                     WHEN rated_outer_length_mm IS DISTINCT FROM $9
+                       OR rated_outer_width_mm IS DISTINCT FROM $10
+                       OR rated_outer_height_mm IS DISTINCT FROM $11
+                       OR rated_outer_dimension_evidence_type
+                         IS DISTINCT FROM $12
+                       OR rated_outer_dimension_evidence_reference
+                         IS DISTINCT FROM $13
+                       THEN now()
+                     ELSE COALESCE(
+                       rated_outer_dimension_confirmed_at,
+                       now()
+                     )
+                   END
+                 ELSE NULL
+               END,
+               rated_outer_dimension_confirmed_by = CASE
+                 WHEN $12::text IS NOT NULL
+                   THEN CASE
+                     WHEN rated_outer_length_mm IS DISTINCT FROM $9
+                       OR rated_outer_width_mm IS DISTINCT FROM $10
+                       OR rated_outer_height_mm IS DISTINCT FROM $11
+                       OR rated_outer_dimension_evidence_type
+                         IS DISTINCT FROM $12
+                       OR rated_outer_dimension_evidence_reference
+                         IS DISTINCT FROM $13
+                       THEN $22
+                     ELSE COALESCE(
+                       rated_outer_dimension_confirmed_by,
+                       $22
+                     )
+                   END
+                 ELSE NULL
+               END,
+               dimension_basis = $14,
+               dimension_evidence_type = $15,
+               dimension_evidence_reference = $16,
                dimension_confirmed_at = CASE
-                 WHEN $10 IN ('customer_confirmed', 'measured')
+                 WHEN $15 IN ('customer_confirmed', 'measured')
                    THEN CASE
                      WHEN inner_length_mm IS DISTINCT FROM $6
                        OR inner_width_mm IS DISTINCT FROM $7
                        OR inner_height_mm IS DISTINCT FROM $8
-                       OR dimension_basis IS DISTINCT FROM $9
-                       OR dimension_evidence_type IS DISTINCT FROM $10
-                       OR dimension_evidence_reference IS DISTINCT FROM $11
+                       OR dimension_basis IS DISTINCT FROM $14
+                       OR dimension_evidence_type IS DISTINCT FROM $15
+                       OR dimension_evidence_reference IS DISTINCT FROM $16
                        THEN now()
                      ELSE COALESCE(dimension_confirmed_at, now())
                    END
                  ELSE NULL
                END,
                dimension_confirmed_by = CASE
-                 WHEN $10 IN ('customer_confirmed', 'measured')
+                 WHEN $15 IN ('customer_confirmed', 'measured')
                    THEN CASE
                      WHEN inner_length_mm IS DISTINCT FROM $6
                        OR inner_width_mm IS DISTINCT FROM $7
                        OR inner_height_mm IS DISTINCT FROM $8
-                       OR dimension_basis IS DISTINCT FROM $9
-                       OR dimension_evidence_type IS DISTINCT FROM $10
-                       OR dimension_evidence_reference IS DISTINCT FROM $11
-                       THEN $17
-                     ELSE COALESCE(dimension_confirmed_by, $17)
+                       OR dimension_basis IS DISTINCT FROM $14
+                       OR dimension_evidence_type IS DISTINCT FROM $15
+                       OR dimension_evidence_reference IS DISTINCT FROM $16
+                       THEN $22
+                     ELSE COALESCE(dimension_confirmed_by, $22)
                    END
                  ELSE NULL
                END,
-               tare_weight_grams = $12,
-               max_weight_grams = $13,
-               unit_cost_minor = $14,
-               currency = $15,
-               status = $16,
-               source = $18,
+               tare_weight_grams = $17,
+               max_weight_grams = $18,
+               unit_cost_minor = $19,
+               currency = $20,
+               status = $21,
+               source = $23,
                row_version = row_version + 1,
-               updated_by = $17,
+               updated_by = $22,
                updated_at = now()
            WHERE organization_id = $1::uuid AND id = $2::uuid
            RETURNING global_id, row_version::text, status`,
@@ -577,6 +646,11 @@ export async function savePackagingMaterialInPostgres(input: {
             input.material.innerLengthMm,
             input.material.innerWidthMm,
             input.material.innerHeightMm,
+            input.material.ratedOuterLengthMm ?? null,
+            input.material.ratedOuterWidthMm ?? null,
+            input.material.ratedOuterHeightMm ?? null,
+            input.material.ratedOuterDimensionEvidenceType ?? null,
+            input.material.ratedOuterDimensionEvidenceReference ?? null,
             input.material.dimensionBasis,
             input.material.dimensionEvidenceType,
             input.material.dimensionEvidenceReference,
@@ -595,6 +669,12 @@ export async function savePackagingMaterialInPostgres(input: {
           `INSERT INTO operations_packaging_materials (
              organization_id, code, name, material_type,
              inner_length_mm, inner_width_mm, inner_height_mm,
+             rated_outer_length_mm, rated_outer_width_mm,
+             rated_outer_height_mm,
+             rated_outer_dimension_evidence_type,
+             rated_outer_dimension_evidence_reference,
+             rated_outer_dimension_confirmed_at,
+             rated_outer_dimension_confirmed_by,
              dimension_basis, dimension_evidence_type,
              dimension_evidence_reference, dimension_confirmed_at,
              dimension_confirmed_by,
@@ -602,11 +682,15 @@ export async function savePackagingMaterialInPostgres(input: {
              status, source, created_by, updated_by
            ) VALUES (
              $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-             CASE WHEN $9 IN ('customer_confirmed', 'measured')
+             $11, $12,
+             CASE WHEN $11::text IS NOT NULL THEN now() ELSE NULL END,
+             CASE WHEN $11::text IS NOT NULL THEN $21 ELSE NULL END,
+             $13, $14, $15,
+             CASE WHEN $14 IN ('customer_confirmed', 'measured')
                THEN now() ELSE NULL END,
-             CASE WHEN $9 IN ('customer_confirmed', 'measured')
-               THEN $16 ELSE NULL END,
-             $11, $12, $13, $14, $15, $17, $16, $16
+             CASE WHEN $14 IN ('customer_confirmed', 'measured')
+               THEN $21 ELSE NULL END,
+             $16, $17, $18, $19, $20, $22, $21, $21
            )
            RETURNING id::text, global_id, row_version::text, status`,
           [
@@ -617,6 +701,11 @@ export async function savePackagingMaterialInPostgres(input: {
             input.material.innerLengthMm,
             input.material.innerWidthMm,
             input.material.innerHeightMm,
+            input.material.ratedOuterLengthMm ?? null,
+            input.material.ratedOuterWidthMm ?? null,
+            input.material.ratedOuterHeightMm ?? null,
+            input.material.ratedOuterDimensionEvidenceType ?? null,
+            input.material.ratedOuterDimensionEvidenceReference ?? null,
             input.material.dimensionBasis,
             input.material.dimensionEvidenceType,
             input.material.dimensionEvidenceReference,
@@ -660,6 +749,15 @@ export async function savePackagingMaterialInPostgres(input: {
             width: input.material.innerWidthMm,
             height: input.material.innerHeightMm,
           },
+          ratedOuterDimensionsMm: {
+            length: input.material.ratedOuterLengthMm ?? null,
+            width: input.material.ratedOuterWidthMm ?? null,
+            height: input.material.ratedOuterHeightMm ?? null,
+          },
+          ratedOuterDimensionEvidenceType:
+            input.material.ratedOuterDimensionEvidenceType ?? null,
+          ratedOuterDimensionEvidenceReference:
+            input.material.ratedOuterDimensionEvidenceReference ?? null,
           dimensionBasis: input.material.dimensionBasis,
           dimensionEvidenceType: input.material.dimensionEvidenceType,
           dimensionEvidenceReference: input.material.dimensionEvidenceReference,
@@ -760,6 +858,41 @@ export async function savePackagingMaterialStockInPostgres(input: {
         'Warehouse packaging stock no longer exists. Refresh and try again.',
         409,
       )
+    }
+    if (current) {
+      const claimResult = await client.query<{
+        active_claimed_quantity: string
+      }>(
+        `SELECT COALESCE(sum(quantity), 0)::text
+                  AS active_claimed_quantity
+         FROM operations_packaging_material_claims
+         WHERE organization_id = $1::uuid
+           AND packaging_material_id = $2::uuid
+           AND warehouse_id = $3::uuid
+           AND status = 'active'`,
+        [
+          input.organizationId,
+          material.rows[0].id,
+          input.stock.warehouseId,
+        ],
+      )
+      const activeClaimedQuantity = integer(
+        claimResult.rows[0]?.active_claimed_quantity || '0',
+      )
+      if (
+        activeClaimedQuantity > 0
+        && (
+          input.stock.isAvailable !== true
+          || input.stock.onHandQuantity === null
+          || input.stock.onHandQuantity < activeClaimedQuantity
+        )
+      ) {
+        throw new PackagingMaterialRequestError(
+          'PACKAGING_MATERIAL_STOCK_ACTIVE_CLAIMS_CONFLICT',
+          `Warehouse packaging stock must remain available with at least ${activeClaimedQuantity} unit${activeClaimedQuantity === 1 ? '' : 's'} while accepted fulfillment plans hold active claims`,
+          409,
+        )
+      }
     }
 
     const saved = current

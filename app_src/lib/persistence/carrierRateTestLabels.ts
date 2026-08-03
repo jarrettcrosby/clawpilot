@@ -1607,7 +1607,7 @@ export async function reconcileCarrierRateTestLabelAttemptInPostgres(input: {
   reason: string
   idempotencyKey: string
 }) {
-  if (!/^gsa[0-9]{7}$/.test(input.attemptGlobalId)) {
+  if (!/^gsa(?:[0-9]{7}|[0-9a-v]{12})$/.test(input.attemptGlobalId)) {
     throw new OperationsRequestError(
       'CARRIER_RATE_TEST_LABEL_ATTEMPT_NOT_FOUND',
       'Carrier rate-test label attempt was not found',

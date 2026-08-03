@@ -26,7 +26,6 @@ import {
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   cartonizationRateEvidenceHash,
-  cartonizationRateEvidenceRequestHash,
   CartonizationRateEvidencePersistenceError,
   claimCartonizationRateEvidenceCommandInPostgres,
   failCartonizationRateEvidenceCommandInPostgres,
@@ -49,41 +48,59 @@ export const revalidate = 0
 export const runtime = 'nodejs'
 export const maxDuration = 60
 
-const EVIDENCE_GLOBAL_ID = /^gcte[0-9]{7}$/
+const EVIDENCE_GLOBAL_ID = /^gcte(?:[0-9]{7}|[0-9a-v]{12})$/
 const MAX_REQUEST_BYTES = 32 * 1024
 const MAX_SELECTED_MATERIALS = 8
 const MILLIMETERS_PER_INCH = 25.4
 const GRAMS_PER_POUND = 453.59237
 
-type NormalizedRateEvidenceRequest = {
+type NormalizedRateEvidenceRequestBase = {
   accountGlobalId: string
   candidateGlobalId: string
   expectedCandidateRowVersion: number
   warehouseGlobalId: string
-  selectedMaterials: Array<{
-    materialGlobalId: string
-    expectedRowVersion: number
-    sandboxRateAssumptions: {
-      ratedOuterDimensionsMm: {
-        length: number
-        width: number
-        height: number
-      }
-      tareWeightGrams: number
-    }
-  }>
-  assumedCommittedQuantities: Array<{
-    lineGlobalId: string
-    quantity: number
-  }>
-  sandboxAssumptions: {
-    acknowledged: true
-    reason: string
-    allowUnderMinimum: boolean
-    assumedMinimumInputQuantity: number | null
-  }
   idempotencyKey: string
 }
+
+type NormalizedOperationalRateEvidenceRequest =
+  NormalizedRateEvidenceRequestBase & {
+    evidenceMode: 'operational'
+    selectedMaterials: Array<{
+      materialGlobalId: string
+      expectedRowVersion: number
+    }>
+  }
+
+type NormalizedSandboxRateEvidenceRequest =
+  NormalizedRateEvidenceRequestBase & {
+    evidenceMode: 'assumption_backed_sandbox'
+    selectedMaterials: Array<{
+      materialGlobalId: string
+      expectedRowVersion: number
+      sandboxRateAssumptions: {
+        ratedOuterDimensionsMm: {
+          length: number
+          width: number
+          height: number
+        }
+        tareWeightGrams: number
+      }
+    }>
+    assumedCommittedQuantities: Array<{
+      lineGlobalId: string
+      quantity: number
+    }>
+    sandboxAssumptions: {
+      acknowledged: true
+      reason: string
+      allowUnderMinimum: boolean
+      assumedMinimumInputQuantity: number | null
+    }
+  }
+
+type NormalizedRateEvidenceRequest =
+  | NormalizedOperationalRateEvidenceRequest
+  | NormalizedSandboxRateEvidenceRequest
 
 class RateEvidenceRequestError extends Error {
   constructor(
@@ -194,6 +211,18 @@ async function requestBody(req: NextRequest) {
 
 function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
   const input = record(value, 'Request body')
+  const evidenceMode = input.evidenceMode === undefined
+    ? 'assumption_backed_sandbox'
+    : input.evidenceMode
+  if (
+    evidenceMode !== 'operational'
+    && evidenceMode !== 'assumption_backed_sandbox'
+  ) {
+    requestError(
+      'Evidence mode must be operational or assumption-backed sandbox',
+      'CARTONIZATION_RATE_EVIDENCE_MODE_INVALID',
+    )
+  }
   const selected = input.selectedMaterials
   if (
     !Array.isArray(selected)
@@ -210,7 +239,7 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
     const item = record(entry, `Selected material ${index + 1}`)
     const materialGlobalId = exactReference(
       item.materialGlobalId,
-      /^gmat[0-9]{7}$/,
+      /^gmat(?:[0-9]{7}|[0-9a-v]{12})$/,
       `Selected material ${index + 1} Global ID`,
     )
     if (materialGlobalIds.has(materialGlobalId)) {
@@ -220,6 +249,19 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
       )
     }
     materialGlobalIds.add(materialGlobalId)
+    const expectedRowVersion = exactInteger(
+      item.expectedRowVersion,
+      `${materialGlobalId} row version`,
+    )
+    if (evidenceMode === 'operational') {
+      if (item.sandboxRateAssumptions !== undefined) {
+        requestError(
+          'Operational evidence cannot accept sandbox parcel assumptions',
+          'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_ASSUMPTIONS_FORBIDDEN',
+        )
+      }
+      return { materialGlobalId, expectedRowVersion }
+    }
     const rateAssumptions = record(
       item.sandboxRateAssumptions,
       `${materialGlobalId} sandbox rate assumptions`,
@@ -230,10 +272,7 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
     )
     return {
       materialGlobalId,
-      expectedRowVersion: exactInteger(
-        item.expectedRowVersion,
-        `${materialGlobalId} row version`,
-      ),
+      expectedRowVersion,
       sandboxRateAssumptions: {
         ratedOuterDimensionsMm: {
           length: exactInteger(
@@ -264,6 +303,49 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
       },
     }
   })
+  const base = {
+    accountGlobalId: exactReference(
+      input.accountGlobalId,
+      /^gia(?:[0-9]{7}|[0-9a-v]{12})$/,
+      'Commerce account Global ID',
+    ),
+    candidateGlobalId: exactReference(
+      input.candidateGlobalId,
+      /^gcoc(?:[0-9]{7}|[0-9a-v]{12})$/,
+      'Order candidate Global ID',
+    ),
+    expectedCandidateRowVersion: exactInteger(
+      input.expectedCandidateRowVersion,
+      'Expected candidate row version',
+    ),
+    warehouseGlobalId: exactReference(
+      input.warehouseGlobalId,
+      /^gwh(?:[0-9]{7}|[0-9a-v]{12})$/,
+      'Warehouse Global ID',
+    ),
+    idempotencyKey: plainText(
+      input.idempotencyKey,
+      'Idempotency key',
+      8,
+      160,
+    ),
+  }
+  if (evidenceMode === 'operational') {
+    if (
+      input.assumedCommittedQuantities !== undefined
+      || input.sandboxAssumptions !== undefined
+    ) {
+      requestError(
+        'Operational evidence uses current provider inventory authority and packaging master facts only; operator assumptions are not accepted',
+        'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_ASSUMPTIONS_FORBIDDEN',
+      )
+    }
+    return {
+      ...base,
+      evidenceMode,
+      selectedMaterials,
+    } as NormalizedOperationalRateEvidenceRequest
+  }
   if (!Array.isArray(input.assumedCommittedQuantities)) {
     requestError('Committed inventory assumptions must be an array')
   }
@@ -273,7 +355,7 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
       return {
         lineGlobalId: exactReference(
           item.lineGlobalId,
-          /^gcol[0-9]{7}$/,
+          /^gcol(?:[0-9]{7}|[0-9a-v]{12})$/,
           `Committed inventory assumption ${index + 1} line`,
         ),
         quantity: exactInteger(
@@ -305,25 +387,8 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
       )
     : null
   return {
-    accountGlobalId: exactReference(
-      input.accountGlobalId,
-      /^gia[0-9]{7}$/,
-      'Commerce account Global ID',
-    ),
-    candidateGlobalId: exactReference(
-      input.candidateGlobalId,
-      /^gcoc[0-9]{7}$/,
-      'Order candidate Global ID',
-    ),
-    expectedCandidateRowVersion: exactInteger(
-      input.expectedCandidateRowVersion,
-      'Expected candidate row version',
-    ),
-    warehouseGlobalId: exactReference(
-      input.warehouseGlobalId,
-      /^gwh[0-9]{7}$/,
-      'Warehouse Global ID',
-    ),
+    ...base,
+    evidenceMode,
     selectedMaterials,
     assumedCommittedQuantities,
     sandboxAssumptions: {
@@ -337,13 +402,41 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
       allowUnderMinimum,
       assumedMinimumInputQuantity,
     },
-    idempotencyKey: plainText(
-      input.idempotencyKey,
-      'Idempotency key',
-      8,
-      160,
+  } as NormalizedSandboxRateEvidenceRequest
+}
+
+function cartonizationRateEvidenceCommandHash(
+  organizationId: string,
+  request: NormalizedRateEvidenceRequest,
+) {
+  const selectedMaterials = [...request.selectedMaterials].sort(
+    (left, right) => (
+      left.materialGlobalId.localeCompare(right.materialGlobalId)
     ),
+  )
+  const common = {
+    version: 'cartonization-rate-evidence-command-v1',
+    organizationId,
+    accountGlobalId: request.accountGlobalId,
+    candidateGlobalId: request.candidateGlobalId,
+    expectedCandidateRowVersion:
+      request.expectedCandidateRowVersion,
+    warehouseGlobalId: request.warehouseGlobalId,
+    evidenceMode: request.evidenceMode,
+    selectedMaterials,
   }
+  if (request.evidenceMode === 'operational') {
+    return cartonizationRateEvidenceHash(common)
+  }
+  return cartonizationRateEvidenceHash({
+    ...common,
+    assumedCommittedQuantities: [
+      ...request.assumedCommittedQuantities,
+    ].sort((left, right) => (
+      left.lineGlobalId.localeCompare(right.lineGlobalId)
+    )),
+    sandboxAssumptions: request.sandboxAssumptions,
+  })
 }
 
 function errorResponse(error: unknown) {
@@ -351,6 +444,19 @@ function errorResponse(error: unknown) {
     return json(
       { ok: false, error: 'Unauthorized', code: 'UNAUTHORIZED' },
       401,
+    )
+  }
+  if (
+    error instanceof Error
+    && error.message === 'ACTIVE_ORGANIZATION_REQUIRED'
+  ) {
+    return json(
+      {
+        ok: false,
+        error: 'Select an active organization before saving rate evidence',
+        code: 'ACTIVE_ORGANIZATION_REQUIRED',
+      },
+      409,
     )
   }
   if (error instanceof CartonizationRateEvidencePersistenceError) {
@@ -453,8 +559,8 @@ function roundCarrierDecimal(value: number) {
   return Math.round(value * 1_000) / 1_000
 }
 
-function materialRateAssumptions(
-  request: NormalizedRateEvidenceRequest,
+function sandboxMaterialRateAssumptions(
+  request: NormalizedSandboxRateEvidenceRequest,
 ): CartonizationRateEvidenceMaterialRateAssumption[] {
   return request.selectedMaterials
     .map((material) => ({
@@ -471,7 +577,7 @@ function materialRateAssumptions(
 }
 
 function minimumOverrides(
-  request: NormalizedRateEvidenceRequest,
+  request: NormalizedSandboxRateEvidenceRequest,
   input: Awaited<
     ReturnType<typeof readHybridCartonizationInputFromPostgres>
   >['input'],
@@ -530,14 +636,60 @@ export async function POST(req: NextRequest) {
     assertCommerceIntakeRuntime()
     const organizationId = activeOperationsOrganizationId(actor)
     const request = normalizeRequest(await requestBody(req))
-    const selectedMaterialRateAssumptions =
-      materialRateAssumptions(request)
-    const rateAssumptionsByMaterial = new Map(
-      selectedMaterialRateAssumptions.map((assumption) => [
-        assumption.materialGlobalId,
-        assumption,
-      ]),
-    )
+    const semanticRequestHash =
+      cartonizationRateEvidenceCommandHash(organizationId, request)
+    const claim = await claimCartonizationRateEvidenceCommandInPostgres({
+      organizationId,
+      idempotencyKey: request.idempotencyKey,
+      semanticRequestHash,
+      actorEmail: actor.email,
+    })
+    if (claim.state === 'completed') {
+      const evidence = await readCartonizationRateEvidenceByGlobalId({
+        organizationId,
+        evidenceGlobalId: claim.evidenceGlobalId,
+      })
+      if (!evidence) {
+        throw new CartonizationRateEvidencePersistenceError(
+          'The saved cartonization evidence could not be reloaded',
+          500,
+          'CARTONIZATION_RATE_EVIDENCE_CORRUPT',
+        )
+      }
+      return json({
+        ok: true,
+        evidence,
+        replayed: true,
+        effects: {
+          databaseEvidenceWrites: false,
+          inventoryWrites: 0,
+          shipmentWrites: 0,
+          labelCalls: 0,
+          postagePurchases: 0,
+          providerWrites: 0,
+          carrierRateReads: 0,
+        },
+      })
+    }
+    if (claim.state === 'pending') {
+      throw new CartonizationRateEvidencePersistenceError(
+        'This cartonization comparison is already in progress',
+        409,
+        'CARTONIZATION_RATE_EVIDENCE_IN_PROGRESS',
+      )
+    }
+    if (claim.state === 'failed') {
+      throw new CartonizationRateEvidencePersistenceError(
+        `The prior attempt failed (${claim.errorCode}); use a new command key after correcting the cause`,
+        409,
+        'CARTONIZATION_RATE_EVIDENCE_PREVIOUS_ATTEMPT_FAILED',
+      )
+    }
+    claimedCommand = {
+      organizationId,
+      idempotencyKey: request.idempotencyKey,
+      semanticRequestHash,
+    }
     const read = await readHybridCartonizationInputFromPostgres({
       organizationId,
       accountGlobalId: request.accountGlobalId,
@@ -545,14 +697,48 @@ export async function POST(req: NextRequest) {
       expectedCandidateRowVersion:
         request.expectedCandidateRowVersion,
       warehouseGlobalId: request.warehouseGlobalId,
-      mode: 'sandbox_demo',
+      mode: request.evidenceMode === 'operational'
+        ? 'production'
+        : 'sandbox_demo',
       selectedMaterials: request.selectedMaterials.map((material) => ({
         materialGlobalId: material.materialGlobalId,
         expectedRowVersion: material.expectedRowVersion,
       })),
-      assumedCommittedQuantities:
-        request.assumedCommittedQuantities,
+      assumedCommittedQuantities: request.evidenceMode === 'operational'
+        ? []
+        : request.assumedCommittedQuantities,
     })
+    const selectedMaterialRateAssumptions =
+      request.evidenceMode === 'operational'
+        ? read.input.materials.map((material) => {
+            if (
+              !material.ratedOuterDimensionsMm
+              || material.tareWeightGrams === null
+              || material.tareWeightGrams <= 0
+            ) {
+              throw new RateEvidenceRequestError(
+                `${material.materialGlobalId} lacks factual rated exterior dimensions or tare`,
+                422,
+                'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_FACTS_REQUIRED',
+              )
+            }
+            return {
+              materialGlobalId: material.materialGlobalId,
+              expectedRowVersion: material.currentRowVersion,
+              ratedOuterDimensionsMm:
+                material.ratedOuterDimensionsMm,
+              tareWeightGrams: material.tareWeightGrams,
+            }
+          }).sort((left, right) => (
+            left.materialGlobalId.localeCompare(right.materialGlobalId)
+          ))
+        : sandboxMaterialRateAssumptions(request)
+    const rateAssumptionsByMaterial = new Map(
+      selectedMaterialRateAssumptions.map((assumption) => [
+        assumption.materialGlobalId,
+        assumption,
+      ]),
+    )
     const destination = await readCartonizationRateCandidateContext({
       organizationId,
       accountGlobalId: request.accountGlobalId,
@@ -568,32 +754,35 @@ export async function POST(req: NextRequest) {
       )
     }
 
-    const assumptions = request.sandboxAssumptions
     const plan = planHybridCartonization({
       ...read.input,
-      materials: read.input.materials.map((material) => {
-        const rateAssumption = rateAssumptionsByMaterial.get(
-          material.materialGlobalId,
-        )
-        if (!rateAssumption) {
-          throw new RateEvidenceRequestError(
-            `${material.materialGlobalId} is missing its sandbox rate assumptions`,
-            400,
-            'CARTONIZATION_RATE_EVIDENCE_MATERIAL_ASSUMPTIONS_MISSING',
-          )
-        }
-        return {
-          ...material,
-          ratedOuterDimensionsMm:
-            rateAssumption.ratedOuterDimensionsMm,
-          tareWeightGrams: rateAssumption.tareWeightGrams,
-        }
-      }),
-      minimumInputOverrides: minimumOverrides(
-        request,
-        read.input,
-        read.candidate.globalId,
-      ),
+      materials: request.evidenceMode === 'operational'
+        ? read.input.materials
+        : read.input.materials.map((material) => {
+            const rateAssumption = rateAssumptionsByMaterial.get(
+              material.materialGlobalId,
+            )
+            if (!rateAssumption) {
+              throw new RateEvidenceRequestError(
+                `${material.materialGlobalId} is missing its sandbox rate assumptions`,
+                400,
+                'CARTONIZATION_RATE_EVIDENCE_MATERIAL_ASSUMPTIONS_MISSING',
+              )
+            }
+            return {
+              ...material,
+              ratedOuterDimensionsMm:
+                rateAssumption.ratedOuterDimensionsMm,
+              tareWeightGrams: rateAssumption.tareWeightGrams,
+            }
+          }),
+      minimumInputOverrides: request.evidenceMode === 'operational'
+        ? []
+        : minimumOverrides(
+            request,
+            read.input,
+            read.candidate.globalId,
+          ),
     })
     if (plan.status !== 'ready') {
       const first = plan.blockers[0]
@@ -743,7 +932,11 @@ export async function POST(req: NextRequest) {
         ))
         const carrierParcelRequest = {
           description:
-            `Sandbox cartonized order ${read.candidate.orderNumber}`.slice(
+            `${
+              request.evidenceMode === 'operational'
+                ? 'Operational'
+                : 'Sandbox'
+            } cartonized order ${read.candidate.orderNumber}`.slice(
               0,
               120,
             ),
@@ -777,7 +970,10 @@ export async function POST(req: NextRequest) {
           contentWeightGrams: packagePlan.contentWeightGrams,
           tareWeightGrams: tareWeight,
           ratedGrossWeightGrams: ratedGrossWeight,
-          maxWeightGrams: null,
+          maxWeightGrams: read.input.materials.find((material) => (
+            material.materialGlobalId
+              === packagePlan.packagingMaterialGlobalId
+          ))?.maximumGrossWeightGrams ?? null,
           allocations: packagePlan.lineAllocations.map((allocation) => ({
             lineGlobalId: allocation.lineGlobalId,
             productGlobalId: allocation.productGlobalId,
@@ -795,7 +991,10 @@ export async function POST(req: NextRequest) {
       })
 
     const planSnapshot = {
-      mode: 'sandbox_demo',
+      mode: request.evidenceMode === 'operational'
+        ? 'production'
+        : 'sandbox_demo',
+      carrierReadEnvironment: 'sandbox',
       policyVersion: plan.policyVersion,
       algorithmVersion: plan.algorithmVersion,
       inputHash: plan.inputHash,
@@ -816,99 +1015,45 @@ export async function POST(req: NextRequest) {
         lineEvidence: read.lineEvidence,
       },
     }
-    const assumptionSnapshot = {
-      watermark:
-        'ASSUMPTION-BACKED SANDBOX EVIDENCE - NOT EXECUTABLE OR ACTUAL BILLED COST',
-      acknowledged: true,
-      reason: assumptions.reason,
-      materialRateAssumptions: selectedMaterialRateAssumptions,
-      allowUnderMinimum: assumptions.allowUnderMinimum,
-      assumedMinimumInputQuantity:
-        assumptions.assumedMinimumInputQuantity,
-      minimumOverrides: plan.assumptions,
-      committedInventory: read.inventory.lines,
-      databaseEffects: {
-        evidenceRowsOnly: true,
-        inventoryWrites: 0,
-        shipmentWrites: 0,
-        labelCalls: 0,
-        postagePurchases: 0,
-        providerWrites: 0,
-      },
+    const databaseEffects = {
+      evidenceRowsOnly: true,
+      inventoryWrites: 0,
+      shipmentWrites: 0,
+      labelCalls: 0,
+      postagePurchases: 0,
+      providerWrites: 0,
     }
-    const semanticInput = {
-      organizationId,
-      accountGlobalId: read.account.globalId,
-      candidateGlobalId: read.candidate.globalId,
-      candidateRowVersion: read.candidate.rowVersion,
-      destinationFingerprint: destination.destinationFingerprint,
-      warehouseGlobalId: read.warehouse.globalId,
-      inventorySyncRunGlobalId: read.inventory.syncRunGlobalId,
-      evidenceMode: 'assumption_backed_sandbox' as const,
-      policyVersion: plan.policyVersion,
-      algorithmVersion: plan.algorithmVersion,
-      planInputHash: plan.inputHash,
-      planResultHash: cartonizationRateEvidenceHash(planSnapshot),
-      planSnapshot,
-      assumptionSnapshot,
-      materialRateAssumptions: selectedMaterialRateAssumptions,
-      packages: packageInputs,
-    }
-    const semanticRequestHash =
-      cartonizationRateEvidenceRequestHash(semanticInput)
-    const claim = await claimCartonizationRateEvidenceCommandInPostgres({
-      organizationId,
-      idempotencyKey: request.idempotencyKey,
-      semanticRequestHash,
-      actorEmail: actor.email,
-    })
-    if (claim.state === 'completed') {
-      const evidence = await readCartonizationRateEvidenceByGlobalId({
-        organizationId,
-        evidenceGlobalId: claim.evidenceGlobalId,
-      })
-      if (!evidence) {
-        throw new CartonizationRateEvidencePersistenceError(
-          'The saved cartonization evidence could not be reloaded',
-          500,
-          'CARTONIZATION_RATE_EVIDENCE_CORRUPT',
-        )
-      }
-      return json({
-        ok: true,
-        evidence,
-        replayed: true,
-        effects: {
-          databaseEvidenceWrites: false,
-          inventoryWrites: 0,
-          shipmentWrites: 0,
-          labelCalls: 0,
-          postagePurchases: 0,
-          providerWrites: 0,
-          carrierRateReads: 0,
-        },
-      })
-    }
-    if (claim.state === 'pending') {
-      throw new CartonizationRateEvidencePersistenceError(
-        'This cartonization comparison is already in progress',
-        409,
-        'CARTONIZATION_RATE_EVIDENCE_IN_PROGRESS',
-      )
-    }
-    if (claim.state === 'failed') {
-      throw new CartonizationRateEvidencePersistenceError(
-        `The prior attempt failed (${claim.errorCode}); use a new command key after correcting the cause`,
-        409,
-        'CARTONIZATION_RATE_EVIDENCE_PREVIOUS_ATTEMPT_FAILED',
-      )
-    }
-    claimedCommand = {
-      organizationId,
-      idempotencyKey: request.idempotencyKey,
-      semanticRequestHash,
-    }
-
+    const assumptionSnapshot = request.evidenceMode === 'operational'
+      ? {
+          boundary:
+            'OPERATIONAL PACK FACTS WITH READ-ONLY SANDBOX CARRIER ESTIMATES',
+          operatorSuppliedAssumptions: false,
+          operationalMaterialFacts: selectedMaterialRateAssumptions,
+          minimumOverrides: [],
+          inventoryAuthority: read.account.provider === 'shopify'
+            ? 'shopify_provider_commitment_preflight'
+            : 'projected_atp_only',
+          planClaimAuthority: read.account.provider === 'shopify'
+            ? 'transactional_provider_commitment_lock'
+            : 'transactional_local_balance_lock',
+          committedInventory: read.inventory.lines,
+          inventoryProducts: read.inventory.products,
+          databaseEffects,
+        }
+      : {
+          watermark:
+            'ASSUMPTION-BACKED SANDBOX EVIDENCE - NOT EXECUTABLE OR ACTUAL BILLED COST',
+          acknowledged: true,
+          reason: request.sandboxAssumptions.reason,
+          materialRateAssumptions: selectedMaterialRateAssumptions,
+          allowUnderMinimum:
+            request.sandboxAssumptions.allowUnderMinimum,
+          assumedMinimumInputQuantity:
+            request.sandboxAssumptions.assumedMinimumInputQuantity,
+          minimumOverrides: plan.assumptions,
+          committedInventory: read.inventory.lines,
+          databaseEffects,
+        }
     const orderedParcels = [...packageInputs]
       .sort((left, right) => (
         left.packageSequence - right.packageSequence
@@ -988,7 +1133,7 @@ export async function POST(req: NextRequest) {
       destinationFingerprint: destination.destinationFingerprint,
       warehouseGlobalId: read.warehouse.globalId,
       inventorySyncRunGlobalId: read.inventory.syncRunGlobalId,
-      evidenceMode: 'assumption_backed_sandbox',
+      evidenceMode: request.evidenceMode,
       policyVersion: plan.policyVersion,
       algorithmVersion: plan.algorithmVersion,
       planInputHash: plan.inputHash,

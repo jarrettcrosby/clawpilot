@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
-import { query, withTransaction } from '@/lib/persistence/postgres'
+import {
+  acquireTransactionAdvisoryLock,
+  query,
+  withTransaction,
+} from '@/lib/persistence/postgres'
 
 const CATALOG_SYNC_POLICY_VERSION = 'commerce-product-intake-policy-v1'
 const CATALOG_RECONCILIATION_INTERVAL = '6 hours'
@@ -13,7 +17,7 @@ const PRODUCT_READABLE_CONNECTION_SQL = `(
     AND COALESCE(
       account.configuration->'grantedScopes',
       '[]'::jsonb
-    ) ? 'read_products'
+    ) ?| ARRAY['read_products', 'write_products']
   )
   OR (
     account.provider = 'faire'
@@ -37,10 +41,14 @@ export type CommerceCatalogSyncJob = {
   policyRevision: number
   requestedBy: string
   continuationRunGlobalId: string | null
+  targetDirtyVersion: number
   readGeneration: number
   pageCount: number
+  providerRecordsSeen: number
   attemptCount: number
+  sweepFailureCount: number
   maxAttempts: number
+  startedAt: string
   lockToken: string
 }
 
@@ -85,6 +93,11 @@ const PERMANENT_ERROR_CODES = new Set([
   'COMMERCE_INTAKE_VERIFICATION_REQUIRED',
   'COMMERCE_INTAKE_CONNECTION_ERROR',
   'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
+  'COMMERCE_CATALOG_SYNC_CONTINUATION_REPEATED',
+  'COMMERCE_CATALOG_SYNC_DURATION_LIMIT_EXCEEDED',
+  'COMMERCE_CATALOG_SYNC_PAGE_LIMIT_EXCEEDED',
+  'COMMERCE_CATALOG_SYNC_RECORD_LIMIT_EXCEEDED',
+  'COMMERCE_CATALOG_SYNC_STATE_INVALID',
   'SHOPIFY_STORE_IDENTITY_CHANGED',
 ])
 
@@ -96,6 +109,99 @@ const RESTART_ERROR_CODES = new Set([
   'COMMERCE_INTAKE_CONTINUATION_NOT_FOUND',
 ])
 
+export function commerceCatalogSweepFailureState(input: {
+  code: string
+  attemptCount: number
+  sweepFailureCount: number
+  maxAttempts: number
+}) {
+  // attempt_count predates the sweep budget and counts claims since the last
+  // successful page. Seed from it so an in-flight legacy retry does not gain a
+  // fresh budget when this protection is deployed.
+  const priorFailures = Math.max(
+    boundedCount(input.sweepFailureCount),
+    Math.max(0, boundedCount(input.attemptCount) - 1),
+  )
+  const sweepFailureCount = priorFailures + 1
+  const maxAttempts = Math.max(1, Math.min(
+    boundedCount(input.maxAttempts) || 1,
+    20,
+  ))
+  const permanent = PERMANENT_ERROR_CODES.has(input.code)
+  return {
+    sweepFailureCount,
+    permanent,
+    dead: permanent || sweepFailureCount >= maxAttempts,
+  }
+}
+
+export async function reconcileOrphanedCommerceCatalogSyncCursorsWithClient(
+  client: PoolClient,
+  input: {
+    organizationId?: string
+    integrationAccountId?: string
+  } = {},
+) {
+  if (
+    Boolean(input.organizationId)
+    !== Boolean(input.integrationAccountId)
+  ) {
+    throw new Error(
+      'Commerce catalog cursor reconciliation requires both account identifiers',
+    )
+  }
+  const reconciled = await client.query<{
+    organization_id: string
+    integration_account_id: string
+    last_error_code: string
+  }>(
+    `UPDATE operations_commerce_sync_cursors cursor
+     SET reconciliation_status = 'idle',
+         last_error_code = COALESCE(
+           (
+             SELECT cancelled.last_error_code
+             FROM operations_commerce_catalog_sync_jobs cancelled
+             WHERE cancelled.organization_id = cursor.organization_id
+               AND cancelled.integration_account_id
+                 = cursor.integration_account_id
+               AND cancelled.status = 'cancelled'
+             ORDER BY cancelled.completed_at DESC NULLS LAST,
+                      cancelled.updated_at DESC,
+                      cancelled.id DESC
+             LIMIT 1
+           ),
+           'COMMERCE_CATALOG_SYNC_ORPHAN_RECONCILED'
+         ),
+         updated_at = now()
+     WHERE cursor.resource = 'products'
+       AND cursor.reconciliation_status = 'running'
+       AND ($1::uuid IS NULL OR cursor.organization_id = $1::uuid)
+       AND ($2::uuid IS NULL OR cursor.integration_account_id = $2::uuid)
+       AND NOT EXISTS (
+         SELECT 1
+         FROM operations_commerce_catalog_sync_jobs active
+         WHERE active.organization_id = cursor.organization_id
+           AND active.integration_account_id = cursor.integration_account_id
+           AND active.status IN ('pending', 'processing', 'failed')
+       )
+     RETURNING cursor.organization_id::text,
+               cursor.integration_account_id::text,
+               cursor.last_error_code`,
+    [
+      input.organizationId || null,
+      input.integrationAccountId || null,
+    ],
+  )
+  return {
+    reconciled: reconciled.rowCount || 0,
+    cursors: reconciled.rows.map((row) => ({
+      organizationId: row.organization_id,
+      integrationAccountId: row.integration_account_id,
+      lastErrorCode: row.last_error_code,
+    })),
+  }
+}
+
 async function cancelCommerceCatalogSyncJobsWithClient(
   client: PoolClient,
   input: {
@@ -104,6 +210,10 @@ async function cancelCommerceCatalogSyncJobsWithClient(
     errorCode: string
   },
 ) {
+  await acquireTransactionAdvisoryLock(
+    client,
+    `shopify-catalog-watermark:${input.organizationId}:${input.integrationAccountId}`,
+  )
   const cancelled = await client.query(
     `UPDATE operations_commerce_catalog_sync_jobs
      SET status = CASE
@@ -126,6 +236,10 @@ async function cancelCommerceCatalogSyncJobsWithClient(
       input.errorCode,
     ],
   )
+  await reconcileOrphanedCommerceCatalogSyncCursorsWithClient(client, {
+    organizationId: input.organizationId,
+    integrationAccountId: input.integrationAccountId,
+  })
   return cancelled.rowCount || 0
 }
 
@@ -141,27 +255,6 @@ export async function applyCommerceCatalogSyncPolicyWithClient(
     actorEmail: string
   },
 ) {
-  if (input.unmatchedAction === 'review') {
-    const cancelled = await client.query(
-      `UPDATE operations_commerce_catalog_sync_jobs
-       SET status = CASE
-             WHEN status = 'processing' THEN status
-             ELSE 'cancelled'
-           END,
-           cancel_requested = true,
-           completed_at = CASE
-             WHEN status = 'processing' THEN completed_at
-             ELSE now()
-           END,
-           updated_at = now()
-       WHERE organization_id = $1::uuid
-         AND integration_account_id = $2::uuid
-         AND status IN ('pending', 'processing', 'failed')`,
-      [input.organizationId, input.integrationAccountId],
-    )
-    return { queued: 0, cancelled: cancelled.rowCount || 0 }
-  }
-
   const stale = await client.query(
     `UPDATE operations_commerce_catalog_sync_jobs
      SET status = CASE
@@ -192,7 +285,8 @@ export async function applyCommerceCatalogSyncPolicyWithClient(
   const queued = await client.query(
     `INSERT INTO operations_commerce_catalog_sync_jobs (
        organization_id, integration_account_id, provider,
-       credential_version, policy_revision, requested_by
+       credential_version, policy_revision, requested_by,
+       target_dirty_version
      )
      SELECT
        account.organization_id,
@@ -200,13 +294,18 @@ export async function applyCommerceCatalogSyncPolicyWithClient(
        account.provider,
        account.commerce_credential_generation,
        $5,
-       $6
+       $6,
+       COALESCE(refresh.dirty_version, 0)
      FROM operations_integration_accounts account
      JOIN operations_commerce_credentials credential
        ON credential.organization_id = account.organization_id
       AND credential.integration_account_id = account.id
      JOIN operations_activation_scopes activation
        ON activation.organization_id = account.organization_id
+     LEFT JOIN operations_shopify_catalog_refresh_states refresh
+       ON refresh.organization_id = account.organization_id
+      AND refresh.integration_account_id = account.id
+      AND refresh.credential_generation = account.commerce_credential_generation
      WHERE account.organization_id = $1::uuid
        AND account.id = $2::uuid
        AND account.integration_type = 'commerce'
@@ -224,6 +323,16 @@ export async function applyCommerceCatalogSyncPolicyWithClient(
            AND active.integration_account_id = $2::uuid
            AND active.status IN ('pending', 'processing', 'failed')
        )
+       AND NOT EXISTS (
+         SELECT 1
+         FROM operations_commerce_catalog_sync_jobs terminal
+         WHERE terminal.organization_id = $1::uuid
+           AND terminal.integration_account_id = $2::uuid
+           AND terminal.provider = $3
+           AND terminal.credential_version = $4
+           AND terminal.policy_revision = $5
+           AND terminal.status = 'dead'
+       )
      ON CONFLICT (
        organization_id, integration_account_id
      ) WHERE status IN ('pending', 'processing', 'failed')
@@ -237,6 +346,10 @@ export async function applyCommerceCatalogSyncPolicyWithClient(
       input.actorEmail,
     ],
   )
+  await reconcileOrphanedCommerceCatalogSyncCursorsWithClient(client, {
+    organizationId: input.organizationId,
+    integrationAccountId: input.integrationAccountId,
+  })
   return {
     queued: queued.rowCount || 0,
     cancelled: stale.rowCount || 0,
@@ -260,6 +373,55 @@ export function automaticCommerceCatalogRuntimeAvailable() {
   return ['dev', 'development', 'local', 'preview'].includes(lane)
 }
 
+export async function signalShopifyCatalogRefreshWithClient(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    integrationAccountId: string
+    credentialGeneration: number
+    receiptGlobalId: string
+    providerTriggeredAt: string | null
+  },
+) {
+  await acquireTransactionAdvisoryLock(
+    client,
+    `shopify-catalog-watermark:${input.organizationId}:${input.integrationAccountId}`,
+  )
+  const signaled = await client.query<{
+    dirty_version: string
+    reconciled_version: string
+  }>(
+    `INSERT INTO operations_shopify_catalog_refresh_states (
+       organization_id, integration_account_id, credential_generation,
+       dirty_version, reconciled_version, last_receipt_global_id,
+       last_provider_triggered_at, last_signaled_at
+     ) VALUES (
+       $1::uuid, $2::uuid, $3, 1, 0, $4, $5::timestamptz, now()
+     )
+     ON CONFLICT (organization_id, integration_account_id)
+     DO UPDATE SET
+       credential_generation = EXCLUDED.credential_generation,
+       dirty_version =
+         operations_shopify_catalog_refresh_states.dirty_version + 1,
+       last_receipt_global_id = EXCLUDED.last_receipt_global_id,
+       last_provider_triggered_at = EXCLUDED.last_provider_triggered_at,
+       last_signaled_at = now(),
+       updated_at = now()
+     RETURNING dirty_version::text, reconciled_version::text`,
+    [
+      input.organizationId,
+      input.integrationAccountId,
+      input.credentialGeneration,
+      input.receiptGlobalId,
+      input.providerTriggeredAt,
+    ],
+  )
+  return {
+    dirtyVersion: Number(signaled.rows[0].dirty_version),
+    reconciledVersion: Number(signaled.rows[0].reconciled_version),
+  }
+}
+
 export function commerceCatalogCredentialSupportsProducts(input: {
   provider: 'shopify' | 'faire'
   authMode:
@@ -269,9 +431,13 @@ export function commerceCatalogCredentialSupportsProducts(input: {
   configuration: Record<string, unknown>
 }) {
   if (input.provider === 'shopify') {
-    return new Set(
+    const grantedScopes = new Set(
       stringArray(input.configuration.grantedScopes),
-    ).has('read_products')
+    )
+    return (
+      grantedScopes.has('read_products')
+      || grantedScopes.has('write_products')
+    )
   }
   return (
     input.authMode === 'faire_brand_token'
@@ -404,18 +570,6 @@ export async function ensureAutomaticCommerceCatalogIntakeWithClient(
       [input.organizationId, input.integrationAccountId],
     )
   ).rows[0] || null
-  if (existing?.unmatched_action === 'review') {
-    return {
-      eligible: true,
-      initialized: false,
-      paused: true,
-      waitingForProductTarget: false,
-      policyRevision: Number(existing.revision),
-      queued: 0,
-      cancelled: 0,
-    }
-  }
-
   let initialized = false
   let policyRevision = Number(existing?.revision || 0)
   if (!existing) {
@@ -446,7 +600,7 @@ export async function ensureAutomaticCommerceCatalogIntakeWithClient(
           provider: account.provider,
           credentialVersion: account.commerce_credential_generation,
           policyRevision,
-          unmatchedAction: 'auto_create',
+          unmatchedAction: existing?.unmatched_action || 'auto_create',
           actorEmail: input.actorEmail || 'system:commerce-catalog',
         },
       )
@@ -485,6 +639,8 @@ export async function ensureAutomaticCommerceCatalogIntakeWithClient(
   return {
     eligible: true,
     initialized,
+    // The review policy only controls unmatched-product creation. It must not
+    // pause provider reads needed to refresh already mapped products.
     paused: false,
     waitingForProductTarget: !account.product_target_ready,
     policyRevision,
@@ -573,7 +729,6 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
              WHERE policy.organization_id = job.organization_id
                AND policy.integration_account_id = job.integration_account_id
                AND policy.policy_version = $1
-               AND policy.unmatched_action = 'auto_create'
                AND policy.revision = job.policy_revision
                AND account.integration_type = 'commerce'
                AND account.provider = job.provider
@@ -592,7 +747,8 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
     const queued = await client.query(
       `INSERT INTO operations_commerce_catalog_sync_jobs (
          organization_id, integration_account_id, provider,
-         credential_version, policy_revision, requested_by
+         credential_version, policy_revision, requested_by,
+         target_dirty_version
        )
        SELECT
          account.organization_id,
@@ -600,7 +756,8 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
          account.provider,
          account.commerce_credential_generation,
          policy.revision,
-         COALESCE(policy.updated_by, policy.created_by)
+         COALESCE(policy.updated_by, policy.created_by),
+         COALESCE(refresh.dirty_version, 0)
        FROM operations_commerce_product_intake_policies policy
        JOIN operations_integration_accounts account
          ON account.organization_id = policy.organization_id
@@ -610,8 +767,11 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
         AND credential.integration_account_id = account.id
        JOIN operations_activation_scopes activation
          ON activation.organization_id = account.organization_id
+       LEFT JOIN operations_shopify_catalog_refresh_states refresh
+         ON refresh.organization_id = account.organization_id
+        AND refresh.integration_account_id = account.id
+        AND refresh.credential_generation = account.commerce_credential_generation
        WHERE policy.policy_version = $1
-         AND policy.unmatched_action = 'auto_create'
          AND account.integration_type = 'commerce'
          AND account.provider IN ('shopify', 'faire')
          AND account.status <> 'error'
@@ -631,6 +791,20 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
          )
          AND NOT EXISTS (
            SELECT 1
+           FROM operations_commerce_catalog_sync_jobs terminal
+           WHERE terminal.organization_id = account.organization_id
+             AND terminal.integration_account_id = account.id
+             AND terminal.provider = account.provider
+             AND terminal.credential_version
+               = account.commerce_credential_generation
+             AND terminal.policy_revision = policy.revision
+             AND terminal.status = 'dead'
+         )
+         AND (
+           COALESCE(refresh.dirty_version, 0)
+             > COALESCE(refresh.reconciled_version, 0)
+           OR NOT EXISTS (
+           SELECT 1
            FROM operations_commerce_catalog_sync_jobs recent
            WHERE recent.organization_id = account.organization_id
              AND recent.integration_account_id = account.id
@@ -638,8 +812,9 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
              AND recent.credential_version
                = account.commerce_credential_generation
              AND recent.policy_revision = policy.revision
-             AND recent.status IN ('succeeded', 'dead')
+             AND recent.status = 'succeeded'
              AND recent.updated_at >= now() - interval '${CATALOG_RECONCILIATION_INTERVAL}'
+           )
          )
        ON CONFLICT (
          organization_id, integration_account_id
@@ -647,6 +822,7 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
        DO NOTHING`,
       [CATALOG_SYNC_POLICY_VERSION],
     )
+    await reconcileOrphanedCommerceCatalogSyncCursorsWithClient(client)
     return connectedDefaultQueued + (queued.rowCount || 0)
   })
 }
@@ -678,10 +854,14 @@ export async function claimCommerceCatalogSyncJobsInPostgres(input: {
       policy_revision: number
       requested_by: string
       continuation_run_global_id: string | null
+      target_dirty_version: string
       read_generation: number
       page_count: number
+      provider_records_seen: string
       attempt_count: number
+      sweep_failure_count: number
       max_attempts: number
+      started_at: string | Date
       lock_token: string
     }>(
       `WITH candidates AS (
@@ -702,7 +882,6 @@ export async function claimCommerceCatalogSyncJobsInPostgres(input: {
            AND job.available_at <= now()
            AND job.cancel_requested = false
            AND policy.policy_version = $1
-           AND policy.unmatched_action = 'auto_create'
            AND policy.revision = job.policy_revision
            AND account.integration_type = 'commerce'
            AND account.provider = job.provider
@@ -740,10 +919,21 @@ export async function claimCommerceCatalogSyncJobsInPostgres(input: {
          job.policy_revision,
          job.requested_by,
          job.continuation_run_global_id,
+         job.target_dirty_version::text,
          job.read_generation,
          job.page_count,
+         job.provider_records_seen::text,
          job.attempt_count,
+         CASE
+           WHEN COALESCE(
+             job.result_summary->>'sweepFailureCount',
+             ''
+           ) ~ '^[0-9]{1,9}$'
+             THEN (job.result_summary->>'sweepFailureCount')::integer
+           ELSE 0
+         END AS sweep_failure_count,
          job.max_attempts,
+         job.started_at,
          job.lock_token::text`,
       [
         CATALOG_SYNC_POLICY_VERSION,
@@ -761,10 +951,14 @@ export async function claimCommerceCatalogSyncJobsInPostgres(input: {
       policyRevision: row.policy_revision,
       requestedBy: row.requested_by,
       continuationRunGlobalId: row.continuation_run_global_id,
+      targetDirtyVersion: Number(row.target_dirty_version),
       readGeneration: row.read_generation,
       pageCount: row.page_count,
+      providerRecordsSeen: Number(row.provider_records_seen),
       attemptCount: row.attempt_count,
+      sweepFailureCount: row.sweep_failure_count,
       maxAttempts: row.max_attempts,
+      startedAt: new Date(row.started_at).toISOString(),
       lockToken: row.lock_token,
     }))
   })
@@ -798,7 +992,6 @@ async function currentJobFence(
        AND queued.credential_version = $6
        AND queued.policy_revision = $7
        AND policy.policy_version = $8
-       AND policy.unmatched_action = 'auto_create'
        AND policy.revision = queued.policy_revision
        AND account.provider = queued.provider
        AND account.status <> 'error'
@@ -831,7 +1024,7 @@ export async function completeCommerceCatalogSyncPageInPostgres(input: {
   return withTransaction(async (client) => {
     const fenced = await currentJobFence(client, input.job)
     if (!fenced) {
-      await client.query(
+      const cancelled = await client.query(
         `UPDATE operations_commerce_catalog_sync_jobs
          SET status = 'cancelled',
              cancel_requested = true,
@@ -846,6 +1039,12 @@ export async function completeCommerceCatalogSyncPageInPostgres(input: {
            AND lock_token = $2::uuid`,
         [input.job.id, input.job.lockToken],
       )
+      if (cancelled.rowCount === 1) {
+        await reconcileOrphanedCommerceCatalogSyncCursorsWithClient(client, {
+          organizationId: input.job.organizationId,
+          integrationAccountId: input.job.integrationAccountId,
+        })
+      }
       return { status: 'cancelled' as const }
     }
     const nextPageCount = input.job.pageCount + 1
@@ -880,13 +1079,14 @@ export async function completeCommerceCatalogSyncPageInPostgres(input: {
            lock_token = NULL,
            completed_at = CASE WHEN $3 = 'succeeded' THEN now() ELSE NULL END,
            last_error_code = NULL,
-           result_summary = jsonb_build_object(
+           result_summary = result_summary || jsonb_build_object(
              'resource', 'products',
              'readOnly', true,
              'providerWrites', 0,
              'ordersTouched', 0,
              'inventoryTouched', 0,
-             'hasNextBatch', $12::boolean
+             'hasNextBatch', $12::boolean,
+             'sweepFailureCount', $13::integer
            ),
            updated_at = now()
        WHERE id = $1::uuid
@@ -909,6 +1109,7 @@ export async function completeCommerceCatalogSyncPageInPostgres(input: {
         boundedCount(input.totals.productsSkipped),
         boundedCount(input.totals.productsFailed),
         hasNext,
+        boundedCount(input.job.sweepFailureCount),
       ],
     )
     if (completed.rowCount !== 1) {
@@ -957,6 +1158,26 @@ export async function completeCommerceCatalogSyncPageInPostgres(input: {
       ],
     )
     if (!hasNext) {
+      if (input.job.provider === 'shopify' && input.job.targetDirtyVersion > 0) {
+        await client.query(
+          `UPDATE operations_shopify_catalog_refresh_states
+           SET reconciled_version = GREATEST(
+                 reconciled_version,
+                 LEAST(dirty_version, $4::bigint)
+               ),
+               last_reconciled_at = now(),
+               updated_at = now()
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+             AND credential_generation = $3`,
+          [
+            input.job.organizationId,
+            input.job.integrationAccountId,
+            input.job.credentialVersion,
+            input.job.targetDirtyVersion,
+          ],
+        )
+      }
       await recordAuditEvent({
         actor: 'system',
         eventType: 'commerce.catalog.sync.succeeded',
@@ -969,6 +1190,7 @@ export async function completeCommerceCatalogSyncPageInPostgres(input: {
           provider: input.job.provider,
           credentialVersion: input.job.credentialVersion,
           policyRevision: input.job.policyRevision,
+          targetDirtyVersion: input.job.targetDirtyVersion,
           pageCount: nextPageCount,
           providerRecordsSeen: Number(totals.provider_records_seen),
           productsCreated: Number(totals.products_created),
@@ -995,8 +1217,13 @@ export async function failCommerceCatalogSyncJobInPostgres(input: {
   error: unknown
 }) {
   const code = safeErrorCode(input.error)
-  const permanent = PERMANENT_ERROR_CODES.has(code)
-  const dead = permanent || input.job.attemptCount >= input.job.maxAttempts
+  const failureState = commerceCatalogSweepFailureState({
+    code,
+    attemptCount: input.job.attemptCount,
+    sweepFailureCount: input.job.sweepFailureCount,
+    maxAttempts: input.job.maxAttempts,
+  })
+  const dead = failureState.dead
   const restart = RESTART_ERROR_CODES.has(code)
   return withTransaction(async (client) => {
     const failed = await client.query(
@@ -1018,6 +1245,14 @@ export async function failCommerceCatalogSyncJobInPostgres(input: {
            locked_by = NULL,
            lock_token = NULL,
            last_error_code = $5,
+           result_summary = result_summary || jsonb_build_object(
+             'resource', 'products',
+             'readOnly', true,
+             'providerWrites', 0,
+             'ordersTouched', 0,
+             'inventoryTouched', 0,
+             'sweepFailureCount', $6::integer
+           ),
            completed_at = CASE WHEN $3 = 'dead' THEN now() ELSE NULL END,
            updated_at = now()
        WHERE id = $1::uuid
@@ -1029,6 +1264,7 @@ export async function failCommerceCatalogSyncJobInPostgres(input: {
         dead ? 'dead' : 'failed',
         restart,
         code,
+        failureState.sweepFailureCount,
       ],
     )
     if (failed.rowCount !== 1) return { dead: false, leaseLost: true, code }
@@ -1067,6 +1303,7 @@ export async function failCommerceCatalogSyncJobInPostgres(input: {
           credentialVersion: input.job.credentialVersion,
           policyRevision: input.job.policyRevision,
           attemptCount: input.job.attemptCount,
+          sweepFailureCount: failureState.sweepFailureCount,
           errorCode: code,
           providerWrites: 0,
           ordersTouched: 0,
@@ -1085,6 +1322,50 @@ export async function readCommerceCatalogSyncStateWithClient(
     integrationAccountId: string
   },
 ) {
+  const catalogRefresh = (
+    await client.query<{
+      provider: 'shopify' | 'faire'
+      dirty_version: string | null
+      reconciled_version: string | null
+    }>(
+      `SELECT
+         account.provider,
+         CASE
+           WHEN account.provider = 'shopify'
+             THEN COALESCE(refresh.dirty_version, 0)::text
+           ELSE NULL
+         END AS dirty_version,
+         CASE
+           WHEN account.provider = 'shopify'
+             THEN COALESCE(refresh.reconciled_version, 0)::text
+           ELSE NULL
+         END AS reconciled_version
+       FROM operations_integration_accounts account
+       LEFT JOIN operations_shopify_catalog_refresh_states refresh
+         ON refresh.organization_id = account.organization_id
+        AND refresh.integration_account_id = account.id
+        AND refresh.credential_generation
+          = account.commerce_credential_generation
+       WHERE account.organization_id = $1::uuid
+         AND account.id = $2::uuid
+         AND account.integration_type = 'commerce'
+         AND account.provider IN ('shopify', 'faire')
+       LIMIT 1`,
+      [input.organizationId, input.integrationAccountId],
+    )
+  ).rows[0]
+  const dirtyVersion = catalogRefresh?.provider === 'shopify'
+    ? boundedCount(catalogRefresh.dirty_version)
+    : null
+  const reconciledVersion = catalogRefresh?.provider === 'shopify'
+    ? boundedCount(catalogRefresh.reconciled_version)
+    : null
+  const pendingRefreshSignals = (
+    dirtyVersion !== null
+    && reconciledVersion !== null
+  )
+    ? Math.max(0, dirtyVersion - reconciledVersion)
+    : null
   const result = await client.query<{
     status: string
     provider: 'shopify' | 'faire'
@@ -1099,6 +1380,7 @@ export async function readCommerceCatalogSyncStateWithClient(
     products_skipped: string
     products_failed: string
     attempt_count: number
+    result_summary: Record<string, unknown>
     max_attempts: number
     available_at: string | Date
     last_error_code: string | null
@@ -1107,6 +1389,10 @@ export async function readCommerceCatalogSyncStateWithClient(
     updated_at: string | Date
     active_backlog: string
     unmatched_action: 'review' | 'auto_create'
+    current_credential_version: number
+    current_policy_revision: number
+    current_policy_version: string
+    current_provider: 'shopify' | 'faire'
     last_success_at: string | Date | null
   }>(
     `SELECT job.status, job.provider, job.credential_version,
@@ -1115,10 +1401,16 @@ export async function readCommerceCatalogSyncStateWithClient(
             job.products_created::text, job.products_mapped::text,
             job.products_unchanged::text,
             job.products_skipped::text, job.products_failed::text,
-            job.attempt_count, job.max_attempts, job.available_at,
+            job.attempt_count, job.result_summary,
+            job.max_attempts, job.available_at,
             job.last_error_code, job.started_at, job.completed_at,
             job.updated_at,
             policy.unmatched_action,
+            account.commerce_credential_generation
+              AS current_credential_version,
+            policy.revision AS current_policy_revision,
+            policy.policy_version AS current_policy_version,
+            account.provider AS current_provider,
             (
               SELECT max(succeeded.completed_at)
               FROM operations_commerce_catalog_sync_jobs succeeded
@@ -1139,6 +1431,9 @@ export async function readCommerceCatalogSyncStateWithClient(
      JOIN operations_commerce_product_intake_policies policy
        ON policy.organization_id = job.organization_id
       AND policy.integration_account_id = job.integration_account_id
+     JOIN operations_integration_accounts account
+       ON account.organization_id = job.organization_id
+      AND account.id = job.integration_account_id
      WHERE job.organization_id = $1::uuid
        AND job.integration_account_id = $2::uuid
      ORDER BY job.created_at DESC, job.id DESC
@@ -1156,35 +1451,44 @@ export async function readCommerceCatalogSyncStateWithClient(
       providerWrites: 0,
       ordersTouched: 0,
       inventoryTouched: 0,
+      dirtyVersion,
+      reconciledVersion,
+      pendingRefreshSignals,
+      terminalRecoveryRequired: false,
+      historicalTerminalEvidence: false,
     }
   }
   const iso = (value: string | Date | null) => (
     value ? new Date(value).toISOString() : null
   )
-  const status = row.unmatched_action === 'review'
-    ? 'paused'
-    : row.status === 'pending'
-      ? 'queued'
-      : row.status === 'processing'
-        ? 'running'
-        : row.status === 'failed'
-          ? 'retrying'
-          : row.status === 'succeeded'
-            ? 'completed'
-            : row.status === 'dead'
+  const authoritativeFence = (
+    row.provider === row.current_provider
+    && row.credential_version === row.current_credential_version
+    && row.policy_revision === row.current_policy_revision
+    && row.current_policy_version === CATALOG_SYNC_POLICY_VERSION
+  )
+  const status = row.status === 'pending'
+    ? 'queued'
+    : row.status === 'processing'
+      ? 'running'
+      : row.status === 'failed'
+        ? 'retrying'
+        : row.status === 'succeeded'
+          ? 'completed'
+          : row.status === 'dead'
+            ? authoritativeFence
               ? 'dead'
-              : row.status === 'cancelled'
-                ? 'idle'
-                : 'idle'
-  const nextRunAt = row.unmatched_action === 'review'
-    ? null
-    : ['pending', 'failed'].includes(row.status)
-      ? iso(row.available_at)
-      : row.status === 'succeeded' && row.completed_at
-        ? new Date(
-            new Date(row.completed_at).getTime() + 6 * 60 * 60 * 1_000,
-          ).toISOString()
-        : null
+              : 'idle'
+            : row.status === 'cancelled'
+              ? 'idle'
+              : 'idle'
+  const nextRunAt = ['pending', 'failed'].includes(row.status)
+    ? iso(row.available_at)
+    : row.status === 'succeeded' && row.completed_at
+      ? new Date(
+          new Date(row.completed_at).getTime() + 6 * 60 * 60 * 1_000,
+        ).toISOString()
+      : null
   return {
     status,
     rawStatus: row.status,
@@ -1200,6 +1504,7 @@ export async function readCommerceCatalogSyncStateWithClient(
     productsSkipped: Number(row.products_skipped),
     productsFailed: Number(row.products_failed),
     attemptCount: row.attempt_count,
+    sweepFailureCount: boundedCount(row.result_summary?.sweepFailureCount),
     maxAttempts: row.max_attempts,
     activeBacklog: Number(row.active_backlog),
     availableAt: iso(row.available_at),
@@ -1214,6 +1519,21 @@ export async function readCommerceCatalogSyncStateWithClient(
     providerWrites: 0,
     ordersTouched: 0,
     inventoryTouched: 0,
+    dirtyVersion,
+    reconciledVersion,
+    pendingRefreshSignals,
+    terminalRecoveryRequired: (
+      status === 'dead'
+      && authoritativeFence
+    ),
+    recoveryMode: status === 'dead'
+      ? 'operator_policy_revision'
+      : null,
+    deadEvidencePreserved: row.status === 'dead',
+    historicalTerminalEvidence: (
+      row.status === 'dead'
+      && !authoritativeFence
+    ),
   }
 }
 

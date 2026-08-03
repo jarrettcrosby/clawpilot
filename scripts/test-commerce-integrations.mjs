@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as globalIds from '../app_src/lib/globalIds.mjs'
 
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
@@ -77,6 +78,9 @@ function includes(source, fragments, label) {
 
 const migration = read('db/migrations/0111_operations_commerce_integrations.sql')
 const oauthMigration = read('db/migrations/0112_operations_faire_oauth.sql')
+const oauthGrantMigration = read(
+  'db/migrations/0228_operations_faire_oauth_grant_evidence.sql',
+)
 includes(migration, [
   "('gcw', 'operations.commerce_webhook_receipt'",
   "('gxa', 'operations.commerce_provider_attempt'",
@@ -141,6 +145,25 @@ assert.ok(
     && !oauthMigration.includes('state text NOT NULL'),
   'Faire OAuth migration must not persist raw state, codes, or plaintext secrets',
 )
+includes(oauthGrantMigration, [
+  'operations_faire_oauth_scope_list_valid',
+  'operations_faire_oauth_scope_json_valid',
+  'validate_operations_faire_scope_evidence_insert',
+  'operations_faire_provider_write_scope_evidence_is_current',
+  "credential.auth_mode = 'faire_oauth'",
+  "attempt.action = 'faire.oauth.authorization_code.exchange'",
+  "attempt.state = 'succeeded'",
+  "'tokenType', 'BEARER'",
+  "'grantType', 'AUTHORIZATION_CODE'",
+  "attempt.completed_at - attempt.requested_at <= interval '60 seconds'",
+  "attempt.completed_at >= evidence.recorded_at - interval '5 minutes'",
+  'auth.verified_write_scopes <@ evidence.verified_write_scopes',
+], 'Faire OAuth grant-evidence migration')
+assert.ok(
+  !/\b(?:access_token|authorization_code|application_secret)\s+(?:text|bytea|jsonb)\b/i
+    .test(oauthGrantMigration),
+  'Faire OAuth grant evidence must not add plaintext token, code, or secret storage',
+)
 
 const persistence = read('app_src/lib/persistence/commerceIntegrations.ts')
 includes(persistence, [
@@ -156,19 +179,24 @@ includes(persistence, [
   "'commerce.credential.rotated'",
   "'commerce.credential.verified'",
   "'commerce.credential.verification_failed'",
-  "'commerce.integration.enabled'",
-  "'commerce.integration.disabled'",
+  "'commerce.receipt_intake.queued'",
+  "'commerce.receipt_intake.held'",
   "'commerce.shopify.scopes_updated'",
   "'commerce.credential.disconnected'",
   "'commerce.credential.revealed'",
   'productCatalogIntake',
   'COMMERCE_CATALOG_SYNC_CONNECTION_REMOVED',
   "'commerce.webhook.received'",
+  "'commerce.inventory.refresh_signaled'",
+  'signalShopifyInventoryRefreshWithClient',
+  'SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS',
+  'webhookQuantityApplied: false',
+  "SET state = 'succeeded'",
   'recordCommerceCredentialRevealInPostgres',
   'payload: { credentialVersion: row.credential_version }',
-  'disableIntegration?: boolean',
-  "reason: 'shopify_scope_profile_incomplete'",
-  'scopeProfileIncomplete',
+  'holdReceiptIntake?: boolean',
+  "reason: 'shopify_receipt_scope_profile_incomplete'",
+  'receiptProofScopeIncomplete',
   'payload_hash',
   'Shopify reused a webhook event ID with a different payload',
   'account.commerce_credential_generation = $6',
@@ -177,10 +205,11 @@ includes(persistence, [
   'commerce_credential_generation = $3',
   'credential.credential_version = $3',
   'credential.credential_version =\n                 account.commerce_credential_generation',
-  "account.configuration->>'scopeProfile' =",
-  "account.configuration->'missingScopes' = '[]'::jsonb",
+  'account.receipt_intake_enabled',
+  "'read_products'",
+  "'read_inventory'",
   'FOR UPDATE OF account, credential',
-  "effectiveStatus === 'active' ? 'queued' : 'held'",
+  "receiptState: 'queued' | 'held'",
   'Shopify webhook credential generation changed before receipt commit',
   'createFaireOAuthInstallationInPostgres',
   'purgeExpiredFaireOAuthInstallationsInPostgres',
@@ -193,6 +222,48 @@ includes(persistence, [
   'AND state_hash = $4',
   'AND expires_at > now()',
 ], 'Commerce persistence')
+includes(persistence, [
+  'fulfillmentWriteReadiness',
+  'operations_faire_fulfillment_scope_evidence_is_current',
+  'operations_commerce_active_capability_claim_is_current',
+  'scope_evidence_recorded',
+], 'Faire fulfillment readiness persistence')
+const faireFulfillmentReadiness = read(
+  'app_src/lib/integrations/faireFulfillmentReadiness.ts',
+)
+includes(faireFulfillmentReadiness, [
+  'FAIRE_FULFILLMENT_REQUIRED_OAUTH_SCOPES',
+  "'READ_BRAND'",
+  "'READ_ORDERS'",
+  "'READ_SHIPMENTS'",
+  "'WRITE_ORDERS'",
+  'requested scopes cannot authorize writes',
+  'providerWrites: 0',
+], 'Faire fulfillment readiness diagnostic')
+const commerceEnablePersistence = persistence.slice(
+  persistence.indexOf(
+    'export async function setCommerceIntegrationEnabledInPostgres',
+  ),
+  persistence.indexOf(
+    'export async function disconnectCommerceCredentialInPostgres',
+  ),
+)
+includes(commerceEnablePersistence, [
+  "credential.webhook_verification_status = 'verified'",
+  'SET receipt_intake_enabled = $3::boolean',
+  "'read_products'",
+  "'write_products'",
+  "'read_inventory'",
+  "'write_inventory'",
+  'replayHeldShopifyProductDeletionsInPostgres({',
+  'organizationId: input.organizationId',
+  'accountGlobalId: input.accountGlobalId',
+], 'Shopify receipt-intake readiness')
+assert.doesNotMatch(
+  commerceEnablePersistence,
+  /SET\s+status\s*=/,
+  'Shopify receipt-intake policy must not change generic connection status',
+)
 assert.ok(
   !/console\.(?:log|error|warn)/.test(persistence),
   'Commerce persistence must not log credentials or payloads',
@@ -272,23 +343,54 @@ includes(service, [
   "'faire_brand_token'",
   "'shopify_client_credentials'",
   'await requestShopifyAccessToken',
+  'SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES',
   'SHOPIFY_RECEIPT_PROOF_SCOPES',
   'auditShopifyScopeRequirements',
   'auditShopifyScopeUpdatePayload',
-  "scopeProfile: 'receipt_evidence_v1'",
+  "scopeProfile: 'distributed_operations_v1'",
   'SHOPIFY_SCOPE_PROFILE_INCOMPLETE',
+  'missingShopifyReceiptProofScopes',
   "runtime.status === 'error'",
   'verifyShopifyWebhookHmac',
   'encryptCommerceWebhookPayload',
   'recordShopifyWebhookReceiptInPostgres',
   'SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPIC_SET.has(topic)',
+  'topics: SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS',
+  'created.filter((subscription) => subscription.created).length',
   "topic === 'app/scopes_update'",
   'SHOPIFY_WEBHOOK_TOPIC_UNSUPPORTED',
-  'Faire runtime polling is not implemented',
+  'Faire does not use Shopify signed-receipt intake',
   'revealCommerceCredential',
   'recordCommerceCredentialRevealInPostgres',
   'expiresAt: new Date(revealedAt.getTime() + 30_000).toISOString()',
 ], 'Commerce service')
+const testConnectionSource = service.slice(
+  service.indexOf('export async function testCommerceConnection'),
+  service.indexOf('export async function setCommerceIntegrationEnabled'),
+)
+includes(testConnectionSource, [
+  'missingShopifyReceiptProofScopes(',
+  'verified.configuration.grantedScopes',
+], 'Shopify verification receipt-scope isolation')
+assert.doesNotMatch(
+  testConnectionSource,
+  /verified\.configuration\.missingScopes[\s\S]{0,160}\.length/,
+  'connection verification must not hold receipts for unrelated missing scopes',
+)
+const receiptEnableSource = service.slice(
+  service.indexOf('export async function setCommerceIntegrationEnabled'),
+  service.indexOf('export async function disconnectCommerceIntegration'),
+)
+includes(receiptEnableSource, [
+  'missingShopifyReceiptProofScopes(',
+  'refreshed.configuration.grantedScopes',
+  'Shopify app is missing signed-receipt scopes:',
+], 'Shopify receipt enablement exact-scope gate')
+assert.doesNotMatch(
+  receiptEnableSource,
+  /configuration\.missingScopes/,
+  'receipt enablement must not require the broader Distributed Operations profile',
+)
 const faireOauthStartSource = service.slice(
   service.indexOf('export async function startFaireOAuthCommerce'),
   service.indexOf('export async function purgeExpiredFaireOAuthCommerce'),
@@ -322,6 +424,52 @@ assert.ok(
     < faireOauthCompleteSource.indexOf('encryptCommerceCredential'),
   'Faire OAuth brand identity must be verified before credential persistence',
 )
+includes(faireOauthCompleteSource, [
+  "grantedScopes: [...pending.requestedScopes]",
+  "scopeVerification: 'oauth_grant'",
+  "oauthGrantTokenType: grant.tokenType",
+  ".update(grant.accessToken)",
+  'credentialFingerprintSha256',
+  'faireOAuthGrant:',
+  'requestedAt: exchangeRequestedAt',
+  'completedAt: exchangeCompletedAt',
+], 'Faire OAuth successful grant persistence')
+const credentialWriteSource = persistence.slice(
+  persistence.indexOf(
+    'export async function writeCommerceCredentialInPostgres',
+  ),
+  persistence.indexOf(
+    'export async function markCommerceCredentialVerificationInPostgres',
+  ),
+)
+includes(credentialWriteSource, [
+  'Faire OAuth credential persistence requires exact grant evidence',
+  "oauthGrant.tokenType !== 'BEARER'",
+  '/^[a-f0-9]{64}$/.test(',
+  "'faire.oauth.authorization_code.exchange'",
+  "'succeeded', 1",
+  'scopeProofAttemptGlobalId',
+  'operations_faire_provider_write_scope_evidence',
+  'if (verifiedWriteScopes.length > 0)',
+  'operations_faire_provider_write_request_hash($6::jsonb)',
+  'operations_faire_provider_write_request_hash($8::jsonb)',
+], 'Atomic Faire OAuth credential and grant evidence persistence')
+assert.doesNotMatch(
+  credentialWriteSource,
+  /\b(?:authorizationCode|accessToken|applicationSecret)\b/,
+  'Faire OAuth grant persistence must receive only redacted grant facts',
+)
+const verifyStoredConnectionSource = service.slice(
+  service.indexOf('async function verifyStoredConnection'),
+  service.indexOf('export async function testCommerceConnection'),
+)
+includes(verifyStoredConnectionSource, [
+  "credential.authMode === 'faire_oauth'",
+  "runtime.configuration.scopeVerification === 'oauth_grant'",
+  "? 'oauth_grant'",
+  ": 'not_exposed_by_provider'",
+  'scopeEvidenceRefreshed: false',
+], 'Faire connection-test persisted grant reporting')
 const faireApiKeyConnectSource = service.slice(
   service.indexOf('export async function connectFaireCommerce'),
   service.indexOf('function decryptStoredCredential'),
@@ -381,6 +529,7 @@ includes(adminRoute, [
   "action === 'connect-faire-api-key'",
   "action === 'start-faire-oauth'",
   "action === 'test-connection'",
+  "action === 'set-receipt-intake'",
   "action === 'set-enabled'",
   "action === 'disconnect'",
   "action === 'reveal-credential'",
@@ -437,7 +586,7 @@ includes(integrationsDoc, [
   '`read_merchant_managed_fulfillment_orders`',
   'Any granted scope beginning `write_` fails closed',
   'additional granted `read_` scopes remain',
-  'leaves the target verified but disabled with pristine cursors',
+  'leaves the target generic-status `active` for verified reads and registered callback computation with pristine cursors and signed receipt intake false',
   'existing default workspace plus non-Shopify shipping, warehouse, printer, and print-agent identities',
   'uses **Generate API key** to obtain the final brand API key',
   '`X-FAIRE-ACCESS-TOKEN`',
@@ -492,7 +641,7 @@ includes(faireOauthCallback, [
   'requireRequestUser(req)',
   'operationsCapabilities(actor).canManage',
   "req.nextUrl.searchParams.get('state')",
-  "'authorizationCode'",
+  'readFaireOAuthCallbackAuthorizationCode(',
   "req.nextUrl.searchParams.has('error')",
   'completeFaireOAuthCommerce',
   'purgeExpiredFaireOAuthCommerce',
@@ -512,6 +661,51 @@ assert.ok(
     'if (state) {\n        await discardFaireOAuthCommerce',
   ),
   'Faire denial cleanup must require the returned state before deleting',
+)
+
+const faireOauthCallbackParser = loadTypeScriptModule(
+  'app_src/lib/integrations/faireOAuthCallback.ts',
+)
+for (const parameterName of [
+  'authorizationCode',
+  'authorization_code',
+  'code',
+]) {
+  const params = new URLSearchParams({
+    [parameterName]: 'faire-authorization-code-1234567890',
+  })
+  assert.equal(
+    faireOauthCallbackParser.readFaireOAuthCallbackAuthorizationCode(params),
+    'faire-authorization-code-1234567890',
+    `Faire OAuth callback accepts ${parameterName}`,
+  )
+}
+const repeatedFaireCode = new URLSearchParams()
+repeatedFaireCode.append('authorizationCode', 'same-faire-code')
+repeatedFaireCode.append('code', 'same-faire-code')
+assert.equal(
+  faireOauthCallbackParser.readFaireOAuthCallbackAuthorizationCode(
+    repeatedFaireCode,
+  ),
+  'same-faire-code',
+  'Equivalent Faire OAuth callback aliases remain deterministic',
+)
+const conflictingFaireCode = new URLSearchParams()
+conflictingFaireCode.append('authorizationCode', 'first-faire-code')
+conflictingFaireCode.append('code', 'second-faire-code')
+assert.equal(
+  faireOauthCallbackParser.readFaireOAuthCallbackAuthorizationCode(
+    conflictingFaireCode,
+  ),
+  null,
+  'Conflicting Faire OAuth callback aliases fail closed',
+)
+assert.equal(
+  faireOauthCallbackParser.readFaireOAuthCallbackAuthorizationCode(
+    new URLSearchParams(),
+  ),
+  null,
+  'Missing Faire OAuth callback code fails closed',
 )
 
 const panel = read(
@@ -561,7 +755,12 @@ includes(panel, [
   'Revoke or remove provider-side access separately',
   'Optional signed receipt setup',
   'Copy URL',
-  'Least-privilege receipt profile',
+  'Distributed Operations scope profile',
+  "action: 'set-receipt-intake'",
+  'Queue signed receipts',
+  'Hold signed receipts',
+  'Queued for intake',
+  'Held as evidence',
   'synchronization with no second approval',
   'type="password"',
   'confirmLiveAccess',
@@ -577,6 +776,12 @@ includes(panel, [
   "account.authMode !== 'faire_brand_token'",
   'Faire generated API keys are encrypted and',
   'inputProps={{ maxLength: 4096 }}',
+  'Faire fulfillment writes',
+  "account.provider === 'shopify' ? (",
+  "account.provider === 'faire' && fulfillmentReadiness",
+  'Shopify manages customer notifications for this connection',
+  'Required OAuth scopes:',
+  'diagnostic provider writes: 0',
   'useRef(integrations.organizationId)',
   'payload.integrations.organizationId',
   '!== organizationIdRef.current',
@@ -636,6 +841,24 @@ assert.equal(capabilities.SHOPIFY_ADMIN_API_VERSION, '2026-07')
 assert.deepEqual(
   JSON.parse(JSON.stringify(capabilities.SHOPIFY_RECEIPT_PROOF_SCOPES)),
   ['read_products', 'read_inventory'],
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    capabilities.SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
+  )),
+  [
+    'read_all_orders',
+    'read_customers',
+    'write_inventory',
+    'read_locations',
+    'read_markets',
+    'write_merchant_managed_fulfillment_orders',
+    'read_orders',
+    'write_products',
+    'write_publications',
+    'write_shipping',
+    'write_app_proxy',
+  ],
 )
 assert.equal(
   capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING.shopify.developerPortalUrl,
@@ -702,18 +925,51 @@ assert.deepEqual(
   },
   'Shopify write scopes must satisfy their paired read requirements',
 )
+assert.equal(
+  capabilities.hasEffectiveShopifyScope(
+    ['write_products'],
+    'read_products',
+  ),
+  true,
+  'Shopify capability checks must honor write scope implied read access',
+)
 assert.deepEqual(
   JSON.parse(JSON.stringify(capabilities.auditShopifyScopeUpdatePayload({
-    current: ['write_products'],
-    previous: ['write_products', 'write_inventory'],
+    current: capabilities.SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES.filter(
+      (scope) => scope !== 'write_inventory',
+    ),
+    previous: capabilities.SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
   }))),
   {
-    requestedScopes: ['read_inventory', 'read_products'],
-    grantedScopes: ['write_products'],
-    missingScopes: ['read_inventory'],
-    restrictedScopes: [],
+    requestedScopes: [
+      'read_all_orders',
+      'read_customers',
+      'read_locations',
+      'read_markets',
+      'read_orders',
+      'write_app_proxy',
+      'write_inventory',
+      'write_merchant_managed_fulfillment_orders',
+      'write_products',
+      'write_publications',
+      'write_shipping',
+    ],
+    grantedScopes: [
+      'read_all_orders',
+      'read_customers',
+      'read_locations',
+      'read_markets',
+      'read_orders',
+      'write_app_proxy',
+      'write_merchant_managed_fulfillment_orders',
+      'write_products',
+      'write_publications',
+      'write_shipping',
+    ],
+    missingScopes: ['write_inventory'],
+    restrictedScopes: ['read_all_orders'],
   },
-  'Shopify scope-update events must expose a fail-closed receipt-profile audit',
+  'Shopify scope-update events must expose a fail-closed Operations-profile audit',
 )
 assert.throws(
   () => capabilities.auditShopifyScopeUpdatePayload({
@@ -730,13 +986,60 @@ assert.equal(
   'control_plane_implemented',
 )
 assert.equal(
+  capabilities.CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION
+    .product_synchronization,
+  'control_plane_implemented',
+)
+assert.equal(
+  capabilities.CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION
+    .shipping_rate_callbacks,
+  'control_plane_implemented',
+)
+assert.equal(
+  capabilities.CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION.fulfillment_export,
+  'control_plane_implemented',
+)
+assert.equal(
+  capabilities.CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION.tracking_export,
+  'control_plane_implemented',
+)
+assert.equal(
   capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION.order_import,
+  'control_plane_implemented',
+)
+assert.equal(
+  capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION
+    .product_synchronization,
   'control_plane_implemented',
 )
 assert.equal(
   capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION.oauth_authentication,
   'control_plane_implemented',
 )
+assert.equal(
+  capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION.order_update,
+  'control_plane_implemented',
+)
+assert.equal(
+  capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION.fulfillment_export,
+  'control_plane_implemented',
+)
+assert.equal(
+  capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION.tracking_export,
+  'control_plane_implemented',
+)
+for (const capability of [
+  'order_update',
+  'fulfillment_export',
+  'tracking_export',
+]) {
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      capabilities.FAIRE_CAPABILITY_SCOPES[capability],
+    )),
+    ['READ_BRAND', 'READ_ORDERS', 'READ_SHIPMENTS', 'WRITE_ORDERS'],
+  )
+}
 assert.ok(
   capabilities.SHOPIFY_PROVIDER_AVAILABLE_CAPABILITIES.includes('order_import'),
 )
@@ -767,6 +1070,7 @@ const cryptoModule = loadTypeScriptModule(
   'app_src/lib/integrations/commerceCredentialCrypto.ts',
   {
     mocks: {
+      '@/lib/globalIds.mjs': globalIds,
       '@/lib/persistence/config': { isHostedRuntime: () => false },
     },
   },
@@ -941,6 +1245,23 @@ const shopifyClient = loadTypeScriptModule(
   {
     mocks: {
       '@/lib/integrations/commerceCapabilities': capabilities,
+      '@/lib/integrations/shopifyCarrierServiceBranding': {
+        normalizeShopifyStoreEntityName(value) {
+          if (typeof value !== 'string') throw new Error('invalid')
+          const normalized = value
+            .normalize('NFKC')
+            .replace(/\s+/g, ' ')
+            .trim()
+          if (
+            normalized.length < 1
+            || [...normalized].length > 255
+            || /[\u0000-\u001f\u007f]/.test(normalized)
+          ) {
+            throw new Error('invalid')
+          }
+          return normalized
+        },
+      },
     },
   },
 )
@@ -1082,6 +1403,7 @@ const shopifyProbe = await shopifyClient.probeShopifyConnection(
   },
 )
 assert.equal(shopifyProbe.shopId, externalAccountId)
+assert.equal(shopifyProbe.shopName, 'Example Store')
 assert.deepEqual(
   JSON.parse(JSON.stringify(shopifyProbe.grantedScopes)),
   ['read_orders', 'read_products'],
@@ -1093,6 +1415,36 @@ assert.match(
 assert.equal(
   shopifyRequests[0].init.headers['X-Shopify-Access-Token'],
   issuedAccessToken,
+)
+await assert.rejects(
+  shopifyClient.probeShopifyConnection(
+    {
+      shopDomain: 'example-store.myshopify.com',
+      accessToken: issuedAccessToken,
+    },
+    {
+      fetchImpl: async () => new Response(JSON.stringify({
+        data: {
+          shop: {
+            id: externalAccountId,
+            myshopifyDomain: 'example-store.myshopify.com',
+            name: 'ﬃ'.repeat(86),
+          },
+          currentAppInstallation: {
+            accessScopes: [
+              { handle: 'read_orders' },
+              { handle: 'read_products' },
+            ],
+          },
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    },
+  ),
+  (error) => error?.code === 'SHOPIFY_PROBE_INVALID',
+  'Provider identity must be NFKC-normalized before the 255-character bound.',
 )
 
 const faireClient = loadTypeScriptModule(
@@ -1237,7 +1589,7 @@ assert.equal(
   'faire-brand-token-1234567890',
 )
 const faireInventory = await faireApi.listInventory({
-  productVariantIds: ['product_variant_123'],
+  productVariantIds: ['product_variant_123', 'product_variant_456'],
 })
 assert.deepEqual(
   JSON.parse(JSON.stringify(
@@ -1247,7 +1599,7 @@ assert.deepEqual(
 )
 assert.equal(
   faireRequests[1].url,
-  'https://www.faire.com/external-api/v2/product-inventory/by-product-variant-ids?ids=product_variant_123',
+  'https://www.faire.com/external-api/v2/product-inventory/by-product-variant-ids?ids=product_variant_123&ids=product_variant_456',
 )
 const faireOrder = await faireApi.getOrder('order_123')
 assert.equal(faireOrder.id, 'order_123')
@@ -1258,6 +1610,7 @@ assert.equal(
 const faireProducts = await faireApi.listProducts({
   cursor: 'faire-products-current-page',
   limit: 50,
+  includeDeleted: true,
 })
 assert.equal(faireProducts.products.length, 1)
 assert.equal(
@@ -1267,8 +1620,13 @@ assert.equal(
 )
 assert.equal(
   faireRequests[3].url,
-  'https://www.faire.com/external-api/v2/products?limit=50&cursor=faire-products-current-page',
-  'The next Faire list request must send the prior response cursor through the cursor query parameter',
+  'https://www.faire.com/external-api/v2/products?limit=50&cursor=faire-products-current-page&include_deleted=true',
+  'Faire catalog reconciliation must retain the cursor and include deleted listings',
+)
+await assert.rejects(
+  faireApi.listProducts({ includeDeleted: 'yes' }),
+  (error) => error.code === 'FAIRE_INCLUDE_DELETED_INVALID',
+  'Faire list requests must reject a non-boolean include-deleted selection',
 )
 await assert.rejects(
   faireApi.listProducts({ cursor: 'x'.repeat(4_097) }),
@@ -1880,8 +2238,8 @@ includes(previewServiceSource, [
   "runtime.provider !== 'shopify'",
   "runtime.environment !== 'sandbox'",
   "runtime.verificationStatus !== 'verified'",
-  "probeScopes.has('read_orders')",
-  "tokenScopes.has('read_orders')",
+  "hasEffectiveShopifyScope(probe.grantedScopes, 'read_orders')",
+  "hasEffectiveShopifyScope(grant.grantedScopes, 'read_orders')",
   'await fetchShopifyOrderPreview',
   'testOrdersIncluded: false',
   'includeTestOrders: false',

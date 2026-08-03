@@ -411,9 +411,23 @@ function sameMaterialRateDimensions(
 export function assertCartonizationRateEvidenceMaterialAssumptions(
   input: Pick<
     CartonizationRateEvidenceWriteInput,
-    'materialRateAssumptions' | 'assumptionSnapshot' | 'packages'
+    | 'evidenceMode'
+    | 'materialRateAssumptions'
+    | 'assumptionSnapshot'
+    | 'planSnapshot'
+    | 'packages'
   >,
 ) {
+  if (
+    input.evidenceMode === 'operational'
+    && input.planSnapshot.carrierReadEnvironment !== 'sandbox'
+  ) {
+    fail(
+      'Development operational evidence must explicitly retain its sandbox carrier-read environment',
+      400,
+      'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_RATE_ENVIRONMENT_INVALID',
+    )
+  }
   if (
     !Array.isArray(input.materialRateAssumptions)
     || input.materialRateAssumptions.length < 1
@@ -431,7 +445,7 @@ export function assertCartonizationRateEvidenceMaterialAssumptions(
   >()
   for (const assumption of input.materialRateAssumptions) {
     if (
-      !/^gmat[0-9]{7}$/.test(assumption?.materialGlobalId || '')
+      !/^gmat(?:[0-9]{7}|[0-9a-v]{12})$/.test(assumption?.materialGlobalId || '')
       || !Number.isSafeInteger(assumption?.expectedRowVersion)
       || assumption.expectedRowVersion < 0
       || !exactMaterialRateDimensions(
@@ -454,8 +468,19 @@ export function assertCartonizationRateEvidenceMaterialAssumptions(
       left.materialGlobalId.localeCompare(right.materialGlobalId)
     ),
   )
-  const retainedAssumptions =
-    input.assumptionSnapshot.materialRateAssumptions
+  const retainedAssumptions = input.evidenceMode === 'operational'
+    ? input.assumptionSnapshot.operationalMaterialFacts
+    : input.assumptionSnapshot.materialRateAssumptions
+  if (
+    input.evidenceMode === 'operational'
+    && Object.hasOwn(input.assumptionSnapshot, 'materialRateAssumptions')
+  ) {
+    fail(
+      'Operational evidence cannot retain sandbox material assumptions',
+      400,
+      'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_ASSUMPTIONS_FORBIDDEN',
+    )
+  }
   if (
     !Array.isArray(retainedAssumptions)
     || cartonizationRateEvidenceHash(retainedAssumptions)
@@ -1211,13 +1236,6 @@ export async function writeCartonizationRateEvidenceInPostgres(
   }
   const requestHash = cartonizationRateEvidenceRequestHash(input)
   assertHash(input.semanticRequestHash, 'Semantic request hash')
-  if (requestHash !== input.semanticRequestHash) {
-    fail(
-      'Semantic request hash does not match the exact pre-carrier command',
-      400,
-      'CARTONIZATION_RATE_EVIDENCE_SEMANTIC_HASH_INVALID',
-    )
-  }
   const writeToken = randomUUID()
   const writeTokenHash = createHash('sha256')
     .update(writeToken)
@@ -1424,6 +1442,16 @@ export async function writeCartonizationRateEvidenceInPostgres(
       }>
     }>()
     const packageSequences = new Set<number>()
+    const requiredMaterialQuantities = input.packages.reduce(
+      (counts, packageInput) => {
+        counts.set(
+          packageInput.packagingMaterialGlobalId,
+          (counts.get(packageInput.packagingMaterialGlobalId) || 0) + 1,
+        )
+        return counts
+      },
+      new Map<string, number>(),
+    )
     for (const packageInput of input.packages) {
       if (packageContexts.has(packageInput.packageKey)) {
         fail(`Duplicate package key ${packageInput.packageKey}`, 400)
@@ -1456,8 +1484,25 @@ export async function writeCartonizationRateEvidenceInPostgres(
       }
       const resolvedMaterial = await client.query<{
         material_id: string
+        status: 'draft' | 'active'
+        rated_outer_length_mm: number | null
+        rated_outer_width_mm: number | null
+        rated_outer_height_mm: number | null
+        rated_outer_dimension_evidence_type: string | null
+        rated_outer_dimension_evidence_reference: string | null
+        rated_outer_dimension_confirmed_at: Date | string | null
+        tare_weight_grams: number | null
       }>(
-        `SELECT material.id::text AS material_id
+        `SELECT
+           material.id::text AS material_id,
+           material.status,
+           material.rated_outer_length_mm,
+           material.rated_outer_width_mm,
+           material.rated_outer_height_mm,
+           material.rated_outer_dimension_evidence_type,
+           material.rated_outer_dimension_evidence_reference,
+           material.rated_outer_dimension_confirmed_at,
+           material.tare_weight_grams
          FROM operations_packaging_materials material
          WHERE material.organization_id = $1::uuid
            AND material.global_id = $2
@@ -1477,6 +1522,65 @@ export async function writeCartonizationRateEvidenceInPostgres(
           409,
           'CARTONIZATION_RATE_EVIDENCE_REVISION_CONFLICT',
         )
+      }
+      if (
+        input.evidenceMode === 'operational'
+        && (
+          material.status !== 'active'
+          || material.rated_outer_length_mm
+            !== packageInput.ratedOuterDimensionsMm.length
+          || material.rated_outer_width_mm
+            !== packageInput.ratedOuterDimensionsMm.width
+          || material.rated_outer_height_mm
+            !== packageInput.ratedOuterDimensionsMm.height
+          || !['customer_confirmed', 'measured', 'provider'].includes(
+            material.rated_outer_dimension_evidence_type || '',
+          )
+          || !material.rated_outer_dimension_evidence_reference?.trim()
+          || material.rated_outer_dimension_confirmed_at === null
+          || material.tare_weight_grams !== packageInput.tareWeightGrams
+        )
+      ) {
+        fail(
+          `${packageInput.packageKey} does not match a current factual rated packaging measurement`,
+          409,
+          'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_STALE',
+        )
+      }
+      if (input.evidenceMode === 'operational') {
+        const stock = await client.query<{
+          is_available: boolean
+          on_hand_quantity: number | null
+        }>(
+          `SELECT stock.is_available, stock.on_hand_quantity
+           FROM operations_packaging_material_stock stock
+           WHERE stock.organization_id = $1::uuid
+             AND stock.packaging_material_id = $2::uuid
+             AND stock.warehouse_id = $3::uuid
+           LIMIT 1
+           FOR SHARE OF stock`,
+          [
+            input.organizationId,
+            material.material_id,
+            exactContext.warehouse_id,
+          ],
+        )
+        const currentStock = stock.rows[0]
+        const requiredQuantity = requiredMaterialQuantities.get(
+          packageInput.packagingMaterialGlobalId,
+        ) || 0
+        if (
+          !currentStock
+          || currentStock.is_available !== true
+          || currentStock.on_hand_quantity === null
+          || currentStock.on_hand_quantity < requiredQuantity
+        ) {
+          fail(
+            `${packageInput.packagingMaterialGlobalId} has insufficient current stock for ${requiredQuantity} planned package(s)`,
+            409,
+            'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_STOCK_STALE',
+          )
+        }
       }
       if (
         (packageInput.planningMethod === 'approved_recipe'

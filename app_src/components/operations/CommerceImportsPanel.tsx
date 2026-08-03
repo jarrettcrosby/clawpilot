@@ -32,6 +32,7 @@ type CommerceAccount = {
 type CommercePayload = {
   ok?: boolean
   error?: string
+  canManage?: boolean
   canActivate?: boolean
   intakeAvailable?: boolean
   integrations?: {
@@ -269,6 +270,7 @@ export default function CommerceImportsPanel() {
                 accountGlobalId={selectedAccount.globalId}
                 provider={selectedAccount.provider}
                 displayName={selectedAccount.displayName}
+                canManage={payload.canManage === true}
                 canActivate={payload.canActivate === true}
               />
               {selectedAccount.provider === 'shopify' ? (

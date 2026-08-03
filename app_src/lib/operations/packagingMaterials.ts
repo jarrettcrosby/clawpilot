@@ -58,6 +58,17 @@ export type PackagingMaterial = {
     width: number | null
     height: number | null
   }
+  ratedOuterDimensionsMm: {
+    length: number | null
+    width: number | null
+    height: number | null
+  }
+  ratedOuterDimensionEvidenceType:
+    | Exclude<PackagingDimensionEvidenceType, 'unknown'>
+    | null
+  ratedOuterDimensionEvidenceReference: string | null
+  ratedOuterDimensionConfirmedAt: string | null
+  ratedOuterDimensionConfirmedBy: string | null
   dimensionBasis: PackagingDimensionBasis
   dimensionEvidenceType: PackagingDimensionEvidenceType
   dimensionEvidenceReference: string | null
@@ -121,6 +132,13 @@ export type PackagingMaterialInput = {
   innerLengthMm: number | null
   innerWidthMm: number | null
   innerHeightMm: number | null
+  ratedOuterLengthMm?: number | null
+  ratedOuterWidthMm?: number | null
+  ratedOuterHeightMm?: number | null
+  ratedOuterDimensionEvidenceType?:
+    | Exclude<PackagingDimensionEvidenceType, 'unknown'>
+    | null
+  ratedOuterDimensionEvidenceReference?: string | null
   dimensionBasis: PackagingDimensionBasis
   dimensionEvidenceType: PackagingDimensionEvidenceType
   dimensionEvidenceReference: string | null

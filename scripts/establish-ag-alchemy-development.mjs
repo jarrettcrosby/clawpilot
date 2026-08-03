@@ -4,6 +4,7 @@ import crypto from 'node:crypto'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { globalIdPattern } from '../app_src/lib/globalIds.mjs'
 
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
@@ -117,7 +118,7 @@ function normalizedEmail(value, label) {
 
 function reference(value, prefix, label) {
   const normalized = normalizedText(value).toLowerCase()
-  if (!new RegExp(`^${prefix}[0-9]{7}$`).test(normalized)) {
+  if (!globalIdPattern(prefix).test(normalized)) {
     fail(`${label} must be a ${prefix} Global ID`)
   }
   return normalized
@@ -1106,7 +1107,7 @@ async function readDevelopmentPlan(client, config) {
     if (
       target.account.externalAccountId !== config.shopExternalAccountId
       || target.account.configuration.shopDomain !== config.shopDomain
-      || target.account.status !== 'disabled'
+      || target.account.status !== 'active'
       || !target.account.credential
       || target.account.credential.authMode
         !== 'shopify_client_credentials'
@@ -1416,7 +1417,7 @@ async function executeTransfer(
            commerce_credential_generation, created_by, updated_by
          ) VALUES (
            $1::uuid, 'shopify', 'commerce', 'sandbox', $2, $3,
-           'disabled', $4::jsonb, 1, $5, $5
+           'active', $4::jsonb, 1, $5, $5
          )
          RETURNING id::text, global_id`,
         [
@@ -1693,7 +1694,7 @@ async function verifyPostflight(client, config, before, result, key) {
       [result.targetOrganization.id, result.targetAccount.global_id],
     )
   ).rows[0]
-  assert.equal(targetState.status, 'disabled')
+  assert.equal(targetState.status, 'active')
   assert.equal(targetState.external_account_id, config.shopExternalAccountId)
   assert.equal(targetState.commerce_credential_generation, 1)
   assert.equal(targetState.credential_version, 1)
@@ -1917,7 +1918,7 @@ async function execute(pool, config, environment) {
       targetAccount: {
         id: result.targetAccount.id,
         globalId: result.targetAccount.global_id,
-        status: 'disabled',
+        status: 'active',
         verificationStatus: 'verified',
       },
       previewRunsDeleted: result.previewRunsDeleted,

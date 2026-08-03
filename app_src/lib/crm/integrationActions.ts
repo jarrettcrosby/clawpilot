@@ -1,5 +1,10 @@
 import crypto from 'node:crypto'
 import type { PoolClient } from 'pg'
+import {
+  GLOBAL_ID_MAX_LENGTH,
+  globalIdFragment,
+  globalIdPattern,
+} from '@/lib/globalIds.mjs'
 import { resolveUserMatonGatewayCredential } from '@/lib/integrations/matonGatewayCredentials'
 import { matonFetch } from '@/lib/maton'
 import {
@@ -168,9 +173,13 @@ function suiteCrmParentType(entity: CrmReferenceRecord['entity']) {
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const CRM_REFERENCE_PATTERN = /^g[aciklmo][0-9]{7}$/
-const CAMPAIGN_RECIPIENT_PATTERN = /^g[cl][0-9]{7}$/
-const CRM_REPLY_MARKER_PATTERN = /%gsltg[aciklmo][0-9]{7}(?![A-Za-z0-9_])/gi
+const CRM_PREFIXES = ['ga', 'gc', 'gi', 'gk', 'gl', 'gm', 'go']
+const CRM_REFERENCE_PATTERN = globalIdPattern(CRM_PREFIXES)
+const CAMPAIGN_RECIPIENT_PATTERN = globalIdPattern(['gc', 'gl'])
+const CRM_REPLY_MARKER_PATTERN = new RegExp(
+  `%gslt${globalIdFragment(CRM_PREFIXES)}(?![A-Za-z0-9_])`,
+  'gi',
+)
 const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
 const MAX_CAMPAIGN_RECIPIENTS = 500
 
@@ -214,7 +223,7 @@ function normalizeEmail(value: unknown, field: string): string {
 }
 
 function normalizeReference(value: unknown): string {
-  const referenceCode = cleanString(value, 9, 'CRM reference').toLowerCase()
+  const referenceCode = cleanString(value, GLOBAL_ID_MAX_LENGTH, 'CRM reference').toLowerCase()
   if (!CRM_REFERENCE_PATTERN.test(referenceCode)) {
     throw new CrmIntegrationActionError('CRM reference is invalid')
   }
@@ -1367,7 +1376,7 @@ function normalizeMeetingStatus(value: unknown): CrmMeeting['status'] {
 
 function calendarEventIdForMeeting(referenceCode: string): string {
   const normalized = normalizeReference(referenceCode)
-  if (!/^gm[0-9]{7}$/.test(normalized)) {
+  if (!globalIdPattern('gm').test(normalized)) {
     throw new PermanentCrmIntegrationActionError('Calendar event requires a meeting reference')
   }
   return normalized

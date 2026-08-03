@@ -59,13 +59,21 @@ function isPublicApi(pathname: string) {
     || normalizedPath === '/api/integrations/toast/process'
     || normalizedPath === '/api/integrations/quickbooks/process'
     || normalizedPath === '/api/integrations/commerce/catalog/process'
+    || normalizedPath === '/api/integrations/commerce/inventory/process'
     || normalizedPath === '/api/integrations/commerce/orders/process'
+    || normalizedPath === '/api/integrations/commerce/images/process'
+    || normalizedPath === '/api/integrations/commerce/fulfillment/process'
     || normalizedPath.startsWith('/api/integrations/commerce/shopify/webhooks/')
+    || normalizedPath.startsWith('/api/integrations/commerce/shopify/carrier-service/')
+    || normalizedPath === '/api/integrations/commerce/shopify/rate-warm'
+    || normalizedPath.startsWith('/api/integrations/commerce/shopify/rate-warm/')
+    || normalizedPath.startsWith('/api/integrations/commerce/shopify/product-media/')
     || normalizedPath === '/api/integrations/commerce/faire/oauth/callback'
     || normalizedPath === '/api/docs/embeddings/process'
     || normalizedPath === '/api/ai-radar/process'
     || normalizedPath === '/api/operations/print-agent/jobs'
     || normalizedPath === '/api/shortlinks'
+    || normalizedPath.startsWith('/api/public/crm-product-images/')
     || normalizedPath.startsWith('/api/auth/')
   )
 }

@@ -1,4 +1,5 @@
 import crypto from 'crypto'
+import { normalizeGlobalId } from '@/lib/globalIds.mjs'
 import { isHostedRuntime } from '@/lib/persistence/config'
 
 export type DirectCarrierProvider = 'ups_rest' | 'fedex_rest' | 'usps_rest'
@@ -45,8 +46,8 @@ export function normalizeCarrierEnvironment(value: unknown): CarrierEnvironment 
 }
 
 export function normalizeCarrierAccountGlobalId(value: unknown) {
-  const globalId = String(value || '').trim().toLowerCase()
-  if (!/^gac[0-9]{7}$/.test(globalId)) {
+  const globalId = normalizeGlobalId(value, 'gac')
+  if (!globalId) {
     throw new Error('A valid carrier account Global ID is required')
   }
   return globalId

@@ -118,6 +118,7 @@ type IntakeLine = {
   sku?: string | null
   title: string
   quantity: number
+  unitMultiplier?: number | null
   requiresShipping: boolean
   unitPriceMinor?: number | null
   currency?: string | null
@@ -178,6 +179,19 @@ type IntakeCandidate = {
   } | null
   lines?: IntakeLine[]
   canonicalOrderGlobalId?: string | null
+  checkoutRateReconciliation?: {
+    globalId?: string | null
+    receiptGlobalId?: string | null
+    outcome?:
+      | 'matched'
+      | 'ambiguous'
+      | 'rejected'
+      | 'expired'
+      | 'not_applicable'
+      | null
+    lineageRequired?: boolean
+    fulfillmentEligible?: boolean
+  } | null
   unsupportedReason?: string | null
 }
 
@@ -188,11 +202,24 @@ type PackageProfile = {
   dimensionsMm?: DimensionsMm | null
 }
 
+type PackProfileVersion = {
+  globalId: string
+  rowVersion: number
+  label: string
+  packageLevel: 'each' | 'inner_pack' | 'case' | 'pallet'
+  baseEachQuantity: number
+  weightGrams: number
+  dimensionsMm: DimensionsMm
+  evidenceType: 'customer_confirmed' | 'measured' | 'provider'
+  weightBasis: string
+}
+
 type ProductCatalogEntry = {
   globalId: string
   name: string
   sku?: string | null
   packageProfiles?: PackageProfile[]
+  packProfileVersions?: PackProfileVersion[]
 }
 
 type CustomerCatalogEntry = {
@@ -234,6 +261,15 @@ type ProductCandidate = {
   variantTitle?: string | null
   vendor?: string | null
   productType?: string | null
+  providerTaxonomy?: {
+    scheme:
+      | 'shopify_standard_product_taxonomy'
+      | 'faire_product_type'
+    externalId?: string | null
+    name?: string | null
+    fullName?: string | null
+    marketplacePaths?: string[]
+  } | null
   selectedOptions?: Array<{
     name: string
     value: string
@@ -285,6 +321,7 @@ type ProductCatalogSync = {
   productsSkipped?: number
   productsFailed?: number
   attemptCount?: number
+  sweepFailureCount?: number
   maxAttempts?: number
   availableAt?: string | null
   lastErrorCode?: string | null
@@ -298,6 +335,13 @@ type ProductCatalogSync = {
   providerWrites?: number
   ordersTouched?: number
   inventoryTouched?: number
+  dirtyVersion?: number | null
+  reconciledVersion?: number | null
+  pendingRefreshSignals?: number | null
+  terminalRecoveryRequired?: boolean
+  recoveryMode?: 'operator_policy_revision' | null
+  deadEvidencePreserved?: boolean
+  historicalTerminalEvidence?: boolean
 }
 
 type CommerceIntake = {
@@ -350,6 +394,13 @@ type CommerceIntake = {
     truncated: boolean
     unresolvedTruncated: boolean
   }
+  rejectionSummary?: {
+    scope: string
+    limit: number
+    total: number
+    returned: number
+    truncated: boolean
+  }
   rejections?: Array<{
     globalId: string
     rowVersion: number
@@ -373,11 +424,13 @@ type CommerceIntake = {
     recordsHeld: number
     consecutiveFailures: number
     lastErrorCode: string | null
+    automaticPromotionAttentionRequired: boolean
     lastStartedAt: string | null
     lastCompletedAt: string | null
     resumable: boolean
+    resetRequired: boolean
     providerWrites: 0
-    canonicalOrderWrites: 0
+    canonicalOrderWrites: number
     inventoryWrites: 0
   } | null
 }
@@ -402,7 +455,7 @@ type IntakePayload = {
     result?: unknown
     automaticProductCreation?: AutomaticProductCreationSummary
     productIntake?: ProductIntakePolicy
-  }
+  } & Partial<CustomerPrefetchBindingPlan>
 }
 
 type CartonizationMaterialsPayload = {
@@ -508,6 +561,24 @@ type CustomerDraft = {
   phone: string
 }
 
+type CustomerPrefetchBindingPlan = {
+  action: 'plan-customer-binding'
+  policyVersion: string
+  customerGlobalId: string
+  customerName: string
+  externalCustomerIdHash: string
+  evidenceEmailHash: string
+  matchMethod: 'email'
+  planHash: string
+  confirmationIdempotencyKey: string
+  alreadyBound: boolean
+  existingBindingStatus: 'active' | 'stale' | 'retired' | null
+  requiresConfirmation: true
+  providerReads: 0
+  providerWrites: 0
+  databaseWrites: 0
+}
+
 type AddressDraft = {
   name: string
   line1: string
@@ -525,6 +596,7 @@ type DeliveryDraft = {
 
 type PackageDraft = {
   packageProfileGlobalId: string
+  packProfileVersionGlobalId: string
   measurementSystem: MeasurementSystem
   weight: string
   length: string
@@ -536,6 +608,7 @@ type CommerceIntakeWorkflowProps = {
   accountGlobalId: string
   provider: CommerceProvider
   displayName: string
+  canManage: boolean
   canActivate: boolean
   connectionReady?: boolean
 }
@@ -554,6 +627,7 @@ class IntakeRequestError extends Error {
   constructor(
     message: string,
     readonly code = 'COMMERCE_INTAKE_REQUEST_FAILED',
+    readonly preserveIdempotencyKey = false,
   ) {
     super(message)
     this.name = 'IntakeRequestError'
@@ -759,6 +833,9 @@ function catalogSyncDescription(
   provider: CommerceProvider,
 ) {
   if (!sync || sync.status === 'idle') {
+    if (sync?.historicalTerminalEvidence) {
+      return 'A previous terminal catalog failure remains retained as historical evidence. Its credential or policy fence is no longer current, so it does not block the current eligible reconciliation.'
+    }
     return 'This verified connection authorizes automatic read-only catalog sync. The initial backfill queues when product-read access, the development runtime, and the Operations product target are eligible; no second approval is required.'
   }
   if (sync.status === 'queued') {
@@ -796,11 +873,11 @@ function catalogSyncDescription(
     }.`
   }
   if (sync.status === 'dead') {
-    return `Automatic catalog sync stopped after repeated or permanent connection errors${
+    return `Automatic catalog sync is terminal after repeated or permanent errors${
       sync.lastErrorCode ? ` (${sync.lastErrorCode})` : ''
-    }. Repair the sales-channel connection. While sync remains resumed, ClawPilot rechecks eligibility and queues a fresh reconciliation when every worker fence passes.`
+    }. ClawPilot will not retry the same continuation. Repair the sales-channel connection or Operations eligibility if needed, then an authorized operator must explicitly start a fresh reconciliation. The terminal job and its error evidence remain preserved.`
   }
-  return 'Automatic catalog sync is paused. Existing ClawPilot products and provider mappings are unchanged.'
+  return 'Catalog synchronization is waiting for an eligible connection, Operations target, or worker pass.'
 }
 
 function automaticProductCreationNotice(
@@ -1050,6 +1127,7 @@ function initialPackageDraft(
 ): PackageDraft {
   return {
     packageProfileGlobalId: line.packageProfileGlobalId || '',
+    packProfileVersionGlobalId: line.packProfileVersionGlobalId || '',
     measurementSystem: system,
     weight: line.weightGrams
       ? displayDraftNumber(gramsToDisplayWeight(line.weightGrams, system))
@@ -1094,6 +1172,47 @@ function initialSandboxParcelAssumption(
         )
       : '',
   }
+}
+
+function operationalPackagingMaterialBlockers(
+  material: PackagingMaterial,
+  warehouseGlobalId: string,
+) {
+  const blockers: string[] = []
+  const ratedOuter = material.ratedOuterDimensionsMm
+  if (material.status !== 'active') blockers.push('material is not active')
+  if (
+    !ratedOuter.length
+    || !ratedOuter.width
+    || !ratedOuter.height
+  ) {
+    blockers.push('rated exterior dimensions are incomplete')
+  }
+  if (
+    !['customer_confirmed', 'measured', 'provider'].includes(
+      material.ratedOuterDimensionEvidenceType || '',
+    )
+    || !material.ratedOuterDimensionEvidenceReference
+    || !material.ratedOuterDimensionConfirmedAt
+  ) {
+    blockers.push('factual rated exterior evidence is incomplete')
+  }
+  if (!material.tareWeightGrams || material.tareWeightGrams <= 0) {
+    blockers.push('tare weight is incomplete')
+  }
+  const stock = material.stock.find((item) => (
+    item.warehouseGlobalId === warehouseGlobalId
+  ))
+  if (
+    !stock
+    || stock.warehouseStatus !== 'active'
+    || !stock.isAvailable
+    || !stock.onHandQuantity
+    || stock.onHandQuantity <= 0
+  ) {
+    blockers.push('available warehouse stock is missing')
+  }
+  return blockers
 }
 
 async function readPayload(response: Response): Promise<IntakePayload> {
@@ -1145,6 +1264,7 @@ export default function CommerceIntakeWorkflow({
   accountGlobalId,
   provider,
   displayName,
+  canManage,
   canActivate,
   connectionReady = true,
 }: CommerceIntakeWorkflowProps) {
@@ -1157,6 +1277,14 @@ export default function CommerceIntakeWorkflow({
     useState<WorkbenchTab>('overview')
   const [productSearch, setProductSearch] = useState('')
   const [orderSearch, setOrderSearch] = useState('')
+  const [exactFaireOrderId, setExactFaireOrderId] = useState('')
+  const [faireRetailerId, setFaireRetailerId] = useState('')
+  const [faireRetailerEvidenceEmail, setFaireRetailerEvidenceEmail] =
+    useState('')
+  const [faireRetailerCustomerGlobalId, setFaireRetailerCustomerGlobalId] =
+    useState('')
+  const [faireCustomerBindingPlan, setFaireCustomerBindingPlan] =
+    useState<CustomerPrefetchBindingPlan | null>(null)
   const [issueSearch, setIssueSearch] = useState('')
   const [productFilter, setProductFilter] =
     useState<ProductReviewFilter>('all')
@@ -1266,6 +1394,7 @@ export default function CommerceIntakeWorkflow({
     setWorkbenchTab('overview')
     setProductSearch('')
     setOrderSearch('')
+    setExactFaireOrderId('')
     setIssueSearch('')
     setProductFilter('all')
     setOrderFilter('all')
@@ -1277,6 +1406,10 @@ export default function CommerceIntakeWorkflow({
     setBulkProductProgress(null)
     setBulkRetryProgress(null)
     retryKeys.current.clear()
+    setFaireRetailerId('')
+    setFaireRetailerEvidenceEmail('')
+    setFaireRetailerCustomerGlobalId('')
+    setFaireCustomerBindingPlan(null)
     setProductDrafts({})
     setCatalogProductDrafts({})
     setRejectionReasons({})
@@ -1389,6 +1522,107 @@ export default function CommerceIntakeWorkflow({
     }
   }, [accountGlobalId, loadIntake, pendingAction])
 
+  async function reviewFaireCustomerBinding() {
+    if (pendingAction || !faireRetailerBindingInputValid) return
+    setPendingAction('plan-customer-binding')
+    setError('')
+    setErrorCode('')
+    setNotice('')
+    setFaireCustomerBindingPlan(null)
+    try {
+      const response = await fetch('/api/integrations/commerce/intake', {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accountGlobalId,
+          action: 'plan-customer-binding',
+          idempotencyKey: idempotencyKey(),
+          externalCustomerId: normalizedFaireRetailerId,
+          evidenceEmail: normalizedFaireRetailerEvidenceEmail,
+          customerGlobalId: faireRetailerCustomerGlobalId,
+        }),
+      })
+      const payload = await readPayload(response)
+      const command = payload.command
+      if (
+        command?.action !== 'plan-customer-binding'
+        || typeof command.planHash !== 'string'
+        || typeof command.confirmationIdempotencyKey !== 'string'
+        || typeof command.customerGlobalId !== 'string'
+        || typeof command.customerName !== 'string'
+      ) {
+        throw new Error('ClawPilot did not return a valid binding plan.')
+      }
+      setIntake(payload.intake || null)
+      setFaireCustomerBindingPlan(command as CustomerPrefetchBindingPlan)
+      setNotice(
+        'Binding review completed without reading or writing Faire. Confirm the exact retailer and CRM customer below.',
+      )
+    } catch (requestError) {
+      setError(safeError(requestError))
+      setErrorCode(
+        requestError instanceof IntakeRequestError
+          ? requestError.code
+          : '',
+      )
+    } finally {
+      setPendingAction('')
+    }
+  }
+
+  async function confirmFaireCustomerBinding() {
+    const plan = faireCustomerBindingPlan
+    if (pendingAction || !plan) return
+    if (
+      !window.confirm(
+        `Bind Faire retailer ${normalizedFaireRetailerId} to ${plan.customerName} (${plan.customerGlobalId})? This creates only an audited ClawPilot identity binding and does not read or write Faire.`,
+      )
+    ) return
+    setPendingAction('confirm-customer-binding')
+    setError('')
+    setErrorCode('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/integrations/commerce/intake', {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accountGlobalId,
+          action: 'confirm-customer-binding',
+          idempotencyKey: plan.confirmationIdempotencyKey,
+          externalCustomerId: normalizedFaireRetailerId,
+          evidenceEmail: normalizedFaireRetailerEvidenceEmail,
+          customerGlobalId: plan.customerGlobalId,
+          bindingPlanHash: plan.planHash,
+          confirmCustomerBinding: true,
+        }),
+      })
+      const payload = await readPayload(response)
+      setIntake(payload.intake || null)
+      setFaireCustomerBindingPlan(null)
+      setNotice(
+        'The Faire retailer is now bound to the selected CRM customer. You can safely fetch the exact Faire order.',
+      )
+    } catch (requestError) {
+      if (
+        requestError instanceof IntakeRequestError
+        && requestError.code === 'COMMERCE_CUSTOMER_PREFETCH_PLAN_STALE'
+      ) {
+        setFaireCustomerBindingPlan(null)
+      }
+      setError(safeError(requestError))
+      setErrorCode(
+        requestError instanceof IntakeRequestError
+          ? requestError.code
+          : '',
+      )
+    } finally {
+      setPendingAction('')
+    }
+  }
+
   async function reloadWorkflow() {
     if (pendingAction) return
     setPendingAction('reload')
@@ -1487,6 +1721,26 @@ export default function CommerceIntakeWorkflow({
     || (latestPagination?.resource === 'products' ? latestPagination : null)
   const operatorCommandsAllowed =
     intake?.policy?.operatorCommandsAllowed === true
+  const normalizedExactFaireOrderId = exactFaireOrderId.trim()
+  const exactFaireOrderIdValid = (
+    normalizedExactFaireOrderId.length > 0
+    && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(
+      normalizedExactFaireOrderId,
+    )
+  )
+  const normalizedFaireRetailerId = faireRetailerId.trim()
+  const normalizedFaireRetailerEvidenceEmail =
+    faireRetailerEvidenceEmail.trim().toLowerCase()
+  const faireRetailerBindingInputValid = (
+    normalizedFaireRetailerId.length > 0
+    && normalizedFaireRetailerId.length <= 512
+    && !/[\u0000-\u001f\u007f]/u.test(normalizedFaireRetailerId)
+    && normalizedFaireRetailerEvidenceEmail.length <= 320
+    && /^[^@\s]+@[^@\s]+\.[^@\s]+$/u.test(
+      normalizedFaireRetailerEvidenceEmail,
+    )
+    && Boolean(faireRetailerCustomerGlobalId)
+  )
   const cartonizationEvidenceSafe = Boolean(
     cartonizationPreview?.readOnly === true
     && cartonizationPreview.evidence.databaseWrites === 0
@@ -1502,6 +1756,20 @@ export default function CommerceIntakeWorkflow({
       )
       return material ? [material] : []
     })
+  const promotedWarehousePlanning =
+    cartonizationCandidate?.state === 'promoted'
+  const operationalMaterialBlockers = selectedCartonizationMaterials.flatMap(
+    (material) => operationalPackagingMaterialBlockers(
+      material,
+      selectedCartonizationWarehouseGlobalId,
+    ).map((blocker) => `${material.code}: ${blocker}`),
+  )
+  const operationalRateEvidenceReady = (
+    selectedCartonizationMaterials.length > 0
+    && selectedCartonizationMaterials.length
+      === selectedCartonizationMaterialGlobalIds.length
+    && operationalMaterialBlockers.length === 0
+  )
   const cartonizationShipmentServiceOptions = useMemo(
     () => commonShipmentServiceOptions(
       cartonizationRateEvidence?.packages || [],
@@ -1522,9 +1790,23 @@ export default function CommerceIntakeWorkflow({
   )
     ? productIntakePolicy.revision
     : 0
+  const pendingCatalogRefreshSignals = (
+    provider === 'shopify'
+    && typeof productCatalogSync?.pendingRefreshSignals === 'number'
+    && Number.isSafeInteger(productCatalogSync.pendingRefreshSignals)
+    && productCatalogSync.pendingRefreshSignals > 0
+  )
+    ? productCatalogSync.pendingRefreshSignals
+    : 0
   const futureProductBehaviorMessage = automaticProductCreationEnabled
     ? 'Catalog sync is resumed. When product-read access, the development runtime, and the Operations product target are eligible, ClawPilot reconciles the catalog automatically. Eligible unmatched products are created and mapped; incomplete or unsafe products remain in review.'
-    : 'Catalog sync is paused. Existing products and mappings remain unchanged, and no new provider pages are read until sync is resumed.'
+    : pendingCatalogRefreshSignals > 0
+      ? `${pendingCatalogRefreshSignals} catalog change notification${
+          pendingCatalogRefreshSignals === 1 ? ' is' : 's are'
+        } awaiting read-only reconciliation. Existing mapped products will refresh automatically; unmatched provider products remain in review.`
+      : provider === 'faire'
+        ? 'Faire does not currently provide catalog webhooks; scheduled read-only catalog reconciliation keeps existing mappings current. Unmatched provider products remain in review until an operator maps or creates them.'
+        : 'Read-only catalog reconciliation remains active for existing Shopify mappings. Unmatched provider products remain in review until an operator maps or creates them.'
   useEffect(() => {
     if (
       !workbenchOpen
@@ -1635,7 +1917,11 @@ export default function CommerceIntakeWorkflow({
   const candidatesWithBlockers = candidates.filter(
     (candidate) => (candidate.blockers?.length || 0) > 0,
   )
-  const issueRecordCount = rejections.length + candidatesWithBlockers.length
+  const rejectionSummary = intake?.rejectionSummary
+  const totalRejectionCount = rejectionSummary?.total ?? rejections.length
+  const rejectionReviewTruncated = Boolean(rejectionSummary?.truncated)
+  const issueRecordCount =
+    totalRejectionCount + candidatesWithBlockers.length
   const unresolvedProductCount = productCandidates.filter((candidate) => (
     !terminalStates.has(candidate.state)
     && candidate.mappingStatus !== 'resolved'
@@ -2292,6 +2578,47 @@ export default function CommerceIntakeWorkflow({
     )
   }
 
+  async function resetTerminalProductCatalogSync() {
+    const resetUnmatchedAction = productIntakePolicy?.unmatchedAction
+    if (
+      pendingAction
+      || !operatorCommandsAllowed
+      || !connectionReady
+      || (
+        resetUnmatchedAction !== 'review'
+        && resetUnmatchedAction !== 'auto_create'
+      )
+      || productCatalogSync?.status !== 'dead'
+      || productCatalogSync.terminalRecoveryRequired !== true
+    ) return
+    const errorCode = productCatalogSync.lastErrorCode || 'unknown error'
+    const confirmed = window.confirm(
+      `Start a fresh read-only ${providerLabel(provider)} catalog reconciliation after terminal error ${errorCode}? The failed job and its evidence will be preserved, and ClawPilot will start at the catalog root instead of retrying the old continuation.`,
+    )
+    if (!confirmed) return
+    const resetReason = window.prompt(
+      'Enter the audit reason for superseding this terminal catalog sweep.',
+      `Reviewed terminal catalog sync error ${errorCode}; eligibility is repaired and a fresh root reconciliation is authorized.`,
+    )?.trim()
+    if (!resetReason) return
+    if (resetReason.length < 10 || resetReason.length > 500) {
+      setError('Enter an audit reason between 10 and 500 characters.')
+      return
+    }
+    await postCommand(
+      'set-product-intake-policy',
+      `reset-product-catalog-sync:${productIntakePolicyRevision}:${resetUnmatchedAction}:${errorCode}`,
+      {
+        expectedPolicyRevision: productIntakePolicyRevision,
+        unmatchedAction: resetUnmatchedAction,
+        confirmAutoCreateProducts: resetUnmatchedAction === 'auto_create',
+        confirmCatalogSyncReset: true,
+        catalogSyncResetReason: resetReason,
+      },
+      `A fresh read-only catalog reconciliation was queued for ${displayName}. The terminal job and its evidence were preserved; no order, inventory, or ${providerLabel(provider)} record was changed.`,
+    )
+  }
+
   async function createAllNewCatalogProducts() {
     if (
       pendingAction
@@ -2717,6 +3044,46 @@ export default function CommerceIntakeWorkflow({
     )
   }
 
+  async function bindFaireVariantPack(
+    candidate: IntakeCandidate,
+    line: IntakeLine,
+  ) {
+    const draft = packageDraft(candidate, line)
+    const selectedProduct = productCatalog.find(
+      (product) => product.globalId === line.productGlobalId,
+    )
+    const version = selectedProduct?.packProfileVersions?.find(
+      (profile) => profile.globalId === draft.packProfileVersionGlobalId,
+    )
+    if (
+      provider !== 'faire'
+      || !line.externalProductId
+      || !line.externalVariantId
+      || !version
+    ) return
+    if (!window.confirm(
+      `Read the exact Faire product ${line.externalProductId}, then bind variant ${line.externalVariantId} to ${version.label} (${version.globalId})? This creates a durable exact-variant pack mapping in ClawPilot. It does not write to Faire or create a legacy package profile.`,
+    )) return
+    await postCommand(
+      'resolve-package',
+      `resolve-package-variant-mapping:${candidate.globalId}:${line.globalId}:${version.globalId}`,
+      {
+        candidateGlobalId: candidate.globalId,
+        lineGlobalId: line.globalId,
+        rowVersion: candidate.rowVersion,
+        package: {
+          mode: 'variant_mapping',
+          externalProductId: line.externalProductId,
+          externalVariantId: line.externalVariantId,
+          packProfileVersionGlobalId: version.globalId,
+          expectedPackProfileVersionRowVersion: version.rowVersion,
+          confirmExactProductRead: true,
+        },
+      },
+      `Exact Faire variant mapped to ${version.label}; this order line now uses the same versioned pack evidence.`,
+    )
+  }
+
   async function resolveManualPackage(
     candidate: IntakeCandidate,
     line: IntakeLine,
@@ -2790,6 +3157,10 @@ export default function CommerceIntakeWorkflow({
         throw new Error(payload.error || 'Packaging materials could not be loaded.')
       }
       const materials = payload.packagingMaterials.materials
+      const activeWarehouseGlobalId =
+        payload.packagingMaterials.warehouses.find(
+          (warehouse) => warehouse.status === 'active',
+        )?.globalId || ''
       const eligible = materials.filter(
         (material) => material.readiness.eligibleForCartonization,
       )
@@ -2806,19 +3177,33 @@ export default function CommerceIntakeWorkflow({
         && material.innerDimensionsMm.width
         && material.innerDimensionsMm.height
       ))
+      const operationalMaterials = activeWarehouseGlobalId
+        ? materials.filter((material) => (
+            operationalPackagingMaterialBlockers(
+              material,
+              activeWarehouseGlobalId,
+            ).length === 0
+          ))
+        : []
+      const operationalAg12v2Material = operationalMaterials.find(
+        (material) => material.code.trim().toUpperCase() === 'AG12V2',
+      )
       const recommendedMaterial = (
-        ag12v2Material
-        || completeCustomerMaterial
-        || eligible[0]
-        || null
+        candidate.state === 'promoted'
+          ? operationalAg12v2Material
+            || operationalMaterials[0]
+            || eligible[0]
+            || ag12v2Material
+            || completeCustomerMaterial
+            || null
+          : ag12v2Material
+            || completeCustomerMaterial
+            || eligible[0]
+            || null
       )
       setCartonizationMaterials(materials)
       setCartonizationWarehouses(payload.packagingMaterials.warehouses)
-      setSelectedCartonizationWarehouseGlobalId(
-        payload.packagingMaterials.warehouses.find(
-          (warehouse) => warehouse.status === 'active',
-        )?.globalId || '',
-      )
+      setSelectedCartonizationWarehouseGlobalId(activeWarehouseGlobalId)
       setSelectedCartonizationMaterialGlobalIds(
         recommendedMaterial ? [recommendedMaterial.globalId] : [],
       )
@@ -2855,9 +3240,15 @@ export default function CommerceIntakeWorkflow({
 
   async function runCartonizationPreview() {
     const candidate = cartonizationCandidate
-    if (!canActivate || !operatorCommandsAllowed) {
+    if (!canManage || !operatorCommandsAllowed) {
       setCartonizationError(
         'Organization manager or administrator permission is required to run a pack-plan preview.',
+      )
+      return
+    }
+    if (candidate?.state === 'promoted') {
+      setCartonizationError(
+        'Fit-only preview is unavailable after an order is added to ClawPilot. Select current factual warehouse and packaging data, then use Save operational pack facts for warehouse planning.',
       )
       return
     }
@@ -2929,9 +3320,15 @@ export default function CommerceIntakeWorkflow({
 
   async function createCartonizationRateEvidence() {
     const candidate = cartonizationCandidate
-    if (!canActivate || !operatorCommandsAllowed) {
+    if (!canManage || !operatorCommandsAllowed) {
       setCartonizationError(
         'Organization manager or administrator permission is required to compare carrier rates.',
+      )
+      return
+    }
+    if (candidate?.state === 'promoted') {
+      setCartonizationError(
+        'Assumption-backed sandbox comparison is unavailable after an order is added to ClawPilot. Correct the warehouse, product packing profile, or packaging material master data, then use Save operational pack facts.',
       )
       return
     }
@@ -3049,59 +3446,156 @@ export default function CommerceIntakeWorkflow({
     setCartonizationLoading(true)
     setCartonizationError('')
     setCartonizationRateEvidence(null)
+    const command = {
+      evidenceMode: 'assumption_backed_sandbox' as const,
+      accountGlobalId,
+      candidateGlobalId: candidate.globalId,
+      expectedCandidateRowVersion: candidate.rowVersion,
+      warehouseGlobalId: selectedCartonizationWarehouseGlobalId,
+      selectedMaterials: selectedMaterialsWithAssumptions,
+      assumedCommittedQuantities: (candidate.lines || [])
+        .filter((line) => line.requiresShipping && line.quantity > 0)
+        .map((line) => ({
+          lineGlobalId: line.globalId,
+          quantity: Number(assumedCommittedByLine[line.globalId] || 0),
+        })),
+      sandboxAssumptions: {
+        acknowledged: true,
+        reason: assumptionReason,
+        allowUnderMinimum: allowSandboxMinimumOverride,
+        assumedMinimumInputQuantity: allowSandboxMinimumOverride
+          ? 1
+          : null,
+      },
+    }
+    const retryKey =
+      `cartonization-rate-evidence:${JSON.stringify(command)}`
+    const stableIdempotencyKey = retryKeys.current.get(retryKey)
+      || idempotencyKey()
+    retryKeys.current.set(retryKey, stableIdempotencyKey)
     try {
-      const idempotencyKey = [
-        'cartonization-rate',
-        candidate.globalId,
-        candidate.rowVersion,
-        typeof crypto !== 'undefined' && 'randomUUID' in crypto
-          ? crypto.randomUUID()
-          : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-      ].join(':')
       const response = await fetch(
         '/api/integrations/commerce/intake/cartonization-rate-evidence',
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            accountGlobalId,
-            candidateGlobalId: candidate.globalId,
-            expectedCandidateRowVersion: candidate.rowVersion,
-            warehouseGlobalId: selectedCartonizationWarehouseGlobalId,
-            selectedMaterials: selectedMaterialsWithAssumptions,
-            assumedCommittedQuantities: (candidate.lines || [])
-              .filter((line) => line.requiresShipping && line.quantity > 0)
-              .map((line) => ({
-                lineGlobalId: line.globalId,
-                quantity: Number(assumedCommittedByLine[line.globalId] || 0),
-              })),
-            sandboxAssumptions: {
-              acknowledged: true,
-              reason: assumptionReason,
-              allowUnderMinimum: allowSandboxMinimumOverride,
-              assumedMinimumInputQuantity: allowSandboxMinimumOverride
-                ? 1
-                : null,
-            },
-            idempotencyKey,
+            ...command,
+            idempotencyKey: stableIdempotencyKey,
           }),
         },
       )
       const payload = await response.json().catch(() => ({})) as
         CartonizationRateEvidencePayload
       if (!response.ok || !payload.ok || !payload.evidence) {
-        throw new Error(
-          `${payload.error || 'Pack and carrier-rate evidence failed.'}${
-            payload.code ? ` [${payload.code}]` : ''
-          }`,
+        const explicitApplicationFailure =
+          typeof payload.code === 'string' && payload.code.trim().length > 0
+        throw new IntakeRequestError(
+          payload.error || 'Pack and carrier-rate evidence failed.',
+          payload.code,
+          response.status >= 500
+            || !explicitApplicationFailure
+            || payload.code === 'CARTONIZATION_RATE_EVIDENCE_IN_PROGRESS',
         )
       }
+      retryKeys.current.delete(retryKey)
       setCartonizationRateEvidence(payload.evidence)
     } catch (caught) {
+      if (
+        caught instanceof IntakeRequestError
+        && !caught.preserveIdempotencyKey
+      ) {
+        retryKeys.current.delete(retryKey)
+      }
       setCartonizationError(
-        caught instanceof Error
-          ? caught.message
-          : 'Pack and carrier-rate evidence failed.',
+        caught instanceof IntakeRequestError
+          ? `${caught.message} [${caught.code}]`
+          : caught instanceof Error
+            ? caught.message
+            : 'Pack and carrier-rate evidence failed.',
+      )
+    } finally {
+      setCartonizationLoading(false)
+    }
+  }
+
+  async function createOperationalCartonizationRateEvidence() {
+    const candidate = cartonizationCandidate
+    if (!canManage || !operatorCommandsAllowed) {
+      setCartonizationError(
+        'Organization manager or administrator permission is required to save operational pack evidence.',
+      )
+      return
+    }
+    if (!candidate || !selectedCartonizationWarehouseGlobalId) return
+    if (!operationalRateEvidenceReady) {
+      setCartonizationError(
+        operationalMaterialBlockers[0]
+          || 'Select active, stocked packaging with factual rated exterior measurements and tare.',
+      )
+      return
+    }
+    setCartonizationLoading(true)
+    setCartonizationError('')
+    setCartonizationRateEvidence(null)
+    const command = {
+      evidenceMode: 'operational' as const,
+      accountGlobalId,
+      candidateGlobalId: candidate.globalId,
+      expectedCandidateRowVersion: candidate.rowVersion,
+      warehouseGlobalId: selectedCartonizationWarehouseGlobalId,
+      selectedMaterials: selectedCartonizationMaterials.map(
+        (material) => ({
+          materialGlobalId: material.globalId,
+          expectedRowVersion: material.rowVersion,
+        }),
+      ),
+    }
+    const retryKey =
+      `cartonization-rate-evidence:${JSON.stringify(command)}`
+    const stableIdempotencyKey = retryKeys.current.get(retryKey)
+      || idempotencyKey()
+    retryKeys.current.set(retryKey, stableIdempotencyKey)
+    try {
+      const response = await fetch(
+        '/api/integrations/commerce/intake/cartonization-rate-evidence',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...command,
+            idempotencyKey: stableIdempotencyKey,
+          }),
+        },
+      )
+      const payload = await response.json().catch(() => ({})) as
+        CartonizationRateEvidencePayload
+      if (!response.ok || !payload.ok || !payload.evidence) {
+        const explicitApplicationFailure =
+          typeof payload.code === 'string' && payload.code.trim().length > 0
+        throw new IntakeRequestError(
+          payload.error || 'Operational pack and rate evidence failed.',
+          payload.code,
+          response.status >= 500
+            || !explicitApplicationFailure
+            || payload.code === 'CARTONIZATION_RATE_EVIDENCE_IN_PROGRESS',
+        )
+      }
+      retryKeys.current.delete(retryKey)
+      setCartonizationRateEvidence(payload.evidence)
+    } catch (caught) {
+      if (
+        caught instanceof IntakeRequestError
+        && !caught.preserveIdempotencyKey
+      ) {
+        retryKeys.current.delete(retryKey)
+      }
+      setCartonizationError(
+        caught instanceof IntakeRequestError
+          ? `${caught.message} [${caught.code}]`
+          : caught instanceof Error
+            ? caught.message
+            : 'Operational pack and rate evidence failed.',
       )
     } finally {
       setCartonizationLoading(false)
@@ -3164,9 +3658,9 @@ export default function CommerceIntakeWorkflow({
                   Import products and orders
                 </Typography>
                 <Typography variant="body2" color="text.secondary">
-                  {automaticProductCreationEnabled
-                    ? `The connected ${providerLabel(provider)} catalog syncs automatically. Use this workspace to monitor progress and resolve only the products or orders that need a decision.`
-                    : `${providerLabel(provider)} catalog sync is paused. Existing imported records remain available for review.`}
+                  The connected {providerLabel(provider)} catalog synchronizes
+                  automatically. Use this workspace to monitor progress and
+                  resolve only unmatched products or orders that need a decision.
                 </Typography>
               </Box>
               <Button
@@ -3380,9 +3874,11 @@ export default function CommerceIntakeWorkflow({
             </CardContent>
           </Card>
           <Alert severity="info">
-            {automaticProductCreationEnabled
-              ? `Your verified ${providerLabel(provider)} connection authorizes automatic read-only product synchronization with no second approval. When product-read access, the development runtime, and the Operations product target are eligible, ClawPilot follows every catalog page and creates safe product records; only exceptions need review.`
-              : `${providerLabel(provider)} product synchronization is paused. Resume it below when you want ClawPilot to continue reading catalog pages.`}{' '}
+            Your verified {providerLabel(provider)} connection authorizes
+            automatic read-only product synchronization with no second approval.
+            Existing mappings refresh from every catalog sweep; whether unmatched
+            provider products are created automatically or retained for review is
+            controlled separately below.{' '}
             It cannot change {providerLabel(provider)}, change an order,
             reserve inventory, or export fulfillment. Credentials and provider
             tokens are never returned here.
@@ -3398,25 +3894,34 @@ export default function CommerceIntakeWorkflow({
                 >
                   <Box>
                     <Typography variant="subtitle2" fontWeight={700}>
-                      Automatic current-order staging
+                      Automatic current-order intake
                     </Typography>
                     <Typography variant="body2" color="text.secondary">
                       {orderReconciliation?.status === 'running'
                         ? `ClawPilot is reading current ${providerLabel(provider)} orders now.`
                         : orderReconciliation?.status === 'succeeded'
-                          ? `The latest read-only order check completed${
-                            orderReconciliation.lastCompletedAt
-                              ? ` ${formatDate(
-                                orderReconciliation.lastCompletedAt,
-                              )}`
-                              : ''
-                          }.`
+                          ? orderReconciliation
+                            .automaticPromotionAttentionRequired
+                            ? `The provider read completed, but automatic local Faire order promotion needs attention${
+                              orderReconciliation.lastErrorCode
+                                ? ` (${orderReconciliation.lastErrorCode})`
+                                : ''
+                            }.`
+                            : `The latest provider-read order check completed${
+                              orderReconciliation.lastCompletedAt
+                                ? ` ${formatDate(
+                                  orderReconciliation.lastCompletedAt,
+                                )}`
+                                : ''
+                            }.`
                           : orderReconciliation?.status === 'failed'
                             ? `The latest read-only order check failed${
                               orderReconciliation.lastErrorCode
                                 ? ` (${orderReconciliation.lastErrorCode})`
                                 : ''
-                            }. Review the verified connection and order-read scope, then return here; ClawPilot retries automatically.`
+                            }. ${orderReconciliation.resetRequired
+                              ? 'Review the connection and error, then explicitly restart automatic staging below. ClawPilot will not reuse the terminal continuation.'
+                              : 'ClawPilot will retry automatically after its bounded backoff; only persistent failures require operator action.'}`
                             : `ClawPilot is ready to check current ${providerLabel(provider)} orders automatically when the verified order-read scope and Operations Shadow or Active mode are available.`}
                     </Typography>
                   </Box>
@@ -3424,6 +3929,8 @@ export default function CommerceIntakeWorkflow({
                     size="small"
                     color={
                       orderReconciliation?.status === 'failed'
+                      || orderReconciliation
+                        ?.automaticPromotionAttentionRequired
                         ? 'warning'
                         : orderReconciliation?.status === 'running'
                           ? 'info'
@@ -3447,6 +3954,15 @@ export default function CommerceIntakeWorkflow({
                       orderReconciliation?.recordsHeld || 0
                     } held or rejected for review`}
                   />
+                  {orderReconciliation?.canonicalOrderWrites ? (
+                    <Chip
+                      size="small"
+                      color="success"
+                      label={`${
+                        orderReconciliation.canonicalOrderWrites
+                      } orders promoted automatically`}
+                    />
+                  ) : null}
                   {orderReconciliation?.resumable ? (
                     <Chip
                       size="small"
@@ -3460,12 +3976,59 @@ export default function CommerceIntakeWorkflow({
                   />
                 </Stack>
                 <Typography variant="caption" color="text.secondary">
-                  Staging preserves source order facts for review. It does not
-                  create a ClawPilot order, reserve inventory, select packaging,
-                  create a shipment, or write back to the provider.
+                  Provider reads remain read-only. Fresh, unambiguous Faire
+                  orders may be promoted locally into ClawPilot automatically;
+                  held records remain available for review. This step does not
+                  reserve inventory, create shipments, or write back to the
+                  provider.
                 </Typography>
+                {orderReconciliation
+                  ?.automaticPromotionAttentionRequired ? (
+                    <Alert severity="warning">
+                      The provider read succeeded, but at least one automatic
+                      Faire order promotion failed. Review the held order and
+                      its error before fulfillment.
+                    </Alert>
+                  ) : null}
                 {orderReconciliation?.status === 'failed' ? (
-                  <Stack direction="row" spacing={1}>
+                  <Stack
+                    direction={{ xs: 'column', sm: 'row' }}
+                    spacing={1}
+                  >
+                    {orderReconciliation.resetRequired
+                      && orderReconciliation.lastErrorCode
+                      && orderReconciliation.lastStartedAt ? (
+                        <Button
+                          size="small"
+                          variant="contained"
+                          disabled={
+                            Boolean(pendingAction)
+                            || !operatorCommandsAllowed
+                          }
+                          onClick={() => void postCommand(
+                            'reset-order-reconciliation',
+                            `reset-order-reconciliation:${
+                              orderReconciliation.lastStartedAt
+                            }:${orderReconciliation.lastErrorCode}`,
+                            {
+                              confirmResetOrderReconciliation: true,
+                              expectedLastErrorCode:
+                                orderReconciliation.lastErrorCode,
+                              expectedLastStartedAt:
+                                orderReconciliation.lastStartedAt,
+                              orderReconciliationResetReason:
+                                'Operator reviewed the terminal read-only order staging failure and requested a fresh root session.',
+                            },
+                            'Automatic order staging was restarted with a fresh root session.',
+                          )}
+                        >
+                          {pendingAction.startsWith(
+                            'reset-order-reconciliation:',
+                          )
+                            ? 'Restarting…'
+                            : 'Restart automatic staging'}
+                        </Button>
+                      ) : null}
                     <Button
                       size="small"
                       variant="outlined"
@@ -3848,7 +4411,9 @@ export default function CommerceIntakeWorkflow({
                     onClick={downloadIssueSummaryCsv}
                     sx={actionButtonSx}
                   >
-                    Export provider issues CSV
+                    {rejectionReviewTruncated
+                      ? 'Export loaded issues CSV'
+                      : 'Export provider issues CSV'}
                   </Button>
                   <TextField
                     label="Search issues"
@@ -3861,6 +4426,14 @@ export default function CommerceIntakeWorkflow({
                   />
                 </Stack>
               </Stack>
+              {rejectionReviewTruncated ? (
+                <Alert severity="info">
+                  Showing the newest {rejectionSummary?.returned ?? 0} of{' '}
+                  {totalRejectionCount} current provider rejections. The issue
+                  total includes every current provider identity; search,
+                  recovery actions, and CSV export apply to the loaded subset.
+                </Alert>
+              ) : null}
               {candidateBlockerGroups.length ? (
                 <Box
                   sx={{
@@ -4335,26 +4908,18 @@ export default function CommerceIntakeWorkflow({
                           'set-product-intake-policy:',
                         )
                           ? 'Saving…'
-                          : `Catalog control: ${
+                          : `Unmatched products: ${
                               automaticProductCreationEnabled
-                                ? 'Resumed'
-                                : 'Paused'
+                                ? 'Auto-create'
+                                : 'Review'
                             }`
                       }
                     />
                     <Chip
                       size="small"
-                      color={
-                        automaticProductCreationEnabled
-                          ? catalogSyncColor(productCatalogSync)
-                          : 'default'
-                      }
+                      color={catalogSyncColor(productCatalogSync)}
                       variant="outlined"
-                      label={
-                        automaticProductCreationEnabled
-                          ? catalogSyncLabel(productCatalogSync)
-                          : 'Sync paused'
-                      }
+                      label={catalogSyncLabel(productCatalogSync)}
                     />
                   </Stack>
                 </Stack>
@@ -4382,26 +4947,28 @@ export default function CommerceIntakeWorkflow({
                       }}
                       inputProps={{
                         'aria-label':
-                          'Pause or resume product catalog sync',
+                          'Automatically create unmatched provider products',
                       }}
                     />
                   )}
                   label={(
                     <Box>
                       <Typography fontWeight={700}>
-                        Pause or resume product catalog sync
+                        Automatically create unmatched provider products
                       </Typography>
                       <Typography variant="body2" color="text.secondary">
                         The verified sales-channel connection is the
                         authorization for automatic read-only catalog sync; no
-                        second approval is required. When product-read access,
-                        the development runtime, and the Operations product
-                        target are eligible, ClawPilot queues a full
-                        reconciliation. Pause stops future provider reads and
-                        automatic creation; resume makes the connection
-                        eligible to queue again. Existing products and mappings
-                        remain unchanged while paused. ClawPilot never writes
-                        to {providerLabel(provider)} or changes an order.
+                        second approval is required. Catalog reads continue in
+                        either mode so existing provider mappings stay current.
+                        Turn this on to create and map safe unmatched products
+                        automatically; turn it off to retain unmatched products
+                        for operator review without pausing catalog reads. A
+                        terminal sweep is not retried by repairing eligibility
+                        alone; an authorized operator must explicitly start a
+                        fresh reconciliation.
+                        ClawPilot never writes to {providerLabel(provider)} or
+                        changes an order.
                       </Typography>
                       <Typography
                         variant="caption"
@@ -4457,11 +5024,50 @@ export default function CommerceIntakeWorkflow({
                           : 'info'
                   }
                 >
-                  {automaticProductCreationEnabled
-                    ? catalogSyncDescription(productCatalogSync, provider)
-                    : futureProductBehaviorMessage}
+                  {catalogSyncDescription(productCatalogSync, provider)}{' '}
+                  {futureProductBehaviorMessage}
                 </Alert>
-                {automaticProductCreationEnabled && productCatalogSync ? (
+                {productCatalogSync?.terminalRecoveryRequired ? (
+                  <Stack
+                    direction={{ xs: 'column', sm: 'row' }}
+                    alignItems={{ sm: 'center' }}
+                    spacing={1}
+                  >
+                    <Button
+                      variant="contained"
+                      color="error"
+                      startIcon={(
+                        pendingAction.startsWith(
+                          'reset-product-catalog-sync:',
+                        )
+                          ? <CircularProgress size={16} color="inherit" />
+                          : <RefreshRounded />
+                      )}
+                      disabled={
+                        Boolean(pendingAction)
+                        || !operatorCommandsAllowed
+                        || !connectionReady
+                      }
+                      onClick={() => {
+                        void resetTerminalProductCatalogSync()
+                      }}
+                    >
+                      {pendingAction.startsWith(
+                        'reset-product-catalog-sync:',
+                      )
+                        ? 'Starting fresh…'
+                        : 'Start fresh reconciliation'}
+                    </Button>
+                    <Typography variant="caption" color="text.secondary">
+                      {!connectionReady
+                        ? `Reconnect and verify ${providerLabel(provider)} first. Repairing the connection does not itself restart this terminal sweep.`
+                        : !operatorCommandsAllowed
+                          ? 'Set Operations to Shadow or Active first. Repairing eligibility does not itself restart this terminal sweep.'
+                          : 'This confirmed action advances the policy fence, queues a new root read, and retains the terminal job as evidence.'}
+                    </Typography>
+                  </Stack>
+                  ) : null}
+                {productCatalogSync ? (
                   <Stack direction="row" gap={0.75} flexWrap="wrap">
                     <Chip
                       size="small"
@@ -4488,6 +5094,16 @@ export default function CommerceIntakeWorkflow({
                       variant="outlined"
                       label={`${productCatalogSync.productsUnchanged || 0} unchanged`}
                     />
+                    {productCatalogSync.status === 'dead' ? (
+                      <Chip
+                        size="small"
+                        color="error"
+                        variant="outlined"
+                        label={`Terminal failures ${
+                          productCatalogSync.sweepFailureCount || 0
+                        }/${productCatalogSync.maxAttempts || 0}`}
+                      />
+                    ) : null}
                     <Chip
                       size="small"
                       variant="outlined"
@@ -4832,6 +5448,23 @@ export default function CommerceIntakeWorkflow({
                               {candidate.productType || 'unavailable'} · barcode{' '}
                               {candidate.barcode || 'unavailable'}
                             </Typography>
+                            {candidate.providerTaxonomy ? (
+                              <Typography
+                                variant="caption"
+                                color="text.secondary"
+                                display="block"
+                              >
+                                {candidate.providerTaxonomy.scheme ===
+                                'shopify_standard_product_taxonomy'
+                                  ? 'Shopify category'
+                                  : 'Faire product type'}
+                                :{' '}
+                                {candidate.providerTaxonomy.fullName
+                                  || candidate.providerTaxonomy.name
+                                  || candidate.providerTaxonomy.externalId
+                                  || 'Unavailable'}
+                              </Typography>
+                            ) : null}
                             {candidate.externalInventoryItemId ? (
                               <Typography
                                 variant="caption"
@@ -5264,11 +5897,213 @@ export default function CommerceIntakeWorkflow({
             </Stack>
           </Stack>
 
+          {provider === 'faire' ? (
+            <Card variant="outlined">
+              <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+                <Stack spacing={1.5}>
+                  <Box>
+                    <Typography fontWeight={700}>
+                      Bind a Faire retailer before the first order read
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      Use this when Faire omits the retailer email from the
+                      order payload. Review verifies the supplied evidence
+                      against exactly one active CRM customer without reading
+                      or writing Faire. Confirmation creates only an audited
+                      ClawPilot identity binding.
+                    </Typography>
+                  </Box>
+                  <Stack
+                    direction={{ xs: 'column', md: 'row' }}
+                    spacing={1}
+                    alignItems={{ md: 'flex-start' }}
+                  >
+                    <TextField
+                      label="Faire retailer ID"
+                      value={faireRetailerId}
+                      onChange={(event) => {
+                        setFaireRetailerId(event.target.value.slice(0, 512))
+                        setFaireCustomerBindingPlan(null)
+                      }}
+                      placeholder="r_ngjpc26v9m"
+                      helperText="Use the immutable retailer identity returned by Faire."
+                      inputProps={{ maxLength: 512 }}
+                      sx={{ ...fieldSx, flex: 1 }}
+                    />
+                    <TextField
+                      label="Retailer evidence email"
+                      type="email"
+                      value={faireRetailerEvidenceEmail}
+                      onChange={(event) => {
+                        setFaireRetailerEvidenceEmail(
+                          event.target.value.slice(0, 320),
+                        )
+                        setFaireCustomerBindingPlan(null)
+                      }}
+                      helperText="Enter the exact email shown in trusted retailer evidence."
+                      inputProps={{ maxLength: 320 }}
+                      sx={{ ...fieldSx, flex: 1 }}
+                    />
+                    <FormControl sx={{ ...fieldSx, flex: 1 }}>
+                      <InputLabel>Existing CRM customer</InputLabel>
+                      <Select
+                        label="Existing CRM customer"
+                        value={faireRetailerCustomerGlobalId}
+                        onChange={(event) => {
+                          setFaireRetailerCustomerGlobalId(event.target.value)
+                          setFaireCustomerBindingPlan(null)
+                        }}
+                      >
+                        <MenuItem value="">Select a customer</MenuItem>
+                        {customerCatalog.map((entry) => (
+                          <MenuItem key={entry.globalId} value={entry.globalId}>
+                            {entry.name}
+                            {entry.email ? ` · ${entry.email}` : ''}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    <Button
+                      variant="outlined"
+                      disabled={
+                        Boolean(pendingAction)
+                        || !canManage
+                        || !operatorCommandsAllowed
+                        || !faireRetailerBindingInputValid
+                      }
+                      onClick={() => void reviewFaireCustomerBinding()}
+                      sx={actionButtonSx}
+                    >
+                      {pendingAction === 'plan-customer-binding'
+                        ? 'Reviewing…'
+                        : 'Review binding'}
+                    </Button>
+                  </Stack>
+                  {faireCustomerBindingPlan ? (
+                    <Alert
+                      severity={
+                        faireCustomerBindingPlan.alreadyBound
+                          ? 'success'
+                          : 'warning'
+                      }
+                    >
+                      <Stack spacing={1}>
+                        <Typography variant="body2">
+                          Faire retailer evidence resolves uniquely to{' '}
+                          <strong>
+                            {faireCustomerBindingPlan.customerName}
+                          </strong>{' '}
+                          ({faireCustomerBindingPlan.customerGlobalId}).
+                          Provider reads: 0; provider writes: 0; database
+                          writes during review: 0.
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          Review fingerprint{' '}
+                          {faireCustomerBindingPlan.planHash.slice(0, 12)}…
+                        </Typography>
+                        <Box>
+                          <Button
+                            variant="contained"
+                            disabled={
+                              Boolean(pendingAction)
+                              || !canManage
+                              || !operatorCommandsAllowed
+                            }
+                            onClick={() => {
+                              void confirmFaireCustomerBinding()
+                            }}
+                            sx={actionButtonSx}
+                          >
+                            {pendingAction === 'confirm-customer-binding'
+                              ? 'Confirming…'
+                              : faireCustomerBindingPlan.alreadyBound
+                                ? 'Verify exact binding'
+                                : 'Confirm exact binding'}
+                          </Button>
+                        </Box>
+                      </Stack>
+                    </Alert>
+                  ) : null}
+                </Stack>
+              </CardContent>
+            </Card>
+          ) : null}
+
+          {provider === 'faire' ? (
+            <Card variant="outlined">
+              <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+                <Stack spacing={1.25}>
+                  <Box>
+                    <Typography fontWeight={700}>
+                      Find one exact Faire order
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      Use the immutable provider ID from the Faire order URL
+                      (for example, bo_b78sny28px). ClawPilot performs one
+                      read-only lookup and creates no provider, inventory, or
+                      fulfillment writes.
+                    </Typography>
+                  </Box>
+                  <Stack
+                    direction={{ xs: 'column', sm: 'row' }}
+                    spacing={1}
+                    alignItems={{ sm: 'flex-start' }}
+                  >
+                    <TextField
+                      label="Faire provider order ID"
+                      value={exactFaireOrderId}
+                      onChange={(event) => {
+                        setExactFaireOrderId(event.target.value.slice(0, 128))
+                      }}
+                      placeholder="bo_b78sny28px"
+                      helperText="This is the bo_… ID in the brand-portal order URL, not the display order number."
+                      inputProps={{ maxLength: 128 }}
+                      sx={{ ...fieldSx, flex: 1 }}
+                    />
+                    <Button
+                      variant="outlined"
+                      startIcon={<CloudDownloadRounded />}
+                      disabled={
+                        Boolean(pendingAction)
+                        || !operatorCommandsAllowed
+                        || !exactFaireOrderIdValid
+                      }
+                      onClick={() => {
+                        setOrderSearch(normalizedExactFaireOrderId)
+                        setOrderFilter('all')
+                        setOrderPage(0)
+                        void postCommand(
+                          'fetch',
+                          `fetch-exact-faire-order:${
+                            normalizedExactFaireOrderId
+                          }`,
+                          {
+                            confirmReadOnly: true,
+                            externalOrderId: normalizedExactFaireOrderId,
+                          },
+                          'The exact Faire order was read. A fresh, unambiguous order is added to ClawPilot automatically; otherwise review its held result below.',
+                        )
+                      }}
+                      sx={actionButtonSx}
+                    >
+                      {pendingAction === `fetch-exact-faire-order:${
+                        normalizedExactFaireOrderId
+                      }`
+                        ? 'Finding…'
+                        : 'Find exact order'}
+                    </Button>
+                  </Stack>
+                </Stack>
+              </CardContent>
+            </Card>
+          ) : null}
+
           {!orderPagination && candidates.length === 0 ? (
             <Alert severity="info">
               Select <strong>Fetch operational orders</strong> to find orders
-              for review. Nothing is added to ClawPilot until a ready order is
-              explicitly approved.
+              for intake. Provider reads are read-only. Fresh, unambiguous
+              Faire orders may be added to ClawPilot automatically; other
+              records remain held for review.
             </Alert>
           ) : candidates.length === 0 ? (
             <Alert severity="info">
@@ -5291,6 +6126,11 @@ export default function CommerceIntakeWorkflow({
                 const refreshLocked = (
                   !Number.isInteger(candidate.rowVersion)
                   || candidate.state === 'promoted'
+                  || candidate.state === 'expired'
+                )
+                const packPlanningLocked = (
+                  !Number.isInteger(candidate.rowVersion)
+                  || candidate.state === 'failed'
                   || candidate.state === 'expired'
                 )
                 const address = candidate.shipTo?.address
@@ -5365,10 +6205,15 @@ export default function CommerceIntakeWorkflow({
                               label={candidate.headerMoney?.unavailableFields
                                 .includes('total')
                                 ? 'Header total unavailable'
-                                : formatMoney(
-                                  candidate.totalMinor,
-                                  candidate.currency,
-                                )}
+                                : provider === 'faire'
+                                  ? `Brand-side amount ${formatMoney(
+                                    candidate.totalMinor,
+                                    candidate.currency,
+                                  )}`
+                                  : formatMoney(
+                                    candidate.totalMinor,
+                                    candidate.currency,
+                                  )}
                             />
                             {candidate.headerMoney?.unavailableFields
                               .includes('shipping') ? (
@@ -5452,6 +6297,40 @@ export default function CommerceIntakeWorkflow({
                             {' '}was created.
                           </Alert>
                         ) : null}
+                        {candidate.checkoutRateReconciliation ? (
+                          <Alert
+                            severity={
+                              candidate.checkoutRateReconciliation
+                                .lineageRequired === false
+                                ? 'info'
+                                : candidate.checkoutRateReconciliation
+                                .fulfillmentEligible
+                                ? 'success'
+                                : 'warning'
+                            }
+                          >
+                            Shopify checkout quote{' '}
+                            {candidate.checkoutRateReconciliation.outcome
+                              ? humanize(
+                                  candidate.checkoutRateReconciliation.outcome,
+                                )
+                              : 'Pending'}
+                            {candidate.checkoutRateReconciliation
+                              .receiptGlobalId
+                              ? ` · receipt ${
+                                  candidate.checkoutRateReconciliation
+                                    .receiptGlobalId
+                                }`
+                              : ''}
+                            {candidate.checkoutRateReconciliation
+                              .lineageRequired === false
+                              ? '. The selected Shopify shipping method does not require ClawPilot quote lineage.'
+                              : !candidate.checkoutRateReconciliation
+                                  .fulfillmentEligible
+                                ? '. Warehouse release remains blocked until the immutable checkout quote lineage is matched.'
+                                : '. Fulfillment lineage is verified.'}
+                          </Alert>
+                        ) : null}
                         {candidate.unsupportedReason ? (
                           <Alert severity="warning">
                             Unsupported: {candidate.unsupportedReason}
@@ -5471,6 +6350,17 @@ export default function CommerceIntakeWorkflow({
                             order-time line prices. This order is blocked from
                             accounting and customer-charge use; missing
                             shipping or totals are never estimated.
+                          </Alert>
+                          ) : null}
+                        {provider === 'faire'
+                        && candidate.headerMoney?.state === 'complete'
+                        && candidate.headerMoney.customerChargeEligible
+                          === false ? (
+                          <Alert severity="info">
+                            Faire exposes brand-side order and payout facts, but
+                            not retailer-funded credits or tender charges. The
+                            amount above and a Paid status are therefore not
+                            labeled as what the retailer paid.
                           </Alert>
                           ) : null}
 
@@ -5531,6 +6421,21 @@ export default function CommerceIntakeWorkflow({
                                 )
                                 const packageProfiles =
                                   selectedProduct?.packageProfiles || []
+                                const packProfileVersions =
+                                  selectedProduct?.packProfileVersions || []
+                                const matchingPackProfileVersions =
+                                  packProfileVersions.filter((profile) => (
+                                    line.unitMultiplier ===
+                                      profile.baseEachQuantity
+                                  ))
+                                const exactFairePackBindingAvailable = (
+                                  provider === 'faire'
+                                  && line.mappingStatus === 'resolved'
+                                  && Boolean(line.productGlobalId)
+                                  && Boolean(line.externalProductId)
+                                  && Boolean(line.externalVariantId)
+                                  && !line.commerceVariantPackMappingGlobalId
+                                )
                                 const manualPackageValid = [
                                   packaging.weight,
                                   packaging.length,
@@ -5819,6 +6724,128 @@ export default function CommerceIntakeWorkflow({
                                                   : ' · package resolution still requires review'}
                                               </Alert>
                                             ) : null}
+                                          {exactFairePackBindingAvailable ? (
+                                            matchingPackProfileVersions.length ? (
+                                              <Stack spacing={1}>
+                                                <Alert severity="info">
+                                                  This mapped Faire variant has
+                                                  no exact versioned pack rule.
+                                                  ClawPilot can read the
+                                                  immutable Faire product now,
+                                                  retain that product evidence,
+                                                  and bind one current Product
+                                                  pack version for this and
+                                                  future orders. Faire will not
+                                                  be changed.
+                                                </Alert>
+                                                <Stack
+                                                  direction={{
+                                                    xs: 'column',
+                                                    sm: 'row',
+                                                  }}
+                                                  spacing={1}
+                                                  alignItems={{
+                                                    sm: 'flex-start',
+                                                  }}
+                                                >
+                                                  <FormControl
+                                                    fullWidth
+                                                    sx={fieldSx}
+                                                  >
+                                                    <InputLabel>
+                                                      Versioned Product pack
+                                                    </InputLabel>
+                                                    <Select
+                                                      label="Versioned Product pack"
+                                                      value={
+                                                        packaging
+                                                          .packProfileVersionGlobalId
+                                                      }
+                                                      onChange={(event) => {
+                                                        updatePackageDraft(
+                                                          candidate,
+                                                          line,
+                                                          {
+                                                            packProfileVersionGlobalId:
+                                                              event.target.value,
+                                                          },
+                                                        )
+                                                      }}
+                                                    >
+                                                      <MenuItem value="">
+                                                        Select a current pack
+                                                      </MenuItem>
+                                                      {matchingPackProfileVersions
+                                                        .map((profile) => (
+                                                          <MenuItem
+                                                            key={
+                                                              profile.globalId
+                                                            }
+                                                            value={
+                                                              profile.globalId
+                                                            }
+                                                          >
+                                                            {profile.label} ·{' '}
+                                                            {humanize(
+                                                              profile.packageLevel,
+                                                            )} ·{' '}
+                                                            {
+                                                              profile
+                                                                .baseEachQuantity
+                                                            } base each ·{' '}
+                                                            {formatGrams(
+                                                              profile.weightGrams,
+                                                              measurementSystem,
+                                                              { maximumFractionDigits: 3 },
+                                                            )} ·{' '}
+                                                            {dimensionsLabel(
+                                                              profile.dimensionsMm,
+                                                              measurementSystem,
+                                                            )}
+                                                          </MenuItem>
+                                                        ))}
+                                                    </Select>
+                                                    <FormHelperText>
+                                                      Only packs matching this
+                                                      line&apos;s exact{' '}
+                                                      {line.unitMultiplier}{' '}
+                                                      base-each multiplier are
+                                                      eligible.
+                                                    </FormHelperText>
+                                                  </FormControl>
+                                                  <Button
+                                                    variant="outlined"
+                                                    disabled={
+                                                      candidateLocked
+                                                      || Boolean(pendingAction)
+                                                      || !packaging
+                                                        .packProfileVersionGlobalId
+                                                    }
+                                                    onClick={() => {
+                                                      void bindFaireVariantPack(
+                                                        candidate,
+                                                        line,
+                                                      )
+                                                    }}
+                                                    sx={actionButtonSx}
+                                                  >
+                                                    Read exact product & bind
+                                                  </Button>
+                                                </Stack>
+                                              </Stack>
+                                            ) : (
+                                              <Alert severity="warning">
+                                                No current eligible versioned
+                                                Product pack matches the Faire
+                                                line&apos;s exact{' '}
+                                                {line.unitMultiplier
+                                                  ?? 'unavailable'} base-each
+                                                multiplier. Correct the provider
+                                                quantity or Product pack rule
+                                                before binding it.
+                                              </Alert>
+                                            )
+                                          ) : null}
                                           {packageProfiles.length ? (
                                             <Stack
                                               direction={{
@@ -5900,10 +6927,12 @@ export default function CommerceIntakeWorkflow({
                                             </Stack>
                                           ) : (
                                             <Alert severity="info">
-                                              No active package profile is
-                                              available for the selected
-                                              product. Enter order-specific
-                                              facts below.
+                                              No active legacy order-specific
+                                              package profile is available for
+                                              the selected product. Use the
+                                              exact versioned mapping above or
+                                              enter one-time package facts
+                                              below.
                                             </Alert>
                                           )}
                                           <Box
@@ -6407,6 +7436,37 @@ export default function CommerceIntakeWorkflow({
                           >
                             Refresh
                           </Button>
+                          {provider === 'shopify'
+                          && candidate.state === 'promoted'
+                          && candidate.checkoutRateReconciliation
+                            ?.lineageRequired
+                          && !candidate.checkoutRateReconciliation
+                            .globalId ? (
+                            <Button
+                              variant="outlined"
+                              startIcon={<CheckCircleOutlineRounded />}
+                              disabled={
+                                Boolean(pendingAction)
+                                || !operatorCommandsAllowed
+                              }
+                              onClick={() => {
+                                void postCommand(
+                                  'reconcile-checkout-rate',
+                                  `reconcile-checkout-rate:${
+                                    candidate.globalId
+                                  }`,
+                                  {
+                                    candidateGlobalId: candidate.globalId,
+                                    rowVersion: candidate.rowVersion,
+                                  },
+                                  'Shopify checkout quote matching completed. Review the immutable result before warehouse release.',
+                                )
+                              }}
+                              sx={actionButtonSx}
+                            >
+                              Match checkout quote
+                            </Button>
+                          ) : null}
                           <Button
                             variant="outlined"
                             startIcon={<CheckCircleOutlineRounded />}
@@ -6428,36 +7488,27 @@ export default function CommerceIntakeWorkflow({
                           >
                             Check order
                           </Button>
-                          {candidate.requiresShipping !== false
-                          && provider === 'shopify' ? (
+                          {candidate.requiresShipping !== false ? (
                             <Button
                               variant="outlined"
                               startIcon={<Inventory2Rounded />}
                               disabled={
-                                refreshLocked
+                                packPlanningLocked
                                 || Boolean(pendingAction)
                                 || !operatorCommandsAllowed
-                                || !canActivate
+                                || !canManage
                               }
-                              title={!canActivate
+                              title={!canManage
                                 ? 'Organization manager or administrator permission is required to plan packages and compare carrier rates.'
-                                : undefined}
+                                : candidate.state === 'promoted'
+                                  ? 'Use current factual warehouse and packaging data to save operational pack facts for this ClawPilot order.'
+                                  : undefined}
                               onClick={() => {
                                 void openCartonizationPreview(candidate)
                               }}
                               sx={actionButtonSx}
                             >
                               Pack & compare rates
-                            </Button>
-                          ) : candidate.requiresShipping !== false ? (
-                            <Button
-                              variant="outlined"
-                              startIcon={<Inventory2Rounded />}
-                              disabled
-                              title="Faire account-bound inventory reconciliation is not implemented yet."
-                              sx={actionButtonSx}
-                            >
-                              Pack preview needs Faire inventory
                             </Button>
                           ) : null}
                           <Button
@@ -6606,16 +7657,19 @@ export default function CommerceIntakeWorkflow({
         <DialogContent dividers>
           <Stack spacing={2}>
             <Alert severity="info">
-              Start with the exact order, warehouse, inventory snapshot, and
-              customer packaging recipe. You can run a fit-only preview or
-              save a reloadable, read-only comparison of UPS and FedEx sandbox
-              shipment rates covering every resulting package. Neither path
-              buys postage, creates a shipment, prints, or changes inventory.
+              {promotedWarehousePlanning
+                ? `This order is already in ClawPilot as ${
+                    cartonizationCandidate?.canonicalOrderGlobalId
+                      || 'a canonical order'
+                  }. Select its exact warehouse and current factual packaging, then save operational pack facts for warehouse planning. ClawPilot records reloadable plan evidence and read-only UPS and FedEx sandbox estimates; it does not buy postage, create a shipment, print, reserve inventory, or change Shopify.`
+                : 'Start with the exact order, warehouse, inventory snapshot, and customer packaging recipe. You can run a fit-only preview or save a reloadable, read-only comparison of UPS and FedEx sandbox shipment rates covering every resulting package. Neither path buys postage, creates a shipment, prints, or changes inventory.'}
             </Alert>
-            {!canActivate ? (
+            {!canManage ? (
               <Alert severity="warning">
                 Organization manager or administrator permission is required
-                to run this preview.
+                {promotedWarehousePlanning
+                  ? ' to save operational warehouse-planning evidence.'
+                  : ' to run this preview.'}
               </Alert>
             ) : null}
 
@@ -6737,13 +7791,13 @@ export default function CommerceIntakeWorkflow({
                 })}
               </Select>
               <FormHelperText>
-                Draft, uncosted, or out-of-stock materials remain selectable so
-                the fit preview can return the exact corrective blocker.
-                Reloadable rate evidence supports one to eight materials and
-                binds each material to its own exterior dimensions and tare.
+                {promotedWarehousePlanning
+                  ? 'Select one to eight materials. Saving operational facts requires each material to be active, stocked at this warehouse, and supported by factual exterior dimensions and tare.'
+                  : 'Draft, uncosted, or out-of-stock materials remain selectable so the fit preview can return the exact corrective blocker. Reloadable rate evidence supports one to eight materials and binds each material to its own exterior dimensions and tare.'}
               </FormHelperText>
             </FormControl>
 
+            {!promotedWarehousePlanning ? (
             <Box component="section" aria-labelledby="committed-inventory-title">
               <Typography variant="overline" color="text.secondary">
                 Step 2 · Confirm inventory attribution
@@ -6822,7 +7876,73 @@ export default function CommerceIntakeWorkflow({
                   ))}
               </Stack>
             </Box>
+            ) : null}
 
+            <Box
+              component="section"
+              aria-labelledby="operational-rating-title"
+            >
+              <Typography variant="overline" color="text.secondary">
+                {promotedWarehousePlanning
+                  ? 'Step 2 · Save warehouse planning evidence'
+                  : 'Preferred path · Use current operational facts'}
+              </Typography>
+              <Typography
+                id="operational-rating-title"
+                variant="subtitle2"
+                fontWeight={700}
+                mb={0.5}
+              >
+                Save a factual pack plan with read-only sandbox carrier estimates
+              </Typography>
+              <Alert
+                severity={operationalRateEvidenceReady ? 'success' : 'info'}
+                variant="outlined"
+                sx={{ mb: 1 }}
+              >
+                This path accepts no operator parcel, inventory, or minimum
+                assumptions. It requires active current recipes and packaging,
+                customer-confirmed, measured, or provider-rated exterior
+                measurements, positive tare, and available packaging stock.
+                Shopify orders use the provider commitment as a read-only
+                preflight; the later Plan action locks the exact claim.
+              </Alert>
+              <Alert severity="warning" variant="outlined" sx={{ mb: 1.5 }}>
+                Carrier reads still use UPS and FedEx sandbox accounts. This
+                development/shadow evidence is not an executable production
+                rate, postage purchase, label, shipment, or billed cost.
+              </Alert>
+              {operationalRateEvidenceReady ? (
+                <Typography variant="body2" color="success.main">
+                  The selected warehouse and packaging pass the current
+                  operational-fact preflight.
+                </Typography>
+              ) : operationalMaterialBlockers.length > 0 ? (
+                <Box
+                  component="ul"
+                  aria-label="Operational pack evidence blockers"
+                  sx={{ my: 0, pl: 3 }}
+                >
+                  {operationalMaterialBlockers.map((blocker) => (
+                    <Typography
+                      component="li"
+                      variant="body2"
+                      color="text.secondary"
+                      key={blocker}
+                    >
+                      {blocker}
+                    </Typography>
+                  ))}
+                </Box>
+              ) : (
+                <Typography variant="body2" color="text.secondary">
+                  Select one to eight packaging materials and an active
+                  warehouse to evaluate this path.
+                </Typography>
+              )}
+            </Box>
+
+            {!promotedWarehousePlanning ? (
             <Box component="section" aria-labelledby="sandbox-rating-title">
               <Typography variant="overline" color="text.secondary">
                 Step 3 · Compare UPS and FedEx without shipping
@@ -7013,6 +8133,16 @@ export default function CommerceIntakeWorkflow({
                 label="I understand this is assumption-backed sandbox evidence, not executable shipping cost, postage, or approved packaging master data."
               />
             </Box>
+            ) : (
+              <Alert severity="warning" variant="outlined">
+                Fit-only preview and assumption-backed sandbox comparison are
+                unavailable after promotion. Warehouse planning must use the
+                current provider inventory, product packing profiles, and
+                factual packaging master data. Correct those records if needed,
+                reopen this order, and select <strong>Save operational pack
+                facts</strong>.
+              </Alert>
+            )}
 
             {cartonizationLoading ? (
               <Stack direction="row" spacing={1} alignItems="center">
@@ -7026,9 +8156,17 @@ export default function CommerceIntakeWorkflow({
 
             {cartonizationRateEvidence ? (
               <Box component="section" aria-label="Saved carrier comparison">
-                <Alert severity="warning" sx={{ mb: 1.5 }}>
-                  ASSUMPTION-BACKED SANDBOX EVIDENCE · NOT EXECUTABLE OR
-                  ACTUAL BILLED COST
+                <Alert
+                  severity={
+                    cartonizationRateEvidence.evidenceMode === 'operational'
+                      ? 'info'
+                      : 'warning'
+                  }
+                  sx={{ mb: 1.5 }}
+                >
+                  {cartonizationRateEvidence.evidenceMode === 'operational'
+                    ? 'OPERATIONAL PACK FACTS · READ-ONLY SANDBOX CARRIER ESTIMATES · DEV/SHADOW ONLY'
+                    : 'ASSUMPTION-BACKED SANDBOX EVIDENCE · NOT EXECUTABLE OR ACTUAL BILLED COST'}
                 </Alert>
                 <Stack
                   direction={{ xs: 'column', sm: 'row' }}
@@ -7689,7 +8827,7 @@ export default function CommerceIntakeWorkflow({
             ) : null}
           </Stack>
         </DialogContent>
-        <DialogActions>
+        <DialogActions sx={{ flexWrap: 'wrap' }}>
           <Button
             onClick={() => setCartonizationCandidate(null)}
             disabled={cartonizationLoading}
@@ -7698,12 +8836,16 @@ export default function CommerceIntakeWorkflow({
           </Button>
           <Button
             variant="outlined"
+            title={promotedWarehousePlanning
+              ? 'Fit-only preview is unavailable after promotion; use factual operational pack facts.'
+              : undefined}
             startIcon={cartonizationLoading
               ? <CircularProgress size={16} color="inherit" />
               : <Inventory2Rounded />}
             disabled={
-              cartonizationLoading
-              || !canActivate
+              promotedWarehousePlanning
+              || cartonizationLoading
+              || !canManage
               || !operatorCommandsAllowed
               || selectedCartonizationMaterialGlobalIds.length < 1
               || selectedCartonizationMaterialGlobalIds.length > 8
@@ -7715,13 +8857,18 @@ export default function CommerceIntakeWorkflow({
             Run fit-only preview
           </Button>
           <Button
-            variant="contained"
+            variant="outlined"
+            color="warning"
+            title={promotedWarehousePlanning
+              ? 'Assumption-backed sandbox comparison is unavailable after promotion; correct master data and save operational pack facts.'
+              : undefined}
             startIcon={cartonizationLoading
               ? <CircularProgress size={16} color="inherit" />
               : <Inventory2Rounded />}
             disabled={
-              cartonizationLoading
-              || !canActivate
+              promotedWarehousePlanning
+              || cartonizationLoading
+              || !canManage
               || !operatorCommandsAllowed
               || selectedCartonizationMaterialGlobalIds.length < 1
               || selectedCartonizationMaterialGlobalIds.length > 8
@@ -7732,7 +8879,25 @@ export default function CommerceIntakeWorkflow({
               void createCartonizationRateEvidence()
             }}
           >
-            Save & compare UPS + FedEx
+            Save sandbox comparison
+          </Button>
+          <Button
+            variant="contained"
+            startIcon={cartonizationLoading
+              ? <CircularProgress size={16} color="inherit" />
+              : <Inventory2Rounded />}
+            disabled={
+              cartonizationLoading
+              || !canManage
+              || !operatorCommandsAllowed
+              || !selectedCartonizationWarehouseGlobalId
+              || !operationalRateEvidenceReady
+            }
+            onClick={() => {
+              void createOperationalCartonizationRateEvidence()
+            }}
+          >
+            Save operational pack facts
           </Button>
         </DialogActions>
       </Dialog>

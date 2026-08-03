@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
-import { generateKeyPairSync } from 'node:crypto'
+import { createHash, generateKeyPairSync } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -13,6 +13,25 @@ function read(relativePath) {
 
 function assertIncludes(source, needle, label) {
   assert.ok(source.includes(needle), `${label} missing ${needle}`)
+}
+
+function normalizedPgProcBodyFromMigration(source, functionName) {
+  const declaration = source.indexOf(functionName)
+  assert.notEqual(declaration, -1, `migration missing function ${functionName}`)
+  const bodyMarker = 'AS $$'
+  const bodyStart = source.indexOf(bodyMarker, declaration)
+  assert.notEqual(bodyStart, -1, `${functionName} missing ${bodyMarker}`)
+  const bodyEnd = source.indexOf('$$;', bodyStart + bodyMarker.length)
+  assert.notEqual(bodyEnd, -1, `${functionName} missing function-body terminator`)
+  return source
+    .slice(bodyStart + bodyMarker.length, bodyEnd)
+    .replace(/(^|[\r\n])[\t ]*--[^\r\n]*/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim()
+}
+
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex')
 }
 
 const migration = read('db/migrations/0001_initial_railway_postgres.sql')
@@ -882,7 +901,8 @@ assertIncludes(crmIntegrationActions, 'senderEmail', 'audited selected Gmail sen
 const crmEmailIngestion = read('app_src/lib/crm/emailIngestion.ts')
 assertIncludes(crmEmailIngestion, 'export function truncateEmailImportContent', 'email import boundary')
 assertIncludes(crmEmailIngestion, 'content.search(/%xx/i)', 'case-insensitive email import boundary')
-assertIncludes(crmEmailIngestion, '/%gslt(g[aciklmo][0-9]{7})(?![A-Za-z0-9_])/gi', 'exact inbound CRM marker syntax')
+assertIncludes(crmEmailIngestion, "globalIdFragment(['ga', 'gc', 'gi', 'gk', 'gl', 'gm', 'go'])", 'dual-format inbound CRM marker syntax')
+assertIncludes(crmEmailIngestion, '(?![A-Za-z0-9_])', 'inbound CRM marker boundary')
 assertIncludes(crmEmailIngestion, 'if (seen.has(reference)) continue', 'quoted-thread marker deduplication')
 assertIncludes(crmEmailIngestion, 'ON CONFLICT (owner_email, external_message_id) DO NOTHING', 'Gmail message deduplication')
 assertIncludes(crmEmailIngestion, 'ownedPipelines', 'cross-owned-pipeline marker resolution')
@@ -902,6 +922,7 @@ assertIncludes(crmIntegrationWorkerRoute, 'processCalendarIngestion', 'Google Ca
 assertIncludes(crmIntegrationWorkerRoute, 'processSuiteCrmAccountContactIngestion', 'SuiteCRM account/contact reconciliation worker')
 assertIncludes(crmIntegrationWorkerRoute, 'processSuiteCrmMeetingIngestion', 'SuiteCRM meeting reconciliation worker')
 assertIncludes(crmIntegrationWorkerRoute, 'processSuiteCrmCallIngestion', 'SuiteCRM native Call reconciliation worker')
+assertIncludes(crmIntegrationWorkerRoute, 'processSuiteCrmProductImageIngestion', 'SuiteCRM Product image reverse-ingestion worker')
 
 const crmCalendarIngestion = read('app_src/lib/crm/calendarIngestion.ts')
 assertIncludes(crmCalendarIngestion, 'clawpilotMeetingReference', 'Calendar meeting reference correlation')
@@ -968,7 +989,7 @@ assertIncludes(crmReferenceRoute, 'resolveCrmReferenceRoute', 'legacy CRM refere
 assertIncludes(crmReferenceRoute, 'resolved.pipelineId', 'CRM reference inferred owning pipeline handoff')
 assertIncludes(crmReferenceRoute, "destination.searchParams.set('pipeline', pipelineId)", 'CRM reference owning pipeline handoff')
 assertIncludes(crmReferenceRoute, "crmAction', 'compose-email'", 'CRM email action deep link')
-assertIncludes(crmReferenceRoute, "|p)[0-9]{7}$", 'product Global ID deep link')
+assertIncludes(crmReferenceRoute, "globalIdPattern(['ga', 'gc', 'gi', 'gk', 'gl', 'gm', 'go', 'gp'])", 'dual-format product Global ID deep link')
 
 const crmReferenceQuarantineMigration = read('db/migrations/0103_pipeline_crm_reference_quarantine.sql')
 assertIncludes(
@@ -1024,7 +1045,8 @@ assertIncludes(organizationsAdapter, 'retireUnusedWorkspaceOrganization', 'faile
 const shortLinks = read('app_src/lib/shortlinks.ts')
 assertIncludes(shortLinks, 'normalizeSlug(input.slug, { allowCrmReference: true })', 'public CRM short-link resolution')
 assertIncludes(shortLinks, '!options.allowCrmReference && (CRM_REFERENCE_SLUG_PATTERN.test(slug) || CRM_ACTION_SLUG_PATTERN.test(slug))', 'creation-only CRM slug reservation')
-assertIncludes(shortLinks, 'g[aciklmop][0-9]{7}', 'product Global ID short-link reservation')
+assertIncludes(shortLinks, 'globalIdPattern(CRM_REFERENCE_PREFIXES)', 'dual-format product Global ID short-link reservation')
+assertIncludes(shortLinks, "globalIdFragment(['ga', 'gc'])", 'dual-format CRM action short-link reservation')
 
 const zonedDateTime = read('app_src/lib/zonedDateTime.ts')
 assertIncludes(zonedDateTime, 'export function zonedDateTimeToIso', 'timezone-aware CRM meeting conversion')
@@ -1500,7 +1522,136 @@ assertIncludes(tenancyDataVerifier, 'count(DISTINCT projection.pipeline_id) <> 1
 const dispatchBridge = read('app_src/lib/dispatchBridge.ts')
 assertIncludes(dispatchBridge, 'execution succeeded but completion telemetry could not be persisted', 'dispatch replay guard')
 
+const faireProviderWriteAuthorizationMigration = read(
+  'db/migrations/0220_operations_faire_provider_write_authorizations.sql',
+)
+const faireOAuthGrantEvidenceMigration = read(
+  'db/migrations/0228_operations_faire_oauth_grant_evidence.sql',
+)
+const faireProductImageProjectionMigration = read(
+  'db/migrations/0230_operations_faire_product_image_projection.sql',
+)
+const faireProductImageWritableLifecycleMigration = read(
+  'db/migrations/0234_operations_faire_product_image_writable_lifecycle.sql',
+)
+for (const fragment of [
+  'channel_state.provider_status_raw',
+  "''DRAFT'', ''PUBLISHED'', ''ACTIVE''",
+  "channel_normalized_status = 'unavailable'",
+]) {
+  assertIncludes(
+    faireProductImageWritableLifecycleMigration,
+    fragment,
+    'Faire Product-image writable lifecycle migration',
+  )
+}
+const commerceFulfillmentRecoveryMigration = read(
+  'db/migrations/0229_operations_commerce_fulfillment_recovery.sql',
+)
+for (const fragment of [
+  'operations_commerce_fulfillment_exports_recovery_idx',
+  'operations_commerce_fulfillment_exports',
+  'state,',
+  'error_code,',
+  'updated_at,',
+  'attempts,',
+  'id',
+  "provider IN ('shopify', 'faire')",
+  "state IN ('processing', 'failed')",
+]) {
+  assertIncludes(
+    commerceFulfillmentRecoveryMigration,
+    fragment,
+    'Commerce fulfillment recovery migration',
+  )
+}
+for (const fragment of [
+  'CREATE TABLE IF NOT EXISTS operations_faire_provider_write_scope_evidence',
+  'CREATE TABLE IF NOT EXISTS operations_faire_provider_write_authorizations',
+  'operations_faire_write_scope_list_valid',
+  'operations_faire_write_capability_list_valid',
+  'operations_faire_provider_write_canonical_jsonb',
+  'operations_faire_provider_write_request_hash',
+  'operations_faire_provider_write_json_is_redacted',
+  'operations_faire_provider_write_scope_evidence_is_current',
+  'operations_faire_provider_write_fence_hash',
+  'protect_operations_faire_scope_evidence_write',
+  'protect_operations_faire_write_authorization_write',
+  'operations_faire_provider_write_authority_is_current',
+  'operations_faire_write_auth_active_aggregate_idx',
+  'operations_faire_write_auth_effect_tombstone_idx',
+  'operations_commerce_effect_faire_auth_unique',
+  'operations_faire_scope_evidence_attempt_fkey',
+  'operations_faire_write_auth_scope_evidence_fkey',
+  'operations_faire_write_auth_attempt_fkey',
+  'operations_commerce_effect_faire_auth_fkey',
+]) {
+  assertIncludes(
+    faireProviderWriteAuthorizationMigration,
+    fragment,
+    'Faire provider-write authorization migration',
+  )
+}
+const faireScopeCurrentProsrcSha256 =
+  'be9c9d5ce1442cf6c1df2aaffcf1dd075eeb24172fe1f7ec2e6d2002b98bea49'
+const faireScopeTriggerProsrcSha256 =
+  '022f71dfd366bf18bc263d8dcfee07d96e9c4e199f797c25b085403105906a03'
+const faireScopeCurrentBody = normalizedPgProcBodyFromMigration(
+  faireOAuthGrantEvidenceMigration,
+  'operations_faire_provider_write_scope_evidence_is_current',
+)
+const faireScopeTriggerBody = normalizedPgProcBodyFromMigration(
+  faireOAuthGrantEvidenceMigration,
+  'protect_operations_faire_scope_evidence',
+)
+for (const fragment of [
+  'operations_faire_oauth_scope_list_valid',
+  'operations_faire_oauth_scope_json_valid',
+  'validate_operations_faire_scope_evidence_insert_write',
+  "credential.auth_mode = 'faire_oauth'",
+  "attempt.action = 'faire.oauth.authorization_code.exchange'",
+  "attempt.state = 'succeeded'",
+  'auth.verified_write_scopes <@ evidence.verified_write_scopes',
+  'NOT NEW.verified_write_scopes <@ evidence_scopes',
+]) {
+  assertIncludes(
+    faireOAuthGrantEvidenceMigration,
+    fragment,
+    'Faire OAuth grant-evidence migration',
+  )
+}
+assert.notEqual(
+  faireScopeCurrentBody,
+  'SELECT false',
+  'Faire OAuth BEARER grant evidence must replace the 0220 closed stub',
+)
+assert.equal(
+  sha256(faireScopeCurrentBody),
+  faireScopeCurrentProsrcSha256,
+  'Faire production scope-evidence helper normalized prosrc changed',
+)
+assert.equal(
+  sha256(faireScopeTriggerBody),
+  faireScopeTriggerProsrcSha256,
+  'Faire scope-evidence protection trigger normalized prosrc changed',
+)
+
 const healthRoute = read('app_src/app/api/health/route.ts')
+for (const source of [faireProductImageProjectionMigration, healthRoute]) {
+  assertIncludes(
+    source,
+    'evidence.verified_write_scopes @> auth.verified_write_scopes',
+    source === healthRoute
+      ? 'hosted Faire hardened authority-scope guard'
+      : 'Faire Product-image hardened authority-scope guard',
+  )
+}
+assert.ok(
+  !healthRoute.includes(
+    "position(\n                'auth.verified_write_scopes <@ evidence.verified_write_scopes'",
+  ),
+  'hosted health must pin the current 0230 Faire authority-scope expression',
+)
 assertIncludes(healthRoute, 'readPipelineOutboxWorkerHeartbeatFromPostgres', 'hosted worker health')
 assertIncludes(healthRoute, '0002_pipeline_outbox_worker.sql', 'hosted migration health')
 assertIncludes(healthRoute, '0003_auth_magic_codes.sql', 'hosted auth migration health')
@@ -1559,6 +1710,402 @@ assertIncludes(healthRoute, '0141_operations_recipe_only_pack_associations.sql',
 assertIncludes(healthRoute, '0142_operations_cartonization_evidence_scale.sql', 'hosted cartonization evidence scale migration health')
 assertIncludes(healthRoute, '0143_operations_cartonization_shipment_rates.sql', 'hosted cartonization shipment-rate migration health')
 assertIncludes(healthRoute, '0144_operations_cartonization_shipment_rate_constraint_repair.sql', 'hosted cartonization shipment-rate constraint repair migration health')
+assertIncludes(healthRoute, '0145_operations_two_pass_pack_rate_runs.sql', 'hosted two-pass pack-rate replay migration health')
+assertIncludes(healthRoute, '0146_operations_pack_rate_pricing_semantics.sql', 'hosted corrected pack-rate pricing semantics migration health')
+assertIncludes(healthRoute, '0147_operations_carrier_billing_mud.sql', 'hosted carrier-billing MUD migration health')
+assertIncludes(healthRoute, '0174_operations_shopify_checkout_provider_attempts.sql', 'hosted Shopify checkout provider-attempt migration health')
+assertIncludes(healthRoute, '0175_operations_shopify_checkout_rate_warm_policy.sql', 'hosted Shopify checkout rate-warm migration health')
+assertIncludes(healthRoute, '0176_operations_canonical_fulfillment_planning.sql', 'hosted canonical fulfillment-planning migration health')
+assertIncludes(healthRoute, '0177_operations_fulfillment_executions.sql', 'hosted Shadow fulfillment-execution migration health')
+assertIncludes(healthRoute, '0178_operations_shopify_customer_rate_policies.sql', 'hosted Shopify customer-rate policy migration health')
+assertIncludes(healthRoute, '0188_operations_shopify_shadow_test_subsidy.sql', 'hosted Shopify Shadow test-subsidy migration health')
+assertIncludes(healthRoute, '0189_operations_shopify_checkout_quote_match_families.sql', 'hosted Shopify quote match-family migration health')
+assertIncludes(healthRoute, '0192_operations_shadow_fulfillment_destination_fingerprint.sql', 'hosted Shadow fulfillment destination-repair migration health')
+assertIncludes(healthRoute, '0193_operations_shadow_rate_choice_package_identity.sql', 'hosted Shadow rate-choice package-identity repair migration health')
+assertIncludes(healthRoute, '0194_operations_fulfillment_execution_union_repair.sql', 'hosted fulfillment-validator UNION repair migration health')
+assertIncludes(healthRoute, '0195_operations_fulfillment_rate_parcel_evidence.sql', 'hosted fulfillment-validator provider parcel repair migration health')
+assertIncludes(healthRoute, '0198_operations_sandbox_commerce_e2e_authorization.sql', 'hosted sandbox commerce E2E authorization migration health')
+assertIncludes(healthRoute, '0199_operations_commerce_active_canonical_collation.sql', 'hosted commerce Active canonical collation migration health')
+assertIncludes(healthRoute, '0200_operations_sandbox_commerce_e2e_active_guards.sql', 'hosted sandbox commerce E2E Active guards migration health')
+assertIncludes(healthRoute, '0231_operations_faire_sandbox_commerce_e2e.sql', 'hosted Faire sandbox commerce E2E migration health')
+assertIncludes(healthRoute, '0232_operations_faire_sandbox_parcel_evidence.sql', 'hosted Faire sealed-parcel E2E migration health')
+assertIncludes(healthRoute, '0233_operations_faire_sandbox_promotion_evidence.sql', 'hosted Faire promoted-candidate E2E migration health')
+assertIncludes(healthRoute, '0218_global_id_alphanumeric_expand_141_149_and_catalog_gate.sql', 'hosted Global ID alphanumeric compatibility migration health')
+assertIncludes(healthRoute, '0219_global_id_base32hex_allocator.sql', 'hosted Global ID base32hex allocator migration health')
+for (const fragment of [
+  '0220_operations_faire_provider_write_authorizations.sql',
+  '0228_operations_faire_oauth_grant_evidence.sql',
+  '0229_operations_commerce_fulfillment_recovery.sql',
+  'operations_commerce_fulfillment_exports_recovery_idx',
+  'operations_commerce_fulfillment_recovery_applied',
+  'operations_faire_provider_write_scope_evidence',
+  'operations_faire_provider_write_authorizations',
+  'operations_faire_write_scope_list_valid(text[])',
+  'operations_faire_write_capability_list_valid(text[])',
+  'operations_faire_provider_write_canonical_jsonb(jsonb)',
+  'operations_faire_provider_write_request_hash(jsonb)',
+  'operations_faire_provider_write_json_is_redacted(jsonb)',
+  'operations_faire_oauth_scope_list_valid(text[])',
+  'operations_faire_oauth_scope_json_valid(jsonb)',
+  'operations_faire_provider_write_scope_evidence_is_current(uuid,uuid,uuid,integer)',
+  'operations_faire_provider_write_fence_hash',
+  'protect_operations_faire_scope_evidence_write',
+  'validate_operations_faire_scope_evidence_insert_write',
+  'validate_operations_faire_scope_evidence_insert()',
+  'protect_operations_faire_write_authorization_write',
+  'protect_operations_commerce_external_effect_intent_write',
+  'operations_faire_provider_write_authority_is_current',
+  'operations_faire_write_auth_active_aggregate_idx',
+  'operations_faire_write_auth_effect_tombstone_idx',
+  'operations_commerce_effect_faire_auth_unique',
+  'operations_faire_scope_evidence_attempt_fkey',
+  'operations_faire_write_auth_scope_evidence_fkey',
+  'operations_faire_write_auth_attempt_fkey',
+  'operations_commerce_effect_faire_auth_fkey',
+]) {
+  assertIncludes(healthRoute, fragment, 'hosted Faire provider-write readiness')
+}
+for (const fragment of [
+  'SHA-256 over pg_proc.prosrc after removing full-line -- comments',
+  faireScopeCurrentProsrcSha256,
+  faireScopeTriggerProsrcSha256,
+  'procedure.prosrc',
+  "E'(^|[\\\\n\\\\r])[[:blank:]]*--[^\\\\n\\\\r]*'",
+  "'[[:space:]]+'",
+  "= '${FAIRE_SCOPE_CURRENT_PROSRC_SHA256}'",
+  "= '${FAIRE_SCOPE_TRIGGER_PROSRC_SHA256}'",
+]) {
+  assertIncludes(healthRoute, fragment, 'hosted Faire grant-evidence body hash')
+}
+assert.equal(
+  (healthRoute.match(/FAIRE_SCOPE_CURRENT_PROSRC_SHA256/g) || []).length,
+  2,
+  'Faire current-scope prosrc hash must be declared and enforced exactly once',
+)
+assert.equal(
+  (healthRoute.match(/FAIRE_SCOPE_TRIGGER_PROSRC_SHA256/g) || []).length,
+  2,
+  'Faire scope trigger prosrc hash must be declared and enforced exactly once',
+)
+const faireScopeTriggerHealthStart = healthRoute.indexOf(
+  "'protect_operations_faire_scope_evidence_write'",
+)
+const faireScopeTriggerHealthEnd = healthRoute.indexOf(
+  "'protect_operations_commerce_external_effect_intent_write'",
+  faireScopeTriggerHealthStart,
+)
+assert.ok(
+  faireScopeTriggerHealthStart >= 0
+    && faireScopeTriggerHealthEnd > faireScopeTriggerHealthStart,
+  'hosted Faire scope trigger health block is missing',
+)
+const faireScopeTriggerHealth = healthRoute.slice(
+  faireScopeTriggerHealthStart,
+  faireScopeTriggerHealthEnd,
+)
+for (const fragment of [
+  "trg.tgfoid = to_regprocedure(",
+  "'protect_operations_faire_scope_evidence()'",
+  "'validate_operations_faire_scope_evidence_insert_write'",
+  "'validate_operations_faire_scope_evidence_insert()'",
+  "trg.tgenabled = 'O'",
+  'trg.tgtype = 31',
+  'trg.tgtype = 5',
+  'NOT trg.tgisinternal',
+]) {
+  assertIncludes(faireScopeTriggerHealth, fragment, 'exact Faire scope trigger health')
+}
+const faireTombstoneHealthStart = healthRoute.indexOf(
+  "'operations_faire_write_auth_effect_tombstone_idx'",
+)
+const faireTombstoneHealthEnd = healthRoute.indexOf(
+  "'operations_commerce_effect_faire_auth_unique'",
+  faireTombstoneHealthStart,
+)
+assert.ok(
+  faireTombstoneHealthStart >= 0
+    && faireTombstoneHealthEnd > faireTombstoneHealthStart,
+  'hosted Faire tombstone-index health block is missing',
+)
+const faireTombstoneHealth = healthRoute.slice(
+  faireTombstoneHealthStart,
+  faireTombstoneHealthEnd,
+)
+for (const fragment of [
+  "'operations_faire_provider_write_authorizations'",
+  'idx.indisunique',
+  'idx.indisvalid',
+  'idx.indisready',
+  'idx.indpred IS NULL',
+  'idx.indexprs IS NULL',
+  'idx.indnkeyatts = 6',
+  'idx.indnatts = 6',
+  "'organization_id'",
+  "'integration_account_id'",
+  "'action'",
+  "'aggregate_type'",
+  "'aggregate_id'",
+  "'aggregate_revision'",
+]) {
+  assertIncludes(faireTombstoneHealth, fragment, 'exact Faire tombstone index health')
+}
+assert.ok(
+  (healthRoute.match(/faire_provider_write_auth_applied/g) || []).length >= 4,
+  'Faire provider-write readiness must gate both migrationsCurrent and health errors',
+)
+const commerceProductImageImportMigration = read(
+  'db/migrations/0221_operations_commerce_product_image_imports.sql',
+)
+for (const fragment of [
+  'operations_commerce_product_image_snapshot_fences',
+  'operations_commerce_product_image_observation_sets',
+  'operations_commerce_product_image_observations',
+  'operations_commerce_product_image_observation_set_memberships',
+  'operations_commerce_product_image_import_jobs',
+  'operations_commerce_product_image_import_worker_heartbeat',
+  'operations_commerce_product_image_asset_provenance',
+  'operations_commerce_product_image_bindings',
+  'operations_commerce_product_image_account_is_current',
+  'operations_commerce_product_image_mapping_resolution',
+  'guard_operations_commerce_product_image_snapshot_fence_write',
+  'guard_operations_commerce_product_image_snapshot_fence()',
+  'guard_operations_commerce_product_image_observation_set_write',
+  'guard_operations_commerce_product_image_observation_set()',
+  'guard_operations_commerce_product_image_set_member_write',
+  'guard_operations_commerce_product_image_observation_set_membership()',
+  'validate_operations_commerce_image_set_membership',
+  'validate_operations_commerce_image_set_member_insert',
+  'validate_ops_commerce_image_set_evidence',
+  'validate_ops_commerce_image_set_row()',
+  'validate_ops_commerce_image_member_row()',
+  'guard_operations_commerce_product_image_observation_write',
+  'guard_operations_commerce_product_image_import_job_write',
+  'guard_operations_commerce_product_image_provenance_write',
+  'guard_operations_commerce_product_image_binding_write',
+  'guard_operations_commerce_product_image_binding()',
+  'ops_commerce_image_observation_set_fkey',
+  'ops_commerce_image_job_observation_generation_unique',
+  'ops_commerce_image_job_single_flight_idx',
+]) {
+  assertIncludes(
+    commerceProductImageImportMigration,
+    fragment,
+    'commerce product image import database authority',
+  )
+  assertIncludes(
+    healthRoute,
+    fragment,
+    'hosted commerce product image import health',
+  )
+}
+assertIncludes(
+  commerceProductImageImportMigration,
+  'observation_set_id uuid NOT NULL',
+  'commerce product image observation-set membership',
+)
+for (const fragment of [
+  'job_generation integer NOT NULL',
+  'import_job_generation integer NOT NULL',
+  'latest_import_job_generation integer NOT NULL',
+  "trigger_row.tgtype = 5",
+  'trigger_row.tgdeferrable',
+  'trigger_row.tginitdeferred',
+]) {
+  assertIncludes(
+    fragment.startsWith('trigger_row.')
+      ? healthRoute
+      : commerceProductImageImportMigration,
+    fragment,
+    'commerce product image successor and membership health',
+  )
+}
+for (const fragment of [
+  "attribute.attname = 'observation_set_id'",
+  'attribute.attnotnull',
+  'NOT attribute.attisdropped',
+  "fk.confdeltype = 'r'",
+  "'ops_commerce_image_observation_set_fkey'",
+  "'observation_set_id'",
+]) {
+  assertIncludes(
+    healthRoute,
+    fragment,
+    'commerce product image observation-set structural health',
+  )
+}
+const commerceProductImageImportPersistence = read(
+  'app_src/lib/persistence/commerceProductImageImports.ts',
+)
+const commerceProductImageFanoutMigration = read(
+  'db/migrations/0225_operations_commerce_product_image_exact_fanout.sql',
+)
+for (const fragment of [
+  'operations_commerce_product_image_mapping_targets',
+  'target_mapping_fingerprint_sha256',
+  'ops_commerce_image_provenance_job_product_unique',
+  'ops_commerce_image_binding_exact_product_unique',
+  'guard_operations_commerce_product_image_asset_provenance()',
+  'guard_operations_commerce_product_image_binding()',
+]) {
+  assertIncludes(
+    commerceProductImageFanoutMigration,
+    fragment,
+    'exact commerce product image fan-out database authority',
+  )
+}
+const suiteCrmProductImageReverseMigration = read(
+  'db/migrations/0226_suitecrm_product_image_reverse_ingestion.sql',
+)
+for (const fragment of [
+  'crm_suitecrm_product_image_observations',
+  'crm_suitecrm_product_image_snapshot_fences',
+  'crm_suitecrm_product_image_asset_provenance',
+  'crm_suitecrm_product_image_ingestion_worker_heartbeat',
+  'provider_write_count integer NOT NULL DEFAULT 0',
+  'guard_crm_suitecrm_product_image_observation_write',
+  'guard_crm_suitecrm_product_image_provenance_write',
+  'guard_crm_suitecrm_product_image_snapshot_fence_write',
+  'guard_crm_suitecrm_image_fence_initial_revision_write',
+  'crm_suitecrm_product_image_observation_provider_writes_zero',
+  'crm_suitecrm_product_image_observation_timestamp_valid',
+  'crm_suitecrm_product_image_provenance_provider_writes_zero',
+  'crm_suitecrm_product_image_snapshot_fence_provenance_fkey',
+]) {
+  assertIncludes(
+    suiteCrmProductImageReverseMigration,
+    fragment,
+    'SuiteCRM Product image reverse-ingestion database authority',
+  )
+}
+const commerceProductImageSourceNormalizationMigration = read(
+  'db/migrations/0227_operations_commerce_product_image_source_normalization.sql',
+)
+for (const fragment of [
+  'source_content_sha256',
+  'source_byte_length',
+  'normalization_version',
+  'ops_commerce_image_provenance_source_evidence_valid',
+  'guard_operations_commerce_product_image_source_evidence_write',
+]) {
+  assertIncludes(
+    commerceProductImageSourceNormalizationMigration,
+    fragment,
+    'commerce product image source-normalization evidence authority',
+  )
+}
+for (const fragment of [
+  'guard_operations_commerce_product_image_source_evidence()',
+  'guard_operations_commerce_product_image_asset_provenance()',
+  'guard_crm_suitecrm_image_fence_initial_revision()',
+  'crm_suitecrm_product_image_snapshot_fence_provenance_fkey',
+  'trigger_row.tgfoid = to_regprocedure',
+  'trigger_row.tgtype = 31',
+  "trigger_row.tgenabled = 'O'",
+]) {
+  assertIncludes(
+    healthRoute,
+    fragment,
+    'Product image health database-authority verification',
+  )
+}
+for (const fragment of [
+  'currentMappingTargets',
+  'persistCommerceProductImageFanoutTarget',
+  'operations.commerce_product_image_import.fanout_completed',
+  'targetCount: persistedTargets.length',
+]) {
+  assertIncludes(
+    commerceProductImageImportPersistence,
+    fragment,
+    'exact commerce product image fan-out persistence',
+  )
+}
+assertIncludes(
+  commerceProductImageImportPersistence,
+  'export async function readCommerceProductImageImportQueueHealthInPostgres',
+  'commerce product image import persistence health API',
+)
+assertIncludes(
+  healthRoute,
+  'readCommerceProductImageImportQueueHealthInPostgres',
+  'commerce product image import queue health',
+)
+assertIncludes(
+  healthRoute,
+  'commerceProductImageImportWorker',
+  'commerce product image import worker health response',
+)
+const commerceProductImageWorkerHealthStart = healthRoute.indexOf(
+  'const imageQueue =',
+)
+const commerceProductImageWorkerHealthEnd = healthRoute.indexOf(
+  'const knowledgeResult =',
+  commerceProductImageWorkerHealthStart,
+)
+assert.ok(
+  commerceProductImageWorkerHealthStart >= 0
+    && commerceProductImageWorkerHealthEnd
+      > commerceProductImageWorkerHealthStart,
+  'commerce product image worker health block is missing',
+)
+const commerceProductImageWorkerHealth = healthRoute.slice(
+  commerceProductImageWorkerHealthStart,
+  commerceProductImageWorkerHealthEnd,
+)
+for (const fragment of [
+  'await readCommerceProductImageImportQueueHealthInPostgres()',
+  'historicalDead: imageQueue.historicalDeadCount',
+  'if (!loopReachable)',
+  "errors.push(\n                'Commerce product image import worker heartbeat is missing or stale.'",
+  'if (imageQueue.deadCount > 0)',
+  'if (imageQueue.staleLeaseCount > 0)',
+  'if (imageQueue.overdueCount > 0)',
+  'if (imageQueue.retryCount > 0)',
+  "warnings.push(\n                'Commerce product image import queue has terminal failed jobs.'",
+  "warnings.push(\n                'Commerce product image import queue has stale claimed jobs.'",
+  "warnings.push(\n                'Commerce product image import queue has overdue jobs.'",
+  "warnings.push(\n                'Commerce product image import jobs are retrying.'",
+]) {
+  assertIncludes(
+    commerceProductImageWorkerHealth,
+    fragment,
+    'commerce product image worker health semantics',
+  )
+}
+assert.equal(
+  commerceProductImageWorkerHealth.includes(
+    'imageQueue.historicalDeadCount > 0',
+  ),
+  false,
+  'Historical commerce product image failures must not degrade current health',
+)
+assert.ok(
+  (
+    healthRoute.match(/operations_commerce_product_image_imports_applied/g)
+    || []
+  ).length >= 4,
+  'Commerce product image readiness must gate migrations, health, and worker checks',
+)
+assert.ok(
+  (
+    healthRoute.match(/operations_commerce_product_image_fanout_applied/g)
+    || []
+  ).length >= 4,
+  'Commerce product image fan-out readiness must gate migrations, health, and worker checks',
+)
+assert.ok(
+  (
+    healthRoute.match(
+      /operations_commerce_product_image_source_normalization_applied/g,
+    ) || []
+  ).length >= 4,
+  'Commerce product image source-normalization readiness must gate migrations, health, and worker checks',
+)
+assertIncludes(
+  healthRoute,
+  "trigger_row.tgenabled = 'O'",
+  'commerce product image source-evidence readiness requires enabled triggers',
+)
 for (const [, alias] of healthRoute.matchAll(/\)\s+AS\s+([a-z0-9_]+)\s*,?/gi)) {
   assert.ok(
     alias.length <= 63,

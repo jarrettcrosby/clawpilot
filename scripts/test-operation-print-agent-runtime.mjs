@@ -236,6 +236,22 @@ function requestErrorAdapter() {
   return { OperationsRequestError: RequestError }
 }
 
+const managedSandboxFulfillmentConfiguration = {
+  managedBy: 'ag-alchemy-episcs-sandbox-rating-delegation',
+  authorizationScope: 'sandbox_fulfillment_diagnostic',
+  credentialRevealAllowed: false,
+  senderOriginWarehouseGlobalId: 'gwh5366613',
+  allowedCapabilities: ['sandbox_rate', 'sandbox_label'],
+}
+
+const managedSandboxRatingOnlyConfiguration = {
+  managedBy: 'ag-alchemy-episcs-sandbox-rating-delegation',
+  authorizationScope: 'sandbox_rating_only',
+  credentialRevealAllowed: false,
+  senderOriginWarehouseGlobalId: 'gwh5366613',
+  allowedCapabilities: ['sandbox_rate'],
+}
+
 async function seedBase(pool) {
   const suffix = randomBytes(4).toString('hex')
   const actorEmail = `print-agent-runtime-${suffix}@example.com`
@@ -314,6 +330,220 @@ async function createPrinter(pool, fixture, input) {
       input.agentId,
     ],
   )
+}
+
+async function seedRateTestConnection(pool, fixture, input) {
+  const integration = await insertReturning(
+    pool,
+    `INSERT INTO operations_integration_accounts (
+       organization_id, provider, integration_type, environment,
+       display_name, status, configuration, created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2, 'carrier', 'sandbox',
+       $3, 'active', $4::jsonb, $5, $5
+     )
+     RETURNING id, global_id`,
+    [
+      fixture.organizationId,
+      input.provider,
+      `${input.name} ${fixture.suffix}`,
+      JSON.stringify(input.configuration),
+      fixture.actorEmail,
+    ],
+  )
+  const accountFingerprint = createHash('sha256')
+    .update(`${input.provider}:account:${fixture.suffix}`)
+    .digest('hex')
+  const addressFingerprint = createHash('sha256')
+    .update(`${input.provider}:address:${fixture.suffix}`)
+    .digest('hex')
+  const carrierAccount = await insertReturning(
+    pool,
+    `INSERT INTO operations_carrier_accounts (
+       organization_id, integration_account_id, display_name, sender_name,
+       account_number_ciphertext, account_number_iv, account_number_tag,
+       account_number_last_four, account_number_fingerprint,
+       registered_address, registered_address_fingerprint,
+       address_verification, allow_sender_billing,
+       allow_recipient_billing, allow_third_party_billing,
+       status, created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3, 'Print runtime sender',
+       'ciphertext', 'iv', 'tag',
+       $4, $5, $6::jsonb, $7,
+       'operator_attested', true, false, false,
+       'active', $8, $8
+     )
+     RETURNING id, global_id, account_number_fingerprint`,
+    [
+      fixture.organizationId,
+      integration.id,
+      `${input.name} account`,
+      input.provider === 'ups_rest' ? '1001' : '2002',
+      accountFingerprint,
+      JSON.stringify({
+        line1: '101 Carrier Way',
+        city: 'Delaware',
+        region: 'OH',
+        postalCode: '43015',
+        countryCode: 'US',
+      }),
+      addressFingerprint,
+      fixture.actorEmail,
+    ],
+  )
+  const requestHash = createHash('sha256')
+    .update(`${input.provider}:rate-request:${fixture.suffix}`)
+    .digest('hex')
+  const rateRequest = await insertReturning(
+    pool,
+    `INSERT INTO operations_carrier_rate_requests (
+       organization_id, integration_account_id, carrier_account_id,
+       provider, environment, purpose, adapter_version,
+       credential_version, request_hash, redacted_request,
+       redacted_response, status, provider_reference, actor_email,
+       requested_at, completed_at
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid,
+       $4, 'sandbox', 'sandbox_rate_test', 'print-runtime-v1',
+       1, $5, '{}'::jsonb,
+       $6::jsonb, 'succeeded', $7, $8,
+       now() - interval '1 second', now()
+     )
+     RETURNING id, global_id, request_hash`,
+    [
+      fixture.organizationId,
+      integration.id,
+      carrierAccount.id,
+      input.provider,
+      requestHash,
+      JSON.stringify({
+        rates: [{
+          serviceCode: 'GROUND',
+          serviceName: `${input.name} Ground`,
+          amount: '12.50',
+          currency: 'USD',
+        }],
+      }),
+      `${input.provider}-rate-${fixture.suffix}`,
+      fixture.actorEmail,
+    ],
+  )
+  return { integration, carrierAccount, rateRequest, provider: input.provider }
+}
+
+async function seedRateTestLabel(pool, fixture, connection, discriminator) {
+  const serviceCode = `GROUND_${discriminator.toUpperCase()}`
+    .replace(/[^A-Z0-9_]/g, '_')
+    .slice(0, 80)
+  const destinationFingerprint = createHash('sha256')
+    .update(`destination:${discriminator}:${fixture.suffix}`)
+    .digest('hex')
+  const requestHash = createHash('sha256')
+    .update(`label-request:${discriminator}:${fixture.suffix}`)
+    .digest('hex')
+  const payload = Buffer.from(
+    `^XA^FO30,30^FD${discriminator}-${fixture.suffix}^FS^XZ`,
+    'utf8',
+  )
+  const contentSha256 = createHash('sha256').update(payload).digest('hex')
+  const attempt = await insertReturning(
+    pool,
+    `INSERT INTO operations_carrier_rate_test_label_attempts (
+       organization_id, rate_request_id, integration_account_id,
+       carrier_account_id, action, state, provider, environment,
+       credential_version, service_code, rate_type, selected_rate,
+       destination_fingerprint, adapter_version, reason,
+       idempotency_key, request_hash, redacted_request, actor_email
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid,
+       $4::uuid, 'create', 'prepared', $5, 'sandbox',
+       1, $6, 'account', $7::jsonb,
+       $8, 'print-runtime-v1', $9,
+       $10, $11, '{}'::jsonb, $12
+     )
+     RETURNING id, global_id`,
+    [
+      fixture.organizationId,
+      connection.rateRequest.id,
+      connection.integration.id,
+      connection.carrierAccount.id,
+      connection.provider,
+      serviceCode,
+      JSON.stringify({
+        serviceCode,
+        serviceName: `${connection.provider} ${discriminator}`,
+        amount: '12.50',
+        currency: 'USD',
+        rateType: 'account',
+      }),
+      destinationFingerprint,
+      `Print authorization regression ${discriminator}`,
+      `rate-test-label-${discriminator}-${fixture.suffix}`,
+      requestHash,
+      fixture.actorEmail,
+    ],
+  )
+  const label = await insertReturning(
+    pool,
+    `INSERT INTO operations_carrier_rate_test_labels (
+       organization_id, rate_request_id, integration_account_id,
+       carrier_account_id, provider, environment, credential_version,
+       account_number_fingerprint, rate_request_hash,
+       destination_fingerprint, service_code, service_name, rate_type,
+       rated_amount, rated_currency, provider_label_id, tracking_number,
+       format, media_size, source_kind, provider_image_type,
+       provider_stock_type, label_payload, content_sha256,
+       provider_reference, redacted_provider_evidence,
+       create_attempt_id, status, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid,
+       $4::uuid, $5, 'sandbox', 1,
+       $6, $7, $8, $9, $10, 'account',
+       '12.50', 'USD', $11, $12,
+       'ZPL', 'label_4x6', 'provider_native', $13, $14, $15, $16,
+       $17, '{}'::jsonb,
+       $18::uuid, 'created', $19
+     )
+     RETURNING id, global_id`,
+    [
+      fixture.organizationId,
+      connection.rateRequest.id,
+      connection.integration.id,
+      connection.carrierAccount.id,
+      connection.provider,
+      connection.carrierAccount.account_number_fingerprint,
+      connection.rateRequest.request_hash,
+      destinationFingerprint,
+      serviceCode,
+      `${connection.provider} ${discriminator}`,
+      `${connection.provider}-label-${discriminator}-${fixture.suffix}`,
+      `${connection.provider}-tracking-${discriminator}-${fixture.suffix}`,
+      connection.provider === 'ups_rest' ? 'ZPL' : 'ZPLII',
+      connection.provider === 'ups_rest' ? 'HEIGHT_6_WIDTH_4' : 'STOCK_4X6',
+      payload,
+      contentSha256,
+      `${connection.provider}-reference-${discriminator}-${fixture.suffix}`,
+      attempt.id,
+      fixture.actorEmail,
+    ],
+  )
+  await pool.query(
+    `UPDATE operations_carrier_rate_test_label_attempts
+     SET state = 'succeeded', label_id = $3::uuid,
+         redacted_response = '{}'::jsonb,
+         provider_reference = $4,
+         completed_at = now()
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid`,
+    [
+      fixture.organizationId,
+      attempt.id,
+      label.id,
+      `${connection.provider}-reference-${discriminator}-${fixture.suffix}`,
+    ],
+  )
+  return { ...label, payload }
 }
 
 async function seedPrintSource(pool, fixture) {
@@ -608,10 +838,14 @@ async function verifyRuntime(connectionString) {
   const auditCalls = []
   try {
     const printing = loadTypeScript('app_src/lib/operations/printing.ts')
+    const carrierManagedDelegation = loadTypeScript(
+      'app_src/lib/integrations/carrierManagedDelegation.ts',
+    )
     const persistence = loadTypeScript(
       'app_src/lib/persistence/operationPrintDelivery.ts',
       {
         '@/lib/auditWriter': auditAdapter(auditCalls),
+        '@/lib/integrations/carrierManagedDelegation': carrierManagedDelegation,
         '@/lib/operations/printing': printing,
         '@/lib/persistence/operations': requestErrorAdapter(),
         '@/lib/persistence/operationPrinting': profileAdapter(),
@@ -918,6 +1152,353 @@ async function verifyRuntime(connectionString) {
       idempotencyKey: `cancel-label-reprint-${fixture.suffix}`,
       reason: 'Controlled label reprint proof completed without physical output',
     })
+
+    const managedRateTestConnection = await seedRateTestConnection(
+      pool,
+      fixture,
+      {
+        provider: 'ups_rest',
+        name: 'Managed UPS sandbox',
+        configuration: managedSandboxFulfillmentConfiguration,
+      },
+    )
+    const updateManagedConnection = async (fields) => {
+      const assignments = []
+      const params = [fixture.organizationId, managedRateTestConnection.integration.id]
+      for (const [column, value] of Object.entries(fields)) {
+        params.push(column === 'configuration' ? JSON.stringify(value) : value)
+        assignments.push(
+          `${column} = $${params.length}${column === 'configuration' ? '::jsonb' : ''}`,
+        )
+      }
+      await pool.query(
+        `UPDATE operations_integration_accounts
+         SET ${assignments.join(', ')}, updated_at = clock_timestamp()
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid`,
+        params,
+      )
+    }
+    const restoreManagedConnection = () => updateManagedConnection({
+      provider: 'ups_rest',
+      integration_type: 'carrier',
+      environment: 'sandbox',
+      configuration: managedSandboxFulfillmentConfiguration,
+    })
+    const enqueueRateTestLabel = (label, discriminator) => (
+      persistence.enqueueOperationsPrintJobInPostgres({
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.actorEmail,
+        idempotencyKey: `rate-test-${discriminator}-${fixture.suffix}`,
+        warehouseId: fixture.warehouseId,
+        preferredPrinterGlobalId: labelPrinter.global_id,
+        maxAttempts: 5,
+        document: {
+          type: 'rate_test_label',
+          sourceRateTestLabelGlobalId: label.global_id,
+          media: 'label_4x6',
+        },
+      })
+    )
+    const printJobStatus = async (globalId) => {
+      const result = await pool.query(
+        `SELECT status
+         FROM operations_print_jobs
+         WHERE organization_id = $1::uuid
+           AND global_id = $2`,
+        [fixture.organizationId, globalId],
+      )
+      return result.rows[0]?.status || null
+    }
+    const assertFreshManagedClaimCancelled = async ({
+      discriminator,
+      mutation,
+    }) => {
+      await restoreManagedConnection()
+      const label = await seedRateTestLabel(
+        pool,
+        fixture,
+        managedRateTestConnection,
+        discriminator,
+      )
+      const job = await enqueueRateTestLabel(label, discriminator)
+      await updateManagedConnection(mutation)
+      const claim = await persistence.claimOperationsPrintJobsInPostgres({
+        agent: primaryAgent,
+        idempotencyKey: `managed-denied-${discriminator}-${fixture.suffix}`,
+        limit: 1,
+        leaseSeconds: 120,
+        runtimeCapabilities: labelCapabilities,
+      })
+      assert.equal(claim.length, 0)
+      assert.equal(await printJobStatus(job.globalId), 'cancelled')
+      await restoreManagedConnection()
+    }
+
+    await assertFreshManagedClaimCancelled({
+      discriminator: 'rating-only',
+      mutation: { configuration: managedSandboxRatingOnlyConfiguration },
+    })
+    await assertFreshManagedClaimCancelled({
+      discriminator: 'drifted',
+      mutation: {
+        configuration: {
+          ...managedSandboxFulfillmentConfiguration,
+          senderOriginWarehouseGlobalId: 'gwh0000001',
+        },
+      },
+    })
+    await assertFreshManagedClaimCancelled({
+      discriminator: 'provider-mismatch',
+      mutation: { provider: 'usps_rest' },
+    })
+    await assertFreshManagedClaimCancelled({
+      discriminator: 'production-environment',
+      mutation: { environment: 'production' },
+    })
+    await assertFreshManagedClaimCancelled({
+      discriminator: 'missing-exact-carrier-origin',
+      mutation: { integration_type: 'printing' },
+    })
+
+    const replayLabel = await seedRateTestLabel(
+      pool,
+      fixture,
+      managedRateTestConnection,
+      'managed-claim-replay',
+    )
+    const replayJob = await enqueueRateTestLabel(replayLabel, 'managed-claim-replay')
+    const managedClaimInput = {
+      agent: primaryAgent,
+      idempotencyKey: `managed-claim-replay-${fixture.suffix}`,
+      limit: 1,
+      leaseSeconds: 120,
+      runtimeCapabilities: labelCapabilities,
+    }
+    const managedClaim = await persistence.claimOperationsPrintJobsInPostgres(
+      managedClaimInput,
+    )
+    assert.equal(managedClaim.length, 1)
+    assert.equal(managedClaim[0].globalId, replayJob.globalId)
+    assert.equal(
+      Buffer.from(managedClaim[0].document.inlinePayload, 'utf8').toString('utf8'),
+      replayLabel.payload.toString('utf8'),
+    )
+    await updateManagedConnection({
+      configuration: managedSandboxRatingOnlyConfiguration,
+    })
+    await expectRejected(
+      () => persistence.claimOperationsPrintJobsInPostgres(managedClaimInput),
+      /not authorized to release sandbox label bytes/,
+    )
+    await restoreManagedConnection()
+
+    const retryLabel = await seedRateTestLabel(
+      pool,
+      fixture,
+      managedRateTestConnection,
+      'managed-retry',
+    )
+    const retryJob = await enqueueRateTestLabel(retryLabel, 'managed-retry')
+    const retryClaim = await persistence.claimOperationsPrintJobsInPostgres({
+      agent: primaryAgent,
+      idempotencyKey: `managed-retry-claim-${fixture.suffix}`,
+      limit: 1,
+      leaseSeconds: 120,
+      runtimeCapabilities: labelCapabilities,
+    })
+    assert.equal(retryClaim[0].globalId, retryJob.globalId)
+    const terminalManagedFailure = await persistence.failOperationsPrintJobInPostgres({
+      agent: primaryAgent,
+      jobGlobalId: retryJob.globalId,
+      claimToken: retryClaim[0].claimToken,
+      idempotencyKey: `managed-retry-fail-${fixture.suffix}`,
+      errorCode: 'TEST_FAILURE',
+      errorMessage: 'Intentional managed authorization retry boundary test',
+      retryable: false,
+    })
+    assert.equal(terminalManagedFailure.status, 'failed')
+    await updateManagedConnection({
+      configuration: managedSandboxRatingOnlyConfiguration,
+    })
+    await expectRejected(
+      () => persistence.retryOperationsPrintJobInPostgres({
+        organizationId: fixture.organizationId,
+        jobGlobalId: retryJob.globalId,
+        actorEmail: fixture.actorEmail,
+        idempotencyKey: `managed-operator-retry-${fixture.suffix}`,
+        reason: 'Authorization downgrade must prevent retry',
+      }),
+      /not authorized to release sandbox label bytes/,
+    )
+    await restoreManagedConnection()
+
+    const reprintLabel = await seedRateTestLabel(
+      pool,
+      fixture,
+      managedRateTestConnection,
+      'managed-reprint',
+    )
+    const reprintSourceJob = await enqueueRateTestLabel(
+      reprintLabel,
+      'managed-reprint',
+    )
+    const reprintSourceClaim = await persistence.claimOperationsPrintJobsInPostgres({
+      agent: primaryAgent,
+      idempotencyKey: `managed-reprint-claim-${fixture.suffix}`,
+      limit: 1,
+      leaseSeconds: 120,
+      runtimeCapabilities: labelCapabilities,
+    })
+    assert.equal(reprintSourceClaim[0].globalId, reprintSourceJob.globalId)
+    await persistence.acknowledgeOperationsPrintJobInPostgres({
+      agent: primaryAgent,
+      jobGlobalId: reprintSourceJob.globalId,
+      claimToken: reprintSourceClaim[0].claimToken,
+      idempotencyKey: `managed-reprint-ack-${fixture.suffix}`,
+    })
+    await updateManagedConnection({
+      configuration: managedSandboxRatingOnlyConfiguration,
+    })
+    await expectRejected(
+      () => persistence.reprintOperationsPrintJobInPostgres({
+        organizationId: fixture.organizationId,
+        jobGlobalId: reprintSourceJob.globalId,
+        actorEmail: fixture.actorEmail,
+        idempotencyKey: `managed-reprint-denied-${fixture.suffix}`,
+        reason: 'Authorization downgrade must prevent reprint',
+      }),
+      /not authorized to release sandbox label bytes/,
+    )
+    await restoreManagedConnection()
+    const userManagedRateTestConnection = await seedRateTestConnection(
+      pool,
+      fixture,
+      {
+        provider: 'fedex_rest',
+        name: 'User-managed FedEx sandbox',
+        configuration: {},
+      },
+    )
+    const deferredUserManagedJobs = []
+    for (let index = 1; index <= 26; index += 1) {
+      const discriminator = `user-managed-deferred-${String(index).padStart(2, '0')}`
+      const label = await seedRateTestLabel(
+        pool,
+        fixture,
+        userManagedRateTestConnection,
+        discriminator,
+      )
+      deferredUserManagedJobs.push(
+        await enqueueRateTestLabel(label, discriminator),
+      )
+    }
+    await pool.query(
+      `UPDATE operations_print_jobs
+       SET available_at = now() + interval '1 hour'
+       WHERE organization_id = $1::uuid
+         AND global_id = ANY($2::text[])`,
+      [
+        fixture.organizationId,
+        deferredUserManagedJobs.map((job) => job.globalId),
+      ],
+    )
+    const managedHeadOfLineJob = await persistence.reprintOperationsPrintJobInPostgres({
+      organizationId: fixture.organizationId,
+      jobGlobalId: reprintSourceJob.globalId,
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `managed-reprint-head-${fixture.suffix}`,
+      reason: 'Create a queued managed job for head-of-line authorization proof',
+    })
+    await updateManagedConnection({
+      configuration: managedSandboxRatingOnlyConfiguration,
+    })
+    await expectRejected(
+      () => persistence.reprintOperationsPrintJobInPostgres({
+        organizationId: fixture.organizationId,
+        jobGlobalId: reprintSourceJob.globalId,
+        actorEmail: fixture.actorEmail,
+        idempotencyKey: `managed-reprint-head-${fixture.suffix}`,
+        reason: 'Create a queued managed job for head-of-line authorization proof',
+      }),
+      /not authorized to release sandbox label bytes/,
+    )
+    const userManagedLabel = await seedRateTestLabel(
+      pool,
+      fixture,
+      userManagedRateTestConnection,
+      'user-managed-lifecycle',
+    )
+    const userManagedJob = await enqueueRateTestLabel(
+      userManagedLabel,
+      'user-managed-lifecycle',
+    )
+    const userManagedClaimInput = {
+      agent: primaryAgent,
+      idempotencyKey: `user-managed-claim-${fixture.suffix}`,
+      limit: 1,
+      leaseSeconds: 120,
+      runtimeCapabilities: labelCapabilities,
+    }
+    const userManagedClaim = await persistence.claimOperationsPrintJobsInPostgres(
+      userManagedClaimInput,
+    )
+    assert.equal(userManagedClaim.length, 1)
+    assert.equal(userManagedClaim[0].globalId, userManagedJob.globalId)
+    assert.equal(await printJobStatus(managedHeadOfLineJob.globalId), 'cancelled')
+    const userManagedReplay = await persistence.claimOperationsPrintJobsInPostgres(
+      userManagedClaimInput,
+    )
+    assert.equal(userManagedReplay[0].claimToken, userManagedClaim[0].claimToken)
+    const userManagedFailure = await persistence.failOperationsPrintJobInPostgres({
+      agent: primaryAgent,
+      jobGlobalId: userManagedJob.globalId,
+      claimToken: userManagedClaim[0].claimToken,
+      idempotencyKey: `user-managed-fail-${fixture.suffix}`,
+      errorCode: 'TEST_FAILURE',
+      errorMessage: 'Intentional user-managed retry lifecycle test',
+      retryable: false,
+    })
+    assert.equal(userManagedFailure.status, 'failed')
+    const userManagedRetry = await persistence.retryOperationsPrintJobInPostgres({
+      organizationId: fixture.organizationId,
+      jobGlobalId: userManagedJob.globalId,
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `user-managed-retry-${fixture.suffix}`,
+      reason: 'User-managed sandbox connections retain operator retry',
+    })
+    assert.equal(userManagedRetry.status, 'queued')
+    const userManagedRetryClaim = await persistence.claimOperationsPrintJobsInPostgres({
+      agent: primaryAgent,
+      idempotencyKey: `user-managed-retry-claim-${fixture.suffix}`,
+      limit: 1,
+      leaseSeconds: 120,
+      runtimeCapabilities: labelCapabilities,
+    })
+    assert.equal(userManagedRetryClaim[0].globalId, userManagedJob.globalId)
+    const userManagedDelivered = await persistence.acknowledgeOperationsPrintJobInPostgres({
+      agent: primaryAgent,
+      jobGlobalId: userManagedJob.globalId,
+      claimToken: userManagedRetryClaim[0].claimToken,
+      idempotencyKey: `user-managed-ack-${fixture.suffix}`,
+    })
+    assert.equal(userManagedDelivered.status, 'delivered')
+    const userManagedReprint = await persistence.reprintOperationsPrintJobInPostgres({
+      organizationId: fixture.organizationId,
+      jobGlobalId: userManagedJob.globalId,
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `user-managed-reprint-${fixture.suffix}`,
+      reason: 'User-managed sandbox connections retain controlled reprint',
+    })
+    assert.equal(userManagedReprint.status, 'queued')
+    await persistence.cancelOperationsPrintJobInPostgres({
+      organizationId: fixture.organizationId,
+      jobGlobalId: userManagedReprint.globalId,
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `cancel-user-managed-reprint-${fixture.suffix}`,
+      reason: 'User-managed lifecycle proof completed without physical output',
+    })
+    await restoreManagedConnection()
 
     const offlinePrimaryEnrollment =
       await persistence.enrollOperationsPrintAgentInPostgres({

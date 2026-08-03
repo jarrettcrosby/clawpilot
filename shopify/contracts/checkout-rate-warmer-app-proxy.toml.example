@@ -1,0 +1,18 @@
+# Merge this app-proxy fragment into the Shopify CLI configuration linked to
+# the existing EPISHIP app. Preserve every scope the app already requires and
+# add read_customers plus write_app_proxy to its existing access-scope list.
+#
+# Shopify app-proxy mapping:
+#   Storefront root:
+#     https://<shop>/apps/clawpilot
+#   ClawPilot development root:
+#     https://dev.aiapp.eigenracing.com/api/integrations/commerce/shopify/rate-warm
+#
+# Shopify appends child paths below the storefront root to the ClawPilot root.
+# Therefore /apps/clawpilot/checkout-rate-warmer resolves to:
+# /api/integrations/commerce/shopify/rate-warm/checkout-rate-warmer
+
+[app_proxy]
+url = "https://dev.aiapp.eigenracing.com/api/integrations/commerce/shopify/rate-warm"
+prefix = "apps"
+subpath = "clawpilot"

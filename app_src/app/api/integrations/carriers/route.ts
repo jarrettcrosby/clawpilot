@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { globalIdPattern } from '@/lib/globalIds.mjs'
 import {
   CarrierIntegrationRequestError,
   createCarrierAccount,
@@ -198,7 +199,7 @@ function globalReference(
   label: string,
 ) {
   const normalized = String(value || '').trim()
-  if (!new RegExp(`^${prefix}[0-9]{7}$`).test(normalized)) {
+  if (!globalIdPattern(prefix).test(normalized)) {
     throw new CarrierIntegrationRequestError(
       `${label} is invalid`,
       400,
@@ -425,16 +426,7 @@ export async function GET(req: NextRequest) {
       integrations,
       rateTestLabels: rateTestLabels.map(safeRateTestLabel),
       rateTestAttempts: rateTestAttempts.map(safeRateTestLabelAttempt),
-      rateTestPrinters: printers
-        .filter((printer) => (
-          printer.status === 'online'
-          && printer.connectionMode === 'local_agent'
-          && printer.localPrintAgentStatus === 'active'
-          && printer.supportedDocumentTypes.includes('shipping_label')
-          && printer.supportedFormats.length > 0
-          && printer.supportedMedia.some((media) => media === 'label_4x6' || media === 'label_4x8')
-        ))
-        .map(safeRateTestPrinter),
+      rateTestPrinters: printers.map(safeRateTestPrinter),
       rateTestLabelOutputs: {
         ups_rest: carrierSandboxLabelOutputOptions('ups_rest'),
         fedex_rest: carrierSandboxLabelOutputOptions('fedex_rest'),

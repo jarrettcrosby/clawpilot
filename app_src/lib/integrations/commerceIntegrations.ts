@@ -26,17 +26,26 @@ import {
 import {
   auditShopifyScopeUpdatePayload,
   auditShopifyScopeRequirements,
+  hasEffectiveShopifyScope,
   SHOPIFY_ADMIN_API_VERSION,
+  SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS,
   SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS,
+  SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
+  SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
   SHOPIFY_RECEIPT_PROOF_SCOPES,
 } from '@/lib/integrations/commerceCapabilities'
 import {
+  createShopifyWebhookSubscription,
+  discoverShopifyWebhookSubscriptions,
   normalizeShopifyShopDomain,
   probeShopifyConnection,
   requestShopifyAccessToken,
   ShopifyCommerceClientError,
   verifyShopifyWebhookHmac,
 } from '@/lib/integrations/shopifyCommerceClient'
+import {
+  shopifyDeletedProductEvidence,
+} from '@/lib/integrations/shopifyCatalogWebhook'
 import {
   assertShopifyOrderPreviewRuntime,
   fetchShopifyOrderPreview,
@@ -70,12 +79,18 @@ import {
   readShopifyOrderPreviewStateFromPostgres,
   storeShopifyOrderPreviewInPostgres,
 } from '@/lib/persistence/commerceOrderPreviews'
+import {
+  ShopifyFulfillmentNotificationPolicyError,
+  updateShopifyFulfillmentNotificationPolicyInPostgres,
+} from '@/lib/persistence/shopifyFulfillmentNotifications'
 import { appPublicUrl } from '@/lib/publicUrl'
 
 const SHOPIFY_ADAPTER_VERSION = `shopify-graphql-${SHOPIFY_ADMIN_API_VERSION}-control-v1`
 const SHOPIFY_ORDER_PREVIEW_ADAPTER_VERSION =
   `shopify-graphql-${SHOPIFY_ADMIN_API_VERSION}-held-preview-v1`
 const FAIRE_ADAPTER_VERSION = 'faire-external-api-v2-control-v1'
+const FAIRE_OAUTH_GRANT_ADAPTER_VERSION =
+  'faire-external-api-v2-oauth-authorization-code-v1'
 const FAIRE_OAUTH_INSTALLATION_TTL_MS = 15 * 60 * 1000
 const SHOPIFY_ORDER_PREVIEW_PROVIDER_BUDGET_MS = 50_000
 const SHOPIFY_ORDER_PREVIEW_PROVIDER_CALL_TIMEOUT_MS = 10_000
@@ -83,6 +98,17 @@ const MAX_WEBHOOK_BYTES = 512 * 1024
 const SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPIC_SET = new Set<string>(
   SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS,
 )
+
+function missingShopifyReceiptProofScopes(grantedScopes: unknown) {
+  const granted = Array.isArray(grantedScopes)
+    ? grantedScopes.filter(
+      (scope): scope is string => typeof scope === 'string',
+    )
+    : []
+  return SHOPIFY_RECEIPT_PROOF_SCOPES.filter(
+    (scope) => !hasEffectiveShopifyScope(granted, scope),
+  )
+}
 
 export class CommerceIntegrationRequestError extends Error {
   readonly status: number
@@ -102,6 +128,13 @@ export class CommerceIntegrationRequestError extends Error {
 
 function sanitize(error: unknown): CommerceIntegrationRequestError {
   if (error instanceof CommerceIntegrationRequestError) return error
+  if (error instanceof ShopifyFulfillmentNotificationPolicyError) {
+    return new CommerceIntegrationRequestError(
+      error.message,
+      error.status,
+      error.code,
+    )
+  }
   if (error instanceof ShopifyCommerceClientError) {
     return new CommerceIntegrationRequestError(
       error.message,
@@ -493,6 +526,7 @@ export async function completeFaireOAuthCommerce(input: {
       pending.browserSessionId,
       pending.stateHash,
     )
+    const exchangeRequestedAt = new Date().toISOString()
     const grant = await exchangeFaireOAuthAuthorizationCode({
       applicationId: application.applicationId,
       applicationSecret: application.applicationSecret,
@@ -501,6 +535,10 @@ export async function completeFaireOAuthCommerce(input: {
       scopes: pending.requestedScopes,
       state,
     })
+    const exchangeCompletedAt = new Date().toISOString()
+    const credentialFingerprintSha256 = createHash('sha256')
+      .update(grant.accessToken)
+      .digest('hex')
     const profile = await probeFaireBrandProfile({
       accessToken: grant.accessToken,
       applicationId: application.applicationId,
@@ -530,8 +568,9 @@ export async function completeFaireOAuthCommerce(input: {
         && pending.requestedScopes[0] === 'READ_BRAND'
         ? 'connection_test'
         : 'distributed_operations',
-      grantedScopes: null,
-      scopeVerification: 'not_exposed_by_provider',
+      grantedScopes: [...pending.requestedScopes],
+      scopeVerification: 'oauth_grant',
+      oauthGrantTokenType: grant.tokenType,
       webhooksAvailable: false,
       sandboxAvailable: false,
       returnWritesAvailable: false,
@@ -556,6 +595,14 @@ export async function completeFaireOAuthCommerce(input: {
       webhookVerificationStatus: 'not_applicable',
       resources: FAIRE_SYNC_RESOURCES,
       actorEmail: input.actorEmail,
+      faireOAuthGrant: {
+        requestedScopes: [...pending.requestedScopes],
+        tokenType: grant.tokenType,
+        credentialFingerprintSha256,
+        requestedAt: exchangeRequestedAt,
+        completedAt: exchangeCompletedAt,
+        adapterVersion: FAIRE_OAUTH_GRANT_ADAPTER_VERSION,
+      },
     })
   } catch (error) {
     throw sanitize(error)
@@ -671,7 +718,7 @@ export async function connectShopifyCommerce(input: {
       accessToken: grant.accessToken,
     })
     const scopeAudit = auditShopifyScopeRequirements(
-      SHOPIFY_RECEIPT_PROOF_SCOPES,
+      SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
       probe.grantedScopes,
     )
     const credential: ShopifyCommerceCredential = {
@@ -693,7 +740,7 @@ export async function connectShopifyCommerce(input: {
       tokenAcquisition: 'client_credentials',
       accessTokenLifetimeSeconds: grant.expiresIn,
       accessTokenPersisted: false,
-      scopeProfile: 'receipt_evidence_v1',
+      scopeProfile: 'distributed_operations_v1',
       requestedScopes: scopeAudit.requestedScopes,
       missingScopes: scopeAudit.missingScopes,
       restrictedScopes: scopeAudit.restrictedScopes,
@@ -977,9 +1024,10 @@ export async function importShopifyOrderPreview(input: {
         'SHOPIFY_STORE_IDENTITY_CHANGED',
       )
     }
-    const probeScopes = new Set(probe.grantedScopes)
-    const tokenScopes = new Set(grant.grantedScopes)
-    if (!probeScopes.has('read_orders') || !tokenScopes.has('read_orders')) {
+    if (
+      !hasEffectiveShopifyScope(probe.grantedScopes, 'read_orders')
+      || !hasEffectiveShopifyScope(grant.grantedScopes, 'read_orders')
+    ) {
       throw new CommerceIntegrationRequestError(
         'The installed Shopify app has not granted read_orders',
         409,
@@ -1110,8 +1158,22 @@ async function verifyStoredConnection(
       )
     }
     const scopeAudit = auditShopifyScopeRequirements(
-      SHOPIFY_RECEIPT_PROOF_SCOPES,
+      SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
       probe.grantedScopes,
+    )
+    const webhookSubscriptions = await discoverShopifyWebhookSubscriptions(
+      { shopDomain, accessToken: grant.accessToken },
+      {
+        desiredUri: webhookUrl(runtime.globalId),
+        topics: SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
+      },
+    )
+    const catalogWebhookSubscriptions = await discoverShopifyWebhookSubscriptions(
+      { shopDomain, accessToken: grant.accessToken },
+      {
+        desiredUri: webhookUrl(runtime.globalId),
+        topics: SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS,
+      },
     )
     return {
       configuration: {
@@ -1125,10 +1187,37 @@ async function verifyStoredConnection(
         tokenAcquisition: 'client_credentials',
         accessTokenLifetimeSeconds: grant.expiresIn,
         accessTokenPersisted: false,
-        scopeProfile: 'receipt_evidence_v1',
+        scopeProfile: 'distributed_operations_v1',
         requestedScopes: scopeAudit.requestedScopes,
         missingScopes: scopeAudit.missingScopes,
         restrictedScopes: scopeAudit.restrictedScopes,
+        webhookSubscriptions: {
+          desiredUri: webhookSubscriptions.desiredUri,
+          requiredTopics: webhookSubscriptions.requiredTopics,
+          observedCount: webhookSubscriptions.subscriptions.length,
+          matchingCount: webhookSubscriptions.subscriptions.filter(
+            (subscription) => subscription.uri === webhookSubscriptions.desiredUri,
+          ).length,
+          missingTopics: webhookSubscriptions.missingTopics,
+          conflictingTopics: webhookSubscriptions.conflictingTopics,
+          ready: webhookSubscriptions.ready,
+          observedAt: new Date().toISOString(),
+          providerWrites: 0,
+        },
+        catalogWebhookSubscriptions: {
+          desiredUri: catalogWebhookSubscriptions.desiredUri,
+          requiredTopics: catalogWebhookSubscriptions.requiredTopics,
+          observedCount: catalogWebhookSubscriptions.subscriptions.length,
+          matchingCount: catalogWebhookSubscriptions.subscriptions.filter(
+            (subscription) => subscription.uri
+              === catalogWebhookSubscriptions.desiredUri,
+          ).length,
+          missingTopics: catalogWebhookSubscriptions.missingTopics,
+          conflictingTopics: catalogWebhookSubscriptions.conflictingTopics,
+          ready: catalogWebhookSubscriptions.ready,
+          observedAt: new Date().toISOString(),
+          providerWrites: 0,
+        },
         lastVerifiedAt: new Date().toISOString(),
         domainWorkersActivated: false,
       },
@@ -1138,6 +1227,16 @@ async function verifyStoredConnection(
         shopDomain: probe.shopDomain,
         grantedScopeCount: probe.grantedScopes.length,
         tokenLifetimeSeconds: grant.expiresIn,
+        webhookSubscriptionReady: webhookSubscriptions.ready,
+        webhookSubscriptionObservedCount: webhookSubscriptions.subscriptions.length,
+        webhookSubscriptionMissingCount: webhookSubscriptions.missingTopics.length,
+        webhookSubscriptionConflictingCount: webhookSubscriptions.conflictingTopics.length,
+        catalogWebhookSubscriptionReady: catalogWebhookSubscriptions.ready,
+        catalogWebhookSubscriptionObservedCount:
+          catalogWebhookSubscriptions.subscriptions.length,
+        catalogWebhookSubscriptionMissingCount:
+          catalogWebhookSubscriptions.missingTopics.length,
+        providerWrites: 0,
       },
     }
   }
@@ -1161,6 +1260,18 @@ async function verifyStoredConnection(
       'FAIRE_BRAND_IDENTITY_CHANGED',
     )
   }
+  const recordedGrantedScopes = Array.isArray(
+    runtime.configuration.grantedScopes,
+  )
+    ? runtime.configuration.grantedScopes.filter(
+        (scope): scope is string => typeof scope === 'string',
+      )
+    : []
+  const recordedScopeVerification = credential.authMode === 'faire_oauth'
+    && runtime.configuration.scopeVerification === 'oauth_grant'
+    && recordedGrantedScopes.length > 0
+    ? 'oauth_grant'
+    : 'not_exposed_by_provider'
   return {
     configuration: {
       ...runtime.configuration,
@@ -1174,7 +1285,9 @@ async function verifyStoredConnection(
     response: {
       brandId: identity.id,
       brandName: identity.name,
-      scopeVerification: 'not_exposed_by_provider',
+      scopeVerification: recordedScopeVerification,
+      grantedScopeCount: recordedGrantedScopes.length,
+      scopeEvidenceRefreshed: false,
     },
   }
 }
@@ -1219,9 +1332,10 @@ export async function testCommerceConnection(input: {
       actorEmail: input.actorEmail,
       errorCode: null,
       configuration: verified.configuration,
-      disableIntegration: runtime.provider === 'shopify'
-        && Array.isArray(verified.configuration.missingScopes)
-        && verified.configuration.missingScopes.length > 0,
+      holdReceiptIntake: runtime.provider === 'shopify'
+        && missingShopifyReceiptProofScopes(
+          verified.configuration.grantedScopes,
+        ).length > 0,
     })
   } catch (error) {
     const sanitized = sanitize(error)
@@ -1262,6 +1376,112 @@ export async function testCommerceConnection(input: {
   }
 }
 
+async function registerShopifyWebhookSubscriptionGroup(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  actorEmail: string
+  group: 'inventory' | 'catalog'
+}) {
+  let runtime: CommerceRuntimeCredentialRecord | null = null
+  const requestedAt = new Date()
+  const idempotencyKey = randomUUID()
+  try {
+    runtime = await storedRuntime(input)
+    if (runtime.provider !== 'shopify') {
+      throw new CommerceIntegrationRequestError(
+        'Webhook registration requires a Shopify sales channel',
+        400,
+        'SHOPIFY_WEBHOOK_PROVIDER_REQUIRED',
+      )
+    }
+    if (runtime.verificationStatus !== 'verified' || runtime.status !== 'active') {
+      throw new CommerceIntegrationRequestError(
+        'Verify and enable the Shopify connection before registering webhooks',
+        409,
+        'SHOPIFY_WEBHOOK_VERIFICATION_REQUIRED',
+      )
+    }
+    const stored = decryptStoredCredential(runtime)
+    if (stored.provider !== 'shopify') throw new Error('Stored commerce credential could not be decrypted')
+    const shopDomain = normalizeShopifyShopDomain(runtime.configuration.shopDomain)
+    const grant = await requestShopifyAccessToken({
+      shopDomain,
+      clientId: stored.clientId,
+      clientSecret: stored.clientSecret,
+    })
+    const providerCredential = { shopDomain, accessToken: grant.accessToken }
+    const desiredUri = webhookUrl(runtime.globalId)
+    const topics = input.group === 'inventory'
+      ? SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS
+      : SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS
+    const created = []
+    for (const topic of topics) {
+      created.push(await createShopifyWebhookSubscription(
+        providerCredential,
+        { uri: desiredUri, topic },
+      ))
+    }
+    const readiness = await discoverShopifyWebhookSubscriptions(
+      providerCredential,
+      { desiredUri, topics },
+    )
+    if (!readiness.ready) {
+      throw new CommerceIntegrationRequestError(
+        `Shopify ${input.group} webhook registration could not be verified`,
+        502,
+        'SHOPIFY_WEBHOOK_REGISTRATION_UNVERIFIED',
+      )
+    }
+    await recordCommerceProviderAttemptInPostgres({
+      organizationId: runtime.organizationId,
+      accountGlobalId: runtime.globalId,
+      action: `webhooks.${input.group}.register`,
+      adapterVersion: SHOPIFY_ADAPTER_VERSION,
+      idempotencyKey,
+      requestHash: createHash('sha256').update(JSON.stringify({
+        accountGlobalId: runtime.globalId,
+        credentialVersion: runtime.credentialVersion,
+        desiredUri,
+        topics,
+      })).digest('hex'),
+      redactedRequest: {
+        credentialVersion: runtime.credentialVersion,
+        topics,
+      },
+      redactedResponse: {
+        ready: true,
+        subscriptionCount: readiness.subscriptions.length,
+        providerWrites: created.filter((subscription) => subscription.created).length,
+      },
+      state: 'succeeded',
+      providerReference: runtime.externalAccountId,
+      errorCode: null,
+      actorEmail: input.actorEmail,
+      requestedAt: requestedAt.toISOString(),
+      completedAt: new Date().toISOString(),
+    })
+    return testCommerceConnection(input)
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
+export function registerShopifyInventoryWebhookSubscriptions(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  actorEmail: string
+}) {
+  return registerShopifyWebhookSubscriptionGroup({ ...input, group: 'inventory' })
+}
+
+export function registerShopifyCatalogWebhookSubscriptions(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  actorEmail: string
+}) {
+  return registerShopifyWebhookSubscriptionGroup({ ...input, group: 'catalog' })
+}
+
 export async function setCommerceIntegrationEnabled(input: {
   organizationId: unknown
   accountGlobalId: unknown
@@ -1277,7 +1497,7 @@ export async function setCommerceIntegrationEnabled(input: {
     const runtime = await storedRuntime(input)
     if (input.enabled && runtime.provider === 'faire') {
       throw new CommerceIntegrationRequestError(
-        'Faire runtime polling is not implemented; the verified connection must remain disabled',
+        'Faire does not use Shopify signed-receipt intake; its verified provider-read connection remains active independently',
         409,
         'FAIRE_RUNTIME_NOT_IMPLEMENTED',
       )
@@ -1292,16 +1512,12 @@ export async function setCommerceIntegrationEnabled(input: {
         organizationId: runtime.organizationId,
         accountGlobalId: runtime.globalId,
       })
-      const missingScopes = Array.isArray(
-        refreshed.configuration.missingScopes,
+      const missingReceiptScopes = missingShopifyReceiptProofScopes(
+        refreshed.configuration.grantedScopes,
       )
-        ? refreshed.configuration.missingScopes.filter(
-          (scope): scope is string => typeof scope === 'string',
-        )
-        : []
-      if (missingScopes.length) {
+      if (missingReceiptScopes.length) {
         throw new CommerceIntegrationRequestError(
-          `Shopify app is missing the receipt-proof scopes: ${missingScopes.join(', ')}`,
+          `Shopify app is missing signed-receipt scopes: ${missingReceiptScopes.join(', ')}`,
           409,
           'SHOPIFY_SCOPE_PROFILE_INCOMPLETE',
         )
@@ -1321,6 +1537,72 @@ export async function setCommerceIntegrationEnabled(input: {
       )
     }
     return result.state
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
+export async function setShopifyFulfillmentNotificationPolicy(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  expectedRevision: unknown
+  notifyCustomerDefault: unknown
+  reason: unknown
+  confirmCustomerNotifications: unknown
+  actorEmail: string
+}) {
+  try {
+    const organizationId = normalizeCommerceOrganizationId(input.organizationId)
+    const accountGlobalId = normalizeCommerceAccountGlobalId(input.accountGlobalId)
+    if (
+      typeof input.expectedRevision !== 'number'
+      || !Number.isSafeInteger(input.expectedRevision)
+      || input.expectedRevision < 0
+    ) {
+      throw new CommerceIntegrationRequestError(
+        'A valid fulfillment notification policy revision is required',
+        400,
+        'SHOPIFY_FULFILLMENT_NOTIFICATION_REVISION_INVALID',
+      )
+    }
+    if (typeof input.notifyCustomerDefault !== 'boolean') {
+      throw new CommerceIntegrationRequestError(
+        'Shopify customer notification default must be true or false',
+        400,
+        'SHOPIFY_FULFILLMENT_NOTIFICATION_DEFAULT_INVALID',
+      )
+    }
+    const reason = String(input.reason || '').trim()
+    if (
+      reason.length < 10
+      || reason.length > 500
+      || /[\u0000-\u001f\u007f]/.test(reason)
+    ) {
+      throw new CommerceIntegrationRequestError(
+        'A fulfillment notification policy reason of 10-500 characters is required',
+        400,
+        'SHOPIFY_FULFILLMENT_NOTIFICATION_REASON_REQUIRED',
+      )
+    }
+    if (
+      input.notifyCustomerDefault
+      && input.confirmCustomerNotifications !== true
+    ) {
+      throw new CommerceIntegrationRequestError(
+        'Confirm that future Shopify fulfillment confirmations may email customers',
+        400,
+        'SHOPIFY_FULFILLMENT_NOTIFICATION_CONFIRMATION_REQUIRED',
+      )
+    }
+    await updateShopifyFulfillmentNotificationPolicyInPostgres({
+      organizationId,
+      accountGlobalId,
+      actorEmail: input.actorEmail,
+      expectedRevision: input.expectedRevision,
+      notifyCustomerDefault: input.notifyCustomerDefault,
+      reason,
+    })
+    return getCommerceIntegrationsState(organizationId)
   } catch (error) {
     throw sanitize(error)
   }
@@ -1484,6 +1766,22 @@ export async function receiveShopifyWebhook(input: {
     const payloadHash = createHash('sha256')
       .update(input.rawBody)
       .digest('hex')
+    let productDeletion: ReturnType<
+      typeof shopifyDeletedProductEvidence
+    > = null
+    try {
+      productDeletion = shopifyDeletedProductEvidence({
+        topic,
+        verifiedPayload: payload,
+        verifiedPayloadHash: payloadHash,
+      })
+    } catch {
+      throw new CommerceIntegrationRequestError(
+        'Shopify product-delete payload is invalid',
+        400,
+        'SHOPIFY_WEBHOOK_JSON_INVALID',
+      )
+    }
     const encryptedPayload = encryptCommerceWebhookPayload(
       input.rawBody,
       runtime.globalId,
@@ -1501,6 +1799,7 @@ export async function receiveShopifyWebhook(input: {
       payloadBytes: input.rawBody.byteLength,
       providerTriggeredAt,
       scopeAudit,
+      productDeletion,
     })
     await markShopifyWebhookSecretVerifiedInPostgres({ runtime })
     return receipt

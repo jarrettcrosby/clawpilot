@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { globalIdPattern } from '../app_src/lib/globalIds.mjs'
 
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
@@ -24,7 +25,7 @@ const STARTER_EVIDENCE_REFERENCE =
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const PRODUCT_GLOBAL_ID_PATTERN = /^gp\d{7}$/
+const PRODUCT_GLOBAL_ID_PATTERN = globalIdPattern('gp')
 const PROFILE_KEY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,79}$/
 const COMPATIBILITY_KEY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,119}$/
 const MAX_ASSIGNED_PRODUCTS = 250
@@ -253,6 +254,7 @@ function profile(input) {
     dimensionBasis: 'unspecified',
     grossWeightGrams: null,
     weightBasis: 'unspecified',
+    unitOfMeasure: input.packageLevel === 'case' ? 'case' : 'each',
     fitModel: 'rigid_3d',
     shipsAsOwnPackage: false,
     assemblyPolicy: 'never',
@@ -491,7 +493,7 @@ export const AG_PRODUCT_PACK_CLASSES = Object.freeze({
       profile({
         profileKey: 'customer-ship-case-1',
         profileName: '10 lb bulk ship-ready carton',
-        packageLevel: 'case',
+        packageLevel: 'inner_pack',
         baseEachQuantity: 1,
         ...AG12V2_DIMENSIONS,
         shipsAsOwnPackage: true,
@@ -535,7 +537,7 @@ export const AG_PRODUCT_PACK_CLASSES = Object.freeze({
       profile({
         profileKey: 'customer-ship-case-1',
         profileName: '20 lb bulk ship-ready carton',
-        packageLevel: 'case',
+        packageLevel: 'inner_pack',
         baseEachQuantity: 1,
         ...TWENTY_POUND_BOX_DIMENSIONS,
         shipsAsOwnPackage: true,
@@ -588,9 +590,21 @@ export function validatePackClassManifest(packClasses = AG_PRODUCT_PACK_CLASSES)
       }
       if (
         candidate.packageLevel === 'each'
-        && candidate.baseEachQuantity !== 1
+        && (
+          candidate.baseEachQuantity !== 1
+          || candidate.unitOfMeasure !== 'each'
+        )
       ) {
         fail(`${classKey} each profile must contain exactly one base each`)
+      }
+      if (
+        candidate.packageLevel === 'case'
+        && (
+          candidate.baseEachQuantity < 2
+          || candidate.unitOfMeasure !== 'case'
+        )
+      ) {
+        fail(`${classKey} case profile must contain at least two base eaches`)
       }
       const dimensionsPresent = [
         candidate.lengthMm,
@@ -914,6 +928,7 @@ async function loadCurrentChannelStates(client, target, product) {
             state.external_product_id, state.external_variant_id,
             state.normalized_status, state.provider_updated_at::text,
             state.observed_at::text, state.source_revision, state.source_hash,
+            state.pack_evidence_hash,
             state.product_mapping_id::text,
             mapping.global_id AS product_mapping_global_id
      FROM operations_product_channel_states state
@@ -1034,14 +1049,13 @@ export function providerPackMappingMatches(existing, expected) {
     existing
     && existing.product_id === expected.productId
     && existing.default_pack_profile_version_id === expected.profileVersionId
+    && existing.mapping_purpose === expected.mappingPurpose
     && existing.external_product_id === expected.channelState.external_product_id
     && existing.provider_lifecycle_state
       === expected.channelState.normalized_status
     && existing.projection_state === 'current'
-    && existing.source_revision === expected.channelState.source_revision
-    && existing.source_hash === expected.channelState.source_hash
-    && existing.provider_updated_at
-      === expected.channelState.provider_updated_at
+    && existing.pack_evidence_hash
+      === expected.channelState.pack_evidence_hash
   )
 }
 
@@ -1144,6 +1158,8 @@ async function loadSyntheticStarterCleanupPlan(client, target) {
     'operations_approved_pack_recipes',
     'operations_cartonization_rate_evidence_packages',
     'operations_packaging_material_stock',
+    'operations_shopify_carrier_service_config_materials',
+    'operations_shopify_checkout_rate_receipt_packages',
   ])
   if (
     actualReferenceTables.size !== expectedReferenceTables.size
@@ -1190,6 +1206,34 @@ async function loadSyntheticStarterCleanupPlan(client, target) {
   if (cartonizationRateEvidencePackages.rowCount > 0) {
     fail(
       'Synthetic starter materials have immutable cartonization-rate evidence references',
+    )
+  }
+  const carrierServiceConfigMaterials = await client.query(
+    `SELECT config_id::text, packaging_material_id::text
+     FROM operations_shopify_carrier_service_config_materials
+     WHERE organization_id = $1::uuid
+       AND packaging_material_id = ANY($2::uuid[])
+     ORDER BY config_id, packaging_material_id
+     FOR UPDATE`,
+    [target.organization.id, materialIds],
+  )
+  if (carrierServiceConfigMaterials.rowCount > 0) {
+    fail(
+      'Synthetic starter materials have Shopify carrier-service configuration references',
+    )
+  }
+  const checkoutReceiptPackages = await client.query(
+    `SELECT receipt_id::text, package_key
+     FROM operations_shopify_checkout_rate_receipt_packages
+     WHERE organization_id = $1::uuid
+       AND packaging_material_id = ANY($2::uuid[])
+     ORDER BY receipt_id, package_key
+     FOR UPDATE`,
+    [target.organization.id, materialIds],
+  )
+  if (checkoutReceiptPackages.rowCount > 0) {
+    fail(
+      'Synthetic starter materials have immutable Shopify checkout receipt references',
     )
   }
   const stock = await client.query(
@@ -1457,7 +1501,7 @@ async function stageProfile(client, target, product, candidate) {
     const version = currentVersions[0]
     const compatible = valuesCompatible(version, {
       base_each_quantity: candidate.baseEachQuantity,
-      unit_of_measure: 'each',
+      unit_of_measure: candidate.unitOfMeasure,
       length_mm: candidate.lengthMm,
       width_mm: candidate.widthMm,
       height_mm: candidate.heightMm,
@@ -1546,9 +1590,9 @@ async function stageProfile(client, target, product, candidate) {
        confirmed_at, confirmed_by, source, is_current, created_by
      ) VALUES (
        $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5,
-       'customer_confirmed', $6, 'each', $7, $8, $9, $10,
-       $11, $12, $13, $14, $15, 'customer_confirmed', $16,
-       now(), $17, 'customer_supplied', true, $17
+       'customer_confirmed', $6, $7, $8, $9, $10, $11,
+       $12, $13, $14, $15, $16, 'customer_confirmed', $17,
+       now(), $18, 'customer_supplied', true, $18
      )
      RETURNING id::text, global_id, version_number, lifecycle_state,
                row_version::text`,
@@ -1559,6 +1603,7 @@ async function stageProfile(client, target, product, candidate) {
       profileRow.id,
       versionNumber,
       candidate.baseEachQuantity,
+      candidate.unitOfMeasure,
       candidate.lengthMm,
       candidate.widthMm,
       candidate.heightMm,
@@ -1586,19 +1631,26 @@ async function stageProviderPackMapping(
   product,
   channelState,
   sellUnitProfile,
+  {
+    mappingPurpose = 'catalog',
+    retainExistingProfile = false,
+  } = {},
 ) {
   const existing = await client.query(
     `SELECT id::text, global_id, product_id::text,
             external_product_id,
             default_pack_profile_version_id::text,
             provider_lifecycle_state, projection_state,
-            source_revision, source_hash, provider_updated_at::text,
+            mapping_purpose, source_revision, source_hash,
+            pack_evidence_hash,
+            provider_updated_at::text, observed_at::text,
             row_version::text
      FROM operations_commerce_variant_pack_mappings
      WHERE organization_id = $1::uuid
        AND integration_account_id = $2::uuid
        AND provider = $3
        AND external_variant_id = $4
+       AND mapping_purpose = $5
        AND is_current = true
      FOR UPDATE`,
     [
@@ -1606,14 +1658,22 @@ async function stageProviderPackMapping(
       channelState.integration_account_id,
       channelState.provider,
       channelState.external_variant_id,
+      mappingPurpose,
     ],
   )
   if (existing.rowCount > 1) {
-    fail('Provider variant has multiple current pack mappings')
+    fail('Provider variant has multiple current pack mappings for one purpose')
   }
+  if (retainExistingProfile && existing.rowCount === 0) {
+    return null
+  }
+  const retainedProfileVersionId = retainExistingProfile
+    ? existing.rows[0].default_pack_profile_version_id
+    : sellUnitProfile.version.id
   const expected = {
     productId: product.id,
-    profileVersionId: sellUnitProfile.version.id,
+    profileVersionId: retainedProfileVersionId,
+    mappingPurpose,
     channelState,
   }
   if (existing.rowCount === 1) {
@@ -1623,18 +1683,12 @@ async function stageProviderPackMapping(
         `${product.reference_code} provider variant has a conflicting pack mapping`,
       )
     }
-    const exactProfile = row.default_pack_profile_version_id
-      === sellUnitProfile.version.id
     const repairedProfile = Boolean(
-      sellUnitProfile.repair
+      !retainExistingProfile
+      && sellUnitProfile.repair
       && row.default_pack_profile_version_id
         === sellUnitProfile.repair.previousVersionId,
     )
-    if (!exactProfile && !repairedProfile) {
-      fail(
-        `${product.reference_code} provider variant has a conflicting pack mapping`,
-      )
-    }
     if (providerPackMappingMatches(row, expected)) {
       return { ...row, disposition: 'reused' }
     }
@@ -1682,12 +1736,13 @@ async function stageProviderPackMapping(
        organization_id, integration_account_id, pipeline_id, product_id,
        provider, external_product_id, external_variant_id,
        default_pack_profile_version_id, provider_lifecycle_state,
-       projection_state, source_revision, source_hash,
-       provider_updated_at, observed_at, is_current, created_by, updated_by
+       projection_state, mapping_purpose, source_revision, source_hash,
+       pack_evidence_hash, provider_updated_at, observed_at, is_current,
+       created_by, updated_by
      ) VALUES (
        $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8::uuid,
-       $9, 'current', $10, $11, $12::timestamptz, $13::timestamptz,
-       true, $14, $14
+       $9, 'current', $10, $11, $12, $13, $14::timestamptz,
+       $15::timestamptz, true, $16, $16
      )
      RETURNING id::text, global_id`,
     [
@@ -1698,10 +1753,12 @@ async function stageProviderPackMapping(
       channelState.provider,
       channelState.external_product_id,
       channelState.external_variant_id,
-      sellUnitProfile.version.id,
+      retainedProfileVersionId,
       channelState.normalized_status,
+      mappingPurpose,
       channelState.source_revision,
       channelState.source_hash,
+      channelState.pack_evidence_hash,
       channelState.provider_updated_at,
       channelState.observed_at,
       target.actorEmail,
@@ -2106,7 +2163,7 @@ async function stageHierarchy(
         const channelState
         of channelStatesByProduct.get(assignment.productGlobalId)
       ) {
-        const row = await stageProviderPackMapping(
+        const catalogMapping = await stageProviderPackMapping(
           client,
           target,
           product,
@@ -2115,18 +2172,49 @@ async function stageHierarchy(
         )
         providerMappings.push({
           provider: channelState.provider,
+          purpose: 'catalog',
           externalVariantId: channelState.external_variant_id,
           sourceRevision: channelState.source_revision,
           sourceHash: channelState.source_hash,
-          disposition: row.disposition,
-          replacedMapping: row.replacedMapping || null,
+          disposition: catalogMapping.disposition,
+          replacedMapping: catalogMapping.replacedMapping || null,
         })
         const dispositionKey = {
           created: 'providerMappingsCreated',
           versioned: 'providerMappingsVersioned',
           reused: 'providerMappingsReused',
-        }[row.disposition]
+        }[catalogMapping.disposition]
         dispositions[dispositionKey] += 1
+        if (channelState.provider === 'shopify') {
+          const checkoutMapping = await stageProviderPackMapping(
+            client,
+            target,
+            product,
+            channelState,
+            sellUnitProfile,
+            {
+              mappingPurpose: 'shopify_checkout',
+              retainExistingProfile: true,
+            },
+          )
+          if (checkoutMapping) {
+            providerMappings.push({
+              provider: channelState.provider,
+              purpose: 'shopify_checkout',
+              externalVariantId: channelState.external_variant_id,
+              sourceRevision: channelState.source_revision,
+              sourceHash: channelState.source_hash,
+              disposition: checkoutMapping.disposition,
+              replacedMapping: checkoutMapping.replacedMapping || null,
+            })
+            const checkoutDispositionKey = {
+              created: 'providerMappingsCreated',
+              versioned: 'providerMappingsVersioned',
+              reused: 'providerMappingsReused',
+            }[checkoutMapping.disposition]
+            dispositions[checkoutDispositionKey] += 1
+          }
+        }
       }
       const relationshipResults = []
       for (const candidate of packClass.relationships) {
@@ -2455,6 +2543,18 @@ function selfTest() {
     [18, 30],
   )
   assert.deepEqual(
+    sixOunce.profiles.map((candidate) => [
+      candidate.packageLevel,
+      candidate.baseEachQuantity,
+      candidate.unitOfMeasure,
+    ]),
+    [
+      ['each', 1, 'each'],
+      ['case', 18, 'case'],
+      ['case', 30, 'case'],
+    ],
+  )
+  assert.deepEqual(
     sixOunce.recipes.map((candidate) => [
       candidate.inputQuantity,
       candidate.minimumInputQuantity,
@@ -2532,10 +2632,16 @@ function selfTest() {
     const providerSellUnit = AG_PRODUCT_PACK_CLASSES[classKey].profiles.find(
       (candidate) => candidate.isDefault,
     )
+    const shipReadyUnit = AG_PRODUCT_PACK_CLASSES[classKey].profiles.find(
+      (candidate) => candidate.shipsAsOwnPackage,
+    )
     assert.equal(providerSellUnit.fitModel, 'approved_recipe_only')
     assert.equal(providerSellUnit.lengthMm, null)
     assert.equal(providerSellUnit.widthMm, null)
     assert.equal(providerSellUnit.heightMm, null)
+    assert.equal(shipReadyUnit.packageLevel, 'inner_pack')
+    assert.equal(shipReadyUnit.baseEachQuantity, 1)
+    assert.equal(shipReadyUnit.unitOfMeasure, 'each')
   }
   const bulkSellUnit = AG_PRODUCT_PACK_CLASSES.ten_pound_bulk.profiles.find(
     (candidate) => candidate.isDefault,
@@ -2699,28 +2805,40 @@ function selfTest() {
   const mappingExpected = {
     productId: '00000000-0000-4000-8000-000000000001',
     profileVersionId: '00000000-0000-4000-8000-000000000002',
+    mappingPurpose: 'shopify_checkout',
     channelState: {
       external_product_id: 'provider-product',
       normalized_status: 'active',
       source_revision: 'revision-1',
       source_hash: 'c'.repeat(64),
+      pack_evidence_hash: 'e'.repeat(64),
       provider_updated_at: '2026-07-28 00:00:00+00',
     },
   }
   const mappingRow = {
     product_id: mappingExpected.productId,
     default_pack_profile_version_id: mappingExpected.profileVersionId,
+    mapping_purpose: mappingExpected.mappingPurpose,
     external_product_id: mappingExpected.channelState.external_product_id,
     provider_lifecycle_state: 'active',
     projection_state: 'current',
     source_revision: mappingExpected.channelState.source_revision,
     source_hash: mappingExpected.channelState.source_hash,
+    pack_evidence_hash: mappingExpected.channelState.pack_evidence_hash,
     provider_updated_at: mappingExpected.channelState.provider_updated_at,
   }
   assert.equal(providerPackMappingMatches(mappingRow, mappingExpected), true)
   assert.equal(providerPackMappingMatches({
     ...mappingRow,
     source_hash: 'd'.repeat(64),
+  }, mappingExpected), true)
+  assert.equal(providerPackMappingMatches({
+    ...mappingRow,
+    pack_evidence_hash: 'd'.repeat(64),
+  }, mappingExpected), false)
+  assert.equal(providerPackMappingMatches({
+    ...mappingRow,
+    mapping_purpose: 'catalog',
   }, mappingExpected), false)
   return {
     ok: true,

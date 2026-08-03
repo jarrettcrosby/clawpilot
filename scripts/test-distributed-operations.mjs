@@ -141,6 +141,27 @@ function verifySourceContracts() {
     )
   }
 
+  const sandboxCommerceE2eActiveGuardMigration = read(
+    'db/migrations/0200_operations_sandbox_commerce_e2e_active_guards.sql',
+  )
+  for (const fragment of [
+    'CREATE OR REPLACE FUNCTION validate_ops_plan_cartonization_evidence()',
+    'CREATE OR REPLACE FUNCTION validate_ops_activation_canonical_plans()',
+    'operations_sandbox_commerce_e2e_authorizations sandbox_auth',
+    "sandbox_auth.state = 'active'",
+    'sandbox_auth.expires_at > statement_timestamp()',
+    "authorized_order.status = 'packed'",
+    "authorized_order.source_provider = 'shopify'",
+    'sandbox_auth.external_order_id = authorized_order.external_order_id',
+    "OLD.status IN ('planned', 'released')",
+    "NEW.status = 'fulfilled'",
+  ]) {
+    assert.ok(
+      sandboxCommerceE2eActiveGuardMigration.includes(fragment),
+      `Sandbox commerce E2E Active guard migration missing ${fragment}`,
+    )
+  }
+
   const packagingMigration = read('db/migrations/0086_product_packaging_profiles.sql')
   for (const fragment of [
     "('gpp', 'operations.product_package_profile'",
@@ -467,6 +488,21 @@ function verifySourceContracts() {
     'Carrier account schema must not persist plaintext account numbers',
   )
 
+  const canonicalPlanningMigration = read(
+    'db/migrations/0176_operations_canonical_fulfillment_planning.sql',
+  )
+  for (const fragment of [
+    'LEFT JOIN operations_cartonization_rate_evidence evidence',
+    'plan.cartonization_evidence_id IS NULL',
+    'Active fulfillment planning requires sealed production carrier-read evidence',
+    'A terminal provider commitment reservation cannot be reactivated',
+  ]) {
+    assert.ok(
+      canonicalPlanningMigration.includes(fragment),
+      `Canonical planning safety migration missing ${fragment}`,
+    )
+  }
+
   const persistence = read('app_src/lib/persistence/operations.ts')
   for (const fragment of [
     'readOperationsWorkspaceFromPostgres',
@@ -479,6 +515,10 @@ function verifySourceContracts() {
     'operations_command_receipts',
     'OPERATIONS_IDEMPOTENCY_CONFLICT',
     'operations.customer_resolution.review_required',
+    'DO UPDATE SET status = \'active\'',
+    'RETURNING entity_global_id',
+    'OPERATIONS_CUSTOMER_IDENTITY_CONFLICT',
+    'trimmed(input.identity.externalCustomerId, 512)',
     "status: 'ambiguous'",
     'uniqueReferenceRows',
     'operations:exception:',
@@ -509,24 +549,225 @@ function verifySourceContracts() {
     "'operations.location.deleted'",
     "'operations.location.retired'",
     'operations_location_product_rules',
-    'row_number() OVER (ORDER BY location.pick_sequence, allocation.id)::integer',
+    'ORDER BY location.pick_sequence, position.global_id,',
+    'allocation.id',
     'SAVEPOINT delete_operations_location',
     "commandType: 'verify_operations_order_pack'",
     "eventType: 'operations.package.packed'",
     "eventType: 'operations.order.pack_verified'",
     'generateOperationsPackagePackingSlipInPostgres',
     "commandType: 'generate_operations_package_packing_slip'",
-    "eventType: 'operations.package.packing_list_generated'",
+    "eventType: 'operations.package.pack_work_instruction_generated'",
+    "documentKind: 'pack_work_instruction'",
+    "documentStage: 'pre_label_pack_work_instruction'",
+    'finalPackingSlip: false',
+    "'legacy_prelabel_packing_list'",
+    'PACKAGE_PACK_WORK_INSTRUCTION_TEMPLATE_VERSION',
+    "storage_reference LIKE",
     'OPERATIONS_PACKAGE_CONTENTS_INCOMPLETE',
     'source_package_id',
     'readDefaultProductPackagingWithClient',
     'orders.archived_at IS NULL',
     "warehouse.code <> 'MOCK-01'",
   ]) assert.ok(persistence.includes(fragment), `Operations persistence missing ${fragment}`)
+  const transpiledPersistence = ts.transpileModule(persistence, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+    fileName: 'app_src/lib/persistence/operations.ts',
+  }).outputText
+  const runtimeAliasImports = [
+    ...new Set(
+      [...transpiledPersistence.matchAll(
+        /require\(["'](@\/[^"']+)["']\)/g,
+      )].map((match) => match[1]),
+    ),
+  ]
+  const acceptanceHarness = read(
+    'scripts/test-distributed-operations.mjs',
+  ).slice(
+    read('scripts/test-distributed-operations.mjs').indexOf(
+      'async function verifyPostgresAcceptance',
+    ),
+  )
+  for (const specifier of runtimeAliasImports) {
+    assert.ok(
+      acceptanceHarness.includes(`'${specifier}'`),
+      `Operations PostgreSQL harness must map runtime alias ${specifier}`,
+    )
+  }
   assert.match(
     persistence,
     /INSERT INTO operations_order_lines[\s\S]*?RETURNING id::text, global_id, external_line_id/,
     'Proof-order package validation must retain the persisted external line ID',
+  )
+  assert.match(
+    persistence,
+    /async function revalidateProviderCommitmentsForPlan[\s\S]*?SET status = status[\s\S]*?reservation_authority = 'provider_commitment'/,
+    'Warehouse release must re-run database authority validation for every active Shopify provider commitment',
+  )
+  const providerCommitmentRevalidation = persistence.match(
+    /async function revalidateProviderCommitmentsForPlan[\s\S]*?(?=\nasync function readOrderDetail)/,
+  )?.[0]
+  assert.ok(
+    providerCommitmentRevalidation,
+    'Provider commitment current-support revalidation helper must remain available',
+  )
+  assert.match(
+    providerCommitmentRevalidation,
+    /SELECT DISTINCT allocation\.position_id::text[\s\S]*?ORDER BY allocation\.position_id::text[\s\S]*?'operations:inventory-reservation'[\s\S]*?const authorityResult[\s\S]*?FOR UPDATE OF position, reservation/,
+    'Provider commitment revalidation must take sorted position advisory locks before row locks',
+  )
+  for (const fragment of [
+    'operations_provider_commitment_current_support',
+    'support.supported',
+    'support.reason_code',
+    'support.latest_inventory_sync_run_global_id',
+  ]) {
+    assert.ok(
+      providerCommitmentRevalidation.includes(fragment),
+      `Provider commitment current-support query missing ${fragment}`,
+    )
+  }
+  assert.match(
+    providerCommitmentRevalidation,
+    /!row\.supported \|\| !row\.latest_sync_run_global_id[\s\S]*?OPERATIONS_PROVIDER_COMMITMENT_CHANGED/,
+    'Unsupported or missing current Shopify evidence must fail with the stable provider-commitment conflict code',
+  )
+  assert.match(
+    providerCommitmentRevalidation,
+    /count: reservationIds\.length[\s\S]*?latestInventorySyncRunGlobalIds/,
+    'Provider commitment revalidation must return immutable current-sync evidence for audit payloads',
+  )
+  assert.match(
+    persistence,
+    /'shopify-inventory-apply'[\s\S]*?revalidateProviderCommitmentsForPlan/,
+    'Warehouse release must serialize provider-commitment revalidation with Shopify inventory application',
+  )
+  const warehouseReleaseRegion = persistence.match(
+    /export async function releaseOperationsOrderFromPostgres[\s\S]*?(?=\nexport async function)/,
+  )?.[0]
+  assert.ok(
+    warehouseReleaseRegion,
+    'Warehouse-release implementation must remain available',
+  )
+  assert.match(
+    warehouseReleaseRegion,
+    /providerCommitmentsRevalidated:[\s\S]*?providerCommitmentInventorySyncRunGlobalIds:[\s\S]*?operations\.order\.released[\s\S]*?providerCommitmentsRevalidated:[\s\S]*?providerCommitmentInventorySyncRunGlobalIds:/,
+    'Warehouse release domain and audit evidence must record the latest current Shopify inventory sync runs',
+  )
+  assert.match(
+    persistence,
+    /LEFT JOIN operations_cartonization_rate_evidence evidence[\s\S]*?plan\.cartonization_evidence_id IS NULL[\s\S]*?carrierReadEnvironment'[\s\S]*?IS DISTINCT FROM 'production'/,
+    'Active activation must fail closed for both missing and non-production plan evidence',
+  )
+  assert.match(
+    persistence,
+    /activation\.state === 'active'[\s\S]*?!plan\.cartonization_evidence_id[\s\S]*?plan\.carrier_read_environment !== 'production'[\s\S]*?OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION/,
+    'Warehouse release must fail closed when active planning evidence is missing or non-production',
+  )
+  assert.match(
+    persistence,
+    /if \(pick\.source_authority === 'shopify'\) \{[\s\S]*?continue[\s\S]*?INSERT INTO operations_inventory_ledger/,
+    'Shopify-authoritative picks must not append a local inventory-ledger movement',
+  )
+  assert.match(
+    persistence,
+    /reservation\.status AS reservation_status[\s\S]*?pick\.reservation_status !== 'active'/,
+    'Pick confirmation must fail closed when either reservation authority is no longer active',
+  )
+  assert.match(
+    persistence,
+    /async function consumeProviderCommitment[\s\S]*?SET status = 'consumed'[\s\S]*?reservation_authority = 'provider_commitment'/,
+    'Shipment confirmation must consume the provider commitment without changing a local inventory balance',
+  )
+  const providerCommitmentConsumer = persistence.match(
+    /async function consumeProviderCommitment[\s\S]*?(?=\nfunction providerCommitmentValidationFailed)/,
+  )?.[0]
+  assert.ok(
+    providerCommitmentConsumer,
+    'Provider commitment consumption helper must remain available',
+  )
+  assert.doesNotMatch(
+    providerCommitmentConsumer,
+    /operations_inventory_(?:positions|ledger)/,
+    'Provider commitment consumption must not mutate local positions or ledger rows',
+  )
+  assert.match(
+    persistence,
+    /allocation\.source_authority === 'shopify'[\s\S]*?consumeProviderCommitment[\s\S]*?continue[\s\S]*?consumeReservedInventory/,
+    'Shipment confirmation must branch provider commitments away from local inventory consumption',
+  )
+  const shipmentConfirmationRegion = persistence.match(
+    /export async function confirmOperationsOrderShipmentFromPostgres[\s\S]*$/,
+  )?.[0]
+  assert.ok(
+    shipmentConfirmationRegion,
+    'Shipment-confirmation implementation must remain available',
+  )
+  assert.match(
+    shipmentConfirmationRegion,
+    /'shopify-inventory-apply'[\s\S]*?const planResult[\s\S]*?FOR UPDATE/,
+    'Shipment confirmation must serialize with Shopify inventory application before locking fulfillment rows',
+  )
+  assert.match(
+    shipmentConfirmationRegion,
+    /OPERATIONS_ALLOCATION_INCOMPLETE[\s\S]*?revalidateProviderCommitmentsForPlan[\s\S]*?consumePackagingMaterialClaimsForPlan[\s\S]*?INSERT INTO operations_shipments/,
+    'Shipment confirmation must revalidate current Shopify support immediately before transactional shipment mutations',
+  )
+  assert.match(
+    shipmentConfirmationRegion,
+    /operations\.shipment\.confirmed[\s\S]*?providerCommitmentsRevalidated:[\s\S]*?providerCommitmentInventorySyncRunGlobalIds:[\s\S]*?operations\.order\.shipment_confirmed[\s\S]*?providerCommitmentsRevalidated:[\s\S]*?providerCommitmentInventorySyncRunGlobalIds:/,
+    'Shipment domain and audit evidence must record the latest current Shopify inventory sync runs',
+  )
+  const canonicalPlanningRegion = persistence.match(
+    /type PlanningPositionRow[\s\S]*?(?=\n      const actualCheckoutCharge)/,
+  )?.[0]
+  assert.ok(
+    canonicalPlanningRegion,
+    'Canonical planning inventory allocation region must remain available',
+  )
+  assert.match(
+    canonicalPlanningRegion,
+    /positionRows\.length !== 1[\s\S]*?OPERATIONS_PROVIDER_INVENTORY_AMBIGUOUS/,
+    'Shopify authority must retain one exact provider inventory level',
+  )
+  assert.match(
+    canonicalPlanningRegion,
+    /floor\([\s\S]*?position\.damaged_quantity[\s\S]*?ORDER BY\s+location\.pick_sequence,\s+position\.global_id[\s\S]*?FOR UPDATE OF position/,
+    'Local planning must lock every usable position in deterministic pick-route and permanent-Global-ID order',
+  )
+  assert.match(
+    canonicalPlanningRegion,
+    /let remainingQuantity = quantity[\s\S]*?for \(const position of positionRows\)[\s\S]*?Math\.min\([\s\S]*?remainingQuantity,[\s\S]*?availableWholeUnits[\s\S]*?remainingQuantity -= allocatedQuantity[\s\S]*?OPERATIONS_INVENTORY_SHORTAGE/,
+    'Local planning must allocate only the remaining whole-unit demand and fail closed on cumulative shortage',
+  )
+  assert.match(
+    canonicalPlanningRegion,
+    /line\.global_id,[\s\S]*?position\.global_id,[\s\S]*?\.join\(':'\)[\s\S]*?reserved_quantity = reserved_quantity \+ \$3[\s\S]*?operations_inventory_ledger/,
+    'Every selected local position must own a stable position-specific reservation and ledger delta',
+  )
+  assert.match(
+    canonicalPlanningRegion,
+    /inventoryAllocations\.reduce\([\s\S]*?\) !== quantity[\s\S]*?OPERATIONS_INVENTORY_ALLOCATION_INCOMPLETE/,
+    'Canonical local allocations must conserve each exact order-line quantity',
+  )
+  assert.match(
+    persistence,
+    /for \(const inventoryAllocation of inventoryAllocations\)[\s\S]*?INSERT INTO operations_fulfillment_allocations[\s\S]*?inventoryAllocation\.quantity/,
+    'Planning must create one fulfillment allocation for every position reservation',
+  )
+  assert.match(
+    persistence,
+    /row_number\(\) OVER \(\s*ORDER BY location\.pick_sequence, position\.global_id,\s*allocation\.id\s*\)::integer/,
+    'Warehouse release must sequence one pick per allocation by route, permanent position Global ID, and allocation identity',
+  )
+  assert.match(
+    persistence,
+    /pickResult\.rows\.length[\s\S]*?allocation_count[\s\S]*?pick\.quantity[\s\S]*?pick\.allocation_quantity[\s\S]*?pick\.reservation_quantity[\s\S]*?pick\.from_location_id !== pick\.position_location_id/,
+    'Pick confirmation must revalidate complete split task count, quantities, and source position',
   )
   assert.ok(!persistence.includes('console.'), 'Operations persistence must not log tenant data')
 
@@ -628,6 +869,11 @@ function verifySourceContracts() {
     "action === 'void-sandbox-label'",
     'Idempotency-Key',
     "action === 'update-exception'",
+    "action === 'prepare-commerce-active-authorization'",
+    "action === 'activate-commerce-with-authorization'",
+    'expectedCurrentState',
+    'expectedCurrentRevision',
+    'COMMERCE_ACTIVE_AUTHORIZATION_REQUIRED',
     "action === 'update-activation'",
   ]) assert.ok(route.includes(fragment), `Operations route missing ${fragment}`)
   assert.ok(!/clientSecret|accessToken|privateKey/i.test(route), 'Operations route must not handle credentials')
@@ -666,16 +912,41 @@ function verifySourceContracts() {
   )
   for (const fragment of [
     'Exact contents',
-    'Generate packing list',
-    'Download PDF',
-    'Print packing list',
+    'Generate Pack Work Instruction',
+    'Download Pack Work Instruction',
+    'Print Pack Work Instruction',
+    'Legacy pre-label packing list',
+    'retained for audit only',
+    'operations-package-work-instruction-v1:',
+    'It is not a final packing slip and has no carrier label or tracking number.',
     "action: 'generate-packing-slip'",
     "action: 'enqueue-packing-slip-artifact'",
-    'does not rate, purchase, void, or update a carrier',
   ]) {
     assert.ok(
       operationsSection.includes(fragment),
-      `Package packing-list UI missing ${fragment}`,
+      `Package Pack Work Instruction UI missing ${fragment}`,
+    )
+  }
+  assert.ok(
+    !operationsSection.includes('Generate packing list')
+      && !operationsSection.includes('Print packing list'),
+    'Pre-label package actions must not be presented as packing-list actions',
+  )
+  for (const fragment of [
+    "action: 'prepare-commerce-active-authorization'",
+    "action: 'activate-commerce-with-authorization'",
+    'expectedActivationState',
+    'expectedActivationRevision',
+    'confirmActiveProviderWrites: true',
+    'expectedCurrentState',
+    'expectedCurrentRevision',
+    'Prepare exact review',
+    'I authorize ClawPilot to move Operations from Shadow to Active for exactly the reviewed accounts and provider-write capabilities.',
+    'commerce-active-transition-v1',
+  ]) {
+    assert.ok(
+      operationsSection.includes(fragment),
+      `Commerce Active authorization UI missing ${fragment}`,
     )
   }
 
@@ -989,6 +1260,42 @@ async function verifyRouteBehavior() {
       this.status = status
     }
   }
+  class CommerceActiveTransitionPersistenceError extends Error {
+    constructor(code, message, status = 409) {
+      super(message)
+      this.code = code
+      this.status = status
+    }
+  }
+  class CarrierIntegrationRequestError extends Error {
+    constructor(message, status = 409, code = 'CARRIER_REQUEST_INVALID') {
+      super(message)
+      this.status = status
+      this.code = code
+    }
+  }
+  class ProductionFulfillmentReratePersistenceError extends Error {
+    constructor(code, message, status = 409) {
+      super(message)
+      this.code = code
+      this.status = status
+    }
+  }
+  class ProductionFulfillmentRerateExecutionError extends Error {
+    constructor(code, message, status = 409, attemptGlobalId = null) {
+      super(message)
+      this.code = code
+      this.status = status
+      this.attemptGlobalId = attemptGlobalId
+    }
+  }
+  class ActiveFulfillmentExecutionPreparationError extends Error {
+    constructor(code, message, status = 409) {
+      super(message)
+      this.code = code
+      this.status = status
+    }
+  }
   const calls = {
     reads: [],
     proofs: [],
@@ -999,7 +1306,12 @@ async function verifyRouteBehavior() {
     labelVoids: [],
     exceptions: [],
     activations: [],
+    activePreparations: [],
+    activeAuthorizations: [],
+    activeTransitions: [],
+    productionRerates: [],
   }
+  let productionRerateError = null
   const route = loadTypeScriptModule('app_src/app/api/operations/route.ts', {
     mocks: {
       'next/server': {
@@ -1020,6 +1332,111 @@ async function verifyRouteBehavior() {
         },
       },
       '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+      '@/lib/integrations/carrierIntegrations': {
+        CarrierIntegrationRequestError,
+      },
+      '@/lib/operations/productionFulfillmentRerateExecution': {
+        ProductionFulfillmentRerateExecutionError,
+        executeProductionFulfillmentRerate: async (input) => {
+          calls.productionRerates.push(input)
+          if (productionRerateError) throw productionRerateError
+          return {
+            run: { globalId: 'gafr1234567', packageCount: 2 },
+            attempt: { globalId: 'gara1234567', replayed: false },
+            result: { globalId: 'garr1234567', state: 'succeeded' },
+          }
+        },
+      },
+      '@/lib/operations/productionFulfillmentRerates': {
+        ProductionFulfillmentReratePersistenceError,
+      },
+      '@/lib/operations/activeFulfillmentExecutionPreparation': {
+        ActiveFulfillmentExecutionPreparationError,
+        prepareActiveFulfillmentExecutionFromShadowInPostgres: async () => {
+          throw new Error('Active preparation is covered by its focused route contract')
+        },
+      },
+      '@/lib/persistence/commerceActiveTransitionAuthorization': {
+        CommerceActiveTransitionPersistenceError,
+        prepareCommerceActiveTransitionInPostgres: async (input) => {
+          calls.activePreparations.push(input)
+          return {
+            preparationGlobalId: 'gcap1234567',
+            cohortHash: 'a'.repeat(64),
+            expectedActivationState: 'shadow',
+            expectedActivationRevision: input.expectedActivationRevision,
+            targetActivationState: 'active',
+            targetActivationRevision: input.expectedActivationRevision + 1,
+            accounts: input.selectedAccounts.map((account, index) => ({
+              accountId: randomUUID(),
+              accountGlobalId: account.accountGlobalId,
+              provider: index === 0 ? 'shopify' : 'faire',
+              environment: index === 0 ? 'sandbox' : 'production',
+              externalAccountId: index === 0
+                ? 'proof-store.myshopify.com'
+                : 'b_proof_brand',
+              credentialGeneration: 2,
+              authMode: index === 0
+                ? 'shopify_client_credentials'
+                : 'faire_brand_token',
+              priorAccountStatus: 'active',
+              targetAccountStatus: 'active',
+              grantedScopes: index === 0
+                ? ['write_products', 'write_publications']
+                : ['WRITE_PRODUCTS'],
+              grantedScopeDigest: 'b'.repeat(64),
+              writeCapabilities: account.capabilities,
+              capabilityDigest: 'c'.repeat(64),
+            })),
+            preparedBy: input.actorEmail,
+            preparedRole: 'owner',
+            preparedAt: '2026-07-30T12:00:00.000Z',
+            replayed: false,
+          }
+        },
+        authorizeCommerceActiveTransitionInPostgres: async (input) => {
+          calls.activeAuthorizations.push(input)
+          return {
+            authorizationGlobalId: 'gcaa1234567',
+            preparationGlobalId: input.preparationGlobalId,
+            cohortHash: input.expectedCohortHash,
+            confirmationStatementVersion: 'commerce-active-transition-v1',
+            authorizedBy: input.actorEmail,
+            authorizedRole: 'owner',
+            authorizedAt: '2026-07-30T12:01:00.000Z',
+            expiresAt: '2026-07-30T12:06:00.000Z',
+            replayed: false,
+          }
+        },
+        consumeCommerceActiveTransitionAuthorizationInPostgres: async (input) => {
+          calls.activeTransitions.push(input)
+          return {
+            transitionGlobalId: 'gcat1234567',
+            preparationGlobalId: 'gcap1234567',
+            authorizationGlobalId: input.authorizationGlobalId,
+            cohortHash: input.expectedCohortHash,
+            fromActivationState: 'shadow',
+            fromActivationRevision: 4,
+            state: 'active',
+            revision: 5,
+            accountCount: 1,
+            capabilityCount: 1,
+            reason: input.reason,
+            activatedBy: input.actorEmail,
+            activatedRole: 'owner',
+            activatedAt: '2026-07-30T12:01:01.000Z',
+            replayed: false,
+          }
+        },
+      },
+      '@/lib/persistence/sandboxCommerceE2eAuthorization': {
+        SandboxCommerceE2eAuthorizationError: class extends Error {},
+        authorizeSandboxCommerceE2eInPostgres: async (input) => ({
+          authorizationGlobalId: 'gsea1234567',
+          orderGlobalId: input.orderGlobalId,
+          state: 'active',
+        }),
+      },
       '@/lib/persistence/operations': {
         OperationsRequestError,
         readOperationsWorkspaceFromPostgres: async (input) => {
@@ -1064,6 +1481,13 @@ async function verifyRouteBehavior() {
           }
         },
         updateOperationsActivationInPostgres: async (input) => {
+          if (input.expectedCurrentRevision === 99) {
+            throw new OperationsRequestError(
+              'OPERATIONS_ACTIVATION_CONFLICT',
+              'Operations activation changed before the requested transition',
+              409,
+            )
+          }
           calls.activations.push(input)
           return {
             state: input.state,
@@ -1154,6 +1578,7 @@ async function verifyRouteBehavior() {
   assert.equal(calls.reads.length, 1)
   assert.deepEqual(JSON.parse(JSON.stringify(calls.reads[0])), {
     organizationId: actor.organizationId,
+    actorEmail: actor.email,
     capabilities: actor.capabilities,
     search: 'proof',
     status: 'shipped',
@@ -1371,6 +1796,168 @@ async function verifyRouteBehavior() {
     idempotencyKey: 'pack-route-proof-1',
   })
 
+  const productionRerateCommand = {
+    action: 'execute-production-rerate',
+    activeExecutionGlobalId: 'gaex1234567',
+    activeShipmentGroupGlobalId: 'gash1234567',
+    expectedActivationRevision: 7,
+    destination: {
+      contactName: 'Test Customer',
+      companyName: null,
+      phone: '2035550100',
+      email: 'customer@example.test',
+      line1: '1 Test Street',
+      line2: null,
+      line3: null,
+      city: 'Hartford',
+      region: 'ct',
+      postalCode: '06103',
+      countryCode: 'us',
+      residential: true,
+    },
+    currency: 'usd',
+    provider: 'fedex_rest',
+    integrationAccountGlobalId: 'gia1234567',
+    carrierAccountGlobalId: 'gac1234567',
+    origin: {
+      contactName: 'AG Alchemy Warehouse',
+      companyName: 'AG Alchemy, LLC',
+      phone: '4025550100',
+      email: 'warehouse@example.test',
+      line1: '7009 S 108th Street',
+      line2: null,
+      line3: null,
+      city: 'La Vista',
+      region: 'ne',
+      postalCode: '68128',
+      countryCode: 'us',
+      residential: false,
+    },
+    fedexPickupType: 'USE_SCHEDULED_PICKUP',
+  }
+  const deniedProductionRerate = await route.POST(request(
+    'http://localhost/api/operations',
+    {
+      actor: {
+        ...actor,
+        capabilities: {
+          canView: true,
+          canManage: true,
+          canExecute: false,
+          canActivate: false,
+        },
+      },
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'production-rerate-denied-1',
+      },
+      body: JSON.stringify(productionRerateCommand),
+    },
+  ))
+  assert.equal(deniedProductionRerate.status, 403)
+  assert.equal(
+    (await payload(deniedProductionRerate)).code,
+    'OPERATIONS_EXECUTE_REQUIRED',
+  )
+  assert.equal(calls.productionRerates.length, 0)
+
+  const invalidProductionRerate = await route.POST(request(
+    'http://localhost/api/operations',
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'production-rerate-invalid-1',
+      },
+      body: JSON.stringify({
+        ...productionRerateCommand,
+        provider: 'usps',
+      }),
+    },
+  ))
+  assert.equal(invalidProductionRerate.status, 400)
+  assert.equal(
+    (await payload(invalidProductionRerate)).code,
+    'OPERATIONS_REQUEST_INVALID',
+  )
+  assert.equal(calls.productionRerates.length, 0)
+
+  const productionRerateWithoutKey = await route.POST(request(
+    'http://localhost/api/operations',
+    {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(productionRerateCommand),
+    },
+  ))
+  assert.equal(productionRerateWithoutKey.status, 400)
+  assert.equal(
+    (await payload(productionRerateWithoutKey)).code,
+    'OPERATIONS_IDEMPOTENCY_KEY_INVALID',
+  )
+  assert.equal(calls.productionRerates.length, 0)
+
+  const validProductionRerate = await route.POST(request(
+    'http://localhost/api/operations',
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'production-rerate-route-1',
+      },
+      body: JSON.stringify(productionRerateCommand),
+    },
+  ))
+  assert.equal(validProductionRerate.status, 201)
+  assert.equal((await payload(validProductionRerate)).result.result.state, 'succeeded')
+  assert.equal(calls.productionRerates.length, 1)
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.productionRerates[0])), {
+    organizationId: actor.organizationId,
+    activeExecutionGlobalId: 'gaex1234567',
+    activeShipmentGroupGlobalId: 'gash1234567',
+    expectedActivationRevision: 7,
+    destination: {
+      ...productionRerateCommand.destination,
+      region: 'CT',
+      countryCode: 'US',
+    },
+    currency: 'USD',
+    provider: 'fedex_rest',
+    integrationAccountGlobalId: 'gia1234567',
+    carrierAccountGlobalId: 'gac1234567',
+    origin: {
+      ...productionRerateCommand.origin,
+      region: 'NE',
+      countryCode: 'US',
+    },
+    fedexPickupType: 'USE_SCHEDULED_PICKUP',
+    idempotencyKey: 'production-rerate-route-1',
+    actorEmail: actor.email,
+  })
+
+  productionRerateError = new ProductionFulfillmentRerateExecutionError(
+    'CARRIER_PRODUCTION_RATE_TIMEOUT',
+    'The carrier request timed out',
+    504,
+    'gara7654321',
+  )
+  const failedProductionRerate = await route.POST(request(
+    'http://localhost/api/operations',
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'production-rerate-route-2',
+      },
+      body: JSON.stringify(productionRerateCommand),
+    },
+  ))
+  assert.equal(failedProductionRerate.status, 504)
+  assert.deepEqual(await payload(failedProductionRerate), {
+    ok: false,
+    error: 'The carrier request timed out',
+    code: 'CARRIER_PRODUCTION_RATE_TIMEOUT',
+    attemptGlobalId: 'gara7654321',
+  })
+  assert.equal(calls.productionRerates.length, 2)
+  productionRerateError = null
+
   const deniedLabelCreate = await route.POST(request('http://localhost/api/operations', {
     actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: false, canActivate: false } },
     headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'label-create-denied-1' },
@@ -1424,6 +2011,8 @@ async function verifyRouteBehavior() {
     carrierRateGlobalId: 'grt1234567',
     carrierAccountGlobalId: 'gac1234567',
     preferredPrinterGlobalId: 'gpr1234567',
+    packageGlobalId: null,
+    sandboxE2eAuthorizationGlobalId: null,
     idempotencyKey: 'label-create-route-proof-1',
   })
 
@@ -1471,7 +2060,13 @@ async function verifyRouteBehavior() {
 
   const validActivation = await route.POST(request('http://localhost/api/operations', {
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'update-activation', state: 'read_only', reason: 'Provider reconciliation only' }),
+    body: JSON.stringify({
+      action: 'update-activation',
+      state: 'read_only',
+      reason: 'Provider reconciliation only',
+      expectedCurrentState: 'shadow',
+      expectedCurrentRevision: 4,
+    }),
   }))
   assert.equal(validActivation.status, 200)
   assert.equal(calls.activations.length, 1)
@@ -1480,7 +2075,40 @@ async function verifyRouteBehavior() {
     actorEmail: actor.email,
     state: 'read_only',
     reason: 'Provider reconciliation only',
+    expectedCurrentState: 'shadow',
+    expectedCurrentRevision: 4,
   })
+
+  const staleActivation = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'update-activation',
+      state: 'frozen',
+      reason: 'Freeze stale transition',
+      expectedCurrentState: 'shadow',
+      expectedCurrentRevision: 99,
+    }),
+  }))
+  assert.equal(staleActivation.status, 409)
+  assert.equal((await payload(staleActivation)).code, 'OPERATIONS_ACTIVATION_CONFLICT')
+  assert.equal(calls.activations.length, 1)
+
+  const directActiveActivation = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'update-activation',
+      state: 'active',
+      reason: 'Attempt to bypass reviewed authorization',
+      expectedCurrentState: 'shadow',
+      expectedCurrentRevision: 4,
+    }),
+  }))
+  assert.equal(directActiveActivation.status, 409)
+  assert.equal(
+    (await payload(directActiveActivation)).code,
+    'COMMERCE_ACTIVE_AUTHORIZATION_REQUIRED',
+  )
+  assert.equal(calls.activations.length, 1)
 
   const deniedActivation = await route.POST(request('http://localhost/api/operations', {
     actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: true, canActivate: false } },
@@ -1489,6 +2117,169 @@ async function verifyRouteBehavior() {
   }))
   assert.equal(deniedActivation.status, 403)
   assert.equal((await payload(deniedActivation)).code, 'OPERATIONS_ACTIVATION_REQUIRED')
+
+  const deniedActivePreparation = await route.POST(request('http://localhost/api/operations', {
+    actor: {
+      ...actor,
+      capabilities: {
+        canView: true,
+        canManage: true,
+        canExecute: true,
+        canActivate: false,
+      },
+    },
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': 'commerce-active-prepare-denied-1',
+    },
+    body: JSON.stringify({
+      action: 'prepare-commerce-active-authorization',
+      expectedActivationState: 'shadow',
+      expectedActivationRevision: 4,
+      selectedAccounts: [{
+        accountGlobalId: 'gia1234567',
+        capabilities: ['catalog_publishing'],
+      }],
+    }),
+  }))
+  assert.equal(deniedActivePreparation.status, 403)
+  assert.equal(
+    (await payload(deniedActivePreparation)).code,
+    'OPERATIONS_ACTIVATION_REQUIRED',
+  )
+  assert.equal(calls.activePreparations.length, 0)
+
+  const validActivePreparation = await route.POST(request('http://localhost/api/operations', {
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': 'commerce-active-prepare-route-1',
+    },
+    body: JSON.stringify({
+      action: 'prepare-commerce-active-authorization',
+      expectedActivationState: 'shadow',
+      expectedActivationRevision: 4,
+      selectedAccounts: [{
+        accountGlobalId: 'gia1234567',
+        capabilities: ['catalog_publishing'],
+      }],
+    }),
+  }))
+  assert.equal(validActivePreparation.status, 201)
+  assert.equal(calls.activePreparations.length, 1)
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(calls.activePreparations[0])),
+    {
+      organizationId: actor.organizationId,
+      actorEmail: actor.email,
+      expectedActivationState: 'shadow',
+      expectedActivationRevision: 4,
+      selectedAccounts: [{
+        accountGlobalId: 'gia1234567',
+        capabilities: ['catalog_publishing'],
+      }],
+      idempotencyKey: 'commerce-active-prepare-route-1',
+    },
+  )
+  const preparedPayload = await payload(validActivePreparation)
+  assert.equal(preparedPayload.result.preparationGlobalId, 'gcap1234567')
+  assert.equal(preparedPayload.result.accounts[0].accountId, undefined)
+  assert.equal(preparedPayload.result.accounts[0].credentialGeneration, 2)
+
+  const activeWithoutConfirmation = await route.POST(request('http://localhost/api/operations', {
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': 'commerce-active-consume-route-1',
+    },
+    body: JSON.stringify({
+      action: 'activate-commerce-with-authorization',
+      preparationGlobalId: 'gcap1234567',
+      expectedCohortHash: 'a'.repeat(64),
+      confirmActiveProviderWrites: false,
+      reason: 'Explicit provider-write approval',
+    }),
+  }))
+  assert.equal(activeWithoutConfirmation.status, 400)
+  assert.equal(
+    (await payload(activeWithoutConfirmation)).code,
+    'COMMERCE_ACTIVE_CONFIRMATION_REQUIRED',
+  )
+  assert.equal(calls.activeAuthorizations.length, 0)
+  assert.equal(calls.activeTransitions.length, 0)
+
+  const validActiveTransition = await route.POST(request('http://localhost/api/operations', {
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': 'commerce-active-consume-route-1',
+    },
+    body: JSON.stringify({
+      action: 'activate-commerce-with-authorization',
+      preparationGlobalId: 'gcap1234567',
+      expectedCohortHash: 'a'.repeat(64),
+      confirmActiveProviderWrites: true,
+      reason: 'Explicit provider-write approval',
+    }),
+  }))
+  assert.equal(validActiveTransition.status, 200)
+  assert.equal(calls.activeAuthorizations.length, 1)
+  assert.equal(calls.activeTransitions.length, 1)
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(calls.activeAuthorizations[0])),
+    {
+      organizationId: actor.organizationId,
+      actorEmail: actor.email,
+      preparationGlobalId: 'gcap1234567',
+      expectedCohortHash: 'a'.repeat(64),
+      idempotencyKey: 'commerce-active-consume-route-1',
+    },
+  )
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(calls.activeTransitions[0])),
+    {
+      organizationId: actor.organizationId,
+      actorEmail: actor.email,
+      authorizationGlobalId: 'gcaa1234567',
+      expectedCohortHash: 'a'.repeat(64),
+      idempotencyKey: 'commerce-active-consume-route-1',
+      reason: 'Explicit provider-write approval',
+    },
+  )
+  const transitionPayload = await payload(validActiveTransition)
+  assert.equal(
+    transitionPayload.result.authorization.confirmationStatementVersion,
+    'commerce-active-transition-v1',
+  )
+  assert.equal(transitionPayload.result.transition.state, 'active')
+  assert.equal(transitionPayload.result.transition.revision, 5)
+
+  const deniedActiveTransition = await route.POST(request('http://localhost/api/operations', {
+    actor: {
+      ...actor,
+      capabilities: {
+        canView: true,
+        canManage: true,
+        canExecute: true,
+        canActivate: false,
+      },
+    },
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': 'commerce-active-consume-denied-1',
+    },
+    body: JSON.stringify({
+      action: 'activate-commerce-with-authorization',
+      preparationGlobalId: 'gcap1234567',
+      expectedCohortHash: 'a'.repeat(64),
+      confirmActiveProviderWrites: true,
+      reason: 'Unauthorized provider-write approval',
+    }),
+  }))
+  assert.equal(deniedActiveTransition.status, 403)
+  assert.equal(
+    (await payload(deniedActiveTransition)).code,
+    'OPERATIONS_ACTIVATION_REQUIRED',
+  )
+  assert.equal(calls.activeAuthorizations.length, 1)
+  assert.equal(calls.activeTransitions.length, 1)
 
   const invalidProduct = await route.POST(request('http://localhost/api/operations', {
     headers: { 'Content-Type': 'application/json' },
@@ -1531,6 +2322,7 @@ async function verifyRouteBehavior() {
 function postgresMock(pool) {
   return {
     query: (sql, params = []) => pool.query(sql, params),
+    getPostgresPool: () => pool,
     acquireTransactionAdvisoryLock: (client, key) => client.query(
       'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
       [key],
@@ -1732,7 +2524,7 @@ async function verifyInboundReceivingAcceptance(pool, persistence, fixture) {
     cutoffTime: '16:00',
     createStarterLocations: false,
   })
-  assert.match(warehouse.warehouseGlobalId, /^gwh\d{7}$/)
+  assert.match(warehouse.warehouseGlobalId, /^gwh[0-9a-v]{12}$/)
   assert.equal(warehouse.locationGlobalIds.length, 0)
 
   const location = await persistence.createOperationsLocationInPostgres({
@@ -1754,7 +2546,7 @@ async function verifyInboundReceivingAcceptance(pool, persistence, fixture) {
       maxQuantity: 4,
     }],
   })
-  assert.match(location.locationGlobalId, /^gwl\d{7}$/)
+  assert.match(location.locationGlobalId, /^gwl[0-9a-v]{12}$/)
 
   const poolResult = await pool.query(
     `INSERT INTO operations_inventory_pools (
@@ -1771,7 +2563,7 @@ async function verifyInboundReceivingAcceptance(pool, persistence, fixture) {
     ],
   )
   const inventoryPoolGlobalId = poolResult.rows[0].global_id
-  assert.match(inventoryPoolGlobalId, /^gip\d{7}$/)
+  assert.match(inventoryPoolGlobalId, /^gip[0-9a-v]{12}$/)
 
   const referenceNumber = `RECEIPT-${randomUUID()}`
   const expectedAt = new Date(Date.now() + 86_400_000).toISOString()
@@ -1793,7 +2585,7 @@ async function verifyInboundReceivingAcceptance(pool, persistence, fixture) {
       }],
     },
   })
-  assert.match(created.receiptGlobalId, /^grc\d{7}$/)
+  assert.match(created.receiptGlobalId, /^grc[0-9a-v]{12}$/)
   assert.equal(created.status, 'expected')
   assert.equal(created.rowVersion, 0)
   assert.equal(created.expectedQuantity, 2)
@@ -2117,7 +2909,7 @@ async function verifyReplenishmentExecutionAcceptance(pool, persistence, fixture
       quantity: 8,
     },
   })
-  assert.match(moved.replenishmentTaskGlobalId, /^grpl\d{7}$/)
+  assert.match(moved.replenishmentTaskGlobalId, /^grpl[0-9a-v]{12}$/)
   assert.equal(moved.status, 'completed')
   assert.equal(moved.movedQuantity, 8)
   assert.equal(moved.sourceAvailableAfter, 12)
@@ -2281,13 +3073,104 @@ async function verifyPostgresAcceptance(databaseUrl) {
         '@/lib/persistence/postgres': postgres,
       },
     })
+    const currency = loadTypeScriptModule('app_src/lib/currency.ts')
+    const commerceFulfillmentRecoveryPolicy = loadTypeScriptModule(
+      'app_src/lib/commerceFulfillmentRecoveryPolicy.ts',
+    )
+    const canonicalFulfillmentPlanning = loadTypeScriptModule(
+      'app_src/lib/operations/canonicalFulfillmentPlanning.ts',
+      { mocks: { '../currency.ts': currency } },
+    )
+    const cartonizationRateEvidence = loadTypeScriptModule(
+      'app_src/lib/persistence/cartonizationRateEvidence.ts',
+      {
+        mocks: {
+          '@/lib/auditWriter': auditWriter,
+          '@/lib/integrations/commerceCredentialCrypto': {
+            decryptCommerceCandidateSnapshot: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not decrypt provider data',
+              )
+            },
+          },
+          '@/lib/integrations/carrierSandboxRate': {
+            carrierSandboxPartyFingerprint: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not rate carrier parties',
+              )
+            },
+            normalizeCarrierSandboxParty: (value) => value,
+          },
+          '@/lib/persistence/postgres': postgres,
+        },
+      },
+    )
+    const shopifyCheckoutPlanRatePolicy = loadTypeScriptModule(
+      'app_src/lib/operations/shopifyCheckoutPlanRatePolicy.ts',
+      { mocks: { '../currency.ts': currency } },
+    )
+    const shopifyCheckoutRateWarmPolicy = loadTypeScriptModule(
+      'app_src/lib/operations/shopifyCheckoutRateWarmPolicy.ts',
+    )
+    const shopifyCheckoutRating = loadTypeScriptModule(
+      'app_src/lib/persistence/shopifyCheckoutRating.ts',
+      {
+        mocks: {
+          '@/lib/auditWriter': auditWriter,
+          '@/lib/operations/shopifyCheckoutPlanRatePolicy':
+            shopifyCheckoutPlanRatePolicy,
+          '@/lib/operations/shopifyCheckoutRateWarmPolicy':
+            shopifyCheckoutRateWarmPolicy,
+          '@/lib/persistence/postgres': postgres,
+        },
+      },
+    )
     const persistence = loadTypeScriptModule('app_src/lib/persistence/operations.ts', {
       mocks: {
         '@/lib/auditWriter': auditWriter,
         '@/lib/crm/stableId': stableId,
+        '@/lib/integrations/carrierCheckoutRate': {
+          rateCheckoutShipment: async () => {
+            throw new Error(
+              'Distributed Operations acceptance does not call checkout carriers',
+            )
+          },
+        },
+        '@/lib/integrations/carrierIntegrations': {
+          testCarrierSandboxShipmentRate: async () => {
+            throw new Error(
+              'Distributed Operations acceptance does not call sandbox carriers',
+            )
+          },
+        },
+        '@/lib/integrations/shopifyFulfillmentWriteback': {
+          executeShopifyFulfillmentWriteback: async () => {
+            throw new Error(
+              'Distributed Operations acceptance does not write Shopify fulfillment',
+            )
+          },
+        },
+        '@/lib/integrations/faireFulfillmentRuntime': {
+          prepareCurrentFaireFulfillmentAuthority: async () => {
+            throw new Error(
+              'Distributed Operations acceptance does not authorize Faire fulfillment',
+            )
+          },
+          executeCurrentFaireFulfillmentWriteback: async () => {
+            throw new Error(
+              'Distributed Operations acceptance does not write Faire fulfillment',
+            )
+          },
+        },
+        '@/lib/commerceFulfillmentRecoveryPolicy':
+          commerceFulfillmentRecoveryPolicy,
         '@/lib/operations/adapters': adapters,
+        '@/lib/operations/canonicalFulfillmentPlanning':
+          canonicalFulfillmentPlanning,
         '@/lib/operations/domain': domain,
         '@/lib/operations/packingSlip': packingSlip,
+        '@/lib/persistence/cartonizationRateEvidence':
+          cartonizationRateEvidence,
         '@/lib/persistence/crm': {
           stageCrmRecordWithClient: stageCommerceCustomerForAcceptance,
         },
@@ -2298,8 +3181,24 @@ async function verifyPostgresAcceptance(databaseUrl) {
             printWarning: 'No printer configured in distributed operations acceptance.',
           }),
         },
+        '@/lib/persistence/operationShadowFulfillmentPreparation': {
+          readShadowFulfillmentPreparation: async () => null,
+        },
+        '@/lib/persistence/sandboxCommerceE2eAuthorization': {
+          requireActiveSandboxCommerceE2eAuthorization: async () => {
+            throw new Error(
+              'Distributed Operations acceptance has no sandbox E2E authorization',
+            )
+          },
+          consumeSandboxCommerceE2eAuthorization: async () => {
+            throw new Error(
+              'Distributed Operations acceptance has no sandbox E2E authorization',
+            )
+          },
+        },
         '@/lib/persistence/postgres': postgres,
         '@/lib/persistence/productPackaging': productPackaging,
+        '@/lib/persistence/shopifyCheckoutRating': shopifyCheckoutRating,
       },
     })
     const primary = await seedWorkspace(pool, 'primary')
@@ -2325,7 +3224,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
         },
       })
     ))
-    assert.match(firstPackageProfile.globalId, /^gpp\d{7}$/)
+    assert.match(firstPackageProfile.globalId, /^gpp[0-9a-v]{12}$/)
     assert.equal(firstPackageProfile.rowVersion, 0)
     assert.equal(firstPackageProfile.source, 'csv_import')
     assert.equal(firstPackageProfile.measurementSystem, 'metric')
@@ -2398,7 +3297,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
       actorEmail: primary.email,
       proof: primaryProof,
     })
-    assert.match(first.orderGlobalId, /^gor\d{7}$/)
+    assert.match(first.orderGlobalId, /^gor[0-9a-v]{12}$/)
     assert.equal(first.orderStatus, 'shipped')
     assert.equal(first.duplicate, false)
     assert.match(first.trackingNumber, /^MOCK[A-F0-9]{18}$/)
@@ -2454,6 +3353,37 @@ async function verifyPostgresAcceptance(databaseUrl) {
     assert.equal(matchedAgain.status, 'matched')
     assert.equal(matchedAgain.method, 'external_id')
     assert.equal(matchedAgain.customer.globalId, primary.customer.reference_code)
+    const preservedCustomerBinding = await pool.query(
+      `SELECT external_id.entity_global_id, external_id.match_method,
+              external_id.match_evidence
+       FROM operations_external_identifiers external_id
+       JOIN operations_integration_accounts account
+         ON account.organization_id = external_id.organization_id
+        AND account.id = external_id.integration_account_id
+       WHERE external_id.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND external_id.entity_type = 'crm.organization'
+         AND external_id.external_id = $3`,
+      [
+        primary.organizationId,
+        commerceIntegration.rows[0].global_id,
+        existingExternalId,
+      ],
+    )
+    assert.equal(
+      preservedCustomerBinding.rows[0].entity_global_id,
+      primary.customer.reference_code,
+    )
+    assert.equal(
+      preservedCustomerBinding.rows[0].match_method,
+      'email',
+      'An external-ID replay must preserve the original evidence method',
+    )
+    assert.equal(
+      preservedCustomerBinding.rows[0].match_evidence.matchedBy,
+      'email',
+      'An external-ID replay must preserve the original match evidence',
+    )
 
     const createdExternalId = `new-customer-${randomUUID()}`
     const createdCustomer = await persistence.resolveCommerceCustomerInPostgres({
@@ -2469,7 +3399,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
     })
     assert.equal(createdCustomer.status, 'created')
     assert.equal(createdCustomer.method, 'created')
-    assert.match(createdCustomer.customer.globalId, /^ga\d{7}$/)
+    assert.match(createdCustomer.customer.globalId, /^ga[0-9a-v]{12}$/)
     const createdAgain = await persistence.resolveCommerceCustomerInPostgres({
       organizationId: primary.organizationId,
       integrationAccountGlobalId: commerceIntegration.rows[0].global_id,
@@ -3062,7 +3992,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
         primary.email,
       ],
     )
-    assert.match(exceptionSeed.rows[0].global_id, /^gex\d{7}$/)
+    assert.match(exceptionSeed.rows[0].global_id, /^gex[0-9a-v]{12}$/)
     const exceptionWorkspace = await persistence.readOperationsWorkspaceFromPostgres({
       organizationId: primary.organizationId,
       capabilities: { canView: true, canManage: true, canExecute: true },

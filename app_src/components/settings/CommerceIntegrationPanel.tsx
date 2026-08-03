@@ -49,6 +49,8 @@ import IntegrationSetupJourney, {
   type IntegrationSetupStepState,
 } from '@/components/settings/IntegrationSetupJourney'
 import CommerceIntakeWorkflow from '@/components/settings/CommerceIntakeWorkflow'
+import ShopifyCarrierServiceSetupPanel
+  from '@/components/settings/ShopifyCarrierServiceSetupPanel'
 
 type CommerceProvider = 'shopify' | 'faire'
 type CommerceEnvironment = 'sandbox' | 'production'
@@ -75,6 +77,7 @@ type CommerceAccount = {
   externalAccountId: string | null
   displayName: string
   status: 'active' | 'disabled' | 'error'
+  receiptIntakeEnabled: boolean
   configured: boolean
   credentialVersion: number
   authMode: string | null
@@ -85,6 +88,21 @@ type CommerceAccount = {
   webhookVerificationStatus: 'not_applicable' | 'unverified' | 'verified'
   webhookVerifiedAt: string | null
   configuration: Record<string, unknown>
+  fulfillmentNotificationPolicy:
+    | {
+      mode: 'clawpilot_explicit'
+      notifyCustomerDefault: boolean
+      revision: number
+      changeReason: string
+      updatedAt: string
+    }
+    | {
+      mode: 'provider_managed'
+      notifyCustomerDefault: null
+      revision: 0
+      changeReason: null
+      updatedAt: null
+    }
   syncCursors: SyncCursor[]
   evidence: {
     webhookReceipts: number
@@ -96,6 +114,30 @@ type CommerceAccount = {
     deadLetterAttempts: number
     lastAttemptAt: string | null
   }
+  fulfillmentWriteReadiness: {
+    ready: boolean
+    authMode: string | null
+    requiredAuthMode: 'faire_oauth'
+    requiredScopes: string[]
+    credentialBinding: {
+      current: boolean
+    }
+    providerScopeEvidence: {
+      recordedForCredentialGeneration: boolean
+      current: boolean
+      verificationSource: string | null
+    }
+    activeCapabilities: {
+      required: string[]
+      current: string[]
+      missing: string[]
+    }
+    blockedBy: {
+      code: string
+      message: string
+    } | null
+    providerWrites: 0
+  } | null
   webhookUrl: string | null
   updatedAt: string
 }
@@ -138,6 +180,14 @@ type CommerceCatalog = {
       requiredBeforeConnect: readonly string[]
       receiptProofScopes: readonly string[]
       acceptedReceiptTopics: readonly string[]
+      webhookSetupGroups: readonly {
+        key: string
+        label: string
+        topics: readonly string[]
+        requiredScopes: readonly string[]
+        state: 'available' | 'processor_pending' | 'privacy_lifecycle_pending'
+        behavior: string
+      }[]
       unsupportedCredentialMode: string
     }
     faire: {
@@ -481,11 +531,19 @@ export default function CommerceIntegrationPanel() {
     accounts: [],
   })
   const [catalog, setCatalog] = useState<CommerceCatalog | null>(null)
+  const [canManage, setCanManage] = useState(false)
   const [canActivate, setCanActivate] = useState(false)
   const [canRevealCredentials, setCanRevealCredentials] = useState(false)
   const [intakeAvailable, setIntakeAvailable] = useState(false)
   const [loading, setLoading] = useState(true)
   const [pendingAction, setPendingAction] = useState('')
+  const [notificationPolicyDrafts, setNotificationPolicyDrafts] = useState<
+    Record<string, {
+      notifyCustomerDefault: boolean
+      reason: string
+      confirmed: boolean
+    }>
+  >({})
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [revealedCredential, setRevealedCredential] =
@@ -524,6 +582,7 @@ export default function CommerceIntegrationPanel() {
       setIntegrations(payload.integrations)
     }
     if (payload.catalog) setCatalog(payload.catalog)
+    setCanManage(payload.canManage === true)
     setCanActivate(payload.canActivate === true)
     setIntakeAvailable(payload.intakeAvailable === true)
     if (typeof payload.canRevealCredentials === 'boolean') {
@@ -630,6 +689,38 @@ export default function CommerceIntegrationPanel() {
       return false
     } finally {
       setPendingAction('')
+    }
+  }
+
+  async function saveFulfillmentNotificationPolicy(
+    account: CommerceAccount,
+  ) {
+    if (account.fulfillmentNotificationPolicy.mode !== 'clawpilot_explicit') {
+      return
+    }
+    const draft = notificationPolicyDrafts[account.globalId]
+    if (!draft) return
+    const saved = await action(
+      `fulfillment-notifications:${account.globalId}`,
+      {
+        action: 'set-shopify-fulfillment-notification-policy',
+        accountGlobalId: account.globalId,
+        expectedRevision: account.fulfillmentNotificationPolicy.revision,
+        notifyCustomerDefault: draft.notifyCustomerDefault,
+        reason: draft.reason.trim(),
+        confirmCustomerNotifications:
+          draft.notifyCustomerDefault ? draft.confirmed : false,
+      },
+      `Shopify fulfillment notifications now default to ${
+        draft.notifyCustomerDefault ? 'on' : 'off'
+      } for future orders.`,
+    )
+    if (saved) {
+      setNotificationPolicyDrafts((current) => {
+        const next = { ...current }
+        delete next[account.globalId]
+        return next
+      })
     }
   }
 
@@ -832,6 +923,38 @@ export default function CommerceIntegrationPanel() {
     }
   }
 
+  async function registerInventoryWebhooks(account: CommerceAccount) {
+    if (!canActivate || pendingAction) return
+    if (!window.confirm(
+      `Register the inventory item and inventory level webhook topics for ${account.displayName}? This creates only the two exact Shopify subscriptions shown in this workflow.`,
+    )) return
+    await action(
+      `register-inventory-webhooks:${account.globalId}`,
+      {
+        action: 'register-shopify-inventory-webhooks',
+        accountGlobalId: account.globalId,
+        confirmProviderWrites: true,
+      },
+      `${account.displayName} inventory webhook subscriptions registered and verified.`,
+    )
+  }
+
+  async function registerCatalogWebhooks(account: CommerceAccount) {
+    if (!canActivate || pendingAction) return
+    if (!window.confirm(
+      `Register the product create, update, and delete webhook topics for ${account.displayName}? Product events will trigger a read-only catalog reconciliation in Shadow.`,
+    )) return
+    await action(
+      `register-catalog-webhooks:${account.globalId}`,
+      {
+        action: 'register-shopify-catalog-webhooks',
+        accountGlobalId: account.globalId,
+        confirmProviderWrites: true,
+      },
+      `${account.displayName} catalog webhook subscriptions registered and verified.`,
+    )
+  }
+
   async function revealCredential(account: CommerceAccount) {
     if (!account.configured || pendingAction) return
     const revealOrganizationId = organizationIdRef.current
@@ -902,7 +1025,7 @@ export default function CommerceIntegrationPanel() {
       ? 'current'
       : 'pending'
   const shopifyReceiptState: IntegrationSetupStepState =
-    shopifyAccount?.status === 'active'
+    shopifyAccount?.receiptIntakeEnabled
       ? 'complete'
       : shopifyAccount?.verificationStatus === 'verified'
         && (
@@ -1105,17 +1228,17 @@ export default function CommerceIntegrationPanel() {
                   },
                   {
                     key: 'shopify-receipts',
-                    label: 'Enable signed receipt intake',
+                    label: 'Choose signed receipt handling',
                     state: shopifyReceiptState,
                     optional: true,
                     description:
-                      'Receipt intake is optional and separate from the API connection. It requires the receipt-proof scopes and one valid signed allowed-topic delivery; order/customer processing and domain workers remain off.',
+                      'Signed receipt intake is optional and separate from the API connection. Queueing requires the receipt-proof scopes and one valid signed allowed-topic delivery. Held receipts remain retained as evidence; order/customer processing and domain workers remain off.',
                     facts: [
                       {
-                        label: 'Receipt intake',
-                        value: shopifyAccount?.status === 'active'
-                          ? 'Enabled'
-                          : 'Disabled',
+                        label: 'New signed receipts',
+                        value: shopifyAccount?.receiptIntakeEnabled
+                          ? 'Queued for intake'
+                          : 'Held as evidence',
                       },
                       {
                         label: 'Webhook secret',
@@ -1611,6 +1734,10 @@ export default function CommerceIntegrationPanel() {
               const missingScopes = valueStrings(
                 account.configuration.missingScopes,
               )
+              const missingReceiptProofScopes = account.provider === 'shopify'
+                ? valueStrings(catalog?.onboarding.shopify.receiptProofScopes)
+                  .filter((scope) => !grantedScopes.includes(scope))
+                : []
               const preview = shopifyPreviews[account.globalId]
               const revealed = revealedCredential?.accountGlobalId
                 === account.globalId
@@ -1634,19 +1761,35 @@ export default function CommerceIntegrationPanel() {
                 && account.verificationStatus === 'verified'
                 && grantedScopes.includes('read_orders')
               const activationBlockers = account.provider === 'shopify'
-                && account.status !== 'active'
+                && !account.receiptIntakeEnabled
                 ? [
                     ...(!canActivate
                       ? ['Owner or operations-administrator access is required.']
                       : []),
-                    ...(missingScopes.length
-                      ? [`Add and approve these app scopes: ${missingScopes.join(', ')}.`]
+                    ...(missingReceiptProofScopes.length
+                      ? [`Add and approve these app scopes: ${missingReceiptProofScopes.join(', ')}.`]
                       : []),
                     ...(account.webhookVerificationStatus !== 'verified'
                       ? ['Send one valid signed allowed-topic delivery to the callback URL.']
                       : []),
                   ]
                 : []
+              const notificationPolicy = account.fulfillmentNotificationPolicy
+              const notificationDraft = notificationPolicyDrafts[account.globalId]
+              const notificationDefault = notificationDraft
+                ? notificationDraft.notifyCustomerDefault
+                : notificationPolicy.notifyCustomerDefault === true
+              const notificationReason = notificationDraft?.reason || ''
+              const notificationConfirmation = notificationDraft?.confirmed === true
+              const notificationChanged = Boolean(
+                notificationDraft
+                && notificationDefault
+                  !== (notificationPolicy.notifyCustomerDefault === true),
+              )
+              const notificationPending = pendingAction
+                === `fulfillment-notifications:${account.globalId}`
+              const fulfillmentReadiness =
+                account.fulfillmentWriteReadiness
               return (
                 <Card key={account.globalId} variant="outlined">
                   <CardContent>
@@ -1684,20 +1827,26 @@ export default function CommerceIntegrationPanel() {
                           ) : null}
                           <Chip
                             size="small"
-                            color={account.status === 'active'
-                              ? 'success'
-                              : 'default'}
-                        label={account.provider === 'shopify'
-                          ? `Receipt intake ${
-                              account.status === 'active'
-                                ? 'enabled'
-                                : 'disabled'
-                            }`
-                          : (
-                              account.verificationStatus === 'verified'
-                                ? 'Product sync authorized'
-                                : 'Product sync needs attention'
-                            )}
+                            color={
+                              account.provider === 'shopify'
+                                ? account.receiptIntakeEnabled
+                                  ? 'success'
+                                  : 'default'
+                                : account.verificationStatus === 'verified'
+                                  ? 'success'
+                                  : 'default'
+                            }
+                            label={account.provider === 'shopify'
+                              ? `Signed receipts · ${
+                                  account.receiptIntakeEnabled
+                                    ? 'queued'
+                                    : 'held'
+                                }`
+                              : (
+                                  account.verificationStatus === 'verified'
+                                    ? 'Product sync authorized'
+                                    : 'Product sync needs attention'
+                                )}
                           />
                           {account.configured
                             && account.credentialIdentifierLastFour ? (
@@ -1720,7 +1869,7 @@ export default function CommerceIntegrationPanel() {
                           ? `${providerLabel(account.provider)} API connection established.`
                           : `${providerLabel(account.provider)} API connection needs attention.`}{' '}
                         {account.provider === 'shopify'
-                          ? 'This connection authorizes automatic product catalog sync with no second approval. Eligibility and worker status appear below; the control only pauses or resumes sync. Signed order receipts remain separate.'
+                          ? 'This connection authorizes automatic product catalog sync with no second approval. The signed receipt control below only chooses whether new verified webhook receipts are queued for intake or retained as held evidence. It does not change the API credential, product-catalog authorization, Operations activation, or provider-write authority.'
                           : 'This connection authorizes automatic product catalog sync with no second approval. Eligibility and worker status appear below; the control only pauses or resumes sync. Orders and inventory remain separate.'}
                       </Alert>
 
@@ -1729,11 +1878,182 @@ export default function CommerceIntegrationPanel() {
                           accountGlobalId={account.globalId}
                           provider={account.provider}
                           displayName={account.displayName}
+                          canManage={canManage}
                           canActivate={canActivate}
                           connectionReady={
                             account.configured
                             && account.verificationStatus === 'verified'
                           }
+                        />
+                      ) : null}
+
+                      <Box>
+                        <Typography variant="subtitle2" fontWeight={700}>
+                          Fulfillment &amp; tracking
+                        </Typography>
+                        {account.provider === 'shopify' ? (
+                          notificationPolicy.mode === 'clawpilot_explicit' ? (
+                            <Stack spacing={1.25} sx={{ mt: 1 }}>
+                              <Alert severity={notificationDefault ? 'warning' : 'info'}>
+                                Customer notifications are an explicit Shopify-account default.
+                                The resolved choice is frozen into each fulfillment export, so
+                                changing this setting never emails customers for prior shipments.
+                                Operators may record a reasoned per-order exception when confirming
+                                a future shipment.
+                              </Alert>
+                              <FormControlLabel
+                                control={(
+                                  <Checkbox
+                                    checked={notificationDefault}
+                                    disabled={!canActivate || notificationPending}
+                                    onChange={(event) => {
+                                      const nextDefault = event.target.checked
+                                      setNotificationPolicyDrafts((current) => ({
+                                        ...current,
+                                        [account.globalId]: {
+                                          notifyCustomerDefault: nextDefault,
+                                          reason: nextDefault
+                                            ? 'Enable Shopify customer notifications for future fulfillment confirmations'
+                                            : 'Disable Shopify customer notifications for future fulfillment confirmations',
+                                          confirmed: false,
+                                        },
+                                      }))
+                                    }}
+                                  />
+                                )}
+                                label={notificationDefault
+                                  ? 'Email customers when future Shopify fulfillments are created'
+                                  : 'Do not email customers when future Shopify fulfillments are created'}
+                              />
+                              <TextField
+                                label="Policy change reason"
+                                value={notificationReason}
+                                disabled={!canActivate || notificationPending || !notificationChanged}
+                                onChange={(event) => {
+                                  setNotificationPolicyDrafts((current) => ({
+                                    ...current,
+                                    [account.globalId]: {
+                                      notifyCustomerDefault: notificationDefault,
+                                      reason: event.target.value,
+                                      confirmed: notificationConfirmation,
+                                    },
+                                  }))
+                                }}
+                                inputProps={{ maxLength: 500 }}
+                                helperText={`Revision ${notificationPolicy.revision} · ${
+                                  notificationReason.trim().length
+                                }/500 · audited`}
+                              />
+                              {notificationDefault && notificationChanged ? (
+                                <FormControlLabel
+                                  control={(
+                                    <Checkbox
+                                      checked={notificationConfirmation}
+                                      disabled={!canActivate || notificationPending}
+                                      onChange={(event) => {
+                                        setNotificationPolicyDrafts((current) => ({
+                                          ...current,
+                                          [account.globalId]: {
+                                            notifyCustomerDefault: notificationDefault,
+                                            reason: notificationReason,
+                                            confirmed: event.target.checked,
+                                          },
+                                        }))
+                                      }}
+                                    />
+                                  )}
+                                  label="I confirm future Shopify fulfillment confirmations may email customers"
+                                />
+                              ) : null}
+                              <Stack direction="row" spacing={1} alignItems="center">
+                                <Button
+                                  size="small"
+                                  variant="outlined"
+                                  disabled={
+                                    !canActivate
+                                    || notificationPending
+                                    || !notificationChanged
+                                    || notificationReason.trim().length < 10
+                                    || (notificationDefault && !notificationConfirmation)
+                                  }
+                                  startIcon={notificationPending
+                                    ? <CircularProgress size={16} />
+                                    : undefined}
+                                  onClick={() => {
+                                    void saveFulfillmentNotificationPolicy(account)
+                                  }}
+                                >
+                                  {notificationPending ? 'Saving' : 'Save notification default'}
+                                </Button>
+                                {!canActivate ? (
+                                  <Typography variant="caption" color="text.secondary">
+                                    Owner or operations-administrator access is required.
+                                  </Typography>
+                                ) : null}
+                              </Stack>
+                            </Stack>
+                          ) : (
+                            <Alert severity="info" sx={{ mt: 1 }}>
+                              Shopify manages customer notifications for this connection;
+                              ClawPilot exposes no notification override.
+                            </Alert>
+                          )
+                        ) : account.provider === 'faire' && fulfillmentReadiness ? (
+                            <Alert
+                              severity={fulfillmentReadiness.ready
+                                ? 'success'
+                                : 'warning'}
+                              sx={{ mt: 1 }}
+                            >
+                              <Typography variant="body2" fontWeight={700}>
+                                Faire fulfillment writes · {fulfillmentReadiness.ready
+                                  ? 'ready'
+                                  : 'blocked'}
+                              </Typography>
+                              <Typography variant="body2">
+                                {fulfillmentReadiness.blockedBy?.message
+                                  || 'Exact OAuth, scope evidence, credential binding, and Active capability claims are current.'}
+                              </Typography>
+                              <Typography variant="caption" display="block" sx={{ mt: 0.5 }}>
+                                Auth: {fulfillmentReadiness.authMode || 'not configured'}
+                                {' · '}binding: {fulfillmentReadiness.credentialBinding.current
+                                  ? 'current'
+                                  : 'not current'}
+                                {' · '}provider scope evidence: {
+                                  fulfillmentReadiness.providerScopeEvidence.current
+                                    ? 'current'
+                                    : fulfillmentReadiness.providerScopeEvidence
+                                      .recordedForCredentialGeneration
+                                      ? 'recorded but not current'
+                                      : 'not recorded'
+                                }
+                              </Typography>
+                              <Typography variant="caption" display="block">
+                                Required OAuth scopes: {
+                                  fulfillmentReadiness.requiredScopes.join(', ')
+                                }
+                              </Typography>
+                              <Typography variant="caption" display="block">
+                                Active claims: {fulfillmentReadiness.activeCapabilities
+                                  .missing.length
+                                  ? `missing ${fulfillmentReadiness.activeCapabilities.missing.join(', ')}`
+                                  : 'current'} · diagnostic provider writes: 0
+                              </Typography>
+                              <Typography variant="caption" display="block" sx={{ mt: 0.5 }}>
+                                Faire manages retailer notifications after shipment and tracking are submitted; ClawPilot exposes no notification toggle.
+                              </Typography>
+                            </Alert>
+                          ) : account.provider === 'faire' ? (
+                            <Alert severity="info" sx={{ mt: 1 }}>
+                              Faire fulfillment write readiness is not available.
+                            </Alert>
+                          ) : null}
+                      </Box>
+
+                      {account.provider === 'shopify' ? (
+                        <ShopifyCarrierServiceSetupPanel
+                          accountGlobalId={account.globalId}
+                          displayName={account.displayName}
                         />
                       ) : null}
 
@@ -1748,12 +2068,73 @@ export default function CommerceIntegrationPanel() {
                             sx={{ mb: 1 }}
                           >
                             Use the account-specific URL below for shop-specific
-                            webhook subscriptions. ClawPilot does not register
-                            provider subscriptions in this slice. One valid
-                            signed allowed-topic delivery verifies the stored
-                            app secret; synthetic CLI delivery proves signing
-                            only, not that a real subscription exists.
+                            webhook subscriptions. Test connection performs a
+                            live, read-only discovery and reports whether every
+                            required subscription points to this exact URL. One
+                            valid signed delivery separately verifies the stored
+                            app secret; neither check writes to Shopify.
                           </Typography>
+                          {(() => {
+                            const subscription = account.configuration.webhookSubscriptions
+                            if (!subscription || typeof subscription !== 'object' || Array.isArray(subscription)) {
+                              return (
+                                <Alert severity="warning" sx={{ mb: 1 }}>
+                                  Test the Shopify connection to discover subscription readiness.
+                                </Alert>
+                              )
+                            }
+                            const state = subscription as Record<string, unknown>
+                            const missingTopics = Array.isArray(state.missingTopics)
+                              ? state.missingTopics.filter((topic): topic is string => typeof topic === 'string')
+                              : []
+                            const conflictingTopics = Array.isArray(state.conflictingTopics)
+                              ? state.conflictingTopics.filter((topic): topic is string => typeof topic === 'string')
+                              : []
+                            return (
+                              <Alert severity={state.ready === true ? 'success' : 'warning'} sx={{ mb: 1 }}>
+                                {state.ready === true
+                                  ? 'Shopify subscription discovery is ready for every required topic.'
+                                  : `Shopify subscription discovery found ${missingTopics.length} missing and ${conflictingTopics.length} conflicting topic${missingTopics.length + conflictingTopics.length === 1 ? '' : 's'}. No provider writes were made.`}
+                              </Alert>
+                            )
+                          })()}
+                          <Accordion disableGutters sx={{ mb: 1 }}>
+                            <AccordionSummary expandIcon={<ExpandMoreRounded />}>
+                              <Box>
+                                <Typography variant="subtitle2" fontWeight={700}>
+                                  Webhook setup plan
+                                </Typography>
+                                <Typography variant="caption" color="text.secondary">
+                                  Provider registration and ClawPilot processing readiness are tracked separately.
+                                </Typography>
+                              </Box>
+                            </AccordionSummary>
+                            <AccordionDetails>
+                              <Stack spacing={1}>
+                                {catalog?.onboarding.shopify.webhookSetupGroups.map((group) => (
+                                  <Alert
+                                    key={group.key}
+                                    severity={group.state === 'available' ? 'success' : 'info'}
+                                  >
+                                    <Typography variant="body2" fontWeight={700}>
+                                      {group.label} · {group.state === 'available'
+                                        ? 'Ready to register'
+                                        : group.state === 'privacy_lifecycle_pending'
+                                          ? 'Privacy lifecycle required'
+                                          : 'Processor pending'}
+                                    </Typography>
+                                    <Typography variant="body2">{group.behavior}</Typography>
+                                    <Typography variant="caption" display="block" sx={{ mt: 0.5 }}>
+                                      Topics: {group.topics.join(', ')}
+                                    </Typography>
+                                    <Typography variant="caption" display="block">
+                                      Scopes: {group.requiredScopes.join(', ')}
+                                    </Typography>
+                                  </Alert>
+                                ))}
+                              </Stack>
+                            </AccordionDetails>
+                          </Accordion>
                           <Stack
                             direction={{ xs: 'column', sm: 'row' }}
                             spacing={1}
@@ -1775,6 +2156,26 @@ export default function CommerceIntegrationPanel() {
                             >
                               Copy URL
                             </Button>
+                            {canActivate ? (
+                              <>
+                                <Button
+                                  variant="contained"
+                                  disabled={pendingAction !== '' || !account.configured}
+                                  onClick={() => registerInventoryWebhooks(account)}
+                                  sx={actionButtonSx}
+                                >
+                                  Register inventory webhooks
+                                </Button>
+                                <Button
+                                  variant="contained"
+                                  disabled={pendingAction !== '' || !account.configured}
+                                  onClick={() => registerCatalogWebhooks(account)}
+                                  sx={actionButtonSx}
+                                >
+                                  Register catalog webhooks
+                                </Button>
+                              </>
+                            ) : null}
                           </Stack>
                           {catalog ? (
                             <>
@@ -1823,7 +2224,7 @@ export default function CommerceIntegrationPanel() {
                             variant="caption"
                             color="text.secondary"
                           >
-                            Least-privilege receipt profile
+                            Distributed Operations scope profile
                           </Typography>
                           <Stack
                             direction="row"
@@ -2184,7 +2585,7 @@ export default function CommerceIntegrationPanel() {
                       {activationBlockers.length ? (
                         <Alert severity="info">
                           <Typography variant="body2" fontWeight={700}>
-                            Receipt intake is not ready to enable
+                            Signed receipts cannot be queued yet
                           </Typography>
                           <Box component="ul" sx={{ pl: 2.5, my: 0.5 }}>
                             {activationBlockers.map((blocker) => (
@@ -2256,31 +2657,32 @@ export default function CommerceIntegrationPanel() {
                         ) : null}
                         {account.provider === 'shopify'
                           && account.configured
-                          && account.status !== 'active' ? (
+                          && !account.receiptIntakeEnabled ? (
                             <Button
                               variant="contained"
                               startIcon={<PowerSettingsNewRounded />}
                               disabled={
                                 pendingAction !== ''
                                 || !canActivate
-                                || missingScopes.length > 0
+                                || missingReceiptProofScopes.length > 0
                                 || account.webhookVerificationStatus !== 'verified'
                               }
                               onClick={() => action(
                                 `enable:${account.globalId}`,
                                 {
-                                  action: 'set-enabled',
+                                  action: 'set-receipt-intake',
                                   accountGlobalId: account.globalId,
                                   enabled: true,
                                 },
-                                `${account.displayName} signed receipt intake enabled.`,
+                                `${account.displayName} will queue new signed receipts for intake.`,
                               )}
                               sx={actionButtonSx}
                             >
-                              Enable receipt intake
+                              Queue signed receipts
                             </Button>
                           ) : null}
-                        {account.status === 'active' ? (
+                        {account.provider === 'shopify'
+                          && account.receiptIntakeEnabled ? (
                           <Button
                             variant="outlined"
                             color="warning"
@@ -2288,15 +2690,15 @@ export default function CommerceIntegrationPanel() {
                             onClick={() => action(
                               `disable:${account.globalId}`,
                               {
-                                action: 'set-enabled',
+                                action: 'set-receipt-intake',
                                 accountGlobalId: account.globalId,
                                 enabled: false,
                               },
-                              `${account.displayName} disabled.`,
+                              `${account.displayName} will retain new signed receipts as held evidence.`,
                             )}
                             sx={actionButtonSx}
                           >
-                            Disable
+                            Hold signed receipts
                           </Button>
                         ) : null}
                         <Button

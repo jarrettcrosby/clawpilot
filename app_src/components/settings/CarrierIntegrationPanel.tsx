@@ -53,13 +53,13 @@ import {
 } from '@/lib/measurements'
 import { formatUserDateTime } from '@/lib/userDateTime'
 import IntegrationSetupJourney from '@/components/settings/IntegrationSetupJourney'
+import {
+  isSourceManagedCarrierConfiguration,
+  managedCarrierDelegationProfile,
+} from '@/lib/integrations/carrierManagedDelegation'
 
 type CarrierProvider = 'ups_rest' | 'fedex_rest' | 'usps_rest'
 type CarrierEnvironment = 'sandbox' | 'production'
-
-const AG_ALCHEMY_EPISCS_RATING_DELEGATION =
-  'ag-alchemy-episcs-sandbox-rating-delegation'
-const AG_ALCHEMY_RATING_ORIGIN_WAREHOUSE = 'gwh5366613'
 
 type CarrierAddress = {
   line1: string
@@ -492,26 +492,25 @@ export default function CarrierIntegrationPanel() {
     () => (account?.carrierAccounts || []).filter((entry) => entry.status === 'active'),
     [account?.carrierAccounts],
   )
-  const sourceManagedDelegation = (
-    account?.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION
-    || (
-      account?.authorizationScope === 'sandbox_rating_only'
-      && account.credentialRevealAllowed === false
-    )
-  )
-  const ratingOnlyDelegation = Boolean(
-    sourceManagedDelegation
-    && account
-    && account.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION
-    && account.authorizationScope === 'sandbox_rating_only'
-    && account.credentialRevealAllowed === false
-    && account.senderOriginWarehouseGlobalId
-      === AG_ALCHEMY_RATING_ORIGIN_WAREHOUSE
-    && account.allowedCapabilities.length === 1
-    && account.allowedCapabilities[0] === 'sandbox_rate',
-  )
-  const managedDelegationDrift = sourceManagedDelegation
-    && !ratingOnlyDelegation
+  const carrierConfiguration = account ? {
+    managedBy: account.managedBy,
+    authorizationScope: account.authorizationScope,
+    credentialRevealAllowed: account.credentialRevealAllowed,
+    senderOriginWarehouseGlobalId: account.senderOriginWarehouseGlobalId,
+    allowedCapabilities: account.allowedCapabilities,
+  } : null
+  const sourceManagedDelegation = carrierConfiguration
+    ? isSourceManagedCarrierConfiguration(carrierConfiguration)
+    : false
+  const delegationProfile = carrierConfiguration
+    ? managedCarrierDelegationProfile(carrierConfiguration)
+    : null
+  const ratingOnlyDelegation = delegationProfile === 'rating_only'
+  const managedSandboxFulfillmentDelegation =
+    delegationProfile === 'sandbox_fulfillment_diagnostic'
+  const managedDelegationDrift = delegationProfile === 'drifted'
+  const labelWorkflowAuthorized =
+    !sourceManagedDelegation || managedSandboxFulfillmentDelegation
   const explicitCarrierAccountGlobalId = selectedCarrierAccounts[key] || ''
   const selectedCarrierAccountGlobalId = activeCarrierAccounts.some(
     (entry) => entry.globalId === explicitCarrierAccountGlobalId,
@@ -597,18 +596,26 @@ export default function CarrierIntegrationPanel() {
   const selectedReconciliationAttempt = visibleReconciliationAttempts.find(
     (entry) => entry.globalId === reconciliationAttemptGlobalId,
   ) || null
-  const compatibleRateTestPrinters = useMemo(
+  const exactCapabilityRateTestPrinters = useMemo(
     () => !selectedRateTestLabel
       ? []
       : rateTestPrinters.filter((entry) => (
-          entry.status === 'online'
-          && entry.connectionMode === 'local_agent'
-          && entry.localPrintAgentStatus === 'active'
-          && entry.supportedDocumentTypes.includes('shipping_label')
+          entry.supportedDocumentTypes.includes('shipping_label')
           && entry.supportedFormats.includes(selectedRateTestLabel.format)
           && entry.supportedMedia.includes(selectedRateTestLabel.mediaSize)
         )),
     [rateTestPrinters, selectedRateTestLabel],
+  )
+  const onlineExactCapabilityRateTestPrinters = useMemo(
+    () => exactCapabilityRateTestPrinters.filter((entry) => entry.status === 'online'),
+    [exactCapabilityRateTestPrinters],
+  )
+  const compatibleRateTestPrinters = useMemo(
+    () => onlineExactCapabilityRateTestPrinters.filter((entry) => (
+      entry.connectionMode === 'local_agent'
+      && entry.localPrintAgentStatus === 'active'
+    )),
+    [onlineExactCapabilityRateTestPrinters],
   )
   const effectiveRateTestPrinterGlobalId = compatibleRateTestPrinters.some(
     (entry) => entry.globalId === selectedRateTestPrinterGlobalId,
@@ -618,6 +625,24 @@ export default function CarrierIntegrationPanel() {
   const selectedRateTestPrinter = compatibleRateTestPrinters.find(
     (entry) => entry.globalId === effectiveRateTestPrinterGlobalId,
   ) || null
+  const printReadinessBlocker = !selectedRateTestLabel
+    ? 'label_required'
+    : !canExecute
+      ? 'execution_permission_required'
+      : selectedRateTestLabel.status === 'voided'
+        ? 'label_voided'
+        : !rateTestPrinters.length
+          ? 'printer_profile_required'
+          : !exactCapabilityRateTestPrinters.length
+            ? 'exact_printer_capability_required'
+            : !onlineExactCapabilityRateTestPrinters.length
+              ? 'compatible_printer_offline'
+              : !compatibleRateTestPrinters.length
+                ? 'active_local_agent_required'
+                : !selectedRateTestPrinter
+                  ? 'printer_selection_required'
+                  : null
+  const testPrintEligible = printReadinessBlocker === null
   const labelWorkflowStep = selectedRateTestLabel?.status === 'voided'
     ? 4
     : selectedRateTestLabel
@@ -1115,6 +1140,61 @@ export default function CarrierIntegrationPanel() {
               },
             ]}
           />
+        ) : managedSandboxFulfillmentDelegation ? (
+          <IntegrationSetupJourney
+            description="The EPISCS-managed sandbox diagnostic lane is ready. Rate a destination, create one sandbox label from an exact returned rate, then download or test-print the stored bytes and void the sample."
+            steps={[
+              {
+                key: 'carrier-delegation-ready',
+                label: 'Managed sandbox diagnostics are ready',
+                state: 'complete',
+                description:
+                  'EPISCS owns and verifies the credential. ClawPilot keeps the AG-scoped projection encrypted and never reveals or changes its credential or billing identity here.',
+                facts: [
+                  { label: 'Provider', value: providerLabel(provider) },
+                  {
+                    label: 'ClawPilot integration ID',
+                    value: account?.globalId || 'Not allocated',
+                    copyable: Boolean(account?.globalId),
+                  },
+                  {
+                    label: 'Sender warehouse',
+                    value: account?.senderOriginWarehouseGlobalId || 'Not bound',
+                    copyable: Boolean(account?.senderOriginWarehouseGlobalId),
+                  },
+                  { label: 'Authorized capability', value: 'Sandbox rate and label diagnostics' },
+                ],
+              },
+              {
+                key: 'carrier-delegation-rate',
+                label: 'Rate the test parcel',
+                state: rateTest?.provider === provider ? 'complete' : 'current',
+                description:
+                  'Edit the destination and request sandbox prices. Select one exact returned service before label creation.',
+              },
+              {
+                key: 'carrier-delegation-label',
+                label: 'Create and inspect one sandbox label',
+                state: selectedRateTestLabel ? 'complete' : rateTest ? 'current' : 'pending',
+                description:
+                  'Create one provider sandbox sample, then download its stored PDF, PNG, or ZPL bytes or route those same bytes to a compatible test printer.',
+                facts: [{
+                  label: 'Stored sample label',
+                  value: selectedRateTestLabel?.globalId || 'Not created',
+                  copyable: Boolean(selectedRateTestLabel?.globalId),
+                }],
+              },
+              {
+                key: 'carrier-delegation-close',
+                label: 'Void or close the sample',
+                state: selectedRateTestLabel?.status === 'voided'
+                  ? 'complete'
+                  : selectedRateTestLabel ? 'current' : 'pending',
+                description:
+                  'Void a real provider sandbox sample. UPS CIE samples, which never become provider shipments, are explicitly closed in ClawPilot instead.',
+              },
+            ]}
+          />
         ) : (
           <IntegrationSetupJourney
             description="Scope the provider lane, verify its credential, bind a billing identity, and activate only after the safe test boundary is ready."
@@ -1285,14 +1365,27 @@ export default function CarrierIntegrationPanel() {
         </Alert>
       ) : null}
 
+      {managedSandboxFulfillmentDelegation ? (
+        <Alert severity="info" sx={{ mb: 2, borderRadius: '8px' }}>
+          <Typography variant="body2" fontWeight={700}>
+            EPISCS-managed sandbox fulfillment diagnostics
+          </Typography>
+          <Typography variant="body2">
+            This connection can request sandbox rates and create, download, test-print, and void sandbox
+            sample labels. Credentials and the full billing identity remain concealed. Production labels,
+            pickups, manifests, and shipments are not authorized.
+          </Typography>
+        </Alert>
+      ) : null}
+
       {managedDelegationDrift ? (
         <Alert severity="error" sx={{ mb: 2, borderRadius: '8px' }}>
           <Typography variant="body2" fontWeight={700}>
-            Managed sandbox rating needs repair
+            Managed sandbox delegation needs repair
           </Typography>
           <Typography variant="body2">
             The EPISCS-managed connection no longer matches its approved AG Alchemy warehouse,
-            scope, or no-reveal policy. Rating and all carrier-management actions are disabled
+            scope, capability set, or no-reveal policy. Rating and all carrier-management actions are disabled
             until the platform operator restores the exact delegated configuration.
           </Typography>
         </Alert>
@@ -1758,17 +1851,23 @@ export default function CarrierIntegrationPanel() {
         <Box sx={{ mt: 2, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
           <Typography variant="subtitle2" fontWeight={700}>
             {sourceManagedDelegation
-              ? ratingOnlyDelegation ? 'Sandbox rate test' : 'Managed sandbox rating'
+              ? ratingOnlyDelegation
+                ? 'Sandbox rate test'
+                : managedSandboxFulfillmentDelegation
+                  ? 'Managed sandbox label test workflow'
+                  : 'Managed sandbox diagnostics'
               : 'Sandbox label test workflow'}
           </Typography>
           <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
             {sourceManagedDelegation
               ? ratingOnlyDelegation
                 ? 'Rate an editable US destination from the AG Alchemy warehouse. No carrier mutation follows the quote.'
-                : 'This managed lane is disabled until its exact AG Alchemy rating policy is restored.'
+                : managedSandboxFulfillmentDelegation
+                  ? 'Rate an editable US destination, choose one exact returned service, create one provider sandbox sample, then download or test-print its stored bytes and void or close it.'
+                  : 'This managed lane is disabled until its exact AG Alchemy delegation policy is restored.'
               : 'Rate an editable US destination, choose one exact returned service, create a sandbox label, print its stored bytes, and void it when the test is complete.'}
           </Typography>
-          {!sourceManagedDelegation ? (
+          {labelWorkflowAuthorized ? (
             <Stepper
               activeStep={labelWorkflowStep}
               alternativeLabel
@@ -1779,10 +1878,10 @@ export default function CarrierIntegrationPanel() {
               ))}
             </Stepper>
           ) : null}
-          {!sourceManagedDelegation && !canExecute ? (
+          {labelWorkflowAuthorized && !canExecute ? (
             <Alert severity="info" sx={{ mb: 2, borderRadius: '8px' }}>
-              You can review and run rating diagnostics, but creating, printing, or voiding a label also
-              requires warehouse-execution permission.
+              You can review and run rating diagnostics, but creating, downloading, printing, or voiding a
+              label also requires warehouse-execution permission.
             </Alert>
           ) : null}
           <Typography variant="overline" color="text.disabled">Step 1 · Rate</Typography>
@@ -2000,7 +2099,7 @@ export default function CarrierIntegrationPanel() {
             </Stack>
           ) : null}
 
-          {!sourceManagedDelegation ? (
+          {labelWorkflowAuthorized ? (
             <>
           <Box sx={{ mt: 3, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
             <Typography variant="overline" color="text.disabled">Step 2 · Create label</Typography>
@@ -2344,13 +2443,15 @@ export default function CarrierIntegrationPanel() {
             </Box>
           ) : null}
 
-          {selectedRateTestLabel ? (
-            <>
-              <Box sx={{ mt: 3, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
-                <Typography variant="overline" color="text.disabled">Step 3 · Print stored label</Typography>
-                <Typography variant="subtitle2" fontWeight={700}>
-                  Route {selectedRateTestLabel.globalId} to a compatible printer
-                </Typography>
+          <Box sx={{ mt: 3, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
+            <Typography variant="overline" color="text.disabled">Step 3 · Print stored label</Typography>
+            <Typography variant="subtitle2" fontWeight={700}>
+              {selectedRateTestLabel
+                ? `Route ${selectedRateTestLabel.globalId} to a compatible printer`
+                : 'Print readiness'}
+            </Typography>
+            {selectedRateTestLabel ? (
+              <>
                 <Alert severity="info" sx={{ mt: 1.5, borderRadius: '8px' }}>
                   Printing queues the label bytes already stored in ClawPilot. It does not call the carrier,
                   buy postage, create another label, or change the tracking number.
@@ -2375,7 +2476,7 @@ export default function CarrierIntegrationPanel() {
                     {selectedRateTestLabel.contentSha256.slice(0, 16)}…
                   </Typography>
                 </Box>
-                {(selectedRateTestLabel.printArtifactGlobalId
+                {canExecute && (selectedRateTestLabel.printArtifactGlobalId
                   || (
                     rateTestPrintJob?.sourceLabelGlobalId === selectedRateTestLabel.globalId
                       ? rateTestPrintJob.artifactGlobalId
@@ -2398,69 +2499,134 @@ export default function CarrierIntegrationPanel() {
                     </Button>
                   </Box>
                 ) : null}
-                {selectedRateTestLabel.status === 'voided' ? (
-                  <Alert severity="warning" sx={{ mt: 1.5, borderRadius: '8px' }}>
-                    This label is voided and cannot be queued for a new test print.
-                  </Alert>
-                ) : compatibleRateTestPrinters.length ? (
-                  <Stack spacing={1.5} sx={{ mt: 1.5 }}>
-                    <FormControl fullWidth size="small">
-                      <InputLabel id="rate-test-printer-label">Compatible printer</InputLabel>
-                      <Select
-                        labelId="rate-test-printer-label"
-                        label="Compatible printer"
-                        value={effectiveRateTestPrinterGlobalId}
-                        onChange={(event) => {
-                          setSelectedRateTestPrinterGlobalId(event.target.value)
-                          setPrintLabelIdempotencyKey('')
-                        }}
-                        disabled={busy}
-                      >
-                        {compatibleRateTestPrinters.map((entry) => (
-                          <MenuItem key={entry.globalId} value={entry.globalId}>
-                            {entry.name} · {entry.warehouseName} · {entry.connectionMode.replace('_', ' ')}
-                          </MenuItem>
-                        ))}
-                      </Select>
-                    </FormControl>
-                    <Box>
-                      <Button
-                        variant="contained"
-                        startIcon={pendingAction === 'print-rate-test-label'
-                          ? <CircularProgress size={16} color="inherit" />
-                          : <PrintRounded />}
-                        disabled={busy || !canExecute || !selectedRateTestPrinter}
-                        onClick={() => void printRateTestLabel()}
-                        sx={buttonSx}
-                      >
-                        Test print stored label
-                      </Button>
-                    </Box>
-                    {rateTestPrintJob?.sourceLabelGlobalId === selectedRateTestLabel.globalId ? (
-                      <>
-                        <Alert
-                          severity={rateTestPrintJob.status === 'failed' ? 'warning' : 'success'}
-                          sx={{ borderRadius: '8px' }}
-                        >
-                          Print job {rateTestPrintJob.globalId} is {rateTestPrintJob.status} for{' '}
-                          {rateTestPrintJob.printerName}. Retry and controlled reprint remain available in
-                          Operations print jobs and reuse the same stored label bytes.
-                        </Alert>
-                      </>
-                    ) : null}
-                  </Stack>
-                ) : (
-                  <Alert severity="warning" sx={{ mt: 1.5, borderRadius: '8px' }}>
-                    No online local-agent printer supports shipping labels in {selectedRateTestLabel.format}{' '}
-                    on {selectedRateTestLabel.mediaSize}.{' '}
-                    {selectedRateTestLabel.format === 'PDF'
-                      ? 'This existing provider PDF remains immutable. Void it below, run a new sandbox rate, and create a new provider-native thermal ZPL label for a ZPL printer; or configure a PDF-capable local print service.'
-                      : 'Configure a printer that explicitly supports this exact format and media before printing.'}
-                  </Alert>
-                )}
-              </Box>
+              </>
+            ) : null}
+            {printReadinessBlocker === 'label_required' ? (
+              <Alert
+                id="rate-test-print-readiness-message"
+                severity="info"
+                sx={{ mt: 1.5, borderRadius: '8px' }}
+              >
+                Create a sandbox label or select one from Stored test labels before printing.
+              </Alert>
+            ) : printReadinessBlocker === 'execution_permission_required' ? (
+              <Alert
+                id="rate-test-print-readiness-message"
+                severity="warning"
+                sx={{ mt: 1.5, borderRadius: '8px' }}
+              >
+                Warehouse-execution permission is required to test print stored labels.
+              </Alert>
+            ) : printReadinessBlocker === 'label_voided' ? (
+              <Alert
+                id="rate-test-print-readiness-message"
+                severity="warning"
+                sx={{ mt: 1.5, borderRadius: '8px' }}
+              >
+                This label is voided and cannot be queued for a new test print.
+              </Alert>
+            ) : printReadinessBlocker === 'printer_profile_required' ? (
+              <Alert
+                id="rate-test-print-readiness-message"
+                severity="warning"
+                sx={{ mt: 1.5, borderRadius: '8px' }}
+              >
+                No available printer profiles are configured in an active warehouse for this organization.
+                Configure a shipping-label printer profile before printing.
+              </Alert>
+            ) : printReadinessBlocker === 'exact_printer_capability_required' && selectedRateTestLabel ? (
+              <Alert
+                id="rate-test-print-readiness-message"
+                severity="warning"
+                sx={{ mt: 1.5, borderRadius: '8px' }}
+              >
+                Printer profiles are configured, but none supports shipping labels in{' '}
+                {selectedRateTestLabel.format} on {selectedRateTestLabel.mediaSize}.{' '}
+                {selectedRateTestLabel.format === 'PDF'
+                  ? 'This existing provider PDF remains immutable. Void it below, run a new sandbox rate, and create a new provider-native thermal ZPL label for a ZPL printer; or configure a PDF-capable local print service.'
+                  : 'Configure a printer that explicitly supports this exact format and media before printing.'}
+              </Alert>
+            ) : printReadinessBlocker === 'compatible_printer_offline' ? (
+              <Alert
+                id="rate-test-print-readiness-message"
+                severity="warning"
+                sx={{ mt: 1.5, borderRadius: '8px' }}
+              >
+                An exact-compatible printer profile exists, but none is online. Bring one online or re-enable
+                a disabled compatible profile before printing.
+              </Alert>
+            ) : printReadinessBlocker === 'active_local_agent_required' ? (
+              <Alert
+                id="rate-test-print-readiness-message"
+                severity="warning"
+                sx={{ mt: 1.5, borderRadius: '8px' }}
+              >
+                An online exact-compatible printer exists, but none is bound to an active enrolled local print
+                agent. Bind or reactivate its agent, or switch the printer to local-agent delivery, before
+                printing.
+              </Alert>
+            ) : printReadinessBlocker === 'printer_selection_required' ? (
+              <Alert
+                id="rate-test-print-readiness-message"
+                severity="info"
+                sx={{ mt: 1.5, borderRadius: '8px' }}
+              >
+                Select one compatible printer to enable the test print.
+              </Alert>
+            ) : null}
+            {selectedRateTestLabel
+              && canExecute
+              && selectedRateTestLabel.status !== 'voided'
+              && compatibleRateTestPrinters.length ? (
+              <FormControl fullWidth size="small" sx={{ mt: 1.5 }}>
+                <InputLabel id="rate-test-printer-label">Compatible printer</InputLabel>
+                <Select
+                  labelId="rate-test-printer-label"
+                  label="Compatible printer"
+                  value={effectiveRateTestPrinterGlobalId}
+                  onChange={(event) => {
+                    setSelectedRateTestPrinterGlobalId(event.target.value)
+                    setPrintLabelIdempotencyKey('')
+                  }}
+                  disabled={busy}
+                >
+                  {compatibleRateTestPrinters.map((entry) => (
+                    <MenuItem key={entry.globalId} value={entry.globalId}>
+                      {entry.name} · {entry.warehouseName} · {entry.connectionMode.replace('_', ' ')}
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            ) : null}
+            <Box sx={{ mt: 1.5 }}>
+              <Button
+                variant="contained"
+                startIcon={pendingAction === 'print-rate-test-label'
+                  ? <CircularProgress size={16} color="inherit" />
+                  : <PrintRounded />}
+                disabled={busy || !testPrintEligible}
+                aria-describedby={printReadinessBlocker ? 'rate-test-print-readiness-message' : undefined}
+                onClick={() => void printRateTestLabel()}
+                sx={buttonSx}
+              >
+                Test print stored label
+              </Button>
+            </Box>
+            {selectedRateTestLabel
+              && rateTestPrintJob?.sourceLabelGlobalId === selectedRateTestLabel.globalId ? (
+                <Alert
+                  severity={rateTestPrintJob.status === 'failed' ? 'warning' : 'success'}
+                  sx={{ mt: 1.5, borderRadius: '8px' }}
+                >
+                  Print job {rateTestPrintJob.globalId} is {rateTestPrintJob.status} for{' '}
+                  {rateTestPrintJob.printerName}. Retry and controlled reprint remain available in
+                  Operations print jobs and reuse the same stored label bytes.
+                </Alert>
+              ) : null}
+          </Box>
 
-              <Box sx={{ mt: 3, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
+          {selectedRateTestLabel ? (
+            <Box sx={{ mt: 3, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
                 <Typography variant="overline" color="text.disabled">
                   Step 4 · {selectedRateTestLabel.lifecycleMode === 'close_sample'
                     ? 'Close sample'
@@ -2579,8 +2745,7 @@ export default function CarrierIntegrationPanel() {
                     </Box>
                   </Stack>
                 )}
-              </Box>
-            </>
+            </Box>
           ) : null}
             </>
           ) : null}

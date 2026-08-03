@@ -22,6 +22,10 @@ for (const fragment of [
   "accountOwnerType: 'operator_owned'",
   "authorizationScope: 'sandbox_rating_only'",
   "allowedCapabilities: ['sandbox_rate']",
+  "authorizationScope: 'sandbox_fulfillment_diagnostic'",
+  "allowedCapabilities: ['sandbox_rate', 'sandbox_label']",
+  "'enable-ag-alchemy-carrier-sandbox-fulfillment-diagnostics-v1'",
+  "process.argv.includes('--enable-sandbox-fulfillment')",
   'credentialRevealAllowed: false',
   'senderOriginWarehouseGlobalId: target.warehouse.global_id',
   "accountNumber: null",
@@ -61,10 +65,6 @@ for (const fragment of [
 }
 
 assert.ok(
-  !source.includes("allowedCapabilities: ['sandbox_rate',"),
-  'AG carrier delegation must remain sandbox-rate-only',
-)
-assert.ok(
   !source.includes('operations_carrier_rate_requests'),
   'Provisioning must not copy or create sandbox rate evidence',
 )
@@ -82,8 +82,14 @@ assert.ok(
 )
 assert.ok(
   source.indexOf('verifySandboxCredential(source.provider, source.credential)')
-    < source.indexOf('const result = await provision(client, sourceRows, target, apply)'),
+    < source.indexOf('const result = await provision(client, sourceRows, target, apply, profile)'),
   'Both provider credentials must be verified before target writes',
+)
+
+assert.ok(
+  source.indexOf("const profile = process.argv.includes('--enable-sandbox-fulfillment')")
+    < source.indexOf('const requiredConfirmation = profile === SANDBOX_FULFILLMENT_PROFILE'),
+  'Sandbox fulfillment diagnostics must require an explicit profile flag and separate confirmation',
 )
 
 console.log('AG Alchemy carrier sandbox establishment contract checks passed.')

@@ -12,11 +12,48 @@ import type {
 const {
   HYBRID_CARTONIZATION_ALGORITHM_VERSION,
   HYBRID_CARTONIZATION_POLICY_VERSION,
+  boundedPoolPreferenceFrontier,
   planHybridCartonization,
 } = hybrid
 
 const COMPATIBILITY_KEY = 'ag-alchemy.loose-six-ounce-bags.v1'
 const MATERIAL_ID = 'gmat0000001'
+
+test('bounded preference frontier covers each pool before combinations', () => {
+  const frontier = boundedPoolPreferenceFrontier([
+    {
+      identity: 'pool-a',
+      materialGlobalIds: ['gmat0000001', 'gmat0000002'],
+    },
+    {
+      identity: 'pool-b',
+      materialGlobalIds: ['gmat0000003', 'gmat0000004'],
+    },
+    {
+      identity: 'pool-c',
+      materialGlobalIds: ['gmat0000005', 'gmat0000006'],
+    },
+  ], 4)
+
+  assert.equal(frontier.length, 4)
+  assert.deepEqual(frontier[0], {
+    'pool-a': 'gmat0000001',
+    'pool-b': 'gmat0000003',
+    'pool-c': 'gmat0000005',
+  })
+  for (const [pool, alternative] of [
+    ['pool-a', 'gmat0000002'],
+    ['pool-b', 'gmat0000004'],
+    ['pool-c', 'gmat0000006'],
+  ] as const) {
+    assert.ok(
+      frontier.slice(1).some((preference) => (
+        preference[pool] === alternative
+      )),
+      `${pool} first alternative should not be excluded by pool order`,
+    )
+  }
+})
 
 function line(
   sequence: number,
@@ -76,14 +113,16 @@ function recipe(
   sourceLine: HybridCartonizationLine,
   overrides: Partial<HybridCartonizationRecipe> = {},
 ): HybridCartonizationRecipe {
+  const sourceSuffix = sourceLine.lineGlobalId.replace(/^gcol/, '')
+  assert.match(sourceSuffix, /^(?:[0-9]{7}|[0-9a-v]{12})$/)
+  const alternateSuffix = `${sourceSuffix.length === 7 ? '9' : 'v'}${sourceSuffix.slice(1)}`
   return {
-    recipeGlobalId:
-      `gpre${sourceLine.lineGlobalId.slice(-7)}`,
+    recipeGlobalId: `gpre${sourceSuffix}`,
     productGlobalId: sourceLine.productGlobalId,
     inputPackProfileVersionGlobalId:
       sourceLine.profile.versionGlobalId,
     outputPackProfileVersionGlobalId:
-      `gppv9${sourceLine.lineGlobalId.slice(-6)}`,
+      `gppv${alternateSuffix}`,
     packagingMaterialGlobalId: MATERIAL_ID,
     recipeType: 'max_capacity',
     maximumInputQuantity: 18,
@@ -101,6 +140,24 @@ function recipe(
     ...overrides,
   }
 }
+
+test('fixture builders preserve future-format Global ID suffixes', () => {
+  const legacyRecipe = recipe(line(1))
+  assert.equal(legacyRecipe.recipeGlobalId, 'gpre0000001')
+  assert.equal(legacyRecipe.outputPackProfileVersionGlobalId, 'gppv9000001')
+
+  const futureLine = line(1, {
+    lineGlobalId: 'gcol0123456789av',
+    productGlobalId: 'gp0123456789av',
+    profile: {
+      ...line(1).profile,
+      versionGlobalId: 'gppv0123456789av',
+    },
+  })
+  const futureRecipe = recipe(futureLine)
+  assert.equal(futureRecipe.recipeGlobalId, 'gpre0123456789av')
+  assert.equal(futureRecipe.outputPackProfileVersionGlobalId, 'gppvv123456789av')
+})
 
 function input(
   lines: HybridCartonizationLine[],
@@ -126,7 +183,10 @@ test('six mixed 6 oz lines use one AG12V2 only with an explicit sandbox minimum 
   assert.equal(withoutAssumption.recipePackages.length, 0)
   assert.deepEqual(
     withoutAssumption.blockers.map(({ code }) => code),
-    ['RECIPE_CAPACITY_MINIMUM_NOT_MET'],
+    [
+      'MATERIAL_CAPACITY_UNAVAILABLE',
+      'RECIPE_CAPACITY_MINIMUM_NOT_MET',
+    ],
   )
   assert.equal(withoutAssumption.geometryFallbackLines.length, 0)
 
@@ -204,6 +264,72 @@ test('different compatibility keys never pool even with one material', () => {
       item.lineAllocations.map(({ productGlobalId }) => productGlobalId)
     )),
     [[apple.productGlobalId], [berry.productGlobalId]],
+  )
+})
+
+test('exact case remains the full-case path while loose each covers one and thirteen', () => {
+  const sourceLine = line(1)
+  const exactCase = recipe(sourceLine, {
+    recipeGlobalId: 'gprex000001',
+    recipeType: 'exact_case',
+    maximumInputQuantity: 12,
+    minimumInputQuantity: null,
+    contentCompatibilityKey: null,
+    allowsMixedProducts: false,
+    exclusiveContents: true,
+  })
+  const looseEach = recipe(sourceLine, {
+    recipeGlobalId: 'gprel000001',
+    recipeType: 'max_capacity',
+    maximumInputQuantity: 12,
+    minimumInputQuantity: 1,
+    contentCompatibilityKey: null,
+    allowsMixedProducts: false,
+    exclusiveContents: true,
+  })
+  const recipes = [looseEach, exactCase]
+
+  const one = planHybridCartonization(input(
+    [{ ...sourceLine, quantity: 1 }],
+    recipes,
+  ))
+  assert.equal(one.status, 'ready')
+  assert.equal(one.geometryFallbackLines.length, 0)
+  assert.equal(one.recipePackages.length, 1)
+  assert.equal(one.recipePackages[0].totalInputQuantity, 1)
+  assert.equal(
+    one.recipePackages[0].recipeEvidence[0]?.recipeGlobalId,
+    looseEach.recipeGlobalId,
+  )
+
+  const twelve = planHybridCartonization(input(
+    [{ ...sourceLine, quantity: 12 }],
+    recipes,
+  ))
+  assert.equal(twelve.status, 'ready')
+  assert.equal(twelve.geometryFallbackLines.length, 0)
+  assert.equal(twelve.recipePackages.length, 1)
+  assert.equal(twelve.recipePackages[0].totalInputQuantity, 12)
+  assert.equal(
+    twelve.recipePackages[0].recipeEvidence[0]?.recipeGlobalId,
+    exactCase.recipeGlobalId,
+  )
+
+  const thirteen = planHybridCartonization(input(
+    [{ ...sourceLine, quantity: 13 }],
+    recipes,
+  ))
+  assert.equal(thirteen.status, 'ready')
+  assert.equal(thirteen.geometryFallbackLines.length, 0)
+  assert.deepEqual(
+    thirteen.recipePackages.map((item) => item.totalInputQuantity),
+    [12, 1],
+  )
+  assert.deepEqual(
+    thirteen.recipePackages.map(
+      (item) => item.recipeEvidence[0]?.recipeGlobalId,
+    ),
+    [exactCase.recipeGlobalId, looseEach.recipeGlobalId],
   )
 })
 

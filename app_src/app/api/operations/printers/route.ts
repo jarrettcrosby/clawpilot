@@ -28,8 +28,8 @@ export const runtime = 'nodejs'
 
 const MAX_REQUEST_BYTES = 16 * 1024
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const PRINTER_GLOBAL_ID = /^gpr\d{7}$/
-const PRINT_AGENT_GLOBAL_ID = /^gpt\d{7}$/
+const PRINTER_GLOBAL_ID = /^gpr(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRINT_AGENT_GLOBAL_ID = /^gpt(?:[0-9]{7}|[0-9a-v]{12})$/
 const SAVE_FIELDS = new Set([
   'action',
   'globalId',

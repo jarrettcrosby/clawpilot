@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -49,6 +50,7 @@ function loadTypeScriptModule(path, mocks = {}) {
     Set,
     String,
     TextEncoder,
+    URL,
     console,
     exports: loadedModule.exports,
     module: loadedModule,
@@ -115,9 +117,41 @@ const shopifySource = {
       description: 'Wholesale snack',
       vendor: 'AG Alchemy',
       productType: 'Snack Bars',
+      category: {
+        id: 'gid://shopify/TaxonomyCategory/aa-1-2',
+        name: 'Snack Bars',
+        fullName: 'Food, Beverages & Tobacco > Food Items > Snack Bars',
+      },
       status: 'ACTIVE',
       createdAt: '2026-07-01T10:00:00Z',
       updatedAt: '2026-07-26T10:00:00Z',
+      media: {
+        nodes: [{
+          id: 'gid://shopify/MediaImage/501',
+          alt: 'Front of package',
+          image: {
+            url: 'https://cdn.shopify.com/s/files/front.png?token=SHOPIFY-SIGNED-TOKEN-SENTINEL',
+            altText: 'Front fallback',
+            width: 1_200,
+            height: 800,
+          },
+        }, {
+          image: {
+            url: 'https://cdn.shopify.com/s/files/nutrition.png?token=SHOPIFY-LOCATOR-TOKEN-SENTINEL#preview',
+            altText: 'Nutrition panel',
+            width: 900,
+            height: 1_200,
+          },
+        }, {
+          image: {
+            url: 'https://cdn.shopify.com/s/files/nutrition.png?token=SHOPIFY-DUPLICATE-TOKEN-SENTINEL',
+            altText: 'Duplicate locator',
+            width: 900,
+            height: 1_200,
+          },
+        }],
+        pageInfo: { hasNextPage: false },
+      },
       variants: {
         nodes: [{
           id: 'gid://shopify/ProductVariant/101',
@@ -175,7 +209,7 @@ const shopifySource = {
       email: 'ada@example.test',
       phone: '+15555550100',
       shippingLine: {
-        code: 'GROUND',
+        code: '03',
         title: 'Ground shipping',
         deliveryCategory: 'SHIPPING',
       },
@@ -239,10 +273,23 @@ const faireSource = {
       name: 'Snack Bars',
     },
     lifecycle_state: 'PUBLISHED',
+    sale_state: 'FOR_SALE',
     active: true,
     currency: 'USD',
     created_at: '2026-07-01T10:00:00Z',
     updated_at: '2026-07-26T10:00:00Z',
+    images: [
+      'https://cdn.faire.com/products/front.png?token=FAIRE-STRING-TOKEN-SENTINEL',
+      {
+        id: 'faire-image-502',
+        url: 'https://cdn.faire.com/products/case.png?token=FAIRE-OBJECT-TOKEN-SENTINEL',
+        sequence: 1,
+        alt_text: ' Case view ',
+        width: 1_000,
+        height: 750,
+      },
+      'https://cdn.faire.com/products/front.png?token=FAIRE-DUPLICATE-TOKEN-SENTINEL#preview',
+    ],
     variants: [{
       id: 'variant-101',
       sku: 'BAR-CaseSensitive',
@@ -416,6 +463,10 @@ const fairePageWrapped = faire.normalizeFaireCommerce({
 
 assert.equal(shopifyNormalized.rejections.length, 0)
 assert.equal(faireNormalized.rejections.length, 0)
+assert.equal(shopifyNormalized.products[0].saleState, null)
+assert.equal(faireNormalized.products[0].lifecycleState, 'PUBLISHED')
+assert.equal(faireNormalized.products[0].saleState, 'FOR_SALE')
+assert.equal(faireNormalized.products[0].active, true)
 for (const lifecycle of ['DRAFT', 'ARCHIVED', 'UNLISTED']) {
   const source = clone(shopifySource)
   source.products.nodes[0].status = lifecycle
@@ -439,15 +490,63 @@ for (const lifecycle of ['DRAFT', 'ARCHIVED', 'UNAVAILABLE']) {
   assert.equal(normalized.products[0].lifecycleState, lifecycle)
   assert.equal(normalized.products[0].active, false)
 }
-for (const normalized of [shopifyNormalized, faireNormalized]) {
-  assert.deepEqual(headerMoneyProjection(normalized.orders[0]), {
+for (const productState of [{
+  lifecycleState: 'PUBLISHED',
+  saleState: 'SALES_PAUSED',
+  deleted: false,
+}, {
+  lifecycleState: 'UNPUBLISHED',
+  saleState: 'FOR_SALE',
+  deleted: false,
+}, {
+  lifecycleState: 'DELETED',
+  saleState: 'FOR_SALE',
+  deleted: true,
+}, {
+  lifecycleState: null,
+  saleState: 'SALES_PAUSED',
+  deleted: false,
+}]) {
+  const source = clone(faireSource)
+  source.products[0].lifecycle_state = productState.lifecycleState
+  source.products[0].sale_state = productState.saleState
+  source.products[0].deleted = productState.deleted
+  source.products[0].active = true
+  const normalized = faire.normalizeFaireCommerce(source, {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+  })
+  assert.equal(normalized.products.length, 1)
+  assert.equal(
+    normalized.products[0].lifecycleState,
+    productState.lifecycleState,
+    'Faire lifecycle_state must not be replaced by sale_state',
+  )
+  assert.equal(normalized.products[0].saleState, productState.saleState)
+  assert.equal(
+    normalized.products[0].active,
+    false,
+    'Deleted, unpublished, or sales-paused Faire products must be inactive',
+  )
+}
+assert.deepEqual(headerMoneyProjection(shopifyNormalized.orders[0]), {
+  state: 'complete',
+  unavailableFields: [],
+  fulfillmentDemandEligible: true,
+  accountingEligible: true,
+  customerChargeEligible: true,
+})
+assert.deepEqual(
+  headerMoneyProjection(faireNormalized.orders[0]),
+  {
     state: 'complete',
     unavailableFields: [],
     fulfillmentDemandEligible: true,
     accountingEligible: true,
-    customerChargeEligible: true,
-  })
-}
+    customerChargeEligible: false,
+  },
+  'Faire complete header money is brand-side evidence, not retailer-charge evidence',
+)
 
 function availableValue(field) {
   assert.equal(field.state, 'available')
@@ -592,7 +691,7 @@ assert.deepEqual(
 )
 assert.equal(
   faireExternalOrderV2Normalized.normalizerVersion,
-  'faire-commerce-normalizer-v3',
+  'faire-commerce-normalizer-v7',
 )
 assert.deepEqual(
   headerMoneyProjection(faireExternalOrderV2NormalizedOrder),
@@ -601,8 +700,78 @@ assert.deepEqual(
     unavailableFields: [],
     fulfillmentDemandEligible: true,
     accountingEligible: true,
-    customerChargeEligible: true,
+    customerChargeEligible: false,
   },
+)
+
+const faireRetailerCreditSource = clone(faireExternalOrderV2Source)
+const faireRetailerCreditOrder = faireRetailerCreditSource.orders[0]
+faireRetailerCreditOrder.id = 'order-v2-retailer-credit'
+faireRetailerCreditOrder.display_id = 'B78SNY28PX'
+faireRetailerCreditOrder.items[0].quantity = 1
+faireRetailerCreditOrder.items[0].price = {
+  amount_minor: 100,
+  currency: 'USD',
+}
+faireRetailerCreditOrder.items[0].discounts = []
+faireRetailerCreditOrder.payout_costs = {
+  subtotal_after_brand_discounts: {
+    amount_minor: 50,
+    currency: 'USD',
+  },
+  total_brand_discounts: {
+    amount_minor: 50,
+    currency: 'USD',
+  },
+  net_tax: {
+    amount_minor: 0,
+    currency: 'USD',
+  },
+  total_payout: {
+    amount_minor: 0,
+    currency: 'USD',
+  },
+}
+const faireRetailerCredit = faire.normalizeFaireCommerce(
+  faireRetailerCreditSource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+const faireRetailerCreditNormalizedOrder = faireRetailerCredit.orders[0]
+assert.deepEqual(
+  {
+    subtotal: moneyValue(faireRetailerCreditNormalizedOrder.subtotal),
+    discount: moneyValue(faireRetailerCreditNormalizedOrder.discount),
+    brandDiscount: moneyValue(
+      faireRetailerCreditNormalizedOrder.providerFacts.brandDiscount,
+    ),
+    brandSideTotal: moneyValue(faireRetailerCreditNormalizedOrder.total),
+    merchantPayout: moneyValue(
+      faireRetailerCreditNormalizedOrder.providerFacts.payoutAmount,
+    ),
+  },
+  {
+    subtotal: '100:USD',
+    discount: '50:USD',
+    brandDiscount: '50:USD',
+    brandSideTotal: '50:USD',
+    merchantPayout: '0:USD',
+  },
+  'Faire retailer credits are absent from brand-side order and payout facts',
+)
+assert.deepEqual(
+  headerMoneyProjection(faireRetailerCreditNormalizedOrder),
+  {
+    state: 'complete',
+    unavailableFields: [],
+    fulfillmentDemandEligible: true,
+    accountingEligible: true,
+    customerChargeEligible: false,
+  },
+  'A Faire brand-side total must not be eligible as the retailer charge',
 )
 
 const faireExternalOrderV2TesterSource = clone(faireExternalOrderV2Source)
@@ -988,6 +1157,22 @@ assert.equal(
 assert.equal(shopifyNormalized.products[0].vendor, 'AG Alchemy')
 assert.equal(shopifyNormalized.products[0].productType, 'Snack Bars')
 assert.deepEqual(
+  clone(shopifyNormalized.products[0].providerTaxonomy),
+  {
+    state: 'available',
+    value: {
+      scheme: 'shopify_standard_product_taxonomy',
+      externalId: 'gid://shopify/TaxonomyCategory/aa-1-2',
+      name: 'Snack Bars',
+      fullName: 'Food, Beverages & Tobacco > Food Items > Snack Bars',
+      marketplacePaths: [
+        'Food, Beverages & Tobacco > Food Items > Snack Bars',
+      ],
+    },
+  },
+  'Shopify standard taxonomy must preserve its stable ID, label, and path',
+)
+assert.deepEqual(
   clone(shopifyNormalized.products[0].variants[0].selectedOptions),
   [{ name: 'Flavor', value: 'Original' }],
 )
@@ -1005,6 +1190,20 @@ assert.equal(
 )
 assert.equal(faireNormalized.products[0].vendor, 'AG Alchemy')
 assert.equal(faireNormalized.products[0].productType, 'Snack Bars')
+assert.deepEqual(
+  clone(faireNormalized.products[0].providerTaxonomy),
+  {
+    state: 'available',
+    value: {
+      scheme: 'faire_product_type',
+      externalId: 'taxonomy-snack-bars',
+      name: 'Snack Bars',
+      fullName: 'Snack Bars',
+      marketplacePaths: ['Snack Bars'],
+    },
+  },
+  'Faire product type must preserve its stable ID separately from its label',
+)
 assert.deepEqual(
   clone(faireNormalized.products[0].variants[0].selectedOptions),
   [{ name: 'Flavor', value: 'Original' }],
@@ -1047,7 +1246,7 @@ assert.deepEqual(
 assert.deepEqual(
   clone(shopifyNormalized.orders[0].providerFacts.shippingService),
   {
-    code: 'GROUND',
+    code: '03',
     title: 'Ground shipping',
     deliveryCategory: 'SHIPPING',
   },
@@ -1249,6 +1448,628 @@ function stringsAndKeys(value, result = [], seen = new Set()) {
   }
   return result
 }
+
+function expectedImageFingerprint(value) {
+  const locator = new URL(value)
+  locator.search = ''
+  locator.hash = ''
+  return createHash('sha256').update(locator.toString()).digest('hex')
+}
+
+assert.deepEqual(
+  JSON.parse(JSON.stringify(shopifyNormalized.products[0].images)),
+  [{
+    providerImageId: 'gid://shopify/MediaImage/501',
+    locatorFingerprint: expectedImageFingerprint(
+      'https://cdn.shopify.com/s/files/front.png',
+    ),
+    sequence: 0,
+    altText: 'Front of package',
+    widthPixels: 1_200,
+    heightPixels: 800,
+  }, {
+    providerImageId: null,
+    locatorFingerprint: expectedImageFingerprint(
+      'https://cdn.shopify.com/s/files/nutrition.png',
+    ),
+    sequence: 1,
+    altText: 'Nutrition panel',
+    widthPixels: 900,
+    heightPixels: 1_200,
+  }],
+  'Shopify media must normalize into ordered, deduplicated safe references',
+)
+assert.equal(shopifyNormalized.products[0].imageSetComplete, true)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(faireNormalized.products[0].images)),
+  [{
+    providerImageId: null,
+    locatorFingerprint: expectedImageFingerprint(
+      'https://cdn.faire.com/products/front.png',
+    ),
+    sequence: 0,
+    altText: null,
+    widthPixels: null,
+    heightPixels: null,
+  }, {
+    providerImageId: 'faire-image-502',
+    locatorFingerprint: expectedImageFingerprint(
+      'https://cdn.faire.com/products/case.png',
+    ),
+    sequence: 1,
+    altText: 'Case view',
+    widthPixels: 1_000,
+    heightPixels: 750,
+  }],
+  'Faire string and object image shapes must normalize without inventing fields',
+)
+assert.equal(faireNormalized.products[0].imageSetComplete, true)
+for (const normalized of [shopifyNormalized, faireNormalized]) {
+  const durableEnvelope = JSON.stringify(normalized, (_key, value) => (
+    typeof value === 'bigint' ? value.toString() : value
+  ))
+  assert.doesNotMatch(durableEnvelope, /https:\/\//)
+  assert.doesNotMatch(durableEnvelope, /TOKEN-SENTINEL/)
+  for (const image of normalized.products[0].images) {
+    assert.deepEqual(
+      [...Object.keys(image)].sort(),
+      [
+        'altText',
+        'heightPixels',
+        'locatorFingerprint',
+        'providerImageId',
+        'sequence',
+        'widthPixels',
+      ],
+      'Normalized image evidence must not expose a URL or byte field',
+    )
+  }
+}
+for (const unsafeLocator of [
+  'http://cdn.shopify.com/image.png',
+  'https://localhost/image.png',
+  'https://service.internal/image.png',
+  'https://cdn.test/image.png',
+  'https://cdn.invalid/image.png',
+  'https://cdn.example/image.png',
+  'https://private.onion/image.png',
+  'https://10.0.0.1/image.png',
+  'https://127.0.0.1/image.png',
+  'https://[::1]/image.png',
+  'https://[fc00::1]/image.png',
+  'https://user:secret@cdn.shopify.com/image.png',
+  ' https://cdn.shopify.com/image.png ',
+  'not-a-url',
+]) {
+  assert.equal(
+    common.commerceProductImageLocatorFingerprint(unsafeLocator),
+    null,
+    `Unsafe image locator must be rejected: ${unsafeLocator}`,
+  )
+}
+
+const shopifyTokenRotationSource = clone(shopifySource)
+shopifyTokenRotationSource.products.nodes[0].media.nodes[1].image.url =
+  'https://cdn.shopify.com/s/files/nutrition.png?token=ROTATED-SIGNED-TOKEN#other'
+const shopifyTokenRotation = shopify.normalizeShopifyCommerce(
+  shopifyTokenRotationSource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.equal(
+  shopifyTokenRotation.products[0].images[1].locatorFingerprint,
+  shopifyNormalized.products[0].images[1].locatorFingerprint,
+  'Signed query and fragment rotation must not change safe image identity',
+)
+assert.equal(
+  shopifyTokenRotation.products[0].sourceHash,
+  shopifyNormalized.products[0].sourceHash,
+  'Signed URL rotation must not churn normalized Shopify product evidence',
+)
+assert.equal(
+  shopifyTokenRotation.products[0].variants[0].sourceHash,
+  shopifyNormalized.products[0].variants[0].sourceHash,
+  'Signed URL rotation must not churn Shopify variant evidence',
+)
+assert.notEqual(
+  shopifyTokenRotation.sourceHash,
+  shopifyNormalized.sourceHash,
+  'Envelope integrity must still detect a changed provider response',
+)
+
+const shopifyImageChangeSource = clone(shopifySource)
+shopifyImageChangeSource.products.nodes[0].media.nodes[1].image.url =
+  'https://cdn.shopify.com/s/files/nutrition-v2.png?token=NEW-TOKEN'
+const shopifyImageChange = shopify.normalizeShopifyCommerce(
+  shopifyImageChangeSource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.notEqual(
+  shopifyImageChange.products[0].images[1].locatorFingerprint,
+  shopifyNormalized.products[0].images[1].locatorFingerprint,
+)
+assert.notEqual(
+  shopifyImageChange.products[0].sourceHash,
+  shopifyNormalized.products[0].sourceHash,
+  'An image-only locator change must advance Shopify product evidence',
+)
+assert.notEqual(
+  shopifyImageChange.products[0].variants[0].sourceHash,
+  shopifyNormalized.products[0].variants[0].sourceHash,
+  'An image-only locator change must advance Shopify variant evidence',
+)
+
+const shopifyProviderImageRebindSource = clone(shopifySource)
+shopifyProviderImageRebindSource.products.nodes[0].media.nodes[0].image.url =
+  'https://cdn.shopify.com/s/files/front-rebound.png?token=NEW-TOKEN'
+const shopifyProviderImageRebind = shopify.normalizeShopifyCommerce(
+  shopifyProviderImageRebindSource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.equal(
+  shopifyProviderImageRebind.products[0].images[0].providerImageId,
+  shopifyNormalized.products[0].images[0].providerImageId,
+)
+assert.notEqual(
+  shopifyProviderImageRebind.products[0].images[0].locatorFingerprint,
+  shopifyNormalized.products[0].images[0].locatorFingerprint,
+  'A provider image ID must retain locator evidence for rebinding checks',
+)
+assert.notEqual(
+  shopifyProviderImageRebind.products[0].sourceHash,
+  shopifyNormalized.products[0].sourceHash,
+  'Rebinding a provider image ID to a different locator must advance evidence',
+)
+
+const faireTokenRotationSource = clone(faireSource)
+faireTokenRotationSource.products[0].images[0] =
+  'https://cdn.faire.com/products/front.png?token=ROTATED-FAIRE-TOKEN#other'
+const faireTokenRotation = faire.normalizeFaireCommerce(
+  faireTokenRotationSource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+assert.equal(
+  faireTokenRotation.products[0].images[0].locatorFingerprint,
+  faireNormalized.products[0].images[0].locatorFingerprint,
+)
+assert.equal(
+  faireTokenRotation.products[0].sourceHash,
+  faireNormalized.products[0].sourceHash,
+  'Signed URL rotation must not churn normalized Faire product evidence',
+)
+assert.equal(
+  faireTokenRotation.products[0].variants[0].sourceHash,
+  faireNormalized.products[0].variants[0].sourceHash,
+  'Signed URL rotation must not churn Faire variant evidence',
+)
+assert.notEqual(faireTokenRotation.sourceHash, faireNormalized.sourceHash)
+
+const faireImageChangeSource = clone(faireSource)
+faireImageChangeSource.products[0].images[0] =
+  'https://cdn.faire.com/products/front-v2.png?token=NEW-FAIRE-TOKEN'
+const faireImageChange = faire.normalizeFaireCommerce(
+  faireImageChangeSource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+assert.notEqual(
+  faireImageChange.products[0].images[0].locatorFingerprint,
+  faireNormalized.products[0].images[0].locatorFingerprint,
+)
+assert.notEqual(
+  faireImageChange.products[0].sourceHash,
+  faireNormalized.products[0].sourceHash,
+  'An image-only locator change must advance Faire product evidence',
+)
+
+const cappedShopifyImagesSource = clone(shopifySource)
+cappedShopifyImagesSource.products.nodes[0].media.nodes = Array.from(
+  { length: 55 },
+  (_value, index) => ({
+    image: {
+      url: `https://cdn.shopify.com/s/files/bounded-${index}.png?token=SECRET-${index}`,
+    },
+  }),
+)
+const cappedShopifyImages = shopify.normalizeShopifyCommerce(
+  cappedShopifyImagesSource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.equal(cappedShopifyImages.products[0].images.length, 50)
+assert.equal(
+  cappedShopifyImages.products[0].imageSetComplete,
+  false,
+  'A locally oversized Shopify media collection must fail closed',
+)
+
+const paginatedShopifyImagesSource = clone(shopifySource)
+paginatedShopifyImagesSource.products.nodes[0].media.pageInfo.hasNextPage = true
+const paginatedShopifyImages = shopify.normalizeShopifyCommerce(
+  paginatedShopifyImagesSource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.equal(
+  paginatedShopifyImages.products[0].imageSetComplete,
+  false,
+  'A capped Shopify media page must not authorize absent-image tombstones',
+)
+
+const malformedShopifyMediaEdgesSource = clone(shopifySource)
+malformedShopifyMediaEdgesSource.products.nodes[0].media = {
+  edges: [
+    { node: clone(shopifySource.products.nodes[0].media.nodes[0]) },
+    { malformed: true },
+  ],
+  pageInfo: { hasNextPage: false },
+}
+const malformedShopifyMediaEdges = shopify.normalizeShopifyCommerce(
+  malformedShopifyMediaEdgesSource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.equal(malformedShopifyMediaEdges.products[0].images.length, 1)
+assert.equal(
+  malformedShopifyMediaEdges.products[0].imageSetComplete,
+  false,
+  'Malformed Shopify media edges must not authorize absent-image tombstones',
+)
+
+const missingShopifyMediaCollectionSource = clone(shopifySource)
+missingShopifyMediaCollectionSource.products.nodes[0].media = {
+  pageInfo: { hasNextPage: false },
+}
+const missingShopifyMediaCollection = shopify.normalizeShopifyCommerce(
+  missingShopifyMediaCollectionSource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.equal(
+  missingShopifyMediaCollection.products[0].imageSetComplete,
+  false,
+  'Missing Shopify media nodes or edges must fail closed',
+)
+
+const bareShopifyMediaArraySource = clone(shopifySource)
+bareShopifyMediaArraySource.products.nodes[0].media = []
+const bareShopifyMediaArray = shopify.normalizeShopifyCommerce(
+  bareShopifyMediaArraySource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.equal(bareShopifyMediaArray.products[0].images.length, 0)
+assert.equal(
+  bareShopifyMediaArray.products[0].imageSetComplete,
+  false,
+  'A bare Shopify media array lacks pagination proof and must not authorize tombstones',
+)
+
+const conflictingShopifyImageIdSource = clone(shopifySource)
+conflictingShopifyImageIdSource.products.nodes[0].media.nodes.push({
+  ...clone(shopifySource.products.nodes[0].media.nodes[0]),
+  image: {
+    ...clone(shopifySource.products.nodes[0].media.nodes[0].image),
+    url: 'https://cdn.shopify.com/s/files/conflicting-front.png',
+  },
+})
+const conflictingShopifyImageId = shopify.normalizeShopifyCommerce(
+  conflictingShopifyImageIdSource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.equal(
+  conflictingShopifyImageId.products[0].imageSetComplete,
+  false,
+  'One provider image ID bound to conflicting locators must fail closed',
+)
+
+const oneSidedShopifyDimensionsSource = clone(shopifySource)
+delete oneSidedShopifyDimensionsSource.products.nodes[0]
+  .media.nodes[0].image.height
+const oneSidedShopifyDimensions = shopify.normalizeShopifyCommerce(
+  oneSidedShopifyDimensionsSource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.equal(oneSidedShopifyDimensions.products[0].imageSetComplete, false)
+assert.equal(
+  oneSidedShopifyDimensions.products[0].images.some(
+    (image) => image.providerImageId === 'gid://shopify/MediaImage/501',
+  ),
+  false,
+  'One-sided dimensions must not reach the persistence sink',
+)
+
+const normalizedShopifyAltTextSource = clone(shopifySource)
+normalizedShopifyAltTextSource.products.nodes[0].media.nodes[0].alt =
+  '  Front of package  '
+normalizedShopifyAltTextSource.products.nodes[0].media.nodes[1]
+  .image.altText = '   '
+const normalizedShopifyAltText = shopify.normalizeShopifyCommerce(
+  normalizedShopifyAltTextSource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.equal(normalizedShopifyAltText.products[0].images[0].altText, 'Front of package')
+assert.equal(normalizedShopifyAltText.products[0].images[1].altText, null)
+assert.equal(
+  normalizedShopifyAltText.products[0].imageSetComplete,
+  true,
+  'Optional alt text must normalize into the persistence sink contract',
+)
+
+const unsafeShopifyImageSource = clone(shopifySource)
+unsafeShopifyImageSource.products.nodes[0].media.nodes.push({
+  image: { url: 'https://127.0.0.1/private.png' },
+})
+const unsafeShopifyImage = shopify.normalizeShopifyCommerce(
+  unsafeShopifyImageSource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.equal(unsafeShopifyImage.products[0].images.length, 2)
+assert.equal(unsafeShopifyImage.products[0].imageSetComplete, false)
+
+const nonnumericShopifyImageIdSource = clone(shopifySource)
+nonnumericShopifyImageIdSource.products.nodes[0].media.nodes.push({
+  id: 'gid://shopify/MediaImage/not-numeric',
+  mediaContentType: 'IMAGE',
+  image: { url: 'https://cdn.shopify.com/s/files/non-numeric.png' },
+})
+const nonnumericShopifyImageId = shopify.normalizeShopifyCommerce(
+  nonnumericShopifyImageIdSource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.equal(nonnumericShopifyImageId.products[0].images.length, 2)
+assert.equal(nonnumericShopifyImageId.products[0].imageSetComplete, false)
+
+const shopifyIdOnlyImageSource = clone(shopifySource)
+shopifyIdOnlyImageSource.products.nodes[0].media.nodes = [{
+  id: 'gid://shopify/MediaImage/501',
+  mediaContentType: 'IMAGE',
+  image: null,
+}]
+const shopifyIdOnlyImage = shopify.normalizeShopifyCommerce(
+  shopifyIdOnlyImageSource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(shopifyIdOnlyImage.products[0].images)),
+  [],
+  'A Shopify provider image ID without safe locator evidence is not importable',
+)
+assert.equal(shopifyIdOnlyImage.products[0].imageSetComplete, false)
+
+const unsafeFaireImageSource = clone(faireSource)
+unsafeFaireImageSource.products[0].images.push(
+  'http://cdn.faire.com/products/insecure.png',
+)
+const unsafeFaireImage = faire.normalizeFaireCommerce(
+  unsafeFaireImageSource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+assert.equal(unsafeFaireImage.products[0].images.length, 2)
+assert.equal(unsafeFaireImage.products[0].imageSetComplete, false)
+
+const faireIdOnlyImageSource = clone(faireSource)
+faireIdOnlyImageSource.products[0].images = [{ id: 'faire-image-502' }]
+const faireIdOnlyImage = faire.normalizeFaireCommerce(
+  faireIdOnlyImageSource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(faireIdOnlyImage.products[0].images)),
+  [],
+  'A Faire provider image ID without safe locator evidence is not importable',
+)
+assert.equal(faireIdOnlyImage.products[0].imageSetComplete, false)
+
+const absentFaireImageSource = clone(faireSource)
+delete absentFaireImageSource.products[0].images
+const absentFaireImage = faire.normalizeFaireCommerce(
+  absentFaireImageSource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(absentFaireImage.products[0].images)),
+  [],
+)
+assert.equal(absentFaireImage.products[0].imageSetComplete, false)
+
+for (const imageShape of ['retained', 'omitted']) {
+  const deletedFaireImageSource = clone(faireSource)
+  deletedFaireImageSource.products[0].deleted = true
+  deletedFaireImageSource.products[0].lifecycle_state = 'PUBLISHED'
+  deletedFaireImageSource.products[0].active = true
+  if (imageShape === 'omitted') {
+    delete deletedFaireImageSource.products[0].images
+  }
+  const deletedFaireImage = faire.normalizeFaireCommerce(
+    deletedFaireImageSource,
+    {
+      ...baseContext,
+      externalAccountId: 'brand-1',
+      apiVersion: 'external-api-v2',
+    },
+  )
+  assert.equal(
+    deletedFaireImage.products[0].lifecycleState,
+    'DELETED',
+    'Faire deleted=true must be canonical authoritative deletion evidence',
+  )
+  assert.equal(deletedFaireImage.products[0].active, false)
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(deletedFaireImage.products[0].images)),
+    [],
+    `Faire deleted listings must ignore ${imageShape} image fields`,
+  )
+  assert.equal(
+    deletedFaireImage.products[0].imageSetComplete,
+    true,
+    'Faire deleted listings must reconcile as complete-empty image sets',
+  )
+}
+
+const cappedFaireImagesSource = clone(faireSource)
+cappedFaireImagesSource.products[0].images = Array.from(
+  { length: 21 },
+  (_value, index) => (
+    `https://cdn.faire.com/products/bounded-${index}.png?token=SECRET-${index}`
+  ),
+)
+const cappedFaireImages = faire.normalizeFaireCommerce(
+  cappedFaireImagesSource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+assert.equal(cappedFaireImages.products[0].images.length, 20)
+assert.equal(cappedFaireImages.products[0].imageSetComplete, false)
+
+const paddedFaireSource = clone(faireSource)
+paddedFaireSource.products[0].name = '  Alchemy Bar  '
+paddedFaireSource.products[0].brand_name = ' AG Alchemy '
+paddedFaireSource.products[0].taxonomy_type.name = ' Snack Bars '
+paddedFaireSource.products[0].lifecycle_state = ' PUBLISHED '
+paddedFaireSource.products[0].sale_state = ' FOR_SALE '
+paddedFaireSource.products[0].variants[0].sku = ' BAR-CaseSensitive '
+paddedFaireSource.products[0].variants[0].name = ' Original '
+paddedFaireSource.products[0].variants[0].options[0].name = ' Flavor '
+paddedFaireSource.products[0].variants[0].options[0].value = ' Original '
+paddedFaireSource.orders[0].display_id = ' 1001 '
+paddedFaireSource.orders[0].state = ' NEW '
+paddedFaireSource.orders[0].payment_state = ' PAID '
+paddedFaireSource.orders[0].fulfillment_state = ' NEW '
+paddedFaireSource.orders[0].return_state = ' NO_RETURN '
+paddedFaireSource.orders[0].payout_costs.state = ' PENDING '
+paddedFaireSource.orders[0].items[0].sku = ' BAR-CaseSensitive '
+paddedFaireSource.orders[0].items[0].product_name = ' Alchemy Bar '
+paddedFaireSource.orders[0].items[0].variant_name = ' Original '
+paddedFaireSource.orders[0].items[0].brand_name = ' AG Alchemy '
+const paddedFaire = faire.normalizeFaireCommerce(paddedFaireSource, {
+  ...baseContext,
+  externalAccountId: 'brand-1',
+  apiVersion: 'external-api-v2',
+})
+assert.equal(paddedFaire.rejections.length, 0)
+assert.equal(paddedFaire.products[0].title, 'Alchemy Bar')
+assert.equal(paddedFaire.products[0].vendor, 'AG Alchemy')
+assert.equal(paddedFaire.products[0].lifecycleState, 'PUBLISHED')
+assert.equal(paddedFaire.products[0].saleState, 'FOR_SALE')
+assert.equal(paddedFaire.products[0].variants[0].sku, 'BAR-CaseSensitive')
+assert.equal(paddedFaire.products[0].variants[0].title, 'Original')
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    paddedFaire.products[0].variants[0].selectedOptions,
+  )),
+  [{ name: 'Flavor', value: 'Original' }],
+)
+assert.equal(paddedFaire.orders[0].orderNumber, '1001')
+assert.equal(paddedFaire.orders[0].lines[0].titleSnapshot, 'Alchemy Bar')
+assert.equal(paddedFaire.orders[0].lines[0].sku, 'BAR-CaseSensitive')
+assert.equal(paddedFaire.orders[0].providerFacts.payoutState, 'PENDING')
+
+for (const invalidTitle of [
+  'Alchemy\u0000 Bar',
+  '   ',
+  'X'.repeat(513),
+]) {
+  const invalidTitleSource = clone(faireSource)
+  invalidTitleSource.orders[0].items[0].product_name = invalidTitle
+  const invalidTitleResult = faire.normalizeFaireCommerce(
+    invalidTitleSource,
+    {
+      ...baseContext,
+      externalAccountId: 'brand-1',
+      apiVersion: 'external-api-v2',
+    },
+  )
+  assert.equal(invalidTitleResult.orders.length, 0)
+  assertSafeRejection(invalidTitleResult.rejections[0], {
+    resourceType: 'order',
+    errorCode: 'COMMERCE_ORDER_RECORD_INVALID',
+    externalId: 'order-200',
+  })
+}
+const paddedFaireIdentitySource = clone(faireSource)
+paddedFaireIdentitySource.orders[0].items[0].id = ' item-201 '
+const paddedFaireIdentity = faire.normalizeFaireCommerce(
+  paddedFaireIdentitySource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+assert.equal(paddedFaireIdentity.orders.length, 0)
+const paddedFaireUrlSource = clone(faireSource)
+paddedFaireUrlSource.products[0].images = [
+  ' https://cdn.faire.com/products/front.png ',
+]
+const paddedFaireUrl = faire.normalizeFaireCommerce(paddedFaireUrlSource, {
+  ...baseContext,
+  externalAccountId: 'brand-1',
+  apiVersion: 'external-api-v2',
+})
+assert.equal(
+  paddedFaireUrl.products[0].images.length,
+  0,
+  'Faire semantic trimming must never be applied to provider image URLs',
+)
 
 const unknownFieldSource = clone(shopifySource)
 unknownFieldSource.future_additive_field = {

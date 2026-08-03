@@ -1,6 +1,11 @@
 import { expect, test } from '@playwright/test'
 import type { Locator, Page } from '@playwright/test'
 import type { OperationsExceptionStatus } from '@/lib/operations/types'
+import type {
+  OperationsRegressionPackRateStage,
+  OperationsRegressionRun,
+  OperationsRegressionWalkthrough,
+} from '@/lib/operations/regressionReplay'
 
 test.use({ hasTouch: true })
 
@@ -333,6 +338,367 @@ async function installOperationsNavigationRoute(page: Page) {
   })
 }
 
+const replayPackages: OperationsRegressionPackRateStage['packages'] = [
+  {
+    packageKey: 'historical-order:package:1',
+    sequence: 1,
+    materialCode: 'AG12V2',
+    materialName: 'AG12V2 carton',
+    dimensionsMm: { length: 279, width: 229, height: 178 },
+    contentWeightGrams: 4536,
+    tareWeightGrams: 340,
+    grossWeightGrams: 4876,
+    allocations: [{
+      lineKey: 'line-apple-crisp',
+      productKey: 'gp1234567',
+      title: 'Apple Crisp 6 oz bag',
+      quantity: 12,
+    }],
+  },
+  {
+    packageKey: 'historical-order:package:2',
+    sequence: 2,
+    materialCode: 'CARTON-2OZ',
+    materialName: 'Carton 2 oz box',
+    dimensionsMm: { length: 356, width: 279, height: 203 },
+    contentWeightGrams: 3062,
+    tareWeightGrams: 410,
+    grossWeightGrams: 3472,
+    allocations: [{
+      lineKey: 'line-kringle',
+      productKey: 'gp7654321',
+      title: 'Apple Crisp Kringle 2 oz bag',
+      quantity: 36,
+    }],
+  },
+]
+
+function replayRateStage(
+  purpose: OperationsRegressionPackRateStage['purpose'],
+): OperationsRegressionPackRateStage {
+  const checkout = purpose === 'checkout_quote'
+  const rates: OperationsRegressionPackRateStage['rateChoices'] = [
+    {
+      provider: 'ups_rest',
+      serviceCode: '03',
+      serviceName: 'UPS Ground',
+      carrierCostMinor: checkout ? 1840 : 1995,
+      currency: 'USD',
+      selected: true,
+      recordedFactVersion: `recorded-${purpose}-ups`,
+    },
+    {
+      provider: 'fedex_rest',
+      serviceCode: 'FEDEX_GROUND',
+      serviceName: 'FedEx Ground',
+      carrierCostMinor: checkout ? 1925 : 2070,
+      currency: 'USD',
+      selected: false,
+      recordedFactVersion: `recorded-${purpose}-fedex`,
+    },
+  ]
+  return {
+    kind: 'pack_rate',
+    status: 'passed',
+    runGlobalId: checkout ? 'grr-checkout-001' : 'grr-fulfillment-001',
+    purpose,
+    packageCount: 2,
+    packages: replayPackages,
+    rateChoices: rates,
+    selectedRate: rates[0],
+    selectedCarrierCostMinor: rates[0].carrierCostMinor,
+    checkoutShippingChargeMinor: 2350,
+    estimatedShippingVarianceMinor: checkout ? 510 : 355,
+    pricingSemanticsVersion: 2,
+    billingReconciliationStatus: 'pending_carrier_invoice',
+    currency: 'USD',
+    inputHash: `input-${purpose}`,
+    resultHash: `result-${purpose}`,
+    expiresAt: checkout ? '2026-07-28T18:15:00.000Z' : null,
+  }
+}
+
+const blockedReplayRun: OperationsRegressionRun = {
+  globalId: 'grr-blocked-001',
+  checkoutRunGlobalId: 'grr-checkout-001',
+  fulfillmentRunGlobalId: 'grr-fulfillment-001',
+  replayGroupKey: 'shopify-historical-order-1042',
+  scenarioId: 'shopify-two-pass',
+  scenarioTitle: 'Shopify two-pass multi-package order',
+  status: 'succeeded',
+  replayed: false,
+  createdAt: '2026-07-28T18:00:00.000Z',
+  noProviderWrites: true,
+  noPostagePurchases: true,
+  stages: {
+    checkoutQuote: replayRateStage('checkout_quote'),
+    orderIntake: {
+      status: 'passed',
+      provider: 'shopify',
+      sourceReference: 'Shopify order #1042',
+      intakeEvidenceHash: 'intake-shopify-1042',
+      customerNeutral: true,
+      detail: 'Recorded order facts were retained before CRM customer resolution.',
+    },
+    customerResolution: {
+      status: 'passed',
+      requestedMode: 'reuse',
+      outcome: 'reused',
+      customerGlobalId: 'ga1234567',
+      identityKey: 'shopify:customer:123',
+      candidateCount: 1,
+      detail: 'Reused the existing CRM customer through its Shopify identity.',
+    },
+    fulfillmentExecution: replayRateStage('fulfillment_execution'),
+    variance: {
+      status: 'warning',
+      changed: true,
+      packageCountDelta: 0,
+      checkoutCarrierCostMinor: 1840,
+      checkoutShippingChargeMinor: 2350,
+      fulfillmentCarrierCostMinor: 1995,
+      preLabelRateVarianceMinor: 155,
+      estimatedShippingVarianceMinor: 355,
+      billingReconciliationStatus: 'pending_carrier_invoice',
+      currency: 'USD',
+      allocationChanged: false,
+      materialChanged: false,
+      serviceChanged: false,
+      causes: ['recorded_rate_changed'],
+    },
+    labelFinalization: {
+      status: 'warning',
+      responseSource: null,
+      noProviderWrites: true,
+      noPostagePurchases: true,
+      packages: replayPackages.map((item) => ({
+        packageKey: item.packageKey,
+        sequence: item.sequence,
+        status: 'not_finalized',
+        carrier: null,
+        serviceCode: null,
+        recordedLabelReference: null,
+        trackingNumber: null,
+      })),
+      detail: 'The pre-label state intentionally has no tracking facts.',
+    },
+    packageDocuments: {
+      status: 'warning',
+      finalPackingSlipEligible: false,
+      preLabelDocumentType: 'pack_work_instruction',
+      packages: replayPackages.map((item) => ({
+        packageKey: item.packageKey,
+        sequence: item.sequence,
+        trackingRequired: true,
+        trackingNumber: null,
+        finalPackingSlipStatus: 'blocked_until_label',
+        finalPackingSlipGlobalId: null,
+      })),
+      detail: 'Final package packing slips are blocked until recorded label finalization.',
+    },
+  },
+}
+
+const finalizedReplayRun: OperationsRegressionRun = {
+  ...blockedReplayRun,
+  globalId: 'grr-finalized-001',
+  replayed: false,
+  createdAt: '2026-07-28T18:05:00.000Z',
+  stages: {
+    ...blockedReplayRun.stages,
+    labelFinalization: {
+      status: 'passed',
+      responseSource: 'recorded_label_response',
+      noProviderWrites: true,
+      noPostagePurchases: true,
+      packages: replayPackages.map((item) => ({
+        packageKey: item.packageKey,
+        sequence: item.sequence,
+        status: 'finalized',
+        carrier: 'UPS',
+        serviceCode: '03',
+        recordedLabelReference: `recorded-label-${item.sequence}`,
+        trackingNumber: `1ZRECORDED000000${item.sequence}`,
+      })),
+      detail: 'Recorded label responses finalized one tracking number per package.',
+    },
+    packageDocuments: {
+      ...blockedReplayRun.stages.packageDocuments,
+      status: 'passed',
+      finalPackingSlipEligible: true,
+      packages: replayPackages.map((item) => ({
+        packageKey: item.packageKey,
+        sequence: item.sequence,
+        trackingRequired: true,
+        trackingNumber: `1ZRECORDED000000${item.sequence}`,
+        finalPackingSlipStatus: 'ready',
+        finalPackingSlipGlobalId: `gpf000000${item.sequence}`,
+      })),
+      detail: 'Each final packing slip is bound to its exact tracked package.',
+    },
+  },
+}
+
+const faireFulfillmentStage: OperationsRegressionPackRateStage = {
+  ...replayRateStage('fulfillment_execution'),
+  packageCount: 1,
+  packages: [replayPackages[0]],
+  checkoutShippingChargeMinor: 1895,
+  estimatedShippingVarianceMinor: -100,
+  pricingSemanticsVersion: 2,
+  billingReconciliationStatus: 'pending_carrier_invoice',
+}
+
+const faireReplayRun: OperationsRegressionRun = {
+  globalId: 'grr-faire-fulfillment-001',
+  checkoutRunGlobalId: 'grr-faire-estimate-001',
+  fulfillmentRunGlobalId: 'grr-faire-fulfillment-001',
+  replayGroupKey: 'faire-captured-estimate-v1',
+  scenarioId: 'faire-captured-estimate',
+  scenarioTitle: 'Faire captured checkout estimate',
+  status: 'succeeded',
+  replayed: false,
+  createdAt: '2026-07-28T18:02:00.000Z',
+  noProviderWrites: true,
+  noPostagePurchases: true,
+  stages: {
+    checkoutQuote: {
+      kind: 'marketplace_estimate',
+      status: 'warning',
+      runGlobalId: 'grr-faire-estimate-001',
+      purpose: 'checkout_quote',
+      source: 'faire_checkout_estimate_captured',
+      capturedCheckoutShippingChargeMinor: 1895,
+      currency: 'USD',
+      inputHash: 'input-faire-estimate',
+      resultHash: 'result-faire-estimate',
+      capturedAt: '2026-07-28T18:02:00.000Z',
+      detail: 'Faire supplied no ClawPilot checkout callback. This is the captured marketplace estimate only.',
+    },
+    orderIntake: {
+      status: 'passed',
+      provider: 'faire',
+      sourceReference: 'Faire order fa-102',
+      intakeEvidenceHash: 'intake-faire-102',
+      customerNeutral: true,
+      detail: 'Recorded Faire order facts were retained before CRM customer resolution.',
+    },
+    customerResolution: {
+      status: 'passed',
+      requestedMode: 'new',
+      outcome: 'created',
+      customerGlobalId: 'ga7654321',
+      identityKey: 'faire:customer:102',
+      candidateCount: 1,
+      detail: 'Created one CRM customer after Faire order intake.',
+    },
+    fulfillmentExecution: faireFulfillmentStage,
+    variance: null,
+    labelFinalization: {
+      status: 'warning',
+      responseSource: null,
+      noProviderWrites: true,
+      noPostagePurchases: true,
+      packages: [{
+        packageKey: replayPackages[0].packageKey,
+        sequence: replayPackages[0].sequence,
+        status: 'not_finalized',
+        carrier: null,
+        serviceCode: null,
+        recordedLabelReference: null,
+        trackingNumber: null,
+      }],
+      detail: 'The successful post-intake state has no recorded label response yet.',
+    },
+    packageDocuments: {
+      status: 'warning',
+      finalPackingSlipEligible: false,
+      preLabelDocumentType: 'pack_work_instruction',
+      packages: [{
+        packageKey: replayPackages[0].packageKey,
+        sequence: replayPackages[0].sequence,
+        trackingRequired: true,
+        trackingNumber: null,
+        finalPackingSlipStatus: 'blocked_until_label',
+        finalPackingSlipGlobalId: null,
+      }],
+      detail: 'Final packing slip is blocked until package tracking exists.',
+    },
+  },
+}
+
+async function installReplayRoutes(page: Page) {
+  let runs = [blockedReplayRun, faireReplayRun]
+  const walkthrough = (): OperationsRegressionWalkthrough => ({
+    schemaVersion: 'operations-regression-replay-v2',
+    generatedAt: '2026-07-28T18:05:00.000Z',
+    scenarios: [{
+      id: 'shopify-two-pass',
+      title: 'Shopify two-pass multi-package order',
+      description: 'Replays checkout cartonization, CRM linkage, fulfillment rerating, and package documents.',
+      provider: 'shopify',
+      checkoutSource: 'live_callback_recorded',
+      sourceReference: 'Shopify order #1042',
+      customerMode: 'reuse',
+      expectedCheckoutPackages: 2,
+      expectedFulfillmentPackages: 2,
+      lines: [
+        {
+          productKey: 'gp1234567',
+          title: 'Apple Crisp 6 oz bag',
+          checkoutQuantity: 12,
+          fulfillmentQuantity: 12,
+          unitWeightGrams: 170,
+        },
+        {
+          productKey: 'gp7654321',
+          title: 'Apple Crisp Kringle 2 oz bag',
+          checkoutQuantity: 36,
+          fulfillmentQuantity: 36,
+          unitWeightGrams: 57,
+        },
+      ],
+      regressionFocus: ['two_pass_variance', 'multi_package', 'tracking_documents'],
+    }, {
+      id: 'faire-captured-estimate',
+      title: 'Faire captured checkout estimate',
+      description: 'Preserves Faire checkout evidence without implying a ClawPilot callback.',
+      provider: 'faire',
+      checkoutSource: 'faire_checkout_estimate_captured',
+      sourceReference: 'Faire order fa-102',
+      customerMode: 'new',
+      expectedCheckoutPackages: 0,
+      expectedFulfillmentPackages: 1,
+      lines: [{
+        productKey: 'gp1234567',
+        title: 'Apple Crisp 6 oz bag',
+        checkoutQuantity: 12,
+        fulfillmentQuantity: 12,
+        unitWeightGrams: 170,
+      }],
+      regressionFocus: ['faire_checkout_semantics'],
+    }],
+    runs,
+  })
+
+  await page.route((url) => url.pathname === '/api/operations/regression-replays', async (route) => {
+    if (route.request().method() === 'POST') {
+      const request = route.request().postDataJSON() as {
+        action?: string
+        scenarioId?: string
+        idempotencyKey?: string
+      }
+      expect(request.action).toBe('run-replay')
+      expect(request.scenarioId).toBe('shopify-two-pass')
+      expect(request.idempotencyKey).toMatch(/^operations-regression-replay:shopify-two-pass:/)
+      expect(route.request().headers()['idempotency-key']).toBe(request.idempotencyKey)
+      runs = [finalizedReplayRun, ...runs]
+      return route.fulfill({ json: { ok: true, run: finalizedReplayRun } })
+    }
+    return route.fulfill({ json: { ok: true, walkthrough: walkthrough() } })
+  })
+}
+
 test('operations workbench renders dense desktop evidence and order drill-in', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 768 })
   await installOperationsRoutes(page)
@@ -459,4 +825,91 @@ test('operations mobile workflow has no page overflow and omits hosted proof gen
   await page.getByRole('button', { name: /PROOF-1042/ }).click()
   await expect(page.getByRole('heading', { name: 'Order PROOF-1042' })).toBeVisible()
   await expect.poll(async () => page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(1)
+})
+
+test('pack and rate replay runs, persists, and reloads two-pass package evidence', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  await installOperationsNavigationRoute(page)
+  await installReplayRoutes(page)
+  await gotoApp(page, '/#operations/replays')
+
+  await expect(page.getByRole('heading', { name: 'Pack & rate replay' })).toBeVisible()
+  await expect(page.getByText('Development-only, non-postage replay')).toBeVisible()
+  await expect(page.getByText(/does not call Shopify, Faire, UPS, or FedEx/)).toBeVisible()
+
+  const scenario = page.getByRole('combobox', { name: 'Historical replay scenario' })
+  await scenario.click()
+  await page.getByRole('option', { name: /Faire captured checkout estimate/ }).click()
+  await expect(page.getByText(/Faire does not call ClawPilot during checkout/)).toBeVisible()
+
+  await page.getByRole('row', { name: /grr-blocked-001/ }).click()
+  await expect(scenario).toContainText('Shopify two-pass multi-package order')
+  await expect(page.getByText(/Faire does not call ClawPilot during checkout/)).toHaveCount(0)
+  await expect(page.getByText(/recorded Shopify live-callback input/)).toBeVisible()
+
+  await expect(
+    page.getByRole('table', { name: 'Checkout Quote recorded carrier rates' }),
+  ).toContainText('UPS Ground')
+  await expect(
+    page.getByRole('table', { name: 'Checkout Quote recorded carrier rates' }),
+  ).toContainText('FedEx Ground')
+  await expect(
+    page.getByRole('table', { name: 'Fulfillment Execution recorded carrier rates' }),
+  ).toContainText('UPS Ground')
+  await expect(page.getByText('Blocked Until Label').first()).toBeVisible()
+  await expect(
+    page.getByText('Customer checkout shipping charge').first(),
+  ).toBeVisible()
+  await expect(page.getByText('Pre-label carrier estimate')).toBeVisible()
+  await expect(page.getByText(
+    /selected for 2 packages, but recorded label finalization has not proven every package used it/,
+  )).toBeVisible()
+
+  await page.getByRole('button', { name: 'Run replay' }).click()
+  await expect(page.getByText(/completed and its evidence was persisted/)).toBeVisible()
+  await expect(page.getByText('1ZRECORDED0000001', { exact: true })).toBeVisible()
+  await expect(page.getByText('1ZRECORDED0000002', { exact: true })).toBeVisible()
+  await expect(page.getByText('Final packing slip ready')).toHaveCount(2)
+  await expect(page.getByRole('link', { name: 'Download PDF' })).toHaveCount(2)
+  await expect(page.getByRole('row', { name: /grr-finalized-001/ })).toBeVisible()
+  await expect(page.getByText(
+    'Recorded labels prove UPS Ground was applied to all 2 packages.',
+  )).toBeVisible()
+
+  await page.getByRole('button', { name: 'Reload results' }).click()
+  await expect(page.getByText('1ZRECORDED0000001', { exact: true })).toBeVisible()
+  await expect(page.getByText('Final packing slip ready')).toHaveCount(2)
+})
+
+test('Faire replay shows only the marketplace estimate before post-intake rating', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  await installOperationsNavigationRoute(page)
+  await installReplayRoutes(page)
+  await gotoApp(page, '/#operations/replays')
+
+  await page.getByRole('row', { name: /grr-faire-fulfillment-001/ }).click()
+  await expect(
+    page.getByRole('heading', { name: 'Marketplace checkout estimate' }),
+  ).toBeVisible()
+  await expect(
+    page.getByText('Captured marketplace estimate', { exact: true }),
+  ).toBeVisible()
+  await expect(page.getByText('$18.95').first()).toBeVisible()
+  await expect(page.getByText('ClawPilot checkout packages and rates')).toBeVisible()
+  await expect(page.getByText('Not run', { exact: true })).toBeVisible()
+  await expect(
+    page.getByRole('table', { name: 'Checkout Quote recorded carrier rates' }),
+  ).toHaveCount(0)
+  await expect(
+    page.getByRole('table', { name: 'Fulfillment Execution recorded carrier rates' }),
+  ).toContainText('UPS Ground')
+  await expect(
+    page.getByRole('table', { name: 'Fulfillment Execution recorded carrier rates' }),
+  ).toContainText('FedEx Ground')
+  await expect(
+    page.getByRole('heading', {
+      name: 'Marketplace estimate vs post-intake fulfillment',
+    }),
+  ).toBeVisible()
+  await expect(page.getByText(/no checkout carrier-cost or package-plan baseline/)).toBeVisible()
 })

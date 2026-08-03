@@ -45,7 +45,7 @@ export function isShareableAgentLearning(value: unknown): boolean {
     /[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(learning)
     || /https?:\/\//i.test(learning)
     || /\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/i.test(learning)
-    || /\bg[a-z][0-9]{7}\b/i.test(learning)
+    || /\bg[a-z]{1,4}(?:[0-9]{7}|[0-9a-v]{12})\b/i.test(learning)
     || /%gslt/i.test(learning)
     || /\b\d{7,}\b/.test(learning)
   )

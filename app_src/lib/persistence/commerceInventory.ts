@@ -74,10 +74,26 @@ export type ShopifyInventoryTarget = {
 export type ShopifyInventoryAttempt = {
   id: string
   globalId: string
+  idempotencyKey: string
+  runGlobalId: string | null
   attemptNumber: number
   replayed: boolean
   captured: boolean
   leaseToken: string | null
+}
+
+export type ShopifyInventoryRefreshExpectedFence = {
+  jobId: string
+  carrierServiceConfigId: string
+  warehouseId: string
+  credentialGeneration: number
+  activationRevision: number
+  configRowVersion: number
+  policyRevision: number
+  policyHash: string
+  inventoryMaxAgeSeconds: number
+  requestedDirtyVersion: number
+  lockToken: string
 }
 
 export type ShopifyInventoryCapture = {
@@ -274,7 +290,7 @@ export async function readShopifyInventoryTargetFromPostgres(input: {
   if (
     row.credential_version !== input.runtime.credentialVersion
     || row.verification_status !== 'verified'
-    || row.account_status === 'error'
+    || row.account_status !== 'active'
   ) {
     persistenceError(
       'SHOPIFY_INVENTORY_CONNECTION_STALE',
@@ -333,7 +349,7 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
   target: ShopifyInventoryTarget
   idempotencyKey: string
   requestHash: string
-  actorEmail: string
+  actorEmail: string | null
 }): Promise<ShopifyInventoryAttempt> {
   return withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
@@ -342,22 +358,79 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
         'shopify-inventory-read',
         input.runtime.organizationId,
         input.runtime.integrationAccountId,
-        input.idempotencyKey,
       ].join(':'),
     )
+    const capturedAttemptLease = async (attempt: {
+      id: string
+      request_hash: string
+      lease_token: string | null
+      lease_expires_at: Date | null
+      lease_is_live: boolean
+    }) => {
+      if (attempt.lease_is_live && attempt.lease_token) {
+        return attempt.lease_token
+      }
+      const reacquired = await client.query<{ lease_token: string }>(
+        `UPDATE operations_commerce_provider_attempts attempt
+         SET lease_token = gen_random_uuid(),
+             lease_expires_at =
+               clock_timestamp() + interval '15 minutes'
+         WHERE attempt.organization_id = $1::uuid
+           AND attempt.integration_account_id = $2::uuid
+           AND attempt.id = $3::uuid
+           AND attempt.action = $4
+           AND attempt.request_hash = $5
+           AND attempt.state = 'prepared'
+           AND attempt.lease_token IS NOT NULL
+           AND attempt.lease_expires_at IS NOT NULL
+           AND attempt.lease_expires_at <= clock_timestamp()
+           AND EXISTS (
+             SELECT 1
+             FROM operations_commerce_inventory_captures capture
+             WHERE capture.organization_id = attempt.organization_id
+               AND capture.integration_account_id =
+                   attempt.integration_account_id
+               AND capture.provider_attempt_id = attempt.id
+               AND capture.request_hash = attempt.request_hash
+           )
+         RETURNING attempt.lease_token::text`,
+        [
+          input.runtime.organizationId,
+          input.runtime.integrationAccountId,
+          attempt.id,
+          SYNC_ACTION,
+          attempt.request_hash,
+        ],
+      )
+      if (!reacquired.rows[0]?.lease_token) {
+        persistenceError(
+          'SHOPIFY_INVENTORY_CAPTURE_LEASE_REACQUIRE_FAILED',
+          'The captured Shopify inventory response could not reacquire its projection lease',
+          409,
+        )
+      }
+      return reacquired.rows[0].lease_token
+    }
     const previous = await client.query<{
       id: string
       global_id: string
+      idempotency_key: string
       attempt_number: number
       request_hash: string
       state: string
       lease_token: string | null
       lease_expires_at: Date | null
+      lease_is_live: boolean
       captured: boolean
     }>(
-      `SELECT attempt.id::text, attempt.global_id,
+      `SELECT attempt.id::text, attempt.global_id, attempt.idempotency_key,
               attempt.attempt_number, attempt.request_hash, attempt.state,
               attempt.lease_token::text, attempt.lease_expires_at,
+              (
+                attempt.lease_token IS NOT NULL
+                AND attempt.lease_expires_at IS NOT NULL
+                AND attempt.lease_expires_at > clock_timestamp()
+              ) AS lease_is_live,
               EXISTS (
                 SELECT 1
                 FROM operations_commerce_inventory_captures capture
@@ -389,20 +462,26 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
       )
     }
     if (latest?.state === 'succeeded') {
-      const run = await client.query(
-        `SELECT id
+      const run = await client.query<{
+        global_id: string
+        idempotency_key: string
+      }>(
+        `SELECT global_id, idempotency_key
          FROM operations_commerce_inventory_sync_runs
          WHERE organization_id = $1::uuid
            AND integration_account_id = $2::uuid
            AND provider_attempt_id = $3::uuid
+           AND warehouse_id = $4::uuid
+           AND status = 'succeeded'
          LIMIT 1`,
         [
           input.runtime.organizationId,
           input.runtime.integrationAccountId,
           latest.id,
+          input.target.warehouse.id,
         ],
       )
-      if (!run.rowCount) {
+      if (!run.rows[0]) {
         persistenceError(
           'SHOPIFY_INVENTORY_EVIDENCE_INCOMPLETE',
           'The prior provider read succeeded without a committed inventory snapshot',
@@ -412,6 +491,8 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
       return {
         id: latest.id,
         globalId: latest.global_id,
+        idempotencyKey: run.rows[0].idempotency_key,
+        runGlobalId: run.rows[0].global_id,
         attemptNumber: latest.attempt_number,
         replayed: true,
         captured: true,
@@ -420,26 +501,25 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
     }
     if (latest?.state === 'prepared') {
       if (latest.captured) {
+        const leaseToken = await capturedAttemptLease(latest)
         return {
           id: latest.id,
           globalId: latest.global_id,
+          idempotencyKey: latest.idempotency_key,
+          runGlobalId: null,
           attemptNumber: latest.attempt_number,
           replayed: false,
           captured: true,
-          leaseToken: latest.lease_token,
+          leaseToken,
         }
       }
-      if (
-        latest.lease_token
-        && latest.lease_expires_at
-        && latest.lease_expires_at.getTime() > Date.now()
-      ) {
+      if (latest.lease_is_live) {
         persistenceError(
           'SHOPIFY_INVENTORY_SYNC_IN_PROGRESS',
           'This Shopify inventory sync is already in progress',
         )
       }
-      await client.query(
+      const expired = await client.query(
         `UPDATE operations_commerce_provider_attempts
          SET state = 'unknown',
              redacted_response = $4::jsonb,
@@ -450,7 +530,10 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
          WHERE organization_id = $1::uuid
            AND integration_account_id = $2::uuid
            AND id = $3::uuid
-           AND state = 'prepared'`,
+           AND state = 'prepared'
+           AND lease_token = $5::uuid
+           AND lease_expires_at <= clock_timestamp()
+         RETURNING id`,
         [
           input.runtime.organizationId,
           input.runtime.integrationAccountId,
@@ -460,8 +543,115 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
             providerWrites: 0,
             orderQuantityAdjustment: 0,
           }),
+          latest.lease_token,
         ],
       )
+      if (!expired.rowCount) {
+        persistenceError(
+          'SHOPIFY_INVENTORY_SYNC_IN_PROGRESS',
+          'This Shopify inventory sync is already in progress',
+        )
+      }
+    }
+    const concurrent = await client.query<{
+      id: string
+      global_id: string
+      idempotency_key: string
+      attempt_number: number
+      request_hash: string
+      lease_token: string | null
+      lease_expires_at: Date | null
+      lease_is_live: boolean
+      captured: boolean
+    }>(
+      `SELECT attempt.id::text, attempt.global_id,
+              attempt.idempotency_key, attempt.attempt_number,
+              attempt.request_hash, attempt.lease_token::text,
+              attempt.lease_expires_at,
+              (
+                attempt.lease_token IS NOT NULL
+                AND attempt.lease_expires_at IS NOT NULL
+                AND attempt.lease_expires_at > clock_timestamp()
+              ) AS lease_is_live,
+              EXISTS (
+                SELECT 1
+                FROM operations_commerce_inventory_captures capture
+                WHERE capture.organization_id = attempt.organization_id
+                  AND capture.integration_account_id =
+                      attempt.integration_account_id
+                  AND capture.provider_attempt_id = attempt.id
+              ) AS captured
+       FROM operations_commerce_provider_attempts attempt
+       WHERE attempt.organization_id = $1::uuid
+         AND attempt.integration_account_id = $2::uuid
+         AND attempt.action = $3
+         AND attempt.state = 'prepared'
+       ORDER BY attempt.requested_at DESC, attempt.id DESC
+       LIMIT 1
+       FOR UPDATE`,
+      [
+        input.runtime.organizationId,
+        input.runtime.integrationAccountId,
+        SYNC_ACTION,
+      ],
+    )
+    const active = concurrent.rows[0]
+    if (active) {
+      if (active.captured && active.request_hash === input.requestHash) {
+        const leaseToken = await capturedAttemptLease(active)
+        return {
+          id: active.id,
+          globalId: active.global_id,
+          idempotencyKey: active.idempotency_key,
+          runGlobalId: null,
+          attemptNumber: active.attempt_number,
+          replayed: false,
+          captured: true,
+          leaseToken,
+        }
+      }
+      if (active.lease_is_live) {
+        persistenceError(
+          'SHOPIFY_INVENTORY_SYNC_IN_PROGRESS',
+          'Another Shopify inventory sync is already in progress',
+        )
+      }
+      const expired = await client.query(
+        `UPDATE operations_commerce_provider_attempts
+         SET state = 'unknown',
+             redacted_response = $4::jsonb,
+             error_code = $5,
+             lease_token = NULL,
+             lease_expires_at = NULL,
+             completed_at = now()
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND id = $3::uuid
+           AND state = 'prepared'
+           AND lease_token = $6::uuid
+           AND lease_expires_at <= clock_timestamp()
+         RETURNING id`,
+        [
+          input.runtime.organizationId,
+          input.runtime.integrationAccountId,
+          active.id,
+          JSON.stringify({
+            inventoryApplied: false,
+            providerWrites: 0,
+            orderQuantityAdjustment: 0,
+          }),
+          active.captured
+            ? 'SHOPIFY_INVENTORY_CAPTURE_FENCE_CHANGED'
+            : 'SHOPIFY_INVENTORY_READ_LEASE_EXPIRED',
+          active.lease_token,
+        ],
+      )
+      if (!expired.rowCount) {
+        persistenceError(
+          'SHOPIFY_INVENTORY_SYNC_IN_PROGRESS',
+          'Another Shopify inventory sync is already in progress',
+        )
+      }
     }
     const attemptNumber = (latest?.attempt_number || 0) + 1
     const inserted = await client.query<{
@@ -503,6 +693,8 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
     return {
       id: inserted.rows[0].id,
       globalId: inserted.rows[0].global_id,
+      idempotencyKey: input.idempotencyKey,
+      runGlobalId: null,
       attemptNumber,
       replayed: false,
       captured: false,
@@ -570,7 +762,7 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
   attempt: ShopifyInventoryAttempt
   requestHash: string
   snapshot: ShopifyInventorySnapshot
-  actorEmail: string
+  actorEmail: string | null
 }): Promise<ShopifyInventoryCapture> {
   if (!input.attempt.leaseToken) {
     persistenceError(
@@ -646,7 +838,7 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
          AND request_hash = $5
          AND state = 'prepared'
          AND lease_token = $6::uuid
-         AND lease_expires_at > now()
+         AND lease_expires_at > clock_timestamp()
        LIMIT 1
        FOR UPDATE`,
       [
@@ -712,7 +904,7 @@ export async function finalizeShopifyInventoryReadFailureInPostgres(input: {
   attempt: ShopifyInventoryAttempt
   state: 'failed' | 'unknown'
   errorCode: string
-  actorEmail: string
+  actorEmail: string | null
 }) {
   const finalized = await withTransaction(async (client) => {
     const finalized = await client.query(
@@ -727,10 +919,8 @@ export async function finalizeShopifyInventoryReadFailureInPostgres(input: {
          AND integration_account_id = $2::uuid
          AND id = $3::uuid
          AND state = 'prepared'
-         AND (
-           $7::uuid IS NULL
-           OR lease_token = $7::uuid
-         )
+         AND lease_token = $7::uuid
+         AND lease_expires_at > clock_timestamp()
        RETURNING id`,
       [
         input.runtime.organizationId,
@@ -750,11 +940,12 @@ export async function finalizeShopifyInventoryReadFailureInPostgres(input: {
   })
   if (!finalized) return false
   await recordAuditEvent({
-    actor: input.actorEmail,
+    actor: input.actorEmail || 'system',
     eventType: 'commerce.inventory.sync_failed',
     aggregateType: 'operations.integration_account',
     aggregateId: input.runtime.globalId,
     organizationId: input.runtime.organizationId,
+    isSystem: !input.actorEmail,
     eventKey:
       `commerce-inventory:${input.attempt.globalId}:${input.state}`,
     payload: {
@@ -765,6 +956,34 @@ export async function finalizeShopifyInventoryReadFailureInPostgres(input: {
     },
   })
   return true
+}
+
+export async function renewShopifyInventoryReadLeaseInPostgres(input: {
+  runtime: CommerceRuntimeCredentialRecord
+  attempt: ShopifyInventoryAttempt
+}) {
+  if (!input.attempt.leaseToken) return false
+  const renewed = await query(
+    `UPDATE operations_commerce_provider_attempts
+     SET lease_expires_at =
+           clock_timestamp() + interval '15 minutes'
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND id = $3::uuid
+       AND action = $4
+       AND state = 'prepared'
+       AND lease_token = $5::uuid
+       AND lease_expires_at > clock_timestamp()
+     RETURNING id`,
+    [
+      input.runtime.organizationId,
+      input.runtime.integrationAccountId,
+      input.attempt.id,
+      SYNC_ACTION,
+      input.attempt.leaseToken,
+    ],
+  )
+  return renewed.rowCount === 1
 }
 
 function safeSum(
@@ -842,7 +1061,8 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
   mappingMethod: 'automatic_single_location' | 'automatic_exact_address'
   idempotencyKey: string
   requestHash: string
-  actorEmail: string
+  actorEmail: string | null
+  expectedRefreshFence?: ShopifyInventoryRefreshExpectedFence | null
 }) {
   const snapshot = input.capture.snapshot
   const committed = await withTransaction(async (client) => {
@@ -859,17 +1079,110 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
          'clawpilot.shopify_inventory_sync', 'on', true
        )`,
     )
+    if (input.expectedRefreshFence) {
+      const expected = input.expectedRefreshFence
+      const refreshFence = await client.query(
+        `SELECT job.id
+         FROM operations_shopify_inventory_refresh_jobs job
+         JOIN operations_shopify_carrier_service_configs config
+           ON config.organization_id = job.organization_id
+          AND config.id = job.carrier_service_config_id
+          AND config.integration_account_id =
+              job.integration_account_id
+          AND config.warehouse_id = job.warehouse_id
+          AND config.credential_generation = job.credential_generation
+          AND config.activation_revision = job.activation_revision
+          AND config.row_version = job.config_row_version
+          AND config.policy_revision = job.policy_revision
+          AND config.policy_hash = job.policy_hash
+          AND config.inventory_max_age_seconds =
+              job.inventory_max_age_seconds
+         JOIN operations_integration_accounts account
+           ON account.organization_id = job.organization_id
+          AND account.id = job.integration_account_id
+          AND account.integration_type = 'commerce'
+          AND account.provider = 'shopify'
+          AND account.status = 'active'
+          AND account.commerce_credential_generation =
+              job.credential_generation
+         JOIN operations_commerce_credentials credential
+           ON credential.organization_id = job.organization_id
+          AND credential.integration_account_id =
+              job.integration_account_id
+          AND credential.credential_version = job.credential_generation
+          AND credential.verification_status = 'verified'
+         JOIN operations_activation_scopes activation
+           ON activation.organization_id = job.organization_id
+          AND activation.revision = job.activation_revision
+         WHERE job.organization_id = $1::uuid
+           AND job.integration_account_id = $2::uuid
+           AND job.id = $3::uuid
+           AND job.carrier_service_config_id = $4::uuid
+           AND job.warehouse_id = $5::uuid
+           AND job.credential_generation = $6::integer
+           AND job.activation_revision = $7::integer
+           AND job.config_row_version = $8::bigint
+           AND job.policy_revision = $9::bigint
+           AND job.policy_hash = $10
+           AND job.inventory_max_age_seconds = $11::integer
+           AND job.status = 'processing'
+           AND job.cancel_requested = false
+           AND job.lock_token = $12::uuid
+           AND job.requested_dirty_version = $13::bigint
+           AND job.lease_expires_at > clock_timestamp()
+           AND (
+             (config.registration_state = 'registered'
+               AND activation.state IN ('shadow', 'active'))
+             OR
+             (config.registration_state = 'shadow_simulated'
+               AND activation.state = 'shadow')
+           )
+           AND operations_shopify_carrier_service_config_is_ready(
+             config.organization_id,
+             config.id
+           )
+         LIMIT 1
+         FOR UPDATE OF job, config, account, credential, activation`,
+        [
+          input.runtime.organizationId,
+          input.runtime.integrationAccountId,
+          expected.jobId,
+          expected.carrierServiceConfigId,
+          expected.warehouseId,
+          expected.credentialGeneration,
+          expected.activationRevision,
+          expected.configRowVersion,
+          expected.policyRevision,
+          expected.policyHash,
+          expected.inventoryMaxAgeSeconds,
+          expected.lockToken,
+          expected.requestedDirtyVersion,
+        ],
+      )
+      if (!refreshFence.rowCount) {
+        persistenceError(
+          'SHOPIFY_INVENTORY_REFRESH_FENCE_CHANGED',
+          'The automatic Shopify inventory refresh authority changed before projection',
+          409,
+        )
+      }
+    }
     const replay = await client.query<{ global_id: string }>(
       `SELECT global_id
        FROM operations_commerce_inventory_sync_runs
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
          AND idempotency_key = $3
+         AND provider_attempt_id = $4::uuid
+         AND warehouse_id = $5::uuid
+         AND status = 'succeeded'
        LIMIT 1`,
       [
         input.runtime.organizationId,
         input.runtime.integrationAccountId,
         input.idempotencyKey,
+        input.attempt.id,
+        input.target.warehouse.id,
       ],
     )
     if (replay.rows[0]) {
@@ -888,13 +1201,21 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
       credential_version: number
       adapter_version: string
       lease_token: string | null
+      lease_expires_at: Date | null
+      lease_is_live: boolean
       state: string
     }>(
       `SELECT capture.request_hash, capture.snapshot_hash,
               capture.provider_location_id, capture.level_count,
               capture.warehouse_id::text, capture.location_id::text,
               capture.credential_version, capture.adapter_version,
-              attempt.lease_token::text, attempt.state
+              attempt.lease_token::text, attempt.lease_expires_at,
+              (
+                attempt.lease_token IS NOT NULL
+                AND attempt.lease_expires_at IS NOT NULL
+                AND attempt.lease_expires_at > clock_timestamp()
+              ) AS lease_is_live,
+              attempt.state
        FROM operations_commerce_inventory_captures capture
        JOIN operations_commerce_provider_attempts attempt
          ON attempt.organization_id = capture.organization_id
@@ -929,6 +1250,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
       || captured.adapter_version !== SHOPIFY_INVENTORY_ADAPTER_VERSION
       || !input.attempt.leaseToken
       || captured.lease_token !== input.attempt.leaseToken
+      || !captured.lease_is_live
     ) {
       persistenceError(
         'SHOPIFY_INVENTORY_CAPTURE_STALE',
@@ -966,7 +1288,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
       !current
       || current.credential_version !== input.runtime.credentialVersion
       || current.verification_status !== 'verified'
-      || current.account_status === 'error'
+      || current.account_status !== 'active'
       || current.data_pipeline_id !== input.target.pipelineId
     ) {
       persistenceError(
@@ -1210,6 +1532,33 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
     const projectedProductIds = projectedProducts.map(
       (level) => level.productId,
     )
+    const positionLockCandidates = await client.query<{ id: string }>(
+      `SELECT position.id::text
+       FROM operations_inventory_positions position
+       WHERE position.organization_id = $1::uuid
+         AND position.warehouse_id = $2::uuid
+         AND position.location_id = $3::uuid
+         AND position.pool_id = $4::uuid
+         AND position.lot_code = $5
+       ORDER BY position.id`,
+      [
+        input.runtime.organizationId,
+        input.target.warehouse.id,
+        input.target.location.id,
+        pool.rows[0].id,
+        INVENTORY_LOT_CODE,
+      ],
+    )
+    for (const position of positionLockCandidates.rows) {
+      await acquireTransactionAdvisoryLock(
+        client,
+        [
+          'operations:inventory-reservation',
+          input.runtime.organizationId,
+          position.id,
+        ].join(':'),
+      )
+    }
     const existing = await client.query<ExistingPositionRow>(
       `SELECT position.id::text, position.global_id,
               position.product_id::text,
@@ -1280,6 +1629,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
         AND position.id = reservation.position_id
        WHERE reservation.organization_id = $1::uuid
          AND reservation.status = 'active'
+         AND reservation.reservation_authority = 'local_balance'
          AND position.warehouse_id = $2::uuid
          AND position.location_id = $3::uuid
          AND position.pool_id = $4::uuid
@@ -1297,6 +1647,50 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
       persistenceError(
         'SHOPIFY_INVENTORY_LOCAL_RESERVATION_CONFLICT',
         'Shopify inventory cannot be reconciled while a ClawPilot reservation is active against the provider-owned balance',
+      )
+    }
+    const activeProviderCommitments = await client.query<{
+      position_id: string
+      product_id: string
+      active_claimed_quantity: string
+    }>(
+      `SELECT reservation.position_id::text,
+              position.product_id::text,
+              sum(reservation.quantity)::text AS active_claimed_quantity
+       FROM operations_reservations reservation
+       JOIN operations_inventory_positions position
+         ON position.organization_id = reservation.organization_id
+        AND position.id = reservation.position_id
+       WHERE reservation.organization_id = $1::uuid
+         AND reservation.status = 'active'
+         AND reservation.reservation_authority = 'provider_commitment'
+         AND position.warehouse_id = $2::uuid
+         AND position.location_id = $3::uuid
+         AND position.pool_id = $4::uuid
+         AND position.lot_code = $5
+       GROUP BY reservation.position_id, position.product_id
+       ORDER BY reservation.position_id`,
+      [
+        input.runtime.organizationId,
+        input.target.warehouse.id,
+        input.target.location.id,
+        pool.rows[0].id,
+        INVENTORY_LOT_CODE,
+      ],
+    )
+    const unsupportedProviderCommitment =
+      activeProviderCommitments.rows.find((claim) => (
+        decimal(claim.active_claimed_quantity)
+          > (
+            projectedByProduct.get(claim.product_id)
+              ?.operationalCommitted || 0
+          )
+      ))
+    if (unsupportedProviderCommitment) {
+      persistenceError(
+        'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT',
+        'The latest Shopify committed quantity does not cover active fulfillment commitments. Reconcile the affected order plans before retrying inventory sync.',
+        409,
       )
     }
     const existingByProduct = new Map(
@@ -1376,6 +1770,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
          AND id = $3::uuid
          AND state = 'prepared'
          AND lease_token = $6::uuid
+         AND lease_expires_at > clock_timestamp()
        RETURNING id`,
       [
         input.runtime.organizationId,
@@ -1744,11 +2139,12 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
     }
   })
   await recordAuditEvent({
-    actor: input.actorEmail,
+    actor: input.actorEmail || 'system',
     eventType: 'commerce.inventory.synced',
     aggregateType: 'operations.commerce_inventory_sync',
     aggregateId: committed.runGlobalId,
     organizationId: input.runtime.organizationId,
+    isSystem: !input.actorEmail,
     eventKey: `commerce-inventory:${committed.runGlobalId}:synced`,
     payload: {
       integrationAccountGlobalId: input.runtime.globalId,

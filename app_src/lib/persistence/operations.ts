@@ -3,6 +3,24 @@ import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { normalizedCrmIdentityText } from '@/lib/crm/stableId'
 import {
+  executeShopifyFulfillmentWriteback,
+  prepareShopifyFulfillmentWriteback,
+  reconcileShopifyFulfillmentWriteback,
+} from '@/lib/integrations/shopifyFulfillmentWriteback'
+import {
+  executeCurrentFaireFulfillmentWriteback,
+  prepareCurrentFaireFulfillmentAuthority,
+} from '@/lib/integrations/faireFulfillmentRuntime'
+import {
+  commerceFulfillmentRecoveryMode,
+  faireFulfillmentErrorAllowsAutomaticReconciliation,
+} from '@/lib/commerceFulfillmentRecoveryPolicy'
+import {
+  consumeSandboxCommerceE2eAuthorization,
+  readActiveSandboxCommerceE2eAuthorizationForOrderInPostgres,
+  requireActiveSandboxCommerceE2eAuthorization,
+} from '@/lib/persistence/sandboxCommerceE2eAuthorization'
+import {
   MockCarrierAdapter,
   MockCommerceAdapter,
   MockPrintAdapter,
@@ -18,11 +36,27 @@ import {
   selectPromiseRate,
 } from '@/lib/operations/domain'
 import {
-  PACKAGE_PACKING_LIST_TEMPLATE_VERSION,
+  PACKAGE_PACK_WORK_INSTRUCTION_TEMPLATE_VERSION,
   PACKING_SLIP_TEMPLATE_VERSION,
-  renderPackagePackingList,
+  renderPackagePackWorkInstruction,
   renderPackingSlip,
 } from '@/lib/operations/packingSlip'
+import {
+  authorizedCheckoutShippingChargeMinor,
+  CANONICAL_FULFILLMENT_RATE_POLICY_VERSION,
+  CanonicalFulfillmentPlanningError,
+  selectCanonicalFulfillmentRate,
+  type CanonicalWholeShipmentRateOffer,
+} from '@/lib/operations/canonicalFulfillmentPlanning'
+import {
+  rateCheckoutShipment,
+  type CheckoutRateCarrierProvider,
+  type CheckoutShipmentRateResult,
+} from '@/lib/integrations/carrierCheckoutRate'
+import {
+  carrierSandboxRateDestinationFingerprint,
+  testCarrierSandboxShipmentRate,
+} from '@/lib/integrations/carrierIntegrations'
 import type { OperationsCapabilities } from '@/lib/operations/authorization'
 import type {
   Address,
@@ -34,6 +68,8 @@ import type {
   MockOperationsProofResult,
   OperationsActivationState,
   OperationsActivationUpdateResult,
+  OperationsCommerceFulfillmentRetryResult,
+  OperationsCustomerNotificationDecision,
   OperationsExceptionListItem,
   OperationsExceptionStatus,
   OperationsExceptionUpdateResult,
@@ -43,6 +79,7 @@ import type {
   OperationsInboundReceiptInput,
   OperationsOrderDetail,
   OperationsOrderCommandResult,
+  OperationsPlanCommandResult,
   OperationsOrderListItem,
   OperationsPackingSlipCommandResult,
   OperationsOrderStatus,
@@ -50,17 +87,31 @@ import type {
   OperationsReplenishmentExecutionInput,
   OperationsReplenishmentExecutionResult,
   OperationsShipmentCommandResult,
+  OperationsShadowFulfillmentExecutionResult,
   OperationsWorkspace,
   PricingDirective,
 } from '@/lib/operations/types'
 import { stageCrmRecordWithClient } from '@/lib/persistence/crm'
+import {
+  readCartonizationRateEvidenceByGlobalId,
+  type CartonizationRateEvidence,
+} from '@/lib/persistence/cartonizationRateEvidence'
 import { enqueueOperationsPrintJobInPostgres } from '@/lib/persistence/operationPrintDelivery'
+import { readShadowFulfillmentPreparation } from '@/lib/persistence/operationShadowFulfillmentPreparation'
 import { readDefaultProductPackagingWithClient } from '@/lib/persistence/productPackaging'
 import {
   acquireTransactionAdvisoryLock,
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  lockShopifyCarrierServiceConfigWritersForActivationWithClient,
+  rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient,
+  ShopifyCheckoutRatingPersistenceError,
+  shopifyCheckoutRateLineageIsRequired,
+  shopifyCheckoutRateOutcomeAllowsFulfillment,
+  type ShopifyCheckoutRateReconciliationOutcome,
+} from '@/lib/persistence/shopifyCheckoutRating'
 
 type PipelineRow = QueryResultRow & { id: string; name: string; owner_email: string }
 type CustomerRow = QueryResultRow & { id: string; reference_code: string; name: string }
@@ -388,6 +439,75 @@ function json(value: unknown): Record<string, unknown> {
     : {}
 }
 
+function customerNotificationDecision(
+  value: unknown,
+): OperationsCustomerNotificationDecision {
+  const source = json(value)
+  if (
+    source.mode === 'provider_managed'
+    && source.source === 'provider_managed'
+  ) {
+    return {
+      mode: 'provider_managed',
+      notifyCustomer: null,
+      source: 'provider_managed',
+      accountPolicyRevision: null,
+      overrideReason: null,
+      decidedBy: typeof source.decidedBy === 'string'
+        ? source.decidedBy
+        : null,
+    }
+  }
+  const explicitSources = [
+    'account_default',
+    'order_override',
+    'sandbox_e2e_suppression',
+    'legacy_safe_default',
+  ] as const
+  const sourceName = String(source.source || '')
+  const explicitDecision = (
+    source.mode === 'clawpilot_explicit'
+    && explicitSources.includes(
+      sourceName as typeof explicitSources[number],
+    )
+    && typeof source.notifyCustomer === 'boolean'
+    && !(
+      sourceName === 'sandbox_e2e_suppression'
+      && source.notifyCustomer === true
+    )
+    && !(
+      sourceName === 'legacy_safe_default'
+      && source.notifyCustomer === true
+    )
+  )
+  if (!explicitDecision) {
+    return {
+      mode: 'clawpilot_explicit',
+      notifyCustomer: false,
+      source: 'legacy_safe_default',
+      accountPolicyRevision: null,
+      overrideReason: null,
+      decidedBy: null,
+    }
+  }
+  return {
+    mode: 'clawpilot_explicit',
+    notifyCustomer: source.notifyCustomer as boolean,
+    source: sourceName as OperationsCustomerNotificationDecision['source'],
+    accountPolicyRevision: source.accountPolicyRevision !== null
+      && source.accountPolicyRevision !== undefined
+      && Number.isSafeInteger(Number(source.accountPolicyRevision))
+      ? Number(source.accountPolicyRevision)
+      : null,
+    overrideReason: typeof source.overrideReason === 'string'
+      ? source.overrideReason
+      : null,
+    decidedBy: typeof source.decidedBy === 'string'
+      ? source.decidedBy
+      : null,
+  }
+}
+
 function address(value: unknown): Address {
   const source = json(value)
   return {
@@ -427,6 +547,108 @@ function moneyMinorFromDecimal(value: unknown): number {
   const minor = Math.round(parsed * 100)
   if (!Number.isSafeInteger(minor)) throw new OperationsRequestError('OPERATIONS_PRICE_INVALID', 'Product price is outside the supported range')
   return minor
+}
+
+function carrierDecimalAmountMinor(value: unknown): number {
+  const amount = String(value ?? '').trim()
+  const match = /^([0-9]+)(?:\.([0-9]{1,2}))?$/.exec(amount)
+  if (!match) {
+    throw new OperationsRequestError(
+      'OPERATIONS_CARRIER_RATE_MONEY_INVALID',
+      'Carrier rate evidence does not use exact decimal currency',
+      409,
+    )
+  }
+  const minor = (
+    BigInt(match[1]) * BigInt(100)
+    + BigInt((match[2] || '').padEnd(2, '0') || '0')
+  )
+  if (minor > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_CARRIER_RATE_MONEY_INVALID',
+      'Carrier rate evidence is outside the supported range',
+      409,
+    )
+  }
+  return Number(minor)
+}
+
+function estimatedDeliveryAt(
+  evidenceCompletedAt: string,
+  deliveryDate: string | null,
+  transitDays: number | null,
+): { deliveryAt: string; transitDays: number } | null {
+  if (deliveryDate) {
+    const delivery = /^\d{4}-\d{2}-\d{2}$/.test(deliveryDate)
+      ? new Date(`${deliveryDate}T23:59:59.000Z`)
+      : new Date(deliveryDate)
+    if (!Number.isNaN(delivery.getTime())) {
+      const completed = new Date(evidenceCompletedAt)
+      const derivedTransit = Number.isNaN(completed.getTime())
+        ? 0
+        : Math.max(
+            0,
+            Math.ceil(
+              (delivery.getTime() - completed.getTime())
+              / 86_400_000,
+            ),
+          )
+      return {
+        deliveryAt: delivery.toISOString(),
+        transitDays: Number.isSafeInteger(transitDays)
+          && Number(transitDays) >= 0
+          ? Number(transitDays)
+          : derivedTransit,
+      }
+    }
+  }
+  if (!Number.isSafeInteger(transitDays) || Number(transitDays) < 0) {
+    return null
+  }
+  const completed = new Date(evidenceCompletedAt)
+  if (Number.isNaN(completed.getTime())) return null
+  completed.setUTCDate(completed.getUTCDate() + Number(transitDays))
+  return {
+    deliveryAt: completed.toISOString(),
+    transitDays: Number(transitDays),
+  }
+}
+
+function canonicalRateOffers(
+  evidence: CartonizationRateEvidence,
+): CanonicalWholeShipmentRateOffer[] {
+  const packageKeys = evidence.packages.map((item) => item.packageKey)
+  return evidence.shipmentRates.flatMap((shipmentRate) => (
+    shipmentRate.status !== 'succeeded'
+    || shipmentRate.packageCount !== packageKeys.length
+    || shipmentRate.packageKeys.some(
+      (packageKey, index) => packageKey !== packageKeys[index],
+    )
+      ? []
+      : shipmentRate.rates.flatMap((rate) => {
+          const delivery = estimatedDeliveryAt(
+            shipmentRate.completedAt,
+            rate.deliveryDate,
+            rate.transitDays,
+          )
+          if (!delivery) return []
+          return [{
+            evidenceState: 'sealed' as const,
+            rateScope: 'multi_package_shipment' as const,
+            rateEvidenceGlobalId: shipmentRate.rateEvidenceGlobalId,
+            packagePlanHash: evidence.planResultHash,
+            packageCount: packageKeys.length,
+            packageKeys,
+            provider: shipmentRate.provider,
+            serviceCode: rate.serviceCode,
+            serviceName: rate.serviceName,
+            carrierCostMinor: carrierDecimalAmountMinor(rate.amount),
+            currency: rate.currency,
+            transitDays: delivery.transitDays,
+            estimatedDeliveryAt: delivery.deliveryAt,
+          }]
+        })
+  ))
 }
 
 function uniqueReferenceRows<T extends { reference_code: string }>(rows: T[]): T[] {
@@ -676,18 +898,16 @@ async function bindCommerceCustomerExternalId(
     evidence: Record<string, unknown>
   },
 ) {
-  await client.query(
+  const result = await client.query<{ entity_global_id: string }>(
     `INSERT INTO operations_external_identifiers (
        organization_id, integration_account_id, entity_type, entity_global_id,
        external_id, status, match_method, match_evidence, last_verified_at
      ) VALUES ($1::uuid, $2::uuid, 'crm.organization', $3, $4,
        'active', $5, $6::jsonb, now())
      ON CONFLICT (organization_id, integration_account_id, entity_type, external_id)
-     DO UPDATE SET entity_global_id = EXCLUDED.entity_global_id,
-                   status = 'active',
-                   match_method = EXCLUDED.match_method,
-                   match_evidence = EXCLUDED.match_evidence,
-                   last_verified_at = now()`,
+     DO UPDATE SET status = 'active',
+                   last_verified_at = now()
+     RETURNING entity_global_id`,
     [
       input.organizationId,
       input.integrationAccountId,
@@ -697,6 +917,13 @@ async function bindCommerceCustomerExternalId(
       JSON.stringify(input.evidence),
     ],
   )
+  if (result.rows[0]?.entity_global_id !== input.customer.globalId) {
+    throw new OperationsRequestError(
+      'OPERATIONS_CUSTOMER_IDENTITY_CONFLICT',
+      'This provider customer is already bound to a different CRM customer',
+      409,
+    )
+  }
 }
 
 export async function resolveCommerceCustomerInPostgres(input: {
@@ -709,7 +936,7 @@ export async function resolveCommerceCustomerInPostgres(input: {
   const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
   const integrationAccountGlobalId = trimmed(input.integrationAccountGlobalId, 20)
   const provider = trimmed(input.identity.provider, 100).toLowerCase()
-  const externalCustomerId = trimmed(input.identity.externalCustomerId, 300)
+  const externalCustomerId = trimmed(input.identity.externalCustomerId, 512)
   const companyName = trimmed(input.identity.companyName, 200)
   if (!actorEmail || !integrationAccountGlobalId || !provider || !externalCustomerId || !companyName) {
     throw new OperationsRequestError('OPERATIONS_CUSTOMER_IDENTITY_INVALID', 'Commerce customer identity is incomplete')
@@ -1382,11 +1609,22 @@ async function consumeReservedInventory(
      WHERE organization_id = $1::uuid AND id = $2::uuid`,
     [input.organizationId, input.position.id, onHand, reserved],
   )
-  await client.query(
+  const consumedReservation = await client.query(
     `UPDATE operations_reservations SET status = 'consumed', released_at = now()
-     WHERE organization_id = $1::uuid AND id = $2::uuid AND status = 'active'`,
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid
+       AND status = 'active'
+       AND reservation_authority = 'local_balance'
+     RETURNING id`,
     [input.organizationId, input.reservation.id],
   )
+  if (consumedReservation.rowCount !== 1) {
+    throw new OperationsRequestError(
+      'OPERATIONS_RESERVATION_CHANGED',
+      'The local inventory reservation changed before shipment confirmation. Refresh and replan the order.',
+      409,
+    )
+  }
   await client.query(
     `INSERT INTO operations_inventory_ledger (
        organization_id, position_id, event_type, on_hand_delta, reserved_delta,
@@ -1407,10 +1645,340 @@ async function consumeReservedInventory(
   )
 }
 
+async function consumeProviderCommitment(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    reservation: IdRow
+  },
+) {
+  const consumed = await client.query(
+    `UPDATE operations_reservations
+     SET status = 'consumed', released_at = now()
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid
+       AND status = 'active'
+       AND reservation_authority = 'provider_commitment'
+     RETURNING id`,
+    [input.organizationId, input.reservation.id],
+  )
+  if (consumed.rowCount !== 1) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PROVIDER_COMMITMENT_CHANGED',
+      'The Shopify inventory commitment changed before shipment confirmation. Refresh the order before retrying.',
+      409,
+    )
+  }
+}
+
+async function consumePackagingMaterialClaimsForPlan(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    planId: string
+    cartonizationEvidenceId: string | null
+    actorEmail: string
+  },
+) {
+  const claimResult = await client.query<QueryResultRow & {
+    id: string
+    global_id: string
+    packaging_material_stock_id: string
+    quantity: string
+    status: 'active' | 'consumed' | 'released'
+    stock_on_hand_quantity: string | null
+    stock_is_available: boolean
+  }>(
+    `SELECT claim.id::text, claim.global_id,
+            claim.packaging_material_stock_id::text,
+            claim.quantity::text, claim.status,
+            stock.on_hand_quantity::text AS stock_on_hand_quantity,
+            stock.is_available AS stock_is_available
+     FROM operations_packaging_material_claims claim
+     JOIN operations_packaging_material_stock stock
+       ON stock.organization_id = claim.organization_id
+      AND stock.id = claim.packaging_material_stock_id
+     WHERE claim.organization_id = $1::uuid
+       AND claim.plan_id = $2::uuid
+     ORDER BY claim.packaging_material_stock_id, claim.id
+     FOR UPDATE OF claim, stock`,
+    [input.organizationId, input.planId],
+  )
+  const claims = claimResult.rows
+  if (input.cartonizationEvidenceId && claims.length < 1) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PACKAGING_MATERIAL_CLAIMS_REQUIRED',
+      'The sealed cartonization plan has no active packaging-material claims. Replan the order before confirming shipment.',
+      409,
+    )
+  }
+  if (claims.some((claim) => claim.status !== 'active')) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PACKAGING_MATERIAL_CLAIMS_CHANGED',
+      'Packaging-material claims changed before shipment confirmation. Refresh and replan the order.',
+      409,
+    )
+  }
+
+  const quantityByStock = new Map<string, number>()
+  for (const claim of claims) {
+    const quantity = Number(claim.quantity)
+    const onHandQuantity = claim.stock_on_hand_quantity === null
+      ? null
+      : Number(claim.stock_on_hand_quantity)
+    if (
+      !claim.stock_is_available
+      || onHandQuantity === null
+      || onHandQuantity < quantity
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PACKAGING_MATERIAL_STOCK_CHANGED',
+        'Physical packaging stock no longer covers the accepted plan. Replenish stock or replan the order.',
+        409,
+      )
+    }
+    quantityByStock.set(
+      claim.packaging_material_stock_id,
+      (quantityByStock.get(claim.packaging_material_stock_id) || 0)
+        + quantity,
+    )
+  }
+  for (const claim of claims) {
+    const available = claim.stock_on_hand_quantity === null
+      ? 0
+      : Number(claim.stock_on_hand_quantity)
+    const claimed = quantityByStock.get(
+      claim.packaging_material_stock_id,
+    ) || 0
+    if (available < claimed) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PACKAGING_MATERIAL_STOCK_CHANGED',
+        'Physical packaging stock no longer covers the accepted plan. Replenish stock or replan the order.',
+        409,
+      )
+    }
+  }
+
+  const consumedClaims = await client.query(
+    `UPDATE operations_packaging_material_claims
+     SET status = 'consumed', consumed_at = now(),
+         updated_by = $3, updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND plan_id = $2::uuid
+       AND status = 'active'
+     RETURNING id`,
+    [input.organizationId, input.planId, input.actorEmail],
+  )
+  if (Number(consumedClaims.rowCount || 0) !== claims.length) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PACKAGING_MATERIAL_CLAIMS_CHANGED',
+      'Packaging-material claims changed before shipment confirmation. Refresh and replan the order.',
+      409,
+    )
+  }
+
+  for (const [stockId, quantity] of quantityByStock) {
+    const consumedStock = await client.query(
+      `UPDATE operations_packaging_material_stock
+       SET on_hand_quantity = on_hand_quantity - $3,
+           row_version = row_version + 1,
+           updated_by = $4, updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND is_available = true
+         AND on_hand_quantity IS NOT NULL
+         AND on_hand_quantity >= $3
+       RETURNING id`,
+      [input.organizationId, stockId, quantity, input.actorEmail],
+    )
+    if (consumedStock.rowCount !== 1) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PACKAGING_MATERIAL_STOCK_CHANGED',
+        'Physical packaging stock changed before shipment confirmation. Refresh and replan the order.',
+        409,
+      )
+    }
+  }
+
+  return {
+    claimCount: claims.length,
+    quantity: claims.reduce(
+      (total, claim) => total + Number(claim.quantity),
+      0,
+    ),
+  }
+}
+
+function providerCommitmentValidationFailed(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || '')
+  return [
+    'Provider commitment',
+    'Shopify-authoritative balances changed',
+    'Active provider commitment claims exceed',
+  ].some((fragment) => message.includes(fragment))
+}
+
+async function revalidateProviderCommitmentsForPlan(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    planId: string
+  },
+): Promise<{
+  count: number
+  latestInventorySyncRunGlobalIds: string[]
+}> {
+  const positionResult = await client.query<QueryResultRow & {
+    position_id: string
+  }>(
+    `SELECT DISTINCT allocation.position_id::text AS position_id
+     FROM operations_fulfillment_allocations allocation
+     WHERE allocation.organization_id = $1::uuid
+       AND allocation.plan_id = $2::uuid
+     ORDER BY allocation.position_id::text`,
+    [input.organizationId, input.planId],
+  )
+  for (const position of positionResult.rows) {
+    await acquireTransactionAdvisoryLock(
+      client,
+      [
+        'operations:inventory-reservation',
+        input.organizationId,
+        position.position_id,
+      ].join(':'),
+    )
+  }
+
+  const authorityResult = await client.query<QueryResultRow & {
+    source_authority: 'clawpilot' | 'shopify'
+    reservation_authority: 'local_balance' | 'provider_commitment'
+    reservation_status: 'active' | 'released' | 'consumed'
+    reservation_id: string
+  }>(
+    `SELECT position.source_authority,
+            reservation.reservation_authority,
+            reservation.status AS reservation_status,
+            reservation.id::text AS reservation_id
+     FROM operations_fulfillment_allocations allocation
+     JOIN operations_inventory_positions position
+       ON position.organization_id = allocation.organization_id
+      AND position.id = allocation.position_id
+     JOIN operations_reservations reservation
+       ON reservation.organization_id = allocation.organization_id
+      AND reservation.id = allocation.reservation_id
+     WHERE allocation.organization_id = $1::uuid
+       AND allocation.plan_id = $2::uuid
+     ORDER BY allocation.id
+     FOR UPDATE OF position, reservation`,
+    [input.organizationId, input.planId],
+  )
+  const providerAllocations = authorityResult.rows.filter(
+    (row) => row.source_authority === 'shopify',
+  )
+  if (providerAllocations.length < 1) {
+    return {
+      count: 0,
+      latestInventorySyncRunGlobalIds: [],
+    }
+  }
+  if (providerAllocations.some((row) => (
+    row.reservation_authority !== 'provider_commitment'
+    || row.reservation_status !== 'active'
+  ))) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PROVIDER_COMMITMENT_INVALID',
+      'Shopify inventory allocations no longer have active provider commitments. Refresh inventory and replan the order.',
+      409,
+    )
+  }
+
+  const reservationIds = [
+    ...new Set(providerAllocations.map((row) => row.reservation_id)),
+  ]
+  try {
+    const revalidated = await client.query(
+      `UPDATE operations_reservations
+       SET status = status
+       WHERE organization_id = $1::uuid
+         AND id = ANY($2::uuid[])
+         AND status = 'active'
+         AND reservation_authority = 'provider_commitment'
+       RETURNING id`,
+      [input.organizationId, reservationIds],
+    )
+    if (Number(revalidated.rowCount || 0) !== reservationIds.length) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PROVIDER_COMMITMENT_CHANGED',
+        'Shopify inventory commitments changed before warehouse release. Refresh inventory and replan the order.',
+        409,
+      )
+    }
+  } catch (error) {
+    if (error instanceof OperationsRequestError) throw error
+    if (providerCommitmentValidationFailed(error)) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PROVIDER_COMMITMENT_CHANGED',
+        'Shopify inventory no longer supports this fulfillment plan. Refresh inventory and replan the order.',
+        409,
+      )
+    }
+    throw error
+  }
+
+  const supportResult = await client.query<QueryResultRow & {
+    reservation_id: string
+    supported: boolean
+    reason_code: string
+    latest_sync_run_global_id: string | null
+  }>(
+    `WITH target_reservations AS (
+       SELECT unnest($2::uuid[]) AS reservation_id
+     )
+     SELECT support.reservation_id::text,
+            support.supported,
+            support.reason_code,
+            support.latest_inventory_sync_run_global_id
+              AS latest_sync_run_global_id
+     FROM target_reservations target
+     CROSS JOIN LATERAL operations_provider_commitment_current_support(
+       $1::uuid,
+       target.reservation_id
+     ) support
+     ORDER BY support.reservation_id`,
+    [input.organizationId, reservationIds],
+  )
+  if (
+    supportResult.rows.length !== reservationIds.length
+    || supportResult.rows.some((row) => (
+      !row.supported || !row.latest_sync_run_global_id
+    ))
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PROVIDER_COMMITMENT_CHANGED',
+      'Shopify inventory no longer supports this fulfillment plan. Refresh inventory and replan the order.',
+      409,
+    )
+  }
+
+  return {
+    count: reservationIds.length,
+    latestInventorySyncRunGlobalIds: [
+      ...new Set(supportResult.rows.map(
+        (row) => row.latest_sync_run_global_id as string,
+      )),
+    ].sort(),
+  }
+}
+
 async function readOrderDetail(
   organizationId: string,
   orderGlobalId: string,
-  context: { activationState: OperationsActivationState; canExecute: boolean },
+  context: {
+    activationState: OperationsActivationState
+    canExecute: boolean
+    actorEmail: string | null
+    canAuthorizeSandboxCommerceE2e: boolean
+  },
 ): Promise<OperationsOrderDetail | null> {
   const orderResult = await query<QueryResultRow & {
     id: string
@@ -1420,6 +1988,9 @@ async function readOrderDetail(
     customer_name: string
     customer_global_id: string
     source_provider: string
+    integration_account_id: string
+    notify_customer_default: boolean | null
+    notification_policy_revision: string | number | null
     status: OperationsOrderStatus
     currency: string
     row_version: string
@@ -1455,18 +2026,33 @@ async function readOrderDetail(
     `SELECT
        orders.id::text, orders.global_id, orders.order_number, orders.external_order_id,
        customer.name AS customer_name, customer.reference_code AS customer_global_id,
-       orders.source_provider, orders.status, orders.currency, orders.ship_to,
+       orders.source_provider, orders.integration_account_id::text,
+       notification_policy.notify_customer_default,
+       notification_policy.revision::text AS notification_policy_revision,
+       orders.status, orders.currency, orders.ship_to,
        orders.row_version::text, plan.id::text AS plan_id,
        plan.warehouse_id::text AS warehouse_id,
        plan.status AS plan_status, wave.status AS wave_status,
        plan_warehouse.name AS warehouse_name, orders.promised_delivery_at,
        (SELECT count(*) FROM operations_order_lines line WHERE line.order_id = orders.id)::text AS line_count,
        (SELECT count(*) FROM operations_order_lines line
-        WHERE line.order_id = orders.id AND EXISTS (
-          SELECT 1 FROM operations_reservations reservation
-          WHERE reservation.order_line_id = line.id AND reservation.status = 'active'
-            AND reservation.quantity >= line.quantity
-        ))::text AS fully_reserved_line_count,
+        WHERE line.organization_id = orders.organization_id
+          AND line.order_id = orders.id
+          AND COALESCE((
+            SELECT sum(reservation.quantity)
+            FROM operations_fulfillment_allocations allocation
+            JOIN operations_reservations reservation
+              ON reservation.organization_id =
+                   allocation.organization_id
+             AND reservation.id = allocation.reservation_id
+            WHERE allocation.organization_id = line.organization_id
+              AND allocation.plan_id = plan.id
+              AND allocation.order_line_id = line.id
+              AND reservation.order_line_id = allocation.order_line_id
+              AND reservation.position_id = allocation.position_id
+              AND reservation.quantity = allocation.quantity
+              AND reservation.status = 'active'
+          ), 0) = line.quantity)::text AS fully_reserved_line_count,
        (SELECT count(*) FROM operations_order_lines line
         WHERE line.organization_id = orders.organization_id AND line.order_id = orders.id
           AND COALESCE((
@@ -1474,7 +2060,7 @@ async function readOrderDetail(
             FROM operations_fulfillment_allocations allocation
             WHERE allocation.organization_id = line.organization_id
               AND allocation.order_line_id = line.id AND allocation.plan_id = plan.id
-          ), 0) >= line.quantity)::text AS allocated_line_count,
+          ), 0) = line.quantity)::text AS allocated_line_count,
        (SELECT count(*) FROM operations_pick_tasks pick
         WHERE pick.organization_id = orders.organization_id AND pick.plan_id = plan.id)::text AS pick_task_count,
        (SELECT count(*) FROM operations_pick_tasks pick
@@ -1530,6 +2116,9 @@ async function readOrderDetail(
        shipment.tracking_number, orders.updated_at
      FROM operations_orders orders
      JOIN crm_organizations customer ON customer.id = orders.customer_id AND customer.pipeline_id = orders.pipeline_id
+     LEFT JOIN operations_shopify_fulfillment_notification_policies notification_policy
+       ON notification_policy.organization_id = orders.organization_id
+      AND notification_policy.integration_account_id = orders.integration_account_id
      LEFT JOIN LATERAL (
        SELECT candidate.* FROM operations_fulfillment_plans candidate
        WHERE candidate.order_id = orders.id ORDER BY candidate.version_number DESC LIMIT 1
@@ -1566,6 +2155,8 @@ async function readOrderDetail(
     artifactResult,
     commerceExportResult,
     eventResult,
+    fulfillmentPreparation,
+    sandboxCommerceE2eAuthorization,
   ] = await Promise.all([
     query<QueryResultRow & {
       global_id: string
@@ -1578,14 +2169,43 @@ async function readOrderDetail(
     }>(
       `SELECT line.global_id, product.reference_code AS product_global_id, product.name AS product_name,
               line.channel_sku, line.quantity::text,
-              CASE WHEN reservation.status = 'active' THEN reservation.quantity ELSE 0 END::text AS reserved_quantity,
+              reservation.reserved_quantity,
               pick.status AS pick_status
        FROM operations_order_lines line
        JOIN crm_products product ON product.id = line.product_id AND product.pipeline_id = line.pipeline_id
-       LEFT JOIN operations_reservations reservation ON reservation.order_line_id = line.id
-       LEFT JOIN operations_fulfillment_allocations allocation
-         ON allocation.order_line_id = line.id AND allocation.plan_id = $3::uuid
-       LEFT JOIN operations_pick_tasks pick ON pick.allocation_id = allocation.id
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(sum(candidate.quantity), 0)::text
+                  AS reserved_quantity
+         FROM operations_fulfillment_allocations allocation
+         JOIN operations_reservations candidate
+           ON candidate.organization_id = allocation.organization_id
+          AND candidate.id = allocation.reservation_id
+         WHERE allocation.organization_id = line.organization_id
+           AND allocation.order_line_id = line.id
+           AND allocation.plan_id = $3::uuid
+           AND candidate.order_line_id = allocation.order_line_id
+           AND candidate.position_id = allocation.position_id
+           AND candidate.quantity = allocation.quantity
+           AND candidate.status = 'active'
+       ) reservation ON true
+       LEFT JOIN LATERAL (
+         SELECT CASE
+           WHEN count(task.id) = 0 THEN NULL
+           WHEN bool_and(task.status = 'picked') THEN 'picked'
+           WHEN bool_and(task.status = 'ready') THEN 'ready'
+           WHEN bool_or(task.status = 'short') THEN 'short'
+           WHEN bool_or(task.status = 'in_progress') THEN 'in_progress'
+           WHEN bool_or(task.status = 'cancelled') THEN 'cancelled'
+           ELSE 'mixed'
+         END AS status
+         FROM operations_fulfillment_allocations allocation
+         LEFT JOIN operations_pick_tasks task
+           ON task.organization_id = allocation.organization_id
+          AND task.allocation_id = allocation.id
+         WHERE allocation.organization_id = line.organization_id
+           AND allocation.order_line_id = line.id
+           AND allocation.plan_id = $3::uuid
+       ) pick ON true
        WHERE line.organization_id = $1::uuid AND line.order_id = $2::uuid
        ORDER BY line.created_at, line.id`,
       [organizationId, row.id, row.plan_id],
@@ -1680,7 +2300,7 @@ async function readOrderDetail(
       service_code: string
       service_name: string
       internal_cost_minor: string
-      customer_charge_minor: string
+      customer_charge_minor: string | null
       estimated_delivery_at: Date
       meets_promise: boolean
       selected: boolean
@@ -1773,6 +2393,7 @@ async function readOrderDetail(
       format: 'ZPL' | 'PDF' | 'PNG'
       media_size: 'label_4x6' | 'label_4x8' | 'letter' | 'a4'
       filename: string | null
+      template_version: string | null
       has_payload: boolean
       created_at: Date
     }>(
@@ -1783,7 +2404,7 @@ async function readOrderDetail(
               ) AS package_global_id,
               shipment.global_id AS shipment_global_id,
               artifact.document_type, artifact.format, artifact.media_size,
-              payload.filename,
+              payload.filename, payload.template_version,
               (payload.artifact_id IS NOT NULL) AS has_payload,
               artifact.created_at
        FROM operations_print_artifacts artifact
@@ -1809,6 +2430,8 @@ async function readOrderDetail(
       shipment_global_id: string
       provider: string
       state: 'queued' | 'processing' | 'succeeded' | 'failed' | 'unsupported'
+      attempts: number
+      payload_snapshot: Record<string, unknown>
       provider_reference: string | null
       error_code: string | null
       error_message: string | null
@@ -1817,7 +2440,8 @@ async function readOrderDetail(
     }>(
       `SELECT export.global_id,
               shipment.global_id AS shipment_global_id,
-              export.provider, export.state, export.provider_reference,
+              export.provider, export.state, export.attempts,
+              export.payload_snapshot, export.provider_reference,
               export.error_code, export.error_message,
               export.requested_at, export.completed_at
        FROM operations_commerce_fulfillment_exports export
@@ -1836,7 +2460,40 @@ async function readOrderDetail(
        ORDER BY occurred_at, id`,
       [organizationId, row.id],
     ),
+    readShadowFulfillmentPreparation(organizationId, row.id),
+    context.actorEmail && context.canAuthorizeSandboxCommerceE2e
+      ? readActiveSandboxCommerceE2eAuthorizationForOrderInPostgres({
+          organizationId,
+          orderGlobalId,
+          actorEmail: context.actorEmail,
+        })
+      : Promise.resolve(null),
   ])
+
+  let shadowPreparationReady = false
+  let shadowPreparationBlockedReason: string | null = null
+  if (fulfillmentPreparation) {
+    shadowPreparationBlockedReason =
+      `Shadow preparation ${fulfillmentPreparation.executionGlobalId} is already durable.`
+  } else if (
+    context.activationState === 'shadow'
+    && row.source_provider === 'shopify'
+    && row.status === 'packed'
+    && Number(row.exception_count) === 0
+  ) {
+    try {
+      await withTransaction((client) => readShadowExecutionContext(client, {
+        organizationId,
+        orderGlobalId: row.global_id,
+        expectedRowVersion: Number(row.row_version),
+      }))
+      shadowPreparationReady = true
+    } catch (caught) {
+      shadowPreparationBlockedReason = caught instanceof Error
+        ? caught.message
+        : 'Checkout, sealed carton, and carrier evidence is incomplete.'
+    }
+  }
 
   return {
     id: row.id,
@@ -1874,12 +2531,43 @@ async function readOrderDetail(
       plannedPackageCount: Number(row.planned_package_count),
       packedPackageCount: Number(row.packed_package_count),
       blockingExceptionCount: Number(row.blocking_exception_count),
+      openExceptionCount: Number(row.exception_count),
+      sourceProvider: row.source_provider,
+      shadowPreparationReady,
+      shadowPreparationBlockedReason,
       activeLabelCount: Number(row.active_label_count),
       shippableLabelCount: Number(row.shippable_label_count),
       sandboxLabelCount: Number(row.sandbox_label_count),
       unresolvedLabelAttemptCount: Number(row.unresolved_label_attempt_count),
       existingShipmentCount: Number(row.existing_shipment_count),
+      sandboxE2eAuthorized: Boolean(sandboxCommerceE2eAuthorization),
     }),
+    sandboxCommerceE2eAuthorization: sandboxCommerceE2eAuthorization
+      ? {
+          authorizationGlobalId:
+            sandboxCommerceE2eAuthorization.authorizationGlobalId,
+          authorizedAt: sandboxCommerceE2eAuthorization.authorizedAt,
+          expiresAt: sandboxCommerceE2eAuthorization.expiresAt,
+        }
+      : null,
+    fulfillmentPreparation,
+    fulfillmentNotificationPolicy: row.source_provider === 'shopify'
+      ? {
+          mode: 'clawpilot_explicit',
+          notifyCustomerDefault: row.notify_customer_default === true,
+          revision: numberValue(row.notification_policy_revision),
+        }
+      : row.source_provider === 'faire'
+        ? {
+            mode: 'provider_managed',
+            notifyCustomerDefault: null,
+            revision: 0,
+          }
+        : {
+            mode: 'unavailable',
+            notifyCustomerDefault: null,
+            revision: 0,
+          },
     warehouseName: row.warehouse_name,
     promisedDeliveryAt: row.promised_delivery_at?.toISOString() || null,
     lineCount: Number(row.line_count),
@@ -1982,6 +2670,14 @@ async function readOrderDetail(
       packageGlobalId: item.package_global_id,
       shipmentGlobalId: item.shipment_global_id,
       documentType: item.document_type,
+      documentKind: item.document_type === 'shipping_label'
+        ? 'shipping_label' as const
+        : item.shipment_global_id
+          ? 'final_packing_slip' as const
+          : item.template_version
+              === PACKAGE_PACK_WORK_INSTRUCTION_TEMPLATE_VERSION
+            ? 'pack_work_instruction' as const
+            : 'legacy_prelabel_packing_list' as const,
       format: item.format,
       media: item.media_size,
       filename: item.filename,
@@ -1995,11 +2691,15 @@ async function readOrderDetail(
       shipmentGlobalId: item.shipment_global_id,
       provider: item.provider,
       state: item.state,
+      attempts: item.attempts,
       providerReference: item.provider_reference,
       errorCode: item.error_code,
       errorMessage: item.error_message,
       requestedAt: item.requested_at.toISOString(),
       completedAt: item.completed_at?.toISOString() || null,
+      customerNotification: customerNotificationDecision(
+        json(item.payload_snapshot).customerNotification,
+      ),
     })),
     events: eventResult.rows.map((item) => ({
       globalId: item.global_id,
@@ -2012,6 +2712,7 @@ async function readOrderDetail(
 
 export async function readOperationsWorkspaceFromPostgres(input: {
   organizationId: string
+  actorEmail?: string | null
   capabilities: OperationsCapabilities
   search?: string
   status?: string | null
@@ -2552,6 +3253,12 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     selectedOrder: selectedGlobalId ? await readOrderDetail(organizationId, selectedGlobalId, {
       activationState: activation.state,
       canExecute: input.capabilities.canExecute,
+      actorEmail: input.actorEmail || null,
+      canAuthorizeSandboxCommerceE2e: Boolean(
+        input.capabilities.canActivate
+        && input.capabilities.canManage
+        && input.capabilities.canExecute
+      ),
     }) : null,
     warehouses: warehouseResult.rows.map((row) => ({
       id: row.id,
@@ -2872,7 +3579,7 @@ function validateLocationMutation(input: OperationsLocationMutationInput) {
   const code = trimmed(input.code, 40).toUpperCase()
   const zone = trimmed(input.zone, 80).toUpperCase()
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
-  if (!/^gwh\d{7}$/.test(input.warehouseGlobalId)) {
+  if (!/^gwh(?:[0-9]{7}|[0-9a-v]{12})$/.test(input.warehouseGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_WAREHOUSE_INVALID', 'Warehouse is invalid')
   }
   if (!code || !/^[A-Z0-9][A-Z0-9_-]*$/.test(code)) {
@@ -2898,7 +3605,7 @@ function validateLocationMutation(input: OperationsLocationMutationInput) {
   }
   const uniqueProducts = new Set<string>()
   for (const rule of rules) {
-    if (!/^gp\d{7}$/.test(rule.productGlobalId) || !LOCATION_PRODUCT_RULE_TYPES.has(rule.ruleType)) {
+    if (!/^gp(?:[0-9]{7}|[0-9a-v]{12})$/.test(rule.productGlobalId) || !LOCATION_PRODUCT_RULE_TYPES.has(rule.ruleType)) {
       throw new OperationsRequestError('OPERATIONS_LOCATION_RULE_INVALID', 'A location product rule is invalid')
     }
     if (uniqueProducts.has(rule.productGlobalId)) {
@@ -2917,7 +3624,7 @@ function validateLocationMutation(input: OperationsLocationMutationInput) {
       replenishmentMode !== 'disabled'
       && (
         !sourceGlobalId
-        || !/^gwl\d{7}$/.test(sourceGlobalId)
+        || !/^gwl(?:[0-9]{7}|[0-9a-v]{12})$/.test(sourceGlobalId)
         || targetQuantity === null
         || (replenishmentMode === 'min_max' && minQuantity === null)
       )
@@ -2970,7 +3677,7 @@ async function resolveLocationParent(
   currentLocationId?: string,
 ): Promise<string | null> {
   if (!parentGlobalId) return null
-  if (!/^gwl\d{7}$/.test(parentGlobalId)) {
+  if (!/^gwl(?:[0-9]{7}|[0-9a-v]{12})$/.test(parentGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_LOCATION_PARENT_INVALID', 'Parent location is invalid')
   }
   const parentResult = await client.query<IdRow>(
@@ -3346,7 +4053,7 @@ export async function updateOperationsWarehouseInPostgres(input: {
   const cutoffTime = trimmed(input.cutoffTime, 8) || null
   const operatingProfile = validateWarehouseOperatingProfile(input)
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
-  if (!/^gwh\d{7}$/.test(input.warehouseGlobalId) || !name) {
+  if (!/^gwh(?:[0-9]{7}|[0-9a-v]{12})$/.test(input.warehouseGlobalId) || !name) {
     throw new OperationsRequestError('OPERATIONS_WAREHOUSE_INVALID', 'Warehouse is invalid')
   }
   if (!WAREHOUSE_FACILITY_TYPES.has(input.facilityType) || !['active', 'inactive'].includes(input.status)) {
@@ -3419,7 +4126,7 @@ export async function updateOperationsLocationInPostgres(
 ): Promise<{ locationGlobalId: string; rowVersion: number }> {
   const organizationId = requireOrganizationId(input.organizationId)
   const normalized = validateLocationMutation(input)
-  if (!/^gwl\d{7}$/.test(input.locationGlobalId)) {
+  if (!/^gwl(?:[0-9]{7}|[0-9a-v]{12})$/.test(input.locationGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_LOCATION_INVALID', 'Location is invalid')
   }
   return withTransaction(async (client) => {
@@ -3519,7 +4226,7 @@ export async function deleteOperationsLocationInPostgres(input: {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
-  if (!/^gwl\d{7}$/.test(input.locationGlobalId)) {
+  if (!/^gwl(?:[0-9]{7}|[0-9a-v]{12})$/.test(input.locationGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_LOCATION_INVALID', 'Location is invalid')
   }
   return withTransaction(async (client) => {
@@ -3613,6 +4320,16 @@ export async function updateOperationsActivationInPostgres(input: {
 
   return withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(client, `operations:activation:${organizationId}`)
+    if (input.state === 'shadow') {
+      await acquireTransactionAdvisoryLock(
+        client,
+        `commerce-active-transition:${organizationId}`,
+      )
+      await lockShopifyCarrierServiceConfigWritersForActivationWithClient(
+        client,
+        organizationId,
+      )
+    }
     if (input.expectedCurrentState !== undefined) {
       const observed = await client.query<{
         state: OperationsActivationState
@@ -3639,6 +4356,45 @@ export async function updateOperationsActivationInPostgres(input: {
     }
     const current = await resolveActivation(client, organizationId, true)
     if (input.state === 'active') {
+      const sandboxPlan = await client.query<{ global_id: string }>(
+        `SELECT plan.global_id
+         FROM operations_fulfillment_plans plan
+         JOIN operations_orders source_order
+           ON source_order.organization_id = plan.organization_id
+          AND source_order.id = plan.order_id
+         LEFT JOIN operations_cartonization_rate_evidence evidence
+           ON evidence.organization_id = plan.organization_id
+          AND evidence.id = plan.cartonization_evidence_id
+         WHERE plan.organization_id = $1::uuid
+           AND plan.status IN ('planned', 'released')
+           AND source_order.status NOT IN ('shipped', 'cancelled')
+           AND (
+             plan.cartonization_evidence_id IS NULL
+             OR evidence.plan_snapshot->>'carrierReadEnvironment'
+                  IS DISTINCT FROM 'production'
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM operations_sandbox_commerce_e2e_authorizations sandbox_auth
+             WHERE sandbox_auth.organization_id = plan.organization_id
+               AND sandbox_auth.order_id = plan.order_id
+               AND sandbox_auth.state = 'active'
+               AND sandbox_auth.expires_at > statement_timestamp()
+               AND source_order.status = 'packed'
+               AND source_order.source_provider = 'shopify'
+               AND sandbox_auth.external_order_id = source_order.external_order_id
+           )
+         ORDER BY plan.created_at, plan.id
+         LIMIT 1`,
+        [organizationId],
+      )
+      if (sandboxPlan.rows[0]) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ACTIVE_SANDBOX_PLANS_EXIST',
+          `Live activation is blocked while fulfillment plan ${sandboxPlan.rows[0].global_id} is missing production carrier-rate evidence`,
+          409,
+        )
+      }
       const providers = await client.query<QueryResultRow & { integration_type: string }>(
         `SELECT DISTINCT integration_type
          FROM operations_integration_accounts
@@ -3677,6 +4433,31 @@ export async function updateOperationsActivationInPostgres(input: {
       [organizationId, input.state, reason, actorEmail],
     )
     const updated = await resolveActivation(client, organizationId)
+    let shadowCarrierServiceRebindings: Awaited<ReturnType<
+      typeof rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient
+    >> = []
+    if (input.state === 'shadow') {
+      try {
+        shadowCarrierServiceRebindings =
+          await rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient(
+            client,
+            {
+              organizationId,
+              targetActivationRevision: updated.revision,
+              actorEmail,
+            },
+          )
+      } catch (error) {
+        if (error instanceof ShopifyCheckoutRatingPersistenceError) {
+          throw new OperationsRequestError(
+            error.code,
+            error.message,
+            error.status,
+          )
+        }
+        throw error
+      }
+    }
     await recordAuditEvent({
       actor: actorEmail,
       eventType: 'operations.activation.updated',
@@ -3691,6 +4472,21 @@ export async function updateOperationsActivationInPostgres(input: {
         revision: updated.revision,
         reason: updated.reason,
         dataPipelineId: updated.data_pipeline_id,
+        carrierServiceRebindings: shadowCarrierServiceRebindings.map(
+          (rebound) => ({
+            configGlobalId: rebound.configGlobalId,
+            accountGlobalId: rebound.accountGlobalId,
+            serviceGid: rebound.serviceGid,
+            fromActivationRevision: rebound.fromActivationRevision,
+            activationRevision: rebound.activationRevision,
+            fromRowVersion: rebound.fromRowVersion,
+            rowVersion: rebound.rowVersion,
+            callbackTokenVersionRetained:
+              rebound.callbackTokenVersion,
+            providerWrites: 0,
+            callbackTokenRotations: 0,
+          }),
+        ),
       },
     }, client)
     return activationPayload(updated)
@@ -3925,6 +4721,2032 @@ async function failCommandReceipt(receiptId: string, error: unknown) {
     )
   } catch {
     // Preserve the command failure even if receipt persistence is unavailable.
+  }
+}
+
+type ShadowExecutionCarrier = {
+  provider: CheckoutRateCarrierProvider
+  carrierAccountId: string
+  carrierAccountGlobalId: string
+}
+
+type ShadowExecutionLine = {
+  id: string
+  globalId: string
+  productGlobalId: string
+  providerVariantId: string
+  title: string
+  quantity: number
+  unitWeightGrams: number
+}
+
+type ShadowExecutionAllocation = {
+  orderLineId: string
+  lineGlobalId: string
+  productGlobalId: string
+  providerVariantId: string
+  title: string
+  quantity: number
+}
+
+type ShadowExecutionPackage = {
+  id: string
+  globalId: string
+  packageKey: string
+  packageSequence: number
+  materialCode: string
+  materialName: string
+  lengthMm: number
+  widthMm: number
+  heightMm: number
+  contentWeightGrams: number
+  tareWeightGrams: number
+  grossWeightGrams: number
+  allocations: ShadowExecutionAllocation[]
+}
+
+type ShadowExecutionContext = {
+  activationRevision: number
+  orderId: string
+  orderGlobalId: string
+  orderRowVersion: number
+  pipelineId: string
+  customerId: string
+  integrationAccountId: string
+  externalOrderId: string
+  currency: string
+  requestedDeliveryAt: string | null
+  shipTo: Record<string, unknown>
+  planId: string
+  planGlobalId: string
+  warehouseId: string
+  reconciliationId: string
+  reconciliationGlobalId: string
+  receiptId: string
+  receiptGlobalId: string
+  receiptConfigId: string
+  receiptCreatedAt: string
+  receiptExpiresAt: string
+  receiptRequestEvidenceHash: string
+  receiptResultHash: string
+  receiptPackagePlanHash: string
+  receiptPolicyHash: string
+  receiptAlgorithmVersion: string
+  receiptCarrierDestinationFingerprint: string
+  fulfillmentCarrierDestinationFingerprint: string
+  checkoutProvider: CheckoutRateCarrierProvider
+  checkoutServiceCode: string
+  checkoutServiceName: string
+  checkoutCarrierCostMinor: number
+  checkoutShippingChargeMinor: number
+  checkoutCurrency: string
+  checkoutPackageCount: number
+  lines: ShadowExecutionLine[]
+  packages: ShadowExecutionPackage[]
+  carriers: ShadowExecutionCarrier[]
+  packagePlanHash: string
+  driftHash: string
+}
+
+function exactWholeQuantity(value: unknown, label: string): number {
+  const parsed = Number(value)
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new OperationsRequestError(
+      'OPERATIONS_FULFILLMENT_EXECUTION_INVALID',
+      `${label} must be an exact positive whole-unit quantity`,
+      409,
+    )
+  }
+  return parsed
+}
+
+function exactMinor(value: unknown, label: string): number {
+  const parsed = Number(value)
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new OperationsRequestError(
+      'OPERATIONS_FULFILLMENT_EXECUTION_INVALID',
+      `${label} must be an exact nonnegative minor-unit amount`,
+      409,
+    )
+  }
+  return parsed
+}
+
+function shadowExecutionDriftHash(input: Omit<
+  ShadowExecutionContext,
+  'driftHash'
+>): string {
+  return commandRequestHash({
+    activationRevision: input.activationRevision,
+    orderId: input.orderId,
+    orderRowVersion: input.orderRowVersion,
+    planId: input.planId,
+    warehouseId: input.warehouseId,
+    reconciliationId: input.reconciliationId,
+    receiptId: input.receiptId,
+    receiptResultHash: input.receiptResultHash,
+    fulfillmentCarrierDestinationFingerprint:
+      input.fulfillmentCarrierDestinationFingerprint,
+    carriers: input.carriers,
+    lines: input.lines,
+    packages: input.packages,
+  })
+}
+
+async function readShadowExecutionContext(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    orderGlobalId: string
+    expectedRowVersion: number
+  },
+): Promise<ShadowExecutionContext> {
+  const activation = await resolveActivation(client, input.organizationId)
+  if (activation.state !== 'shadow') {
+    throw new OperationsRequestError(
+      'OPERATIONS_SHADOW_EXECUTION_REQUIRED',
+      'Shipment execution preparation is limited to Shadow mode',
+      409,
+    )
+  }
+
+  const orderResult = await client.query<QueryResultRow & {
+    id: string
+    global_id: string
+    status: OperationsOrderStatus
+    row_version: string
+    pipeline_id: string
+    customer_id: string
+    integration_account_id: string | null
+    source_provider: string
+    external_order_id: string
+    currency: string
+    requested_delivery_at: Date | null
+    ship_to: Record<string, unknown>
+  }>(
+    `SELECT
+       source_order.id::text,
+       source_order.global_id,
+       source_order.status,
+       source_order.row_version::text,
+       source_order.pipeline_id::text,
+       source_order.customer_id::text,
+       source_order.integration_account_id::text,
+       source_order.source_provider,
+       source_order.external_order_id,
+       source_order.currency,
+       source_order.requested_delivery_at,
+       source_order.ship_to
+     FROM operations_orders source_order
+     WHERE source_order.organization_id = $1::uuid
+       AND source_order.global_id = $2
+     FOR UPDATE`,
+    [input.organizationId, input.orderGlobalId],
+  )
+  const order = orderResult.rows[0]
+  if (!order) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_NOT_FOUND',
+      'Operations order was not found',
+      404,
+    )
+  }
+  if (Number(order.row_version) !== input.expectedRowVersion) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_VERSION_CONFLICT',
+      'This order changed after it was opened. Refresh before preparing shipment execution.',
+      409,
+    )
+  }
+  if (
+    order.status !== 'packed'
+    || order.source_provider !== 'shopify'
+    || !order.integration_account_id
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_FULFILLMENT_EXECUTION_NOT_READY',
+      'Shadow shipment execution requires one packed Shopify order with an integration account',
+      409,
+    )
+  }
+
+  const existingExecutionResult = await client.query<{ global_id: string }>(
+    `SELECT execution.global_id
+     FROM operations_fulfillment_executions execution
+     WHERE execution.organization_id = $1::uuid
+       AND execution.order_id = $2::uuid
+     LIMIT 1
+     FOR SHARE`,
+    [input.organizationId, order.id],
+  )
+  const existingExecution = existingExecutionResult.rows[0]
+  if (existingExecution) {
+    throw new OperationsRequestError(
+      'OPERATIONS_FULFILLMENT_EXECUTION_ALREADY_PREPARED',
+      `Shadow preparation ${existingExecution.global_id} is already durable for this order`,
+      409,
+    )
+  }
+
+  const blockerResult = await client.query<{ count: string }>(
+    `SELECT count(*)::text AS count
+     FROM operations_exceptions exception
+     WHERE exception.organization_id = $1::uuid
+       AND exception.order_id = $2::uuid
+       AND exception.status IN ('open', 'acknowledged')`,
+    [input.organizationId, order.id],
+  )
+  if (Number(blockerResult.rows[0]?.count || 0) !== 0) {
+    throw new OperationsRequestError(
+      'OPERATIONS_FULFILLMENT_EXECUTION_BLOCKED',
+      'Resolve all order exceptions before preparing shipment execution',
+      409,
+    )
+  }
+
+  const planResult = await client.query<QueryResultRow & {
+    id: string
+    global_id: string
+    status: string
+    warehouse_id: string
+  }>(
+    `SELECT plan.id::text, plan.global_id, plan.status,
+            plan.warehouse_id::text
+     FROM operations_fulfillment_plans plan
+     WHERE plan.organization_id = $1::uuid
+       AND plan.order_id = $2::uuid
+     ORDER BY plan.version_number DESC
+     LIMIT 1
+     FOR UPDATE`,
+    [input.organizationId, order.id],
+  )
+  const plan = planResult.rows[0]
+  if (!plan || plan.status !== 'released') {
+    throw new OperationsRequestError(
+      'OPERATIONS_FULFILLMENT_PLAN_INVALID',
+      'The latest single-warehouse fulfillment plan must be released',
+      409,
+    )
+  }
+
+  const lineRows = await client.query<QueryResultRow & {
+    id: string
+    global_id: string
+    product_global_id: string
+    provider_variant_id: string
+    description: string
+    quantity: string
+    weight_grams: number
+  }>(
+    `SELECT
+       line.id::text,
+       line.global_id,
+       product.reference_code AS product_global_id,
+       candidate_line.external_variant_id AS provider_variant_id,
+       line.description,
+       line.quantity::text,
+       line.weight_grams
+     FROM operations_order_lines line
+     JOIN crm_products product
+       ON product.pipeline_id = line.pipeline_id
+      AND product.id = line.product_id
+     JOIN operations_commerce_order_candidates candidate
+       ON candidate.organization_id = line.organization_id
+      AND candidate.canonical_order_id = line.order_id
+      AND candidate.integration_account_id = $3::uuid
+      AND candidate.provider = 'shopify'
+      AND candidate.workflow_state = 'promoted'
+     JOIN operations_commerce_order_candidate_lines candidate_line
+       ON candidate_line.organization_id = line.organization_id
+      AND candidate_line.order_candidate_id = candidate.id
+      AND candidate_line.canonical_order_line_id = line.id
+      AND candidate_line.provider = 'shopify'
+      AND candidate_line.workflow_state = 'promoted'
+      AND candidate_line.external_variant_id IS NOT NULL
+     WHERE line.organization_id = $1::uuid
+       AND line.order_id = $2::uuid
+     ORDER BY line.global_id
+     FOR UPDATE OF line`,
+    [input.organizationId, order.id, order.integration_account_id],
+  )
+  const lines: ShadowExecutionLine[] = lineRows.rows.map((line) => ({
+    id: line.id,
+    globalId: line.global_id,
+    productGlobalId: line.product_global_id,
+    providerVariantId: line.provider_variant_id,
+    title: line.description,
+    quantity: exactWholeQuantity(line.quantity, `Order line ${line.global_id}`),
+    unitWeightGrams: exactWholeQuantity(
+      line.weight_grams,
+      `Order line ${line.global_id} weight`,
+    ),
+  }))
+  if (!lines.length) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_LINES_INVALID',
+      'The packed order has no canonical lines',
+      409,
+    )
+  }
+  const lineById = new Map(lines.map((line) => [line.id, line]))
+
+  const packageRows = await client.query<QueryResultRow & {
+    id: string
+    global_id: string
+    package_number: number
+    status: string
+    evidence_package_key: string | null
+    length_mm: number
+    width_mm: number
+    height_mm: number
+    weight_grams: number
+    material_code: string | null
+    material_name: string | null
+    content_weight_grams: number | null
+    tare_weight_grams: number | null
+  }>(
+    `SELECT
+       package.id::text,
+       package.global_id,
+       package.package_number,
+       package.status,
+       package.evidence_package_key,
+       package.length_mm,
+       package.width_mm,
+       package.height_mm,
+       package.weight_grams,
+       material.code AS material_code,
+       material.name AS material_name,
+       evidence_package.content_weight_grams,
+       evidence_package.tare_weight_grams
+     FROM operations_packages package
+     LEFT JOIN operations_cartonization_rate_evidence_packages
+       evidence_package
+       ON evidence_package.organization_id = package.organization_id
+      AND evidence_package.evidence_id = package.cartonization_evidence_id
+      AND evidence_package.package_key = package.evidence_package_key
+     LEFT JOIN operations_packaging_materials material
+       ON material.organization_id = evidence_package.organization_id
+      AND material.id = evidence_package.packaging_material_id
+     WHERE package.organization_id = $1::uuid
+       AND package.plan_id = $2::uuid
+     ORDER BY package.package_number
+     FOR UPDATE OF package`,
+    [input.organizationId, plan.id],
+  )
+  if (
+    !packageRows.rows.length
+    || packageRows.rows.some((item) => (
+      item.status !== 'packed'
+      || !item.evidence_package_key
+      || !item.material_code
+      || !item.material_name
+      || !item.content_weight_grams
+      || !item.tare_weight_grams
+      || item.weight_grams !== (
+        item.content_weight_grams + item.tare_weight_grams
+      )
+    ))
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_CANONICAL_PACKAGES_REQUIRED',
+      'Every physical package must be packed and bound to sealed cartonization evidence',
+      409,
+    )
+  }
+
+  const allocationRows = await client.query<QueryResultRow & {
+    package_id: string
+    order_line_id: string
+    line_global_id: string
+    product_global_id: string
+    title: string
+    quantity: string
+  }>(
+    `SELECT
+       content.package_id::text,
+       content.order_line_id::text,
+       line.global_id AS line_global_id,
+       product.reference_code AS product_global_id,
+       line.description AS title,
+       content.quantity::text
+     FROM operations_package_contents content
+     JOIN operations_order_lines line
+       ON line.organization_id = content.organization_id
+      AND line.id = content.order_line_id
+     JOIN crm_products product
+       ON product.pipeline_id = line.pipeline_id
+      AND product.id = line.product_id
+     WHERE content.organization_id = $1::uuid
+       AND content.plan_id = $2::uuid
+       AND content.order_id = $3::uuid
+     ORDER BY content.package_id, line.global_id
+     FOR UPDATE OF content`,
+    [input.organizationId, plan.id, order.id],
+  )
+  const allocationByPackage = new Map<string, ShadowExecutionAllocation[]>()
+  const allocatedByLine = new Map<string, number>()
+  for (const allocation of allocationRows.rows) {
+    const executionLine = lineById.get(allocation.order_line_id)
+    if (!executionLine) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PACKAGE_CONTENTS_INCOMPLETE',
+        'Physical package allocations must resolve one promoted provider variant identity',
+        409,
+      )
+    }
+    const quantity = exactWholeQuantity(
+      allocation.quantity,
+      `Package allocation ${allocation.line_global_id}`,
+    )
+    const values = allocationByPackage.get(allocation.package_id) || []
+    values.push({
+      orderLineId: allocation.order_line_id,
+      lineGlobalId: allocation.line_global_id,
+      productGlobalId: allocation.product_global_id,
+      providerVariantId: executionLine.providerVariantId,
+      title: allocation.title,
+      quantity,
+    })
+    allocationByPackage.set(allocation.package_id, values)
+    allocatedByLine.set(
+      allocation.order_line_id,
+      (allocatedByLine.get(allocation.order_line_id) || 0) + quantity,
+    )
+  }
+  if (
+    lines.some((line) => allocatedByLine.get(line.id) !== line.quantity)
+    || packageRows.rows.some(
+      (packageRow) => !allocationByPackage.get(packageRow.id)?.length,
+    )
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PACKAGE_CONTENTS_INCOMPLETE',
+      'Physical package allocations must exactly cover every canonical order line',
+      409,
+    )
+  }
+  const packages: ShadowExecutionPackage[] = packageRows.rows.map((item) => ({
+    id: item.id,
+    globalId: item.global_id,
+    packageKey: item.evidence_package_key as string,
+    packageSequence: item.package_number,
+    materialCode: item.material_code as string,
+    materialName: item.material_name as string,
+    lengthMm: item.length_mm,
+    widthMm: item.width_mm,
+    heightMm: item.height_mm,
+    contentWeightGrams: item.content_weight_grams as number,
+    tareWeightGrams: item.tare_weight_grams as number,
+    grossWeightGrams: item.weight_grams,
+    allocations: allocationByPackage.get(item.id) || [],
+  }))
+
+  const reconciliationResult = await client.query<QueryResultRow & {
+    id: string
+    global_id: string
+    receipt_id: string
+    receipt_global_id: string
+    receipt_config_id: string
+    outcome: ShopifyCheckoutRateReconciliationOutcome
+    source_shipping_charge_minor: string | null
+    source_shopify_service_code: string | null
+    selected_carrier_provider: CheckoutRateCarrierProvider | null
+    selected_service_code: string | null
+    selected_currency: string | null
+    selected_customer_charge_minor: string | null
+    receipt_created_at: Date
+    receipt_expires_at: Date | null
+    request_evidence_hash: string
+    receipt_result_hash: string
+    receipt_package_plan_hash: string
+    receipt_policy_hash: string
+    receipt_algorithm_version: string
+    receipt_carrier_destination_fingerprint: string
+    checkout_service_name: string | null
+    checkout_carrier_cost_minor: string | null
+    checkout_package_count: number
+  }>(
+    `SELECT
+       reconciliation.id::text,
+       reconciliation.global_id,
+       reconciliation.receipt_id::text,
+       receipt.global_id AS receipt_global_id,
+       receipt.config_id::text AS receipt_config_id,
+       reconciliation.outcome,
+       reconciliation.source_shipping_charge_minor::text,
+       reconciliation.source_shopify_service_code,
+       reconciliation.selected_carrier_provider,
+       reconciliation.selected_service_code,
+       reconciliation.selected_currency,
+       reconciliation.selected_customer_charge_minor::text,
+       receipt.created_at AS receipt_created_at,
+       receipt.expires_at AS receipt_expires_at,
+       receipt.request_evidence_hash,
+       receipt.result_hash AS receipt_result_hash,
+       receipt.package_plan_hash AS receipt_package_plan_hash,
+       receipt.policy_hash AS receipt_policy_hash,
+       receipt.algorithm_version AS receipt_algorithm_version,
+       receipt.carrier_destination_fingerprint
+         AS receipt_carrier_destination_fingerprint,
+       selected_offer.service_name AS checkout_service_name,
+       selected_offer.carrier_cost_minor::text
+         AS checkout_carrier_cost_minor,
+       receipt.package_count AS checkout_package_count
+     FROM operations_shopify_checkout_rate_current_reconciliations
+       reconciliation
+     JOIN operations_shopify_checkout_rate_receipts receipt
+       ON receipt.organization_id = reconciliation.organization_id
+      AND receipt.id = reconciliation.receipt_id
+     LEFT JOIN operations_shopify_checkout_rate_receipt_offers
+       selected_offer
+       ON selected_offer.organization_id = receipt.organization_id
+      AND selected_offer.receipt_id = receipt.id
+      AND selected_offer.shopify_service_code
+        = reconciliation.source_shopify_service_code
+     WHERE reconciliation.organization_id = $1::uuid
+       AND reconciliation.order_id = $2::uuid
+     ORDER BY reconciliation.created_at DESC`,
+    [input.organizationId, order.id],
+  )
+  if (reconciliationResult.rows.length !== 1) {
+    throw new OperationsRequestError(
+      'OPERATIONS_SHOPIFY_CHECKOUT_RATE_RECONCILIATION_REQUIRED',
+      'Exactly one current Shopify checkout-rate reconciliation is required',
+      409,
+    )
+  }
+  const reconciliation = reconciliationResult.rows[0]
+  if (
+    reconciliation.outcome !== 'matched'
+    || !reconciliation.receipt_expires_at
+    || !reconciliation.source_shopify_service_code
+    || !reconciliation.selected_carrier_provider
+    || !reconciliation.selected_service_code
+    || !reconciliation.selected_currency
+    || !reconciliation.checkout_service_name
+    || reconciliation.checkout_carrier_cost_minor === null
+    || reconciliation.selected_customer_charge_minor === null
+    || reconciliation.source_shipping_charge_minor === null
+    || reconciliation.selected_customer_charge_minor
+      !== reconciliation.source_shipping_charge_minor
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_SHOPIFY_CHECKOUT_RATE_RECONCILIATION_REQUIRED',
+      'The current Shopify reconciliation must be an exact matched checkout offer',
+      409,
+    )
+  }
+  const invalidReceiptFacts = await client.query<{ count: string }>(
+    `SELECT count(*)::text AS count
+     FROM operations_shopify_checkout_rate_receipt_lines line
+     WHERE line.organization_id = $1::uuid
+       AND line.receipt_id = $2::uuid
+       AND line.unit_weight_grams <= 0`,
+    [input.organizationId, reconciliation.receipt_id],
+  )
+  if (Number(invalidReceiptFacts.rows[0]?.count || 0) !== 0) {
+    throw new OperationsRequestError(
+      'OPERATIONS_CHECKOUT_PACK_RATE_INCOMPLETE',
+      'The matched checkout receipt lacks positive unit-weight evidence',
+      409,
+    )
+  }
+
+  const carrierRows = await client.query<QueryResultRow & {
+    carrier_provider: CheckoutRateCarrierProvider
+    carrier_account_id: string
+    carrier_account_global_id: string
+    environment: string
+  }>(
+    `SELECT
+       binding.carrier_provider,
+       carrier_account.id::text AS carrier_account_id,
+       carrier_account.global_id AS carrier_account_global_id,
+       carrier_connection.environment
+     FROM operations_shopify_carrier_service_configs config
+     JOIN operations_shopify_carrier_service_config_carriers binding
+       ON binding.organization_id = config.organization_id
+      AND binding.config_id = config.id
+     JOIN operations_carrier_accounts carrier_account
+       ON carrier_account.organization_id = binding.organization_id
+      AND carrier_account.id = binding.carrier_account_id
+     JOIN operations_integration_accounts carrier_connection
+       ON carrier_connection.organization_id = carrier_account.organization_id
+      AND carrier_connection.id = carrier_account.integration_account_id
+     WHERE config.organization_id = $1::uuid
+       AND config.integration_account_id = $2::uuid
+       AND config.warehouse_id = $3::uuid
+       AND config.id = $4::uuid
+       AND operations_shopify_carrier_service_config_is_ready(
+         config.organization_id, config.id
+       )
+     ORDER BY binding.carrier_provider
+     FOR UPDATE OF config, binding, carrier_account, carrier_connection`,
+    [
+      input.organizationId,
+      order.integration_account_id,
+      plan.warehouse_id,
+      reconciliation.receipt_config_id,
+    ],
+  )
+  if (
+    carrierRows.rows.length !== 2
+    || carrierRows.rows.some((row) => row.environment !== 'sandbox')
+    || new Set(carrierRows.rows.map((row) => row.carrier_provider)).size !== 2
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_SHADOW_CARRIERS_NOT_READY',
+      'Shadow execution requires the configured UPS and FedEx sandbox accounts',
+      409,
+    )
+  }
+  const carriers: ShadowExecutionCarrier[] = carrierRows.rows.map((row) => ({
+    provider: row.carrier_provider,
+    carrierAccountId: row.carrier_account_id,
+    carrierAccountGlobalId: row.carrier_account_global_id,
+  }))
+  const packagePlanHash = commandRequestHash(packages.map((item) => ({
+    packageKey: item.packageKey,
+    packageSequence: item.packageSequence,
+    lengthMm: item.lengthMm,
+    widthMm: item.widthMm,
+    heightMm: item.heightMm,
+    grossWeightGrams: item.grossWeightGrams,
+    allocations: item.allocations,
+  })))
+  const contextWithoutDrift: Omit<ShadowExecutionContext, 'driftHash'> = {
+    activationRevision: activation.revision,
+    orderId: order.id,
+    orderGlobalId: order.global_id,
+    orderRowVersion: Number(order.row_version),
+    pipelineId: order.pipeline_id,
+    customerId: order.customer_id,
+    integrationAccountId: order.integration_account_id,
+    externalOrderId: order.external_order_id,
+    currency: order.currency.toUpperCase(),
+    requestedDeliveryAt:
+      order.requested_delivery_at?.toISOString() || null,
+    shipTo: order.ship_to,
+    planId: plan.id,
+    planGlobalId: plan.global_id,
+    warehouseId: plan.warehouse_id,
+    reconciliationId: reconciliation.id,
+    reconciliationGlobalId: reconciliation.global_id,
+    receiptId: reconciliation.receipt_id,
+    receiptGlobalId: reconciliation.receipt_global_id,
+    receiptConfigId: reconciliation.receipt_config_id,
+    receiptCreatedAt: reconciliation.receipt_created_at.toISOString(),
+    receiptExpiresAt: reconciliation.receipt_expires_at.toISOString(),
+    receiptRequestEvidenceHash:
+      reconciliation.request_evidence_hash,
+    receiptResultHash: reconciliation.receipt_result_hash,
+    receiptPackagePlanHash:
+      reconciliation.receipt_package_plan_hash,
+    receiptPolicyHash: reconciliation.receipt_policy_hash,
+    receiptAlgorithmVersion:
+      reconciliation.receipt_algorithm_version,
+    receiptCarrierDestinationFingerprint:
+      reconciliation.receipt_carrier_destination_fingerprint,
+    fulfillmentCarrierDestinationFingerprint:
+      carrierSandboxRateDestinationFingerprint(
+        shadowExecutionDestination(order.ship_to),
+      ),
+    checkoutProvider:
+      reconciliation.selected_carrier_provider,
+    checkoutServiceCode: reconciliation.selected_service_code,
+    checkoutServiceName: reconciliation.checkout_service_name,
+    checkoutCarrierCostMinor: exactMinor(
+      reconciliation.checkout_carrier_cost_minor,
+      'Checkout carrier cost',
+    ),
+    checkoutShippingChargeMinor: exactMinor(
+      reconciliation.selected_customer_charge_minor,
+      'Checkout shipping charge',
+    ),
+    checkoutCurrency: reconciliation.selected_currency.toUpperCase(),
+    checkoutPackageCount: reconciliation.checkout_package_count,
+    lines,
+    packages,
+    carriers,
+    packagePlanHash,
+  }
+  if (contextWithoutDrift.checkoutCurrency !== contextWithoutDrift.currency) {
+    throw new OperationsRequestError(
+      'OPERATIONS_CHECKOUT_CURRENCY_MISMATCH',
+      'Checkout and order currencies do not match',
+      409,
+    )
+  }
+  return {
+    ...contextWithoutDrift,
+    driftHash: shadowExecutionDriftHash(contextWithoutDrift),
+  }
+}
+
+function completedShadowFulfillmentExecutionResult(
+  receipt: Pick<CommandReceiptRow, 'result_payload'>,
+): OperationsShadowFulfillmentExecutionResult {
+  const payload = receipt.result_payload
+  if (
+    !payload
+    || typeof payload.orderGlobalId !== 'string'
+    || payload.orderStatus !== 'packed'
+    || typeof payload.fulfillmentExecutionGlobalId !== 'string'
+    || typeof payload.shipmentGroupGlobalId !== 'string'
+    || !Array.isArray(payload.providerAttempts)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_COMMAND_RECEIPT_INVALID',
+      'Completed command receipt has no Shadow fulfillment execution result',
+      409,
+    )
+  }
+  return {
+    ...(payload as unknown as OperationsShadowFulfillmentExecutionResult),
+    replayed: true,
+  }
+}
+
+function shadowExecutionDestination(
+  shipTo: Record<string, unknown>,
+) {
+  const value = (key: string): string | null => {
+    const normalized = String(shipTo[key] ?? '').trim()
+    return normalized || null
+  }
+  const postalCode = value('postalCode')
+  const country = String(shipTo.country ?? '').trim().toUpperCase()
+  if (
+    !postalCode
+    || !['US', 'USA', 'UNITED STATES', 'UNITED STATES OF AMERICA'].includes(
+      country,
+    )
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_SHADOW_DESTINATION_INVALID',
+      'Shadow shipment preparation currently requires one complete US destination',
+      409,
+    )
+  }
+  return {
+    name: value('name'),
+    line1: value('line1'),
+    line2: value('line2'),
+    city: value('city'),
+    region: value('region'),
+    postalCode,
+    countryCode: 'US' as const,
+  }
+}
+
+function shadowExecutionParcels(context: ShadowExecutionContext) {
+  return context.packages.map((item) => ({
+    packageKey: item.packageKey,
+    description: `ClawPilot carton ${item.packageSequence}`,
+    exteriorInches: {
+      length: Math.ceil(item.lengthMm / 25.4),
+      width: Math.ceil(item.widthMm / 25.4),
+      height: Math.ceil(item.heightMm / 25.4),
+    },
+    grossPounds: Math.max(
+      0.1,
+      Math.ceil((item.grossWeightGrams / 453.59237) * 10) / 10,
+    ),
+  }))
+}
+
+function selectShadowExecutionRate(
+  context: ShadowExecutionContext,
+  rated: CheckoutShipmentRateResult,
+) {
+  const packageKeys = context.packages.map((item) => item.packageKey)
+  const offers: CanonicalWholeShipmentRateOffer[] = rated.offers.flatMap(
+    (offer) => {
+      const delivery = estimatedDeliveryAt(
+        rated.completedAt,
+        offer.deliveryDate,
+        offer.transitDays,
+      )
+      if (!delivery) return []
+      return [{
+        evidenceState: 'sealed' as const,
+        rateScope: 'multi_package_shipment' as const,
+        rateEvidenceGlobalId: offer.evidenceGlobalId,
+        packagePlanHash: context.packagePlanHash,
+        packageCount: context.packages.length,
+        packageKeys,
+        provider: offer.provider,
+        serviceCode: offer.serviceLevelCode,
+        serviceName: offer.serviceName,
+        carrierCostMinor: offer.amountMinor,
+        currency: offer.currency,
+        transitDays: delivery.transitDays,
+        estimatedDeliveryAt: delivery.deliveryAt,
+      }]
+    },
+  )
+  try {
+    return selectCanonicalFulfillmentRate({
+      packagePlanHash: context.packagePlanHash,
+      packageCount: context.packages.length,
+      packageKeys,
+      expectedCurrency: context.currency,
+      requestedDeliveryAt: context.requestedDeliveryAt,
+      actualCheckoutShippingChargeMinor:
+        context.checkoutShippingChargeMinor,
+      offers,
+    })
+  } catch (error) {
+    if (error instanceof CanonicalFulfillmentPlanningError) {
+      throw new OperationsRequestError(
+        `OPERATIONS_${error.code}`,
+        error.message,
+        409,
+      )
+    }
+    throw error
+  }
+}
+
+type ShadowRateEvidenceRow = QueryResultRow & {
+  id: string
+  global_id: string
+  provider: CheckoutRateCarrierProvider
+  carrier_account_id: string
+  request_hash: string
+  environment: string
+  purpose: string
+  status: 'succeeded' | 'failed'
+  error_code: string | null
+  redacted_request: Record<string, unknown>
+  redacted_response: Record<string, unknown>
+}
+
+function nestedRecord(
+  value: unknown,
+  key: string,
+): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const nested = (value as Record<string, unknown>)[key]
+  return nested && typeof nested === 'object' && !Array.isArray(nested)
+    ? nested as Record<string, unknown>
+    : {}
+}
+
+export async function prepareOperationsShipmentExecutionFromPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  orderGlobalId: string
+  expectedRowVersion: number
+  reason: string
+  idempotencyKey: string
+}): Promise<OperationsShadowFulfillmentExecutionResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
+  const orderGlobalId = String(input.orderGlobalId || '').trim()
+  const reason = String(input.reason || '').trim()
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  if (!actorEmail) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ACTOR_REQUIRED',
+      'A signed-in user is required',
+      401,
+    )
+  }
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_INVALID',
+      'Order is invalid',
+    )
+  }
+  if (
+    !Number.isSafeInteger(input.expectedRowVersion)
+    || input.expectedRowVersion < 0
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_VERSION_INVALID',
+      'Order version is invalid',
+    )
+  }
+  if (!reason || reason.length > 500) {
+    throw new OperationsRequestError(
+      'OPERATIONS_FULFILLMENT_EXECUTION_REASON_INVALID',
+      'A Shadow shipment-preparation reason is required',
+    )
+  }
+  if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_IDEMPOTENCY_KEY_INVALID',
+      'A valid idempotency key is required',
+    )
+  }
+
+  const requestHash = commandRequestHash({
+    orderGlobalId,
+    expectedRowVersion: input.expectedRowVersion,
+    reason,
+  })
+  const command = await prepareCommandReceipt({
+    organizationId,
+    commandType: 'prepare_operations_shipment_execution',
+    idempotencyKey,
+    requestHash,
+    actorEmail,
+  })
+  if (command.completed) {
+    return completedShadowFulfillmentExecutionResult(command.receipt)
+  }
+
+  try {
+    const preflight = await withTransaction(async (client) => {
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:activation:${organizationId}`,
+      )
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:order:${organizationId}:${orderGlobalId}`,
+      )
+      return readShadowExecutionContext(client, {
+        organizationId,
+        orderGlobalId,
+        expectedRowVersion: input.expectedRowVersion,
+      })
+    })
+
+    // This is deliberately outside either database transaction. The helper
+    // calls every configured carrier once with the complete ordered package
+    // array and permits at most one degraded provider with durable evidence.
+    const rated = await rateCheckoutShipment({
+      destination: shadowExecutionDestination(preflight.shipTo),
+      parcels: shadowExecutionParcels(preflight),
+      carriers: preflight.carriers.map((carrier) => ({
+        provider: carrier.provider,
+        carrierAccountGlobalId: carrier.carrierAccountGlobalId,
+      })),
+      currency: preflight.currency,
+      deadlineAt: Date.now() + 25_000,
+      invoke: async (selection, request) => {
+        const result = await testCarrierSandboxShipmentRate({
+          organizationId,
+          provider: selection.provider,
+          environment: 'sandbox',
+          carrierAccountGlobalId: selection.carrierAccountGlobalId,
+          destination: request.destination,
+          parcels: request.parcels,
+          actorEmail,
+          timeoutMs: 20_000,
+          signal: request.signal,
+          requireFailureEvidence: true,
+        })
+        return {
+          provider: selection.provider,
+          carrierAccountGlobalId: selection.carrierAccountGlobalId,
+          packageCount: request.parcels.length,
+          rateScope: 'multi_package_shipment' as const,
+          rates: result.rates.map((rate) => ({
+            serviceCode: rate.serviceCode,
+            serviceName: rate.serviceName,
+            amount: rate.amount,
+            currency: rate.currency,
+            transitDays: rate.transitDays,
+            deliveryDate: rate.deliveryDate,
+            evidenceGlobalId: result.evidenceGlobalId,
+          })),
+        }
+      },
+    })
+    const selected = selectShadowExecutionRate(preflight, rated)
+
+    return await withTransaction(async (client) => {
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:activation:${organizationId}`,
+      )
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:order:${organizationId}:${orderGlobalId}`,
+      )
+      const current = await readShadowExecutionContext(client, {
+        organizationId,
+        orderGlobalId,
+        expectedRowVersion: input.expectedRowVersion,
+      })
+      if (current.driftHash !== preflight.driftHash) {
+        throw new OperationsRequestError(
+          'OPERATIONS_FULFILLMENT_EXECUTION_DRIFT',
+          'Order, packages, checkout reconciliation, or carrier configuration changed during rating',
+          409,
+        )
+      }
+
+      const evidenceIds = rated.providerAttempts.map(
+        (attempt) => attempt.rateEvidenceGlobalId,
+      )
+      const evidenceResult = await client.query<ShadowRateEvidenceRow>(
+        `SELECT
+           evidence.id::text,
+           evidence.global_id,
+           evidence.provider,
+           evidence.carrier_account_id::text,
+           evidence.request_hash,
+           evidence.environment,
+           evidence.purpose,
+           evidence.status,
+           evidence.error_code,
+           evidence.redacted_request,
+           evidence.redacted_response
+         FROM operations_carrier_rate_requests evidence
+         WHERE evidence.organization_id = $1::uuid
+           AND evidence.global_id = ANY($2::text[])
+         ORDER BY evidence.provider
+         FOR SHARE`,
+        [organizationId, evidenceIds],
+      )
+      if (evidenceResult.rows.length !== rated.providerAttempts.length) {
+        throw new OperationsRequestError(
+          'OPERATIONS_CARRIER_RATE_EVIDENCE_REQUIRED',
+          'Every configured carrier attempt must retain durable evidence',
+          409,
+        )
+      }
+      const evidenceByGlobalId = new Map(
+        evidenceResult.rows.map((row) => [row.global_id, row]),
+      )
+      for (const attempt of rated.providerAttempts) {
+        const evidence = evidenceByGlobalId.get(
+          attempt.rateEvidenceGlobalId,
+        )
+        const carrier = current.carriers.find(
+          (item) => item.provider === attempt.provider,
+        )
+        const shipment = nestedRecord(evidence?.redacted_request, 'shipment')
+        if (
+          !evidence
+          || !carrier
+          || evidence.provider !== attempt.provider
+          || evidence.carrier_account_id !== carrier.carrierAccountId
+          || evidence.environment !== 'sandbox'
+          || evidence.purpose !== 'cartonization_shipment_rate'
+          || shipment.destinationFingerprint
+            !== current.fulfillmentCarrierDestinationFingerprint
+          || shipment.rateScope !== 'multi_package_shipment'
+          || Number(shipment.packageCount) !== current.packages.length
+          || (
+            attempt.status === 'succeeded'
+            && (
+              evidence.status !== 'succeeded'
+              || evidence.error_code !== null
+              || attempt.failureCode !== null
+            )
+          )
+          || (
+            attempt.status === 'degraded'
+            && (
+              evidence.status !== 'failed'
+              || evidence.error_code !== attempt.failureCode
+            )
+          )
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_CARRIER_RATE_EVIDENCE_MISMATCH',
+            'Carrier attempt evidence no longer matches this exact Shadow rerate',
+            409,
+          )
+        }
+      }
+
+      const replayGroupKey =
+        `shadow:${orderGlobalId}:${current.receiptGlobalId}:` +
+        requestHash.slice(0, 16)
+      const scenarioId = `shadow-${orderGlobalId}`
+      const checkoutIdempotencyKey = `shadow-checkout:${requestHash}`
+      const fulfillmentIdempotencyKey =
+        `shadow-fulfillment:${requestHash}`
+
+      const checkoutRunResult = await client.query<{
+        id: string
+        global_id: string
+      }>(
+        `INSERT INTO operations_pack_rate_runs (
+           organization_id,
+           replay_group_key,
+           scenario_id,
+           source_kind,
+           source_reference,
+           provider,
+           checkout_source,
+           purpose,
+           prior_checkout_run_id,
+           pipeline_id,
+           customer_id,
+           customer_resolution_outcome,
+           status,
+           blocker_code,
+           policy_version,
+           algorithm_version,
+           input_hash,
+           result_hash,
+           input_snapshot,
+           result_snapshot,
+           stage_snapshot,
+           line_count,
+           package_count,
+           rate_choice_count,
+           currency,
+           selected_provider,
+           selected_service_code,
+           selected_service_name,
+           selected_carrier_cost_minor,
+           customer_charge_minor,
+           mud_markup_minor,
+           margin_minor,
+           idempotency_key,
+           actor_email,
+           provider_write_count,
+           postage_purchase_count,
+           label_write_count,
+           expires_at,
+           created_at,
+           pricing_semantics_version
+         )
+         SELECT
+           receipt.organization_id,
+           $3,
+           $4,
+           'provider_checkout',
+           receipt.global_id,
+           'shopify',
+           'live_callback_recorded',
+           'checkout_quote',
+           NULL,
+           NULL,
+           NULL,
+           'not_attempted',
+           'succeeded',
+           NULL,
+           receipt.policy_hash,
+           receipt.algorithm_version,
+           receipt.request_evidence_hash,
+           receipt.result_hash,
+           receipt.redacted_request_snapshot,
+           receipt.result_snapshot,
+           jsonb_build_object(
+             'stage', 'checkout_quote',
+             'receiptGlobalId', receipt.global_id,
+             'reconciliationGlobalId', $5::text
+           ),
+           receipt.line_count,
+           receipt.package_count,
+           receipt.offer_count,
+           receipt.currency,
+           $6,
+           $7,
+           $8,
+           $9::bigint,
+           $10::bigint,
+           NULL,
+           $10::bigint - $9::bigint,
+           $11,
+           $12,
+           0,
+           0,
+           0,
+           receipt.expires_at,
+           receipt.created_at,
+           2
+         FROM operations_shopify_checkout_rate_receipts receipt
+         WHERE receipt.organization_id = $1::uuid
+           AND receipt.id = $2::uuid
+           AND receipt.status = 'succeeded'
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          current.receiptId,
+          replayGroupKey,
+          scenarioId,
+          current.reconciliationGlobalId,
+          current.checkoutProvider,
+          current.checkoutServiceCode,
+          current.checkoutServiceName,
+          current.checkoutCarrierCostMinor,
+          current.checkoutShippingChargeMinor,
+          checkoutIdempotencyKey,
+          actorEmail,
+        ],
+      )
+      const checkoutRun = checkoutRunResult.rows[0]
+      if (!checkoutRun) {
+        throw new OperationsRequestError(
+          'OPERATIONS_CHECKOUT_PACK_RATE_REQUIRED',
+          'The matched checkout receipt could not become immutable pack-and-rate evidence',
+          409,
+        )
+      }
+
+      await client.query(
+        `INSERT INTO operations_pack_rate_run_lines (
+           organization_id,
+           run_id,
+           line_key,
+           product_key,
+           title,
+           required_quantity,
+           unit_weight_grams,
+           line_hash,
+           line_snapshot
+         )
+         SELECT
+           line.organization_id,
+           $3::uuid,
+           line.line_key,
+           line.provider_variant_id,
+           COALESCE(NULLIF(line.sku, ''), line.provider_variant_id),
+           line.quantity,
+           line.unit_weight_grams,
+           line.line_hash,
+           line.line_snapshot
+         FROM operations_shopify_checkout_rate_receipt_lines line
+         WHERE line.organization_id = $1::uuid
+           AND line.receipt_id = $2::uuid`,
+        [organizationId, current.receiptId, checkoutRun.id],
+      )
+      await client.query(
+        `INSERT INTO operations_pack_rate_run_packages (
+           organization_id,
+           run_id,
+           package_key,
+           package_sequence,
+           material_code,
+           material_name,
+           length_mm,
+           width_mm,
+           height_mm,
+           content_weight_grams,
+           tare_weight_grams,
+           gross_weight_grams,
+           allocation_count,
+           package_hash,
+           package_snapshot
+         )
+         SELECT
+           package.organization_id,
+           $3::uuid,
+           package.package_key,
+           package.package_sequence,
+           material.code,
+           material.name,
+           package.rated_outer_length_mm,
+           package.rated_outer_width_mm,
+           package.rated_outer_height_mm,
+           package.content_weight_grams,
+           package.tare_weight_grams,
+           package.gross_weight_grams,
+           package.allocation_count,
+           package.package_hash,
+           package.package_snapshot
+         FROM operations_shopify_checkout_rate_receipt_packages package
+         JOIN operations_packaging_materials material
+           ON material.organization_id = package.organization_id
+          AND material.id = package.packaging_material_id
+         WHERE package.organization_id = $1::uuid
+           AND package.receipt_id = $2::uuid`,
+        [organizationId, current.receiptId, checkoutRun.id],
+      )
+      await client.query(
+        `INSERT INTO operations_pack_rate_run_allocations (
+           organization_id,
+           run_id,
+           package_key,
+           line_key,
+           product_key,
+           comparison_product_key,
+           title,
+           quantity,
+           allocation_hash
+         )
+         SELECT
+           allocation.organization_id,
+           $3::uuid,
+           allocation.package_key,
+           allocation.line_key,
+           line.provider_variant_id,
+           line.provider_variant_id,
+           COALESCE(NULLIF(line.sku, ''), line.provider_variant_id),
+           allocation.quantity,
+           allocation.allocation_hash
+         FROM operations_shopify_checkout_rate_receipt_allocations allocation
+         JOIN operations_shopify_checkout_rate_receipt_lines line
+           ON line.organization_id = allocation.organization_id
+          AND line.receipt_id = allocation.receipt_id
+          AND line.line_key = allocation.line_key
+         WHERE allocation.organization_id = $1::uuid
+           AND allocation.receipt_id = $2::uuid`,
+        [organizationId, current.receiptId, checkoutRun.id],
+      )
+      await client.query(
+        `INSERT INTO operations_pack_rate_run_rate_choices (
+           organization_id,
+           run_id,
+           provider,
+           service_code,
+           service_name,
+           carrier_cost_minor,
+           currency,
+           selected,
+           recorded_fact_version,
+           normalized_response
+         )
+         SELECT
+           offer.organization_id,
+           $3::uuid,
+           offer.carrier_provider,
+           offer.service_code,
+           offer.service_name,
+           offer.carrier_cost_minor,
+           offer.currency,
+           (
+             offer.carrier_provider = $4
+             AND offer.service_code = $5
+           ),
+           'shopify-checkout-receipt-v1',
+           offer.offer_snapshot
+           || jsonb_build_object(
+             'packagePlanHash', offer.package_plan_hash,
+             'packageCount', offer.package_count
+           )
+         FROM operations_shopify_checkout_rate_receipt_offers offer
+         WHERE offer.organization_id = $1::uuid
+           AND offer.receipt_id = $2::uuid`,
+        [
+          organizationId,
+          current.receiptId,
+          checkoutRun.id,
+          current.checkoutProvider,
+          current.checkoutServiceCode,
+        ],
+      )
+
+      const fulfillmentInputSnapshot = {
+        checkoutCarrierDestinationFingerprint:
+          current.receiptCarrierDestinationFingerprint,
+        carrierDestinationFingerprint:
+          current.fulfillmentCarrierDestinationFingerprint,
+        configuredCarriers: current.carriers.map((carrier) => ({
+          provider: carrier.provider,
+          carrierAccountId: carrier.carrierAccountId,
+          carrierAccountGlobalId: carrier.carrierAccountGlobalId,
+        })),
+        orderGlobalId,
+        planGlobalId: current.planGlobalId,
+        packagePlanHash: current.packagePlanHash,
+        packages: current.packages.map((item) => ({
+          packageKey: item.packageKey,
+          packageSequence: item.packageSequence,
+          lengthMm: item.lengthMm,
+          widthMm: item.widthMm,
+          heightMm: item.heightMm,
+          grossWeightGrams: item.grossWeightGrams,
+        })),
+      }
+      const fulfillmentResultSnapshot = {
+        rateScope: rated.rateScope,
+        packageCount: rated.packageCount,
+        packagePlanHash: current.packagePlanHash,
+        selectedProvider: selected.carrierProvider,
+        selectedServiceCode: selected.serviceCode,
+        selectedServiceName: selected.serviceName,
+        selectedCarrierCostMinor: selected.carrierCostMinor,
+        currency: selected.currency,
+        providerAttempts: rated.providerAttempts,
+        policy: selected.policy,
+      }
+      const fulfillmentStageSnapshot = {
+        stage: 'pre_label_fulfillment_rerate',
+        authorityMode: 'shadow',
+        checkoutReceiptGlobalId: current.receiptGlobalId,
+        checkoutReconciliationGlobalId: current.reconciliationGlobalId,
+        providerWriteCount: 0,
+        postagePurchaseCount: 0,
+        labelWriteCount: 0,
+        commerceWriteCount: 0,
+      }
+      const fulfillmentRunResult = await client.query<{
+        id: string
+        global_id: string
+      }>(
+        `INSERT INTO operations_pack_rate_runs (
+           organization_id,
+           replay_group_key,
+           scenario_id,
+           source_kind,
+           source_reference,
+           provider,
+           checkout_source,
+           purpose,
+           prior_checkout_run_id,
+           pipeline_id,
+           customer_id,
+           customer_resolution_outcome,
+           status,
+           blocker_code,
+           policy_version,
+           algorithm_version,
+           input_hash,
+           result_hash,
+           input_snapshot,
+           result_snapshot,
+           stage_snapshot,
+           line_count,
+           package_count,
+           rate_choice_count,
+           currency,
+           selected_provider,
+           selected_service_code,
+           selected_service_name,
+           selected_carrier_cost_minor,
+           customer_charge_minor,
+           mud_markup_minor,
+           margin_minor,
+           idempotency_key,
+           actor_email,
+           provider_write_count,
+           postage_purchase_count,
+           label_write_count,
+           expires_at,
+           pricing_semantics_version
+         ) VALUES (
+           $1::uuid, $2, $3, 'provider_checkout', $4, 'shopify',
+           'live_callback_recorded', 'fulfillment_execution',
+           $5::uuid, $6::uuid, $7::uuid, 'reused', 'succeeded',
+           NULL, $8, $9, $10, $11, $12::jsonb, $13::jsonb,
+           $14::jsonb, $15, $16, $17, $18, $19, $20, $21,
+           $22::bigint, $23::bigint, NULL,
+           $23::bigint - $22::bigint, $24, $25, 0, 0, 0, NULL, 2
+         )
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          replayGroupKey,
+          scenarioId,
+          current.receiptGlobalId,
+          checkoutRun.id,
+          current.pipelineId,
+          current.customerId,
+          CANONICAL_FULFILLMENT_RATE_POLICY_VERSION,
+          'shadow-fulfillment-preparation-v1',
+          commandRequestHash(fulfillmentInputSnapshot),
+          commandRequestHash(fulfillmentResultSnapshot),
+          JSON.stringify(fulfillmentInputSnapshot),
+          JSON.stringify(fulfillmentResultSnapshot),
+          JSON.stringify(fulfillmentStageSnapshot),
+          current.lines.length,
+          current.packages.length,
+          rated.offers.length,
+          current.currency,
+          selected.carrierProvider,
+          selected.serviceCode,
+          selected.serviceName,
+          selected.carrierCostMinor,
+          current.checkoutShippingChargeMinor,
+          fulfillmentIdempotencyKey,
+          actorEmail,
+        ],
+      )
+      const fulfillmentRun = fulfillmentRunResult.rows[0]
+
+      for (const line of current.lines) {
+        const lineSnapshot = {
+          lineKey: line.globalId,
+          productKey: line.productGlobalId,
+          providerVariantId: line.providerVariantId,
+          title: line.title,
+          requiredQuantity: line.quantity,
+          unitWeightGrams: line.unitWeightGrams,
+        }
+        await client.query(
+          `INSERT INTO operations_pack_rate_run_lines (
+             organization_id, run_id, line_key, product_key, title,
+             required_quantity, unit_weight_grams, line_hash, line_snapshot
+           ) VALUES (
+             $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9::jsonb
+           )`,
+          [
+            organizationId,
+            fulfillmentRun.id,
+            line.globalId,
+            line.productGlobalId,
+            line.title,
+            line.quantity,
+            line.unitWeightGrams,
+            commandRequestHash(lineSnapshot),
+            JSON.stringify(lineSnapshot),
+          ],
+        )
+      }
+      for (const packageItem of current.packages) {
+        const packageSnapshot = {
+          packageKey: packageItem.packageKey,
+          packageSequence: packageItem.packageSequence,
+          materialCode: packageItem.materialCode,
+          materialName: packageItem.materialName,
+          lengthMm: packageItem.lengthMm,
+          widthMm: packageItem.widthMm,
+          heightMm: packageItem.heightMm,
+          contentWeightGrams: packageItem.contentWeightGrams,
+          tareWeightGrams: packageItem.tareWeightGrams,
+          grossWeightGrams: packageItem.grossWeightGrams,
+        }
+        await client.query(
+          `INSERT INTO operations_pack_rate_run_packages (
+             organization_id, run_id, package_key, package_sequence,
+             material_code, material_name, length_mm, width_mm, height_mm,
+             content_weight_grams, tare_weight_grams, gross_weight_grams,
+             allocation_count, package_hash, package_snapshot
+           ) VALUES (
+             $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9,
+             $10, $11, $12, $13, $14, $15::jsonb
+           )`,
+          [
+            organizationId,
+            fulfillmentRun.id,
+            packageItem.packageKey,
+            packageItem.packageSequence,
+            packageItem.materialCode,
+            packageItem.materialName,
+            packageItem.lengthMm,
+            packageItem.widthMm,
+            packageItem.heightMm,
+            packageItem.contentWeightGrams,
+            packageItem.tareWeightGrams,
+            packageItem.grossWeightGrams,
+            packageItem.allocations.length,
+            commandRequestHash(packageSnapshot),
+            JSON.stringify(packageSnapshot),
+          ],
+        )
+        for (const allocation of packageItem.allocations) {
+          const allocationSnapshot = {
+            packageKey: packageItem.packageKey,
+            lineKey: allocation.lineGlobalId,
+            productKey: allocation.productGlobalId,
+            providerVariantId: allocation.providerVariantId,
+            quantity: allocation.quantity,
+          }
+          await client.query(
+            `INSERT INTO operations_pack_rate_run_allocations (
+               organization_id, run_id, package_key, line_key,
+               product_key, comparison_product_key, title, quantity,
+               allocation_hash
+             ) VALUES (
+               $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9
+             )`,
+            [
+              organizationId,
+              fulfillmentRun.id,
+              packageItem.packageKey,
+              allocation.lineGlobalId,
+              allocation.productGlobalId,
+              allocation.providerVariantId,
+              allocation.title,
+              allocation.quantity,
+              commandRequestHash(allocationSnapshot),
+            ],
+          )
+        }
+      }
+      for (const offer of rated.offers) {
+        const evidence = evidenceByGlobalId.get(offer.evidenceGlobalId)
+        const responseRates = Array.isArray(evidence?.redacted_response.rates)
+          ? evidence.redacted_response.rates.filter((candidate) => {
+              if (
+                !candidate
+                || typeof candidate !== 'object'
+                || Array.isArray(candidate)
+              ) return false
+              const rate = candidate as Record<string, unknown>
+              try {
+                return (
+                  String(rate.serviceCode || '').trim().toLowerCase()
+                    === offer.serviceLevelCode.toLowerCase()
+                  && String(rate.serviceName || '').trim()
+                    === offer.serviceName
+                  && String(rate.currency || '').trim().toUpperCase()
+                    === offer.currency
+                  && carrierDecimalAmountMinor(rate.amount)
+                    === offer.amountMinor
+                )
+              } catch {
+                return false
+              }
+            })
+          : []
+        if (responseRates.length !== 1) {
+          throw new OperationsRequestError(
+            'OPERATIONS_CARRIER_RATE_EVIDENCE_MISMATCH',
+            'Every fulfillment offer must match exactly one durable normalized carrier rate',
+            409,
+          )
+        }
+        const normalizedResponse = {
+          ...responseRates[0] as Record<string, unknown>,
+          packagePlanHash: current.packagePlanHash,
+          packageCount: current.packages.length,
+        }
+        await client.query(
+          `INSERT INTO operations_pack_rate_run_rate_choices (
+             organization_id, run_id, provider, service_code,
+             service_name, carrier_cost_minor, currency, selected,
+             recorded_fact_version, normalized_response
+           ) VALUES (
+             $1::uuid, $2::uuid, $3, $4, $5, $6::bigint, $7, $8,
+             'sandbox-carrier-rate-evidence-v1', $9::jsonb
+           )`,
+          [
+            organizationId,
+            fulfillmentRun.id,
+            offer.provider,
+            offer.serviceLevelCode,
+            offer.serviceName,
+            offer.amountMinor,
+            offer.currency,
+            offer.provider === selected.carrierProvider
+              && offer.serviceLevelCode === selected.serviceCode,
+            JSON.stringify(normalizedResponse),
+          ],
+        )
+      }
+
+      const changeResult = await client.query<{
+        comparison_identity_missing: boolean
+        allocation_changed: boolean
+        material_changed: boolean
+      }>(
+        `SELECT
+           EXISTS (
+             SELECT 1
+             FROM operations_pack_rate_run_allocations allocation
+             WHERE allocation.organization_id = $1::uuid
+               AND allocation.run_id IN ($2::uuid, $3::uuid)
+               AND allocation.comparison_product_key IS NULL
+           ) AS comparison_identity_missing,
+           EXISTS (
+             (
+               SELECT package_key, comparison_product_key,
+                      sum(quantity)::bigint AS quantity
+               FROM operations_pack_rate_run_allocations
+               WHERE organization_id = $1::uuid AND run_id = $2::uuid
+               GROUP BY package_key, comparison_product_key
+               EXCEPT
+               SELECT package_key, comparison_product_key,
+                      sum(quantity)::bigint AS quantity
+               FROM operations_pack_rate_run_allocations
+               WHERE organization_id = $1::uuid AND run_id = $3::uuid
+               GROUP BY package_key, comparison_product_key
+             )
+             UNION ALL
+             (
+               SELECT package_key, comparison_product_key,
+                      sum(quantity)::bigint AS quantity
+               FROM operations_pack_rate_run_allocations
+               WHERE organization_id = $1::uuid AND run_id = $3::uuid
+               GROUP BY package_key, comparison_product_key
+               EXCEPT
+               SELECT package_key, comparison_product_key,
+                      sum(quantity)::bigint AS quantity
+               FROM operations_pack_rate_run_allocations
+               WHERE organization_id = $1::uuid AND run_id = $2::uuid
+               GROUP BY package_key, comparison_product_key
+             )
+           ) AS allocation_changed,
+           EXISTS (
+             (
+               SELECT package_key, material_code, length_mm, width_mm,
+                      height_mm, gross_weight_grams
+               FROM operations_pack_rate_run_packages
+               WHERE organization_id = $1::uuid AND run_id = $2::uuid
+               EXCEPT
+               SELECT package_key, material_code, length_mm, width_mm,
+                      height_mm, gross_weight_grams
+               FROM operations_pack_rate_run_packages
+               WHERE organization_id = $1::uuid AND run_id = $3::uuid
+             )
+             UNION ALL
+             (
+               SELECT package_key, material_code, length_mm, width_mm,
+                      height_mm, gross_weight_grams
+               FROM operations_pack_rate_run_packages
+               WHERE organization_id = $1::uuid AND run_id = $3::uuid
+               EXCEPT
+               SELECT package_key, material_code, length_mm, width_mm,
+                      height_mm, gross_weight_grams
+               FROM operations_pack_rate_run_packages
+               WHERE organization_id = $1::uuid AND run_id = $2::uuid
+             )
+           ) AS material_changed`,
+        [organizationId, checkoutRun.id, fulfillmentRun.id],
+      )
+      if (changeResult.rows[0]?.comparison_identity_missing !== false) {
+        throw new OperationsRequestError(
+          'OPERATIONS_FULFILLMENT_COMPARISON_IDENTITY_REQUIRED',
+          'Checkout and fulfillment allocations require the same provider variant identity before variance can be recorded',
+          409,
+        )
+      }
+      const allocationChanged =
+        changeResult.rows[0]?.allocation_changed === true
+      const materialChanged = changeResult.rows[0]?.material_changed === true
+      const serviceChanged = (
+        current.checkoutProvider !== selected.carrierProvider
+        || current.checkoutServiceCode !== selected.serviceCode
+      )
+      const causes = [
+        ...(allocationChanged ? ['allocation_changed'] : []),
+        ...(materialChanged ? ['material_changed'] : []),
+        ...(serviceChanged ? ['service_changed'] : []),
+        ...(current.checkoutCarrierCostMinor !== selected.carrierCostMinor
+          ? ['recorded_rate_changed']
+          : []),
+      ]
+      const comparisonSnapshot = {
+        checkoutRunGlobalId: checkoutRun.global_id,
+        fulfillmentRunGlobalId: fulfillmentRun.global_id,
+        packageCountDelta:
+          current.packages.length - current.checkoutPackageCount,
+        checkoutCarrierCostMinor: current.checkoutCarrierCostMinor,
+        checkoutCustomerChargeMinor: current.checkoutShippingChargeMinor,
+        fulfillmentCarrierCostMinor: selected.carrierCostMinor,
+        allocationChanged,
+        materialChanged,
+        serviceChanged,
+        causes,
+      }
+      const varianceResult = await client.query<{
+        id: string
+        global_id: string
+      }>(
+        `INSERT INTO operations_pack_rate_variances (
+           organization_id, checkout_run_id, fulfillment_run_id,
+           package_count_delta, checkout_carrier_cost_minor,
+           checkout_customer_charge_minor,
+           fulfillment_carrier_cost_minor, carrier_cost_variance_minor,
+           realized_margin_minor, currency, allocation_changed,
+           material_changed, service_changed, causes, comparison_hash
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, $4, $5::bigint, $6::bigint,
+           $7::bigint, $7::bigint - $5::bigint,
+           $6::bigint - $7::bigint, $8, $9, $10, $11, $12::jsonb, $13
+         )
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          checkoutRun.id,
+          fulfillmentRun.id,
+          current.packages.length - current.checkoutPackageCount,
+          current.checkoutCarrierCostMinor,
+          current.checkoutShippingChargeMinor,
+          selected.carrierCostMinor,
+          current.currency,
+          allocationChanged,
+          materialChanged,
+          serviceChanged,
+          JSON.stringify(causes),
+          commandRequestHash(comparisonSnapshot),
+        ],
+      )
+      const variance = varianceResult.rows[0]
+
+      const executionResult = await client.query<{
+        id: string
+        global_id: string
+      }>(
+        `INSERT INTO operations_fulfillment_executions (
+           organization_id, order_id, plan_id, checkout_pack_rate_run_id,
+           fulfillment_pack_rate_run_id,
+           shopify_checkout_reconciliation_id,
+           shopify_checkout_receipt_id, authority_mode, state,
+           idempotency_key, request_hash, provider_write_count,
+           postage_purchase_count, label_write_count,
+           commerce_write_count, prepared_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+           $6::uuid, $7::uuid, 'shadow', 'shadow_prepared',
+           $8, $9, 0, 0, 0, 0, $10
+         )
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          current.orderId,
+          current.planId,
+          checkoutRun.id,
+          fulfillmentRun.id,
+          current.reconciliationId,
+          current.receiptId,
+          idempotencyKey,
+          requestHash,
+          actorEmail,
+        ],
+      )
+      const execution = executionResult.rows[0]
+      const shipmentGroupResult = await client.query<{
+        id: string
+        global_id: string
+      }>(
+        `INSERT INTO operations_shipment_groups (
+           organization_id, fulfillment_execution_id, order_id, plan_id,
+           warehouse_id, fulfillment_pack_rate_run_id, selected_provider,
+           selected_service_code, selected_service_name,
+           selected_carrier_cost_minor, currency, state
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid,
+           $7, $8, $9, $10::bigint, $11, 'shadow_prepared'
+         )
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          execution.id,
+          current.orderId,
+          current.planId,
+          current.warehouseId,
+          fulfillmentRun.id,
+          selected.carrierProvider,
+          selected.serviceCode,
+          selected.serviceName,
+          selected.carrierCostMinor,
+          current.currency,
+        ],
+      )
+      const shipmentGroup = shipmentGroupResult.rows[0]
+
+      for (const line of current.lines) {
+        await client.query(
+          `INSERT INTO operations_fulfillment_execution_lines (
+             organization_id, execution_id, fulfillment_pack_rate_run_id,
+             order_line_id, line_key, product_key, required_quantity
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7
+           )`,
+          [
+            organizationId,
+            execution.id,
+            fulfillmentRun.id,
+            line.id,
+            line.globalId,
+            line.productGlobalId,
+            line.quantity,
+          ],
+        )
+      }
+      for (const packageItem of current.packages) {
+        await client.query(
+          `INSERT INTO operations_fulfillment_execution_packages (
+             organization_id, execution_id, shipment_group_id,
+             fulfillment_pack_rate_run_id, package_id, package_key
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6
+           )`,
+          [
+            organizationId,
+            execution.id,
+            shipmentGroup.id,
+            fulfillmentRun.id,
+            packageItem.id,
+            packageItem.packageKey,
+          ],
+        )
+      }
+      for (const attempt of rated.providerAttempts) {
+        const evidence = evidenceByGlobalId.get(attempt.rateEvidenceGlobalId)
+        if (!evidence) {
+          throw new OperationsRequestError(
+            'OPERATIONS_CARRIER_RATE_EVIDENCE_REQUIRED',
+            'Carrier rate evidence disappeared before commit',
+            409,
+          )
+        }
+        await client.query(
+          `INSERT INTO operations_fulfillment_execution_rate_attempts (
+             organization_id, execution_id, carrier_provider,
+             fulfillment_pack_rate_run_id, carrier_account_id,
+             carrier_rate_request_id, carrier_rate_purpose,
+             carrier_request_hash, environment, attempt_status,
+             failure_code, selected
+           ) VALUES (
+             $1::uuid, $2::uuid, $3, $4::uuid, $5::uuid, $6::uuid,
+             'cartonization_shipment_rate', $7, 'sandbox', $8, $9, $10
+           )`,
+          [
+            organizationId,
+            execution.id,
+            attempt.provider,
+            fulfillmentRun.id,
+            evidence.carrier_account_id,
+            evidence.id,
+            evidence.request_hash,
+            attempt.status,
+            attempt.failureCode,
+            attempt.provider === selected.carrierProvider,
+          ],
+        )
+      }
+
+      const result: OperationsShadowFulfillmentExecutionResult = {
+        orderGlobalId,
+        orderStatus: 'packed',
+        rowVersion: current.orderRowVersion,
+        fulfillmentExecutionGlobalId: execution.global_id,
+        shipmentGroupGlobalId: shipmentGroup.global_id,
+        checkoutRateReceiptGlobalId: current.receiptGlobalId,
+        checkoutPackRateRunGlobalId: checkoutRun.global_id,
+        fulfillmentPackRateRunGlobalId: fulfillmentRun.global_id,
+        varianceGlobalId: variance.global_id,
+        packageCount: current.packages.length,
+        carrier: selected.carrierName,
+        provider: selected.carrierProvider,
+        serviceCode: selected.serviceCode,
+        serviceName: selected.serviceName,
+        carrierCostMinor: selected.carrierCostMinor,
+        checkoutShippingChargeMinor:
+          current.checkoutShippingChargeMinor,
+        carrierCostVarianceMinor:
+          selected.carrierCostMinor - current.checkoutCarrierCostMinor,
+        estimatedCheckoutVarianceMinor:
+          current.checkoutShippingChargeMinor - selected.carrierCostMinor,
+        currency: current.currency,
+        providerAttempts: rated.providerAttempts,
+        providerWriteCount: 0,
+        postagePurchaseCount: 0,
+        labelWriteCount: 0,
+        commerceWriteCount: 0,
+        replayed: false,
+      }
+      await appendDomainEvent(client, {
+        organizationId,
+        aggregateType: 'operations.fulfillment_execution',
+        aggregateId: execution.id,
+        aggregateGlobalId: execution.global_id,
+        eventType: 'operations.fulfillment_execution.shadow_prepared',
+        actorEmail,
+        correlationId: command.receipt.correlation_id,
+        idempotencyKey:
+          `operations:shadow-fulfillment:${execution.global_id}`,
+        payload: {
+          orderGlobalId,
+          planGlobalId: current.planGlobalId,
+          shipmentGroupGlobalId: shipmentGroup.global_id,
+          checkoutPackRateRunGlobalId: checkoutRun.global_id,
+          fulfillmentPackRateRunGlobalId: fulfillmentRun.global_id,
+          varianceGlobalId: variance.global_id,
+          packageCount: current.packages.length,
+          selectedProvider: selected.carrierProvider,
+          selectedServiceCode: selected.serviceCode,
+          providerWriteCount: 0,
+          postagePurchaseCount: 0,
+          labelWriteCount: 0,
+          commerceWriteCount: 0,
+          reason,
+        },
+      })
+      await recordAuditEvent({
+        actor: actorEmail,
+        eventType: 'operations.fulfillment_execution.shadow_prepared',
+        aggregateType: 'operations.fulfillment_execution',
+        aggregateId: execution.global_id,
+        subject: orderGlobalId,
+        organizationId,
+        eventKey:
+          `operations:shadow-fulfillment:${execution.global_id}`,
+        payload: {
+          orderGlobalId,
+          packageCount: current.packages.length,
+          selectedProvider: selected.carrierProvider,
+          selectedServiceCode: selected.serviceCode,
+          checkoutShippingChargeMinor:
+            current.checkoutShippingChargeMinor,
+          carrierCostMinor: selected.carrierCostMinor,
+          estimatedCheckoutVarianceMinor:
+            current.checkoutShippingChargeMinor - selected.carrierCostMinor,
+          writeCounters: {
+            provider: 0,
+            postage: 0,
+            label: 0,
+            commerce: 0,
+          },
+          reason,
+        },
+      }, client)
+      await completeCommandReceipt(
+        client,
+        command.receipt.id,
+        execution.global_id,
+        result as unknown as Record<string, unknown>,
+      )
+      return result
+    })
+  } catch (error) {
+    await failCommandReceipt(command.receipt.id, error)
+    throw error
   }
 }
 
@@ -5362,6 +8184,61 @@ async function completedOrderCommandResult(
   }
 }
 
+function completedPlanCommandResult(
+  receipt: Pick<CommandReceiptRow, 'result_payload'>,
+): OperationsPlanCommandResult {
+  const payload = receipt.result_payload
+  if (payload
+    && typeof payload.orderGlobalId === 'string'
+    && payload.orderStatus === 'planned'
+    && Number.isSafeInteger(Number(payload.rowVersion))
+    && typeof payload.fulfillmentPlanGlobalId === 'string'
+    && typeof payload.cartonizationEvidenceGlobalId === 'string'
+    && Number.isSafeInteger(Number(payload.packageCount))
+    && typeof payload.carrier === 'string'
+    && typeof payload.serviceCode === 'string'
+    && typeof payload.serviceName === 'string'
+    && Number.isSafeInteger(Number(payload.carrierCostMinor))
+    && typeof payload.currency === 'string'
+    && (
+      payload.checkoutShippingChargeMinor === null
+      || Number.isSafeInteger(Number(payload.checkoutShippingChargeMinor))
+    )
+    && (
+      payload.checkoutVarianceMinor === null
+      || Number.isSafeInteger(Number(payload.checkoutVarianceMinor))
+    )) {
+    return {
+      orderGlobalId: payload.orderGlobalId,
+      orderStatus: 'planned',
+      rowVersion: Number(payload.rowVersion),
+      fulfillmentPlanGlobalId: payload.fulfillmentPlanGlobalId,
+      cartonizationEvidenceGlobalId:
+        payload.cartonizationEvidenceGlobalId,
+      packageCount: Number(payload.packageCount),
+      carrier: payload.carrier,
+      serviceCode: payload.serviceCode,
+      serviceName: payload.serviceName,
+      carrierCostMinor: Number(payload.carrierCostMinor),
+      currency: payload.currency,
+      checkoutShippingChargeMinor:
+        payload.checkoutShippingChargeMinor === null
+          ? null
+          : Number(payload.checkoutShippingChargeMinor),
+      checkoutVarianceMinor:
+        payload.checkoutVarianceMinor === null
+          ? null
+          : Number(payload.checkoutVarianceMinor),
+      replayed: true,
+    }
+  }
+  throw new OperationsRequestError(
+    'OPERATIONS_COMMAND_RECEIPT_INVALID',
+    'Completed fulfillment-planning result is unavailable',
+    409,
+  )
+}
+
 async function completedPackingSlipCommandResult(
   receipt: Pick<CommandReceiptRow, 'result_payload'>,
 ): Promise<OperationsPackingSlipCommandResult> {
@@ -5374,12 +8251,24 @@ async function completedPackingSlipCommandResult(
     && Number.isSafeInteger(Number(payload.packageNumber))
     && typeof payload.packingSlipArtifactGlobalId === 'string'
     && typeof payload.contentUrl === 'string') {
+    const isPackWorkInstruction = (
+      payload.documentKind === 'pack_work_instruction'
+      && payload.documentStage === 'pre_label_pack_work_instruction'
+      && payload.finalPackingSlip === false
+    )
     return {
       orderGlobalId: payload.orderGlobalId,
       orderStatus: 'packed',
       rowVersion: Number(payload.rowVersion),
       packageGlobalId: payload.packageGlobalId,
       packageNumber: Number(payload.packageNumber),
+      documentKind: isPackWorkInstruction
+        ? 'pack_work_instruction'
+        : 'legacy_prelabel_packing_list',
+      documentStage: isPackWorkInstruction
+        ? 'pre_label_pack_work_instruction'
+        : 'legacy_prelabel_packing_list',
+      finalPackingSlip: false,
       packingSlipArtifactGlobalId: payload.packingSlipArtifactGlobalId,
       contentUrl: payload.contentUrl,
       replayed: true,
@@ -5387,7 +8276,7 @@ async function completedPackingSlipCommandResult(
   }
   throw new OperationsRequestError(
     'OPERATIONS_COMMAND_RECEIPT_INVALID',
-    'Completed package packing-list result is unavailable',
+    'Completed Pack Work Instruction result is unavailable',
     409,
   )
 }
@@ -5405,7 +8294,8 @@ async function completedShipmentCommandResult(
     && typeof payload.trackingNumber === 'string'
     && typeof payload.packingSlipArtifactGlobalId === 'string'
     && typeof payload.commerceExportGlobalId === 'string'
-    && ['succeeded', 'unsupported', 'failed'].includes(String(payload.commerceExportState))) {
+    && ['succeeded', 'unsupported', 'failed']
+      .includes(String(payload.commerceExportState))) {
     return {
       orderGlobalId: payload.orderGlobalId,
       orderStatus: 'shipped',
@@ -5415,6 +8305,9 @@ async function completedShipmentCommandResult(
       packingSlipArtifactGlobalId: payload.packingSlipArtifactGlobalId,
       commerceExportGlobalId: payload.commerceExportGlobalId,
       commerceExportState: payload.commerceExportState as OperationsShipmentCommandResult['commerceExportState'],
+      customerNotification: customerNotificationDecision(
+        payload.customerNotification,
+      ),
       replayed: true,
       printJobGlobalId: typeof payload.printJobGlobalId === 'string'
         ? payload.printJobGlobalId
@@ -5441,6 +8334,7 @@ async function completedShipmentCommandResult(
     artifact_global_id: string
     export_global_id: string
     export_state: string
+    export_payload_snapshot: Record<string, unknown>
     print_job_global_id: string | null
   }>(
     `SELECT source_order.global_id AS order_global_id,
@@ -5451,6 +8345,7 @@ async function completedShipmentCommandResult(
             artifact.global_id AS artifact_global_id,
             fulfillment_export.global_id AS export_global_id,
             fulfillment_export.state AS export_state,
+            fulfillment_export.payload_snapshot AS export_payload_snapshot,
             print_job.global_id AS print_job_global_id
      FROM operations_orders source_order
      JOIN LATERAL (
@@ -5489,7 +8384,8 @@ async function completedShipmentCommandResult(
       409,
     )
   }
-  const exportState = ['succeeded', 'unsupported', 'failed'].includes(row.export_state)
+  const exportState = ['succeeded', 'unsupported', 'failed']
+    .includes(row.export_state)
     ? row.export_state as OperationsShipmentCommandResult['commerceExportState']
     : 'failed'
   return {
@@ -5501,6 +8397,9 @@ async function completedShipmentCommandResult(
     packingSlipArtifactGlobalId: row.artifact_global_id,
     commerceExportGlobalId: row.export_global_id,
     commerceExportState: exportState,
+    customerNotification: customerNotificationDecision(
+      json(row.export_payload_snapshot).customerNotification,
+    ),
     replayed: true,
     printJobGlobalId: row.print_job_global_id,
     printWarning: exportState === 'failed' && row.export_state !== 'failed'
@@ -5526,7 +8425,7 @@ function canonicalProofLines(proof: MockOperationsProofInput): MockOperationsPro
   const seen = new Set<string>()
   return suppliedLines.map((line) => {
     const productGlobalId = String(line.productGlobalId || '').trim()
-    if (!/^gp\d{7}$/.test(productGlobalId)) {
+    if (!/^gp(?:[0-9]{7}|[0-9a-v]{12})$/.test(productGlobalId)) {
       throw new OperationsRequestError('OPERATIONS_PRODUCT_NOT_FOUND', 'Select an active CRM product from the active workspace', 404)
     }
     if (seen.has(productGlobalId)) {
@@ -6148,7 +9047,7 @@ export async function runMockOperationsProofFromPostgres(input: {
     if (plannedPackages.length !== 1) {
       throw new OperationsRequestError(
         'OPERATIONS_MULTI_PACKAGE_EXECUTION_UNSUPPORTED',
-        'The optimizer produced multiple physical packages, but this proof command can execute labels and shipment confirmation only for one package. No proof records were committed; use planned mode to retain the carton plan and print its package-specific packing lists.',
+        'The optimizer produced multiple physical packages, but this proof command can execute labels and shipment confirmation only for one package. No proof records were committed; use planned mode to retain the carton plan and print its package-specific Pack Work Instructions.',
         409,
       )
     }
@@ -6613,6 +9512,1399 @@ export async function runMockOperationsProofFromPostgres(input: {
   }
 }
 
+export async function planOperationsOrderFromPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  orderGlobalId: string
+  cartonizationEvidenceGlobalId: string
+  expectedRowVersion: number
+  reason: string
+  idempotencyKey: string
+}): Promise<OperationsPlanCommandResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
+  const orderGlobalId = String(input.orderGlobalId || '').trim()
+  const evidenceGlobalId = String(
+    input.cartonizationEvidenceGlobalId || '',
+  ).trim()
+  const reason = String(input.reason || '').trim()
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  if (!actorEmail) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ACTOR_REQUIRED',
+      'A signed-in user is required',
+      401,
+    )
+  }
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_INVALID',
+      'Order is invalid',
+    )
+  }
+  if (!/^gcte(?:[0-9]{7}|[0-9a-v]{12})$/.test(evidenceGlobalId)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_CARTONIZATION_EVIDENCE_INVALID',
+      'Cartonization evidence is invalid',
+    )
+  }
+  if (
+    !Number.isSafeInteger(input.expectedRowVersion)
+    || input.expectedRowVersion < 0
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_VERSION_INVALID',
+      'Order version is invalid',
+    )
+  }
+  if (!reason || reason.length > 500) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PLANNING_REASON_INVALID',
+      'A planning reason is required',
+    )
+  }
+  if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_IDEMPOTENCY_KEY_INVALID',
+      'A valid idempotency key is required',
+    )
+  }
+
+  const evidence = await readCartonizationRateEvidenceByGlobalId({
+    organizationId,
+    evidenceGlobalId,
+  })
+  if (!evidence) {
+    throw new OperationsRequestError(
+      'OPERATIONS_CARTONIZATION_EVIDENCE_NOT_FOUND',
+      'Sealed cartonization evidence was not found',
+      404,
+    )
+  }
+  if (
+    evidence.evidenceMode !== 'operational'
+    || evidence.status === 'failed'
+    || evidence.packages.length < 1
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_CARTONIZATION_EVIDENCE_NOT_OPERATIONAL',
+      'Only successful sealed operational cartonization evidence can become warehouse work',
+      409,
+    )
+  }
+
+  const command = await prepareCommandReceipt({
+    organizationId,
+    commandType: 'plan_operations_order',
+    idempotencyKey,
+    requestHash: commandRequestHash({
+      orderGlobalId,
+      cartonizationEvidenceGlobalId: evidenceGlobalId,
+      expectedRowVersion: input.expectedRowVersion,
+      reason,
+    }),
+    actorEmail,
+  })
+  if (command.completed) {
+    return completedPlanCommandResult(command.receipt)
+  }
+
+  try {
+    return await withTransaction(async (client) => {
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:activation:${organizationId}`,
+      )
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:order:${organizationId}:${orderGlobalId}`,
+      )
+      const activation = await resolveActivation(client, organizationId)
+      if (!['shadow', 'active'].includes(activation.state)) {
+        throw new OperationsRequestError(
+          'OPERATIONS_EXECUTION_STATE_INVALID',
+          'Set Operations to Shadow or Active before planning warehouse work',
+          409,
+        )
+      }
+
+      type PlanningOrderRow = OrderIdentityRow & {
+        pipeline_id: string
+        customer_id: string
+        integration_account_id: string
+        source_provider: string
+        currency: string
+        requested_delivery_at: Date | null
+        source_payload: Record<string, unknown>
+        candidate_id: string
+        candidate_global_id: string
+        candidate_workflow_state: string
+        candidate_source_hash: string
+        evidence_id: string
+        evidence_candidate_source_hash: string
+        evidence_mode: string
+        evidence_status: string
+        evidence_sealed_at: Date | null
+        evidence_plan_snapshot: Record<string, unknown>
+        evidence_inventory_sync_run_id: string | null
+        warehouse_id: string
+        warehouse_global_id: string
+        warehouse_status: string
+      }
+      const orderResult = await client.query<PlanningOrderRow>(
+        `SELECT
+           orders.id::text,
+           orders.global_id,
+           orders.status,
+           orders.row_version::text,
+           orders.pipeline_id::text,
+           orders.customer_id::text,
+           orders.integration_account_id::text,
+           orders.source_provider,
+           orders.currency,
+           orders.requested_delivery_at,
+           orders.source_payload,
+           candidate.id::text AS candidate_id,
+           candidate.global_id AS candidate_global_id,
+           candidate.workflow_state AS candidate_workflow_state,
+           candidate.source_hash AS candidate_source_hash,
+           evidence.id::text AS evidence_id,
+           evidence.candidate_source_hash
+             AS evidence_candidate_source_hash,
+           evidence.evidence_mode,
+           evidence.status AS evidence_status,
+           evidence.sealed_at AS evidence_sealed_at,
+           evidence.plan_snapshot AS evidence_plan_snapshot,
+           evidence.inventory_sync_run_id::text
+             AS evidence_inventory_sync_run_id,
+           warehouse.id::text AS warehouse_id,
+           warehouse.global_id AS warehouse_global_id,
+           warehouse.status AS warehouse_status
+         FROM operations_orders orders
+         JOIN operations_commerce_order_candidates candidate
+           ON candidate.organization_id = orders.organization_id
+          AND candidate.integration_account_id =
+                orders.integration_account_id
+          AND candidate.canonical_order_id = orders.id
+         JOIN operations_cartonization_rate_evidence evidence
+           ON evidence.organization_id = candidate.organization_id
+          AND evidence.integration_account_id =
+                candidate.integration_account_id
+          AND evidence.order_candidate_id = candidate.id
+          AND evidence.global_id = $3
+         JOIN operations_warehouses warehouse
+           ON warehouse.organization_id = evidence.organization_id
+          AND warehouse.id = evidence.warehouse_id
+         WHERE orders.organization_id = $1::uuid
+           AND orders.global_id = $2
+         FOR UPDATE OF orders, candidate, evidence, warehouse`,
+        [organizationId, orderGlobalId, evidenceGlobalId],
+      )
+      const order = orderResult.rows[0]
+      if (!order || order.row_version === undefined) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_EVIDENCE_MISMATCH',
+          'The order and cartonization evidence do not share one promoted commerce candidate',
+          409,
+        )
+      }
+      if (Number(order.row_version) !== input.expectedRowVersion) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_VERSION_CONFLICT',
+          'This order changed after it was opened. Refresh it before planning warehouse work.',
+          409,
+        )
+      }
+      if (order.status !== 'imported') {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_TRANSITION_INVALID',
+          `Order cannot be planned from ${order.status}`,
+          409,
+        )
+      }
+      if (
+        order.candidate_workflow_state !== 'promoted'
+        || order.candidate_global_id !== evidence.candidateGlobalId
+        || order.candidate_source_hash !== evidence.candidateSourceHash
+        || order.evidence_candidate_source_hash
+          !== evidence.candidateSourceHash
+        || order.evidence_mode !== 'operational'
+        || order.evidence_status === 'failed'
+        || !order.evidence_sealed_at
+        || order.warehouse_status !== 'active'
+        || order.warehouse_global_id !== evidence.warehouse.globalId
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_CARTONIZATION_EVIDENCE_STALE',
+          'Cartonization evidence is no longer the sealed operational version for this order and warehouse',
+          409,
+        )
+      }
+      const carrierReadEnvironment = String(
+        order.evidence_plan_snapshot?.carrierReadEnvironment || '',
+      ).trim().toLowerCase()
+      if (!['sandbox', 'production'].includes(carrierReadEnvironment)) {
+        throw new OperationsRequestError(
+          'OPERATIONS_CARTONIZATION_RATE_ENVIRONMENT_INVALID',
+          'Cartonization evidence does not identify a supported carrier-read environment',
+          409,
+        )
+      }
+      if (
+        activation.state === 'active'
+        && carrierReadEnvironment !== 'production'
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION',
+          'Active warehouse planning requires production carrier-read evidence. Use Shadow for sandbox carrier estimates.',
+          409,
+        )
+      }
+
+      const existingPlan = await client.query<{ global_id: string }>(
+        `SELECT global_id
+         FROM operations_fulfillment_plans
+         WHERE organization_id = $1::uuid
+           AND (
+             order_id = $2::uuid
+             OR cartonization_evidence_id = $3::uuid
+           )
+         LIMIT 1
+         FOR UPDATE`,
+        [organizationId, order.id, order.evidence_id],
+      )
+      if (existingPlan.rows[0]) {
+        throw new OperationsRequestError(
+          'OPERATIONS_FULFILLMENT_PLAN_EXISTS',
+          `Order already has fulfillment plan ${existingPlan.rows[0].global_id}`,
+          409,
+        )
+      }
+
+      type PlanningPackagingMaterialRow = {
+        package_key: string
+        material_id: string
+        material_global_id: string
+      }
+      const lockedPackagingMaterials =
+        await client.query<PlanningPackagingMaterialRow>(
+        `SELECT
+           package.package_key,
+           material.id::text AS material_id,
+           material.global_id AS material_global_id
+         FROM operations_cartonization_rate_evidence_packages package
+         JOIN operations_packaging_materials material
+           ON material.organization_id = package.organization_id
+          AND material.id = package.packaging_material_id
+         WHERE package.organization_id = $1::uuid
+           AND package.evidence_id = $2::uuid
+         ORDER BY material.id
+         FOR UPDATE OF material`,
+        [organizationId, order.evidence_id],
+      )
+      if (
+        lockedPackagingMaterials.rows.length !== evidence.packages.length
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_CARTONIZATION_PACKAGING_STALE',
+          'Sealed packaging-material evidence is incomplete. Re-run the plan.',
+          409,
+        )
+      }
+      const evidencePackageByKey = new Map(
+        evidence.packages.map((packageEvidence) => [
+          packageEvidence.packageKey,
+          packageEvidence,
+        ]),
+      )
+      const requiredPackagingByMaterialId = new Map<string, {
+        materialGlobalId: string
+        quantity: number
+      }>()
+      for (const lockedMaterial of lockedPackagingMaterials.rows) {
+        const packageEvidence = evidencePackageByKey.get(
+          lockedMaterial.package_key,
+        )
+        if (
+          !packageEvidence
+          || packageEvidence.packagingMaterialGlobalId
+            !== lockedMaterial.material_global_id
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_CARTONIZATION_PACKAGING_STALE',
+            'A sealed package no longer references the reviewed packaging material',
+            409,
+          )
+        }
+        const current = requiredPackagingByMaterialId.get(
+          lockedMaterial.material_id,
+        )
+        requiredPackagingByMaterialId.set(lockedMaterial.material_id, {
+          materialGlobalId: lockedMaterial.material_global_id,
+          quantity: (current?.quantity || 0) + 1,
+        })
+      }
+      await client.query(
+        `SELECT recipe.id
+         FROM operations_cartonization_rate_evidence_packages package
+         JOIN operations_approved_pack_recipes recipe
+           ON recipe.organization_id = package.organization_id
+          AND recipe.id = package.approved_pack_recipe_id
+         WHERE package.organization_id = $1::uuid
+           AND package.evidence_id = $2::uuid
+         ORDER BY recipe.id
+         FOR UPDATE OF recipe`,
+        [organizationId, order.evidence_id],
+      )
+      const stalePackaging = await client.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+         FROM operations_cartonization_rate_evidence_packages package
+         JOIN operations_packaging_materials material
+           ON material.organization_id = package.organization_id
+          AND material.id = package.packaging_material_id
+         LEFT JOIN operations_approved_pack_recipes recipe
+           ON recipe.organization_id = package.organization_id
+          AND recipe.id = package.approved_pack_recipe_id
+         WHERE package.organization_id = $1::uuid
+           AND package.evidence_id = $2::uuid
+           AND (
+             material.row_version <> package.material_row_version
+             OR material.status <> 'active'
+             OR (
+               package.approved_pack_recipe_id IS NOT NULL
+               AND (
+                 recipe.id IS NULL
+                 OR recipe.row_version <> package.recipe_row_version
+                 OR recipe.is_current IS DISTINCT FROM true
+                 OR recipe.lifecycle_state NOT IN (
+                   'customer_confirmed', 'active'
+                 )
+               )
+             )
+           )`,
+        [organizationId, order.evidence_id],
+      )
+      if (Number(stalePackaging.rows[0]?.count || 0) > 0) {
+        throw new OperationsRequestError(
+          'OPERATIONS_CARTONIZATION_PACKAGING_STALE',
+          'A packaging material or approved pack recipe changed after cartonization. Re-run the plan.',
+          409,
+        )
+      }
+
+      type PlanningPackagingStockRow = {
+        id: string
+        packaging_material_id: string
+        is_available: boolean
+        on_hand_quantity: number | null
+        row_version: string
+      }
+      const packagingMaterialIds = [
+        ...requiredPackagingByMaterialId.keys(),
+      ]
+      const lockedPackagingStock =
+        await client.query<PlanningPackagingStockRow>(
+          `SELECT
+             stock.id::text,
+             stock.packaging_material_id::text,
+             stock.is_available,
+             stock.on_hand_quantity,
+             stock.row_version::text
+           FROM operations_packaging_material_stock stock
+           WHERE stock.organization_id = $1::uuid
+             AND stock.warehouse_id = $2::uuid
+             AND stock.packaging_material_id = ANY($3::uuid[])
+           ORDER BY stock.id
+           FOR UPDATE OF stock`,
+          [
+            organizationId,
+            order.warehouse_id,
+            packagingMaterialIds,
+          ],
+        )
+      const stockByMaterialId = new Map(
+        lockedPackagingStock.rows.map((stock) => [
+          stock.packaging_material_id,
+          stock,
+        ]),
+      )
+      if (stockByMaterialId.size !== requiredPackagingByMaterialId.size) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PACKAGING_MATERIAL_STOCK_REQUIRED',
+          'Every selected packaging material requires warehouse-specific stock before planning',
+          409,
+        )
+      }
+      type ActivePackagingClaimRow = {
+        id: string
+        packaging_material_id: string
+        quantity: number
+      }
+      const activePackagingClaims =
+        await client.query<ActivePackagingClaimRow>(
+          `SELECT
+             claim.id::text,
+             claim.packaging_material_id::text,
+             claim.quantity
+           FROM operations_packaging_material_claims claim
+           WHERE claim.organization_id = $1::uuid
+             AND claim.warehouse_id = $2::uuid
+             AND claim.packaging_material_id = ANY($3::uuid[])
+             AND claim.status = 'active'
+           ORDER BY claim.id
+           FOR UPDATE OF claim`,
+          [
+            organizationId,
+            order.warehouse_id,
+            packagingMaterialIds,
+          ],
+        )
+      const activeClaimedByMaterialId = new Map<string, number>()
+      for (const claim of activePackagingClaims.rows) {
+        activeClaimedByMaterialId.set(
+          claim.packaging_material_id,
+          (
+            activeClaimedByMaterialId.get(claim.packaging_material_id)
+            || 0
+          ) + Number(claim.quantity),
+        )
+      }
+      const packagingClaimInputs = packagingMaterialIds.map((materialId) => {
+        const requirement = requiredPackagingByMaterialId.get(materialId)
+        const stock = stockByMaterialId.get(materialId)
+        if (!requirement || !stock) {
+          throw new Error('OPERATIONS_PACKAGING_CLAIM_INPUT_MISSING')
+        }
+        const activeClaimed = (
+          activeClaimedByMaterialId.get(materialId) || 0
+        )
+        if (
+          stock.is_available !== true
+          || stock.on_hand_quantity === null
+          || stock.on_hand_quantity - activeClaimed
+            < requirement.quantity
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_PACKAGING_MATERIAL_STOCK_EXHAUSTED',
+            `${requirement.materialGlobalId} does not have enough unclaimed warehouse stock for ${requirement.quantity} package(s)`,
+            409,
+          )
+        }
+        return {
+          materialId,
+          materialGlobalId: requirement.materialGlobalId,
+          quantity: requirement.quantity,
+          stockId: stock.id,
+          stockRowVersion: Number(stock.row_version),
+          onHandQuantity: stock.on_hand_quantity,
+        }
+      })
+
+      await client.query(
+        `SELECT recipe.id, profile_version.id
+         FROM
+           operations_cartonization_rate_evidence_package_recipes edge
+         JOIN operations_approved_pack_recipes recipe
+           ON recipe.organization_id = edge.organization_id
+          AND recipe.id = edge.approved_pack_recipe_id
+         JOIN operations_product_pack_profile_versions profile_version
+           ON profile_version.organization_id = edge.organization_id
+          AND profile_version.id = edge.input_pack_profile_version_id
+         WHERE edge.organization_id = $1::uuid
+           AND edge.evidence_id = $2::uuid
+         ORDER BY recipe.id, profile_version.id
+         FOR UPDATE OF recipe, profile_version`,
+        [organizationId, order.evidence_id],
+      )
+      const staleRecipeInputs = await client.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+         FROM
+           operations_cartonization_rate_evidence_package_recipes edge
+         JOIN operations_approved_pack_recipes recipe
+           ON recipe.organization_id = edge.organization_id
+          AND recipe.id = edge.approved_pack_recipe_id
+         JOIN operations_product_pack_profile_versions profile_version
+           ON profile_version.organization_id = edge.organization_id
+          AND profile_version.id = edge.input_pack_profile_version_id
+         WHERE edge.organization_id = $1::uuid
+           AND edge.evidence_id = $2::uuid
+           AND (
+             recipe.row_version <> edge.recipe_row_version
+             OR recipe.is_current IS DISTINCT FROM true
+             OR recipe.lifecycle_state NOT IN (
+               'customer_confirmed', 'active'
+             )
+             OR profile_version.row_version
+                  <> edge.input_profile_version_row_version
+             OR profile_version.is_current IS DISTINCT FROM true
+             OR profile_version.lifecycle_state NOT IN (
+               'customer_confirmed', 'active'
+             )
+           )`,
+        [organizationId, order.evidence_id],
+      )
+      if (Number(staleRecipeInputs.rows[0]?.count || 0) > 0) {
+        throw new OperationsRequestError(
+          'OPERATIONS_CARTONIZATION_PACK_PROFILE_STALE',
+          'A product pack profile changed after cartonization. Re-run the plan.',
+          409,
+        )
+      }
+
+      if (evidence.inventorySyncRunGlobalId) {
+        const latestInventory = await client.query<{
+          id: string
+          global_id: string
+        }>(
+          `SELECT id::text, global_id
+           FROM operations_commerce_inventory_sync_runs
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+             AND warehouse_id = $3::uuid
+             AND status = 'succeeded'
+           ORDER BY completed_at DESC, id DESC
+           LIMIT 1`,
+          [
+            organizationId,
+            order.integration_account_id,
+            order.warehouse_id,
+          ],
+        )
+        if (
+          latestInventory.rows[0]?.global_id
+            !== evidence.inventorySyncRunGlobalId
+          || latestInventory.rows[0]?.id
+            !== order.evidence_inventory_sync_run_id
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_CARTONIZATION_INVENTORY_STALE',
+            'Provider inventory changed after cartonization. Refresh inventory and re-run the plan.',
+            409,
+          )
+        }
+      } else if (order.source_provider === 'shopify') {
+        throw new OperationsRequestError(
+          'OPERATIONS_CARTONIZATION_INVENTORY_REQUIRED',
+          'Shopify orders require exact successful inventory-sync evidence before planning',
+          409,
+        )
+      }
+
+      type PlanningLineRow = {
+        id: string
+        global_id: string
+        product_id: string
+        product_global_id: string
+        quantity: string
+        candidate_line_global_id: string
+      }
+      const lineResult = await client.query<PlanningLineRow>(
+        `SELECT
+           line.id::text,
+           line.global_id,
+           line.product_id::text,
+           product.reference_code AS product_global_id,
+           line.quantity::text,
+           candidate_line.global_id AS candidate_line_global_id
+         FROM operations_order_lines line
+         JOIN crm_products product
+           ON product.pipeline_id = line.pipeline_id
+          AND product.id = line.product_id
+         JOIN operations_commerce_order_candidate_lines candidate_line
+           ON candidate_line.organization_id = line.organization_id
+          AND candidate_line.order_candidate_id = $3::uuid
+          AND candidate_line.canonical_order_line_id = line.id
+          AND candidate_line.workflow_state = 'promoted'
+         WHERE line.organization_id = $1::uuid
+           AND line.order_id = $2::uuid
+         ORDER BY line.global_id
+         FOR UPDATE OF line, candidate_line`,
+        [organizationId, order.id, order.candidate_id],
+      )
+      if (!lineResult.rows.length) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_LINES_INVALID',
+          'The promoted order has no canonical fulfillment lines',
+          409,
+        )
+      }
+
+      const lineByCandidateGlobalId = new Map(
+        lineResult.rows.map((line) => [
+          line.candidate_line_global_id,
+          line,
+        ]),
+      )
+      const quantityByLineId = new Map<string, number>()
+      for (const packageEvidence of evidence.packages) {
+        const packageLineIds = new Set<string>()
+        for (const allocation of packageEvidence.allocations) {
+          const line = lineByCandidateGlobalId.get(
+            allocation.lineGlobalId,
+          )
+          if (
+            !line
+            || line.product_global_id !== allocation.productGlobalId
+          ) {
+            throw new OperationsRequestError(
+              'OPERATIONS_PACKAGE_CONTENTS_INVALID',
+              'Sealed package allocations do not match the promoted order lines',
+              409,
+            )
+          }
+          if (packageLineIds.has(line.id)) {
+            throw new OperationsRequestError(
+              'OPERATIONS_PACKAGE_CONTENTS_DUPLICATE',
+              `Sealed package ${packageEvidence.packageKey} repeats canonical order line ${line.global_id}`,
+              409,
+            )
+          }
+          packageLineIds.add(line.id)
+          const quantity = assertPositiveQuantity(allocation.quantity)
+          if (!Number.isSafeInteger(quantity)) {
+            throw new OperationsRequestError(
+              'OPERATIONS_PACKAGE_CONTENTS_INVALID',
+              'Sealed package allocations must use exact whole units',
+              409,
+            )
+          }
+          quantityByLineId.set(
+            line.id,
+            (quantityByLineId.get(line.id) || 0) + quantity,
+          )
+        }
+      }
+      for (const line of lineResult.rows) {
+        if (
+          !Number.isSafeInteger(Number(line.quantity))
+          || quantityByLineId.get(line.id) !== Number(line.quantity)
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_PACKAGE_CONTENTS_INCOMPLETE',
+            'Every canonical order-line quantity must be assigned to exactly one or more sealed packages',
+            409,
+          )
+        }
+      }
+
+      let rateSelection
+      const offers = canonicalRateOffers(evidence)
+      try {
+        rateSelection = selectCanonicalFulfillmentRate({
+          packagePlanHash: evidence.planResultHash,
+          packageCount: evidence.packages.length,
+          packageKeys: evidence.packages.map(
+            (packageEvidence) => packageEvidence.packageKey,
+          ),
+          expectedCurrency: order.currency,
+          requestedDeliveryAt:
+            order.requested_delivery_at?.toISOString() || null,
+          actualCheckoutShippingChargeMinor:
+            authorizedCheckoutShippingChargeMinor(
+              order.source_payload,
+            ),
+          offers,
+        })
+      } catch (error) {
+        if (error instanceof CanonicalFulfillmentPlanningError) {
+          throw new OperationsRequestError(
+            `OPERATIONS_${error.code}`,
+            error.message,
+            409,
+          )
+        }
+        throw error
+      }
+
+      type PlanningPositionRow = PositionRow & {
+        inventory_level_id: string | null
+        inventory_level_global_id: string | null
+        provider_committed_quantity: string | null
+        available_whole_units: string | null
+      }
+      type PlannedInventoryAllocation = {
+        reservation: IdRow
+        position: PlanningPositionRow
+        quantity: number
+      }
+      const inventoryAllocationsByLineId = new Map<
+        string,
+        PlannedInventoryAllocation[]
+      >()
+      for (const line of lineResult.rows) {
+        const quantity = Number(line.quantity)
+        let positionRows: PlanningPositionRow[]
+        let positionAllocations: Array<{
+          position: PlanningPositionRow
+          quantity: number
+        }>
+        if (order.evidence_inventory_sync_run_id) {
+          const positionResult =
+            await client.query<PlanningPositionRow>(
+              `SELECT
+                 position.id::text,
+                 position.global_id,
+                 position.warehouse_id::text,
+                 warehouse.global_id AS warehouse_global_id,
+                 warehouse.name AS warehouse_name,
+                 position.location_id::text,
+                 position.on_hand_quantity::text,
+                 position.reserved_quantity::text,
+                 position.source_authority,
+                 level.id::text AS inventory_level_id,
+                 level.global_id AS inventory_level_global_id,
+                 level.provider_committed_quantity::text
+                   AS provider_committed_quantity,
+                 NULL::text AS available_whole_units
+               FROM operations_commerce_inventory_levels level
+               JOIN operations_inventory_positions position
+                 ON position.organization_id = level.organization_id
+                AND position.id = level.inventory_position_id
+               JOIN operations_warehouses warehouse
+                 ON warehouse.organization_id = position.organization_id
+                AND warehouse.id = position.warehouse_id
+               JOIN operations_locations location
+                 ON location.organization_id = position.organization_id
+                AND location.id = position.location_id
+               JOIN operations_inventory_pools pool
+                 ON pool.organization_id = position.organization_id
+                AND pool.id = position.pool_id
+               WHERE level.organization_id = $1::uuid
+                 AND level.sync_run_id = $2::uuid
+                 AND level.product_id = $3::uuid
+                 AND level.warehouse_id = $4::uuid
+                 AND level.pipeline_id = $5::uuid
+                 AND level.location_id = position.location_id
+                 AND level.inventory_pool_id = position.pool_id
+                 AND level.mapping_state = 'mapped'
+                 AND level.projection_state = 'projected'
+                 AND level.tracked = true
+                 AND level.equation_matches = true
+                 AND position.pipeline_id = $5::uuid
+                 AND position.source_authority = 'shopify'
+                 AND location.active = true
+                 AND pool.active = true
+                 AND (
+                   pool.pool_type = 'shared'
+                   OR pool.owner_customer_id = $6::uuid
+                   OR EXISTS (
+                     SELECT 1
+                     FROM operations_inventory_pool_customers eligible
+                     WHERE eligible.organization_id =
+                             pool.organization_id
+                       AND eligible.pool_id = pool.id
+                       AND eligible.customer_id = $6::uuid
+                       AND eligible.effective_from <= now()
+                       AND (
+                         eligible.effective_to IS NULL
+                         OR eligible.effective_to > now()
+                       )
+                   )
+                 )
+               ORDER BY level.id
+               FOR UPDATE OF position, location, pool`,
+              [
+                organizationId,
+                order.evidence_inventory_sync_run_id,
+                line.product_id,
+                order.warehouse_id,
+                order.pipeline_id,
+                order.customer_id,
+              ],
+            )
+          positionRows = positionResult.rows
+          if (
+            positionRows.length !== 1
+            || !positionRows[0].inventory_level_id
+          ) {
+            throw new OperationsRequestError(
+              'OPERATIONS_PROVIDER_INVENTORY_AMBIGUOUS',
+              `Exact provider inventory evidence is unavailable for ${line.product_global_id}`,
+              409,
+            )
+          }
+          const claimed = await client.query<{ quantity: string }>(
+            `SELECT COALESCE(sum(quantity), 0)::text AS quantity
+             FROM operations_reservations
+             WHERE organization_id = $1::uuid
+               AND provider_inventory_level_id = $2::uuid
+               AND status = 'active'`,
+            [organizationId, positionRows[0].inventory_level_id],
+          )
+          if (
+            Number(claimed.rows[0]?.quantity || 0) + quantity
+            > Number(
+              positionRows[0].provider_committed_quantity || 0,
+            )
+          ) {
+            throw new OperationsRequestError(
+              'OPERATIONS_PROVIDER_COMMITMENT_EXHAUSTED',
+              `Provider committed inventory cannot cover ${line.product_global_id} without double-claiming another order`,
+              409,
+            )
+          }
+          positionAllocations = [{
+            position: positionRows[0],
+            quantity,
+          }]
+        } else {
+          const positionResult =
+            await client.query<PlanningPositionRow>(
+              `SELECT
+                 position.id::text,
+                 position.global_id,
+                 position.warehouse_id::text,
+                 warehouse.global_id AS warehouse_global_id,
+                 warehouse.name AS warehouse_name,
+                 position.location_id::text,
+                 position.on_hand_quantity::text,
+                 position.reserved_quantity::text,
+                 position.source_authority,
+                 NULL::text AS inventory_level_id,
+                 NULL::text AS inventory_level_global_id,
+                 NULL::text AS provider_committed_quantity,
+                 floor(
+                   position.on_hand_quantity
+                     - position.reserved_quantity
+                     - position.damaged_quantity
+                 )::text AS available_whole_units
+               FROM operations_inventory_positions position
+               JOIN operations_warehouses warehouse
+                 ON warehouse.organization_id = position.organization_id
+                AND warehouse.id = position.warehouse_id
+               JOIN operations_locations location
+                 ON location.organization_id = position.organization_id
+                AND location.id = position.location_id
+               JOIN operations_inventory_pools pool
+                 ON pool.organization_id = position.organization_id
+                AND pool.id = position.pool_id
+               WHERE position.organization_id = $1::uuid
+                 AND position.pipeline_id = $2::uuid
+                 AND position.product_id = $3::uuid
+                 AND position.warehouse_id = $4::uuid
+                 AND position.source_authority = 'clawpilot'
+                 AND location.active = true
+                 AND pool.active = true
+                 AND (
+                   pool.pool_type = 'shared'
+                   OR pool.owner_customer_id = $5::uuid
+                   OR EXISTS (
+                     SELECT 1
+                     FROM operations_inventory_pool_customers eligible
+                     WHERE eligible.organization_id =
+                             pool.organization_id
+                       AND eligible.pool_id = pool.id
+                       AND eligible.customer_id = $5::uuid
+                       AND eligible.effective_from <= now()
+                       AND (
+                         eligible.effective_to IS NULL
+                         OR eligible.effective_to > now()
+                       )
+                   )
+                 )
+                 AND position.on_hand_quantity
+                       - position.reserved_quantity
+                       - position.damaged_quantity > 0
+               ORDER BY
+                 location.pick_sequence,
+                 position.global_id
+               FOR UPDATE OF position`,
+              [
+                organizationId,
+                order.pipeline_id,
+                line.product_id,
+                order.warehouse_id,
+                order.customer_id,
+              ],
+            )
+          positionRows = positionResult.rows
+          let remainingQuantity = quantity
+          positionAllocations = []
+          for (const position of positionRows) {
+            const availableWholeUnits = Number(
+              position.available_whole_units,
+            )
+            if (
+              !Number.isSafeInteger(availableWholeUnits)
+              || availableWholeUnits < 0
+            ) {
+              throw new OperationsRequestError(
+                'OPERATIONS_INVENTORY_BALANCE_INVALID',
+                `Available ClawPilot inventory is invalid for ${line.product_global_id}`,
+                409,
+              )
+            }
+            const allocatedQuantity = Math.min(
+              remainingQuantity,
+              availableWholeUnits,
+            )
+            if (allocatedQuantity < 1) continue
+            positionAllocations.push({
+              position,
+              quantity: allocatedQuantity,
+            })
+            remainingQuantity -= allocatedQuantity
+            if (remainingQuantity === 0) break
+          }
+          if (remainingQuantity !== 0) {
+            throw new OperationsRequestError(
+              'OPERATIONS_INVENTORY_SHORTAGE',
+              `Available ClawPilot inventory cannot cover ${line.product_global_id}`,
+              409,
+            )
+          }
+        }
+        const inventoryAllocations: PlannedInventoryAllocation[] = []
+        for (const positionAllocation of positionAllocations) {
+          const { position } = positionAllocation
+          const reservationResult = await client.query<IdRow>(
+            `INSERT INTO operations_reservations (
+               organization_id, order_id, order_line_id, position_id,
+               quantity, status, idempotency_key, created_by,
+               reservation_authority, provider_inventory_sync_run_id,
+               provider_inventory_level_id
+             ) VALUES (
+               $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+               $5, 'active', $6, $7, $8,
+               $9::uuid, $10::uuid
+             )
+             RETURNING id::text, global_id`,
+            [
+              organizationId,
+              order.id,
+              line.id,
+              position.id,
+              positionAllocation.quantity,
+              [
+                order.global_id,
+                'canonical-plan',
+                line.global_id,
+                position.global_id,
+              ].join(':'),
+              actorEmail,
+              position.source_authority === 'shopify'
+                ? 'provider_commitment'
+                : 'local_balance',
+              position.source_authority === 'shopify'
+                ? order.evidence_inventory_sync_run_id
+                : null,
+              position.source_authority === 'shopify'
+                ? position.inventory_level_id
+                : null,
+            ],
+          )
+          const reservation = reservationResult.rows[0]
+          inventoryAllocations.push({
+            reservation,
+            position,
+            quantity: positionAllocation.quantity,
+          })
+
+          if (position.source_authority === 'clawpilot') {
+            const balances = await client.query<{
+              on_hand_quantity: string
+              reserved_quantity: string
+            }>(
+              `UPDATE operations_inventory_positions
+               SET reserved_quantity = reserved_quantity + $3,
+                   version = version + 1,
+                   updated_at = now()
+               WHERE organization_id = $1::uuid
+                 AND id = $2::uuid
+                 AND on_hand_quantity
+                       - reserved_quantity
+                       - damaged_quantity >= $3
+               RETURNING on_hand_quantity::text,
+                         reserved_quantity::text`,
+              [
+                organizationId,
+                position.id,
+                positionAllocation.quantity,
+              ],
+            )
+            if (!balances.rows[0]) {
+              throw new OperationsRequestError(
+                'OPERATIONS_INVENTORY_CONFLICT',
+                `Inventory changed while planning ${line.product_global_id}`,
+                409,
+              )
+            }
+            await client.query(
+              `INSERT INTO operations_inventory_ledger (
+                 organization_id, position_id, event_type,
+                 on_hand_delta, reserved_delta, on_hand_after,
+                 reserved_after, source_global_id, reason,
+                 idempotency_key, actor_email, source_authority
+               ) VALUES (
+                 $1::uuid, $2::uuid, 'reservation',
+                 0, $3, $4, $5, $6, $7, $8, $9, 'clawpilot'
+               )`,
+              [
+                organizationId,
+                position.id,
+                positionAllocation.quantity,
+                balances.rows[0].on_hand_quantity,
+                balances.rows[0].reserved_quantity,
+                line.global_id,
+                reason,
+                `${order.global_id}:${reservation.global_id}:reservation-ledger`,
+                actorEmail,
+              ],
+            )
+          }
+        }
+        if (
+          inventoryAllocations.reduce(
+            (sum, allocation) => sum + allocation.quantity,
+            0,
+          ) !== quantity
+        ) {
+          throw new Error('OPERATIONS_INVENTORY_ALLOCATION_INCOMPLETE')
+        }
+        inventoryAllocationsByLineId.set(line.id, inventoryAllocations)
+      }
+
+      const actualCheckoutCharge =
+        rateSelection.actualCheckoutShippingChargeMinor
+      const estimatedRevenueMinor = actualCheckoutCharge
+      const estimatedMarginMinor = actualCheckoutCharge === null
+        ? null
+        : actualCheckoutCharge - rateSelection.carrierCostMinor
+      const planResult = await client.query<IdRow>(
+        `INSERT INTO operations_fulfillment_plans (
+           organization_id, order_id, warehouse_id, version_number,
+           status, method, solver_status, fallback_reason,
+           estimated_cost_minor, estimated_revenue_minor,
+           estimated_margin_minor, promised_delivery_at,
+           explanation, created_by, cartonization_evidence_id
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, 1,
+           'planned', $4, 'sealed_evidence_accepted', NULL,
+           $5, $6, $7, $8::timestamptz,
+           $9::jsonb, $10, $11::uuid
+         )
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          order.id,
+          order.warehouse_id,
+          evidence.packages.some(
+            (packageEvidence) =>
+              packageEvidence.planningMethod === 'or_tools',
+          )
+            ? 'optimizer'
+            : 'deterministic_fallback',
+          rateSelection.carrierCostMinor,
+          estimatedRevenueMinor,
+          estimatedMarginMinor,
+          rateSelection.estimatedDeliveryAt,
+          JSON.stringify({
+            version: 'canonical-fulfillment-plan-v1',
+            reason,
+            candidateGlobalId: order.candidate_global_id,
+            cartonizationEvidenceGlobalId: evidence.globalId,
+            inventorySyncRunGlobalId:
+              evidence.inventorySyncRunGlobalId,
+            packagePlanHash: evidence.planResultHash,
+            packageCount: evidence.packages.length,
+            carrierReadEnvironment,
+            packagingMaterialClaimCount: packagingClaimInputs.length,
+            packagingStockDecremented: false,
+            selectedWholeShipmentRate: rateSelection,
+            checkoutShippingChargeMinor: actualCheckoutCharge,
+            customerPaidVarianceMinor:
+              rateSelection.customerPaidVarianceMinor,
+            mudApplied: false,
+            providerWrites: 0,
+            labelWrites: 0,
+            shipmentWrites: 0,
+          }),
+          actorEmail,
+          order.evidence_id,
+        ],
+      )
+      const plan = planResult.rows[0]
+      for (const claimInput of packagingClaimInputs) {
+        await client.query(
+          `INSERT INTO operations_packaging_material_claims (
+             organization_id, plan_id, packaging_material_id,
+             warehouse_id, packaging_material_stock_id, quantity,
+             status, stock_row_version_at_claim,
+             on_hand_quantity_at_claim, created_by, updated_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid,
+             $4::uuid, $5::uuid, $6,
+             'active', $7, $8, $9, $9
+           )`,
+          [
+            organizationId,
+            plan.id,
+            claimInput.materialId,
+            order.warehouse_id,
+            claimInput.stockId,
+            claimInput.quantity,
+            claimInput.stockRowVersion,
+            claimInput.onHandQuantity,
+            actorEmail,
+          ],
+        )
+      }
+      for (const line of lineResult.rows) {
+        const inventoryAllocations =
+          inventoryAllocationsByLineId.get(line.id)
+        if (!inventoryAllocations?.length) {
+          throw new Error('OPERATIONS_RESERVATION_RESULT_MISSING')
+        }
+        for (const inventoryAllocation of inventoryAllocations) {
+          await client.query(
+            `INSERT INTO operations_fulfillment_allocations (
+               organization_id, plan_id, order_line_id,
+               reservation_id, position_id, quantity
+             ) VALUES (
+               $1::uuid, $2::uuid, $3::uuid,
+               $4::uuid, $5::uuid, $6
+             )`,
+            [
+              organizationId,
+              plan.id,
+              line.id,
+              inventoryAllocation.reservation.id,
+              inventoryAllocation.position.id,
+              inventoryAllocation.quantity,
+            ],
+          )
+        }
+      }
+
+      const canonicalPackageSnapshots = evidence.packages.map(
+        (packageEvidence) => ({
+          packageNumber: packageEvidence.packageSequence,
+          packageKey: packageEvidence.packageKey,
+          planningMethod: packageEvidence.planningMethod,
+          packagingMaterialGlobalId:
+            packageEvidence.packagingMaterialGlobalId,
+          packagingMaterialName: packageEvidence.packagingMaterialName,
+          approvedPackRecipeGlobalIds:
+            packageEvidence.recipes.map((recipe) => recipe.recipeGlobalId),
+          innerDimensionsMm: packageEvidence.innerDimensionsMm,
+          ratedOuterDimensionsMm:
+            packageEvidence.ratedOuterDimensionsMm,
+          contentWeightGrams: packageEvidence.contentWeightGrams,
+          tareWeightGrams: packageEvidence.tareWeightGrams,
+          ratedGrossWeightGrams:
+            packageEvidence.ratedGrossWeightGrams,
+          packageHash: packageEvidence.packageHash,
+          allocations: packageEvidence.allocations,
+        }),
+      )
+      await client.query(
+        `INSERT INTO operations_carton_plans (
+           organization_id, plan_id, algorithm, package_count,
+           total_weight_grams, packages
+         ) VALUES (
+           $1::uuid, $2::uuid, $3, $4, $5, $6::jsonb
+         )`,
+        [
+          organizationId,
+          plan.id,
+          evidence.algorithmVersion,
+          evidence.packages.length,
+          evidence.packages.reduce(
+            (sum, packageEvidence) =>
+              sum + packageEvidence.ratedGrossWeightGrams,
+            0,
+          ),
+          JSON.stringify(canonicalPackageSnapshots),
+        ],
+      )
+
+      for (const offer of offers) {
+        const carrier = offer.provider === 'ups_rest' ? 'UPS' : 'FedEx'
+        const selected = (
+          offer.provider === rateSelection.carrierProvider
+          && offer.serviceCode.toLowerCase()
+            === rateSelection.serviceCode
+        )
+        await client.query(
+          `INSERT INTO operations_carrier_rates (
+             organization_id, plan_id, carrier, service_code,
+             service_name, internal_cost_minor,
+             customer_charge_minor, transit_days,
+             estimated_delivery_at, meets_promise, selected,
+             quote_snapshot
+           ) VALUES (
+             $1::uuid, $2::uuid, $3, $4, $5, $6,
+             $7, $8, $9::timestamptz, $10, $11, $12::jsonb
+           )`,
+          [
+            organizationId,
+            plan.id,
+            carrier,
+            offer.serviceCode.toLowerCase(),
+            offer.serviceName,
+            offer.carrierCostMinor,
+            actualCheckoutCharge,
+            offer.transitDays,
+            offer.estimatedDeliveryAt,
+            order.requested_delivery_at === null
+              || new Date(offer.estimatedDeliveryAt).getTime()
+                <= order.requested_delivery_at.getTime(),
+            selected,
+            JSON.stringify({
+              version: 'canonical-whole-shipment-rate-evidence-v1',
+              rateEvidenceGlobalId: offer.rateEvidenceGlobalId,
+              rateScope: offer.rateScope,
+              packagePlanHash: offer.packagePlanHash,
+              packageCount: offer.packageCount,
+              packageKeys: offer.packageKeys,
+              provider: offer.provider,
+              currency: offer.currency,
+              checkoutShippingChargeMinor: actualCheckoutCharge,
+              mudApplied: false,
+            }),
+          ],
+        )
+      }
+
+      for (const packageEvidence of evidence.packages) {
+        const packageResult = await client.query<IdRow>(
+          `INSERT INTO operations_packages (
+             organization_id, plan_id, package_number,
+             length_mm, width_mm, height_mm, weight_grams,
+             status, cartonization_evidence_id,
+             evidence_package_key
+           ) VALUES (
+             $1::uuid, $2::uuid, $3, $4, $5, $6, $7,
+             'planned', $8::uuid, $9
+           )
+           RETURNING id::text, global_id`,
+          [
+            organizationId,
+            plan.id,
+            packageEvidence.packageSequence,
+            packageEvidence.ratedOuterDimensionsMm.length,
+            packageEvidence.ratedOuterDimensionsMm.width,
+            packageEvidence.ratedOuterDimensionsMm.height,
+            packageEvidence.ratedGrossWeightGrams,
+            order.evidence_id,
+            packageEvidence.packageKey,
+          ],
+        )
+        const packageRow = packageResult.rows[0]
+        for (const allocation of packageEvidence.allocations) {
+          const line = lineByCandidateGlobalId.get(
+            allocation.lineGlobalId,
+          )
+          if (!line) {
+            throw new Error('OPERATIONS_PACKAGE_LINE_RESULT_MISSING')
+          }
+          await client.query(
+            `INSERT INTO operations_package_contents (
+               organization_id, plan_id, order_id, package_id,
+               order_line_id, quantity, created_by
+             ) VALUES (
+               $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+               $5::uuid, $6, $7
+             )`,
+            [
+              organizationId,
+              plan.id,
+              order.id,
+              packageRow.id,
+              line.id,
+              allocation.quantity,
+              actorEmail,
+            ],
+          )
+        }
+      }
+
+      await transitionOrder(client, {
+        organizationId,
+        order,
+        status: 'planned',
+        eventType: 'operations.fulfillment.planned',
+        actorEmail,
+        correlationId: command.receipt.correlation_id,
+        eventKey: `canonical-plan:${evidence.globalId}`,
+        promisedDeliveryAt: rateSelection.estimatedDeliveryAt,
+        payload: {
+          planGlobalId: plan.global_id,
+          candidateGlobalId: order.candidate_global_id,
+          cartonizationEvidenceGlobalId: evidence.globalId,
+          inventorySyncRunGlobalId:
+            evidence.inventorySyncRunGlobalId,
+          packageCount: evidence.packages.length,
+          selectedCarrier: rateSelection.carrierName,
+          selectedServiceCode: rateSelection.serviceCode,
+          selectedServiceName: rateSelection.serviceName,
+          selectedCarrierCostMinor:
+            rateSelection.carrierCostMinor,
+          checkoutShippingChargeMinor: actualCheckoutCharge,
+          customerPaidVarianceMinor:
+            rateSelection.customerPaidVarianceMinor,
+          selectionPolicy: rateSelection.policy,
+          mudApplied: false,
+          providerWrites: 0,
+          labelsCreated: 0,
+          shipmentsCreated: 0,
+        },
+      })
+      const updatedOrder = await client.query<{ row_version: string }>(
+        `SELECT row_version::text
+         FROM operations_orders
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [organizationId, order.id],
+      )
+      const result: OperationsPlanCommandResult = {
+        orderGlobalId: order.global_id,
+        orderStatus: 'planned',
+        rowVersion: Number(updatedOrder.rows[0].row_version),
+        fulfillmentPlanGlobalId: plan.global_id,
+        cartonizationEvidenceGlobalId: evidence.globalId,
+        packageCount: evidence.packages.length,
+        carrier: rateSelection.carrierName,
+        serviceCode: rateSelection.serviceCode,
+        serviceName: rateSelection.serviceName,
+        carrierCostMinor: rateSelection.carrierCostMinor,
+        currency: rateSelection.currency,
+        checkoutShippingChargeMinor: actualCheckoutCharge,
+        checkoutVarianceMinor:
+          rateSelection.customerPaidVarianceMinor,
+        replayed: false,
+      }
+      await recordAuditEvent({
+        actor: actorEmail,
+        eventType: 'operations.fulfillment_plan.accepted',
+        aggregateType: 'operations.order',
+        aggregateId: order.global_id,
+        subject: order.global_id,
+        organizationId,
+        eventKey:
+          `operations:fulfillment-plan:${organizationId}:${plan.global_id}`,
+        payload: {
+          ...result,
+          candidateGlobalId: order.candidate_global_id,
+          reason,
+          providerWrites: 0,
+          labelsCreated: 0,
+          shipmentsCreated: 0,
+        },
+      }, client)
+      await completeCommandReceipt(
+        client,
+        command.receipt.id,
+        order.global_id,
+        result,
+      )
+      return result
+    })
+  } catch (error) {
+    await failCommandReceipt(command.receipt.id, error)
+    throw error
+  }
+}
+
 export async function releaseOperationsOrderFromPostgres(input: {
   organizationId: string
   actorEmail: string
@@ -6627,7 +10919,7 @@ export async function releaseOperationsOrderFromPostgres(input: {
   const reason = String(input.reason || '').trim()
   const idempotencyKey = String(input.idempotencyKey || '').trim()
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
-  if (!/^gor\d{7}$/.test(orderGlobalId)) {
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
   }
   if (!Number.isSafeInteger(input.expectedRowVersion) || input.expectedRowVersion < 0) {
@@ -6653,6 +10945,10 @@ export async function releaseOperationsOrderFromPostgres(input: {
 
   try {
     return await withTransaction(async (client) => {
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:activation:${organizationId}`,
+      )
       await acquireTransactionAdvisoryLock(client, `operations:order:${organizationId}:${orderGlobalId}`)
       const activation = await resolveActivation(client, organizationId)
       if (!['shadow', 'active'].includes(activation.state)) {
@@ -6663,8 +10959,12 @@ export async function releaseOperationsOrderFromPostgres(input: {
         )
       }
 
-      const orderResult = await client.query<OrderIdentityRow>(
-        `SELECT id::text, global_id, status, row_version::text
+      const orderResult = await client.query<OrderIdentityRow & {
+        source_provider: string
+        integration_account_id: string | null
+      }>(
+        `SELECT id::text, global_id, status, row_version::text,
+                source_provider, integration_account_id::text
          FROM operations_orders
          WHERE organization_id = $1::uuid AND global_id = $2
          FOR UPDATE`,
@@ -6688,6 +10988,69 @@ export async function releaseOperationsOrderFromPostgres(input: {
           409,
         )
       }
+      if (order.source_provider === 'shopify') {
+        if (!order.integration_account_id) {
+          throw new OperationsRequestError(
+            'OPERATIONS_PROVIDER_ACCOUNT_REQUIRED',
+            'The Shopify order is missing its integration account. Reconcile the order before warehouse release.',
+            409,
+          )
+        }
+        await acquireTransactionAdvisoryLock(
+          client,
+          [
+            'shopify-inventory-apply',
+            organizationId,
+            order.integration_account_id,
+          ].join(':'),
+        )
+        const reconciliationResult = await client.query<{
+          checkout_shipping_service_code: string | null
+          outcome: ShopifyCheckoutRateReconciliationOutcome | null
+        }>(
+          `SELECT candidate.checkout_shipping_service_code,
+                  reconciliation.outcome
+           FROM operations_commerce_order_candidates candidate
+           LEFT JOIN
+               operations_shopify_checkout_rate_current_reconciliations
+               reconciliation
+             ON reconciliation.organization_id = candidate.organization_id
+            AND reconciliation.order_candidate_id = candidate.id
+           WHERE candidate.organization_id = $1::uuid
+             AND candidate.canonical_order_id = $2::uuid
+             AND candidate.provider = 'shopify'
+             AND candidate.workflow_state = 'promoted'
+           ORDER BY candidate.promoted_at DESC, candidate.id DESC`,
+          [organizationId, order.id],
+        )
+        const requiredLineage = reconciliationResult.rows.filter((row) => (
+          shopifyCheckoutRateLineageIsRequired(
+            row.checkout_shipping_service_code,
+          )
+        ))
+        const reconciliationOutcome = requiredLineage.length === 1
+          ? requiredLineage[0].outcome
+          : null
+        if (
+          requiredLineage.length > 0
+          && (
+            requiredLineage.length !== 1
+            || !shopifyCheckoutRateOutcomeAllowsFulfillment(
+              reconciliationOutcome,
+            )
+          )
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_SHOPIFY_CHECKOUT_RATE_RECONCILIATION_REQUIRED',
+            requiredLineage.length > 1
+              ? 'Multiple ClawPilot checkout-rate lineage records exist; resolve the ambiguity before releasing warehouse work'
+              : reconciliationOutcome
+              ? `Shopify checkout-rate reconciliation is ${reconciliationOutcome}; resolve the immutable quote lineage before releasing warehouse work`
+              : 'Shopify checkout-rate reconciliation is missing; reconcile the immutable quote lineage before releasing warehouse work',
+            409,
+          )
+        }
+      }
 
       const planResult = await client.query<QueryResultRow & {
         id: string
@@ -6695,13 +11058,23 @@ export async function releaseOperationsOrderFromPostgres(input: {
         warehouse_id: string
         status: string
         method: string
+        cartonization_evidence_id: string | null
+        carrier_read_environment: string | null
       }>(
-        `SELECT id::text, global_id, warehouse_id::text, status, method
-         FROM operations_fulfillment_plans
-         WHERE organization_id = $1::uuid AND order_id = $2::uuid
-         ORDER BY version_number DESC
+        `SELECT plan.id::text, plan.global_id, plan.warehouse_id::text,
+                plan.status, plan.method,
+                plan.cartonization_evidence_id::text,
+                evidence.plan_snapshot->>'carrierReadEnvironment'
+                  AS carrier_read_environment
+         FROM operations_fulfillment_plans plan
+         LEFT JOIN operations_cartonization_rate_evidence evidence
+           ON evidence.organization_id = plan.organization_id
+          AND evidence.id = plan.cartonization_evidence_id
+         WHERE plan.organization_id = $1::uuid
+           AND plan.order_id = $2::uuid
+         ORDER BY plan.version_number DESC
          LIMIT 1
-         FOR UPDATE`,
+         FOR UPDATE OF plan`,
         [organizationId, order.id],
       )
       const plan = planResult.rows[0]
@@ -6712,46 +11085,79 @@ export async function releaseOperationsOrderFromPostgres(input: {
           409,
         )
       }
+      if (
+        activation.state === 'active'
+        && (
+          !plan.cartonization_evidence_id
+          || plan.carrier_read_environment !== 'production'
+        )
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION',
+          'Active warehouse release requires production carrier-read evidence. Return to Shadow or replan against production rates.',
+          409,
+        )
+      }
 
       const readinessResult = await client.query<QueryResultRow & {
         line_count: string
-        fully_reserved_line_count: string
-        allocation_count: string
+        ready_line_count: string
+        allocation_row_count: string
       }>(
         `SELECT
            count(*)::text AS line_count,
-           count(*) FILTER (WHERE COALESCE(reserved.quantity, 0) >= line.quantity)::text AS fully_reserved_line_count,
-           count(*) FILTER (WHERE COALESCE(allocation.quantity, 0) >= line.quantity)::text AS allocation_count
+           count(*) FILTER (
+             WHERE allocation.quantity = line.quantity
+               AND allocation.valid_row_count = allocation.row_count
+               AND allocation.row_count > 0
+           )::text AS ready_line_count,
+           COALESCE(sum(allocation.row_count), 0)::text AS allocation_row_count
          FROM operations_order_lines line
          LEFT JOIN LATERAL (
-           SELECT sum(reservation.quantity) AS quantity
-           FROM operations_reservations reservation
-           WHERE reservation.organization_id = line.organization_id
-             AND reservation.order_line_id = line.id
-             AND reservation.status = 'active'
-         ) reserved ON true
-         LEFT JOIN LATERAL (
-           SELECT candidate.order_line_id, sum(candidate.quantity) AS quantity
-           FROM operations_fulfillment_allocations candidate
-           WHERE candidate.organization_id = line.organization_id
-             AND candidate.plan_id = $3::uuid
-             AND candidate.order_line_id = line.id
-           GROUP BY candidate.order_line_id
+           SELECT sum(allocation.quantity) AS quantity,
+                  count(*) AS row_count,
+                  count(*) FILTER (
+                    WHERE reservation.status = 'active'
+                      AND reservation.order_line_id =
+                            allocation.order_line_id
+                      AND reservation.position_id =
+                            allocation.position_id
+                      AND reservation.quantity = allocation.quantity
+                  ) AS valid_row_count
+           FROM operations_fulfillment_allocations allocation
+           LEFT JOIN operations_reservations reservation
+             ON reservation.organization_id =
+                  allocation.organization_id
+            AND reservation.id = allocation.reservation_id
+           WHERE allocation.organization_id = line.organization_id
+             AND allocation.plan_id = $3::uuid
+             AND allocation.order_line_id = line.id
          ) allocation ON true
          WHERE line.organization_id = $1::uuid AND line.order_id = $2::uuid`,
         [organizationId, order.id, plan.id],
       )
       const readiness = readinessResult.rows[0]
       const lineCount = Number(readiness?.line_count || 0)
+      const allocationRowCount = Number(
+        readiness?.allocation_row_count || 0,
+      )
       if (lineCount < 1
-        || Number(readiness?.fully_reserved_line_count || 0) !== lineCount
-        || Number(readiness?.allocation_count || 0) !== lineCount) {
+        || Number(readiness?.ready_line_count || 0) !== lineCount
+        || allocationRowCount < lineCount) {
         throw new OperationsRequestError(
           'OPERATIONS_ORDER_NOT_READY',
           'Every order line must have a complete reservation and allocation before release',
           409,
         )
       }
+      const providerCommitmentRevalidation =
+        await revalidateProviderCommitmentsForPlan(
+          client,
+          {
+            organizationId,
+            planId: plan.id,
+          },
+        )
 
       const blockingResult = await client.query<QueryResultRow & { count: string }>(
         `SELECT count(*)::text AS count
@@ -6797,7 +11203,10 @@ export async function releaseOperationsOrderFromPostgres(input: {
          )
          SELECT allocation.organization_id, $3::uuid, allocation.plan_id, allocation.id,
                 position.location_id, allocation.quantity,
-                row_number() OVER (ORDER BY location.pick_sequence, allocation.id)::integer,
+                row_number() OVER (
+                  ORDER BY location.pick_sequence, position.global_id,
+                           allocation.id
+                )::integer,
                 'ready', $4
          FROM operations_fulfillment_allocations allocation
          JOIN operations_inventory_positions position
@@ -6811,7 +11220,7 @@ export async function releaseOperationsOrderFromPostgres(input: {
          RETURNING global_id`,
         [organizationId, plan.id, wave.id, actorEmail],
       )
-      if (Number(pickResult.rowCount || 0) < lineCount) {
+      if (Number(pickResult.rowCount || 0) !== allocationRowCount) {
         throw new OperationsRequestError('OPERATIONS_PICK_TASKS_INCOMPLETE', 'Warehouse pick tasks could not be created', 409)
       }
 
@@ -6846,6 +11255,11 @@ export async function releaseOperationsOrderFromPostgres(input: {
           planGlobalId: plan.global_id,
           waveGlobalId: wave.global_id,
           pickTaskGlobalIds: pickResult.rows.map((row) => row.global_id),
+          providerCommitmentsRevalidated:
+            providerCommitmentRevalidation.count,
+          providerCommitmentInventorySyncRunGlobalIds:
+            providerCommitmentRevalidation
+              .latestInventorySyncRunGlobalIds,
           reason,
         },
       })
@@ -6864,6 +11278,11 @@ export async function releaseOperationsOrderFromPostgres(input: {
           rowVersion: Number(released.row_version),
           planGlobalId: plan.global_id,
           waveGlobalId: wave.global_id,
+          providerCommitmentsRevalidated:
+            providerCommitmentRevalidation.count,
+          providerCommitmentInventorySyncRunGlobalIds:
+            providerCommitmentRevalidation
+              .latestInventorySyncRunGlobalIds,
           reason,
         },
       }, client)
@@ -6897,7 +11316,7 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
   const reason = String(input.reason || '').trim()
   const idempotencyKey = String(input.idempotencyKey || '').trim()
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
-  if (!/^gor\d{7}$/.test(orderGlobalId)) {
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
   }
   if (!Number.isSafeInteger(input.expectedRowVersion) || input.expectedRowVersion < 0) {
@@ -7009,23 +11428,89 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
         global_id: string
         status: string
         quantity: string
+        allocation_quantity: string
         position_id: string
+        from_location_id: string
+        position_location_id: string
+        reservation_quantity: string
+        reservation_order_line_id: string
+        reservation_position_id: string
+        allocation_order_line_id: string
+        allocation_count: string
+        source_authority: 'clawpilot' | 'shopify'
+        reservation_authority: 'local_balance' | 'provider_commitment'
+        reservation_status: 'active' | 'released' | 'consumed'
       }>(
-        `SELECT pick.id::text, pick.global_id, pick.status, pick.quantity::text,
-                allocation.position_id::text
+        `SELECT pick.id::text, pick.global_id, pick.status,
+                pick.quantity::text,
+                allocation.quantity::text AS allocation_quantity,
+                allocation.order_line_id::text AS allocation_order_line_id,
+                allocation.position_id::text,
+                pick.from_location_id::text,
+                position.location_id::text AS position_location_id,
+                reservation.quantity::text AS reservation_quantity,
+                reservation.order_line_id::text
+                  AS reservation_order_line_id,
+                reservation.position_id::text
+                  AS reservation_position_id,
+                reservation.reservation_authority,
+                reservation.status AS reservation_status,
+                position.source_authority,
+                expected.allocation_count::text
          FROM operations_pick_tasks pick
          JOIN operations_fulfillment_allocations allocation
            ON allocation.organization_id = pick.organization_id
           AND allocation.id = pick.allocation_id
+         JOIN operations_inventory_positions position
+           ON position.organization_id = allocation.organization_id
+          AND position.id = allocation.position_id
+         JOIN operations_reservations reservation
+           ON reservation.organization_id = allocation.organization_id
+          AND reservation.id = allocation.reservation_id
+         CROSS JOIN LATERAL (
+           SELECT count(*) AS allocation_count
+           FROM operations_fulfillment_allocations expected_allocation
+           WHERE expected_allocation.organization_id =
+                   allocation.organization_id
+             AND expected_allocation.plan_id = allocation.plan_id
+         ) expected
          WHERE pick.organization_id = $1::uuid AND pick.plan_id = $2::uuid
          ORDER BY pick.sequence_number, pick.id
          FOR UPDATE OF pick`,
         [organizationId, plan.id],
       )
-      if (pickResult.rows.length < 1 || pickResult.rows.some((pick) => pick.status !== 'ready')) {
+      if (
+        pickResult.rows.length < 1
+        || pickResult.rows.length
+          !== Number(pickResult.rows[0]?.allocation_count || 0)
+        || pickResult.rows.some((pick) => (
+          pick.status !== 'ready'
+          || numberValue(pick.quantity)
+            !== numberValue(pick.allocation_quantity)
+          || numberValue(pick.quantity)
+            !== numberValue(pick.reservation_quantity)
+          || pick.from_location_id !== pick.position_location_id
+          || pick.reservation_order_line_id
+            !== pick.allocation_order_line_id
+          || pick.reservation_position_id !== pick.position_id
+        ))
+      ) {
         throw new OperationsRequestError(
           'OPERATIONS_PICK_TASKS_NOT_READY',
-          'Every pick task must be ready before confirming this wave',
+          'Every allocation must have one exact, ready pick task before confirming this wave',
+          409,
+        )
+      }
+      if (pickResult.rows.some((pick) => (
+        pick.reservation_status !== 'active'
+        || (pick.source_authority === 'shopify'
+          && pick.reservation_authority !== 'provider_commitment')
+        || (pick.source_authority === 'clawpilot'
+          && pick.reservation_authority !== 'local_balance')
+      ))) {
+        throw new OperationsRequestError(
+          'OPERATIONS_RESERVATION_AUTHORITY_INVALID',
+          'Pick inventory authority no longer matches its reservation. Refresh and replan the order.',
           409,
         )
       }
@@ -7051,6 +11536,7 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
         `SELECT id::text
          FROM operations_inventory_positions
          WHERE organization_id = $1::uuid AND id = ANY($2::uuid[])
+         ORDER BY id
          FOR UPDATE`,
         [organizationId, positionIds],
       )
@@ -7077,7 +11563,13 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
         )
       }
 
+      let localPickLedgerCount = 0
+      let providerCommitmentPickCount = 0
       for (const pick of pickResult.rows) {
+        if (pick.source_authority === 'shopify') {
+          providerCommitmentPickCount += 1
+          continue
+        }
         const ledgerEvent = await client.query(
           `INSERT INTO operations_inventory_ledger (
              organization_id, position_id, event_type,
@@ -7106,6 +11598,7 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
             409,
           )
         }
+        localPickLedgerCount += 1
       }
 
       const completedWave = await client.query(
@@ -7152,6 +11645,8 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           pickTaskGlobalIds: updatedPicks.rows.map((pick) => pick.global_id),
           reason,
           reservationsRetained: true,
+          localPickLedgerCount,
+          providerCommitmentPickCount,
         },
       })
       await recordAuditEvent({
@@ -7172,6 +11667,8 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           pickTaskCount: updatedPicks.rows.length,
           reason,
           reservationsRetained: true,
+          localPickLedgerCount,
+          providerCommitmentPickCount,
         },
       }, client)
       const result: OperationsOrderCommandResult = {
@@ -7204,7 +11701,7 @@ export async function verifyOperationsOrderPackFromPostgres(input: {
   const reason = String(input.reason || '').trim()
   const idempotencyKey = String(input.idempotencyKey || '').trim()
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
-  if (!/^gor\d{7}$/.test(orderGlobalId)) {
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
   }
   if (!Number.isSafeInteger(input.expectedRowVersion) || input.expectedRowVersion < 0) {
@@ -7548,13 +12045,13 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
       401,
     )
   }
-  if (!/^gor\d{7}$/.test(orderGlobalId)) {
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError(
       'OPERATIONS_ORDER_INVALID',
       'Order is invalid',
     )
   }
-  if (!/^gpa\d{7}$/.test(packageGlobalId)) {
+  if (!/^gpa(?:[0-9]{7}|[0-9a-v]{12})$/.test(packageGlobalId)) {
     throw new OperationsRequestError(
       'OPERATIONS_PACKAGE_INVALID',
       'Package is invalid',
@@ -7687,14 +12184,14 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
       if (source.order_status !== 'packed') {
         throw new OperationsRequestError(
           'OPERATIONS_PACKING_LIST_STAGE_INVALID',
-          `Package packing lists can be generated only while an order is packed, not ${source.order_status}`,
+          `Pack Work Instructions can be generated only while an order is packed, not ${source.order_status}`,
           409,
         )
       }
       if (Number(source.row_version) !== input.expectedRowVersion) {
         throw new OperationsRequestError(
           'OPERATIONS_ORDER_VERSION_CONFLICT',
-          'This order changed after it was opened. Refresh before generating the packing list.',
+          'This order changed after it was opened. Refresh before generating the Pack Work Instruction.',
           409,
         )
       }
@@ -7704,7 +12201,7 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
       ) {
         throw new OperationsRequestError(
           'OPERATIONS_PACKING_LIST_STAGE_INVALID',
-          'Verify the physical package before generating its packing list',
+          'Verify the physical package before generating its Pack Work Instruction',
           409,
         )
       }
@@ -7738,7 +12235,7 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
       ) {
         throw new OperationsRequestError(
           'OPERATIONS_PACKAGE_CONTENTS_INCOMPLETE',
-          'Exact line quantities are not allocated across every physical package. Correct cartonization before generating a packing list.',
+          'Exact line quantities are not allocated across every physical package. Correct cartonization before generating a Pack Work Instruction.',
           409,
         )
       }
@@ -7775,7 +12272,9 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
         )
       }
       const packingSnapshot = {
-        documentStage: 'warehouse_packing' as const,
+        documentKind: 'pack_work_instruction' as const,
+        documentStage: 'pre_label_pack_work_instruction' as const,
+        finalPackingSlip: false as const,
         orderGlobalId: source.order_global_id,
         orderNumber: source.order_number,
         customerName: source.customer_name,
@@ -7795,9 +12294,9 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
           quantity: assertPositiveQuantity(content.quantity),
         })),
       }
-      const rendered = renderPackagePackingList(packingSnapshot)
+      const rendered = renderPackagePackWorkInstruction(packingSnapshot)
       const storageReference = (
-        `clawpilot-document:${source.package_global_id}:packing-list:${rendered.contentSha256}`
+        `clawpilot-document:${source.package_global_id}:pack-work-instruction:${rendered.contentSha256}`
       )
       const insertedArtifact = await client.query<IdRow>(
         `INSERT INTO operations_print_artifacts (
@@ -7813,6 +12312,8 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
          ) WHERE document_type = 'packing_slip'
            AND source_package_id IS NOT NULL
            AND source_shipment_id IS NULL
+           AND storage_reference LIKE
+             'clawpilot-document:%:pack-work-instruction:%'
          DO NOTHING
          RETURNING id::text, global_id`,
         [
@@ -7840,7 +12341,7 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
             rendered.mimeType,
             rendered.filename,
             rendered.payload,
-            PACKAGE_PACKING_LIST_TEMPLATE_VERSION,
+            PACKAGE_PACK_WORK_INSTRUCTION_TEMPLATE_VERSION,
             JSON.stringify(packingSnapshot),
           ],
         )
@@ -7863,6 +12364,8 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
              AND artifact.source_package_id = $2::uuid
              AND artifact.source_shipment_id IS NULL
              AND artifact.document_type = 'packing_slip'
+             AND artifact.storage_reference LIKE
+               'clawpilot-document:%:pack-work-instruction:%'
              AND artifact.format = 'PDF'
              AND artifact.media_size = 'letter'
            FOR SHARE OF artifact, payload`,
@@ -7878,7 +12381,7 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
         ) {
           throw new OperationsRequestError(
             'OPERATIONS_PACKING_LIST_CONFLICT',
-            'The existing package packing list does not match its immutable allocation',
+            'The existing Pack Work Instruction does not match its immutable allocation',
             409,
           )
         }
@@ -7893,7 +12396,7 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
         aggregateType: 'operations.order',
         aggregateId: source.order_id,
         aggregateGlobalId: source.order_global_id,
-        eventType: 'operations.package.packing_list_generated',
+        eventType: 'operations.package.pack_work_instruction_generated',
         actorEmail,
         correlationId: command.receipt.correlation_id,
         idempotencyKey: `${artifact.global_id}:generated`,
@@ -7901,6 +12404,9 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
           packageGlobalId: source.package_global_id,
           packageNumber: source.package_number,
           packageCount: Number(source.package_count),
+          documentKind: packingSnapshot.documentKind,
+          documentStage: packingSnapshot.documentStage,
+          finalPackingSlip: packingSnapshot.finalPackingSlip,
           packingSlipArtifactGlobalId: artifact.global_id,
           lineCount: packingSnapshot.lines.length,
           carrierActionPerformed: false,
@@ -7908,20 +12414,23 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
       })
       await recordAuditEvent({
         actor: actorEmail,
-        eventType: 'operations.package.packing_list_generated',
+        eventType: 'operations.package.pack_work_instruction_generated',
         aggregateType: 'operations.package',
         aggregateId: source.package_global_id,
-        subject: `Generated package ${source.package_number} packing list for ${source.order_global_id}`,
+        subject: `Generated package ${source.package_number} Pack Work Instruction for ${source.order_global_id}`,
         organizationId,
-        eventKey: `operations:package-packing-list:${artifact.global_id}`,
+        eventKey: `operations:package-pack-work-instruction:${artifact.global_id}`,
         payload: {
           orderGlobalId: source.order_global_id,
           packageGlobalId: source.package_global_id,
+          documentKind: packingSnapshot.documentKind,
+          documentStage: packingSnapshot.documentStage,
+          finalPackingSlip: packingSnapshot.finalPackingSlip,
           packingSlipArtifactGlobalId: artifact.global_id,
           lineCount: packingSnapshot.lines.length,
           contentSha256: rendered.contentSha256,
           byteLength: rendered.byteLength,
-          templateVersion: PACKAGE_PACKING_LIST_TEMPLATE_VERSION,
+          templateVersion: PACKAGE_PACK_WORK_INSTRUCTION_TEMPLATE_VERSION,
           carrierActionPerformed: false,
         },
       }, client)
@@ -7932,6 +12441,9 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
         rowVersion: Number(source.row_version),
         packageGlobalId: source.package_global_id,
         packageNumber: Number(source.package_number),
+        documentKind: packingSnapshot.documentKind,
+        documentStage: packingSnapshot.documentStage,
+        finalPackingSlip: packingSnapshot.finalPackingSlip,
         packingSlipArtifactGlobalId: artifact.global_id,
         contentUrl,
         replayed: false,
@@ -7950,6 +12462,1199 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
   }
 }
 
+type CommerceFulfillmentExportExecutionRow = QueryResultRow & {
+  order_id: string
+  order_currency: string
+  global_id: string
+  provider: string
+  state: 'queued' | 'processing' | 'succeeded' | 'failed' | 'unsupported'
+  external_order_id: string
+  payload_snapshot: Record<string, unknown>
+  idempotency_key: string
+  attempts: number
+  provider_reference: string | null
+  error_code: string | null
+  error_message: string | null
+  updated_at: Date
+  integration_account_id: string | null
+  account_global_id: string | null
+  provider_attempt_id: string | null
+  provider_attempt_global_id: string | null
+  provider_attempt_state: string | null
+  provider_attempt_number: number | null
+  provider_attempt_request_hash: string | null
+  provider_attempt_request: Record<string, unknown> | null
+}
+
+const SHOPIFY_FULFILLMENT_PROVIDER_ATTEMPT_ACTION =
+  'shopify.fulfillment.create'
+const SHOPIFY_FULFILLMENT_PROVIDER_ATTEMPT_ADAPTER =
+  'shopify-fulfillment-writeback-v2'
+const FAIRE_FULFILLMENT_PROVIDER_ATTEMPT_ACTION =
+  'faire.fulfillment.shipments.create'
+const FAIRE_FULFILLMENT_PROVIDER_ATTEMPT_ADAPTER =
+  'faire-fulfillment-writeback-v2'
+const FAIRE_FULFILLMENT_PROVIDER_WRITE_PROTOCOL =
+  'faire-fulfillment-attempt-v1'
+
+type FaireFulfillmentAttemptRequest = {
+  version: 1
+  externalOrderId: string
+  expectedShipDate: string
+  authorizationRevision: number
+  packages: Array<{
+    packageReference: string
+    carrier: string
+    trackingCode: string
+    makerCost?: {
+      amountMinor: number
+      currency: string
+    }
+  }>
+}
+
+function normalizeFaireFulfillmentPackages(value: unknown) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 100) {
+    throw new OperationsRequestError(
+      'OPERATIONS_FAIRE_FULFILLMENT_PACKAGES_INVALID',
+      'Faire fulfillment requires exact evidence for every physical package',
+      409,
+    )
+  }
+  const packageReferences = new Set<string>()
+  const trackingCodes = new Set<string>()
+  return value.map((candidate) => {
+    const packageSnapshot = json(candidate)
+    const packageReference = String(
+      packageSnapshot.packageReference || '',
+    ).trim()
+    const carrier = String(packageSnapshot.carrier || '').trim()
+    const trackingCode = String(packageSnapshot.trackingCode || '').trim()
+    const makerCostSnapshot = packageSnapshot.makerCost === undefined
+      || packageSnapshot.makerCost === null
+      ? null
+      : json(packageSnapshot.makerCost)
+    const makerCost = makerCostSnapshot === null
+      ? null
+      : {
+          amountMinor: Number(makerCostSnapshot.amountMinor),
+          currency: String(makerCostSnapshot.currency || '')
+            .trim()
+            .toUpperCase(),
+        }
+    if (
+      !/^gpa(?:[0-9]{7}|[0-9a-v]{12})$/.test(packageReference)
+      || !carrier
+      || carrier.length > 80
+      || !trackingCode
+      || trackingCode.length > 255
+      || /[\u0000-\u001f\u007f]/.test(`${carrier}${trackingCode}`)
+      || (
+        makerCost !== null
+        && (
+          !Number.isSafeInteger(makerCost.amountMinor)
+          || makerCost.amountMinor < 0
+          || !/^[A-Z]{3}$/.test(makerCost.currency)
+        )
+      )
+      || packageReferences.has(packageReference)
+      || trackingCodes.has(trackingCode)
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_FAIRE_FULFILLMENT_PACKAGES_INVALID',
+        'Faire package carrier and tracking evidence is invalid or duplicated',
+        409,
+      )
+    }
+    packageReferences.add(packageReference)
+    trackingCodes.add(trackingCode)
+    return {
+      packageReference,
+      carrier,
+      trackingCode,
+      ...(makerCost === null ? {} : { makerCost }),
+    }
+  })
+}
+
+async function requireFaireFulfillmentPackageMakerCosts(input: {
+  organizationId: string
+  orderId: string
+  orderCurrency: string
+  packages: ReturnType<typeof normalizeFaireFulfillmentPackages>
+}) {
+  if (input.packages.every((item) => item.makerCost)) {
+    return input.packages
+  }
+  const references = input.packages.map((item) => item.packageReference)
+  const result = await query<{
+    package_global_id: string
+    quoted_carrier_cost_minor: string
+  }>(
+    `SELECT package.global_id AS package_global_id,
+            shipment.quoted_carrier_cost_minor::text
+     FROM operations_shipments shipment
+     JOIN operations_packages package
+       ON package.organization_id = shipment.organization_id
+      AND package.id = shipment.package_id
+     WHERE shipment.organization_id = $1::uuid
+       AND shipment.order_id = $2::uuid
+       AND package.global_id = ANY($3::text[])
+     ORDER BY package.global_id`,
+    [input.organizationId, input.orderId, references],
+  )
+  const costs = new Map(result.rows.map((row) => [
+    row.package_global_id,
+    Number(row.quoted_carrier_cost_minor),
+  ]))
+  if (
+    costs.size !== references.length
+    || [...costs.values()].some((amountMinor) => (
+      !Number.isSafeInteger(amountMinor) || amountMinor < 0
+    ))
+    || !/^[A-Z]{3}$/.test(input.orderCurrency)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_FAIRE_FULFILLMENT_MAKER_COST_INVALID',
+      'Faire fulfillment requires durable shipping-cost evidence for every package',
+      409,
+    )
+  }
+  return input.packages.map((item) => ({
+    ...item,
+    makerCost: item.makerCost || {
+      amountMinor: costs.get(item.packageReference)!,
+      currency: input.orderCurrency,
+    },
+  }))
+}
+
+function normalizeFaireFulfillmentAttemptRequest(
+  value: unknown,
+  expectedExternalOrderId: string,
+): FaireFulfillmentAttemptRequest {
+  const request = json(value)
+  const externalOrderId = String(request.externalOrderId || '').trim()
+  const expectedShipDate = String(request.expectedShipDate || '').trim()
+  const authorizationRevision = Number(request.authorizationRevision)
+  const parsedShipDate = new Date(expectedShipDate)
+  if (
+    request.version !== 1
+    || externalOrderId !== expectedExternalOrderId
+    || !/^bo_[A-Za-z0-9_-]+$/.test(externalOrderId)
+    || !Number.isFinite(parsedShipDate.getTime())
+    || !Number.isSafeInteger(authorizationRevision)
+    || authorizationRevision < 1
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_FAIRE_FULFILLMENT_SIGNATURE_INVALID',
+      'The durable Faire fulfillment attempt signature is invalid or stale',
+      409,
+    )
+  }
+  return {
+    version: 1,
+    externalOrderId,
+    expectedShipDate: parsedShipDate.toISOString(),
+    authorizationRevision,
+    packages: normalizeFaireFulfillmentPackages(request.packages),
+  }
+}
+
+function faireFulfillmentAttemptRequestHash(
+  request: FaireFulfillmentAttemptRequest,
+) {
+  return createHash('sha256')
+    .update(JSON.stringify(request))
+    .digest('hex')
+}
+
+function requireFaireFulfillmentAttemptRequestHash(
+  request: FaireFulfillmentAttemptRequest,
+  expectedHash: unknown,
+) {
+  const normalizedExpectedHash = String(expectedHash || '')
+    .trim()
+    .toLowerCase()
+  if (
+    !/^[a-f0-9]{64}$/.test(normalizedExpectedHash)
+    || faireFulfillmentAttemptRequestHash(request) !== normalizedExpectedHash
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_FAIRE_FULFILLMENT_SIGNATURE_INVALID',
+      'The durable Faire fulfillment attempt request failed its integrity check',
+      409,
+    )
+  }
+}
+
+async function registerShopifyFulfillmentProviderAttempt(input: {
+  organizationId: string
+  actorEmail: string | null
+  commerceExportGlobalId: string
+  integrationAccountId: string
+  exportIdempotencyKey: string
+  exportAttempt: number
+  preparedRequest: unknown
+}) {
+  if (
+    !input.preparedRequest
+    || typeof input.preparedRequest !== 'object'
+    || Array.isArray(input.preparedRequest)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_SHOPIFY_FULFILLMENT_SIGNATURE_INVALID',
+      'Shopify fulfillment preparation returned an invalid durable signature',
+      409,
+    )
+  }
+  const serializedRequest = JSON.stringify(input.preparedRequest)
+  const requestHash = createHash('sha256')
+    .update(serializedRequest)
+    .digest('hex')
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:commerce-fulfillment-export:${input.organizationId}:${input.commerceExportGlobalId}`,
+    )
+    const guardedExport = await client.query(
+      `SELECT id
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+         AND state = 'processing'
+         AND attempts = $3
+       FOR UPDATE`,
+      [
+        input.organizationId,
+        input.commerceExportGlobalId,
+        input.exportAttempt,
+      ],
+    )
+    if (guardedExport.rowCount !== 1) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_EXPORT_CHANGED',
+        'Commerce fulfillment export changed before the provider attempt was registered',
+        409,
+      )
+    }
+    const existing = await client.query(
+      `SELECT global_id
+       FROM operations_commerce_provider_attempts
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND action = $3
+         AND external_object_id = $4
+       LIMIT 1`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        SHOPIFY_FULFILLMENT_PROVIDER_ATTEMPT_ACTION,
+        input.commerceExportGlobalId,
+      ],
+    )
+    if (existing.rowCount) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED',
+        'A durable Shopify provider attempt already exists; only read-only reconciliation is safe',
+        409,
+      )
+    }
+    const attempt = await client.query<{
+      id: string
+      global_id: string
+    }>(
+      `INSERT INTO operations_commerce_provider_attempts (
+         organization_id, integration_account_id, action, adapter_version,
+         external_object_id, idempotency_key, request_hash,
+         redacted_request, redacted_response, state, attempt_number,
+         lease_token, lease_expires_at, requested_at, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, $4,
+         $5, $6, $7, $8::jsonb, '{}'::jsonb, 'prepared', $9,
+         $10::uuid, now() + interval '5 minutes', now(), $11
+       )
+       RETURNING id::text, global_id`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        SHOPIFY_FULFILLMENT_PROVIDER_ATTEMPT_ACTION,
+        SHOPIFY_FULFILLMENT_PROVIDER_ATTEMPT_ADAPTER,
+        input.commerceExportGlobalId,
+        input.exportIdempotencyKey,
+        requestHash,
+        serializedRequest,
+        input.exportAttempt,
+        randomUUID(),
+        input.actorEmail,
+      ],
+    )
+    return {
+      id: attempt.rows[0].id,
+      globalId: attempt.rows[0].global_id,
+      requestHash,
+    }
+  })
+}
+
+async function registerFaireFulfillmentProviderAttempt(input: {
+  organizationId: string
+  actorEmail: string | null
+  commerceExportGlobalId: string
+  integrationAccountId: string
+  exportIdempotencyKey: string
+  exportAttempt: number
+  preparedRequest: FaireFulfillmentAttemptRequest
+}) {
+  const serializedRequest = JSON.stringify(input.preparedRequest)
+  const requestHash = faireFulfillmentAttemptRequestHash(
+    input.preparedRequest,
+  )
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:commerce-fulfillment-export:${input.organizationId}:${input.commerceExportGlobalId}`,
+    )
+    const guardedExport = await client.query(
+      `SELECT id
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+         AND state = 'processing'
+         AND attempts = $3
+       FOR UPDATE`,
+      [
+        input.organizationId,
+        input.commerceExportGlobalId,
+        input.exportAttempt,
+      ],
+    )
+    if (guardedExport.rowCount !== 1) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_EXPORT_CHANGED',
+        'Commerce fulfillment export changed before the Faire attempt was registered',
+        409,
+      )
+    }
+    const existing = await client.query<{
+      global_id: string
+      state: string
+      error_code: string | null
+      request_hash: string
+      redacted_request: Record<string, unknown>
+    }>(
+      `SELECT global_id, state, error_code, request_hash, redacted_request
+       FROM operations_commerce_provider_attempts
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND action = $3
+         AND external_object_id = $4
+       ORDER BY attempt_number DESC, requested_at DESC, id DESC
+       LIMIT 1`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        FAIRE_FULFILLMENT_PROVIDER_ATTEMPT_ACTION,
+        input.commerceExportGlobalId,
+      ],
+    )
+    if (existing.rowCount) {
+      const prior = existing.rows[0]
+      const priorRevision = Number(
+        json(prior.redacted_request).authorizationRevision,
+      )
+      const revisedKnownRejection = (
+        prior.state === 'failed'
+        && prior.error_code === 'FAIRE_REQUEST_REJECTED'
+        && Number.isSafeInteger(priorRevision)
+        && input.preparedRequest.authorizationRevision > priorRevision
+        && requestHash !== prior.request_hash
+      )
+      if (!revisedKnownRejection) {
+        throw new OperationsRequestError(
+          'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED',
+          'A durable Faire provider attempt already exists; a known rejection requires a newer reviewed authorization before resubmission',
+          409,
+        )
+      }
+    }
+    const attempt = await client.query<{
+      id: string
+      global_id: string
+    }>(
+      `INSERT INTO operations_commerce_provider_attempts (
+         organization_id, integration_account_id, action, adapter_version,
+         external_object_id, idempotency_key, request_hash,
+         redacted_request, redacted_response, state, attempt_number,
+         lease_token, lease_expires_at, requested_at, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, $4,
+         $5, $6, $7, $8::jsonb, '{}'::jsonb, 'prepared', $9,
+         $10::uuid, now() + interval '5 minutes', now(), $11
+       )
+       RETURNING id::text, global_id`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        FAIRE_FULFILLMENT_PROVIDER_ATTEMPT_ACTION,
+        FAIRE_FULFILLMENT_PROVIDER_ATTEMPT_ADAPTER,
+        input.commerceExportGlobalId,
+        input.exportIdempotencyKey,
+        requestHash,
+        serializedRequest,
+        input.exportAttempt,
+        randomUUID(),
+        input.actorEmail,
+      ],
+    )
+    return {
+      id: attempt.rows[0].id,
+      globalId: attempt.rows[0].global_id,
+      requestHash,
+    }
+  })
+}
+
+export async function executeOperationsCommerceFulfillmentExportFromPostgres(input: {
+  organizationId: string
+  actorEmail: string | null
+  commerceExportGlobalId: string
+  reason: string
+  auditEventKey: string
+  preclaimed?: {
+    attempt: number
+    priorState: 'queued' | 'processing' | 'failed'
+    priorErrorCode: string | null
+    workerId: string
+  }
+}): Promise<OperationsCommerceFulfillmentRetryResult> {
+  const claimed = await withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:commerce-fulfillment-export:${input.organizationId}:${input.commerceExportGlobalId}`,
+    )
+    const result = await client.query<CommerceFulfillmentExportExecutionRow>(
+      `SELECT fulfillment_export.order_id::text AS order_id,
+              source_order.currency AS order_currency,
+              fulfillment_export.global_id, fulfillment_export.provider,
+              fulfillment_export.state, fulfillment_export.external_order_id,
+              fulfillment_export.payload_snapshot,
+              fulfillment_export.idempotency_key,
+              fulfillment_export.attempts,
+              fulfillment_export.provider_reference,
+              fulfillment_export.error_code,
+              fulfillment_export.error_message,
+              fulfillment_export.updated_at,
+              integration.id::text AS integration_account_id,
+              integration.global_id AS account_global_id,
+              provider_attempt.id::text AS provider_attempt_id,
+              provider_attempt.global_id AS provider_attempt_global_id,
+              provider_attempt.state AS provider_attempt_state,
+              provider_attempt.attempt_number AS provider_attempt_number,
+              provider_attempt.request_hash AS provider_attempt_request_hash,
+              provider_attempt.redacted_request AS provider_attempt_request
+       FROM operations_commerce_fulfillment_exports fulfillment_export
+       JOIN operations_orders source_order
+         ON source_order.organization_id = fulfillment_export.organization_id
+        AND source_order.id = fulfillment_export.order_id
+       LEFT JOIN operations_integration_accounts integration
+         ON integration.organization_id = source_order.organization_id
+        AND integration.id = source_order.integration_account_id
+       LEFT JOIN LATERAL (
+         SELECT attempt.id, attempt.global_id, attempt.state,
+                attempt.attempt_number, attempt.request_hash,
+                attempt.redacted_request,
+                attempt.requested_at
+         FROM operations_commerce_provider_attempts attempt
+         WHERE attempt.organization_id = fulfillment_export.organization_id
+           AND attempt.integration_account_id = integration.id
+           AND attempt.action = CASE fulfillment_export.provider
+             WHEN 'shopify' THEN 'shopify.fulfillment.create'
+             WHEN 'faire' THEN 'faire.fulfillment.shipments.create'
+             ELSE ''
+           END
+           AND attempt.external_object_id = fulfillment_export.global_id
+         ORDER BY attempt.attempt_number DESC, attempt.requested_at DESC,
+                  attempt.id DESC
+         LIMIT 1
+       ) provider_attempt ON true
+       WHERE fulfillment_export.organization_id = $1::uuid
+         AND fulfillment_export.global_id = $2
+       LIMIT 1
+       FOR UPDATE OF fulfillment_export`,
+      [input.organizationId, input.commerceExportGlobalId],
+    )
+    const row = result.rows[0]
+    if (!row) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_EXPORT_NOT_FOUND',
+        'Commerce fulfillment export was not found',
+        404,
+      )
+    }
+    const decision = customerNotificationDecision(
+      json(row.payload_snapshot).customerNotification,
+    )
+    if (['succeeded', 'unsupported'].includes(row.state)) {
+      return { row, decision, terminal: true as const }
+    }
+    if (
+      !input.preclaimed
+      &&
+      row.state === 'processing'
+      && Date.now() - row.updated_at.getTime() < 5 * 60_000
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_EXPORT_IN_PROGRESS',
+        'This commerce fulfillment export is already being processed',
+        409,
+      )
+    }
+    const exportSnapshot = json(row.payload_snapshot)
+    const usesSafeShopifyAttemptProtocol = (
+      exportSnapshot.providerWriteProtocol
+      === 'shopify-fulfillment-attempt-v2'
+    )
+    const usesSafeFaireAttemptProtocol = (
+      exportSnapshot.providerWriteProtocol
+      === FAIRE_FULFILLMENT_PROVIDER_WRITE_PROTOCOL
+    )
+    const priorState: 'queued' | 'processing' | 'failed' = (
+      input.preclaimed?.priorState
+      || (row.state === 'processing' || row.state === 'failed'
+        ? row.state
+        : 'queued')
+    )
+    const priorErrorCode = input.preclaimed
+      ? input.preclaimed.priorErrorCode
+      : row.error_code
+    const recoveryMode = commerceFulfillmentRecoveryMode({
+      provider: row.provider,
+      priorState,
+      priorErrorCode,
+      hasProviderAttempt: Boolean(row.provider_attempt_global_id),
+      providerAttemptState: row.provider_attempt_state,
+      usesSafeShopifyAttemptProtocol,
+      usesSafeFaireAttemptProtocol,
+    })
+    let claimedRow: CommerceFulfillmentExportExecutionRow
+    if (input.preclaimed) {
+      if (
+        row.state !== 'processing'
+        || row.attempts !== input.preclaimed.attempt
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_COMMERCE_EXPORT_CHANGED',
+          'Commerce fulfillment export changed after the recovery worker claim',
+          409,
+        )
+      }
+      claimedRow = row
+    } else {
+      const updated = await client.query<CommerceFulfillmentExportExecutionRow>(
+        `UPDATE operations_commerce_fulfillment_exports
+         SET state = 'processing', attempts = attempts + 1,
+             provider_reference = NULL, error_code = NULL, error_message = NULL,
+             completed_at = NULL, updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND global_id = $2
+           AND attempts = $3
+           AND state = $4
+         RETURNING global_id, provider, state, external_order_id,
+                   payload_snapshot, idempotency_key, attempts,
+                   provider_reference, error_code, error_message, updated_at,
+                   NULL::text AS integration_account_id,
+                   NULL::text AS account_global_id,
+                   NULL::text AS provider_attempt_id,
+                   NULL::text AS provider_attempt_global_id,
+                   NULL::text AS provider_attempt_state,
+                   NULL::integer AS provider_attempt_number,
+                   NULL::text AS provider_attempt_request_hash,
+                   NULL::jsonb AS provider_attempt_request`,
+        [
+          input.organizationId,
+          input.commerceExportGlobalId,
+          row.attempts,
+          row.state,
+        ],
+      )
+      if (updated.rowCount !== 1) {
+        throw new OperationsRequestError(
+          'OPERATIONS_COMMERCE_EXPORT_CHANGED',
+          'Commerce fulfillment export changed before it could be retried',
+          409,
+        )
+      }
+      claimedRow = {
+        ...updated.rows[0],
+        order_id: row.order_id,
+        order_currency: row.order_currency,
+        integration_account_id: row.integration_account_id,
+        account_global_id: row.account_global_id,
+        provider_attempt_id: row.provider_attempt_id,
+        provider_attempt_global_id: row.provider_attempt_global_id,
+        provider_attempt_state: row.provider_attempt_state,
+        provider_attempt_number: row.provider_attempt_number,
+        provider_attempt_request_hash: row.provider_attempt_request_hash,
+        provider_attempt_request: row.provider_attempt_request,
+      }
+    }
+    await recordAuditEvent({
+      actor: input.preclaimed ? 'system' : input.actorEmail,
+      isSystem: Boolean(input.preclaimed),
+      eventType: 'operations.commerce_fulfillment.attempted',
+      aggregateType: 'operations.commerce_fulfillment_export',
+      aggregateId: row.global_id,
+      subject: `Commerce fulfillment export ${row.global_id}`,
+      organizationId: input.organizationId,
+      eventKey: input.auditEventKey,
+      payload: {
+        provider: row.provider,
+        attempt: claimedRow.attempts,
+        priorState,
+        recoveryMode,
+        reason: input.reason,
+        recoveryWorkerId: input.preclaimed?.workerId || null,
+        originalConfirmer: input.preclaimed ? input.actorEmail : null,
+        customerNotification: decision,
+      },
+    }, client)
+    return {
+      row: claimedRow,
+      decision,
+      recoveryMode,
+      terminal: false as const,
+    }
+  })
+
+  if (claimed.terminal) {
+    return {
+      commerceExportGlobalId: claimed.row.global_id,
+      state: claimed.row.state as OperationsCommerceFulfillmentRetryResult['state'],
+      providerReference: claimed.row.provider_reference,
+      errorCode: claimed.row.error_code,
+      errorMessage: claimed.row.error_message,
+      customerNotification: claimed.decision,
+      replayed: true,
+    }
+  }
+
+  const snapshot = json(claimed.row.payload_snapshot)
+  const trackingNumbers = Array.isArray(snapshot.trackingNumbers)
+    ? [...new Set(snapshot.trackingNumbers
+        .filter((value): value is string => typeof value === 'string')
+        .map((value) => value.trim())
+        .filter(Boolean))]
+    : typeof snapshot.trackingNumber === 'string'
+      ? [snapshot.trackingNumber.trim()].filter(Boolean)
+      : []
+  const carrier = typeof snapshot.carrier === 'string'
+    ? snapshot.carrier.trim()
+    : ''
+  const shippedAt = typeof snapshot.shippedAt === 'string'
+    ? snapshot.shippedAt
+    : ''
+  let state: OperationsCommerceFulfillmentRetryResult['state'] = 'failed'
+  let providerReference: string | null = null
+  let errorCode: string | null = null
+  let errorMessage: string | null = null
+  let registeredProviderAttempt: {
+    id: string
+    globalId: string
+    requestHash: string
+  } | null = null
+  let providerAttemptResponse: Record<string, unknown> | null = null
+  try {
+    if (!carrier || trackingNumbers.length === 0) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_EXPORT_SNAPSHOT_INVALID',
+        'Commerce fulfillment export tracking evidence is incomplete',
+        409,
+      )
+    }
+    if (claimed.row.provider === 'mock-commerce') {
+      if (claimed.recoveryMode === 'reconcile_only') {
+        errorCode = 'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
+        errorMessage = (
+          'A stale fulfillment export was fenced. Repeated recovery remains '
+          + 'read-only until provider state is unambiguous.'
+        )
+      } else {
+        const commerceAdapter = new MockCommerceAdapter()
+        const result = await commerceAdapter.updateFulfillment({
+          externalOrderId: claimed.row.external_order_id,
+          trackingNumber: trackingNumbers[0],
+          carrier,
+          shippedAt,
+          idempotencyKey: claimed.row.idempotency_key,
+        })
+        state = result.accepted ? 'succeeded' : 'failed'
+        providerReference = result.providerReference || null
+        if (!result.accepted) {
+          errorCode = 'OPERATIONS_COMMERCE_EXPORT_REJECTED'
+          errorMessage = 'The commerce provider rejected the fulfillment export.'
+        }
+      }
+    } else if (claimed.row.provider === 'shopify') {
+      if (
+        !claimed.row.account_global_id
+        || !claimed.row.integration_account_id
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PROVIDER_ACCOUNT_REQUIRED',
+          'The Shopify fulfillment export is missing its integration account',
+          409,
+        )
+      }
+      if (!Array.isArray(snapshot.shippedLines)) {
+        throw new OperationsRequestError(
+          'OPERATIONS_SHOPIFY_FULFILLMENT_SIGNATURE_REQUIRED',
+          'The Shopify fulfillment export lacks exact packaged line evidence and requires manual review',
+          409,
+        )
+      }
+      const writebackInput = {
+        organizationId: input.organizationId,
+        accountGlobalId: claimed.row.account_global_id,
+        externalOrderId: claimed.row.external_order_id,
+        trackingNumbers,
+        carrier,
+        notifyCustomer: claimed.decision.notifyCustomer === true,
+        expectedLineItems: snapshot.shippedLines,
+      }
+      if (claimed.recoveryMode === 'reconcile_only') {
+        if (!claimed.row.provider_attempt_request) {
+          throw new OperationsRequestError(
+            'OPERATIONS_SHOPIFY_FULFILLMENT_SIGNATURE_REQUIRED',
+            'The prior Shopify attempt predates durable exact signatures and cannot be replayed safely',
+            409,
+          )
+        }
+        const observed = await reconcileShopifyFulfillmentWriteback(
+          {
+            ...writebackInput,
+            attemptSignature: claimed.row.provider_attempt_request,
+          },
+        )
+        if (observed) {
+          state = 'succeeded'
+          providerReference = observed.providerReference
+        } else {
+          errorCode = 'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
+          errorMessage = (
+            'The durable Shopify attempt has no exact matching fulfillment yet. '
+            + 'No provider write was made; later retries remain read-only.'
+          )
+        }
+      } else {
+        const prepared = await prepareShopifyFulfillmentWriteback(writebackInput)
+        if (prepared.existing) {
+          state = 'succeeded'
+          providerReference = prepared.existing.providerReference
+        } else {
+          registeredProviderAttempt =
+            await registerShopifyFulfillmentProviderAttempt({
+              organizationId: input.organizationId,
+              actorEmail: input.actorEmail,
+              commerceExportGlobalId: input.commerceExportGlobalId,
+              integrationAccountId: claimed.row.integration_account_id,
+              exportIdempotencyKey: claimed.row.idempotency_key,
+              exportAttempt: claimed.row.attempts,
+              preparedRequest: prepared.signature,
+            })
+          const result = await executeShopifyFulfillmentWriteback({
+            ...writebackInput,
+            attemptSignature: prepared.signature,
+          })
+          state = 'succeeded'
+          providerReference = result.providerReference
+        }
+      }
+    } else if (claimed.row.provider === 'faire') {
+      if (
+        !claimed.row.account_global_id
+        || !claimed.row.integration_account_id
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PROVIDER_ACCOUNT_REQUIRED',
+          'The Faire fulfillment export is missing its integration account',
+          409,
+        )
+      }
+      let attemptRequest: FaireFulfillmentAttemptRequest
+      let mode: 'execute' | 'reconcile_unknown'
+      let writeAttempt: {
+        attemptId: string
+        authorizationRevision: number
+        state: 'authorized' | 'outcome_unknown'
+      }
+      if (claimed.recoveryMode === 'reconcile_only') {
+        if (
+          !claimed.row.provider_attempt_global_id
+          || !claimed.row.provider_attempt_request
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_FAIRE_FULFILLMENT_SIGNATURE_REQUIRED',
+            'The Faire export predates exact durable package evidence and cannot be submitted safely',
+            409,
+          )
+        }
+        attemptRequest = normalizeFaireFulfillmentAttemptRequest(
+          claimed.row.provider_attempt_request,
+          claimed.row.external_order_id,
+        )
+        requireFaireFulfillmentAttemptRequestHash(
+          attemptRequest,
+          claimed.row.provider_attempt_request_hash,
+        )
+        mode = 'reconcile_unknown'
+        writeAttempt = {
+          attemptId: claimed.row.provider_attempt_global_id,
+          authorizationRevision: attemptRequest.authorizationRevision,
+          state: 'outcome_unknown',
+        }
+        if (
+          claimed.row.provider_attempt_state === 'prepared'
+          && claimed.row.provider_attempt_id
+          && claimed.row.provider_attempt_request_hash
+        ) {
+          registeredProviderAttempt = {
+            id: claimed.row.provider_attempt_id,
+            globalId: claimed.row.provider_attempt_global_id,
+            requestHash: claimed.row.provider_attempt_request_hash,
+          }
+        }
+      } else {
+        const packages = await requireFaireFulfillmentPackageMakerCosts({
+          organizationId: input.organizationId,
+          orderId: claimed.row.order_id,
+          orderCurrency: claimed.row.order_currency,
+          packages: normalizeFaireFulfillmentPackages(snapshot.packages),
+        })
+        const authority = await prepareCurrentFaireFulfillmentAuthority({
+          organizationId: input.organizationId,
+          accountGlobalId: claimed.row.account_global_id,
+        })
+        attemptRequest = normalizeFaireFulfillmentAttemptRequest({
+          version: 1,
+          externalOrderId: claimed.row.external_order_id,
+          expectedShipDate: shippedAt,
+          authorizationRevision: authority.authorizationRevision,
+          packages,
+        }, claimed.row.external_order_id)
+        registeredProviderAttempt =
+          await registerFaireFulfillmentProviderAttempt({
+            organizationId: input.organizationId,
+            actorEmail: input.actorEmail,
+            commerceExportGlobalId: input.commerceExportGlobalId,
+            integrationAccountId: claimed.row.integration_account_id,
+            exportIdempotencyKey: claimed.row.idempotency_key,
+            exportAttempt: claimed.row.attempts,
+            preparedRequest: attemptRequest,
+          })
+        mode = 'execute'
+        writeAttempt = {
+          attemptId: registeredProviderAttempt.globalId,
+          authorizationRevision: attemptRequest.authorizationRevision,
+          state: 'authorized',
+        }
+      }
+      const result = await executeCurrentFaireFulfillmentWriteback({
+        organizationId: input.organizationId,
+        accountGlobalId: claimed.row.account_global_id,
+        mode,
+        writeAttempt,
+        externalOrderId: attemptRequest.externalOrderId,
+        expectedShipDate: attemptRequest.expectedShipDate,
+        packages: attemptRequest.packages,
+      })
+      providerAttemptResponse = {
+        outcome: result.outcome,
+        providerOrderId: result.providerOrderId,
+        providerState: result.providerState,
+        providerShipmentReferences: result.providerShipmentReferences,
+        trackingCodes: result.trackingCodes,
+        replayed: result.replayed,
+        reconciledUnknownOutcome: result.reconciledUnknownOutcome,
+        ...(result.outcome === 'unknown' ? { reason: result.reason } : {}),
+      }
+      if (result.outcome === 'succeeded') {
+        state = 'succeeded'
+        providerReference = result.providerOrderId
+      } else {
+        errorCode = 'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
+        errorMessage = (
+          'The one-shot Faire shipment outcome is unknown. '
+          + 'Later retries remain read-only until exact package tracking is observed.'
+        )
+      }
+    } else {
+      state = 'unsupported'
+      errorCode = 'OPERATIONS_COMMERCE_PROVIDER_UNSUPPORTED'
+      errorMessage = (
+        `Fulfillment export adapter for ${claimed.row.provider} is not configured.`
+      )
+    }
+  } catch (error) {
+    state = 'failed'
+    const faireAttemptIntegrityFailure = (
+      claimed.row.provider === 'faire'
+      && error
+      && typeof error === 'object'
+      && 'code' in error
+      && error.code === 'OPERATIONS_FAIRE_FULFILLMENT_SIGNATURE_INVALID'
+    )
+    const faireRecoveryErrorIsRetryable = (
+      claimed.row.provider === 'faire'
+      && faireFulfillmentErrorAllowsAutomaticReconciliation(error)
+    )
+    const providerOutcomeUnknown = (
+      (
+        claimed.row.provider === 'shopify'
+        && (
+          claimed.recoveryMode === 'reconcile_only'
+          || (
+            error
+            && typeof error === 'object'
+            && (
+              ('outcomeUnknown' in error && error.outcomeUnknown === true)
+              || ('retryable' in error && error.retryable === true)
+            )
+          )
+        )
+      )
+      || (
+        claimed.row.provider === 'faire'
+        && !faireAttemptIntegrityFailure
+        && faireRecoveryErrorIsRetryable
+        && (
+          Boolean(registeredProviderAttempt)
+          || Boolean(claimed.row.provider_attempt_global_id)
+        )
+      )
+    )
+    errorCode = providerOutcomeUnknown
+      ? 'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
+      : error && typeof error === 'object' && 'code' in error
+        ? String(error.code).slice(0, 128)
+        : 'OPERATIONS_COMMERCE_EXPORT_FAILED'
+    errorMessage = error instanceof Error
+      ? error.message.slice(0, 500)
+      : 'Commerce fulfillment export failed'
+  }
+
+  const providerAttemptToFinalize = registeredProviderAttempt
+  await withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:commerce-fulfillment-export:${input.organizationId}:${input.commerceExportGlobalId}`,
+    )
+    if (providerAttemptToFinalize) {
+      const providerAttemptState = state === 'succeeded'
+        ? 'succeeded'
+        : errorCode ===
+            'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
+          ? 'unknown'
+          : 'failed'
+      const finalizedProviderAttempt = await client.query(
+        `UPDATE operations_commerce_provider_attempts
+         SET state = $3, redacted_response = $4::jsonb,
+             provider_reference = $5, error_code = $6,
+             next_attempt_at = CASE WHEN $3 = 'unknown' THEN now() ELSE NULL END,
+             lease_token = NULL, lease_expires_at = NULL,
+             completed_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND state = 'prepared'`,
+        [
+          input.organizationId,
+          providerAttemptToFinalize.id,
+          providerAttemptState,
+          JSON.stringify({
+            commerceExportState: state,
+            providerReference,
+            errorCode,
+            errorMessage,
+            ...(providerAttemptResponse
+              ? { providerResult: providerAttemptResponse }
+              : {}),
+          }),
+          providerReference,
+          errorCode,
+        ],
+      )
+      if (finalizedProviderAttempt.rowCount !== 1) {
+        throw new OperationsRequestError(
+          'OPERATIONS_COMMERCE_EXPORT_CHANGED',
+          'The durable commerce provider attempt changed before finalization',
+          409,
+        )
+      }
+    }
+    const updated = await client.query(
+      `UPDATE operations_commerce_fulfillment_exports
+       SET state = $3, provider_reference = $4,
+           error_code = $5, error_message = $6,
+           completed_at = now(), updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+         AND state = 'processing'
+         AND attempts = $7`,
+      [
+        input.organizationId,
+        input.commerceExportGlobalId,
+        state,
+        providerReference,
+        errorCode,
+        errorMessage,
+        claimed.row.attempts,
+      ],
+    )
+    if (updated.rowCount !== 1) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_EXPORT_CHANGED',
+        'Commerce fulfillment export changed while the provider attempt was running',
+        409,
+      )
+    }
+    await recordAuditEvent({
+      actor: input.preclaimed ? 'system' : input.actorEmail,
+      isSystem: Boolean(input.preclaimed),
+      eventType: `operations.commerce_fulfillment.${state}`,
+      aggregateType: 'operations.commerce_fulfillment_export',
+      aggregateId: input.commerceExportGlobalId,
+      subject: `Commerce fulfillment export ${input.commerceExportGlobalId}`,
+      organizationId: input.organizationId,
+      eventKey: `${input.auditEventKey}:outcome`,
+      payload: {
+        provider: claimed.row.provider,
+        attempt: claimed.row.attempts,
+        recoveryMode: claimed.recoveryMode,
+        state,
+        providerReference,
+        errorCode,
+        errorMessage,
+        customerNotification: claimed.decision,
+        providerAttemptGlobalId:
+          providerAttemptToFinalize?.globalId
+          || claimed.row.provider_attempt_global_id,
+        providerAttemptRequestHash:
+          providerAttemptToFinalize?.requestHash
+          || null,
+        originalConfirmer: input.preclaimed ? input.actorEmail : null,
+      },
+    }, client)
+  })
+  return {
+    commerceExportGlobalId: input.commerceExportGlobalId,
+    state,
+    providerReference,
+    errorCode,
+    errorMessage,
+    customerNotification: claimed.decision,
+    replayed: false,
+  }
+}
+
+export async function retryOperationsCommerceFulfillmentExportFromPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  commerceExportGlobalId: string
+  reason: string
+  idempotencyKey: string
+}): Promise<OperationsCommerceFulfillmentRetryResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
+  const commerceExportGlobalId = String(input.commerceExportGlobalId || '').trim()
+  const reason = String(input.reason || '').trim()
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  if (!actorEmail) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ACTOR_REQUIRED',
+      'A signed-in user is required',
+      401,
+    )
+  }
+  if (!/^gfe(?:[0-9]{7}|[0-9a-v]{12})$/.test(commerceExportGlobalId)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_COMMERCE_EXPORT_INVALID',
+      'Commerce fulfillment export is invalid',
+    )
+  }
+  if (
+    reason.length < 10
+    || reason.length > 500
+    || /[\u0000-\u001f\u007f]/.test(reason)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_COMMERCE_EXPORT_RETRY_REASON_REQUIRED',
+      'A commerce fulfillment retry reason of 10-500 characters is required',
+    )
+  }
+  if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_IDEMPOTENCY_KEY_INVALID',
+      'A valid idempotency key is required',
+    )
+  }
+  const command = await prepareCommandReceipt({
+    organizationId,
+    commandType: 'retry_operations_commerce_fulfillment_export',
+    idempotencyKey,
+    requestHash: commandRequestHash({ commerceExportGlobalId, reason }),
+    actorEmail,
+  })
+  if (command.completed) {
+    const payload = command.receipt.result_payload
+    if (
+      payload
+      && payload.commerceExportGlobalId === commerceExportGlobalId
+      && ['succeeded', 'unsupported', 'failed']
+        .includes(String(payload.state))
+    ) {
+      return {
+        commerceExportGlobalId,
+        state: payload.state as OperationsCommerceFulfillmentRetryResult['state'],
+        providerReference: typeof payload.providerReference === 'string'
+          ? payload.providerReference
+          : null,
+        errorCode: typeof payload.errorCode === 'string' ? payload.errorCode : null,
+        errorMessage: typeof payload.errorMessage === 'string'
+          ? payload.errorMessage
+          : null,
+        customerNotification: customerNotificationDecision(
+          payload.customerNotification,
+        ),
+        replayed: true,
+      }
+    }
+    throw new OperationsRequestError(
+      'OPERATIONS_COMMAND_RECEIPT_INVALID',
+      'Completed fulfillment export retry result is unavailable',
+      409,
+    )
+  }
+  try {
+    const result = await executeOperationsCommerceFulfillmentExportFromPostgres({
+      organizationId,
+      actorEmail,
+      commerceExportGlobalId,
+      reason,
+      auditEventKey: `operations:commerce-fulfillment-retry:${command.receipt.id}`,
+    })
+    await withTransaction((client) => completeCommandReceipt(
+      client,
+      command.receipt.id,
+      commerceExportGlobalId,
+      result as unknown as Record<string, unknown>,
+    ))
+    return result
+  } catch (error) {
+    await failCommandReceipt(command.receipt.id, error)
+    throw error
+  }
+}
+
 export async function confirmOperationsOrderShipmentFromPostgres(input: {
   organizationId: string
   actorEmail: string
@@ -7958,6 +13663,10 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
   expectedRowVersion: number
   reason: string
   idempotencyKey: string
+  sandboxE2eAuthorizationGlobalId?: string | null
+  expectedNotificationPolicyRevision?: number | null
+  customerNotificationOverride?: boolean | null
+  customerNotificationOverrideReason?: string | null
 }): Promise<OperationsShipmentCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
@@ -7965,13 +13674,70 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
   const preferredPrinterGlobalId = String(input.preferredPrinterGlobalId || '').trim() || null
   const reason = String(input.reason || '').trim()
   const idempotencyKey = String(input.idempotencyKey || '').trim()
+  const sandboxE2eAuthorizationGlobalId = String(
+    input.sandboxE2eAuthorizationGlobalId || '',
+  ).trim() || null
+  const expectedNotificationPolicyRevision =
+    input.expectedNotificationPolicyRevision ?? null
+  if (
+    expectedNotificationPolicyRevision !== null
+    && (
+      !Number.isSafeInteger(expectedNotificationPolicyRevision)
+      || expectedNotificationPolicyRevision < 0
+    )
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_NOTIFICATION_POLICY_REVISION_INVALID',
+      'A valid fulfillment notification policy revision is required',
+    )
+  }
+  if (
+    input.customerNotificationOverride !== undefined
+    && input.customerNotificationOverride !== null
+    && typeof input.customerNotificationOverride !== 'boolean'
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_NOTIFICATION_OVERRIDE_INVALID',
+      'Customer notification override must be true or false',
+    )
+  }
+  const customerNotificationOverride =
+    typeof input.customerNotificationOverride === 'boolean'
+      ? input.customerNotificationOverride
+      : null
+  const customerNotificationOverrideReason = String(
+    input.customerNotificationOverrideReason || '',
+  ).trim() || null
+  if (
+    customerNotificationOverride !== null
+    && (
+      !customerNotificationOverrideReason
+      || customerNotificationOverrideReason.length < 10
+      || customerNotificationOverrideReason.length > 500
+      || /[\u0000-\u001f\u007f]/.test(customerNotificationOverrideReason)
+    )
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_NOTIFICATION_OVERRIDE_REASON_REQUIRED',
+      'A customer notification exception reason of 10-500 characters is required',
+    )
+  }
+  if (
+    customerNotificationOverride === null
+    && customerNotificationOverrideReason
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_NOTIFICATION_OVERRIDE_REASON_INVALID',
+      'A customer notification exception reason requires an explicit override',
+    )
+  }
   if (!actorEmail) {
     throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
   }
-  if (!/^gor\d{7}$/.test(orderGlobalId)) {
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
   }
-  if (preferredPrinterGlobalId && !/^gpr\d{7}$/.test(preferredPrinterGlobalId)) {
+  if (preferredPrinterGlobalId && !/^gpr(?:[0-9]{7}|[0-9a-v]{12})$/.test(preferredPrinterGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_PRINTER_INVALID', 'Preferred printer is invalid')
   }
   if (!Number.isSafeInteger(input.expectedRowVersion) || input.expectedRowVersion < 0) {
@@ -7989,6 +13755,15 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
       'A valid idempotency key is required',
     )
   }
+  if (
+    sandboxE2eAuthorizationGlobalId
+    && !/^gsea(?:[0-9]{7}|[0-9a-v]{12})$/.test(sandboxE2eAuthorizationGlobalId)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_SANDBOX_E2E_AUTHORIZATION_INVALID',
+      'Sandbox E2E authorization is invalid',
+    )
+  }
 
   const command = await prepareCommandReceipt({
     organizationId,
@@ -7999,6 +13774,10 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
       preferredPrinterGlobalId,
       expectedRowVersion: input.expectedRowVersion,
       reason,
+      sandboxE2eAuthorizationGlobalId,
+      expectedNotificationPolicyRevision,
+      customerNotificationOverride,
+      customerNotificationOverrideReason,
     }),
     actorEmail,
   })
@@ -8008,10 +13787,6 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
 
   type ShipmentCommitContext = {
     result: OperationsShipmentCommandResult
-    sourceProvider: string
-    externalOrderId: string
-    carrier: string
-    shippedAt: string
     warehouseId: string
     storageReference: string
     renderedPackingSlip: ReturnType<typeof renderPackingSlip>
@@ -8039,6 +13814,8 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         customer_global_id: string
         customer_name: string
         source_provider: string
+        integration_account_id: string | null
+        integration_account_global_id: string
         external_order_id: string
         order_number: string
         currency: string
@@ -8050,7 +13827,10 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
                 source_order.customer_id::text,
                 customer.reference_code AS customer_global_id,
                 customer.name AS customer_name,
-                source_order.source_provider, source_order.external_order_id,
+                source_order.source_provider,
+                source_order.integration_account_id::text,
+                integration.global_id AS integration_account_global_id,
+                source_order.external_order_id,
                 source_order.order_number, source_order.currency,
                 source_order.ship_to,
                 (SELECT count(*)::text
@@ -8061,6 +13841,9 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
          JOIN crm_organizations customer
            ON customer.pipeline_id = source_order.pipeline_id
           AND customer.id = source_order.customer_id
+         JOIN operations_integration_accounts integration
+           ON integration.organization_id = source_order.organization_id
+          AND integration.id = source_order.integration_account_id
          WHERE source_order.organization_id = $1::uuid
            AND source_order.global_id = $2
          FOR UPDATE OF source_order`,
@@ -8088,14 +13871,144 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           409,
         )
       }
+      let resolvedCustomerNotification: OperationsCustomerNotificationDecision
+      let sandboxE2eAuthorizationValidated = false
+      if (sandboxE2eAuthorizationGlobalId) {
+        await requireActiveSandboxCommerceE2eAuthorization(client, {
+          organizationId,
+          authorizationGlobalId: sandboxE2eAuthorizationGlobalId,
+          orderGlobalId,
+          actorEmail,
+        })
+        sandboxE2eAuthorizationValidated = true
+      }
+      if (order.source_provider === 'shopify') {
+        if (!order.integration_account_id) {
+          throw new OperationsRequestError(
+            'OPERATIONS_PROVIDER_ACCOUNT_REQUIRED',
+            'The Shopify order is missing its integration account. Reconcile the order before confirming shipment.',
+            409,
+          )
+        }
+        await acquireTransactionAdvisoryLock(
+          client,
+          [
+            'shopify-inventory-apply',
+            organizationId,
+            order.integration_account_id,
+          ].join(':'),
+        )
+        await acquireTransactionAdvisoryLock(
+          client,
+          [
+            'commerce',
+            'shopify-fulfillment-notification-policy',
+            organizationId,
+            order.integration_account_id,
+          ].join(':'),
+        )
+        const policyResult = await client.query<{
+          notify_customer_default: boolean
+          revision: string | number
+        }>(
+          `SELECT notify_customer_default, revision::text
+           FROM operations_shopify_fulfillment_notification_policies
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+           FOR UPDATE`,
+          [organizationId, order.integration_account_id],
+        )
+        const policy = policyResult.rows[0] || null
+        const policyRevision = policy ? Number(policy.revision) : 0
+        const policyDefault = policy?.notify_customer_default === true
+        if (
+          expectedNotificationPolicyRevision === null
+          || expectedNotificationPolicyRevision !== policyRevision
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_NOTIFICATION_POLICY_REVISION_CONFLICT',
+            'The Shopify fulfillment notification policy changed. Refresh the order before confirming shipment.',
+            409,
+          )
+        }
+        if (sandboxE2eAuthorizationGlobalId) {
+          if (customerNotificationOverride === true) {
+            throw new OperationsRequestError(
+              'OPERATIONS_SANDBOX_NOTIFICATION_BLOCKED',
+              'Sandbox E2E shipments cannot notify Shopify customers',
+              409,
+            )
+          }
+          resolvedCustomerNotification = {
+            mode: 'clawpilot_explicit',
+            notifyCustomer: false,
+            source: 'sandbox_e2e_suppression',
+            accountPolicyRevision: policyRevision,
+            overrideReason: null,
+            decidedBy: actorEmail,
+          }
+        } else if (customerNotificationOverride !== null) {
+          if (customerNotificationOverride === policyDefault) {
+            throw new OperationsRequestError(
+              'OPERATIONS_NOTIFICATION_OVERRIDE_NOT_EXCEPTION',
+              'The requested customer notification value matches the Shopify account default',
+              409,
+            )
+          }
+          resolvedCustomerNotification = {
+            mode: 'clawpilot_explicit',
+            notifyCustomer: customerNotificationOverride,
+            source: 'order_override',
+            accountPolicyRevision: policyRevision,
+            overrideReason: customerNotificationOverrideReason,
+            decidedBy: actorEmail,
+          }
+        } else {
+          resolvedCustomerNotification = {
+            mode: 'clawpilot_explicit',
+            notifyCustomer: policyDefault,
+            source: 'account_default',
+            accountPolicyRevision: policyRevision,
+            overrideReason: null,
+            decidedBy: actorEmail,
+          }
+        }
+      } else if (order.source_provider === 'faire') {
+        if (customerNotificationOverride !== null) {
+          throw new OperationsRequestError(
+            'OPERATIONS_NOTIFICATION_PROVIDER_MANAGED',
+            'Faire manages retailer shipment notifications and does not accept a ClawPilot override',
+            409,
+          )
+        }
+        resolvedCustomerNotification = {
+          mode: 'provider_managed',
+          notifyCustomer: null,
+          source: 'provider_managed',
+          accountPolicyRevision: null,
+          overrideReason: null,
+          decidedBy: actorEmail,
+        }
+      } else {
+        resolvedCustomerNotification = {
+          mode: 'clawpilot_explicit',
+          notifyCustomer: false,
+          source: 'legacy_safe_default',
+          accountPolicyRevision: null,
+          overrideReason: null,
+          decidedBy: actorEmail,
+        }
+      }
 
       const planResult = await client.query<QueryResultRow & {
         id: string
         global_id: string
         status: string
         warehouse_id: string
+        cartonization_evidence_id: string | null
       }>(
-        `SELECT id::text, global_id, status, warehouse_id::text
+        `SELECT id::text, global_id, status, warehouse_id::text,
+                cartonization_evidence_id::text
          FROM operations_fulfillment_plans
          WHERE organization_id = $1::uuid AND order_id = $2::uuid
          ORDER BY version_number DESC
@@ -8148,15 +14061,23 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
          FOR UPDATE`,
         [organizationId, plan.id],
       )
-      if (packageResult.rows.length !== 1 || packageResult.rows[0].status !== 'labeled') {
+      if (
+        packageResult.rows.length < 1
+        || packageResult.rows.some((item) => item.status !== 'labeled')
+        || (
+          !sandboxE2eAuthorizationGlobalId
+          && order.source_provider !== 'faire'
+          && packageResult.rows.length !== 1
+        )
+      ) {
         throw new OperationsRequestError(
           'OPERATIONS_SHIPMENT_PACKAGE_INVALID',
-          'Shipment confirmation currently requires exactly one verified, labeled package',
+          sandboxE2eAuthorizationGlobalId
+            ? 'Authorized sandbox E2E completion requires every package to have a verified label'
+            : 'Shipment confirmation requires a supported package set with every package verified and labeled',
           409,
         )
       }
-      const sourcePackage = packageResult.rows[0]
-
       const unresolvedAttempts = await client.query<QueryResultRow & {
         id: string
         state: string
@@ -8185,40 +14106,81 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         carrier: string
         service_code: string
         internal_cost_minor: string
+        package_id: string
+        package_global_id: string
       }>(
         `SELECT label.id::text, label.global_id, label.environment,
                 label.tracking_number, label.carrier, label.service_code,
-                rate.internal_cost_minor::text
+                rate.internal_cost_minor::text,
+                package.id::text AS package_id,
+                package.global_id AS package_global_id
          FROM operations_labels label
+         JOIN operations_packages package
+           ON package.organization_id = label.organization_id
+          AND package.id = label.package_id
          JOIN operations_carrier_rates rate
            ON rate.organization_id = label.organization_id
           AND rate.id = label.carrier_rate_id
          WHERE label.organization_id = $1::uuid
-           AND label.package_id = $2::uuid
+           AND package.plan_id = $2::uuid
            AND label.status = 'created'
-         ORDER BY label.created_at DESC, label.id DESC
+         ORDER BY package.package_number, label.created_at DESC, label.id DESC
          FOR UPDATE OF label`,
-        [organizationId, sourcePackage.id],
+        [organizationId, plan.id],
       )
-      if (labelResult.rows.length !== 1) {
+      if (
+        labelResult.rows.length !== packageResult.rows.length
+        || new Set(labelResult.rows.map((item) => item.package_id)).size
+          !== packageResult.rows.length
+      ) {
         throw new OperationsRequestError(
           'OPERATIONS_ACTIVE_LABEL_INVALID',
-          'Exactly one active carrier label is required before confirming shipment',
+          'Exactly one active carrier label is required for every package before confirming shipment',
           409,
         )
       }
-      const label = labelResult.rows[0]
-      if (label.environment === 'sandbox') {
+      if (
+        labelResult.rows.some((item) => item.environment === 'sandbox')
+        && !sandboxE2eAuthorizationGlobalId
+      ) {
         throw new OperationsRequestError(
           'OPERATIONS_SANDBOX_LABEL_CANNOT_SHIP',
           'Sandbox labels are test evidence only. Void the sandbox label; it cannot confirm shipment or consume inventory.',
           409,
         )
       }
-      if (!['mock', 'production'].includes(label.environment)) {
+      const allowedLabelEnvironments = sandboxE2eAuthorizationGlobalId
+        ? ['sandbox']
+        : ['mock', 'production']
+      if (labelResult.rows.some((item) => (
+        !allowedLabelEnvironments.includes(item.environment)
+      ))) {
         throw new OperationsRequestError(
           'OPERATIONS_LABEL_ENVIRONMENT_INVALID',
-          'Only mock or production label evidence may confirm a shipment',
+          sandboxE2eAuthorizationGlobalId
+            ? 'Authorized sandbox E2E completion requires sandbox labels only'
+            : 'Only mock or production label evidence may confirm a shipment',
+          409,
+        )
+      }
+      if (
+        order.source_provider === 'faire'
+        && labelResult.rows.some((item) => item.environment !== 'production')
+        && !sandboxE2eAuthorizationValidated
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_FAIRE_PRODUCTION_LABEL_REQUIRED',
+          'Faire fulfillment writeback requires a production carrier label for every package',
+          409,
+        )
+      }
+      if (
+        new Set(labelResult.rows.map((item) => item.carrier)).size !== 1
+        || new Set(labelResult.rows.map((item) => item.service_code)).size !== 1
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_LABEL_SERVICE_MISMATCH',
+          'Every package must use the same carrier and service',
           409,
         )
       }
@@ -8267,6 +14229,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         reservation_global_id: string
         reservation_quantity: string
         reservation_status: string
+        reservation_authority: 'local_balance' | 'provider_commitment'
         position_id: string
         position_global_id: string
         position_warehouse_id: string
@@ -8288,6 +14251,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
                 reservation.global_id AS reservation_global_id,
                 reservation.quantity::text AS reservation_quantity,
                 reservation.status AS reservation_status,
+                reservation.reservation_authority,
                 position.id::text AS position_id,
                 position.global_id AS position_global_id,
                 position.warehouse_id::text AS position_warehouse_id,
@@ -8307,6 +14271,8 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
          JOIN operations_reservations reservation
            ON reservation.organization_id = allocation.organization_id
           AND reservation.id = allocation.reservation_id
+          AND reservation.order_line_id = allocation.order_line_id
+          AND reservation.position_id = allocation.position_id
          JOIN operations_inventory_positions position
            ON position.organization_id = allocation.organization_id
           AND position.id = allocation.position_id
@@ -8331,6 +14297,14 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           allocation.reservation_status !== 'active'
           || numberValue(allocation.reservation_quantity) !== quantity
           || allocation.position_warehouse_id !== plan.warehouse_id
+          || (
+            allocation.source_authority === 'shopify'
+            && allocation.reservation_authority !== 'provider_commitment'
+          )
+          || (
+            allocation.source_authority === 'clawpilot'
+            && allocation.reservation_authority !== 'local_balance'
+          )
         ) {
           throw new OperationsRequestError(
             'OPERATIONS_RESERVATION_INVALID',
@@ -8357,30 +14331,93 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         )
       }
 
-      const shipmentResult = await client.query<IdRow & { shipped_at: Date }>(
-        `INSERT INTO operations_shipments (
-           organization_id, order_id, plan_id, package_id, label_id, status,
-           tracking_number, shipped_at, quoted_carrier_cost_minor, confirmed_by
-         ) VALUES (
-           $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 'confirmed',
-           $6, now(), $7, $8
-         )
-         RETURNING id::text, global_id, shipped_at`,
-        [
+      const providerCommitmentRevalidation =
+        await revalidateProviderCommitmentsForPlan(
+          client,
+          {
+            organizationId,
+            planId: plan.id,
+          },
+        )
+
+      const packagingConsumption =
+        await consumePackagingMaterialClaimsForPlan(client, {
           organizationId,
-          order.id,
-          plan.id,
-          sourcePackage.id,
-          label.id,
-          label.tracking_number,
-          label.internal_cost_minor,
+          planId: plan.id,
+          cartonizationEvidenceId: plan.cartonization_evidence_id,
           actorEmail,
-        ],
-      )
-      const shipment = shipmentResult.rows[0]
+        })
+
+      const shipments: Array<IdRow & {
+        shipped_at: Date
+        package_id: string
+        package_global_id: string
+        label_id: string
+        label_global_id: string
+        tracking_number: string
+        carrier: string
+        service_code: string
+        environment: 'mock' | 'sandbox' | 'production'
+        quoted_carrier_cost_minor: number
+      }> = []
+      for (const packageRow of packageResult.rows) {
+        const packageLabel = labelResult.rows.find(
+          (item) => item.package_id === packageRow.id,
+        )!
+        const shipmentResult = await client.query<IdRow & { shipped_at: Date }>(
+          `INSERT INTO operations_shipments (
+             organization_id, order_id, plan_id, package_id, label_id, status,
+             tracking_number, shipped_at, quoted_carrier_cost_minor, confirmed_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 'confirmed',
+             $6, now(), $7, $8
+           )
+           RETURNING id::text, global_id, shipped_at`,
+          [
+            organizationId,
+            order.id,
+            plan.id,
+            packageRow.id,
+            packageLabel.id,
+            packageLabel.tracking_number,
+            sandboxE2eAuthorizationGlobalId
+              ? 0
+              : packageLabel.internal_cost_minor,
+            actorEmail,
+          ],
+        )
+        shipments.push({
+          ...shipmentResult.rows[0],
+          package_id: packageRow.id,
+          package_global_id: packageRow.global_id,
+          label_id: packageLabel.id,
+          label_global_id: packageLabel.global_id,
+          tracking_number: packageLabel.tracking_number,
+          carrier: packageLabel.carrier,
+          service_code: packageLabel.service_code,
+          environment: packageLabel.environment,
+          quoted_carrier_cost_minor: sandboxE2eAuthorizationGlobalId
+            ? 0
+            : Number(packageLabel.internal_cost_minor),
+        })
+      }
+      const shipment = shipments[0]
       const shippedAt = shipment.shipped_at.toISOString()
 
+      let localInventoryConsumptionCount = 0
+      let providerCommitmentConsumptionCount = 0
       for (const allocation of allocations) {
+        if (allocation.source_authority === 'shopify') {
+          await consumeProviderCommitment(client, {
+            organizationId,
+            reservation: {
+              id: allocation.reservation_id,
+              global_id: allocation.reservation_global_id,
+            },
+          })
+          providerCommitmentConsumptionCount += 1
+          continue
+        }
         await consumeReservedInventory(client, {
           organizationId,
           order,
@@ -8402,114 +14439,190 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           quantity: numberValue(allocation.allocation_quantity),
           actorEmail,
         })
+        localInventoryConsumptionCount += 1
       }
 
-      const packingLines = [...new Map(allocations.map((allocation) => [
-        allocation.line_id,
-        {
-          productGlobalId: allocation.product_global_id,
-          productName: allocation.product_name,
-          channelSku: allocation.channel_sku,
-          quantity: numberValue(allocation.line_quantity),
-        },
-      ])).values()]
-      const packingSnapshot = {
-        orderGlobalId: order.global_id,
-        orderNumber: order.order_number,
-        customerName: order.customer_name,
-        customerGlobalId: order.customer_global_id,
-        shipmentGlobalId: shipment.global_id,
-        trackingNumber: label.tracking_number,
-        carrier: label.carrier,
-        serviceCode: label.service_code,
-        shippedAt,
-        shipTo: address(order.ship_to),
-        lines: packingLines,
+      const packageContentResult = await client.query<{
+        package_id: string
+        external_line_id: string
+        product_global_id: string
+        product_name: string
+        channel_sku: string
+        quantity: string
+      }>(
+        `SELECT content.package_id::text, source_line.external_line_id,
+                product.reference_code AS product_global_id,
+                product.name AS product_name, source_line.channel_sku,
+                content.quantity::text
+         FROM operations_package_contents content
+         JOIN operations_order_lines source_line
+           ON source_line.organization_id = content.organization_id
+          AND source_line.id = content.order_line_id
+         JOIN crm_products product
+           ON product.pipeline_id = source_line.pipeline_id
+          AND product.id = source_line.product_id
+         WHERE content.organization_id = $1::uuid
+           AND content.plan_id = $2::uuid
+         ORDER BY content.package_id, source_line.created_at, source_line.id`,
+        [organizationId, plan.id],
+      )
+      const artifactContexts: Array<{
+        artifact: IdRow
+        shipment: typeof shipments[number]
+        storageReference: string
+        renderedPackingSlip: ReturnType<typeof renderPackingSlip>
+      }> = []
+      for (const packageShipment of shipments) {
+        const packingSnapshot = {
+          orderGlobalId: order.global_id,
+          orderNumber: order.order_number,
+          customerName: order.customer_name,
+          customerGlobalId: order.customer_global_id,
+          shipmentGlobalId: packageShipment.global_id,
+          trackingNumber: packageShipment.tracking_number,
+          carrier: packageShipment.carrier,
+          serviceCode: packageShipment.service_code,
+          shippedAt: packageShipment.shipped_at.toISOString(),
+          shipTo: address(order.ship_to),
+          lines: packageContentResult.rows
+            .filter((line) => line.package_id === packageShipment.package_id)
+            .map((line) => ({
+              productGlobalId: line.product_global_id,
+              productName: line.product_name,
+              channelSku: line.channel_sku,
+              quantity: numberValue(line.quantity),
+            })),
+        }
+        if (packingSnapshot.lines.length < 1) {
+          throw new OperationsRequestError(
+            'OPERATIONS_PACKAGE_CONTENTS_INCOMPLETE',
+            'Every shipment package requires exact contents before confirmation',
+            409,
+          )
+        }
+        const renderedPackingSlip = renderPackingSlip(packingSnapshot)
+        const storageReference = (
+          `clawpilot-document:${packageShipment.global_id}:packing-slip:${renderedPackingSlip.contentSha256}`
+        )
+        const artifactResult = await client.query<IdRow>(
+          `INSERT INTO operations_print_artifacts (
+             organization_id, source_order_id, source_shipment_id, source_package_id,
+             document_type, format, media_size, content_sha256,
+             byte_length, storage_reference, created_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+             'packing_slip', 'PDF', 'letter', $5, $6, $7, $8
+           )
+           RETURNING id::text, global_id`,
+          [
+            organizationId, order.id, packageShipment.id,
+            packageShipment.package_id, renderedPackingSlip.contentSha256,
+            renderedPackingSlip.byteLength, storageReference, actorEmail,
+          ],
+        )
+        const artifact = artifactResult.rows[0]
+        await client.query(
+          `INSERT INTO operations_print_artifact_payloads (
+             artifact_id, organization_id, mime_type, filename, payload,
+             template_version, render_snapshot
+           ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7::jsonb)`,
+          [
+            artifact.id, organizationId, renderedPackingSlip.mimeType,
+            renderedPackingSlip.filename, renderedPackingSlip.payload,
+            PACKING_SLIP_TEMPLATE_VERSION, JSON.stringify(packingSnapshot),
+          ],
+        )
+        await client.query(
+          `INSERT INTO operations_tracking_observations (
+             organization_id, shipment_id, status, provider, location,
+             observed_at, source, raw_snapshot, idempotency_key, actor_email
+           ) VALUES (
+             $1::uuid, $2::uuid, 'confirmed', $3, NULL,
+             $4::timestamptz, 'shipment_confirmation', $5::jsonb, $6, $7
+           )`,
+          [
+            organizationId, packageShipment.id, packageShipment.carrier,
+            packageShipment.shipped_at.toISOString(), JSON.stringify({
+              shipmentGlobalId: packageShipment.global_id,
+              labelGlobalId: packageShipment.label_global_id,
+              trackingNumber: packageShipment.tracking_number,
+              environment: packageShipment.environment,
+              sandboxE2eAuthorizationGlobalId,
+            }), `${packageShipment.global_id}:tracking:confirmed`, actorEmail,
+          ],
+        )
+        artifactContexts.push({
+          artifact, shipment: packageShipment, storageReference,
+          renderedPackingSlip,
+        })
       }
-      const renderedPackingSlip = renderPackingSlip(packingSnapshot)
-      const storageReference = (
-        `clawpilot-document:${shipment.global_id}:packing-slip:${renderedPackingSlip.contentSha256}`
-      )
-      const artifactResult = await client.query<IdRow>(
-        `INSERT INTO operations_print_artifacts (
-           organization_id, source_order_id, source_shipment_id, source_package_id,
-           document_type, format, media_size, content_sha256,
-           byte_length, storage_reference, created_by
-         ) VALUES (
-           $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-           'packing_slip', 'PDF', 'letter', $5, $6, $7, $8
-         )
-         RETURNING id::text, global_id`,
-        [
-          organizationId,
-          order.id,
-          shipment.id,
-          sourcePackage.id,
-          renderedPackingSlip.contentSha256,
-          renderedPackingSlip.byteLength,
-          storageReference,
-          actorEmail,
-        ],
-      )
-      const artifact = artifactResult.rows[0]
-      await client.query(
-        `INSERT INTO operations_print_artifact_payloads (
-           artifact_id, organization_id, mime_type, filename, payload,
-           template_version, render_snapshot
-         ) VALUES (
-           $1::uuid, $2::uuid, $3, $4, $5, $6, $7::jsonb
-         )`,
-        [
-          artifact.id,
-          organizationId,
-          renderedPackingSlip.mimeType,
-          renderedPackingSlip.filename,
-          renderedPackingSlip.payload,
-          PACKING_SLIP_TEMPLATE_VERSION,
-          JSON.stringify(packingSnapshot),
-        ],
-      )
+      const artifact = artifactContexts[0].artifact
+      const renderedPackingSlip = artifactContexts[0].renderedPackingSlip
+      const storageReference = artifactContexts[0].storageReference
 
-      await client.query(
-        `INSERT INTO operations_tracking_observations (
-           organization_id, shipment_id, status, provider, location,
-           observed_at, source, raw_snapshot, idempotency_key, actor_email
-         ) VALUES (
-           $1::uuid, $2::uuid, 'confirmed', $3, NULL,
-           $4::timestamptz, 'shipment_confirmation', $5::jsonb, $6, $7
-         )`,
-        [
-          organizationId,
-          shipment.id,
-          label.carrier,
-          shippedAt,
-          JSON.stringify({
-            shipmentGlobalId: shipment.global_id,
-            labelGlobalId: label.global_id,
-            trackingNumber: label.tracking_number,
-            environment: label.environment,
-          }),
-          `${shipment.global_id}:tracking:confirmed`,
-          actorEmail,
-        ],
-      )
+      const shippedLineQuantities = new Map<string, number>()
+      for (const line of packageContentResult.rows) {
+        const quantity = numberValue(line.quantity)
+        if (
+          order.source_provider === 'shopify'
+          && (!Number.isSafeInteger(quantity) || quantity <= 0)
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_SHOPIFY_FULFILLMENT_LINE_INVALID',
+            'Shopify fulfillment requires positive whole-unit packaged quantities',
+            409,
+          )
+        }
+        shippedLineQuantities.set(
+          line.external_line_id,
+          (shippedLineQuantities.get(line.external_line_id) || 0) + quantity,
+        )
+      }
+      const shippedLines = [...shippedLineQuantities]
+        .map(([externalLineId, quantity]) => ({ externalLineId, quantity }))
+        .sort((left, right) => left.externalLineId.localeCompare(right.externalLineId))
 
       const exportSnapshot = {
         orderGlobalId: order.global_id,
         shipmentGlobalId: shipment.global_id,
         externalOrderId: order.external_order_id,
-        trackingNumber: label.tracking_number,
-        carrier: label.carrier,
-        serviceCode: label.service_code,
+        trackingNumber: shipment.tracking_number,
+        trackingNumbers: shipments.map((item) => item.tracking_number),
+        carrier: shipment.carrier,
+        serviceCode: shipment.service_code,
         shippedAt,
+        sandboxE2eAuthorizationGlobalId,
+        customerNotification: resolvedCustomerNotification,
+        ...(order.source_provider === 'shopify'
+          ? {
+              providerWriteProtocol: 'shopify-fulfillment-attempt-v2',
+              shippedLines,
+            }
+          : order.source_provider === 'faire'
+            ? {
+                providerWriteProtocol:
+                  FAIRE_FULFILLMENT_PROVIDER_WRITE_PROTOCOL,
+                packages: shipments.map((item) => ({
+                  packageReference: item.package_global_id,
+                  carrier: item.carrier,
+                  trackingCode: item.tracking_number,
+                  makerCost: {
+                    amountMinor: item.quoted_carrier_cost_minor,
+                    currency: order.currency,
+                  },
+                })),
+              }
+            : {}),
       }
+      const initialExportState = 'queued'
       const exportResult = await client.query<IdRow>(
         `INSERT INTO operations_commerce_fulfillment_exports (
            organization_id, order_id, shipment_id, provider,
-           external_order_id, state, payload_snapshot, idempotency_key
+           external_order_id, state, payload_snapshot, idempotency_key,
+           completed_at
          ) VALUES (
            $1::uuid, $2::uuid, $3::uuid, $4, $5,
-           'queued', $6::jsonb, $7
+           $6, $7::jsonb, $8, NULL
          )
          RETURNING id::text, global_id`,
         [
@@ -8518,6 +14631,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           shipment.id,
           order.source_provider,
           order.external_order_id,
+          initialExportState,
           JSON.stringify(exportSnapshot),
           `${shipment.global_id}:commerce-fulfillment`,
         ],
@@ -8528,12 +14642,12 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         `UPDATE operations_packages
          SET status = 'shipped'
          WHERE organization_id = $1::uuid
-           AND id = $2::uuid
+           AND plan_id = $2::uuid
            AND status = 'labeled'
          RETURNING id`,
-        [organizationId, sourcePackage.id],
+        [organizationId, plan.id],
       )
-      if (updatedPackage.rowCount !== 1) {
+      if (updatedPackage.rowCount !== packageResult.rows.length) {
         throw new OperationsRequestError(
           'OPERATIONS_PACKAGE_CHANGED',
           'The package changed before shipment confirmation. Refresh and try again.',
@@ -8575,6 +14689,14 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           409,
         )
       }
+      if (sandboxE2eAuthorizationGlobalId) {
+        await consumeSandboxCommerceE2eAuthorization(client, {
+          organizationId,
+          authorizationGlobalId: sandboxE2eAuthorizationGlobalId,
+          orderGlobalId,
+          actorEmail,
+        })
+      }
 
       await appendDomainEvent(client, {
         organizationId,
@@ -8587,13 +14709,30 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         idempotencyKey: `${shipment.global_id}:confirmed`,
         payload: {
           shipmentGlobalId: shipment.global_id,
-          labelGlobalId: label.global_id,
-          trackingNumber: label.tracking_number,
-          carrier: label.carrier,
-          serviceCode: label.service_code,
-          labelEnvironment: label.environment,
+          shipmentGlobalIds: shipments.map((item) => item.global_id),
+          labelGlobalId: shipment.label_global_id,
+          labelGlobalIds: shipments.map((item) => item.label_global_id),
+          trackingNumber: shipment.tracking_number,
+          trackingNumbers: shipments.map((item) => item.tracking_number),
+          carrier: shipment.carrier,
+          serviceCode: shipment.service_code,
+          labelEnvironment: shipment.environment,
+          sandboxE2eAuthorizationGlobalId,
           packingSlipArtifactGlobalId: artifact.global_id,
+          packingSlipArtifactGlobalIds: artifactContexts.map(
+            (item) => item.artifact.global_id,
+          ),
           commerceExportGlobalId: fulfillmentExport.global_id,
+          customerNotification: resolvedCustomerNotification,
+          providerCommitmentsRevalidated:
+            providerCommitmentRevalidation.count,
+          providerCommitmentInventorySyncRunGlobalIds:
+            providerCommitmentRevalidation
+              .latestInventorySyncRunGlobalIds,
+          packagingMaterialClaimsConsumed:
+            packagingConsumption.claimCount,
+          packagingMaterialQuantityConsumed:
+            packagingConsumption.quantity,
           reason,
         },
       })
@@ -8608,11 +14747,24 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         idempotencyKey: `${shipment.global_id}:inventory-consumed`,
         payload: {
           shipmentGlobalId: shipment.global_id,
+          shipmentGlobalIds: shipments.map((item) => item.global_id),
           allocations: allocations.map((allocation) => ({
             inventoryPositionGlobalId: allocation.position_global_id,
             productGlobalId: allocation.product_global_id,
             quantity: numberValue(allocation.allocation_quantity),
+            sourceAuthority: allocation.source_authority,
           })),
+          localInventoryConsumptionCount,
+          providerCommitmentConsumptionCount,
+          providerCommitmentsRevalidated:
+            providerCommitmentRevalidation.count,
+          providerCommitmentInventorySyncRunGlobalIds:
+            providerCommitmentRevalidation
+              .latestInventorySyncRunGlobalIds,
+          packagingMaterialClaimsConsumed:
+            packagingConsumption.claimCount,
+          packagingMaterialQuantityConsumed:
+            packagingConsumption.quantity,
         },
       })
       await appendDomainEvent(client, {
@@ -8623,7 +14775,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         eventType: 'operations.commerce_fulfillment.queued',
         actorEmail,
         correlationId: command.receipt.correlation_id,
-        idempotencyKey: `${fulfillmentExport.global_id}:queued`,
+        idempotencyKey: `${fulfillmentExport.global_id}:${initialExportState}`,
         payload: exportSnapshot,
       })
       await recordAuditEvent({
@@ -8640,11 +14792,28 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           previousRowVersion: input.expectedRowVersion,
           rowVersion: Number(shippedOrder.row_version),
           shipmentGlobalId: shipment.global_id,
-          labelGlobalId: label.global_id,
-          labelEnvironment: label.environment,
-          trackingNumber: label.tracking_number,
+          shipmentGlobalIds: shipments.map((item) => item.global_id),
+          labelGlobalId: shipment.label_global_id,
+          labelGlobalIds: shipments.map((item) => item.label_global_id),
+          labelEnvironment: shipment.environment,
+          trackingNumber: shipment.tracking_number,
+          trackingNumbers: shipments.map((item) => item.tracking_number),
+          sandboxE2eAuthorizationGlobalId,
           packingSlipArtifactGlobalId: artifact.global_id,
+          packingSlipArtifactGlobalIds: artifactContexts.map(
+            (item) => item.artifact.global_id,
+          ),
           commerceExportGlobalId: fulfillmentExport.global_id,
+          customerNotification: resolvedCustomerNotification,
+          providerCommitmentsRevalidated:
+            providerCommitmentRevalidation.count,
+          providerCommitmentInventorySyncRunGlobalIds:
+            providerCommitmentRevalidation
+              .latestInventorySyncRunGlobalIds,
+          packagingMaterialClaimsConsumed:
+            packagingConsumption.claimCount,
+          packagingMaterialQuantityConsumed:
+            packagingConsumption.quantity,
           reason,
         },
       }, client)
@@ -8654,10 +14823,11 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         orderStatus: 'shipped',
         rowVersion: Number(shippedOrder.row_version),
         shipmentGlobalId: shipment.global_id,
-        trackingNumber: label.tracking_number,
+        trackingNumber: shipment.tracking_number,
         packingSlipArtifactGlobalId: artifact.global_id,
         commerceExportGlobalId: fulfillmentExport.global_id,
         commerceExportState: 'failed',
+        customerNotification: resolvedCustomerNotification,
         replayed: false,
         printJobGlobalId: null,
         printWarning: 'Shipment committed; print and commerce post-processing are pending.',
@@ -8666,10 +14836,6 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
 
       return {
         result,
-        sourceProvider: order.source_provider,
-        externalOrderId: order.external_order_id,
-        carrier: label.carrier,
-        shippedAt,
         warehouseId: plan.warehouse_id,
         storageReference,
         renderedPackingSlip,
@@ -8718,62 +14884,20 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         : 'Packing slip is available, but automatic printing was not queued.'
     }
 
-    let commerceExportState: OperationsShipmentCommandResult['commerceExportState']
-    let providerReference: string | null = null
-    let exportErrorCode: string | null = null
-    let exportErrorMessage: string | null = null
-    if (context.sourceProvider === 'mock-commerce') {
-      try {
-        const commerceAdapter = new MockCommerceAdapter()
-        const exportResult = await commerceAdapter.updateFulfillment({
-          externalOrderId: context.externalOrderId,
-          trackingNumber: context.result.trackingNumber,
-          carrier: context.carrier,
-          shippedAt: context.shippedAt,
-          idempotencyKey: `${context.result.shipmentGlobalId}:commerce-fulfillment`,
-        })
-        commerceExportState = exportResult.accepted ? 'succeeded' : 'failed'
-        providerReference = exportResult.providerReference || null
-        if (!exportResult.accepted) {
-          exportErrorCode = 'OPERATIONS_COMMERCE_EXPORT_REJECTED'
-          exportErrorMessage = 'The commerce provider rejected the fulfillment export.'
-        }
-      } catch (error) {
-        commerceExportState = 'failed'
-        exportErrorCode = 'OPERATIONS_COMMERCE_EXPORT_FAILED'
-        exportErrorMessage = error instanceof Error
-          ? error.message.slice(0, 500)
-          : 'Commerce fulfillment export failed'
-      }
-    } else {
-      commerceExportState = 'unsupported'
-      exportErrorCode = 'OPERATIONS_COMMERCE_PROVIDER_UNSUPPORTED'
-      exportErrorMessage = (
-        `Fulfillment export adapter for ${context.sourceProvider} is not configured.`
-      )
-    }
-
-    await query(
-      `UPDATE operations_commerce_fulfillment_exports
-       SET state = $3, attempts = attempts + 1,
-           provider_reference = $4, error_code = $5, error_message = $6,
-           completed_at = now(), updated_at = now()
-       WHERE organization_id = $1::uuid
-         AND global_id = $2
-         AND state IN ('queued', 'processing')`,
-      [
+    const commerceExport =
+      await executeOperationsCommerceFulfillmentExportFromPostgres({
         organizationId,
-        context.result.commerceExportGlobalId,
-        commerceExportState,
-        providerReference,
-        exportErrorCode,
-        exportErrorMessage,
-      ],
-    )
+        actorEmail,
+        commerceExportGlobalId: context.result.commerceExportGlobalId,
+        reason: 'Automatic post-shipment fulfillment export',
+        auditEventKey:
+          `operations:commerce-fulfillment:${context.result.commerceExportGlobalId}:initial`,
+      })
 
     const result: OperationsShipmentCommandResult = {
       ...context.result,
-      commerceExportState,
+      commerceExportState: commerceExport.state,
+      customerNotification: commerceExport.customerNotification,
       printJobGlobalId,
       printWarning,
     }

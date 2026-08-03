@@ -1,0 +1,19 @@
+query ClawPilotVerifyTestRateIsolation($id: ID!) {
+  deliveryCustomization(id: $id) {
+    id
+    title
+    enabled
+    functionId
+    metafield(
+      namespace: "$app:clawpilot-test-rate-isolation"
+      key: "function-configuration"
+    ) {
+      id
+      namespace
+      key
+      type
+      jsonValue
+      updatedAt
+    }
+  }
+}

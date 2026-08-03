@@ -293,6 +293,7 @@ type CrmOutboxItemBase = {
   id: string
   aggregateType: string
   aggregateId: string
+  idempotencyKey: string | null
   attempts: number
   lockToken: string
 }
@@ -818,7 +819,7 @@ async function applyWorkspaceOrganizationIdentity(
   referenceCode: string | null | undefined,
 ) {
   if (!referenceCode) return row
-  if (!/^ga[0-9]{7}$/.test(referenceCode)) throw new Error('Workspace organization reference is invalid')
+  if (!/^ga(?:[0-9]{7}|[0-9a-v]{12})$/.test(referenceCode)) throw new Error('Workspace organization reference is invalid')
   const result = await client.query<{ id: string; suitecrm_id: string; reference_code: string }>(
     `UPDATE crm_organizations
      SET reference_code = $2, updated_at = now()
@@ -836,7 +837,7 @@ async function applyAppUserContactIdentity(
   referenceCode: string | null | undefined,
 ) {
   if (!email && !referenceCode) return row
-  if (!email || !referenceCode || !/^gc[0-9]{7}$/.test(referenceCode)) {
+  if (!email || !referenceCode || !/^gc(?:[0-9]{7}|[0-9a-v]{12})$/.test(referenceCode)) {
     throw new Error('App user contact identity is invalid')
   }
   const result = await client.query<{ id: string; suitecrm_id: string; reference_code: string }>(
@@ -1639,7 +1640,7 @@ async function currentCrmContactOwner(
   const referenceCode = clean(row?.owner_user_reference_code).toLowerCase()
   const email = clean(row?.owner_email).toLowerCase()
   const displayName = clean(row?.owner_display_name)
-  if (!/^gu[0-9]{7}$/.test(referenceCode) || !email || !displayName) return null
+  if (!/^gu(?:[0-9]{7}|[0-9a-v]{12})$/.test(referenceCode) || !email || !displayName) return null
   return {
     referenceCode,
     email,
@@ -1717,7 +1718,7 @@ async function normalizeStageContactOwner(
         },
       }
     }
-    if (!/^gu[0-9]{7}$/.test(requestedReference)) throw new Error('Contact owner identity is invalid')
+    if (!/^gu(?:[0-9]{7}|[0-9a-v]{12})$/.test(requestedReference)) throw new Error('Contact owner identity is invalid')
     const [owner] = await activeCrmContactOwners(client, {
       pipelineId: input.pipelineId,
       referenceCode: requestedReference,
@@ -4870,7 +4871,7 @@ export function crmEntityForReferenceCode(referenceValue: unknown): CrmEntity | 
 
 export async function resolveCrmReferenceCode(referenceValue: unknown): Promise<string> {
   const referenceCode = clean(referenceValue).toLowerCase()
-  if (!/^g[aciklmop][0-9]{7}$/.test(referenceCode)) throw new Error('CRM reference is invalid')
+  if (!/^g[aciklmop](?:[0-9]{7}|[0-9a-v]{12})$/.test(referenceCode)) throw new Error('CRM reference is invalid')
   if (!isPostgresStorageEnabled()) return referenceCode
   try {
     const result = await query<{ canonical_code: string }>(
@@ -4954,7 +4955,7 @@ export async function readCrmRecordByReference(input: {
 }) {
   const referenceCode = await resolveCrmReferenceCode(input.referenceCode)
   const entity = crmEntityForReferenceCode(referenceCode)
-  if (!entity || !/^g[aciklmop][0-9]{7}$/.test(referenceCode)) throw new Error('CRM reference is invalid')
+  if (!entity || !/^g[aciklmop](?:[0-9]{7}|[0-9a-v]{12})$/.test(referenceCode)) throw new Error('CRM reference is invalid')
   const table = ENTITY_TABLE[entity]
   const result = await query<{ id: string }>(
     `SELECT id::text FROM ${table} record
@@ -5059,7 +5060,8 @@ export async function claimSuiteCrmOutboxInPostgres(input: { limit?: number; max
          locked_at = now(), lock_token = $3, updated_at = now()
        FROM candidates WHERE outbox.id = candidates.id
        RETURNING outbox.id::text, outbox.aggregate_type, outbox.aggregate_id, outbox.operation,
-         outbox.payload, outbox.attempts, outbox.lock_token`,
+         outbox.payload, outbox.idempotency_key, outbox.attempts,
+         outbox.lock_token`,
       [maxAttempts, limit, lockToken],
     )
     for (const row of result.rows) {
@@ -5075,6 +5077,7 @@ export async function claimSuiteCrmOutboxInPostgres(input: { limit?: number; max
     return result.rows.map((row) => ({
       id: String(row.id), aggregateType: String(row.aggregate_type), aggregateId: String(row.aggregate_id),
       operation: row.operation, payload: row.payload,
+      idempotencyKey: row.idempotency_key ? String(row.idempotency_key) : null,
       attempts: Number(row.attempts), lockToken: String(row.lock_token),
     } as CrmOutboxItem))
   })
@@ -5085,7 +5088,15 @@ function tableForAggregate(aggregateType: string) {
   return ENTITY_TABLE[entity] || null
 }
 
-export async function completeSuiteCrmOutboxInPostgres(item: CrmOutboxItem) {
+export async function completeSuiteCrmOutboxInPostgres(
+  item: CrmOutboxItem,
+  completion: {
+    productImageProjection?: {
+      action: 'disabled' | 'unchanged' | 'attached' | 'cleared'
+      mediaId: string | null
+    } | null
+  } = {},
+) {
   return withTransaction(async (client) => {
     const completed = await client.query(
       `UPDATE sync_outbox SET status = 'succeeded', processed_at = now(), last_error = NULL,
@@ -5094,6 +5105,56 @@ export async function completeSuiteCrmOutboxInPostgres(item: CrmOutboxItem) {
       [item.id, item.lockToken],
     )
     if (!completed.rows[0]) throw new Error('SuiteCRM outbox lease was lost')
+    if (
+      item.operation !== 'upsert_user_identity'
+      && item.payload.entity === 'products'
+      && item.payload.productImage !== undefined
+      && completion.productImageProjection
+    ) {
+      const context = await client.query<{
+        organization_id: string
+        product_reference_code: string
+      }>(
+        `SELECT pipeline.workspace_organization_id::text AS organization_id,
+           product.reference_code AS product_reference_code
+         FROM crm_products product
+         JOIN pipeline_spaces pipeline
+           ON pipeline.id = product.pipeline_id
+          AND pipeline.workspace_organization_id IS NOT NULL
+         WHERE product.id = $1::uuid
+           AND product.pipeline_id = $2::uuid
+         LIMIT 1`,
+        [item.aggregateId, item.payload.pipelineId],
+      )
+      const resultContext = context.rows[0]
+      if (!resultContext) {
+        throw new Error('SuiteCRM Product image projection result context was not found')
+      }
+      await recordAuditEvent({
+        actor: 'system',
+        subject: 'system',
+        isSystem: true,
+        eventType: 'crm.product_image.suitecrm_native_projection_completed',
+        aggregateType: 'crm_product',
+        aggregateId: item.aggregateId,
+        organizationId: resultContext.organization_id,
+        eventKey: `crm-product-image-suitecrm-native-result:${item.id}:${item.attempts}`,
+        payload: {
+          pipelineId: item.payload.pipelineId,
+          productId: item.aggregateId,
+          productReferenceCode: resultContext.product_reference_code,
+          suiteCrmId: item.payload.suiteCrmId,
+          imageContentSha256: item.payload.productImage?.contentSha256 || null,
+          projectionRequired:
+            item.payload.productImageProjectionRequired === true,
+          action: completion.productImageProjection.action,
+          mediaId: completion.productImageProjection.mediaId,
+          outboxId: item.id,
+          outboxIdempotencyKey: item.idempotencyKey,
+          outboxAttempt: item.attempts,
+        },
+      }, client)
+    }
     const table = tableForAggregate(item.aggregateType)
     if (table && (item.operation === 'upsert_record' || item.operation === 'reproject_record')) {
       await client.query(

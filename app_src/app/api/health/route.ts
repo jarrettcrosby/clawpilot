@@ -5,6 +5,9 @@ import { getRepositoryRunnerConfiguration } from '@/lib/agents/repositoryRunnerC
 import { getStorageDriver, isHostedRuntime } from '@/lib/persistence/config'
 import { query as queryAgentCredentials } from '@/lib/persistence/agentCredentials'
 import { query } from '@/lib/persistence/postgres'
+import {
+  OPERATIONS_COMMAND_RECEIPT_HEALTH_QUERY,
+} from '@/lib/persistence/operationsCommandReceiptHealth'
 import { readPipelineOutboxWorkerHeartbeatFromPostgres } from '@/lib/persistence/pipeline'
 import { readAgentDispatchWorkerHeartbeatFromPostgres } from '@/lib/persistence/agentDispatch'
 import { readAgentResearchWorkerHeartbeatFromPostgres } from '@/lib/persistence/agentResearch'
@@ -13,17 +16,53 @@ import { readQuickBooksWorkerHeartbeatFromPostgres } from '@/lib/persistence/qui
 import {
   readCommerceCatalogWorkerHeartbeatFromPostgres,
 } from '@/lib/persistence/commerceCatalogSync'
+import {
+  readCommerceOrderReconciliationHealthFromPostgres,
+  readCommerceOrderReconciliationWorkerHeartbeatFromPostgres,
+} from '@/lib/persistence/commerceOrderReconciliation'
+import {
+  readShopifyInventoryRefreshHealthFromPostgres,
+  readShopifyInventoryRefreshWorkerHeartbeatFromPostgres,
+} from '@/lib/persistence/shopifyInventoryRefresh'
+import {
+  readFaireInventoryPollHealthFromPostgres,
+  readFaireInventoryPollWorkerHeartbeatFromPostgres,
+} from '@/lib/persistence/faireInventoryPolling'
+import {
+  readCommerceProductImageImportQueueHealthInPostgres,
+} from '@/lib/persistence/commerceProductImageImports'
+import {
+  readFaireProductImageProjectionHealthInPostgres,
+} from '@/lib/persistence/faireProductImageProjection'
 import { commerceIntakeRuntimeAvailable } from '@/lib/integrations/commerceIntake'
 import { effectiveDocumentEmbeddingConfiguration } from '@/lib/documentEmbeddings'
 import { validateShortLinkConfiguration } from '@/lib/shortlinks'
 import { readSuiteCrmWorkerHeartbeat } from '@/lib/persistence/crm'
 import { suiteCrmBaseUrl } from '@/lib/crm/suiteCrmClient'
+import {
+  suiteCrmProductImageReadConfiguration,
+} from '@/lib/crm/suiteCrmProductImageReadClient'
+import {
+  suiteCrmNativeProductImageProjectionConfiguration,
+} from '@/lib/crm/suiteCrmNativeProductImageClient'
+import {
+  readSuiteCrmProductImageIngestionHealthInPostgres,
+} from '@/lib/persistence/suiteCrmProductImageIngestion'
+import {
+  readSuiteCrmNativeProductImageProjectionHealthInPostgres,
+} from '@/lib/persistence/suiteCrmProductImageProjection'
 
 const DEV_LOG_PATH = '/tmp/clawd-app-dev.log'
 const FALLBACK_LOG_PATH = '/tmp/clawd-app.log'
 const ERROR_PATTERNS = [/⨯/, /Error:/, /error TS/, /TypeError/, /ReferenceError/, /SyntaxError/, /Unhandled/, /ENOENT/, /500/]
 const WINDOW_MS = 5 * 60 * 1000 // last 5 minutes
 const MAX_BYTES_TO_SCAN = 256 * 1024
+// SHA-256 over pg_proc.prosrc after removing full-line -- comments, collapsing
+// whitespace, and trimming. These pin the audited Faire grant-evidence bodies.
+const FAIRE_SCOPE_CURRENT_PROSRC_SHA256 =
+  'be9c9d5ce1442cf6c1df2aaffcf1dd075eeb24172fe1f7ec2e6d2002b98bea49'
+const FAIRE_SCOPE_TRIGGER_PROSRC_SHA256 =
+  '022f71dfd366bf18bc263d8dcfee07d96e9c4e199f797c25b085403105906a03'
 
 function resolveLogPath(): { path: string; expectedDevLogPresent: boolean; usedFallback: boolean } {
   const expectedDevLogPresent = fs.existsSync(DEV_LOG_PATH)
@@ -78,6 +117,48 @@ export async function GET() {
     let quickBooksWorker: Record<string, unknown> = { status: 'not-owned' }
     let commerceCatalogWorker: Record<string, unknown> = {
       status: 'disabled',
+    }
+    let commerceOrderReconciliationWorker: Record<string, unknown> = {
+      status: 'disabled',
+    }
+    let shopifyInventoryRefreshWorker: Record<string, unknown> = {
+      status: 'disabled',
+    }
+    let faireInventoryPollWorker: Record<string, unknown> = {
+      status: 'disabled',
+    }
+    let commerceProductImageImportWorker: Record<string, unknown> = {
+      status: 'disabled',
+    }
+    let faireProductImageProjection: Record<string, unknown> = {
+      status: 'unavailable',
+      latestResultAt: null,
+    }
+    const suiteCrmProductImageConfiguration =
+      suiteCrmProductImageReadConfiguration()
+    const suiteCrmNativeProductImageConfiguration =
+      suiteCrmNativeProductImageProjectionConfiguration()
+    let suiteCrmNativeProductImageProjection: Record<string, unknown> = {
+      status: suiteCrmNativeProductImageConfiguration.enabled
+        ? 'unavailable'
+        : 'disabled',
+      ...suiteCrmNativeProductImageConfiguration,
+      latestResult: null,
+      latestResultAt: null,
+    }
+    let suiteCrmProductImageIngestion: Record<string, unknown> = {
+      status: suiteCrmProductImageConfiguration.enabled
+        ? 'unavailable'
+        : 'disabled',
+      enabled: suiteCrmProductImageConfiguration.enabled,
+      ready: suiteCrmProductImageConfiguration.ready,
+      missing: suiteCrmProductImageConfiguration.missing,
+      invalid: suiteCrmProductImageConfiguration.invalid,
+      credentialConflicts:
+        suiteCrmProductImageConfiguration.credentialConflicts,
+      aclAttestation: suiteCrmProductImageConfiguration.aclAttestation,
+      requiredAcl: suiteCrmProductImageConfiguration.acl,
+      providerWrites: 0,
     }
     let integrationQueues: Record<string, unknown> = { status: 'not-configured' }
     let operationsCommands: Record<string, unknown> = { status: 'not-configured' }
@@ -296,6 +377,47 @@ export async function GET() {
           operations_cartonization_evidence_scale_applied: boolean
           operations_cartonization_shipment_rates_applied: boolean
           operations_cartonization_rate_constraint_repair_applied: boolean
+          operations_two_pass_pack_rate_runs_applied: boolean
+          operations_pack_rate_pricing_semantics_applied: boolean
+          operations_carrier_billing_mud_applied: boolean
+          operations_shopify_inventory_refresh_migration_applied: boolean
+          operations_shopify_inventory_webhook_refresh_applied: boolean
+          operations_shopify_catalog_webhook_refresh_applied: boolean
+          operations_commerce_pack_evidence_fingerprint_applied: boolean
+          operations_shadow_fulfillment_destination_repair_applied: boolean
+          operations_shadow_rate_choice_package_identity_repair_applied: boolean
+          operations_fulfillment_execution_union_repair_applied: boolean
+          operations_fulfillment_rate_parcel_repair_applied: boolean
+          operations_shopify_checkout_plan_rate_policy_applied: boolean
+          shopify_active_account_readiness_migration_applied: boolean
+          operations_commerce_inventory_attempt_lease_renewal_applied: boolean
+          operations_shopify_shipping_service_codes_applied: boolean
+          operations_shopify_checkout_provider_attempts_applied: boolean
+          operations_shopify_checkout_rate_warm_policy_applied: boolean
+          operations_canonical_fulfillment_planning_applied: boolean
+          operations_fulfillment_executions_applied: boolean
+          operations_shopify_customer_rate_policies_applied: boolean
+          operations_active_multi_package_execution_applied: boolean
+          operations_production_fulfillment_rerates_applied: boolean
+          operations_shopify_shadow_policy_lifetime_applied: boolean
+          operations_shopify_shadow_test_subsidy_applied: boolean
+          operations_shopify_quote_match_families_applied: boolean
+          operations_sandbox_commerce_e2e_authorization_applied: boolean
+          operations_commerce_active_canonical_collation_applied: boolean
+          operations_sandbox_commerce_e2e_active_guards_applied: boolean
+          operations_faire_sandbox_commerce_e2e_applied: boolean
+          operations_fulfillment_notification_policy_applied: boolean
+          global_id_alphanumeric_compatibility_applied: boolean
+          global_id_base32hex_allocator_applied: boolean
+          faire_provider_write_auth_applied: boolean
+          faire_fulfillment_authority_applied: boolean
+          operations_commerce_fulfillment_recovery_applied: boolean
+          operations_commerce_product_image_imports_applied: boolean
+          operations_commerce_product_image_fanout_applied: boolean
+          operations_commerce_product_image_source_normalization_applied: boolean
+          operations_faire_product_image_projection_applied: boolean
+          operations_faire_inventory_polling_applied: boolean
+          suitecrm_product_image_reverse_ingestion_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -931,6 +1053,1233 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0144_operations_cartonization_shipment_rate_constraint_repair.sql'
               ) AS operations_cartonization_rate_constraint_repair_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0145_operations_two_pass_pack_rate_runs.sql'
+              ) AS operations_two_pass_pack_rate_runs_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0146_operations_pack_rate_pricing_semantics.sql'
+              ) AS operations_pack_rate_pricing_semantics_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0147_operations_carrier_billing_mud.sql'
+              ) AS operations_carrier_billing_mud_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0169_operations_shopify_inventory_refresh_queue.sql'
+              ) AS operations_shopify_inventory_refresh_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0190_operations_shopify_inventory_webhook_refresh.sql'
+              ) AS operations_shopify_inventory_webhook_refresh_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0197_operations_shopify_catalog_webhook_refresh.sql'
+              ) AS operations_shopify_catalog_webhook_refresh_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0191_operations_commerce_pack_evidence_fingerprint.sql'
+              ) AS operations_commerce_pack_evidence_fingerprint_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0192_operations_shadow_fulfillment_destination_fingerprint.sql'
+              ) AS operations_shadow_fulfillment_destination_repair_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0193_operations_shadow_rate_choice_package_identity.sql'
+              ) AS operations_shadow_rate_choice_package_identity_repair_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0194_operations_fulfillment_execution_union_repair.sql'
+              ) AS operations_fulfillment_execution_union_repair_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0195_operations_fulfillment_rate_parcel_evidence.sql'
+              ) AS operations_fulfillment_rate_parcel_repair_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0170_operations_shopify_checkout_plan_rate_policy.sql'
+              ) AS operations_shopify_checkout_plan_rate_policy_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0171_shopify_active_account_readiness.sql'
+              ) AS shopify_active_account_readiness_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0172_operations_commerce_inventory_attempt_lease_renewal.sql'
+              ) AS operations_commerce_inventory_attempt_lease_renewal_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0173_operations_shopify_shipping_service_codes.sql'
+              ) AS operations_shopify_shipping_service_codes_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0174_operations_shopify_checkout_provider_attempts.sql'
+              ) AS operations_shopify_checkout_provider_attempts_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0175_operations_shopify_checkout_rate_warm_policy.sql'
+              ) AS operations_shopify_checkout_rate_warm_policy_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0176_operations_canonical_fulfillment_planning.sql'
+              ) AS operations_canonical_fulfillment_planning_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0177_operations_fulfillment_executions.sql'
+              ) AS operations_fulfillment_executions_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0178_operations_shopify_customer_rate_policies.sql'
+              ) AS operations_shopify_customer_rate_policies_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0179_operations_active_multi_package_execution.sql'
+              ) AS operations_active_multi_package_execution_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0180_operations_production_fulfillment_rerates.sql'
+              ) AS operations_production_fulfillment_rerates_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0181_operations_shopify_shadow_policy_lifetime.sql'
+              ) AS operations_shopify_shadow_policy_lifetime_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0188_operations_shopify_shadow_test_subsidy.sql'
+              ) AS operations_shopify_shadow_test_subsidy_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0189_operations_shopify_checkout_quote_match_families.sql'
+              ) AS operations_shopify_quote_match_families_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0198_operations_sandbox_commerce_e2e_authorization.sql'
+              ) AS operations_sandbox_commerce_e2e_authorization_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0199_operations_commerce_active_canonical_collation.sql'
+              ) AS operations_commerce_active_canonical_collation_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0200_operations_sandbox_commerce_e2e_active_guards.sql'
+              ) AS operations_sandbox_commerce_e2e_active_guards_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0201_operations_fulfillment_notification_policy.sql'
+              ) AS operations_fulfillment_notification_policy_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0218_global_id_alphanumeric_expand_141_149_and_catalog_gate.sql'
+              ) AS global_id_alphanumeric_compatibility_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0219_global_id_base32hex_allocator.sql'
+              ) AND EXISTS (
+                SELECT 1
+                FROM pg_proc procedure
+                JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+                WHERE namespace.nspname = current_schema()
+                  AND procedure.proname = 'allocate_global_reference'
+                  AND pg_get_function_identity_arguments(procedure.oid) =
+                    'requested_prefix text'
+                  AND position(
+                    'gen_random_bytes(12)'
+                    IN pg_get_functiondef(procedure.oid)
+                  ) > 0
+                  AND position(
+                    '0123456789abcdefghijklmnopqrstuv'
+                    IN pg_get_functiondef(procedure.oid)
+                  ) > 0
+                  AND position(
+                    'FOR attempt IN 1..32 LOOP'
+                    IN pg_get_functiondef(procedure.oid)
+                  ) > 0
+                  AND position(
+                    '1000000 + floor(random() * 9000000)'
+                    IN pg_get_functiondef(procedure.oid)
+                  ) = 0
+              ) AND EXISTS (
+                SELECT 1
+                FROM pg_index index_row
+                WHERE index_row.indexrelid = to_regclass(
+                    'crm_reference_registry_base32hex_suffix_unique_idx'
+                  )
+                  AND index_row.indisunique
+                  AND index_row.indisvalid
+                  AND index_row.indisready
+                  AND position(
+                    'global_reference_suffix'
+                    IN pg_get_indexdef(index_row.indexrelid)
+                  ) > 0
+                  AND position(
+                    '= 12'
+                    IN pg_get_indexdef(index_row.indexrelid)
+                  ) > 0
+              ) AS global_id_base32hex_allocator_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0220_operations_faire_provider_write_authorizations.sql'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0228_operations_faire_oauth_grant_evidence.sql'
+              )
+              AND to_regclass(
+                'operations_faire_provider_write_scope_evidence'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_faire_provider_write_authorizations'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_write_scope_list_valid(text[])'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_write_capability_list_valid(text[])'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_provider_write_canonical_jsonb(jsonb)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_provider_write_request_hash(jsonb)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_provider_write_json_is_redacted(jsonb)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_oauth_scope_list_valid(text[])'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_oauth_scope_json_valid(jsonb)'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_proc procedure
+                JOIN pg_namespace namespace
+                  ON namespace.oid = procedure.pronamespace
+                WHERE namespace.nspname = current_schema()
+                  AND procedure.oid = to_regprocedure(
+                    'operations_faire_provider_write_scope_evidence_is_current(uuid,uuid,uuid,integer)'
+                  )::oid
+                  AND encode(
+                    digest(
+                      convert_to(
+                        btrim(
+                          regexp_replace(
+                            regexp_replace(
+                              procedure.prosrc,
+                              E'(^|[\\n\\r])[[:blank:]]*--[^\\n\\r]*',
+                              ' ',
+                              'g'
+                            ),
+                            '[[:space:]]+',
+                            ' ',
+                            'g'
+                          )
+                        ),
+                        'UTF8'
+                      ),
+                      'sha256'
+                    ),
+                    'hex'
+                  ) = '${FAIRE_SCOPE_CURRENT_PROSRC_SHA256}'
+              )
+              AND to_regprocedure(
+                'operations_faire_provider_write_fence_hash(uuid,uuid,uuid,text,integer,integer,text,text,text,bigint,text,text,text,text[],text[],text)'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_proc procedure
+                JOIN pg_namespace namespace
+                  ON namespace.oid = procedure.pronamespace
+                WHERE namespace.nspname = current_schema()
+                  AND procedure.oid = to_regprocedure(
+                    'protect_operations_faire_scope_evidence()'
+                  )::oid
+                  AND encode(
+                    digest(
+                      convert_to(
+                        btrim(
+                          regexp_replace(
+                            regexp_replace(
+                              procedure.prosrc,
+                              E'(^|[\\n\\r])[[:blank:]]*--[^\\n\\r]*',
+                              ' ',
+                              'g'
+                            ),
+                            '[[:space:]]+',
+                            ' ',
+                            'g'
+                          )
+                        ),
+                        'UTF8'
+                      ),
+                      'sha256'
+                    ),
+                    'hex'
+                  ) = '${FAIRE_SCOPE_TRIGGER_PROSRC_SHA256}'
+              )
+              AND to_regprocedure(
+                'protect_operations_faire_write_authorization()'
+              ) IS NOT NULL
+              AND position(
+                'NOT NEW.verified_write_scopes <@ evidence_scopes'
+                IN pg_get_functiondef(
+                  to_regprocedure(
+                    'protect_operations_faire_write_authorization()'
+                  )::oid
+                )
+              ) > 0
+              AND to_regprocedure(
+                'validate_operations_faire_scope_evidence_insert()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_provider_write_authority_is_current(uuid,uuid,uuid,text,integer,integer,text,text,text,bigint,text,text,text,jsonb,uuid)'
+              ) IS NOT NULL
+              AND position(
+                'evidence.verified_write_scopes @> auth.verified_write_scopes'
+                IN pg_get_functiondef(
+                  to_regprocedure(
+                    'operations_faire_provider_write_authority_is_current(uuid,uuid,uuid,text,integer,integer,text,text,text,bigint,text,text,text,jsonb,uuid)'
+                  )::oid
+                )
+              ) > 0
+              AND to_regprocedure(
+                'protect_operations_commerce_external_effect_intent()'
+              ) IS NOT NULL
+              AND position(
+                'operations_faire_provider_write_authority_is_current'
+                IN pg_get_functiondef(
+                  to_regprocedure(
+                    'protect_operations_commerce_external_effect_intent()'
+                  )::oid
+                )
+              ) > 0
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trg
+                WHERE trg.tgrelid = to_regclass(
+                    'operations_faire_provider_write_scope_evidence'
+                  )
+                  AND trg.tgname =
+                    'protect_operations_faire_scope_evidence_write'
+                  AND trg.tgfoid = to_regprocedure(
+                    'protect_operations_faire_scope_evidence()'
+                  )::oid
+                  AND trg.tgenabled = 'O'
+                  AND trg.tgtype = 31
+                  AND NOT trg.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trg
+                WHERE trg.tgrelid = to_regclass(
+                    'operations_faire_provider_write_scope_evidence'
+                  )
+                  AND trg.tgname =
+                    'validate_operations_faire_scope_evidence_insert_write'
+                  AND trg.tgfoid = to_regprocedure(
+                    'validate_operations_faire_scope_evidence_insert()'
+                  )::oid
+                  AND trg.tgenabled = 'O'
+                  AND trg.tgtype = 5
+                  AND NOT trg.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trg
+                WHERE trg.tgrelid = to_regclass(
+                    'operations_commerce_external_effect_intents'
+                  )
+                  AND trg.tgname =
+                    'protect_operations_commerce_external_effect_intent_write'
+                  AND trg.tgfoid = to_regprocedure(
+                    'protect_operations_commerce_external_effect_intent()'
+                  )::oid
+                  AND trg.tgenabled <> 'D'
+                  AND NOT trg.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trg
+                WHERE trg.tgrelid = to_regclass(
+                    'operations_faire_provider_write_authorizations'
+                  )
+                  AND trg.tgname =
+                    'protect_operations_faire_write_authorization_write'
+                  AND trg.tgfoid = to_regprocedure(
+                    'protect_operations_faire_write_authorization()'
+                  )::oid
+                  AND trg.tgenabled <> 'D'
+                  AND NOT trg.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_index idx
+                WHERE idx.indexrelid = to_regclass(
+                    'operations_faire_write_auth_active_aggregate_idx'
+                  )
+                  AND idx.indisunique
+                  AND idx.indisvalid
+                  AND idx.indisready
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_index idx
+                WHERE idx.indexrelid = to_regclass(
+                    'operations_faire_write_auth_effect_tombstone_idx'
+                  )
+                  AND idx.indrelid = to_regclass(
+                    'operations_faire_provider_write_authorizations'
+                  )
+                  AND idx.indisunique
+                  AND idx.indisvalid
+                  AND idx.indisready
+                  AND idx.indpred IS NULL
+                  AND idx.indexprs IS NULL
+                  AND idx.indnkeyatts = 6
+                  AND idx.indnatts = 6
+                  AND ARRAY(
+                    SELECT attribute.attname::text
+                    FROM unnest(idx.indkey) WITH ORDINALITY
+                      key_column(attnum, ordinality)
+                    JOIN pg_attribute attribute
+                      ON attribute.attrelid = idx.indrelid
+                     AND attribute.attnum = key_column.attnum
+                    ORDER BY key_column.ordinality
+                  ) = ARRAY[
+                    'organization_id',
+                    'integration_account_id',
+                    'action',
+                    'aggregate_type',
+                    'aggregate_id',
+                    'aggregate_revision'
+                  ]::text[]
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_index idx
+                WHERE idx.indexrelid = to_regclass(
+                    'operations_commerce_effect_faire_auth_unique'
+                  )
+                  AND idx.indisunique
+                  AND idx.indisvalid
+                  AND idx.indisready
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint fk
+                WHERE fk.conrelid = to_regclass(
+                    'operations_faire_provider_write_scope_evidence'
+                  )
+                  AND fk.confrelid = to_regclass(
+                    'operations_commerce_provider_attempts'
+                  )
+                  AND fk.conname =
+                    'operations_faire_scope_evidence_attempt_fkey'
+                  AND fk.contype = 'f'
+                  AND fk.convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint fk
+                WHERE fk.conrelid = to_regclass(
+                    'operations_faire_provider_write_authorizations'
+                  )
+                  AND fk.confrelid = to_regclass(
+                    'operations_faire_provider_write_scope_evidence'
+                  )
+                  AND fk.conname =
+                    'operations_faire_write_auth_scope_evidence_fkey'
+                  AND fk.contype = 'f'
+                  AND fk.convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint fk
+                WHERE fk.conrelid = to_regclass(
+                    'operations_faire_provider_write_authorizations'
+                  )
+                  AND fk.confrelid = to_regclass(
+                    'operations_commerce_provider_attempts'
+                  )
+                  AND fk.conname =
+                    'operations_faire_write_auth_attempt_fkey'
+                  AND fk.contype = 'f'
+                  AND fk.convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint fk
+                WHERE fk.conrelid = to_regclass(
+                    'operations_commerce_external_effect_intents'
+                  )
+                  AND fk.confrelid = to_regclass(
+                    'operations_faire_provider_write_authorizations'
+                  )
+                  AND fk.conname =
+                    'operations_commerce_effect_faire_auth_fkey'
+                  AND fk.contype = 'f'
+                  AND fk.convalidated
+              ) AS faire_provider_write_auth_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0224_operations_faire_fulfillment_authority.sql'
+              )
+              AND to_regprocedure(
+                'operations_faire_fulfillment_scope_evidence_is_current(uuid,uuid,integer)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_commerce_active_cohort_matches_current(uuid,jsonb,text,integer,text)'
+              ) IS NOT NULL
+                AS faire_fulfillment_authority_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0229_operations_commerce_fulfillment_recovery.sql'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_index idx
+                WHERE idx.indexrelid = to_regclass(
+                    'operations_commerce_fulfillment_exports_recovery_idx'
+                  )
+                  AND idx.indrelid = to_regclass(
+                    'operations_commerce_fulfillment_exports'
+                  )
+                  AND idx.indisvalid
+                  AND idx.indisready
+                  AND idx.indpred IS NOT NULL
+              ) AS operations_commerce_fulfillment_recovery_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0221_operations_commerce_product_image_imports.sql'
+              )
+              AND to_regclass(
+                'operations_commerce_product_image_snapshot_fences'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_product_image_observation_sets'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_product_image_observations'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_product_image_observation_set_memberships'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_product_image_import_jobs'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_product_image_import_worker_heartbeat'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_product_image_asset_provenance'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_product_image_bindings'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_commerce_product_image_account_is_current(uuid,uuid,text,integer)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_commerce_product_image_mapping_resolution(uuid,uuid,text,text)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_commerce_product_image_observation_is_current_active(uuid,uuid)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_commerce_product_image_job_fences_are_current(uuid,uuid)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'guard_operations_commerce_product_image_observation_set_membership()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'validate_ops_commerce_image_set_evidence(uuid,uuid,uuid)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'validate_ops_commerce_image_set_row()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'validate_ops_commerce_image_member_row()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'guard_operations_commerce_product_image_binding()'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_attribute attribute
+                WHERE attribute.attrelid = to_regclass(
+                    'operations_commerce_product_image_observations'
+                  )
+                  AND attribute.attname = 'observation_set_id'
+                  AND attribute.attnotnull
+                  AND NOT attribute.attisdropped
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint fk
+                WHERE fk.conrelid = to_regclass(
+                    'operations_commerce_product_image_observations'
+                  )
+                  AND fk.confrelid = to_regclass(
+                    'operations_commerce_product_image_observation_sets'
+                  )
+                  AND fk.conname =
+                    'ops_commerce_image_observation_set_fkey'
+                  AND fk.contype = 'f'
+                  AND fk.convalidated
+                  AND fk.confdeltype = 'r'
+                  AND ARRAY(
+                    SELECT attribute.attname::text
+                    FROM unnest(fk.conkey) WITH ORDINALITY
+                      key_column(attnum, ordinality)
+                    JOIN pg_attribute attribute
+                      ON attribute.attrelid = fk.conrelid
+                     AND attribute.attnum = key_column.attnum
+                    ORDER BY key_column.ordinality
+                  ) = ARRAY[
+                    'organization_id',
+                    'integration_account_id',
+                    'provider',
+                    'credential_generation',
+                    'external_product_id',
+                    'observation_set_id'
+                  ]::text[]
+                  AND ARRAY(
+                    SELECT attribute.attname::text
+                    FROM unnest(fk.confkey) WITH ORDINALITY
+                      key_column(attnum, ordinality)
+                    JOIN pg_attribute attribute
+                      ON attribute.attrelid = fk.confrelid
+                     AND attribute.attnum = key_column.attnum
+                    ORDER BY key_column.ordinality
+                  ) = ARRAY[
+                    'organization_id',
+                    'integration_account_id',
+                    'provider',
+                    'credential_generation',
+                    'external_product_id',
+                    'id'
+                  ]::text[]
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_snapshot_fences'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_snapshot_fence_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_snapshot_fence()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 31
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_observation_set_memberships'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_set_member_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_observation_set_membership()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 31
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_observation_sets'
+                  )
+                  AND trigger_row.tgname =
+                    'validate_operations_commerce_image_set_membership'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'validate_ops_commerce_image_set_row()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 5
+                  AND trigger_row.tgdeferrable
+                  AND trigger_row.tginitdeferred
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_observation_set_memberships'
+                  )
+                  AND trigger_row.tgname =
+                    'validate_operations_commerce_image_set_member_insert'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'validate_ops_commerce_image_member_row()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 5
+                  AND trigger_row.tgdeferrable
+                  AND trigger_row.tginitdeferred
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_observation_sets'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_observation_set_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_observation_set()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 31
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_observations'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_observation_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_observation()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 31
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_import_jobs'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_import_job_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_import_job()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 31
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_asset_provenance'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_provenance_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_asset_provenance()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 31
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_bindings'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_binding_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_binding()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 31
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'operations_commerce_product_image_import_jobs'
+                  )
+                  AND constraint_row.conname =
+                    'ops_commerce_image_job_observation_generation_unique'
+                  AND constraint_row.contype = 'u'
+                  AND constraint_row.convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_index index_row
+                WHERE index_row.indexrelid = to_regclass(
+                    'ops_commerce_image_job_single_flight_idx'
+                  )
+                  AND index_row.indisunique
+                  AND index_row.indisvalid
+                  AND index_row.indisready
+              ) AS operations_commerce_product_image_imports_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0225_operations_commerce_product_image_exact_fanout.sql'
+              )
+              AND to_regprocedure(
+                'operations_commerce_product_image_mapping_targets(uuid,uuid,text,text)'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'operations_commerce_product_image_asset_provenance'
+                  )
+                  AND constraint_row.conname =
+                    'ops_commerce_image_provenance_job_product_unique'
+                  AND constraint_row.contype = 'u'
+                  AND constraint_row.convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'operations_commerce_product_image_bindings'
+                  )
+                  AND constraint_row.conname =
+                    'ops_commerce_image_binding_exact_product_unique'
+                  AND constraint_row.contype = 'u'
+                  AND constraint_row.convalidated
+              ) AS operations_commerce_product_image_fanout_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0227_operations_commerce_product_image_source_normalization.sql'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'operations_commerce_product_image_asset_provenance'
+                  )
+                  AND constraint_row.conname =
+                    'ops_commerce_image_provenance_source_evidence_valid'
+                  AND constraint_row.contype = 'c'
+                  AND constraint_row.convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_asset_provenance'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_source_evidence_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_source_evidence()'
+                  )
+                  AND trigger_row.tgtype = 31
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_asset_provenance'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_provenance_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_asset_provenance()'
+                  )
+                  AND trigger_row.tgtype = 31
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              ) AS operations_commerce_product_image_source_normalization_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0230_operations_faire_product_image_projection.sql'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0234_operations_faire_product_image_writable_lifecycle.sql'
+              )
+              AND to_regclass(
+                'operations_faire_product_image_delivery_grants'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_faire_product_image_provider_steps'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_provider_write_authority_is_current(uuid,uuid,uuid,text,integer,integer,text,text,text,bigint,text,text,text,jsonb,uuid)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_operations_faire_product_image_grant()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_operations_faire_product_image_authority()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_operations_faire_product_image_step()'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_faire_product_image_delivery_grants'
+                  )
+                  AND trigger_row.tgname =
+                    'protect_operations_faire_product_image_grant_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'protect_operations_faire_product_image_grant()'
+                  )
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_faire_provider_write_authorizations'
+                  )
+                  AND trigger_row.tgname =
+                    'protect_operations_faire_product_image_authority_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'protect_operations_faire_product_image_authority()'
+                  )
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_faire_product_image_provider_steps'
+                  )
+                  AND trigger_row.tgname =
+                    'protect_operations_faire_product_image_step_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'protect_operations_faire_product_image_step()'
+                  )
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'operations_faire_provider_write_authorizations'
+                  )
+                  AND constraint_row.conname =
+                    'operations_faire_write_auth_image_grant_fkey'
+                  AND constraint_row.contype = 'f'
+                  AND constraint_row.convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'operations_faire_provider_write_authorizations'
+                  )
+                  AND constraint_row.conname =
+                    'operations_faire_write_auth_shadow_effect_fkey'
+                  AND constraint_row.contype = 'f'
+                  AND constraint_row.convalidated
+              ) AS operations_faire_product_image_projection_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0231_operations_faire_sandbox_commerce_e2e.sql'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0232_operations_faire_sandbox_parcel_evidence.sql'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0233_operations_faire_sandbox_promotion_evidence.sql'
+              )
+              AND to_regclass(
+                'operations_sandbox_commerce_e2e_faire_evidence'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM information_schema.columns column_row
+                WHERE column_row.table_schema = 'public'
+                  AND column_row.table_name =
+                    'operations_sandbox_commerce_e2e_faire_evidence'
+                  AND column_row.column_name =
+                    'item_pack_evidence_hash'
+                  AND column_row.is_nullable = 'NO'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM information_schema.columns column_row
+                WHERE column_row.table_schema = 'public'
+                  AND column_row.table_name =
+                    'operations_sandbox_commerce_e2e_faire_evidence'
+                  AND column_row.column_name =
+                    'parcel_gross_weight_grams'
+                  AND column_row.is_nullable = 'NO'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'operations_sandbox_commerce_e2e_faire_evidence'
+                  )
+                  AND constraint_row.conname =
+                    'operations_sandbox_commerce_e2e_faire_evidence_carton_package_fkey'
+                  AND constraint_row.contype = 'f'
+                  AND constraint_row.convalidated
+              )
+              AND to_regprocedure(
+                'operations_sandbox_commerce_e2e_authorization_is_current(uuid,uuid,uuid)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_sandbox_commerce_e2e_faire_evidence()'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_sandbox_commerce_e2e_faire_evidence'
+                  )
+                  AND trigger_row.tgname =
+                    'protect_sandbox_commerce_e2e_faire_evidence_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'protect_sandbox_commerce_e2e_faire_evidence()'
+                  )
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              ) AS operations_faire_sandbox_commerce_e2e_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0223_operations_faire_inventory_observation_polling.sql'
+              )
+              AND to_regclass(
+                'operations_faire_inventory_poll_jobs'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_faire_inventory_observations'
+              ) IS NOT NULL
+              AND to_regclass(
+                'idx_operations_faire_inventory_poll_active_account'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_faire_inventory_observations'
+                  )
+                  AND trigger_row.tgname =
+                    'protect_operations_faire_inventory_observation'
+                  AND NOT trigger_row.tgisinternal
+              ) AS operations_faire_inventory_polling_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0226_suitecrm_product_image_reverse_ingestion.sql'
+              )
+              AND to_regclass(
+                'crm_suitecrm_product_image_observations'
+              ) IS NOT NULL
+              AND to_regclass(
+                'crm_suitecrm_product_image_snapshot_fences'
+              ) IS NOT NULL
+              AND to_regclass(
+                'crm_suitecrm_product_image_asset_provenance'
+              ) IS NOT NULL
+              AND to_regclass(
+                'crm_suitecrm_product_image_ingestion_worker_heartbeat'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'crm_suitecrm_product_image_observations'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_crm_suitecrm_product_image_observation_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_crm_suitecrm_product_image_observation()'
+                  )
+                  AND trigger_row.tgtype = 31
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'crm_suitecrm_product_image_asset_provenance'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_crm_suitecrm_product_image_provenance_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_crm_suitecrm_product_image_provenance()'
+                  )
+                  AND trigger_row.tgtype = 31
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'crm_suitecrm_product_image_snapshot_fences'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_crm_suitecrm_product_image_snapshot_fence_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_crm_suitecrm_product_image_snapshot_fence()'
+                  )
+                  AND trigger_row.tgtype = 31
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'crm_suitecrm_product_image_snapshot_fences'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_crm_suitecrm_image_fence_initial_revision_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_crm_suitecrm_image_fence_initial_revision()'
+                  )
+                  AND trigger_row.tgtype = 5
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND (
+                SELECT count(*) = 5
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'crm_suitecrm_product_image_observations'
+                  )
+                  AND constraint_row.conname IN (
+                    'crm_suitecrm_product_image_observation_provider_writes_zero',
+                    'crm_suitecrm_product_image_observation_correlation_valid',
+                    'crm_suitecrm_product_image_observation_media_valid',
+                    'crm_suitecrm_product_image_observation_primary_valid',
+                    'crm_suitecrm_product_image_observation_timestamp_valid'
+                  )
+                  AND constraint_row.convalidated
+              )
+              AND (
+                SELECT count(*) = 5
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'crm_suitecrm_product_image_asset_provenance'
+                  )
+                  AND constraint_row.conname IN (
+                    'crm_suitecrm_product_image_provenance_provider_writes_zero',
+                    'crm_suitecrm_product_image_provenance_scope_valid',
+                    'crm_suitecrm_product_image_provenance_primary_before_valid',
+                    'crm_suitecrm_product_image_provenance_result_valid',
+                    'crm_suitecrm_product_image_provenance_resolution_valid'
+                  )
+                  AND constraint_row.convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'crm_suitecrm_product_image_snapshot_fences'
+                  )
+                  AND constraint_row.conname =
+                    'crm_suitecrm_product_image_snapshot_fence_provenance_fkey'
+                  AND constraint_row.contype = 'f'
+                  AND constraint_row.convalidated
+              ) AS suitecrm_product_image_reverse_ingestion_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1069,6 +2418,47 @@ export async function GET() {
             && row?.operations_cartonization_evidence_scale_applied
             && row?.operations_cartonization_shipment_rates_applied
             && row?.operations_cartonization_rate_constraint_repair_applied
+            && row?.operations_two_pass_pack_rate_runs_applied
+            && row?.operations_pack_rate_pricing_semantics_applied
+            && row?.operations_carrier_billing_mud_applied
+            && row?.operations_shopify_inventory_refresh_migration_applied
+            && row?.operations_shopify_inventory_webhook_refresh_applied
+            && row?.operations_shopify_catalog_webhook_refresh_applied
+            && row?.operations_commerce_pack_evidence_fingerprint_applied
+            && row?.operations_shadow_fulfillment_destination_repair_applied
+            && row?.operations_shadow_rate_choice_package_identity_repair_applied
+            && row?.operations_fulfillment_execution_union_repair_applied
+            && row?.operations_fulfillment_rate_parcel_repair_applied
+            && row?.operations_shopify_checkout_plan_rate_policy_applied
+            && row?.shopify_active_account_readiness_migration_applied
+            && row?.operations_commerce_inventory_attempt_lease_renewal_applied
+            && row?.operations_shopify_shipping_service_codes_applied
+            && row?.operations_shopify_checkout_provider_attempts_applied
+            && row?.operations_shopify_checkout_rate_warm_policy_applied
+            && row?.operations_canonical_fulfillment_planning_applied
+            && row?.operations_fulfillment_executions_applied
+            && row?.operations_shopify_customer_rate_policies_applied
+            && row?.operations_active_multi_package_execution_applied
+            && row?.operations_production_fulfillment_rerates_applied
+            && row?.operations_shopify_shadow_policy_lifetime_applied
+            && row?.operations_shopify_shadow_test_subsidy_applied
+            && row?.operations_shopify_quote_match_families_applied
+            && row?.operations_sandbox_commerce_e2e_authorization_applied
+            && row?.operations_commerce_active_canonical_collation_applied
+            && row?.operations_sandbox_commerce_e2e_active_guards_applied
+            && row?.operations_faire_sandbox_commerce_e2e_applied
+            && row?.operations_fulfillment_notification_policy_applied
+            && row?.global_id_alphanumeric_compatibility_applied
+            && row?.global_id_base32hex_allocator_applied
+            && row?.faire_provider_write_auth_applied
+            && row?.faire_fulfillment_authority_applied
+            && row?.operations_commerce_fulfillment_recovery_applied
+            && row?.operations_commerce_product_image_imports_applied
+            && row?.operations_commerce_product_image_fanout_applied
+            && row?.operations_commerce_product_image_source_normalization_applied
+            && row?.operations_faire_product_image_projection_applied
+            && row?.operations_faire_inventory_polling_applied
+            && row?.suitecrm_product_image_reverse_ingestion_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1199,6 +2589,47 @@ export async function GET() {
           || !row?.operations_cartonization_evidence_scale_applied
           || !row?.operations_cartonization_shipment_rates_applied
           || !row?.operations_cartonization_rate_constraint_repair_applied
+          || !row?.operations_two_pass_pack_rate_runs_applied
+          || !row?.operations_pack_rate_pricing_semantics_applied
+          || !row?.operations_carrier_billing_mud_applied
+          || !row?.operations_shopify_inventory_refresh_migration_applied
+          || !row?.operations_shopify_inventory_webhook_refresh_applied
+          || !row?.operations_shopify_catalog_webhook_refresh_applied
+          || !row?.operations_commerce_pack_evidence_fingerprint_applied
+          || !row?.operations_shadow_fulfillment_destination_repair_applied
+          || !row?.operations_shadow_rate_choice_package_identity_repair_applied
+          || !row?.operations_fulfillment_execution_union_repair_applied
+          || !row?.operations_fulfillment_rate_parcel_repair_applied
+          || !row?.operations_shopify_checkout_plan_rate_policy_applied
+          || !row?.shopify_active_account_readiness_migration_applied
+          || !row?.operations_commerce_inventory_attempt_lease_renewal_applied
+          || !row?.operations_shopify_shipping_service_codes_applied
+          || !row?.operations_shopify_checkout_provider_attempts_applied
+          || !row?.operations_shopify_checkout_rate_warm_policy_applied
+          || !row?.operations_canonical_fulfillment_planning_applied
+          || !row?.operations_fulfillment_executions_applied
+          || !row?.operations_shopify_customer_rate_policies_applied
+          || !row?.operations_active_multi_package_execution_applied
+          || !row?.operations_production_fulfillment_rerates_applied
+          || !row?.operations_shopify_shadow_policy_lifetime_applied
+          || !row?.operations_shopify_shadow_test_subsidy_applied
+          || !row?.operations_shopify_quote_match_families_applied
+          || !row?.operations_sandbox_commerce_e2e_authorization_applied
+          || !row?.operations_commerce_active_canonical_collation_applied
+          || !row?.operations_sandbox_commerce_e2e_active_guards_applied
+          || !row?.operations_faire_sandbox_commerce_e2e_applied
+          || !row?.operations_fulfillment_notification_policy_applied
+          || !row?.global_id_alphanumeric_compatibility_applied
+          || !row?.global_id_base32hex_allocator_applied
+          || !row?.faire_provider_write_auth_applied
+          || !row?.faire_fulfillment_authority_applied
+          || !row?.operations_commerce_fulfillment_recovery_applied
+          || !row?.operations_commerce_product_image_imports_applied
+          || !row?.operations_commerce_product_image_fanout_applied
+          || !row?.operations_commerce_product_image_source_normalization_applied
+          || !row?.operations_faire_product_image_projection_applied
+          || !row?.operations_faire_inventory_polling_applied
+          || !row?.suitecrm_product_image_reverse_ingestion_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -1209,37 +2640,43 @@ export async function GET() {
             processing: number
             failed: number
             stale_processing: number
+            policy_rejected: number
+            superseded: number
+            actionable_failed: number
             active_organizations: number
             shadow_organizations: number
-          }>(
-            `SELECT
-               count(*) FILTER (WHERE receipt.status = 'processing')::integer AS processing,
-               count(*) FILTER (WHERE receipt.status = 'failed')::integer AS failed,
-               count(*) FILTER (
-                 WHERE receipt.status = 'processing'
-                   AND receipt.updated_at < now() - interval '15 minutes'
-               )::integer AS stale_processing,
-               (SELECT count(*)::integer FROM operations_activation_scopes WHERE state = 'active') AS active_organizations,
-               (SELECT count(*)::integer FROM operations_activation_scopes WHERE state = 'shadow') AS shadow_organizations
-             FROM operations_command_receipts receipt
-             JOIN workspace_organizations organization ON organization.id = receipt.organization_id
-             WHERE organization.is_demo = false`,
-          )
+          }>(OPERATIONS_COMMAND_RECEIPT_HEALTH_QUERY)
           const commands = commandResult.rows[0]
           const staleProcessing = Number(commands?.stale_processing || 0)
           const failed = Number(commands?.failed || 0)
+          const policyRejected = Number(commands?.policy_rejected || 0)
+          const superseded = Number(commands?.superseded || 0)
+          const actionableFailed = Number(commands?.actionable_failed || 0)
           operationsCommands = {
-            status: staleProcessing > 0 ? 'error' : failed > 0 ? 'degraded' : 'healthy',
+            status: staleProcessing > 0
+              ? 'error'
+              : actionableFailed > 0
+                ? 'degraded'
+                : 'healthy',
             processing: Number(commands?.processing || 0),
             failed,
+            policyRejected,
+            superseded,
+            actionableFailed,
             staleProcessing,
             activation: {
               activeOrganizations: Number(commands?.active_organizations || 0),
               shadowOrganizations: Number(commands?.shadow_organizations || 0),
             },
           }
-          if (staleProcessing > 0) errors.push('Operations command queue has stale processing commands.')
-          if (failed > 0) warnings.push('Operations command queue has failed commands available for review or retry.')
+          if (staleProcessing > 0) {
+            errors.push('Operations command receipts have stale processing commands.')
+          }
+          if (actionableFailed > 0) {
+            warnings.push(
+              'Operations command receipts have actionable failures available for review or retry.',
+            )
+          }
         }
 
         if (
@@ -1458,6 +2895,34 @@ export async function GET() {
             if (crmAgeMs === null || crmAgeMs > maxHeartbeatAgeMs) {
               errors.push('SuiteCRM outbox worker heartbeat is missing or stale.')
             }
+            if (
+              suiteCrmNativeProductImageConfiguration.enabled
+              && !suiteCrmNativeProductImageConfiguration.ready
+            ) {
+              warnings.push(
+                'SuiteCRM native Product image projection is enabled but its dedicated media credentials, URLs, or credential separation are incomplete or invalid.',
+              )
+            } else if (suiteCrmNativeProductImageConfiguration.enabled) {
+              const nativeImageProjection =
+                await readSuiteCrmNativeProductImageProjectionHealthInPostgres()
+              const projectionDegraded = nativeImageProjection.dead > 0
+                || nativeImageProjection.retrying > 0
+              suiteCrmNativeProductImageProjection = {
+                status: projectionDegraded ? 'degraded' : 'ready',
+                ...suiteCrmNativeProductImageConfiguration,
+                ...nativeImageProjection,
+              }
+              if (nativeImageProjection.dead > 0) {
+                warnings.push(
+                  'SuiteCRM native Product image projection has terminal failed outbox work.',
+                )
+              }
+              if (nativeImageProjection.retrying > 0) {
+                warnings.push(
+                  'SuiteCRM native Product image projection has retrying outbox work.',
+                )
+              }
+            }
           }
 
           const agentHeartbeat = await readAgentDispatchWorkerHeartbeatFromPostgres()
@@ -1550,10 +3015,112 @@ export async function GET() {
                 queued: number
                 retrying: number
                 dead: number
+                historical_dead: number
                 stale_processing: number
                 overdue: number
+                orphaned_running_cursors: number
+                unreconciled_shopify_accounts: number
+                unreconciled_shopify_signals: string
+                overdue_shopify_refreshes_without_active_job: number
               }>(
-                `SELECT
+                `WITH catalog_jobs AS (
+                   SELECT job.*,
+                          EXISTS (
+                            SELECT 1
+                            FROM operations_integration_accounts account
+                            JOIN operations_commerce_credentials credential
+                              ON credential.organization_id = account.organization_id
+                             AND credential.integration_account_id = account.id
+                            JOIN operations_commerce_product_intake_policies policy
+                              ON policy.organization_id = account.organization_id
+                             AND policy.integration_account_id = account.id
+                            JOIN operations_activation_scopes activation
+                              ON activation.organization_id = account.organization_id
+                            WHERE account.organization_id = job.organization_id
+                              AND account.id = job.integration_account_id
+                              AND account.integration_type = 'commerce'
+                              AND account.provider = job.provider
+                              AND account.status <> 'error'
+                              AND account.commerce_credential_generation
+                                = job.credential_version
+                              AND credential.credential_version
+                                = job.credential_version
+                              AND credential.verification_status = 'verified'
+                              AND policy.policy_version
+                                = 'commerce-product-intake-policy-v1'
+                              AND policy.revision = job.policy_revision
+                              AND activation.state IN ('shadow', 'active')
+                              AND (
+                                (
+                                  account.provider = 'shopify'
+                                  AND COALESCE(
+                                    account.configuration->'grantedScopes',
+                                    '[]'::jsonb
+                                  ) ?| ARRAY[
+                                    'read_products',
+                                    'write_products'
+                                  ]
+                                )
+                                OR (
+                                  account.provider = 'faire'
+                                  AND (
+                                    credential.auth_mode = 'faire_brand_token'
+                                    OR COALESCE(
+                                      account.configuration->'requestedScopes',
+                                      '[]'::jsonb
+                                    ) ? 'READ_PRODUCTS'
+                                  )
+                                )
+                              )
+                          ) AS authoritative
+                   FROM operations_commerce_catalog_sync_jobs job
+                 ),
+                 shopify_refresh AS (
+                   SELECT
+                     refresh.organization_id,
+                     refresh.integration_account_id,
+                     refresh.dirty_version,
+                     refresh.reconciled_version,
+                     refresh.last_signaled_at,
+                     EXISTS (
+                       SELECT 1
+                       FROM operations_commerce_catalog_sync_jobs active
+                       WHERE active.organization_id = refresh.organization_id
+                         AND active.integration_account_id
+                           = refresh.integration_account_id
+                         AND active.status IN (
+                           'pending', 'processing', 'failed'
+                         )
+                     ) AS active_job
+                   FROM operations_shopify_catalog_refresh_states refresh
+                   JOIN operations_integration_accounts account
+                     ON account.organization_id = refresh.organization_id
+                    AND account.id = refresh.integration_account_id
+                   JOIN operations_commerce_credentials credential
+                     ON credential.organization_id = account.organization_id
+                    AND credential.integration_account_id = account.id
+                   JOIN operations_commerce_product_intake_policies policy
+                     ON policy.organization_id = account.organization_id
+                    AND policy.integration_account_id = account.id
+                   JOIN operations_activation_scopes activation
+                     ON activation.organization_id = account.organization_id
+                   WHERE account.integration_type = 'commerce'
+                     AND account.provider = 'shopify'
+                     AND account.status <> 'error'
+                     AND account.commerce_credential_generation
+                       = refresh.credential_generation
+                     AND credential.credential_version
+                       = refresh.credential_generation
+                     AND credential.verification_status = 'verified'
+                     AND policy.policy_version
+                       = 'commerce-product-intake-policy-v1'
+                     AND activation.state IN ('shadow', 'active')
+                     AND COALESCE(
+                       account.configuration->'grantedScopes',
+                       '[]'::jsonb
+                     ) ?| ARRAY['read_products', 'write_products']
+                 )
+                 SELECT
                    count(*) FILTER (
                      WHERE status = 'pending'
                    )::integer AS queued,
@@ -1561,8 +3128,11 @@ export async function GET() {
                      WHERE status = 'failed'
                    )::integer AS retrying,
                    count(*) FILTER (
-                     WHERE status = 'dead'
+                     WHERE status = 'dead' AND authoritative
                    )::integer AS dead,
+                   count(*) FILTER (
+                     WHERE status = 'dead'
+                   )::integer AS historical_dead,
                    count(*) FILTER (
                      WHERE status = 'processing'
                        AND locked_at < now() - interval '10 minutes'
@@ -1570,8 +3140,47 @@ export async function GET() {
                    count(*) FILTER (
                      WHERE status IN ('pending', 'failed')
                        AND available_at < now() - interval '5 minutes'
-                   )::integer AS overdue
-                 FROM operations_commerce_catalog_sync_jobs`,
+                   )::integer AS overdue,
+                   (
+                     SELECT count(*)::integer
+                     FROM operations_commerce_sync_cursors cursor
+                     WHERE cursor.resource = 'products'
+                       AND cursor.reconciliation_status = 'running'
+                       AND NOT EXISTS (
+                         SELECT 1
+                         FROM operations_commerce_catalog_sync_jobs active
+                         WHERE active.organization_id = cursor.organization_id
+                           AND active.integration_account_id
+                             = cursor.integration_account_id
+                           AND active.status IN (
+                             'pending', 'processing', 'failed'
+                           )
+                       )
+                   ) AS orphaned_running_cursors,
+                   (
+                     SELECT count(*)::integer
+                     FROM shopify_refresh refresh
+                     WHERE refresh.dirty_version
+                       > refresh.reconciled_version
+                   ) AS unreconciled_shopify_accounts,
+                   (
+                     SELECT COALESCE(sum(
+                       refresh.dirty_version - refresh.reconciled_version
+                     ), 0)::text
+                     FROM shopify_refresh refresh
+                     WHERE refresh.dirty_version
+                       > refresh.reconciled_version
+                   ) AS unreconciled_shopify_signals,
+                   (
+                     SELECT count(*)::integer
+                     FROM shopify_refresh refresh
+                     WHERE refresh.dirty_version
+                       > refresh.reconciled_version
+                       AND refresh.active_job = false
+                       AND refresh.last_signaled_at
+                         < now() - interval '5 minutes'
+                   ) AS overdue_shopify_refreshes_without_active_job
+                 FROM catalog_jobs`,
               )
             ).rows[0]
             const dead = Number(commerceQueue?.dead || 0)
@@ -1579,23 +3188,49 @@ export async function GET() {
               commerceQueue?.stale_processing || 0,
             )
             const overdue = Number(commerceQueue?.overdue || 0)
-            const healthy = (
+            const orphanedRunningCursors = Number(
+              commerceQueue?.orphaned_running_cursors || 0,
+            )
+            const unreconciledShopifyAccounts = Number(
+              commerceQueue?.unreconciled_shopify_accounts || 0,
+            )
+            const unreconciledShopifySignals = Number(
+              commerceQueue?.unreconciled_shopify_signals || 0,
+            )
+            const overdueShopifyRefreshesWithoutActiveJob = Number(
+              commerceQueue
+                ?.overdue_shopify_refreshes_without_active_job || 0,
+            )
+            const loopReachable = (
               commerceAgeMs !== null
               && commerceAgeMs <= maxCommerceHeartbeatAgeMs
-              && dead === 0
-              && stale === 0
-              && overdue === 0
+            )
+            const operationalDegraded = (
+              dead > 0
+              || stale > 0
+              || overdue > 0
+              || orphanedRunningCursors > 0
+              || overdueShopifyRefreshesWithoutActiveJob > 0
             )
             commerceCatalogWorker = {
-              status: healthy ? 'reachable' : 'stale',
+              status: loopReachable
+                ? (operationalDegraded ? 'degraded' : 'reachable')
+                : 'stale',
+              livenessStatus: loopReachable ? 'reachable' : 'stale',
+              operationalStatus: operationalDegraded ? 'degraded' : 'ready',
               heartbeatAt: commerceHeartbeat?.checkedAt || null,
               phase: commerceHeartbeat?.phase || null,
               ageMs: commerceAgeMs,
               queued: Number(commerceQueue?.queued || 0),
               retrying: Number(commerceQueue?.retrying || 0),
               dead,
+              historicalDead: Number(commerceQueue?.historical_dead || 0),
               staleProcessing: stale,
               overdue,
+              orphanedRunningCursors,
+              unreconciledShopifyAccounts,
+              unreconciledShopifySignals,
+              overdueShopifyRefreshesWithoutActiveJob,
             }
             if (
               commerceAgeMs === null
@@ -1619,6 +3254,487 @@ export async function GET() {
               errors.push(
                 'Commerce catalog queue has overdue jobs.',
               )
+            }
+            if (orphanedRunningCursors > 0) {
+              errors.push(
+                'Commerce catalog sync has running cursors without active jobs.',
+              )
+            }
+            if (overdueShopifyRefreshesWithoutActiveJob > 0) {
+              warnings.push(
+                'Shopify catalog refresh has unreconciled webhook signals without an active reconciliation job.',
+              )
+            }
+          }
+
+          if (
+            commerceIntakeRuntimeAvailable()
+            && row?.operations_commerce_continuations_migration_applied
+            && row?.operations_commerce_normalization_migration_applied
+          ) {
+            const orderHeartbeat =
+              await readCommerceOrderReconciliationWorkerHeartbeatFromPostgres()
+            const orderHeartbeatAt = Date.parse(
+              String(orderHeartbeat?.checkedAt || ''),
+            )
+            const orderPollMs = Math.max(
+              5_000,
+              Math.min(
+                Number(
+                  process.env.COMMERCE_ORDER_RECONCILIATION_POLL_MS || 60_000,
+                ),
+                300_000,
+              ),
+            )
+            const maxOrderHeartbeatAgeMs = Math.max(180_000, orderPollMs * 3)
+            const orderAgeMs = Number.isFinite(orderHeartbeatAt)
+              ? checkedAt - orderHeartbeatAt
+              : null
+            const orderState =
+              await readCommerceOrderReconciliationHealthFromPostgres()
+            const loopReachable = (
+              orderAgeMs !== null
+              && orderAgeMs <= maxOrderHeartbeatAgeMs
+            )
+            const operationalDegraded = (
+              orderState.failed > 0
+              || orderState.promotionAttentionRequired > 0
+              || orderState.staleProcessing > 0
+              || orderState.overdue > 0
+            )
+            commerceOrderReconciliationWorker = {
+              status: loopReachable
+                ? (operationalDegraded ? 'degraded' : 'reachable')
+                : 'stale',
+              livenessStatus: loopReachable ? 'reachable' : 'stale',
+              operationalStatus: operationalDegraded ? 'degraded' : 'ready',
+              heartbeatAt: orderHeartbeat?.checkedAt || null,
+              phase: orderHeartbeat?.phase || null,
+              ageMs: orderAgeMs,
+              ...orderState,
+            }
+            if (!loopReachable) {
+              errors.push(
+                'Commerce order reconciliation worker heartbeat is missing or stale.',
+              )
+            }
+            if (orderState.failed > 0) {
+              warnings.push(
+                'Commerce order reconciliation has failed accounts.',
+              )
+            }
+            if (orderState.promotionAttentionRequired > 0) {
+              warnings.push(
+                'Faire provider reads completed, but automatic local order promotion needs operator attention.',
+              )
+            }
+            if (orderState.staleProcessing > 0) {
+              warnings.push(
+                'Commerce order reconciliation has stale processing accounts.',
+              )
+            }
+            if (orderState.overdue > 0) {
+              warnings.push(
+                'Commerce order reconciliation has overdue accounts.',
+              )
+            }
+          }
+
+          if (
+            commerceIntakeRuntimeAvailable()
+            && row?.operations_shopify_inventory_refresh_migration_applied
+            && row?.operations_shopify_inventory_webhook_refresh_applied
+            && row?.operations_shopify_catalog_webhook_refresh_applied
+            && row?.operations_commerce_pack_evidence_fingerprint_applied
+            && row?.shopify_active_account_readiness_migration_applied
+            && row?.operations_commerce_inventory_attempt_lease_renewal_applied
+          ) {
+            const inventoryHeartbeat =
+              await readShopifyInventoryRefreshWorkerHeartbeatFromPostgres()
+            const inventoryHeartbeatAt = Date.parse(
+              String(inventoryHeartbeat?.checkedAt || ''),
+            )
+            const inventoryPollMs = Math.max(
+              5_000,
+              Math.min(
+                Number(
+                  process.env.SHOPIFY_INVENTORY_REFRESH_POLL_MS || 10_000,
+                ),
+                300_000,
+              ),
+            )
+            const maxInventoryHeartbeatAgeMs = Math.max(
+              180_000,
+              inventoryPollMs * 3,
+            )
+            const inventoryAgeMs = Number.isFinite(inventoryHeartbeatAt)
+              ? checkedAt - inventoryHeartbeatAt
+              : null
+            const inventoryQueue =
+              await readShopifyInventoryRefreshHealthFromPostgres()
+            const loopReachable = (
+              inventoryAgeMs !== null
+              && inventoryAgeMs <= maxInventoryHeartbeatAgeMs
+            )
+            const operationalDegraded = (
+              inventoryQueue.currentDead > 0
+              || inventoryQueue.staleProcessing > 0
+              || inventoryQueue.overdue > 0
+              || inventoryQueue.staleAccounts > 0
+              || inventoryQueue.retrying > 0
+            )
+            shopifyInventoryRefreshWorker = {
+              status: loopReachable
+                ? (operationalDegraded ? 'degraded' : 'reachable')
+                : 'stale',
+              livenessStatus: loopReachable ? 'reachable' : 'stale',
+              operationalStatus: operationalDegraded ? 'degraded' : 'ready',
+              heartbeatAt: inventoryHeartbeat?.checkedAt || null,
+              phase: inventoryHeartbeat?.phase || null,
+              ageMs: inventoryAgeMs,
+              ...inventoryQueue,
+            }
+            if (
+              inventoryAgeMs === null
+              || inventoryAgeMs > maxInventoryHeartbeatAgeMs
+            ) {
+              errors.push(
+                'Shopify inventory refresh worker heartbeat is missing or stale.',
+              )
+            }
+            if (inventoryQueue.currentDead > 0) {
+              warnings.push(
+                'Shopify inventory refresh queue has terminal failed jobs.',
+              )
+            }
+            if (inventoryQueue.staleProcessing > 0) {
+              warnings.push(
+                'Shopify inventory refresh queue has stale processing jobs.',
+              )
+            }
+            if (inventoryQueue.overdue > 0) {
+              warnings.push(
+                'Shopify inventory refresh queue has overdue jobs.',
+              )
+            }
+            if (inventoryQueue.staleAccounts > 0) {
+              warnings.push(
+                'Checkout-ready Shopify accounts have stale inventory evidence.',
+              )
+            }
+            if (inventoryQueue.retrying > 0) {
+              warnings.push(
+                'Shopify inventory refresh jobs are retrying.',
+              )
+            }
+          }
+
+          if (
+            commerceIntakeRuntimeAvailable()
+            && row?.operations_faire_inventory_polling_applied
+          ) {
+            const faireHeartbeat =
+              await readFaireInventoryPollWorkerHeartbeatFromPostgres()
+            const faireHeartbeatAt = Date.parse(
+              String(faireHeartbeat?.checkedAt || ''),
+            )
+            const sharedInventoryPollMs = Math.max(
+              5_000,
+              Math.min(
+                Number(
+                  process.env.SHOPIFY_INVENTORY_REFRESH_POLL_MS || 10_000,
+                ),
+                300_000,
+              ),
+            )
+            const maxFaireHeartbeatAgeMs = Math.max(
+              180_000,
+              sharedInventoryPollMs * 3,
+            )
+            const faireAgeMs = Number.isFinite(faireHeartbeatAt)
+              ? checkedAt - faireHeartbeatAt
+              : null
+            const faireQueue =
+              await readFaireInventoryPollHealthFromPostgres()
+            const loopReachable = (
+              faireAgeMs !== null
+              && faireAgeMs <= maxFaireHeartbeatAgeMs
+            )
+            const operationalDegraded = (
+              faireQueue.dead > 0
+              || faireQueue.staleLeases > 0
+              || faireQueue.overdueAccounts > 0
+              || faireQueue.retrying > 0
+            )
+            faireInventoryPollWorker = {
+              status: loopReachable
+                ? (operationalDegraded ? 'degraded' : 'reachable')
+                : 'stale',
+              livenessStatus: loopReachable ? 'reachable' : 'stale',
+              operationalStatus: operationalDegraded ? 'degraded' : 'ready',
+              heartbeatAt: faireHeartbeat?.checkedAt || null,
+              phase: faireHeartbeat?.phase || null,
+              ageMs: faireAgeMs,
+              ...faireQueue,
+            }
+            if (!loopReachable) {
+              errors.push(
+                'Faire inventory observation worker heartbeat is missing or stale.',
+              )
+            }
+            if (faireQueue.dead > 0) {
+              warnings.push(
+                'Faire inventory observation has terminal failed accounts requiring reviewed recovery.',
+              )
+            }
+            if (faireQueue.staleLeases > 0) {
+              warnings.push(
+                'Faire inventory observation has stale processing leases.',
+              )
+            }
+            if (faireQueue.overdueAccounts > 0) {
+              warnings.push(
+                'Faire inventory observations are overdue.',
+              )
+            }
+            if (faireQueue.retrying > 0) {
+              warnings.push(
+                'Faire inventory observation jobs are retrying.',
+              )
+            }
+            if (faireQueue.oauthScopeHintMissingAccounts > 0) {
+              warnings.push(
+                'Faire OAuth accounts that did not request READ_INVENTORIES cannot schedule inventory observation polling.',
+              )
+            }
+          }
+
+          if (
+            commerceIntakeRuntimeAvailable()
+            && row?.operations_commerce_product_image_imports_applied
+            && row?.operations_commerce_product_image_fanout_applied
+            && row?.operations_commerce_product_image_source_normalization_applied
+          ) {
+            const imageQueue =
+              await readCommerceProductImageImportQueueHealthInPostgres()
+            const imageHeartbeatAt = Date.parse(
+              String(imageQueue.heartbeat?.checkedAt || ''),
+            )
+            const imagePollMs = Math.max(
+              5_000,
+              Math.min(
+                Number(
+                  process.env.COMMERCE_PRODUCT_IMAGE_IMPORT_POLL_MS || 15_000,
+                ),
+                300_000,
+              ),
+            )
+            const maxImageHeartbeatAgeMs = Math.max(
+              180_000,
+              imagePollMs * 3,
+            )
+            const imageAgeMs = Number.isFinite(imageHeartbeatAt)
+              ? checkedAt - imageHeartbeatAt
+              : null
+            const loopReachable = (
+              imageAgeMs !== null
+              && imageAgeMs <= maxImageHeartbeatAgeMs
+            )
+            const operationalDegraded = (
+              imageQueue.deadCount > 0
+              || imageQueue.staleLeaseCount > 0
+              || imageQueue.overdueCount > 0
+              || imageQueue.retryCount > 0
+              || imageQueue.heartbeat?.phase === 'degraded'
+            )
+            commerceProductImageImportWorker = {
+              status: loopReachable
+                ? (operationalDegraded ? 'degraded' : 'reachable')
+                : 'stale',
+              livenessStatus: loopReachable ? 'reachable' : 'stale',
+              operationalStatus: operationalDegraded ? 'degraded' : 'ready',
+              heartbeatAt: imageQueue.heartbeat?.checkedAt || null,
+              phase: imageQueue.heartbeat?.phase || null,
+              ageMs: imageAgeMs,
+              waitingMapping: imageQueue.waitingMappingCount,
+              queued: imageQueue.queuedCount,
+              retrying: imageQueue.retryCount,
+              claimed: imageQueue.claimedCount,
+              dead: imageQueue.deadCount,
+              historicalDead: imageQueue.historicalDeadCount,
+              staleLeases: imageQueue.staleLeaseCount,
+              overdue: imageQueue.overdueCount,
+            }
+            if (!loopReachable) {
+              errors.push(
+                'Commerce product image import worker heartbeat is missing or stale.',
+              )
+            }
+            if (imageQueue.deadCount > 0) {
+              warnings.push(
+                'Commerce product image import queue has terminal failed jobs.',
+              )
+            }
+            if (imageQueue.staleLeaseCount > 0) {
+              warnings.push(
+                'Commerce product image import queue has stale claimed jobs.',
+              )
+            }
+            if (imageQueue.overdueCount > 0) {
+              warnings.push(
+                'Commerce product image import queue has overdue jobs.',
+              )
+            }
+            if (imageQueue.retryCount > 0) {
+              warnings.push(
+                'Commerce product image import jobs are retrying.',
+              )
+            }
+            if (imageQueue.heartbeat?.phase === 'degraded') {
+              warnings.push(
+                'Commerce product image import worker reported a degraded pass.',
+              )
+            }
+          }
+
+          if (row?.operations_faire_product_image_projection_applied) {
+            const projectionHealth =
+              await readFaireProductImageProjectionHealthInPostgres()
+            const pending = Number(projectionHealth.counts.pending || 0)
+            const claimed = Number(projectionHealth.counts.claimed || 0)
+            const expiredClaimed = Number(
+              projectionHealth.expiredClaimed || 0,
+            )
+            const historicalUnknown = Number(
+              projectionHealth.counts.unknown || 0,
+            )
+            const historicalFailed = Number(
+              projectionHealth.counts.failed || 0,
+            )
+            const unknown = Number(
+              projectionHealth.unresolvedCounts.unknown || 0,
+            )
+            const failed = Number(
+              projectionHealth.unresolvedCounts.failed || 0,
+            )
+            faireProductImageProjection = {
+              status: claimed > 0 || unknown > 0 || failed > 0
+                ? 'degraded'
+                : 'ready',
+              pending,
+              claimed,
+              claimedInFlight: Math.max(0, claimed - expiredClaimed),
+              expiredClaimed,
+              simulated: Number(
+                projectionHealth.counts.simulated || 0,
+              ),
+              succeeded: Number(
+                projectionHealth.counts.succeeded || 0,
+              ),
+              failed,
+              unknown,
+              historical: {
+                failed: historicalFailed,
+                unknown: historicalUnknown,
+              },
+              latestResultAt: projectionHealth.latestAt,
+            }
+            if (claimed > expiredClaimed) {
+              warnings.push(
+                'Faire Product-image publication has in-flight claimed effects.',
+              )
+            }
+            if (expiredClaimed > 0) {
+              warnings.push(
+                'Faire Product-image publication has expired claims ready for terminal no-replay reconciliation.',
+              )
+            }
+            if (unknown > 0) {
+              warnings.push(
+                'Faire Product-image publication has terminal unknown outcomes requiring provider readback.',
+              )
+            }
+            if (failed > 0) {
+              warnings.push(
+                'Faire Product-image publication has failed effects requiring operator review.',
+              )
+            }
+          }
+
+          if (row?.suitecrm_product_image_reverse_ingestion_applied) {
+            if (
+              suiteCrmProductImageConfiguration.enabled
+              && !suiteCrmProductImageConfiguration.ready
+            ) {
+              suiteCrmProductImageIngestion = {
+                ...suiteCrmProductImageIngestion,
+                status: 'unavailable',
+              }
+              warnings.push(
+                'SuiteCRM Product image reverse ingestion is enabled but its dedicated read-only credentials or ACL attestation are incomplete or invalid.',
+              )
+            } else if (suiteCrmProductImageConfiguration.enabled) {
+              const imageIngestion =
+                await readSuiteCrmProductImageIngestionHealthInPostgres()
+              const imageIngestionHeartbeatAt = Date.parse(
+                String(imageIngestion.heartbeat?.checkedAt || ''),
+              )
+              const imageIngestionPollMs = Math.max(
+                5_000,
+                Math.min(
+                  Number(process.env.CRM_INTEGRATION_POLL_MS || 30_000),
+                  300_000,
+                ),
+              )
+              const imageIngestionAgeMs = Number.isFinite(
+                imageIngestionHeartbeatAt,
+              ) ? checkedAt - imageIngestionHeartbeatAt : null
+              const imageIngestionReachable = (
+                imageIngestionAgeMs !== null
+                && imageIngestionAgeMs <= Math.max(
+                  180_000,
+                  imageIngestionPollMs * 3,
+                )
+              )
+              const imageIngestionDegraded = (
+                imageIngestion.heartbeat?.phase === 'degraded'
+              )
+              suiteCrmProductImageIngestion = {
+                status: imageIngestionReachable
+                  ? (imageIngestionDegraded ? 'degraded' : 'reachable')
+                  : 'unavailable',
+                enabled: true,
+                ready: true,
+                missing: [],
+                invalid: [],
+                credentialConflicts: [],
+                aclAttestation:
+                  suiteCrmProductImageConfiguration.aclAttestation,
+                requiredAcl: suiteCrmProductImageConfiguration.acl,
+                heartbeatAt: imageIngestion.heartbeat?.checkedAt || null,
+                phase: imageIngestion.heartbeat?.phase || null,
+                currentPass: imageIngestion.heartbeat?.details || {},
+                ageMs: imageIngestionAgeMs,
+                observations: imageIngestion.observations,
+                importedPrimary: imageIngestion.importedPrimary,
+                importedSecondary: imageIngestion.importedSecondary,
+                echoesSuppressed: imageIngestion.echoesSuppressed,
+                identityConflicts: imageIngestion.identityConflicts,
+                mediaIntegrityConflicts:
+                  imageIngestion.mediaIntegrityConflicts,
+                lastObservedAt: imageIngestion.lastObservedAt,
+                providerWrites: imageIngestion.providerWrites,
+              }
+              if (!imageIngestionReachable) {
+                warnings.push(
+                  'SuiteCRM Product image reverse ingestion is unavailable because its worker heartbeat is missing or stale.',
+                )
+              }
+              if (imageIngestionDegraded) {
+                warnings.push(
+                  'SuiteCRM Product image reverse ingestion has a current sweep error or conflict for review.',
+                )
+              }
             }
           }
 
@@ -1693,6 +3809,13 @@ export async function GET() {
       toastWorker,
       quickBooksWorker,
       commerceCatalogWorker,
+      commerceOrderReconciliationWorker,
+      shopifyInventoryRefreshWorker,
+      faireInventoryPollWorker,
+      commerceProductImageImportWorker,
+      faireProductImageProjection,
+      suiteCrmNativeProductImageProjection,
+      suiteCrmProductImageIngestion,
       integrationQueues,
       operationsCommands,
       crm,

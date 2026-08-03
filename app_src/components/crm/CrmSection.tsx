@@ -59,6 +59,8 @@ import DownloadRounded from '@mui/icons-material/DownloadRounded'
 import CallMergeRounded from '@mui/icons-material/CallMergeRounded'
 import CrmDataTransferDialog from '@/components/crm/CrmDataTransferDialog'
 import ProductIdentityDialog from '@/components/crm/ProductIdentityDialog'
+import ProductImagePanel from '@/components/crm/ProductImagePanel'
+import ProductPackProfilePanel from '@/components/crm/ProductPackProfilePanel'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { annotateInteractionEventHistory } from '@/lib/crm/interactionHistory.mjs'
@@ -332,6 +334,21 @@ function productSalesChannels(record: RecordValue) {
       String((value as Record<string, unknown>).provider || ''),
     )
   ))
+}
+
+function isFaireProductImageChannel(
+  channel: ProductSalesChannelState,
+) {
+  if (channel.provider !== 'faire') return false
+  const lifecycle = channel.providerStatusRaw.trim().toUpperCase()
+  if (!['DRAFT', 'PUBLISHED', 'ACTIVE'].includes(lifecycle)) return false
+  return (
+    channel.normalizedStatus === 'active'
+    && channel.providerActive === true
+  ) || (
+    channel.normalizedStatus === 'unavailable'
+    && channel.providerActive === false
+  )
 }
 
 function salesChannelStatusLabel(
@@ -2332,6 +2349,23 @@ export default function CrmSection() {
                         ? ` · Barcode: ${channel.providerBarcode}`
                         : ''}
                     </Typography>
+                    {channel.providerTaxonomyScheme ? (
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        display="block"
+                      >
+                        {channel.providerTaxonomyScheme ===
+                        'shopify_standard_product_taxonomy'
+                          ? 'Shopify category'
+                          : 'Faire product type'}
+                        :{' '}
+                        {channel.providerCategoryFullName
+                          || channel.providerCategoryName
+                          || channel.providerCategoryId
+                          || 'Unavailable'}
+                      </Typography>
+                    ) : null}
                     {salesChannelOfferSummary(channel) ? (
                       <Typography
                         variant="caption"
@@ -2396,6 +2430,37 @@ export default function CrmSection() {
               </TextField>
             </Stack>
             <TextField disabled={!recordEditable} label="Product URL" type="url" value={fields.url || ''} onChange={(event) => setFields({ ...fields, url: event.target.value })} />
+            {editorRecord ? (
+              <>
+                <Divider />
+                <ProductImagePanel
+                  productId={textValue(editorRecord, 'id')}
+                  canManage={canManageHierarchy}
+                  shopifyChannels={productSalesChannels(editorRecord).filter(
+                    (channel) =>
+                      channel.provider === 'shopify'
+                      && channel.normalizedStatus === 'active'
+                      && channel.providerActive === true,
+                  )}
+                  faireChannels={productSalesChannels(editorRecord).filter(
+                    isFaireProductImageChannel,
+                  )}
+                />
+              </>
+            ) : null}
+            {editorRecord && /^gp(?:[0-9]{7}|[0-9a-v]{12})$/.test(
+              textValue(editorRecord, 'referenceCode'),
+            ) ? (
+              <>
+                <Divider />
+                <ProductPackProfilePanel
+                  productGlobalId={textValue(
+                    editorRecord,
+                    'referenceCode',
+                  )}
+                />
+              </>
+            ) : null}
           </>}
           {editorEntity === 'meetings' && <>
             <TextField disabled={!recordEditable} label="Meeting" value={fields.subject || ''} onChange={(event) => setFields({ ...fields, subject: event.target.value })} required />

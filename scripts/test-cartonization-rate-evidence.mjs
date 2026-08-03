@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -96,6 +97,280 @@ function loadPersistence() {
   return module.exports
 }
 
+function loadOperationalFaireRoute(observed) {
+  const path =
+    'app_src/app/api/integrations/commerce/intake/cartonization-rate-evidence/route.ts'
+  const output = ts.transpileModule(read(path), {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+    fileName: path,
+  }).outputText
+  const module = { exports: {} }
+  class PersistenceError extends Error {
+    constructor(message, status = 409, code = 'PERSISTENCE_ERROR') {
+      super(message)
+      this.status = status
+      this.code = code
+    }
+  }
+  class IntegrationError extends Error {}
+  const evidenceHash = (value) => createHash('sha256')
+    .update(JSON.stringify(value))
+    .digest('hex')
+  const cartonizationRead = {
+    readAt: '2026-08-02T20:00:00.000Z',
+    account: {
+      globalId: 'gia0000001',
+      provider: 'faire',
+      status: 'active',
+    },
+    candidate: {
+      globalId: 'gcoc0000001',
+      orderNumber: 'FAIRE-TEST-1',
+      rowVersion: 1,
+      sourceHash: 'c'.repeat(64),
+      workflowState: 'promoted',
+    },
+    warehouse: {
+      globalId: 'gwh0000001',
+      name: 'Faire local inventory warehouse',
+    },
+    inventory: {
+      syncRunGlobalId: null,
+      providerFetchedAt: null,
+      completedAt: null,
+      lines: [{
+        lineGlobalId: 'gcol0000001',
+        productGlobalId: 'gpr0000001',
+        requiredQuantity: 1,
+        assumedCommittedQuantity: 0,
+      }],
+      products: [{
+        productGlobalId: 'gpr0000001',
+        requiredQuantity: 1,
+        availabilityAuthority: 'operational_available',
+        operationalAvailableQuantity: 3,
+        providerCommittedQuantity: 0,
+        assumedCommittedQuantity: 0,
+        effectiveAvailableQuantity: 3,
+        sourceLevelGlobalIds: [],
+        sourcePositionGlobalIds: ['giv0000001'],
+        sourceProjectionStates: ['projected'],
+      }],
+    },
+    materialEvidence: [],
+    recipeEvidence: [],
+    lineEvidence: [],
+    input: {
+      mode: 'production',
+      lines: [],
+      recipes: [],
+      materials: [{
+        materialGlobalId: 'gmat0000001',
+        currentRowVersion: 2,
+        ratedOuterDimensionsMm: {
+          length: 280,
+          width: 230,
+          height: 180,
+        },
+        tareWeightGrams: 120,
+        maximumGrossWeightGrams: 5000,
+      }],
+    },
+  }
+  const plan = {
+    policyVersion: 'hybrid-cartonization-policy-v1',
+    algorithmVersion: 'approved-recipe-v1',
+    inputHash: 'a'.repeat(64),
+    resultHash: 'b'.repeat(64),
+    status: 'ready',
+    recipePackages: [{
+      packageKey: 'package-1',
+      sequence: 1,
+      planningMethod: 'approved_recipe',
+      packagingMaterialGlobalId: 'gmat0000001',
+      packagingMaterialRowVersion: 2,
+      materialEvidence: {
+        innerDimensionsMm: {
+          length: 270,
+          width: 220,
+          height: 170,
+        },
+      },
+      contentWeightGrams: 170,
+      rateReadiness: {
+        status: 'ready',
+        ratedOuterDimensionsMm: {
+          length: 280,
+          width: 230,
+          height: 180,
+        },
+        tareWeightGrams: 120,
+        ratedWeightGrams: 290,
+      },
+      lineAllocations: [{
+        lineGlobalId: 'gcol0000001',
+        productGlobalId: 'gpr0000001',
+        title: 'Faire test product',
+        quantity: 1,
+        recipeGlobalId: 'gpkrc0000001',
+        recipeRowVersion: 1,
+        profileVersionGlobalId: 'gppv0000001',
+        profileVersionRowVersion: 1,
+      }],
+    }],
+    geometryFallbackLines: [],
+    assumptions: [],
+    blockers: [],
+  }
+  const carrierAccounts = ['ups_rest', 'fedex_rest'].map((provider) => ({
+    provider,
+    environment: 'sandbox',
+    status: 'active',
+    senderOriginWarehouseGlobalId: 'gwh0000001',
+    carrierAccounts: [{
+      globalId: provider === 'ups_rest'
+        ? 'gca0000001'
+        : 'gca0000002',
+      status: 'active',
+      allowSenderBilling: true,
+    }],
+  }))
+  const mocks = {
+    'next/server': {
+      NextRequest: Request,
+      NextResponse: {
+        json(payload, options = {}) {
+          return new Response(JSON.stringify(payload), {
+            ...options,
+            headers: options.headers,
+          })
+        },
+      },
+    },
+    '@/lib/integrations/carrierIntegrations': {
+      CarrierIntegrationRequestError: IntegrationError,
+      getCarrierIntegrationsState: async () => ({
+        accounts: carrierAccounts,
+      }),
+      sanitizedCarrierIntegrationError: (error) => error,
+      testCarrierSandboxShipmentRate: async (input) => {
+        observed.carrierReads.push(input)
+        return {
+          evidenceGlobalId: input.provider === 'ups_rest'
+            ? 'grq0000001'
+            : 'grq0000002',
+        }
+      },
+    },
+    '@/lib/integrations/carrierSandboxRate': {
+      normalizeCarrierSandboxParcel: (input) => ({
+        description: input.description,
+        length: input.exteriorInches.length,
+        width: input.exteriorInches.width,
+        height: input.exteriorInches.height,
+        dimensionUnit: 'IN',
+        weight: input.grossPounds,
+        weightUnit: 'LB',
+      }),
+    },
+    '@/lib/integrations/commerceIntake': {
+      assertCommerceIntakeRuntime() {},
+    },
+    '@/lib/integrations/commerceIntegrations': {
+      CommerceIntegrationRequestError: IntegrationError,
+      sanitizedCommerceIntegrationError: (error) => error,
+    },
+    '@/lib/operations/authorization': {
+      activeOperationsOrganizationId: () => (
+        '00000000-0000-4000-8000-000000000001'
+      ),
+      operationsCapabilities: () => ({ canManage: true, canView: true }),
+    },
+    '@/lib/operations/hybridCartonization': {
+      planHybridCartonization: () => plan,
+    },
+    '@/lib/persistence/config': {
+      isPostgresStorageEnabled: () => true,
+    },
+    '@/lib/persistence/cartonizationRateEvidence': {
+      cartonizationRateEvidenceHash: evidenceHash,
+      CartonizationRateEvidencePersistenceError: PersistenceError,
+      claimCartonizationRateEvidenceCommandInPostgres: async () => ({
+        state: 'created',
+      }),
+      failCartonizationRateEvidenceCommandInPostgres: async () => {
+        throw new Error('Successful route acceptance must not fail its claim')
+      },
+      MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES: 50,
+      readCartonizationRateCandidateContext: async () => ({
+        candidateSourceHash: cartonizationRead.candidate.sourceHash,
+        destinationFingerprint: 'd'.repeat(64),
+        destination: {
+          name: 'Faire test customer',
+          addressLine1: '35 Saxony Drive',
+          city: 'Trumbull',
+          stateOrProvinceCode: 'CT',
+          postalCode: '06611',
+          countryCode: 'US',
+        },
+      }),
+      readCartonizationRateEvidenceByGlobalId: async () => null,
+      writeCartonizationRateEvidenceInPostgres: async (input) => {
+        observed.write = input
+        return { globalId: 'gcte0000001' }
+      },
+    },
+    '@/lib/persistence/hybridCartonization': {
+      HybridCartonizationPersistenceError: PersistenceError,
+      readHybridCartonizationInputFromPostgres: async (input) => {
+        observed.readInput = input
+        return cartonizationRead
+      },
+    },
+    '@/lib/requestUser': {
+      requireRequestUser: async () => ({ email: 'operator@example.com' }),
+    },
+  }
+  vm.runInNewContext(output, {
+    Array,
+    BigInt,
+    Boolean,
+    Buffer,
+    Date,
+    Error,
+    Headers,
+    JSON,
+    Map,
+    Math,
+    Number,
+    Object,
+    Promise,
+    RegExp,
+    Request,
+    Response,
+    Set,
+    String,
+    TextDecoder,
+    TextEncoder,
+    URL,
+    console,
+    exports: module.exports,
+    module,
+    process,
+    require(specifier) {
+      if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
+        return mocks[specifier]
+      }
+      return requireFromApp(specifier)
+    },
+  }, { filename: path })
+  return module.exports
+}
+
 const migration = read(
   'db/migrations/0137_operations_cartonization_rate_evidence.sql',
 )
@@ -116,6 +391,9 @@ const persistence = read(
 )
 const route = read(
   'app_src/app/api/integrations/commerce/intake/cartonization-rate-evidence/route.ts',
+)
+const workflow = read(
+  'app_src/components/settings/CommerceIntakeWorkflow.tsx',
 )
 
 assertIncludes(migration, [
@@ -217,6 +495,10 @@ assertIncludes(persistence, [
   'CartonizationRateEvidenceMaterialRateAssumption',
   'assertCartonizationRateEvidenceMaterialAssumptions',
   'materialRateAssumptions',
+  'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_ASSUMPTIONS_FORBIDDEN',
+  'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_RATE_ENVIRONMENT_INVALID',
+  'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_STALE',
+  'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_STOCK_STALE',
   'CARTONIZATION_RATE_EVIDENCE_MATERIAL_ASSUMPTION_MISMATCH',
   'rateContextsByEvidence',
   'export function cartonizationRateEvidenceRequestHash',
@@ -269,11 +551,20 @@ assert.doesNotMatch(
 
 assertIncludes(route, [
   'export async function POST(req: NextRequest)',
+  "version: 'cartonization-rate-evidence-command-v1'",
+  'function cartonizationRateEvidenceCommandHash(',
+  "error.message === 'ACTIVE_ORGANIZATION_REQUIRED'",
   'MAX_SELECTED_MATERIALS = 8',
   'selected.length < 1',
   'selected.length > MAX_SELECTED_MATERIALS',
   'sandboxRateAssumptions',
-  'materialRateAssumptions(request)',
+  'sandboxMaterialRateAssumptions(request)',
+  "request.evidenceMode === 'operational'",
+  "carrierReadEnvironment: 'sandbox'",
+  'operatorSuppliedAssumptions: false',
+  'operationalMaterialFacts',
+  "'shopify_provider_commitment_preflight'",
+  "'transactional_provider_commitment_lock'",
   'rateAssumptionsByMaterial',
   'readHybridCartonizationInputFromPostgres',
   'readCartonizationRateCandidateContext',
@@ -297,6 +588,131 @@ assertIncludes(route, [
   'postagePurchases: 0',
   'providerWrites: 0',
 ], 'Executable package-and-rate workflow')
+assert.ok(
+  route.indexOf('claimCartonizationRateEvidenceCommandInPostgres({')
+    < route.indexOf('readHybridCartonizationInputFromPostgres({'),
+  'The durable idempotency claim must precede database planning and carrier reads',
+)
+const commandHashSection = section(
+  route,
+  'function cartonizationRateEvidenceCommandHash(',
+  'function errorResponse(',
+  'Stable cartonization command hash',
+)
+assert.doesNotMatch(
+  commandHashSection,
+  /readAt|planSnapshot|carrierReadEnvironment/,
+  'The durable command identity must exclude volatile read and plan output',
+)
+assertIncludes(workflow, [
+  'canManage: boolean',
+  'readonly preserveIdempotencyKey = false',
+  "evidenceMode: 'operational'",
+  "evidenceMode: 'assumption_backed_sandbox'",
+  '`cartonization-rate-evidence:${JSON.stringify(command)}`',
+  "'CARTONIZATION_RATE_EVIDENCE_IN_PROGRESS'",
+  'response.status >= 500',
+  '!explicitApplicationFailure',
+  '&& !caught.preserveIdempotencyKey',
+  'createOperationalCartonizationRateEvidence',
+  'operationalRateEvidenceReady',
+  'Save operational pack facts',
+  'Save sandbox comparison',
+  'READ-ONLY SANDBOX CARRIER ESTIMATES',
+], 'Operator evidence-mode workflow')
+assert.equal(
+  workflow.includes(
+    'Faire account-bound inventory reconciliation is not implemented yet.',
+  ),
+  false,
+  'Faire candidates must expose the implemented local-inventory cartonization workflow',
+)
+assertIncludes(workflow, [
+  'candidate.requiresShipping !== false ? (',
+  'void openCartonizationPreview(candidate)',
+  'Pack & compare rates',
+], 'Provider-neutral candidate cartonization action')
+assert.equal(
+  workflow.match(/response\.status >= 500/g)?.length,
+  2,
+  'Both evidence modes must preserve retry identity after 5xx responses',
+)
+assert.equal(
+  workflow.match(/&& !caught\.preserveIdempotencyKey/g)?.length,
+  2,
+  'Both evidence modes must rotate retry identity only after terminal responses',
+)
+const packPlanningLock = section(
+  workflow,
+  'const packPlanningLocked = (',
+  'const address = candidate.shipTo?.address',
+  'Promoted-order pack-planning lock',
+)
+assert.doesNotMatch(
+  packPlanningLock,
+  /candidate\.state === 'promoted'/,
+  'Promotion must not lock the factual warehouse-planning workflow',
+)
+const promotedMaterialDefault = section(
+  workflow,
+  'const operationalMaterials = activeWarehouseGlobalId',
+  'setCartonizationMaterials(materials)',
+  'Promoted-order material default',
+)
+assertIncludes(promotedMaterialDefault, [
+  'operationalPackagingMaterialBlockers(',
+  "candidate.state === 'promoted'",
+  'operationalAg12v2Material',
+  'operationalMaterials[0]',
+  'eligible[0]',
+], 'Promoted-order operational material preference')
+assert.ok(
+  promotedMaterialDefault.indexOf('operationalMaterials[0]')
+    < promotedMaterialDefault.lastIndexOf('eligible[0]'),
+  'Promoted-order defaults must prefer operational material before a generic optimizer-ready fallback',
+)
+const fitPreviewHandler = section(
+  workflow,
+  'async function runCartonizationPreview()',
+  'async function createCartonizationRateEvidence()',
+  'Fit-only preview handler',
+)
+assertIncludes(fitPreviewHandler, [
+  "candidate?.state === 'promoted'",
+  'Fit-only preview is unavailable after an order is added to ClawPilot.',
+  'Save operational pack facts for warehouse planning.',
+], 'Promoted-order fit-preview guard')
+const assumptionBackedHandler = section(
+  workflow,
+  'async function createCartonizationRateEvidence()',
+  'async function createOperationalCartonizationRateEvidence()',
+  'Assumption-backed comparison handler',
+)
+assertIncludes(assumptionBackedHandler, [
+  "candidate?.state === 'promoted'",
+  'Assumption-backed sandbox comparison is unavailable after an order is added to ClawPilot.',
+  'Correct the warehouse, product packing profile, or packaging material master data',
+], 'Promoted-order sandbox-comparison guard')
+assertIncludes(workflow, [
+  "cartonizationCandidate?.state === 'promoted'",
+  'Step 2 · Save warehouse planning evidence',
+  'Warehouse planning must use the',
+  'current provider inventory, product packing profiles, and',
+  'factual packaging master data.',
+], 'Promoted-order warehouse-planning UI')
+const dialogActions = section(
+  workflow,
+  'aria-labelledby="cartonization-preview-title"',
+  '</DialogActions>',
+  'Pack-and-rate dialog actions',
+)
+assertIncludes(dialogActions, [
+  'title={promotedWarehousePlanning',
+  'disabled={\n              promotedWarehousePlanning',
+  'Run fit-only preview',
+  'Save sandbox comparison',
+  'Save operational pack facts',
+], 'Promoted-order action visibility')
 assert.doesNotMatch(
   route,
   /CARTONIZATION_RATE_EVIDENCE_ONE_MATERIAL_REQUIRED/,
@@ -370,6 +786,7 @@ assert.throws(
 )
 
 const planSnapshot = {
+  carrierReadEnvironment: 'sandbox',
   warehouseGlobalId: 'gwh0000001',
   packages: [{ packageKey: 'package-1' }],
 }
@@ -452,7 +869,9 @@ const request = {
   planInputHash: 'a'.repeat(64),
   planResultHash: cartonizationRateEvidenceHash(planSnapshot),
   planSnapshot,
-  assumptionSnapshot: { materialRateAssumptions },
+  assumptionSnapshot: {
+    operationalMaterialFacts: materialRateAssumptions,
+  },
   status: 'succeeded',
   idempotencyKey: 'cartonization-demo-1',
   actorEmail: 'operator@example.com',
@@ -462,7 +881,45 @@ const request = {
 }
 assert.doesNotThrow(
   () => assertCartonizationRateEvidenceMaterialAssumptions(request),
-  'Every package must match its retained per-material rating assumptions',
+  'Every operational package must match its retained factual material inputs',
+)
+assert.throws(
+  () => assertCartonizationRateEvidenceMaterialAssumptions({
+    ...request,
+    assumptionSnapshot: {
+      operationalMaterialFacts: materialRateAssumptions,
+      materialRateAssumptions,
+    },
+  }),
+  (error) => (
+    error instanceof CartonizationRateEvidencePersistenceError
+    && error.code
+      === 'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_ASSUMPTIONS_FORBIDDEN'
+  ),
+  'Operational evidence must reject a retained sandbox-assumption payload',
+)
+assert.throws(
+  () => assertCartonizationRateEvidenceMaterialAssumptions({
+    ...request,
+    planSnapshot: {
+      ...request.planSnapshot,
+      carrierReadEnvironment: 'production',
+    },
+  }),
+  (error) => (
+    error instanceof CartonizationRateEvidencePersistenceError
+    && error.code
+      === 'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_RATE_ENVIRONMENT_INVALID'
+  ),
+  'Development operational evidence must retain its sandbox carrier environment',
+)
+assert.doesNotThrow(
+  () => assertCartonizationRateEvidenceMaterialAssumptions({
+    ...request,
+    evidenceMode: 'assumption_backed_sandbox',
+    assumptionSnapshot: { materialRateAssumptions },
+  }),
+  'The explicit assumption-backed sandbox path must remain supported',
 )
 assert.equal(
   quotes.length,
@@ -524,7 +981,7 @@ assert.equal(
     packages: [...packages].reverse(),
     quotes: [...quotes].reverse(),
   }),
-  'Semantic request hashing must ignore actor, command key, material order, and edge ordering',
+  'Exact evidence request hashing must ignore actor, command key, material order, and edge ordering',
 )
 assert.notEqual(
   requestHash,
@@ -555,5 +1012,73 @@ assert.notEqual(
   }),
   'Semantic request hashing must change when a material rate assumption changes',
 )
+
+const faireRouteObserved = {
+  carrierReads: [],
+  readInput: null,
+  write: null,
+}
+const faireRoute = loadOperationalFaireRoute(faireRouteObserved)
+const faireRouteResponse = await faireRoute.POST(new Request(
+  'http://localhost/api/integrations/commerce/intake/cartonization-rate-evidence',
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      accountGlobalId: 'gia0000001',
+      candidateGlobalId: 'gcoc0000001',
+      expectedCandidateRowVersion: 1,
+      warehouseGlobalId: 'gwh0000001',
+      idempotencyKey: 'faire-operational-route-acceptance',
+      evidenceMode: 'operational',
+      selectedMaterials: [{
+        materialGlobalId: 'gmat0000001',
+        expectedRowVersion: 2,
+      }],
+    }),
+  },
+))
+assert.equal(faireRouteResponse.status, 200)
+assert.deepEqual(
+  await faireRouteResponse.json(),
+  {
+    ok: true,
+    evidence: { globalId: 'gcte0000001' },
+    effects: {
+      databaseEvidenceWrites: true,
+      inventoryWrites: 0,
+      shipmentWrites: 0,
+      labelCalls: 0,
+      postagePurchases: 0,
+      providerWrites: 0,
+      carrierRateReads: 2,
+      carrierQuoteEdges: 2,
+    },
+  },
+)
+assert.equal(faireRouteObserved.readInput.mode, 'production')
+assert.equal(
+  faireRouteObserved.readInput.assumedCommittedQuantities.length,
+  0,
+)
+assert.equal(faireRouteObserved.carrierReads.length, 2)
+assert.equal(faireRouteObserved.write.inventorySyncRunGlobalId, null)
+assert.equal(faireRouteObserved.write.evidenceMode, 'operational')
+assert.equal(
+  faireRouteObserved.write.assumptionSnapshot.inventoryAuthority,
+  'projected_atp_only',
+)
+assert.equal(
+  faireRouteObserved.write.assumptionSnapshot.planClaimAuthority,
+  'transactional_local_balance_lock',
+)
+assert.equal(
+  faireRouteObserved.write.assumptionSnapshot
+    .inventoryProducts[0].sourcePositionGlobalIds[0],
+  'giv0000001',
+)
+assert.equal(faireRouteObserved.write.packages[0].contentWeightGrams, 170)
+assert.equal(faireRouteObserved.write.packages[0].tareWeightGrams, 120)
+assert.equal(faireRouteObserved.write.packages[0].ratedGrossWeightGrams, 290)
 
 console.log('cartonization rate evidence contract tests passed')

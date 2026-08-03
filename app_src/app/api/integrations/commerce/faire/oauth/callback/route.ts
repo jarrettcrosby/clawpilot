@@ -6,6 +6,9 @@ import {
   purgeExpiredFaireOAuthCommerce,
   sanitizedCommerceIntegrationError,
 } from '@/lib/integrations/commerceIntegrations'
+import {
+  readFaireOAuthCallbackAuthorizationCode,
+} from '@/lib/integrations/faireOAuthCallback'
 import { operationsCapabilities } from '@/lib/operations/authorization'
 import { appPublicUrl } from '@/lib/publicUrl'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
@@ -64,8 +67,8 @@ export async function GET(req: NextRequest) {
     }
     await purgeExpiredFaireOAuthCommerce()
     const state = req.nextUrl.searchParams.get('state')
-    const authorizationCode = req.nextUrl.searchParams.get(
-      'authorizationCode',
+    const authorizationCode = readFaireOAuthCallbackAuthorizationCode(
+      req.nextUrl.searchParams,
     )
     const providerDenied = req.nextUrl.searchParams.has('error')
     if (providerDenied || !state || !authorizationCode) {

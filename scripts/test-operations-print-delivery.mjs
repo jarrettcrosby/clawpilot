@@ -98,6 +98,13 @@ function loadPersistenceHelpers() {
     if (specifier === '@/lib/auditWriter') {
       return { recordAuditEvent: async () => undefined }
     }
+    if (specifier === '@/lib/integrations/carrierManagedDelegation') {
+      return {
+        carrierConfigurationAllowsSandboxLabel: () => true,
+        isSourceManagedCarrierConfiguration: () => false,
+        managedCarrierDelegationProfile: () => null,
+      }
+    }
     if (specifier === '@/lib/operations/printing') return {}
     if (specifier === '@/lib/persistence/operationPrinting') return {}
     if (specifier === '@/lib/persistence/operations') {
@@ -225,6 +232,13 @@ function verifySourceContracts() {
     'strictBase64Bytes',
     'rate_test_label.label_payload AS rate_test_label_payload',
     'cancelVoidedRateTestLabelJobs',
+    'cancelUnauthorizedRateTestLabelJobs',
+    'assertRateTestLabelPrintCapability',
+    'carrierConfigurationAllowsSandboxLabel',
+    'sandbox_label_revoked',
+    "jsonb_typeof(connection.configuration->'allowedCapabilities')",
+    'rate_test_label.integration_account_id::text',
+    "'sandbox_label'",
     'artifact.source_rate_test_label_id IS NULL',
     'original.rate_test_label_id',
     'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
@@ -235,13 +249,17 @@ function verifySourceContracts() {
     'sourceArtifactGlobalId',
     'assertPackingSlipArtifactCanBeEnqueued',
     'OPERATIONS_PRINT_PACKING_SLIP_ALREADY_ENQUEUED',
-    'Packing-list content failed integrity validation',
+    'Pack Work Instruction content failed integrity validation',
   ]) {
     assert.ok(
       persistence.includes(fragment),
       `Missing print-delivery persistence contract: ${fragment}`,
     )
   }
+  assert.ok(
+    (persistence.match(/assertRateTestLabelPrintCapability\(/g) || []).length >= 5,
+    'Enqueue, claim, claim replay, retry, and reprint must recheck sandbox-label capability',
+  )
   assert.ok(
     !/\b(?:createLabel|purchaseLabel|buyLabel|carrierClient)\s*\(/.test(persistence),
     'Print delivery persistence must not purchase labels or call carrier APIs',
@@ -820,7 +838,7 @@ async function verifyPostgresAcceptance(connectionString) {
         WHERE id = $1`,
       [fixture.agentId],
     )
-    assert.match(credentialRecord.rows[0].global_id, /^gpt\d{7}$/)
+    assert.match(credentialRecord.rows[0].global_id, /^gpt[0-9a-v]{12}$/)
     assert.equal(credentialRecord.rows[0].secret_hash, fixture.secretHash)
     assert.notEqual(credentialRecord.rows[0].secret_hash, fixture.plainSecret)
     assert.equal(credentialRecord.rows[0].credential_version, 1)
@@ -961,9 +979,9 @@ async function verifyPostgresAcceptance(connectionString) {
       hash: 'c'.repeat(64),
       storageReference: `s3://print-delivery/${fixture.suffix}/packing-a4.png`,
     })
-    assert.match(labelArtifact.global_id, /^gpf\d{7}$/)
-    assert.match(packingArtifact.global_id, /^gpf\d{7}$/)
-    assert.match(a4Artifact.global_id, /^gpf\d{7}$/)
+    assert.match(labelArtifact.global_id, /^gpf[0-9a-v]{12}$/)
+    assert.match(packingArtifact.global_id, /^gpf[0-9a-v]{12}$/)
+    assert.match(a4Artifact.global_id, /^gpf[0-9a-v]{12}$/)
     await expectRejected(
       () => createArtifact(pool, fixture, {
         documentType: 'packing_slip',

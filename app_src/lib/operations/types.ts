@@ -20,10 +20,30 @@ export type OperationsExceptionStatus = 'open' | 'acknowledged' | 'resolved' | '
 
 export type OperationsActivationState = 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
 
+export type CommerceActiveWriteCapability =
+  | 'catalog_publishing'
+  | 'inventory_export'
+  | 'inventory_transfer_synchronization'
+  | 'inventory_shipment_synchronization'
+  | 'location_administration'
+  | 'customer_export'
+  | 'order_creation'
+  | 'order_update'
+  | 'order_edit'
+  | 'draft_order_synchronization'
+  | 'refund_export'
+  | 'fulfillment_export'
+  | 'third_party_fulfillment_orchestration'
+  | 'fulfillment_service'
+  | 'tracking_export'
+  | 'shipping_rate_callbacks'
+  | 'return_export'
+
 export type OperationsOrderAction =
   | 'release_to_warehouse'
   | 'confirm_picks'
   | 'verify_pack'
+  | 'prepare_fulfillment'
   | 'confirm_shipment'
 
 export type OperationsOrderActionAvailability = {
@@ -57,10 +77,38 @@ export type OperationsShipmentCommandResult = {
   trackingNumber: string
   packingSlipArtifactGlobalId: string
   commerceExportGlobalId: string
-  commerceExportState: 'succeeded' | 'unsupported' | 'failed'
+  commerceExportState:
+    | 'succeeded'
+    | 'unsupported'
+    | 'failed'
+  customerNotification: OperationsCustomerNotificationDecision
   replayed: boolean
   printJobGlobalId: string | null
   printWarning: string | null
+}
+
+export type OperationsCustomerNotificationDecision = {
+  mode: 'clawpilot_explicit' | 'provider_managed'
+  notifyCustomer: boolean | null
+  source:
+    | 'account_default'
+    | 'order_override'
+    | 'sandbox_e2e_suppression'
+    | 'legacy_safe_default'
+    | 'provider_managed'
+  accountPolicyRevision: number | null
+  overrideReason: string | null
+  decidedBy: string | null
+}
+
+export type OperationsCommerceFulfillmentRetryResult = {
+  commerceExportGlobalId: string
+  state: 'succeeded' | 'unsupported' | 'failed'
+  providerReference: string | null
+  errorCode: string | null
+  errorMessage: string | null
+  customerNotification: OperationsCustomerNotificationDecision
+  replayed: boolean
 }
 
 export type OperationsPackingSlipCommandResult = {
@@ -69,6 +117,11 @@ export type OperationsPackingSlipCommandResult = {
   rowVersion: number
   packageGlobalId: string
   packageNumber: number
+  documentKind: 'pack_work_instruction' | 'legacy_prelabel_packing_list'
+  documentStage:
+    | 'pre_label_pack_work_instruction'
+    | 'legacy_prelabel_packing_list'
+  finalPackingSlip: false
   packingSlipArtifactGlobalId: string
   contentUrl: string
   replayed: boolean
@@ -568,6 +621,74 @@ export type OperationsExceptionListItem = {
   resolvedAt: string | null
 }
 
+export type OperationsShadowFulfillmentPreparationPackage = {
+  packageKey: string
+  sequence: number
+  materialCode: string
+  materialName: string
+  dimensionsMm: Millimeters
+  contentWeightGrams: number
+  tareWeightGrams: number
+  grossWeightGrams: number
+  allocations: Array<{
+    lineKey: string
+    productGlobalId: string
+    providerVariantId: string
+    title: string
+    quantity: number
+  }>
+}
+
+export type OperationsShadowFulfillmentPreparationStage = {
+  runGlobalId: string
+  packageCount: number
+  packages: OperationsShadowFulfillmentPreparationPackage[]
+  selectedRate: {
+    provider: 'ups_rest' | 'fedex_rest'
+    serviceCode: string
+    serviceName: string
+    carrierCostMinor: string
+    customerChargeMinor: string
+    currency: string
+  }
+}
+
+export type OperationsShadowFulfillmentPreparation = {
+  executionGlobalId: string
+  shipmentGroupGlobalId: string
+  reconciliationGlobalId: string | null
+  checkoutRateReceiptGlobalId: string
+  preparedAt: string
+  checkout: OperationsShadowFulfillmentPreparationStage
+  fulfillment: OperationsShadowFulfillmentPreparationStage
+  variance: {
+    globalId: string
+    packageCountDelta: number
+    carrierCostVarianceMinor: string
+    estimatedCheckoutVarianceMinor: string
+    allocationChanged: boolean
+    materialChanged: boolean
+    serviceChanged: boolean
+    causes: string[]
+  }
+  providerAttempts: Array<{
+    provider: 'ups_rest' | 'fedex_rest'
+    carrierAccountGlobalId: string
+    carrierAccountName: string
+    rateEvidenceGlobalId: string
+    environment: 'sandbox'
+    status: 'succeeded' | 'degraded'
+    failureCode: string | null
+    selected: boolean
+  }>
+  effects: {
+    providerWriteCount: 0
+    postagePurchaseCount: 0
+    labelWriteCount: 0
+    commerceWriteCount: 0
+  }
+}
+
 export type OperationsOrderDetail = OperationsOrderListItem & {
   externalOrderId: string
   currency: string
@@ -582,6 +703,28 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
   plannedPackageCount: number
   packedPackageCount: number
   availableActions: OperationsOrderActionAvailability[]
+  sandboxCommerceE2eAuthorization: {
+    authorizationGlobalId: string
+    authorizedAt: string
+    expiresAt: string
+  } | null
+  fulfillmentPreparation: OperationsShadowFulfillmentPreparation | null
+  fulfillmentNotificationPolicy:
+    | {
+      mode: 'clawpilot_explicit'
+      notifyCustomerDefault: boolean
+      revision: number
+    }
+    | {
+      mode: 'provider_managed'
+      notifyCustomerDefault: null
+      revision: 0
+    }
+    | {
+      mode: 'unavailable'
+      notifyCustomerDefault: null
+      revision: 0
+    }
   shipTo: Address
   lines: Array<{
     globalId: string
@@ -625,7 +768,7 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     serviceCode: string
     serviceName: string
     internalCostMinor: string
-    customerChargeMinor: string
+    customerChargeMinor: string | null
     estimatedDeliveryAt: string
     meetsPromise: boolean
     selected: boolean
@@ -669,6 +812,11 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     packageGlobalId: string | null
     shipmentGlobalId: string | null
     documentType: 'shipping_label' | 'packing_slip'
+    documentKind:
+      | 'shipping_label'
+      | 'final_packing_slip'
+      | 'pack_work_instruction'
+      | 'legacy_prelabel_packing_list'
     format: 'ZPL' | 'PDF' | 'PNG'
     media: 'label_4x6' | 'label_4x8' | 'letter' | 'a4'
     filename: string | null
@@ -679,12 +827,19 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     globalId: string
     shipmentGlobalId: string
     provider: string
-    state: 'queued' | 'processing' | 'succeeded' | 'failed' | 'unsupported'
+    state:
+      | 'queued'
+      | 'processing'
+      | 'succeeded'
+      | 'failed'
+      | 'unsupported'
+    attempts: number
     providerReference: string | null
     errorCode: string | null
     errorMessage: string | null
     requestedAt: string
     completedAt: string | null
+    customerNotification: OperationsCustomerNotificationDecision
   }>
   events: Array<{
     globalId: string
@@ -965,6 +1120,54 @@ export type OperationsOrderCommandResult = {
   replayed: boolean
 }
 
+export type OperationsPlanCommandResult = OperationsOrderCommandResult & {
+  orderStatus: 'planned'
+  fulfillmentPlanGlobalId: string
+  cartonizationEvidenceGlobalId: string
+  packageCount: number
+  carrier: string
+  serviceCode: string
+  serviceName: string
+  carrierCostMinor: number
+  currency: string
+  checkoutShippingChargeMinor: number | null
+  checkoutVarianceMinor: number | null
+}
+
+export type OperationsShadowFulfillmentExecutionResult = {
+  orderGlobalId: string
+  orderStatus: 'packed'
+  rowVersion: number
+  fulfillmentExecutionGlobalId: string
+  shipmentGroupGlobalId: string
+  checkoutRateReceiptGlobalId: string
+  checkoutPackRateRunGlobalId: string
+  fulfillmentPackRateRunGlobalId: string
+  varianceGlobalId: string
+  packageCount: number
+  carrier: 'UPS' | 'FedEx'
+  provider: 'ups_rest' | 'fedex_rest'
+  serviceCode: string
+  serviceName: string
+  carrierCostMinor: number
+  checkoutShippingChargeMinor: number
+  carrierCostVarianceMinor: number
+  estimatedCheckoutVarianceMinor: number
+  currency: string
+  providerAttempts: Array<{
+    provider: 'ups_rest' | 'fedex_rest'
+    carrierAccountGlobalId: string
+    status: 'succeeded' | 'degraded'
+    failureCode: string | null
+    rateEvidenceGlobalId: string
+  }>
+  providerWriteCount: 0
+  postagePurchaseCount: 0
+  labelWriteCount: 0
+  commerceWriteCount: 0
+  replayed: boolean
+}
+
 export type OperationsExceptionUpdateResult = {
   exception: OperationsExceptionListItem
   changed: boolean
@@ -972,4 +1175,62 @@ export type OperationsExceptionUpdateResult = {
 
 export type OperationsActivationUpdateResult = OperationsWorkspace['activation'] & {
   dataPipeline: OperationsWorkspace['dataPipeline']
+}
+
+export type OperationsCommerceActivePreparationResult = {
+  preparationGlobalId: string
+  cohortHash: string
+  expectedActivationState: 'shadow'
+  expectedActivationRevision: number
+  targetActivationState: 'active'
+  targetActivationRevision: number
+  accounts: Array<{
+    accountGlobalId: string
+    provider: 'shopify' | 'faire'
+    environment: 'sandbox' | 'production'
+    externalAccountId: string
+    credentialGeneration: number
+    authMode: string
+    priorAccountStatus: 'active' | 'disabled'
+    targetAccountStatus: 'active'
+    grantedScopes: string[]
+    grantedScopeDigest: string
+    writeCapabilities: CommerceActiveWriteCapability[]
+    capabilityDigest: string
+  }>
+  preparedBy: string
+  preparedRole: 'owner' | 'admin'
+  preparedAt: string
+  replayed: boolean
+}
+
+export type OperationsCommerceActiveTransitionResult = {
+  authorization: {
+    authorizationGlobalId: string
+    preparationGlobalId: string
+    cohortHash: string
+    confirmationStatementVersion: 'commerce-active-transition-v1'
+    authorizedBy: string
+    authorizedRole: 'owner' | 'admin'
+    authorizedAt: string
+    expiresAt: string
+    replayed: boolean
+  }
+  transition: {
+    transitionGlobalId: string
+    preparationGlobalId: string
+    authorizationGlobalId: string
+    cohortHash: string
+    fromActivationState: 'shadow'
+    fromActivationRevision: number
+    state: 'active'
+    revision: number
+    accountCount: number
+    capabilityCount: number
+    reason: string | null
+    activatedBy: string
+    activatedRole: 'owner' | 'admin'
+    activatedAt: string
+    replayed: boolean
+  }
 }

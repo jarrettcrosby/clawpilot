@@ -15,6 +15,21 @@ export type CarrierSandboxParty = {
   countryCode: 'US'
 }
 
+/**
+ * Carrier rate requests may be submitted before Shopify releases a complete
+ * delivery address. This shape is intentionally limited to quote-only paths;
+ * shipping and label creation continue to require CarrierSandboxParty.
+ */
+export type CarrierSandboxRateDestination = {
+  name: string | null
+  line1: string | null
+  line2: string | null
+  city: string | null
+  region: string | null
+  postalCode: string
+  countryCode: 'US'
+}
+
 export type CarrierSandboxParcel = {
   description: string
   length: number
@@ -50,7 +65,7 @@ export const MAX_CARRIER_SANDBOX_SHIPMENT_PACKAGES = 50
 
 export type CarrierSandboxShipmentRateFixture = {
   origin: CarrierSandboxParty
-  destination: CarrierSandboxParty
+  destination: CarrierSandboxRateDestination
   parcels: CarrierSandboxParcel[]
 }
 
@@ -112,6 +127,63 @@ export type CarrierSandboxRate = {
   rateType: string | null
   transitDays: number | null
   deliveryDate: string | null
+}
+
+const EXACT_RATE_AMOUNT = /^(?:0|[1-9][0-9]{0,12})(?:\.[0-9]{1,2})?$/
+
+function exactRateAmountMinor(value: string) {
+  if (!EXACT_RATE_AMOUNT.test(value)) return null
+  const [whole, fraction = ''] = value.split('.')
+  return BigInt(`${whole}${fraction.padEnd(2, '0')}`)
+}
+
+function compareDuplicateServiceRates(
+  left: CarrierSandboxRate,
+  right: CarrierSandboxRate,
+) {
+  const leftMinor = exactRateAmountMinor(left.amount)
+  const rightMinor = exactRateAmountMinor(right.amount)
+  if (leftMinor === null && rightMinor !== null) return 1
+  if (leftMinor !== null && rightMinor === null) return -1
+  if (leftMinor !== null && rightMinor !== null && leftMinor !== rightMinor) {
+    return leftMinor < rightMinor ? -1 : 1
+  }
+  return (
+    (left.deliveryDate || '9999-12-31')
+      .localeCompare(right.deliveryDate || '9999-12-31')
+    || (left.transitDays ?? 366) - (right.transitDays ?? 366)
+    || left.serviceName.localeCompare(right.serviceName)
+    || (left.rateType || '').localeCompare(right.rateType || '')
+  )
+}
+
+/**
+ * FedEx can return more than one rateReplyDetails row for the same service
+ * code. Shopify requires a unique service code, so collapse exact-currency
+ * duplicates to the lowest usable account rate before the strict checkout
+ * response boundary. A cross-currency duplicate remains visible and will fail
+ * closed in the checkout normalizer.
+ */
+function collapseFedexDuplicateServices(
+  rates: CarrierSandboxRate[],
+) {
+  const selected = new Map<string, CarrierSandboxRate>()
+  const passthrough: CarrierSandboxRate[] = []
+  for (const rate of rates) {
+    const current = selected.get(rate.serviceCode)
+    if (!current) {
+      selected.set(rate.serviceCode, rate)
+      continue
+    }
+    if (current.currency !== rate.currency) {
+      passthrough.push(rate)
+      continue
+    }
+    if (compareDuplicateServiceRates(rate, current) < 0) {
+      selected.set(rate.serviceCode, rate)
+    }
+  }
+  return [...selected.values(), ...passthrough]
 }
 
 export type CarrierSandboxRateResult = {
@@ -317,6 +389,25 @@ function partyText(value: unknown, label: string, maximum: number) {
   return normalized
 }
 
+function optionalPartyText(
+  value: unknown,
+  label: string,
+  maximum: number,
+) {
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'string' || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error(`Carrier sandbox ${label} must be plain text`)
+  }
+  const normalized = value.trim().replace(/\s+/g, ' ')
+  if (!normalized) return null
+  if (normalized.length > maximum) {
+    throw new Error(
+      `Carrier sandbox ${label} must be ${maximum} characters or fewer`,
+    )
+  }
+  return normalized
+}
+
 function exactObject(
   value: unknown,
   expected: ReadonlySet<string>,
@@ -455,11 +546,103 @@ export function normalizeCarrierSandboxParty(value: unknown): CarrierSandboxPart
   }
 }
 
+export function normalizeCarrierSandboxRateDestination(
+  value: unknown,
+): CarrierSandboxRateDestination {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Carrier sandbox rate destination must be an object')
+  }
+  const input = value as Record<string, unknown>
+  const unsupported = Object.keys(input).find(
+    (field) => !PARTY_FIELDS.has(field),
+  )
+  if (unsupported) {
+    throw new Error(
+      `Carrier sandbox rate destination field is not supported: ${unsupported}`,
+    )
+  }
+  const postalCode = partyText(
+    input.postalCode,
+    'rate destination postal code',
+    10,
+  )
+  if (!/^\d{5}(?:-\d{4})?$/.test(postalCode)) {
+    throw new Error(
+      'Carrier sandbox rate destination postal code must be a five or '
+      + 'nine digit US ZIP code',
+    )
+  }
+  const countryCode = partyText(
+    input.countryCode,
+    'rate destination country code',
+    2,
+  ).toUpperCase()
+  if (countryCode !== 'US') {
+    throw new Error('Carrier sandbox rating currently supports US addresses only')
+  }
+  const name = optionalPartyText(input.name, 'rate destination name', 120)
+  const line1 = optionalPartyText(
+    input.line1,
+    'rate destination address line 1',
+    160,
+  )
+  const line2 = optionalPartyText(
+    input.line2,
+    'rate destination address line 2',
+    120,
+  )
+  if (line2 && !line1) {
+    throw new Error(
+      'Carrier sandbox rate destination line 2 requires address line 1',
+    )
+  }
+  const region = optionalPartyText(
+    input.region,
+    'rate destination region',
+    64,
+  )
+  return {
+    name,
+    line1,
+    line2,
+    city: optionalPartyText(input.city, 'rate destination city', 100),
+    region: region ? normalizeUsRegion(region) : null,
+    postalCode,
+    countryCode,
+  }
+}
+
 export function carrierSandboxPartyFingerprint(normalizedParty: CarrierSandboxParty) {
   const party = normalizeCarrierSandboxParty(normalizedParty)
   return hash({
     version: 'carrier-sandbox-party-v1',
     party,
+  })
+}
+
+export function carrierSandboxRateDestinationFingerprint(
+  normalizedDestination: CarrierSandboxRateDestination,
+) {
+  const destination = normalizeCarrierSandboxRateDestination(
+    normalizedDestination,
+  )
+  if (
+    destination.name
+    && destination.line1
+    && destination.city
+    && destination.region
+  ) {
+    return carrierSandboxPartyFingerprint({
+      ...destination,
+      name: destination.name,
+      line1: destination.line1,
+      city: destination.city,
+      region: destination.region,
+    })
+  }
+  return hash({
+    version: 'carrier-sandbox-rate-destination-v1',
+    destination,
   })
 }
 
@@ -543,7 +726,7 @@ export function buildCarrierSandboxShipmentRateFixture(input: {
       postalCode: input.registeredAddress.postalCode,
       countryCode: input.registeredAddress.countryCode,
     }),
-    destination: normalizeCarrierSandboxParty(input.destination),
+    destination: normalizeCarrierSandboxRateDestination(input.destination),
     parcels: input.parcels.map(normalizeCarrierSandboxParcel),
   }
 }
@@ -600,12 +783,23 @@ function fedexRequest(
         },
       },
       recipient: { address: {
-        streetLines: [
-          fixture.destination.line1,
-          ...(fixture.destination.line2 ? [fixture.destination.line2] : []),
-        ],
-        city: fixture.destination.city,
-        stateOrProvinceCode: fixture.destination.region, postalCode: fixture.destination.postalCode,
+        ...(fixture.destination.line1
+          ? {
+              streetLines: [
+                fixture.destination.line1,
+                ...(fixture.destination.line2
+                  ? [fixture.destination.line2]
+                  : []),
+              ],
+            }
+          : {}),
+        ...(fixture.destination.city
+          ? { city: fixture.destination.city }
+          : {}),
+        ...(fixture.destination.region
+          ? { stateOrProvinceCode: fixture.destination.region }
+          : {}),
+        postalCode: fixture.destination.postalCode,
         countryCode: fixture.destination.countryCode,
       } },
       pickupType: 'DROPOFF_AT_FEDEX_LOCATION',
@@ -639,6 +833,26 @@ function upsParty(address: CarrierSandboxParty) {
   }
 }
 
+function upsRateDestination(address: CarrierSandboxRateDestination) {
+  return {
+    ...(address.name ? { Name: address.name } : {}),
+    Address: {
+      ...(address.line1
+        ? {
+            AddressLine: [
+              address.line1,
+              ...(address.line2 ? [address.line2] : []),
+            ],
+          }
+        : {}),
+      ...(address.city ? { City: address.city } : {}),
+      ...(address.region ? { StateProvinceCode: address.region } : {}),
+      PostalCode: address.postalCode,
+      CountryCode: address.countryCode,
+    },
+  }
+}
+
 function upsRequest(
   accountNumber: string,
   fixture: CarrierSandboxShipmentRateFixture,
@@ -652,7 +866,7 @@ function upsRequest(
       Shipment: {
         Shipper: { ...upsParty(fixture.origin), ShipperNumber: accountNumber },
         ShipFrom: upsParty(fixture.origin),
-        ShipTo: upsParty(fixture.destination),
+        ShipTo: upsRateDestination(fixture.destination),
         PaymentDetails: {
           ShipmentCharge: [{ Type: '01', BillShipper: { AccountNumber: accountNumber } }],
         },
@@ -677,7 +891,7 @@ function upsRequest(
 
 function parseFedex(payload: Record<string, unknown>): CarrierSandboxRate[] {
   const output = record(payload.output)
-  return list(output.rateReplyDetails).flatMap((rawDetail) => {
+  const rates = list(output.rateReplyDetails).flatMap((rawDetail) => {
     const detail = record(rawDetail)
     const rated = list(detail.ratedShipmentDetails).map(record)
     const preferred = rated.find((item) => text(item.rateType).includes('ACCOUNT')) || rated[0]
@@ -699,6 +913,7 @@ function parseFedex(payload: Record<string, unknown>): CarrierSandboxRate[] {
       deliveryDate: normalizeDate(dateDetail.dayFormat || operational.deliveryDate),
     }]
   })
+  return collapseFedexDuplicateServices(rates)
 }
 
 function parseUps(payload: Record<string, unknown>): CarrierSandboxRate[] {
@@ -788,7 +1003,7 @@ export function carrierSandboxShipmentRateRequestEvidence(
         packageCount: fixture.parcels.length,
         originFingerprint: carrierSandboxPartyFingerprint(fixture.origin),
         destinationFingerprint:
-          carrierSandboxPartyFingerprint(fixture.destination),
+          carrierSandboxRateDestinationFingerprint(fixture.destination),
         origin: {
           region: fixture.origin.region,
           countryCode: fixture.origin.countryCode,
@@ -866,6 +1081,7 @@ async function executeCarrierSandboxRateRequest(
   options: {
     fetchImpl: typeof fetch
     timeoutMs?: number
+    signal?: AbortSignal
     fixture: CarrierSandboxShipmentRateFixture
     purpose: CarrierSandboxRatePurpose
     responseLimitBytes: number
@@ -884,12 +1100,16 @@ async function executeCarrierSandboxRateRequest(
   const token = await requestCarrierAccessToken(input, {
     fetchImpl: options.fetchImpl,
     timeoutMs: options.timeoutMs,
+    signal: options.signal,
   })
   const body = input.provider === 'fedex_rest'
     ? fedexRequest(input.credential.accountNumber!, options.fixture)
     : upsRequest(input.credential.accountNumber!, options.fixture)
   const transactionId = randomUUID()
   const controller = new AbortController()
+  const abortFromCaller = () => controller.abort()
+  if (options.signal?.aborted) controller.abort()
+  else options.signal?.addEventListener('abort', abortFromCaller, { once: true })
   const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs || 12_000, 15_000))
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
   try {
@@ -958,6 +1178,7 @@ async function executeCarrierSandboxRateRequest(
     )
   } finally {
     clearTimeout(timeout)
+    options.signal?.removeEventListener('abort', abortFromCaller)
   }
 }
 
@@ -966,6 +1187,7 @@ export async function requestCarrierSandboxRates(
   options: {
     fetchImpl?: typeof fetch
     timeoutMs?: number
+    signal?: AbortSignal
     fixture?: CarrierSandboxRateFixture
     purpose?: CarrierSandboxRatePurpose
   } = {},
@@ -996,6 +1218,7 @@ export async function requestCarrierSandboxRates(
   const response = await executeCarrierSandboxRateRequest(input, {
     fetchImpl: options.fetchImpl || fetch,
     timeoutMs: options.timeoutMs,
+    signal: options.signal,
     fixture: shipmentFixture,
     purpose,
     responseLimitBytes: SINGLE_PARCEL_RATE_RESPONSE_LIMIT_BYTES,
@@ -1021,6 +1244,7 @@ export async function requestCarrierSandboxShipmentRates(
   options: {
     fetchImpl?: typeof fetch
     timeoutMs?: number
+    signal?: AbortSignal
     fixture: CarrierSandboxShipmentRateFixture
   },
 ): Promise<{
@@ -1044,7 +1268,9 @@ export async function requestCarrierSandboxShipmentRates(
   }
   const fixture: CarrierSandboxShipmentRateFixture = {
     origin: normalizeCarrierSandboxParty(options.fixture.origin),
-    destination: normalizeCarrierSandboxParty(options.fixture.destination),
+    destination: normalizeCarrierSandboxRateDestination(
+      options.fixture.destination,
+    ),
     parcels: options.fixture.parcels.map((parcel) => ({
       ...parcel,
     })),
@@ -1056,6 +1282,7 @@ export async function requestCarrierSandboxShipmentRates(
   const response = await executeCarrierSandboxRateRequest(input, {
     fetchImpl: options.fetchImpl || fetch,
     timeoutMs: options.timeoutMs,
+    signal: options.signal,
     fixture,
     purpose: 'cartonization_shipment_rate',
     responseLimitBytes: carrierSandboxShipmentResponseLimitBytes(
@@ -1076,7 +1303,7 @@ export async function requestCarrierSandboxShipmentRates(
       fixture,
       packageCount: fixture.parcels.length,
       destinationFingerprint:
-        carrierSandboxPartyFingerprint(fixture.destination),
+        carrierSandboxRateDestinationFingerprint(fixture.destination),
       rates: response.rates,
       testedAt: response.testedAt,
     },

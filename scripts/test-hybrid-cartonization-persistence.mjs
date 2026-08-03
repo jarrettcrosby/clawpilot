@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -22,6 +23,36 @@ const output = ts.transpileModule(source, {
   fileName: sourcePath,
 }).outputText
 const module = { exports: {} }
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [key, canonicalize(item)]),
+    )
+  }
+  return value
+}
+function shopifyCheckoutRatingHash(value) {
+  return createHash('sha256')
+    .update(JSON.stringify(canonicalize(value)))
+    .digest('hex')
+}
+function withReceiptLineHash(line) {
+  return {
+    ...line,
+    line_hash: shopifyCheckoutRatingHash({
+      lineKey: line.line_key,
+      providerVariantId: line.provider_variant_id,
+      sku: line.sku,
+      quantity: line.quantity,
+      unitWeightGrams: line.unit_weight_grams,
+      requiresShipping: line.requires_shipping,
+      lineSnapshot: line.line_snapshot,
+    }),
+  }
+}
 vm.runInNewContext(output, {
   Array,
   Boolean,
@@ -46,16 +77,616 @@ vm.runInNewContext(output, {
         },
       }
     }
+    if (specifier === '@/lib/persistence/shopifyCheckoutRating') {
+      return { shopifyCheckoutRatingHash }
+    }
     return requireFromApp(specifier)
   },
 }, { filename: sourcePath })
 
 const {
+  applyMatchedCheckoutPackLineage,
+  applyCurrentFulfillmentPackLineage,
+  assertCurrentFulfillmentPackEvidenceAvailable,
+  assertMatchedShopifyCheckoutPackLineage,
+  assertHybridCartonizationCandidateEligible,
+  buildShopifyFulfillmentPackEvidence,
   HybridCartonizationPersistenceError,
   evaluateHybridCartonizationInventoryAvailability,
   hybridCartonizationInventoryProjectionStates,
+  mapCandidateLines,
   normalizeHybridCartonizationReadRequest,
+  resolveOperationalShopifyCheckoutReconciliation,
 } = module.exports
+
+const matchedCheckoutDecision = {
+  outcome: 'matched',
+  source_shopify_service_code: 'clawpilot:ups:03',
+  receipt_id: '00000000-0000-4000-8000-000000000040',
+  receipt_global_id: 'gsqr0000001',
+  receipt_status: 'succeeded',
+}
+assert.equal(
+  resolveOperationalShopifyCheckoutReconciliation({
+    candidateServiceCode: 'clawpilot:ups:03',
+    rows: [matchedCheckoutDecision],
+  }).receipt_global_id,
+  'gsqr0000001',
+  'A ClawPilot checkout must resolve only its exact current matched succeeded receipt',
+)
+for (const rows of [
+  [],
+  [{ ...matchedCheckoutDecision, outcome: 'rejected', receipt_id: null }],
+  [{ ...matchedCheckoutDecision, receipt_status: 'failed' }],
+]) {
+  assert.throws(
+    () => resolveOperationalShopifyCheckoutReconciliation({
+      candidateServiceCode: 'clawpilot:ups:03',
+      rows,
+    }),
+    (error) => (
+      error instanceof HybridCartonizationPersistenceError
+      && error.code
+        === 'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID'
+    ),
+    'A ClawPilot checkout must fail closed without one current matched succeeded receipt',
+  )
+}
+assert.equal(
+  resolveOperationalShopifyCheckoutReconciliation({
+    candidateServiceCode: 'shopify-standard',
+    rows: [],
+  }),
+  null,
+  'A genuinely non-ClawPilot Shopify shipping method may use candidate-captured pack facts',
+)
+
+const matchedCheckoutLineage = {
+  candidateLineGlobalId: 'gcol0000001',
+  candidateProductId: '00000000-0000-4000-8000-000000000010',
+  candidateProductGlobalId: 'gp0000001',
+  candidateExternalProductId: 'gid://shopify/Product/10',
+  candidateExternalVariantId: 'gid://shopify/ProductVariant/20',
+  receiptLine: withReceiptLineHash({
+    receipt_global_id: 'gsqr0000001',
+    line_key: 'checkout-line-1',
+    provider_variant_id: 'gid://shopify/ProductVariant/20',
+    sku: 'TEST-6OZ',
+    quantity: 50,
+    unit_weight_grams: 170,
+    requires_shipping: true,
+    line_snapshot: {
+      productGid: 'gid://shopify/Product/10',
+      variantGid: 'gid://shopify/ProductVariant/20',
+      productGlobalId: 'gp0000001',
+      packMappingGlobalId: 'gcvm0000001',
+      packMappingRowVersion: 4,
+      packProfileVersionGlobalId: 'gppv0000001',
+      packProfileVersionRowVersion: 2,
+      snapshotVersion: 'shopify-checkout-line-pack-evidence-v1',
+      packEvidenceHash: 'a'.repeat(64),
+      packageLevel: 'each',
+      baseEachQuantity: 1,
+      shipsAsOwnPackage: false,
+      inventoryLevelGlobalIds: ['giil0000001'],
+      quantity: 50,
+      unitWeightGrams: 170,
+    },
+    // These retired mutable rows are deliberately ignored. The receipt is the
+    // immutable checkout baseline, not a live join back to mapping/profile A.
+    pack_mapping_row_version: '5',
+    pack_mapping_is_current: false,
+    pack_mapping_projection_state: 'stale',
+    pack_profile_version_global_id: 'gppv0000002',
+    pack_profile_is_current: false,
+    pack_profile_status: 'retired',
+  }),
+}
+const checkoutPackBaseline = {
+  snapshotVersion: 'shopify-checkout-line-pack-evidence-v1',
+  packEvidenceHash: 'a'.repeat(64),
+  providerProductId: 'gid://shopify/Product/10',
+  providerVariantId: 'gid://shopify/ProductVariant/20',
+  productGlobalId: 'gp0000001',
+  mappingGlobalId: 'gcvm0000001',
+  mappingRowVersion: 4,
+  profileVersionGlobalId: 'gppv0000001',
+  profileRowVersion: 2,
+  packageLevel: 'each',
+  baseEachQuantity: 1,
+  shipsAsOwnPackage: false,
+  inventoryLevelGlobalIds: ['giil0000001'],
+  receiptLineKeys: ['checkout-line-1'],
+  quantity: 50,
+  unitWeightGrams: 170,
+}
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    assertMatchedShopifyCheckoutPackLineage(matchedCheckoutLineage),
+  )),
+  checkoutPackBaseline,
+  'Operational cartonization must retain the exact immutable checkout baseline even after mapping A is retired',
+)
+assert.throws(
+  () => assertMatchedShopifyCheckoutPackLineage({
+    ...matchedCheckoutLineage,
+    receiptLine: {
+      ...matchedCheckoutLineage.receiptLine,
+      line_snapshot: {
+        ...matchedCheckoutLineage.receiptLine.line_snapshot,
+        packEvidenceHash: 'b'.repeat(64),
+      },
+    },
+  }),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code
+      === 'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID'
+  ),
+  'Operational cartonization must verify the immutable receipt-line hash before trusting snapshot A',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(assertMatchedShopifyCheckoutPackLineage({
+    ...matchedCheckoutLineage,
+    receiptLine: withReceiptLineHash({
+      ...matchedCheckoutLineage.receiptLine,
+      line_snapshot: {
+        ...matchedCheckoutLineage.receiptLine.line_snapshot,
+        packMappingRowVersion: undefined,
+        snapshotVersion: undefined,
+        packEvidenceHash: undefined,
+        shipsAsOwnPackage: undefined,
+        inventoryLevelGlobalIds: undefined,
+      },
+    }),
+  }))),
+  {
+    ...checkoutPackBaseline,
+    snapshotVersion: null,
+    packEvidenceHash: null,
+    mappingRowVersion: null,
+    shipsAsOwnPackage: null,
+    inventoryLevelGlobalIds: null,
+  },
+  'A legacy immutable receipt remains usable without inventing a missing mapping row version',
+)
+assert.throws(
+  () => assertMatchedShopifyCheckoutPackLineage({
+    ...matchedCheckoutLineage,
+    receiptLine: withReceiptLineHash({
+      ...matchedCheckoutLineage.receiptLine,
+      line_snapshot: {
+        ...matchedCheckoutLineage.receiptLine.line_snapshot,
+        variantGid: 'gid://shopify/ProductVariant/99',
+      },
+    }),
+  }),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code
+      === 'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID'
+  ),
+  'Operational cartonization must fail closed when the immutable checkout identity conflicts',
+)
+assert.throws(
+  () => assertMatchedShopifyCheckoutPackLineage({
+    ...matchedCheckoutLineage,
+    receiptLine: withReceiptLineHash({
+      ...matchedCheckoutLineage.receiptLine,
+      line_snapshot: {
+        ...matchedCheckoutLineage.receiptLine.line_snapshot,
+        packEvidenceHash: undefined,
+      },
+    }),
+  }),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code
+      === 'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID'
+  ),
+  'Versioned checkout snapshots must retain their exact evidence hash',
+)
+for (const missingField of [
+  'shipsAsOwnPackage',
+  'inventoryLevelGlobalIds',
+]) {
+  assert.throws(
+    () => assertMatchedShopifyCheckoutPackLineage({
+      ...matchedCheckoutLineage,
+      receiptLine: withReceiptLineHash({
+        ...matchedCheckoutLineage.receiptLine,
+        line_snapshot: {
+          ...matchedCheckoutLineage.receiptLine.line_snapshot,
+          [missingField]: undefined,
+        },
+      }),
+    }),
+    (error) => (
+      error instanceof HybridCartonizationPersistenceError
+      && error.code
+        === 'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID'
+    ),
+    `Versioned checkout snapshots must retain ${missingField}`,
+  )
+}
+
+const fulfillmentCandidate = {
+  global_id: 'gcol0000001',
+  provider: 'shopify',
+  product_id: '00000000-0000-4000-8000-000000000010',
+  product_global_id: 'gp0000001',
+  product_title_snapshot: 'Test Product',
+  variant_title_snapshot: 'Default Title',
+  external_product_id: 'gid://shopify/Product/10',
+  external_variant_id: 'gid://shopify/ProductVariant/20',
+  requires_shipping: true,
+  ordered_quantity: '50',
+  unfulfilled_quantity: '50',
+  packaging_weight_source: 'provider_catalog',
+  weight_grams: 170,
+  mapping_state: 'resolved',
+  packaging_state: 'resolved',
+  packaging_source: 'variant_pack_mapping',
+  pack_mapping_id: '00000000-0000-4000-8000-000000000020',
+  pack_mapping_global_id: 'gcvm0000001',
+  captured_pack_mapping_row_version: '4',
+  current_pack_mapping_row_version: '4',
+  pack_mapping_is_current: true,
+  pack_mapping_projection_state: 'current',
+  pack_mapping_source_revision: 'source-revision-a',
+  pack_mapping_source_hash: 'source-hash-a',
+  pack_mapping_pack_evidence_hash: 'a'.repeat(64),
+  pack_mapping_purpose: 'shopify_checkout',
+  channel_source_revision: 'source-revision-a',
+  channel_source_hash: 'source-hash-a',
+  channel_pack_evidence_hash: 'a'.repeat(64),
+  channel_provider_status_raw: 'active',
+  channel_weight_grams: 170,
+  pack_profile_version_id: '00000000-0000-4000-8000-000000000030',
+  pack_profile_version_global_id: 'gppv0000001',
+  captured_pack_profile_row_version: '2',
+  current_pack_profile_row_version: '2',
+  pack_profile_is_current: true,
+  pack_profile_lifecycle_state: 'active',
+  pack_profile_fit_model: 'rigid_3d',
+  pack_profile_evidence_type: 'customer_confirmed',
+  pack_profile_evidence_reference: 'customer-dimensions',
+  pack_profile_confirmed_at: '2026-07-30T00:00:00.000Z',
+  pack_profile_status: 'active',
+  pack_profile_base_each_quantity: 1,
+  current_pack_profile_base_each_quantity: 1,
+  current_pack_profile_length_mm: 203,
+  current_pack_profile_width_mm: 152,
+  current_pack_profile_height_mm: 51,
+  current_pack_profile_dimension_basis: 'outer',
+  current_pack_profile_package_level: 'each',
+  current_pack_profile_ships_as_own_package: false,
+  current_pack_profile_gross_weight_grams: 170,
+  current_pack_profile_weight_basis: 'customer_confirmed',
+  pack_lineage_source: 'matched_shopify_checkout_receipt',
+  checkout_receipt_global_id: 'gsqr0000001',
+  fulfillment_pack_source: 'candidate_capture',
+  checkout_pack_baseline: checkoutPackBaseline,
+}
+
+const publishedFaireSoldOutCandidate = {
+  ...fulfillmentCandidate,
+  provider: 'faire',
+  external_product_id: 'p_testproduct',
+  external_variant_id: 'po_testvariant',
+  pack_mapping_purpose: 'catalog',
+  channel_provider_status_raw: 'PUBLISHED',
+  channel_normalized_status: 'unavailable',
+  channel_provider_active: false,
+  channel_requires_shipping: null,
+  pack_lineage_source: 'order_candidate_capture',
+  checkout_receipt_global_id: null,
+  checkout_pack_baseline: null,
+}
+assert.doesNotThrow(
+  () => mapCandidateLines(
+    { mode: 'production' },
+    [publishedFaireSoldOutCandidate],
+  ),
+  'A published Faire order may retain its exact catalog pack capture after the listing sells out',
+)
+assert.throws(
+  () => mapCandidateLines(
+    { mode: 'production' },
+    [{
+      ...publishedFaireSoldOutCandidate,
+      channel_provider_status_raw: 'DRAFT',
+    }],
+  ),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code === 'HYBRID_CARTONIZATION_PACK_EVIDENCE_REQUIRED'
+  ),
+  'Faire order capture must not waive current-pack checks for nonpublished listings',
+)
+
+const aggregatedCandidateLines = [{
+  ...fulfillmentCandidate,
+  global_id: 'gcol0000002',
+  ordered_quantity: '1',
+  unfulfilled_quantity: '1',
+}, {
+  ...fulfillmentCandidate,
+  global_id: 'gcol0000003',
+  ordered_quantity: '4',
+  unfulfilled_quantity: '4',
+}]
+const repeatedReceiptLines = [withReceiptLineHash({
+  ...matchedCheckoutLineage.receiptLine,
+  line_key: 'checkout-line-2',
+  quantity: 2,
+  line_snapshot: {
+    ...matchedCheckoutLineage.receiptLine.line_snapshot,
+    quantity: 2,
+  },
+}), withReceiptLineHash({
+  ...matchedCheckoutLineage.receiptLine,
+  line_key: 'checkout-line-1',
+  quantity: 3,
+  line_snapshot: {
+    ...matchedCheckoutLineage.receiptLine.line_snapshot,
+    quantity: 3,
+  },
+})]
+const aggregatedLineage = applyMatchedCheckoutPackLineage(
+  aggregatedCandidateLines,
+  {
+    receiptGlobalId: 'gsqr0000001',
+    lines: repeatedReceiptLines,
+  },
+)
+for (const row of aggregatedLineage) {
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(row.checkout_pack_baseline)),
+    {
+      ...checkoutPackBaseline,
+      receiptLineKeys: ['checkout-line-1', 'checkout-line-2'],
+      quantity: 5,
+    },
+    'Repeated Shopify receipt rows must retain a deterministic variant-aggregate checkout baseline',
+  )
+}
+assert.throws(
+  () => applyMatchedCheckoutPackLineage(
+    aggregatedCandidateLines,
+    {
+      receiptGlobalId: 'gsqr0000001',
+      lines: [
+        repeatedReceiptLines[0],
+        withReceiptLineHash({
+          ...repeatedReceiptLines[1],
+          line_snapshot: {
+            ...repeatedReceiptLines[1].line_snapshot,
+            packageLevel: 'case',
+            baseEachQuantity: 12,
+          },
+        }),
+      ],
+    },
+  ),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code
+      === 'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID'
+  ),
+  'Repeated Shopify receipt rows must agree on all nonquantity physical facts',
+)
+
+const missingCurrentFulfillment = applyCurrentFulfillmentPackLineage(
+  [fulfillmentCandidate],
+  [],
+)[0]
+assert.equal(missingCurrentFulfillment.pack_mapping_global_id, null)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(missingCurrentFulfillment.checkout_pack_baseline)),
+  checkoutPackBaseline,
+  'Resolving current fulfillment authority must never mutate checkout baseline A',
+)
+assert.throws(
+  () => assertCurrentFulfillmentPackEvidenceAvailable({
+    mode: 'production',
+    productTitle: missingCurrentFulfillment.product_title_snapshot,
+    checkoutPackBaseline: missingCurrentFulfillment.checkout_pack_baseline,
+    source: missingCurrentFulfillment.fulfillment_pack_source,
+    mappingPurpose: missingCurrentFulfillment.pack_mapping_purpose,
+  }),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code
+      === 'HYBRID_CARTONIZATION_FULFILLMENT_PACK_MAPPING_REQUIRED'
+  ),
+  'Fulfillment must fail closed with actionable evidence when replacement mapping B is missing',
+)
+
+const currentFulfillmentRow = {
+    line_global_id: 'gcol0000001',
+    pack_mapping_id: '00000000-0000-4000-8000-000000000021',
+    pack_mapping_global_id: 'gcvm0000002',
+    pack_mapping_row_version: '1',
+    pack_mapping_is_current: true,
+    pack_mapping_projection_state: 'current',
+    pack_mapping_source_revision: 'source-revision-b',
+    pack_mapping_source_hash: 'source-hash-b',
+    pack_mapping_pack_evidence_hash: 'b'.repeat(64),
+    pack_mapping_purpose: 'shopify_checkout',
+    channel_source_revision: 'source-revision-b',
+    channel_source_hash: 'source-hash-b',
+    channel_pack_evidence_hash: 'b'.repeat(64),
+    channel_normalized_status: 'active',
+    channel_provider_active: true,
+    channel_requires_shipping: true,
+    channel_weight_grams: 2040,
+    pack_profile_version_id: '00000000-0000-4000-8000-000000000031',
+    pack_profile_version_global_id: 'gppv0000002',
+    pack_profile_version_row_version: '1',
+    pack_profile_is_current: true,
+    pack_profile_lifecycle_state: 'active',
+    pack_profile_fit_model: 'rigid_3d',
+    pack_profile_evidence_type: 'customer_confirmed',
+    pack_profile_evidence_reference: 'replacement-dimensions',
+    pack_profile_confirmed_at: '2026-07-31T00:00:00.000Z',
+    pack_profile_status: 'active',
+    pack_profile_package_level: 'case',
+    pack_profile_base_each_quantity: 12,
+    pack_profile_ships_as_own_package: true,
+    pack_profile_length_mm: 279,
+    pack_profile_width_mm: 229,
+    pack_profile_height_mm: 178,
+    pack_profile_dimension_basis: 'outer',
+    pack_profile_gross_weight_grams: 2040,
+    pack_profile_weight_basis: 'customer_confirmed',
+  }
+const currentFulfillment = applyCurrentFulfillmentPackLineage(
+  [fulfillmentCandidate],
+  [currentFulfillmentRow],
+)[0]
+assert.equal(currentFulfillment.pack_mapping_global_id, 'gcvm0000002')
+assert.equal(currentFulfillment.pack_profile_version_global_id, 'gppv0000002')
+assert.deepEqual(
+  JSON.parse(JSON.stringify(currentFulfillment.checkout_pack_baseline)),
+  checkoutPackBaseline,
+  'Current fulfillment mapping B must be independent from immutable checkout baseline A',
+)
+assert.doesNotThrow(
+  () => assertCurrentFulfillmentPackEvidenceAvailable({
+    mode: 'production',
+    productTitle: currentFulfillment.product_title_snapshot,
+    checkoutPackBaseline: currentFulfillment.checkout_pack_baseline,
+    source: currentFulfillment.fulfillment_pack_source,
+    mappingPurpose: currentFulfillment.pack_mapping_purpose,
+  }),
+  'An exact current Shopify checkout mapping B is valid fulfillment authority',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    buildShopifyFulfillmentPackEvidence(currentFulfillment),
+  )),
+  {
+    providerProductId: 'gid://shopify/Product/10',
+    providerVariantId: 'gid://shopify/ProductVariant/20',
+    mappingPurpose: 'shopify_checkout',
+    mappingGlobalId: 'gcvm0000002',
+    mappingRowVersion: 1,
+    mappingSourceRevision: 'source-revision-b',
+    mappingSourceHash: 'source-hash-b',
+    mappingPackEvidenceHash: 'b'.repeat(64),
+    channelSourceRevision: 'source-revision-b',
+    channelSourceHash: 'source-hash-b',
+    channelPackEvidenceHash: 'b'.repeat(64),
+    channelNormalizedStatus: 'active',
+    channelProviderActive: true,
+    channelRequiresShipping: true,
+    profileVersionGlobalId: 'gppv0000002',
+    profileRowVersion: 1,
+    fitModel: 'rigid_3d',
+    packageLevel: 'case',
+    baseEachQuantity: 12,
+    shipsAsOwnPackage: true,
+    dimensionsMm: { length: 279, width: 229, height: 178 },
+    dimensionBasis: 'outer',
+    grossWeightGrams: 2040,
+    weightBasis: 'customer_confirmed',
+    channelWeightGrams: 2040,
+  },
+  'Fulfillment evidence must durably retain mapping B hashes, identity, version, and physical facts',
+)
+for (const [label, channelEligibilityPatch] of [
+  ['inactive channel status', { channel_normalized_status: 'archived' }],
+  ['provider-inactive channel', { channel_provider_active: false }],
+  ['non-shipping channel', { channel_requires_shipping: false }],
+]) {
+  const ineligibleCurrentFulfillment = applyCurrentFulfillmentPackLineage(
+    [fulfillmentCandidate],
+    [{ ...currentFulfillmentRow, ...channelEligibilityPatch }],
+  )[0]
+  assert.throws(
+    () => mapCandidateLines(
+      { mode: 'production' },
+      [ineligibleCurrentFulfillment],
+    ),
+    (error) => (
+      error instanceof HybridCartonizationPersistenceError
+      && error.code
+        === 'HYBRID_CARTONIZATION_FULFILLMENT_PACK_EVIDENCE_INVALID'
+    ),
+    `Current fulfillment mapping B must reject ${label}`,
+  )
+}
+const mappedCurrentFulfillment = mapCandidateLines(
+  { mode: 'production' },
+  [currentFulfillment],
+)[0]
+assert.deepEqual(
+  JSON.parse(JSON.stringify(mappedCurrentFulfillment.line.profile)),
+  {
+    versionGlobalId: 'gppv0000002',
+    capturedRowVersion: 1,
+    currentRowVersion: 1,
+    isCurrent: true,
+    lifecycleState: 'active',
+    fitModel: 'rigid_3d',
+    evidenceType: 'customer_confirmed',
+    evidenceReference: 'replacement-dimensions',
+    confirmedAt: '2026-07-31T00:00:00.000Z',
+    packageLevel: 'case',
+    baseEachQuantity: 12,
+    shipsAsOwnPackage: true,
+    outerDimensionsMm: { length: 279, width: 229, height: 178 },
+    grossWeightGrams: 2040,
+  },
+  'Optimizer input must use current fulfillment mapping B package-level physical facts',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    mappedCurrentFulfillment.evidence.fulfillmentPackEvidence,
+  )),
+  JSON.parse(JSON.stringify(
+    buildShopifyFulfillmentPackEvidence(currentFulfillment),
+  )),
+  'Mapped line evidence must retain the same durable fulfillment mapping B proof',
+)
+
+const candidateEligibilityNow = new Date('2026-07-31T12:00:00.000Z')
+assert.doesNotThrow(
+  () => assertHybridCartonizationCandidateEligible({
+    mode: 'production',
+    workflowState: 'promoted',
+    expiresAt: '2026-07-01T12:00:00.000Z',
+    now: candidateEligibilityNow,
+  }),
+  'A promoted candidate is durable canonical lineage for operational planning even after its review window',
+)
+assert.throws(
+  () => assertHybridCartonizationCandidateEligible({
+    mode: 'sandbox_demo',
+    workflowState: 'promoted',
+    expiresAt: '2026-08-01T12:00:00.000Z',
+    now: candidateEligibilityNow,
+  }),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code === 'HYBRID_CARTONIZATION_CANDIDATE_STATE_INVALID'
+  ),
+  'A promoted candidate must never re-enter the assumption-backed sandbox path',
+)
+assert.throws(
+  () => assertHybridCartonizationCandidateEligible({
+    mode: 'production',
+    workflowState: 'ready',
+    expiresAt: '2026-07-01T12:00:00.000Z',
+    now: candidateEligibilityNow,
+  }),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code === 'HYBRID_CARTONIZATION_CANDIDATE_EXPIRED'
+  ),
+  'An unpromoted candidate remains bounded by its intake review window',
+)
 
 assert.deepEqual(
   JSON.parse(JSON.stringify(
@@ -143,6 +774,7 @@ assert.deepEqual(
   {
     productGlobalId: 'gp0000001',
     requiredQuantity: 3,
+    availabilityAuthority: 'operational_available',
     operationalAvailableQuantity: 1,
     providerCommittedQuantity: 2,
     assumedCommittedQuantity: 2,
@@ -178,6 +810,7 @@ assert.deepEqual(
   {
     productGlobalId: 'gp0000001',
     requiredQuantity: 2,
+    availabilityAuthority: 'operational_available',
     operationalAvailableQuantity: 0,
     providerCommittedQuantity: 2,
     assumedCommittedQuantity: 2,
@@ -211,6 +844,103 @@ assert.throws(
       === 'HYBRID_CARTONIZATION_COMMITTED_ASSUMPTION_UNSUPPORTED'
   ),
 )
+
+const shopifyProductionInventory =
+  evaluateHybridCartonizationInventoryAvailability({
+    mode: 'production',
+    provider: 'shopify',
+    lines: [{
+      lineGlobalId: 'gcol0000001',
+      productGlobalId: 'gp0000001',
+      requiredQuantity: 2,
+    }],
+    positions: [{
+      productGlobalId: 'gp0000001',
+      operationalAvailableQuantity: 0,
+      providerCommittedQuantity: 2,
+      sourceLevelGlobalIds: ['giil0000001'],
+      sourceProjectionStates: ['projected'],
+    }],
+    assumedCommittedQuantities: [],
+  })
+assert.deepEqual(
+  JSON.parse(JSON.stringify(shopifyProductionInventory.products[0])),
+  {
+    productGlobalId: 'gp0000001',
+    requiredQuantity: 2,
+    availabilityAuthority: 'shopify_provider_commitment',
+    operationalAvailableQuantity: 0,
+    providerCommittedQuantity: 2,
+    assumedCommittedQuantity: 0,
+    effectiveAvailableQuantity: 2,
+    sourceLevelGlobalIds: ['giil0000001'],
+    sourceProjectionStates: ['projected'],
+  },
+  'Shopify production evidence must use provider commitment without an operator attribution assumption',
+)
+const faireProductionInventory =
+  evaluateHybridCartonizationInventoryAvailability({
+    mode: 'production',
+    provider: 'faire',
+    lines: [{
+      lineGlobalId: 'gcol0000001',
+      productGlobalId: 'gp0000001',
+      requiredQuantity: 2,
+    }],
+    positions: [{
+      productGlobalId: 'gp0000001',
+      operationalAvailableQuantity: 3,
+      providerCommittedQuantity: 0,
+      sourceLevelGlobalIds: [],
+      sourcePositionGlobalIds: ['giv0000001'],
+      sourceProjectionStates: ['projected'],
+    }],
+    assumedCommittedQuantities: [],
+  })
+assert.deepEqual(
+  JSON.parse(JSON.stringify(faireProductionInventory.products[0])),
+  {
+    productGlobalId: 'gp0000001',
+    requiredQuantity: 2,
+    availabilityAuthority: 'operational_available',
+    operationalAvailableQuantity: 3,
+    providerCommittedQuantity: 0,
+    assumedCommittedQuantity: 0,
+    effectiveAvailableQuantity: 3,
+    sourceLevelGlobalIds: [],
+    sourcePositionGlobalIds: ['giv0000001'],
+    sourceProjectionStates: ['projected'],
+  },
+  'Faire production evidence must use current ClawPilot-local inventory positions',
+)
+assert.throws(
+  () => evaluateHybridCartonizationInventoryAvailability({
+    mode: 'production',
+    provider: 'shopify',
+    lines: [{
+      lineGlobalId: 'gcol0000001',
+      productGlobalId: 'gp0000001',
+      requiredQuantity: 1,
+    }],
+    positions: [{
+      productGlobalId: 'gp0000001',
+      operationalAvailableQuantity: 1,
+      providerCommittedQuantity: 1,
+      sourceLevelGlobalIds: ['giil0000001'],
+      sourceProjectionStates: ['projected'],
+    }],
+    assumedCommittedQuantities: [{
+      lineGlobalId: 'gcol0000001',
+      quantity: 1,
+    }],
+  }),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code
+      === 'HYBRID_CARTONIZATION_PRODUCTION_ASSUMPTIONS_FORBIDDEN'
+  ),
+  'Production evidence must reject operator-entered committed inventory assumptions',
+)
 assert.throws(
   () => evaluateHybridCartonizationInventoryAvailability({
     lines: [{
@@ -243,6 +973,10 @@ for (const contract of [
   'candidate.global_id = $3',
   "warehouse.status = 'active'",
   "run.status = 'succeeded'",
+  "const inventoryRun = account.provider === 'shopify'",
+  "position.source_authority = 'clawpilot'",
+  'sourcePositionGlobalIds',
+  'syncRunGlobalId: inventoryRun?.global_id || null',
   'pack_mapping.row_version::text',
   'pack_mapping.global_id AS pack_mapping_global_id',
   'pack_version.row_version::text',
@@ -251,18 +985,77 @@ for (const contract of [
   'recipeOnlyAssociation',
   'row.channel_weight_grams',
   'variantPackMappingGlobalId',
-  'channelSourceRevision',
-  'channelSourceHash',
+  'pack_mapping_pack_evidence_hash',
+  'channel_pack_evidence_hash',
   'row.current_pack_profile_length_mm === null',
   "row.current_pack_profile_dimension_basis === 'unspecified'",
   'material.row_version::text',
+  'material.rated_outer_length_mm',
+  'ratedOuterDimensionsMm',
+  'maximumGrossWeightGrams',
+  'availableQuantity',
   'recipe.input_pack_profile_version_id',
   'recipe.packaging_material_id = ANY($3::uuid[])',
   'recipe.is_current = true',
   'level.projection_state = ANY($5::text[])',
   'hybridCartonizationInventoryProjectionStates(input.mode)',
+  'provider: account.provider',
+  "'shopify_provider_commitment'",
+  'HYBRID_CARTONIZATION_MATERIAL_RATE_EVIDENCE_REQUIRED',
+  'candidate.checkout_shipping_service_code',
+  'reconciliation.outcome,',
+  'operations_shopify_checkout_rate_current_reconciliations',
+  'line.ordered_quantity::text',
+  'row.ordered_quantity',
+  'const activeCandidateLines = candidateLines.filter',
+  'const unfulfilledRows = lineageRows.filter',
+  "pack_mapping.mapping_purpose = 'shopify_checkout'",
+  'product_mapping.external_product_id = line.external_product_id',
+  'product_mapping.external_variant_id = line.external_variant_id',
+  'product_mapping.active = true',
+  'applyMatchedCheckoutPackLineage',
+  'applyCurrentFulfillmentPackLineage',
+  "packLineageSource: row.pack_lineage_source",
+  'checkoutReceiptGlobalId: row.checkout_receipt_global_id',
+  'fulfillmentPackSource:',
+  'checkoutPackBaseline: row.checkout_pack_baseline',
+  'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID',
+  'HYBRID_CARTONIZATION_FULFILLMENT_PACK_MAPPING_REQUIRED',
+  'HYBRID_CARTONIZATION_FULFILLMENT_PACK_EVIDENCE_INVALID',
 ]) {
   assert.ok(source.includes(contract), `Missing persistence contract: ${contract}`)
 }
+
+assert.doesNotMatch(
+  source,
+  /AND reconciliation\.outcome = 'matched'/,
+  'Operational planning must inspect and fail closed on non-matched ClawPilot checkout decisions',
+)
+assert.doesNotMatch(
+  source,
+  /AND line\.unfulfilled_quantity > 0/,
+  'Checkout lineage must include fulfilled and cancelled shippable source lines before remaining work is filtered',
+)
+
+const receiptBaselineReadSource = source.slice(
+  source.indexOf('async function readMatchedCheckoutPackLineage'),
+  source.indexOf('function applyMatchedCheckoutPackLineage'),
+)
+for (const mutableCheckoutJoin of [
+  'operations_commerce_variant_pack_mappings',
+  'operations_product_pack_profile_versions',
+  'operations_product_channel_states',
+]) {
+  assert.doesNotMatch(
+    receiptBaselineReadSource,
+    new RegExp(mutableCheckoutJoin),
+    `Immutable checkout receipt reads must not join mutable ${mutableCheckoutJoin}`,
+  )
+}
+assert.doesNotMatch(
+  source,
+  /shopify.*mutation|mutation.*shopify/i,
+  'Hybrid cartonization evidence reads must not write back to Shopify',
+)
 
 console.log('Hybrid cartonization persistence contract passed')

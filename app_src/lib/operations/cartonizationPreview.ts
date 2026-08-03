@@ -13,10 +13,10 @@ export const CARTONIZATION_PREVIEW_POLICY_VERSION =
 export const CARTONIZATION_INVENTORY_POLICY_VERSION =
   'shopify-atp-plus-bounded-candidate-committed-v1'
 
-const ACCOUNT_GLOBAL_ID = /^gia[0-9]{7}$/
-const CANDIDATE_GLOBAL_ID = /^gcoc[0-9]{7}$/
-const LINE_GLOBAL_ID = /^gcol[0-9]{7}$/
-const MATERIAL_GLOBAL_ID = /^gmat[0-9]{7}$/
+const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
+const CANDIDATE_GLOBAL_ID = /^gcoc(?:[0-9]{7}|[0-9a-v]{12})$/
+const LINE_GLOBAL_ID = /^gcol(?:[0-9]{7}|[0-9a-v]{12})$/
+const MATERIAL_GLOBAL_ID = /^gmat(?:[0-9]{7}|[0-9a-v]{12})$/
 const MAX_SELECTED_MATERIALS = 8
 const MAX_OPTIMIZER_UNITS = 80
 const MAX_OPTIMIZER_PACKAGES = 64

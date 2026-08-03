@@ -548,17 +548,58 @@ async function productIdentityRows(pipelineId: string) {
   return result.rows
 }
 
-export async function listProductIdentitySuggestionsInPostgres(input: {
-  pipelineId: string
-}) {
-  const records = buildProductRecords(
-    await productIdentityRows(input.pipelineId),
+function crossProviderIdentityPair(
+  left: ProductIdentityAggregate,
+  right: ProductIdentityAggregate,
+) {
+  return (
+    left.providers.includes('shopify')
+    && right.providers.includes('faire')
+  ) || (
+    left.providers.includes('faire')
+    && right.providers.includes('shopify')
   )
+}
+
+function productIdentityPairKey(
+  left: ProductIdentityAggregate,
+  right: ProductIdentityAggregate,
+) {
+  return [left.id, right.id].sort().join(':')
+}
+
+export function buildProductIdentitySuggestions(input: {
+  pipelineId: string
+  records: ProductIdentityAggregate[]
+}) {
+  const records = input.records
   const groups = new Map<string, typeof records>()
   for (const record of records) {
     const key = normalizedDisplayName(record.requestedName)
     if (!key) continue
     groups.set(key, [...(groups.get(key) || []), record])
+  }
+  const pairs = new Map<
+    string,
+    [ProductIdentityAggregate, ProductIdentityAggregate]
+  >()
+  const registerPair = (
+    left: ProductIdentityAggregate,
+    right: ProductIdentityAggregate,
+  ) => {
+    if (left.id === right.id || !crossProviderIdentityPair(left, right)) {
+      return
+    }
+    const ordered = left.id.localeCompare(right.id) <= 0
+      ? [left, right] as [
+          ProductIdentityAggregate,
+          ProductIdentityAggregate,
+        ]
+      : [right, left] as [
+          ProductIdentityAggregate,
+          ProductIdentityAggregate,
+        ]
+    pairs.set(productIdentityPairKey(left, right), ordered)
   }
   const suggestions: ProductIdentitySuggestion[] = []
   for (const group of groups.values()) {
@@ -569,11 +610,59 @@ export async function listProductIdentitySuggestionsInPostgres(input: {
       record.providers.includes('faire')
     ))
     if (shopify.length !== 1 || faire.length !== 1) continue
-    if (shopify[0].id === faire[0].id) continue
-    const canonical = preferredCanonical(shopify[0], faire[0])
-    const duplicate = canonical.id === shopify[0].id
-      ? faire[0]
-      : shopify[0]
+    registerPair(shopify[0], faire[0])
+  }
+
+  const exactIdentityGroups = new Map<string, typeof records>()
+  for (const record of records) {
+    for (const sku of normalizedIdentifierSet([
+      record.sku,
+      ...record.channelSkus,
+    ])) {
+      const key = `sku:${sku}`
+      exactIdentityGroups.set(
+        key,
+        [...(exactIdentityGroups.get(key) || []), record],
+      )
+    }
+    for (const barcode of normalizedIdentifierSet(record.barcodes)) {
+      const key = `barcode:${barcode}`
+      exactIdentityGroups.set(
+        key,
+        [...(exactIdentityGroups.get(key) || []), record],
+      )
+    }
+  }
+  const ambiguousExactIdentityProductIds = new Set<string>()
+  for (const group of exactIdentityGroups.values()) {
+    const uniqueProducts = [
+      ...new Map(group.map((record) => [record.id, record])).values(),
+    ]
+    const shopify = uniqueProducts.filter((record) => (
+      record.providers.includes('shopify')
+    ))
+    const faire = uniqueProducts.filter((record) => (
+      record.providers.includes('faire')
+    ))
+    if (
+      uniqueProducts.length === 2
+      && shopify.length === 1
+      && faire.length === 1
+      && shopify[0].id !== faire[0].id
+    ) {
+      registerPair(shopify[0], faire[0])
+      continue
+    }
+    if (shopify.length > 0 && faire.length > 0) {
+      for (const record of uniqueProducts) {
+        ambiguousExactIdentityProductIds.add(record.id)
+      }
+    }
+  }
+
+  for (const [left, right] of pairs.values()) {
+    const canonical = preferredCanonical(left, right)
+    const duplicate = canonical.id === left.id ? right : left
     const skuMatches = identifierIntersection(
       [canonical.sku, ...canonical.channelSkus],
       [duplicate.sku, ...duplicate.channelSkus],
@@ -601,6 +690,12 @@ export async function listProductIdentitySuggestionsInPostgres(input: {
       ...(conflictingBarcodes
         ? ['conflicting_barcodes']
         : []),
+      ...(
+        ambiguousExactIdentityProductIds.has(canonical.id)
+        || ambiguousExactIdentityProductIds.has(duplicate.id)
+          ? ['ambiguous_exact_identifier']
+          : []
+      ),
     ]
     const canonicalRecord = { ...canonical }
     const duplicateRecord = { ...duplicate }
@@ -635,6 +730,17 @@ export async function listProductIdentitySuggestionsInPostgres(input: {
   return suggestions.sort((left, right) => (
     left.displayName.localeCompare(right.displayName)
   ))
+}
+
+export async function listProductIdentitySuggestionsInPostgres(input: {
+  pipelineId: string
+}) {
+  return buildProductIdentitySuggestions({
+    pipelineId: input.pipelineId,
+    records: buildProductRecords(
+      await productIdentityRows(input.pipelineId),
+    ),
+  })
 }
 
 function sourceHash(input: unknown) {
@@ -1154,8 +1260,11 @@ export async function reconcileProductIdentityInPostgres(
       pack_profile_evidence: [],
     })
     if (
+      input.evidenceType === 'operator_confirmed'
+      && (
       normalizedDisplayName(requestedCanonical)
       !== normalizedDisplayName(requestedDuplicate)
+      )
     ) {
       throw new Error(
         'Product names no longer identify the same sellable pack; reload the review',

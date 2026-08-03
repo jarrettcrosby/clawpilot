@@ -4,13 +4,21 @@ export const SHOPIFY_API_VERSION = SHOPIFY_ADMIN_API_VERSION
 // The current control plane retains encrypted payload evidence without a
 // retention/purge worker. Keep intake limited to non-customer operational
 // topics until that privacy lifecycle and canonical processors exist.
-export const SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS = [
-  'app/scopes_update',
+export const SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS = [
   'inventory_items/update',
   'inventory_levels/update',
+] as const
+
+export const SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS = [
   'products/create',
   'products/delete',
   'products/update',
+] as const
+
+export const SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS = [
+  'app/scopes_update',
+  ...SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
+  ...SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS,
 ] as const
 
 export const COMMERCE_CAPABILITIES = [
@@ -153,6 +161,8 @@ export const SHOPIFY_ACCESS_SCOPES = [
   'write_fulfillments',
   'read_shipping',
   'write_shipping',
+  'read_app_proxy',
+  'write_app_proxy',
   'read_returns',
   'write_returns',
   'read_markets',
@@ -254,6 +264,25 @@ export const SHOPIFY_RECEIPT_PROOF_SCOPES = [
   'read_inventory',
 ] as const satisfies readonly ShopifyAccessScope[]
 
+// Merchant-owned Dev Dashboard apps configure this profile in Shopify and
+// release it as one app version. ClawPilot never grants these scopes itself;
+// it reads the installed store grant and fails each capability closed when
+// its required scope is absent. Matching write scopes include their paired
+// read access under Shopify's managed-install rules.
+export const SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES = [
+  'read_all_orders',
+  'read_customers',
+  'write_inventory',
+  'read_locations',
+  'read_markets',
+  'write_merchant_managed_fulfillment_orders',
+  'read_orders',
+  'write_products',
+  'write_publications',
+  'write_shipping',
+  'write_app_proxy',
+] as const satisfies readonly ShopifyAccessScope[]
+
 export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
   shopify: {
     ownership: 'merchant_owned_same_shopify_organization',
@@ -272,7 +301,58 @@ export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
       'Copy the canonical myshopify.com domain, client ID, and client secret.',
     ],
     receiptProofScopes: SHOPIFY_RECEIPT_PROOF_SCOPES,
+    distributedOperationsScopes: SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
     acceptedReceiptTopics: SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS,
+    webhookSetupGroups: [
+      {
+        key: 'inventory',
+        label: 'Inventory freshness',
+        topics: SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
+        requiredScopes: ['read_inventory'],
+        state: 'available',
+        behavior: 'Signals an immediate read-only inventory reconciliation; scheduled reconciliation remains the backstop.',
+      },
+      {
+        key: 'catalog',
+        label: 'Product catalog',
+        topics: SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS,
+        requiredScopes: ['read_products'],
+        state: 'available',
+        behavior: 'Signals an immediate read-only full catalog reconciliation through a lossless monotonic watermark; scheduled reconciliation remains the backstop.',
+      },
+      {
+        key: 'customers',
+        label: 'Customer lifecycle',
+        topics: ['customers/create', 'customers/update', 'customers/enable', 'customers/disable', 'customers/merge', 'customers/delete'],
+        requiredScopes: ['read_customers'],
+        state: 'privacy_lifecycle_pending',
+        behavior: 'Create and update will upsert the channel identity into CRM; disable, merge, and delete will preserve history and deactivate or redirect that identity.',
+      },
+      {
+        key: 'orders',
+        label: 'Order lifecycle',
+        topics: ['orders/create', 'orders/update', 'orders/edited', 'orders/cancelled', 'orders/paid'],
+        requiredScopes: ['read_orders'],
+        state: 'processor_pending',
+        behavior: 'Order events will trigger exact normalized-order refresh while polling remains the missed-event backstop.',
+      },
+      {
+        key: 'fulfillment_returns',
+        label: 'Fulfillment, refunds, and returns',
+        topics: ['fulfillment_orders/moved', 'fulfillment_orders/placed_on_hold', 'fulfillment_orders/split', 'fulfillments/create', 'fulfillments/update', 'refunds/create', 'returns/update'],
+        requiredScopes: ['read_merchant_managed_fulfillment_orders', 'read_returns'],
+        state: 'processor_pending',
+        behavior: 'Shipment and post-purchase events will refresh package, fulfillment, refund, and return state without creating an unapproved provider write.',
+      },
+      {
+        key: 'configuration',
+        label: 'Connection and locations',
+        topics: ['app/scopes_update', 'app/uninstalled', 'locations/create', 'locations/update', 'locations/delete'],
+        requiredScopes: ['read_locations'],
+        state: 'processor_pending',
+        behavior: 'Configuration events will re-evaluate scopes, connection health, locations, and warehouse routing.',
+      },
+    ],
     unsupportedCredentialMode: 'legacy_admin_access_token',
   },
   faire: {
@@ -317,17 +397,19 @@ export type ClawPilotCapabilityImplementationState = 'control_plane_implemented'
 
 // Current-state evidence only. "control_plane_implemented" means a safe
 // operator command or connection/receipt boundary exists; it does not imply an
-// unattended domain sync or export worker. Shopify inventory and location
-// synchronization are bounded, manager-triggered, read-only development
-// controls; they are not production activation or provider-write capabilities.
+// No implementation state below is production-activation evidence. Product
+// and variant synchronization are bounded read-only development workers;
+// inventory and location synchronization remain manager-triggered controls;
+// checkout rating is a customer-neutral CarrierService control plane whose
+// live provider acceptance is tracked separately.
 export const CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION = {
   oauth_authentication: 'not_implemented',
   api_authentication: 'control_plane_implemented',
-  webhook_registration: 'not_implemented',
+  webhook_registration: 'control_plane_implemented',
   webhook_verification: 'control_plane_implemented',
   webhook_idempotency: 'control_plane_implemented',
-  product_synchronization: 'not_implemented',
-  variant_synchronization: 'not_implemented',
+  product_synchronization: 'control_plane_implemented',
+  variant_synchronization: 'control_plane_implemented',
   catalog_publishing: 'not_implemented',
   inventory_import: 'control_plane_implemented',
   inventory_export: 'not_implemented',
@@ -346,11 +428,11 @@ export const CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION = {
   cancellation_import: 'not_implemented',
   refund_import: 'not_implemented',
   refund_export: 'not_implemented',
-  fulfillment_export: 'not_implemented',
+  fulfillment_export: 'control_plane_implemented',
   third_party_fulfillment_orchestration: 'not_implemented',
   fulfillment_service: 'not_implemented',
-  tracking_export: 'not_implemented',
-  shipping_rate_callbacks: 'not_implemented',
+  tracking_export: 'control_plane_implemented',
+  shipping_rate_callbacks: 'control_plane_implemented',
   return_import: 'not_implemented',
   return_export: 'not_implemented',
   market_context: 'not_implemented',
@@ -396,23 +478,39 @@ export const FAIRE_CAPABILITY_SCOPES = {
   inventory_export: ['WRITE_INVENTORIES'],
   customer_synchronization: ['READ_RETAILER'],
   order_import: ['READ_ORDERS'],
-  order_update: ['WRITE_ORDERS'],
+  order_update: [
+    'READ_BRAND',
+    'READ_ORDERS',
+    'READ_SHIPMENTS',
+    'WRITE_ORDERS',
+  ],
   cancellation_import: ['READ_ORDERS'],
-  fulfillment_export: ['WRITE_ORDERS'],
-  tracking_export: ['WRITE_ORDERS', 'READ_SHIPMENTS'],
+  fulfillment_export: [
+    'READ_BRAND',
+    'READ_ORDERS',
+    'READ_SHIPMENTS',
+    'WRITE_ORDERS',
+  ],
+  tracking_export: [
+    'READ_BRAND',
+    'READ_ORDERS',
+    'READ_SHIPMENTS',
+    'WRITE_ORDERS',
+  ],
 } as const satisfies Partial<Record<CommerceCapability, readonly string[]>>
 
-// The typed Faire client exposes the provider protocol surface, but none of
-// those methods may mutate canonical operations state until a reviewed worker
-// and mapping workflow is delivered. This mirrors the Shopify evidence rule.
+// Faire product and variant synchronization use the bounded read-only
+// development catalog worker and reviewed mapping workflow. Other typed client
+// methods remain provider-surface evidence only until their own executable
+// worker and reconciliation boundary exists.
 export const CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION = {
   oauth_authentication: 'control_plane_implemented',
   api_authentication: 'control_plane_implemented',
   webhook_registration: 'not_implemented',
   webhook_verification: 'not_implemented',
   webhook_idempotency: 'not_implemented',
-  product_synchronization: 'not_implemented',
-  variant_synchronization: 'not_implemented',
+  product_synchronization: 'control_plane_implemented',
+  variant_synchronization: 'control_plane_implemented',
   catalog_publishing: 'not_implemented',
   inventory_import: 'not_implemented',
   inventory_export: 'not_implemented',
@@ -425,16 +523,16 @@ export const CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION = {
   order_import: 'control_plane_implemented',
   historical_order_import: 'not_implemented',
   order_creation: 'not_implemented',
-  order_update: 'not_implemented',
+  order_update: 'control_plane_implemented',
   order_edit: 'not_implemented',
   draft_order_synchronization: 'not_implemented',
   cancellation_import: 'not_implemented',
   refund_import: 'not_implemented',
   refund_export: 'not_implemented',
-  fulfillment_export: 'not_implemented',
+  fulfillment_export: 'control_plane_implemented',
   third_party_fulfillment_orchestration: 'not_implemented',
   fulfillment_service: 'not_implemented',
-  tracking_export: 'not_implemented',
+  tracking_export: 'control_plane_implemented',
   shipping_rate_callbacks: 'not_implemented',
   return_import: 'not_implemented',
   return_export: 'not_implemented',
@@ -448,6 +546,25 @@ export const CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION = {
   integration_health: 'control_plane_implemented',
   test_environment: 'not_implemented',
 } as const satisfies Record<CommerceCapability, ClawPilotCapabilityImplementationState>
+
+export type CommerceCapabilityProvider = 'shopify' | 'faire'
+
+export function commerceCapabilityImplementationState(
+  provider: CommerceCapabilityProvider,
+  capability: CommerceCapability,
+): ClawPilotCapabilityImplementationState {
+  return provider === 'shopify'
+    ? CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION[capability]
+    : CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION[capability]
+}
+
+export function isClawPilotCommerceCapabilityImplemented(
+  provider: CommerceCapabilityProvider,
+  capability: CommerceCapability,
+) {
+  return commerceCapabilityImplementationState(provider, capability)
+    === 'control_plane_implemented'
+}
 
 const SHOPIFY_PROVIDER_CAPABILITY_SET = new Set<CommerceCapability>(SHOPIFY_PROVIDER_AVAILABLE_CAPABILITIES)
 const SHOPIFY_SCOPED_CAPABILITY_SET = new Set<CommerceCapability>(
@@ -503,6 +620,13 @@ function effectiveGrantedScopeSet(grantedScopes: readonly string[]) {
   return effective
 }
 
+export function hasEffectiveShopifyScope(
+  grantedScopes: readonly string[],
+  scope: ShopifyAccessScope,
+) {
+  return effectiveGrantedScopeSet(grantedScopes).has(scope)
+}
+
 export function auditShopifyScopeRequirements(
   requestedScopes: readonly ShopifyAccessScope[],
   grantedScopes: readonly string[],
@@ -532,7 +656,7 @@ export function auditShopifyScopeUpdatePayload(
     throw new TypeError('Shopify scope-update payload was invalid')
   }
   return auditShopifyScopeRequirements(
-    SHOPIFY_RECEIPT_PROOF_SCOPES,
+    SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
     current,
   )
 }

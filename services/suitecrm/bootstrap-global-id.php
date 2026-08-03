@@ -10,13 +10,25 @@ require_once 'modules/DynamicFields/DynamicField.php';
 require_once 'modules/DynamicFields/FieldCases.php';
 require_once 'modules/ModuleBuilder/parsers/ParserFactory.php';
 require_once 'modules/ModuleBuilder/parsers/parser.searchfields.php';
+require_once 'include/SugarObjects/VardefManager.php';
 require_once 'lib/Search/SearchModules.php';
 
 const CLAWPILOT_GLOBAL_ID_FIELD = 'global_id_c';
 const CLAWPILOT_GLOBAL_ID_LABEL = 'LBL_GLOBAL_ID';
+const CLAWPILOT_GLOBAL_ID_MIN_LENGTH = 32;
 const CLAWPILOT_NOTE_OCCURRED_AT_FIELD = 'occurred_at_c';
 const CLAWPILOT_NOTE_OCCURRED_AT_LABEL = 'LBL_OCCURRED_AT';
 const CLAWPILOT_PRODUCT_MODULE = 'AOS_Products';
+const CLAWPILOT_PRODUCT_IMAGE_FIELD = 'clawpilot_image_c';
+const CLAWPILOT_PRODUCT_IMAGE_LABEL = 'LBL_CLAWPILOT_PRODUCT_IMAGE';
+const CLAWPILOT_PRODUCT_IMAGE_METADATA = [
+    'storage_type' => 'private-images',
+    'createThumbnail' => true,
+    'thumbnailHeight' => 320,
+    'thumbnailWidth' => 320,
+    'preview' => true,
+    'upload_maxsize' => 2097152,
+];
 
 /** @param mixed $value */
 function layout_contains_field($value, string $fieldName): bool
@@ -141,7 +153,7 @@ function global_id_definition_is_current(array $definition, bool $unifiedSearch 
 {
     $fullText = $definition['full_text_search'] ?? null;
     $base = ($definition['vname'] ?? '') === CLAWPILOT_GLOBAL_ID_LABEL
-        && (int) ($definition['len'] ?? 0) === 9
+        && (int) ($definition['len'] ?? 0) >= CLAWPILOT_GLOBAL_ID_MIN_LENGTH
         && !empty($definition['audited'])
         && !empty($definition['reportable']);
     if (!$base || !$unifiedSearch) {
@@ -150,6 +162,75 @@ function global_id_definition_is_current(array $definition, bool $unifiedSearch 
     return !empty($definition['unified_search'])
         && is_array($fullText)
         && !empty($fullText['enabled']);
+}
+
+function refresh_and_verify_global_id_field(string $module): void
+{
+    $objectName = BeanFactory::getObjectName($module);
+    if (!is_string($objectName) || $objectName === '') {
+        throw new RuntimeException("SuiteCRM object name for {$module} is unavailable");
+    }
+
+    // DynamicField::addFieldObject() persists fields_meta_data and alters the
+    // custom table, then calls buildCache(). SuiteCRM's buildCache() only fills
+    // vardef keys that are not already present in this process. Without a full
+    // refresh, an older cached len therefore survives the successful ALTER and
+    // is written back to the vardef cache consumed by Api/V8/meta/fields.
+    VardefManager::clearVardef($module, $objectName);
+    unset($GLOBALS['dictionary'][$objectName]);
+    VardefManager::refreshVardefs($module, $objectName);
+
+    $hadReloadVardefs = array_key_exists('reload_vardefs', $GLOBALS);
+    $previousReloadVardefs = $GLOBALS['reload_vardefs'] ?? null;
+    $GLOBALS['reload_vardefs'] = true;
+    try {
+        $freshBean = BeanFactory::newBean($module);
+    } finally {
+        if ($hadReloadVardefs) {
+            $GLOBALS['reload_vardefs'] = $previousReloadVardefs;
+        } else {
+            unset($GLOBALS['reload_vardefs']);
+        }
+    }
+    if (!$freshBean) {
+        throw new RuntimeException("SuiteCRM module {$module} is unavailable after vardef refresh");
+    }
+
+    $definition = isset($freshBean->field_defs[CLAWPILOT_GLOBAL_ID_FIELD])
+        && is_array($freshBean->field_defs[CLAWPILOT_GLOBAL_ID_FIELD])
+        ? $freshBean->field_defs[CLAWPILOT_GLOBAL_ID_FIELD]
+        : [];
+    $definitionLength = (int) ($definition['len'] ?? 0);
+    if ($definitionLength < CLAWPILOT_GLOBAL_ID_MIN_LENGTH) {
+        throw new RuntimeException(
+            "Global ID vardef for {$module} is stale after refresh (length {$definitionLength})"
+        );
+    }
+
+    $dynamic = new DynamicField($module);
+    $dynamic->setup($freshBean);
+    $persisted = $dynamic->getFieldWidget($module, CLAWPILOT_GLOBAL_ID_FIELD);
+    $persistedLength = $persisted ? (int) ($persisted->len ?? 0) : 0;
+    if (!$persisted || $persistedLength < CLAWPILOT_GLOBAL_ID_MIN_LENGTH) {
+        throw new RuntimeException(
+            "Global ID metadata for {$module} is not widened (length {$persistedLength})"
+        );
+    }
+
+    $tableName = $freshBean->table_name . '_cstm';
+    $columns = DBManagerFactory::getInstance()->get_columns($tableName);
+    $column = $columns[strtolower(CLAWPILOT_GLOBAL_ID_FIELD)] ?? [];
+    $columnLength = is_array($column) ? (int) ($column['len'] ?? 0) : 0;
+    if (
+        !is_array($column)
+        || !in_array(strtolower((string) ($column['type'] ?? '')), ['varchar', 'char'], true)
+        || $columnLength < CLAWPILOT_GLOBAL_ID_MIN_LENGTH
+    ) {
+        throw new RuntimeException(
+            "Global ID database column {$tableName}." . CLAWPILOT_GLOBAL_ID_FIELD
+            . " is not widened (length {$columnLength})"
+        );
+    }
 }
 
 function ensure_global_id_field(string $module, bool $unifiedSearch = true): void
@@ -167,14 +248,23 @@ function ensure_global_id_field(string $module, bool $unifiedSearch = true): voi
         : [];
     $existing = $dynamic->getFieldWidget($module, CLAWPILOT_GLOBAL_ID_FIELD);
 
-    if (!$existing || !global_id_definition_is_current($definition, $unifiedSearch)) {
+    if (
+        !$existing
+        || (int) ($existing->len ?? 0) < CLAWPILOT_GLOBAL_ID_MIN_LENGTH
+        || !global_id_definition_is_current($definition, $unifiedSearch)
+    ) {
         $field = $existing ?: get_widget('varchar');
+        $fieldLength = max(
+            CLAWPILOT_GLOBAL_ID_MIN_LENGTH,
+            (int) ($field->len ?? 0),
+            (int) ($definition['len'] ?? 0)
+        );
         $field->name = $existing ? CLAWPILOT_GLOBAL_ID_FIELD : 'global_id';
         $field->label = CLAWPILOT_GLOBAL_ID_LABEL;
         $field->vname = CLAWPILOT_GLOBAL_ID_LABEL;
         $field->label_value = 'Global ID';
-        $field->len = '9';
-        $field->size = '12';
+        $field->len = (string) $fieldLength;
+        $field->size = (string) $fieldLength;
         $field->required = false;
         $field->default = null;
         $field->default_value = null;
@@ -190,6 +280,7 @@ function ensure_global_id_field(string $module, bool $unifiedSearch = true): voi
         $field->save($dynamic);
     }
 
+    refresh_and_verify_global_id_field($module);
     $dynamic->setLabel('en_us', CLAWPILOT_GLOBAL_ID_LABEL, 'Global ID');
     if ($unifiedSearch) {
         ensure_global_id_search_field($module);
@@ -198,6 +289,170 @@ function ensure_global_id_field(string $module, bool $unifiedSearch = true): voi
     expose_global_id_in_list_view($module);
     expose_global_id_in_search_view($module, 'basic_search');
     expose_global_id_in_search_view($module, 'advanced_search');
+}
+
+/** @param mixed $metadata */
+function product_image_metadata_is_current($metadata): bool
+{
+    if (is_string($metadata)) {
+        $decoded = json_decode($metadata, true);
+        if (!is_array($decoded)) {
+            // DynamicField::getFieldWidget() HTML-encodes DB values, including
+            // the JSON quotes, while vardef metadata is already decoded.
+            $decoded = json_decode(html_entity_decode($metadata, ENT_QUOTES | ENT_HTML5, 'UTF-8'), true);
+        }
+        $metadata = is_array($decoded) ? $decoded : [];
+    }
+    if (!is_array($metadata)) {
+        return false;
+    }
+
+    foreach (CLAWPILOT_PRODUCT_IMAGE_METADATA as $key => $expected) {
+        if (!array_key_exists($key, $metadata) || $metadata[$key] !== $expected) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** @param array<string, mixed> $definition */
+function product_image_definition_is_current(array $definition): bool
+{
+    return ($definition['vname'] ?? '') === CLAWPILOT_PRODUCT_IMAGE_LABEL
+        && ($definition['type'] ?? '') === 'image'
+        && ($definition['source'] ?? '') === 'non-db'
+        && product_image_metadata_is_current($definition['metadata'] ?? []);
+}
+
+/** @param mixed $widget */
+function product_image_widget_is_current($widget): bool
+{
+    if (!$widget) {
+        return false;
+    }
+    $definition = $widget->get_field_def();
+    return is_array($definition)
+        && ($definition['type'] ?? '') === 'image'
+        && ($definition['source'] ?? '') === 'non-db'
+        && product_image_metadata_is_current($widget->metadata ?? []);
+}
+
+function refresh_and_verify_product_image_field(): void
+{
+    $objectName = BeanFactory::getObjectName(CLAWPILOT_PRODUCT_MODULE);
+    if (!is_string($objectName) || $objectName === '') {
+        throw new RuntimeException('SuiteCRM AOS Products object name is unavailable');
+    }
+
+    VardefManager::clearVardef(CLAWPILOT_PRODUCT_MODULE, $objectName);
+    unset($GLOBALS['dictionary'][$objectName]);
+    VardefManager::refreshVardefs(CLAWPILOT_PRODUCT_MODULE, $objectName);
+
+    $hadReloadVardefs = array_key_exists('reload_vardefs', $GLOBALS);
+    $previousReloadVardefs = $GLOBALS['reload_vardefs'] ?? null;
+    $GLOBALS['reload_vardefs'] = true;
+    try {
+        $freshBean = BeanFactory::newBean(CLAWPILOT_PRODUCT_MODULE);
+    } finally {
+        if ($hadReloadVardefs) {
+            $GLOBALS['reload_vardefs'] = $previousReloadVardefs;
+        } else {
+            unset($GLOBALS['reload_vardefs']);
+        }
+    }
+    if (!$freshBean) {
+        throw new RuntimeException('SuiteCRM AOS Products is unavailable after vardef refresh');
+    }
+
+    $definition = isset($freshBean->field_defs[CLAWPILOT_PRODUCT_IMAGE_FIELD])
+        && is_array($freshBean->field_defs[CLAWPILOT_PRODUCT_IMAGE_FIELD])
+        ? $freshBean->field_defs[CLAWPILOT_PRODUCT_IMAGE_FIELD]
+        : [];
+    if (!product_image_definition_is_current($definition)) {
+        throw new RuntimeException(
+            'ClawPilot product image vardef is not a native non-db private image field after refresh'
+        );
+    }
+
+    $dynamic = new DynamicField(CLAWPILOT_PRODUCT_MODULE);
+    $dynamic->setup($freshBean);
+    $persisted = $dynamic->getFieldWidget(CLAWPILOT_PRODUCT_MODULE, CLAWPILOT_PRODUCT_IMAGE_FIELD);
+    if (!product_image_widget_is_current($persisted)) {
+        throw new RuntimeException(
+            'ClawPilot product image fields_meta_data does not contain the required native image metadata'
+        );
+    }
+}
+
+function expose_product_image_in_view(string $view): void
+{
+    $parser = ParserFactory::getParser($view, CLAWPILOT_PRODUCT_MODULE);
+    if (!$parser) {
+        throw new RuntimeException("SuiteCRM {$view} layout for AOS Products is unavailable");
+    }
+    if (!layout_contains_field($parser->getLayout(), CLAWPILOT_PRODUCT_IMAGE_FIELD)) {
+        $parser->addField([
+            'name' => CLAWPILOT_PRODUCT_IMAGE_FIELD,
+            'label' => CLAWPILOT_PRODUCT_IMAGE_LABEL,
+        ]);
+        $parser->handleSave(false);
+        $parser = ParserFactory::getParser($view, CLAWPILOT_PRODUCT_MODULE);
+    }
+    if (!$parser || !layout_contains_field($parser->getLayout(), CLAWPILOT_PRODUCT_IMAGE_FIELD)) {
+        throw new RuntimeException("ClawPilot product image is missing from the AOS Products {$view} layout");
+    }
+}
+
+function ensure_product_image_field(): void
+{
+    $bean = BeanFactory::newBean(CLAWPILOT_PRODUCT_MODULE);
+    if (!$bean) {
+        throw new RuntimeException('SuiteCRM AOS Products module is unavailable');
+    }
+
+    $dynamic = new DynamicField(CLAWPILOT_PRODUCT_MODULE);
+    $dynamic->setup($bean);
+    $definition = isset($bean->field_defs[CLAWPILOT_PRODUCT_IMAGE_FIELD])
+        && is_array($bean->field_defs[CLAWPILOT_PRODUCT_IMAGE_FIELD])
+        ? $bean->field_defs[CLAWPILOT_PRODUCT_IMAGE_FIELD]
+        : [];
+    $existing = $dynamic->getFieldWidget(CLAWPILOT_PRODUCT_MODULE, CLAWPILOT_PRODUCT_IMAGE_FIELD);
+
+    if (!product_image_definition_is_current($definition) || !product_image_widget_is_current($existing)) {
+        // Always use TemplateImage, including when repairing a wrongly typed
+        // pre-existing field, so DynamicField persists the image metadata map.
+        $field = get_widget('image');
+        $field->name = $existing ? CLAWPILOT_PRODUCT_IMAGE_FIELD : 'clawpilot_image';
+        $field->label = CLAWPILOT_PRODUCT_IMAGE_LABEL;
+        $field->vname = CLAWPILOT_PRODUCT_IMAGE_LABEL;
+        $field->label_value = 'ClawPilot Product Image';
+        $field->type = 'image';
+        $field->required = false;
+        $field->default = null;
+        $field->default_value = null;
+        $field->audited = 1;
+        $field->inline_edit = 0;
+        $field->massupdate = 0;
+        $field->importable = 'false';
+        $field->duplicate_merge = 'disabled';
+        $field->reportable = false;
+        $field->comment = 'Native SuiteCRM product media managed by ClawPilot.';
+        $field->metadata = CLAWPILOT_PRODUCT_IMAGE_METADATA;
+        $field->storage_type = CLAWPILOT_PRODUCT_IMAGE_METADATA['storage_type'];
+        $field->maxHeight = null;
+        $field->maxWidth = null;
+        $field->createThumbnail = CLAWPILOT_PRODUCT_IMAGE_METADATA['createThumbnail'];
+        $field->thumbnailHeight = CLAWPILOT_PRODUCT_IMAGE_METADATA['thumbnailHeight'];
+        $field->thumbnailWidth = CLAWPILOT_PRODUCT_IMAGE_METADATA['thumbnailWidth'];
+        $field->preview = CLAWPILOT_PRODUCT_IMAGE_METADATA['preview'];
+        $field->upload_maxsize = CLAWPILOT_PRODUCT_IMAGE_METADATA['upload_maxsize'];
+        $field->save($dynamic);
+    }
+
+    refresh_and_verify_product_image_field();
+    $dynamic->setLabel('en_us', CLAWPILOT_PRODUCT_IMAGE_LABEL, 'ClawPilot Product Image');
+    expose_product_image_in_view('detailview');
+    expose_product_image_in_view('editview');
 }
 
 function expose_note_occurred_at_in_view(string $view): void
@@ -404,9 +659,10 @@ foreach ($modules as $module) {
 ensure_global_id_field('Users', false);
 
 ensure_note_occurred_at_field();
+ensure_product_image_field();
 hide_unowned_product_purchases_subpanel();
 
 rebuild_and_verify_global_search($modules);
 enable_and_verify_global_search_modules([CLAWPILOT_PRODUCT_MODULE]);
 
-fwrite(STDOUT, "SuiteCRM Global ID fields, owned layouts, and search metadata are ready\n");
+fwrite(STDOUT, "SuiteCRM Global ID fields, native product image, owned layouts, and search metadata are ready\n");

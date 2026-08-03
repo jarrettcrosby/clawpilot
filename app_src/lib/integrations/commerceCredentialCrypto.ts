@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { normalizeGlobalId } from '@/lib/globalIds.mjs'
 import { isHostedRuntime } from '@/lib/persistence/config'
 
 export type CommerceProvider = 'shopify' | 'faire'
@@ -92,11 +93,19 @@ export function normalizeCommerceEnvironment(
 }
 
 export function normalizeCommerceAccountGlobalId(value: unknown) {
-  const globalId = String(value || '').trim().toLowerCase()
-  if (!/^gia[0-9]{7}$/.test(globalId)) {
+  const globalId = normalizeGlobalId(value, 'gia')
+  if (!globalId) {
     throw new Error('A valid commerce account Global ID is required')
   }
   return globalId
+}
+
+function normalizeCommerceCredentialGeneration(value: unknown) {
+  const generation = Number(value)
+  if (!Number.isSafeInteger(generation) || generation < 1) {
+    throw new Error('A valid commerce credential generation is required')
+  }
+  return generation
 }
 
 export function normalizeCommerceAuthMode(
@@ -244,6 +253,153 @@ function encryptionKey() {
     throw new Error('Commerce credential encryption is not configured')
   }
   return crypto.createHash('sha256').update(secret).digest()
+}
+
+function normalizedCheckoutDestinationPart(
+  value: unknown,
+  casing: 'lower' | 'upper',
+) {
+  const normalized = String(value || '')
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return casing === 'upper'
+    ? normalized.toUpperCase()
+    : normalized.toLowerCase()
+}
+
+export function commerceCustomerEvidenceFingerprint(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  kind: 'external_customer_id' | 'email'
+  value: unknown
+}) {
+  const organizationId = normalizeCommerceOrganizationId(
+    input.organizationId,
+  )
+  const accountGlobalId = normalizeCommerceAccountGlobalId(
+    input.accountGlobalId,
+  )
+  const value = String(input.value ?? '').normalize('NFKC').trim()
+  if (
+    value.length < 1
+    || value.length > 512
+    || /[\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    throw new Error('Commerce customer evidence is invalid')
+  }
+  return crypto
+    .createHmac('sha256', encryptionKey())
+    .update('clawpilot:commerce:customer-evidence:v1\0', 'utf8')
+    .update(organizationId, 'utf8')
+    .update('\0', 'utf8')
+    .update(accountGlobalId, 'utf8')
+    .update('\0', 'utf8')
+    .update(input.kind, 'utf8')
+    .update('\0', 'utf8')
+    .update(value, 'utf8')
+    .digest('hex')
+}
+
+/**
+ * Produces the customer-neutral rate-zone identity shared by the live
+ * CarrierService callback and the later Shopify order-intake record. Shopify
+ * can withhold state, street, and city during checkout rating, so those fields
+ * must not influence reconciliation with the later complete order. Plaintext
+ * destination data is never retained at the checkout boundary.
+ */
+export function shopifyCheckoutDestinationFingerprint(input: {
+  countryCode?: unknown
+  postalCode?: unknown
+  provinceCode?: unknown
+  city?: unknown
+  address1?: unknown
+  address2?: unknown
+}) {
+  const canonical = {
+    version: 'shopify-rate-zone-fingerprint-v2',
+    countryCode: normalizedCheckoutDestinationPart(
+      input.countryCode,
+      'upper',
+    ),
+    postalCode: normalizedCheckoutDestinationPart(
+      input.postalCode,
+      'upper',
+    ),
+  }
+  if (
+    !canonical.countryCode
+    || !canonical.postalCode
+  ) {
+    throw new Error(
+      'Shopify checkout destination fingerprint requires country '
+      + 'and postal code',
+    )
+  }
+  return crypto
+    .createHmac('sha256', encryptionKey())
+    .update(JSON.stringify(canonical), 'utf8')
+    .digest('hex')
+}
+
+/**
+ * Shopify CarrierService callbacks do not include a Shopify signature. Keep
+ * the account-specific callback URL unguessable instead. The token is derived
+ * from the current credential generation, so rotating the app credential
+ * invalidates the prior callback URL without retaining another plaintext
+ * secret in Postgres.
+ */
+export function shopifyCarrierServiceCallbackToken(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  credentialGeneration: unknown
+  callbackTokenVersion: unknown
+}) {
+  const organizationId = normalizeCommerceOrganizationId(
+    input.organizationId,
+  )
+  const accountGlobalId = normalizeCommerceAccountGlobalId(
+    input.accountGlobalId,
+  )
+  const credentialGeneration = normalizeCommerceCredentialGeneration(
+    input.credentialGeneration,
+  )
+  const callbackTokenVersion = normalizeCommerceCredentialGeneration(
+    input.callbackTokenVersion,
+  )
+  return crypto
+    .createHmac('sha256', encryptionKey())
+    .update(
+      [
+        'clawpilot',
+        'shopify',
+        'carrier-service-callback',
+        'v1',
+        organizationId,
+        accountGlobalId,
+        credentialGeneration,
+        callbackTokenVersion,
+      ].join(':'),
+    )
+    .digest('base64url')
+}
+
+export function shopifyCarrierServiceCallbackTokenMatches(
+  input: {
+    organizationId: unknown
+    accountGlobalId: unknown
+    credentialGeneration: unknown
+    callbackTokenVersion: unknown
+  },
+  tokenValue: unknown,
+) {
+  const supplied = String(tokenValue || '').trim()
+  if (!/^[A-Za-z0-9_-]{43}$/.test(supplied)) return false
+  const expected = shopifyCarrierServiceCallbackToken(input)
+  return crypto.timingSafeEqual(
+    Buffer.from(supplied, 'ascii'),
+    Buffer.from(expected, 'ascii'),
+  )
 }
 
 function credentialAuthenticatedData(

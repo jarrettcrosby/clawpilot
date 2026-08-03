@@ -16,6 +16,16 @@ import type {
 } from '@/lib/operations/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
+  authorizeCommerceActiveTransitionInPostgres,
+  CommerceActiveTransitionPersistenceError,
+  consumeCommerceActiveTransitionAuthorizationInPostgres,
+  prepareCommerceActiveTransitionInPostgres,
+} from '@/lib/persistence/commerceActiveTransitionAuthorization'
+import {
+  authorizeSandboxCommerceE2eInPostgres,
+  SandboxCommerceE2eAuthorizationError,
+} from '@/lib/persistence/sandboxCommerceE2eAuthorization'
+import {
   confirmOperationsOrderShipmentFromPostgres,
   confirmOperationsOrderPicksFromPostgres,
   completeOperationsInboundReceiptInPostgres,
@@ -26,8 +36,11 @@ import {
   executeOperationsReplenishmentInPostgres,
   generateOperationsPackagePackingSlipInPostgres,
   OperationsRequestError,
+  planOperationsOrderFromPostgres,
+  prepareOperationsShipmentExecutionFromPostgres,
   readOperationsWorkspaceFromPostgres,
   releaseOperationsOrderFromPostgres,
+  retryOperationsCommerceFulfillmentExportFromPostgres,
   runMockOperationsProofFromPostgres,
   updateOperationsActivationInPostgres,
   updateOperationsExceptionInPostgres,
@@ -39,6 +52,20 @@ import {
   createOperationsSandboxLabelInPostgres,
   voidOperationsSandboxLabelInPostgres,
 } from '@/lib/persistence/operationShipping'
+import { CarrierIntegrationRequestError } from '@/lib/integrations/carrierIntegrations'
+import {
+  executeProductionFulfillmentRerate,
+  ProductionFulfillmentRerateExecutionError,
+} from '@/lib/operations/productionFulfillmentRerateExecution'
+import {
+  ProductionFulfillmentReratePersistenceError,
+  selectProductionFulfillmentRerateOfferInPostgres,
+} from '@/lib/operations/productionFulfillmentRerates'
+import {
+  ActiveFulfillmentExecutionPreparationError,
+  prepareActiveFulfillmentExecutionFromShadowInPostgres,
+} from '@/lib/operations/activeFulfillmentExecutionPreparation'
+import type { ActiveCarrierDispatchAddressSnapshot } from '@/lib/operations/activeCarrierDispatchSnapshot'
 import { requireRequestUser } from '@/lib/requestUser'
 
 export const dynamic = 'force-dynamic'
@@ -46,19 +73,28 @@ export const revalidate = 0
 export const runtime = 'nodejs'
 
 const MAX_REQUEST_BYTES = 64 * 1024
-const CUSTOMER_GLOBAL_ID = /^ga\d{7}$/
-const PRODUCT_GLOBAL_ID = /^gp\d{7}$/
-const ORDER_GLOBAL_ID = /^gor\d{7}$/
-const PACKAGE_GLOBAL_ID = /^gpa\d{7}$/
-const EXCEPTION_GLOBAL_ID = /^gex\d{7}$/
-const RATE_GLOBAL_ID = /^grt\d{7}$/
-const CARRIER_ACCOUNT_GLOBAL_ID = /^gac\d{7}$/
-const PRINTER_GLOBAL_ID = /^gpr\d{7}$/
-const WAREHOUSE_GLOBAL_ID = /^gwh\d{7}$/
-const LOCATION_GLOBAL_ID = /^gwl\d{7}$/
-const INVENTORY_POOL_GLOBAL_ID = /^gip\d{7}$/
-const RECEIPT_GLOBAL_ID = /^grc\d{7}$/
-const RECEIPT_LINE_GLOBAL_ID = /^grcl\d{7}$/
+const CUSTOMER_GLOBAL_ID = /^ga(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRODUCT_GLOBAL_ID = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/
+const ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/
+const CARTONIZATION_EVIDENCE_GLOBAL_ID = /^gcte(?:[0-9]{7}|[0-9a-v]{12})$/
+const PACKAGE_GLOBAL_ID = /^gpa(?:[0-9]{7}|[0-9a-v]{12})$/
+const EXCEPTION_GLOBAL_ID = /^gex(?:[0-9]{7}|[0-9a-v]{12})$/
+const RATE_GLOBAL_ID = /^grt(?:[0-9]{7}|[0-9a-v]{12})$/
+const CARRIER_ACCOUNT_GLOBAL_ID = /^gac(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRINTER_GLOBAL_ID = /^gpr(?:[0-9]{7}|[0-9a-v]{12})$/
+const WAREHOUSE_GLOBAL_ID = /^gwh(?:[0-9]{7}|[0-9a-v]{12})$/
+const LOCATION_GLOBAL_ID = /^gwl(?:[0-9]{7}|[0-9a-v]{12})$/
+const INVENTORY_POOL_GLOBAL_ID = /^gip(?:[0-9]{7}|[0-9a-v]{12})$/
+const RECEIPT_GLOBAL_ID = /^grc(?:[0-9]{7}|[0-9a-v]{12})$/
+const RECEIPT_LINE_GLOBAL_ID = /^grcl(?:[0-9]{7}|[0-9a-v]{12})$/
+const INTEGRATION_ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
+const COMMERCE_ACTIVE_PREPARATION_GLOBAL_ID = /^gcap(?:[0-9]{7}|[0-9a-v]{12})$/
+const SHADOW_EXECUTION_GLOBAL_ID = /^gofe(?:[0-9]{7}|[0-9a-v]{12})$/
+const ACTIVE_EXECUTION_GLOBAL_ID = /^gaex(?:[0-9]{7}|[0-9a-v]{12})$/
+const ACTIVE_SHIPMENT_GROUP_GLOBAL_ID = /^gash(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRODUCTION_RERATE_RUN_GLOBAL_ID = /^gafr(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRODUCTION_RERATE_OFFER_GLOBAL_ID = /^garo(?:[0-9]{7}|[0-9a-v]{12})$/
+const SHA256 = /^[a-f0-9]{64}$/
 const ORDER_STATUSES = new Set<OperationsOrderStatus>([
   'imported', 'validated', 'held', 'promised', 'reserved', 'planned',
   'released', 'picking', 'packed', 'shipped', 'cancelled', 'exception',
@@ -75,6 +111,10 @@ const PROOF_FIELDS = new Set([
 ])
 const PROOF_LINE_FIELDS = new Set(['productGlobalId', 'quantity', 'openingQuantity'])
 const ADDRESS_FIELDS = new Set(['name', 'line1', 'line2', 'city', 'region', 'postalCode', 'country'])
+const CARRIER_DISPATCH_ADDRESS_FIELDS = new Set([
+  'contactName', 'companyName', 'phone', 'email', 'line1', 'line2', 'line3',
+  'city', 'region', 'postalCode', 'countryCode', 'residential',
+])
 
 function json(payload: Record<string, unknown>, status = 200) {
   return NextResponse.json(payload, {
@@ -91,6 +131,12 @@ function requirePostgres() {
   if (!isPostgresStorageEnabled()) {
     requestError('OPERATIONS_POSTGRES_REQUIRED', 'Operations requires Postgres storage', 503)
   }
+}
+
+function commerceFulfillmentRecoveryRuntimeAvailable() {
+  return String(
+    process.env.CLAWPILOT_COMMERCE_FULFILLMENT_RECOVERY_ENABLED || '0',
+  ) === '1'
 }
 
 function requireOperationsProofFixture() {
@@ -264,6 +310,14 @@ function booleanValue(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback
 }
 
+function optionalBooleanValue(value: unknown, label: string): boolean | null {
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'boolean') {
+    requestError('OPERATIONS_REQUEST_INVALID', `${label} must be true or false`)
+  }
+  return value
+}
+
 function carrierCutoffsValue(value: unknown): Record<string, string> {
   if (value === undefined || value === null) return {}
   const input = record(value, 'OPERATIONS_REQUEST_INVALID', 'Carrier cutoffs')
@@ -283,6 +337,73 @@ function carrierCutoffsValue(value: unknown): Record<string, string> {
     result[provider] = cutoff
   }
   return result
+}
+
+function commerceActiveSelectedAccountsValue(value: unknown) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 8) {
+    requestError(
+      'COMMERCE_ACTIVE_COHORT_INVALID',
+      'Select between one and eight commerce accounts',
+    )
+  }
+  const seen = new Set<string>()
+  return value.map((entry, index) => {
+    const selected = record(
+      entry,
+      'COMMERCE_ACTIVE_COHORT_INVALID',
+      `Commerce account ${index + 1}`,
+    )
+    assertFields(
+      selected,
+      new Set(['accountGlobalId', 'capabilities']),
+      'COMMERCE_ACTIVE_COHORT_INVALID',
+      `Commerce account ${index + 1}`,
+    )
+    const accountGlobalId = globalIdValue(
+      selected.accountGlobalId,
+      `Commerce account ${index + 1}`,
+      INTEGRATION_ACCOUNT_GLOBAL_ID,
+    )
+    if (seen.has(accountGlobalId)) {
+      requestError(
+        'COMMERCE_ACTIVE_ACCOUNT_DUPLICATE',
+        'A commerce account can appear only once in an Active cohort',
+      )
+    }
+    seen.add(accountGlobalId)
+    if (
+      !Array.isArray(selected.capabilities)
+      || selected.capabilities.length < 1
+      || selected.capabilities.length > 32
+    ) {
+      requestError(
+        'COMMERCE_ACTIVE_CAPABILITIES_INVALID',
+        `Select at least one write capability for ${accountGlobalId}`,
+      )
+    }
+    const capabilities = selected.capabilities.map((capability) => {
+      const normalized = String(capability || '').trim()
+      if (!/^[a-z][a-z0-9_]{0,127}$/.test(normalized)) {
+        requestError(
+          'COMMERCE_ACTIVE_CAPABILITIES_INVALID',
+          `Selected write capabilities for ${accountGlobalId} are invalid`,
+        )
+      }
+      return normalized
+    })
+    return {
+      accountGlobalId,
+      capabilities: [...new Set(capabilities)].sort(),
+    }
+  })
+}
+
+function sha256Value(value: unknown, label: string) {
+  const normalized = String(value || '').trim()
+  if (!SHA256.test(normalized)) {
+    requestError('COMMERCE_ACTIVE_COHORT_INVALID', `${label} is invalid`)
+  }
+  return normalized
 }
 
 function locationStorageFunctionValue(
@@ -401,6 +522,59 @@ function addressValue(value: unknown): Address {
   }
 }
 
+function carrierDispatchAddressValue(
+  value: unknown,
+  label: string,
+): ActiveCarrierDispatchAddressSnapshot {
+  const input = record(value, 'OPERATIONS_REQUEST_INVALID', label)
+  assertFields(
+    input,
+    CARRIER_DISPATCH_ADDRESS_FIELDS,
+    'OPERATIONS_REQUEST_INVALID',
+    label,
+  )
+  const countryCode = textValue(
+    input.countryCode,
+    `${label} country`,
+    2,
+  ).toUpperCase()
+  if (countryCode !== 'US') {
+    requestError(
+      'OPERATIONS_REQUEST_INVALID',
+      `${label} must use the currently supported US production carrier lane`,
+    )
+  }
+  const region = textValue(input.region, `${label} region`, 2).toUpperCase()
+  if (!/^[A-Z]{2}$/.test(region)) {
+    requestError('OPERATIONS_REQUEST_INVALID', `${label} region is invalid`)
+  }
+  if (typeof input.residential !== 'boolean') {
+    requestError(
+      'OPERATIONS_REQUEST_INVALID',
+      `${label} residential classification is required`,
+    )
+  }
+  return {
+    contactName: textValue(input.contactName, `${label} contact name`, 100),
+    companyName: textValue(
+      input.companyName,
+      `${label} company name`,
+      120,
+      false,
+    ) || null,
+    phone: textValue(input.phone, `${label} phone`, 40, false) || null,
+    email: textValue(input.email, `${label} email`, 254, false) || null,
+    line1: textValue(input.line1, `${label} line 1`, 160),
+    line2: textValue(input.line2, `${label} line 2`, 120, false) || null,
+    line3: textValue(input.line3, `${label} line 3`, 120, false) || null,
+    city: textValue(input.city, `${label} city`, 100),
+    region,
+    postalCode: textValue(input.postalCode, `${label} postal code`, 32),
+    countryCode: 'US',
+    residential: input.residential,
+  }
+}
+
 function proofLinesValue(input: Record<string, unknown>): MockOperationsProofLineInput[] {
   const hasLines = input.lines !== undefined
   const hasLegacyLine = input.productGlobalId !== undefined
@@ -494,10 +668,41 @@ function errorResponse(error: unknown) {
   if (error instanceof OperationsRequestError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
+  if (error instanceof CommerceActiveTransitionPersistenceError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
+  if (error instanceof SandboxCommerceE2eAuthorizationError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
+  if (
+    error instanceof CarrierIntegrationRequestError
+    || error instanceof ActiveFulfillmentExecutionPreparationError
+    || error instanceof ProductionFulfillmentReratePersistenceError
+    || error instanceof ProductionFulfillmentRerateExecutionError
+  ) {
+    return json({
+      ok: false,
+      error: error.message,
+      code: error.code,
+      ...(
+        error instanceof ProductionFulfillmentRerateExecutionError
+        && error.attemptGlobalId
+          ? { attemptGlobalId: error.attemptGlobalId }
+          : {}
+      ),
+    }, error.status)
+  }
   const code = error instanceof Error && /^OPERATIONS_[A-Z_]+$/.test(error.message)
     ? error.message
     : 'OPERATIONS_REQUEST_FAILED'
   const status = code === 'OPERATIONS_REQUEST_FAILED' ? 500 : 400
+  if (status === 500) {
+    console.error('[operations] unhandled request failure', {
+      name: error instanceof Error ? error.name : typeof error,
+      message: error instanceof Error ? error.message : 'Unknown error',
+      stack: error instanceof Error ? error.stack : undefined,
+    })
+  }
   return json({ ok: false, error: status === 500 ? 'Operations request failed' : code, code }, status)
 }
 
@@ -531,13 +736,21 @@ export async function GET(req: NextRequest) {
     }
     const operations = await readOperationsWorkspaceFromPostgres({
       organizationId: activeOperationsOrganizationId(actor),
+      actorEmail: actor.email,
       capabilities,
       search,
       status: statusValue || null,
       exceptionStatus: (exceptionStatusValue as OperationsExceptionStatus) || null,
       selectedOrderGlobalId: selectedValue || null,
     })
-    return json({ ok: true, operations })
+    return json({
+      ok: true,
+      operations,
+      runtime: {
+        commerceFulfillmentRecoveryEnabled:
+          commerceFulfillmentRecoveryRuntimeAvailable(),
+      },
+    })
   } catch (error) {
     return errorResponse(error)
   }
@@ -859,6 +1072,50 @@ export async function POST(req: NextRequest) {
       })
       return json({ ok: true, capabilities, result }, result.duplicate ? 200 : 201)
     }
+    if (action === 'plan-order') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to plan warehouse work',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'orderGlobalId',
+          'cartonizationEvidenceGlobalId',
+          'expectedRowVersion',
+          'reason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await planOperationsOrderFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+        cartonizationEvidenceGlobalId: globalIdValue(
+          body.cartonizationEvidenceGlobalId,
+          'Cartonization evidence',
+          CARTONIZATION_EVIDENCE_GLOBAL_ID,
+        ),
+        expectedRowVersion: integerValue(
+          body.expectedRowVersion,
+          'Order version',
+          0,
+          2_147_483_647,
+        ),
+        reason: textValue(body.reason, 'Planning reason', 500),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
     if (action === 'release-order') {
       if (!capabilities.canManage || !capabilities.canExecute) {
         return json({
@@ -931,11 +1188,280 @@ export async function POST(req: NextRequest) {
       })
       return json({ ok: true, capabilities, result })
     }
+    if (action === 'authorize-sandbox-commerce-e2e') {
+      if (!capabilities.canActivate || !capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'Only an authorized organization owner or administrator may authorize a sandbox commerce E2E test',
+          code: 'OPERATIONS_ACTIVATION_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action', 'orderGlobalId', 'confirmationStatement', 'reason',
+          'lifetimeMinutes',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await authorizeSandboxCommerceE2eInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+        confirmationStatement: body.confirmationStatement,
+        reason: textValue(body.reason, 'Sandbox E2E authorization reason', 500),
+        lifetimeMinutes: body.lifetimeMinutes === undefined
+          ? undefined
+          : integerValue(body.lifetimeMinutes, 'Authorization lifetime', 5, 1_440),
+      })
+      return json({ ok: true, capabilities, result }, 201)
+    }
+    if (action === 'prepare-shipment-execution') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to prepare Shadow shipment execution',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set(['action', 'orderGlobalId', 'expectedRowVersion', 'reason']),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await prepareOperationsShipmentExecutionFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+        expectedRowVersion: integerValue(
+          body.expectedRowVersion,
+          'Order version',
+          0,
+          2_147_483_647,
+        ),
+        reason: textValue(
+          body.reason,
+          'Shadow shipment-preparation reason',
+          500,
+        ),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json(
+        { ok: true, capabilities, result },
+        result.replayed ? 200 : 201,
+      )
+    }
+    if (action === 'prepare-active-fulfillment-execution') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to prepare Active fulfillment execution',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'shadowExecutionGlobalId',
+          'expectedActivationRevision',
+          'expectedOrderRowVersion',
+          'reason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result =
+        await prepareActiveFulfillmentExecutionFromShadowInPostgres({
+          organizationId: activeOperationsOrganizationId(actor),
+          shadowExecutionGlobalId: globalIdValue(
+            body.shadowExecutionGlobalId,
+            'Shadow fulfillment execution',
+            SHADOW_EXECUTION_GLOBAL_ID,
+          ),
+          expectedActivationRevision: integerValue(
+            body.expectedActivationRevision,
+            'Expected activation revision',
+            1,
+            2_147_483_647,
+          ),
+          expectedOrderRowVersion: integerValue(
+            body.expectedOrderRowVersion,
+            'Expected order row version',
+            0,
+            2_147_483_647,
+          ),
+          reason: textValue(
+            body.reason,
+            'Active fulfillment-preparation reason',
+            500,
+          ),
+          idempotencyKey: idempotencyKeyValue(req),
+          actorEmail: actor.email,
+        })
+      return json(
+        { ok: true, capabilities, result },
+        result.replayed ? 200 : 201,
+      )
+    }
+    if (action === 'execute-production-rerate') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to execute production carrier rating',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'activeExecutionGlobalId',
+          'activeShipmentGroupGlobalId',
+          'expectedActivationRevision',
+          'destination',
+          'currency',
+          'provider',
+          'integrationAccountGlobalId',
+          'carrierAccountGlobalId',
+          'origin',
+          'fedexPickupType',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const provider = textValue(body.provider, 'Carrier provider', 20)
+      if (provider !== 'ups_rest' && provider !== 'fedex_rest') {
+        requestError(
+          'OPERATIONS_REQUEST_INVALID',
+          'Carrier provider must be UPS REST or FedEx REST',
+        )
+      }
+      const currency = textValue(body.currency, 'Currency', 3).toUpperCase()
+      if (currency !== 'USD') {
+        requestError(
+          'OPERATIONS_REQUEST_INVALID',
+          'Production carrier rerating currently requires USD',
+        )
+      }
+      const fedexPickupType = textValue(
+        body.fedexPickupType,
+        'FedEx pickup type',
+        40,
+        false,
+      )
+      if (
+        fedexPickupType
+        && ![
+          'DROPOFF_AT_FEDEX_LOCATION',
+          'CONTACT_FEDEX_TO_SCHEDULE',
+          'USE_SCHEDULED_PICKUP',
+        ].includes(fedexPickupType)
+      ) {
+        requestError('OPERATIONS_REQUEST_INVALID', 'FedEx pickup type is invalid')
+      }
+      const result = await executeProductionFulfillmentRerate({
+        organizationId: activeOperationsOrganizationId(actor),
+        activeExecutionGlobalId: globalIdValue(
+          body.activeExecutionGlobalId,
+          'Active fulfillment execution',
+          ACTIVE_EXECUTION_GLOBAL_ID,
+        ),
+        activeShipmentGroupGlobalId: globalIdValue(
+          body.activeShipmentGroupGlobalId,
+          'Active shipment group',
+          ACTIVE_SHIPMENT_GROUP_GLOBAL_ID,
+        ),
+        expectedActivationRevision: integerValue(
+          body.expectedActivationRevision,
+          'Expected activation revision',
+          1,
+          2_147_483_647,
+        ),
+        destination: carrierDispatchAddressValue(body.destination, 'Destination'),
+        currency,
+        provider,
+        integrationAccountGlobalId: globalIdValue(
+          body.integrationAccountGlobalId,
+          'Carrier integration account',
+          INTEGRATION_ACCOUNT_GLOBAL_ID,
+        ),
+        carrierAccountGlobalId: globalIdValue(
+          body.carrierAccountGlobalId,
+          'Carrier account',
+          CARRIER_ACCOUNT_GLOBAL_ID,
+        ),
+        origin: carrierDispatchAddressValue(body.origin, 'Origin'),
+        fedexPickupType: fedexPickupType
+          ? fedexPickupType as
+            | 'DROPOFF_AT_FEDEX_LOCATION'
+            | 'CONTACT_FEDEX_TO_SCHEDULE'
+            | 'USE_SCHEDULED_PICKUP'
+          : null,
+        idempotencyKey: idempotencyKeyValue(req),
+        actorEmail: actor.email,
+      })
+      return json({ ok: true, capabilities, result }, 201)
+    }
+    if (action === 'select-production-rerate-offer') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to select a production carrier service',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'rerateRunGlobalId',
+          'offerGlobalId',
+          'selectionReason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await selectProductionFulfillmentRerateOfferInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        rerateRunGlobalId: globalIdValue(
+          body.rerateRunGlobalId,
+          'Production rerate run',
+          PRODUCTION_RERATE_RUN_GLOBAL_ID,
+        ),
+        offerGlobalId: globalIdValue(
+          body.offerGlobalId,
+          'Production rerate offer',
+          PRODUCTION_RERATE_OFFER_GLOBAL_ID,
+        ),
+        selectionReason: textValue(
+          body.selectionReason,
+          'Production carrier service selection reason',
+          500,
+        ),
+        idempotencyKey: idempotencyKeyValue(req),
+        selectedBy: actor.email,
+      })
+      return json(
+        { ok: true, capabilities, result },
+        result.replayed ? 200 : 201,
+      )
+    }
     if (action === 'generate-packing-slip') {
       if (!capabilities.canManage || !capabilities.canExecute) {
         return json({
           ok: false,
-          error: 'You do not have permission to generate warehouse packing lists',
+          error: 'You do not have permission to generate Pack Work Instructions',
           code: 'OPERATIONS_EXECUTE_REQUIRED',
         }, 403)
       }
@@ -989,6 +1515,10 @@ export async function POST(req: NextRequest) {
           'expectedRowVersion',
           'reason',
           'preferredPrinterGlobalId',
+          'sandboxE2eAuthorizationGlobalId',
+          'expectedNotificationPolicyRevision',
+          'customerNotificationOverride',
+          'customerNotificationOverrideReason',
         ]),
         'OPERATIONS_REQUEST_INVALID',
         'Operations command',
@@ -1004,6 +1534,60 @@ export async function POST(req: NextRequest) {
           'Preferred printer',
           PRINTER_GLOBAL_ID,
         ),
+        sandboxE2eAuthorizationGlobalId: optionalGlobalIdValue(
+          body.sandboxE2eAuthorizationGlobalId,
+          'Sandbox E2E authorization',
+          /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
+        ),
+        expectedNotificationPolicyRevision:
+          body.expectedNotificationPolicyRevision === undefined
+            || body.expectedNotificationPolicyRevision === null
+            ? null
+            : integerValue(
+                body.expectedNotificationPolicyRevision,
+                'Fulfillment notification policy revision',
+                0,
+                2_147_483_647,
+              ),
+        customerNotificationOverride: optionalBooleanValue(
+          body.customerNotificationOverride,
+          'Customer notification override',
+        ),
+        customerNotificationOverrideReason: body.customerNotificationOverrideReason
+          === undefined || body.customerNotificationOverrideReason === null
+          ? null
+          : textValue(
+              body.customerNotificationOverrideReason,
+              'Customer notification exception reason',
+              500,
+            ),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'retry-commerce-fulfillment-export') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to retry commerce fulfillment exports',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set(['action', 'commerceExportGlobalId', 'reason']),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await retryOperationsCommerceFulfillmentExportFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        commerceExportGlobalId: globalIdValue(
+          body.commerceExportGlobalId,
+          'Commerce fulfillment export',
+          /^gfe(?:[0-9]{7}|[0-9a-v]{12})$/,
+        ),
+        reason: textValue(body.reason, 'Commerce fulfillment retry reason', 500),
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })
@@ -1026,6 +1610,8 @@ export async function POST(req: NextRequest) {
           'carrierRateGlobalId',
           'carrierAccountGlobalId',
           'preferredPrinterGlobalId',
+          'packageGlobalId',
+          'sandboxE2eAuthorizationGlobalId',
         ]),
         'OPERATIONS_REQUEST_INVALID',
         'Operations command',
@@ -1046,6 +1632,16 @@ export async function POST(req: NextRequest) {
           body.preferredPrinterGlobalId,
           'Preferred printer',
           PRINTER_GLOBAL_ID,
+        ),
+        packageGlobalId: optionalGlobalIdValue(
+          body.packageGlobalId,
+          'Package',
+          PACKAGE_GLOBAL_ID,
+        ),
+        sandboxE2eAuthorizationGlobalId: optionalGlobalIdValue(
+          body.sandboxE2eAuthorizationGlobalId,
+          'Sandbox E2E authorization',
+          /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
         ),
         idempotencyKey: idempotencyKeyValue(req),
       })
@@ -1096,6 +1692,133 @@ export async function POST(req: NextRequest) {
       })
       return json({ ok: true, capabilities, result })
     }
+    if (action === 'prepare-commerce-active-authorization') {
+      if (!capabilities.canActivate) {
+        return json({
+          ok: false,
+          error: 'Only an organization owner or authorized administrator may prepare Operations Active mode',
+          code: 'OPERATIONS_ACTIVATION_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'expectedActivationState',
+          'expectedActivationRevision',
+          'selectedAccounts',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      if (textValue(body.expectedActivationState, 'Expected activation state', 20) !== 'shadow') {
+        requestError(
+          'COMMERCE_ACTIVE_SHADOW_REQUIRED',
+          'Return Operations to Shadow before preparing Active provider writes',
+          409,
+        )
+      }
+      const prepared = await prepareCommerceActiveTransitionInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        expectedActivationState: 'shadow',
+        expectedActivationRevision: integerValue(
+          body.expectedActivationRevision,
+          'Expected activation revision',
+          1,
+          2_147_483_647,
+        ),
+        selectedAccounts: commerceActiveSelectedAccountsValue(
+          body.selectedAccounts,
+        ),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      const result = {
+        ...prepared,
+        accounts: prepared.accounts.map((account) => ({
+          accountGlobalId: account.accountGlobalId,
+          provider: account.provider,
+          environment: account.environment,
+          externalAccountId: account.externalAccountId,
+          credentialGeneration: account.credentialGeneration,
+          authMode: account.authMode,
+          priorAccountStatus: account.priorAccountStatus,
+          targetAccountStatus: account.targetAccountStatus,
+          grantedScopes: account.grantedScopes,
+          grantedScopeDigest: account.grantedScopeDigest,
+          writeCapabilities: account.writeCapabilities,
+          capabilityDigest: account.capabilityDigest,
+        })),
+      }
+      return json(
+        { ok: true, capabilities, result },
+        prepared.replayed ? 200 : 201,
+      )
+    }
+    if (action === 'activate-commerce-with-authorization') {
+      if (!capabilities.canActivate) {
+        return json({
+          ok: false,
+          error: 'Only an organization owner or authorized administrator may activate Operations provider writes',
+          code: 'OPERATIONS_ACTIVATION_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'preparationGlobalId',
+          'expectedCohortHash',
+          'confirmActiveProviderWrites',
+          'reason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      if (body.confirmActiveProviderWrites !== true) {
+        requestError(
+          'COMMERCE_ACTIVE_CONFIRMATION_REQUIRED',
+          'Confirm the exact reviewed commerce accounts and provider-write capabilities before activating',
+        )
+      }
+      const preparationGlobalId = globalIdValue(
+        body.preparationGlobalId,
+        'Commerce Active preparation',
+        COMMERCE_ACTIVE_PREPARATION_GLOBAL_ID,
+      )
+      const expectedCohortHash = sha256Value(
+        body.expectedCohortHash,
+        'Expected commerce cohort hash',
+      )
+      const idempotencyKey = idempotencyKeyValue(req)
+      const authorization =
+        await authorizeCommerceActiveTransitionInPostgres({
+          organizationId: activeOperationsOrganizationId(actor),
+          actorEmail: actor.email,
+          preparationGlobalId,
+          expectedCohortHash,
+          idempotencyKey,
+        })
+      const transition =
+        await consumeCommerceActiveTransitionAuthorizationInPostgres({
+          organizationId: activeOperationsOrganizationId(actor),
+          actorEmail: actor.email,
+          authorizationGlobalId: authorization.authorizationGlobalId,
+          expectedCohortHash,
+          idempotencyKey,
+          reason: textValue(
+            body.reason,
+            'Activation reason',
+            500,
+            false,
+          ) || null,
+        })
+      return json({
+        ok: true,
+        capabilities,
+        result: { authorization, transition },
+      })
+    }
     if (action === 'update-activation') {
       if (!capabilities.canActivate) {
         return json({
@@ -1104,16 +1827,52 @@ export async function POST(req: NextRequest) {
           code: 'OPERATIONS_ACTIVATION_REQUIRED',
         }, 403)
       }
-      assertFields(body, new Set(['action', 'state', 'reason']), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'state',
+          'reason',
+          'expectedCurrentState',
+          'expectedCurrentRevision',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
       const state = textValue(body.state, 'Activation state', 20) as OperationsActivationState
       if (!ACTIVATION_STATES.has(state)) {
         requestError('OPERATIONS_ACTIVATION_STATE_INVALID', 'Operations activation state is invalid')
+      }
+      if (state === 'active') {
+        requestError(
+          'COMMERCE_ACTIVE_AUTHORIZATION_REQUIRED',
+          'Prepare and explicitly authorize the exact commerce provider-write cohort before activating Operations',
+          409,
+        )
+      }
+      const expectedCurrentState = textValue(
+        body.expectedCurrentState,
+        'Expected current activation state',
+        20,
+      ) as OperationsActivationState
+      if (!ACTIVATION_STATES.has(expectedCurrentState)) {
+        requestError(
+          'OPERATIONS_ACTIVATION_STATE_INVALID',
+          'Expected current activation state is invalid',
+        )
       }
       const result = await updateOperationsActivationInPostgres({
         organizationId: activeOperationsOrganizationId(actor),
         actorEmail: actor.email,
         state,
         reason: textValue(body.reason, 'Activation reason', 500, false) || null,
+        expectedCurrentState,
+        expectedCurrentRevision: integerValue(
+          body.expectedCurrentRevision,
+          'Expected current activation revision',
+          1,
+          2_147_483_647,
+        ),
       })
       return json({ ok: true, capabilities, result })
     }

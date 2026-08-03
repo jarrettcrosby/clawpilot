@@ -20,6 +20,7 @@ function mapping(
     isCurrent: true,
     sourceRevision: 'provider-revision-1',
     sourceHash: 'a'.repeat(64),
+    packEvidenceHash: 'c'.repeat(64),
     profileVersionId: '00000000-0000-4000-8000-000000000004',
     profileVersionGlobalId: 'gppv0000001',
     profileVersionRowVersion: 0,
@@ -38,6 +39,7 @@ function mapping(
     evidenceType: 'customer_confirmed',
     channelSourceRevision: 'provider-revision-1',
     channelSourceHash: 'a'.repeat(64),
+    channelPackEvidenceHash: 'c'.repeat(64),
     channelWeightGrams: 2_400,
     ...changes,
   }
@@ -153,15 +155,36 @@ test('recipe-only association requires exact source-bound catalog weight', () =>
   assert.equal(resolved.packaging, null)
 })
 
-test('fails closed when provider source evidence has changed', () => {
+test('non-pack catalog drift preserves physical pack readiness', () => {
   const resolved = resolveCommerceRuntimePack({
-    mapping: mapping({ channelSourceHash: 'b'.repeat(64) }),
+    mapping: mapping({
+      channelSourceRevision: 'provider-revision-2',
+      channelSourceHash: 'b'.repeat(64),
+    }),
+    providerUnitMultiplier: 12,
+    providerPackaging: null,
+  })
+  assert.equal(resolved.reason, 'resolved')
+})
+
+test('fails closed when pack-relevant provider evidence has changed', () => {
+  const resolved = resolveCommerceRuntimePack({
+    mapping: mapping({ channelPackEvidenceHash: 'd'.repeat(64) }),
     providerUnitMultiplier: 12,
     providerPackaging: null,
   })
   assert.equal(resolved.reason, 'mapping_stale')
   assert.equal(resolved.association, null)
   assert.equal(resolved.packaging, null)
+})
+
+test('fails closed when a current mapping lacks a pack fingerprint', () => {
+  const resolved = resolveCommerceRuntimePack({
+    mapping: mapping({ packEvidenceHash: null }),
+    providerUnitMultiplier: 12,
+    providerPackaging: null,
+  })
+  assert.equal(resolved.reason, 'mapping_stale')
 })
 
 test('fails closed for non-outer or nonconfirmed pack evidence', () => {

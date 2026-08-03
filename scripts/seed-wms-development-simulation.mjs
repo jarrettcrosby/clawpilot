@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import { createRequire } from 'node:module'
+import { globalIdPattern } from '../app_src/lib/globalIds.mjs'
 
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
 
@@ -18,12 +19,12 @@ const DEFAULT_ANCHOR_DATE = '2026-07-25'
 const ALLOWED_ENVIRONMENTS = new Set(['dev', 'development', 'local'])
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/
-const WAREHOUSE_GLOBAL_ID_PATTERN = /^gwh[0-9]{7}$/
-const LOCATION_GLOBAL_ID_PATTERN = /^gwl[0-9]{7}$/
-const INVENTORY_POOL_GLOBAL_ID_PATTERN = /^gip[0-9]{7}$/
-const INVENTORY_POSITION_GLOBAL_ID_PATTERN = /^giv[0-9]{7}$/
-const PRINTER_GLOBAL_ID_PATTERN = /^gpr[0-9]{7}$/
-const PRINT_AGENT_GLOBAL_ID_PATTERN = /^gpt[0-9]{7}$/
+const WAREHOUSE_GLOBAL_ID_PATTERN = globalIdPattern('gwh')
+const LOCATION_GLOBAL_ID_PATTERN = globalIdPattern('gwl')
+const INVENTORY_POOL_GLOBAL_ID_PATTERN = globalIdPattern('gip')
+const INVENTORY_POSITION_GLOBAL_ID_PATTERN = globalIdPattern('giv')
+const PRINTER_GLOBAL_ID_PATTERN = globalIdPattern('gpr')
+const PRINT_AGENT_GLOBAL_ID_PATTERN = globalIdPattern('gpt')
 const FALSE_PERMISSIONS = Object.freeze({
   inviteUsers: false,
   manageUserAccess: false,

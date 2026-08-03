@@ -15,7 +15,7 @@ app_visible: false
 
 ClawPilot separates carrier-rate authority, carrier-account ownership, shipment matching, shipper assignment, and financial settlement. None can be inferred from CRM hierarchy or from another step succeeding.
 
-This is the contract for the current development slice. Migrations `0089_operations_rate_delegation_and_carrier_settlement.sql` and `0090_operations_carrier_accounts_and_gl_coding.sql` provide the rate-network and operator-workbench foundation. Migration `0092_operations_carrier_billing_integrity.sql` binds each billing statement and charge to exact provider, environment, account, tracking, assignment, GL-run, reconciliation, and settlement evidence while preserving legacy rows for explicit backfill. The Operations workbench exposes the selected-batch GL Coding runner, pinned routing-rule versions, and manual orphan assignment. This is not evidence of a provider-specific live carrier-bill importer, final settlement approval, payout, or accounting export. Provider mechanics remain behind the [small parcel carrier adapter boundary](small-parcel-carrier-adapters.md), and the operator workflow is documented in [Printing, Carrier Billing, And GL Coding](../operations/printing-carrier-billing-and-gl-coding.md).
+This is the contract for the current development slice. Migrations `0089_operations_rate_delegation_and_carrier_settlement.sql` and `0090_operations_carrier_accounts_and_gl_coding.sql` provide the rate-network and operator-workbench foundation. Migration `0092_operations_carrier_billing_integrity.sql` binds each billing statement and charge to exact provider, environment, account, tracking, assignment, GL-run, reconciliation, and settlement evidence while preserving legacy rows for explicit backfill. Additive migration `0146_operations_pack_rate_pricing_semantics.sql` separates replay checkout and pre-label estimates from MUD, and `0147_operations_carrier_billing_mud.sql` adds append-only billing-time MUD evidence. The Operations workbench exposes the selected-batch GL Coding runner, pinned routing-rule versions, and manual orphan assignment. This is development-only evidence, not proof of a provider-specific live carrier-bill importer, final production settlement approval, payout, or accounting export. Provider mechanics remain behind the [small parcel carrier adapter boundary](small-parcel-carrier-adapters.md), and the operator workflow is documented in [Printing, Carrier Billing, And GL Coding](../operations/printing-carrier-billing-and-gl-coding.md).
 
 ## Rate Network
 
@@ -27,9 +27,22 @@ The economic path uses these stable role names:
 | Square | Reseller or 3PL | May receive and regrant authorized rate access within the same versioned path. |
 | Circle | Downstream shipper | Ends the path and receives the customer-facing charge. It cannot grant itself access. |
 
-A path is `Triangle -> zero or more Squares -> Circle`. Every hop has an active, versioned grant and its own ordered pricing directives. The root grant always begins at Triangle, descendant grants must continue the same carrier-account authorization, and cycles are rejected.
+A path is `Triangle -> zero or more Squares -> Circle`. Every hop has an
+active, versioned grant and its own ordered pricing directives. The root grant
+always begins at Triangle, descendant grants must continue the same
+carrier-account authorization, and cycles are rejected. Storing a directive on
+that path does not authorize quote-time MUD: an `actual_cost` MUD is selected
+and evaluated only after exact approved carrier billing. The current
+billing-time slice intentionally requires exactly one direct grant to the
+assigned Circle with one or more applicable `actual_cost` directives. Grants
+that have no applicable actual-cost directive do not create ambiguity; more
+than one eligible direct grant is blocked instead of selecting a price path
+implicitly.
 
-Triangle's platform fee is never implicit. The quote must retain a platform-fee directive and calculated value even when that value is `0`. Square fees are also explicit when a Square participates.
+Triangle's platform fee is never implicit. Any fee presented at quote time
+must retain its own explicit quote-time basis and value, including `0`, and
+must not be labeled as billing-time MUD. Square fees are also explicit when a
+Square participates.
 
 Carrier-account ownership is separate from the economic role path:
 
@@ -53,16 +66,22 @@ Sender has precedence when the registered address matches both sender and recipi
 
 ## Quotes And Economic Entries
 
-Carrier API quotes are pro forma. An immutable quote snapshot records the account and owner, Triangle/Square/Circle path, grant and directive versions, carrier and service, quoted carrier cost, explicit platform and reseller fees, customer charge, request hash, provider reference, expiration, and redacted evidence.
+Carrier API quotes are pro forma estimates. The immutable checkout snapshot
+records the customer-facing shipping charge separately from the selected
+checkout carrier estimate. A later pre-label rerate records a second estimate
+without replacing either checkout fact. Their signed comparisons are
+**estimated variances**, not realized margin, carrier-billed actual, or MUD.
 
-The quote establishes the expected economics:
+The quote establishes expected operational economics only. It does not prove
+what the carrier billed or create a final carrier payable. Any explicit
+quote-time platform or reseller fee remains visible with its own provenance,
+including a zero fee, but an `actual_cost` MUD is not evaluated at quote time.
+The immutable checkout shipping charge remains unchanged through fulfillment.
 
-- the carrier-account owner owes the carrier;
-- Circle reimburses the account owner for carrier cost;
-- Circle owes Triangle the explicit platform fee;
-- Circle owes each participating Square its explicit reseller fee.
-
-A zero platform fee remains visible in the quote and calculation provenance. Actual carrier cost comes only from carrier billing evidence and reconciliation; a later bill never rewrites the quote.
+Carrier-billed actual comes only from imported billing evidence whose charges
+have an exact current shipment match and approved GL Coding review. A later
+bill and any billing-time MUD calculation create new append-only facts; neither
+rewrites the checkout charge, checkout estimate, or pre-label estimate.
 
 ## Carrier CSV And GL Coding
 
@@ -77,6 +96,13 @@ Only operator-selected CSV batches run through GL Coding. GL Coding is the opera
 
 An unmatched charge remains an orphan with no shipment ID. A GL Coding rule or an authorized operator may assign that orphan to a Circle for billing, but the shipment match remains `unmatched`. Manual assignment requires an actor and reason. ClawPilot never creates a synthetic shipment match to make reconciliation totals close.
 
+CSV import alone does not establish carrier-billed actual for a shipment.
+Carrier-billed actual becomes eligible for MUD only when every included charge
+is retained exactly, the current shipment match is unambiguous, the exact
+shipper assignment is present, and the GL Coding review is approved. Assigning
+an unmatched orphan to a Circle does not satisfy the shipment-match
+requirement.
+
 ## Reconciliation, Settlement, And Rebill
 
 The financial flow is:
@@ -85,12 +111,33 @@ The financial flow is:
 2. Resolve every statement to its billed carrier account.
 3. Record charge lines, shipment-match decisions, and independent shipper assignments.
 4. Run the selected version of GL Coding and retain unresolved charges as orphans.
-5. Aggregate matched charge categories into actual carrier cost and compare it with the pro forma quote.
+5. After approval, aggregate the exactly matched retained charges into
+   carrier-billed actual and compare it with the immutable checkout shipping
+   charge; keep the checkout and pre-label estimate comparisons separate.
 6. Hold ambiguous matches, unresolved account ownership, assignment exceptions, or incomplete statements in `needs_review`.
-7. Finalize a versioned reconciliation snapshot only from retained evidence.
-8. Approve settlement changes and downstream billing/export separately.
+7. Evaluate MUD only when an approved, effective-as-of-shipment,
+   currency-matched
+   directive with `calculation_basis=actual_cost` applies to the exact
+   shipment and the single eligible direct shipper grant. A later version
+   whose effective window starts after `shipped_at` does not invalidate the
+   historical version that applied to that shipment. Retain the grant,
+   contract, directive version,
+   statement lineage, charge set, calculation snapshot, input hash, and actor.
+   Persist `not_configured` when no applicable directive exists and `blocked`
+   for invalid or ambiguous evidence.
+8. Finalize a versioned reconciliation snapshot only from retained evidence.
+9. Approve settlement changes and downstream billing/export separately.
 
-Nonzero carrier payable, account-owner reimbursement, platform fee, and reseller fee entries remain append-only. A zero platform fee remains explicit in quote and calculation evidence rather than disappearing from the rate path. A reconciled variance produces linked credit or rebill entries after approval. Settlement events record approval, billing, payment, dispute, resolution, reversal, or void without editing prior entries. Accounting export consumes approved entries; it does not define carrier cost or rate-path economics.
+Nonzero carrier payable, account-owner reimbursement, platform fee, and
+reseller fee entries remain append-only. A zero platform fee remains explicit
+in its applicable evidence rather than disappearing from the rate path.
+Checkout-to-carrier-actual and checkout-to-contract-bill variances are
+different facts; before approved carrier billing, only estimated variance
+exists. A reconciled variance produces linked credit or rebill entries after
+approval. Settlement events record approval, billing, payment, dispute,
+resolution, reversal, or void without editing prior entries. Accounting export
+consumes approved entries; it does not define carrier cost, manufacture MUD, or
+rewrite rate-path economics.
 
 ## Carrier Test Policy
 
@@ -108,7 +155,16 @@ A failed void or cancellation freezes further tests for that account until recon
 
 ## Remaining Delivery
 
-The working-tree foundation defines schema, append-only evidence, pure rate-path pricing, payer classification, statement grouping, selected-batch GL Coding, independent shipper assignment, manual orphan resolution, reconciliation calculations, multiple address-bound carrier-account administration, exact actual-cost provenance, and least-privilege capability enforcement. New integrity constraints are initially `NOT VALID` where historical rows require an explicit evidence backfill; new writes are still checked. It does not yet provide the production services that:
+The working-tree foundation defines schema, append-only evidence, separate
+checkout and pre-label estimate semantics, payer classification, statement
+grouping, selected-batch GL Coding, independent shipper assignment, manual
+orphan resolution, approved exact carrier-billed actuals, billing-time
+`actual_cost` MUD calculation or explicit `not_configured` evidence, multiple
+address-bound carrier-account administration, immutable calculation
+provenance, and least-privilege capability enforcement. New integrity
+constraints are initially `NOT VALID` where historical rows require an
+explicit evidence backfill; new writes are still checked. It does not yet
+provide the production services that:
 
 - parse and import provider-specific carrier CSV formats into immutable billing batches;
 - add rule simulation, accounting-catalog bindings, and GL dimensions beyond shipper assignment;

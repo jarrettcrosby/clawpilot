@@ -21,11 +21,11 @@ export const revalidate = 0
 export const runtime = 'nodejs'
 
 const MAX_REQUEST_BYTES = 32 * 1024
-const BILLING_BATCH_GLOBAL_ID = /^gcb\d{7}$/
-const BILLING_CHARGE_GLOBAL_ID = /^gcl\d{7}$/
-const GL_CODING_RUN_GLOBAL_ID = /^ggl\d{7}$/
-const RATE_PARTY_GLOBAL_ID = /^grp\d{7}$/
-const SETTLEMENT_GLOBAL_ID = /^gse\d{7}$/
+const BILLING_BATCH_GLOBAL_ID = /^gcb(?:[0-9]{7}|[0-9a-v]{12})$/
+const BILLING_CHARGE_GLOBAL_ID = /^gcl(?:[0-9]{7}|[0-9a-v]{12})$/
+const GL_CODING_RUN_GLOBAL_ID = /^ggl(?:[0-9]{7}|[0-9a-v]{12})$/
+const RATE_PARTY_GLOBAL_ID = /^grp(?:[0-9]{7}|[0-9a-v]{12})$/
+const SETTLEMENT_GLOBAL_ID = /^gse(?:[0-9]{7}|[0-9a-v]{12})$/
 
 function json(payload: Record<string, unknown>, status = 200) {
   return NextResponse.json(payload, {

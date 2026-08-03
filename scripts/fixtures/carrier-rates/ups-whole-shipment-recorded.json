@@ -1,0 +1,52 @@
+{
+  "RateResponse": {
+    "Response": {
+      "TransactionReference": {
+        "CustomerContext": "ClawPilot whole-shipment rate"
+      }
+    },
+    "RatedShipment": [
+      {
+        "Service": {
+          "Code": "03",
+          "Description": "UPS Ground"
+        },
+        "NegotiatedRateCharges": {
+          "TotalCharge": {
+            "MonetaryValue": "21.45",
+            "CurrencyCode": "USD"
+          }
+        },
+        "TimeInTransit": {
+          "ServiceSummary": {
+            "EstimatedArrival": {
+              "BusinessDaysInTransit": "3",
+              "Arrival": {
+                "Date": "20260803"
+              }
+            }
+          }
+        }
+      },
+      {
+        "Service": {
+          "Code": "02"
+        },
+        "TotalCharges": {
+          "MonetaryValue": "64.10",
+          "CurrencyCode": "USD"
+        },
+        "TimeInTransit": {
+          "ServiceSummary": {
+            "EstimatedArrival": {
+              "BusinessDaysInTransit": "2",
+              "Arrival": {
+                "Date": "20260802"
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

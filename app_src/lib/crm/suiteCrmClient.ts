@@ -1,5 +1,11 @@
 import type { CrmEntity, SuiteCrmOutboxRecord, SuiteCrmUserIdentityOutboxRecord } from '@/lib/crm/types'
 import { isIso4217CurrencyCode } from '@/lib/currency'
+import { publicCrmProductImageUrl } from '@/lib/crm/productImagePublic'
+import {
+  projectSuiteCrmNativeProductImage,
+  type SuiteCrmNativeProductImageResult,
+} from '@/lib/crm/suiteCrmNativeProductImageClient'
+import { appPublicUrl } from '@/lib/publicUrl'
 
 type SuiteCrmRecordModule =
   | 'Accounts'
@@ -248,7 +254,7 @@ export async function findSuiteCrmUser(input: {
 }, fetchImpl: typeof fetch = fetch): Promise<SuiteCrmUserMatch | null> {
   const email = String(input.email || '').trim().toLowerCase()
   const globalId = String(input.globalId || '').trim().toLowerCase()
-  if (globalId && !/^gu[0-9]{7}$/.test(globalId)) throw new Error('SuiteCRM user Global ID is invalid')
+  if (globalId && !/^gu(?:[0-9]{7}|[0-9a-v]{12})$/.test(globalId)) throw new Error('SuiteCRM user Global ID is invalid')
   if (!globalId && (!email || email.length > 254)) throw new Error('SuiteCRM user email is invalid')
   const field = globalId ? 'global_id_c' : 'email1'
   const value = globalId || email
@@ -393,10 +399,15 @@ function suiteCrmRecordModule(record: SuiteCrmOutboxRecord): SuiteCrmRecordModul
   return canonicalModule
 }
 
-export async function upsertSuiteCrmRecord(
+export type SuiteCrmUpsertResult = {
+  suiteCrmId: string
+  productImageProjection: SuiteCrmNativeProductImageResult | null
+}
+
+export async function upsertSuiteCrmRecordWithResult(
   record: SuiteCrmOutboxRecord,
   fetchImpl: typeof fetch = fetch,
-) {
+): Promise<SuiteCrmUpsertResult> {
   const moduleName = suiteCrmRecordModule(record)
   const existing = await request(
     `/Api/V8/module/${moduleName}/${encodeURIComponent(record.suiteCrmId)}`,
@@ -407,13 +418,23 @@ export async function upsertSuiteCrmRecord(
   const currencyId = record.currencyCode
     ? await resolveSuiteCrmCurrencyId(record.currencyCode, fetchImpl)
     : null
+  const attributes = { ...record.attributes }
+  if (record.productImage === null) {
+    attributes.product_image = ''
+  } else if (record.productImage !== undefined) {
+    attributes.product_image = publicCrmProductImageUrl({
+      publicOrigin: appPublicUrl(),
+      productReferenceCode: record.productImage.referenceCode,
+      contentSha256: record.productImage.contentSha256,
+    })
+  }
   const body = {
     data: {
       type: moduleName,
       id: record.suiteCrmId,
       attributes: currencyId
-        ? { ...record.attributes, currency_id: currencyId }
-        : record.attributes,
+        ? { ...attributes, currency_id: currencyId }
+        : attributes,
     },
   }
   const response = await request('/Api/V8/module', {
@@ -422,6 +443,9 @@ export async function upsertSuiteCrmRecord(
   }, fetchImpl) as JsonApiResponse
   const id = String(response?.data?.id || record.suiteCrmId)
   if (id !== record.suiteCrmId) throw new Error('SuiteCRM returned an unexpected record ID')
+  const productImageProjection = record.productImage !== undefined
+    ? await projectSuiteCrmNativeProductImage(record, fetchImpl)
+    : null
   for (const relationship of record.relationships || []) {
     const linkFieldName = relationship.linkFieldName
     if (!['accounts', 'contact', 'contacts', 'leads', 'opportunity'].includes(linkFieldName)) {
@@ -446,7 +470,14 @@ export async function upsertSuiteCrmRecord(
       }),
     }, fetchImpl)
   }
-  return id
+  return { suiteCrmId: id, productImageProjection }
+}
+
+export async function upsertSuiteCrmRecord(
+  record: SuiteCrmOutboxRecord,
+  fetchImpl: typeof fetch = fetch,
+) {
+  return (await upsertSuiteCrmRecordWithResult(record, fetchImpl)).suiteCrmId
 }
 
 export async function upsertSuiteCrmUserIdentity(
@@ -459,7 +490,7 @@ export async function upsertSuiteCrmUserIdentity(
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(suiteCrmUserId)) {
     throw new Error('SuiteCRM user identity has an invalid record ID')
   }
-  if (!/^gu[0-9]{7}$/.test(referenceCode)) {
+  if (!/^gu(?:[0-9]{7}|[0-9a-v]{12})$/.test(referenceCode)) {
     throw new Error('SuiteCRM user identity has an invalid Global ID')
   }
   if (username !== referenceCode) {

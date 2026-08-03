@@ -106,6 +106,21 @@ assert.match(
 )
 assert.match(
   adapter,
+  /exactIdentityGroups/,
+  'safe exact Shopify and Faire identifiers must be considered independently of display name',
+)
+assert.match(
+  adapter,
+  /ambiguous_exact_identifier/,
+  'an identifier shared by multiple products must remain blocked for explicit review',
+)
+assert.match(
+  adapter,
+  /input\.evidenceType === 'operator_confirmed'[\s\S]*normalizedDisplayName\(requestedCanonical\)/,
+  'name equality must gate name-only reconciliation without blocking exact identifier evidence',
+)
+assert.match(
+  adapter,
   /currentCandidateEvidence/,
   'the committed alias must retain current candidate revisions and hashes',
 )
@@ -244,6 +259,73 @@ new Function('require', 'module', 'exports', compiled)(
   runtimeModule.exports,
 )
 const runtime = runtimeModule.exports
+
+const identityRecord = (input) => ({
+  id: input.id,
+  globalId: `gp-${input.id}`,
+  name: input.name,
+  requestedName: input.name,
+  sku: input.sku,
+  sourceHash: `hash-${input.id}`,
+  updatedAt: '2026-07-31T12:00:00.000Z',
+  providers: [input.provider],
+  mappingGlobalIds: [`gpm-${input.id}`],
+  channelSkus: input.sku ? [input.sku] : [],
+  barcodes: input.barcode ? [input.barcode] : [],
+  packEvidence: { status: 'unknown', profiles: [] },
+  operationalReferenceCount: 0,
+})
+const exactCrossProviderSuggestions =
+  runtime.buildProductIdentitySuggestions({
+    pipelineId: 'pipeline-1',
+    records: [
+      identityRecord({
+        id: 'shopify',
+        name: 'Shopify merchandising title',
+        sku: 'AG-CASE-12',
+        provider: 'shopify',
+      }),
+      identityRecord({
+        id: 'faire',
+        name: 'Faire wholesale title',
+        sku: 'ag-case-12',
+        provider: 'faire',
+      }),
+    ],
+  })
+assert.equal(
+  exactCrossProviderSuggestions.length,
+  1,
+  'A unique cross-provider exact SKU must be exposed despite different names',
+)
+assert.equal(exactCrossProviderSuggestions[0].evidenceType, 'exact_sku')
+assert.equal(exactCrossProviderSuggestions[0].canApply, true)
+const ambiguousCrossProviderSuggestions =
+  runtime.buildProductIdentitySuggestions({
+    pipelineId: 'pipeline-1',
+    records: [
+      ...[
+        ['shopify-a', 'Shopify A'],
+        ['shopify-b', 'Shopify B'],
+      ].map(([id, name]) => identityRecord({
+        id,
+        name,
+        sku: 'AMBIGUOUS-SKU',
+        provider: 'shopify',
+      })),
+      identityRecord({
+        id: 'faire-ambiguous',
+        name: 'Faire title',
+        sku: 'AMBIGUOUS-SKU',
+        provider: 'faire',
+      }),
+    ],
+  })
+assert.equal(
+  ambiguousCrossProviderSuggestions.length,
+  0,
+  'An identifier owned by multiple provider products must never create an automatic merge suggestion',
+)
 
 assert.equal(
   runtime.archivedProductIdentityName({

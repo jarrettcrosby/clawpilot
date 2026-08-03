@@ -27,6 +27,7 @@ export type CommerceRuntimePackMapping = {
   isCurrent: boolean
   sourceRevision: string | null
   sourceHash: string | null
+  packEvidenceHash: string | null
   profileVersionId: string
   profileVersionGlobalId: string
   profileVersionRowVersion: number
@@ -45,6 +46,7 @@ export type CommerceRuntimePackMapping = {
   evidenceType: string
   channelSourceRevision: string | null
   channelSourceHash: string | null
+  channelPackEvidenceHash: string | null
   channelWeightGrams: number | null
 }
 
@@ -119,10 +121,8 @@ export function resolveCommerceRuntimePack(input: {
   if (
     !mapping.isCurrent
     || mapping.projectionState !== 'current'
-    || !mapping.sourceRevision
-    || !mapping.sourceHash
-    || mapping.sourceRevision !== mapping.channelSourceRevision
-    || mapping.sourceHash !== mapping.channelSourceHash
+    || !mapping.packEvidenceHash
+    || mapping.packEvidenceHash !== mapping.channelPackEvidenceHash
   ) {
     return {
       association: null,
