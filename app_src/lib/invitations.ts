@@ -12,7 +12,7 @@ import {
   inviteAppUser,
   normalizeUserEmail,
   resolveAppUserActor,
-  restoreInvitedUserAssignment,
+  restoreInvitedUserAssignments,
   type AppUser,
   type AppUserMembershipSnapshot,
 } from '@/lib/users'
@@ -45,12 +45,23 @@ function tokenDigest(token: string): string {
   return crypto.createHash('sha256').update(`clawpilot-user-invitation:v1\n${token}`).digest('hex')
 }
 
+function normalizeOrganizationIds(value: unknown): string[] {
+  const raw = Array.isArray(value) ? value : value == null ? [] : [value]
+  const seen = new Set<string>()
+  for (const candidate of raw) {
+    const organizationId = String(candidate || '').trim()
+    if (organizationId) seen.add(organizationId)
+  }
+  return [...seen]
+}
+
 async function claimInvitation(input: {
   email: string
   actorEmail: string
   digest: string
   fromAddress: string
   organizationId: string
+  organizationIds: string[]
 }): Promise<IssuedInvitationRow> {
   return withTransaction(async (client) => {
     await client.query('SELECT email FROM app_users WHERE email = $1 FOR UPDATE', [input.email])
@@ -94,11 +105,11 @@ async function claimInvitation(input: {
     const issued = await client.query<IssuedInvitationRow>(
       `
         INSERT INTO app_user_invitations (
-          email, invited_by, workspace_organization_id, token_digest, from_address, expires_at, supersedes_id,
+          email, invited_by, workspace_organization_id, workspace_organization_ids, token_digest, from_address, expires_at, supersedes_id,
           delivery_pending_at, revoked_at, created_at, updated_at
         )
         VALUES (
-          $1, $2, $3::uuid, $4, $5, now() + ($6::text || ' days')::interval, $7::uuid,
+          $1, $2, $3::uuid, $4::uuid[], $5, $6, now() + ($7::text || ' days')::interval, $8::uuid,
           now(), now(), now(), now()
         )
         RETURNING id::text, expires_at::text, supersedes_id::text
@@ -107,6 +118,7 @@ async function claimInvitation(input: {
         input.email,
         input.actorEmail,
         input.organizationId,
+        input.organizationIds,
         input.digest,
         input.fromAddress,
         String(INVITATION_LIFETIME_DAYS),
@@ -235,6 +247,7 @@ export async function createUserInvitation(input: {
   actorEmail: unknown
   email: unknown
   organizationId?: unknown
+  organizationIds?: unknown
   createOrganization?: unknown
   organizationName?: unknown
   parentOrganizationId?: unknown
@@ -254,12 +267,21 @@ export async function createUserInvitation(input: {
   let userCreated = false
   let previousInvitedBy: string | null = null
   let previousMembership: AppUserMembershipSnapshot | null = null
+  let previousMemberships: Array<{
+    organizationId: string
+    previousMembership: AppUserMembershipSnapshot | null
+  }> = []
   let invitation: IssuedInvitationRow | null = null
+  const requestedOrganizationIds = normalizeOrganizationIds(input.organizationIds)
+  const organizationIds = requestedOrganizationIds.includes(assignment.organization.id)
+    ? requestedOrganizationIds
+    : [assignment.organization.id, ...requestedOrganizationIds]
   try {
     const invited = await inviteAppUser({
       actorEmail: actor,
       email,
-      organizationId: assignment.organization.id,
+      organizationIds,
+      createOrganization: input.createOrganization,
       crmUserEnabled: input.crmUserEnabled,
       demoAccess: input.demoAccess,
     })
@@ -267,6 +289,7 @@ export async function createUserInvitation(input: {
     userCreated = invited.created
     previousInvitedBy = invited.previousInvitedBy
     previousMembership = invited.previousMembership
+    previousMemberships = invited.previousMemberships
     const token = crypto.randomBytes(32).toString('base64url')
     const digest = tokenDigest(token)
     const fromAddress = mailFromAddress()
@@ -277,6 +300,7 @@ export async function createUserInvitation(input: {
       digest,
       fromAddress,
       organizationId: assignment.organization.id,
+      organizationIds,
     })
     const welcomeUrl = new URL('/welcome', publicUrl)
     welcomeUrl.hash = `token=${encodeURIComponent(token)}`
@@ -304,11 +328,17 @@ export async function createUserInvitation(input: {
   } catch (error) {
     if (user) await rollbackInvitation({ invitation, email: user.email, deleteUser: userCreated })
     if (user && !userCreated) {
-      await restoreInvitedUserAssignment({
+      const scopedPreviousMemberships = previousMemberships
+      if (!scopedPreviousMemberships.length) {
+        scopedPreviousMemberships.push({
+          organizationId: assignment.organization.id,
+          previousMembership,
+        })
+      }
+      await restoreInvitedUserAssignments({
         email: user.email,
-        organizationId: assignment.organization.id,
+        memberships: scopedPreviousMemberships,
         invitedBy: previousInvitedBy,
-        previousMembership,
       })
     }
     if (assignment.created) await retireUnusedWorkspaceOrganization(assignment.organization.id)

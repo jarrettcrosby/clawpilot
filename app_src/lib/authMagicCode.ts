@@ -210,7 +210,12 @@ export async function requestInvitationAuthMagicCode(input: {
           SELECT 1
           FROM app_user_organization_memberships membership
           WHERE membership.user_email = invitation.email
-            AND membership.organization_id = invitation.workspace_organization_id
+            AND membership.organization_id = ANY(
+              COALESCE(
+                invitation.workspace_organization_ids,
+                ARRAY[invitation.workspace_organization_id]::uuid[]
+              )
+            )
             AND membership.status = 'invited'
         )
       LIMIT 1
@@ -307,12 +312,13 @@ export async function verifyAuthMagicCode(
       if (verified.purpose === 'invitation') {
         const invitation = await client.query<{
           id: string
+          workspace_organization_ids: string[] | null
           workspace_organization_id: string
         }>(
           `
-            UPDATE app_user_invitations
+            UPDATE app_user_invitations AS invitation
             SET accepted_at = now(), updated_at = now()
-            WHERE id = $1::uuid
+            WHERE invitation.id = $1::uuid
               AND email = $2
               AND accepted_at IS NULL
               AND revoked_at IS NULL
@@ -320,24 +326,45 @@ export async function verifyAuthMagicCode(
               AND expires_at > now()
               AND EXISTS (
                 SELECT 1
-                FROM app_user_organization_memberships membership
-                WHERE membership.user_email = $2
-                  AND membership.organization_id = app_user_invitations.workspace_organization_id
+                  FROM app_user_organization_memberships membership
+                  WHERE membership.user_email = $2
+                    AND (
+                    membership.organization_id = invitation.workspace_organization_id
+                    OR membership.organization_id = ANY(
+                    COALESCE(
+                      invitation.workspace_organization_ids,
+                      ARRAY[invitation.workspace_organization_id]::uuid[]
+                    )
+                  )
+                    )
                   AND membership.status = 'invited'
               )
-            RETURNING id::text, workspace_organization_id::text
+            RETURNING id::text, invitation.workspace_organization_id::text,
+              invitation.workspace_organization_ids::uuid[]
           `,
           [verified.invitation_id, requestedEmail],
         )
         if (!invitation.rows[0]) throw new Error(AUTHORIZATION_CHANGED)
+        const inviteOrganizationIds = [
+          invitation.rows[0].workspace_organization_id,
+          ...(invitation.rows[0].workspace_organization_ids || []),
+        ]
         const activatedMembership = await client.query(
           `UPDATE app_user_organization_memberships
            SET status = 'active', updated_at = now()
            WHERE user_email = $1
              AND organization_id = $2::uuid
+             AND (
+               organization_id = $2::uuid
+               OR organization_id = ANY($3::uuid[])
+             )
              AND status = 'invited'
-           RETURNING organization_id`,
-          [requestedEmail, invitation.rows[0].workspace_organization_id],
+           RETURNING organization_id::text`,
+          [
+            requestedEmail,
+            invitation.rows[0].workspace_organization_id,
+            inviteOrganizationIds,
+          ],
         )
         if (!activatedMembership.rows[0]) throw new Error(AUTHORIZATION_CHANGED)
         const activated = await client.query(

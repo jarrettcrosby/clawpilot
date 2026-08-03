@@ -554,6 +554,8 @@ includes(adminRoute, [
   'acceptedReceiptTopics: SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS',
   '...COMMERCE_CUSTOM_INTEGRATION_ONBOARDING',
   'callbackUrl: faireOAuthCallbackUrl()',
+  'providerScopes: SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES',
+  'providerScopes: FAIRE_API_SCOPES',
 ], 'Commerce admin route')
 const faireApiKeyRouteSource = adminRoute.slice(
   adminRoute.indexOf("if (action === 'connect-faire-api-key')"),
@@ -753,6 +755,12 @@ includes(panel, [
   'const actionError = actionableCommerceError(requestError)',
   'await requestCommerce()',
   'Revoke or remove provider-side access separately',
+  'Open setup checklist',
+  'Provider scopes and permissions',
+  'setupChecklistCatalog?.requiredBeforeConnect',
+  'Open setup checklist',
+  'setupChecklistProvider',
+  'catalog?.providers.shopify.providerScopes',
   'Optional signed receipt setup',
   'Copy URL',
   'Distributed Operations scope profile',

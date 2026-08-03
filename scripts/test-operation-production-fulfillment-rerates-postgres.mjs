@@ -2103,7 +2103,8 @@ async function verifyAcceptance(databaseUrl) {
                   2, 'prepared', environment, selected_provider,
                   '02', 'UPS 2nd Day Air', package_count, adapter_version,
                   'changed-direct-retry-lineage', request_hash,
-                  redacted_request, actor_email, clock_timestamp()
+                  redacted_request, actor_email,
+                  GREATEST(clock_timestamp(), completed_at)
            FROM operations_active_carrier_group_attempts
            WHERE organization_id = $1 AND id = $2`,
           [ids.organization, preparedDispatch.id],

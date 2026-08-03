@@ -64,6 +64,7 @@ export async function POST(req: NextRequest) {
       actorEmail: actor,
       email: body?.email,
       organizationId: body?.organizationId,
+      organizationIds: body?.organizationIds,
       createOrganization: body?.createOrganization === true,
       organizationName: body?.organizationName,
       parentOrganizationId: body?.parentOrganizationId,

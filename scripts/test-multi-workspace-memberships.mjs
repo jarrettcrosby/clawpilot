@@ -206,6 +206,49 @@ for (const fragment of [
   assertIncludes(users, fragment, 'membership-scoped user invitation')
 }
 
+const usersRoute = read('app_src/app/api/users/route.ts')
+for (const fragment of [
+  'organizationIds',
+  'createOrganization: body?.createOrganization === true',
+  'createOrganization',
+]) {
+  assertIncludes(usersRoute, fragment, 'users invite multi-organization request payload')
+}
+
+const userInviteDialog = read('app_src/components/settings/UserAccessDialog.tsx')
+for (const fragment of [
+  'Add additional organizations',
+  'organizationIds',
+  'inviteOrganizationOptions',
+]) {
+  assertIncludes(userInviteDialog, fragment, 'multi-organization invite UI controls')
+}
+
+const commerceComponents = read('app_src/components/settings/CommerceIntegrationPanel.tsx')
+for (const fragment of [
+  'Open setup checklist',
+  'setupChecklistProvider',
+  'Copy scope list',
+  'providerScopes',
+  'requiredBeforeConnect',
+]) {
+  assertIncludes(commerceComponents, fragment, 'commerce setup checklist UX')
+}
+
+const invitations = read('app_src/lib/invitations.ts')
+for (const fragment of [
+  'workspace_organization_ids',
+  'organizationIds',
+  'assignment.organization.id',
+]) {
+  assertIncludes(invitations, fragment, 'invitation multi-org persistence')
+}
+
+assert.ok(
+  fs.existsSync(path.join(root, 'db/migrations/0235_app_user_invitation_organization_ids.sql')),
+  'multi-org invitation migration must be present',
+)
+
 const authMagicCode = read('app_src/lib/authMagicCode.ts')
 for (const fragment of [
   'membership.organization_id = invitation.workspace_organization_id',

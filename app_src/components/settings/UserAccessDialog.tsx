@@ -14,6 +14,7 @@ import DialogTitle from '@mui/material/DialogTitle'
 import Divider from '@mui/material/Divider'
 import FormControlLabel from '@mui/material/FormControlLabel'
 import IconButton from '@mui/material/IconButton'
+import Checkbox from '@mui/material/Checkbox'
 import MenuItem from '@mui/material/MenuItem'
 import Stack from '@mui/material/Stack'
 import Switch from '@mui/material/Switch'
@@ -415,6 +416,7 @@ export default function UserAccessDialog({
   const [inviteCrmEmployee, setInviteCrmEmployee] = useState(false)
   const [inviteDemoAccess, setInviteDemoAccess] = useState(false)
   const [inviteOrganizationId, setInviteOrganizationId] = useState('')
+  const [inviteAdditionalOrganizationIds, setInviteAdditionalOrganizationIds] = useState<string[]>([])
   const [newOrganizationName, setNewOrganizationName] = useState('')
   const [newOrganizationParentId, setNewOrganizationParentId] = useState('')
   const [createNames, setCreateNames] = useState({ board: '', pipeline: '' })
@@ -452,6 +454,26 @@ export default function UserAccessDialog({
     [profile.locale],
   )
 
+  const inviteOrganizationOptions = useMemo(
+    () => usersPayload?.workspaceOrganizations || [],
+    [usersPayload?.workspaceOrganizations],
+  )
+  const additionalOrganizationOptions = inviteOrganizationOptions.filter((organization) => (
+    organization.id !== inviteOrganizationId && organization.id !== NEW_ORGANIZATION
+  ))
+
+  function toggleAdditionalInviteOrganization(organizationId: string, isSelected: boolean) {
+    setInviteAdditionalOrganizationIds((current) => {
+      const next = new Set(
+        current.filter((id) => id !== organizationId && id !== inviteOrganizationId),
+      )
+      if (isSelected) {
+        next.add(organizationId)
+      }
+      return Array.from(next)
+    })
+  }
+
   const persistedProfile = currentUser ? profileFrom(currentUser) : EMPTY_PROFILE
   const profileDirty = currentUser
     ? profile.displayName.trim() !== persistedProfile.displayName
@@ -473,6 +495,7 @@ export default function UserAccessDialog({
     setInviteCrmEmployee(false)
     setInviteDemoAccess(false)
     setInviteOrganizationId('')
+    setInviteAdditionalOrganizationIds([])
     setNewOrganizationName('')
     setNewOrganizationParentId('')
     setCreateNames({ board: '', pipeline: '' })
@@ -495,6 +518,7 @@ export default function UserAccessDialog({
           setProfile(profileFrom(usersResult.value.currentUser))
           const organizationId = usersResult.value.currentUser.organizationId || ''
           setInviteOrganizationId(organizationId)
+          setInviteAdditionalOrganizationIds([])
           setNewOrganizationParentId(organizationId)
         }
       } else {
@@ -513,6 +537,12 @@ export default function UserAccessDialog({
 
     return () => { active = false }
   }, [initialTab, open])
+
+  useEffect(() => {
+    setInviteAdditionalOrganizationIds((current) => current.filter((organizationId) => (
+      organizationId !== inviteOrganizationId && organizationId !== NEW_ORGANIZATION
+    )))
+  }, [inviteOrganizationId])
 
   useEffect(() => {
     if (!open || busy || !hasActivePipelineProvisioning) return
@@ -615,6 +645,11 @@ export default function UserAccessDialog({
     event.preventDefault()
     const email = inviteEmail.trim().toLowerCase()
     const creatingOrganization = inviteOrganizationId === NEW_ORGANIZATION
+    const additionalOrganizationIds = Array.from(new Set(inviteAdditionalOrganizationIds))
+      .filter((organizationId) => organizationId && organizationId !== NEW_ORGANIZATION)
+    const organizationIds = creatingOrganization
+      ? additionalOrganizationIds
+      : [inviteOrganizationId, ...additionalOrganizationIds]
     if (
       busy
       || !isEmail(email)
@@ -628,6 +663,7 @@ export default function UserAccessDialog({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           email,
+          organizationIds,
           organizationId: creatingOrganization ? undefined : inviteOrganizationId,
           createOrganization: creatingOrganization,
           organizationName: creatingOrganization ? newOrganizationName.trim() : undefined,
@@ -640,6 +676,7 @@ export default function UserAccessDialog({
       const refreshed = await requestJson<UsersPayload>('/api/users')
       setUsersPayload(refreshed)
       setInviteEmail('')
+      setInviteAdditionalOrganizationIds([])
       setInviteCrmEmployee(false)
       setInviteDemoAccess(false)
       setInviteOrganizationId(refreshed.currentUser?.organizationId || '')
@@ -1151,9 +1188,10 @@ export default function UserAccessDialog({
               <Box component="form" onSubmit={inviteUser} mb={2.5}>
                 <Typography variant="subtitle2" color="text.primary" fontWeight={700} mb={1}>Invite</Typography>
                 <Alert severity="info" variant="outlined" sx={{ mb: 1.5, borderRadius: '8px' }}>
-                  Choose the organization whose data this person may access. New invitations start as Members; after inviting,
-                  the owner can promote the person to Admin and select administrative permissions on their user card. Enable
-                  CRM employee only when the person should own CRM records.
+                  Choose the organization whose data this person may access.
+                  Choose the primary organization for this invite, then optionally add more organizations as member access.
+                  New invitations start as Members; after inviting, the owner can promote to Admin and adjust permissions
+                  on the user card. Enable CRM employee only when the person should own CRM records.
                 </Alert>
                 <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'minmax(0, 1fr) minmax(0, 1fr) auto' }, gap: 1 }}>
                   <TextField
@@ -1172,7 +1210,7 @@ export default function UserAccessDialog({
                     required
                     fullWidth
                     size="small"
-                    label="Organization"
+                    label="Primary organization"
                     value={inviteOrganizationId}
                     onChange={(event) => {
                       const value = event.target.value
@@ -1182,7 +1220,7 @@ export default function UserAccessDialog({
                     disabled={busy}
                     sx={fieldSx}
                   >
-                    {(usersPayload.workspaceOrganizations || []).map((organization) => (
+                    {inviteOrganizationOptions.map((organization) => (
                       <MenuItem key={organization.id} value={organization.id}>
                         {'  '.repeat(Math.max(0, organization.depth))}{organization.name} ({organization.referenceCode})
                       </MenuItem>
@@ -1227,13 +1265,68 @@ export default function UserAccessDialog({
                         disabled={busy}
                         sx={{ ...fieldSx, gridColumn: { sm: '2 / 3' } }}
                       >
-                        {(usersPayload.workspaceOrganizations || []).map((organization) => (
+                        {inviteOrganizationOptions.map((organization) => (
                           <MenuItem key={organization.id} value={organization.id}>
                             {'  '.repeat(Math.max(0, organization.depth))}{organization.name} ({organization.referenceCode})
                           </MenuItem>
                         ))}
                       </TextField>
                     </>
+                  ) : null}
+                  {additionalOrganizationOptions.length ? (
+                    <Box sx={{ gridColumn: { sm: '1 / -1' } }}>
+                      <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.25 }}>
+                        Add additional organizations (member access on first sign-in):
+                      </Typography>
+                      <Box
+                        sx={{
+                          mt: 0.75,
+                          border: '1px solid',
+                          borderColor: 'divider',
+                          borderRadius: 1,
+                          p: 1,
+                          maxHeight: 180,
+                          overflowY: 'auto',
+                        }}
+                      >
+                        <Box sx={{ display: 'grid', gap: 0.5 }}>
+                          {additionalOrganizationOptions.map((organization) => {
+                            const isChecked = inviteAdditionalOrganizationIds.includes(organization.id)
+                            return (
+                              <FormControlLabel
+                                key={organization.id}
+                                control={(
+                                  <Checkbox
+                                    checked={isChecked}
+                                    onChange={(event) => {
+                                      toggleAdditionalInviteOrganization(
+                                        organization.id,
+                                        event.target.checked,
+                                      )
+                                    }}
+                                    disabled={busy}
+                                    inputProps={{
+                                      'aria-label': `Invite user to ${organization.name}`,
+                                    }}
+                                  />
+                                )}
+                                label={
+                                  <Box>
+                                    <Typography variant="body2">
+                                      {'  '.repeat(Math.max(0, organization.depth))}
+                                      {organization.name}
+                                    </Typography>
+                                    <Typography variant="caption" color="text.disabled">
+                                      {organization.referenceCode}
+                                    </Typography>
+                                  </Box>
+                                }
+                              />
+                            )
+                          })}
+                        </Box>
+                      </Box>
+                    </Box>
                   ) : null}
                   <Box sx={{ gridColumn: { sm: '1 / -1' }, px: 0.25 }}>
                     <FormControlLabel

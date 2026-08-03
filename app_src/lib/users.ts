@@ -4,6 +4,7 @@ import { findSuiteCrmUser } from '@/lib/crm/suiteCrmClient'
 import { DEMO_WORKSPACE_ID } from '@/lib/demoMode'
 
 const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 export type AppUserRole = 'owner' | 'admin' | 'member'
 export type AppUserStatus = 'invited' | 'active' | 'disabled'
@@ -127,6 +128,12 @@ export type InviteAppUserResult = {
   previousInvitedBy: string | null
   membershipCreated: boolean
   previousMembership: AppUserMembershipSnapshot | null
+  previousMemberships: AppUserInvitedOrganizationMembership[]
+}
+
+export type AppUserInvitedOrganizationMembership = {
+  organizationId: string
+  previousMembership: AppUserMembershipSnapshot | null
 }
 
 export type AppUserMembershipSnapshot = {
@@ -134,6 +141,26 @@ export type AppUserMembershipSnapshot = {
   permissions: AppUserPermissions
   status: AppUserStatus
   isDefault: boolean
+}
+
+function normalizeOrganizationIds(value: unknown): string[] {
+  const raw = Array.isArray(value) ? value : value == null ? [] : [value]
+  const seen = new Set<string>()
+  const ids: string[] = []
+
+  for (const candidate of raw) {
+    const organizationId = String(candidate || '').trim()
+    if (!organizationId) continue
+    if (!UUID_PATTERN.test(organizationId)) {
+      throw new Error('A valid invitation organization is required')
+    }
+    if (!seen.has(organizationId)) {
+      seen.add(organizationId)
+      ids.push(organizationId)
+    }
+  }
+
+  return ids
 }
 
 type AppUserRow = {
@@ -468,7 +495,8 @@ export async function listAppUsers(actorEmailValue: AppUser | unknown): Promise<
 export async function inviteAppUser(input: {
   actorEmail: unknown
   email: unknown
-  organizationId: unknown
+  organizationIds: unknown
+  createOrganization?: unknown
   crmUserEnabled?: unknown
   demoAccess?: unknown
 }): Promise<InviteAppUserResult> {
@@ -480,12 +508,16 @@ export async function inviteAppUser(input: {
     ...MEMBER_PERMISSIONS,
     accessDemo: input.demoAccess === true,
   }
-  const organizationId = String(input.organizationId || '').trim()
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(organizationId)) {
+  const organizationIds = normalizeOrganizationIds(input.organizationIds)
+  const allowEmptyOrganizationIds = input.createOrganization === true
+  if (!organizationIds.length && !allowEmptyOrganizationIds) {
     throw new Error('A valid invitation organization is required')
   }
+  const primaryOrganizationId = organizationIds[0]
   if (email === actor.email) {
-    if (actor.organizationId !== organizationId) throw new AppUserAuthorizationError('Your own organization cannot be changed by invitation')
+    if (organizationIds.length !== 1 || actor.organizationId !== primaryOrganizationId) {
+      throw new AppUserAuthorizationError('Your own organization cannot be changed by invitation')
+    }
     return {
       user: actor,
       created: false,
@@ -493,27 +525,52 @@ export async function inviteAppUser(input: {
       previousInvitedBy: actor.invitedBy,
       membershipCreated: false,
       previousMembership: null,
+      previousMemberships: [],
     }
   }
 
   return withTransaction(async (client) => {
     if (!actor.organizationId) throw new AppUserAuthorizationError('Your organization is not configured')
-    const organization = await client.query<{ id: string; name: string }>(
-      `WITH RECURSIVE managed AS (
-         SELECT id FROM workspace_organizations WHERE id = $2::uuid
-         UNION ALL
-         SELECT child.id
-         FROM workspace_organizations child
-         JOIN managed parent ON child.parent_id = parent.id
-       )
-       SELECT organization.id::text, organization.name
-       FROM workspace_organizations organization
-       JOIN managed ON managed.id = organization.id
-       WHERE organization.id = $1::uuid
-       FOR SHARE`,
-      [organizationId, actor.organizationId],
-    )
-    if (!organization.rows[0]) throw new Error('Invitation organization was not found')
+    const organizationDetails = [] as Array<{ id: string; name: string }>
+    const existingMemberships = new Map<string, {
+      role: AppUserRole
+      permissions: unknown
+      status: AppUserStatus
+      is_default: boolean
+    }>()
+
+    for (const organizationId of organizationIds) {
+      await requireOrganizationInActorScope(actor, organizationId)
+      const organization = await client.query<{ id: string; name: string }>(
+        `SELECT organization.id::text, organization.name
+         FROM workspace_organizations organization
+         WHERE organization.id = $1::uuid`,
+        [organizationId],
+      )
+      const row = organization.rows[0]
+      if (!row) throw new Error('Invitation organization was not found')
+      organizationDetails.push(row)
+
+      const existingMembership = await client.query<{
+        role: AppUserRole
+        permissions: unknown
+        status: AppUserStatus
+        is_default: boolean
+      }>(
+        `SELECT role, permissions, status, is_default
+         FROM app_user_organization_memberships
+         WHERE user_email = $1 AND organization_id = $2::uuid
+         FOR UPDATE`,
+        [email, organizationId],
+      )
+      if (existingMembership.rows[0]) {
+        existingMemberships.set(organizationId, existingMembership.rows[0])
+      }
+    }
+
+    const primaryOrganization = organizationDetails.find((organization) => organization.id === primaryOrganizationId)
+    if (!primaryOrganization) throw new Error('Invitation organization was not found')
+
     const existing = await client.query<AppUserRow>('SELECT * FROM app_users WHERE email = $1 FOR UPDATE', [email])
     const current = existing.rows[0]
     if (current?.status === 'disabled') {
@@ -522,29 +579,27 @@ export async function inviteAppUser(input: {
       }
       throw new AppUserAuthorizationError('Restore the disabled user before sending a new invitation')
     }
-    const existingMembership = await client.query<{
-      role: AppUserRole
-      permissions: unknown
-      status: AppUserStatus
-      is_default: boolean
-    }>(
-      `SELECT role, permissions, status, is_default
-       FROM app_user_organization_memberships
-       WHERE user_email = $1 AND organization_id = $2::uuid
-       FOR UPDATE`,
-      [email, organizationId],
+
+    const previousMemberships = organizationIds.map((organizationId) => {
+      const existingMembership = existingMemberships.get(organizationId)
+      return {
+        organizationId,
+        previousMembership: existingMembership
+          ? {
+            role: existingMembership.role,
+            permissions: permissionsForRole(existingMembership.role, existingMembership.permissions),
+            status: existingMembership.status,
+            isDefault: existingMembership.is_default,
+          }
+          : null,
+      }
+    })
+
+    const activeExistingMembership = previousMemberships.find(
+      (membership) => membership.previousMembership?.status === 'active',
     )
-    const membershipRow = existingMembership.rows[0]
-    const previousMembership = membershipRow
-      ? {
-          role: membershipRow.role,
-          permissions: permissionsForRole(membershipRow.role, membershipRow.permissions),
-          status: membershipRow.status,
-          isDefault: membershipRow.is_default,
-        }
-      : null
-    if (membershipRow?.status === 'active') {
-      throw new AppUserAuthorizationError('This user already has active access to the selected organization')
+    if (activeExistingMembership) {
+      throw new AppUserAuthorizationError('This user already has active access to one selected organization')
     }
     const invitedCrmUserEnabled = current ? current.crm_user_enabled : crmUserEnabled
 
@@ -577,42 +632,73 @@ export async function inviteAppUser(input: {
           updated_at = now()
         RETURNING *
       `,
-      [email, actor.email, JSON.stringify(invitedPermissions), organizationId, organization.rows[0].name, invitedCrmUserEnabled],
+      [
+        email,
+        actor.email,
+        JSON.stringify(invitedPermissions),
+        primaryOrganizationId,
+        primaryOrganization.name,
+        invitedCrmUserEnabled,
+      ],
     )
-    const membership = await client.query<{
+
+    let invitedMembership: {
       role: AppUserRole
       permissions: unknown
       status: AppUserStatus
       is_default: boolean
-    }>(
-      `INSERT INTO app_user_organization_memberships (
-         user_email, organization_id, role, permissions, status, is_default,
-         created_by, updated_by, created_at, updated_at
-       ) VALUES (
-         $1, $2::uuid, 'member', $3::jsonb, 'invited',
-         NOT EXISTS (
-           SELECT 1 FROM app_user_organization_memberships
-           WHERE user_email = $1 AND is_default
-         ),
-         $4, $4, now(), now()
-       )
-       ON CONFLICT (user_email, organization_id) DO UPDATE SET
-         role = 'member',
-         permissions = EXCLUDED.permissions,
-         status = 'invited',
-         updated_by = EXCLUDED.updated_by,
-         updated_at = now()
-       RETURNING role, permissions, status, is_default`,
-      [email, organizationId, JSON.stringify(invitedPermissions), actor.email],
-    )
-    const invitedMembership = membership.rows[0]
+    } | null = null
+    for (const organizationId of organizationIds) {
+      const membership = await client.query<{
+        role: AppUserRole
+        permissions: unknown
+        status: AppUserStatus
+        is_default: boolean
+      }>(
+        `INSERT INTO app_user_organization_memberships (
+           user_email, organization_id, role, permissions, status, is_default,
+           created_by, updated_by, created_at, updated_at
+         ) VALUES (
+           $1, $2::uuid, 'member', $3::jsonb, 'invited',
+           CASE
+             WHEN NOT EXISTS (
+               SELECT 1 FROM app_user_organization_memberships
+               WHERE user_email = $1 AND is_default
+             )
+             THEN $4::uuid = $2::uuid
+             ELSE false
+           END,
+           $5, $5, now(), now()
+         )
+         ON CONFLICT (user_email, organization_id) DO UPDATE SET
+           role = 'member',
+           permissions = EXCLUDED.permissions,
+           status = 'invited',
+           updated_by = EXCLUDED.updated_by,
+           updated_at = now()
+         RETURNING role, permissions, status, is_default`,
+        [
+          email,
+          organizationId,
+          JSON.stringify(invitedPermissions),
+          primaryOrganizationId,
+          actor.email,
+        ],
+      )
+      if (organizationId === primaryOrganizationId) {
+        invitedMembership = membership.rows[0]
+      }
+    }
+
     const invitedUser = {
       ...toAppUser(result.rows[0]),
-      organizationId,
-      organizationName: organization.rows[0].name,
-      organizationRole: invitedMembership.role,
-      organizationPermissions: permissionsForRole(invitedMembership.role, invitedMembership.permissions),
-      status: invitedMembership.status,
+      organizationId: primaryOrganizationId,
+      organizationName: primaryOrganization.name,
+      organizationRole: invitedMembership?.role || 'member',
+      organizationPermissions: invitedMembership
+        ? permissionsForRole(invitedMembership.role, invitedMembership.permissions)
+        : invitedPermissions,
+      status: invitedMembership?.status || 'invited',
     }
     await recordAuditEvent({
       actor: actor.email,
@@ -620,13 +706,14 @@ export async function inviteAppUser(input: {
       aggregateType: 'app_user',
       aggregateId: email,
       subject: email,
-      organizationId,
+      organizationId: primaryOrganizationId,
       payload: {
-        organizationId,
-        organizationName: organization.rows[0].name,
+        organizationId: primaryOrganizationId,
+        organizationName: primaryOrganization.name,
+        organizationIds,
         previousOrganizationId: current?.organization_id || null,
-        membershipCreated: !membershipRow,
-        reinvited: Boolean(membershipRow),
+        membershipCreated: previousMemberships.some((membership) => !membership.previousMembership),
+        reinvited: previousMemberships.some((membership) => Boolean(membership.previousMembership)),
         crmUserEnabled: result.rows[0].crm_user_enabled,
       },
     }, client)
@@ -635,8 +722,9 @@ export async function inviteAppUser(input: {
       created: !current,
       previousOrganizationId: current?.organization_id || null,
       previousInvitedBy: current?.invited_by || null,
-      membershipCreated: !membershipRow,
-      previousMembership,
+      membershipCreated: previousMemberships.some((membership) => !membership.previousMembership),
+      previousMembership: previousMemberships[0]?.previousMembership || null,
+      previousMemberships,
     }
   })
 }
@@ -647,32 +735,49 @@ export async function restoreInvitedUserAssignment(input: {
   invitedBy: string | null
   previousMembership: AppUserMembershipSnapshot | null
 }): Promise<void> {
+  await restoreInvitedUserAssignments({
+    email: input.email,
+    invitedBy: input.invitedBy,
+    memberships: [{
+      organizationId: input.organizationId,
+      previousMembership: input.previousMembership,
+    }],
+  })
+}
+
+export async function restoreInvitedUserAssignments(input: {
+  email: unknown
+  memberships: AppUserInvitedOrganizationMembership[]
+  invitedBy: string | null
+}): Promise<void> {
   const email = normalizeUserEmail(input.email)
   await withTransaction(async (client) => {
-    if (input.previousMembership) {
-      await client.query(
-        `UPDATE app_user_organization_memberships
-         SET role = $3,
-             permissions = $4::jsonb,
-             status = $5,
-             is_default = $6,
-             updated_at = now()
-         WHERE user_email = $1 AND organization_id = $2::uuid`,
-        [
-          email,
-          input.organizationId,
-          input.previousMembership.role,
-          JSON.stringify(input.previousMembership.permissions),
-          input.previousMembership.status,
-          input.previousMembership.isDefault,
-        ],
-      )
-    } else {
-      await client.query(
-        `DELETE FROM app_user_organization_memberships
-         WHERE user_email = $1 AND organization_id = $2::uuid`,
-        [email, input.organizationId],
-      )
+    for (const membership of input.memberships) {
+      if (membership.previousMembership) {
+        await client.query(
+          `UPDATE app_user_organization_memberships
+           SET role = $3,
+               permissions = $4::jsonb,
+               status = $5,
+               is_default = $6,
+               updated_at = now()
+           WHERE user_email = $1 AND organization_id = $2::uuid`,
+          [
+            email,
+            membership.organizationId,
+            membership.previousMembership.role,
+            JSON.stringify(membership.previousMembership.permissions),
+            membership.previousMembership.status,
+            membership.previousMembership.isDefault,
+          ],
+        )
+      } else {
+        await client.query(
+          `DELETE FROM app_user_organization_memberships
+           WHERE user_email = $1 AND organization_id = $2::uuid`,
+          [email, membership.organizationId],
+        )
+      }
     }
     await client.query(
       `UPDATE app_users
