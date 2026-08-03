@@ -107,14 +107,8 @@ CREATE TABLE IF NOT EXISTS operations_faire_product_image_delivery_grants (
     AND asset_pixel_width::bigint * asset_pixel_height::bigint <= 40000000
   ),
   CONSTRAINT operations_faire_product_image_grant_channel_valid CHECK (
-    (
-      channel_normalized_status = 'active'
-      AND channel_provider_active = true
-    )
-    OR (
-      channel_normalized_status = 'unavailable'
-      AND channel_provider_active = false
-    )
+    channel_normalized_status = 'active'
+    AND channel_provider_active = true
   ),
   CONSTRAINT operations_faire_product_image_grant_expiry_valid CHECK (
     expires_at > issued_at
@@ -492,23 +486,8 @@ AS $$
           AND channel_state.row_version = image_grant.channel_state_row_version
           AND channel_state.source_revision = image_grant.channel_source_revision
           AND channel_state.source_hash = image_grant.channel_source_hash
-          AND upper(btrim(channel_state.provider_status_raw)) IN (
-            'DRAFT', 'PUBLISHED', 'ACTIVE'
-          )
-          AND channel_state.normalized_status
-            = image_grant.channel_normalized_status
-          AND channel_state.provider_active
-            = image_grant.channel_provider_active
-          AND (
-            (
-              channel_state.normalized_status = 'active'
-              AND channel_state.provider_active = true
-            )
-            OR (
-              channel_state.normalized_status = 'unavailable'
-              AND channel_state.provider_active = false
-            )
-          )
+          AND channel_state.normalized_status = 'active'
+          AND channel_state.provider_active = true
           AND mapping.product_id = image_grant.product_id
           AND mapping.external_product_id = image_grant.external_product_id
           AND mapping.external_variant_id = image_grant.external_variant_id
