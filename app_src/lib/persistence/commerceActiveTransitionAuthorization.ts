@@ -9,6 +9,9 @@ import {
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import type {
+  CommerceActiveContinuation,
+} from '@/lib/operations/commerceActiveSelection'
 
 export type CommerceActiveProvider = 'shopify' | 'faire'
 export type CommerceActiveActorRole = 'owner' | 'admin'
@@ -1959,6 +1962,96 @@ export async function consumeCommerceActiveTransitionAuthorizationInPostgres(
     }
     return transition(row, false)
   })
+}
+
+export async function readCommerceActiveContinuationInPostgres(input: {
+  organizationId: unknown
+}): Promise<CommerceActiveContinuation | null> {
+  const scopedOrganizationId = organizationId(input.organizationId)
+  const result = await query<{
+    source_transition_global_id: string
+    source_activation_revision: number
+    shadow_activation_revision: number
+    cohort: unknown
+  }>(
+    `SELECT
+       activated.global_id AS source_transition_global_id,
+       activated.to_activation_revision AS source_activation_revision,
+       activation.revision AS shadow_activation_revision,
+       prepared.cohort
+     FROM operations_activation_scopes activation
+     JOIN operations_commerce_active_transitions activated
+       ON activated.organization_id = activation.organization_id
+      AND activated.to_activation_state = 'active'
+      AND activated.to_activation_revision = activation.revision - 1
+     JOIN operations_commerce_active_transition_preparations prepared
+       ON prepared.organization_id = activated.organization_id
+      AND prepared.id = activated.preparation_id
+     WHERE activation.organization_id = $1::uuid
+       AND activation.state = 'shadow'
+       AND activated.from_activation_state = 'shadow'
+     ORDER BY activated.activated_at DESC, activated.id DESC
+     LIMIT 1`,
+    [scopedOrganizationId],
+  )
+  const row = result.rows[0]
+  if (!row) return null
+  const sourceActivationRevision = Number(row.source_activation_revision)
+  const shadowActivationRevision = Number(row.shadow_activation_revision)
+  if (
+    !row.source_transition_global_id
+    || !Number.isSafeInteger(sourceActivationRevision)
+    || sourceActivationRevision < 1
+    || !Number.isSafeInteger(shadowActivationRevision)
+    || shadowActivationRevision !== sourceActivationRevision + 1
+    || !Array.isArray(row.cohort)
+  ) {
+    fail(
+      'COMMERCE_ACTIVE_CONTINUATION_INVALID',
+      'The prior Commerce Active continuation evidence is invalid',
+    )
+  }
+  const shopifyAccounts = row.cohort.flatMap((raw) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      fail(
+        'COMMERCE_ACTIVE_CONTINUATION_INVALID',
+        'The prior Commerce Active cohort is invalid',
+      )
+    }
+    const member = raw as Record<string, unknown>
+    if (member.provider !== 'shopify') return []
+    if (
+      typeof member.accountGlobalId !== 'string'
+      || !ACCOUNT_GLOBAL_ID.test(member.accountGlobalId)
+      || !Array.isArray(member.writeCapabilities)
+      || member.writeCapabilities.length < 1
+      || !member.writeCapabilities.every(
+        (capability) => isCommerceActiveWriteCapability(
+          'shopify',
+          capability,
+        ),
+      )
+    ) {
+      fail(
+        'COMMERCE_ACTIVE_CONTINUATION_INVALID',
+        'The prior Shopify Active authority is invalid',
+      )
+    }
+    return [{
+      accountGlobalId: member.accountGlobalId,
+      writeCapabilities: [...new Set(member.writeCapabilities)] as
+        CommerceActiveContinuation['shopifyAccounts'][number]['writeCapabilities'],
+    }]
+  }).sort((left, right) => codePointOrder(
+    left.accountGlobalId,
+    right.accountGlobalId,
+  ))
+  return {
+    sourceTransitionGlobalId: row.source_transition_global_id,
+    sourceActivationRevision,
+    shadowActivationRevision,
+    shopifyAccounts,
+  }
 }
 
 export async function requireCurrentFaireFulfillmentScopeEvidenceInPostgres(

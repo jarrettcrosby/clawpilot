@@ -241,6 +241,172 @@ function orderFixture(input) {
   })
 }
 
+function faireRetailerOrderFixture(input) {
+  const base = orderFixture({
+    key: input.key,
+    variantId: `po_${input.key}`,
+    unitPrice: money(0, 'USD'),
+    unfulfilledQuantity: 1,
+  })
+  const externalOrderId = `faire-order-${input.key}`
+  const externalProductId = `p_${input.key}`
+  const externalVariantId = `po_${input.key}`
+  const line = base.lines[0]
+  return Object.freeze({
+    ...base,
+    identity: Object.freeze({
+      provider: 'faire',
+      resourceType: 'order',
+      value: externalOrderId,
+    }),
+    orderNumber: `FAIRE-${input.key}`,
+    headerMoney: Object.freeze({
+      ...base.headerMoney,
+      customerChargeEligible: false,
+    }),
+    party: available(Object.freeze({
+      role: 'retailer',
+      partyType: 'organization',
+      externalIdentity: available(Object.freeze({
+        provider: 'faire',
+        resourceType: 'retailer',
+        value: input.retailerId,
+      })),
+      organizationName: available('Commerce promotion PostgreSQL customer'),
+      contactName: available('Jarrett Crosby'),
+      email: available(input.evidenceEmail),
+      phone: unavailable(),
+    })),
+    lines: Object.freeze([Object.freeze({
+      ...line,
+      identity: Object.freeze({
+        provider: 'faire',
+        resourceType: 'order_line',
+        value: `faire-line-${input.key}`,
+      }),
+      productIdentity: available(Object.freeze({
+        provider: 'faire',
+        resourceType: 'product',
+        value: externalProductId,
+      })),
+      variantIdentity: available(Object.freeze({
+        provider: 'faire',
+        resourceType: 'variant',
+        value: externalVariantId,
+      })),
+      sourceHash: hash(`faire-line:${input.key}`),
+    })]),
+    readinessFacts: Object.freeze([
+      Object.freeze({
+        dimension: 'product',
+        code: 'product_mapping_required',
+        blocking: true,
+        subjectExternalId: externalVariantId,
+      }),
+      Object.freeze({
+        dimension: 'customer',
+        code: 'customer_resolution_required',
+        blocking: true,
+        subjectExternalId: null,
+      }),
+    ]),
+    providerFacts: Object.freeze({
+      provider: 'faire',
+      brandIdentity: available(Object.freeze({
+        provider: 'faire',
+        resourceType: 'brand',
+        value: 'brand-9202',
+      })),
+      retailerIdentity: available(Object.freeze({
+        provider: 'faire',
+        resourceType: 'retailer',
+        value: input.retailerId,
+      })),
+      brandDiscount: money(0, 'USD'),
+      lineDiscountTotal: money(0, 'USD'),
+      payoutState: null,
+      payoutAmount: unavailable(),
+    }),
+    sourceHash: hash(`faire-order:${input.key}`),
+  })
+}
+
+function fairePackOrderFixture(input) {
+  const base = faireRetailerOrderFixture(input)
+  return Object.freeze({
+    ...base,
+    lines: Object.freeze([Object.freeze({
+      ...base.lines[0],
+      requiresShipping: true,
+      packaging: unavailable(),
+    })]),
+    readinessFacts: Object.freeze([
+      ...base.readinessFacts,
+      Object.freeze({
+        dimension: 'packaging',
+        code: 'packaging_required',
+        blocking: true,
+        subjectExternalId: `po_${input.key}`,
+      }),
+    ]),
+  })
+}
+
+function faireProductFixture(input) {
+  const productIdentity = Object.freeze({
+    provider: 'faire',
+    resourceType: 'product',
+    value: input.externalProductId,
+  })
+  return Object.freeze({
+    schemaVersion: 'commerce-normalized-product-v1',
+    identity: productIdentity,
+    brandIdentity: available(Object.freeze({
+      provider: 'faire',
+      resourceType: 'brand',
+      value: 'brand-9202',
+    })),
+    title: `Faire exact pack ${input.key}`,
+    description: null,
+    vendor: 'ClawPilot acceptance',
+    productType: 'Test',
+    providerTaxonomy: unavailable(),
+    lifecycleState: 'ACTIVE',
+    saleState: 'FOR_SALE',
+    active: true,
+    providerCreatedAt: observedAt,
+    providerUpdatedAt: observedAt,
+    imageSetComplete: true,
+    images: Object.freeze([]),
+    variants: Object.freeze([Object.freeze({
+      schemaVersion: 'commerce-normalized-variant-v1',
+      identity: Object.freeze({
+        provider: 'faire',
+        resourceType: 'variant',
+        value: input.externalVariantId,
+      }),
+      productIdentity,
+      inventoryItemIdentity: unavailable(),
+      sku: `FAIRE-PACK-${input.key}`,
+      barcode: null,
+      title: 'Default',
+      selectedOptions: Object.freeze([]),
+      unitMultiplier: 1,
+      wholesalePrice: unavailable(),
+      retailPrice: unavailable(),
+      taxable: false,
+      requiresShipping: true,
+      inventory: unavailable(),
+      packaging: unavailable(),
+      weightGrams: 454,
+      providerCreatedAt: observedAt,
+      providerUpdatedAt: observedAt,
+      sourceHash: input.variantSourceHash,
+    })]),
+    sourceHash: input.productSourceHash,
+  })
+}
+
 function productImageFixture() {
   const providerImageId = 'gid://shopify/MediaImage/9201001'
   const locatorFingerprint = hash('commerce-staging-product-image-locator')
@@ -325,6 +491,9 @@ class CommerceIntegrationRequestError extends Error {
 }
 
 function loadCommerceStagingService(pool, counters) {
+  const mustNotRun = (name) => () => {
+    throw new Error(`${name} must not run during order-only staging acceptance`)
+  }
   const normalization = loadTypeScriptModule(
     'app_src/lib/operations/commerceNormalization.ts',
   )
@@ -334,9 +503,18 @@ function loadCommerceStagingService(pool, counters) {
   const orderStaging = loadTypeScriptModule(
     'app_src/lib/integrations/commerceOrderStaging.ts',
   )
-  const mustNotRun = (name) => () => {
-    throw new Error(`${name} must not run during order-only staging acceptance`)
-  }
+  const commercePackEvidence = loadTypeScriptModule(
+    'app_src/lib/operations/commercePackEvidence.ts',
+  )
+  const productChannelStates = loadTypeScriptModule(
+    'app_src/lib/persistence/productChannelStates.ts',
+    {
+      '@/lib/operations/commercePackEvidence': commercePackEvidence,
+      '@/lib/persistence/postgres': {
+        query: mustNotRun('productChannelStates.query'),
+      },
+    },
+  )
   const reconcileCommerceProductImageSetWithClient = async (
     input,
     client,
@@ -429,12 +607,19 @@ function loadCommerceStagingService(pool, counters) {
         decryptCommerceIntakeContinuation() {
           return { orderCursor: 'commerce-staging-recovery-cursor' }
         },
-        decryptCommerceCandidateSnapshot: mustNotRun(
-          'decryptCommerceCandidateSnapshot',
-        ),
-        encryptCommerceCandidateSnapshot: mustNotRun(
-          'encryptCommerceCandidateSnapshot',
-        ),
+        decryptCommerceCandidateSnapshot({ ciphertext }) {
+          return JSON.parse(Buffer.from(ciphertext).toString('utf8'))
+        },
+        encryptCommerceCandidateSnapshot(value) {
+          const ciphertext = Buffer.from(JSON.stringify(value), 'utf8')
+          return {
+            ciphertext,
+            iv: Buffer.alloc(12, 7),
+            tag: Buffer.alloc(16, 8),
+            hash: hash(ciphertext),
+            encryptionVersion: 1,
+          }
+        },
         encryptCommerceIntakeReadResult: mustNotRun(
           'encryptCommerceIntakeReadResult',
         ),
@@ -469,9 +654,11 @@ function loadCommerceStagingService(pool, counters) {
         ),
       },
       '@/lib/integrations/commerceProductChannelOffers': {
-        selectCommerceProductChannelOffers: mustNotRun(
-          'selectCommerceProductChannelOffers',
-        ),
+        selectCommerceProductChannelOffers: () => ({
+          wholesale: null,
+          retail: null,
+          compareAt: null,
+        }),
       },
       '@/lib/integrations/commercePackRuntime': packRuntime,
       '@/lib/integrations/commerceOrderStaging': orderStaging,
@@ -527,14 +714,7 @@ function loadCommerceStagingService(pool, counters) {
           'readCommerceCatalogSyncStateWithClient',
         ),
       },
-      '@/lib/persistence/productChannelStates': {
-        linkProductChannelStateWithClient: mustNotRun(
-          'linkProductChannelStateWithClient',
-        ),
-        upsertProductChannelStateWithClient: mustNotRun(
-          'upsertProductChannelStateWithClient',
-        ),
-      },
+      '@/lib/persistence/productChannelStates': productChannelStates,
       '@/lib/persistence/shopifyCheckoutRating': {
         reconcileShopifyCheckoutRateForOrderCandidateWithClient: mustNotRun(
           'reconcileShopifyCheckoutRateForOrderCandidateWithClient',
@@ -879,6 +1059,11 @@ async function seedCapturedRead(client, ids, envelope) {
 }
 
 async function seedAdditionalCapturedRead(client, ids, input) {
+  const integrationAccountId = input.integrationAccountId
+    || ids.integrationAccount
+  const provider = input.provider || 'shopify'
+  const resource = input.resource || 'orders'
+  const intakeAction = input.intakeAction || 'fetch'
   await client.query('SET session_replication_role = replica')
   try {
     await client.query(
@@ -895,7 +1080,7 @@ async function seedAdditionalCapturedRead(client, ids, input) {
         input.providerAttemptId,
         input.providerAttemptGlobalId,
         ids.organization,
-        ids.integrationAccount,
+        integrationAccountId,
         input.idempotencyKey,
         hash(`${input.idempotencyKey}:provider-read-request`),
         JSON.stringify(input.redactedRequest || {}),
@@ -912,15 +1097,18 @@ async function seedAdditionalCapturedRead(client, ids, input) {
          response_hash, response_bytes, response_encryption_version,
          created_by, updated_by, expires_at
        ) VALUES (
-         $1, $2, $3, $4, 'shopify', 'orders', 'fetch', $5, $6,
-         1, 'none', $7, 1, NULL, $8::timestamptz, $9, 'captured',
-         $10, $11, $12, $13, $14, 2, 1, $15, $15, $16::timestamptz
+         $1, $2, $3, $4, $5, $6, $7, $8, $9,
+         1, 'none', $10, 1, NULL, $11::timestamptz, $12, 'captured',
+         $13, $14, $15, $16, $17, 2, 1, $18, $18, $19::timestamptz
        )`,
       [
         input.readIntentId,
         ids.organization,
-        ids.integrationAccount,
+        integrationAccountId,
         ids.pipeline,
+        provider,
+        resource,
+        intakeAction,
         input.idempotencyKey,
         hash(`${input.idempotencyKey}:read-intent-request`),
         input.sessionId,
@@ -940,6 +1128,648 @@ async function seedAdditionalCapturedRead(client, ids, input) {
   }
 }
 
+async function verifyFaireExactVariantPackBinding(
+  pool,
+  ids,
+  persistence,
+  counters,
+) {
+  const runtime = {
+    organizationId: ids.organization,
+    globalId: 'gia0009202',
+    integrationAccountId: ids.faireIntegrationAccount,
+    provider: 'faire',
+    credentialVersion: 1,
+  }
+  const scenarios = {
+    success: {
+      key: 'pack_success',
+      externalProductId: 'p_pack_success',
+      externalVariantId: 'po_pack_success',
+      productSourceHash: hash('faire-pack-success-product'),
+      variantSourceHash: hash('faire-pack-success-variant'),
+    },
+    stale: {
+      key: 'pack_stale',
+      externalProductId: 'p_pack_stale',
+      externalVariantId: 'po_pack_stale',
+      productSourceHash: hash('faire-pack-stale-product'),
+      variantSourceHash: hash('faire-pack-stale-variant'),
+    },
+    rejected: {
+      key: 'pack_rejected',
+      externalProductId: 'p_pack_rejected',
+      externalVariantId: 'po_pack_rejected',
+      productSourceHash: hash('faire-pack-rejected-product'),
+      variantSourceHash: hash('faire-pack-rejected-variant'),
+    },
+  }
+  const setup = await pool.connect()
+  let packVersion
+  try {
+    await setup.query('BEGIN')
+    for (const scenario of Object.values(scenarios)) {
+      const mapping = await setup.query(
+        `INSERT INTO operations_product_mappings (
+           organization_id, integration_account_id, pipeline_id, product_id,
+           channel_sku, external_product_id, external_variant_id,
+           mapping_method, mapping_source_revision, active, created_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7,
+           'exact_variant', $8, true, $9
+         )
+         RETURNING id::text, global_id`,
+        [
+          ids.organization,
+          ids.faireIntegrationAccount,
+          ids.pipeline,
+          ids.product,
+          `FAIRE-PACK-${scenario.key}`,
+          scenario.externalProductId,
+          scenario.externalVariantId,
+          hash(`faire-pack-mapping:${scenario.key}`),
+          actorEmail,
+        ],
+      )
+      scenario.productMappingId = mapping.rows[0].id
+      scenario.productMappingGlobalId = mapping.rows[0].global_id
+    }
+    const profile = await setup.query(
+      `INSERT INTO operations_product_pack_profiles (
+         organization_id, pipeline_id, product_id, profile_key, profile_name,
+         package_level, is_default, status, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'faire-exact-each',
+         'Faire exact each', 'each', true, 'active', $4, $4
+       )
+       RETURNING id::text, global_id`,
+      [ids.organization, ids.pipeline, ids.product, actorEmail],
+    )
+    const version = await setup.query(
+      `INSERT INTO operations_product_pack_profile_versions (
+         organization_id, pipeline_id, product_id, profile_id,
+         version_number, lifecycle_state, base_each_quantity,
+         unit_of_measure, length_mm, width_mm, height_mm, dimension_basis,
+         gross_weight_grams, weight_basis, evidence_type, source, is_current,
+         evidence_reference, confirmed_at, confirmed_by, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+         1, 'customer_confirmed', 1, 'each', 120, 80, 60, 'outer',
+         454, 'customer_stated', 'customer_confirmed', 'manual', true,
+         'Disposable PostgreSQL exact Faire pack acceptance', now(), $5, $5
+       )
+       RETURNING id::text, global_id, row_version::integer`,
+      [
+        ids.organization,
+        ids.pipeline,
+        ids.product,
+        profile.rows[0].id,
+        actorEmail,
+      ],
+    )
+    packVersion = version.rows[0]
+    await setup.query('COMMIT')
+  } catch (error) {
+    await setup.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    setup.release()
+  }
+
+  const orderRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa0009210',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-pack-orders',
+    responseHash: hash('commerce-staging-faire-pack-orders-response'),
+  }
+  const orderSeed = await pool.connect()
+  try {
+    await seedAdditionalCapturedRead(orderSeed, ids, {
+      ...orderRead,
+      integrationAccountId: ids.faireIntegrationAccount,
+      provider: 'faire',
+      resource: 'orders',
+      intakeAction: 'fetch',
+    })
+  } finally {
+    orderSeed.release()
+  }
+  const orders = [scenarios.success, scenarios.stale].map((scenario) => (
+    fairePackOrderFixture({
+      key: scenario.key,
+      retailerId: `retailer-${scenario.key}`,
+      evidenceEmail: `${scenario.key}@example.com`,
+    })
+  ))
+  const orderEnvelope = Object.freeze({
+    schemaVersion: 'commerce-normalization-envelope-v1',
+    normalizerVersion: 'commerce-staging-postgres-v1',
+    provider: 'faire',
+    organizationId: ids.organization,
+    integrationAccountId: ids.faireIntegrationAccount,
+    externalAccountId: 'brand-9202',
+    apiVersion: '2026-07',
+    observedAt,
+    credentialGeneration: 1,
+    retentionExpiresAt,
+    sourceHash: hash('commerce-staging-faire-pack-orders-envelope'),
+    products: Object.freeze([]),
+    orders: Object.freeze(orders),
+    rejections: Object.freeze([]),
+  })
+  const stagedOrders = await persistence
+    .stageCommerceNormalizationEnvelopeInPostgres({
+      runtime,
+      actorEmail,
+      idempotencyKey: orderRead.idempotencyKey,
+      envelope: orderEnvelope,
+      stageAction: 'fetch',
+      page: {
+        mode: 'operational',
+        resource: 'orders',
+        sessionId: orderRead.sessionId,
+        batchNumber: 1,
+        previousRunGlobalId: null,
+        windowStart: null,
+        windowEnd: observedAt,
+        queryHash: ids.queryHash,
+        nextOrderCursor: null,
+        providerRowsSeen: orders.length,
+        eligibleOrdersSeen: orders.length,
+      },
+      refreshCandidateGlobalId: null,
+      retryRejectionGlobalId: null,
+      readIntentId: orderRead.readIntentId,
+      capturedResponseHash: orderRead.responseHash,
+    })
+  assert.equal(stagedOrders.ordersStaged, 2)
+
+  const exactReadOrdinal = new Map([
+    ['success', 9211],
+    ['stale', 9212],
+    ['rejected', 9213],
+  ])
+  async function stageExactProduct(name) {
+    const scenario = scenarios[name]
+    const ordinal = exactReadOrdinal.get(name)
+    const descriptor = {
+      providerAttemptId: randomUUID(),
+      providerAttemptGlobalId: `gxa${String(ordinal).padStart(7, '0')}`,
+      readIntentId: randomUUID(),
+      sessionId: randomUUID(),
+      idempotencyKey: `commerce-staging-faire-exact-product-${name}`,
+      responseHash: hash(`commerce-staging-faire-exact-product-${name}-response`),
+    }
+    const targetHash = commandHash(scenario.externalProductId)
+    const seed = await pool.connect()
+    try {
+      await seedAdditionalCapturedRead(seed, ids, {
+        ...descriptor,
+        integrationAccountId: ids.faireIntegrationAccount,
+        provider: 'faire',
+        resource: 'products',
+        intakeAction: 'fetch-products',
+        redactedRequest: {
+          targetedRead: true,
+          targetHash,
+          productsFetched: true,
+          readOnly: true,
+          providerWrites: 0,
+          syncCursorAdvanced: false,
+        },
+      })
+    } finally {
+      seed.release()
+    }
+    const product = faireProductFixture(scenario)
+    const envelope = Object.freeze({
+      schemaVersion: 'commerce-normalization-envelope-v1',
+      normalizerVersion: 'commerce-staging-postgres-v1',
+      provider: 'faire',
+      organizationId: ids.organization,
+      integrationAccountId: ids.faireIntegrationAccount,
+      externalAccountId: 'brand-9202',
+      apiVersion: '2026-07',
+      observedAt,
+      credentialGeneration: 1,
+      retentionExpiresAt,
+      sourceHash: hash(`commerce-staging-faire-exact-product-${name}-envelope`),
+      products: Object.freeze([product]),
+      orders: Object.freeze([]),
+      rejections: Object.freeze([]),
+    })
+    counters.expectedImageStage = {
+      idempotencyKey: descriptor.idempotencyKey,
+      readIntentId: descriptor.readIntentId,
+    }
+    const result = await persistence
+      .stageCommerceNormalizationEnvelopeInPostgres({
+        runtime,
+        actorEmail,
+        idempotencyKey: descriptor.idempotencyKey,
+        envelope,
+        stageAction: 'fetch-products',
+        page: {
+          mode: 'operational',
+          resource: 'products',
+          sessionId: descriptor.sessionId,
+          batchNumber: 1,
+          previousRunGlobalId: null,
+          windowStart: null,
+          windowEnd: observedAt,
+          queryHash: ids.queryHash,
+          nextOrderCursor: null,
+          providerRowsSeen: 1,
+          eligibleOrdersSeen: 1,
+        },
+        refreshCandidateGlobalId: null,
+        retryRejectionGlobalId: null,
+        readIntentId: descriptor.readIntentId,
+        capturedResponseHash: descriptor.responseHash,
+        exactExternalProductIdHash: targetHash,
+      })
+    assert.equal(result.productVariantsStaged, 1)
+    assert.equal(result.exactProductEvidence.externalProductId,
+      scenario.externalProductId)
+    assert.equal(result.exactProductEvidence.variants.length, 1)
+    return { descriptor, envelope, result }
+  }
+
+  const exactSuccess = await stageExactProduct('success')
+  const exactStale = await stageExactProduct('stale')
+  const exactRejectedOld = await stageExactProduct('rejected')
+
+  const rejectionRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa0009214',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-exact-product-rejected-later',
+    responseHash: hash(
+      'commerce-staging-faire-exact-product-rejected-later-response',
+    ),
+  }
+  const rejectedTargetHash = commandHash(
+    scenarios.rejected.externalProductId,
+  )
+  const rejectionSeed = await pool.connect()
+  try {
+    await seedAdditionalCapturedRead(rejectionSeed, ids, {
+      ...rejectionRead,
+      integrationAccountId: ids.faireIntegrationAccount,
+      provider: 'faire',
+      resource: 'products',
+      intakeAction: 'fetch-products',
+      redactedRequest: {
+        targetedRead: true,
+        targetHash: rejectedTargetHash,
+        productsFetched: true,
+        readOnly: true,
+        providerWrites: 0,
+        syncCursorAdvanced: false,
+      },
+    })
+  } finally {
+    rejectionSeed.release()
+  }
+  const rejectedChannelBefore = (await pool.query(
+    `SELECT global_id, row_version::integer, source_revision, source_hash,
+            pack_evidence_hash
+     FROM operations_product_channel_states
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_variant_id = $3`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      scenarios.rejected.externalVariantId,
+    ],
+  )).rows[0]
+  assert.ok(rejectedChannelBefore?.global_id)
+  const mappingsBeforeRejectedRead = Number((await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_commerce_variant_pack_mappings
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [ids.organization, ids.faireIntegrationAccount],
+  )).rows[0].count)
+  const imageCallsBeforeRejectedRead = counters.imageReconcileCalls.length
+  await assert.rejects(
+    persistence.stageCommerceNormalizationEnvelopeInPostgres({
+      runtime,
+      actorEmail,
+      idempotencyKey: rejectionRead.idempotencyKey,
+      envelope: Object.freeze({
+        ...exactRejectedOld.envelope,
+        sourceHash: hash(
+          'commerce-staging-faire-exact-product-rejected-later-envelope',
+        ),
+        products: Object.freeze([]),
+        rejections: Object.freeze([Object.freeze({
+          resourceType: 'product',
+          externalId: scenarios.rejected.externalProductId,
+          sourceHash: hash('faire-pack-rejected-normalization-rejection'),
+          errorCode: 'COMMERCE_PRODUCT_RECORD_INVALID',
+          safeMessage: 'Provider product was rejected.',
+        })]),
+      }),
+      stageAction: 'fetch-products',
+      page: {
+        mode: 'operational',
+        resource: 'products',
+        sessionId: rejectionRead.sessionId,
+        batchNumber: 1,
+        previousRunGlobalId: null,
+        windowStart: null,
+        windowEnd: observedAt,
+        queryHash: ids.queryHash,
+        nextOrderCursor: null,
+        providerRowsSeen: 1,
+        eligibleOrdersSeen: 0,
+      },
+      refreshCandidateGlobalId: null,
+      retryRejectionGlobalId: null,
+      readIntentId: rejectionRead.readIntentId,
+      capturedResponseHash: rejectionRead.responseHash,
+      exactExternalProductIdHash: rejectedTargetHash,
+    }),
+    (error) => error?.code === 'COMMERCE_INTAKE_EXACT_PRODUCT_TARGET_MISMATCH',
+  )
+  assert.equal(
+    counters.imageReconcileCalls.length,
+    imageCallsBeforeRejectedRead,
+    'A rejected exact product must fail before channel or image reconciliation',
+  )
+  const rejectedChannelAfter = (await pool.query(
+    `SELECT global_id, row_version::integer, source_revision, source_hash,
+            pack_evidence_hash
+     FROM operations_product_channel_states
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_variant_id = $3`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      scenarios.rejected.externalVariantId,
+    ],
+  )).rows[0]
+  assert.deepEqual(rejectedChannelAfter, rejectedChannelBefore)
+  assert.equal(Number((await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_commerce_variant_pack_mappings
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [ids.organization, ids.faireIntegrationAccount],
+  )).rows[0].count), mappingsBeforeRejectedRead)
+  const rejectedIntent = (await pool.query(
+    `SELECT intent_state, staged_run_id::text
+     FROM operations_commerce_intake_read_intents
+     WHERE id = $1::uuid`,
+    [rejectionRead.readIntentId],
+  )).rows[0]
+  assert.deepEqual(rejectedIntent, {
+    intent_state: 'captured',
+    staged_run_id: null,
+  })
+
+  const candidateRows = await pool.query(
+    `SELECT
+       candidate.external_order_id,
+       candidate.global_id AS candidate_global_id,
+       candidate.row_version::integer AS candidate_row_version,
+       line.global_id AS line_global_id,
+       line.row_version::integer AS line_row_version,
+       line.mapping_state,
+       line.packaging_state,
+       line.external_product_id,
+       line.external_variant_id,
+       line.product_id::text,
+       line.product_mapping_id::text,
+       line.commerce_variant_pack_mapping_id::text
+     FROM operations_commerce_order_candidates candidate
+     JOIN operations_commerce_order_candidate_lines line
+       ON line.organization_id = candidate.organization_id
+      AND line.integration_account_id = candidate.integration_account_id
+      AND line.pipeline_id = candidate.pipeline_id
+      AND line.order_candidate_id = candidate.id
+     WHERE candidate.organization_id = $1::uuid
+       AND candidate.integration_account_id = $2::uuid
+       AND candidate.external_order_id = ANY($3::text[])
+     ORDER BY candidate.external_order_id`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      orders.map((order) => order.identity.value),
+    ],
+  )
+  assert.equal(candidateRows.rowCount, 2)
+  const candidateFor = (scenario) => candidateRows.rows.find(
+    (row) => row.external_order_id === `faire-order-${scenario.key}`,
+  )
+  const successCandidate = candidateFor(scenarios.success)
+  const staleCandidate = candidateFor(scenarios.stale)
+  for (const row of [successCandidate, staleCandidate]) {
+    assert.equal(row.mapping_state, 'resolved')
+    assert.equal(row.packaging_state, 'unresolved')
+    assert.equal(row.product_id, ids.product)
+    assert.ok(row.product_mapping_id)
+    assert.equal(row.commerce_variant_pack_mapping_id, null)
+  }
+  const exactEvidence = (staged, scenario) => ({
+    runGlobalId: staged.result.runGlobalId,
+    externalProductId: scenario.externalProductId,
+    productSourceHash: staged.result.exactProductEvidence.productSourceHash,
+    ...staged.result.exactProductEvidence.variants[0],
+  })
+  const successEvidence = exactEvidence(exactSuccess, scenarios.success)
+  const successKey = 'commerce-staging-faire-variant-pack-success'
+  const successResult = await persistence
+    .resolveCommerceCandidatePackageInPostgres({
+      runtime,
+      actorEmail,
+      idempotencyKey: successKey,
+      candidateGlobalId: successCandidate.candidate_global_id,
+      candidateRowVersion: successCandidate.candidate_row_version,
+      lineGlobalId: successCandidate.line_global_id,
+      package: {
+        mode: 'variant_mapping',
+        externalProductId: scenarios.success.externalProductId,
+        externalVariantId: scenarios.success.externalVariantId,
+        packProfileVersionGlobalId: packVersion.global_id,
+        expectedPackProfileVersionRowVersion: packVersion.row_version,
+        exactProductReadEvidence: successEvidence,
+      },
+    })
+  assert.equal(successResult.mappingCreated, true)
+  assert.equal(successResult.exactProductRunGlobalId,
+    exactSuccess.result.runGlobalId)
+  assert.equal(successResult.channelStateGlobalId,
+    successEvidence.channelStateGlobalId)
+  const successState = (await pool.query(
+    `SELECT
+       line.packaging_state,
+       line.packaging_source,
+       line.packaging_weight_source,
+       line.row_version::integer AS line_row_version,
+       line.commerce_variant_pack_mapping_id::text,
+       line.pack_profile_version_id::text,
+       receipt.status AS receipt_status,
+       receipt.completed_at IS NOT NULL AS receipt_completed,
+       mapping.global_id AS mapping_global_id,
+       mapping.pack_evidence_hash
+     FROM operations_commerce_order_candidate_lines line
+     JOIN operations_commerce_order_candidates candidate
+       ON candidate.organization_id = line.organization_id
+      AND candidate.id = line.order_candidate_id
+     JOIN operations_command_receipts receipt
+       ON receipt.organization_id = candidate.organization_id
+      AND receipt.command_type = 'commerce.intake.resolve_package'
+      AND receipt.idempotency_key = $3
+     JOIN operations_commerce_variant_pack_mappings mapping
+       ON mapping.organization_id = line.organization_id
+      AND mapping.id = line.commerce_variant_pack_mapping_id
+     WHERE line.organization_id = $1::uuid
+       AND line.global_id = $2`,
+    [ids.organization, successCandidate.line_global_id, successKey],
+  )).rows[0]
+  assert.equal(successState.packaging_state, 'resolved')
+  assert.equal(successState.packaging_source, 'variant_pack_mapping')
+  assert.equal(successState.packaging_weight_source, 'profile_version')
+  assert.ok(
+    successState.line_row_version > successCandidate.line_row_version,
+  )
+  assert.ok(successState.commerce_variant_pack_mapping_id)
+  assert.equal(successState.pack_profile_version_id, packVersion.id)
+  assert.equal(successState.receipt_status, 'succeeded')
+  assert.equal(successState.receipt_completed, true)
+  assert.equal(
+    successState.mapping_global_id,
+    successResult.variantPackMappingGlobalId,
+  )
+  assert.equal(
+    successState.pack_evidence_hash,
+    successEvidence.channelPackEvidenceHash,
+  )
+
+  const staleEvidence = exactEvidence(exactStale, scenarios.stale)
+  const rollbackSnapshot = async () => ({
+    line: (await pool.query(
+      `SELECT row_version::integer, packaging_state, packaging_source,
+              packaging_weight_source,
+              commerce_variant_pack_mapping_id::text,
+              pack_profile_version_id::text
+       FROM operations_commerce_order_candidate_lines
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [ids.organization, staleCandidate.line_global_id],
+    )).rows[0],
+    candidate: (await pool.query(
+      `SELECT row_version::integer, workflow_state
+       FROM operations_commerce_order_candidates
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [ids.organization, staleCandidate.candidate_global_id],
+    )).rows[0],
+    mappingCount: Number((await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_commerce_variant_pack_mappings
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [ids.organization, ids.faireIntegrationAccount],
+    )).rows[0].count),
+  })
+  const assertRolledBack = async (before, key) => {
+    const after = await rollbackSnapshot()
+    assert.deepEqual(after, before)
+    const receipts = (await pool.query(
+      `SELECT count(*)::integer AS total,
+              count(*) FILTER (WHERE status = 'succeeded')::integer
+                AS completed
+       FROM operations_command_receipts
+       WHERE organization_id = $1::uuid
+         AND command_type = 'commerce.intake.resolve_package'
+         AND idempotency_key = $2`,
+      [ids.organization, key],
+    )).rows[0]
+    assert.deepEqual(receipts, { total: 0, completed: 0 })
+  }
+  const tamperedBefore = await rollbackSnapshot()
+  const tamperedKey = 'commerce-staging-faire-variant-pack-tampered-evidence'
+  await assert.rejects(
+    persistence.resolveCommerceCandidatePackageInPostgres({
+      runtime,
+      actorEmail,
+      idempotencyKey: tamperedKey,
+      candidateGlobalId: staleCandidate.candidate_global_id,
+      candidateRowVersion: staleCandidate.candidate_row_version,
+      lineGlobalId: staleCandidate.line_global_id,
+      package: {
+        mode: 'variant_mapping',
+        externalProductId: scenarios.stale.externalProductId,
+        externalVariantId: scenarios.stale.externalVariantId,
+        packProfileVersionGlobalId: packVersion.global_id,
+        expectedPackProfileVersionRowVersion: packVersion.row_version,
+        exactProductReadEvidence: {
+          ...staleEvidence,
+          productSourceHash: hash('tampered-product-source'),
+        },
+      },
+    }),
+    (error) => error?.code === 'COMMERCE_INTAKE_EXACT_PRODUCT_EVIDENCE_REQUIRED',
+  )
+  await assertRolledBack(tamperedBefore, tamperedKey)
+
+  const advancedChannel = await pool.query(
+    `UPDATE operations_product_channel_states
+     SET provider_updated_at = '2026-08-01T18:00:00.000Z'::timestamptz,
+         observed_at = '2026-08-01T18:00:00.000Z'::timestamptz,
+         source_revision = '2026-08-01T18:00:00.000Z',
+         source_hash = $4,
+         row_version = row_version + 1,
+         updated_by = $5,
+         updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND global_id = $3
+     RETURNING row_version::integer, source_hash`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      staleEvidence.channelStateGlobalId,
+      hash('newer-faire-pack-channel-observation'),
+      actorEmail,
+    ],
+  )
+  assert.equal(
+    advancedChannel.rows[0].row_version,
+    staleEvidence.channelStateRowVersion + 1,
+  )
+  const staleBefore = await rollbackSnapshot()
+  const staleKey = 'commerce-staging-faire-variant-pack-stale-evidence'
+  await assert.rejects(
+    persistence.resolveCommerceCandidatePackageInPostgres({
+      runtime,
+      actorEmail,
+      idempotencyKey: staleKey,
+      candidateGlobalId: staleCandidate.candidate_global_id,
+      candidateRowVersion: staleCandidate.candidate_row_version,
+      lineGlobalId: staleCandidate.line_global_id,
+      package: {
+        mode: 'variant_mapping',
+        externalProductId: scenarios.stale.externalProductId,
+        externalVariantId: scenarios.stale.externalVariantId,
+        packProfileVersionGlobalId: packVersion.global_id,
+        expectedPackProfileVersionRowVersion: packVersion.row_version,
+        exactProductReadEvidence: staleEvidence,
+      },
+    }),
+    (error) => error?.code === 'COMMERCE_INTAKE_EXACT_PRODUCT_STATE_REQUIRED',
+  )
+  await assertRolledBack(staleBefore, staleKey)
+}
+
 async function verifyCustomerPrefetchBinding(
   pool,
   ids,
@@ -957,6 +1787,7 @@ async function verifyCustomerPrefetchBinding(
   assert.ok(customer?.reference_code)
   const runtime = {
     organizationId: ids.organization,
+    integrationAccountId: ids.faireIntegrationAccount,
     globalId: 'gia0009202',
     provider: 'faire',
     credentialVersion: 1,
@@ -1145,6 +1976,254 @@ async function verifyCustomerPrefetchBinding(
   ]) assert.equal(afterConfirm[field], beforePlan[field])
   assert.equal(counters.fetchCalls, 0)
 
+  const preservedVerifiedAt = '2026-08-01T12:34:56.000Z'
+  await pool.query(
+    `UPDATE operations_external_identifiers
+     SET last_verified_at = $4::timestamptz
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND entity_type = 'crm.organization'
+       AND external_id = $3`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      retailerId,
+      preservedVerifiedAt,
+    ],
+  )
+  const operatorEvidenceBeforeAutomatic = (await pool.query(
+    `SELECT entity_global_id, status, match_method, match_evidence,
+            last_verified_at
+     FROM operations_external_identifiers
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND entity_type = 'crm.organization'
+       AND external_id = $3`,
+    [ids.organization, ids.faireIntegrationAccount, retailerId],
+  )).rows[0]
+  assert.equal(
+    operatorEvidenceBeforeAutomatic.match_evidence.evidenceType,
+    'operator_confirmed_email',
+  )
+
+  const weakRetailerId = 'retailer-301'
+  const weakVerifiedAt = '2026-08-01T11:00:00.000Z'
+  await pool.query(
+    `INSERT INTO operations_external_identifiers (
+       organization_id, integration_account_id, entity_type,
+       entity_global_id, external_id, status, match_method,
+       match_evidence, last_verified_at
+     ) VALUES (
+       $1::uuid, $2::uuid, 'crm.organization', $3, $4, 'active',
+       'name', '{"source":"legacy_name_match"}'::jsonb,
+       $5::timestamptz
+     )`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      customer.reference_code,
+      weakRetailerId,
+      weakVerifiedAt,
+    ],
+  )
+
+  const automaticRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009205',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-binding-preservation',
+    responseHash: hash('commerce-staging-faire-binding-response'),
+  }
+  const automaticOrder = faireRetailerOrderFixture({
+    key: 'binding-preservation',
+    retailerId,
+    evidenceEmail,
+  })
+  const weakEvidenceOrder = faireRetailerOrderFixture({
+    key: 'binding-normal-update',
+    retailerId: weakRetailerId,
+    evidenceEmail,
+  })
+  const automaticEnvelope = Object.freeze({
+    schemaVersion: 'commerce-normalization-envelope-v1',
+    normalizerVersion: 'commerce-staging-postgres-v1',
+    provider: 'faire',
+    organizationId: ids.organization,
+    integrationAccountId: ids.faireIntegrationAccount,
+    externalAccountId: 'brand-9202',
+    apiVersion: '2026-07',
+    observedAt,
+    credentialGeneration: 1,
+    retentionExpiresAt,
+    sourceHash: hash('commerce-staging-faire-binding-envelope'),
+    products: Object.freeze([]),
+    orders: Object.freeze([automaticOrder, weakEvidenceOrder]),
+    rejections: Object.freeze([]),
+  })
+  const automaticSeed = await pool.connect()
+  try {
+    await seedAdditionalCapturedRead(automaticSeed, ids, {
+      ...automaticRead,
+      integrationAccountId: ids.faireIntegrationAccount,
+      provider: 'faire',
+    })
+  } finally {
+    automaticSeed.release()
+  }
+  const stagedAutomaticOrder =
+    await persistence.stageCommerceNormalizationEnvelopeInPostgres({
+      runtime,
+      actorEmail,
+      idempotencyKey: automaticRead.idempotencyKey,
+      envelope: automaticEnvelope,
+      stageAction: 'fetch',
+      page: {
+        mode: 'operational',
+        resource: 'orders',
+        sessionId: automaticRead.sessionId,
+        batchNumber: 1,
+        previousRunGlobalId: null,
+        windowStart: null,
+        windowEnd: observedAt,
+        queryHash: ids.queryHash,
+        nextOrderCursor: null,
+        providerRowsSeen: 2,
+        eligibleOrdersSeen: 2,
+      },
+      refreshCandidateGlobalId: null,
+      retryRejectionGlobalId: null,
+      readIntentId: automaticRead.readIntentId,
+      capturedResponseHash: automaticRead.responseHash,
+    })
+  assert.equal(stagedAutomaticOrder.ordersStaged, 2)
+  const automaticCandidate = (await pool.query(
+    `SELECT global_id, row_version::integer
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_order_id = $3`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      automaticOrder.identity.value,
+    ],
+  )).rows[0]
+  assert.ok(automaticCandidate?.global_id)
+  const automaticResolution =
+    await persistence.resolveCommerceCandidateCustomerInPostgres({
+      runtime,
+      actorEmail,
+      idempotencyKey: 'commerce-staging-faire-external-id-resolution',
+      candidateGlobalId: automaticCandidate.global_id,
+      candidateRowVersion: automaticCandidate.row_version,
+      customer: {
+        mode: 'existing',
+        customerGlobalId: customer.reference_code,
+        resolutionMethod: 'external_id',
+      },
+    })
+  assert.equal(
+    automaticResolution.customerResolutionMethod,
+    'external_id',
+  )
+  const operatorEvidenceAfterAutomatic = (await pool.query(
+    `SELECT identity.entity_global_id, identity.status,
+            identity.match_method, identity.match_evidence,
+            identity.last_verified_at,
+            candidate.customer_match_method,
+            customer.reference_code AS candidate_customer_global_id
+     FROM operations_external_identifiers identity
+     JOIN operations_commerce_order_candidates candidate
+       ON candidate.organization_id = identity.organization_id
+      AND candidate.integration_account_id = identity.integration_account_id
+      AND candidate.global_id = $4
+     JOIN crm_organizations customer
+       ON customer.pipeline_id = candidate.pipeline_id
+      AND customer.id = candidate.customer_id
+     WHERE identity.organization_id = $1::uuid
+       AND identity.integration_account_id = $2::uuid
+       AND identity.entity_type = 'crm.organization'
+       AND identity.external_id = $3`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      retailerId,
+      automaticCandidate.global_id,
+    ],
+  )).rows[0]
+  assert.equal(
+    operatorEvidenceAfterAutomatic.entity_global_id,
+    customer.reference_code,
+  )
+  assert.equal(operatorEvidenceAfterAutomatic.status, 'active')
+  assert.equal(operatorEvidenceAfterAutomatic.match_method, 'email')
+  assert.deepEqual(
+    operatorEvidenceAfterAutomatic.match_evidence,
+    operatorEvidenceBeforeAutomatic.match_evidence,
+    'Automatic same-entity resolution must preserve stronger operator evidence',
+  )
+  assert.equal(
+    new Date(operatorEvidenceAfterAutomatic.last_verified_at).toISOString(),
+    preservedVerifiedAt,
+    'Automatic same-entity resolution must preserve its verified timestamp',
+  )
+  assert.equal(
+    operatorEvidenceAfterAutomatic.customer_match_method,
+    'external_id',
+  )
+  assert.equal(
+    operatorEvidenceAfterAutomatic.candidate_customer_global_id,
+    customer.reference_code,
+  )
+  const weakEvidenceCandidate = (await pool.query(
+    `SELECT global_id, row_version::integer, source_hash
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_order_id = $3`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      weakEvidenceOrder.identity.value,
+    ],
+  )).rows[0]
+  assert.ok(weakEvidenceCandidate?.global_id)
+  await persistence.resolveCommerceCandidateCustomerInPostgres({
+    runtime,
+    actorEmail,
+    idempotencyKey: 'commerce-staging-faire-normal-binding-evidence',
+    candidateGlobalId: weakEvidenceCandidate.global_id,
+    candidateRowVersion: weakEvidenceCandidate.row_version,
+    customer: {
+      mode: 'existing',
+      customerGlobalId: customer.reference_code,
+      resolutionMethod: 'external_id',
+    },
+  })
+  const normalAutomaticEvidence = (await pool.query(
+    `SELECT entity_global_id, status, match_method, match_evidence,
+            last_verified_at
+     FROM operations_external_identifiers
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND entity_type = 'crm.organization'
+       AND external_id = $3`,
+    [ids.organization, ids.faireIntegrationAccount, weakRetailerId],
+  )).rows[0]
+  assert.equal(normalAutomaticEvidence.entity_global_id, customer.reference_code)
+  assert.equal(normalAutomaticEvidence.status, 'active')
+  assert.equal(normalAutomaticEvidence.match_method, 'external_id')
+  assert.deepEqual(normalAutomaticEvidence.match_evidence, {
+    candidateGlobalId: weakEvidenceCandidate.global_id,
+    sourceHash: weakEvidenceCandidate.source_hash,
+  })
+  assert.ok(
+    new Date(normalAutomaticEvidence.last_verified_at).getTime()
+      > new Date(weakVerifiedAt).getTime(),
+    'Normal automatic evidence should verify when no stronger binding exists',
+  )
+
   const conflictingCustomer = (await pool.query(
     `INSERT INTO crm_organizations (
        pipeline_id, source_key, identity_key, name, relationship_type,
@@ -1157,6 +2236,67 @@ async function verifyCustomerPrefetchBinding(
      ) RETURNING reference_code`,
     [ids.pipeline, hash('prefetch-conflict-customer'), actorEmail],
   )).rows[0]
+  const candidateBeforeConflict = (await pool.query(
+    `SELECT row_version::integer, customer_id::text
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND global_id = $2`,
+    [ids.organization, automaticCandidate.global_id],
+  )).rows[0]
+  await assert.rejects(
+    persistence.resolveCommerceCandidateCustomerInPostgres({
+      runtime,
+      actorEmail,
+      idempotencyKey: 'commerce-staging-faire-binding-conflict',
+      candidateGlobalId: automaticCandidate.global_id,
+      candidateRowVersion: candidateBeforeConflict.row_version,
+      customer: {
+        mode: 'existing',
+        customerGlobalId: conflictingCustomer.reference_code,
+        resolutionMethod: 'external_id',
+      },
+    }),
+    (error) => error?.code === 'COMMERCE_INTAKE_CUSTOMER_IDENTITY_CONFLICT',
+  )
+  const conflictRollback = (await pool.query(
+    `SELECT identity.entity_global_id, identity.match_method,
+            identity.match_evidence, identity.last_verified_at,
+            candidate.row_version::integer,
+            candidate.customer_id::text
+     FROM operations_external_identifiers identity
+     JOIN operations_commerce_order_candidates candidate
+       ON candidate.organization_id = identity.organization_id
+      AND candidate.integration_account_id = identity.integration_account_id
+      AND candidate.global_id = $4
+     WHERE identity.organization_id = $1::uuid
+       AND identity.integration_account_id = $2::uuid
+       AND identity.entity_type = 'crm.organization'
+       AND identity.external_id = $3`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      retailerId,
+      automaticCandidate.global_id,
+    ],
+  )).rows[0]
+  assert.equal(conflictRollback.entity_global_id, customer.reference_code)
+  assert.equal(conflictRollback.match_method, 'email')
+  assert.deepEqual(
+    conflictRollback.match_evidence,
+    operatorEvidenceBeforeAutomatic.match_evidence,
+  )
+  assert.equal(
+    new Date(conflictRollback.last_verified_at).toISOString(),
+    preservedVerifiedAt,
+  )
+  assert.equal(
+    conflictRollback.row_version,
+    candidateBeforeConflict.row_version,
+  )
+  assert.equal(
+    conflictRollback.customer_id,
+    candidateBeforeConflict.customer_id,
+  )
   await pool.query(
     `INSERT INTO operations_external_identifiers (
        organization_id, integration_account_id, entity_type,
@@ -2695,6 +3835,7 @@ async function verifyAcceptance(databaseUrl) {
     4,
     'Only still-unresolved prior-run candidates belong in the backlog sweep',
   )
+  await verifyFaireExactVariantPackBinding(pool, ids, persistence, counters)
   await verifyCustomerPrefetchBinding(pool, ids, persistence, counters)
   await pool.end()
 }
@@ -2736,7 +3877,7 @@ async function main() {
     'Commerce intake staging, scaled-whole zero-price promotion, fractional '
       + 'rollback, review-mode terminal catalog recovery, and policy-drift '
       + 'recovery, plus Faire customer pre-fetch binding disposable-PostgreSQL '
-      + 'acceptance passed',
+      + 'and exact variant-pack evidence acceptance passed',
   )
 }
 

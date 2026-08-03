@@ -297,12 +297,15 @@ type CandidateLineRow = {
   sku_snapshot: string | null
   product_title_snapshot: string
   variant_title_snapshot: string | null
+  provider_status_raw: string
+  normalized_status: string
   ordered_quantity: string
   current_quantity: string
   cancelled_quantity: string
   fulfilled_quantity: string
   unfulfilled_quantity: string
   returned_quantity: string
+  unit_multiplier: string
   currency_code: string | null
   unit_price_minor: string | null
   subtotal_minor: string | null
@@ -346,6 +349,7 @@ type CandidateLineRow = {
   blocking_codes: string[]
   source_revision: string
   source_hash: string
+  observed_at: string | Date
   row_version: string
 }
 
@@ -382,6 +386,23 @@ type RuntimePackMappingRow = {
   channel_source_hash: string | null
   channel_pack_evidence_hash: string | null
   channel_weight_grams: number | null
+}
+
+type ExactProductVariantStageEvidence = {
+  externalVariantId: string
+  variantSourceRevision: string
+  variantSourceHash: string
+  channelStateGlobalId: string
+  channelStateRowVersion: number
+  channelSourceRevision: string
+  channelSourceHash: string
+  channelPackEvidenceHash: string
+}
+
+type ExactProductPackReadEvidence = ExactProductVariantStageEvidence & {
+  runGlobalId: string
+  externalProductId: string
+  productSourceHash: string
 }
 
 type ProductCandidateRow = {
@@ -1185,6 +1206,8 @@ export async function confirmCommerceCustomerPrefetchBindingInPostgres(input: {
          match_method = 'email',
          match_evidence = EXCLUDED.match_evidence,
          last_verified_at = now()
+       WHERE operations_external_identifiers.entity_global_id
+             = EXCLUDED.entity_global_id
        RETURNING entity_global_id`,
       [
         account.organization_id,
@@ -1448,6 +1471,52 @@ function envelopeMatchesExactOrderTarget(
     returnedOrderIdentities.length === 1
     && commandHash(returnedOrderIdentities[0])
       === exactExternalOrderIdHash
+  )
+}
+
+function envelopeMatchesExactProductTarget(
+  envelope: CommerceNormalizationEnvelope,
+  exactExternalProductIdHash: string,
+) {
+  const productRejections = envelope.rejections.filter(
+    (rejection) => rejection.resourceType === 'product',
+  )
+  return (
+    envelope.products.length === 1
+    && productRejections.length === 0
+    && commandHash(envelope.products[0].identity.value)
+      === exactExternalProductIdHash
+  )
+}
+
+function exactProductAuditEvidenceMatches(
+  value: unknown,
+  expected: ExactProductPackReadEvidence,
+) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const product = value as Record<string, unknown>
+  if (
+    product.externalProductId !== expected.externalProductId
+    || product.productSourceHash !== expected.productSourceHash
+    || !Array.isArray(product.variants)
+  ) return false
+  const variants = product.variants.filter((entry) => (
+    entry
+    && typeof entry === 'object'
+    && !Array.isArray(entry)
+    && (entry as Record<string, unknown>).externalVariantId
+      === expected.externalVariantId
+  )) as Record<string, unknown>[]
+  if (variants.length !== 1) return false
+  const variant = variants[0]
+  return (
+    variant.variantSourceRevision === expected.variantSourceRevision
+    && variant.variantSourceHash === expected.variantSourceHash
+    && variant.channelStateGlobalId === expected.channelStateGlobalId
+    && variant.channelStateRowVersion === expected.channelStateRowVersion
+    && variant.channelSourceRevision === expected.channelSourceRevision
+    && variant.channelSourceHash === expected.channelSourceHash
+    && variant.channelPackEvidenceHash === expected.channelPackEvidenceHash
   )
 }
 
@@ -1864,12 +1933,15 @@ const LINE_SELECT = `SELECT
   line.sku_snapshot,
   line.product_title_snapshot,
   line.variant_title_snapshot,
+  line.provider_status_raw,
+  line.normalized_status,
   line.ordered_quantity::text,
   line.current_quantity::text,
   line.cancelled_quantity::text,
   line.fulfilled_quantity::text,
   line.unfulfilled_quantity::text,
   line.returned_quantity::text,
+  line.unit_multiplier::text,
   line.currency_code,
   line.unit_price_minor::text,
   line.subtotal_minor::text,
@@ -1914,6 +1986,7 @@ const LINE_SELECT = `SELECT
   line.blocking_codes,
   line.source_revision,
   line.source_hash,
+  line.observed_at,
   line.row_version::text
 FROM operations_commerce_order_candidate_lines line
 LEFT JOIN crm_products product
@@ -3063,6 +3136,7 @@ type CommerceIntakeStageReplayLookup = {
   idempotencyKey: string
   action: CommerceIntakeStageAction
   exactExternalOrderIdHash?: string | null
+  exactExternalProductIdHash?: string | null
   target: {
     kind: 'none' | 'candidate' | 'rejection' | 'continuation'
     globalId: string | null
@@ -3148,6 +3222,10 @@ async function readCommerceIntakeStageReplayWithClient(
       input.exactExternalOrderIdHash !== undefined
       && row.provider_target_hash !== input.exactExternalOrderIdHash
     )
+    || (
+      input.exactExternalProductIdHash !== undefined
+      && row.provider_target_hash !== input.exactExternalProductIdHash
+    )
   ) {
     intakeError(
       'COMMERCE_INTAKE_IDEMPOTENCY_CONFLICT',
@@ -3198,6 +3276,7 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
   resource: 'orders' | 'products'
   target: CommerceIntakeReadIntentTarget
   exactExternalOrderIdHash?: string | null
+  exactExternalProductIdHash?: string | null
   continuationRunGlobalId: string | null
   pageSize: number
 }) {
@@ -3240,6 +3319,20 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
           || input.continuationRunGlobalId !== null
           || !/^[a-f0-9]{64}$/.test(input.exactExternalOrderIdHash)
         )
+      )
+      || (
+        input.exactExternalProductIdHash
+        && (
+          input.action !== 'fetch-products'
+          || input.resource !== 'products'
+          || input.target.kind !== 'none'
+          || input.continuationRunGlobalId !== null
+          || !/^[a-f0-9]{64}$/.test(input.exactExternalProductIdHash)
+        )
+      )
+      || (
+        Boolean(input.exactExternalOrderIdHash)
+        && Boolean(input.exactExternalProductIdHash)
       )
     ) {
       intakeError(
@@ -3431,6 +3524,9 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
       target,
       ...(input.exactExternalOrderIdHash
         ? { exactExternalOrderIdHash: input.exactExternalOrderIdHash }
+        : {}),
+      ...(input.exactExternalProductIdHash
+        ? { exactExternalProductIdHash: input.exactExternalProductIdHash }
         : {}),
       pageSize: input.pageSize,
       readOnly: true,
@@ -3653,6 +3749,9 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
         pageSize: input.pageSize,
         ...(input.exactExternalOrderIdHash
           ? { exactExternalOrderIdHash: input.exactExternalOrderIdHash }
+          : {}),
+        ...(input.exactExternalProductIdHash
+          ? { exactExternalProductIdHash: input.exactExternalProductIdHash }
           : {}),
         productsFetched: input.resource === 'products',
         oneRootPage: true,
@@ -4338,6 +4437,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
   readIntentId: string
   capturedResponseHash: string
   exactExternalOrderIdHash?: string | null
+  exactExternalProductIdHash?: string | null
 }) {
   return withTransaction(async (client) => {
     const account = await resolveAccount(client, {
@@ -4432,6 +4532,18 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           || !/^[a-f0-9]{64}$/.test(input.exactExternalOrderIdHash)
         )
       )
+      || (
+        input.exactExternalProductIdHash
+        && (
+          input.stageAction !== 'fetch-products'
+          || input.page?.resource !== 'products'
+          || !/^[a-f0-9]{64}$/.test(input.exactExternalProductIdHash)
+        )
+      )
+      || (
+        Boolean(input.exactExternalOrderIdHash)
+        && Boolean(input.exactExternalProductIdHash)
+      )
     ) {
       intakeError(
         'COMMERCE_INTAKE_CONTINUATION_INVALID',
@@ -4471,6 +4583,9 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       retryRejectionGlobalId: input.retryRejectionGlobalId,
       ...(input.exactExternalOrderIdHash
         ? { exactExternalOrderIdHash: input.exactExternalOrderIdHash }
+        : {}),
+      ...(input.exactExternalProductIdHash
+        ? { exactExternalProductIdHash: input.exactExternalProductIdHash }
         : {}),
       readIntentId: input.readIntentId,
       capturedResponseHash: input.capturedResponseHash,
@@ -4535,6 +4650,12 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
             ? {
                 exactExternalOrderIdHash:
                   input.exactExternalOrderIdHash ?? null,
+              }
+            : {}),
+          ...(input.stageAction === 'fetch-products'
+            ? {
+                exactExternalProductIdHash:
+                  input.exactExternalProductIdHash ?? null,
               }
             : {}),
         },
@@ -4634,6 +4755,11 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
             !== input.exactExternalOrderIdHash
         )
         || (
+          input.exactExternalProductIdHash !== undefined
+          && readIntent.provider_target_hash
+            !== input.exactExternalProductIdHash
+        )
+        || (
           input.page
           && (
             readIntent.session_id !== input.page.sessionId
@@ -4689,6 +4815,19 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       intakeError(
         'COMMERCE_INTAKE_EXACT_ORDER_TARGET_MISMATCH',
         'The exact provider read returned a different or ambiguous order identity. No provider data was staged.',
+        409,
+      )
+    }
+    if (
+      input.exactExternalProductIdHash
+      && !envelopeMatchesExactProductTarget(
+        input.envelope,
+        input.exactExternalProductIdHash,
+      )
+    ) {
+      intakeError(
+        'COMMERCE_INTAKE_EXACT_PRODUCT_TARGET_MISMATCH',
+        'The exact provider read returned a different or ambiguous product identity. No provider data was staged.',
         409,
       )
     }
@@ -5193,6 +5332,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       ]),
     )
     const productCandidateByVariant = new Map<string, string>()
+    const exactProductVariantEvidence: ExactProductVariantStageEvidence[] = []
     let productVariantsStaged = 0
     let productVariantsPreserved = 0
     for (const product of input.envelope.products) {
@@ -5258,6 +5398,84 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           sourceHash: variant.sourceHash,
           actorEmail: input.actorEmail,
         })
+        if (input.exactExternalProductIdHash) {
+          const exactChannelState = (
+            await client.query<{
+              global_id: string
+              row_version: string
+              external_product_id: string
+              external_variant_id: string
+              product_id: string | null
+              product_mapping_id: string | null
+              source_revision: string
+              source_hash: string
+              pack_evidence_hash: string
+            }>(
+              `SELECT
+                 global_id,
+                 row_version::text,
+                 external_product_id,
+                 external_variant_id,
+                 product_id::text,
+                 product_mapping_id::text,
+                 source_revision,
+                 source_hash,
+                 pack_evidence_hash
+               FROM operations_product_channel_states
+               WHERE organization_id = $1::uuid
+                 AND integration_account_id = $2::uuid
+                 AND pipeline_id = $3::uuid
+                 AND provider = $4
+                 AND external_product_id = $5
+                 AND external_variant_id = $6
+               LIMIT 1
+               FOR UPDATE`,
+              [
+                account.organization_id,
+                account.id,
+                account.pipeline_id,
+                account.provider,
+                product.identity.value,
+                variant.identity.value,
+              ],
+            )
+          ).rows[0]
+          if (
+            !exactChannelState
+            || exactChannelState.external_product_id
+              !== product.identity.value
+            || exactChannelState.external_variant_id
+              !== variant.identity.value
+            || exactChannelState.source_revision !== incomingSourceRevision
+            || exactChannelState.source_hash !== variant.sourceHash
+            || exactChannelState.pack_evidence_hash
+              !== channelStateEvidence.packEvidenceHash
+            || (
+              mapping
+              && (
+                exactChannelState.product_id !== mapping.product_id
+                || exactChannelState.product_mapping_id !== mapping.id
+              )
+            )
+          ) {
+            intakeError(
+              'COMMERCE_INTAKE_EXACT_PRODUCT_STATE_MISMATCH',
+              'The exact provider product could not be tied to the channel state staged by this read. No provider data was retained.',
+              409,
+            )
+          }
+          exactProductVariantEvidence.push({
+            externalVariantId: exactChannelState.external_variant_id,
+            variantSourceRevision: incomingSourceRevision,
+            variantSourceHash: variant.sourceHash,
+            channelStateGlobalId: exactChannelState.global_id,
+            channelStateRowVersion: Number(exactChannelState.row_version),
+            channelSourceRevision: exactChannelState.source_revision,
+            channelSourceHash: exactChannelState.source_hash,
+            channelPackEvidenceHash:
+              exactChannelState.pack_evidence_hash,
+          })
+        }
         const runtimePackMapping = runtimePackMappingByVariant.get(
           variant.identity.value,
         )
@@ -6222,6 +6440,16 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       recordsRejected,
       recordsStaged,
       productImageImports,
+      ...(input.exactExternalProductIdHash
+        ? {
+            exactProductEvidence: {
+              externalProductId:
+                input.envelope.products[0].identity.value,
+              productSourceHash: input.envelope.products[0].sourceHash,
+              variants: exactProductVariantEvidence,
+            },
+          }
+        : {}),
       pagination,
       providerWrites: 0,
       syncCursorAdvanced: false,
@@ -6248,6 +6476,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         productImageImports,
         action: stageResult.action,
         exactOrderTargetHash: input.exactExternalOrderIdHash,
+        exactProductTargetHash: input.exactExternalProductIdHash,
         pagination,
         stageResult,
         providerWrites: 0,
@@ -7021,6 +7250,17 @@ export async function readCommerceIntakeStateFromPostgres(input: {
         weightGrams: number
         dimensionsMm: { length: number; width: number; height: number }
       }>
+      packProfileVersions: Array<{
+        globalId: string
+        rowVersion: number
+        label: string
+        packageLevel: 'each' | 'inner_pack' | 'case' | 'pallet'
+        baseEachQuantity: number
+        weightGrams: number
+        dimensionsMm: { length: number; width: number; height: number }
+        evidenceType: 'customer_confirmed' | 'measured' | 'provider'
+        weightBasis: string
+      }>
     }>()
     for (const row of productRows.rows) {
       const product = productCatalogMap.get(row.id) || {
@@ -7028,6 +7268,7 @@ export async function readCommerceIntakeStateFromPostgres(input: {
         name: row.name,
         sku: row.sku,
         packageProfiles: [],
+        packProfileVersions: [],
       }
       if (
         row.profile_global_id
@@ -7049,6 +7290,86 @@ export async function readCommerceIntakeStateFromPostgres(input: {
         })
       }
       productCatalogMap.set(row.id, product)
+    }
+    const packProfileVersionRows = await client.query<{
+      product_id: string
+      global_id: string
+      row_version: string
+      profile_name: string
+      package_level: 'each' | 'inner_pack' | 'case' | 'pallet'
+      base_each_quantity: number
+      gross_weight_grams: number
+      length_mm: number
+      width_mm: number
+      height_mm: number
+      evidence_type: 'customer_confirmed' | 'measured' | 'provider'
+      weight_basis: string
+    }>(
+      `SELECT
+         version.product_id::text,
+         version.global_id,
+         version.row_version::text,
+         profile.profile_name,
+         profile.package_level,
+         version.base_each_quantity,
+         version.gross_weight_grams,
+         version.length_mm,
+         version.width_mm,
+         version.height_mm,
+         version.evidence_type,
+         version.weight_basis
+       FROM operations_product_pack_profile_versions version
+       JOIN operations_product_pack_profiles profile
+         ON profile.organization_id = version.organization_id
+        AND profile.pipeline_id = version.pipeline_id
+        AND profile.product_id = version.product_id
+        AND profile.id = version.profile_id
+       WHERE version.organization_id = $1::uuid
+         AND version.pipeline_id = $2::uuid
+         AND version.is_current = true
+         AND version.lifecycle_state IN ('customer_confirmed', 'active')
+         AND version.dimension_basis = 'outer'
+         AND version.length_mm IS NOT NULL
+         AND version.width_mm IS NOT NULL
+         AND version.height_mm IS NOT NULL
+         AND version.gross_weight_grams IS NOT NULL
+         AND version.weight_basis <> 'unspecified'
+         AND version.evidence_type IN (
+           'customer_confirmed', 'measured', 'provider'
+         )
+         AND profile.status <> 'retired'
+       ORDER BY
+         version.product_id,
+         profile.is_default DESC,
+         CASE profile.package_level
+           WHEN 'each' THEN 1
+           WHEN 'inner_pack' THEN 2
+           WHEN 'case' THEN 3
+           WHEN 'pallet' THEN 4
+         END,
+         lower(profile.profile_name),
+         version.version_number DESC
+       LIMIT 4000`,
+      [account.organization_id, account.pipeline_id],
+    )
+    for (const row of packProfileVersionRows.rows) {
+      const product = productCatalogMap.get(row.product_id)
+      if (!product) continue
+      product.packProfileVersions.push({
+        globalId: row.global_id,
+        rowVersion: Number(row.row_version),
+        label: row.profile_name,
+        packageLevel: row.package_level,
+        baseEachQuantity: row.base_each_quantity,
+        weightGrams: row.gross_weight_grams,
+        dimensionsMm: {
+          length: row.length_mm,
+          width: row.width_mm,
+          height: row.height_mm,
+        },
+        evidenceType: row.evidence_type,
+        weightBasis: row.weight_basis,
+      })
     }
     const customers = await client.query<{
       reference_code: string
@@ -7223,6 +7544,7 @@ export async function readCommerceIntakeStateFromPostgres(input: {
           // lifecycle breakdown beside it so the operator can see why a
           // partially fulfilled Shopify line will not be fulfilled twice.
           quantity: safeNumber(line.unfulfilled_quantity),
+          unitMultiplier: safeNumber(line.unit_multiplier),
           orderedQuantity: safeNumber(line.ordered_quantity),
           currentQuantity: safeNumber(line.current_quantity),
           cancelledQuantity: safeNumber(line.cancelled_quantity),
@@ -9341,15 +9663,33 @@ export async function resolveCommerceCandidateCustomerInPostgres(input: {
          ON CONFLICT (
            organization_id, integration_account_id, entity_type, external_id
          ) DO UPDATE SET
-           entity_global_id = CASE
-             WHEN $7::boolean
-               THEN operations_external_identifiers.entity_global_id
-             ELSE EXCLUDED.entity_global_id
-           END,
            status = 'active',
-           match_method = EXCLUDED.match_method,
-           match_evidence = EXCLUDED.match_evidence,
-           last_verified_at = now()
+           match_method = CASE
+             WHEN operations_external_identifiers.status = 'active'
+              AND operations_external_identifiers.match_method = 'email'
+              AND operations_external_identifiers.match_evidence
+                  @> $7::jsonb
+               THEN operations_external_identifiers.match_method
+             ELSE EXCLUDED.match_method
+           END,
+           match_evidence = CASE
+             WHEN operations_external_identifiers.status = 'active'
+              AND operations_external_identifiers.match_method = 'email'
+              AND operations_external_identifiers.match_evidence
+                  @> $7::jsonb
+               THEN operations_external_identifiers.match_evidence
+             ELSE EXCLUDED.match_evidence
+           END,
+           last_verified_at = CASE
+             WHEN operations_external_identifiers.status = 'active'
+              AND operations_external_identifiers.match_method = 'email'
+              AND operations_external_identifiers.match_evidence
+                  @> $7::jsonb
+               THEN operations_external_identifiers.last_verified_at
+             ELSE now()
+           END
+         WHERE operations_external_identifiers.entity_global_id
+               = EXCLUDED.entity_global_id
          RETURNING entity_global_id`,
         [
           candidate.organization_id,
@@ -9361,7 +9701,12 @@ export async function resolveCommerceCandidateCustomerInPostgres(input: {
             candidateGlobalId: candidate.global_id,
             sourceHash: candidate.source_hash,
           }),
-          input.customer.mode === 'create',
+          JSON.stringify({
+            schema: CUSTOMER_PREFETCH_BINDING_POLICY_VERSION,
+            provider: 'faire',
+            evidenceType: 'operator_confirmed_email',
+            confirmedBeforeProviderRead: true,
+          }),
         ],
       )
       if (boundIdentity.rows[0]?.entity_global_id !== customer.globalId) {
@@ -10152,6 +10497,14 @@ export async function resolveCommerceCandidatePackageInPostgres(input: {
   package:
     | { mode: 'profile'; packageProfileGlobalId: string }
     | {
+        mode: 'variant_mapping'
+        externalProductId: string
+        externalVariantId: string
+        packProfileVersionGlobalId: string
+        expectedPackProfileVersionRowVersion: number
+        exactProductReadEvidence: ExactProductPackReadEvidence
+      }
+    | {
         mode: 'manual'
         weightGrams: number
         dimensionsMm: { length: number; width: number; height: number }
@@ -10197,6 +10550,701 @@ export async function resolveCommerceCandidatePackageInPostgres(input: {
         'This line does not require a package',
         422,
       )
+    }
+    if (input.package.mode === 'variant_mapping') {
+      if (
+        candidate.provider !== 'faire'
+        || started.account.provider !== 'faire'
+      ) {
+        intakeError(
+          'COMMERCE_INTAKE_VARIANT_PACK_PROVIDER_INVALID',
+          'Order-evidence pack binding is currently available only for Faire',
+          409,
+        )
+      }
+      if (candidate.credential_version !== started.account.credential_version) {
+        intakeError(
+          'COMMERCE_INTAKE_CREDENTIAL_GENERATION_STALE',
+          'The provider credential changed after this fetch. Fetch and resolve the order again',
+          422,
+        )
+      }
+      if (
+        line.mapping_state !== 'resolved'
+        || !line.product_id
+        || !line.product_global_id
+        || !line.product_mapping_id
+        || !line.external_product_id
+        || !line.external_variant_id
+        || line.external_product_id !== input.package.externalProductId
+        || line.external_variant_id !== input.package.externalVariantId
+      ) {
+        intakeError(
+          'COMMERCE_INTAKE_VARIANT_PACK_IDENTITY_REQUIRED',
+          'Confirm the exact Faire product and variant mapping before binding a Product pack version',
+          422,
+        )
+      }
+      const newerSource = await client.query<{ global_id: string }>(
+        `SELECT newer.global_id
+         FROM operations_commerce_order_candidates newer
+         WHERE newer.organization_id = $1::uuid
+           AND newer.integration_account_id = $2::uuid
+           AND newer.external_order_id = $3
+           AND newer.id <> $4::uuid
+           AND newer.observed_at > $5::timestamptz
+           AND (
+             newer.source_hash <> $6
+             OR newer.source_revision <> $7
+           )
+         ORDER BY newer.observed_at DESC
+         LIMIT 1`,
+        [
+          candidate.organization_id,
+          candidate.integration_account_id,
+          candidate.external_order_id,
+          candidate.id,
+          iso(candidate.observed_at),
+          candidate.source_hash,
+          candidate.source_revision,
+        ],
+      )
+      if (newerSource.rows[0]) {
+        intakeError(
+          'COMMERCE_INTAKE_SOURCE_REVISION_STALE',
+          `A newer provider revision is held as ${newerSource.rows[0].global_id}. Resolve that revision instead`,
+          422,
+        )
+      }
+      const unitMultiplier = exactWholeCommerceQuantityFromNumeric(
+        line.unit_multiplier,
+      )
+      if (
+        unitMultiplier === null
+        || unitMultiplier < BigInt(1)
+        || unitMultiplier > BigInt(Number.MAX_SAFE_INTEGER)
+      ) {
+        intakeError(
+          'COMMERCE_INTAKE_PACK_UNIT_MULTIPLIER_INVALID',
+          'The provider line unit count is not an exact supported whole number',
+          422,
+        )
+      }
+      const exactRead = input.package.exactProductReadEvidence
+      const exactReadTargetHash = commandHash(input.package.externalProductId)
+      const exactReadResult = await client.query<{
+        run_id: string
+        run_global_id: string
+        exact_product_evidence: unknown
+      }>(
+        `SELECT
+           run.id::text AS run_id,
+           run.global_id AS run_global_id,
+           stage.exact_product_evidence
+         FROM operations_commerce_intake_runs run
+         JOIN operations_commerce_intake_read_intents intent
+           ON intent.organization_id = run.organization_id
+          AND intent.integration_account_id = run.integration_account_id
+          AND intent.pipeline_id = run.pipeline_id
+          AND intent.staged_run_id = run.id
+          AND intent.provider_attempt_id = run.provider_attempt_id
+         JOIN operations_commerce_provider_attempts attempt
+           ON attempt.organization_id = intent.organization_id
+          AND attempt.integration_account_id = intent.integration_account_id
+          AND attempt.id = intent.provider_attempt_id
+         JOIN LATERAL (
+           SELECT
+             event.payload #> '{stageResult,exactProductEvidence}'
+               AS exact_product_evidence
+           FROM audit_events event
+           WHERE event.organization_id = run.organization_id
+             AND event.event_type = 'commerce.intake.staged'
+             AND event.aggregate_type = 'operations.commerce_intake_run'
+             AND event.aggregate_id = run.global_id
+             AND event.payload->>'exactProductTargetHash' = $6
+           ORDER BY event.created_at DESC, event.id DESC
+           LIMIT 1
+         ) stage ON true
+         WHERE run.organization_id = $1::uuid
+           AND run.integration_account_id = $2::uuid
+           AND run.pipeline_id = $3::uuid
+           AND run.provider = 'faire'
+           AND run.resource = 'products'
+           AND run.global_id = $4
+           AND run.credential_version = $5::integer
+           AND run.provider_attempt_id IS NOT NULL
+           AND run.expires_at > now()
+           AND run.workflow_state <> 'expired'
+           AND run.provider_write_count = 0
+           AND run.sync_cursor_advanced = false
+           AND intent.provider = 'faire'
+           AND intent.resource = 'products'
+           AND intent.intake_action = 'fetch-products'
+           AND intent.intent_state = 'staged'
+           AND intent.credential_version = $5::integer
+           AND intent.target_kind = 'none'
+           AND intent.expires_at > now()
+           AND attempt.action = 'commerce.intake.read'
+           AND attempt.state = 'succeeded'
+           AND attempt.redacted_request->>'targetHash' = $6
+           AND attempt.redacted_request->>'targetedRead' = 'true'
+           AND attempt.redacted_request->>'productsFetched' = 'true'
+           AND attempt.redacted_request->>'readOnly' = 'true'
+           AND attempt.redacted_request->>'providerWrites' = '0'
+           AND attempt.redacted_request->>'syncCursorAdvanced' = 'false'
+         LIMIT 1
+         FOR UPDATE OF run, intent, attempt`,
+        [
+          candidate.organization_id,
+          candidate.integration_account_id,
+          candidate.pipeline_id,
+          exactRead.runGlobalId,
+          started.account.credential_version,
+          exactReadTargetHash,
+        ],
+      )
+      const exactReadRun = exactReadResult.rows[0]
+      if (!exactReadRun) {
+        intakeError(
+          'COMMERCE_INTAKE_EXACT_PRODUCT_READ_REQUIRED',
+          'The selected pack is not tied to a current successful exact read-only Faire product run. Reload and retry the exact product read',
+          409,
+        )
+      }
+      if (
+        exactRead.externalProductId !== input.package.externalProductId
+        || exactRead.externalVariantId !== input.package.externalVariantId
+        || !exactProductAuditEvidenceMatches(
+          exactReadRun.exact_product_evidence,
+          exactRead,
+        )
+      ) {
+        intakeError(
+          'COMMERCE_INTAKE_EXACT_PRODUCT_EVIDENCE_REQUIRED',
+          'The exact Faire product run does not contain the staged product and variant evidence selected for this pack. Reload and retry',
+          409,
+        )
+      }
+      await acquireTransactionAdvisoryLock(
+        client,
+        `product-pack:${candidate.organization_id}:${line.product_global_id}`,
+      )
+      const exactProductMapping = await client.query<{
+        id: string
+        global_id: string
+      }>(
+        `SELECT mapping.id::text, mapping.global_id
+         FROM operations_product_mappings mapping
+         JOIN crm_products product
+           ON product.pipeline_id = mapping.pipeline_id
+          AND product.id = mapping.product_id
+         WHERE mapping.organization_id = $1::uuid
+           AND mapping.integration_account_id = $2::uuid
+           AND mapping.pipeline_id = $3::uuid
+           AND mapping.id = $4::uuid
+           AND mapping.product_id = $5::uuid
+           AND mapping.external_product_id = $6
+           AND mapping.external_variant_id = $7
+           AND mapping.active = true
+           AND COALESCE(lower(product.source_payload->>'archived'), 'false')
+               NOT IN ('true', '1', 'yes')
+         LIMIT 1
+         FOR UPDATE OF mapping, product`,
+        [
+          candidate.organization_id,
+          candidate.integration_account_id,
+          candidate.pipeline_id,
+          line.product_mapping_id,
+          line.product_id,
+          line.external_product_id,
+          line.external_variant_id,
+        ],
+      )
+      if (!exactProductMapping.rows[0]) {
+        intakeError(
+          'COMMERCE_INTAKE_PRODUCT_MAPPING_STALE',
+          'The exact Faire product and variant mapping changed. Resolve the product again',
+          409,
+        )
+      }
+      const versionResult = await client.query<{
+        id: string
+        global_id: string
+        row_version: string
+        lifecycle_state: string
+        is_current: boolean
+        base_each_quantity: number
+        length_mm: number | null
+        width_mm: number | null
+        height_mm: number | null
+        dimension_basis: string
+        gross_weight_grams: number | null
+        weight_basis: string
+        evidence_type: string
+        profile_global_id: string
+        profile_name: string
+        package_level: 'each' | 'inner_pack' | 'case' | 'pallet'
+        profile_status: string
+      }>(
+        `SELECT
+           version.id::text,
+           version.global_id,
+           version.row_version::text,
+           version.lifecycle_state,
+           version.is_current,
+           version.base_each_quantity,
+           version.length_mm,
+           version.width_mm,
+           version.height_mm,
+           version.dimension_basis,
+           version.gross_weight_grams,
+           version.weight_basis,
+           version.evidence_type,
+           profile.global_id AS profile_global_id,
+           profile.profile_name,
+           profile.package_level,
+           profile.status AS profile_status
+         FROM operations_product_pack_profile_versions version
+         JOIN operations_product_pack_profiles profile
+           ON profile.organization_id = version.organization_id
+          AND profile.pipeline_id = version.pipeline_id
+          AND profile.product_id = version.product_id
+          AND profile.id = version.profile_id
+         WHERE version.organization_id = $1::uuid
+           AND version.pipeline_id = $2::uuid
+           AND version.product_id = $3::uuid
+           AND version.global_id = $4
+         LIMIT 1
+         FOR UPDATE OF version, profile`,
+        [
+          candidate.organization_id,
+          candidate.pipeline_id,
+          line.product_id,
+          input.package.packProfileVersionGlobalId,
+        ],
+      )
+      const version = versionResult.rows[0]
+      if (!version) {
+        intakeError(
+          'COMMERCE_INTAKE_PACK_PROFILE_VERSION_NOT_FOUND',
+          'Select a current Product pack version for the mapped product',
+          404,
+        )
+      }
+      if (
+        Number(version.row_version)
+          !== input.package.expectedPackProfileVersionRowVersion
+      ) {
+        intakeError(
+          'COMMERCE_INTAKE_PACK_PROFILE_VERSION_CONFLICT',
+          'The Product pack version changed. Reload before binding it',
+          409,
+        )
+      }
+      if (
+        version.is_current !== true
+        || !['customer_confirmed', 'active'].includes(
+          version.lifecycle_state,
+        )
+        || version.profile_status === 'retired'
+        || version.dimension_basis !== 'outer'
+        || !Number.isSafeInteger(version.length_mm)
+        || Number(version.length_mm) < 1
+        || !Number.isSafeInteger(version.width_mm)
+        || Number(version.width_mm) < 1
+        || !Number.isSafeInteger(version.height_mm)
+        || Number(version.height_mm) < 1
+        || !Number.isSafeInteger(version.gross_weight_grams)
+        || Number(version.gross_weight_grams) < 1
+        || version.weight_basis === 'unspecified'
+        || !['customer_confirmed', 'measured', 'provider'].includes(
+          version.evidence_type,
+        )
+      ) {
+        intakeError(
+          'COMMERCE_INTAKE_PACK_PROFILE_VERSION_INELIGIBLE',
+          'The selected Product pack version no longer has eligible current outer dimensions and weight evidence',
+          409,
+        )
+      }
+      if (BigInt(version.base_each_quantity) !== unitMultiplier) {
+        intakeError(
+          'COMMERCE_INTAKE_PACK_UNIT_MULTIPLIER_CONFLICT',
+          `The Faire line represents ${unitMultiplier.toString()} base each, but the selected pack represents ${version.base_each_quantity}`,
+          409,
+        )
+      }
+      const channelStateResult = await client.query<{
+        id: string
+        global_id: string
+        row_version: string
+        product_id: string | null
+        product_mapping_id: string | null
+        provider: string
+        external_product_id: string
+        external_variant_id: string
+        normalized_status: string
+        provider_updated_at: string | Date | null
+        observed_at: string | Date
+        source_revision: string
+        source_hash: string
+        pack_evidence_hash: string
+      }>(
+        `SELECT
+           state.id::text,
+           state.global_id,
+           state.row_version::text,
+           state.product_id::text,
+           state.product_mapping_id::text,
+           state.provider,
+           state.external_product_id,
+           state.external_variant_id,
+           state.normalized_status,
+           state.provider_updated_at,
+           state.observed_at,
+           state.source_revision,
+           state.source_hash,
+           state.pack_evidence_hash
+         FROM operations_product_channel_states state
+         WHERE state.organization_id = $1::uuid
+           AND state.integration_account_id = $2::uuid
+           AND state.pipeline_id = $3::uuid
+           AND state.global_id = $4
+           AND state.provider = 'faire'
+           AND state.external_product_id = $5
+           AND state.external_variant_id = $6
+           AND state.product_id = $7::uuid
+           AND state.product_mapping_id = $8::uuid
+           AND state.row_version = $9::bigint
+           AND state.source_revision = $10
+           AND state.source_hash = $11
+           AND state.pack_evidence_hash = $12
+         LIMIT 1
+         FOR UPDATE OF state`,
+        [
+          candidate.organization_id,
+          candidate.integration_account_id,
+          candidate.pipeline_id,
+          exactRead.channelStateGlobalId,
+          line.external_product_id,
+          line.external_variant_id,
+          line.product_id,
+          line.product_mapping_id,
+          exactRead.channelStateRowVersion,
+          exactRead.channelSourceRevision,
+          exactRead.channelSourceHash,
+          exactRead.channelPackEvidenceHash,
+        ],
+      )
+      const channelState = channelStateResult.rows[0]
+      if (
+        !channelState
+        || channelState.provider !== 'faire'
+        || channelState.external_product_id !== line.external_product_id
+        || channelState.external_variant_id !== line.external_variant_id
+        || channelState.product_id !== line.product_id
+        || channelState.product_mapping_id !== line.product_mapping_id
+        || channelState.source_revision !== exactRead.variantSourceRevision
+        || channelState.source_hash !== exactRead.variantSourceHash
+        || !/^[a-f0-9]{64}$/.test(channelState.source_hash)
+        || !/^[a-f0-9]{64}$/.test(channelState.pack_evidence_hash)
+      ) {
+        intakeError(
+          'COMMERCE_INTAKE_EXACT_PRODUCT_STATE_REQUIRED',
+          'The exact read-only Faire product observation did not produce a current channel state for this mapped variant',
+          409,
+        )
+      }
+      const currentMappingResult = await client.query<{
+        id: string
+        global_id: string
+        row_version: string
+        product_id: string
+        external_product_id: string
+        external_variant_id: string
+        default_pack_profile_version_id: string
+        projection_state: string
+        pack_evidence_hash: string | null
+      }>(
+        `SELECT
+           mapping.id::text,
+           mapping.global_id,
+           mapping.row_version::text,
+           mapping.product_id::text,
+           mapping.external_product_id,
+           mapping.external_variant_id,
+           mapping.default_pack_profile_version_id::text,
+           mapping.projection_state,
+           mapping.pack_evidence_hash
+         FROM operations_commerce_variant_pack_mappings mapping
+         WHERE mapping.organization_id = $1::uuid
+           AND mapping.integration_account_id = $2::uuid
+           AND mapping.provider = 'faire'
+           AND mapping.external_variant_id = $3
+           AND mapping.mapping_purpose = 'catalog'
+           AND mapping.is_current = true
+         LIMIT 2
+         FOR UPDATE OF mapping`,
+        [
+          candidate.organization_id,
+          candidate.integration_account_id,
+          line.external_variant_id,
+        ],
+      )
+      if (currentMappingResult.rows.length > 1) {
+        intakeError(
+          'COMMERCE_INTAKE_PACK_MAPPING_CURRENT_CONFLICT',
+          'This Faire variant has multiple current pack mappings. Resolve the data conflict before continuing',
+          500,
+        )
+      }
+      let packMapping = currentMappingResult.rows[0] || null
+      if (packMapping && (
+        packMapping.product_id !== line.product_id
+        || packMapping.external_product_id !== line.external_product_id
+        || packMapping.external_variant_id !== line.external_variant_id
+        || packMapping.default_pack_profile_version_id !== version.id
+        || packMapping.projection_state !== 'current'
+        || packMapping.pack_evidence_hash !== channelState.pack_evidence_hash
+      )) {
+        intakeError(
+          'COMMERCE_INTAKE_PACK_MAPPING_CONFLICT',
+          'This Faire variant already has a different current Product pack mapping. Reload Product pack rules before replacing it',
+          409,
+        )
+      }
+      let mappingCreated = false
+      if (!packMapping) {
+        const insertedMapping = await client.query<{
+          id: string
+          global_id: string
+          row_version: string
+          product_id: string
+          external_product_id: string
+          external_variant_id: string
+          default_pack_profile_version_id: string
+          projection_state: string
+          pack_evidence_hash: string
+        }>(
+          `INSERT INTO operations_commerce_variant_pack_mappings (
+             organization_id,
+             integration_account_id,
+             pipeline_id,
+             product_id,
+             provider,
+             external_product_id,
+             external_variant_id,
+             default_pack_profile_version_id,
+             provider_lifecycle_state,
+             projection_state,
+             mapping_purpose,
+             source_revision,
+             source_hash,
+             pack_evidence_hash,
+             provider_updated_at,
+             observed_at,
+             is_current,
+             created_by,
+             updated_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'faire', $5, $6,
+             $7::uuid, $8, 'current', 'catalog', $9, $10, $11,
+             $12::timestamptz, $13::timestamptz, true, $14, $14
+           )
+           RETURNING
+             id::text,
+             global_id,
+             row_version::text,
+             product_id::text,
+             external_product_id,
+             external_variant_id,
+             default_pack_profile_version_id::text,
+             projection_state,
+             pack_evidence_hash`,
+          [
+            candidate.organization_id,
+            candidate.integration_account_id,
+            candidate.pipeline_id,
+            line.product_id,
+            line.external_product_id,
+            line.external_variant_id,
+            version.id,
+            channelState.normalized_status,
+            channelState.source_revision,
+            channelState.source_hash,
+            channelState.pack_evidence_hash,
+            iso(channelState.provider_updated_at),
+            iso(channelState.observed_at),
+            input.actorEmail,
+          ],
+        )
+        packMapping = insertedMapping.rows[0]
+        mappingCreated = true
+      }
+      if (!packMapping) {
+        intakeError(
+          'COMMERCE_INTAKE_PACK_MAPPING_CREATE_FAILED',
+          'The exact Faire variant pack mapping was not retained',
+          500,
+        )
+      }
+      const lineUpdate = await client.query(
+        `UPDATE operations_commerce_order_candidate_lines
+         SET packaging_state = 'resolved',
+             package_profile_id = NULL,
+             commerce_variant_pack_mapping_id = $2::uuid,
+             commerce_variant_pack_mapping_row_version = $3::bigint,
+             pack_profile_version_id = $4::uuid,
+             pack_profile_version_row_version = $5::bigint,
+             pack_profile_package_level = $6,
+             pack_profile_base_each_quantity = $7,
+             packaging_source = 'variant_pack_mapping',
+             packaging_weight_source = 'profile_version',
+             weight_grams = $8,
+             length_mm = $9,
+             width_mm = $10,
+             height_mm = $11,
+             workflow_state = 'resolving',
+             blocking_codes = array_remove(
+               blocking_codes, 'packaging_required'
+             ),
+             row_version = row_version + 1,
+             updated_by = $12,
+             updated_at = now()
+         WHERE id = $1::uuid
+           AND row_version = $13::bigint`,
+        [
+          line.id,
+          packMapping.id,
+          Number(packMapping.row_version),
+          version.id,
+          Number(version.row_version),
+          version.package_level,
+          version.base_each_quantity,
+          version.gross_weight_grams,
+          version.length_mm,
+          version.width_mm,
+          version.height_mm,
+          input.actorEmail,
+          Number(line.row_version),
+        ],
+      )
+      if (lineUpdate.rowCount !== 1) {
+        intakeError(
+          'COMMERCE_INTAKE_LINE_VERSION_CONFLICT',
+          'The provider line changed. Reload before binding its Product pack version',
+          409,
+        )
+      }
+      const advanced = await advanceCandidate(
+        client,
+        candidate,
+        input.actorEmail,
+        'resolving',
+      )
+      await recordDecision(client, {
+        candidate,
+        targetType: 'order_candidate_line',
+        targetGlobalId: line.global_id,
+        targetSourceRevision: line.source_revision,
+        targetSourceHash: line.source_hash,
+        decisionType: 'package_resolution',
+        resultingWorkflowState: advanced.candidate.workflow_state,
+        reasonCode: mappingCreated
+          ? 'variant_pack_mapping_created_from_exact_product'
+          : 'current_variant_pack_mapping_reused',
+        receipt: started.receipt,
+        idempotencyKey: input.idempotencyKey,
+        requestHash: started.requestHash,
+        actorEmail: input.actorEmail,
+      })
+      const result = commandResult(
+        advanced.candidate,
+        'resolve-package',
+        {
+          replayed: false,
+          lineGlobalId: line.global_id,
+          packageSource: 'variant_pack_mapping',
+          mappingCreated,
+          variantPackMappingGlobalId: packMapping.global_id,
+          variantPackMappingRowVersion: Number(packMapping.row_version),
+          productMappingGlobalId: exactProductMapping.rows[0].global_id,
+          productGlobalId: line.product_global_id,
+          externalProductId: line.external_product_id,
+          externalVariantId: line.external_variant_id,
+          exactProductRunGlobalId: exactReadRun.run_global_id,
+          exactProductSourceHash: exactRead.productSourceHash,
+          exactProductVariantSourceRevision: exactRead.variantSourceRevision,
+          exactProductVariantSourceHash: exactRead.variantSourceHash,
+          orderSourceRevision: line.source_revision,
+          orderSourceHash: line.source_hash,
+          channelStateGlobalId: channelState.global_id,
+          channelStateRowVersion: Number(channelState.row_version),
+          channelSourceRevision: channelState.source_revision,
+          channelSourceHash: channelState.source_hash,
+          channelPackEvidenceHash: channelState.pack_evidence_hash,
+          packProfileGlobalId: version.profile_global_id,
+          packProfileVersionGlobalId: version.global_id,
+          packProfileVersionRowVersion: Number(version.row_version),
+          packageLevel: version.package_level,
+          baseEachQuantity: version.base_each_quantity,
+          providerUnitMultiplier: Number(unitMultiplier),
+          weightGrams: version.gross_weight_grams,
+          dimensionsMm: {
+            length: version.length_mm,
+            width: version.width_mm,
+            height: version.height_mm,
+          },
+          providerReads: 1,
+          providerWrites: 0,
+          syncCursorAdvanced: false,
+        },
+      )
+      await completeReceipt(
+        client,
+        started.receipt.id,
+        candidate.global_id,
+        result,
+      )
+      await recordAuditEvent({
+        actor: input.actorEmail,
+        eventType: 'commerce.intake.variant_pack_mapping_bound',
+        aggregateType: 'operations.commerce_variant_pack_mapping',
+        aggregateId: packMapping.global_id,
+        subject: line.product_title_snapshot,
+        organizationId: candidate.organization_id,
+        eventKey:
+          `commerce-intake:${candidate.global_id}:${line.global_id}:variant-pack:${started.receipt.id}`,
+        payload: {
+          candidateGlobalId: candidate.global_id,
+          lineGlobalId: line.global_id,
+          provider: 'faire',
+          mappingCreated,
+          productGlobalId: line.product_global_id,
+          productMappingGlobalId: exactProductMapping.rows[0].global_id,
+          externalProductId: line.external_product_id,
+          externalVariantId: line.external_variant_id,
+          exactProductRunGlobalId: exactReadRun.run_global_id,
+          exactProductSourceHash: exactRead.productSourceHash,
+          exactProductVariantSourceRevision: exactRead.variantSourceRevision,
+          exactProductVariantSourceHash: exactRead.variantSourceHash,
+          orderSourceRevision: line.source_revision,
+          orderSourceHash: line.source_hash,
+          channelStateGlobalId: channelState.global_id,
+          channelStateRowVersion: Number(channelState.row_version),
+          channelSourceRevision: channelState.source_revision,
+          channelSourceHash: channelState.source_hash,
+          channelPackEvidenceHash: channelState.pack_evidence_hash,
+          packProfileVersionGlobalId: version.global_id,
+          packProfileVersionRowVersion: Number(version.row_version),
+          baseEachQuantity: version.base_each_quantity,
+          providerUnitMultiplier: Number(unitMultiplier),
+          providerReads: 1,
+          providerWrites: 0,
+          syncCursorAdvanced: false,
+        },
+      }, client)
+      return result
     }
     let packageProfileId: string | null = null
     let packageProfileGlobalId: string | null = null

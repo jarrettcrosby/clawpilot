@@ -31,6 +31,9 @@ import {
 import {
   readCommerceProductImageImportQueueHealthInPostgres,
 } from '@/lib/persistence/commerceProductImageImports'
+import {
+  readFaireProductImageProjectionHealthInPostgres,
+} from '@/lib/persistence/faireProductImageProjection'
 import { commerceIntakeRuntimeAvailable } from '@/lib/integrations/commerceIntake'
 import { effectiveDocumentEmbeddingConfiguration } from '@/lib/documentEmbeddings'
 import { validateShortLinkConfiguration } from '@/lib/shortlinks'
@@ -126,6 +129,10 @@ export async function GET() {
     }
     let commerceProductImageImportWorker: Record<string, unknown> = {
       status: 'disabled',
+    }
+    let faireProductImageProjection: Record<string, unknown> = {
+      status: 'unavailable',
+      latestResultAt: null,
     }
     const suiteCrmProductImageConfiguration =
       suiteCrmProductImageReadConfiguration()
@@ -407,6 +414,7 @@ export async function GET() {
           operations_commerce_product_image_imports_applied: boolean
           operations_commerce_product_image_fanout_applied: boolean
           operations_commerce_product_image_source_normalization_applied: boolean
+          operations_faire_product_image_projection_applied: boolean
           operations_faire_inventory_polling_applied: boolean
           suitecrm_product_image_reverse_ingestion_applied: boolean
           migration_checksums_present: boolean
@@ -1965,6 +1973,94 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename =
+                  '0230_operations_faire_product_image_projection.sql'
+              )
+              AND to_regclass(
+                'operations_faire_product_image_delivery_grants'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_faire_product_image_provider_steps'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_faire_provider_write_authority_is_current(uuid,uuid,uuid,text,integer,integer,text,text,text,bigint,text,text,text,jsonb,uuid)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_operations_faire_product_image_grant()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_operations_faire_product_image_authority()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_operations_faire_product_image_step()'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_faire_product_image_delivery_grants'
+                  )
+                  AND trigger_row.tgname =
+                    'protect_operations_faire_product_image_grant_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'protect_operations_faire_product_image_grant()'
+                  )
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_faire_provider_write_authorizations'
+                  )
+                  AND trigger_row.tgname =
+                    'protect_operations_faire_product_image_authority_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'protect_operations_faire_product_image_authority()'
+                  )
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_faire_product_image_provider_steps'
+                  )
+                  AND trigger_row.tgname =
+                    'protect_operations_faire_product_image_step_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'protect_operations_faire_product_image_step()'
+                  )
+                  AND trigger_row.tgenabled = 'O'
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'operations_faire_provider_write_authorizations'
+                  )
+                  AND constraint_row.conname =
+                    'operations_faire_write_auth_image_grant_fkey'
+                  AND constraint_row.contype = 'f'
+                  AND constraint_row.convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'operations_faire_provider_write_authorizations'
+                  )
+                  AND constraint_row.conname =
+                    'operations_faire_write_auth_shadow_effect_fkey'
+                  AND constraint_row.contype = 'f'
+                  AND constraint_row.convalidated
+              ) AS operations_faire_product_image_projection_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
                   '0223_operations_faire_inventory_observation_polling.sql'
               )
               AND to_regclass(
@@ -2280,6 +2376,7 @@ export async function GET() {
             && row?.operations_commerce_product_image_imports_applied
             && row?.operations_commerce_product_image_fanout_applied
             && row?.operations_commerce_product_image_source_normalization_applied
+            && row?.operations_faire_product_image_projection_applied
             && row?.operations_faire_inventory_polling_applied
             && row?.suitecrm_product_image_reverse_ingestion_applied
             && row?.migration_checksums_present
@@ -2449,6 +2546,7 @@ export async function GET() {
           || !row?.operations_commerce_product_image_imports_applied
           || !row?.operations_commerce_product_image_fanout_applied
           || !row?.operations_commerce_product_image_source_normalization_applied
+          || !row?.operations_faire_product_image_projection_applied
           || !row?.operations_faire_inventory_polling_applied
           || !row?.suitecrm_product_image_reverse_ingestion_applied
           || !row?.migration_checksums_present
@@ -3418,6 +3516,70 @@ export async function GET() {
             }
           }
 
+          if (row?.operations_faire_product_image_projection_applied) {
+            const projectionHealth =
+              await readFaireProductImageProjectionHealthInPostgres()
+            const pending = Number(projectionHealth.counts.pending || 0)
+            const claimed = Number(projectionHealth.counts.claimed || 0)
+            const expiredClaimed = Number(
+              projectionHealth.expiredClaimed || 0,
+            )
+            const historicalUnknown = Number(
+              projectionHealth.counts.unknown || 0,
+            )
+            const historicalFailed = Number(
+              projectionHealth.counts.failed || 0,
+            )
+            const unknown = Number(
+              projectionHealth.unresolvedCounts.unknown || 0,
+            )
+            const failed = Number(
+              projectionHealth.unresolvedCounts.failed || 0,
+            )
+            faireProductImageProjection = {
+              status: claimed > 0 || unknown > 0 || failed > 0
+                ? 'degraded'
+                : 'ready',
+              pending,
+              claimed,
+              claimedInFlight: Math.max(0, claimed - expiredClaimed),
+              expiredClaimed,
+              simulated: Number(
+                projectionHealth.counts.simulated || 0,
+              ),
+              succeeded: Number(
+                projectionHealth.counts.succeeded || 0,
+              ),
+              failed,
+              unknown,
+              historical: {
+                failed: historicalFailed,
+                unknown: historicalUnknown,
+              },
+              latestResultAt: projectionHealth.latestAt,
+            }
+            if (claimed > expiredClaimed) {
+              warnings.push(
+                'Faire Product-image publication has in-flight claimed effects.',
+              )
+            }
+            if (expiredClaimed > 0) {
+              warnings.push(
+                'Faire Product-image publication has expired claims ready for terminal no-replay reconciliation.',
+              )
+            }
+            if (unknown > 0) {
+              warnings.push(
+                'Faire Product-image publication has terminal unknown outcomes requiring provider readback.',
+              )
+            }
+            if (failed > 0) {
+              warnings.push(
+                'Faire Product-image publication has failed effects requiring operator review.',
+              )
+            }
+          }
+
           if (row?.suitecrm_product_image_reverse_ingestion_applied) {
             if (
               suiteCrmProductImageConfiguration.enabled
@@ -3570,6 +3732,7 @@ export async function GET() {
       shopifyInventoryRefreshWorker,
       faireInventoryPollWorker,
       commerceProductImageImportWorker,
+      faireProductImageProjection,
       suiteCrmNativeProductImageProjection,
       suiteCrmProductImageIngestion,
       integrationQueues,

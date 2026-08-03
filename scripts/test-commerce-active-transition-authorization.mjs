@@ -274,12 +274,136 @@ function verifySourceContracts() {
     'disabled={!option.selectable}',
     "option.unavailableReason === 'not_implemented'",
     'Provider-supported capabilities remain',
+    'commerceActiveInitialSelection({',
+    'preservationBlockers.length',
+    'No immediately preceding Active Shopify cohort was found',
   ]) {
     assert.ok(
       operationsUi.includes(fragment),
       `Commerce Active UI truthfulness guard missing ${fragment}`,
     )
   }
+
+  const integrationPersistence = read(
+    'app_src/lib/persistence/commerceIntegrations.ts',
+  )
+  for (const fragment of [
+    'commerceActiveContinuation',
+    'readCommerceActiveContinuationInPostgres({ organizationId })',
+  ]) {
+    assert.ok(
+      integrationPersistence.includes(fragment),
+      `Commerce integrations state missing ${fragment}`,
+    )
+  }
+  for (const fragment of [
+    'readCommerceActiveContinuationInPostgres',
+    "activation.state = 'shadow'",
+    'activated.to_activation_revision = activation.revision - 1',
+    'prepared.cohort',
+  ]) {
+    assert.ok(
+      persistence.includes(fragment),
+      `Commerce Active Shopify continuation read missing ${fragment}`,
+    )
+  }
+
+  const selection = loadTypeScriptModule(
+    'app_src/lib/operations/commerceActiveSelection.ts',
+  )
+  const selectionAccounts = [
+    {
+      accountGlobalId: 'gia-shopify-prior',
+      provider: 'shopify',
+      capabilities: [
+        { capability: 'fulfillment_export', selectable: true, unavailableReason: null },
+        { capability: 'tracking_export', selectable: true, unavailableReason: null },
+        { capability: 'shipping_rate_callbacks', selectable: true, unavailableReason: null },
+      ],
+    },
+    {
+      accountGlobalId: 'gia-shopify-new',
+      provider: 'shopify',
+      capabilities: [
+        { capability: 'shipping_rate_callbacks', selectable: true, unavailableReason: null },
+      ],
+    },
+    {
+      accountGlobalId: 'gia-faire',
+      provider: 'faire',
+      capabilities: [
+        { capability: 'catalog_publishing', selectable: true, unavailableReason: null },
+        { capability: 'order_update', selectable: true, unavailableReason: null },
+        { capability: 'fulfillment_export', selectable: true, unavailableReason: null },
+        { capability: 'tracking_export', selectable: true, unavailableReason: null },
+      ],
+    },
+  ]
+  const preservedSelection = JSON.parse(JSON.stringify(
+    selection.commerceActiveInitialSelection({
+      accounts: selectionAccounts,
+      continuation: {
+        sourceTransitionGlobalId: 'gcat000000000001',
+        sourceActivationRevision: 2,
+        shadowActivationRevision: 3,
+        shopifyAccounts: [{
+          accountGlobalId: 'gia-shopify-prior',
+          writeCapabilities: [
+            'fulfillment_export',
+            'shipping_rate_callbacks',
+            'tracking_export',
+          ],
+        }],
+      },
+      expectedShadowActivationRevision: 3,
+    }),
+  ))
+  assert.deepEqual(preservedSelection.selections, {
+    'gia-shopify-prior': [
+      'fulfillment_export',
+      'shipping_rate_callbacks',
+      'tracking_export',
+    ],
+    'gia-shopify-new': [],
+    'gia-faire': ['order_update', 'fulfillment_export', 'tracking_export'],
+  })
+  assert.deepEqual(preservedSelection.preservationBlockers, [])
+  assert.equal(preservedSelection.preservedShopifyCapabilityCount, 3)
+  assert.equal(preservedSelection.faireDefaultedAccountCount, 1)
+  const blockedSelection = JSON.parse(JSON.stringify(
+    selection.commerceActiveInitialSelection({
+      accounts: selectionAccounts.map((account) => account.accountGlobalId
+        === 'gia-shopify-prior'
+        ? {
+            ...account,
+            capabilities: account.capabilities.map((option) => option.capability
+              === 'tracking_export'
+              ? { ...option, selectable: false, unavailableReason: 'missing_scope' }
+              : option),
+          }
+        : account),
+      continuation: {
+        sourceTransitionGlobalId: 'gcat000000000001',
+        sourceActivationRevision: 2,
+        shadowActivationRevision: 3,
+        shopifyAccounts: [{
+          accountGlobalId: 'gia-shopify-prior',
+          writeCapabilities: [
+            'fulfillment_export',
+            'shipping_rate_callbacks',
+            'tracking_export',
+          ],
+        }],
+      },
+      expectedShadowActivationRevision: 3,
+    }),
+  ))
+  assert.deepEqual(blockedSelection.selections['gia-shopify-prior'], [
+    'fulfillment_export',
+    'shipping_rate_callbacks',
+  ])
+  assert.equal(blockedSelection.preservationBlockers.length, 1)
+  assert.match(blockedSelection.preservationBlockers[0], /missing a required scope/)
 }
 
 async function waitForPostgres(pool) {
@@ -1150,6 +1274,248 @@ async function verifyDisposablePostgres() {
       null,
     )
 
+    const combinedFaireScopes = [
+      'READ_BRAND',
+      'READ_ORDERS',
+      'READ_SHIPMENTS',
+      'WRITE_ORDERS',
+    ]
+    const credentialFingerprintSha256 = 'c'.repeat(64)
+    const oauthGrantCompletedAt = new Date().toISOString()
+    const credentialReference =
+      `commerce-credential:${accounts.faire.id}:v1`
+    const oauthGrantRequest = {
+      provider: 'faire',
+      operation: 'authorizationCodeExchange',
+      grantType: 'AUTHORIZATION_CODE',
+      requestedScopes: combinedFaireScopes,
+      credentialFingerprintSha256,
+      providerWrites: 0,
+    }
+    const oauthGrantEvidence = {
+      provider: 'faire',
+      operation: 'authorizationCodeExchange',
+      grantType: 'AUTHORIZATION_CODE',
+      tokenType: 'BEARER',
+      externalAccountId: 'faire-brand-ag-alchemy',
+      credentialGeneration: 1,
+      requestedScopes: combinedFaireScopes,
+      grantedScopes: combinedFaireScopes,
+      credentialFingerprintSha256,
+      providerReference: credentialFingerprintSha256,
+      providerWrites: 0,
+    }
+    await pool.query(
+      `UPDATE operations_integration_accounts
+       SET credential_reference = $3,
+           updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [organizationId, accounts.faire.id, credentialReference],
+    )
+    const oauthGrantAttempt = await pool.query(
+      `INSERT INTO operations_commerce_provider_attempts (
+         organization_id, integration_account_id, action, adapter_version,
+         external_object_id, idempotency_key, request_hash, redacted_request,
+         redacted_response, state, attempt_number, provider_reference,
+         requested_at, completed_at, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, 'faire.oauth.authorization_code.exchange',
+         'faire-external-api-v2-oauth-authorization-code-v1', $3,
+         $4, operations_faire_provider_write_request_hash($5::jsonb),
+         $5::jsonb, $6::jsonb, 'succeeded', 1, $7,
+         $8::timestamptz, $8::timestamptz, $9
+       ) RETURNING id::text, global_id`,
+      [
+        organizationId,
+        accounts.faire.id,
+        credentialReference,
+        `faire-oauth-grant:1:${credentialFingerprintSha256}`,
+        JSON.stringify(oauthGrantRequest),
+        JSON.stringify(oauthGrantEvidence),
+        credentialFingerprintSha256,
+        oauthGrantCompletedAt,
+        ownerEmail,
+      ],
+    )
+    await pool.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = $3::jsonb,
+           updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [
+        organizationId,
+        accounts.faire.id,
+        JSON.stringify({
+          authMode: 'faire_oauth',
+          tokenAcquisition: 'authorization_code',
+          requestedScopes: combinedFaireScopes,
+          grantedScopes: combinedFaireScopes,
+          scopeVerification: 'oauth_grant',
+          oauthGrantTokenType: 'BEARER',
+          oauthGrantCredentialFingerprintSha256:
+            credentialFingerprintSha256,
+          scopeProofProviderReference: credentialFingerprintSha256,
+          scopeProofAttemptGlobalId: oauthGrantAttempt.rows[0].global_id,
+        }),
+      ],
+    )
+    await pool.query(
+      `INSERT INTO operations_faire_provider_write_scope_evidence (
+         organization_id, integration_account_id, provider_attempt_id,
+         external_account_id, credential_generation, verified_write_scopes,
+         verification_source, provider_reference, redacted_evidence,
+         evidence_hash, observed_at, recorded_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'faire-brand-ag-alchemy', 1,
+         ARRAY['WRITE_ORDERS']::text[], 'oauth_grant', $4, $5::jsonb,
+         operations_faire_provider_write_request_hash($5::jsonb),
+         $6::timestamptz, $7
+       )`,
+      [
+        organizationId,
+        accounts.faire.id,
+        oauthGrantAttempt.rows[0].id,
+        credentialFingerprintSha256,
+        JSON.stringify(oauthGrantEvidence),
+        oauthGrantCompletedAt,
+        ownerEmail,
+      ],
+    )
+    assert.equal(
+      (
+        await pool.query(
+          `SELECT operations_faire_fulfillment_scope_evidence_is_current(
+             $1::uuid, $2::uuid, 1
+           ) AS current`,
+          [organizationId, accounts.faire.id],
+        )
+      ).rows[0].current,
+      true,
+    )
+    await pool.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = jsonb_set(
+             configuration,
+             '{grantedScopes}',
+             (configuration->'grantedScopes')
+               || '"write_merchant_managed_fulfillment_orders"'::jsonb
+           ),
+           updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [organizationId, accounts.shopify.global_id],
+    )
+    const returnedToShadow = await pool.query(
+      `UPDATE operations_activation_scopes
+       SET state = 'shadow', revision = revision + 1,
+           reason = 'Extend the exact Active cohort with Faire OAuth authority',
+           updated_by = $2, updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND state = 'active'
+         AND revision = 2
+       RETURNING state, revision`,
+      [organizationId, ownerEmail],
+    )
+    assert.deepEqual(returnedToShadow.rows[0], {
+      state: 'shadow',
+      revision: 3,
+    })
+    const continuation = await persistence
+      .readCommerceActiveContinuationInPostgres({ organizationId })
+    assert.equal(
+      continuation.sourceTransitionGlobalId,
+      activated.transitionGlobalId,
+    )
+    assert.equal(continuation.sourceActivationRevision, 2)
+    assert.equal(continuation.shadowActivationRevision, 3)
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(continuation.shopifyAccounts)),
+      [{
+        accountGlobalId: accounts.shopify.global_id,
+        writeCapabilities: ['fulfillment_export', 'tracking_export'],
+      }],
+    )
+    const combinedSelection = [
+      {
+        accountGlobalId: accounts.shopify.global_id,
+        capabilities: ['fulfillment_export', 'tracking_export'],
+      },
+      {
+        accountGlobalId: accounts.faire.global_id,
+        capabilities: [
+          'order_update',
+          'fulfillment_export',
+          'tracking_export',
+        ],
+      },
+    ]
+    const combinedPreparation = await persistence
+      .prepareCommerceActiveTransitionInPostgres({
+        organizationId,
+        actorEmail: ownerEmail,
+        expectedActivationState: 'shadow',
+        expectedActivationRevision: 3,
+        selectedAccounts: combinedSelection,
+        idempotencyKey: 'prepare-shopify-faire-oauth',
+      })
+    assert.equal(combinedPreparation.accounts.length, 2)
+    assert.deepEqual(
+      combinedPreparation.accounts.find(
+        (account) => account.provider === 'shopify',
+      )?.writeCapabilities,
+      ['fulfillment_export', 'tracking_export'],
+    )
+    assert.deepEqual(
+      combinedPreparation.accounts.find(
+        (account) => account.provider === 'faire',
+      )?.writeCapabilities,
+      ['fulfillment_export', 'order_update', 'tracking_export'],
+    )
+    const combinedAuthorization = await persistence
+      .authorizeCommerceActiveTransitionInPostgres({
+        organizationId,
+        actorEmail: ownerEmail,
+        preparationGlobalId: combinedPreparation.preparationGlobalId,
+        expectedCohortHash: combinedPreparation.cohortHash,
+        idempotencyKey: 'authorize-shopify-faire-oauth',
+      })
+    const combinedActivation = await persistence
+      .consumeCommerceActiveTransitionAuthorizationInPostgres({
+        organizationId,
+        actorEmail: ownerEmail,
+        authorizationGlobalId:
+          combinedAuthorization.authorizationGlobalId,
+        expectedCohortHash: combinedPreparation.cohortHash,
+        idempotencyKey: 'consume-shopify-faire-oauth',
+        reason: 'Preserve Shopify and activate exact Faire fulfillment claims',
+      })
+    assert.equal(combinedActivation.state, 'active')
+    assert.equal(combinedActivation.revision, 4)
+    assert.equal(combinedActivation.accountCount, 2)
+    assert.equal(combinedActivation.capabilityCount, 5)
+    for (const [accountGlobalId, capabilities] of [
+      [accounts.shopify.global_id, ['fulfillment_export', 'tracking_export']],
+      [accounts.faire.global_id, [
+        'order_update',
+        'fulfillment_export',
+        'tracking_export',
+      ]],
+    ]) {
+      for (const capability of capabilities) {
+        assert.ok(
+          await persistence.readCommerceActiveCapabilityClaimInPostgres({
+            organizationId,
+            accountGlobalId,
+            capability,
+            expectedActivationRevision: 4,
+          }),
+          `${accountGlobalId} must retain ${capability} at Active revision 4`,
+        )
+      }
+    }
+
     await assert.rejects(
       pool.query(
         `UPDATE operations_commerce_active_transition_preparations
@@ -1167,7 +1533,7 @@ async function verifyDisposablePostgres() {
           === 'operations.commerce.active_transition.consumed'
         ),
       ).length,
-      1,
+      2,
     )
   } finally {
     if (pool) await pool.end().catch(() => undefined)

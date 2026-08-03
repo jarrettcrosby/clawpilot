@@ -12,6 +12,7 @@ import {
   hasEffectiveShopifyScope,
 } from '@/lib/integrations/commerceCapabilities'
 import {
+  getFaireProduct,
   getFaireOrder,
   listFaireInventory,
   listFaireOrders,
@@ -91,6 +92,8 @@ const LINE_PATTERN = /^gcol(?:[0-9]{7}|[0-9a-v]{12})$/
 const PRODUCT_PATTERN = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/
 const CUSTOMER_PATTERN = /^ga(?:[0-9]{7}|[0-9a-v]{12})$/
 const PACKAGE_PROFILE_PATTERN = /^gpp(?:[0-9]{7}|[0-9a-v]{12})$/
+const PACK_PROFILE_VERSION_PATTERN = /^gppv(?:[0-9]{7}|[0-9a-v]{12})$/
+const CHANNEL_STATE_PATTERN = /^gpcs(?:[0-9]{7}|[0-9a-v]{12})$/
 
 const SHOPIFY_ORDER_PAGE_SIZE = 25
 const SHOPIFY_PRODUCT_VARIANT_PAGE_SIZE = 50
@@ -637,6 +640,30 @@ function faireOrderId(value: unknown) {
   return result
 }
 
+function faireProductId(value: unknown) {
+  const result = text(value, 'Faire provider product ID', 512)
+  if (!/^p_[A-Za-z0-9][A-Za-z0-9_-]{0,509}$/.test(result)) {
+    throw new CommerceIntegrationRequestError(
+      'Faire provider product ID is invalid',
+      400,
+      'COMMERCE_INTAKE_EXACT_PRODUCT_ID_INVALID',
+    )
+  }
+  return result
+}
+
+function faireVariantId(value: unknown) {
+  const result = text(value, 'Faire provider variant ID', 512)
+  if (!/^po_[A-Za-z0-9][A-Za-z0-9_-]{0,508}$/.test(result)) {
+    throw new CommerceIntegrationRequestError(
+      'Faire provider variant ID is invalid',
+      400,
+      'COMMERCE_INTAKE_EXACT_VARIANT_ID_INVALID',
+    )
+  }
+  return result
+}
+
 function faireRetailerId(value: unknown) {
   const result = text(value, 'Faire retailer ID', 512)
   if (/[\u0000-\u001f\u007f]/u.test(result)) {
@@ -678,6 +705,79 @@ function sha256Hash(value: unknown, label: string) {
 
 function requestHash(value: unknown) {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex')
+}
+
+function exactProductPackReadEvidence(
+  command: Record<string, unknown>,
+  target: { externalProductId: string; externalVariantId: string },
+) {
+  const invalid = (): never => {
+    throw new CommerceIntegrationRequestError(
+      'The exact Faire product read did not retain staged evidence for the selected variant. Reload and retry without binding a pack.',
+      409,
+      'COMMERCE_INTAKE_EXACT_PRODUCT_EVIDENCE_REQUIRED',
+    )
+  }
+  const runGlobalId = typeof command.runGlobalId === 'string'
+    && RUN_PATTERN.test(command.runGlobalId)
+    ? command.runGlobalId
+    : invalid()
+  const evidence = command.exactProductEvidence
+  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) {
+    return invalid()
+  }
+  const productEvidence = evidence as Record<string, unknown>
+  if (
+    productEvidence.externalProductId !== target.externalProductId
+    || typeof productEvidence.productSourceHash !== 'string'
+    || !/^[a-f0-9]{64}$/.test(productEvidence.productSourceHash)
+    || !Array.isArray(productEvidence.variants)
+  ) return invalid()
+  const matches = productEvidence.variants.filter((value) => (
+    value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && (value as Record<string, unknown>).externalVariantId
+      === target.externalVariantId
+  )) as Record<string, unknown>[]
+  if (matches.length !== 1) return invalid()
+  const variant = matches[0]
+  const validRevision = (value: unknown) => (
+    typeof value === 'string'
+    && value.length >= 1
+    && value.length <= 2_048
+    && !/[\u0000-\u001f\u007f]/.test(value)
+  )
+  const validHash = (value: unknown) => (
+    typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
+  )
+  const channelStateRowVersion = Number(variant.channelStateRowVersion)
+  if (
+    !validRevision(variant.variantSourceRevision)
+    || !validHash(variant.variantSourceHash)
+    || typeof variant.channelStateGlobalId !== 'string'
+    || !CHANNEL_STATE_PATTERN.test(variant.channelStateGlobalId)
+    || !Number.isSafeInteger(channelStateRowVersion)
+    || channelStateRowVersion < 0
+    || !validRevision(variant.channelSourceRevision)
+    || !validHash(variant.channelSourceHash)
+    || !validHash(variant.channelPackEvidenceHash)
+    || variant.channelSourceRevision !== variant.variantSourceRevision
+    || variant.channelSourceHash !== variant.variantSourceHash
+  ) return invalid()
+  return {
+    runGlobalId,
+    externalProductId: target.externalProductId,
+    productSourceHash: productEvidence.productSourceHash as string,
+    externalVariantId: target.externalVariantId,
+    variantSourceRevision: variant.variantSourceRevision as string,
+    variantSourceHash: variant.variantSourceHash as string,
+    channelStateGlobalId: variant.channelStateGlobalId,
+    channelStateRowVersion,
+    channelSourceRevision: variant.channelSourceRevision as string,
+    channelSourceHash: variant.channelSourceHash as string,
+    channelPackEvidenceHash: variant.channelPackEvidenceHash as string,
+  }
 }
 
 function providerRecord(
@@ -1559,10 +1659,14 @@ async function faireProductEnvelope(
   runtime: CommerceRuntimeCredentialRecord,
   page: OperationalPageRequest,
   hydrateInventory = true,
+  targetExternalProductId: string | null = null,
 ): Promise<OperationalPageResult> {
   // Faire has no catalog webhook cursor, so read-start time is the durable
   // ordering fence for its bounded reconciliation snapshots.
-  const context = normalizationContext(runtime, 'stale')
+  const context = normalizationContext(
+    runtime,
+    targetExternalProductId ? 'current' : 'stale',
+  )
   const credential = decryptCommerceCredential(
     runtime.encrypted,
     runtime.organizationId,
@@ -1598,18 +1702,24 @@ async function faireProductEnvelope(
     await probeFaireBrandProfile(options),
     runtime.externalAccountId,
   )
-  const providerPage = await listFaireProducts(options, {
-    cursor: page.orderCursor,
-    limit: FAIRE_PRODUCT_PAGE_SIZE,
-    ...(page.orderCursor ? {} : { includeDeleted: true }),
-  })
+  const providerPage = targetExternalProductId
+    ? {
+        products: [await getFaireProduct(options, targetExternalProductId)],
+      }
+    : await listFaireProducts(options, {
+        cursor: page.orderCursor,
+        limit: FAIRE_PRODUCT_PAGE_SIZE,
+        ...(page.orderCursor ? {} : { includeDeleted: true }),
+      })
   const productNodes = faireCollection(providerPage, 'products')
   assertFaireRecordBrandScope(productNodes, runtime.externalAccountId)
-  const nextProductCursor = nextFaireCursor(
-    providerPage,
-    'Faire products',
-    page.orderCursor,
-  )
+  const nextProductCursor = targetExternalProductId
+    ? null
+    : nextFaireCursor(
+        providerPage,
+        'Faire products',
+        page.orderCursor,
+      )
   const bounded = boundedFaireProducts(productNodes)
   const normalizedSource = {
     brand: { id: runtime.externalAccountId },
@@ -1686,7 +1796,10 @@ async function fetchEnvelope(
   runtime: CommerceRuntimeCredentialRecord,
   page: OperationalPageRequest,
   targetExternalOrderId: string | null = null,
-  options: { hydrateProductInventory?: boolean } = {},
+  options: {
+    hydrateProductInventory?: boolean
+    targetExternalProductId?: string | null
+  } = {},
 ): Promise<OperationalPageResult> {
   return page.resource === 'products'
     ? runtime.provider === 'shopify'
@@ -1699,6 +1812,7 @@ async function fetchEnvelope(
           runtime,
           page,
           options.hydrateProductInventory !== false,
+          options.targetExternalProductId || null,
         )
     : runtime.provider === 'shopify'
       ? shopifyEnvelope(runtime, page, targetExternalOrderId)
@@ -2345,6 +2459,20 @@ async function executeCommerceIntakeCommandInternal(
     const exactExternalOrderIdHash = exactExternalOrderId
       ? requestHash(exactExternalOrderId)
       : null
+    const exactExternalProductId = input.body.externalProductId === undefined
+      ? null
+      : commandAction === 'fetch-products' && runtime.provider === 'faire'
+        ? faireProductId(input.body.externalProductId)
+        : (() => {
+            throw new CommerceIntegrationRequestError(
+              'Exact product discovery is available only for a root Faire product fetch',
+              400,
+              'COMMERCE_INTAKE_EXACT_PRODUCT_ACTION_INVALID',
+            )
+          })()
+    const exactExternalProductIdHash = exactExternalProductId
+      ? requestHash(exactExternalProductId)
+      : null
     const refreshCandidateGlobalId = commandAction === 'refresh'
       ? globalId(
         input.body.candidateGlobalId,
@@ -2396,6 +2524,9 @@ async function executeCommerceIntakeCommandInternal(
       target: replayTarget,
       ...(commandAction === 'fetch'
         ? { exactExternalOrderIdHash }
+        : {}),
+      ...(commandAction === 'fetch-products'
+        ? { exactExternalProductIdHash }
         : {}),
     })
     if (replay) {
@@ -2487,9 +2618,13 @@ async function executeCommerceIntakeCommandInternal(
         resource,
         target,
         exactExternalOrderIdHash,
+        exactExternalProductIdHash,
         continuationRunGlobalId,
         pageSize: (
-          exactExternalOrderId || refreshTarget || rejectionTarget
+          exactExternalOrderId
+          || exactExternalProductId
+          || refreshTarget
+          || rejectionTarget
             ? 1
             : resource === 'products'
               ? runtime.provider === 'shopify'
@@ -2534,7 +2669,7 @@ async function executeCommerceIntakeCommandInternal(
       || refreshTarget?.external_order_id
       || rejectionTarget?.external_id
       || null
-    const pageSize = targetExternalOrderId
+    const pageSize = targetExternalOrderId || exactExternalProductId
       ? 1
       : resource === 'products'
         ? runtime.provider === 'shopify'
@@ -2551,13 +2686,15 @@ async function executeCommerceIntakeCommandInternal(
       batchNumber: page.batchNumber,
       continuationPresent: Boolean(page.orderCursor),
       continuationCursorHash: page.cursorHash,
-      targetedRead: Boolean(targetExternalOrderId),
-      targetHash: targetExternalOrderId
-        ? requestHash(targetExternalOrderId)
+      targetedRead: Boolean(
+        targetExternalOrderId || exactExternalProductId,
+      ),
+      targetHash: targetExternalOrderId || exactExternalProductId
+        ? requestHash(targetExternalOrderId || exactExternalProductId)
         : null,
       pageSize,
       productsFetched: page.resource === 'products',
-      oneRootPage: !targetExternalOrderId,
+      oneRootPage: !targetExternalOrderId && !exactExternalProductId,
       readOnly: true,
       providerWrites: 0,
       syncCursorAdvanced: false,
@@ -2591,6 +2728,7 @@ async function executeCommerceIntakeCommandInternal(
           targetExternalOrderId,
           {
             hydrateProductInventory: options.hydrateProductInventory,
+            targetExternalProductId: exactExternalProductId,
           },
         )
         const normalizedVariants = result.envelope.products.reduce(
@@ -2654,6 +2792,9 @@ async function executeCommerceIntakeCommandInternal(
       capturedResponseHash: captured.responseHash,
       ...(commandAction === 'fetch'
         ? { exactExternalOrderIdHash }
+        : {}),
+      ...(commandAction === 'fetch-products'
+        ? { exactExternalProductIdHash }
         : {}),
     })
     const commandWithAutomaticCreation = await withAutomaticProductCreation(
@@ -2899,22 +3040,88 @@ async function executeCommerceIntakeCommandInternal(
   } else if (commandAction === 'resolve-package') {
     const packageInput = record(input.body.package)
     const mode = text(packageInput.mode, 'Package resolution mode', 20)
-    if (mode !== 'profile' && mode !== 'manual') {
+    if (
+      mode !== 'profile'
+      && mode !== 'manual'
+      && mode !== 'variant_mapping'
+    ) {
       throw new CommerceIntegrationRequestError(
-        'Package resolution mode must be profile or manual',
+        'Package resolution mode must be profile, mapped variant, or manual',
         400,
         'COMMERCE_INTAKE_COMMAND_INVALID',
+      )
+    }
+    const lineGlobalId = globalId(
+      input.body.lineGlobalId,
+      LINE_PATTERN,
+      'Candidate line Global ID',
+    )
+    const variantMappingPackage = mode === 'variant_mapping'
+      ? {
+          mode,
+          externalProductId: faireProductId(
+            packageInput.externalProductId,
+          ),
+          externalVariantId: faireVariantId(
+            packageInput.externalVariantId,
+          ),
+          packProfileVersionGlobalId: globalId(
+            packageInput.packProfileVersionGlobalId,
+            PACK_PROFILE_VERSION_PATTERN,
+            'Product pack version Global ID',
+          ),
+          expectedPackProfileVersionRowVersion: rowVersion(
+            packageInput.expectedPackProfileVersionRowVersion,
+          ),
+        } as const
+      : null
+    let exactProductReadEvidence: ReturnType<
+      typeof exactProductPackReadEvidence
+    > | null = null
+    if (variantMappingPackage) {
+      if (runtime.provider !== 'faire') {
+        throw new CommerceIntegrationRequestError(
+          'Order-evidence pack binding is currently available only for Faire',
+          409,
+          'COMMERCE_INTAKE_VARIANT_PACK_PROVIDER_INVALID',
+        )
+      }
+      if (packageInput.confirmExactProductRead !== true) {
+        throw new CommerceIntegrationRequestError(
+          'Confirm the exact read-only Faire product fetch before binding its pack',
+          400,
+          'COMMERCE_INTAKE_READ_CONFIRMATION_REQUIRED',
+        )
+      }
+      const exactProductRead = await executeCommerceIntakeCommandInternal({
+        organizationId: runtime.organizationId,
+        actorEmail: input.actorEmail,
+        body: {
+          accountGlobalId: runtime.globalId,
+          action: 'fetch-products',
+          idempotencyKey: deterministicCustomerCommandUuid([
+            'commerce-intake-exact-product-pack-v1',
+            runtime.globalId,
+            key,
+          ]),
+          confirmReadOnly: true,
+          externalProductId: variantMappingPackage.externalProductId,
+        },
+      }, {
+        includeIntakeState: false,
+        hydrateProductInventory: options.hydrateProductInventory,
+        providerAttemptActorEmail: options.providerAttemptActorEmail,
+      })
+      exactProductReadEvidence = exactProductPackReadEvidence(
+        exactProductRead.command as Record<string, unknown>,
+        variantMappingPackage,
       )
     }
     command = await resolveCommerceCandidatePackageInPostgres({
       ...shared,
       candidateGlobalId,
       candidateRowVersion: version,
-      lineGlobalId: globalId(
-        input.body.lineGlobalId,
-        LINE_PATTERN,
-        'Candidate line Global ID',
-      ),
+      lineGlobalId,
       package: mode === 'profile'
         ? {
             mode,
@@ -2924,8 +3131,13 @@ async function executeCommerceIntakeCommandInternal(
               'Package profile Global ID',
             ),
           } as const
-        : {
-            mode,
+        : variantMappingPackage && exactProductReadEvidence
+          ? {
+              ...variantMappingPackage,
+              exactProductReadEvidence,
+            }
+          : {
+            mode: 'manual',
             weightGrams: positiveInteger(
               packageInput.weightGrams,
               'Package weight',

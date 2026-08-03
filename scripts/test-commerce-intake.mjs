@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -1061,6 +1062,19 @@ includes(serviceSource, [
   'const organizationId = normalizeCommerceOrganizationId(input.organizationId)',
   'const accountGlobalId = normalizeCommerceAccountGlobalId(',
 ], 'Commerce intake service')
+includes(serviceSource, [
+  'getFaireProduct',
+  'targetExternalProductId',
+  "targetExternalProductId ? 'current' : 'stale'",
+  'exactExternalProductIdHash',
+  'COMMERCE_INTAKE_EXACT_PRODUCT_ACTION_INVALID',
+  'COMMERCE_INTAKE_EXACT_PRODUCT_ID_INVALID',
+  "'commerce-intake-exact-product-pack-v1'",
+  'confirmExactProductRead',
+  "mode !== 'variant_mapping'",
+  'providerWrites: 0',
+  'syncCursorAdvanced: false',
+], 'Exact read-only Faire product intake and one-time pack binding')
 for (const providerWrite of [
   'moveFaireOrderToProcessing',
   'cancelFaireOrder',
@@ -1100,6 +1114,43 @@ includes(persistenceSource, [
   "SET disposition = 'retried'",
   'retry_run_id = $2::uuid',
 ], 'Successful exact-order retry closes the matching legacy rejection')
+includes(persistenceSource, [
+  'envelopeMatchesExactProductTarget',
+  'envelope.products.length === 1',
+  'productRejections.length === 0',
+  'COMMERCE_INTAKE_EXACT_PRODUCT_TARGET_MISMATCH',
+  'exactProductTargetHash',
+  'exactProductAuditEvidenceMatches',
+  'exactProductReadEvidence',
+  'FOR UPDATE OF run, intent, attempt',
+  "intent.intake_action = 'fetch-products'",
+  "attempt.redacted_request->>'targetHash' = $6",
+  'state.global_id = $4',
+  'state.row_version = $9::bigint',
+  'operations_product_pack_profile_versions version',
+  'expectedPackProfileVersionRowVersion',
+  'COMMERCE_INTAKE_PACK_UNIT_MULTIPLIER_CONFLICT',
+  'operations_product_channel_states state',
+  "mapping.mapping_purpose = 'catalog'",
+  "mapping.provider = 'faire'",
+  "packaging_source = 'variant_pack_mapping'",
+  "packaging_weight_source = 'profile_version'",
+  'variant_pack_mapping_created_from_exact_product',
+  'orderSourceRevision: line.source_revision',
+  'orderSourceHash: line.source_hash',
+  'channelSourceRevision: channelState.source_revision',
+  'channelSourceHash: channelState.source_hash',
+  "eventType: 'commerce.intake.variant_pack_mapping_bound'",
+], 'Exact Faire variant pack binding preserves source, identity, and version fences')
+const variantPackResolutionSource = persistenceSource.slice(
+  persistenceSource.indexOf("input.package.mode === 'variant_mapping'"),
+  persistenceSource.indexOf('let packageProfileId: string | null'),
+)
+assert.doesNotMatch(
+  variantPackResolutionSource,
+  /INSERT INTO operations_product_package_profiles/,
+  'Versioned Faire pack binding must not create a legacy package profile',
+)
 includes(persistenceSource, [
   'reconcileStagedCommerceProductImages',
   "input.account.provider === 'faire'",
@@ -1954,6 +2005,30 @@ includes(persistenceSource, [
   'providerReads: 0',
   'providerWrites: 0',
 ], 'Audited deterministic Faire retailer pre-fetch binding persistence')
+const candidateCustomerResolutionSource = persistenceSource.slice(
+  persistenceSource.indexOf(
+    'export async function resolveCommerceCandidateCustomerInPostgres',
+  ),
+  persistenceSource.indexOf(
+    'export async function confirmCommerceCandidateAddressInPostgres',
+  ),
+)
+includes(candidateCustomerResolutionSource, [
+  "operations_external_identifiers.status = 'active'",
+  "operations_external_identifiers.match_method = 'email'",
+  'operations_external_identifiers.match_evidence\n                  @> $7::jsonb',
+  'THEN operations_external_identifiers.match_evidence',
+  'THEN operations_external_identifiers.last_verified_at',
+  'WHERE operations_external_identifiers.entity_global_id\n               = EXCLUDED.entity_global_id',
+  "evidenceType: 'operator_confirmed_email'",
+  'confirmedBeforeProviderRead: true',
+], 'Operator-confirmed Faire retailer evidence preservation')
+assert.ok(
+  !candidateCustomerResolutionSource.includes(
+    'entity_global_id = EXCLUDED.entity_global_id',
+  ),
+  'Automatic customer resolution must never replace a bound CRM entity',
+)
 includes(persistenceSource, [
   'WITH anchor_run AS',
   "run.resource = 'products_and_orders'",
@@ -2042,6 +2117,16 @@ includes(workflowSource, [
   'current provider rejections',
   'CSV export apply to the loaded subset',
 ], 'Truthful truncated provider-issue presentation')
+includes(workflowSource, [
+  'packProfileVersions',
+  'matchingPackProfileVersions',
+  'bindFaireVariantPack',
+  "mode: 'variant_mapping'",
+  'externalVariantId: line.externalVariantId',
+  'confirmExactProductRead: true',
+  'Read exact product & bind',
+  'It does not write to Faire or create a legacy package profile.',
+], 'Fail-closed exact Faire variant Product pack action')
 const intakeRouteSource = read(
   'app_src/app/api/integrations/commerce/intake/route.ts',
 )
@@ -2416,6 +2501,7 @@ const providerReads = {
   faireOrder: 0,
   faireProfile: 0,
 }
+let exactFaireProductReads = 0
 const faireProductListOptions = []
 const providerAttempts = []
 const providerReservations = []
@@ -2438,6 +2524,7 @@ const customerBindingPlanCalls = []
 const customerBindingConfirmCalls = []
 let failStageOnceForKey = null
 let failReadIntentPreparationForKey = null
+let rejectedExactFaireProductId = null
 const refreshTargets = new Map([
   ['gcoc0000001', {
     provider: 'shopify',
@@ -2563,6 +2650,19 @@ const service = loadTypeScriptModule(
               : {}),
           }
         },
+        async getFaireProduct(_options, productId) {
+          exactFaireProductReads += 1
+          return {
+            id: productId,
+            brand_id: faireReturnedBrandId,
+            images: [{
+              id: 'faire-exact-image-1',
+              url: 'https://cdn.faire.com/products/exact.png?token=FAIRE-EXACT-TOKEN-SENTINEL',
+              sequence: 0,
+            }],
+            variants: [{ id: 'po_exact_variant_1' }],
+          }
+        },
         async listFaireInventory(_options, query) {
           providerReads.faireInventory += 1
           assert.ok(query.productVariantIds.length <= 50)
@@ -2612,7 +2712,12 @@ const service = loadTypeScriptModule(
             'faire',
             source.orders.orders.map((order) => order.id),
           )
-          result.products = source.products.products.map((product) => ({
+          const rejectedProducts = source.products.products.filter(
+            (product) => product.id === rejectedExactFaireProductId,
+          )
+          result.products = source.products.products
+            .filter((product) => product.id !== rejectedExactFaireProductId)
+            .map((product) => ({
             identity: { value: product.id },
             sourceHash: product.id === 'faire-product-1'
               ? '1'.repeat(64)
@@ -2629,7 +2734,16 @@ const service = loadTypeScriptModule(
             })),
             variants: product.variants.map((variant) => ({
               identity: { value: variant.id },
+              sourceHash: '9'.repeat(64),
+              providerUpdatedAt: '2026-07-26T00:00:00.000Z',
             })),
+          }))
+          result.rejections = rejectedProducts.map((product) => ({
+            resourceType: 'product',
+            externalId: product.id,
+            sourceHash: '7'.repeat(64),
+            errorCode: 'COMMERCE_NORMALIZATION_PRODUCT_INVALID',
+            safeMessage: 'Provider product was rejected.',
           }))
           return result
         },
@@ -2957,6 +3071,11 @@ const service = loadTypeScriptModule(
                 && replay.exactExternalOrderIdHash
                   !== input.exactExternalOrderIdHash
               )
+              || (
+                input.exactExternalProductIdHash !== undefined
+                && replay.exactExternalProductIdHash
+                  !== input.exactExternalProductIdHash
+              )
             )
           ) {
             const error = new Error(
@@ -3097,6 +3216,30 @@ const service = loadTypeScriptModule(
             failStageOnceForKey = null
             throw new Error('simulated crash after durable provider capture')
           }
+          if (input.exactExternalProductIdHash) {
+            const productRejections = input.envelope.rejections.filter(
+              (rejection) => rejection.resourceType === 'product',
+            )
+            const exactProduct = input.envelope.products.length === 1
+              ? input.envelope.products[0]
+              : null
+            const returnedTargetHash = exactProduct
+              ? createHash('sha256')
+                  .update(JSON.stringify(exactProduct.identity.value))
+                  .digest('hex')
+              : null
+            if (
+              !exactProduct
+              || productRejections.length > 0
+              || returnedTargetHash !== input.exactExternalProductIdHash
+            ) {
+              const error = new Error(
+                'The exact provider read returned a different or ambiguous product identity. No provider data was staged.',
+              )
+              error.code = 'COMMERCE_INTAKE_EXACT_PRODUCT_TARGET_MISMATCH'
+              throw error
+            }
+          }
           persistenceCommands.push({ name: 'stage-envelope', input })
           const action = input.stageAction
           const runGlobalId =
@@ -3119,6 +3262,28 @@ const service = loadTypeScriptModule(
             },
             providerWrites: 0,
             syncCursorAdvanced: false,
+            ...(input.exactExternalProductIdHash
+              ? {
+                  exactProductEvidence: {
+                    externalProductId:
+                      input.envelope.products[0].identity.value,
+                    productSourceHash: input.envelope.products[0].sourceHash,
+                    variants: input.envelope.products[0].variants.map(
+                      (variant) => ({
+                        externalVariantId: variant.identity.value,
+                        variantSourceRevision: variant.providerUpdatedAt,
+                        variantSourceHash: variant.sourceHash,
+                        channelStateGlobalId:
+                          `gpcs${String(runSequence).padStart(7, '0')}`,
+                        channelStateRowVersion: 3,
+                        channelSourceRevision: variant.providerUpdatedAt,
+                        channelSourceHash: variant.sourceHash,
+                        channelPackEvidenceHash: '8'.repeat(64),
+                      }),
+                    ),
+                  },
+                }
+              : {}),
           }
           if (input.page?.nextOrderCursor) {
             continuations.set(runGlobalId, {
@@ -3159,6 +3324,8 @@ const service = loadTypeScriptModule(
               result: { ...result, replayed: true },
               exactExternalOrderIdHash:
                 input.exactExternalOrderIdHash ?? null,
+              exactExternalProductIdHash:
+                input.exactExternalProductIdHash ?? null,
             },
           )
           return result
@@ -4361,6 +4528,176 @@ try {
     faireOrder: 2,
     faireProfile: 7,
   }, 'Resolution, validation, and promotion must not call providers')
+  const readsBeforeExactPackBinding = { ...providerReads }
+  const stagesBeforeExactPackBinding = stageAttempts.length
+  const exactPackBindingKey = nextKey()
+  const exactPackBinding = await service.executeCommerceIntakeCommand({
+    organizationId,
+    actorEmail,
+    body: {
+      action: 'resolve-package',
+      accountGlobalId: faireRuntime.globalId,
+      candidateGlobalId: 'gcoc0000001',
+      lineGlobalId: 'gcol0000001',
+      rowVersion: 0,
+      idempotencyKey: exactPackBindingKey,
+      package: {
+        mode: 'variant_mapping',
+        externalProductId: 'p_exact_product_1',
+        externalVariantId: 'po_exact_variant_1',
+        packProfileVersionGlobalId: 'gppv0000001',
+        expectedPackProfileVersionRowVersion: 0,
+        confirmExactProductRead: true,
+      },
+    },
+  })
+  assert.equal(exactFaireProductReads, 1)
+  assert.equal(
+    providerReads.faireProducts,
+    readsBeforeExactPackBinding.faireProducts,
+    'Exact Faire Product pack binding must use GET /products/:id, not the paginated catalog',
+  )
+  assert.equal(
+    providerReads.faireProfile,
+    readsBeforeExactPackBinding.faireProfile + 1,
+  )
+  assert.equal(
+    stageAttempts.length,
+    stagesBeforeExactPackBinding + 1,
+  )
+  const exactProductStage = stageAttempts.at(-1)
+  assert.equal(exactProductStage.stageAction, 'fetch-products')
+  assert.match(
+    exactProductStage.exactExternalProductIdHash,
+    /^[a-f0-9]{64}$/,
+  )
+  assert.equal(
+    exactProductStage.envelope.products[0].identity.value,
+    'p_exact_product_1',
+  )
+  const exactProductReservation = providerReservations.at(-1)
+  assert.equal(exactProductReservation.redactedRequest.targetedRead, true)
+  assert.equal(exactProductReservation.redactedRequest.productsFetched, true)
+  assert.equal(exactProductReservation.redactedRequest.providerWrites, 0)
+  assert.equal(exactProductReservation.redactedRequest.syncCursorAdvanced, false)
+  assert.doesNotMatch(
+    JSON.stringify(exactProductReservation.redactedRequest),
+    /p_exact_product_1/,
+    'Durable exact-product request evidence must retain only the provider-ID hash',
+  )
+  assert.equal(exactPackBinding.command.action, 'resolve-package')
+  const exactPackResolution = persistenceCommands
+    .filter(({ name }) => name === 'resolve-package')
+    .at(-1)
+  assert.equal(exactPackResolution.input.runtime.provider, 'faire')
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(exactPackResolution.input.package)),
+    {
+      mode: 'variant_mapping',
+      externalProductId: 'p_exact_product_1',
+      externalVariantId: 'po_exact_variant_1',
+      packProfileVersionGlobalId: 'gppv0000001',
+      expectedPackProfileVersionRowVersion: 0,
+      exactProductReadEvidence: {
+        runGlobalId:
+          exactPackResolution.input.package.exactProductReadEvidence.runGlobalId,
+        externalProductId: 'p_exact_product_1',
+        productSourceHash: '2'.repeat(64),
+        externalVariantId: 'po_exact_variant_1',
+        variantSourceRevision: '2026-07-26T00:00:00.000Z',
+        variantSourceHash: '9'.repeat(64),
+        channelStateGlobalId:
+          exactPackResolution.input.package.exactProductReadEvidence
+            .channelStateGlobalId,
+        channelStateRowVersion: 3,
+        channelSourceRevision: '2026-07-26T00:00:00.000Z',
+        channelSourceHash: '9'.repeat(64),
+        channelPackEvidenceHash: '8'.repeat(64),
+      },
+    },
+  )
+  assert.match(
+    exactPackResolution.input.package.exactProductReadEvidence.runGlobalId,
+    /^gcir(?:[0-9]{7}|[0-9a-v]{12})$/,
+  )
+  assert.match(
+    exactPackResolution.input.package.exactProductReadEvidence
+      .channelStateGlobalId,
+    /^gpcs(?:[0-9]{7}|[0-9a-v]{12})$/,
+  )
+  const exactReadsBeforeChangedTargetRetry = exactFaireProductReads
+  await assert.rejects(
+    service.executeCommerceIntakeCommand({
+      organizationId,
+      actorEmail,
+      body: {
+        action: 'resolve-package',
+        accountGlobalId: faireRuntime.globalId,
+        candidateGlobalId: 'gcoc0000001',
+        lineGlobalId: 'gcol0000001',
+        rowVersion: 0,
+        idempotencyKey: exactPackBindingKey,
+        package: {
+          mode: 'variant_mapping',
+          externalProductId: 'p_different_product_1',
+          externalVariantId: 'po_exact_variant_1',
+          packProfileVersionGlobalId: 'gppv0000001',
+          expectedPackProfileVersionRowVersion: 0,
+          confirmExactProductRead: true,
+        },
+      },
+    }),
+    (error) => error.code === 'COMMERCE_INTAKE_IDEMPOTENCY_CONFLICT',
+  )
+  assert.equal(
+    exactFaireProductReads,
+    exactReadsBeforeChangedTargetRetry,
+    'A changed target under the same pack-binding key must fail before another provider read',
+  )
+  const resolvesBeforeRejectedExactProduct = persistenceCommands.filter(
+    ({ name }) => name === 'resolve-package',
+  ).length
+  const stagesBeforeRejectedExactProduct = stageAttempts.length
+  const readsBeforeRejectedExactProduct = exactFaireProductReads
+  rejectedExactFaireProductId = 'p_rejected_product_1'
+  try {
+    await assert.rejects(
+      service.executeCommerceIntakeCommand({
+        organizationId,
+        actorEmail,
+        body: {
+          action: 'resolve-package',
+          accountGlobalId: faireRuntime.globalId,
+          candidateGlobalId: 'gcoc0000001',
+          lineGlobalId: 'gcol0000001',
+          rowVersion: 0,
+          idempotencyKey: nextKey(),
+          package: {
+            mode: 'variant_mapping',
+            externalProductId: rejectedExactFaireProductId,
+            externalVariantId: 'po_rejected_variant_1',
+            packProfileVersionGlobalId: 'gppv0000001',
+            expectedPackProfileVersionRowVersion: 0,
+            confirmExactProductRead: true,
+          },
+        },
+      }),
+      (error) => (
+        error.code === 'COMMERCE_INTAKE_EXACT_PRODUCT_TARGET_MISMATCH'
+      ),
+    )
+  } finally {
+    rejectedExactFaireProductId = null
+  }
+  assert.equal(exactFaireProductReads, readsBeforeRejectedExactProduct + 1)
+  assert.equal(stageAttempts.length, stagesBeforeRejectedExactProduct + 1)
+  assert.equal(stageAttempts.at(-1).envelope.products.length, 0)
+  assert.equal(stageAttempts.at(-1).envelope.rejections.length, 1)
+  assert.equal(
+    persistenceCommands.filter(({ name }) => name === 'resolve-package').length,
+    resolvesBeforeRejectedExactProduct,
+    'A rejected exact product must never reach pack mapping create or reuse',
+  )
   const promotion = persistenceCommands.find(({ name }) => name === 'promote')
   assert.match(promotion.input.requestHash, /^[a-f0-9]{64}$/)
   assert.ok(stateReads.length >= localCommands.length + 2)

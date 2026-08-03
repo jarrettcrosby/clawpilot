@@ -396,6 +396,66 @@ test('reads Faire string and object image shapes without returning secrets in er
   )
 })
 
+test('authoritative Faire image reads preserve every ordered entry without dedupe', async () => {
+  const duplicateUrl = 'https://cdn.faire.com/duplicate.png'
+  const runtime = shopifyRuntime({
+    configuration: {},
+    externalAccountId: 'b_100',
+    provider: 'faire',
+  })
+  const { module } = fixture({
+    runtime,
+    faireProduct: {
+      id: 'p_200',
+      brand_id: 'b_100',
+      images: [duplicateUrl, duplicateUrl],
+    },
+  })
+  const sources = await module.readCurrentCommerceProviderImageSources(
+    sourceInput({
+      externalProductId: 'p_200',
+      provider: 'faire',
+      requireExactOrderedSet: true,
+    }),
+  )
+  assert.equal(sources.length, 2)
+  assert.deepEqual(Array.from(sources, (source) => source.sequence), [0, 1])
+  assert.deepEqual(Array.from(sources, (source) => source.url), [
+    duplicateUrl,
+    duplicateUrl,
+  ])
+})
+
+test('authoritative Faire image reads fail closed on any undecodable entry', async () => {
+  const runtime = shopifyRuntime({
+    configuration: {},
+    externalAccountId: 'b_100',
+    provider: 'faire',
+  })
+  for (const invalidImage of [null, {}, 'http://cdn.faire.com/not-https.png']) {
+    const { module } = fixture({
+      runtime,
+      faireProduct: {
+        id: 'p_200',
+        brand_id: 'b_100',
+        images: [
+          'https://cdn.faire.com/valid.png',
+          invalidImage,
+        ],
+      },
+    })
+    await expectCode(
+      module.readCurrentCommerceProviderImageSources(sourceInput({
+        externalProductId: 'p_200',
+        provider: 'faire',
+        requireExactOrderedSet: true,
+      })),
+      'COMMERCE_PROVIDER_IMAGE_SOURCE_EXACT_SET_INVALID',
+      ['not-https.png', 'cdn.faire.com'],
+    )
+  }
+})
+
 test('retries a malformed Faire product image shape instead of treating it as absence', async () => {
   const runtime = shopifyRuntime({
     configuration: {},

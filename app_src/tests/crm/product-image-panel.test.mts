@@ -92,3 +92,26 @@ test('Shopify publishing stays Shadow and requires one exact resource authorizat
   assert.doesNotMatch(panel, /activation scope is Active/)
   assert.doesNotMatch(panel, /Shopify primary image (?:published|updated|complete)/i)
 })
+
+test('Faire publishing requires exact Shadow simulation and a one-use two-write authorization', () => {
+  assert.match(panel, /data-testid="crm-faire-image-publishing"/)
+  assert.match(panel, /\/faire-product-image/)
+  assert.match(panel, /action: 'publish-product-image'/)
+  assert.match(panel, /action: 'reconcile-product-image'/)
+  assert.match(panel, /channelStateGlobalId: channel\.globalId/)
+  assert.match(panel, /assetId: asset\.id/)
+  assert.match(panel, /shadowSimulationEffectGlobalId/)
+  assert.match(panel, /zero\s+Faire network requests and zero provider writes/)
+  assert.match(
+    panel,
+    /I authorize the two required Faire provider writes once for this exact Product, listing, and image revision/,
+  )
+  assert.match(panel, /Current Faire images are preserved/)
+  assert.match(panel, /Reconcile by Faire readback/)
+  assert.match(panel, /no provider write repeated/)
+  assert.match(panel, /payload\.externalEffectGlobalId/)
+  assert.match(panel, /state: 'reconciliation_required'/)
+  assert.match(panel, /The Faire effect identity was retained/)
+  assert.match(panel, /if \(!executeProviderWrite\) setFaireProjection\(null\)/)
+  assert.doesNotMatch(panel, /faire.*idempotencyKey/is)
+})

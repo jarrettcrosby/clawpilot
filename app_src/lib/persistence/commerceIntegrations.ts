@@ -42,6 +42,12 @@ import {
   ensureShopifyFulfillmentNotificationPolicyWithClient,
   type ShopifyFulfillmentNotificationPolicyState,
 } from '@/lib/persistence/shopifyFulfillmentNotifications'
+import type {
+  CommerceActiveContinuation,
+} from '@/lib/operations/commerceActiveSelection'
+import {
+  readCommerceActiveContinuationInPostgres,
+} from '@/lib/persistence/commerceActiveTransitionAuthorization'
 
 type TimestampValue = string | Date
 
@@ -179,6 +185,7 @@ export type CommerceIntegrationAccountState = {
 export type CommerceIntegrationsState = {
   organizationId: string
   accounts: CommerceIntegrationAccountState[]
+  commerceActiveContinuation: CommerceActiveContinuation | null
 }
 
 export type CommerceRuntimeCredentialRecord = {
@@ -380,6 +387,7 @@ export async function readCommerceIntegrationsStateFromPostgres(
     evidenceRows,
     notificationPolicyRows,
     faireAuthorityRows,
+    commerceActiveContinuation,
   ] =
     await Promise.all([
       query<CommerceConnectionRow>(
@@ -511,6 +519,7 @@ export async function readCommerceIntegrationsStateFromPostgres(
            AND account.provider = 'faire'`,
         [organizationId],
       ),
+      readCommerceActiveContinuationInPostgres({ organizationId }),
     ])
 
   const cursors = new Map<string, CommerceSyncCursorState[]>()
@@ -530,6 +539,7 @@ export async function readCommerceIntegrationsStateFromPostgres(
   )
   return {
     organizationId,
+    commerceActiveContinuation,
     accounts: connections.rows.map((row) => accountState(
       row,
       cursors.get(row.id) || [],

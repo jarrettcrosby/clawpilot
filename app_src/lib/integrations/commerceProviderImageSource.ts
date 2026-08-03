@@ -299,6 +299,7 @@ async function readFaireSources(input: {
     typeof readCommerceRuntimeCredentialFromPostgres
   >>>
   externalProductId: string
+  requireExactOrderedSet: boolean
 }) {
   const externalProductId = requiredText(
     input.externalProductId,
@@ -421,18 +422,54 @@ async function readFaireSources(input: {
         url: value,
         sequence,
       })
+      if (!source && input.requireExactOrderedSet) {
+        fail(
+          'COMMERCE_PROVIDER_IMAGE_SOURCE_EXACT_SET_INVALID',
+          'Faire returned an image array that cannot be preserved exactly',
+          409,
+        )
+      }
       return source ? [source] : []
     }
     const image = record(value)
-    if (!image) return []
+    if (!image) {
+      if (input.requireExactOrderedSet) {
+        fail(
+          'COMMERCE_PROVIDER_IMAGE_SOURCE_EXACT_SET_INVALID',
+          'Faire returned an image array that cannot be preserved exactly',
+          409,
+        )
+      }
+      return []
+    }
     const source = sourceFromCandidate({
       provider: 'faire',
       providerImageId: image.id ?? image.image_id ?? image.imageId,
       url: image.url ?? image.image_url ?? image.imageUrl,
       sequence,
     })
+    if (!source && input.requireExactOrderedSet) {
+      fail(
+        'COMMERCE_PROVIDER_IMAGE_SOURCE_EXACT_SET_INVALID',
+        'Faire returned an image array that cannot be preserved exactly',
+        409,
+      )
+    }
     return source ? [source] : []
   })
+  if (input.requireExactOrderedSet) {
+    if (
+      sources.length !== product.images.length
+      || sources.some((source, sequence) => source.sequence !== sequence)
+    ) {
+      fail(
+        'COMMERCE_PROVIDER_IMAGE_SOURCE_EXACT_SET_INVALID',
+        'Faire returned an image array that cannot be preserved exactly',
+        409,
+      )
+    }
+    return Object.freeze(sources)
+  }
   return dedupeSources(sources)
 }
 
@@ -447,6 +484,7 @@ export async function readCurrentCommerceProviderImageSources(input: {
   provider: CommerceProviderImageSourceProvider
   credentialGeneration: number
   externalProductId: string
+  requireExactOrderedSet?: boolean
 }): Promise<readonly CommerceProviderImageSource[]> {
   const organizationId = normalizeCommerceOrganizationId(input.organizationId)
   const accountGlobalId = normalizeCommerceAccountGlobalId(input.accountGlobalId)
@@ -487,7 +525,11 @@ export async function readCurrentCommerceProviderImageSources(input: {
   try {
     return input.provider === 'shopify'
       ? await readShopifySources({ runtime, externalProductId: input.externalProductId })
-      : await readFaireSources({ runtime, externalProductId: input.externalProductId })
+      : await readFaireSources({
+          runtime,
+          externalProductId: input.externalProductId,
+          requireExactOrderedSet: input.requireExactOrderedSet === true,
+        })
   } catch (error) {
     if (error instanceof CommerceProviderImageSourceError) throw error
     fail(

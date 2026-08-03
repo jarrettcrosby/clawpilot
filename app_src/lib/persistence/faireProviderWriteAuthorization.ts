@@ -25,8 +25,14 @@ export const FAIRE_PROVIDER_WRITE_CONFIRMATION =
   'I authorize one production Faire draft-product creation for this exact reviewed request. An unknown outcome will not be retried.' as const
 export const FAIRE_PROVIDER_WRITE_ACTION =
   'faire.product.draft.create' as const
+export const FAIRE_PRODUCT_IMAGE_WRITE_ACTION =
+  'faire.product.image.publish' as const
 export const FAIRE_PROVIDER_WRITE_ADAPTER_CAPABILITY =
   'product_draft_create' as const
+export const FAIRE_PRODUCT_IMAGE_WRITE_CAPABILITIES = Object.freeze([
+  'product_draft_update',
+  'product_image_upload',
+] as const)
 export const FAIRE_PROVIDER_WRITE_REQUIRED_SCOPE = 'WRITE_PRODUCTS' as const
 
 export type FaireProviderWriteScopeVerificationSource = 'oauth_grant'
@@ -50,7 +56,9 @@ type AuthorizationRow = {
   capabilities: string[]
   credential_generation: number
   activation_revision: number
-  action: typeof FAIRE_PROVIDER_WRITE_ACTION
+  action:
+    | typeof FAIRE_PROVIDER_WRITE_ACTION
+    | typeof FAIRE_PRODUCT_IMAGE_WRITE_ACTION
   aggregate_type: string
   aggregate_id: string
   aggregate_revision: string | number
@@ -75,6 +83,8 @@ type AuthorizationRow = {
   lease_expires_at: TimestampValue | null
   claimed_by: string | null
   claimed_at: TimestampValue | null
+  product_image_delivery_grant_id: string | null
+  shadow_simulation_effect_id: string | null
 }
 
 export type FaireProviderWriteAuthorization = {
@@ -90,10 +100,12 @@ export type FaireProviderWriteAuthorization = {
   scopeVerificationSource: FaireProviderWriteScopeVerificationSource
   scopeEvidenceHash: string
   verifiedWriteScopes: [typeof FAIRE_PROVIDER_WRITE_REQUIRED_SCOPE]
-  capabilities: [typeof FAIRE_PROVIDER_WRITE_ADAPTER_CAPABILITY]
+  capabilities:
+    | [typeof FAIRE_PROVIDER_WRITE_ADAPTER_CAPABILITY]
+    | ['product_draft_update', 'product_image_upload']
   credentialGeneration: number
   activationRevision: number
-  action: typeof FAIRE_PROVIDER_WRITE_ACTION
+  action: AuthorizationRow['action']
   aggregateType: string
   aggregateId: string
   aggregateRevision: number
@@ -118,6 +130,8 @@ export type FaireProviderWriteAuthorization = {
   leaseExpiresAt: string | null
   claimedBy: string | null
   claimedAt: string | null
+  productImageDeliveryGrantId: string | null
+  shadowSimulationEffectId: string | null
 }
 
 export type ClaimedFaireProviderWrite = FaireProviderWriteAuthorization & {
@@ -235,13 +249,19 @@ function assertFaireProviderWriteRedacted(
 }
 
 function authorization(row: AuthorizationRow): FaireProviderWriteAuthorization {
+  const draftCapability = row.action === FAIRE_PROVIDER_WRITE_ACTION
+    && row.capabilities.length === 1
+    && row.capabilities[0] === FAIRE_PROVIDER_WRITE_ADAPTER_CAPABILITY
+  const imageCapabilities = row.action === FAIRE_PRODUCT_IMAGE_WRITE_ACTION
+    && row.capabilities.length === 2
+    && row.capabilities[0] === FAIRE_PRODUCT_IMAGE_WRITE_CAPABILITIES[0]
+    && row.capabilities[1] === FAIRE_PRODUCT_IMAGE_WRITE_CAPABILITIES[1]
   if (
     !row.effect_id
     || !row.effect_global_id
     || !row.effect_state
     || row.authorization_revision !== 1
-    || row.capabilities.length !== 1
-    || row.capabilities[0] !== FAIRE_PROVIDER_WRITE_ADAPTER_CAPABILITY
+    || (!draftCapability && !imageCapabilities)
     || row.verified_write_scopes.length !== 1
     || row.verified_write_scopes[0] !== FAIRE_PROVIDER_WRITE_REQUIRED_SCOPE
   ) {
@@ -264,7 +284,9 @@ function authorization(row: AuthorizationRow): FaireProviderWriteAuthorization {
     scopeVerificationSource: row.scope_verification_source,
     scopeEvidenceHash: row.scope_evidence_hash,
     verifiedWriteScopes: [FAIRE_PROVIDER_WRITE_REQUIRED_SCOPE],
-    capabilities: [FAIRE_PROVIDER_WRITE_ADAPTER_CAPABILITY],
+    capabilities: draftCapability
+      ? [FAIRE_PROVIDER_WRITE_ADAPTER_CAPABILITY]
+      : [...FAIRE_PRODUCT_IMAGE_WRITE_CAPABILITIES],
     credentialGeneration: Number(row.credential_generation),
     activationRevision: Number(row.activation_revision),
     action: row.action,
@@ -292,6 +314,9 @@ function authorization(row: AuthorizationRow): FaireProviderWriteAuthorization {
     leaseExpiresAt: iso(row.lease_expires_at),
     claimedBy: row.claimed_by,
     claimedAt: iso(row.claimed_at),
+    productImageDeliveryGrantId:
+      row.product_image_delivery_grant_id,
+    shadowSimulationEffectId: row.shadow_simulation_effect_id,
   }
 }
 
@@ -336,7 +361,9 @@ const AUTHORIZATION_SELECT = `SELECT
   effect.lease_token::text,
   effect.lease_expires_at,
   effect.claimed_by,
-  effect.claimed_at
+  effect.claimed_at,
+  auth.product_image_delivery_grant_id::text,
+  auth.shadow_simulation_effect_id::text
 FROM operations_faire_provider_write_authorizations auth
 JOIN operations_integration_accounts account
   ON account.organization_id = auth.organization_id
@@ -1052,7 +1079,9 @@ export async function finalizeExpiredFaireProviderWriteClaimUnknownInPostgres(
 
     const redactedResult = {
       provider: 'faire',
-      operation: 'productDraftCreate',
+      operation: current.action === FAIRE_PRODUCT_IMAGE_WRITE_ACTION
+        ? 'productImagePublish'
+        : 'productDraftCreate',
       outcome: 'unknown',
       stage: 'claim_lease_expired',
       errorCode: 'FAIRE_PROVIDER_WRITE_CLAIM_EXPIRED',

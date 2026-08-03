@@ -211,6 +211,11 @@ export type FaireProductDraftPatchInput = {
   madeInCountry?: string
 }
 
+export type FaireProductImagePatchInput = {
+  expectedCurrentImages: readonly FaireProductImageInput[]
+  images: readonly FaireProductImageInput[]
+}
+
 export type FaireImageUploadInput = {
   attachmentBase64: string
 }
@@ -320,6 +325,10 @@ export type FaireCommerceClient = {
   updateDraftProduct: (
     productId: string,
     input: FaireProductDraftPatchInput,
+  ) => Promise<FaireProduct>
+  updateProductImages: (
+    productId: string,
+    input: FaireProductImagePatchInput,
   ) => Promise<FaireProduct>
   uploadProductImage: (
     input: FaireImageUploadInput,
@@ -1728,6 +1737,24 @@ function expectDraftProduct(value: unknown, expectedProductId?: string) {
   return product
 }
 
+function expectImageWritableProduct(
+  value: unknown,
+  expectedProductId?: string,
+) {
+  const product = expectProduct(value, expectedProductId)
+  const lifecycleState = String(product.lifecycle_state || '')
+    .trim()
+    .toUpperCase()
+  if (!['DRAFT', 'PUBLISHED', 'ACTIVE'].includes(lifecycleState)) {
+    throw new FaireCommerceClientError(
+      'Faire product lifecycle does not permit a Product-image update',
+      409,
+      'FAIRE_PRODUCT_IMAGE_LIFECYCLE_UNSUPPORTED',
+    )
+  }
+  return product
+}
+
 function providerBrandIdentifiers(value: Record<string, unknown>) {
   const nestedBrand = safeRecord(value.brand)
   return [
@@ -2331,6 +2358,70 @@ export function createFaireCommerceClient(
     )
   }
 
+  async function updateProductImages(
+    productIdValue: string,
+    input: FaireProductImagePatchInput,
+  ) {
+    requireWriteAuthorization(['product_draft_update'], 'WRITE_PRODUCTS')
+    const productId = normalizeResourceId(
+      productIdValue,
+      'Faire product ID',
+      'FAIRE_PRODUCT_ID_INVALID',
+    )
+    const expectedCurrentImages = normalizeProductImages(
+      input?.expectedCurrentImages,
+    )
+    const images = normalizeProductImages(input?.images)
+    if (images.length < 1) {
+      invalidInput(
+        'Faire Product-image publication requires at least one image',
+        'FAIRE_PRODUCT_IMAGES_INVALID',
+      )
+    }
+    await verifyWriteBrandIdentity()
+    const existing = expectImageWritableProduct(
+      await request(`/products/${productId}`),
+      productId,
+    )
+    if (providerBrandIdentifiers(existing).length > 0) {
+      expectExactBrandIdentity(
+        existing,
+        credentialBinding!.externalAccountId,
+        'FAIRE_PRODUCT_BRAND_READBACK_MISMATCH',
+      )
+    }
+    if (!exactRequestedValue(existing.images, expectedCurrentImages)) {
+      throw new FaireCommerceClientError(
+        'Faire Product images changed after the authoritative base read',
+        409,
+        'FAIRE_PRODUCT_IMAGE_BASE_SET_CHANGED',
+      )
+    }
+    expectImageWritableProduct(await request(`/products/${productId}`, {
+      method: 'PATCH',
+      body: { images },
+    }), productId)
+    const readback = expectImageWritableProduct(
+      await request(`/products/${productId}`),
+      productId,
+    )
+    if (providerBrandIdentifiers(readback).length > 0) {
+      expectExactBrandIdentity(
+        readback,
+        credentialBinding!.externalAccountId,
+        'FAIRE_PRODUCT_BRAND_READBACK_MISMATCH',
+      )
+    }
+    if (!exactRequestedValue(readback.images, images)) {
+      throw new FaireCommerceClientError(
+        'Faire product readback did not match the requested Product images',
+        409,
+        'FAIRE_PRODUCT_IMAGE_READBACK_MISMATCH',
+      )
+    }
+    return readback
+  }
+
   async function uploadProductImage(input: FaireImageUploadInput) {
     requireWriteAuthorization(['product_image_upload'], 'WRITE_PRODUCTS')
     const payload = normalizeImageUpload(input)
@@ -2469,6 +2560,7 @@ export function createFaireCommerceClient(
     getProduct,
     createDraftProduct,
     updateDraftProduct,
+    updateProductImages,
     uploadProductImage,
     listOrders,
     getOrder,
@@ -2514,6 +2606,17 @@ export function updateFaireDraftProduct(
   input: FaireProductDraftPatchInput,
 ) {
   return createFaireCommerceClient(options).updateDraftProduct(productId, input)
+}
+
+export function updateFaireProductImages(
+  options: FaireCommerceClientOptions,
+  productId: string,
+  input: FaireProductImagePatchInput,
+) {
+  return createFaireCommerceClient(options).updateProductImages(
+    productId,
+    input,
+  )
 }
 
 export function uploadFaireProductImage(

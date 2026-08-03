@@ -146,6 +146,49 @@ type FaireProductImageRefreshPayload = {
   code?: string
 }
 
+type FaireProductImageProjection = {
+  productReferenceCode: string
+  channelStateGlobalId: string
+  imageAssetId: string
+  imageAssetRevision: number
+  imageContentSha256: string
+  mode: 'shadow' | 'active'
+  replayed: boolean
+  providerMutation: {
+    accepted: boolean
+    writeCount: number
+    uploadAccepted: boolean
+    attachmentAccepted: boolean
+  }
+  images: {
+    existingPreserved: boolean
+    priorCount: number | null
+    projectedCount: number | null
+    uploadedLocatorSha256: string | null
+  }
+  externalEffect: {
+    globalId: string
+    state: string
+    providerWriteCount: number
+  }
+}
+
+type FaireProductImageProjectionPayload = {
+  ok?: boolean
+  publication?: FaireProductImageProjection
+  externalEffectGlobalId?: string
+  reconciliation?: {
+    externalEffectGlobalId: string
+    outcome: 'observed_applied' | 'observed_absent' | 'manual_review'
+    confirmedApplied: boolean
+    providerImageCount?: number
+    exactLocatorMatchCount?: number
+    reason?: string
+  }
+  error?: string
+  code?: string
+}
+
 const PRODUCT_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const SUPPORTED_MIME_TYPES = [
@@ -210,17 +253,26 @@ export default function ProductImagePanel({
   const [selectedShopifyChannel, setSelectedShopifyChannel] = useState('')
   const [selectedShopifyAsset, setSelectedShopifyAsset] = useState('')
   const [selectedFaireChannel, setSelectedFaireChannel] = useState('')
+  const [selectedFaireAsset, setSelectedFaireAsset] = useState('')
   const [activePublishConfirmed, setActivePublishConfirmed] = useState(false)
+  const [fairePublishConfirmed, setFairePublishConfirmed] = useState(false)
   const [projection, setProjection] =
     useState<ShopifyProductImageProjection | null>(null)
   const [reconciliation, setReconciliation] =
     useState<NonNullable<
       ShopifyProductImageProjectionPayload['reconciliation']
     > | null>(null)
+  const [faireProjection, setFaireProjection] =
+    useState<FaireProductImageProjection | null>(null)
+  const [faireReconciliation, setFaireReconciliation] =
+    useState<NonNullable<
+      FaireProductImageProjectionPayload['reconciliation']
+    > | null>(null)
   const [loading, setLoading] = useState(canManage)
   const [saving, setSaving] = useState(false)
   const [projecting, setProjecting] = useState(false)
   const [refreshingFaire, setRefreshingFaire] = useState(false)
+  const [publishingFaire, setPublishingFaire] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
 
@@ -249,6 +301,9 @@ export default function ProductImagePanel({
       setProjection(null)
       setReconciliation(null)
       setActivePublishConfirmed(false)
+      setFaireProjection(null)
+      setFaireReconciliation(null)
+      setFairePublishConfirmed(false)
     } catch (loadError) {
       setState(null)
       setError(
@@ -268,9 +323,13 @@ export default function ProductImagePanel({
     setSelectedShopifyChannel('')
     setSelectedShopifyAsset('')
     setSelectedFaireChannel('')
+    setSelectedFaireAsset('')
     setActivePublishConfirmed(false)
+    setFairePublishConfirmed(false)
     setProjection(null)
     setReconciliation(null)
+    setFaireProjection(null)
+    setFaireReconciliation(null)
     setNotice('')
     setError('')
     if (fileInput.current) fileInput.current.value = ''
@@ -314,6 +373,17 @@ export default function ProductImagePanel({
     )
   }, [selectedShopifyAsset, state?.assets])
 
+  useEffect(() => {
+    const assets = state?.assets || []
+    if (
+      selectedFaireAsset
+      && assets.some((asset) => asset.id === selectedFaireAsset)
+    ) return
+    setSelectedFaireAsset(
+      assets.find((asset) => asset.isPrimary)?.id || assets[0]?.id || '',
+    )
+  }, [selectedFaireAsset, state?.assets])
+
   const selectedChannelEvidence = shopifyChannels.find(
     (channel) => channel.globalId === selectedShopifyChannel,
   ) || null
@@ -322,6 +392,9 @@ export default function ProductImagePanel({
   ) || null
   const selectedFaireChannelEvidence = faireChannels.find(
     (channel) => channel.globalId === selectedFaireChannel,
+  ) || null
+  const selectedFaireAssetEvidence = state?.assets.find(
+    (asset) => asset.id === selectedFaireAsset,
   ) || null
   const exactShadowSimulation = projection?.mode === 'shadow'
     && projection.productReferenceCode === state?.product.referenceCode
@@ -336,6 +409,19 @@ export default function ProductImagePanel({
     && projection.externalEffect.providerWriteCount === 0
     ? projection
     : null
+  const exactFaireShadowSimulation = faireProjection?.mode === 'shadow'
+    && faireProjection.productReferenceCode === state?.product.referenceCode
+    && faireProjection.channelStateGlobalId
+      === selectedFaireChannelEvidence?.globalId
+    && faireProjection.imageAssetId === selectedFaireAssetEvidence?.id
+    && faireProjection.imageAssetRevision
+      === selectedFaireAssetEvidence?.assetRevision
+    && faireProjection.imageContentSha256
+      === selectedFaireAssetEvidence?.contentSha256
+    && faireProjection.externalEffect.state === 'simulated'
+    && faireProjection.externalEffect.providerWriteCount === 0
+    ? faireProjection
+    : null
 
   useEffect(() => {
     setProjection(null)
@@ -347,6 +433,18 @@ export default function ProductImagePanel({
     selectedAssetEvidence?.assetRevision,
     selectedAssetEvidence?.rowVersion,
     selectedAssetEvidence?.contentSha256,
+  ])
+
+  useEffect(() => {
+    setFaireProjection(null)
+    setFaireReconciliation(null)
+    setFairePublishConfirmed(false)
+  }, [
+    selectedFaireChannelEvidence?.rowVersion,
+    selectedFaireChannelEvidence?.sourceRevision,
+    selectedFaireAssetEvidence?.assetRevision,
+    selectedFaireAssetEvidence?.rowVersion,
+    selectedFaireAssetEvidence?.contentSha256,
   ])
 
   const chooseFile = (event: ChangeEvent<HTMLInputElement>) => {
@@ -460,6 +558,9 @@ export default function ProductImagePanel({
       setProjection(null)
       setReconciliation(null)
       setActivePublishConfirmed(false)
+      setFaireProjection(null)
+      setFaireReconciliation(null)
+      setFairePublishConfirmed(false)
       setSelectedFile(null)
       setAltText('')
       setSetPrimary(false)
@@ -509,6 +610,9 @@ export default function ProductImagePanel({
       setProjection(null)
       setReconciliation(null)
       setActivePublishConfirmed(false)
+      setFaireProjection(null)
+      setFaireReconciliation(null)
+      setFairePublishConfirmed(false)
       setNotice(`Image revision ${asset.assetRevision} is now primary.`)
     } catch (primaryError) {
       setError(
@@ -667,6 +771,167 @@ export default function ProductImagePanel({
       )
     } finally {
       setRefreshingFaire(false)
+    }
+  }
+
+  const projectToFaire = async (executeProviderWrite: boolean) => {
+    const channel = selectedFaireChannelEvidence
+    const asset = selectedFaireAssetEvidence
+    if (!channel || !asset || !state?.product) {
+      setError('Choose one exact Faire listing and primary image revision.')
+      return
+    }
+    if (
+      executeProviderWrite
+      && (!fairePublishConfirmed || !exactFaireShadowSimulation)
+    ) {
+      setError(
+        'Run the exact zero-write Faire Shadow simulation, then confirm the two-call publication once.',
+      )
+      return
+    }
+    setPublishingFaire(true)
+    setError('')
+    setNotice('')
+    if (!executeProviderWrite) setFaireProjection(null)
+    setFaireReconciliation(null)
+    try {
+      const response = await fetch(
+        `/api/crm/products/${encodeURIComponent(productId)}/faire-product-image`,
+        {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            action: 'publish-product-image',
+            assetId: asset.id,
+            channelStateGlobalId: channel.globalId,
+            executeProviderWrite,
+            expectedProductReferenceCode: state.product.referenceCode,
+            expectedChannelStateRowVersion: channel.rowVersion,
+            expectedChannelSourceRevision: channel.sourceRevision,
+            expectedAssetRevision: asset.assetRevision,
+            expectedAssetRowVersion: asset.rowVersion,
+            expectedAssetContentSha256: asset.contentSha256,
+            shadowSimulationEffectGlobalId: executeProviderWrite
+              ? exactFaireShadowSimulation!.externalEffect.globalId
+              : null,
+          }),
+        },
+      )
+      const payload = (
+        await response.json().catch(() => ({}))
+      ) as FaireProductImageProjectionPayload
+      if (!response.ok || payload.ok !== true || !payload.publication) {
+        if (
+          executeProviderWrite
+          && typeof payload.externalEffectGlobalId === 'string'
+          && /^gcef(?:[0-9]{7}|[0-9a-v]{12})$/.test(
+            payload.externalEffectGlobalId,
+          )
+        ) {
+          setFaireProjection({
+            productReferenceCode: state.product.referenceCode,
+            channelStateGlobalId: channel.globalId,
+            imageAssetId: asset.id,
+            imageAssetRevision: asset.assetRevision,
+            imageContentSha256: asset.contentSha256,
+            mode: 'active',
+            replayed: false,
+            providerMutation: {
+              accepted: false,
+              writeCount: 0,
+              uploadAccepted: false,
+              attachmentAccepted: false,
+            },
+            images: {
+              existingPreserved: true,
+              priorCount: null,
+              projectedCount: null,
+              uploadedLocatorSha256: null,
+            },
+            externalEffect: {
+              globalId: payload.externalEffectGlobalId,
+              state: 'reconciliation_required',
+              providerWriteCount: 0,
+            },
+          })
+          setNotice(
+            'The Faire effect identity was retained. Reconcile by provider readback; the provider writes will not be repeated.',
+          )
+        }
+        throw new Error(
+          payload.error || 'Faire Product-image command did not complete',
+        )
+      }
+      setFaireProjection(payload.publication)
+      setNotice(
+        payload.publication.mode === 'shadow'
+          ? 'Faire Shadow simulation recorded with zero provider requests and zero writes.'
+          : payload.publication.externalEffect.state === 'succeeded'
+            ? `Faire accepted the upload and exact Product attachment. ${payload.publication.images.priorCount || 0} existing image${payload.publication.images.priorCount === 1 ? '' : 's'} preserved.`
+            : 'Faire publication is terminal unknown and will not be retried. Use provider readback reconciliation.',
+      )
+    } catch (publishError) {
+      setError(
+        publishError instanceof Error
+          ? publishError.message
+          : 'Faire Product-image command did not complete',
+      )
+    } finally {
+      setPublishingFaire(false)
+    }
+  }
+
+  const reconcileFaireImage = async () => {
+    if (!faireProjection || faireProjection.mode !== 'active') return
+    setPublishingFaire(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch(
+        `/api/crm/products/${encodeURIComponent(productId)}/faire-product-image`,
+        {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            action: 'reconcile-product-image',
+            externalEffectGlobalId:
+              faireProjection.externalEffect.globalId,
+          }),
+        },
+      )
+      const payload = (
+        await response.json().catch(() => ({}))
+      ) as FaireProductImageProjectionPayload
+      if (!response.ok || payload.ok !== true || !payload.reconciliation) {
+        throw new Error(
+          payload.error || 'Faire Product-image readback did not complete',
+        )
+      }
+      setFaireReconciliation(payload.reconciliation)
+      setNotice(
+        payload.reconciliation.confirmedApplied
+          ? 'Faire readback confirms the uploaded image is attached to the exact Product.'
+          : payload.reconciliation.outcome === 'observed_absent'
+            ? 'Faire readback did not observe the uploaded image. The original write remains terminal and was not repeated.'
+            : 'The upload locator was unavailable; manual provider review is required and no write was repeated.',
+      )
+    } catch (reconcileError) {
+      setError(
+        reconcileError instanceof Error
+          ? reconcileError.message
+          : 'Faire Product-image readback did not complete',
+      )
+    } finally {
+      setPublishingFaire(false)
     }
   }
 
@@ -978,6 +1243,184 @@ export default function ProductImagePanel({
                 ? 'Reading exact Faire Product…'
                 : 'Refresh and import from Faire'}
             </Button>
+          </Stack>
+
+          <Divider />
+          <Stack spacing={1.25} data-testid="crm-faire-image-publishing">
+            <Box>
+              <Typography variant="subtitle2" fontWeight={700}>
+                Faire image publishing
+              </Typography>
+              <Typography variant="caption" color="text.secondary">
+                Publish one immutable ClawPilot primary image to one exact
+                mapped Faire Product. Faire requires two provider writes: an
+                image upload followed by an exact Product-image attachment.
+                Current Faire images are preserved.
+              </Typography>
+            </Box>
+
+            {faireChannels.length === 0 ? (
+              <Alert severity="info">
+                Map this Product to an active Faire listing before publishing
+                an image.
+              </Alert>
+            ) : null}
+
+            <TextField
+              select
+              fullWidth
+              label="Faire listing to publish"
+              value={selectedFaireChannel}
+              onChange={(event) => {
+                setSelectedFaireChannel(event.target.value)
+                setFaireProjection(null)
+                setFaireReconciliation(null)
+                setFairePublishConfirmed(false)
+              }}
+              disabled={publishingFaire || faireChannels.length === 0}
+            >
+              {faireChannels.map((channel) => (
+                <MenuItem key={channel.globalId} value={channel.globalId}>
+                  {channel.integrationAccountName} ·{' '}
+                  {channel.providerProductTitle}
+                  {channel.providerVariantTitle
+                    ? ` · ${channel.providerVariantTitle}`
+                    : ''}
+                  {' · '}
+                  {channel.globalId}
+                </MenuItem>
+              ))}
+            </TextField>
+
+            <TextField
+              select
+              fullWidth
+              label="ClawPilot primary image revision"
+              value={selectedFaireAsset}
+              onChange={(event) => {
+                setSelectedFaireAsset(event.target.value)
+                setFaireProjection(null)
+                setFaireReconciliation(null)
+                setFairePublishConfirmed(false)
+              }}
+              disabled={publishingFaire || !state?.assets.length}
+            >
+              {(state?.assets || [])
+                .filter((asset) => asset.isPrimary)
+                .map((asset) => (
+                  <MenuItem key={asset.id} value={asset.id}>
+                    Revision {asset.assetRevision} · ClawPilot primary ·{' '}
+                    {asset.altText}
+                  </MenuItem>
+                ))}
+            </TextField>
+
+            <Alert severity="info">
+              Shadow performs the exact account, Product, listing, mapping,
+              image, credential, OAuth-scope, and idempotency checks with zero
+              Faire network requests and zero provider writes.
+            </Alert>
+            <Button
+              variant="outlined"
+              onClick={() => void projectToFaire(false)}
+              disabled={
+                publishingFaire
+                || !selectedFaireChannelEvidence
+                || !selectedFaireAssetEvidence
+              }
+              sx={{ alignSelf: 'flex-start' }}
+            >
+              {publishingFaire ? 'Running…' : 'Simulate Faire in Shadow'}
+            </Button>
+
+            <Alert severity="warning">
+              This one-use authorization permits only the selected Faire
+              account, Product, mapped listing, and primary image revision.
+              Operations remains globally Shadow. If either provider call has
+              an uncertain outcome, neither call is retried automatically.
+            </Alert>
+            <FormControlLabel
+              control={(
+                <Checkbox
+                  checked={fairePublishConfirmed}
+                  onChange={(event) => setFairePublishConfirmed(
+                    event.target.checked,
+                  )}
+                  disabled={
+                    publishingFaire
+                    || !exactFaireShadowSimulation
+                  }
+                />
+              )}
+              label="I authorize the two required Faire provider writes once for this exact Product, listing, and image revision"
+            />
+            <Button
+              color="warning"
+              variant="contained"
+              onClick={() => void projectToFaire(true)}
+              disabled={
+                publishingFaire
+                || !fairePublishConfirmed
+                || !exactFaireShadowSimulation
+                || !selectedFaireChannelEvidence
+                || !selectedFaireAssetEvidence
+              }
+              sx={{ alignSelf: 'flex-start' }}
+            >
+              {publishingFaire
+                ? 'Publishing exact Faire image…'
+                : 'Publish this image to Faire once'}
+            </Button>
+
+            {faireProjection ? (
+              <Alert severity={
+                faireProjection.mode === 'shadow'
+                  ? 'info'
+                  : faireProjection.externalEffect.state === 'succeeded'
+                    ? 'success'
+                    : 'warning'
+              }>
+                {faireProjection.mode === 'shadow'
+                  ? 'Shadow simulation'
+                  : 'One-use Faire publication'}
+                {' · '}
+                {faireProjection.externalEffect.state}
+                {' · '}
+                {faireProjection.externalEffect.providerWriteCount} known
+                provider write{faireProjection.externalEffect.providerWriteCount === 1 ? '' : 's'}
+                {faireProjection.images.priorCount !== null
+                  ? ` · ${faireProjection.images.priorCount} prior image${faireProjection.images.priorCount === 1 ? '' : 's'} preserved`
+                  : ''}
+              </Alert>
+            ) : null}
+            {faireProjection?.mode === 'active'
+              && faireProjection.externalEffect.state !== 'succeeded' ? (
+                <Button
+                  size="small"
+                  variant="outlined"
+                  startIcon={publishingFaire
+                    ? <CircularProgress size={14} />
+                    : <RefreshRounded />}
+                  onClick={() => void reconcileFaireImage()}
+                  disabled={publishingFaire}
+                  sx={{ alignSelf: 'flex-start' }}
+                >
+                  Reconcile by Faire readback
+                </Button>
+              ) : null}
+            {faireReconciliation ? (
+              <Alert severity={
+                faireReconciliation.confirmedApplied
+                  ? 'success'
+                  : 'warning'
+              }>
+                Readback {faireReconciliation.outcome.replaceAll('_', ' ')}
+                {faireReconciliation.providerImageCount !== undefined
+                  ? ` · ${faireReconciliation.providerImageCount} current provider image${faireReconciliation.providerImageCount === 1 ? '' : 's'}`
+                  : ''}
+                {' · no provider write repeated'}
+              </Alert>
+            ) : null}
           </Stack>
 
           <Divider />

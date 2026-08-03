@@ -118,6 +118,7 @@ type IntakeLine = {
   sku?: string | null
   title: string
   quantity: number
+  unitMultiplier?: number | null
   requiresShipping: boolean
   unitPriceMinor?: number | null
   currency?: string | null
@@ -201,11 +202,24 @@ type PackageProfile = {
   dimensionsMm?: DimensionsMm | null
 }
 
+type PackProfileVersion = {
+  globalId: string
+  rowVersion: number
+  label: string
+  packageLevel: 'each' | 'inner_pack' | 'case' | 'pallet'
+  baseEachQuantity: number
+  weightGrams: number
+  dimensionsMm: DimensionsMm
+  evidenceType: 'customer_confirmed' | 'measured' | 'provider'
+  weightBasis: string
+}
+
 type ProductCatalogEntry = {
   globalId: string
   name: string
   sku?: string | null
   packageProfiles?: PackageProfile[]
+  packProfileVersions?: PackProfileVersion[]
 }
 
 type CustomerCatalogEntry = {
@@ -582,6 +596,7 @@ type DeliveryDraft = {
 
 type PackageDraft = {
   packageProfileGlobalId: string
+  packProfileVersionGlobalId: string
   measurementSystem: MeasurementSystem
   weight: string
   length: string
@@ -1112,6 +1127,7 @@ function initialPackageDraft(
 ): PackageDraft {
   return {
     packageProfileGlobalId: line.packageProfileGlobalId || '',
+    packProfileVersionGlobalId: line.packProfileVersionGlobalId || '',
     measurementSystem: system,
     weight: line.weightGrams
       ? displayDraftNumber(gramsToDisplayWeight(line.weightGrams, system))
@@ -3025,6 +3041,46 @@ export default function CommerceIntakeWorkflow({
         },
       },
       `Package profile assigned to ${line.title}.`,
+    )
+  }
+
+  async function bindFaireVariantPack(
+    candidate: IntakeCandidate,
+    line: IntakeLine,
+  ) {
+    const draft = packageDraft(candidate, line)
+    const selectedProduct = productCatalog.find(
+      (product) => product.globalId === line.productGlobalId,
+    )
+    const version = selectedProduct?.packProfileVersions?.find(
+      (profile) => profile.globalId === draft.packProfileVersionGlobalId,
+    )
+    if (
+      provider !== 'faire'
+      || !line.externalProductId
+      || !line.externalVariantId
+      || !version
+    ) return
+    if (!window.confirm(
+      `Read the exact Faire product ${line.externalProductId}, then bind variant ${line.externalVariantId} to ${version.label} (${version.globalId})? This creates a durable exact-variant pack mapping in ClawPilot. It does not write to Faire or create a legacy package profile.`,
+    )) return
+    await postCommand(
+      'resolve-package',
+      `resolve-package-variant-mapping:${candidate.globalId}:${line.globalId}:${version.globalId}`,
+      {
+        candidateGlobalId: candidate.globalId,
+        lineGlobalId: line.globalId,
+        rowVersion: candidate.rowVersion,
+        package: {
+          mode: 'variant_mapping',
+          externalProductId: line.externalProductId,
+          externalVariantId: line.externalVariantId,
+          packProfileVersionGlobalId: version.globalId,
+          expectedPackProfileVersionRowVersion: version.rowVersion,
+          confirmExactProductRead: true,
+        },
+      },
+      `Exact Faire variant mapped to ${version.label}; this order line now uses the same versioned pack evidence.`,
     )
   }
 
@@ -6365,6 +6421,21 @@ export default function CommerceIntakeWorkflow({
                                 )
                                 const packageProfiles =
                                   selectedProduct?.packageProfiles || []
+                                const packProfileVersions =
+                                  selectedProduct?.packProfileVersions || []
+                                const matchingPackProfileVersions =
+                                  packProfileVersions.filter((profile) => (
+                                    line.unitMultiplier ===
+                                      profile.baseEachQuantity
+                                  ))
+                                const exactFairePackBindingAvailable = (
+                                  provider === 'faire'
+                                  && line.mappingStatus === 'resolved'
+                                  && Boolean(line.productGlobalId)
+                                  && Boolean(line.externalProductId)
+                                  && Boolean(line.externalVariantId)
+                                  && !line.commerceVariantPackMappingGlobalId
+                                )
                                 const manualPackageValid = [
                                   packaging.weight,
                                   packaging.length,
@@ -6653,6 +6724,128 @@ export default function CommerceIntakeWorkflow({
                                                   : ' · package resolution still requires review'}
                                               </Alert>
                                             ) : null}
+                                          {exactFairePackBindingAvailable ? (
+                                            matchingPackProfileVersions.length ? (
+                                              <Stack spacing={1}>
+                                                <Alert severity="info">
+                                                  This mapped Faire variant has
+                                                  no exact versioned pack rule.
+                                                  ClawPilot can read the
+                                                  immutable Faire product now,
+                                                  retain that product evidence,
+                                                  and bind one current Product
+                                                  pack version for this and
+                                                  future orders. Faire will not
+                                                  be changed.
+                                                </Alert>
+                                                <Stack
+                                                  direction={{
+                                                    xs: 'column',
+                                                    sm: 'row',
+                                                  }}
+                                                  spacing={1}
+                                                  alignItems={{
+                                                    sm: 'flex-start',
+                                                  }}
+                                                >
+                                                  <FormControl
+                                                    fullWidth
+                                                    sx={fieldSx}
+                                                  >
+                                                    <InputLabel>
+                                                      Versioned Product pack
+                                                    </InputLabel>
+                                                    <Select
+                                                      label="Versioned Product pack"
+                                                      value={
+                                                        packaging
+                                                          .packProfileVersionGlobalId
+                                                      }
+                                                      onChange={(event) => {
+                                                        updatePackageDraft(
+                                                          candidate,
+                                                          line,
+                                                          {
+                                                            packProfileVersionGlobalId:
+                                                              event.target.value,
+                                                          },
+                                                        )
+                                                      }}
+                                                    >
+                                                      <MenuItem value="">
+                                                        Select a current pack
+                                                      </MenuItem>
+                                                      {matchingPackProfileVersions
+                                                        .map((profile) => (
+                                                          <MenuItem
+                                                            key={
+                                                              profile.globalId
+                                                            }
+                                                            value={
+                                                              profile.globalId
+                                                            }
+                                                          >
+                                                            {profile.label} ·{' '}
+                                                            {humanize(
+                                                              profile.packageLevel,
+                                                            )} ·{' '}
+                                                            {
+                                                              profile
+                                                                .baseEachQuantity
+                                                            } base each ·{' '}
+                                                            {formatGrams(
+                                                              profile.weightGrams,
+                                                              measurementSystem,
+                                                              { maximumFractionDigits: 3 },
+                                                            )} ·{' '}
+                                                            {dimensionsLabel(
+                                                              profile.dimensionsMm,
+                                                              measurementSystem,
+                                                            )}
+                                                          </MenuItem>
+                                                        ))}
+                                                    </Select>
+                                                    <FormHelperText>
+                                                      Only packs matching this
+                                                      line&apos;s exact{' '}
+                                                      {line.unitMultiplier}{' '}
+                                                      base-each multiplier are
+                                                      eligible.
+                                                    </FormHelperText>
+                                                  </FormControl>
+                                                  <Button
+                                                    variant="outlined"
+                                                    disabled={
+                                                      candidateLocked
+                                                      || Boolean(pendingAction)
+                                                      || !packaging
+                                                        .packProfileVersionGlobalId
+                                                    }
+                                                    onClick={() => {
+                                                      void bindFaireVariantPack(
+                                                        candidate,
+                                                        line,
+                                                      )
+                                                    }}
+                                                    sx={actionButtonSx}
+                                                  >
+                                                    Read exact product & bind
+                                                  </Button>
+                                                </Stack>
+                                              </Stack>
+                                            ) : (
+                                              <Alert severity="warning">
+                                                No current eligible versioned
+                                                Product pack matches the Faire
+                                                line&apos;s exact{' '}
+                                                {line.unitMultiplier
+                                                  ?? 'unavailable'} base-each
+                                                multiplier. Correct the provider
+                                                quantity or Product pack rule
+                                                before binding it.
+                                              </Alert>
+                                            )
+                                          ) : null}
                                           {packageProfiles.length ? (
                                             <Stack
                                               direction={{
@@ -6734,10 +6927,12 @@ export default function CommerceIntakeWorkflow({
                                             </Stack>
                                           ) : (
                                             <Alert severity="info">
-                                              No active package profile is
-                                              available for the selected
-                                              product. Enter order-specific
-                                              facts below.
+                                              No active legacy order-specific
+                                              package profile is available for
+                                              the selected product. Use the
+                                              exact versioned mapping above or
+                                              enter one-time package facts
+                                              below.
                                             </Alert>
                                           )}
                                           <Box

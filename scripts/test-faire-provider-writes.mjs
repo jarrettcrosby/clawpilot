@@ -304,6 +304,93 @@ assert.equal(
   Buffer.from('bounded image fixture').toString('base64'),
 )
 
+productReadback = {
+  ...productReadback,
+  lifecycle_state: 'PUBLISHED',
+  images: [{
+    url: 'https://cdn.faire.com/existing-image.png',
+    sequence: 0,
+  }],
+}
+await client.updateProductImages('p_product123', {
+  expectedCurrentImages: [{
+    url: 'https://cdn.faire.com/existing-image.png',
+    sequence: 0,
+  }],
+  images: [{
+    url: 'https://cdn.faire.com/existing-image.png',
+    sequence: 0,
+  }, {
+    url: 'https://cdn.faire.com/test-image.png',
+    sequence: 1,
+  }],
+})
+const publishedImagePatch = requests.findLast((request) => (
+  request.method === 'PATCH'
+  && request.url.endsWith('/products/p_product123')
+))
+assert.deepEqual(JSON.parse(JSON.stringify(publishedImagePatch.body)), {
+  images: [{
+    url: 'https://cdn.faire.com/existing-image.png',
+    sequence: 0,
+  }, {
+    url: 'https://cdn.faire.com/test-image.png',
+    sequence: 1,
+  }],
+})
+assert.equal(
+  requests[requests.indexOf(publishedImagePatch) - 1].method,
+  'GET',
+  'published lifecycle must be read before the image-only PATCH',
+)
+assert.equal(
+  requests[requests.indexOf(publishedImagePatch) + 1].method,
+  'GET',
+  'published Product images must be read back exactly after PATCH',
+)
+
+productReadback = {
+  ...productReadback,
+  images: [...productReadback.images, {
+    url: 'https://cdn.faire.com/concurrent-image.png',
+    sequence: 2,
+  }],
+}
+const patchCountBeforeConcurrencyCheck = requests.filter((request) => (
+  request.method === 'PATCH'
+  && request.url.endsWith('/products/p_product123')
+)).length
+await assert.rejects(
+  client.updateProductImages('p_product123', {
+    expectedCurrentImages: [{
+      url: 'https://cdn.faire.com/existing-image.png',
+      sequence: 0,
+    }, {
+      url: 'https://cdn.faire.com/test-image.png',
+      sequence: 1,
+    }],
+    images: [{
+      url: 'https://cdn.faire.com/existing-image.png',
+      sequence: 0,
+    }, {
+      url: 'https://cdn.faire.com/test-image.png',
+      sequence: 1,
+    }, {
+      url: 'https://cdn.faire.com/new-image.png',
+      sequence: 2,
+    }],
+  }),
+  (error) => error?.code === 'FAIRE_PRODUCT_IMAGE_BASE_SET_CHANGED',
+  'a concurrent Faire image edit must fail before the replacement PATCH',
+)
+assert.equal(
+  requests.filter((request) => (
+    request.method === 'PATCH'
+    && request.url.endsWith('/products/p_product123')
+  )).length,
+  patchCountBeforeConcurrencyCheck,
+)
+
 await client.updateInventory({
   by: 'skus',
   inventories: [{

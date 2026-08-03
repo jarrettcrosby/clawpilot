@@ -83,6 +83,11 @@ import WarehouseSetupPanel from '@/components/operations/WarehouseSetupPanel'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatDimensionsMm, formatGrams } from '@/lib/measurements'
+import {
+  commerceActiveInitialSelection,
+  type CommerceActiveContinuation,
+  type CommerceActiveInitialSelection,
+} from '@/lib/operations/commerceActiveSelection'
 import { SANDBOX_COMMERCE_E2E_CONFIRMATION } from '@/lib/operations/sandboxCommerceE2e'
 import { formatUserDateTime } from '@/lib/userDateTime'
 
@@ -200,6 +205,7 @@ type CommerceActiveCatalogPayload = {
   ok?: boolean
   error?: string
   integrations?: {
+    commerceActiveContinuation?: CommerceActiveContinuation | null
     accounts?: Array<{
       globalId: string
       displayName: string
@@ -1962,6 +1968,12 @@ export default function OperationsSection({
   const [commerceActiveAccounts, setCommerceActiveAccounts] = useState<
     CommerceActiveAccountOption[]
   >([])
+  const [commerceActiveSelectionEvidence, setCommerceActiveSelectionEvidence] =
+    useState<(
+      Omit<CommerceActiveInitialSelection, 'selections'> & {
+        continuation: CommerceActiveContinuation | null
+      }
+    ) | null>(null)
   const [
     commerceActiveSelections,
     setCommerceActiveSelections,
@@ -2956,6 +2968,7 @@ export default function OperationsSection({
     setCommerceActiveError('')
     setCommerceActiveAccounts([])
     setCommerceActiveSelections({})
+    setCommerceActiveSelectionEvidence(null)
     setCommerceActivePreparation(null)
     setCommerceActiveConfirmed(false)
     setCommerceActivePrepareKey(commerceActiveIdempotencyKey('prepare'))
@@ -2975,14 +2988,24 @@ export default function OperationsSection({
         )
       }
       setCommerceActiveAccounts(accounts)
-      setCommerceActiveSelections(Object.fromEntries(
-        accounts.map((account) => [
-          account.accountGlobalId,
-          account.capabilities
-            .filter((option) => option.selectable)
-            .map((option) => option.capability),
-        ]),
-      ))
+      const continuation =
+        payload.integrations.commerceActiveContinuation || null
+      const initialSelection = commerceActiveInitialSelection({
+        accounts,
+        continuation,
+        expectedShadowActivationRevision: workspace.activation.revision,
+      })
+      setCommerceActiveSelections(initialSelection.selections)
+      setCommerceActiveSelectionEvidence({
+        continuation,
+        preservationBlockers: initialSelection.preservationBlockers,
+        preservedShopifyAccountCount:
+          initialSelection.preservedShopifyAccountCount,
+        preservedShopifyCapabilityCount:
+          initialSelection.preservedShopifyCapabilityCount,
+        faireDefaultedAccountCount:
+          initialSelection.faireDefaultedAccountCount,
+      })
     } catch (caught) {
       setCommerceActiveError(
         caught instanceof Error
@@ -3667,6 +3690,39 @@ export default function OperationsSection({
                     every capability for an account to exclude it.
                   </Typography>
                 </Box>
+                {commerceActiveSelectionEvidence?.preservationBlockers.length ? (
+                  <Alert severity="error">
+                    <Typography variant="body2" fontWeight={700}>
+                      The prior Shopify provider-write authority cannot be preserved safely.
+                    </Typography>
+                    {commerceActiveSelectionEvidence.preservationBlockers.map((blocker) => (
+                      <Typography key={blocker} variant="body2">
+                        {blocker}
+                      </Typography>
+                    ))}
+                  </Alert>
+                ) : commerceActiveSelectionEvidence?.continuation ? (
+                  <Alert severity="info">
+                    Preserved {commerceActiveSelectionEvidence.preservedShopifyCapabilityCount}{' '}
+                    Shopify claim
+                    {commerceActiveSelectionEvidence.preservedShopifyCapabilityCount === 1
+                      ? ''
+                      : 's'} across{' '}
+                    {commerceActiveSelectionEvidence.preservedShopifyAccountCount} account
+                    {commerceActiveSelectionEvidence.preservedShopifyAccountCount === 1
+                      ? ''
+                      : 's'} from Active revision{' '}
+                    {commerceActiveSelectionEvidence.continuation.sourceActivationRevision}.
+                    Eligible Faire accounts default only to order update, fulfillment export,
+                    and tracking export. Review any manual change before preparing.
+                  </Alert>
+                ) : commerceActiveSelectionEvidence ? (
+                  <Alert severity="info">
+                    No immediately preceding Active Shopify cohort was found for this Shadow
+                    revision, so Shopify provider writes start unselected. Eligible Faire accounts
+                    default only to order update, fulfillment export, and tracking export.
+                  </Alert>
+                ) : null}
                 {commerceActiveAccounts.map((account) => (
                   <Box
                     key={account.accountGlobalId}
@@ -3920,6 +3976,9 @@ export default function OperationsSection({
               onClick={() => void prepareCommerceActive()}
               disabled={
                 Boolean(commerceActivePending)
+                || Boolean(
+                  commerceActiveSelectionEvidence?.preservationBlockers.length,
+                )
                 || commerceActiveSelectedAccountCount === 0
                 || commerceActiveSelectedCapabilityCount === 0
               }

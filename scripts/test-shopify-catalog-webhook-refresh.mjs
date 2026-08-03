@@ -255,6 +255,13 @@ const receiptPersistenceModule = loadTypeScriptModule(
       '@/lib/persistence/commerceExternalEffects': {
         assertRedactedCommerceExternalEffectEvidence() {},
       },
+      '@/lib/persistence/commerceActiveTransitionAuthorization': {
+        async readCommerceActiveContinuationInPostgres() {
+          assert.fail(
+            'Catalog webhook receipt tests must not read Active continuation state',
+          )
+        },
+      },
       '@/lib/persistence/postgres': {
         async acquireTransactionAdvisoryLock(_client, key) {
           receiptTrace.push({ kind: 'lock', key })
