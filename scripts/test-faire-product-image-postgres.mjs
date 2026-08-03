@@ -124,6 +124,10 @@ async function applyMigrations(client) {
     files.includes('0230_operations_faire_product_image_projection.sql'),
     'Faire Product-image projection migration is missing',
   )
+  assert.ok(
+    files.includes('0234_operations_faire_product_image_writable_lifecycle.sql'),
+    'Faire Product-image writable-lifecycle migration is missing',
+  )
   for (const file of files) {
     await client.query('BEGIN')
     try {
@@ -373,7 +377,7 @@ async function seedOperationalFixture(pool) {
          $1::uuid, $2::uuid, $3::uuid, 'faire', 'p_image_acceptance',
          'po_image_acceptance', $4::uuid, $5::uuid,
          'Faire image Test Product', 'Default', 'FAIRE-IMAGE-TEST',
-         'PUBLISHED', 'active', true, clock_timestamp(),
+         'PUBLISHED', 'unavailable', false, clock_timestamp(),
          'faire-image-channel-v1', $6, $7, $7
        ) RETURNING id::text, global_id, row_version::text`,
       [

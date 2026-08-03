@@ -1976,6 +1976,12 @@ export async function GET() {
                 WHERE filename =
                   '0230_operations_faire_product_image_projection.sql'
               )
+              AND EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0234_operations_faire_product_image_writable_lifecycle.sql'
+              )
               AND to_regclass(
                 'operations_faire_product_image_delivery_grants'
               ) IS NOT NULL

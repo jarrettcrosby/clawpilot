@@ -1531,6 +1531,20 @@ const faireOAuthGrantEvidenceMigration = read(
 const faireProductImageProjectionMigration = read(
   'db/migrations/0230_operations_faire_product_image_projection.sql',
 )
+const faireProductImageWritableLifecycleMigration = read(
+  'db/migrations/0234_operations_faire_product_image_writable_lifecycle.sql',
+)
+for (const fragment of [
+  'channel_state.provider_status_raw',
+  "''DRAFT'', ''PUBLISHED'', ''ACTIVE''",
+  "channel_normalized_status = 'unavailable'",
+]) {
+  assertIncludes(
+    faireProductImageWritableLifecycleMigration,
+    fragment,
+    'Faire Product-image writable lifecycle migration',
+  )
+}
 const commerceFulfillmentRecoveryMigration = read(
   'db/migrations/0229_operations_commerce_fulfillment_recovery.sql',
 )

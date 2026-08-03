@@ -47,6 +47,7 @@ type SelectionRow = QueryResultRow & {
   channel_source_hash: string
   external_product_id: string
   external_variant_id: string
+  provider_status_raw: string
   normalized_status: string
   provider_active: boolean
   image_asset_id: string
@@ -406,6 +407,7 @@ export async function resolveFaireProductImageSelectionInPostgres(input: {
        channel_state.source_hash AS channel_source_hash,
        channel_state.external_product_id,
        channel_state.external_variant_id,
+       channel_state.provider_status_raw,
        channel_state.normalized_status,
        channel_state.provider_active,
        image_asset.id::text AS image_asset_id,
@@ -518,13 +520,23 @@ function assertExpectedSelection(
       'The selected Product, Faire listing, or primary image changed after review',
     )
   }
+  const providerLifecycle = row.provider_status_raw.trim().toUpperCase()
+  const writableListing = (
+    ['DRAFT', 'PUBLISHED', 'ACTIVE'].includes(providerLifecycle)
+    && (
+      (row.normalized_status === 'active' && row.provider_active === true)
+      || (
+        row.normalized_status === 'unavailable'
+        && row.provider_active === false
+      )
+    )
+  )
   if (
     row.account_status !== 'active'
     || row.credential_generation !== row.credential_version
     || row.verification_status !== 'verified'
     || row.activation_state !== 'shadow'
-    || row.normalized_status !== 'active'
-    || row.provider_active !== true
+    || !writableListing
   ) {
     fail(
       'FAIRE_PRODUCT_IMAGE_CONNECTION_NOT_READY',
@@ -612,6 +624,7 @@ export async function prepareFaireProductImageProjectionInPostgres(
          channel_state.source_hash AS channel_source_hash,
          channel_state.external_product_id,
          channel_state.external_variant_id,
+         channel_state.provider_status_raw,
          channel_state.normalized_status,
          channel_state.provider_active,
          image_asset.id::text AS image_asset_id,
@@ -737,10 +750,10 @@ export async function prepareFaireProductImageProjectionInPostgres(
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid,
          $7::uuid, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-         $17::bigint, $18, $19, 'active', true, $20::bigint, $21::bigint,
-         $22, $23, $24, $25, $26, $27, $28, $29, $30::bigint, $31,
+         $17::bigint, $18, $19, $20, $21, $22::bigint, $23::bigint,
+         $24, $25, $26, $27, $28, $29, $30, $31, $32::bigint, $33,
          statement_timestamp(),
-         statement_timestamp() + ($32::text || ' seconds')::interval, $33
+         statement_timestamp() + ($34::text || ' seconds')::interval, $35
        ) RETURNING id`,
       [
         grantId,
@@ -762,6 +775,8 @@ export async function prepareFaireProductImageProjectionInPostgres(
         integer(row.channel_state_row_version, 'Channel revision'),
         row.channel_source_revision,
         row.channel_source_hash,
+        row.normalized_status,
+        row.provider_active,
         integer(row.asset_revision, 'Asset revision', 1),
         integer(row.asset_row_version, 'Asset row revision', 1),
         row.asset_content_sha256,
