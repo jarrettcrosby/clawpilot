@@ -332,6 +332,7 @@ for (const requiredPath of [
   'db/migrations/0230_operations_faire_product_image_projection.sql',
   'db/migrations/0231_operations_faire_sandbox_commerce_e2e.sql',
   'db/migrations/0232_operations_faire_sandbox_parcel_evidence.sql',
+  'db/migrations/0233_operations_faire_sandbox_promotion_evidence.sql',
   'app_src/app/api/crm/products/[productId]/images/route.ts',
   'app_src/app/api/crm/products/[productId]/images/[assetId]/route.ts',
   'app_src/app/api/crm/products/[productId]/shopify-product-image/route.ts',

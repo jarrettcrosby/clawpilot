@@ -266,9 +266,14 @@ async function readExactFaireEvidence(
          AS parcel_gross_weight_grams,
        operations_sandbox_commerce_e2e_jsonb_hash(source_order.ship_to)
          AS ship_to_hash,
-       upper(coalesce(
+       CASE upper(coalesce(
          source_order.ship_to->>'region', source_order.ship_to->>'state'
-       )) AS destination_region,
+       ))
+         WHEN 'CALIFORNIA' THEN 'CA'
+         ELSE upper(coalesce(
+           source_order.ship_to->>'region', source_order.ship_to->>'state'
+         ))
+       END AS destination_region,
        upper(coalesce(
          source_order.ship_to->>'countryCode', source_order.ship_to->>'country'
        )) AS destination_country_code,
@@ -396,7 +401,24 @@ async function readExactFaireEvidence(
        AND cartonization.evidence_mode = 'operational'
        AND cartonization.status IN ('succeeded', 'partial')
        AND cartonization.sealed_at IS NOT NULL
-       AND cartonization.candidate_row_version = candidate.row_version
+       AND (
+         cartonization.candidate_row_version = candidate.row_version
+         OR (
+           cartonization.candidate_row_version + 1 = candidate.row_version
+           AND cartonization.sealed_at <= candidate.updated_at
+           AND EXISTS (
+             SELECT 1
+             FROM audit_events promotion_event
+             WHERE promotion_event.organization_id = candidate.organization_id
+               AND promotion_event.event_type = 'commerce.intake.promoted'
+               AND promotion_event.aggregate_type = 'operations.order'
+               AND promotion_event.aggregate_id = source_order.global_id
+               AND promotion_event.payload->>'candidateGlobalId' =
+                     candidate.global_id
+               AND promotion_event.created_at = candidate.updated_at
+           )
+         )
+       )
        AND cartonization.candidate_source_hash = candidate.source_hash
        AND carton_package.planning_method = 'approved_recipe'
        AND jsonb_array_length(carton_package.allocations) = 1
@@ -450,7 +472,7 @@ async function readExactFaireEvidence(
        AND content.quantity = 1
        AND upper(coalesce(
              source_order.ship_to->>'region', source_order.ship_to->>'state'
-           )) = 'CA'
+           )) IN ('CA', 'CALIFORNIA')
        AND upper(coalesce(
              source_order.ship_to->>'countryCode',
              source_order.ship_to->>'country'

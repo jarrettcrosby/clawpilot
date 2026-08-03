@@ -1715,6 +1715,7 @@ assertIncludes(healthRoute, '0199_operations_commerce_active_canonical_collation
 assertIncludes(healthRoute, '0200_operations_sandbox_commerce_e2e_active_guards.sql', 'hosted sandbox commerce E2E Active guards migration health')
 assertIncludes(healthRoute, '0231_operations_faire_sandbox_commerce_e2e.sql', 'hosted Faire sandbox commerce E2E migration health')
 assertIncludes(healthRoute, '0232_operations_faire_sandbox_parcel_evidence.sql', 'hosted Faire sealed-parcel E2E migration health')
+assertIncludes(healthRoute, '0233_operations_faire_sandbox_promotion_evidence.sql', 'hosted Faire promoted-candidate E2E migration health')
 assertIncludes(healthRoute, '0218_global_id_alphanumeric_expand_141_149_and_catalog_gate.sql', 'hosted Global ID alphanumeric compatibility migration health')
 assertIncludes(healthRoute, '0219_global_id_base32hex_allocator.sql', 'hosted Global ID base32hex allocator migration health')
 for (const fragment of [

@@ -2116,7 +2116,7 @@ async function verifyFaireExactVariantPackBinding(
     line1: '16691 Gothard St',
     line2: 'Suite Q',
     city: 'Huntington Beach',
-    region: 'CA',
+    region: 'California',
     postalCode: '92647',
     country: 'US',
   }
@@ -2404,7 +2404,7 @@ async function verifyFaireExactVariantPackBinding(
       candidateGlobalId: operational.candidate.global_id,
       expectedCandidateRowVersion: operational.candidate.row_version,
     })
-  assert.equal(candidateContext.destination.region, 'CA')
+  assert.equal(candidateContext.destination.region, 'California')
   assert.equal(candidateContext.destination.countryCode, 'US')
 
   const cartonizationPlan = warehouseServices.hybridCartonization
@@ -2687,6 +2687,49 @@ async function verifyFaireExactVariantPackBinding(
   assert.equal(cartonizationEvidence.evidenceMode, 'operational')
   assert.equal(cartonizationEvidence.inventorySyncRunGlobalId, null)
   assert.equal(cartonizationEvidence.packages.length, 1)
+
+  // Reproduce the operator flow where exact carton evidence is sealed while
+  // the candidate is ready and promotion performs the sole later row bump.
+  // The evidence remains bound to the same provider source and destination.
+  const auditedPromotionBump = await pool.query(
+    `WITH bumped AS (
+       UPDATE operations_commerce_order_candidates
+       SET row_version = row_version + 1,
+           updated_by = $3,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+         AND row_version = $4::bigint
+       RETURNING row_version::integer, updated_at
+     ), recorded AS (
+       INSERT INTO audit_events (
+         actor, event_type, aggregate_type, aggregate_id, payload,
+         event_key, subject, organization_id, is_system, created_at
+       )
+       SELECT
+         $3, 'commerce.intake.promoted', 'operations.order', $5,
+         jsonb_build_object('candidateGlobalId', $2),
+         'commerce-staging-faire-post-evidence-promotion',
+         $3, $1::uuid, false, bumped.updated_at
+       FROM bumped
+       RETURNING id
+     )
+     SELECT bumped.row_version
+     FROM bumped
+     JOIN recorded ON true`,
+    [
+      ids.organization,
+      operational.candidate.global_id,
+      actorEmail,
+      operational.candidate.row_version,
+      promoted.canonicalOrderGlobalId,
+    ],
+  )
+  assert.equal(auditedPromotionBump.rowCount, 1)
+  assert.equal(
+    auditedPromotionBump.rows[0].row_version,
+    operational.candidate.row_version + 1,
+  )
 
   const planned = await warehouseServices.operations
     .planOperationsOrderFromPostgres({

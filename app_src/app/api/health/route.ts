@@ -2070,6 +2070,12 @@ export async function GET() {
                 WHERE filename =
                   '0232_operations_faire_sandbox_parcel_evidence.sql'
               )
+              AND EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0233_operations_faire_sandbox_promotion_evidence.sql'
+              )
               AND to_regclass(
                 'operations_sandbox_commerce_e2e_faire_evidence'
               ) IS NOT NULL
