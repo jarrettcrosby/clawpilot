@@ -107,6 +107,7 @@ import {
 import {
   lockShopifyCarrierServiceConfigWritersForActivationWithClient,
   rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient,
+  ShopifyCheckoutRatingPersistenceError,
   shopifyCheckoutRateLineageIsRequired,
   shopifyCheckoutRateOutcomeAllowsFulfillment,
   type ShopifyCheckoutRateReconciliationOutcome,
@@ -4432,16 +4433,31 @@ export async function updateOperationsActivationInPostgres(input: {
       [organizationId, input.state, reason, actorEmail],
     )
     const updated = await resolveActivation(client, organizationId)
-    const shadowCarrierServiceRebindings = input.state === 'shadow'
-      ? await rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient(
-          client,
-          {
-            organizationId,
-            targetActivationRevision: updated.revision,
-            actorEmail,
-          },
-        )
-      : []
+    let shadowCarrierServiceRebindings: Awaited<ReturnType<
+      typeof rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient
+    >> = []
+    if (input.state === 'shadow') {
+      try {
+        shadowCarrierServiceRebindings =
+          await rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient(
+            client,
+            {
+              organizationId,
+              targetActivationRevision: updated.revision,
+              actorEmail,
+            },
+          )
+      } catch (error) {
+        if (error instanceof ShopifyCheckoutRatingPersistenceError) {
+          throw new OperationsRequestError(
+            error.code,
+            error.message,
+            error.status,
+          )
+        }
+        throw error
+      }
+    }
     await recordAuditEvent({
       actor: actorEmail,
       eventType: 'operations.activation.updated',
