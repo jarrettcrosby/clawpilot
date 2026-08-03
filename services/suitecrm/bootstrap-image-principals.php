@@ -277,6 +277,36 @@ function image_principal_database(): PDO
     );
 }
 
+function image_principal_bootstrap_lock_name(): string
+{
+    $databaseName = image_principal_required_database_value('SUITECRM_DB_NAME');
+    return 'clawpilot.image-principals.' . substr(hash('sha256', $databaseName), 0, 32);
+}
+
+function image_principal_acquire_bootstrap_lock(PDO $pdo): string
+{
+    $lockName = image_principal_bootstrap_lock_name();
+    $statement = $pdo->prepare('SELECT GET_LOCK(?, 120)');
+    $statement->execute([$lockName]);
+    if ((int) $statement->fetchColumn() !== 1) {
+        image_principal_invariant_failure(
+            'SuiteCRM image-principal bootstrap lock could not be acquired'
+        );
+    }
+    return $lockName;
+}
+
+function image_principal_release_bootstrap_lock(PDO $pdo, string $lockName): void
+{
+    $statement = $pdo->prepare('SELECT RELEASE_LOCK(?)');
+    $statement->execute([$lockName]);
+    if ((int) $statement->fetchColumn() !== 1) {
+        image_principal_invariant_failure(
+            'SuiteCRM image-principal bootstrap lock could not be released'
+        );
+    }
+}
+
 /** @return array<string, mixed> */
 function image_principal_find_single_user(PDO $pdo, string $username): array
 {
@@ -499,43 +529,113 @@ function image_principal_assign_exact_acl(
     string $roleId,
     array $allowedActions
 ): void {
-    $otherRoleUsers = $pdo->prepare(
-        'SELECT COUNT(*)
-           FROM acl_roles_users
-          WHERE role_id = ? AND user_id <> ? AND deleted = 0'
-    );
-    $otherRoleUsers->execute([$roleId, $userId]);
-    if ((int) $otherRoleUsers->fetchColumn() !== 0) {
-        image_principal_invariant_failure('managed image role is assigned to another user');
-    }
-    $roleGroups = $pdo->prepare(
-        'SELECT COUNT(*) FROM securitygroups_acl_roles WHERE role_id = ? AND deleted = 0'
-    );
-    $roleGroups->execute([$roleId]);
-    if ((int) $roleGroups->fetchColumn() !== 0) {
-        image_principal_invariant_failure('managed image role is assigned to a Security Group');
-    }
-
     $pdo->beginTransaction();
     try {
-        $removeOtherRoles = $pdo->prepare(
+        $lockUser = $pdo->prepare(
+            'SELECT id, status, deleted FROM users WHERE id = ? FOR UPDATE'
+        );
+        $lockUser->execute([$userId]);
+        $lockedUser = $lockUser->fetch();
+        if (
+            !$lockedUser
+            || (int) ($lockedUser['deleted'] ?? 1) !== 0
+            || (string) ($lockedUser['status'] ?? '') !== 'Active'
+        ) {
+            image_principal_invariant_failure('managed image user is not active under lock');
+        }
+        $lockRole = $pdo->prepare(
+            'SELECT id, deleted FROM acl_roles WHERE id = ? FOR UPDATE'
+        );
+        $lockRole->execute([$roleId]);
+        $lockedRole = $lockRole->fetch();
+        if (!$lockedRole || (int) ($lockedRole['deleted'] ?? 1) !== 0) {
+            image_principal_invariant_failure('managed image role is not active under lock');
+        }
+
+        $otherRoleUsers = $pdo->prepare(
+            'SELECT id
+               FROM acl_roles_users
+              WHERE role_id = ? AND user_id <> ? AND deleted = 0
+              FOR UPDATE'
+        );
+        $otherRoleUsers->execute([$roleId, $userId]);
+        if ($otherRoleUsers->fetchColumn() !== false) {
+            image_principal_invariant_failure(
+                'managed image role is assigned to another user'
+            );
+        }
+        $roleGroups = $pdo->prepare(
+            'SELECT id
+               FROM securitygroups_acl_roles
+              WHERE role_id = ? AND deleted = 0
+              FOR UPDATE'
+        );
+        $roleGroups->execute([$roleId]);
+        if ($roleGroups->fetchColumn() !== false) {
+            image_principal_invariant_failure(
+                'managed image role is assigned to a Security Group'
+            );
+        }
+
+        $existingMembership = $pdo->prepare(
+            'SELECT id
+               FROM acl_roles_users
+              WHERE user_id = ? AND role_id = ?
+              ORDER BY deleted ASC, date_modified DESC, id
+              LIMIT 1
+              FOR UPDATE'
+        );
+        $existingMembership->execute([$userId, $roleId]);
+        $membershipId = $existingMembership->fetchColumn();
+
+        $removeUserRoles = $pdo->prepare(
             'UPDATE acl_roles_users
                 SET deleted = 1, date_modified = UTC_TIMESTAMP()
-              WHERE user_id = ? AND role_id <> ? AND deleted = 0'
+              WHERE user_id = ? AND deleted = 0'
         );
-        $removeOtherRoles->execute([$userId, $roleId]);
+        $removeUserRoles->execute([$userId]);
         $removeGroups = $pdo->prepare(
             'UPDATE securitygroups_users
                 SET deleted = 1, date_modified = UTC_TIMESTAMP()
               WHERE user_id = ? AND deleted = 0'
         );
         $removeGroups->execute([$userId]);
-        $membership = $pdo->prepare(
-            'INSERT INTO acl_roles_users (id, role_id, user_id, date_modified, deleted)
-             VALUES (?, ?, ?, UTC_TIMESTAMP(), 0)
-             ON DUPLICATE KEY UPDATE date_modified = UTC_TIMESTAMP(), deleted = 0'
+        if (is_string($membershipId) && $membershipId !== '') {
+            $restoreMembership = $pdo->prepare(
+                'UPDATE acl_roles_users
+                    SET role_id = ?, user_id = ?, date_modified = UTC_TIMESTAMP(), deleted = 0
+                  WHERE id = ?'
+            );
+            $restoreMembership->execute([$roleId, $userId, $membershipId]);
+        } else {
+            $insertMembership = $pdo->prepare(
+                'INSERT INTO acl_roles_users (id, role_id, user_id, date_modified, deleted)
+                 VALUES (?, ?, ?, UTC_TIMESTAMP(), 0)'
+            );
+            $insertMembership->execute([create_guid(), $roleId, $userId]);
+        }
+
+        $existingRoleActions = $pdo->prepare(
+            'SELECT id, action_id
+               FROM acl_roles_actions
+              WHERE role_id = ?
+              ORDER BY deleted ASC, date_modified DESC, id
+              FOR UPDATE'
         );
-        $membership->execute([create_guid(), $roleId, $userId]);
+        $existingRoleActions->execute([$roleId]);
+        $existingActionIds = [];
+        foreach ($existingRoleActions->fetchAll() as $existingRoleAction) {
+            $actionId = (string) $existingRoleAction['action_id'];
+            if (!isset($existingActionIds[$actionId])) {
+                $existingActionIds[$actionId] = (string) $existingRoleAction['id'];
+            }
+        }
+        $deactivateRoleActions = $pdo->prepare(
+            'UPDATE acl_roles_actions
+                SET deleted = 1, date_modified = UTC_TIMESTAMP()
+              WHERE role_id = ? AND deleted = 0'
+        );
+        $deactivateRoleActions->execute([$roleId]);
 
         $actions = $pdo->query(
             'SELECT id, category, acltype, name
@@ -547,16 +647,19 @@ function image_principal_assign_exact_acl(
             image_principal_invariant_failure('SuiteCRM ACL actions are unavailable');
         }
         $targetActions = [];
-        $upsert = $pdo->prepare(
+        $restoreAction = $pdo->prepare(
+            'UPDATE acl_roles_actions
+                SET role_id = ?, action_id = ?, access_override = ?,
+                    date_modified = UTC_TIMESTAMP(), deleted = 0
+              WHERE id = ?'
+        );
+        $insertAction = $pdo->prepare(
             'INSERT INTO acl_roles_actions
                 (id, role_id, action_id, access_override, date_modified, deleted)
-             VALUES (?, ?, ?, ?, UTC_TIMESTAMP(), 0)
-             ON DUPLICATE KEY UPDATE
-                access_override = VALUES(access_override),
-                date_modified = UTC_TIMESTAMP(),
-                deleted = 0'
+             VALUES (?, ?, ?, ?, UTC_TIMESTAMP(), 0)'
         );
         foreach ($actions as $action) {
+            $actionId = (string) $action['id'];
             $category = (string) $action['category'];
             $aclType = (string) $action['acltype'];
             $name = (string) $action['name'];
@@ -566,17 +669,27 @@ function image_principal_assign_exact_acl(
                 }
                 $targetActions[$name] = true;
             }
-            $upsert->execute([
-                create_guid(),
-                $roleId,
-                (string) $action['id'],
-                image_principal_expected_access(
-                    $category,
-                    $aclType,
-                    $name,
-                    $allowedActions
-                ),
-            ]);
+            $accessOverride = image_principal_expected_access(
+                $category,
+                $aclType,
+                $name,
+                $allowedActions
+            );
+            if (isset($existingActionIds[$actionId])) {
+                $restoreAction->execute([
+                    $roleId,
+                    $actionId,
+                    $accessOverride,
+                    $existingActionIds[$actionId],
+                ]);
+            } else {
+                $insertAction->execute([
+                    create_guid(),
+                    $roleId,
+                    $actionId,
+                    $accessOverride,
+                ]);
+            }
         }
         foreach (CLAWPILOT_IMAGE_ROLE_ACTIONS as $requiredAction) {
             if (!isset($targetActions[$requiredAction])) {
@@ -585,17 +698,6 @@ function image_principal_assign_exact_acl(
                 );
             }
         }
-        $removeStaleActions = $pdo->prepare(
-            'UPDATE acl_roles_actions role_action
-             LEFT JOIN acl_actions action_record
-                    ON action_record.id = role_action.action_id
-                SET role_action.deleted = 1,
-                    role_action.date_modified = UTC_TIMESTAMP()
-              WHERE role_action.role_id = ?
-                AND role_action.deleted = 0
-                AND (action_record.id IS NULL OR action_record.deleted = 1)'
-        );
-        $removeStaleActions->execute([$roleId]);
         $pdo->commit();
     } catch (Throwable $error) {
         if ($pdo->inTransaction()) {
@@ -651,7 +753,9 @@ function image_principal_verify_exact_acl(
     }
 
     $actions = $pdo->prepare(
-        'SELECT action_record.category,
+        'SELECT action_record.id AS action_id,
+                role_action.id AS role_action_id,
+                action_record.category,
                 action_record.acltype,
                 action_record.name,
                 role_action.access_override
@@ -664,9 +768,17 @@ function image_principal_verify_exact_acl(
     );
     $actions->execute([$roleId]);
     $targetActions = [];
+    $actionMembershipCounts = [];
     foreach ($actions->fetchAll() as $row) {
         if ($row['access_override'] === null) {
             image_principal_invariant_failure('managed image role is missing an ACL override');
+        }
+        $actionId = (string) $row['action_id'];
+        $actionMembershipCounts[$actionId] = ($actionMembershipCounts[$actionId] ?? 0) + 1;
+        if ($actionMembershipCounts[$actionId] !== 1) {
+            image_principal_invariant_failure(
+                'managed image role ACL action membership is not exact'
+            );
         }
         $category = (string) $row['category'];
         $aclType = (string) $row['acltype'];
@@ -683,6 +795,21 @@ function image_principal_verify_exact_acl(
         if ($category === CLAWPILOT_IMAGE_PRODUCT_MODULE && $aclType === 'module') {
             $targetActions[$name] = (int) $row['access_override'];
         }
+    }
+    $staleRoleActions = $pdo->prepare(
+        'SELECT COUNT(*)
+           FROM acl_roles_actions role_action
+      LEFT JOIN acl_actions action_record
+             ON action_record.id = role_action.action_id
+          WHERE role_action.role_id = ?
+            AND role_action.deleted = 0
+            AND (action_record.id IS NULL OR action_record.deleted <> 0)'
+    );
+    $staleRoleActions->execute([$roleId]);
+    if ((int) $staleRoleActions->fetchColumn() !== 0) {
+        image_principal_invariant_failure(
+            'managed image role has a stale ACL action mapping'
+        );
     }
     foreach (CLAWPILOT_IMAGE_ROLE_ACTIONS as $requiredAction) {
         if (!array_key_exists($requiredAction, $targetActions)) {
@@ -882,82 +1009,100 @@ try {
     require_once 'modules/ACLRoles/ACLRole.php';
 
     $pdo = image_principal_database();
-    $admin = image_principal_admin_user($pdo);
-    $GLOBALS['current_user'] = $admin;
-    image_principal_verify_product_field();
-    ACLAction::addActions(CLAWPILOT_IMAGE_PRODUCT_MODULE, 'module');
+    $bootstrapLockName = image_principal_acquire_bootstrap_lock($pdo);
+    $bootstrapFailure = null;
+    try {
+        $admin = image_principal_admin_user($pdo);
+        $GLOBALS['current_user'] = $admin;
+        image_principal_verify_product_field();
+        ACLAction::addActions(CLAWPILOT_IMAGE_PRODUCT_MODULE, 'module');
 
-    if ($configuration['forward'] !== null) {
-        $forward = image_principal_ensure_user(
-            $pdo,
-            $admin,
-            $configuration['forward']['username'],
-            $configuration['forward']['password'],
-            CLAWPILOT_IMAGE_FORWARD_DESCRIPTION,
-            'Product Image Media Writer'
-        );
-        $forwardRole = image_principal_ensure_role(
-            $pdo,
-            $admin,
-            CLAWPILOT_IMAGE_FORWARD_ROLE,
-            CLAWPILOT_IMAGE_FORWARD_DESCRIPTION
-        );
-        image_principal_assign_exact_acl(
-            $pdo,
-            (string) $forward->id,
-            (string) $forwardRole->id,
-            ['view', 'edit']
-        );
-        image_principal_verify_exact_acl(
-            $pdo,
-            (string) $forward->id,
-            (string) $forwardRole->id,
-            ['view', 'edit']
-        );
-        image_principal_verify_no_oauth_client($pdo, (string) $forward->id);
+        if ($configuration['forward'] !== null) {
+            $forward = image_principal_ensure_user(
+                $pdo,
+                $admin,
+                $configuration['forward']['username'],
+                $configuration['forward']['password'],
+                CLAWPILOT_IMAGE_FORWARD_DESCRIPTION,
+                'Product Image Media Writer'
+            );
+            $forwardRole = image_principal_ensure_role(
+                $pdo,
+                $admin,
+                CLAWPILOT_IMAGE_FORWARD_ROLE,
+                CLAWPILOT_IMAGE_FORWARD_DESCRIPTION
+            );
+            image_principal_assign_exact_acl(
+                $pdo,
+                (string) $forward->id,
+                (string) $forwardRole->id,
+                ['view', 'edit']
+            );
+            image_principal_verify_exact_acl(
+                $pdo,
+                (string) $forward->id,
+                (string) $forwardRole->id,
+                ['view', 'edit']
+            );
+            image_principal_verify_no_oauth_client($pdo, (string) $forward->id);
+        }
+
+        if ($configuration['reverse'] !== null) {
+            $reverse = image_principal_ensure_user(
+                $pdo,
+                $admin,
+                $configuration['reverse']['username'],
+                $configuration['reverse']['password'],
+                CLAWPILOT_IMAGE_REVERSE_DESCRIPTION,
+                'Product Image Reader'
+            );
+            $reverseRole = image_principal_ensure_role(
+                $pdo,
+                $admin,
+                CLAWPILOT_IMAGE_REVERSE_ROLE,
+                CLAWPILOT_IMAGE_REVERSE_DESCRIPTION
+            );
+            image_principal_assign_exact_acl(
+                $pdo,
+                (string) $reverse->id,
+                (string) $reverseRole->id,
+                ['list', 'view']
+            );
+            image_principal_verify_exact_acl(
+                $pdo,
+                (string) $reverse->id,
+                (string) $reverseRole->id,
+                ['list', 'view']
+            );
+            image_principal_ensure_reader_client(
+                $pdo,
+                (string) $admin->id,
+                (string) $reverse->id,
+                $configuration['reverse']['clientId'],
+                $configuration['reverse']['clientSecret']
+            );
+        }
+
+        if (
+            isset($forward, $reverse)
+            && hash_equals((string) $forward->id, (string) $reverse->id)
+        ) {
+            image_principal_invariant_failure(
+                'forward and reverse image users are not separate'
+            );
+        }
+    } catch (Throwable $error) {
+        $bootstrapFailure = $error;
     }
-
-    if ($configuration['reverse'] !== null) {
-        $reverse = image_principal_ensure_user(
-            $pdo,
-            $admin,
-            $configuration['reverse']['username'],
-            $configuration['reverse']['password'],
-            CLAWPILOT_IMAGE_REVERSE_DESCRIPTION,
-            'Product Image Reader'
-        );
-        $reverseRole = image_principal_ensure_role(
-            $pdo,
-            $admin,
-            CLAWPILOT_IMAGE_REVERSE_ROLE,
-            CLAWPILOT_IMAGE_REVERSE_DESCRIPTION
-        );
-        image_principal_assign_exact_acl(
-            $pdo,
-            (string) $reverse->id,
-            (string) $reverseRole->id,
-            ['list', 'view']
-        );
-        image_principal_verify_exact_acl(
-            $pdo,
-            (string) $reverse->id,
-            (string) $reverseRole->id,
-            ['list', 'view']
-        );
-        image_principal_ensure_reader_client(
-            $pdo,
-            (string) $admin->id,
-            (string) $reverse->id,
-            $configuration['reverse']['clientId'],
-            $configuration['reverse']['clientSecret']
-        );
+    try {
+        image_principal_release_bootstrap_lock($pdo, $bootstrapLockName);
+    } catch (Throwable $releaseError) {
+        if ($bootstrapFailure === null) {
+            $bootstrapFailure = $releaseError;
+        }
     }
-
-    if (
-        isset($forward, $reverse)
-        && hash_equals((string) $forward->id, (string) $reverse->id)
-    ) {
-        image_principal_invariant_failure('forward and reverse image users are not separate');
+    if ($bootstrapFailure !== null) {
+        throw $bootstrapFailure;
     }
 
     fwrite(STDOUT, "SuiteCRM image service principals and exact ACLs are ready\n");
