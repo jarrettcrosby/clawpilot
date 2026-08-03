@@ -1,7 +1,7 @@
 -- Extend the exact-order sandbox commerce E2E authority to Faire without
 -- weakening the existing Shopify path. Faire authority is valid only while
--- its immutable promoted-candidate, item-pack, sealed operational parcel,
--- origin, and destination evidence still matches live durable state.
+-- its immutable promoted-candidate, mapped pack, canonical package, origin,
+-- and destination evidence still matches live durable state.
 
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '25s';
@@ -88,69 +88,16 @@ CREATE TABLE IF NOT EXISTS
     warehouse_address_hash text NOT NULL CHECK (
       warehouse_address_hash ~ '^[a-f0-9]{64}$'
     ),
-    cartonization_evidence_id uuid NOT NULL,
-    cartonization_evidence_global_id text NOT NULL,
-    cartonization_request_hash text NOT NULL CHECK (
-      cartonization_request_hash ~ '^[a-f0-9]{64}$'
-    ),
-    cartonization_plan_input_hash text NOT NULL CHECK (
-      cartonization_plan_input_hash ~ '^[a-f0-9]{64}$'
-    ),
-    cartonization_plan_result_hash text NOT NULL CHECK (
-      cartonization_plan_result_hash ~ '^[a-f0-9]{64}$'
-    ),
-    cartonization_package_key text NOT NULL CHECK (
-      length(btrim(cartonization_package_key)) BETWEEN 1 AND 80
-      AND cartonization_package_key !~ '[[:cntrl:]]'
-    ),
-    cartonization_package_hash text NOT NULL CHECK (
-      cartonization_package_hash ~ '^[a-f0-9]{64}$'
-    ),
-    packaging_material_id uuid NOT NULL,
-    packaging_material_global_id text NOT NULL,
-    packaging_material_row_version bigint NOT NULL CHECK (
-      packaging_material_row_version >= 0
-    ),
-    approved_pack_recipe_id uuid NOT NULL,
-    approved_pack_recipe_global_id text NOT NULL,
-    approved_pack_recipe_row_version bigint NOT NULL CHECK (
-      approved_pack_recipe_row_version >= 0
-    ),
     package_id uuid NOT NULL,
     package_global_id text NOT NULL,
     package_content_id uuid NOT NULL,
     package_content_global_id text NOT NULL,
     package_number integer NOT NULL CHECK (package_number > 0),
     item_quantity numeric(20,6) NOT NULL CHECK (item_quantity = 1),
-    item_pack_length_mm integer NOT NULL CHECK (item_pack_length_mm > 0),
-    item_pack_width_mm integer NOT NULL CHECK (item_pack_width_mm > 0),
-    item_pack_height_mm integer NOT NULL CHECK (item_pack_height_mm > 0),
-    item_pack_gross_weight_grams integer NOT NULL CHECK (
-      item_pack_gross_weight_grams > 0
-    ),
-    item_pack_evidence_hash text NOT NULL CHECK (
-      item_pack_evidence_hash ~ '^[a-f0-9]{64}$'
-    ),
-    parcel_inner_dimensions_mm jsonb NOT NULL CHECK (
-      operations_cartonization_dimensions_mm_valid(
-        parcel_inner_dimensions_mm
-      )
-    ),
-    parcel_length_mm integer NOT NULL CHECK (parcel_length_mm > 0),
-    parcel_width_mm integer NOT NULL CHECK (parcel_width_mm > 0),
-    parcel_height_mm integer NOT NULL CHECK (parcel_height_mm > 0),
-    parcel_content_weight_grams integer NOT NULL CHECK (
-      parcel_content_weight_grams > 0
-    ),
-    parcel_tare_weight_grams integer NOT NULL CHECK (
-      parcel_tare_weight_grams > 0
-    ),
-    parcel_gross_weight_grams integer NOT NULL CHECK (
-      parcel_gross_weight_grams =
-        parcel_content_weight_grams + parcel_tare_weight_grams
-      AND parcel_content_weight_grams =
-        item_pack_gross_weight_grams * item_quantity
-    ),
+    length_mm integer NOT NULL CHECK (length_mm > 0),
+    width_mm integer NOT NULL CHECK (width_mm > 0),
+    height_mm integer NOT NULL CHECK (height_mm > 0),
+    gross_weight_grams integer NOT NULL CHECK (gross_weight_grams > 0),
     ship_to_hash text NOT NULL CHECK (ship_to_hash ~ '^[a-f0-9]{64}$'),
     destination_region text NOT NULL CHECK (destination_region = 'CA'),
     destination_country_code text NOT NULL CHECK (
@@ -211,28 +158,6 @@ CREATE TABLE IF NOT EXISTS
       FOREIGN KEY (organization_id, warehouse_id)
       REFERENCES operations_warehouses(organization_id, id)
       ON DELETE RESTRICT,
-    CONSTRAINT operations_sandbox_commerce_e2e_faire_evidence_carton_fkey
-      FOREIGN KEY (organization_id, cartonization_evidence_id)
-      REFERENCES operations_cartonization_rate_evidence(
-        organization_id, id
-      ) ON DELETE RESTRICT,
-    CONSTRAINT operations_sandbox_commerce_e2e_faire_evidence_carton_package_fkey
-      FOREIGN KEY (
-        organization_id, cartonization_evidence_id,
-        cartonization_package_key
-      ) REFERENCES operations_cartonization_rate_evidence_packages(
-        organization_id, evidence_id, package_key
-      ) ON DELETE RESTRICT,
-    CONSTRAINT operations_sandbox_commerce_e2e_faire_evidence_material_fkey
-      FOREIGN KEY (organization_id, packaging_material_id)
-      REFERENCES operations_packaging_materials(organization_id, id)
-      ON DELETE RESTRICT,
-    CONSTRAINT operations_sandbox_commerce_e2e_faire_evidence_recipe_fkey
-      FOREIGN KEY (
-        organization_id, packaging_material_id, approved_pack_recipe_id
-      ) REFERENCES operations_approved_pack_recipes(
-        organization_id, packaging_material_id, id
-      ) ON DELETE RESTRICT,
     CONSTRAINT operations_sandbox_commerce_e2e_faire_evidence_package_fkey
       FOREIGN KEY (organization_id, package_id)
       REFERENCES operations_packages(organization_id, id)
@@ -340,24 +265,6 @@ AS $$
             JOIN operations_warehouses warehouse
               ON warehouse.organization_id = evidence.organization_id
              AND warehouse.id = evidence.warehouse_id
-            JOIN operations_cartonization_rate_evidence cartonization
-              ON cartonization.organization_id = evidence.organization_id
-             AND cartonization.id = evidence.cartonization_evidence_id
-            JOIN operations_cartonization_rate_evidence_packages
-              carton_package
-              ON carton_package.organization_id = evidence.organization_id
-             AND carton_package.evidence_id =
-                   evidence.cartonization_evidence_id
-             AND carton_package.package_key =
-                   evidence.cartonization_package_key
-            JOIN operations_packaging_materials material
-              ON material.organization_id = evidence.organization_id
-             AND material.id = evidence.packaging_material_id
-            JOIN operations_approved_pack_recipes recipe
-              ON recipe.organization_id = evidence.organization_id
-             AND recipe.id = evidence.approved_pack_recipe_id
-             AND recipe.packaging_material_id =
-                   evidence.packaging_material_id
             JOIN operations_packages package
               ON package.organization_id = evidence.organization_id
              AND package.plan_id = plan.id
@@ -435,130 +342,42 @@ AS $$
               )
               AND pack_version.base_each_quantity = 1
               AND pack_version.dimension_basis = 'outer'
-              AND pack_version.length_mm = evidence.item_pack_length_mm
-              AND pack_version.width_mm = evidence.item_pack_width_mm
-              AND pack_version.height_mm = evidence.item_pack_height_mm
+              AND pack_version.length_mm = evidence.length_mm
+              AND pack_version.width_mm = evidence.width_mm
+              AND pack_version.height_mm = evidence.height_mm
               AND pack_version.gross_weight_grams =
-                    evidence.item_pack_gross_weight_grams
-              AND candidate_line.length_mm = evidence.item_pack_length_mm
-              AND candidate_line.width_mm = evidence.item_pack_width_mm
-              AND candidate_line.height_mm = evidence.item_pack_height_mm
-              AND candidate_line.weight_grams =
-                    evidence.item_pack_gross_weight_grams
+                    evidence.gross_weight_grams
+              AND candidate_line.length_mm = evidence.length_mm
+              AND candidate_line.width_mm = evidence.width_mm
+              AND candidate_line.height_mm = evidence.height_mm
+              AND candidate_line.weight_grams = evidence.gross_weight_grams
               AND (canonical_line.dimensions_mm->>'length')::integer =
-                    evidence.item_pack_length_mm
+                    evidence.length_mm
               AND (canonical_line.dimensions_mm->>'width')::integer =
-                    evidence.item_pack_width_mm
+                    evidence.width_mm
               AND (canonical_line.dimensions_mm->>'height')::integer =
-                    evidence.item_pack_height_mm
-              AND canonical_line.weight_grams =
-                    evidence.item_pack_gross_weight_grams
-              AND operations_sandbox_commerce_e2e_jsonb_hash(
-                    jsonb_build_object(
-                      'candidateLineGlobalId', candidate_line.global_id,
-                      'canonicalOrderLineGlobalId', canonical_line.global_id,
-                      'packProfileVersionGlobalId', pack_version.global_id,
-                      'quantity', content.quantity,
-                      'lengthMm', pack_version.length_mm,
-                      'widthMm', pack_version.width_mm,
-                      'heightMm', pack_version.height_mm,
-                      'grossWeightGrams', pack_version.gross_weight_grams
-                    )
-                  ) = evidence.item_pack_evidence_hash
+                    evidence.height_mm
+              AND canonical_line.weight_grams = evidence.gross_weight_grams
               AND plan.global_id = evidence.fulfillment_plan_global_id
               AND plan.version_number = evidence.fulfillment_plan_version
               AND plan.warehouse_id = evidence.warehouse_id
-              AND plan.cartonization_evidence_id = cartonization.id
               AND plan.status = 'released'
               AND warehouse.address IS NOT NULL
               AND operations_sandbox_commerce_e2e_jsonb_hash(
                     warehouse.address
                   ) = evidence.warehouse_address_hash
-              AND cartonization.global_id =
-                    evidence.cartonization_evidence_global_id
-              AND cartonization.integration_account_id = account.id
-              AND cartonization.order_candidate_id = candidate.id
-              AND cartonization.candidate_row_version =
-                    evidence.order_candidate_row_version
-              AND cartonization.candidate_source_hash =
-                    evidence.order_candidate_source_hash
-              AND cartonization.warehouse_id = warehouse.id
-              AND cartonization.evidence_mode = 'operational'
-              AND cartonization.status IN ('succeeded', 'partial')
-              AND cartonization.sealed_at IS NOT NULL
-              AND cartonization.request_hash =
-                    evidence.cartonization_request_hash
-              AND cartonization.plan_input_hash =
-                    evidence.cartonization_plan_input_hash
-              AND cartonization.plan_result_hash =
-                    evidence.cartonization_plan_result_hash
-              AND carton_package.package_hash =
-                    evidence.cartonization_package_hash
-              AND carton_package.planning_method = 'approved_recipe'
-              AND carton_package.packaging_material_id = material.id
-              AND carton_package.material_row_version =
-                    evidence.packaging_material_row_version
-              AND carton_package.approved_pack_recipe_id = recipe.id
-              AND carton_package.recipe_row_version =
-                    evidence.approved_pack_recipe_row_version
-              AND jsonb_array_length(carton_package.allocations) = 1
-              AND carton_package.allocations->0->>'lineGlobalId' =
-                    candidate_line.global_id
-              AND (
-                    carton_package.allocations->0->>'quantity'
-                  )::numeric = evidence.item_quantity
-              AND material.global_id =
-                    evidence.packaging_material_global_id
-              AND material.row_version =
-                    evidence.packaging_material_row_version
-              AND material.status = 'active'
-              AND material.rated_outer_length_mm = evidence.parcel_length_mm
-              AND material.rated_outer_width_mm = evidence.parcel_width_mm
-              AND material.rated_outer_height_mm = evidence.parcel_height_mm
-              AND material.tare_weight_grams =
-                    evidence.parcel_tare_weight_grams
-              AND recipe.global_id = evidence.approved_pack_recipe_global_id
-              AND recipe.row_version =
-                    evidence.approved_pack_recipe_row_version
-              AND recipe.is_current = true
-              AND recipe.lifecycle_state IN ('customer_confirmed', 'active')
-              AND recipe.input_pack_profile_version_id = pack_version.id
-              AND recipe.packaging_material_id = material.id
               AND package.global_id = evidence.package_global_id
               AND package.package_number = evidence.package_number
-              AND package.cartonization_evidence_id = cartonization.id
-              AND package.evidence_package_key =
-                    evidence.cartonization_package_key
               -- Shipment confirmation marks packages shipped immediately
               -- before the released plan transitions to fulfilled. The exact
               -- package identity and parcel evidence remain unchanged during
               -- that same transaction, so permit this transient state while
               -- the one-use authorization is still locked and active.
               AND package.status IN ('packed', 'labeled', 'shipped')
-              AND carton_package.inner_dimensions_mm =
-                    evidence.parcel_inner_dimensions_mm
-              AND (
-                    carton_package.rated_outer_dimensions_mm->>'length'
-                  )::integer = evidence.parcel_length_mm
-              AND (
-                    carton_package.rated_outer_dimensions_mm->>'width'
-                  )::integer = evidence.parcel_width_mm
-              AND (
-                    carton_package.rated_outer_dimensions_mm->>'height'
-                  )::integer = evidence.parcel_height_mm
-              AND carton_package.content_weight_grams =
-                    evidence.parcel_content_weight_grams
-              AND carton_package.content_weight_grams =
-                    evidence.item_pack_gross_weight_grams
-                      * evidence.item_quantity
-              AND carton_package.tare_weight_grams =
-                    evidence.parcel_tare_weight_grams
-              AND carton_package.rated_gross_weight_grams =
-                    evidence.parcel_gross_weight_grams
-              AND package.length_mm = evidence.parcel_length_mm
-              AND package.width_mm = evidence.parcel_width_mm
-              AND package.height_mm = evidence.parcel_height_mm
-              AND package.weight_grams = evidence.parcel_gross_weight_grams
+              AND package.length_mm = evidence.length_mm
+              AND package.width_mm = evidence.width_mm
+              AND package.height_mm = evidence.height_mm
+              AND package.weight_grams = evidence.gross_weight_grams
               AND content.global_id = evidence.package_content_global_id
               AND operations_sandbox_commerce_e2e_jsonb_hash(
                     jsonb_build_object(
@@ -566,24 +385,10 @@ AS $$
                       'contentGlobalId', content.global_id,
                       'orderLineGlobalId', canonical_line.global_id,
                       'quantity', content.quantity,
-                      'cartonizationEvidenceGlobalId',
-                        cartonization.global_id,
-                      'cartonizationPackageKey', carton_package.package_key,
-                      'packagingMaterialGlobalId', material.global_id,
-                      'packagingMaterialRowVersion',
-                        carton_package.material_row_version,
-                      'approvedPackRecipeGlobalId', recipe.global_id,
-                      'approvedPackRecipeRowVersion',
-                        carton_package.recipe_row_version,
-                      'innerDimensionsMm',
-                        carton_package.inner_dimensions_mm,
-                      'ratedOuterDimensionsMm',
-                        carton_package.rated_outer_dimensions_mm,
-                      'contentWeightGrams',
-                        carton_package.content_weight_grams,
-                      'tareWeightGrams', carton_package.tare_weight_grams,
-                      'grossWeightGrams',
-                        carton_package.rated_gross_weight_grams
+                      'lengthMm', package.length_mm,
+                      'widthMm', package.width_mm,
+                      'heightMm', package.height_mm,
+                      'grossWeightGrams', package.weight_grams
                     )
                   ) = evidence.package_evidence_hash
               AND operations_sandbox_commerce_e2e_jsonb_hash(
@@ -852,8 +657,8 @@ END;
 $$;
 
 COMMENT ON TABLE operations_sandbox_commerce_e2e_faire_evidence IS
-  'Immutable exact promoted-order, item-pack, sealed cartonization/material/recipe parcel, origin, and CA destination evidence for one Faire sandbox E2E authorization.';
+  'Immutable exact promoted-order, mapped-pack, package, origin, and CA destination evidence for one Faire sandbox E2E authorization.';
 COMMENT ON FUNCTION operations_sandbox_commerce_e2e_authorization_is_current(
   uuid, uuid, uuid
 ) IS
-  'Preserves existing Shopify sandbox authority and requires exact immutable Faire order/item-pack/cartonization/parcel/address evidence.';
+  'Preserves existing Shopify sandbox authority and requires exact immutable Faire order/pack/package/address evidence.';

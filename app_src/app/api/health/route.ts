@@ -2064,9 +2064,46 @@ export async function GET() {
                 WHERE filename =
                   '0231_operations_faire_sandbox_commerce_e2e.sql'
               )
+              AND EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0232_operations_faire_sandbox_parcel_evidence.sql'
+              )
               AND to_regclass(
                 'operations_sandbox_commerce_e2e_faire_evidence'
               ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM information_schema.columns column_row
+                WHERE column_row.table_schema = 'public'
+                  AND column_row.table_name =
+                    'operations_sandbox_commerce_e2e_faire_evidence'
+                  AND column_row.column_name =
+                    'item_pack_evidence_hash'
+                  AND column_row.is_nullable = 'NO'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM information_schema.columns column_row
+                WHERE column_row.table_schema = 'public'
+                  AND column_row.table_name =
+                    'operations_sandbox_commerce_e2e_faire_evidence'
+                  AND column_row.column_name =
+                    'parcel_gross_weight_grams'
+                  AND column_row.is_nullable = 'NO'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'operations_sandbox_commerce_e2e_faire_evidence'
+                  )
+                  AND constraint_row.conname =
+                    'operations_sandbox_commerce_e2e_faire_evidence_carton_package_fkey'
+                  AND constraint_row.contype = 'f'
+                  AND constraint_row.convalidated
+              )
               AND to_regprocedure(
                 'operations_sandbox_commerce_e2e_authorization_is_current(uuid,uuid,uuid)'
               ) IS NOT NULL
