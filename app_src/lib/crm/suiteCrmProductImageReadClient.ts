@@ -686,10 +686,19 @@ class SuiteCrmProductImageReader implements SuiteCrmProductImageReadClient {
       && !Array.isArray(meta)
       ? (meta as JsonObject)['total-pages']
       : undefined
-    const totalPages = Number(rawTotalPages)
+    const emptyResultWithoutPagination = products.length === 0
+      && rawTotalPages === undefined
+      && meta
+      && typeof meta === 'object'
+      && !Array.isArray(meta)
+      && String((meta as JsonObject).message || '').trim()
+        === 'Request was successful, but there is no result'
+    const totalPages = emptyResultWithoutPagination ? 0 : Number(rawTotalPages)
     if (
-      rawTotalPages === undefined
-      || rawTotalPages === null
+      (!emptyResultWithoutPagination && (
+        rawTotalPages === undefined
+        || rawTotalPages === null
+      ))
       || !Number.isSafeInteger(totalPages)
       || totalPages < 0
     ) throw new Error('SuiteCRM returned invalid Product pagination metadata')

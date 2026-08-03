@@ -230,6 +230,7 @@ const calls = []
 let graphModifiedAt = '2026-08-02T12:00:00Z'
 let contentUrlOverride = null
 let omitTotalRecords = false
+let emptyCollection = false
 
 function jsonResponse(value, status = 200, headers = {}) {
   return new Response(JSON.stringify(value), {
@@ -256,6 +257,12 @@ const fetchImpl = async (input, init = {}) => {
     assert.equal(url.searchParams.get('page[number]'), '1')
     assert.equal(url.searchParams.get('page[size]'), '50')
     assert.equal(url.searchParams.get('sort'), 'global_id_c')
+    if (emptyCollection) {
+      return jsonResponse({
+        data: [],
+        meta: { message: 'Request was successful, but there is no result' },
+      })
+    }
     return jsonResponse({
       data: [{
         id: PRODUCT_ID,
@@ -431,6 +438,16 @@ assert.equal(
   1,
 )
 omitTotalRecords = false
+emptyCollection = true
+assert.deepEqual(
+  JSON.parse(JSON.stringify(await reader.listProductsUpdatedSince({
+    updatedSince: '2026-08-02T11:00:00Z',
+    updatedBeforeOrAt: '2026-08-02T13:00:00Z',
+    page: 1,
+  }))),
+  { products: [], totalPages: 1, totalRecords: 0 },
+)
+emptyCollection = false
 
 const multiPageCalls = []
 const multiPageFetch = async (input, init = {}) => {
