@@ -1484,7 +1484,6 @@ async function applyRegisteredShopifyCarrierServiceRebindings(
     const updated = await client.query<{
       activation_revision: number
       row_version: string
-      callback_ready: boolean
     }>(
       `UPDATE operations_shopify_carrier_service_configs
        SET activation_revision = $3,
@@ -1501,11 +1500,7 @@ async function applyRegisteredShopifyCarrierServiceRebindings(
          AND row_version = $9::bigint
        RETURNING
          activation_revision,
-         row_version::text,
-         operations_shopify_carrier_service_config_is_ready(
-           organization_id,
-           id
-         ) AS callback_ready`,
+         row_version::text`,
       [
         input.organizationId,
         rebinding.id,
@@ -1518,11 +1513,23 @@ async function applyRegisteredShopifyCarrierServiceRebindings(
         rebinding.rowVersion,
       ],
     )
+    // The readiness function is STABLE and reads this table. PostgreSQL can
+    // evaluate it from the UPDATE command's pre-update snapshot when it is
+    // included in RETURNING, which falsely reports drift after a valid rebind.
+    // A separate command advances the command counter and observes the exact
+    // row written above while the surrounding transaction remains locked.
+    const readiness = await client.query<{ callback_ready: boolean }>(
+      `SELECT operations_shopify_carrier_service_config_is_ready(
+         $1::uuid,
+         $2::uuid
+       ) AS callback_ready`,
+      [input.organizationId, rebinding.id],
+    )
     if (
       Number(updated.rows[0]?.activation_revision)
         !== input.targetActivationRevision
       || Number(updated.rows[0]?.row_version) !== rebinding.rowVersion + 1
-      || updated.rows[0]?.callback_ready !== true
+      || readiness.rows[0]?.callback_ready !== true
     ) {
       fail(
         'COMMERCE_ACTIVE_SHOPIFY_CALLBACK_CONFIG_DRIFT',

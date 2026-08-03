@@ -236,6 +236,19 @@ function verifySourceContracts() {
     rebind.includes('callback_ready'),
     'Active rebind must prove canonical callback readiness after account activation and revision rebinding',
   )
+  assert.ok(
+    rebind.includes(
+      'SELECT operations_shopify_carrier_service_config_is_ready(',
+    ),
+    'Active rebind must evaluate stable callback readiness in a separate command after the config update',
+  )
+  assert.equal(
+    /RETURNING[\s\S]*operations_shopify_carrier_service_config_is_ready\(/.test(
+      rebind.slice(0, rebind.indexOf('const readiness')),
+    ),
+    false,
+    'Active rebind must not evaluate stable callback readiness from the UPDATE command snapshot',
+  )
   for (const forbiddenMutation of [
     'SET service_gid =',
     'SET callback_token_version =',
