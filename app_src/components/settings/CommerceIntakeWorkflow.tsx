@@ -7488,8 +7488,7 @@ export default function CommerceIntakeWorkflow({
                           >
                             Check order
                           </Button>
-                          {candidate.requiresShipping !== false
-                          && provider === 'shopify' ? (
+                          {candidate.requiresShipping !== false ? (
                             <Button
                               variant="outlined"
                               startIcon={<Inventory2Rounded />}
@@ -7510,16 +7509,6 @@ export default function CommerceIntakeWorkflow({
                               sx={actionButtonSx}
                             >
                               Pack & compare rates
-                            </Button>
-                          ) : candidate.requiresShipping !== false ? (
-                            <Button
-                              variant="outlined"
-                              startIcon={<Inventory2Rounded />}
-                              disabled
-                              title="Faire account-bound inventory reconciliation is not implemented yet."
-                              sx={actionButtonSx}
-                            >
-                              Pack preview needs Faire inventory
                             </Button>
                           ) : null}
                           <Button

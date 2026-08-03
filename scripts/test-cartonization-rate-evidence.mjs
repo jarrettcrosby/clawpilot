@@ -621,6 +621,18 @@ assertIncludes(workflow, [
   'READ-ONLY SANDBOX CARRIER ESTIMATES',
 ], 'Operator evidence-mode workflow')
 assert.equal(
+  workflow.includes(
+    'Faire account-bound inventory reconciliation is not implemented yet.',
+  ),
+  false,
+  'Faire candidates must expose the implemented local-inventory cartonization workflow',
+)
+assertIncludes(workflow, [
+  'candidate.requiresShipping !== false ? (',
+  'void openCartonizationPreview(candidate)',
+  'Pack & compare rates',
+], 'Provider-neutral candidate cartonization action')
+assert.equal(
   workflow.match(/response\.status >= 500/g)?.length,
   2,
   'Both evidence modes must preserve retry identity after 5xx responses',
