@@ -1139,7 +1139,9 @@ export default function CommerceIntegrationPanel() {
                 justifyContent="space-between"
               >
                 <Typography variant="subtitle2">
-                  Exact app scopes ClawPilot expects
+                  {setupChecklistProvider === 'shopify'
+                    ? 'Exact Shopify app scopes ClawPilot expects'
+                    : 'Faire permissions ClawPilot verifies'}
                 </Typography>
                 <Button
                   size="small"
@@ -1153,7 +1155,9 @@ export default function CommerceIntegrationPanel() {
                 </Button>
               </Stack>
               <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
-                Copy this list into the provider app-version permission screen. ClawPilot verifies the granted permissions before enabling each capability.
+                {setupChecklistProvider === 'shopify'
+                  ? 'Copy this list into the Shopify app-version permission screen. ClawPilot verifies the granted scopes before enabling each capability.'
+                  : 'These permissions describe the Faire access ClawPilot verifies for the selected connection path. Generated brand API-key access is issued by Faire rather than entered as an app-version scope list.'}
               </Typography>
               <Stack direction="row" gap={0.75} flexWrap="wrap">
                 {setupChecklistScopes.map((scope) => (

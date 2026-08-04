@@ -761,6 +761,8 @@ includes(panel, [
   'defaultExpanded={false}',
   'Shopify dashboard',
   'API key guide',
+  'Exact Shopify app scopes ClawPilot expects',
+  'Faire permissions ClawPilot verifies',
   'Open setup checklist',
   'setupChecklistProvider',
   'catalog?.providers.shopify.providerScopes',
