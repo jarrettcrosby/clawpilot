@@ -2370,6 +2370,19 @@ function automaticFairePromotionFailureCode(error: unknown) {
     : 'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_FAILED'
 }
 
+function automaticFairePromotionCanonicalRace(code: string) {
+  return code === 'COMMERCE_INTAKE_ALREADY_PROMOTED'
+    || code === 'COMMERCE_INTAKE_CANONICAL_ORDER_EXISTS'
+}
+
+function automaticFaireHoldRequiresOperator(reason: string) {
+  return !new Set([
+    'exact_refresh_required',
+    'canonical_order_exists',
+    'order_terminal_no_demand',
+  ]).has(reason)
+}
+
 function automaticFaireCommandKey(parts: readonly string[]) {
   return deterministicCustomerCommandUuid([
     'commerce-faire-order-auto-promotion-v1',
@@ -2433,12 +2446,16 @@ async function withAutomaticFaireOrderPromotion(
   let promoted = 0
   let held = 0
   let failed = 0
+  let operatorReviewRequired = 0
   const heldByReason: Record<string, number> = {}
   const failedByCode: Record<string, number> = {}
   for (const target of targets) {
     if (!target.eligible) {
       held += 1
       heldByReason[target.reason] = (heldByReason[target.reason] || 0) + 1
+      if (automaticFaireHoldRequiresOperator(target.reason)) {
+        operatorReviewRequired += 1
+      }
       continue
     }
     eligible += 1
@@ -2497,6 +2514,7 @@ async function withAutomaticFaireOrderPromotion(
       rowVersion = Number(validation.rowVersion)
       if (validation.ready !== true) {
         held += 1
+        operatorReviewRequired += 1
         heldByReason.validation_blocked =
           (heldByReason.validation_blocked || 0) + 1
         continue
@@ -2524,8 +2542,15 @@ async function withAutomaticFaireOrderPromotion(
       })
       promoted += 1
     } catch (error) {
-      failed += 1
       const code = automaticFairePromotionFailureCode(error)
+      if (automaticFairePromotionCanonicalRace(code)) {
+        held += 1
+        heldByReason.canonical_order_exists =
+          (heldByReason.canonical_order_exists || 0) + 1
+        continue
+      }
+      failed += 1
+      operatorReviewRequired += 1
       failedByCode[code] = (failedByCode[code] || 0) + 1
     }
   }
@@ -2541,7 +2566,7 @@ async function withAutomaticFaireOrderPromotion(
       heldByReason,
       failed,
       failedByCode,
-      operatorReviewRequired: held + failed,
+      operatorReviewRequired,
       providerWrites: 0,
       canonicalOrderWrites: promoted,
       inventoryWrites: 0,
@@ -2560,6 +2585,11 @@ type CommerceIntakeExecutionOptions = {
   includeIntakeState: boolean
   hydrateProductInventory: boolean
   providerAttemptActorEmail?: string | null
+  refreshTargetExpectation?: {
+    candidateGlobalId: string
+    candidateRowVersion: number
+    sourceHash: string
+  }
 }
 
 async function executeCommerceIntakeCommandInternal(
@@ -2822,6 +2852,20 @@ async function executeCommerceIntakeCommandInternal(
         'Candidate Global ID',
       )
       : null
+    if (
+      options.refreshTargetExpectation
+      && (
+        runtime.provider !== 'faire'
+        || refreshCandidateGlobalId
+          !== options.refreshTargetExpectation.candidateGlobalId
+      )
+    ) {
+      throw new CommerceIntegrationRequestError(
+        'The worker exact-refresh target does not match this Faire candidate',
+        409,
+        'COMMERCE_FAIRE_EXACT_REFRESH_TARGET_INVALID',
+      )
+    }
     const retryRejectionGlobalId = commandAction === 'retry-rejection'
       ? globalId(
           input.body.rejectionGlobalId,
@@ -2838,6 +2882,19 @@ async function executeCommerceIntakeCommandInternal(
         RUN_PATTERN,
         'Continuation run Global ID',
       )
+      : null
+    const expectedRefreshTarget = (
+      refreshCandidateGlobalId
+      && options.refreshTargetExpectation
+    )
+      ? await readCommerceIntakeRefreshTargetFromPostgres({
+          organizationId: runtime.organizationId,
+          accountGlobalId: runtime.globalId,
+          candidateGlobalId: refreshCandidateGlobalId,
+          expectedSourceHash: options.refreshTargetExpectation.sourceHash,
+          expectedRowVersion:
+            options.refreshTargetExpectation.candidateRowVersion,
+        })
       : null
     const replayTarget = refreshCandidateGlobalId
       ? {
@@ -2916,7 +2973,8 @@ async function executeCommerceIntakeCommandInternal(
       }
     }
     const refreshTarget = refreshCandidateGlobalId
-      ? await readCommerceIntakeRefreshTargetFromPostgres({
+      ? expectedRefreshTarget
+        || await readCommerceIntakeRefreshTargetFromPostgres({
           organizationId: runtime.organizationId,
           accountGlobalId: runtime.globalId,
           candidateGlobalId: refreshCandidateGlobalId,
@@ -3627,5 +3685,42 @@ export async function executeCommerceOrderPage(input: {
     // Provider-attempt attribution is nullable for an unattended system read;
     // never borrow a historical human merely to satisfy optional evidence.
     providerAttemptActorEmail: null,
+  })
+}
+
+/**
+ * Worker-only exact Faire order read. It reuses the browser refresh pipeline's
+ * durable read intent, capture, staging, customer, and promotion contracts,
+ * while fencing the exact candidate revision selected before any provider
+ * request and omitting retained intake state from the worker response.
+ */
+export async function executeCommerceFaireOrderExactRefresh(input: {
+  organizationId: string
+  accountGlobalId: string
+  actorEmail: string
+  idempotencyKey: string
+  candidateGlobalId: string
+  candidateRowVersion: number
+  sourceHash: string
+}) {
+  return executeCommerceIntakeCommandInternal({
+    organizationId: input.organizationId,
+    actorEmail: input.actorEmail,
+    body: {
+      action: 'refresh',
+      accountGlobalId: input.accountGlobalId,
+      idempotencyKey: input.idempotencyKey,
+      candidateGlobalId: input.candidateGlobalId,
+      confirmReadOnly: true,
+    },
+  }, {
+    includeIntakeState: false,
+    hydrateProductInventory: false,
+    providerAttemptActorEmail: null,
+    refreshTargetExpectation: {
+      candidateGlobalId: input.candidateGlobalId,
+      candidateRowVersion: input.candidateRowVersion,
+      sourceHash: input.sourceHash,
+    },
   })
 }

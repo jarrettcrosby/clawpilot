@@ -1992,9 +1992,21 @@ includes(serviceSource, [
   'validateCommerceCandidateInPostgres',
   'promoteCommerceCandidateInPostgres',
   'automaticFaireOrderPromotion',
-  'operatorReviewRequired: held + failed',
+  'automaticFaireHoldRequiresOperator',
+  'automaticFairePromotionCanonicalRace',
+  'COMMERCE_INTAKE_CANONICAL_ORDER_EXISTS',
+  'COMMERCE_INTAKE_ALREADY_PROMOTED',
+  'operatorReviewRequired,',
   'canonicalOrderWrites: promoted',
 ], 'Conservative automatic Faire order promotion orchestration')
+includes(serviceSource, [
+  'export async function executeCommerceFaireOrderExactRefresh',
+  "action: 'refresh'",
+  'providerAttemptActorEmail: null',
+  'refreshTargetExpectation',
+  'candidateRowVersion: input.candidateRowVersion',
+  'sourceHash: input.sourceHash',
+], 'Worker-only revision-fenced Faire exact refresh wrapper')
 includes(serviceSource, [
   "'plan-customer-binding'",
   "'confirm-customer-binding'",
@@ -2048,6 +2060,20 @@ includes(persistenceSource, [
   'party?.organizationName\n        || address?.organizationName\n        || party?.contactName',
 ], 'Automatic customer targets include a bounded account backlog behind a validated run anchor')
 includes(persistenceSource, [
+  'readAutomaticFaireExactRefreshTargetsInPostgres',
+  'WITH anchor AS',
+  "run.created_by = 'system:commerce-order-reconciliation'",
+  "'source_stale' = ANY(candidate.blocking_codes)",
+  '(run.global_id = $3) DESC',
+  'excludedCandidateGlobalIds?: readonly string[]',
+  'NOT candidate.global_id = ANY($6::text[])',
+  'retry_intent.target_global_id = candidate.global_id',
+  'retry_intent.target_source_hash = candidate.source_hash',
+  'history.external_order_id = candidate.external_order_id',
+  "history.created_by\n                   <> 'system:commerce-order-reconciliation'",
+  'operations_commerce_resolution_decisions decision',
+], 'Durable preferred-run Faire exact-refresh backlog selection')
+includes(persistenceSource, [
   'readAutomaticFaireOrderPromotionTargetsForRunInPostgres',
   "run.global_id = $3",
   "run.provider = 'faire'",
@@ -2055,6 +2081,13 @@ includes(persistenceSource, [
   "candidate.workflow_state IN ('held', 'resolving', 'ready')",
   'prior.run_id <> $5::uuid',
   'prior_candidate_requires_review',
+  'unsafe_candidate_history',
+  'exact_refresh_lineage',
+  "exact_intent.intake_action = 'refresh'",
+  'exact_intent.target_global_id',
+  'exact_intent.target_source_hash',
+  'exact_refresh_required',
+  'order_terminal_no_demand',
   'source_age_requires_review',
   "candidate.normalized_order_status !== 'open'",
   "candidate.normalized_fulfillment_status !== 'unfulfilled'",
@@ -2065,6 +2098,29 @@ includes(persistenceSource, [
   'ship_to_requires_review',
   'delivery_date_requires_review',
 ], 'Fresh-run Faire promotion eligibility and retained-order hold fences')
+includes(persistenceSource, [
+  'async function lockCommerceOrderIdentity',
+  "'commerce-intake-order-identity-v1'",
+  'for (const externalOrderId of [...externalOrderIds].sort())',
+  'await lockCommerceOrderIdentity(client, {',
+  'newer.observed_at = current.observed_at',
+  'newer.created_at > current.created_at',
+  'newer.id > current.id',
+], 'Shared staging and promotion order-identity concurrency fence')
+assert.equal(
+  persistenceSource.match(/await lockCommerceOrderIdentity\(client, \{/gu)
+    ?.length,
+  2,
+  'Staging and promotion must both acquire the same order identity lock',
+)
+includes(persistenceSource, [
+  "rejection.resourceType === 'order'",
+  'rejection.externalId === refreshTarget.rows[0].external_order_id',
+  'readIntent.target_external_id_hash',
+  'envelopeMatchesExactOrderTarget(',
+  'COMMERCE_INTAKE_EXACT_ORDER_TARGET_MISMATCH',
+  'COMMERCE_INTAKE_REFRESH_TARGET_MISSING',
+], 'Exact Faire refresh stages a matching normalized rejection and fails closed on identity mismatch')
 assert.ok(
   !persistenceSource.includes('records_failed AS records_rejected'),
   'Normalization rejection counts must come from stage audit evidence',
@@ -2528,12 +2584,14 @@ const continuations = new Map()
 const readIntents = new Map()
 const readIntentPreparations = []
 const invalidContinuations = []
+const refreshTargetReads = []
 const stageAttempts = []
 const automaticProductSweeps = []
 let automaticCustomerTargets = []
 const automaticCustomerResolverCalls = []
 let automaticFairePromotionTargets = []
 let automaticShopifyPromotionTargets = []
+let automaticFairePromotionFailureCode = null
 const productPolicyUpdates = []
 const customerBindingPlanCalls = []
 const customerBindingConfirmCalls = []
@@ -2545,6 +2603,13 @@ const refreshTargets = new Map([
     provider: 'shopify',
     external_order_id: 'gid://shopify/Order/999',
     source_hash: 'f'.repeat(64),
+    row_version: '0',
+  }],
+  ['gcoc0000020', {
+    provider: 'faire',
+    external_order_id: 'faire-order-exact-worker-1',
+    source_hash: '9'.repeat(64),
+    row_version: '7',
   }],
 ])
 let runSequence = 0
@@ -2595,6 +2660,15 @@ function persistenceCommand(name) {
         marked: false,
         reasonCode: 'canonical_order_exists',
       }
+    }
+    if (name === 'promote' && automaticFairePromotionFailureCode) {
+      const code = automaticFairePromotionFailureCode
+      automaticFairePromotionFailureCode = null
+      throw new MockCommerceIntegrationRequestError(
+        'Simulated concurrent canonical promotion',
+        409,
+        code,
+      )
     }
     return {
       action: name,
@@ -3253,7 +3327,28 @@ const service = loadTypeScriptModule(
           }
         },
         async readCommerceIntakeRefreshTargetFromPostgres(input) {
-          return refreshTargets.get(input.candidateGlobalId)
+          refreshTargetReads.push(input)
+          const target = refreshTargets.get(input.candidateGlobalId)
+          if (
+            target
+            && (
+              (
+                input.expectedSourceHash !== undefined
+                && input.expectedSourceHash !== target.source_hash
+              )
+              || (
+                input.expectedRowVersion !== undefined
+                && input.expectedRowVersion !== Number(target.row_version)
+              )
+            )
+          ) {
+            throw new MockCommerceIntegrationRequestError(
+              'The held order changed before its exact provider read could begin',
+              409,
+              'COMMERCE_INTAKE_REFRESH_TARGET_CHANGED',
+            )
+          }
+          return target
         },
         async markCommerceIntakeContinuationInvalidInPostgres(input) {
           invalidContinuations.push(input)
@@ -4326,6 +4421,117 @@ try {
     4,
     'Each automatic Faire command must have a distinct deterministic receipt key',
   )
+  automaticFairePromotionTargets = [{
+    eligible: true,
+    reason: null,
+    candidateGlobalId: 'gcoc0000013',
+    candidateRowVersion: 13,
+    providerAddress: null,
+    deliveryMode: null,
+  }]
+  automaticFairePromotionFailureCode =
+    'COMMERCE_INTAKE_CANONICAL_ORDER_EXISTS'
+  const concurrentCanonicalFetch = await service.executeCommerceIntakeCommand({
+    organizationId,
+    actorEmail,
+    body: {
+      action: 'fetch',
+      accountGlobalId: faireRuntime.globalId,
+      confirmReadOnly: true,
+      idempotencyKey: nextKey(),
+    },
+  })
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      concurrentCanonicalFetch.command.automaticFaireOrderPromotion,
+    )),
+    {
+      policyVersion: 'commerce-faire-order-auto-promotion-v1',
+      runGlobalId: concurrentCanonicalFetch.command.runGlobalId,
+      candidatesFound: 1,
+      eligible: 1,
+      promoted: 0,
+      held: 1,
+      heldByReason: { canonical_order_exists: 1 },
+      failed: 0,
+      failedByCode: {},
+      operatorReviewRequired: 0,
+      providerWrites: 0,
+      canonicalOrderWrites: 0,
+      inventoryWrites: 0,
+      syncCursorAdvanced: false,
+    },
+    'A concurrent canonical promotion must settle as a benign hold without operator attention',
+  )
+  const workerExactRefreshKey = nextKey()
+  const faireExactReadsBeforeWorkerRefresh = providerReads.faireOrder
+  const stateReadsBeforeWorkerRefresh = stateReads.length
+  const workerExactRefreshInput = {
+    organizationId,
+    accountGlobalId: faireRuntime.globalId,
+    actorEmail: 'system:commerce-order-reconciliation',
+    idempotencyKey: workerExactRefreshKey,
+    candidateGlobalId: 'gcoc0000020',
+    candidateRowVersion: 7,
+    sourceHash: '9'.repeat(64),
+  }
+  const workerExactRefresh =
+    await service.executeCommerceFaireOrderExactRefresh(
+      workerExactRefreshInput,
+    )
+  assert.equal(workerExactRefresh.command.action, 'refresh')
+  assert.equal(workerExactRefresh.intake, null)
+  assert.equal(
+    providerReads.faireOrder,
+    faireExactReadsBeforeWorkerRefresh + 1,
+    'The worker wrapper performs exactly one targeted Faire GET',
+  )
+  assert.equal(
+    stateReads.length,
+    stateReadsBeforeWorkerRefresh,
+    'The worker wrapper must not hydrate retained browser intake state',
+  )
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(refreshTargetReads.at(-1))),
+    {
+      organizationId,
+      accountGlobalId: faireRuntime.globalId,
+      candidateGlobalId: 'gcoc0000020',
+      expectedSourceHash: '9'.repeat(64),
+      expectedRowVersion: 7,
+    },
+    'The selected row version and source hash fence the provider read',
+  )
+  assert.equal(
+    providerReservations.find(
+      (reservation) => reservation.idempotencyKey === workerExactRefreshKey,
+    )?.providerAttemptActorEmail,
+    null,
+    'An unattended exact read never borrows a human provider-attempt actor',
+  )
+  const replayedWorkerExactRefresh =
+    await service.executeCommerceFaireOrderExactRefresh(
+      workerExactRefreshInput,
+    )
+  assert.equal(replayedWorkerExactRefresh.command.replayed, true)
+  assert.equal(
+    providerReads.faireOrder,
+    faireExactReadsBeforeWorkerRefresh + 1,
+    'A deterministic exact-refresh replay must not issue a second provider GET',
+  )
+  await assert.rejects(
+    service.executeCommerceFaireOrderExactRefresh({
+      ...workerExactRefreshInput,
+      idempotencyKey: nextKey(),
+      candidateRowVersion: 8,
+    }),
+    (error) => error.code === 'COMMERCE_INTAKE_REFRESH_TARGET_CHANGED',
+  )
+  assert.equal(
+    providerReads.faireOrder,
+    faireExactReadsBeforeWorkerRefresh + 1,
+    'Source concurrency drift must fail before provider I/O',
+  )
   await assert.rejects(
     service.executeCommerceIntakeCommand({
       organizationId,
@@ -4401,9 +4607,9 @@ try {
     shopifyGraphql: 9,
     faireProducts: 2,
     faireInventory: 3,
-    faireOrders: 3,
-    faireOrder: 2,
-    faireProfile: 7,
+    faireOrders: 4,
+    faireOrder: 3,
+    faireProfile: 9,
   })
   assert.equal(normalizedSources.shopify.data.products.nodes.length, 0)
   assert.equal(normalizedSources.shopify.data.orders.nodes.length, 1)
@@ -4431,8 +4637,8 @@ try {
       .available_quantity.quantity,
     -2,
   )
-  assert.equal(providerAttempts.length, 14)
-  assert.equal(providerReservations.length, 17)
+  assert.equal(providerAttempts.length, 16)
+  assert.equal(providerReservations.length, 19)
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'faire'
@@ -4447,9 +4653,9 @@ try {
     )),
     'Shopify provider-attempt evidence must record its current normalizer',
   )
-  assert.equal(capturedReads.size, 14)
+  assert.equal(capturedReads.size, 16)
   assert.equal(uncertainReads.length, 0)
-  assert.equal(stageAttempts.length, 17)
+  assert.equal(stageAttempts.length, 19)
   for (const attempt of providerAttempts) {
     assert.equal(attempt.action, 'commerce.intake.read')
     assert.equal(attempt.redactedRequest.readOnly, true)
@@ -4458,7 +4664,7 @@ try {
   }
   assert.equal(
     persistenceCommands.filter(({ name }) => name === 'stage-envelope').length,
-    14,
+    16,
   )
   const staged = persistenceCommands.filter(
     ({ name }) => name === 'stage-envelope',
@@ -4502,6 +4708,8 @@ try {
       'refresh',
       'fetch',
       'fetch',
+      'fetch',
+      'refresh',
       'retry-rejection',
       'retry-rejection',
     ],
@@ -4513,10 +4721,11 @@ try {
   assert.equal(staged[2].input.page.resource, 'products')
   assert.equal(staged[3].input.page.resource, 'products')
   assert.equal(staged[9].input.page, null)
-  assert.equal(staged[12].input.page, null)
   assert.equal(staged[13].input.page, null)
+  assert.equal(staged[14].input.page, null)
+  assert.equal(staged[15].input.page, null)
   assert.equal(
-    staged[13].input.envelope.orders[0].identity.value,
+    staged[15].input.envelope.orders[0].identity.value,
     'faire-order-rejected-1',
     'Faire exact-order retry must stage the identity read by getFaireOrder',
   )
@@ -4787,9 +4996,9 @@ try {
     shopifyGraphql: 9,
     faireProducts: 2,
     faireInventory: 3,
-    faireOrders: 3,
-    faireOrder: 2,
-    faireProfile: 7,
+    faireOrders: 4,
+    faireOrder: 3,
+    faireProfile: 9,
   }, 'Resolution, validation, and promotion must not call providers')
   const readsBeforeExactPackBinding = { ...providerReads }
   const stagesBeforeExactPackBinding = stageAttempts.length

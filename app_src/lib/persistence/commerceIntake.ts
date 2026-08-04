@@ -2133,6 +2133,25 @@ LEFT JOIN operations_product_mappings mapping
  AND mapping.id = candidate.product_mapping_id
  AND mapping.product_id = candidate.product_id`
 
+async function lockCommerceOrderIdentity(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    integrationAccountId: string
+    externalOrderId: string
+  },
+) {
+  await client.query(
+    `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`,
+    [[
+      'commerce-intake-order-identity-v1',
+      input.organizationId,
+      input.integrationAccountId,
+      input.externalOrderId,
+    ].join(':')],
+  )
+}
+
 async function lockCandidate(
   client: PoolClient,
   context: CandidateCommandContext,
@@ -2938,6 +2957,8 @@ export async function readCommerceIntakeRefreshTargetFromPostgres(input: {
   organizationId: string
   accountGlobalId: string
   candidateGlobalId: string
+  expectedSourceHash?: string
+  expectedRowVersion?: number
 }) {
   return withTransaction(async (client) => {
     const account = await resolveAccount(client, {
@@ -2948,9 +2969,10 @@ export async function readCommerceIntakeRefreshTargetFromPostgres(input: {
       external_order_id: string
       source_hash: string
       provider: 'shopify' | 'faire'
+      row_version: string
     }>(
       `SELECT candidate.external_order_id, candidate.source_hash,
-              candidate.provider
+              candidate.provider, candidate.row_version::text
        FROM operations_commerce_order_candidates candidate
        WHERE candidate.organization_id = $1::uuid
          AND candidate.integration_account_id = $2::uuid
@@ -2967,7 +2989,249 @@ export async function readCommerceIntakeRefreshTargetFromPostgres(input: {
         404,
       )
     }
-    return result.rows[0]
+    const target = result.rows[0]
+    if (
+      (
+        input.expectedSourceHash !== undefined
+        && target.source_hash !== input.expectedSourceHash
+      )
+      || (
+        input.expectedRowVersion !== undefined
+        && Number(target.row_version) !== input.expectedRowVersion
+      )
+    ) {
+      intakeError(
+        'COMMERCE_INTAKE_REFRESH_TARGET_CHANGED',
+        'The held order changed before its exact provider read could begin. A later reconciliation will use the current revision.',
+        409,
+      )
+    }
+    return target
+  })
+}
+
+export type AutomaticFaireExactRefreshTarget = {
+  candidateGlobalId: string
+  candidateRowVersion: number
+  sourceHash: string
+  originatingRunGlobalId: string
+}
+
+/**
+ * Uses worker-created stale Faire list candidates as a durable exact-read
+ * queue. The preferred run only affects ordering: account-wide selection
+ * ensures an invocation budget or worker crash cannot strand row N+1.
+ * Browser-created candidates, operator-touched candidates, canonical orders,
+ * and candidates owned by a human exact-read attempt remain outside this path.
+ * System intents remain selectable so prepared/captured work recovers and a
+ * staged exact rejection or uncertain outcome keeps durable operator attention
+ * without issuing a second provider request.
+ */
+export async function readAutomaticFaireExactRefreshTargetsInPostgres(input: {
+  runtime: Pick<
+    CommerceRuntimeCredentialRecord,
+    'organizationId' | 'globalId' | 'provider' | 'credentialVersion'
+  >
+  preferredRunGlobalId: string
+  limit: number
+  excludedCandidateGlobalIds?: readonly string[]
+}) {
+  return withTransaction(async (client) => {
+    const account = await resolveAccount(client, {
+      organizationId: input.runtime.organizationId,
+      accountGlobalId: input.runtime.globalId,
+    })
+    if (
+      account.provider !== 'faire'
+      || account.credential_version !== input.runtime.credentialVersion
+    ) return []
+    const limit = Math.max(1, Math.min(Number(input.limit || 1), 25))
+    const selected = await client.query<{
+      global_id: string
+      row_version: string
+      source_hash: string
+      run_global_id: string
+    }>(
+      `WITH anchor AS (
+         SELECT run.id
+         FROM operations_commerce_intake_runs run
+         JOIN operations_commerce_intake_read_intents intent
+           ON intent.organization_id = run.organization_id
+          AND intent.integration_account_id = run.integration_account_id
+          AND intent.staged_run_id = run.id
+          AND intent.intent_state = 'staged'
+          AND intent.intake_action IN ('fetch', 'fetch-next')
+          AND intent.target_kind IN ('none', 'continuation')
+          AND intent.created_by = 'system:commerce-order-reconciliation'
+         WHERE run.organization_id = $1::uuid
+           AND run.integration_account_id = $2::uuid
+           AND run.global_id = $3
+           AND run.provider = 'faire'
+           AND run.resource = 'products_and_orders'
+           AND run.credential_version = $4::integer
+           AND run.created_by = 'system:commerce-order-reconciliation'
+           AND run.expires_at > now()
+           AND run.workflow_state <> 'expired'
+         LIMIT 1
+       )
+       SELECT candidate.global_id, candidate.row_version::text,
+              candidate.source_hash, run.global_id AS run_global_id
+       FROM anchor
+       JOIN operations_commerce_order_candidates candidate
+         ON candidate.organization_id = $1::uuid
+        AND candidate.integration_account_id = $2::uuid
+       JOIN operations_commerce_intake_runs run
+         ON run.organization_id = candidate.organization_id
+        AND run.integration_account_id = candidate.integration_account_id
+        AND run.pipeline_id = candidate.pipeline_id
+        AND run.id = candidate.run_id
+       JOIN operations_commerce_intake_read_intents discovery_intent
+         ON discovery_intent.organization_id = run.organization_id
+        AND discovery_intent.integration_account_id = run.integration_account_id
+        AND discovery_intent.staged_run_id = run.id
+        AND discovery_intent.intent_state = 'staged'
+        AND discovery_intent.intake_action IN ('fetch', 'fetch-next')
+        AND discovery_intent.target_kind IN ('none', 'continuation')
+        AND discovery_intent.created_by
+            = 'system:commerce-order-reconciliation'
+       WHERE candidate.provider = 'faire'
+         AND candidate.created_by = 'system:commerce-order-reconciliation'
+         AND candidate.expires_at > now()
+         AND candidate.workflow_state IN ('held', 'resolving', 'ready')
+         AND candidate.canonical_order_id IS NULL
+         AND candidate.normalized_order_status <> 'cancelled'
+         AND candidate.normalized_fulfillment_status NOT IN (
+           'fulfilled', 'cancelled'
+         )
+         AND 'source_stale' = ANY(candidate.blocking_codes)
+         AND run.provider = 'faire'
+         AND run.resource = 'products_and_orders'
+         AND run.credential_version = $4::integer
+         AND run.created_by = 'system:commerce-order-reconciliation'
+         AND run.expires_at > now()
+         AND run.workflow_state <> 'expired'
+         AND NOT EXISTS (
+           SELECT 1
+           FROM operations_orders canonical
+           WHERE canonical.organization_id = candidate.organization_id
+             AND canonical.integration_account_id
+                 = candidate.integration_account_id
+             AND canonical.external_order_id = candidate.external_order_id
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM operations_external_identifiers external
+           WHERE external.organization_id = candidate.organization_id
+             AND external.integration_account_id
+                 = candidate.integration_account_id
+             AND external.entity_type = 'operations.order'
+             AND external.status = 'active'
+             AND external.external_id = candidate.external_order_id
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM operations_commerce_order_candidates promoted
+           WHERE promoted.organization_id = candidate.organization_id
+             AND promoted.integration_account_id
+                 = candidate.integration_account_id
+             AND promoted.external_order_id = candidate.external_order_id
+             AND (
+               promoted.workflow_state = 'promoted'
+               OR promoted.canonical_order_id IS NOT NULL
+             )
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM operations_commerce_order_candidates newer
+           WHERE newer.organization_id = candidate.organization_id
+             AND newer.integration_account_id
+                 = candidate.integration_account_id
+             AND newer.external_order_id = candidate.external_order_id
+             AND newer.id <> candidate.id
+             AND (
+               newer.observed_at > candidate.observed_at
+               OR (
+                 newer.observed_at = candidate.observed_at
+                 AND newer.created_at > candidate.created_at
+               )
+               OR (
+                 newer.observed_at = candidate.observed_at
+                 AND newer.created_at = candidate.created_at
+                 AND newer.id > candidate.id
+               )
+             )
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM operations_commerce_order_candidates history
+           WHERE history.organization_id = candidate.organization_id
+             AND history.integration_account_id
+                 = candidate.integration_account_id
+             AND history.external_order_id = candidate.external_order_id
+             AND (
+               history.created_by
+                   <> 'system:commerce-order-reconciliation'
+               OR EXISTS (
+                 SELECT 1
+                 FROM operations_commerce_resolution_decisions decision
+                 WHERE decision.organization_id = history.organization_id
+                   AND decision.target_global_id = history.global_id
+                   AND decision.actor_email
+                       <> 'system:commerce-order-reconciliation'
+               )
+               OR EXISTS (
+                 SELECT 1
+                 FROM operations_commerce_intake_read_intents exact_intent
+                 WHERE exact_intent.organization_id = history.organization_id
+                   AND exact_intent.integration_account_id
+                       = history.integration_account_id
+                   AND exact_intent.provider = 'faire'
+                   AND exact_intent.resource = 'orders'
+                   AND exact_intent.intake_action = 'refresh'
+                   AND exact_intent.target_kind = 'candidate'
+                   AND exact_intent.target_global_id = history.global_id
+                   AND exact_intent.created_by
+                       <> 'system:commerce-order-reconciliation'
+               )
+             )
+         )
+         AND NOT candidate.global_id = ANY($6::text[])
+       ORDER BY (run.global_id = $3) DESC,
+                EXISTS (
+                  SELECT 1
+                  FROM operations_commerce_intake_read_intents retry_intent
+                  WHERE retry_intent.organization_id
+                      = candidate.organization_id
+                    AND retry_intent.integration_account_id
+                      = candidate.integration_account_id
+                    AND retry_intent.provider = 'faire'
+                    AND retry_intent.resource = 'orders'
+                    AND retry_intent.intake_action = 'refresh'
+                    AND retry_intent.target_kind = 'candidate'
+                    AND retry_intent.target_global_id = candidate.global_id
+                    AND retry_intent.target_source_hash = candidate.source_hash
+                    AND retry_intent.created_by
+                      = 'system:commerce-order-reconciliation'
+                ) ASC,
+                candidate.observed_at,
+                candidate.created_at,
+                candidate.id
+       LIMIT $5::integer`,
+      [
+        account.organization_id,
+        account.id,
+        input.preferredRunGlobalId,
+        input.runtime.credentialVersion,
+        limit,
+        [...(input.excludedCandidateGlobalIds || [])],
+      ],
+    )
+    return selected.rows.map((row): AutomaticFaireExactRefreshTarget => ({
+      candidateGlobalId: row.global_id,
+      candidateRowVersion: Number(row.row_version),
+      sourceHash: row.source_hash,
+      originatingRunGlobalId: row.run_global_id,
+    }))
   })
 }
 
@@ -4895,6 +5159,25 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         409,
       )
     }
+    if (
+      (
+        input.refreshCandidateGlobalId
+        || input.retryRejectionGlobalId
+      )
+      && (
+        !readIntent?.target_external_id_hash
+        || !envelopeMatchesExactOrderTarget(
+          input.envelope,
+          readIntent.target_external_id_hash,
+        )
+      )
+    ) {
+      intakeError(
+        'COMMERCE_INTAKE_EXACT_ORDER_TARGET_MISMATCH',
+        'The exact provider read returned a different or ambiguous order identity. No provider data was staged.',
+        409,
+      )
+    }
     if (input.refreshCandidateGlobalId) {
       const refreshTarget = await client.query<{
         id: string
@@ -4934,11 +5217,17 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           409,
         )
       }
-      if (!input.envelope.orders.some(
+      const refreshTargetWasReturned = input.envelope.orders.some(
         (order) => (
           order.identity.value === refreshTarget.rows[0].external_order_id
         ),
-      )) {
+      ) || input.envelope.rejections.some(
+        (rejection) => (
+          rejection.resourceType === 'order'
+          && rejection.externalId === refreshTarget.rows[0].external_order_id
+        ),
+      )
+      if (!refreshTargetWasReturned) {
         intakeError(
           'COMMERCE_INTAKE_REFRESH_TARGET_MISSING',
           'The provider no longer returned this order. Mark the prior candidate unsupported or run a fresh eligible-order fetch',
@@ -5121,6 +5410,15 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       normalizerVersion: string
     }>()
     if (externalOrderIds.length) {
+      // Promotion uses the same per-order transaction lock. Sorting avoids a
+      // lock-order cycle when one provider page contains multiple orders.
+      for (const externalOrderId of [...externalOrderIds].sort()) {
+        await lockCommerceOrderIdentity(client, {
+          organizationId: account.organization_id,
+          integrationAccountId: account.id,
+          externalOrderId,
+        })
+      }
       const canonicalOrders = await client.query<{
         external_order_id: string
       }>(
@@ -10375,7 +10673,7 @@ type AutomaticFairePromotionTarget = {
   candidateGlobalId: string
   candidateRowVersion: number
   providerAddress: CandidateAddress | null
-  deliveryMode: 'provider' | 'default_sla' | null
+  deliveryMode: 'provider' | null
 } | {
   eligible: false
   reason: string
@@ -10444,11 +10742,13 @@ export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
     ).rows
     const targets: AutomaticFairePromotionTarget[] = []
     for (const candidate of candidates) {
-      const lines = await candidateLines(client, candidate)
-      const priorOrCanonical =
-        await client.query<{
+      const [lines, priorOrCanonical] = await Promise.all([
+        candidateLines(client, candidate),
+        client.query<{
           prior_candidate: boolean
+          unsafe_candidate_history: boolean
           canonical_order: boolean
+          exact_refresh_lineage: boolean
         }>(
           `SELECT
              EXISTS (
@@ -10462,19 +10762,199 @@ export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
              ) AS prior_candidate,
              EXISTS (
                SELECT 1
-               FROM operations_orders canonical
-               WHERE canonical.organization_id = $1::uuid
-                 AND canonical.integration_account_id = $2::uuid
-                 AND canonical.external_order_id = $3
-             ) AS canonical_order`,
+               FROM operations_commerce_order_candidates history
+               WHERE history.organization_id = $1::uuid
+                 AND history.integration_account_id = $2::uuid
+                 AND history.external_order_id = $3
+                 AND (
+                   history.created_by
+                       <> 'system:commerce-order-reconciliation'
+                   OR EXISTS (
+                     SELECT 1
+                     FROM operations_commerce_resolution_decisions decision
+                     WHERE decision.organization_id = history.organization_id
+                       AND decision.target_global_id = history.global_id
+                       AND decision.actor_email
+                           <> 'system:commerce-order-reconciliation'
+                   )
+                   OR EXISTS (
+                     SELECT 1
+                     FROM operations_commerce_intake_read_intents
+                       human_exact_intent
+                     WHERE human_exact_intent.organization_id
+                         = history.organization_id
+                       AND human_exact_intent.integration_account_id
+                           = history.integration_account_id
+                       AND human_exact_intent.provider = 'faire'
+                       AND human_exact_intent.resource = 'orders'
+                       AND human_exact_intent.intake_action = 'refresh'
+                       AND human_exact_intent.target_kind = 'candidate'
+                       AND human_exact_intent.target_global_id
+                           = history.global_id
+                       AND human_exact_intent.created_by
+                           <> 'system:commerce-order-reconciliation'
+                   )
+                 )
+             ) AS unsafe_candidate_history,
+             (
+               EXISTS (
+                 SELECT 1
+                 FROM operations_orders canonical
+                 WHERE canonical.organization_id = $1::uuid
+                   AND canonical.integration_account_id = $2::uuid
+                   AND canonical.external_order_id = $3
+               )
+               OR EXISTS (
+                 SELECT 1
+                 FROM operations_external_identifiers external
+                 WHERE external.organization_id = $1::uuid
+                   AND external.integration_account_id = $2::uuid
+                   AND external.entity_type = 'operations.order'
+                   AND external.status = 'active'
+                   AND external.external_id = $3
+               )
+               OR EXISTS (
+                 SELECT 1
+                 FROM operations_commerce_order_candidates promoted
+                 WHERE promoted.organization_id = $1::uuid
+                   AND promoted.integration_account_id = $2::uuid
+                   AND promoted.external_order_id = $3
+                   AND (
+                     promoted.workflow_state = 'promoted'
+                     OR promoted.canonical_order_id IS NOT NULL
+                   )
+               )
+             ) AS canonical_order,
+             EXISTS (
+               SELECT 1
+               FROM operations_commerce_intake_read_intents exact_intent
+               JOIN operations_commerce_intake_runs exact_run
+                 ON exact_run.organization_id = exact_intent.organization_id
+                AND exact_run.integration_account_id
+                    = exact_intent.integration_account_id
+                AND exact_run.id = exact_intent.staged_run_id
+               JOIN operations_commerce_order_candidates prior
+                 ON prior.organization_id = exact_intent.organization_id
+                AND prior.integration_account_id
+                    = exact_intent.integration_account_id
+                AND prior.global_id = exact_intent.target_global_id
+                AND prior.source_hash = exact_intent.target_source_hash
+               JOIN operations_commerce_intake_runs prior_run
+                 ON prior_run.organization_id = prior.organization_id
+                AND prior_run.integration_account_id
+                    = prior.integration_account_id
+                AND prior_run.pipeline_id = prior.pipeline_id
+                AND prior_run.id = prior.run_id
+               JOIN operations_commerce_intake_read_intents discovery_intent
+                 ON discovery_intent.organization_id
+                    = prior_run.organization_id
+                AND discovery_intent.integration_account_id
+                    = prior_run.integration_account_id
+                AND discovery_intent.staged_run_id = prior_run.id
+                AND discovery_intent.intent_state = 'staged'
+                AND discovery_intent.intake_action IN ('fetch', 'fetch-next')
+                AND discovery_intent.target_kind IN ('none', 'continuation')
+                AND discovery_intent.created_by
+                    = 'system:commerce-order-reconciliation'
+               WHERE exact_intent.organization_id = $1::uuid
+                 AND exact_intent.integration_account_id = $2::uuid
+                 AND exact_intent.staged_run_id = $5::uuid
+                 AND exact_intent.provider = 'faire'
+                 AND exact_intent.resource = 'orders'
+                 AND exact_intent.credential_version = $6::integer
+                 AND exact_intent.intake_action = 'refresh'
+                 AND exact_intent.target_kind = 'candidate'
+                 AND exact_intent.intent_state = 'staged'
+                 AND exact_intent.created_by
+                     = 'system:commerce-order-reconciliation'
+                 AND exact_run.provider = 'faire'
+                 AND exact_run.resource = 'products_and_orders'
+                 AND exact_run.credential_version = $6::integer
+                 AND exact_run.created_by
+                     = 'system:commerce-order-reconciliation'
+                 AND prior.external_order_id = $3
+                 AND prior.id <> $4::uuid
+                 AND prior.provider = 'faire'
+                 AND prior.created_by
+                     = 'system:commerce-order-reconciliation'
+                 AND prior.workflow_state IN ('held', 'resolving', 'ready')
+                 AND 'source_stale' = ANY(prior.blocking_codes)
+                 AND prior_run.provider = 'faire'
+                 AND prior_run.resource = 'products_and_orders'
+                 AND prior_run.credential_version = $6::integer
+                 AND prior_run.created_by
+                     = 'system:commerce-order-reconciliation'
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM operations_commerce_order_candidates history
+                   WHERE history.organization_id = prior.organization_id
+                     AND history.integration_account_id
+                         = prior.integration_account_id
+                     AND history.external_order_id = prior.external_order_id
+                     AND (
+                       history.created_by
+                           <> 'system:commerce-order-reconciliation'
+                       OR EXISTS (
+                         SELECT 1
+                         FROM operations_commerce_resolution_decisions decision
+                         WHERE decision.organization_id
+                             = history.organization_id
+                           AND decision.target_global_id = history.global_id
+                           AND decision.actor_email
+                               <> 'system:commerce-order-reconciliation'
+                       )
+                       OR EXISTS (
+                         SELECT 1
+                         FROM operations_commerce_intake_read_intents
+                           human_exact_intent
+                         WHERE human_exact_intent.organization_id
+                             = history.organization_id
+                           AND human_exact_intent.integration_account_id
+                               = history.integration_account_id
+                           AND human_exact_intent.provider = 'faire'
+                           AND human_exact_intent.resource = 'orders'
+                           AND human_exact_intent.intake_action = 'refresh'
+                           AND human_exact_intent.target_kind = 'candidate'
+                           AND human_exact_intent.target_global_id
+                               = history.global_id
+                           AND human_exact_intent.created_by
+                               <> 'system:commerce-order-reconciliation'
+                       )
+                     )
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM operations_commerce_order_candidates newer_prior
+                   WHERE newer_prior.organization_id = prior.organization_id
+                     AND newer_prior.integration_account_id
+                         = prior.integration_account_id
+                     AND newer_prior.external_order_id
+                         = prior.external_order_id
+                     AND newer_prior.id NOT IN (prior.id, $4::uuid)
+                     AND (
+                       newer_prior.observed_at > prior.observed_at
+                       OR (
+                         newer_prior.observed_at = prior.observed_at
+                         AND newer_prior.created_at > prior.created_at
+                       )
+                       OR (
+                         newer_prior.observed_at = prior.observed_at
+                         AND newer_prior.created_at = prior.created_at
+                         AND newer_prior.id > prior.id
+                       )
+                     )
+                 )
+             ) AS exact_refresh_lineage`,
           [
             candidate.organization_id,
             candidate.integration_account_id,
             candidate.external_order_id,
             candidate.id,
             candidate.run_id,
+            input.runtime.credentialVersion,
           ],
-        )
+        ),
+      ])
       if (priorOrCanonical.rows[0]?.canonical_order) {
         targets.push(heldAutomaticFairePromotionTarget(
           candidate,
@@ -10482,7 +10962,36 @@ export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
         ))
         continue
       }
-      if (priorOrCanonical.rows[0]?.prior_candidate) {
+      if (
+        candidate.normalized_order_status === 'cancelled'
+        || ['fulfilled', 'cancelled'].includes(
+          candidate.normalized_fulfillment_status,
+        )
+      ) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'order_terminal_no_demand',
+        ))
+        continue
+      }
+      if (priorOrCanonical.rows[0]?.unsafe_candidate_history) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'prior_candidate_requires_review',
+        ))
+        continue
+      }
+      if (candidate.blocking_codes.includes('source_stale')) {
+        targets.push(heldAutomaticFairePromotionTarget(
+          candidate,
+          'exact_refresh_required',
+        ))
+        continue
+      }
+      if (
+        priorOrCanonical.rows[0]?.prior_candidate
+        && !priorOrCanonical.rows[0]?.exact_refresh_lineage
+      ) {
         targets.push(heldAutomaticFairePromotionTarget(
           candidate,
           'prior_candidate_requires_review',
@@ -10646,13 +11155,11 @@ export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
           continue
         }
       }
-      let deliveryMode: 'provider' | 'default_sla' | null = null
+      let deliveryMode: 'provider' | null = null
       if (requiresShipping && candidate.delivery_resolution_state === 'unresolved') {
         deliveryMode = candidate.provider_requested_delivery_at
           ? 'provider'
-          : candidate.provider_created_at
-            ? 'default_sla'
-            : null
+          : null
         if (!deliveryMode) {
           targets.push(heldAutomaticFairePromotionTarget(
             candidate,
@@ -12350,6 +12857,11 @@ export async function promoteCommerceCandidateInPostgres(input: {
       })
     }
     const candidate = await lockCandidate(client, input)
+    await lockCommerceOrderIdentity(client, {
+      organizationId: candidate.organization_id,
+      integrationAccountId: candidate.integration_account_id,
+      externalOrderId: candidate.external_order_id,
+    })
     const lines = await candidateLines(client, candidate, true)
     const operationalLines = lines.filter((line) => (
       Number(line.unfulfilled_quantity) > 0
@@ -12439,23 +12951,35 @@ export async function promoteCommerceCandidateInPostgres(input: {
     const newerSource = await client.query<{ global_id: string }>(
       `SELECT newer.global_id
        FROM operations_commerce_order_candidates newer
+       JOIN operations_commerce_order_candidates current
+         ON current.id = $4::uuid
        WHERE newer.organization_id = $1::uuid
          AND newer.integration_account_id = $2::uuid
          AND newer.external_order_id = $3
          AND newer.id <> $4::uuid
-         AND newer.observed_at > $5::timestamptz
          AND (
-           newer.source_hash <> $6
-           OR newer.source_revision <> $7
+           newer.observed_at > current.observed_at
+           OR (
+             newer.observed_at = current.observed_at
+             AND newer.created_at > current.created_at
+           )
+           OR (
+             newer.observed_at = current.observed_at
+             AND newer.created_at = current.created_at
+             AND newer.id > current.id
+           )
          )
-       ORDER BY newer.observed_at DESC
+         AND (
+           newer.source_hash <> $5
+           OR newer.source_revision <> $6
+         )
+       ORDER BY newer.observed_at DESC, newer.created_at DESC, newer.id DESC
        LIMIT 1`,
       [
         candidate.organization_id,
         candidate.integration_account_id,
         candidate.external_order_id,
         candidate.id,
-        iso(candidate.observed_at),
         candidate.source_hash,
         candidate.source_revision,
       ],
@@ -12829,13 +13353,24 @@ export async function promoteCommerceCandidateInPostgres(input: {
       }
     }
     const duplicate = await client.query<{ global_id: string }>(
-      `SELECT global_id
-       FROM operations_orders
-       WHERE organization_id = $1::uuid
-         AND integration_account_id = $2::uuid
-         AND external_order_id = $3
-       LIMIT 1
-       FOR UPDATE`,
+      `WITH canonical_identity AS (
+         SELECT canonical.global_id
+         FROM operations_orders canonical
+         WHERE canonical.organization_id = $1::uuid
+           AND canonical.integration_account_id = $2::uuid
+           AND canonical.external_order_id = $3
+         UNION ALL
+         SELECT external.entity_global_id AS global_id
+         FROM operations_external_identifiers external
+         WHERE external.organization_id = $1::uuid
+           AND external.integration_account_id = $2::uuid
+           AND external.entity_type = 'operations.order'
+           AND external.status = 'active'
+           AND external.external_id = $3
+       )
+       SELECT global_id
+       FROM canonical_identity
+       LIMIT 1`,
       [
         candidate.organization_id,
         candidate.integration_account_id,

@@ -48,6 +48,13 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
     ...globals,
     require(specifier) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) return mocks[specifier]
+      if (specifier === '@/lib/persistence/commerceIntake') {
+        return {
+          async readAutomaticFaireExactRefreshTargetsInPostgres() {
+            return []
+          },
+        }
+      }
       if (specifier === '@/lib/integrations/commerceIntegrations') {
         return {
           CommerceIntegrationRequestError: class CommerceIntegrationRequestError extends Error {
@@ -817,6 +824,15 @@ includes(workerSource, [
   "'CLAWPILOT_COMMERCE_ORDER_MAX_SESSION_RECORDS'",
   '100_000',
   'MAX_RECONCILIATION_RUNTIME_MS = 180_000',
+  'MIN_REMAINING_RUNTIME_FOR_EXACT_REFRESH_MS = 15_000',
+  "'CLAWPILOT_COMMERCE_ORDER_MAX_FAIRE_EXACT_REFRESHES'",
+  'deterministicFaireExactRefreshUuid',
+  'readAutomaticFaireExactRefreshTargetsInPostgres',
+  'targetFaireExactRefreshAttemptedCandidates',
+  'excludedCandidateGlobalIds',
+  'executeCommerceFaireOrderExactRefresh',
+  'assertReconciliationFence(exactCommand)',
+  "budgetStopReason = 'exact-refresh'",
   'COMMERCE_ORDER_RECONCILIATION_CONTINUATION_REPEATED',
   'COMMERCE_ORDER_RECONCILIATION_PROVIDER_CURSOR_REPEATED',
   'COMMERCE_ORDER_RECONCILIATION_PAGE_SEQUENCE_INVALID',
@@ -986,6 +1002,7 @@ const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWork
                 held: 1,
                 failed: 0,
                 failedByCode: {},
+                operatorReviewRequired: 1,
                 providerWrites: 0,
                 canonicalOrderWrites: 1,
                 inventoryWrites: 0,
@@ -1029,6 +1046,7 @@ const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWork
               failedByCode: {
                 COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_FAILED: 1,
               },
+              operatorReviewRequired: 2,
               providerWrites: 0,
               canonicalOrderWrites: 0,
               inventoryWrites: 0,
@@ -1365,6 +1383,218 @@ assert.equal(recoveredTrace.failed, 0)
 assert.equal(recovered.staged, 1)
 assert.equal(recovered.providerWrites, 0)
 
+const priorExactRefreshLimit =
+  process.env.CLAWPILOT_COMMERCE_ORDER_MAX_FAIRE_EXACT_REFRESHES
+process.env.CLAWPILOT_COMMERCE_ORDER_MAX_FAIRE_EXACT_REFRESHES = '2'
+const exactRefreshTrace = {
+  listPages: 0,
+  selections: [],
+  reads: [],
+  complete: [],
+  failed: 0,
+}
+const exactRefreshWorker = loadTypeScriptModule(
+  'app_src/lib/commerceOrderReconciliationWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceIntake': {
+        commerceIntakeRuntimeAvailable: () => true,
+        async executeCommerceOrderPage() {
+          exactRefreshTrace.listPages += 1
+          return {
+            command: {
+              providerWrites: 0,
+              syncCursorAdvanced: false,
+              ordersStaged: 2,
+              recordsRejected: 0,
+              automaticFaireOrderPromotion: {
+                promoted: 0,
+                held: 2,
+                failed: 0,
+                failedByCode: {},
+                operatorReviewRequired: 0,
+                providerWrites: 0,
+                canonicalOrderWrites: 0,
+                inventoryWrites: 0,
+                syncCursorAdvanced: false,
+              },
+              pagination: {
+                batchNumber: 1,
+                runGlobalId: 'gcir0000201',
+                providerRowsSeen: 2,
+                hasNextBatch: true,
+                continuationRunGlobalId: 'gcir0000201',
+              },
+            },
+          }
+        },
+        async executeCommerceFaireOrderExactRefresh(input) {
+          exactRefreshTrace.reads.push(input)
+          if (input.candidateGlobalId === 'gcoc0000102') {
+            return {
+              command: {
+                providerWrites: 0,
+                syncCursorAdvanced: false,
+                ordersStaged: 0,
+                recordsRejected: 1,
+              },
+            }
+          }
+          return {
+            command: {
+              providerWrites: 0,
+              syncCursorAdvanced: false,
+              ordersStaged: 1,
+              recordsRejected: 0,
+              automaticCustomerResolution: {
+                matched: 1,
+                created: 0,
+                ambiguous: 0,
+                skipped: 0,
+                failed: 0,
+                failedByCode: {},
+                providerWrites: 0,
+                syncCursorAdvanced: false,
+              },
+              automaticFaireOrderPromotion: {
+                promoted: 1,
+                held: 0,
+                failed: 0,
+                failedByCode: {},
+                operatorReviewRequired: 0,
+                providerWrites: 0,
+                canonicalOrderWrites: 1,
+                inventoryWrites: 0,
+                syncCursorAdvanced: false,
+              },
+            },
+          }
+        },
+      },
+      '@/lib/persistence/commerceIntake': {
+        async readAutomaticFaireExactRefreshTargetsInPostgres(input) {
+          exactRefreshTrace.selections.push(input)
+          return [
+            {
+              candidateGlobalId: 'gcoc0000101',
+              candidateRowVersion: 4,
+              sourceHash: 'a'.repeat(64),
+              originatingRunGlobalId: 'gcir0000201',
+            },
+            {
+              candidateGlobalId: 'gcoc0000102',
+              candidateRowVersion: 5,
+              sourceHash: 'b'.repeat(64),
+              originatingRunGlobalId: 'gcir0000201',
+            },
+            {
+              candidateGlobalId: 'gcoc0000103',
+              candidateRowVersion: 6,
+              sourceHash: 'c'.repeat(64),
+              originatingRunGlobalId: 'gcir0000100',
+            },
+          ].slice(0, input.limit)
+        },
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async claimCommerceOrderReconciliationTargetsInPostgres() {
+          return [{
+            ...failureTarget,
+            provider: 'faire',
+            accountGlobalId: 'gca0000201',
+            continuationBatchNumber: null,
+            continuationRunGlobalId: null,
+            continuationIdempotencyKey: null,
+          }]
+        },
+        async completeCommerceOrderReconciliationInPostgres(input) {
+          exactRefreshTrace.complete.push(input)
+          return { leaseLost: false }
+        },
+        async projectCommerceOrderReconciliationPageInPostgres({ target }) {
+          return {
+            leaseLost: false,
+            startedAt: new Date(
+              Date.parse(target.startedAt) + 1_000,
+            ).toISOString(),
+            recordsSeen: 2,
+            recordsHeld: 2,
+            continuationBatchNumber: 1,
+            providerCursorRepeated: false,
+          }
+        },
+        async failCommerceOrderReconciliationInPostgres() {
+          exactRefreshTrace.failed += 1
+          return {
+            leaseLost: false,
+            errorCode: 'COMMERCE_ORDER_RECONCILIATION_FAILED',
+          }
+        },
+      },
+    },
+  },
+)
+if (priorExactRefreshLimit === undefined) {
+  delete process.env.CLAWPILOT_COMMERCE_ORDER_MAX_FAIRE_EXACT_REFRESHES
+} else {
+  process.env.CLAWPILOT_COMMERCE_ORDER_MAX_FAIRE_EXACT_REFRESHES =
+    priorExactRefreshLimit
+}
+const exactRefreshSummary = await exactRefreshWorker
+  .processCommerceOrderReconciliation({ limit: 1 })
+assert.equal(exactRefreshTrace.listPages, 1)
+assert.equal(exactRefreshTrace.failed, 0)
+assert.equal(exactRefreshTrace.selections.length, 1)
+assert.equal(exactRefreshTrace.selections[0].preferredRunGlobalId, 'gcir0000201')
+assert.equal(exactRefreshTrace.selections[0].limit, 2)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    exactRefreshTrace.selections[0].excludedCandidateGlobalIds,
+  )),
+  [],
+)
+assert.deepEqual(
+  exactRefreshTrace.reads.map((read) => read.candidateGlobalId),
+  ['gcoc0000101', 'gcoc0000102'],
+  'The count budget must process current-run targets before retained backlog',
+)
+assert.equal(new Set(
+  exactRefreshTrace.reads.map((read) => read.idempotencyKey),
+).size, 2)
+for (const read of exactRefreshTrace.reads) {
+  assert.match(
+    read.idempotencyKey,
+    /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+  )
+  assert.equal(read.actorEmail, 'system:commerce-order-reconciliation')
+}
+assert.deepEqual(
+  JSON.parse(JSON.stringify(exactRefreshSummary.automaticFaireExactRefresh)),
+  {
+    attempted: 2,
+    succeeded: 1,
+    rejected: 1,
+    failed: 0,
+    failedByCode: {
+      COMMERCE_FAIRE_EXACT_REFRESH_NORMALIZATION_REJECTED: 1,
+    },
+    operatorReviewRequired: 1,
+    providerWrites: 0,
+    inventoryWrites: 0,
+    syncCursorAdvanced: false,
+  },
+)
+assert.equal(exactRefreshSummary.canonicalOrderWrites, 1)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(exactRefreshSummary.budgetStops)),
+  { pages: 0, records: 0, time: 0, exactRefreshes: 1 },
+)
+assert.equal(exactRefreshSummary.resumable, 1)
+assert.equal(exactRefreshTrace.complete[0].faireOperatorReviewRequired, 1)
+assert.equal(exactRefreshTrace.complete[0].faireExactRefreshAttempted, 2)
+assert.equal(exactRefreshTrace.complete[0].faireExactRefreshRejected, 1)
+assert.equal(exactRefreshTrace.complete[0].hasNextBatch, true)
+
 const boundedTrace = { pages: 0, complete: [], failed: [] }
 const boundedWorker = loadTypeScriptModule(
   'app_src/lib/commerceOrderReconciliationWorker.ts',
@@ -1431,7 +1661,7 @@ assert.equal(boundedSummary.pagesRead, 5)
 assert.equal(boundedSummary.resumable, 1)
 assert.deepEqual(
   JSON.parse(JSON.stringify(boundedSummary.budgetStops)),
-  { pages: 1, records: 0, time: 0 },
+  { pages: 1, records: 0, time: 0, exactRefreshes: 0 },
   'A long chain must yield its encrypted continuation at the page budget',
 )
 
@@ -1495,7 +1725,7 @@ assert.equal(timeTrace.pages, 1)
 assert.equal(timeTrace.complete[0].hasNextBatch, true)
 assert.deepEqual(
   JSON.parse(JSON.stringify(timeSummary.budgetStops)),
-  { pages: 0, records: 0, time: 1 },
+  { pages: 0, records: 0, time: 1, exactRefreshes: 0 },
   'A near-deadline worker must persist its continuation without another read',
 )
 

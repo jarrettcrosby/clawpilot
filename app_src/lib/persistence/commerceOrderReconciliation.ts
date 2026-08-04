@@ -748,6 +748,12 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
   faireOrdersHeld: unknown
   fairePromotionFailed: unknown
   fairePromotionFailureCodes: Record<string, number>
+  faireOperatorReviewRequired: unknown
+  faireExactRefreshAttempted: unknown
+  faireExactRefreshSucceeded: unknown
+  faireExactRefreshRejected: unknown
+  faireExactRefreshFailed: unknown
+  faireExactRefreshFailureCodes: Record<string, number>
 }) {
   return withTransaction(async (client) => {
     const providerRecordsSeen = boundedCount(input.providerRecordsSeen)
@@ -778,6 +784,22 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
     const faireOrdersPromoted = boundedCount(input.faireOrdersPromoted)
     const faireOrdersHeld = boundedCount(input.faireOrdersHeld)
     const fairePromotionFailed = boundedCount(input.fairePromotionFailed)
+    const faireOperatorReviewRequired = input.faireOperatorReviewRequired
+      === undefined
+      ? fairePromotionFailed
+      : boundedCount(input.faireOperatorReviewRequired)
+    const faireExactRefreshAttempted = boundedCount(
+      input.faireExactRefreshAttempted,
+    )
+    const faireExactRefreshSucceeded = boundedCount(
+      input.faireExactRefreshSucceeded,
+    )
+    const faireExactRefreshRejected = boundedCount(
+      input.faireExactRefreshRejected,
+    )
+    const faireExactRefreshFailed = boundedCount(
+      input.faireExactRefreshFailed,
+    )
     const customerResolutionFailureCodes = Object.fromEntries(
       Object.entries(input.customerResolutionFailureCodes)
         .filter(([code]) => /^[A-Z][A-Z0-9_]{2,127}$/u.test(code))
@@ -795,6 +817,11 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
     )
     const shopifyPromotionFailureCodes = Object.fromEntries(
       Object.entries(input.shopifyPromotionFailureCodes || {})
+        .filter(([code]) => /^[A-Z][A-Z0-9_]{2,127}$/u.test(code))
+        .map(([code, value]) => [code, boundedCount(value)]),
+    )
+    const faireExactRefreshFailureCodes = Object.fromEntries(
+      Object.entries(input.faireExactRefreshFailureCodes || {})
         .filter(([code]) => /^[A-Z][A-Z0-9_]{2,127}$/u.test(code))
         .map(([code, value]) => [code, boundedCount(value)]),
     )
@@ -871,7 +898,7 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
         input.hasNextBatch,
         shopifyOrdersPromoted + faireOrdersPromoted,
         shopifyPromotionAttentionRequired,
-        fairePromotionFailed,
+        faireOperatorReviewRequired,
         Boolean(input.target.continuationRunGlobalId),
         input.target.provider,
       ],
@@ -913,7 +940,21 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
           held: faireOrdersHeld,
           failed: fairePromotionFailed,
           failedByCode: fairePromotionFailureCodes,
-          operatorReviewRequired: faireOrdersHeld + fairePromotionFailed,
+          operatorReviewRequired: Math.max(
+            faireOperatorReviewRequired
+              - faireExactRefreshRejected
+              - faireExactRefreshFailed,
+            0,
+          ),
+        },
+        automaticFaireExactRefresh: {
+          attempted: faireExactRefreshAttempted,
+          succeeded: faireExactRefreshSucceeded,
+          rejected: faireExactRefreshRejected,
+          failed: faireExactRefreshFailed,
+          failedByCode: faireExactRefreshFailureCodes,
+          operatorReviewRequired:
+            faireExactRefreshRejected + faireExactRefreshFailed,
         },
         automaticShopifyOrderPromotion: {
           promoted: shopifyOrdersPromoted,
