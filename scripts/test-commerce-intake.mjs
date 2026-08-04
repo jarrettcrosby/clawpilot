@@ -2558,7 +2558,7 @@ const shopifyRuntime = {
 const faireRuntime = {
   ...shopifyRuntime,
   integrationAccountId: '33333333-3333-4333-8333-333333333333',
-  globalId: 'gcia0000002',
+  globalId: 'gia0000002',
   provider: 'faire',
   externalAccountId: 'brand-123',
   configuration: {},
@@ -3559,9 +3559,26 @@ const savedEnvironment = {
   lane: process.env.CLAWPILOT_ENV,
   shopifyAutoCohort:
     process.env.CLAWPILOT_SHOPIFY_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS,
+  faireAutoCohort:
+    process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS,
+  faireAutoNotBefore:
+    process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE,
 }
 process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED = '1'
 process.env.CLAWPILOT_ENV = 'development'
+process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS =
+  faireRuntime.globalId
+process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE =
+  '2000-01-01T00:00:00.000Z'
+const automaticFaireNotBefore =
+  process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE
+const automaticFaireCohortHash = createHash('sha256')
+  .update('commerce-faire-order-auto-promotion-v1')
+  .update('\0')
+  .update(faireRuntime.globalId)
+  .update('\0')
+  .update(automaticFaireNotBefore)
+  .digest('hex')
 
 assert.equal(
   service.nextFaireCursor(
@@ -4398,6 +4415,8 @@ try {
     )),
     {
       policyVersion: 'commerce-faire-order-auto-promotion-v1',
+      cohortHash: automaticFaireCohortHash,
+      notBefore: automaticFaireNotBefore,
       runGlobalId: automaticFaireFetch.command.runGlobalId,
       candidatesFound: 3,
       eligible: 1,
@@ -4478,6 +4497,8 @@ try {
     )),
     {
       policyVersion: 'commerce-faire-order-auto-promotion-v1',
+      cohortHash: automaticFaireCohortHash,
+      notBefore: automaticFaireNotBefore,
       runGlobalId: automaticFaireFetch.command.runGlobalId,
       sourceHash: 'a'.repeat(64),
     },
@@ -4510,6 +4531,8 @@ try {
     )),
     {
       policyVersion: 'commerce-faire-order-auto-promotion-v1',
+      cohortHash: automaticFaireCohortHash,
+      notBefore: automaticFaireNotBefore,
       runGlobalId: concurrentCanonicalFetch.command.runGlobalId,
       candidatesFound: 1,
       eligible: 1,
@@ -4538,6 +4561,8 @@ try {
     candidateRowVersion: 7,
     sourceHash: '9'.repeat(64),
     expectedCredentialVersion: faireRuntime.credentialVersion,
+    cohortHash: automaticFaireCohortHash,
+    notBefore: automaticFaireNotBefore,
   }
   const workerExactRefresh =
     await service.executeCommerceFaireOrderExactRefresh(
@@ -4630,6 +4655,52 @@ try {
     credentialFenceAttempts,
     'Credential drift must fail before provider I/O',
   )
+  const postStageCrashKey = nextKey()
+  const postStageCrashReads = providerReads.faireOrder
+  const postStageCrashAttentionStart = persistenceCommands.length
+  automaticFairePromotionTargets = [{
+    eligible: false,
+    reason: 'customer_resolution_required',
+    candidateGlobalId: 'gcoc0000021',
+    candidateRowVersion: 3,
+    sourceHash: '8'.repeat(64),
+    providerAddress: null,
+    deliveryMode: null,
+  }]
+  await assert.rejects(
+    service.executeCommerceFaireOrderExactRefresh({
+      ...workerExactRefreshInput,
+      idempotencyKey: postStageCrashKey,
+      afterStageBeforeAutomaticHooks() {
+        throw new Error('simulated crash after exact stage before hooks')
+      },
+    }),
+    /simulated crash after exact stage before hooks/u,
+  )
+  assert.equal(
+    providerReads.faireOrder,
+    postStageCrashReads + 1,
+    'The injected failure occurs only after the exact provider result is durably staged',
+  )
+  const recoveredPostStageCrash =
+    await service.executeCommerceFaireOrderExactRefresh({
+      ...workerExactRefreshInput,
+      idempotencyKey: postStageCrashKey,
+    })
+  assert.equal(recoveredPostStageCrash.command.replayed, true)
+  assert.equal(
+    providerReads.faireOrder,
+    postStageCrashReads + 1,
+    'Post-stage recovery must replay durable evidence without another Faire GET',
+  )
+  assert.equal(
+    persistenceCommands
+      .slice(postStageCrashAttentionStart)
+      .filter((entry) => entry.name === 'mark-faire-auto-attention')
+      .length,
+    1,
+    'A deterministic stage replay must resume the skipped automatic hook',
+  )
   await assert.rejects(
     service.executeCommerceIntakeCommand({
       organizationId,
@@ -4706,8 +4777,8 @@ try {
     faireProducts: 2,
     faireInventory: 3,
     faireOrders: 4,
-    faireOrder: 3,
-    faireProfile: 9,
+    faireOrder: 4,
+    faireProfile: 10,
   })
   assert.equal(normalizedSources.shopify.data.products.nodes.length, 0)
   assert.equal(normalizedSources.shopify.data.orders.nodes.length, 1)
@@ -4735,8 +4806,8 @@ try {
       .available_quantity.quantity,
     -2,
   )
-  assert.equal(providerAttempts.length, 16)
-  assert.equal(providerReservations.length, 19)
+  assert.equal(providerAttempts.length, 17)
+  assert.equal(providerReservations.length, 20)
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'faire'
@@ -4751,9 +4822,9 @@ try {
     )),
     'Shopify provider-attempt evidence must record its current normalizer',
   )
-  assert.equal(capturedReads.size, 16)
+  assert.equal(capturedReads.size, 17)
   assert.equal(uncertainReads.length, 0)
-  assert.equal(stageAttempts.length, 19)
+  assert.equal(stageAttempts.length, 20)
   for (const attempt of providerAttempts) {
     assert.equal(attempt.action, 'commerce.intake.read')
     assert.equal(attempt.redactedRequest.readOnly, true)
@@ -4762,7 +4833,7 @@ try {
   }
   assert.equal(
     persistenceCommands.filter(({ name }) => name === 'stage-envelope').length,
-    16,
+    17,
   )
   const staged = persistenceCommands.filter(
     ({ name }) => name === 'stage-envelope',
@@ -4808,6 +4879,7 @@ try {
       'fetch',
       'fetch',
       'refresh',
+      'refresh',
       'retry-rejection',
       'retry-rejection',
     ],
@@ -4822,8 +4894,9 @@ try {
   assert.equal(staged[13].input.page, null)
   assert.equal(staged[14].input.page, null)
   assert.equal(staged[15].input.page, null)
+  assert.equal(staged[16].input.page, null)
   assert.equal(
-    staged[15].input.envelope.orders[0].identity.value,
+    staged[16].input.envelope.orders[0].identity.value,
     'faire-order-rejected-1',
     'Faire exact-order retry must stage the identity read by getFaireOrder',
   )
@@ -5095,8 +5168,8 @@ try {
     faireProducts: 2,
     faireInventory: 3,
     faireOrders: 4,
-    faireOrder: 3,
-    faireProfile: 9,
+    faireOrder: 4,
+    faireProfile: 10,
   }, 'Resolution, validation, and promotion must not call providers')
   const readsBeforeExactPackBinding = { ...providerReads }
   const stagesBeforeExactPackBinding = stageAttempts.length
@@ -5353,6 +5426,19 @@ try {
   } else {
     process.env.CLAWPILOT_SHOPIFY_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS =
       savedEnvironment.shopifyAutoCohort
+  }
+  if (savedEnvironment.faireAutoCohort === undefined) {
+    delete process.env
+      .CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS
+  } else {
+    process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS =
+      savedEnvironment.faireAutoCohort
+  }
+  if (savedEnvironment.faireAutoNotBefore === undefined) {
+    delete process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE
+  } else {
+    process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE =
+      savedEnvironment.faireAutoNotBefore
   }
 }
 

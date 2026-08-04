@@ -5285,6 +5285,16 @@ async function verifyAutomaticFaireExactRefreshLineage(
     provider: 'faire',
     credentialVersion: 1,
   }
+  const promotionNotBefore = String(
+    process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE || '',
+  )
+  const promotionCohortHash = createHash('sha256')
+    .update('commerce-faire-order-auto-promotion-v1')
+    .update('\0')
+    .update(runtime.globalId)
+    .update('\0')
+    .update(promotionNotBefore)
+    .digest('hex')
   const key = 'auto_exact_lineage'
   const externalOrderId = `faire-order-${key}`
   const externalProductId = `p_${key}`
@@ -5642,6 +5652,87 @@ async function verifyAutomaticFaireExactRefreshLineage(
   assert.equal(staleCandidate.source_hash, listOrder.sourceHash)
   assert.equal(staleCandidate.header_money_state, 'operational_incomplete')
   assert.deepEqual(staleCandidate.header_money_gaps, ['shipping', 'total'])
+
+  const preFeatureKey = '22_prefeature_rediscovered'
+  const preFeatureExternalOrderId = `faire-order-${preFeatureKey}`
+  const preFeatureBaseOrder = faireRetailerOrderFixture({
+    key: preFeatureKey,
+    retailerId: 'retailer-22-prefeature',
+    evidenceEmail: 'jarrett+22-prefeature@episcs.com',
+  })
+  const preFeatureOrder = Object.freeze({
+    ...preFeatureBaseOrder,
+    providerCreatedAt: new Date(
+      Date.parse(promotionNotBefore) - 1,
+    ).toISOString(),
+    providerProcessedAt: freshObservedAt,
+    providerUpdatedAt: freshObservedAt,
+    sourceStale: true,
+    readinessFacts: Object.freeze([
+      ...preFeatureBaseOrder.readinessFacts,
+      Object.freeze({
+        dimension: 'source',
+        code: 'source_stale',
+        blocking: true,
+        subjectExternalId: preFeatureExternalOrderId,
+      }),
+    ]),
+    sourceHash: hash('faire-auto-22-prefeature-rediscovered'),
+  })
+  const preFeatureRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009239',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-auto-22-prefeature',
+    responseHash: hash('commerce-staging-faire-auto-22-response'),
+    intakeAction: 'fetch',
+    targetCandidate: null,
+  }
+  await seedWorkerRead(preFeatureRead)
+  const preFeatureStage = await stageWorkerEnvelope({
+    read: preFeatureRead,
+    action: 'fetch',
+    order: preFeatureOrder,
+    targetCandidate: null,
+  })
+  const preFeatureCandidate = (await pool.query(
+    `SELECT global_id, provider_created_at, observed_at
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_order_id = $3
+     ORDER BY observed_at DESC, created_at DESC, id DESC
+     LIMIT 1`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      preFeatureExternalOrderId,
+    ],
+  )).rows[0]
+  assert.ok(
+    new Date(preFeatureCandidate.provider_created_at).getTime()
+      < Date.parse(promotionNotBefore),
+  )
+  assert.ok(
+    new Date(preFeatureCandidate.observed_at).getTime()
+      >= Date.parse(promotionNotBefore),
+    'The pre-feature provider order is deliberately rediscovered after rollout',
+  )
+  assert.equal((await persistence
+    .readAutomaticFaireExactRefreshTargetsInPostgres({
+      runtime,
+      preferredRunGlobalId: preFeatureStage.runGlobalId,
+      limit: 10,
+    })).some(
+      (target) => target.candidateGlobalId === preFeatureCandidate.global_id,
+    ), false, 'A 22-like provider order created before rollout must never enter unattended exact refresh even when rediscovered afterward')
+  assert.equal((await persistence
+    .readAutomaticFaireOrderPromotionTargetsForRunInPostgres({
+      runtime,
+      runGlobalId: preFeatureStage.runGlobalId,
+    })).length, 0, 'A post-cutoff observation cannot make a pre-cutoff provider order automatically promotable')
+
   const refreshTargets = await persistence
     .readAutomaticFaireExactRefreshTargetsInPostgres({
       runtime,
@@ -5655,6 +5746,8 @@ async function verifyAutomaticFaireExactRefreshLineage(
       candidateRowVersion: staleCandidate.row_version,
       sourceHash: staleCandidate.source_hash,
       originatingRunGlobalId: listStage.runGlobalId,
+      cohortHash: promotionCohortHash,
+      notBefore: promotionNotBefore,
     }],
   )
   assert.equal((await persistence
@@ -5711,12 +5804,40 @@ async function verifyAutomaticFaireExactRefreshLineage(
   })
   assert.equal(exactReplay.replayed, true)
   assert.equal(exactReplay.runGlobalId, exactStage.runGlobalId)
-  assert.equal((await persistence
+  const crashRecoveryTargets = await persistence
     .readAutomaticFaireExactRefreshTargetsInPostgres({
       runtime,
       preferredRunGlobalId: listStage.runGlobalId,
       limit: 10,
-    })).length, 0)
+    })
+  assert.deepEqual(
+    crashRecoveryTargets.map((target) => target.candidateGlobalId),
+    [staleCandidate.global_id],
+    'A sole system exact child must keep the original target selectable so a post-stage, pre-hook crash deterministically replays the same exact request',
+  )
+  assert.equal(crashRecoveryTargets[0].cohortHash, promotionCohortHash)
+  assert.equal(crashRecoveryTargets[0].notBefore, promotionNotBefore)
+  const supersededAttention = await persistence
+    .markAutomaticFaireOrderPromotionAttentionInPostgres({
+      runtime,
+      actorEmail: systemActor,
+      idempotencyKey:
+        'commerce-staging-faire-auto-superseded-attention',
+      candidateGlobalId: staleCandidate.global_id,
+      candidateRowVersion: staleCandidate.row_version + 100,
+      sourceHash: staleCandidate.source_hash,
+      runGlobalId: listStage.runGlobalId,
+      reasonCode: 'COMMERCE_FAIRE_EXACT_REFRESH_INTERRUPTED',
+      cohortHash: promotionCohortHash,
+      notBefore: promotionNotBefore,
+    })
+  assert.equal(supersededAttention.marked, false)
+  assert.equal(supersededAttention.reasonCode, 'newer_candidate_exists')
+  assert.equal(
+    supersededAttention.rowVersion,
+    staleCandidate.row_version,
+    'Verified newer-candidate authority must resolve benignly before a stale row-version conflict',
+  )
   let exactCandidate = (await pool.query(
     `SELECT global_id, row_version::integer, source_hash,
             header_money_state, header_money_gaps
@@ -5785,6 +5906,8 @@ async function verifyAutomaticFaireExactRefreshLineage(
       policyVersion: 'commerce-faire-order-auto-promotion-v1',
       runGlobalId: exactStage.runGlobalId,
       sourceHash: exactCandidate.source_hash,
+      cohortHash: promotionCohortHash,
+      notBefore: promotionNotBefore,
     },
   }
   const promotionBlocker = await pool.connect()
@@ -6043,6 +6166,8 @@ async function verifyAutomaticFaireExactRefreshLineage(
         policyVersion: 'commerce-faire-order-auto-promotion-v1',
         runGlobalId: raceExactStage.runGlobalId,
         sourceHash: raceTargets[0].sourceHash,
+        cohortHash: promotionCohortHash,
+        notBefore: promotionNotBefore,
       },
     }),
     (error) => error?.code
@@ -6218,6 +6343,8 @@ async function verifyAutomaticFaireExactRefreshLineage(
     sourceHash: rejectionSourceCandidate.source_hash,
     runGlobalId: rejectionListStage.runGlobalId,
     reasonCode: 'COMMERCE_FAIRE_EXACT_REFRESH_NORMALIZATION_REJECTED',
+    cohortHash: promotionCohortHash,
+    notBefore: promotionNotBefore,
   }
   const exactRejectionAttention = await persistence
     .markAutomaticFaireOrderPromotionAttentionInPostgres(
@@ -6657,6 +6784,8 @@ async function verifyAutomaticFaireExactRefreshLineage(
     sourceHash: packTargets[0].sourceHash,
     runGlobalId: packExactStage.runGlobalId,
     reasonCode: packTargets[0].reason,
+    cohortHash: promotionCohortHash,
+    notBefore: promotionNotBefore,
   }
   const packAttention = await persistence
     .markAutomaticFaireOrderPromotionAttentionInPostgres(packAttentionInput)
@@ -8059,12 +8188,43 @@ async function verifyAcceptance(databaseUrl) {
     4,
     'Only still-unresolved prior-run candidates belong in the backlog sweep',
   )
-  await verifyAutomaticFaireExactRefreshLineage(
-    pool,
-    ids,
-    persistence,
-    counters,
-  )
+  const previousFairePromotionCohort = process.env
+    .CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS
+  const previousFairePromotionNotBefore = process.env
+    .CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE
+  const previousFairePromotionLane = process.env.CLAWPILOT_ENV
+  process.env.CLAWPILOT_ENV = 'development'
+  process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS =
+    'gia0009202'
+  process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE =
+    new Date(Date.now() - 60_000).toISOString()
+  try {
+    await verifyAutomaticFaireExactRefreshLineage(
+      pool,
+      ids,
+      persistence,
+      counters,
+    )
+  } finally {
+    if (previousFairePromotionCohort === undefined) {
+      delete process.env
+        .CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS
+    } else {
+      process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS =
+        previousFairePromotionCohort
+    }
+    if (previousFairePromotionNotBefore === undefined) {
+      delete process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE
+    } else {
+      process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE =
+        previousFairePromotionNotBefore
+    }
+    if (previousFairePromotionLane === undefined) {
+      delete process.env.CLAWPILOT_ENV
+    } else {
+      process.env.CLAWPILOT_ENV = previousFairePromotionLane
+    }
+  }
   await verifyFaireExactVariantPackBinding(
     pool,
     ids,

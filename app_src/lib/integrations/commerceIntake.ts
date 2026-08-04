@@ -29,6 +29,7 @@ import {
 } from '@/lib/integrations/shopifyCommerceNormalizer'
 import {
   automaticFairePromotionHoldRequiresAttention,
+  faireAutomaticOrderPromotionGate,
   AUTOMATIC_FAIRE_ORDER_PROMOTION_POLICY_VERSION,
 } from '@/lib/integrations/commerceFaireAutomaticPromotion'
 import {
@@ -2404,10 +2405,25 @@ async function withAutomaticFaireOrderPromotion(
       && input.action !== 'retry-rejection'
     )
   ) return command
+  const gate = faireAutomaticOrderPromotionGate({
+    accountGlobalId: input.runtime.globalId,
+  })
+  if (!gate.accountEnabled || !gate.cohortHash || !gate.notBefore) {
+    return command
+  }
+  const cohortHash = gate.cohortHash
+  const notBefore = gate.notBefore
   const runGlobalId = typeof command.runGlobalId === 'string'
     ? command.runGlobalId
     : ''
   if (!RUN_PATTERN.test(runGlobalId)) return command
+  const automaticCommandKey = (parts: readonly string[]) => (
+    automaticFaireCommandKey([
+      cohortHash,
+      notBefore,
+      ...parts,
+    ])
+  )
   let targets: Awaited<ReturnType<
     typeof readAutomaticFaireOrderPromotionTargetsForRunInPostgres
   >>
@@ -2421,6 +2437,8 @@ async function withAutomaticFaireOrderPromotion(
       ...command,
       automaticFaireOrderPromotion: {
         policyVersion: AUTOMATIC_FAIRE_ORDER_PROMOTION_POLICY_VERSION,
+        cohortHash,
+        notBefore,
         runGlobalId,
         candidatesFound: 0,
         eligible: 0,
@@ -2452,42 +2470,34 @@ async function withAutomaticFaireOrderPromotion(
     sourceHash: string
     reasonCode: string
   }) => {
-    try {
-      const result = await markAutomaticFaireOrderPromotionAttentionInPostgres({
-        runtime: input.runtime,
-        actorEmail: input.actorEmail,
-        idempotencyKey: automaticFaireCommandKey([
-          input.runtime.globalId,
-          runGlobalId,
-          target.candidateGlobalId,
-          String(target.candidateRowVersion),
-          target.sourceHash,
-          `attention:${target.reasonCode}`,
-        ]),
-        candidateGlobalId: target.candidateGlobalId,
-        candidateRowVersion: target.candidateRowVersion,
-        sourceHash: target.sourceHash,
+    const result = await markAutomaticFaireOrderPromotionAttentionInPostgres({
+      runtime: input.runtime,
+      actorEmail: input.actorEmail,
+      idempotencyKey: automaticCommandKey([
+        input.runtime.globalId,
         runGlobalId,
-        reasonCode: target.reasonCode,
-      }) as { marked?: boolean; reasonCode?: string }
-      return result.marked === false
-        ? {
-            attentionRequired: false as const,
-            reasonCode: result.reasonCode || 'candidate_resolved',
-          }
-        : {
-            attentionRequired: true as const,
-            reasonCode: target.reasonCode,
-          }
-    } catch {
-      failed += 1
-      const code = 'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_PROVENANCE_FAILED'
-      failedByCode[code] = (failedByCode[code] || 0) + 1
-      return {
-        attentionRequired: true as const,
-        reasonCode: target.reasonCode,
-      }
-    }
+        target.candidateGlobalId,
+        String(target.candidateRowVersion),
+        target.sourceHash,
+        `attention:${target.reasonCode}`,
+      ]),
+      candidateGlobalId: target.candidateGlobalId,
+      candidateRowVersion: target.candidateRowVersion,
+      sourceHash: target.sourceHash,
+      runGlobalId,
+      reasonCode: target.reasonCode,
+      cohortHash,
+      notBefore,
+    }) as { marked?: boolean; reasonCode?: string }
+    return result.marked === false
+      ? {
+          attentionRequired: false as const,
+          reasonCode: result.reasonCode || 'candidate_resolved',
+        }
+      : {
+          attentionRequired: true as const,
+          reasonCode: target.reasonCode,
+        }
   }
   for (const target of targets) {
     if (!target.eligible) {
@@ -2520,7 +2530,7 @@ async function withAutomaticFaireOrderPromotion(
         const addressResult = await confirmCommerceCandidateAddressInPostgres({
           runtime: input.runtime,
           actorEmail: input.actorEmail,
-          idempotencyKey: automaticFaireCommandKey([
+          idempotencyKey: automaticCommandKey([
             input.runtime.globalId,
             runGlobalId,
             target.candidateGlobalId,
@@ -2537,7 +2547,7 @@ async function withAutomaticFaireOrderPromotion(
         const deliveryResult = await resolveCommerceCandidateDeliveryInPostgres({
           runtime: input.runtime,
           actorEmail: input.actorEmail,
-          idempotencyKey: automaticFaireCommandKey([
+          idempotencyKey: automaticCommandKey([
             input.runtime.globalId,
             runGlobalId,
             target.candidateGlobalId,
@@ -2556,7 +2566,7 @@ async function withAutomaticFaireOrderPromotion(
       const validation = await validateCommerceCandidateInPostgres({
         runtime: input.runtime,
         actorEmail: input.actorEmail,
-        idempotencyKey: automaticFaireCommandKey([
+        idempotencyKey: automaticCommandKey([
           input.runtime.globalId,
           runGlobalId,
           target.candidateGlobalId,
@@ -2588,7 +2598,7 @@ async function withAutomaticFaireOrderPromotion(
       await promoteCommerceCandidateInPostgres({
         runtime: input.runtime,
         actorEmail: input.actorEmail,
-        idempotencyKey: automaticFaireCommandKey([
+        idempotencyKey: automaticCommandKey([
           input.runtime.globalId,
           runGlobalId,
           target.candidateGlobalId,
@@ -2604,12 +2614,16 @@ async function withAutomaticFaireOrderPromotion(
           candidateGlobalId: target.candidateGlobalId,
           candidateRowVersion: rowVersion,
           sourceHash: target.sourceHash,
+          cohortHash,
+          notBefore,
           providerWrites: 0,
         }),
         automaticFairePromotion: {
           policyVersion: AUTOMATIC_FAIRE_ORDER_PROMOTION_POLICY_VERSION,
           runGlobalId,
           sourceHash: target.sourceHash,
+          cohortHash,
+          notBefore,
         },
       })
       promoted += 1
@@ -2642,6 +2656,8 @@ async function withAutomaticFaireOrderPromotion(
     ...command,
     automaticFaireOrderPromotion: {
       policyVersion: AUTOMATIC_FAIRE_ORDER_PROMOTION_POLICY_VERSION,
+      cohortHash,
+      notBefore,
       runGlobalId,
       candidatesFound: targets.length,
       eligible,
@@ -2675,6 +2691,8 @@ type CommerceIntakeExecutionOptions = {
     candidateRowVersion: number
     sourceHash: string
   }
+  /** Test-only crash seam after the durable stage commits, before hooks. */
+  afterStageBeforeAutomaticHooks?: () => void | Promise<void>
 }
 
 async function executeCommerceIntakeCommandInternal(
@@ -3304,6 +3322,7 @@ async function executeCommerceIntakeCommandInternal(
         ? { exactExternalProductIdHash }
         : {}),
     })
+    await options.afterStageBeforeAutomaticHooks?.()
     const commandWithAutomaticCreation = await withAutomaticProductCreation(
       command as Record<string, unknown>,
       {
@@ -3801,7 +3820,25 @@ export async function executeCommerceFaireOrderExactRefresh(input: {
   candidateRowVersion: number
   sourceHash: string
   expectedCredentialVersion: number
+  cohortHash: string
+  notBefore: string
+  /** Deterministic test seam; worker callers never supply this. */
+  afterStageBeforeAutomaticHooks?: () => void | Promise<void>
 }) {
+  const gate = faireAutomaticOrderPromotionGate({
+    accountGlobalId: input.accountGlobalId,
+  })
+  if (
+    !gate.accountEnabled
+    || gate.cohortHash !== input.cohortHash
+    || gate.notBefore !== input.notBefore
+  ) {
+    throw new CommerceIntegrationRequestError(
+      'The automatic Faire exact-read cohort or rollout boundary changed before execution',
+      409,
+      'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_GATE_CLOSED',
+    )
+  }
   return executeCommerceIntakeCommandInternal({
     organizationId: input.organizationId,
     actorEmail: input.actorEmail,
@@ -3822,5 +3859,6 @@ export async function executeCommerceFaireOrderExactRefresh(input: {
       candidateRowVersion: input.candidateRowVersion,
       sourceHash: input.sourceHash,
     },
+    afterStageBeforeAutomaticHooks: input.afterStageBeforeAutomaticHooks,
   })
 }

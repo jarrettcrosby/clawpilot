@@ -59,6 +59,8 @@ function deterministicFaireExactRefreshUuid(input: {
   credentialVersion: number
   candidateGlobalId: string
   sourceHash: string
+  cohortHash: string
+  notBefore: string
 }) {
   return deterministicRunUuid({
     organizationId: input.organizationId,
@@ -68,6 +70,8 @@ function deterministicFaireExactRefreshUuid(input: {
       'faire-exact-refresh-v1',
       input.candidateGlobalId,
       input.sourceHash,
+      input.cohortHash,
+      input.notBefore,
     ].join(':'),
   })
 }
@@ -79,6 +83,8 @@ function deterministicFaireAttentionUuid(input: {
   candidateGlobalId: string
   sourceHash: string
   reasonCode: string
+  cohortHash: string
+  notBefore: string
 }) {
   return deterministicRunUuid({
     organizationId: input.organizationId,
@@ -89,6 +95,8 @@ function deterministicFaireAttentionUuid(input: {
       input.candidateGlobalId,
       input.sourceHash,
       input.reasonCode,
+      input.cohortHash,
+      input.notBefore,
     ].join(':'),
   })
 }
@@ -161,7 +169,7 @@ const MAX_PAGES_PER_RECONCILIATION = 5
 const MAX_PROVIDER_RECORDS_PER_RECONCILIATION = 250
 const MAX_RECONCILIATION_RUNTIME_MS = 180_000
 const MIN_REMAINING_RUNTIME_FOR_PAGE_MS = 30_000
-const MIN_REMAINING_RUNTIME_FOR_EXACT_REFRESH_MS = 15_000
+const MIN_REMAINING_RUNTIME_FOR_EXACT_REFRESH_MS = 30_000
 const PROVIDER_PAGE_RECORD_LIMIT = {
   shopify: 25,
   faire: 50,
@@ -216,6 +224,23 @@ function reconciliationError(code: string, message: string) {
   const error = new Error(message) as Error & { code?: string }
   error.code = code
   return error
+}
+
+async function persistAutomaticFaireAttention(
+  input: Parameters<
+    typeof markAutomaticFaireOrderPromotionAttentionInPostgres
+  >[0],
+) {
+  try {
+    return await markAutomaticFaireOrderPromotionAttentionInPostgres(input)
+  } catch (cause) {
+    const error = new Error(
+      'Automatic Faire operator attention could not be durably persisted',
+      { cause },
+    ) as Error & { code?: string }
+    error.code = 'COMMERCE_FAIRE_AUTO_PROMOTION_ATTENTION_PERSIST_FAILED'
+    throw error
+  }
 }
 
 /**
@@ -690,11 +715,15 @@ export async function processCommerceOrderReconciliation(input: {
                       credentialVersion: target.credentialVersion,
                       candidateGlobalId: exactTarget.candidateGlobalId,
                       sourceHash: exactTarget.sourceHash,
+                      cohortHash: exactTarget.cohortHash,
+                      notBefore: exactTarget.notBefore,
                     }),
                     candidateGlobalId: exactTarget.candidateGlobalId,
                     candidateRowVersion: exactTarget.candidateRowVersion,
                     sourceHash: exactTarget.sourceHash,
                     expectedCredentialVersion: target.credentialVersion,
+                    cohortHash: exactTarget.cohortHash,
+                    notBefore: exactTarget.notBefore,
                   })
                 const exactCommand = record(exactResponse.command)
                 assertReconciliationFence(exactCommand)
@@ -709,7 +738,7 @@ export async function processCommerceOrderReconciliation(input: {
                   targetFaireExactRefreshRejected += exactRejected
                   const rejectionCode =
                     'COMMERCE_FAIRE_EXACT_REFRESH_NORMALIZATION_REJECTED'
-                  const attention = await markAutomaticFaireOrderPromotionAttentionInPostgres({
+                  const attention = await persistAutomaticFaireAttention({
                     runtime: {
                       organizationId: target.organizationId,
                       integrationAccountId: target.integrationAccountId,
@@ -725,13 +754,17 @@ export async function processCommerceOrderReconciliation(input: {
                       candidateGlobalId: exactTarget.candidateGlobalId,
                       sourceHash: exactTarget.sourceHash,
                       reasonCode: rejectionCode,
+                      cohortHash: exactTarget.cohortHash,
+                      notBefore: exactTarget.notBefore,
                     }),
                     candidateGlobalId: exactTarget.candidateGlobalId,
                     candidateRowVersion: exactTarget.candidateRowVersion,
                     sourceHash: exactTarget.sourceHash,
                     runGlobalId: exactTarget.originatingRunGlobalId,
                     reasonCode: rejectionCode,
-                  }).catch(() => ({ marked: true }))
+                    cohortHash: exactTarget.cohortHash,
+                    notBefore: exactTarget.notBefore,
+                  })
                   if (record(attention).marked !== false) {
                     targetFaireOperatorReviewRequired += exactRejected
                   }
@@ -790,10 +823,12 @@ export async function processCommerceOrderReconciliation(input: {
                 if (
                   reconciliationFailureCode(error)
                     === 'COMMERCE_ORDER_RECONCILIATION_WRITE_FENCE'
+                  || reconciliationFailureCode(error)
+                    === 'COMMERCE_FAIRE_AUTO_PROMOTION_ATTENTION_PERSIST_FAILED'
                 ) throw error
                 targetFaireExactRefreshFailed += 1
                 const code = reconciliationFailureCode(error)
-                const attention = await markAutomaticFaireOrderPromotionAttentionInPostgres({
+                const attention = await persistAutomaticFaireAttention({
                   runtime: {
                     organizationId: target.organizationId,
                     integrationAccountId: target.integrationAccountId,
@@ -809,13 +844,17 @@ export async function processCommerceOrderReconciliation(input: {
                     candidateGlobalId: exactTarget.candidateGlobalId,
                     sourceHash: exactTarget.sourceHash,
                     reasonCode: code,
+                    cohortHash: exactTarget.cohortHash,
+                    notBefore: exactTarget.notBefore,
                   }),
                   candidateGlobalId: exactTarget.candidateGlobalId,
                   candidateRowVersion: exactTarget.candidateRowVersion,
                   sourceHash: exactTarget.sourceHash,
                   runGlobalId: exactTarget.originatingRunGlobalId,
                   reasonCode: code,
-                }).catch(() => ({ marked: true }))
+                  cohortHash: exactTarget.cohortHash,
+                  notBefore: exactTarget.notBefore,
+                })
                 if (record(attention).marked !== false) {
                   targetFaireOperatorReviewRequired += 1
                 }

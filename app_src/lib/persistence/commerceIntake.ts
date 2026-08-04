@@ -35,6 +35,7 @@ import {
 import {
   automaticFairePromotionHoldRequiresAttention,
   automaticFaireOrderSourceIsFresh,
+  faireAutomaticOrderPromotionGate,
   AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER,
   AUTOMATIC_FAIRE_ORDER_PROMOTION_POLICY_VERSION,
 } from '@/lib/integrations/commerceFaireAutomaticPromotion'
@@ -3092,6 +3093,8 @@ export type AutomaticFaireExactRefreshTarget = {
   candidateRowVersion: number
   sourceHash: string
   originatingRunGlobalId: string
+  cohortHash: string
+  notBefore: string
 }
 
 /**
@@ -3113,6 +3116,12 @@ export async function readAutomaticFaireExactRefreshTargetsInPostgres(input: {
   limit: number
   excludedCandidateGlobalIds?: readonly string[]
 }) {
+  const gate = faireAutomaticOrderPromotionGate({
+    accountGlobalId: input.runtime.globalId,
+  })
+  if (!gate.accountEnabled || !gate.cohortHash || !gate.notBefore) return []
+  const cohortHash = gate.cohortHash
+  const notBefore = gate.notBefore
   return withTransaction(async (client) => {
     const account = await resolveAccount(client, {
       organizationId: input.runtime.organizationId,
@@ -3147,6 +3156,8 @@ export async function readAutomaticFaireExactRefreshTargetsInPostgres(input: {
            AND run.resource = 'products_and_orders'
            AND run.credential_version = $4::integer
            AND run.created_by = 'system:commerce-order-reconciliation'
+           AND run.created_at >= $7::timestamptz
+           AND intent.created_at >= $7::timestamptz
            AND run.expires_at > now()
            AND run.workflow_state <> 'expired'
          LIMIT 1
@@ -3173,6 +3184,8 @@ export async function readAutomaticFaireExactRefreshTargetsInPostgres(input: {
             = 'system:commerce-order-reconciliation'
        WHERE candidate.provider = 'faire'
          AND candidate.created_by = 'system:commerce-order-reconciliation'
+         AND candidate.provider_created_at >= $7::timestamptz
+         AND candidate.observed_at >= $7::timestamptz
          AND candidate.expires_at > now()
          AND candidate.workflow_state IN ('held', 'resolving', 'ready')
          AND candidate.canonical_order_id IS NULL
@@ -3187,6 +3200,8 @@ export async function readAutomaticFaireExactRefreshTargetsInPostgres(input: {
          AND run.resource = 'products_and_orders'
          AND run.credential_version = $4::integer
          AND run.created_by = 'system:commerce-order-reconciliation'
+         AND run.created_at >= $7::timestamptz
+         AND discovery_intent.created_at >= $7::timestamptz
          AND run.expires_at > now()
          AND run.workflow_state <> 'expired'
          AND NOT EXISTS (
@@ -3237,6 +3252,68 @@ export async function readAutomaticFaireExactRefreshTargetsInPostgres(input: {
                  newer.observed_at = candidate.observed_at
                  AND newer.created_at = candidate.created_at
                  AND newer.id > candidate.id
+               )
+             )
+             AND NOT (
+               newer.provider = 'faire'
+               AND newer.created_by
+                 = 'system:commerce-order-reconciliation'
+               AND newer.updated_by
+                 = 'system:commerce-order-reconciliation'
+               AND newer.provider_created_at >= $7::timestamptz
+               AND newer.observed_at >= $7::timestamptz
+               AND EXISTS (
+                 SELECT 1
+                 FROM operations_commerce_intake_runs exact_run
+                 JOIN operations_commerce_intake_read_intents exact_intent
+                   ON exact_intent.organization_id
+                       = exact_run.organization_id
+                  AND exact_intent.integration_account_id
+                       = exact_run.integration_account_id
+                  AND exact_intent.staged_run_id = exact_run.id
+                 WHERE exact_run.organization_id = newer.organization_id
+                   AND exact_run.integration_account_id
+                       = newer.integration_account_id
+                   AND exact_run.id = newer.run_id
+                   AND exact_run.provider = 'faire'
+                   AND exact_run.resource = 'products_and_orders'
+                   AND exact_run.credential_version = $4::integer
+                   AND exact_run.created_by
+                       = 'system:commerce-order-reconciliation'
+                   AND exact_run.created_at >= $7::timestamptz
+                   AND exact_intent.provider = 'faire'
+                   AND exact_intent.resource = 'orders'
+                   AND exact_intent.intake_action = 'refresh'
+                   AND exact_intent.target_kind = 'candidate'
+                   AND exact_intent.target_global_id = candidate.global_id
+                   AND exact_intent.target_source_hash = candidate.source_hash
+                   AND exact_intent.intent_state = 'staged'
+                   AND exact_intent.created_by
+                       = 'system:commerce-order-reconciliation'
+                   AND exact_intent.created_at >= $7::timestamptz
+               )
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM operations_commerce_order_candidates other_newer
+                 WHERE other_newer.organization_id
+                     = candidate.organization_id
+                   AND other_newer.integration_account_id
+                     = candidate.integration_account_id
+                   AND other_newer.external_order_id
+                     = candidate.external_order_id
+                   AND other_newer.id NOT IN (candidate.id, newer.id)
+                   AND (
+                     other_newer.observed_at > candidate.observed_at
+                     OR (
+                       other_newer.observed_at = candidate.observed_at
+                       AND other_newer.created_at > candidate.created_at
+                     )
+                     OR (
+                       other_newer.observed_at = candidate.observed_at
+                       AND other_newer.created_at = candidate.created_at
+                       AND other_newer.id > candidate.id
+                     )
+                   )
                )
              )
          )
@@ -3305,6 +3382,7 @@ export async function readAutomaticFaireExactRefreshTargetsInPostgres(input: {
         input.runtime.credentialVersion,
         limit,
         [...(input.excludedCandidateGlobalIds || [])],
+        notBefore,
       ],
     )
     return selected.rows.map((row): AutomaticFaireExactRefreshTarget => ({
@@ -3312,6 +3390,8 @@ export async function readAutomaticFaireExactRefreshTargetsInPostgres(input: {
       candidateRowVersion: Number(row.row_version),
       sourceHash: row.source_hash,
       originatingRunGlobalId: row.run_global_id,
+      cohortHash,
+      notBefore,
     }))
   })
 }
@@ -10794,6 +10874,10 @@ export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
     runGlobalId: string
   },
 ) {
+  const gate = faireAutomaticOrderPromotionGate({
+    accountGlobalId: input.runtime.globalId,
+  })
+  if (!gate.accountEnabled || !gate.cohortHash || !gate.notBefore) return []
   return withTransaction(async (client) => {
     const account = await resolveAccount(client, {
       organizationId: input.runtime.organizationId,
@@ -10809,13 +10893,31 @@ export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
            AND run.credential_version = $4::integer
            AND run.resource = 'products_and_orders'
            AND run.provider = 'faire'
+           AND run.created_by = 'system:commerce-order-reconciliation'
+           AND run.created_at >= $5::timestamptz
            AND run.expires_at > now()
            AND run.workflow_state <> 'expired'
            AND candidate.provider = 'faire'
+           AND candidate.created_by = 'system:commerce-order-reconciliation'
+           AND candidate.provider_created_at >= $5::timestamptz
+           AND candidate.observed_at >= $5::timestamptz
            AND candidate.expires_at > now()
            AND candidate.workflow_state IN ('held', 'resolving', 'ready')
            AND candidate.last_error_code IS DISTINCT FROM
                '${AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER}'
+           AND EXISTS (
+             SELECT 1
+             FROM operations_commerce_intake_read_intents originating_intent
+             WHERE originating_intent.organization_id
+                 = run.organization_id
+               AND originating_intent.integration_account_id
+                 = run.integration_account_id
+               AND originating_intent.staged_run_id = run.id
+               AND originating_intent.intent_state = 'staged'
+               AND originating_intent.created_by
+                 = 'system:commerce-order-reconciliation'
+               AND originating_intent.created_at >= $5::timestamptz
+           )
          ORDER BY candidate.created_at, candidate.id
          LIMIT 50`,
         [
@@ -10823,6 +10925,7 @@ export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
           account.id,
           input.runGlobalId,
           input.runtime.credentialVersion,
+          gate.notBefore,
         ],
       )
     ).rows
@@ -10955,16 +11058,20 @@ export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
                  AND exact_intent.intent_state = 'staged'
                  AND exact_intent.created_by
                      = 'system:commerce-order-reconciliation'
+                 AND exact_intent.created_at >= $7::timestamptz
                  AND exact_run.provider = 'faire'
                  AND exact_run.resource = 'products_and_orders'
                  AND exact_run.credential_version = $6::integer
                  AND exact_run.created_by
                      = 'system:commerce-order-reconciliation'
+                 AND exact_run.created_at >= $7::timestamptz
                  AND prior.external_order_id = $3
                  AND prior.id <> $4::uuid
                  AND prior.provider = 'faire'
                  AND prior.created_by
                      = 'system:commerce-order-reconciliation'
+                 AND prior.provider_created_at >= $7::timestamptz
+                 AND prior.observed_at >= $7::timestamptz
                  AND prior.workflow_state IN ('held', 'resolving', 'ready')
                  AND 'source_stale' = ANY(prior.blocking_codes)
                  AND prior_run.provider = 'faire'
@@ -10972,6 +11079,8 @@ export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
                  AND prior_run.credential_version = $6::integer
                  AND prior_run.created_by
                      = 'system:commerce-order-reconciliation'
+                 AND prior_run.created_at >= $7::timestamptz
+                 AND discovery_intent.created_at >= $7::timestamptz
                  AND NOT EXISTS (
                    SELECT 1
                    FROM operations_commerce_order_candidates history
@@ -11042,6 +11151,7 @@ export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
             candidate.id,
             candidate.run_id,
             input.runtime.credentialVersion,
+            gate.notBefore,
           ],
         ),
       ])
@@ -11079,8 +11189,8 @@ export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
         continue
       }
       if (
-        priorOrCanonical.rows[0]?.prior_candidate
-        && !priorOrCanonical.rows[0]?.exact_refresh_lineage
+        !priorOrCanonical.rows[0]?.prior_candidate
+        || !priorOrCanonical.rows[0]?.exact_refresh_lineage
       ) {
         targets.push(heldAutomaticFairePromotionTarget(
           candidate,
@@ -12808,6 +12918,8 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
     sourceHash: string
     runGlobalId: string
     reasonCode: string
+    cohortHash: string
+    notBefore: string
   },
 ) {
   return withTransaction(async (client) => {
@@ -12834,6 +12946,7 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
         input.candidateGlobalId,
       )
       || !/^[a-f0-9]{64}$/u.test(input.sourceHash)
+      || !/^[a-f0-9]{64}$/u.test(input.cohortHash)
     ) {
       intakeError(
         'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_NOT_AUTHORIZED',
@@ -12846,6 +12959,20 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
       accountGlobalId: input.runtime.globalId,
       forUpdate: true,
     })
+    const gate = faireAutomaticOrderPromotionGate({
+      accountGlobalId: account.global_id,
+    })
+    if (
+      !gate.accountEnabled
+      || gate.cohortHash !== input.cohortHash
+      || gate.notBefore !== input.notBefore
+    ) {
+      intakeError(
+        'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_GATE_CLOSED',
+        'Automatic Faire order attention is not authorized for this exact development cohort and rollout boundary',
+        409,
+      )
+    }
     if (!['shadow', 'active'].includes(account.activation_state)) {
       intakeError(
         'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
@@ -12864,6 +12991,8 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
       sourceHash: input.sourceHash,
       runGlobalId: input.runGlobalId,
       reasonCode,
+      cohortHash: input.cohortHash,
+      notBefore: input.notBefore,
       marker: AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER,
       providerWrites: 0,
       inventoryWrites: 0,
@@ -12910,17 +13039,6 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
         409,
       )
     }
-    if (
-      Number(candidate.row_version) !== input.candidateRowVersion
-      && candidate.last_error_code
-        !== AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER
-    ) {
-      intakeError(
-        'COMMERCE_INTAKE_ROW_VERSION_CONFLICT',
-        'This held order changed before automatic attention was recorded',
-        409,
-      )
-    }
     await lockCommerceOrderIdentity(client, {
       organizationId: candidate.organization_id,
       integrationAccountId: candidate.integration_account_id,
@@ -12958,8 +13076,30 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
                AND run.resource = 'products_and_orders'
                AND run.credential_version = $6::integer
                AND run.created_by = 'system:commerce-order-reconciliation'
+               AND run.created_at >= $7::timestamptz
                AND run.workflow_state <> 'expired'
                AND run.expires_at > now()
+               AND EXISTS (
+                 SELECT 1
+                 FROM operations_commerce_intake_read_intents
+                   originating_intent
+                 WHERE originating_intent.organization_id
+                     = run.organization_id
+                   AND originating_intent.integration_account_id
+                     = run.integration_account_id
+                   AND originating_intent.staged_run_id = run.id
+                   AND originating_intent.intent_state = 'staged'
+                   AND originating_intent.created_by
+                     = 'system:commerce-order-reconciliation'
+                   AND originating_intent.created_at >= $7::timestamptz
+               )
+           ) AND EXISTS (
+             SELECT 1
+             FROM operations_commerce_order_candidates provenance_candidate
+             WHERE provenance_candidate.id = $8::uuid
+               AND provenance_candidate.provider_created_at
+                 >= $7::timestamptz
+               AND provenance_candidate.observed_at >= $7::timestamptz
            ) AS run_active,
            (
              EXISTS (
@@ -13032,6 +13172,8 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
           candidate.run_id,
           input.runGlobalId,
           input.runtime.credentialVersion,
+          input.notBefore,
+          candidate.id,
         ],
       )
     ).rows[0]
@@ -13067,29 +13209,21 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
         ],
       )
     ).rows[0]?.exists === true
-    const resolvedReason = authority?.canonical_exists
+    const benignResolution = authority?.canonical_exists
       ? 'canonical_order_exists'
       : authority?.operator_owned_history
         ? 'operator_owned_history'
         : newerCandidate
           ? 'newer_candidate_exists'
-          : candidate.workflow_state === 'promoted'
-            ? 'candidate_promoted'
-            : candidate.workflow_state === 'failed'
-              || candidate.customer_resolution_state === 'unsupported'
-              ? 'candidate_terminal'
-              : new Date(candidate.expires_at).getTime() <= Date.now()
-                || !authority?.run_active
-                ? 'candidate_expired'
-                : null
-    if (resolvedReason) {
+          : null
+    if (benignResolution) {
       const result = {
         action: 'mark-faire-auto-promotion-attention',
         candidateGlobalId: candidate.global_id,
         rowVersion: Number(candidate.row_version),
         marked: false,
         alreadyMarked: false,
-        reasonCode: resolvedReason,
+        reasonCode: benignResolution,
         providerWrites: 0,
         inventoryWrites: 0,
         syncCursorAdvanced: false,
@@ -13102,6 +13236,30 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
         result,
       )
       return result
+    }
+    if (
+      !authority?.run_active
+      || candidate.workflow_state === 'promoted'
+      || candidate.workflow_state === 'failed'
+      || candidate.customer_resolution_state === 'unsupported'
+      || new Date(candidate.expires_at).getTime() <= Date.now()
+    ) {
+      intakeError(
+        'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_AUTHORITY_STALE',
+        'Automatic Faire order attention no longer has current rollout and candidate authority',
+        409,
+      )
+    }
+    if (
+      Number(candidate.row_version) !== input.candidateRowVersion
+      && candidate.last_error_code
+        !== AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER
+    ) {
+      intakeError(
+        'COMMERCE_INTAKE_ROW_VERSION_CONFLICT',
+        'This held order changed before automatic attention was recorded',
+        409,
+      )
     }
     const alreadyMarked = candidate.last_error_code
       === AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER
@@ -13145,6 +13303,8 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
           policyVersion: AUTOMATIC_FAIRE_ORDER_PROMOTION_POLICY_VERSION,
           runGlobalId: input.runGlobalId,
           sourceHash: input.sourceHash,
+          cohortHash: input.cohortHash,
+          notBefore: input.notBefore,
           reasonCode,
           marker: AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER,
           providerWrites: 0,
@@ -13291,6 +13451,8 @@ export async function promoteCommerceCandidateInPostgres(input: {
     policyVersion: typeof AUTOMATIC_FAIRE_ORDER_PROMOTION_POLICY_VERSION
     runGlobalId: string
     sourceHash: string
+    cohortHash: string
+    notBefore: string
   }
 }) {
   return withTransaction(async (client) => {
@@ -13347,6 +13509,10 @@ export async function promoteCommerceCandidateInPostgres(input: {
         || !/^[a-f0-9]{64}$/u.test(
           input.automaticFairePromotion.sourceHash,
         )
+        || !/^[a-f0-9]{64}$/u.test(
+          input.automaticFairePromotion.cohortHash,
+        )
+        || !input.automaticFairePromotion.notBefore
         || started.account.provider !== 'faire'
         || input.runtime.provider !== 'faire'
       ) {
@@ -13368,6 +13534,20 @@ export async function promoteCommerceCandidateInPostgres(input: {
       externalOrderId: candidate.external_order_id,
     })
     if (input.automaticFairePromotion) {
+      const gate = faireAutomaticOrderPromotionGate({
+        accountGlobalId: started.account.global_id,
+      })
+      if (
+        !gate.accountEnabled
+        || gate.cohortHash !== input.automaticFairePromotion.cohortHash
+        || gate.notBefore !== input.automaticFairePromotion.notBefore
+      ) {
+        intakeError(
+          'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_GATE_CLOSED',
+          'Automatic Faire order promotion is not authorized for this exact development cohort and rollout boundary',
+          409,
+        )
+      }
       await client.query(
         `SELECT history.id
          FROM operations_commerce_order_candidates history
@@ -13403,8 +13583,22 @@ export async function promoteCommerceCandidateInPostgres(input: {
                  AND current_run.credential_version = $6::integer
                  AND current_run.created_by
                    = 'system:commerce-order-reconciliation'
+                 AND current_run.created_at >= $9::timestamptz
                  AND current_run.workflow_state <> 'expired'
                  AND current_run.expires_at > now()
+                 AND EXISTS (
+                   SELECT 1
+                   FROM operations_commerce_intake_read_intents current_intent
+                   WHERE current_intent.organization_id
+                       = current_run.organization_id
+                     AND current_intent.integration_account_id
+                       = current_run.integration_account_id
+                     AND current_intent.staged_run_id = current_run.id
+                     AND current_intent.intent_state = 'staged'
+                     AND current_intent.created_by
+                       = 'system:commerce-order-reconciliation'
+                     AND current_intent.created_at >= $9::timestamptz
+                 )
              ) AND EXISTS (
                SELECT 1
                FROM operations_commerce_order_candidates current_candidate
@@ -13412,6 +13606,9 @@ export async function promoteCommerceCandidateInPostgres(input: {
                  AND current_candidate.created_by
                    = 'system:commerce-order-reconciliation'
                  AND current_candidate.source_hash = $8
+                 AND current_candidate.provider_created_at
+                   >= $9::timestamptz
+                 AND current_candidate.observed_at >= $9::timestamptz
              ) AS current_worker_run,
              EXISTS (
                SELECT 1
@@ -13464,12 +13661,14 @@ export async function promoteCommerceCandidateInPostgres(input: {
                  AND exact_intent.intent_state = 'staged'
                  AND exact_intent.created_by
                     = 'system:commerce-order-reconciliation'
+                 AND exact_intent.created_at >= $9::timestamptz
                  AND exact_run.global_id = $7
                  AND exact_run.provider = 'faire'
                  AND exact_run.resource = 'products_and_orders'
                  AND exact_run.credential_version = $6::integer
                  AND exact_run.created_by
                     = 'system:commerce-order-reconciliation'
+                 AND exact_run.created_at >= $9::timestamptz
                  AND exact_run.workflow_state <> 'expired'
                  AND exact_run.expires_at > now()
                  AND prior.external_order_id = $3
@@ -13477,6 +13676,8 @@ export async function promoteCommerceCandidateInPostgres(input: {
                  AND prior.provider = 'faire'
                  AND prior.created_by
                     = 'system:commerce-order-reconciliation'
+                 AND prior.provider_created_at >= $9::timestamptz
+                 AND prior.observed_at >= $9::timestamptz
                  AND prior.workflow_state IN ('held', 'resolving', 'ready')
                  AND prior.customer_resolution_state <> 'unsupported'
                  AND prior.expires_at > now()
@@ -13486,6 +13687,8 @@ export async function promoteCommerceCandidateInPostgres(input: {
                  AND prior_run.credential_version = $6::integer
                  AND prior_run.created_by
                     = 'system:commerce-order-reconciliation'
+                 AND prior_run.created_at >= $9::timestamptz
+                 AND discovery_intent.created_at >= $9::timestamptz
                  AND prior_run.workflow_state <> 'expired'
                  AND prior_run.expires_at > now()
                  AND NOT EXISTS (
@@ -13597,6 +13800,7 @@ export async function promoteCommerceCandidateInPostgres(input: {
             input.runtime.credentialVersion,
             input.automaticFairePromotion.runGlobalId,
             input.automaticFairePromotion.sourceHash,
+            input.automaticFairePromotion.notBefore,
           ],
         )
       ).rows[0]
@@ -13609,10 +13813,8 @@ export async function promoteCommerceCandidateInPostgres(input: {
         || !authority?.current_worker_run
         || authority.unsafe_candidate_history
         || authority.newer_candidate
-        || (
-          authority.prior_candidate
-          && !authority.exact_refresh_lineage
-        )
+        || !authority.prior_candidate
+        || !authority.exact_refresh_lineage
       ) {
         intakeError(
           'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_AUTHORITY_STALE',
