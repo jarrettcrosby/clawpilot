@@ -70,6 +70,7 @@ import {
   recordShopifyWebhookReceiptInPostgres,
   setCommerceIntegrationEnabledInPostgres,
   writeCommerceCredentialInPostgres,
+  type CommerceIntegrationsState,
   type CommerceRuntimeCredentialRecord,
   type CommerceSyncResource,
 } from '@/lib/persistence/commerceIntegrations'
@@ -353,11 +354,35 @@ const FAIRE_SYNC_RESOURCES: CommerceSyncResource[] = [
   'returns',
 ]
 
-function webhookUrl(globalId: string) {
+function webhookUrl(globalId: string, publicUrl = appPublicUrl()) {
   return new URL(
     `/api/integrations/commerce/shopify/webhooks/${globalId}`,
-    appPublicUrl(),
+    publicUrl,
   ).toString()
+}
+
+export type CommerceIntegrationsViewState = Omit<
+  CommerceIntegrationsState,
+  'accounts'
+> & {
+  accounts: Array<CommerceIntegrationsState['accounts'][number] & {
+    webhookUrl: string | null
+  }>
+}
+
+export function createCommerceIntegrationsStateProjector(): (
+  state: CommerceIntegrationsState,
+) => CommerceIntegrationsViewState {
+  const publicUrl = appPublicUrl()
+  return (state) => ({
+    ...state,
+    accounts: state.accounts.map((account) => ({
+      ...account,
+      webhookUrl: account.provider === 'shopify'
+        ? webhookUrl(account.globalId, publicUrl)
+        : null,
+    })),
+  })
 }
 
 export function faireOAuthCallbackUrl() {
@@ -613,17 +638,10 @@ export async function getCommerceIntegrationsState(
   organizationIdValue: unknown,
 ) {
   const organizationId = normalizeCommerceOrganizationId(organizationIdValue)
+  const project = createCommerceIntegrationsStateProjector()
   await purgeExpiredShopifyOrderPreviewsInPostgres()
   const state = await readCommerceIntegrationsStateFromPostgres(organizationId)
-  return {
-    ...state,
-    accounts: state.accounts.map((account) => ({
-      ...account,
-      webhookUrl: account.provider === 'shopify'
-        ? webhookUrl(account.globalId)
-        : null,
-    })),
-  }
+  return project(state)
 }
 
 export async function revealCommerceCredential(input: {

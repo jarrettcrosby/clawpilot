@@ -3,6 +3,7 @@ import {
   connectFaireCommerce,
   connectShopifyCommerce,
   CommerceIntegrationRequestError,
+  createCommerceIntegrationsStateProjector,
   disconnectCommerceIntegration,
   faireOAuthCallbackUrl,
   getCommerceIntegrationsState,
@@ -81,6 +82,17 @@ function requirePostgres() {
       'COMMERCE_POSTGRES_REQUIRED',
     )
   }
+}
+
+type CommerceMutationState = Parameters<
+  ReturnType<typeof createCommerceIntegrationsStateProjector>
+>[0]
+
+async function commerceMutationIntegrations(
+  mutation: () => Promise<CommerceMutationState>,
+) {
+  const project = createCommerceIntegrationsStateProjector()
+  return project(await mutation())
 }
 
 function organizationId(actor: AppUser) {
@@ -329,15 +341,17 @@ export async function PATCH(req: NextRequest) {
           'COMMERCE_LIVE_ACCESS_CONFIRMATION_REQUIRED',
         )
       }
-      const integrations = await connectShopifyCommerce({
-        organizationId: organization,
-        environment: body.environment,
-        displayName: body.displayName,
-        shopDomain: body.shopDomain,
-        clientId: body.clientId,
-        clientSecret: body.clientSecret,
-        actorEmail: actor.email,
-      })
+      const integrations = await commerceMutationIntegrations(
+        () => connectShopifyCommerce({
+          organizationId: organization,
+          environment: body.environment,
+          displayName: body.displayName,
+          shopDomain: body.shopDomain,
+          clientId: body.clientId,
+          clientSecret: body.clientSecret,
+          actorEmail: actor.email,
+        }),
+      )
       return json({
         ok: true,
         canManage: true,
@@ -357,11 +371,13 @@ export async function PATCH(req: NextRequest) {
           'COMMERCE_PROVIDER_WRITE_CONFIRMATION_REQUIRED',
         )
       }
-      const integrations = await registerShopifyInventoryWebhookSubscriptions({
-        organizationId: organization,
-        accountGlobalId: body.accountGlobalId,
-        actorEmail: actor.email,
-      })
+      const integrations = await commerceMutationIntegrations(
+        () => registerShopifyInventoryWebhookSubscriptions({
+          organizationId: organization,
+          accountGlobalId: body.accountGlobalId,
+          actorEmail: actor.email,
+        }),
+      )
       return json({
         ok: true,
         canManage: true,
@@ -381,11 +397,13 @@ export async function PATCH(req: NextRequest) {
           'COMMERCE_PROVIDER_WRITE_CONFIRMATION_REQUIRED',
         )
       }
-      const integrations = await registerShopifyCatalogWebhookSubscriptions({
-        organizationId: organization,
-        accountGlobalId: body.accountGlobalId,
-        actorEmail: actor.email,
-      })
+      const integrations = await commerceMutationIntegrations(
+        () => registerShopifyCatalogWebhookSubscriptions({
+          organizationId: organization,
+          accountGlobalId: body.accountGlobalId,
+          actorEmail: actor.email,
+        }),
+      )
       return json({
         ok: true,
         canManage: true,
@@ -441,12 +459,14 @@ export async function PATCH(req: NextRequest) {
           'COMMERCE_LIVE_ACCESS_CONFIRMATION_REQUIRED',
         )
       }
-      const integrations = await connectFaireCommerce({
-        organizationId: organization,
-        displayName: body.displayName,
-        accessToken: body.accessToken,
-        actorEmail: actor.email,
-      })
+      const integrations = await commerceMutationIntegrations(
+        () => connectFaireCommerce({
+          organizationId: organization,
+          displayName: body.displayName,
+          accessToken: body.accessToken,
+          actorEmail: actor.email,
+        }),
+      )
       return json({
         ok: true,
         canManage: true,
@@ -458,11 +478,13 @@ export async function PATCH(req: NextRequest) {
 
     if (action === 'test-connection') {
       only(body, ['action', 'accountGlobalId'])
-      const integrations = await testCommerceConnection({
-        organizationId: organization,
-        accountGlobalId: body.accountGlobalId,
-        actorEmail: actor.email,
-      })
+      const integrations = await commerceMutationIntegrations(
+        () => testCommerceConnection({
+          organizationId: organization,
+          accountGlobalId: body.accountGlobalId,
+          actorEmail: actor.email,
+        }),
+      )
       return json({
         ok: true,
         canManage: true,
@@ -478,12 +500,14 @@ export async function PATCH(req: NextRequest) {
     ) {
       only(body, ['action', 'accountGlobalId', 'enabled'])
       if (body.enabled === true) requireActivator(actor)
-      const integrations = await setCommerceIntegrationEnabled({
-        organizationId: organization,
-        accountGlobalId: body.accountGlobalId,
-        enabled: body.enabled,
-        actorEmail: actor.email,
-      })
+      const integrations = await commerceMutationIntegrations(
+        () => setCommerceIntegrationEnabled({
+          organizationId: organization,
+          accountGlobalId: body.accountGlobalId,
+          enabled: body.enabled,
+          actorEmail: actor.email,
+        }),
+      )
       return json({
         ok: true,
         canManage: true,
@@ -503,15 +527,17 @@ export async function PATCH(req: NextRequest) {
         'confirmCustomerNotifications',
       ])
       requireActivator(actor)
-      const integrations = await setShopifyFulfillmentNotificationPolicy({
-        organizationId: organization,
-        accountGlobalId: body.accountGlobalId,
-        expectedRevision: body.expectedRevision,
-        notifyCustomerDefault: body.notifyCustomerDefault,
-        reason: body.reason,
-        confirmCustomerNotifications: body.confirmCustomerNotifications,
-        actorEmail: actor.email,
-      })
+      const integrations = await commerceMutationIntegrations(
+        () => setShopifyFulfillmentNotificationPolicy({
+          organizationId: organization,
+          accountGlobalId: body.accountGlobalId,
+          expectedRevision: body.expectedRevision,
+          notifyCustomerDefault: body.notifyCustomerDefault,
+          reason: body.reason,
+          confirmCustomerNotifications: body.confirmCustomerNotifications,
+          actorEmail: actor.email,
+        }),
+      )
       return json({
         ok: true,
         canManage: true,
@@ -524,11 +550,13 @@ export async function PATCH(req: NextRequest) {
 
     if (action === 'disconnect') {
       only(body, ['action', 'accountGlobalId'])
-      const integrations = await disconnectCommerceIntegration({
-        organizationId: organization,
-        accountGlobalId: body.accountGlobalId,
-        actorEmail: actor.email,
-      })
+      const integrations = await commerceMutationIntegrations(
+        () => disconnectCommerceIntegration({
+          organizationId: organization,
+          accountGlobalId: body.accountGlobalId,
+          actorEmail: actor.email,
+        }),
+      )
       return json({
         ok: true,
         canManage: true,
