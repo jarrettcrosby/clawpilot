@@ -1189,7 +1189,7 @@ export default function UserAccessDialog({
                 <Typography variant="subtitle2" color="text.primary" fontWeight={700} mb={1}>Invite</Typography>
                 <Alert severity="info" variant="outlined" sx={{ mb: 1.5, borderRadius: '8px' }}>
                   Choose the organization whose data this person may access.
-                  Choose the primary organization for this invite, then optionally add more organizations as member access.
+                  Choose the primary organization for this invite, then optionally add other organizations you manage as member access.
                   New invitations start as Members; after inviting, the owner can promote to Admin and adjust permissions
                   on the user card. Enable CRM employee only when the person should own CRM records.
                 </Alert>
@@ -1328,7 +1328,7 @@ export default function UserAccessDialog({
                       </Box>
                     ) : (
                       <Alert severity="info" variant="outlined" sx={{ mt: 0.75 }}>
-                        No other workspace organizations are available in this account graph.
+                        No other workspace organizations are available for you to manage.
                         Choose <strong>Create child organization</strong> above to create one with this invitation,
                         or invite this person to the selected primary organization only.
                       </Alert>

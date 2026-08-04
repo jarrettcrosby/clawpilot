@@ -172,21 +172,18 @@ try {
       }
 
       if (sql.includes('UPDATE app_user_organization_memberships')) {
+        const organizationIds = Array.isArray(values[1]) ? values[1] : []
         if (
           values[0] === 'invited@example.com'
-          && (
-            values[1] === invitationOrganizationId
-            || (Array.isArray(values[2]) && values[2].includes(values[1]))
-          )
+          && organizationIds.includes(invitationOrganizationId)
         ) {
-          const organizationIds = [values[1], ...(Array.isArray(values[2]) ? values[2] : [])]
           const seen = new Set()
           for (const organizationId of organizationIds) {
             if (typeof organizationId !== 'string' || seen.has(organizationId)) continue
             seen.add(organizationId)
             activatedMemberships.push({ email: values[0], organizationId })
           }
-          return { rows: [{ organization_id: values[1] }], rowCount: 1 }
+          return { rows: organizationIds.map((organizationId) => ({ organization_id: organizationId })), rowCount: organizationIds.length }
         }
         return { rows: [], rowCount: 0 }
       }
@@ -279,8 +276,8 @@ try {
     authModule.source.indexOf('const activatedMembership'),
     authModule.source.indexOf('const activated ='),
   )
-  assert.ok(invitationActivationSource.includes('AND organization_id = ANY($3::uuid[])'))
-  assert.ok(!invitationActivationSource.includes('organization_id = $2::uuid'))
+  assert.ok(invitationActivationSource.includes('AND organization_id = ANY($2::uuid[])'))
+  assert.ok(!invitationActivationSource.includes('ANY($3::uuid[])'))
   assert.ok(authModule.source.includes('workspace_organization_ids'))
   assert.ok(authModule.source.includes('workspace_organization_ids::uuid[]'))
   assert.ok(!authModule.source.includes('console.'))

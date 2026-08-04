@@ -218,7 +218,7 @@ for (const fragment of [
 const userInviteDialog = read('app_src/components/settings/UserAccessDialog.tsx')
 for (const fragment of [
   'Additional organizations',
-  'No other workspace organizations are available in this account graph',
+  'No other workspace organizations are available for you to manage',
   'organizationIds',
   'inviteOrganizationOptions',
 ]) {
@@ -246,6 +246,22 @@ for (const fragment of [
   assertIncludes(invitations, fragment, 'invitation multi-org persistence')
 }
 
+const organizations = read('app_src/lib/organizations.ts')
+for (const fragment of [
+  'invitation_organizations',
+  "membership.permissions ->> 'inviteUsers'",
+  'Invitation organization is outside the workspaces you can manage',
+  'membership.user_email = $1',
+]) {
+  assertIncludes(organizations, fragment, 'cross-workspace invitation organization scope')
+}
+
+assertIncludes(
+  users,
+  'requireInvitationOrganizationInActorScope(actor, organizationId)',
+  'cross-workspace invitation authorization',
+)
+
 assert.ok(
   invitations.indexOf('assignment.organization.id')
     < invitations.indexOf('requestedOrganizationIds.filter'),
@@ -261,7 +277,7 @@ const authMagicCode = read('app_src/lib/authMagicCode.ts')
 for (const fragment of [
   'membership.organization_id = invitation.workspace_organization_id',
   "membership.status = 'invited'",
-  'AND organization_id = ANY($3::uuid[])',
+  'AND organization_id = ANY($2::uuid[])',
   'organization_id: invitation.rows[0].workspace_organization_id',
 ]) {
   assertIncludes(authMagicCode, fragment, 'organization-specific invitation acceptance')
@@ -272,7 +288,7 @@ const invitationActivationSource = authMagicCode.slice(
   authMagicCode.indexOf('const activated ='),
 )
 assert.ok(
-  !invitationActivationSource.includes('organization_id = $2::uuid'),
+  !invitationActivationSource.includes('ANY($3::uuid[])'),
   'invitation acceptance must not restrict activation to only the primary organization',
 )
 

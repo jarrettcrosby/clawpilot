@@ -442,13 +442,13 @@ assertIncludes(magicCodeAdapter, 'UPDATE app_user_invitations', 'atomic invitati
 assertIncludes(magicCodeAdapter, 'AUTHORIZATION_CHANGED', 'invitation authorization rollback')
 assertIncludes(magicCodeAdapter, 'membership.organization_id = invitation.workspace_organization_id', 'invitation organization acceptance boundary')
 assertIncludes(magicCodeAdapter, 'UPDATE app_user_organization_memberships', 'invitation membership activation')
-assertIncludes(magicCodeAdapter, 'AND organization_id = ANY($3::uuid[])', 'multi-organization invitation membership activation')
+assertIncludes(magicCodeAdapter, 'AND organization_id = ANY($2::uuid[])', 'multi-organization invitation membership activation')
 const invitationMembershipActivation = magicCodeAdapter.slice(
   magicCodeAdapter.indexOf('const activatedMembership'),
   magicCodeAdapter.indexOf('const activated ='),
 )
 assert.ok(
-  !invitationMembershipActivation.includes('organization_id = $2::uuid'),
+  !invitationMembershipActivation.includes('ANY($3::uuid[])'),
   'multi-organization invitation acceptance must not be restricted to the primary organization',
 )
 
@@ -1044,8 +1044,9 @@ assertIncludes(crmBoardProjection, 'DELETE FROM crm_board_cards', 'stale CRM pro
 
 const organizationsAdapter = read('app_src/lib/organizations.ts')
 assertIncludes(organizationsAdapter, 'resolveInvitationWorkspaceOrganization', 'invitation membership resolver')
-assertIncludes(organizationsAdapter, 'outside your managed account graph', 'invitation organization subtree boundary')
-assertIncludes(organizationsAdapter, 'WHERE organization.id = $1::uuid', 'organization hierarchy scoped root')
+assertIncludes(organizationsAdapter, 'outside the workspaces you can manage', 'invitation organization membership boundary')
+assertIncludes(organizationsAdapter, 'invitation_organizations', 'cross-workspace invitation organization catalog')
+assertIncludes(organizationsAdapter, "membership.permissions ->> 'inviteUsers'", 'cross-workspace invitation permission boundary')
 assertIncludes(organizationsAdapter, 'defines your admin scope', 'organization reparenting scope boundary')
 assertIncludes(organizationsAdapter, "relationship_type = 'workspace_member'", 'CRM customer account promotion')
 assertIncludes(organizationsAdapter, 'retireUnusedWorkspaceOrganization', 'failed child organization cleanup')

@@ -318,6 +318,43 @@ async function requireOrganizationInActorScope(actor: AppUser, organizationId: s
   }
 }
 
+async function requireInvitationOrganizationInActorScope(actor: AppUser, organizationId: string | null) {
+  if (!organizationId) {
+    throw new AppUserAuthorizationError('Invitation organization is outside the workspaces you can manage')
+  }
+  const result = await query<{ allowed: boolean }>(
+    `WITH RECURSIVE ancestors AS (
+       SELECT organization.id, organization.parent_id, ARRAY[organization.id] AS path
+       FROM workspace_organizations organization
+       WHERE organization.id = $2::uuid
+       UNION ALL
+       SELECT parent.id, parent.parent_id, ancestor.path || parent.id
+       FROM workspace_organizations parent
+       JOIN ancestors ancestor ON ancestor.parent_id = parent.id
+       WHERE NOT parent.id = ANY(ancestor.path)
+     )
+     SELECT EXISTS (
+       SELECT 1
+       FROM ancestors ancestor
+       JOIN app_user_organization_memberships membership
+         ON membership.organization_id = ancestor.id
+       WHERE membership.user_email = $1
+         AND membership.status = 'active'
+         AND (
+           membership.role = 'owner'
+           OR (
+             membership.role = 'admin'
+             AND COALESCE((membership.permissions ->> 'inviteUsers')::boolean, false)
+           )
+         )
+     ) AS allowed`,
+    [actor.email, organizationId],
+  )
+  if (!result.rows[0]?.allowed) {
+    throw new AppUserAuthorizationError('Invitation organization is outside the workspaces you can manage')
+  }
+}
+
 function toAppUser(row: AppUserRow): AppUser {
   return {
     email: row.email,
@@ -540,7 +577,7 @@ export async function inviteAppUser(input: {
     }>()
 
     for (const organizationId of organizationIds) {
-      await requireOrganizationInActorScope(actor, organizationId)
+      await requireInvitationOrganizationInActorScope(actor, organizationId)
       const organization = await client.query<{ id: string; name: string }>(
         `SELECT organization.id::text, organization.name
          FROM workspace_organizations organization
