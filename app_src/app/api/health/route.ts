@@ -3311,6 +3311,10 @@ export async function GET() {
               heartbeatAt: orderHeartbeat?.checkedAt || null,
               phase: orderHeartbeat?.phase || null,
               ageMs: orderAgeMs,
+              automaticShopifyOrderPromotion:
+                orderHeartbeat?.automaticShopifyOrderPromotion || null,
+              automaticFaireOrderPromotion:
+                orderHeartbeat?.automaticFaireOrderPromotion || null,
               ...orderState,
             }
             if (!loopReachable) {
@@ -3323,7 +3327,14 @@ export async function GET() {
                 'Commerce order reconciliation has failed accounts.',
               )
             }
-            if (orderState.promotionAttentionRequired > 0) {
+            if (
+              orderState.providerPromotionAttentionRequired.shopify > 0
+            ) {
+              warnings.push(
+                'Shopify provider reads completed, but clean-path automatic local order promotion needs operator attention.',
+              )
+            }
+            if (orderState.providerPromotionAttentionRequired.faire > 0) {
               warnings.push(
                 'Faire provider reads completed, but automatic local order promotion needs operator attention.',
               )

@@ -62,6 +62,14 @@ function loadTypeScriptModule(path, mocks = {}, globals = {}) {
           'app_src/lib/integrations/commerceFaireAutomaticPromotion.ts',
         )
       }
+      if (
+        specifier
+        === '@/lib/integrations/commerceShopifyAutomaticPromotion'
+      ) {
+        return loadTypeScriptModule(
+          'app_src/lib/integrations/commerceShopifyAutomaticPromotion.ts',
+        )
+      }
       return nodeRequire(specifier)
     },
     ...globals,
@@ -494,7 +502,49 @@ class CommerceIntegrationRequestError extends Error {
   }
 }
 
-function loadCommerceStagingService(pool, counters) {
+function loadShopifyCheckoutRatingPersistence(pool) {
+  const currency = loadTypeScriptModule('app_src/lib/currency.ts')
+  const postgres = {
+    acquireTransactionAdvisoryLock: (client, key) => client.query(
+      'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
+      [key],
+    ),
+    getPostgresPool: () => pool,
+    query: (sql, values) => pool.query(sql, values),
+    async withTransaction(operation) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const result = await operation(client)
+        await client.query('COMMIT')
+        return result
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {})
+        throw error
+      } finally {
+        client.release()
+      }
+    },
+  }
+  return loadTypeScriptModule(
+    'app_src/lib/persistence/shopifyCheckoutRating.ts',
+    {
+      '@/lib/auditWriter': { recordAuditEvent: async () => {} },
+      '@/lib/operations/shopifyCheckoutPlanRatePolicy':
+        loadTypeScriptModule(
+          'app_src/lib/operations/shopifyCheckoutPlanRatePolicy.ts',
+          { '../currency.ts': currency },
+        ),
+      '@/lib/operations/shopifyCheckoutRateWarmPolicy':
+        loadTypeScriptModule(
+          'app_src/lib/operations/shopifyCheckoutRateWarmPolicy.ts',
+        ),
+      '@/lib/persistence/postgres': postgres,
+    },
+  )
+}
+
+function loadCommerceStagingService(pool, counters, options = {}) {
   const mustNotRun = (name) => () => {
     throw new Error(`${name} must not run during order-only staging acceptance`)
   }
@@ -630,9 +680,8 @@ function loadCommerceStagingService(pool, counters) {
         encryptCommerceIntakeContinuation: mustNotRun(
           'encryptCommerceIntakeContinuation',
         ),
-        shopifyCheckoutDestinationFingerprint: mustNotRun(
-          'shopifyCheckoutDestinationFingerprint',
-        ),
+        shopifyCheckoutDestinationFingerprint: () =>
+          hash('shopify-clean-path-destination'),
       },
       '@/lib/integrations/commerceIntegrations': {
         CommerceIntegrationRequestError,
@@ -719,13 +768,14 @@ function loadCommerceStagingService(pool, counters) {
         ),
       },
       '@/lib/persistence/productChannelStates': productChannelStates,
-      '@/lib/persistence/shopifyCheckoutRating': {
+      '@/lib/persistence/shopifyCheckoutRating': options
+        .shopifyCheckoutRating || {
         reconcileShopifyCheckoutRateForOrderCandidateWithClient: mustNotRun(
           'reconcileShopifyCheckoutRateForOrderCandidateWithClient',
         ),
         shopifyCheckoutRateLineageIsRequired: () => false,
         shopifyCheckoutRateOutcomeAllowsFulfillment: () => false,
-      },
+        },
     },
     {
       fetch() {
@@ -3773,6 +3823,816 @@ async function verifyPromotionNumericScaleAcceptance(
   assert.equal(counters.fetchCalls, 0)
 }
 
+async function verifyAutomaticShopifyCleanPromotion(
+  pool,
+  ids,
+  counters,
+) {
+  const candidateKeys = {
+    success: 'gid://shopify/Order/mapped-fractional',
+    missing: 'gid://shopify/Order/mismatch-positive',
+    ambiguous: 'gid://shopify/Order/negative-positive',
+    expired: 'gid://shopify/Order/fulfilled-missing',
+  }
+  const sourceTimestamp = new Date().toISOString()
+  const requestedDeliveryAt = new Date(
+    Date.now() + 2 * 24 * 60 * 60 * 1_000,
+  ).toISOString()
+  const address = {
+    name: 'Shopify clean-path acceptance',
+    line1: '123 Test Street',
+    city: 'Atlanta',
+    region: 'GA',
+    postalCode: '30301',
+    country: 'US',
+  }
+  const addressCiphertext = Buffer.from(JSON.stringify(address), 'utf8')
+
+  await pool.query(
+    `INSERT INTO app_users (email, role, status)
+     VALUES ('system:commerce-order-reconciliation', 'owner', 'active')
+     ON CONFLICT (email) DO NOTHING`,
+  )
+
+  await pool.query(
+    `UPDATE operations_integration_accounts
+     SET environment = 'sandbox', status = 'active', updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid`,
+    [ids.organization, ids.integrationAccount],
+  )
+  await pool.query(
+    `INSERT INTO operations_commerce_credentials (
+       organization_id, integration_account_id, external_account_id,
+       auth_mode, credential_ciphertext, credential_iv, credential_tag,
+       credential_version, credential_identifier_last_four,
+       verification_status, verified_at, webhook_verification_status,
+       created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, 'gid://shopify/Shop/9201',
+       'shopify_client_credentials', $3, $4, $5, 1, '9201',
+       'verified', now(), 'unverified', $6, $6
+     ) ON CONFLICT (organization_id, integration_account_id) DO UPDATE SET
+       verification_status = 'verified',
+       verified_at = now(),
+       last_error_code = NULL,
+       credential_version = 1,
+       updated_by = EXCLUDED.updated_by,
+       updated_at = now()`,
+    [
+      ids.organization,
+      ids.integrationAccount,
+      Buffer.from('shopify-clean-path-test-credential'),
+      Buffer.alloc(12, 3),
+      Buffer.alloc(16, 4),
+      actorEmail,
+    ],
+  )
+
+  const profileVersion = (await pool.query(
+    `SELECT
+       version.id::text,
+       version.row_version::integer,
+       profile.package_level,
+       version.base_each_quantity,
+       version.length_mm,
+       version.width_mm,
+       version.height_mm,
+       version.gross_weight_grams
+     FROM operations_product_pack_profile_versions version
+     JOIN operations_product_pack_profiles profile
+       ON profile.organization_id = version.organization_id
+      AND profile.pipeline_id = version.pipeline_id
+      AND profile.product_id = version.product_id
+      AND profile.id = version.profile_id
+     WHERE version.organization_id = $1::uuid
+       AND version.pipeline_id = $2::uuid
+       AND version.product_id = $3::uuid
+       AND version.is_current = true
+       AND version.lifecycle_state IN ('customer_confirmed', 'active')
+       AND profile.status <> 'retired'
+       AND version.dimension_basis = 'outer'
+       AND version.gross_weight_grams IS NOT NULL
+     ORDER BY profile.is_default DESC, version.created_at DESC
+     LIMIT 1`,
+    [ids.organization, ids.pipeline, ids.product],
+  )).rows[0]
+  assert.ok(profileVersion?.id, 'A current exact pack profile is required')
+
+  let channelState = (await pool.query(
+    `SELECT id::text, pack_evidence_hash
+     FROM operations_product_channel_states
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_variant_id = $3`,
+    [ids.organization, ids.integrationAccount, ids.mappedVariant],
+  )).rows[0]
+  if (!channelState) {
+    channelState = (await pool.query(
+      `INSERT INTO operations_product_channel_states (
+         organization_id, integration_account_id, pipeline_id, provider,
+         external_product_id, external_variant_id, product_id,
+         product_mapping_id, provider_status_raw, normalized_status,
+         provider_active, provider_updated_at, observed_at, source_revision,
+         source_hash, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'shopify',
+         'gid://shopify/Product/mapped-zero', $4, $5::uuid, $6::uuid,
+         'ACTIVE', 'active', true, now(), now(), $7, $8, $9, $9
+       ) RETURNING id::text, pack_evidence_hash`,
+      [
+        ids.organization,
+        ids.integrationAccount,
+        ids.pipeline,
+        ids.mappedVariant,
+        ids.product,
+        ids.productMapping,
+        sourceTimestamp,
+        hash('shopify-clean-path-channel-state'),
+        actorEmail,
+      ],
+    )).rows[0]
+  }
+  let packMapping = (await pool.query(
+    `SELECT id::text, row_version::integer, pack_evidence_hash
+     FROM operations_commerce_variant_pack_mappings
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND provider = 'shopify'
+       AND external_variant_id = $3
+       AND is_current = true`,
+    [ids.organization, ids.integrationAccount, ids.mappedVariant],
+  )).rows[0]
+  if (!packMapping) {
+    packMapping = (await pool.query(
+      `INSERT INTO operations_commerce_variant_pack_mappings (
+         organization_id, integration_account_id, pipeline_id, product_id,
+         provider, external_product_id, external_variant_id,
+         default_pack_profile_version_id, provider_lifecycle_state,
+         projection_state, source_revision, source_hash, provider_updated_at,
+         observed_at, is_current, pack_evidence_hash, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'shopify',
+         'gid://shopify/Product/mapped-zero', $5, $6::uuid, 'active',
+         'current', $7, $8, now(), now(), true, $9, $10, $10
+       ) RETURNING id::text, row_version::integer, pack_evidence_hash`,
+      [
+        ids.organization,
+        ids.integrationAccount,
+        ids.pipeline,
+        ids.product,
+        ids.mappedVariant,
+        profileVersion.id,
+        sourceTimestamp,
+        hash('shopify-clean-path-pack-mapping'),
+        channelState.pack_evidence_hash,
+        actorEmail,
+      ],
+    )).rows[0]
+  }
+  assert.equal(packMapping.pack_evidence_hash, channelState.pack_evidence_hash)
+
+  const setup = await pool.connect()
+  try {
+    await setup.query('SET session_replication_role = replica')
+    await setup.query(
+      `UPDATE operations_commerce_intake_runs run
+       SET created_by = 'system:commerce-order-reconciliation',
+           updated_by = 'system:commerce-order-reconciliation',
+           expires_at = now() + interval '7 days'
+       FROM operations_commerce_order_candidates candidate
+       WHERE candidate.run_id = run.id
+         AND candidate.organization_id = $1::uuid
+         AND candidate.external_order_id = ANY($2::text[])`,
+      [ids.organization, Object.values(candidateKeys)],
+    )
+    const updatedCandidates = await setup.query(
+      `UPDATE operations_commerce_order_candidates candidate
+       SET normalized_order_status = 'open',
+           normalized_payment_status = 'paid',
+           normalized_fulfillment_status = 'unfulfilled',
+           normalized_return_status = 'none',
+           requires_shipping = true,
+           currency_code = 'USD',
+           subtotal_minor = 0,
+           discount_minor = 0,
+           brand_discount_minor = 0,
+           shipping_minor = 2071,
+           tax_minor = 0,
+           other_adjustment_minor = 0,
+           total_minor = 2071,
+           header_money_state = 'complete',
+           header_money_gaps = '{}'::text[],
+           customer_resolution_state = 'resolved',
+           customer_match_method = 'external_id',
+           customer_id = $3::uuid,
+           ship_to_snapshot_state = 'confirmed',
+           ship_to_snapshot_source = 'provider',
+           ship_to_snapshot_ciphertext = $4,
+           ship_to_snapshot_iv = $5,
+           ship_to_snapshot_tag = $6,
+           ship_to_snapshot_hash = $7,
+           ship_to_snapshot_encryption_version = 1,
+           delivery_resolution_state = 'policy',
+           requested_delivery_at = $8::timestamptz,
+           delivery_policy_version = 'shopify-clean-path-test-v1',
+           provider_created_at = $9::timestamptz,
+           provider_updated_at = $9::timestamptz,
+           observed_at = $9::timestamptz,
+           source_revision = candidate.external_order_id || ':clean-v1',
+           source_hash = encode(
+             digest(candidate.external_order_id || ':clean-v1', 'sha256'),
+             'hex'
+           ),
+           checkout_destination_fingerprint = encode(
+             digest(candidate.external_order_id || ':destination', 'sha256'),
+             'hex'
+           ),
+           checkout_shipping_service_code = 'clawpilot:ups:ground',
+           workflow_state = 'ready',
+           blocking_codes = '{}'::text[],
+           row_version = candidate.row_version + 1,
+           updated_by = 'system:commerce-order-reconciliation',
+           updated_at = now(),
+           expires_at = now() + interval '7 days'
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.external_order_id = ANY($2::text[])
+       RETURNING candidate.id::text, candidate.global_id,
+                 candidate.external_order_id,
+                 candidate.run_id::text, candidate.row_version::integer`,
+      [
+        ids.organization,
+        Object.values(candidateKeys),
+        ids.customer,
+        addressCiphertext,
+        Buffer.alloc(12, 5),
+        Buffer.alloc(16, 6),
+        hash(addressCiphertext),
+        requestedDeliveryAt,
+        sourceTimestamp,
+      ],
+    )
+    assert.equal(updatedCandidates.rowCount, 4)
+    const updatedLines = await setup.query(
+      `UPDATE operations_commerce_order_candidate_lines line
+       SET external_product_id = 'gid://shopify/Product/mapped-zero',
+           external_variant_id = $3,
+           sku_snapshot = 'POSTGRES-MAPPED',
+           provider_status_raw = 'OPEN',
+           normalized_status = 'open',
+           ordered_quantity = 1,
+           current_quantity = 1,
+           cancelled_quantity = 0,
+           fulfilled_quantity = 0,
+           unfulfilled_quantity = 1,
+           returned_quantity = 0,
+           unit_multiplier = 1,
+           physical_quantity = 1,
+           currency_code = 'USD',
+           unit_price_minor = 0,
+           subtotal_minor = 0,
+           discount_minor = 0,
+           brand_discount_minor = 0,
+           tax_minor = 0,
+           other_adjustment_minor = 0,
+           total_minor = 0,
+           price_resolution_state = 'provider',
+           resolved_currency_code = 'USD',
+           resolved_unit_price_minor = 0,
+           resolved_subtotal_minor = 0,
+           resolved_discount_minor = 0,
+           resolved_brand_discount_minor = 0,
+           resolved_tax_minor = 0,
+           resolved_other_adjustment_minor = 0,
+           resolved_total_minor = 0,
+           requires_shipping = true,
+           mapping_state = 'resolved',
+           product_id = $4::uuid,
+           product_mapping_id = $5::uuid,
+           packaging_state = 'resolved',
+           package_profile_id = NULL,
+           packaging_source = 'variant_pack_mapping',
+           commerce_variant_pack_mapping_id = $6::uuid,
+           commerce_variant_pack_mapping_row_version = $7::bigint,
+           pack_profile_version_id = $8::uuid,
+           pack_profile_version_row_version = $9::bigint,
+           pack_profile_package_level = $10,
+           pack_profile_base_each_quantity = $11::integer,
+           packaging_weight_source = 'profile_version',
+           weight_grams = $12::integer,
+           length_mm = $13::integer,
+           width_mm = $14::integer,
+           height_mm = $15::integer,
+           observed_at = $16::timestamptz,
+           source_revision = line.external_line_id || ':clean-v1',
+           source_hash = encode(
+             digest(line.external_line_id || ':clean-v1', 'sha256'), 'hex'
+           ),
+           workflow_state = 'ready',
+           blocking_codes = '{}'::text[],
+           row_version = line.row_version + 1,
+           updated_by = 'system:commerce-order-reconciliation',
+           updated_at = now(),
+           expires_at = now() + interval '7 days'
+       FROM operations_commerce_order_candidates candidate
+       WHERE line.organization_id = $1::uuid
+         AND candidate.organization_id = line.organization_id
+         AND candidate.id = line.order_candidate_id
+         AND candidate.external_order_id = ANY($2::text[])
+       RETURNING line.id::text`,
+      [
+        ids.organization,
+        Object.values(candidateKeys),
+        ids.mappedVariant,
+        ids.product,
+        ids.productMapping,
+        packMapping.id,
+        packMapping.row_version,
+        profileVersion.id,
+        profileVersion.row_version,
+        profileVersion.package_level,
+        profileVersion.base_each_quantity,
+        profileVersion.gross_weight_grams,
+        profileVersion.length_mm,
+        profileVersion.width_mm,
+        profileVersion.height_mm,
+        sourceTimestamp,
+      ],
+    )
+    assert.equal(updatedLines.rowCount, 4)
+  } finally {
+    await setup.query('SET session_replication_role = origin').catch(() => {})
+    setup.release()
+  }
+
+  const candidates = (await pool.query(
+    `SELECT
+       candidate.id::text,
+       candidate.global_id,
+       candidate.external_order_id,
+       candidate.row_version::integer,
+       candidate.provider_created_at,
+       candidate.observed_at,
+       candidate.checkout_destination_fingerprint,
+       run.global_id AS run_global_id,
+       operations_shopify_checkout_order_line_quantity_fingerprint(
+         candidate.organization_id, candidate.id
+       ) AS line_quantity_fingerprint
+     FROM operations_commerce_order_candidates candidate
+     JOIN operations_commerce_intake_runs run
+       ON run.id = candidate.run_id
+     WHERE candidate.organization_id = $1::uuid
+       AND candidate.external_order_id = ANY($2::text[])`,
+    [ids.organization, Object.values(candidateKeys)],
+  )).rows
+  const byExternalId = new Map(candidates.map((row) => [
+    row.external_order_id,
+    row,
+  ]))
+  const runGlobalId = candidates[0].run_global_id
+  assert.ok(candidates.every((candidate) => (
+    candidate.run_global_id === runGlobalId
+  )))
+
+  async function insertCheckoutReceipt(input) {
+    const candidate = input.candidate
+    const providerCreatedAt = new Date(candidate.provider_created_at).getTime()
+    const createdAt = new Date(
+      providerCreatedAt - (input.expired ? 3 * 60 * 60_000 : 60_000),
+    )
+    const windowSeconds = input.expired ? 60 : 7_200
+    const completedAt = new Date(createdAt.getTime() + 5_000)
+    const expiresAt = new Date(completedAt.getTime() + 24 * 60 * 60_000)
+    const fakeConfigId = randomUUID()
+    const fakeWarehouseId = randomUUID()
+    const fakeCarrierAccountId = randomUUID()
+    const fakeCarrierRateRequestId = randomUUID()
+    const fakeCarrierNetworkId = randomUUID()
+    const fakeCarrierAuthorizationId = randomUUID()
+    const packagePlanHash = hash(`clean-package:${input.key}`)
+    const client = await pool.connect()
+    try {
+      await client.query('SET session_replication_role = replica')
+      await client.query(
+        `INSERT INTO operations_carrier_accounts (
+           id, organization_id, integration_account_id, display_name,
+           sender_name,
+           account_number_ciphertext, account_number_iv, account_number_tag,
+           encryption_version, account_number_last_four,
+           account_number_fingerprint, registered_address,
+           registered_address_fingerprint, address_verification, status,
+           created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, $4, 'ClawPilot Test',
+           'test-ciphertext', 'test-iv',
+           'test-tag', 1, '9999', $5, $6::jsonb, $7,
+           'operator_attested', 'active',
+           'system:commerce-order-reconciliation',
+           'system:commerce-order-reconciliation'
+         )`,
+        [
+          fakeCarrierAccountId,
+          ids.organization,
+          ids.integrationAccount,
+          `Shopify clean path ${input.key}`,
+          hash(`clean-account:${input.key}`),
+          JSON.stringify({
+            line1: '123 Test Street',
+            city: 'Atlanta',
+            region: 'GA',
+            postalCode: '30301',
+            countryCode: 'US',
+          }),
+          hash(`clean-account-address:${input.key}`),
+        ],
+      )
+      await client.query(
+        `INSERT INTO operations_carrier_rate_requests (
+           id, organization_id, integration_account_id, provider,
+           carrier_account_id, network_id, account_authorization_id,
+           billing_relationship, billing_selection_snapshot,
+           environment, purpose, adapter_version, credential_version,
+           request_hash, redacted_request, redacted_response, status,
+           actor_email, requested_at, completed_at
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, 'ups_rest', $4::uuid, $5::uuid,
+           $6::uuid, 'sender', '{}'::jsonb, 'sandbox',
+           'cartonization_shipment_rate', 'shopify-clean-path-test-v1', 1,
+           $7, '{}'::jsonb, '{}'::jsonb, 'succeeded',
+           'system:commerce-order-reconciliation',
+           $8::timestamptz, $9::timestamptz
+         )`,
+        [
+          fakeCarrierRateRequestId,
+          ids.organization,
+          ids.integrationAccount,
+          fakeCarrierAccountId,
+          fakeCarrierNetworkId,
+          fakeCarrierAuthorizationId,
+          hash(`clean-rate-request:${input.key}`),
+          createdAt.toISOString(),
+          completedAt.toISOString(),
+        ],
+      )
+      const receipt = (await client.query(
+        `INSERT INTO operations_shopify_checkout_rate_receipts (
+           global_id, organization_id, integration_account_id, config_id,
+           config_row_version, credential_generation, activation_revision,
+           activation_state, policy_revision, policy_hash, warehouse_id,
+           algorithm_version, request_fingerprint, destination_fingerprint,
+           carrier_destination_fingerprint, line_quantity_fingerprint,
+           request_evidence_hash, redacted_request_snapshot, currency,
+           idempotency_key, status, line_count, package_count, offer_count,
+           package_plan_hash, result_hash, result_snapshot,
+           provider_write_count, inventory_snapshot_hash,
+           inventory_snapshot_at, reconciliation_window_seconds,
+           reconciliation_deadline_at, expires_at, completed_at,
+           created_at, updated_at
+         ) VALUES (
+           $1, $2::uuid, $3::uuid, $4::uuid, 0, 1, 1, 'shadow', 1, $5,
+           $6::uuid, 'shopify-clean-path-test-v1', $7, $8, $9, $10, $11,
+           '{}'::jsonb, 'USD', $12, 'succeeded', 1, 1, 1, $13, $14,
+           '{}'::jsonb, 0, $15, $16::timestamptz, $17::integer,
+           $18::timestamptz, $19::timestamptz, $20::timestamptz,
+           $21::timestamptz, $21::timestamptz
+         ) RETURNING id::text`,
+        [
+          input.globalId,
+          ids.organization,
+          ids.integrationAccount,
+          fakeConfigId,
+          hash(`clean-policy:${input.key}`),
+          fakeWarehouseId,
+          hash(`clean-request:${input.key}`),
+          candidate.checkout_destination_fingerprint,
+          hash(`clean-carrier-destination:${input.key}`),
+          candidate.line_quantity_fingerprint,
+          hash(`clean-request-evidence:${input.key}`),
+          `shopify-clean-path-${input.key}`,
+          packagePlanHash,
+          hash(`clean-result:${input.key}`),
+          hash(`clean-inventory:${input.key}`),
+          createdAt.toISOString(),
+          windowSeconds,
+          new Date(
+            createdAt.getTime() + windowSeconds * 1_000,
+          ).toISOString(),
+          expiresAt.toISOString(),
+          completedAt.toISOString(),
+          createdAt.toISOString(),
+        ],
+      )).rows[0]
+      await client.query(
+        `INSERT INTO operations_shopify_checkout_rate_receipt_offers (
+           organization_id, receipt_id, carrier_provider,
+           carrier_account_id, carrier_rate_request_id, carrier_request_hash,
+           carrier_response_rate_hash, shopify_service_code, service_code,
+           service_name, carrier_cost_minor, customer_charge_minor,
+           checkout_adjustment_minor, checkout_adjustment_kind, currency,
+           package_count, package_plan_hash, offer_hash, offer_snapshot
+         ) VALUES (
+           $1::uuid, $2::uuid, 'ups_rest', $3::uuid, $4::uuid, $5, $6,
+           'clawpilot:ups:ground', 'ground', 'UPS Ground', 2071, 2071,
+           0, 'none', 'USD', 1, $7, $8, '{}'::jsonb
+         )`,
+        [
+          ids.organization,
+          receipt.id,
+          fakeCarrierAccountId,
+          fakeCarrierRateRequestId,
+          hash(`clean-carrier-request:${input.key}`),
+          hash(`clean-carrier-response:${input.key}`),
+          packagePlanHash,
+          hash(`clean-offer:${input.key}`),
+        ],
+      )
+    } finally {
+      await client.query('SET session_replication_role = origin').catch(() => {})
+      client.release()
+    }
+  }
+
+  const successCandidate = byExternalId.get(candidateKeys.success)
+  const missingCandidate = byExternalId.get(candidateKeys.missing)
+  const ambiguousCandidate = byExternalId.get(candidateKeys.ambiguous)
+  const expiredCandidate = byExternalId.get(candidateKeys.expired)
+  await insertCheckoutReceipt({
+    candidate: successCandidate,
+    key: 'success-a',
+    globalId: 'gsqr0099901',
+  })
+  await insertCheckoutReceipt({
+    candidate: ambiguousCandidate,
+    key: 'ambiguous-a',
+    globalId: 'gsqr0099902',
+  })
+  await insertCheckoutReceipt({
+    candidate: expiredCandidate,
+    key: 'expired-a',
+    globalId: 'gsqr0099903',
+    expired: true,
+  })
+
+  const previousClawPilotEnv = process.env.CLAWPILOT_ENV
+  const previousCohort = process.env
+    .CLAWPILOT_SHOPIFY_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS
+  process.env.CLAWPILOT_ENV = 'development'
+  process.env.CLAWPILOT_SHOPIFY_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS =
+    'gia0009201'
+  try {
+    const shopifyCheckoutRating = loadShopifyCheckoutRatingPersistence(pool)
+    const persistence = loadCommerceStagingService(pool, counters, {
+      shopifyCheckoutRating,
+    })
+    const promotionPolicy = loadTypeScriptModule(
+      'app_src/lib/integrations/commerceShopifyAutomaticPromotion.ts',
+    )
+    const gate = promotionPolicy.shopifyAutomaticOrderPromotionGate({
+      accountGlobalId: 'gia0009201',
+    })
+    assert.equal(gate.accountEnabled, true)
+    assert.match(gate.cohortHash, /^[a-f0-9]{64}$/u)
+    const runtime = {
+      organizationId: ids.organization,
+      integrationAccountId: ids.integrationAccount,
+      globalId: 'gia0009201',
+      provider: 'shopify',
+      environment: 'sandbox',
+      externalAccountId: 'gid://shopify/Shop/9201',
+      status: 'active',
+      verificationStatus: 'verified',
+      credentialVersion: 1,
+      authMode: 'shopify_client_credentials',
+      configuration: { shopDomain: 'commerce-staging-postgres.myshopify.com' },
+      encrypted: {},
+    }
+    const targets = await persistence
+      .readAutomaticShopifyOrderPromotionTargetsForRunInPostgres({
+        runtime,
+        runGlobalId,
+        expectedCohortHash: gate.cohortHash,
+      })
+    const targetByCandidate = new Map(targets.map((target) => [
+      target.candidateGlobalId,
+      target,
+    ]))
+    assert.equal(
+      targetByCandidate.get(successCandidate.global_id)?.eligible,
+      true,
+      JSON.stringify(targetByCandidate.get(successCandidate.global_id)),
+    )
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(
+        targetByCandidate.get(missingCandidate.global_id),
+      )),
+      {
+        eligible: false,
+        reason: 'checkout_rate_lineage_missing',
+        candidateGlobalId: missingCandidate.global_id,
+        candidateRowVersion: missingCandidate.row_version,
+        providerAddress: null,
+        deliveryMode: null,
+      },
+    )
+    assert.equal(
+      targetByCandidate.get(ambiguousCandidate.global_id)?.eligible,
+      true,
+    )
+    assert.equal(
+      targetByCandidate.get(expiredCandidate.global_id)?.reason,
+      'checkout_rate_lineage_expired',
+    )
+
+    const promotionInput = {
+      runtime,
+      actorEmail: 'system:commerce-order-reconciliation',
+      idempotencyKey: 'shopify-clean-path-success',
+      candidateGlobalId: successCandidate.global_id,
+      candidateRowVersion: successCandidate.row_version,
+      requestHash: hash('shopify-clean-path-success'),
+      automaticShopifyPromotion: {
+        policyVersion:
+          promotionPolicy.SHOPIFY_AUTOMATIC_ORDER_PROMOTION_POLICY_VERSION,
+        cohortHash: gate.cohortHash,
+      },
+    }
+    await pool.query(
+      `UPDATE operations_commerce_credentials
+       SET verification_status = 'failed',
+           last_error_code = 'TEST_CREDENTIAL_DRIFT',
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [ids.organization, ids.integrationAccount],
+    )
+    await assert.rejects(
+      persistence.promoteCommerceCandidateInPostgres(promotionInput),
+      (error) => error?.code
+        === 'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_CREDENTIAL_STALE',
+    )
+    await pool.query(
+      `UPDATE operations_commerce_credentials
+       SET verification_status = 'verified',
+           verified_at = now(),
+           last_error_code = NULL,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [ids.organization, ids.integrationAccount],
+    )
+    const sourceDrift = await pool.connect()
+    try {
+      await sourceDrift.query('SET session_replication_role = replica')
+      await sourceDrift.query(
+        `UPDATE operations_commerce_order_candidates
+         SET provider_created_at = now() - interval '49 hours',
+             observed_at = now() - interval '49 hours'
+         WHERE organization_id = $1::uuid
+           AND global_id = $2`,
+        [ids.organization, successCandidate.global_id],
+      )
+    } finally {
+      await sourceDrift.query('SET session_replication_role = origin')
+        .catch(() => {})
+      sourceDrift.release()
+    }
+    await assert.rejects(
+      persistence.promoteCommerceCandidateInPostgres(promotionInput),
+      (error) => error?.code
+        === 'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_INVARIANT_STALE',
+    )
+    const sourceRestore = await pool.connect()
+    try {
+      await sourceRestore.query('SET session_replication_role = replica')
+      await sourceRestore.query(
+        `UPDATE operations_commerce_order_candidates
+         SET provider_created_at = $3::timestamptz,
+             observed_at = $4::timestamptz
+         WHERE organization_id = $1::uuid
+           AND global_id = $2`,
+        [
+          ids.organization,
+          successCandidate.global_id,
+          successCandidate.provider_created_at,
+          successCandidate.observed_at,
+        ],
+      )
+    } finally {
+      await sourceRestore.query('SET session_replication_role = origin')
+        .catch(() => {})
+      sourceRestore.release()
+    }
+    const providerAttemptsBefore = Number((await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_commerce_provider_attempts
+       WHERE organization_id = $1::uuid`,
+      [ids.organization],
+    )).rows[0].count)
+    const promoted = await persistence
+      .promoteCommerceCandidateInPostgres(promotionInput)
+    assert.equal(promoted.replayed, false)
+    assert.equal(promoted.checkoutRateReconciliation.outcome, 'matched')
+    assert.equal(promoted.providerWrites, 0)
+    assert.equal(promoted.inventoryWrites, 0)
+    const replayed = await persistence
+      .promoteCommerceCandidateInPostgres(promotionInput)
+    assert.equal(replayed.replayed, true)
+    assert.equal(replayed.canonicalOrderGlobalId,
+      promoted.canonicalOrderGlobalId)
+    assert.equal(Number((await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_commerce_provider_attempts
+       WHERE organization_id = $1::uuid`,
+      [ids.organization],
+    )).rows[0].count), providerAttemptsBefore)
+
+    await insertCheckoutReceipt({
+      candidate: ambiguousCandidate,
+      key: 'ambiguous-b',
+      globalId: 'gsqr0099904',
+    })
+    const ambiguousInput = {
+      ...promotionInput,
+      idempotencyKey: 'shopify-clean-path-ambiguous-race',
+      candidateGlobalId: ambiguousCandidate.global_id,
+      candidateRowVersion: ambiguousCandidate.row_version,
+      requestHash: hash('shopify-clean-path-ambiguous-race'),
+    }
+    await assert.rejects(
+      persistence.promoteCommerceCandidateInPostgres(ambiguousInput),
+      (error) => error?.code
+        === 'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED',
+    )
+    const rollback = (await pool.query(
+      `SELECT
+         candidate.workflow_state,
+         candidate.canonical_order_id::text,
+         (SELECT count(*)::integer
+          FROM operations_orders operation_order
+          WHERE operation_order.organization_id = candidate.organization_id
+            AND operation_order.external_order_id = candidate.external_order_id)
+           AS canonical_count,
+         (SELECT count(*)::integer
+          FROM operations_shopify_checkout_rate_reconciliations reconciliation
+          WHERE reconciliation.organization_id = candidate.organization_id
+            AND reconciliation.order_candidate_id = candidate.id)
+           AS reconciliation_count,
+         (SELECT count(*)::integer
+          FROM operations_command_receipts receipt
+          WHERE receipt.organization_id = candidate.organization_id
+            AND receipt.idempotency_key =
+                'shopify-clean-path-ambiguous-race') AS command_receipt_count
+       FROM operations_commerce_order_candidates candidate
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.global_id = $2`,
+      [ids.organization, ambiguousCandidate.global_id],
+    )).rows[0]
+    assert.deepEqual(rollback, {
+      workflow_state: 'ready',
+      canonical_order_id: null,
+      canonical_count: 0,
+      reconciliation_count: 0,
+      command_receipt_count: 0,
+    })
+    const ambiguousTargets = await persistence
+      .readAutomaticShopifyOrderPromotionTargetsForRunInPostgres({
+        runtime,
+        runGlobalId,
+        expectedCohortHash: gate.cohortHash,
+      })
+    assert.equal(
+      ambiguousTargets.find((target) => (
+        target.candidateGlobalId === ambiguousCandidate.global_id
+      ))?.reason,
+      'checkout_rate_lineage_ambiguous',
+    )
+    const heldCanonicalCount = Number((await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_orders
+       WHERE organization_id = $1::uuid
+         AND external_order_id = ANY($2::text[])`,
+      [
+        ids.organization,
+        [candidateKeys.missing, candidateKeys.expired, candidateKeys.ambiguous],
+      ],
+    )).rows[0].count)
+    assert.equal(heldCanonicalCount, 0)
+  } finally {
+    if (previousClawPilotEnv === undefined) {
+      delete process.env.CLAWPILOT_ENV
+    } else {
+      process.env.CLAWPILOT_ENV = previousClawPilotEnv
+    }
+    if (previousCohort === undefined) {
+      delete process.env
+        .CLAWPILOT_SHOPIFY_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS
+    } else {
+      process.env.CLAWPILOT_SHOPIFY_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS =
+        previousCohort
+    }
+  }
+}
+
 async function verifyAcceptance(databaseUrl) {
   const pool = new Pool({
     connectionString: databaseUrl,
@@ -5081,6 +5941,7 @@ async function verifyAcceptance(databaseUrl) {
     counters,
     loadSandboxCommerceE2eAuthorization(pool),
   )
+  await verifyAutomaticShopifyCleanPromotion(pool, ids, counters)
   await verifyCustomerPrefetchBinding(pool, ids, persistence, counters)
   await pool.end()
 }
@@ -5122,7 +5983,9 @@ async function main() {
     'Commerce intake staging, scaled-whole zero-price promotion, fractional '
       + 'rollback, review-mode terminal catalog recovery, and policy-drift '
       + 'recovery, plus Faire customer pre-fetch binding disposable-PostgreSQL '
-      + 'and exact variant-pack evidence acceptance passed',
+      + 'and exact variant-pack evidence, plus Shopify clean-path preflight, '
+      + 'matched promotion, drift fencing, and atomic rollback acceptance '
+      + 'passed',
   )
 }
 

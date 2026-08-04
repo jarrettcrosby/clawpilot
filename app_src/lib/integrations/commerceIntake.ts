@@ -28,6 +28,11 @@ import {
   normalizeShopifyCommerce,
 } from '@/lib/integrations/shopifyCommerceNormalizer'
 import {
+  automaticShopifyPromotionHoldRequiresAttention,
+  shopifyAutomaticOrderPromotionGate,
+  SHOPIFY_AUTOMATIC_ORDER_PROMOTION_POLICY_VERSION,
+} from '@/lib/integrations/commerceShopifyAutomaticPromotion'
+import {
   normalizeShopifyShopDomain,
   probeShopifyConnection,
   requestShopifyAccessToken,
@@ -62,6 +67,7 @@ import {
   reconcilePromotedCommerceCandidateCheckoutRateInPostgres,
   readCommerceIntakeRejectionTargetFromPostgres,
   readAutomaticFaireOrderPromotionTargetsForRunInPostgres,
+  readAutomaticShopifyOrderPromotionTargetsForRunInPostgres,
   readAutomaticCommerceCustomerTargetsForRunInPostgres,
   readCommerceIntakeRefreshTargetFromPostgres,
   readCommerceIntakeStateFromPostgres,
@@ -2019,6 +2025,262 @@ async function withAutomaticCustomerResolution(
   }
 }
 
+function automaticShopifyPromotionFailureCode(error: unknown) {
+  const code = error instanceof CommerceIntegrationRequestError
+    ? error.code
+    : ''
+  return /^[A-Z][A-Z0-9_]{2,127}$/u.test(code)
+    ? code
+    : 'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_FAILED'
+}
+
+function automaticShopifyCommandKey(parts: readonly string[]) {
+  return deterministicCustomerCommandUuid([
+    SHOPIFY_AUTOMATIC_ORDER_PROMOTION_POLICY_VERSION,
+    ...parts,
+  ])
+}
+
+function automaticShopifyGateSummary(input: {
+  runtime: CommerceRuntimeCredentialRecord
+  actorEmail: string
+}) {
+  const gate = shopifyAutomaticOrderPromotionGate({
+    accountGlobalId: input.runtime.globalId,
+  })
+  const workerActor = input.actorEmail === 'system:commerce-order-reconciliation'
+  const sandboxAccount = input.runtime.environment === 'sandbox'
+  const enabled = gate.accountEnabled && workerActor && sandboxAccount
+  return {
+    policyVersion: SHOPIFY_AUTOMATIC_ORDER_PROMOTION_POLICY_VERSION,
+    enabled,
+    runtimeEligible: gate.runtimeEligible,
+    cohortConfigured: gate.configured,
+    cohortValid: gate.valid,
+    cohortSize: gate.cohortSize,
+    cohortHash: gate.cohortHash,
+    accountInCohort: gate.accountEnabled,
+    disabledReason: !workerActor
+      ? 'worker_actor_required'
+      : !sandboxAccount
+        ? 'sandbox_account_required'
+        : gate.disabledReason,
+  }
+}
+
+async function withAutomaticShopifyOrderPromotion(
+  command: Record<string, unknown>,
+  input: {
+    runtime: CommerceRuntimeCredentialRecord
+    actorEmail: string
+    action: IntakeCommandAction
+  },
+) {
+  if (
+    input.runtime.provider !== 'shopify'
+    || (
+      input.action !== 'fetch'
+      && input.action !== 'fetch-next'
+      && input.action !== 'refresh'
+      && input.action !== 'retry-rejection'
+    )
+  ) return command
+  const runGlobalId = typeof command.runGlobalId === 'string'
+    ? command.runGlobalId
+    : ''
+  if (!RUN_PATTERN.test(runGlobalId)) return command
+  const gate = automaticShopifyGateSummary(input)
+  const empty = {
+    ...gate,
+    runGlobalId,
+    candidatesFound: 0,
+    eligible: 0,
+    promoted: 0,
+    held: 0,
+    actionableHeld: 0,
+    heldByReason: {},
+    failed: 0,
+    failedByCode: {},
+    rollbackFenced: 0,
+    operatorReviewRequired: 0,
+    providerWrites: 0,
+    canonicalOrderWrites: 0,
+    inventoryWrites: 0,
+    syncCursorAdvanced: false,
+  }
+  if (!gate.enabled || !gate.cohortHash) {
+    return { ...command, automaticShopifyOrderPromotion: empty }
+  }
+  let targets: Awaited<ReturnType<
+    typeof readAutomaticShopifyOrderPromotionTargetsForRunInPostgres
+  >>
+  try {
+    targets = await readAutomaticShopifyOrderPromotionTargetsForRunInPostgres({
+      runtime: input.runtime,
+      runGlobalId,
+      expectedCohortHash: gate.cohortHash,
+    })
+  } catch {
+    return {
+      ...command,
+      automaticShopifyOrderPromotion: {
+        ...empty,
+        failed: 1,
+        failedByCode: {
+          COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_SELECTION_FAILED: 1,
+        },
+        operatorReviewRequired: 1,
+      },
+    }
+  }
+  let eligible = 0
+  let promoted = 0
+  let held = 0
+  let actionableHeld = 0
+  let failed = 0
+  let rollbackFenced = 0
+  const heldByReason: Record<string, number> = {}
+  const failedByCode: Record<string, number> = {}
+  for (const target of targets) {
+    if (!target.eligible) {
+      held += 1
+      heldByReason[target.reason] = (heldByReason[target.reason] || 0) + 1
+      if (automaticShopifyPromotionHoldRequiresAttention(target.reason)) {
+        actionableHeld += 1
+      }
+      continue
+    }
+    eligible += 1
+    let rowVersion = target.candidateRowVersion
+    try {
+      if (target.providerAddress) {
+        const addressResult = await confirmCommerceCandidateAddressInPostgres({
+          runtime: input.runtime,
+          actorEmail: input.actorEmail,
+          idempotencyKey: automaticShopifyCommandKey([
+            input.runtime.globalId,
+            runGlobalId,
+            target.candidateGlobalId,
+            String(rowVersion),
+            'provider-address',
+          ]),
+          candidateGlobalId: target.candidateGlobalId,
+          candidateRowVersion: rowVersion,
+          address: target.providerAddress,
+        }) as { rowVersion?: number }
+        rowVersion = Number(addressResult.rowVersion)
+      }
+      if (target.deliveryMode) {
+        const deliveryResult = await resolveCommerceCandidateDeliveryInPostgres({
+          runtime: input.runtime,
+          actorEmail: input.actorEmail,
+          idempotencyKey: automaticShopifyCommandKey([
+            input.runtime.globalId,
+            runGlobalId,
+            target.candidateGlobalId,
+            String(rowVersion),
+            `delivery:${target.deliveryMode}`,
+          ]),
+          candidateGlobalId: target.candidateGlobalId,
+          candidateRowVersion: rowVersion,
+          decision: {
+            mode: target.deliveryMode,
+            requestedDeliveryAt: null,
+          },
+        }) as { rowVersion?: number }
+        rowVersion = Number(deliveryResult.rowVersion)
+      }
+      const validation = await validateCommerceCandidateInPostgres({
+        runtime: input.runtime,
+        actorEmail: input.actorEmail,
+        idempotencyKey: automaticShopifyCommandKey([
+          input.runtime.globalId,
+          runGlobalId,
+          target.candidateGlobalId,
+          String(rowVersion),
+          'validate',
+        ]),
+        candidateGlobalId: target.candidateGlobalId,
+        candidateRowVersion: rowVersion,
+      }) as { ready?: boolean; rowVersion?: number }
+      rowVersion = Number(validation.rowVersion)
+      if (validation.ready !== true) {
+        held += 1
+        actionableHeld += 1
+        heldByReason.validation_blocked =
+          (heldByReason.validation_blocked || 0) + 1
+        continue
+      }
+      const promotion = await promoteCommerceCandidateInPostgres({
+        runtime: input.runtime,
+        actorEmail: input.actorEmail,
+        idempotencyKey: automaticShopifyCommandKey([
+          input.runtime.globalId,
+          runGlobalId,
+          target.candidateGlobalId,
+          String(rowVersion),
+          'promote-matched-checkout',
+          gate.cohortHash,
+        ]),
+        candidateGlobalId: target.candidateGlobalId,
+        candidateRowVersion: rowVersion,
+        requestHash: requestHash({
+          policyVersion: SHOPIFY_AUTOMATIC_ORDER_PROMOTION_POLICY_VERSION,
+          cohortHash: gate.cohortHash,
+          accountGlobalId: input.runtime.globalId,
+          runGlobalId,
+          candidateGlobalId: target.candidateGlobalId,
+          candidateRowVersion: rowVersion,
+          requiredCheckoutRateOutcome: 'matched',
+          providerWrites: 0,
+        }),
+        automaticShopifyPromotion: {
+          policyVersion: SHOPIFY_AUTOMATIC_ORDER_PROMOTION_POLICY_VERSION,
+          cohortHash: gate.cohortHash,
+        },
+      }) as {
+        checkoutRateReconciliation?: { outcome?: string }
+      }
+      if (promotion.checkoutRateReconciliation?.outcome !== 'matched') {
+        throw new CommerceIntegrationRequestError(
+          'Automatic Shopify order promotion did not return matched checkout-rate lineage',
+          409,
+          'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED',
+        )
+      }
+      promoted += 1
+    } catch (error) {
+      failed += 1
+      const code = automaticShopifyPromotionFailureCode(error)
+      failedByCode[code] = (failedByCode[code] || 0) + 1
+      if (code === 'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED') {
+        rollbackFenced += 1
+      }
+    }
+  }
+  return {
+    ...command,
+    automaticShopifyOrderPromotion: {
+      ...gate,
+      runGlobalId,
+      candidatesFound: targets.length,
+      eligible,
+      promoted,
+      held,
+      actionableHeld,
+      heldByReason,
+      failed,
+      failedByCode,
+      rollbackFenced,
+      operatorReviewRequired: actionableHeld + failed,
+      providerWrites: 0,
+      canonicalOrderWrites: promoted,
+      inventoryWrites: 0,
+      syncCursorAdvanced: false,
+    },
+  }
+}
+
 function automaticFairePromotionFailureCode(error: unknown) {
   const code = error instanceof CommerceIntegrationRequestError
     ? error.code
@@ -2546,8 +2808,17 @@ async function executeCommerceIntakeCommandInternal(
           action: commandAction,
         },
       )
+      const commandWithShopifyPromotion =
+        await withAutomaticShopifyOrderPromotion(
+          commandWithCustomers,
+          {
+            runtime,
+            actorEmail: input.actorEmail,
+            action: commandAction,
+          },
+        )
       const command = await withAutomaticFaireOrderPromotion(
-        commandWithCustomers,
+        commandWithShopifyPromotion,
         {
           runtime,
           actorEmail: input.actorEmail,
@@ -2814,9 +3085,18 @@ async function executeCommerceIntakeCommandInternal(
           action: commandAction,
         },
       )
+    const commandWithAutomaticShopifyPromotion =
+      await withAutomaticShopifyOrderPromotion(
+        commandWithAutomaticResolution,
+        {
+          runtime,
+          actorEmail: input.actorEmail,
+          action: commandAction,
+        },
+      )
     const commandWithAutomaticPromotion =
       await withAutomaticFaireOrderPromotion(
-        commandWithAutomaticResolution,
+        commandWithAutomaticShopifyPromotion,
         {
           runtime,
           actorEmail: input.actorEmail,

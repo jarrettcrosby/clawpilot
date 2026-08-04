@@ -3902,7 +3902,7 @@ export default function CommerceIntakeWorkflow({
                         : orderReconciliation?.status === 'succeeded'
                           ? orderReconciliation
                             .automaticPromotionAttentionRequired
-                            ? `The provider read completed, but automatic local Faire order promotion needs attention${
+                            ? `The provider read completed, but automatic local ${providerLabel(provider)} order promotion needs attention${
                               orderReconciliation.lastErrorCode
                                 ? ` (${orderReconciliation.lastErrorCode})`
                                 : ''
@@ -4002,21 +4002,24 @@ export default function CommerceIntakeWorkflow({
                   orders added. ClawPilot filters ineligible rows and
                   deduplicates already-known orders before an eligible row can
                   be held for review or added automatically when the channel
-                  safety policy permits. The eligible count is for the latest
-                  provider page; new held/rejected and ClawPilot-order counts
-                  are current scan results. Retained order candidates and
-                  provider rejections remain visible across scans for their
-                  review-retention window, so they are not new outcomes from
-                  the latest page.
-                  This read-only step does not reserve inventory, create
-                  shipments, or write back to the provider.
+                  safety policy permits. Fresh, unambiguous Faire orders and
+                  exact development-cohort Shopify orders with one matched
+                  ClawPilot checkout quote may be promoted locally. The
+                  eligible count is for the latest provider page; new
+                  held/rejected and ClawPilot-order counts are current scan
+                  results. Retained order candidates and provider rejections
+                  remain visible across scans for their review-retention
+                  window, so they are not new outcomes from the latest page.
+                  Provider reads remain read-only. This step does not reserve
+                  inventory, create shipments, or write back to the provider.
                 </Typography>
                 {orderReconciliation
                   ?.automaticPromotionAttentionRequired ? (
                     <Alert severity="warning">
-                      The provider read succeeded, but at least one automatic
-                      Faire order promotion failed. Review the held order and
-                      its error before fulfillment.
+                      The provider read succeeded, but at least one automatic{' '}
+                      {providerLabel(provider)} order promotion was held or
+                      failed. Review the order evidence and error before
+                      fulfillment.
                     </Alert>
                   ) : null}
                 {orderReconciliation?.status === 'failed' ? (

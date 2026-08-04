@@ -35,6 +35,11 @@ import {
 import {
   automaticFaireOrderSourceIsFresh,
 } from '@/lib/integrations/commerceFaireAutomaticPromotion'
+import {
+  automaticShopifyOrderSourceIsFresh,
+  shopifyAutomaticOrderPromotionGate,
+  SHOPIFY_AUTOMATIC_ORDER_PROMOTION_POLICY_VERSION,
+} from '@/lib/integrations/commerceShopifyAutomaticPromotion'
 import type { CommerceRuntimeCredentialRecord } from '@/lib/persistence/commerceIntegrations'
 import {
   commerceCurrencyMinorUnit,
@@ -177,6 +182,7 @@ type IntakeAccountRow = {
   global_id: string
   organization_id: string
   provider: 'shopify' | 'faire'
+  environment: 'sandbox' | 'production'
   credential_version: number
   pipeline_id: string
   activation_state:
@@ -782,6 +788,7 @@ async function resolveAccount(
        account.global_id,
        account.organization_id::text,
        account.provider,
+       account.environment,
        account.commerce_credential_generation AS credential_version,
        pipeline.id::text AS pipeline_id,
        activation.state AS activation_state,
@@ -1829,6 +1836,59 @@ async function assertCurrentAutomaticProductCredentialFence(
     intakeError(
       'COMMERCE_PRODUCT_AUTO_CREATE_DISABLED',
       'The current verified commerce connection no longer authorizes automatic product creation',
+      409,
+    )
+  }
+}
+
+async function assertCurrentAutomaticShopifyOrderCredentialFence(
+  client: PoolClient,
+  input: {
+    account: IntakeAccountRow
+    runtime: CommerceRuntimeCredentialRecord
+  },
+) {
+  const current = (
+    await client.query<{
+      status: 'active' | 'disabled' | 'error'
+      environment: 'sandbox' | 'production'
+      commerce_credential_generation: number
+      credential_version: number
+      verification_status: 'unverified' | 'verified' | 'failed'
+    }>(
+      `SELECT
+         account.status,
+         account.environment,
+         account.commerce_credential_generation,
+         credential.credential_version,
+         credential.verification_status
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+       WHERE account.organization_id = $1::uuid
+         AND account.id = $2::uuid
+         AND account.integration_type = 'commerce'
+         AND account.provider = 'shopify'
+       LIMIT 1
+       FOR UPDATE OF account, credential`,
+      [input.account.organization_id, input.account.id],
+    )
+  ).rows[0]
+  if (
+    !current
+    || current.status !== 'active'
+    || current.environment !== 'sandbox'
+    || current.verification_status !== 'verified'
+    || current.commerce_credential_generation
+      !== input.runtime.credentialVersion
+    || current.credential_version !== input.runtime.credentialVersion
+    || input.runtime.status !== 'active'
+    || input.runtime.verificationStatus !== 'verified'
+  ) {
+    intakeError(
+      'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_CREDENTIAL_STALE',
+      'The current verified Shopify sandbox credential changed or was disabled after intake',
       409,
     )
   }
@@ -9884,6 +9944,416 @@ export async function readAutomaticCommerceCustomerTargetsForRunInPostgres(
   })
 }
 
+type AutomaticShopifyProductMappingRow = {
+  id: string
+  product_id: string
+  external_product_id: string
+  external_variant_id: string | null
+  channel_sku: string | null
+}
+
+export type AutomaticShopifyPromotionTarget = {
+  eligible: true
+  reason: null
+  candidateGlobalId: string
+  candidateRowVersion: number
+  providerAddress: CandidateAddress | null
+  deliveryMode: 'provider' | 'default_sla' | null
+} | {
+  eligible: false
+  reason: string
+  candidateGlobalId: string
+  candidateRowVersion: number
+  providerAddress: null
+  deliveryMode: null
+}
+
+function heldAutomaticShopifyPromotionTarget(
+  candidate: CandidateRow,
+  reason: string,
+): AutomaticShopifyPromotionTarget {
+  return {
+    eligible: false,
+    reason,
+    candidateGlobalId: candidate.global_id,
+    candidateRowVersion: Number(candidate.row_version),
+    providerAddress: null,
+    deliveryMode: null,
+  }
+}
+
+/**
+ * Selects only newly staged Shopify orders that can cross the automatic local
+ * promotion boundary without inference. The explicit development account
+ * cohort is rechecked here as well as by the service and promotion transaction.
+ * Exact checkout matching is preflighted before address/delivery resolution;
+ * the authoritative match is repeated inside atomic promotion.
+ */
+export async function readAutomaticShopifyOrderPromotionTargetsForRunInPostgres(
+  input: {
+    runtime: CommerceRuntimeCredentialRecord
+    runGlobalId: string
+    expectedCohortHash: string
+  },
+) {
+  return withTransaction(async (client) => {
+    const gate = shopifyAutomaticOrderPromotionGate({
+      accountGlobalId: input.runtime.globalId,
+    })
+    if (
+      !gate.accountEnabled
+      || !gate.cohortHash
+      || gate.cohortHash !== input.expectedCohortHash
+      || input.runtime.provider !== 'shopify'
+      || input.runtime.environment !== 'sandbox'
+    ) return []
+    const account = await resolveAccount(client, {
+      organizationId: input.runtime.organizationId,
+      accountGlobalId: input.runtime.globalId,
+    })
+    if (
+      account.provider !== 'shopify'
+      || account.environment !== 'sandbox'
+      || account.global_id !== input.runtime.globalId
+    ) return []
+    const candidates = (
+      await client.query<CandidateRow>(
+        `${CANDIDATE_SELECT}
+         WHERE candidate.organization_id = $1::uuid
+           AND candidate.integration_account_id = $2::uuid
+           AND run.global_id = $3
+           AND run.credential_version = $4::integer
+           AND run.resource = 'products_and_orders'
+           AND run.provider = 'shopify'
+           AND run.created_by = 'system:commerce-order-reconciliation'
+           AND run.expires_at > now()
+           AND run.workflow_state <> 'expired'
+           AND candidate.provider = 'shopify'
+           AND candidate.expires_at > now()
+           AND candidate.workflow_state IN ('held', 'resolving', 'ready')
+         ORDER BY candidate.created_at, candidate.id
+         LIMIT 25`,
+        [
+          account.organization_id,
+          account.id,
+          input.runGlobalId,
+          input.runtime.credentialVersion,
+        ],
+      )
+    ).rows
+    const targets: AutomaticShopifyPromotionTarget[] = []
+    for (const candidate of candidates) {
+      const [lines, priorOrCanonical] = await Promise.all([
+        candidateLines(client, candidate),
+        client.query<{ prior_candidate: boolean; canonical_order: boolean }>(
+          `SELECT
+             EXISTS (
+               SELECT 1
+               FROM operations_commerce_order_candidates prior
+               WHERE prior.organization_id = $1::uuid
+                 AND prior.integration_account_id = $2::uuid
+                 AND prior.external_order_id = $3
+                 AND prior.id <> $4::uuid
+             ) AS prior_candidate,
+             EXISTS (
+               SELECT 1
+               FROM operations_orders canonical
+               WHERE canonical.organization_id = $1::uuid
+                 AND canonical.integration_account_id = $2::uuid
+                 AND canonical.external_order_id = $3
+             ) AS canonical_order`,
+          [
+            candidate.organization_id,
+            candidate.integration_account_id,
+            candidate.external_order_id,
+            candidate.id,
+          ],
+        ),
+      ])
+      if (priorOrCanonical.rows[0]?.canonical_order) {
+        targets.push(heldAutomaticShopifyPromotionTarget(
+          candidate,
+          'canonical_order_exists',
+        ))
+        continue
+      }
+      if (priorOrCanonical.rows[0]?.prior_candidate) {
+        targets.push(heldAutomaticShopifyPromotionTarget(
+          candidate,
+          'prior_candidate_requires_review',
+        ))
+        continue
+      }
+      if (!automaticShopifyOrderSourceIsFresh({
+        providerCreatedAt: candidate.provider_created_at,
+        observedAt: candidate.observed_at,
+      })) {
+        targets.push(heldAutomaticShopifyPromotionTarget(
+          candidate,
+          'source_age_requires_review',
+        ))
+        continue
+      }
+      if (
+        candidate.normalized_order_status !== 'open'
+        || candidate.normalized_payment_status !== 'paid'
+        || candidate.normalized_fulfillment_status !== 'unfulfilled'
+        || candidate.normalized_return_status !== 'none'
+      ) {
+        targets.push(heldAutomaticShopifyPromotionTarget(
+          candidate,
+          'order_state_requires_review',
+        ))
+        continue
+      }
+      if (candidate.header_money_state !== 'complete') {
+        targets.push(heldAutomaticShopifyPromotionTarget(
+          candidate,
+          'order_money_requires_review',
+        ))
+        continue
+      }
+      if (
+        candidate.customer_resolution_state !== 'resolved'
+        || !candidate.customer_id
+        || !candidate.customer_match_method
+      ) {
+        targets.push(heldAutomaticShopifyPromotionTarget(
+          candidate,
+          'customer_resolution_required',
+        ))
+        continue
+      }
+      const operationalLines = lines.filter((line) => (
+        Number(line.unfulfilled_quantity) > 0
+      ))
+      if (!operationalLines.length) {
+        targets.push(heldAutomaticShopifyPromotionTarget(
+          candidate,
+          'line_items_empty',
+        ))
+        continue
+      }
+      if (
+        !candidate.requires_shipping
+        || operationalLines.some((line) => !line.requires_shipping)
+      ) {
+        targets.push(heldAutomaticShopifyPromotionTarget(
+          candidate,
+          'physical_shipping_required',
+        ))
+        continue
+      }
+      if (operationalLines.some((line) => {
+        const quantity = exactWholeCommerceQuantityFromNumeric(
+          line.unfulfilled_quantity,
+        )
+        return (
+          quantity === null
+          || quantity <= BigInt(0)
+          || line.normalized_status !== 'open'
+        )
+      })) {
+        targets.push(heldAutomaticShopifyPromotionTarget(
+          candidate,
+          'line_quantity_requires_review',
+        ))
+        continue
+      }
+      const productMappingIds = [...new Set(
+        operationalLines
+          .map((line) => line.product_mapping_id)
+          .filter((value): value is string => Boolean(value)),
+      )]
+      const mappings = productMappingIds.length
+        ? (
+            await client.query<AutomaticShopifyProductMappingRow>(
+              `SELECT id::text, product_id::text, external_product_id,
+                      external_variant_id, channel_sku
+               FROM operations_product_mappings
+               WHERE organization_id = $1::uuid
+                 AND integration_account_id = $2::uuid
+                 AND pipeline_id = $3::uuid
+                 AND id = ANY($4::uuid[])
+                 AND active = true`,
+              [
+                candidate.organization_id,
+                candidate.integration_account_id,
+                candidate.pipeline_id,
+                productMappingIds,
+              ],
+            )
+          ).rows
+        : []
+      const mappingById = new Map(mappings.map((mapping) => [
+        mapping.id,
+        mapping,
+      ]))
+      const invalidLineMapping = operationalLines.some((line) => {
+        const sku = line.sku_snapshot?.trim() || ''
+        const mapping = line.product_mapping_id
+          ? mappingById.get(line.product_mapping_id)
+          : null
+        return (
+          !sku
+          || /[\p{C}]/u.test(sku)
+          || line.mapping_state !== 'resolved'
+          || !line.product_id
+          || !line.external_variant_id
+          || !mapping
+          || mapping.product_id !== line.product_id
+          || mapping.external_product_id !== line.external_product_id
+          || mapping.external_variant_id !== line.external_variant_id
+          || (mapping.channel_sku?.trim() || '') !== sku
+          || line.price_resolution_state !== 'provider'
+          || line.resolved_unit_price_minor === null
+          || !/^[0-9]+$/u.test(line.resolved_unit_price_minor)
+          || line.resolved_currency_code !== candidate.currency_code
+          || (
+            line.requires_shipping
+            && (
+              line.packaging_state !== 'resolved'
+              || line.packaging_source !== 'variant_pack_mapping'
+              || !line.commerce_variant_pack_mapping_id
+              || line.commerce_variant_pack_mapping_row_version === null
+              || !line.pack_profile_version_id
+              || line.pack_profile_version_row_version === null
+              || !line.pack_profile_package_level
+              || !line.pack_profile_base_each_quantity
+              || !line.packaging_weight_source
+            )
+          )
+        )
+      })
+      if (invalidLineMapping) {
+        targets.push(heldAutomaticShopifyPromotionTarget(
+          candidate,
+          'product_sku_or_pack_mapping_requires_review',
+        ))
+        continue
+      }
+      const blockers = dynamicCandidateBlockingCodes(candidate, lines)
+      const automaticBlockers = new Set([
+        'ship_to_confirmation_required',
+        'delivery_decision_required',
+      ])
+      if (blockers.some((code) => !automaticBlockers.has(code))) {
+        targets.push(heldAutomaticShopifyPromotionTarget(
+          candidate,
+          'candidate_blockers_require_review',
+        ))
+        continue
+      }
+      const requiresShipping = candidate.requires_shipping
+        && operationalLines.some((line) => line.requires_shipping)
+      let providerAddress: CandidateAddress | null = null
+      if (requiresShipping) {
+        let snapshot: Record<string, unknown> | null = null
+        try {
+          snapshot = encryptedSnapshot(
+            candidate,
+            input.runtime.globalId,
+            'ship_to',
+          )
+        } catch {
+          snapshot = null
+        }
+        if (!snapshot || !completeAddress(snapshot)) {
+          targets.push(heldAutomaticShopifyPromotionTarget(
+            candidate,
+            'ship_to_requires_review',
+          ))
+          continue
+        }
+        if (candidate.ship_to_snapshot_state === 'protected') {
+          providerAddress = normalizedAddress(snapshot)
+        } else if (candidate.ship_to_snapshot_state !== 'confirmed') {
+          targets.push(heldAutomaticShopifyPromotionTarget(
+            candidate,
+            'ship_to_requires_review',
+          ))
+          continue
+        }
+      }
+      let deliveryMode: 'provider' | 'default_sla' | null = null
+      if (requiresShipping && candidate.delivery_resolution_state === 'unresolved') {
+        deliveryMode = candidate.provider_requested_delivery_at
+          ? 'provider'
+          : candidate.provider_created_at
+            ? 'default_sla'
+            : null
+        if (!deliveryMode) {
+          targets.push(heldAutomaticShopifyPromotionTarget(
+            candidate,
+            'delivery_date_requires_review',
+          ))
+          continue
+        }
+      } else if (
+        requiresShipping
+        && (
+          !['provider', 'manual', 'policy'].includes(
+            candidate.delivery_resolution_state,
+          )
+          || !candidate.requested_delivery_at
+        )
+      ) {
+        targets.push(heldAutomaticShopifyPromotionTarget(
+          candidate,
+          'delivery_date_requires_review',
+        ))
+        continue
+      }
+      if (!shopifyCheckoutRateLineageIsRequired(
+        candidate.checkout_shipping_service_code,
+      )) {
+        targets.push(heldAutomaticShopifyPromotionTarget(
+          candidate,
+          'checkout_rate_lineage_not_applicable',
+        ))
+        continue
+      }
+      const [exactMatches, potentialMatches] = await Promise.all([
+        client.query(
+          `SELECT receipt_id
+           FROM operations_shopify_checkout_rate_preflight_match_candidates(
+             $1::uuid, $2::uuid, true
+           )`,
+          [candidate.organization_id, candidate.id],
+        ),
+        client.query<{ candidate_count: number }>(
+          `SELECT count(*)::integer AS candidate_count
+           FROM operations_shopify_checkout_rate_preflight_match_candidates(
+             $1::uuid, $2::uuid, false
+           )`,
+          [candidate.organization_id, candidate.id],
+        ),
+      ])
+      if (exactMatches.rowCount !== 1) {
+        const potentialCount = potentialMatches.rows[0]?.candidate_count || 0
+        targets.push(heldAutomaticShopifyPromotionTarget(
+          candidate,
+          (exactMatches.rowCount || 0) > 1
+            ? 'checkout_rate_lineage_ambiguous'
+            : potentialCount > 0
+              ? 'checkout_rate_lineage_expired'
+              : 'checkout_rate_lineage_missing',
+        ))
+        continue
+      }
+      targets.push({
+        eligible: true,
+        reason: null,
+        candidateGlobalId: candidate.global_id,
+        candidateRowVersion: Number(candidate.row_version),
+        providerAddress,
+        deliveryMode,
+      })
+    }
+    return targets
+  })
+}
+
 type AutomaticFaireProductMappingRow = {
   id: string
   product_id: string
@@ -11561,6 +12031,10 @@ export async function promoteCommerceCandidateInPostgres(input: {
   candidateGlobalId: string
   candidateRowVersion: number
   requestHash: string
+  automaticShopifyPromotion?: {
+    policyVersion: typeof SHOPIFY_AUTOMATIC_ORDER_PROMOTION_POLICY_VERSION
+    cohortHash: string
+  }
 }) {
   return withTransaction(async (client) => {
     const started = await commandStart(
@@ -11569,21 +12043,126 @@ export async function promoteCommerceCandidateInPostgres(input: {
       'commerce.intake.promote',
       {
         promotionRequestHash: input.requestHash,
+        automaticShopifyPromotion: input.automaticShopifyPromotion || null,
         providerWrites: 0,
         syncCursorAdvanced: false,
       },
     )
     if (started.replayed) return replayPayload(started.receipt)
+    if (input.automaticShopifyPromotion) {
+      const gate = shopifyAutomaticOrderPromotionGate({
+        accountGlobalId: started.account.global_id,
+      })
+      if (
+        input.actorEmail !== 'system:commerce-order-reconciliation'
+        || input.automaticShopifyPromotion.policyVersion
+          !== SHOPIFY_AUTOMATIC_ORDER_PROMOTION_POLICY_VERSION
+        || !/^[a-f0-9]{64}$/u.test(
+          input.automaticShopifyPromotion.cohortHash,
+        )
+        || !gate.accountEnabled
+        || gate.cohortHash !== input.automaticShopifyPromotion.cohortHash
+        || started.account.provider !== 'shopify'
+        || started.account.environment !== 'sandbox'
+        || input.runtime.provider !== 'shopify'
+        || input.runtime.environment !== 'sandbox'
+      ) {
+        intakeError(
+          'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_GATE_CLOSED',
+          'Automatic Shopify order promotion is not authorized for this exact development account cohort',
+          409,
+        )
+      }
+      await assertCurrentAutomaticShopifyOrderCredentialFence(client, {
+        account: started.account,
+        runtime: input.runtime,
+      })
+    }
     const candidate = await lockCandidate(client, input)
     const lines = await candidateLines(client, candidate, true)
     const operationalLines = lines.filter((line) => (
       Number(line.unfulfilled_quantity) > 0
     ))
+    if (
+      input.automaticShopifyPromotion
+      && (
+        !operationalLines.length
+        || !candidate.requires_shipping
+        || operationalLines.some((line) => !line.requires_shipping)
+      )
+    ) {
+      intakeError(
+        'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_PHYSICAL_SHIPPING_REQUIRED',
+        'Automatic Shopify order promotion is limited to physical shipping orders',
+        409,
+      )
+    }
+    if (
+      input.automaticShopifyPromotion
+      && (
+        !automaticShopifyOrderSourceIsFresh({
+          providerCreatedAt: candidate.provider_created_at,
+          observedAt: candidate.observed_at,
+        })
+        || candidate.normalized_order_status !== 'open'
+        || candidate.normalized_payment_status !== 'paid'
+        || candidate.normalized_fulfillment_status !== 'unfulfilled'
+        || candidate.normalized_return_status !== 'none'
+        || candidate.header_money_state !== 'complete'
+        || candidate.customer_resolution_state !== 'resolved'
+        || !candidate.customer_id
+        || !candidate.customer_match_method
+        || operationalLines.some((line) => {
+          const quantity = exactWholeCommerceQuantityFromNumeric(
+            line.unfulfilled_quantity,
+          )
+          return (
+            quantity === null
+            || quantity <= BigInt(0)
+            || line.normalized_status !== 'open'
+            || line.mapping_state !== 'resolved'
+            || !line.product_id
+            || !line.product_mapping_id
+            || !line.external_product_id
+            || !line.external_variant_id
+            || !line.sku_snapshot?.trim()
+            || /[\p{C}]/u.test(line.sku_snapshot)
+            || line.price_resolution_state !== 'provider'
+            || line.resolved_unit_price_minor === null
+            || !/^[0-9]+$/u.test(line.resolved_unit_price_minor)
+            || line.resolved_currency_code !== candidate.currency_code
+            || line.packaging_state !== 'resolved'
+            || line.packaging_source !== 'variant_pack_mapping'
+          )
+        })
+      )
+    ) {
+      intakeError(
+        'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_INVARIANT_STALE',
+        'Automatic Shopify order promotion evidence changed after selection',
+        409,
+      )
+    }
     if (candidate.credential_version !== started.account.credential_version) {
       intakeError(
         'COMMERCE_INTAKE_CREDENTIAL_GENERATION_STALE',
         'The provider credential changed after this fetch. Fetch and resolve the order again',
         422,
+      )
+    }
+    if (
+      input.automaticShopifyPromotion
+      && (
+        candidate.provider !== 'shopify'
+        || !shopifyCheckoutRateLineageIsRequired(
+          candidate.checkout_shipping_service_code,
+        )
+      )
+    ) {
+      intakeError(
+        'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED',
+        'Automatic Shopify order promotion requires an exact ClawPilot checkout-rate lineage',
+        409,
       )
     }
     const newerSource = await client.query<{ global_id: string }>(
@@ -11616,6 +12195,32 @@ export async function promoteCommerceCandidateInPostgres(input: {
         `A newer provider revision is held as ${newerSource.rows[0].global_id}. Resolve and promote that revision instead`,
         422,
       )
+    }
+    if (input.automaticShopifyPromotion) {
+      const priorCandidate = await client.query<{ global_id: string }>(
+        `SELECT prior.global_id
+         FROM operations_commerce_order_candidates prior
+         WHERE prior.organization_id = $1::uuid
+           AND prior.integration_account_id = $2::uuid
+           AND prior.external_order_id = $3
+           AND prior.id <> $4::uuid
+         ORDER BY prior.observed_at DESC, prior.created_at DESC, prior.id DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [
+          candidate.organization_id,
+          candidate.integration_account_id,
+          candidate.external_order_id,
+          candidate.id,
+        ],
+      )
+      if (priorCandidate.rows[0]) {
+        intakeError(
+          'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_PRIOR_CANDIDATE',
+          `Another intake candidate ${priorCandidate.rows[0].global_id} exists for this Shopify order`,
+          409,
+        )
+      }
     }
     const blockers = dynamicCandidateBlockingCodes(candidate, lines)
     if (candidate.workflow_state !== 'ready' || blockers.length) {
@@ -11686,8 +12291,12 @@ export async function promoteCommerceCandidateInPostgres(input: {
             422,
           )
         }
-        const activeMapping = await client.query<{ id: string }>(
-          `SELECT id::text
+        const activeMapping = await client.query<{
+          id: string
+          external_product_id: string
+          channel_sku: string | null
+        }>(
+          `SELECT id::text, external_product_id, channel_sku
            FROM operations_product_mappings
            WHERE organization_id = $1::uuid
              AND integration_account_id = $2::uuid
@@ -11712,6 +12321,21 @@ export async function promoteCommerceCandidateInPostgres(input: {
             'COMMERCE_INTAKE_PRODUCT_MAPPING_STALE',
             `${line.product_title_snapshot} no longer has the confirmed provider variant mapping. Resolve it again`,
             422,
+          )
+        }
+        if (
+          input.automaticShopifyPromotion
+          && (
+            activeMapping.rows[0].external_product_id
+              !== line.external_product_id
+            || (activeMapping.rows[0].channel_sku?.trim() || '')
+              !== line.sku_snapshot?.trim()
+          )
+        ) {
+          intakeError(
+            'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_PRODUCT_MAPPING_STALE',
+            `${line.product_title_snapshot} no longer has the exact Shopify product and SKU mapping selected for automatic promotion`,
+            409,
           )
         }
       } else if (line.external_variant_id) {
@@ -12286,6 +12910,20 @@ export async function promoteCommerceCandidateInPostgres(input: {
           },
         )
       : null
+    if (
+      input.automaticShopifyPromotion
+      && checkoutRateReconciliation?.outcome !== 'matched'
+    ) {
+      // The canonical order, lines, identifiers, command receipt, and the
+      // non-matched reconciliation all live in this transaction. Throwing
+      // here is the rollback fence: no partial local order survives a missing,
+      // expired, or ambiguous checkout quote.
+      intakeError(
+        'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED',
+        'Automatic Shopify order promotion requires exactly one matched checkout-rate lineage',
+        409,
+      )
+    }
     await refreshRunCounts(client, candidate, input.actorEmail)
     await recordDecision(client, {
       candidate,

@@ -91,6 +91,14 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
           'app_src/lib/integrations/commerceFaireAutomaticPromotion.ts',
         )
       }
+      if (
+        specifier
+        === '@/lib/integrations/commerceShopifyAutomaticPromotion'
+      ) {
+        return loadTypeScriptModule(
+          'app_src/lib/integrations/commerceShopifyAutomaticPromotion.ts',
+        )
+      }
       return nodeRequire(specifier)
     },
   }
@@ -2485,10 +2493,16 @@ const faireRuntime = {
   externalAccountId: 'brand-123',
   configuration: {},
 }
+const shopifyAutoRuntime = {
+  ...shopifyRuntime,
+  integrationAccountId: '44444444-4444-4444-8444-444444444444',
+  globalId: 'gia0009201',
+}
 let faireProfileId = faireRuntime.externalAccountId
 let faireReturnedBrandId = faireRuntime.externalAccountId
 const runtimes = new Map([
   [shopifyRuntime.globalId, shopifyRuntime],
+  [shopifyAutoRuntime.globalId, shopifyAutoRuntime],
   [faireRuntime.globalId, faireRuntime],
 ])
 const providerReads = {
@@ -2519,6 +2533,7 @@ const automaticProductSweeps = []
 let automaticCustomerTargets = []
 const automaticCustomerResolverCalls = []
 let automaticFairePromotionTargets = []
+let automaticShopifyPromotionTargets = []
 const productPolicyUpdates = []
 const customerBindingPlanCalls = []
 const customerBindingConfirmCalls = []
@@ -2559,13 +2574,33 @@ function envelope(provider, orderIds) {
 function persistenceCommand(name) {
   return async (input) => {
     persistenceCommands.push({ name, input })
+    if (
+      name === 'promote'
+      && input.candidateGlobalId === 'gcoc0000023'
+    ) {
+      throw new MockCommerceIntegrationRequestError(
+        'Exact Shopify checkout-rate lineage changed before commit',
+        409,
+        'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED',
+      )
+    }
     return {
       action: name,
       replayed: false,
       rowVersion: Number(input.candidateRowVersion || 0) + 1,
-      ...(name === 'validate' ? { ready: true } : {}),
+      ...(name === 'validate'
+        ? {
+            ready: input.candidateGlobalId !== 'gcoc0000024',
+          }
+        : {}),
       ...(name === 'promote'
-        ? { canonicalOrderGlobalId: 'go0000001' }
+        ? {
+            canonicalOrderGlobalId: 'go0000001',
+            checkoutRateReconciliation:
+              input.automaticShopifyPromotion
+                ? { outcome: 'matched' }
+                : undefined,
+          }
         : {}),
     }
   }
@@ -3026,6 +3061,15 @@ const service = loadTypeScriptModule(
           automaticFairePromotionTargets = []
           return targets
         },
+        async readAutomaticShopifyOrderPromotionTargetsForRunInPostgres(
+          input,
+        ) {
+          assert.equal(input.runtime.globalId, shopifyAutoRuntime.globalId)
+          assert.match(input.expectedCohortHash, /^[a-f0-9]{64}$/u)
+          const targets = automaticShopifyPromotionTargets
+          automaticShopifyPromotionTargets = []
+          return targets
+        },
         async readAutomaticCommerceCustomerTargetsForRunInPostgres() {
           const targets = automaticCustomerTargets
           automaticCustomerTargets = []
@@ -3388,6 +3432,8 @@ const service = loadTypeScriptModule(
 const savedEnvironment = {
   enabled: process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED,
   lane: process.env.CLAWPILOT_ENV,
+  shopifyAutoCohort:
+    process.env.CLAWPILOT_SHOPIFY_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS,
 }
 process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED = '1'
 process.env.CLAWPILOT_ENV = 'development'
@@ -3971,6 +4017,127 @@ try {
       },
     ],
   )
+  const automaticShopifyCommandStart = persistenceCommands.length
+  process.env.CLAWPILOT_SHOPIFY_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS =
+    shopifyAutoRuntime.globalId
+  automaticShopifyPromotionTargets = [
+    {
+      eligible: true,
+      reason: null,
+      candidateGlobalId: 'gcoc0000020',
+      candidateRowVersion: 20,
+      providerAddress: {
+        name: 'Exact Shopify Customer',
+        line1: '200 Checkout Way',
+        line2: null,
+        city: 'Huntington Beach',
+        region: 'CA',
+        postalCode: '92647',
+        country: 'US',
+      },
+      deliveryMode: 'default_sla',
+    },
+    {
+      eligible: false,
+      reason: 'checkout_rate_lineage_missing',
+      candidateGlobalId: 'gcoc0000021',
+      candidateRowVersion: 21,
+      providerAddress: null,
+      deliveryMode: null,
+    },
+    {
+      eligible: false,
+      reason: 'physical_shipping_required',
+      candidateGlobalId: 'gcoc0000022',
+      candidateRowVersion: 22,
+      providerAddress: null,
+      deliveryMode: null,
+    },
+    {
+      eligible: true,
+      reason: null,
+      candidateGlobalId: 'gcoc0000023',
+      candidateRowVersion: 23,
+      providerAddress: null,
+      deliveryMode: null,
+    },
+    {
+      eligible: true,
+      reason: null,
+      candidateGlobalId: 'gcoc0000024',
+      candidateRowVersion: 24,
+      providerAddress: null,
+      deliveryMode: null,
+    },
+  ]
+  const automaticShopifyFetch = await service.executeCommerceIntakeCommand({
+    organizationId,
+    actorEmail: 'system:commerce-order-reconciliation',
+    body: {
+      action: 'fetch',
+      accountGlobalId: shopifyAutoRuntime.globalId,
+      confirmReadOnly: true,
+      idempotencyKey: nextKey(),
+    },
+  })
+  const automaticShopifySummary = JSON.parse(JSON.stringify(
+    automaticShopifyFetch.command.automaticShopifyOrderPromotion,
+  ))
+  assert.equal(automaticShopifySummary.enabled, true)
+  assert.equal(automaticShopifySummary.cohortConfigured, true)
+  assert.equal(automaticShopifySummary.cohortValid, true)
+  assert.equal(automaticShopifySummary.cohortSize, 1)
+  assert.equal(automaticShopifySummary.accountInCohort, true)
+  assert.match(automaticShopifySummary.cohortHash, /^[a-f0-9]{64}$/u)
+  assert.equal(automaticShopifySummary.candidatesFound, 5)
+  assert.equal(automaticShopifySummary.eligible, 3)
+  assert.equal(automaticShopifySummary.promoted, 1)
+  assert.equal(automaticShopifySummary.held, 3)
+  assert.equal(automaticShopifySummary.actionableHeld, 3)
+  assert.deepEqual(automaticShopifySummary.heldByReason, {
+    checkout_rate_lineage_missing: 1,
+    physical_shipping_required: 1,
+    validation_blocked: 1,
+  })
+  assert.equal(automaticShopifySummary.failed, 1)
+  assert.deepEqual(automaticShopifySummary.failedByCode, {
+    COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED: 1,
+  })
+  assert.equal(automaticShopifySummary.rollbackFenced, 1)
+  assert.equal(automaticShopifySummary.operatorReviewRequired, 4)
+  assert.equal(automaticShopifySummary.canonicalOrderWrites, 1)
+  assert.equal(automaticShopifySummary.providerWrites, 0)
+  assert.equal(automaticShopifySummary.inventoryWrites, 0)
+  const automaticShopifyCommands = persistenceCommands
+    .slice(automaticShopifyCommandStart)
+    .filter((entry) => entry.input.candidateGlobalId === 'gcoc0000020')
+  assert.deepEqual(
+    automaticShopifyCommands.map((entry) => ({
+      action: entry.name,
+      rowVersion: entry.input.candidateRowVersion,
+    })),
+    [
+      { action: 'confirm-address', rowVersion: 20 },
+      { action: 'resolve-delivery', rowVersion: 21 },
+      { action: 'validate', rowVersion: 22 },
+      { action: 'promote', rowVersion: 23 },
+    ],
+    'Shopify clean path must advance exact row versions before one strict atomic promotion',
+  )
+  const strictShopifyPromotion = automaticShopifyCommands.at(-1).input
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      strictShopifyPromotion.automaticShopifyPromotion,
+    )),
+    {
+      policyVersion: 'commerce-shopify-order-auto-promotion-v1',
+      cohortHash: automaticShopifySummary.cohortHash,
+    },
+  )
+  assert.equal(strictShopifyPromotion.runtime.environment, 'sandbox')
+  delete process.env
+    .CLAWPILOT_SHOPIFY_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS
+
   const automaticFaireCommandStart = persistenceCommands.length
   automaticFairePromotionTargets = [
     {
@@ -4134,9 +4301,9 @@ try {
   )
 
   assert.deepEqual(providerReads, {
-    shopifyToken: 6,
-    shopifyProbe: 6,
-    shopifyGraphql: 7,
+    shopifyToken: 7,
+    shopifyProbe: 7,
+    shopifyGraphql: 9,
     faireProducts: 2,
     faireInventory: 3,
     faireOrders: 3,
@@ -4169,8 +4336,8 @@ try {
       .available_quantity.quantity,
     -2,
   )
-  assert.equal(providerAttempts.length, 13)
-  assert.equal(providerReservations.length, 16)
+  assert.equal(providerAttempts.length, 14)
+  assert.equal(providerReservations.length, 17)
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'faire'
@@ -4185,9 +4352,9 @@ try {
     )),
     'Shopify provider-attempt evidence must record its current normalizer',
   )
-  assert.equal(capturedReads.size, 13)
+  assert.equal(capturedReads.size, 14)
   assert.equal(uncertainReads.length, 0)
-  assert.equal(stageAttempts.length, 16)
+  assert.equal(stageAttempts.length, 17)
   for (const attempt of providerAttempts) {
     assert.equal(attempt.action, 'commerce.intake.read')
     assert.equal(attempt.redactedRequest.readOnly, true)
@@ -4196,7 +4363,7 @@ try {
   }
   assert.equal(
     persistenceCommands.filter(({ name }) => name === 'stage-envelope').length,
-    13,
+    14,
   )
   const staged = persistenceCommands.filter(
     ({ name }) => name === 'stage-envelope',
@@ -4239,6 +4406,7 @@ try {
       'fetch',
       'refresh',
       'fetch',
+      'fetch',
       'retry-rejection',
       'retry-rejection',
     ],
@@ -4250,10 +4418,10 @@ try {
   assert.equal(staged[2].input.page.resource, 'products')
   assert.equal(staged[3].input.page.resource, 'products')
   assert.equal(staged[9].input.page, null)
-  assert.equal(staged[11].input.page, null)
   assert.equal(staged[12].input.page, null)
+  assert.equal(staged[13].input.page, null)
   assert.equal(
-    staged[12].input.envelope.orders[0].identity.value,
+    staged[13].input.envelope.orders[0].identity.value,
     'faire-order-rejected-1',
     'Faire exact-order retry must stage the identity read by getFaireOrder',
   )
@@ -4519,9 +4687,9 @@ try {
     assert.ok(calledNames.includes(expected), `Command path missing ${expected}`)
   }
   assert.deepEqual(providerReads, {
-    shopifyToken: 6,
-    shopifyProbe: 6,
-    shopifyGraphql: 7,
+    shopifyToken: 7,
+    shopifyProbe: 7,
+    shopifyGraphql: 9,
     faireProducts: 2,
     faireInventory: 3,
     faireOrders: 3,
@@ -4776,6 +4944,13 @@ try {
     delete process.env.CLAWPILOT_ENV
   } else {
     process.env.CLAWPILOT_ENV = savedEnvironment.lane
+  }
+  if (savedEnvironment.shopifyAutoCohort === undefined) {
+    delete process.env
+      .CLAWPILOT_SHOPIFY_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS
+  } else {
+    process.env.CLAWPILOT_SHOPIFY_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS =
+      savedEnvironment.shopifyAutoCohort
   }
 }
 
