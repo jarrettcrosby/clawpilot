@@ -31,6 +31,108 @@ export const OPERATIONS_COMMAND_RECEIPT_CLASSIFICATION_CTES = `
           AND failed.result_payload IS NULL
           AND failed.completed_at IS NOT NULL
         THEN 'policy_rejected'
+        WHEN failed.command_type = 'plan_operations_order'
+          AND failed.result_global_id IS NULL
+          AND failed.result_payload IS NULL
+          AND failed.completed_at IS NOT NULL
+          AND failed.completed_at >= failed.created_at
+          AND failed.updated_at >= failed.completed_at
+          AND failed.error_code IS NOT NULL
+          AND length(btrim(failed.error_code)) > 0
+          AND failed.error_message IS NOT NULL
+          AND length(btrim(failed.error_message)) > 0
+          AND failed.target_global_id
+            ~ '^gor([0-9]{7}|[0-9a-v]{12})$'
+          AND EXISTS (
+            SELECT 1
+            FROM operations_command_receipts successor
+            WHERE successor.organization_id = failed.organization_id
+              AND successor.command_type = failed.command_type
+              AND successor.status = 'succeeded'
+              AND successor.created_at > failed.completed_at
+              AND successor.completed_at > failed.completed_at
+              AND successor.completed_at >= successor.created_at
+              AND successor.updated_at >= successor.completed_at
+              AND successor.error_code IS NULL
+              AND successor.error_message IS NULL
+              AND successor.target_global_id = failed.target_global_id
+              AND successor.result_global_id =
+                failed.target_global_id
+              AND successor.result_global_id
+                ~ '^gor([0-9]{7}|[0-9a-v]{12})$'
+              AND jsonb_typeof(successor.result_payload) = 'object'
+              AND jsonb_typeof(
+                successor.result_payload->'orderGlobalId'
+              ) = 'string'
+              AND successor.result_payload->>'orderGlobalId' =
+                successor.result_global_id
+              AND successor.result_payload->>'orderStatus' = 'planned'
+              AND jsonb_typeof(
+                successor.result_payload->'rowVersion'
+              ) = 'number'
+              AND successor.result_payload->>'rowVersion'
+                ~ '^(0|[1-9][0-9]{0,14})$'
+              AND successor.result_payload->>'fulfillmentPlanGlobalId'
+                ~ '^gfp([0-9]{7}|[0-9a-v]{12})$'
+              AND successor.result_payload->>'cartonizationEvidenceGlobalId'
+                ~ '^gcte([0-9]{7}|[0-9a-v]{12})$'
+              AND jsonb_typeof(
+                successor.result_payload->'packageCount'
+              ) = 'number'
+              AND successor.result_payload->>'packageCount'
+                ~ '^[1-9][0-9]{0,8}$'
+              AND successor.result_payload->>'carrier' IN ('UPS', 'FedEx')
+              AND jsonb_typeof(
+                successor.result_payload->'serviceCode'
+              ) = 'string'
+              AND length(btrim(
+                successor.result_payload->>'serviceCode'
+              )) > 0
+              AND jsonb_typeof(
+                successor.result_payload->'serviceName'
+              ) = 'string'
+              AND length(btrim(
+                successor.result_payload->>'serviceName'
+              )) > 0
+              AND jsonb_typeof(
+                successor.result_payload->'carrierCostMinor'
+              ) = 'number'
+              AND successor.result_payload->>'carrierCostMinor'
+                ~ '^(0|[1-9][0-9]{0,14})$'
+              AND jsonb_typeof(
+                successor.result_payload->'currency'
+              ) = 'string'
+              AND successor.result_payload->>'currency' ~ '^[A-Z]{3}$'
+              AND successor.result_payload
+                ? 'checkoutShippingChargeMinor'
+              AND (
+                successor.result_payload->'checkoutShippingChargeMinor'
+                  = 'null'::jsonb
+                OR (
+                  jsonb_typeof(
+                    successor.result_payload
+                      ->'checkoutShippingChargeMinor'
+                  ) = 'number'
+                  AND successor.result_payload
+                    ->>'checkoutShippingChargeMinor'
+                    ~ '^(0|[1-9][0-9]{0,14})$'
+                )
+              )
+              AND successor.result_payload ? 'checkoutVarianceMinor'
+              AND (
+                successor.result_payload->'checkoutVarianceMinor'
+                  = 'null'::jsonb
+                OR (
+                  jsonb_typeof(
+                    successor.result_payload->'checkoutVarianceMinor'
+                  ) = 'number'
+                  AND successor.result_payload->>'checkoutVarianceMinor'
+                    ~ '^-?(0|[1-9][0-9]{0,14})$'
+                )
+              )
+              AND successor.result_payload->'replayed' = 'false'::jsonb
+          )
+        THEN 'superseded'
         WHEN failed.command_type = 'prepare_operations_shipment_execution'
           AND failed.error_code = 'OPERATIONS_REQUEST_FAILED'
           AND failed.error_message =
