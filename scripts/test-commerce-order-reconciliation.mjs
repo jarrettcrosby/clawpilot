@@ -59,6 +59,14 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
           },
         }
       }
+      if (
+        specifier
+        === '@/lib/integrations/commerceShopifyAutomaticPromotion'
+      ) {
+        return loadTypeScriptModule(
+          'app_src/lib/integrations/commerceShopifyAutomaticPromotion.ts',
+        )
+      }
       return nodeRequire(specifier)
     },
   }
@@ -69,6 +77,95 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
 const persistence = read('app_src/lib/persistence/commerceOrderReconciliation.ts')
 const fairePromotionPolicy = loadTypeScriptModule(
   'app_src/lib/integrations/commerceFaireAutomaticPromotion.ts',
+)
+const shopifyPromotionPolicy = loadTypeScriptModule(
+  'app_src/lib/integrations/commerceShopifyAutomaticPromotion.ts',
+)
+const shopifyCohortEnv =
+  shopifyPromotionPolicy.SHOPIFY_AUTOMATIC_ORDER_PROMOTION_COHORT_ENV
+const enabledShopifyAccount = 'gia0009201'
+const secondShopifyAccount = 'gia0bcdefghjkmn'
+const cohortOff = shopifyPromotionPolicy
+  .shopifyAutomaticOrderPromotionGate({
+    accountGlobalId: enabledShopifyAccount,
+    environment: { CLAWPILOT_ENV: 'development' },
+  })
+assert.equal(cohortOff.accountEnabled, false)
+assert.equal(cohortOff.disabledReason, 'account_cohort_not_configured')
+const nonDevelopment = shopifyPromotionPolicy
+  .shopifyAutomaticOrderPromotionGate({
+    accountGlobalId: enabledShopifyAccount,
+    environment: {
+      CLAWPILOT_ENV: 'production',
+      [shopifyCohortEnv]: enabledShopifyAccount,
+    },
+  })
+assert.equal(nonDevelopment.accountEnabled, false)
+assert.equal(nonDevelopment.disabledReason, 'development_runtime_required')
+const contradictoryHostedProduction = shopifyPromotionPolicy
+  .shopifyAutomaticOrderPromotionGate({
+    accountGlobalId: enabledShopifyAccount,
+    environment: {
+      CLAWPILOT_ENV: 'development',
+      RAILWAY_ENVIRONMENT_NAME: 'production',
+      VERCEL_ENV: 'preview',
+      [shopifyCohortEnv]: enabledShopifyAccount,
+    },
+  })
+assert.equal(contradictoryHostedProduction.accountEnabled, false)
+assert.equal(
+  contradictoryHostedProduction.disabledReason,
+  'hosted_production_runtime',
+)
+const malformedCohort = shopifyPromotionPolicy
+  .shopifyAutomaticOrderPromotionCohort({
+    CLAWPILOT_ENV: 'development',
+    [shopifyCohortEnv]: `${enabledShopifyAccount},not-an-account`,
+  })
+assert.equal(malformedCohort.valid, false)
+assert.deepEqual([...malformedCohort.accountGlobalIds], [])
+const duplicateCohort = shopifyPromotionPolicy
+  .shopifyAutomaticOrderPromotionCohort({
+    CLAWPILOT_ENV: 'development',
+    [shopifyCohortEnv]: `${enabledShopifyAccount},${enabledShopifyAccount}`,
+  })
+assert.equal(duplicateCohort.valid, false)
+const exactCohortEnvironment = {
+  CLAWPILOT_ENV: 'development',
+  [shopifyCohortEnv]: `${secondShopifyAccount},${enabledShopifyAccount}`,
+}
+const accountMismatch = shopifyPromotionPolicy
+  .shopifyAutomaticOrderPromotionGate({
+    accountGlobalId: 'gia0009202',
+    environment: exactCohortEnvironment,
+  })
+assert.equal(accountMismatch.accountEnabled, false)
+assert.equal(accountMismatch.disabledReason, 'account_not_in_cohort')
+const exactCohort = shopifyPromotionPolicy
+  .shopifyAutomaticOrderPromotionGate({
+    accountGlobalId: enabledShopifyAccount,
+    environment: exactCohortEnvironment,
+  })
+assert.equal(exactCohort.accountEnabled, true)
+assert.equal(exactCohort.cohortSize, 2)
+assert.match(exactCohort.cohortHash, /^[a-f0-9]{64}$/u)
+assert.deepEqual(
+  [...exactCohort.accountGlobalIds],
+  [enabledShopifyAccount, secondShopifyAccount].sort(),
+)
+assert.equal(
+  shopifyPromotionPolicy.automaticShopifyPromotionHoldRequiresAttention(
+    'canonical_order_exists',
+  ),
+  false,
+  'Canonical-order dedupe is a benign automatic-promotion no-op',
+)
+assert.equal(
+  shopifyPromotionPolicy.automaticShopifyPromotionHoldRequiresAttention(
+    'checkout_rate_lineage_missing',
+  ),
+  true,
+  'Missing checkout lineage must remain durable operator attention',
 )
 const freshProviderCreatedAt = Date.parse('2026-08-01T12:00:00.000Z')
 const freshObservedAt = freshProviderCreatedAt + 5 * 60_000
@@ -99,9 +196,44 @@ assert.equal(
   false,
   'Faire provider creation must not postdate the captured observation',
 )
+assert.equal(
+  shopifyPromotionPolicy.automaticShopifyOrderSourceIsFresh({
+    providerCreatedAt: new Date(freshProviderCreatedAt),
+    observedAt: new Date(freshObservedAt),
+    nowMs: freshProviderCreatedAt + 48 * 60 * 60 * 1_000,
+  }),
+  true,
+  'Fresh Shopify source evidence remains eligible at the exact boundary',
+)
+assert.equal(
+  shopifyPromotionPolicy.automaticShopifyOrderSourceIsFresh({
+    providerCreatedAt: new Date(freshProviderCreatedAt),
+    observedAt: new Date(freshObservedAt),
+    nowMs: freshObservedAt + 48 * 60 * 60 * 1_000 + 1,
+  }),
+  false,
+  'Retained Shopify evidence must not become automatically promotable later',
+)
 const shippingServiceCodeMigration = read(
   'db/migrations/0173_operations_shopify_shipping_service_codes.sql',
 )
+const shopifyPreflightMigration = read(
+  'db/migrations/0245_operations_shopify_checkout_rate_preflight.sql',
+)
+includes(shopifyPreflightMigration, [
+  'operations_shopify_checkout_rate_match_candidate_facts_for_workflow',
+  'require_promoted_candidate boolean',
+  'operations_shopify_checkout_rate_match_candidate_facts(',
+  'require_promoted_candidate',
+  'operations_shopify_checkout_rate_preflight_match_candidates(',
+  'enforce_reconciliation_deadline',
+  'false',
+  'true',
+  'SECURITY INVOKER',
+  'SET search_path = pg_catalog, public',
+  'REVOKE EXECUTE ON FUNCTION',
+  'FROM PUBLIC',
+], 'Shopify held-candidate checkout preflight migration')
 includes(persistence, [
   "const ORDER_RECONCILIATION_INTERVAL = '30 minutes'",
   "const ORDER_RECONCILIATION_LEASE = '10 minutes'",
@@ -144,6 +276,10 @@ includes(persistence, [
   'providerWrites: 0',
   'canonicalOrderWrites: 0',
   'inventoryWrites: 0',
+  'unresolved_shopify_promotion',
+  "candidate.workflow_state IN ('held', 'resolving', 'ready')",
+  "run.created_by = 'system:commerce-order-reconciliation'",
+  'canonical.external_order_id',
 ], 'Order reconciliation persistence')
 includes(shippingServiceCodeMigration, [
   'operations_commerce_order_candidates_checkout_service_valid',
@@ -207,6 +343,11 @@ assert.match(
   claimSql,
   /RETURNING[\s\S]*last_started_at/,
   'Claim SQL must return the persisted reconciliation lease timestamp',
+)
+assert.match(
+  claimSql,
+  /last_error_code IN \([\s\S]*COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED/,
+  'Root claims must preserve durable automatic-promotion attention',
 )
 assert.equal(claimedTargets.length, 1)
 assert.equal(
@@ -294,7 +435,8 @@ const healthPersistenceModule = loadTypeScriptModule(
                 running: '0',
                 failed: '1',
                 stale_processing: '0',
-                promotion_attention_required: '1',
+                shopify_promotion_attention_required: '1',
+                faire_promotion_attention_required: '0',
                 overdue: '1',
                 resumable: '1',
                 last_success_at: '2026-08-01T16:20:00.000Z',
@@ -320,6 +462,7 @@ assert.deepEqual(JSON.parse(JSON.stringify(orderHealth)), {
   failed: 1,
   staleProcessing: 0,
   promotionAttentionRequired: 1,
+  providerPromotionAttentionRequired: { shopify: 1, faire: 0 },
   overdue: 1,
   resumable: 1,
   lastSuccessAt: '2026-08-01T16:20:00.000Z',
@@ -403,7 +546,13 @@ const promotionCompletionModule = loadTypeScriptModule(
               promotionCompletionQueries.push({ sql, values })
               return {
                 rowCount: 1,
-                rows: [{ organization_id: failureTarget.organizationId }],
+                rows: [{
+                  last_error_code: values[8] === 'shopify' && values[5] > 0
+                    ? 'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED'
+                    : values[6] > 0
+                      ? 'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED'
+                      : null,
+                }],
               }
             },
           })
@@ -426,6 +575,13 @@ const promotionCompletion = await promotionCompletionModule
     customersSkipped: 0,
     customerResolutionFailed: 0,
     customerResolutionFailureCodes: {},
+    shopifyOrdersPromoted: 0,
+    shopifyOrdersHeld: 0,
+    shopifyPromotionActionableHeld: 0,
+    shopifyPromotionHeldReasons: {},
+    shopifyPromotionFailed: 0,
+    shopifyPromotionFailureCodes: {},
+    shopifyPromotionRollbackFenced: 0,
     faireOrdersPromoted: 0,
     faireOrdersHeld: 0,
     fairePromotionFailed: 1,
@@ -440,12 +596,88 @@ assert.match(
   /COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED/u,
   'Successful provider reads must durably retain local-promotion attention',
 )
-assert.equal(promotionCompletionQueries[0].values[5], 1)
-assert.equal(promotionCompletionQueries[0].values[6], false)
+assert.equal(promotionCompletionQueries[0].values[5], 0)
+assert.equal(promotionCompletionQueries[0].values[6], 1)
+assert.equal(promotionCompletionQueries[0].values[7], false)
+assert.equal(promotionCompletionQueries[0].values[8], 'faire')
 assert.equal(
   promotionCompletionAudits[0].payload
     .automaticFaireOrderPromotion.failed,
   1,
+)
+promotionCompletionQueries.length = 0
+promotionCompletionAudits.length = 0
+await promotionCompletionModule.completeCommerceOrderReconciliationInPostgres({
+  target: { ...failureTarget, provider: 'shopify' },
+  providerRecordsSeen: 1,
+  ordersHeld: 1,
+  recordsRejected: 0,
+  pagesRead: 1,
+  hasNextBatch: false,
+  customersMatched: 1,
+  customersCreated: 0,
+  customersAmbiguous: 0,
+  customersSkipped: 0,
+  customerResolutionFailed: 0,
+  customerResolutionFailureCodes: {},
+  shopifyOrdersPromoted: 0,
+  shopifyOrdersHeld: 1,
+  shopifyPromotionActionableHeld: 1,
+  shopifyPromotionHeldReasons: { checkout_rate_lineage_missing: 1 },
+  shopifyPromotionFailed: 0,
+  shopifyPromotionFailureCodes: {},
+  shopifyPromotionRollbackFenced: 0,
+  faireOrdersPromoted: 0,
+  faireOrdersHeld: 0,
+  fairePromotionFailed: 0,
+  fairePromotionFailureCodes: {},
+})
+assert.equal(
+  promotionCompletionQueries[0].values[5],
+  1,
+  'An actionable Shopify hold must persist automatic-promotion attention',
+)
+assert.equal(
+  promotionCompletionAudits[0].payload
+    .automaticShopifyOrderPromotion.operatorReviewRequired,
+  1,
+)
+promotionCompletionQueries.length = 0
+promotionCompletionAudits.length = 0
+await promotionCompletionModule.completeCommerceOrderReconciliationInPostgres({
+  target: { ...failureTarget, provider: 'shopify' },
+  providerRecordsSeen: 1,
+  ordersHeld: 1,
+  recordsRejected: 0,
+  pagesRead: 1,
+  hasNextBatch: false,
+  customersMatched: 0,
+  customersCreated: 0,
+  customersAmbiguous: 0,
+  customersSkipped: 0,
+  customerResolutionFailed: 0,
+  customerResolutionFailureCodes: {},
+  shopifyOrdersPromoted: 0,
+  shopifyOrdersHeld: 1,
+  shopifyPromotionActionableHeld: 0,
+  shopifyPromotionHeldReasons: { canonical_order_exists: 1 },
+  shopifyPromotionFailed: 0,
+  shopifyPromotionFailureCodes: {},
+  shopifyPromotionRollbackFenced: 0,
+  faireOrdersPromoted: 0,
+  faireOrdersHeld: 0,
+  fairePromotionFailed: 0,
+  fairePromotionFailureCodes: {},
+})
+assert.equal(
+  promotionCompletionQueries[0].values[5],
+  0,
+  'A canonical-order dedupe must not create durable operator attention',
+)
+assert.equal(
+  promotionCompletionAudits[0].payload
+    .automaticShopifyOrderPromotion.operatorReviewRequired,
+  0,
 )
 const knownConstraintFailure = await failurePersistenceModule
   .failCommerceOrderReconciliationInPostgres({
@@ -563,12 +795,15 @@ includes(workerSource, [
   'COMMERCE_ORDER_RECONCILIATION_PROVIDER_CURSOR_REPEATED',
   'COMMERCE_ORDER_RECONCILIATION_PAGE_SEQUENCE_INVALID',
   'projectCommerceOrderReconciliationPageInPostgres',
+  'automaticShopifyOrderPromotion',
+  'rollbackFenced',
+  'canonicalOrderWrites: shopifyOrdersPromoted + faireOrdersPromoted',
 ], 'Bounded order reconciliation worker')
 assert.ok(
   workerSource.includes('permits a bounded')
-    && workerSource.includes('local-only Faire promotion')
+    && workerSource.includes('local-only')
     && workerSource.includes('never derives packages or shipments'),
-  'Order reconciliation must permit only bounded local Faire promotion while remaining package, shipment, inventory, and provider-write fenced',
+  'Order reconciliation must permit only bounded local promotion while remaining package, shipment, inventory, and provider-write fenced',
 )
 const intakeSource = read('app_src/lib/integrations/commerceIntake.ts')
 includes(intakeSource, [
@@ -582,13 +817,66 @@ includes(intakeSource, [
   'expectedLastStartedAt',
   'resetCommerceOrderReconciliationInPostgres',
 ], 'Order-page execution path')
+includes(intakeSource, [
+  'withAutomaticShopifyOrderPromotion',
+  'shopifyAutomaticOrderPromotionGate',
+  'worker_actor_required',
+  'sandbox_account_required',
+  'requiredCheckoutRateOutcome: \'matched\'',
+  'automaticShopifyPromotion',
+  'rollbackFenced',
+], 'Shopify clean-path automatic promotion service')
+const intakePersistenceSource = read(
+  'app_src/lib/persistence/commerceIntake.ts',
+)
+includes(intakePersistenceSource, [
+  'readAutomaticShopifyOrderPromotionTargetsForRunInPostgres',
+  "run.created_by = 'system:commerce-order-reconciliation'",
+  "account.environment !== 'sandbox'",
+  "candidate.normalized_payment_status !== 'paid'",
+  "candidate.normalized_return_status !== 'none'",
+  "line.packaging_source !== 'variant_pack_mapping'",
+  'physical_shipping_required',
+  'operations_shopify_checkout_rate_preflight_match_candidates',
+  'exactMatches.rowCount !== 1',
+  'prior_candidate_requires_review',
+  'canonical_order_exists',
+  'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED',
+  "checkoutRateReconciliation?.outcome !== 'matched'",
+  'no partial local order survives',
+], 'Shopify clean-path selector and atomic rollback fence')
+const strictPromotionSource = intakePersistenceSource.slice(
+  intakePersistenceSource.indexOf(
+    'export async function promoteCommerceCandidateInPostgres',
+  ),
+  intakePersistenceSource.indexOf(
+    'export async function\nreconcilePromotedCommerceCandidateCheckoutRateInPostgres',
+  ),
+)
+const canonicalInsertIndex = strictPromotionSource.indexOf(
+  'INSERT INTO operations_orders',
+)
+const reconciliationIndex = strictPromotionSource.indexOf(
+  'reconcileShopifyCheckoutRateForOrderCandidateWithClient',
+)
+const strictMatchFenceIndex = strictPromotionSource.indexOf(
+  "checkoutRateReconciliation?.outcome !== 'matched'",
+)
+assert.ok(canonicalInsertIndex > 0)
+assert.ok(reconciliationIndex > canonicalInsertIndex)
+assert.ok(strictMatchFenceIndex > reconciliationIndex)
+assert.match(
+  strictPromotionSource,
+  /return withTransaction\(async \(client\) => \{[\s\S]*COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED/u,
+  'The strict matched-lineage failure must throw inside the same canonical-order transaction',
+)
 const intakeWorkflowSource = read(
   'app_src/components/settings/CommerceIntakeWorkflow.tsx',
 )
 includes(intakeWorkflowSource, [
   'resetRequired: boolean',
   'automaticPromotionAttentionRequired: boolean',
-  'automatic local Faire order promotion needs attention',
+  'automatic local ${providerLabel(provider)} order promotion needs attention',
   'provider order rows scanned',
   'eligible order rows in latest page',
   'ClawPilot orders added',
@@ -600,7 +888,11 @@ includes(intakeWorkflowSource, [
   'Scanned rows are provider order rows checked, not ClawPilot',
   'filters ineligible rows and',
   'deduplicates already-known orders',
-  'This read-only step does not reserve inventory, create',
+  'with one matched',
+  'ClawPilot checkout quote',
+  'Provider reads remain read-only.',
+  'This step does not reserve',
+  'order promotion was held or',
   "'reset-order-reconciliation'",
   'Restart automatic staging',
   'ClawPilot will not reuse the terminal continuation.',
@@ -825,6 +1117,147 @@ assert.deepEqual(
   { ...completed.failureCodes },
   {},
   'Successful order reconciliation must report no failure categories',
+)
+
+let shopifyCompletionInput = null
+const shopifyWorker = loadTypeScriptModule(
+  'app_src/lib/commerceOrderReconciliationWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceIntake': {
+        commerceIntakeRuntimeAvailable: () => true,
+        async executeCommerceOrderPage() {
+          return {
+            command: {
+              providerWrites: 0,
+              syncCursorAdvanced: false,
+              ordersStaged: 4,
+              recordsRejected: 0,
+              automaticCustomerResolution: {
+                matched: 1,
+                created: 0,
+                ambiguous: 0,
+                skipped: 0,
+                failed: 0,
+                failedByCode: {},
+                providerWrites: 0,
+                syncCursorAdvanced: false,
+              },
+              automaticShopifyOrderPromotion: {
+                promoted: 1,
+                held: 2,
+                actionableHeld: 2,
+                heldByReason: {
+                  checkout_rate_lineage_missing: 1,
+                  physical_shipping_required: 1,
+                },
+                failed: 1,
+                failedByCode: {
+                  COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED: 1,
+                },
+                rollbackFenced: 1,
+                providerWrites: 0,
+                canonicalOrderWrites: 1,
+                inventoryWrites: 0,
+                syncCursorAdvanced: false,
+              },
+              pagination: {
+                batchNumber: 1,
+                runGlobalId: 'gcir0000200',
+                providerRowsSeen: 4,
+                hasNextBatch: false,
+              },
+            },
+          }
+        },
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async claimCommerceOrderReconciliationTargetsInPostgres() {
+          return [{
+            organizationId: '11111111-1111-4111-8111-111111111111',
+            integrationAccountId: '22222222-2222-4222-8222-222222222222',
+            accountGlobalId: 'gia0009201',
+            provider: 'shopify',
+            credentialVersion: 3,
+            startedAt: '2026-08-01T12:00:00.000Z',
+            recordsSeen: 0,
+            recordsHeld: 0,
+            continuationBatchNumber: null,
+            continuationRunGlobalId: null,
+            continuationIdempotencyKey: null,
+          }]
+        },
+        async projectCommerceOrderReconciliationPageInPostgres() {
+          return {
+            leaseLost: false,
+            startedAt: '2026-08-01T12:00:01.000Z',
+            recordsSeen: 4,
+            recordsHeld: 4,
+            continuationBatchNumber: 1,
+            providerCursorRepeated: false,
+          }
+        },
+        async completeCommerceOrderReconciliationInPostgres(input) {
+          shopifyCompletionInput = input
+          return {
+            leaseLost: false,
+            shopifyAutomaticPromotionAttentionRequired: true,
+          }
+        },
+        async failCommerceOrderReconciliationInPostgres() {
+          assert.fail('Shopify clean-path counters must complete successfully')
+        },
+      },
+    },
+  },
+)
+const shopifySummary = await shopifyWorker
+  .processCommerceOrderReconciliation({ limit: 1 })
+assert.equal(shopifySummary.canonicalOrderWrites, 1)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    shopifySummary.automaticShopifyOrderPromotion,
+  )),
+  {
+    policyVersion: 'commerce-shopify-order-auto-promotion-v1',
+    enabled: false,
+    runtimeEligible: false,
+    cohortConfigured: false,
+    cohortValid: false,
+    cohortSize: 0,
+    cohortHash: null,
+    disabledReason: 'development_runtime_required',
+    promoted: 1,
+    held: 2,
+    actionableHeld: 2,
+    heldByReason: {
+      checkout_rate_lineage_missing: 1,
+      physical_shipping_required: 1,
+    },
+    failed: 1,
+    failedByCode: {
+      COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED: 1,
+    },
+    rollbackFenced: 1,
+    attentionRequiredAccounts: 1,
+    operatorReviewRequired: 3,
+    providerWrites: 0,
+    canonicalOrderWrites: 1,
+    inventoryWrites: 0,
+    syncCursorAdvanced: false,
+  },
+)
+assert.equal(shopifyCompletionInput.shopifyOrdersPromoted, 1)
+assert.equal(shopifyCompletionInput.shopifyOrdersHeld, 2)
+assert.equal(shopifyCompletionInput.shopifyPromotionActionableHeld, 2)
+assert.equal(shopifyCompletionInput.shopifyPromotionFailed, 1)
+assert.equal(shopifyCompletionInput.shopifyPromotionRollbackFenced, 1)
+assert.deepEqual(
+  { ...shopifyCompletionInput.shopifyPromotionHeldReasons },
+  {
+    checkout_rate_lineage_missing: 1,
+    physical_shipping_required: 1,
+  },
 )
 
 const recoveredIntentKey = '018f0f50-28ec-7af5-a3fb-9bcbe43ea204'

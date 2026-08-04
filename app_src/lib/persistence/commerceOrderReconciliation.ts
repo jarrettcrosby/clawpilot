@@ -12,6 +12,8 @@ const ORDER_RECONCILIATION_LEASE = '10 minutes'
 const WORKER_HEARTBEAT_KEY = 'commerce_order_reconciliation_worker_heartbeat'
 export const FAIRE_AUTO_PROMOTION_ATTENTION_CODE =
   'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED'
+export const SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE =
+  'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED'
 
 const ORDER_RECONCILIATION_TERMINAL_FAILURE_CODES = [
   'COMMERCE_ORDER_RECONCILIATION_SESSION_RECORD_BUDGET_EXCEEDED',
@@ -182,7 +184,8 @@ export async function readCommerceOrderReconciliationHealthFromPostgres() {
     running: string
     failed: string
     stale_processing: string
-    promotion_attention_required: string
+    shopify_promotion_attention_required: string
+    faire_promotion_attention_required: string
     overdue: string
     resumable: string
     last_success_at: Date | string | null
@@ -224,8 +227,13 @@ export async function readCommerceOrderReconciliationHealthFromPostgres() {
        count(*) FILTER (WHERE reconciliation_status = 'running')::text AS running,
        count(*) FILTER (WHERE reconciliation_status = 'failed')::text AS failed,
        count(*) FILTER (
-         WHERE last_error_code = '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}'
-       )::text AS promotion_attention_required,
+         WHERE provider = 'shopify'
+           AND last_error_code = '${SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE}'
+       )::text AS shopify_promotion_attention_required,
+       count(*) FILTER (
+         WHERE provider = 'faire'
+           AND last_error_code = '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}'
+       )::text AS faire_promotion_attention_required,
        count(*) FILTER (
          WHERE reconciliation_status = 'running'
            AND last_started_at < now() - interval '${ORDER_RECONCILIATION_LEASE}'
@@ -256,9 +264,14 @@ export async function readCommerceOrderReconciliationHealthFromPostgres() {
     neverRun: Number(row?.never_run || 0),
     running: Number(row?.running || 0),
     failed: Number(row?.failed || 0),
-    promotionAttentionRequired: Number(
-      row?.promotion_attention_required || 0,
+    promotionAttentionRequired: (
+      Number(row?.shopify_promotion_attention_required || 0)
+      + Number(row?.faire_promotion_attention_required || 0)
     ),
+    providerPromotionAttentionRequired: {
+      shopify: Number(row?.shopify_promotion_attention_required || 0),
+      faire: Number(row?.faire_promotion_attention_required || 0),
+    },
     staleProcessing: Number(row?.stale_processing || 0),
     overdue: Number(row?.overdue || 0),
     resumable: Number(row?.resumable || 0),
@@ -469,6 +482,20 @@ export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
            LIMIT 1
          ),
          last_error_code = CASE
+           WHEN (
+             SELECT candidate.continuation_run_global_id
+             FROM candidates candidate
+             WHERE candidate.organization_id
+                   = operations_commerce_sync_cursors.organization_id
+               AND candidate.integration_account_id
+                   = operations_commerce_sync_cursors.integration_account_id
+             LIMIT 1
+           ) IS NULL
+             AND operations_commerce_sync_cursors.last_error_code IN (
+               '${SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE}',
+               '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}'
+             )
+             THEN operations_commerce_sync_cursors.last_error_code
            WHEN (
              SELECT candidate.continuation_run_global_id
              FROM candidates candidate
@@ -707,6 +734,13 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
   customersSkipped: unknown
   customerResolutionFailed: unknown
   customerResolutionFailureCodes: Record<string, number>
+  shopifyOrdersPromoted: unknown
+  shopifyOrdersHeld: unknown
+  shopifyPromotionActionableHeld: unknown
+  shopifyPromotionHeldReasons: Record<string, number>
+  shopifyPromotionFailed: unknown
+  shopifyPromotionFailureCodes: Record<string, number>
+  shopifyPromotionRollbackFenced: unknown
   faireOrdersPromoted: unknown
   faireOrdersHeld: unknown
   fairePromotionFailed: unknown
@@ -724,6 +758,20 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
     const customerResolutionFailed = boundedCount(
       input.customerResolutionFailed,
     )
+    const shopifyOrdersPromoted = boundedCount(input.shopifyOrdersPromoted)
+    const shopifyOrdersHeld = boundedCount(input.shopifyOrdersHeld)
+    const shopifyPromotionActionableHeld = boundedCount(
+      input.shopifyPromotionActionableHeld,
+    )
+    const shopifyPromotionFailed = boundedCount(
+      input.shopifyPromotionFailed,
+    )
+    const shopifyPromotionRollbackFenced = boundedCount(
+      input.shopifyPromotionRollbackFenced,
+    )
+    const shopifyPromotionAttentionRequired = boundedCount(
+      shopifyPromotionActionableHeld + shopifyPromotionFailed,
+    )
     const faireOrdersPromoted = boundedCount(input.faireOrdersPromoted)
     const faireOrdersHeld = boundedCount(input.faireOrdersHeld)
     const fairePromotionFailed = boundedCount(input.fairePromotionFailed)
@@ -737,8 +785,46 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
         .filter(([code]) => /^[A-Z][A-Z0-9_]{2,127}$/u.test(code))
         .map(([code, value]) => [code, boundedCount(value)]),
     )
-    const completed = await client.query(
-      `UPDATE operations_commerce_sync_cursors
+    const shopifyPromotionHeldReasons = Object.fromEntries(
+      Object.entries(input.shopifyPromotionHeldReasons || {})
+        .filter(([reason]) => /^[a-z][a-z0-9_]{2,127}$/u.test(reason))
+        .map(([reason, value]) => [reason, boundedCount(value)]),
+    )
+    const shopifyPromotionFailureCodes = Object.fromEntries(
+      Object.entries(input.shopifyPromotionFailureCodes || {})
+        .filter(([code]) => /^[A-Z][A-Z0-9_]{2,127}$/u.test(code))
+        .map(([code, value]) => [code, boundedCount(value)]),
+    )
+    const completed = await client.query<{ last_error_code: string | null }>(
+      `WITH unresolved_shopify_promotion AS (
+         SELECT EXISTS (
+           SELECT 1
+           FROM operations_commerce_order_candidates candidate
+           JOIN operations_commerce_intake_runs run
+             ON run.organization_id = candidate.organization_id
+            AND run.integration_account_id
+                = candidate.integration_account_id
+            AND run.id = candidate.run_id
+           WHERE candidate.organization_id = $1::uuid
+             AND candidate.integration_account_id = $2::uuid
+             AND candidate.provider = 'shopify'
+             AND candidate.workflow_state IN ('held', 'resolving', 'ready')
+             AND candidate.expires_at > now()
+             AND run.provider = 'shopify'
+             AND run.resource = 'products_and_orders'
+             AND run.created_by = 'system:commerce-order-reconciliation'
+             AND NOT EXISTS (
+               SELECT 1
+               FROM operations_orders canonical
+               WHERE canonical.organization_id = candidate.organization_id
+                 AND canonical.integration_account_id
+                     = candidate.integration_account_id
+                 AND canonical.external_order_id
+                     = candidate.external_order_id
+             )
+         ) AS attention_required
+       )
+       UPDATE operations_commerce_sync_cursors
        SET reconciliation_status = 'succeeded',
            records_applied = records_applied + $5::bigint,
            consecutive_failures = CASE
@@ -746,10 +832,22 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
              ELSE 0
            END,
            last_error_code = CASE
-             WHEN $6::bigint > 0
+             WHEN $9 = 'shopify'
+               AND (
+                 $6::bigint > 0
+                 OR (
+                   SELECT attention_required
+                   FROM unresolved_shopify_promotion
+                 )
+               )
+               THEN '${SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE}'
+             WHEN $7::bigint > 0
                THEN '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}'
-             WHEN $7::boolean
-               AND last_error_code = '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}'
+             WHEN $8::boolean
+               AND last_error_code IN (
+                 '${SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE}',
+                 '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}'
+               )
                THEN last_error_code
              ELSE NULL
            END,
@@ -760,18 +858,25 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
          AND resource = 'orders'
          AND reconciliation_status = 'running'
          AND last_started_at = $3::timestamptz
-       RETURNING organization_id::text`,
+       RETURNING last_error_code`,
       [
         input.target.organizationId,
         input.target.integrationAccountId,
         input.target.startedAt,
         input.hasNextBatch,
-        faireOrdersPromoted,
+        shopifyOrdersPromoted + faireOrdersPromoted,
+        shopifyPromotionAttentionRequired,
         fairePromotionFailed,
         Boolean(input.target.continuationRunGlobalId),
+        input.target.provider,
       ],
     )
-    if (completed.rowCount !== 1) return { leaseLost: true as const }
+    if (completed.rowCount !== 1) {
+      return {
+        leaseLost: true as const,
+        shopifyAutomaticPromotionAttentionRequired: false,
+      }
+    }
     await recordAuditEvent({
       actor: 'system',
       eventType: 'commerce.orders.reconciliation.staged',
@@ -805,14 +910,31 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
           failedByCode: fairePromotionFailureCodes,
           operatorReviewRequired: faireOrdersHeld + fairePromotionFailed,
         },
+        automaticShopifyOrderPromotion: {
+          promoted: shopifyOrdersPromoted,
+          held: shopifyOrdersHeld,
+          actionableHeld: shopifyPromotionActionableHeld,
+          heldByReason: shopifyPromotionHeldReasons,
+          failed: shopifyPromotionFailed,
+          failedByCode: shopifyPromotionFailureCodes,
+          rollbackFenced: shopifyPromotionRollbackFenced,
+          operatorReviewRequired:
+            shopifyPromotionAttentionRequired,
+        },
         resumed: Boolean(input.target.continuationRunGlobalId),
         providerReadOnly: true,
         providerWrites: 0,
-        canonicalOrderWrites: faireOrdersPromoted,
+        canonicalOrderWrites:
+          shopifyOrdersPromoted + faireOrdersPromoted,
         inventoryWrites: 0,
       },
     }, client)
-    return { leaseLost: false as const }
+    return {
+      leaseLost: false as const,
+      shopifyAutomaticPromotionAttentionRequired:
+        completed.rows[0]?.last_error_code
+          === SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE,
+    }
   })
 }
 
@@ -887,8 +1009,10 @@ export async function readCommerceOrderReconciliationStateInPostgres(input: {
       ),
       consecutiveFailures: boundedCount(row.consecutive_failures),
       lastErrorCode: row.last_error_code,
-      automaticPromotionAttentionRequired:
-        row.last_error_code === FAIRE_AUTO_PROMOTION_ATTENTION_CODE,
+      automaticPromotionAttentionRequired: [
+        FAIRE_AUTO_PROMOTION_ATTENTION_CODE,
+        SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE,
+      ].includes(row.last_error_code || ''),
       lastStartedAt: row.last_started_at?.toISOString() || null,
       lastCompletedAt: row.last_completed_at?.toISOString() || null,
       resumable: row.resumable,

@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto'
 import { commerceIntakeRuntimeAvailable, executeCommerceOrderPage } from '@/lib/integrations/commerceIntake'
 import {
+  shopifyAutomaticOrderPromotionCohort,
+} from '@/lib/integrations/commerceShopifyAutomaticPromotion'
+import {
   claimCommerceOrderReconciliationTargetsInPostgres,
   completeCommerceOrderReconciliationInPostgres,
   failCommerceOrderReconciliationInPostgres,
@@ -57,6 +60,9 @@ function assertReconciliationFence(command: Record<string, unknown>) {
   const automaticCustomerResolution = record(
     command.automaticCustomerResolution,
   )
+  const automaticShopifyOrderPromotion = record(
+    command.automaticShopifyOrderPromotion,
+  )
   const automaticFaireOrderPromotion = record(
     command.automaticFaireOrderPromotion,
   )
@@ -70,6 +76,20 @@ function assertReconciliationFence(command: Record<string, unknown>) {
       && (
         automaticCustomerResolution.providerWrites !== 0
         || automaticCustomerResolution.syncCursorAdvanced !== false
+      )
+    )
+    || (
+      Object.keys(automaticShopifyOrderPromotion).length > 0
+      && (
+        automaticShopifyOrderPromotion.providerWrites !== 0
+        || automaticShopifyOrderPromotion.inventoryWrites !== 0
+        || automaticShopifyOrderPromotion.syncCursorAdvanced !== false
+        || count(automaticShopifyOrderPromotion.canonicalOrderWrites)
+          !== count(automaticShopifyOrderPromotion.promoted)
+        || count(automaticShopifyOrderPromotion.rollbackFenced)
+          > count(automaticShopifyOrderPromotion.failed)
+        || count(automaticShopifyOrderPromotion.actionableHeld)
+          > count(automaticShopifyOrderPromotion.held)
       )
     )
     || (
@@ -139,17 +159,30 @@ function reconciliationError(code: string, message: string) {
  * session budgets. A bounded invocation stores its continuation for the next
  * poll; a session that is too large fails closed for operator review.
  * It stages candidates and normalization rejections, then permits a bounded
- * local-only Faire promotion for a newly observed order whose customer,
- * provider variant/SKU, quantity, address, delivery, and packaging evidence is
- * unambiguous. It never derives packages or shipments, changes inventory, or
- * calls a provider write API. Existing held orders and any ambiguous/error
- * candidates remain held for operator review.
+ * local-only promotion for a newly observed order whose customer, provider
+ * variant/SKU, quantity, address, delivery, and packaging evidence is
+ * unambiguous. Shopify additionally requires its exact default-off development
+ * account cohort and one matched checkout quote. It never derives packages or shipments,
+ * changes inventory, or calls a provider write API. Existing held
+ * orders and any ambiguous/error candidates remain held for operator review.
  */
 export async function processCommerceOrderReconciliation(input: {
   limit?: number
   /** Deterministic test seam; API callers never supply this. */
   clock?: () => number
 }) {
+  const shopifyPromotionCohort =
+    shopifyAutomaticOrderPromotionCohort()
+  const shopifyPromotionGateHealth = {
+    policyVersion: shopifyPromotionCohort.policyVersion,
+    enabled: shopifyPromotionCohort.enabled,
+    runtimeEligible: shopifyPromotionCohort.runtimeEligible,
+    cohortConfigured: shopifyPromotionCohort.configured,
+    cohortValid: shopifyPromotionCohort.valid,
+    cohortSize: shopifyPromotionCohort.cohortSize,
+    cohortHash: shopifyPromotionCohort.cohortHash,
+    disabledReason: shopifyPromotionCohort.disabledReason,
+  }
   if (!commerceIntakeRuntimeAvailable()) {
     return {
       skipped: true,
@@ -163,6 +196,22 @@ export async function processCommerceOrderReconciliation(input: {
       providerWrites: 0,
       canonicalOrderWrites: 0,
       inventoryWrites: 0,
+      automaticShopifyOrderPromotion: {
+        ...shopifyPromotionGateHealth,
+        promoted: 0,
+        held: 0,
+        actionableHeld: 0,
+        heldByReason: {},
+        failed: 0,
+        failedByCode: {},
+        rollbackFenced: 0,
+        attentionRequiredAccounts: 0,
+        operatorReviewRequired: 0,
+        providerWrites: 0,
+        canonicalOrderWrites: 0,
+        inventoryWrites: 0,
+        syncCursorAdvanced: false,
+      },
       automaticFaireOrderPromotion: {
         promoted: 0,
         held: 0,
@@ -205,10 +254,18 @@ export async function processCommerceOrderReconciliation(input: {
   let customersAmbiguous = 0
   let customersSkipped = 0
   let customerResolutionFailed = 0
+  let shopifyOrdersPromoted = 0
+  let shopifyOrdersHeld = 0
+  let shopifyActionableOrdersHeld = 0
+  let shopifyPromotionFailed = 0
+  let shopifyPromotionRollbackFenced = 0
+  let shopifyPromotionAttentionRequiredAccounts = 0
   let faireOrdersPromoted = 0
   let faireOrdersHeld = 0
   let fairePromotionFailed = 0
   const fairePromotionFailureCodes: Record<string, number> = {}
+  const shopifyPromotionHeldReasons: Record<string, number> = {}
+  const shopifyPromotionFailureCodes: Record<string, number> = {}
   const customerResolutionFailureCodes: Record<string, number> = {}
   const failureCodes: Record<string, number> = {}
   const clock = input.clock || Date.now
@@ -227,10 +284,17 @@ export async function processCommerceOrderReconciliation(input: {
       let targetCustomersAmbiguous = 0
       let targetCustomersSkipped = 0
       let targetCustomerResolutionFailed = 0
+      let targetShopifyOrdersPromoted = 0
+      let targetShopifyOrdersHeld = 0
+      let targetShopifyActionableOrdersHeld = 0
+      let targetShopifyPromotionFailed = 0
+      let targetShopifyPromotionRollbackFenced = 0
       let targetFaireOrdersPromoted = 0
       let targetFaireOrdersHeld = 0
       let targetFairePromotionFailed = 0
       const targetFairePromotionFailureCodes: Record<string, number> = {}
+      const targetShopifyPromotionHeldReasons: Record<string, number> = {}
+      const targetShopifyPromotionFailureCodes: Record<string, number> = {}
       const targetCustomerResolutionFailureCodes: Record<string, number> = {}
       let hasNextBatch = false
       let budgetStopReason: 'page' | 'records' | 'time' | null = null
@@ -306,6 +370,9 @@ export async function processCommerceOrderReconciliation(input: {
         const automaticCustomerResolution = record(
           command.automaticCustomerResolution,
         )
+        const automaticShopifyOrderPromotion = record(
+          command.automaticShopifyOrderPromotion,
+        )
         const automaticFaireOrderPromotion = record(
           command.automaticFaireOrderPromotion,
         )
@@ -319,6 +386,21 @@ export async function processCommerceOrderReconciliation(input: {
         targetCustomersSkipped += count(automaticCustomerResolution.skipped)
         targetCustomerResolutionFailed += count(
           automaticCustomerResolution.failed,
+        )
+        targetShopifyOrdersPromoted += count(
+          automaticShopifyOrderPromotion.promoted,
+        )
+        targetShopifyOrdersHeld += count(
+          automaticShopifyOrderPromotion.held,
+        )
+        targetShopifyActionableOrdersHeld += count(
+          automaticShopifyOrderPromotion.actionableHeld,
+        )
+        targetShopifyPromotionFailed += count(
+          automaticShopifyOrderPromotion.failed,
+        )
+        targetShopifyPromotionRollbackFenced += count(
+          automaticShopifyOrderPromotion.rollbackFenced,
         )
         targetFaireOrdersPromoted += count(
           automaticFaireOrderPromotion.promoted,
@@ -341,6 +423,24 @@ export async function processCommerceOrderReconciliation(input: {
           if (!/^[A-Z][A-Z0-9_]{2,127}$/u.test(code)) continue
           targetFairePromotionFailureCodes[code] = (
             targetFairePromotionFailureCodes[code] || 0
+          ) + count(value)
+        }
+        const shopifyHeldByReason = record(
+          automaticShopifyOrderPromotion.heldByReason,
+        )
+        for (const [reason, value] of Object.entries(shopifyHeldByReason)) {
+          if (!/^[a-z][a-z0-9_]{2,127}$/u.test(reason)) continue
+          targetShopifyPromotionHeldReasons[reason] = (
+            targetShopifyPromotionHeldReasons[reason] || 0
+          ) + count(value)
+        }
+        const shopifyFailedByCode = record(
+          automaticShopifyOrderPromotion.failedByCode,
+        )
+        for (const [code, value] of Object.entries(shopifyFailedByCode)) {
+          if (!/^[A-Z][A-Z0-9_]{2,127}$/u.test(code)) continue
+          targetShopifyPromotionFailureCodes[code] = (
+            targetShopifyPromotionFailureCodes[code] || 0
           ) + count(value)
         }
         targetPagesRead += 1
@@ -454,6 +554,15 @@ export async function processCommerceOrderReconciliation(input: {
         customersSkipped: targetCustomersSkipped,
         customerResolutionFailed: targetCustomerResolutionFailed,
         customerResolutionFailureCodes: targetCustomerResolutionFailureCodes,
+        shopifyOrdersPromoted: targetShopifyOrdersPromoted,
+        shopifyOrdersHeld: targetShopifyOrdersHeld,
+        shopifyPromotionActionableHeld:
+          targetShopifyActionableOrdersHeld,
+        shopifyPromotionHeldReasons: targetShopifyPromotionHeldReasons,
+        shopifyPromotionFailed: targetShopifyPromotionFailed,
+        shopifyPromotionFailureCodes: targetShopifyPromotionFailureCodes,
+        shopifyPromotionRollbackFenced:
+          targetShopifyPromotionRollbackFenced,
         faireOrdersPromoted: targetFaireOrdersPromoted,
         faireOrdersHeld: targetFaireOrdersHeld,
         fairePromotionFailed: targetFairePromotionFailed,
@@ -470,6 +579,15 @@ export async function processCommerceOrderReconciliation(input: {
         customersAmbiguous += targetCustomersAmbiguous
         customersSkipped += targetCustomersSkipped
         customerResolutionFailed += targetCustomerResolutionFailed
+        shopifyOrdersPromoted += targetShopifyOrdersPromoted
+        shopifyOrdersHeld += targetShopifyOrdersHeld
+        shopifyActionableOrdersHeld += targetShopifyActionableOrdersHeld
+        shopifyPromotionFailed += targetShopifyPromotionFailed
+        shopifyPromotionRollbackFenced +=
+          targetShopifyPromotionRollbackFenced
+        if (completion.shopifyAutomaticPromotionAttentionRequired) {
+          shopifyPromotionAttentionRequiredAccounts += 1
+        }
         faireOrdersPromoted += targetFaireOrdersPromoted
         faireOrdersHeld += targetFaireOrdersHeld
         fairePromotionFailed += targetFairePromotionFailed
@@ -479,6 +597,22 @@ export async function processCommerceOrderReconciliation(input: {
         ) {
           customerResolutionFailureCodes[code] = (
             customerResolutionFailureCodes[code] || 0
+          ) + value
+        }
+        for (
+          const [reason, value]
+          of Object.entries(targetShopifyPromotionHeldReasons)
+        ) {
+          shopifyPromotionHeldReasons[reason] = (
+            shopifyPromotionHeldReasons[reason] || 0
+          ) + value
+        }
+        for (
+          const [code, value]
+          of Object.entries(targetShopifyPromotionFailureCodes)
+        ) {
+          shopifyPromotionFailureCodes[code] = (
+            shopifyPromotionFailureCodes[code] || 0
           ) + value
         }
         for (
@@ -529,7 +663,7 @@ export async function processCommerceOrderReconciliation(input: {
     },
     resource: 'orders',
     providerWrites: 0,
-    canonicalOrderWrites: faireOrdersPromoted,
+    canonicalOrderWrites: shopifyOrdersPromoted + faireOrdersPromoted,
     inventoryWrites: 0,
     automaticCustomerResolution: {
       matched: customersMatched,
@@ -541,6 +675,27 @@ export async function processCommerceOrderReconciliation(input: {
       operatorReviewRequired:
         customersAmbiguous + customersSkipped + customerResolutionFailed,
       providerWrites: 0,
+      syncCursorAdvanced: false,
+    },
+    automaticShopifyOrderPromotion: {
+      ...shopifyPromotionGateHealth,
+      promoted: shopifyOrdersPromoted,
+      held: shopifyOrdersHeld,
+      actionableHeld: shopifyActionableOrdersHeld,
+      heldByReason: shopifyPromotionHeldReasons,
+      failed: shopifyPromotionFailed,
+      failedByCode: shopifyPromotionFailureCodes,
+      rollbackFenced: shopifyPromotionRollbackFenced,
+      attentionRequiredAccounts:
+        shopifyPromotionAttentionRequiredAccounts,
+      operatorReviewRequired:
+        Math.max(
+          shopifyActionableOrdersHeld + shopifyPromotionFailed,
+          shopifyPromotionAttentionRequiredAccounts,
+        ),
+      providerWrites: 0,
+      canonicalOrderWrites: shopifyOrdersPromoted,
+      inventoryWrites: 0,
       syncCursorAdvanced: false,
     },
     automaticFaireOrderPromotion: {
