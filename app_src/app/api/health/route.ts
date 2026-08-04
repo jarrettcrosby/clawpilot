@@ -3596,14 +3596,38 @@ export async function GET() {
             const imageAgeMs = Number.isFinite(imageHeartbeatAt)
               ? checkedAt - imageHeartbeatAt
               : null
+            const imageProgressAt = Date.parse(
+              String(imageQueue.lastTerminalProgressAt || ''),
+            )
+            const imageProgressAgeMs = Number.isFinite(imageProgressAt)
+              ? checkedAt - imageProgressAt
+              : null
             const loopReachable = (
               imageAgeMs !== null
               && imageAgeMs <= maxImageHeartbeatAgeMs
             )
+            const maxImageProgressAgeMs = Math.max(
+              90_000,
+              imagePollMs * 4,
+            )
+            const activelyDraining = (
+              imageQueue.overdueCount > 0
+              && imageQueue.deadCount === 0
+              && imageQueue.staleLeaseCount === 0
+              && imageQueue.retryCount === 0
+              && imageQueue.heartbeat?.phase !== 'degraded'
+              && loopReachable
+              && imageProgressAgeMs !== null
+              && imageProgressAgeMs <= maxImageProgressAgeMs
+            )
+            const stalledOverdue = (
+              imageQueue.overdueCount > 0
+              && !activelyDraining
+            )
             const operationalDegraded = (
               imageQueue.deadCount > 0
               || imageQueue.staleLeaseCount > 0
-              || imageQueue.overdueCount > 0
+              || stalledOverdue
               || imageQueue.retryCount > 0
               || imageQueue.heartbeat?.phase === 'degraded'
             )
@@ -3624,6 +3648,10 @@ export async function GET() {
               historicalDead: imageQueue.historicalDeadCount,
               staleLeases: imageQueue.staleLeaseCount,
               overdue: imageQueue.overdueCount,
+              activelyDraining,
+              stalledOverdue,
+              lastTerminalProgressAt: imageQueue.lastTerminalProgressAt,
+              progressAgeMs: imageProgressAgeMs,
             }
             if (!loopReachable) {
               errors.push(
@@ -3640,9 +3668,9 @@ export async function GET() {
                 'Commerce product image import queue has stale claimed jobs.',
               )
             }
-            if (imageQueue.overdueCount > 0) {
+            if (stalledOverdue) {
               warnings.push(
-                'Commerce product image import queue has overdue jobs.',
+                'Commerce product image import queue has overdue jobs and is not making recent progress.',
               )
             }
             if (imageQueue.retryCount > 0) {

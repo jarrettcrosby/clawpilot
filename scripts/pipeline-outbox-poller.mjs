@@ -87,7 +87,7 @@ await Promise.all([
     ? [runLoop('commerce-order-reconciliation', '/api/integrations/commerce/orders/process', 1, commerceOrderReconciliationIntervalMs)]
     : []),
   ...(commerceProductImageImportEnabled
-    ? [runLoop('commerce-product-images', '/api/integrations/commerce/images/process', 1, commerceProductImageImportIntervalMs)]
+    ? [runLoop('commerce-product-images', '/api/integrations/commerce/images/process', 5, commerceProductImageImportIntervalMs)]
     : []),
   ...(commerceFulfillmentRecoveryEnabled
     ? [runLoop('commerce-fulfillment-recovery', '/api/integrations/commerce/fulfillment/process', 1, commerceFulfillmentRecoveryIntervalMs)]

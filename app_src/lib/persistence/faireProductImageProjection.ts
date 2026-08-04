@@ -20,6 +20,7 @@ const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
 const CHANNEL_GLOBAL_ID = /^gpcs(?:[0-9]{7}|[0-9a-v]{12})$/
 const EFFECT_GLOBAL_ID = /^gcef(?:[0-9]{7}|[0-9a-v]{12})$/
 const PRODUCT_REFERENCE = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/
+const MAX_PROVIDER_IMAGES = 20
 const ACTIVE_TTL_SECONDS = 5 * 60
 const SHADOW_TTL_SECONDS = 60
 
@@ -120,14 +121,22 @@ type ReconciliationRow = QueryResultRow & {
   account_global_id: string
   credential_generation: number
   external_product_id: string
+  asset_content_sha256: string
   external_effect_id: string
   external_effect_global_id: string
   effect_state: string
+  terminal_evidence_hash: string | null
   lease_expired: boolean
   provider_write_count: number
   uploaded_locator_sha256: string | null
+  prior_image_count: string | number | null
+  projected_image_count: string | number | null
   latest_outcome: string | null
   latest_observed_at: TimestampValue | null
+  reconciliation_applied: boolean
+  reconciled_provider_image_count: string | number | null
+  reconciled_exact_locator_match_count: string | number | null
+  reconciled_provider_image_set_sha256: string | null
 }
 
 export type FaireProductImageProjectionMode = 'shadow' | 'active'
@@ -186,14 +195,22 @@ export type FaireProductImageReconciliationContext = {
   accountGlobalId: string
   credentialGeneration: number
   externalProductId: string
+  assetContentSha256: string
   externalEffectId: string
   externalEffectGlobalId: string
   effectState: string
+  terminalEvidenceHash: string | null
   leaseExpired: boolean
   providerWriteCount: number
   uploadedLocatorSha256: string | null
+  priorImageCount: number | null
+  projectedImageCount: number | null
   latestOutcome: string | null
   latestObservedAt: string | null
+  reconciliationApplied: boolean
+  reconciledProviderImageCount: number | null
+  reconciledExactLocatorMatchCount: number | null
+  reconciledProviderImageSetSha256: string | null
 }
 
 export class FaireProductImageProjectionPersistenceError extends Error {
@@ -1208,9 +1225,11 @@ async function readFaireProductImageReconciliationContextWithClient(
        image_grant.account_global_id,
        image_grant.credential_generation,
        image_grant.external_product_id,
+       image_grant.asset_content_sha256,
        effect.id::text AS external_effect_id,
        effect.global_id AS external_effect_global_id,
        effect.state AS effect_state,
+       effect.terminal_evidence_hash,
        (
          effect.state = 'claimed'
          AND effect.lease_expires_at <= clock_timestamp()
@@ -1233,8 +1252,54 @@ async function readFaireProductImageReconciliationContextWithClient(
            ELSE NULL
          END
        ) AS uploaded_locator_sha256,
+       CASE
+         WHEN jsonb_typeof(effect.redacted_result->'priorImageCount') = 'number'
+          AND (effect.redacted_result->>'priorImageCount')::numeric
+                BETWEEN 0 AND ${MAX_PROVIDER_IMAGES}
+         THEN (effect.redacted_result->>'priorImageCount')::integer
+         ELSE NULL
+       END AS prior_image_count,
+       CASE
+         WHEN jsonb_typeof(effect.redacted_result->'projectedImageCount') = 'number'
+          AND (effect.redacted_result->>'projectedImageCount')::numeric
+                BETWEEN 0 AND ${MAX_PROVIDER_IMAGES}
+         THEN (effect.redacted_result->>'projectedImageCount')::integer
+         ELSE NULL
+       END AS projected_image_count,
        latest.outcome AS latest_outcome,
-       latest.observed_at AS latest_observed_at
+       latest.observed_at AS latest_observed_at,
+       (
+         effect.state = 'succeeded'
+         AND effect.provider_write_count = 2
+         AND effect.error_code IS NULL
+         AND effect.provider_reference = image_grant.external_product_id
+         AND effect.redacted_result->>'provider' = 'faire'
+         AND effect.redacted_result->>'operation' = 'productImagePublish'
+         AND effect.redacted_result->>'outcome' = 'succeeded'
+         AND effect.redacted_result->>'stage' =
+               'exact_product_readback_reconciliation'
+         AND effect.redacted_result->>'deliveryGrantId' = image_grant.id::text
+         AND effect.redacted_result->>'assetContentSha256' =
+               image_grant.asset_content_sha256
+         AND effect.redacted_result->>'reconciliationStepId' =
+               resolution.id::text
+         AND effect.redacted_result->>'uploadedLocatorSha256' =
+               resolution.uploaded_locator_sha256
+         AND effect.redacted_result->>'providerImageSetSha256' =
+               resolution.provider_image_set_sha256
+         AND effect.redacted_result->>'providerImageCount' =
+               resolution.provider_image_count::text
+         AND effect.redacted_result->>'exactLocatorMatchCount' = '1'
+         AND effect.terminal_evidence_hash =
+               operations_faire_provider_write_request_hash(
+                 effect.redacted_result
+               )
+       ) AS reconciliation_applied,
+       resolution.provider_image_count AS reconciled_provider_image_count,
+       resolution.exact_locator_match_count AS
+         reconciled_exact_locator_match_count,
+       resolution.provider_image_set_sha256 AS
+         reconciled_provider_image_set_sha256
      FROM operations_commerce_external_effect_intents effect
      JOIN operations_faire_product_image_delivery_grants image_grant
        ON image_grant.organization_id = effect.organization_id
@@ -1269,6 +1334,48 @@ async function readFaireProductImageReconciliationContextWithClient(
        ORDER BY step.observed_at DESC, step.id DESC
        LIMIT 1
      ) latest ON true
+     LEFT JOIN LATERAL (
+       SELECT
+         step.id,
+         step.uploaded_locator_sha256,
+         CASE
+           WHEN step.redacted_evidence->>'providerImageCount' ~ '^[0-9]{1,2}$'
+            AND (step.redacted_evidence->>'providerImageCount')::numeric
+                  BETWEEN 1 AND ${MAX_PROVIDER_IMAGES}
+           THEN (step.redacted_evidence->>'providerImageCount')::integer
+           ELSE NULL
+         END AS provider_image_count,
+         1::integer AS exact_locator_match_count,
+         step.redacted_evidence->>'providerImageSetSha256' AS
+           provider_image_set_sha256
+       FROM operations_faire_product_image_provider_steps step
+       WHERE step.organization_id = effect.organization_id
+         AND step.external_effect_id = effect.id
+         AND step.delivery_grant_id = image_grant.id
+         AND step.stage = 'reconcile'
+         AND step.outcome = 'observed_applied'
+         AND step.id = CASE
+           WHEN effect.redacted_result->>'reconciliationStepId' ~*
+             '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+           THEN (effect.redacted_result->>'reconciliationStepId')::uuid
+           ELSE NULL
+         END
+         AND step.redacted_evidence->>'provider' = 'faire'
+         AND step.redacted_evidence->>'operation' =
+               'productImagePublishReconciliation'
+         AND step.redacted_evidence->>'outcome' = 'observed_applied'
+         AND step.redacted_evidence->>'assetContentSha256' =
+               image_grant.asset_content_sha256
+         AND step.redacted_evidence->>'uploadedLocatorSha256' =
+               step.uploaded_locator_sha256
+         AND step.redacted_evidence->>'exactLocatorMatchCount' = '1'
+         AND step.redacted_evidence->>'providerImageCount' ~ '^[0-9]{1,2}$'
+         AND (step.redacted_evidence->>'providerImageCount')::integer
+               BETWEEN 1 AND ${MAX_PROVIDER_IMAGES}
+         AND step.redacted_evidence->>'providerImageSetSha256' ~
+               '^[a-f0-9]{64}$'
+       LIMIT 1
+     ) resolution ON true
      WHERE effect.organization_id = $1::uuid
        AND image_grant.product_id = $2::uuid
        AND effect.global_id = $3
@@ -1293,16 +1400,41 @@ async function readFaireProductImageReconciliationContextWithClient(
     accountGlobalId: row.account_global_id,
     credentialGeneration: row.credential_generation,
     externalProductId: row.external_product_id,
+    assetContentSha256: row.asset_content_sha256,
     externalEffectId: row.external_effect_id,
     externalEffectGlobalId: row.external_effect_global_id,
     effectState: row.effect_state,
+    terminalEvidenceHash: row.terminal_evidence_hash,
     leaseExpired: row.lease_expired === true,
     providerWriteCount: row.provider_write_count,
     uploadedLocatorSha256: row.uploaded_locator_sha256,
+    priorImageCount: row.prior_image_count === null
+      ? null
+      : integer(row.prior_image_count, 'Faire prior image count'),
+    projectedImageCount: row.projected_image_count === null
+      ? null
+      : integer(row.projected_image_count, 'Faire projected image count'),
     latestOutcome: row.latest_outcome,
     latestObservedAt: row.latest_observed_at
       ? iso(row.latest_observed_at)
       : null,
+    reconciliationApplied: row.reconciliation_applied === true,
+    reconciledProviderImageCount:
+      row.reconciled_provider_image_count === null
+        ? null
+        : integer(
+          row.reconciled_provider_image_count,
+          'Faire reconciled provider image count',
+        ),
+    reconciledExactLocatorMatchCount:
+      row.reconciled_exact_locator_match_count === null
+        ? null
+        : integer(
+          row.reconciled_exact_locator_match_count,
+          'Faire reconciled exact locator count',
+        ),
+    reconciledProviderImageSetSha256:
+      row.reconciled_provider_image_set_sha256,
   }
 }
 
@@ -1316,6 +1448,299 @@ export async function readFaireProductImageReconciliationContextInPostgres(
   return withTransaction((client) => (
     readFaireProductImageReconciliationContextWithClient(client, input)
   ))
+}
+
+export async function resolveFaireProductImageAppliedReconciliationInPostgres(
+  input: {
+    organizationId: string
+    productId: string
+    externalEffectGlobalId: string
+    expectedDeliveryGrantId: string
+    expectedExternalEffectId: string
+    expectedAccountGlobalId: string
+    expectedCredentialGeneration: number
+    expectedExternalProductId: string
+    expectedAssetContentSha256: string
+    expectedUploadedLocatorSha256: string
+    providerImageCount: number
+    exactLocatorMatchCount: number
+    providerImageSetSha256: string
+    actorEmail: string
+  },
+) {
+  if (
+    !UUID.test(input.organizationId)
+    || !UUID.test(input.productId)
+    || !EFFECT_GLOBAL_ID.test(input.externalEffectGlobalId)
+    || !UUID.test(input.expectedDeliveryGrantId)
+    || !UUID.test(input.expectedExternalEffectId)
+    || !ACCOUNT_GLOBAL_ID.test(input.expectedAccountGlobalId)
+    || !Number.isSafeInteger(input.expectedCredentialGeneration)
+    || input.expectedCredentialGeneration < 1
+    || !HASH.test(input.expectedAssetContentSha256)
+    || !HASH.test(input.expectedUploadedLocatorSha256)
+    || !HASH.test(input.providerImageSetSha256)
+    || !Number.isSafeInteger(input.providerImageCount)
+    || input.providerImageCount < 1
+    || input.providerImageCount > MAX_PROVIDER_IMAGES
+    || input.exactLocatorMatchCount !== 1
+  ) {
+    fail(
+      'FAIRE_PRODUCT_IMAGE_RECONCILIATION_INVALID',
+      'Exact Faire Product-image reconciliation evidence is invalid',
+      400,
+    )
+  }
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `faire-product-image-resolve:${input.organizationId}:${input.externalEffectGlobalId}`,
+    )
+    const current = await readFaireProductImageReconciliationContextWithClient(
+      client,
+      { ...input, forUpdate: true },
+    )
+    if (
+      current.deliveryGrantId !== input.expectedDeliveryGrantId
+      || current.externalEffectId !== input.expectedExternalEffectId
+      || current.accountGlobalId !== input.expectedAccountGlobalId
+      || current.credentialGeneration !== input.expectedCredentialGeneration
+      || current.externalProductId !== input.expectedExternalProductId
+      || current.assetContentSha256 !== input.expectedAssetContentSha256
+      || current.uploadedLocatorSha256 !==
+        input.expectedUploadedLocatorSha256
+    ) {
+      fail(
+        'FAIRE_PRODUCT_IMAGE_RECONCILIATION_STALE',
+        'Faire Product-image reconciliation identity changed after provider readback',
+      )
+    }
+    if (current.effectState === 'succeeded') {
+      if (
+        !current.reconciliationApplied
+        || current.reconciledProviderImageCount !== input.providerImageCount
+        || current.reconciledExactLocatorMatchCount !== 1
+        || current.reconciledProviderImageSetSha256 !==
+          input.providerImageSetSha256
+      ) {
+        fail(
+          'FAIRE_PRODUCT_IMAGE_RECONCILIATION_CONFLICT',
+          'Succeeded Faire Product-image evidence does not match this readback',
+        )
+      }
+      return {
+        effectState: 'succeeded' as const,
+        providerImageCount: current.reconciledProviderImageCount,
+        exactLocatorMatchCount: 1 as const,
+        providerImageSetSha256:
+          current.reconciledProviderImageSetSha256,
+        replayed: true,
+      }
+    }
+    if (
+      current.effectState !== 'unknown'
+      || !current.terminalEvidenceHash
+      || current.providerWriteCount !== 1
+      || current.priorImageCount === null
+      || current.projectedImageCount !== input.providerImageCount
+      || current.projectedImageCount !== current.priorImageCount + 1
+    ) {
+      fail(
+        'FAIRE_PRODUCT_IMAGE_RECONCILIATION_NOT_TERMINALIZABLE',
+        'Faire Product-image readback does not prove the exact uncertain attachment',
+      )
+    }
+    const reconciliationEvidence = {
+      provider: 'faire',
+      operation: 'productImagePublishReconciliation',
+      outcome: 'observed_applied',
+      externalProductId: current.externalProductId,
+      assetContentSha256: current.assetContentSha256,
+      uploadedLocatorSha256: current.uploadedLocatorSha256,
+      providerImageCount: input.providerImageCount,
+      exactLocatorMatchCount: 1,
+      providerImageSetSha256: input.providerImageSetSha256,
+      providerWrites: 2,
+      reconciledBy: input.actorEmail,
+    }
+    assertRedactedCommerceExternalEffectEvidence(
+      reconciliationEvidence,
+      'Faire Product-image applied reconciliation evidence',
+    )
+    const reconciliationHash = commerceExternalEffectHash(
+      reconciliationEvidence,
+    )
+    const step = await client.query<{
+      id: string
+      observed_at: TimestampValue
+    }>(
+      `INSERT INTO operations_faire_product_image_provider_steps (
+         organization_id, integration_account_id, idempotency_key,
+         delivery_grant_id, external_effect_id, provider_attempt_id,
+         stage, outcome, uploaded_locator_sha256, provider_write_count,
+         redacted_evidence, evidence_hash, recorded_by
+       )
+       SELECT
+         image_grant.organization_id, image_grant.integration_account_id,
+         image_grant.idempotency_key, image_grant.id, effect.id, NULL,
+         'reconcile', 'observed_applied', $6, 2, $7::jsonb, $8, $9
+       FROM operations_faire_product_image_delivery_grants image_grant
+       JOIN operations_commerce_external_effect_intents effect
+         ON effect.organization_id = image_grant.organization_id
+        AND effect.integration_account_id = image_grant.integration_account_id
+        AND effect.idempotency_key = image_grant.idempotency_key
+       WHERE image_grant.organization_id = $1::uuid
+         AND image_grant.product_id = $2::uuid
+         AND image_grant.id = $3::uuid
+         AND effect.id = $4::uuid
+         AND effect.global_id = $5
+         AND effect.provider = 'faire'
+         AND effect.action = '${ACTION}'
+         AND effect.desired_mode = 'active'
+         AND effect.state = 'unknown'
+         AND effect.terminal_evidence_hash = $10
+         AND effect.provider_write_count = 1
+         AND image_grant.asset_content_sha256 = $11
+         AND image_grant.external_product_id = $12
+         AND EXISTS (
+           SELECT 1
+           FROM operations_faire_product_image_provider_steps upload
+           WHERE upload.organization_id = effect.organization_id
+             AND upload.external_effect_id = effect.id
+             AND upload.delivery_grant_id = image_grant.id
+             AND upload.provider_attempt_id = effect.provider_attempt_id
+             AND upload.stage = 'upload'
+             AND upload.outcome = 'succeeded'
+             AND upload.provider_write_count = 1
+             AND upload.uploaded_locator_sha256 = $6
+             AND upload.redacted_evidence->>'assetContentSha256' = $11
+             AND upload.redacted_evidence->>'uploadedLocatorSha256' = $6
+         )
+       RETURNING id::text, observed_at`,
+      [
+        input.organizationId,
+        input.productId,
+        current.deliveryGrantId,
+        current.externalEffectId,
+        input.externalEffectGlobalId,
+        current.uploadedLocatorSha256,
+        JSON.stringify(reconciliationEvidence),
+        reconciliationHash,
+        input.actorEmail,
+        current.terminalEvidenceHash,
+        current.assetContentSha256,
+        current.externalProductId,
+      ],
+    )
+    if (!step.rows[0]) {
+      fail(
+        'FAIRE_PRODUCT_IMAGE_RECONCILIATION_CONFLICT',
+        'Faire Product-image effect changed before reconciliation was recorded',
+      )
+    }
+    const terminalEvidence = {
+      provider: 'faire',
+      action: ACTION,
+      operation: 'productImagePublish',
+      outcome: 'succeeded',
+      stage: 'exact_product_readback_reconciliation',
+      errorCode: null,
+      deliveryGrantId: current.deliveryGrantId,
+      externalProductId: current.externalProductId,
+      assetContentSha256: current.assetContentSha256,
+      uploadedLocatorSha256: current.uploadedLocatorSha256,
+      existingImagesPreserved: true,
+      priorImageCount: current.priorImageCount,
+      projectedImageCount: input.providerImageCount,
+      providerWritesKnown: true,
+      providerWriteCountLowerBound: 2,
+      providerWrites: 2,
+      reconciliationStepId: step.rows[0].id,
+      reconciledFromState: 'unknown',
+      reconciledFromTerminalEvidenceHash: current.terminalEvidenceHash,
+      providerImageSetSha256: input.providerImageSetSha256,
+      providerImageCount: input.providerImageCount,
+      exactLocatorMatchCount: 1,
+      reconciledBy: input.actorEmail,
+    }
+    assertRedactedCommerceExternalEffectEvidence(
+      terminalEvidence,
+      'Faire Product-image terminal reconciliation evidence',
+    )
+    const terminalHash = commerceExternalEffectHash(terminalEvidence)
+    const terminalized = await client.query<{ id: string }>(
+      `UPDATE operations_commerce_external_effect_intents
+       SET state = 'succeeded',
+           redacted_result = $6::jsonb,
+           terminal_evidence_hash = $7,
+           provider_reference = $8,
+           error_code = NULL,
+           provider_write_count = 2,
+           completed_at = (
+             SELECT resolution.observed_at
+             FROM operations_faire_product_image_provider_steps resolution
+             WHERE resolution.organization_id = $1::uuid
+               AND resolution.external_effect_id = $2::uuid
+               AND resolution.id = $9::uuid
+           ),
+           updated_at = (
+             SELECT resolution.observed_at
+             FROM operations_faire_product_image_provider_steps resolution
+             WHERE resolution.organization_id = $1::uuid
+               AND resolution.external_effect_id = $2::uuid
+               AND resolution.id = $9::uuid
+           )
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND global_id = $3
+         AND state = 'unknown'
+         AND terminal_evidence_hash = $4
+         AND provider_write_count = $5
+       RETURNING id::text`,
+      [
+        input.organizationId,
+        current.externalEffectId,
+        input.externalEffectGlobalId,
+        current.terminalEvidenceHash,
+        current.providerWriteCount,
+        JSON.stringify(terminalEvidence),
+        terminalHash,
+        current.externalProductId,
+        step.rows[0].id,
+      ],
+    )
+    if (!terminalized.rows[0]) {
+      fail(
+        'FAIRE_PRODUCT_IMAGE_RECONCILIATION_CONFLICT',
+        'Faire Product-image effect changed before terminal reconciliation',
+      )
+    }
+    const resolved = await readFaireProductImageReconciliationContextWithClient(
+      client,
+      input,
+    )
+    if (
+      resolved.effectState !== 'succeeded'
+      || !resolved.reconciliationApplied
+      || resolved.reconciledProviderImageCount !== input.providerImageCount
+      || resolved.reconciledExactLocatorMatchCount !== 1
+      || resolved.reconciledProviderImageSetSha256 !==
+        input.providerImageSetSha256
+    ) {
+      fail(
+        'FAIRE_PRODUCT_IMAGE_RECONCILIATION_SAVE_FAILED',
+        'Faire Product-image terminal reconciliation could not be verified',
+        500,
+      )
+    }
+    return {
+      effectState: 'succeeded' as const,
+      providerImageCount: resolved.reconciledProviderImageCount,
+      exactLocatorMatchCount: 1 as const,
+      providerImageSetSha256: resolved.reconciledProviderImageSetSha256,
+      replayed: false,
+    }
+  })
 }
 
 export async function recoverExpiredFaireProductImageClaimInPostgres(input: {
@@ -1442,16 +1867,6 @@ export async function readFaireProductImageProjectionHealthInPostgres() {
        count(*)::text AS count,
        count(*) FILTER (
          WHERE effect.state IN ('unknown', 'failed')
-           AND NOT EXISTS (
-             SELECT 1
-             FROM operations_faire_product_image_provider_steps resolution
-             WHERE resolution.organization_id = effect.organization_id
-               AND resolution.external_effect_id = effect.id
-               AND resolution.stage = 'reconcile'
-               AND resolution.outcome IN (
-                 'observed_applied', 'observed_absent'
-               )
-           )
        )::text AS unresolved_count,
        count(*) FILTER (
          WHERE effect.state = 'claimed'

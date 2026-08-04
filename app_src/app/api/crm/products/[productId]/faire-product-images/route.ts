@@ -6,6 +6,7 @@ import {
 import {
   FaireProductImageRefreshError,
 } from '@/lib/integrations/faireProductImageRefreshTypes'
+import { commerceIntakeRuntimeAvailable } from '@/lib/integrations/commerceIntake'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { appPublicUrl } from '@/lib/publicUrl'
 import { requestSession, requireRequestUser } from '@/lib/requestUser'
@@ -177,6 +178,13 @@ export async function POST(
         'FAIRE_PRODUCT_IMAGE_REFRESH_SELECTION_INVALID',
         'Product is invalid',
         404,
+      )
+    }
+    if (!commerceIntakeRuntimeAvailable()) {
+      fail(
+        'FAIRE_PRODUCT_IMAGE_REFRESH_DEVELOPMENT_ONLY',
+        'Faire Product image import is available only while development commerce intake is enabled',
+        409,
       )
     }
     const body = await boundedJson(req)
