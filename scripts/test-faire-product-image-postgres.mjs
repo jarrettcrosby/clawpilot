@@ -128,6 +128,10 @@ async function applyMigrations(client) {
     files.includes('0234_operations_faire_product_image_writable_lifecycle.sql'),
     'Faire Product-image writable-lifecycle migration is missing',
   )
+  assert.ok(
+    files.includes('0252_operations_faire_product_image_reconciliation_terminal.sql'),
+    'Faire Product-image reconciliation terminal migration is missing',
+  )
   for (const file of files) {
     await client.query('BEGIN')
     try {
@@ -768,7 +772,242 @@ async function runOperationalAcceptance({
     await persistence.readFaireProductImageProjectionHealthInPostgres()
   assert.equal(health.expiredClaimed, 0)
   assert.equal(health.counts.unknown, 1)
-  assert.equal(health.unresolvedCounts.unknown, 0)
+  assert.equal(health.unresolvedCounts.unknown, 1)
+
+  const terminalShadow = await persistence
+    .prepareFaireProductImageProjectionInPostgres({
+      ...base,
+      idempotencyKey: 'faire-image-terminal-shadow-v1',
+      mode: 'shadow',
+      shadowSimulationEffectGlobalId: null,
+    })
+  const terminalActive = await persistence
+    .prepareFaireProductImageProjectionInPostgres({
+      ...base,
+      idempotencyKey: 'faire-image-terminal-active-v1',
+      mode: 'active',
+      shadowSimulationEffectGlobalId: terminalShadow.effectGlobalId,
+    })
+  const terminalClaim = await authorization.claimFaireProviderWriteInPostgres({
+    organizationId: fixture.organizationId,
+    authorizationGlobalId: terminalActive.authorization.globalId,
+    expectedAuthorizationFenceHash: terminalActive.authorization.fenceHash,
+    workerId: 'faire-image-terminal-reconciliation',
+    adapterVersion: 'faire-image-operational-v1',
+    leaseSeconds: 30,
+  })
+  const terminalLocatorSha256 = evidenceHash('terminal-upload-locator')
+  const terminalUploadEvidence = {
+    provider: 'faire',
+    operation: 'productImageUpload',
+    outcome: 'succeeded',
+    assetContentSha256: selection.assetContentSha256,
+    uploadedLocatorSha256: terminalLocatorSha256,
+    providerWrites: 1,
+  }
+  await persistence.recordFaireProductImageProviderStepInPostgres({
+    organizationId: fixture.organizationId,
+    deliveryGrantId: terminalActive.id,
+    externalEffectId: terminalActive.effectId,
+    providerAttemptId: terminalClaim.providerAttemptId,
+    stage: 'upload',
+    outcome: 'succeeded',
+    uploadedLocatorSha256: terminalLocatorSha256,
+    providerWriteCount: 1,
+    redactedEvidence: terminalUploadEvidence,
+    actorEmail: fixture.actorEmail,
+  })
+  const terminalUnknownEvidence = {
+    provider: 'faire',
+    action: 'faire.product.image.publish',
+    operation: 'productImagePublish',
+    outcome: 'unknown',
+    stage: 'attach_dispatch_or_readback',
+    errorCode: 'FAIRE_PRODUCT_IMAGE_READBACK_MISMATCH',
+    deliveryGrantId: terminalActive.id,
+    authorizationGlobalId: terminalClaim.authorizationGlobalId,
+    scopeEvidenceGlobalId: terminalClaim.scopeEvidenceGlobalId,
+    providerAttemptGlobalId: terminalClaim.providerAttemptGlobalId,
+    externalProductId: selection.externalProductId,
+    assetContentSha256: selection.assetContentSha256,
+    uploadedLocatorSha256: terminalLocatorSha256,
+    existingImagesPreserved: true,
+    priorImageCount: 1,
+    projectedImageCount: 2,
+    providerWritesKnown: false,
+    providerWriteCountLowerBound: 1,
+    providerWrites: 1,
+  }
+  await finalizeUnknownEffectWithoutStep(pool, {
+    organizationId: fixture.organizationId,
+    integrationAccountId: fixture.accountId,
+    providerAttemptId: terminalClaim.providerAttemptId,
+    leaseToken: terminalClaim.leaseToken,
+    externalEffectId: terminalActive.effectId,
+    redactedResult: terminalUnknownEvidence,
+    providerReference: selection.externalProductId,
+    errorCode: 'FAIRE_PRODUCT_IMAGE_READBACK_MISMATCH',
+    providerWriteCount: 1,
+  })
+  const providerImageSetSha256 = evidenceHash([
+    { locatorSha256: evidenceHash('existing-locator'), sequence: 0 },
+    { locatorSha256: terminalLocatorSha256, sequence: 1 },
+  ])
+  const terminalInput = {
+    organizationId: fixture.organizationId,
+    productId: fixture.productId,
+    externalEffectGlobalId: terminalActive.effectGlobalId,
+    expectedDeliveryGrantId: terminalActive.id,
+    expectedExternalEffectId: terminalActive.effectId,
+    expectedAccountGlobalId: selection.accountGlobalId,
+    expectedCredentialGeneration: 1,
+    expectedExternalProductId: selection.externalProductId,
+    expectedAssetContentSha256: selection.assetContentSha256,
+    expectedUploadedLocatorSha256: terminalLocatorSha256,
+    providerImageCount: 2,
+    exactLocatorMatchCount: 1,
+    providerImageSetSha256,
+    actorEmail: fixture.actorEmail,
+  }
+  await expectCode(
+    persistence.resolveFaireProductImageAppliedReconciliationInPostgres({
+      ...terminalInput,
+      exactLocatorMatchCount: 2,
+    }),
+    'FAIRE_PRODUCT_IMAGE_RECONCILIATION_INVALID',
+  )
+  await expectCode(
+    persistence.resolveFaireProductImageAppliedReconciliationInPostgres({
+      ...terminalInput,
+      providerImageCount: 3,
+    }),
+    'FAIRE_PRODUCT_IMAGE_RECONCILIATION_NOT_TERMINALIZABLE',
+  )
+  const beforeResolution = await pool.query(
+    `SELECT effect.state, effect.provider_write_count,
+            count(step.id) FILTER (
+              WHERE step.stage = 'reconcile'
+            )::integer AS reconciliation_steps
+     FROM operations_commerce_external_effect_intents effect
+     LEFT JOIN operations_faire_product_image_provider_steps step
+       ON step.organization_id = effect.organization_id
+      AND step.external_effect_id = effect.id
+     WHERE effect.id = $1::uuid
+     GROUP BY effect.id`,
+    [terminalActive.effectId],
+  )
+  assert.deepEqual(beforeResolution.rows[0], {
+    state: 'unknown',
+    provider_write_count: 1,
+    reconciliation_steps: 0,
+  })
+  const forgedTerminalEvidence = {
+    ...terminalUnknownEvidence,
+    outcome: 'succeeded',
+    stage: 'exact_product_readback_reconciliation',
+    errorCode: null,
+    providerWritesKnown: true,
+    providerWriteCountLowerBound: 2,
+    providerWrites: 2,
+    reconciliationStepId: randomUUID(),
+    reconciledFromState: 'unknown',
+    reconciledFromTerminalEvidenceHash:
+      evidenceHash(terminalUnknownEvidence),
+    providerImageSetSha256,
+    providerImageCount: 2,
+    exactLocatorMatchCount: 1,
+    reconciledBy: fixture.actorEmail,
+  }
+  const forgedCompletedAt = new Date().toISOString()
+  await assert.rejects(
+    pool.query(
+      `UPDATE operations_commerce_external_effect_intents
+       SET state = 'succeeded',
+           redacted_result = $2::jsonb,
+           terminal_evidence_hash = $3,
+           provider_reference = $4,
+           error_code = NULL,
+           provider_write_count = 2,
+           completed_at = $5::timestamptz,
+           updated_at = $5::timestamptz
+       WHERE id = $1::uuid`,
+      [
+        terminalActive.effectId,
+        JSON.stringify(forgedTerminalEvidence),
+        evidenceHash(forgedTerminalEvidence),
+        selection.externalProductId,
+        forgedCompletedAt,
+      ],
+    ),
+    /provider write count|immutable/i,
+  )
+  const resolved = await persistence
+    .resolveFaireProductImageAppliedReconciliationInPostgres(terminalInput)
+  assert.equal(resolved.effectState, 'succeeded')
+  assert.equal(resolved.replayed, false)
+  assert.equal(resolved.providerImageCount, 2)
+  assert.equal(resolved.exactLocatorMatchCount, 1)
+  const resolvedContext = await persistence
+    .readFaireProductImageReconciliationContextInPostgres({
+      organizationId: fixture.organizationId,
+      productId: fixture.productId,
+      externalEffectGlobalId: terminalActive.effectGlobalId,
+    })
+  assert.equal(resolvedContext.effectState, 'succeeded')
+  assert.equal(resolvedContext.reconciliationApplied, true)
+  assert.equal(resolvedContext.providerWriteCount, 2)
+  assert.equal(resolvedContext.reconciledProviderImageCount, 2)
+  assert.equal(resolvedContext.reconciledExactLocatorMatchCount, 1)
+  const resolvedStates = await pool.query(
+    `SELECT effect.state AS effect_state,
+            effect.provider_write_count,
+            effect.error_code,
+            attempt.state AS attempt_state,
+            count(step.id) FILTER (
+              WHERE step.stage = 'reconcile'
+            )::integer AS reconciliation_steps
+     FROM operations_commerce_external_effect_intents effect
+     JOIN operations_commerce_provider_attempts attempt
+       ON attempt.id = effect.provider_attempt_id
+     LEFT JOIN operations_faire_product_image_provider_steps step
+       ON step.organization_id = effect.organization_id
+      AND step.external_effect_id = effect.id
+     WHERE effect.id = $1::uuid
+     GROUP BY effect.id, attempt.id`,
+    [terminalActive.effectId],
+  )
+  assert.deepEqual(resolvedStates.rows[0], {
+    effect_state: 'succeeded',
+    provider_write_count: 2,
+    error_code: null,
+    attempt_state: 'unknown',
+    reconciliation_steps: 1,
+  })
+  const replayedResolution = await persistence
+    .resolveFaireProductImageAppliedReconciliationInPostgres(terminalInput)
+  assert.equal(replayedResolution.effectState, 'succeeded')
+  assert.equal(replayedResolution.replayed, true)
+  await expectCode(
+    persistence.resolveFaireProductImageAppliedReconciliationInPostgres({
+      ...terminalInput,
+      providerImageSetSha256: evidenceHash('different-provider-image-set'),
+    }),
+    'FAIRE_PRODUCT_IMAGE_RECONCILIATION_CONFLICT',
+  )
+  const afterReplay = await pool.query(
+    `SELECT count(*)::integer AS reconciliation_steps
+     FROM operations_faire_product_image_provider_steps
+     WHERE organization_id = $1::uuid
+       AND external_effect_id = $2::uuid
+       AND stage = 'reconcile'`,
+    [fixture.organizationId, terminalActive.effectId],
+  )
+  assert.equal(afterReplay.rows[0].reconciliation_steps, 1)
+  const resolvedHealth =
+    await persistence.readFaireProductImageProjectionHealthInPostgres()
+  assert.equal(resolvedHealth.counts.succeeded, 1)
+  assert.equal(resolvedHealth.counts.unknown, 1)
+  assert.equal(resolvedHealth.unresolvedCounts.unknown, 1)
 
   const fallbackShadow = await persistence
     .prepareFaireProductImageProjectionInPostgres({
@@ -1113,7 +1352,10 @@ async function run(databaseUrl) {
       )) AS authority_trigger,
       pg_get_functiondef(to_regprocedure(
         'operations_faire_provider_write_authority_is_current(uuid,uuid,uuid,text,integer,integer,text,text,text,bigint,text,text,text,jsonb,uuid)'
-      )) AS authority_predicate`)
+      )) AS authority_predicate,
+      pg_get_functiondef(to_regprocedure(
+        'protect_operations_commerce_external_effect_intent()'
+      )) AS external_effect_trigger`)
     assert.match(
       freshness.rows[0].authority_trigger,
       /shadow_grant\.expires_at <= clock_timestamp\(\)/,
@@ -1121,6 +1363,10 @@ async function run(databaseUrl) {
     assert.match(
       freshness.rows[0].authority_predicate,
       /shadow_grant\.expires_at > clock_timestamp\(\)/,
+    )
+    assert.match(
+      freshness.rows[0].external_effect_trigger,
+      /exact_faire_product_image_reconciliation/,
     )
     assert.match(
       readFileSync(

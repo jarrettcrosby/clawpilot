@@ -28,6 +28,19 @@ test('Product image panel uses the manager-scoped immutable asset API', () => {
   assert.match(panel, /expectedRowVersion: asset\.rowVersion/)
 })
 
+test('Product image import capability is explicit and provider flow is controlled', () => {
+  assert.match(panel, /imageImportAvailable: boolean/)
+  assert.match(panel, /typeof payload\.imageImportAvailable !== 'boolean'/)
+  assert.match(panel, /Image flow is controlled, not a live mirror/)
+  assert.match(panel, /Faire image import \(development only\)/)
+  assert.match(panel, /state\?\.imageImportAvailable !== true/)
+  assert.match(
+    panel,
+    /No Faire read or image job will be attempted/,
+  )
+  assert.match(panel, /exact Shadow simulation and one-use authorization/)
+})
+
 test('Product image evidence includes an authenticated inline preview', () => {
   assert.match(panel, /Revision \$\{asset\.assetRevision\}/)
   assert.match(panel, /Row v\$\{asset\.rowVersion\}/)

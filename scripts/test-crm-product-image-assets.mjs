@@ -206,6 +206,8 @@ for (const contract of [
   'assertSameOrigin(req)',
   'isBrowserSameOriginRequest',
   'appPublicUrl()',
+  'commerceIntakeRuntimeAvailable()',
+  'imageImportAvailable:',
   "'Cache-Control': 'private, no-store, max-age=0'",
 ]) {
   assert.ok(route.includes(contract), `route must include ${contract}`)
@@ -214,6 +216,12 @@ assert.doesNotMatch(route, /form\.get\(['"]organizationId['"]\)/)
 assert.doesNotMatch(route, /body\.organizationId/)
 assert.doesNotMatch(route, /shopify/i)
 assert.doesNotMatch(route, /\bfetch\s*\(/)
+assert.equal(
+  (route.match(/imageImportAvailable: commerceIntakeRuntimeAvailable\(\)/g)
+    || []).length,
+  3,
+  'GET, POST, and PATCH must all return the current image-import capability',
+)
 
 const previewRoute = read(
   'app_src/app/api/crm/products/[productId]/images/[assetId]/route.ts',

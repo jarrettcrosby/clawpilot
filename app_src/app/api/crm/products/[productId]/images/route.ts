@@ -6,6 +6,7 @@ import {
 import {
   isBrowserSameOriginRequest,
 } from '@/lib/browserSameOrigin'
+import { commerceIntakeRuntimeAvailable } from '@/lib/integrations/commerceIntake'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { appPublicUrl } from '@/lib/publicUrl'
 import {
@@ -323,7 +324,11 @@ export async function GET(
       organizationId,
       productId,
     })
-    return json({ ok: true, ...state })
+    return json({
+      ok: true,
+      ...state,
+      imageImportAvailable: commerceIntakeRuntimeAvailable(),
+    })
   } catch (error) {
     return errorResponse(error)
   }
@@ -344,7 +349,11 @@ export async function POST(
       actorEmail: actor.email,
       ...upload,
     })
-    return json({ ok: true, ...state }, 201)
+    return json({
+      ok: true,
+      ...state,
+      imageImportAvailable: commerceIntakeRuntimeAvailable(),
+    }, 201)
   } catch (error) {
     return errorResponse(error)
   }
@@ -410,7 +419,11 @@ export async function PATCH(
       expectedRowVersion: body.expectedRowVersion,
       actorEmail: actor.email,
     })
-    return json({ ok: true, ...state })
+    return json({
+      ok: true,
+      ...state,
+      imageImportAvailable: commerceIntakeRuntimeAvailable(),
+    })
   } catch (error) {
     return errorResponse(error)
   }

@@ -2034,6 +2034,17 @@ assertIncludes(
   'export async function readCommerceProductImageImportQueueHealthInPostgres',
   'commerce product image import persistence health API',
 )
+for (const fragment of [
+  'lastTerminalProgressAt: string | null',
+  'AS last_terminal_progress_at',
+  'lastTerminalProgressAt: row.last_terminal_progress_at',
+]) {
+  assertIncludes(
+    commerceProductImageImportPersistence,
+    fragment,
+    'commerce product image import progress health evidence',
+  )
+}
 assertIncludes(
   healthRoute,
   'readCommerceProductImageImportQueueHealthInPostgres',
@@ -2065,14 +2076,21 @@ for (const fragment of [
   'await readCommerceProductImageImportQueueHealthInPostgres()',
   'historicalDead: imageQueue.historicalDeadCount',
   'if (!loopReachable)',
+  'const activelyDraining =',
+  'const stalledOverdue =',
+  '|| stalledOverdue',
+  'activelyDraining,',
+  'stalledOverdue,',
+  'lastTerminalProgressAt: imageQueue.lastTerminalProgressAt',
+  'progressAgeMs: imageProgressAgeMs',
   "errors.push(\n                'Commerce product image import worker heartbeat is missing or stale.'",
   'if (imageQueue.deadCount > 0)',
   'if (imageQueue.staleLeaseCount > 0)',
-  'if (imageQueue.overdueCount > 0)',
+  'if (stalledOverdue)',
   'if (imageQueue.retryCount > 0)',
   "warnings.push(\n                'Commerce product image import queue has terminal failed jobs.'",
   "warnings.push(\n                'Commerce product image import queue has stale claimed jobs.'",
-  "warnings.push(\n                'Commerce product image import queue has overdue jobs.'",
+  "warnings.push(\n                'Commerce product image import queue has overdue jobs and is not making recent progress.'",
   "warnings.push(\n                'Commerce product image import jobs are retrying.'",
 ]) {
   assertIncludes(
@@ -2087,6 +2105,13 @@ assert.equal(
   ),
   false,
   'Historical commerce product image failures must not degrade current health',
+)
+assert.equal(
+  commerceProductImageWorkerHealth.includes(
+    '|| imageQueue.overdueCount > 0',
+  ),
+  false,
+  'An actively draining overdue image backlog must not degrade health solely because it is overdue',
 )
 assert.ok(
   (

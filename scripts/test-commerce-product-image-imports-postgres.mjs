@@ -3261,6 +3261,11 @@ async function verifyImports(pool) {
     .readCommerceProductImageImportQueueHealthInPostgres()
   assert.equal(overdueHealth.queuedCount, 1)
   assert.equal(overdueHealth.overdueCount, 1)
+  assert.ok(
+    overdueHealth.lastTerminalProgressAt === null
+      || Number.isFinite(Date.parse(overdueHealth.lastTerminalProgressAt)),
+  )
+  const overdueCompletionStartedAt = Date.now() - 1_000
   await completeClaim(
     await claimOne(beta.organizationId, 'overdue-image-worker'),
     FOUR_BY_FIVE_WEBP,
@@ -3298,6 +3303,10 @@ async function verifyImports(pool) {
   assert.equal(finalHealth.historicalDeadCount, 1)
   assert.equal(finalHealth.staleLeaseCount, 0)
   assert.equal(finalHealth.overdueCount, 0)
+  assert.ok(
+    Date.parse(finalHealth.lastTerminalProgressAt)
+      >= overdueCompletionStartedAt,
+  )
   assert.equal(finalHealth.heartbeat.phase, 'completed')
   assert.equal(finalHealth.heartbeat.checkedAt, completedHeartbeat.checkedAt)
 

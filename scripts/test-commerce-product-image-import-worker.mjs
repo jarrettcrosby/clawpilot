@@ -626,6 +626,12 @@ test('worker route, proxy, and poller are wired without unsafe output paths', ()
   assert.ok(!workerSource.includes('providerWrites: 1'))
   assert.ok(proxySource.includes('/api/integrations/commerce/images/process'))
   assert.ok(pollerSource.includes('COMMERCE_PRODUCT_IMAGE_IMPORT_POLL_MS'))
-  assert.ok(pollerSource.includes("runLoop('commerce-product-images'"))
+  assert.ok(pollerSource.includes(
+    "runLoop('commerce-product-images', '/api/integrations/commerce/images/process', 5, commerceProductImageImportIntervalMs)",
+  ))
   assert.ok(pollerSource.includes('/api/integrations/commerce/images/process'))
+  assert.ok(workerSource.includes('const MAX_JOB_LIMIT = 5'))
+  assert.ok(workerSource.includes(
+    'const sourceReads = new Map<string, readonly CommerceProviderImageSource[]>()',
+  ))
 })

@@ -50,6 +50,7 @@ type ProductImageAsset = {
 }
 
 type ProductImageState = {
+  imageImportAvailable: boolean
   product: {
     id: string
     referenceCode: string
@@ -184,6 +185,8 @@ type FaireProductImageProjectionPayload = {
     providerImageCount?: number
     exactLocatorMatchCount?: number
     reason?: string
+    terminalized?: boolean
+    replayed?: boolean
   }
   error?: string
   code?: string
@@ -204,8 +207,13 @@ function apiPath(productId: string) {
 }
 
 function assetState(payload: ProductImagePayload): ProductImageState | null {
-  if (!payload.product || !Array.isArray(payload.assets)) return null
+  if (
+    typeof payload.imageImportAvailable !== 'boolean'
+    || !payload.product
+    || !Array.isArray(payload.assets)
+  ) return null
   return {
+    imageImportAvailable: payload.imageImportAvailable,
     product: payload.product,
     assets: payload.assets,
   }
@@ -707,6 +715,12 @@ export default function ProductImagePanel({
   }
 
   const refreshFromFaire = async () => {
+    if (state?.imageImportAvailable !== true) {
+      setError(
+        'Faire Product image import is available only while development commerce intake is enabled.',
+      )
+      return
+    }
     const channel = selectedFaireChannelEvidence
     if (!channel || !state?.product) {
       setError('Refresh and choose one exact mapped Faire listing.')
@@ -918,12 +932,33 @@ export default function ProductImagePanel({
         )
       }
       setFaireReconciliation(payload.reconciliation)
+      if (payload.reconciliation.terminalized) {
+        setFaireProjection((current) => current
+          ? {
+            ...current,
+            providerMutation: {
+              accepted: true,
+              writeCount: 2,
+              uploadAccepted: true,
+              attachmentAccepted: true,
+            },
+            externalEffect: {
+              ...current.externalEffect,
+              state: 'succeeded',
+              providerWriteCount: 2,
+            },
+          }
+          : current)
+      }
       setNotice(
         payload.reconciliation.confirmedApplied
-          ? 'Faire readback confirms the uploaded image is attached to the exact Product.'
+          ? 'Faire readback confirms the exact uploaded image is attached. The uncertain effect is now succeeded; no provider write was repeated.'
           : payload.reconciliation.outcome === 'observed_absent'
-            ? 'Faire readback did not observe the uploaded image. The original write remains terminal and was not repeated.'
-            : 'The upload locator was unavailable; manual provider review is required and no write was repeated.',
+            ? 'Faire readback did not observe the exact uploaded image. The effect remains unknown and actionable; no provider write was repeated.'
+            : payload.reconciliation.reason ===
+                'ambiguous_exact_locator_matches'
+              ? 'Faire returned multiple matches for the uploaded locator. The effect remains unknown and requires review; no provider write was repeated.'
+              : 'Faire readback could not safely resolve the effect. It remains actionable and no provider write was repeated.',
       )
     } catch (reconcileError) {
       setError(
@@ -982,9 +1017,13 @@ export default function ProductImagePanel({
       ) : (
         <>
           <Alert severity="info">
-            Uploads are retained as immutable originals. Changing the primary
-            image selects a revision; it does not overwrite or delete another
-            file.
+            Image flow is controlled, not a live mirror. Shopify and Faire
+            images import as immutable ClawPilot revisions only while
+            development commerce intake is enabled. A ClawPilot primary image
+            queues projection to SuiteCRM; SuiteCRM changes return as immutable
+            revisions and remain secondary when an independently governed
+            primary exists. Sending an image to Shopify or Faire always
+            requires an exact Shadow simulation and one-use authorization.
           </Alert>
           {error ? <Alert severity="error">{error}</Alert> : null}
           {notice ? <Alert severity="success">{notice}</Alert> : null}
@@ -1183,7 +1222,7 @@ export default function ProductImagePanel({
           <Stack spacing={1.25} data-testid="crm-faire-image-import">
             <Box>
               <Typography variant="subtitle2" fontWeight={700}>
-                Faire image import
+                Faire image import (development only)
               </Typography>
               <Typography variant="caption" color="text.secondary">
                 Re-read one exact mapped Faire Product and queue its current
@@ -1200,13 +1239,24 @@ export default function ProductImagePanel({
               </Alert>
             ) : null}
 
+            {state?.imageImportAvailable === false ? (
+              <Alert severity="warning">
+                Automatic provider-image import is disabled in this
+                environment. No Faire read or image job will be attempted.
+              </Alert>
+            ) : null}
+
             <TextField
               select
               fullWidth
               label="Faire listing"
               value={selectedFaireChannel}
               onChange={(event) => setSelectedFaireChannel(event.target.value)}
-              disabled={refreshingFaire || faireChannels.length === 0}
+              disabled={
+                refreshingFaire
+                || faireChannels.length === 0
+                || state?.imageImportAvailable !== true
+              }
             >
               {faireChannels.map((channel) => (
                 <MenuItem key={channel.globalId} value={channel.globalId}>
@@ -1235,6 +1285,7 @@ export default function ProductImagePanel({
               onClick={() => void refreshFromFaire()}
               disabled={
                 refreshingFaire
+                || state?.imageImportAvailable !== true
                 || !selectedFaireChannelEvidence
                 || !selectedFaireChannelEvidence.providerSku
               }
