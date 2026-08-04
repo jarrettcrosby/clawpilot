@@ -392,6 +392,68 @@ assert.deepEqual(
     totalRecords: 1,
   },
 )
+
+let minutePrecisionListModifiedAt = '2026-08-02T11:00:00Z'
+const minutePrecisionListReader = readClient.createSuiteCrmProductImageReadClient(
+  async (input, init = {}) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/Api/access_token') {
+      return jsonResponse({ access_token: 'minute-list-token', expires_in: 3600 })
+    }
+    assert.equal(url.pathname, '/Api/V8/module/AOS_Products')
+    assert.equal(String(init.method || 'GET').toUpperCase(), 'GET')
+    assert.equal(
+      url.searchParams.get('filter[date_modified][gte]'),
+      '2026-08-02T11:00:15.000Z',
+    )
+    assert.equal(
+      url.searchParams.get('filter[date_modified][lte]'),
+      '2026-08-02T13:00:45.000Z',
+    )
+    return jsonResponse({
+      data: [{
+        id: PRODUCT_ID,
+        type: 'AOS_Products',
+        attributes: {
+          global_id_c: PRODUCT_GLOBAL_ID,
+          name: 'Minute precision Product',
+          date_modified: minutePrecisionListModifiedAt,
+          deleted: '0',
+        },
+      }],
+      meta: { 'total-pages': 1, 'total-records': 1 },
+    })
+  },
+)
+const minutePrecisionListPage = await minutePrecisionListReader
+  .listProductsUpdatedSince({
+    updatedSince: '2026-08-02T11:00:15Z',
+    updatedBeforeOrAt: '2026-08-02T13:00:45Z',
+    page: 1,
+  })
+assert.equal(
+  minutePrecisionListPage.products[0].modifiedAt,
+  '2026-08-02T11:00:00.000Z',
+  'A qualifying SuiteCRM record rounded to the lower cursor minute must remain eligible',
+)
+minutePrecisionListModifiedAt = '2026-08-02T10:59:00Z'
+await assert.rejects(
+  minutePrecisionListReader.listProductsUpdatedSince({
+    updatedSince: '2026-08-02T11:00:15Z',
+    updatedBeforeOrAt: '2026-08-02T13:00:45Z',
+    page: 1,
+  }),
+  /outside the requested snapshot/u,
+)
+minutePrecisionListModifiedAt = '2026-08-02T13:01:00Z'
+await assert.rejects(
+  minutePrecisionListReader.listProductsUpdatedSince({
+    updatedSince: '2026-08-02T11:00:15Z',
+    updatedBeforeOrAt: '2026-08-02T13:00:45Z',
+    page: 1,
+  }),
+  /outside the requested snapshot/u,
+)
 const media = await reader.readProductImage(
   PRODUCT_ID,
   '2026-08-02T12:00:00Z',

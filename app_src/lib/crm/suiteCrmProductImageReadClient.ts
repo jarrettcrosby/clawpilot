@@ -463,6 +463,22 @@ function sameSuiteCrmRevisionAtListPrecision(
     === Math.floor(Date.parse(currentRevision) / 60_000)
 }
 
+function withinSuiteCrmListPrecisionRange(
+  modifiedAt: string,
+  updatedSince: string,
+  updatedBeforeOrAt: string,
+) {
+  // SuiteCRM applies the requested date filter to its stored timestamp, but
+  // the V8 Product collection serializes date_modified at minute precision.
+  // A qualifying record can therefore be returned as 12:00:00 for a cursor
+  // beginning at 12:00:15. Validate at the precision the collection actually
+  // supplies; the worker's overlapping, double-pass sweep still detects real
+  // membership changes and the exact-record read fences the image revision.
+  const modifiedMinute = Math.floor(Date.parse(modifiedAt) / 60_000)
+  return modifiedMinute >= Math.floor(Date.parse(updatedSince) / 60_000)
+    && modifiedMinute <= Math.floor(Date.parse(updatedBeforeOrAt) / 60_000)
+}
+
 function deletedValue(value: unknown) {
   if (value === true || value === 1) return true
   const normalized = String(value ?? '').trim().toLowerCase()
@@ -661,10 +677,11 @@ class SuiteCrmProductImageReader implements SuiteCrmProductImageReadClient {
         values.date_modified,
         'modified timestamp',
       )
-      if (
-        Date.parse(modifiedAt) < Date.parse(cursor.updatedSince)
-        || Date.parse(modifiedAt) > Date.parse(cursor.updatedBeforeOrAt)
-      ) {
+      if (!withinSuiteCrmListPrecisionRange(
+        modifiedAt,
+        cursor.updatedSince,
+        cursor.updatedBeforeOrAt,
+      )) {
         throw new Error('SuiteCRM returned a Product outside the requested snapshot')
       }
       return {
