@@ -120,6 +120,18 @@ type CommerceAccount = {
     failedAttempts: number
     deadLetterAttempts: number
     lastAttemptAt: string | null
+    webhookReceiptHealth: {
+      integrationAccountId: string
+      accountGlobalId: string
+      status: 'ready' | 'attention'
+      actionable: number
+      staleQueued: number
+      staleProcessing: number
+      failed: number
+      deadLetter: number
+      heldProductDeletes: number
+      oldestActionableAt: string | null
+    } | null
   }
   fulfillmentWriteReadiness: {
     ready: boolean
@@ -536,6 +548,37 @@ function maskedCommerceCredential(account: CommerceAccount | undefined) {
   return `Generation ${account.credentialVersion}${suffix}`
 }
 
+function hasEffectiveShopifyScope(
+  grantedScopes: readonly string[],
+  requiredScope: string,
+) {
+  if (grantedScopes.includes(requiredScope)) return true
+  if (!requiredScope.startsWith('read_')) return false
+  return grantedScopes.includes(`write_${requiredScope.slice('read_'.length)}`)
+}
+
+function webhookSubscriptionReadiness(
+  configuration: Record<string, unknown>,
+  key: string,
+) {
+  const value = configuration[key]
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {
+      observed: false,
+      ready: false,
+      missingTopics: [] as string[],
+      conflictingTopics: [] as string[],
+    }
+  }
+  const state = value as Record<string, unknown>
+  return {
+    observed: true,
+    ready: state.ready === true,
+    missingTopics: valueStrings(state.missingTopics),
+    conflictingTopics: valueStrings(state.conflictingTopics),
+  }
+}
+
 export default function CommerceIntegrationPanel() {
   const [integrations, setIntegrations] = useState<CommerceState>({
     organizationId: '',
@@ -949,6 +992,22 @@ export default function CommerceIntegrationPanel() {
         confirmProviderWrites: true,
       },
       `${account.displayName} inventory webhook subscriptions registered and verified.`,
+    )
+  }
+
+  async function registerScopeWebhooks(account: CommerceAccount) {
+    if (!canActivate || pendingAction) return
+    if (!window.confirm(
+      `Register the Shopify access-scope safety webhook for ${account.displayName}? This creates only the app/scopes_update subscription shown in this workflow.`,
+    )) return
+    await action(
+      `register-scope-webhooks:${account.globalId}`,
+      {
+        action: 'register-shopify-scope-webhooks',
+        accountGlobalId: account.globalId,
+        confirmProviderWrites: true,
+      },
+      `${account.displayName} access-scope safety webhook registered and verified.`,
     )
   }
 
@@ -2078,8 +2137,39 @@ export default function CommerceIntegrationPanel() {
               )
               const missingReceiptProofScopes = account.provider === 'shopify'
                 ? valueStrings(catalog?.onboarding.shopify.receiptProofScopes)
-                  .filter((scope) => !grantedScopes.includes(scope))
+                  .filter((scope) => !hasEffectiveShopifyScope(
+                    grantedScopes,
+                    scope,
+                  ))
                 : []
+              const webhookSubscriptionGroups = account.provider === 'shopify'
+                ? [
+                    {
+                      key: 'scopeWebhookSubscriptions',
+                      label: 'Access-scope safety',
+                    },
+                    {
+                      key: 'webhookSubscriptions',
+                      label: 'Inventory freshness',
+                    },
+                    {
+                      key: 'catalogWebhookSubscriptions',
+                      label: 'Product catalog',
+                    },
+                  ].map((group) => ({
+                    ...group,
+                    ...webhookSubscriptionReadiness(
+                      account.configuration,
+                      group.key,
+                    ),
+                  }))
+                : []
+              const missingWebhookSubscriptionGroups =
+                webhookSubscriptionGroups
+                  .filter((group) => !group.ready)
+                  .map((group) => group.label)
+              const webhookReceiptHealth =
+                account.evidence.webhookReceiptHealth
               const preview = shopifyPreviews[account.globalId]
               const revealed = revealedCredential?.accountGlobalId
                 === account.globalId
@@ -2113,6 +2203,9 @@ export default function CommerceIntegrationPanel() {
                       : []),
                     ...(account.webhookVerificationStatus !== 'verified'
                       ? ['Send one valid signed allowed-topic delivery to the callback URL.']
+                      : []),
+                    ...(missingWebhookSubscriptionGroups.length
+                      ? [`Register and verify these webhook groups: ${missingWebhookSubscriptionGroups.join(', ')}.`]
                       : []),
                   ]
                 : []
@@ -2214,6 +2307,32 @@ export default function CommerceIntegrationPanel() {
                           ? 'This connection authorizes automatic product catalog sync with no second approval. The signed receipt control below only chooses whether new verified webhook receipts are queued for intake or retained as held evidence. It does not change the API credential, product-catalog authorization, Operations activation, or provider-write authority.'
                           : 'This connection authorizes automatic product catalog sync with no second approval. Eligibility and worker status appear below; the control only pauses or resumes sync. Orders and inventory remain separate.'}
                       </Alert>
+
+                      {account.provider === 'shopify'
+                        && webhookReceiptHealth
+                        && webhookReceiptHealth.actionable > 0 ? (
+                          <Alert severity="warning">
+                            <Typography variant="body2" fontWeight={700}>
+                              Current Shopify webhook receipts need attention
+                            </Typography>
+                            <Typography variant="body2">
+                              {webhookReceiptHealth.actionable} actionable receipt{
+                                webhookReceiptHealth.actionable === 1 ? '' : 's'
+                              }: {webhookReceiptHealth.staleQueued} stale queued,{' '}
+                              {webhookReceiptHealth.staleProcessing} stale processing,{' '}
+                              {webhookReceiptHealth.failed} failed,{' '}
+                              {webhookReceiptHealth.deadLetter} dead-letter, and{' '}
+                              {webhookReceiptHealth.heldProductDeletes} replayable held product deletion{
+                                webhookReceiptHealth.heldProductDeletes === 1 ? '' : 's'
+                              }.
+                            </Typography>
+                            <Typography variant="caption" display="block" sx={{ mt: 0.5 }}>
+                              This alert covers only the current credential generation.
+                              Ordinary held inventory/catalog history and prior generations remain
+                              informational evidence below.
+                            </Typography>
+                          </Alert>
+                        ) : null}
 
                       {intakeAvailable ? (
                         <CommerceIntakeWorkflow
@@ -2407,7 +2526,7 @@ export default function CommerceIntegrationPanel() {
                       {account.provider === 'shopify' && account.webhookUrl ? (
                         <Box>
                           <Typography variant="subtitle2" fontWeight={700}>
-                            Optional signed receipt setup
+                            Signed receipt setup
                           </Typography>
                           <Typography
                             variant="body2"
@@ -2421,30 +2540,25 @@ export default function CommerceIntegrationPanel() {
                             valid signed delivery separately verifies the stored
                             app secret; neither check writes to Shopify.
                           </Typography>
-                          {(() => {
-                            const subscription = account.configuration.webhookSubscriptions
-                            if (!subscription || typeof subscription !== 'object' || Array.isArray(subscription)) {
-                              return (
-                                <Alert severity="warning" sx={{ mb: 1 }}>
-                                  Test the Shopify connection to discover subscription readiness.
-                                </Alert>
-                              )
-                            }
-                            const state = subscription as Record<string, unknown>
-                            const missingTopics = Array.isArray(state.missingTopics)
-                              ? state.missingTopics.filter((topic): topic is string => typeof topic === 'string')
-                              : []
-                            const conflictingTopics = Array.isArray(state.conflictingTopics)
-                              ? state.conflictingTopics.filter((topic): topic is string => typeof topic === 'string')
-                              : []
-                            return (
-                              <Alert severity={state.ready === true ? 'success' : 'warning'} sx={{ mb: 1 }}>
-                                {state.ready === true
-                                  ? 'Shopify subscription discovery is ready for every required topic.'
-                                  : `Shopify subscription discovery found ${missingTopics.length} missing and ${conflictingTopics.length} conflicting topic${missingTopics.length + conflictingTopics.length === 1 ? '' : 's'}. No provider writes were made.`}
+                          <Stack spacing={1} sx={{ mb: 1 }}>
+                            {webhookSubscriptionGroups.map((group) => (
+                              <Alert
+                                key={group.key}
+                                severity={group.ready ? 'success' : 'warning'}
+                              >
+                                <Typography variant="body2" fontWeight={700}>
+                                  {group.label} · {group.ready ? 'ready' : 'not ready'}
+                                </Typography>
+                                <Typography variant="body2">
+                                  {!group.observed
+                                    ? 'Test the Shopify connection to discover this subscription group.'
+                                    : group.ready
+                                      ? 'Every required topic points to this exact callback URL.'
+                                      : `Discovery found ${group.missingTopics.length} missing and ${group.conflictingTopics.length} conflicting topic${group.missingTopics.length + group.conflictingTopics.length === 1 ? '' : 's'}. No provider writes were made.`}
+                                </Typography>
                               </Alert>
-                            )
-                          })()}
+                            ))}
+                          </Stack>
                           <Accordion disableGutters sx={{ mb: 1 }}>
                             <AccordionSummary expandIcon={<ExpandMoreRounded />}>
                               <Box>
@@ -2475,7 +2589,9 @@ export default function CommerceIntegrationPanel() {
                                       Topics: {group.topics.join(', ')}
                                     </Typography>
                                     <Typography variant="caption" display="block">
-                                      Scopes: {group.requiredScopes.join(', ')}
+                                      Scopes: {group.requiredScopes.length
+                                        ? group.requiredScopes.join(', ')
+                                        : 'None (control event only)'}
                                     </Typography>
                                   </Alert>
                                 ))}
@@ -2505,6 +2621,14 @@ export default function CommerceIntegrationPanel() {
                             </Button>
                             {canActivate ? (
                               <>
+                                <Button
+                                  variant="contained"
+                                  disabled={pendingAction !== '' || !account.configured}
+                                  onClick={() => registerScopeWebhooks(account)}
+                                  sx={actionButtonSx}
+                                >
+                                  Register scope safety webhook
+                                </Button>
                                 <Button
                                   variant="contained"
                                   disabled={pendingAction !== '' || !account.configured}
@@ -3013,6 +3137,7 @@ export default function CommerceIntegrationPanel() {
                                 || !canActivate
                                 || missingReceiptProofScopes.length > 0
                                 || account.webhookVerificationStatus !== 'verified'
+                                || missingWebhookSubscriptionGroups.length > 0
                               }
                               onClick={() => action(
                                 `enable:${account.globalId}`,
