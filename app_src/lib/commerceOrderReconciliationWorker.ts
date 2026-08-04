@@ -205,6 +205,7 @@ export async function processCommerceOrderReconciliation(input: {
         failed: 0,
         failedByCode: {},
         rollbackFenced: 0,
+        attentionRequiredAccounts: 0,
         operatorReviewRequired: 0,
         providerWrites: 0,
         canonicalOrderWrites: 0,
@@ -258,6 +259,7 @@ export async function processCommerceOrderReconciliation(input: {
   let shopifyActionableOrdersHeld = 0
   let shopifyPromotionFailed = 0
   let shopifyPromotionRollbackFenced = 0
+  let shopifyPromotionAttentionRequiredAccounts = 0
   let faireOrdersPromoted = 0
   let faireOrdersHeld = 0
   let fairePromotionFailed = 0
@@ -583,6 +585,9 @@ export async function processCommerceOrderReconciliation(input: {
         shopifyPromotionFailed += targetShopifyPromotionFailed
         shopifyPromotionRollbackFenced +=
           targetShopifyPromotionRollbackFenced
+        if (completion.shopifyAutomaticPromotionAttentionRequired) {
+          shopifyPromotionAttentionRequiredAccounts += 1
+        }
         faireOrdersPromoted += targetFaireOrdersPromoted
         faireOrdersHeld += targetFaireOrdersHeld
         fairePromotionFailed += targetFairePromotionFailed
@@ -681,8 +686,13 @@ export async function processCommerceOrderReconciliation(input: {
       failed: shopifyPromotionFailed,
       failedByCode: shopifyPromotionFailureCodes,
       rollbackFenced: shopifyPromotionRollbackFenced,
+      attentionRequiredAccounts:
+        shopifyPromotionAttentionRequiredAccounts,
       operatorReviewRequired:
-        shopifyActionableOrdersHeld + shopifyPromotionFailed,
+        Math.max(
+          shopifyActionableOrdersHeld + shopifyPromotionFailed,
+          shopifyPromotionAttentionRequiredAccounts,
+        ),
       providerWrites: 0,
       canonicalOrderWrites: shopifyOrdersPromoted,
       inventoryWrites: 0,

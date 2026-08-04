@@ -28,6 +28,8 @@ RETURNS TABLE (
 )
 LANGUAGE sql
 STABLE
+SECURITY INVOKER
+SET search_path = pg_catalog, public
 AS $$
   SELECT
     receipt.id,
@@ -125,6 +127,16 @@ AS $$
     );
 $$;
 
+-- The Boolean switch is an internal composition helper. Runtime and migration
+-- currently share the function-owner role through DATABASE_URL, so the owner
+-- retains execution while arbitrary PUBLIC callers cannot bypass the two
+-- deliberate promoted-only and preflight entry points below.
+REVOKE EXECUTE ON FUNCTION
+  public.operations_shopify_checkout_rate_match_candidate_facts_for_workflow(
+    uuid, uuid, boolean, boolean
+  )
+FROM PUBLIC;
+
 CREATE OR REPLACE FUNCTION
   operations_shopify_checkout_rate_match_candidate_facts(
     requested_organization_id uuid,
@@ -147,9 +159,11 @@ RETURNS TABLE (
 )
 LANGUAGE sql
 STABLE
+SECURITY INVOKER
+SET search_path = pg_catalog, public
 AS $$
   SELECT *
-  FROM operations_shopify_checkout_rate_match_candidate_facts_for_workflow(
+  FROM public.operations_shopify_checkout_rate_match_candidate_facts_for_workflow(
     requested_organization_id,
     requested_order_candidate_id,
     enforce_reconciliation_deadline,
@@ -177,6 +191,8 @@ RETURNS TABLE (
 )
 LANGUAGE sql
 STABLE
+SECURITY INVOKER
+SET search_path = pg_catalog, public
 AS $$
   WITH ranked AS (
     SELECT
@@ -189,7 +205,7 @@ AS $$
           facts.offer_hash DESC
       ) AS family_rank
     FROM
-      operations_shopify_checkout_rate_match_candidate_facts_for_workflow(
+      public.operations_shopify_checkout_rate_match_candidate_facts_for_workflow(
         requested_organization_id,
         requested_order_candidate_id,
         enforce_reconciliation_deadline,

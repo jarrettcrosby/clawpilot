@@ -229,6 +229,10 @@ includes(shopifyPreflightMigration, [
   'enforce_reconciliation_deadline',
   'false',
   'true',
+  'SECURITY INVOKER',
+  'SET search_path = pg_catalog, public',
+  'REVOKE EXECUTE ON FUNCTION',
+  'FROM PUBLIC',
 ], 'Shopify held-candidate checkout preflight migration')
 includes(persistence, [
   "const ORDER_RECONCILIATION_INTERVAL = '30 minutes'",
@@ -272,6 +276,10 @@ includes(persistence, [
   'providerWrites: 0',
   'canonicalOrderWrites: 0',
   'inventoryWrites: 0',
+  'unresolved_shopify_promotion',
+  "candidate.workflow_state IN ('held', 'resolving', 'ready')",
+  "run.created_by = 'system:commerce-order-reconciliation'",
+  'canonical.external_order_id',
 ], 'Order reconciliation persistence')
 includes(shippingServiceCodeMigration, [
   'operations_commerce_order_candidates_checkout_service_valid',
@@ -335,6 +343,11 @@ assert.match(
   claimSql,
   /RETURNING[\s\S]*last_started_at/,
   'Claim SQL must return the persisted reconciliation lease timestamp',
+)
+assert.match(
+  claimSql,
+  /last_error_code IN \([\s\S]*COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED/,
+  'Root claims must preserve durable automatic-promotion attention',
 )
 assert.equal(claimedTargets.length, 1)
 assert.equal(
@@ -533,7 +546,13 @@ const promotionCompletionModule = loadTypeScriptModule(
               promotionCompletionQueries.push({ sql, values })
               return {
                 rowCount: 1,
-                rows: [{ organization_id: failureTarget.organizationId }],
+                rows: [{
+                  last_error_code: values[8] === 'shopify' && values[5] > 0
+                    ? 'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED'
+                    : values[6] > 0
+                      ? 'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED'
+                      : null,
+                }],
               }
             },
           })
@@ -580,6 +599,7 @@ assert.match(
 assert.equal(promotionCompletionQueries[0].values[5], 0)
 assert.equal(promotionCompletionQueries[0].values[6], 1)
 assert.equal(promotionCompletionQueries[0].values[7], false)
+assert.equal(promotionCompletionQueries[0].values[8], 'faire')
 assert.equal(
   promotionCompletionAudits[0].payload
     .automaticFaireOrderPromotion.failed,
@@ -1179,7 +1199,10 @@ const shopifyWorker = loadTypeScriptModule(
         },
         async completeCommerceOrderReconciliationInPostgres(input) {
           shopifyCompletionInput = input
-          return { leaseLost: false }
+          return {
+            leaseLost: false,
+            shopifyAutomaticPromotionAttentionRequired: true,
+          }
         },
         async failCommerceOrderReconciliationInPostgres() {
           assert.fail('Shopify clean-path counters must complete successfully')
@@ -1216,6 +1239,7 @@ assert.deepEqual(
       COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED: 1,
     },
     rollbackFenced: 1,
+    attentionRequiredAccounts: 1,
     operatorReviewRequired: 3,
     providerWrites: 0,
     canonicalOrderWrites: 1,

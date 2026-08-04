@@ -10043,9 +10043,15 @@ export async function readAutomaticShopifyOrderPromotionTargetsForRunInPostgres(
     ).rows
     const targets: AutomaticShopifyPromotionTarget[] = []
     for (const candidate of candidates) {
-      const [lines, priorOrCanonical] = await Promise.all([
-        candidateLines(client, candidate),
-        client.query<{ prior_candidate: boolean; canonical_order: boolean }>(
+      // A PoolClient serializes work today and pg@9 removes support for
+      // concurrent queries on one client. Keep this transaction explicitly
+      // sequential so selection stays compatible with both versions.
+      const lines = await candidateLines(client, candidate)
+      const priorOrCanonical =
+        await client.query<{
+          prior_candidate: boolean
+          canonical_order: boolean
+        }>(
           `SELECT
              EXISTS (
                SELECT 1
@@ -10068,8 +10074,7 @@ export async function readAutomaticShopifyOrderPromotionTargetsForRunInPostgres(
             candidate.external_order_id,
             candidate.id,
           ],
-        ),
-      ])
+        )
       if (priorOrCanonical.rows[0]?.canonical_order) {
         targets.push(heldAutomaticShopifyPromotionTarget(
           candidate,
@@ -10313,22 +10318,21 @@ export async function readAutomaticShopifyOrderPromotionTargetsForRunInPostgres(
         ))
         continue
       }
-      const [exactMatches, potentialMatches] = await Promise.all([
-        client.query(
-          `SELECT receipt_id
-           FROM operations_shopify_checkout_rate_preflight_match_candidates(
-             $1::uuid, $2::uuid, true
-           )`,
-          [candidate.organization_id, candidate.id],
-        ),
-        client.query<{ candidate_count: number }>(
+      const exactMatches = await client.query(
+        `SELECT receipt_id
+         FROM operations_shopify_checkout_rate_preflight_match_candidates(
+           $1::uuid, $2::uuid, true
+         )`,
+        [candidate.organization_id, candidate.id],
+      )
+      const potentialMatches =
+        await client.query<{ candidate_count: number }>(
           `SELECT count(*)::integer AS candidate_count
            FROM operations_shopify_checkout_rate_preflight_match_candidates(
              $1::uuid, $2::uuid, false
            )`,
           [candidate.organization_id, candidate.id],
-        ),
-      ])
+        )
       if (exactMatches.rowCount !== 1) {
         const potentialCount = potentialMatches.rows[0]?.candidate_count || 0
         targets.push(heldAutomaticShopifyPromotionTarget(
@@ -10436,9 +10440,12 @@ export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
     ).rows
     const targets: AutomaticFairePromotionTarget[] = []
     for (const candidate of candidates) {
-      const [lines, priorOrCanonical] = await Promise.all([
-        candidateLines(client, candidate),
-        client.query<{ prior_candidate: boolean; canonical_order: boolean }>(
+      const lines = await candidateLines(client, candidate)
+      const priorOrCanonical =
+        await client.query<{
+          prior_candidate: boolean
+          canonical_order: boolean
+        }>(
           `SELECT
              EXISTS (
                SELECT 1
@@ -10463,8 +10470,7 @@ export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
             candidate.id,
             candidate.run_id,
           ],
-        ),
-      ])
+        )
       if (priorOrCanonical.rows[0]?.canonical_order) {
         targets.push(heldAutomaticFairePromotionTarget(
           candidate,

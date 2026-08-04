@@ -1067,6 +1067,31 @@ function loadCommerceOrderReconciliationPersistence(pool) {
   )
 }
 
+function loadCommerceOrderReconciliationWorker(input) {
+  return loadTypeScriptModule(
+    'app_src/lib/commerceOrderReconciliationWorker.ts',
+    {
+      '@/lib/integrations/commerceIntake': {
+        commerceIntakeRuntimeAvailable: () => true,
+        executeCommerceOrderPage: input.executeCommerceOrderPage,
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        ...input.persistence,
+        async projectCommerceOrderReconciliationPageInPostgres({ target }) {
+          return {
+            leaseLost: false,
+            startedAt: target.startedAt,
+            recordsSeen: target.recordsSeen,
+            recordsHeld: target.recordsHeld,
+            continuationBatchNumber: 1,
+            providerCursorRepeated: false,
+          }
+        },
+      },
+    },
+  )
+}
+
 async function verifyReviewTerminalCatalogRecovery(input) {
   const {
     pool,
@@ -3823,11 +3848,313 @@ async function verifyPromotionNumericScaleAcceptance(
   assert.equal(counters.fetchCalls, 0)
 }
 
+async function verifyShopifyAttentionAcrossWorkerScans(input) {
+  const {
+    pool,
+    ids,
+    missingCandidate,
+    canonicalOrderGlobalId,
+  } = input
+  const persistence = loadCommerceOrderReconciliationPersistence(pool)
+  const scans = [
+    {
+      providerRowsSeen: 1,
+      ordersStaged: 1,
+      held: 1,
+      actionableHeld: 1,
+      heldByReason: { checkout_rate_lineage_missing: 1 },
+    },
+    {
+      providerRowsSeen: 0,
+      ordersStaged: 0,
+      held: 0,
+      actionableHeld: 0,
+      heldByReason: {},
+    },
+    {
+      providerRowsSeen: 0,
+      ordersStaged: 0,
+      held: 0,
+      actionableHeld: 0,
+      heldByReason: {},
+    },
+    {
+      providerRowsSeen: 0,
+      ordersStaged: 0,
+      held: 0,
+      actionableHeld: 0,
+      heldByReason: {},
+    },
+  ]
+  const worker = loadCommerceOrderReconciliationWorker({
+    persistence,
+    async executeCommerceOrderPage() {
+      const scan = scans.shift()
+      assert.ok(scan, 'Unexpected extra Shopify reconciliation worker page')
+      return {
+        command: {
+          providerWrites: 0,
+          syncCursorAdvanced: false,
+          canonicalOrdersCreated: 0,
+          inventoryTouched: 0,
+          ordersStaged: scan.ordersStaged,
+          recordsRejected: 0,
+          pagination: {
+            runGlobalId: 'gcir0099999',
+            providerRowsSeen: scan.providerRowsSeen,
+            batchNumber: 1,
+            hasNextBatch: false,
+            continuationRunGlobalId: null,
+          },
+          automaticCustomerResolution: {
+            matched: 0,
+            created: 0,
+            ambiguous: 0,
+            skipped: 0,
+            failed: 0,
+            failedByCode: {},
+            providerWrites: 0,
+            syncCursorAdvanced: false,
+          },
+          automaticShopifyOrderPromotion: {
+            promoted: 0,
+            held: scan.held,
+            actionableHeld: scan.actionableHeld,
+            heldByReason: scan.heldByReason,
+            failed: 0,
+            failedByCode: {},
+            rollbackFenced: 0,
+            providerWrites: 0,
+            canonicalOrderWrites: 0,
+            inventoryWrites: 0,
+            syncCursorAdvanced: false,
+          },
+          automaticFaireOrderPromotion: {
+            promoted: 0,
+            held: 0,
+            failed: 0,
+            failedByCode: {},
+            providerWrites: 0,
+            canonicalOrderWrites: 0,
+            inventoryWrites: 0,
+            syncCursorAdvanced: false,
+          },
+        },
+      }
+    },
+  })
+  const faireStatus = (await pool.query(
+    `SELECT status
+     FROM operations_integration_accounts
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid`,
+    [ids.organization, ids.faireIntegrationAccount],
+  )).rows[0]?.status || null
+  if (faireStatus) {
+    await pool.query(
+      `UPDATE operations_integration_accounts
+       SET status = 'error', updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [ids.organization, ids.faireIntegrationAccount],
+    )
+  }
+  const makeRootPollDue = async (clearError = false) => {
+    await pool.query(
+      `UPDATE operations_commerce_sync_cursors
+       SET reconciliation_status = 'succeeded',
+           last_error_code = CASE WHEN $3 THEN NULL ELSE last_error_code END,
+           last_started_at = now() - interval '31 minutes',
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND resource = 'orders'`,
+      [ids.organization, ids.integrationAccount, clearError],
+    )
+  }
+  try {
+    await makeRootPollDue(true)
+    const actionable = await worker.processCommerceOrderReconciliation({
+      limit: 1,
+    })
+    assert.equal(actionable.claimed, 1)
+    assert.equal(
+      actionable.automaticShopifyOrderPromotion.actionableHeld,
+      1,
+    )
+    assert.equal(
+      actionable.automaticShopifyOrderPromotion.attentionRequiredAccounts,
+      1,
+    )
+    assert.equal(
+      actionable.automaticShopifyOrderPromotion.operatorReviewRequired,
+      1,
+    )
+    let health = await persistence
+      .readCommerceOrderReconciliationHealthFromPostgres()
+    assert.equal(
+      health.providerPromotionAttentionRequired.shopify,
+      1,
+    )
+
+    await makeRootPollDue()
+    const laterEmptyPoll = await worker.processCommerceOrderReconciliation({
+      limit: 1,
+    })
+    assert.equal(laterEmptyPoll.claimed, 1)
+    assert.equal(
+      laterEmptyPoll.automaticShopifyOrderPromotion.actionableHeld,
+      0,
+    )
+    assert.equal(
+      laterEmptyPoll.automaticShopifyOrderPromotion.attentionRequiredAccounts,
+      1,
+      'An empty root poll must retain account attention for an unresolved candidate',
+    )
+    assert.equal(
+      laterEmptyPoll.automaticShopifyOrderPromotion.operatorReviewRequired,
+      1,
+    )
+    health = await persistence.readCommerceOrderReconciliationHealthFromPostgres()
+    assert.equal(
+      health.providerPromotionAttentionRequired.shopify,
+      1,
+      'The durable health signal must survive an empty root poll',
+    )
+    const retainedState = await persistence
+      .readCommerceOrderReconciliationStateInPostgres({
+        organizationId: ids.organization,
+        accountGlobalId: 'gia0009201',
+      })
+    assert.equal(retainedState.automaticPromotionAttentionRequired, true)
+
+    const resolutionClient = await pool.connect()
+    try {
+      await resolutionClient.query('SET session_replication_role = replica')
+      await resolutionClient.query(
+        `UPDATE operations_commerce_order_candidates candidate
+         SET workflow_state = 'failed',
+             last_error_code = 'operator_resolved',
+             blocking_codes = ARRAY['operator_resolved']::text[],
+             row_version = candidate.row_version + 1,
+             updated_by = $3,
+             updated_at = now()
+         FROM operations_commerce_intake_runs run
+         WHERE candidate.organization_id = $1::uuid
+           AND candidate.integration_account_id = $2::uuid
+           AND run.organization_id = candidate.organization_id
+           AND run.integration_account_id = candidate.integration_account_id
+           AND run.id = candidate.run_id
+           AND run.created_by = 'system:commerce-order-reconciliation'
+           AND candidate.provider = 'shopify'
+           AND candidate.workflow_state IN ('held', 'resolving', 'ready')`,
+        [ids.organization, ids.integrationAccount, actorEmail],
+      )
+    } finally {
+      await resolutionClient.query('SET session_replication_role = origin')
+        .catch(() => {})
+      resolutionClient.release()
+    }
+    await makeRootPollDue()
+    const resolvedPoll = await worker.processCommerceOrderReconciliation({
+      limit: 1,
+    })
+    assert.equal(resolvedPoll.claimed, 1)
+    assert.equal(
+      resolvedPoll.automaticShopifyOrderPromotion.attentionRequiredAccounts,
+      0,
+    )
+    assert.equal(
+      resolvedPoll.automaticShopifyOrderPromotion.operatorReviewRequired,
+      0,
+    )
+    health = await persistence.readCommerceOrderReconciliationHealthFromPostgres()
+    assert.equal(health.providerPromotionAttentionRequired.shopify, 0)
+
+    const dedupeClient = await pool.connect()
+    try {
+      await dedupeClient.query('SET session_replication_role = replica')
+      await dedupeClient.query(
+        `UPDATE operations_orders
+         SET external_order_id = $3, updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND global_id = $2`,
+        [
+          ids.organization,
+          canonicalOrderGlobalId,
+          missingCandidate.external_order_id,
+        ],
+      )
+      await dedupeClient.query(
+        `UPDATE operations_commerce_order_candidates
+         SET workflow_state = 'held',
+             last_error_code = NULL,
+             blocking_codes = '{}'::text[],
+             expires_at = now() + interval '7 days',
+             row_version = row_version + 1,
+             updated_by = $3,
+             updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND global_id = $2`,
+        [ids.organization, missingCandidate.global_id, actorEmail],
+      )
+    } finally {
+      await dedupeClient.query('SET session_replication_role = origin')
+        .catch(() => {})
+      dedupeClient.release()
+    }
+    await makeRootPollDue()
+    const benignDedupePoll = await worker.processCommerceOrderReconciliation({
+      limit: 1,
+    })
+    assert.equal(benignDedupePoll.claimed, 1)
+    assert.equal(
+      benignDedupePoll.automaticShopifyOrderPromotion.attentionRequiredAccounts,
+      0,
+      'A held candidate with an existing canonical order is a benign dedupe',
+    )
+    health = await persistence.readCommerceOrderReconciliationHealthFromPostgres()
+    assert.equal(health.providerPromotionAttentionRequired.shopify, 0)
+    assert.equal(scans.length, 0)
+  } finally {
+    if (faireStatus) {
+      await pool.query(
+        `UPDATE operations_integration_accounts
+         SET status = $3, updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid`,
+        [ids.organization, ids.faireIntegrationAccount, faireStatus],
+      )
+    }
+  }
+}
+
 async function verifyAutomaticShopifyCleanPromotion(
   pool,
   ids,
   counters,
 ) {
+  const helperAcl = (await pool.query(
+    `SELECT EXISTS (
+       SELECT 1
+       FROM pg_proc function_row
+       CROSS JOIN LATERAL aclexplode(
+         COALESCE(
+           function_row.proacl,
+           acldefault('f', function_row.proowner)
+         )
+       ) privilege
+       WHERE function_row.oid = (
+         'public.operations_shopify_checkout_rate_match_candidate_facts_for_workflow(uuid,uuid,boolean,boolean)'
+       )::regprocedure
+         AND privilege.grantee = 0
+         AND privilege.privilege_type = 'EXECUTE'
+     ) AS public_execute`)).rows[0]
+  assert.equal(
+    helperAcl.public_execute,
+    false,
+    'The Boolean Shopify checkout workflow helper must not be executable by PUBLIC',
+  )
   const candidateKeys = {
     success: 'gid://shopify/Order/mapped-fractional',
     missing: 'gid://shopify/Order/mismatch-positive',
@@ -4017,10 +4344,16 @@ async function verifyAutomaticShopifyCleanPromotion(
            subtotal_minor = 0,
            discount_minor = 0,
            brand_discount_minor = 0,
-           shipping_minor = 2071,
+           shipping_minor = CASE
+             WHEN candidate.external_order_id = $10 THEN 0
+             ELSE 2071
+           END,
            tax_minor = 0,
            other_adjustment_minor = 0,
-           total_minor = 2071,
+           total_minor = CASE
+             WHEN candidate.external_order_id = $10 THEN 0
+             ELSE 2071
+           END,
            header_money_state = 'complete',
            header_money_gaps = '{}'::text[],
            customer_resolution_state = 'resolved',
@@ -4070,6 +4403,7 @@ async function verifyAutomaticShopifyCleanPromotion(
         hash(addressCiphertext),
         requestedDeliveryAt,
         sourceTimestamp,
+        candidateKeys.success,
       ],
     )
     assert.equal(updatedCandidates.rowCount, 4)
@@ -4210,6 +4544,12 @@ async function verifyAutomaticShopifyCleanPromotion(
     const fakeCarrierNetworkId = randomUUID()
     const fakeCarrierAuthorizationId = randomUUID()
     const packagePlanHash = hash(`clean-package:${input.key}`)
+    const carrierCostMinor = 2071
+    const customerChargeMinor = input.subsidized ? 0 : carrierCostMinor
+    const checkoutAdjustmentMinor = input.subsidized
+      ? -carrierCostMinor
+      : 0
+    const checkoutAdjustmentKind = input.subsidized ? 'subsidy' : 'none'
     const client = await pool.connect()
     try {
       await client.query('SET session_replication_role = replica')
@@ -4332,8 +4672,8 @@ async function verifyAutomaticShopifyCleanPromotion(
            package_count, package_plan_hash, offer_hash, offer_snapshot
          ) VALUES (
            $1::uuid, $2::uuid, 'ups_rest', $3::uuid, $4::uuid, $5, $6,
-           'clawpilot:ups:ground', 'ground', 'UPS Ground', 2071, 2071,
-           0, 'none', 'USD', 1, $7, $8, '{}'::jsonb
+           'clawpilot:ups:ground', 'ground', 'UPS Ground', $7::bigint,
+           $8::bigint, $9::bigint, $10, 'USD', 1, $11, $12, '{}'::jsonb
          )`,
         [
           ids.organization,
@@ -4342,6 +4682,10 @@ async function verifyAutomaticShopifyCleanPromotion(
           fakeCarrierRateRequestId,
           hash(`clean-carrier-request:${input.key}`),
           hash(`clean-carrier-response:${input.key}`),
+          carrierCostMinor,
+          customerChargeMinor,
+          checkoutAdjustmentMinor,
+          checkoutAdjustmentKind,
           packagePlanHash,
           hash(`clean-offer:${input.key}`),
         ],
@@ -4360,6 +4704,7 @@ async function verifyAutomaticShopifyCleanPromotion(
     candidate: successCandidate,
     key: 'success-a',
     globalId: 'gsqr0099901',
+    subsidized: true,
   })
   await insertCheckoutReceipt({
     candidate: ambiguousCandidate,
@@ -4371,6 +4716,38 @@ async function verifyAutomaticShopifyCleanPromotion(
     key: 'expired-a',
     globalId: 'gsqr0099903',
     expired: true,
+  })
+  const subsidizedCheckout = (await pool.query(
+    `SELECT
+       candidate.shipping_minor::text AS candidate_shipping_minor,
+       offer.carrier_cost_minor::text AS carrier_cost_minor,
+       offer.customer_charge_minor::text AS customer_charge_minor,
+       offer.checkout_adjustment_minor::text AS checkout_adjustment_minor,
+       offer.checkout_adjustment_kind,
+       (
+         SELECT count(*)::integer
+         FROM operations_shopify_checkout_rate_preflight_match_candidates(
+           candidate.organization_id, candidate.id, true
+         )
+       ) AS preflight_match_count
+     FROM operations_commerce_order_candidates candidate
+     JOIN operations_shopify_checkout_rate_receipts receipt
+       ON receipt.organization_id = candidate.organization_id
+      AND receipt.global_id = 'gsqr0099901'
+     JOIN operations_shopify_checkout_rate_receipt_offers offer
+       ON offer.organization_id = receipt.organization_id
+      AND offer.receipt_id = receipt.id
+     WHERE candidate.organization_id = $1::uuid
+       AND candidate.global_id = $2`,
+    [ids.organization, successCandidate.global_id],
+  )).rows[0]
+  assert.deepEqual(subsidizedCheckout, {
+    candidate_shipping_minor: '0',
+    carrier_cost_minor: '2071',
+    customer_charge_minor: '0',
+    checkout_adjustment_minor: '-2071',
+    checkout_adjustment_kind: 'subsidy',
+    preflight_match_count: 1,
   })
 
   const previousClawPilotEnv = process.env.CLAWPILOT_ENV
@@ -4534,6 +4911,33 @@ async function verifyAutomaticShopifyCleanPromotion(
     assert.equal(promoted.checkoutRateReconciliation.outcome, 'matched')
     assert.equal(promoted.providerWrites, 0)
     assert.equal(promoted.inventoryWrites, 0)
+    const authoritativeSubsidizedMatch = (await pool.query(
+      `SELECT
+         reconciliation.outcome,
+         reconciliation.source_shipping_charge_minor::text
+           AS source_shipping_charge_minor,
+         reconciliation.selected_customer_charge_minor::text
+           AS selected_customer_charge_minor,
+         offer.carrier_cost_minor::text AS carrier_cost_minor,
+         offer.checkout_adjustment_minor::text AS checkout_adjustment_minor,
+         offer.checkout_adjustment_kind
+       FROM operations_shopify_checkout_rate_reconciliations reconciliation
+       JOIN operations_shopify_checkout_rate_receipt_offers offer
+         ON offer.organization_id = reconciliation.organization_id
+        AND offer.receipt_id = reconciliation.receipt_id
+        AND offer.offer_hash = reconciliation.selected_offer_hash
+       WHERE reconciliation.organization_id = $1::uuid
+         AND reconciliation.order_candidate_id = $2::uuid`,
+      [ids.organization, successCandidate.id],
+    )).rows[0]
+    assert.deepEqual(authoritativeSubsidizedMatch, {
+      outcome: 'matched',
+      source_shipping_charge_minor: '0',
+      selected_customer_charge_minor: '0',
+      carrier_cost_minor: '2071',
+      checkout_adjustment_minor: '-2071',
+      checkout_adjustment_kind: 'subsidy',
+    })
     const replayed = await persistence
       .promoteCommerceCandidateInPostgres(promotionInput)
     assert.equal(replayed.replayed, true)
@@ -4617,6 +5021,12 @@ async function verifyAutomaticShopifyCleanPromotion(
       ],
     )).rows[0].count)
     assert.equal(heldCanonicalCount, 0)
+    await verifyShopifyAttentionAcrossWorkerScans({
+      pool,
+      ids,
+      missingCandidate,
+      canonicalOrderGlobalId: promoted.canonicalOrderGlobalId,
+    })
   } finally {
     if (previousClawPilotEnv === undefined) {
       delete process.env.CLAWPILOT_ENV
@@ -5984,8 +6394,8 @@ async function main() {
       + 'rollback, review-mode terminal catalog recovery, and policy-drift '
       + 'recovery, plus Faire customer pre-fetch binding disposable-PostgreSQL '
       + 'and exact variant-pack evidence, plus Shopify clean-path preflight, '
-      + 'matched promotion, drift fencing, and atomic rollback acceptance '
-      + 'passed',
+      + 'zero-dollar subsidized checkout matching, drift fencing, atomic '
+      + 'rollback, and durable cross-scan worker attention acceptance passed',
   )
 }
 
