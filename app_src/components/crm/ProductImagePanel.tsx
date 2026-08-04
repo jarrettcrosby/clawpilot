@@ -41,7 +41,7 @@ type ProductImageAsset = {
   pixelWidth: number
   pixelHeight: number
   altText: string
-  source: 'manual_upload' | 'provider_import' | 'migration'
+  source: 'manual_upload' | 'provider_import' | 'suitecrm_import' | 'migration'
   isPrimary: boolean
   createdBy: string
   updatedBy: string
@@ -226,6 +226,7 @@ function displayBytes(byteLength: number) {
 
 function displaySource(source: ProductImageAsset['source']) {
   if (source === 'provider_import') return 'Provider import'
+  if (source === 'suitecrm_import') return 'SuiteCRM import'
   if (source === 'migration') return 'Migration'
   return 'Manual upload'
 }
