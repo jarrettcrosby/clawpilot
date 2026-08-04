@@ -2835,7 +2835,155 @@ async function verifyCanonicalPlanning(databaseUrl) {
     )
 
     const fixture = await seedCanonicalPlanningFixture(pool)
-    const idempotencyKey = `canonical-plan-${randomUUID()}`
+    const foreignFixture = await seedCanonicalPlanningFixture(pool)
+    const unrelatedSuffix = randomUUID().slice(0, 8)
+    const unrelatedOrderResult = await pool.query(
+      `INSERT INTO operations_orders (
+         organization_id, pipeline_id, customer_id, integration_account_id,
+         source_provider, external_order_id, order_number, status, currency,
+         merchandise_total_minor, requested_delivery_at, ship_to,
+         source_payload, created_by, updated_by
+       )
+       SELECT
+         organization_id, pipeline_id, customer_id, integration_account_id,
+         source_provider, external_order_id || '-unrelated-' || $3,
+         order_number || '-UNRELATED-' || $3, 'imported', currency,
+         merchandise_total_minor, requested_delivery_at, ship_to,
+         source_payload, created_by, updated_by
+       FROM operations_orders
+       WHERE organization_id = $1::uuid AND id = $2::uuid
+       RETURNING id::text, global_id, row_version::text`,
+      [fixture.organizationId, fixture.order.id, unrelatedSuffix],
+    )
+    const unrelatedOrder = unrelatedOrderResult.rows[0]
+    assert.ok(unrelatedOrder, 'Same-organization unrelated order is required')
+
+    const planningReceiptForKey = async (idempotencyKey) => {
+      const receipt = await pool.query(
+        `SELECT target_global_id, status, attempts,
+                request_hash, updated_at::text
+         FROM operations_command_receipts
+         WHERE organization_id = $1::uuid
+           AND command_type = 'plan_operations_order'
+           AND idempotency_key = $2
+         LIMIT 1`,
+        [fixture.organizationId, idempotencyKey],
+      )
+      return receipt.rows[0] ?? null
+    }
+    const assertPlanningAuthorityRejected = async ({
+      label,
+      orderGlobalId,
+      evidenceGlobalId,
+      expectedRowVersion,
+    }) => {
+      const rejectedKey = `authority-rejected-${randomUUID()}`
+      await assert.rejects(
+        () => operations.planOperationsOrderFromPostgres({
+          organizationId: fixture.organizationId,
+          actorEmail: fixture.email,
+          orderGlobalId,
+          cartonizationEvidenceGlobalId: evidenceGlobalId,
+          expectedRowVersion,
+          reason: `Reject ${label} planning authority`,
+          idempotencyKey: rejectedKey,
+        }),
+        (error) => {
+          assert.equal(error.code, 'OPERATIONS_ORDER_EVIDENCE_MISMATCH')
+          assert.equal(error.status, 409)
+          assert.equal(
+            error.message,
+            'The order and cartonization evidence do not share one promoted commerce candidate',
+          )
+          return true
+        },
+        `${label} must use the uniform planning authority error`,
+      )
+      assert.equal(
+        await planningReceiptForKey(rejectedKey),
+        null,
+        `${label} must not create a command receipt`,
+      )
+    }
+
+    await assertPlanningAuthorityRejected({
+      label: 'cross-organization order and evidence',
+      orderGlobalId: foreignFixture.order.global_id,
+      evidenceGlobalId: foreignFixture.evidence.global_id,
+      expectedRowVersion: Number(foreignFixture.order.row_version),
+    })
+    await assertPlanningAuthorityRejected({
+      label: 'nonexistent same-organization order',
+      orderGlobalId: `gor${randomUUID().replaceAll('-', '').slice(0, 12)}`,
+      evidenceGlobalId: fixture.evidence.global_id,
+      expectedRowVersion: Number(fixture.order.row_version),
+    })
+    await assertPlanningAuthorityRejected({
+      label: 'same-organization order with unrelated evidence',
+      orderGlobalId: unrelatedOrder.global_id,
+      evidenceGlobalId: fixture.evidence.global_id,
+      expectedRowVersion: Number(unrelatedOrder.row_version),
+    })
+    await pool.query(
+      `ALTER TABLE operations_commerce_order_candidates
+       DISABLE TRIGGER protect_operations_commerce_order_candidate`,
+    )
+    await pool.query(
+      `ALTER TABLE operations_commerce_order_candidates
+       DROP CONSTRAINT commerce_order_candidates_promotion_valid`,
+    )
+    try {
+      await pool.query(
+        `UPDATE operations_commerce_order_candidates
+         SET workflow_state = 'ready', row_version = row_version + 1
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [fixture.organizationId, fixture.candidate.id],
+      )
+      await assertPlanningAuthorityRejected({
+        label: 'unpromoted same-organization candidate',
+        orderGlobalId: fixture.order.global_id,
+        evidenceGlobalId: fixture.evidence.global_id,
+        expectedRowVersion: Number(fixture.order.row_version),
+      })
+    } finally {
+      await pool.query(
+        `UPDATE operations_commerce_order_candidates
+         SET workflow_state = 'promoted', row_version = row_version + 1
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [fixture.organizationId, fixture.candidate.id],
+      )
+      await pool.query(
+        `ALTER TABLE operations_commerce_order_candidates
+         ADD CONSTRAINT commerce_order_candidates_promotion_valid CHECK (
+           (
+             workflow_state = 'promoted'
+             AND canonical_order_id IS NOT NULL
+             AND promotion_command_receipt_id IS NOT NULL
+             AND promotion_idempotency_key IS NOT NULL
+             AND length(btrim(promotion_idempotency_key)) BETWEEN 1 AND 255
+             AND promotion_request_hash IS NOT NULL
+             AND promotion_request_hash ~ '^[a-f0-9]{64}$'
+             AND promoted_at IS NOT NULL
+           )
+           OR (
+             workflow_state <> 'promoted'
+             AND canonical_order_id IS NULL
+             AND promotion_command_receipt_id IS NULL
+             AND promotion_idempotency_key IS NULL
+             AND promotion_request_hash IS NULL
+             AND promoted_at IS NULL
+           )
+         )`,
+      )
+      await pool.query(
+        `ALTER TABLE operations_commerce_order_candidates
+         ENABLE TRIGGER protect_operations_commerce_order_candidate`,
+      )
+    }
+
+    const idempotencyKey = (
+      `operations-plan:${foreignFixture.order.global_id}:${randomUUID()}`
+    )
     const input = {
       organizationId: fixture.organizationId,
       actorEmail: fixture.email,
@@ -2950,6 +3098,58 @@ async function verifyCanonicalPlanning(databaseUrl) {
     assert.equal(state.explanation.packagingMaterialClaimCount, 1)
     assert.equal(state.explanation.packagingStockDecremented, false)
 
+    const receiptTarget = async () => (
+      (await planningReceiptForKey(idempotencyKey))?.target_global_id ?? null
+    )
+    assert.equal(
+      await receiptTarget(),
+      fixture.order.global_id,
+      'Planning receipts must persist the server-resolved order target',
+    )
+    await pool.query(
+      `UPDATE operations_command_receipts
+       SET target_global_id = NULL
+       WHERE organization_id = $1::uuid
+         AND command_type = 'plan_operations_order'
+         AND idempotency_key = $2`,
+      [fixture.organizationId, idempotencyKey],
+    )
+    const legacyNullReceipt = await planningReceiptForKey(idempotencyKey)
+    await assert.rejects(
+      () => operations.planOperationsOrderFromPostgres({
+        ...input,
+        orderGlobalId: foreignFixture.order.global_id,
+        cartonizationEvidenceGlobalId: foreignFixture.evidence.global_id,
+        expectedRowVersion: Number(foreignFixture.order.row_version),
+      }),
+      (error) => {
+        assert.equal(error.code, 'OPERATIONS_ORDER_EVIDENCE_MISMATCH')
+        assert.equal(error.status, 409)
+        return true
+      },
+      'A legacy NULL receipt requires fresh same-organization authority',
+    )
+    assert.deepEqual(
+      await planningReceiptForKey(idempotencyKey),
+      legacyNullReceipt,
+      'Failed fresh authority must not mutate a legacy NULL receipt',
+    )
+    await assert.rejects(
+      () => operations.planOperationsOrderFromPostgres({
+        ...input,
+        reason: `${input.reason} with a changed request hash`,
+      }),
+      (error) => {
+        assert.equal(error.code, 'OPERATIONS_IDEMPOTENCY_CONFLICT')
+        return true
+      },
+      'A hash conflict must not populate a legacy NULL target',
+    )
+    assert.equal(
+      await receiptTarget(),
+      null,
+      'Legacy target fill must happen only after request-hash equality',
+    )
     const replayed = await operations.planOperationsOrderFromPostgres(input)
     assert.deepEqual(
       {
@@ -2960,6 +3160,40 @@ async function verifyCanonicalPlanning(databaseUrl) {
       'Idempotent replay must return the original canonical planning result',
     )
     assert.equal(replayed.replayed, true)
+    assert.equal(
+      await receiptTarget(),
+      fixture.order.global_id,
+      'An exact replay must safely fill a legacy NULL target',
+    )
+    await pool.query(
+      `UPDATE operations_command_receipts
+       SET target_global_id = $3
+       WHERE organization_id = $1::uuid
+         AND command_type = 'plan_operations_order'
+         AND idempotency_key = $2`,
+      [fixture.organizationId, idempotencyKey, fixture.evidence.global_id],
+    )
+    await assert.rejects(
+      () => operations.planOperationsOrderFromPostgres(input),
+      (error) => {
+        assert.equal(error.code, 'OPERATIONS_IDEMPOTENCY_CONFLICT')
+        return true
+      },
+      'A non-NULL receipt target mismatch must fail closed',
+    )
+    assert.equal(
+      await receiptTarget(),
+      fixture.evidence.global_id,
+      'A mismatched non-NULL target must remain unchanged',
+    )
+    await pool.query(
+      `UPDATE operations_command_receipts
+       SET target_global_id = $3
+       WHERE organization_id = $1::uuid
+         AND command_type = 'plan_operations_order'
+         AND idempotency_key = $2`,
+      [fixture.organizationId, idempotencyKey, fixture.order.global_id],
+    )
     const duplicateCounts = await pool.query(
       `SELECT
          (SELECT count(*)::int

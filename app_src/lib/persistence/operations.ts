@@ -279,6 +279,7 @@ type ActivationRow = QueryResultRow & {
 type CommandReceiptRow = QueryResultRow & {
   id: string
   request_hash: string
+  target_global_id: string | null
   status: 'processing' | 'succeeded' | 'failed'
   correlation_id: string
   result_global_id: string | null
@@ -4664,6 +4665,7 @@ async function prepareCommandReceipt(input: {
   idempotencyKey: string
   requestHash: string
   actorEmail: string
+  targetGlobalId?: string
 }): Promise<{ receipt: CommandReceiptRow; completed: boolean }> {
   return withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
@@ -4671,14 +4673,15 @@ async function prepareCommandReceipt(input: {
       `operations:command-receipt:${input.organizationId}:${input.commandType}:${input.idempotencyKey}`,
     )
     const existing = await client.query<CommandReceiptRow>(
-      `SELECT id::text, request_hash, status, correlation_id::text,
+      `SELECT id::text, request_hash, target_global_id,
+              status, correlation_id::text,
               result_global_id, result_payload, attempts, updated_at
        FROM operations_command_receipts
        WHERE organization_id = $1::uuid AND command_type = $2 AND idempotency_key = $3
        FOR UPDATE`,
       [input.organizationId, input.commandType, input.idempotencyKey],
     )
-    const receipt = existing.rows[0]
+    let receipt = existing.rows[0]
     if (receipt) {
       if (receipt.request_hash !== input.requestHash) {
         throw new OperationsRequestError(
@@ -4686,6 +4689,29 @@ async function prepareCommandReceipt(input: {
           'This idempotency key was already used with different command data',
           409,
         )
+      }
+      if (
+        input.targetGlobalId
+        && receipt.target_global_id
+        && receipt.target_global_id !== input.targetGlobalId
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_IDEMPOTENCY_CONFLICT',
+          'This idempotency key was already used for a different command target',
+          409,
+        )
+      }
+      if (input.targetGlobalId && !receipt.target_global_id) {
+        const targeted = await client.query<CommandReceiptRow>(
+          `UPDATE operations_command_receipts
+           SET target_global_id = $2
+           WHERE id = $1::uuid AND target_global_id IS NULL
+           RETURNING id::text, request_hash, target_global_id,
+                     status, correlation_id::text,
+                     result_global_id, result_payload, attempts, updated_at`,
+          [receipt.id, input.targetGlobalId],
+        )
+        receipt = targeted.rows[0]
       }
       if (receipt.status === 'succeeded') return { receipt, completed: true }
       if (receipt.status === 'processing' && Date.now() - receipt.updated_at.getTime() < 5 * 60_000) {
@@ -4701,7 +4727,8 @@ async function prepareCommandReceipt(input: {
              error_code = NULL, error_message = NULL, completed_at = NULL,
              started_at = now(), updated_at = now()
          WHERE id = $1::uuid
-         RETURNING id::text, request_hash, status, correlation_id::text,
+         RETURNING id::text, request_hash, target_global_id,
+                   status, correlation_id::text,
                    result_global_id, result_payload, attempts, updated_at`,
         [receipt.id, input.actorEmail],
       )
@@ -4710,9 +4737,12 @@ async function prepareCommandReceipt(input: {
     const created = await client.query<CommandReceiptRow>(
       `INSERT INTO operations_command_receipts (
          organization_id, command_type, idempotency_key, request_hash,
-         actor_email, status, correlation_id
-       ) VALUES ($1::uuid, $2, $3, $4, $5, 'processing', $6::uuid)
-       RETURNING id::text, request_hash, status, correlation_id::text,
+         actor_email, status, correlation_id, target_global_id
+       ) VALUES (
+         $1::uuid, $2, $3, $4, $5, 'processing', $6::uuid, $7
+       )
+       RETURNING id::text, request_hash, target_global_id,
+                 status, correlation_id::text,
                  result_global_id, result_payload, attempts, updated_at`,
       [
         input.organizationId,
@@ -4721,6 +4751,7 @@ async function prepareCommandReceipt(input: {
         input.requestHash,
         input.actorEmail,
         randomUUID(),
+        input.targetGlobalId || null,
       ],
     )
     return { receipt: created.rows[0], completed: false }
@@ -9602,6 +9633,49 @@ export async function runMockOperationsProofFromPostgres(input: {
   }
 }
 
+function planningOrderEvidenceMismatch(): OperationsRequestError {
+  return new OperationsRequestError(
+    'OPERATIONS_ORDER_EVIDENCE_MISMATCH',
+    'The order and cartonization evidence do not share one promoted commerce candidate',
+    409,
+  )
+}
+
+async function resolvePlanningOrderTarget(input: {
+  organizationId: string
+  requestedOrderGlobalId: string
+  evidenceGlobalId: string
+}): Promise<string> {
+  const result = await query<{ global_id: string }>(
+    `SELECT source_order.global_id
+     FROM operations_orders source_order
+     JOIN operations_commerce_order_candidates candidate
+       ON candidate.organization_id = source_order.organization_id
+      AND candidate.integration_account_id =
+            source_order.integration_account_id
+      AND candidate.canonical_order_id = source_order.id
+     JOIN operations_cartonization_rate_evidence evidence
+       ON evidence.organization_id = candidate.organization_id
+      AND evidence.integration_account_id = candidate.integration_account_id
+      AND evidence.order_candidate_id = candidate.id
+     WHERE source_order.organization_id = $1::uuid
+       AND source_order.global_id = $2
+       AND evidence.global_id = $3
+       AND candidate.workflow_state = 'promoted'
+     LIMIT 1`,
+    [
+      input.organizationId,
+      input.requestedOrderGlobalId,
+      input.evidenceGlobalId,
+    ],
+  )
+  const authoritativeOrderGlobalId = result.rows[0]?.global_id
+  if (!authoritativeOrderGlobalId) {
+    throw planningOrderEvidenceMismatch()
+  }
+  return authoritativeOrderGlobalId
+}
+
 export async function planOperationsOrderFromPostgres(input: {
   organizationId: string
   actorEmail: string
@@ -9613,7 +9687,7 @@ export async function planOperationsOrderFromPostgres(input: {
 }): Promise<OperationsPlanCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
-  const orderGlobalId = String(input.orderGlobalId || '').trim()
+  const requestedOrderGlobalId = String(input.orderGlobalId || '').trim()
   const evidenceGlobalId = String(
     input.cartonizationEvidenceGlobalId || '',
   ).trim()
@@ -9626,7 +9700,7 @@ export async function planOperationsOrderFromPostgres(input: {
       401,
     )
   }
-  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(requestedOrderGlobalId)) {
     throw new OperationsRequestError(
       'OPERATIONS_ORDER_INVALID',
       'Order is invalid',
@@ -9660,16 +9734,17 @@ export async function planOperationsOrderFromPostgres(input: {
     )
   }
 
+  const orderGlobalId = await resolvePlanningOrderTarget({
+    organizationId,
+    requestedOrderGlobalId,
+    evidenceGlobalId,
+  })
   const evidence = await readCartonizationRateEvidenceByGlobalId({
     organizationId,
     evidenceGlobalId,
   })
   if (!evidence) {
-    throw new OperationsRequestError(
-      'OPERATIONS_CARTONIZATION_EVIDENCE_NOT_FOUND',
-      'Sealed cartonization evidence was not found',
-      404,
-    )
+    throw planningOrderEvidenceMismatch()
   }
   if (
     evidence.evidenceMode !== 'operational'
@@ -9694,6 +9769,7 @@ export async function planOperationsOrderFromPostgres(input: {
       reason,
     }),
     actorEmail,
+    targetGlobalId: orderGlobalId,
   })
   if (command.completed) {
     return completedPlanCommandResult(command.receipt)
@@ -9792,11 +9868,7 @@ export async function planOperationsOrderFromPostgres(input: {
       )
       const order = orderResult.rows[0]
       if (!order || order.row_version === undefined) {
-        throw new OperationsRequestError(
-          'OPERATIONS_ORDER_EVIDENCE_MISMATCH',
-          'The order and cartonization evidence do not share one promoted commerce candidate',
-          409,
-        )
+        throw planningOrderEvidenceMismatch()
       }
       if (Number(order.row_version) !== input.expectedRowVersion) {
         throw new OperationsRequestError(
