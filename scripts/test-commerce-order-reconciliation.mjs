@@ -167,6 +167,10 @@ assert.equal(
   true,
   'Missing checkout lineage must remain durable operator attention',
 )
+assert.equal(
+  shopifyPromotionPolicy.SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER,
+  'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED',
+)
 const freshProviderCreatedAt = Date.parse('2026-08-01T12:00:00.000Z')
 const freshObservedAt = freshProviderCreatedAt + 5 * 60_000
 assert.equal(
@@ -278,7 +282,11 @@ includes(persistence, [
   'inventoryWrites: 0',
   'unresolved_shopify_promotion',
   "candidate.workflow_state IN ('held', 'resolving', 'ready')",
+  'candidate.last_error_code =',
+  'SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER',
   "run.created_by = 'system:commerce-order-reconciliation'",
+  "run.workflow_state <> 'expired'",
+  'run.expires_at > now()',
   'canonical.external_order_id',
 ], 'Order reconciliation persistence')
 includes(shippingServiceCodeMigration, [
@@ -297,6 +305,24 @@ assert.ok(
   !persistence.includes('faire_updated_at_min')
     && !persistence.includes('high_watermark ='),
   'Faire automatic reconciliation must not use an unsafe live-cursor incremental checkpoint',
+)
+const completionPersistenceSource = persistence.slice(
+  persistence.indexOf(
+    'export async function completeCommerceOrderReconciliationInPostgres',
+  ),
+  persistence.indexOf(
+    'export async function failCommerceOrderReconciliationInPostgres',
+  ),
+)
+assert.match(
+  completionPersistenceSource,
+  /WHEN \$8::boolean[\s\S]*last_error_code =\s*'\$\{FAIRE_AUTO_PROMOTION_ATTENTION_CODE\}'/u,
+  'Only Faire may use the legacy continuation attention fallback',
+)
+assert.doesNotMatch(
+  completionPersistenceSource,
+  /WHEN \$8::boolean[\s\S]{0,300}SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE/u,
+  'Shopify continuation attention must be recomputed from active candidate markers',
 )
 
 let claimSql = ''
@@ -824,6 +850,8 @@ includes(intakeSource, [
   'sandbox_account_required',
   'requiredCheckoutRateOutcome: \'matched\'',
   'automaticShopifyPromotion',
+  'markAutomaticShopifyOrderPromotionAttentionInPostgres',
+  'attention:${target.reasonCode}',
   'rollbackFenced',
 ], 'Shopify clean-path automatic promotion service')
 const intakePersistenceSource = read(
@@ -843,6 +871,12 @@ includes(intakePersistenceSource, [
   'canonical_order_exists',
   'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED',
   "checkoutRateReconciliation?.outcome !== 'matched'",
+  'markAutomaticShopifyOrderPromotionAttentionInPostgres',
+  'commerce.intake.mark_shopify_auto_promotion_attention',
+  'commerce.intake.shopify_auto_promotion.attention_marked',
+  'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_NOT_REQUIRED',
+  'SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER',
+  'last_error_code = NULL',
   'no partial local order survives',
 ], 'Shopify clean-path selector and atomic rollback fence')
 const strictPromotionSource = intakePersistenceSource.slice(

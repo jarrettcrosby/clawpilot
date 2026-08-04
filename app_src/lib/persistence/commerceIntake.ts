@@ -36,8 +36,10 @@ import {
   automaticFaireOrderSourceIsFresh,
 } from '@/lib/integrations/commerceFaireAutomaticPromotion'
 import {
+  automaticShopifyPromotionHoldRequiresAttention,
   automaticShopifyOrderSourceIsFresh,
   shopifyAutomaticOrderPromotionGate,
+  SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER,
   SHOPIFY_AUTOMATIC_ORDER_PROMOTION_POLICY_VERSION,
 } from '@/lib/integrations/commerceShopifyAutomaticPromotion'
 import type { CommerceRuntimeCredentialRecord } from '@/lib/persistence/commerceIntegrations'
@@ -276,6 +278,7 @@ type CandidateRow = {
   requested_delivery_at: string | Date | null
   delivery_policy_version: string | null
   workflow_state: string
+  last_error_code: string | null
   blocking_codes: string[]
   unsupported_reason_code: string | null
   unsupported_reason_detail: string | null
@@ -1948,6 +1951,7 @@ const CANDIDATE_SELECT = `SELECT
   candidate.requested_delivery_at,
   candidate.delivery_policy_version,
   candidate.workflow_state,
+  candidate.last_error_code,
   candidate.blocking_codes,
   candidate.unsupported_reason_code,
   candidate.unsupported_reason_detail,
@@ -11929,6 +11933,267 @@ export async function validateCommerceCandidateInPostgres(input: {
   })
 }
 
+/**
+ * Persists provenance only after the enabled development-only Shopify path
+ * actually encounters an actionable candidate. The candidate marker is the
+ * durable source for later empty-poll attention; unresolved historical rows
+ * without this marker are deliberately outside that signal.
+ */
+export async function markAutomaticShopifyOrderPromotionAttentionInPostgres(
+  input: {
+    runtime: CommerceRuntimeCredentialRecord
+    actorEmail: string
+    idempotencyKey: string
+    candidateGlobalId: string
+    candidateRowVersion: number
+    runGlobalId: string
+    reasonCode: string
+    expectedCohortHash: string
+  },
+) {
+  return withTransaction(async (client) => {
+    const reasonCode = input.reasonCode.trim()
+    if (!/^[A-Za-z][A-Za-z0-9_]{2,127}$/u.test(reasonCode)) {
+      intakeError(
+        'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_REASON_INVALID',
+        'Automatic Shopify order attention requires a safe reason code',
+        422,
+      )
+    }
+    if (!automaticShopifyPromotionHoldRequiresAttention(reasonCode)) {
+      intakeError(
+        'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_NOT_REQUIRED',
+        'A benign Shopify promotion hold cannot create durable attention',
+        409,
+      )
+    }
+    const gate = shopifyAutomaticOrderPromotionGate({
+      accountGlobalId: input.runtime.globalId,
+    })
+    if (
+      input.actorEmail !== 'system:commerce-order-reconciliation'
+      || input.runtime.provider !== 'shopify'
+      || input.runtime.environment !== 'sandbox'
+      || !gate.accountEnabled
+      || !gate.cohortHash
+      || gate.cohortHash !== input.expectedCohortHash
+      || !/^[a-f0-9]{64}$/u.test(input.expectedCohortHash)
+    ) {
+      intakeError(
+        'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_NOT_AUTHORIZED',
+        'Automatic Shopify order attention is not authorized for this exact development account cohort',
+        409,
+      )
+    }
+    const started = await commandStart(
+      client,
+      input,
+      'commerce.intake.mark_shopify_auto_promotion_attention',
+      {
+        policyVersion: SHOPIFY_AUTOMATIC_ORDER_PROMOTION_POLICY_VERSION,
+        cohortHash: input.expectedCohortHash,
+        runGlobalId: input.runGlobalId,
+        reasonCode,
+        expectedCandidateRowVersion: input.candidateRowVersion,
+        marker: SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER,
+      },
+    )
+    if (started.replayed) return replayPayload(started.receipt)
+    if (
+      started.account.provider !== 'shopify'
+      || started.account.environment !== 'sandbox'
+      || started.account.global_id !== input.runtime.globalId
+      || started.account.credential_version
+        !== input.runtime.credentialVersion
+    ) {
+      intakeError(
+        'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_INVARIANT_STALE',
+        'Automatic Shopify order attention evidence changed before it was recorded',
+        409,
+      )
+    }
+    const candidate = (
+      await client.query<CandidateRow>(
+        `${CANDIDATE_SELECT}
+         WHERE candidate.organization_id = $1::uuid
+           AND candidate.integration_account_id = $2::uuid
+           AND candidate.global_id = $3
+         FOR UPDATE OF candidate`,
+        [
+          input.runtime.organizationId,
+          input.runtime.integrationAccountId,
+          input.candidateGlobalId,
+        ],
+      )
+    ).rows[0]
+    if (!candidate) {
+      intakeError(
+        'COMMERCE_INTAKE_CANDIDATE_NOT_FOUND',
+        'The held order is no longer available',
+        404,
+      )
+    }
+    const exactRun = (
+      await client.query<{
+        provider: string
+        resource: string
+        credential_version: number
+        created_by: string
+        workflow_state: string
+        expires_at: Date | string
+      }>(
+        `SELECT provider, resource, credential_version, created_by,
+                workflow_state, expires_at
+         FROM operations_commerce_intake_runs
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND id = $3::uuid
+           AND global_id = $4`,
+        [
+          candidate.organization_id,
+          candidate.integration_account_id,
+          candidate.run_id,
+          input.runGlobalId,
+        ],
+      )
+    ).rows[0]
+    if (
+      candidate.provider !== 'shopify'
+      || candidate.run_global_id !== input.runGlobalId
+      || candidate.credential_version !== input.runtime.credentialVersion
+      || exactRun?.provider !== 'shopify'
+      || exactRun.resource !== 'products_and_orders'
+      || exactRun.credential_version !== input.runtime.credentialVersion
+      || exactRun.created_by !== 'system:commerce-order-reconciliation'
+    ) {
+      intakeError(
+        'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_INVARIANT_STALE',
+        'Automatic Shopify order attention is limited to the exact current worker candidate',
+        409,
+      )
+    }
+    const canonicalExists = (
+      await client.query<{ canonical_exists: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1
+           FROM operations_orders canonical
+           WHERE canonical.organization_id = $1::uuid
+             AND canonical.integration_account_id = $2::uuid
+             AND canonical.external_order_id = $3
+         ) AS canonical_exists`,
+        [
+          candidate.organization_id,
+          candidate.integration_account_id,
+          candidate.external_order_id,
+        ],
+      )
+    ).rows[0]?.canonical_exists === true
+    const resolvedReason = canonicalExists
+      ? 'canonical_order_exists'
+      : candidate.workflow_state === 'promoted'
+        ? 'candidate_promoted'
+        : candidate.workflow_state === 'failed'
+          || candidate.customer_resolution_state === 'unsupported'
+          ? 'candidate_terminal'
+          : new Date(candidate.expires_at).getTime() <= Date.now()
+            || exactRun.workflow_state === 'expired'
+            || new Date(exactRun.expires_at).getTime() <= Date.now()
+            ? 'candidate_expired'
+            : null
+    if (resolvedReason) {
+      const result = {
+        action: 'mark-shopify-auto-promotion-attention',
+        candidateGlobalId: candidate.global_id,
+        rowVersion: Number(candidate.row_version),
+        marked: false,
+        alreadyMarked: false,
+        reasonCode: resolvedReason,
+        providerWrites: 0,
+        inventoryWrites: 0,
+        syncCursorAdvanced: false,
+        replayed: false,
+      }
+      await completeReceipt(
+        client,
+        started.receipt.id,
+        candidate.global_id,
+        result,
+      )
+      return result
+    }
+    await lockCandidate(client, input)
+    const alreadyMarked = candidate.last_error_code
+      === SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER
+    let rowVersion = candidate.row_version
+    if (!alreadyMarked) {
+      const updated = await client.query<{ row_version: string }>(
+        `UPDATE operations_commerce_order_candidates
+         SET last_error_code = $2,
+             row_version = row_version + 1,
+             updated_by = $3,
+             updated_at = now()
+         WHERE id = $1::uuid
+           AND row_version = $4::bigint
+         RETURNING row_version::text`,
+        [
+          candidate.id,
+          SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER,
+          input.actorEmail,
+          candidate.row_version,
+        ],
+      )
+      if (updated.rowCount !== 1) {
+        intakeError(
+          'COMMERCE_INTAKE_ROW_VERSION_CONFLICT',
+          'This held order changed before automatic attention was recorded',
+          409,
+        )
+      }
+      rowVersion = updated.rows[0].row_version
+      await recordAuditEvent({
+        actor: input.actorEmail,
+        eventType: 'commerce.intake.shopify_auto_promotion.attention_marked',
+        aggregateType: 'operations.commerce_order_candidate',
+        aggregateId: candidate.global_id,
+        organizationId: candidate.organization_id,
+        isSystem: true,
+        eventKey:
+          `commerce-intake:${candidate.global_id}:shopify-auto-attention:${started.receipt.id}`,
+        payload: {
+          provider: 'shopify',
+          policyVersion: SHOPIFY_AUTOMATIC_ORDER_PROMOTION_POLICY_VERSION,
+          cohortHash: input.expectedCohortHash,
+          runGlobalId: input.runGlobalId,
+          reasonCode,
+          marker: SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER,
+          providerWrites: 0,
+          inventoryWrites: 0,
+          syncCursorAdvanced: false,
+        },
+      }, client)
+    }
+    const result = {
+      action: 'mark-shopify-auto-promotion-attention',
+      candidateGlobalId: candidate.global_id,
+      rowVersion: Number(rowVersion),
+      marked: true,
+      alreadyMarked,
+      reasonCode,
+      providerWrites: 0,
+      inventoryWrites: 0,
+      syncCursorAdvanced: false,
+      replayed: false,
+    }
+    await completeReceipt(
+      client,
+      started.receipt.id,
+      candidate.global_id,
+      result,
+    )
+    return result
+  })
+}
+
 export async function markCommerceCandidateUnsupportedInPostgres(input: {
   runtime: CommerceRuntimeCredentialRecord
   actorEmail: string
@@ -12878,6 +13143,7 @@ export async function promoteCommerceCandidateInPostgres(input: {
       `UPDATE operations_commerce_order_candidates
        SET workflow_state = 'promoted',
            canonical_order_id = $2::uuid,
+           last_error_code = NULL,
            promotion_command_receipt_id = $3::uuid,
            promotion_idempotency_key = $4,
            promotion_request_hash = $5,

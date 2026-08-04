@@ -2584,6 +2584,18 @@ function persistenceCommand(name) {
         'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED',
       )
     }
+    if (
+      name === 'mark-shopify-auto-attention'
+      && input.candidateGlobalId === 'gcoc0000026'
+    ) {
+      return {
+        action: name,
+        replayed: false,
+        rowVersion: input.candidateRowVersion,
+        marked: false,
+        reasonCode: 'canonical_order_exists',
+      }
+    }
     return {
       action: name,
       replayed: false,
@@ -3090,6 +3102,8 @@ const service = loadTypeScriptModule(
         },
         confirmCommerceCandidateAddressInPostgres:
           persistenceCommand('confirm-address'),
+        markAutomaticShopifyOrderPromotionAttentionInPostgres:
+          persistenceCommand('mark-shopify-auto-attention'),
         markCommerceCandidateUnsupportedInPostgres:
           persistenceCommand('mark-unsupported'),
         excludeCommerceIntakeRejectionInPostgres:
@@ -4069,6 +4083,22 @@ try {
       providerAddress: null,
       deliveryMode: null,
     },
+    {
+      eligible: false,
+      reason: 'canonical_order_exists',
+      candidateGlobalId: 'gcoc0000025',
+      candidateRowVersion: 25,
+      providerAddress: null,
+      deliveryMode: null,
+    },
+    {
+      eligible: false,
+      reason: 'checkout_rate_lineage_missing',
+      candidateGlobalId: 'gcoc0000026',
+      candidateRowVersion: 26,
+      providerAddress: null,
+      deliveryMode: null,
+    },
   ]
   const automaticShopifyFetch = await service.executeCommerceIntakeCommand({
     organizationId,
@@ -4089,15 +4119,16 @@ try {
   assert.equal(automaticShopifySummary.cohortSize, 1)
   assert.equal(automaticShopifySummary.accountInCohort, true)
   assert.match(automaticShopifySummary.cohortHash, /^[a-f0-9]{64}$/u)
-  assert.equal(automaticShopifySummary.candidatesFound, 5)
+  assert.equal(automaticShopifySummary.candidatesFound, 7)
   assert.equal(automaticShopifySummary.eligible, 3)
   assert.equal(automaticShopifySummary.promoted, 1)
-  assert.equal(automaticShopifySummary.held, 3)
+  assert.equal(automaticShopifySummary.held, 5)
   assert.equal(automaticShopifySummary.actionableHeld, 3)
   assert.deepEqual(automaticShopifySummary.heldByReason, {
     checkout_rate_lineage_missing: 1,
     physical_shipping_required: 1,
     validation_blocked: 1,
+    canonical_order_exists: 2,
   })
   assert.equal(automaticShopifySummary.failed, 1)
   assert.deepEqual(automaticShopifySummary.failedByCode, {
@@ -4108,6 +4139,70 @@ try {
   assert.equal(automaticShopifySummary.canonicalOrderWrites, 1)
   assert.equal(automaticShopifySummary.providerWrites, 0)
   assert.equal(automaticShopifySummary.inventoryWrites, 0)
+  const automaticShopifyAttentionCommands = persistenceCommands
+    .slice(automaticShopifyCommandStart)
+    .filter((entry) => entry.name === 'mark-shopify-auto-attention')
+  assert.deepEqual(
+    automaticShopifyAttentionCommands.map((entry) => ({
+      candidateGlobalId: entry.input.candidateGlobalId,
+      rowVersion: entry.input.candidateRowVersion,
+      reasonCode: entry.input.reasonCode,
+      runGlobalId: entry.input.runGlobalId,
+      actorEmail: entry.input.actorEmail,
+      cohortHash: entry.input.expectedCohortHash,
+    })),
+    [
+      {
+        candidateGlobalId: 'gcoc0000021',
+        rowVersion: 21,
+        reasonCode: 'checkout_rate_lineage_missing',
+        runGlobalId: automaticShopifyFetch.command.runGlobalId,
+        actorEmail: 'system:commerce-order-reconciliation',
+        cohortHash: automaticShopifySummary.cohortHash,
+      },
+      {
+        candidateGlobalId: 'gcoc0000022',
+        rowVersion: 22,
+        reasonCode: 'physical_shipping_required',
+        runGlobalId: automaticShopifyFetch.command.runGlobalId,
+        actorEmail: 'system:commerce-order-reconciliation',
+        cohortHash: automaticShopifySummary.cohortHash,
+      },
+      {
+        candidateGlobalId: 'gcoc0000023',
+        rowVersion: 24,
+        reasonCode:
+          'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED',
+        runGlobalId: automaticShopifyFetch.command.runGlobalId,
+        actorEmail: 'system:commerce-order-reconciliation',
+        cohortHash: automaticShopifySummary.cohortHash,
+      },
+      {
+        candidateGlobalId: 'gcoc0000024',
+        rowVersion: 25,
+        reasonCode: 'validation_blocked',
+        runGlobalId: automaticShopifyFetch.command.runGlobalId,
+        actorEmail: 'system:commerce-order-reconciliation',
+        cohortHash: automaticShopifySummary.cohortHash,
+      },
+      {
+        candidateGlobalId: 'gcoc0000026',
+        rowVersion: 26,
+        reasonCode: 'checkout_rate_lineage_missing',
+        runGlobalId: automaticShopifyFetch.command.runGlobalId,
+        actorEmail: 'system:commerce-order-reconciliation',
+        cohortHash: automaticShopifySummary.cohortHash,
+      },
+    ],
+    'Only candidates encountered as actionable by the enabled Shopify path reach the durable provenance boundary',
+  )
+  assert.ok(
+    !automaticShopifyAttentionCommands.some((entry) => (
+      entry.input.candidateGlobalId === 'gcoc0000020'
+      || entry.input.candidateGlobalId === 'gcoc0000025'
+    )),
+    'Successful promotion and an already-known canonical dedupe must never reach the marker command',
+  )
   const automaticShopifyCommands = persistenceCommands
     .slice(automaticShopifyCommandStart)
     .filter((entry) => entry.input.candidateGlobalId === 'gcoc0000020')
