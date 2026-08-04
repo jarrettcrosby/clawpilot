@@ -3946,23 +3946,31 @@ export default function CommerceIntakeWorkflow({
                     size="small"
                     label={`${
                       orderReconciliation?.recordsSeen || 0
-                    } provider records read`}
+                    } provider order rows scanned`}
                   />
+                  {orderPagination ? (
+                    <Chip
+                      size="small"
+                      label={`${
+                        orderPagination.eligibleOrdersSeen
+                      } eligible order rows in latest page`}
+                    />
+                  ) : null}
                   <Chip
                     size="small"
                     label={`${
                       orderReconciliation?.recordsHeld || 0
                     } held or rejected for review`}
                   />
-                  {orderReconciliation?.canonicalOrderWrites ? (
-                    <Chip
-                      size="small"
-                      color="success"
-                      label={`${
-                        orderReconciliation.canonicalOrderWrites
-                      } orders promoted automatically`}
-                    />
-                  ) : null}
+                  <Chip
+                    size="small"
+                    color={orderReconciliation?.canonicalOrderWrites
+                      ? 'success'
+                      : 'default'}
+                    label={`${
+                      orderReconciliation?.canonicalOrderWrites || 0
+                    } ClawPilot orders added`}
+                  />
                   {orderReconciliation?.resumable ? (
                     <Chip
                       size="small"
@@ -3976,11 +3984,15 @@ export default function CommerceIntakeWorkflow({
                   />
                 </Stack>
                 <Typography variant="caption" color="text.secondary">
-                  Provider reads remain read-only. Fresh, unambiguous Faire
-                  orders may be promoted locally into ClawPilot automatically;
-                  held records remain available for review. This step does not
-                  reserve inventory, create shipments, or write back to the
-                  provider.
+                  Scanned rows are provider order rows checked, not ClawPilot
+                  orders added. ClawPilot filters ineligible rows and
+                  deduplicates already-known orders before an eligible row can
+                  be held for review or added automatically when the channel
+                  safety policy permits. The eligible count is for the latest
+                  provider page; held or rejected and ClawPilot-order counts
+                  are current scan results.
+                  This read-only step does not reserve inventory, create
+                  shipments, or write back to the provider.
                 </Typography>
                 {orderReconciliation
                   ?.automaticPromotionAttentionRequired ? (

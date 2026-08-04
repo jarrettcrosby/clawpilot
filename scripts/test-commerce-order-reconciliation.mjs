@@ -589,11 +589,21 @@ includes(intakeWorkflowSource, [
   'resetRequired: boolean',
   'automaticPromotionAttentionRequired: boolean',
   'automatic local Faire order promotion needs attention',
-  'Provider reads remain read-only.',
+  'provider order rows scanned',
+  'eligible order rows in latest page',
+  'ClawPilot orders added',
+  'Scanned rows are provider order rows checked, not ClawPilot',
+  'filters ineligible rows and',
+  'deduplicates already-known orders',
+  'This read-only step does not reserve inventory, create',
   "'reset-order-reconciliation'",
   'Restart automatic staging',
   'ClawPilot will not reuse the terminal continuation.',
 ], 'Order-reconciliation operator recovery')
+assert.ok(
+  !intakeWorkflowSource.includes('provider records read'),
+  'Order reconciliation must not present scanned provider rows as orders added',
+)
 assert.ok(
   !intakeSource.includes('updatedAtMin: page.windowStart')
     && !intakeSource.includes('initialWindowStart'),
