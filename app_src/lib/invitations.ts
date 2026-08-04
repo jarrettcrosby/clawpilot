@@ -273,9 +273,12 @@ export async function createUserInvitation(input: {
   }> = []
   let invitation: IssuedInvitationRow | null = null
   const requestedOrganizationIds = normalizeOrganizationIds(input.organizationIds)
-  const organizationIds = requestedOrganizationIds.includes(assignment.organization.id)
-    ? requestedOrganizationIds
-    : [assignment.organization.id, ...requestedOrganizationIds]
+  const organizationIds = [
+    assignment.organization.id,
+    ...requestedOrganizationIds.filter((organizationId) => (
+      organizationId !== assignment.organization.id
+    )),
+  ]
   try {
     const invited = await inviteAppUser({
       actorEmail: actor,

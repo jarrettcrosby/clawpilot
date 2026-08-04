@@ -296,9 +296,7 @@ export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
     apiVersion: SHOPIFY_ADMIN_API_VERSION,
     requiredBeforeConnect: [
       'Create a merchant-owned app in Shopify Dev Dashboard.',
-      'Grant these exact app scopes before release:',
-      ...SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
-      'Create and release an app version with least-privilege scopes.',
+      'Configure the exact ClawPilot app scopes shown below, then create and release the app version.',
       'Install the app on a store in the same Shopify organization.',
       'Copy the canonical myshopify.com domain, client ID, and client secret.',
     ],

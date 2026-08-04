@@ -353,11 +353,7 @@ export async function verifyAuthMagicCode(
           `UPDATE app_user_organization_memberships
            SET status = 'active', updated_at = now()
            WHERE user_email = $1
-             AND organization_id = $2::uuid
-             AND (
-               organization_id = $2::uuid
-               OR organization_id = ANY($3::uuid[])
-             )
+             AND organization_id = ANY($3::uuid[])
              AND status = 'invited'
            RETURNING organization_id::text`,
           [

@@ -442,7 +442,15 @@ assertIncludes(magicCodeAdapter, 'UPDATE app_user_invitations', 'atomic invitati
 assertIncludes(magicCodeAdapter, 'AUTHORIZATION_CHANGED', 'invitation authorization rollback')
 assertIncludes(magicCodeAdapter, 'membership.organization_id = invitation.workspace_organization_id', 'invitation organization acceptance boundary')
 assertIncludes(magicCodeAdapter, 'UPDATE app_user_organization_memberships', 'invitation membership activation')
-assertIncludes(magicCodeAdapter, 'AND organization_id = $2::uuid', 'invitation-specific membership activation')
+assertIncludes(magicCodeAdapter, 'AND organization_id = ANY($3::uuid[])', 'multi-organization invitation membership activation')
+const invitationMembershipActivation = magicCodeAdapter.slice(
+  magicCodeAdapter.indexOf('const activatedMembership'),
+  magicCodeAdapter.indexOf('const activated ='),
+)
+assert.ok(
+  !invitationMembershipActivation.includes('organization_id = $2::uuid'),
+  'multi-organization invitation acceptance must not be restricted to the primary organization',
+)
 
 const documentsAdapter = read('app_src/lib/documents.ts')
 assertIncludes(documentsAdapter, 'WHERE owner_email = $1', 'user-scoped document reads')

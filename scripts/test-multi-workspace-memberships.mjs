@@ -217,7 +217,8 @@ for (const fragment of [
 
 const userInviteDialog = read('app_src/components/settings/UserAccessDialog.tsx')
 for (const fragment of [
-  'Add additional organizations',
+  'Additional organizations',
+  'No other workspace organizations are available in this account graph',
   'organizationIds',
   'inviteOrganizationOptions',
 ]) {
@@ -240,9 +241,16 @@ for (const fragment of [
   'workspace_organization_ids',
   'organizationIds',
   'assignment.organization.id',
+  'requestedOrganizationIds.filter',
 ]) {
   assertIncludes(invitations, fragment, 'invitation multi-org persistence')
 }
+
+assert.ok(
+  invitations.indexOf('assignment.organization.id')
+    < invitations.indexOf('requestedOrganizationIds.filter'),
+  'the explicitly selected primary organization must remain first in the invitation organization list',
+)
 
 assert.ok(
   fs.existsSync(path.join(root, 'db/migrations/0235_app_user_invitation_organization_ids.sql')),
@@ -253,11 +261,20 @@ const authMagicCode = read('app_src/lib/authMagicCode.ts')
 for (const fragment of [
   'membership.organization_id = invitation.workspace_organization_id',
   "membership.status = 'invited'",
-  'AND organization_id = $2::uuid',
+  'AND organization_id = ANY($3::uuid[])',
   'organization_id: invitation.rows[0].workspace_organization_id',
 ]) {
   assertIncludes(authMagicCode, fragment, 'organization-specific invitation acceptance')
 }
+
+const invitationActivationSource = authMagicCode.slice(
+  authMagicCode.indexOf('const activatedMembership'),
+  authMagicCode.indexOf('const activated ='),
+)
+assert.ok(
+  !invitationActivationSource.includes('organization_id = $2::uuid'),
+  'invitation acceptance must not restrict activation to only the primary organization',
+)
 
 const magicVerifyRoute = read('app_src/app/api/auth/magic/verify/route.ts')
 assertIncludes(magicVerifyRoute, 'requireWorkspaceAppUser(result.email, result.organizationId)', 'invitation workspace session issuance')

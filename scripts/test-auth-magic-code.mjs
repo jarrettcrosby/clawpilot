@@ -275,9 +275,13 @@ try {
   assert.ok(authModule.source.includes('FOR UPDATE'))
   assert.ok(authModule.source.includes('membership.organization_id = invitation.workspace_organization_id'))
   assert.ok(authModule.source.includes("membership.status = 'invited'"))
-  assert.ok(authModule.source.includes('OR organization_id = ANY($3::uuid[])'))
+  const invitationActivationSource = authModule.source.slice(
+    authModule.source.indexOf('const activatedMembership'),
+    authModule.source.indexOf('const activated ='),
+  )
+  assert.ok(invitationActivationSource.includes('AND organization_id = ANY($3::uuid[])'))
+  assert.ok(!invitationActivationSource.includes('organization_id = $2::uuid'))
   assert.ok(authModule.source.includes('workspace_organization_ids'))
-  assert.ok(authModule.source.includes('AND organization_id = $2::uuid'))
   assert.ok(authModule.source.includes('workspace_organization_ids::uuid[]'))
   assert.ok(!authModule.source.includes('console.'))
 

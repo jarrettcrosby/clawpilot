@@ -1113,17 +1113,25 @@ export default function CommerceIntegrationPanel() {
         </DialogTitle>
         <DialogContent>
           <Typography variant="body2" color="text.secondary">
-            Open these items in the provider portal before connecting in ClawPilot.
+            Complete these provider-side steps in order, then return to ClawPilot to verify the connection.
           </Typography>
-          <Stack spacing={1} sx={{ mt: 1.5 }}>
+          <Stack component="ol" spacing={1} sx={{ mt: 1.5, mb: 0, pl: 2.5 }}>
             {(setupChecklistCatalog?.requiredBeforeConnect || []).map((step, index) => (
-              <Typography key={step} variant="body2">
-                {index + 1}. {step}
+              <Typography component="li" key={step} variant="body2" sx={{ pl: 0.5 }}>
+                <strong>Step {index + 1}.</strong> {step}
               </Typography>
             ))}
           </Stack>
           {setupChecklistScopes.length ? (
-            <Box sx={{ mt: 1.5 }}>
+            <Box
+              sx={{
+                mt: 2,
+                border: 1,
+                borderColor: 'divider',
+                borderRadius: 1.5,
+                p: 1.5,
+              }}
+            >
               <Stack
                 direction={{ xs: 'column', sm: 'row' }}
                 spacing={1}
@@ -1145,7 +1153,7 @@ export default function CommerceIntegrationPanel() {
                 </Button>
               </Stack>
               <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
-                Use these values exactly in the provider scope screen.
+                Copy this list into the provider app-version permission screen. ClawPilot verifies the granted permissions before enabling each capability.
               </Typography>
               <Stack direction="row" gap={0.75} flexWrap="wrap">
                 {setupChecklistScopes.map((scope) => (
@@ -1156,28 +1164,50 @@ export default function CommerceIntegrationPanel() {
                   />
                 ))}
               </Stack>
-              {setupChecklistProvider === 'shopify'
-                && catalog?.onboarding.shopify.receiptProofScopes?.length ? (
-                <Box sx={{ mt: 1.5 }}>
-                  <Typography variant="subtitle2" sx={{ mb: 0.75 }}>
-                    Required receipt-proof scopes (minimum)
-                  </Typography>
-                  <Stack direction="row" gap={0.75} flexWrap="wrap">
-                    {catalog.onboarding.shopify.receiptProofScopes.map((scope) => (
-                      <Chip
-                        key={`receipt-${scope}`}
-                        size="small"
-                        variant="outlined"
-                        label={`${setupChecklistProvider}: ${scope}`}
-                      />
-                    ))}
-                  </Stack>
-                </Box>
-              ) : null}
             </Box>
           ) : null}
         </DialogContent>
-        <DialogActions>
+        <DialogActions sx={{ px: 3, pb: 2, flexWrap: 'wrap' }}>
+          {setupChecklistProvider === 'shopify' && catalog ? (
+            <>
+              <Button
+                href={catalog.onboarding.shopify.developerPortalUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                endIcon={<OpenInNewRounded />}
+              >
+                Shopify dashboard
+              </Button>
+              <Button
+                href={catalog.onboarding.shopify.setupGuideUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                endIcon={<OpenInNewRounded />}
+              >
+                Setup guide
+              </Button>
+            </>
+          ) : null}
+          {setupChecklistProvider === 'faire' && catalog ? (
+            <>
+              <Button
+                href={catalog.onboarding.faire.developerPortalUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                endIcon={<OpenInNewRounded />}
+              >
+                Faire developer portal
+              </Button>
+              <Button
+                href={catalog.onboarding.faire.directTokenGuideUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                endIcon={<OpenInNewRounded />}
+              >
+                API key guide
+              </Button>
+            </>
+          ) : null}
           <Button onClick={() => setSetupChecklistProvider(null)}>Close</Button>
         </DialogActions>
       </Dialog>
@@ -1230,23 +1260,10 @@ export default function CommerceIntegrationPanel() {
                   </Button>
                 ) : null}
               </Stack>
-              {catalog?.providers.shopify.providerScopes?.length ? (
-                <Stack direction="row" gap={0.75} flexWrap="wrap">
-                  <Typography variant="caption" color="text.secondary" sx={{ width: '100%' }}>
-                    Required app scopes
-                  </Typography>
-                  {catalog.providers.shopify.providerScopes.map((scope) => (
-                    <Chip
-                      key={scope}
-                      size="small"
-                      label={`shopify:${scope}`}
-                    />
-                  ))}
-                </Stack>
-              ) : null}
               <IntegrationSetupJourney
                 title="Before you connect · Shopify setup"
                 description="Follow the provider steps in order. Expand this journey later to review the current nonsecret operating facts."
+                defaultExpanded={false}
                 steps={[
                   {
                     key: 'shopify-app',
@@ -1601,23 +1618,10 @@ export default function CommerceIntegrationPanel() {
                   </Button>
                 ) : null}
               </Stack>
-              {catalog?.providers.faire.providerScopes?.length ? (
-                <Stack direction="row" gap={0.75} flexWrap="wrap">
-                  <Typography variant="caption" color="text.secondary" sx={{ width: '100%' }}>
-                    Required app scopes
-                  </Typography>
-                  {catalog.providers.faire.providerScopes.map((scope) => (
-                    <Chip
-                      key={scope}
-                      size="small"
-                      label={`faire:${scope}`}
-                    />
-                  ))}
-                </Stack>
-              ) : null}
               <IntegrationSetupJourney
                 title="Before you connect · Faire setup"
                 description="Follow the provider-side path that matches the credential Faire issued. The generated brand API key and OAuth application credentials are different values."
+                defaultExpanded={false}
                 steps={[
                   {
                     key: 'faire-path',

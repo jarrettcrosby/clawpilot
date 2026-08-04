@@ -1273,11 +1273,11 @@ export default function UserAccessDialog({
                       </TextField>
                     </>
                   ) : null}
-                  {additionalOrganizationOptions.length ? (
-                    <Box sx={{ gridColumn: { sm: '1 / -1' } }}>
-                      <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.25 }}>
-                        Add additional organizations (member access on first sign-in):
-                      </Typography>
+                  <Box sx={{ gridColumn: { sm: '1 / -1' } }}>
+                    <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.25 }}>
+                      Additional organizations (optional member access on first sign-in)
+                    </Typography>
+                    {additionalOrganizationOptions.length ? (
                       <Box
                         sx={{
                           mt: 0.75,
@@ -1326,8 +1326,14 @@ export default function UserAccessDialog({
                           })}
                         </Box>
                       </Box>
-                    </Box>
-                  ) : null}
+                    ) : (
+                      <Alert severity="info" variant="outlined" sx={{ mt: 0.75 }}>
+                        No other workspace organizations are available in this account graph.
+                        Choose <strong>Create child organization</strong> above to create one with this invitation,
+                        or invite this person to the selected primary organization only.
+                      </Alert>
+                    )}
+                  </Box>
                   <Box sx={{ gridColumn: { sm: '1 / -1' }, px: 0.25 }}>
                     <FormControlLabel
                       control={(
