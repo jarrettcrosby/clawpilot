@@ -117,6 +117,16 @@ assert.doesNotMatch(persistence, /commerce_external_effect/iu)
 assert.doesNotMatch(persistence, /provider_attempt/iu)
 assert.doesNotMatch(persistence, /\bfetch\s*\(/u)
 
+const productImagePanel = read(
+  'app_src/components/crm/ProductImagePanel.tsx',
+)
+assert.ok(
+  productImagePanel.includes(
+    "if (source === 'suitecrm_import') return 'SuiteCRM import'",
+  ),
+  'SuiteCRM-imported Product image revisions must not be labeled as manual uploads',
+)
+
 const worker = read('app_src/lib/crm/suiteCrmProductImageIngestion.ts')
 for (const contract of [
   'crm.suitecrm.product_image_ingestion.cursor',
