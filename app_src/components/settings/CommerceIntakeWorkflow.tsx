@@ -2139,9 +2139,9 @@ export default function CommerceIntakeWorkflow({
       : issueRecordCount > 0
         ? {
             label: `Review ${issueRecordCount} ${
-              issueRecordCount === 1 ? 'issue' : 'issues'
+              issueRecordCount === 1 ? 'exception' : 'exceptions'
             }`,
-            detail: 'Grouped provider failures and order blockers show what can be fixed next.',
+            detail: 'Retained provider rejections and blocked order candidates show what genuinely needs attention.',
             tab: 'issues' as WorkbenchTab,
           }
         : candidates.length > 0
@@ -3714,7 +3714,7 @@ export default function CommerceIntakeWorkflow({
                 size="small"
                 color={issueRecordCount ? 'warning' : 'default'}
                 label={`${issueRecordCount} ${
-                  issueRecordCount === 1 ? 'issue' : 'issues'
+                  issueRecordCount === 1 ? 'exception' : 'exceptions'
                 }`}
               />
             </Stack>
@@ -3788,13 +3788,13 @@ export default function CommerceIntakeWorkflow({
               id={`commerce-intake-tab-orders-${accountGlobalId}`}
               aria-controls={`commerce-intake-panel-orders-${accountGlobalId}`}
               value="orders"
-              label={`Orders (${candidates.length})`}
+              label={`Order candidates (${candidates.length})`}
             />
             <Tab
               id={`commerce-intake-tab-issues-${accountGlobalId}`}
               aria-controls={`commerce-intake-panel-issues-${accountGlobalId}`}
               value="issues"
-              label={`Issues (${issueRecordCount})`}
+              label={`Exceptions (${issueRecordCount})`}
             />
           </Tabs>
         </Box>
@@ -3960,7 +3960,7 @@ export default function CommerceIntakeWorkflow({
                     size="small"
                     label={`${
                       orderReconciliation?.recordsHeld || 0
-                    } held or rejected for review`}
+                    } new rows held/rejected in this scan`}
                   />
                   <Chip
                     size="small"
@@ -3982,6 +3982,20 @@ export default function CommerceIntakeWorkflow({
                     size="small"
                     label="0 provider writes"
                   />
+                  <Chip
+                    size="small"
+                    color={candidates.length ? 'warning' : 'default'}
+                    label={`${candidates.length} retained order ${
+                      candidates.length === 1 ? 'candidate' : 'candidates'
+                    }`}
+                  />
+                  <Chip
+                    size="small"
+                    color={totalRejectionCount ? 'warning' : 'default'}
+                    label={`${totalRejectionCount} retained provider ${
+                      totalRejectionCount === 1 ? 'rejection' : 'rejections'
+                    }`}
+                  />
                 </Stack>
                 <Typography variant="caption" color="text.secondary">
                   Scanned rows are provider order rows checked, not ClawPilot
@@ -3989,8 +4003,11 @@ export default function CommerceIntakeWorkflow({
                   deduplicates already-known orders before an eligible row can
                   be held for review or added automatically when the channel
                   safety policy permits. The eligible count is for the latest
-                  provider page; held or rejected and ClawPilot-order counts
-                  are current scan results.
+                  provider page; new held/rejected and ClawPilot-order counts
+                  are current scan results. Retained order candidates and
+                  provider rejections remain visible across scans for their
+                  review-retention window, so they are not new outcomes from
+                  the latest page.
                   This read-only step does not reserve inventory, create
                   shipments, or write back to the provider.
                 </Typography>
