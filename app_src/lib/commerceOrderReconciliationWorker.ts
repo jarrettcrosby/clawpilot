@@ -1,5 +1,13 @@
 import { createHash } from 'node:crypto'
-import { commerceIntakeRuntimeAvailable, executeCommerceOrderPage } from '@/lib/integrations/commerceIntake'
+import {
+  commerceIntakeRuntimeAvailable,
+  executeCommerceFaireOrderExactRefresh,
+  executeCommerceOrderPage,
+} from '@/lib/integrations/commerceIntake'
+import {
+  markAutomaticFaireOrderPromotionAttentionInPostgres,
+  readAutomaticFaireExactRefreshTargetsInPostgres,
+} from '@/lib/persistence/commerceIntake'
 import {
   shopifyAutomaticOrderPromotionCohort,
 } from '@/lib/integrations/commerceShopifyAutomaticPromotion'
@@ -42,6 +50,54 @@ function deterministicContinuationUuid(input: {
     accountGlobalId: input.accountGlobalId,
     credentialVersion: input.credentialVersion,
     startedAt: `continuation:${input.continuationRunGlobalId}`,
+  })
+}
+
+function deterministicFaireExactRefreshUuid(input: {
+  organizationId: string
+  accountGlobalId: string
+  credentialVersion: number
+  candidateGlobalId: string
+  sourceHash: string
+  cohortHash: string
+  notBefore: string
+}) {
+  return deterministicRunUuid({
+    organizationId: input.organizationId,
+    accountGlobalId: input.accountGlobalId,
+    credentialVersion: input.credentialVersion,
+    startedAt: [
+      'faire-exact-refresh-v1',
+      input.candidateGlobalId,
+      input.sourceHash,
+      input.cohortHash,
+      input.notBefore,
+    ].join(':'),
+  })
+}
+
+function deterministicFaireAttentionUuid(input: {
+  organizationId: string
+  accountGlobalId: string
+  credentialVersion: number
+  candidateGlobalId: string
+  sourceHash: string
+  reasonCode: string
+  cohortHash: string
+  notBefore: string
+}) {
+  return deterministicRunUuid({
+    organizationId: input.organizationId,
+    accountGlobalId: input.accountGlobalId,
+    credentialVersion: input.credentialVersion,
+    startedAt: [
+      'faire-auto-promotion-attention-v1',
+      input.candidateGlobalId,
+      input.sourceHash,
+      input.reasonCode,
+      input.cohortHash,
+      input.notBefore,
+    ].join(':'),
   })
 }
 
@@ -113,6 +169,7 @@ const MAX_PAGES_PER_RECONCILIATION = 5
 const MAX_PROVIDER_RECORDS_PER_RECONCILIATION = 250
 const MAX_RECONCILIATION_RUNTIME_MS = 180_000
 const MIN_REMAINING_RUNTIME_FOR_PAGE_MS = 30_000
+const MIN_REMAINING_RUNTIME_FOR_EXACT_REFRESH_MS = 30_000
 const PROVIDER_PAGE_RECORD_LIMIT = {
   shopify: 25,
   faire: 50,
@@ -147,6 +204,21 @@ const MAX_PROVIDER_RECORDS_PER_SESSION = configuredInteger(
   5_000,
   1_000_000,
 )
+const MAX_FAIRE_EXACT_REFRESHES_PER_RECONCILIATION = configuredInteger(
+  'CLAWPILOT_COMMERCE_ORDER_MAX_FAIRE_EXACT_REFRESHES',
+  10,
+  1,
+  25,
+)
+
+function reconciliationFailureCode(error: unknown) {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? String((error as { code?: unknown }).code || '')
+    : ''
+  return /^[A-Z][A-Z0-9_]{2,127}$/u.test(code)
+    ? code
+    : 'COMMERCE_FAIRE_EXACT_REFRESH_FAILED'
+}
 
 function reconciliationError(code: string, message: string) {
   const error = new Error(message) as Error & { code?: string }
@@ -154,17 +226,36 @@ function reconciliationError(code: string, message: string) {
   return error
 }
 
+async function persistAutomaticFaireAttention(
+  input: Parameters<
+    typeof markAutomaticFaireOrderPromotionAttentionInPostgres
+  >[0],
+) {
+  try {
+    return await markAutomaticFaireOrderPromotionAttentionInPostgres(input)
+  } catch (cause) {
+    const error = new Error(
+      'Automatic Faire operator attention could not be durably persisted',
+      { cause },
+    ) as Error & { code?: string }
+    error.code = 'COMMERCE_FAIRE_AUTO_PROMOTION_ATTENTION_PERSIST_FAILED'
+    throw error
+  }
+}
+
 /**
  * Follows the encrypted continuation chain within strict invocation and
  * session budgets. A bounded invocation stores its continuation for the next
  * poll; a session that is too large fails closed for operator review.
  * It stages candidates and normalization rejections, then permits a bounded
- * local-only promotion for a newly observed order whose customer, provider
- * variant/SKU, quantity, address, delivery, and packaging evidence is
+ * local-only promotion for a newly observed order whose customer,
+ * provider variant/SKU, quantity, address, delivery, and packaging evidence is
  * unambiguous. Shopify additionally requires its exact default-off development
- * account cohort and one matched checkout quote. It never derives packages or shipments,
- * changes inventory, or calls a provider write API. Existing held
- * orders and any ambiguous/error candidates remain held for operator review.
+ * account cohort and one matched checkout quote. A bounded worker-only exact
+ * read can supersede an untouched, stale Faire list candidate; ambiguous,
+ * operator-owned, or failed evidence remains held for review.
+ * It never derives packages or shipments, changes inventory, or calls a
+ * provider write API.
  */
 export async function processCommerceOrderReconciliation(input: {
   limit?: number
@@ -217,9 +308,21 @@ export async function processCommerceOrderReconciliation(input: {
         held: 0,
         failed: 0,
         failedByCode: {},
+        attentionRequiredAccounts: 0,
         operatorReviewRequired: 0,
         providerWrites: 0,
         canonicalOrderWrites: 0,
+        inventoryWrites: 0,
+        syncCursorAdvanced: false,
+      },
+      automaticFaireExactRefresh: {
+        attempted: 0,
+        succeeded: 0,
+        rejected: 0,
+        failed: 0,
+        failedByCode: {},
+        operatorReviewRequired: 0,
+        providerWrites: 0,
         inventoryWrites: 0,
         syncCursorAdvanced: false,
       },
@@ -249,6 +352,7 @@ export async function processCommerceOrderReconciliation(input: {
   let pageBudgetStops = 0
   let recordBudgetStops = 0
   let timeBudgetStops = 0
+  let exactRefreshBudgetStops = 0
   let customersMatched = 0
   let customersCreated = 0
   let customersAmbiguous = 0
@@ -263,6 +367,13 @@ export async function processCommerceOrderReconciliation(input: {
   let faireOrdersPromoted = 0
   let faireOrdersHeld = 0
   let fairePromotionFailed = 0
+  let faireOperatorReviewRequired = 0
+  let fairePromotionAttentionRequiredAccounts = 0
+  let faireExactRefreshAttempted = 0
+  let faireExactRefreshSucceeded = 0
+  let faireExactRefreshRejected = 0
+  let faireExactRefreshFailed = 0
+  const faireExactRefreshFailureCodes: Record<string, number> = {}
   const fairePromotionFailureCodes: Record<string, number> = {}
   const shopifyPromotionHeldReasons: Record<string, number> = {}
   const shopifyPromotionFailureCodes: Record<string, number> = {}
@@ -292,12 +403,25 @@ export async function processCommerceOrderReconciliation(input: {
       let targetFaireOrdersPromoted = 0
       let targetFaireOrdersHeld = 0
       let targetFairePromotionFailed = 0
+      let targetFaireOperatorReviewRequired = 0
+      let targetFaireExactRefreshAttempted = 0
+      let targetFaireExactRefreshSucceeded = 0
+      let targetFaireExactRefreshRejected = 0
+      let targetFaireExactRefreshFailed = 0
+      let targetFaireExactRefreshPaused = false
+      const targetFaireExactRefreshAttemptedCandidates = new Set<string>()
+      const targetFaireExactRefreshFailureCodes: Record<string, number> = {}
       const targetFairePromotionFailureCodes: Record<string, number> = {}
       const targetShopifyPromotionHeldReasons: Record<string, number> = {}
       const targetShopifyPromotionFailureCodes: Record<string, number> = {}
       const targetCustomerResolutionFailureCodes: Record<string, number> = {}
       let hasNextBatch = false
-      let budgetStopReason: 'page' | 'records' | 'time' | null = null
+      let budgetStopReason:
+        | 'page'
+        | 'records'
+        | 'time'
+        | 'exact-refresh'
+        | null = null
       let priorBatchNumber = target.continuationBatchNumber
       const seenRunGlobalIds = new Set<string>()
       if (continuationRunGlobalId) {
@@ -409,6 +533,9 @@ export async function processCommerceOrderReconciliation(input: {
         targetFairePromotionFailed += count(
           automaticFaireOrderPromotion.failed,
         )
+        targetFaireOperatorReviewRequired += count(
+          automaticFaireOrderPromotion.operatorReviewRequired,
+        )
         const failedByCode = record(automaticCustomerResolution.failedByCode)
         for (const [code, value] of Object.entries(failedByCode)) {
           if (!/^[A-Z][A-Z0-9_]{2,127}$/u.test(code)) continue
@@ -507,33 +634,254 @@ export async function processCommerceOrderReconciliation(input: {
         const next = typeof pagination.continuationRunGlobalId === 'string'
           ? pagination.continuationRunGlobalId
           : null
-        if (!hasNextBatch) {
-          continuationRunGlobalId = null
-          break
-        }
-        if (!next) {
+        if (hasNextBatch && !next) {
           const error = new Error('Order page did not return a continuation handle') as Error & { code?: string }
           error.code = 'COMMERCE_ORDER_RECONCILIATION_CONTINUATION_MISSING'
           throw error
         }
-        if (seenRunGlobalIds.has(next)) {
+        if (next && seenRunGlobalIds.has(next)) {
           throw reconciliationError(
             'COMMERCE_ORDER_RECONCILIATION_CONTINUATION_REPEATED',
             'Order reconciliation repeated a continuation handle',
           )
         }
-        seenRunGlobalIds.add(next)
-        if (batchNumber >= MAX_PAGES_PER_SESSION) {
+        if (next) seenRunGlobalIds.add(next)
+        if (hasNextBatch && batchNumber >= MAX_PAGES_PER_SESSION) {
           throw reconciliationError(
             'COMMERCE_ORDER_RECONCILIATION_SESSION_PAGE_BUDGET_EXCEEDED',
             'Order reconciliation session reached its provider-page budget',
           )
         }
-        if (target.recordsSeen >= MAX_PROVIDER_RECORDS_PER_SESSION) {
+        if (
+          hasNextBatch
+          && target.recordsSeen >= MAX_PROVIDER_RECORDS_PER_SESSION
+        ) {
           throw reconciliationError(
             'COMMERCE_ORDER_RECONCILIATION_SESSION_RECORD_BUDGET_EXCEEDED',
             'Order reconciliation session reached its provider-record budget',
           )
+        }
+
+        if (
+          target.provider === 'faire'
+          && !targetFaireExactRefreshPaused
+          && targetFaireExactRefreshAttempted
+            < MAX_FAIRE_EXACT_REFRESHES_PER_RECONCILIATION
+        ) {
+          if (
+            clock() - targetStartedAtMs
+              >= MAX_RECONCILIATION_RUNTIME_MS
+                - MIN_REMAINING_RUNTIME_FOR_EXACT_REFRESH_MS
+          ) {
+            budgetStopReason = 'time'
+          } else {
+            const exactTargets =
+              await readAutomaticFaireExactRefreshTargetsInPostgres({
+                runtime: {
+                  organizationId: target.organizationId,
+                  globalId: target.accountGlobalId,
+                  provider: target.provider,
+                  credentialVersion: target.credentialVersion,
+                },
+                preferredRunGlobalId: stagedRunGlobalId,
+                limit: MAX_FAIRE_EXACT_REFRESHES_PER_RECONCILIATION
+                  - targetFaireExactRefreshAttempted,
+                excludedCandidateGlobalIds: [
+                  ...targetFaireExactRefreshAttemptedCandidates,
+                ],
+              })
+            for (const exactTarget of exactTargets) {
+              if (
+                clock() - targetStartedAtMs
+                  >= MAX_RECONCILIATION_RUNTIME_MS
+                    - MIN_REMAINING_RUNTIME_FOR_EXACT_REFRESH_MS
+              ) {
+                budgetStopReason = 'time'
+                break
+              }
+              targetFaireExactRefreshAttemptedCandidates.add(
+                exactTarget.candidateGlobalId,
+              )
+              targetFaireExactRefreshAttempted += 1
+              try {
+                const exactResponse =
+                  await executeCommerceFaireOrderExactRefresh({
+                    organizationId: target.organizationId,
+                    accountGlobalId: target.accountGlobalId,
+                    actorEmail: 'system:commerce-order-reconciliation',
+                    idempotencyKey: deterministicFaireExactRefreshUuid({
+                      organizationId: target.organizationId,
+                      accountGlobalId: target.accountGlobalId,
+                      credentialVersion: target.credentialVersion,
+                      candidateGlobalId: exactTarget.candidateGlobalId,
+                      sourceHash: exactTarget.sourceHash,
+                      cohortHash: exactTarget.cohortHash,
+                      notBefore: exactTarget.notBefore,
+                    }),
+                    candidateGlobalId: exactTarget.candidateGlobalId,
+                    candidateRowVersion: exactTarget.candidateRowVersion,
+                    sourceHash: exactTarget.sourceHash,
+                    expectedCredentialVersion: target.credentialVersion,
+                    cohortHash: exactTarget.cohortHash,
+                    notBefore: exactTarget.notBefore,
+                  })
+                const exactCommand = record(exactResponse.command)
+                assertReconciliationFence(exactCommand)
+                const exactCustomerResolution = record(
+                  exactCommand.automaticCustomerResolution,
+                )
+                const exactFairePromotion = record(
+                  exactCommand.automaticFaireOrderPromotion,
+                )
+                const exactRejected = count(exactCommand.recordsRejected)
+                if (exactRejected > 0) {
+                  targetFaireExactRefreshRejected += exactRejected
+                  const rejectionCode =
+                    'COMMERCE_FAIRE_EXACT_REFRESH_NORMALIZATION_REJECTED'
+                  const attention = await persistAutomaticFaireAttention({
+                    runtime: {
+                      organizationId: target.organizationId,
+                      integrationAccountId: target.integrationAccountId,
+                      globalId: target.accountGlobalId,
+                      provider: 'faire',
+                      credentialVersion: target.credentialVersion,
+                    },
+                    actorEmail: 'system:commerce-order-reconciliation',
+                    idempotencyKey: deterministicFaireAttentionUuid({
+                      organizationId: target.organizationId,
+                      accountGlobalId: target.accountGlobalId,
+                      credentialVersion: target.credentialVersion,
+                      candidateGlobalId: exactTarget.candidateGlobalId,
+                      sourceHash: exactTarget.sourceHash,
+                      reasonCode: rejectionCode,
+                      cohortHash: exactTarget.cohortHash,
+                      notBefore: exactTarget.notBefore,
+                    }),
+                    candidateGlobalId: exactTarget.candidateGlobalId,
+                    candidateRowVersion: exactTarget.candidateRowVersion,
+                    sourceHash: exactTarget.sourceHash,
+                    runGlobalId: exactTarget.originatingRunGlobalId,
+                    reasonCode: rejectionCode,
+                    cohortHash: exactTarget.cohortHash,
+                    notBefore: exactTarget.notBefore,
+                  })
+                  if (record(attention).marked !== false) {
+                    targetFaireOperatorReviewRequired += exactRejected
+                  }
+                  targetFaireExactRefreshFailureCodes[rejectionCode] = (
+                    targetFaireExactRefreshFailureCodes[rejectionCode] || 0
+                  ) + exactRejected
+                } else {
+                  targetFaireExactRefreshSucceeded += 1
+                }
+                targetCustomersMatched += count(
+                  exactCustomerResolution.matched,
+                )
+                targetCustomersCreated += count(
+                  exactCustomerResolution.created,
+                )
+                targetCustomersAmbiguous += count(
+                  exactCustomerResolution.ambiguous,
+                )
+                targetCustomersSkipped += count(
+                  exactCustomerResolution.skipped,
+                )
+                targetCustomerResolutionFailed += count(
+                  exactCustomerResolution.failed,
+                )
+                targetFaireOrdersPromoted += count(
+                  exactFairePromotion.promoted,
+                )
+                targetFaireOrdersHeld += count(exactFairePromotion.held)
+                targetFairePromotionFailed += count(
+                  exactFairePromotion.failed,
+                )
+                targetFaireOperatorReviewRequired += count(
+                  exactFairePromotion.operatorReviewRequired,
+                )
+                for (
+                  const [code, value]
+                  of Object.entries(record(
+                    exactCustomerResolution.failedByCode,
+                  ))
+                ) {
+                  if (!/^[A-Z][A-Z0-9_]{2,127}$/u.test(code)) continue
+                  targetCustomerResolutionFailureCodes[code] = (
+                    targetCustomerResolutionFailureCodes[code] || 0
+                  ) + count(value)
+                }
+                for (
+                  const [code, value]
+                  of Object.entries(record(exactFairePromotion.failedByCode))
+                ) {
+                  if (!/^[A-Z][A-Z0-9_]{2,127}$/u.test(code)) continue
+                  targetFairePromotionFailureCodes[code] = (
+                    targetFairePromotionFailureCodes[code] || 0
+                  ) + count(value)
+                }
+              } catch (error) {
+                if (
+                  reconciliationFailureCode(error)
+                    === 'COMMERCE_ORDER_RECONCILIATION_WRITE_FENCE'
+                  || reconciliationFailureCode(error)
+                    === 'COMMERCE_FAIRE_AUTO_PROMOTION_ATTENTION_PERSIST_FAILED'
+                ) throw error
+                targetFaireExactRefreshFailed += 1
+                const code = reconciliationFailureCode(error)
+                const attention = await persistAutomaticFaireAttention({
+                  runtime: {
+                    organizationId: target.organizationId,
+                    integrationAccountId: target.integrationAccountId,
+                    globalId: target.accountGlobalId,
+                    provider: 'faire',
+                    credentialVersion: target.credentialVersion,
+                  },
+                  actorEmail: 'system:commerce-order-reconciliation',
+                  idempotencyKey: deterministicFaireAttentionUuid({
+                    organizationId: target.organizationId,
+                    accountGlobalId: target.accountGlobalId,
+                    credentialVersion: target.credentialVersion,
+                    candidateGlobalId: exactTarget.candidateGlobalId,
+                    sourceHash: exactTarget.sourceHash,
+                    reasonCode: code,
+                    cohortHash: exactTarget.cohortHash,
+                    notBefore: exactTarget.notBefore,
+                  }),
+                  candidateGlobalId: exactTarget.candidateGlobalId,
+                  candidateRowVersion: exactTarget.candidateRowVersion,
+                  sourceHash: exactTarget.sourceHash,
+                  runGlobalId: exactTarget.originatingRunGlobalId,
+                  reasonCode: code,
+                  cohortHash: exactTarget.cohortHash,
+                  notBefore: exactTarget.notBefore,
+                })
+                if (record(attention).marked !== false) {
+                  targetFaireOperatorReviewRequired += 1
+                }
+                targetFaireExactRefreshFailureCodes[code] = (
+                  targetFaireExactRefreshFailureCodes[code] || 0
+                ) + 1
+                // A provider/read-fence failure pauses exact reads for this
+                // account invocation; list continuation evidence remains
+                // durable and can resume independently.
+                targetFaireExactRefreshPaused = true
+                break
+              }
+            }
+          }
+        }
+        if (
+          targetFaireExactRefreshAttempted
+            >= MAX_FAIRE_EXACT_REFRESHES_PER_RECONCILIATION
+        ) {
+          budgetStopReason = 'exact-refresh'
+        }
+        if (budgetStopReason === 'time' || budgetStopReason === 'exact-refresh') {
+          break
+        }
+        if (!hasNextBatch) {
+          continuationRunGlobalId = null
+          break
         }
         continuationRunGlobalId = next
         // A new continuation has no prior read intent. Its deterministic key
@@ -567,6 +915,12 @@ export async function processCommerceOrderReconciliation(input: {
         faireOrdersHeld: targetFaireOrdersHeld,
         fairePromotionFailed: targetFairePromotionFailed,
         fairePromotionFailureCodes: targetFairePromotionFailureCodes,
+        faireOperatorReviewRequired: targetFaireOperatorReviewRequired,
+        faireExactRefreshAttempted: targetFaireExactRefreshAttempted,
+        faireExactRefreshSucceeded: targetFaireExactRefreshSucceeded,
+        faireExactRefreshRejected: targetFaireExactRefreshRejected,
+        faireExactRefreshFailed: targetFaireExactRefreshFailed,
+        faireExactRefreshFailureCodes: targetFaireExactRefreshFailureCodes,
       })
       if (completion.leaseLost) {
         leaseLost += 1
@@ -591,6 +945,14 @@ export async function processCommerceOrderReconciliation(input: {
         faireOrdersPromoted += targetFaireOrdersPromoted
         faireOrdersHeld += targetFaireOrdersHeld
         fairePromotionFailed += targetFairePromotionFailed
+        faireOperatorReviewRequired += targetFaireOperatorReviewRequired
+        if (completion.faireAutomaticPromotionAttentionRequired) {
+          fairePromotionAttentionRequiredAccounts += 1
+        }
+        faireExactRefreshAttempted += targetFaireExactRefreshAttempted
+        faireExactRefreshSucceeded += targetFaireExactRefreshSucceeded
+        faireExactRefreshRejected += targetFaireExactRefreshRejected
+        faireExactRefreshFailed += targetFaireExactRefreshFailed
         for (
           const [code, value]
           of Object.entries(targetCustomerResolutionFailureCodes)
@@ -623,10 +985,21 @@ export async function processCommerceOrderReconciliation(input: {
             fairePromotionFailureCodes[code] || 0
           ) + value
         }
+        for (
+          const [code, value]
+          of Object.entries(targetFaireExactRefreshFailureCodes)
+        ) {
+          faireExactRefreshFailureCodes[code] = (
+            faireExactRefreshFailureCodes[code] || 0
+          ) + value
+        }
         if (hasNextBatch) resumable += 1
         if (budgetStopReason === 'page') pageBudgetStops += 1
         if (budgetStopReason === 'records') recordBudgetStops += 1
         if (budgetStopReason === 'time') timeBudgetStops += 1
+        if (budgetStopReason === 'exact-refresh') {
+          exactRefreshBudgetStops += 1
+        }
       }
     } catch (error) {
       const failure = await failCommerceOrderReconciliationInPostgres({
@@ -656,10 +1029,15 @@ export async function processCommerceOrderReconciliation(input: {
       MAX_PROVIDER_RECORDS_PER_RECONCILIATION,
     maxProviderRecordsPerSession: MAX_PROVIDER_RECORDS_PER_SESSION,
     maxReconciliationRuntimeMs: MAX_RECONCILIATION_RUNTIME_MS,
+    maxFaireExactRefreshesPerReconciliation:
+      MAX_FAIRE_EXACT_REFRESHES_PER_RECONCILIATION,
+    minRemainingRuntimeForFaireExactRefreshMs:
+      MIN_REMAINING_RUNTIME_FOR_EXACT_REFRESH_MS,
     budgetStops: {
       pages: pageBudgetStops,
       records: recordBudgetStops,
       time: timeBudgetStops,
+      exactRefreshes: exactRefreshBudgetStops,
     },
     resource: 'orders',
     providerWrites: 0,
@@ -703,9 +1081,26 @@ export async function processCommerceOrderReconciliation(input: {
       held: faireOrdersHeld,
       failed: fairePromotionFailed,
       failedByCode: fairePromotionFailureCodes,
-      operatorReviewRequired: faireOrdersHeld + fairePromotionFailed,
+      attentionRequiredAccounts:
+        fairePromotionAttentionRequiredAccounts,
+      operatorReviewRequired: Math.max(
+        faireOperatorReviewRequired,
+        fairePromotionAttentionRequiredAccounts,
+      ),
       providerWrites: 0,
       canonicalOrderWrites: faireOrdersPromoted,
+      inventoryWrites: 0,
+      syncCursorAdvanced: false,
+    },
+    automaticFaireExactRefresh: {
+      attempted: faireExactRefreshAttempted,
+      succeeded: faireExactRefreshSucceeded,
+      rejected: faireExactRefreshRejected,
+      failed: faireExactRefreshFailed,
+      failedByCode: faireExactRefreshFailureCodes,
+      operatorReviewRequired:
+        faireExactRefreshRejected + faireExactRefreshFailed,
+      providerWrites: 0,
       inventoryWrites: 0,
       syncCursorAdvanced: false,
     },

@@ -1992,9 +1992,25 @@ includes(serviceSource, [
   'validateCommerceCandidateInPostgres',
   'promoteCommerceCandidateInPostgres',
   'automaticFaireOrderPromotion',
-  'operatorReviewRequired: held + failed',
+  'automaticFairePromotionHoldRequiresAttention',
+  'markAutomaticFaireOrderPromotionAttentionInPostgres',
+  'automaticFairePromotionCanonicalRace',
+  'COMMERCE_INTAKE_CANONICAL_ORDER_EXISTS',
+  'COMMERCE_INTAKE_ALREADY_PROMOTED',
+  'operatorReviewRequired,',
   'canonicalOrderWrites: promoted',
+  'automaticFairePromotion:',
 ], 'Conservative automatic Faire order promotion orchestration')
+includes(serviceSource, [
+  'export async function executeCommerceFaireOrderExactRefresh',
+  "action: 'refresh'",
+  'providerAttemptActorEmail: null',
+  'refreshTargetExpectation',
+  'candidateRowVersion: input.candidateRowVersion',
+  'sourceHash: input.sourceHash',
+  'expectedCredentialVersion: input.expectedCredentialVersion',
+  'COMMERCE_FAIRE_EXACT_REFRESH_CREDENTIAL_STALE',
+], 'Worker-only revision-fenced Faire exact refresh wrapper')
 includes(serviceSource, [
   "'plan-customer-binding'",
   "'confirm-customer-binding'",
@@ -2048,6 +2064,20 @@ includes(persistenceSource, [
   'party?.organizationName\n        || address?.organizationName\n        || party?.contactName',
 ], 'Automatic customer targets include a bounded account backlog behind a validated run anchor')
 includes(persistenceSource, [
+  'readAutomaticFaireExactRefreshTargetsInPostgres',
+  'WITH anchor AS',
+  "run.created_by = 'system:commerce-order-reconciliation'",
+  "'source_stale' = ANY(candidate.blocking_codes)",
+  '(run.global_id = $3) DESC',
+  'excludedCandidateGlobalIds?: readonly string[]',
+  'NOT candidate.global_id = ANY($6::text[])',
+  'retry_intent.target_global_id = candidate.global_id',
+  'retry_intent.target_source_hash = candidate.source_hash',
+  'history.external_order_id = candidate.external_order_id',
+  "history.created_by\n                   <> 'system:commerce-order-reconciliation'",
+  'operations_commerce_resolution_decisions decision',
+], 'Durable preferred-run Faire exact-refresh backlog selection')
+includes(persistenceSource, [
   'readAutomaticFaireOrderPromotionTargetsForRunInPostgres',
   "run.global_id = $3",
   "run.provider = 'faire'",
@@ -2055,6 +2085,13 @@ includes(persistenceSource, [
   "candidate.workflow_state IN ('held', 'resolving', 'ready')",
   'prior.run_id <> $5::uuid',
   'prior_candidate_requires_review',
+  'unsafe_candidate_history',
+  'exact_refresh_lineage',
+  "exact_intent.intake_action = 'refresh'",
+  'exact_intent.target_global_id',
+  'exact_intent.target_source_hash',
+  'exact_refresh_required',
+  'order_terminal_no_demand',
   'source_age_requires_review',
   "candidate.normalized_order_status !== 'open'",
   "candidate.normalized_fulfillment_status !== 'unfulfilled'",
@@ -2064,7 +2101,40 @@ includes(persistenceSource, [
   'product_sku_or_pack_mapping_requires_review',
   'ship_to_requires_review',
   'delivery_date_requires_review',
+  'operator_owned_history',
 ], 'Fresh-run Faire promotion eligibility and retained-order hold fences')
+includes(persistenceSource, [
+  'markAutomaticFaireOrderPromotionAttentionInPostgres',
+  'commerce.intake.mark_faire_auto_promotion_attention',
+  'commerce.intake.faire_auto_promotion.attention_marked',
+  'AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER',
+  'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_AUTHORITY_STALE',
+  'unsafe_candidate_history',
+  'exact_refresh_lineage',
+], 'Durable Faire attention provenance and final promotion authority fence')
+includes(persistenceSource, [
+  'async function lockCommerceOrderIdentity',
+  "'commerce-intake-order-identity-v1'",
+  'for (const externalOrderId of [...externalOrderIds].sort())',
+  'await lockCommerceOrderIdentity(client, {',
+  'newer.observed_at = current.observed_at',
+  'newer.created_at > current.created_at',
+  'newer.id > current.id',
+], 'Shared staging and promotion order-identity concurrency fence')
+assert.equal(
+  persistenceSource.match(/await lockCommerceOrderIdentity\(client, \{/gu)
+    ?.length,
+  3,
+  'Staging, attention marking, and promotion must share the same order identity lock',
+)
+includes(persistenceSource, [
+  "rejection.resourceType === 'order'",
+  'rejection.externalId === refreshTarget.rows[0].external_order_id',
+  'readIntent.target_external_id_hash',
+  'envelopeMatchesExactOrderTarget(',
+  'COMMERCE_INTAKE_EXACT_ORDER_TARGET_MISMATCH',
+  'COMMERCE_INTAKE_REFRESH_TARGET_MISSING',
+], 'Exact Faire refresh stages a matching normalized rejection and fails closed on identity mismatch')
 assert.ok(
   !persistenceSource.includes('records_failed AS records_rejected'),
   'Normalization rejection counts must come from stage audit evidence',
@@ -2488,7 +2558,7 @@ const shopifyRuntime = {
 const faireRuntime = {
   ...shopifyRuntime,
   integrationAccountId: '33333333-3333-4333-8333-333333333333',
-  globalId: 'gcia0000002',
+  globalId: 'gia0000002',
   provider: 'faire',
   externalAccountId: 'brand-123',
   configuration: {},
@@ -2528,12 +2598,14 @@ const continuations = new Map()
 const readIntents = new Map()
 const readIntentPreparations = []
 const invalidContinuations = []
+const refreshTargetReads = []
 const stageAttempts = []
 const automaticProductSweeps = []
 let automaticCustomerTargets = []
 const automaticCustomerResolverCalls = []
 let automaticFairePromotionTargets = []
 let automaticShopifyPromotionTargets = []
+let automaticFairePromotionFailureCode = null
 const productPolicyUpdates = []
 const customerBindingPlanCalls = []
 const customerBindingConfirmCalls = []
@@ -2545,6 +2617,13 @@ const refreshTargets = new Map([
     provider: 'shopify',
     external_order_id: 'gid://shopify/Order/999',
     source_hash: 'f'.repeat(64),
+    row_version: '0',
+  }],
+  ['gcoc0000020', {
+    provider: 'faire',
+    external_order_id: 'faire-order-exact-worker-1',
+    source_hash: '9'.repeat(64),
+    row_version: '7',
   }],
 ])
 let runSequence = 0
@@ -2595,6 +2674,15 @@ function persistenceCommand(name) {
         marked: false,
         reasonCode: 'canonical_order_exists',
       }
+    }
+    if (name === 'promote' && automaticFairePromotionFailureCode) {
+      const code = automaticFairePromotionFailureCode
+      automaticFairePromotionFailureCode = null
+      throw new MockCommerceIntegrationRequestError(
+        'Simulated concurrent canonical promotion',
+        409,
+        code,
+      )
     }
     return {
       action: name,
@@ -3102,6 +3190,8 @@ const service = loadTypeScriptModule(
         },
         confirmCommerceCandidateAddressInPostgres:
           persistenceCommand('confirm-address'),
+        markAutomaticFaireOrderPromotionAttentionInPostgres:
+          persistenceCommand('mark-faire-auto-attention'),
         markAutomaticShopifyOrderPromotionAttentionInPostgres:
           persistenceCommand('mark-shopify-auto-attention'),
         markCommerceCandidateUnsupportedInPostgres:
@@ -3253,7 +3343,28 @@ const service = loadTypeScriptModule(
           }
         },
         async readCommerceIntakeRefreshTargetFromPostgres(input) {
-          return refreshTargets.get(input.candidateGlobalId)
+          refreshTargetReads.push(input)
+          const target = refreshTargets.get(input.candidateGlobalId)
+          if (
+            target
+            && (
+              (
+                input.expectedSourceHash !== undefined
+                && input.expectedSourceHash !== target.source_hash
+              )
+              || (
+                input.expectedRowVersion !== undefined
+                && input.expectedRowVersion !== Number(target.row_version)
+              )
+            )
+          ) {
+            throw new MockCommerceIntegrationRequestError(
+              'The held order changed before its exact provider read could begin',
+              409,
+              'COMMERCE_INTAKE_REFRESH_TARGET_CHANGED',
+            )
+          }
+          return target
         },
         async markCommerceIntakeContinuationInvalidInPostgres(input) {
           invalidContinuations.push(input)
@@ -3448,9 +3559,26 @@ const savedEnvironment = {
   lane: process.env.CLAWPILOT_ENV,
   shopifyAutoCohort:
     process.env.CLAWPILOT_SHOPIFY_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS,
+  faireAutoCohort:
+    process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS,
+  faireAutoNotBefore:
+    process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE,
 }
 process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED = '1'
 process.env.CLAWPILOT_ENV = 'development'
+process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS =
+  faireRuntime.globalId
+process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE =
+  '2000-01-01T00:00:00.000Z'
+const automaticFaireNotBefore =
+  process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE
+const automaticFaireCohortHash = createHash('sha256')
+  .update('commerce-faire-order-auto-promotion-v1')
+  .update('\0')
+  .update(faireRuntime.globalId)
+  .update('\0')
+  .update(automaticFaireNotBefore)
+  .digest('hex')
 
 assert.equal(
   service.nextFaireCursor(
@@ -4240,6 +4368,7 @@ try {
       reason: null,
       candidateGlobalId: 'gcoc0000010',
       candidateRowVersion: 10,
+      sourceHash: 'a'.repeat(64),
       providerAddress: {
         name: 'Controlled Faire Retailer',
         line1: '100 Test Way',
@@ -4256,6 +4385,7 @@ try {
       reason: 'customer_resolution_required',
       candidateGlobalId: 'gcoc0000011',
       candidateRowVersion: 11,
+      sourceHash: 'b'.repeat(64),
       providerAddress: null,
       deliveryMode: null,
     },
@@ -4264,13 +4394,14 @@ try {
       reason: 'product_sku_or_pack_mapping_requires_review',
       candidateGlobalId: 'gcoc0000012',
       candidateRowVersion: 12,
+      sourceHash: 'c'.repeat(64),
       providerAddress: null,
       deliveryMode: null,
     },
   ]
   const automaticFaireFetch = await service.executeCommerceIntakeCommand({
     organizationId,
-    actorEmail,
+    actorEmail: 'system:commerce-order-reconciliation',
     body: {
       action: 'fetch',
       accountGlobalId: faireRuntime.globalId,
@@ -4284,6 +4415,8 @@ try {
     )),
     {
       policyVersion: 'commerce-faire-order-auto-promotion-v1',
+      cohortHash: automaticFaireCohortHash,
+      notBefore: automaticFaireNotBefore,
       runGlobalId: automaticFaireFetch.command.runGlobalId,
       candidatesFound: 3,
       eligible: 1,
@@ -4325,6 +4458,248 @@ try {
     )).size,
     4,
     'Each automatic Faire command must have a distinct deterministic receipt key',
+  )
+  const automaticFaireAttentionCommands = persistenceCommands
+    .slice(automaticFaireCommandStart)
+    .filter((entry) => entry.name === 'mark-faire-auto-attention')
+  assert.deepEqual(
+    automaticFaireAttentionCommands.map((entry) => ({
+      candidateGlobalId: entry.input.candidateGlobalId,
+      candidateRowVersion: entry.input.candidateRowVersion,
+      sourceHash: entry.input.sourceHash,
+      reasonCode: entry.input.reasonCode,
+      runGlobalId: entry.input.runGlobalId,
+      actorEmail: entry.input.actorEmail,
+    })),
+    [
+      {
+        candidateGlobalId: 'gcoc0000011',
+        candidateRowVersion: 11,
+        sourceHash: 'b'.repeat(64),
+        reasonCode: 'customer_resolution_required',
+        runGlobalId: automaticFaireFetch.command.runGlobalId,
+        actorEmail: 'system:commerce-order-reconciliation',
+      },
+      {
+        candidateGlobalId: 'gcoc0000012',
+        candidateRowVersion: 12,
+        sourceHash: 'c'.repeat(64),
+        reasonCode: 'product_sku_or_pack_mapping_requires_review',
+        runGlobalId: automaticFaireFetch.command.runGlobalId,
+        actorEmail: 'system:commerce-order-reconciliation',
+      },
+    ],
+    'Only actionable Faire holds cross the durable candidate-provenance boundary',
+  )
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      automaticFaireCommands.at(-1).input.automaticFairePromotion,
+    )),
+    {
+      policyVersion: 'commerce-faire-order-auto-promotion-v1',
+      cohortHash: automaticFaireCohortHash,
+      notBefore: automaticFaireNotBefore,
+      runGlobalId: automaticFaireFetch.command.runGlobalId,
+      sourceHash: 'a'.repeat(64),
+    },
+    'The final Faire promotion transaction receives exact policy, run, and source authority',
+  )
+  automaticFairePromotionTargets = [{
+    eligible: true,
+    reason: null,
+    candidateGlobalId: 'gcoc0000013',
+    candidateRowVersion: 13,
+    sourceHash: 'd'.repeat(64),
+    providerAddress: null,
+    deliveryMode: null,
+  }]
+  automaticFairePromotionFailureCode =
+    'COMMERCE_INTAKE_CANONICAL_ORDER_EXISTS'
+  const concurrentCanonicalFetch = await service.executeCommerceIntakeCommand({
+    organizationId,
+    actorEmail: 'system:commerce-order-reconciliation',
+    body: {
+      action: 'fetch',
+      accountGlobalId: faireRuntime.globalId,
+      confirmReadOnly: true,
+      idempotencyKey: nextKey(),
+    },
+  })
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      concurrentCanonicalFetch.command.automaticFaireOrderPromotion,
+    )),
+    {
+      policyVersion: 'commerce-faire-order-auto-promotion-v1',
+      cohortHash: automaticFaireCohortHash,
+      notBefore: automaticFaireNotBefore,
+      runGlobalId: concurrentCanonicalFetch.command.runGlobalId,
+      candidatesFound: 1,
+      eligible: 1,
+      promoted: 0,
+      held: 1,
+      heldByReason: { canonical_order_exists: 1 },
+      failed: 0,
+      failedByCode: {},
+      operatorReviewRequired: 0,
+      providerWrites: 0,
+      canonicalOrderWrites: 0,
+      inventoryWrites: 0,
+      syncCursorAdvanced: false,
+    },
+    'A concurrent canonical promotion must settle as a benign hold without operator attention',
+  )
+  const workerExactRefreshKey = nextKey()
+  const faireExactReadsBeforeWorkerRefresh = providerReads.faireOrder
+  const stateReadsBeforeWorkerRefresh = stateReads.length
+  const workerExactRefreshInput = {
+    organizationId,
+    accountGlobalId: faireRuntime.globalId,
+    actorEmail: 'system:commerce-order-reconciliation',
+    idempotencyKey: workerExactRefreshKey,
+    candidateGlobalId: 'gcoc0000020',
+    candidateRowVersion: 7,
+    sourceHash: '9'.repeat(64),
+    expectedCredentialVersion: faireRuntime.credentialVersion,
+    cohortHash: automaticFaireCohortHash,
+    notBefore: automaticFaireNotBefore,
+  }
+  const workerExactRefresh =
+    await service.executeCommerceFaireOrderExactRefresh(
+      workerExactRefreshInput,
+    )
+  assert.equal(workerExactRefresh.command.action, 'refresh')
+  assert.equal(workerExactRefresh.intake, null)
+  assert.equal(
+    providerReads.faireOrder,
+    faireExactReadsBeforeWorkerRefresh + 1,
+    'The worker wrapper performs exactly one targeted Faire GET',
+  )
+  assert.equal(
+    stateReads.length,
+    stateReadsBeforeWorkerRefresh,
+    'The worker wrapper must not hydrate retained browser intake state',
+  )
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(refreshTargetReads.at(-1))),
+    {
+      organizationId,
+      accountGlobalId: faireRuntime.globalId,
+      candidateGlobalId: 'gcoc0000020',
+      expectedSourceHash: '9'.repeat(64),
+      expectedRowVersion: 7,
+    },
+    'The selected row version and source hash fence the provider read',
+  )
+  assert.equal(
+    providerReservations.find(
+      (reservation) => reservation.idempotencyKey === workerExactRefreshKey,
+    )?.providerAttemptActorEmail,
+    null,
+    'An unattended exact read never borrows a human provider-attempt actor',
+  )
+  const replayedWorkerExactRefresh =
+    await service.executeCommerceFaireOrderExactRefresh(
+      workerExactRefreshInput,
+    )
+  assert.equal(replayedWorkerExactRefresh.command.replayed, true)
+  assert.equal(
+    providerReads.faireOrder,
+    faireExactReadsBeforeWorkerRefresh + 1,
+    'A deterministic exact-refresh replay must not issue a second provider GET',
+  )
+  await assert.rejects(
+    service.executeCommerceFaireOrderExactRefresh({
+      ...workerExactRefreshInput,
+      idempotencyKey: nextKey(),
+      candidateRowVersion: 8,
+    }),
+    (error) => error.code === 'COMMERCE_INTAKE_REFRESH_TARGET_CHANGED',
+  )
+  assert.equal(
+    providerReads.faireOrder,
+    faireExactReadsBeforeWorkerRefresh + 1,
+    'Source concurrency drift must fail before provider I/O',
+  )
+  const credentialFencePreparations = readIntentPreparations.length
+  const credentialFenceReservations = providerReservations.length
+  const credentialFenceAttempts = providerAttempts.length
+  runtimes.set(faireRuntime.globalId, {
+    ...faireRuntime,
+    credentialVersion: faireRuntime.credentialVersion + 1,
+  })
+  try {
+    await assert.rejects(
+      service.executeCommerceFaireOrderExactRefresh({
+        ...workerExactRefreshInput,
+        idempotencyKey: nextKey(),
+      }),
+      (error) => error.code
+        === 'COMMERCE_FAIRE_EXACT_REFRESH_CREDENTIAL_STALE',
+    )
+  } finally {
+    runtimes.set(faireRuntime.globalId, faireRuntime)
+  }
+  assert.equal(
+    readIntentPreparations.length,
+    credentialFencePreparations,
+    'Credential drift must fail before creating a read intent',
+  )
+  assert.equal(
+    providerReservations.length,
+    credentialFenceReservations,
+    'Credential drift must fail before reserving a provider attempt',
+  )
+  assert.equal(
+    providerAttempts.length,
+    credentialFenceAttempts,
+    'Credential drift must fail before provider I/O',
+  )
+  const postStageCrashKey = nextKey()
+  const postStageCrashReads = providerReads.faireOrder
+  const postStageCrashAttentionStart = persistenceCommands.length
+  automaticFairePromotionTargets = [{
+    eligible: false,
+    reason: 'customer_resolution_required',
+    candidateGlobalId: 'gcoc0000021',
+    candidateRowVersion: 3,
+    sourceHash: '8'.repeat(64),
+    providerAddress: null,
+    deliveryMode: null,
+  }]
+  await assert.rejects(
+    service.executeCommerceFaireOrderExactRefresh({
+      ...workerExactRefreshInput,
+      idempotencyKey: postStageCrashKey,
+      afterStageBeforeAutomaticHooks() {
+        throw new Error('simulated crash after exact stage before hooks')
+      },
+    }),
+    /simulated crash after exact stage before hooks/u,
+  )
+  assert.equal(
+    providerReads.faireOrder,
+    postStageCrashReads + 1,
+    'The injected failure occurs only after the exact provider result is durably staged',
+  )
+  const recoveredPostStageCrash =
+    await service.executeCommerceFaireOrderExactRefresh({
+      ...workerExactRefreshInput,
+      idempotencyKey: postStageCrashKey,
+    })
+  assert.equal(recoveredPostStageCrash.command.replayed, true)
+  assert.equal(
+    providerReads.faireOrder,
+    postStageCrashReads + 1,
+    'Post-stage recovery must replay durable evidence without another Faire GET',
+  )
+  assert.equal(
+    persistenceCommands
+      .slice(postStageCrashAttentionStart)
+      .filter((entry) => entry.name === 'mark-faire-auto-attention')
+      .length,
+    1,
+    'A deterministic stage replay must resume the skipped automatic hook',
   )
   await assert.rejects(
     service.executeCommerceIntakeCommand({
@@ -4401,9 +4776,9 @@ try {
     shopifyGraphql: 9,
     faireProducts: 2,
     faireInventory: 3,
-    faireOrders: 3,
-    faireOrder: 2,
-    faireProfile: 7,
+    faireOrders: 4,
+    faireOrder: 4,
+    faireProfile: 10,
   })
   assert.equal(normalizedSources.shopify.data.products.nodes.length, 0)
   assert.equal(normalizedSources.shopify.data.orders.nodes.length, 1)
@@ -4431,8 +4806,8 @@ try {
       .available_quantity.quantity,
     -2,
   )
-  assert.equal(providerAttempts.length, 14)
-  assert.equal(providerReservations.length, 17)
+  assert.equal(providerAttempts.length, 17)
+  assert.equal(providerReservations.length, 20)
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'faire'
@@ -4447,9 +4822,9 @@ try {
     )),
     'Shopify provider-attempt evidence must record its current normalizer',
   )
-  assert.equal(capturedReads.size, 14)
+  assert.equal(capturedReads.size, 17)
   assert.equal(uncertainReads.length, 0)
-  assert.equal(stageAttempts.length, 17)
+  assert.equal(stageAttempts.length, 20)
   for (const attempt of providerAttempts) {
     assert.equal(attempt.action, 'commerce.intake.read')
     assert.equal(attempt.redactedRequest.readOnly, true)
@@ -4458,7 +4833,7 @@ try {
   }
   assert.equal(
     persistenceCommands.filter(({ name }) => name === 'stage-envelope').length,
-    14,
+    17,
   )
   const staged = persistenceCommands.filter(
     ({ name }) => name === 'stage-envelope',
@@ -4502,6 +4877,9 @@ try {
       'refresh',
       'fetch',
       'fetch',
+      'fetch',
+      'refresh',
+      'refresh',
       'retry-rejection',
       'retry-rejection',
     ],
@@ -4513,10 +4891,12 @@ try {
   assert.equal(staged[2].input.page.resource, 'products')
   assert.equal(staged[3].input.page.resource, 'products')
   assert.equal(staged[9].input.page, null)
-  assert.equal(staged[12].input.page, null)
   assert.equal(staged[13].input.page, null)
+  assert.equal(staged[14].input.page, null)
+  assert.equal(staged[15].input.page, null)
+  assert.equal(staged[16].input.page, null)
   assert.equal(
-    staged[13].input.envelope.orders[0].identity.value,
+    staged[16].input.envelope.orders[0].identity.value,
     'faire-order-rejected-1',
     'Faire exact-order retry must stage the identity read by getFaireOrder',
   )
@@ -4787,9 +5167,9 @@ try {
     shopifyGraphql: 9,
     faireProducts: 2,
     faireInventory: 3,
-    faireOrders: 3,
-    faireOrder: 2,
-    faireProfile: 7,
+    faireOrders: 4,
+    faireOrder: 4,
+    faireProfile: 10,
   }, 'Resolution, validation, and promotion must not call providers')
   const readsBeforeExactPackBinding = { ...providerReads }
   const stagesBeforeExactPackBinding = stageAttempts.length
@@ -5046,6 +5426,19 @@ try {
   } else {
     process.env.CLAWPILOT_SHOPIFY_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS =
       savedEnvironment.shopifyAutoCohort
+  }
+  if (savedEnvironment.faireAutoCohort === undefined) {
+    delete process.env
+      .CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS
+  } else {
+    process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS =
+      savedEnvironment.faireAutoCohort
+  }
+  if (savedEnvironment.faireAutoNotBefore === undefined) {
+    delete process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE
+  } else {
+    process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE =
+      savedEnvironment.faireAutoNotBefore
   }
 }
 
