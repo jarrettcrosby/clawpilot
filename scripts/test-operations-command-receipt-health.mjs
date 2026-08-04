@@ -109,6 +109,9 @@ async function createFixture(client) {
       idempotency_key text NOT NULL,
       request_hash text,
       actor_email text,
+      correlation_id uuid NOT NULL DEFAULT
+        '00000000-0000-4000-8000-000000000000'::uuid,
+      attempts integer NOT NULL DEFAULT 1,
       status text NOT NULL,
       error_code text,
       error_message text,
@@ -172,14 +175,16 @@ async function verifyTargetMigration(client) {
     await client.query(
       `INSERT INTO operations_command_receipts (
          id, organization_id, command_type, idempotency_key,
-         request_hash, actor_email, status, error_code, error_message,
+         request_hash, actor_email, correlation_id, attempts,
+         status, error_code, error_message,
          result_global_id, result_payload, started_at,
          created_at, completed_at, updated_at
        ) VALUES (
          $1::uuid, $2::uuid, $3, $4,
-         $5, $6, $7, $8, $9,
-         $10, $11::jsonb, $12::timestamptz,
-         $13::timestamptz, $14::timestamptz, $15::timestamptz
+         $5, $6, $7::uuid, $8,
+         $9, $10, $11,
+         $12, $13::jsonb, $14::timestamptz,
+         $15::timestamptz, $16::timestamptz, $17::timestamptz
        )`,
       [
         input.id,
@@ -188,6 +193,8 @@ async function verifyTargetMigration(client) {
         input.idempotencyKey,
         input.requestHash,
         input.actorEmail ?? 'migration-fixture@example.com',
+        input.correlationId ?? randomUUID(),
+        input.attempts ?? 1,
         input.status,
         input.errorCode ?? null,
         input.errorMessage ?? null,
@@ -279,13 +286,15 @@ async function verifyTargetMigration(client) {
       'dc0be151be1c427af4aa7240f8f6646e1fee04156ff306b3706693b2daabdabc'
     ),
     actorEmail: 'jarrett@suburbiasandwichco.com',
+    correlationId: '4463472c-ae48-44a8-b332-bb9a9f24e684',
+    attempts: 1,
     status: 'succeeded',
     resultGlobalId: auditedOrderGlobalId,
     resultPayload: planningResult(auditedOrderGlobalId),
-    startedAt: '2026-08-03T11:15:47.260Z',
-    createdAt: '2026-08-03T11:15:47.260Z',
-    completedAt: '2026-08-03T11:15:47.265Z',
-    updatedAt: '2026-08-03T11:15:47.265Z',
+    startedAt: '2026-08-03T11:15:47.260995Z',
+    createdAt: '2026-08-03T11:15:47.260995Z',
+    completedAt: '2026-08-03T11:15:47.265098Z',
+    updatedAt: '2026-08-03T11:15:47.265098Z',
   })
   await insertLegacyReceipt({
     id: auditedFailureOneId,
@@ -298,13 +307,15 @@ async function verifyTargetMigration(client) {
       'e422f911970377b598ea7e743efb95d1ca5b63bf0181e07183a0da08ffe28274'
     ),
     actorEmail: 'jarrett@suburbiasandwichco.com',
+    correlationId: '9efe8904-b38f-45de-8d3f-1ccc44fb1acb',
+    attempts: 1,
     status: 'failed',
     errorCode: 'OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION',
     errorMessage: ACTIVE_RATE_MESSAGE,
-    startedAt: '2026-08-03T11:11:31.100Z',
-    createdAt: '2026-08-03T11:11:31.100Z',
-    completedAt: '2026-08-03T11:11:31.110Z',
-    updatedAt: '2026-08-03T11:11:31.110Z',
+    startedAt: '2026-08-03T11:11:31.100605Z',
+    createdAt: '2026-08-03T11:11:31.100605Z',
+    completedAt: '2026-08-03T11:11:31.110882Z',
+    updatedAt: '2026-08-03T11:11:31.110882Z',
   })
   await insertLegacyReceipt({
     id: auditedFailureTwoId,
@@ -317,13 +328,15 @@ async function verifyTargetMigration(client) {
       'e422f911970377b598ea7e743efb95d1ca5b63bf0181e07183a0da08ffe28274'
     ),
     actorEmail: 'jarrett@suburbiasandwichco.com',
+    correlationId: 'db5e1731-a210-4f79-a3ec-50feacf8790b',
+    attempts: 1,
     status: 'failed',
     errorCode: 'OPERATIONS_CANONICAL_FULFILLMENT_RATE_PROMISE_UNAVAILABLE',
     errorMessage: RATE_PROMISE_MESSAGE,
-    startedAt: '2026-08-03T11:13:13.178Z',
-    createdAt: '2026-08-03T11:13:13.178Z',
-    completedAt: '2026-08-03T11:13:13.209Z',
-    updatedAt: '2026-08-03T11:13:13.209Z',
+    startedAt: '2026-08-03T11:13:13.178687Z',
+    createdAt: '2026-08-03T11:13:13.178687Z',
+    completedAt: '2026-08-03T11:13:13.209979Z',
+    updatedAt: '2026-08-03T11:13:13.209979Z',
   })
   await insertLegacyReceipt({
     id: auditedNearMissId,
@@ -339,10 +352,10 @@ async function verifyTargetMigration(client) {
     status: 'failed',
     errorCode: 'OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION',
     errorMessage: ACTIVE_RATE_MESSAGE,
-    startedAt: '2026-08-03T11:11:31.100Z',
-    createdAt: '2026-08-03T11:11:31.100Z',
-    completedAt: '2026-08-03T11:11:31.110Z',
-    updatedAt: '2026-08-03T11:11:31.110Z',
+    startedAt: '2026-08-03T11:11:31.100605Z',
+    createdAt: '2026-08-03T11:11:31.100605Z',
+    completedAt: '2026-08-03T11:11:31.110882Z',
+    updatedAt: '2026-08-03T11:11:31.110882Z',
   })
 
   const migrationPath = (
@@ -370,6 +383,69 @@ async function verifyTargetMigration(client) {
     'Legacy target migration must not trust caller-controlled key text',
   )
   await client.query(migration)
+
+  const targetsAfter0249 = await client.query(
+    `SELECT id::text, target_global_id
+     FROM operations_command_receipts
+     WHERE id = ANY($1::uuid[])
+     ORDER BY id`,
+    [[
+      authoritativeSuccessId,
+      sameHashFailureId,
+      maliciousKeyFailureId,
+      malformedSuccessId,
+      auditedSuccessId,
+      auditedFailureOneId,
+      auditedFailureTwoId,
+      auditedNearMissId,
+    ]],
+  )
+  assert.deepEqual(
+    Object.fromEntries(targetsAfter0249.rows.map((row) => [
+      row.id,
+      row.target_global_id,
+    ])),
+    {
+      [authoritativeSuccessId]: authoritativeOrderGlobalId,
+      [sameHashFailureId]: authoritativeOrderGlobalId,
+      [maliciousKeyFailureId]: null,
+      [malformedSuccessId]: null,
+      [auditedSuccessId]: auditedOrderGlobalId,
+      [auditedFailureOneId]: null,
+      [auditedFailureTwoId]: null,
+      [auditedNearMissId]: null,
+    },
+    '0249 must fail closed when audited timestamps differ below milliseconds',
+  )
+
+  const exactAuditMigrationPath = (
+    'db/migrations/0250_operations_command_receipt_exact_audit.sql'
+  )
+  const exactAuditMigration = read(exactAuditMigrationPath)
+  for (const fragment of [
+    'Follow-up to 0249',
+    '2026-08-03T11:11:31.100605Z',
+    '2026-08-03T11:13:13.209979Z',
+    '2026-08-03T11:15:47.260995Z',
+    "successor.result_payload =",
+    'successor.idempotency_key =',
+    'failed.correlation_id = audited.correlation_id',
+    'failed.attempts = audited.attempts',
+    'successor.correlation_id = audited.successor_correlation_id',
+    'successor.attempts = audited.successor_attempts',
+    'failed.updated_at = audited.updated_at',
+  ]) {
+    assert.ok(
+      exactAuditMigration.includes(fragment),
+      `Exact audit migration is missing ${fragment}`,
+    )
+  }
+  assert.doesNotMatch(
+    exactAuditMigration,
+    /substring\s*\(\s*failed\.idempotency_key/iu,
+    'Exact audit migration must not derive authority from key text',
+  )
+  await client.query(exactAuditMigration)
 
   const targets = await client.query(
     `SELECT id::text, target_global_id
@@ -402,7 +478,7 @@ async function verifyTargetMigration(client) {
       [auditedFailureTwoId]: auditedOrderGlobalId,
       [auditedNearMissId]: null,
     },
-    'Only immutable successes, equal request hashes, and exact audits backfill',
+    'Only the exact microsecond audited receipts may receive the target',
   )
   const schema = await client.query(
     `SELECT
@@ -428,17 +504,130 @@ async function verifyTargetMigration(client) {
      WHERE id = $1::uuid`,
     [auditedFailureOneId],
   )
-  await client.query(migration)
+  await client.query(
+    `UPDATE operations_command_receipts
+     SET target_global_id = NULL,
+         updated_at = updated_at + interval '1 microsecond'
+     WHERE id = $1::uuid`,
+    [auditedFailureTwoId],
+  )
+  await client.query(exactAuditMigration)
   const adjudicationMismatch = await client.query(
-    `SELECT target_global_id
+    `SELECT id::text, target_global_id
      FROM operations_command_receipts
+     WHERE id = ANY($1::uuid[])
+     ORDER BY id`,
+    [[auditedFailureOneId, auditedFailureTwoId]],
+  )
+  assert.deepEqual(
+    Object.fromEntries(adjudicationMismatch.rows.map((row) => [
+      row.id,
+      row.target_global_id,
+    ])),
+    {
+      [auditedFailureOneId]: null,
+      [auditedFailureTwoId]: null,
+    },
+    'Actor or one-microsecond mismatches must make the correction a no-op',
+  )
+
+  await client.query(
+    `UPDATE operations_command_receipts
+     SET actor_email = 'jarrett@suburbiasandwichco.com',
+         correlation_id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'::uuid
      WHERE id = $1::uuid`,
     [auditedFailureOneId],
   )
-  assert.equal(
-    adjudicationMismatch.rows[0].target_global_id,
-    null,
-    'Any audited immutable-fingerprint mismatch must make the correction a no-op',
+  await client.query(
+    `UPDATE operations_command_receipts
+     SET updated_at = '2026-08-03T11:13:13.209979Z'::timestamptz,
+         attempts = 2
+     WHERE id = $1::uuid`,
+    [auditedFailureTwoId],
+  )
+  await client.query(exactAuditMigration)
+  const receiptIdentityMismatch = await client.query(
+    `SELECT id::text, target_global_id
+     FROM operations_command_receipts
+     WHERE id = ANY($1::uuid[])
+     ORDER BY id`,
+    [[auditedFailureOneId, auditedFailureTwoId]],
+  )
+  assert.deepEqual(
+    Object.fromEntries(receiptIdentityMismatch.rows.map((row) => [
+      row.id,
+      row.target_global_id,
+    ])),
+    {
+      [auditedFailureOneId]: null,
+      [auditedFailureTwoId]: null,
+    },
+    'Correlation or attempt mismatches must make the correction a no-op',
+  )
+
+  await client.query(
+    `UPDATE operations_command_receipts
+     SET correlation_id = '9efe8904-b38f-45de-8d3f-1ccc44fb1acb'::uuid
+     WHERE id = $1::uuid`,
+    [auditedFailureOneId],
+  )
+  await client.query(
+    `UPDATE operations_command_receipts
+     SET attempts = 1
+     WHERE id = $1::uuid`,
+    [auditedFailureTwoId],
+  )
+  await client.query(
+    `UPDATE operations_command_receipts
+     SET correlation_id = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'::uuid
+     WHERE id = $1::uuid`,
+    [auditedSuccessId],
+  )
+  await client.query(exactAuditMigration)
+  const successorIdentityMismatch = await client.query(
+    `SELECT id::text, target_global_id
+     FROM operations_command_receipts
+     WHERE id = ANY($1::uuid[])
+     ORDER BY id`,
+    [[auditedFailureOneId, auditedFailureTwoId]],
+  )
+  assert.deepEqual(
+    Object.fromEntries(successorIdentityMismatch.rows.map((row) => [
+      row.id,
+      row.target_global_id,
+    ])),
+    {
+      [auditedFailureOneId]: null,
+      [auditedFailureTwoId]: null,
+    },
+    'A successor correlation mismatch must make the correction a no-op',
+  )
+
+  await client.query(
+    `UPDATE operations_command_receipts
+     SET correlation_id = '4463472c-ae48-44a8-b332-bb9a9f24e684'::uuid,
+         attempts = 2
+     WHERE id = $1::uuid`,
+    [auditedSuccessId],
+  )
+  await client.query(exactAuditMigration)
+  const successorAttemptMismatch = await client.query(
+    `SELECT id::text, target_global_id
+     FROM operations_command_receipts
+     WHERE id = ANY($1::uuid[])
+     ORDER BY id`,
+    [[auditedFailureOneId, auditedFailureTwoId]],
+  )
+  assert.deepEqual(
+    Object.fromEntries(successorAttemptMismatch.rows.map((row) => [
+      row.id,
+      row.target_global_id,
+    ])),
+    {
+      [auditedFailureOneId]: null,
+      [auditedFailureTwoId]: null,
+    },
+    'A successor attempt mismatch must make the correction a no-op',
   )
 }
 
