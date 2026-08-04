@@ -113,6 +113,182 @@ export function shopifyAutomaticOrderPromotionCohort(
   } as const
 }
 
+/**
+ * Operator-safe cohort state for worker heartbeats and health responses.
+ * Exact account IDs and the cohort fingerprint remain server-only authority;
+ * a one-account legacy `gia` cohort can otherwise be recovered by hashing the
+ * small identifier space and comparing it with the published fingerprint.
+ */
+export function shopifyAutomaticOrderPromotionGateHealth(
+  environment: ShopifyAutomaticPromotionEnvironment = process.env,
+) {
+  const cohort = shopifyAutomaticOrderPromotionCohort(environment)
+  return {
+    policyVersion: cohort.policyVersion,
+    enabled: cohort.enabled,
+    runtimeEligible: cohort.runtimeEligible,
+    cohortConfigured: cohort.configured,
+    cohortValid: cohort.valid,
+    cohortSize: cohort.cohortSize,
+    disabledReason: cohort.disabledReason,
+  } as const
+}
+
+function healthRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+}
+
+const MAX_PUBLIC_HEALTH_COUNTER = 1_000_000
+const MAX_PUBLIC_HEALTH_MAP_ENTRIES = 16
+
+const AUTOMATIC_SHOPIFY_PROMOTION_PUBLIC_HOLD_REASONS = [
+  'canonical_order_exists',
+  'prior_candidate_requires_review',
+  'source_age_requires_review',
+  'order_state_requires_review',
+  'order_money_requires_review',
+  'customer_resolution_required',
+  'line_items_empty',
+  'physical_shipping_required',
+  'line_quantity_requires_review',
+  'product_sku_or_pack_mapping_requires_review',
+  'candidate_blockers_require_review',
+  'ship_to_requires_review',
+  'delivery_date_requires_review',
+  'checkout_rate_lineage_not_applicable',
+  'checkout_rate_lineage_ambiguous',
+  'checkout_rate_lineage_expired',
+  'checkout_rate_lineage_missing',
+  'validation_blocked',
+  'candidate_promoted',
+  'candidate_terminal',
+  'candidate_expired',
+] as const
+
+const AUTOMATIC_SHOPIFY_PROMOTION_PUBLIC_FAILURE_CODES = [
+  'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_FAILED',
+  'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_SELECTION_FAILED',
+  'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_PROVENANCE_FAILED',
+  'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_GATE_CLOSED',
+  'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_INVARIANT_STALE',
+  'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED',
+  'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_PHYSICAL_SHIPPING_REQUIRED',
+  'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_PRIOR_CANDIDATE',
+  'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_PRODUCT_MAPPING_STALE',
+  'COMMERCE_INTAKE_ADDRESS_INCOMPLETE',
+  'COMMERCE_INTAKE_ADDRESS_NOT_REQUIRED',
+  'COMMERCE_INTAKE_DEFAULT_SLA_UNAVAILABLE',
+  'COMMERCE_INTAKE_DELIVERY_NOT_REQUIRED',
+  'COMMERCE_INTAKE_MANUAL_DELIVERY_REQUIRED',
+  'COMMERCE_INTAKE_PROVIDER_DELIVERY_UNAVAILABLE',
+  'COMMERCE_INTAKE_ALREADY_PROMOTED',
+  'COMMERCE_INTAKE_CANDIDATE_NOT_FOUND',
+  'COMMERCE_INTAKE_CANDIDATE_EXPIRED',
+  'COMMERCE_INTAKE_CANDIDATE_TERMINAL',
+  'COMMERCE_INTAKE_ROW_VERSION_CONFLICT',
+  'COMMERCE_INTAKE_CREDENTIAL_GENERATION_STALE',
+  'COMMERCE_INTAKE_CUSTOMER_REQUIRED',
+  'COMMERCE_INTAKE_CUSTOMER_STALE',
+  'COMMERCE_INTAKE_NOT_READY',
+  'COMMERCE_INTAKE_PACKAGE_PROFILE_STALE',
+  'COMMERCE_INTAKE_PACK_MAPPING_STALE',
+  'COMMERCE_INTAKE_PRODUCT_MAPPING_STALE',
+  'COMMERCE_INTAKE_PRODUCT_STALE',
+  'COMMERCE_INTAKE_SOURCE_REVISION_STALE',
+] as const
+
+function healthCount(value: unknown) {
+  const parsed = Number(value || 0)
+  return Number.isSafeInteger(parsed) && parsed >= 0
+    ? Math.min(parsed, MAX_PUBLIC_HEALTH_COUNTER)
+    : 0
+}
+
+function healthCounterMap(
+  value: unknown,
+  allowedKeys: readonly string[],
+  total: number,
+) {
+  if (total === 0) return {}
+  const source = healthRecord(value)
+  const counters: Record<string, number> = {}
+  let remaining = total
+  const namedEntryLimit = MAX_PUBLIC_HEALTH_MAP_ENTRIES - 1
+  for (const key of allowedKeys) {
+    if (Object.keys(counters).length >= namedEntryLimit) break
+    if (!Object.prototype.hasOwnProperty.call(source, key)) continue
+    const count = Math.min(healthCount(source[key]), remaining)
+    if (count > 0) counters[key] = count
+    remaining -= count
+    if (remaining === 0) break
+  }
+  if (remaining > 0) counters.OTHER = remaining
+  return counters
+}
+
+/**
+ * Sanitizes the durable Shopify worker summary for worker returns and health.
+ * Current deployment gate metadata is recalculated rather than trusted from a
+ * stale heartbeat, while bounded allowlisted maps preserve aggregate totals
+ * without echoing arbitrary keys that may contain account or provider data.
+ */
+export function shopifyAutomaticOrderPromotionHealthSnapshot(input: {
+  heartbeat?: unknown
+  environment?: ShopifyAutomaticPromotionEnvironment
+} = {}) {
+  const heartbeat = healthRecord(input.heartbeat)
+  const held = healthCount(heartbeat.held)
+  const actionableHeld = Math.min(
+    healthCount(heartbeat.actionableHeld),
+    held,
+  )
+  const failed = healthCount(heartbeat.failed)
+  const attentionRequiredAccounts = healthCount(
+    heartbeat.attentionRequiredAccounts,
+  )
+  const minimumOperatorReviewRequired = Math.max(
+    Math.min(
+      actionableHeld + failed,
+      MAX_PUBLIC_HEALTH_COUNTER,
+    ),
+    attentionRequiredAccounts,
+  )
+  return {
+    ...shopifyAutomaticOrderPromotionGateHealth(
+      input.environment || process.env,
+    ),
+    promoted: healthCount(heartbeat.promoted),
+    held,
+    actionableHeld,
+    heldByReason: healthCounterMap(
+      heartbeat.heldByReason,
+      AUTOMATIC_SHOPIFY_PROMOTION_PUBLIC_HOLD_REASONS,
+      held,
+    ),
+    failed,
+    failedByCode: healthCounterMap(
+      heartbeat.failedByCode,
+      AUTOMATIC_SHOPIFY_PROMOTION_PUBLIC_FAILURE_CODES,
+      failed,
+    ),
+    rollbackFenced: Math.min(
+      healthCount(heartbeat.rollbackFenced),
+      failed,
+    ),
+    attentionRequiredAccounts,
+    operatorReviewRequired: Math.max(
+      healthCount(heartbeat.operatorReviewRequired),
+      minimumOperatorReviewRequired,
+    ),
+    providerWrites: healthCount(heartbeat.providerWrites),
+    canonicalOrderWrites: healthCount(heartbeat.canonicalOrderWrites),
+    inventoryWrites: healthCount(heartbeat.inventoryWrites),
+    syncCursorAdvanced: heartbeat.syncCursorAdvanced === true,
+  } as const
+}
+
 export function shopifyAutomaticOrderPromotionGate(input: {
   accountGlobalId: string
   environment?: ShopifyAutomaticPromotionEnvironment

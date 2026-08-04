@@ -2488,6 +2488,7 @@ async function withAutomaticFaireOrderPromotion(
       reasonCode: target.reasonCode,
       cohortHash,
       notBefore,
+      attentionKind: 'promotion',
     }) as { marked?: boolean; reasonCode?: string }
     return result.marked === false
       ? {
