@@ -3853,9 +3853,41 @@ async function verifyShopifyAttentionAcrossWorkerScans(input) {
     pool,
     ids,
     missingCandidate,
+    historicalCandidate,
     canonicalOrderGlobalId,
+    intakePersistence,
+    runtime,
+    runGlobalId,
+    cohortHash,
   } = input
   const persistence = loadCommerceOrderReconciliationPersistence(pool)
+  const readHistoricalCandidate = async () => (await pool.query(
+    `SELECT
+       candidate.workflow_state,
+       candidate.last_error_code,
+       candidate.expires_at > now() AS unexpired,
+       (SELECT count(*)::integer
+        FROM operations_orders canonical
+        WHERE canonical.organization_id = candidate.organization_id
+          AND canonical.integration_account_id =
+              candidate.integration_account_id
+          AND canonical.external_order_id = candidate.external_order_id)
+         AS canonical_count
+     FROM operations_commerce_order_candidates candidate
+     WHERE candidate.organization_id = $1::uuid
+       AND candidate.global_id = $2`,
+    [ids.organization, historicalCandidate.global_id],
+  )).rows[0]
+  assert.deepEqual(
+    await readHistoricalCandidate(),
+    {
+      workflow_state: 'ready',
+      last_error_code: null,
+      unexpired: true,
+      canonical_count: 0,
+    },
+    'A pre-feature unresolved candidate must remain explicitly unmarked',
+  )
   const scans = [
     {
       providerRowsSeen: 1,
@@ -4037,18 +4069,24 @@ async function verifyShopifyAttentionAcrossWorkerScans(input) {
              last_error_code = 'operator_resolved',
              blocking_codes = ARRAY['operator_resolved']::text[],
              row_version = candidate.row_version + 1,
-             updated_by = $3,
+             updated_by = $4,
              updated_at = now()
          FROM operations_commerce_intake_runs run
          WHERE candidate.organization_id = $1::uuid
            AND candidate.integration_account_id = $2::uuid
+           AND candidate.global_id = $3
            AND run.organization_id = candidate.organization_id
            AND run.integration_account_id = candidate.integration_account_id
            AND run.id = candidate.run_id
            AND run.created_by = 'system:commerce-order-reconciliation'
            AND candidate.provider = 'shopify'
            AND candidate.workflow_state IN ('held', 'resolving', 'ready')`,
-        [ids.organization, ids.integrationAccount, actorEmail],
+        [
+          ids.organization,
+          ids.integrationAccount,
+          missingCandidate.global_id,
+          actorEmail,
+        ],
       )
     } finally {
       await resolutionClient.query('SET session_replication_role = origin')
@@ -4070,7 +4108,88 @@ async function verifyShopifyAttentionAcrossWorkerScans(input) {
     )
     health = await persistence.readCommerceOrderReconciliationHealthFromPostgres()
     assert.equal(health.providerPromotionAttentionRequired.shopify, 0)
+    assert.deepEqual(
+      await readHistoricalCandidate(),
+      {
+        workflow_state: 'ready',
+        last_error_code: null,
+        unexpired: true,
+        canonical_count: 0,
+      },
+      'An unresolved historical NULL-marker candidate must not keep account attention active',
+    )
 
+    const staleContinuationLease = (await pool.query(
+      `UPDATE operations_commerce_sync_cursors
+       SET reconciliation_status = 'running',
+           last_error_code =
+             'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED',
+           last_started_at = date_trunc('milliseconds', clock_timestamp()),
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND resource = 'orders'
+       RETURNING last_started_at`,
+      [ids.organization, ids.integrationAccount],
+    )).rows[0]
+    const emptyContinuation = await persistence
+      .completeCommerceOrderReconciliationInPostgres({
+        target: {
+          organizationId: ids.organization,
+          integrationAccountId: ids.integrationAccount,
+          accountGlobalId: 'gia0009201',
+          provider: 'shopify',
+          credentialVersion: 1,
+          startedAt: staleContinuationLease.last_started_at.toISOString(),
+          recordsSeen: 0,
+          recordsHeld: 0,
+          continuationBatchNumber: 2,
+          continuationRunGlobalId: 'gcir0099999',
+          continuationIdempotencyKey: null,
+        },
+        providerRecordsSeen: 0,
+        ordersHeld: 0,
+        recordsRejected: 0,
+        pagesRead: 1,
+        hasNextBatch: false,
+        customersMatched: 0,
+        customersCreated: 0,
+        customersAmbiguous: 0,
+        customersSkipped: 0,
+        customerResolutionFailed: 0,
+        customerResolutionFailureCodes: {},
+        shopifyOrdersPromoted: 0,
+        shopifyOrdersHeld: 0,
+        shopifyPromotionActionableHeld: 0,
+        shopifyPromotionHeldReasons: {},
+        shopifyPromotionFailed: 0,
+        shopifyPromotionFailureCodes: {},
+        shopifyPromotionRollbackFenced: 0,
+        faireOrdersPromoted: 0,
+        faireOrdersHeld: 0,
+        fairePromotionFailed: 0,
+        fairePromotionFailureCodes: {},
+      })
+    assert.equal(emptyContinuation.leaseLost, false)
+    assert.equal(
+      emptyContinuation.shopifyAutomaticPromotionAttentionRequired,
+      false,
+      'An empty continuation must not preserve stale Shopify attention without an active marked candidate',
+    )
+    const clearedContinuation = (await pool.query(
+      `SELECT reconciliation_status, last_error_code
+       FROM operations_commerce_sync_cursors
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND resource = 'orders'`,
+      [ids.organization, ids.integrationAccount],
+    )).rows[0]
+    assert.deepEqual(clearedContinuation, {
+      reconciliation_status: 'succeeded',
+      last_error_code: null,
+    })
+
+    let dedupeCandidateRowVersion = 0
     const dedupeClient = await pool.connect()
     try {
       await dedupeClient.query('SET session_replication_role = replica')
@@ -4085,7 +4204,7 @@ async function verifyShopifyAttentionAcrossWorkerScans(input) {
           missingCandidate.external_order_id,
         ],
       )
-      await dedupeClient.query(
+      const reopenedCandidate = await dedupeClient.query(
         `UPDATE operations_commerce_order_candidates
          SET workflow_state = 'held',
              last_error_code = NULL,
@@ -4095,14 +4214,40 @@ async function verifyShopifyAttentionAcrossWorkerScans(input) {
              updated_by = $3,
              updated_at = now()
          WHERE organization_id = $1::uuid
-           AND global_id = $2`,
+           AND global_id = $2
+         RETURNING row_version::integer`,
         [ids.organization, missingCandidate.global_id, actorEmail],
       )
+      dedupeCandidateRowVersion =
+        reopenedCandidate.rows[0]?.row_version || 0
     } finally {
       await dedupeClient.query('SET session_replication_role = origin')
         .catch(() => {})
       dedupeClient.release()
     }
+    assert.ok(dedupeCandidateRowVersion > 0)
+    const canonicalRace = await intakePersistence
+      .markAutomaticShopifyOrderPromotionAttentionInPostgres({
+        runtime,
+        actorEmail: 'system:commerce-order-reconciliation',
+        idempotencyKey: 'shopify-auto-attention-canonical-race',
+        candidateGlobalId: missingCandidate.global_id,
+        candidateRowVersion: dedupeCandidateRowVersion,
+        runGlobalId,
+        reasonCode: 'checkout_rate_lineage_missing',
+        expectedCohortHash: cohortHash,
+      })
+    assert.equal(canonicalRace.marked, false)
+    assert.equal(canonicalRace.reasonCode, 'canonical_order_exists')
+    assert.equal(canonicalRace.rowVersion, dedupeCandidateRowVersion)
+    const canonicalRaceMarker = (await pool.query(
+      `SELECT last_error_code
+       FROM operations_commerce_order_candidates
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [ids.organization, missingCandidate.global_id],
+    )).rows[0]
+    assert.equal(canonicalRaceMarker.last_error_code, null)
     await makeRootPollDue()
     const benignDedupePoll = await worker.processCommerceOrderReconciliation({
       limit: 1,
@@ -4383,6 +4528,7 @@ async function verifyAutomaticShopifyCleanPromotion(
            ),
            checkout_shipping_service_code = 'clawpilot:ups:ground',
            workflow_state = 'ready',
+           last_error_code = NULL,
            blocking_codes = '{}'::text[],
            row_version = candidate.row_version + 1,
            updated_by = 'system:commerce-order-reconciliation',
@@ -4820,6 +4966,76 @@ async function verifyAutomaticShopifyCleanPromotion(
       'checkout_rate_lineage_expired',
     )
 
+    await assert.rejects(
+      persistence.markAutomaticShopifyOrderPromotionAttentionInPostgres({
+        runtime,
+        actorEmail: 'system:commerce-order-reconciliation',
+        idempotencyKey: 'shopify-auto-attention-benign-veto',
+        candidateGlobalId: expiredCandidate.global_id,
+        candidateRowVersion: expiredCandidate.row_version,
+        runGlobalId,
+        reasonCode: 'canonical_order_exists',
+        expectedCohortHash: gate.cohortHash,
+      }),
+      (error) => error?.code
+        === 'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_NOT_REQUIRED',
+    )
+
+    const attentionInput = {
+      runtime,
+      actorEmail: 'system:commerce-order-reconciliation',
+      idempotencyKey: 'shopify-auto-attention-missing',
+      candidateGlobalId: missingCandidate.global_id,
+      candidateRowVersion: missingCandidate.row_version,
+      runGlobalId,
+      reasonCode: 'checkout_rate_lineage_missing',
+      expectedCohortHash: gate.cohortHash,
+    }
+    const markedAttention = await persistence
+      .markAutomaticShopifyOrderPromotionAttentionInPostgres(attentionInput)
+    assert.equal(markedAttention.marked, true)
+    assert.equal(markedAttention.alreadyMarked, false)
+    assert.equal(markedAttention.replayed, false)
+    assert.equal(markedAttention.providerWrites, 0)
+    assert.equal(markedAttention.inventoryWrites, 0)
+    assert.equal(markedAttention.syncCursorAdvanced, false)
+    const replayedAttention = await persistence
+      .markAutomaticShopifyOrderPromotionAttentionInPostgres(attentionInput)
+    assert.equal(replayedAttention.replayed, true)
+    const attentionEvidence = (await pool.query(
+      `SELECT
+         candidate.last_error_code,
+         candidate.row_version::integer,
+         (SELECT count(*)::integer
+          FROM operations_command_receipts receipt
+          WHERE receipt.organization_id = candidate.organization_id
+            AND receipt.command_type =
+                'commerce.intake.mark_shopify_auto_promotion_attention'
+            AND receipt.idempotency_key = $3) AS receipt_count,
+         (SELECT count(*)::integer
+          FROM audit_events event
+          WHERE event.organization_id = candidate.organization_id
+            AND event.aggregate_id = candidate.global_id
+            AND event.event_type =
+                'commerce.intake.shopify_auto_promotion.attention_marked')
+           AS audit_count
+       FROM operations_commerce_order_candidates candidate
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.global_id = $2`,
+      [
+        ids.organization,
+        missingCandidate.global_id,
+        attentionInput.idempotencyKey,
+      ],
+    )).rows[0]
+    assert.deepEqual(attentionEvidence, {
+      last_error_code:
+        promotionPolicy.SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER,
+      row_version: missingCandidate.row_version + 1,
+      receipt_count: 1,
+      audit_count: 1,
+    })
+
     const promotionInput = {
       runtime,
       actorEmail: 'system:commerce-order-reconciliation',
@@ -5025,7 +5241,12 @@ async function verifyAutomaticShopifyCleanPromotion(
       pool,
       ids,
       missingCandidate,
+      historicalCandidate: expiredCandidate,
       canonicalOrderGlobalId: promoted.canonicalOrderGlobalId,
+      intakePersistence: persistence,
+      runtime,
+      runGlobalId,
+      cohortHash: gate.cohortHash,
     })
   } finally {
     if (previousClawPilotEnv === undefined) {

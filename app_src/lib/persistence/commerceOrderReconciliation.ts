@@ -2,6 +2,9 @@ import { createHash, randomUUID } from 'node:crypto'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { CommerceIntegrationRequestError } from '@/lib/integrations/commerceIntegrations'
 import {
+  SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER,
+} from '@/lib/integrations/commerceShopifyAutomaticPromotion'
+import {
   acquireTransactionAdvisoryLock,
   query,
   withTransaction,
@@ -13,7 +16,7 @@ const WORKER_HEARTBEAT_KEY = 'commerce_order_reconciliation_worker_heartbeat'
 export const FAIRE_AUTO_PROMOTION_ATTENTION_CODE =
   'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED'
 export const SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE =
-  'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED'
+  SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER
 
 const ORDER_RECONCILIATION_TERMINAL_FAILURE_CODES = [
   'COMMERCE_ORDER_RECONCILIATION_SESSION_RECORD_BUDGET_EXCEEDED',
@@ -810,9 +813,13 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
              AND candidate.provider = 'shopify'
              AND candidate.workflow_state IN ('held', 'resolving', 'ready')
              AND candidate.expires_at > now()
+             AND candidate.last_error_code =
+                 '${SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER}'
              AND run.provider = 'shopify'
              AND run.resource = 'products_and_orders'
              AND run.created_by = 'system:commerce-order-reconciliation'
+             AND run.workflow_state <> 'expired'
+             AND run.expires_at > now()
              AND NOT EXISTS (
                SELECT 1
                FROM operations_orders canonical
@@ -843,12 +850,10 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
                THEN '${SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE}'
              WHEN $7::bigint > 0
                THEN '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}'
-             WHEN $8::boolean
-               AND last_error_code IN (
-                 '${SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE}',
-                 '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}'
-               )
-               THEN last_error_code
+            WHEN $8::boolean
+              AND last_error_code =
+                  '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}'
+              THEN last_error_code
              ELSE NULL
            END,
            last_completed_at = now(),

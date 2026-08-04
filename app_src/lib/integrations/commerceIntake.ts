@@ -59,6 +59,7 @@ import {
   confirmCommerceCandidateAddressInPostgres,
   excludeCommerceIntakeRejectionInPostgres,
   markCommerceIntakeProviderReadUncertainInPostgres,
+  markAutomaticShopifyOrderPromotionAttentionInPostgres,
   markCommerceCandidateUnsupportedInPostgres,
   markCommerceIntakeContinuationInvalidInPostgres,
   prepareCommerceIntakeReadIntentInPostgres,
@@ -2111,6 +2112,7 @@ async function withAutomaticShopifyOrderPromotion(
   if (!gate.enabled || !gate.cohortHash) {
     return { ...command, automaticShopifyOrderPromotion: empty }
   }
+  const cohortHash = gate.cohortHash
   let targets: Awaited<ReturnType<
     typeof readAutomaticShopifyOrderPromotionTargetsForRunInPostgres
   >>
@@ -2141,12 +2143,69 @@ async function withAutomaticShopifyOrderPromotion(
   let rollbackFenced = 0
   const heldByReason: Record<string, number> = {}
   const failedByCode: Record<string, number> = {}
+  const markAttention = async (target: {
+    candidateGlobalId: string
+    candidateRowVersion: number
+    reasonCode: string
+  }) => {
+    try {
+      const result = await markAutomaticShopifyOrderPromotionAttentionInPostgres({
+        runtime: input.runtime,
+        actorEmail: input.actorEmail,
+        idempotencyKey: automaticShopifyCommandKey([
+          input.runtime.globalId,
+          runGlobalId,
+          target.candidateGlobalId,
+          String(target.candidateRowVersion),
+          `attention:${target.reasonCode}`,
+          cohortHash,
+        ]),
+        candidateGlobalId: target.candidateGlobalId,
+        candidateRowVersion: target.candidateRowVersion,
+        runGlobalId,
+        reasonCode: target.reasonCode,
+        expectedCohortHash: cohortHash,
+      }) as { marked?: boolean; reasonCode?: string }
+      return result.marked === false
+        ? {
+            attentionRequired: false as const,
+            reasonCode: result.reasonCode || 'candidate_resolved',
+          }
+        : {
+            attentionRequired: true as const,
+            reasonCode: target.reasonCode,
+          }
+    } catch {
+      failed += 1
+      const code =
+        'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_PROVENANCE_FAILED'
+      failedByCode[code] = (failedByCode[code] || 0) + 1
+      return {
+        attentionRequired: true as const,
+        reasonCode: target.reasonCode,
+      }
+    }
+  }
   for (const target of targets) {
     if (!target.eligible) {
       held += 1
-      heldByReason[target.reason] = (heldByReason[target.reason] || 0) + 1
       if (automaticShopifyPromotionHoldRequiresAttention(target.reason)) {
-        actionableHeld += 1
+        const outcome = await markAttention({
+          candidateGlobalId: target.candidateGlobalId,
+          candidateRowVersion: target.candidateRowVersion,
+          reasonCode: target.reason,
+        })
+        if (!outcome.attentionRequired) {
+          heldByReason[outcome.reasonCode] =
+            (heldByReason[outcome.reasonCode] || 0) + 1
+        } else {
+          actionableHeld += 1
+          heldByReason[target.reason] =
+            (heldByReason[target.reason] || 0) + 1
+        }
+      } else {
+        heldByReason[target.reason] =
+          (heldByReason[target.reason] || 0) + 1
       }
       continue
     }
@@ -2206,9 +2265,19 @@ async function withAutomaticShopifyOrderPromotion(
       rowVersion = Number(validation.rowVersion)
       if (validation.ready !== true) {
         held += 1
-        actionableHeld += 1
-        heldByReason.validation_blocked =
-          (heldByReason.validation_blocked || 0) + 1
+        const outcome = await markAttention({
+          candidateGlobalId: target.candidateGlobalId,
+          candidateRowVersion: rowVersion,
+          reasonCode: 'validation_blocked',
+        })
+        if (!outcome.attentionRequired) {
+          heldByReason[outcome.reasonCode] =
+            (heldByReason[outcome.reasonCode] || 0) + 1
+        } else {
+          actionableHeld += 1
+          heldByReason.validation_blocked =
+            (heldByReason.validation_blocked || 0) + 1
+        }
         continue
       }
       const promotion = await promoteCommerceCandidateInPostgres({
@@ -2250,11 +2319,22 @@ async function withAutomaticShopifyOrderPromotion(
       }
       promoted += 1
     } catch (error) {
-      failed += 1
       const code = automaticShopifyPromotionFailureCode(error)
-      failedByCode[code] = (failedByCode[code] || 0) + 1
-      if (code === 'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED') {
-        rollbackFenced += 1
+      const outcome = await markAttention({
+        candidateGlobalId: target.candidateGlobalId,
+        candidateRowVersion: rowVersion,
+        reasonCode: code,
+      })
+      if (!outcome.attentionRequired) {
+        held += 1
+        heldByReason[outcome.reasonCode] =
+          (heldByReason[outcome.reasonCode] || 0) + 1
+      } else {
+        failed += 1
+        failedByCode[code] = (failedByCode[code] || 0) + 1
+        if (code === 'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED') {
+          rollbackFenced += 1
+        }
       }
     }
   }
