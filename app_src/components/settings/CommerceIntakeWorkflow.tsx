@@ -425,6 +425,9 @@ type CommerceIntake = {
     consecutiveFailures: number
     lastErrorCode: string | null
     automaticPromotionAttentionRequired: boolean
+    automaticExactRefreshAttentionRequired: boolean
+    automaticUnattributedAttentionRequired: boolean
+    operatorAttentionRequired: boolean
     lastStartedAt: string | null
     lastCompletedAt: string | null
     resumable: boolean
@@ -3900,9 +3903,26 @@ export default function CommerceIntakeWorkflow({
                       {orderReconciliation?.status === 'running'
                         ? `ClawPilot is reading current ${providerLabel(provider)} orders now.`
                         : orderReconciliation?.status === 'succeeded'
-                          ? orderReconciliation
-                            .automaticPromotionAttentionRequired
-                            ? `The provider read completed, but automatic local ${providerLabel(provider)} order promotion needs attention${
+                          ? orderReconciliation.operatorAttentionRequired
+                            ? `The provider read completed, but ${
+                              orderReconciliation
+                                .automaticUnattributedAttentionRequired
+                                ? orderReconciliation
+                                  .automaticPromotionAttentionRequired
+                                  || orderReconciliation
+                                    .automaticExactRefreshAttentionRequired
+                                  ? 'classified automatic attention and legacy Faire attention with unavailable subtype need review'
+                                  : 'legacy Faire order attention with unavailable subtype needs review'
+                                : orderReconciliation
+                                .automaticPromotionAttentionRequired
+                                && orderReconciliation
+                                  .automaticExactRefreshAttentionRequired
+                                ? `automatic local ${providerLabel(provider)} order promotion and Faire exact refresh need attention`
+                                : orderReconciliation
+                                  .automaticExactRefreshAttentionRequired
+                                  ? 'Faire exact order refresh needs attention'
+                                  : `automatic local ${providerLabel(provider)} order promotion needs attention`
+                            }${
                               orderReconciliation.lastErrorCode
                                 ? ` (${orderReconciliation.lastErrorCode})`
                                 : ''
@@ -3930,7 +3950,7 @@ export default function CommerceIntakeWorkflow({
                     color={
                       orderReconciliation?.status === 'failed'
                       || orderReconciliation
-                        ?.automaticPromotionAttentionRequired
+                        ?.operatorAttentionRequired
                         ? 'warning'
                         : orderReconciliation?.status === 'running'
                           ? 'info'
@@ -4019,6 +4039,23 @@ export default function CommerceIntakeWorkflow({
                       The provider read succeeded, but at least one automatic{' '}
                       {providerLabel(provider)} order promotion was held or
                       failed. Review the order evidence and error before
+                      fulfillment.
+                    </Alert>
+                  ) : null}
+                {orderReconciliation
+                  ?.automaticExactRefreshAttentionRequired ? (
+                    <Alert severity="warning">
+                      A Faire exact order refresh was rejected or failed and
+                      remains marked for operator review. Review the retained
+                      candidate evidence before fulfillment.
+                    </Alert>
+                  ) : null}
+                {orderReconciliation
+                  ?.automaticUnattributedAttentionRequired ? (
+                    <Alert severity="warning">
+                      This Faire attention record predates subtype tracking, so
+                      ClawPilot cannot safely classify it as promotion or exact
+                      refresh. Review the retained candidate evidence before
                       fulfillment.
                     </Alert>
                   ) : null}

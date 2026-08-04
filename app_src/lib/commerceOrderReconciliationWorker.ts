@@ -9,8 +9,13 @@ import {
   readAutomaticFaireExactRefreshTargetsInPostgres,
 } from '@/lib/persistence/commerceIntake'
 import {
-  shopifyAutomaticOrderPromotionCohort,
+  shopifyAutomaticOrderPromotionHealthSnapshot,
 } from '@/lib/integrations/commerceShopifyAutomaticPromotion'
+import {
+  faireAutomaticExactRefreshHealthSnapshot,
+  faireAutomaticOrderPromotionHealthSnapshot,
+  faireUnattributedAttentionHealthSnapshot,
+} from '@/lib/integrations/commerceFaireAutomaticPromotion'
 import {
   claimCommerceOrderReconciliationTargetsInPostgres,
   completeCommerceOrderReconciliationInPostgres,
@@ -262,18 +267,6 @@ export async function processCommerceOrderReconciliation(input: {
   /** Deterministic test seam; API callers never supply this. */
   clock?: () => number
 }) {
-  const shopifyPromotionCohort =
-    shopifyAutomaticOrderPromotionCohort()
-  const shopifyPromotionGateHealth = {
-    policyVersion: shopifyPromotionCohort.policyVersion,
-    enabled: shopifyPromotionCohort.enabled,
-    runtimeEligible: shopifyPromotionCohort.runtimeEligible,
-    cohortConfigured: shopifyPromotionCohort.configured,
-    cohortValid: shopifyPromotionCohort.valid,
-    cohortSize: shopifyPromotionCohort.cohortSize,
-    cohortHash: shopifyPromotionCohort.cohortHash,
-    disabledReason: shopifyPromotionCohort.disabledReason,
-  }
   if (!commerceIntakeRuntimeAvailable()) {
     return {
       skipped: true,
@@ -287,45 +280,14 @@ export async function processCommerceOrderReconciliation(input: {
       providerWrites: 0,
       canonicalOrderWrites: 0,
       inventoryWrites: 0,
-      automaticShopifyOrderPromotion: {
-        ...shopifyPromotionGateHealth,
-        promoted: 0,
-        held: 0,
-        actionableHeld: 0,
-        heldByReason: {},
-        failed: 0,
-        failedByCode: {},
-        rollbackFenced: 0,
-        attentionRequiredAccounts: 0,
-        operatorReviewRequired: 0,
-        providerWrites: 0,
-        canonicalOrderWrites: 0,
-        inventoryWrites: 0,
-        syncCursorAdvanced: false,
-      },
-      automaticFaireOrderPromotion: {
-        promoted: 0,
-        held: 0,
-        failed: 0,
-        failedByCode: {},
-        attentionRequiredAccounts: 0,
-        operatorReviewRequired: 0,
-        providerWrites: 0,
-        canonicalOrderWrites: 0,
-        inventoryWrites: 0,
-        syncCursorAdvanced: false,
-      },
-      automaticFaireExactRefresh: {
-        attempted: 0,
-        succeeded: 0,
-        rejected: 0,
-        failed: 0,
-        failedByCode: {},
-        operatorReviewRequired: 0,
-        providerWrites: 0,
-        inventoryWrites: 0,
-        syncCursorAdvanced: false,
-      },
+      automaticShopifyOrderPromotion:
+        shopifyAutomaticOrderPromotionHealthSnapshot(),
+      automaticFaireOrderPromotion:
+        faireAutomaticOrderPromotionHealthSnapshot(),
+      automaticFaireExactRefresh:
+        faireAutomaticExactRefreshHealthSnapshot(),
+      automaticFaireUnattributedAttention:
+        faireUnattributedAttentionHealthSnapshot(),
       automaticCustomerResolution: {
         matched: 0,
         created: 0,
@@ -367,12 +329,15 @@ export async function processCommerceOrderReconciliation(input: {
   let faireOrdersPromoted = 0
   let faireOrdersHeld = 0
   let fairePromotionFailed = 0
-  let faireOperatorReviewRequired = 0
+  let fairePromotionOperatorReviewRequired = 0
   let fairePromotionAttentionRequiredAccounts = 0
   let faireExactRefreshAttempted = 0
   let faireExactRefreshSucceeded = 0
   let faireExactRefreshRejected = 0
   let faireExactRefreshFailed = 0
+  let faireExactRefreshOperatorReviewRequired = 0
+  let faireExactRefreshAttentionRequiredAccounts = 0
+  let faireUnattributedAttentionRequiredAccounts = 0
   const faireExactRefreshFailureCodes: Record<string, number> = {}
   const fairePromotionFailureCodes: Record<string, number> = {}
   const shopifyPromotionHeldReasons: Record<string, number> = {}
@@ -403,11 +368,12 @@ export async function processCommerceOrderReconciliation(input: {
       let targetFaireOrdersPromoted = 0
       let targetFaireOrdersHeld = 0
       let targetFairePromotionFailed = 0
-      let targetFaireOperatorReviewRequired = 0
+      let targetFairePromotionOperatorReviewRequired = 0
       let targetFaireExactRefreshAttempted = 0
       let targetFaireExactRefreshSucceeded = 0
       let targetFaireExactRefreshRejected = 0
       let targetFaireExactRefreshFailed = 0
+      let targetFaireExactRefreshOperatorReviewRequired = 0
       let targetFaireExactRefreshPaused = false
       const targetFaireExactRefreshAttemptedCandidates = new Set<string>()
       const targetFaireExactRefreshFailureCodes: Record<string, number> = {}
@@ -533,7 +499,7 @@ export async function processCommerceOrderReconciliation(input: {
         targetFairePromotionFailed += count(
           automaticFaireOrderPromotion.failed,
         )
-        targetFaireOperatorReviewRequired += count(
+        targetFairePromotionOperatorReviewRequired += count(
           automaticFaireOrderPromotion.operatorReviewRequired,
         )
         const failedByCode = record(automaticCustomerResolution.failedByCode)
@@ -764,13 +730,11 @@ export async function processCommerceOrderReconciliation(input: {
                     reasonCode: rejectionCode,
                     cohortHash: exactTarget.cohortHash,
                     notBefore: exactTarget.notBefore,
+                    attentionKind: 'exact_refresh',
                   })
-                  if (record(attention).marked !== false) {
-                    targetFaireOperatorReviewRequired += exactRejected
+                  if (record(attention).marked === true) {
+                    targetFaireExactRefreshOperatorReviewRequired += 1
                   }
-                  targetFaireExactRefreshFailureCodes[rejectionCode] = (
-                    targetFaireExactRefreshFailureCodes[rejectionCode] || 0
-                  ) + exactRejected
                 } else {
                   targetFaireExactRefreshSucceeded += 1
                 }
@@ -796,7 +760,7 @@ export async function processCommerceOrderReconciliation(input: {
                 targetFairePromotionFailed += count(
                   exactFairePromotion.failed,
                 )
-                targetFaireOperatorReviewRequired += count(
+                targetFairePromotionOperatorReviewRequired += count(
                   exactFairePromotion.operatorReviewRequired,
                 )
                 for (
@@ -854,9 +818,10 @@ export async function processCommerceOrderReconciliation(input: {
                   reasonCode: code,
                   cohortHash: exactTarget.cohortHash,
                   notBefore: exactTarget.notBefore,
+                  attentionKind: 'exact_refresh',
                 })
-                if (record(attention).marked !== false) {
-                  targetFaireOperatorReviewRequired += 1
+                if (record(attention).marked === true) {
+                  targetFaireExactRefreshOperatorReviewRequired += 1
                 }
                 targetFaireExactRefreshFailureCodes[code] = (
                   targetFaireExactRefreshFailureCodes[code] || 0
@@ -915,11 +880,14 @@ export async function processCommerceOrderReconciliation(input: {
         faireOrdersHeld: targetFaireOrdersHeld,
         fairePromotionFailed: targetFairePromotionFailed,
         fairePromotionFailureCodes: targetFairePromotionFailureCodes,
-        faireOperatorReviewRequired: targetFaireOperatorReviewRequired,
+        fairePromotionOperatorReviewRequired:
+          targetFairePromotionOperatorReviewRequired,
         faireExactRefreshAttempted: targetFaireExactRefreshAttempted,
         faireExactRefreshSucceeded: targetFaireExactRefreshSucceeded,
         faireExactRefreshRejected: targetFaireExactRefreshRejected,
         faireExactRefreshFailed: targetFaireExactRefreshFailed,
+        faireExactRefreshOperatorReviewRequired:
+          targetFaireExactRefreshOperatorReviewRequired,
         faireExactRefreshFailureCodes: targetFaireExactRefreshFailureCodes,
       })
       if (completion.leaseLost) {
@@ -945,7 +913,8 @@ export async function processCommerceOrderReconciliation(input: {
         faireOrdersPromoted += targetFaireOrdersPromoted
         faireOrdersHeld += targetFaireOrdersHeld
         fairePromotionFailed += targetFairePromotionFailed
-        faireOperatorReviewRequired += targetFaireOperatorReviewRequired
+        fairePromotionOperatorReviewRequired +=
+          targetFairePromotionOperatorReviewRequired
         if (completion.faireAutomaticPromotionAttentionRequired) {
           fairePromotionAttentionRequiredAccounts += 1
         }
@@ -953,6 +922,14 @@ export async function processCommerceOrderReconciliation(input: {
         faireExactRefreshSucceeded += targetFaireExactRefreshSucceeded
         faireExactRefreshRejected += targetFaireExactRefreshRejected
         faireExactRefreshFailed += targetFaireExactRefreshFailed
+        faireExactRefreshOperatorReviewRequired +=
+          targetFaireExactRefreshOperatorReviewRequired
+        if (completion.faireExactRefreshAttentionRequired) {
+          faireExactRefreshAttentionRequiredAccounts += 1
+        }
+        if (completion.faireUnattributedAttentionRequired) {
+          faireUnattributedAttentionRequiredAccounts += 1
+        }
         for (
           const [code, value]
           of Object.entries(targetCustomerResolutionFailureCodes)
@@ -1055,55 +1032,70 @@ export async function processCommerceOrderReconciliation(input: {
       providerWrites: 0,
       syncCursorAdvanced: false,
     },
-    automaticShopifyOrderPromotion: {
-      ...shopifyPromotionGateHealth,
-      promoted: shopifyOrdersPromoted,
-      held: shopifyOrdersHeld,
-      actionableHeld: shopifyActionableOrdersHeld,
-      heldByReason: shopifyPromotionHeldReasons,
-      failed: shopifyPromotionFailed,
-      failedByCode: shopifyPromotionFailureCodes,
-      rollbackFenced: shopifyPromotionRollbackFenced,
-      attentionRequiredAccounts:
-        shopifyPromotionAttentionRequiredAccounts,
-      operatorReviewRequired:
-        Math.max(
-          shopifyActionableOrdersHeld + shopifyPromotionFailed,
-          shopifyPromotionAttentionRequiredAccounts,
+    automaticShopifyOrderPromotion:
+      shopifyAutomaticOrderPromotionHealthSnapshot({
+        heartbeat: {
+          promoted: shopifyOrdersPromoted,
+          held: shopifyOrdersHeld,
+          actionableHeld: shopifyActionableOrdersHeld,
+          heldByReason: shopifyPromotionHeldReasons,
+          failed: shopifyPromotionFailed,
+          failedByCode: shopifyPromotionFailureCodes,
+          rollbackFenced: shopifyPromotionRollbackFenced,
+          attentionRequiredAccounts:
+            shopifyPromotionAttentionRequiredAccounts,
+          operatorReviewRequired:
+            Math.max(
+              shopifyActionableOrdersHeld + shopifyPromotionFailed,
+              shopifyPromotionAttentionRequiredAccounts,
+            ),
+          providerWrites: 0,
+          canonicalOrderWrites: shopifyOrdersPromoted,
+          inventoryWrites: 0,
+          syncCursorAdvanced: false,
+        },
+      }),
+    automaticFaireOrderPromotion:
+      faireAutomaticOrderPromotionHealthSnapshot({
+        heartbeat: {
+          promoted: faireOrdersPromoted,
+          held: faireOrdersHeld,
+          failed: fairePromotionFailed,
+          failedByCode: fairePromotionFailureCodes,
+          attentionRequiredAccounts:
+            fairePromotionAttentionRequiredAccounts,
+          operatorReviewRequired: Math.max(
+            fairePromotionOperatorReviewRequired,
+            fairePromotionAttentionRequiredAccounts,
+          ),
+          providerWrites: 0,
+          canonicalOrderWrites: faireOrdersPromoted,
+          inventoryWrites: 0,
+          syncCursorAdvanced: false,
+        },
+      }),
+    automaticFaireExactRefresh:
+      faireAutomaticExactRefreshHealthSnapshot({
+        attempted: faireExactRefreshAttempted,
+        succeeded: faireExactRefreshSucceeded,
+        rejected: faireExactRefreshRejected,
+        failed: faireExactRefreshFailed,
+        failedByCode: faireExactRefreshFailureCodes,
+        operatorReviewRequired: Math.max(
+          faireExactRefreshOperatorReviewRequired,
+          faireExactRefreshAttentionRequiredAccounts,
         ),
-      providerWrites: 0,
-      canonicalOrderWrites: shopifyOrdersPromoted,
-      inventoryWrites: 0,
-      syncCursorAdvanced: false,
-    },
-    automaticFaireOrderPromotion: {
-      promoted: faireOrdersPromoted,
-      held: faireOrdersHeld,
-      failed: fairePromotionFailed,
-      failedByCode: fairePromotionFailureCodes,
-      attentionRequiredAccounts:
-        fairePromotionAttentionRequiredAccounts,
-      operatorReviewRequired: Math.max(
-        faireOperatorReviewRequired,
-        fairePromotionAttentionRequiredAccounts,
-      ),
-      providerWrites: 0,
-      canonicalOrderWrites: faireOrdersPromoted,
-      inventoryWrites: 0,
-      syncCursorAdvanced: false,
-    },
-    automaticFaireExactRefresh: {
-      attempted: faireExactRefreshAttempted,
-      succeeded: faireExactRefreshSucceeded,
-      rejected: faireExactRefreshRejected,
-      failed: faireExactRefreshFailed,
-      failedByCode: faireExactRefreshFailureCodes,
-      operatorReviewRequired:
-        faireExactRefreshRejected + faireExactRefreshFailed,
-      providerWrites: 0,
-      inventoryWrites: 0,
-      syncCursorAdvanced: false,
-    },
+        providerWrites: 0,
+        inventoryWrites: 0,
+        syncCursorAdvanced: false,
+      }),
+    automaticFaireUnattributedAttention:
+      faireUnattributedAttentionHealthSnapshot({
+        attentionRequiredAccounts:
+          faireUnattributedAttentionRequiredAccounts,
+        operatorReviewRequired:
+          faireUnattributedAttentionRequiredAccounts,
+      }),
     failureCodes,
   }
 }

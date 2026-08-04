@@ -36,6 +36,9 @@ import {
   automaticFairePromotionHoldRequiresAttention,
   automaticFaireOrderSourceIsFresh,
   faireAutomaticOrderPromotionGate,
+  AUTOMATIC_FAIRE_EXACT_REFRESH_ATTENTION_MARKER,
+  AUTOMATIC_FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_MARKER,
+  AUTOMATIC_FAIRE_MIXED_ATTENTION_MARKER,
   AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER,
   AUTOMATIC_FAIRE_ORDER_PROMOTION_POLICY_VERSION,
 } from '@/lib/integrations/commerceFaireAutomaticPromotion'
@@ -3189,8 +3192,12 @@ export async function readAutomaticFaireExactRefreshTargetsInPostgres(input: {
          AND candidate.expires_at > now()
          AND candidate.workflow_state IN ('held', 'resolving', 'ready')
          AND candidate.canonical_order_id IS NULL
-         AND candidate.last_error_code IS DISTINCT FROM
-             '${AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER}'
+         AND COALESCE(candidate.last_error_code, '') NOT IN (
+           '${AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER}',
+           '${AUTOMATIC_FAIRE_EXACT_REFRESH_ATTENTION_MARKER}',
+           '${AUTOMATIC_FAIRE_MIXED_ATTENTION_MARKER}',
+           '${AUTOMATIC_FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_MARKER}'
+         )
          AND candidate.normalized_order_status <> 'cancelled'
          AND candidate.normalized_fulfillment_status NOT IN (
            'fulfilled', 'cancelled'
@@ -10903,8 +10910,12 @@ export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
            AND candidate.observed_at >= $5::timestamptz
            AND candidate.expires_at > now()
            AND candidate.workflow_state IN ('held', 'resolving', 'ready')
-           AND candidate.last_error_code IS DISTINCT FROM
-               '${AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER}'
+           AND COALESCE(candidate.last_error_code, '') NOT IN (
+             '${AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER}',
+             '${AUTOMATIC_FAIRE_EXACT_REFRESH_ATTENTION_MARKER}',
+             '${AUTOMATIC_FAIRE_MIXED_ATTENTION_MARKER}',
+             '${AUTOMATIC_FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_MARKER}'
+           )
            AND EXISTS (
              SELECT 1
              FROM operations_commerce_intake_read_intents originating_intent
@@ -12920,10 +12931,20 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
     reasonCode: string
     cohortHash: string
     notBefore: string
+    attentionKind: 'promotion' | 'exact_refresh'
   },
 ) {
   return withTransaction(async (client) => {
     const reasonCode = input.reasonCode.trim()
+    const attentionMarker = input.attentionKind === 'exact_refresh'
+      ? AUTOMATIC_FAIRE_EXACT_REFRESH_ATTENTION_MARKER
+      : AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER
+    const otherAttentionMarker = input.attentionKind === 'exact_refresh'
+      ? AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER
+      : AUTOMATIC_FAIRE_EXACT_REFRESH_ATTENTION_MARKER
+    const action = input.attentionKind === 'exact_refresh'
+      ? 'mark-faire-exact-refresh-attention'
+      : 'mark-faire-auto-promotion-attention'
     if (!/^[A-Za-z][A-Za-z0-9_]{2,127}$/u.test(reasonCode)) {
       intakeError(
         'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_REASON_INVALID',
@@ -12993,14 +13014,17 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
       reasonCode,
       cohortHash: input.cohortHash,
       notBefore: input.notBefore,
-      marker: AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER,
+      attentionKind: input.attentionKind,
+      marker: attentionMarker,
       providerWrites: 0,
       inventoryWrites: 0,
       syncCursorAdvanced: false,
     })
     const prepared = await prepareReceipt(client, {
       organizationId: input.runtime.organizationId,
-      commandType: 'commerce.intake.mark_faire_auto_promotion_attention',
+      commandType: input.attentionKind === 'exact_refresh'
+        ? 'commerce.intake.mark_faire_exact_refresh_attention'
+        : 'commerce.intake.mark_faire_auto_promotion_attention',
       idempotencyKey: input.idempotencyKey,
       requestHash,
       actorEmail: input.actorEmail,
@@ -13218,7 +13242,8 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
           : null
     if (benignResolution) {
       const result = {
-        action: 'mark-faire-auto-promotion-attention',
+        action,
+        attentionKind: input.attentionKind,
         candidateGlobalId: candidate.global_id,
         rowVersion: Number(candidate.row_version),
         marked: false,
@@ -13252,8 +13277,12 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
     }
     if (
       Number(candidate.row_version) !== input.candidateRowVersion
-      && candidate.last_error_code
-        !== AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER
+      && ![
+        attentionMarker,
+        otherAttentionMarker,
+        AUTOMATIC_FAIRE_MIXED_ATTENTION_MARKER,
+        AUTOMATIC_FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_MARKER,
+      ].includes(candidate.last_error_code || '')
     ) {
       intakeError(
         'COMMERCE_INTAKE_ROW_VERSION_CONFLICT',
@@ -13261,8 +13290,39 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
         409,
       )
     }
-    const alreadyMarked = candidate.last_error_code
-      === AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER
+    if (
+      candidate.last_error_code
+        === AUTOMATIC_FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_MARKER
+    ) {
+      const result = {
+        action,
+        attentionKind: 'unattributed' as const,
+        candidateGlobalId: candidate.global_id,
+        rowVersion: Number(candidate.row_version),
+        marked: false,
+        alreadyMarked: true,
+        reasonCode: 'legacy_unattributed_attention_exists',
+        providerWrites: 0,
+        inventoryWrites: 0,
+        syncCursorAdvanced: false,
+        replayed: false,
+      }
+      await completeReceipt(
+        client,
+        prepared.receipt.id,
+        candidate.global_id,
+        result,
+      )
+      return result
+    }
+    const alreadyMarked = [
+      attentionMarker,
+      AUTOMATIC_FAIRE_MIXED_ATTENTION_MARKER,
+    ].includes(candidate.last_error_code || '')
+    const nextAttentionMarker = candidate.last_error_code
+      === otherAttentionMarker
+      ? AUTOMATIC_FAIRE_MIXED_ATTENTION_MARKER
+      : attentionMarker
     let rowVersion = candidate.row_version
     if (!alreadyMarked) {
       const updated = await client.query<{ row_version: string }>(
@@ -13276,7 +13336,7 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
          RETURNING row_version::text`,
         [
           candidate.id,
-          AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER,
+          nextAttentionMarker,
           input.actorEmail,
           candidate.row_version,
         ],
@@ -13291,13 +13351,15 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
       rowVersion = updated.rows[0].row_version
       await recordAuditEvent({
         actor: input.actorEmail,
-        eventType: 'commerce.intake.faire_auto_promotion.attention_marked',
+        eventType: input.attentionKind === 'exact_refresh'
+          ? 'commerce.intake.faire_exact_refresh.attention_marked'
+          : 'commerce.intake.faire_auto_promotion.attention_marked',
         aggregateType: 'operations.commerce_order_candidate',
         aggregateId: candidate.global_id,
         organizationId: candidate.organization_id,
         isSystem: true,
         eventKey:
-          `commerce-intake:${candidate.global_id}:faire-auto-attention:${prepared.receipt.id}`,
+          `commerce-intake:${candidate.global_id}:faire-${input.attentionKind}-attention:${prepared.receipt.id}`,
         payload: {
           provider: 'faire',
           policyVersion: AUTOMATIC_FAIRE_ORDER_PROMOTION_POLICY_VERSION,
@@ -13306,7 +13368,8 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
           cohortHash: input.cohortHash,
           notBefore: input.notBefore,
           reasonCode,
-          marker: AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER,
+          attentionKind: input.attentionKind,
+          marker: nextAttentionMarker,
           providerWrites: 0,
           inventoryWrites: 0,
           syncCursorAdvanced: false,
@@ -13314,7 +13377,8 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
       }, client)
     }
     const result = {
-      action: 'mark-faire-auto-promotion-attention',
+      action,
+      attentionKind: input.attentionKind,
       candidateGlobalId: candidate.global_id,
       rowVersion: Number(rowVersion),
       marked: true,
@@ -13900,8 +13964,12 @@ export async function promoteCommerceCandidateInPostgres(input: {
         || candidate.customer_resolution_state !== 'resolved'
         || !candidate.customer_id
         || !candidate.customer_match_method
-        || candidate.last_error_code
-          === AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER
+        || [
+          AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER,
+          AUTOMATIC_FAIRE_EXACT_REFRESH_ATTENTION_MARKER,
+          AUTOMATIC_FAIRE_MIXED_ATTENTION_MARKER,
+          AUTOMATIC_FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_MARKER,
+        ].includes(candidate.last_error_code || '')
         || operationalLines.some((line) => {
           const quantity = exactWholeCommerceQuantityFromNumeric(
             line.unfulfilled_quantity,

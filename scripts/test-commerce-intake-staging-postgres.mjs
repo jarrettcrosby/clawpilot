@@ -5359,7 +5359,11 @@ async function verifyAutomaticFaireExactRefreshLineage(
   )
   const reconciliationPersistence =
     loadCommerceOrderReconciliationPersistence(pool)
-  const completeFaireAttentionScan = async (currentReviewRequired) => {
+  const completeFaireAttentionScan = async ({
+    promotionReviewRequired = 0,
+    exactRefreshReviewRequired = 0,
+    failureCode = null,
+  } = {}) => {
     const shopifyStatus = (await pool.query(
       `SELECT status
        FROM operations_integration_accounts
@@ -5391,6 +5395,22 @@ async function verifyAutomaticFaireExactRefreshLineage(
         .claimCommerceOrderReconciliationTargetsInPostgres({ limit: 1 })
       assert.equal(claimed.length, 1)
       assert.equal(claimed[0].provider, 'faire')
+      if (failureCode) {
+        const failed = await reconciliationPersistence
+          .failCommerceOrderReconciliationInPostgres({
+            target: claimed[0],
+            error: { code: failureCode },
+          })
+        assert.equal(failed.leaseLost, false)
+        const health = await reconciliationPersistence
+          .readCommerceOrderReconciliationHealthFromPostgres()
+        const state = await reconciliationPersistence
+          .readCommerceOrderReconciliationStateInPostgres({
+            organizationId: ids.organization,
+            accountGlobalId: runtime.globalId,
+          })
+        return { failed, health, state }
+      }
       const completed = await reconciliationPersistence
         .completeCommerceOrderReconciliationInPostgres({
           target: claimed[0],
@@ -5416,11 +5436,13 @@ async function verifyAutomaticFaireExactRefreshLineage(
           faireOrdersHeld: 0,
           fairePromotionFailed: 0,
           fairePromotionFailureCodes: {},
-          faireOperatorReviewRequired: currentReviewRequired,
+          fairePromotionOperatorReviewRequired: promotionReviewRequired,
           faireExactRefreshAttempted: 0,
           faireExactRefreshSucceeded: 0,
           faireExactRefreshRejected: 0,
           faireExactRefreshFailed: 0,
+          faireExactRefreshOperatorReviewRequired:
+            exactRefreshReviewRequired,
           faireExactRefreshFailureCodes: {},
         })
       assert.equal(completed.leaseLost, false)
@@ -5830,6 +5852,7 @@ async function verifyAutomaticFaireExactRefreshLineage(
       reasonCode: 'COMMERCE_FAIRE_EXACT_REFRESH_INTERRUPTED',
       cohortHash: promotionCohortHash,
       notBefore: promotionNotBefore,
+      attentionKind: 'exact_refresh',
     })
   assert.equal(supersededAttention.marked, false)
   assert.equal(supersededAttention.reasonCode, 'newer_candidate_exists')
@@ -5838,6 +5861,29 @@ async function verifyAutomaticFaireExactRefreshLineage(
     staleCandidate.row_version,
     'Verified newer-candidate authority must resolve benignly before a stale row-version conflict',
   )
+  const resolvedMarkerScan = await completeFaireAttentionScan()
+  assert.equal(
+    resolvedMarkerScan.completed.faireAutomaticPromotionAttentionRequired,
+    false,
+  )
+  assert.equal(
+    resolvedMarkerScan.completed.faireExactRefreshAttentionRequired,
+    false,
+    'A marked:false exact race must persist neither attention subtype',
+  )
+  assert.equal(
+    resolvedMarkerScan.completed.faireUnattributedAttentionRequired,
+    false,
+  )
+  assert.equal(
+    resolvedMarkerScan.health.providerPromotionAttentionRequired.faire,
+    0,
+  )
+  assert.equal(
+    resolvedMarkerScan.health.faireExactRefreshAttentionRequired,
+    0,
+  )
+  assert.equal(resolvedMarkerScan.state.operatorAttentionRequired, false)
   let exactCandidate = (await pool.query(
     `SELECT global_id, row_version::integer, source_hash,
             header_money_state, header_money_gaps
@@ -6345,6 +6391,7 @@ async function verifyAutomaticFaireExactRefreshLineage(
     reasonCode: 'COMMERCE_FAIRE_EXACT_REFRESH_NORMALIZATION_REJECTED',
     cohortHash: promotionCohortHash,
     notBefore: promotionNotBefore,
+    attentionKind: 'exact_refresh',
   }
   const exactRejectionAttention = await persistence
     .markAutomaticFaireOrderPromotionAttentionInPostgres(
@@ -6367,14 +6414,14 @@ async function verifyAutomaticFaireExactRefreshLineage(
              FROM operations_command_receipts receipt
              WHERE receipt.organization_id = candidate.organization_id
                AND receipt.command_type =
-                   'commerce.intake.mark_faire_auto_promotion_attention'
+                   'commerce.intake.mark_faire_exact_refresh_attention'
                AND receipt.idempotency_key = $3) AS receipt_count,
             (SELECT count(*)::integer
              FROM audit_events event
              WHERE event.organization_id = candidate.organization_id
                AND event.aggregate_id = candidate.global_id
                AND event.event_type =
-                   'commerce.intake.faire_auto_promotion.attention_marked')
+                   'commerce.intake.faire_exact_refresh.attention_marked')
               AS audit_count
      FROM operations_commerce_order_candidates candidate
      WHERE candidate.organization_id = $1::uuid
@@ -6387,7 +6434,7 @@ async function verifyAutomaticFaireExactRefreshLineage(
   )).rows[0]
   assert.deepEqual(exactRejectionAttentionEvidence, {
     last_error_code:
-      'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED',
+      'COMMERCE_FAIRE_EXACT_REFRESH_ATTENTION_REQUIRED',
     row_version: rejectionSourceCandidate.row_version + 1,
     receipt_count: 1,
     audit_count: 1,
@@ -6401,6 +6448,189 @@ async function verifyAutomaticFaireExactRefreshLineage(
       (target) => target.candidateGlobalId
         === rejectionSourceCandidate.global_id,
     ), false, 'A marked exact outcome must not issue another provider read')
+  const exactOnlyAttentionScan = await completeFaireAttentionScan({
+    exactRefreshReviewRequired: 1,
+  })
+  assert.equal(
+    exactOnlyAttentionScan.completed.faireAutomaticPromotionAttentionRequired,
+    false,
+  )
+  assert.equal(
+    exactOnlyAttentionScan.completed.faireExactRefreshAttentionRequired,
+    true,
+  )
+  assert.equal(
+    exactOnlyAttentionScan.completed.faireUnattributedAttentionRequired,
+    false,
+  )
+  assert.equal(
+    exactOnlyAttentionScan.health.providerPromotionAttentionRequired.faire,
+    0,
+    'Exact-only durable attention must not enter the promotion bucket',
+  )
+  assert.equal(
+    exactOnlyAttentionScan.health.faireExactRefreshAttentionRequired,
+    1,
+  )
+  assert.equal(
+    exactOnlyAttentionScan.health.operatorAttentionRequired,
+    1,
+    'The aggregate account count must count one exact-only account once',
+  )
+  assert.equal(
+    exactOnlyAttentionScan.state.automaticPromotionAttentionRequired,
+    false,
+  )
+  assert.equal(
+    exactOnlyAttentionScan.state.automaticExactRefreshAttentionRequired,
+    true,
+  )
+  assert.equal(
+    exactOnlyAttentionScan.state.automaticUnattributedAttentionRequired,
+    false,
+  )
+  const emptyExactOnlyAttentionScan = await completeFaireAttentionScan()
+  assert.equal(
+    emptyExactOnlyAttentionScan.completed
+      .faireAutomaticPromotionAttentionRequired,
+    false,
+  )
+  assert.equal(
+    emptyExactOnlyAttentionScan.completed.faireExactRefreshAttentionRequired,
+    true,
+    'A later empty poll must retain exact-only candidate attribution',
+  )
+  assert.equal(
+    emptyExactOnlyAttentionScan.health.providerPromotionAttentionRequired.faire,
+    0,
+  )
+  assert.equal(
+    emptyExactOnlyAttentionScan.health.faireExactRefreshAttentionRequired,
+    1,
+  )
+  const legacyCandidate = (await pool.query(
+    `UPDATE operations_commerce_order_candidates
+     SET last_error_code =
+           'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED',
+         row_version = row_version + 1,
+         updated_by = 'system:commerce-order-reconciliation',
+         updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND global_id = $3
+     RETURNING row_version::integer`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      rejectionSourceCandidate.global_id,
+    ],
+  )).rows[0]
+  await pool.query(
+    `UPDATE operations_commerce_sync_cursors
+     SET last_error_code = 'COMMERCE_ORDER_RECONCILIATION_PROVIDER_FAILED',
+         updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND resource = 'orders'`,
+    [ids.organization, ids.faireIntegrationAccount],
+  )
+  await pool.query(
+    `ALTER TABLE operations_commerce_sync_cursors
+       DROP COLUMN automatic_promotion_attention_required,
+       DROP COLUMN automatic_exact_refresh_attention_required,
+       DROP COLUMN automatic_unattributed_attention_required`,
+  )
+  await pool.query(read(
+    'db/migrations/0251_operations_commerce_order_attention_kinds.sql',
+  ))
+  const legacyMigrationState = await reconciliationPersistence
+    .readCommerceOrderReconciliationStateInPostgres({
+      organizationId: ids.organization,
+      accountGlobalId: runtime.globalId,
+    })
+  assert.equal(
+    legacyMigrationState.lastErrorCode,
+    'COMMERCE_ORDER_RECONCILIATION_PROVIDER_FAILED',
+    'The migration test must begin with an overwritten cursor error code',
+  )
+  assert.equal(
+    legacyMigrationState.automaticPromotionAttentionRequired,
+    false,
+    'A legacy generic marker must not be backfilled as promotion',
+  )
+  assert.equal(
+    legacyMigrationState.automaticExactRefreshAttentionRequired,
+    false,
+    'A legacy generic marker must not be guessed as exact refresh',
+  )
+  assert.equal(
+    legacyMigrationState.automaticUnattributedAttentionRequired,
+    true,
+    'Candidate evidence must recover legacy attention after cursor error overwrite',
+  )
+  assert.equal(legacyMigrationState.operatorAttentionRequired, true)
+  const legacyRemark = await persistence
+    .markAutomaticFaireOrderPromotionAttentionInPostgres({
+      ...exactRejectionAttentionInput,
+      idempotencyKey: 'commerce-staging-faire-legacy-attention-remark',
+      candidateRowVersion: legacyCandidate.row_version,
+      reasonCode: 'validation_blocked',
+      attentionKind: 'promotion',
+    })
+  assert.equal(legacyRemark.marked, false)
+  assert.equal(legacyRemark.alreadyMarked, true)
+  assert.equal(legacyRemark.attentionKind, 'unattributed')
+  assert.equal(
+    (await pool.query(
+      `SELECT last_error_code
+       FROM operations_commerce_order_candidates
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND global_id = $3`,
+      [
+        ids.organization,
+        ids.faireIntegrationAccount,
+        rejectionSourceCandidate.global_id,
+      ],
+    )).rows[0].last_error_code,
+    'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED',
+    'A new typed attempt must not relabel ambiguous legacy evidence',
+  )
+  const legacyFailureScan = await completeFaireAttentionScan({
+    failureCode: 'COMMERCE_ORDER_RECONCILIATION_PROVIDER_FAILED',
+  })
+  assert.equal(
+    legacyFailureScan.health.providerPromotionAttentionRequired.faire,
+    0,
+  )
+  assert.equal(legacyFailureScan.health.faireExactRefreshAttentionRequired, 0)
+  assert.equal(legacyFailureScan.health.faireUnattributedAttentionRequired, 1)
+  assert.equal(legacyFailureScan.health.operatorAttentionRequired, 1)
+  assert.equal(
+    legacyFailureScan.state.automaticUnattributedAttentionRequired,
+    true,
+    'A reconciliation failure must not erase legacy aggregate attention',
+  )
+  const legacyEmptyAttentionScan = await completeFaireAttentionScan()
+  assert.equal(
+    legacyEmptyAttentionScan.completed
+      .faireAutomaticPromotionAttentionRequired,
+    false,
+  )
+  assert.equal(
+    legacyEmptyAttentionScan.completed.faireExactRefreshAttentionRequired,
+    false,
+  )
+  assert.equal(
+    legacyEmptyAttentionScan.completed.faireUnattributedAttentionRequired,
+    true,
+    'A later empty poll must preserve legacy unattributed candidate evidence',
+  )
+  assert.equal(
+    legacyEmptyAttentionScan.health.faireUnattributedAttentionRequired,
+    1,
+  )
+  assert.equal(legacyEmptyAttentionScan.health.operatorAttentionRequired, 1)
   const mismatchedExactRead = {
     providerAttemptId: randomUUID(),
     providerAttemptGlobalId: 'gxa000000009246',
@@ -6786,6 +7016,7 @@ async function verifyAutomaticFaireExactRefreshLineage(
     reasonCode: packTargets[0].reason,
     cohortHash: promotionCohortHash,
     notBefore: promotionNotBefore,
+    attentionKind: 'promotion',
   }
   const packAttention = await persistence
     .markAutomaticFaireOrderPromotionAttentionInPostgres(packAttentionInput)
@@ -6799,54 +7030,162 @@ async function verifyAutomaticFaireExactRefreshLineage(
       runGlobalId: packExactStage.runGlobalId,
     })).length, 0, 'Marked actionable Faire candidates must leave the selector')
 
-  const attentionScan = await completeFaireAttentionScan(1)
+  await persistence.markCommerceCandidateUnsupportedInPostgres({
+    runtime,
+    actorEmail: humanActor,
+    idempotencyKey: 'commerce-staging-faire-auto-rejection-resolved',
+    candidateGlobalId: rejectionSourceCandidate.global_id,
+    candidateRowVersion: legacyCandidate.row_version,
+    reasonCode: 'operator_resolved',
+    reason: 'Operator reviewed and resolved the exact-read rejection.',
+  })
+  const promotionOnlyAttentionScan = await completeFaireAttentionScan({
+    promotionReviewRequired: 1,
+  })
+  assert.equal(
+    promotionOnlyAttentionScan.completed
+      .faireAutomaticPromotionAttentionRequired,
+    true,
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.completed.faireExactRefreshAttentionRequired,
+    false,
+    'Promotion-only attention must not enter the exact-refresh bucket',
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.completed.faireUnattributedAttentionRequired,
+    false,
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.health.providerPromotionAttentionRequired.faire,
+    1,
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.health.faireExactRefreshAttentionRequired,
+    0,
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.health.operatorAttentionRequired,
+    1,
+    'A promotion-only account must count once in aggregate operator attention',
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.state.automaticPromotionAttentionRequired,
+    true,
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.state.automaticExactRefreshAttentionRequired,
+    false,
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.state.automaticUnattributedAttentionRequired,
+    false,
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.state.lastErrorCode,
+    'COMMERCE_FAIRE_PROMOTION_ATTENTION_REQUIRED',
+    'New promotion attention must never reuse the ambiguous legacy marker',
+  )
+
+  const packMixedAttention = await persistence
+    .markAutomaticFaireOrderPromotionAttentionInPostgres({
+      ...packAttentionInput,
+      idempotencyKey: 'commerce-staging-faire-auto-pack-exact-attention',
+      candidateRowVersion: packAttention.rowVersion,
+      reasonCode: 'COMMERCE_FAIRE_EXACT_REFRESH_INTERRUPTED',
+      attentionKind: 'exact_refresh',
+    })
+  assert.equal(packMixedAttention.marked, true)
+  assert.equal(packMixedAttention.alreadyMarked, false)
+  assert.equal((await pool.query(
+    `SELECT last_error_code
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND global_id = $3`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      packAttention.candidateGlobalId,
+    ],
+  )).rows[0].last_error_code,
+  'COMMERCE_FAIRE_PROMOTION_AND_EXACT_REFRESH_ATTENTION_REQUIRED')
+
+  const attentionScan = await completeFaireAttentionScan({
+    promotionReviewRequired: 1,
+    exactRefreshReviewRequired: 1,
+  })
   assert.equal(
     attentionScan.completed.faireAutomaticPromotionAttentionRequired,
     true,
   )
   assert.equal(
+    attentionScan.completed.faireExactRefreshAttentionRequired,
+    true,
+    'Mixed unresolved candidates must retain both attention subtypes',
+  )
+  assert.equal(
+    attentionScan.completed.faireUnattributedAttentionRequired,
+    false,
+  )
+  assert.equal(
     attentionScan.health.providerPromotionAttentionRequired.faire,
     1,
   )
+  assert.equal(attentionScan.health.faireExactRefreshAttentionRequired, 1)
+  assert.equal(
+    attentionScan.health.operatorAttentionRequired,
+    1,
+    'A mixed account must count once in aggregate operator attention',
+  )
   assert.equal(attentionScan.state.automaticPromotionAttentionRequired, true)
-  const emptyAttentionScan = await completeFaireAttentionScan(0)
+  assert.equal(
+    attentionScan.state.automaticExactRefreshAttentionRequired,
+    true,
+  )
+  const emptyAttentionScan = await completeFaireAttentionScan()
   assert.equal(
     emptyAttentionScan.completed.faireAutomaticPromotionAttentionRequired,
     true,
     'A later empty root scan must retain candidate-scoped Faire attention',
   )
   assert.equal(
+    emptyAttentionScan.completed.faireExactRefreshAttentionRequired,
+    true,
+    'A later empty root scan must preserve mixed subtype attribution',
+  )
+  assert.equal(
     emptyAttentionScan.health.providerPromotionAttentionRequired.faire,
     1,
   )
+  assert.equal(emptyAttentionScan.health.faireExactRefreshAttentionRequired, 1)
   assert.equal(
     emptyAttentionScan.state.automaticPromotionAttentionRequired,
+    true,
+  )
+  assert.equal(
+    emptyAttentionScan.state.automaticExactRefreshAttentionRequired,
     true,
   )
 
   await persistence.markCommerceCandidateUnsupportedInPostgres({
     runtime,
     actorEmail: humanActor,
-    idempotencyKey: 'commerce-staging-faire-auto-rejection-resolved',
-    candidateGlobalId: rejectionSourceCandidate.global_id,
-    candidateRowVersion: exactRejectionAttention.rowVersion,
-    reasonCode: 'operator_resolved',
-    reason: 'Operator reviewed and resolved the exact-read rejection.',
-  })
-  await persistence.markCommerceCandidateUnsupportedInPostgres({
-    runtime,
-    actorEmail: humanActor,
     idempotencyKey: 'commerce-staging-faire-auto-pack-resolved',
     candidateGlobalId: packAttention.candidateGlobalId,
-    candidateRowVersion: packAttention.rowVersion,
+    candidateRowVersion: packMixedAttention.rowVersion,
     reasonCode: 'operator_resolved',
     reason: 'Operator reviewed and resolved the package mapping hold.',
   })
   const markerHistory = (await pool.query(
     `SELECT
        count(*) FILTER (
-         WHERE last_error_code =
-           'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED'
+         WHERE last_error_code IN (
+           'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED',
+           'COMMERCE_FAIRE_PROMOTION_ATTENTION_REQUIRED',
+           'COMMERCE_FAIRE_EXACT_REFRESH_ATTENTION_REQUIRED',
+           'COMMERCE_FAIRE_PROMOTION_AND_EXACT_REFRESH_ATTENTION_REQUIRED'
+         )
        )::integer AS active_markers,
        count(*) FILTER (
          WHERE external_order_id = $3
@@ -6861,7 +7200,7 @@ async function verifyAutomaticFaireExactRefreshLineage(
     active_markers: 0,
     historical_unmarked: 2,
   })
-  const clearedAttentionScan = await completeFaireAttentionScan(0)
+  const clearedAttentionScan = await completeFaireAttentionScan()
   assert.equal(
     clearedAttentionScan.completed.faireAutomaticPromotionAttentionRequired,
     false,
@@ -6871,8 +7210,18 @@ async function verifyAutomaticFaireExactRefreshLineage(
     clearedAttentionScan.health.providerPromotionAttentionRequired.faire,
     0,
   )
+  assert.equal(clearedAttentionScan.health.faireExactRefreshAttentionRequired, 0)
+  assert.equal(clearedAttentionScan.health.faireUnattributedAttentionRequired, 0)
   assert.equal(
     clearedAttentionScan.state.automaticPromotionAttentionRequired,
+    false,
+  )
+  assert.equal(
+    clearedAttentionScan.state.automaticExactRefreshAttentionRequired,
+    false,
+  )
+  assert.equal(
+    clearedAttentionScan.state.automaticUnattributedAttentionRequired,
     false,
   )
   assert.equal(clearedAttentionScan.state.lastErrorCode, null)

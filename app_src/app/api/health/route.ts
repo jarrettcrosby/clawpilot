@@ -35,6 +35,14 @@ import {
   readFaireProductImageProjectionHealthInPostgres,
 } from '@/lib/persistence/faireProductImageProjection'
 import { commerceIntakeRuntimeAvailable } from '@/lib/integrations/commerceIntake'
+import {
+  faireAutomaticExactRefreshHealthSnapshot,
+  faireAutomaticOrderPromotionHealthSnapshot,
+  faireUnattributedAttentionHealthSnapshot,
+} from '@/lib/integrations/commerceFaireAutomaticPromotion'
+import {
+  shopifyAutomaticOrderPromotionHealthSnapshot,
+} from '@/lib/integrations/commerceShopifyAutomaticPromotion'
 import { effectiveDocumentEmbeddingConfiguration } from '@/lib/documentEmbeddings'
 import { validateShortLinkConfiguration } from '@/lib/shortlinks'
 import { readSuiteCrmWorkerHeartbeat } from '@/lib/persistence/crm'
@@ -120,6 +128,14 @@ export async function GET() {
     }
     let commerceOrderReconciliationWorker: Record<string, unknown> = {
       status: 'disabled',
+      automaticShopifyOrderPromotion:
+        shopifyAutomaticOrderPromotionHealthSnapshot(),
+      automaticFaireOrderPromotion:
+        faireAutomaticOrderPromotionHealthSnapshot(),
+      automaticFaireExactRefresh:
+        faireAutomaticExactRefreshHealthSnapshot(),
+      automaticFaireUnattributedAttention:
+        faireUnattributedAttentionHealthSnapshot(),
     }
     let shopifyInventoryRefreshWorker: Record<string, unknown> = {
       status: 'disabled',
@@ -348,6 +364,7 @@ export async function GET() {
           operations_shopify_order_preview_migration_applied: boolean
           operations_commerce_normalization_migration_applied: boolean
           operations_commerce_continuations_migration_applied: boolean
+          operations_commerce_order_attention_kinds_applied: boolean
           operations_carrier_rate_test_labels_migration_applied: boolean
           operations_print_agent_capabilities_migration_applied: boolean
           operations_carrier_label_artifacts_migration_applied: boolean
@@ -908,6 +925,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0115_operations_commerce_intake_continuations.sql'
               ) AS operations_commerce_continuations_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0251_operations_commerce_order_attention_kinds.sql'
+              ) AS operations_commerce_order_attention_kinds_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -2389,6 +2411,7 @@ export async function GET() {
             && row?.operations_shopify_order_preview_migration_applied
             && row?.operations_commerce_normalization_migration_applied
             && row?.operations_commerce_continuations_migration_applied
+            && row?.operations_commerce_order_attention_kinds_applied
             && row?.operations_carrier_rate_test_labels_migration_applied
             && row?.operations_print_agent_capabilities_migration_applied
             && row?.operations_carrier_label_artifacts_migration_applied
@@ -2560,6 +2583,7 @@ export async function GET() {
           || !row?.operations_shopify_order_preview_migration_applied
           || !row?.operations_commerce_normalization_migration_applied
           || !row?.operations_commerce_continuations_migration_applied
+          || !row?.operations_commerce_order_attention_kinds_applied
           || !row?.operations_carrier_rate_test_labels_migration_applied
           || !row?.operations_print_agent_capabilities_migration_applied
           || !row?.operations_carrier_label_artifacts_migration_applied
@@ -3271,6 +3295,7 @@ export async function GET() {
             commerceIntakeRuntimeAvailable()
             && row?.operations_commerce_continuations_migration_applied
             && row?.operations_commerce_normalization_migration_applied
+            && row?.operations_commerce_order_attention_kinds_applied
           ) {
             const orderHeartbeat =
               await readCommerceOrderReconciliationWorkerHeartbeatFromPostgres()
@@ -3298,7 +3323,7 @@ export async function GET() {
             )
             const operationalDegraded = (
               orderState.failed > 0
-              || orderState.promotionAttentionRequired > 0
+              || orderState.operatorAttentionRequired > 0
               || orderState.staleProcessing > 0
               || orderState.overdue > 0
             )
@@ -3312,9 +3337,23 @@ export async function GET() {
               phase: orderHeartbeat?.phase || null,
               ageMs: orderAgeMs,
               automaticShopifyOrderPromotion:
-                orderHeartbeat?.automaticShopifyOrderPromotion || null,
+                shopifyAutomaticOrderPromotionHealthSnapshot({
+                  heartbeat:
+                    orderHeartbeat?.automaticShopifyOrderPromotion,
+                }),
               automaticFaireOrderPromotion:
-                orderHeartbeat?.automaticFaireOrderPromotion || null,
+                faireAutomaticOrderPromotionHealthSnapshot({
+                  heartbeat:
+                    orderHeartbeat?.automaticFaireOrderPromotion,
+                }),
+              automaticFaireExactRefresh:
+                faireAutomaticExactRefreshHealthSnapshot(
+                  orderHeartbeat?.automaticFaireExactRefresh,
+                ),
+              automaticFaireUnattributedAttention:
+                faireUnattributedAttentionHealthSnapshot(
+                  orderHeartbeat?.automaticFaireUnattributedAttention,
+                ),
               ...orderState,
             }
             if (!loopReachable) {
@@ -3337,6 +3376,16 @@ export async function GET() {
             if (orderState.providerPromotionAttentionRequired.faire > 0) {
               warnings.push(
                 'Faire provider reads completed, but automatic local order promotion needs operator attention.',
+              )
+            }
+            if (orderState.faireExactRefreshAttentionRequired > 0) {
+              warnings.push(
+                'Faire exact order refresh needs operator attention.',
+              )
+            }
+            if (orderState.faireUnattributedAttentionRequired > 0) {
+              warnings.push(
+                'Legacy Faire order attention needs operator review; its original subtype is unavailable.',
               )
             }
             if (orderState.staleProcessing > 0) {
