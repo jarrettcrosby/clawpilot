@@ -557,6 +557,20 @@ includes(adminRoute, [
   'providerScopes: SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES',
   'providerScopes: FAIRE_API_SCOPES',
 ], 'Commerce admin route')
+includes(adminRoute, [
+  'async function refreshedCommerceIntegrations(',
+  'await mutation',
+  'return getCommerceIntegrationsState(organization)',
+], 'Commerce mutation response refresh')
+assert.equal(
+  (
+    adminRoute.match(
+      /const integrations = await refreshedCommerceIntegrations\(/g,
+    ) || []
+  ).length,
+  8,
+  'Every commerce mutation that returns integration state must restore computed account fields',
+)
 const faireApiKeyRouteSource = adminRoute.slice(
   adminRoute.indexOf("if (action === 'connect-faire-api-key')"),
   adminRoute.indexOf("if (action === 'test-connection')"),
@@ -2275,12 +2289,11 @@ const commerceStateSource = service.slice(
   service.indexOf('export async function getCommerceIntegrationsState'),
   service.indexOf('export async function connectShopifyCommerce'),
 )
-assert.ok(
-  commerceStateSource.includes(
-    'await purgeExpiredShopifyOrderPreviewsInPostgres()',
-  ),
-  'Sales-channel reads must opportunistically purge expired Shopify previews',
-)
+includes(commerceStateSource, [
+  'await purgeExpiredShopifyOrderPreviewsInPostgres()',
+  "webhookUrl: account.provider === 'shopify'",
+  'webhookUrl(account.globalId)',
+], 'Sales-channel state enrichment')
 
 const previewRoute = read(
   'app_src/app/api/integrations/commerce/shopify/order-preview/route.ts',
