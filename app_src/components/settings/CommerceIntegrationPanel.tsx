@@ -56,6 +56,8 @@ import IntegrationSetupJourney, {
 import CommerceIntakeWorkflow from '@/components/settings/CommerceIntakeWorkflow'
 import ShopifyCarrierServiceSetupPanel
   from '@/components/settings/ShopifyCarrierServiceSetupPanel'
+import { resolveCommerceSetupPermissionGuidance }
+  from '@/lib/integrations/commerceSetupGuidance'
 
 type CommerceProvider = 'shopify' | 'faire'
 type CommerceEnvironment = 'sandbox' | 'production'
@@ -180,6 +182,8 @@ type CommerceCatalog = {
       developerPortalUrl: string
       setupGuideUrl: string
       tokenGuideUrl: string
+      restrictedOrderScopeApprovalUrl: string
+      protectedCustomerDataApprovalUrl: string
       defaultAppUrl: string
       apiVersion: string
       requiredBeforeConnect: readonly string[]
@@ -200,6 +204,8 @@ type CommerceCatalog = {
       setupGuideUrl: string
       directTokenGuideUrl: string
       callbackUrl: string
+      brandApiKeyRequiredBeforeConnect: readonly string[]
+      oauthRequiredBeforeConnect: readonly string[]
       requiredBeforeConnect: readonly string[]
       supportContact: string
       minimumProbeScope: string
@@ -998,15 +1004,15 @@ export default function CommerceIntegrationPanel() {
   }
 
   async function copySetupChecklistScopes() {
-    if (!setupChecklistProvider || !catalog) return
-    const providerScopes = catalog.providers[setupChecklistProvider].providerScopes || []
-    const value = providerScopes.join(', ')
+    if (!setupChecklistProvider || !setupPermissionGuidance?.copyable) return
+    const provider = setupChecklistProvider
+    const value = setupPermissionGuidance.scopes.join(', ')
     if (!value) return
     try {
       await navigator.clipboard.writeText(value)
-      setCopiedSetupScopes(setupChecklistProvider)
+      setCopiedSetupScopes(setupPermissionGuidanceKey)
       setTimeout(() => setCopiedSetupScopes(null), 1_200)
-      setNotice(`${providerLabel(setupChecklistProvider)} setup scopes copied.`)
+      setNotice(`${providerLabel(provider)} setup scopes copied.`)
     } catch {
       setError('Could not copy setup scopes. Select and copy the list manually.')
     }
@@ -1061,14 +1067,29 @@ export default function CommerceIntegrationPanel() {
   const faireConnectionState = connectionSetupState(faireAccount)
   const shopifyRequiredSetupChecklist = (catalog?.onboarding.shopify.requiredBeforeConnect || [])
     .join(' → ') || 'From the Shopify setup guide'
-  const faireRequiredSetupChecklist = (catalog?.onboarding.faire.requiredBeforeConnect || [])
+  const faireRequiredSetupSteps = faire.authPath === 'brand_api_key'
+    ? catalog?.onboarding.faire.brandApiKeyRequiredBeforeConnect || []
+    : catalog?.onboarding.faire.oauthRequiredBeforeConnect || []
+  const faireRequiredSetupChecklist = faireRequiredSetupSteps
     .join(' → ') || 'From the Faire setup guide'
-  const setupChecklistCatalog = setupChecklistProvider && catalog
-    ? catalog.onboarding[setupChecklistProvider]
-    : null
-  const setupChecklistScopes = setupChecklistProvider && catalog
-    ? catalog.providers[setupChecklistProvider].providerScopes || []
-    : []
+  const setupChecklistSteps = setupChecklistProvider === 'shopify'
+    ? catalog?.onboarding.shopify.requiredBeforeConnect || []
+    : setupChecklistProvider === 'faire'
+      ? faireRequiredSetupSteps
+      : []
+  const setupPermissionGuidance = resolveCommerceSetupPermissionGuidance({
+    provider: setupChecklistProvider,
+    shopifyScopes: catalog?.providers.shopify.providerScopes || [],
+    faireAuthPath: faire.authPath,
+    faireScopeProfile: faire.scopeProfile,
+    faireScopeProfiles: catalog?.onboarding.faire.scopeProfiles || {
+      connection_test: [],
+      distributed_operations: [],
+    },
+  })
+  const setupPermissionGuidanceKey = setupChecklistProvider === 'faire'
+    ? `faire:${faire.authPath}:${faire.scopeProfile}`
+    : setupChecklistProvider || ''
 
   return (
     <Stack spacing={3}>
@@ -1109,20 +1130,24 @@ export default function CommerceIntegrationPanel() {
         fullWidth
       >
         <DialogTitle>
-          {setupChecklistProvider === 'shopify' ? 'Shopify setup checklist' : 'Faire setup checklist'}
+          {setupChecklistProvider === 'shopify'
+            ? 'Shopify setup checklist'
+            : faire.authPath === 'brand_api_key'
+              ? 'Faire generated API-key setup'
+              : 'Faire Custom App OAuth setup'}
         </DialogTitle>
         <DialogContent>
           <Typography variant="body2" color="text.secondary">
             Complete these provider-side steps in order, then return to ClawPilot to verify the connection.
           </Typography>
           <Stack component="ol" spacing={1} sx={{ mt: 1.5, mb: 0, pl: 2.5 }}>
-            {(setupChecklistCatalog?.requiredBeforeConnect || []).map((step, index) => (
+            {setupChecklistSteps.map((step, index) => (
               <Typography component="li" key={step} variant="body2" sx={{ pl: 0.5 }}>
                 <strong>Step {index + 1}.</strong> {step}
               </Typography>
             ))}
           </Stack>
-          {setupChecklistScopes.length ? (
+          {setupPermissionGuidance ? (
             <Box
               sx={{
                 mt: 2,
@@ -1139,36 +1164,79 @@ export default function CommerceIntegrationPanel() {
                 justifyContent="space-between"
               >
                 <Typography variant="subtitle2">
-                  {setupChecklistProvider === 'shopify'
-                    ? 'Exact Shopify app scopes ClawPilot expects'
-                    : 'Faire permissions ClawPilot verifies'}
+                  {setupPermissionGuidance.heading}
                 </Typography>
-                <Button
-                  size="small"
-                  startIcon={<ContentCopyRounded fontSize="small" />}
-                  onClick={() => void copySetupChecklistScopes()}
-                  disabled={setupChecklistProvider === null}
-                >
-                  {copiedSetupScopes === setupChecklistProvider
-                    ? 'Copied'
-                    : 'Copy scope list'}
-                </Button>
+                {setupPermissionGuidance.copyable ? (
+                  <Button
+                    size="small"
+                    startIcon={<ContentCopyRounded fontSize="small" />}
+                    onClick={() => void copySetupChecklistScopes()}
+                  >
+                    {copiedSetupScopes === setupPermissionGuidanceKey
+                      ? 'Copied'
+                      : 'Copy scope list'}
+                  </Button>
+                ) : null}
               </Stack>
               <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
-                {setupChecklistProvider === 'shopify'
-                  ? 'Copy this list into the Shopify app-version permission screen. ClawPilot verifies the granted scopes before enabling each capability.'
-                  : 'These permissions describe the Faire access ClawPilot verifies for the selected connection path. Generated brand API-key access is issued by Faire rather than entered as an app-version scope list.'}
+                {setupPermissionGuidance.description}
               </Typography>
-              <Stack direction="row" gap={0.75} flexWrap="wrap">
-                {setupChecklistScopes.map((scope) => (
-                  <Chip
-                    key={scope}
-                    size="small"
-                    label={`${setupChecklistProvider}: ${scope}`}
-                  />
-                ))}
-              </Stack>
+              {setupPermissionGuidance.scopes.length ? (
+                <Stack direction="row" gap={0.75} flexWrap="wrap" sx={{ mt: 1 }}>
+                  {setupPermissionGuidance.scopes.map((scope) => (
+                    <Chip
+                      key={scope}
+                      size="small"
+                      label={`${setupChecklistProvider}: ${scope}`}
+                    />
+                  ))}
+                </Stack>
+              ) : null}
             </Box>
+          ) : null}
+          {setupChecklistProvider === 'shopify' && catalog ? (
+            <Stack spacing={1.25} sx={{ mt: 2 }}>
+              <Alert severity="warning">
+                <Typography variant="subtitle2">
+                  Separate restricted-scope approval · <code>read_all_orders</code>
+                </Typography>
+                <Typography variant="body2" sx={{ mt: 0.5 }}>
+                  Adding the scope to the app version is not the approval step.
+                  Request Shopify&apos;s separate permission before ClawPilot can
+                  read order history outside Shopify&apos;s default window.
+                </Typography>
+                <Button
+                  href={catalog.onboarding.shopify.restrictedOrderScopeApprovalUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  size="small"
+                  endIcon={<OpenInNewRounded />}
+                  sx={{ mt: 0.5 }}
+                >
+                  Shopify read-all-orders approval
+                </Button>
+              </Alert>
+              <Alert severity="info">
+                <Typography variant="subtitle2">
+                  Protected customer-data approval · <code>read_customers</code>
+                </Typography>
+                <Typography variant="body2" sx={{ mt: 0.5 }}>
+                  Confirm the app&apos;s protected customer-data access and any
+                  identifying fields it needs. Shopify determines the required
+                  review based on the app type, distribution, and store plan.
+                </Typography>
+                <Button
+                  href={catalog.onboarding.shopify.protectedCustomerDataApprovalUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  size="small"
+                  endIcon={<OpenInNewRounded />}
+                  sx={{ mt: 0.5 }}
+                >
+                  Shopify protected-data requirements
+                </Button>
+              </Alert>
+            </Stack>
           ) : null}
         </DialogContent>
         <DialogActions sx={{ px: 3, pb: 2, flexWrap: 'wrap' }}>
@@ -1203,12 +1271,16 @@ export default function CommerceIntegrationPanel() {
                 Faire developer portal
               </Button>
               <Button
-                href={catalog.onboarding.faire.directTokenGuideUrl}
+                href={faire.authPath === 'brand_api_key'
+                  ? catalog.onboarding.faire.directTokenGuideUrl
+                  : catalog.onboarding.faire.setupGuideUrl}
                 target="_blank"
                 rel="noopener noreferrer"
                 endIcon={<OpenInNewRounded />}
               >
-                API key guide
+                {faire.authPath === 'brand_api_key'
+                  ? 'API key guide'
+                  : 'OAuth guide'}
               </Button>
             </>
           ) : null}
@@ -1309,6 +1381,14 @@ export default function CommerceIntegrationPanel() {
                         value: catalog?.providers.shopify.providerScopes?.join(' · ')
                           || 'Scope details unavailable in this environment',
                       },
+                      {
+                        label: 'Restricted scope approval',
+                        value: 'read_all_orders · separate Shopify permission',
+                      },
+                      {
+                        label: 'Protected customer data',
+                        value: 'read_customers · confirm Shopify approval requirements',
+                      },
                     ],
                     action: catalog ? (
                       <Stack
@@ -1354,6 +1434,26 @@ export default function CommerceIntegrationPanel() {
                           endIcon={<OpenInNewRounded />}
                         >
                           Client-credentials guide
+                        </Button>
+                        <Button
+                          href={catalog.onboarding.shopify.restrictedOrderScopeApprovalUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          variant="text"
+                          size="small"
+                          endIcon={<OpenInNewRounded />}
+                        >
+                          read_all_orders approval
+                        </Button>
+                        <Button
+                          href={catalog.onboarding.shopify.protectedCustomerDataApprovalUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          variant="text"
+                          size="small"
+                          endIcon={<OpenInNewRounded />}
+                        >
+                          Protected customer data
                         </Button>
                       </Stack>
                     ) : undefined,
@@ -1720,6 +1820,10 @@ export default function CommerceIntegrationPanel() {
                         value: 'One read-only brand-profile request',
                       },
                       {
+                        label: 'OAuth permission list',
+                        value: 'Not applicable · access is issued with the generated key',
+                      },
+                      {
                         label: 'Provider support',
                         value: catalog
                           ? catalog.onboarding.faire.supportContact
@@ -1748,6 +1852,12 @@ export default function CommerceIntegrationPanel() {
                         label: 'Minimum identity probe',
                         value: catalog?.onboarding.faire.minimumProbeScope
                           || 'READ_BRAND',
+                      },
+                      {
+                        label: 'Exact OAuth permissions',
+                        value: catalog?.onboarding.faire.scopeProfiles[
+                          faire.scopeProfile
+                        ].join(' · ') || 'No permissions selected',
                       },
                       {
                         label: 'Provider support',

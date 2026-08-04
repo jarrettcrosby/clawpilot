@@ -440,9 +440,14 @@ assertIncludes(magicCodeAdapter, "user.status !== 'active'", 'ordinary sign-in a
 assertIncludes(magicCodeAdapter, 'requestInvitationAuthMagicCode', 'invitation-purpose sign-in')
 assertIncludes(magicCodeAdapter, 'UPDATE app_user_invitations', 'atomic invitation acceptance')
 assertIncludes(magicCodeAdapter, 'AUTHORIZATION_CHANGED', 'invitation authorization rollback')
-assertIncludes(magicCodeAdapter, 'membership.organization_id = invitation.workspace_organization_id', 'invitation organization acceptance boundary')
+assertIncludes(magicCodeAdapter, 'cardinality(assigned.organization_ids) > 0', 'canonical invitation organization set')
+assertIncludes(magicCodeAdapter, "membership.status <> 'invited'", 'exact invitation membership authorization boundary')
+assertIncludes(magicCodeAdapter, 'invitedUser.rowCount !== 1', 'invited user acceptance lock')
+assertIncludes(magicCodeAdapter, 'FOR UPDATE OF invitation', 'invitation acceptance lock')
+assertIncludes(magicCodeAdapter, 'lockedMemberships.rowCount !== inviteOrganizationIds.length', 'all invitation memberships must remain invited')
 assertIncludes(magicCodeAdapter, 'UPDATE app_user_organization_memberships', 'invitation membership activation')
 assertIncludes(magicCodeAdapter, 'AND organization_id = ANY($2::uuid[])', 'multi-organization invitation membership activation')
+assertIncludes(magicCodeAdapter, 'activatedMembership.rowCount !== inviteOrganizationIds.length', 'exact invitation membership activation count')
 const invitationMembershipActivation = magicCodeAdapter.slice(
   magicCodeAdapter.indexOf('const activatedMembership'),
   magicCodeAdapter.indexOf('const activated ='),
