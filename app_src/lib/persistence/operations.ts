@@ -508,6 +508,44 @@ function customerNotificationDecision(
   }
 }
 
+function hasRetainedShopifySandboxAuthorization(
+  payloadValue: unknown,
+  provider: unknown,
+): boolean {
+  const payload = json(payloadValue)
+  const retainedSandboxAuthorizationGlobalId = String(
+    payload.sandboxE2eAuthorizationGlobalId || '',
+  ).trim()
+  return (
+    provider === 'shopify'
+    && /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/.test(
+      retainedSandboxAuthorizationGlobalId,
+    )
+  )
+}
+
+function commerceExportCustomerNotificationDecision(
+  payloadValue: unknown,
+  provider: unknown,
+): OperationsCustomerNotificationDecision {
+  const payload = json(payloadValue)
+  const decision = customerNotificationDecision(payload.customerNotification)
+  if (
+    decision.source === 'legacy_safe_default'
+    && hasRetainedShopifySandboxAuthorization(payload, provider)
+  ) {
+    return {
+      mode: 'clawpilot_explicit',
+      notifyCustomer: false,
+      source: 'sandbox_e2e_suppression',
+      accountPolicyRevision: null,
+      overrideReason: null,
+      decidedBy: null,
+    }
+  }
+  return decision
+}
+
 function address(value: unknown): Address {
   const source = json(value)
   return {
@@ -2697,8 +2735,9 @@ async function readOrderDetail(
       errorMessage: item.error_message,
       requestedAt: item.requested_at.toISOString(),
       completedAt: item.completed_at?.toISOString() || null,
-      customerNotification: customerNotificationDecision(
-        json(item.payload_snapshot).customerNotification,
+      customerNotification: commerceExportCustomerNotificationDecision(
+        item.payload_snapshot,
+        item.provider,
       ),
     })),
     events: eventResult.rows.map((item) => ({
@@ -8296,6 +8335,49 @@ async function completedShipmentCommandResult(
     && typeof payload.commerceExportGlobalId === 'string'
     && ['succeeded', 'unsupported', 'failed']
       .includes(String(payload.commerceExportState))) {
+    let notificationDecision = customerNotificationDecision(
+      payload.customerNotification,
+    )
+    if (notificationDecision.source === 'legacy_safe_default') {
+      const exactExport = await query<QueryResultRow & {
+        provider: string
+        payload_snapshot: Record<string, unknown>
+      }>(
+        `SELECT fulfillment_export.provider,
+                fulfillment_export.payload_snapshot
+         FROM operations_commerce_fulfillment_exports fulfillment_export
+         JOIN operations_orders source_order
+           ON source_order.organization_id = fulfillment_export.organization_id
+          AND source_order.id = fulfillment_export.order_id
+         JOIN operations_shipments shipment
+           ON shipment.organization_id = fulfillment_export.organization_id
+          AND shipment.id = fulfillment_export.shipment_id
+         WHERE fulfillment_export.organization_id = $1::uuid
+           AND fulfillment_export.global_id = $2
+           AND source_order.global_id = $3
+           AND shipment.global_id = $4
+         LIMIT 1`,
+        [
+          organizationId,
+          payload.commerceExportGlobalId,
+          payload.orderGlobalId,
+          payload.shipmentGlobalId,
+        ],
+      )
+      const recoveredDecision = exactExport.rows[0]
+        && hasRetainedShopifySandboxAuthorization(
+            exactExport.rows[0].payload_snapshot,
+            exactExport.rows[0].provider,
+          )
+        ? commerceExportCustomerNotificationDecision(
+            exactExport.rows[0].payload_snapshot,
+            exactExport.rows[0].provider,
+          )
+        : notificationDecision
+      if (recoveredDecision.source === 'sandbox_e2e_suppression') {
+        notificationDecision = recoveredDecision
+      }
+    }
     return {
       orderGlobalId: payload.orderGlobalId,
       orderStatus: 'shipped',
@@ -8305,9 +8387,7 @@ async function completedShipmentCommandResult(
       packingSlipArtifactGlobalId: payload.packingSlipArtifactGlobalId,
       commerceExportGlobalId: payload.commerceExportGlobalId,
       commerceExportState: payload.commerceExportState as OperationsShipmentCommandResult['commerceExportState'],
-      customerNotification: customerNotificationDecision(
-        payload.customerNotification,
-      ),
+      customerNotification: notificationDecision,
       replayed: true,
       printJobGlobalId: typeof payload.printJobGlobalId === 'string'
         ? payload.printJobGlobalId
@@ -8325,6 +8405,11 @@ async function completedShipmentCommandResult(
       409,
     )
   }
+  const receiptCommerceExportGlobalId = (
+    payload && typeof payload.commerceExportGlobalId === 'string'
+      ? payload.commerceExportGlobalId
+      : null
+  )
   const result = await query<QueryResultRow & {
     order_global_id: string
     order_status: OperationsOrderStatus
@@ -8333,6 +8418,7 @@ async function completedShipmentCommandResult(
     tracking_number: string
     artifact_global_id: string
     export_global_id: string
+    export_provider: string
     export_state: string
     export_payload_snapshot: Record<string, unknown>
     print_job_global_id: string | null
@@ -8344,6 +8430,7 @@ async function completedShipmentCommandResult(
             shipment.tracking_number,
             artifact.global_id AS artifact_global_id,
             fulfillment_export.global_id AS export_global_id,
+            fulfillment_export.provider AS export_provider,
             fulfillment_export.state AS export_state,
             fulfillment_export.payload_snapshot AS export_payload_snapshot,
             print_job.global_id AS print_job_global_id
@@ -8373,8 +8460,10 @@ async function completedShipmentCommandResult(
      ) print_job ON true
      WHERE source_order.organization_id = $1::uuid
        AND source_order.global_id = $2
+       AND ($3::text IS NULL OR fulfillment_export.global_id = $3)
+     ORDER BY fulfillment_export.requested_at DESC, fulfillment_export.id DESC
      LIMIT 1`,
-    [organizationId, orderGlobalId],
+    [organizationId, orderGlobalId, receiptCommerceExportGlobalId],
   )
   const row = result.rows[0]
   if (!row || row.order_status !== 'shipped') {
@@ -8397,8 +8486,9 @@ async function completedShipmentCommandResult(
     packingSlipArtifactGlobalId: row.artifact_global_id,
     commerceExportGlobalId: row.export_global_id,
     commerceExportState: exportState,
-    customerNotification: customerNotificationDecision(
-      json(row.export_payload_snapshot).customerNotification,
+    customerNotification: commerceExportCustomerNotificationDecision(
+      row.export_payload_snapshot,
+      row.export_provider,
     ),
     replayed: true,
     printJobGlobalId: row.print_job_global_id,
@@ -12992,8 +13082,9 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
         404,
       )
     }
-    const decision = customerNotificationDecision(
-      json(row.payload_snapshot).customerNotification,
+    const decision = commerceExportCustomerNotificationDecision(
+      row.payload_snapshot,
+      row.provider,
     )
     if (['succeeded', 'unsupported'].includes(row.state)) {
       return { row, decision, terminal: true as const }

@@ -718,7 +718,7 @@ export default function CommerceIntegrationPanel() {
         confirmCustomerNotifications:
           draft.notifyCustomerDefault ? draft.confirmed : false,
       },
-      `Shopify fulfillment notifications now default to ${
+      `Shopify customer notification requests now default to ${
         draft.notifyCustomerDefault ? 'on' : 'off'
       } for future orders.`,
     )
@@ -2127,9 +2127,11 @@ export default function CommerceIntegrationPanel() {
                           notificationPolicy.mode === 'clawpilot_explicit' ? (
                             <Stack spacing={1.25} sx={{ mt: 1 }}>
                               <Alert severity={notificationDefault ? 'warning' : 'info'}>
-                                Customer notifications are an explicit Shopify-account default.
+                                Customer notification requests use a ClawPilot default for this
+                                Shopify connection.
                                 The resolved choice is frozen into each fulfillment export, so
-                                changing this setting never emails customers for prior shipments.
+                                changing this setting never changes the request captured for prior
+                                shipments.
                                 Operators may record a reasoned per-order exception when confirming
                                 a future shipment.
                               </Alert>
@@ -2145,8 +2147,8 @@ export default function CommerceIntegrationPanel() {
                                         [account.globalId]: {
                                           notifyCustomerDefault: nextDefault,
                                           reason: nextDefault
-                                            ? 'Enable Shopify customer notifications for future fulfillment confirmations'
-                                            : 'Disable Shopify customer notifications for future fulfillment confirmations',
+                                            ? 'Enable Shopify customer notification requests for future fulfillment confirmations'
+                                            : 'Disable Shopify customer notification requests for future fulfillment confirmations',
                                           confirmed: false,
                                         },
                                       }))
@@ -2154,8 +2156,8 @@ export default function CommerceIntegrationPanel() {
                                   />
                                 )}
                                 label={notificationDefault
-                                  ? 'Email customers when future Shopify fulfillments are created'
-                                  : 'Do not email customers when future Shopify fulfillments are created'}
+                                  ? 'Request customer notifications for future Shopify fulfillments'
+                                  : 'Do not request customer notifications for future Shopify fulfillments'}
                               />
                               <TextField
                                 label="Policy change reason"
@@ -2272,7 +2274,10 @@ export default function CommerceIntegrationPanel() {
                                   : 'current'} · diagnostic provider writes: 0
                               </Typography>
                               <Typography variant="caption" display="block" sx={{ mt: 0.5 }}>
-                                Faire manages retailer notifications after shipment and tracking are submitted; ClawPilot exposes no notification toggle.
+                                Faire may send a processing email when a NEW order is accepted,
+                                and submitting shipment tracking triggers Faire&apos;s shipment email.
+                                Use a controlled recipient for test orders; ClawPilot exposes no
+                                notification toggle.
                               </Typography>
                             </Alert>
                           ) : account.provider === 'faire' ? (
