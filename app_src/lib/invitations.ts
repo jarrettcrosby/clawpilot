@@ -230,12 +230,52 @@ async function invitationByToken(tokenValue: unknown): Promise<InvitationRow | n
         organization.name AS organization_name,
         invitation.expires_at::text
       FROM app_user_invitations invitation
+      INNER JOIN app_users invited_user ON invited_user.email = invitation.email
       LEFT JOIN app_users inviter ON inviter.email = invitation.invited_by
       LEFT JOIN workspace_organizations organization ON organization.id = invitation.workspace_organization_id
+      CROSS JOIN LATERAL (
+        SELECT ARRAY(
+          SELECT grouped.organization_id
+          FROM (
+            SELECT
+              candidate.organization_id,
+              min(candidate.position) AS position
+            FROM (
+              SELECT
+                invitation.workspace_organization_id AS organization_id,
+                0::bigint AS position
+              UNION ALL
+              SELECT entry.organization_id, entry.position
+              FROM unnest(
+                COALESCE(
+                  invitation.workspace_organization_ids,
+                  ARRAY[]::uuid[]
+                )
+              ) WITH ORDINALITY AS entry(organization_id, position)
+            ) candidate
+            WHERE candidate.organization_id IS NOT NULL
+            GROUP BY candidate.organization_id
+          ) grouped
+          ORDER BY grouped.position
+        )::uuid[] AS organization_ids
+      ) assigned
       WHERE invitation.token_digest = $1
         AND invitation.revoked_at IS NULL
         AND invitation.expires_at > now()
         AND invitation.accepted_at IS NULL
+        AND invited_user.status IN ('invited', 'active')
+        AND invitation.workspace_organization_id IS NOT NULL
+        AND cardinality(assigned.organization_ids) > 0
+        AND NOT EXISTS (
+          SELECT 1
+          FROM unnest(assigned.organization_ids)
+            AS assigned_organization(organization_id)
+          LEFT JOIN app_user_organization_memberships membership
+            ON membership.user_email = invitation.email
+           AND membership.organization_id = assigned_organization.organization_id
+          WHERE membership.organization_id IS NULL
+             OR membership.status <> 'invited'
+        )
       LIMIT 1
     `,
     [tokenDigest(token)],

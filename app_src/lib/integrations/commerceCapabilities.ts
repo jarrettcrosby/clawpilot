@@ -292,6 +292,10 @@ export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
       'https://shopify.dev/docs/apps/build/dev-dashboard/create-apps-using-dev-dashboard',
     tokenGuideUrl:
       'https://shopify.dev/docs/apps/build/dev-dashboard/get-api-access-tokens',
+    restrictedOrderScopeApprovalUrl:
+      'https://shopify.dev/docs/api/usage/access-scopes#orders-permissions',
+    protectedCustomerDataApprovalUrl:
+      'https://shopify.dev/docs/apps/launch/protected-customer-data',
     defaultAppUrl: 'https://shopify.dev/apps/default-app-home',
     apiVersion: SHOPIFY_ADMIN_API_VERSION,
     requiredBeforeConnect: [
@@ -364,6 +368,18 @@ export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
       'https://developers.faire.com/docs#/#authentication',
     directTokenGuideUrl:
       'https://www.faire.com/support/articles/37632363832091',
+    brandApiKeyRequiredBeforeConnect: [
+      'Create a Faire Developer account and a Custom App.',
+      'In Faire Brand Portal, open the unpublished integration for that app and choose Generate API key.',
+      'Copy the final provider-issued API key once; do not use the Application ID, APA application token, or Secret ID.',
+      'Return to ClawPilot and authorize one read-only brand-profile verification request.',
+    ],
+    oauthRequiredBeforeConnect: [
+      'Create a Faire Developer account and a Custom App.',
+      'Confirm Faire accepts the Custom App OAuth authorization path for the intended brand.',
+      'Copy the Application ID and Secret ID from App Details and Settings.',
+      'Select the least-privilege permission profile in ClawPilot, then continue to Faire for approval.',
+    ],
     requiredBeforeConnect: [
       'Create a Faire Developer account and a Custom App.',
       'For one brand, use the unpublished integration in Faire Brand Portal to generate a final API key.',

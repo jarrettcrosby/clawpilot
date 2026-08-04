@@ -275,12 +275,25 @@ assert.ok(
 
 const authMagicCode = read('app_src/lib/authMagicCode.ts')
 for (const fragment of [
-  'membership.organization_id = invitation.workspace_organization_id',
-  "membership.status = 'invited'",
+  'min(candidate.position) AS position',
+  'cardinality(assigned.organization_ids) > 0',
+  "membership.status <> 'invited'",
+  'invitedUser.rowCount !== 1',
+  'FOR UPDATE OF invitation',
+  'lockedMemberships.rowCount !== inviteOrganizationIds.length',
   'AND organization_id = ANY($2::uuid[])',
+  'activatedMembership.rowCount !== inviteOrganizationIds.length',
   'organization_id: invitation.rows[0].workspace_organization_id',
 ]) {
   assertIncludes(authMagicCode, fragment, 'organization-specific invitation acceptance')
+}
+
+for (const fragment of [
+  'invited_user.status IN',
+  'cardinality(assigned.organization_ids) > 0',
+  "membership.status <> 'invited'",
+]) {
+  assertIncludes(invitations, fragment, 'exact-set invitation token authorization')
 }
 
 const invitationActivationSource = authMagicCode.slice(
@@ -290,6 +303,11 @@ const invitationActivationSource = authMagicCode.slice(
 assert.ok(
   !invitationActivationSource.includes('ANY($3::uuid[])'),
   'invitation acceptance must not restrict activation to only the primary organization',
+)
+assert.ok(
+  authMagicCode.indexOf('const activatedMembership')
+    < authMagicCode.indexOf('const accepted ='),
+  'all assigned memberships must activate before the invitation or user is accepted',
 )
 
 const magicVerifyRoute = read('app_src/app/api/auth/magic/verify/route.ts')

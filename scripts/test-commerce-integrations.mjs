@@ -965,12 +965,22 @@ includes(panel, [
   'Revoke or remove provider-side access separately',
   'Open setup checklist',
   'Provider scopes and permissions',
-  'setupChecklistCatalog?.requiredBeforeConnect',
+  'setupChecklistSteps.map',
   'defaultExpanded={false}',
   'Shopify dashboard',
   'API key guide',
-  'Exact Shopify app scopes ClawPilot expects',
-  'Faire permissions ClawPilot verifies',
+  'Faire generated API-key setup',
+  'Faire Custom App OAuth setup',
+  'resolveCommerceSetupPermissionGuidance',
+  'setupPermissionGuidance.copyable',
+  'setupPermissionGuidance.scopes',
+  'Separate restricted-scope approval · <code>read_all_orders</code>',
+  'Protected customer-data approval · <code>read_customers</code>',
+  'Shopify read-all-orders approval',
+  'Shopify protected-data requirements',
+  'OAuth permission list',
+  'Not applicable · access is issued with the generated key',
+  'Exact OAuth permissions',
   'Open setup checklist',
   'setupChecklistProvider',
   'catalog?.providers.shopify.providerScopes',
@@ -1009,6 +1019,16 @@ includes(panel, [
   'const revealOrganizationId = organizationIdRef.current',
   'organizationIdRef.current === revealOrganizationId',
 ], 'Commerce settings UI')
+const setupGuidance = read(
+  'app_src/lib/integrations/commerceSetupGuidance.ts',
+)
+includes(setupGuidance, [
+  'Exact Shopify app scopes ClawPilot expects',
+  "mode: 'provider_issued_access'",
+  'There is no OAuth scope list to copy or configure for this path',
+  'input.faireScopeProfiles[input.faireScopeProfile]',
+  "mode: 'faire_oauth_scopes'",
+], 'Commerce setup permission guidance')
 const revealPanelSource = panel.slice(
   panel.indexOf('async function revealCredential'),
   panel.indexOf('async function copyRevealedCredential'),
@@ -1086,6 +1106,16 @@ assert.equal(
   'https://dev.shopify.com/dashboard',
 )
 assert.equal(
+  capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING.shopify
+    .restrictedOrderScopeApprovalUrl,
+  'https://shopify.dev/docs/api/usage/access-scopes#orders-permissions',
+)
+assert.equal(
+  capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING.shopify
+    .protectedCustomerDataApprovalUrl,
+  'https://shopify.dev/docs/apps/launch/protected-customer-data',
+)
+assert.equal(
   capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING.faire.setupGuideUrl,
   'https://developers.faire.com/docs#/#authentication',
 )
@@ -1106,6 +1136,30 @@ assert.deepEqual(
       .faire.scopeProfiles.connection_test,
   )),
   ['READ_BRAND'],
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING
+      .faire.brandApiKeyRequiredBeforeConnect,
+  )),
+  [
+    'Create a Faire Developer account and a Custom App.',
+    'In Faire Brand Portal, open the unpublished integration for that app and choose Generate API key.',
+    'Copy the final provider-issued API key once; do not use the Application ID, APA application token, or Secret ID.',
+    'Return to ClawPilot and authorize one read-only brand-profile verification request.',
+  ],
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING
+      .faire.oauthRequiredBeforeConnect,
+  )),
+  [
+    'Create a Faire Developer account and a Custom App.',
+    'Confirm Faire accepts the Custom App OAuth authorization path for the intended brand.',
+    'Copy the Application ID and Secret ID from App Details and Settings.',
+    'Select the least-privilege permission profile in ClawPilot, then continue to Faire for approval.',
+  ],
 )
 assert.equal(
   capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING
