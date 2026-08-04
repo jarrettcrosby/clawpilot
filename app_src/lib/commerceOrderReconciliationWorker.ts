@@ -5,6 +5,7 @@ import {
   executeCommerceOrderPage,
 } from '@/lib/integrations/commerceIntake'
 import {
+  markAutomaticFaireOrderPromotionAttentionInPostgres,
   readAutomaticFaireExactRefreshTargetsInPostgres,
 } from '@/lib/persistence/commerceIntake'
 import {
@@ -67,6 +68,27 @@ function deterministicFaireExactRefreshUuid(input: {
       'faire-exact-refresh-v1',
       input.candidateGlobalId,
       input.sourceHash,
+    ].join(':'),
+  })
+}
+
+function deterministicFaireAttentionUuid(input: {
+  organizationId: string
+  accountGlobalId: string
+  credentialVersion: number
+  candidateGlobalId: string
+  sourceHash: string
+  reasonCode: string
+}) {
+  return deterministicRunUuid({
+    organizationId: input.organizationId,
+    accountGlobalId: input.accountGlobalId,
+    credentialVersion: input.credentialVersion,
+    startedAt: [
+      'faire-auto-promotion-attention-v1',
+      input.candidateGlobalId,
+      input.sourceHash,
+      input.reasonCode,
     ].join(':'),
   })
 }
@@ -261,6 +283,7 @@ export async function processCommerceOrderReconciliation(input: {
         held: 0,
         failed: 0,
         failedByCode: {},
+        attentionRequiredAccounts: 0,
         operatorReviewRequired: 0,
         providerWrites: 0,
         canonicalOrderWrites: 0,
@@ -320,6 +343,7 @@ export async function processCommerceOrderReconciliation(input: {
   let faireOrdersHeld = 0
   let fairePromotionFailed = 0
   let faireOperatorReviewRequired = 0
+  let fairePromotionAttentionRequiredAccounts = 0
   let faireExactRefreshAttempted = 0
   let faireExactRefreshSucceeded = 0
   let faireExactRefreshRejected = 0
@@ -670,6 +694,7 @@ export async function processCommerceOrderReconciliation(input: {
                     candidateGlobalId: exactTarget.candidateGlobalId,
                     candidateRowVersion: exactTarget.candidateRowVersion,
                     sourceHash: exactTarget.sourceHash,
+                    expectedCredentialVersion: target.credentialVersion,
                   })
                 const exactCommand = record(exactResponse.command)
                 assertReconciliationFence(exactCommand)
@@ -682,9 +707,34 @@ export async function processCommerceOrderReconciliation(input: {
                 const exactRejected = count(exactCommand.recordsRejected)
                 if (exactRejected > 0) {
                   targetFaireExactRefreshRejected += exactRejected
-                  targetFaireOperatorReviewRequired += exactRejected
                   const rejectionCode =
                     'COMMERCE_FAIRE_EXACT_REFRESH_NORMALIZATION_REJECTED'
+                  const attention = await markAutomaticFaireOrderPromotionAttentionInPostgres({
+                    runtime: {
+                      organizationId: target.organizationId,
+                      integrationAccountId: target.integrationAccountId,
+                      globalId: target.accountGlobalId,
+                      provider: 'faire',
+                      credentialVersion: target.credentialVersion,
+                    },
+                    actorEmail: 'system:commerce-order-reconciliation',
+                    idempotencyKey: deterministicFaireAttentionUuid({
+                      organizationId: target.organizationId,
+                      accountGlobalId: target.accountGlobalId,
+                      credentialVersion: target.credentialVersion,
+                      candidateGlobalId: exactTarget.candidateGlobalId,
+                      sourceHash: exactTarget.sourceHash,
+                      reasonCode: rejectionCode,
+                    }),
+                    candidateGlobalId: exactTarget.candidateGlobalId,
+                    candidateRowVersion: exactTarget.candidateRowVersion,
+                    sourceHash: exactTarget.sourceHash,
+                    runGlobalId: exactTarget.originatingRunGlobalId,
+                    reasonCode: rejectionCode,
+                  }).catch(() => ({ marked: true }))
+                  if (record(attention).marked !== false) {
+                    targetFaireOperatorReviewRequired += exactRejected
+                  }
                   targetFaireExactRefreshFailureCodes[rejectionCode] = (
                     targetFaireExactRefreshFailureCodes[rejectionCode] || 0
                   ) + exactRejected
@@ -742,8 +792,33 @@ export async function processCommerceOrderReconciliation(input: {
                     === 'COMMERCE_ORDER_RECONCILIATION_WRITE_FENCE'
                 ) throw error
                 targetFaireExactRefreshFailed += 1
-                targetFaireOperatorReviewRequired += 1
                 const code = reconciliationFailureCode(error)
+                const attention = await markAutomaticFaireOrderPromotionAttentionInPostgres({
+                  runtime: {
+                    organizationId: target.organizationId,
+                    integrationAccountId: target.integrationAccountId,
+                    globalId: target.accountGlobalId,
+                    provider: 'faire',
+                    credentialVersion: target.credentialVersion,
+                  },
+                  actorEmail: 'system:commerce-order-reconciliation',
+                  idempotencyKey: deterministicFaireAttentionUuid({
+                    organizationId: target.organizationId,
+                    accountGlobalId: target.accountGlobalId,
+                    credentialVersion: target.credentialVersion,
+                    candidateGlobalId: exactTarget.candidateGlobalId,
+                    sourceHash: exactTarget.sourceHash,
+                    reasonCode: code,
+                  }),
+                  candidateGlobalId: exactTarget.candidateGlobalId,
+                  candidateRowVersion: exactTarget.candidateRowVersion,
+                  sourceHash: exactTarget.sourceHash,
+                  runGlobalId: exactTarget.originatingRunGlobalId,
+                  reasonCode: code,
+                }).catch(() => ({ marked: true }))
+                if (record(attention).marked !== false) {
+                  targetFaireOperatorReviewRequired += 1
+                }
                 targetFaireExactRefreshFailureCodes[code] = (
                   targetFaireExactRefreshFailureCodes[code] || 0
                 ) + 1
@@ -832,6 +907,9 @@ export async function processCommerceOrderReconciliation(input: {
         faireOrdersHeld += targetFaireOrdersHeld
         fairePromotionFailed += targetFairePromotionFailed
         faireOperatorReviewRequired += targetFaireOperatorReviewRequired
+        if (completion.faireAutomaticPromotionAttentionRequired) {
+          fairePromotionAttentionRequiredAccounts += 1
+        }
         faireExactRefreshAttempted += targetFaireExactRefreshAttempted
         faireExactRefreshSucceeded += targetFaireExactRefreshSucceeded
         faireExactRefreshRejected += targetFaireExactRefreshRejected
@@ -964,7 +1042,12 @@ export async function processCommerceOrderReconciliation(input: {
       held: faireOrdersHeld,
       failed: fairePromotionFailed,
       failedByCode: fairePromotionFailureCodes,
-      operatorReviewRequired: faireOperatorReviewRequired,
+      attentionRequiredAccounts:
+        fairePromotionAttentionRequiredAccounts,
+      operatorReviewRequired: Math.max(
+        faireOperatorReviewRequired,
+        fairePromotionAttentionRequiredAccounts,
+      ),
       providerWrites: 0,
       canonicalOrderWrites: faireOrdersPromoted,
       inventoryWrites: 0,

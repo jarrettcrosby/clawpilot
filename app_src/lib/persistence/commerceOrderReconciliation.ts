@@ -2,6 +2,9 @@ import { createHash, randomUUID } from 'node:crypto'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { CommerceIntegrationRequestError } from '@/lib/integrations/commerceIntegrations'
 import {
+  AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER,
+} from '@/lib/integrations/commerceFaireAutomaticPromotion'
+import {
   SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER,
 } from '@/lib/integrations/commerceShopifyAutomaticPromotion'
 import {
@@ -14,7 +17,7 @@ const ORDER_RECONCILIATION_INTERVAL = '30 minutes'
 const ORDER_RECONCILIATION_LEASE = '10 minutes'
 const WORKER_HEARTBEAT_KEY = 'commerce_order_reconciliation_worker_heartbeat'
 export const FAIRE_AUTO_PROMOTION_ATTENTION_CODE =
-  'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED'
+  AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER
 export const SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE =
   SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER
 
@@ -857,6 +860,107 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
                      = candidate.external_order_id
              )
          ) AS attention_required
+       ), unresolved_faire_promotion AS (
+         SELECT EXISTS (
+           SELECT 1
+           FROM operations_commerce_order_candidates candidate
+           JOIN operations_commerce_intake_runs run
+             ON run.organization_id = candidate.organization_id
+            AND run.integration_account_id
+                = candidate.integration_account_id
+            AND run.id = candidate.run_id
+           WHERE candidate.organization_id = $1::uuid
+             AND candidate.integration_account_id = $2::uuid
+             AND candidate.provider = 'faire'
+             AND candidate.workflow_state IN ('held', 'resolving', 'ready')
+             AND candidate.customer_resolution_state <> 'unsupported'
+             AND candidate.expires_at > now()
+             AND candidate.last_error_code =
+                 '${AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER}'
+             AND candidate.created_by
+                 = 'system:commerce-order-reconciliation'
+             AND run.provider = 'faire'
+             AND run.resource = 'products_and_orders'
+             AND run.created_by = 'system:commerce-order-reconciliation'
+             AND run.workflow_state <> 'expired'
+             AND run.expires_at > now()
+             AND NOT EXISTS (
+               SELECT 1
+               FROM operations_orders canonical
+               WHERE canonical.organization_id = candidate.organization_id
+                 AND canonical.integration_account_id
+                     = candidate.integration_account_id
+                 AND canonical.external_order_id
+                     = candidate.external_order_id
+             )
+             AND NOT EXISTS (
+               SELECT 1
+               FROM operations_external_identifiers external
+               WHERE external.organization_id = candidate.organization_id
+                 AND external.integration_account_id
+                     = candidate.integration_account_id
+                 AND external.entity_type = 'operations.order'
+                 AND external.status = 'active'
+                 AND external.external_id = candidate.external_order_id
+             )
+             AND NOT EXISTS (
+               SELECT 1
+               FROM operations_commerce_order_candidates newer
+               WHERE newer.organization_id = candidate.organization_id
+                 AND newer.integration_account_id
+                     = candidate.integration_account_id
+                 AND newer.external_order_id = candidate.external_order_id
+                 AND newer.id <> candidate.id
+                 AND (
+                   newer.observed_at > candidate.observed_at
+                   OR (
+                     newer.observed_at = candidate.observed_at
+                     AND newer.created_at > candidate.created_at
+                   )
+                   OR (
+                     newer.observed_at = candidate.observed_at
+                     AND newer.created_at = candidate.created_at
+                     AND newer.id > candidate.id
+                   )
+                 )
+             )
+             AND NOT EXISTS (
+               SELECT 1
+               FROM operations_commerce_order_candidates history
+               WHERE history.organization_id = candidate.organization_id
+                 AND history.integration_account_id
+                     = candidate.integration_account_id
+                 AND history.external_order_id = candidate.external_order_id
+                 AND (
+                   history.created_by
+                       <> 'system:commerce-order-reconciliation'
+                   OR history.updated_by
+                       <> 'system:commerce-order-reconciliation'
+                   OR EXISTS (
+                     SELECT 1
+                     FROM operations_commerce_resolution_decisions decision
+                     WHERE decision.organization_id = history.organization_id
+                       AND decision.target_global_id = history.global_id
+                       AND decision.actor_email
+                           <> 'system:commerce-order-reconciliation'
+                   )
+                   OR EXISTS (
+                     SELECT 1
+                     FROM operations_commerce_intake_read_intents human_intent
+                     WHERE human_intent.organization_id
+                         = history.organization_id
+                       AND human_intent.integration_account_id
+                           = history.integration_account_id
+                       AND human_intent.provider = 'faire'
+                       AND human_intent.resource = 'orders'
+                       AND human_intent.target_kind = 'candidate'
+                       AND human_intent.target_global_id = history.global_id
+                       AND human_intent.created_by
+                           <> 'system:commerce-order-reconciliation'
+                   )
+                 )
+             )
+         ) AS attention_required
        )
        UPDATE operations_commerce_sync_cursors
        SET reconciliation_status = 'succeeded',
@@ -866,7 +970,7 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
              ELSE 0
            END,
            last_error_code = CASE
-             WHEN $9 = 'shopify'
+             WHEN $8 = 'shopify'
                AND (
                  $6::bigint > 0
                  OR (
@@ -875,12 +979,15 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
                  )
                )
                THEN '${SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE}'
-             WHEN $7::bigint > 0
+             WHEN $8 = 'faire'
+               AND (
+                 $7::bigint > 0
+                 OR (
+                   SELECT attention_required
+                   FROM unresolved_faire_promotion
+                 )
+               )
                THEN '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}'
-            WHEN $8::boolean
-              AND last_error_code =
-                  '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}'
-              THEN last_error_code
              ELSE NULL
            END,
            last_completed_at = now(),
@@ -899,7 +1006,6 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
         shopifyOrdersPromoted + faireOrdersPromoted,
         shopifyPromotionAttentionRequired,
         faireOperatorReviewRequired,
-        Boolean(input.target.continuationRunGlobalId),
         input.target.provider,
       ],
     )
@@ -907,6 +1013,7 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
       return {
         leaseLost: true as const,
         shopifyAutomaticPromotionAttentionRequired: false,
+        faireAutomaticPromotionAttentionRequired: false,
       }
     }
     await recordAuditEvent({
@@ -980,6 +1087,9 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
       shopifyAutomaticPromotionAttentionRequired:
         completed.rows[0]?.last_error_code
           === SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE,
+      faireAutomaticPromotionAttentionRequired:
+        completed.rows[0]?.last_error_code
+          === FAIRE_AUTO_PROMOTION_ATTENTION_CODE,
     }
   })
 }

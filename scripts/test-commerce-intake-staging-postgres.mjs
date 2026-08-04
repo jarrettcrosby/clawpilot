@@ -1076,6 +1076,9 @@ function loadCommerceOrderReconciliationWorker(input) {
         executeCommerceOrderPage: input.executeCommerceOrderPage,
       },
       '@/lib/persistence/commerceIntake': {
+        async markAutomaticFaireOrderPromotionAttentionInPostgres() {
+          return { marked: true }
+        },
         async readAutomaticFaireExactRefreshTargetsInPostgres() {
           return []
         },
@@ -4365,7 +4368,6 @@ async function verifyAutomaticShopifyCleanPromotion(
       actorEmail,
     ],
   )
-
   const profileVersion = (await pool.query(
     `SELECT
        version.id::text,
@@ -5318,6 +5320,120 @@ async function verifyAutomaticFaireExactRefreshLineage(
      ON CONFLICT (email) DO NOTHING`,
     [systemActor],
   )
+  await pool.query(
+    `INSERT INTO operations_commerce_credentials (
+       organization_id, integration_account_id, external_account_id,
+       auth_mode, credential_ciphertext, credential_iv, credential_tag,
+       credential_version, credential_identifier_last_four,
+       verification_status, verified_at, webhook_verification_status,
+       created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, 'brand-9202', 'faire_brand_token',
+       $3, $4, $5, 1, '9202', 'verified', now(), 'not_applicable', $6, $6
+     ) ON CONFLICT (organization_id, integration_account_id) DO UPDATE SET
+       auth_mode = 'faire_brand_token',
+       credential_version = 1,
+       verification_status = 'verified',
+       verified_at = now(),
+       last_error_code = NULL,
+       updated_by = EXCLUDED.updated_by,
+       updated_at = now()`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      Buffer.from('faire-auto-promotion-test-credential'),
+      Buffer.alloc(12, 9),
+      Buffer.alloc(16, 10),
+      actorEmail,
+    ],
+  )
+  const reconciliationPersistence =
+    loadCommerceOrderReconciliationPersistence(pool)
+  const completeFaireAttentionScan = async (currentReviewRequired) => {
+    const shopifyStatus = (await pool.query(
+      `SELECT status
+       FROM operations_integration_accounts
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [ids.organization, ids.integrationAccount],
+    )).rows[0]?.status || null
+    try {
+      if (shopifyStatus) {
+        await pool.query(
+          `UPDATE operations_integration_accounts
+           SET status = 'error', updated_at = now()
+           WHERE organization_id = $1::uuid
+             AND id = $2::uuid`,
+          [ids.organization, ids.integrationAccount],
+        )
+      }
+      await pool.query(
+        `UPDATE operations_commerce_sync_cursors
+         SET reconciliation_status = 'succeeded',
+             last_started_at = now() - interval '31 minutes',
+             updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND resource = 'orders'`,
+        [ids.organization, ids.faireIntegrationAccount],
+      )
+      const claimed = await reconciliationPersistence
+        .claimCommerceOrderReconciliationTargetsInPostgres({ limit: 1 })
+      assert.equal(claimed.length, 1)
+      assert.equal(claimed[0].provider, 'faire')
+      const completed = await reconciliationPersistence
+        .completeCommerceOrderReconciliationInPostgres({
+          target: claimed[0],
+          providerRecordsSeen: 0,
+          ordersHeld: 0,
+          recordsRejected: 0,
+          pagesRead: 1,
+          hasNextBatch: false,
+          customersMatched: 0,
+          customersCreated: 0,
+          customersAmbiguous: 0,
+          customersSkipped: 0,
+          customerResolutionFailed: 0,
+          customerResolutionFailureCodes: {},
+          shopifyOrdersPromoted: 0,
+          shopifyOrdersHeld: 0,
+          shopifyPromotionActionableHeld: 0,
+          shopifyPromotionHeldReasons: {},
+          shopifyPromotionFailed: 0,
+          shopifyPromotionFailureCodes: {},
+          shopifyPromotionRollbackFenced: 0,
+          faireOrdersPromoted: 0,
+          faireOrdersHeld: 0,
+          fairePromotionFailed: 0,
+          fairePromotionFailureCodes: {},
+          faireOperatorReviewRequired: currentReviewRequired,
+          faireExactRefreshAttempted: 0,
+          faireExactRefreshSucceeded: 0,
+          faireExactRefreshRejected: 0,
+          faireExactRefreshFailed: 0,
+          faireExactRefreshFailureCodes: {},
+        })
+      assert.equal(completed.leaseLost, false)
+      const health = await reconciliationPersistence
+        .readCommerceOrderReconciliationHealthFromPostgres()
+      const state = await reconciliationPersistence
+        .readCommerceOrderReconciliationStateInPostgres({
+          organizationId: ids.organization,
+          accountGlobalId: runtime.globalId,
+        })
+      return { completed, health, state }
+    } finally {
+      if (shopifyStatus) {
+        await pool.query(
+          `UPDATE operations_integration_accounts
+           SET status = $3, updated_at = now()
+           WHERE organization_id = $1::uuid
+             AND id = $2::uuid`,
+          [ids.organization, ids.integrationAccount, shopifyStatus],
+        )
+      }
+    }
+  }
   const customerGlobalId = (await pool.query(
     `SELECT reference_code
      FROM crm_organizations
@@ -5647,6 +5763,7 @@ async function verifyAutomaticFaireExactRefreshLineage(
     })
   assert.equal(eligibleTargets.length, 1)
   assert.equal(eligibleTargets[0].eligible, true)
+  assert.equal(eligibleTargets[0].sourceHash, exactCandidate.source_hash)
   assert.equal(eligibleTargets[0].providerAddress, null)
   assert.equal(eligibleTargets[0].deliveryMode, null)
   const validation = await persistence.validateCommerceCandidateInPostgres({
@@ -5664,6 +5781,11 @@ async function verifyAutomaticFaireExactRefreshLineage(
     candidateGlobalId: exactCandidate.global_id,
     candidateRowVersion: validation.rowVersion,
     requestHash: hash('commerce-staging-faire-auto-promote-request'),
+    automaticFairePromotion: {
+      policyVersion: 'commerce-faire-order-auto-promotion-v1',
+      runGlobalId: exactStage.runGlobalId,
+      sourceHash: exactCandidate.source_hash,
+    },
   }
   const promotionBlocker = await pool.connect()
   let promoted
@@ -5737,6 +5859,219 @@ async function verifyAutomaticFaireExactRefreshLineage(
   })
   assert.equal(durable.source_payload.amountsMinor.shipping, null)
   assert.equal(durable.source_payload.amountsMinor.total, null)
+
+  const raceKey = 'auto_exact_authority_race'
+  const raceExternalOrderId = `faire-order-${raceKey}`
+  await pool.query(
+    `INSERT INTO operations_product_mappings (
+       organization_id, integration_account_id, pipeline_id, product_id,
+       channel_sku, external_product_id, external_variant_id,
+       mapping_method, mapping_source_revision, active, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7,
+       'exact_variant', $8, true, $9
+     )`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      ids.pipeline,
+      ids.product,
+      `POSTGRES-${raceKey}`,
+      `p_${raceKey}`,
+      `po_${raceKey}`,
+      hash('faire-auto-exact-authority-race-mapping'),
+      systemActor,
+    ],
+  )
+  const raceBase = faireRetailerOrderFixture({
+    key: raceKey,
+    retailerId: 'retailer-auto-exact-authority-race',
+    evidenceEmail: 'jarrett+authority-race@episcs.com',
+  })
+  const raceExactOrder = Object.freeze({
+    ...raceBase,
+    ...incompleteMoney,
+    providerCreatedAt: freshObservedAt,
+    providerProcessedAt: freshObservedAt,
+    providerUpdatedAt: freshObservedAt,
+    sourceStale: false,
+    sourceHash: hash('faire-auto-exact-authority-race-current'),
+  })
+  const raceListOrder = Object.freeze({
+    ...raceExactOrder,
+    sourceStale: true,
+    readinessFacts: Object.freeze([
+      ...raceExactOrder.readinessFacts,
+      Object.freeze({
+        dimension: 'source',
+        code: 'source_stale',
+        blocking: true,
+        subjectExternalId: raceExternalOrderId,
+      }),
+    ]),
+    sourceHash: hash('faire-auto-exact-authority-race-list'),
+  })
+  const raceListRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009249',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-auto-authority-race-list',
+    responseHash: hash(
+      'commerce-staging-faire-auto-authority-race-list-response',
+    ),
+    intakeAction: 'fetch',
+    targetCandidate: null,
+    externalOrderId: raceExternalOrderId,
+  }
+  await seedWorkerRead(raceListRead)
+  const raceListStage = await stageWorkerEnvelope({
+    read: raceListRead,
+    action: 'fetch',
+    order: raceListOrder,
+    targetCandidate: null,
+  })
+  const raceSourceCandidate = (await pool.query(
+    `SELECT global_id, row_version::integer, source_hash
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_order_id = $3
+     ORDER BY observed_at DESC, created_at DESC, id DESC
+     LIMIT 1`,
+    [ids.organization, ids.faireIntegrationAccount, raceExternalOrderId],
+  )).rows[0]
+  const raceExactRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009250',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-auto-authority-race-exact',
+    responseHash: hash(
+      'commerce-staging-faire-auto-authority-race-exact-response',
+    ),
+    intakeAction: 'refresh',
+    targetCandidate: {
+      globalId: raceSourceCandidate.global_id,
+      sourceHash: raceSourceCandidate.source_hash,
+    },
+    externalOrderId: raceExternalOrderId,
+  }
+  await seedWorkerRead(raceExactRead)
+  const raceExactStage = await stageWorkerEnvelope({
+    read: raceExactRead,
+    action: 'refresh',
+    order: raceExactOrder,
+    targetCandidate: raceExactRead.targetCandidate,
+  })
+  let raceExactCandidate = (await pool.query(
+    `SELECT global_id, row_version::integer, source_hash
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_order_id = $3
+     ORDER BY observed_at DESC, created_at DESC, id DESC
+     LIMIT 1`,
+    [ids.organization, ids.faireIntegrationAccount, raceExternalOrderId],
+  )).rows[0]
+  const raceCustomer = await persistence
+    .resolveCommerceCandidateCustomerInPostgres({
+      runtime,
+      actorEmail: systemActor,
+      idempotencyKey: 'commerce-staging-faire-auto-authority-race-customer',
+      candidateGlobalId: raceExactCandidate.global_id,
+      candidateRowVersion: raceExactCandidate.row_version,
+      customer: {
+        mode: 'existing',
+        customerGlobalId,
+        resolutionMethod: 'external_id',
+      },
+    })
+  raceExactCandidate = {
+    ...raceExactCandidate,
+    row_version: raceCustomer.rowVersion,
+  }
+  const raceTargets = await persistence
+    .readAutomaticFaireOrderPromotionTargetsForRunInPostgres({
+      runtime,
+      runGlobalId: raceExactStage.runGlobalId,
+    })
+  assert.equal(raceTargets.length, 1)
+  assert.equal(raceTargets[0].eligible, true)
+  const raceValidation = await persistence.validateCommerceCandidateInPostgres({
+    runtime,
+    actorEmail: systemActor,
+    idempotencyKey: 'commerce-staging-faire-auto-authority-race-validate',
+    candidateGlobalId: raceTargets[0].candidateGlobalId,
+    candidateRowVersion: raceTargets[0].candidateRowVersion,
+  })
+  assert.equal(raceValidation.ready, true)
+  const providerWritesBeforeRace = (await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_commerce_provider_attempts
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND action <> 'commerce.intake.read'`,
+    [ids.organization, ids.faireIntegrationAccount],
+  )).rows[0].count
+  const inventoryRowsBeforeRace = (await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_inventory_positions
+     WHERE organization_id = $1::uuid`,
+    [ids.organization],
+  )).rows[0].count
+  await persistence.markCommerceCandidateUnsupportedInPostgres({
+    runtime,
+    actorEmail,
+    idempotencyKey: 'commerce-staging-faire-auto-authority-race-human',
+    candidateGlobalId: raceSourceCandidate.global_id,
+    candidateRowVersion: raceSourceCandidate.row_version,
+    reasonCode: 'operator_reviewed',
+    reason: 'A human operator took ownership after automatic selection.',
+  })
+  await assert.rejects(
+    persistence.promoteCommerceCandidateInPostgres({
+      runtime,
+      actorEmail: systemActor,
+      idempotencyKey: 'commerce-staging-faire-auto-authority-race-promote',
+      candidateGlobalId: raceTargets[0].candidateGlobalId,
+      candidateRowVersion: raceValidation.rowVersion,
+      requestHash: hash(
+        'commerce-staging-faire-auto-authority-race-promote-request',
+      ),
+      automaticFairePromotion: {
+        policyVersion: 'commerce-faire-order-auto-promotion-v1',
+        runGlobalId: raceExactStage.runGlobalId,
+        sourceHash: raceTargets[0].sourceHash,
+      },
+    }),
+    (error) => error?.code
+      === 'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_AUTHORITY_STALE',
+    'A human mutation after selection must revoke final promotion authority',
+  )
+  assert.equal((await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_orders
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_order_id = $3`,
+    [ids.organization, ids.faireIntegrationAccount, raceExternalOrderId],
+  )).rows[0].count, 0)
+  assert.equal((await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_commerce_provider_attempts
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND action <> 'commerce.intake.read'`,
+    [ids.organization, ids.faireIntegrationAccount],
+  )).rows[0].count, providerWritesBeforeRace)
+  assert.equal((await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_inventory_positions
+     WHERE organization_id = $1::uuid`,
+    [ids.organization],
+  )).rows[0].count, inventoryRowsBeforeRace)
+  assert.equal(raceListStage.providerWrites, 0)
 
   const rejectionKey = 'auto_exact_rejection'
   const rejectionExternalOrderId = `faire-order-${rejectionKey}`
@@ -5874,6 +6209,71 @@ async function verifyAutomaticFaireExactRefreshLineage(
     external_id: rejectionExternalOrderId,
     error_code: 'COMMERCE_ORDER_RECORD_INVALID',
   })
+  const exactRejectionAttentionInput = {
+    runtime,
+    actorEmail: systemActor,
+    idempotencyKey: 'commerce-staging-faire-auto-rejection-attention',
+    candidateGlobalId: rejectionSourceCandidate.global_id,
+    candidateRowVersion: rejectionSourceCandidate.row_version,
+    sourceHash: rejectionSourceCandidate.source_hash,
+    runGlobalId: rejectionListStage.runGlobalId,
+    reasonCode: 'COMMERCE_FAIRE_EXACT_REFRESH_NORMALIZATION_REJECTED',
+  }
+  const exactRejectionAttention = await persistence
+    .markAutomaticFaireOrderPromotionAttentionInPostgres(
+      exactRejectionAttentionInput,
+    )
+  assert.equal(exactRejectionAttention.marked, true)
+  assert.equal(exactRejectionAttention.alreadyMarked, false)
+  assert.equal(exactRejectionAttention.providerWrites, 0)
+  assert.equal(exactRejectionAttention.inventoryWrites, 0)
+  assert.equal(exactRejectionAttention.syncCursorAdvanced, false)
+  const exactRejectionAttentionReplay = await persistence
+    .markAutomaticFaireOrderPromotionAttentionInPostgres(
+      exactRejectionAttentionInput,
+    )
+  assert.equal(exactRejectionAttentionReplay.replayed, true)
+  const exactRejectionAttentionEvidence = (await pool.query(
+    `SELECT candidate.last_error_code,
+            candidate.row_version::integer,
+            (SELECT count(*)::integer
+             FROM operations_command_receipts receipt
+             WHERE receipt.organization_id = candidate.organization_id
+               AND receipt.command_type =
+                   'commerce.intake.mark_faire_auto_promotion_attention'
+               AND receipt.idempotency_key = $3) AS receipt_count,
+            (SELECT count(*)::integer
+             FROM audit_events event
+             WHERE event.organization_id = candidate.organization_id
+               AND event.aggregate_id = candidate.global_id
+               AND event.event_type =
+                   'commerce.intake.faire_auto_promotion.attention_marked')
+              AS audit_count
+     FROM operations_commerce_order_candidates candidate
+     WHERE candidate.organization_id = $1::uuid
+       AND candidate.global_id = $2`,
+    [
+      ids.organization,
+      rejectionSourceCandidate.global_id,
+      exactRejectionAttentionInput.idempotencyKey,
+    ],
+  )).rows[0]
+  assert.deepEqual(exactRejectionAttentionEvidence, {
+    last_error_code:
+      'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED',
+    row_version: rejectionSourceCandidate.row_version + 1,
+    receipt_count: 1,
+    audit_count: 1,
+  })
+  assert.equal((await persistence
+    .readAutomaticFaireExactRefreshTargetsInPostgres({
+      runtime,
+      preferredRunGlobalId: rejectionListStage.runGlobalId,
+      limit: 10,
+    })).some(
+      (target) => target.candidateGlobalId
+        === rejectionSourceCandidate.global_id,
+    ), false, 'A marked exact outcome must not issue another provider read')
   const mismatchedExactRead = {
     providerAttemptId: randomUUID(),
     providerAttemptGlobalId: 'gxa000000009246',
@@ -5980,7 +6380,7 @@ async function verifyAutomaticFaireExactRefreshLineage(
     })).some(
       (target) => target.candidateGlobalId
         === rejectionSourceCandidate.global_id,
-    ), true, 'A staged exact rejection remains queued for replay-only durable attention')
+    ), false, 'Candidate attention provenance replaces replay-only exact retries')
 
   const humanActor = 'jarrett+faire-manual-history@episcs.com'
   await pool.query(
@@ -6097,8 +6497,8 @@ async function verifyAutomaticFaireExactRefreshLineage(
   assert.equal(manualHistoryPromotion[0].eligible, false)
   assert.equal(
     manualHistoryPromotion[0].reason,
-    'prior_candidate_requires_review',
-    'Manual authority must remain an actionable hold instead of a silent exact-refresh skip',
+    'operator_owned_history',
+    'Browser-owned history must remain held without creating new unattended attention',
   )
 
   const packKey = 'auto_exact_missing_pack'
@@ -6248,6 +6648,105 @@ async function verifyAutomaticFaireExactRefreshLineage(
     'product_sku_or_pack_mapping_requires_review',
     'Missing package evidence must remain an actionable no-go hold',
   )
+  const packAttentionInput = {
+    runtime,
+    actorEmail: systemActor,
+    idempotencyKey: 'commerce-staging-faire-auto-pack-attention',
+    candidateGlobalId: packTargets[0].candidateGlobalId,
+    candidateRowVersion: packTargets[0].candidateRowVersion,
+    sourceHash: packTargets[0].sourceHash,
+    runGlobalId: packExactStage.runGlobalId,
+    reasonCode: packTargets[0].reason,
+  }
+  const packAttention = await persistence
+    .markAutomaticFaireOrderPromotionAttentionInPostgres(packAttentionInput)
+  assert.equal(packAttention.marked, true)
+  assert.equal(packAttention.alreadyMarked, false)
+  assert.equal(packAttention.providerWrites, 0)
+  assert.equal(packAttention.inventoryWrites, 0)
+  assert.equal((await persistence
+    .readAutomaticFaireOrderPromotionTargetsForRunInPostgres({
+      runtime,
+      runGlobalId: packExactStage.runGlobalId,
+    })).length, 0, 'Marked actionable Faire candidates must leave the selector')
+
+  const attentionScan = await completeFaireAttentionScan(1)
+  assert.equal(
+    attentionScan.completed.faireAutomaticPromotionAttentionRequired,
+    true,
+  )
+  assert.equal(
+    attentionScan.health.providerPromotionAttentionRequired.faire,
+    1,
+  )
+  assert.equal(attentionScan.state.automaticPromotionAttentionRequired, true)
+  const emptyAttentionScan = await completeFaireAttentionScan(0)
+  assert.equal(
+    emptyAttentionScan.completed.faireAutomaticPromotionAttentionRequired,
+    true,
+    'A later empty root scan must retain candidate-scoped Faire attention',
+  )
+  assert.equal(
+    emptyAttentionScan.health.providerPromotionAttentionRequired.faire,
+    1,
+  )
+  assert.equal(
+    emptyAttentionScan.state.automaticPromotionAttentionRequired,
+    true,
+  )
+
+  await persistence.markCommerceCandidateUnsupportedInPostgres({
+    runtime,
+    actorEmail: humanActor,
+    idempotencyKey: 'commerce-staging-faire-auto-rejection-resolved',
+    candidateGlobalId: rejectionSourceCandidate.global_id,
+    candidateRowVersion: exactRejectionAttention.rowVersion,
+    reasonCode: 'operator_resolved',
+    reason: 'Operator reviewed and resolved the exact-read rejection.',
+  })
+  await persistence.markCommerceCandidateUnsupportedInPostgres({
+    runtime,
+    actorEmail: humanActor,
+    idempotencyKey: 'commerce-staging-faire-auto-pack-resolved',
+    candidateGlobalId: packAttention.candidateGlobalId,
+    candidateRowVersion: packAttention.rowVersion,
+    reasonCode: 'operator_resolved',
+    reason: 'Operator reviewed and resolved the package mapping hold.',
+  })
+  const markerHistory = (await pool.query(
+    `SELECT
+       count(*) FILTER (
+         WHERE last_error_code =
+           'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED'
+       )::integer AS active_markers,
+       count(*) FILTER (
+         WHERE external_order_id = $3
+           AND last_error_code IS NULL
+       )::integer AS historical_unmarked
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [ids.organization, ids.faireIntegrationAccount, manualExternalOrderId],
+  )).rows[0]
+  assert.deepEqual(markerHistory, {
+    active_markers: 0,
+    historical_unmarked: 2,
+  })
+  const clearedAttentionScan = await completeFaireAttentionScan(0)
+  assert.equal(
+    clearedAttentionScan.completed.faireAutomaticPromotionAttentionRequired,
+    false,
+    'Resolved markers and historical unmarked records must clear attention',
+  )
+  assert.equal(
+    clearedAttentionScan.health.providerPromotionAttentionRequired.faire,
+    0,
+  )
+  assert.equal(
+    clearedAttentionScan.state.automaticPromotionAttentionRequired,
+    false,
+  )
+  assert.equal(clearedAttentionScan.state.lastErrorCode, null)
   assert.equal((await pool.query(
     `SELECT count(*)::integer AS count
      FROM operations_orders

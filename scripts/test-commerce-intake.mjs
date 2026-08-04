@@ -1992,12 +1992,14 @@ includes(serviceSource, [
   'validateCommerceCandidateInPostgres',
   'promoteCommerceCandidateInPostgres',
   'automaticFaireOrderPromotion',
-  'automaticFaireHoldRequiresOperator',
+  'automaticFairePromotionHoldRequiresAttention',
+  'markAutomaticFaireOrderPromotionAttentionInPostgres',
   'automaticFairePromotionCanonicalRace',
   'COMMERCE_INTAKE_CANONICAL_ORDER_EXISTS',
   'COMMERCE_INTAKE_ALREADY_PROMOTED',
   'operatorReviewRequired,',
   'canonicalOrderWrites: promoted',
+  'automaticFairePromotion:',
 ], 'Conservative automatic Faire order promotion orchestration')
 includes(serviceSource, [
   'export async function executeCommerceFaireOrderExactRefresh',
@@ -2006,6 +2008,8 @@ includes(serviceSource, [
   'refreshTargetExpectation',
   'candidateRowVersion: input.candidateRowVersion',
   'sourceHash: input.sourceHash',
+  'expectedCredentialVersion: input.expectedCredentialVersion',
+  'COMMERCE_FAIRE_EXACT_REFRESH_CREDENTIAL_STALE',
 ], 'Worker-only revision-fenced Faire exact refresh wrapper')
 includes(serviceSource, [
   "'plan-customer-binding'",
@@ -2097,7 +2101,17 @@ includes(persistenceSource, [
   'product_sku_or_pack_mapping_requires_review',
   'ship_to_requires_review',
   'delivery_date_requires_review',
+  'operator_owned_history',
 ], 'Fresh-run Faire promotion eligibility and retained-order hold fences')
+includes(persistenceSource, [
+  'markAutomaticFaireOrderPromotionAttentionInPostgres',
+  'commerce.intake.mark_faire_auto_promotion_attention',
+  'commerce.intake.faire_auto_promotion.attention_marked',
+  'AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER',
+  'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_AUTHORITY_STALE',
+  'unsafe_candidate_history',
+  'exact_refresh_lineage',
+], 'Durable Faire attention provenance and final promotion authority fence')
 includes(persistenceSource, [
   'async function lockCommerceOrderIdentity',
   "'commerce-intake-order-identity-v1'",
@@ -2110,8 +2124,8 @@ includes(persistenceSource, [
 assert.equal(
   persistenceSource.match(/await lockCommerceOrderIdentity\(client, \{/gu)
     ?.length,
-  2,
-  'Staging and promotion must both acquire the same order identity lock',
+  3,
+  'Staging, attention marking, and promotion must share the same order identity lock',
 )
 includes(persistenceSource, [
   "rejection.resourceType === 'order'",
@@ -3176,6 +3190,8 @@ const service = loadTypeScriptModule(
         },
         confirmCommerceCandidateAddressInPostgres:
           persistenceCommand('confirm-address'),
+        markAutomaticFaireOrderPromotionAttentionInPostgres:
+          persistenceCommand('mark-faire-auto-attention'),
         markAutomaticShopifyOrderPromotionAttentionInPostgres:
           persistenceCommand('mark-shopify-auto-attention'),
         markCommerceCandidateUnsupportedInPostgres:
@@ -4335,6 +4351,7 @@ try {
       reason: null,
       candidateGlobalId: 'gcoc0000010',
       candidateRowVersion: 10,
+      sourceHash: 'a'.repeat(64),
       providerAddress: {
         name: 'Controlled Faire Retailer',
         line1: '100 Test Way',
@@ -4351,6 +4368,7 @@ try {
       reason: 'customer_resolution_required',
       candidateGlobalId: 'gcoc0000011',
       candidateRowVersion: 11,
+      sourceHash: 'b'.repeat(64),
       providerAddress: null,
       deliveryMode: null,
     },
@@ -4359,13 +4377,14 @@ try {
       reason: 'product_sku_or_pack_mapping_requires_review',
       candidateGlobalId: 'gcoc0000012',
       candidateRowVersion: 12,
+      sourceHash: 'c'.repeat(64),
       providerAddress: null,
       deliveryMode: null,
     },
   ]
   const automaticFaireFetch = await service.executeCommerceIntakeCommand({
     organizationId,
-    actorEmail,
+    actorEmail: 'system:commerce-order-reconciliation',
     body: {
       action: 'fetch',
       accountGlobalId: faireRuntime.globalId,
@@ -4421,11 +4440,55 @@ try {
     4,
     'Each automatic Faire command must have a distinct deterministic receipt key',
   )
+  const automaticFaireAttentionCommands = persistenceCommands
+    .slice(automaticFaireCommandStart)
+    .filter((entry) => entry.name === 'mark-faire-auto-attention')
+  assert.deepEqual(
+    automaticFaireAttentionCommands.map((entry) => ({
+      candidateGlobalId: entry.input.candidateGlobalId,
+      candidateRowVersion: entry.input.candidateRowVersion,
+      sourceHash: entry.input.sourceHash,
+      reasonCode: entry.input.reasonCode,
+      runGlobalId: entry.input.runGlobalId,
+      actorEmail: entry.input.actorEmail,
+    })),
+    [
+      {
+        candidateGlobalId: 'gcoc0000011',
+        candidateRowVersion: 11,
+        sourceHash: 'b'.repeat(64),
+        reasonCode: 'customer_resolution_required',
+        runGlobalId: automaticFaireFetch.command.runGlobalId,
+        actorEmail: 'system:commerce-order-reconciliation',
+      },
+      {
+        candidateGlobalId: 'gcoc0000012',
+        candidateRowVersion: 12,
+        sourceHash: 'c'.repeat(64),
+        reasonCode: 'product_sku_or_pack_mapping_requires_review',
+        runGlobalId: automaticFaireFetch.command.runGlobalId,
+        actorEmail: 'system:commerce-order-reconciliation',
+      },
+    ],
+    'Only actionable Faire holds cross the durable candidate-provenance boundary',
+  )
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      automaticFaireCommands.at(-1).input.automaticFairePromotion,
+    )),
+    {
+      policyVersion: 'commerce-faire-order-auto-promotion-v1',
+      runGlobalId: automaticFaireFetch.command.runGlobalId,
+      sourceHash: 'a'.repeat(64),
+    },
+    'The final Faire promotion transaction receives exact policy, run, and source authority',
+  )
   automaticFairePromotionTargets = [{
     eligible: true,
     reason: null,
     candidateGlobalId: 'gcoc0000013',
     candidateRowVersion: 13,
+    sourceHash: 'd'.repeat(64),
     providerAddress: null,
     deliveryMode: null,
   }]
@@ -4433,7 +4496,7 @@ try {
     'COMMERCE_INTAKE_CANONICAL_ORDER_EXISTS'
   const concurrentCanonicalFetch = await service.executeCommerceIntakeCommand({
     organizationId,
-    actorEmail,
+    actorEmail: 'system:commerce-order-reconciliation',
     body: {
       action: 'fetch',
       accountGlobalId: faireRuntime.globalId,
@@ -4474,6 +4537,7 @@ try {
     candidateGlobalId: 'gcoc0000020',
     candidateRowVersion: 7,
     sourceHash: '9'.repeat(64),
+    expectedCredentialVersion: faireRuntime.credentialVersion,
   }
   const workerExactRefresh =
     await service.executeCommerceFaireOrderExactRefresh(
@@ -4531,6 +4595,40 @@ try {
     providerReads.faireOrder,
     faireExactReadsBeforeWorkerRefresh + 1,
     'Source concurrency drift must fail before provider I/O',
+  )
+  const credentialFencePreparations = readIntentPreparations.length
+  const credentialFenceReservations = providerReservations.length
+  const credentialFenceAttempts = providerAttempts.length
+  runtimes.set(faireRuntime.globalId, {
+    ...faireRuntime,
+    credentialVersion: faireRuntime.credentialVersion + 1,
+  })
+  try {
+    await assert.rejects(
+      service.executeCommerceFaireOrderExactRefresh({
+        ...workerExactRefreshInput,
+        idempotencyKey: nextKey(),
+      }),
+      (error) => error.code
+        === 'COMMERCE_FAIRE_EXACT_REFRESH_CREDENTIAL_STALE',
+    )
+  } finally {
+    runtimes.set(faireRuntime.globalId, faireRuntime)
+  }
+  assert.equal(
+    readIntentPreparations.length,
+    credentialFencePreparations,
+    'Credential drift must fail before creating a read intent',
+  )
+  assert.equal(
+    providerReservations.length,
+    credentialFenceReservations,
+    'Credential drift must fail before reserving a provider attempt',
+  )
+  assert.equal(
+    providerAttempts.length,
+    credentialFenceAttempts,
+    'Credential drift must fail before provider I/O',
   )
   await assert.rejects(
     service.executeCommerceIntakeCommand({

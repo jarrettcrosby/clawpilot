@@ -4,6 +4,25 @@ export const AUTOMATIC_FAIRE_ORDER_MAX_SOURCE_AGE_MS =
 export const AUTOMATIC_FAIRE_ORDER_MAX_FUTURE_SKEW_MS =
   5 * 60 * 1_000
 
+export const AUTOMATIC_FAIRE_ORDER_PROMOTION_POLICY_VERSION =
+  'commerce-faire-order-auto-promotion-v1'
+
+export const AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER =
+  'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED'
+
+const BENIGN_AUTOMATIC_FAIRE_PROMOTION_HOLDS = new Set([
+  'exact_refresh_required',
+  'canonical_order_exists',
+  'order_terminal_no_demand',
+  'operator_owned_history',
+])
+
+export function automaticFairePromotionHoldRequiresAttention(
+  reason: string,
+) {
+  return !BENIGN_AUTOMATIC_FAIRE_PROMOTION_HOLDS.has(reason)
+}
+
 function timestamp(value: Date | string | null) {
   if (value === null) return Number.NaN
   const parsed = value instanceof Date ? value.getTime() : new Date(value).getTime()

@@ -50,6 +50,9 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) return mocks[specifier]
       if (specifier === '@/lib/persistence/commerceIntake') {
         return {
+          async markAutomaticFaireOrderPromotionAttentionInPostgres() {
+            return { marked: true }
+          },
           async readAutomaticFaireExactRefreshTargetsInPostgres() {
             return []
           },
@@ -65,6 +68,14 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
             }
           },
         }
+      }
+      if (
+        specifier
+        === '@/lib/integrations/commerceFaireAutomaticPromotion'
+      ) {
+        return loadTypeScriptModule(
+          'app_src/lib/integrations/commerceFaireAutomaticPromotion.ts',
+        )
       }
       if (
         specifier
@@ -321,15 +332,10 @@ const completionPersistenceSource = persistence.slice(
     'export async function failCommerceOrderReconciliationInPostgres',
   ),
 )
-assert.match(
-  completionPersistenceSource,
-  /WHEN \$8::boolean[\s\S]*last_error_code =\s*'\$\{FAIRE_AUTO_PROMOTION_ATTENTION_CODE\}'/u,
-  'Only Faire may use the legacy continuation attention fallback',
-)
 assert.doesNotMatch(
   completionPersistenceSource,
-  /WHEN \$8::boolean[\s\S]{0,300}SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE/u,
-  'Shopify continuation attention must be recomputed from active candidate markers',
+  /WHEN \$8::boolean/u,
+  'Shopify and Faire continuation attention must be recomputed from active candidate markers',
 )
 
 let claimSql = ''
@@ -580,7 +586,7 @@ const promotionCompletionModule = loadTypeScriptModule(
               return {
                 rowCount: 1,
                 rows: [{
-                  last_error_code: values[8] === 'shopify' && values[5] > 0
+                  last_error_code: values[7] === 'shopify' && values[5] > 0
                     ? 'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED'
                     : values[6] > 0
                       ? 'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED'
@@ -631,8 +637,7 @@ assert.match(
 )
 assert.equal(promotionCompletionQueries[0].values[5], 0)
 assert.equal(promotionCompletionQueries[0].values[6], 1)
-assert.equal(promotionCompletionQueries[0].values[7], false)
-assert.equal(promotionCompletionQueries[0].values[8], 'faire')
+assert.equal(promotionCompletionQueries[0].values[7], 'faire')
 assert.equal(
   promotionCompletionAudits[0].payload
     .automaticFaireOrderPromotion.failed,
@@ -1138,6 +1143,7 @@ assert.deepEqual(
     failedByCode: {
       COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_FAILED: 1,
     },
+    attentionRequiredAccounts: 0,
     operatorReviewRequired: 3,
     providerWrites: 0,
     canonicalOrderWrites: 1,
@@ -1390,6 +1396,7 @@ const exactRefreshTrace = {
   listPages: 0,
   selections: [],
   reads: [],
+  attention: [],
   complete: [],
   failed: 0,
 }
@@ -1472,6 +1479,10 @@ const exactRefreshWorker = loadTypeScriptModule(
         },
       },
       '@/lib/persistence/commerceIntake': {
+        async markAutomaticFaireOrderPromotionAttentionInPostgres(input) {
+          exactRefreshTrace.attention.push(input)
+          return { marked: true }
+        },
         async readAutomaticFaireExactRefreshTargetsInPostgres(input) {
           exactRefreshTrace.selections.push(input)
           return [
@@ -1567,7 +1578,25 @@ for (const read of exactRefreshTrace.reads) {
     /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
   )
   assert.equal(read.actorEmail, 'system:commerce-order-reconciliation')
+  assert.equal(read.expectedCredentialVersion, failureTarget.credentialVersion)
 }
+assert.deepEqual(
+  exactRefreshTrace.attention.map((entry) => ({
+    candidateGlobalId: entry.candidateGlobalId,
+    candidateRowVersion: entry.candidateRowVersion,
+    sourceHash: entry.sourceHash,
+    runGlobalId: entry.runGlobalId,
+    reasonCode: entry.reasonCode,
+  })),
+  [{
+    candidateGlobalId: 'gcoc0000102',
+    candidateRowVersion: 5,
+    sourceHash: 'b'.repeat(64),
+    runGlobalId: 'gcir0000201',
+    reasonCode: 'COMMERCE_FAIRE_EXACT_REFRESH_NORMALIZATION_REJECTED',
+  }],
+  'An exact normalization rejection marks only its original stale candidate',
+)
 assert.deepEqual(
   JSON.parse(JSON.stringify(exactRefreshSummary.automaticFaireExactRefresh)),
   {

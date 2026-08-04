@@ -28,6 +28,10 @@ import {
   normalizeShopifyCommerce,
 } from '@/lib/integrations/shopifyCommerceNormalizer'
 import {
+  automaticFairePromotionHoldRequiresAttention,
+  AUTOMATIC_FAIRE_ORDER_PROMOTION_POLICY_VERSION,
+} from '@/lib/integrations/commerceFaireAutomaticPromotion'
+import {
   automaticShopifyPromotionHoldRequiresAttention,
   shopifyAutomaticOrderPromotionGate,
   SHOPIFY_AUTOMATIC_ORDER_PROMOTION_POLICY_VERSION,
@@ -59,6 +63,7 @@ import {
   confirmCommerceCandidateAddressInPostgres,
   excludeCommerceIntakeRejectionInPostgres,
   markCommerceIntakeProviderReadUncertainInPostgres,
+  markAutomaticFaireOrderPromotionAttentionInPostgres,
   markAutomaticShopifyOrderPromotionAttentionInPostgres,
   markCommerceCandidateUnsupportedInPostgres,
   markCommerceIntakeContinuationInvalidInPostgres,
@@ -2375,17 +2380,9 @@ function automaticFairePromotionCanonicalRace(code: string) {
     || code === 'COMMERCE_INTAKE_CANONICAL_ORDER_EXISTS'
 }
 
-function automaticFaireHoldRequiresOperator(reason: string) {
-  return !new Set([
-    'exact_refresh_required',
-    'canonical_order_exists',
-    'order_terminal_no_demand',
-  ]).has(reason)
-}
-
 function automaticFaireCommandKey(parts: readonly string[]) {
   return deterministicCustomerCommandUuid([
-    'commerce-faire-order-auto-promotion-v1',
+    AUTOMATIC_FAIRE_ORDER_PROMOTION_POLICY_VERSION,
     ...parts,
   ])
 }
@@ -2423,7 +2420,7 @@ async function withAutomaticFaireOrderPromotion(
     return {
       ...command,
       automaticFaireOrderPromotion: {
-        policyVersion: 'commerce-faire-order-auto-promotion-v1',
+        policyVersion: AUTOMATIC_FAIRE_ORDER_PROMOTION_POLICY_VERSION,
         runGlobalId,
         candidatesFound: 0,
         eligible: 0,
@@ -2449,12 +2446,70 @@ async function withAutomaticFaireOrderPromotion(
   let operatorReviewRequired = 0
   const heldByReason: Record<string, number> = {}
   const failedByCode: Record<string, number> = {}
+  const markAttention = async (target: {
+    candidateGlobalId: string
+    candidateRowVersion: number
+    sourceHash: string
+    reasonCode: string
+  }) => {
+    try {
+      const result = await markAutomaticFaireOrderPromotionAttentionInPostgres({
+        runtime: input.runtime,
+        actorEmail: input.actorEmail,
+        idempotencyKey: automaticFaireCommandKey([
+          input.runtime.globalId,
+          runGlobalId,
+          target.candidateGlobalId,
+          String(target.candidateRowVersion),
+          target.sourceHash,
+          `attention:${target.reasonCode}`,
+        ]),
+        candidateGlobalId: target.candidateGlobalId,
+        candidateRowVersion: target.candidateRowVersion,
+        sourceHash: target.sourceHash,
+        runGlobalId,
+        reasonCode: target.reasonCode,
+      }) as { marked?: boolean; reasonCode?: string }
+      return result.marked === false
+        ? {
+            attentionRequired: false as const,
+            reasonCode: result.reasonCode || 'candidate_resolved',
+          }
+        : {
+            attentionRequired: true as const,
+            reasonCode: target.reasonCode,
+          }
+    } catch {
+      failed += 1
+      const code = 'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_PROVENANCE_FAILED'
+      failedByCode[code] = (failedByCode[code] || 0) + 1
+      return {
+        attentionRequired: true as const,
+        reasonCode: target.reasonCode,
+      }
+    }
+  }
   for (const target of targets) {
     if (!target.eligible) {
       held += 1
-      heldByReason[target.reason] = (heldByReason[target.reason] || 0) + 1
-      if (automaticFaireHoldRequiresOperator(target.reason)) {
-        operatorReviewRequired += 1
+      if (automaticFairePromotionHoldRequiresAttention(target.reason)) {
+        const outcome = await markAttention({
+          candidateGlobalId: target.candidateGlobalId,
+          candidateRowVersion: target.candidateRowVersion,
+          sourceHash: target.sourceHash,
+          reasonCode: target.reason,
+        })
+        if (outcome.attentionRequired) {
+          operatorReviewRequired += 1
+          heldByReason[target.reason] =
+            (heldByReason[target.reason] || 0) + 1
+        } else {
+          heldByReason[outcome.reasonCode] =
+            (heldByReason[outcome.reasonCode] || 0) + 1
+        }
+      } else {
+        heldByReason[target.reason] =
+          (heldByReason[target.reason] || 0) + 1
       }
       continue
     }
@@ -2514,9 +2569,20 @@ async function withAutomaticFaireOrderPromotion(
       rowVersion = Number(validation.rowVersion)
       if (validation.ready !== true) {
         held += 1
-        operatorReviewRequired += 1
-        heldByReason.validation_blocked =
-          (heldByReason.validation_blocked || 0) + 1
+        const outcome = await markAttention({
+          candidateGlobalId: target.candidateGlobalId,
+          candidateRowVersion: rowVersion,
+          sourceHash: target.sourceHash,
+          reasonCode: 'validation_blocked',
+        })
+        if (outcome.attentionRequired) {
+          operatorReviewRequired += 1
+          heldByReason.validation_blocked =
+            (heldByReason.validation_blocked || 0) + 1
+        } else {
+          heldByReason[outcome.reasonCode] =
+            (heldByReason[outcome.reasonCode] || 0) + 1
+        }
         continue
       }
       await promoteCommerceCandidateInPostgres({
@@ -2532,13 +2598,19 @@ async function withAutomaticFaireOrderPromotion(
         candidateGlobalId: target.candidateGlobalId,
         candidateRowVersion: rowVersion,
         requestHash: requestHash({
-          policyVersion: 'commerce-faire-order-auto-promotion-v1',
+          policyVersion: AUTOMATIC_FAIRE_ORDER_PROMOTION_POLICY_VERSION,
           accountGlobalId: input.runtime.globalId,
           runGlobalId,
           candidateGlobalId: target.candidateGlobalId,
           candidateRowVersion: rowVersion,
+          sourceHash: target.sourceHash,
           providerWrites: 0,
         }),
+        automaticFairePromotion: {
+          policyVersion: AUTOMATIC_FAIRE_ORDER_PROMOTION_POLICY_VERSION,
+          runGlobalId,
+          sourceHash: target.sourceHash,
+        },
       })
       promoted += 1
     } catch (error) {
@@ -2549,15 +2621,27 @@ async function withAutomaticFaireOrderPromotion(
           (heldByReason.canonical_order_exists || 0) + 1
         continue
       }
-      failed += 1
-      operatorReviewRequired += 1
-      failedByCode[code] = (failedByCode[code] || 0) + 1
+      const outcome = await markAttention({
+        candidateGlobalId: target.candidateGlobalId,
+        candidateRowVersion: rowVersion,
+        sourceHash: target.sourceHash,
+        reasonCode: code,
+      })
+      if (outcome.attentionRequired) {
+        failed += 1
+        operatorReviewRequired += 1
+        failedByCode[code] = (failedByCode[code] || 0) + 1
+      } else {
+        held += 1
+        heldByReason[outcome.reasonCode] =
+          (heldByReason[outcome.reasonCode] || 0) + 1
+      }
     }
   }
   return {
     ...command,
     automaticFaireOrderPromotion: {
-      policyVersion: 'commerce-faire-order-auto-promotion-v1',
+      policyVersion: AUTOMATIC_FAIRE_ORDER_PROMOTION_POLICY_VERSION,
       runGlobalId,
       candidatesFound: targets.length,
       eligible,
@@ -2585,6 +2669,7 @@ type CommerceIntakeExecutionOptions = {
   includeIntakeState: boolean
   hydrateProductInventory: boolean
   providerAttemptActorEmail?: string | null
+  expectedCredentialVersion?: number
   refreshTargetExpectation?: {
     candidateGlobalId: string
     candidateRowVersion: number
@@ -2747,6 +2832,19 @@ async function executeCommerceIntakeCommandInternal(
     organizationId: input.organizationId,
     accountGlobalId: input.body.accountGlobalId,
   })
+  if (
+    options.expectedCredentialVersion !== undefined
+    && (
+      runtime.provider !== 'faire'
+      || runtime.credentialVersion !== options.expectedCredentialVersion
+    )
+  ) {
+    throw new CommerceIntegrationRequestError(
+      'The Faire credential changed after this exact-refresh target was selected',
+      409,
+      'COMMERCE_FAIRE_EXACT_REFRESH_CREDENTIAL_STALE',
+    )
+  }
   const shared = {
     runtime,
     actorEmail: input.actorEmail,
@@ -3702,6 +3800,7 @@ export async function executeCommerceFaireOrderExactRefresh(input: {
   candidateGlobalId: string
   candidateRowVersion: number
   sourceHash: string
+  expectedCredentialVersion: number
 }) {
   return executeCommerceIntakeCommandInternal({
     organizationId: input.organizationId,
@@ -3717,6 +3816,7 @@ export async function executeCommerceFaireOrderExactRefresh(input: {
     includeIntakeState: false,
     hydrateProductInventory: false,
     providerAttemptActorEmail: null,
+    expectedCredentialVersion: input.expectedCredentialVersion,
     refreshTargetExpectation: {
       candidateGlobalId: input.candidateGlobalId,
       candidateRowVersion: input.candidateRowVersion,
