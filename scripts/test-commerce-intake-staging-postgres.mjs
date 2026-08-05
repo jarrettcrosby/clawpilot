@@ -434,7 +434,35 @@ function productImageFixture() {
       vendor: 'ClawPilot acceptance',
       productType: 'Test',
       providerTaxonomy: unavailable(),
-      variants: Object.freeze([]),
+      variants: Object.freeze([Object.freeze({
+        schemaVersion: 'commerce-normalized-variant-v1',
+        identity: Object.freeze({
+          provider: 'shopify',
+          resourceType: 'variant',
+          value: 'gid://shopify/ProductVariant/92010011',
+        }),
+        productIdentity: Object.freeze({
+          provider: 'shopify',
+          resourceType: 'product',
+          value: 'gid://shopify/Product/9201001',
+        }),
+        inventoryItemIdentity: unavailable(),
+        sku: 'COMMERCE-STAGING-IMAGE-9201001',
+        barcode: null,
+        title: 'Default',
+        selectedOptions: Object.freeze([]),
+        unitMultiplier: 1,
+        wholesalePrice: unavailable(),
+        retailPrice: unavailable(),
+        taxable: false,
+        requiresShipping: false,
+        inventory: unavailable(),
+        packaging: unavailable(),
+        weightGrams: null,
+        providerCreatedAt: observedAt,
+        providerUpdatedAt: observedAt,
+        sourceHash: hash('commerce-staging-product-variant-source'),
+      })]),
       images: Object.freeze([Object.freeze({
         providerImageId,
         locatorFingerprint,
@@ -6359,7 +6387,9 @@ async function verifyAutomaticFaireExactRefreshLineage(
   const exactRejectionEvidence = (await pool.query(
     `SELECT intent.intent_state, intent.target_global_id,
             intent.target_source_hash, rejection.disposition,
-            rejection.external_id, rejection.error_code
+            rejection.external_id, rejection.error_code,
+            rejection.expires_at IS DISTINCT FROM run.expires_at
+              AS expiry_mismatch
      FROM operations_commerce_intake_read_intents intent
      JOIN operations_commerce_intake_runs run
        ON run.organization_id = intent.organization_id
@@ -6379,6 +6409,7 @@ async function verifyAutomaticFaireExactRefreshLineage(
     disposition: 'open',
     external_id: rejectionExternalOrderId,
     error_code: 'COMMERCE_ORDER_RECORD_INVALID',
+    expiry_mismatch: false,
   })
   const exactRejectionAttentionInput = {
     runtime,
@@ -7259,6 +7290,9 @@ async function verifyAcceptance(databaseUrl) {
     mappedVariant: 'gid://shopify/ProductVariant/mapped-zero',
   }
   const imageFixture = productImageFixture()
+  const providerClockAheadRetentionExpiresAt = new Date(
+    Date.now() + 30 * 24 * 60 * 60 * 1_000 + 60_000,
+  ).toISOString()
   const envelope = Object.freeze({
     schemaVersion: 'commerce-normalization-envelope-v1',
     normalizerVersion: 'commerce-staging-postgres-v1',
@@ -7269,7 +7303,7 @@ async function verifyAcceptance(databaseUrl) {
     apiVersion: '2026-07',
     observedAt,
     credentialGeneration: 1,
-    retentionExpiresAt,
+    retentionExpiresAt: providerClockAheadRetentionExpiresAt,
     sourceHash: hash('commerce-staging-envelope'),
     products: Object.freeze([imageFixture.product]),
     orders: Object.freeze([
@@ -7448,9 +7482,70 @@ async function verifyAcceptance(databaseUrl) {
   )
   assert.equal(result.replayed, false)
   assert.equal(result.ordersStaged, 6)
-  assert.equal(result.recordsStaged, 6)
+  assert.equal(result.productVariantsStaged, 1)
+  assert.equal(result.recordsStaged, 7)
   assert.equal(result.providerWrites, 0)
   assert.equal(result.syncCursorAdvanced, false)
+  const retention = (await pool.query(
+    `SELECT
+       run.expires_at > run.created_at AS remains_unexpired,
+       run.expires_at <= run.created_at + interval '30 days'
+         AS database_bounded,
+       run.expires_at < $2::timestamptz AS provider_clock_clamped,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_product_candidates product_candidate
+         WHERE product_candidate.run_id = run.id
+           AND product_candidate.expires_at IS DISTINCT FROM run.expires_at
+       ) AS product_expiry_mismatches,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_product_candidates product_candidate
+         WHERE product_candidate.run_id = run.id
+       ) AS product_candidate_count,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_order_candidates candidate
+         WHERE candidate.run_id = run.id
+           AND candidate.expires_at IS DISTINCT FROM run.expires_at
+       ) AS order_expiry_mismatches,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_order_candidate_lines line
+         WHERE line.run_id = run.id
+           AND line.expires_at IS DISTINCT FROM run.expires_at
+       ) AS line_expiry_mismatches,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_intake_continuations continuation
+         WHERE continuation.run_id = run.id
+           AND continuation.expires_at IS DISTINCT FROM run.expires_at
+       ) AS continuation_expiry_mismatches,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_intake_continuations continuation
+         WHERE continuation.run_id = run.id
+       ) AS continuation_count
+     FROM operations_commerce_intake_runs run
+     WHERE run.organization_id = $1::uuid
+       AND run.global_id = $3`,
+    [
+      ids.organization,
+      providerClockAheadRetentionExpiresAt,
+      result.runGlobalId,
+    ],
+  )).rows[0]
+  assert.deepEqual(retention, {
+    remains_unexpired: true,
+    database_bounded: true,
+    provider_clock_clamped: true,
+    product_expiry_mismatches: 0,
+    product_candidate_count: 1,
+    order_expiry_mismatches: 0,
+    line_expiry_mismatches: 0,
+    continuation_expiry_mismatches: 0,
+    continuation_count: 1,
+  })
   assert.deepEqual(JSON.parse(JSON.stringify(result.productImageImports)), {
     productsObserved: 1,
     activeImagesObserved: 1,

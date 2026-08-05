@@ -5670,6 +5670,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       id: string
       global_id: string
       resource: 'products' | 'products_and_orders'
+      expires_at: string
     }>(
       `INSERT INTO operations_commerce_intake_runs (
          organization_id, integration_account_id, pipeline_id, provider,
@@ -5681,9 +5682,10 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7,
          $8, $9, $10, $11::uuid, $12::timestamptz, $13::timestamptz,
-         'held', $14, $15, 0, $16, $16, $17::timestamptz
+         'held', $14, $15, 0, $16, $16,
+         LEAST($17::timestamptz, now() + interval '30 days')
        )
-       RETURNING id::text, global_id`,
+       RETURNING id::text, global_id, expires_at::text AS expires_at`,
       [
         account.organization_id,
         account.id,
@@ -6120,7 +6122,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
             mapping?.id || null,
             mapping ? [] : ['product_mapping_required'],
             input.actorEmail,
-            input.envelope.retentionExpiresAt,
+            run.expires_at,
           ],
         )
         productCandidateByVariant.set(
@@ -6412,7 +6414,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           input.envelope.normalizerVersion,
           initialCodes,
           input.actorEmail,
-          input.envelope.retentionExpiresAt,
+          run.expires_at,
           checkoutDestinationFingerprint,
           checkoutShippingServiceCode,
         ],
@@ -6606,7 +6608,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
             input.envelope.normalizerVersion,
             codes,
             input.actorEmail,
-            input.envelope.retentionExpiresAt,
+            run.expires_at,
             providerPriceResolution.state,
             providerPriceResolution.resolvedCurrencyCode,
             providerPriceResolution.resolvedUnitPriceMinor === null
@@ -6668,7 +6670,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           rejection.errorCode,
           rejection.safeMessage,
           input.actorEmail,
-          input.envelope.retentionExpiresAt,
+          run.expires_at,
         ],
       )
     }
@@ -6886,7 +6888,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           input.page.providerRowsSeen,
           input.page.eligibleOrdersSeen,
           input.actorEmail,
-          input.envelope.retentionExpiresAt,
+          run.expires_at,
         ],
       )
       pagination = {
