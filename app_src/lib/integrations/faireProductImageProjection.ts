@@ -551,9 +551,10 @@ function recoveredClaimResult(
       attachmentAccepted: context.providerWriteCount >= 2,
     },
     images: {
-      existingPreserved: true,
-      priorCount: null,
-      projectedCount: null,
+      existingPreserved:
+        context.reconciliationEligibility === 'readback_terminalizable',
+      priorCount: context.priorImageCount,
+      projectedCount: context.projectedImageCount,
       uploadedLocatorSha256: context.uploadedLocatorSha256,
     },
     externalEffect: {
@@ -882,10 +883,13 @@ export async function executeFaireProductImagePublish(
         operation: 'productImageAttach',
         outcome: 'succeeded',
         externalProductId: grant.externalProductId,
+        assetContentSha256: grant.assetContentSha256,
         uploadedLocatorSha256,
         priorImageCount: providerImages.length,
         projectedImageCount: projectedImages.length,
         existingImagesPreserved: true,
+        providerWritesKnown: true,
+        providerWriteCountLowerBound: 2,
         providerWrites: 2,
       },
       actorEmail: input.actorEmail,
@@ -906,8 +910,15 @@ export async function executeFaireProductImagePublish(
           operation: 'productImageAttach',
           outcome: 'unknown',
           errorCode: safeCode(error, 'FAIRE_PRODUCT_IMAGE_ATTACH_OUTCOME_UNKNOWN'),
+          externalProductId: grant.externalProductId,
+          assetContentSha256: grant.assetContentSha256,
           uploadedLocatorSha256,
+          priorImageCount: providerImages.length,
+          projectedImageCount: projectedImages.length,
+          existingImagesPreserved: true,
           knownProviderWrites: 1,
+          providerWritesKnown: false,
+          providerWriteCountLowerBound: 1,
           providerWrites: 1,
         },
         actorEmail: input.actorEmail,
@@ -1003,6 +1014,41 @@ export async function reconcileFaireProductImagePublish(
         ? 'Faire Product-image publication is still inside its claim lease'
         : 'Only an uncertain or failed Faire Product-image publication can be reconciled',
     )
+  }
+  if (
+    context.effectState === 'unknown'
+    && context.reconciliationEligibility !== 'readback_terminalizable'
+  ) {
+    const evidence = {
+      provider: 'faire',
+      operation: 'productImagePublishReconciliation',
+      outcome: 'manual_review',
+      reason: context.reconciliationReason,
+      externalProductId: context.externalProductId,
+      uploadedLocatorSha256: context.uploadedLocatorSha256,
+      providerWrites: context.providerWriteCount,
+      reconciledBy,
+    }
+    await dependencies.recordProviderStep({
+      organizationId,
+      deliveryGrantId: context.deliveryGrantId,
+      externalEffectId: context.externalEffectId,
+      providerAttemptId: null,
+      stage: 'reconcile',
+      outcome: 'manual_review',
+      uploadedLocatorSha256: context.uploadedLocatorSha256,
+      providerWriteCount: context.providerWriteCount,
+      redactedEvidence: evidence,
+      actorEmail: reconciledBy,
+    })
+    return {
+      externalEffectGlobalId,
+      outcome: 'manual_review' as const,
+      confirmedApplied: false,
+      reason: context.reconciliationReason,
+      terminalized: false,
+      replayed: false,
+    }
   }
   if (!context.uploadedLocatorSha256) {
     const evidence = {
