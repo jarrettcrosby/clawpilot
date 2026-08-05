@@ -19,10 +19,19 @@ const HASH = /^[a-f0-9]{64}$/
 const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
 const CHANNEL_GLOBAL_ID = /^gpcs(?:[0-9]{7}|[0-9a-v]{12})$/
 const EFFECT_GLOBAL_ID = /^gcef(?:[0-9]{7}|[0-9a-v]{12})$/
+const PROVIDER_ATTEMPT_GLOBAL_ID = /^gxa(?:[0-9]{7}|[0-9a-v]{12})$/
 const PRODUCT_REFERENCE = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/
 const MAX_PROVIDER_IMAGES = 20
 const ACTIVE_TTL_SECONDS = 5 * 60
 const SHADOW_TTL_SECONDS = 60
+const PROVIDER_STEP_OUTCOMES = new Set([
+  'succeeded',
+  'failed',
+  'unknown',
+  'observed_applied',
+  'observed_absent',
+  'manual_review',
+])
 
 type TimestampValue = string | Date
 
@@ -122,6 +131,8 @@ type ReconciliationRow = QueryResultRow & {
   credential_generation: number
   external_product_id: string
   asset_content_sha256: string
+  provider_attempt_id: string
+  provider_attempt_global_id: string
   external_effect_id: string
   external_effect_global_id: string
   effect_state: string
@@ -131,12 +142,27 @@ type ReconciliationRow = QueryResultRow & {
   uploaded_locator_sha256: string | null
   prior_image_count: string | number | null
   projected_image_count: string | number | null
+  evidence_source: 'attach_step' | 'effect_result' | null
+  durable_attach_step_id: string | null
+  durable_attach_outcome: 'unknown' | 'succeeded' | null
   latest_outcome: string | null
   latest_observed_at: TimestampValue | null
   reconciliation_applied: boolean
   reconciled_provider_image_count: string | number | null
   reconciled_exact_locator_match_count: string | number | null
   reconciled_provider_image_set_sha256: string | null
+}
+
+type RecoveryEffectRow = QueryResultRow & {
+  external_effect_global_id: string
+  product_reference_code: string
+  channel_state_global_id: string
+  asset_revision: string | number
+  asset_alt_text: string
+  latest_outcome: string | null
+  latest_observed_at: TimestampValue | null
+  error_code: string | null
+  occurred_at: TimestampValue
 }
 
 export type FaireProductImageProjectionMode = 'shadow' | 'active'
@@ -196,6 +222,8 @@ export type FaireProductImageReconciliationContext = {
   credentialGeneration: number
   externalProductId: string
   assetContentSha256: string
+  providerAttemptId: string
+  providerAttemptGlobalId: string
   externalEffectId: string
   externalEffectGlobalId: string
   effectState: string
@@ -205,12 +233,40 @@ export type FaireProductImageReconciliationContext = {
   uploadedLocatorSha256: string | null
   priorImageCount: number | null
   projectedImageCount: number | null
+  durableEvidenceSource: 'attach_step' | 'effect_result' | null
+  durableAttachStepId: string | null
+  durableAttachOutcome: 'unknown' | 'succeeded' | null
+  reconciliationEligibility: 'readback_terminalizable' | 'manual_review'
+  reconciliationReason:
+    | 'exact_attach_unknown_evidence'
+    | 'exact_attach_succeeded_evidence'
+    | 'exact_unknown_effect_evidence'
+    | 'upload_locator_unavailable'
+    | 'provider_write_count_unsupported'
+    | 'exact_attachment_evidence_unavailable'
   latestOutcome: string | null
   latestObservedAt: string | null
   reconciliationApplied: boolean
   reconciledProviderImageCount: number | null
   reconciledExactLocatorMatchCount: number | null
   reconciledProviderImageSetSha256: string | null
+}
+
+export type FaireProductImageRecoveryEffect = {
+  externalEffectGlobalId: string
+  recoveryState: 'unknown' | 'expired_claim'
+  providerWriteCount: number
+  uploadedLocatorAvailable: boolean
+  reconciliationEligibility: 'readback_terminalizable' | 'manual_review'
+  reconciliationReason: FaireProductImageReconciliationContext['reconciliationReason']
+  productReferenceCode: string
+  channelStateGlobalId: string
+  assetRevision: number
+  assetAltText: string
+  latestOutcome: string | null
+  latestObservedAt: string | null
+  errorCode: string | null
+  occurredAt: string
 }
 
 export class FaireProductImageProjectionPersistenceError extends Error {
@@ -1209,6 +1265,116 @@ export async function recordFaireProductImageProviderStepInPostgres(input: {
   }
 }
 
+/**
+ * Returns only durable, product-scoped Faire image effects that an operator can
+ * safely send through provider readback reconciliation. Raw provider identity,
+ * URLs, credentials, requests, responses, and authorization material never
+ * cross this boundary.
+ */
+export async function listFaireProductImageRecoveryEffectsInPostgres(input: {
+  organizationId: string
+  productId: string
+}): Promise<FaireProductImageRecoveryEffect[]> {
+  if (!UUID.test(input.organizationId) || !UUID.test(input.productId)) {
+    fail(
+      'FAIRE_PRODUCT_IMAGE_RECOVERY_SELECTION_INVALID',
+      'Faire Product-image recovery selection is invalid',
+      404,
+    )
+  }
+  return withTransaction(async (client) => {
+    const result = await client.query<RecoveryEffectRow>(
+      `SELECT
+         effect.global_id AS external_effect_global_id,
+         image_grant.product_reference_code,
+         image_grant.channel_state_global_id,
+         image_grant.asset_revision,
+         image_grant.asset_alt_text,
+         effect.error_code,
+         COALESCE(effect.completed_at, effect.claimed_at, effect.created_at)
+           AS occurred_at
+       FROM operations_faire_product_image_delivery_grants image_grant
+       JOIN operations_commerce_external_effect_intents effect
+         ON effect.organization_id = image_grant.organization_id
+        AND effect.integration_account_id = image_grant.integration_account_id
+        AND effect.idempotency_key = image_grant.idempotency_key
+       WHERE image_grant.organization_id = $1::uuid
+         AND image_grant.product_id = $2::uuid
+         AND image_grant.desired_mode = 'active'
+         AND effect.provider = 'faire'
+         AND effect.action = '${ACTION}'
+         AND effect.desired_mode = 'active'
+         AND (
+           effect.state = 'unknown'
+           OR (
+             effect.state = 'claimed'
+             AND effect.lease_expires_at <= clock_timestamp()
+           )
+         )
+       ORDER BY
+         COALESCE(effect.completed_at, effect.claimed_at, effect.created_at) DESC,
+         effect.id DESC`,
+      [input.organizationId, input.productId],
+    )
+    const recoveryEffects: FaireProductImageRecoveryEffect[] = []
+    for (const row of result.rows) {
+      const context =
+        await readFaireProductImageReconciliationContextWithClient(client, {
+          organizationId: input.organizationId,
+          productId: input.productId,
+          externalEffectGlobalId: row.external_effect_global_id,
+        })
+      const isExpiredClaim = context.effectState === 'claimed'
+        && context.leaseExpired
+      if (context.effectState !== 'unknown' && !isExpiredClaim) continue
+      if (
+        !EFFECT_GLOBAL_ID.test(row.external_effect_global_id)
+        || !PRODUCT_REFERENCE.test(row.product_reference_code)
+        || !CHANNEL_GLOBAL_ID.test(row.channel_state_global_id)
+        || typeof row.asset_alt_text !== 'string'
+        || row.asset_alt_text.length < 1
+        || row.asset_alt_text.length > 500
+        || /[\u0000-\u001f\u007f]/.test(row.asset_alt_text)
+        || (
+          context.latestOutcome !== null
+          && !PROVIDER_STEP_OUTCOMES.has(context.latestOutcome)
+        )
+        || (
+          row.error_code !== null
+          && !/^[A-Z][A-Z0-9_]{1,127}$/.test(row.error_code)
+        )
+      ) {
+        fail(
+          'FAIRE_PRODUCT_IMAGE_EVIDENCE_INVALID',
+          'Durable Faire Product-image recovery evidence is invalid',
+          500,
+        )
+      }
+      recoveryEffects.push({
+        externalEffectGlobalId: row.external_effect_global_id,
+        recoveryState: isExpiredClaim ? 'expired_claim' : 'unknown',
+        providerWriteCount: context.providerWriteCount,
+        uploadedLocatorAvailable: context.uploadedLocatorSha256 !== null,
+        reconciliationEligibility: context.reconciliationEligibility,
+        reconciliationReason: context.reconciliationReason,
+        productReferenceCode: row.product_reference_code,
+        channelStateGlobalId: row.channel_state_global_id,
+        assetRevision: integer(
+          row.asset_revision,
+          'Faire Product-image recovery asset revision',
+          1,
+        ),
+        assetAltText: row.asset_alt_text,
+        latestOutcome: context.latestOutcome,
+        latestObservedAt: context.latestObservedAt,
+        errorCode: row.error_code,
+        occurredAt: iso(row.occurred_at),
+      })
+    }
+    return recoveryEffects
+  })
+}
+
 async function readFaireProductImageReconciliationContextWithClient(
   client: PoolClient,
   input: {
@@ -1226,6 +1392,8 @@ async function readFaireProductImageReconciliationContextWithClient(
        image_grant.credential_generation,
        image_grant.external_product_id,
        image_grant.asset_content_sha256,
+       attempt.id::text AS provider_attempt_id,
+       attempt.global_id AS provider_attempt_global_id,
        effect.id::text AS external_effect_id,
        effect.global_id AS external_effect_global_id,
        effect.state AS effect_state,
@@ -1234,38 +1402,34 @@ async function readFaireProductImageReconciliationContextWithClient(
          effect.state = 'claimed'
          AND effect.lease_expires_at <= clock_timestamp()
        ) AS lease_expired,
-       GREATEST(
-         effect.provider_write_count,
-         COALESCE(progress.provider_write_count, 0)
-       ) AS provider_write_count,
-       COALESCE(
-         upload.uploaded_locator_sha256,
-         CASE
-           WHEN effect.redacted_result->>'provider' = 'faire'
-            AND effect.redacted_result->>'operation' = 'productImagePublish'
-            AND effect.redacted_result->>'deliveryGrantId' = image_grant.id::text
-            AND effect.redacted_result->>'assetContentSha256' =
-                  image_grant.asset_content_sha256
-            AND effect.redacted_result->>'uploadedLocatorSha256'
-                  ~ '^[a-f0-9]{64}$'
-           THEN effect.redacted_result->>'uploadedLocatorSha256'
-           ELSE NULL
-         END
-       ) AS uploaded_locator_sha256,
        CASE
-         WHEN jsonb_typeof(effect.redacted_result->'priorImageCount') = 'number'
-          AND (effect.redacted_result->>'priorImageCount')::numeric
-                BETWEEN 0 AND ${MAX_PROVIDER_IMAGES}
-         THEN (effect.redacted_result->>'priorImageCount')::integer
+         WHEN effect.state = 'succeeded' THEN effect.provider_write_count
+         WHEN attach.id IS NOT NULL THEN attach.provider_write_count
+         WHEN effect_evidence.evidence_kind = 'normal_unknown' THEN 1
+         WHEN upload.id IS NOT NULL THEN 1
+         ELSE effect.provider_write_count
+       END AS provider_write_count,
+       upload.uploaded_locator_sha256,
+       CASE
+         WHEN attach.id IS NOT NULL THEN attach.prior_image_count
+         WHEN effect_evidence.evidence_kind = 'normal_unknown'
+           THEN effect_evidence.prior_image_count
          ELSE NULL
        END AS prior_image_count,
        CASE
-         WHEN jsonb_typeof(effect.redacted_result->'projectedImageCount') = 'number'
-          AND (effect.redacted_result->>'projectedImageCount')::numeric
-                BETWEEN 0 AND ${MAX_PROVIDER_IMAGES}
-         THEN (effect.redacted_result->>'projectedImageCount')::integer
+         WHEN attach.id IS NOT NULL THEN attach.projected_image_count
+         WHEN effect_evidence.evidence_kind = 'normal_unknown'
+           THEN effect_evidence.projected_image_count
          ELSE NULL
        END AS projected_image_count,
+       CASE
+         WHEN attach.id IS NOT NULL THEN 'attach_step'
+         WHEN effect_evidence.evidence_kind = 'normal_unknown'
+           THEN 'effect_result'
+         ELSE NULL
+       END AS evidence_source,
+       attach.id AS durable_attach_step_id,
+       attach.outcome AS durable_attach_outcome,
        latest.outcome AS latest_outcome,
        latest.observed_at AS latest_observed_at,
        (
@@ -1302,35 +1466,274 @@ async function readFaireProductImageReconciliationContextWithClient(
          reconciled_provider_image_set_sha256
      FROM operations_commerce_external_effect_intents effect
      JOIN operations_faire_product_image_delivery_grants image_grant
-       ON image_grant.organization_id = effect.organization_id
+      ON image_grant.organization_id = effect.organization_id
       AND image_grant.integration_account_id = effect.integration_account_id
       AND image_grant.idempotency_key = effect.idempotency_key
+     JOIN operations_commerce_provider_attempts attempt
+       ON attempt.organization_id = effect.organization_id
+      AND attempt.integration_account_id = effect.integration_account_id
+      AND attempt.id = effect.provider_attempt_id
      LEFT JOIN LATERAL (
-       SELECT max(step.provider_write_count)::integer AS provider_write_count
+       SELECT step.id, step.uploaded_locator_sha256
        FROM operations_faire_product_image_provider_steps step
        WHERE step.organization_id = effect.organization_id
+         AND step.integration_account_id = effect.integration_account_id
          AND step.external_effect_id = effect.id
-     ) progress ON true
-     LEFT JOIN LATERAL (
-       SELECT step.uploaded_locator_sha256
-       FROM operations_faire_product_image_provider_steps step
-       WHERE step.organization_id = effect.organization_id
-         AND step.external_effect_id = effect.id
+         AND step.delivery_grant_id = image_grant.id
+         AND step.provider_attempt_id = effect.provider_attempt_id
          AND step.stage = 'upload'
          AND step.outcome = 'succeeded'
+         AND step.provider_write_count = 1
          AND step.uploaded_locator_sha256 IS NOT NULL
+         AND step.uploaded_locator_sha256 ~ '^[a-f0-9]{64}$'
+         AND step.redacted_evidence->>'provider' = 'faire'
+         AND step.redacted_evidence->>'operation' = 'productImageUpload'
+         AND step.redacted_evidence->>'outcome' = 'succeeded'
          AND step.redacted_evidence->>'assetContentSha256' =
                image_grant.asset_content_sha256
          AND step.redacted_evidence->>'uploadedLocatorSha256' =
                step.uploaded_locator_sha256
+         AND step.redacted_evidence->>'providerWrites' = '1'
+         AND step.evidence_hash =
+               operations_faire_provider_write_request_hash(
+                 step.redacted_evidence
+               )
        ORDER BY step.observed_at DESC, step.id DESC
        LIMIT 1
      ) upload ON true
+     LEFT JOIN LATERAL (
+       SELECT
+         candidate.id,
+         candidate.outcome,
+         candidate.provider_write_count,
+         candidate.prior_image_count,
+         candidate.projected_image_count
+       FROM (
+         SELECT
+           step.id::text AS id,
+           step.outcome,
+           step.provider_write_count,
+           step.observed_at,
+           CASE
+             WHEN jsonb_typeof(
+                    step.redacted_evidence->'priorImageCount'
+                  ) = 'number'
+              AND step.redacted_evidence->>'priorImageCount' ~ '^[0-9]{1,3}$'
+             THEN (step.redacted_evidence->>'priorImageCount')::integer
+             ELSE NULL
+           END AS prior_image_count,
+           CASE
+             WHEN jsonb_typeof(
+                    step.redacted_evidence->'projectedImageCount'
+                  ) = 'number'
+              AND step.redacted_evidence->>'projectedImageCount' ~
+                    '^[0-9]{1,3}$'
+             THEN (step.redacted_evidence->>'projectedImageCount')::integer
+             ELSE NULL
+           END AS projected_image_count
+         FROM operations_faire_product_image_provider_steps step
+         WHERE step.organization_id = effect.organization_id
+           AND step.integration_account_id = effect.integration_account_id
+           AND step.external_effect_id = effect.id
+           AND step.delivery_grant_id = image_grant.id
+           AND step.provider_attempt_id = effect.provider_attempt_id
+           AND step.stage = 'attach'
+           AND (
+             (step.outcome = 'unknown' AND step.provider_write_count = 1)
+             OR (step.outcome = 'succeeded' AND step.provider_write_count = 2)
+           )
+           AND step.uploaded_locator_sha256 = upload.uploaded_locator_sha256
+           AND step.redacted_evidence->>'provider' = 'faire'
+           AND step.redacted_evidence->>'operation' = 'productImageAttach'
+           AND step.redacted_evidence->>'outcome' = step.outcome
+           AND step.redacted_evidence->>'externalProductId' =
+                 image_grant.external_product_id
+           AND (
+             step.redacted_evidence->>'assetContentSha256' =
+               image_grant.asset_content_sha256
+             OR (
+               step.outcome = 'succeeded'
+               AND NOT (step.redacted_evidence ? 'assetContentSha256')
+             )
+           )
+           AND step.redacted_evidence->>'uploadedLocatorSha256' =
+                 upload.uploaded_locator_sha256
+           AND step.redacted_evidence->>'existingImagesPreserved' = 'true'
+           AND step.redacted_evidence->>'providerWrites' =
+                 step.provider_write_count::text
+           AND step.evidence_hash =
+                 operations_faire_provider_write_request_hash(
+                   step.redacted_evidence
+                 )
+       ) candidate
+       WHERE candidate.prior_image_count BETWEEN 0 AND ${MAX_PROVIDER_IMAGES - 1}
+         AND candidate.projected_image_count BETWEEN 1 AND ${MAX_PROVIDER_IMAGES}
+         AND candidate.projected_image_count = candidate.prior_image_count + 1
+         AND (
+           (
+             effect.state = 'claimed'
+             AND attempt.state = 'prepared'
+           )
+           OR (
+             effect.state = 'unknown'
+             AND attempt.state = 'unknown'
+             AND attempt.redacted_response = effect.redacted_result
+             AND attempt.provider_reference IS NOT DISTINCT FROM
+                   effect.provider_reference
+             AND attempt.error_code IS NOT DISTINCT FROM effect.error_code
+             AND attempt.completed_at IS NOT NULL
+             AND effect.completed_at IS NOT NULL
+             AND attempt.completed_at <= effect.completed_at
+             AND effect.redacted_result->>'provider' = 'faire'
+             AND effect.redacted_result->>'action' = '${ACTION}'
+             AND effect.redacted_result->>'operation' = 'productImagePublish'
+             AND effect.redacted_result->>'outcome' = 'unknown'
+             AND effect.redacted_result->>'deliveryGrantId' =
+                   image_grant.id::text
+             AND effect.redacted_result->>'providerAttemptGlobalId' =
+                   attempt.global_id
+             AND effect.redacted_result->>'externalProductId' =
+                   image_grant.external_product_id
+             AND effect.redacted_result->>'assetContentSha256' =
+                   image_grant.asset_content_sha256
+             AND effect.redacted_result->>'uploadedLocatorSha256' =
+                   upload.uploaded_locator_sha256
+             AND effect.redacted_result->>'priorImageCount' =
+                   candidate.prior_image_count::text
+             AND effect.redacted_result->>'projectedImageCount' =
+                   candidate.projected_image_count::text
+             AND effect.redacted_result->>'existingImagesPreserved' = 'true'
+             AND effect.redacted_result->>'providerWrites' =
+                   candidate.provider_write_count::text
+             AND effect.redacted_result->>'providerWriteCountLowerBound' =
+                   candidate.provider_write_count::text
+             AND effect.provider_write_count = candidate.provider_write_count
+             AND effect.provider_reference = image_grant.external_product_id
+             AND effect.error_code =
+                   effect.redacted_result->>'errorCode'
+             AND effect.terminal_evidence_hash =
+                   operations_faire_provider_write_request_hash(
+                     effect.redacted_result
+                   )
+             AND (
+               (
+                 effect.redacted_result->>'stage' =
+                       'attach_dispatch_or_readback'
+                 AND candidate.provider_write_count = 1
+                 AND candidate.outcome = 'unknown'
+                 AND effect.redacted_result->>'providerWritesKnown' = 'false'
+               )
+               OR (
+                 effect.redacted_result->>'stage' =
+                       'expired_claim_reconciliation'
+                 AND effect.redacted_result->>'externalEffectGlobalId' =
+                       effect.global_id
+                 AND effect.redacted_result->>'durableAttachStepId' =
+                       candidate.id
+                 AND effect.redacted_result->>'durableAttachOutcome' =
+                       candidate.outcome
+                 AND effect.redacted_result->>'readbackEligibility' =
+                       'readback_terminalizable'
+                 AND effect.redacted_result->>'readbackReason' = CASE
+                   WHEN candidate.outcome = 'unknown'
+                     THEN 'exact_attach_unknown_evidence'
+                   ELSE 'exact_attach_succeeded_evidence'
+                 END
+                 AND effect.redacted_result->>'uploadedLocatorAvailable' =
+                       'true'
+                 AND effect.redacted_result->>'providerMutationAttempted' =
+                       'true'
+                 AND effect.redacted_result->>'providerWritesKnown' = CASE
+                   WHEN candidate.outcome = 'succeeded' THEN 'true'
+                   ELSE 'false'
+                 END
+                 AND effect.redacted_result->>'errorCode' =
+                       'FAIRE_PRODUCT_IMAGE_EXPIRED_CLAIM_UNKNOWN'
+                 AND EXISTS (
+                   SELECT 1
+                   FROM app_user_organization_memberships membership
+                   WHERE membership.organization_id = effect.organization_id
+                     AND membership.user_email =
+                           effect.redacted_result->>'reconciledBy'
+                     AND membership.role IN ('owner', 'admin')
+                     AND membership.status = 'active'
+                 )
+               )
+             )
+           )
+         )
+       ORDER BY candidate.observed_at DESC, candidate.id DESC
+       LIMIT 1
+     ) attach ON true
+     LEFT JOIN LATERAL (
+       SELECT
+         'normal_unknown'::text AS evidence_kind,
+         counts.prior_image_count,
+         counts.projected_image_count
+       FROM (
+         SELECT
+           CASE
+             WHEN jsonb_typeof(effect.redacted_result->'priorImageCount') =
+                    'number'
+              AND effect.redacted_result->>'priorImageCount' ~ '^[0-9]{1,3}$'
+             THEN (effect.redacted_result->>'priorImageCount')::integer
+             ELSE NULL
+           END AS prior_image_count,
+           CASE
+             WHEN jsonb_typeof(effect.redacted_result->'projectedImageCount') =
+                    'number'
+              AND effect.redacted_result->>'projectedImageCount' ~
+                    '^[0-9]{1,3}$'
+             THEN (effect.redacted_result->>'projectedImageCount')::integer
+             ELSE NULL
+           END AS projected_image_count
+       ) counts
+       WHERE effect.state = 'unknown'
+         AND effect.provider_write_count = 1
+         AND effect.provider_reference = image_grant.external_product_id
+         AND effect.error_code = effect.redacted_result->>'errorCode'
+         AND effect.completed_at IS NOT NULL
+         AND attempt.state = 'unknown'
+         AND attempt.redacted_response = effect.redacted_result
+         AND attempt.provider_reference IS NOT DISTINCT FROM
+               effect.provider_reference
+         AND attempt.error_code IS NOT DISTINCT FROM effect.error_code
+         AND attempt.completed_at IS NOT NULL
+         AND attempt.completed_at <= effect.completed_at
+         AND effect.redacted_result->>'provider' = 'faire'
+         AND effect.redacted_result->>'action' = '${ACTION}'
+         AND effect.redacted_result->>'operation' = 'productImagePublish'
+         AND effect.redacted_result->>'outcome' = 'unknown'
+         AND effect.redacted_result->>'stage' = 'attach_dispatch_or_readback'
+         AND effect.redacted_result->>'deliveryGrantId' = image_grant.id::text
+         AND effect.redacted_result->>'providerAttemptGlobalId' =
+               attempt.global_id
+         AND effect.redacted_result->>'externalProductId' =
+               image_grant.external_product_id
+         AND effect.redacted_result->>'assetContentSha256' =
+               image_grant.asset_content_sha256
+         AND effect.redacted_result->>'uploadedLocatorSha256' =
+               upload.uploaded_locator_sha256
+         AND effect.redacted_result->>'existingImagesPreserved' = 'true'
+         AND effect.redacted_result->>'providerWrites' =
+               effect.provider_write_count::text
+         AND effect.redacted_result->>'providerWriteCountLowerBound' =
+               '1'
+         AND effect.redacted_result->>'providerWritesKnown' = 'false'
+         AND effect.terminal_evidence_hash =
+               operations_faire_provider_write_request_hash(
+                 effect.redacted_result
+               )
+         AND counts.prior_image_count BETWEEN 0 AND ${MAX_PROVIDER_IMAGES - 1}
+         AND counts.projected_image_count BETWEEN 1 AND ${MAX_PROVIDER_IMAGES}
+         AND counts.projected_image_count = counts.prior_image_count + 1
+     ) effect_evidence ON true
      LEFT JOIN LATERAL (
        SELECT step.outcome, step.observed_at
        FROM operations_faire_product_image_provider_steps step
        WHERE step.organization_id = effect.organization_id
          AND step.external_effect_id = effect.id
+         AND step.delivery_grant_id = image_grant.id
        ORDER BY step.observed_at DESC, step.id DESC
        LIMIT 1
      ) latest ON true
@@ -1394,6 +1797,91 @@ async function readFaireProductImageReconciliationContextWithClient(
       404,
     )
   }
+  const providerWriteCount = integer(
+    row.provider_write_count,
+    'Faire reconciliation provider write count',
+  )
+  const priorImageCount = row.prior_image_count === null
+    ? null
+    : integer(row.prior_image_count, 'Faire prior image count')
+  const projectedImageCount = row.projected_image_count === null
+    ? null
+    : integer(row.projected_image_count, 'Faire projected image count')
+  const uploadedLocatorSha256 = typeof row.uploaded_locator_sha256 === 'string'
+    && HASH.test(row.uploaded_locator_sha256)
+    ? row.uploaded_locator_sha256
+    : null
+  const evidenceSource = ['attach_step', 'effect_result'].includes(
+    String(row.evidence_source || ''),
+  )
+    ? row.evidence_source
+    : null
+  const durableAttachOutcome = ['unknown', 'succeeded'].includes(
+    String(row.durable_attach_outcome || ''),
+  )
+    ? row.durable_attach_outcome
+    : null
+  const exactCountEvidence = (
+    priorImageCount !== null
+    && projectedImageCount !== null
+    && projectedImageCount === priorImageCount + 1
+    && projectedImageCount <= MAX_PROVIDER_IMAGES
+  )
+  let reconciliationReason:
+    FaireProductImageReconciliationContext['reconciliationReason']
+  if (!uploadedLocatorSha256) {
+    reconciliationReason = 'upload_locator_unavailable'
+  } else if (![1, 2].includes(providerWriteCount)) {
+    reconciliationReason = 'provider_write_count_unsupported'
+  } else if (
+    !exactCountEvidence
+    || !evidenceSource
+    || (
+      evidenceSource === 'attach_step'
+      && (
+        !row.durable_attach_step_id
+        || !UUID.test(row.durable_attach_step_id)
+        || (
+          providerWriteCount === 1
+          && durableAttachOutcome !== 'unknown'
+        )
+        || (
+          providerWriteCount === 2
+          && durableAttachOutcome !== 'succeeded'
+        )
+      )
+    )
+    || (
+      evidenceSource === 'effect_result'
+      && providerWriteCount !== 1
+    )
+  ) {
+    reconciliationReason = 'exact_attachment_evidence_unavailable'
+  } else if (evidenceSource === 'effect_result') {
+    reconciliationReason = 'exact_unknown_effect_evidence'
+  } else if (durableAttachOutcome === 'succeeded') {
+    reconciliationReason = 'exact_attach_succeeded_evidence'
+  } else {
+    reconciliationReason = 'exact_attach_unknown_evidence'
+  }
+  const reconciliationEligibility = [
+    'exact_unknown_effect_evidence',
+    'exact_attach_succeeded_evidence',
+    'exact_attach_unknown_evidence',
+  ].includes(reconciliationReason)
+    ? 'readback_terminalizable' as const
+    : 'manual_review' as const
+  if (
+    providerWriteCount > 2
+    || !UUID.test(row.provider_attempt_id)
+    || !PROVIDER_ATTEMPT_GLOBAL_ID.test(row.provider_attempt_global_id)
+  ) {
+    fail(
+      'FAIRE_PRODUCT_IMAGE_EVIDENCE_INVALID',
+      'Durable Faire Product-image reconciliation evidence is invalid',
+      500,
+    )
+  }
   return {
     deliveryGrantId: row.delivery_grant_id,
     productId: row.product_id,
@@ -1401,19 +1889,22 @@ async function readFaireProductImageReconciliationContextWithClient(
     credentialGeneration: row.credential_generation,
     externalProductId: row.external_product_id,
     assetContentSha256: row.asset_content_sha256,
+    providerAttemptId: row.provider_attempt_id,
+    providerAttemptGlobalId: row.provider_attempt_global_id,
     externalEffectId: row.external_effect_id,
     externalEffectGlobalId: row.external_effect_global_id,
     effectState: row.effect_state,
     terminalEvidenceHash: row.terminal_evidence_hash,
     leaseExpired: row.lease_expired === true,
-    providerWriteCount: row.provider_write_count,
-    uploadedLocatorSha256: row.uploaded_locator_sha256,
-    priorImageCount: row.prior_image_count === null
-      ? null
-      : integer(row.prior_image_count, 'Faire prior image count'),
-    projectedImageCount: row.projected_image_count === null
-      ? null
-      : integer(row.projected_image_count, 'Faire projected image count'),
+    providerWriteCount,
+    uploadedLocatorSha256,
+    priorImageCount,
+    projectedImageCount,
+    durableEvidenceSource: evidenceSource,
+    durableAttachStepId: row.durable_attach_step_id,
+    durableAttachOutcome,
+    reconciliationEligibility,
+    reconciliationReason,
     latestOutcome: row.latest_outcome,
     latestObservedAt: row.latest_observed_at
       ? iso(row.latest_observed_at)
@@ -1540,7 +2031,8 @@ export async function resolveFaireProductImageAppliedReconciliationInPostgres(
     if (
       current.effectState !== 'unknown'
       || !current.terminalEvidenceHash
-      || current.providerWriteCount !== 1
+      || ![1, 2].includes(current.providerWriteCount)
+      || current.reconciliationEligibility !== 'readback_terminalizable'
       || current.priorImageCount === null
       || current.projectedImageCount !== input.providerImageCount
       || current.projectedImageCount !== current.priorImageCount + 1
@@ -1599,7 +2091,7 @@ export async function resolveFaireProductImageAppliedReconciliationInPostgres(
          AND effect.desired_mode = 'active'
          AND effect.state = 'unknown'
          AND effect.terminal_evidence_hash = $10
-         AND effect.provider_write_count = 1
+         AND effect.provider_write_count = $13
          AND image_grant.asset_content_sha256 = $11
          AND image_grant.external_product_id = $12
          AND EXISTS (
@@ -1630,6 +2122,7 @@ export async function resolveFaireProductImageAppliedReconciliationInPostgres(
         current.terminalEvidenceHash,
         current.assetContentSha256,
         current.externalProductId,
+        current.providerWriteCount,
       ],
     )
     if (!step.rows[0]) {
@@ -1657,7 +2150,11 @@ export async function resolveFaireProductImageAppliedReconciliationInPostgres(
       providerWrites: 2,
       reconciliationStepId: step.rows[0].id,
       reconciledFromState: 'unknown',
+      reconciledFromProviderWriteCount: current.providerWriteCount,
       reconciledFromTerminalEvidenceHash: current.terminalEvidenceHash,
+      durableEvidenceSource: current.durableEvidenceSource,
+      durableAttachStepId: current.durableAttachStepId,
+      durableAttachOutcome: current.durableAttachOutcome,
       providerImageSetSha256: input.providerImageSetSha256,
       providerImageCount: input.providerImageCount,
       exactLocatorMatchCount: 1,
@@ -1761,16 +2258,31 @@ export async function recoverExpiredFaireProductImageClaimInPostgres(input: {
     if (current.effectState !== 'claimed' || !current.leaseExpired) {
       return current
     }
+    const readbackTerminalizable =
+      current.reconciliationEligibility === 'readback_terminalizable'
     const evidence = {
       provider: 'faire',
+      action: ACTION,
       operation: 'productImagePublish',
       outcome: 'unknown',
       stage: 'expired_claim_reconciliation',
       errorCode: 'FAIRE_PRODUCT_IMAGE_EXPIRED_CLAIM_UNKNOWN',
+      deliveryGrantId: current.deliveryGrantId,
+      externalEffectGlobalId: current.externalEffectGlobalId,
+      providerAttemptGlobalId: current.providerAttemptGlobalId,
       externalProductId: current.externalProductId,
+      assetContentSha256: current.assetContentSha256,
+      uploadedLocatorSha256: current.uploadedLocatorSha256,
       uploadedLocatorAvailable: current.uploadedLocatorSha256 !== null,
+      existingImagesPreserved: readbackTerminalizable,
+      priorImageCount: current.priorImageCount,
+      projectedImageCount: current.projectedImageCount,
+      durableAttachStepId: current.durableAttachStepId,
+      durableAttachOutcome: current.durableAttachOutcome,
+      readbackEligibility: current.reconciliationEligibility,
+      readbackReason: current.reconciliationReason,
       providerMutationAttempted: true,
-      providerWritesKnown: false,
+      providerWritesKnown: current.durableAttachOutcome === 'succeeded',
       providerWriteCountLowerBound: current.providerWriteCount,
       providerWrites: current.providerWriteCount,
       reconciledBy: input.actorEmail,
@@ -1784,7 +2296,7 @@ export async function recoverExpiredFaireProductImageClaimInPostgres(input: {
       `UPDATE operations_commerce_provider_attempts attempt
        SET state = 'unknown',
            redacted_response = $4::jsonb,
-           provider_reference = NULL,
+           provider_reference = $5,
            error_code = 'FAIRE_PRODUCT_IMAGE_EXPIRED_CLAIM_UNKNOWN',
            lease_token = NULL,
            lease_expires_at = NULL,
@@ -1806,6 +2318,7 @@ export async function recoverExpiredFaireProductImageClaimInPostgres(input: {
         current.externalEffectId,
         input.externalEffectGlobalId,
         JSON.stringify(evidence),
+        current.externalProductId,
       ],
     )
     if (!attempt.rows[0]) {
@@ -1821,7 +2334,7 @@ export async function recoverExpiredFaireProductImageClaimInPostgres(input: {
            lease_expires_at = NULL,
            redacted_result = $4::jsonb,
            terminal_evidence_hash = $5,
-           provider_reference = NULL,
+           provider_reference = $7,
            error_code = 'FAIRE_PRODUCT_IMAGE_EXPIRED_CLAIM_UNKNOWN',
            provider_write_count = $6,
            completed_at = clock_timestamp(),
@@ -1838,6 +2351,7 @@ export async function recoverExpiredFaireProductImageClaimInPostgres(input: {
         JSON.stringify(evidence),
         evidenceHash,
         current.providerWriteCount,
+        current.externalProductId,
       ],
     )
     if (!effect.rows[0]) {

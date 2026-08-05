@@ -12,6 +12,13 @@ const crmSection = readFileSync(
   resolve(root, 'app_src/components/crm/CrmSection.tsx'),
   'utf8',
 )
+const faireProductImageRoute = readFileSync(
+  resolve(
+    root,
+    'app_src/app/api/crm/products/[productId]/faire-product-image/route.ts',
+  ),
+  'utf8',
+)
 
 test('Product image panel uses the manager-scoped immutable asset API', () => {
   assert.match(
@@ -134,4 +141,54 @@ test('Faire publishing requires exact Shadow simulation and a one-use two-write 
   assert.match(panel, /The Faire effect identity was retained/)
   assert.match(panel, /if \(!executeProviderWrite\) setFaireProjection\(null\)/)
   assert.doesNotMatch(panel, /faire.*idempotencyKey/is)
+})
+
+test('Faire recovery survives reload and exposes only exact-effect readback', () => {
+  assert.match(panel, /type FaireProductImageRecoveryEffect/)
+  assert.match(panel, /const loadFaireRecoveryEffects = useCallback/)
+  assert.match(panel, /const loadGeneration = \+\+faireRecoveryLoadGeneration\.current/)
+  assert.match(panel, /faireRecoveryLoadGeneration\.current !== loadGeneration/)
+  assert.match(panel, /fetch\(faireProductImagePath\(productId\), \{/)
+  assert.match(panel, /payload\.providerReads !== 0/)
+  assert.match(panel, /payload\.providerWrites !== 0/)
+  assert.match(panel, /void loadFaireRecoveryEffects\(\)/)
+  assert.match(panel, /data-testid="crm-faire-image-recovery"/)
+  assert.match(panel, /These records survive page reloads and new\s+operator sessions/)
+  assert.match(panel, /Reconcile by read-only Faire readback/)
+  assert.match(panel, /Record safe manual-review state/)
+  assert.match(panel, /reconciliationEligibility/)
+  assert.match(panel, /exact_attach_succeeded_evidence/)
+  assert.match(panel, /Eligible for exact read-only Faire readback/)
+  assert.match(panel, /Manual review only/)
+  assert.match(panel, /reconcileFaireImage\(\s*effect\.externalEffectGlobalId/)
+  assert.match(panel, /fenced to this Product and exact effect/)
+  assert.match(panel, /performs zero provider writes/)
+  assert.match(panel, /without contacting Faire or terminalizing the effect/)
+  const recoveryMarkup = panel.slice(
+    panel.indexOf('data-testid="crm-faire-image-recovery"'),
+    panel.indexOf('{faireChannels.length === 0'),
+  )
+  assert.doesNotMatch(recoveryMarkup, /executeProviderWrite/)
+  assert.doesNotMatch(recoveryMarkup, /publish-product-image/)
+  assert.doesNotMatch(recoveryMarkup, /Checkbox/)
+})
+
+test('Faire recovery discovery is tenant/product scoped and performs no provider I/O', () => {
+  assert.match(faireProductImageRoute, /export async function GET/)
+  assert.match(
+    faireProductImageRoute,
+    /listFaireProductImageRecoveryEffectsInPostgres\(\{\s*organizationId,\s*productId,/,
+  )
+  assert.match(faireProductImageRoute, /providerReads: 0/)
+  assert.match(faireProductImageRoute, /providerWrites: 0/)
+  assert.match(faireProductImageRoute, /\['owner', 'admin'\]\.includes\(role\)/)
+  assert.match(faireProductImageRoute, /actor\.permissions\.manageOperations !== true/)
+  assert.match(faireProductImageRoute, /session\?\.impersonating/)
+  const getHandler = faireProductImageRoute.slice(
+    faireProductImageRoute.indexOf('export async function GET'),
+    faireProductImageRoute.indexOf('export async function POST'),
+  )
+  assert.doesNotMatch(getHandler, /executeFaireProductImagePublish/)
+  assert.doesNotMatch(getHandler, /reconcileFaireProductImagePublish/)
+  assert.doesNotMatch(getHandler, /assertSameOrigin/)
 })

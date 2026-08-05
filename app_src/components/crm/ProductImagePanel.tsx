@@ -192,6 +192,38 @@ type FaireProductImageProjectionPayload = {
   code?: string
 }
 
+type FaireProductImageRecoveryEffect = {
+  externalEffectGlobalId: string
+  recoveryState: 'unknown' | 'expired_claim'
+  providerWriteCount: number
+  uploadedLocatorAvailable: boolean
+  reconciliationEligibility: 'readback_terminalizable' | 'manual_review'
+  reconciliationReason:
+    | 'exact_attach_unknown_evidence'
+    | 'exact_attach_succeeded_evidence'
+    | 'exact_unknown_effect_evidence'
+    | 'upload_locator_unavailable'
+    | 'provider_write_count_unsupported'
+    | 'exact_attachment_evidence_unavailable'
+  productReferenceCode: string
+  channelStateGlobalId: string
+  assetRevision: number
+  assetAltText: string
+  latestOutcome: string | null
+  latestObservedAt: string | null
+  errorCode: string | null
+  occurredAt: string
+}
+
+type FaireProductImageRecoveryPayload = {
+  ok?: boolean
+  recoveryEffects?: FaireProductImageRecoveryEffect[]
+  providerReads?: number
+  providerWrites?: number
+  error?: string
+  code?: string
+}
+
 const PRODUCT_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const SUPPORTED_MIME_TYPES = [
@@ -201,9 +233,34 @@ const SUPPORTED_MIME_TYPES = [
 ] as const
 const MAX_IMAGE_BYTES = 2 * 1024 * 1024
 const MAX_ALT_TEXT_LENGTH = 500
+const EFFECT_GLOBAL_ID = /^gcef(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRODUCT_REFERENCE = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/
+const CHANNEL_GLOBAL_ID = /^gpcs(?:[0-9]{7}|[0-9a-v]{12})$/
+const RECOVERY_OUTCOMES = new Set([
+  'succeeded',
+  'failed',
+  'unknown',
+  'observed_applied',
+  'observed_absent',
+  'manual_review',
+])
+const RECOVERY_REASONS = new Set<FaireProductImageRecoveryEffect[
+  'reconciliationReason'
+]>([
+  'exact_attach_unknown_evidence',
+  'exact_attach_succeeded_evidence',
+  'exact_unknown_effect_evidence',
+  'upload_locator_unavailable',
+  'provider_write_count_unsupported',
+  'exact_attachment_evidence_unavailable',
+])
 
 function apiPath(productId: string) {
   return `/api/crm/products/${encodeURIComponent(productId)}/images`
+}
+
+function faireProductImagePath(productId: string) {
+  return `/api/crm/products/${encodeURIComponent(productId)}/faire-product-image`
 }
 
 function assetState(payload: ProductImagePayload): ProductImageState | null {
@@ -219,10 +276,93 @@ function assetState(payload: ProductImagePayload): ProductImageState | null {
   }
 }
 
+function recoveryEffects(
+  payload: FaireProductImageRecoveryPayload,
+): FaireProductImageRecoveryEffect[] | null {
+  if (
+    payload.ok !== true
+    || payload.providerReads !== 0
+    || payload.providerWrites !== 0
+    || !Array.isArray(payload.recoveryEffects)
+  ) return null
+  for (const effect of payload.recoveryEffects) {
+    if (
+      !effect
+      || !EFFECT_GLOBAL_ID.test(effect.externalEffectGlobalId)
+      || !['unknown', 'expired_claim'].includes(effect.recoveryState)
+      || !Number.isInteger(effect.providerWriteCount)
+      || effect.providerWriteCount < 0
+      || effect.providerWriteCount > 2
+      || typeof effect.uploadedLocatorAvailable !== 'boolean'
+      || !['readback_terminalizable', 'manual_review'].includes(
+        effect.reconciliationEligibility,
+      )
+      || !RECOVERY_REASONS.has(effect.reconciliationReason)
+      || (
+        effect.reconciliationEligibility === 'readback_terminalizable'
+        && ![
+          'exact_attach_unknown_evidence',
+          'exact_attach_succeeded_evidence',
+          'exact_unknown_effect_evidence',
+        ].includes(effect.reconciliationReason)
+      )
+      || (
+        effect.reconciliationEligibility === 'manual_review'
+        && [
+          'exact_attach_unknown_evidence',
+          'exact_attach_succeeded_evidence',
+          'exact_unknown_effect_evidence',
+        ].includes(effect.reconciliationReason)
+      )
+      || !PRODUCT_REFERENCE.test(effect.productReferenceCode)
+      || !CHANNEL_GLOBAL_ID.test(effect.channelStateGlobalId)
+      || !Number.isInteger(effect.assetRevision)
+      || effect.assetRevision < 1
+      || typeof effect.assetAltText !== 'string'
+      || effect.assetAltText.length < 1
+      || effect.assetAltText.length > MAX_ALT_TEXT_LENGTH
+      || /[\u0000-\u001f\u007f]/.test(effect.assetAltText)
+      || (
+        effect.latestOutcome !== null
+        && !RECOVERY_OUTCOMES.has(effect.latestOutcome)
+      )
+      || (
+        effect.errorCode !== null
+        && !/^[A-Z][A-Z0-9_]{1,127}$/.test(effect.errorCode)
+      )
+      || Number.isNaN(Date.parse(effect.occurredAt))
+      || (
+        effect.latestObservedAt !== null
+        && Number.isNaN(Date.parse(effect.latestObservedAt))
+      )
+    ) return null
+  }
+  return payload.recoveryEffects
+}
+
 function displayMimeType(mimeType: ProductImageAsset['mimeType']) {
   if (mimeType === 'image/jpeg') return 'JPEG'
   if (mimeType === 'image/webp') return 'WebP'
   return 'PNG'
+}
+
+function faireRecoveryReason(
+  reason: FaireProductImageRecoveryEffect['reconciliationReason'],
+) {
+  switch (reason) {
+    case 'exact_attach_unknown_evidence':
+      return 'exact uncertain attachment evidence is preserved'
+    case 'exact_attach_succeeded_evidence':
+      return 'exact completed attachment evidence is preserved'
+    case 'exact_unknown_effect_evidence':
+      return 'exact uncertain effect evidence is preserved'
+    case 'upload_locator_unavailable':
+      return 'the durable upload fingerprint is unavailable'
+    case 'provider_write_count_unsupported':
+      return 'the durable provider-write count is unsupported'
+    default:
+      return 'exact attachment identity and image-count evidence is incomplete'
+  }
 }
 
 function displayBytes(byteLength: number) {
@@ -255,6 +395,7 @@ export default function ProductImagePanel({
   faireChannels: ProductSalesChannelState[]
 }) {
   const fileInput = useRef<HTMLInputElement | null>(null)
+  const faireRecoveryLoadGeneration = useRef(0)
   const [state, setState] = useState<ProductImageState | null>(null)
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [altText, setAltText] = useState('')
@@ -277,13 +418,60 @@ export default function ProductImagePanel({
     useState<NonNullable<
       FaireProductImageProjectionPayload['reconciliation']
     > | null>(null)
+  const [faireRecoveryEffects, setFaireRecoveryEffects] =
+    useState<FaireProductImageRecoveryEffect[]>([])
   const [loading, setLoading] = useState(canManage)
+  const [loadingFaireRecoveries, setLoadingFaireRecoveries] =
+    useState(canManage)
   const [saving, setSaving] = useState(false)
   const [projecting, setProjecting] = useState(false)
   const [refreshingFaire, setRefreshingFaire] = useState(false)
   const [publishingFaire, setPublishingFaire] = useState(false)
+  const [reconcilingFaireEffect, setReconcilingFaireEffect] = useState('')
   const [error, setError] = useState('')
+  const [faireRecoveryError, setFaireRecoveryError] = useState('')
   const [notice, setNotice] = useState('')
+
+  const loadFaireRecoveryEffects = useCallback(async () => {
+    const loadGeneration = ++faireRecoveryLoadGeneration.current
+    if (!canManage || !PRODUCT_ID_PATTERN.test(productId)) {
+      setFaireRecoveryEffects([])
+      setFaireRecoveryError('')
+      setLoadingFaireRecoveries(false)
+      return
+    }
+    setLoadingFaireRecoveries(true)
+    setFaireRecoveryError('')
+    try {
+      const response = await fetch(faireProductImagePath(productId), {
+        cache: 'no-store',
+        credentials: 'same-origin',
+        headers: { Accept: 'application/json' },
+      })
+      const payload = (
+        await response.json().catch(() => ({}))
+      ) as FaireProductImageRecoveryPayload
+      const nextEffects = recoveryEffects(payload)
+      if (!response.ok || nextEffects === null) {
+        throw new Error(
+          payload.error || 'Faire image recovery records did not load',
+        )
+      }
+      if (faireRecoveryLoadGeneration.current !== loadGeneration) return
+      setFaireRecoveryEffects(nextEffects)
+    } catch (loadError) {
+      if (faireRecoveryLoadGeneration.current !== loadGeneration) return
+      setFaireRecoveryError(
+        loadError instanceof Error
+          ? loadError.message
+          : 'Faire image recovery records did not load',
+      )
+    } finally {
+      if (faireRecoveryLoadGeneration.current === loadGeneration) {
+        setLoadingFaireRecoveries(false)
+      }
+    }
+  }, [canManage, productId])
 
   const load = useCallback(async () => {
     if (!canManage || !PRODUCT_ID_PATTERN.test(productId)) {
@@ -339,11 +527,15 @@ export default function ProductImagePanel({
     setReconciliation(null)
     setFaireProjection(null)
     setFaireReconciliation(null)
+    setFaireRecoveryEffects([])
+    setFaireRecoveryError('')
+    setReconcilingFaireEffect('')
     setNotice('')
     setError('')
     if (fileInput.current) fileInput.current.value = ''
     void load()
-  }, [load])
+    void loadFaireRecoveryEffects()
+  }, [load, loadFaireRecoveryEffects])
 
   useEffect(() => {
     if (
@@ -812,7 +1004,7 @@ export default function ProductImagePanel({
     setFaireReconciliation(null)
     try {
       const response = await fetch(
-        `/api/crm/products/${encodeURIComponent(productId)}/faire-product-image`,
+        faireProductImagePath(productId),
         {
           method: 'POST',
           credentials: 'same-origin',
@@ -897,18 +1089,24 @@ export default function ProductImagePanel({
           : 'Faire Product-image command did not complete',
       )
     } finally {
+      if (executeProviderWrite) void loadFaireRecoveryEffects()
       setPublishingFaire(false)
     }
   }
 
-  const reconcileFaireImage = async () => {
-    if (!faireProjection || faireProjection.mode !== 'active') return
+  const reconcileFaireImage = async (selectedEffectGlobalId?: string) => {
+    const externalEffectGlobalId = selectedEffectGlobalId
+      || (faireProjection?.mode === 'active'
+        ? faireProjection.externalEffect.globalId
+        : '')
+    if (!EFFECT_GLOBAL_ID.test(externalEffectGlobalId)) return
     setPublishingFaire(true)
+    setReconcilingFaireEffect(externalEffectGlobalId)
     setError('')
     setNotice('')
     try {
       const response = await fetch(
-        `/api/crm/products/${encodeURIComponent(productId)}/faire-product-image`,
+        faireProductImagePath(productId),
         {
           method: 'POST',
           credentials: 'same-origin',
@@ -918,8 +1116,7 @@ export default function ProductImagePanel({
           },
           body: JSON.stringify({
             action: 'reconcile-product-image',
-            externalEffectGlobalId:
-              faireProjection.externalEffect.globalId,
+            externalEffectGlobalId,
           }),
         },
       )
@@ -934,6 +1131,7 @@ export default function ProductImagePanel({
       setFaireReconciliation(payload.reconciliation)
       if (payload.reconciliation.terminalized) {
         setFaireProjection((current) => current
+          && current.externalEffect.globalId === externalEffectGlobalId
           ? {
             ...current,
             providerMutation: {
@@ -967,6 +1165,8 @@ export default function ProductImagePanel({
           : 'Faire Product-image readback did not complete',
       )
     } finally {
+      await loadFaireRecoveryEffects()
+      setReconcilingFaireEffect('')
       setPublishingFaire(false)
     }
   }
@@ -993,11 +1193,14 @@ export default function ProductImagePanel({
         {canManage ? (
           <Button
             size="small"
-            startIcon={loading
+            startIcon={loading || loadingFaireRecoveries
               ? <CircularProgress size={14} />
               : <RefreshRounded />}
-            onClick={() => void load()}
-            disabled={loading || saving}
+            onClick={() => {
+              void load()
+              void loadFaireRecoveryEffects()
+            }}
+            disabled={loading || loadingFaireRecoveries || saving}
             sx={{ alignSelf: { xs: 'flex-start', sm: 'center' } }}
           >
             Refresh
@@ -1311,6 +1514,137 @@ export default function ProductImagePanel({
               </Typography>
             </Box>
 
+            {loadingFaireRecoveries ? (
+              <Alert severity="info" icon={<CircularProgress size={18} />}>
+                Checking this Product for durable Faire image recovery records…
+              </Alert>
+            ) : null}
+            {faireRecoveryError ? (
+              <Alert
+                severity="warning"
+                action={(
+                  <Button
+                    color="inherit"
+                    size="small"
+                    onClick={() => void loadFaireRecoveryEffects()}
+                    disabled={loadingFaireRecoveries}
+                  >
+                    Retry
+                  </Button>
+                )}
+              >
+                Recovery status is unavailable: {faireRecoveryError}
+              </Alert>
+            ) : null}
+            {faireRecoveryEffects.length > 0 ? (
+              <Stack
+                spacing={1.25}
+                data-testid="crm-faire-image-recovery"
+                sx={{
+                  border: 1,
+                  borderColor: 'warning.main',
+                  borderRadius: 1,
+                  p: 1.5,
+                }}
+              >
+                <Alert severity="warning">
+                  Unresolved Faire image publication evidence was recovered for
+                  this Product. These records survive page reloads and new
+                  operator sessions. Recovery cannot repeat the image upload or
+                  Product attachment.
+                </Alert>
+                {faireRecoveryEffects.map((effect) => (
+                  <Stack
+                    key={effect.externalEffectGlobalId}
+                    spacing={0.75}
+                    sx={{
+                      border: 1,
+                      borderColor: 'divider',
+                      borderRadius: 1,
+                      p: 1.25,
+                    }}
+                  >
+                    <Stack
+                      direction={{ xs: 'column', sm: 'row' }}
+                      gap={0.75}
+                      alignItems={{ xs: 'flex-start', sm: 'center' }}
+                    >
+                      <Chip
+                        size="small"
+                        color="warning"
+                        label={effect.recoveryState === 'expired_claim'
+                          ? 'Expired claim · recovery required'
+                          : 'Unknown · recovery required'}
+                      />
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        sx={{ overflowWrap: 'anywhere' }}
+                      >
+                        Effect {effect.externalEffectGlobalId}
+                      </Typography>
+                    </Stack>
+                    <Typography variant="body2">
+                      Product {effect.productReferenceCode} · listing{' '}
+                      {effect.channelStateGlobalId} · image revision{' '}
+                      {effect.assetRevision} · {effect.assetAltText}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      {effect.providerWriteCount} known provider write
+                      {effect.providerWriteCount === 1 ? '' : 's'} · exact
+                      upload fingerprint {effect.uploadedLocatorAvailable
+                        ? 'available'
+                        : 'unavailable'} · recorded{' '}
+                      {new Date(effect.occurredAt).toLocaleString()}
+                      {effect.latestOutcome
+                        ? ` · latest ${effect.latestOutcome.replaceAll('_', ' ')}`
+                        : ''}
+                      {effect.errorCode ? ` · ${effect.errorCode}` : ''}
+                    </Typography>
+                    <Alert
+                      severity={effect.reconciliationEligibility ===
+                        'readback_terminalizable'
+                        ? 'info'
+                        : 'warning'}
+                    >
+                      {effect.reconciliationEligibility ===
+                      'readback_terminalizable'
+                        ? 'Eligible for exact read-only Faire readback: '
+                        : 'Manual review only: '}
+                      {faireRecoveryReason(effect.reconciliationReason)}.
+                    </Alert>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      startIcon={
+                        reconcilingFaireEffect === effect.externalEffectGlobalId
+                          ? <CircularProgress size={14} />
+                          : <RefreshRounded />
+                      }
+                      onClick={() => void reconcileFaireImage(
+                        effect.externalEffectGlobalId,
+                      )}
+                      disabled={publishingFaire}
+                      sx={{ alignSelf: 'flex-start' }}
+                    >
+                      {effect.reconciliationEligibility ===
+                      'readback_terminalizable'
+                        ? 'Reconcile by read-only Faire readback'
+                        : 'Record safe manual-review state'}
+                    </Button>
+                    <Typography variant="caption" color="text.secondary">
+                      This action is fenced to this Product and exact effect. It
+                      performs zero provider writes.
+                      {effect.reconciliationEligibility ===
+                      'readback_terminalizable'
+                        ? ' It reads the current Faire Product image set and terminalizes only an exact single-locator match.'
+                        : ' It records the durable manual-review decision without contacting Faire or terminalizing the effect.'}
+                    </Typography>
+                  </Stack>
+                ))}
+              </Stack>
+            ) : null}
+
             {faireChannels.length === 0 ? (
               <Alert severity="info">
                 Map this Product to an active Faire listing before publishing
@@ -1446,7 +1780,11 @@ export default function ProductImagePanel({
               </Alert>
             ) : null}
             {faireProjection?.mode === 'active'
-              && faireProjection.externalEffect.state !== 'succeeded' ? (
+              && faireProjection.externalEffect.state !== 'succeeded'
+              && !faireRecoveryEffects.some(
+                (effect) => effect.externalEffectGlobalId
+                  === faireProjection.externalEffect.globalId,
+              ) ? (
                 <Button
                   size="small"
                   variant="outlined"
@@ -1466,7 +1804,7 @@ export default function ProductImagePanel({
                   ? 'success'
                   : 'warning'
               }>
-                Readback {faireReconciliation.outcome.replaceAll('_', ' ')}
+                Recovery {faireReconciliation.outcome.replaceAll('_', ' ')}
                 {faireReconciliation.providerImageCount !== undefined
                   ? ` · ${faireReconciliation.providerImageCount} current provider image${faireReconciliation.providerImageCount === 1 ? '' : 's'}`
                   : ''}

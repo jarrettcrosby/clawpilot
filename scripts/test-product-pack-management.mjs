@@ -9,6 +9,7 @@ const [
   migration,
   packEvidenceMigration,
   checkoutAccountCorrection,
+  unlistedCheckoutMigration,
   domain,
   persistence,
   route,
@@ -17,11 +18,34 @@ const [
   read('db/migrations/0151_operations_product_pack_management_hardening.sql'),
   read('db/migrations/0191_operations_commerce_pack_evidence_fingerprint.sql'),
   read('db/migrations/0162_operations_shopify_checkout_mapping_account_status.sql'),
+  read('db/migrations/0255_operations_shopify_unlisted_checkout_eligibility.sql'),
   read('app_src/lib/operations/productPackManagement.ts'),
   read('app_src/lib/persistence/productPackManagement.ts'),
   read('app_src/app/api/operations/product-pack-profiles/route.ts'),
   read('app_src/components/crm/ProductPackProfilePanel.tsx'),
 ])
+
+for (const fragment of [
+  'operations_shopify_checkout_channel_is_eligible(',
+  "lower(btrim(requested_environment)) = 'sandbox'",
+  "lower(btrim(requested_provider_status_raw)) = 'active'",
+  "lower(btrim(requested_normalized_status)) = 'unlisted'",
+  "lower(btrim(requested_provider_status_raw)) = 'unlisted'",
+  'requested_provider_active IS FALSE',
+  "credential_verification_status IS DISTINCT FROM 'verified'",
+  'channel_state.provider_status_raw',
+  'operations_shopify_carrier_service_config_is_ready(',
+]) {
+  assert.ok(
+    unlistedCheckoutMigration.includes(fragment),
+    `unlisted checkout migration is missing ${fragment}`,
+  )
+}
+assert.doesNotMatch(
+  unlistedCheckoutMigration,
+  /UPDATE\s+operations_product_channel_states/i,
+  'unlisted checkout migration must not relabel provider lifecycle evidence',
+)
 
 for (const fragment of [
   'operations_commerce_pack_evidence_hash(',
@@ -140,6 +164,8 @@ for (const fragment of [
   'state.source_revision',
   'state.source_hash',
   'state.pack_evidence_hash',
+  'state.provider_status_raw',
+  'isShopifySandboxCheckoutChannelEligible({',
   'material.rated_outer_length_mm',
   'recordAuditEvent({',
   "row.account_status === 'error'",

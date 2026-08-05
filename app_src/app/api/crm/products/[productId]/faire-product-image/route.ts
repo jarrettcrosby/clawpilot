@@ -11,6 +11,7 @@ import {
 } from '@/lib/persistence/faireProviderWriteAuthorization'
 import {
   FaireProductImageProjectionPersistenceError,
+  listFaireProductImageRecoveryEffectsInPostgres,
 } from '@/lib/persistence/faireProductImageProjection'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { requestSession, requireRequestUser } from '@/lib/requestUser'
@@ -58,10 +59,10 @@ function errorResponse(error: unknown) {
   if (error instanceof Error && error.message === 'Unauthorized') {
     return json({ ok: false, error: 'Unauthorized', code: 'unauthorized' }, 401)
   }
-  console.error('[faire product image publish] request failed')
+  console.error('[faire product image] request failed')
   return json({
     ok: false,
-    error: 'Faire Product-image publication failed',
+    error: 'Faire Product-image request failed',
     code: 'FAIRE_PRODUCT_IMAGE_REQUEST_FAILED',
   }, 500)
 }
@@ -110,62 +111,97 @@ async function boundedJson(req: NextRequest) {
   return body as Record<string, unknown>
 }
 
+function assertSameOrigin(req: NextRequest) {
+  if (!isBrowserSameOriginRequest({
+    headers: req.headers,
+    requestOrigin: req.nextUrl.origin,
+    trustedOrigins: [appPublicUrl()],
+  })) {
+    fail(
+      'FAIRE_PRODUCT_IMAGE_SAME_ORIGIN_REQUIRED',
+      'Faire Product-image commands require a same-origin browser request',
+      403,
+    )
+  }
+}
+
+async function managerContext(
+  req: NextRequest,
+  context: { params: Promise<{ productId: string }> },
+) {
+  const session = await requestSession(req)
+  if (session?.impersonating) {
+    fail(
+      'FAIRE_PRODUCT_IMAGE_IMPERSONATION_FORBIDDEN',
+      'Exit user view before accessing Faire Product-image publication',
+      403,
+    )
+  }
+  const actor = await requireRequestUser(req)
+  const role = effectiveAuthorizationRole(actor)
+  if (
+    !['owner', 'admin'].includes(role)
+    || actor.permissions.manageOperations !== true
+  ) {
+    fail(
+      'FAIRE_PRODUCT_IMAGE_MANAGER_REQUIRED',
+      'Organization manager permission is required for Faire Product images',
+      403,
+    )
+  }
+  if (!actor.organizationId) {
+    fail(
+      'FAIRE_PRODUCT_IMAGE_ORGANIZATION_REQUIRED',
+      'Active workspace is not available',
+      403,
+    )
+  }
+  if (!isPostgresStorageEnabled()) {
+    fail(
+      'FAIRE_PRODUCT_IMAGE_POSTGRES_REQUIRED',
+      'Faire Product-image publication requires Postgres storage',
+      503,
+    )
+  }
+  const productId = String((await context.params).productId || '')
+    .trim()
+    .toLowerCase()
+  if (!UUID.test(productId)) {
+    fail('FAIRE_PRODUCT_IMAGE_SELECTION_INVALID', 'Product is invalid', 404)
+  }
+  return { actor, organizationId: actor.organizationId, productId }
+}
+
+export async function GET(
+  req: NextRequest,
+  context: { params: Promise<{ productId: string }> },
+) {
+  try {
+    const { organizationId, productId } = await managerContext(req, context)
+    const recoveryEffects =
+      await listFaireProductImageRecoveryEffectsInPostgres({
+        organizationId,
+        productId,
+      })
+    return json({
+      ok: true,
+      recoveryEffects,
+      providerReads: 0,
+      providerWrites: 0,
+    })
+  } catch (error) {
+    return errorResponse(error)
+  }
+}
+
 export async function POST(
   req: NextRequest,
   context: { params: Promise<{ productId: string }> },
 ) {
   try {
-    if (!isBrowserSameOriginRequest({
-      headers: req.headers,
-      requestOrigin: req.nextUrl.origin,
-      trustedOrigins: [appPublicUrl()],
-    })) {
-      fail(
-        'FAIRE_PRODUCT_IMAGE_SAME_ORIGIN_REQUIRED',
-        'Faire Product-image commands require a same-origin browser request',
-        403,
-      )
-    }
-    const session = await requestSession(req)
-    if (session?.impersonating) {
-      fail(
-        'FAIRE_PRODUCT_IMAGE_IMPERSONATION_FORBIDDEN',
-        'Exit user view before accessing Faire Product-image publication',
-        403,
-      )
-    }
-    const actor = await requireRequestUser(req)
-    const role = effectiveAuthorizationRole(actor)
-    if (
-      !['owner', 'admin'].includes(role)
-      || actor.permissions.manageOperations !== true
-    ) {
-      fail(
-        'FAIRE_PRODUCT_IMAGE_MANAGER_REQUIRED',
-        'Organization manager permission is required for Faire Product images',
-        403,
-      )
-    }
-    if (!actor.organizationId) {
-      fail(
-        'FAIRE_PRODUCT_IMAGE_ORGANIZATION_REQUIRED',
-        'Active workspace is not available',
-        403,
-      )
-    }
-    if (!isPostgresStorageEnabled()) {
-      fail(
-        'FAIRE_PRODUCT_IMAGE_POSTGRES_REQUIRED',
-        'Faire Product-image publication requires Postgres storage',
-        503,
-      )
-    }
-    const productId = String((await context.params).productId || '')
-      .trim()
-      .toLowerCase()
-    if (!UUID.test(productId)) {
-      fail('FAIRE_PRODUCT_IMAGE_SELECTION_INVALID', 'Product is invalid', 404)
-    }
+    assertSameOrigin(req)
+    const { actor, organizationId, productId } =
+      await managerContext(req, context)
     const body = await boundedJson(req)
     if (body.action === 'reconcile-product-image') {
       if (
@@ -182,7 +218,7 @@ export async function POST(
         )
       }
       const reconciliation = await reconcileFaireProductImagePublish({
-        organizationId: actor.organizationId,
+        organizationId,
         productId,
         externalEffectGlobalId: body.externalEffectGlobalId,
         actorEmail: actor.email,
@@ -217,7 +253,7 @@ export async function POST(
       )
     }
     const publication = await executeFaireProductImagePublish({
-      organizationId: actor.organizationId,
+      organizationId,
       productId,
       channelStateGlobalId: body.channelStateGlobalId,
       imageAssetId: body.assetId,
