@@ -143,7 +143,7 @@ export type AppUserMembershipSnapshot = {
   isDefault: boolean
 }
 
-function normalizeOrganizationIds(value: unknown): string[] {
+export function normalizeOrganizationIds(value: unknown): string[] {
   const raw = Array.isArray(value) ? value : value == null ? [] : [value]
   const seen = new Set<string>()
   const ids: string[] = []
@@ -161,6 +161,117 @@ function normalizeOrganizationIds(value: unknown): string[] {
   }
 
   return ids
+}
+
+export async function addAppUserOrganizationMemberships(input: {
+  actorEmail: unknown
+  email: unknown
+  organizationIds: unknown
+}): Promise<{ user: AppUser; addedOrganizationIds: string[] }> {
+  const actor = await resolveAppUserActor(input.actorEmail)
+  if (!canInviteUsers(actor) || !canManageUserAccess(actor)) {
+    throw new AppUserAuthorizationError('You do not have permission to add user organization access')
+  }
+  const email = normalizeUserEmail(input.email)
+  if (email === actor.email) {
+    throw new AppUserAuthorizationError('Your own organization access cannot be changed here')
+  }
+  const organizationIds = normalizeOrganizationIds(input.organizationIds)
+  if (!organizationIds.length) throw new Error('Choose at least one additional organization')
+
+  for (const organizationId of organizationIds) {
+    await requireInvitationOrganizationInActorScope(actor, organizationId)
+  }
+
+  return withTransaction(async (client) => {
+    const targetResult = await client.query<AppUserRow>(
+      'SELECT * FROM app_users WHERE email = $1 FOR UPDATE',
+      [email],
+    )
+    const targetRow = targetResult.rows[0]
+    if (!targetRow) throw new AppUserNotFoundError()
+    if (targetRow.status === 'disabled') {
+      throw new AppUserAuthorizationError('Restore the disabled user before adding organization access')
+    }
+
+    const targetMemberships = await client.query<{
+      role: AppUserRole
+      organization_id: string
+    }>(
+      `SELECT role, organization_id::text
+       FROM app_user_organization_memberships
+       WHERE user_email = $1
+       FOR UPDATE`,
+      [email],
+    )
+    if (!targetMemberships.rows.length) throw new AppUserNotFoundError()
+    if (
+      effectiveAuthorizationRole(actor) !== 'owner'
+      && targetMemberships.rows.some((membership) => membership.role !== 'member')
+    ) {
+      throw new AppUserAuthorizationError('Only the owner can manage administrators')
+    }
+
+    const existingOrganizationIds = new Set(
+      targetMemberships.rows.map((membership) => membership.organization_id),
+    )
+    const addedOrganizationIds = organizationIds.filter(
+      (organizationId) => !existingOrganizationIds.has(organizationId),
+    )
+    if (!addedOrganizationIds.length) {
+      throw new Error('This user already has access to the selected organizations')
+    }
+
+    const membershipStatus: AppUserStatus = targetRow.status === 'active' ? 'active' : 'invited'
+    for (const organizationId of addedOrganizationIds) {
+      await client.query(
+        `INSERT INTO app_user_organization_memberships (
+           user_email, organization_id, role, permissions, status, is_default,
+           created_by, updated_by, created_at, updated_at
+         ) VALUES ($1, $2::uuid, 'member', $3::jsonb, $4, false, $5, $5, now(), now())
+         ON CONFLICT (user_email, organization_id) DO NOTHING`,
+        [email, organizationId, JSON.stringify(MEMBER_PERMISSIONS), membershipStatus, actor.email],
+      )
+    }
+
+    await client.query(
+      'UPDATE app_users SET updated_at = now() WHERE email = $1',
+      [email],
+    )
+    await recordAuditEvent({
+      actor: actor.email,
+      eventType: 'user.organizations.added',
+      aggregateType: 'app_user',
+      aggregateId: email,
+      subject: email,
+      organizationId: actor.organizationId,
+      payload: {
+        organizationIds: addedOrganizationIds,
+        membershipStatus,
+        role: 'member',
+      },
+    }, client)
+
+    const primaryOrganizationId = addedOrganizationIds[0]
+    const addedUser = await client.query<ScopedAppUserRow>(
+      `SELECT app_user.*,
+         membership.organization_id::text AS membership_organization_id,
+         organization.name AS membership_organization_name,
+         membership.role AS membership_role,
+         membership.permissions AS membership_permissions,
+         membership.status AS membership_status
+       FROM app_users app_user
+       JOIN app_user_organization_memberships membership ON membership.user_email = app_user.email
+       JOIN workspace_organizations organization ON organization.id = membership.organization_id
+       WHERE app_user.email = $1 AND membership.organization_id = $2::uuid`,
+      [email, primaryOrganizationId],
+    )
+    if (!addedUser.rows[0]) throw new AppUserNotFoundError()
+    return {
+      user: toScopedAppUser(addedUser.rows[0]),
+      addedOrganizationIds,
+    }
+  })
 }
 
 type AppUserRow = {
