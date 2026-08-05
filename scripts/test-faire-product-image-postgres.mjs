@@ -711,6 +711,44 @@ async function runOperationalAcceptance({
   assert.equal(expired.leaseExpired, true)
   assert.equal(expired.providerWriteCount, 1)
   assert.equal(expired.uploadedLocatorSha256, uploadedLocatorSha256)
+  const expiredRecoveries = await persistence
+    .listFaireProductImageRecoveryEffectsInPostgres({
+      organizationId: fixture.organizationId,
+      productId: fixture.productId,
+    })
+  assert.equal(expiredRecoveries.length, 1)
+  assert.equal(expiredRecoveries[0].externalEffectGlobalId, active.effectGlobalId)
+  assert.equal(expiredRecoveries[0].recoveryState, 'expired_claim')
+  assert.equal(expiredRecoveries[0].providerWriteCount, 1)
+  assert.equal(expiredRecoveries[0].uploadedLocatorAvailable, true)
+  assert.equal(
+    expiredRecoveries[0].productReferenceCode,
+    selection.productReferenceCode,
+  )
+  assert.equal(
+    expiredRecoveries[0].channelStateGlobalId,
+    active.channelStateGlobalId,
+  )
+  assert.equal(expiredRecoveries[0].assetRevision, selection.assetRevision)
+  assert.equal(expiredRecoveries[0].assetAltText, active.assetAltText)
+  assert.equal(expiredRecoveries[0].latestOutcome, 'succeeded')
+  assert.equal(expiredRecoveries[0].errorCode, null)
+  assert.ok(Date.parse(expiredRecoveries[0].latestObservedAt))
+  assert.ok(Date.parse(expiredRecoveries[0].occurredAt))
+  assert.equal(
+    (await persistence.listFaireProductImageRecoveryEffectsInPostgres({
+      organizationId: fixture.organizationId,
+      productId: randomUUID(),
+    })).length,
+    0,
+  )
+  assert.equal(
+    (await persistence.listFaireProductImageRecoveryEffectsInPostgres({
+      organizationId: randomUUID(),
+      productId: fixture.productId,
+    })).length,
+    0,
+  )
   const recovered = await persistence
     .recoverExpiredFaireProductImageClaimInPostgres({
       organizationId: fixture.organizationId,
@@ -722,6 +760,15 @@ async function runOperationalAcceptance({
   assert.equal(recovered.leaseExpired, false)
   assert.equal(recovered.providerWriteCount, 1)
   assert.equal(recovered.uploadedLocatorSha256, uploadedLocatorSha256)
+  const unknownRecoveries = await persistence
+    .listFaireProductImageRecoveryEffectsInPostgres({
+      organizationId: fixture.organizationId,
+      productId: fixture.productId,
+    })
+  assert.equal(unknownRecoveries.length, 1)
+  assert.equal(unknownRecoveries[0].externalEffectGlobalId, active.effectGlobalId)
+  assert.equal(unknownRecoveries[0].recoveryState, 'unknown')
+  assert.equal(unknownRecoveries[0].uploadedLocatorAvailable, true)
   const reconcileEvidence = {
     provider: 'faire',
     operation: 'productImagePublishReconciliation',
@@ -958,6 +1005,23 @@ async function runOperationalAcceptance({
   assert.equal(resolvedContext.providerWriteCount, 2)
   assert.equal(resolvedContext.reconciledProviderImageCount, 2)
   assert.equal(resolvedContext.reconciledExactLocatorMatchCount, 1)
+  const recoveriesAfterTerminalization = await persistence
+    .listFaireProductImageRecoveryEffectsInPostgres({
+      organizationId: fixture.organizationId,
+      productId: fixture.productId,
+    })
+  assert.equal(
+    recoveriesAfterTerminalization.some(
+      (effect) => effect.externalEffectGlobalId === terminalActive.effectGlobalId,
+    ),
+    false,
+  )
+  assert.equal(
+    recoveriesAfterTerminalization.some(
+      (effect) => effect.externalEffectGlobalId === active.effectGlobalId,
+    ),
+    true,
+  )
   const resolvedStates = await pool.query(
     `SELECT effect.state AS effect_state,
             effect.provider_write_count,
@@ -1115,6 +1179,19 @@ async function runOperationalAcceptance({
     fallbackLocatorSha256,
   )
   assert.equal(fallbackContext.latestOutcome, null)
+  const fallbackRecoveries = await persistence
+    .listFaireProductImageRecoveryEffectsInPostgres({
+      organizationId: fixture.organizationId,
+      productId: fixture.productId,
+    })
+  const fallbackRecovery = fallbackRecoveries.find(
+    (effect) => effect.externalEffectGlobalId === fallbackActive.effectGlobalId,
+  )
+  assert.ok(fallbackRecovery)
+  assert.equal(fallbackRecovery.recoveryState, 'unknown')
+  assert.equal(fallbackRecovery.providerWriteCount, 1)
+  assert.equal(fallbackRecovery.uploadedLocatorAvailable, true)
+  assert.equal(fallbackRecovery.latestOutcome, null)
   const fallbackSteps = await pool.query(
     `SELECT count(*)::integer AS count
      FROM operations_faire_product_image_provider_steps
