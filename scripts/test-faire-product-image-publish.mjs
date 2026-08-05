@@ -368,6 +368,12 @@ assert.equal(successResult.externalEffect.state, 'succeeded')
 assert.equal(successResult.providerMutation.writeCount, 2)
 assert.equal(success.steps.length, 2)
 assert.deepEqual(success.steps.map((step) => step.stage), ['upload', 'attach'])
+assert.equal(
+  success.steps[1].redactedEvidence.assetContentSha256,
+  selection.assetContentSha256,
+)
+assert.equal(success.steps[1].redactedEvidence.providerWritesKnown, true)
+assert.equal(success.steps[1].redactedEvidence.providerWriteCountLowerBound, 2)
 assert.equal(success.finalizations[0].providerWriteCount, 2)
 assert.equal(success.patches[0].productId, selection.externalProductId)
 assert.deepEqual(
@@ -486,6 +492,10 @@ const expiredClaimReplay = await projection.executeFaireProductImagePublish({
       leaseExpired: false,
       providerWriteCount: 1,
       uploadedLocatorSha256: hash('recovered-upload'),
+      priorImageCount: 2,
+      projectedImageCount: 3,
+      reconciliationEligibility: 'readback_terminalizable',
+      reconciliationReason: 'exact_attach_unknown_evidence',
       latestOutcome: 'succeeded',
       latestObservedAt: new Date().toISOString(),
     }
@@ -495,6 +505,9 @@ assert.equal(expiredRecoveryCalls, 1)
 assert.equal(expiredClaimReplay.replayed, true)
 assert.equal(expiredClaimReplay.externalEffect.state, 'unknown')
 assert.equal(expiredClaimReplay.providerMutation.writeCount, 1)
+assert.equal(expiredClaimReplay.images.existingPreserved, true)
+assert.equal(expiredClaimReplay.images.priorCount, 2)
+assert.equal(expiredClaimReplay.images.projectedCount, 3)
 
 const uploadUnknown = activeDependencies({
   uploadError: Object.assign(new Error('timeout'), {
@@ -547,6 +560,22 @@ assert.equal(attachUnknownResult.externalEffect.state, 'unknown')
 assert.equal(attachUnknownResult.providerMutation.writeCount, 1)
 assert.equal(attachUnknown.steps[0].stage, 'upload')
 assert.equal(attachUnknown.steps[1].outcome, 'unknown')
+assert.equal(
+  attachUnknown.steps[1].redactedEvidence.externalProductId,
+  selection.externalProductId,
+)
+assert.equal(
+  attachUnknown.steps[1].redactedEvidence.assetContentSha256,
+  selection.assetContentSha256,
+)
+assert.equal(attachUnknown.steps[1].redactedEvidence.priorImageCount, 2)
+assert.equal(attachUnknown.steps[1].redactedEvidence.projectedImageCount, 3)
+assert.equal(attachUnknown.steps[1].redactedEvidence.existingImagesPreserved, true)
+assert.equal(attachUnknown.steps[1].redactedEvidence.providerWritesKnown, false)
+assert.equal(
+  attachUnknown.steps[1].redactedEvidence.providerWriteCountLowerBound,
+  1,
+)
 assert.equal(attachUnknown.finalizations.length, 1)
 
 const locatorSha256 = hash('uploaded-locator')
@@ -570,6 +599,8 @@ const reconciliation = await projection.reconcileFaireProductImagePublish({
     leaseExpired: false,
     providerWriteCount: 1,
     uploadedLocatorSha256: locatorSha256,
+    reconciliationEligibility: 'readback_terminalizable',
+    reconciliationReason: 'exact_unknown_effect_evidence',
     latestOutcome: 'unknown',
     latestObservedAt: new Date().toISOString(),
   }),
@@ -670,6 +701,8 @@ const absentReconciliation =
       leaseExpired: false,
       providerWriteCount: 1,
       uploadedLocatorSha256: locatorSha256,
+      reconciliationEligibility: 'readback_terminalizable',
+      reconciliationReason: 'exact_unknown_effect_evidence',
       latestOutcome: 'unknown',
       latestObservedAt: new Date().toISOString(),
     }),
@@ -713,6 +746,8 @@ const ambiguousReconciliation =
       leaseExpired: false,
       providerWriteCount: 1,
       uploadedLocatorSha256: locatorSha256,
+      reconciliationEligibility: 'readback_terminalizable',
+      reconciliationReason: 'exact_unknown_effect_evidence',
       latestOutcome: 'unknown',
       latestObservedAt: new Date().toISOString(),
     }),
@@ -818,6 +853,8 @@ const recoveredReconciliation =
         leaseExpired: false,
         providerWriteCount: 1,
         uploadedLocatorSha256: locatorSha256,
+        reconciliationEligibility: 'readback_terminalizable',
+        reconciliationReason: 'exact_attach_unknown_evidence',
         latestOutcome: 'succeeded',
         latestObservedAt: new Date().toISOString(),
       }
@@ -883,6 +920,8 @@ const recoveredManualReview =
       leaseExpired: false,
       providerWriteCount: 0,
       uploadedLocatorSha256: null,
+      reconciliationEligibility: 'manual_review',
+      reconciliationReason: 'upload_locator_unavailable',
       latestOutcome: null,
       latestObservedAt: null,
     }),
@@ -897,6 +936,50 @@ const recoveredManualReview =
   })
 assert.equal(recoveredManualReview.outcome, 'manual_review')
 assert.equal(manualReviewProviderReads, 0)
+
+let ineligibleLocatorProviderReads = 0
+const ineligibleLocatorSteps = []
+const ineligibleLocatorReview =
+  await projection.reconcileFaireProductImagePublish({
+    organizationId: ids.organizationId,
+    productId: ids.productId,
+    externalEffectGlobalId: 'gcef0000001',
+    actorEmail: command.actorEmail,
+  }, {
+    readContext: async () => ({
+      deliveryGrantId: ids.grantId,
+      productId: ids.productId,
+      accountGlobalId: selection.accountGlobalId,
+      credentialGeneration: 7,
+      externalProductId: selection.externalProductId,
+      assetContentSha256: selection.assetContentSha256,
+      externalEffectId: ids.effectId,
+      externalEffectGlobalId: 'gcef0000001',
+      effectState: 'unknown',
+      leaseExpired: false,
+      providerWriteCount: 1,
+      uploadedLocatorSha256: locatorSha256,
+      reconciliationEligibility: 'manual_review',
+      reconciliationReason: 'exact_attachment_evidence_unavailable',
+      latestOutcome: 'succeeded',
+      latestObservedAt: new Date().toISOString(),
+    }),
+    readProviderImages: async () => {
+      ineligibleLocatorProviderReads += 1
+      return []
+    },
+    recordProviderStep: async (step) => {
+      ineligibleLocatorSteps.push(step)
+      return { id: ids.attemptId, observedAt: new Date().toISOString() }
+    },
+  })
+assert.equal(ineligibleLocatorReview.outcome, 'manual_review')
+assert.equal(
+  ineligibleLocatorReview.reason,
+  'exact_attachment_evidence_unavailable',
+)
+assert.equal(ineligibleLocatorProviderReads, 0)
+assert.equal(ineligibleLocatorSteps[0].outcome, 'manual_review')
 
 const malformedReadSteps = []
 const malformedReadResult =
@@ -918,6 +1001,8 @@ const malformedReadResult =
       leaseExpired: false,
       providerWriteCount: 1,
       uploadedLocatorSha256: locatorSha256,
+      reconciliationEligibility: 'readback_terminalizable',
+      reconciliationReason: 'exact_unknown_effect_evidence',
       latestOutcome: 'unknown',
       latestObservedAt: new Date().toISOString(),
     }),
