@@ -1448,6 +1448,21 @@ const commandResultSource = persistenceSource.slice(
 includes(persistenceSource, [
   'CASE WHEN $29::text IS NULL THEN NULL ELSE 0 END',
 ], 'Nullable presentment-currency staging parameter typing')
+const intakeRunInsertSource = persistenceSource.slice(
+  persistenceSource.indexOf(
+    '`INSERT INTO operations_commerce_intake_runs',
+  ),
+  persistenceSource.indexOf('const mappingVariantIds'),
+)
+includes(intakeRunInsertSource, [
+  "LEAST($17::timestamptz, now() + interval '30 days')",
+  'RETURNING id::text, global_id, expires_at::text AS expires_at',
+], 'Database-clock commerce intake-run retention')
+assert.doesNotMatch(
+  persistenceSource.slice(persistenceSource.indexOf('const mappingVariantIds')),
+  /input\.envelope\.retentionExpiresAt/u,
+  'Child intake evidence must inherit the database-clamped run expiry',
+)
 const readIntentPreparationSource = persistenceSource.slice(
   persistenceSource.indexOf(
     'export async function prepareCommerceIntakeReadIntentInPostgres',

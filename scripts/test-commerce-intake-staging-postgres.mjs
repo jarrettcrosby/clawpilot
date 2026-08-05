@@ -7259,6 +7259,9 @@ async function verifyAcceptance(databaseUrl) {
     mappedVariant: 'gid://shopify/ProductVariant/mapped-zero',
   }
   const imageFixture = productImageFixture()
+  const providerClockAheadRetentionExpiresAt = new Date(
+    Date.now() + 30 * 24 * 60 * 60 * 1_000 + 60_000,
+  ).toISOString()
   const envelope = Object.freeze({
     schemaVersion: 'commerce-normalization-envelope-v1',
     normalizerVersion: 'commerce-staging-postgres-v1',
@@ -7269,7 +7272,7 @@ async function verifyAcceptance(databaseUrl) {
     apiVersion: '2026-07',
     observedAt,
     credentialGeneration: 1,
-    retentionExpiresAt,
+    retentionExpiresAt: providerClockAheadRetentionExpiresAt,
     sourceHash: hash('commerce-staging-envelope'),
     products: Object.freeze([imageFixture.product]),
     orders: Object.freeze([
@@ -7451,6 +7454,47 @@ async function verifyAcceptance(databaseUrl) {
   assert.equal(result.recordsStaged, 6)
   assert.equal(result.providerWrites, 0)
   assert.equal(result.syncCursorAdvanced, false)
+  const retention = (await pool.query(
+    `SELECT
+       run.expires_at > run.created_at AS remains_unexpired,
+       run.expires_at <= run.created_at + interval '30 days'
+         AS database_bounded,
+       run.expires_at < $2::timestamptz AS provider_clock_clamped,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_product_candidates product_candidate
+         WHERE product_candidate.run_id = run.id
+           AND product_candidate.expires_at IS DISTINCT FROM run.expires_at
+       ) AS product_expiry_mismatches,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_order_candidates candidate
+         WHERE candidate.run_id = run.id
+           AND candidate.expires_at IS DISTINCT FROM run.expires_at
+       ) AS order_expiry_mismatches,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_order_candidate_lines line
+         WHERE line.run_id = run.id
+           AND line.expires_at IS DISTINCT FROM run.expires_at
+       ) AS line_expiry_mismatches
+     FROM operations_commerce_intake_runs run
+     WHERE run.organization_id = $1::uuid
+       AND run.global_id = $3`,
+    [
+      ids.organization,
+      providerClockAheadRetentionExpiresAt,
+      result.runGlobalId,
+    ],
+  )).rows[0]
+  assert.deepEqual(retention, {
+    remains_unexpired: true,
+    database_bounded: true,
+    provider_clock_clamped: true,
+    product_expiry_mismatches: 0,
+    order_expiry_mismatches: 0,
+    line_expiry_mismatches: 0,
+  })
   assert.deepEqual(JSON.parse(JSON.stringify(result.productImageImports)), {
     productsObserved: 1,
     activeImagesObserved: 1,
