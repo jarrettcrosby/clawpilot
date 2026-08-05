@@ -202,6 +202,12 @@ for (const fragment of [
   'organization_id = COALESCE(app_users.organization_id, EXCLUDED.organization_id)',
   'JOIN managed ON managed.id = membership.organization_id',
   'previousMembership',
+  'addAppUserOrganizationMemberships',
+  "eventType: 'user.organizations.added'",
+  "targetRow.status === 'active' ? 'active' : 'invited'",
+  "role: 'member'",
+  "is_default,",
+  'ON CONFLICT (user_email, organization_id) DO NOTHING',
 ]) {
   assertIncludes(users, fragment, 'membership-scoped user invitation')
 }
@@ -211,6 +217,8 @@ for (const fragment of [
   'organizationIds',
   'createOrganization: body?.createOrganization === true',
   'createOrganization',
+  "body?.action === 'organizations-add'",
+  'addAppUserOrganizationMemberships',
 ]) {
   assertIncludes(usersRoute, fragment, 'users invite multi-organization request payload')
 }
@@ -221,6 +229,9 @@ for (const fragment of [
   'No other workspace organizations are available for you to manage',
   'organizationIds',
   'inviteOrganizationOptions',
+  'addOrganizationAccess',
+  "action: 'organizations-add'",
+  'Existing access is left unchanged; new access starts as Member.',
 ]) {
   assertIncludes(userInviteDialog, fragment, 'multi-organization invite UI controls')
 }

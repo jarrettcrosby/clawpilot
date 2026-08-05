@@ -11,6 +11,7 @@ import { requireRequestUser } from '@/lib/requestUser'
 import {
   AppUserAuthorizationError,
   AppUserNotFoundError,
+  addAppUserOrganizationMemberships,
   canInviteUsers,
   canManageUserAccess,
   effectiveAuthorizationRole,
@@ -87,6 +88,14 @@ export async function PATCH(req: NextRequest) {
   try {
     const actor = await requireRequestUser(req)
     const body = await req.json()
+    if (body?.action === 'organizations-add') {
+      const result = await addAppUserOrganizationMemberships({
+        actorEmail: actor,
+        email: body.email,
+        organizationIds: body.organizationIds,
+      })
+      return NextResponse.json({ ok: true, ...result })
+    }
     if (body?.action === 'crm-employee') {
       let user = await updateAppUserCrmEmployee({
         actorEmail: actor,
