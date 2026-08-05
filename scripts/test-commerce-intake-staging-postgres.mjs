@@ -6359,7 +6359,9 @@ async function verifyAutomaticFaireExactRefreshLineage(
   const exactRejectionEvidence = (await pool.query(
     `SELECT intent.intent_state, intent.target_global_id,
             intent.target_source_hash, rejection.disposition,
-            rejection.external_id, rejection.error_code
+            rejection.external_id, rejection.error_code,
+            rejection.expires_at IS DISTINCT FROM run.expires_at
+              AS expiry_mismatch
      FROM operations_commerce_intake_read_intents intent
      JOIN operations_commerce_intake_runs run
        ON run.organization_id = intent.organization_id
@@ -6379,6 +6381,7 @@ async function verifyAutomaticFaireExactRefreshLineage(
     disposition: 'open',
     external_id: rejectionExternalOrderId,
     error_code: 'COMMERCE_ORDER_RECORD_INVALID',
+    expiry_mismatch: false,
   })
   const exactRejectionAttentionInput = {
     runtime,
@@ -7477,7 +7480,18 @@ async function verifyAcceptance(databaseUrl) {
          FROM operations_commerce_order_candidate_lines line
          WHERE line.run_id = run.id
            AND line.expires_at IS DISTINCT FROM run.expires_at
-       ) AS line_expiry_mismatches
+       ) AS line_expiry_mismatches,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_intake_continuations continuation
+         WHERE continuation.run_id = run.id
+           AND continuation.expires_at IS DISTINCT FROM run.expires_at
+       ) AS continuation_expiry_mismatches,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_intake_continuations continuation
+         WHERE continuation.run_id = run.id
+       ) AS continuation_count
      FROM operations_commerce_intake_runs run
      WHERE run.organization_id = $1::uuid
        AND run.global_id = $3`,
@@ -7494,6 +7508,8 @@ async function verifyAcceptance(databaseUrl) {
     product_expiry_mismatches: 0,
     order_expiry_mismatches: 0,
     line_expiry_mismatches: 0,
+    continuation_expiry_mismatches: 0,
+    continuation_count: 1,
   })
   assert.deepEqual(JSON.parse(JSON.stringify(result.productImageImports)), {
     productsObserved: 1,
