@@ -133,6 +133,7 @@ type WorkspaceOrganization = {
 
 type UserMutationPayload = ApiPayload & {
   user?: AppUser
+  addedOrganizationIds?: string[]
   delivery?: string
   crmIdentitySync?: 'queued' | 'not-mapped'
   warning?: string
@@ -417,6 +418,7 @@ export default function UserAccessDialog({
   const [inviteDemoAccess, setInviteDemoAccess] = useState(false)
   const [inviteOrganizationId, setInviteOrganizationId] = useState('')
   const [inviteAdditionalOrganizationIds, setInviteAdditionalOrganizationIds] = useState<string[]>([])
+  const [additionalOrganizationDrafts, setAdditionalOrganizationDrafts] = useState<Record<string, string[]>>({})
   const [newOrganizationName, setNewOrganizationName] = useState('')
   const [newOrganizationParentId, setNewOrganizationParentId] = useState('')
   const [createNames, setCreateNames] = useState({ board: '', pipeline: '' })
@@ -496,6 +498,7 @@ export default function UserAccessDialog({
     setInviteDemoAccess(false)
     setInviteOrganizationId('')
     setInviteAdditionalOrganizationIds([])
+    setAdditionalOrganizationDrafts({})
     setNewOrganizationName('')
     setNewOrganizationParentId('')
     setCreateNames({ board: '', pipeline: '' })
@@ -736,6 +739,34 @@ export default function UserAccessDialog({
       setNotice(`Access updated for ${result.user.displayName || result.user.email}.`)
     } catch (updateError) {
       setError(messageFrom(updateError, 'Unable to update access'))
+    } finally {
+      finishAction()
+    }
+  }
+
+  async function addOrganizationAccess(user: AppUser) {
+    const organizationIds = additionalOrganizationDrafts[user.email] || []
+    if (busy || !organizationIds.length || !canManageUser(user) || !usersPayload?.canInvite) return
+    startAction(`organizations:${user.email}`)
+    try {
+      const result = await requestJson<UserMutationPayload>('/api/users', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'organizations-add',
+          email: user.email,
+          organizationIds,
+        }),
+      })
+      const refreshed = await requestJson<UsersPayload>('/api/users')
+      setUsersPayload(refreshed)
+      setAdditionalOrganizationDrafts((current) => ({ ...current, [user.email]: [] }))
+      const addedNames = (result.addedOrganizationIds || [])
+        .map((organizationId) => refreshed.workspaceOrganizations?.find((organization) => organization.id === organizationId)?.name)
+        .filter(Boolean)
+      setNotice(`Organization access added for ${user.displayName || user.email}${addedNames.length ? `: ${addedNames.join(', ')}` : '.'}`)
+    } catch (updateError) {
+      setError(messageFrom(updateError, 'Unable to add organization access'))
     } finally {
       finishAction()
     }
@@ -1374,6 +1405,14 @@ export default function UserAccessDialog({
             <Stack spacing={1.5}>
               {displayedUsers.map((user) => {
                 const manageable = canManageUser(user)
+                const userOrganizations = inviteOrganizationOptions.filter((organization) => (
+                  displayedUsers.some((candidate) => (
+                    candidate.email === user.email && candidate.organizationId === organization.id
+                  ))
+                ))
+                const availableUserOrganizations = inviteOrganizationOptions.filter((organization) => (
+                  !userOrganizations.some((assigned) => assigned.id === organization.id)
+                ))
                 const canChangeRole = manageable && currentUser?.role === 'owner'
                 const crmMappingManageable = canManageCrmMapping(user)
                 const crmEmployeeManageable = crmMappingManageable && user.role !== 'owner'
@@ -1388,6 +1427,7 @@ export default function UserAccessDialog({
                       : 'Admin permissions can be adjusted individually. An admin cannot grant access they do not hold.'
                 const userPending = pendingAction === `status:${user.email}`
                   || pendingAction === `access:${user.email}`
+                  || pendingAction === `organizations:${user.email}`
                   || pendingAction === `crm-employee:${user.email}`
                   || pendingAction === `crm-map:${user.email}`
 
@@ -1495,6 +1535,61 @@ export default function UserAccessDialog({
                           >
                             {user.suiteCrmUserId ? 'Resync CRM identity' : 'Sync CRM identity'}
                           </Button>
+                        </Box>
+                      ) : null}
+                      {manageable && usersPayload?.canInvite && user.status !== 'disabled' && displayedUsers.findIndex((candidate) => candidate.email === user.email) === displayedUsers.indexOf(user) ? (
+                        <Box sx={{ mb: 1.5 }}>
+                          <Typography variant="body2" color="text.primary" fontWeight={700}>Organization access</Typography>
+                          <Typography variant="caption" color="text.disabled" sx={{ display: 'block', mb: 1 }}>
+                            Add this person to other organizations you manage. Existing access is left unchanged; new access starts as Member.
+                          </Typography>
+                          <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap mb={1}>
+                            {userOrganizations.map((organization) => (
+                              <Chip key={organization.id} size="small" variant="outlined" label={organization.name} />
+                            ))}
+                          </Stack>
+                          {availableUserOrganizations.length ? <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'minmax(0, 1fr) auto' }, gap: 1 }}>
+                            <TextField
+                              select
+                              fullWidth
+                              size="small"
+                              label="Additional organizations"
+                              value={additionalOrganizationDrafts[user.email] || []}
+                              onChange={(event) => {
+                                const value = event.target.value
+                                setAdditionalOrganizationDrafts((current) => ({
+                                  ...current,
+                                  [user.email]: typeof value === 'string' ? value.split(',').filter(Boolean) : value,
+                                }))
+                              }}
+                              disabled={busy}
+                              SelectProps={{
+                                multiple: true,
+                                renderValue: (selected) => (selected as string[])
+                                  .map((organizationId) => inviteOrganizationOptions.find((organization) => organization.id === organizationId)?.name || organizationId)
+                                  .join(', '),
+                              }}
+                              sx={fieldSx}
+                            >
+                              {availableUserOrganizations.map((organization) => (
+                                  <MenuItem key={organization.id} value={organization.id}>
+                                    <Checkbox checked={(additionalOrganizationDrafts[user.email] || []).includes(organization.id)} size="small" />
+                                    {organization.name}
+                                  </MenuItem>
+                                ))}
+                            </TextField>
+                            <Button
+                              variant="outlined"
+                              startIcon={pendingAction === `organizations:${user.email}` ? <CircularProgress size={16} /> : <PersonAddRounded />}
+                              onClick={() => { void addOrganizationAccess(user) }}
+                              disabled={busy || !(additionalOrganizationDrafts[user.email] || []).length}
+                              sx={compactButtonSx}
+                            >
+                              Add access
+                            </Button>
+                          </Box> : (
+                            <Typography variant="caption" color="text.disabled">This person already has access to every organization you manage.</Typography>
+                          )}
                         </Box>
                       ) : null}
                       <Box display="flex" alignItems="center" justifyContent="space-between" gap={1.5} mb={0.75}>
