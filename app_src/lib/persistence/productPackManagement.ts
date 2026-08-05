@@ -9,6 +9,9 @@ import {
   type ProductPackVariantMappingInput,
 } from '@/lib/operations/productPackManagement'
 import {
+  isShopifySandboxCheckoutChannelEligible,
+} from '@/lib/integrations/shopifyCheckoutChannelEligibility'
+import {
   acquireTransactionAdvisoryLock,
   query,
   withTransaction,
@@ -108,6 +111,7 @@ type ChannelStateRow = QueryResultRow & {
   external_product_id: string
   external_variant_id: string
   product_id: string | null
+  provider_status_raw: string
   normalized_status:
     | 'active'
     | 'draft'
@@ -410,6 +414,7 @@ async function lockProviderWeightEvidence(
        state.external_product_id,
        state.external_variant_id,
        state.product_id::text,
+       state.provider_status_raw,
        state.normalized_status,
        state.provider_active,
        state.provider_updated_at,
@@ -1068,6 +1073,7 @@ async function lockChannelState(
        state.external_product_id,
        state.external_variant_id,
        state.product_id::text,
+       state.provider_status_raw,
        state.normalized_status,
        state.provider_active,
        state.provider_updated_at,
@@ -1225,17 +1231,19 @@ async function requireShopifyCheckoutPackReady(
   },
 ) {
   if (
-    input.state.provider !== 'shopify'
-    || input.state.account_environment !== 'sandbox'
-    || input.state.normalized_status !== 'active'
-    || input.state.provider_active !== true
-    || input.state.requires_shipping !== true
-    || !Number.isSafeInteger(input.state.weight_grams)
-    || Number(input.state.weight_grams) < 1
+    !isShopifySandboxCheckoutChannelEligible({
+      provider: input.state.provider,
+      accountEnvironment: input.state.account_environment,
+      providerStatusRaw: input.state.provider_status_raw,
+      normalizedStatus: input.state.normalized_status,
+      providerActive: input.state.provider_active,
+      requiresShipping: input.state.requires_shipping,
+      weightGrams: input.state.weight_grams,
+    })
   ) {
     fail(
       'PRODUCT_PACK_SHOPIFY_CHECKOUT_CHANNEL_NOT_READY',
-      'Shopify checkout mapping requires an active sandbox shipping variant with positive provider weight',
+      'Shopify checkout mapping requires an eligible sandbox shipping variant with positive provider weight',
       409,
     )
   }
