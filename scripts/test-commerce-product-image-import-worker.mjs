@@ -87,6 +87,9 @@ const worker = loadTypeScriptModule(
     },
   },
 )
+const imageImportHealth = loadTypeScriptModule(
+  'app_src/lib/commerceProductImageImportHealth.ts',
+)
 
 const LOCATOR_A = 'a'.repeat(64)
 const LOCATOR_B = 'b'.repeat(64)
@@ -133,6 +136,64 @@ function codedError(code, status, message = 'Sanitized provider failure') {
   error.status = status
   return error
 }
+
+test('fresh terminal progress is actively draining even while jobs retry', () => {
+  const health = imageImportHealth
+    .classifyCommerceProductImageImportOperationalHealth({
+      deadCount: 0,
+      staleLeaseCount: 0,
+      overdueCount: 280,
+      retryCount: 12,
+      heartbeatPhase: 'completed',
+      loopReachable: true,
+      progressAgeMs: 79,
+      maxProgressAgeMs: 90_000,
+    })
+
+  assert.equal(health.activelyDraining, true)
+  assert.equal(health.stalledOverdue, false)
+  assert.equal(
+    health.operationalDegraded,
+    true,
+    'Retries remain an independent operational degradation',
+  )
+})
+
+test('overdue jobs without recent terminal progress remain stalled', () => {
+  const health = imageImportHealth
+    .classifyCommerceProductImageImportOperationalHealth({
+      deadCount: 0,
+      staleLeaseCount: 0,
+      overdueCount: 280,
+      retryCount: 0,
+      heartbeatPhase: 'completed',
+      loopReachable: true,
+      progressAgeMs: 90_001,
+      maxProgressAgeMs: 90_000,
+    })
+
+  assert.equal(health.activelyDraining, false)
+  assert.equal(health.stalledOverdue, true)
+  assert.equal(health.operationalDegraded, true)
+})
+
+test('retry-only image work degrades without inventing an overdue stall', () => {
+  const health = imageImportHealth
+    .classifyCommerceProductImageImportOperationalHealth({
+      deadCount: 0,
+      staleLeaseCount: 0,
+      overdueCount: 0,
+      retryCount: 3,
+      heartbeatPhase: 'completed',
+      loopReachable: true,
+      progressAgeMs: null,
+      maxProgressAgeMs: 90_000,
+    })
+
+  assert.equal(health.activelyDraining, false)
+  assert.equal(health.stalledOverdue, false)
+  assert.equal(health.operationalDegraded, true)
+})
 
 function fixture(input = {}) {
   const claims = [...(input.claims || [claim()])]
