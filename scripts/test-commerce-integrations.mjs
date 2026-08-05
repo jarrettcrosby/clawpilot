@@ -530,6 +530,7 @@ includes(adminRoute, [
   "action === 'start-faire-oauth'",
   "action === 'test-connection'",
   "action === 'set-receipt-intake'",
+  "action === 'register-shopify-scope-webhooks'",
   "action === 'set-enabled'",
   "action === 'disconnect'",
   "action === 'reveal-credential'",
@@ -568,7 +569,7 @@ assert.equal(
       /const integrations = await commerceMutationIntegrations\(/g,
     ) || []
   ).length,
-  8,
+  9,
   'Every commerce mutation that returns integration state must restore computed account fields',
 )
 const mutationResponseHelper = adminRoute.slice(
@@ -984,7 +985,9 @@ includes(panel, [
   'Open setup checklist',
   'setupChecklistProvider',
   'catalog?.providers.shopify.providerScopes',
-  'Optional signed receipt setup',
+  'Signed receipt setup',
+  'Register scope safety webhook',
+  'Current Shopify webhook receipts need attention',
   'Copy URL',
   'Distributed Operations scope profile',
   "action: 'set-receipt-intake'",

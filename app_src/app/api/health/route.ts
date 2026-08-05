@@ -25,6 +25,9 @@ import {
   readShopifyInventoryRefreshWorkerHeartbeatFromPostgres,
 } from '@/lib/persistence/shopifyInventoryRefresh'
 import {
+  readShopifyWebhookReceiptHealthFromPostgres,
+} from '@/lib/persistence/shopifyWebhookReceiptHealth'
+import {
   readFaireInventoryPollHealthFromPostgres,
   readFaireInventoryPollWorkerHeartbeatFromPostgres,
 } from '@/lib/persistence/faireInventoryPolling'
@@ -139,6 +142,18 @@ export async function GET() {
     }
     let shopifyInventoryRefreshWorker: Record<string, unknown> = {
       status: 'disabled',
+    }
+    let shopifyWebhookReceipts: Record<string, unknown> = {
+      status: 'disabled',
+      accounts: 0,
+      actionableAccounts: 0,
+      actionable: 0,
+      staleQueued: 0,
+      staleProcessing: 0,
+      failed: 0,
+      deadLetter: 0,
+      heldProductDeletes: 0,
+      oldestActionableAt: null,
     }
     let faireInventoryPollWorker: Record<string, unknown> = {
       status: 'disabled',
@@ -2485,6 +2500,15 @@ export async function GET() {
             && row?.migration_checksums_present
           ),
         }
+        if (row?.operations_commerce_integrations_migration_applied) {
+          shopifyWebhookReceipts =
+            await readShopifyWebhookReceiptHealthFromPostgres()
+          if (Number(shopifyWebhookReceipts.actionable || 0) > 0) {
+            warnings.push(
+              'Current Shopify webhook receipts require operator attention.',
+            )
+          }
+        }
         if (
           !row?.worker_migration_applied
           || !row?.auth_migration_applied
@@ -3899,6 +3923,7 @@ export async function GET() {
       commerceCatalogWorker,
       commerceOrderReconciliationWorker,
       shopifyInventoryRefreshWorker,
+      shopifyWebhookReceipts,
       faireInventoryPollWorker,
       commerceProductImageImportWorker,
       faireProductImageProjection,

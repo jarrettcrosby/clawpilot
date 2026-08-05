@@ -219,10 +219,21 @@ const receiptPersistenceModule = loadTypeScriptModule(
     mocks: {
       '@/lib/auditWriter': {
         async recordAuditEvent(input) {
-          receiptTrace.push({ kind: 'audit', eventType: input.eventType })
+          receiptTrace.push({
+            kind: 'audit',
+            eventType: input.eventType,
+            payload: input.payload,
+          })
         },
       },
       '@/lib/integrations/commerceCapabilities': {
+        hasEffectiveShopifyScope(grantedScopes, requiredScope) {
+          if (grantedScopes.includes(requiredScope)) return true
+          return requiredScope.startsWith('read_')
+            && grantedScopes.includes(
+              `write_${requiredScope.slice('read_'.length)}`,
+            )
+        },
         SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS: [
           'products/create',
           'products/delete',
@@ -231,6 +242,10 @@ const receiptPersistenceModule = loadTypeScriptModule(
         SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS: [
           'inventory_items/update',
           'inventory_levels/update',
+        ],
+        SHOPIFY_RECEIPT_PROOF_SCOPES: [
+          'read_products',
+          'read_inventory',
         ],
       },
       '@/lib/integrations/commerceCredentialCrypto': {
@@ -429,6 +444,14 @@ const receiptPersistenceModule = loadTypeScriptModule(
                   }],
                 }
               }
+              if (sql.includes('UPDATE operations_integration_accounts')) {
+                receiptTrace.push({
+                  kind: 'scope_account_update',
+                  intakeDisabled: values[3],
+                  configuration: JSON.parse(values[4]),
+                })
+                return { rowCount: 1, rows: [] }
+              }
               if (
                 sql.includes('UPDATE operations_commerce_webhook_receipts')
               ) {
@@ -466,6 +489,11 @@ const receiptPersistenceModule = loadTypeScriptModule(
         },
       },
       '@/lib/persistence/shopifyFulfillmentNotifications': {},
+      '@/lib/persistence/shopifyWebhookReceiptHealth': {
+        async readShopifyWebhookReceiptAccountHealthFromPostgres() {
+          return []
+        },
+      },
     },
   },
 )
@@ -521,6 +549,151 @@ assert.deepEqual(JSON.parse(JSON.stringify(firstImageDelete)), {
   providerUpdatedAt: exactDeletion.providerUpdatedAt,
   actorEmail: 'owner@example.com',
 })
+
+replayExistingReceipt = false
+receiptIntakeEnabled = true
+const effectiveWriteScopeTraceStart = receiptTrace.length
+const effectiveWriteScopeReceipt = await receiptPersistenceModule
+  .recordShopifyWebhookReceiptInPostgres({
+    ...receiptInput,
+    providerEventId: 'event-scope-complete-write-scopes',
+    topic: 'app/scopes_update',
+    productDeletion: null,
+    scopeAudit: {
+      requestedScopes: ['write_inventory', 'write_products'],
+      grantedScopes: ['write_inventory', 'write_products'],
+      missingScopes: [],
+      restrictedScopes: [],
+    },
+  })
+assert.equal(effectiveWriteScopeReceipt.duplicate, false)
+const effectiveWriteScopeTrace = receiptTrace.slice(
+  effectiveWriteScopeTraceStart,
+)
+assert.equal(
+  effectiveWriteScopeTrace.find(
+    (entry) => entry.kind === 'scope_account_update',
+  ).intakeDisabled,
+  false,
+  'Effective write scopes must satisfy the paired receipt-proof reads',
+)
+assert.equal(
+  effectiveWriteScopeTrace.find(
+    (entry) => entry.kind === 'receipt_insert',
+  ).state,
+  'queued',
+)
+assert.equal(
+  effectiveWriteScopeTrace.filter(
+    (entry) => entry.kind === 'receipt_finalize',
+  ).length,
+  1,
+  'A complete access-scope event must terminalize synchronously',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(effectiveWriteScopeTrace.find(
+    (entry) => entry.kind === 'audit'
+      && entry.eventType === 'commerce.webhook.received',
+  ).payload)),
+  {
+    provider: 'shopify',
+    environment: 'production',
+    receiptGlobalId: 'gcw1234567',
+    topic: 'app/scopes_update',
+    providerEventId: 'event-scope-complete-write-scopes',
+    credentialVersion: 3,
+    inventoryRefreshSignaled: false,
+    catalogRefreshSignaled: false,
+    scopeRefreshApplied: true,
+    scopeRefreshTerminalized: true,
+    productDeletionReconciled: false,
+    productDeletionStaleIgnored: false,
+    productDeletionHeld: false,
+    productImagesInactivated: 0,
+  },
+  'Complete scope evidence must distinguish application from terminalization',
+)
+assert.equal(
+  effectiveWriteScopeTrace.some((entry) => (
+    entry.kind === 'catalog_signal' || entry.kind === 'image_delete'
+  )),
+  false,
+  'Access-scope events must not signal a catalog or image mutation',
+)
+
+receiptIntakeEnabled = false
+const heldIntakeCompleteScopeTraceStart = receiptTrace.length
+await receiptPersistenceModule.recordShopifyWebhookReceiptInPostgres({
+  ...receiptInput,
+  providerEventId: 'event-scope-complete-while-intake-held',
+  topic: 'app/scopes_update',
+  productDeletion: null,
+  scopeAudit: {
+    requestedScopes: ['write_inventory', 'write_products'],
+    grantedScopes: ['write_inventory', 'write_products'],
+    missingScopes: [],
+    restrictedScopes: [],
+  },
+})
+const heldIntakeCompleteScopeTrace = receiptTrace.slice(
+  heldIntakeCompleteScopeTraceStart,
+)
+assert.equal(
+  heldIntakeCompleteScopeTrace.find(
+    (entry) => entry.kind === 'receipt_insert',
+  ).state,
+  'queued',
+  'A complete control event bypasses the manual domain-receipt hold',
+)
+assert.equal(
+  heldIntakeCompleteScopeTrace.filter(
+    (entry) => entry.kind === 'receipt_finalize',
+  ).length,
+  1,
+  'A complete control event must terminalize while intake is held',
+)
+
+receiptIntakeEnabled = true
+const lostProofScopeTraceStart = receiptTrace.length
+await receiptPersistenceModule.recordShopifyWebhookReceiptInPostgres({
+  ...receiptInput,
+  providerEventId: 'event-scope-missing-inventory-proof',
+  topic: 'app/scopes_update',
+  productDeletion: null,
+  scopeAudit: {
+    requestedScopes: ['write_inventory', 'write_products'],
+    grantedScopes: ['write_products'],
+    missingScopes: ['write_inventory'],
+    restrictedScopes: [],
+  },
+})
+const lostProofScopeTrace = receiptTrace.slice(lostProofScopeTraceStart)
+assert.equal(
+  lostProofScopeTrace.find(
+    (entry) => entry.kind === 'scope_account_update',
+  ).intakeDisabled,
+  true,
+  'Losing an effective inventory proof scope must disable receipt intake',
+)
+assert.equal(
+  lostProofScopeTrace.find(
+    (entry) => entry.kind === 'receipt_insert',
+  ).state,
+  'held',
+)
+assert.equal(
+  lostProofScopeTrace.some(
+    (entry) => entry.kind === 'receipt_finalize',
+  ),
+  false,
+  'A scope-loss receipt remains durable held evidence after intake closes',
+)
+const lostProofScopeAudit = lostProofScopeTrace.find(
+  (entry) => entry.kind === 'audit'
+    && entry.eventType === 'commerce.webhook.received',
+)
+assert.equal(lostProofScopeAudit.payload.scopeRefreshApplied, true)
+assert.equal(lostProofScopeAudit.payload.scopeRefreshTerminalized, false)
 
 replayExistingReceipt = true
 const traceBeforeReplay = receiptTrace.length
@@ -936,18 +1109,24 @@ const integrationService = read(
   'app_src/lib/integrations/commerceIntegrations.ts',
 )
 includes(integrationService, [
+  'registerShopifyScopeWebhookSubscriptions',
   'registerShopifyCatalogWebhookSubscriptions',
-  "group: 'inventory' | 'catalog'",
+  "group: 'scope' | 'inventory' | 'catalog'",
+  'SHOPIFY_SCOPE_REFRESH_WEBHOOK_TOPICS',
   'SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS',
+  'scopeWebhookSubscriptions',
   'catalogWebhookSubscriptions',
+  'SHOPIFY_RECEIPT_SUBSCRIPTIONS_INCOMPLETE',
   'providerWrites: 0',
 ], 'Shopify catalog webhook registration')
 
 includes(
   read('app_src/app/api/integrations/commerce/route.ts'),
   [
+    "action === 'register-shopify-scope-webhooks'",
     "action === 'register-shopify-catalog-webhooks'",
     'confirmProviderWrites !== true',
+    'registerShopifyScopeWebhookSubscriptions',
     'registerShopifyCatalogWebhookSubscriptions',
   ],
   'Shopify catalog webhook registration API',
@@ -955,6 +1134,8 @@ includes(
 includes(
   read('app_src/components/settings/CommerceIntegrationPanel.tsx'),
   [
+    'registerScopeWebhooks',
+    'Register scope safety webhook',
     'registerCatalogWebhooks',
     'Register catalog webhooks',
     'read-only catalog reconciliation in Shadow',

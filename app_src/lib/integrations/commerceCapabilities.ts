@@ -15,8 +15,12 @@ export const SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS = [
   'products/update',
 ] as const
 
-export const SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS = [
+export const SHOPIFY_SCOPE_REFRESH_WEBHOOK_TOPICS = [
   'app/scopes_update',
+] as const
+
+export const SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS = [
+  ...SHOPIFY_SCOPE_REFRESH_WEBHOOK_TOPICS,
   ...SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
   ...SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS,
 ] as const
@@ -309,6 +313,14 @@ export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
     acceptedReceiptTopics: SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS,
     webhookSetupGroups: [
       {
+        key: 'scope_control',
+        label: 'Access-scope safety',
+        topics: SHOPIFY_SCOPE_REFRESH_WEBHOOK_TOPICS,
+        requiredScopes: [],
+        state: 'available',
+        behavior: 'Re-evaluates the installed grant and immediately holds signed receipt intake if the product or inventory proof scope is removed.',
+      },
+      {
         key: 'inventory',
         label: 'Inventory freshness',
         topics: SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
@@ -351,7 +363,7 @@ export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
       {
         key: 'configuration',
         label: 'Connection and locations',
-        topics: ['app/scopes_update', 'app/uninstalled', 'locations/create', 'locations/update', 'locations/delete'],
+        topics: ['app/uninstalled', 'locations/create', 'locations/update', 'locations/delete'],
         requiredScopes: ['read_locations'],
         state: 'processor_pending',
         behavior: 'Configuration events will re-evaluate scopes, connection health, locations, and warehouse routing.',
