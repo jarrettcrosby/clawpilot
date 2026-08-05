@@ -35,6 +35,9 @@ import {
   readCommerceProductImageImportQueueHealthInPostgres,
 } from '@/lib/persistence/commerceProductImageImports'
 import {
+  classifyCommerceProductImageImportOperationalHealth,
+} from '@/lib/commerceProductImageImportHealth'
+import {
   readFaireProductImageProjectionHealthInPostgres,
 } from '@/lib/persistence/faireProductImageProjection'
 import { commerceIntakeRuntimeAvailable } from '@/lib/integrations/commerceIntake'
@@ -3634,27 +3637,20 @@ export async function GET() {
               90_000,
               imagePollMs * 4,
             )
-            const activelyDraining = (
-              imageQueue.overdueCount > 0
-              && imageQueue.deadCount === 0
-              && imageQueue.staleLeaseCount === 0
-              && imageQueue.retryCount === 0
-              && imageQueue.heartbeat?.phase !== 'degraded'
-              && loopReachable
-              && imageProgressAgeMs !== null
-              && imageProgressAgeMs <= maxImageProgressAgeMs
-            )
-            const stalledOverdue = (
-              imageQueue.overdueCount > 0
-              && !activelyDraining
-            )
-            const operationalDegraded = (
-              imageQueue.deadCount > 0
-              || imageQueue.staleLeaseCount > 0
-              || stalledOverdue
-              || imageQueue.retryCount > 0
-              || imageQueue.heartbeat?.phase === 'degraded'
-            )
+            const {
+              activelyDraining,
+              stalledOverdue,
+              operationalDegraded,
+            } = classifyCommerceProductImageImportOperationalHealth({
+              deadCount: imageQueue.deadCount,
+              staleLeaseCount: imageQueue.staleLeaseCount,
+              overdueCount: imageQueue.overdueCount,
+              retryCount: imageQueue.retryCount,
+              heartbeatPhase: imageQueue.heartbeat?.phase,
+              loopReachable,
+              progressAgeMs: imageProgressAgeMs,
+              maxProgressAgeMs: maxImageProgressAgeMs,
+            })
             commerceProductImageImportWorker = {
               status: loopReachable
                 ? (operationalDegraded ? 'degraded' : 'reachable')
