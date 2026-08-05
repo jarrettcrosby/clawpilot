@@ -156,10 +156,14 @@ test('Faire recovery survives reload and exposes only exact-effect readback', ()
   assert.match(panel, /These records survive page reloads and new\s+operator sessions/)
   assert.match(panel, /Reconcile by read-only Faire readback/)
   assert.match(panel, /Record safe manual-review state/)
+  assert.match(panel, /reconciliationEligibility/)
+  assert.match(panel, /exact_attach_succeeded_evidence/)
+  assert.match(panel, /Eligible for exact read-only Faire readback/)
+  assert.match(panel, /Manual review only/)
   assert.match(panel, /reconcileFaireImage\(\s*effect\.externalEffectGlobalId/)
   assert.match(panel, /fenced to this Product and exact effect/)
   assert.match(panel, /performs zero provider writes/)
-  assert.match(panel, /effect remains unresolved for review/)
+  assert.match(panel, /without contacting Faire or terminalizing the effect/)
   const recoveryMarkup = panel.slice(
     panel.indexOf('data-testid="crm-faire-image-recovery"'),
     panel.indexOf('{faireChannels.length === 0'),

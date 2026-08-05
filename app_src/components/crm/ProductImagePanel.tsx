@@ -197,6 +197,14 @@ type FaireProductImageRecoveryEffect = {
   recoveryState: 'unknown' | 'expired_claim'
   providerWriteCount: number
   uploadedLocatorAvailable: boolean
+  reconciliationEligibility: 'readback_terminalizable' | 'manual_review'
+  reconciliationReason:
+    | 'exact_attach_unknown_evidence'
+    | 'exact_attach_succeeded_evidence'
+    | 'exact_unknown_effect_evidence'
+    | 'upload_locator_unavailable'
+    | 'provider_write_count_unsupported'
+    | 'exact_attachment_evidence_unavailable'
   productReferenceCode: string
   channelStateGlobalId: string
   assetRevision: number
@@ -235,6 +243,16 @@ const RECOVERY_OUTCOMES = new Set([
   'observed_applied',
   'observed_absent',
   'manual_review',
+])
+const RECOVERY_REASONS = new Set<FaireProductImageRecoveryEffect[
+  'reconciliationReason'
+]>([
+  'exact_attach_unknown_evidence',
+  'exact_attach_succeeded_evidence',
+  'exact_unknown_effect_evidence',
+  'upload_locator_unavailable',
+  'provider_write_count_unsupported',
+  'exact_attachment_evidence_unavailable',
 ])
 
 function apiPath(productId: string) {
@@ -276,6 +294,26 @@ function recoveryEffects(
       || effect.providerWriteCount < 0
       || effect.providerWriteCount > 2
       || typeof effect.uploadedLocatorAvailable !== 'boolean'
+      || !['readback_terminalizable', 'manual_review'].includes(
+        effect.reconciliationEligibility,
+      )
+      || !RECOVERY_REASONS.has(effect.reconciliationReason)
+      || (
+        effect.reconciliationEligibility === 'readback_terminalizable'
+        && ![
+          'exact_attach_unknown_evidence',
+          'exact_attach_succeeded_evidence',
+          'exact_unknown_effect_evidence',
+        ].includes(effect.reconciliationReason)
+      )
+      || (
+        effect.reconciliationEligibility === 'manual_review'
+        && [
+          'exact_attach_unknown_evidence',
+          'exact_attach_succeeded_evidence',
+          'exact_unknown_effect_evidence',
+        ].includes(effect.reconciliationReason)
+      )
       || !PRODUCT_REFERENCE.test(effect.productReferenceCode)
       || !CHANNEL_GLOBAL_ID.test(effect.channelStateGlobalId)
       || !Number.isInteger(effect.assetRevision)
@@ -306,6 +344,25 @@ function displayMimeType(mimeType: ProductImageAsset['mimeType']) {
   if (mimeType === 'image/jpeg') return 'JPEG'
   if (mimeType === 'image/webp') return 'WebP'
   return 'PNG'
+}
+
+function faireRecoveryReason(
+  reason: FaireProductImageRecoveryEffect['reconciliationReason'],
+) {
+  switch (reason) {
+    case 'exact_attach_unknown_evidence':
+      return 'exact uncertain attachment evidence is preserved'
+    case 'exact_attach_succeeded_evidence':
+      return 'exact completed attachment evidence is preserved'
+    case 'exact_unknown_effect_evidence':
+      return 'exact uncertain effect evidence is preserved'
+    case 'upload_locator_unavailable':
+      return 'the durable upload fingerprint is unavailable'
+    case 'provider_write_count_unsupported':
+      return 'the durable provider-write count is unsupported'
+    default:
+      return 'exact attachment identity and image-count evidence is incomplete'
+  }
 }
 
 function displayBytes(byteLength: number) {
@@ -1544,6 +1601,18 @@ export default function ProductImagePanel({
                         : ''}
                       {effect.errorCode ? ` · ${effect.errorCode}` : ''}
                     </Typography>
+                    <Alert
+                      severity={effect.reconciliationEligibility ===
+                        'readback_terminalizable'
+                        ? 'info'
+                        : 'warning'}
+                    >
+                      {effect.reconciliationEligibility ===
+                      'readback_terminalizable'
+                        ? 'Eligible for exact read-only Faire readback: '
+                        : 'Manual review only: '}
+                      {faireRecoveryReason(effect.reconciliationReason)}.
+                    </Alert>
                     <Button
                       size="small"
                       variant="outlined"
@@ -1558,15 +1627,18 @@ export default function ProductImagePanel({
                       disabled={publishingFaire}
                       sx={{ alignSelf: 'flex-start' }}
                     >
-                      {effect.uploadedLocatorAvailable
+                      {effect.reconciliationEligibility ===
+                      'readback_terminalizable'
                         ? 'Reconcile by read-only Faire readback'
                         : 'Record safe manual-review state'}
                     </Button>
                     <Typography variant="caption" color="text.secondary">
                       This action is fenced to this Product and exact effect. It
-                      may read the current Faire Product image set, but it
-                      performs zero provider writes. If the exact upload cannot
-                      be proved, the effect remains unresolved for review.
+                      performs zero provider writes.
+                      {effect.reconciliationEligibility ===
+                      'readback_terminalizable'
+                        ? ' It reads the current Faire Product image set and terminalizes only an exact single-locator match.'
+                        : ' It records the durable manual-review decision without contacting Faire or terminalizing the effect.'}
                     </Typography>
                   </Stack>
                 ))}
