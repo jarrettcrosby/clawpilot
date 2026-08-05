@@ -17,6 +17,9 @@ const branding = read(
 const context = read(
   'app_src/lib/persistence/shopifyCheckoutContext.ts',
 )
+const channelEligibility = read(
+  'app_src/lib/integrations/shopifyCheckoutChannelEligibility.ts',
+)
 const route = read(
   'app_src/app/api/integrations/commerce/shopify/carrier-service/'
   + '[accountGlobalId]/[token]/route.ts',
@@ -157,6 +160,23 @@ for (const required of [
   assert.ok(
     callback.includes(required),
     `callback is missing required contract: ${required}`,
+  )
+}
+
+for (const required of [
+  "normalizedStatus === 'active'",
+  "providerStatusRaw === 'active'",
+  'input.providerActive === true',
+  "normalizedStatus === 'unlisted'",
+  "providerStatusRaw === 'unlisted'",
+  'input.providerActive === false',
+  "normalizedText(input.accountEnvironment) === 'sandbox'",
+  'input.requiresShipping === true',
+  'Number.isSafeInteger(input.weightGrams)',
+]) {
+  assert.ok(
+    channelEligibility.includes(required),
+    `checkout channel eligibility is missing ${required}`,
   )
 }
 
@@ -465,6 +485,10 @@ for (const required of [
   'mapping.external_product_id = requested.product_gid',
   'mapping.external_variant_id = requested.variant_gid',
   "mapping.mapping_purpose = 'shopify_checkout'",
+  'state.provider_status_raw AS state_provider_status_raw',
+  'isShopifySandboxCheckoutChannelEligible({',
+  'accountEnvironment: account.environment',
+  'row.pack_mapping_provider_lifecycle_state\n        !== row.state_normalized_status',
   "level.projection_state = 'projected'",
   'level.external_inventory_item_id =',
   "recipe.lifecycle_state = 'active'",

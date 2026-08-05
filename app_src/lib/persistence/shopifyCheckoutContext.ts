@@ -6,6 +6,9 @@ import type {
   HybridCartonizationMaterial,
   HybridCartonizationRecipe,
 } from '@/lib/operations/hybridCartonization'
+import {
+  isShopifySandboxCheckoutChannelEligible,
+} from '@/lib/integrations/shopifyCheckoutChannelEligibility'
 import type { ShopifyCheckoutRatingAccount } from '@/lib/persistence/shopifyCheckoutRating'
 import { getPostgresPool } from '@/lib/persistence/postgres'
 
@@ -110,6 +113,7 @@ type LineRow = QueryResultRow & {
   external_inventory_item_id: string | null
   state_requires_shipping: boolean | null
   state_weight_grams: number | null
+  state_provider_status_raw: string
   state_normalized_status: string
   state_provider_active: boolean | null
   state_source_revision: string
@@ -229,6 +233,7 @@ async function readLines(
        state.external_inventory_item_id,
        state.requires_shipping AS state_requires_shipping,
        state.weight_grams AS state_weight_grams,
+       state.provider_status_raw AS state_provider_status_raw,
        state.normalized_status AS state_normalized_status,
        state.provider_active AS state_provider_active,
        state.source_revision AS state_source_revision,
@@ -313,6 +318,7 @@ async function readLines(
 function mapLines(
   rows: LineRow[],
   requested: Map<string, ShopifyCheckoutContextLine>,
+  account: ShopifyCheckoutRatingAccount,
 ) {
   return rows.map((row) => {
     const input = requested.get(row.line_key)
@@ -323,11 +329,18 @@ function mapLines(
       )
     }
     if (
-      row.state_normalized_status !== 'active'
-      || row.state_provider_active !== true
-      || row.state_requires_shipping !== true
+      !isShopifySandboxCheckoutChannelEligible({
+        provider: 'shopify',
+        accountEnvironment: account.environment,
+        providerStatusRaw: row.state_provider_status_raw,
+        normalizedStatus: row.state_normalized_status,
+        providerActive: row.state_provider_active,
+        requiresShipping: row.state_requires_shipping,
+        weightGrams: row.state_weight_grams,
+      })
       || row.pack_mapping_projection_state !== 'current'
-      || row.pack_mapping_provider_lifecycle_state !== 'active'
+      || row.pack_mapping_provider_lifecycle_state
+        !== row.state_normalized_status
       || !row.pack_mapping_pack_evidence_hash
       || row.pack_mapping_pack_evidence_hash
         !== row.state_pack_evidence_hash
@@ -951,7 +964,11 @@ export async function readShopifyCheckoutContextFromPostgres(input: {
       readLines(client, input.account, input.lines),
       readMaterials(client, input.account),
     ])
-    const mappedLines = mapLines(lineRows, requestedByKey)
+    const mappedLines = mapLines(
+      lineRows,
+      requestedByKey,
+      input.account,
+    )
     const materials = mapMaterials(materialRows)
     const [recipeRows, inventorySnapshot] = await Promise.all([
       readRecipes(
