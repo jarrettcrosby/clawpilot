@@ -434,7 +434,35 @@ function productImageFixture() {
       vendor: 'ClawPilot acceptance',
       productType: 'Test',
       providerTaxonomy: unavailable(),
-      variants: Object.freeze([]),
+      variants: Object.freeze([Object.freeze({
+        schemaVersion: 'commerce-normalized-variant-v1',
+        identity: Object.freeze({
+          provider: 'shopify',
+          resourceType: 'variant',
+          value: 'gid://shopify/ProductVariant/92010011',
+        }),
+        productIdentity: Object.freeze({
+          provider: 'shopify',
+          resourceType: 'product',
+          value: 'gid://shopify/Product/9201001',
+        }),
+        inventoryItemIdentity: unavailable(),
+        sku: 'COMMERCE-STAGING-IMAGE-9201001',
+        barcode: null,
+        title: 'Default',
+        selectedOptions: Object.freeze([]),
+        unitMultiplier: 1,
+        wholesalePrice: unavailable(),
+        retailPrice: unavailable(),
+        taxable: false,
+        requiresShipping: false,
+        inventory: unavailable(),
+        packaging: unavailable(),
+        weightGrams: null,
+        providerCreatedAt: observedAt,
+        providerUpdatedAt: observedAt,
+        sourceHash: hash('commerce-staging-product-variant-source'),
+      })]),
       images: Object.freeze([Object.freeze({
         providerImageId,
         locatorFingerprint,
@@ -7454,7 +7482,8 @@ async function verifyAcceptance(databaseUrl) {
   )
   assert.equal(result.replayed, false)
   assert.equal(result.ordersStaged, 6)
-  assert.equal(result.recordsStaged, 6)
+  assert.equal(result.productVariantsStaged, 1)
+  assert.equal(result.recordsStaged, 7)
   assert.equal(result.providerWrites, 0)
   assert.equal(result.syncCursorAdvanced, false)
   const retention = (await pool.query(
@@ -7469,6 +7498,11 @@ async function verifyAcceptance(databaseUrl) {
          WHERE product_candidate.run_id = run.id
            AND product_candidate.expires_at IS DISTINCT FROM run.expires_at
        ) AS product_expiry_mismatches,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_product_candidates product_candidate
+         WHERE product_candidate.run_id = run.id
+       ) AS product_candidate_count,
        (
          SELECT count(*)::integer
          FROM operations_commerce_order_candidates candidate
@@ -7506,6 +7540,7 @@ async function verifyAcceptance(databaseUrl) {
     database_bounded: true,
     provider_clock_clamped: true,
     product_expiry_mismatches: 0,
+    product_candidate_count: 1,
     order_expiry_mismatches: 0,
     line_expiry_mismatches: 0,
     continuation_expiry_mismatches: 0,
