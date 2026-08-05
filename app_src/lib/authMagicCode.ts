@@ -47,6 +47,17 @@ type VerificationOutcome = VerificationRow & {
   organization_id?: string | null
 }
 
+type InvitationAcceptanceRow = {
+  id: string
+  workspace_organization_id: string
+  assigned_organization_ids: string[]
+}
+
+type InvitationMembershipRow = {
+  organization_id: string
+  status: 'invited' | 'active' | 'disabled'
+}
+
 function sessionSecret(): string {
   const secret = String(process.env.APP_SESSION_SECRET || '')
   if (secret.length < 32) throw new Error('APP_SESSION_SECRET must contain at least 32 characters')
@@ -200,18 +211,49 @@ export async function requestInvitationAuthMagicCode(input: {
       SELECT invitation.id::text
       FROM app_user_invitations invitation
       INNER JOIN app_users user_record ON user_record.email = invitation.email
+      CROSS JOIN LATERAL (
+        SELECT ARRAY(
+          SELECT grouped.organization_id
+          FROM (
+            SELECT
+              candidate.organization_id,
+              min(candidate.position) AS position
+            FROM (
+              SELECT
+                invitation.workspace_organization_id AS organization_id,
+                0::bigint AS position
+              UNION ALL
+              SELECT entry.organization_id, entry.position
+              FROM unnest(
+                COALESCE(
+                  invitation.workspace_organization_ids,
+                  ARRAY[]::uuid[]
+                )
+              ) WITH ORDINALITY AS entry(organization_id, position)
+            ) candidate
+            WHERE candidate.organization_id IS NOT NULL
+            GROUP BY candidate.organization_id
+          ) grouped
+          ORDER BY grouped.position
+        )::uuid[] AS organization_ids
+      ) assigned
       WHERE invitation.id = $1::uuid
         AND invitation.email = $2
         AND invitation.revoked_at IS NULL
         AND invitation.accepted_at IS NULL
         AND invitation.expires_at > now()
         AND user_record.status IN ('invited', 'active')
-        AND EXISTS (
+        AND invitation.workspace_organization_id IS NOT NULL
+        AND cardinality(assigned.organization_ids) > 0
+        AND NOT EXISTS (
           SELECT 1
-          FROM app_user_organization_memberships membership
-          WHERE membership.user_email = invitation.email
-            AND membership.organization_id = invitation.workspace_organization_id
-            AND membership.status = 'invited'
+          FROM unnest(assigned.organization_ids)
+            AS assigned_organization(organization_id)
+          LEFT JOIN app_user_organization_memberships membership
+            ON membership.user_email = invitation.email
+           AND membership.organization_id = assigned_organization.organization_id
+          WHERE membership.organization_id IS NULL
+             OR membership.status <> 'invited'
         )
       LIMIT 1
     `,
@@ -305,10 +347,101 @@ export async function verifyAuthMagicCode(
       const verified = result.rows[0]
       if (verified?.status !== 'verified') return verified
       if (verified.purpose === 'invitation') {
-        const invitation = await client.query<{
-          id: string
-          workspace_organization_id: string
-        }>(
+        const invitedUser = await client.query(
+          `
+            SELECT email
+            FROM app_users
+            WHERE email = $1
+              AND status IN ('invited', 'active')
+            FOR UPDATE
+          `,
+          [requestedEmail],
+        )
+        if (invitedUser.rowCount !== 1) throw new Error(AUTHORIZATION_CHANGED)
+        const invitation = await client.query<InvitationAcceptanceRow>(
+          `
+            SELECT
+              invitation.id::text,
+              invitation.workspace_organization_id::text,
+              assigned.organization_ids::uuid[] AS assigned_organization_ids
+            FROM app_user_invitations AS invitation
+            CROSS JOIN LATERAL (
+              SELECT ARRAY(
+                SELECT grouped.organization_id
+                FROM (
+                  SELECT
+                    candidate.organization_id,
+                    min(candidate.position) AS position
+                  FROM (
+                    SELECT
+                      invitation.workspace_organization_id AS organization_id,
+                      0::bigint AS position
+                    UNION ALL
+                    SELECT entry.organization_id, entry.position
+                    FROM unnest(
+                      COALESCE(
+                        invitation.workspace_organization_ids,
+                        ARRAY[]::uuid[]
+                      )
+                    ) WITH ORDINALITY AS entry(organization_id, position)
+                  ) candidate
+                  WHERE candidate.organization_id IS NOT NULL
+                  GROUP BY candidate.organization_id
+                ) grouped
+                ORDER BY grouped.position
+              )::uuid[] AS organization_ids
+            ) assigned
+            WHERE invitation.id = $1::uuid
+              AND invitation.email = $2
+              AND invitation.accepted_at IS NULL
+              AND invitation.revoked_at IS NULL
+              AND invitation.code_requested_at IS NOT NULL
+              AND invitation.expires_at > now()
+              AND invitation.workspace_organization_id IS NOT NULL
+              AND cardinality(assigned.organization_ids) > 0
+            FOR UPDATE OF invitation
+          `,
+          [verified.invitation_id, requestedEmail],
+        )
+        if (!invitation.rows[0]) throw new Error(AUTHORIZATION_CHANGED)
+        const inviteOrganizationIds = invitation.rows[0]
+          .assigned_organization_ids
+        const lockedMemberships = await client.query<InvitationMembershipRow>(
+          `
+            SELECT organization_id::text, status
+            FROM app_user_organization_memberships
+            WHERE user_email = $1
+              AND organization_id = ANY($2::uuid[])
+            ORDER BY array_position($2::uuid[], organization_id)
+            FOR UPDATE
+          `,
+          [requestedEmail, inviteOrganizationIds],
+        )
+        if (
+          lockedMemberships.rowCount !== inviteOrganizationIds.length
+          || lockedMemberships.rows.some((membership, index) => (
+            membership.organization_id !== inviteOrganizationIds[index]
+            || membership.status !== 'invited'
+          ))
+        ) {
+          throw new Error(AUTHORIZATION_CHANGED)
+        }
+        const activatedMembership = await client.query(
+          `UPDATE app_user_organization_memberships
+           SET status = 'active', updated_at = now()
+           WHERE user_email = $1
+             AND organization_id = ANY($2::uuid[])
+             AND status = 'invited'
+           RETURNING organization_id::text`,
+          [
+            requestedEmail,
+            inviteOrganizationIds,
+          ],
+        )
+        if (activatedMembership.rowCount !== inviteOrganizationIds.length) {
+          throw new Error(AUTHORIZATION_CHANGED)
+        }
+        const accepted = await client.query(
           `
             UPDATE app_user_invitations
             SET accepted_at = now(), updated_at = now()
@@ -318,28 +451,11 @@ export async function verifyAuthMagicCode(
               AND revoked_at IS NULL
               AND code_requested_at IS NOT NULL
               AND expires_at > now()
-              AND EXISTS (
-                SELECT 1
-                FROM app_user_organization_memberships membership
-                WHERE membership.user_email = $2
-                  AND membership.organization_id = app_user_invitations.workspace_organization_id
-                  AND membership.status = 'invited'
-              )
-            RETURNING id::text, workspace_organization_id::text
+            RETURNING id
           `,
           [verified.invitation_id, requestedEmail],
         )
-        if (!invitation.rows[0]) throw new Error(AUTHORIZATION_CHANGED)
-        const activatedMembership = await client.query(
-          `UPDATE app_user_organization_memberships
-           SET status = 'active', updated_at = now()
-           WHERE user_email = $1
-             AND organization_id = $2::uuid
-             AND status = 'invited'
-           RETURNING organization_id`,
-          [requestedEmail, invitation.rows[0].workspace_organization_id],
-        )
-        if (!activatedMembership.rows[0]) throw new Error(AUTHORIZATION_CHANGED)
+        if (accepted.rowCount !== 1) throw new Error(AUTHORIZATION_CHANGED)
         const activated = await client.query(
           `
             UPDATE app_users

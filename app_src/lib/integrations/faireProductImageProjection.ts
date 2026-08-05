@@ -28,6 +28,7 @@ import {
   readFaireProductImageReconciliationContextInPostgres,
   recoverExpiredFaireProductImageClaimInPostgres,
   recordFaireProductImageProviderStepInPostgres,
+  resolveFaireProductImageAppliedReconciliationInPostgres,
   resolveFaireProductImageSelectionInPostgres,
   type FaireProductImageProjectionGrant,
 } from '@/lib/persistence/faireProductImageProjection'
@@ -106,6 +107,8 @@ export type FaireProductImageReconciliationDependencies = {
   recoverExpiredClaim: typeof recoverExpiredFaireProductImageClaimInPostgres
   readProviderImages: typeof readCurrentCommerceProviderImageSources
   recordProviderStep: typeof recordFaireProductImageProviderStepInPostgres
+  resolveApplied:
+    typeof resolveFaireProductImageAppliedReconciliationInPostgres
 }
 
 const DEFAULT_DEPENDENCIES: FaireProductImageProjectionDependencies = {
@@ -128,6 +131,7 @@ FaireProductImageReconciliationDependencies = {
   recoverExpiredClaim: recoverExpiredFaireProductImageClaimInPostgres,
   readProviderImages: readCurrentCommerceProviderImageSources,
   recordProviderStep: recordFaireProductImageProviderStepInPostgres,
+  resolveApplied: resolveFaireProductImageAppliedReconciliationInPostgres,
 }
 
 export class FaireProductImageProjectionError extends Error {
@@ -165,6 +169,17 @@ function safeCode(error: unknown, fallback: string) {
   return /^[A-Z][A-Z0-9_]{1,127}$/.test(candidate)
     ? candidate
     : fallback
+}
+
+function providerImageSetFingerprint(
+  sources: Awaited<ReturnType<typeof readCurrentCommerceProviderImageSources>>,
+) {
+  return createHash('sha256').update(JSON.stringify(
+    sources.map((source) => ({
+      locatorSha256: source.locatorSha256,
+      sequence: source.sequence,
+    })),
+  )).digest('hex')
 }
 
 function stringValue(value: unknown, label: string, maximum = 512) {
@@ -536,9 +551,10 @@ function recoveredClaimResult(
       attachmentAccepted: context.providerWriteCount >= 2,
     },
     images: {
-      existingPreserved: true,
-      priorCount: null,
-      projectedCount: null,
+      existingPreserved:
+        context.reconciliationEligibility === 'readback_terminalizable',
+      priorCount: context.priorImageCount,
+      projectedCount: context.projectedImageCount,
       uploadedLocatorSha256: context.uploadedLocatorSha256,
     },
     externalEffect: {
@@ -867,10 +883,13 @@ export async function executeFaireProductImagePublish(
         operation: 'productImageAttach',
         outcome: 'succeeded',
         externalProductId: grant.externalProductId,
+        assetContentSha256: grant.assetContentSha256,
         uploadedLocatorSha256,
         priorImageCount: providerImages.length,
         projectedImageCount: projectedImages.length,
         existingImagesPreserved: true,
+        providerWritesKnown: true,
+        providerWriteCountLowerBound: 2,
         providerWrites: 2,
       },
       actorEmail: input.actorEmail,
@@ -891,8 +910,15 @@ export async function executeFaireProductImagePublish(
           operation: 'productImageAttach',
           outcome: 'unknown',
           errorCode: safeCode(error, 'FAIRE_PRODUCT_IMAGE_ATTACH_OUTCOME_UNKNOWN'),
+          externalProductId: grant.externalProductId,
+          assetContentSha256: grant.assetContentSha256,
           uploadedLocatorSha256,
+          priorImageCount: providerImages.length,
+          projectedImageCount: projectedImages.length,
+          existingImagesPreserved: true,
           knownProviderWrites: 1,
+          providerWritesKnown: false,
+          providerWriteCountLowerBound: 1,
           providerWrites: 1,
         },
         actorEmail: input.actorEmail,
@@ -967,6 +993,20 @@ export async function reconcileFaireProductImagePublish(
       actorEmail: reconciledBy,
     })
   }
+  if (
+    context.effectState === 'succeeded'
+    && context.reconciliationApplied
+  ) {
+    return {
+      externalEffectGlobalId,
+      outcome: 'observed_applied' as const,
+      confirmedApplied: true,
+      providerImageCount: context.reconciledProviderImageCount,
+      exactLocatorMatchCount: 1,
+      terminalized: true,
+      replayed: true,
+    }
+  }
   if (!['unknown', 'failed'].includes(context.effectState)) {
     fail(
       'FAIRE_PRODUCT_IMAGE_RECONCILIATION_NOT_REQUIRED',
@@ -974,6 +1014,41 @@ export async function reconcileFaireProductImagePublish(
         ? 'Faire Product-image publication is still inside its claim lease'
         : 'Only an uncertain or failed Faire Product-image publication can be reconciled',
     )
+  }
+  if (
+    context.effectState === 'unknown'
+    && context.reconciliationEligibility !== 'readback_terminalizable'
+  ) {
+    const evidence = {
+      provider: 'faire',
+      operation: 'productImagePublishReconciliation',
+      outcome: 'manual_review',
+      reason: context.reconciliationReason,
+      externalProductId: context.externalProductId,
+      uploadedLocatorSha256: context.uploadedLocatorSha256,
+      providerWrites: context.providerWriteCount,
+      reconciledBy,
+    }
+    await dependencies.recordProviderStep({
+      organizationId,
+      deliveryGrantId: context.deliveryGrantId,
+      externalEffectId: context.externalEffectId,
+      providerAttemptId: null,
+      stage: 'reconcile',
+      outcome: 'manual_review',
+      uploadedLocatorSha256: context.uploadedLocatorSha256,
+      providerWriteCount: context.providerWriteCount,
+      redactedEvidence: evidence,
+      actorEmail: reconciledBy,
+    })
+    return {
+      externalEffectGlobalId,
+      outcome: 'manual_review' as const,
+      confirmedApplied: false,
+      reason: context.reconciliationReason,
+      terminalized: false,
+      replayed: false,
+    }
   }
   if (!context.uploadedLocatorSha256) {
     const evidence = {
@@ -1050,8 +1125,42 @@ export async function reconcileFaireProductImagePublish(
   const matches = sources.filter(
     (source) => source.locatorSha256 === context.uploadedLocatorSha256,
   )
-  const confirmedApplied = matches.length === 1
-  const outcome = confirmedApplied ? 'observed_applied' : 'observed_absent'
+  const providerImageSetSha256 = providerImageSetFingerprint(sources)
+  if (matches.length === 1 && context.effectState === 'unknown') {
+    const resolution = await dependencies.resolveApplied({
+      organizationId,
+      productId,
+      externalEffectGlobalId,
+      expectedDeliveryGrantId: context.deliveryGrantId,
+      expectedExternalEffectId: context.externalEffectId,
+      expectedAccountGlobalId: context.accountGlobalId,
+      expectedCredentialGeneration: context.credentialGeneration,
+      expectedExternalProductId: context.externalProductId,
+      expectedAssetContentSha256: context.assetContentSha256,
+      expectedUploadedLocatorSha256: context.uploadedLocatorSha256,
+      providerImageCount: sources.length,
+      exactLocatorMatchCount: matches.length,
+      providerImageSetSha256,
+      actorEmail: reconciledBy,
+    })
+    return {
+      externalEffectGlobalId,
+      outcome: 'observed_applied' as const,
+      confirmedApplied: true,
+      providerImageCount: resolution.providerImageCount,
+      exactLocatorMatchCount: resolution.exactLocatorMatchCount,
+      terminalized: resolution.effectState === 'succeeded',
+      replayed: resolution.replayed,
+    }
+  }
+  const outcome = matches.length === 0
+    ? 'observed_absent'
+    : 'manual_review'
+  const reason = matches.length > 1
+    ? 'ambiguous_exact_locator_matches'
+    : context.effectState === 'failed'
+      ? 'effect_state_conflicts_with_readback'
+      : null
   await dependencies.recordProviderStep({
     organizationId,
     deliveryGrantId: context.deliveryGrantId,
@@ -1066,10 +1175,13 @@ export async function reconcileFaireProductImagePublish(
       operation: 'productImagePublishReconciliation',
       outcome,
       externalProductId: context.externalProductId,
+      assetContentSha256: context.assetContentSha256,
       uploadedLocatorSha256: context.uploadedLocatorSha256,
       providerImageCount: sources.length,
       exactLocatorMatchCount: matches.length,
+      providerImageSetSha256,
       providerWrites: context.providerWriteCount,
+      ...(reason ? { reason } : {}),
       reconciledBy,
     },
     actorEmail: reconciledBy,
@@ -1077,8 +1189,11 @@ export async function reconcileFaireProductImagePublish(
   return {
     externalEffectGlobalId,
     outcome,
-    confirmedApplied,
+    confirmedApplied: false,
     providerImageCount: sources.length,
     exactLocatorMatchCount: matches.length,
+    ...(reason ? { reason } : {}),
+    terminalized: false,
+    replayed: false,
   }
 }

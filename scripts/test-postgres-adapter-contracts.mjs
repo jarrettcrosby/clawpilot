@@ -440,9 +440,22 @@ assertIncludes(magicCodeAdapter, "user.status !== 'active'", 'ordinary sign-in a
 assertIncludes(magicCodeAdapter, 'requestInvitationAuthMagicCode', 'invitation-purpose sign-in')
 assertIncludes(magicCodeAdapter, 'UPDATE app_user_invitations', 'atomic invitation acceptance')
 assertIncludes(magicCodeAdapter, 'AUTHORIZATION_CHANGED', 'invitation authorization rollback')
-assertIncludes(magicCodeAdapter, 'membership.organization_id = invitation.workspace_organization_id', 'invitation organization acceptance boundary')
+assertIncludes(magicCodeAdapter, 'cardinality(assigned.organization_ids) > 0', 'canonical invitation organization set')
+assertIncludes(magicCodeAdapter, "membership.status <> 'invited'", 'exact invitation membership authorization boundary')
+assertIncludes(magicCodeAdapter, 'invitedUser.rowCount !== 1', 'invited user acceptance lock')
+assertIncludes(magicCodeAdapter, 'FOR UPDATE OF invitation', 'invitation acceptance lock')
+assertIncludes(magicCodeAdapter, 'lockedMemberships.rowCount !== inviteOrganizationIds.length', 'all invitation memberships must remain invited')
 assertIncludes(magicCodeAdapter, 'UPDATE app_user_organization_memberships', 'invitation membership activation')
-assertIncludes(magicCodeAdapter, 'AND organization_id = $2::uuid', 'invitation-specific membership activation')
+assertIncludes(magicCodeAdapter, 'AND organization_id = ANY($2::uuid[])', 'multi-organization invitation membership activation')
+assertIncludes(magicCodeAdapter, 'activatedMembership.rowCount !== inviteOrganizationIds.length', 'exact invitation membership activation count')
+const invitationMembershipActivation = magicCodeAdapter.slice(
+  magicCodeAdapter.indexOf('const activatedMembership'),
+  magicCodeAdapter.indexOf('const activated ='),
+)
+assert.ok(
+  !invitationMembershipActivation.includes('ANY($3::uuid[])'),
+  'multi-organization invitation acceptance must not be restricted to the primary organization',
+)
 
 const documentsAdapter = read('app_src/lib/documents.ts')
 assertIncludes(documentsAdapter, 'WHERE owner_email = $1', 'user-scoped document reads')
@@ -1036,8 +1049,9 @@ assertIncludes(crmBoardProjection, 'DELETE FROM crm_board_cards', 'stale CRM pro
 
 const organizationsAdapter = read('app_src/lib/organizations.ts')
 assertIncludes(organizationsAdapter, 'resolveInvitationWorkspaceOrganization', 'invitation membership resolver')
-assertIncludes(organizationsAdapter, 'outside your managed account graph', 'invitation organization subtree boundary')
-assertIncludes(organizationsAdapter, 'WHERE organization.id = $1::uuid', 'organization hierarchy scoped root')
+assertIncludes(organizationsAdapter, 'outside the workspaces you can manage', 'invitation organization membership boundary')
+assertIncludes(organizationsAdapter, 'invitation_organizations', 'cross-workspace invitation organization catalog')
+assertIncludes(organizationsAdapter, "membership.permissions ->> 'inviteUsers'", 'cross-workspace invitation permission boundary')
 assertIncludes(organizationsAdapter, 'defines your admin scope', 'organization reparenting scope boundary')
 assertIncludes(organizationsAdapter, "relationship_type = 'workspace_member'", 'CRM customer account promotion')
 assertIncludes(organizationsAdapter, 'retireUnusedWorkspaceOrganization', 'failed child organization cleanup')
@@ -2025,6 +2039,17 @@ assertIncludes(
   'export async function readCommerceProductImageImportQueueHealthInPostgres',
   'commerce product image import persistence health API',
 )
+for (const fragment of [
+  'lastTerminalProgressAt: string | null',
+  'AS last_terminal_progress_at',
+  'lastTerminalProgressAt: row.last_terminal_progress_at',
+]) {
+  assertIncludes(
+    commerceProductImageImportPersistence,
+    fragment,
+    'commerce product image import progress health evidence',
+  )
+}
 assertIncludes(
   healthRoute,
   'readCommerceProductImageImportQueueHealthInPostgres',
@@ -2056,14 +2081,19 @@ for (const fragment of [
   'await readCommerceProductImageImportQueueHealthInPostgres()',
   'historicalDead: imageQueue.historicalDeadCount',
   'if (!loopReachable)',
+  'classifyCommerceProductImageImportOperationalHealth({',
+  'activelyDraining,',
+  'stalledOverdue,',
+  'lastTerminalProgressAt: imageQueue.lastTerminalProgressAt',
+  'progressAgeMs: imageProgressAgeMs',
   "errors.push(\n                'Commerce product image import worker heartbeat is missing or stale.'",
   'if (imageQueue.deadCount > 0)',
   'if (imageQueue.staleLeaseCount > 0)',
-  'if (imageQueue.overdueCount > 0)',
+  'if (stalledOverdue)',
   'if (imageQueue.retryCount > 0)',
   "warnings.push(\n                'Commerce product image import queue has terminal failed jobs.'",
   "warnings.push(\n                'Commerce product image import queue has stale claimed jobs.'",
-  "warnings.push(\n                'Commerce product image import queue has overdue jobs.'",
+  "warnings.push(\n                'Commerce product image import queue has overdue jobs and is not making recent progress.'",
   "warnings.push(\n                'Commerce product image import jobs are retrying.'",
 ]) {
   assertIncludes(
@@ -2078,6 +2108,13 @@ assert.equal(
   ),
   false,
   'Historical commerce product image failures must not degrade current health',
+)
+assert.equal(
+  commerceProductImageWorkerHealth.includes(
+    '|| imageQueue.overdueCount > 0',
+  ),
+  false,
+  'An actively draining overdue image backlog must not degrade health solely because it is overdue',
 )
 assert.ok(
   (

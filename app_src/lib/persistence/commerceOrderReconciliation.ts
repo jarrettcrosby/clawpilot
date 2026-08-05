@@ -2,6 +2,15 @@ import { createHash, randomUUID } from 'node:crypto'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { CommerceIntegrationRequestError } from '@/lib/integrations/commerceIntegrations'
 import {
+  AUTOMATIC_FAIRE_EXACT_REFRESH_ATTENTION_MARKER,
+  AUTOMATIC_FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_MARKER,
+  AUTOMATIC_FAIRE_MIXED_ATTENTION_MARKER,
+  AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER,
+} from '@/lib/integrations/commerceFaireAutomaticPromotion'
+import {
+  SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER,
+} from '@/lib/integrations/commerceShopifyAutomaticPromotion'
+import {
   acquireTransactionAdvisoryLock,
   query,
   withTransaction,
@@ -11,7 +20,15 @@ const ORDER_RECONCILIATION_INTERVAL = '30 minutes'
 const ORDER_RECONCILIATION_LEASE = '10 minutes'
 const WORKER_HEARTBEAT_KEY = 'commerce_order_reconciliation_worker_heartbeat'
 export const FAIRE_AUTO_PROMOTION_ATTENTION_CODE =
-  'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED'
+  AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER
+export const FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_CODE =
+  AUTOMATIC_FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_MARKER
+export const FAIRE_EXACT_REFRESH_ATTENTION_CODE =
+  AUTOMATIC_FAIRE_EXACT_REFRESH_ATTENTION_MARKER
+export const FAIRE_MIXED_ATTENTION_CODE =
+  AUTOMATIC_FAIRE_MIXED_ATTENTION_MARKER
+export const SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE =
+  SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER
 
 const ORDER_RECONCILIATION_TERMINAL_FAILURE_CODES = [
   'COMMERCE_ORDER_RECONCILIATION_SESSION_RECORD_BUDGET_EXCEEDED',
@@ -182,7 +199,11 @@ export async function readCommerceOrderReconciliationHealthFromPostgres() {
     running: string
     failed: string
     stale_processing: string
-    promotion_attention_required: string
+    shopify_promotion_attention_required: string
+    faire_promotion_attention_required: string
+    faire_exact_refresh_attention_required: string
+    faire_unattributed_attention_required: string
+    operator_attention_required: string
     overdue: string
     resumable: string
     last_success_at: Date | string | null
@@ -209,6 +230,9 @@ export async function readCommerceOrderReconciliationHealthFromPostgres() {
      state AS (
        SELECT eligible.*, cursor.reconciliation_status,
               cursor.last_error_code,
+              cursor.automatic_promotion_attention_required,
+              cursor.automatic_exact_refresh_attention_required,
+              cursor.automatic_unattributed_attention_required,
               cursor.last_started_at, cursor.last_completed_at
        FROM eligible
        LEFT JOIN operations_commerce_sync_cursors cursor
@@ -224,8 +248,26 @@ export async function readCommerceOrderReconciliationHealthFromPostgres() {
        count(*) FILTER (WHERE reconciliation_status = 'running')::text AS running,
        count(*) FILTER (WHERE reconciliation_status = 'failed')::text AS failed,
        count(*) FILTER (
-         WHERE last_error_code = '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}'
-       )::text AS promotion_attention_required,
+         WHERE provider = 'shopify'
+           AND automatic_promotion_attention_required
+       )::text AS shopify_promotion_attention_required,
+       count(*) FILTER (
+         WHERE provider = 'faire'
+           AND automatic_promotion_attention_required
+       )::text AS faire_promotion_attention_required,
+       count(*) FILTER (
+         WHERE provider = 'faire'
+           AND automatic_exact_refresh_attention_required
+       )::text AS faire_exact_refresh_attention_required,
+       count(*) FILTER (
+         WHERE provider = 'faire'
+           AND automatic_unattributed_attention_required
+       )::text AS faire_unattributed_attention_required,
+       count(*) FILTER (
+         WHERE automatic_promotion_attention_required
+            OR automatic_exact_refresh_attention_required
+            OR automatic_unattributed_attention_required
+       )::text AS operator_attention_required,
        count(*) FILTER (
          WHERE reconciliation_status = 'running'
            AND last_started_at < now() - interval '${ORDER_RECONCILIATION_LEASE}'
@@ -256,8 +298,22 @@ export async function readCommerceOrderReconciliationHealthFromPostgres() {
     neverRun: Number(row?.never_run || 0),
     running: Number(row?.running || 0),
     failed: Number(row?.failed || 0),
-    promotionAttentionRequired: Number(
-      row?.promotion_attention_required || 0,
+    promotionAttentionRequired: (
+      Number(row?.shopify_promotion_attention_required || 0)
+      + Number(row?.faire_promotion_attention_required || 0)
+    ),
+    providerPromotionAttentionRequired: {
+      shopify: Number(row?.shopify_promotion_attention_required || 0),
+      faire: Number(row?.faire_promotion_attention_required || 0),
+    },
+    faireExactRefreshAttentionRequired: Number(
+      row?.faire_exact_refresh_attention_required || 0,
+    ),
+    faireUnattributedAttentionRequired: Number(
+      row?.faire_unattributed_attention_required || 0,
+    ),
+    operatorAttentionRequired: Number(
+      row?.operator_attention_required || 0,
     ),
     staleProcessing: Number(row?.stale_processing || 0),
     overdue: Number(row?.overdue || 0),
@@ -469,6 +525,23 @@ export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
            LIMIT 1
          ),
          last_error_code = CASE
+           WHEN (
+             SELECT candidate.continuation_run_global_id
+             FROM candidates candidate
+             WHERE candidate.organization_id
+                   = operations_commerce_sync_cursors.organization_id
+               AND candidate.integration_account_id
+                   = operations_commerce_sync_cursors.integration_account_id
+             LIMIT 1
+           ) IS NULL
+             AND operations_commerce_sync_cursors.last_error_code IN (
+               '${SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE}',
+               '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}',
+               '${FAIRE_EXACT_REFRESH_ATTENTION_CODE}',
+               '${FAIRE_MIXED_ATTENTION_CODE}',
+               '${FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_CODE}'
+             )
+             THEN operations_commerce_sync_cursors.last_error_code
            WHEN (
              SELECT candidate.continuation_run_global_id
              FROM candidates candidate
@@ -707,10 +780,24 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
   customersSkipped: unknown
   customerResolutionFailed: unknown
   customerResolutionFailureCodes: Record<string, number>
+  shopifyOrdersPromoted: unknown
+  shopifyOrdersHeld: unknown
+  shopifyPromotionActionableHeld: unknown
+  shopifyPromotionHeldReasons: Record<string, number>
+  shopifyPromotionFailed: unknown
+  shopifyPromotionFailureCodes: Record<string, number>
+  shopifyPromotionRollbackFenced: unknown
   faireOrdersPromoted: unknown
   faireOrdersHeld: unknown
   fairePromotionFailed: unknown
   fairePromotionFailureCodes: Record<string, number>
+  fairePromotionOperatorReviewRequired: unknown
+  faireExactRefreshAttempted: unknown
+  faireExactRefreshSucceeded: unknown
+  faireExactRefreshRejected: unknown
+  faireExactRefreshFailed: unknown
+  faireExactRefreshOperatorReviewRequired: unknown
+  faireExactRefreshFailureCodes: Record<string, number>
 }) {
   return withTransaction(async (client) => {
     const providerRecordsSeen = boundedCount(input.providerRecordsSeen)
@@ -724,9 +811,41 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
     const customerResolutionFailed = boundedCount(
       input.customerResolutionFailed,
     )
+    const shopifyOrdersPromoted = boundedCount(input.shopifyOrdersPromoted)
+    const shopifyOrdersHeld = boundedCount(input.shopifyOrdersHeld)
+    const shopifyPromotionActionableHeld = boundedCount(
+      input.shopifyPromotionActionableHeld,
+    )
+    const shopifyPromotionFailed = boundedCount(
+      input.shopifyPromotionFailed,
+    )
+    const shopifyPromotionRollbackFenced = boundedCount(
+      input.shopifyPromotionRollbackFenced,
+    )
+    const shopifyPromotionAttentionRequired = boundedCount(
+      shopifyPromotionActionableHeld + shopifyPromotionFailed,
+    )
     const faireOrdersPromoted = boundedCount(input.faireOrdersPromoted)
     const faireOrdersHeld = boundedCount(input.faireOrdersHeld)
     const fairePromotionFailed = boundedCount(input.fairePromotionFailed)
+    const fairePromotionOperatorReviewRequired = boundedCount(
+      input.fairePromotionOperatorReviewRequired,
+    )
+    const faireExactRefreshAttempted = boundedCount(
+      input.faireExactRefreshAttempted,
+    )
+    const faireExactRefreshSucceeded = boundedCount(
+      input.faireExactRefreshSucceeded,
+    )
+    const faireExactRefreshRejected = boundedCount(
+      input.faireExactRefreshRejected,
+    )
+    const faireExactRefreshFailed = boundedCount(
+      input.faireExactRefreshFailed,
+    )
+    const faireExactRefreshOperatorReviewRequired = boundedCount(
+      input.faireExactRefreshOperatorReviewRequired,
+    )
     const customerResolutionFailureCodes = Object.fromEntries(
       Object.entries(input.customerResolutionFailureCodes)
         .filter(([code]) => /^[A-Z][A-Z0-9_]{2,127}$/u.test(code))
@@ -737,8 +856,174 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
         .filter(([code]) => /^[A-Z][A-Z0-9_]{2,127}$/u.test(code))
         .map(([code, value]) => [code, boundedCount(value)]),
     )
-    const completed = await client.query(
-      `UPDATE operations_commerce_sync_cursors
+    const shopifyPromotionHeldReasons = Object.fromEntries(
+      Object.entries(input.shopifyPromotionHeldReasons || {})
+        .filter(([reason]) => /^[a-z][a-z0-9_]{2,127}$/u.test(reason))
+        .map(([reason, value]) => [reason, boundedCount(value)]),
+    )
+    const shopifyPromotionFailureCodes = Object.fromEntries(
+      Object.entries(input.shopifyPromotionFailureCodes || {})
+        .filter(([code]) => /^[A-Z][A-Z0-9_]{2,127}$/u.test(code))
+        .map(([code, value]) => [code, boundedCount(value)]),
+    )
+    const faireExactRefreshFailureCodes = Object.fromEntries(
+      Object.entries(input.faireExactRefreshFailureCodes || {})
+        .filter(([code]) => /^[A-Z][A-Z0-9_]{2,127}$/u.test(code))
+        .map(([code, value]) => [code, boundedCount(value)]),
+    )
+    const completed = await client.query<{
+      last_error_code: string | null
+      automatic_promotion_attention_required: boolean
+      automatic_exact_refresh_attention_required: boolean
+      automatic_unattributed_attention_required: boolean
+    }>(
+      `WITH unresolved_shopify_promotion AS (
+         SELECT EXISTS (
+           SELECT 1
+           FROM operations_commerce_order_candidates candidate
+           JOIN operations_commerce_intake_runs run
+             ON run.organization_id = candidate.organization_id
+            AND run.integration_account_id
+                = candidate.integration_account_id
+            AND run.id = candidate.run_id
+           WHERE candidate.organization_id = $1::uuid
+             AND candidate.integration_account_id = $2::uuid
+             AND candidate.provider = 'shopify'
+             AND candidate.workflow_state IN ('held', 'resolving', 'ready')
+             AND candidate.expires_at > now()
+             AND candidate.last_error_code =
+                 '${SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER}'
+             AND run.provider = 'shopify'
+             AND run.resource = 'products_and_orders'
+             AND run.created_by = 'system:commerce-order-reconciliation'
+             AND run.workflow_state <> 'expired'
+             AND run.expires_at > now()
+             AND NOT EXISTS (
+               SELECT 1
+               FROM operations_orders canonical
+               WHERE canonical.organization_id = candidate.organization_id
+                 AND canonical.integration_account_id
+                     = candidate.integration_account_id
+                 AND canonical.external_order_id
+                     = candidate.external_order_id
+             )
+         ) AS attention_required
+       ), unresolved_faire_attention AS (
+         SELECT
+           COALESCE(bool_or(candidate.last_error_code IN (
+             '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}',
+             '${FAIRE_MIXED_ATTENTION_CODE}'
+           )), false) AS promotion_attention_required,
+           COALESCE(bool_or(candidate.last_error_code IN (
+             '${FAIRE_EXACT_REFRESH_ATTENTION_CODE}',
+             '${FAIRE_MIXED_ATTENTION_CODE}'
+           )), false) AS exact_refresh_attention_required,
+           COALESCE(bool_or(candidate.last_error_code =
+             '${FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_CODE}'
+           ), false) AS unattributed_attention_required
+           FROM operations_commerce_order_candidates candidate
+           JOIN operations_commerce_intake_runs run
+             ON run.organization_id = candidate.organization_id
+            AND run.integration_account_id
+                = candidate.integration_account_id
+            AND run.id = candidate.run_id
+           WHERE candidate.organization_id = $1::uuid
+             AND candidate.integration_account_id = $2::uuid
+             AND candidate.provider = 'faire'
+             AND candidate.workflow_state IN ('held', 'resolving', 'ready')
+             AND candidate.customer_resolution_state <> 'unsupported'
+             AND candidate.expires_at > now()
+             AND candidate.last_error_code IN (
+               '${AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER}',
+               '${AUTOMATIC_FAIRE_EXACT_REFRESH_ATTENTION_MARKER}',
+               '${AUTOMATIC_FAIRE_MIXED_ATTENTION_MARKER}',
+               '${AUTOMATIC_FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_MARKER}'
+             )
+             AND candidate.created_by
+                 = 'system:commerce-order-reconciliation'
+             AND run.provider = 'faire'
+             AND run.resource = 'products_and_orders'
+             AND run.created_by = 'system:commerce-order-reconciliation'
+             AND run.workflow_state <> 'expired'
+             AND run.expires_at > now()
+             AND NOT EXISTS (
+               SELECT 1
+               FROM operations_orders canonical
+               WHERE canonical.organization_id = candidate.organization_id
+                 AND canonical.integration_account_id
+                     = candidate.integration_account_id
+                 AND canonical.external_order_id
+                     = candidate.external_order_id
+             )
+             AND NOT EXISTS (
+               SELECT 1
+               FROM operations_external_identifiers external
+               WHERE external.organization_id = candidate.organization_id
+                 AND external.integration_account_id
+                     = candidate.integration_account_id
+                 AND external.entity_type = 'operations.order'
+                 AND external.status = 'active'
+                 AND external.external_id = candidate.external_order_id
+             )
+             AND NOT EXISTS (
+               SELECT 1
+               FROM operations_commerce_order_candidates newer
+               WHERE newer.organization_id = candidate.organization_id
+                 AND newer.integration_account_id
+                     = candidate.integration_account_id
+                 AND newer.external_order_id = candidate.external_order_id
+                 AND newer.id <> candidate.id
+                 AND (
+                   newer.observed_at > candidate.observed_at
+                   OR (
+                     newer.observed_at = candidate.observed_at
+                     AND newer.created_at > candidate.created_at
+                   )
+                   OR (
+                     newer.observed_at = candidate.observed_at
+                     AND newer.created_at = candidate.created_at
+                     AND newer.id > candidate.id
+                   )
+                 )
+             )
+             AND NOT EXISTS (
+               SELECT 1
+               FROM operations_commerce_order_candidates history
+               WHERE history.organization_id = candidate.organization_id
+                 AND history.integration_account_id
+                     = candidate.integration_account_id
+                 AND history.external_order_id = candidate.external_order_id
+                 AND (
+                   history.created_by
+                       <> 'system:commerce-order-reconciliation'
+                   OR history.updated_by
+                       <> 'system:commerce-order-reconciliation'
+                   OR EXISTS (
+                     SELECT 1
+                     FROM operations_commerce_resolution_decisions decision
+                     WHERE decision.organization_id = history.organization_id
+                       AND decision.target_global_id = history.global_id
+                       AND decision.actor_email
+                           <> 'system:commerce-order-reconciliation'
+                   )
+                   OR EXISTS (
+                     SELECT 1
+                     FROM operations_commerce_intake_read_intents human_intent
+                     WHERE human_intent.organization_id
+                         = history.organization_id
+                       AND human_intent.integration_account_id
+                           = history.integration_account_id
+                       AND human_intent.provider = 'faire'
+                       AND human_intent.resource = 'orders'
+                       AND human_intent.target_kind = 'candidate'
+                       AND human_intent.target_global_id = history.global_id
+                       AND human_intent.created_by
+                           <> 'system:commerce-order-reconciliation'
+                   )
+                 )
+             )
+       )
+       UPDATE operations_commerce_sync_cursors
        SET reconciliation_status = 'succeeded',
            records_applied = records_applied + $5::bigint,
            consecutive_failures = CASE
@@ -746,13 +1031,91 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
              ELSE 0
            END,
            last_error_code = CASE
-             WHEN $6::bigint > 0
+             WHEN $9 = 'shopify'
+               AND (
+                 $6::bigint > 0
+                 OR (
+                   SELECT attention_required
+                   FROM unresolved_shopify_promotion
+                 )
+               )
+               THEN '${SHOPIFY_AUTO_PROMOTION_ATTENTION_CODE}'
+             WHEN $9 = 'faire'
+               AND (
+                 $7::bigint > 0
+                 OR (
+                   SELECT promotion_attention_required
+                   FROM unresolved_faire_attention
+                 )
+               )
+               AND (
+                 $8::bigint > 0
+                 OR (
+                   SELECT exact_refresh_attention_required
+                   FROM unresolved_faire_attention
+                 )
+               )
+               THEN '${FAIRE_MIXED_ATTENTION_CODE}'
+             WHEN $9 = 'faire'
+               AND (
+                 $7::bigint > 0
+                 OR (
+                   SELECT promotion_attention_required
+                   FROM unresolved_faire_attention
+                 )
+               )
                THEN '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}'
-             WHEN $7::boolean
-               AND last_error_code = '${FAIRE_AUTO_PROMOTION_ATTENTION_CODE}'
-               THEN last_error_code
+             WHEN $9 = 'faire'
+               AND (
+                 $8::bigint > 0
+                 OR (
+                   SELECT exact_refresh_attention_required
+                   FROM unresolved_faire_attention
+                 )
+               )
+               THEN '${FAIRE_EXACT_REFRESH_ATTENTION_CODE}'
+             WHEN $9 = 'faire'
+               AND (
+                 SELECT unattributed_attention_required
+                 FROM unresolved_faire_attention
+               )
+               THEN '${FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_CODE}'
              ELSE NULL
            END,
+           automatic_promotion_attention_required = CASE
+             WHEN $9 = 'shopify' THEN (
+               $6::bigint > 0
+               OR (
+                 SELECT attention_required
+                 FROM unresolved_shopify_promotion
+               )
+             )
+             WHEN $9 = 'faire' THEN (
+               $7::bigint > 0
+               OR (
+                 SELECT promotion_attention_required
+                 FROM unresolved_faire_attention
+               )
+             )
+             ELSE false
+           END,
+           automatic_exact_refresh_attention_required = (
+             $9 = 'faire'
+             AND (
+               $8::bigint > 0
+               OR (
+                 SELECT exact_refresh_attention_required
+                 FROM unresolved_faire_attention
+               )
+             )
+           ),
+           automatic_unattributed_attention_required = (
+             $9 = 'faire'
+             AND (
+               SELECT unattributed_attention_required
+               FROM unresolved_faire_attention
+             )
+           ),
            last_completed_at = now(),
            updated_at = now()
        WHERE organization_id = $1::uuid
@@ -760,18 +1123,31 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
          AND resource = 'orders'
          AND reconciliation_status = 'running'
          AND last_started_at = $3::timestamptz
-       RETURNING organization_id::text`,
+       RETURNING last_error_code,
+                 automatic_promotion_attention_required,
+                 automatic_exact_refresh_attention_required,
+                 automatic_unattributed_attention_required`,
       [
         input.target.organizationId,
         input.target.integrationAccountId,
         input.target.startedAt,
         input.hasNextBatch,
-        faireOrdersPromoted,
-        fairePromotionFailed,
-        Boolean(input.target.continuationRunGlobalId),
+        shopifyOrdersPromoted + faireOrdersPromoted,
+        shopifyPromotionAttentionRequired,
+        fairePromotionOperatorReviewRequired,
+        faireExactRefreshOperatorReviewRequired,
+        input.target.provider,
       ],
     )
-    if (completed.rowCount !== 1) return { leaseLost: true as const }
+    if (completed.rowCount !== 1) {
+      return {
+        leaseLost: true as const,
+        shopifyAutomaticPromotionAttentionRequired: false,
+        faireAutomaticPromotionAttentionRequired: false,
+        faireExactRefreshAttentionRequired: false,
+        faireUnattributedAttentionRequired: false,
+      }
+    }
     await recordAuditEvent({
       actor: 'system',
       eventType: 'commerce.orders.reconciliation.staged',
@@ -803,16 +1179,54 @@ export async function completeCommerceOrderReconciliationInPostgres(input: {
           held: faireOrdersHeld,
           failed: fairePromotionFailed,
           failedByCode: fairePromotionFailureCodes,
-          operatorReviewRequired: faireOrdersHeld + fairePromotionFailed,
+          operatorReviewRequired:
+            fairePromotionOperatorReviewRequired,
+        },
+        automaticFaireExactRefresh: {
+          attempted: faireExactRefreshAttempted,
+          succeeded: faireExactRefreshSucceeded,
+          rejected: faireExactRefreshRejected,
+          failed: faireExactRefreshFailed,
+          failedByCode: faireExactRefreshFailureCodes,
+          operatorReviewRequired:
+            faireExactRefreshOperatorReviewRequired,
+        },
+        automaticFaireUnattributedAttention: {
+          attentionRequired:
+            completed.rows[0]
+              ?.automatic_unattributed_attention_required === true,
+        },
+        automaticShopifyOrderPromotion: {
+          promoted: shopifyOrdersPromoted,
+          held: shopifyOrdersHeld,
+          actionableHeld: shopifyPromotionActionableHeld,
+          heldByReason: shopifyPromotionHeldReasons,
+          failed: shopifyPromotionFailed,
+          failedByCode: shopifyPromotionFailureCodes,
+          rollbackFenced: shopifyPromotionRollbackFenced,
+          operatorReviewRequired:
+            shopifyPromotionAttentionRequired,
         },
         resumed: Boolean(input.target.continuationRunGlobalId),
         providerReadOnly: true,
         providerWrites: 0,
-        canonicalOrderWrites: faireOrdersPromoted,
+        canonicalOrderWrites:
+          shopifyOrdersPromoted + faireOrdersPromoted,
         inventoryWrites: 0,
       },
     }, client)
-    return { leaseLost: false as const }
+    return {
+      leaseLost: false as const,
+      shopifyAutomaticPromotionAttentionRequired:
+        input.target.provider === 'shopify'
+        && completed.rows[0]?.automatic_promotion_attention_required === true,
+      faireAutomaticPromotionAttentionRequired:
+        completed.rows[0]?.automatic_promotion_attention_required === true,
+      faireExactRefreshAttentionRequired:
+        completed.rows[0]?.automatic_exact_refresh_attention_required === true,
+      faireUnattributedAttentionRequired:
+        completed.rows[0]?.automatic_unattributed_attention_required === true,
+    }
   })
 }
 
@@ -833,6 +1247,9 @@ export async function readCommerceOrderReconciliationStateInPostgres(input: {
       records_held: string | number | null
       consecutive_failures: number | null
       last_error_code: string | null
+      automatic_promotion_attention_required: boolean | null
+      automatic_exact_refresh_attention_required: boolean | null
+      automatic_unattributed_attention_required: boolean | null
       last_started_at: Date | null
       last_completed_at: Date | null
       resumable: boolean
@@ -844,6 +1261,9 @@ export async function readCommerceOrderReconciliationStateInPostgres(input: {
          cursor.records_held,
          cursor.consecutive_failures,
          cursor.last_error_code,
+         cursor.automatic_promotion_attention_required,
+         cursor.automatic_exact_refresh_attention_required,
+         cursor.automatic_unattributed_attention_required,
          cursor.last_started_at,
          cursor.last_completed_at,
          EXISTS (
@@ -888,7 +1308,16 @@ export async function readCommerceOrderReconciliationStateInPostgres(input: {
       consecutiveFailures: boundedCount(row.consecutive_failures),
       lastErrorCode: row.last_error_code,
       automaticPromotionAttentionRequired:
-        row.last_error_code === FAIRE_AUTO_PROMOTION_ATTENTION_CODE,
+        row.automatic_promotion_attention_required === true,
+      automaticExactRefreshAttentionRequired:
+        row.automatic_exact_refresh_attention_required === true,
+      automaticUnattributedAttentionRequired:
+        row.automatic_unattributed_attention_required === true,
+      operatorAttentionRequired: (
+        row.automatic_promotion_attention_required === true
+        || row.automatic_exact_refresh_attention_required === true
+        || row.automatic_unattributed_attention_required === true
+      ),
       lastStartedAt: row.last_started_at?.toISOString() || null,
       lastCompletedAt: row.last_completed_at?.toISOString() || null,
       resumable: row.resumable,

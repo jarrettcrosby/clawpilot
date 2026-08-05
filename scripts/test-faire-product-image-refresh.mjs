@@ -304,10 +304,28 @@ test('route and UI pin authenticated same-origin exact-target zero-write behavio
   assert.match(route, /expectedExternalProductId/u)
   assert.match(route, /expectedExternalVariantId/u)
   assert.match(route, /expectedProviderSku/u)
+  assert.match(route, /commerceIntakeRuntimeAvailable\(\)/u)
+  assert.match(route, /FAIRE_PRODUCT_IMAGE_REFRESH_DEVELOPMENT_ONLY/u)
+  assert.ok(
+    route.indexOf('if (!commerceIntakeRuntimeAvailable())')
+      < route.indexOf('const body = await boundedJson(req)'),
+    'runtime gate must reject before command parsing and provider refresh',
+  )
+  assert.ok(
+    route.indexOf('if (!commerceIntakeRuntimeAvailable())')
+      < route.indexOf('await refreshExactFaireProductImages({'),
+    'runtime gate must reject before provider reads or queue writes',
+  )
 
   const panel = read('app_src/components/crm/ProductImagePanel.tsx')
   assert.match(panel, /data-testid="crm-faire-image-import"/u)
   assert.match(panel, /Refresh and import from Faire/u)
+  assert.match(panel, /Faire image import \(development only\)/u)
+  assert.match(panel, /state\?\.imageImportAvailable !== true/u)
+  assert.match(
+    panel,
+    /No Faire read or image job will be attempted/u,
+  )
   assert.match(panel, /confirmReadOnlyProviderRequest: true/u)
   assert.match(panel, /cannot write to Faire/u)
   assert.match(panel, /makes two[\s\S]*read-only Faire requests/u)

@@ -18,6 +18,10 @@ import Checkbox from '@mui/material/Checkbox'
 import Chip from '@mui/material/Chip'
 import CircularProgress from '@mui/material/CircularProgress'
 import Divider from '@mui/material/Divider'
+import Dialog from '@mui/material/Dialog'
+import DialogActions from '@mui/material/DialogActions'
+import DialogContent from '@mui/material/DialogContent'
+import DialogTitle from '@mui/material/DialogTitle'
 import FormControl from '@mui/material/FormControl'
 import FormControlLabel from '@mui/material/FormControlLabel'
 import IconButton from '@mui/material/IconButton'
@@ -37,6 +41,7 @@ import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import ExpandMoreRounded from '@mui/icons-material/ExpandMoreRounded'
 import ContentCopyRounded from '@mui/icons-material/ContentCopyRounded'
+import IntegrationInstructionsRounded from '@mui/icons-material/IntegrationInstructionsRounded'
 import LinkRounded from '@mui/icons-material/LinkRounded'
 import LinkOffRounded from '@mui/icons-material/LinkOffRounded'
 import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
@@ -51,6 +56,8 @@ import IntegrationSetupJourney, {
 import CommerceIntakeWorkflow from '@/components/settings/CommerceIntakeWorkflow'
 import ShopifyCarrierServiceSetupPanel
   from '@/components/settings/ShopifyCarrierServiceSetupPanel'
+import { resolveCommerceSetupPermissionGuidance }
+  from '@/lib/integrations/commerceSetupGuidance'
 
 type CommerceProvider = 'shopify' | 'faire'
 type CommerceEnvironment = 'sandbox' | 'production'
@@ -113,6 +120,18 @@ type CommerceAccount = {
     failedAttempts: number
     deadLetterAttempts: number
     lastAttemptAt: string | null
+    webhookReceiptHealth: {
+      integrationAccountId: string
+      accountGlobalId: string
+      status: 'ready' | 'attention'
+      actionable: number
+      staleQueued: number
+      staleProcessing: number
+      failed: number
+      deadLetter: number
+      heldProductDeletes: number
+      oldestActionableAt: string | null
+    } | null
   }
   fulfillmentWriteReadiness: {
     ready: boolean
@@ -175,6 +194,8 @@ type CommerceCatalog = {
       developerPortalUrl: string
       setupGuideUrl: string
       tokenGuideUrl: string
+      restrictedOrderScopeApprovalUrl: string
+      protectedCustomerDataApprovalUrl: string
       defaultAppUrl: string
       apiVersion: string
       requiredBeforeConnect: readonly string[]
@@ -195,6 +216,8 @@ type CommerceCatalog = {
       setupGuideUrl: string
       directTokenGuideUrl: string
       callbackUrl: string
+      brandApiKeyRequiredBeforeConnect: readonly string[]
+      oauthRequiredBeforeConnect: readonly string[]
       requiredBeforeConnect: readonly string[]
       supportContact: string
       minimumProbeScope: string
@@ -525,6 +548,37 @@ function maskedCommerceCredential(account: CommerceAccount | undefined) {
   return `Generation ${account.credentialVersion}${suffix}`
 }
 
+function hasEffectiveShopifyScope(
+  grantedScopes: readonly string[],
+  requiredScope: string,
+) {
+  if (grantedScopes.includes(requiredScope)) return true
+  if (!requiredScope.startsWith('read_')) return false
+  return grantedScopes.includes(`write_${requiredScope.slice('read_'.length)}`)
+}
+
+function webhookSubscriptionReadiness(
+  configuration: Record<string, unknown>,
+  key: string,
+) {
+  const value = configuration[key]
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {
+      observed: false,
+      ready: false,
+      missingTopics: [] as string[],
+      conflictingTopics: [] as string[],
+    }
+  }
+  const state = value as Record<string, unknown>
+  return {
+    observed: true,
+    ready: state.ready === true,
+    missingTopics: valueStrings(state.missingTopics),
+    conflictingTopics: valueStrings(state.conflictingTopics),
+  }
+}
+
 export default function CommerceIntegrationPanel() {
   const [integrations, setIntegrations] = useState<CommerceState>({
     organizationId: '',
@@ -569,6 +623,8 @@ export default function CommerceIntegrationPanel() {
     scopeProfile: 'connection_test',
     confirmLiveAccess: false,
   })
+  const [setupChecklistProvider, setSetupChecklistProvider] = useState<CommerceProvider | null>(null)
+  const [copiedSetupScopes, setCopiedSetupScopes] = useState<null | string>(null)
 
   function applyPayload(payload: CommercePayload) {
     if (payload.integrations) {
@@ -711,7 +767,7 @@ export default function CommerceIntegrationPanel() {
         confirmCustomerNotifications:
           draft.notifyCustomerDefault ? draft.confirmed : false,
       },
-      `Shopify fulfillment notifications now default to ${
+      `Shopify customer notification requests now default to ${
         draft.notifyCustomerDefault ? 'on' : 'off'
       } for future orders.`,
     )
@@ -939,6 +995,22 @@ export default function CommerceIntegrationPanel() {
     )
   }
 
+  async function registerScopeWebhooks(account: CommerceAccount) {
+    if (!canActivate || pendingAction) return
+    if (!window.confirm(
+      `Register the Shopify access-scope safety webhook for ${account.displayName}? This creates only the app/scopes_update subscription shown in this workflow.`,
+    )) return
+    await action(
+      `register-scope-webhooks:${account.globalId}`,
+      {
+        action: 'register-shopify-scope-webhooks',
+        accountGlobalId: account.globalId,
+        confirmProviderWrites: true,
+      },
+      `${account.displayName} access-scope safety webhook registered and verified.`,
+    )
+  }
+
   async function registerCatalogWebhooks(account: CommerceAccount) {
     if (!canActivate || pendingAction) return
     if (!window.confirm(
@@ -990,6 +1062,21 @@ export default function CommerceIntegrationPanel() {
     }
   }
 
+  async function copySetupChecklistScopes() {
+    if (!setupChecklistProvider || !setupPermissionGuidance?.copyable) return
+    const provider = setupChecklistProvider
+    const value = setupPermissionGuidance.scopes.join(', ')
+    if (!value) return
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopiedSetupScopes(setupPermissionGuidanceKey)
+      setTimeout(() => setCopiedSetupScopes(null), 1_200)
+      setNotice(`${providerLabel(provider)} setup scopes copied.`)
+    } catch {
+      setError('Could not copy setup scopes. Select and copy the list manually.')
+    }
+  }
+
   if (loading) {
     return (
       <Stack alignItems="center" sx={{ py: 8 }}>
@@ -1035,8 +1122,33 @@ export default function CommerceIntegrationPanel() {
         ? 'attention'
         : shopifyAccount?.verificationStatus === 'verified'
           ? 'current'
-          : 'pending'
+        : 'pending'
   const faireConnectionState = connectionSetupState(faireAccount)
+  const shopifyRequiredSetupChecklist = (catalog?.onboarding.shopify.requiredBeforeConnect || [])
+    .join(' → ') || 'From the Shopify setup guide'
+  const faireRequiredSetupSteps = faire.authPath === 'brand_api_key'
+    ? catalog?.onboarding.faire.brandApiKeyRequiredBeforeConnect || []
+    : catalog?.onboarding.faire.oauthRequiredBeforeConnect || []
+  const faireRequiredSetupChecklist = faireRequiredSetupSteps
+    .join(' → ') || 'From the Faire setup guide'
+  const setupChecklistSteps = setupChecklistProvider === 'shopify'
+    ? catalog?.onboarding.shopify.requiredBeforeConnect || []
+    : setupChecklistProvider === 'faire'
+      ? faireRequiredSetupSteps
+      : []
+  const setupPermissionGuidance = resolveCommerceSetupPermissionGuidance({
+    provider: setupChecklistProvider,
+    shopifyScopes: catalog?.providers.shopify.providerScopes || [],
+    faireAuthPath: faire.authPath,
+    faireScopeProfile: faire.scopeProfile,
+    faireScopeProfiles: catalog?.onboarding.faire.scopeProfiles || {
+      connection_test: [],
+      distributed_operations: [],
+    },
+  })
+  const setupPermissionGuidanceKey = setupChecklistProvider === 'faire'
+    ? `faire:${faire.authPath}:${faire.scopeProfile}`
+    : setupChecklistProvider || ''
 
   return (
     <Stack spacing={3}>
@@ -1070,6 +1182,170 @@ export default function CommerceIntegrationPanel() {
         mutation, fulfillment export, multi-merchant OAuth, and production
         provider writes remain unavailable or separately controlled.
       </Alert>
+      <Dialog
+        open={setupChecklistProvider !== null}
+        onClose={() => setSetupChecklistProvider(null)}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>
+          {setupChecklistProvider === 'shopify'
+            ? 'Shopify setup checklist'
+            : faire.authPath === 'brand_api_key'
+              ? 'Faire generated API-key setup'
+              : 'Faire Custom App OAuth setup'}
+        </DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="text.secondary">
+            Complete these provider-side steps in order, then return to ClawPilot to verify the connection.
+          </Typography>
+          <Stack component="ol" spacing={1} sx={{ mt: 1.5, mb: 0, pl: 2.5 }}>
+            {setupChecklistSteps.map((step, index) => (
+              <Typography component="li" key={step} variant="body2" sx={{ pl: 0.5 }}>
+                <strong>Step {index + 1}.</strong> {step}
+              </Typography>
+            ))}
+          </Stack>
+          {setupPermissionGuidance ? (
+            <Box
+              sx={{
+                mt: 2,
+                border: 1,
+                borderColor: 'divider',
+                borderRadius: 1.5,
+                p: 1.5,
+              }}
+            >
+              <Stack
+                direction={{ xs: 'column', sm: 'row' }}
+                spacing={1}
+                alignItems={{ sm: 'center' }}
+                justifyContent="space-between"
+              >
+                <Typography variant="subtitle2">
+                  {setupPermissionGuidance.heading}
+                </Typography>
+                {setupPermissionGuidance.copyable ? (
+                  <Button
+                    size="small"
+                    startIcon={<ContentCopyRounded fontSize="small" />}
+                    onClick={() => void copySetupChecklistScopes()}
+                  >
+                    {copiedSetupScopes === setupPermissionGuidanceKey
+                      ? 'Copied'
+                      : 'Copy scope list'}
+                  </Button>
+                ) : null}
+              </Stack>
+              <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
+                {setupPermissionGuidance.description}
+              </Typography>
+              {setupPermissionGuidance.scopes.length ? (
+                <Stack direction="row" gap={0.75} flexWrap="wrap" sx={{ mt: 1 }}>
+                  {setupPermissionGuidance.scopes.map((scope) => (
+                    <Chip
+                      key={scope}
+                      size="small"
+                      label={`${setupChecklistProvider}: ${scope}`}
+                    />
+                  ))}
+                </Stack>
+              ) : null}
+            </Box>
+          ) : null}
+          {setupChecklistProvider === 'shopify' && catalog ? (
+            <Stack spacing={1.25} sx={{ mt: 2 }}>
+              <Alert severity="warning">
+                <Typography variant="subtitle2">
+                  Separate restricted-scope approval · <code>read_all_orders</code>
+                </Typography>
+                <Typography variant="body2" sx={{ mt: 0.5 }}>
+                  Adding the scope to the app version is not the approval step.
+                  Request Shopify&apos;s separate permission before ClawPilot can
+                  read order history outside Shopify&apos;s default window.
+                </Typography>
+                <Button
+                  href={catalog.onboarding.shopify.restrictedOrderScopeApprovalUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  size="small"
+                  endIcon={<OpenInNewRounded />}
+                  sx={{ mt: 0.5 }}
+                >
+                  Shopify read-all-orders approval
+                </Button>
+              </Alert>
+              <Alert severity="info">
+                <Typography variant="subtitle2">
+                  Protected customer-data approval · <code>read_customers</code>
+                </Typography>
+                <Typography variant="body2" sx={{ mt: 0.5 }}>
+                  Confirm the app&apos;s protected customer-data access and any
+                  identifying fields it needs. Shopify determines the required
+                  review based on the app type, distribution, and store plan.
+                </Typography>
+                <Button
+                  href={catalog.onboarding.shopify.protectedCustomerDataApprovalUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  size="small"
+                  endIcon={<OpenInNewRounded />}
+                  sx={{ mt: 0.5 }}
+                >
+                  Shopify protected-data requirements
+                </Button>
+              </Alert>
+            </Stack>
+          ) : null}
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2, flexWrap: 'wrap' }}>
+          {setupChecklistProvider === 'shopify' && catalog ? (
+            <>
+              <Button
+                href={catalog.onboarding.shopify.developerPortalUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                endIcon={<OpenInNewRounded />}
+              >
+                Shopify dashboard
+              </Button>
+              <Button
+                href={catalog.onboarding.shopify.setupGuideUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                endIcon={<OpenInNewRounded />}
+              >
+                Setup guide
+              </Button>
+            </>
+          ) : null}
+          {setupChecklistProvider === 'faire' && catalog ? (
+            <>
+              <Button
+                href={catalog.onboarding.faire.developerPortalUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                endIcon={<OpenInNewRounded />}
+              >
+                Faire developer portal
+              </Button>
+              <Button
+                href={faire.authPath === 'brand_api_key'
+                  ? catalog.onboarding.faire.directTokenGuideUrl
+                  : catalog.onboarding.faire.setupGuideUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                endIcon={<OpenInNewRounded />}
+              >
+                {faire.authPath === 'brand_api_key'
+                  ? 'API key guide'
+                  : 'OAuth guide'}
+              </Button>
+            </>
+          ) : null}
+          <Button onClick={() => setSetupChecklistProvider(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
       {error ? <Alert severity="error">{error}</Alert> : null}
       {notice ? <Alert severity="success">{notice}</Alert> : null}
 
@@ -1096,9 +1372,33 @@ export default function CommerceIntegrationPanel() {
                   same-organization <code>.myshopify.com</code> store.
                 </Typography>
               </Box>
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} flexWrap="wrap" useFlexGap>
+                <Button
+                  onClick={() => setSetupChecklistProvider('shopify')}
+                  type="button"
+                  variant="contained"
+                  size="small"
+                  startIcon={<IntegrationInstructionsRounded />}
+                >
+                  Open Shopify setup checklist
+                </Button>
+                {catalog?.onboarding.shopify.developerPortalUrl ? (
+                  <Button
+                    href={catalog?.onboarding.shopify.developerPortalUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    variant="text"
+                    size="small"
+                    endIcon={<OpenInNewRounded />}
+                  >
+                    Open Shopify Dev Dashboard
+                  </Button>
+                ) : null}
+              </Stack>
               <IntegrationSetupJourney
                 title="Before you connect · Shopify setup"
                 description="Follow the provider steps in order. Expand this journey later to review the current nonsecret operating facts."
+                defaultExpanded={false}
                 steps={[
                   {
                     key: 'shopify-app',
@@ -1107,6 +1407,10 @@ export default function CommerceIntegrationPanel() {
                     description:
                       'Create the API-only app in the Shopify Dev Dashboard, release the required scopes, and install it on a store in the same Shopify organization. The default app home is expected for this server-to-server flow; it is not a ClawPilot sign-in URL.',
                     facts: [
+                      {
+                        label: 'Required setup checklist',
+                        value: shopifyRequiredSetupChecklist,
+                      },
                       {
                         label: 'API-only app home',
                         value: catalog?.onboarding.shopify.defaultAppUrl
@@ -1125,6 +1429,25 @@ export default function CommerceIntegrationPanel() {
                         value: shopifyAccount?.environment
                           || shopify.environment,
                       },
+                      {
+                        label: 'Provider scopes',
+                        value: catalog?.providers.shopify.providerScopes
+                          ? `${catalog.providers.shopify.providerScopes.length} provider scopes`
+                          : 'Requested by ClawPilot',
+                      },
+                      {
+                        label: 'Provider scope detail',
+                        value: catalog?.providers.shopify.providerScopes?.join(' · ')
+                          || 'Scope details unavailable in this environment',
+                      },
+                      {
+                        label: 'Restricted scope approval',
+                        value: 'read_all_orders · separate Shopify permission',
+                      },
+                      {
+                        label: 'Protected customer data',
+                        value: 'read_customers · confirm Shopify approval requirements',
+                      },
                     ],
                     action: catalog ? (
                       <Stack
@@ -1133,6 +1456,14 @@ export default function CommerceIntegrationPanel() {
                         flexWrap="wrap"
                         useFlexGap
                       >
+                        <Button
+                          onClick={() => setSetupChecklistProvider('shopify')}
+                          type="button"
+                          variant="outlined"
+                          size="small"
+                        >
+                          Open setup checklist
+                        </Button>
                         <Button
                           href={catalog.onboarding.shopify.developerPortalUrl}
                           target="_blank"
@@ -1162,6 +1493,26 @@ export default function CommerceIntegrationPanel() {
                           endIcon={<OpenInNewRounded />}
                         >
                           Client-credentials guide
+                        </Button>
+                        <Button
+                          href={catalog.onboarding.shopify.restrictedOrderScopeApprovalUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          variant="text"
+                          size="small"
+                          endIcon={<OpenInNewRounded />}
+                        >
+                          read_all_orders approval
+                        </Button>
+                        <Button
+                          href={catalog.onboarding.shopify.protectedCustomerDataApprovalUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          variant="text"
+                          size="small"
+                          endIcon={<OpenInNewRounded />}
+                        >
+                          Protected customer data
                         </Button>
                       </Stack>
                     ) : undefined,
@@ -1407,9 +1758,33 @@ export default function CommerceIntegrationPanel() {
                   </MenuItem>
                 </Select>
               </FormControl>
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} flexWrap="wrap" useFlexGap>
+                <Button
+                  onClick={() => setSetupChecklistProvider('faire')}
+                  type="button"
+                  variant="contained"
+                  size="small"
+                  startIcon={<IntegrationInstructionsRounded />}
+                >
+                  Open Faire setup checklist
+                </Button>
+                {catalog?.onboarding.faire.developerPortalUrl ? (
+                  <Button
+                    href={catalog?.onboarding.faire.developerPortalUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    variant="text"
+                    size="small"
+                    endIcon={<OpenInNewRounded />}
+                  >
+                    Open Faire developer portal
+                  </Button>
+                ) : null}
+              </Stack>
               <IntegrationSetupJourney
                 title="Before you connect · Faire setup"
                 description="Follow the provider-side path that matches the credential Faire issued. The generated brand API key and OAuth application credentials are different values."
+                defaultExpanded={false}
                 steps={[
                   {
                     key: 'faire-path',
@@ -1440,6 +1815,14 @@ export default function CommerceIntegrationPanel() {
                         flexWrap="wrap"
                         useFlexGap
                       >
+                        <Button
+                          onClick={() => setSetupChecklistProvider('faire')}
+                          type="button"
+                          variant="outlined"
+                          size="small"
+                        >
+                          Open setup checklist
+                        </Button>
                         <Button
                           href={catalog.onboarding.faire.developerPortalUrl}
                           target="_blank"
@@ -1496,10 +1879,18 @@ export default function CommerceIntegrationPanel() {
                         value: 'One read-only brand-profile request',
                       },
                       {
+                        label: 'OAuth permission list',
+                        value: 'Not applicable · access is issued with the generated key',
+                      },
+                      {
                         label: 'Provider support',
                         value: catalog
                           ? catalog.onboarding.faire.supportContact
                           : 'Faire Developer Support',
+                      },
+                      {
+                        label: 'Required setup checklist',
+                        value: faireRequiredSetupChecklist,
                       },
                     ] : [
                       {
@@ -1522,10 +1913,20 @@ export default function CommerceIntegrationPanel() {
                           || 'READ_BRAND',
                       },
                       {
+                        label: 'Exact OAuth permissions',
+                        value: catalog?.onboarding.faire.scopeProfiles[
+                          faire.scopeProfile
+                        ].join(' · ') || 'No permissions selected',
+                      },
+                      {
                         label: 'Provider support',
                         value: catalog
                           ? catalog.onboarding.faire.supportContact
                           : 'Faire Developer Support',
+                      },
+                      {
+                        label: 'Required setup checklist',
+                        value: faireRequiredSetupChecklist,
                       },
                     ],
                   },
@@ -1736,8 +2137,39 @@ export default function CommerceIntegrationPanel() {
               )
               const missingReceiptProofScopes = account.provider === 'shopify'
                 ? valueStrings(catalog?.onboarding.shopify.receiptProofScopes)
-                  .filter((scope) => !grantedScopes.includes(scope))
+                  .filter((scope) => !hasEffectiveShopifyScope(
+                    grantedScopes,
+                    scope,
+                  ))
                 : []
+              const webhookSubscriptionGroups = account.provider === 'shopify'
+                ? [
+                    {
+                      key: 'scopeWebhookSubscriptions',
+                      label: 'Access-scope safety',
+                    },
+                    {
+                      key: 'webhookSubscriptions',
+                      label: 'Inventory freshness',
+                    },
+                    {
+                      key: 'catalogWebhookSubscriptions',
+                      label: 'Product catalog',
+                    },
+                  ].map((group) => ({
+                    ...group,
+                    ...webhookSubscriptionReadiness(
+                      account.configuration,
+                      group.key,
+                    ),
+                  }))
+                : []
+              const missingWebhookSubscriptionGroups =
+                webhookSubscriptionGroups
+                  .filter((group) => !group.ready)
+                  .map((group) => group.label)
+              const webhookReceiptHealth =
+                account.evidence.webhookReceiptHealth
               const preview = shopifyPreviews[account.globalId]
               const revealed = revealedCredential?.accountGlobalId
                 === account.globalId
@@ -1771,6 +2203,9 @@ export default function CommerceIntegrationPanel() {
                       : []),
                     ...(account.webhookVerificationStatus !== 'verified'
                       ? ['Send one valid signed allowed-topic delivery to the callback URL.']
+                      : []),
+                    ...(missingWebhookSubscriptionGroups.length
+                      ? [`Register and verify these webhook groups: ${missingWebhookSubscriptionGroups.join(', ')}.`]
                       : []),
                   ]
                 : []
@@ -1873,6 +2308,32 @@ export default function CommerceIntegrationPanel() {
                           : 'This connection authorizes automatic product catalog sync with no second approval. Eligibility and worker status appear below; the control only pauses or resumes sync. Orders and inventory remain separate.'}
                       </Alert>
 
+                      {account.provider === 'shopify'
+                        && webhookReceiptHealth
+                        && webhookReceiptHealth.actionable > 0 ? (
+                          <Alert severity="warning">
+                            <Typography variant="body2" fontWeight={700}>
+                              Current Shopify webhook receipts need attention
+                            </Typography>
+                            <Typography variant="body2">
+                              {webhookReceiptHealth.actionable} actionable receipt{
+                                webhookReceiptHealth.actionable === 1 ? '' : 's'
+                              }: {webhookReceiptHealth.staleQueued} stale queued,{' '}
+                              {webhookReceiptHealth.staleProcessing} stale processing,{' '}
+                              {webhookReceiptHealth.failed} failed,{' '}
+                              {webhookReceiptHealth.deadLetter} dead-letter, and{' '}
+                              {webhookReceiptHealth.heldProductDeletes} replayable held product deletion{
+                                webhookReceiptHealth.heldProductDeletes === 1 ? '' : 's'
+                              }.
+                            </Typography>
+                            <Typography variant="caption" display="block" sx={{ mt: 0.5 }}>
+                              This alert covers only the current credential generation.
+                              Ordinary held inventory/catalog history and prior generations remain
+                              informational evidence below.
+                            </Typography>
+                          </Alert>
+                        ) : null}
+
                       {intakeAvailable ? (
                         <CommerceIntakeWorkflow
                           accountGlobalId={account.globalId}
@@ -1895,9 +2356,11 @@ export default function CommerceIntegrationPanel() {
                           notificationPolicy.mode === 'clawpilot_explicit' ? (
                             <Stack spacing={1.25} sx={{ mt: 1 }}>
                               <Alert severity={notificationDefault ? 'warning' : 'info'}>
-                                Customer notifications are an explicit Shopify-account default.
+                                Customer notification requests use a ClawPilot default for this
+                                Shopify connection.
                                 The resolved choice is frozen into each fulfillment export, so
-                                changing this setting never emails customers for prior shipments.
+                                changing this setting never changes the request captured for prior
+                                shipments.
                                 Operators may record a reasoned per-order exception when confirming
                                 a future shipment.
                               </Alert>
@@ -1913,8 +2376,8 @@ export default function CommerceIntegrationPanel() {
                                         [account.globalId]: {
                                           notifyCustomerDefault: nextDefault,
                                           reason: nextDefault
-                                            ? 'Enable Shopify customer notifications for future fulfillment confirmations'
-                                            : 'Disable Shopify customer notifications for future fulfillment confirmations',
+                                            ? 'Enable Shopify customer notification requests for future fulfillment confirmations'
+                                            : 'Disable Shopify customer notification requests for future fulfillment confirmations',
                                           confirmed: false,
                                         },
                                       }))
@@ -1922,8 +2385,8 @@ export default function CommerceIntegrationPanel() {
                                   />
                                 )}
                                 label={notificationDefault
-                                  ? 'Email customers when future Shopify fulfillments are created'
-                                  : 'Do not email customers when future Shopify fulfillments are created'}
+                                  ? 'Request customer notifications for future Shopify fulfillments'
+                                  : 'Do not request customer notifications for future Shopify fulfillments'}
                               />
                               <TextField
                                 label="Policy change reason"
@@ -2040,7 +2503,10 @@ export default function CommerceIntegrationPanel() {
                                   : 'current'} · diagnostic provider writes: 0
                               </Typography>
                               <Typography variant="caption" display="block" sx={{ mt: 0.5 }}>
-                                Faire manages retailer notifications after shipment and tracking are submitted; ClawPilot exposes no notification toggle.
+                                Faire may send a processing email when a NEW order is accepted,
+                                and submitting shipment tracking triggers Faire&apos;s shipment email.
+                                Use a controlled recipient for test orders; ClawPilot exposes no
+                                notification toggle.
                               </Typography>
                             </Alert>
                           ) : account.provider === 'faire' ? (
@@ -2060,7 +2526,7 @@ export default function CommerceIntegrationPanel() {
                       {account.provider === 'shopify' && account.webhookUrl ? (
                         <Box>
                           <Typography variant="subtitle2" fontWeight={700}>
-                            Optional signed receipt setup
+                            Signed receipt setup
                           </Typography>
                           <Typography
                             variant="body2"
@@ -2074,30 +2540,25 @@ export default function CommerceIntegrationPanel() {
                             valid signed delivery separately verifies the stored
                             app secret; neither check writes to Shopify.
                           </Typography>
-                          {(() => {
-                            const subscription = account.configuration.webhookSubscriptions
-                            if (!subscription || typeof subscription !== 'object' || Array.isArray(subscription)) {
-                              return (
-                                <Alert severity="warning" sx={{ mb: 1 }}>
-                                  Test the Shopify connection to discover subscription readiness.
-                                </Alert>
-                              )
-                            }
-                            const state = subscription as Record<string, unknown>
-                            const missingTopics = Array.isArray(state.missingTopics)
-                              ? state.missingTopics.filter((topic): topic is string => typeof topic === 'string')
-                              : []
-                            const conflictingTopics = Array.isArray(state.conflictingTopics)
-                              ? state.conflictingTopics.filter((topic): topic is string => typeof topic === 'string')
-                              : []
-                            return (
-                              <Alert severity={state.ready === true ? 'success' : 'warning'} sx={{ mb: 1 }}>
-                                {state.ready === true
-                                  ? 'Shopify subscription discovery is ready for every required topic.'
-                                  : `Shopify subscription discovery found ${missingTopics.length} missing and ${conflictingTopics.length} conflicting topic${missingTopics.length + conflictingTopics.length === 1 ? '' : 's'}. No provider writes were made.`}
+                          <Stack spacing={1} sx={{ mb: 1 }}>
+                            {webhookSubscriptionGroups.map((group) => (
+                              <Alert
+                                key={group.key}
+                                severity={group.ready ? 'success' : 'warning'}
+                              >
+                                <Typography variant="body2" fontWeight={700}>
+                                  {group.label} · {group.ready ? 'ready' : 'not ready'}
+                                </Typography>
+                                <Typography variant="body2">
+                                  {!group.observed
+                                    ? 'Test the Shopify connection to discover this subscription group.'
+                                    : group.ready
+                                      ? 'Every required topic points to this exact callback URL.'
+                                      : `Discovery found ${group.missingTopics.length} missing and ${group.conflictingTopics.length} conflicting topic${group.missingTopics.length + group.conflictingTopics.length === 1 ? '' : 's'}. No provider writes were made.`}
+                                </Typography>
                               </Alert>
-                            )
-                          })()}
+                            ))}
+                          </Stack>
                           <Accordion disableGutters sx={{ mb: 1 }}>
                             <AccordionSummary expandIcon={<ExpandMoreRounded />}>
                               <Box>
@@ -2128,7 +2589,9 @@ export default function CommerceIntegrationPanel() {
                                       Topics: {group.topics.join(', ')}
                                     </Typography>
                                     <Typography variant="caption" display="block">
-                                      Scopes: {group.requiredScopes.join(', ')}
+                                      Scopes: {group.requiredScopes.length
+                                        ? group.requiredScopes.join(', ')
+                                        : 'None (control event only)'}
                                     </Typography>
                                   </Alert>
                                 ))}
@@ -2158,6 +2621,14 @@ export default function CommerceIntegrationPanel() {
                             </Button>
                             {canActivate ? (
                               <>
+                                <Button
+                                  variant="contained"
+                                  disabled={pendingAction !== '' || !account.configured}
+                                  onClick={() => registerScopeWebhooks(account)}
+                                  sx={actionButtonSx}
+                                >
+                                  Register scope safety webhook
+                                </Button>
                                 <Button
                                   variant="contained"
                                   disabled={pendingAction !== '' || !account.configured}
@@ -2666,6 +3137,7 @@ export default function CommerceIntegrationPanel() {
                                 || !canActivate
                                 || missingReceiptProofScopes.length > 0
                                 || account.webhookVerificationStatus !== 'verified'
+                                || missingWebhookSubscriptionGroups.length > 0
                               }
                               onClick={() => action(
                                 `enable:${account.globalId}`,
@@ -2928,12 +3400,19 @@ export default function CommerceIntegrationPanel() {
               </Table>
             </TableContainer>
             <Divider sx={{ my: 2 }} />
-            <Typography variant="subtitle2">Faire public scopes</Typography>
+            <Typography variant="subtitle2">Provider scopes and permissions</Typography>
             <Stack direction="row" gap={0.75} flexWrap="wrap" sx={{ mt: 1 }}>
+              {(catalog.providers.shopify.providerScopes || []).map((scope) => (
+                <Chip key={`shopify-${scope}`} size="small" label={`Shopify: ${scope}`} />
+              ))}
               {(catalog.providers.faire.providerScopes || []).map((scope) => (
                 <Chip key={scope} size="small" label={scope} />
               ))}
             </Stack>
+            <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
+              Scope chips are shown for setup reference only; ClawPilot verifies scope evidence
+              after connection attempt before enabling catalog or product-read behavior.
+            </Typography>
           </AccordionDetails>
         </Accordion>
       ) : null}

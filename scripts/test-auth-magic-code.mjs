@@ -110,6 +110,11 @@ try {
   let deliveryShouldFail = false
   let invitationValid = true
   const invitationOrganizationId = '20000000-0000-4000-8000-000000000001'
+  const additionalInvitedOrganizationIds = [
+    '33333333-3333-4333-8333-333333333333',
+    '44444444-4444-4444-8444-444444444444',
+  ]
+  let activeInvitationAdditionalOrganizationIds = []
 
   const fakeClient = {
     async query(sql, values) {
@@ -153,18 +158,65 @@ try {
         return { rows: [{ status, attempts: record.attempts, purpose: record.purpose, invitation_id: record.invitationId }], rowCount: 1 }
       }
 
-      if (sql.includes('UPDATE app_user_invitations')) {
+      if (
+        sql.includes('FROM app_user_invitations AS invitation')
+        && sql.includes('FOR UPDATE OF invitation')
+      ) {
         return invitationValid && values[0] === '10000000-0000-4000-8000-000000000001'
-          ? { rows: [{ id: values[0], workspace_organization_id: invitationOrganizationId }], rowCount: 1 }
+          ? {
+            rows: [{
+              id: values[0],
+              workspace_organization_id: invitationOrganizationId,
+              assigned_organization_ids: [
+                invitationOrganizationId,
+                ...activeInvitationAdditionalOrganizationIds,
+              ],
+            }],
+            rowCount: 1,
+          }
           : { rows: [], rowCount: 0 }
       }
 
+      if (sql.includes('SELECT email') && sql.includes('FROM app_users')) {
+        return values[0] === 'invited@example.com'
+          ? { rows: [{ email: values[0] }], rowCount: 1 }
+          : { rows: [], rowCount: 0 }
+      }
+
+      if (
+        sql.includes('SELECT organization_id::text, status')
+        && sql.includes('FOR UPDATE')
+      ) {
+        return {
+          rows: values[1].map((organizationId) => ({
+            organization_id: organizationId,
+            status: 'invited',
+          })),
+          rowCount: values[1].length,
+        }
+      }
+
       if (sql.includes('UPDATE app_user_organization_memberships')) {
-        if (values[0] === 'invited@example.com' && values[1] === invitationOrganizationId) {
-          activatedMemberships.push({ email: values[0], organizationId: values[1] })
-          return { rows: [{ organization_id: values[1] }], rowCount: 1 }
+        const organizationIds = Array.isArray(values[1]) ? values[1] : []
+        if (
+          values[0] === 'invited@example.com'
+          && organizationIds.includes(invitationOrganizationId)
+        ) {
+          const seen = new Set()
+          for (const organizationId of organizationIds) {
+            if (typeof organizationId !== 'string' || seen.has(organizationId)) continue
+            seen.add(organizationId)
+            activatedMemberships.push({ email: values[0], organizationId })
+          }
+          return { rows: organizationIds.map((organizationId) => ({ organization_id: organizationId })), rowCount: organizationIds.length }
         }
         return { rows: [], rowCount: 0 }
+      }
+
+      if (sql.includes('UPDATE app_user_invitations')) {
+        return invitationValid
+          ? { rows: [{ id: values[0] }], rowCount: 1 }
+          : { rows: [], rowCount: 0 }
       }
 
       if (sql.includes('UPDATE app_users')) {
@@ -184,7 +236,26 @@ try {
     async query(sql, values) {
       if (sql.includes('FROM app_user_invitations invitation')) {
         return invitationValid
-          ? { rows: [{ id: '10000000-0000-4000-8000-000000000001' }], rowCount: 1 }
+          ? {
+            rows: [{
+              id: '10000000-0000-4000-8000-000000000001',
+              workspace_organization_id: invitationOrganizationId,
+              workspace_organization_ids: activeInvitationAdditionalOrganizationIds,
+            }],
+            rowCount: 1,
+          }
+          : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('UPDATE app_user_invitations')) {
+        return invitationValid && values[0] === '10000000-0000-4000-8000-000000000001'
+          ? {
+            rows: [{
+              id: values[0],
+              workspace_organization_id: invitationOrganizationId,
+              workspace_organization_ids: activeInvitationAdditionalOrganizationIds,
+            }],
+            rowCount: 1,
+          }
           : { rows: [], rowCount: 0 }
       }
       assert.ok(sql.includes('DELETE FROM auth_magic_codes'))
@@ -230,9 +301,25 @@ try {
   assert.ok(authModule.source.includes("interval '15 minutes'"))
   assert.ok(authModule.source.includes("interval '60 seconds'"))
   assert.ok(authModule.source.includes('FOR UPDATE'))
-  assert.ok(authModule.source.includes('membership.organization_id = invitation.workspace_organization_id'))
-  assert.ok(authModule.source.includes("membership.status = 'invited'"))
-  assert.ok(authModule.source.includes('AND organization_id = $2::uuid'))
+  assert.ok(authModule.source.includes('FOR UPDATE OF invitation'))
+  assert.ok(authModule.source.includes('invitedUser.rowCount !== 1'))
+  assert.ok(authModule.source.includes('min(candidate.position) AS position'))
+  assert.ok(authModule.source.includes('cardinality(assigned.organization_ids) > 0'))
+  assert.ok(authModule.source.includes('membership.status <> \'invited\''))
+  assert.ok(authModule.source.includes('lockedMemberships.rowCount !== inviteOrganizationIds.length'))
+  const invitationActivationSource = authModule.source.slice(
+    authModule.source.indexOf('const activatedMembership'),
+    authModule.source.indexOf('const activated ='),
+  )
+  assert.ok(invitationActivationSource.includes('AND organization_id = ANY($2::uuid[])'))
+  assert.ok(!invitationActivationSource.includes('ANY($3::uuid[])'))
+  assert.ok(invitationActivationSource.includes('activatedMembership.rowCount !== inviteOrganizationIds.length'))
+  assert.ok(
+    authModule.source.indexOf('const activatedMembership')
+      < authModule.source.indexOf('const accepted ='),
+  )
+  assert.ok(authModule.source.includes('workspace_organization_ids'))
+  assert.ok(authModule.source.includes('assigned.organization_ids::uuid[]'))
   assert.ok(!authModule.source.includes('console.'))
 
   const unauthorized = await requestAuthMagicCode({ email: 'other@example.com' })
@@ -304,6 +391,31 @@ try {
     email: 'invited@example.com',
     organizationId: invitationOrganizationId,
   }])
+  activatedMemberships.length = 0
+
+  now += 61_000
+  activeInvitationAdditionalOrganizationIds = additionalInvitedOrganizationIds
+  const invitedAcrossOrganizations = await requestInvitationAuthMagicCode({
+    email: 'invited@example.com',
+    invitationId: '10000000-0000-4000-8000-000000000001',
+  })
+  assert.equal(invitedAcrossOrganizations.status, 'sent')
+  assert.equal(record.purpose, 'invitation')
+  assert.equal(record.invitationId, '10000000-0000-4000-8000-000000000001')
+  const invitationVerifiedWithAdditions = await verifyAuthMagicCode({
+    email: 'invited@example.com',
+    code: delivered.at(-1).code,
+  })
+  assert.equal(invitationVerifiedWithAdditions.status, 'verified')
+  assert.equal(invitationVerifiedWithAdditions.organizationId, invitationOrganizationId)
+  assert.deepEqual(activatedMemberships, [
+    { email: 'invited@example.com', organizationId: invitationOrganizationId },
+    ...additionalInvitedOrganizationIds.map((orgId) => ({
+      email: 'invited@example.com',
+      organizationId: orgId,
+    })),
+  ])
+  activeInvitationAdditionalOrganizationIds = []
 
   now += 61_000
   invitationValid = false

@@ -25,6 +25,9 @@ import {
   readShopifyInventoryRefreshWorkerHeartbeatFromPostgres,
 } from '@/lib/persistence/shopifyInventoryRefresh'
 import {
+  readShopifyWebhookReceiptHealthFromPostgres,
+} from '@/lib/persistence/shopifyWebhookReceiptHealth'
+import {
   readFaireInventoryPollHealthFromPostgres,
   readFaireInventoryPollWorkerHeartbeatFromPostgres,
 } from '@/lib/persistence/faireInventoryPolling'
@@ -32,9 +35,20 @@ import {
   readCommerceProductImageImportQueueHealthInPostgres,
 } from '@/lib/persistence/commerceProductImageImports'
 import {
+  classifyCommerceProductImageImportOperationalHealth,
+} from '@/lib/commerceProductImageImportHealth'
+import {
   readFaireProductImageProjectionHealthInPostgres,
 } from '@/lib/persistence/faireProductImageProjection'
 import { commerceIntakeRuntimeAvailable } from '@/lib/integrations/commerceIntake'
+import {
+  faireAutomaticExactRefreshHealthSnapshot,
+  faireAutomaticOrderPromotionHealthSnapshot,
+  faireUnattributedAttentionHealthSnapshot,
+} from '@/lib/integrations/commerceFaireAutomaticPromotion'
+import {
+  shopifyAutomaticOrderPromotionHealthSnapshot,
+} from '@/lib/integrations/commerceShopifyAutomaticPromotion'
 import { effectiveDocumentEmbeddingConfiguration } from '@/lib/documentEmbeddings'
 import { validateShortLinkConfiguration } from '@/lib/shortlinks'
 import { readSuiteCrmWorkerHeartbeat } from '@/lib/persistence/crm'
@@ -120,9 +134,29 @@ export async function GET() {
     }
     let commerceOrderReconciliationWorker: Record<string, unknown> = {
       status: 'disabled',
+      automaticShopifyOrderPromotion:
+        shopifyAutomaticOrderPromotionHealthSnapshot(),
+      automaticFaireOrderPromotion:
+        faireAutomaticOrderPromotionHealthSnapshot(),
+      automaticFaireExactRefresh:
+        faireAutomaticExactRefreshHealthSnapshot(),
+      automaticFaireUnattributedAttention:
+        faireUnattributedAttentionHealthSnapshot(),
     }
     let shopifyInventoryRefreshWorker: Record<string, unknown> = {
       status: 'disabled',
+    }
+    let shopifyWebhookReceipts: Record<string, unknown> = {
+      status: 'disabled',
+      accounts: 0,
+      actionableAccounts: 0,
+      actionable: 0,
+      staleQueued: 0,
+      staleProcessing: 0,
+      failed: 0,
+      deadLetter: 0,
+      heldProductDeletes: 0,
+      oldestActionableAt: null,
     }
     let faireInventoryPollWorker: Record<string, unknown> = {
       status: 'disabled',
@@ -348,6 +382,7 @@ export async function GET() {
           operations_shopify_order_preview_migration_applied: boolean
           operations_commerce_normalization_migration_applied: boolean
           operations_commerce_continuations_migration_applied: boolean
+          operations_commerce_order_attention_kinds_applied: boolean
           operations_carrier_rate_test_labels_migration_applied: boolean
           operations_print_agent_capabilities_migration_applied: boolean
           operations_carrier_label_artifacts_migration_applied: boolean
@@ -908,6 +943,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0115_operations_commerce_intake_continuations.sql'
               ) AS operations_commerce_continuations_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0251_operations_commerce_order_attention_kinds.sql'
+              ) AS operations_commerce_order_attention_kinds_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -2389,6 +2429,7 @@ export async function GET() {
             && row?.operations_shopify_order_preview_migration_applied
             && row?.operations_commerce_normalization_migration_applied
             && row?.operations_commerce_continuations_migration_applied
+            && row?.operations_commerce_order_attention_kinds_applied
             && row?.operations_carrier_rate_test_labels_migration_applied
             && row?.operations_print_agent_capabilities_migration_applied
             && row?.operations_carrier_label_artifacts_migration_applied
@@ -2461,6 +2502,15 @@ export async function GET() {
             && row?.suitecrm_product_image_reverse_ingestion_applied
             && row?.migration_checksums_present
           ),
+        }
+        if (row?.operations_commerce_integrations_migration_applied) {
+          shopifyWebhookReceipts =
+            await readShopifyWebhookReceiptHealthFromPostgres()
+          if (Number(shopifyWebhookReceipts.actionable || 0) > 0) {
+            warnings.push(
+              'Current Shopify webhook receipts require operator attention.',
+            )
+          }
         }
         if (
           !row?.worker_migration_applied
@@ -2560,6 +2610,7 @@ export async function GET() {
           || !row?.operations_shopify_order_preview_migration_applied
           || !row?.operations_commerce_normalization_migration_applied
           || !row?.operations_commerce_continuations_migration_applied
+          || !row?.operations_commerce_order_attention_kinds_applied
           || !row?.operations_carrier_rate_test_labels_migration_applied
           || !row?.operations_print_agent_capabilities_migration_applied
           || !row?.operations_carrier_label_artifacts_migration_applied
@@ -3271,6 +3322,7 @@ export async function GET() {
             commerceIntakeRuntimeAvailable()
             && row?.operations_commerce_continuations_migration_applied
             && row?.operations_commerce_normalization_migration_applied
+            && row?.operations_commerce_order_attention_kinds_applied
           ) {
             const orderHeartbeat =
               await readCommerceOrderReconciliationWorkerHeartbeatFromPostgres()
@@ -3298,7 +3350,7 @@ export async function GET() {
             )
             const operationalDegraded = (
               orderState.failed > 0
-              || orderState.promotionAttentionRequired > 0
+              || orderState.operatorAttentionRequired > 0
               || orderState.staleProcessing > 0
               || orderState.overdue > 0
             )
@@ -3311,6 +3363,24 @@ export async function GET() {
               heartbeatAt: orderHeartbeat?.checkedAt || null,
               phase: orderHeartbeat?.phase || null,
               ageMs: orderAgeMs,
+              automaticShopifyOrderPromotion:
+                shopifyAutomaticOrderPromotionHealthSnapshot({
+                  heartbeat:
+                    orderHeartbeat?.automaticShopifyOrderPromotion,
+                }),
+              automaticFaireOrderPromotion:
+                faireAutomaticOrderPromotionHealthSnapshot({
+                  heartbeat:
+                    orderHeartbeat?.automaticFaireOrderPromotion,
+                }),
+              automaticFaireExactRefresh:
+                faireAutomaticExactRefreshHealthSnapshot(
+                  orderHeartbeat?.automaticFaireExactRefresh,
+                ),
+              automaticFaireUnattributedAttention:
+                faireUnattributedAttentionHealthSnapshot(
+                  orderHeartbeat?.automaticFaireUnattributedAttention,
+                ),
               ...orderState,
             }
             if (!loopReachable) {
@@ -3323,9 +3393,26 @@ export async function GET() {
                 'Commerce order reconciliation has failed accounts.',
               )
             }
-            if (orderState.promotionAttentionRequired > 0) {
+            if (
+              orderState.providerPromotionAttentionRequired.shopify > 0
+            ) {
+              warnings.push(
+                'Shopify provider reads completed, but clean-path automatic local order promotion needs operator attention.',
+              )
+            }
+            if (orderState.providerPromotionAttentionRequired.faire > 0) {
               warnings.push(
                 'Faire provider reads completed, but automatic local order promotion needs operator attention.',
+              )
+            }
+            if (orderState.faireExactRefreshAttentionRequired > 0) {
+              warnings.push(
+                'Faire exact order refresh needs operator attention.',
+              )
+            }
+            if (orderState.faireUnattributedAttentionRequired > 0) {
+              warnings.push(
+                'Legacy Faire order attention needs operator review; its original subtype is unavailable.',
               )
             }
             if (orderState.staleProcessing > 0) {
@@ -3536,17 +3623,34 @@ export async function GET() {
             const imageAgeMs = Number.isFinite(imageHeartbeatAt)
               ? checkedAt - imageHeartbeatAt
               : null
+            const imageProgressAt = Date.parse(
+              String(imageQueue.lastTerminalProgressAt || ''),
+            )
+            const imageProgressAgeMs = Number.isFinite(imageProgressAt)
+              ? checkedAt - imageProgressAt
+              : null
             const loopReachable = (
               imageAgeMs !== null
               && imageAgeMs <= maxImageHeartbeatAgeMs
             )
-            const operationalDegraded = (
-              imageQueue.deadCount > 0
-              || imageQueue.staleLeaseCount > 0
-              || imageQueue.overdueCount > 0
-              || imageQueue.retryCount > 0
-              || imageQueue.heartbeat?.phase === 'degraded'
+            const maxImageProgressAgeMs = Math.max(
+              90_000,
+              imagePollMs * 4,
             )
+            const {
+              activelyDraining,
+              stalledOverdue,
+              operationalDegraded,
+            } = classifyCommerceProductImageImportOperationalHealth({
+              deadCount: imageQueue.deadCount,
+              staleLeaseCount: imageQueue.staleLeaseCount,
+              overdueCount: imageQueue.overdueCount,
+              retryCount: imageQueue.retryCount,
+              heartbeatPhase: imageQueue.heartbeat?.phase,
+              loopReachable,
+              progressAgeMs: imageProgressAgeMs,
+              maxProgressAgeMs: maxImageProgressAgeMs,
+            })
             commerceProductImageImportWorker = {
               status: loopReachable
                 ? (operationalDegraded ? 'degraded' : 'reachable')
@@ -3564,6 +3668,10 @@ export async function GET() {
               historicalDead: imageQueue.historicalDeadCount,
               staleLeases: imageQueue.staleLeaseCount,
               overdue: imageQueue.overdueCount,
+              activelyDraining,
+              stalledOverdue,
+              lastTerminalProgressAt: imageQueue.lastTerminalProgressAt,
+              progressAgeMs: imageProgressAgeMs,
             }
             if (!loopReachable) {
               errors.push(
@@ -3580,9 +3688,9 @@ export async function GET() {
                 'Commerce product image import queue has stale claimed jobs.',
               )
             }
-            if (imageQueue.overdueCount > 0) {
+            if (stalledOverdue) {
               warnings.push(
-                'Commerce product image import queue has overdue jobs.',
+                'Commerce product image import queue has overdue jobs and is not making recent progress.',
               )
             }
             if (imageQueue.retryCount > 0) {
@@ -3811,6 +3919,7 @@ export async function GET() {
       commerceCatalogWorker,
       commerceOrderReconciliationWorker,
       shopifyInventoryRefreshWorker,
+      shopifyWebhookReceipts,
       faireInventoryPollWorker,
       commerceProductImageImportWorker,
       faireProductImageProjection,

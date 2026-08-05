@@ -77,6 +77,7 @@ const projection = load(
       readFaireProductImageReconciliationContextInPostgres: noop,
       recoverExpiredFaireProductImageClaimInPostgres: noop,
       recordFaireProductImageProviderStepInPostgres: noop,
+      resolveFaireProductImageAppliedReconciliationInPostgres: noop,
       resolveFaireProductImageSelectionInPostgres: noop,
     },
     '@/lib/persistence/commerceIntegrations': {
@@ -367,6 +368,12 @@ assert.equal(successResult.externalEffect.state, 'succeeded')
 assert.equal(successResult.providerMutation.writeCount, 2)
 assert.equal(success.steps.length, 2)
 assert.deepEqual(success.steps.map((step) => step.stage), ['upload', 'attach'])
+assert.equal(
+  success.steps[1].redactedEvidence.assetContentSha256,
+  selection.assetContentSha256,
+)
+assert.equal(success.steps[1].redactedEvidence.providerWritesKnown, true)
+assert.equal(success.steps[1].redactedEvidence.providerWriteCountLowerBound, 2)
 assert.equal(success.finalizations[0].providerWriteCount, 2)
 assert.equal(success.patches[0].productId, selection.externalProductId)
 assert.deepEqual(
@@ -485,6 +492,10 @@ const expiredClaimReplay = await projection.executeFaireProductImagePublish({
       leaseExpired: false,
       providerWriteCount: 1,
       uploadedLocatorSha256: hash('recovered-upload'),
+      priorImageCount: 2,
+      projectedImageCount: 3,
+      reconciliationEligibility: 'readback_terminalizable',
+      reconciliationReason: 'exact_attach_unknown_evidence',
       latestOutcome: 'succeeded',
       latestObservedAt: new Date().toISOString(),
     }
@@ -494,6 +505,9 @@ assert.equal(expiredRecoveryCalls, 1)
 assert.equal(expiredClaimReplay.replayed, true)
 assert.equal(expiredClaimReplay.externalEffect.state, 'unknown')
 assert.equal(expiredClaimReplay.providerMutation.writeCount, 1)
+assert.equal(expiredClaimReplay.images.existingPreserved, true)
+assert.equal(expiredClaimReplay.images.priorCount, 2)
+assert.equal(expiredClaimReplay.images.projectedCount, 3)
 
 const uploadUnknown = activeDependencies({
   uploadError: Object.assign(new Error('timeout'), {
@@ -546,10 +560,26 @@ assert.equal(attachUnknownResult.externalEffect.state, 'unknown')
 assert.equal(attachUnknownResult.providerMutation.writeCount, 1)
 assert.equal(attachUnknown.steps[0].stage, 'upload')
 assert.equal(attachUnknown.steps[1].outcome, 'unknown')
+assert.equal(
+  attachUnknown.steps[1].redactedEvidence.externalProductId,
+  selection.externalProductId,
+)
+assert.equal(
+  attachUnknown.steps[1].redactedEvidence.assetContentSha256,
+  selection.assetContentSha256,
+)
+assert.equal(attachUnknown.steps[1].redactedEvidence.priorImageCount, 2)
+assert.equal(attachUnknown.steps[1].redactedEvidence.projectedImageCount, 3)
+assert.equal(attachUnknown.steps[1].redactedEvidence.existingImagesPreserved, true)
+assert.equal(attachUnknown.steps[1].redactedEvidence.providerWritesKnown, false)
+assert.equal(
+  attachUnknown.steps[1].redactedEvidence.providerWriteCountLowerBound,
+  1,
+)
 assert.equal(attachUnknown.finalizations.length, 1)
 
 const locatorSha256 = hash('uploaded-locator')
-const reconciliationSteps = []
+const appliedResolutions = []
 const reconciliation = await projection.reconcileFaireProductImagePublish({
   organizationId: ids.organizationId,
   productId: ids.productId,
@@ -562,12 +592,15 @@ const reconciliation = await projection.reconcileFaireProductImagePublish({
     accountGlobalId: selection.accountGlobalId,
     credentialGeneration: 7,
     externalProductId: selection.externalProductId,
+    assetContentSha256: selection.assetContentSha256,
     externalEffectId: ids.effectId,
     externalEffectGlobalId: 'gcef0000001',
     effectState: 'unknown',
     leaseExpired: false,
     providerWriteCount: 1,
     uploadedLocatorSha256: locatorSha256,
+    reconciliationEligibility: 'readback_terminalizable',
+    reconciliationReason: 'exact_unknown_effect_evidence',
     latestOutcome: 'unknown',
     latestObservedAt: new Date().toISOString(),
   }),
@@ -580,18 +613,206 @@ const reconciliation = await projection.reconcileFaireProductImagePublish({
       url: 'https://cdn.faire.com/transient-only.png',
     }]
   },
-  recordProviderStep: async (step) => {
-    reconciliationSteps.push(step)
-    return { id: ids.attemptId, observedAt: new Date().toISOString() }
+  recordProviderStep: async () => {
+    throw new Error('exact application must use atomic terminal resolution')
+  },
+  resolveApplied: async (resolution) => {
+    appliedResolutions.push(resolution)
+    return {
+      effectState: 'succeeded',
+      providerImageCount: 1,
+      exactLocatorMatchCount: 1,
+      providerImageSetSha256: resolution.providerImageSetSha256,
+      replayed: false,
+    }
   },
 })
 assert.equal(reconciliation.confirmedApplied, true)
 assert.equal(reconciliation.outcome, 'observed_applied')
-assert.equal(reconciliationSteps[0].stage, 'reconcile')
+assert.equal(reconciliation.terminalized, true)
+assert.equal(appliedResolutions.length, 1)
 assert.equal(
-  JSON.stringify(reconciliationSteps[0].redactedEvidence).includes('https://'),
+  JSON.stringify(appliedResolutions[0]).includes('https://'),
   false,
 )
+
+let terminalReplayReconciliationCalls = 0
+const terminalReconciliationReplay =
+  await projection.reconcileFaireProductImagePublish({
+    organizationId: ids.organizationId,
+    productId: ids.productId,
+    externalEffectGlobalId: 'gcef0000001',
+    actorEmail: command.actorEmail,
+  }, {
+    readContext: async () => ({
+      deliveryGrantId: ids.grantId,
+      productId: ids.productId,
+      accountGlobalId: selection.accountGlobalId,
+      credentialGeneration: 7,
+      externalProductId: selection.externalProductId,
+      assetContentSha256: selection.assetContentSha256,
+      externalEffectId: ids.effectId,
+      externalEffectGlobalId: 'gcef0000001',
+      effectState: 'succeeded',
+      leaseExpired: false,
+      providerWriteCount: 2,
+      uploadedLocatorSha256: locatorSha256,
+      latestOutcome: 'observed_applied',
+      latestObservedAt: new Date().toISOString(),
+      reconciliationApplied: true,
+      reconciledProviderImageCount: 1,
+      reconciledExactLocatorMatchCount: 1,
+      reconciledProviderImageSetSha256: hash('provider-set'),
+    }),
+    readProviderImages: async () => {
+      terminalReplayReconciliationCalls += 1
+      return []
+    },
+    recordProviderStep: async () => {
+      terminalReplayReconciliationCalls += 1
+    },
+    resolveApplied: async () => {
+      terminalReplayReconciliationCalls += 1
+    },
+  })
+assert.equal(terminalReconciliationReplay.outcome, 'observed_applied')
+assert.equal(terminalReconciliationReplay.terminalized, true)
+assert.equal(terminalReconciliationReplay.replayed, true)
+assert.equal(terminalReplayReconciliationCalls, 0)
+
+const absentSteps = []
+const absentReconciliation =
+  await projection.reconcileFaireProductImagePublish({
+    organizationId: ids.organizationId,
+    productId: ids.productId,
+    externalEffectGlobalId: 'gcef0000001',
+    actorEmail: command.actorEmail,
+  }, {
+    readContext: async () => ({
+      deliveryGrantId: ids.grantId,
+      productId: ids.productId,
+      accountGlobalId: selection.accountGlobalId,
+      credentialGeneration: 7,
+      externalProductId: selection.externalProductId,
+      assetContentSha256: selection.assetContentSha256,
+      externalEffectId: ids.effectId,
+      externalEffectGlobalId: 'gcef0000001',
+      effectState: 'unknown',
+      leaseExpired: false,
+      providerWriteCount: 1,
+      uploadedLocatorSha256: locatorSha256,
+      reconciliationEligibility: 'readback_terminalizable',
+      reconciliationReason: 'exact_unknown_effect_evidence',
+      latestOutcome: 'unknown',
+      latestObservedAt: new Date().toISOString(),
+    }),
+    readProviderImages: async () => [{
+      providerImageId: null,
+      locatorSha256: hash('different-locator'),
+      sequence: 0,
+      url: 'https://cdn.faire.com/different.png',
+    }],
+    recordProviderStep: async (step) => {
+      absentSteps.push(step)
+      return { id: ids.attemptId, observedAt: new Date().toISOString() }
+    },
+    resolveApplied: async () => {
+      throw new Error('absent locator must remain unknown')
+    },
+  })
+assert.equal(absentReconciliation.outcome, 'observed_absent')
+assert.equal(absentReconciliation.confirmedApplied, false)
+assert.equal(absentReconciliation.terminalized, false)
+assert.equal(absentSteps[0].outcome, 'observed_absent')
+
+const ambiguousSteps = []
+const ambiguousReconciliation =
+  await projection.reconcileFaireProductImagePublish({
+    organizationId: ids.organizationId,
+    productId: ids.productId,
+    externalEffectGlobalId: 'gcef0000001',
+    actorEmail: command.actorEmail,
+  }, {
+    readContext: async () => ({
+      deliveryGrantId: ids.grantId,
+      productId: ids.productId,
+      accountGlobalId: selection.accountGlobalId,
+      credentialGeneration: 7,
+      externalProductId: selection.externalProductId,
+      assetContentSha256: selection.assetContentSha256,
+      externalEffectId: ids.effectId,
+      externalEffectGlobalId: 'gcef0000001',
+      effectState: 'unknown',
+      leaseExpired: false,
+      providerWriteCount: 1,
+      uploadedLocatorSha256: locatorSha256,
+      reconciliationEligibility: 'readback_terminalizable',
+      reconciliationReason: 'exact_unknown_effect_evidence',
+      latestOutcome: 'unknown',
+      latestObservedAt: new Date().toISOString(),
+    }),
+    readProviderImages: async () => [0, 1].map((sequence) => ({
+      providerImageId: null,
+      locatorSha256,
+      sequence,
+      url: `https://cdn.faire.com/duplicate-${sequence}.png`,
+    })),
+    recordProviderStep: async (step) => {
+      ambiguousSteps.push(step)
+      return { id: ids.attemptId, observedAt: new Date().toISOString() }
+    },
+    resolveApplied: async () => {
+      throw new Error('duplicate locator matches must remain unknown')
+    },
+  })
+assert.equal(ambiguousReconciliation.outcome, 'manual_review')
+assert.equal(
+  ambiguousReconciliation.reason,
+  'ambiguous_exact_locator_matches',
+)
+assert.equal(ambiguousReconciliation.terminalized, false)
+assert.equal(ambiguousSteps[0].outcome, 'manual_review')
+
+const failedConflictSteps = []
+const failedConflict = await projection.reconcileFaireProductImagePublish({
+  organizationId: ids.organizationId,
+  productId: ids.productId,
+  externalEffectGlobalId: 'gcef0000001',
+  actorEmail: command.actorEmail,
+}, {
+  readContext: async () => ({
+    deliveryGrantId: ids.grantId,
+    productId: ids.productId,
+    accountGlobalId: selection.accountGlobalId,
+    credentialGeneration: 7,
+    externalProductId: selection.externalProductId,
+    assetContentSha256: selection.assetContentSha256,
+    externalEffectId: ids.effectId,
+    externalEffectGlobalId: 'gcef0000001',
+    effectState: 'failed',
+    leaseExpired: false,
+    providerWriteCount: 1,
+    uploadedLocatorSha256: locatorSha256,
+    latestOutcome: 'failed',
+    latestObservedAt: new Date().toISOString(),
+  }),
+  readProviderImages: async () => [{
+    providerImageId: null,
+    locatorSha256,
+    sequence: 0,
+    url: 'https://cdn.faire.com/failed-conflict.png',
+  }],
+  recordProviderStep: async (step) => {
+    failedConflictSteps.push(step)
+    return { id: ids.attemptId, observedAt: new Date().toISOString() }
+  },
+  resolveApplied: async () => {
+    throw new Error('known failed effects must not become succeeded')
+  },
+})
+assert.equal(failedConflict.outcome, 'manual_review')
+assert.equal(failedConflict.reason, 'effect_state_conflicts_with_readback')
+assert.equal(failedConflictSteps[0].outcome, 'manual_review')
 
 let reconciliationRecoveryCalls = 0
 let reconciliationProviderReads = 0
@@ -625,12 +846,15 @@ const recoveredReconciliation =
         accountGlobalId: selection.accountGlobalId,
         credentialGeneration: 7,
         externalProductId: selection.externalProductId,
+        assetContentSha256: selection.assetContentSha256,
         externalEffectId: ids.effectId,
         externalEffectGlobalId: 'gcef0000001',
         effectState: 'unknown',
         leaseExpired: false,
         providerWriteCount: 1,
         uploadedLocatorSha256: locatorSha256,
+        reconciliationEligibility: 'readback_terminalizable',
+        reconciliationReason: 'exact_attach_unknown_evidence',
         latestOutcome: 'succeeded',
         latestObservedAt: new Date().toISOString(),
       }
@@ -648,6 +872,13 @@ const recoveredReconciliation =
     recordProviderStep: async () => ({
       id: ids.attemptId,
       observedAt: new Date().toISOString(),
+    }),
+    resolveApplied: async (resolution) => ({
+      effectState: 'succeeded',
+      providerImageCount: 1,
+      exactLocatorMatchCount: 1,
+      providerImageSetSha256: resolution.providerImageSetSha256,
+      replayed: false,
     }),
   })
 assert.equal(reconciliationRecoveryCalls, 1)
@@ -689,6 +920,8 @@ const recoveredManualReview =
       leaseExpired: false,
       providerWriteCount: 0,
       uploadedLocatorSha256: null,
+      reconciliationEligibility: 'manual_review',
+      reconciliationReason: 'upload_locator_unavailable',
       latestOutcome: null,
       latestObservedAt: null,
     }),
@@ -703,6 +936,50 @@ const recoveredManualReview =
   })
 assert.equal(recoveredManualReview.outcome, 'manual_review')
 assert.equal(manualReviewProviderReads, 0)
+
+let ineligibleLocatorProviderReads = 0
+const ineligibleLocatorSteps = []
+const ineligibleLocatorReview =
+  await projection.reconcileFaireProductImagePublish({
+    organizationId: ids.organizationId,
+    productId: ids.productId,
+    externalEffectGlobalId: 'gcef0000001',
+    actorEmail: command.actorEmail,
+  }, {
+    readContext: async () => ({
+      deliveryGrantId: ids.grantId,
+      productId: ids.productId,
+      accountGlobalId: selection.accountGlobalId,
+      credentialGeneration: 7,
+      externalProductId: selection.externalProductId,
+      assetContentSha256: selection.assetContentSha256,
+      externalEffectId: ids.effectId,
+      externalEffectGlobalId: 'gcef0000001',
+      effectState: 'unknown',
+      leaseExpired: false,
+      providerWriteCount: 1,
+      uploadedLocatorSha256: locatorSha256,
+      reconciliationEligibility: 'manual_review',
+      reconciliationReason: 'exact_attachment_evidence_unavailable',
+      latestOutcome: 'succeeded',
+      latestObservedAt: new Date().toISOString(),
+    }),
+    readProviderImages: async () => {
+      ineligibleLocatorProviderReads += 1
+      return []
+    },
+    recordProviderStep: async (step) => {
+      ineligibleLocatorSteps.push(step)
+      return { id: ids.attemptId, observedAt: new Date().toISOString() }
+    },
+  })
+assert.equal(ineligibleLocatorReview.outcome, 'manual_review')
+assert.equal(
+  ineligibleLocatorReview.reason,
+  'exact_attachment_evidence_unavailable',
+)
+assert.equal(ineligibleLocatorProviderReads, 0)
+assert.equal(ineligibleLocatorSteps[0].outcome, 'manual_review')
 
 const malformedReadSteps = []
 const malformedReadResult =
@@ -724,6 +1001,8 @@ const malformedReadResult =
       leaseExpired: false,
       providerWriteCount: 1,
       uploadedLocatorSha256: locatorSha256,
+      reconciliationEligibility: 'readback_terminalizable',
+      reconciliationReason: 'exact_unknown_effect_evidence',
       latestOutcome: 'unknown',
       latestObservedAt: new Date().toISOString(),
     }),

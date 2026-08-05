@@ -206,15 +206,109 @@ for (const fragment of [
   assertIncludes(users, fragment, 'membership-scoped user invitation')
 }
 
+const usersRoute = read('app_src/app/api/users/route.ts')
+for (const fragment of [
+  'organizationIds',
+  'createOrganization: body?.createOrganization === true',
+  'createOrganization',
+]) {
+  assertIncludes(usersRoute, fragment, 'users invite multi-organization request payload')
+}
+
+const userInviteDialog = read('app_src/components/settings/UserAccessDialog.tsx')
+for (const fragment of [
+  'Additional organizations',
+  'No other workspace organizations are available for you to manage',
+  'organizationIds',
+  'inviteOrganizationOptions',
+]) {
+  assertIncludes(userInviteDialog, fragment, 'multi-organization invite UI controls')
+}
+
+const commerceComponents = read('app_src/components/settings/CommerceIntegrationPanel.tsx')
+for (const fragment of [
+  'Open setup checklist',
+  'setupChecklistProvider',
+  'Copy scope list',
+  'providerScopes',
+  'requiredBeforeConnect',
+]) {
+  assertIncludes(commerceComponents, fragment, 'commerce setup checklist UX')
+}
+
+const invitations = read('app_src/lib/invitations.ts')
+for (const fragment of [
+  'workspace_organization_ids',
+  'organizationIds',
+  'assignment.organization.id',
+  'requestedOrganizationIds.filter',
+]) {
+  assertIncludes(invitations, fragment, 'invitation multi-org persistence')
+}
+
+const organizations = read('app_src/lib/organizations.ts')
+for (const fragment of [
+  'invitation_organizations',
+  "membership.permissions ->> 'inviteUsers'",
+  'Invitation organization is outside the workspaces you can manage',
+  'membership.user_email = $1',
+]) {
+  assertIncludes(organizations, fragment, 'cross-workspace invitation organization scope')
+}
+
+assertIncludes(
+  users,
+  'requireInvitationOrganizationInActorScope(actor, organizationId)',
+  'cross-workspace invitation authorization',
+)
+
+assert.ok(
+  invitations.indexOf('assignment.organization.id')
+    < invitations.indexOf('requestedOrganizationIds.filter'),
+  'the explicitly selected primary organization must remain first in the invitation organization list',
+)
+
+assert.ok(
+  fs.existsSync(path.join(root, 'db/migrations/0235_app_user_invitation_organization_ids.sql')),
+  'multi-org invitation migration must be present',
+)
+
 const authMagicCode = read('app_src/lib/authMagicCode.ts')
 for (const fragment of [
-  'membership.organization_id = invitation.workspace_organization_id',
-  "membership.status = 'invited'",
-  'AND organization_id = $2::uuid',
+  'min(candidate.position) AS position',
+  'cardinality(assigned.organization_ids) > 0',
+  "membership.status <> 'invited'",
+  'invitedUser.rowCount !== 1',
+  'FOR UPDATE OF invitation',
+  'lockedMemberships.rowCount !== inviteOrganizationIds.length',
+  'AND organization_id = ANY($2::uuid[])',
+  'activatedMembership.rowCount !== inviteOrganizationIds.length',
   'organization_id: invitation.rows[0].workspace_organization_id',
 ]) {
   assertIncludes(authMagicCode, fragment, 'organization-specific invitation acceptance')
 }
+
+for (const fragment of [
+  'invited_user.status IN',
+  'cardinality(assigned.organization_ids) > 0',
+  "membership.status <> 'invited'",
+]) {
+  assertIncludes(invitations, fragment, 'exact-set invitation token authorization')
+}
+
+const invitationActivationSource = authMagicCode.slice(
+  authMagicCode.indexOf('const activatedMembership'),
+  authMagicCode.indexOf('const activated ='),
+)
+assert.ok(
+  !invitationActivationSource.includes('ANY($3::uuid[])'),
+  'invitation acceptance must not restrict activation to only the primary organization',
+)
+assert.ok(
+  authMagicCode.indexOf('const activatedMembership')
+    < authMagicCode.indexOf('const accepted ='),
+  'all assigned memberships must activate before the invitation or user is accepted',
+)
 
 const magicVerifyRoute = read('app_src/app/api/auth/magic/verify/route.ts')
 assertIncludes(magicVerifyRoute, 'requireWorkspaceAppUser(result.email, result.organizationId)', 'invitation workspace session issuance')

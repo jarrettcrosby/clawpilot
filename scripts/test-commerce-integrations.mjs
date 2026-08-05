@@ -530,6 +530,7 @@ includes(adminRoute, [
   "action === 'start-faire-oauth'",
   "action === 'test-connection'",
   "action === 'set-receipt-intake'",
+  "action === 'register-shopify-scope-webhooks'",
   "action === 'set-enabled'",
   "action === 'disconnect'",
   "action === 'reveal-credential'",
@@ -554,7 +555,217 @@ includes(adminRoute, [
   'acceptedReceiptTopics: SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS',
   '...COMMERCE_CUSTOM_INTEGRATION_ONBOARDING',
   'callbackUrl: faireOAuthCallbackUrl()',
+  'providerScopes: SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES',
+  'providerScopes: FAIRE_API_SCOPES',
 ], 'Commerce admin route')
+includes(adminRoute, [
+  'async function commerceMutationIntegrations(',
+  'const project = createCommerceIntegrationsStateProjector()',
+  'return project(await mutation())',
+], 'Commerce mutation response projection')
+assert.equal(
+  (
+    adminRoute.match(
+      /const integrations = await commerceMutationIntegrations\(/g,
+    ) || []
+  ).length,
+  9,
+  'Every commerce mutation that returns integration state must restore computed account fields',
+)
+const mutationResponseHelper = adminRoute.slice(
+  adminRoute.indexOf('async function commerceMutationIntegrations('),
+  adminRoute.indexOf('function organizationId('),
+)
+assert.ok(
+  !mutationResponseHelper.includes('getCommerceIntegrationsState'),
+  'Committed commerce mutations must not perform a second state read or purge',
+)
+
+let inventoryWebhookProviderWrites = 0
+let legacyRefreshReads = 0
+let projectorCreations = 0
+let projectorSetupFails = false
+const committedMutationState = {
+  organizationId,
+  accounts: [{
+    globalId: 'gia0000001',
+    provider: 'shopify',
+    configuration: {
+      webhookSubscriptionReadiness: {
+        ready: true,
+        missingTopics: [],
+      },
+    },
+  }],
+  commerceActiveContinuation: null,
+}
+class MockCommerceIntegrationRequestError extends Error {
+  constructor(
+    message,
+    status = 400,
+    code = 'COMMERCE_REQUEST_INVALID',
+  ) {
+    super(message)
+    this.status = status
+    this.code = code
+  }
+}
+const routeUnderMutationTest = loadTypeScriptModule(
+  'app_src/app/api/integrations/commerce/route.ts',
+  {
+    mocks: {
+      'next/server': {
+        NextResponse: {
+          json(payload, init) {
+            return new Response(JSON.stringify(payload), {
+              status: init.status,
+              headers: {
+                ...init.headers,
+                'Content-Type': 'application/json',
+              },
+            })
+          },
+        },
+      },
+      '@/lib/integrations/commerceIntegrations': {
+        CommerceIntegrationRequestError:
+          MockCommerceIntegrationRequestError,
+        createCommerceIntegrationsStateProjector() {
+          projectorCreations += 1
+          if (projectorSetupFails) {
+            throw new Error('simulated projector setup failure')
+          }
+          return (state) => ({
+            ...state,
+            accounts: state.accounts.map((account) => ({
+              ...account,
+              webhookUrl: account.provider === 'shopify'
+                ? `https://clawpilot.example/webhooks/${account.globalId}`
+                : null,
+            })),
+          })
+        },
+        async getCommerceIntegrationsState() {
+          legacyRefreshReads += 1
+          throw new Error('simulated post-commit refresh failure')
+        },
+        async registerShopifyInventoryWebhookSubscriptions() {
+          inventoryWebhookProviderWrites += 1
+          return committedMutationState
+        },
+        faireOAuthCallbackUrl() {
+          return 'https://clawpilot.example/faire/oauth/callback'
+        },
+        sanitizedCommerceIntegrationError(error) {
+          return {
+            message: error instanceof Error ? error.message : 'Unknown error',
+            status: error?.status || 503,
+            code: error?.code || 'COMMERCE_TEST_FAILURE',
+          }
+        },
+      },
+      '@/lib/integrations/commerceIntake': {
+        commerceIntakeRuntimeAvailable() {
+          return false
+        },
+      },
+      '@/lib/integrations/commerceCapabilities': {
+        CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION: {},
+        CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION: {},
+        COMMERCE_CUSTOM_INTEGRATION_ONBOARDING: {
+          shopify: {},
+          faire: {},
+        },
+        COMMERCE_CAPABILITY_DEFINITIONS: {},
+        FAIRE_CAPABILITY_SCOPES: {},
+        FAIRE_PROVIDER_AVAILABLE_CAPABILITIES: [],
+        SHOPIFY_ADMIN_API_VERSION: 'test',
+        SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES: [],
+        SHOPIFY_CAPABILITY_SCOPES: {},
+        SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS: [],
+        SHOPIFY_PROVIDER_AVAILABLE_CAPABILITIES: [],
+        SHOPIFY_RESTRICTED_ACCESS_SCOPES: [],
+      },
+      '@/lib/integrations/faireCommerceClient': {
+        FAIRE_API_SCOPES: [],
+        FAIRE_COMMERCE_CAPABILITIES: {
+          classification: 'test_faire',
+        },
+      },
+      '@/lib/operations/authorization': {
+        operationsCapabilities() {
+          return { canManage: true, canActivate: true }
+        },
+      },
+      '@/lib/persistence/config': {
+        isPostgresStorageEnabled() {
+          return true
+        },
+      },
+      '@/lib/requestUser': {
+        async requireRequestUser() {
+          return {
+            email: 'operator@example.com',
+            organizationId,
+          }
+        },
+        async requireRequestSession() {
+          return { id: 'session-id' }
+        },
+      },
+      '@/lib/users': {
+        effectiveAuthorizationRole() {
+          return 'owner'
+        },
+      },
+    },
+  },
+)
+function inventoryWebhookRequest() {
+  return new Request('https://clawpilot.example/api/integrations/commerce', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'register-shopify-inventory-webhooks',
+      accountGlobalId: 'gia0000001',
+      confirmProviderWrites: true,
+    }),
+  })
+}
+const committedMutationResponse = await routeUnderMutationTest.PATCH(
+  inventoryWebhookRequest(),
+)
+assert.equal(committedMutationResponse.status, 200)
+const committedMutationPayload = await committedMutationResponse.json()
+assert.equal(inventoryWebhookProviderWrites, 1)
+assert.equal(projectorCreations, 1)
+assert.equal(
+  legacyRefreshReads,
+  0,
+  'Successful provider writes must not depend on a fallible second state read',
+)
+assert.equal(
+  committedMutationPayload.integrations.accounts[0].webhookUrl,
+  'https://clawpilot.example/webhooks/gia0000001',
+)
+assert.deepEqual(
+  committedMutationPayload.integrations.accounts[0]
+    .configuration.webhookSubscriptionReadiness,
+  { ready: true, missingTopics: [] },
+  'The authoritative mutation readiness must survive view projection',
+)
+
+projectorSetupFails = true
+const failedProjectorResponse = await routeUnderMutationTest.PATCH(
+  inventoryWebhookRequest(),
+)
+assert.equal(failedProjectorResponse.status, 503)
+assert.equal(
+  inventoryWebhookProviderWrites,
+  1,
+  'View-enrichment setup failure must occur before the provider mutation',
+)
+assert.equal(legacyRefreshReads, 0)
 const faireApiKeyRouteSource = adminRoute.slice(
   adminRoute.indexOf("if (action === 'connect-faire-api-key')"),
   adminRoute.indexOf("if (action === 'test-connection')"),
@@ -753,7 +964,30 @@ includes(panel, [
   'const actionError = actionableCommerceError(requestError)',
   'await requestCommerce()',
   'Revoke or remove provider-side access separately',
-  'Optional signed receipt setup',
+  'Open setup checklist',
+  'Provider scopes and permissions',
+  'setupChecklistSteps.map',
+  'defaultExpanded={false}',
+  'Shopify dashboard',
+  'API key guide',
+  'Faire generated API-key setup',
+  'Faire Custom App OAuth setup',
+  'resolveCommerceSetupPermissionGuidance',
+  'setupPermissionGuidance.copyable',
+  'setupPermissionGuidance.scopes',
+  'Separate restricted-scope approval · <code>read_all_orders</code>',
+  'Protected customer-data approval · <code>read_customers</code>',
+  'Shopify read-all-orders approval',
+  'Shopify protected-data requirements',
+  'OAuth permission list',
+  'Not applicable · access is issued with the generated key',
+  'Exact OAuth permissions',
+  'Open setup checklist',
+  'setupChecklistProvider',
+  'catalog?.providers.shopify.providerScopes',
+  'Signed receipt setup',
+  'Register scope safety webhook',
+  'Current Shopify webhook receipts need attention',
   'Copy URL',
   'Distributed Operations scope profile',
   "action: 'set-receipt-intake'",
@@ -788,6 +1022,16 @@ includes(panel, [
   'const revealOrganizationId = organizationIdRef.current',
   'organizationIdRef.current === revealOrganizationId',
 ], 'Commerce settings UI')
+const setupGuidance = read(
+  'app_src/lib/integrations/commerceSetupGuidance.ts',
+)
+includes(setupGuidance, [
+  'Exact Shopify app scopes ClawPilot expects',
+  "mode: 'provider_issued_access'",
+  'There is no OAuth scope list to copy or configure for this path',
+  'input.faireScopeProfiles[input.faireScopeProfile]',
+  "mode: 'faire_oauth_scopes'",
+], 'Commerce setup permission guidance')
 const revealPanelSource = panel.slice(
   panel.indexOf('async function revealCredential'),
   panel.indexOf('async function copyRevealedCredential'),
@@ -865,6 +1109,16 @@ assert.equal(
   'https://dev.shopify.com/dashboard',
 )
 assert.equal(
+  capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING.shopify
+    .restrictedOrderScopeApprovalUrl,
+  'https://shopify.dev/docs/api/usage/access-scopes#orders-permissions',
+)
+assert.equal(
+  capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING.shopify
+    .protectedCustomerDataApprovalUrl,
+  'https://shopify.dev/docs/apps/launch/protected-customer-data',
+)
+assert.equal(
   capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING.faire.setupGuideUrl,
   'https://developers.faire.com/docs#/#authentication',
 )
@@ -885,6 +1139,30 @@ assert.deepEqual(
       .faire.scopeProfiles.connection_test,
   )),
   ['READ_BRAND'],
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING
+      .faire.brandApiKeyRequiredBeforeConnect,
+  )),
+  [
+    'Create a Faire Developer account and a Custom App.',
+    'In Faire Brand Portal, open the unpublished integration for that app and choose Generate API key.',
+    'Copy the final provider-issued API key once; do not use the Application ID, APA application token, or Secret ID.',
+    'Return to ClawPilot and authorize one read-only brand-profile verification request.',
+  ],
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING
+      .faire.oauthRequiredBeforeConnect,
+  )),
+  [
+    'Create a Faire Developer account and a Custom App.',
+    'Confirm Faire accepts the Custom App OAuth authorization path for the intended brand.',
+    'Copy the Application ID and Secret ID from App Details and Settings.',
+    'Select the least-privilege permission profile in ClawPilot, then continue to Faire for approval.',
+  ],
 )
 assert.equal(
   capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING
@@ -2262,12 +2540,20 @@ const commerceStateSource = service.slice(
   service.indexOf('export async function getCommerceIntegrationsState'),
   service.indexOf('export async function connectShopifyCommerce'),
 )
-assert.ok(
-  commerceStateSource.includes(
-    'await purgeExpiredShopifyOrderPreviewsInPostgres()',
-  ),
-  'Sales-channel reads must opportunistically purge expired Shopify previews',
+includes(commerceStateSource, [
+  'const project = createCommerceIntegrationsStateProjector()',
+  'await purgeExpiredShopifyOrderPreviewsInPostgres()',
+  'return project(state)',
+], 'Sales-channel state enrichment')
+const commerceStateProjectorSource = service.slice(
+  service.indexOf('export function createCommerceIntegrationsStateProjector'),
+  service.indexOf('export function faireOAuthCallbackUrl'),
 )
+includes(commerceStateProjectorSource, [
+  'const publicUrl = appPublicUrl()',
+  "webhookUrl: account.provider === 'shopify'",
+  'webhookUrl(account.globalId, publicUrl)',
+], 'Sales-channel state projector')
 
 const previewRoute = read(
   'app_src/app/api/integrations/commerce/shopify/order-preview/route.ts',

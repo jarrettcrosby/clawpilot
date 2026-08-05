@@ -15,8 +15,12 @@ export const SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS = [
   'products/update',
 ] as const
 
-export const SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS = [
+export const SHOPIFY_SCOPE_REFRESH_WEBHOOK_TOPICS = [
   'app/scopes_update',
+] as const
+
+export const SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS = [
+  ...SHOPIFY_SCOPE_REFRESH_WEBHOOK_TOPICS,
   ...SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
   ...SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS,
 ] as const
@@ -292,11 +296,15 @@ export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
       'https://shopify.dev/docs/apps/build/dev-dashboard/create-apps-using-dev-dashboard',
     tokenGuideUrl:
       'https://shopify.dev/docs/apps/build/dev-dashboard/get-api-access-tokens',
+    restrictedOrderScopeApprovalUrl:
+      'https://shopify.dev/docs/api/usage/access-scopes#orders-permissions',
+    protectedCustomerDataApprovalUrl:
+      'https://shopify.dev/docs/apps/launch/protected-customer-data',
     defaultAppUrl: 'https://shopify.dev/apps/default-app-home',
     apiVersion: SHOPIFY_ADMIN_API_VERSION,
     requiredBeforeConnect: [
       'Create a merchant-owned app in Shopify Dev Dashboard.',
-      'Create and release an app version with least-privilege scopes.',
+      'Configure the exact ClawPilot app scopes shown below, then create and release the app version.',
       'Install the app on a store in the same Shopify organization.',
       'Copy the canonical myshopify.com domain, client ID, and client secret.',
     ],
@@ -304,6 +312,14 @@ export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
     distributedOperationsScopes: SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
     acceptedReceiptTopics: SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS,
     webhookSetupGroups: [
+      {
+        key: 'scope_control',
+        label: 'Access-scope safety',
+        topics: SHOPIFY_SCOPE_REFRESH_WEBHOOK_TOPICS,
+        requiredScopes: [],
+        state: 'available',
+        behavior: 'Re-evaluates the installed grant and immediately holds signed receipt intake if the product or inventory proof scope is removed.',
+      },
       {
         key: 'inventory',
         label: 'Inventory freshness',
@@ -347,7 +363,7 @@ export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
       {
         key: 'configuration',
         label: 'Connection and locations',
-        topics: ['app/scopes_update', 'app/uninstalled', 'locations/create', 'locations/update', 'locations/delete'],
+        topics: ['app/uninstalled', 'locations/create', 'locations/update', 'locations/delete'],
         requiredScopes: ['read_locations'],
         state: 'processor_pending',
         behavior: 'Configuration events will re-evaluate scopes, connection health, locations, and warehouse routing.',
@@ -364,6 +380,18 @@ export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
       'https://developers.faire.com/docs#/#authentication',
     directTokenGuideUrl:
       'https://www.faire.com/support/articles/37632363832091',
+    brandApiKeyRequiredBeforeConnect: [
+      'Create a Faire Developer account and a Custom App.',
+      'In Faire Brand Portal, open the unpublished integration for that app and choose Generate API key.',
+      'Copy the final provider-issued API key once; do not use the Application ID, APA application token, or Secret ID.',
+      'Return to ClawPilot and authorize one read-only brand-profile verification request.',
+    ],
+    oauthRequiredBeforeConnect: [
+      'Create a Faire Developer account and a Custom App.',
+      'Confirm Faire accepts the Custom App OAuth authorization path for the intended brand.',
+      'Copy the Application ID and Secret ID from App Details and Settings.',
+      'Select the least-privilege permission profile in ClawPilot, then continue to Faire for approval.',
+    ],
     requiredBeforeConnect: [
       'Create a Faire Developer account and a Custom App.',
       'For one brand, use the unpublished integration in Faire Brand Portal to generate a final API key.',

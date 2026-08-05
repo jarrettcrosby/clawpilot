@@ -425,6 +425,9 @@ type CommerceIntake = {
     consecutiveFailures: number
     lastErrorCode: string | null
     automaticPromotionAttentionRequired: boolean
+    automaticExactRefreshAttentionRequired: boolean
+    automaticUnattributedAttentionRequired: boolean
+    operatorAttentionRequired: boolean
     lastStartedAt: string | null
     lastCompletedAt: string | null
     resumable: boolean
@@ -2139,9 +2142,9 @@ export default function CommerceIntakeWorkflow({
       : issueRecordCount > 0
         ? {
             label: `Review ${issueRecordCount} ${
-              issueRecordCount === 1 ? 'issue' : 'issues'
+              issueRecordCount === 1 ? 'exception' : 'exceptions'
             }`,
-            detail: 'Grouped provider failures and order blockers show what can be fixed next.',
+            detail: 'Retained provider rejections and blocked order candidates show what genuinely needs attention.',
             tab: 'issues' as WorkbenchTab,
           }
         : candidates.length > 0
@@ -3714,7 +3717,7 @@ export default function CommerceIntakeWorkflow({
                 size="small"
                 color={issueRecordCount ? 'warning' : 'default'}
                 label={`${issueRecordCount} ${
-                  issueRecordCount === 1 ? 'issue' : 'issues'
+                  issueRecordCount === 1 ? 'exception' : 'exceptions'
                 }`}
               />
             </Stack>
@@ -3788,13 +3791,13 @@ export default function CommerceIntakeWorkflow({
               id={`commerce-intake-tab-orders-${accountGlobalId}`}
               aria-controls={`commerce-intake-panel-orders-${accountGlobalId}`}
               value="orders"
-              label={`Orders (${candidates.length})`}
+              label={`Order candidates (${candidates.length})`}
             />
             <Tab
               id={`commerce-intake-tab-issues-${accountGlobalId}`}
               aria-controls={`commerce-intake-panel-issues-${accountGlobalId}`}
               value="issues"
-              label={`Issues (${issueRecordCount})`}
+              label={`Exceptions (${issueRecordCount})`}
             />
           </Tabs>
         </Box>
@@ -3900,9 +3903,26 @@ export default function CommerceIntakeWorkflow({
                       {orderReconciliation?.status === 'running'
                         ? `ClawPilot is reading current ${providerLabel(provider)} orders now.`
                         : orderReconciliation?.status === 'succeeded'
-                          ? orderReconciliation
-                            .automaticPromotionAttentionRequired
-                            ? `The provider read completed, but automatic local Faire order promotion needs attention${
+                          ? orderReconciliation.operatorAttentionRequired
+                            ? `The provider read completed, but ${
+                              orderReconciliation
+                                .automaticUnattributedAttentionRequired
+                                ? orderReconciliation
+                                  .automaticPromotionAttentionRequired
+                                  || orderReconciliation
+                                    .automaticExactRefreshAttentionRequired
+                                  ? 'classified automatic attention and legacy Faire attention with unavailable subtype need review'
+                                  : 'legacy Faire order attention with unavailable subtype needs review'
+                                : orderReconciliation
+                                .automaticPromotionAttentionRequired
+                                && orderReconciliation
+                                  .automaticExactRefreshAttentionRequired
+                                ? `automatic local ${providerLabel(provider)} order promotion and Faire exact refresh need attention`
+                                : orderReconciliation
+                                  .automaticExactRefreshAttentionRequired
+                                  ? 'Faire exact order refresh needs attention'
+                                  : `automatic local ${providerLabel(provider)} order promotion needs attention`
+                            }${
                               orderReconciliation.lastErrorCode
                                 ? ` (${orderReconciliation.lastErrorCode})`
                                 : ''
@@ -3930,7 +3950,7 @@ export default function CommerceIntakeWorkflow({
                     color={
                       orderReconciliation?.status === 'failed'
                       || orderReconciliation
-                        ?.automaticPromotionAttentionRequired
+                        ?.operatorAttentionRequired
                         ? 'warning'
                         : orderReconciliation?.status === 'running'
                           ? 'info'
@@ -3946,23 +3966,31 @@ export default function CommerceIntakeWorkflow({
                     size="small"
                     label={`${
                       orderReconciliation?.recordsSeen || 0
-                    } provider records read`}
+                    } provider order rows scanned`}
                   />
+                  {orderPagination ? (
+                    <Chip
+                      size="small"
+                      label={`${
+                        orderPagination.eligibleOrdersSeen
+                      } eligible order rows in latest page`}
+                    />
+                  ) : null}
                   <Chip
                     size="small"
                     label={`${
                       orderReconciliation?.recordsHeld || 0
-                    } held or rejected for review`}
+                    } new rows held/rejected in this scan`}
                   />
-                  {orderReconciliation?.canonicalOrderWrites ? (
-                    <Chip
-                      size="small"
-                      color="success"
-                      label={`${
-                        orderReconciliation.canonicalOrderWrites
-                      } orders promoted automatically`}
-                    />
-                  ) : null}
+                  <Chip
+                    size="small"
+                    color={orderReconciliation?.canonicalOrderWrites
+                      ? 'success'
+                      : 'default'}
+                    label={`${
+                      orderReconciliation?.canonicalOrderWrites || 0
+                    } ClawPilot orders added`}
+                  />
                   {orderReconciliation?.resumable ? (
                     <Chip
                       size="small"
@@ -3974,20 +4002,61 @@ export default function CommerceIntakeWorkflow({
                     size="small"
                     label="0 provider writes"
                   />
+                  <Chip
+                    size="small"
+                    color={candidates.length ? 'warning' : 'default'}
+                    label={`${candidates.length} retained order ${
+                      candidates.length === 1 ? 'candidate' : 'candidates'
+                    }`}
+                  />
+                  <Chip
+                    size="small"
+                    color={totalRejectionCount ? 'warning' : 'default'}
+                    label={`${totalRejectionCount} retained provider ${
+                      totalRejectionCount === 1 ? 'rejection' : 'rejections'
+                    }`}
+                  />
                 </Stack>
                 <Typography variant="caption" color="text.secondary">
-                  Provider reads remain read-only. Fresh, unambiguous Faire
-                  orders may be promoted locally into ClawPilot automatically;
-                  held records remain available for review. This step does not
-                  reserve inventory, create shipments, or write back to the
-                  provider.
+                  Scanned rows are provider order rows checked, not ClawPilot
+                  orders added. ClawPilot filters ineligible rows and
+                  deduplicates already-known orders before an eligible row can
+                  be held for review or added automatically when the channel
+                  safety policy permits. Fresh, unambiguous Faire orders and
+                  exact development-cohort Shopify orders with one matched
+                  ClawPilot checkout quote may be promoted locally. The
+                  eligible count is for the latest provider page; new
+                  held/rejected and ClawPilot-order counts are current scan
+                  results. Retained order candidates and provider rejections
+                  remain visible across scans for their review-retention
+                  window, so they are not new outcomes from the latest page.
+                  Provider reads remain read-only. This step does not reserve
+                  inventory, create shipments, or write back to the provider.
                 </Typography>
                 {orderReconciliation
                   ?.automaticPromotionAttentionRequired ? (
                     <Alert severity="warning">
-                      The provider read succeeded, but at least one automatic
-                      Faire order promotion failed. Review the held order and
-                      its error before fulfillment.
+                      The provider read succeeded, but at least one automatic{' '}
+                      {providerLabel(provider)} order promotion was held or
+                      failed. Review the order evidence and error before
+                      fulfillment.
+                    </Alert>
+                  ) : null}
+                {orderReconciliation
+                  ?.automaticExactRefreshAttentionRequired ? (
+                    <Alert severity="warning">
+                      A Faire exact order refresh was rejected or failed and
+                      remains marked for operator review. Review the retained
+                      candidate evidence before fulfillment.
+                    </Alert>
+                  ) : null}
+                {orderReconciliation
+                  ?.automaticUnattributedAttentionRequired ? (
+                    <Alert severity="warning">
+                      This Faire attention record predates subtype tracking, so
+                      ClawPilot cannot safely classify it as promotion or exact
+                      refresh. Review the retained candidate evidence before
+                      fulfillment.
                     </Alert>
                   ) : null}
                 {orderReconciliation?.status === 'failed' ? (

@@ -2,8 +2,10 @@ import { createHash } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
+  hasEffectiveShopifyScope,
   SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS,
   SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
+  SHOPIFY_RECEIPT_PROOF_SCOPES,
 } from '@/lib/integrations/commerceCapabilities'
 import {
   faireFulfillmentWriteReadiness,
@@ -42,6 +44,10 @@ import {
   ensureShopifyFulfillmentNotificationPolicyWithClient,
   type ShopifyFulfillmentNotificationPolicyState,
 } from '@/lib/persistence/shopifyFulfillmentNotifications'
+import {
+  readShopifyWebhookReceiptAccountHealthFromPostgres,
+  type ShopifyWebhookReceiptAccountHealth,
+} from '@/lib/persistence/shopifyWebhookReceiptHealth'
 import type {
   CommerceActiveContinuation,
 } from '@/lib/operations/commerceActiveSelection'
@@ -177,6 +183,7 @@ export type CommerceIntegrationAccountState = {
     failedAttempts: number
     deadLetterAttempts: number
     lastAttemptAt: string | null
+    webhookReceiptHealth: ShopifyWebhookReceiptAccountHealth | null
   }
   fulfillmentWriteReadiness: FaireFulfillmentWriteReadiness | null
   updatedAt: string
@@ -295,6 +302,7 @@ function accountState(
     updated_at: TimestampValue
   },
   faireAuthority?: FaireFulfillmentAuthoritySummaryRow,
+  shopifyWebhookReceiptHealth?: ShopifyWebhookReceiptAccountHealth,
 ): CommerceIntegrationAccountState {
   const configured = commerceCredentialConfigured(row)
   return {
@@ -344,6 +352,20 @@ function accountState(
       failedAttempts: numberValue(evidence?.failed_attempts),
       deadLetterAttempts: numberValue(evidence?.dead_letter_attempts),
       lastAttemptAt: iso(evidence?.last_attempt_at),
+      webhookReceiptHealth: row.provider === 'shopify'
+        ? shopifyWebhookReceiptHealth || {
+            integrationAccountId: row.id,
+            accountGlobalId: row.global_id,
+            status: 'ready',
+            actionable: 0,
+            staleQueued: 0,
+            staleProcessing: 0,
+            failed: 0,
+            deadLetter: 0,
+            heldProductDeletes: 0,
+            oldestActionableAt: null,
+          }
+        : null,
     },
     fulfillmentWriteReadiness: row.provider === 'faire'
       ? faireFulfillmentWriteReadiness({
@@ -387,6 +409,7 @@ export async function readCommerceIntegrationsStateFromPostgres(
     evidenceRows,
     notificationPolicyRows,
     faireAuthorityRows,
+    shopifyWebhookReceiptHealthRows,
     commerceActiveContinuation,
   ] =
     await Promise.all([
@@ -519,6 +542,7 @@ export async function readCommerceIntegrationsStateFromPostgres(
            AND account.provider = 'faire'`,
         [organizationId],
       ),
+      readShopifyWebhookReceiptAccountHealthFromPostgres(organizationId),
       readCommerceActiveContinuationInPostgres({ organizationId }),
     ])
 
@@ -537,6 +561,12 @@ export async function readCommerceIntegrationsStateFromPostgres(
   const faireAuthorities = new Map(
     faireAuthorityRows.rows.map((row) => [row.integration_account_id, row]),
   )
+  const shopifyWebhookReceiptHealth = new Map(
+    shopifyWebhookReceiptHealthRows.map((row) => [
+      row.integrationAccountId,
+      row,
+    ]),
+  )
   return {
     organizationId,
     commerceActiveContinuation,
@@ -546,6 +576,7 @@ export async function readCommerceIntegrationsStateFromPostgres(
       evidence.get(row.id),
       notificationPolicies.get(row.id),
       faireAuthorities.get(row.id),
+      shopifyWebhookReceiptHealth.get(row.id),
     )),
   }
 }
@@ -1987,9 +2018,11 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
     }
     const receiptProofScopeIncomplete = Boolean(
       input.scopeAudit
-      && (
-        !input.scopeAudit.grantedScopes.includes('read_products')
-        || !input.scopeAudit.grantedScopes.includes('read_inventory')
+      && SHOPIFY_RECEIPT_PROOF_SCOPES.some(
+        (scope) => !hasEffectiveShopifyScope(
+          input.scopeAudit?.grantedScopes || [],
+          scope,
+        ),
       ),
     )
     if (input.scopeAudit) {
@@ -2038,9 +2071,18 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
     const receiptIntakeEnabled = receiptProofScopeIncomplete
       ? false
       : current.receipt_intake_enabled
+    // Access-scope control is applied synchronously in this transaction. A
+    // manual domain-receipt hold must not leave a complete control event
+    // queued forever; a proof-scope loss remains held after closing intake.
     let receiptState: 'queued' | 'held' = (
-      receiptIntakeEnabled
-      && (!input.productDeletion || productDeletionCanReconcile)
+      (
+        Boolean(input.scopeAudit)
+        && !receiptProofScopeIncomplete
+      )
+      || (
+        receiptIntakeEnabled
+        && (!input.productDeletion || productDeletionCanReconcile)
+      )
     )
       ? 'queued'
       : 'held'
@@ -2077,6 +2119,33 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
       ],
     )
     const globalId = inserted.rows[0].global_id
+    let scopeRefreshTerminalized = false
+    if (input.scopeAudit && receiptState === 'queued') {
+      const finalized = await client.query(
+        `UPDATE operations_commerce_webhook_receipts
+         SET state = 'succeeded',
+             attempts = attempts + 1,
+             processed_at = clock_timestamp(),
+             last_error_code = NULL,
+             updated_at = clock_timestamp()
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND global_id = $3
+           AND topic = 'app/scopes_update'
+           AND state = 'queued'`,
+        [
+          input.runtime.organizationId,
+          input.runtime.integrationAccountId,
+          globalId,
+        ],
+      )
+      if (finalized.rowCount !== 1) {
+        throw new Error(
+          'Shopify access-scope webhook receipt could not be finalized',
+        )
+      }
+      scopeRefreshTerminalized = true
+    }
     // The exact signed deletion projection and the encrypted immutable receipt
     // commit in one transaction. The catalog dirty watermark is signaled only
     // after durable complete-empty image/binding evidence exists.
@@ -2255,6 +2324,8 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
         credentialVersion: input.runtime.credentialVersion,
         inventoryRefreshSignaled: Boolean(inventoryRefreshSignal),
         catalogRefreshSignaled: Boolean(catalogRefreshSignal),
+        scopeRefreshApplied: Boolean(input.scopeAudit),
+        scopeRefreshTerminalized,
         productDeletionReconciled: Boolean(
           productDeletion && !productDeletion.staleSnapshotIgnored,
         ),

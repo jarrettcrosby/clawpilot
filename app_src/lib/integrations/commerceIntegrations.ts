@@ -33,6 +33,7 @@ import {
   SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
   SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
   SHOPIFY_RECEIPT_PROOF_SCOPES,
+  SHOPIFY_SCOPE_REFRESH_WEBHOOK_TOPICS,
 } from '@/lib/integrations/commerceCapabilities'
 import {
   createShopifyWebhookSubscription,
@@ -70,6 +71,7 @@ import {
   recordShopifyWebhookReceiptInPostgres,
   setCommerceIntegrationEnabledInPostgres,
   writeCommerceCredentialInPostgres,
+  type CommerceIntegrationsState,
   type CommerceRuntimeCredentialRecord,
   type CommerceSyncResource,
 } from '@/lib/persistence/commerceIntegrations'
@@ -108,6 +110,26 @@ function missingShopifyReceiptProofScopes(grantedScopes: unknown) {
   return SHOPIFY_RECEIPT_PROOF_SCOPES.filter(
     (scope) => !hasEffectiveShopifyScope(granted, scope),
   )
+}
+
+const SHOPIFY_RECEIPT_SUBSCRIPTION_GROUPS = [
+  { key: 'scopeWebhookSubscriptions', label: 'access-scope safety' },
+  { key: 'webhookSubscriptions', label: 'inventory freshness' },
+  { key: 'catalogWebhookSubscriptions', label: 'product catalog' },
+] as const
+
+function missingShopifyReceiptSubscriptionGroups(
+  configuration: Record<string, unknown>,
+) {
+  return SHOPIFY_RECEIPT_SUBSCRIPTION_GROUPS
+    .filter(({ key }) => {
+      const readiness = configuration[key]
+      return !readiness
+        || typeof readiness !== 'object'
+        || Array.isArray(readiness)
+        || (readiness as Record<string, unknown>).ready !== true
+    })
+    .map(({ label }) => label)
 }
 
 export class CommerceIntegrationRequestError extends Error {
@@ -353,11 +375,35 @@ const FAIRE_SYNC_RESOURCES: CommerceSyncResource[] = [
   'returns',
 ]
 
-function webhookUrl(globalId: string) {
+function webhookUrl(globalId: string, publicUrl = appPublicUrl()) {
   return new URL(
     `/api/integrations/commerce/shopify/webhooks/${globalId}`,
-    appPublicUrl(),
+    publicUrl,
   ).toString()
+}
+
+export type CommerceIntegrationsViewState = Omit<
+  CommerceIntegrationsState,
+  'accounts'
+> & {
+  accounts: Array<CommerceIntegrationsState['accounts'][number] & {
+    webhookUrl: string | null
+  }>
+}
+
+export function createCommerceIntegrationsStateProjector(): (
+  state: CommerceIntegrationsState,
+) => CommerceIntegrationsViewState {
+  const publicUrl = appPublicUrl()
+  return (state) => ({
+    ...state,
+    accounts: state.accounts.map((account) => ({
+      ...account,
+      webhookUrl: account.provider === 'shopify'
+        ? webhookUrl(account.globalId, publicUrl)
+        : null,
+    })),
+  })
 }
 
 export function faireOAuthCallbackUrl() {
@@ -613,17 +659,10 @@ export async function getCommerceIntegrationsState(
   organizationIdValue: unknown,
 ) {
   const organizationId = normalizeCommerceOrganizationId(organizationIdValue)
+  const project = createCommerceIntegrationsStateProjector()
   await purgeExpiredShopifyOrderPreviewsInPostgres()
   const state = await readCommerceIntegrationsStateFromPostgres(organizationId)
-  return {
-    ...state,
-    accounts: state.accounts.map((account) => ({
-      ...account,
-      webhookUrl: account.provider === 'shopify'
-        ? webhookUrl(account.globalId)
-        : null,
-    })),
-  }
+  return project(state)
 }
 
 export async function revealCommerceCredential(input: {
@@ -1161,6 +1200,13 @@ async function verifyStoredConnection(
       SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
       probe.grantedScopes,
     )
+    const scopeWebhookSubscriptions = await discoverShopifyWebhookSubscriptions(
+      { shopDomain, accessToken: grant.accessToken },
+      {
+        desiredUri: webhookUrl(runtime.globalId),
+        topics: SHOPIFY_SCOPE_REFRESH_WEBHOOK_TOPICS,
+      },
+    )
     const webhookSubscriptions = await discoverShopifyWebhookSubscriptions(
       { shopDomain, accessToken: grant.accessToken },
       {
@@ -1191,6 +1237,20 @@ async function verifyStoredConnection(
         requestedScopes: scopeAudit.requestedScopes,
         missingScopes: scopeAudit.missingScopes,
         restrictedScopes: scopeAudit.restrictedScopes,
+        scopeWebhookSubscriptions: {
+          desiredUri: scopeWebhookSubscriptions.desiredUri,
+          requiredTopics: scopeWebhookSubscriptions.requiredTopics,
+          observedCount: scopeWebhookSubscriptions.subscriptions.length,
+          matchingCount: scopeWebhookSubscriptions.subscriptions.filter(
+            (subscription) => subscription.uri
+              === scopeWebhookSubscriptions.desiredUri,
+          ).length,
+          missingTopics: scopeWebhookSubscriptions.missingTopics,
+          conflictingTopics: scopeWebhookSubscriptions.conflictingTopics,
+          ready: scopeWebhookSubscriptions.ready,
+          observedAt: new Date().toISOString(),
+          providerWrites: 0,
+        },
         webhookSubscriptions: {
           desiredUri: webhookSubscriptions.desiredUri,
           requiredTopics: webhookSubscriptions.requiredTopics,
@@ -1227,6 +1287,13 @@ async function verifyStoredConnection(
         shopDomain: probe.shopDomain,
         grantedScopeCount: probe.grantedScopes.length,
         tokenLifetimeSeconds: grant.expiresIn,
+        scopeWebhookSubscriptionReady: scopeWebhookSubscriptions.ready,
+        scopeWebhookSubscriptionObservedCount:
+          scopeWebhookSubscriptions.subscriptions.length,
+        scopeWebhookSubscriptionMissingCount:
+          scopeWebhookSubscriptions.missingTopics.length,
+        scopeWebhookSubscriptionConflictingCount:
+          scopeWebhookSubscriptions.conflictingTopics.length,
         webhookSubscriptionReady: webhookSubscriptions.ready,
         webhookSubscriptionObservedCount: webhookSubscriptions.subscriptions.length,
         webhookSubscriptionMissingCount: webhookSubscriptions.missingTopics.length,
@@ -1380,7 +1447,7 @@ async function registerShopifyWebhookSubscriptionGroup(input: {
   organizationId: unknown
   accountGlobalId: unknown
   actorEmail: string
-  group: 'inventory' | 'catalog'
+  group: 'scope' | 'inventory' | 'catalog'
 }) {
   let runtime: CommerceRuntimeCredentialRecord | null = null
   const requestedAt = new Date()
@@ -1411,9 +1478,11 @@ async function registerShopifyWebhookSubscriptionGroup(input: {
     })
     const providerCredential = { shopDomain, accessToken: grant.accessToken }
     const desiredUri = webhookUrl(runtime.globalId)
-    const topics = input.group === 'inventory'
-      ? SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS
-      : SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS
+    const topics = input.group === 'scope'
+      ? SHOPIFY_SCOPE_REFRESH_WEBHOOK_TOPICS
+      : input.group === 'inventory'
+        ? SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS
+        : SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS
     const created = []
     for (const topic of topics) {
       created.push(await createShopifyWebhookSubscription(
@@ -1464,6 +1533,14 @@ async function registerShopifyWebhookSubscriptionGroup(input: {
   } catch (error) {
     throw sanitize(error)
   }
+}
+
+export function registerShopifyScopeWebhookSubscriptions(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  actorEmail: string
+}) {
+  return registerShopifyWebhookSubscriptionGroup({ ...input, group: 'scope' })
 }
 
 export function registerShopifyInventoryWebhookSubscriptions(input: {
@@ -1520,6 +1597,15 @@ export async function setCommerceIntegrationEnabled(input: {
           `Shopify app is missing signed-receipt scopes: ${missingReceiptScopes.join(', ')}`,
           409,
           'SHOPIFY_SCOPE_PROFILE_INCOMPLETE',
+        )
+      }
+      const missingSubscriptionGroups =
+        missingShopifyReceiptSubscriptionGroups(refreshed.configuration)
+      if (missingSubscriptionGroups.length) {
+        throw new CommerceIntegrationRequestError(
+          `Shopify signed-receipt subscriptions are not ready: ${missingSubscriptionGroups.join(', ')}`,
+          409,
+          'SHOPIFY_RECEIPT_SUBSCRIPTIONS_INCOMPLETE',
         )
       }
     }

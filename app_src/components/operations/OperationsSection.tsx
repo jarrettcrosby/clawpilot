@@ -1715,8 +1715,8 @@ function OrderDetailDrawer({
                                   {fulfillmentExport.customerNotification.mode === 'provider_managed'
                                     ? 'Retailer notification is provider-managed.'
                                     : fulfillmentExport.customerNotification.notifyCustomer
-                                      ? `Customer email enabled · ${displayStatus(fulfillmentExport.customerNotification.source)}`
-                                      : `Customer email disabled · ${displayStatus(fulfillmentExport.customerNotification.source)}`}
+                                      ? `Customer notification requested · ${displayStatus(fulfillmentExport.customerNotification.source)}`
+                                      : `Customer notification not requested · ${displayStatus(fulfillmentExport.customerNotification.source)}`}
                                   {' '}· {fulfillmentExport.attempts} processing attempt{fulfillmentExport.attempts === 1 ? '' : 's'}
                                 </Typography>
                                 {(fulfillmentExport.errorCode || fulfillmentExport.errorMessage) && (
@@ -4372,15 +4372,16 @@ export default function OperationsSection({
                   {detail.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} even though
                   those labels will not track with the carrier.{' '}
                   {detail.sourceProvider === 'faire'
-                    ? 'Faire manages the retailer notification after writeback.'
+                    ? 'Faire may send a processing email when a NEW order is accepted, and submitting these tracking details triggers Faire\'s shipment email. Verify this test order uses a controlled recipient.'
                     : 'Shopify customer notification is forcibly disabled for this test and cannot be overridden.'}
                 </Alert>
               )}
               {detail?.fulfillmentNotificationPolicy.mode === 'provider_managed' ? (
                 <Alert severity="info">
-                  Faire manages retailer notifications after shipment and tracking are submitted.
-                  ClawPilot will attempt the separate fulfillment export, but does not expose a
-                  retailer-notification override.
+                  Faire may send a processing email when a NEW order is accepted, and submitting
+                  shipment tracking triggers Faire&apos;s shipment email. Use a controlled recipient
+                  for test orders. ClawPilot will attempt the separate fulfillment export, but
+                  does not expose a retailer-notification override.
                 </Alert>
               ) : detail?.fulfillmentNotificationPolicy.mode === 'unavailable' ? (
                 <Alert severity="info">
@@ -4407,14 +4408,14 @@ export default function OperationsSection({
                     }}
                   >
                     <MenuItem value="default">
-                      Use account default — {detail.fulfillmentNotificationPolicy.notifyCustomerDefault
-                        ? 'email customer'
-                        : 'do not email customer'}
+                      Use ClawPilot connection default — {detail.fulfillmentNotificationPolicy.notifyCustomerDefault
+                        ? 'request customer notification'
+                        : 'do not request customer notification'}
                     </MenuItem>
                     <MenuItem value="override">
                       Per-order exception — {detail.fulfillmentNotificationPolicy.notifyCustomerDefault
-                        ? 'do not email customer'
-                        : 'email customer'}
+                        ? 'do not request customer notification'
+                        : 'request customer notification'}
                     </MenuItem>
                   </TextField>
                   {customerNotificationOverride !== null ? (
@@ -4432,8 +4433,9 @@ export default function OperationsSection({
                     />
                   ) : null}
                   <Typography variant="caption" color="text.secondary">
-                    Account policy revision {detail.fulfillmentNotificationPolicy.revision} is
-                    rechecked transactionally and frozen into the immutable export.
+                    ClawPilot connection policy revision{' '}
+                    {detail.fulfillmentNotificationPolicy.revision} is rechecked transactionally
+                    and frozen into the immutable export.
                   </Typography>
                 </>
               ) : null}

@@ -62,6 +62,14 @@ function loadTypeScriptModule(path, mocks = {}, globals = {}) {
           'app_src/lib/integrations/commerceFaireAutomaticPromotion.ts',
         )
       }
+      if (
+        specifier
+        === '@/lib/integrations/commerceShopifyAutomaticPromotion'
+      ) {
+        return loadTypeScriptModule(
+          'app_src/lib/integrations/commerceShopifyAutomaticPromotion.ts',
+        )
+      }
       return nodeRequire(specifier)
     },
     ...globals,
@@ -426,7 +434,35 @@ function productImageFixture() {
       vendor: 'ClawPilot acceptance',
       productType: 'Test',
       providerTaxonomy: unavailable(),
-      variants: Object.freeze([]),
+      variants: Object.freeze([Object.freeze({
+        schemaVersion: 'commerce-normalized-variant-v1',
+        identity: Object.freeze({
+          provider: 'shopify',
+          resourceType: 'variant',
+          value: 'gid://shopify/ProductVariant/92010011',
+        }),
+        productIdentity: Object.freeze({
+          provider: 'shopify',
+          resourceType: 'product',
+          value: 'gid://shopify/Product/9201001',
+        }),
+        inventoryItemIdentity: unavailable(),
+        sku: 'COMMERCE-STAGING-IMAGE-9201001',
+        barcode: null,
+        title: 'Default',
+        selectedOptions: Object.freeze([]),
+        unitMultiplier: 1,
+        wholesalePrice: unavailable(),
+        retailPrice: unavailable(),
+        taxable: false,
+        requiresShipping: false,
+        inventory: unavailable(),
+        packaging: unavailable(),
+        weightGrams: null,
+        providerCreatedAt: observedAt,
+        providerUpdatedAt: observedAt,
+        sourceHash: hash('commerce-staging-product-variant-source'),
+      })]),
       images: Object.freeze([Object.freeze({
         providerImageId,
         locatorFingerprint,
@@ -494,7 +530,49 @@ class CommerceIntegrationRequestError extends Error {
   }
 }
 
-function loadCommerceStagingService(pool, counters) {
+function loadShopifyCheckoutRatingPersistence(pool) {
+  const currency = loadTypeScriptModule('app_src/lib/currency.ts')
+  const postgres = {
+    acquireTransactionAdvisoryLock: (client, key) => client.query(
+      'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
+      [key],
+    ),
+    getPostgresPool: () => pool,
+    query: (sql, values) => pool.query(sql, values),
+    async withTransaction(operation) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const result = await operation(client)
+        await client.query('COMMIT')
+        return result
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {})
+        throw error
+      } finally {
+        client.release()
+      }
+    },
+  }
+  return loadTypeScriptModule(
+    'app_src/lib/persistence/shopifyCheckoutRating.ts',
+    {
+      '@/lib/auditWriter': { recordAuditEvent: async () => {} },
+      '@/lib/operations/shopifyCheckoutPlanRatePolicy':
+        loadTypeScriptModule(
+          'app_src/lib/operations/shopifyCheckoutPlanRatePolicy.ts',
+          { '../currency.ts': currency },
+        ),
+      '@/lib/operations/shopifyCheckoutRateWarmPolicy':
+        loadTypeScriptModule(
+          'app_src/lib/operations/shopifyCheckoutRateWarmPolicy.ts',
+        ),
+      '@/lib/persistence/postgres': postgres,
+    },
+  )
+}
+
+function loadCommerceStagingService(pool, counters, options = {}) {
   const mustNotRun = (name) => () => {
     throw new Error(`${name} must not run during order-only staging acceptance`)
   }
@@ -630,9 +708,8 @@ function loadCommerceStagingService(pool, counters) {
         encryptCommerceIntakeContinuation: mustNotRun(
           'encryptCommerceIntakeContinuation',
         ),
-        shopifyCheckoutDestinationFingerprint: mustNotRun(
-          'shopifyCheckoutDestinationFingerprint',
-        ),
+        shopifyCheckoutDestinationFingerprint: () =>
+          hash('shopify-clean-path-destination'),
       },
       '@/lib/integrations/commerceIntegrations': {
         CommerceIntegrationRequestError,
@@ -719,13 +796,14 @@ function loadCommerceStagingService(pool, counters) {
         ),
       },
       '@/lib/persistence/productChannelStates': productChannelStates,
-      '@/lib/persistence/shopifyCheckoutRating': {
+      '@/lib/persistence/shopifyCheckoutRating': options
+        .shopifyCheckoutRating || {
         reconcileShopifyCheckoutRateForOrderCandidateWithClient: mustNotRun(
           'reconcileShopifyCheckoutRateForOrderCandidateWithClient',
         ),
         shopifyCheckoutRateLineageIsRequired: () => false,
         shopifyCheckoutRateOutcomeAllowsFulfillment: () => false,
-      },
+        },
     },
     {
       fetch() {
@@ -1010,6 +1088,39 @@ function loadCommerceOrderReconciliationPersistence(pool) {
             throw error
           } finally {
             client.release()
+          }
+        },
+      },
+    },
+  )
+}
+
+function loadCommerceOrderReconciliationWorker(input) {
+  return loadTypeScriptModule(
+    'app_src/lib/commerceOrderReconciliationWorker.ts',
+    {
+      '@/lib/integrations/commerceIntake': {
+        commerceIntakeRuntimeAvailable: () => true,
+        executeCommerceOrderPage: input.executeCommerceOrderPage,
+      },
+      '@/lib/persistence/commerceIntake': {
+        async markAutomaticFaireOrderPromotionAttentionInPostgres() {
+          return { marked: true }
+        },
+        async readAutomaticFaireExactRefreshTargetsInPostgres() {
+          return []
+        },
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        ...input.persistence,
+        async projectCommerceOrderReconciliationPageInPostgres({ target }) {
+          return {
+            leaseLost: false,
+            startedAt: target.startedAt,
+            recordsSeen: target.recordsSeen,
+            recordsHeld: target.recordsHeld,
+            continuationBatchNumber: 1,
+            providerCursorRepeated: false,
           }
         },
       },
@@ -3773,6 +3884,3389 @@ async function verifyPromotionNumericScaleAcceptance(
   assert.equal(counters.fetchCalls, 0)
 }
 
+async function verifyShopifyAttentionAcrossWorkerScans(input) {
+  const {
+    pool,
+    ids,
+    missingCandidate,
+    historicalCandidate,
+    canonicalOrderGlobalId,
+    intakePersistence,
+    runtime,
+    runGlobalId,
+    cohortHash,
+  } = input
+  const persistence = loadCommerceOrderReconciliationPersistence(pool)
+  const readHistoricalCandidate = async () => (await pool.query(
+    `SELECT
+       candidate.workflow_state,
+       candidate.last_error_code,
+       candidate.expires_at > now() AS unexpired,
+       (SELECT count(*)::integer
+        FROM operations_orders canonical
+        WHERE canonical.organization_id = candidate.organization_id
+          AND canonical.integration_account_id =
+              candidate.integration_account_id
+          AND canonical.external_order_id = candidate.external_order_id)
+         AS canonical_count
+     FROM operations_commerce_order_candidates candidate
+     WHERE candidate.organization_id = $1::uuid
+       AND candidate.global_id = $2`,
+    [ids.organization, historicalCandidate.global_id],
+  )).rows[0]
+  assert.deepEqual(
+    await readHistoricalCandidate(),
+    {
+      workflow_state: 'ready',
+      last_error_code: null,
+      unexpired: true,
+      canonical_count: 0,
+    },
+    'A pre-feature unresolved candidate must remain explicitly unmarked',
+  )
+  const scans = [
+    {
+      providerRowsSeen: 1,
+      ordersStaged: 1,
+      held: 1,
+      actionableHeld: 1,
+      heldByReason: { checkout_rate_lineage_missing: 1 },
+    },
+    {
+      providerRowsSeen: 0,
+      ordersStaged: 0,
+      held: 0,
+      actionableHeld: 0,
+      heldByReason: {},
+    },
+    {
+      providerRowsSeen: 0,
+      ordersStaged: 0,
+      held: 0,
+      actionableHeld: 0,
+      heldByReason: {},
+    },
+    {
+      providerRowsSeen: 0,
+      ordersStaged: 0,
+      held: 0,
+      actionableHeld: 0,
+      heldByReason: {},
+    },
+  ]
+  const worker = loadCommerceOrderReconciliationWorker({
+    persistence,
+    async executeCommerceOrderPage() {
+      const scan = scans.shift()
+      assert.ok(scan, 'Unexpected extra Shopify reconciliation worker page')
+      return {
+        command: {
+          providerWrites: 0,
+          syncCursorAdvanced: false,
+          canonicalOrdersCreated: 0,
+          inventoryTouched: 0,
+          ordersStaged: scan.ordersStaged,
+          recordsRejected: 0,
+          pagination: {
+            runGlobalId: 'gcir0099999',
+            providerRowsSeen: scan.providerRowsSeen,
+            batchNumber: 1,
+            hasNextBatch: false,
+            continuationRunGlobalId: null,
+          },
+          automaticCustomerResolution: {
+            matched: 0,
+            created: 0,
+            ambiguous: 0,
+            skipped: 0,
+            failed: 0,
+            failedByCode: {},
+            providerWrites: 0,
+            syncCursorAdvanced: false,
+          },
+          automaticShopifyOrderPromotion: {
+            promoted: 0,
+            held: scan.held,
+            actionableHeld: scan.actionableHeld,
+            heldByReason: scan.heldByReason,
+            failed: 0,
+            failedByCode: {},
+            rollbackFenced: 0,
+            providerWrites: 0,
+            canonicalOrderWrites: 0,
+            inventoryWrites: 0,
+            syncCursorAdvanced: false,
+          },
+          automaticFaireOrderPromotion: {
+            promoted: 0,
+            held: 0,
+            failed: 0,
+            failedByCode: {},
+            providerWrites: 0,
+            canonicalOrderWrites: 0,
+            inventoryWrites: 0,
+            syncCursorAdvanced: false,
+          },
+        },
+      }
+    },
+  })
+  const faireStatus = (await pool.query(
+    `SELECT status
+     FROM operations_integration_accounts
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid`,
+    [ids.organization, ids.faireIntegrationAccount],
+  )).rows[0]?.status || null
+  if (faireStatus) {
+    await pool.query(
+      `UPDATE operations_integration_accounts
+       SET status = 'error', updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [ids.organization, ids.faireIntegrationAccount],
+    )
+  }
+  const makeRootPollDue = async (clearError = false) => {
+    await pool.query(
+      `UPDATE operations_commerce_sync_cursors
+       SET reconciliation_status = 'succeeded',
+           last_error_code = CASE WHEN $3 THEN NULL ELSE last_error_code END,
+           last_started_at = now() - interval '31 minutes',
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND resource = 'orders'`,
+      [ids.organization, ids.integrationAccount, clearError],
+    )
+  }
+  try {
+    await makeRootPollDue(true)
+    const actionable = await worker.processCommerceOrderReconciliation({
+      limit: 1,
+    })
+    assert.equal(actionable.claimed, 1)
+    assert.equal(
+      actionable.automaticShopifyOrderPromotion.actionableHeld,
+      1,
+    )
+    assert.equal(
+      actionable.automaticShopifyOrderPromotion.attentionRequiredAccounts,
+      1,
+    )
+    assert.equal(
+      actionable.automaticShopifyOrderPromotion.operatorReviewRequired,
+      1,
+    )
+    let health = await persistence
+      .readCommerceOrderReconciliationHealthFromPostgres()
+    assert.equal(
+      health.providerPromotionAttentionRequired.shopify,
+      1,
+    )
+
+    await makeRootPollDue()
+    const laterEmptyPoll = await worker.processCommerceOrderReconciliation({
+      limit: 1,
+    })
+    assert.equal(laterEmptyPoll.claimed, 1)
+    assert.equal(
+      laterEmptyPoll.automaticShopifyOrderPromotion.actionableHeld,
+      0,
+    )
+    assert.equal(
+      laterEmptyPoll.automaticShopifyOrderPromotion.attentionRequiredAccounts,
+      1,
+      'An empty root poll must retain account attention for an unresolved candidate',
+    )
+    assert.equal(
+      laterEmptyPoll.automaticShopifyOrderPromotion.operatorReviewRequired,
+      1,
+    )
+    health = await persistence.readCommerceOrderReconciliationHealthFromPostgres()
+    assert.equal(
+      health.providerPromotionAttentionRequired.shopify,
+      1,
+      'The durable health signal must survive an empty root poll',
+    )
+    const retainedState = await persistence
+      .readCommerceOrderReconciliationStateInPostgres({
+        organizationId: ids.organization,
+        accountGlobalId: 'gia0009201',
+      })
+    assert.equal(retainedState.automaticPromotionAttentionRequired, true)
+
+    const resolutionClient = await pool.connect()
+    try {
+      await resolutionClient.query('SET session_replication_role = replica')
+      await resolutionClient.query(
+        `UPDATE operations_commerce_order_candidates candidate
+         SET workflow_state = 'failed',
+             last_error_code = 'operator_resolved',
+             blocking_codes = ARRAY['operator_resolved']::text[],
+             row_version = candidate.row_version + 1,
+             updated_by = $4,
+             updated_at = now()
+         FROM operations_commerce_intake_runs run
+         WHERE candidate.organization_id = $1::uuid
+           AND candidate.integration_account_id = $2::uuid
+           AND candidate.global_id = $3
+           AND run.organization_id = candidate.organization_id
+           AND run.integration_account_id = candidate.integration_account_id
+           AND run.id = candidate.run_id
+           AND run.created_by = 'system:commerce-order-reconciliation'
+           AND candidate.provider = 'shopify'
+           AND candidate.workflow_state IN ('held', 'resolving', 'ready')`,
+        [
+          ids.organization,
+          ids.integrationAccount,
+          missingCandidate.global_id,
+          actorEmail,
+        ],
+      )
+    } finally {
+      await resolutionClient.query('SET session_replication_role = origin')
+        .catch(() => {})
+      resolutionClient.release()
+    }
+    await makeRootPollDue()
+    const resolvedPoll = await worker.processCommerceOrderReconciliation({
+      limit: 1,
+    })
+    assert.equal(resolvedPoll.claimed, 1)
+    assert.equal(
+      resolvedPoll.automaticShopifyOrderPromotion.attentionRequiredAccounts,
+      0,
+    )
+    assert.equal(
+      resolvedPoll.automaticShopifyOrderPromotion.operatorReviewRequired,
+      0,
+    )
+    health = await persistence.readCommerceOrderReconciliationHealthFromPostgres()
+    assert.equal(health.providerPromotionAttentionRequired.shopify, 0)
+    assert.deepEqual(
+      await readHistoricalCandidate(),
+      {
+        workflow_state: 'ready',
+        last_error_code: null,
+        unexpired: true,
+        canonical_count: 0,
+      },
+      'An unresolved historical NULL-marker candidate must not keep account attention active',
+    )
+
+    const staleContinuationLease = (await pool.query(
+      `UPDATE operations_commerce_sync_cursors
+       SET reconciliation_status = 'running',
+           last_error_code =
+             'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED',
+           last_started_at = date_trunc('milliseconds', clock_timestamp()),
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND resource = 'orders'
+       RETURNING last_started_at`,
+      [ids.organization, ids.integrationAccount],
+    )).rows[0]
+    const emptyContinuation = await persistence
+      .completeCommerceOrderReconciliationInPostgres({
+        target: {
+          organizationId: ids.organization,
+          integrationAccountId: ids.integrationAccount,
+          accountGlobalId: 'gia0009201',
+          provider: 'shopify',
+          credentialVersion: 1,
+          startedAt: staleContinuationLease.last_started_at.toISOString(),
+          recordsSeen: 0,
+          recordsHeld: 0,
+          continuationBatchNumber: 2,
+          continuationRunGlobalId: 'gcir0099999',
+          continuationIdempotencyKey: null,
+        },
+        providerRecordsSeen: 0,
+        ordersHeld: 0,
+        recordsRejected: 0,
+        pagesRead: 1,
+        hasNextBatch: false,
+        customersMatched: 0,
+        customersCreated: 0,
+        customersAmbiguous: 0,
+        customersSkipped: 0,
+        customerResolutionFailed: 0,
+        customerResolutionFailureCodes: {},
+        shopifyOrdersPromoted: 0,
+        shopifyOrdersHeld: 0,
+        shopifyPromotionActionableHeld: 0,
+        shopifyPromotionHeldReasons: {},
+        shopifyPromotionFailed: 0,
+        shopifyPromotionFailureCodes: {},
+        shopifyPromotionRollbackFenced: 0,
+        faireOrdersPromoted: 0,
+        faireOrdersHeld: 0,
+        fairePromotionFailed: 0,
+        fairePromotionFailureCodes: {},
+      })
+    assert.equal(emptyContinuation.leaseLost, false)
+    assert.equal(
+      emptyContinuation.shopifyAutomaticPromotionAttentionRequired,
+      false,
+      'An empty continuation must not preserve stale Shopify attention without an active marked candidate',
+    )
+    const clearedContinuation = (await pool.query(
+      `SELECT reconciliation_status, last_error_code
+       FROM operations_commerce_sync_cursors
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND resource = 'orders'`,
+      [ids.organization, ids.integrationAccount],
+    )).rows[0]
+    assert.deepEqual(clearedContinuation, {
+      reconciliation_status: 'succeeded',
+      last_error_code: null,
+    })
+
+    let dedupeCandidateRowVersion = 0
+    const dedupeClient = await pool.connect()
+    try {
+      await dedupeClient.query('SET session_replication_role = replica')
+      await dedupeClient.query(
+        `UPDATE operations_orders
+         SET external_order_id = $3, updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND global_id = $2`,
+        [
+          ids.organization,
+          canonicalOrderGlobalId,
+          missingCandidate.external_order_id,
+        ],
+      )
+      const reopenedCandidate = await dedupeClient.query(
+        `UPDATE operations_commerce_order_candidates
+         SET workflow_state = 'held',
+             last_error_code = NULL,
+             blocking_codes = '{}'::text[],
+             expires_at = now() + interval '7 days',
+             row_version = row_version + 1,
+             updated_by = $3,
+             updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND global_id = $2
+         RETURNING row_version::integer`,
+        [ids.organization, missingCandidate.global_id, actorEmail],
+      )
+      dedupeCandidateRowVersion =
+        reopenedCandidate.rows[0]?.row_version || 0
+    } finally {
+      await dedupeClient.query('SET session_replication_role = origin')
+        .catch(() => {})
+      dedupeClient.release()
+    }
+    assert.ok(dedupeCandidateRowVersion > 0)
+    const canonicalRace = await intakePersistence
+      .markAutomaticShopifyOrderPromotionAttentionInPostgres({
+        runtime,
+        actorEmail: 'system:commerce-order-reconciliation',
+        idempotencyKey: 'shopify-auto-attention-canonical-race',
+        candidateGlobalId: missingCandidate.global_id,
+        candidateRowVersion: dedupeCandidateRowVersion,
+        runGlobalId,
+        reasonCode: 'checkout_rate_lineage_missing',
+        expectedCohortHash: cohortHash,
+      })
+    assert.equal(canonicalRace.marked, false)
+    assert.equal(canonicalRace.reasonCode, 'canonical_order_exists')
+    assert.equal(canonicalRace.rowVersion, dedupeCandidateRowVersion)
+    const canonicalRaceMarker = (await pool.query(
+      `SELECT last_error_code
+       FROM operations_commerce_order_candidates
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [ids.organization, missingCandidate.global_id],
+    )).rows[0]
+    assert.equal(canonicalRaceMarker.last_error_code, null)
+    await makeRootPollDue()
+    const benignDedupePoll = await worker.processCommerceOrderReconciliation({
+      limit: 1,
+    })
+    assert.equal(benignDedupePoll.claimed, 1)
+    assert.equal(
+      benignDedupePoll.automaticShopifyOrderPromotion.attentionRequiredAccounts,
+      0,
+      'A held candidate with an existing canonical order is a benign dedupe',
+    )
+    health = await persistence.readCommerceOrderReconciliationHealthFromPostgres()
+    assert.equal(health.providerPromotionAttentionRequired.shopify, 0)
+    assert.equal(scans.length, 0)
+  } finally {
+    if (faireStatus) {
+      await pool.query(
+        `UPDATE operations_integration_accounts
+         SET status = $3, updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid`,
+        [ids.organization, ids.faireIntegrationAccount, faireStatus],
+      )
+    }
+  }
+}
+
+async function verifyAutomaticShopifyCleanPromotion(
+  pool,
+  ids,
+  counters,
+) {
+  const helperAcl = (await pool.query(
+    `SELECT EXISTS (
+       SELECT 1
+       FROM pg_proc function_row
+       CROSS JOIN LATERAL aclexplode(
+         COALESCE(
+           function_row.proacl,
+           acldefault('f', function_row.proowner)
+         )
+       ) privilege
+       WHERE function_row.oid = (
+         'public.operations_shopify_checkout_rate_match_candidate_facts_for_workflow(uuid,uuid,boolean,boolean)'
+       )::regprocedure
+         AND privilege.grantee = 0
+         AND privilege.privilege_type = 'EXECUTE'
+     ) AS public_execute`)).rows[0]
+  assert.equal(
+    helperAcl.public_execute,
+    false,
+    'The Boolean Shopify checkout workflow helper must not be executable by PUBLIC',
+  )
+  const candidateKeys = {
+    success: 'gid://shopify/Order/mapped-fractional',
+    missing: 'gid://shopify/Order/mismatch-positive',
+    ambiguous: 'gid://shopify/Order/negative-positive',
+    expired: 'gid://shopify/Order/fulfilled-missing',
+  }
+  const sourceTimestamp = new Date().toISOString()
+  const requestedDeliveryAt = new Date(
+    Date.now() + 2 * 24 * 60 * 60 * 1_000,
+  ).toISOString()
+  const address = {
+    name: 'Shopify clean-path acceptance',
+    line1: '123 Test Street',
+    city: 'Atlanta',
+    region: 'GA',
+    postalCode: '30301',
+    country: 'US',
+  }
+  const addressCiphertext = Buffer.from(JSON.stringify(address), 'utf8')
+
+  await pool.query(
+    `INSERT INTO app_users (email, role, status)
+     VALUES ('system:commerce-order-reconciliation', 'owner', 'active')
+     ON CONFLICT (email) DO NOTHING`,
+  )
+
+  await pool.query(
+    `UPDATE operations_integration_accounts
+     SET environment = 'sandbox', status = 'active', updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid`,
+    [ids.organization, ids.integrationAccount],
+  )
+  await pool.query(
+    `INSERT INTO operations_commerce_credentials (
+       organization_id, integration_account_id, external_account_id,
+       auth_mode, credential_ciphertext, credential_iv, credential_tag,
+       credential_version, credential_identifier_last_four,
+       verification_status, verified_at, webhook_verification_status,
+       created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, 'gid://shopify/Shop/9201',
+       'shopify_client_credentials', $3, $4, $5, 1, '9201',
+       'verified', now(), 'unverified', $6, $6
+     ) ON CONFLICT (organization_id, integration_account_id) DO UPDATE SET
+       verification_status = 'verified',
+       verified_at = now(),
+       last_error_code = NULL,
+       credential_version = 1,
+       updated_by = EXCLUDED.updated_by,
+       updated_at = now()`,
+    [
+      ids.organization,
+      ids.integrationAccount,
+      Buffer.from('shopify-clean-path-test-credential'),
+      Buffer.alloc(12, 3),
+      Buffer.alloc(16, 4),
+      actorEmail,
+    ],
+  )
+  const profileVersion = (await pool.query(
+    `SELECT
+       version.id::text,
+       version.row_version::integer,
+       profile.package_level,
+       version.base_each_quantity,
+       version.length_mm,
+       version.width_mm,
+       version.height_mm,
+       version.gross_weight_grams
+     FROM operations_product_pack_profile_versions version
+     JOIN operations_product_pack_profiles profile
+       ON profile.organization_id = version.organization_id
+      AND profile.pipeline_id = version.pipeline_id
+      AND profile.product_id = version.product_id
+      AND profile.id = version.profile_id
+     WHERE version.organization_id = $1::uuid
+       AND version.pipeline_id = $2::uuid
+       AND version.product_id = $3::uuid
+       AND version.is_current = true
+       AND version.lifecycle_state IN ('customer_confirmed', 'active')
+       AND profile.status <> 'retired'
+       AND version.dimension_basis = 'outer'
+       AND version.gross_weight_grams IS NOT NULL
+     ORDER BY profile.is_default DESC, version.created_at DESC
+     LIMIT 1`,
+    [ids.organization, ids.pipeline, ids.product],
+  )).rows[0]
+  assert.ok(profileVersion?.id, 'A current exact pack profile is required')
+
+  let channelState = (await pool.query(
+    `SELECT id::text, pack_evidence_hash
+     FROM operations_product_channel_states
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_variant_id = $3`,
+    [ids.organization, ids.integrationAccount, ids.mappedVariant],
+  )).rows[0]
+  if (!channelState) {
+    channelState = (await pool.query(
+      `INSERT INTO operations_product_channel_states (
+         organization_id, integration_account_id, pipeline_id, provider,
+         external_product_id, external_variant_id, product_id,
+         product_mapping_id, provider_status_raw, normalized_status,
+         provider_active, provider_updated_at, observed_at, source_revision,
+         source_hash, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'shopify',
+         'gid://shopify/Product/mapped-zero', $4, $5::uuid, $6::uuid,
+         'ACTIVE', 'active', true, now(), now(), $7, $8, $9, $9
+       ) RETURNING id::text, pack_evidence_hash`,
+      [
+        ids.organization,
+        ids.integrationAccount,
+        ids.pipeline,
+        ids.mappedVariant,
+        ids.product,
+        ids.productMapping,
+        sourceTimestamp,
+        hash('shopify-clean-path-channel-state'),
+        actorEmail,
+      ],
+    )).rows[0]
+  }
+  let packMapping = (await pool.query(
+    `SELECT id::text, row_version::integer, pack_evidence_hash
+     FROM operations_commerce_variant_pack_mappings
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND provider = 'shopify'
+       AND external_variant_id = $3
+       AND is_current = true`,
+    [ids.organization, ids.integrationAccount, ids.mappedVariant],
+  )).rows[0]
+  if (!packMapping) {
+    packMapping = (await pool.query(
+      `INSERT INTO operations_commerce_variant_pack_mappings (
+         organization_id, integration_account_id, pipeline_id, product_id,
+         provider, external_product_id, external_variant_id,
+         default_pack_profile_version_id, provider_lifecycle_state,
+         projection_state, source_revision, source_hash, provider_updated_at,
+         observed_at, is_current, pack_evidence_hash, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'shopify',
+         'gid://shopify/Product/mapped-zero', $5, $6::uuid, 'active',
+         'current', $7, $8, now(), now(), true, $9, $10, $10
+       ) RETURNING id::text, row_version::integer, pack_evidence_hash`,
+      [
+        ids.organization,
+        ids.integrationAccount,
+        ids.pipeline,
+        ids.product,
+        ids.mappedVariant,
+        profileVersion.id,
+        sourceTimestamp,
+        hash('shopify-clean-path-pack-mapping'),
+        channelState.pack_evidence_hash,
+        actorEmail,
+      ],
+    )).rows[0]
+  }
+  assert.equal(packMapping.pack_evidence_hash, channelState.pack_evidence_hash)
+
+  const setup = await pool.connect()
+  try {
+    await setup.query('SET session_replication_role = replica')
+    await setup.query(
+      `UPDATE operations_commerce_intake_runs run
+       SET created_by = 'system:commerce-order-reconciliation',
+           updated_by = 'system:commerce-order-reconciliation',
+           expires_at = now() + interval '7 days'
+       FROM operations_commerce_order_candidates candidate
+       WHERE candidate.run_id = run.id
+         AND candidate.organization_id = $1::uuid
+         AND candidate.external_order_id = ANY($2::text[])`,
+      [ids.organization, Object.values(candidateKeys)],
+    )
+    const updatedCandidates = await setup.query(
+      `UPDATE operations_commerce_order_candidates candidate
+       SET normalized_order_status = 'open',
+           normalized_payment_status = 'paid',
+           normalized_fulfillment_status = 'unfulfilled',
+           normalized_return_status = 'none',
+           requires_shipping = true,
+           currency_code = 'USD',
+           subtotal_minor = 0,
+           discount_minor = 0,
+           brand_discount_minor = 0,
+           shipping_minor = CASE
+             WHEN candidate.external_order_id = $10 THEN 0
+             ELSE 2071
+           END,
+           tax_minor = 0,
+           other_adjustment_minor = 0,
+           total_minor = CASE
+             WHEN candidate.external_order_id = $10 THEN 0
+             ELSE 2071
+           END,
+           header_money_state = 'complete',
+           header_money_gaps = '{}'::text[],
+           customer_resolution_state = 'resolved',
+           customer_match_method = 'external_id',
+           customer_id = $3::uuid,
+           ship_to_snapshot_state = 'confirmed',
+           ship_to_snapshot_source = 'provider',
+           ship_to_snapshot_ciphertext = $4,
+           ship_to_snapshot_iv = $5,
+           ship_to_snapshot_tag = $6,
+           ship_to_snapshot_hash = $7,
+           ship_to_snapshot_encryption_version = 1,
+           delivery_resolution_state = 'policy',
+           requested_delivery_at = $8::timestamptz,
+           delivery_policy_version = 'shopify-clean-path-test-v1',
+           provider_created_at = $9::timestamptz,
+           provider_updated_at = $9::timestamptz,
+           observed_at = $9::timestamptz,
+           source_revision = candidate.external_order_id || ':clean-v1',
+           source_hash = encode(
+             digest(candidate.external_order_id || ':clean-v1', 'sha256'),
+             'hex'
+           ),
+           checkout_destination_fingerprint = encode(
+             digest(candidate.external_order_id || ':destination', 'sha256'),
+             'hex'
+           ),
+           checkout_shipping_service_code = 'clawpilot:ups:ground',
+           workflow_state = 'ready',
+           last_error_code = NULL,
+           blocking_codes = '{}'::text[],
+           row_version = candidate.row_version + 1,
+           updated_by = 'system:commerce-order-reconciliation',
+           updated_at = now(),
+           expires_at = now() + interval '7 days'
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.external_order_id = ANY($2::text[])
+       RETURNING candidate.id::text, candidate.global_id,
+                 candidate.external_order_id,
+                 candidate.run_id::text, candidate.row_version::integer`,
+      [
+        ids.organization,
+        Object.values(candidateKeys),
+        ids.customer,
+        addressCiphertext,
+        Buffer.alloc(12, 5),
+        Buffer.alloc(16, 6),
+        hash(addressCiphertext),
+        requestedDeliveryAt,
+        sourceTimestamp,
+        candidateKeys.success,
+      ],
+    )
+    assert.equal(updatedCandidates.rowCount, 4)
+    const updatedLines = await setup.query(
+      `UPDATE operations_commerce_order_candidate_lines line
+       SET external_product_id = 'gid://shopify/Product/mapped-zero',
+           external_variant_id = $3,
+           sku_snapshot = 'POSTGRES-MAPPED',
+           provider_status_raw = 'OPEN',
+           normalized_status = 'open',
+           ordered_quantity = 1,
+           current_quantity = 1,
+           cancelled_quantity = 0,
+           fulfilled_quantity = 0,
+           unfulfilled_quantity = 1,
+           returned_quantity = 0,
+           unit_multiplier = 1,
+           physical_quantity = 1,
+           currency_code = 'USD',
+           unit_price_minor = 0,
+           subtotal_minor = 0,
+           discount_minor = 0,
+           brand_discount_minor = 0,
+           tax_minor = 0,
+           other_adjustment_minor = 0,
+           total_minor = 0,
+           price_resolution_state = 'provider',
+           resolved_currency_code = 'USD',
+           resolved_unit_price_minor = 0,
+           resolved_subtotal_minor = 0,
+           resolved_discount_minor = 0,
+           resolved_brand_discount_minor = 0,
+           resolved_tax_minor = 0,
+           resolved_other_adjustment_minor = 0,
+           resolved_total_minor = 0,
+           requires_shipping = true,
+           mapping_state = 'resolved',
+           product_id = $4::uuid,
+           product_mapping_id = $5::uuid,
+           packaging_state = 'resolved',
+           package_profile_id = NULL,
+           packaging_source = 'variant_pack_mapping',
+           commerce_variant_pack_mapping_id = $6::uuid,
+           commerce_variant_pack_mapping_row_version = $7::bigint,
+           pack_profile_version_id = $8::uuid,
+           pack_profile_version_row_version = $9::bigint,
+           pack_profile_package_level = $10,
+           pack_profile_base_each_quantity = $11::integer,
+           packaging_weight_source = 'profile_version',
+           weight_grams = $12::integer,
+           length_mm = $13::integer,
+           width_mm = $14::integer,
+           height_mm = $15::integer,
+           observed_at = $16::timestamptz,
+           source_revision = line.external_line_id || ':clean-v1',
+           source_hash = encode(
+             digest(line.external_line_id || ':clean-v1', 'sha256'), 'hex'
+           ),
+           workflow_state = 'ready',
+           blocking_codes = '{}'::text[],
+           row_version = line.row_version + 1,
+           updated_by = 'system:commerce-order-reconciliation',
+           updated_at = now(),
+           expires_at = now() + interval '7 days'
+       FROM operations_commerce_order_candidates candidate
+       WHERE line.organization_id = $1::uuid
+         AND candidate.organization_id = line.organization_id
+         AND candidate.id = line.order_candidate_id
+         AND candidate.external_order_id = ANY($2::text[])
+       RETURNING line.id::text`,
+      [
+        ids.organization,
+        Object.values(candidateKeys),
+        ids.mappedVariant,
+        ids.product,
+        ids.productMapping,
+        packMapping.id,
+        packMapping.row_version,
+        profileVersion.id,
+        profileVersion.row_version,
+        profileVersion.package_level,
+        profileVersion.base_each_quantity,
+        profileVersion.gross_weight_grams,
+        profileVersion.length_mm,
+        profileVersion.width_mm,
+        profileVersion.height_mm,
+        sourceTimestamp,
+      ],
+    )
+    assert.equal(updatedLines.rowCount, 4)
+  } finally {
+    await setup.query('SET session_replication_role = origin').catch(() => {})
+    setup.release()
+  }
+
+  const candidates = (await pool.query(
+    `SELECT
+       candidate.id::text,
+       candidate.global_id,
+       candidate.external_order_id,
+       candidate.row_version::integer,
+       candidate.provider_created_at,
+       candidate.observed_at,
+       candidate.checkout_destination_fingerprint,
+       run.global_id AS run_global_id,
+       operations_shopify_checkout_order_line_quantity_fingerprint(
+         candidate.organization_id, candidate.id
+       ) AS line_quantity_fingerprint
+     FROM operations_commerce_order_candidates candidate
+     JOIN operations_commerce_intake_runs run
+       ON run.id = candidate.run_id
+     WHERE candidate.organization_id = $1::uuid
+       AND candidate.external_order_id = ANY($2::text[])`,
+    [ids.organization, Object.values(candidateKeys)],
+  )).rows
+  const byExternalId = new Map(candidates.map((row) => [
+    row.external_order_id,
+    row,
+  ]))
+  const runGlobalId = candidates[0].run_global_id
+  assert.ok(candidates.every((candidate) => (
+    candidate.run_global_id === runGlobalId
+  )))
+
+  async function insertCheckoutReceipt(input) {
+    const candidate = input.candidate
+    const providerCreatedAt = new Date(candidate.provider_created_at).getTime()
+    const createdAt = new Date(
+      providerCreatedAt - (input.expired ? 3 * 60 * 60_000 : 60_000),
+    )
+    const windowSeconds = input.expired ? 60 : 7_200
+    const completedAt = new Date(createdAt.getTime() + 5_000)
+    const expiresAt = new Date(completedAt.getTime() + 24 * 60 * 60_000)
+    const fakeConfigId = randomUUID()
+    const fakeWarehouseId = randomUUID()
+    const fakeCarrierAccountId = randomUUID()
+    const fakeCarrierRateRequestId = randomUUID()
+    const fakeCarrierNetworkId = randomUUID()
+    const fakeCarrierAuthorizationId = randomUUID()
+    const packagePlanHash = hash(`clean-package:${input.key}`)
+    const carrierCostMinor = 2071
+    const customerChargeMinor = input.subsidized ? 0 : carrierCostMinor
+    const checkoutAdjustmentMinor = input.subsidized
+      ? -carrierCostMinor
+      : 0
+    const checkoutAdjustmentKind = input.subsidized ? 'subsidy' : 'none'
+    const client = await pool.connect()
+    try {
+      await client.query('SET session_replication_role = replica')
+      await client.query(
+        `INSERT INTO operations_carrier_accounts (
+           id, organization_id, integration_account_id, display_name,
+           sender_name,
+           account_number_ciphertext, account_number_iv, account_number_tag,
+           encryption_version, account_number_last_four,
+           account_number_fingerprint, registered_address,
+           registered_address_fingerprint, address_verification, status,
+           created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, $4, 'ClawPilot Test',
+           'test-ciphertext', 'test-iv',
+           'test-tag', 1, '9999', $5, $6::jsonb, $7,
+           'operator_attested', 'active',
+           'system:commerce-order-reconciliation',
+           'system:commerce-order-reconciliation'
+         )`,
+        [
+          fakeCarrierAccountId,
+          ids.organization,
+          ids.integrationAccount,
+          `Shopify clean path ${input.key}`,
+          hash(`clean-account:${input.key}`),
+          JSON.stringify({
+            line1: '123 Test Street',
+            city: 'Atlanta',
+            region: 'GA',
+            postalCode: '30301',
+            countryCode: 'US',
+          }),
+          hash(`clean-account-address:${input.key}`),
+        ],
+      )
+      await client.query(
+        `INSERT INTO operations_carrier_rate_requests (
+           id, organization_id, integration_account_id, provider,
+           carrier_account_id, network_id, account_authorization_id,
+           billing_relationship, billing_selection_snapshot,
+           environment, purpose, adapter_version, credential_version,
+           request_hash, redacted_request, redacted_response, status,
+           actor_email, requested_at, completed_at
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, 'ups_rest', $4::uuid, $5::uuid,
+           $6::uuid, 'sender', '{}'::jsonb, 'sandbox',
+           'cartonization_shipment_rate', 'shopify-clean-path-test-v1', 1,
+           $7, '{}'::jsonb, '{}'::jsonb, 'succeeded',
+           'system:commerce-order-reconciliation',
+           $8::timestamptz, $9::timestamptz
+         )`,
+        [
+          fakeCarrierRateRequestId,
+          ids.organization,
+          ids.integrationAccount,
+          fakeCarrierAccountId,
+          fakeCarrierNetworkId,
+          fakeCarrierAuthorizationId,
+          hash(`clean-rate-request:${input.key}`),
+          createdAt.toISOString(),
+          completedAt.toISOString(),
+        ],
+      )
+      const receipt = (await client.query(
+        `INSERT INTO operations_shopify_checkout_rate_receipts (
+           global_id, organization_id, integration_account_id, config_id,
+           config_row_version, credential_generation, activation_revision,
+           activation_state, policy_revision, policy_hash, warehouse_id,
+           algorithm_version, request_fingerprint, destination_fingerprint,
+           carrier_destination_fingerprint, line_quantity_fingerprint,
+           request_evidence_hash, redacted_request_snapshot, currency,
+           idempotency_key, status, line_count, package_count, offer_count,
+           package_plan_hash, result_hash, result_snapshot,
+           provider_write_count, inventory_snapshot_hash,
+           inventory_snapshot_at, reconciliation_window_seconds,
+           reconciliation_deadline_at, expires_at, completed_at,
+           created_at, updated_at
+         ) VALUES (
+           $1, $2::uuid, $3::uuid, $4::uuid, 0, 1, 1, 'shadow', 1, $5,
+           $6::uuid, 'shopify-clean-path-test-v1', $7, $8, $9, $10, $11,
+           '{}'::jsonb, 'USD', $12, 'succeeded', 1, 1, 1, $13, $14,
+           '{}'::jsonb, 0, $15, $16::timestamptz, $17::integer,
+           $18::timestamptz, $19::timestamptz, $20::timestamptz,
+           $21::timestamptz, $21::timestamptz
+         ) RETURNING id::text`,
+        [
+          input.globalId,
+          ids.organization,
+          ids.integrationAccount,
+          fakeConfigId,
+          hash(`clean-policy:${input.key}`),
+          fakeWarehouseId,
+          hash(`clean-request:${input.key}`),
+          candidate.checkout_destination_fingerprint,
+          hash(`clean-carrier-destination:${input.key}`),
+          candidate.line_quantity_fingerprint,
+          hash(`clean-request-evidence:${input.key}`),
+          `shopify-clean-path-${input.key}`,
+          packagePlanHash,
+          hash(`clean-result:${input.key}`),
+          hash(`clean-inventory:${input.key}`),
+          createdAt.toISOString(),
+          windowSeconds,
+          new Date(
+            createdAt.getTime() + windowSeconds * 1_000,
+          ).toISOString(),
+          expiresAt.toISOString(),
+          completedAt.toISOString(),
+          createdAt.toISOString(),
+        ],
+      )).rows[0]
+      await client.query(
+        `INSERT INTO operations_shopify_checkout_rate_receipt_offers (
+           organization_id, receipt_id, carrier_provider,
+           carrier_account_id, carrier_rate_request_id, carrier_request_hash,
+           carrier_response_rate_hash, shopify_service_code, service_code,
+           service_name, carrier_cost_minor, customer_charge_minor,
+           checkout_adjustment_minor, checkout_adjustment_kind, currency,
+           package_count, package_plan_hash, offer_hash, offer_snapshot
+         ) VALUES (
+           $1::uuid, $2::uuid, 'ups_rest', $3::uuid, $4::uuid, $5, $6,
+           'clawpilot:ups:ground', 'ground', 'UPS Ground', $7::bigint,
+           $8::bigint, $9::bigint, $10, 'USD', 1, $11, $12, '{}'::jsonb
+         )`,
+        [
+          ids.organization,
+          receipt.id,
+          fakeCarrierAccountId,
+          fakeCarrierRateRequestId,
+          hash(`clean-carrier-request:${input.key}`),
+          hash(`clean-carrier-response:${input.key}`),
+          carrierCostMinor,
+          customerChargeMinor,
+          checkoutAdjustmentMinor,
+          checkoutAdjustmentKind,
+          packagePlanHash,
+          hash(`clean-offer:${input.key}`),
+        ],
+      )
+    } finally {
+      await client.query('SET session_replication_role = origin').catch(() => {})
+      client.release()
+    }
+  }
+
+  const successCandidate = byExternalId.get(candidateKeys.success)
+  const missingCandidate = byExternalId.get(candidateKeys.missing)
+  const ambiguousCandidate = byExternalId.get(candidateKeys.ambiguous)
+  const expiredCandidate = byExternalId.get(candidateKeys.expired)
+  await insertCheckoutReceipt({
+    candidate: successCandidate,
+    key: 'success-a',
+    globalId: 'gsqr0099901',
+    subsidized: true,
+  })
+  await insertCheckoutReceipt({
+    candidate: ambiguousCandidate,
+    key: 'ambiguous-a',
+    globalId: 'gsqr0099902',
+  })
+  await insertCheckoutReceipt({
+    candidate: expiredCandidate,
+    key: 'expired-a',
+    globalId: 'gsqr0099903',
+    expired: true,
+  })
+  const subsidizedCheckout = (await pool.query(
+    `SELECT
+       candidate.shipping_minor::text AS candidate_shipping_minor,
+       offer.carrier_cost_minor::text AS carrier_cost_minor,
+       offer.customer_charge_minor::text AS customer_charge_minor,
+       offer.checkout_adjustment_minor::text AS checkout_adjustment_minor,
+       offer.checkout_adjustment_kind,
+       (
+         SELECT count(*)::integer
+         FROM operations_shopify_checkout_rate_preflight_match_candidates(
+           candidate.organization_id, candidate.id, true
+         )
+       ) AS preflight_match_count
+     FROM operations_commerce_order_candidates candidate
+     JOIN operations_shopify_checkout_rate_receipts receipt
+       ON receipt.organization_id = candidate.organization_id
+      AND receipt.global_id = 'gsqr0099901'
+     JOIN operations_shopify_checkout_rate_receipt_offers offer
+       ON offer.organization_id = receipt.organization_id
+      AND offer.receipt_id = receipt.id
+     WHERE candidate.organization_id = $1::uuid
+       AND candidate.global_id = $2`,
+    [ids.organization, successCandidate.global_id],
+  )).rows[0]
+  assert.deepEqual(subsidizedCheckout, {
+    candidate_shipping_minor: '0',
+    carrier_cost_minor: '2071',
+    customer_charge_minor: '0',
+    checkout_adjustment_minor: '-2071',
+    checkout_adjustment_kind: 'subsidy',
+    preflight_match_count: 1,
+  })
+
+  const previousClawPilotEnv = process.env.CLAWPILOT_ENV
+  const previousCohort = process.env
+    .CLAWPILOT_SHOPIFY_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS
+  process.env.CLAWPILOT_ENV = 'development'
+  process.env.CLAWPILOT_SHOPIFY_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS =
+    'gia0009201'
+  try {
+    const shopifyCheckoutRating = loadShopifyCheckoutRatingPersistence(pool)
+    const persistence = loadCommerceStagingService(pool, counters, {
+      shopifyCheckoutRating,
+    })
+    const promotionPolicy = loadTypeScriptModule(
+      'app_src/lib/integrations/commerceShopifyAutomaticPromotion.ts',
+    )
+    const gate = promotionPolicy.shopifyAutomaticOrderPromotionGate({
+      accountGlobalId: 'gia0009201',
+    })
+    assert.equal(gate.accountEnabled, true)
+    assert.match(gate.cohortHash, /^[a-f0-9]{64}$/u)
+    const runtime = {
+      organizationId: ids.organization,
+      integrationAccountId: ids.integrationAccount,
+      globalId: 'gia0009201',
+      provider: 'shopify',
+      environment: 'sandbox',
+      externalAccountId: 'gid://shopify/Shop/9201',
+      status: 'active',
+      verificationStatus: 'verified',
+      credentialVersion: 1,
+      authMode: 'shopify_client_credentials',
+      configuration: { shopDomain: 'commerce-staging-postgres.myshopify.com' },
+      encrypted: {},
+    }
+    const targets = await persistence
+      .readAutomaticShopifyOrderPromotionTargetsForRunInPostgres({
+        runtime,
+        runGlobalId,
+        expectedCohortHash: gate.cohortHash,
+      })
+    const targetByCandidate = new Map(targets.map((target) => [
+      target.candidateGlobalId,
+      target,
+    ]))
+    assert.equal(
+      targetByCandidate.get(successCandidate.global_id)?.eligible,
+      true,
+      JSON.stringify(targetByCandidate.get(successCandidate.global_id)),
+    )
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(
+        targetByCandidate.get(missingCandidate.global_id),
+      )),
+      {
+        eligible: false,
+        reason: 'checkout_rate_lineage_missing',
+        candidateGlobalId: missingCandidate.global_id,
+        candidateRowVersion: missingCandidate.row_version,
+        providerAddress: null,
+        deliveryMode: null,
+      },
+    )
+    assert.equal(
+      targetByCandidate.get(ambiguousCandidate.global_id)?.eligible,
+      true,
+    )
+    assert.equal(
+      targetByCandidate.get(expiredCandidate.global_id)?.reason,
+      'checkout_rate_lineage_expired',
+    )
+
+    await assert.rejects(
+      persistence.markAutomaticShopifyOrderPromotionAttentionInPostgres({
+        runtime,
+        actorEmail: 'system:commerce-order-reconciliation',
+        idempotencyKey: 'shopify-auto-attention-benign-veto',
+        candidateGlobalId: expiredCandidate.global_id,
+        candidateRowVersion: expiredCandidate.row_version,
+        runGlobalId,
+        reasonCode: 'canonical_order_exists',
+        expectedCohortHash: gate.cohortHash,
+      }),
+      (error) => error?.code
+        === 'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_NOT_REQUIRED',
+    )
+
+    const attentionInput = {
+      runtime,
+      actorEmail: 'system:commerce-order-reconciliation',
+      idempotencyKey: 'shopify-auto-attention-missing',
+      candidateGlobalId: missingCandidate.global_id,
+      candidateRowVersion: missingCandidate.row_version,
+      runGlobalId,
+      reasonCode: 'checkout_rate_lineage_missing',
+      expectedCohortHash: gate.cohortHash,
+    }
+    const markedAttention = await persistence
+      .markAutomaticShopifyOrderPromotionAttentionInPostgres(attentionInput)
+    assert.equal(markedAttention.marked, true)
+    assert.equal(markedAttention.alreadyMarked, false)
+    assert.equal(markedAttention.replayed, false)
+    assert.equal(markedAttention.providerWrites, 0)
+    assert.equal(markedAttention.inventoryWrites, 0)
+    assert.equal(markedAttention.syncCursorAdvanced, false)
+    const replayedAttention = await persistence
+      .markAutomaticShopifyOrderPromotionAttentionInPostgres(attentionInput)
+    assert.equal(replayedAttention.replayed, true)
+    const attentionEvidence = (await pool.query(
+      `SELECT
+         candidate.last_error_code,
+         candidate.row_version::integer,
+         (SELECT count(*)::integer
+          FROM operations_command_receipts receipt
+          WHERE receipt.organization_id = candidate.organization_id
+            AND receipt.command_type =
+                'commerce.intake.mark_shopify_auto_promotion_attention'
+            AND receipt.idempotency_key = $3) AS receipt_count,
+         (SELECT count(*)::integer
+          FROM audit_events event
+          WHERE event.organization_id = candidate.organization_id
+            AND event.aggregate_id = candidate.global_id
+            AND event.event_type =
+                'commerce.intake.shopify_auto_promotion.attention_marked')
+           AS audit_count
+       FROM operations_commerce_order_candidates candidate
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.global_id = $2`,
+      [
+        ids.organization,
+        missingCandidate.global_id,
+        attentionInput.idempotencyKey,
+      ],
+    )).rows[0]
+    assert.deepEqual(attentionEvidence, {
+      last_error_code:
+        promotionPolicy.SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER,
+      row_version: missingCandidate.row_version + 1,
+      receipt_count: 1,
+      audit_count: 1,
+    })
+
+    const promotionInput = {
+      runtime,
+      actorEmail: 'system:commerce-order-reconciliation',
+      idempotencyKey: 'shopify-clean-path-success',
+      candidateGlobalId: successCandidate.global_id,
+      candidateRowVersion: successCandidate.row_version,
+      requestHash: hash('shopify-clean-path-success'),
+      automaticShopifyPromotion: {
+        policyVersion:
+          promotionPolicy.SHOPIFY_AUTOMATIC_ORDER_PROMOTION_POLICY_VERSION,
+        cohortHash: gate.cohortHash,
+      },
+    }
+    await pool.query(
+      `UPDATE operations_commerce_credentials
+       SET verification_status = 'failed',
+           last_error_code = 'TEST_CREDENTIAL_DRIFT',
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [ids.organization, ids.integrationAccount],
+    )
+    await assert.rejects(
+      persistence.promoteCommerceCandidateInPostgres(promotionInput),
+      (error) => error?.code
+        === 'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_CREDENTIAL_STALE',
+    )
+    await pool.query(
+      `UPDATE operations_commerce_credentials
+       SET verification_status = 'verified',
+           verified_at = now(),
+           last_error_code = NULL,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [ids.organization, ids.integrationAccount],
+    )
+    const sourceDrift = await pool.connect()
+    try {
+      await sourceDrift.query('SET session_replication_role = replica')
+      await sourceDrift.query(
+        `UPDATE operations_commerce_order_candidates
+         SET provider_created_at = now() - interval '49 hours',
+             observed_at = now() - interval '49 hours'
+         WHERE organization_id = $1::uuid
+           AND global_id = $2`,
+        [ids.organization, successCandidate.global_id],
+      )
+    } finally {
+      await sourceDrift.query('SET session_replication_role = origin')
+        .catch(() => {})
+      sourceDrift.release()
+    }
+    await assert.rejects(
+      persistence.promoteCommerceCandidateInPostgres(promotionInput),
+      (error) => error?.code
+        === 'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_INVARIANT_STALE',
+    )
+    const sourceRestore = await pool.connect()
+    try {
+      await sourceRestore.query('SET session_replication_role = replica')
+      await sourceRestore.query(
+        `UPDATE operations_commerce_order_candidates
+         SET provider_created_at = $3::timestamptz,
+             observed_at = $4::timestamptz
+         WHERE organization_id = $1::uuid
+           AND global_id = $2`,
+        [
+          ids.organization,
+          successCandidate.global_id,
+          successCandidate.provider_created_at,
+          successCandidate.observed_at,
+        ],
+      )
+    } finally {
+      await sourceRestore.query('SET session_replication_role = origin')
+        .catch(() => {})
+      sourceRestore.release()
+    }
+    const providerAttemptsBefore = Number((await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_commerce_provider_attempts
+       WHERE organization_id = $1::uuid`,
+      [ids.organization],
+    )).rows[0].count)
+    const promoted = await persistence
+      .promoteCommerceCandidateInPostgres(promotionInput)
+    assert.equal(promoted.replayed, false)
+    assert.equal(promoted.checkoutRateReconciliation.outcome, 'matched')
+    assert.equal(promoted.providerWrites, 0)
+    assert.equal(promoted.inventoryWrites, 0)
+    const authoritativeSubsidizedMatch = (await pool.query(
+      `SELECT
+         reconciliation.outcome,
+         reconciliation.source_shipping_charge_minor::text
+           AS source_shipping_charge_minor,
+         reconciliation.selected_customer_charge_minor::text
+           AS selected_customer_charge_minor,
+         offer.carrier_cost_minor::text AS carrier_cost_minor,
+         offer.checkout_adjustment_minor::text AS checkout_adjustment_minor,
+         offer.checkout_adjustment_kind
+       FROM operations_shopify_checkout_rate_reconciliations reconciliation
+       JOIN operations_shopify_checkout_rate_receipt_offers offer
+         ON offer.organization_id = reconciliation.organization_id
+        AND offer.receipt_id = reconciliation.receipt_id
+        AND offer.offer_hash = reconciliation.selected_offer_hash
+       WHERE reconciliation.organization_id = $1::uuid
+         AND reconciliation.order_candidate_id = $2::uuid`,
+      [ids.organization, successCandidate.id],
+    )).rows[0]
+    assert.deepEqual(authoritativeSubsidizedMatch, {
+      outcome: 'matched',
+      source_shipping_charge_minor: '0',
+      selected_customer_charge_minor: '0',
+      carrier_cost_minor: '2071',
+      checkout_adjustment_minor: '-2071',
+      checkout_adjustment_kind: 'subsidy',
+    })
+    const replayed = await persistence
+      .promoteCommerceCandidateInPostgres(promotionInput)
+    assert.equal(replayed.replayed, true)
+    assert.equal(replayed.canonicalOrderGlobalId,
+      promoted.canonicalOrderGlobalId)
+    assert.equal(Number((await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_commerce_provider_attempts
+       WHERE organization_id = $1::uuid`,
+      [ids.organization],
+    )).rows[0].count), providerAttemptsBefore)
+
+    await insertCheckoutReceipt({
+      candidate: ambiguousCandidate,
+      key: 'ambiguous-b',
+      globalId: 'gsqr0099904',
+    })
+    const ambiguousInput = {
+      ...promotionInput,
+      idempotencyKey: 'shopify-clean-path-ambiguous-race',
+      candidateGlobalId: ambiguousCandidate.global_id,
+      candidateRowVersion: ambiguousCandidate.row_version,
+      requestHash: hash('shopify-clean-path-ambiguous-race'),
+    }
+    await assert.rejects(
+      persistence.promoteCommerceCandidateInPostgres(ambiguousInput),
+      (error) => error?.code
+        === 'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED',
+    )
+    const rollback = (await pool.query(
+      `SELECT
+         candidate.workflow_state,
+         candidate.canonical_order_id::text,
+         (SELECT count(*)::integer
+          FROM operations_orders operation_order
+          WHERE operation_order.organization_id = candidate.organization_id
+            AND operation_order.external_order_id = candidate.external_order_id)
+           AS canonical_count,
+         (SELECT count(*)::integer
+          FROM operations_shopify_checkout_rate_reconciliations reconciliation
+          WHERE reconciliation.organization_id = candidate.organization_id
+            AND reconciliation.order_candidate_id = candidate.id)
+           AS reconciliation_count,
+         (SELECT count(*)::integer
+          FROM operations_command_receipts receipt
+          WHERE receipt.organization_id = candidate.organization_id
+            AND receipt.idempotency_key =
+                'shopify-clean-path-ambiguous-race') AS command_receipt_count
+       FROM operations_commerce_order_candidates candidate
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.global_id = $2`,
+      [ids.organization, ambiguousCandidate.global_id],
+    )).rows[0]
+    assert.deepEqual(rollback, {
+      workflow_state: 'ready',
+      canonical_order_id: null,
+      canonical_count: 0,
+      reconciliation_count: 0,
+      command_receipt_count: 0,
+    })
+    const ambiguousTargets = await persistence
+      .readAutomaticShopifyOrderPromotionTargetsForRunInPostgres({
+        runtime,
+        runGlobalId,
+        expectedCohortHash: gate.cohortHash,
+      })
+    assert.equal(
+      ambiguousTargets.find((target) => (
+        target.candidateGlobalId === ambiguousCandidate.global_id
+      ))?.reason,
+      'checkout_rate_lineage_ambiguous',
+    )
+    const heldCanonicalCount = Number((await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_orders
+       WHERE organization_id = $1::uuid
+         AND external_order_id = ANY($2::text[])`,
+      [
+        ids.organization,
+        [candidateKeys.missing, candidateKeys.expired, candidateKeys.ambiguous],
+      ],
+    )).rows[0].count)
+    assert.equal(heldCanonicalCount, 0)
+    await verifyShopifyAttentionAcrossWorkerScans({
+      pool,
+      ids,
+      missingCandidate,
+      historicalCandidate: expiredCandidate,
+      canonicalOrderGlobalId: promoted.canonicalOrderGlobalId,
+      intakePersistence: persistence,
+      runtime,
+      runGlobalId,
+      cohortHash: gate.cohortHash,
+    })
+  } finally {
+    if (previousClawPilotEnv === undefined) {
+      delete process.env.CLAWPILOT_ENV
+    } else {
+      process.env.CLAWPILOT_ENV = previousClawPilotEnv
+    }
+    if (previousCohort === undefined) {
+      delete process.env
+        .CLAWPILOT_SHOPIFY_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS
+    } else {
+      process.env.CLAWPILOT_SHOPIFY_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS =
+        previousCohort
+    }
+  }
+}
+
+async function verifyAutomaticFaireExactRefreshLineage(
+  pool,
+  ids,
+  persistence,
+  counters,
+) {
+  const systemActor = 'system:commerce-order-reconciliation'
+  const runtime = {
+    organizationId: ids.organization,
+    integrationAccountId: ids.faireIntegrationAccount,
+    globalId: 'gia0009202',
+    provider: 'faire',
+    credentialVersion: 1,
+  }
+  const promotionNotBefore = String(
+    process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE || '',
+  )
+  const promotionCohortHash = createHash('sha256')
+    .update('commerce-faire-order-auto-promotion-v1')
+    .update('\0')
+    .update(runtime.globalId)
+    .update('\0')
+    .update(promotionNotBefore)
+    .digest('hex')
+  const key = 'auto_exact_lineage'
+  const externalOrderId = `faire-order-${key}`
+  const externalProductId = `p_${key}`
+  const externalVariantId = `po_${key}`
+  const sku = `POSTGRES-${key}`
+  const freshObservedAt = new Date().toISOString()
+  const freshRetentionExpiresAt = new Date(
+    Date.now() + 20 * 24 * 60 * 60 * 1_000,
+  ).toISOString()
+  const orderIdentityLockKey = (externalOrderId) => [
+    'commerce-intake-order-identity-v1',
+    ids.organization,
+    ids.faireIntegrationAccount,
+    externalOrderId,
+  ].join(':')
+  const waitForAdvisoryWait = async (label) => {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const waiting = (await pool.query(
+        `SELECT count(*)::integer AS count
+         FROM pg_stat_activity
+         WHERE wait_event_type = 'Lock'
+           AND lower(COALESCE(wait_event, '')) = 'advisory'
+           AND query LIKE '%pg_advisory_xact_lock%'`,
+      )).rows[0].count
+      if (waiting > 0) return
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 25))
+    }
+    assert.fail(`${label} did not wait on the shared order identity lock`)
+  }
+  await pool.query(
+    `INSERT INTO app_users (email, role, status)
+     VALUES ($1, 'owner', 'active')
+     ON CONFLICT (email) DO NOTHING`,
+    [systemActor],
+  )
+  await pool.query(
+    `INSERT INTO operations_commerce_credentials (
+       organization_id, integration_account_id, external_account_id,
+       auth_mode, credential_ciphertext, credential_iv, credential_tag,
+       credential_version, credential_identifier_last_four,
+       verification_status, verified_at, webhook_verification_status,
+       created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, 'brand-9202', 'faire_brand_token',
+       $3, $4, $5, 1, '9202', 'verified', now(), 'not_applicable', $6, $6
+     ) ON CONFLICT (organization_id, integration_account_id) DO UPDATE SET
+       auth_mode = 'faire_brand_token',
+       credential_version = 1,
+       verification_status = 'verified',
+       verified_at = now(),
+       last_error_code = NULL,
+       updated_by = EXCLUDED.updated_by,
+       updated_at = now()`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      Buffer.from('faire-auto-promotion-test-credential'),
+      Buffer.alloc(12, 9),
+      Buffer.alloc(16, 10),
+      actorEmail,
+    ],
+  )
+  const reconciliationPersistence =
+    loadCommerceOrderReconciliationPersistence(pool)
+  const completeFaireAttentionScan = async ({
+    promotionReviewRequired = 0,
+    exactRefreshReviewRequired = 0,
+    failureCode = null,
+  } = {}) => {
+    const shopifyStatus = (await pool.query(
+      `SELECT status
+       FROM operations_integration_accounts
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [ids.organization, ids.integrationAccount],
+    )).rows[0]?.status || null
+    try {
+      if (shopifyStatus) {
+        await pool.query(
+          `UPDATE operations_integration_accounts
+           SET status = 'error', updated_at = now()
+           WHERE organization_id = $1::uuid
+             AND id = $2::uuid`,
+          [ids.organization, ids.integrationAccount],
+        )
+      }
+      await pool.query(
+        `UPDATE operations_commerce_sync_cursors
+         SET reconciliation_status = 'succeeded',
+             last_started_at = now() - interval '31 minutes',
+             updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND resource = 'orders'`,
+        [ids.organization, ids.faireIntegrationAccount],
+      )
+      const claimed = await reconciliationPersistence
+        .claimCommerceOrderReconciliationTargetsInPostgres({ limit: 1 })
+      assert.equal(claimed.length, 1)
+      assert.equal(claimed[0].provider, 'faire')
+      if (failureCode) {
+        const failed = await reconciliationPersistence
+          .failCommerceOrderReconciliationInPostgres({
+            target: claimed[0],
+            error: { code: failureCode },
+          })
+        assert.equal(failed.leaseLost, false)
+        const health = await reconciliationPersistence
+          .readCommerceOrderReconciliationHealthFromPostgres()
+        const state = await reconciliationPersistence
+          .readCommerceOrderReconciliationStateInPostgres({
+            organizationId: ids.organization,
+            accountGlobalId: runtime.globalId,
+          })
+        return { failed, health, state }
+      }
+      const completed = await reconciliationPersistence
+        .completeCommerceOrderReconciliationInPostgres({
+          target: claimed[0],
+          providerRecordsSeen: 0,
+          ordersHeld: 0,
+          recordsRejected: 0,
+          pagesRead: 1,
+          hasNextBatch: false,
+          customersMatched: 0,
+          customersCreated: 0,
+          customersAmbiguous: 0,
+          customersSkipped: 0,
+          customerResolutionFailed: 0,
+          customerResolutionFailureCodes: {},
+          shopifyOrdersPromoted: 0,
+          shopifyOrdersHeld: 0,
+          shopifyPromotionActionableHeld: 0,
+          shopifyPromotionHeldReasons: {},
+          shopifyPromotionFailed: 0,
+          shopifyPromotionFailureCodes: {},
+          shopifyPromotionRollbackFenced: 0,
+          faireOrdersPromoted: 0,
+          faireOrdersHeld: 0,
+          fairePromotionFailed: 0,
+          fairePromotionFailureCodes: {},
+          fairePromotionOperatorReviewRequired: promotionReviewRequired,
+          faireExactRefreshAttempted: 0,
+          faireExactRefreshSucceeded: 0,
+          faireExactRefreshRejected: 0,
+          faireExactRefreshFailed: 0,
+          faireExactRefreshOperatorReviewRequired:
+            exactRefreshReviewRequired,
+          faireExactRefreshFailureCodes: {},
+        })
+      assert.equal(completed.leaseLost, false)
+      const health = await reconciliationPersistence
+        .readCommerceOrderReconciliationHealthFromPostgres()
+      const state = await reconciliationPersistence
+        .readCommerceOrderReconciliationStateInPostgres({
+          organizationId: ids.organization,
+          accountGlobalId: runtime.globalId,
+        })
+      return { completed, health, state }
+    } finally {
+      if (shopifyStatus) {
+        await pool.query(
+          `UPDATE operations_integration_accounts
+           SET status = $3, updated_at = now()
+           WHERE organization_id = $1::uuid
+             AND id = $2::uuid`,
+          [ids.organization, ids.integrationAccount, shopifyStatus],
+        )
+      }
+    }
+  }
+  const customerGlobalId = (await pool.query(
+    `SELECT reference_code
+     FROM crm_organizations
+     WHERE pipeline_id = $1::uuid
+       AND id = $2::uuid`,
+    [ids.pipeline, ids.customer],
+  )).rows[0].reference_code
+  const mapping = (await pool.query(
+    `INSERT INTO operations_product_mappings (
+       organization_id, integration_account_id, pipeline_id, product_id,
+       channel_sku, external_product_id, external_variant_id,
+       mapping_method, mapping_source_revision, active, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7,
+       'exact_variant', $8, true, $9
+     )
+     RETURNING id::text`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      ids.pipeline,
+      ids.product,
+      sku,
+      externalProductId,
+      externalVariantId,
+      hash('faire-auto-exact-lineage-mapping'),
+      systemActor,
+    ],
+  )).rows[0]
+  assert.ok(mapping.id)
+
+  const baseOrder = faireRetailerOrderFixture({
+    key,
+    retailerId: 'retailer-auto-exact-lineage',
+    evidenceEmail: 'jarrett+warehouse@episcs.com',
+  })
+  const incompleteMoney = {
+    shipping: unavailable(),
+    total: unavailable(),
+    headerMoney: Object.freeze({
+      state: 'operational_incomplete',
+      unavailableFields: Object.freeze(['shipping', 'total']),
+      fulfillmentDemandEligible: true,
+      accountingEligible: false,
+      customerChargeEligible: false,
+    }),
+  }
+  const exactOrder = Object.freeze({
+    ...baseOrder,
+    ...incompleteMoney,
+    providerCreatedAt: freshObservedAt,
+    providerProcessedAt: freshObservedAt,
+    providerUpdatedAt: freshObservedAt,
+    sourceStale: false,
+    sourceHash: hash('faire-auto-exact-current-order'),
+  })
+  const listOrder = Object.freeze({
+    ...exactOrder,
+    sourceStale: true,
+    readinessFacts: Object.freeze([
+      ...exactOrder.readinessFacts,
+      Object.freeze({
+        dimension: 'source',
+        code: 'source_stale',
+        blocking: true,
+        subjectExternalId: externalOrderId,
+      }),
+    ]),
+    sourceHash: hash('faire-auto-exact-stale-list-order'),
+  })
+
+  const seedWorkerRead = async (input) => {
+    const readActor = input.actorEmail || systemActor
+    const seeded = await pool.connect()
+    try {
+      await seedAdditionalCapturedRead(seeded, ids, {
+        providerAttemptId: input.providerAttemptId,
+        providerAttemptGlobalId: input.providerAttemptGlobalId,
+        readIntentId: input.readIntentId,
+        sessionId: input.sessionId,
+        idempotencyKey: input.idempotencyKey,
+        responseHash: input.responseHash,
+        integrationAccountId: ids.faireIntegrationAccount,
+        provider: 'faire',
+        resource: 'orders',
+        // Seed through a schema-valid root read, then atomically move the
+        // intent to its final schema-valid refresh/candidate identity below.
+        intakeAction: 'fetch',
+      })
+      await seeded.query('SET session_replication_role = replica')
+      await seeded.query(
+        `UPDATE operations_commerce_provider_attempts
+         SET created_by = $2
+         WHERE id = $1::uuid`,
+        [input.providerAttemptId, readActor],
+      )
+      await seeded.query(
+        `UPDATE operations_commerce_intake_read_intents
+         SET created_by = $2,
+             updated_by = $2,
+             target_kind = $3,
+             target_global_id = $4,
+             target_source_hash = $5,
+             target_external_id_hash = $6,
+             window_end = $7::timestamptz,
+             intake_action = $8
+         WHERE id = $1::uuid`,
+        [
+          input.readIntentId,
+          readActor,
+          input.targetCandidate ? 'candidate' : 'none',
+          input.targetCandidate?.globalId || null,
+          input.targetCandidate?.sourceHash || null,
+          input.targetCandidate
+            ? commandHash(input.externalOrderId || externalOrderId)
+            : null,
+          freshObservedAt,
+          input.intakeAction,
+        ],
+      )
+    } finally {
+      await seeded.query('SET session_replication_role = origin').catch(() => {})
+      seeded.release()
+    }
+  }
+
+  const stageWorkerEnvelope = async (input) => {
+    counters.expectedImageStage = {
+      idempotencyKey: input.read.idempotencyKey,
+      readIntentId: input.read.readIntentId,
+    }
+    return persistence.stageCommerceNormalizationEnvelopeInPostgres({
+      runtime,
+      actorEmail: input.read.actorEmail || systemActor,
+      idempotencyKey: input.read.idempotencyKey,
+      envelope: Object.freeze({
+        schemaVersion: 'commerce-normalization-envelope-v1',
+        normalizerVersion: 'commerce-staging-postgres-v1',
+        provider: 'faire',
+        organizationId: ids.organization,
+        integrationAccountId: ids.faireIntegrationAccount,
+        externalAccountId: 'brand-9202',
+        apiVersion: '2026-07',
+        observedAt: freshObservedAt,
+        credentialGeneration: 1,
+        retentionExpiresAt: freshRetentionExpiresAt,
+        sourceHash: hash(`${input.read.idempotencyKey}:envelope`),
+        products: Object.freeze([]),
+        orders: Object.freeze(input.orders || [input.order]),
+        rejections: Object.freeze(input.rejections || []),
+      }),
+      stageAction: input.action,
+      page: input.action === 'refresh'
+        ? null
+        : {
+            mode: 'operational',
+            resource: 'orders',
+            sessionId: input.read.sessionId,
+            batchNumber: 1,
+            previousRunGlobalId: null,
+            windowStart: null,
+            windowEnd: freshObservedAt,
+            queryHash: ids.queryHash,
+            nextOrderCursor: null,
+            providerRowsSeen: (input.orders || [input.order]).length
+              + (input.rejections || []).length,
+            eligibleOrdersSeen: (input.orders || [input.order]).length,
+          },
+      refreshCandidateGlobalId:
+        input.targetCandidate?.globalId || null,
+      retryRejectionGlobalId: null,
+      readIntentId: input.read.readIntentId,
+      capturedResponseHash: input.read.responseHash,
+    })
+  }
+
+  const listRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009240',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-auto-list',
+    responseHash: hash('commerce-staging-faire-auto-list-response'),
+    intakeAction: 'fetch',
+    targetCandidate: null,
+  }
+  await seedWorkerRead(listRead)
+  const listStage = await stageWorkerEnvelope({
+    read: listRead,
+    action: 'fetch',
+    order: listOrder,
+    targetCandidate: null,
+  })
+  assert.equal(listStage.ordersStaged, 1)
+  const staleCandidate = (await pool.query(
+    `SELECT global_id, row_version::integer, source_hash,
+            header_money_state, header_money_gaps
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_order_id = $3
+     ORDER BY observed_at DESC, created_at DESC, id DESC
+     LIMIT 1`,
+    [ids.organization, ids.faireIntegrationAccount, externalOrderId],
+  )).rows[0]
+  assert.equal(staleCandidate.source_hash, listOrder.sourceHash)
+  assert.equal(staleCandidate.header_money_state, 'operational_incomplete')
+  assert.deepEqual(staleCandidate.header_money_gaps, ['shipping', 'total'])
+
+  const preFeatureKey = '22_prefeature_rediscovered'
+  const preFeatureExternalOrderId = `faire-order-${preFeatureKey}`
+  const preFeatureBaseOrder = faireRetailerOrderFixture({
+    key: preFeatureKey,
+    retailerId: 'retailer-22-prefeature',
+    evidenceEmail: 'jarrett+22-prefeature@episcs.com',
+  })
+  const preFeatureOrder = Object.freeze({
+    ...preFeatureBaseOrder,
+    providerCreatedAt: new Date(
+      Date.parse(promotionNotBefore) - 1,
+    ).toISOString(),
+    providerProcessedAt: freshObservedAt,
+    providerUpdatedAt: freshObservedAt,
+    sourceStale: true,
+    readinessFacts: Object.freeze([
+      ...preFeatureBaseOrder.readinessFacts,
+      Object.freeze({
+        dimension: 'source',
+        code: 'source_stale',
+        blocking: true,
+        subjectExternalId: preFeatureExternalOrderId,
+      }),
+    ]),
+    sourceHash: hash('faire-auto-22-prefeature-rediscovered'),
+  })
+  const preFeatureRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009239',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-auto-22-prefeature',
+    responseHash: hash('commerce-staging-faire-auto-22-response'),
+    intakeAction: 'fetch',
+    targetCandidate: null,
+  }
+  await seedWorkerRead(preFeatureRead)
+  const preFeatureStage = await stageWorkerEnvelope({
+    read: preFeatureRead,
+    action: 'fetch',
+    order: preFeatureOrder,
+    targetCandidate: null,
+  })
+  const preFeatureCandidate = (await pool.query(
+    `SELECT global_id, provider_created_at, observed_at
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_order_id = $3
+     ORDER BY observed_at DESC, created_at DESC, id DESC
+     LIMIT 1`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      preFeatureExternalOrderId,
+    ],
+  )).rows[0]
+  assert.ok(
+    new Date(preFeatureCandidate.provider_created_at).getTime()
+      < Date.parse(promotionNotBefore),
+  )
+  assert.ok(
+    new Date(preFeatureCandidate.observed_at).getTime()
+      >= Date.parse(promotionNotBefore),
+    'The pre-feature provider order is deliberately rediscovered after rollout',
+  )
+  assert.equal((await persistence
+    .readAutomaticFaireExactRefreshTargetsInPostgres({
+      runtime,
+      preferredRunGlobalId: preFeatureStage.runGlobalId,
+      limit: 10,
+    })).some(
+      (target) => target.candidateGlobalId === preFeatureCandidate.global_id,
+    ), false, 'A 22-like provider order created before rollout must never enter unattended exact refresh even when rediscovered afterward')
+  assert.equal((await persistence
+    .readAutomaticFaireOrderPromotionTargetsForRunInPostgres({
+      runtime,
+      runGlobalId: preFeatureStage.runGlobalId,
+    })).length, 0, 'A post-cutoff observation cannot make a pre-cutoff provider order automatically promotable')
+
+  const refreshTargets = await persistence
+    .readAutomaticFaireExactRefreshTargetsInPostgres({
+      runtime,
+      preferredRunGlobalId: listStage.runGlobalId,
+      limit: 10,
+    })
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(refreshTargets)),
+    [{
+      candidateGlobalId: staleCandidate.global_id,
+      candidateRowVersion: staleCandidate.row_version,
+      sourceHash: staleCandidate.source_hash,
+      originatingRunGlobalId: listStage.runGlobalId,
+      cohortHash: promotionCohortHash,
+      notBefore: promotionNotBefore,
+    }],
+  )
+  assert.equal((await persistence
+    .readAutomaticFaireExactRefreshTargetsInPostgres({
+      runtime,
+      preferredRunGlobalId: listStage.runGlobalId,
+      limit: 10,
+      excludedCandidateGlobalIds: [staleCandidate.global_id],
+    })).length, 0, 'An invocation must not reselect an exact target it already attempted')
+  const stalePromotionTargets = await persistence
+    .readAutomaticFaireOrderPromotionTargetsForRunInPostgres({
+      runtime,
+      runGlobalId: listStage.runGlobalId,
+    })
+  assert.equal(stalePromotionTargets[0].eligible, false)
+  assert.equal(stalePromotionTargets[0].reason, 'exact_refresh_required')
+  await assert.rejects(
+    persistence.readCommerceIntakeRefreshTargetFromPostgres({
+      organizationId: ids.organization,
+      accountGlobalId: runtime.globalId,
+      candidateGlobalId: staleCandidate.global_id,
+      expectedSourceHash: '0'.repeat(64),
+      expectedRowVersion: staleCandidate.row_version,
+    }),
+    (error) => error?.code === 'COMMERCE_INTAKE_REFRESH_TARGET_CHANGED',
+  )
+
+  const exactRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009241',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-auto-exact',
+    responseHash: hash('commerce-staging-faire-auto-exact-response'),
+    intakeAction: 'refresh',
+    targetCandidate: {
+      globalId: staleCandidate.global_id,
+      sourceHash: staleCandidate.source_hash,
+    },
+  }
+  await seedWorkerRead(exactRead)
+  const exactStage = await stageWorkerEnvelope({
+    read: exactRead,
+    action: 'refresh',
+    order: exactOrder,
+    targetCandidate: exactRead.targetCandidate,
+  })
+  assert.equal(exactStage.ordersStaged, 1)
+  const exactReplay = await stageWorkerEnvelope({
+    read: exactRead,
+    action: 'refresh',
+    order: exactOrder,
+    targetCandidate: exactRead.targetCandidate,
+  })
+  assert.equal(exactReplay.replayed, true)
+  assert.equal(exactReplay.runGlobalId, exactStage.runGlobalId)
+  const crashRecoveryTargets = await persistence
+    .readAutomaticFaireExactRefreshTargetsInPostgres({
+      runtime,
+      preferredRunGlobalId: listStage.runGlobalId,
+      limit: 10,
+    })
+  assert.deepEqual(
+    crashRecoveryTargets.map((target) => target.candidateGlobalId),
+    [staleCandidate.global_id],
+    'A sole system exact child must keep the original target selectable so a post-stage, pre-hook crash deterministically replays the same exact request',
+  )
+  assert.equal(crashRecoveryTargets[0].cohortHash, promotionCohortHash)
+  assert.equal(crashRecoveryTargets[0].notBefore, promotionNotBefore)
+  const supersededAttention = await persistence
+    .markAutomaticFaireOrderPromotionAttentionInPostgres({
+      runtime,
+      actorEmail: systemActor,
+      idempotencyKey:
+        'commerce-staging-faire-auto-superseded-attention',
+      candidateGlobalId: staleCandidate.global_id,
+      candidateRowVersion: staleCandidate.row_version + 100,
+      sourceHash: staleCandidate.source_hash,
+      runGlobalId: listStage.runGlobalId,
+      reasonCode: 'COMMERCE_FAIRE_EXACT_REFRESH_INTERRUPTED',
+      cohortHash: promotionCohortHash,
+      notBefore: promotionNotBefore,
+      attentionKind: 'exact_refresh',
+    })
+  assert.equal(supersededAttention.marked, false)
+  assert.equal(supersededAttention.reasonCode, 'newer_candidate_exists')
+  assert.equal(
+    supersededAttention.rowVersion,
+    staleCandidate.row_version,
+    'Verified newer-candidate authority must resolve benignly before a stale row-version conflict',
+  )
+  const resolvedMarkerScan = await completeFaireAttentionScan()
+  assert.equal(
+    resolvedMarkerScan.completed.faireAutomaticPromotionAttentionRequired,
+    false,
+  )
+  assert.equal(
+    resolvedMarkerScan.completed.faireExactRefreshAttentionRequired,
+    false,
+    'A marked:false exact race must persist neither attention subtype',
+  )
+  assert.equal(
+    resolvedMarkerScan.completed.faireUnattributedAttentionRequired,
+    false,
+  )
+  assert.equal(
+    resolvedMarkerScan.health.providerPromotionAttentionRequired.faire,
+    0,
+  )
+  assert.equal(
+    resolvedMarkerScan.health.faireExactRefreshAttentionRequired,
+    0,
+  )
+  assert.equal(resolvedMarkerScan.state.operatorAttentionRequired, false)
+  let exactCandidate = (await pool.query(
+    `SELECT global_id, row_version::integer, source_hash,
+            header_money_state, header_money_gaps
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_order_id = $3
+     ORDER BY observed_at DESC, created_at DESC, id DESC
+     LIMIT 1`,
+    [ids.organization, ids.faireIntegrationAccount, externalOrderId],
+  )).rows[0]
+  assert.equal(exactCandidate.source_hash, exactOrder.sourceHash)
+  const unresolvedTargets = await persistence
+    .readAutomaticFaireOrderPromotionTargetsForRunInPostgres({
+      runtime,
+      runGlobalId: exactStage.runGlobalId,
+    })
+  assert.equal(unresolvedTargets[0].eligible, false)
+  assert.equal(
+    unresolvedTargets[0].reason,
+    'customer_resolution_required',
+    'Durable worker exact-read lineage must supersede only its stale list parent',
+  )
+  const resolved = await persistence.resolveCommerceCandidateCustomerInPostgres({
+    runtime,
+    actorEmail: systemActor,
+    idempotencyKey: 'commerce-staging-faire-auto-customer',
+    candidateGlobalId: exactCandidate.global_id,
+    candidateRowVersion: exactCandidate.row_version,
+    customer: {
+      mode: 'existing',
+      customerGlobalId,
+      resolutionMethod: 'external_id',
+    },
+  })
+  exactCandidate = {
+    ...exactCandidate,
+    row_version: resolved.rowVersion,
+  }
+  const eligibleTargets = await persistence
+    .readAutomaticFaireOrderPromotionTargetsForRunInPostgres({
+      runtime,
+      runGlobalId: exactStage.runGlobalId,
+    })
+  assert.equal(eligibleTargets.length, 1)
+  assert.equal(eligibleTargets[0].eligible, true)
+  assert.equal(eligibleTargets[0].sourceHash, exactCandidate.source_hash)
+  assert.equal(eligibleTargets[0].providerAddress, null)
+  assert.equal(eligibleTargets[0].deliveryMode, null)
+  const validation = await persistence.validateCommerceCandidateInPostgres({
+    runtime,
+    actorEmail: systemActor,
+    idempotencyKey: 'commerce-staging-faire-auto-validate',
+    candidateGlobalId: exactCandidate.global_id,
+    candidateRowVersion: exactCandidate.row_version,
+  })
+  assert.equal(validation.ready, true)
+  const promotionInput = {
+    runtime,
+    actorEmail: systemActor,
+    idempotencyKey: 'commerce-staging-faire-auto-promote',
+    candidateGlobalId: exactCandidate.global_id,
+    candidateRowVersion: validation.rowVersion,
+    requestHash: hash('commerce-staging-faire-auto-promote-request'),
+    automaticFairePromotion: {
+      policyVersion: 'commerce-faire-order-auto-promotion-v1',
+      runGlobalId: exactStage.runGlobalId,
+      sourceHash: exactCandidate.source_hash,
+      cohortHash: promotionCohortHash,
+      notBefore: promotionNotBefore,
+    },
+  }
+  const promotionBlocker = await pool.connect()
+  let promoted
+  try {
+    await promotionBlocker.query('BEGIN')
+    await promotionBlocker.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`,
+      [orderIdentityLockKey(externalOrderId)],
+    )
+    const promotionOutcome = persistence
+      .promoteCommerceCandidateInPostgres(promotionInput)
+      .then(
+        (value) => ({ value, error: null }),
+        (error) => ({ value: null, error }),
+      )
+    await waitForAdvisoryWait('Candidate promotion')
+    await promotionBlocker.query('COMMIT')
+    const outcome = await promotionOutcome
+    if (outcome.error) throw outcome.error
+    promoted = outcome.value
+  } finally {
+    await promotionBlocker.query('ROLLBACK').catch(() => {})
+    promotionBlocker.release()
+  }
+  assert.equal(promoted.providerWrites, 0)
+  assert.equal(promoted.inventoryWrites, 0)
+  const promotedReplay = await persistence.promoteCommerceCandidateInPostgres(
+    promotionInput,
+  )
+  assert.equal(promotedReplay.replayed, true)
+  assert.equal(
+    promotedReplay.canonicalOrderGlobalId,
+    promoted.canonicalOrderGlobalId,
+  )
+  const durable = (await pool.query(
+    `SELECT canonical.source_payload, candidate.workflow_state,
+            candidate.canonical_order_id::text,
+            (SELECT count(*)::integer
+             FROM operations_orders duplicate
+             WHERE duplicate.organization_id = canonical.organization_id
+               AND duplicate.integration_account_id
+                   = canonical.integration_account_id
+               AND duplicate.external_order_id = canonical.external_order_id)
+              AS canonical_count,
+            (SELECT count(*)::integer
+             FROM operations_commerce_provider_attempts attempt
+             WHERE attempt.organization_id = canonical.organization_id
+               AND attempt.integration_account_id
+                   = canonical.integration_account_id
+               AND attempt.action <> 'commerce.intake.read')
+              AS provider_write_attempts
+     FROM operations_orders canonical
+     JOIN operations_commerce_order_candidates candidate
+       ON candidate.organization_id = canonical.organization_id
+      AND candidate.canonical_order_id = canonical.id
+     WHERE canonical.organization_id = $1::uuid
+       AND canonical.integration_account_id = $2::uuid
+       AND canonical.external_order_id = $3`,
+    [ids.organization, ids.faireIntegrationAccount, externalOrderId],
+  )).rows[0]
+  assert.equal(durable.workflow_state, 'promoted')
+  assert.ok(durable.canonical_order_id)
+  assert.equal(durable.canonical_count, 1)
+  assert.equal(durable.provider_write_attempts, 0)
+  assert.deepEqual(durable.source_payload.headerMoney, {
+    state: 'operational_incomplete',
+    unavailableFields: ['shipping', 'total'],
+    fulfillmentDemandUse: 'exact_lines_only',
+    accountingUse: 'blocked',
+    customerChargeUse: 'blocked',
+  })
+  assert.equal(durable.source_payload.amountsMinor.shipping, null)
+  assert.equal(durable.source_payload.amountsMinor.total, null)
+
+  const raceKey = 'auto_exact_authority_race'
+  const raceExternalOrderId = `faire-order-${raceKey}`
+  await pool.query(
+    `INSERT INTO operations_product_mappings (
+       organization_id, integration_account_id, pipeline_id, product_id,
+       channel_sku, external_product_id, external_variant_id,
+       mapping_method, mapping_source_revision, active, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7,
+       'exact_variant', $8, true, $9
+     )`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      ids.pipeline,
+      ids.product,
+      `POSTGRES-${raceKey}`,
+      `p_${raceKey}`,
+      `po_${raceKey}`,
+      hash('faire-auto-exact-authority-race-mapping'),
+      systemActor,
+    ],
+  )
+  const raceBase = faireRetailerOrderFixture({
+    key: raceKey,
+    retailerId: 'retailer-auto-exact-authority-race',
+    evidenceEmail: 'jarrett+authority-race@episcs.com',
+  })
+  const raceExactOrder = Object.freeze({
+    ...raceBase,
+    ...incompleteMoney,
+    providerCreatedAt: freshObservedAt,
+    providerProcessedAt: freshObservedAt,
+    providerUpdatedAt: freshObservedAt,
+    sourceStale: false,
+    sourceHash: hash('faire-auto-exact-authority-race-current'),
+  })
+  const raceListOrder = Object.freeze({
+    ...raceExactOrder,
+    sourceStale: true,
+    readinessFacts: Object.freeze([
+      ...raceExactOrder.readinessFacts,
+      Object.freeze({
+        dimension: 'source',
+        code: 'source_stale',
+        blocking: true,
+        subjectExternalId: raceExternalOrderId,
+      }),
+    ]),
+    sourceHash: hash('faire-auto-exact-authority-race-list'),
+  })
+  const raceListRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009249',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-auto-authority-race-list',
+    responseHash: hash(
+      'commerce-staging-faire-auto-authority-race-list-response',
+    ),
+    intakeAction: 'fetch',
+    targetCandidate: null,
+    externalOrderId: raceExternalOrderId,
+  }
+  await seedWorkerRead(raceListRead)
+  const raceListStage = await stageWorkerEnvelope({
+    read: raceListRead,
+    action: 'fetch',
+    order: raceListOrder,
+    targetCandidate: null,
+  })
+  const raceSourceCandidate = (await pool.query(
+    `SELECT global_id, row_version::integer, source_hash
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_order_id = $3
+     ORDER BY observed_at DESC, created_at DESC, id DESC
+     LIMIT 1`,
+    [ids.organization, ids.faireIntegrationAccount, raceExternalOrderId],
+  )).rows[0]
+  const raceExactRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009250',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-auto-authority-race-exact',
+    responseHash: hash(
+      'commerce-staging-faire-auto-authority-race-exact-response',
+    ),
+    intakeAction: 'refresh',
+    targetCandidate: {
+      globalId: raceSourceCandidate.global_id,
+      sourceHash: raceSourceCandidate.source_hash,
+    },
+    externalOrderId: raceExternalOrderId,
+  }
+  await seedWorkerRead(raceExactRead)
+  const raceExactStage = await stageWorkerEnvelope({
+    read: raceExactRead,
+    action: 'refresh',
+    order: raceExactOrder,
+    targetCandidate: raceExactRead.targetCandidate,
+  })
+  let raceExactCandidate = (await pool.query(
+    `SELECT global_id, row_version::integer, source_hash
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_order_id = $3
+     ORDER BY observed_at DESC, created_at DESC, id DESC
+     LIMIT 1`,
+    [ids.organization, ids.faireIntegrationAccount, raceExternalOrderId],
+  )).rows[0]
+  const raceCustomer = await persistence
+    .resolveCommerceCandidateCustomerInPostgres({
+      runtime,
+      actorEmail: systemActor,
+      idempotencyKey: 'commerce-staging-faire-auto-authority-race-customer',
+      candidateGlobalId: raceExactCandidate.global_id,
+      candidateRowVersion: raceExactCandidate.row_version,
+      customer: {
+        mode: 'existing',
+        customerGlobalId,
+        resolutionMethod: 'external_id',
+      },
+    })
+  raceExactCandidate = {
+    ...raceExactCandidate,
+    row_version: raceCustomer.rowVersion,
+  }
+  const raceTargets = await persistence
+    .readAutomaticFaireOrderPromotionTargetsForRunInPostgres({
+      runtime,
+      runGlobalId: raceExactStage.runGlobalId,
+    })
+  assert.equal(raceTargets.length, 1)
+  assert.equal(raceTargets[0].eligible, true)
+  const raceValidation = await persistence.validateCommerceCandidateInPostgres({
+    runtime,
+    actorEmail: systemActor,
+    idempotencyKey: 'commerce-staging-faire-auto-authority-race-validate',
+    candidateGlobalId: raceTargets[0].candidateGlobalId,
+    candidateRowVersion: raceTargets[0].candidateRowVersion,
+  })
+  assert.equal(raceValidation.ready, true)
+  const providerWritesBeforeRace = (await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_commerce_provider_attempts
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND action <> 'commerce.intake.read'`,
+    [ids.organization, ids.faireIntegrationAccount],
+  )).rows[0].count
+  const inventoryRowsBeforeRace = (await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_inventory_positions
+     WHERE organization_id = $1::uuid`,
+    [ids.organization],
+  )).rows[0].count
+  await persistence.markCommerceCandidateUnsupportedInPostgres({
+    runtime,
+    actorEmail,
+    idempotencyKey: 'commerce-staging-faire-auto-authority-race-human',
+    candidateGlobalId: raceSourceCandidate.global_id,
+    candidateRowVersion: raceSourceCandidate.row_version,
+    reasonCode: 'operator_reviewed',
+    reason: 'A human operator took ownership after automatic selection.',
+  })
+  await assert.rejects(
+    persistence.promoteCommerceCandidateInPostgres({
+      runtime,
+      actorEmail: systemActor,
+      idempotencyKey: 'commerce-staging-faire-auto-authority-race-promote',
+      candidateGlobalId: raceTargets[0].candidateGlobalId,
+      candidateRowVersion: raceValidation.rowVersion,
+      requestHash: hash(
+        'commerce-staging-faire-auto-authority-race-promote-request',
+      ),
+      automaticFairePromotion: {
+        policyVersion: 'commerce-faire-order-auto-promotion-v1',
+        runGlobalId: raceExactStage.runGlobalId,
+        sourceHash: raceTargets[0].sourceHash,
+        cohortHash: promotionCohortHash,
+        notBefore: promotionNotBefore,
+      },
+    }),
+    (error) => error?.code
+      === 'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_AUTHORITY_STALE',
+    'A human mutation after selection must revoke final promotion authority',
+  )
+  assert.equal((await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_orders
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_order_id = $3`,
+    [ids.organization, ids.faireIntegrationAccount, raceExternalOrderId],
+  )).rows[0].count, 0)
+  assert.equal((await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_commerce_provider_attempts
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND action <> 'commerce.intake.read'`,
+    [ids.organization, ids.faireIntegrationAccount],
+  )).rows[0].count, providerWritesBeforeRace)
+  assert.equal((await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_inventory_positions
+     WHERE organization_id = $1::uuid`,
+    [ids.organization],
+  )).rows[0].count, inventoryRowsBeforeRace)
+  assert.equal(raceListStage.providerWrites, 0)
+
+  const rejectionKey = 'auto_exact_rejection'
+  const rejectionExternalOrderId = `faire-order-${rejectionKey}`
+  const rejectionBase = faireRetailerOrderFixture({
+    key: rejectionKey,
+    retailerId: 'retailer-auto-exact-rejection',
+    evidenceEmail: 'jarrett+rejection@episcs.com',
+  })
+  const rejectionListOrder = Object.freeze({
+    ...rejectionBase,
+    providerCreatedAt: freshObservedAt,
+    providerProcessedAt: freshObservedAt,
+    providerUpdatedAt: freshObservedAt,
+    sourceStale: true,
+    readinessFacts: Object.freeze([
+      ...rejectionBase.readinessFacts,
+      Object.freeze({
+        dimension: 'source',
+        code: 'source_stale',
+        blocking: true,
+        subjectExternalId: rejectionExternalOrderId,
+      }),
+    ]),
+    sourceHash: hash('faire-auto-exact-rejection-list'),
+  })
+  const rejectionSiblingKey = 'auto_exact_rejection_sibling'
+  const rejectionSiblingBase = faireRetailerOrderFixture({
+    key: rejectionSiblingKey,
+    retailerId: 'retailer-auto-exact-rejection-sibling',
+    evidenceEmail: 'jarrett+rejection-sibling@episcs.com',
+  })
+  const rejectionSiblingListOrder = Object.freeze({
+    ...rejectionSiblingBase,
+    providerCreatedAt: freshObservedAt,
+    providerProcessedAt: freshObservedAt,
+    providerUpdatedAt: freshObservedAt,
+    sourceStale: true,
+    readinessFacts: Object.freeze([
+      ...rejectionSiblingBase.readinessFacts,
+      Object.freeze({
+        dimension: 'source',
+        code: 'source_stale',
+        blocking: true,
+        subjectExternalId: `faire-order-${rejectionSiblingKey}`,
+      }),
+    ]),
+    sourceHash: hash('faire-auto-exact-rejection-sibling-list'),
+  })
+  const rejectionListRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009242',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-auto-rejection-list',
+    responseHash: hash('commerce-staging-faire-auto-rejection-list-response'),
+    intakeAction: 'fetch',
+    targetCandidate: null,
+    externalOrderId: rejectionExternalOrderId,
+  }
+  await seedWorkerRead(rejectionListRead)
+  const rejectionListStage = await stageWorkerEnvelope({
+    read: rejectionListRead,
+    action: 'fetch',
+    orders: [rejectionListOrder, rejectionSiblingListOrder],
+    targetCandidate: null,
+  })
+  const rejectionSourceCandidate = (await pool.query(
+    `SELECT global_id, row_version::integer, source_hash
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_order_id = $3
+     ORDER BY observed_at DESC, created_at DESC, id DESC
+     LIMIT 1`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      rejectionExternalOrderId,
+    ],
+  )).rows[0]
+  assert.equal(rejectionListStage.ordersStaged, 2)
+  const rejectionExactRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009243',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-auto-rejection-exact',
+    responseHash: hash('commerce-staging-faire-auto-rejection-exact-response'),
+    intakeAction: 'refresh',
+    targetCandidate: {
+      globalId: rejectionSourceCandidate.global_id,
+      sourceHash: rejectionSourceCandidate.source_hash,
+    },
+    externalOrderId: rejectionExternalOrderId,
+  }
+  await seedWorkerRead(rejectionExactRead)
+  const exactRejectionStage = await stageWorkerEnvelope({
+    read: rejectionExactRead,
+    action: 'refresh',
+    order: null,
+    orders: [],
+    rejections: [Object.freeze({
+      schemaVersion: 'commerce-normalization-rejection-v1',
+      resourceType: 'order',
+      externalId: rejectionExternalOrderId,
+      sourceHash: hash('faire-auto-exact-rejection-current'),
+      errorCode: 'COMMERCE_ORDER_RECORD_INVALID',
+      safeMessage: 'Exact Faire order failed normalized record validation',
+    })],
+    targetCandidate: rejectionExactRead.targetCandidate,
+  })
+  assert.equal(exactRejectionStage.ordersStaged, 0)
+  assert.equal(exactRejectionStage.recordsRejected, 1)
+  const exactRejectionEvidence = (await pool.query(
+    `SELECT intent.intent_state, intent.target_global_id,
+            intent.target_source_hash, rejection.disposition,
+            rejection.external_id, rejection.error_code,
+            rejection.expires_at IS DISTINCT FROM run.expires_at
+              AS expiry_mismatch
+     FROM operations_commerce_intake_read_intents intent
+     JOIN operations_commerce_intake_runs run
+       ON run.organization_id = intent.organization_id
+      AND run.integration_account_id = intent.integration_account_id
+      AND run.id = intent.staged_run_id
+     JOIN operations_commerce_intake_rejections rejection
+       ON rejection.organization_id = run.organization_id
+      AND rejection.integration_account_id = run.integration_account_id
+      AND rejection.run_id = run.id
+     WHERE intent.id = $1::uuid`,
+    [rejectionExactRead.readIntentId],
+  )).rows[0]
+  assert.deepEqual(exactRejectionEvidence, {
+    intent_state: 'staged',
+    target_global_id: rejectionSourceCandidate.global_id,
+    target_source_hash: rejectionSourceCandidate.source_hash,
+    disposition: 'open',
+    external_id: rejectionExternalOrderId,
+    error_code: 'COMMERCE_ORDER_RECORD_INVALID',
+    expiry_mismatch: false,
+  })
+  const exactRejectionAttentionInput = {
+    runtime,
+    actorEmail: systemActor,
+    idempotencyKey: 'commerce-staging-faire-auto-rejection-attention',
+    candidateGlobalId: rejectionSourceCandidate.global_id,
+    candidateRowVersion: rejectionSourceCandidate.row_version,
+    sourceHash: rejectionSourceCandidate.source_hash,
+    runGlobalId: rejectionListStage.runGlobalId,
+    reasonCode: 'COMMERCE_FAIRE_EXACT_REFRESH_NORMALIZATION_REJECTED',
+    cohortHash: promotionCohortHash,
+    notBefore: promotionNotBefore,
+    attentionKind: 'exact_refresh',
+  }
+  const exactRejectionAttention = await persistence
+    .markAutomaticFaireOrderPromotionAttentionInPostgres(
+      exactRejectionAttentionInput,
+    )
+  assert.equal(exactRejectionAttention.marked, true)
+  assert.equal(exactRejectionAttention.alreadyMarked, false)
+  assert.equal(exactRejectionAttention.providerWrites, 0)
+  assert.equal(exactRejectionAttention.inventoryWrites, 0)
+  assert.equal(exactRejectionAttention.syncCursorAdvanced, false)
+  const exactRejectionAttentionReplay = await persistence
+    .markAutomaticFaireOrderPromotionAttentionInPostgres(
+      exactRejectionAttentionInput,
+    )
+  assert.equal(exactRejectionAttentionReplay.replayed, true)
+  const exactRejectionAttentionEvidence = (await pool.query(
+    `SELECT candidate.last_error_code,
+            candidate.row_version::integer,
+            (SELECT count(*)::integer
+             FROM operations_command_receipts receipt
+             WHERE receipt.organization_id = candidate.organization_id
+               AND receipt.command_type =
+                   'commerce.intake.mark_faire_exact_refresh_attention'
+               AND receipt.idempotency_key = $3) AS receipt_count,
+            (SELECT count(*)::integer
+             FROM audit_events event
+             WHERE event.organization_id = candidate.organization_id
+               AND event.aggregate_id = candidate.global_id
+               AND event.event_type =
+                   'commerce.intake.faire_exact_refresh.attention_marked')
+              AS audit_count
+     FROM operations_commerce_order_candidates candidate
+     WHERE candidate.organization_id = $1::uuid
+       AND candidate.global_id = $2`,
+    [
+      ids.organization,
+      rejectionSourceCandidate.global_id,
+      exactRejectionAttentionInput.idempotencyKey,
+    ],
+  )).rows[0]
+  assert.deepEqual(exactRejectionAttentionEvidence, {
+    last_error_code:
+      'COMMERCE_FAIRE_EXACT_REFRESH_ATTENTION_REQUIRED',
+    row_version: rejectionSourceCandidate.row_version + 1,
+    receipt_count: 1,
+    audit_count: 1,
+  })
+  assert.equal((await persistence
+    .readAutomaticFaireExactRefreshTargetsInPostgres({
+      runtime,
+      preferredRunGlobalId: rejectionListStage.runGlobalId,
+      limit: 10,
+    })).some(
+      (target) => target.candidateGlobalId
+        === rejectionSourceCandidate.global_id,
+    ), false, 'A marked exact outcome must not issue another provider read')
+  const exactOnlyAttentionScan = await completeFaireAttentionScan({
+    exactRefreshReviewRequired: 1,
+  })
+  assert.equal(
+    exactOnlyAttentionScan.completed.faireAutomaticPromotionAttentionRequired,
+    false,
+  )
+  assert.equal(
+    exactOnlyAttentionScan.completed.faireExactRefreshAttentionRequired,
+    true,
+  )
+  assert.equal(
+    exactOnlyAttentionScan.completed.faireUnattributedAttentionRequired,
+    false,
+  )
+  assert.equal(
+    exactOnlyAttentionScan.health.providerPromotionAttentionRequired.faire,
+    0,
+    'Exact-only durable attention must not enter the promotion bucket',
+  )
+  assert.equal(
+    exactOnlyAttentionScan.health.faireExactRefreshAttentionRequired,
+    1,
+  )
+  assert.equal(
+    exactOnlyAttentionScan.health.operatorAttentionRequired,
+    1,
+    'The aggregate account count must count one exact-only account once',
+  )
+  assert.equal(
+    exactOnlyAttentionScan.state.automaticPromotionAttentionRequired,
+    false,
+  )
+  assert.equal(
+    exactOnlyAttentionScan.state.automaticExactRefreshAttentionRequired,
+    true,
+  )
+  assert.equal(
+    exactOnlyAttentionScan.state.automaticUnattributedAttentionRequired,
+    false,
+  )
+  const emptyExactOnlyAttentionScan = await completeFaireAttentionScan()
+  assert.equal(
+    emptyExactOnlyAttentionScan.completed
+      .faireAutomaticPromotionAttentionRequired,
+    false,
+  )
+  assert.equal(
+    emptyExactOnlyAttentionScan.completed.faireExactRefreshAttentionRequired,
+    true,
+    'A later empty poll must retain exact-only candidate attribution',
+  )
+  assert.equal(
+    emptyExactOnlyAttentionScan.health.providerPromotionAttentionRequired.faire,
+    0,
+  )
+  assert.equal(
+    emptyExactOnlyAttentionScan.health.faireExactRefreshAttentionRequired,
+    1,
+  )
+  const legacyCandidate = (await pool.query(
+    `UPDATE operations_commerce_order_candidates
+     SET last_error_code =
+           'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED',
+         row_version = row_version + 1,
+         updated_by = 'system:commerce-order-reconciliation',
+         updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND global_id = $3
+     RETURNING row_version::integer`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      rejectionSourceCandidate.global_id,
+    ],
+  )).rows[0]
+  await pool.query(
+    `UPDATE operations_commerce_sync_cursors
+     SET last_error_code = 'COMMERCE_ORDER_RECONCILIATION_PROVIDER_FAILED',
+         updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND resource = 'orders'`,
+    [ids.organization, ids.faireIntegrationAccount],
+  )
+  await pool.query(
+    `ALTER TABLE operations_commerce_sync_cursors
+       DROP COLUMN automatic_promotion_attention_required,
+       DROP COLUMN automatic_exact_refresh_attention_required,
+       DROP COLUMN automatic_unattributed_attention_required`,
+  )
+  await pool.query(read(
+    'db/migrations/0251_operations_commerce_order_attention_kinds.sql',
+  ))
+  const legacyMigrationState = await reconciliationPersistence
+    .readCommerceOrderReconciliationStateInPostgres({
+      organizationId: ids.organization,
+      accountGlobalId: runtime.globalId,
+    })
+  assert.equal(
+    legacyMigrationState.lastErrorCode,
+    'COMMERCE_ORDER_RECONCILIATION_PROVIDER_FAILED',
+    'The migration test must begin with an overwritten cursor error code',
+  )
+  assert.equal(
+    legacyMigrationState.automaticPromotionAttentionRequired,
+    false,
+    'A legacy generic marker must not be backfilled as promotion',
+  )
+  assert.equal(
+    legacyMigrationState.automaticExactRefreshAttentionRequired,
+    false,
+    'A legacy generic marker must not be guessed as exact refresh',
+  )
+  assert.equal(
+    legacyMigrationState.automaticUnattributedAttentionRequired,
+    true,
+    'Candidate evidence must recover legacy attention after cursor error overwrite',
+  )
+  assert.equal(legacyMigrationState.operatorAttentionRequired, true)
+  const legacyRemark = await persistence
+    .markAutomaticFaireOrderPromotionAttentionInPostgres({
+      ...exactRejectionAttentionInput,
+      idempotencyKey: 'commerce-staging-faire-legacy-attention-remark',
+      candidateRowVersion: legacyCandidate.row_version,
+      reasonCode: 'validation_blocked',
+      attentionKind: 'promotion',
+    })
+  assert.equal(legacyRemark.marked, false)
+  assert.equal(legacyRemark.alreadyMarked, true)
+  assert.equal(legacyRemark.attentionKind, 'unattributed')
+  assert.equal(
+    (await pool.query(
+      `SELECT last_error_code
+       FROM operations_commerce_order_candidates
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND global_id = $3`,
+      [
+        ids.organization,
+        ids.faireIntegrationAccount,
+        rejectionSourceCandidate.global_id,
+      ],
+    )).rows[0].last_error_code,
+    'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED',
+    'A new typed attempt must not relabel ambiguous legacy evidence',
+  )
+  const legacyFailureScan = await completeFaireAttentionScan({
+    failureCode: 'COMMERCE_ORDER_RECONCILIATION_PROVIDER_FAILED',
+  })
+  assert.equal(
+    legacyFailureScan.health.providerPromotionAttentionRequired.faire,
+    0,
+  )
+  assert.equal(legacyFailureScan.health.faireExactRefreshAttentionRequired, 0)
+  assert.equal(legacyFailureScan.health.faireUnattributedAttentionRequired, 1)
+  assert.equal(legacyFailureScan.health.operatorAttentionRequired, 1)
+  assert.equal(
+    legacyFailureScan.state.automaticUnattributedAttentionRequired,
+    true,
+    'A reconciliation failure must not erase legacy aggregate attention',
+  )
+  const legacyEmptyAttentionScan = await completeFaireAttentionScan()
+  assert.equal(
+    legacyEmptyAttentionScan.completed
+      .faireAutomaticPromotionAttentionRequired,
+    false,
+  )
+  assert.equal(
+    legacyEmptyAttentionScan.completed.faireExactRefreshAttentionRequired,
+    false,
+  )
+  assert.equal(
+    legacyEmptyAttentionScan.completed.faireUnattributedAttentionRequired,
+    true,
+    'A later empty poll must preserve legacy unattributed candidate evidence',
+  )
+  assert.equal(
+    legacyEmptyAttentionScan.health.faireUnattributedAttentionRequired,
+    1,
+  )
+  assert.equal(legacyEmptyAttentionScan.health.operatorAttentionRequired, 1)
+  const mismatchedExactRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009246',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-auto-rejection-mismatch',
+    responseHash: hash('commerce-staging-faire-auto-rejection-mismatch-response'),
+    intakeAction: 'refresh',
+    targetCandidate: rejectionExactRead.targetCandidate,
+    externalOrderId: rejectionExternalOrderId,
+  }
+  await seedWorkerRead(mismatchedExactRead)
+  await assert.rejects(
+    stageWorkerEnvelope({
+      read: mismatchedExactRead,
+      action: 'refresh',
+      order: null,
+      orders: [],
+      rejections: [Object.freeze({
+        schemaVersion: 'commerce-normalization-rejection-v1',
+        resourceType: 'order',
+        externalId: 'faire-order-different-identity',
+        sourceHash: hash('faire-auto-exact-rejection-wrong-identity'),
+        errorCode: 'COMMERCE_ORDER_RECORD_INVALID',
+        safeMessage: 'Different exact Faire order identity',
+      })],
+      targetCandidate: mismatchedExactRead.targetCandidate,
+    }),
+    (error) => error?.code === 'COMMERCE_INTAKE_EXACT_ORDER_TARGET_MISMATCH',
+  )
+  await assert.rejects(
+    stageWorkerEnvelope({
+      read: mismatchedExactRead,
+      action: 'refresh',
+      order: null,
+      orders: [],
+      rejections: [
+        Object.freeze({
+          schemaVersion: 'commerce-normalization-rejection-v1',
+          resourceType: 'order',
+          externalId: rejectionExternalOrderId,
+          sourceHash: hash('faire-auto-exact-rejection-matching-ambiguous'),
+          errorCode: 'COMMERCE_ORDER_RECORD_INVALID',
+          safeMessage: 'Matching identity in an ambiguous exact response',
+        }),
+        Object.freeze({
+          schemaVersion: 'commerce-normalization-rejection-v1',
+          resourceType: 'order',
+          externalId: 'faire-order-different-identity',
+          sourceHash: hash('faire-auto-exact-rejection-extra-identity'),
+          errorCode: 'COMMERCE_ORDER_RECORD_INVALID',
+          safeMessage: 'Extra identity in an ambiguous exact response',
+        }),
+      ],
+      targetCandidate: mismatchedExactRead.targetCandidate,
+    }),
+    (error) => error?.code === 'COMMERCE_INTAKE_EXACT_ORDER_TARGET_MISMATCH',
+  )
+  assert.deepEqual((await pool.query(
+    `SELECT intent_state, staged_run_id::text,
+            (SELECT count(*)::integer
+             FROM operations_commerce_intake_runs run
+             WHERE run.organization_id = intent.organization_id
+               AND run.integration_account_id = intent.integration_account_id
+               AND run.idempotency_key = $2) AS run_count
+     FROM operations_commerce_intake_read_intents intent
+     WHERE intent.id = $1::uuid`,
+    [mismatchedExactRead.readIntentId, mismatchedExactRead.idempotencyKey],
+  )).rows[0], {
+    intent_state: 'captured',
+    staged_run_id: null,
+    run_count: 0,
+  })
+  const rejectionSiblingCandidate = (await pool.query(
+    `SELECT global_id
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_order_id = $3
+     ORDER BY observed_at DESC, created_at DESC, id DESC
+     LIMIT 1`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      `faire-order-${rejectionSiblingKey}`,
+    ],
+  )).rows[0]
+  const firstRankedRetryTarget = (await persistence
+    .readAutomaticFaireExactRefreshTargetsInPostgres({
+      runtime,
+      preferredRunGlobalId: rejectionListStage.runGlobalId,
+      limit: 1,
+    }))[0]
+  assert.equal(
+    firstRankedRetryTarget.candidateGlobalId,
+    rejectionSiblingCandidate.global_id,
+    'Fresh exact-read work must rank ahead of replay-only durable attention in the same run',
+  )
+  assert.equal((await persistence
+    .readAutomaticFaireExactRefreshTargetsInPostgres({
+      runtime,
+      preferredRunGlobalId: rejectionListStage.runGlobalId,
+      limit: 10,
+    })).some(
+      (target) => target.candidateGlobalId
+        === rejectionSourceCandidate.global_id,
+    ), false, 'Candidate attention provenance replaces replay-only exact retries')
+
+  const humanActor = 'jarrett+faire-manual-history@episcs.com'
+  await pool.query(
+    `INSERT INTO app_users (email, role, status)
+     VALUES ($1, 'owner', 'active')
+     ON CONFLICT (email) DO NOTHING`,
+    [humanActor],
+  )
+  const manualKey = 'auto_exact_manual_history'
+  const manualExternalOrderId = `faire-order-${manualKey}`
+  const manualBaseOrder = faireRetailerOrderFixture({
+    key: manualKey,
+    retailerId: 'retailer-auto-exact-manual-history',
+    evidenceEmail: 'jarrett+manual-history@episcs.com',
+  })
+  const manualStaleOrder = (sourceHash) => Object.freeze({
+    ...manualBaseOrder,
+    ...incompleteMoney,
+    providerCreatedAt: freshObservedAt,
+    providerProcessedAt: freshObservedAt,
+    providerUpdatedAt: freshObservedAt,
+    sourceStale: true,
+    readinessFacts: Object.freeze([
+      ...manualBaseOrder.readinessFacts,
+      Object.freeze({
+        dimension: 'source',
+        code: 'source_stale',
+        blocking: true,
+        subjectExternalId: manualExternalOrderId,
+      }),
+    ]),
+    sourceHash,
+  })
+  const manualRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009247',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-manual-history',
+    responseHash: hash('commerce-staging-faire-manual-history-response'),
+    intakeAction: 'fetch',
+    targetCandidate: null,
+    actorEmail: humanActor,
+  }
+  await seedWorkerRead(manualRead)
+  await stageWorkerEnvelope({
+    read: manualRead,
+    action: 'fetch',
+    order: manualStaleOrder(hash('faire-auto-manual-history-first')),
+    targetCandidate: null,
+  })
+  const laterSystemRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009248',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-system-after-manual-history',
+    responseHash: hash(
+      'commerce-staging-faire-system-after-manual-history-response',
+    ),
+    intakeAction: 'fetch',
+    targetCandidate: null,
+  }
+  await seedWorkerRead(laterSystemRead)
+  const stagingBlocker = await pool.connect()
+  let laterSystemStage
+  try {
+    await stagingBlocker.query('BEGIN')
+    await stagingBlocker.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`,
+      [orderIdentityLockKey(manualExternalOrderId)],
+    )
+    const stageOutcome = stageWorkerEnvelope({
+      read: laterSystemRead,
+      action: 'fetch',
+      order: manualStaleOrder(hash('faire-auto-manual-history-second')),
+      targetCandidate: null,
+    }).then(
+      (value) => ({ value, error: null }),
+      (error) => ({ value: null, error }),
+    )
+    await waitForAdvisoryWait('Order staging')
+    await stagingBlocker.query('COMMIT')
+    const outcome = await stageOutcome
+    if (outcome.error) throw outcome.error
+    laterSystemStage = outcome.value
+  } finally {
+    await stagingBlocker.query('ROLLBACK').catch(() => {})
+    stagingBlocker.release()
+  }
+  const laterSystemCandidate = (await pool.query(
+    `SELECT global_id
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_order_id = $3
+     ORDER BY observed_at DESC, created_at DESC, id DESC
+     LIMIT 1`,
+    [ids.organization, ids.faireIntegrationAccount, manualExternalOrderId],
+  )).rows[0]
+  assert.equal((await persistence
+    .readAutomaticFaireExactRefreshTargetsInPostgres({
+      runtime,
+      preferredRunGlobalId: laterSystemStage.runGlobalId,
+      limit: 10,
+    })).some(
+      (target) => target.candidateGlobalId === laterSystemCandidate.global_id,
+    ), false, 'Older browser-owned order history must block unattended exact refresh')
+  const manualHistoryPromotion = await persistence
+    .readAutomaticFaireOrderPromotionTargetsForRunInPostgres({
+      runtime,
+      runGlobalId: laterSystemStage.runGlobalId,
+    })
+  assert.equal(manualHistoryPromotion[0].eligible, false)
+  assert.equal(
+    manualHistoryPromotion[0].reason,
+    'operator_owned_history',
+    'Browser-owned history must remain held without creating new unattended attention',
+  )
+
+  const packKey = 'auto_exact_missing_pack'
+  const packExternalOrderId = `faire-order-${packKey}`
+  await pool.query(
+    `INSERT INTO operations_product_mappings (
+       organization_id, integration_account_id, pipeline_id, product_id,
+       channel_sku, external_product_id, external_variant_id,
+       mapping_method, mapping_source_revision, active, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7,
+       'exact_variant', $8, true, $9
+     )`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      ids.pipeline,
+      ids.product,
+      `POSTGRES-${packKey}`,
+      `p_${packKey}`,
+      `po_${packKey}`,
+      hash('faire-auto-exact-missing-pack-mapping'),
+      systemActor,
+    ],
+  )
+  const packBase = fairePackOrderFixture({
+    key: packKey,
+    retailerId: 'retailer-auto-exact-missing-pack',
+    evidenceEmail: 'jarrett+missing-pack@episcs.com',
+  })
+  const packExactOrder = Object.freeze({
+    ...packBase,
+    providerCreatedAt: freshObservedAt,
+    providerProcessedAt: freshObservedAt,
+    providerUpdatedAt: freshObservedAt,
+    sourceStale: false,
+    sourceHash: hash('faire-auto-exact-missing-pack-current'),
+  })
+  const packListOrder = Object.freeze({
+    ...packExactOrder,
+    sourceStale: true,
+    readinessFacts: Object.freeze([
+      ...packExactOrder.readinessFacts,
+      Object.freeze({
+        dimension: 'source',
+        code: 'source_stale',
+        blocking: true,
+        subjectExternalId: packExternalOrderId,
+      }),
+    ]),
+    sourceHash: hash('faire-auto-exact-missing-pack-list'),
+  })
+  const packListRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009244',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-auto-pack-list',
+    responseHash: hash('commerce-staging-faire-auto-pack-list-response'),
+    intakeAction: 'fetch',
+    targetCandidate: null,
+    externalOrderId: packExternalOrderId,
+  }
+  await seedWorkerRead(packListRead)
+  const packListStage = await stageWorkerEnvelope({
+    read: packListRead,
+    action: 'fetch',
+    order: packListOrder,
+    targetCandidate: null,
+  })
+  const packSourceCandidate = (await pool.query(
+    `SELECT global_id, row_version::integer, source_hash
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_order_id = $3
+     ORDER BY observed_at DESC, created_at DESC, id DESC
+     LIMIT 1`,
+    [ids.organization, ids.faireIntegrationAccount, packExternalOrderId],
+  )).rows[0]
+  const packExactRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009245',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-faire-auto-pack-exact',
+    responseHash: hash('commerce-staging-faire-auto-pack-exact-response'),
+    intakeAction: 'refresh',
+    targetCandidate: {
+      globalId: packSourceCandidate.global_id,
+      sourceHash: packSourceCandidate.source_hash,
+    },
+    externalOrderId: packExternalOrderId,
+  }
+  await seedWorkerRead(packExactRead)
+  const packExactStage = await stageWorkerEnvelope({
+    read: packExactRead,
+    action: 'refresh',
+    order: packExactOrder,
+    targetCandidate: packExactRead.targetCandidate,
+  })
+  const packExactCandidate = (await pool.query(
+    `SELECT candidate.global_id, candidate.row_version::integer,
+            candidate.blocking_codes,
+            line.packaging_state, line.mapping_state,
+            line.price_resolution_state
+     FROM operations_commerce_order_candidates candidate
+     JOIN operations_commerce_order_candidate_lines line
+       ON line.organization_id = candidate.organization_id
+      AND line.integration_account_id = candidate.integration_account_id
+      AND line.order_candidate_id = candidate.id
+     WHERE candidate.organization_id = $1::uuid
+       AND candidate.integration_account_id = $2::uuid
+       AND candidate.external_order_id = $3
+     ORDER BY candidate.observed_at DESC, candidate.created_at DESC,
+              candidate.id DESC
+     LIMIT 1`,
+    [ids.organization, ids.faireIntegrationAccount, packExternalOrderId],
+  )).rows[0]
+  assert.equal(packExactCandidate.mapping_state, 'resolved')
+  assert.equal(packExactCandidate.price_resolution_state, 'provider')
+  assert.equal(packExactCandidate.packaging_state, 'unresolved')
+  assert.ok(packExactCandidate.blocking_codes.includes('packaging_required'))
+  const packCustomer = await persistence
+    .resolveCommerceCandidateCustomerInPostgres({
+      runtime,
+      actorEmail: systemActor,
+      idempotencyKey: 'commerce-staging-faire-auto-pack-customer',
+      candidateGlobalId: packExactCandidate.global_id,
+      candidateRowVersion: packExactCandidate.row_version,
+      customer: {
+        mode: 'existing',
+        customerGlobalId,
+        resolutionMethod: 'external_id',
+      },
+    })
+  assert.ok(packCustomer.rowVersion > packExactCandidate.row_version)
+  const packTargets = await persistence
+    .readAutomaticFaireOrderPromotionTargetsForRunInPostgres({
+      runtime,
+      runGlobalId: packExactStage.runGlobalId,
+    })
+  assert.equal(packTargets.length, 1)
+  assert.equal(packTargets[0].eligible, false)
+  assert.equal(
+    packTargets[0].reason,
+    'product_sku_or_pack_mapping_requires_review',
+    'Missing package evidence must remain an actionable no-go hold',
+  )
+  const packAttentionInput = {
+    runtime,
+    actorEmail: systemActor,
+    idempotencyKey: 'commerce-staging-faire-auto-pack-attention',
+    candidateGlobalId: packTargets[0].candidateGlobalId,
+    candidateRowVersion: packTargets[0].candidateRowVersion,
+    sourceHash: packTargets[0].sourceHash,
+    runGlobalId: packExactStage.runGlobalId,
+    reasonCode: packTargets[0].reason,
+    cohortHash: promotionCohortHash,
+    notBefore: promotionNotBefore,
+    attentionKind: 'promotion',
+  }
+  const packAttention = await persistence
+    .markAutomaticFaireOrderPromotionAttentionInPostgres(packAttentionInput)
+  assert.equal(packAttention.marked, true)
+  assert.equal(packAttention.alreadyMarked, false)
+  assert.equal(packAttention.providerWrites, 0)
+  assert.equal(packAttention.inventoryWrites, 0)
+  assert.equal((await persistence
+    .readAutomaticFaireOrderPromotionTargetsForRunInPostgres({
+      runtime,
+      runGlobalId: packExactStage.runGlobalId,
+    })).length, 0, 'Marked actionable Faire candidates must leave the selector')
+
+  await persistence.markCommerceCandidateUnsupportedInPostgres({
+    runtime,
+    actorEmail: humanActor,
+    idempotencyKey: 'commerce-staging-faire-auto-rejection-resolved',
+    candidateGlobalId: rejectionSourceCandidate.global_id,
+    candidateRowVersion: legacyCandidate.row_version,
+    reasonCode: 'operator_resolved',
+    reason: 'Operator reviewed and resolved the exact-read rejection.',
+  })
+  const promotionOnlyAttentionScan = await completeFaireAttentionScan({
+    promotionReviewRequired: 1,
+  })
+  assert.equal(
+    promotionOnlyAttentionScan.completed
+      .faireAutomaticPromotionAttentionRequired,
+    true,
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.completed.faireExactRefreshAttentionRequired,
+    false,
+    'Promotion-only attention must not enter the exact-refresh bucket',
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.completed.faireUnattributedAttentionRequired,
+    false,
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.health.providerPromotionAttentionRequired.faire,
+    1,
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.health.faireExactRefreshAttentionRequired,
+    0,
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.health.operatorAttentionRequired,
+    1,
+    'A promotion-only account must count once in aggregate operator attention',
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.state.automaticPromotionAttentionRequired,
+    true,
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.state.automaticExactRefreshAttentionRequired,
+    false,
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.state.automaticUnattributedAttentionRequired,
+    false,
+  )
+  assert.equal(
+    promotionOnlyAttentionScan.state.lastErrorCode,
+    'COMMERCE_FAIRE_PROMOTION_ATTENTION_REQUIRED',
+    'New promotion attention must never reuse the ambiguous legacy marker',
+  )
+
+  const packMixedAttention = await persistence
+    .markAutomaticFaireOrderPromotionAttentionInPostgres({
+      ...packAttentionInput,
+      idempotencyKey: 'commerce-staging-faire-auto-pack-exact-attention',
+      candidateRowVersion: packAttention.rowVersion,
+      reasonCode: 'COMMERCE_FAIRE_EXACT_REFRESH_INTERRUPTED',
+      attentionKind: 'exact_refresh',
+    })
+  assert.equal(packMixedAttention.marked, true)
+  assert.equal(packMixedAttention.alreadyMarked, false)
+  assert.equal((await pool.query(
+    `SELECT last_error_code
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND global_id = $3`,
+    [
+      ids.organization,
+      ids.faireIntegrationAccount,
+      packAttention.candidateGlobalId,
+    ],
+  )).rows[0].last_error_code,
+  'COMMERCE_FAIRE_PROMOTION_AND_EXACT_REFRESH_ATTENTION_REQUIRED')
+
+  const attentionScan = await completeFaireAttentionScan({
+    promotionReviewRequired: 1,
+    exactRefreshReviewRequired: 1,
+  })
+  assert.equal(
+    attentionScan.completed.faireAutomaticPromotionAttentionRequired,
+    true,
+  )
+  assert.equal(
+    attentionScan.completed.faireExactRefreshAttentionRequired,
+    true,
+    'Mixed unresolved candidates must retain both attention subtypes',
+  )
+  assert.equal(
+    attentionScan.completed.faireUnattributedAttentionRequired,
+    false,
+  )
+  assert.equal(
+    attentionScan.health.providerPromotionAttentionRequired.faire,
+    1,
+  )
+  assert.equal(attentionScan.health.faireExactRefreshAttentionRequired, 1)
+  assert.equal(
+    attentionScan.health.operatorAttentionRequired,
+    1,
+    'A mixed account must count once in aggregate operator attention',
+  )
+  assert.equal(attentionScan.state.automaticPromotionAttentionRequired, true)
+  assert.equal(
+    attentionScan.state.automaticExactRefreshAttentionRequired,
+    true,
+  )
+  const emptyAttentionScan = await completeFaireAttentionScan()
+  assert.equal(
+    emptyAttentionScan.completed.faireAutomaticPromotionAttentionRequired,
+    true,
+    'A later empty root scan must retain candidate-scoped Faire attention',
+  )
+  assert.equal(
+    emptyAttentionScan.completed.faireExactRefreshAttentionRequired,
+    true,
+    'A later empty root scan must preserve mixed subtype attribution',
+  )
+  assert.equal(
+    emptyAttentionScan.health.providerPromotionAttentionRequired.faire,
+    1,
+  )
+  assert.equal(emptyAttentionScan.health.faireExactRefreshAttentionRequired, 1)
+  assert.equal(
+    emptyAttentionScan.state.automaticPromotionAttentionRequired,
+    true,
+  )
+  assert.equal(
+    emptyAttentionScan.state.automaticExactRefreshAttentionRequired,
+    true,
+  )
+
+  await persistence.markCommerceCandidateUnsupportedInPostgres({
+    runtime,
+    actorEmail: humanActor,
+    idempotencyKey: 'commerce-staging-faire-auto-pack-resolved',
+    candidateGlobalId: packAttention.candidateGlobalId,
+    candidateRowVersion: packMixedAttention.rowVersion,
+    reasonCode: 'operator_resolved',
+    reason: 'Operator reviewed and resolved the package mapping hold.',
+  })
+  const markerHistory = (await pool.query(
+    `SELECT
+       count(*) FILTER (
+         WHERE last_error_code IN (
+           'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED',
+           'COMMERCE_FAIRE_PROMOTION_ATTENTION_REQUIRED',
+           'COMMERCE_FAIRE_EXACT_REFRESH_ATTENTION_REQUIRED',
+           'COMMERCE_FAIRE_PROMOTION_AND_EXACT_REFRESH_ATTENTION_REQUIRED'
+         )
+       )::integer AS active_markers,
+       count(*) FILTER (
+         WHERE external_order_id = $3
+           AND last_error_code IS NULL
+       )::integer AS historical_unmarked
+     FROM operations_commerce_order_candidates
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [ids.organization, ids.faireIntegrationAccount, manualExternalOrderId],
+  )).rows[0]
+  assert.deepEqual(markerHistory, {
+    active_markers: 0,
+    historical_unmarked: 2,
+  })
+  const clearedAttentionScan = await completeFaireAttentionScan()
+  assert.equal(
+    clearedAttentionScan.completed.faireAutomaticPromotionAttentionRequired,
+    false,
+    'Resolved markers and historical unmarked records must clear attention',
+  )
+  assert.equal(
+    clearedAttentionScan.health.providerPromotionAttentionRequired.faire,
+    0,
+  )
+  assert.equal(clearedAttentionScan.health.faireExactRefreshAttentionRequired, 0)
+  assert.equal(clearedAttentionScan.health.faireUnattributedAttentionRequired, 0)
+  assert.equal(
+    clearedAttentionScan.state.automaticPromotionAttentionRequired,
+    false,
+  )
+  assert.equal(
+    clearedAttentionScan.state.automaticExactRefreshAttentionRequired,
+    false,
+  )
+  assert.equal(
+    clearedAttentionScan.state.automaticUnattributedAttentionRequired,
+    false,
+  )
+  assert.equal(clearedAttentionScan.state.lastErrorCode, null)
+  assert.equal((await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_orders
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND external_order_id = $3`,
+    [ids.organization, ids.faireIntegrationAccount, packExternalOrderId],
+  )).rows[0].count, 0)
+  assert.equal(packListStage.providerWrites, 0)
+}
+
 async function verifyAcceptance(databaseUrl) {
   const pool = new Pool({
     connectionString: databaseUrl,
@@ -3796,6 +7290,9 @@ async function verifyAcceptance(databaseUrl) {
     mappedVariant: 'gid://shopify/ProductVariant/mapped-zero',
   }
   const imageFixture = productImageFixture()
+  const providerClockAheadRetentionExpiresAt = new Date(
+    Date.now() + 30 * 24 * 60 * 60 * 1_000 + 60_000,
+  ).toISOString()
   const envelope = Object.freeze({
     schemaVersion: 'commerce-normalization-envelope-v1',
     normalizerVersion: 'commerce-staging-postgres-v1',
@@ -3806,7 +7303,7 @@ async function verifyAcceptance(databaseUrl) {
     apiVersion: '2026-07',
     observedAt,
     credentialGeneration: 1,
-    retentionExpiresAt,
+    retentionExpiresAt: providerClockAheadRetentionExpiresAt,
     sourceHash: hash('commerce-staging-envelope'),
     products: Object.freeze([imageFixture.product]),
     orders: Object.freeze([
@@ -3985,9 +7482,70 @@ async function verifyAcceptance(databaseUrl) {
   )
   assert.equal(result.replayed, false)
   assert.equal(result.ordersStaged, 6)
-  assert.equal(result.recordsStaged, 6)
+  assert.equal(result.productVariantsStaged, 1)
+  assert.equal(result.recordsStaged, 7)
   assert.equal(result.providerWrites, 0)
   assert.equal(result.syncCursorAdvanced, false)
+  const retention = (await pool.query(
+    `SELECT
+       run.expires_at > run.created_at AS remains_unexpired,
+       run.expires_at <= run.created_at + interval '30 days'
+         AS database_bounded,
+       run.expires_at < $2::timestamptz AS provider_clock_clamped,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_product_candidates product_candidate
+         WHERE product_candidate.run_id = run.id
+           AND product_candidate.expires_at IS DISTINCT FROM run.expires_at
+       ) AS product_expiry_mismatches,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_product_candidates product_candidate
+         WHERE product_candidate.run_id = run.id
+       ) AS product_candidate_count,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_order_candidates candidate
+         WHERE candidate.run_id = run.id
+           AND candidate.expires_at IS DISTINCT FROM run.expires_at
+       ) AS order_expiry_mismatches,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_order_candidate_lines line
+         WHERE line.run_id = run.id
+           AND line.expires_at IS DISTINCT FROM run.expires_at
+       ) AS line_expiry_mismatches,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_intake_continuations continuation
+         WHERE continuation.run_id = run.id
+           AND continuation.expires_at IS DISTINCT FROM run.expires_at
+       ) AS continuation_expiry_mismatches,
+       (
+         SELECT count(*)::integer
+         FROM operations_commerce_intake_continuations continuation
+         WHERE continuation.run_id = run.id
+       ) AS continuation_count
+     FROM operations_commerce_intake_runs run
+     WHERE run.organization_id = $1::uuid
+       AND run.global_id = $3`,
+    [
+      ids.organization,
+      providerClockAheadRetentionExpiresAt,
+      result.runGlobalId,
+    ],
+  )).rows[0]
+  assert.deepEqual(retention, {
+    remains_unexpired: true,
+    database_bounded: true,
+    provider_clock_clamped: true,
+    product_expiry_mismatches: 0,
+    product_candidate_count: 1,
+    order_expiry_mismatches: 0,
+    line_expiry_mismatches: 0,
+    continuation_expiry_mismatches: 0,
+    continuation_count: 1,
+  })
   assert.deepEqual(JSON.parse(JSON.stringify(result.productImageImports)), {
     productsObserved: 1,
     activeImagesObserved: 1,
@@ -5074,6 +8632,43 @@ async function verifyAcceptance(databaseUrl) {
     4,
     'Only still-unresolved prior-run candidates belong in the backlog sweep',
   )
+  const previousFairePromotionCohort = process.env
+    .CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS
+  const previousFairePromotionNotBefore = process.env
+    .CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE
+  const previousFairePromotionLane = process.env.CLAWPILOT_ENV
+  process.env.CLAWPILOT_ENV = 'development'
+  process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS =
+    'gia0009202'
+  process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE =
+    new Date(Date.now() - 60_000).toISOString()
+  try {
+    await verifyAutomaticFaireExactRefreshLineage(
+      pool,
+      ids,
+      persistence,
+      counters,
+    )
+  } finally {
+    if (previousFairePromotionCohort === undefined) {
+      delete process.env
+        .CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS
+    } else {
+      process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_ACCOUNT_GLOBAL_IDS =
+        previousFairePromotionCohort
+    }
+    if (previousFairePromotionNotBefore === undefined) {
+      delete process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE
+    } else {
+      process.env.CLAWPILOT_FAIRE_ORDER_AUTO_PROMOTION_NOT_BEFORE =
+        previousFairePromotionNotBefore
+    }
+    if (previousFairePromotionLane === undefined) {
+      delete process.env.CLAWPILOT_ENV
+    } else {
+      process.env.CLAWPILOT_ENV = previousFairePromotionLane
+    }
+  }
   await verifyFaireExactVariantPackBinding(
     pool,
     ids,
@@ -5081,6 +8676,7 @@ async function verifyAcceptance(databaseUrl) {
     counters,
     loadSandboxCommerceE2eAuthorization(pool),
   )
+  await verifyAutomaticShopifyCleanPromotion(pool, ids, counters)
   await verifyCustomerPrefetchBinding(pool, ids, persistence, counters)
   await pool.end()
 }
@@ -5122,7 +8718,9 @@ async function main() {
     'Commerce intake staging, scaled-whole zero-price promotion, fractional '
       + 'rollback, review-mode terminal catalog recovery, and policy-drift '
       + 'recovery, plus Faire customer pre-fetch binding disposable-PostgreSQL '
-      + 'and exact variant-pack evidence acceptance passed',
+      + 'and exact variant-pack evidence, plus Shopify clean-path preflight, '
+      + 'zero-dollar subsidized checkout matching, drift fencing, atomic '
+      + 'rollback, and durable cross-scan worker attention acceptance passed',
   )
 }
 

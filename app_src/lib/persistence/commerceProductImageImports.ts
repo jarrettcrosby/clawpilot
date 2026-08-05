@@ -129,6 +129,7 @@ export type CommerceProductImageImportQueueHealth = {
   historicalDeadCount: number
   staleLeaseCount: number
   overdueCount: number
+  lastTerminalProgressAt: string | null
   heartbeat: {
     phase: CommerceProductImageImportWorkerPhase
     checkedAt: string
@@ -3617,6 +3618,7 @@ Promise<CommerceProductImageImportQueueHealth> {
       historical_dead_count: string
       stale_lease_count: string
       overdue_count: string
+      last_terminal_progress_at: Date | string | null
     }>(
       `SELECT
          count(*) FILTER (WHERE state = 'waiting_mapping')::text
@@ -3652,7 +3654,10 @@ Promise<CommerceProductImageImportQueueHealth> {
            WHERE state IN ('queued', 'retry')
              AND available_at <=
                    statement_timestamp() - interval '5 minutes'
-         )::text AS overdue_count
+         )::text AS overdue_count,
+         max(updated_at) FILTER (
+           WHERE state IN ('succeeded', 'cancelled', 'dead')
+         ) AS last_terminal_progress_at
        FROM operations_commerce_product_image_import_jobs job`,
     )
     const heartbeat = await client.query<{
@@ -3690,6 +3695,9 @@ Promise<CommerceProductImageImportQueueHealth> {
         'stale lease count',
       ),
       overdueCount: nonnegativeInteger(row.overdue_count, 'overdue count'),
+      lastTerminalProgressAt: row.last_terminal_progress_at
+        ? iso(row.last_terminal_progress_at, 'last terminal progress timestamp')
+        : null,
       heartbeat: latestHeartbeat
         ? {
             phase: latestHeartbeat.phase,

@@ -279,6 +279,7 @@ type ActivationRow = QueryResultRow & {
 type CommandReceiptRow = QueryResultRow & {
   id: string
   request_hash: string
+  target_global_id: string | null
   status: 'processing' | 'succeeded' | 'failed'
   correlation_id: string
   result_global_id: string | null
@@ -506,6 +507,44 @@ function customerNotificationDecision(
       ? source.decidedBy
       : null,
   }
+}
+
+function hasRetainedShopifySandboxAuthorization(
+  payloadValue: unknown,
+  provider: unknown,
+): boolean {
+  const payload = json(payloadValue)
+  const retainedSandboxAuthorizationGlobalId = String(
+    payload.sandboxE2eAuthorizationGlobalId || '',
+  ).trim()
+  return (
+    provider === 'shopify'
+    && /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/.test(
+      retainedSandboxAuthorizationGlobalId,
+    )
+  )
+}
+
+function commerceExportCustomerNotificationDecision(
+  payloadValue: unknown,
+  provider: unknown,
+): OperationsCustomerNotificationDecision {
+  const payload = json(payloadValue)
+  const decision = customerNotificationDecision(payload.customerNotification)
+  if (
+    decision.source === 'legacy_safe_default'
+    && hasRetainedShopifySandboxAuthorization(payload, provider)
+  ) {
+    return {
+      mode: 'clawpilot_explicit',
+      notifyCustomer: false,
+      source: 'sandbox_e2e_suppression',
+      accountPolicyRevision: null,
+      overrideReason: null,
+      decidedBy: null,
+    }
+  }
+  return decision
 }
 
 function address(value: unknown): Address {
@@ -2697,8 +2736,9 @@ async function readOrderDetail(
       errorMessage: item.error_message,
       requestedAt: item.requested_at.toISOString(),
       completedAt: item.completed_at?.toISOString() || null,
-      customerNotification: customerNotificationDecision(
-        json(item.payload_snapshot).customerNotification,
+      customerNotification: commerceExportCustomerNotificationDecision(
+        item.payload_snapshot,
+        item.provider,
       ),
     })),
     events: eventResult.rows.map((item) => ({
@@ -4625,6 +4665,7 @@ async function prepareCommandReceipt(input: {
   idempotencyKey: string
   requestHash: string
   actorEmail: string
+  targetGlobalId?: string
 }): Promise<{ receipt: CommandReceiptRow; completed: boolean }> {
   return withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
@@ -4632,14 +4673,15 @@ async function prepareCommandReceipt(input: {
       `operations:command-receipt:${input.organizationId}:${input.commandType}:${input.idempotencyKey}`,
     )
     const existing = await client.query<CommandReceiptRow>(
-      `SELECT id::text, request_hash, status, correlation_id::text,
+      `SELECT id::text, request_hash, target_global_id,
+              status, correlation_id::text,
               result_global_id, result_payload, attempts, updated_at
        FROM operations_command_receipts
        WHERE organization_id = $1::uuid AND command_type = $2 AND idempotency_key = $3
        FOR UPDATE`,
       [input.organizationId, input.commandType, input.idempotencyKey],
     )
-    const receipt = existing.rows[0]
+    let receipt = existing.rows[0]
     if (receipt) {
       if (receipt.request_hash !== input.requestHash) {
         throw new OperationsRequestError(
@@ -4647,6 +4689,29 @@ async function prepareCommandReceipt(input: {
           'This idempotency key was already used with different command data',
           409,
         )
+      }
+      if (
+        input.targetGlobalId
+        && receipt.target_global_id
+        && receipt.target_global_id !== input.targetGlobalId
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_IDEMPOTENCY_CONFLICT',
+          'This idempotency key was already used for a different command target',
+          409,
+        )
+      }
+      if (input.targetGlobalId && !receipt.target_global_id) {
+        const targeted = await client.query<CommandReceiptRow>(
+          `UPDATE operations_command_receipts
+           SET target_global_id = $2
+           WHERE id = $1::uuid AND target_global_id IS NULL
+           RETURNING id::text, request_hash, target_global_id,
+                     status, correlation_id::text,
+                     result_global_id, result_payload, attempts, updated_at`,
+          [receipt.id, input.targetGlobalId],
+        )
+        receipt = targeted.rows[0]
       }
       if (receipt.status === 'succeeded') return { receipt, completed: true }
       if (receipt.status === 'processing' && Date.now() - receipt.updated_at.getTime() < 5 * 60_000) {
@@ -4662,7 +4727,8 @@ async function prepareCommandReceipt(input: {
              error_code = NULL, error_message = NULL, completed_at = NULL,
              started_at = now(), updated_at = now()
          WHERE id = $1::uuid
-         RETURNING id::text, request_hash, status, correlation_id::text,
+         RETURNING id::text, request_hash, target_global_id,
+                   status, correlation_id::text,
                    result_global_id, result_payload, attempts, updated_at`,
         [receipt.id, input.actorEmail],
       )
@@ -4671,9 +4737,12 @@ async function prepareCommandReceipt(input: {
     const created = await client.query<CommandReceiptRow>(
       `INSERT INTO operations_command_receipts (
          organization_id, command_type, idempotency_key, request_hash,
-         actor_email, status, correlation_id
-       ) VALUES ($1::uuid, $2, $3, $4, $5, 'processing', $6::uuid)
-       RETURNING id::text, request_hash, status, correlation_id::text,
+         actor_email, status, correlation_id, target_global_id
+       ) VALUES (
+         $1::uuid, $2, $3, $4, $5, 'processing', $6::uuid, $7
+       )
+       RETURNING id::text, request_hash, target_global_id,
+                 status, correlation_id::text,
                  result_global_id, result_payload, attempts, updated_at`,
       [
         input.organizationId,
@@ -4682,6 +4751,7 @@ async function prepareCommandReceipt(input: {
         input.requestHash,
         input.actorEmail,
         randomUUID(),
+        input.targetGlobalId || null,
       ],
     )
     return { receipt: created.rows[0], completed: false }
@@ -8296,6 +8366,49 @@ async function completedShipmentCommandResult(
     && typeof payload.commerceExportGlobalId === 'string'
     && ['succeeded', 'unsupported', 'failed']
       .includes(String(payload.commerceExportState))) {
+    let notificationDecision = customerNotificationDecision(
+      payload.customerNotification,
+    )
+    if (notificationDecision.source === 'legacy_safe_default') {
+      const exactExport = await query<QueryResultRow & {
+        provider: string
+        payload_snapshot: Record<string, unknown>
+      }>(
+        `SELECT fulfillment_export.provider,
+                fulfillment_export.payload_snapshot
+         FROM operations_commerce_fulfillment_exports fulfillment_export
+         JOIN operations_orders source_order
+           ON source_order.organization_id = fulfillment_export.organization_id
+          AND source_order.id = fulfillment_export.order_id
+         JOIN operations_shipments shipment
+           ON shipment.organization_id = fulfillment_export.organization_id
+          AND shipment.id = fulfillment_export.shipment_id
+         WHERE fulfillment_export.organization_id = $1::uuid
+           AND fulfillment_export.global_id = $2
+           AND source_order.global_id = $3
+           AND shipment.global_id = $4
+         LIMIT 1`,
+        [
+          organizationId,
+          payload.commerceExportGlobalId,
+          payload.orderGlobalId,
+          payload.shipmentGlobalId,
+        ],
+      )
+      const recoveredDecision = exactExport.rows[0]
+        && hasRetainedShopifySandboxAuthorization(
+            exactExport.rows[0].payload_snapshot,
+            exactExport.rows[0].provider,
+          )
+        ? commerceExportCustomerNotificationDecision(
+            exactExport.rows[0].payload_snapshot,
+            exactExport.rows[0].provider,
+          )
+        : notificationDecision
+      if (recoveredDecision.source === 'sandbox_e2e_suppression') {
+        notificationDecision = recoveredDecision
+      }
+    }
     return {
       orderGlobalId: payload.orderGlobalId,
       orderStatus: 'shipped',
@@ -8305,9 +8418,7 @@ async function completedShipmentCommandResult(
       packingSlipArtifactGlobalId: payload.packingSlipArtifactGlobalId,
       commerceExportGlobalId: payload.commerceExportGlobalId,
       commerceExportState: payload.commerceExportState as OperationsShipmentCommandResult['commerceExportState'],
-      customerNotification: customerNotificationDecision(
-        payload.customerNotification,
-      ),
+      customerNotification: notificationDecision,
       replayed: true,
       printJobGlobalId: typeof payload.printJobGlobalId === 'string'
         ? payload.printJobGlobalId
@@ -8325,6 +8436,11 @@ async function completedShipmentCommandResult(
       409,
     )
   }
+  const receiptCommerceExportGlobalId = (
+    payload && typeof payload.commerceExportGlobalId === 'string'
+      ? payload.commerceExportGlobalId
+      : null
+  )
   const result = await query<QueryResultRow & {
     order_global_id: string
     order_status: OperationsOrderStatus
@@ -8333,6 +8449,7 @@ async function completedShipmentCommandResult(
     tracking_number: string
     artifact_global_id: string
     export_global_id: string
+    export_provider: string
     export_state: string
     export_payload_snapshot: Record<string, unknown>
     print_job_global_id: string | null
@@ -8344,6 +8461,7 @@ async function completedShipmentCommandResult(
             shipment.tracking_number,
             artifact.global_id AS artifact_global_id,
             fulfillment_export.global_id AS export_global_id,
+            fulfillment_export.provider AS export_provider,
             fulfillment_export.state AS export_state,
             fulfillment_export.payload_snapshot AS export_payload_snapshot,
             print_job.global_id AS print_job_global_id
@@ -8373,8 +8491,10 @@ async function completedShipmentCommandResult(
      ) print_job ON true
      WHERE source_order.organization_id = $1::uuid
        AND source_order.global_id = $2
+       AND ($3::text IS NULL OR fulfillment_export.global_id = $3)
+     ORDER BY fulfillment_export.requested_at DESC, fulfillment_export.id DESC
      LIMIT 1`,
-    [organizationId, orderGlobalId],
+    [organizationId, orderGlobalId, receiptCommerceExportGlobalId],
   )
   const row = result.rows[0]
   if (!row || row.order_status !== 'shipped') {
@@ -8397,8 +8517,9 @@ async function completedShipmentCommandResult(
     packingSlipArtifactGlobalId: row.artifact_global_id,
     commerceExportGlobalId: row.export_global_id,
     commerceExportState: exportState,
-    customerNotification: customerNotificationDecision(
-      json(row.export_payload_snapshot).customerNotification,
+    customerNotification: commerceExportCustomerNotificationDecision(
+      row.export_payload_snapshot,
+      row.export_provider,
     ),
     replayed: true,
     printJobGlobalId: row.print_job_global_id,
@@ -9512,6 +9633,49 @@ export async function runMockOperationsProofFromPostgres(input: {
   }
 }
 
+function planningOrderEvidenceMismatch(): OperationsRequestError {
+  return new OperationsRequestError(
+    'OPERATIONS_ORDER_EVIDENCE_MISMATCH',
+    'The order and cartonization evidence do not share one promoted commerce candidate',
+    409,
+  )
+}
+
+async function resolvePlanningOrderTarget(input: {
+  organizationId: string
+  requestedOrderGlobalId: string
+  evidenceGlobalId: string
+}): Promise<string> {
+  const result = await query<{ global_id: string }>(
+    `SELECT source_order.global_id
+     FROM operations_orders source_order
+     JOIN operations_commerce_order_candidates candidate
+       ON candidate.organization_id = source_order.organization_id
+      AND candidate.integration_account_id =
+            source_order.integration_account_id
+      AND candidate.canonical_order_id = source_order.id
+     JOIN operations_cartonization_rate_evidence evidence
+       ON evidence.organization_id = candidate.organization_id
+      AND evidence.integration_account_id = candidate.integration_account_id
+      AND evidence.order_candidate_id = candidate.id
+     WHERE source_order.organization_id = $1::uuid
+       AND source_order.global_id = $2
+       AND evidence.global_id = $3
+       AND candidate.workflow_state = 'promoted'
+     LIMIT 1`,
+    [
+      input.organizationId,
+      input.requestedOrderGlobalId,
+      input.evidenceGlobalId,
+    ],
+  )
+  const authoritativeOrderGlobalId = result.rows[0]?.global_id
+  if (!authoritativeOrderGlobalId) {
+    throw planningOrderEvidenceMismatch()
+  }
+  return authoritativeOrderGlobalId
+}
+
 export async function planOperationsOrderFromPostgres(input: {
   organizationId: string
   actorEmail: string
@@ -9523,7 +9687,7 @@ export async function planOperationsOrderFromPostgres(input: {
 }): Promise<OperationsPlanCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
-  const orderGlobalId = String(input.orderGlobalId || '').trim()
+  const requestedOrderGlobalId = String(input.orderGlobalId || '').trim()
   const evidenceGlobalId = String(
     input.cartonizationEvidenceGlobalId || '',
   ).trim()
@@ -9536,7 +9700,7 @@ export async function planOperationsOrderFromPostgres(input: {
       401,
     )
   }
-  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(requestedOrderGlobalId)) {
     throw new OperationsRequestError(
       'OPERATIONS_ORDER_INVALID',
       'Order is invalid',
@@ -9570,16 +9734,17 @@ export async function planOperationsOrderFromPostgres(input: {
     )
   }
 
+  const orderGlobalId = await resolvePlanningOrderTarget({
+    organizationId,
+    requestedOrderGlobalId,
+    evidenceGlobalId,
+  })
   const evidence = await readCartonizationRateEvidenceByGlobalId({
     organizationId,
     evidenceGlobalId,
   })
   if (!evidence) {
-    throw new OperationsRequestError(
-      'OPERATIONS_CARTONIZATION_EVIDENCE_NOT_FOUND',
-      'Sealed cartonization evidence was not found',
-      404,
-    )
+    throw planningOrderEvidenceMismatch()
   }
   if (
     evidence.evidenceMode !== 'operational'
@@ -9604,6 +9769,7 @@ export async function planOperationsOrderFromPostgres(input: {
       reason,
     }),
     actorEmail,
+    targetGlobalId: orderGlobalId,
   })
   if (command.completed) {
     return completedPlanCommandResult(command.receipt)
@@ -9702,11 +9868,7 @@ export async function planOperationsOrderFromPostgres(input: {
       )
       const order = orderResult.rows[0]
       if (!order || order.row_version === undefined) {
-        throw new OperationsRequestError(
-          'OPERATIONS_ORDER_EVIDENCE_MISMATCH',
-          'The order and cartonization evidence do not share one promoted commerce candidate',
-          409,
-        )
+        throw planningOrderEvidenceMismatch()
       }
       if (Number(order.row_version) !== input.expectedRowVersion) {
         throw new OperationsRequestError(
@@ -12992,8 +13154,9 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
         404,
       )
     }
-    const decision = customerNotificationDecision(
-      json(row.payload_snapshot).customerNotification,
+    const decision = commerceExportCustomerNotificationDecision(
+      row.payload_snapshot,
+      row.provider,
     )
     if (['succeeded', 'unsupported'].includes(row.state)) {
       return { row, decision, terminal: true as const }

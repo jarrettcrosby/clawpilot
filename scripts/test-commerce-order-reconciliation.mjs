@@ -41,6 +41,7 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
     Promise,
     RegExp,
     String,
+    URL,
     console,
     exports: module.exports,
     module,
@@ -48,6 +49,16 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
     ...globals,
     require(specifier) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) return mocks[specifier]
+      if (specifier === '@/lib/persistence/commerceIntake') {
+        return {
+          async markAutomaticFaireOrderPromotionAttentionInPostgres() {
+            return { marked: true }
+          },
+          async readAutomaticFaireExactRefreshTargetsInPostgres() {
+            return []
+          },
+        }
+      }
       if (specifier === '@/lib/integrations/commerceIntegrations') {
         return {
           CommerceIntegrationRequestError: class CommerceIntegrationRequestError extends Error {
@@ -59,6 +70,22 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
           },
         }
       }
+      if (
+        specifier
+        === '@/lib/integrations/commerceFaireAutomaticPromotion'
+      ) {
+        return loadTypeScriptModule(
+          'app_src/lib/integrations/commerceFaireAutomaticPromotion.ts',
+        )
+      }
+      if (
+        specifier
+        === '@/lib/integrations/commerceShopifyAutomaticPromotion'
+      ) {
+        return loadTypeScriptModule(
+          'app_src/lib/integrations/commerceShopifyAutomaticPromotion.ts',
+        )
+      }
       return nodeRequire(specifier)
     },
   }
@@ -69,6 +96,632 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
 const persistence = read('app_src/lib/persistence/commerceOrderReconciliation.ts')
 const fairePromotionPolicy = loadTypeScriptModule(
   'app_src/lib/integrations/commerceFaireAutomaticPromotion.ts',
+)
+assert.equal(
+  fairePromotionPolicy.AUTOMATIC_FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_MARKER,
+  'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED',
+)
+assert.equal(
+  fairePromotionPolicy.AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER,
+  'COMMERCE_FAIRE_PROMOTION_ATTENTION_REQUIRED',
+)
+const shopifyPromotionPolicy = loadTypeScriptModule(
+  'app_src/lib/integrations/commerceShopifyAutomaticPromotion.ts',
+)
+const shopifyCohortEnv =
+  shopifyPromotionPolicy.SHOPIFY_AUTOMATIC_ORDER_PROMOTION_COHORT_ENV
+const enabledShopifyAccount = 'gia0009201'
+const secondShopifyAccount = 'gia0bcdefghjkmn'
+const cohortOff = shopifyPromotionPolicy
+  .shopifyAutomaticOrderPromotionGate({
+    accountGlobalId: enabledShopifyAccount,
+    environment: { CLAWPILOT_ENV: 'development' },
+  })
+assert.equal(cohortOff.accountEnabled, false)
+assert.equal(cohortOff.disabledReason, 'account_cohort_not_configured')
+const nonDevelopment = shopifyPromotionPolicy
+  .shopifyAutomaticOrderPromotionGate({
+    accountGlobalId: enabledShopifyAccount,
+    environment: {
+      CLAWPILOT_ENV: 'production',
+      [shopifyCohortEnv]: enabledShopifyAccount,
+    },
+  })
+assert.equal(nonDevelopment.accountEnabled, false)
+assert.equal(nonDevelopment.disabledReason, 'development_runtime_required')
+const contradictoryHostedProduction = shopifyPromotionPolicy
+  .shopifyAutomaticOrderPromotionGate({
+    accountGlobalId: enabledShopifyAccount,
+    environment: {
+      CLAWPILOT_ENV: 'development',
+      RAILWAY_ENVIRONMENT_NAME: 'production',
+      VERCEL_ENV: 'preview',
+      [shopifyCohortEnv]: enabledShopifyAccount,
+    },
+  })
+assert.equal(contradictoryHostedProduction.accountEnabled, false)
+assert.equal(
+  contradictoryHostedProduction.disabledReason,
+  'hosted_production_runtime',
+)
+const malformedCohort = shopifyPromotionPolicy
+  .shopifyAutomaticOrderPromotionCohort({
+    CLAWPILOT_ENV: 'development',
+    [shopifyCohortEnv]: `${enabledShopifyAccount},not-an-account`,
+  })
+assert.equal(malformedCohort.valid, false)
+assert.deepEqual([...malformedCohort.accountGlobalIds], [])
+const duplicateCohort = shopifyPromotionPolicy
+  .shopifyAutomaticOrderPromotionCohort({
+    CLAWPILOT_ENV: 'development',
+    [shopifyCohortEnv]: `${enabledShopifyAccount},${enabledShopifyAccount}`,
+  })
+assert.equal(duplicateCohort.valid, false)
+const exactCohortEnvironment = {
+  CLAWPILOT_ENV: 'development',
+  [shopifyCohortEnv]: `${secondShopifyAccount},${enabledShopifyAccount}`,
+}
+const accountMismatch = shopifyPromotionPolicy
+  .shopifyAutomaticOrderPromotionGate({
+    accountGlobalId: 'gia0009202',
+    environment: exactCohortEnvironment,
+  })
+assert.equal(accountMismatch.accountEnabled, false)
+assert.equal(accountMismatch.disabledReason, 'account_not_in_cohort')
+const exactCohort = shopifyPromotionPolicy
+  .shopifyAutomaticOrderPromotionGate({
+    accountGlobalId: enabledShopifyAccount,
+    environment: exactCohortEnvironment,
+  })
+assert.equal(exactCohort.accountEnabled, true)
+assert.equal(exactCohort.cohortSize, 2)
+assert.match(exactCohort.cohortHash, /^[a-f0-9]{64}$/u)
+assert.deepEqual(
+  [...exactCohort.accountGlobalIds],
+  [enabledShopifyAccount, secondShopifyAccount].sort(),
+)
+const legacyOneAccountShopifyGate = shopifyPromotionPolicy
+  .shopifyAutomaticOrderPromotionGate({
+    accountGlobalId: enabledShopifyAccount,
+    environment: {
+      CLAWPILOT_ENV: 'development',
+      [shopifyCohortEnv]: enabledShopifyAccount,
+    },
+  })
+assert.equal(legacyOneAccountShopifyGate.accountEnabled, true)
+assert.match(legacyOneAccountShopifyGate.cohortHash, /^[a-f0-9]{64}$/u)
+const validDevelopmentShopifyHealth = shopifyPromotionPolicy
+  .shopifyAutomaticOrderPromotionGateHealth({
+    CLAWPILOT_ENV: 'development',
+    [shopifyCohortEnv]: enabledShopifyAccount,
+  })
+assert.deepEqual(
+  JSON.parse(JSON.stringify(validDevelopmentShopifyHealth)),
+  {
+    policyVersion: 'commerce-shopify-order-auto-promotion-v1',
+    enabled: true,
+    runtimeEligible: true,
+    cohortConfigured: true,
+    cohortValid: true,
+    cohortSize: 1,
+    disabledReason: null,
+  },
+)
+assert.equal(
+  Object.prototype.hasOwnProperty.call(
+    validDevelopmentShopifyHealth,
+    'cohortHash',
+  ),
+  false,
+)
+assert.equal(
+  JSON.stringify(validDevelopmentShopifyHealth).includes(
+    legacyOneAccountShopifyGate.cohortHash,
+  ),
+  false,
+  'A legacy one-account Shopify cohort fingerprint must not be public',
+)
+const sanitizedShopifyHealth = shopifyPromotionPolicy
+  .shopifyAutomaticOrderPromotionHealthSnapshot({
+    environment: {
+      CLAWPILOT_ENV: 'development',
+      [shopifyCohortEnv]: enabledShopifyAccount,
+    },
+    heartbeat: {
+      policyVersion: 'untrusted-old-policy',
+      cohortHash: legacyOneAccountShopifyGate.cohortHash,
+      accountGlobalIds: [enabledShopifyAccount],
+      rawCohortConfiguration: enabledShopifyAccount,
+      providerToken: 'must-not-leak',
+      promoted: 2_000_000,
+      held: 4,
+      actionableHeld: 999,
+      heldByReason: {
+        checkout_rate_lineage_missing: 2,
+        GIA0009201: 1,
+        SECRETVALUE123: 1,
+        ...Object.fromEntries(Array.from(
+          { length: 1_000 },
+          (_, index) => [`MALICIOUS_HOLD_${index}`, index + 1],
+        )),
+      },
+      failed: 3,
+      failedByCode: {
+        COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED: 1,
+        GIA0009201: 1,
+        PROVIDER_TOKEN_SUPERSECRET: 1,
+        ...Object.fromEntries(Array.from(
+          { length: 1_000 },
+          (_, index) => [`MALICIOUS_FAILURE_${index}`, index + 1],
+        )),
+      },
+      rollbackFenced: 9,
+      attentionRequiredAccounts: 2,
+      operatorReviewRequired: 0,
+      providerWrites: 0,
+      canonicalOrderWrites: 2,
+      inventoryWrites: 0,
+      syncCursorAdvanced: false,
+    },
+  })
+assert.equal(
+  sanitizedShopifyHealth.policyVersion,
+  validDevelopmentShopifyHealth.policyVersion,
+)
+assert.equal(sanitizedShopifyHealth.promoted, 1_000_000)
+assert.equal(sanitizedShopifyHealth.actionableHeld, 4)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(sanitizedShopifyHealth.heldByReason)),
+  { checkout_rate_lineage_missing: 2, OTHER: 2 },
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(sanitizedShopifyHealth.failedByCode)),
+  {
+    COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED: 1,
+    OTHER: 2,
+  },
+)
+assert.equal(sanitizedShopifyHealth.rollbackFenced, 3)
+assert.equal(sanitizedShopifyHealth.operatorReviewRequired, 7)
+assert.equal(
+  Object.values(sanitizedShopifyHealth.heldByReason)
+    .reduce((sum, count) => sum + count, 0),
+  sanitizedShopifyHealth.held,
+)
+assert.equal(
+  Object.values(sanitizedShopifyHealth.failedByCode)
+    .reduce((sum, count) => sum + count, 0),
+  sanitizedShopifyHealth.failed,
+)
+const serializedShopifyHealth = JSON.stringify(sanitizedShopifyHealth)
+for (const sensitiveValue of [
+  enabledShopifyAccount,
+  legacyOneAccountShopifyGate.cohortHash,
+  'must-not-leak',
+  'GIA0009201',
+  'SECRETVALUE123',
+  'PROVIDER_TOKEN_SUPERSECRET',
+  'MALICIOUS_HOLD_',
+  'MALICIOUS_FAILURE_',
+]) {
+  assert.equal(
+    serializedShopifyHealth.includes(sensitiveValue),
+    false,
+    `Shopify public health must not echo ${sensitiveValue}`,
+  )
+}
+const faireCohortEnv = fairePromotionPolicy
+  .AUTOMATIC_FAIRE_ORDER_PROMOTION_COHORT_ENV
+const faireNotBeforeEnv = fairePromotionPolicy
+  .AUTOMATIC_FAIRE_ORDER_PROMOTION_NOT_BEFORE_ENV
+const enabledFaireAccount = 'gia0009202'
+const secondFaireAccount = 'gia0bcdefghjkmn'
+const faireNotBefore = '2026-08-04T12:00:00.000Z'
+const faireGateOff = fairePromotionPolicy
+  .faireAutomaticOrderPromotionGate({
+    accountGlobalId: enabledFaireAccount,
+    environment: { CLAWPILOT_ENV: 'development' },
+  })
+assert.equal(faireGateOff.accountEnabled, false)
+assert.equal(faireGateOff.disabledReason, 'cohort_and_not_before_required')
+const invalidFaireBoundary = fairePromotionPolicy
+  .faireAutomaticOrderPromotionCohort({
+    CLAWPILOT_ENV: 'development',
+    [faireCohortEnv]: enabledFaireAccount,
+    [faireNotBeforeEnv]: '2026-08-04T12:00:00Z',
+  })
+assert.equal(invalidFaireBoundary.valid, false)
+const faireProductionHostVeto = fairePromotionPolicy
+  .faireAutomaticOrderPromotionGate({
+    accountGlobalId: enabledFaireAccount,
+    environment: {
+      CLAWPILOT_ENV: 'development',
+      NODE_ENV: 'development',
+      CLAWPILOT_PUBLIC_URL: 'https://aiapp.eigenracing.com',
+      [faireCohortEnv]: enabledFaireAccount,
+      [faireNotBeforeEnv]: faireNotBefore,
+    },
+  })
+assert.equal(faireProductionHostVeto.accountEnabled, false)
+assert.equal(
+  faireProductionHostVeto.disabledReason,
+  'hosted_production_runtime',
+)
+const faireVercelProductionHostVeto = fairePromotionPolicy
+  .faireAutomaticOrderPromotionGate({
+    accountGlobalId: enabledFaireAccount,
+    environment: {
+      CLAWPILOT_ENV: 'development',
+      NODE_ENV: 'development',
+      VERCEL_ENV: 'preview',
+      VERCEL_URL: 'clawpilot-production.example.vercel.app',
+      VERCEL_PROJECT_PRODUCTION_URL:
+        'clawpilot-production.example.vercel.app',
+      [faireCohortEnv]: enabledFaireAccount,
+      [faireNotBeforeEnv]: faireNotBefore,
+    },
+  })
+assert.equal(faireVercelProductionHostVeto.accountEnabled, false)
+assert.equal(
+  faireVercelProductionHostVeto.disabledReason,
+  'hosted_production_runtime',
+)
+const faireVercelPreviewHostAllowed = fairePromotionPolicy
+  .faireAutomaticOrderPromotionGate({
+    accountGlobalId: enabledFaireAccount,
+    environment: {
+      CLAWPILOT_ENV: 'development',
+      NODE_ENV: 'development',
+      VERCEL_ENV: 'preview',
+      VERCEL_URL: 'clawpilot-preview.example.vercel.app',
+      VERCEL_PROJECT_PRODUCTION_URL:
+        'clawpilot-production.example.vercel.app',
+      [faireCohortEnv]: enabledFaireAccount,
+      [faireNotBeforeEnv]: faireNotBefore,
+    },
+  })
+assert.equal(faireVercelPreviewHostAllowed.accountEnabled, true)
+const exactFaireGate = fairePromotionPolicy
+  .faireAutomaticOrderPromotionGate({
+    accountGlobalId: enabledFaireAccount,
+    environment: {
+      CLAWPILOT_ENV: 'development',
+      [faireCohortEnv]: `${secondFaireAccount},${enabledFaireAccount}`,
+      [faireNotBeforeEnv]: faireNotBefore,
+    },
+  })
+assert.equal(exactFaireGate.accountEnabled, true)
+assert.equal(exactFaireGate.notBefore, faireNotBefore)
+assert.match(exactFaireGate.cohortHash, /^[a-f0-9]{64}$/u)
+assert.deepEqual(
+  [...exactFaireGate.accountGlobalIds],
+  [enabledFaireAccount, secondFaireAccount].sort(),
+)
+const changedFaireBoundary = fairePromotionPolicy
+  .faireAutomaticOrderPromotionGate({
+    accountGlobalId: enabledFaireAccount,
+    environment: {
+      CLAWPILOT_ENV: 'development',
+      [faireCohortEnv]: `${secondFaireAccount},${enabledFaireAccount}`,
+      [faireNotBeforeEnv]: '2026-08-04T12:00:00.001Z',
+    },
+  })
+assert.notEqual(changedFaireBoundary.cohortHash, exactFaireGate.cohortHash)
+const faireGateHealthKeys = [
+  'policyVersion',
+  'runtimeEligible',
+  'configured',
+  'valid',
+  'enabled',
+  'disabledReason',
+  'cohortSize',
+  'notBefore',
+]
+const unconfiguredFaireHealth = fairePromotionPolicy
+  .faireAutomaticOrderPromotionGateHealth({
+    CLAWPILOT_ENV: 'development',
+  })
+assert.deepEqual(Object.keys(unconfiguredFaireHealth), faireGateHealthKeys)
+assert.deepEqual(JSON.parse(JSON.stringify(unconfiguredFaireHealth)), {
+  policyVersion: 'commerce-faire-order-auto-promotion-v1',
+  runtimeEligible: true,
+  configured: false,
+  valid: false,
+  enabled: false,
+  disabledReason: 'cohort_and_not_before_required',
+  cohortSize: 0,
+  notBefore: null,
+})
+const validDevelopmentFaireHealth = fairePromotionPolicy
+  .faireAutomaticOrderPromotionGateHealth({
+    CLAWPILOT_ENV: 'development',
+    [faireCohortEnv]: `${secondFaireAccount},${enabledFaireAccount}`,
+    [faireNotBeforeEnv]: faireNotBefore,
+  })
+assert.deepEqual(Object.keys(validDevelopmentFaireHealth), faireGateHealthKeys)
+assert.equal(validDevelopmentFaireHealth.runtimeEligible, true)
+assert.equal(validDevelopmentFaireHealth.configured, true)
+assert.equal(validDevelopmentFaireHealth.valid, true)
+assert.equal(validDevelopmentFaireHealth.enabled, true)
+assert.equal(validDevelopmentFaireHealth.disabledReason, null)
+assert.equal(validDevelopmentFaireHealth.cohortSize, 2)
+assert.equal(validDevelopmentFaireHealth.notBefore, faireNotBefore)
+const legacyOneAccountFaireGate = fairePromotionPolicy
+  .faireAutomaticOrderPromotionGate({
+    accountGlobalId: enabledFaireAccount,
+    environment: {
+      CLAWPILOT_ENV: 'development',
+      [faireCohortEnv]: enabledFaireAccount,
+      [faireNotBeforeEnv]: faireNotBefore,
+    },
+  })
+assert.match(legacyOneAccountFaireGate.cohortHash, /^[a-f0-9]{64}$/u)
+assert.equal(
+  JSON.stringify(validDevelopmentFaireHealth).includes(enabledFaireAccount),
+  false,
+  'Health must never expose account Global IDs',
+)
+assert.equal(
+  JSON.stringify(validDevelopmentFaireHealth).includes(
+    exactFaireGate.cohortHash,
+  ),
+  false,
+  'Health must never expose a reversible cohort fingerprint',
+)
+const malformedFaireHealth = fairePromotionPolicy
+  .faireAutomaticOrderPromotionGateHealth({
+    CLAWPILOT_ENV: 'development',
+    [faireCohortEnv]: enabledFaireAccount,
+    [faireNotBeforeEnv]: '2026-08-04T12:00:00Z',
+  })
+assert.deepEqual(JSON.parse(JSON.stringify(malformedFaireHealth)), {
+  policyVersion: 'commerce-faire-order-auto-promotion-v1',
+  runtimeEligible: true,
+  configured: true,
+  valid: false,
+  enabled: false,
+  disabledReason: 'cohort_or_not_before_invalid',
+  cohortSize: 0,
+  notBefore: null,
+})
+const hostedProductionFaireHealth = fairePromotionPolicy
+  .faireAutomaticOrderPromotionGateHealth({
+    CLAWPILOT_ENV: 'development',
+    CLAWPILOT_PUBLIC_URL: 'https://aiapp.eigenracing.com',
+    [faireCohortEnv]: enabledFaireAccount,
+    [faireNotBeforeEnv]: faireNotBefore,
+  })
+assert.equal(hostedProductionFaireHealth.runtimeEligible, false)
+assert.equal(hostedProductionFaireHealth.configured, true)
+assert.equal(hostedProductionFaireHealth.valid, true)
+assert.equal(hostedProductionFaireHealth.enabled, false)
+assert.equal(
+  hostedProductionFaireHealth.disabledReason,
+  'hosted_production_runtime',
+)
+assert.equal(hostedProductionFaireHealth.cohortSize, 1)
+assert.equal(hostedProductionFaireHealth.notBefore, faireNotBefore)
+assert.equal(
+  JSON.stringify(hostedProductionFaireHealth).includes(
+    legacyOneAccountFaireGate.cohortHash,
+  ),
+  false,
+  'A legacy one-account cohort fingerprint must not be publicly reversible',
+)
+const sanitizedFaireHealth = fairePromotionPolicy
+  .faireAutomaticOrderPromotionHealthSnapshot({
+    environment: {
+      CLAWPILOT_ENV: 'development',
+      [faireCohortEnv]: enabledFaireAccount,
+      [faireNotBeforeEnv]: faireNotBefore,
+    },
+    heartbeat: {
+      policyVersion: 'untrusted-old-policy',
+      cohortHash: 'untrusted-old-hash',
+      accountGlobalIds: [enabledFaireAccount],
+      providerToken: 'must-not-leak',
+      promoted: 2,
+      held: 3,
+      failed: 1,
+      failedByCode: {
+        COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_FAILED: 2_000_000,
+        GIA5156705: 17,
+        SECRETVALUE123: 23,
+        PROVIDER_TOKEN_SUPERSECRET: 29,
+        'unsafe-code': 99,
+        ...Object.fromEntries(Array.from(
+          { length: 1_000 },
+          (_, index) => [`MALICIOUS_${index}`, index + 1],
+        )),
+      },
+      attentionRequiredAccounts: 1,
+      operatorReviewRequired: 4,
+      providerWrites: 0,
+      canonicalOrderWrites: 2,
+      inventoryWrites: 0,
+      syncCursorAdvanced: false,
+    },
+  })
+assert.equal(sanitizedFaireHealth.policyVersion, validDevelopmentFaireHealth.policyVersion)
+assert.equal(
+  Object.prototype.hasOwnProperty.call(sanitizedFaireHealth, 'cohortHash'),
+  false,
+)
+assert.equal(sanitizedFaireHealth.promoted, 2)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(sanitizedFaireHealth.failedByCode)),
+  { COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_FAILED: 1 },
+)
+assert.equal(
+  JSON.stringify(sanitizedFaireHealth).includes('must-not-leak'),
+  false,
+)
+assert.equal(JSON.stringify(sanitizedFaireHealth).includes('GIA5156705'), false)
+assert.equal(JSON.stringify(sanitizedFaireHealth).includes('SECRETVALUE123'), false)
+assert.equal(JSON.stringify(sanitizedFaireHealth).includes('MALICIOUS_'), false)
+assert.equal(
+  JSON.stringify(sanitizedFaireHealth).includes(
+    legacyOneAccountFaireGate.cohortHash,
+  ),
+  false,
+)
+const unknownFaireFailureHealth = fairePromotionPolicy
+  .faireAutomaticOrderPromotionHealthSnapshot({
+    environment: { CLAWPILOT_ENV: 'development' },
+    heartbeat: {
+      failed: 4,
+      failedByCode: {
+        GIA5156705: 1,
+        SECRETVALUE123: 1,
+        PROVIDER_TOKEN_SUPERSECRET: 1,
+        MALICIOUS_4: 1,
+      },
+    },
+  })
+assert.deepEqual(
+  JSON.parse(JSON.stringify(unknownFaireFailureHealth.failedByCode)),
+  { OTHER: 4 },
+  'Unknown failure keys must reconcile safely without echoing their names',
+)
+assert.equal(
+  Object.values(unknownFaireFailureHealth.failedByCode)
+    .reduce((sum, count) => sum + count, 0),
+  unknownFaireFailureHealth.failed,
+)
+const actualPromotionFailureHealth = fairePromotionPolicy
+  .faireAutomaticOrderPromotionHealthSnapshot({
+    environment: { CLAWPILOT_ENV: 'development' },
+    heartbeat: {
+      failed: 1,
+      failedByCode: { COMMERCE_INTAKE_PACK_MAPPING_STALE: 1 },
+    },
+  })
+assert.deepEqual(
+  JSON.parse(JSON.stringify(actualPromotionFailureHealth.failedByCode)),
+  { COMMERCE_INTAKE_PACK_MAPPING_STALE: 1 },
+)
+const cappedFaireFailureMap = fairePromotionPolicy
+  .faireAutomaticOrderPromotionHealthSnapshot({
+    environment: {
+      CLAWPILOT_ENV: 'development',
+      [faireCohortEnv]: enabledFaireAccount,
+      [faireNotBeforeEnv]: faireNotBefore,
+    },
+    heartbeat: {
+      failed: 17,
+      failedByCode: Object.fromEntries([
+        'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_FAILED',
+        'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_SELECTION_FAILED',
+        'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_AUTHORITY_STALE',
+        'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_GATE_CLOSED',
+        'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_INVARIANT_STALE',
+        'COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_PRODUCT_MAPPING_STALE',
+        'COMMERCE_INTAKE_ADDRESS_INCOMPLETE',
+        'COMMERCE_INTAKE_ADDRESS_NOT_REQUIRED',
+        'COMMERCE_INTAKE_DEFAULT_SLA_UNAVAILABLE',
+        'COMMERCE_INTAKE_DELIVERY_NOT_REQUIRED',
+        'COMMERCE_INTAKE_MANUAL_DELIVERY_REQUIRED',
+        'COMMERCE_INTAKE_PROVIDER_DELIVERY_UNAVAILABLE',
+        'COMMERCE_INTAKE_CANDIDATE_NOT_FOUND',
+        'COMMERCE_INTAKE_ROW_VERSION_CONFLICT',
+        'COMMERCE_INTAKE_CREDENTIAL_GENERATION_STALE',
+        'COMMERCE_INTAKE_CUSTOMER_REQUIRED',
+        'COMMERCE_INTAKE_CUSTOMER_STALE',
+      ].map((code) => [code, 1])),
+    },
+  }).failedByCode
+assert.equal(Object.keys(cappedFaireFailureMap).length, 16)
+assert.equal(
+  Object.values(cappedFaireFailureMap).reduce(
+    (sum, count) => sum + count,
+    0,
+  ),
+  17,
+  'A bounded public failure map must still reconcile to the failure total',
+)
+assert.equal(cappedFaireFailureMap.OTHER, 2)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    fairePromotionPolicy.faireAutomaticExactRefreshHealthSnapshot({
+      attempted: 2_000_000,
+      succeeded: 2,
+      rejected: 1,
+      failed: 1,
+      failedByCode: {
+        COMMERCE_FAIRE_EXACT_REFRESH_FAILED: 1,
+        GIA5156705: 17,
+        SECRETVALUE123: 23,
+        PROVIDER_TOKEN_SUPERSECRET: 29,
+        ...Object.fromEntries(Array.from(
+          { length: 1_000 },
+          (_, index) => [`MALICIOUS_${index}`, index + 1],
+        )),
+      },
+      operatorReviewRequired: 2,
+      providerWrites: 0,
+      inventoryWrites: 0,
+      syncCursorAdvanced: false,
+      providerToken: 'must-not-leak',
+    }),
+  )),
+  {
+    attempted: 1_000_000,
+    succeeded: 2,
+    rejected: 1,
+    failed: 1,
+    failedByCode: { COMMERCE_FAIRE_EXACT_REFRESH_FAILED: 1 },
+    operatorReviewRequired: 2,
+    providerWrites: 0,
+    inventoryWrites: 0,
+    syncCursorAdvanced: false,
+  },
+)
+const actualExactRefreshFailureHealth = fairePromotionPolicy
+  .faireAutomaticExactRefreshHealthSnapshot({
+    failed: 3,
+    failedByCode: {
+      COMMERCE_INTAKE_REFRESH_TARGET_MISSING: 1,
+      COMMERCE_INTAKE_EXACT_ORDER_TARGET_MISMATCH: 1,
+      COMMERCE_INTAKE_INTENT_TARGET_CHANGED: 1,
+    },
+  })
+assert.deepEqual(
+  JSON.parse(JSON.stringify(actualExactRefreshFailureHealth.failedByCode)),
+  {
+    COMMERCE_INTAKE_EXACT_ORDER_TARGET_MISMATCH: 1,
+    COMMERCE_INTAKE_INTENT_TARGET_CHANGED: 1,
+    COMMERCE_INTAKE_REFRESH_TARGET_MISSING: 1,
+  },
+)
+assert.equal(
+  Object.values(actualExactRefreshFailureHealth.failedByCode)
+    .reduce((sum, count) => sum + count, 0),
+  actualExactRefreshFailureHealth.failed,
+)
+const missingExactRefreshBreakdown = fairePromotionPolicy
+  .faireAutomaticExactRefreshHealthSnapshot({ failed: 3 })
+assert.deepEqual(
+  JSON.parse(JSON.stringify(missingExactRefreshBreakdown.failedByCode)),
+  { OTHER: 3 },
+  'A nonzero failure total must never have an empty public breakdown',
+)
+assert.equal(
+  shopifyPromotionPolicy.automaticShopifyPromotionHoldRequiresAttention(
+    'canonical_order_exists',
+  ),
+  false,
+  'Canonical-order dedupe is a benign automatic-promotion no-op',
+)
+assert.equal(
+  shopifyPromotionPolicy.automaticShopifyPromotionHoldRequiresAttention(
+    'checkout_rate_lineage_missing',
+  ),
+  true,
+  'Missing checkout lineage must remain durable operator attention',
+)
+assert.equal(
+  shopifyPromotionPolicy.SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER,
+  'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED',
 )
 const freshProviderCreatedAt = Date.parse('2026-08-01T12:00:00.000Z')
 const freshObservedAt = freshProviderCreatedAt + 5 * 60_000
@@ -99,9 +752,44 @@ assert.equal(
   false,
   'Faire provider creation must not postdate the captured observation',
 )
+assert.equal(
+  shopifyPromotionPolicy.automaticShopifyOrderSourceIsFresh({
+    providerCreatedAt: new Date(freshProviderCreatedAt),
+    observedAt: new Date(freshObservedAt),
+    nowMs: freshProviderCreatedAt + 48 * 60 * 60 * 1_000,
+  }),
+  true,
+  'Fresh Shopify source evidence remains eligible at the exact boundary',
+)
+assert.equal(
+  shopifyPromotionPolicy.automaticShopifyOrderSourceIsFresh({
+    providerCreatedAt: new Date(freshProviderCreatedAt),
+    observedAt: new Date(freshObservedAt),
+    nowMs: freshObservedAt + 48 * 60 * 60 * 1_000 + 1,
+  }),
+  false,
+  'Retained Shopify evidence must not become automatically promotable later',
+)
 const shippingServiceCodeMigration = read(
   'db/migrations/0173_operations_shopify_shipping_service_codes.sql',
 )
+const shopifyPreflightMigration = read(
+  'db/migrations/0245_operations_shopify_checkout_rate_preflight.sql',
+)
+includes(shopifyPreflightMigration, [
+  'operations_shopify_checkout_rate_match_candidate_facts_for_workflow',
+  'require_promoted_candidate boolean',
+  'operations_shopify_checkout_rate_match_candidate_facts(',
+  'require_promoted_candidate',
+  'operations_shopify_checkout_rate_preflight_match_candidates(',
+  'enforce_reconciliation_deadline',
+  'false',
+  'true',
+  'SECURITY INVOKER',
+  'SET search_path = pg_catalog, public',
+  'REVOKE EXECUTE ON FUNCTION',
+  'FROM PUBLIC',
+], 'Shopify held-candidate checkout preflight migration')
 includes(persistence, [
   "const ORDER_RECONCILIATION_INTERVAL = '30 minutes'",
   "const ORDER_RECONCILIATION_LEASE = '10 minutes'",
@@ -144,6 +832,14 @@ includes(persistence, [
   'providerWrites: 0',
   'canonicalOrderWrites: 0',
   'inventoryWrites: 0',
+  'unresolved_shopify_promotion',
+  "candidate.workflow_state IN ('held', 'resolving', 'ready')",
+  'candidate.last_error_code =',
+  'SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER',
+  "run.created_by = 'system:commerce-order-reconciliation'",
+  "run.workflow_state <> 'expired'",
+  'run.expires_at > now()',
+  'canonical.external_order_id',
 ], 'Order reconciliation persistence')
 includes(shippingServiceCodeMigration, [
   'operations_commerce_order_candidates_checkout_service_valid',
@@ -161,6 +857,19 @@ assert.ok(
   !persistence.includes('faire_updated_at_min')
     && !persistence.includes('high_watermark ='),
   'Faire automatic reconciliation must not use an unsafe live-cursor incremental checkpoint',
+)
+const completionPersistenceSource = persistence.slice(
+  persistence.indexOf(
+    'export async function completeCommerceOrderReconciliationInPostgres',
+  ),
+  persistence.indexOf(
+    'export async function failCommerceOrderReconciliationInPostgres',
+  ),
+)
+assert.doesNotMatch(
+  completionPersistenceSource,
+  /WHEN \$8::boolean/u,
+  'Shopify and Faire continuation attention must be recomputed from active candidate markers',
 )
 
 let claimSql = ''
@@ -207,6 +916,11 @@ assert.match(
   claimSql,
   /RETURNING[\s\S]*last_started_at/,
   'Claim SQL must return the persisted reconciliation lease timestamp',
+)
+assert.match(
+  claimSql,
+  /last_error_code IN \([\s\S]*COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED/,
+  'Root claims must preserve durable automatic-promotion attention',
 )
 assert.equal(claimedTargets.length, 1)
 assert.equal(
@@ -294,7 +1008,11 @@ const healthPersistenceModule = loadTypeScriptModule(
                 running: '0',
                 failed: '1',
                 stale_processing: '0',
-                promotion_attention_required: '1',
+                shopify_promotion_attention_required: '1',
+                faire_promotion_attention_required: '0',
+                faire_exact_refresh_attention_required: '0',
+                faire_unattributed_attention_required: '1',
+                operator_attention_required: '2',
                 overdue: '1',
                 resumable: '1',
                 last_success_at: '2026-08-01T16:20:00.000Z',
@@ -320,6 +1038,10 @@ assert.deepEqual(JSON.parse(JSON.stringify(orderHealth)), {
   failed: 1,
   staleProcessing: 0,
   promotionAttentionRequired: 1,
+  providerPromotionAttentionRequired: { shopify: 1, faire: 0 },
+  faireExactRefreshAttentionRequired: 0,
+  faireUnattributedAttentionRequired: 1,
+  operatorAttentionRequired: 2,
   overdue: 1,
   resumable: 1,
   lastSuccessAt: '2026-08-01T16:20:00.000Z',
@@ -403,7 +1125,22 @@ const promotionCompletionModule = loadTypeScriptModule(
               promotionCompletionQueries.push({ sql, values })
               return {
                 rowCount: 1,
-                rows: [{ organization_id: failureTarget.organizationId }],
+                rows: [{
+                  last_error_code: values[8] === 'shopify' && values[5] > 0
+                    ? 'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED'
+                    : values[6] > 0 && values[7] > 0
+                      ? 'COMMERCE_FAIRE_PROMOTION_AND_EXACT_REFRESH_ATTENTION_REQUIRED'
+                      : values[6] > 0
+                        ? 'COMMERCE_FAIRE_PROMOTION_ATTENTION_REQUIRED'
+                        : values[7] > 0
+                          ? 'COMMERCE_FAIRE_EXACT_REFRESH_ATTENTION_REQUIRED'
+                          : null,
+                  automatic_promotion_attention_required:
+                    values[5] > 0 || values[6] > 0,
+                  automatic_exact_refresh_attention_required:
+                    values[7] > 0,
+                  automatic_unattributed_attention_required: false,
+                }],
               }
             },
           })
@@ -426,26 +1163,148 @@ const promotionCompletion = await promotionCompletionModule
     customersSkipped: 0,
     customerResolutionFailed: 0,
     customerResolutionFailureCodes: {},
+    shopifyOrdersPromoted: 0,
+    shopifyOrdersHeld: 0,
+    shopifyPromotionActionableHeld: 0,
+    shopifyPromotionHeldReasons: {},
+    shopifyPromotionFailed: 0,
+    shopifyPromotionFailureCodes: {},
+    shopifyPromotionRollbackFenced: 0,
     faireOrdersPromoted: 0,
     faireOrdersHeld: 0,
     fairePromotionFailed: 1,
     fairePromotionFailureCodes: {
       COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_FAILED: 1,
     },
+    fairePromotionOperatorReviewRequired: 1,
+    faireExactRefreshAttempted: 2,
+    faireExactRefreshSucceeded: 0,
+    faireExactRefreshRejected: 1,
+    faireExactRefreshFailed: 1,
+    faireExactRefreshOperatorReviewRequired: 1,
+    faireExactRefreshFailureCodes: {
+      COMMERCE_INTAKE_REFRESH_TARGET_MISSING: 1,
+    },
   })
 assert.equal(promotionCompletion.leaseLost, false)
 assert.equal(promotionCompletionQueries.length, 1)
 assert.match(
   promotionCompletionQueries[0].sql,
-  /COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_ATTENTION_REQUIRED/u,
+  /COMMERCE_FAIRE_PROMOTION_ATTENTION_REQUIRED/u,
   'Successful provider reads must durably retain local-promotion attention',
 )
-assert.equal(promotionCompletionQueries[0].values[5], 1)
-assert.equal(promotionCompletionQueries[0].values[6], false)
+assert.equal(promotionCompletionQueries[0].values[5], 0)
+assert.equal(promotionCompletionQueries[0].values[6], 1)
+assert.equal(promotionCompletionQueries[0].values[7], 1)
+assert.equal(promotionCompletionQueries[0].values[8], 'faire')
+assert.equal(
+  promotionCompletion.faireAutomaticPromotionAttentionRequired,
+  true,
+)
+assert.equal(promotionCompletion.faireExactRefreshAttentionRequired, true)
+assert.equal(promotionCompletion.faireUnattributedAttentionRequired, false)
 assert.equal(
   promotionCompletionAudits[0].payload
     .automaticFaireOrderPromotion.failed,
   1,
+)
+assert.equal(
+  promotionCompletionAudits[0].payload
+    .automaticFaireOrderPromotion.operatorReviewRequired,
+  1,
+  'Promotion review count must exclude exact-refresh marker outcomes',
+)
+assert.equal(
+  promotionCompletionAudits[0].payload
+    .automaticFaireExactRefresh.operatorReviewRequired,
+  1,
+  'Exact-refresh review count must use durable marked:true outcomes',
+)
+assert.equal(
+  promotionCompletionAudits[0].payload
+    .automaticFaireExactRefresh.failed,
+  1,
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    promotionCompletionAudits[0].payload
+      .automaticFaireExactRefresh.failedByCode,
+  )),
+  { COMMERCE_INTAKE_REFRESH_TARGET_MISSING: 1 },
+)
+promotionCompletionQueries.length = 0
+promotionCompletionAudits.length = 0
+await promotionCompletionModule.completeCommerceOrderReconciliationInPostgres({
+  target: { ...failureTarget, provider: 'shopify' },
+  providerRecordsSeen: 1,
+  ordersHeld: 1,
+  recordsRejected: 0,
+  pagesRead: 1,
+  hasNextBatch: false,
+  customersMatched: 1,
+  customersCreated: 0,
+  customersAmbiguous: 0,
+  customersSkipped: 0,
+  customerResolutionFailed: 0,
+  customerResolutionFailureCodes: {},
+  shopifyOrdersPromoted: 0,
+  shopifyOrdersHeld: 1,
+  shopifyPromotionActionableHeld: 1,
+  shopifyPromotionHeldReasons: { checkout_rate_lineage_missing: 1 },
+  shopifyPromotionFailed: 0,
+  shopifyPromotionFailureCodes: {},
+  shopifyPromotionRollbackFenced: 0,
+  faireOrdersPromoted: 0,
+  faireOrdersHeld: 0,
+  fairePromotionFailed: 0,
+  fairePromotionFailureCodes: {},
+})
+assert.equal(
+  promotionCompletionQueries[0].values[5],
+  1,
+  'An actionable Shopify hold must persist automatic-promotion attention',
+)
+assert.equal(
+  promotionCompletionAudits[0].payload
+    .automaticShopifyOrderPromotion.operatorReviewRequired,
+  1,
+)
+promotionCompletionQueries.length = 0
+promotionCompletionAudits.length = 0
+await promotionCompletionModule.completeCommerceOrderReconciliationInPostgres({
+  target: { ...failureTarget, provider: 'shopify' },
+  providerRecordsSeen: 1,
+  ordersHeld: 1,
+  recordsRejected: 0,
+  pagesRead: 1,
+  hasNextBatch: false,
+  customersMatched: 0,
+  customersCreated: 0,
+  customersAmbiguous: 0,
+  customersSkipped: 0,
+  customerResolutionFailed: 0,
+  customerResolutionFailureCodes: {},
+  shopifyOrdersPromoted: 0,
+  shopifyOrdersHeld: 1,
+  shopifyPromotionActionableHeld: 0,
+  shopifyPromotionHeldReasons: { canonical_order_exists: 1 },
+  shopifyPromotionFailed: 0,
+  shopifyPromotionFailureCodes: {},
+  shopifyPromotionRollbackFenced: 0,
+  faireOrdersPromoted: 0,
+  faireOrdersHeld: 0,
+  fairePromotionFailed: 0,
+  fairePromotionFailureCodes: {},
+})
+assert.equal(
+  promotionCompletionQueries[0].values[5],
+  0,
+  'A canonical-order dedupe must not create durable operator attention',
+)
+assert.equal(
+  promotionCompletionAudits[0].payload
+    .automaticShopifyOrderPromotion.operatorReviewRequired,
+  0,
 )
 const knownConstraintFailure = await failurePersistenceModule
   .failCommerceOrderReconciliationInPostgres({
@@ -559,16 +1418,30 @@ includes(workerSource, [
   "'CLAWPILOT_COMMERCE_ORDER_MAX_SESSION_RECORDS'",
   '100_000',
   'MAX_RECONCILIATION_RUNTIME_MS = 180_000',
+  'MIN_REMAINING_RUNTIME_FOR_EXACT_REFRESH_MS = 30_000',
+  "'CLAWPILOT_COMMERCE_ORDER_MAX_FAIRE_EXACT_REFRESHES'",
+  'deterministicFaireExactRefreshUuid',
+  'readAutomaticFaireExactRefreshTargetsInPostgres',
+  'targetFaireExactRefreshAttemptedCandidates',
+  'excludedCandidateGlobalIds',
+  'executeCommerceFaireOrderExactRefresh',
+  'COMMERCE_FAIRE_AUTO_PROMOTION_ATTENTION_PERSIST_FAILED',
+  'assertReconciliationFence(exactCommand)',
+  "budgetStopReason = 'exact-refresh'",
   'COMMERCE_ORDER_RECONCILIATION_CONTINUATION_REPEATED',
   'COMMERCE_ORDER_RECONCILIATION_PROVIDER_CURSOR_REPEATED',
   'COMMERCE_ORDER_RECONCILIATION_PAGE_SEQUENCE_INVALID',
   'projectCommerceOrderReconciliationPageInPostgres',
+  'automaticShopifyOrderPromotion',
+  'shopifyAutomaticOrderPromotionHealthSnapshot',
+  'rollbackFenced',
+  'canonicalOrderWrites: shopifyOrdersPromoted + faireOrdersPromoted',
 ], 'Bounded order reconciliation worker')
 assert.ok(
   workerSource.includes('permits a bounded')
-    && workerSource.includes('local-only Faire promotion')
+    && workerSource.includes('local-only')
     && workerSource.includes('never derives packages or shipments'),
-  'Order reconciliation must permit only bounded local Faire promotion while remaining package, shipment, inventory, and provider-write fenced',
+  'Order reconciliation must permit only bounded local promotion while remaining package, shipment, inventory, and provider-write fenced',
 )
 const intakeSource = read('app_src/lib/integrations/commerceIntake.ts')
 includes(intakeSource, [
@@ -582,18 +1455,98 @@ includes(intakeSource, [
   'expectedLastStartedAt',
   'resetCommerceOrderReconciliationInPostgres',
 ], 'Order-page execution path')
+includes(intakeSource, [
+  'withAutomaticShopifyOrderPromotion',
+  'shopifyAutomaticOrderPromotionGate',
+  'worker_actor_required',
+  'sandbox_account_required',
+  'requiredCheckoutRateOutcome: \'matched\'',
+  'automaticShopifyPromotion',
+  'markAutomaticShopifyOrderPromotionAttentionInPostgres',
+  'attention:${target.reasonCode}',
+  'rollbackFenced',
+], 'Shopify clean-path automatic promotion service')
+const intakePersistenceSource = read(
+  'app_src/lib/persistence/commerceIntake.ts',
+)
+includes(intakePersistenceSource, [
+  'readAutomaticShopifyOrderPromotionTargetsForRunInPostgres',
+  "run.created_by = 'system:commerce-order-reconciliation'",
+  "account.environment !== 'sandbox'",
+  "candidate.normalized_payment_status !== 'paid'",
+  "candidate.normalized_return_status !== 'none'",
+  "line.packaging_source !== 'variant_pack_mapping'",
+  'physical_shipping_required',
+  'operations_shopify_checkout_rate_preflight_match_candidates',
+  'exactMatches.rowCount !== 1',
+  'prior_candidate_requires_review',
+  'canonical_order_exists',
+  'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED',
+  "checkoutRateReconciliation?.outcome !== 'matched'",
+  'markAutomaticShopifyOrderPromotionAttentionInPostgres',
+  'commerce.intake.mark_shopify_auto_promotion_attention',
+  'commerce.intake.shopify_auto_promotion.attention_marked',
+  'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_ATTENTION_NOT_REQUIRED',
+  'SHOPIFY_AUTOMATIC_ORDER_PROMOTION_ATTENTION_MARKER',
+  'last_error_code = NULL',
+  'no partial local order survives',
+], 'Shopify clean-path selector and atomic rollback fence')
+const strictPromotionSource = intakePersistenceSource.slice(
+  intakePersistenceSource.indexOf(
+    'export async function promoteCommerceCandidateInPostgres',
+  ),
+  intakePersistenceSource.indexOf(
+    'export async function\nreconcilePromotedCommerceCandidateCheckoutRateInPostgres',
+  ),
+)
+const canonicalInsertIndex = strictPromotionSource.indexOf(
+  'INSERT INTO operations_orders',
+)
+const reconciliationIndex = strictPromotionSource.indexOf(
+  'reconcileShopifyCheckoutRateForOrderCandidateWithClient',
+)
+const strictMatchFenceIndex = strictPromotionSource.indexOf(
+  "checkoutRateReconciliation?.outcome !== 'matched'",
+)
+assert.ok(canonicalInsertIndex > 0)
+assert.ok(reconciliationIndex > canonicalInsertIndex)
+assert.ok(strictMatchFenceIndex > reconciliationIndex)
+assert.match(
+  strictPromotionSource,
+  /return withTransaction\(async \(client\) => \{[\s\S]*COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED/u,
+  'The strict matched-lineage failure must throw inside the same canonical-order transaction',
+)
 const intakeWorkflowSource = read(
   'app_src/components/settings/CommerceIntakeWorkflow.tsx',
 )
 includes(intakeWorkflowSource, [
   'resetRequired: boolean',
   'automaticPromotionAttentionRequired: boolean',
-  'automatic local Faire order promotion needs attention',
+  'automatic local ${providerLabel(provider)} order promotion needs attention',
+  'provider order rows scanned',
+  'eligible order rows in latest page',
+  'ClawPilot orders added',
+  'new rows held/rejected in this scan',
+  'retained order',
+  'retained provider',
+  'Order candidates (',
+  'Exceptions (',
+  'Scanned rows are provider order rows checked, not ClawPilot',
+  'filters ineligible rows and',
+  'deduplicates already-known orders',
+  'with one matched',
+  'ClawPilot checkout quote',
   'Provider reads remain read-only.',
+  'This step does not reserve',
+  'order promotion was held or',
   "'reset-order-reconciliation'",
   'Restart automatic staging',
   'ClawPilot will not reuse the terminal continuation.',
 ], 'Order-reconciliation operator recovery')
+assert.ok(
+  !intakeWorkflowSource.includes('provider records read'),
+  'Order reconciliation must not present scanned provider rows as orders added',
+)
 assert.ok(
   !intakeSource.includes('updatedAtMin: page.windowStart')
     && !intakeSource.includes('initialWindowStart'),
@@ -610,6 +1563,62 @@ assert.ok(
 )
 
 const trace = { claims: 0, complete: [], failed: [] }
+const disabledWorker = loadTypeScriptModule(
+  'app_src/lib/commerceOrderReconciliationWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceIntake': {
+        commerceIntakeRuntimeAvailable: () => false,
+        async executeCommerceOrderPage() {
+          assert.fail('A disabled runtime must not read a provider page')
+        },
+        async executeCommerceFaireOrderExactRefresh() {
+          assert.fail('A disabled runtime must not execute an exact read')
+        },
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async claimCommerceOrderReconciliationTargetsInPostgres() {
+          assert.fail('A disabled runtime must not claim reconciliation work')
+        },
+        async completeCommerceOrderReconciliationInPostgres() {
+          assert.fail('A disabled runtime must not complete reconciliation work')
+        },
+        async failCommerceOrderReconciliationInPostgres() {
+          assert.fail('A disabled runtime must not fail reconciliation work')
+        },
+        async projectCommerceOrderReconciliationPageInPostgres() {
+          assert.fail('A disabled runtime must not project reconciliation work')
+        },
+      },
+    },
+  },
+)
+const disabledSummary = await disabledWorker
+  .processCommerceOrderReconciliation({ limit: 1 })
+const currentFaireGateHealth = JSON.parse(JSON.stringify(
+  fairePromotionPolicy.faireAutomaticOrderPromotionGateHealth(),
+))
+for (const key of faireGateHealthKeys) {
+  assert.deepEqual(
+    disabledSummary.automaticFaireOrderPromotion[key],
+    currentFaireGateHealth[key],
+    `Disabled worker summary must include current Faire gate field ${key}`,
+  )
+}
+assert.deepEqual(
+  JSON.parse(JSON.stringify(disabledSummary.automaticFaireExactRefresh)),
+  {
+    attempted: 0,
+    succeeded: 0,
+    rejected: 0,
+    failed: 0,
+    failedByCode: {},
+    operatorReviewRequired: 0,
+    providerWrites: 0,
+    inventoryWrites: 0,
+    syncCursorAdvanced: false,
+  },
+)
 let page = 0
 const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWorker.ts', {
   mocks: {
@@ -645,6 +1654,7 @@ const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWork
                 held: 1,
                 failed: 0,
                 failedByCode: {},
+                operatorReviewRequired: 1,
                 providerWrites: 0,
                 canonicalOrderWrites: 1,
                 inventoryWrites: 0,
@@ -688,6 +1698,7 @@ const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWork
               failedByCode: {
                 COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_FAILED: 1,
               },
+              operatorReviewRequired: 2,
               providerWrites: 0,
               canonicalOrderWrites: 0,
               inventoryWrites: 0,
@@ -773,12 +1784,14 @@ assert.deepEqual(
 assert.deepEqual(
   JSON.parse(JSON.stringify(completed.automaticFaireOrderPromotion)),
   {
+    ...currentFaireGateHealth,
     promoted: 1,
     held: 2,
     failed: 1,
     failedByCode: {
       COMMERCE_FAIRE_ORDER_AUTO_PROMOTION_FAILED: 1,
     },
+    attentionRequiredAccounts: 0,
     operatorReviewRequired: 3,
     providerWrites: 0,
     canonicalOrderWrites: 1,
@@ -810,6 +1823,146 @@ assert.deepEqual(
   { ...completed.failureCodes },
   {},
   'Successful order reconciliation must report no failure categories',
+)
+
+let shopifyCompletionInput = null
+const shopifyWorker = loadTypeScriptModule(
+  'app_src/lib/commerceOrderReconciliationWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceIntake': {
+        commerceIntakeRuntimeAvailable: () => true,
+        async executeCommerceOrderPage() {
+          return {
+            command: {
+              providerWrites: 0,
+              syncCursorAdvanced: false,
+              ordersStaged: 4,
+              recordsRejected: 0,
+              automaticCustomerResolution: {
+                matched: 1,
+                created: 0,
+                ambiguous: 0,
+                skipped: 0,
+                failed: 0,
+                failedByCode: {},
+                providerWrites: 0,
+                syncCursorAdvanced: false,
+              },
+              automaticShopifyOrderPromotion: {
+                promoted: 1,
+                held: 2,
+                actionableHeld: 2,
+                heldByReason: {
+                  checkout_rate_lineage_missing: 1,
+                  physical_shipping_required: 1,
+                },
+                failed: 1,
+                failedByCode: {
+                  COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED: 1,
+                },
+                rollbackFenced: 1,
+                providerWrites: 0,
+                canonicalOrderWrites: 1,
+                inventoryWrites: 0,
+                syncCursorAdvanced: false,
+              },
+              pagination: {
+                batchNumber: 1,
+                runGlobalId: 'gcir0000200',
+                providerRowsSeen: 4,
+                hasNextBatch: false,
+              },
+            },
+          }
+        },
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async claimCommerceOrderReconciliationTargetsInPostgres() {
+          return [{
+            organizationId: '11111111-1111-4111-8111-111111111111',
+            integrationAccountId: '22222222-2222-4222-8222-222222222222',
+            accountGlobalId: 'gia0009201',
+            provider: 'shopify',
+            credentialVersion: 3,
+            startedAt: '2026-08-01T12:00:00.000Z',
+            recordsSeen: 0,
+            recordsHeld: 0,
+            continuationBatchNumber: null,
+            continuationRunGlobalId: null,
+            continuationIdempotencyKey: null,
+          }]
+        },
+        async projectCommerceOrderReconciliationPageInPostgres() {
+          return {
+            leaseLost: false,
+            startedAt: '2026-08-01T12:00:01.000Z',
+            recordsSeen: 4,
+            recordsHeld: 4,
+            continuationBatchNumber: 1,
+            providerCursorRepeated: false,
+          }
+        },
+        async completeCommerceOrderReconciliationInPostgres(input) {
+          shopifyCompletionInput = input
+          return {
+            leaseLost: false,
+            shopifyAutomaticPromotionAttentionRequired: true,
+          }
+        },
+        async failCommerceOrderReconciliationInPostgres() {
+          assert.fail('Shopify clean-path counters must complete successfully')
+        },
+      },
+    },
+  },
+)
+const shopifySummary = await shopifyWorker
+  .processCommerceOrderReconciliation({ limit: 1 })
+assert.equal(shopifySummary.canonicalOrderWrites, 1)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    shopifySummary.automaticShopifyOrderPromotion,
+  )),
+  {
+    policyVersion: 'commerce-shopify-order-auto-promotion-v1',
+    enabled: false,
+    runtimeEligible: false,
+    cohortConfigured: false,
+    cohortValid: false,
+    cohortSize: 0,
+    disabledReason: 'development_runtime_required',
+    promoted: 1,
+    held: 2,
+    actionableHeld: 2,
+    heldByReason: {
+      checkout_rate_lineage_missing: 1,
+      physical_shipping_required: 1,
+    },
+    failed: 1,
+    failedByCode: {
+      COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_MATCH_REQUIRED: 1,
+    },
+    rollbackFenced: 1,
+    attentionRequiredAccounts: 1,
+    operatorReviewRequired: 3,
+    providerWrites: 0,
+    canonicalOrderWrites: 1,
+    inventoryWrites: 0,
+    syncCursorAdvanced: false,
+  },
+)
+assert.equal(shopifyCompletionInput.shopifyOrdersPromoted, 1)
+assert.equal(shopifyCompletionInput.shopifyOrdersHeld, 2)
+assert.equal(shopifyCompletionInput.shopifyPromotionActionableHeld, 2)
+assert.equal(shopifyCompletionInput.shopifyPromotionFailed, 1)
+assert.equal(shopifyCompletionInput.shopifyPromotionRollbackFenced, 1)
+assert.deepEqual(
+  { ...shopifyCompletionInput.shopifyPromotionHeldReasons },
+  {
+    checkout_rate_lineage_missing: 1,
+    physical_shipping_required: 1,
+  },
 )
 
 const recoveredIntentKey = '018f0f50-28ec-7af5-a3fb-9bcbe43ea204'
@@ -883,6 +2036,413 @@ assert.equal(recoveredTrace.failed, 0)
 assert.equal(recovered.staged, 1)
 assert.equal(recovered.providerWrites, 0)
 
+const priorExactRefreshLimit =
+  process.env.CLAWPILOT_COMMERCE_ORDER_MAX_FAIRE_EXACT_REFRESHES
+process.env.CLAWPILOT_COMMERCE_ORDER_MAX_FAIRE_EXACT_REFRESHES = '3'
+const exactRefreshTrace = {
+  listPages: 0,
+  selections: [],
+  reads: [],
+  attention: [],
+  attentionResults: [],
+  complete: [],
+  failed: 0,
+}
+const exactRefreshCohortHash = 'd'.repeat(64)
+const exactRefreshNotBefore = '2026-08-04T12:00:00.000Z'
+const exactRefreshWorker = loadTypeScriptModule(
+  'app_src/lib/commerceOrderReconciliationWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceIntake': {
+        commerceIntakeRuntimeAvailable: () => true,
+        async executeCommerceOrderPage() {
+          exactRefreshTrace.listPages += 1
+          return {
+            command: {
+              providerWrites: 0,
+              syncCursorAdvanced: false,
+              ordersStaged: 2,
+              recordsRejected: 0,
+              automaticFaireOrderPromotion: {
+                promoted: 0,
+                held: 2,
+                failed: 0,
+                failedByCode: {},
+                operatorReviewRequired: 0,
+                providerWrites: 0,
+                canonicalOrderWrites: 0,
+                inventoryWrites: 0,
+                syncCursorAdvanced: false,
+              },
+              pagination: {
+                batchNumber: 1,
+                runGlobalId: 'gcir0000201',
+                providerRowsSeen: 2,
+                hasNextBatch: true,
+                continuationRunGlobalId: 'gcir0000201',
+              },
+            },
+          }
+        },
+        async executeCommerceFaireOrderExactRefresh(input) {
+          exactRefreshTrace.reads.push(input)
+          if (input.candidateGlobalId === 'gcoc0000102') {
+            return {
+              command: {
+                providerWrites: 0,
+                syncCursorAdvanced: false,
+                ordersStaged: 0,
+                recordsRejected: 1,
+              },
+            }
+          }
+          if (input.candidateGlobalId === 'gcoc0000103') {
+            const error = new Error('simulated exact-refresh target race')
+            error.code = 'COMMERCE_INTAKE_REFRESH_TARGET_MISSING'
+            throw error
+          }
+          return {
+            command: {
+              providerWrites: 0,
+              syncCursorAdvanced: false,
+              ordersStaged: 1,
+              recordsRejected: 0,
+              automaticCustomerResolution: {
+                matched: 1,
+                created: 0,
+                ambiguous: 0,
+                skipped: 0,
+                failed: 0,
+                failedByCode: {},
+                providerWrites: 0,
+                syncCursorAdvanced: false,
+              },
+              automaticFaireOrderPromotion: {
+                promoted: 1,
+                held: 0,
+                failed: 0,
+                failedByCode: {},
+                operatorReviewRequired: 0,
+                providerWrites: 0,
+                canonicalOrderWrites: 1,
+                inventoryWrites: 0,
+                syncCursorAdvanced: false,
+              },
+            },
+          }
+        },
+      },
+      '@/lib/persistence/commerceIntake': {
+        async markAutomaticFaireOrderPromotionAttentionInPostgres(input) {
+          exactRefreshTrace.attention.push(input)
+          const result = {
+            marked: input.candidateGlobalId !== 'gcoc0000103',
+          }
+          exactRefreshTrace.attentionResults.push(result)
+          return result
+        },
+        async readAutomaticFaireExactRefreshTargetsInPostgres(input) {
+          exactRefreshTrace.selections.push(input)
+          return [
+            {
+              candidateGlobalId: 'gcoc0000101',
+              candidateRowVersion: 4,
+              sourceHash: 'a'.repeat(64),
+              originatingRunGlobalId: 'gcir0000201',
+              cohortHash: exactRefreshCohortHash,
+              notBefore: exactRefreshNotBefore,
+            },
+            {
+              candidateGlobalId: 'gcoc0000102',
+              candidateRowVersion: 5,
+              sourceHash: 'b'.repeat(64),
+              originatingRunGlobalId: 'gcir0000201',
+              cohortHash: exactRefreshCohortHash,
+              notBefore: exactRefreshNotBefore,
+            },
+            {
+              candidateGlobalId: 'gcoc0000103',
+              candidateRowVersion: 6,
+              sourceHash: 'c'.repeat(64),
+              originatingRunGlobalId: 'gcir0000100',
+              cohortHash: exactRefreshCohortHash,
+              notBefore: exactRefreshNotBefore,
+            },
+          ].slice(0, input.limit)
+        },
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async claimCommerceOrderReconciliationTargetsInPostgres() {
+          return [{
+            ...failureTarget,
+            provider: 'faire',
+            accountGlobalId: 'gca0000201',
+            continuationBatchNumber: null,
+            continuationRunGlobalId: null,
+            continuationIdempotencyKey: null,
+          }]
+        },
+        async completeCommerceOrderReconciliationInPostgres(input) {
+          exactRefreshTrace.complete.push(input)
+          return {
+            leaseLost: false,
+            faireAutomaticPromotionAttentionRequired: false,
+            faireExactRefreshAttentionRequired: true,
+          }
+        },
+        async projectCommerceOrderReconciliationPageInPostgres({ target }) {
+          return {
+            leaseLost: false,
+            startedAt: new Date(
+              Date.parse(target.startedAt) + 1_000,
+            ).toISOString(),
+            recordsSeen: 2,
+            recordsHeld: 2,
+            continuationBatchNumber: 1,
+            providerCursorRepeated: false,
+          }
+        },
+        async failCommerceOrderReconciliationInPostgres() {
+          exactRefreshTrace.failed += 1
+          return {
+            leaseLost: false,
+            errorCode: 'COMMERCE_ORDER_RECONCILIATION_FAILED',
+          }
+        },
+      },
+    },
+  },
+)
+if (priorExactRefreshLimit === undefined) {
+  delete process.env.CLAWPILOT_COMMERCE_ORDER_MAX_FAIRE_EXACT_REFRESHES
+} else {
+  process.env.CLAWPILOT_COMMERCE_ORDER_MAX_FAIRE_EXACT_REFRESHES =
+    priorExactRefreshLimit
+}
+const exactRefreshSummary = await exactRefreshWorker
+  .processCommerceOrderReconciliation({ limit: 1 })
+assert.equal(exactRefreshTrace.listPages, 1)
+assert.equal(exactRefreshTrace.failed, 0)
+assert.equal(exactRefreshTrace.selections.length, 1)
+assert.equal(exactRefreshTrace.selections[0].preferredRunGlobalId, 'gcir0000201')
+assert.equal(exactRefreshTrace.selections[0].limit, 3)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    exactRefreshTrace.selections[0].excludedCandidateGlobalIds,
+  )),
+  [],
+)
+assert.deepEqual(
+  exactRefreshTrace.reads.map((read) => read.candidateGlobalId),
+  ['gcoc0000101', 'gcoc0000102', 'gcoc0000103'],
+  'The count budget must process current-run targets before retained backlog',
+)
+assert.equal(new Set(
+  exactRefreshTrace.reads.map((read) => read.idempotencyKey),
+).size, 3)
+for (const read of exactRefreshTrace.reads) {
+  assert.match(
+    read.idempotencyKey,
+    /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+  )
+  assert.equal(read.actorEmail, 'system:commerce-order-reconciliation')
+  assert.equal(read.expectedCredentialVersion, failureTarget.credentialVersion)
+  assert.equal(read.cohortHash, exactRefreshCohortHash)
+  assert.equal(read.notBefore, exactRefreshNotBefore)
+}
+assert.deepEqual(
+  exactRefreshTrace.attention.map((entry) => ({
+    candidateGlobalId: entry.candidateGlobalId,
+    candidateRowVersion: entry.candidateRowVersion,
+    sourceHash: entry.sourceHash,
+    runGlobalId: entry.runGlobalId,
+    reasonCode: entry.reasonCode,
+    cohortHash: entry.cohortHash,
+    notBefore: entry.notBefore,
+  })),
+  [
+    {
+      candidateGlobalId: 'gcoc0000102',
+      candidateRowVersion: 5,
+      sourceHash: 'b'.repeat(64),
+      runGlobalId: 'gcir0000201',
+      reasonCode: 'COMMERCE_FAIRE_EXACT_REFRESH_NORMALIZATION_REJECTED',
+      cohortHash: exactRefreshCohortHash,
+      notBefore: exactRefreshNotBefore,
+    },
+    {
+      candidateGlobalId: 'gcoc0000103',
+      candidateRowVersion: 6,
+      sourceHash: 'c'.repeat(64),
+      runGlobalId: 'gcir0000100',
+      reasonCode: 'COMMERCE_INTAKE_REFRESH_TARGET_MISSING',
+      cohortHash: exactRefreshCohortHash,
+      notBefore: exactRefreshNotBefore,
+    },
+  ],
+  'Each exact rejection or failure marks only its original stale candidate',
+)
+assert.ok(
+  exactRefreshTrace.attention.every(
+    (entry) => entry.attentionKind === 'exact_refresh',
+  ),
+  'Exact-refresh markers must retain exact-refresh provenance',
+)
+assert.deepEqual(
+  exactRefreshTrace.attentionResults.map((result) => result.marked),
+  [true, false],
+  'A resolved marker race must remain marked:false and non-actionable',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(exactRefreshSummary.automaticFaireExactRefresh)),
+  {
+    attempted: 3,
+    succeeded: 1,
+    rejected: 1,
+    failed: 1,
+    failedByCode: {
+      COMMERCE_INTAKE_REFRESH_TARGET_MISSING: 1,
+    },
+    operatorReviewRequired: 1,
+    providerWrites: 0,
+    inventoryWrites: 0,
+    syncCursorAdvanced: false,
+  },
+)
+assert.equal(exactRefreshSummary.canonicalOrderWrites, 1)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(exactRefreshSummary.budgetStops)),
+  { pages: 0, records: 0, time: 0, exactRefreshes: 1 },
+)
+assert.equal(exactRefreshSummary.resumable, 1)
+assert.equal(
+  exactRefreshSummary.automaticFaireOrderPromotion.operatorReviewRequired,
+  0,
+  'Exact-refresh markers must not inflate promotion-only review counts',
+)
+assert.equal(
+  Object.values(exactRefreshSummary.automaticFaireExactRefresh.failedByCode)
+    .reduce((sum, count) => sum + count, 0),
+  exactRefreshSummary.automaticFaireExactRefresh.failed,
+  'Exact-refresh failure codes must reconcile to failures, not rejections',
+)
+assert.equal(
+  exactRefreshTrace.complete[0].fairePromotionOperatorReviewRequired,
+  0,
+)
+assert.equal(
+  exactRefreshTrace.complete[0].faireExactRefreshOperatorReviewRequired,
+  1,
+  'Only marked:true durable attention outcomes require operator review',
+)
+assert.equal(exactRefreshTrace.complete[0].faireExactRefreshAttempted, 3)
+assert.equal(exactRefreshTrace.complete[0].faireExactRefreshRejected, 1)
+assert.equal(exactRefreshTrace.complete[0].faireExactRefreshFailed, 1)
+assert.deepEqual(
+  { ...exactRefreshTrace.complete[0].faireExactRefreshFailureCodes },
+  { COMMERCE_INTAKE_REFRESH_TARGET_MISSING: 1 },
+  'Completion must exclude normalization rejections from failure codes',
+)
+assert.equal(exactRefreshTrace.complete[0].hasNextBatch, true)
+
+const markerFailureTrace = { markerCalls: 0, complete: 0, failed: [] }
+const markerFailureWorker = loadTypeScriptModule(
+  'app_src/lib/commerceOrderReconciliationWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceIntake': {
+        commerceIntakeRuntimeAvailable: () => true,
+        async executeCommerceOrderPage() {
+          return {
+            command: {
+              providerWrites: 0,
+              syncCursorAdvanced: false,
+              ordersStaged: 1,
+              recordsRejected: 0,
+              pagination: {
+                batchNumber: 1,
+                runGlobalId: 'gcir0000301',
+                providerRowsSeen: 1,
+                hasNextBatch: false,
+                continuationRunGlobalId: null,
+              },
+            },
+          }
+        },
+        async executeCommerceFaireOrderExactRefresh() {
+          return {
+            command: {
+              providerWrites: 0,
+              syncCursorAdvanced: false,
+              ordersStaged: 0,
+              recordsRejected: 1,
+            },
+          }
+        },
+      },
+      '@/lib/persistence/commerceIntake': {
+        async readAutomaticFaireExactRefreshTargetsInPostgres() {
+          return [{
+            candidateGlobalId: 'gcoc0000301',
+            candidateRowVersion: 2,
+            sourceHash: 'e'.repeat(64),
+            originatingRunGlobalId: 'gcir0000301',
+            cohortHash: exactRefreshCohortHash,
+            notBefore: exactRefreshNotBefore,
+          }]
+        },
+        async markAutomaticFaireOrderPromotionAttentionInPostgres() {
+          markerFailureTrace.markerCalls += 1
+          throw new Error('simulated durable marker outage')
+        },
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async claimCommerceOrderReconciliationTargetsInPostgres() {
+          return [{ ...failureTarget, provider: 'faire' }]
+        },
+        async projectCommerceOrderReconciliationPageInPostgres({ target }) {
+          return {
+            leaseLost: false,
+            startedAt: new Date(
+              Date.parse(target.startedAt) + 1_000,
+            ).toISOString(),
+            recordsSeen: 1,
+            recordsHeld: 1,
+            continuationBatchNumber: 1,
+            providerCursorRepeated: false,
+          }
+        },
+        async completeCommerceOrderReconciliationInPostgres() {
+          markerFailureTrace.complete += 1
+          return { leaseLost: false }
+        },
+        async failCommerceOrderReconciliationInPostgres(input) {
+          markerFailureTrace.failed.push(input)
+          return {
+            leaseLost: false,
+            errorCode: input.error.code,
+          }
+        },
+      },
+    },
+  },
+)
+const markerFailureSummary = await markerFailureWorker
+  .processCommerceOrderReconciliation({ limit: 1 })
+assert.equal(markerFailureTrace.markerCalls, 1)
+assert.equal(markerFailureTrace.complete, 0)
+assert.equal(markerFailureTrace.failed.length, 1)
+assert.equal(
+  markerFailureTrace.failed[0].error.code,
+  'COMMERCE_FAIRE_AUTO_PROMOTION_ATTENTION_PERSIST_FAILED',
+)
+assert.equal(markerFailureSummary.failed, 1)
+assert.ok(
+  !workerSource.includes('.catch(() => ({ marked: true }))'),
+  'A marker failure must fail and retry the reconciliation target, never synthesize durable attention',
+)
+
 const boundedTrace = { pages: 0, complete: [], failed: [] }
 const boundedWorker = loadTypeScriptModule(
   'app_src/lib/commerceOrderReconciliationWorker.ts',
@@ -949,7 +2509,7 @@ assert.equal(boundedSummary.pagesRead, 5)
 assert.equal(boundedSummary.resumable, 1)
 assert.deepEqual(
   JSON.parse(JSON.stringify(boundedSummary.budgetStops)),
-  { pages: 1, records: 0, time: 0 },
+  { pages: 1, records: 0, time: 0, exactRefreshes: 0 },
   'A long chain must yield its encrypted continuation at the page budget',
 )
 
@@ -1013,7 +2573,7 @@ assert.equal(timeTrace.pages, 1)
 assert.equal(timeTrace.complete[0].hasNextBatch, true)
 assert.deepEqual(
   JSON.parse(JSON.stringify(timeSummary.budgetStops)),
-  { pages: 0, records: 0, time: 1 },
+  { pages: 0, records: 0, time: 1, exactRefreshes: 0 },
   'A near-deadline worker must persist its continuation without another read',
 )
 
@@ -1162,6 +2722,139 @@ assert.deepEqual(
   'Worker summary must expose only the stable allowlisted failure category',
 )
 
+const completedRouteHeartbeats = []
+const completedRouteRunResult = {
+  automaticShopifyOrderPromotion:
+    shopifyPromotionPolicy.shopifyAutomaticOrderPromotionHealthSnapshot({
+      heartbeat: {
+        attentionRequiredAccounts: 1,
+        operatorReviewRequired: 1,
+      },
+    }),
+  automaticFaireOrderPromotion:
+    fairePromotionPolicy.faireAutomaticOrderPromotionHealthSnapshot({
+      heartbeat: {
+        attentionRequiredAccounts: 1,
+        operatorReviewRequired: 1,
+      },
+    }),
+  automaticFaireExactRefresh:
+    fairePromotionPolicy.faireAutomaticExactRefreshHealthSnapshot({
+      operatorReviewRequired: 1,
+    }),
+  automaticFaireUnattributedAttention:
+    fairePromotionPolicy.faireUnattributedAttentionHealthSnapshot({
+      attentionRequiredAccounts: 1,
+      operatorReviewRequired: 1,
+    }),
+}
+const completedRouteModule = loadTypeScriptModule(
+  'app_src/app/api/integrations/commerce/orders/process/route.ts',
+  {
+    mocks: {
+      'next/server': {
+        NextRequest: class NextRequest {},
+        NextResponse: {
+          json(body, init = {}) {
+            return { body, status: init.status || 200 }
+          },
+        },
+      },
+      '@/lib/integrations/commerceIntake': {
+        commerceIntakeRuntimeAvailable: () => true,
+      },
+      '@/lib/commerceOrderReconciliationWorker': {
+        async processCommerceOrderReconciliation() {
+          return completedRouteRunResult
+        },
+      },
+      '@/lib/persistence/config': {
+        isPostgresStorageEnabled: () => true,
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async readCommerceOrderReconciliationHealthFromPostgres() {
+          return {
+            providerPromotionAttentionRequired: {
+              shopify: 2,
+              faire: 3,
+            },
+            faireExactRefreshAttentionRequired: 4,
+            faireUnattributedAttentionRequired: 5,
+            operatorAttentionRequired: 8,
+          }
+        },
+        async recordCommerceOrderReconciliationWorkerHeartbeatInPostgres(
+          input,
+        ) {
+          completedRouteHeartbeats.push(input)
+          return { checkedAt: '2026-08-04T22:45:00.000Z' }
+        },
+      },
+    },
+  },
+)
+const priorWorkerSecret = process.env.PIPELINE_OUTBOX_WORKER_SECRET
+const completedRouteSecret = 's'.repeat(40)
+process.env.PIPELINE_OUTBOX_WORKER_SECRET = completedRouteSecret
+let completedRouteResponse
+try {
+  completedRouteResponse = await completedRouteModule.POST({
+    headers: {
+      get(name) {
+        return name === 'authorization'
+          ? `Bearer ${completedRouteSecret}`
+          : null
+      },
+    },
+    async json() {
+      return { limit: 1 }
+    },
+  })
+} finally {
+  if (priorWorkerSecret === undefined) {
+    delete process.env.PIPELINE_OUTBOX_WORKER_SECRET
+  } else {
+    process.env.PIPELINE_OUTBOX_WORKER_SECRET = priorWorkerSecret
+  }
+}
+assert.equal(completedRouteResponse.status, 200)
+assert.equal(completedRouteHeartbeats.length, 2)
+const completedRouteHeartbeat = completedRouteHeartbeats[1]
+assert.equal(completedRouteHeartbeat.phase, 'completed')
+assert.equal(
+  completedRouteHeartbeat.automaticShopifyOrderPromotion
+    .attentionRequiredAccounts,
+  2,
+  'A completed limited batch must retain durable attention on unclaimed Shopify accounts',
+)
+assert.equal(
+  completedRouteHeartbeat.automaticFaireOrderPromotion
+    .attentionRequiredAccounts,
+  3,
+  'A completed limited batch must retain durable promotion attention on unclaimed Faire accounts',
+)
+assert.equal(
+  completedRouteHeartbeat.automaticFaireExactRefresh.operatorReviewRequired,
+  4,
+  'A completed limited batch must retain durable exact-refresh attention on unclaimed Faire accounts',
+)
+assert.equal(
+  completedRouteResponse.body.automaticFaireExactRefresh
+    .operatorReviewRequired,
+  4,
+)
+assert.equal(
+  completedRouteHeartbeat.automaticFaireUnattributedAttention
+    .attentionRequiredAccounts,
+  5,
+  'Legacy unattributed attention must survive a completed limited batch',
+)
+assert.notEqual(
+  completedRouteHeartbeat.automaticFaireExactRefresh.operatorReviewRequired,
+  8,
+  'Aggregate account attention must not be projected back into an exact subtype',
+)
+
 const route = read('app_src/app/api/integrations/commerce/orders/process/route.ts')
 includes(route, [
   'PIPELINE_OUTBOX_WORKER_SECRET',
@@ -1170,15 +2863,30 @@ includes(route, [
   'isPostgresStorageEnabled()',
   'processCommerceOrderReconciliation',
   'recordCommerceOrderReconciliationWorkerHeartbeatInPostgres',
+  'readCommerceOrderReconciliationHealthFromPostgres',
+  'durableAutomaticAttentionHealth',
+  'mergeDurableAutomaticAttentionHealth',
+  'health?.providerPromotionAttentionRequired.shopify',
+  'health?.providerPromotionAttentionRequired.faire',
+  'health?.faireExactRefreshAttentionRequired',
+  'health?.faireUnattributedAttentionRequired',
   "phase: 'started'",
   "phase: 'completed'",
   "phase: 'failed'",
   'providerReadOnly: true',
   'localCanonicalOrderWritesPossible: true',
+  'shopifyAutomaticOrderPromotionHealthSnapshot',
+  'faireAutomaticOrderPromotionHealthSnapshot',
+  'faireAutomaticExactRefreshHealthSnapshot',
+  'faireUnattributedAttentionHealthSnapshot',
 ], 'Order reconciliation route')
 assert.ok(
   !route.includes('readOnly: true'),
   'The order worker must not claim that local canonical promotion is read-only',
+)
+assert.ok(
+  !route.includes('health?.operatorAttentionRequired'),
+  'Aggregate attention must not feed back into a classified subtype',
 )
 const poller = read('scripts/pipeline-outbox-poller.mjs')
 includes(poller, [
@@ -1193,12 +2901,20 @@ includes(health, [
   "WHERE filename = '0122_operations_commerce_incomplete_header_money.sql'",
   'row?.operations_commerce_incomplete_header_money_migration_applied',
   "'0173_operations_shopify_shipping_service_codes.sql'",
+  "'0251_operations_commerce_order_attention_kinds.sql'",
   'row?.operations_shopify_shipping_service_codes_applied',
   'commerceOrderReconciliationWorker',
   'readCommerceOrderReconciliationHealthFromPostgres',
   'Commerce order reconciliation worker heartbeat is missing or stale.',
-  'orderState.promotionAttentionRequired > 0',
+  'orderState.operatorAttentionRequired > 0',
   'automatic local order promotion needs operator attention',
+  'shopifyAutomaticOrderPromotionHealthSnapshot',
+  'faireAutomaticOrderPromotionHealthSnapshot',
+  'faireAutomaticExactRefreshHealthSnapshot',
+  'faireUnattributedAttentionHealthSnapshot',
+  'orderHeartbeat?.automaticFaireExactRefresh',
+  'orderHeartbeat?.automaticFaireUnattributedAttention',
+  'Legacy Faire order attention needs operator review',
 ], 'Order reconciliation health migration gate')
 const reconciliationPersistence = read(
   'app_src/lib/persistence/commerceOrderReconciliation.ts',
@@ -1209,16 +2925,23 @@ includes(reconciliationPersistence, [
   "account.provider IN ('shopify', 'faire')",
   "cursor.resource = 'orders'",
   'stale_processing',
+  'automatic_promotion_attention_required',
+  'automatic_exact_refresh_attention_required',
+  'automatic_unattributed_attention_required',
   'promotion_attention_required',
   'overdue',
   'providerAccounts',
   'promotionAttentionRequired',
+  'faireExactRefreshAttentionRequired',
+  'faireUnattributedAttentionRequired',
+  'operatorAttentionRequired',
   'automaticPromotionAttentionRequired',
 ], 'Order reconciliation durable health')
 const predeploy = read('scripts/verify-predeploy.mjs')
 includes(predeploy, [
   "'db/migrations/0122_operations_commerce_incomplete_header_money.sql'",
   "'db/migrations/0173_operations_shopify_shipping_service_codes.sql'",
+  "'db/migrations/0251_operations_commerce_order_attention_kinds.sql'",
   "'scripts/test-commerce-order-reconciliation.mjs'",
 ], 'Order reconciliation predeploy gate')
 

@@ -75,6 +75,40 @@ function toWorkspaceOrganization(row: WorkspaceOrganizationRow): WorkspaceOrgani
   }
 }
 
+async function requireInvitationOrganizationInActorScope(actor: AppUser, organizationId: string) {
+  const result = await query<{ allowed: boolean }>(
+    `WITH RECURSIVE ancestors AS (
+       SELECT organization.id, organization.parent_id, ARRAY[organization.id] AS path
+       FROM workspace_organizations organization
+       WHERE organization.id = $2::uuid
+       UNION ALL
+       SELECT parent.id, parent.parent_id, ancestor.path || parent.id
+       FROM workspace_organizations parent
+       JOIN ancestors ancestor ON ancestor.parent_id = parent.id
+       WHERE NOT parent.id = ANY(ancestor.path)
+     )
+     SELECT EXISTS (
+       SELECT 1
+       FROM ancestors ancestor
+       JOIN app_user_organization_memberships membership
+         ON membership.organization_id = ancestor.id
+       WHERE membership.user_email = $1
+         AND membership.status = 'active'
+         AND (
+           membership.role = 'owner'
+           OR (
+             membership.role = 'admin'
+             AND COALESCE((membership.permissions ->> 'inviteUsers')::boolean, false)
+           )
+         )
+     ) AS allowed`,
+    [actor.email, organizationId],
+  )
+  if (!result.rows[0]?.allowed) {
+    throw new AppUserAuthorizationError('Invitation organization is outside the workspaces you can manage')
+  }
+}
+
 export async function workspaceOrganizationById(id: string) {
   const result = await query<WorkspaceOrganizationRow>(
     `SELECT organization.id::text, organization.reference_code,
@@ -249,20 +283,14 @@ export async function resolveInvitationWorkspaceOrganization(input: {
   if (!createOrganization) {
     const organization = requestedId ? await workspaceOrganizationById(requestedId) : current
     if (!organization) throw new Error('Invitation organization was not found')
-    const lineage = await workspaceOrganizationAncestors(organization.id)
-    if (!lineage.some((candidate) => candidate.id === current.id)) {
-      throw new AppUserAuthorizationError('Invitation organization is outside your managed account graph')
-    }
+    await requireInvitationOrganizationInActorScope(actor, organization.id)
     return { organization, created: false }
   }
 
   const parentId = String(input.parentOrganizationId || '').trim() || current.id
   const parent = await workspaceOrganizationById(parentId)
   if (!parent) throw new Error('Parent organization was not found')
-  const parentLineage = await workspaceOrganizationAncestors(parent.id)
-  if (!parentLineage.some((candidate) => candidate.id === current.id)) {
-    throw new AppUserAuthorizationError('Parent organization is outside your managed account graph')
-  }
+  await requireInvitationOrganizationInActorScope(actor, parent.id)
   const name = cleanOrganizationName(input.organizationName)
 
   return withTransaction(async (client) => {
@@ -415,14 +443,29 @@ export async function listWorkspaceOrganizationHierarchy(actorEmailValue: AppUse
       ? `WITH RECURSIVE organization_tree AS (
            SELECT organization.id, organization.reference_code, organization.parent_id, organization.name,
              organization.organization_type, 0 AS depth, ARRAY[organization.id] AS path
-           FROM workspace_organizations organization
-           WHERE organization.id = $1::uuid
+           FROM app_user_organization_memberships membership
+           JOIN workspace_organizations organization ON organization.id = membership.organization_id
+           WHERE membership.user_email = $1
+             AND membership.status = 'active'
+             AND organization.is_demo = false
+             AND (
+               membership.role = 'owner'
+               OR (
+                 membership.role = 'admin'
+                 AND COALESCE((membership.permissions ->> 'inviteUsers')::boolean, false)
+               )
+             )
            UNION ALL
            SELECT child.id, child.reference_code, child.parent_id, child.name, child.organization_type,
              tree.depth + 1, tree.path || child.id
            FROM workspace_organizations child
            JOIN organization_tree tree ON child.parent_id = tree.id
            WHERE NOT child.id = ANY(tree.path)
+         ), invitation_organizations AS (
+           SELECT DISTINCT ON (id)
+             id, reference_code, parent_id, name, organization_type, depth, path
+           FROM organization_tree
+           ORDER BY id, depth, path
          )
          SELECT tree.id::text, tree.reference_code, tree.parent_id::text, parent.name AS parent_name,
            tree.name, tree.organization_type, tree.depth,
@@ -437,9 +480,9 @@ export async function listWorkspaceOrganizationHierarchy(actorEmailValue: AppUse
              JOIN app_users app_user ON app_user.email = membership.user_email
              WHERE membership.organization_id = tree.id
            ), '[]'::jsonb) AS members
-         FROM organization_tree tree
+         FROM invitation_organizations tree
          LEFT JOIN workspace_organizations parent ON parent.id = tree.parent_id
-         ORDER BY tree.path`
+         ORDER BY lower(tree.name), tree.id`
       : `SELECT organization.id::text, organization.reference_code,
            organization.parent_id::text, parent.name AS parent_name,
            organization.name, organization.organization_type, 0 AS depth,
@@ -457,7 +500,7 @@ export async function listWorkspaceOrganizationHierarchy(actorEmailValue: AppUse
          FROM workspace_organizations organization
          LEFT JOIN workspace_organizations parent ON parent.id = organization.parent_id
          WHERE organization.id = $1::uuid`,
-    [current.id],
+    [canViewAll ? actor.email : current.id],
   )
   return result.rows.map(toWorkspaceOrganization)
 }

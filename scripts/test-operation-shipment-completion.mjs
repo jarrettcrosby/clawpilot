@@ -716,6 +716,7 @@ async function verifyShipmentCompletion(databaseUrl) {
     )
     let shopifyFulfillmentPreparationCalls = 0
     let shopifyFulfillmentPreparationHook = null
+    const shopifyFulfillmentInputs = []
     let shopifyFulfillmentExecutionCalls = 0
     let shopifyFulfillmentReconciliationCalls = 0
     let shopifyFulfillmentReconciliationResult = null
@@ -744,6 +745,7 @@ async function verifyShipmentCompletion(databaseUrl) {
         '@/lib/integrations/shopifyFulfillmentWriteback': {
           prepareShopifyFulfillmentWriteback: async (input) => {
             shopifyFulfillmentPreparationCalls += 1
+            shopifyFulfillmentInputs.push(JSON.parse(JSON.stringify(input)))
             if (shopifyFulfillmentPreparationHook) {
               await shopifyFulfillmentPreparationHook(input)
             }
@@ -831,7 +833,7 @@ async function verifyShipmentCompletion(databaseUrl) {
         },
         '@/lib/persistence/operationPrintDelivery': {
           enqueueOperationsPrintJobInPostgres: async () => ({
-            printJobGlobalId: null,
+            printJobGlobalId: 'gpj1234567',
             printJobStatus: null,
             printWarning: 'No printer configured in focused shipment completion acceptance.',
           }),
@@ -889,6 +891,79 @@ async function verifyShipmentCompletion(databaseUrl) {
         })
       ))
       return fixture
+    }
+
+    const createShopifyShipmentFixture = async (
+      scenario,
+      { notifyCustomerDefault = false } = {},
+    ) => {
+      const fixture = await createFixture(scenario)
+      const order = await advanceOrderToPacked(persistence, fixture, scenario)
+      await addPackagingClaim(pool, fixture, order.planned.orderGlobalId)
+      await addActiveLabel(pool, fixture, order.planned.orderGlobalId, 'mock')
+      const account = await pool.query(
+        `UPDATE operations_integration_accounts integration
+         SET provider = 'shopify', integration_type = 'commerce',
+             environment = 'sandbox',
+             external_account_id = $3,
+             display_name = $4,
+             configuration = jsonb_build_object('shopDomain', $5::text),
+             updated_by = $6, updated_at = now()
+         FROM operations_orders source_order
+         WHERE source_order.organization_id = $1::uuid
+           AND source_order.global_id = $2
+           AND integration.organization_id = source_order.organization_id
+           AND integration.id = source_order.integration_account_id
+         RETURNING integration.id::text, integration.global_id`,
+        [
+          fixture.organizationId,
+          order.planned.orderGlobalId,
+          `gid://shopify/Shop/${randomUUID()}`,
+          `Shopify notification ${scenario}`,
+          `${scenario}.myshopify.com`,
+          fixture.email,
+        ],
+      )
+      assert.equal(account.rowCount, 1)
+      await pool.query(
+        `UPDATE operations_orders
+         SET source_provider = 'shopify',
+             external_order_id = $3, updated_by = $4, updated_at = now()
+         WHERE organization_id = $1::uuid AND global_id = $2`,
+        [
+          fixture.organizationId,
+          order.planned.orderGlobalId,
+          `gid://shopify/Order/${randomUUID()}`,
+          fixture.email,
+        ],
+      )
+      await postgres.withTransaction((client) => (
+        fulfillmentNotificationPolicy
+          .ensureShopifyFulfillmentNotificationPolicyWithClient(client, {
+            organizationId: fixture.organizationId,
+            integrationAccountId: account.rows[0].id,
+            actorEmail: fixture.email,
+          })
+      ))
+      let revision = 1
+      if (notifyCustomerDefault) {
+        const enabled = await fulfillmentNotificationPolicy
+          .updateShopifyFulfillmentNotificationPolicyInPostgres({
+            organizationId: fixture.organizationId,
+            accountGlobalId: account.rows[0].global_id,
+            actorEmail: fixture.email,
+            expectedRevision: revision,
+            notifyCustomerDefault: true,
+            reason: `Enable the ${scenario} Shopify notification acceptance default`,
+          })
+        revision = enabled.revision
+      }
+      return {
+        fixture,
+        order,
+        account: account.rows[0],
+        revision,
+      }
     }
 
     const policyFixture = await seedWorkspace(pool, 'notification-policy')
@@ -1952,17 +2027,158 @@ async function verifyShipmentCompletion(databaseUrl) {
       consumedWorkspace.selectedOrder?.sandboxCommerceE2eAuthorization,
       null,
     )
+    const multiPackageIdentity = await pool.query(
+      `SELECT package.package_number, shipment.global_id AS shipment_global_id,
+              shipment.tracking_number,
+              artifact.global_id AS packing_slip_artifact_global_id
+       FROM operations_shipments shipment
+       JOIN operations_packages package
+         ON package.organization_id = shipment.organization_id
+        AND package.id = shipment.package_id
+       JOIN operations_print_artifacts artifact
+         ON artifact.organization_id = shipment.organization_id
+        AND artifact.source_shipment_id = shipment.id
+        AND artifact.document_type = 'packing_slip'
+       JOIN operations_orders source_order
+         ON source_order.organization_id = shipment.organization_id
+        AND source_order.id = shipment.order_id
+       WHERE source_order.organization_id = $1::uuid
+         AND source_order.global_id = $2
+       ORDER BY package.package_number`,
+      [authorizedFixture.organizationId, authorized.planned.orderGlobalId],
+    )
+    assert.equal(multiPackageIdentity.rowCount, 2)
+    assert.equal(
+      authorizedResult.shipmentGlobalId,
+      multiPackageIdentity.rows[0].shipment_global_id,
+    )
+    assert.equal(
+      authorizedResult.trackingNumber,
+      multiPackageIdentity.rows[0].tracking_number,
+    )
+    assert.equal(
+      authorizedResult.packingSlipArtifactGlobalId,
+      multiPackageIdentity.rows[0].packing_slip_artifact_global_id,
+    )
+    assert.notEqual(
+      authorizedResult.shipmentGlobalId,
+      multiPackageIdentity.rows[1].shipment_global_id,
+    )
+    assert.notEqual(
+      authorizedResult.trackingNumber,
+      multiPackageIdentity.rows[1].tracking_number,
+    )
+    const retainedSandboxExport = await pool.query(
+      `INSERT INTO operations_commerce_fulfillment_exports (
+         organization_id, order_id, shipment_id, provider, external_order_id,
+         state, attempts, payload_snapshot, idempotency_key,
+         provider_reference, completed_at
+       )
+       SELECT organization_id, order_id, shipment_id, provider,
+              external_order_id, 'succeeded', attempts,
+              payload_snapshot - 'customerNotification',
+              idempotency_key || ':legacy-completed-receipt-replay',
+              provider_reference, now()
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2
+       RETURNING global_id,
+                 payload_snapshot->>'sandboxE2eAuthorizationGlobalId'
+                   AS sandbox_authorization_global_id`,
+      [authorizedFixture.organizationId, authorizedResult.commerceExportGlobalId],
+    )
+    assert.equal(retainedSandboxExport.rowCount, 1)
+    assert.equal(
+      retainedSandboxExport.rows[0].sandbox_authorization_global_id,
+      authorizationGlobalId,
+    )
+    const legacySandboxReceipt = await pool.query(
+      `UPDATE operations_command_receipts
+       SET result_payload = jsonb_set(
+             result_payload - 'customerNotification',
+             '{commerceExportGlobalId}',
+             to_jsonb($3::text),
+             true
+           ),
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND command_type = 'confirm_operations_order_shipment'
+         AND idempotency_key = $2
+         AND status = 'succeeded'
+       RETURNING result_payload`,
+      [
+        authorizedFixture.organizationId,
+        authorizedInput.idempotencyKey,
+        retainedSandboxExport.rows[0].global_id,
+      ],
+    )
+    assert.equal(legacySandboxReceipt.rowCount, 1)
+    assert.equal(
+      legacySandboxReceipt.rows[0].result_payload.printJobGlobalId,
+      authorizedResult.printJobGlobalId,
+    )
+    assert.equal(
+      legacySandboxReceipt.rows[0].result_payload.printWarning,
+      authorizedResult.printWarning,
+    )
+    assert.equal(
+      legacySandboxReceipt.rows[0].result_payload.commerceExportGlobalId,
+      retainedSandboxExport.rows[0].global_id,
+    )
+    const legacyReplayEvidenceBefore = await orderEvidence(
+      pool,
+      authorizedFixture,
+      authorized.planned.orderGlobalId,
+    )
     const authorizedReplay = await persistence.confirmOperationsOrderShipmentFromPostgres(
       authorizedInput,
     )
     assert.equal(authorizedReplay.replayed, true)
+    const {
+      customerNotification: _receiptNotification,
+      replayed: _receiptReplayState,
+      ...immutableReceiptFields
+    } = legacySandboxReceipt.rows[0].result_payload
+    const {
+      customerNotification: replayedNotification,
+      replayed: _replayedReplayState,
+      ...replayedReceiptFields
+    } = JSON.parse(JSON.stringify(authorizedReplay))
+    assert.deepEqual(
+      replayedReceiptFields,
+      immutableReceiptFields,
+      'Legacy notification recovery must preserve every immutable completed-receipt field',
+    )
+    assert.deepEqual(replayedNotification, {
+      mode: 'clawpilot_explicit',
+      notifyCustomer: false,
+      source: 'sandbox_e2e_suppression',
+      accountPolicyRevision: null,
+      overrideReason: null,
+      decidedBy: null,
+    })
+    for (const field of [
+      'rowVersion',
+      'shipmentGlobalId',
+      'trackingNumber',
+      'packingSlipArtifactGlobalId',
+      'commerceExportGlobalId',
+      'commerceExportState',
+      'printJobGlobalId',
+      'printWarning',
+    ]) {
+      assert.equal(
+        authorizedReplay[field],
+        legacySandboxReceipt.rows[0].result_payload[field],
+        `Completed receipt replay changed immutable ${field}`,
+      )
+    }
     assert.deepEqual(
       await orderEvidence(
         pool,
         authorizedFixture,
         authorized.planned.orderGlobalId,
       ),
-      authorizedEvidence,
+      legacyReplayEvidenceBefore,
     )
     const replayedAuthorization = await sandboxAuthorization
       .readSandboxCommerceE2eAuthorizationInPostgres({
@@ -1971,6 +2187,50 @@ async function verifyShipmentCompletion(databaseUrl) {
       })
     assert.equal(replayedAuthorization.state, 'consumed')
     assert.equal(replayedAuthorization.consumedAt, consumedAuthorization.consumedAt)
+
+    const legacySandboxExport6567 = await pool.query(
+      `INSERT INTO operations_commerce_fulfillment_exports (
+         organization_id, order_id, shipment_id, provider, external_order_id,
+         state, attempts, payload_snapshot, idempotency_key, completed_at
+       )
+       SELECT organization_id, order_id, shipment_id, provider,
+              external_order_id, 'succeeded', attempts,
+              payload_snapshot - 'customerNotification',
+              idempotency_key || ':legacy-sandbox-6567-read-model', now()
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2
+       RETURNING global_id`,
+      [authorizedFixture.organizationId, authorizedResult.commerceExportGlobalId],
+    )
+    assert.equal(legacySandboxExport6567.rowCount, 1)
+    const legacySandboxWorkspace =
+      await persistence.readOperationsWorkspaceFromPostgres({
+        organizationId: authorizedFixture.organizationId,
+        actorEmail: authorizedFixture.email,
+        capabilities: {
+          canView: true,
+          canManage: true,
+          canExecute: true,
+          canActivate: true,
+        },
+        selectedOrderGlobalId: authorized.planned.orderGlobalId,
+      })
+    const legacySandboxDecision = legacySandboxWorkspace.selectedOrder
+      ?.commerceExports.find(
+        (item) => item.globalId === legacySandboxExport6567.rows[0].global_id,
+      )?.customerNotification
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(legacySandboxDecision)),
+      {
+        mode: 'clawpilot_explicit',
+        notifyCustomer: false,
+        source: 'sandbox_e2e_suppression',
+        accountPolicyRevision: null,
+        overrideReason: null,
+        decidedBy: null,
+      },
+      'A retained Shopify sandbox E2E authorization must identify legacy #6567-style export suppression',
+    )
 
     const cappedProcessingExport = await pool.query(
       `INSERT INTO operations_commerce_fulfillment_exports (
@@ -2386,7 +2646,7 @@ async function verifyShipmentCompletion(databaseUrl) {
       {
         mode: 'clawpilot_explicit',
         notifyCustomer: false,
-        source: 'legacy_safe_default',
+        source: 'sandbox_e2e_suppression',
         accountPolicyRevision: null,
         overrideReason: null,
         decidedBy: null,
@@ -2521,6 +2781,225 @@ async function verifyShipmentCompletion(databaseUrl) {
     assert.equal(afterStale.status, 'packed')
     assert.equal(afterStale.on_hand_quantity, '12.000000')
     assert.equal(afterStale.reserved_quantity, '2.000000')
+
+    const falseDefault = await createShopifyShipmentFixture(
+      'notification-default-false',
+    )
+    const falseDefaultResult =
+      await persistence.confirmOperationsOrderShipmentFromPostgres({
+        organizationId: falseDefault.fixture.organizationId,
+        actorEmail: falseDefault.fixture.email,
+        orderGlobalId: falseDefault.order.planned.orderGlobalId,
+        expectedRowVersion: falseDefault.order.packed.rowVersion,
+        reason: 'Confirm the safe false Shopify notification default',
+        idempotencyKey: `confirm-notification-default-false-${randomUUID()}`,
+        expectedNotificationPolicyRevision: falseDefault.revision,
+      })
+    assert.equal(falseDefaultResult.commerceExportState, 'succeeded')
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(falseDefaultResult.customerNotification)),
+      {
+        mode: 'clawpilot_explicit',
+        notifyCustomer: false,
+        source: 'account_default',
+        accountPolicyRevision: 1,
+        overrideReason: null,
+        decidedBy: falseDefault.fixture.email,
+      },
+    )
+    assert.equal(shopifyFulfillmentInputs.at(-1).notifyCustomer, false)
+
+    const trueDefault = await createShopifyShipmentFixture(
+      'notification-default-true',
+      { notifyCustomerDefault: true },
+    )
+    const trueDefaultResult =
+      await persistence.confirmOperationsOrderShipmentFromPostgres({
+        organizationId: trueDefault.fixture.organizationId,
+        actorEmail: trueDefault.fixture.email,
+        orderGlobalId: trueDefault.order.planned.orderGlobalId,
+        expectedRowVersion: trueDefault.order.packed.rowVersion,
+        reason: 'Confirm the enabled Shopify notification request default',
+        idempotencyKey: `confirm-notification-default-true-${randomUUID()}`,
+        expectedNotificationPolicyRevision: trueDefault.revision,
+      })
+    assert.equal(trueDefaultResult.commerceExportState, 'succeeded')
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(trueDefaultResult.customerNotification)),
+      {
+        mode: 'clawpilot_explicit',
+        notifyCustomer: true,
+        source: 'account_default',
+        accountPolicyRevision: 2,
+        overrideReason: null,
+        decidedBy: trueDefault.fixture.email,
+      },
+    )
+    assert.equal(shopifyFulfillmentInputs.at(-1).notifyCustomer, true)
+
+    const orderOverride = await createShopifyShipmentFixture(
+      'notification-order-override',
+    )
+    const overrideReason = (
+      'Request a notification for this exact Shopify acceptance order only'
+    )
+    const orderOverrideResult =
+      await persistence.confirmOperationsOrderShipmentFromPostgres({
+        organizationId: orderOverride.fixture.organizationId,
+        actorEmail: orderOverride.fixture.email,
+        orderGlobalId: orderOverride.order.planned.orderGlobalId,
+        expectedRowVersion: orderOverride.order.packed.rowVersion,
+        reason: 'Confirm the explicit per-order notification exception',
+        idempotencyKey: `confirm-notification-override-${randomUUID()}`,
+        expectedNotificationPolicyRevision: orderOverride.revision,
+        customerNotificationOverride: true,
+        customerNotificationOverrideReason: overrideReason,
+      })
+    assert.equal(orderOverrideResult.commerceExportState, 'succeeded')
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(orderOverrideResult.customerNotification)),
+      {
+        mode: 'clawpilot_explicit',
+        notifyCustomer: true,
+        source: 'order_override',
+        accountPolicyRevision: 1,
+        overrideReason,
+        decidedBy: orderOverride.fixture.email,
+      },
+    )
+    assert.equal(shopifyFulfillmentInputs.at(-1).notifyCustomer, true)
+
+    const revisionRace = await createShopifyShipmentFixture(
+      'notification-policy-revision-race',
+    )
+    const raceEvidenceBefore = await orderEvidence(
+      pool,
+      revisionRace.fixture,
+      revisionRace.order.planned.orderGlobalId,
+    )
+    const racePreparationCallsBefore = shopifyFulfillmentPreparationCalls
+    const revisedRacePolicy = await fulfillmentNotificationPolicy
+      .updateShopifyFulfillmentNotificationPolicyInPostgres({
+        organizationId: revisionRace.fixture.organizationId,
+        accountGlobalId: revisionRace.account.global_id,
+        actorEmail: revisionRace.fixture.email,
+        expectedRevision: revisionRace.revision,
+        notifyCustomerDefault: true,
+        reason: 'Change the policy after the operator opened the shipment',
+      })
+    assert.equal(revisedRacePolicy.revision, 2)
+    await expectRejected(
+      () => persistence.confirmOperationsOrderShipmentFromPostgres({
+        organizationId: revisionRace.fixture.organizationId,
+        actorEmail: revisionRace.fixture.email,
+        orderGlobalId: revisionRace.order.planned.orderGlobalId,
+        expectedRowVersion: revisionRace.order.packed.rowVersion,
+        reason: 'Reject confirmation using the stale notification revision',
+        idempotencyKey: `confirm-notification-revision-race-${randomUUID()}`,
+        expectedNotificationPolicyRevision: revisionRace.revision,
+      }),
+      (error) => (
+        error?.code === 'OPERATIONS_NOTIFICATION_POLICY_REVISION_CONFLICT'
+      ),
+      'Shipment confirmation must reject a raced Shopify notification policy',
+    )
+    assert.equal(
+      shopifyFulfillmentPreparationCalls,
+      racePreparationCallsBefore,
+      'A notification policy race must fail before any Shopify provider I/O',
+    )
+    assert.deepEqual(
+      await orderEvidence(
+        pool,
+        revisionRace.fixture,
+        revisionRace.order.planned.orderGlobalId,
+      ),
+      raceEvidenceBefore,
+    )
+
+    const retryAfterPolicyChange = await createShopifyShipmentFixture(
+      'notification-policy-change-after-export',
+    )
+    shopifyFulfillmentPreparationHook = async () => {
+      const error = new Error(
+        'Simulated Shopify preparation rejection before provider dispatch',
+      )
+      error.code = 'SHOPIFY_PREPARATION_REJECTED'
+      throw error
+    }
+    let failedImmutableExport
+    try {
+      failedImmutableExport =
+        await persistence.confirmOperationsOrderShipmentFromPostgres({
+          organizationId: retryAfterPolicyChange.fixture.organizationId,
+          actorEmail: retryAfterPolicyChange.fixture.email,
+          orderGlobalId: retryAfterPolicyChange.order.planned.orderGlobalId,
+          expectedRowVersion: retryAfterPolicyChange.order.packed.rowVersion,
+          reason: 'Create the immutable export before a policy change',
+          idempotencyKey: `confirm-before-notification-change-${randomUUID()}`,
+          expectedNotificationPolicyRevision: retryAfterPolicyChange.revision,
+        })
+    } finally {
+      shopifyFulfillmentPreparationHook = null
+    }
+    assert.equal(failedImmutableExport.commerceExportState, 'failed')
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(failedImmutableExport.customerNotification)),
+      {
+        mode: 'clawpilot_explicit',
+        notifyCustomer: false,
+        source: 'account_default',
+        accountPolicyRevision: 1,
+        overrideReason: null,
+        decidedBy: retryAfterPolicyChange.fixture.email,
+      },
+    )
+    const changedAfterExport = await fulfillmentNotificationPolicy
+      .updateShopifyFulfillmentNotificationPolicyInPostgres({
+        organizationId: retryAfterPolicyChange.fixture.organizationId,
+        accountGlobalId: retryAfterPolicyChange.account.global_id,
+        actorEmail: retryAfterPolicyChange.fixture.email,
+        expectedRevision: retryAfterPolicyChange.revision,
+        notifyCustomerDefault: true,
+        reason: 'Enable requests only after the failed export was frozen',
+      })
+    assert.equal(changedAfterExport.revision, 2)
+    const retryInputCountBefore = shopifyFulfillmentInputs.length
+    const immutableRetry = await persistence
+      .retryOperationsCommerceFulfillmentExportFromPostgres({
+        organizationId: retryAfterPolicyChange.fixture.organizationId,
+        actorEmail: retryAfterPolicyChange.fixture.email,
+        commerceExportGlobalId: failedImmutableExport.commerceExportGlobalId,
+        reason: 'Retry with the original immutable notification decision',
+        idempotencyKey: `retry-after-notification-change-${randomUUID()}`,
+      })
+    assert.equal(immutableRetry.state, 'succeeded')
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(immutableRetry.customerNotification)),
+      JSON.parse(JSON.stringify(failedImmutableExport.customerNotification)),
+    )
+    assert.equal(
+      shopifyFulfillmentInputs.length,
+      retryInputCountBefore + 1,
+    )
+    assert.equal(
+      shopifyFulfillmentInputs.at(-1).notifyCustomer,
+      false,
+      'A later policy change must not alter the retry request frozen in the export',
+    )
+    const immutableExportEvidence = await pool.query(
+      `SELECT payload_snapshot->'customerNotification' AS decision
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [
+        retryAfterPolicyChange.fixture.organizationId,
+        failedImmutableExport.commerceExportGlobalId,
+      ],
+    )
+    assert.deepEqual(
+      immutableExportEvidence.rows[0].decision,
+      JSON.parse(JSON.stringify(failedImmutableExport.customerNotification)),
+    )
   } finally {
     await pool.end()
   }
@@ -2598,7 +3077,13 @@ async function main() {
   for (const fragment of [
     'Fulfillment &amp; tracking',
     'Save notification default',
-    'changing this setting never emails customers for prior shipments',
+    'Customer notification requests use a ClawPilot default for this',
+    'Shopify customer notification requests now default to',
+    'Enable Shopify customer notification requests for future',
+    'Disable Shopify customer notification requests for future',
+    'changing this setting never changes the request captured for prior',
+    'shipment tracking triggers Faire&apos;s shipment email',
+    'Use a controlled recipient for test orders',
   ]) {
     assert.ok(
       commercePanel.includes(fragment),
@@ -2606,9 +3091,22 @@ async function main() {
     )
   }
   const operationsPanel = read('app_src/components/operations/OperationsSection.tsx')
+  for (const fragment of [
+    'This commerce provider does not expose a ClawPilot customer-notification',
+    'Customer notification requested',
+    'Customer notification not requested',
+    'Use ClawPilot connection default',
+    'shipment tracking triggers Faire&apos;s shipment email',
+    'Verify this test order uses a controlled recipient',
+  ]) {
+    assert.ok(
+      operationsPanel.includes(fragment),
+      `Operations notification UI is missing ${fragment}`,
+    )
+  }
   assert.ok(
-    operationsPanel.includes('This commerce provider does not expose a ClawPilot customer-notification'),
-    'Operations UI must not describe every non-Shopify provider as Faire',
+    !operationsPanel.includes('Customer email enabled'),
+    'Operations UI must describe a provider notification request, not email delivery',
   )
   const operationsRoute = read('app_src/app/api/operations/route.ts')
   for (const fragment of [
