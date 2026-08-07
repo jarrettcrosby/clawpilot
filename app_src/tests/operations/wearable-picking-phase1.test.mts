@@ -60,4 +60,6 @@ test('Meta DAT callback uses the app URL scheme and camera access requires regis
   assert.match(app, /\.onOpenURL \{ url in Task \{ await model\.handleMetaURL\(url\) \} \}/)
   assert.match(app, /guard MetaWearablesAppBridge\.isRegistered else/)
   assert.match(app, /\.disabled\(!model\.canRequestMetaCamera\)/)
+  assert.match(app, /model\.metaCameraGranted \? "Camera granted" : "Camera access"/)
+  assert.match(app, /await loadQueue\(readAloud: false\)/)
 })

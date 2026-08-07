@@ -57,7 +57,9 @@ struct ClawPilotPickingPhoneApp: App {
                         HStack {
                             Button("Register") { Task { await model.registerMeta() } }
                                 .disabled(!model.canRegisterMeta)
-                            Button("Camera access") { Task { await model.requestMetaCamera() } }
+                            Button(model.metaCameraGranted ? "Camera granted" : "Camera access") {
+                                Task { await model.requestMetaCamera() }
+                            }
                                 .disabled(!model.canRequestMetaCamera)
                         }
                     }
@@ -95,6 +97,7 @@ final class PickingPhoneModel: ObservableObject {
     @Published var metaStatus = "Meta setup not checked. iPhone camera remains available."
     @Published var canRegisterMeta = false
     @Published var canRequestMetaCamera = false
+    @Published var metaCameraGranted = false
 
     private let cache: DurablePickCache
     private let api: PickingAPIClient
@@ -138,6 +141,8 @@ final class PickingPhoneModel: ObservableObject {
             } catch {
                 status = "Prior confirmation remains pending; no new key was created."
             }
+        } else {
+            await loadQueue(readAloud: false)
         }
     }
 
@@ -177,7 +182,7 @@ final class PickingPhoneModel: ObservableObject {
         } catch { status = "Sign-in failed: \(error.localizedDescription)" }
     }
 
-    func loadQueue() async {
+    func loadQueue(readAloud: Bool = true) async {
         guard !hasPendingConfirmation else {
             status = "Resolve the pending confirmation before loading new work."
             return
@@ -187,7 +192,7 @@ final class PickingPhoneModel: ObservableObject {
             try await picking.replaceQueue(queue)
             status = queue.orders.isEmpty ? "No released picks are assigned to this worker." : "Assigned picks cached."
             await updateProjection()
-            readInstruction()
+            if readAloud { readInstruction() }
         } catch { status = "Pick queue refresh failed: \(error.localizedDescription)" }
     }
 
@@ -269,18 +274,22 @@ final class PickingPhoneModel: ObservableObject {
         case .unavailable:
             canRegisterMeta = false
             canRequestMetaCamera = false
+            metaCameraGranted = false
             metaStatus = "Meta registration is unavailable. Confirm Meta AI is installed."
         case .available:
             canRegisterMeta = true
             canRequestMetaCamera = false
+            metaCameraGranted = false
             metaStatus = "Ready to register with Meta · \(deviceLabel)."
         case .registering:
             canRegisterMeta = false
             canRequestMetaCamera = false
+            metaCameraGranted = false
             metaStatus = "Waiting for Meta AI registration approval · \(deviceLabel)."
         case .registered:
             canRegisterMeta = false
-            canRequestMetaCamera = snapshot.connectedDeviceCount > 0
+            metaCameraGranted = snapshot.cameraPermissionGranted == true
+            canRequestMetaCamera = snapshot.connectedDeviceCount > 0 && !metaCameraGranted
             let permissionLabel: String
             switch snapshot.cameraPermissionGranted {
             case true: permissionLabel = "camera granted"
@@ -291,6 +300,7 @@ final class PickingPhoneModel: ObservableObject {
         @unknown default:
             canRegisterMeta = false
             canRequestMetaCamera = false
+            metaCameraGranted = false
             metaStatus = "Unknown Meta registration state. iPhone camera remains available."
         }
     }
