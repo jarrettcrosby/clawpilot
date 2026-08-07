@@ -5,12 +5,30 @@ import MWDATCore
 import UIKit
 import Vision
 
+@MainActor
 enum MetaWearablesAppBridge {
-    static func configure() throws { try Wearables.configure() }
-    static var registrationState: RegistrationState { Wearables.shared.registrationState }
+    private(set) static var isConfigured = false
+
+    static func configure() throws {
+        try Wearables.configure()
+        isConfigured = true
+    }
+    static var registrationState: RegistrationState {
+        isConfigured ? Wearables.shared.registrationState : .unavailable
+    }
     static var isRegistered: Bool { registrationState == .registered }
-    static func startRegistration() async throws { try await Wearables.shared.startRegistration() }
+    static func startRegistration() async throws {
+        guard isConfigured else { throw MetaBridgeError.notConfigured }
+        try await Wearables.shared.startRegistration()
+    }
     static func statusSnapshot() async -> MetaWearablesStatusSnapshot {
+        guard isConfigured else {
+            return MetaWearablesStatusSnapshot(
+                registrationState: .unavailable,
+                cameraPermissionGranted: nil,
+                connectedDeviceCount: 0
+            )
+        }
         let state = registrationState
         let connectedDeviceCount = Wearables.shared.devices.reduce(into: 0) { count, identifier in
             guard let device = Wearables.shared.deviceForIdentifier(identifier) else { return }
@@ -30,10 +48,20 @@ enum MetaWearablesAppBridge {
         )
     }
     static func requestCameraPermission() async throws -> Bool {
-        try await Wearables.shared.requestPermission(.camera) == .granted
+        guard isConfigured else { throw MetaBridgeError.notConfigured }
+        return try await Wearables.shared.requestPermission(.camera) == .granted
     }
     static func handleOpenURL(_ url: URL) async throws -> Bool {
-        try await Wearables.shared.handleUrl(url)
+        guard isConfigured else { throw MetaBridgeError.notConfigured }
+        return try await Wearables.shared.handleUrl(url)
+    }
+}
+
+enum MetaBridgeError: LocalizedError {
+    case notConfigured
+
+    var errorDescription: String? {
+        "Meta Wearables is not configured in this build."
     }
 }
 

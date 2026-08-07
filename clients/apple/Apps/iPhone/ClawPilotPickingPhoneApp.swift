@@ -10,63 +10,7 @@ struct ClawPilotPickingPhoneApp: App {
 
     var body: some Scene {
         WindowGroup {
-            NavigationStack {
-                Form {
-                    Section("Sign in") {
-                        TextField("Email", text: $model.email)
-                            .textInputAutocapitalization(.never)
-                            .keyboardType(.emailAddress)
-                        HStack {
-                            Button("Send code") { Task { await model.requestCode() } }
-                                .disabled(!model.canRequestCode)
-                            TextField("6-digit code", text: $model.code)
-                                .keyboardType(.numberPad)
-                            Button("Verify") { Task { await model.verifyCode() } }
-                        }
-                    }
-
-                    Section("Assigned pick") {
-                        if model.hasPendingConfirmation {
-                            Text("A prior confirmation is unresolved. New work is blocked.")
-                            Button("Retry exact confirmation") {
-                                Task { await model.retryPendingConfirmation() }
-                            }
-                        } else if let task = model.currentTask {
-                            Text(task.locationCode).font(.largeTitle).bold()
-                            Text(task.productName).font(.title3)
-                            Text("SKU \(task.channelSku) · Qty \(task.quantity.formatted())")
-                            HStack {
-                                Button("iPhone scan") { model.showPhoneScanner = true }
-                                Button("Meta scan") { Task { await model.scanWithMeta() } }
-                            }
-                            Button("Read instruction") { model.readInstruction() }
-                        } else if model.readyToConfirm {
-                            Text("Every product is scanned.")
-                            Button("Listen for confirmation") {
-                                Task { await model.listenForConfirmation() }
-                            }
-                            Button("Confirm picks") { Task { await model.confirmOrder() } }
-                        } else {
-                            Text("No assigned pick is cached.")
-                            Button("Load assigned picks") { Task { await model.loadQueue() } }
-                        }
-                    }
-
-                    Section("Meta glasses") {
-                        Text(model.metaStatus).font(.caption)
-                        HStack {
-                            Button("Register") { Task { await model.registerMeta() } }
-                                .disabled(!model.canRegisterMeta)
-                            Button(model.metaCameraGranted ? "Camera granted" : "Camera access") {
-                                Task { await model.requestMetaCamera() }
-                            }
-                                .disabled(!model.canRequestMetaCamera)
-                        }
-                    }
-
-                    Section("Status") { Text(model.status) }
-                }
-                .navigationTitle("ClawPilot Picking")
+            PickingDashboardView(model: model)
                 .sheet(isPresented: $model.showPhoneScanner) {
                     PhoneCameraScanner(
                         onBarcode: { value in Task { await model.accept(value, source: .iPhoneCamera) } },
@@ -79,7 +23,7 @@ struct ClawPilotPickingPhoneApp: App {
                     Task { await model.refreshMetaStatus() }
                 }
                 .task { await model.restoreAndRefresh() }
-            }
+                .preferredColorScheme(.dark)
         }
     }
 }
@@ -89,6 +33,11 @@ final class PickingPhoneModel: ObservableObject {
     @Published var email = ""
     @Published var code = ""
     @Published var canRequestCode = true
+    @Published var codeRequested = false
+    @Published var isAuthenticated = false
+    @Published var isRestoringSession = true
+    @Published var isAuthBusy = false
+    @Published var isQueueBusy = false
     @Published var currentTask: PickTask?
     @Published var readyToConfirm = false
     @Published var showPhoneScanner = false
@@ -106,6 +55,14 @@ final class PickingPhoneModel: ObservableObject {
     private let voice = VoiceConfirmationController()
     private var metaSource: MetaWearablesBarcodeSource?
     private var codeRequestCooldown: Task<Void, Never>?
+
+    var canSendCode: Bool {
+        canRequestCode && !isAuthBusy && email.contains("@") && email.count <= 254
+    }
+
+    var canVerifyCode: Bool {
+        !isAuthBusy && code.count == 6 && code.allSatisfy(\.isNumber)
+    }
 
     init() {
         let support = FileManager.default.urls(
@@ -127,6 +84,8 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func restoreAndRefresh() async {
+        isRestoringSession = true
+        defer { isRestoringSession = false }
         await refreshMetaStatus()
         _ = try? await picking.restore()
         await updateProjection()
@@ -135,6 +94,7 @@ final class PickingPhoneModel: ObservableObject {
             status = "A prior confirmation is pending. Replaying the same command."
             do {
                 try await api.confirm(pending)
+                isAuthenticated = true
                 try await picking.finishConfirmedOrder()
                 hasPendingConfirmation = false
                 status = "Prior confirmation reconciled."
@@ -147,9 +107,12 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func requestCode() async {
-        guard canRequestCode else { return }
+        guard canSendCode else { return }
+        isAuthBusy = true
+        defer { isAuthBusy = false }
         do {
             try await api.requestMagicCode(email: email)
+            codeRequested = true
             status = "Code requested. Check your email before requesting another."
         } catch PickingAPIError.rateLimited(let seconds) {
             startCodeRequestCooldown(seconds: seconds)
@@ -175,11 +138,20 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func verifyCode() async {
+        guard canVerifyCode else { return }
+        isAuthBusy = true
+        defer { isAuthBusy = false }
         do {
             try await api.verifyMagicCode(email: email, code: code)
+            isAuthenticated = true
+            codeRequested = false
+            code = ""
             status = "Signed in. Loading assigned picks."
             await loadQueue()
-        } catch { status = "Sign-in failed: \(error.localizedDescription)" }
+        } catch {
+            isAuthenticated = false
+            status = "Sign-in failed: \(error.localizedDescription)"
+        }
     }
 
     func loadQueue(readAloud: Bool = true) async {
@@ -187,13 +159,21 @@ final class PickingPhoneModel: ObservableObject {
             status = "Resolve the pending confirmation before loading new work."
             return
         }
+        isQueueBusy = true
+        defer { isQueueBusy = false }
         do {
             let queue = try await api.fetchQueue()
+            isAuthenticated = true
             try await picking.replaceQueue(queue)
             status = queue.orders.isEmpty ? "No released picks are assigned to this worker." : "Assigned picks cached."
             await updateProjection()
             if readAloud { readInstruction() }
-        } catch { status = "Pick queue refresh failed: \(error.localizedDescription)" }
+        } catch PickingAPIError.unauthorized {
+            isAuthenticated = false
+            status = "Sign in to load assigned picks."
+        } catch {
+            status = "Pick queue refresh failed: \(error.localizedDescription)"
+        }
     }
 
     func accept(_ value: String, source: BarcodeSource) async {

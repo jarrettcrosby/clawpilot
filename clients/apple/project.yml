@@ -40,9 +40,11 @@ targets:
       - path: Apps/iPhone
         excludes:
           - TestResources
+      - path: Assets/ClawPilotAssets.xcassets
     settings:
       base:
         CODE_SIGN_ENTITLEMENTS: Apps/iPhone/ClawPilotPickingPhone.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         PRODUCT_BUNDLE_IDENTIFIER: $(CLAWPILOT_PHONE_BUNDLE_IDENTIFIER)
         PRODUCT_NAME: ClawPilotPicking
         TARGETED_DEVICE_FAMILY: "1"
@@ -76,6 +78,7 @@ targets:
         NSCameraUsageDescription: ClawPilot scans product barcodes for assigned warehouse picks.
         NSMicrophoneUsageDescription: ClawPilot listens for short pick-confirmation commands.
         NSSpeechRecognitionUsageDescription: ClawPilot converts short confirmation phrases into typed local actions.
+        UILaunchScreen: {}
         UIBackgroundModes:
           - bluetooth-central
           - external-accessory
