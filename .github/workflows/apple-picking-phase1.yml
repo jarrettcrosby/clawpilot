@@ -1,0 +1,52 @@
+name: Apple Picking Phase 1
+
+on:
+  pull_request:
+    paths:
+      - 'clients/apple/**'
+      - 'app_src/app/api/operations/picks/**'
+      - 'app_src/lib/operations/wearablePicking.ts'
+      - 'app_src/lib/persistence/wearablePicking.ts'
+      - 'app_src/tests/operations/wearable-picking-phase1.test.mts'
+      - 'docs/integrations/meta-wearables-device-access.md'
+      - 'docs/modules/wearable-picking.md'
+      - 'scripts/apple-wearable-pilot-readiness.mjs'
+      - 'package.json'
+      - '.github/workflows/apple-picking-phase1.yml'
+  push:
+    branches: [dev, main]
+    paths:
+      - 'clients/apple/**'
+      - 'app_src/app/api/operations/picks/**'
+      - 'app_src/lib/operations/wearablePicking.ts'
+      - 'app_src/lib/persistence/wearablePicking.ts'
+      - 'app_src/tests/operations/wearable-picking-phase1.test.mts'
+      - 'scripts/apple-wearable-pilot-readiness.mjs'
+      - 'package.json'
+      - '.github/workflows/apple-picking-phase1.yml'
+
+concurrency:
+  group: apple-picking-phase1-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install XcodeGen 2.45.4
+        run: |
+          curl --fail --location --silent --show-error \
+            'https://github.com/yonaskolb/XcodeGen/releases/download/2.45.4/xcodegen.zip' \
+            --output "${RUNNER_TEMP}/xcodegen.zip"
+          ditto -x -k "${RUNNER_TEMP}/xcodegen.zip" "${RUNNER_TEMP}/xcodegen"
+          sudo install -m 0755 "${RUNNER_TEMP}/xcodegen/bin/xcodegen" /usr/local/bin/xcodegen
+      - name: Validate Phase 1 contracts and fixtures
+        run: npm run test:wearable-phase1
+      - name: Build iPhone and Watch simulators
+        run: npm run build:apple-picking-simulators
+

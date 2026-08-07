@@ -1,0 +1,4 @@
+// Safe build defaults. Local.xcconfig is optional and ignored by Git.
+CLAWPILOT_META_APP_ID = 0
+CLAWPILOT_META_CLIENT_TOKEN =
+#include? "Local.xcconfig"

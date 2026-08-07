@@ -78,6 +78,12 @@ function isPublicApi(pathname: string) {
   )
 }
 
+function isPublicAppleAppLink(pathname: string) {
+  return pathname === '/.well-known/apple-app-site-association'
+    || pathname === '/apple-app-site-association'
+    || pathname === '/ios'
+}
+
 function sensitiveMutationDuringImpersonation(req: NextRequest, session: BrowserSession): boolean {
   if (!session.impersonating || ['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return false
   const path = req.nextUrl.pathname
@@ -133,6 +139,7 @@ export async function proxy(req: NextRequest) {
 
   if (!AUTH_REQUIRED) return NextResponse.next()
   if (pathname.startsWith('/api/') && isPublicApi(pathname)) return NextResponse.next()
+  if (isPublicAppleAppLink(pathname)) return NextResponse.next()
   if (pathname.startsWith('/s/')) return NextResponse.next()
 
   if (pathname === '/welcome') {
