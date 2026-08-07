@@ -5,6 +5,7 @@ import {
   upgradeLegacyRequestSession,
 } from '@/lib/authSessions'
 import { getAppUser, isRootAppOwner } from '@/lib/users'
+import { operationsCapabilities } from '@/lib/operations/authorization'
 import { listWorkspaceMemberships, requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
 
 export async function GET(req: NextRequest) {
@@ -25,6 +26,8 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ ok: false }, { status: 401 })
     }
     const expiration = Math.min(Date.parse(session.idleExpiresAt), Date.parse(session.absoluteExpiresAt))
+    const operations = operationsCapabilities(effectiveUser)
+    const managerRole = effectiveUser.role === 'owner' || effectiveUser.role === 'admin'
     const response = NextResponse.json({
       ok: true,
       user: effectiveUser.email,
@@ -71,6 +74,10 @@ export async function GET(req: NextRequest) {
         startedAt: session.impersonationStartedAt,
         expiresAt: session.impersonationExpiresAt,
       } : { active: false },
+      mobileCapabilities: {
+        canUsePicker: operations.canView && operations.canManage && operations.canExecute,
+        canUseManager: managerRole || operations.canManage,
+      },
       isRootAdmin: isRootAppOwner(authenticatedUser),
     })
     if (issued) setBrowserSessionCookie(response, issued)

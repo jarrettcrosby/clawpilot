@@ -77,6 +77,134 @@ extension PickingAPIError: LocalizedError {
     }
 }
 
+public struct ClawPilotSessionProfile: Decodable, Equatable, Sendable {
+    public struct EffectiveUser: Decodable, Equatable, Sendable {
+        public let email: String
+        public let displayName: String?
+        public let role: String
+        public let organizationName: String?
+        public let organizationRole: String?
+
+        public init(
+            email: String,
+            displayName: String?,
+            role: String,
+            organizationName: String?,
+            organizationRole: String?
+        ) {
+            self.email = email
+            self.displayName = displayName
+            self.role = role
+            self.organizationName = organizationName
+            self.organizationRole = organizationRole
+        }
+    }
+
+    public struct MobileCapabilities: Decodable, Equatable, Sendable {
+        public let canUsePicker: Bool
+        public let canUseManager: Bool
+
+        public init(canUsePicker: Bool, canUseManager: Bool) {
+            self.canUsePicker = canUsePicker
+            self.canUseManager = canUseManager
+        }
+    }
+
+    public let user: String
+    public let effectiveUser: EffectiveUser
+    public let mobileCapabilities: MobileCapabilities
+
+    public init(
+        user: String,
+        effectiveUser: EffectiveUser,
+        mobileCapabilities: MobileCapabilities
+    ) {
+        self.user = user
+        self.effectiveUser = effectiveUser
+        self.mobileCapabilities = mobileCapabilities
+    }
+}
+
+public struct ManagerOrderSummary: Decodable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let globalId: String
+    public let orderNumber: String
+    public let customerName: String
+    public let status: String
+    public let warehouseName: String?
+    public let lineCount: Int
+
+    public init(
+        id: String,
+        globalId: String,
+        orderNumber: String,
+        customerName: String,
+        status: String,
+        warehouseName: String?,
+        lineCount: Int
+    ) {
+        self.id = id
+        self.globalId = globalId
+        self.orderNumber = orderNumber
+        self.customerName = customerName
+        self.status = status
+        self.warehouseName = warehouseName
+        self.lineCount = lineCount
+    }
+}
+
+public struct ManagerOrderDetail: Decodable, Equatable, Identifiable, Sendable {
+    public var id: String { globalId }
+    public let globalId: String
+    public let orderNumber: String
+    public let customerName: String
+    public let status: String
+    public let warehouseName: String?
+    public let rowVersion: Int
+    public let planStatus: String?
+    public let waveStatus: String?
+    public let pickTaskCount: Int
+    public let readyPickTaskCount: Int
+    public let pickedPickTaskCount: Int
+
+    public init(
+        globalId: String,
+        orderNumber: String,
+        customerName: String,
+        status: String,
+        warehouseName: String?,
+        rowVersion: Int,
+        planStatus: String?,
+        waveStatus: String?,
+        pickTaskCount: Int,
+        readyPickTaskCount: Int,
+        pickedPickTaskCount: Int
+    ) {
+        self.globalId = globalId
+        self.orderNumber = orderNumber
+        self.customerName = customerName
+        self.status = status
+        self.warehouseName = warehouseName
+        self.rowVersion = rowVersion
+        self.planStatus = planStatus
+        self.waveStatus = waveStatus
+        self.pickTaskCount = pickTaskCount
+        self.readyPickTaskCount = readyPickTaskCount
+        self.pickedPickTaskCount = pickedPickTaskCount
+    }
+}
+
+public struct ManagerPicker: Decodable, Equatable, Identifiable, Sendable {
+    public var id: String { email }
+    public let email: String
+    public let displayName: String?
+
+    public init(email: String, displayName: String?) {
+        self.email = email
+        self.displayName = displayName
+    }
+}
+
 public actor PickingAPIClient {
     private struct QueueEnvelope: Decodable {
         let ok: Bool
@@ -91,6 +219,33 @@ public actor PickingAPIClient {
         let error: String?
     }
 
+    private struct ManagerOperationsEnvelope: Decodable {
+        struct Workspace: Decodable {
+            let orders: [ManagerOrderSummary]
+            let selectedOrder: ManagerOrderDetail?
+        }
+
+        let ok: Bool
+        let operations: Workspace?
+        let code: String?
+        let error: String?
+    }
+
+    private struct PickerEnvelope: Decodable {
+        let ok: Bool
+        let pickers: [ManagerPicker]?
+        let code: String?
+        let error: String?
+    }
+
+    private struct ManagerOrderCommandBody: Encodable {
+        let action: String
+        let orderGlobalId: String
+        let expectedRowVersion: Int
+        let assignedTo: String
+        let reason: String
+    }
+
     private struct ConfirmBody: Encodable {
         let action: String
         let orderGlobalId: String
@@ -98,7 +253,7 @@ public actor PickingAPIClient {
         let reason: String
     }
 
-    private let origin: URL
+    public nonisolated let webOrigin: URL
     private let session: URLSession
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
@@ -112,7 +267,7 @@ public actor PickingAPIClient {
               (origin.scheme == "https" || (allowDebugHTTP && origin.scheme == "http")) else {
             throw PickingAPIError.invalidOrigin
         }
-        self.origin = origin
+        self.webOrigin = origin
         self.session = session
         encoder.dateEncodingStrategy = .iso8601
         decoder.dateDecodingStrategy = .iso8601
@@ -129,6 +284,29 @@ public actor PickingAPIClient {
         )
     }
 
+    public func fetchSessionProfile() async throws -> ClawPilotSessionProfile {
+        var request = URLRequest(url: try endpoint("/api/auth/session"))
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await session.data(for: request)
+        try validateHTTP(response)
+        return try decoder.decode(ClawPilotSessionProfile.self, from: data)
+    }
+
+    public func logout() async throws {
+        var request = URLRequest(url: try endpoint("/api/auth/logout"))
+        request.httpMethod = "POST"
+        let (data, response) = try await session.data(for: request)
+        try validateHTTP(response)
+        let envelope = try decoder.decode(BasicEnvelope.self, from: data)
+        guard envelope.ok else {
+            throw PickingAPIError.rejected(
+                code: envelope.code ?? "AUTH_LOGOUT_FAILED",
+                message: envelope.error ?? "Sign out failed"
+            )
+        }
+    }
+
     public func fetchQueue() async throws -> PickQueue {
         var request = URLRequest(url: try endpoint("/api/operations/picks"))
         request.httpMethod = "GET"
@@ -143,6 +321,83 @@ public actor PickingAPIClient {
             )
         }
         return queue
+    }
+
+    public func fetchManagerOrders() async throws -> [ManagerOrderSummary] {
+        var request = URLRequest(url: try endpoint("/api/operations"))
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await session.data(for: request)
+        try validateHTTP(response)
+        let envelope = try decoder.decode(ManagerOperationsEnvelope.self, from: data)
+        guard envelope.ok, let operations = envelope.operations else {
+            throw PickingAPIError.rejected(
+                code: envelope.code ?? "OPERATIONS_MANAGER_FAILED",
+                message: envelope.error ?? "Manager orders are unavailable"
+            )
+        }
+        return operations.orders
+    }
+
+    public func fetchManagerOrderDetail(_ orderGlobalId: String) async throws -> ManagerOrderDetail {
+        var components = URLComponents(url: try endpoint("/api/operations"), resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "order", value: orderGlobalId)]
+        guard let url = components.url else { throw PickingAPIError.invalidOrigin }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await session.data(for: request)
+        try validateHTTP(response)
+        let envelope = try decoder.decode(ManagerOperationsEnvelope.self, from: data)
+        guard envelope.ok, let detail = envelope.operations?.selectedOrder else {
+            throw PickingAPIError.rejected(
+                code: envelope.code ?? "OPERATIONS_ORDER_FAILED",
+                message: envelope.error ?? "Order details are unavailable"
+            )
+        }
+        return detail
+    }
+
+    public func fetchManagerPickers() async throws -> [ManagerPicker] {
+        var request = URLRequest(url: try endpoint("/api/operations/pickers"))
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await session.data(for: request)
+        try validateHTTP(response)
+        let envelope = try decoder.decode(PickerEnvelope.self, from: data)
+        guard envelope.ok, let pickers = envelope.pickers else {
+            throw PickingAPIError.rejected(
+                code: envelope.code ?? "OPERATIONS_PICKERS_FAILED",
+                message: envelope.error ?? "Picker list is unavailable"
+            )
+        }
+        return pickers
+    }
+
+    public func releaseManagerOrder(
+        _ order: ManagerOrderDetail,
+        assignedTo: String,
+        reason: String
+    ) async throws {
+        try await managerOrderCommand(
+            action: "release-order",
+            order: order,
+            assignedTo: assignedTo,
+            reason: reason
+        )
+    }
+
+    public func assignManagerOrder(
+        _ order: ManagerOrderDetail,
+        assignedTo: String,
+        reason: String
+    ) async throws {
+        try await managerOrderCommand(
+            action: "assign-picks",
+            order: order,
+            assignedTo: assignedTo,
+            reason: reason
+        )
     }
 
     public func confirm(_ command: ConfirmPicksCommand) async throws {
@@ -183,10 +438,38 @@ public actor PickingAPIClient {
         }
     }
 
+    private func managerOrderCommand(
+        action: String,
+        order: ManagerOrderDetail,
+        assignedTo: String,
+        reason: String
+    ) async throws {
+        var request = URLRequest(url: try endpoint("/api/operations"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(UUID().uuidString, forHTTPHeaderField: "Idempotency-Key")
+        request.httpBody = try encoder.encode(ManagerOrderCommandBody(
+            action: action,
+            orderGlobalId: order.globalId,
+            expectedRowVersion: order.rowVersion,
+            assignedTo: assignedTo,
+            reason: reason
+        ))
+        let (data, response) = try await session.data(for: request)
+        try validateHTTP(response)
+        let envelope = try decoder.decode(BasicEnvelope.self, from: data)
+        guard envelope.ok else {
+            throw PickingAPIError.rejected(
+                code: envelope.code ?? "OPERATIONS_COMMAND_FAILED",
+                message: envelope.error ?? "The Operations command failed"
+            )
+        }
+    }
+
     private func endpoint(_ path: String) throws -> URL {
-        guard let url = URL(string: path, relativeTo: origin)?.absoluteURL,
-              url.host == origin.host,
-              url.scheme == origin.scheme else {
+        guard let url = URL(string: path, relativeTo: webOrigin)?.absoluteURL,
+              url.host == webOrigin.host,
+              url.scheme == webOrigin.scheme else {
             throw PickingAPIError.invalidOrigin
         }
         return url

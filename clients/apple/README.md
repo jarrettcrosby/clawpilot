@@ -7,10 +7,13 @@ confirmation outbox, and all ClawPilot API calls. Apple Watch caches only the
 current and next two display cards and has no mutation authority.
 
 The iPhone app uses the ClawPilot dark palette and mark, includes a native app
-icon, restores an existing worker session at launch, and keeps authentication
-out of the task surface once sign-in succeeds. The one-time-code keyboard can
-be dismissed with its **Done** control or by dragging the screen, while iOS
-AutoFill remains enabled for codes received by email.
+icon, and gates every workflow behind the same session as the web app. After
+sign-in, capability-aware **Picker** and **Manager** entry points keep worker
+execution separate from management. Manager Operations can review orders,
+release a warehouse wave and assign its ready picks to an eligible worker using
+the audited Operations command boundary. The one-time-code keyboard can be
+dismissed with its **Done** control or by dragging the screen, while iOS AutoFill
+remains enabled for codes received by email.
 
 The client reads the signed worker queue from `GET /api/operations/picks` and
 submits the existing `confirm-picks` command to `POST /api/operations` with the

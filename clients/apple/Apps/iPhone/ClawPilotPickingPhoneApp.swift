@@ -10,7 +10,7 @@ struct ClawPilotPickingPhoneApp: App {
 
     var body: some Scene {
         WindowGroup {
-            PickingDashboardView(model: model)
+            ClawPilotAppShellView(model: model)
                 .sheet(isPresented: $model.showPhoneScanner) {
                     PhoneCameraScanner(
                         onBarcode: { value in Task { await model.accept(value, source: .iPhoneCamera) } },
@@ -38,11 +38,17 @@ final class PickingPhoneModel: ObservableObject {
     @Published var isRestoringSession = true
     @Published var isAuthBusy = false
     @Published var isQueueBusy = false
+    @Published var sessionProfile: ClawPilotSessionProfile?
+    @Published var managerOrders: [ManagerOrderSummary] = []
+    @Published var managerPickers: [ManagerPicker] = []
+    @Published var managerSelectedOrder: ManagerOrderDetail?
+    @Published var managerStatus = "Loading Operations orders."
+    @Published var isManagerBusy = false
     @Published var currentTask: PickTask?
     @Published var readyToConfirm = false
     @Published var showPhoneScanner = false
     @Published var hasPendingConfirmation = false
-    @Published var status = "Sign in, then load assigned picks."
+    @Published var status = "Sign in to continue."
     @Published var metaStatus = "Meta setup not checked. iPhone camera remains available."
     @Published var canRegisterMeta = false
     @Published var canRequestMetaCamera = false
@@ -64,6 +70,36 @@ final class PickingPhoneModel: ObservableObject {
         !isAuthBusy && code.count == 6 && code.allSatisfy(\.isNumber)
     }
 
+    var canUsePicker: Bool {
+        sessionProfile?.mobileCapabilities.canUsePicker == true
+    }
+
+    var canUseManager: Bool {
+        sessionProfile?.mobileCapabilities.canUseManager == true
+    }
+
+    var sessionDisplayName: String {
+        let displayName = sessionProfile?.effectiveUser.displayName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let displayName, !displayName.isEmpty { return displayName }
+        return sessionProfile?.effectiveUser.email ?? "ClawPilot user"
+    }
+
+    var sessionOrganizationName: String {
+        sessionProfile?.effectiveUser.organizationName ?? "ClawPilot workspace"
+    }
+
+    var webOrigin: URL { api.webOrigin }
+
+    var walkthroughScreen: String? {
+#if DEBUG
+        ProcessInfo.processInfo.arguments
+            .first { $0.hasPrefix("--walkthrough=") }?
+            .replacingOccurrences(of: "--walkthrough=", with: "")
+#else
+        nil
+#endif
+    }
+
     init() {
         let support = FileManager.default.urls(
             for: .applicationSupportDirectory,
@@ -81,14 +117,95 @@ final class PickingPhoneModel: ObservableObject {
         } catch {
             metaStatus = "Meta SDK unavailable. Use iPhone camera."
         }
+#if DEBUG
+        if let walkthroughScreen {
+            isRestoringSession = false
+            if walkthroughScreen != "login" {
+                sessionProfile = ClawPilotSessionProfile(
+                    user: "manager@example.com",
+                    effectiveUser: .init(
+                        email: "manager@example.com",
+                        displayName: "Alex Morgan",
+                        role: "admin",
+                        organizationName: "Suburbia Sandwich Co.",
+                        organizationRole: "admin"
+                    ),
+                    mobileCapabilities: .init(
+                        canUsePicker: true,
+                        canUseManager: true
+                    )
+                )
+                isAuthenticated = true
+            }
+            managerOrders = [
+                .init(
+                    id: "1",
+                    globalId: "gor0000001",
+                    orderNumber: "10482",
+                    customerName: "Faire Wholesale",
+                    status: "planned",
+                    warehouseName: "Main Warehouse",
+                    lineCount: 6
+                ),
+                .init(
+                    id: "2",
+                    globalId: "gor0000002",
+                    orderNumber: "10481",
+                    customerName: "Shopify Direct",
+                    status: "released",
+                    warehouseName: "Main Warehouse",
+                    lineCount: 3
+                ),
+                .init(
+                    id: "3",
+                    globalId: "gor0000003",
+                    orderNumber: "10479",
+                    customerName: "Westside Market",
+                    status: "picking",
+                    warehouseName: "Main Warehouse",
+                    lineCount: 9
+                ),
+            ]
+            managerPickers = [
+                .init(email: "jamie@example.com", displayName: "Jamie Lee"),
+                .init(email: "taylor@example.com", displayName: "Taylor Reed"),
+            ]
+            managerStatus = "Review an order to wave and assign its picks."
+            if walkthroughScreen == "assignment" {
+                managerSelectedOrder = .init(
+                    globalId: "gor0000001",
+                    orderNumber: "10482",
+                    customerName: "Faire Wholesale",
+                    status: "planned",
+                    warehouseName: "Main Warehouse",
+                    rowVersion: 8,
+                    planStatus: "planned",
+                    waveStatus: nil,
+                    pickTaskCount: 6,
+                    readyPickTaskCount: 0,
+                    pickedPickTaskCount: 0
+                )
+            }
+        }
+#endif
     }
 
     func restoreAndRefresh() async {
+        if walkthroughScreen != nil { return }
         isRestoringSession = true
         defer { isRestoringSession = false }
         await refreshMetaStatus()
         _ = try? await picking.restore()
         await updateProjection()
+        do {
+            sessionProfile = try await api.fetchSessionProfile()
+            isAuthenticated = true
+        } catch {
+            sessionProfile = nil
+            isAuthenticated = false
+            status = "Sign in to continue."
+            return
+        }
         if let pending = try? await cache.loadOutbox() {
             hasPendingConfirmation = true
             status = "A prior confirmation is pending. Replaying the same command."
@@ -102,7 +219,7 @@ final class PickingPhoneModel: ObservableObject {
                 status = "Prior confirmation remains pending; no new key was created."
             }
         } else {
-            await loadQueue(readAloud: false)
+            status = "Choose a workflow to begin."
         }
     }
 
@@ -143,15 +260,127 @@ final class PickingPhoneModel: ObservableObject {
         defer { isAuthBusy = false }
         do {
             try await api.verifyMagicCode(email: email, code: code)
+            sessionProfile = try await api.fetchSessionProfile()
             isAuthenticated = true
             codeRequested = false
             code = ""
-            status = "Signed in. Loading assigned picks."
-            await loadQueue()
+            status = "Signed in. Choose a workflow to begin."
         } catch {
             isAuthenticated = false
             status = "Sign-in failed: \(error.localizedDescription)"
         }
+    }
+
+    func preparePickerWorkflow() async {
+        guard canUsePicker else {
+            status = "Picker access is not assigned to this account."
+            return
+        }
+        await loadQueue(readAloud: false)
+    }
+
+    func loadManagerOperations() async {
+        if walkthroughScreen != nil { return }
+        guard canUseManager else {
+            managerStatus = "Manager access is not assigned to this account."
+            return
+        }
+        isManagerBusy = true
+        defer { isManagerBusy = false }
+        do {
+            async let orders = api.fetchManagerOrders()
+            async let pickers = api.fetchManagerPickers()
+            managerOrders = try await orders
+            managerPickers = try await pickers
+            managerStatus = managerOrders.isEmpty
+                ? "No Operations orders are available."
+                : "Review an order to wave and assign its picks."
+        } catch {
+            managerStatus = "Manager orders could not be loaded: \(error.localizedDescription)"
+        }
+    }
+
+    func loadManagerOrder(_ order: ManagerOrderSummary) async {
+        if walkthroughScreen != nil {
+            managerSelectedOrder = ManagerOrderDetail(
+                globalId: order.globalId,
+                orderNumber: order.orderNumber,
+                customerName: order.customerName,
+                status: order.status,
+                warehouseName: order.warehouseName,
+                rowVersion: 8,
+                planStatus: order.status == "planned" ? "planned" : "released",
+                waveStatus: order.status == "planned" ? nil : "released",
+                pickTaskCount: order.lineCount,
+                readyPickTaskCount: order.status == "planned" ? 0 : order.lineCount,
+                pickedPickTaskCount: 0
+            )
+            return
+        }
+        isManagerBusy = true
+        defer { isManagerBusy = false }
+        do {
+            managerSelectedOrder = try await api.fetchManagerOrderDetail(order.globalId)
+            managerStatus = "Choose an eligible picker before sending warehouse work."
+        } catch {
+            managerSelectedOrder = nil
+            managerStatus = "Order details could not be loaded: \(error.localizedDescription)"
+        }
+    }
+
+    func releaseOrAssignManagerOrder(
+        assignedTo: String,
+        reason: String
+    ) async -> Bool {
+        guard let order = managerSelectedOrder else { return false }
+        isManagerBusy = true
+        defer { isManagerBusy = false }
+        do {
+            if order.status == "planned" {
+                try await api.releaseManagerOrder(
+                    order,
+                    assignedTo: assignedTo,
+                    reason: reason
+                )
+                managerStatus = "Order waved and assigned to \(assignedTo)."
+            } else if order.status == "released" {
+                try await api.assignManagerOrder(
+                    order,
+                    assignedTo: assignedTo,
+                    reason: reason
+                )
+                managerStatus = "Ready picks assigned to \(assignedTo)."
+            } else {
+                managerStatus = "Only planned or released orders can be assigned here."
+                return false
+            }
+            managerSelectedOrder = nil
+            await loadManagerOperations()
+            return true
+        } catch {
+            managerStatus = "Warehouse assignment failed: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func logout() async {
+        do {
+            try await api.logout()
+        } catch {
+            status = "Sign out failed: \(error.localizedDescription)"
+            return
+        }
+        await WebSessionBridge.clearCookies()
+        sessionProfile = nil
+        isAuthenticated = false
+        codeRequested = false
+        code = ""
+        currentTask = nil
+        readyToConfirm = false
+        status = "Signed out."
+        managerOrders = []
+        managerPickers = []
+        managerSelectedOrder = nil
     }
 
     func loadQueue(readAloud: Bool = true) async {
