@@ -12,6 +12,10 @@ test('wearable queue is signed-worker scoped and read only', () => {
   assert.match(persistence, /orders\.status = 'released'/)
   assert.match(persistence, /plan\.status = 'released'/)
   assert.match(persistence, /wave\.status = 'released'/)
+  assert.match(persistence, /operations_product_channel_states channel/)
+  assert.match(persistence, /channel\.provider_barcode/)
+  assert.match(persistence, /channel\.provider_sku = line\.channel_sku/)
+  assert.doesNotMatch(persistence, /line\.barcode_snapshot/)
   assert.doesNotMatch(persistence, /\b(?:INSERT|UPDATE|DELETE)\b/)
 })
 

@@ -50,7 +50,7 @@ export async function readAssignedWearablePickQueueFromPostgres(input: {
             product.reference_code AS product_global_id,
             product.name AS product_name,
             line.channel_sku,
-            line.barcode_snapshot,
+            product_channel.provider_barcode AS barcode_snapshot,
             location.code AS location_code,
             pick.quantity::text
      FROM operations_pick_tasks pick
@@ -69,6 +69,19 @@ export async function readAssignedWearablePickQueueFromPostgres(input: {
      JOIN operations_orders orders
        ON orders.organization_id = plan.organization_id
       AND orders.id = plan.order_id
+     LEFT JOIN LATERAL (
+       SELECT channel.provider_barcode
+       FROM operations_product_channel_states channel
+       WHERE channel.organization_id = line.organization_id
+         AND channel.integration_account_id = orders.integration_account_id
+         AND channel.pipeline_id = line.pipeline_id
+         AND channel.product_id = line.product_id
+         AND channel.provider_sku = line.channel_sku
+         AND channel.provider_active = true
+         AND channel.provider_barcode IS NOT NULL
+       ORDER BY channel.observed_at DESC, channel.id DESC
+       LIMIT 1
+     ) product_channel ON true
      JOIN operations_waves wave
        ON wave.organization_id = pick.organization_id
       AND wave.id = pick.wave_id
@@ -131,4 +144,3 @@ export async function readAssignedWearablePickQueueFromPostgres(input: {
     orders: [...orderById.values()],
   }
 }
-
