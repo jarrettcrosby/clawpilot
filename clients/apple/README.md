@@ -27,10 +27,13 @@ contains the Watch companion. The readiness command prints only whether each
 build-owned setting is present; it never prints configured values or
 credentials.
 
-The source-controlled project pins the development server, development
-universal link/associated domain, Apple team, and phone/watch bundle
-identifiers. Signed
-pilot builds keep these Meta credentials in the ignored
+The source-controlled project pins the development server, HTTPS fallback
+associated domain, Meta DAT callback scheme, Apple team, and phone/watch bundle
+identifiers. For DAT 0.9, the Meta Wearables Developer Center iOS
+**Universal link** field must exactly match the app's callback value
+`clawpilot-meta://`; despite the portal label, this is the custom URL scheme
+used by Meta AI to return to the app. Signed pilot builds keep these Meta
+credentials in the ignored
 `Config/Local.xcconfig` file:
 
 - `CLAWPILOT_META_APP_ID`

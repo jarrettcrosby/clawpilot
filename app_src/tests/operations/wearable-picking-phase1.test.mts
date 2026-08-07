@@ -47,3 +47,13 @@ test('Meta universal-link metadata and callback remain public without exposing a
   assert.match(association, /'\/': '\/ios\*'/)
   assert.doesNotMatch(callback, /requireRequestUser|resolveRequestSession|operations|pipeline/)
 })
+
+test('Meta DAT callback uses the app URL scheme and camera access requires registration', () => {
+  const project = read('../clients/apple/project.yml')
+  const app = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+  assert.match(project, /CLAWPILOT_META_URL_SCHEME: "clawpilot-meta"/)
+  assert.match(project, /CLAWPILOT_META_APP_LINK_SCHEME: "clawpilot-meta:\/\/"/)
+  assert.match(app, /\.onOpenURL \{ url in Task \{ await model\.handleMetaURL\(url\) \} \}/)
+  assert.match(app, /guard MetaWearablesAppBridge\.isRegistered else/)
+  assert.match(app, /\.disabled\(!model\.canRequestMetaCamera\)/)
+})

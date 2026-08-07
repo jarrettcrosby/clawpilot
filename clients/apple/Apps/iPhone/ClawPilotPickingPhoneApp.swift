@@ -5,6 +5,7 @@ import ClawPilotPickingCore
 
 @main
 struct ClawPilotPickingPhoneApp: App {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = PickingPhoneModel()
 
     var body: some Scene {
@@ -55,7 +56,9 @@ struct ClawPilotPickingPhoneApp: App {
                         Text(model.metaStatus).font(.caption)
                         HStack {
                             Button("Register") { Task { await model.registerMeta() } }
+                                .disabled(!model.canRegisterMeta)
                             Button("Camera access") { Task { await model.requestMetaCamera() } }
+                                .disabled(!model.canRequestMetaCamera)
                         }
                     }
 
@@ -69,6 +72,10 @@ struct ClawPilotPickingPhoneApp: App {
                     )
                 }
                 .onOpenURL { url in Task { await model.handleMetaURL(url) } }
+                .onChange(of: scenePhase) { _, phase in
+                    guard phase == .active else { return }
+                    Task { await model.refreshMetaStatus() }
+                }
                 .task { await model.restoreAndRefresh() }
             }
         }
@@ -86,6 +93,8 @@ final class PickingPhoneModel: ObservableObject {
     @Published var hasPendingConfirmation = false
     @Published var status = "Sign in, then load assigned picks."
     @Published var metaStatus = "Meta setup not checked. iPhone camera remains available."
+    @Published var canRegisterMeta = false
+    @Published var canRequestMetaCamera = false
 
     private let cache: DurablePickCache
     private let api: PickingAPIClient
@@ -115,6 +124,7 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func restoreAndRefresh() async {
+        await refreshMetaStatus()
         _ = try? await picking.restore()
         await updateProjection()
         if let pending = try? await cache.loadOutbox() {
@@ -215,20 +225,74 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func registerMeta() async {
-        do { try await MetaWearablesAppBridge.startRegistration(); metaStatus = "Meta registration started." }
+        guard canRegisterMeta else {
+            await refreshMetaStatus()
+            return
+        }
+        do {
+            try await MetaWearablesAppBridge.startRegistration()
+            metaStatus = "Meta registration started. Approve it in Meta AI."
+            canRegisterMeta = false
+        }
         catch { metaStatus = "Meta registration failed: \(error.localizedDescription)" }
     }
 
     func requestMetaCamera() async {
+        guard MetaWearablesAppBridge.isRegistered else {
+            metaStatus = "Register this app with Meta before requesting camera access."
+            await refreshMetaStatus()
+            return
+        }
         do {
             metaStatus = try await MetaWearablesAppBridge.requestCameraPermission()
                 ? "Meta camera access granted." : "Meta camera access denied."
         } catch { metaStatus = "Meta camera request failed: \(error.localizedDescription)" }
+        await refreshMetaStatus()
     }
 
     func handleMetaURL(_ url: URL) async {
-        do { _ = try await MetaWearablesAppBridge.handleOpenURL(url); metaStatus = "Meta setup callback received." }
-        catch { metaStatus = "Meta setup callback failed." }
+        do {
+            let handled = try await MetaWearablesAppBridge.handleOpenURL(url)
+            metaStatus = handled ? "Meta setup callback received." : "The callback was not recognized by Meta."
+        } catch {
+            metaStatus = "Meta setup callback failed: \(error.localizedDescription)"
+        }
+        await refreshMetaStatus()
+    }
+
+    func refreshMetaStatus() async {
+        let snapshot = await MetaWearablesAppBridge.statusSnapshot()
+        let deviceLabel = snapshot.connectedDeviceCount == 1
+            ? "1 glasses connection"
+            : "\(snapshot.connectedDeviceCount) glasses connections"
+        switch snapshot.registrationState {
+        case .unavailable:
+            canRegisterMeta = false
+            canRequestMetaCamera = false
+            metaStatus = "Meta registration is unavailable. Confirm Meta AI is installed."
+        case .available:
+            canRegisterMeta = true
+            canRequestMetaCamera = false
+            metaStatus = "Ready to register with Meta · \(deviceLabel)."
+        case .registering:
+            canRegisterMeta = false
+            canRequestMetaCamera = false
+            metaStatus = "Waiting for Meta AI registration approval · \(deviceLabel)."
+        case .registered:
+            canRegisterMeta = false
+            canRequestMetaCamera = snapshot.connectedDeviceCount > 0
+            let permissionLabel: String
+            switch snapshot.cameraPermissionGranted {
+            case true: permissionLabel = "camera granted"
+            case false: permissionLabel = "camera not granted"
+            case nil: permissionLabel = "camera status unavailable"
+            }
+            metaStatus = "Registered with Meta · \(permissionLabel) · \(deviceLabel)."
+        @unknown default:
+            canRegisterMeta = false
+            canRequestMetaCamera = false
+            metaStatus = "Unknown Meta registration state. iPhone camera remains available."
+        }
     }
 
     func readInstruction() {

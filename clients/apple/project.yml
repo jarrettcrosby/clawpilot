@@ -17,7 +17,7 @@ settings:
     CLAWPILOT_WATCH_BUNDLE_IDENTIFIER: "com.eigenracing.ios.picking.watch"
     CLAWPILOT_ASSOCIATED_DOMAIN: "dev.aiapp.eigenracing.com"
     CLAWPILOT_META_URL_SCHEME: "clawpilot-meta"
-    CLAWPILOT_META_APP_LINK_SCHEME: "https://dev.aiapp.eigenracing.com/ios"
+    CLAWPILOT_META_APP_LINK_SCHEME: "clawpilot-meta://"
     CLAWPILOT_APPLE_DEVELOPMENT_TEAM: "CN2T77JHQQ"
     DEVELOPMENT_TEAM: $(CLAWPILOT_APPLE_DEVELOPMENT_TEAM)
 

@@ -8,13 +8,39 @@ import Vision
 enum MetaWearablesAppBridge {
     static func configure() throws { try Wearables.configure() }
     static var registrationState: RegistrationState { Wearables.shared.registrationState }
+    static var isRegistered: Bool { registrationState == .registered }
     static func startRegistration() async throws { try await Wearables.shared.startRegistration() }
+    static func statusSnapshot() async -> MetaWearablesStatusSnapshot {
+        let state = registrationState
+        let connectedDeviceCount = Wearables.shared.devices.reduce(into: 0) { count, identifier in
+            guard let device = Wearables.shared.deviceForIdentifier(identifier) else { return }
+            if device.linkState == .connected { count += 1 }
+        }
+        let cameraPermission: Bool?
+        if state == .registered {
+            let status = try? await Wearables.shared.checkPermissionStatus(.camera)
+            cameraPermission = status.map { $0 == .granted }
+        } else {
+            cameraPermission = nil
+        }
+        return MetaWearablesStatusSnapshot(
+            registrationState: state,
+            cameraPermissionGranted: cameraPermission,
+            connectedDeviceCount: connectedDeviceCount
+        )
+    }
     static func requestCameraPermission() async throws -> Bool {
         try await Wearables.shared.requestPermission(.camera) == .granted
     }
     static func handleOpenURL(_ url: URL) async throws -> Bool {
         try await Wearables.shared.handleUrl(url)
     }
+}
+
+struct MetaWearablesStatusSnapshot {
+    let registrationState: RegistrationState
+    let cameraPermissionGranted: Bool?
+    let connectedDeviceCount: Int
 }
 
 enum MetaScanError: Error, Sendable {
