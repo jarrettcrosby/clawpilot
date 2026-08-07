@@ -58,7 +58,6 @@ import {
   testCarrierSandboxShipmentRate,
 } from '@/lib/integrations/carrierIntegrations'
 import type { OperationsCapabilities } from '@/lib/operations/authorization'
-import { permissionsForRole, type AppUserRole } from '@/lib/users'
 import type {
   Address,
   CommerceCustomerIdentity,
@@ -706,11 +705,15 @@ async function requireEligibleOperationsPicker(
   organizationId: string,
   pickerEmail: string,
 ) {
-  const result = await client.query<{
-    role: AppUserRole
-    permissions: unknown
-  }>(
-    `SELECT membership.role, membership.permissions
+  const result = await client.query<{ eligible: boolean }>(
+    `SELECT (
+       membership.role = 'owner'
+       OR (
+         COALESCE((membership.permissions->>'viewOperations')::boolean, false)
+         AND COALESCE((membership.permissions->>'manageOperations')::boolean, false)
+         AND COALESCE((membership.permissions->>'executeWarehouse')::boolean, false)
+       )
+     ) AS eligible
      FROM app_user_organization_memberships membership
      JOIN app_users app_user ON app_user.email = membership.user_email
      WHERE membership.organization_id = $1::uuid
@@ -728,16 +731,7 @@ async function requireEligibleOperationsPicker(
       409,
     )
   }
-  const permissions = permissionsForRole(
-    membership.role,
-    membership.permissions,
-  )
-  const owner = membership.role === 'owner'
-  if (!owner && (
-    !permissions.viewOperations
-    || !permissions.manageOperations
-    || !permissions.executeWarehouse
-  )) {
+  if (!membership.eligible) {
     throw new OperationsRequestError(
       'OPERATIONS_PICKER_ACCESS_REQUIRED',
       'The selected worker needs Operations view, management, and warehouse execution permission',
@@ -11127,7 +11121,8 @@ export async function releaseOperationsOrderFromPostgres(input: {
   const orderGlobalId = String(input.orderGlobalId || '').trim()
   const reason = String(input.reason || '').trim()
   const idempotencyKey = String(input.idempotencyKey || '').trim()
-  const assignedTo = String(input.assignedTo || actorEmail).trim().toLowerCase()
+  const explicitAssignedTo = String(input.assignedTo || '').trim().toLowerCase()
+  const assignedTo = explicitAssignedTo || actorEmail
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
   if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
@@ -11176,7 +11171,9 @@ export async function releaseOperationsOrderFromPostgres(input: {
           409,
         )
       }
-      await requireEligibleOperationsPicker(client, organizationId, assignedTo)
+      if (explicitAssignedTo) {
+        await requireEligibleOperationsPicker(client, organizationId, assignedTo)
+      }
 
       const orderResult = await client.query<OrderIdentityRow & {
         source_provider: string
