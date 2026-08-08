@@ -20,6 +20,26 @@ type WearablePickRow = QueryResultRow & {
   quantity: string
 }
 
+type PickerPerformanceRow = QueryResultRow & {
+  email: string
+  display_name: string | null
+  units_today: string
+  units_seven_days: string
+  orders_seven_days: string
+  active_seconds_today: string
+  active_seconds_seven_days: string
+}
+
+export type PickerPerformanceMetric = {
+  email: string
+  displayName: string | null
+  unitsToday: number
+  unitsSevenDays: number
+  ordersSevenDays: number
+  uphToday: number | null
+  uphSevenDays: number | null
+}
+
 function requiredIdentity(value: string, label: string): string {
   const normalized = String(value || '').trim()
   if (!normalized) throw new Error(`Wearable picking ${label} is unavailable`)
@@ -143,4 +163,85 @@ export async function readAssignedWearablePickQueueFromPostgres(input: {
     generatedAt: new Date().toISOString(),
     orders: [...orderById.values()],
   }
+}
+
+function uph(units: number, activeSeconds: number): number | null {
+  if (!Number.isFinite(units) || units <= 0 || !Number.isFinite(activeSeconds) || activeSeconds <= 0) {
+    return null
+  }
+  return Math.round((units * 3600 / activeSeconds) * 10) / 10
+}
+
+export async function readPickerPerformanceFromPostgres(input: {
+  organizationId: string
+  pickerEmail?: string | null
+}): Promise<PickerPerformanceMetric[]> {
+  const organizationId = requiredIdentity(input.organizationId, 'organization')
+  const pickerEmail = String(input.pickerEmail || '').trim().toLowerCase() || null
+  const result = await query<PickerPerformanceRow>(
+    `WITH completed_orders AS (
+       SELECT lower(pick.assigned_to) AS email,
+              plan.order_id,
+              sum(pick.picked_quantity)::numeric AS units,
+              min(COALESCE(pick.assigned_at, pick.created_at)) AS assigned_at,
+              max(pick.picked_at) AS completed_at
+       FROM operations_pick_tasks pick
+       JOIN operations_fulfillment_plans plan
+         ON plan.organization_id = pick.organization_id
+        AND plan.id = pick.plan_id
+       WHERE pick.organization_id = $1::uuid
+         AND pick.status = 'picked'
+         AND pick.assigned_to IS NOT NULL
+         AND pick.picked_quantity IS NOT NULL
+         AND pick.picked_at >= now() - interval '7 days'
+         AND ($2::text IS NULL OR lower(pick.assigned_to) = $2)
+       GROUP BY lower(pick.assigned_to), plan.order_id
+     ), picker_totals AS (
+       SELECT email,
+              COALESCE(sum(units) FILTER (
+                WHERE completed_at >= date_trunc('day', now())
+              ), 0)::text AS units_today,
+              COALESCE(sum(units), 0)::text AS units_seven_days,
+              count(*)::text AS orders_seven_days,
+              COALESCE(sum(GREATEST(
+                EXTRACT(epoch FROM completed_at - assigned_at), 60
+              )) FILTER (
+                WHERE completed_at >= date_trunc('day', now())
+              ), 0)::text AS active_seconds_today,
+              COALESCE(sum(GREATEST(
+                EXTRACT(epoch FROM completed_at - assigned_at), 60
+              )), 0)::text AS active_seconds_seven_days
+       FROM completed_orders
+       GROUP BY email
+     )
+     SELECT totals.email,
+            app_user.display_name,
+            totals.units_today,
+            totals.units_seven_days,
+            totals.orders_seven_days,
+            totals.active_seconds_today,
+            totals.active_seconds_seven_days
+     FROM picker_totals totals
+     JOIN app_users app_user ON lower(app_user.email) = totals.email
+     ORDER BY (totals.units_seven_days::numeric * 3600
+               / NULLIF(totals.active_seconds_seven_days::numeric, 0)) DESC NULLS LAST,
+              lower(COALESCE(app_user.display_name, totals.email))`,
+    [organizationId, pickerEmail],
+  )
+
+  return result.rows.map((row) => {
+    const unitsToday = Number(row.units_today)
+    const unitsSevenDays = Number(row.units_seven_days)
+    const activeSecondsToday = Number(row.active_seconds_today)
+    const activeSecondsSevenDays = Number(row.active_seconds_seven_days)
+    return {
+      email: row.email,
+      displayName: row.display_name,
+      unitsToday,
+      unitsSevenDays,
+      ordersSevenDays: Number(row.orders_seven_days),
+      uphToday: uph(unitsToday, activeSecondsToday),
+      uphSevenDays: uph(unitsSevenDays, activeSecondsSevenDays),
+    }
+  })
 }

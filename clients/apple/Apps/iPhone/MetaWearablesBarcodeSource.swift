@@ -134,6 +134,7 @@ actor MetaWearablesBarcodeSource {
     }
 
     func stop() {
+        continuation.finish()
         guard active else { return }
         active = false
         streamTokens.clear()

@@ -11,9 +11,19 @@ icon, and gates every workflow behind the same session as the web app. After
 sign-in, capability-aware **Picker** and **Manager** entry points keep worker
 execution separate from management. Manager Operations can review orders,
 release a warehouse wave and assign its ready picks to an eligible worker using
-the audited Operations command boundary. The one-time-code keyboard can be
+the audited Operations command boundary. Managers can open **People** to invite
+a worker and grant the bounded **Picker access** permission; picker accounts need
+Operations view and warehouse execution, not Operations management. Both roles
+see assignment-to-audited-confirmation UPH backed by pick-task assignment and
+completion timestamps. The one-time-code keyboard can be
 dismissed with its **Done** control or by dragging the screen, while iOS AutoFill
 remains enabled for codes received by email.
+
+The picker screen explains the three-step operating loop. When one registered
+device is connected, **Start Meta scan** opens a live glasses camera stream and
+reads one barcode locally without saving a photo. Returning from Meta AI starts
+a bounded reconnection poll; **Reconnect glasses** retries it without requiring
+the worker to leave ClawPilot. The iPhone camera remains an explicit fallback.
 
 The client reads the signed worker queue from `GET /api/operations/picks` and
 submits the existing `confirm-picks` command to `POST /api/operations` with the

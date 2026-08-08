@@ -23,8 +23,8 @@ test('wearable route keeps existing ClawPilot authorization boundary', () => {
   const route = read('app/api/operations/picks/route.ts')
   assert.match(route, /requireRequestUser\(req\)/)
   assert.match(route, /capabilities\.canView/)
-  assert.match(route, /capabilities\.canManage/)
   assert.match(route, /capabilities\.canExecute/)
+  assert.doesNotMatch(route, /!capabilities\.canManage/)
   assert.match(route, /Cache-Control': 'private, no-store'/)
 })
 
@@ -92,6 +92,25 @@ test('mobile manager assignment reuses audited Operations concurrency controls',
   assert.match(persistence, /eventType: 'operations\.pick\.assigned'/)
   assert.match(pickers, /operationsCapabilities\(actor\)/)
   assert.match(pickers, /permissions\.executeWarehouse/)
+})
+
+test('picker setup and UPH use durable Operations evidence', () => {
+  const session = read('app/api/auth/session/route.ts')
+  const queue = read('app/api/operations/picks/route.ts')
+  const performance = read('app/api/operations/picker-performance/route.ts')
+  const persistence = read('lib/persistence/wearablePicking.ts')
+  const migration = read('../db/migrations/0256_operations_picker_performance.sql')
+  const people = read('components/settings/UserAccessDialog.tsx')
+  assert.match(session, /operations\.canView && operations\.canExecute/)
+  assert.match(queue, /!capabilities\.canView \|\| !capabilities\.canExecute/)
+  assert.match(performance, /readPickerPerformanceFromPostgres/)
+  assert.match(performance, /managerScope \? null : actor\.email/)
+  assert.match(persistence, /pick\.assigned_at/)
+  assert.match(persistence, /pick\.picked_at/)
+  assert.match(persistence, /EXTRACT\(epoch FROM completed_at - assigned_at\)/)
+  assert.match(migration, /ADD COLUMN IF NOT EXISTS assigned_at timestamptz/)
+  assert.match(people, /label: 'Picker access'/)
+  assert.match(people, /next\.viewOperations = true/)
 })
 
 test('mobile app gates workflows behind the shared ClawPilot session', () => {

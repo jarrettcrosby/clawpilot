@@ -403,6 +403,7 @@ private struct ManagerModuleView: View {
     private let modules = [
         ManagerModule(id: "dashboard", title: "Dashboard", detail: "Workspace overview", icon: "rectangle.3.group.fill"),
         ManagerModule(id: "operations", title: "Operations", detail: "Orders and warehouse control", icon: "shippingbox.fill"),
+        ManagerModule(id: "people", title: "People", detail: "Invite workers and grant picker access", icon: "person.2.badge.gearshape.fill"),
         ManagerModule(id: "projects", title: "Projects", detail: "Boards and active work", icon: "checklist"),
         ManagerModule(id: "pipeline", title: "Pipeline", detail: "Commercial pipeline", icon: "chart.bar.xaxis"),
         ManagerModule(id: "crm", title: "CRM", detail: "Customers and contacts", icon: "person.2.fill"),
@@ -413,31 +414,34 @@ private struct ManagerModuleView: View {
 
     var body: some View {
         ScrollView {
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 14) {
-                ForEach(modules) { module in
-                    NavigationLink(value: module) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Image(systemName: module.icon)
-                                .font(.system(size: 23, weight: .semibold))
-                                .foregroundStyle(AppShellTheme.primary)
-                                .frame(width: 44, height: 44)
-                                .background(AppShellTheme.primary.opacity(0.1), in: RoundedRectangle(cornerRadius: 13))
-                            Text(module.title)
-                                .font(.headline)
-                                .foregroundStyle(AppShellTheme.text)
-                            Text(module.detail)
-                                .font(.caption)
-                                .foregroundStyle(AppShellTheme.muted)
-                                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(spacing: 16) {
+                managerQuickStart
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 14) {
+                    ForEach(modules) { module in
+                        NavigationLink(value: module) {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Image(systemName: module.icon)
+                                    .font(.system(size: 23, weight: .semibold))
+                                    .foregroundStyle(AppShellTheme.primary)
+                                    .frame(width: 44, height: 44)
+                                    .background(AppShellTheme.primary.opacity(0.1), in: RoundedRectangle(cornerRadius: 13))
+                                Text(module.title)
+                                    .font(.headline)
+                                    .foregroundStyle(AppShellTheme.text)
+                                Text(module.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(AppShellTheme.muted)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .padding(16)
+                            .frame(maxWidth: .infinity, minHeight: 160, alignment: .topLeading)
+                            .background(AppShellTheme.surface, in: RoundedRectangle(cornerRadius: 19))
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 19).stroke(AppShellTheme.outline, lineWidth: 1)
+                            }
                         }
-                        .padding(16)
-                        .frame(maxWidth: .infinity, minHeight: 160, alignment: .topLeading)
-                        .background(AppShellTheme.surface, in: RoundedRectangle(cornerRadius: 19))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 19).stroke(AppShellTheme.outline, lineWidth: 1)
-                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
             }
             .padding(18)
@@ -453,6 +457,21 @@ private struct ManagerModuleView: View {
             }
         }
     }
+
+    private var managerQuickStart: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Manager quick start", systemImage: "checklist.checked")
+                .font(.headline)
+                .foregroundStyle(AppShellTheme.text)
+            Text("1. Open People to invite a worker and enable Picker access.\n2. Open Operations and select a planned order.\n3. Choose the picker, then wave and assign the order.")
+                .font(.subheadline)
+                .foregroundStyle(AppShellTheme.muted)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(AppShellTheme.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
+    }
 }
 
 private struct ManagerPickingOperationsView: View {
@@ -462,6 +481,7 @@ private struct ManagerPickingOperationsView: View {
         ScrollView {
             LazyVStack(spacing: 13) {
                 workflowExplanation
+                pickerPerformance
 
                 if model.isManagerBusy && model.managerOrders.isEmpty {
                     ProgressView("Loading orders")
@@ -532,6 +552,51 @@ private struct ManagerPickingOperationsView: View {
         }
         .padding(16)
         .background(AppShellTheme.mint.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private var pickerPerformance: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Picker performance")
+                        .font(.headline)
+                        .foregroundStyle(AppShellTheme.text)
+                    Text("Last 7 days · assignment to audited confirmation")
+                        .font(.caption)
+                        .foregroundStyle(AppShellTheme.muted)
+                }
+                Spacer()
+                Image(systemName: "gauge.with.dots.needle.67percent")
+                    .foregroundStyle(AppShellTheme.mint)
+            }
+            if model.pickerPerformance.isEmpty {
+                Text("UPH appears after assigned orders are confirmed.")
+                    .font(.subheadline)
+                    .foregroundStyle(AppShellTheme.muted)
+            } else {
+                ForEach(model.pickerPerformance.prefix(5)) { metric in
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(metric.displayName ?? metric.email)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(AppShellTheme.text)
+                            Text("\(metric.ordersSevenDays) orders · \(metric.unitsSevenDays.formatted(.number.precision(.fractionLength(0...1)))) units")
+                                .font(.caption2)
+                                .foregroundStyle(AppShellTheme.muted)
+                        }
+                        Spacer()
+                        Text(metric.uphSevenDays?.formatted(.number.precision(.fractionLength(1))) ?? "—")
+                            .font(.headline)
+                            .foregroundStyle(AppShellTheme.mint)
+                        Text("UPH")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(AppShellTheme.muted)
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .background(AppShellTheme.surface, in: RoundedRectangle(cornerRadius: 18))
     }
 
     private func orderCard(_ order: ManagerOrderSummary) -> some View {
@@ -616,6 +681,15 @@ private struct ManagerOrderAssignmentView: View {
                         || reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         || !["planned", "released"].contains(order.status)
                     )
+
+                    Button {
+                        dismiss()
+                    } label: {
+                        Label("Back to orders without changes", systemImage: "xmark.circle")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(ShellSecondaryButtonStyle())
+                    .disabled(model.isManagerBusy)
                 }
                 .padding(20)
             }
@@ -626,7 +700,15 @@ private struct ManagerOrderAssignmentView: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Close") { dismiss() }
                 }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .accessibilityLabel("Close order without changes")
+                    .disabled(model.isManagerBusy)
+                }
             }
+            .interactiveDismissDisabled(model.isManagerBusy)
             .onAppear {
                 if pickerEmail.isEmpty { pickerEmail = model.managerPickers.first?.email ?? "" }
             }
@@ -678,6 +760,15 @@ private struct ManagerOrderAssignmentView: View {
             .frame(minHeight: 52)
             .background(AppShellTheme.raised, in: RoundedRectangle(cornerRadius: 13))
 
+            if model.managerPickers.isEmpty {
+                Label(
+                    "No eligible pickers. Close this order, open People, invite the worker, and enable View operations plus Picker access.",
+                    systemImage: "person.crop.circle.badge.exclamationmark"
+                )
+                .font(.caption)
+                .foregroundStyle(AppShellTheme.muted)
+            }
+
             TextField("Audit reason", text: $reason, axis: .vertical)
                 .lineLimit(2...4)
                 .shellInputSurface()
@@ -724,7 +815,12 @@ private struct ManagerWebModuleView: View {
 
     private var moduleURL: URL {
         var components = URLComponents(url: origin, resolvingAgainstBaseURL: false)!
-        components.fragment = module.id
+        if module.id == "people" {
+            components.queryItems = [URLQueryItem(name: "settings", value: "people")]
+            components.fragment = "dashboard"
+        } else {
+            components.fragment = module.id
+        }
         return components.url!
     }
 }
@@ -806,5 +902,20 @@ private struct ShellPrimaryButtonStyle: ButtonStyle {
             .frame(minHeight: 52)
             .background(AppShellTheme.primary, in: Capsule())
             .opacity(isEnabled ? (configuration.isPressed ? 0.8 : 1) : 0.45)
+    }
+}
+
+private struct ShellSecondaryButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(AppShellTheme.primary)
+            .padding(.horizontal, 16)
+            .frame(minHeight: 50)
+            .background(AppShellTheme.raised, in: Capsule())
+            .overlay { Capsule().stroke(AppShellTheme.outline, lineWidth: 1) }
+            .opacity(isEnabled ? (configuration.isPressed ? 0.75 : 1) : 0.45)
     }
 }

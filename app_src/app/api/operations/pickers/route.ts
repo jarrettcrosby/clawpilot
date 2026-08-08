@@ -59,7 +59,6 @@ export async function GET(req: NextRequest) {
       const permissions = permissionsForRole(row.role, row.permissions)
       const eligible = row.role === 'owner' || (
         permissions.viewOperations
-        && permissions.manageOperations
         && permissions.executeWarehouse
       )
       return eligible ? [{

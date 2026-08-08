@@ -75,7 +75,7 @@ export async function GET(req: NextRequest) {
         expiresAt: session.impersonationExpiresAt,
       } : { active: false },
       mobileCapabilities: {
-        canUsePicker: operations.canView && operations.canManage && operations.canExecute,
+        canUsePicker: operations.canView && operations.canExecute,
         canUseManager: managerRole || operations.canManage,
       },
       isRootAdmin: isRootAppOwner(authenticatedUser),

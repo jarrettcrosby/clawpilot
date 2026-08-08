@@ -29,11 +29,11 @@ export async function GET(req: NextRequest) {
     }
     const actor = await requireRequestUser(req)
     const capabilities = operationsCapabilities(actor)
-    if (!capabilities.canView || !capabilities.canManage || !capabilities.canExecute) {
+    if (!capabilities.canView || !capabilities.canExecute) {
       return json({
         ok: false,
         code: 'OPERATIONS_WEARABLE_PICKING_REQUIRED',
-        error: 'Wearable picking requires Operations view, management, and warehouse execution permission',
+        error: 'Wearable picking requires Operations view and warehouse execution permission',
       }, 403)
     }
     const queue = await readAssignedWearablePickQueueFromPostgres({
@@ -59,4 +59,3 @@ export async function GET(req: NextRequest) {
     }, 500)
   }
 }
-

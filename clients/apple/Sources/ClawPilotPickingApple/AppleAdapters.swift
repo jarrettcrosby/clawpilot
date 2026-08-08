@@ -205,6 +205,35 @@ public struct ManagerPicker: Decodable, Equatable, Identifiable, Sendable {
     }
 }
 
+public struct PickerPerformanceMetric: Decodable, Equatable, Identifiable, Sendable {
+    public var id: String { email }
+    public let email: String
+    public let displayName: String?
+    public let unitsToday: Double
+    public let unitsSevenDays: Double
+    public let ordersSevenDays: Int
+    public let uphToday: Double?
+    public let uphSevenDays: Double?
+
+    public init(
+        email: String,
+        displayName: String?,
+        unitsToday: Double,
+        unitsSevenDays: Double,
+        ordersSevenDays: Int,
+        uphToday: Double?,
+        uphSevenDays: Double?
+    ) {
+        self.email = email
+        self.displayName = displayName
+        self.unitsToday = unitsToday
+        self.unitsSevenDays = unitsSevenDays
+        self.ordersSevenDays = ordersSevenDays
+        self.uphToday = uphToday
+        self.uphSevenDays = uphSevenDays
+    }
+}
+
 public actor PickingAPIClient {
     private struct QueueEnvelope: Decodable {
         let ok: Bool
@@ -234,6 +263,13 @@ public actor PickingAPIClient {
     private struct PickerEnvelope: Decodable {
         let ok: Bool
         let pickers: [ManagerPicker]?
+        let code: String?
+        let error: String?
+    }
+
+    private struct PickerPerformanceEnvelope: Decodable {
+        let ok: Bool
+        let metrics: [PickerPerformanceMetric]?
         let code: String?
         let error: String?
     }
@@ -372,6 +408,22 @@ public actor PickingAPIClient {
             )
         }
         return pickers
+    }
+
+    public func fetchPickerPerformance() async throws -> [PickerPerformanceMetric] {
+        var request = URLRequest(url: try endpoint("/api/operations/picker-performance"))
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await session.data(for: request)
+        try validateHTTP(response)
+        let envelope = try decoder.decode(PickerPerformanceEnvelope.self, from: data)
+        guard envelope.ok, let metrics = envelope.metrics else {
+            throw PickingAPIError.rejected(
+                code: envelope.code ?? "OPERATIONS_PERFORMANCE_FAILED",
+                message: envelope.error ?? "Picker performance is unavailable"
+            )
+        }
+        return metrics
     }
 
     public func releaseManagerOrder(

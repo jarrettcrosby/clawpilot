@@ -37,6 +37,8 @@ struct PickingDashboardView: View {
                         signInCard
                     }
 
+                    pickerGuideCard
+                    pickerPerformanceCard
                     assignedPickCard
                     metaCard
                     statusNotice
@@ -250,6 +252,47 @@ struct PickingDashboardView: View {
         }
     }
 
+    private var pickerGuideCard: some View {
+        dashboardCard {
+            VStack(alignment: .leading, spacing: 14) {
+                sectionHeading(
+                    icon: "list.number",
+                    title: "How picking works",
+                    subtitle: "The iPhone controls the workflow; the glasses supply the camera."
+                )
+                guideStep(1, "Receive work", "A manager waves an order and assigns it to you.")
+                guideStep(2, "Scan the product", "Tap Start Meta scan, then look at the barcode. ClawPilot reads the live glasses camera; it does not take or save a photo.")
+                guideStep(3, "Confirm the order", "After every product matches, confirm once to write the audited result to ClawPilot.")
+            }
+        }
+    }
+
+    private var pickerPerformanceCard: some View {
+        dashboardCard {
+            VStack(alignment: .leading, spacing: 13) {
+                sectionHeading(
+                    icon: "gauge.with.dots.needle.67percent",
+                    title: "My picking pace",
+                    subtitle: "Assignment-to-confirmation performance"
+                )
+                if let performance = model.ownPickerPerformance {
+                    HStack(spacing: 10) {
+                        performanceMetric("Today UPH", value: formattedUPH(performance.uphToday))
+                        performanceMetric("7-day UPH", value: formattedUPH(performance.uphSevenDays))
+                        performanceMetric("Today units", value: performance.unitsToday.formatted(.number.precision(.fractionLength(0...1))))
+                    }
+                    Text("UPH uses completed units divided by the time from assignment to audited order confirmation. Idle time while an order is assigned is included.")
+                        .font(.caption2)
+                        .foregroundStyle(PickingTheme.muted)
+                } else {
+                    Text("Your UPH will appear after your first assigned order is confirmed.")
+                        .font(.subheadline)
+                        .foregroundStyle(PickingTheme.muted)
+                }
+            }
+        }
+    }
+
     private func currentTaskView(_ task: PickTask) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
@@ -273,24 +316,32 @@ struct PickingDashboardView: View {
                     .foregroundStyle(PickingTheme.muted)
             }
 
-            HStack(spacing: 10) {
+            if model.isMetaScanning {
                 Button {
-                    model.showPhoneScanner = true
+                    Task { await model.cancelMetaScan() }
                 } label: {
-                    Label("iPhone", systemImage: "iphone.gen3")
+                    Label("Stop Meta scan", systemImage: "stop.circle.fill")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(SecondaryDashboardButtonStyle())
-
+            } else {
                 Button {
                     Task { await model.scanWithMeta() }
                 } label: {
-                    Label("Meta glasses", systemImage: "eyeglasses")
+                    Label("Start Meta scan", systemImage: "eyeglasses")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(PrimaryDashboardButtonStyle())
-                .disabled(!model.metaCameraGranted)
+                .disabled(!model.metaScanReady)
             }
+
+            Button {
+                model.showPhoneScanner = true
+            } label: {
+                Label("Use iPhone camera instead", systemImage: "iphone.gen3")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(SecondaryDashboardButtonStyle())
 
             Button {
                 model.readInstruction()
@@ -307,28 +358,34 @@ struct PickingDashboardView: View {
                 HStack(spacing: 12) {
                     ZStack {
                         RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(model.metaCameraGranted ? PickingTheme.mint.opacity(0.12) : PickingTheme.raised)
+                            .fill(model.metaScanReady ? PickingTheme.mint.opacity(0.12) : PickingTheme.raised)
                             .frame(width: 44, height: 44)
                         Image(systemName: "eyeglasses")
                             .font(.system(size: 20, weight: .semibold))
-                            .foregroundStyle(model.metaCameraGranted ? PickingTheme.mint : PickingTheme.muted)
+                            .foregroundStyle(model.metaScanReady ? PickingTheme.mint : PickingTheme.muted)
                     }
 
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Meta glasses")
                             .font(.headline)
                             .foregroundStyle(PickingTheme.text)
-                        Text(model.metaCameraGranted ? "Connected · Camera ready" : "Setup required")
+                        Text(model.metaScanReady
+                            ? "Connected · Camera ready"
+                            : model.metaCameraGranted ? "Registered · Reconnecting" : "Setup required")
                             .font(.subheadline)
-                            .foregroundStyle(model.metaCameraGranted ? PickingTheme.mint : PickingTheme.muted)
+                            .foregroundStyle(model.metaScanReady ? PickingTheme.mint : PickingTheme.muted)
                     }
 
                     Spacer()
 
-                    Circle()
-                        .fill(model.metaCameraGranted ? PickingTheme.mint : PickingTheme.muted.opacity(0.4))
-                        .frame(width: 9, height: 9)
-                        .shadow(color: model.metaCameraGranted ? PickingTheme.mint.opacity(0.6) : .clear, radius: 5)
+                    if model.isMetaSyncing {
+                        ProgressView().tint(PickingTheme.primary)
+                    } else {
+                        Circle()
+                            .fill(model.metaScanReady ? PickingTheme.mint : PickingTheme.muted.opacity(0.4))
+                            .frame(width: 9, height: 9)
+                            .shadow(color: model.metaScanReady ? PickingTheme.mint.opacity(0.6) : .clear, radius: 5)
+                    }
                 }
 
                 Text(model.metaStatus)
@@ -342,9 +399,54 @@ struct PickingDashboardView: View {
                 } else if model.canRequestMetaCamera {
                     Button("Allow camera access") { Task { await model.requestMetaCamera() } }
                         .buttonStyle(PrimaryDashboardButtonStyle())
+                } else if model.metaCameraGranted && !model.metaScanReady {
+                    Button("Reconnect glasses") { model.syncMetaConnection() }
+                        .buttonStyle(SecondaryDashboardButtonStyle())
                 }
+
+                Text("To scan: open an assigned pick, tap Start Meta scan, and look steadily at one barcode. Use the iPhone camera only as a fallback.")
+                    .font(.caption2)
+                    .foregroundStyle(PickingTheme.muted)
             }
         }
+    }
+
+    private func guideStep(_ number: Int, _ title: String, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 11) {
+            Text("\(number)")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(PickingTheme.primaryText)
+                .frame(width: 24, height: 24)
+                .background(PickingTheme.primary, in: Circle())
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(PickingTheme.text)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(PickingTheme.muted)
+            }
+        }
+    }
+
+    private func performanceMetric(_ title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title.uppercased())
+                .font(.system(size: 8, weight: .bold))
+                .tracking(0.5)
+                .foregroundStyle(PickingTheme.muted)
+            Text(value)
+                .font(.headline)
+                .foregroundStyle(PickingTheme.text)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(PickingTheme.raised, in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func formattedUPH(_ value: Double?) -> String {
+        guard let value else { return "—" }
+        return value.formatted(.number.precision(.fractionLength(1)))
     }
 
     private var statusNotice: some View {

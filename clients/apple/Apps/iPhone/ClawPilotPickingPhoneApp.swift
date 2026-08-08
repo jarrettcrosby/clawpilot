@@ -20,7 +20,7 @@ struct ClawPilotPickingPhoneApp: App {
                 .onOpenURL { url in Task { await model.handleMetaURL(url) } }
                 .onChange(of: scenePhase) { _, phase in
                     guard phase == .active else { return }
-                    Task { await model.refreshMetaStatus() }
+                    model.syncMetaConnection()
                 }
                 .task { await model.restoreAndRefresh() }
                 .preferredColorScheme(.dark)
@@ -41,6 +41,7 @@ final class PickingPhoneModel: ObservableObject {
     @Published var sessionProfile: ClawPilotSessionProfile?
     @Published var managerOrders: [ManagerOrderSummary] = []
     @Published var managerPickers: [ManagerPicker] = []
+    @Published var pickerPerformance: [PickerPerformanceMetric] = []
     @Published var managerSelectedOrder: ManagerOrderDetail?
     @Published var managerStatus = "Loading Operations orders."
     @Published var isManagerBusy = false
@@ -53,6 +54,9 @@ final class PickingPhoneModel: ObservableObject {
     @Published var canRegisterMeta = false
     @Published var canRequestMetaCamera = false
     @Published var metaCameraGranted = false
+    @Published var metaConnectedDeviceCount = 0
+    @Published var isMetaSyncing = false
+    @Published var isMetaScanning = false
 
     private let cache: DurablePickCache
     private let api: PickingAPIClient
@@ -61,6 +65,7 @@ final class PickingPhoneModel: ObservableObject {
     private let voice = VoiceConfirmationController()
     private var metaSource: MetaWearablesBarcodeSource?
     private var codeRequestCooldown: Task<Void, Never>?
+    private var metaConnectionRefreshTask: Task<Void, Never>?
 
     var canSendCode: Bool {
         canRequestCode && !isAuthBusy && email.contains("@") && email.count <= 254
@@ -76,6 +81,15 @@ final class PickingPhoneModel: ObservableObject {
 
     var canUseManager: Bool {
         sessionProfile?.mobileCapabilities.canUseManager == true
+    }
+
+    var metaScanReady: Bool {
+        metaCameraGranted && metaConnectedDeviceCount == 1 && !isMetaSyncing
+    }
+
+    var ownPickerPerformance: PickerPerformanceMetric? {
+        guard let email = sessionProfile?.effectiveUser.email.lowercased() else { return nil }
+        return pickerPerformance.first { $0.email.lowercased() == email }
     }
 
     var sessionDisplayName: String {
@@ -170,6 +184,26 @@ final class PickingPhoneModel: ObservableObject {
                 .init(email: "jamie@example.com", displayName: "Jamie Lee"),
                 .init(email: "taylor@example.com", displayName: "Taylor Reed"),
             ]
+            pickerPerformance = [
+                .init(
+                    email: "jamie@example.com",
+                    displayName: "Jamie Lee",
+                    unitsToday: 84,
+                    unitsSevenDays: 462,
+                    ordersSevenDays: 31,
+                    uphToday: 118.4,
+                    uphSevenDays: 111.7
+                ),
+                .init(
+                    email: "taylor@example.com",
+                    displayName: "Taylor Reed",
+                    unitsToday: 61,
+                    unitsSevenDays: 398,
+                    ordersSevenDays: 27,
+                    uphToday: 104.2,
+                    uphSevenDays: 101.5
+                ),
+            ]
             managerStatus = "Review an order to wave and assign its picks."
             if walkthroughScreen == "assignment" {
                 managerSelectedOrder = .init(
@@ -200,6 +234,7 @@ final class PickingPhoneModel: ObservableObject {
         do {
             sessionProfile = try await api.fetchSessionProfile()
             isAuthenticated = true
+            syncMetaConnection()
         } catch {
             sessionProfile = nil
             isAuthenticated = false
@@ -276,7 +311,9 @@ final class PickingPhoneModel: ObservableObject {
             status = "Picker access is not assigned to this account."
             return
         }
+        syncMetaConnection()
         await loadQueue(readAloud: false)
+        await loadPickerPerformance()
     }
 
     func loadManagerOperations() async {
@@ -290,8 +327,10 @@ final class PickingPhoneModel: ObservableObject {
         do {
             async let orders = api.fetchManagerOrders()
             async let pickers = api.fetchManagerPickers()
+            async let performance = api.fetchPickerPerformance()
             managerOrders = try await orders
             managerPickers = try await pickers
+            pickerPerformance = try await performance
             managerStatus = managerOrders.isEmpty
                 ? "No Operations orders are available."
                 : "Review an order to wave and assign its picks."
@@ -380,6 +419,7 @@ final class PickingPhoneModel: ObservableObject {
         status = "Signed out."
         managerOrders = []
         managerPickers = []
+        pickerPerformance = []
         managerSelectedOrder = nil
     }
 
@@ -405,6 +445,14 @@ final class PickingPhoneModel: ObservableObject {
         }
     }
 
+    func loadPickerPerformance() async {
+        do {
+            pickerPerformance = try await api.fetchPickerPerformance()
+        } catch {
+            // Performance is supporting context; never block assigned work on it.
+        }
+    }
+
     func accept(_ value: String, source: BarcodeSource) async {
         guard !hasPendingConfirmation else { return }
         do {
@@ -419,11 +467,22 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func scanWithMeta() async {
+        guard currentTask != nil else {
+            metaStatus = "Load an assigned pick before starting the glasses camera."
+            return
+        }
+        guard metaScanReady else {
+            metaStatus = "Waiting for one connected Meta glasses device. Open Meta AI once if it does not reconnect."
+            syncMetaConnection()
+            return
+        }
         let source = MetaWearablesBarcodeSource()
         metaSource = source
+        isMetaScanning = true
+        defer { isMetaScanning = false }
         do {
             try await source.start()
-            metaStatus = "Scanning with Meta glasses."
+            metaStatus = "Meta camera is live. Look directly at the product barcode; no photo is saved."
             for await value in source.barcodes {
                 await accept(value, source: .metaGlasses)
                 await source.stop()
@@ -431,11 +490,21 @@ final class PickingPhoneModel: ObservableObject {
                 metaStatus = "Meta scan complete."
                 return
             }
+            metaSource = nil
+            metaStatus = "Meta scan stopped. Start it again when the barcode is in view."
         } catch {
             metaStatus = "Meta scan unavailable. Use iPhone camera: \(error.localizedDescription)"
             await source.stop()
             metaSource = nil
         }
+    }
+
+    func cancelMetaScan() async {
+        guard let metaSource else { return }
+        await metaSource.stop()
+        self.metaSource = nil
+        isMetaScanning = false
+        metaStatus = "Meta scan stopped."
     }
 
     func registerMeta() async {
@@ -476,6 +545,7 @@ final class PickingPhoneModel: ObservableObject {
 
     func refreshMetaStatus() async {
         let snapshot = await MetaWearablesAppBridge.statusSnapshot()
+        metaConnectedDeviceCount = snapshot.connectedDeviceCount
         let deviceLabel = snapshot.connectedDeviceCount == 1
             ? "1 glasses connection"
             : "\(snapshot.connectedDeviceCount) glasses connections"
@@ -514,6 +584,21 @@ final class PickingPhoneModel: ObservableObject {
         }
     }
 
+    func syncMetaConnection() {
+        metaConnectionRefreshTask?.cancel()
+        isMetaSyncing = true
+        metaConnectionRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            defer { isMetaSyncing = false }
+            for attempt in 0..<8 {
+                guard !Task.isCancelled else { return }
+                await refreshMetaStatus()
+                if metaConnectedDeviceCount == 1 || canRegisterMeta { return }
+                if attempt < 7 { try? await Task.sleep(for: .seconds(1)) }
+            }
+        }
+    }
+
     func readInstruction() {
         if let currentTask { voice.speak(PickVoice.instruction(for: currentTask)) }
         else if readyToConfirm { voice.speak("All products scanned. Say confirm pick to submit the order.") }
@@ -542,6 +627,7 @@ final class PickingPhoneModel: ObservableObject {
             hasPendingConfirmation = false
             status = "ClawPilot confirmed and audited the picks."
             voice.speak("Picks confirmed.")
+            await loadPickerPerformance()
             await loadQueue()
         } catch {
             status = "Confirmation is pending or rejected. Refresh before new work: \(error.localizedDescription)"

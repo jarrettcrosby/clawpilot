@@ -245,9 +245,17 @@ const PERMISSIONS: Array<{
   { key: 'manageUserAccess', label: 'Manage access', adminOnly: true },
   { key: 'createBoards', label: 'Create boards' },
   { key: 'createPipelines', label: 'Create pipelines' },
-  { key: 'viewOperations', label: 'View operations' },
+  {
+    key: 'viewOperations',
+    label: 'View operations',
+    description: 'Required with Picker access so the worker can load assigned warehouse work.',
+  },
   { key: 'manageOperations', label: 'Manage operations', adminOnly: true },
-  { key: 'executeWarehouse', label: 'Execute warehouse work' },
+  {
+    key: 'executeWarehouse',
+    label: 'Picker access',
+    description: 'Receive assigned picks and use the ClawPilot mobile picking workflow. View operations is enabled automatically.',
+  },
   {
     key: 'manageCarrierRateNetworks',
     label: 'Manage carrier rate networks',
@@ -309,6 +317,17 @@ function permissionsForRolePreset(role: EditableRole, current: UserPermissions):
     viewOrganizationAudit: enabled,
     viewSystemAudit: enabled,
   }
+}
+
+function permissionsWithDependencies(
+  current: UserPermissions,
+  key: PermissionKey,
+  enabled: boolean,
+): UserPermissions {
+  const next = { ...current, [key]: enabled }
+  if (key === 'executeWarehouse' && enabled) next.viewOperations = true
+  if (key === 'viewOperations' && !enabled) next.executeWarehouse = false
+  return next
 }
 
 const panelSx = {
@@ -1640,10 +1659,15 @@ export default function UserAccessDialog({
                                     size="small"
                                     checked={Boolean(user.permissions[permission.key])}
                                     onChange={(event) => {
-                                      void updateAccess(user, user.role as EditableRole, {
-                                        ...user.permissions,
-                                        [permission.key]: event.target.checked,
-                                      })
+                                      void updateAccess(
+                                        user,
+                                        user.role as EditableRole,
+                                        permissionsWithDependencies(
+                                          user.permissions,
+                                          permission.key,
+                                          event.target.checked,
+                                        ),
+                                      )
                                     }}
                                     disabled={busy || !permissionEditable}
                                     inputProps={{ 'aria-label': `${permission.label} for ${user.email}` }}

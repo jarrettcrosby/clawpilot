@@ -710,7 +710,6 @@ async function requireEligibleOperationsPicker(
        membership.role = 'owner'
        OR (
          COALESCE((membership.permissions->>'viewOperations')::boolean, false)
-         AND COALESCE((membership.permissions->>'manageOperations')::boolean, false)
          AND COALESCE((membership.permissions->>'executeWarehouse')::boolean, false)
        )
      ) AS eligible
@@ -734,7 +733,7 @@ async function requireEligibleOperationsPicker(
   if (!membership.eligible) {
     throw new OperationsRequestError(
       'OPERATIONS_PICKER_ACCESS_REQUIRED',
-      'The selected worker needs Operations view, management, and warehouse execution permission',
+      'The selected worker needs Operations view and warehouse execution permission',
       409,
     )
   }
@@ -9250,9 +9249,9 @@ export async function runMockOperationsProofFromPostgres(input: {
       const pickResult = await client.query<IdRow>(
         `INSERT INTO operations_pick_tasks (
            organization_id, wave_id, plan_id, allocation_id, from_location_id,
-           quantity, sequence_number, status, assigned_to
+           quantity, sequence_number, status, assigned_to, assigned_at
          ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
-           $6, $7, 'ready', $8)
+           $6, $7, 'ready', $8, now())
          RETURNING id::text, global_id`,
         [
           organizationId,
@@ -11415,7 +11414,7 @@ export async function releaseOperationsOrderFromPostgres(input: {
       const pickResult = await client.query<QueryResultRow & { global_id: string }>(
         `INSERT INTO operations_pick_tasks (
            organization_id, wave_id, plan_id, allocation_id, from_location_id,
-           quantity, sequence_number, status, assigned_to
+           quantity, sequence_number, status, assigned_to, assigned_at
          )
          SELECT allocation.organization_id, $3::uuid, allocation.plan_id, allocation.id,
                 position.location_id, allocation.quantity,
@@ -11423,7 +11422,7 @@ export async function releaseOperationsOrderFromPostgres(input: {
                   ORDER BY location.pick_sequence, position.global_id,
                            allocation.id
                 )::integer,
-                'ready', $4
+                'ready', $4, CASE WHEN $4::text IS NULL THEN NULL ELSE now() END
          FROM operations_fulfillment_allocations allocation
          JOIN operations_inventory_positions position
            ON position.organization_id = allocation.organization_id
@@ -11632,7 +11631,7 @@ export async function assignOperationsOrderPicksFromPostgres(input: {
 
       const assignment = await client.query(
         `UPDATE operations_pick_tasks pick
-         SET assigned_to = $3
+         SET assigned_to = $3, assigned_at = now(), updated_at = now()
          FROM operations_fulfillment_plans plan,
               operations_waves wave
          WHERE pick.organization_id = $1::uuid
