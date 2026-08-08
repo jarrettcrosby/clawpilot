@@ -3,6 +3,7 @@ import Foundation
 public protocol PickCache: Sendable {
     func loadQueue() async throws -> PickQueue?
     func saveQueue(_ queue: PickQueue) async throws
+    func clearQueue() async throws
     func saveOutbox(_ command: ConfirmPicksCommand) async throws
     func loadOutbox() async throws -> ConfirmPicksCommand?
     func clearOutbox() async throws
@@ -31,6 +32,13 @@ public actor PickingSession {
         self.queue = queue
         orderIndex = 0
         scannedTaskIDs = []
+    }
+
+    public func clearQueue() async throws {
+        queue = nil
+        orderIndex = 0
+        scannedTaskIDs = []
+        try await cache.clearQueue()
     }
 
     public func currentTask() -> PickTask? {
@@ -117,4 +125,3 @@ public enum PickVoice {
         return ["confirm", "confirm pick", "complete order"].contains(normalized)
     }
 }
-

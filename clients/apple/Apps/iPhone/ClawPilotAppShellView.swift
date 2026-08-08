@@ -259,11 +259,12 @@ private struct ModuleHomeView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 profileHeader
+                WorkspaceSwitcherCard(model: model)
                 VStack(alignment: .leading, spacing: 5) {
                     Text("Choose a workflow")
                         .font(.title2.weight(.bold))
                         .foregroundStyle(AppShellTheme.text)
-                    Text("Your permissions determine which workspaces are available.")
+                    Text("Your permissions determine which workflows are available.")
                         .font(.subheadline)
                         .foregroundStyle(AppShellTheme.muted)
                 }
@@ -390,6 +391,82 @@ private struct ModuleHomeView: View {
     }
 }
 
+private struct WorkspaceSwitcherCard: View {
+    @ObservedObject var model: PickingPhoneModel
+    var compact = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: compact ? 9 : 12) {
+            HStack(spacing: 10) {
+                Image(systemName: "building.2.fill")
+                    .foregroundStyle(AppShellTheme.primary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Organization")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(AppShellTheme.muted)
+                    Text(model.sessionOrganizationName)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(AppShellTheme.text)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .layoutPriority(1)
+                }
+                Spacer()
+                if model.isWorkspaceBusy {
+                    ProgressView()
+                        .tint(AppShellTheme.primary)
+                } else if model.availableWorkspaces.count > 1 {
+                    workspaceMenu
+                } else {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(AppShellTheme.mint)
+                }
+            }
+
+            if !compact {
+                Text(model.workspaceStatus)
+                    .font(.footnote)
+                    .foregroundStyle(AppShellTheme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(compact ? 14 : 16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(AppShellTheme.surface, in: RoundedRectangle(cornerRadius: 18))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18)
+                .stroke(AppShellTheme.outline, lineWidth: 1)
+        }
+    }
+
+    private var workspaceMenu: some View {
+        Menu {
+            ForEach(model.availableWorkspaces) { workspace in
+                Button {
+                    Task { await model.switchWorkspace(to: workspace.organizationId) }
+                } label: {
+                    if workspace.organizationId == model.activeWorkspace?.organizationId {
+                        Label(workspaceLabel(workspace), systemImage: "checkmark")
+                    } else {
+                        Text(workspaceLabel(workspace))
+                    }
+                }
+            }
+        } label: {
+            Label("Change", systemImage: "chevron.up.chevron.down")
+                .font(.subheadline.weight(.semibold))
+                .padding(.horizontal, 12)
+                .frame(minHeight: 38)
+                .background(AppShellTheme.raised, in: Capsule())
+        }
+        .disabled(!model.canSwitchWorkspace)
+    }
+
+    private func workspaceLabel(_ workspace: ClawPilotSessionProfile.Workspace) -> String {
+        workspace.name ?? workspace.referenceCode ?? "ClawPilot organization"
+    }
+}
+
 private struct ManagerModule: Identifiable, Hashable {
     let id: String
     let title: String
@@ -480,6 +557,7 @@ private struct ManagerPickingOperationsView: View {
     var body: some View {
         ScrollView {
             LazyVStack(spacing: 13) {
+                WorkspaceSwitcherCard(model: model, compact: true)
                 workflowExplanation
                 pickerPerformance
 

@@ -24,6 +24,13 @@ public actor DurablePickCache: PickCache {
         try write(queue, name: "pick-queue.json")
     }
 
+    public func clearQueue() async throws {
+        let url = directory.appendingPathComponent("pick-queue.json")
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+
     public func saveOutbox(_ command: ConfirmPicksCommand) async throws {
         if let existing = try await loadOutbox(), existing != command {
             throw PickingContractError.contextMismatch
@@ -78,6 +85,32 @@ extension PickingAPIError: LocalizedError {
 }
 
 public struct ClawPilotSessionProfile: Decodable, Equatable, Sendable {
+    public struct Workspace: Decodable, Equatable, Identifiable, Sendable {
+        public var id: String { organizationId }
+        public let organizationId: String
+        public let referenceCode: String?
+        public let name: String?
+        public let organizationType: String?
+        public let role: String?
+        public let isDefault: Bool?
+
+        public init(
+            organizationId: String,
+            referenceCode: String?,
+            name: String?,
+            organizationType: String? = nil,
+            role: String?,
+            isDefault: Bool? = nil
+        ) {
+            self.organizationId = organizationId
+            self.referenceCode = referenceCode
+            self.name = name
+            self.organizationType = organizationType
+            self.role = role
+            self.isDefault = isDefault
+        }
+    }
+
     public struct EffectiveUser: Decodable, Equatable, Sendable {
         public let email: String
         public let displayName: String?
@@ -113,15 +146,21 @@ public struct ClawPilotSessionProfile: Decodable, Equatable, Sendable {
     public let user: String
     public let effectiveUser: EffectiveUser
     public let mobileCapabilities: MobileCapabilities
+    public let activeWorkspace: Workspace
+    public let availableWorkspaces: [Workspace]
 
     public init(
         user: String,
         effectiveUser: EffectiveUser,
-        mobileCapabilities: MobileCapabilities
+        mobileCapabilities: MobileCapabilities,
+        activeWorkspace: Workspace,
+        availableWorkspaces: [Workspace]
     ) {
         self.user = user
         self.effectiveUser = effectiveUser
         self.mobileCapabilities = mobileCapabilities
+        self.activeWorkspace = activeWorkspace
+        self.availableWorkspaces = availableWorkspaces
     }
 }
 
@@ -248,6 +287,11 @@ public actor PickingAPIClient {
         let error: String?
     }
 
+    private struct WorkspaceSwitchBody: Encodable {
+        let action: String
+        let organizationId: String
+    }
+
     private struct ManagerOperationsEnvelope: Decodable {
         struct Workspace: Decodable {
             let orders: [ManagerOrderSummary]
@@ -327,6 +371,26 @@ public actor PickingAPIClient {
         let (data, response) = try await session.data(for: request)
         try validateHTTP(response)
         return try decoder.decode(ClawPilotSessionProfile.self, from: data)
+    }
+
+    public func switchWorkspace(to organizationId: String) async throws {
+        var request = URLRequest(url: try endpoint("/api/auth/workspace"))
+        request.httpMethod = "POST"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try encoder.encode(WorkspaceSwitchBody(
+            action: "switch",
+            organizationId: organizationId
+        ))
+        let (data, response) = try await session.data(for: request)
+        try validateHTTP(response)
+        let envelope = try decoder.decode(BasicEnvelope.self, from: data)
+        guard envelope.ok else {
+            throw PickingAPIError.rejected(
+                code: envelope.code ?? "WORKSPACE_SWITCH_FAILED",
+                message: envelope.error ?? "The organization could not be changed"
+            )
+        }
     }
 
     public func logout() async throws {

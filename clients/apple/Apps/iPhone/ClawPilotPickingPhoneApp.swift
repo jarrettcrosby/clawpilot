@@ -38,6 +38,8 @@ final class PickingPhoneModel: ObservableObject {
     @Published var isRestoringSession = true
     @Published var isAuthBusy = false
     @Published var isQueueBusy = false
+    @Published var isWorkspaceBusy = false
+    @Published var workspaceStatus = "Orders, assigned picks, people, and UPH follow this organization."
     @Published var sessionProfile: ClawPilotSessionProfile?
     @Published var managerOrders: [ManagerOrderSummary] = []
     @Published var managerPickers: [ManagerPicker] = []
@@ -83,6 +85,21 @@ final class PickingPhoneModel: ObservableObject {
         sessionProfile?.mobileCapabilities.canUseManager == true
     }
 
+    var activeWorkspace: ClawPilotSessionProfile.Workspace? {
+        sessionProfile?.activeWorkspace
+    }
+
+    var availableWorkspaces: [ClawPilotSessionProfile.Workspace] {
+        sessionProfile?.availableWorkspaces ?? []
+    }
+
+    var canSwitchWorkspace: Bool {
+        !isWorkspaceBusy
+            && !isManagerBusy
+            && !isQueueBusy
+            && !hasPendingConfirmation
+    }
+
     var metaScanReady: Bool {
         metaCameraGranted && metaConnectedDeviceCount == 1 && !isMetaSyncing
     }
@@ -99,7 +116,9 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     var sessionOrganizationName: String {
-        sessionProfile?.effectiveUser.organizationName ?? "ClawPilot workspace"
+        sessionProfile?.activeWorkspace.name
+            ?? sessionProfile?.effectiveUser.organizationName
+            ?? "ClawPilot workspace"
     }
 
     var webOrigin: URL { api.webOrigin }
@@ -147,7 +166,29 @@ final class PickingPhoneModel: ObservableObject {
                     mobileCapabilities: .init(
                         canUsePicker: true,
                         canUseManager: true
-                    )
+                    ),
+                    activeWorkspace: .init(
+                        organizationId: "11111111-1111-4111-8111-111111111111",
+                        referenceCode: "SUBURBIA",
+                        name: "Suburbia Sandwich Co.",
+                        role: "admin",
+                        isDefault: true
+                    ),
+                    availableWorkspaces: [
+                        .init(
+                            organizationId: "11111111-1111-4111-8111-111111111111",
+                            referenceCode: "SUBURBIA",
+                            name: "Suburbia Sandwich Co.",
+                            role: "admin",
+                            isDefault: true
+                        ),
+                        .init(
+                            organizationId: "22222222-2222-4222-8222-222222222222",
+                            referenceCode: "FAIRE",
+                            name: "Faire Wholesale",
+                            role: "manager"
+                        ),
+                    ]
                 )
                 isAuthenticated = true
             }
@@ -314,6 +355,59 @@ final class PickingPhoneModel: ObservableObject {
         syncMetaConnection()
         await loadQueue(readAloud: false)
         await loadPickerPerformance()
+    }
+
+    func switchWorkspace(to organizationId: String) async {
+        guard let activeWorkspace,
+              organizationId != activeWorkspace.organizationId else { return }
+        guard canSwitchWorkspace else {
+            workspaceStatus = hasPendingConfirmation
+                ? "Confirm or reconcile the current pick before changing organizations."
+                : "Wait for the current operation to finish before changing organizations."
+            return
+        }
+        guard availableWorkspaces.contains(where: { $0.organizationId == organizationId }) else {
+            workspaceStatus = "That organization is not available to this account."
+            return
+        }
+
+        isWorkspaceBusy = true
+        workspaceStatus = "Changing organization and clearing scoped mobile data…"
+        defer { isWorkspaceBusy = false }
+
+        do {
+            if isMetaScanning { await cancelMetaScan() }
+            try await api.switchWorkspace(to: organizationId)
+
+            managerOrders = []
+            managerPickers = []
+            pickerPerformance = []
+            managerSelectedOrder = nil
+            currentTask = nil
+            readyToConfirm = false
+            try await picking.clearQueue()
+            await updateProjection()
+
+            sessionProfile = try await api.fetchSessionProfile()
+            isAuthenticated = true
+
+            if canUseManager { await loadManagerOperations() }
+            if canUsePicker {
+                await loadQueue(readAloud: false)
+                await loadPickerPerformance()
+            }
+
+            let name = sessionProfile?.activeWorkspace.name ?? "the selected organization"
+            workspaceStatus = "Now using " + name + ". Organization-scoped data is refreshed."
+            status = "Organization changed to " + name + "."
+        } catch PickingAPIError.unauthorized {
+            sessionProfile = nil
+            isAuthenticated = false
+            workspaceStatus = "Your session expired while changing organizations. Sign in again."
+            status = "Sign in to continue."
+        } catch {
+            workspaceStatus = "Organization change failed: " + error.localizedDescription
+        }
     }
 
     func loadManagerOperations() async {

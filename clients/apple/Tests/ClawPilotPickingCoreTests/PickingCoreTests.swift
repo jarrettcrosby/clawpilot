@@ -8,9 +8,26 @@ private actor MemoryCache: PickCache {
 
     func loadQueue() async throws -> PickQueue? { queue }
     func saveQueue(_ queue: PickQueue) async throws { self.queue = queue }
+    func clearQueue() async throws { queue = nil }
     func saveOutbox(_ command: ConfirmPicksCommand) async throws { outbox = command }
     func loadOutbox() async throws -> ConfirmPicksCommand? { outbox }
     func clearOutbox() async throws { outbox = nil }
+}
+
+@Test("workspace changes clear cached pick identity and progress")
+func clearWorkspaceQueue() async throws {
+    let cache = MemoryCache()
+    let session = PickingSession(cache: cache)
+    try await session.replaceQueue(fixtureQueue())
+    _ = try await session.accept(BarcodeObservation(
+        value: "0012345678905", source: .metaGlasses
+    ))
+
+    try await session.clearQueue()
+
+    #expect(await session.currentOrder() == nil)
+    #expect(await session.currentTask() == nil)
+    #expect(try await cache.loadQueue() == nil)
 }
 
 private func fixtureQueue() throws -> PickQueue {
