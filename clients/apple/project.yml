@@ -57,6 +57,7 @@ targets:
         CFBundleDisplayName: ClawPilot
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        ITSAppUsesNonExemptEncryption: false
         ClawPilotServerOrigin: $(CLAWPILOT_SERVER_ORIGIN)
         CFBundleURLTypes:
           - CFBundleTypeRole: Editor
