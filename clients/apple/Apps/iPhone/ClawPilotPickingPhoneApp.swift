@@ -182,6 +182,12 @@ final class PickingPhoneModel: ObservableObject {
             if ProcessInfo.processInfo.arguments.contains("--voice-self-test") {
                 print("CLAWPILOT_VOICE_SELF_TEST \(await self.voice.runOfflineVoiceSelfTest())")
             }
+            if ProcessInfo.processInfo.arguments.contains("--speech-auth-self-test") {
+                print("CLAWPILOT_SPEECH_AUTH_SELF_TEST \(await self.voice.runSpeechAuthorizationSelfTest())")
+            }
+            if ProcessInfo.processInfo.arguments.contains("--listening-self-test") {
+                print("CLAWPILOT_LISTENING_SELF_TEST \(await self.voice.runListeningSelfTest())")
+            }
 #endif
         }
         watch.onCommand = { [weak self] command in

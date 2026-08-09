@@ -142,6 +142,7 @@ final class VoiceConfirmationController {
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var recognitionTimeoutTask: Task<Void, Never>?
+    private var recognitionFinalHandler: (@MainActor (String) -> Void)?
     private(set) var voicePackState: OfflineVoicePackState
     var onVoicePackStateChange: (@MainActor (OfflineVoicePackState) -> Void)?
 
@@ -210,6 +211,28 @@ final class VoiceConfirmationController {
     }
 
 #if DEBUG
+    func runSpeechAuthorizationSelfTest() async -> String {
+        let status = await Self.requestSpeechAuthorization()
+        return status == .authorized ? "PASS authorized" : "FAIL status=\(status.rawValue)"
+    }
+
+    func runListeningSelfTest() async -> String {
+        do {
+            try await listen(
+                preferBluetoothInput: false,
+                timeout: .seconds(2),
+                onTimeout: {},
+                onFinal: { _ in }
+            )
+            try await Task.sleep(for: .milliseconds(2_500))
+            stopListening()
+            return "PASS microphone-session"
+        } catch {
+            stopListening()
+            return "FAIL error=\(error.localizedDescription)"
+        }
+    }
+
     func runOfflineVoiceSelfTest() async -> String {
         guard voicePackState == .ready else {
             return "FAIL state=\(voicePackState.title)"
@@ -363,9 +386,7 @@ final class VoiceConfirmationController {
         onTimeout: (@MainActor () -> Void)? = nil,
         onFinal: @escaping @MainActor (String) -> Void
     ) async throws {
-        let speechStatus = await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) }
-        }
+        let speechStatus = await Self.requestSpeechAuthorization()
         guard speechStatus == .authorized else { throw VoiceError.permissionDenied }
         let granted = await AVAudioApplication.requestRecordPermission()
         guard granted else { throw VoiceError.permissionDenied }
@@ -374,6 +395,7 @@ final class VoiceConfirmationController {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = false
         self.request = request
+        recognitionFinalHandler = onFinal
 
         let session = AVAudioSession.sharedInstance()
         var options: AVAudioSession.CategoryOptions = [.allowBluetoothHFP, .allowBluetoothA2DP]
@@ -402,17 +424,27 @@ final class VoiceConfirmationController {
         let recognizer = SFSpeechRecognizer(
             locale: Locale(identifier: instructionLanguage.recognitionLocaleIdentifier)
         )
-        recognitionTask = recognizer?.recognitionTask(with: request) { [weak self] result, error in
-            guard let result, result.isFinal else {
-                if error != nil { Task { @MainActor in self?.stopListening() } }
-                return
-            }
-            let transcript = result.bestTranscription.formattedString
-            Task { @MainActor in
-                self?.stopListening()
-                onFinal(transcript)
+        let recognitionHandler: @Sendable (SFSpeechRecognitionResult?, Error?) -> Void = {
+            [weak self] result, error in
+            let transcript = result?.isFinal == true
+                ? result?.bestTranscription.formattedString
+                : nil
+            guard transcript != nil || error != nil else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard let transcript else {
+                    self.stopListening()
+                    return
+                }
+                let onFinal = self.recognitionFinalHandler
+                self.stopListening()
+                onFinal?(transcript)
             }
         }
+        recognitionTask = recognizer?.recognitionTask(
+            with: request,
+            resultHandler: recognitionHandler
+        )
         if let timeout {
             recognitionTimeoutTask = Task { [weak self] in
                 do {
@@ -436,6 +468,7 @@ final class VoiceConfirmationController {
         recognitionTask?.cancel()
         request = nil
         recognitionTask = nil
+        recognitionFinalHandler = nil
         try? AVAudioSession.sharedInstance().setActive(
             false,
             options: .notifyOthersOnDeactivation
@@ -563,6 +596,16 @@ final class VoiceConfirmationController {
     private func setVoicePackState(_ state: OfflineVoicePackState) {
         voicePackState = state
         onVoicePackStateChange?(state)
+    }
+
+    nonisolated private static func requestSpeechAuthorization() async
+        -> SFSpeechRecognizerAuthorizationStatus
+    {
+        await withCheckedContinuation { continuation in
+            SFSpeechRecognizer.requestAuthorization { status in
+                continuation.resume(returning: status)
+            }
+        }
     }
 
     private static var voicePackDirectory: URL {
