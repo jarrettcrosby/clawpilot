@@ -24,6 +24,9 @@ struct PickingDashboardView: View {
     @ObservedObject var model: PickingPhoneModel
     @FocusState private var authenticationField: AuthenticationField?
     @State private var showMetaResetConfirmation = false
+    @State private var showVoicePackRemovalConfirmation = false
+    @State private var pronunciationWritten = ""
+    @State private var pronunciationSpoken = ""
 
     var body: some View {
         ZStack {
@@ -78,6 +81,18 @@ struct PickingDashboardView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("This removes ClawPilot’s Meta authorization. It does not unpair your glasses. You will register ClawPilot and grant camera access again.")
+        }
+        .confirmationDialog(
+            "Remove enhanced voice pack?",
+            isPresented: $showVoicePackRemovalConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Remove voice pack", role: .destructive) {
+                Task { await model.removeEnhancedVoicePack() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("ClawPilot will immediately return to Apple speech. You can download the enhanced voice again later.")
         }
     }
 
@@ -485,6 +500,63 @@ struct PickingDashboardView: View {
                     .font(.caption)
                     .foregroundStyle(PickingTheme.muted)
 
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("INSTRUCTION LANGUAGE")
+                        .font(.caption2.weight(.bold))
+                        .tracking(0.6)
+                        .foregroundStyle(PickingTheme.muted)
+
+                    Picker(
+                        "Instruction language",
+                        selection: Binding(
+                            get: { model.instructionLanguage },
+                            set: { model.selectInstructionLanguage($0) }
+                        )
+                    ) {
+                        ForEach(InstructionVoiceLanguage.allCases) { language in
+                            Text(language.title).tag(language)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    Text(model.voicePackState.title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(PickingTheme.text)
+
+                    Text(model.voicePackState.detail)
+                        .font(.caption)
+                        .foregroundStyle(PickingTheme.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if let progress = model.voicePackState.progress {
+                        ProgressView(value: progress)
+                            .tint(PickingTheme.primary)
+                    }
+
+                    if model.voicePackState.canInstall {
+                        Button {
+                            Task { await model.installEnhancedVoicePack() }
+                        } label: {
+                            Label("Install enhanced voice pack", systemImage: "arrow.down.circle.fill")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(PrimaryDashboardButtonStyle())
+                    } else if model.voicePackState == .ready {
+                        Button(role: .destructive) {
+                            showVoicePackRemovalConfirmation = true
+                        } label: {
+                            Label("Remove enhanced voice pack", systemImage: "trash")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(SecondaryDashboardButtonStyle())
+                    }
+
+                    Divider().overlay(PickingTheme.outline)
+                    pronunciationDictionary
+                }
+                .padding(12)
+                .background(PickingTheme.raised, in: RoundedRectangle(cornerRadius: 14))
+
                 HStack(spacing: 12) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Choose current output")
@@ -518,6 +590,80 @@ struct PickingDashboardView: View {
                 }
                 .buttonStyle(SecondaryDashboardButtonStyle())
             }
+        }
+    }
+
+    private var pronunciationDictionary: some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Add a term exactly as it appears, then enter how it should sound. Corrections stay on this iPhone and apply to all instruction voices.")
+                    .font(.caption)
+                    .foregroundStyle(PickingTheme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                TextField("Written term, e.g. ClawPilot", text: $pronunciationWritten)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .padding(11)
+                    .background(PickingTheme.surface, in: RoundedRectangle(cornerRadius: 10))
+                    .foregroundStyle(PickingTheme.text)
+
+                TextField("Speak as, e.g. Claw Pilot", text: $pronunciationSpoken)
+                    .padding(11)
+                    .background(PickingTheme.surface, in: RoundedRectangle(cornerRadius: 10))
+                    .foregroundStyle(PickingTheme.text)
+
+                Button {
+                    if model.addPronunciationCorrection(
+                        written: pronunciationWritten,
+                        spoken: pronunciationSpoken
+                    ) {
+                        pronunciationWritten = ""
+                        pronunciationSpoken = ""
+                    }
+                } label: {
+                    Label("Save and preview", systemImage: "waveform.badge.plus")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(SecondaryDashboardButtonStyle())
+                .disabled(
+                    pronunciationWritten.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || pronunciationSpoken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                )
+
+                ForEach(model.pronunciationCorrections) { correction in
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(correction.written)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(PickingTheme.text)
+                            Text("Sounds like \(correction.spoken)")
+                                .font(.caption)
+                                .foregroundStyle(PickingTheme.muted)
+                        }
+                        Spacer()
+                        Button {
+                            model.previewPronunciation(correction)
+                        } label: {
+                            Image(systemName: "speaker.wave.2")
+                        }
+                        .accessibilityLabel("Preview \(correction.written)")
+                        Button(role: .destructive) {
+                            model.removePronunciationCorrection(id: correction.id)
+                        } label: {
+                            Image(systemName: "trash")
+                                .foregroundStyle(PickingTheme.danger)
+                        }
+                        .accessibilityLabel("Remove \(correction.written) pronunciation")
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+            .padding(.top, 8)
+        } label: {
+            Label("Pronunciation corrections", systemImage: "text.bubble")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(PickingTheme.text)
         }
     }
 

@@ -23,6 +23,7 @@ packages="${build_root}/packages"
 
 xcodebuild -quiet -resolvePackageDependencies \
   -project "${project}" -scheme ClawPilotPickingPhone \
+  -packageAuthorizationProvider netrc \
   -clonedSourcePackagesDirPath "${packages}"
 
 resolved="${project}/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
@@ -36,6 +37,7 @@ fi
 xcodebuild -quiet -project "${project}" -scheme ClawPilotPickingPhone \
   -destination 'generic/platform=iOS Simulator' \
   -derivedDataPath "${build_root}/phone" \
+  -packageAuthorizationProvider netrc \
   -clonedSourcePackagesDirPath "${packages}" \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
 
@@ -48,6 +50,7 @@ fi
 xcodebuild -quiet -project "${project}" -scheme ClawPilotPickingWatch \
   -destination 'generic/platform=watchOS Simulator' \
   -derivedDataPath "${build_root}/watch" \
+  -packageAuthorizationProvider netrc \
   -clonedSourcePackagesDirPath "${packages}" \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
 

@@ -128,3 +128,16 @@ func voiceGrammar() {
     #expect(!PickVoice.isConfirmation("pick order 1001 quantity 10"))
     #expect(PickVoice.action(for: "pick order 1001 quantity 10") == nil)
 }
+
+@Test("warehouse location codes are spoken without losing leading zeroes")
+func warehouseLocationCodesAreSpokenExactly() {
+    #expect(PickVoice.spokenLocationCode("PICK-01") == "pick zero one")
+    #expect(PickVoice.spokenLocationCode("A-01-02") == "A zero one zero two")
+    #expect(PickVoice.spokenLocationCode("PICK-01", languageCode: "es") == "pick cero uno")
+}
+
+@Test("spoken product names omit channel suffixes and expand warehouse units")
+func spokenProductNamesAreClear() {
+    #expect(PickVoice.spokenProductName("Bacon Bits 20lb · Shopify") == "Bacon Bits 20 pounds")
+    #expect(PickVoice.spokenProductName("Coffee 12oz", languageCode: "es") == "Coffee 12 onzas")
+}

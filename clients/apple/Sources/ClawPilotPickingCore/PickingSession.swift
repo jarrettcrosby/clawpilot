@@ -123,8 +123,71 @@ public enum PickVoice {
         case confirmPick
     }
 
-    public static func instruction(for task: PickTask) -> String {
-        "Pick \(task.quantity.formatted()) of \(task.productName) from \(task.locationCode). Scan the product barcode."
+    public static func instruction(for task: PickTask, languageCode: String = "en") -> String {
+        let location = spokenLocationCode(task.locationCode, languageCode: languageCode)
+        let product = spokenProductName(task.productName, languageCode: languageCode)
+        if languageCode == "es" {
+            return "Recoge \(task.quantity.formatted()) de \(product) en la ubicación \(location). Escanea el código de barras del producto."
+        }
+        return "Pick \(task.quantity.formatted()) of \(product) from location \(location). Scan the product barcode."
+    }
+
+    public static func spokenProductName(
+        _ name: String,
+        languageCode: String = "en"
+    ) -> String {
+        let product = name.components(separatedBy: " · ").first ?? name
+        let units = languageCode == "es"
+            ? [(#"(?i)(\d+(?:\.\d+)?)\s*lb\b"#, "$1 libras"),
+               (#"(?i)(\d+(?:\.\d+)?)\s*oz\b"#, "$1 onzas")]
+            : [(#"(?i)(\d+(?:\.\d+)?)\s*lb\b"#, "$1 pounds"),
+               (#"(?i)(\d+(?:\.\d+)?)\s*oz\b"#, "$1 ounces")]
+        return units.reduce(product) { result, replacement in
+            result.replacingOccurrences(
+                of: replacement.0,
+                with: replacement.1,
+                options: .regularExpression
+            )
+        }
+    }
+
+    public static func spokenLocationCode(
+        _ code: String,
+        languageCode: String = "en"
+    ) -> String {
+        var runs: [(text: String, isNumber: Bool)] = []
+        var current = ""
+        var currentIsNumber: Bool?
+        func flush() {
+            guard !current.isEmpty, let isNumber = currentIsNumber else { return }
+            runs.append((current, isNumber))
+            current = ""
+            currentIsNumber = nil
+        }
+        for character in code {
+            guard character.isLetter || character.isNumber else {
+                flush()
+                continue
+            }
+            let isNumber = character.isNumber
+            if let currentIsNumber, currentIsNumber != isNumber { flush() }
+            current.append(character)
+            currentIsNumber = isNumber
+        }
+        flush()
+
+        let digitWords = languageCode == "es"
+            ? ["cero", "uno", "dos", "tres", "cuatro", "cinco", "seis", "siete", "ocho", "nueve"]
+            : ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
+        let spoken = runs.flatMap { run -> [String] in
+            if run.isNumber {
+                return run.text.compactMap { character in
+                    character.wholeNumberValue.map { digitWords[$0] }
+                }
+            }
+            return [run.text.count == 1 ? run.text.uppercased() : run.text.lowercased()]
+        }
+        return spoken.isEmpty ? code : spoken.joined(separator: " ")
     }
 
     public static func action(for transcript: String) -> Action? {
@@ -134,13 +197,17 @@ public enum PickVoice {
             .filter { !$0.isEmpty }
             .joined(separator: " ")
         switch normalized {
-        case "start glasses scan", "scan with glasses", "start meta scan", "scan barcode":
+        case "start glasses scan", "scan with glasses", "start meta scan", "scan barcode",
+             "iniciar escaneo", "escanear con gafas", "escanear código", "escanear código de barras":
             return .startMetaScan
-        case "stop glasses scan", "stop meta scan", "stop scan":
+        case "stop glasses scan", "stop meta scan", "stop scan",
+             "detener escaneo", "parar escaneo":
             return .stopMetaScan
-        case "read instruction", "repeat instruction", "what is my pick":
+        case "read instruction", "repeat instruction", "what is my pick",
+             "leer instrucción", "repetir instrucción", "cuál es mi tarea":
             return .readInstruction
-        case "confirm", "confirm pick", "confirmed pick", "confirm picks", "complete order":
+        case "confirm", "confirm pick", "confirmed pick", "confirm picks", "complete order",
+             "confirmar", "confirmar selección", "confirmar pedido", "completar pedido":
             return .confirmPick
         default:
             return nil

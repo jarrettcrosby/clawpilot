@@ -75,6 +75,9 @@ final class PickingPhoneModel: ObservableObject {
     @Published var isListeningForPickCommand = false
     @Published private(set) var isConfirmingOrder = false
     @Published var audioRouteStatus = "Automatic audio uses the iPhone speaker when no accessory is connected."
+    @Published var voicePackState: OfflineVoicePackState = .notInstalled
+    @Published var instructionLanguage: InstructionVoiceLanguage = .english
+    @Published var pronunciationCorrections: [PronunciationCorrection] = []
 
     private let cache: DurablePickCache
     private let api: PickingAPIClient
@@ -166,6 +169,21 @@ final class PickingPhoneModel: ObservableObject {
         ) as? String ?? "https://build.invalid"
         api = try! PickingAPIClient(origin: URL(string: configured)!)
         picking = PickingSession(cache: cache)
+        voicePackState = voice.voicePackState
+        instructionLanguage = voice.instructionLanguage
+        pronunciationCorrections = voice.pronunciationCorrections
+        voice.onVoicePackStateChange = { [weak self] state in
+            self?.voicePackState = state
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            await self.voice.prepareInstalledVoicePack()
+#if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("--voice-self-test") {
+                print("CLAWPILOT_VOICE_SELF_TEST \(await self.voice.runOfflineVoiceSelfTest())")
+            }
+#endif
+        }
         watch.onCommand = { [weak self] command in
             Task { await self?.handleWatchCommand(command) }
         }
@@ -610,7 +628,10 @@ final class PickingPhoneModel: ObservableObject {
             if source == .metaGlasses {
                 ClawPilotScanDiagnostic.record("mismatch:\(value)")
             }
-            voice.speak("Wrong product. Scan the displayed product.")
+            voice.speak(
+                "Wrong product. Scan the displayed product.",
+                spanish: "Producto incorrecto. Escanea el producto mostrado."
+            )
             refreshAudioRouteStatus()
         } catch { status = "Scan rejected: \(error.localizedDescription)" }
     }
@@ -683,7 +704,10 @@ final class PickingPhoneModel: ObservableObject {
             metaSource = nil
             metaStatus = "No barcode was found within 15 seconds. Start another glasses scan or use the iPhone camera."
             ClawPilotScanDiagnostic.record("timeout:no-barcode")
-            voice.speak("No barcode found. Try the glasses scan again or use the iPhone camera.")
+            voice.speak(
+                "No barcode found. Try the glasses scan again or use the iPhone camera.",
+                spanish: "No se encontró un código de barras. Intenta otra vez con las gafas o usa la cámara del iPhone."
+            )
             refreshAudioRouteStatus()
         } catch {
             metaStatus = "Meta scan unavailable. Use iPhone camera: \(error.localizedDescription)"
@@ -870,8 +894,17 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func readInstruction() {
-        if let currentTask { voice.speak(PickVoice.instruction(for: currentTask)) }
-        else if readyToConfirm { voice.speak("All products scanned. Say confirm pick to submit the order.") }
+        if let currentTask {
+            voice.speak(PickVoice.instruction(
+                for: currentTask,
+                languageCode: instructionLanguage.languageCode
+            ))
+        } else if readyToConfirm {
+            voice.speak(
+                "All products scanned. Say confirm pick to submit the order.",
+                spanish: "Todos los productos están escaneados. Di confirmar pedido para enviarlo."
+            )
+        }
         refreshAudioRouteStatus()
     }
 
@@ -915,7 +948,10 @@ final class PickingPhoneModel: ObservableObject {
         case .confirmPick:
             guard readyToConfirm else {
                 status = "Scan every assigned product before confirming from Apple Watch."
-                voice.speak("Scan every assigned product before confirming.")
+                voice.speak(
+                    "Scan every assigned product before confirming.",
+                    spanish: "Escanea todos los productos asignados antes de confirmar."
+                )
                 return
             }
             await confirmOrder()
@@ -927,7 +963,10 @@ final class PickingPhoneModel: ObservableObject {
     private func handlePickVoiceAction(_ transcript: String) async {
         guard let action = PickVoice.action(for: transcript) else {
             status = "Command not recognized. Say “Start glasses scan,” “Read instruction,” or “Confirm pick.”"
-            voice.speak("Command not recognized.")
+            voice.speak(
+                "Command not recognized.",
+                spanish: "Comando no reconocido."
+            )
             refreshAudioRouteStatus()
             return
         }
@@ -941,7 +980,10 @@ final class PickingPhoneModel: ObservableObject {
         case .confirmPick:
             guard readyToConfirm else {
                 status = "Scan every assigned product before confirming the pick."
-                voice.speak("Scan every assigned product before confirming.")
+                voice.speak(
+                    "Scan every assigned product before confirming.",
+                    spanish: "Escanea todos los productos asignados antes de confirmar."
+                )
                 refreshAudioRouteStatus()
                 return
             }
@@ -952,7 +994,10 @@ final class PickingPhoneModel: ObservableObject {
     private func beginHandsFreeConfirmation() async {
         guard readyToConfirm, !hasPendingConfirmation, !isConfirmingOrder else { return }
         status = "Barcode matched. Voice confirmation will listen after the prompt."
-        await voice.speakAndWait("Item matched. Say confirm pick to submit.")
+        await voice.speakAndWait(
+            "Item matched. Say confirm pick to submit.",
+            spanish: "Producto correcto. Di confirmar pedido para enviarlo."
+        )
         guard readyToConfirm, !hasPendingConfirmation, !isConfirmingOrder else { return }
         await listenForConfirmation(automatic: true)
     }
@@ -992,8 +1037,43 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func previewVoice() {
-        voice.speak("ClawPilot voice check. Your next pick instruction will sound like this.")
+        voice.speak(
+            "ClawPilot voice check. Your next pick instruction will sound like this.",
+            spanish: "Prueba de voz de ClawPilot. Tu próxima instrucción sonará así."
+        )
         refreshAudioRouteStatus()
+    }
+
+    func installEnhancedVoicePack() async {
+        await voice.installVoicePack()
+    }
+
+    func removeEnhancedVoicePack() async {
+        await voice.removeVoicePack()
+    }
+
+    func selectInstructionLanguage(_ language: InstructionVoiceLanguage) {
+        instructionLanguage = language
+        voice.setInstructionLanguage(language)
+    }
+
+    @discardableResult
+    func addPronunciationCorrection(written: String, spoken: String) -> Bool {
+        guard voice.addPronunciationCorrection(written: written, spoken: spoken) else {
+            return false
+        }
+        pronunciationCorrections = voice.pronunciationCorrections
+        voice.previewPronunciation(spoken)
+        return true
+    }
+
+    func removePronunciationCorrection(id: UUID) {
+        voice.removePronunciationCorrection(id: id)
+        pronunciationCorrections = voice.pronunciationCorrections
+    }
+
+    func previewPronunciation(_ correction: PronunciationCorrection) {
+        voice.previewPronunciation(correction.spoken)
     }
 
     func openAppSettings() {
@@ -1012,7 +1092,7 @@ final class PickingPhoneModel: ObservableObject {
             try await picking.finishConfirmedOrder()
             hasPendingConfirmation = false
             status = "ClawPilot confirmed and audited the picks."
-            voice.speak("Picks confirmed.")
+            voice.speak("Picks confirmed.", spanish: "Pedido confirmado.")
             refreshAudioRouteStatus()
             await loadPickerPerformance()
             await loadQueue(readAloud: false)

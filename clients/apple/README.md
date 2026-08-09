@@ -25,6 +25,18 @@ reads one barcode locally without saving a photo. Returning from Meta AI starts
 a bounded reconnection poll; **Reconnect glasses** retries it without requiring
 the worker to leave ClawPilot. The iPhone camera remains an explicit fallback.
 
+Instruction audio can use the optional Supertonic-3 FP16 voice pack through
+SpeechSwift 0.0.23. The pack is installed explicitly from the Picker audio card,
+validated by exact asset sizes, stored in the app's model cache, and runs locally
+through CoreML after download. English and Spanish instructions use separately
+validated voice profiles; Apple speech remains the safe fallback while the pack is
+absent, downloading, invalid, or unavailable. The approximately 332 MB model is
+derived from Supertone's Supertonic-3 under the OpenRAIL-M license. Supertonic
+requires iOS 18 while the Watch target remains watchOS 10.2.
+The Picker audio card also maintains a device-local pronunciation dictionary;
+operators can add, preview, replace, and remove written-term to spoken-term
+corrections, which apply to both the enhanced voice and Apple fallback speech.
+
 The client reads the signed worker queue from `GET /api/operations/picks` and
 submits the existing `confirm-picks` command to `POST /api/operations` with the
 order's `expectedRowVersion` and a durable `Idempotency-Key`. A timeout or other
