@@ -143,6 +143,7 @@ final class VoiceConfirmationController {
     private var recognitionTask: SFSpeechRecognitionTask?
     private var recognitionTimeoutTask: Task<Void, Never>?
     private var recognitionFinalHandler: (@MainActor (String) -> Void)?
+    private var inputTapInstalled = false
     private(set) var voicePackState: OfflineVoicePackState
     var onVoicePackStateChange: (@MainActor (OfflineVoicePackState) -> Void)?
 
@@ -392,6 +393,7 @@ final class VoiceConfirmationController {
         guard granted else { throw VoiceError.permissionDenied }
 
         stopListening()
+        stopSpeech()
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = false
         self.request = request
@@ -416,11 +418,28 @@ final class VoiceConfirmationController {
         }
         let input = audioEngine.inputNode
         let format = input.outputFormat(forBus: 0)
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            stopListening()
+            throw VoiceError.microphoneUnavailable
+        }
+        let audioTapHandler: @Sendable (AVAudioPCMBuffer, AVAudioTime) -> Void = {
+            buffer, _ in
             request.append(buffer)
         }
+        input.installTap(
+            onBus: 0,
+            bufferSize: 1024,
+            format: nil,
+            block: audioTapHandler
+        )
+        inputTapInstalled = true
         audioEngine.prepare()
-        try audioEngine.start()
+        do {
+            try audioEngine.start()
+        } catch {
+            stopListening()
+            throw error
+        }
         let recognizer = SFSpeechRecognizer(
             locale: Locale(identifier: instructionLanguage.recognitionLocaleIdentifier)
         )
@@ -463,7 +482,11 @@ final class VoiceConfirmationController {
         recognitionTimeoutTask?.cancel()
         recognitionTimeoutTask = nil
         if audioEngine.isRunning { audioEngine.stop() }
-        audioEngine.inputNode.removeTap(onBus: 0)
+        if inputTapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            inputTapInstalled = false
+        }
+        audioEngine.reset()
         request?.endAudio()
         recognitionTask?.cancel()
         request = nil
@@ -688,6 +711,7 @@ final class VoiceConfirmationController {
         case emptyAudio
         case playbackFailed
         case incompleteVoicePack
+        case microphoneUnavailable
 
         var errorDescription: String? {
             switch self {
@@ -699,6 +723,8 @@ final class VoiceConfirmationController {
                 "The enhanced voice audio player could not start."
             case .incompleteVoicePack:
                 "The downloaded voice pack is incomplete or failed validation."
+            case .microphoneUnavailable:
+                "The microphone is not ready. Reconnect the audio device and try again."
             }
         }
     }
