@@ -83,11 +83,12 @@ struct MetaWearablesStatusSnapshot {
     let connectedDeviceCount: Int
 }
 
-enum MetaScanError: LocalizedError, Sendable {
+enum MetaScanError: LocalizedError, Sendable, Equatable {
     case unavailable
     case registrationRequired
     case cameraPermissionRequired
     case exactlyOneDeviceRequired
+    case glassesAppUpdateRequired
     case sessionFailed
 
     var errorDescription: String? {
@@ -100,6 +101,8 @@ enum MetaScanError: LocalizedError, Sendable {
             "Allow Meta camera access before starting a scan."
         case .exactlyOneDeviceRequired:
             "Connect exactly one compatible pair of Meta glasses."
+        case .glassesAppUpdateRequired:
+            "The Meta camera software on the glasses must be updated before scanning."
         case .sessionFailed:
             "The glasses camera session did not become ready. Reconnect the glasses and try again."
         }
@@ -168,7 +171,7 @@ actor MetaWearablesBarcodeSource {
         }.store(in: sessionTokens)
         session.errorPublisher.listen { [weak self] error in
             ClawPilotScanDiagnostic.record("session-error:\(String(describing: error))")
-            Task { await self?.stop() }
+            Task { await self?.handleSessionError(error) }
         }.store(in: sessionTokens)
         try await withCheckedThrowingContinuation { continuation in
             startContinuation = continuation
@@ -203,6 +206,14 @@ actor MetaWearablesBarcodeSource {
         case .started: attachCamera()
         case .stopped: stop()
         case .idle, .starting, .paused, .stopping: break
+        }
+    }
+
+    private func handleSessionError(_ error: DeviceSessionError) {
+        if error == .datAppOnTheGlassesUpdateRequired {
+            failStart(MetaScanError.glassesAppUpdateRequired)
+        } else {
+            failStart(MetaScanError.sessionFailed)
         }
     }
 
@@ -297,24 +308,24 @@ actor MetaWearablesBarcodeSource {
         _ = camera.stream.capturePhoto(format: .jpeg)
     }
 
-    private func failStart() {
-        guard let startContinuation else { return }
-        self.startContinuation = nil
-        startContinuation.resume(throwing: MetaScanError.sessionFailed)
-        if active {
-            active = false
-            streamTokens.clear()
-            sessionTokens.clear()
-            videoFallbackTask?.cancel()
-            videoFallbackTask = nil
-            photoRetryTask?.cancel()
-            photoRetryTask = nil
-            camera?.stop()
-            deviceSession?.stop()
-            camera = nil
-            deviceSession = nil
-            continuation.finish()
+    private func failStart(_ error: any Error = MetaScanError.sessionFailed) {
+        if let startContinuation {
+            self.startContinuation = nil
+            startContinuation.resume(throwing: error)
         }
+        guard active else { return }
+        active = false
+        streamTokens.clear()
+        sessionTokens.clear()
+        videoFallbackTask?.cancel()
+        videoFallbackTask = nil
+        photoRetryTask?.cancel()
+        photoRetryTask = nil
+        camera?.stop()
+        deviceSession?.stop()
+        camera = nil
+        deviceSession = nil
+        continuation.finish()
     }
 }
 

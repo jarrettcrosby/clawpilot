@@ -70,6 +70,7 @@ final class PickingPhoneModel: ObservableObject {
     @Published var canRequestMetaCamera = false
     @Published var metaCameraGranted = false
     @Published var metaConnectedDeviceCount = 0
+    @Published var metaGlassesAppUpdateRequired = false
     @Published var isMetaSyncing = false
     @Published var isMetaScanning = false
     @Published var isListeningForPickCommand = false
@@ -677,12 +678,14 @@ final class PickingPhoneModel: ObservableObject {
                     ClawPilotScanDiagnostic.record("camera-start-failed:\(attempt):\(error.localizedDescription)")
                     await candidate.stop()
                     metaSource = nil
+                    if error as? MetaScanError == .glassesAppUpdateRequired { break }
                     if attempt < 3 { try? await Task.sleep(for: .seconds(1)) }
                 }
             }
             guard let source = startedSource else {
                 throw startError ?? MetaScanError.sessionFailed
             }
+            metaGlassesAppUpdateRequired = false
             metaStatus = "Meta camera is live. Look directly at the product barcode; no photo is saved."
             ClawPilotScanDiagnostic.record("camera-live")
             let value = await withTaskGroup(of: String?.self) { group in
@@ -716,7 +719,12 @@ final class PickingPhoneModel: ObservableObject {
             )
             refreshAudioRouteStatus()
         } catch {
-            metaStatus = "Meta scan unavailable. Use iPhone camera: \(error.localizedDescription)"
+            if error as? MetaScanError == .glassesAppUpdateRequired {
+                metaGlassesAppUpdateRequired = true
+                metaStatus = "Camera software update required. Tap Update camera software, finish the update in Meta AI, then return to ClawPilot. Do not reset or re-pair the glasses."
+            } else {
+                metaStatus = "Meta scan unavailable. Use iPhone camera: \(error.localizedDescription)"
+            }
             ClawPilotScanDiagnostic.record("error:\(error.localizedDescription)")
             if let metaSource { await metaSource.stop() }
             metaSource = nil
@@ -812,10 +820,10 @@ final class PickingPhoneModel: ObservableObject {
 
     func checkMetaAppUpdate() async {
         do {
-            metaStatus = "Opening the Meta AI app update check."
+            metaStatus = "Opening Meta AI to update the camera software on the glasses."
             try await MetaWearablesAppBridge.openMetaAppUpdate()
         } catch {
-            metaStatus = "Could not open the Meta AI update check: \(error.localizedDescription)"
+            metaStatus = "Could not open the camera software update: \(error.localizedDescription)"
         }
     }
 

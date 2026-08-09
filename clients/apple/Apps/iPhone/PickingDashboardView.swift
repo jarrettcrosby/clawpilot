@@ -420,7 +420,9 @@ struct PickingDashboardView: View {
                             .foregroundStyle(PickingTheme.text)
                         Text(model.metaScanReady
                             ? "Connected · Camera ready"
-                            : model.metaCameraGranted ? "Registered · Reconnecting" : "Setup required")
+                            : model.metaGlassesAppUpdateRequired
+                                ? "Camera software update required"
+                                : model.metaCameraGranted ? "Registered · Reconnecting" : "Setup required")
                             .font(.subheadline)
                             .foregroundStyle(model.metaScanReady ? PickingTheme.mint : PickingTheme.muted)
                     }
@@ -442,7 +444,16 @@ struct PickingDashboardView: View {
                     .foregroundStyle(PickingTheme.muted)
                     .fixedSize(horizontal: false, vertical: true)
 
-                if model.canRegisterMeta {
+                if model.metaGlassesAppUpdateRequired {
+                    Button("Update camera software in Meta AI") {
+                        Task { await model.checkMetaAppUpdate() }
+                    }
+                    .buttonStyle(PrimaryDashboardButtonStyle())
+
+                    Text("Finish the update in Meta AI, then return to ClawPilot and start the scan again. Do not reset ClawPilot or re-pair the glasses for this update.")
+                        .font(.caption2)
+                        .foregroundStyle(PickingTheme.muted)
+                } else if model.canRegisterMeta {
                     Button("Register with Meta") { Task { await model.registerMeta() } }
                         .buttonStyle(PrimaryDashboardButtonStyle())
                 } else if model.canRequestMetaCamera {
@@ -460,7 +471,7 @@ struct PickingDashboardView: View {
                         }
                         .buttonStyle(SecondaryDashboardButtonStyle())
 
-                        Button("Meta AI update") {
+                        Button("Camera software") {
                             Task { await model.checkMetaAppUpdate() }
                         }
                         .buttonStyle(SecondaryDashboardButtonStyle())
