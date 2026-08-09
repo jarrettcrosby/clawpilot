@@ -119,9 +119,7 @@ actor MetaWearablesBarcodeSource {
     private var camera: MWDATCamera.Camera?
     private var active = false
     private var startContinuation: CheckedContinuation<Void, any Error>?
-    private var videoListenerAttached = false
     private var photoRequested = false
-    private var videoFallbackTask: Task<Void, Never>?
     private var photoRetryTask: Task<Void, Never>?
 
     init() {
@@ -163,7 +161,6 @@ actor MetaWearablesBarcodeSource {
         active = true
         deviceSession = session
         processor.reset()
-        videoListenerAttached = false
         photoRequested = false
         session.statePublisher.listen { [weak self] state in
             ClawPilotScanDiagnostic.record("session-state:\(String(describing: state))")
@@ -190,8 +187,6 @@ actor MetaWearablesBarcodeSource {
         active = false
         streamTokens.clear()
         sessionTokens.clear()
-        videoFallbackTask?.cancel()
-        videoFallbackTask = nil
         photoRetryTask?.cancel()
         photoRetryTask = nil
         camera?.stop()
@@ -222,7 +217,7 @@ actor MetaWearablesBarcodeSource {
         do {
             let configuration = StreamConfiguration(
                 videoCodec: .raw,
-                resolution: .medium,
+                resolution: .high,
                 frameRate: 15
             )
             guard let camera = try deviceSession.addCamera(config: configuration) else {
@@ -233,6 +228,9 @@ actor MetaWearablesBarcodeSource {
             let processor = processor
             camera.stream.photoDataPublisher.listen { photo in
                 processor.consume(photo)
+            }.store(in: streamTokens)
+            camera.stream.videoFramePublisher.listen { frame in
+                processor.consume(frame)
             }.store(in: streamTokens)
             camera.stream.statePublisher.listen { [weak self] state in
                 ClawPilotScanDiagnostic.record("stream-state:\(String(describing: state))")
@@ -256,12 +254,6 @@ actor MetaWearablesBarcodeSource {
                 photoRequested = true
                 let accepted = camera.stream.capturePhoto(format: .jpeg)
                 if accepted {
-                    videoFallbackTask?.cancel()
-                    videoFallbackTask = Task { [weak self] in
-                        try? await Task.sleep(for: .milliseconds(700))
-                        guard !Task.isCancelled else { return }
-                        await self?.enableVideoFallback()
-                    }
                     photoRetryTask?.cancel()
                     photoRetryTask = Task { [weak self] in
                         // The first photo can occur before the worker has the
@@ -273,8 +265,6 @@ actor MetaWearablesBarcodeSource {
                             await self?.captureFollowupPhoto()
                         }
                     }
-                } else {
-                    enableVideoFallback()
                 }
             }
             startContinuation?.resume()
@@ -288,19 +278,10 @@ actor MetaWearablesBarcodeSource {
 
     private func handleStreamError(_ error: StreamError) {
         if error == .photoCaptureFailed {
-            enableVideoFallback()
+            captureFollowupPhoto()
         } else {
             stop()
         }
-    }
-
-    private func enableVideoFallback() {
-        guard active, !videoListenerAttached, let camera else { return }
-        videoListenerAttached = true
-        let processor = processor
-        camera.stream.videoFramePublisher.listen { frame in
-            processor.consume(frame)
-        }.store(in: streamTokens)
     }
 
     private func captureFollowupPhoto() {
@@ -317,8 +298,6 @@ actor MetaWearablesBarcodeSource {
         active = false
         streamTokens.clear()
         sessionTokens.clear()
-        videoFallbackTask?.cancel()
-        videoFallbackTask = nil
         photoRetryTask?.cancel()
         photoRetryTask = nil
         camera?.stop()
@@ -334,6 +313,9 @@ private final class MetaVisionFrameProcessor: @unchecked Sendable {
     private let continuation: AsyncStream<String>.Continuation
     private var decoding = false
     private var emitted = false
+    private var recordedVideoInput = false
+    private var recordedPhotoInput = false
+    private var recordedCandidate = false
 
     init(continuation: AsyncStream<String>.Continuation) {
         self.continuation = continuation
@@ -343,10 +325,20 @@ private final class MetaVisionFrameProcessor: @unchecked Sendable {
         lock.lock()
         emitted = false
         decoding = false
+        recordedVideoInput = false
+        recordedPhotoInput = false
+        recordedCandidate = false
         lock.unlock()
     }
 
     func consume(_ frame: VideoFrame) {
+        if markFirstInput(isPhoto: false) {
+            var dimensions = "unknown"
+            if let buffer = CMSampleBufferGetImageBuffer(frame.sampleBuffer) {
+                dimensions = "\(CVPixelBufferGetWidth(buffer))x\(CVPixelBufferGetHeight(buffer))"
+            }
+            ClawPilotScanDiagnostic.record("video-received:\(dimensions)")
+        }
         guard beginDecoding() else { return }
 
         let request = barcodeRequest()
@@ -358,14 +350,30 @@ private final class MetaVisionFrameProcessor: @unchecked Sendable {
     }
 
     func consume(_ photo: PhotoData) {
+        if markFirstInput(isPhoto: true) {
+            ClawPilotScanDiagnostic.record("photo-received:bytes=\(photo.data.count)")
+        }
         guard beginDecoding() else { return }
 
         let request = barcodeRequest()
         try? VNImageRequestHandler(
             data: photo.data,
-            orientation: .up
+            orientation: imageOrientation(in: photo.data)
         ).perform([request])
         finishDecoding(request)
+    }
+
+    private func markFirstInput(isPhoto: Bool) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if isPhoto {
+            guard !recordedPhotoInput else { return false }
+            recordedPhotoInput = true
+        } else {
+            guard !recordedVideoInput else { return false }
+            recordedVideoInput = true
+        }
+        return true
     }
 
     private func beginDecoding() -> Bool {
@@ -381,22 +389,50 @@ private final class MetaVisionFrameProcessor: @unchecked Sendable {
 
     private func barcodeRequest() -> VNDetectBarcodesRequest {
         let request = VNDetectBarcodesRequest()
-        request.symbologies = [.dataMatrix, .qr, .code128, .ean8, .ean13, .upce]
+        request.symbologies = [
+            .ean8, .ean13, .upce,
+            .code128, .code39, .code93,
+            .i2of5, .itf14,
+            .gs1DataBar, .gs1DataBarExpanded, .gs1DataBarLimited,
+            .dataMatrix, .qr, .pdf417, .aztec,
+        ]
         return request
     }
 
     private func finishDecoding(_ request: VNDetectBarcodesRequest) {
-        let observations = (request.results ?? []).filter { $0.confidence >= 0.5 }
-        let value = observations.count == 1 ? observations.first?.payloadStringValue : nil
+        let observations = (request.results ?? []).filter { $0.confidence >= 0.25 }
+        let values = Set(observations.compactMap(\.payloadStringValue).filter { !$0.isEmpty })
+        let value = values.count == 1 ? values.first : nil
+        let bestConfidence = observations.map(\.confidence).max()
 
         lock.lock()
         decoding = false
+        let shouldRecordCandidate = !values.isEmpty && !recordedCandidate
+        if shouldRecordCandidate { recordedCandidate = true }
         if let value, !value.isEmpty, !emitted {
             emitted = true
             lock.unlock()
+            ClawPilotScanDiagnostic.record(
+                "vision-decoded:\(value):confidence=\(bestConfidence ?? 0)"
+            )
             continuation.yield(value)
         } else {
             lock.unlock()
+            if shouldRecordCandidate {
+                ClawPilotScanDiagnostic.record(
+                    "vision-candidates:\(values.count):confidence=\(bestConfidence ?? 0)"
+                )
+            }
         }
+    }
+
+    private func imageOrientation(in data: Data) -> CGImagePropertyOrientation {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+                as? [CFString: Any],
+              let rawValue = properties[kCGImagePropertyOrientation] as? UInt32,
+              let orientation = CGImagePropertyOrientation(rawValue: rawValue)
+        else { return .up }
+        return orientation
     }
 }

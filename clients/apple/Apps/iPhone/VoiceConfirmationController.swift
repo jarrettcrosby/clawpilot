@@ -263,12 +263,13 @@ final class VoiceConfirmationController {
     func prepareInstalledVoicePack() async {
 #if !targetEnvironment(simulator)
         do {
+            try Self.preparePersistentVoicePackStorage()
             if FileManager.default.fileExists(atPath: Self.legacyKokoroDirectory.path) {
                 try FileManager.default.removeItem(at: Self.legacyKokoroDirectory)
             }
         } catch {
             setVoicePackState(.failed(
-                "The retired voice pack could not be removed: \(error.localizedDescription)"
+                "Enhanced voice storage could not be prepared: \(error.localizedDescription)"
             ))
             return
         }
@@ -298,6 +299,7 @@ final class VoiceConfirmationController {
         await offlineSpeech.unload()
         setVoicePackState(.downloading(progress: 0, status: "Starting the one-time download."))
         do {
+            try Self.preparePersistentVoicePackStorage()
             try await offlineSpeech.load(
                 cacheDirectory: Self.voicePackDirectory,
                 offlineMode: false,
@@ -327,6 +329,9 @@ final class VoiceConfirmationController {
         do {
             if FileManager.default.fileExists(atPath: Self.voicePackDirectory.path) {
                 try FileManager.default.removeItem(at: Self.voicePackDirectory)
+            }
+            if FileManager.default.fileExists(atPath: Self.purgeableVoicePackDirectory.path) {
+                try FileManager.default.removeItem(at: Self.purgeableVoicePackDirectory)
             }
             setVoicePackState(.notInstalled)
         } catch {
@@ -633,13 +638,25 @@ final class VoiceConfirmationController {
 
     private static var voicePackDirectory: URL {
         // SpeechSwift's Hub downloader expects a <base>/models/<organization>/<model>
-        // layout. The loader and downloader use the same directory so a completed
-        // snapshot is immediately available for offline synthesis.
+        // layout. Application Support is intentional: iOS may purge Library/Caches,
+        // but this user-installed offline model must survive routine storage cleanup.
+        voicePackStorageRoot
+            .appendingPathComponent("ClawPilotPicking", isDirectory: true)
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent("aufklarer", isDirectory: true)
+            .appendingPathComponent("Supertonic-3-CoreML-FP16", isDirectory: true)
+    }
+
+    private static var purgeableVoicePackDirectory: URL {
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("ClawPilotPicking", isDirectory: true)
             .appendingPathComponent("models", isDirectory: true)
             .appendingPathComponent("aufklarer", isDirectory: true)
             .appendingPathComponent("Supertonic-3-CoreML-FP16", isDirectory: true)
+    }
+
+    private static var voicePackStorageRoot: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
     }
 
     private static var legacyKokoroDirectory: URL {
@@ -650,7 +667,43 @@ final class VoiceConfirmationController {
             .appendingPathComponent("Kokoro-82M-CoreML-INT8", isDirectory: true)
     }
 
+    private static func preparePersistentVoicePackStorage() throws {
+        let root = voicePackDirectory
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutableRoot = root
+        try mutableRoot.setResourceValues(values)
+
+        guard isVoicePackInstalled(at: purgeableVoicePackDirectory) else { return }
+        if isVoicePackInstalled(at: voicePackDirectory) {
+            try? FileManager.default.removeItem(at: purgeableVoicePackDirectory)
+            return
+        }
+        if FileManager.default.fileExists(atPath: voicePackDirectory.path) {
+            try FileManager.default.removeItem(at: voicePackDirectory)
+        }
+        try FileManager.default.createDirectory(
+            at: voicePackDirectory.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.moveItem(
+            at: purgeableVoicePackDirectory,
+            to: voicePackDirectory
+        )
+    }
+
     private static var isVoicePackInstalled: Bool {
+        isVoicePackInstalled(at: voicePackDirectory)
+    }
+
+    private static func isVoicePackInstalled(at directory: URL) -> Bool {
         let requiredSizes: [String: UInt64] = [
             "DurationPredictor.mlpackage/Data/com.apple.CoreML/model.mlmodel": 93_496,
             "DurationPredictor.mlpackage/Data/com.apple.CoreML/weights/weight.bin": 1_797_952,
@@ -670,7 +723,7 @@ final class VoiceConfirmationController {
             "voice_styles/F2.json": 292_423,
         ]
         return requiredSizes.allSatisfy { relativePath, expectedSize in
-            let url = voicePackDirectory.appendingPathComponent(relativePath)
+            let url = directory.appendingPathComponent(relativePath)
             guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
                   let fileSize = attributes[.size] as? NSNumber
             else { return false }
