@@ -6,6 +6,7 @@ public struct PickTask: Codable, Equatable, Identifiable, Sendable {
     public let productGlobalId: String
     public let productName: String
     public let channelSku: String
+    public let productImageURL: URL?
     public let barcode: String?
     public let locationCode: String
     public let quantity: Double
@@ -18,6 +19,7 @@ public struct PickTask: Codable, Equatable, Identifiable, Sendable {
         productGlobalId: String,
         productName: String,
         channelSku: String,
+        productImageURL: URL? = nil,
         barcode: String?,
         locationCode: String,
         quantity: Double
@@ -36,6 +38,7 @@ public struct PickTask: Codable, Equatable, Identifiable, Sendable {
         self.productGlobalId = productGlobalId
         self.productName = productName
         self.channelSku = channelSku
+        self.productImageURL = productImageURL
         self.barcode = barcode
         self.locationCode = locationCode
         self.quantity = quantity
@@ -148,6 +151,8 @@ public enum BarcodeMatcher {
 
 public struct WatchPickCard: Codable, Equatable, Sendable {
     public let productName: String
+    public let channelSku: String?
+    public let productImageURL: URL?
     public let locationCode: String
     public let quantity: Double
     public let progress: String
@@ -159,6 +164,23 @@ public struct WatchPickSnapshot: Codable, Equatable, Sendable {
     public let current: WatchPickCard?
     public let upcoming: [WatchPickCard]
     public let generatedAt: Date
+}
+
+public enum WatchPickAction: String, Codable, Equatable, Sendable {
+    case requestMetaScan = "request_meta_scan"
+    case readInstruction = "read_instruction"
+    case confirmPick = "confirm_pick"
+    case refreshQueue = "refresh_queue"
+}
+
+public struct WatchPickCommand: Codable, Equatable, Sendable {
+    public let id: String
+    public let action: WatchPickAction
+
+    public init(id: String = UUID().uuidString.lowercased(), action: WatchPickAction) {
+        self.id = id
+        self.action = action
+    }
 }
 
 public struct ConfirmPicksCommand: Codable, Equatable, Sendable {

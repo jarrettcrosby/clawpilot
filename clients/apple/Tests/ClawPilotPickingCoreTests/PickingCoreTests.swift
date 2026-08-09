@@ -35,7 +35,9 @@ private func fixtureQueue() throws -> PickQueue {
         PickTask(
             pickTaskGlobalId: "gpk0000001", sequence: 1,
             productGlobalId: "gp0000001", productName: "Blue Widget",
-            channelSku: "BLUE-1", barcode: "012345678905",
+            channelSku: "BLUE-1",
+            productImageURL: URL(string: "https://example.com/product.png"),
+            barcode: "012345678905",
             locationCode: "A-01-01", quantity: 2
         ),
         PickTask(
@@ -98,13 +100,31 @@ func safeWatchProjection() async throws {
     let data = try JSONEncoder().encode(snapshot)
     let text = String(decoding: data, as: UTF8.self)
     #expect(text.contains("Blue Widget"))
+    #expect(snapshot.current?.productImageURL?.absoluteString == "https://example.com/product.png")
     #expect(!text.contains("012345678905"))
     #expect(!text.contains("orderGlobalId"))
     #expect(snapshot.upcoming.count == 1)
 }
 
+@Test("Watch commands carry bounded actions but no pick or order identity")
+func safeWatchCommand() throws {
+    let command = WatchPickCommand(id: "watch-command-1", action: .confirmPick)
+    let data = try JSONEncoder().encode(command)
+    let text = String(decoding: data, as: UTF8.self)
+    #expect(text.contains("confirm_pick"))
+    #expect(!text.contains("orderGlobalId"))
+    #expect(!text.contains("pickTaskGlobalId"))
+}
+
 @Test("voice grammar is bounded and never supplies task identity")
 func voiceGrammar() {
     #expect(PickVoice.isConfirmation("confirm pick"))
+    #expect(PickVoice.isConfirmation("Confirmed pick."))
+    #expect(PickVoice.isConfirmation("confirm picks"))
+    #expect(PickVoice.action(for: "start glasses scan") == .startMetaScan)
+    #expect(PickVoice.action(for: "scan with glasses") == .startMetaScan)
+    #expect(PickVoice.action(for: "stop scan") == .stopMetaScan)
+    #expect(PickVoice.action(for: "repeat instruction") == .readInstruction)
     #expect(!PickVoice.isConfirmation("pick order 1001 quantity 10"))
+    #expect(PickVoice.action(for: "pick order 1001 quantity 10") == nil)
 }

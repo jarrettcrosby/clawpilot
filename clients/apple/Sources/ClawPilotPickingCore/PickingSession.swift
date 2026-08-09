@@ -70,6 +70,8 @@ public actor PickingSession {
         func card(_ task: PickTask) -> WatchPickCard {
             WatchPickCard(
                 productName: task.productName,
+                channelSku: task.channelSku,
+                productImageURL: task.productImageURL,
                 locationCode: task.locationCode,
                 quantity: task.quantity,
                 progress: "\(scannedTaskIDs.count + 1) of \(order.tasks.count)"
@@ -114,14 +116,38 @@ public actor PickingSession {
 }
 
 public enum PickVoice {
+    public enum Action: Equatable, Sendable {
+        case startMetaScan
+        case stopMetaScan
+        case readInstruction
+        case confirmPick
+    }
+
     public static func instruction(for task: PickTask) -> String {
         "Pick \(task.quantity.formatted()) of \(task.productName) from \(task.locationCode). Scan the product barcode."
     }
 
-    public static func isConfirmation(_ transcript: String) -> Bool {
+    public static func action(for transcript: String) -> Action? {
         let normalized = transcript
             .lowercased()
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return ["confirm", "confirm pick", "complete order"].contains(normalized)
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        switch normalized {
+        case "start glasses scan", "scan with glasses", "start meta scan", "scan barcode":
+            return .startMetaScan
+        case "stop glasses scan", "stop meta scan", "stop scan":
+            return .stopMetaScan
+        case "read instruction", "repeat instruction", "what is my pick":
+            return .readInstruction
+        case "confirm", "confirm pick", "confirmed pick", "confirm picks", "complete order":
+            return .confirmPick
+        default:
+            return nil
+        }
+    }
+
+    public static func isConfirmation(_ transcript: String) -> Bool {
+        action(for: transcript) == .confirmPick
     }
 }

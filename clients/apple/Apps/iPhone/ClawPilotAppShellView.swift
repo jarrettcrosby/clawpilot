@@ -51,6 +51,8 @@ struct ClawPilotAppShellView: View {
             LoginGateView(model: model)
         case "manager":
             NavigationStack { ManagerModuleView(model: model) }
+        case "picker":
+            NavigationStack { PickingDashboardView(model: model) }
         case "orders":
             NavigationStack { ManagerPickingOperationsView(model: model) }
         case "assignment":

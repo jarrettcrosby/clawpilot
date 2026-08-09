@@ -21,6 +21,18 @@ enum MetaWearablesAppBridge {
         guard isConfigured else { throw MetaBridgeError.notConfigured }
         try await Wearables.shared.startRegistration()
     }
+    static func startUnregistration() async throws {
+        guard isConfigured else { throw MetaBridgeError.notConfigured }
+        try await Wearables.shared.startUnregistration()
+    }
+    static func openFirmwareUpdate() async throws {
+        guard isConfigured else { throw MetaBridgeError.notConfigured }
+        try await Wearables.shared.openFirmwareUpdate()
+    }
+    static func openMetaAppUpdate() async throws {
+        guard isConfigured else { throw MetaBridgeError.notConfigured }
+        try await Wearables.shared.openDATGlassesAppUpdate()
+    }
     static func statusSnapshot() async -> MetaWearablesStatusSnapshot {
         guard isConfigured else {
             return MetaWearablesStatusSnapshot(
@@ -71,12 +83,27 @@ struct MetaWearablesStatusSnapshot {
     let connectedDeviceCount: Int
 }
 
-enum MetaScanError: Error, Sendable {
+enum MetaScanError: LocalizedError, Sendable {
     case unavailable
     case registrationRequired
     case cameraPermissionRequired
     case exactlyOneDeviceRequired
     case sessionFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .unavailable:
+            "Meta Wearables is unavailable in this build."
+        case .registrationRequired:
+            "Register ClawPilot with Meta before starting a scan."
+        case .cameraPermissionRequired:
+            "Allow Meta camera access before starting a scan."
+        case .exactlyOneDeviceRequired:
+            "Connect exactly one compatible pair of Meta glasses."
+        case .sessionFailed:
+            "The glasses camera session did not become ready. Reconnect the glasses and try again."
+        }
+    }
 }
 
 actor MetaWearablesBarcodeSource {
@@ -88,6 +115,11 @@ actor MetaWearablesBarcodeSource {
     private var deviceSession: DeviceSession?
     private var camera: MWDATCamera.Camera?
     private var active = false
+    private var startContinuation: CheckedContinuation<Void, any Error>?
+    private var videoListenerAttached = false
+    private var photoRequested = false
+    private var videoFallbackTask: Task<Void, Never>?
+    private var photoRetryTask: Task<Void, Never>?
 
     init() {
         var continuation: AsyncStream<String>.Continuation!
@@ -104,14 +136,21 @@ actor MetaWearablesBarcodeSource {
         guard try await Wearables.shared.checkPermissionStatus(.camera) == .granted else {
             throw MetaScanError.cameraPermissionRequired
         }
-        let devices = Wearables.shared.devices.filter { identifier in
+        let registeredDevices = Wearables.shared.devices
+        ClawPilotScanDiagnostic.record("device-count:\(registeredDevices.count)")
+        let devices = registeredDevices.filter { identifier in
             guard let device = Wearables.shared.deviceForIdentifier(identifier) else { return false }
+            let compatibility = device.compatibility()
+            let linkState = device.linkState
+            ClawPilotScanDiagnostic.record(
+                "device-candidate:link=\(String(describing: linkState)):compatibility=\(String(describing: compatibility))"
+            )
 #if DEBUG
-            let compatible = device.compatibility() == .compatible || device.compatibility() == .undefined
+            let compatible = compatibility == .compatible || compatibility == .undefined
 #else
-            let compatible = device.compatibility() == .compatible
+            let compatible = compatibility == .compatible
 #endif
-            return device.linkState == .connected && compatible
+            return linkState == .connected && compatible
         }
         guard devices.count == 1, let identifier = devices.first else {
             throw MetaScanError.exactlyOneDeviceRequired
@@ -121,24 +160,37 @@ actor MetaWearablesBarcodeSource {
         active = true
         deviceSession = session
         processor.reset()
+        videoListenerAttached = false
+        photoRequested = false
         session.statePublisher.listen { [weak self] state in
+            ClawPilotScanDiagnostic.record("session-state:\(String(describing: state))")
             Task { await self?.handleSessionState(state) }
         }.store(in: sessionTokens)
-        session.errorPublisher.listen { [weak self] _ in
+        session.errorPublisher.listen { [weak self] error in
+            ClawPilotScanDiagnostic.record("session-error:\(String(describing: error))")
             Task { await self?.stop() }
         }.store(in: sessionTokens)
-        do { try session.start() } catch {
-            stop()
-            throw MetaScanError.sessionFailed
+        try await withCheckedThrowingContinuation { continuation in
+            startContinuation = continuation
+            do {
+                try session.start()
+            } catch {
+                failStart()
+            }
         }
     }
 
     func stop() {
         continuation.finish()
+        failStart()
         guard active else { return }
         active = false
         streamTokens.clear()
         sessionTokens.clear()
+        videoFallbackTask?.cancel()
+        videoFallbackTask = nil
+        photoRetryTask?.cancel()
+        photoRetryTask = nil
         camera?.stop()
         deviceSession?.stop()
         camera = nil
@@ -168,15 +220,100 @@ actor MetaWearablesBarcodeSource {
             }
             self.camera = camera
             let processor = processor
-            camera.stream.videoFramePublisher.listen { frame in
-                processor.consume(frame)
+            camera.stream.photoDataPublisher.listen { photo in
+                processor.consume(photo)
             }.store(in: streamTokens)
-            camera.stream.errorPublisher.listen { [weak self] _ in
-                Task { await self?.stop() }
+            camera.stream.statePublisher.listen { [weak self] state in
+                ClawPilotScanDiagnostic.record("stream-state:\(String(describing: state))")
+                Task { await self?.handleStreamState(state) }
+            }.store(in: streamTokens)
+            camera.stream.errorPublisher.listen { [weak self] error in
+                ClawPilotScanDiagnostic.record("stream-error:\(String(describing: error))")
+                Task { await self?.handleStreamError(error) }
             }.store(in: streamTokens)
             camera.stream.start()
         } catch {
+            failStart()
+        }
+    }
+
+    private func handleStreamState(_ state: StreamState) {
+        guard active, let camera else { return }
+        switch state {
+        case .streaming:
+            if !photoRequested {
+                photoRequested = true
+                let accepted = camera.stream.capturePhoto(format: .jpeg)
+                if accepted {
+                    videoFallbackTask?.cancel()
+                    videoFallbackTask = Task { [weak self] in
+                        try? await Task.sleep(for: .milliseconds(700))
+                        guard !Task.isCancelled else { return }
+                        await self?.enableVideoFallback()
+                    }
+                    photoRetryTask?.cancel()
+                    photoRetryTask = Task { [weak self] in
+                        // The first photo can occur before the worker has the
+                        // barcode centered. Retry high-resolution capture while
+                        // live frames continue as a lower-latency fallback.
+                        for _ in 0..<6 {
+                            try? await Task.sleep(for: .seconds(2))
+                            guard !Task.isCancelled else { return }
+                            await self?.captureFollowupPhoto()
+                        }
+                    }
+                } else {
+                    enableVideoFallback()
+                }
+            }
+            startContinuation?.resume()
+            startContinuation = nil
+        case .stopped:
             stop()
+        case .stopping, .waitingForDevice, .starting, .paused:
+            break
+        }
+    }
+
+    private func handleStreamError(_ error: StreamError) {
+        if error == .photoCaptureFailed {
+            enableVideoFallback()
+        } else {
+            stop()
+        }
+    }
+
+    private func enableVideoFallback() {
+        guard active, !videoListenerAttached, let camera else { return }
+        videoListenerAttached = true
+        let processor = processor
+        camera.stream.videoFramePublisher.listen { frame in
+            processor.consume(frame)
+        }.store(in: streamTokens)
+    }
+
+    private func captureFollowupPhoto() {
+        guard active, let camera else { return }
+        _ = camera.stream.capturePhoto(format: .jpeg)
+    }
+
+    private func failStart() {
+        guard let startContinuation else { return }
+        self.startContinuation = nil
+        startContinuation.resume(throwing: MetaScanError.sessionFailed)
+        if active {
+            active = false
+            streamTokens.clear()
+            sessionTokens.clear()
+            videoFallbackTask?.cancel()
+            videoFallbackTask = nil
+            photoRetryTask?.cancel()
+            photoRetryTask = nil
+            camera?.stop()
+            deviceSession?.stop()
+            camera = nil
+            deviceSession = nil
+            continuation.finish()
         }
     }
 }
@@ -199,17 +336,45 @@ private final class MetaVisionFrameProcessor: @unchecked Sendable {
     }
 
     func consume(_ frame: VideoFrame) {
-        lock.lock()
-        guard !decoding, !emitted else { lock.unlock(); return }
-        decoding = true
-        lock.unlock()
+        guard beginDecoding() else { return }
 
-        let request = VNDetectBarcodesRequest()
-        request.symbologies = [.dataMatrix, .qr, .code128, .ean8, .ean13, .upce]
+        let request = barcodeRequest()
         try? VNImageRequestHandler(
             cmSampleBuffer: frame.sampleBuffer,
             orientation: .up
         ).perform([request])
+        finishDecoding(request)
+    }
+
+    func consume(_ photo: PhotoData) {
+        guard beginDecoding() else { return }
+
+        let request = barcodeRequest()
+        try? VNImageRequestHandler(
+            data: photo.data,
+            orientation: .up
+        ).perform([request])
+        finishDecoding(request)
+    }
+
+    private func beginDecoding() -> Bool {
+        lock.lock()
+        guard !decoding, !emitted else {
+            lock.unlock()
+            return false
+        }
+        decoding = true
+        lock.unlock()
+        return true
+    }
+
+    private func barcodeRequest() -> VNDetectBarcodesRequest {
+        let request = VNDetectBarcodesRequest()
+        request.symbologies = [.dataMatrix, .qr, .code128, .ean8, .ean13, .upce]
+        return request
+    }
+
+    private func finishDecoding(_ request: VNDetectBarcodesRequest) {
         let observations = (request.results ?? []).filter { $0.confidence >= 0.5 }
         let value = observations.count == 1 ? observations.first?.payloadStringValue : nil
 

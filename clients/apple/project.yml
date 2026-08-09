@@ -101,8 +101,10 @@ targets:
     deploymentTarget: "10.2"
     sources:
       - path: Apps/Watch
+      - path: Assets/ClawPilotAssets.xcassets
     settings:
       base:
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         PRODUCT_BUNDLE_IDENTIFIER: $(CLAWPILOT_WATCH_BUNDLE_IDENTIFIER)
         PRODUCT_NAME: ClawPilotPickingWatch
         TARGETED_DEVICE_FAMILY: "4"

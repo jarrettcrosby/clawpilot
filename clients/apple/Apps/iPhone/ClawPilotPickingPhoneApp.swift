@@ -1,5 +1,6 @@
 import AVFoundation
 import SwiftUI
+import UIKit
 import ClawPilotPickingApple
 import ClawPilotPickingCore
 
@@ -17,10 +18,22 @@ struct ClawPilotPickingPhoneApp: App {
                         onClose: { model.showPhoneScanner = false }
                     )
                 }
-                .onOpenURL { url in Task { await model.handleMetaURL(url) } }
+                .onOpenURL { url in
+                    Task {
+                        if ClawPilotSystemActionLink.requestsScan(url) {
+                            PendingMobileAction.requestMetaScan()
+                            ClawPilotScanDiagnostic.begin("action-link-received")
+                            await model.handlePendingSystemScan()
+                        } else {
+                            await model.handleMetaURL(url)
+                        }
+                    }
+                }
                 .onChange(of: scenePhase) { _, phase in
                     guard phase == .active else { return }
                     model.syncMetaConnection()
+                    model.refreshAudioRouteStatus()
+                    Task { await model.handlePendingSystemScan() }
                 }
                 .task { await model.restoreAndRefresh() }
                 .preferredColorScheme(.dark)
@@ -59,6 +72,9 @@ final class PickingPhoneModel: ObservableObject {
     @Published var metaConnectedDeviceCount = 0
     @Published var isMetaSyncing = false
     @Published var isMetaScanning = false
+    @Published var isListeningForPickCommand = false
+    @Published private(set) var isConfirmingOrder = false
+    @Published var audioRouteStatus = "Automatic audio uses the iPhone speaker when no accessory is connected."
 
     private let cache: DurablePickCache
     private let api: PickingAPIClient
@@ -68,6 +84,7 @@ final class PickingPhoneModel: ObservableObject {
     private var metaSource: MetaWearablesBarcodeSource?
     private var codeRequestCooldown: Task<Void, Never>?
     private var metaConnectionRefreshTask: Task<Void, Never>?
+    private var isHandlingPendingSystemScan = false
 
     var canSendCode: Bool {
         canRequestCode && !isAuthBusy && email.contains("@") && email.count <= 254
@@ -104,6 +121,11 @@ final class PickingPhoneModel: ObservableObject {
         metaCameraGranted && metaConnectedDeviceCount == 1 && !isMetaSyncing
     }
 
+    var canManageMetaConnection: Bool {
+        MetaWearablesAppBridge.isRegistered && !isMetaScanning
+    }
+
+    var playbackPreferenceTitle: String { voice.playbackPreference.title }
     var ownPickerPerformance: PickerPerformanceMetric? {
         guard let email = sessionProfile?.effectiveUser.email.lowercased() else { return nil }
         return pickerPerformance.first { $0.email.lowercased() == email }
@@ -144,6 +166,9 @@ final class PickingPhoneModel: ObservableObject {
         ) as? String ?? "https://build.invalid"
         api = try! PickingAPIClient(origin: URL(string: configured)!)
         picking = PickingSession(cache: cache)
+        watch.onCommand = { [weak self] command in
+            Task { await self?.handleWatchCommand(command) }
+        }
         do {
             try MetaWearablesAppBridge.configure()
             metaStatus = "Meta SDK ready for registration."
@@ -261,6 +286,23 @@ final class PickingPhoneModel: ObservableObject {
                     pickedPickTaskCount: 0
                 )
             }
+            if walkthroughScreen == "picker" {
+                currentTask = try? PickTask(
+                    pickTaskGlobalId: "gpk0000001",
+                    sequence: 1,
+                    productGlobalId: "gp0000001",
+                    productName: "Bacon Bits 20lb · Shopify",
+                    channelSku: "AG-BITS-BA-BK",
+                    barcode: "850019783162",
+                    locationCode: "PICK-01",
+                    quantity: 1
+                )
+                metaCameraGranted = true
+                metaConnectedDeviceCount = 1
+                metaStatus = "Registered with Meta · camera granted · 1 glasses connection."
+                audioRouteStatus = "Automatic audio will prefer connected Bluetooth audio when playback starts."
+                status = "Assigned picks cached."
+            }
         }
 #endif
     }
@@ -297,6 +339,8 @@ final class PickingPhoneModel: ObservableObject {
         } else {
             status = "Choose a workflow to begin."
         }
+        isRestoringSession = false
+        await handlePendingSystemScan()
     }
 
     func requestCode() async {
@@ -552,45 +596,143 @@ final class PickingPhoneModel: ObservableObject {
         do {
             _ = try await picking.accept(BarcodeObservation(value: value, source: source))
             status = "Barcode matched."
+            if source == .metaGlasses {
+                ClawPilotScanDiagnostic.record("matched:\(value)")
+            }
             await updateProjection()
-            readInstruction()
+            if source == .metaGlasses, readyToConfirm {
+                await beginHandsFreeConfirmation()
+            } else {
+                readInstruction()
+            }
         } catch PickingContractError.barcodeMismatch {
             status = "Barcode does not match the current assigned product."
+            if source == .metaGlasses {
+                ClawPilotScanDiagnostic.record("mismatch:\(value)")
+            }
             voice.speak("Wrong product. Scan the displayed product.")
+            refreshAudioRouteStatus()
         } catch { status = "Scan rejected: \(error.localizedDescription)" }
     }
 
     func scanWithMeta() async {
+        guard !isMetaScanning else {
+            ClawPilotScanDiagnostic.record("request-ignored:scan-already-active")
+            return
+        }
         guard currentTask != nil else {
             metaStatus = "Load an assigned pick before starting the glasses camera."
+            ClawPilotScanDiagnostic.record("blocked:no-assigned-pick")
             return
         }
         guard metaScanReady else {
             metaStatus = "Waiting for one connected Meta glasses device. Open Meta AI once if it does not reconnect."
+            ClawPilotScanDiagnostic.record("blocked:meta-not-ready")
             syncMetaConnection()
             return
         }
-        let source = MetaWearablesBarcodeSource()
-        metaSource = source
         isMetaScanning = true
         defer { isMetaScanning = false }
         do {
-            try await source.start()
+            var startedSource: MetaWearablesBarcodeSource?
+            var startError: Error?
+            for attempt in 1...3 {
+                let candidate = MetaWearablesBarcodeSource()
+                metaSource = candidate
+                metaStatus = "Starting the Meta glasses camera (attempt \(attempt)/3)…"
+                ClawPilotScanDiagnostic.record("camera-starting:\(attempt)")
+                do {
+                    try await candidate.start()
+                    startedSource = candidate
+                    break
+                } catch {
+                    startError = error
+                    ClawPilotScanDiagnostic.record("camera-start-failed:\(attempt):\(error.localizedDescription)")
+                    await candidate.stop()
+                    metaSource = nil
+                    if attempt < 3 { try? await Task.sleep(for: .seconds(1)) }
+                }
+            }
+            guard let source = startedSource else {
+                throw startError ?? MetaScanError.sessionFailed
+            }
             metaStatus = "Meta camera is live. Look directly at the product barcode; no photo is saved."
-            for await value in source.barcodes {
-                await accept(value, source: .metaGlasses)
+            ClawPilotScanDiagnostic.record("camera-live")
+            let value = await withTaskGroup(of: String?.self) { group in
+                group.addTask {
+                    for await value in source.barcodes { return value }
+                    return nil
+                }
+                group.addTask {
+                    try? await Task.sleep(for: .seconds(15))
+                    return nil
+                }
+                let first = await group.next() ?? nil
+                group.cancelAll()
+                return first
+            }
+            if let value {
+                ClawPilotScanDiagnostic.record("decoded:\(value)")
                 await source.stop()
                 metaSource = nil
                 metaStatus = "Meta scan complete."
+                await accept(value, source: .metaGlasses)
                 return
             }
-            metaSource = nil
-            metaStatus = "Meta scan stopped. Start it again when the barcode is in view."
-        } catch {
-            metaStatus = "Meta scan unavailable. Use iPhone camera: \(error.localizedDescription)"
             await source.stop()
             metaSource = nil
+            metaStatus = "No barcode was found within 15 seconds. Start another glasses scan or use the iPhone camera."
+            ClawPilotScanDiagnostic.record("timeout:no-barcode")
+            voice.speak("No barcode found. Try the glasses scan again or use the iPhone camera.")
+            refreshAudioRouteStatus()
+        } catch {
+            metaStatus = "Meta scan unavailable. Use iPhone camera: \(error.localizedDescription)"
+            ClawPilotScanDiagnostic.record("error:\(error.localizedDescription)")
+            if let metaSource { await metaSource.stop() }
+            metaSource = nil
         }
+    }
+
+    func handlePendingSystemScan() async {
+        guard PendingMobileAction.hasMetaScanRequest else { return }
+        guard !isRestoringSession else { return }
+        guard !isHandlingPendingSystemScan else {
+            ClawPilotScanDiagnostic.record("request-ignored:handoff-already-active")
+            return
+        }
+        isHandlingPendingSystemScan = true
+        defer { isHandlingPendingSystemScan = false }
+        ClawPilotScanDiagnostic.record("request-processing")
+        status = "Siri scan received. Preparing the assigned item and Meta glasses."
+        guard isAuthenticated, canUsePicker else {
+            status = "Sign in with Picker access, then say “Hey Siri, scan with ClawPilot” again."
+            PendingMobileAction.clearMetaScanRequest()
+            ClawPilotScanDiagnostic.record("blocked:not-authenticated-picker")
+            return
+        }
+        if currentTask == nil { await loadQueue(readAloud: false) }
+        guard currentTask != nil else {
+            status = "No released pick is assigned to scan."
+            PendingMobileAction.clearMetaScanRequest()
+            ClawPilotScanDiagnostic.record("blocked:no-released-pick")
+            return
+        }
+
+        for attempt in 0..<8 {
+            await refreshMetaStatus()
+            if metaScanReady { break }
+            status = "Siri scan received. Waiting for the Meta glasses camera (\(attempt + 1)/8)."
+            if attempt < 7 { try? await Task.sleep(for: .seconds(1)) }
+        }
+        guard metaScanReady else {
+            status = "Siri opened ClawPilot, but one camera-ready Meta glasses connection is required."
+            PendingMobileAction.clearMetaScanRequest()
+            ClawPilotScanDiagnostic.record("blocked:meta-not-camera-ready")
+            return
+        }
+
+        PendingMobileAction.clearMetaScanRequest()
+        await scanWithMeta()
     }
 
     func cancelMetaScan() async {
@@ -612,6 +754,39 @@ final class PickingPhoneModel: ObservableObject {
             canRegisterMeta = false
         }
         catch { metaStatus = "Meta registration failed: \(error.localizedDescription)" }
+    }
+
+    func resetMetaConnection() async {
+        guard canManageMetaConnection else {
+            await refreshMetaStatus()
+            return
+        }
+        await cancelMetaScan()
+        do {
+            metaStatus = "Opening Meta AI to remove ClawPilot authorization."
+            try await MetaWearablesAppBridge.startUnregistration()
+        } catch {
+            metaStatus = "Meta connection reset failed: \(error.localizedDescription)"
+        }
+        await refreshMetaStatus()
+    }
+
+    func checkMetaFirmwareUpdate() async {
+        do {
+            metaStatus = "Opening the glasses firmware check in Meta AI."
+            try await MetaWearablesAppBridge.openFirmwareUpdate()
+        } catch {
+            metaStatus = "Could not open the glasses firmware check: \(error.localizedDescription)"
+        }
+    }
+
+    func checkMetaAppUpdate() async {
+        do {
+            metaStatus = "Opening the Meta AI app update check."
+            try await MetaWearablesAppBridge.openMetaAppUpdate()
+        } catch {
+            metaStatus = "Could not open the Meta AI update check: \(error.localizedDescription)"
+        }
     }
 
     func requestMetaCamera() async {
@@ -679,6 +854,7 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func syncMetaConnection() {
+        if walkthroughScreen != nil { return }
         metaConnectionRefreshTask?.cancel()
         isMetaSyncing = true
         metaConnectionRefreshTask = Task { [weak self] in
@@ -696,23 +872,139 @@ final class PickingPhoneModel: ObservableObject {
     func readInstruction() {
         if let currentTask { voice.speak(PickVoice.instruction(for: currentTask)) }
         else if readyToConfirm { voice.speak("All products scanned. Say confirm pick to submit the order.") }
+        refreshAudioRouteStatus()
     }
 
-    func listenForConfirmation() async {
+    func listenForPickCommand() async {
+        guard currentTask != nil || readyToConfirm || isMetaScanning else {
+            status = "Load an assigned pick before starting voice control."
+            return
+        }
+        isListeningForPickCommand = true
         do {
-            try await voice.listen { [weak self] transcript in
+            try await voice.listen(
+                preferBluetoothInput: metaConnectedDeviceCount == 1
+            ) { [weak self] transcript in
+                guard let self else { return }
+                self.isListeningForPickCommand = false
+                Task { await self.handlePickVoiceAction(transcript) }
+            }
+            status = currentTask != nil
+                ? "Listening. Say “Start glasses scan.”"
+                : "Listening. Say “Confirm pick.”"
+            refreshAudioRouteStatus()
+        } catch {
+            isListeningForPickCommand = false
+            status = "Voice command unavailable: \(error.localizedDescription)"
+        }
+    }
+
+    func stopListeningForPickCommand() {
+        voice.stopListening()
+        isListeningForPickCommand = false
+        status = "Voice command stopped."
+    }
+
+    private func handleWatchCommand(_ command: WatchPickCommand) async {
+        switch command.action {
+        case .requestMetaScan:
+            status = "Apple Watch requested a glasses scan."
+            await scanWithMeta()
+        case .readInstruction:
+            readInstruction()
+        case .confirmPick:
+            guard readyToConfirm else {
+                status = "Scan every assigned product before confirming from Apple Watch."
+                voice.speak("Scan every assigned product before confirming.")
+                return
+            }
+            await confirmOrder()
+        case .refreshQueue:
+            await loadQueue(readAloud: false)
+        }
+    }
+
+    private func handlePickVoiceAction(_ transcript: String) async {
+        guard let action = PickVoice.action(for: transcript) else {
+            status = "Command not recognized. Say “Start glasses scan,” “Read instruction,” or “Confirm pick.”"
+            voice.speak("Command not recognized.")
+            refreshAudioRouteStatus()
+            return
+        }
+        switch action {
+        case .startMetaScan:
+            await scanWithMeta()
+        case .stopMetaScan:
+            await cancelMetaScan()
+        case .readInstruction:
+            readInstruction()
+        case .confirmPick:
+            guard readyToConfirm else {
+                status = "Scan every assigned product before confirming the pick."
+                voice.speak("Scan every assigned product before confirming.")
+                refreshAudioRouteStatus()
+                return
+            }
+            await confirmOrder()
+        }
+    }
+
+    private func beginHandsFreeConfirmation() async {
+        guard readyToConfirm, !hasPendingConfirmation, !isConfirmingOrder else { return }
+        status = "Barcode matched. Voice confirmation will listen after the prompt."
+        await voice.speakAndWait("Item matched. Say confirm pick to submit.")
+        guard readyToConfirm, !hasPendingConfirmation, !isConfirmingOrder else { return }
+        await listenForConfirmation(automatic: true)
+    }
+
+    func listenForConfirmation(automatic: Bool = false) async {
+        guard readyToConfirm, !hasPendingConfirmation, !isConfirmingOrder else {
+            status = "Scan every assigned product before confirming the pick."
+            return
+        }
+        do {
+            try await voice.listen(
+                preferBluetoothInput: metaConnectedDeviceCount == 1,
+                timeout: automatic ? .seconds(8) : nil,
+                onTimeout: { [weak self] in
+                    guard let self else { return }
+                    self.status = "Voice confirmation timed out. Say confirm pick after tapping Voice confirm, or use Confirm picks."
+                    self.refreshAudioRouteStatus()
+                }
+            ) { [weak self] transcript in
                 guard let self else { return }
                 if PickVoice.isConfirmation(transcript) {
+                    self.status = "Confirming the audited picks with ClawPilot."
                     Task { await self.confirmOrder() }
                 } else {
-                    self.status = "Confirmation phrase not recognized."
+                    self.status = "Confirmation phrase not recognized. Say confirm pick or use Confirm picks."
                 }
             }
-            status = "Listening for confirm pick."
+            status = automatic
+                ? "Listening for confirm pick for 8 seconds."
+                : "Listening for confirm pick."
+            refreshAudioRouteStatus()
         } catch { status = "Voice confirmation unavailable: \(error.localizedDescription)" }
     }
 
+    func refreshAudioRouteStatus() {
+        audioRouteStatus = voice.routeDescription(metaConnected: metaConnectedDeviceCount == 1)
+    }
+
+    func previewVoice() {
+        voice.speak("ClawPilot voice check. Your next pick instruction will sound like this.")
+        refreshAudioRouteStatus()
+    }
+
+    func openAppSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(url)
+    }
+
     func confirmOrder() async {
+        guard readyToConfirm, !hasPendingConfirmation, !isConfirmingOrder else { return }
+        isConfirmingOrder = true
+        defer { isConfirmingOrder = false }
         do {
             let command = try await picking.persistConfirmation()
             hasPendingConfirmation = true
@@ -721,8 +1013,9 @@ final class PickingPhoneModel: ObservableObject {
             hasPendingConfirmation = false
             status = "ClawPilot confirmed and audited the picks."
             voice.speak("Picks confirmed.")
+            refreshAudioRouteStatus()
             await loadPickerPerformance()
-            await loadQueue()
+            await loadQueue(readAloud: false)
         } catch {
             status = "Confirmation is pending or rejected. Refresh before new work: \(error.localizedDescription)"
         }
@@ -748,6 +1041,6 @@ final class PickingPhoneModel: ObservableObject {
         currentTask = await picking.currentTask()
         let activeOrder = await picking.currentOrder()
         readyToConfirm = currentTask == nil && activeOrder != nil
-        if let snapshot = await picking.makeWatchSnapshot() { watch.publish(snapshot) }
+        watch.publish(await picking.makeWatchSnapshot())
     }
 }

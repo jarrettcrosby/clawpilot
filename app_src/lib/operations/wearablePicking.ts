@@ -6,6 +6,7 @@ export type WearablePickTask = {
   productGlobalId: string
   productName: string
   channelSku: string
+  productImageURL: string | null
   barcode: string | null
   locationCode: string
   quantity: number
@@ -25,4 +26,3 @@ export type WearablePickQueue = {
   generatedAt: string
   orders: WearablePickOrder[]
 }
-

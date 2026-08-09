@@ -4,6 +4,7 @@ import {
   type WearablePickOrder,
   type WearablePickQueue,
 } from '@/lib/operations/wearablePicking'
+import { publicCrmProductImageUrl } from '@/lib/crm/productImagePublic'
 import { query } from '@/lib/persistence/postgres'
 
 type WearablePickRow = QueryResultRow & {
@@ -15,6 +16,7 @@ type WearablePickRow = QueryResultRow & {
   product_global_id: string
   product_name: string
   channel_sku: string
+  product_image_content_sha256: string | null
   barcode_snapshot: string | null
   location_code: string
   quantity: string
@@ -57,6 +59,7 @@ function positiveNumber(value: string, label: string): number {
 export async function readAssignedWearablePickQueueFromPostgres(input: {
   organizationId: string
   workerEmail: string
+  publicOrigin: string
 }): Promise<WearablePickQueue> {
   const organizationId = requiredIdentity(input.organizationId, 'organization')
   const workerEmail = requiredIdentity(input.workerEmail, 'worker').toLowerCase()
@@ -70,6 +73,7 @@ export async function readAssignedWearablePickQueueFromPostgres(input: {
             product.reference_code AS product_global_id,
             product.name AS product_name,
             line.channel_sku,
+            product_image.content_sha256 AS product_image_content_sha256,
             product_channel.provider_barcode AS barcode_snapshot,
             location.code AS location_code,
             pick.quantity::text
@@ -102,6 +106,16 @@ export async function readAssignedWearablePickQueueFromPostgres(input: {
        ORDER BY channel.observed_at DESC, channel.id DESC
        LIMIT 1
      ) product_channel ON true
+     LEFT JOIN LATERAL (
+       SELECT asset.content_sha256
+       FROM crm_product_image_assets asset
+       WHERE asset.organization_id = pick.organization_id
+         AND asset.pipeline_id = line.pipeline_id
+         AND asset.product_id = line.product_id
+         AND asset.is_primary = true
+       ORDER BY asset.asset_revision DESC, asset.id DESC
+       LIMIT 1
+     ) product_image ON true
      JOIN operations_waves wave
        ON wave.organization_id = pick.organization_id
       AND wave.id = pick.wave_id
@@ -148,6 +162,13 @@ export async function readAssignedWearablePickQueueFromPostgres(input: {
       productGlobalId: requiredIdentity(row.product_global_id, 'product'),
       productName: requiredIdentity(row.product_name, 'product name'),
       channelSku: requiredIdentity(row.channel_sku, 'SKU'),
+      productImageURL: row.product_image_content_sha256 === null
+        ? null
+        : publicCrmProductImageUrl({
+            publicOrigin: input.publicOrigin,
+            productReferenceCode: row.product_global_id,
+            contentSha256: row.product_image_content_sha256,
+          }),
       barcode: row.barcode_snapshot === null
         ? null
         : requiredIdentity(row.barcode_snapshot, 'barcode'),

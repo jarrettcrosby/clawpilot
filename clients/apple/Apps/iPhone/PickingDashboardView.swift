@@ -1,4 +1,5 @@
 import SwiftUI
+import MediaPlayer
 import ClawPilotPickingCore
 
 private enum PickingTheme {
@@ -22,6 +23,7 @@ private enum AuthenticationField: Hashable {
 struct PickingDashboardView: View {
     @ObservedObject var model: PickingPhoneModel
     @FocusState private var authenticationField: AuthenticationField?
+    @State private var showMetaResetConfirmation = false
 
     var body: some View {
         ZStack {
@@ -41,6 +43,7 @@ struct PickingDashboardView: View {
                     pickerPerformanceCard
                     assignedPickCard
                     metaCard
+                    audioCard
                     statusNotice
                 }
                 .padding(.horizontal, 18)
@@ -63,6 +66,18 @@ struct PickingDashboardView: View {
         .onChange(of: model.code) { _, code in
             let sanitized = String(code.filter(\.isNumber).prefix(6))
             if sanitized != code { model.code = sanitized }
+        }
+        .confirmationDialog(
+            "Reset Meta connection?",
+            isPresented: $showMetaResetConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Reset and open Meta AI", role: .destructive) {
+                Task { await model.resetMetaConnection() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes ClawPilot’s Meta authorization. It does not unpair your glasses. You will register ClawPilot and grant camera access again.")
         }
     }
 
@@ -336,6 +351,25 @@ struct PickingDashboardView: View {
             }
 
             Button {
+                if model.isListeningForPickCommand {
+                    model.stopListeningForPickCommand()
+                } else {
+                    Task { await model.listenForPickCommand() }
+                }
+            } label: {
+                Label(
+                    model.isListeningForPickCommand ? "Stop voice command" : "Listen for voice command",
+                    systemImage: model.isListeningForPickCommand ? "waveform.slash" : "waveform.and.mic"
+                )
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(SecondaryDashboardButtonStyle())
+
+            Text("Hands-free: say “Hey Siri, scan with ClawPilot.” In-app voice control also accepts “Start glasses scan.” ClawPilot analyzes one in-memory glasses photo first, then briefly checks live frames; nothing is saved.")
+                .font(.caption)
+                .foregroundStyle(PickingTheme.muted)
+
+            Button {
                 model.showPhoneScanner = true
             } label: {
                 Label("Use iPhone camera instead", systemImage: "iphone.gen3")
@@ -404,9 +438,85 @@ struct PickingDashboardView: View {
                         .buttonStyle(SecondaryDashboardButtonStyle())
                 }
 
-                Text("To scan: open an assigned pick, tap Start Meta scan, and look steadily at one barcode. Use the iPhone camera only as a fallback.")
+                if model.canManageMetaConnection {
+                    HStack(spacing: 10) {
+                        Button("Glasses update") {
+                            Task { await model.checkMetaFirmwareUpdate() }
+                        }
+                        .buttonStyle(SecondaryDashboardButtonStyle())
+
+                        Button("Meta AI update") {
+                            Task { await model.checkMetaAppUpdate() }
+                        }
+                        .buttonStyle(SecondaryDashboardButtonStyle())
+                    }
+
+                    Button(role: .destructive) {
+                        showMetaResetConfirmation = true
+                    } label: {
+                        Label("Reset Meta connection", systemImage: "arrow.counterclockwise")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(SecondaryDashboardButtonStyle())
+                }
+
+                Text("To scan: say “Hey Siri, scan with ClawPilot,” or tap Start Meta scan. Look steadily at one item barcode. ClawPilot checks a high-resolution photo first and live frames second; use the iPhone camera only as a fallback.")
                     .font(.caption2)
                     .foregroundStyle(PickingTheme.muted)
+            }
+        }
+    }
+
+    private var audioCard: some View {
+        dashboardCard {
+            VStack(alignment: .leading, spacing: 14) {
+                sectionHeading(
+                    icon: "speaker.wave.2.fill",
+                    title: "Audio playback",
+                    subtitle: model.playbackPreferenceTitle
+                )
+
+                Text(model.audioRouteStatus)
+                    .font(.subheadline)
+                    .foregroundStyle(PickingTheme.text)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text("Automatic uses connected Bluetooth audio, including Meta glasses, and otherwise uses the iPhone loudspeaker. iOS controls the final accessory route.")
+                    .font(.caption)
+                    .foregroundStyle(PickingTheme.muted)
+
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Choose current output")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(PickingTheme.text)
+                        Text("Opens the iOS audio-route picker.")
+                            .font(.caption)
+                            .foregroundStyle(PickingTheme.muted)
+                    }
+                    Spacer()
+                    SystemAudioRoutePicker()
+                        .frame(width: 44, height: 44)
+                        .accessibilityLabel("Choose audio output")
+                }
+                .padding(12)
+                .background(PickingTheme.raised, in: RoundedRectangle(cornerRadius: 14))
+
+                Button {
+                    model.previewVoice()
+                } label: {
+                    Label("Preview instruction voice", systemImage: "waveform")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(SecondaryDashboardButtonStyle())
+
+                Button {
+                    model.openAppSettings()
+                } label: {
+                    Label("Open ClawPilot App Settings", systemImage: "gearshape.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(SecondaryDashboardButtonStyle())
             }
         }
     }
@@ -538,6 +648,22 @@ struct PickingDashboardView: View {
         authenticationField = nil
         Task { await model.verifyCode() }
     }
+}
+
+private struct SystemAudioRoutePicker: UIViewRepresentable {
+    func makeUIView(context: Context) -> MPVolumeView {
+        let view = MPVolumeView(frame: .zero)
+        view.showsVolumeSlider = false
+        view.tintColor = UIColor(
+            red: 168 / 255,
+            green: 199 / 255,
+            blue: 250 / 255,
+            alpha: 1
+        )
+        return view
+    }
+
+    func updateUIView(_ uiView: MPVolumeView, context: Context) {}
 }
 
 private extension View {

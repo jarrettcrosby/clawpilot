@@ -57,9 +57,17 @@ public actor DurablePickCache: PickCache {
 
     private func write<T: Encodable>(_ value: T, name: String) throws {
         let data = try encoder.encode(value)
+#if os(iOS) || os(watchOS)
+        let options: Data.WritingOptions = [.atomic, .completeFileProtection]
+#else
+        // Complete file protection is an iOS/watchOS data-protection class.
+        // The macOS package test runner can reject the atomic temporary file
+        // when that option is applied inside its protected temporary folder.
+        let options: Data.WritingOptions = [.atomic]
+#endif
         try data.write(
             to: directory.appendingPathComponent(name),
-            options: [.atomic, .completeFileProtection]
+            options: options
         )
     }
 }

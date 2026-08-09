@@ -39,6 +39,7 @@ export async function GET(req: NextRequest) {
     const queue = await readAssignedWearablePickQueueFromPostgres({
       organizationId: activeOperationsOrganizationId(actor),
       workerEmail: actor.email,
+      publicOrigin: req.nextUrl.origin,
     })
     return json({ ok: true, capabilities, queue })
   } catch (error) {
