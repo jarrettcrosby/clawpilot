@@ -3081,6 +3081,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
       'app_src/lib/operations/canonicalFulfillmentPlanning.ts',
       { mocks: { '../currency.ts': currency } },
     )
+    const fulfillmentOptimizerContract = loadTypeScriptModule(
+      'app_src/lib/operations/fulfillmentOptimizerContract.ts',
+    )
     const cartonizationRateEvidence = loadTypeScriptModule(
       'app_src/lib/persistence/cartonizationRateEvidence.ts',
       {
@@ -3101,6 +3104,8 @@ async function verifyPostgresAcceptance(databaseUrl) {
             },
             normalizeCarrierSandboxParty: (value) => value,
           },
+          '@/lib/operations/fulfillmentOptimizerContract':
+            fulfillmentOptimizerContract,
           '@/lib/persistence/postgres': postgres,
         },
       },
