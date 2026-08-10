@@ -448,6 +448,22 @@ export function commerceIntakeRuntimeAvailable() {
   return ['dev', 'development', 'local', 'preview'].includes(lane)
 }
 
+export function shopifyTestOrderSearchConstraint(
+  runtime: Pick<
+    CommerceRuntimeCredentialRecord,
+    'environment' | 'provider' | 'status' | 'verificationStatus'
+  >,
+) {
+  const includeTestOrders = (
+    commerceIntakeRuntimeAvailable()
+    && runtime.provider === 'shopify'
+    && runtime.environment === 'sandbox'
+    && runtime.status === 'active'
+    && runtime.verificationStatus === 'verified'
+  )
+  return includeTestOrders ? '' : 'test:false '
+}
+
 export function assertCommerceIntakeRuntime() {
   if (process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED !== '1') {
     throw new CommerceIntegrationRequestError(
@@ -1312,6 +1328,8 @@ async function shopifyEnvelope(
   page: OperationalPageRequest,
   targetExternalOrderId: string | null = null,
 ): Promise<OperationalPageResult> {
+  const testOrderSearchConstraint = shopifyTestOrderSearchConstraint(runtime)
+  const testOrdersAllowed = testOrderSearchConstraint === ''
   const credential = decryptCommerceCredential(
     runtime.encrypted,
     runtime.organizationId,
@@ -1380,7 +1398,7 @@ async function shopifyEnvelope(
           operationName: 'ClawPilotCommerceOrders',
           variables: {
             after: page.orderCursor,
-            query: `test:false status:open${currentOrderWindow} updated_at:<='${page.windowEnd}'`,
+            query: `${testOrderSearchConstraint}status:open${currentOrderWindow} updated_at:<='${page.windowEnd}'`,
           },
         },
         { timeoutMs: SHOPIFY_GRAPHQL_TIMEOUT_MS },
@@ -1395,6 +1413,16 @@ async function shopifyEnvelope(
           : []
       )
     : providerNodes(connection, 'Shopify orders')
+  if (
+    !testOrdersAllowed
+    && orderNodes.some((order) => order.test === true)
+  ) {
+    throw new CommerceIntegrationRequestError(
+      'Shopify test orders require an active verified sandbox connection in a development intake runtime',
+      409,
+      'COMMERCE_INTAKE_SHOPIFY_TEST_ORDER_RESTRICTED',
+    )
+  }
   const nextOrderCursor = targetExternalOrderId
     ? null
     : nextShopifyCursor(connection, 'Shopify orders')

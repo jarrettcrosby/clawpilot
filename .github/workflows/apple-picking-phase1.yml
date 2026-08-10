@@ -2,6 +2,7 @@ name: Apple Picking Phase 1
 
 on:
   pull_request:
+    branches: [dev]
     paths:
       - 'clients/apple/**'
       - 'app_src/app/api/operations/picks/**'

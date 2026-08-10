@@ -976,6 +976,17 @@ includes(shopifyQuerySource, [
 includes(serviceSource, [
   'SHOPIFY_PRODUCT_IMAGE_PAGE_SIZE = 50',
 ], 'Bounded Shopify product-image intake')
+includes(serviceSource, [
+  'shopifyTestOrderSearchConstraint(runtime)',
+  'commerceIntakeRuntimeAvailable()',
+  "runtime.environment === 'sandbox'",
+  "runtime.status === 'active'",
+  "runtime.verificationStatus === 'verified'",
+  "return includeTestOrders ? '' : 'test:false '",
+  'testOrdersAllowed = testOrderSearchConstraint ===',
+  'orderNodes.some((order) => order.test === true)',
+  'COMMERCE_INTAKE_SHOPIFY_TEST_ORDER_RESTRICTED',
+], 'Development Shopify sandbox test-order intake fence')
 const shopifyProductQuerySource = serviceSource.slice(
   serviceSource.indexOf('function shopifyProductVariantsQuery'),
   serviceSource.indexOf('type IntakeCommandAction'),
@@ -1325,6 +1336,10 @@ includes(persistenceSource, [
   'truncated:',
   'unresolvedTruncated:',
 ], 'Unchanged product evidence deduplication and page-bounded mappings')
+includes(persistenceSource, [
+  'candidate.test_order,',
+  'order.providerFacts.testOrder',
+], 'Shopify test-order provenance persistence')
 const productCandidateReadSource = persistenceSource.slice(
   persistenceSource.indexOf(
     'export async function readCommerceIntakeStateFromPostgres',
@@ -2969,12 +2984,14 @@ const service = loadTypeScriptModule(
           providerReads.shopifyGraphql += 1
           assert.doesNotMatch(request.query, /\bmutation\b/i)
           if (request.operationName === 'ClawPilotCommerceOrders') {
-            assert.match(request.variables.query, /test:false status:open/)
+            assert.match(request.variables.query, /^status:open/)
+            assert.doesNotMatch(request.variables.query, /\btest:false\b/)
             if (!request.variables.after) {
               return {
                 orders: {
                   nodes: [{
                     id: 'gid://shopify/Order/1',
+                    test: true,
                     lineItems: {
                       nodes: [{ id: 'gid://shopify/LineItem/1' }],
                       pageInfo: {
@@ -3594,6 +3611,43 @@ const automaticFaireCohortHash = createHash('sha256')
   .update('\0')
   .update(automaticFaireNotBefore)
   .digest('hex')
+
+assert.equal(
+  service.shopifyTestOrderSearchConstraint(shopifyRuntime),
+  '',
+  'An active verified Shopify sandbox may intake test orders only in a development runtime',
+)
+assert.equal(
+  service.shopifyTestOrderSearchConstraint({
+    ...shopifyRuntime,
+    environment: 'production',
+  }),
+  'test:false ',
+  'A production Shopify account must exclude test orders',
+)
+assert.equal(
+  service.shopifyTestOrderSearchConstraint({
+    ...shopifyRuntime,
+    status: 'disabled',
+  }),
+  'test:false ',
+  'A disabled Shopify sandbox account must exclude test orders',
+)
+assert.equal(
+  service.shopifyTestOrderSearchConstraint({
+    ...shopifyRuntime,
+    verificationStatus: 'unverified',
+  }),
+  'test:false ',
+  'An unverified Shopify sandbox account must exclude test orders',
+)
+process.env.CLAWPILOT_ENV = 'test'
+assert.equal(
+  service.shopifyTestOrderSearchConstraint(shopifyRuntime),
+  'test:false ',
+  'A mock or test runtime must exclude Shopify test orders',
+)
+process.env.CLAWPILOT_ENV = 'development'
 
 assert.equal(
   service.nextFaireCursor(
