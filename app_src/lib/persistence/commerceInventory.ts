@@ -48,6 +48,19 @@ type TargetRow = QueryResultRow & {
   location_code: string
 }
 
+type InventoryLocationMappingRow = QueryResultRow & {
+  id: string
+  global_id: string
+  external_location_id: string
+  external_location_name: string
+  warehouse_id: string
+  location_id: string
+}
+
+type WarehouseAuthorityRow = QueryResultRow & {
+  warehouse_id: string
+}
+
 export type ShopifyInventoryTarget = {
   integrationAccountId: string
   credentialVersion: number
@@ -206,25 +219,108 @@ function persistenceError(
 
 export async function readShopifyInventoryTargetFromPostgres(input: {
   runtime: CommerceRuntimeCredentialRecord
+  expectedWarehouseId?: string | null
 }): Promise<ShopifyInventoryTarget> {
-  const target = await query<TargetRow>(
-    `WITH active_warehouse AS (
-       SELECT warehouse.id, warehouse.global_id, warehouse.name,
-              warehouse.address
+  const mapping = await query<InventoryLocationMappingRow>(
+    `SELECT mapping.id::text, mapping.global_id,
+            mapping.external_location_id,
+            mapping.external_location_name,
+            mapping.warehouse_id::text,
+            mapping.location_id::text
+     FROM operations_commerce_inventory_location_mappings mapping
+     WHERE mapping.organization_id = $1::uuid
+       AND mapping.integration_account_id = $2::uuid
+       AND mapping.active = true
+     ORDER BY mapping.id
+     LIMIT 2`,
+    [input.runtime.organizationId, input.runtime.integrationAccountId],
+  )
+  if (mapping.rows.length > 1) {
+    persistenceError(
+      'SHOPIFY_INVENTORY_LOCATION_MAPPING_AMBIGUOUS',
+      'More than one active Shopify inventory location mapping requires review',
+    )
+  }
+  const existingMapping = mapping.rows[0] || null
+  const configuredWarehouses = await query<WarehouseAuthorityRow>(
+    `SELECT DISTINCT config.warehouse_id::text AS warehouse_id
+     FROM operations_shopify_carrier_service_configs config
+     WHERE config.organization_id = $1::uuid
+       AND config.integration_account_id = $2::uuid
+       AND config.registration_state IN ('shadow_simulated', 'registered')
+     ORDER BY config.warehouse_id::text
+     LIMIT 2`,
+    [input.runtime.organizationId, input.runtime.integrationAccountId],
+  )
+  if (configuredWarehouses.rows.length > 1) {
+    persistenceError(
+      'SHOPIFY_INVENTORY_CARRIER_CONFIG_AMBIGUOUS',
+      'More than one active Shopify carrier-service warehouse requires review',
+    )
+  }
+  const configuredWarehouseId =
+    configuredWarehouses.rows[0]?.warehouse_id || null
+  const expectedWarehouseId = input.expectedWarehouseId || null
+  if (expectedWarehouseId) {
+    if (
+      (existingMapping
+        && existingMapping.warehouse_id !== expectedWarehouseId)
+      || (configuredWarehouseId
+        && configuredWarehouseId !== expectedWarehouseId)
+    ) {
+      persistenceError(
+        'SHOPIFY_INVENTORY_REFRESH_FENCE_CHANGED',
+        'The inventory refresh warehouse no longer matches current Shopify inventory authority',
+      )
+    }
+  } else if (
+    existingMapping
+    && configuredWarehouseId
+    && existingMapping.warehouse_id !== configuredWarehouseId
+  ) {
+    persistenceError(
+      'SHOPIFY_INVENTORY_WAREHOUSE_AUTHORITY_CONFLICT',
+      'The saved Shopify inventory mapping and carrier-service configuration target different warehouses',
+    )
+  }
+
+  let warehouseId = expectedWarehouseId
+    || existingMapping?.warehouse_id
+    || configuredWarehouseId
+    || null
+  if (!warehouseId) {
+    const activeWarehouses = await query<WarehouseAuthorityRow>(
+      `SELECT warehouse.id::text AS warehouse_id
        FROM operations_warehouses warehouse
        WHERE warehouse.organization_id = $1::uuid
          AND warehouse.status = 'active'
-     ),
-     warehouse_count AS (
-       SELECT count(*)::integer AS count FROM active_warehouse
-     ),
-     selected_location AS (
+       ORDER BY warehouse.id
+       LIMIT 2`,
+      [input.runtime.organizationId],
+    )
+    if (activeWarehouses.rows.length > 1) {
+      persistenceError(
+        'SHOPIFY_INVENTORY_SINGLE_WAREHOUSE_REQUIRED',
+        'Choose a Shopify inventory warehouse before syncing inventory in a multi-warehouse workspace',
+      )
+    }
+    warehouseId = activeWarehouses.rows[0]?.warehouse_id || null
+  }
+  if (!warehouseId) {
+    persistenceError(
+      'SHOPIFY_INVENTORY_TARGET_REQUIRED',
+      'Configure an active Operations warehouse and reserve or storage location before syncing Shopify inventory',
+    )
+  }
+
+  const target = await query<TargetRow>(
+    `WITH selected_location AS (
        SELECT location.id, location.global_id, location.code
        FROM operations_locations location
-       JOIN active_warehouse warehouse
-         ON warehouse.id = location.warehouse_id
        WHERE location.organization_id = $1::uuid
+         AND location.warehouse_id = $3::uuid
          AND location.active = true
+         AND ($4::uuid IS NULL OR location.id = $4::uuid)
        ORDER BY
          CASE
            WHEN location.code = 'RESERVE-01' THEN 0
@@ -257,29 +353,29 @@ export async function readShopifyInventoryTargetFromPostgres(input: {
           account.commerce_credential_generation
      JOIN operations_activation_scopes activation
        ON activation.organization_id = account.organization_id
-     CROSS JOIN warehouse_count count
-     CROSS JOIN active_warehouse warehouse
+     JOIN operations_warehouses warehouse
+       ON warehouse.organization_id = account.organization_id
+      AND warehouse.id = $3::uuid
+      AND warehouse.status = 'active'
      CROSS JOIN selected_location location
      WHERE account.organization_id = $1::uuid
        AND account.global_id = $2
        AND account.integration_type = 'commerce'
        AND account.provider = 'shopify'
-       AND count.count = 1
      LIMIT 1`,
-    [input.runtime.organizationId, input.runtime.globalId],
+    [
+      input.runtime.organizationId,
+      input.runtime.globalId,
+      warehouseId,
+      existingMapping?.location_id || null,
+    ],
   )
   const row = target.rows[0]
   if (!row) {
-    const warehouseCount = await query<{ count: string }>(
-      `SELECT count(*)::text AS count
-       FROM operations_warehouses
-       WHERE organization_id = $1::uuid AND status = 'active'`,
-      [input.runtime.organizationId],
-    )
-    if (Number(warehouseCount.rows[0]?.count || 0) !== 1) {
+    if (expectedWarehouseId) {
       persistenceError(
-        'SHOPIFY_INVENTORY_SINGLE_WAREHOUSE_REQUIRED',
-        'Shopify inventory sync requires exactly one active warehouse for this development workspace',
+        'SHOPIFY_INVENTORY_REFRESH_FENCE_CHANGED',
+        'The inventory refresh warehouse or mapped location is no longer active',
       )
     }
     persistenceError(
@@ -297,27 +393,6 @@ export async function readShopifyInventoryTargetFromPostgres(input: {
       'Reconnect and verify Shopify before syncing inventory',
     )
   }
-  const mapping = await query<{
-    id: string
-    global_id: string
-    external_location_id: string
-    external_location_name: string
-  }>(
-    `SELECT id::text, global_id, external_location_id,
-            external_location_name
-     FROM operations_commerce_inventory_location_mappings
-     WHERE organization_id = $1::uuid
-       AND integration_account_id = $2::uuid
-       AND active = true
-     LIMIT 2`,
-    [input.runtime.organizationId, input.runtime.integrationAccountId],
-  )
-  if (mapping.rows.length > 1) {
-    persistenceError(
-      'SHOPIFY_INVENTORY_LOCATION_MAPPING_AMBIGUOUS',
-      'More than one active Shopify inventory location mapping requires review',
-    )
-  }
   return {
     integrationAccountId: row.integration_account_id,
     credentialVersion: row.credential_version,
@@ -333,12 +408,12 @@ export async function readShopifyInventoryTargetFromPostgres(input: {
       globalId: row.location_global_id,
       code: row.location_code,
     },
-    existingMapping: mapping.rows[0]
+    existingMapping: existingMapping
       ? {
-          id: mapping.rows[0].id,
-          globalId: mapping.rows[0].global_id,
-          externalLocationId: mapping.rows[0].external_location_id,
-          externalLocationName: mapping.rows[0].external_location_name,
+          id: existingMapping.id,
+          globalId: existingMapping.global_id,
+          externalLocationId: existingMapping.external_location_id,
+          externalLocationName: existingMapping.external_location_name,
         }
       : null,
   }

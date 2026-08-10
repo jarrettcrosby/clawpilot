@@ -338,6 +338,7 @@ export async function syncShopifyInventory(input: {
     }
     const target = await readShopifyInventoryTargetFromPostgres({
       runtime: stored,
+      expectedWarehouseId: input.expectedRefreshFence?.warehouseId || null,
     })
     const hash = requestHash(stored, target)
     attempt = await prepareShopifyInventoryReadInPostgres({

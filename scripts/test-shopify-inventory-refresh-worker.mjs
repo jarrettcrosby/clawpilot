@@ -421,6 +421,253 @@ assert.doesNotMatch(
   'Inventory lease fences must not round-trip PostgreSQL microseconds through JavaScript Date',
 )
 
+const inventoryTargetIds = {
+  organization: '11111111-1111-4111-8111-111111111111',
+  account: '22222222-2222-4222-8222-222222222222',
+  agWarehouse: '33333333-3333-4333-8333-333333333333',
+  proofWarehouse: '44444444-4444-4444-8444-444444444444',
+  agLocation: '55555555-5555-4555-8555-555555555555',
+}
+const inventoryTargetRuntime = {
+  organizationId: inventoryTargetIds.organization,
+  integrationAccountId: inventoryTargetIds.account,
+  globalId: 'gia0000001',
+  credentialVersion: 3,
+}
+const agMapping = {
+  id: '66666666-6666-4666-8666-666666666666',
+  global_id: 'gilm0000001',
+  external_location_id: 'gid://shopify/Location/35568222286',
+  external_location_name: 'Ag-Alchemy',
+  warehouse_id: inventoryTargetIds.agWarehouse,
+  location_id: inventoryTargetIds.agLocation,
+}
+const agTargetRow = {
+  integration_account_id: inventoryTargetIds.account,
+  credential_version: 3,
+  verification_status: 'verified',
+  account_status: 'active',
+  pipeline_id: '77777777-7777-4777-8777-777777777777',
+  warehouse_id: inventoryTargetIds.agWarehouse,
+  warehouse_global_id: 'gwh5366613',
+  warehouse_name: 'Ag-Alchemy',
+  warehouse_address: { countryCode: 'US' },
+  location_id: inventoryTargetIds.agLocation,
+  location_global_id: 'gol0000001',
+  location_code: 'RESERVE-01',
+}
+
+function inventoryTargetPersistenceScenario({
+  mappings = [],
+  configuredWarehouses = [],
+  activeWarehouses = [],
+  targetRow = agTargetRow,
+}) {
+  const queries = []
+  const loaded = loadTypeScriptModule(
+    'app_src/lib/persistence/commerceInventory.ts',
+    {
+      mocks: {
+        '@/lib/auditWriter': {
+          async recordAuditEvent() {},
+        },
+        '@/lib/integrations/shopifyInventory': {
+          SHOPIFY_INVENTORY_ADAPTER_VERSION: 'test',
+        },
+        '@/lib/operations/shopifyInventoryProjection': {
+          projectShopifyInventoryBalance() {
+            assert.fail('Target selection must not project inventory')
+          },
+        },
+        '@/lib/persistence/postgres': {
+          async acquireTransactionAdvisoryLock() {
+            assert.fail('Target selection must remain read-only')
+          },
+          async withTransaction() {
+            assert.fail('Target selection must remain read-only')
+          },
+          async query(sql, values) {
+            queries.push({ sql, values })
+            if (sql.includes(
+              'FROM operations_commerce_inventory_location_mappings mapping',
+            )) {
+              return { rowCount: mappings.length, rows: mappings }
+            }
+            if (sql.includes(
+              'FROM operations_shopify_carrier_service_configs config',
+            )) {
+              const rows = configuredWarehouses.map((warehouse_id) => ({
+                warehouse_id,
+              }))
+              return { rowCount: rows.length, rows }
+            }
+            if (sql.includes('WITH selected_location AS')) {
+              return {
+                rowCount: targetRow ? 1 : 0,
+                rows: targetRow ? [targetRow] : [],
+              }
+            }
+            if (
+              sql.includes('FROM operations_warehouses warehouse')
+              && !sql.includes('JOIN operations_integration_accounts')
+            ) {
+              const rows = activeWarehouses.map((warehouse_id) => ({
+                warehouse_id,
+              }))
+              return { rowCount: rows.length, rows }
+            }
+            assert.fail(`Unexpected inventory target query: ${sql}`)
+          },
+        },
+      },
+    },
+  )
+  return { loaded, queries }
+}
+
+const mappedTargetScenario = inventoryTargetPersistenceScenario({
+  mappings: [agMapping],
+  configuredWarehouses: [inventoryTargetIds.agWarehouse],
+  activeWarehouses: [
+    inventoryTargetIds.agWarehouse,
+    inventoryTargetIds.proofWarehouse,
+  ],
+})
+const mappedTarget = await mappedTargetScenario.loaded
+  .readShopifyInventoryTargetFromPostgres({
+    runtime: inventoryTargetRuntime,
+  })
+assert.equal(mappedTarget.warehouse.globalId, 'gwh5366613')
+assert.equal(mappedTarget.location.code, 'RESERVE-01')
+assert.equal(
+  mappedTarget.existingMapping.externalLocationId,
+  'gid://shopify/Location/35568222286',
+)
+const mappedTargetRead = mappedTargetScenario.queries.find(({ sql }) => (
+  sql.includes('WITH selected_location AS')
+))
+assert.deepEqual(
+  JSON.parse(JSON.stringify(mappedTargetRead.values)),
+  [
+    inventoryTargetIds.organization,
+    inventoryTargetRuntime.globalId,
+    inventoryTargetIds.agWarehouse,
+    inventoryTargetIds.agLocation,
+  ],
+)
+assert.equal(
+  mappedTargetScenario.queries.some(({ sql }) => (
+    sql.includes('SELECT warehouse.id::text AS warehouse_id')
+  )),
+  false,
+  'A saved/configured Ag-Alchemy target must not fall back to active warehouse count',
+)
+
+const configuredTargetScenario = inventoryTargetPersistenceScenario({
+  configuredWarehouses: [inventoryTargetIds.agWarehouse],
+  activeWarehouses: [
+    inventoryTargetIds.agWarehouse,
+    inventoryTargetIds.proofWarehouse,
+  ],
+})
+await configuredTargetScenario.loaded
+  .readShopifyInventoryTargetFromPostgres({
+    runtime: inventoryTargetRuntime,
+  })
+const configuredTargetRead = configuredTargetScenario.queries.find(
+  ({ sql }) => sql.includes('WITH selected_location AS'),
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(configuredTargetRead.values)),
+  [
+    inventoryTargetIds.organization,
+    inventoryTargetRuntime.globalId,
+    inventoryTargetIds.agWarehouse,
+    null,
+  ],
+)
+
+const fenceMismatchScenario = inventoryTargetPersistenceScenario({
+  mappings: [agMapping],
+  configuredWarehouses: [inventoryTargetIds.agWarehouse],
+})
+await assert.rejects(
+  fenceMismatchScenario.loaded.readShopifyInventoryTargetFromPostgres({
+    runtime: inventoryTargetRuntime,
+    expectedWarehouseId: inventoryTargetIds.proofWarehouse,
+  }),
+  (error) => (
+    error.code === 'SHOPIFY_INVENTORY_REFRESH_FENCE_CHANGED'
+  ),
+)
+assert.equal(
+  fenceMismatchScenario.queries.some(({ sql }) => (
+    sql.includes('WITH selected_location AS')
+  )),
+  false,
+  'A refresh fence mismatch must fail before reading a target location',
+)
+
+const authorityConflictScenario = inventoryTargetPersistenceScenario({
+  mappings: [agMapping],
+  configuredWarehouses: [inventoryTargetIds.proofWarehouse],
+})
+await assert.rejects(
+  authorityConflictScenario.loaded
+    .readShopifyInventoryTargetFromPostgres({
+      runtime: inventoryTargetRuntime,
+    }),
+  (error) => (
+    error.code === 'SHOPIFY_INVENTORY_WAREHOUSE_AUTHORITY_CONFLICT'
+  ),
+)
+assert.equal(
+  authorityConflictScenario.queries.some(({ sql }) => (
+    sql.includes('WITH selected_location AS')
+  )),
+  false,
+  'Conflicting mapping and carrier configuration must fail before target selection',
+)
+
+const ambiguousConfigScenario = inventoryTargetPersistenceScenario({
+  configuredWarehouses: [
+    inventoryTargetIds.agWarehouse,
+    inventoryTargetIds.proofWarehouse,
+  ],
+})
+await assert.rejects(
+  ambiguousConfigScenario.loaded
+    .readShopifyInventoryTargetFromPostgres({
+      runtime: inventoryTargetRuntime,
+    }),
+  (error) => (
+    error.code === 'SHOPIFY_INVENTORY_CARRIER_CONFIG_AMBIGUOUS'
+  ),
+)
+
+const ambiguousFallbackScenario = inventoryTargetPersistenceScenario({
+  activeWarehouses: [
+    inventoryTargetIds.agWarehouse,
+    inventoryTargetIds.proofWarehouse,
+  ],
+})
+await assert.rejects(
+  ambiguousFallbackScenario.loaded
+    .readShopifyInventoryTargetFromPostgres({
+      runtime: inventoryTargetRuntime,
+    }),
+  (error) => (
+    error.code === 'SHOPIFY_INVENTORY_SINGLE_WAREHOUSE_REQUIRED'
+  ),
+)
+assert.equal(
+  ambiguousFallbackScenario.queries.some(({ sql }) => (
+    sql.includes('WITH selected_location AS')
+  )),
+  false,
+  'A multi-warehouse workspace without authority must fail before target selection',
+)
+
 const orchestration = read(
   'app_src/lib/integrations/commerceInventory.ts',
 )
@@ -431,6 +678,7 @@ includes(orchestration, [
   'effectiveIdempotencyKey: attempt.idempotencyKey',
   'inventoryRunGlobalId: applied.runGlobalId',
   'expectedRefreshFence: input.expectedRefreshFence',
+  'expectedWarehouseId: input.expectedRefreshFence?.warehouseId || null',
   'onProgress: async (current)',
   'readShopifyInventoryRefreshRecoveryStateFromPostgres',
   'return { ...inventory, refreshRecovery }',
