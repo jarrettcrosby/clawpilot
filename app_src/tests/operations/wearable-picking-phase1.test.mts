@@ -29,7 +29,9 @@ test('wearable route keeps existing ClawPilot authorization boundary', () => {
   assert.match(route, /capabilities\.canExecute/)
   assert.doesNotMatch(route, /!capabilities\.canManage/)
   assert.match(route, /Cache-Control': 'private, no-store'/)
-  assert.match(route, /publicOrigin: req\.nextUrl\.origin/)
+  assert.match(route, /import \{ appPublicUrl \} from '@\/lib\/publicUrl'/)
+  assert.match(route, /publicOrigin: appPublicUrl\(\)/)
+  assert.doesNotMatch(route, /publicOrigin: req\.nextUrl\.origin/)
 })
 
 test('Phase 1 confirmation reuses the audited Operations command', () => {

@@ -5,6 +5,7 @@ import {
 } from '@/lib/operations/authorization'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { readAssignedWearablePickQueueFromPostgres } from '@/lib/persistence/wearablePicking'
+import { appPublicUrl } from '@/lib/publicUrl'
 import { requireRequestUser } from '@/lib/requestUser'
 
 export const dynamic = 'force-dynamic'
@@ -39,7 +40,7 @@ export async function GET(req: NextRequest) {
     const queue = await readAssignedWearablePickQueueFromPostgres({
       organizationId: activeOperationsOrganizationId(actor),
       workerEmail: actor.email,
-      publicOrigin: req.nextUrl.origin,
+      publicOrigin: appPublicUrl(),
     })
     return json({ ok: true, capabilities, queue })
   } catch (error) {
