@@ -3150,6 +3150,21 @@ async function verifyPostgresAcceptance(databaseUrl) {
             )
           },
         },
+        '@/lib/integrations/shopifyOrderPlanningAuthority': {
+          ShopifyOrderPlanningAuthorityError: class extends Error {},
+          assertShopifyOrderPlanningAuthorityHash: (value) => value,
+          normalizeShopifyOrderPlanningAuthoritySnapshot: (value) => value,
+          shopifyOrderPlanningAuthorityHash: () => {
+            throw new Error(
+              'Distributed Operations acceptance does not hash Shopify planning authority',
+            )
+          },
+          inspectShopifyOrderPlanningAuthority: async () => {
+            throw new Error(
+              'Distributed Operations acceptance does not read Shopify planning authority',
+            )
+          },
+        },
         '@/lib/integrations/faireFulfillmentRuntime': {
           prepareCurrentFaireFulfillmentAuthority: async () => {
             throw new Error(

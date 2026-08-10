@@ -788,6 +788,21 @@ async function verifyShipmentCompletion(databaseUrl) {
             return shopifyFulfillmentReconciliationResult
           },
         },
+        '@/lib/integrations/shopifyOrderPlanningAuthority': {
+          ShopifyOrderPlanningAuthorityError: class extends Error {},
+          assertShopifyOrderPlanningAuthorityHash: (value) => value,
+          normalizeShopifyOrderPlanningAuthoritySnapshot: (value) => value,
+          shopifyOrderPlanningAuthorityHash: () => {
+            throw new Error(
+              'Shipment completion acceptance does not hash Shopify planning authority',
+            )
+          },
+          inspectShopifyOrderPlanningAuthority: async () => {
+            throw new Error(
+              'Shipment completion acceptance does not read Shopify planning authority',
+            )
+          },
+        },
         '@/lib/integrations/faireFulfillmentRuntime': {
           prepareCurrentFaireFulfillmentAuthority: async () => {
             faireFulfillmentPreparationCalls += 1
