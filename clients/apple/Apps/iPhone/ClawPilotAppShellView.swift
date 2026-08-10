@@ -163,13 +163,15 @@ private struct LoginGateView: View {
                         .foregroundStyle(AppShellTheme.muted)
                 }
                 Spacer()
-                Text("DEV")
-                    .font(.caption2.weight(.bold))
-                    .tracking(0.8)
-                    .foregroundStyle(AppShellTheme.primary)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
-                    .background(AppShellTheme.primary.opacity(0.12), in: Capsule())
+                if let environmentLabel = model.environmentLabel {
+                    Text(environmentLabel)
+                        .font(.caption2.weight(.bold))
+                        .tracking(0.8)
+                        .foregroundStyle(AppShellTheme.primary)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(AppShellTheme.primary.opacity(0.12), in: Capsule())
+                }
             }
 
             if model.isLocallyLocked {

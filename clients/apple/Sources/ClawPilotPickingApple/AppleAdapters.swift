@@ -346,7 +346,7 @@ public actor PickingAPIClient {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
-    public init(origin: URL, session: URLSession = .shared, allowDebugHTTP: Bool = false) throws {
+    public init(origin: URL, session: URLSession? = nil, allowDebugHTTP: Bool = false) throws {
         guard origin.path.isEmpty || origin.path == "/",
               origin.query == nil,
               origin.fragment == nil,
@@ -356,7 +356,15 @@ public actor PickingAPIClient {
             throw PickingAPIError.invalidOrigin
         }
         self.webOrigin = origin
-        self.session = session
+        if let session {
+            self.session = session
+        } else {
+            let configuration = URLSessionConfiguration.default
+            configuration.httpShouldSetCookies = true
+            configuration.httpCookieStorage = .shared
+            HTTPCookieStorage.shared.cookieAcceptPolicy = .always
+            self.session = URLSession(configuration: configuration)
+        }
         encoder.dateEncodingStrategy = .iso8601
         decoder.dateDecodingStrategy = .iso8601
     }
@@ -560,6 +568,7 @@ public actor PickingAPIClient {
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await session.data(for: request)
         try validateHTTP(response)
+        persistResponseCookies(response)
         let envelope = try decoder.decode(BasicEnvelope.self, from: data)
         guard envelope.ok else {
             throw PickingAPIError.rejected(
@@ -567,6 +576,20 @@ public actor PickingAPIClient {
                 message: envelope.error ?? "Authentication failed"
             )
         }
+    }
+
+    private func persistResponseCookies(_ response: URLResponse) {
+        guard let http = response as? HTTPURLResponse,
+              let responseURL = http.url,
+              let storage = session.configuration.httpCookieStorage else { return }
+        let fields = http.allHeaderFields.reduce(into: [String: String]()) { result, entry in
+            guard let key = entry.key as? String else { return }
+            result[key] = String(describing: entry.value)
+        }
+        let cookies = HTTPCookie.cookies(withResponseHeaderFields: fields, for: responseURL)
+        guard !cookies.isEmpty else { return }
+        storage.cookieAcceptPolicy = .always
+        storage.setCookies(cookies, for: responseURL, mainDocumentURL: webOrigin)
     }
 
     private func managerOrderCommand(

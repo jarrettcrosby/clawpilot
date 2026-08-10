@@ -14,7 +14,7 @@ configs:
 settings:
   base:
     SWIFT_VERSION: "6.0"
-    CURRENT_PROJECT_VERSION: "2"
+    CURRENT_PROJECT_VERSION: "3"
     MARKETING_VERSION: "0.1.0"
     CLAWPILOT_APPLE_DEVELOPMENT_TEAM: "CN2T77JHQQ"
     DEVELOPMENT_TEAM: $(CLAWPILOT_APPLE_DEVELOPMENT_TEAM)
@@ -59,6 +59,7 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         ITSAppUsesNonExemptEncryption: false
+        ClawPilotEnvironment: $(CLAWPILOT_ENVIRONMENT)
         ClawPilotServerOrigin: $(CLAWPILOT_SERVER_ORIGIN)
         GIDClientID: $(CLAWPILOT_GOOGLE_IOS_CLIENT_ID)
         GIDServerClientID: $(CLAWPILOT_GOOGLE_SERVER_CLIENT_ID)

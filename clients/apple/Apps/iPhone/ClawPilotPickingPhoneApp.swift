@@ -169,6 +169,13 @@ final class PickingPhoneModel: ObservableObject {
 
     var webOrigin: URL { api.webOrigin }
 
+    var environmentLabel: String? {
+        let value = String(
+            Bundle.main.object(forInfoDictionaryKey: "ClawPilotEnvironment") as? String ?? ""
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.lowercased() == "development" ? "DEV" : nil
+    }
+
     var walkthroughScreen: String? {
 #if DEBUG
         ProcessInfo.processInfo.arguments
@@ -435,6 +442,12 @@ final class PickingPhoneModel: ObservableObject {
         defer { isAuthBusy = false }
         do {
             try await api.verifyMagicCode(email: email, code: code)
+        } catch {
+            isAuthenticated = false
+            status = "Code could not be verified. Request a new code and try again."
+            return
+        }
+        do {
             sessionProfile = try await api.fetchSessionProfile()
             isAuthenticated = true
             biometrics.rememberAuthenticatedSession()
@@ -443,7 +456,7 @@ final class PickingPhoneModel: ObservableObject {
             status = "Signed in. Choose a workflow to begin."
         } catch {
             isAuthenticated = false
-            status = "Sign-in failed: \(error.localizedDescription)"
+            status = "Code accepted, but the secure session could not be restored. Request a new code and try again."
         }
     }
 
