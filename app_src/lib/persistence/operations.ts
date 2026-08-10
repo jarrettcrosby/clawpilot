@@ -9908,6 +9908,15 @@ export async function planOperationsOrderFromPostgres(input: {
       409,
     )
   }
+  if (evidence.packages.some((item) => (
+    item.planningMethod === 'sandbox_fixed_axis'
+  ))) {
+    throw new OperationsRequestError(
+      'OPERATIONS_CARTONIZATION_SANDBOX_PACKAGE_FORBIDDEN',
+      'Assumption-backed sandbox fixed-axis packages cannot become warehouse work',
+      409,
+    )
+  }
 
   const command = await prepareCommandReceipt({
     organizationId,
@@ -10258,13 +10267,15 @@ export async function planOperationsOrderFromPostgres(input: {
 
       type PlanningPackagingMaterialRow = {
         package_key: string
+        planning_method: string
         material_id: string
         material_global_id: string
       }
       const lockedPackagingMaterials =
         await client.query<PlanningPackagingMaterialRow>(
-        `SELECT
+         `SELECT
            package.package_key,
+           package.planning_method,
            material.id::text AS material_id,
            material.global_id AS material_global_id
          FROM operations_cartonization_rate_evidence_packages package
@@ -10283,6 +10294,209 @@ export async function planOperationsOrderFromPostgres(input: {
         throw new OperationsRequestError(
           'OPERATIONS_CARTONIZATION_PACKAGING_STALE',
           'Sealed packaging-material evidence is incomplete. Re-run the plan.',
+          409,
+        )
+      }
+      if (lockedPackagingMaterials.rows.some((item) => (
+        item.planning_method === 'sandbox_fixed_axis'
+      ))) {
+        throw new OperationsRequestError(
+          'OPERATIONS_CARTONIZATION_SANDBOX_PACKAGE_FORBIDDEN',
+          'Assumption-backed sandbox fixed-axis packages cannot become warehouse work',
+          409,
+        )
+      }
+      const expectedOrToolsProfiles = evidence.packages.flatMap(
+        (packageEvidence) => {
+          if (packageEvidence.planningMethod !== 'or_tools') {
+            if (packageEvidence.orToolsProfiles.length !== 0) {
+              throw new OperationsRequestError(
+                'OPERATIONS_CARTONIZATION_PROFILE_EVIDENCE_INVALID',
+                'A non-OR-Tools package retained unexpected geometry profile evidence',
+                409,
+              )
+            }
+            return []
+          }
+          if (
+            packageEvidence.orToolsProfiles.length < 1
+            || packageEvidence.orToolsProfiles.length
+              !== packageEvidence.allocations.length
+          ) {
+            throw new OperationsRequestError(
+              'OPERATIONS_CARTONIZATION_PROFILE_EVIDENCE_INCOMPLETE',
+              'Sealed OR-Tools packages require one exact product profile edge per allocation line. Re-run the plan.',
+              409,
+            )
+          }
+          return packageEvidence.orToolsProfiles.map((profile) => ({
+            packageKey: packageEvidence.packageKey,
+            ...profile,
+          }))
+        },
+      )
+      type PlanningProfileEvidenceRow = {
+        package_key: string
+        line_global_id: string
+        product_global_id: string
+        input_profile_version_global_id: string
+        input_profile_version_row_version: string
+        fit_model: string
+        unit_dimensions_mm: {
+          length: number
+          width: number
+          height: number
+        }
+        unit_weight_grams: number
+        quantity: number
+        candidate_line_global_id: string
+        candidate_line_product_global_id: string
+        candidate_line_requires_shipping: boolean
+        candidate_line_mapping_state: string
+        candidate_line_packaging_state: string
+        candidate_line_pack_profile_version_id: string | null
+        candidate_line_pack_profile_version_row_version: string | null
+        current_profile_global_id: string
+        current_profile_row_version: string
+        current_profile_lifecycle_state: string
+        current_profile_is_current: boolean
+        current_profile_dimension_basis: string
+        current_profile_fit_model: string
+        current_profile_length_mm: number | null
+        current_profile_width_mm: number | null
+        current_profile_height_mm: number | null
+        current_profile_gross_weight_grams: number | null
+      }
+      const lockedOrToolsProfiles =
+        await client.query<PlanningProfileEvidenceRow>(
+          `SELECT
+             profile_edge.package_key,
+             profile_edge.line_global_id,
+             profile_edge.product_global_id,
+             profile_edge.input_profile_version_global_id,
+             profile_edge.input_profile_version_row_version::text,
+             profile_edge.fit_model,
+             profile_edge.unit_dimensions_mm,
+             profile_edge.unit_weight_grams,
+             profile_edge.quantity,
+             candidate_line.global_id AS candidate_line_global_id,
+             product.reference_code AS candidate_line_product_global_id,
+             candidate_line.requires_shipping
+               AS candidate_line_requires_shipping,
+             candidate_line.mapping_state AS candidate_line_mapping_state,
+             candidate_line.packaging_state
+               AS candidate_line_packaging_state,
+             candidate_line.pack_profile_version_id::text
+               AS candidate_line_pack_profile_version_id,
+             candidate_line.pack_profile_version_row_version::text
+               AS candidate_line_pack_profile_version_row_version,
+             profile_version.global_id AS current_profile_global_id,
+             profile_version.row_version::text
+               AS current_profile_row_version,
+             profile_version.lifecycle_state
+               AS current_profile_lifecycle_state,
+             profile_version.is_current AS current_profile_is_current,
+             profile_version.dimension_basis
+               AS current_profile_dimension_basis,
+             profile_version.fit_model AS current_profile_fit_model,
+             profile_version.length_mm AS current_profile_length_mm,
+             profile_version.width_mm AS current_profile_width_mm,
+             profile_version.height_mm AS current_profile_height_mm,
+             profile_version.gross_weight_grams
+               AS current_profile_gross_weight_grams
+           FROM operations_cartonization_rate_evidence_package_profiles
+             profile_edge
+           JOIN operations_cartonization_rate_evidence evidence
+             ON evidence.organization_id = profile_edge.organization_id
+            AND evidence.id = profile_edge.evidence_id
+           JOIN operations_commerce_order_candidate_lines candidate_line
+             ON candidate_line.organization_id = evidence.organization_id
+            AND candidate_line.integration_account_id =
+                 evidence.integration_account_id
+            AND candidate_line.order_candidate_id = evidence.order_candidate_id
+            AND candidate_line.global_id = profile_edge.line_global_id
+           JOIN crm_products product
+             ON product.pipeline_id = candidate_line.pipeline_id
+            AND product.id = candidate_line.product_id
+           JOIN operations_product_pack_profile_versions profile_version
+             ON profile_version.organization_id =
+                  candidate_line.organization_id
+            AND profile_version.pipeline_id = candidate_line.pipeline_id
+            AND profile_version.product_id = candidate_line.product_id
+            AND profile_version.id =
+                  profile_edge.input_pack_profile_version_id
+            AND profile_version.id = candidate_line.pack_profile_version_id
+           WHERE profile_edge.organization_id = $1::uuid
+             AND profile_edge.evidence_id = $2::uuid
+             AND evidence.evidence_mode = 'operational'
+           ORDER BY candidate_line.id, profile_version.id,
+                    profile_edge.package_key,
+                    profile_edge.line_global_id
+           FOR UPDATE OF candidate_line, profile_version`,
+          [organizationId, order.evidence_id],
+        )
+      const expectedProfileByKey = new Map(
+        expectedOrToolsProfiles.map((profile) => [
+          `${profile.packageKey}:${profile.lineGlobalId}`,
+          profile,
+        ]),
+      )
+      if (
+        expectedProfileByKey.size !== expectedOrToolsProfiles.length
+        || lockedOrToolsProfiles.rows.length
+          !== expectedOrToolsProfiles.length
+        || lockedOrToolsProfiles.rows.some((row) => {
+          const expected = expectedProfileByKey.get(
+            `${row.package_key}:${row.line_global_id}`,
+          )
+          return (
+            !expected
+            || expected.productGlobalId !== row.product_global_id
+            || expected.inputProfileVersionGlobalId
+              !== row.input_profile_version_global_id
+            || expected.inputProfileVersionRowVersion
+              !== Number(row.input_profile_version_row_version)
+            || expected.fitModel !== row.fit_model
+            || expected.unitDimensionsMm.length
+              !== row.unit_dimensions_mm.length
+            || expected.unitDimensionsMm.width
+              !== row.unit_dimensions_mm.width
+            || expected.unitDimensionsMm.height
+              !== row.unit_dimensions_mm.height
+            || expected.unitWeightGrams !== row.unit_weight_grams
+            || expected.quantity !== row.quantity
+            || row.candidate_line_global_id !== row.line_global_id
+            || row.candidate_line_product_global_id
+              !== row.product_global_id
+            || row.candidate_line_requires_shipping !== true
+            || row.candidate_line_mapping_state !== 'resolved'
+            || row.candidate_line_packaging_state !== 'resolved'
+            || !row.candidate_line_pack_profile_version_id
+            || row.candidate_line_pack_profile_version_row_version === null
+            || Number(row.candidate_line_pack_profile_version_row_version)
+              !== Number(row.input_profile_version_row_version)
+            || row.current_profile_global_id
+              !== row.input_profile_version_global_id
+            || Number(row.current_profile_row_version)
+              !== Number(row.input_profile_version_row_version)
+            || row.current_profile_lifecycle_state !== 'active'
+            || row.current_profile_is_current !== true
+            || row.current_profile_dimension_basis !== 'outer'
+            || row.current_profile_fit_model !== 'rigid_3d'
+            || row.current_profile_length_mm
+              !== row.unit_dimensions_mm.length
+            || row.current_profile_width_mm
+              !== row.unit_dimensions_mm.width
+            || row.current_profile_height_mm
+              !== row.unit_dimensions_mm.height
+            || row.current_profile_gross_weight_grams
+              !== row.unit_weight_grams
+          )
+        })
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_CARTONIZATION_PROFILE_EVIDENCE_STALE',
+          'An OR-Tools product profile changed after cartonization. Re-run the plan before creating warehouse work.',
           409,
         )
       }
@@ -10802,9 +11016,10 @@ export async function planOperationsOrderFromPostgres(input: {
             `SELECT COALESCE(sum(quantity), 0)::text AS quantity
              FROM operations_reservations
              WHERE organization_id = $1::uuid
-               AND provider_inventory_level_id = $2::uuid
+               AND position_id = $2::uuid
+               AND reservation_authority = 'provider_commitment'
                AND status = 'active'`,
-            [organizationId, positionRows[0].inventory_level_id],
+            [organizationId, positionRows[0].id],
           )
           if (
             Number(claimed.rows[0]?.quantity || 0) + quantity

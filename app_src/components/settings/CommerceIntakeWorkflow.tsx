@@ -3259,6 +3259,7 @@ export default function CommerceIntakeWorkflow({
     if (
       !candidate
       || !Number.isInteger(candidate.rowVersion)
+      || !selectedCartonizationWarehouseGlobalId
       || selectedCartonizationMaterialGlobalIds.length < 1
       || selectedCartonizationMaterialGlobalIds.length > 8
     ) return
@@ -3291,6 +3292,7 @@ export default function CommerceIntakeWorkflow({
             accountGlobalId,
             candidateGlobalId: candidate.globalId,
             expectedCandidateRowVersion: candidate.rowVersion,
+            warehouseGlobalId: selectedCartonizationWarehouseGlobalId,
             materialGlobalIds: selectedCartonizationMaterialGlobalIds,
             assumedCommittedByLine: (candidate.lines || [])
               .filter((line) => line.requiresShipping && line.quantity > 0)
@@ -8918,6 +8920,7 @@ export default function CommerceIntakeWorkflow({
               || cartonizationLoading
               || !canManage
               || !operatorCommandsAllowed
+              || !selectedCartonizationWarehouseGlobalId
               || selectedCartonizationMaterialGlobalIds.length < 1
               || selectedCartonizationMaterialGlobalIds.length > 8
             }

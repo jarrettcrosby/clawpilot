@@ -1428,6 +1428,31 @@ async function seedCanonicalPlanningFixture(
           sha(`${packageKey}-${suffix}`),
         ],
       )
+      await evidenceClient.query(
+        `INSERT INTO
+           operations_cartonization_rate_evidence_package_profiles (
+             organization_id, evidence_id, package_key, line_global_id,
+             product_global_id, input_pack_profile_version_id,
+             input_profile_version_global_id,
+             input_profile_version_row_version, fit_model,
+             unit_dimensions_mm, unit_weight_grams, quantity
+           ) VALUES (
+             $1::uuid, $2::uuid, $3, $4,
+             $5, $6::uuid, $7, $8, 'rigid_3d',
+             '{"length":203,"width":152,"height":51}'::jsonb,
+             170, 1
+           )`,
+        [
+          organizationId,
+          evidence.id,
+          packageKey,
+          candidateLine.global_id,
+          product.reference_code,
+          commercePackVersion.id,
+          commercePackVersion.global_id,
+          Number(commercePackVersion.row_version),
+        ],
+      )
     }
     for (const packageKey of packageKeys) {
       for (const provider of ['ups_rest', 'fedex_rest']) {
@@ -2000,8 +2025,16 @@ async function canonicalPlanningState(pool, fixture) {
   return result.rows[0]
 }
 
-async function verifyLatestProviderCommitmentRelease(pool, operations) {
-  const fixture = await seedCanonicalPlanningFixture(pool)
+async function verifyLatestProviderCommitmentRelease(
+  pool,
+  operations,
+  hybridCartonizationPersistence,
+) {
+  const fixture = await seedCanonicalPlanningFixture(pool, {
+    checkoutServiceCode: 'clawpilot:dev:test-zero',
+    shopifyUnlistedChannel: true,
+    packagingStockOnHand: 10,
+  })
   const planned = await operations.planOperationsOrderFromPostgres({
     organizationId: fixture.organizationId,
     actorEmail: fixture.email,
@@ -2075,6 +2108,31 @@ async function verifyLatestProviderCommitmentRelease(pool, operations) {
   assert.equal(
     supportResult.rows[0].latest_sync_run_global_id,
     latest.run.global_id,
+  )
+  await installReceiptExemptUnlistedCheckoutMapping(pool, fixture)
+  await assert.rejects(
+    () => hybridCartonizationPersistence
+      .readHybridCartonizationInputFromPostgres({
+        organizationId: fixture.organizationId,
+        accountGlobalId: fixture.commerceAccount.global_id,
+        candidateGlobalId: fixture.candidate.global_id,
+        expectedCandidateRowVersion: Number(fixture.candidate.row_version),
+        warehouseGlobalId: fixture.warehouse.global_id,
+        mode: 'production',
+        selectedMaterials: [{
+          materialGlobalId: fixture.material.global_id,
+          expectedRowVersion: Number(fixture.material.row_version),
+        }],
+        assumedCommittedQuantities: [],
+      }),
+    (error) => {
+      assert.equal(
+        error.code,
+        'HYBRID_CARTONIZATION_INVENTORY_INSUFFICIENT',
+      )
+      return true
+    },
+    'A reservation tied to the prior Shopify sync must still consume the current level commitment through its stable position',
   )
 
   const released = await operations.releaseOperationsOrderFromPostgres({
@@ -2768,6 +2826,9 @@ async function verifyCanonicalPlanning(databaseUrl) {
     const commerceFulfillmentRecoveryPolicy = loadTypeScriptModule(
       'app_src/lib/commerceFulfillmentRecoveryPolicy.ts',
     )
+    const fulfillmentOptimizerContract = loadTypeScriptModule(
+      'app_src/lib/operations/fulfillmentOptimizerContract.ts',
+    )
     const cartonizationRateEvidence = loadTypeScriptModule(
       'app_src/lib/persistence/cartonizationRateEvidence.ts',
       {
@@ -2788,6 +2849,8 @@ async function verifyCanonicalPlanning(databaseUrl) {
             },
             normalizeCarrierSandboxParty: (value) => value,
           },
+          '@/lib/operations/fulfillmentOptimizerContract':
+            fulfillmentOptimizerContract,
           '@/lib/persistence/postgres': postgres,
         },
       },
@@ -4139,26 +4202,18 @@ async function verifyCanonicalPlanning(databaseUrl) {
       },
     )
 
-    const duplicateAllocationFixture =
-      await seedCanonicalPlanningFixture(pool, {
-        duplicatePackageLine: true,
-      })
     await assert.rejects(
-      () => operations.planOperationsOrderFromPostgres({
-        organizationId: duplicateAllocationFixture.organizationId,
-        actorEmail: duplicateAllocationFixture.email,
-        orderGlobalId: duplicateAllocationFixture.order.global_id,
-        cartonizationEvidenceGlobalId:
-          duplicateAllocationFixture.evidence.global_id,
-        expectedRowVersion:
-          Number(duplicateAllocationFixture.order.row_version),
-        reason: 'Reject duplicate same-line package contents',
-        idempotencyKey: `canonical-plan-${randomUUID()}`,
+      () => seedCanonicalPlanningFixture(pool, {
+        duplicatePackageLine: true,
       }),
       (error) => {
         assert.equal(
           error.code,
-          'OPERATIONS_PACKAGE_CONTENTS_DUPLICATE',
+          'P0001',
+        )
+        assert.match(
+          error.message,
+          /one exact operational profile edge per allocation/,
         )
         return true
       },
@@ -4358,7 +4413,11 @@ async function verifyCanonicalPlanning(databaseUrl) {
       /Fulfillment allocation identity and quantity are immutable/,
     )
 
-    await verifyLatestProviderCommitmentRelease(pool, operations)
+    await verifyLatestProviderCommitmentRelease(
+      pool,
+      operations,
+      hybridCartonizationPersistence,
+    )
     await verifyLocalSplitPlanning(pool, operations)
     await verifyPackagingClaimConcurrency(pool)
   } finally {
