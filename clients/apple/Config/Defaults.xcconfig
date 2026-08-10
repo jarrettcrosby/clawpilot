@@ -1,0 +1,11 @@
+// Safe build defaults. Override environment-specific values in the ignored
+// Local.xcconfig file. Never place credentials in a source-controlled file.
+CLAWPILOT_META_DEV_APP_ID = 0
+CLAWPILOT_META_DEV_CLIENT_TOKEN =
+CLAWPILOT_META_PRODUCTION_APP_ID = 0
+CLAWPILOT_META_PRODUCTION_CLIENT_TOKEN =
+CLAWPILOT_GOOGLE_DEV_IOS_CLIENT_ID = google-not-configured.apps.googleusercontent.com
+CLAWPILOT_GOOGLE_DEV_REVERSED_CLIENT_ID = com.googleusercontent.apps.google-not-configured
+CLAWPILOT_GOOGLE_PRODUCTION_IOS_CLIENT_ID = google-not-configured.apps.googleusercontent.com
+CLAWPILOT_GOOGLE_PRODUCTION_REVERSED_CLIENT_ID = com.googleusercontent.apps.google-not-configured
+CLAWPILOT_GOOGLE_SERVER_CLIENT_ID_SHARED = google-not-configured.apps.googleusercontent.com

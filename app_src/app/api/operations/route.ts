@@ -26,6 +26,7 @@ import {
   SandboxCommerceE2eAuthorizationError,
 } from '@/lib/persistence/sandboxCommerceE2eAuthorization'
 import {
+  assignOperationsOrderPicksFromPostgres,
   confirmOperationsOrderShipmentFromPostgres,
   confirmOperationsOrderPicksFromPostgres,
   completeOperationsInboundReceiptInPostgres,
@@ -1126,7 +1127,7 @@ export async function POST(req: NextRequest) {
       }
       assertFields(
         body,
-        new Set(['action', 'orderGlobalId', 'expectedRowVersion', 'reason']),
+        new Set(['action', 'orderGlobalId', 'expectedRowVersion', 'reason', 'assignedTo']),
         'OPERATIONS_REQUEST_INVALID',
         'Operations command',
       )
@@ -1136,6 +1137,38 @@ export async function POST(req: NextRequest) {
         orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
         expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
         reason: textValue(body.reason, 'Release reason', 500),
+        assignedTo: textValue(body.assignedTo, 'Assigned picker', 254, false) || undefined,
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'assign-picks') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to assign warehouse picks',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'orderGlobalId',
+          'expectedRowVersion',
+          'assignedTo',
+          'reason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await assignOperationsOrderPicksFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
+        expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
+        assignedTo: textValue(body.assignedTo, 'Assigned picker', 254),
+        reason: textValue(body.reason, 'Assignment reason', 500),
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })

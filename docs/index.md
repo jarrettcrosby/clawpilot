@@ -30,6 +30,8 @@ This repository is the canonical source for ClawPilot product, engineering, and 
 - [Local-first knowledge retrieval](decisions/0004-local-first-knowledge-retrieval.md)
 - [Multi-workspace user membership](decisions/0005-multi-workspace-membership.md)
 - [Native distributed operations authority and adapter boundaries](decisions/0006-native-distributed-operations-authority.md)
+- [Wearable picking Phase 1](modules/wearable-picking.md)
+- [Meta Wearables Device Access](integrations/meta-wearables-device-access.md)
 
 ## Active Module Contracts
 

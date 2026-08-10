@@ -700,6 +700,45 @@ function requireOrganizationId(value: string) {
   return organizationId
 }
 
+async function requireEligibleOperationsPicker(
+  client: PoolClient,
+  organizationId: string,
+  pickerEmail: string,
+) {
+  const result = await client.query<{ eligible: boolean }>(
+    `SELECT (
+       membership.role = 'owner'
+       OR (
+         COALESCE((membership.permissions->>'viewOperations')::boolean, false)
+         AND COALESCE((membership.permissions->>'executeWarehouse')::boolean, false)
+       )
+     ) AS eligible
+     FROM app_user_organization_memberships membership
+     JOIN app_users app_user ON app_user.email = membership.user_email
+     WHERE membership.organization_id = $1::uuid
+       AND membership.user_email = $2
+       AND membership.status = 'active'
+       AND app_user.status = 'active'
+     LIMIT 1`,
+    [organizationId, pickerEmail],
+  )
+  const membership = result.rows[0]
+  if (!membership) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICKER_NOT_FOUND',
+      'The selected picker is not an active member of this workspace',
+      409,
+    )
+  }
+  if (!membership.eligible) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICKER_ACCESS_REQUIRED',
+      'The selected worker needs Operations view and warehouse execution permission',
+      409,
+    )
+  }
+}
+
 const ACTIVATION_STATES = new Set<OperationsActivationState>([
   'disabled', 'shadow', 'read_only', 'active', 'frozen',
 ])
@@ -9210,9 +9249,9 @@ export async function runMockOperationsProofFromPostgres(input: {
       const pickResult = await client.query<IdRow>(
         `INSERT INTO operations_pick_tasks (
            organization_id, wave_id, plan_id, allocation_id, from_location_id,
-           quantity, sequence_number, status, assigned_to
+           quantity, sequence_number, status, assigned_to, assigned_at
          ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
-           $6, $7, 'ready', $8)
+           $6, $7, 'ready', $8, now())
          RETURNING id::text, global_id`,
         [
           organizationId,
@@ -11074,12 +11113,15 @@ export async function releaseOperationsOrderFromPostgres(input: {
   expectedRowVersion: number
   reason: string
   idempotencyKey: string
+  assignedTo?: string
 }): Promise<OperationsOrderCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
   const orderGlobalId = String(input.orderGlobalId || '').trim()
   const reason = String(input.reason || '').trim()
   const idempotencyKey = String(input.idempotencyKey || '').trim()
+  const explicitAssignedTo = String(input.assignedTo || '').trim().toLowerCase()
+  const assignedTo = explicitAssignedTo || actorEmail
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
   if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
@@ -11090,6 +11132,9 @@ export async function releaseOperationsOrderFromPostgres(input: {
   if (!reason || reason.length > 500) {
     throw new OperationsRequestError('OPERATIONS_RELEASE_REASON_INVALID', 'A release reason is required')
   }
+  if (!assignedTo.includes('@') || assignedTo.length > 254) {
+    throw new OperationsRequestError('OPERATIONS_PICKER_INVALID', 'Choose a valid picker')
+  }
   if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
     throw new OperationsRequestError('OPERATIONS_IDEMPOTENCY_KEY_INVALID', 'A valid idempotency key is required')
   }
@@ -11098,7 +11143,12 @@ export async function releaseOperationsOrderFromPostgres(input: {
     organizationId,
     commandType: 'release_operations_order',
     idempotencyKey,
-    requestHash: commandRequestHash({ orderGlobalId, expectedRowVersion: input.expectedRowVersion, reason }),
+    requestHash: commandRequestHash({
+      orderGlobalId,
+      expectedRowVersion: input.expectedRowVersion,
+      reason,
+      assignedTo,
+    }),
     actorEmail,
   })
   if (command.completed) {
@@ -11119,6 +11169,9 @@ export async function releaseOperationsOrderFromPostgres(input: {
           'Set Operations to Shadow or Active before releasing warehouse work',
           409,
         )
+      }
+      if (explicitAssignedTo) {
+        await requireEligibleOperationsPicker(client, organizationId, assignedTo)
       }
 
       const orderResult = await client.query<OrderIdentityRow & {
@@ -11361,7 +11414,7 @@ export async function releaseOperationsOrderFromPostgres(input: {
       const pickResult = await client.query<QueryResultRow & { global_id: string }>(
         `INSERT INTO operations_pick_tasks (
            organization_id, wave_id, plan_id, allocation_id, from_location_id,
-           quantity, sequence_number, status, assigned_to
+           quantity, sequence_number, status, assigned_to, assigned_at
          )
          SELECT allocation.organization_id, $3::uuid, allocation.plan_id, allocation.id,
                 position.location_id, allocation.quantity,
@@ -11369,7 +11422,7 @@ export async function releaseOperationsOrderFromPostgres(input: {
                   ORDER BY location.pick_sequence, position.global_id,
                            allocation.id
                 )::integer,
-                'ready', $4
+                'ready', $4, CASE WHEN $4::text IS NULL THEN NULL ELSE now() END
          FROM operations_fulfillment_allocations allocation
          JOIN operations_inventory_positions position
            ON position.organization_id = allocation.organization_id
@@ -11380,7 +11433,7 @@ export async function releaseOperationsOrderFromPostgres(input: {
          WHERE allocation.organization_id = $1::uuid AND allocation.plan_id = $2::uuid
          ON CONFLICT (allocation_id) DO NOTHING
          RETURNING global_id`,
-        [organizationId, plan.id, wave.id, actorEmail],
+        [organizationId, plan.id, wave.id, assignedTo],
       )
       if (Number(pickResult.rowCount || 0) !== allocationRowCount) {
         throw new OperationsRequestError('OPERATIONS_PICK_TASKS_INCOMPLETE', 'Warehouse pick tasks could not be created', 409)
@@ -11423,6 +11476,7 @@ export async function releaseOperationsOrderFromPostgres(input: {
             providerCommitmentRevalidation
               .latestInventorySyncRunGlobalIds,
           reason,
+          assignedTo,
         },
       })
       await recordAuditEvent({
@@ -11446,6 +11500,7 @@ export async function releaseOperationsOrderFromPostgres(input: {
             providerCommitmentRevalidation
               .latestInventorySyncRunGlobalIds,
           reason,
+          assignedTo,
         },
       }, client)
       const result: OperationsOrderCommandResult = {
@@ -11456,6 +11511,201 @@ export async function releaseOperationsOrderFromPostgres(input: {
       }
       await completeCommandReceipt(client, command.receipt.id, order.global_id, result)
 
+      return result
+    })
+  } catch (error) {
+    await failCommandReceipt(command.receipt.id, error)
+    throw error
+  }
+}
+
+export async function assignOperationsOrderPicksFromPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  orderGlobalId: string
+  expectedRowVersion: number
+  assignedTo: string
+  reason: string
+  idempotencyKey: string
+}): Promise<OperationsOrderCommandResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
+  const orderGlobalId = String(input.orderGlobalId || '').trim()
+  const assignedTo = String(input.assignedTo || '').trim().toLowerCase()
+  const reason = String(input.reason || '').trim()
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
+    throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
+  }
+  if (!Number.isSafeInteger(input.expectedRowVersion) || input.expectedRowVersion < 0) {
+    throw new OperationsRequestError('OPERATIONS_ORDER_VERSION_INVALID', 'Order version is invalid')
+  }
+  if (!assignedTo.includes('@') || assignedTo.length > 254) {
+    throw new OperationsRequestError('OPERATIONS_PICKER_INVALID', 'Choose a valid picker')
+  }
+  if (!reason || reason.length > 500) {
+    throw new OperationsRequestError('OPERATIONS_ASSIGNMENT_REASON_INVALID', 'An assignment reason is required')
+  }
+  if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
+    throw new OperationsRequestError('OPERATIONS_IDEMPOTENCY_KEY_INVALID', 'A valid idempotency key is required')
+  }
+
+  const command = await prepareCommandReceipt({
+    organizationId,
+    commandType: 'assign_operations_order_picks',
+    idempotencyKey,
+    requestHash: commandRequestHash({
+      orderGlobalId,
+      expectedRowVersion: input.expectedRowVersion,
+      assignedTo,
+      reason,
+    }),
+    actorEmail,
+  })
+  if (command.completed) {
+    return completedOrderCommandResult(organizationId, command.receipt)
+  }
+
+  try {
+    return await withTransaction(async (client) => {
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:order:${organizationId}:${orderGlobalId}`,
+      )
+      await requireEligibleOperationsPicker(client, organizationId, assignedTo)
+      const orderResult = await client.query<OrderIdentityRow>(
+        `SELECT id::text, global_id, status, row_version::text
+         FROM operations_orders
+         WHERE organization_id = $1::uuid AND global_id = $2
+         FOR UPDATE`,
+        [organizationId, orderGlobalId],
+      )
+      const order = orderResult.rows[0]
+      if (!order || order.row_version === undefined) {
+        throw new OperationsRequestError('OPERATIONS_ORDER_NOT_FOUND', 'Operations order was not found', 404)
+      }
+      if (Number(order.row_version) !== input.expectedRowVersion) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_VERSION_CONFLICT',
+          'This order changed before the picker assignment was saved. Refresh and try again.',
+          409,
+        )
+      }
+      if (order.status !== 'released') {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_ASSIGNMENT_INVALID',
+          'Only a released order with unstarted picks can be assigned',
+          409,
+        )
+      }
+
+      const taskSummary = await client.query<{
+        task_count: string
+        ready_count: string
+      }>(
+        `SELECT count(*)::text AS task_count,
+                count(*) FILTER (WHERE pick.status = 'ready')::text AS ready_count
+         FROM operations_pick_tasks pick
+         JOIN operations_fulfillment_plans plan
+           ON plan.organization_id = pick.organization_id
+          AND plan.id = pick.plan_id
+         JOIN operations_waves wave
+           ON wave.organization_id = pick.organization_id
+          AND wave.id = pick.wave_id
+         WHERE pick.organization_id = $1::uuid
+           AND plan.order_id = $2::uuid
+           AND plan.status = 'released'
+           AND wave.status = 'released'`,
+        [organizationId, order.id],
+      )
+      const taskCount = Number(taskSummary.rows[0]?.task_count || 0)
+      const readyCount = Number(taskSummary.rows[0]?.ready_count || 0)
+      if (taskCount < 1 || readyCount !== taskCount) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_ASSIGNMENT_INVALID',
+          'Every pick must still be ready before reassigning this order',
+          409,
+        )
+      }
+
+      const assignment = await client.query(
+        `UPDATE operations_pick_tasks pick
+         SET assigned_to = $3, assigned_at = now(), updated_at = now()
+         FROM operations_fulfillment_plans plan,
+              operations_waves wave
+         WHERE pick.organization_id = $1::uuid
+           AND plan.organization_id = pick.organization_id
+           AND plan.id = pick.plan_id
+           AND plan.order_id = $2::uuid
+           AND plan.status = 'released'
+           AND wave.organization_id = pick.organization_id
+           AND wave.id = pick.wave_id
+           AND wave.status = 'released'
+           AND pick.status = 'ready'
+         RETURNING pick.id`,
+        [organizationId, order.id, assignedTo],
+      )
+      if (Number(assignment.rowCount || 0) !== taskCount) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_ASSIGNMENT_INCOMPLETE',
+          'Not every pick task could be assigned',
+          409,
+        )
+      }
+
+      const updated = await client.query<OrderIdentityRow>(
+        `UPDATE operations_orders
+         SET updated_by = $4, updated_at = now(), row_version = row_version + 1
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND status = 'released'
+           AND row_version = $3
+         RETURNING id::text, global_id, status, row_version::text`,
+        [organizationId, order.id, input.expectedRowVersion, actorEmail],
+      )
+      const assignedOrder = updated.rows[0]
+      if (!assignedOrder || assignedOrder.row_version === undefined) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_VERSION_CONFLICT',
+          'This order changed before the picker assignment was saved. Refresh and try again.',
+          409,
+        )
+      }
+      const result: OperationsOrderCommandResult = {
+        orderGlobalId: assignedOrder.global_id,
+        orderStatus: assignedOrder.status,
+        rowVersion: Number(assignedOrder.row_version),
+        replayed: false,
+      }
+      await appendDomainEvent(client, {
+        organizationId,
+        aggregateType: 'operations.order',
+        aggregateId: order.id,
+        aggregateGlobalId: order.global_id,
+        eventType: 'operations.pick.assigned',
+        actorEmail,
+        correlationId: command.receipt.correlation_id,
+        idempotencyKey: `picker-assignment:${command.receipt.id}`,
+        payload: { assignedTo, taskCount, reason },
+      })
+      await recordAuditEvent({
+        actor: actorEmail,
+        eventType: 'operations.pick.assigned',
+        aggregateType: 'operations.order',
+        aggregateId: order.global_id,
+        subject: `Assigned ${order.global_id} picks to ${assignedTo}`,
+        organizationId,
+        eventKey: `operations:pick-assignment:${command.receipt.id}`,
+        payload: {
+          assignedTo,
+          taskCount,
+          reason,
+          previousRowVersion: input.expectedRowVersion,
+          rowVersion: result.rowVersion,
+        },
+      }, client)
+      await completeCommandReceipt(client, command.receipt.id, order.global_id, result)
       return result
     })
   } catch (error) {

@@ -42,7 +42,7 @@ export async function recordAuthActivity(input: {
   req: NextRequest
   email: unknown
   eventType: 'auth.code.requested' | 'auth.code.request.denied' | 'auth.login.succeeded' | 'auth.login.failed' | 'auth.logout.succeeded'
-  method: 'magic_code' | 'operator_password' | 'session'
+  method: 'magic_code' | 'google_sso' | 'operator_password' | 'session'
   reason?: string
   effectiveUser?: string
   sessionId?: string

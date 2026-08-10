@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-labelledby="title desc">
+  <title id="title">ClawPilot mark</title>
+  <desc id="desc">A monoline CP route mark inside a rounded frame.</desc>
+  <rect x="14" y="14" width="68" height="68" rx="20" stroke="#E4E1EC" fill="none" stroke-width="3.5"/>
+  <path d="M59 29 C55 25 50 23 44 23 C32 23 23 33 23 48 C23 63 32 73 45 73 C52 73 58 70 62 65" stroke="#7EABFF" fill="none" stroke-width="5" stroke-linecap="round"/>
+  <path d="M47 68 V29 H59 C67 29 72 34 72 42 C72 50 67 54 59 54 H47" stroke="#E4E1EC" fill="none" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="72" cy="42" r="4" fill="#4FD1B8"/>
+</svg>

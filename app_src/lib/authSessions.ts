@@ -12,7 +12,7 @@ const IMPERSONATION_TTL_SECONDS = 30 * 60
 const RECENT_AUTH_SECONDS = 15 * 60
 
 type SessionRole = 'owner' | 'admin' | 'member'
-type SessionAuthMethod = 'magic_code' | 'operator_password' | 'legacy_upgrade' | 'demo'
+type SessionAuthMethod = 'magic_code' | 'google_sso' | 'operator_password' | 'legacy_upgrade' | 'demo'
 
 type SessionRow = {
   id: string

@@ -12,6 +12,13 @@ coverage/
 dist/
 backups/
 *.tsbuildinfo
+clients/apple/.build/
+clients/apple/.swiftpm/
+clients/apple/build/
+clients/apple/*.xcodeproj/
+clients/apple/Apps/iPhone/Info.plist
+clients/apple/Apps/Watch/Info.plist
+clients/apple/Config/Local.xcconfig
 
 # Local test/build artifacts
 app_src/test-results/

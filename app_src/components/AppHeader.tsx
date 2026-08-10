@@ -111,6 +111,13 @@ export default function AppHeader({
 
   useEffect(() => {
     const params = new URL(window.location.href).searchParams
+    if (params.get('settings') === 'people') {
+      const frame = window.requestAnimationFrame(() => {
+        setSettingsInitialTab(1)
+        setUserAccessOpen(true)
+      })
+      return () => window.cancelAnimationFrame(frame)
+    }
     if (
       params.get('settings') === 'integrations'
       && params.get('integration') === 'commerce'
