@@ -64,7 +64,11 @@ public actor PickingSession {
         return task
     }
 
-    public func makeWatchSnapshot(now: Date = Date()) -> WatchPickSnapshot? {
+    public func makeWatchSnapshot(
+        now: Date = Date(),
+        instructionLanguageCode: String = "en",
+        readInstructionOnPhone: Bool = false
+    ) -> WatchPickSnapshot? {
         guard let order = currentOrder() else { return nil }
         let remaining = order.tasks.filter { !scannedTaskIDs.contains($0.pickTaskGlobalId) }
         func card(_ task: PickTask) -> WatchPickCard {
@@ -82,7 +86,9 @@ public actor PickingSession {
             orderNumber: order.orderNumber,
             current: remaining.first.map(card),
             upcoming: remaining.dropFirst().prefix(2).map(card),
-            generatedAt: now
+            generatedAt: now,
+            instructionLanguageCode: instructionLanguageCode,
+            readInstructionOnPhone: readInstructionOnPhone
         )
     }
 
@@ -124,12 +130,26 @@ public enum PickVoice {
     }
 
     public static func instruction(for task: PickTask, languageCode: String = "en") -> String {
-        let location = spokenLocationCode(task.locationCode, languageCode: languageCode)
-        let product = spokenProductName(task.productName, languageCode: languageCode)
+        instruction(
+            productName: task.productName,
+            locationCode: task.locationCode,
+            quantity: task.quantity,
+            languageCode: languageCode
+        )
+    }
+
+    public static func instruction(
+        productName: String,
+        locationCode: String,
+        quantity: Double,
+        languageCode: String = "en"
+    ) -> String {
+        let location = spokenLocationCode(locationCode, languageCode: languageCode)
+        let product = spokenProductName(productName, languageCode: languageCode)
         if languageCode == "es" {
-            return "Recoge \(task.quantity.formatted()) de \(product) en la ubicación \(location). Escanea el código de barras del producto."
+            return "Recoge \(quantity.formatted()) de \(product) en la ubicación \(location). Escanea el código de barras del producto."
         }
-        return "Pick \(task.quantity.formatted()) of \(product) from location \(location). Scan the product barcode."
+        return "Pick \(quantity.formatted()) of \(product) from location \(location). Scan the product barcode."
     }
 
     public static func spokenProductName(

@@ -96,7 +96,10 @@ func persistedConfirmation() async throws {
 func safeWatchProjection() async throws {
     let session = PickingSession(cache: MemoryCache())
     try await session.replaceQueue(fixtureQueue())
-    let snapshot = try #require(await session.makeWatchSnapshot())
+    let snapshot = try #require(await session.makeWatchSnapshot(
+        instructionLanguageCode: "es",
+        readInstructionOnPhone: true
+    ))
     let data = try JSONEncoder().encode(snapshot)
     let text = String(decoding: data, as: UTF8.self)
     #expect(text.contains("Blue Widget"))
@@ -104,6 +107,17 @@ func safeWatchProjection() async throws {
     #expect(!text.contains("012345678905"))
     #expect(!text.contains("orderGlobalId"))
     #expect(snapshot.upcoming.count == 1)
+    #expect(snapshot.instructionLanguageCode == "es")
+    #expect(snapshot.readInstructionOnPhone == true)
+}
+
+@Test("Watch instruction uses the same bounded pick wording as iPhone")
+func watchInstructionText() {
+    #expect(PickVoice.instruction(
+        productName: "Blue Widget",
+        locationCode: "PICK-01",
+        quantity: 2
+    ) == "Pick 2 of Blue Widget from location pick zero one. Scan the product barcode.")
 }
 
 @Test("Watch commands carry bounded actions but no pick or order identity")

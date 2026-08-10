@@ -24,6 +24,10 @@ device is connected, **Start Meta scan** opens a live glasses camera stream and
 reads one barcode locally without saving a photo. Returning from Meta AI starts
 a bounded reconnection poll; **Reconnect glasses** retries it without requiring
 the worker to leave ClawPilot. The iPhone camera remains an explicit fallback.
+The Watch reads its cached current instruction through the Watch speaker when
+glasses are unavailable, without waking the iPhone voice runtime. When one Meta
+glasses connection is active, the Watch delegates that read request to the
+iPhone so iOS can route playback to the glasses.
 
 Instruction audio can use the optional Supertonic-3 FP16 voice pack through
 SpeechSwift 0.0.23. The pack is installed explicitly from the Picker audio card,

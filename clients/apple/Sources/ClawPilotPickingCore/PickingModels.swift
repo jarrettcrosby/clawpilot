@@ -164,6 +164,8 @@ public struct WatchPickSnapshot: Codable, Equatable, Sendable {
     public let current: WatchPickCard?
     public let upcoming: [WatchPickCard]
     public let generatedAt: Date
+    public let instructionLanguageCode: String?
+    public let readInstructionOnPhone: Bool?
 }
 
 public enum WatchPickAction: String, Codable, Equatable, Sendable {

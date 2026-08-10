@@ -1,3 +1,4 @@
+@preconcurrency import AVFoundation
 import SwiftUI
 import WatchConnectivity
 import ClawPilotPickingCore
@@ -104,12 +105,11 @@ private struct WatchPickView: View {
 
             HStack {
                 Button {
-                    model.send(.readInstruction)
+                    model.readInstruction()
                 } label: {
                     Image(systemName: "speaker.wave.2.fill")
                 }
                 .accessibilityLabel("Read instruction")
-                .disabled(!model.isReachable)
 
                 Button {
                     model.send(.refreshQueue)
@@ -216,6 +216,7 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate {
     @Published private(set) var actionStatus = ""
     private let key = "clawpilot.pick.snapshot.v1"
     private let session: WCSession? = WCSession.isSupported() ? .default : nil
+    private let speech = AVSpeechSynthesizer()
 
     override init() {
         super.init()
@@ -251,6 +252,32 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate {
                 self?.actionStatus = "The iPhone did not receive the command. Open ClawPilot and try again."
             }
         }
+    }
+
+    func readInstruction() {
+        guard let snapshot, let current = snapshot.current else {
+            actionStatus = "No current pick instruction is available."
+            return
+        }
+        if snapshot.readInstructionOnPhone == true, session?.isReachable == true {
+            send(.readInstruction)
+            return
+        }
+        let languageCode = snapshot.instructionLanguageCode == "es" ? "es" : "en"
+        let text = PickVoice.instruction(
+            productName: current.productName,
+            locationCode: current.locationCode,
+            quantity: current.quantity,
+            languageCode: languageCode
+        )
+        speech.stopSpeaking(at: .immediate)
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.voice = AVSpeechSynthesisVoice(
+            language: languageCode == "es" ? "es-US" : "en-US"
+        )
+        utterance.rate = 0.48
+        speech.speak(utterance)
+        actionStatus = "Playing instruction on Apple Watch."
     }
 
     private func apply(_ data: Data) {

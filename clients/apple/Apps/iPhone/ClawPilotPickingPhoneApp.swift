@@ -1264,6 +1264,9 @@ final class PickingPhoneModel: ObservableObject {
         currentTask = await picking.currentTask()
         let activeOrder = await picking.currentOrder()
         readyToConfirm = currentTask == nil && activeOrder != nil
-        watch.publish(await picking.makeWatchSnapshot())
+        watch.publish(await picking.makeWatchSnapshot(
+            instructionLanguageCode: instructionLanguage.languageCode,
+            readInstructionOnPhone: metaConnectedDeviceCount == 1
+        ))
     }
 }
