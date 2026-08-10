@@ -1,6 +1,7 @@
 import SwiftUI
 import WebKit
 import ClawPilotPickingApple
+import GoogleSignInSwift
 
 private enum AppShellTheme {
     static let canvas = Color(red: 15 / 255, green: 15 / 255, blue: 19 / 255)
@@ -171,6 +172,25 @@ private struct LoginGateView: View {
                     .background(AppShellTheme.primary.opacity(0.12), in: Capsule())
             }
 
+            if model.isLocallyLocked {
+                Button {
+                    Task { await model.unlockWithBiometrics() }
+                } label: {
+                    Label("Unlock with \(model.biometricUnlockTitle)", systemImage: "faceid")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(ShellPrimaryButtonStyle())
+                .disabled(model.isAuthBusy)
+
+                HStack {
+                    Rectangle().fill(AppShellTheme.outline).frame(height: 1)
+                    Text("OR SIGN IN AGAIN")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(AppShellTheme.muted)
+                    Rectangle().fill(AppShellTheme.outline).frame(height: 1)
+                }
+            }
+
             VStack(alignment: .leading, spacing: 7) {
                 Text("Email")
                     .font(.caption.weight(.semibold))
@@ -214,6 +234,23 @@ private struct LoginGateView: View {
             }
             .buttonStyle(ShellPrimaryButtonStyle())
             .disabled(model.codeRequested ? !model.canVerifyCode : !model.canSendCode)
+
+            if model.googleSSOAvailable && !model.codeRequested {
+                HStack {
+                    Rectangle().fill(AppShellTheme.outline).frame(height: 1)
+                    Text("OR")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(AppShellTheme.muted)
+                    Rectangle().fill(AppShellTheme.outline).frame(height: 1)
+                }
+
+                GoogleSignInButton {
+                    field = nil
+                    Task { await model.signInWithGoogle() }
+                }
+                .frame(minHeight: 50)
+                .disabled(model.isAuthBusy)
+            }
 
             if model.codeRequested {
                 Button("Use a different email") {
@@ -262,6 +299,7 @@ private struct ModuleHomeView: View {
             VStack(alignment: .leading, spacing: 22) {
                 profileHeader
                 WorkspaceSwitcherCard(model: model)
+                sessionSecurityCard
                 VStack(alignment: .leading, spacing: 5) {
                     Text("Choose a workflow")
                         .font(.title2.weight(.bold))
@@ -349,6 +387,41 @@ private struct ModuleHomeView: View {
                 .padding(.horizontal, 9)
                 .padding(.vertical, 5)
                 .background(AppShellTheme.primary.opacity(0.12), in: Capsule())
+        }
+    }
+
+    private var sessionSecurityCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("Session security", systemImage: "faceid")
+                    .font(.headline)
+                    .foregroundStyle(AppShellTheme.text)
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { model.biometricUnlockEnabled },
+                    set: { enabled in
+                        Task { await model.setBiometricUnlockEnabled(enabled) }
+                    }
+                ))
+                .labelsHidden()
+                .disabled(!model.biometricUnlockAvailable)
+            }
+            Text(model.biometricUnlockAvailable
+                 ? "Use \(model.biometricUnlockTitle) to unlock this signed-in session after a fresh app launch. Magic codes and Google remain available."
+                 : "Set up Face ID or Touch ID in iPhone Settings to enable local unlock.")
+                .font(.footnote)
+                .foregroundStyle(AppShellTheme.muted)
+            if !model.biometricStatus.isEmpty {
+                Text(model.biometricStatus)
+                    .font(.caption2)
+                    .foregroundStyle(AppShellTheme.muted)
+            }
+        }
+        .padding(16)
+        .background(AppShellTheme.surface, in: RoundedRectangle(cornerRadius: 18))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18)
+                .stroke(AppShellTheme.outline, lineWidth: 1)
         }
     }
 

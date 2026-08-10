@@ -340,7 +340,11 @@ final class VoiceConfirmationController {
 #endif
     }
 
-    func speak(_ english: String, spanish: String? = nil) {
+    func speak(
+        _ english: String,
+        spanish: String? = nil,
+        forceSystemVoice: Bool = false
+    ) {
         stopListening()
         stopSpeech()
         let language = instructionLanguage
@@ -356,7 +360,7 @@ final class VoiceConfirmationController {
                     self.speechTask = nil
                 }
             }
-            if self.voicePackState == .ready {
+            if self.voicePackState == .ready && !forceSystemVoice {
                 do {
                     let samples = try await self.offlineSpeech.synthesize(text: text, language: language)
                     try Task.checkCancellation()

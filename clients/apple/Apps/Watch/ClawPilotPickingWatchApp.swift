@@ -237,17 +237,19 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate {
             actionStatus = "The Watch command could not be prepared."
             return
         }
-        session.sendMessageData(data, replyHandler: nil) { [weak self] _ in
+        actionStatus = "Sending command to iPhone…"
+        session.sendMessageData(data) { [weak self] data in
+            let response = String(data: data, encoding: .utf8)
+                ?? "The iPhone received the command."
+            Task { @MainActor in
+                self?.isReachable = true
+                self?.actionStatus = response
+            }
+        } errorHandler: { [weak self] _ in
             Task { @MainActor in
                 self?.isReachable = false
                 self?.actionStatus = "The iPhone did not receive the command. Open ClawPilot and try again."
             }
-        }
-        switch action {
-        case .requestMetaScan: actionStatus = "Glasses scan requested."
-        case .readInstruction: actionStatus = "Instruction requested."
-        case .confirmPick: actionStatus = "Confirmation sent to ClawPilot on iPhone."
-        case .refreshQueue: actionStatus = "Pick refresh requested."
         }
     }
 

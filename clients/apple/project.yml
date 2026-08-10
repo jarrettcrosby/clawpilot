@@ -7,17 +7,15 @@ options:
     iOS: "18.0"
     watchOS: "10.2"
 
+configs:
+  Development: debug
+  Production: release
+
 settings:
   base:
     SWIFT_VERSION: "6.0"
-    CURRENT_PROJECT_VERSION: "1"
+    CURRENT_PROJECT_VERSION: "2"
     MARKETING_VERSION: "0.1.0"
-    CLAWPILOT_SERVER_ORIGIN: "https://dev.aiapp.eigenracing.com"
-    CLAWPILOT_PHONE_BUNDLE_IDENTIFIER: "com.eigenracing.ios.picking"
-    CLAWPILOT_WATCH_BUNDLE_IDENTIFIER: "com.eigenracing.ios.picking.watch"
-    CLAWPILOT_ASSOCIATED_DOMAIN: "dev.aiapp.eigenracing.com"
-    CLAWPILOT_META_URL_SCHEME: "clawpilot-meta"
-    CLAWPILOT_META_APP_LINK_SCHEME: "clawpilot-meta://"
     CLAWPILOT_APPLE_DEVELOPMENT_TEAM: "CN2T77JHQQ"
     DEVELOPMENT_TEAM: $(CLAWPILOT_APPLE_DEVELOPMENT_TEAM)
 
@@ -30,6 +28,9 @@ packages:
   SpeechSwift:
     url: https://github.com/soniqo/speech-swift.git
     exactVersion: 0.0.23
+  GoogleSignIn:
+    url: https://github.com/google/GoogleSignIn-iOS.git
+    exactVersion: 9.1.0
 
 targets:
   ClawPilotPickingPhone:
@@ -37,8 +38,8 @@ targets:
     platform: iOS
     deploymentTarget: "18.0"
     configFiles:
-      Debug: Config/Defaults.xcconfig
-      Release: Config/Defaults.xcconfig
+      Development: Config/Development.xcconfig
+      Production: Config/Production.xcconfig
     sources:
       - path: Apps/iPhone
         excludes:
@@ -54,16 +55,22 @@ targets:
     info:
       path: Apps/iPhone/Info.plist
       properties:
-        CFBundleDisplayName: ClawPilot
+        CFBundleDisplayName: $(CLAWPILOT_DISPLAY_NAME)
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         ITSAppUsesNonExemptEncryption: false
         ClawPilotServerOrigin: $(CLAWPILOT_SERVER_ORIGIN)
+        GIDClientID: $(CLAWPILOT_GOOGLE_IOS_CLIENT_ID)
+        GIDServerClientID: $(CLAWPILOT_GOOGLE_SERVER_CLIENT_ID)
         CFBundleURLTypes:
           - CFBundleTypeRole: Editor
             CFBundleURLName: $(PRODUCT_BUNDLE_IDENTIFIER)
             CFBundleURLSchemes:
               - $(CLAWPILOT_META_URL_SCHEME)
+          - CFBundleTypeRole: Editor
+            CFBundleURLName: Google Sign-In
+            CFBundleURLSchemes:
+              - $(CLAWPILOT_GOOGLE_REVERSED_CLIENT_ID)
         LSApplicationQueriesSchemes:
           - fb-viewapp
         MWDAT:
@@ -80,10 +87,12 @@ targets:
         NSBonjourServices:
           - _bonjour._tcp
         NSCameraUsageDescription: ClawPilot scans product barcodes for assigned warehouse picks.
+        NSFaceIDUsageDescription: ClawPilot uses Face ID to unlock an existing signed-in session on this iPhone.
         NSMicrophoneUsageDescription: ClawPilot listens for short pick-confirmation commands.
         NSSpeechRecognitionUsageDescription: ClawPilot converts short confirmation phrases into typed local actions.
         UILaunchScreen: {}
         UIBackgroundModes:
+          - audio
           - bluetooth-central
           - external-accessory
         UISupportedExternalAccessoryProtocols:
@@ -100,6 +109,10 @@ targets:
         product: MWDATCamera
       - package: SpeechSwift
         product: SupertonicTTS
+      - package: GoogleSignIn
+        product: GoogleSignIn
+      - package: GoogleSignIn
+        product: GoogleSignInSwift
 
   ClawPilotPickingWatch:
     type: application
@@ -108,6 +121,9 @@ targets:
     sources:
       - path: Apps/Watch
       - path: Assets/ClawPilotAssets.xcassets
+    configFiles:
+      Development: Config/Development.xcconfig
+      Production: Config/Production.xcconfig
     settings:
       base:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -117,7 +133,7 @@ targets:
     info:
       path: Apps/Watch/Info.plist
       properties:
-        CFBundleDisplayName: ClawPilot
+        CFBundleDisplayName: $(CLAWPILOT_DISPLAY_NAME)
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         WKApplication: true
@@ -127,19 +143,35 @@ targets:
         product: ClawPilotPickingCore
 
 schemes:
+  ClawPilotPickingPhoneDev:
+    build:
+      targets:
+        ClawPilotPickingPhone: all
+    run:
+      config: Development
+    archive:
+      config: Development
   ClawPilotPickingPhone:
     build:
       targets:
         ClawPilotPickingPhone: all
     run:
-      config: Debug
+      config: Production
     archive:
-      config: Release
+      config: Production
+  ClawPilotPickingWatchDev:
+    build:
+      targets:
+        ClawPilotPickingWatch: all
+    run:
+      config: Development
+    archive:
+      config: Development
   ClawPilotPickingWatch:
     build:
       targets:
         ClawPilotPickingWatch: all
     run:
-      config: Debug
+      config: Production
     archive:
-      config: Release
+      config: Production

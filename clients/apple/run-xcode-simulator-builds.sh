@@ -22,7 +22,7 @@ trap 'rm -rf -- "${build_root}"' EXIT
 packages="${build_root}/packages"
 
 xcodebuild -quiet -resolvePackageDependencies \
-  -project "${project}" -scheme ClawPilotPickingPhone \
+  -project "${project}" -scheme ClawPilotPickingPhoneDev \
   -packageAuthorizationProvider netrc \
   -clonedSourcePackagesDirPath "${packages}"
 
@@ -34,24 +34,44 @@ if [[ "${version}" != "${expected_meta_version}" || "${revision}" != "${expected
   exit 1
 fi
 
-xcodebuild -quiet -project "${project}" -scheme ClawPilotPickingPhone \
+xcodebuild -quiet -project "${project}" -scheme ClawPilotPickingPhoneDev \
   -destination 'generic/platform=iOS Simulator' \
-  -derivedDataPath "${build_root}/phone" \
+  -derivedDataPath "${build_root}/phone-dev" \
   -packageAuthorizationProvider netrc \
   -clonedSourcePackagesDirPath "${packages}" \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
 
-embedded_watch="${build_root}/phone/Build/Products/Debug-iphonesimulator/ClawPilotPicking.app/Watch/ClawPilotPickingWatch.app"
+embedded_watch="${build_root}/phone-dev/Build/Products/Development-iphonesimulator/ClawPilotPicking.app/Watch/ClawPilotPickingWatch.app"
 if [[ ! -d "${embedded_watch}" ]]; then
-  echo "The iPhone app did not embed the Watch companion." >&2
+  echo "The development iPhone app did not embed its development Watch companion." >&2
+  exit 1
+fi
+
+xcodebuild -quiet -project "${project}" -scheme ClawPilotPickingWatchDev \
+  -destination 'generic/platform=watchOS Simulator' \
+  -derivedDataPath "${build_root}/watch-dev" \
+  -packageAuthorizationProvider netrc \
+  -clonedSourcePackagesDirPath "${packages}" \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+
+xcodebuild -quiet -project "${project}" -scheme ClawPilotPickingPhone \
+  -destination 'generic/platform=iOS Simulator' \
+  -derivedDataPath "${build_root}/phone-production" \
+  -packageAuthorizationProvider netrc \
+  -clonedSourcePackagesDirPath "${packages}" \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+
+embedded_watch="${build_root}/phone-production/Build/Products/Production-iphonesimulator/ClawPilotPicking.app/Watch/ClawPilotPickingWatch.app"
+if [[ ! -d "${embedded_watch}" ]]; then
+  echo "The production iPhone app did not embed its production Watch companion." >&2
   exit 1
 fi
 
 xcodebuild -quiet -project "${project}" -scheme ClawPilotPickingWatch \
   -destination 'generic/platform=watchOS Simulator' \
-  -derivedDataPath "${build_root}/watch" \
+  -derivedDataPath "${build_root}/watch-production" \
   -packageAuthorizationProvider netrc \
   -clonedSourcePackagesDirPath "${packages}" \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
 
-echo "ClawPilot iPhone and Watch simulator builds passed with Meta DAT ${version}."
+echo "ClawPilot development and production iPhone/Watch simulator builds passed with Meta DAT ${version}."

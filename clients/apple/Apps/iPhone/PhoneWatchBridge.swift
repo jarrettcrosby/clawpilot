@@ -33,12 +33,26 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate {
     nonisolated func sessionDidDeactivate(_ session: WCSession) { session.activate() }
 
     nonisolated func session(_ session: WCSession, didReceiveMessageData messageData: Data) {
-        Task { @MainActor in self.receiveCommand(messageData) }
+        guard let command = try? JSONDecoder().decode(WatchPickCommand.self, from: messageData)
+        else { return }
+        Task { @MainActor in self.receiveCommand(command) }
     }
 
-    private func receiveCommand(_ data: Data) {
-        guard let command = try? JSONDecoder().decode(WatchPickCommand.self, from: data),
-              !handledCommandIDs.contains(command.id) else { return }
+    nonisolated func session(
+        _ session: WCSession,
+        didReceiveMessageData messageData: Data,
+        replyHandler: @escaping (Data) -> Void
+    ) {
+        guard let command = try? JSONDecoder().decode(WatchPickCommand.self, from: messageData) else {
+            replyHandler(Data("The Watch command was invalid.".utf8))
+            return
+        }
+        replyHandler(Data("Command received by iPhone.".utf8))
+        Task { @MainActor in self.receiveCommand(command) }
+    }
+
+    private func receiveCommand(_ command: WatchPickCommand) {
+        guard !handledCommandIDs.contains(command.id) else { return }
         handledCommandIDs.append(command.id)
         if handledCommandIDs.count > 32 { handledCommandIDs.removeFirst() }
         onCommand?(command)

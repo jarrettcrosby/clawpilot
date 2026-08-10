@@ -325,6 +325,8 @@ struct PickingDashboardView: View {
 
     private func currentTaskView(_ task: PickTask) -> some View {
         VStack(alignment: .leading, spacing: 16) {
+            productImage(task.productImageURL, productName: task.productName)
+
             VStack(alignment: .leading, spacing: 4) {
                 Text("GO TO")
                     .font(.caption2.weight(.bold))
@@ -398,6 +400,50 @@ struct PickingDashboardView: View {
                 Label("Read instruction aloud", systemImage: "speaker.wave.2.fill")
             }
             .font(.subheadline.weight(.semibold))
+        }
+    }
+
+    @ViewBuilder
+    private func productImage(_ url: URL?, productName: String) -> some View {
+        if let url {
+            AsyncImage(url: url, transaction: Transaction(animation: .easeInOut)) { phase in
+                switch phase {
+                case .success(let image):
+                    image
+                        .resizable()
+                        .scaledToFit()
+                        .padding(8)
+                case .failure:
+                    productImagePlaceholder("Product image unavailable")
+                case .empty:
+                    ProgressView("Loading product image")
+                        .tint(PickingTheme.primary)
+                        .foregroundStyle(PickingTheme.muted)
+                @unknown default:
+                    productImagePlaceholder("Product image unavailable")
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 190)
+            .background(Color.white.opacity(0.96), in: RoundedRectangle(cornerRadius: 18))
+            .clipShape(RoundedRectangle(cornerRadius: 18))
+            .accessibilityLabel("Product image for \(productName)")
+        } else {
+            productImagePlaceholder("No primary product image is available")
+                .frame(maxWidth: .infinity)
+                .frame(height: 112)
+                .background(PickingTheme.raised, in: RoundedRectangle(cornerRadius: 18))
+        }
+    }
+
+    private func productImagePlaceholder(_ message: String) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: "shippingbox.fill")
+                .font(.title)
+                .foregroundStyle(PickingTheme.muted)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(PickingTheme.muted)
         }
     }
 

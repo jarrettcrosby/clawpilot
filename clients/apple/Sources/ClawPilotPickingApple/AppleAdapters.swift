@@ -372,6 +372,13 @@ public actor PickingAPIClient {
         )
     }
 
+    public func verifyGoogleIdentityToken(_ idToken: String) async throws {
+        try await postAuth(
+            path: "/api/auth/google/native",
+            body: ["idToken": idToken]
+        )
+    }
+
     public func fetchSessionProfile() async throws -> ClawPilotSessionProfile {
         var request = URLRequest(url: try endpoint("/api/auth/session"))
         request.httpMethod = "GET"

@@ -1,4 +1,5 @@
 import AVFoundation
+import GoogleSignIn
 import SwiftUI
 import UIKit
 import ClawPilotPickingApple
@@ -20,7 +21,9 @@ struct ClawPilotPickingPhoneApp: App {
                 }
                 .onOpenURL { url in
                     Task {
-                        if ClawPilotSystemActionLink.requestsScan(url) {
+                        if GIDSignIn.sharedInstance.handle(url) {
+                            return
+                        } else if ClawPilotSystemActionLink.requestsScan(url) {
                             PendingMobileAction.requestMetaScan()
                             ClawPilotScanDiagnostic.begin("action-link-received")
                             await model.handlePendingSystemScan()
@@ -79,12 +82,16 @@ final class PickingPhoneModel: ObservableObject {
     @Published var voicePackState: OfflineVoicePackState = .notInstalled
     @Published var instructionLanguage: InstructionVoiceLanguage = .english
     @Published var pronunciationCorrections: [PronunciationCorrection] = []
+    @Published var biometricUnlockEnabled = false
+    @Published var isLocallyLocked = false
+    @Published var biometricStatus = "Face ID can unlock an existing ClawPilot session on this iPhone."
 
     private let cache: DurablePickCache
     private let api: PickingAPIClient
     private let picking: PickingSession
     private let watch = PhoneWatchBridge()
     private let voice = VoiceConfirmationController()
+    private let biometrics = BiometricUnlockController()
     private var metaSource: MetaWearablesBarcodeSource?
     private var codeRequestCooldown: Task<Void, Never>?
     private var metaConnectionRefreshTask: Task<Void, Never>?
@@ -97,6 +104,19 @@ final class PickingPhoneModel: ObservableObject {
     var canVerifyCode: Bool {
         !isAuthBusy && code.count == 6 && code.allSatisfy(\.isNumber)
     }
+
+    var googleSSOAvailable: Bool {
+        guard let clientID = Bundle.main.object(forInfoDictionaryKey: "GIDClientID") as? String,
+              let serverClientID = Bundle.main.object(forInfoDictionaryKey: "GIDServerClientID") as? String
+        else { return false }
+        return clientID.hasSuffix(".apps.googleusercontent.com")
+            && serverClientID.hasSuffix(".apps.googleusercontent.com")
+            && !clientID.hasPrefix("google-not-configured")
+            && !serverClientID.hasPrefix("google-not-configured")
+    }
+
+    var biometricUnlockAvailable: Bool { biometrics.isAvailable }
+    var biometricUnlockTitle: String { biometrics.title }
 
     var canUsePicker: Bool {
         sessionProfile?.mobileCapabilities.canUsePicker == true
@@ -173,6 +193,12 @@ final class PickingPhoneModel: ObservableObject {
         voicePackState = voice.voicePackState
         instructionLanguage = voice.instructionLanguage
         pronunciationCorrections = voice.pronunciationCorrections
+        biometricUnlockEnabled = biometrics.isEnabled
+        isLocallyLocked = biometricUnlockEnabled && biometrics.hasRememberedSession
+        if isLocallyLocked {
+            isRestoringSession = false
+            status = "Unlock with \(biometrics.title), or use another sign-in method."
+        }
         voice.onVoicePackStateChange = { [weak self] state in
             self?.voicePackState = state
         }
@@ -334,6 +360,10 @@ final class PickingPhoneModel: ObservableObject {
 
     func restoreAndRefresh() async {
         if walkthroughScreen != nil { return }
+        guard !isLocallyLocked else {
+            isRestoringSession = false
+            return
+        }
         isRestoringSession = true
         defer { isRestoringSession = false }
         await refreshMetaStatus()
@@ -407,12 +437,92 @@ final class PickingPhoneModel: ObservableObject {
             try await api.verifyMagicCode(email: email, code: code)
             sessionProfile = try await api.fetchSessionProfile()
             isAuthenticated = true
+            biometrics.rememberAuthenticatedSession()
             codeRequested = false
             code = ""
             status = "Signed in. Choose a workflow to begin."
         } catch {
             isAuthenticated = false
             status = "Sign-in failed: \(error.localizedDescription)"
+        }
+    }
+
+    func signInWithGoogle() async {
+        guard googleSSOAvailable else {
+            status = "Google sign-in needs the ClawPilot Google OAuth configuration. Magic codes remain available."
+            return
+        }
+        guard let presentingViewController = Self.presentingViewController else {
+            status = "Google sign-in could not open. Try again."
+            return
+        }
+        guard let clientID = Bundle.main.object(forInfoDictionaryKey: "GIDClientID") as? String,
+              let serverClientID = Bundle.main.object(forInfoDictionaryKey: "GIDServerClientID") as? String
+        else { return }
+
+        isAuthBusy = true
+        defer { isAuthBusy = false }
+        do {
+            GIDSignIn.sharedInstance.configuration = GIDConfiguration(
+                clientID: clientID,
+                serverClientID: serverClientID
+            )
+            let result = try await GIDSignIn.sharedInstance.signIn(
+                withPresenting: presentingViewController
+            )
+            guard let idToken = result.user.idToken?.tokenString else {
+                status = "Google did not return a verified identity token."
+                return
+            }
+            try await api.verifyGoogleIdentityToken(idToken)
+            sessionProfile = try await api.fetchSessionProfile()
+            email = sessionProfile?.effectiveUser.email ?? result.user.profile?.email ?? ""
+            isAuthenticated = true
+            isLocallyLocked = false
+            biometrics.rememberAuthenticatedSession()
+            status = "Signed in with Google. Choose a workflow to begin."
+        } catch {
+            isAuthenticated = false
+            status = "Google sign-in failed: \(error.localizedDescription)"
+        }
+    }
+
+    func unlockWithBiometrics() async {
+        guard biometricUnlockEnabled, biometricUnlockAvailable else {
+            isLocallyLocked = false
+            status = "Use a magic code or Google to sign in."
+            return
+        }
+        isAuthBusy = true
+        defer { isAuthBusy = false }
+        do {
+            guard try await biometrics.authenticate() else { return }
+            isLocallyLocked = false
+            await restoreAndRefresh()
+        } catch {
+            status = "\(biometricUnlockTitle) did not unlock ClawPilot. Use another sign-in method."
+        }
+    }
+
+    func setBiometricUnlockEnabled(_ enabled: Bool) async {
+        guard enabled else {
+            biometrics.setEnabled(false)
+            biometricUnlockEnabled = false
+            biometricStatus = "Biometric unlock is off."
+            return
+        }
+        guard biometricUnlockAvailable else {
+            biometricStatus = "Set up Face ID or Touch ID in iPhone Settings first."
+            return
+        }
+        do {
+            guard try await biometrics.authenticate() else { return }
+            biometrics.setEnabled(true)
+            biometrics.rememberAuthenticatedSession()
+            biometricUnlockEnabled = true
+            biometricStatus = "\(biometricUnlockTitle) will unlock ClawPilot after a fresh launch."
+        } catch {
+            biometricStatus = "Biometric unlock was not enabled: \(error.localizedDescription)"
         }
     }
 
@@ -573,6 +683,9 @@ final class PickingPhoneModel: ObservableObject {
             return
         }
         await WebSessionBridge.clearCookies()
+        GIDSignIn.sharedInstance.signOut()
+        biometrics.forgetAuthenticatedSession()
+        isLocallyLocked = false
         sessionProfile = nil
         isAuthenticated = false
         codeRequested = false
@@ -584,6 +697,17 @@ final class PickingPhoneModel: ObservableObject {
         managerPickers = []
         pickerPerformance = []
         managerSelectedOrder = nil
+    }
+
+    private static var presentingViewController: UIViewController? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        guard let root = scenes
+            .flatMap(\.windows)
+            .first(where: \.isKeyWindow)?
+            .rootViewController else { return nil }
+        var presented = root
+        while let next = presented.presentedViewController { presented = next }
+        return presented
     }
 
     func loadQueue(readAloud: Bool = true) async {
@@ -907,16 +1031,17 @@ final class PickingPhoneModel: ObservableObject {
         }
     }
 
-    func readInstruction() {
+    func readInstruction(forceSystemVoice: Bool = false) {
         if let currentTask {
             voice.speak(PickVoice.instruction(
                 for: currentTask,
                 languageCode: instructionLanguage.languageCode
-            ))
+            ), forceSystemVoice: forceSystemVoice)
         } else if readyToConfirm {
             voice.speak(
                 "All products scanned. Say confirm pick to submit the order.",
-                spanish: "Todos los productos están escaneados. Di confirmar pedido para enviarlo."
+                spanish: "Todos los productos están escaneados. Di confirmar pedido para enviarlo.",
+                forceSystemVoice: forceSystemVoice
             )
         }
         refreshAudioRouteStatus()
@@ -958,7 +1083,11 @@ final class PickingPhoneModel: ObservableObject {
             status = "Apple Watch requested a glasses scan."
             await scanWithMeta()
         case .readInstruction:
-            readInstruction()
+            // Watch commands commonly wake the iPhone in the background. Use
+            // Apple's lightweight synthesizer for this path instead of
+            // starting the large optional CoreML voice model while backgrounded.
+            status = "Apple Watch requested the current pick instruction."
+            readInstruction(forceSystemVoice: true)
         case .confirmPick:
             guard readyToConfirm else {
                 status = "Scan every assigned product before confirming from Apple Watch."

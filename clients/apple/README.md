@@ -58,17 +58,35 @@ contains the Watch companion. The readiness command prints only whether each
 build-owned setting is present; it never prints configured values or
 credentials.
 
-The source-controlled project pins the development server, HTTPS fallback
-associated domain, Meta DAT callback scheme, Apple team, and phone/watch bundle
-identifiers. For DAT 0.9, the Meta Wearables Developer Center iOS
-**Universal link** field must exactly match the app's callback value
-`clawpilot-meta://`; despite the portal label, this is the custom URL scheme
-used by Meta AI to return to the app. Signed pilot builds keep these Meta
-credentials in the ignored
+The source-controlled project produces two fixed environments from the same
+source revision. `ClawPilotPickingPhoneDev` builds **ClawPilot Dev** with the
+`.dev` phone/Watch identifiers and `https://dev.aiapp.eigenracing.com`.
+`ClawPilotPickingPhone` builds **ClawPilot** with the existing production
+identifiers and `https://aiapp.eigenracing.com`. The environment is selected by
+the signed Xcode scheme, never by a picker on the login screen.
+
+For DAT 0.9, each Meta Wearables Developer Center project must use the callback
+from its matching configuration: `clawpilot-meta-dev://` for development and
+`clawpilot-meta://` for production. Despite the portal label **Universal link**,
+these are the custom URL schemes Meta AI uses to return to the matching app.
+Signed builds keep environment-specific credentials in the ignored
 `Config/Local.xcconfig` file:
 
-- `CLAWPILOT_META_APP_ID`
-- `CLAWPILOT_META_CLIENT_TOKEN`
+- `CLAWPILOT_META_DEV_APP_ID`
+- `CLAWPILOT_META_DEV_CLIENT_TOKEN`
+- `CLAWPILOT_META_PRODUCTION_APP_ID`
+- `CLAWPILOT_META_PRODUCTION_CLIENT_TOKEN`
+- `CLAWPILOT_GOOGLE_DEV_IOS_CLIENT_ID`
+- `CLAWPILOT_GOOGLE_DEV_REVERSED_CLIENT_ID`
+- `CLAWPILOT_GOOGLE_PRODUCTION_IOS_CLIENT_ID`
+- `CLAWPILOT_GOOGLE_PRODUCTION_REVERSED_CLIENT_ID`
+- `CLAWPILOT_GOOGLE_SERVER_CLIENT_ID_SHARED`
+
+Google sign-in is additive to magic codes. The server verifies the Google ID
+token against `GOOGLE_SSO_SERVER_CLIENT_ID`, requires a verified email, and then
+requires an existing ClawPilot user with that exact normalized email. It never
+creates a user or grants an organization role. Face ID is a device-local unlock
+for an already authenticated ClawPilot session and cannot replace server login.
 
 The local file is optional for simulator compilation and must never be
 committed. Physical validation must still prove Meta registration, camera

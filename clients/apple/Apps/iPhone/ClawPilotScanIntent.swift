@@ -45,7 +45,7 @@ enum ClawPilotSystemActionLink {
     static func scanURL() -> URL {
         let configured = Bundle.main.object(
             forInfoDictionaryKey: "ClawPilotServerOrigin"
-        ) as? String ?? "https://dev.aiapp.eigenracing.com"
+        ) as? String ?? "https://aiapp.eigenracing.com"
         var components = URLComponents(
             url: URL(string: configured)!.appending(path: "ios"),
             resolvingAgainstBaseURL: false
