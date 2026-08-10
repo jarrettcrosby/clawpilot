@@ -2481,6 +2481,12 @@ async function verifyCanonicalPlanning(databaseUrl) {
         mocks: {
           '@/lib/persistence/postgres': postgres,
           '@/lib/persistence/shopifyCheckoutRating': {
+            shopifyCheckoutRateLineageIsRequired: (serviceCode) => (
+              typeof serviceCode === 'string'
+              && /^clawpilot:(ups|fedex):[A-Za-z0-9][A-Za-z0-9._-]{0,56}$/.test(
+                serviceCode.trim(),
+              )
+            ),
             shopifyCheckoutRatingHash: (value) => sha(
               JSON.stringify(value),
             ),

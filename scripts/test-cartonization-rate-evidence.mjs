@@ -97,7 +97,10 @@ function loadPersistence() {
   return module.exports
 }
 
-function loadOperationalFaireRoute(observed) {
+function loadOperationalFaireRoute(
+  observed,
+  { providers = ['ups_rest', 'fedex_rest'] } = {},
+) {
   const path =
     'app_src/app/api/integrations/commerce/intake/cartonization-rate-evidence/route.ts'
   const output = ts.transpileModule(read(path), {
@@ -226,10 +229,12 @@ function loadOperationalFaireRoute(observed) {
     assumptions: [],
     blockers: [],
   }
-  const carrierAccounts = ['ups_rest', 'fedex_rest'].map((provider) => ({
+  const carrierAccounts = providers.map((provider) => ({
     provider,
     environment: 'sandbox',
     status: 'active',
+    configured: true,
+    verificationStatus: 'verified',
     senderOriginWarehouseGlobalId: 'gwh0000001',
     carrierAccounts: [{
       globalId: provider === 'ups_rest'
@@ -297,6 +302,10 @@ function loadOperationalFaireRoute(observed) {
       isPostgresStorageEnabled: () => true,
     },
     '@/lib/persistence/cartonizationRateEvidence': {
+      CARTONIZATION_RATE_EVIDENCE_CARRIER_PROVIDERS: [
+        'ups_rest',
+        'fedex_rest',
+      ],
       cartonizationRateEvidenceHash: evidenceHash,
       CartonizationRateEvidencePersistenceError: PersistenceError,
       claimCartonizationRateEvidenceCommandInPostgres: async () => ({
@@ -385,6 +394,9 @@ const shipmentRateMigration = read(
 )
 const shipmentRateConstraintRepairMigration = read(
   'db/migrations/0144_operations_cartonization_shipment_rate_constraint_repair.sql',
+)
+const enabledCarrierMigration = read(
+  'db/migrations/0259_operations_cartonization_enabled_carriers.sql',
 )
 const persistence = read(
   'app_src/lib/persistence/cartonizationRateEvidence.ts',
@@ -488,11 +500,23 @@ assertIncludes(shipmentRateConstraintRepairMigration, [
   'DROP CONSTRAINT IF EXISTS',
   'operations_cartonization_rate_evidence_quote_rate_purpose_check',
 ], 'Whole-shipment quote-purpose constraint repair')
+assertIncludes(enabledCarrierMigration, [
+  'required_carrier_providers text[] NOT NULL',
+  "ARRAY['ups_rest']::text[]",
+  "ARRAY['fedex_rest']::text[]",
+  "ARRAY['ups_rest', 'fedex_rest']::text[]",
+  'cardinality(required_carrier_providers)',
+  'quote.provider = ANY(required_carrier_providers)',
+  'one supporting edge from every retained carrier per package',
+], 'Enabled-carrier cartonization evidence migration')
 
 assertIncludes(persistence, [
   'export function cartonizationRateEvidenceHash',
   'MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES = 50',
   'CartonizationRateEvidenceMaterialRateAssumption',
+  'CARTONIZATION_RATE_EVIDENCE_CARRIER_PROVIDERS',
+  'assertCartonizationRateEvidenceCarrierCoverage',
+  'requiredCarrierProviders',
   'assertCartonizationRateEvidenceMaterialAssumptions',
   'materialRateAssumptions',
   'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_ASSUMPTIONS_FORBIDDEN',
@@ -573,7 +597,8 @@ assertIncludes(route, [
   'semanticRequestHash',
   'const orderedParcels = [...packageInputs]',
   'left.packageSequence - right.packageSequence',
-  "const providers = ['ups_rest', 'fedex_rest'] as const",
+  'CARTONIZATION_RATE_EVIDENCE_CARRIER_PROVIDERS.filter(',
+  "account.verificationStatus === 'verified'",
   'testCarrierSandboxShipmentRate',
   'parcels: orderedParcels',
   'shipmentRateEvidenceByProvider',
@@ -748,6 +773,7 @@ assert.doesNotMatch(
 )
 
 const {
+  assertCartonizationRateEvidenceCarrierCoverage,
   assertCartonizationRateEvidenceMaterialAssumptions,
   cartonizationRateEvidenceHash,
   cartonizationRateEvidenceRequestHash,
@@ -787,6 +813,7 @@ assert.throws(
 
 const planSnapshot = {
   carrierReadEnvironment: 'sandbox',
+  requiredCarrierProviders: ['ups_rest', 'fedex_rest'],
   warehouseGlobalId: 'gwh0000001',
   packages: [{ packageKey: 'package-1' }],
 }
@@ -864,6 +891,7 @@ const request = {
   warehouseGlobalId: 'gwh0000001',
   inventorySyncRunGlobalId: 'gisr0000001',
   evidenceMode: 'operational',
+  requiredCarrierProviders: ['ups_rest', 'fedex_rest'],
   policyVersion: 'cartonization-rate-v1',
   algorithmVersion: 'or-tools-v1',
   planInputHash: 'a'.repeat(64),
@@ -879,6 +907,30 @@ const request = {
   packages,
   quotes,
 }
+assert.doesNotThrow(
+  () => assertCartonizationRateEvidenceCarrierCoverage(request),
+  'Dual-carrier evidence must retain exactly one quote edge per provider and package',
+)
+assert.doesNotThrow(
+  () => assertCartonizationRateEvidenceCarrierCoverage({
+    ...request,
+    requiredCarrierProviders: ['ups_rest'],
+    quotes: quotes.filter((quote) => quote.provider === 'ups_rest'),
+  }),
+  'A single enabled carrier must be sufficient for complete evidence',
+)
+assert.throws(
+  () => assertCartonizationRateEvidenceCarrierCoverage({
+    ...request,
+    requiredCarrierProviders: ['ups_rest'],
+  }),
+  (error) => (
+    error instanceof CartonizationRateEvidencePersistenceError
+    && error.code
+      === 'CARTONIZATION_RATE_EVIDENCE_CARRIER_COVERAGE_INVALID'
+  ),
+  'Evidence must reject quote edges outside the retained carrier set',
+)
 assert.doesNotThrow(
   () => assertCartonizationRateEvidenceMaterialAssumptions(request),
   'Every operational package must match its retained factual material inputs',
@@ -987,6 +1039,14 @@ assert.notEqual(
   requestHash,
   cartonizationRateEvidenceRequestHash({
     ...request,
+    requiredCarrierProviders: ['ups_rest'],
+  }),
+  'Semantic request hashing must change with the retained carrier set',
+)
+assert.notEqual(
+  requestHash,
+  cartonizationRateEvidenceRequestHash({
+    ...request,
     packages: packages.map((item, index) => (
       index === 0
         ? { ...item, ratedGrossWeightGrams: item.ratedGrossWeightGrams + 1 }
@@ -1062,6 +1122,10 @@ assert.equal(
   0,
 )
 assert.equal(faireRouteObserved.carrierReads.length, 2)
+assert.deepEqual(
+  Array.from(faireRouteObserved.write.requiredCarrierProviders),
+  ['ups_rest', 'fedex_rest'],
+)
 assert.equal(faireRouteObserved.write.inventorySyncRunGlobalId, null)
 assert.equal(faireRouteObserved.write.evidenceMode, 'operational')
 assert.equal(
@@ -1080,5 +1144,48 @@ assert.equal(
 assert.equal(faireRouteObserved.write.packages[0].contentWeightGrams, 170)
 assert.equal(faireRouteObserved.write.packages[0].tareWeightGrams, 120)
 assert.equal(faireRouteObserved.write.packages[0].ratedGrossWeightGrams, 290)
+
+const upsOnlyObserved = {
+  carrierReads: [],
+  readInput: null,
+  write: null,
+}
+const upsOnlyRoute = loadOperationalFaireRoute(
+  upsOnlyObserved,
+  { providers: ['ups_rest'] },
+)
+const upsOnlyResponse = await upsOnlyRoute.POST(new Request(
+  'http://localhost/api/integrations/commerce/intake/cartonization-rate-evidence',
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      accountGlobalId: 'gia0000001',
+      candidateGlobalId: 'gcoc0000001',
+      expectedCandidateRowVersion: 1,
+      warehouseGlobalId: 'gwh0000001',
+      idempotencyKey: 'faire-ups-only-route-acceptance',
+      evidenceMode: 'operational',
+      selectedMaterials: [{
+        materialGlobalId: 'gmat0000001',
+        expectedRowVersion: 2,
+      }],
+    }),
+  },
+))
+assert.equal(upsOnlyResponse.status, 200)
+const upsOnlyPayload = await upsOnlyResponse.json()
+assert.equal(upsOnlyPayload.effects.carrierRateReads, 1)
+assert.equal(upsOnlyPayload.effects.carrierQuoteEdges, 1)
+assert.deepEqual(
+  Array.from(upsOnlyObserved.write.requiredCarrierProviders),
+  ['ups_rest'],
+)
+assert.deepEqual(
+  Array.from(upsOnlyObserved.write.planSnapshot.requiredCarrierProviders),
+  ['ups_rest'],
+)
+assert.equal(upsOnlyObserved.write.quotes.length, 1)
+assert.equal(upsOnlyObserved.write.quotes[0].provider, 'ups_rest')
 
 console.log('cartonization rate evidence contract tests passed')

@@ -39,6 +39,7 @@ import {
   useTheme,
 } from '@mui/material'
 import TabScrollButton, { type TabScrollButtonProps } from '@mui/material/TabScrollButton'
+import AddRounded from '@mui/icons-material/AddRounded'
 import CheckCircleRounded from '@mui/icons-material/CheckCircleRounded'
 import CancelRounded from '@mui/icons-material/CancelRounded'
 import CloseRounded from '@mui/icons-material/CloseRounded'
@@ -86,6 +87,7 @@ import PackRateReplayPanel from '@/components/operations/PackRateReplayPanel'
 import CartonizationRateEvidencePanel from '@/components/operations/CartonizationRateEvidencePanel'
 import ReceivingPanel from '@/components/operations/ReceivingPanel'
 import WarehouseSetupPanel from '@/components/operations/WarehouseSetupPanel'
+import OneOffShipmentDialog from '@/components/operations/OneOffShipmentDialog'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatDimensionsMm, formatGrams } from '@/lib/measurements'
@@ -2030,6 +2032,7 @@ export default function OperationsSection({
   const [exceptionDrawerOpen, setExceptionDrawerOpen] = useState(false)
   const [updatingException, setUpdatingException] = useState(false)
   const [guideOpen, setGuideOpen] = useState(false)
+  const [oneOffShipmentOpen, setOneOffShipmentOpen] = useState(false)
   const [updatingActivation, setUpdatingActivation] = useState(false)
   const [commerceActiveOpen, setCommerceActiveOpen] = useState(false)
   const [commerceActivePending, setCommerceActivePending] = useState<
@@ -3408,6 +3411,24 @@ export default function OperationsSection({
     void updateActivation(state)
   }
 
+  const openCreatedOneOffShipment = async (result: {
+    orderGlobalId: string
+    packageCount: number
+    createdProductGlobalIds: string[]
+  }) => {
+    setView('orders')
+    setSearch('')
+    setStatus('')
+    setSelectedGlobalId(result.orderGlobalId)
+    setDrawerOpen(true)
+    setNotice(
+      `One-off shipment ${result.orderGlobalId} was planned with ${result.packageCount} ${result.packageCount === 1 ? 'parcel' : 'parcels'}`
+      + `${result.createdProductGlobalIds.length ? ` and ${result.createdProductGlobalIds.length} new ${result.createdProductGlobalIds.length === 1 ? 'product' : 'products'}` : ''}. `
+      + 'No postage, label, tracking number, wave, or picker assignment was created.',
+    )
+    await loadWorkspace(result.orderGlobalId)
+  }
+
   const commerceActiveSelectedAccountCount = Object.values(
     commerceActiveSelections,
   ).filter((entries) => entries.length > 0).length
@@ -3495,6 +3516,18 @@ export default function OperationsSection({
             <Typography variant="body2" color="text.secondary">{subheading}</Typography>
           </Box>
           <Stack direction="row" spacing={1} alignItems="center" sx={{ flexWrap: 'wrap', rowGap: 1 }}>
+            {view === 'orders'
+              && workspace?.capabilities.canManage
+              && workspace.capabilities.canExecute && (
+              <Button
+                size="small"
+                variant="contained"
+                startIcon={<AddRounded />}
+                onClick={() => setOneOffShipmentOpen(true)}
+              >
+                Create one-off shipment
+              </Button>
+            )}
             {workspace?.capabilities.canActivate && (
               <Tooltip title="Controls whether Operations is disabled, validating mock flows, read only, live, or frozen">
                 <TextField
@@ -3881,6 +3914,11 @@ export default function OperationsSection({
         onOpenOrder={openExceptionOrder}
       />
       <OperationsGuide open={guideOpen} onClose={() => setGuideOpen(false)} />
+      <OneOffShipmentDialog
+        open={oneOffShipmentOpen}
+        onClose={() => setOneOffShipmentOpen(false)}
+        onCreated={openCreatedOneOffShipment}
+      />
 
       <Dialog
         open={commerceActiveOpen}

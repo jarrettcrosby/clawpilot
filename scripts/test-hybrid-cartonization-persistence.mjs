@@ -78,7 +78,15 @@ vm.runInNewContext(output, {
       }
     }
     if (specifier === '@/lib/persistence/shopifyCheckoutRating') {
-      return { shopifyCheckoutRatingHash }
+      return {
+        shopifyCheckoutRateLineageIsRequired(serviceCode) {
+          return typeof serviceCode === 'string'
+            && /^clawpilot:(ups|fedex):[A-Za-z0-9][A-Za-z0-9._-]{0,56}$/.test(
+              serviceCode.trim(),
+            )
+        },
+        shopifyCheckoutRatingHash,
+      }
     }
     return requireFromApp(specifier)
   },
@@ -139,6 +147,14 @@ assert.equal(
   }),
   null,
   'A genuinely non-ClawPilot Shopify shipping method may use candidate-captured pack facts',
+)
+assert.equal(
+  resolveOperationalShopifyCheckoutReconciliation({
+    candidateServiceCode: 'clawpilot:dev:test-zero',
+    rows: [],
+  }),
+  null,
+  'A test or manually entered shipping code must not impersonate genuine ClawPilot carrier-rate lineage',
 )
 
 const matchedCheckoutLineage = {

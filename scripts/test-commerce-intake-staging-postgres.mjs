@@ -2707,6 +2707,7 @@ async function verifyFaireExactVariantPackBinding(
   const planSnapshot = JSON.parse(JSON.stringify({
     mode: 'production',
     carrierReadEnvironment: 'sandbox',
+    requiredCarrierProviders: ['ups_rest', 'fedex_rest'],
     policyVersion: cartonizationPlan.policyVersion,
     algorithmVersion: cartonizationPlan.algorithmVersion,
     inputHash: cartonizationPlan.inputHash,
@@ -2737,6 +2738,7 @@ async function verifyFaireExactVariantPackBinding(
       warehouseGlobalId: operational.warehouse.global_id,
       inventorySyncRunGlobalId: null,
       evidenceMode: 'operational',
+      requiredCarrierProviders: ['ups_rest', 'fedex_rest'],
       policyVersion: cartonizationPlan.policyVersion,
       algorithmVersion: cartonizationPlan.algorithmVersion,
       planInputHash: cartonizationPlan.inputHash,
@@ -2772,6 +2774,7 @@ async function verifyFaireExactVariantPackBinding(
     'warehouseGlobalId',
     'inventorySyncRunGlobalId',
     'evidenceMode',
+    'requiredCarrierProviders',
     'policyVersion',
     'algorithmVersion',
     'planInputHash',
@@ -2798,6 +2801,40 @@ async function verifyFaireExactVariantPackBinding(
   assert.equal(cartonizationEvidence.evidenceMode, 'operational')
   assert.equal(cartonizationEvidence.inventorySyncRunGlobalId, null)
   assert.equal(cartonizationEvidence.packages.length, 1)
+
+  const upsOnlyIdempotencyKey =
+    'commerce-staging-faire-operational-cartonization-ups-only'
+  const upsOnlySemanticRequestHash = hash(
+    'faire-e2e-operational-cartonization-ups-only',
+  )
+  const upsOnlyClaim = await warehouseServices.cartonizationRateEvidence
+    .claimCartonizationRateEvidenceCommandInPostgres({
+      organizationId: ids.organization,
+      idempotencyKey: upsOnlyIdempotencyKey,
+      semanticRequestHash: upsOnlySemanticRequestHash,
+      actorEmail,
+    })
+  assert.equal(upsOnlyClaim.state, 'claimed')
+  const upsOnlyPlanSnapshot = {
+    ...planSnapshot,
+    requiredCarrierProviders: ['ups_rest'],
+  }
+  const upsOnlyEvidence = await warehouseServices.cartonizationRateEvidence
+    .writeCartonizationRateEvidenceInPostgres({
+      ...cartonizationEvidenceInput,
+      idempotencyKey: upsOnlyIdempotencyKey,
+      semanticRequestHash: upsOnlySemanticRequestHash,
+      requiredCarrierProviders: ['ups_rest'],
+      planSnapshot: upsOnlyPlanSnapshot,
+      planResultHash: warehouseServices.cartonizationRateEvidence
+        .cartonizationRateEvidenceHash(upsOnlyPlanSnapshot),
+      quotes: cartonizationEvidenceInput.quotes.filter(
+        (quote) => quote.provider === 'ups_rest',
+      ),
+    })
+  assert.deepEqual(upsOnlyEvidence.requiredCarrierProviders, ['ups_rest'])
+  assert.equal(upsOnlyEvidence.shipmentRates.length, 1)
+  assert.equal(upsOnlyEvidence.packages[0].quotes.length, 1)
 
   // Reproduce the operator flow where exact carton evidence is sealed while
   // the candidate is ready and promotion performs the sole later row bump.

@@ -17,6 +17,14 @@ import {
 // sum independent package rates, so the shared evidence bound is 50.
 export const MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES = 50
 
+export const CARTONIZATION_RATE_EVIDENCE_CARRIER_PROVIDERS = [
+  'ups_rest',
+  'fedex_rest',
+] as const
+
+export type CartonizationRateEvidenceCarrierProvider =
+  typeof CARTONIZATION_RATE_EVIDENCE_CARRIER_PROVIDERS[number]
+
 export type CartonizationRateEvidenceAllocation = {
   lineGlobalId: string
   productGlobalId: string
@@ -65,7 +73,7 @@ export type CartonizationRateEvidencePackageInput = {
 
 export type CartonizationRateEvidenceQuoteInput = {
   packageKey: string
-  provider: 'ups_rest' | 'fedex_rest'
+  provider: CartonizationRateEvidenceCarrierProvider
   rateEvidenceGlobalId: string
 }
 
@@ -78,6 +86,7 @@ export type CartonizationRateEvidenceWriteInput = {
   warehouseGlobalId: string
   inventorySyncRunGlobalId: string | null
   evidenceMode: 'operational' | 'assumption_backed_sandbox'
+  requiredCarrierProviders: CartonizationRateEvidenceCarrierProvider[]
   policyVersion: string
   algorithmVersion: string
   planInputHash: string
@@ -108,6 +117,7 @@ type EvidenceHeaderRow = {
   warehouse_name: string
   inventory_sync_run_global_id: string | null
   evidence_mode: 'operational' | 'assumption_backed_sandbox'
+  required_carrier_providers: CartonizationRateEvidenceCarrierProvider[]
   policy_version: string
   algorithm_version: string
   plan_input_hash: string
@@ -161,7 +171,7 @@ type EvidenceRecipeRow = {
 
 type EvidenceQuoteRow = {
   package_key: string
-  provider: 'ups_rest' | 'fedex_rest'
+  provider: CartonizationRateEvidenceCarrierProvider
   rate_evidence_global_id: string
   quote_status: 'succeeded' | 'failed'
   error_code: string | null
@@ -200,6 +210,7 @@ export type CartonizationRateEvidence = {
   }
   inventorySyncRunGlobalId: string | null
   evidenceMode: 'operational' | 'assumption_backed_sandbox'
+  requiredCarrierProviders: CartonizationRateEvidenceCarrierProvider[]
   policyVersion: string
   algorithmVersion: string
   planInputHash: string
@@ -211,7 +222,7 @@ export type CartonizationRateEvidence = {
   actorEmail: string | null
   createdAt: string
   shipmentRates: Array<{
-    provider: 'ups_rest' | 'fedex_rest'
+    provider: CartonizationRateEvidenceCarrierProvider
     rateEvidenceGlobalId: string
     status: 'succeeded' | 'failed'
     errorCode: string | null
@@ -267,7 +278,7 @@ export type CartonizationRateEvidence = {
     carrierParcel: CarrierSandboxParcel
     packageHash: string
     quotes: Array<{
-      provider: 'ups_rest' | 'fedex_rest'
+      provider: CartonizationRateEvidenceCarrierProvider
       rateEvidenceGlobalId: string
       status: 'succeeded' | 'failed'
       errorCode: string | null
@@ -408,6 +419,69 @@ function sameMaterialRateDimensions(
   )
 }
 
+export function assertCartonizationRateEvidenceCarrierCoverage(
+  input: Pick<
+    CartonizationRateEvidenceWriteInput,
+    'requiredCarrierProviders' | 'packages' | 'quotes'
+  >,
+) {
+  const requiredCarrierProviders = input.requiredCarrierProviders
+  const providerSignature = Array.isArray(requiredCarrierProviders)
+    ? requiredCarrierProviders.join(',')
+    : ''
+  if (![
+    'ups_rest',
+    'fedex_rest',
+    'ups_rest,fedex_rest',
+  ].includes(providerSignature)) {
+    fail(
+      'Cartonization rate evidence requires a canonical nonempty UPS and/or FedEx provider set',
+      400,
+      'CARTONIZATION_RATE_EVIDENCE_CARRIER_COVERAGE_INVALID',
+    )
+  }
+
+  const packageKeys = new Set(input.packages.map((item) => item.packageKey))
+  const quoteCounts = new Map<string, number>()
+  if (
+    packageKeys.size !== input.packages.length
+    || !Array.isArray(input.quotes)
+    || input.quotes.length
+      !== input.packages.length * requiredCarrierProviders.length
+  ) {
+    fail(
+      'Cartonization rate evidence requires exactly one quote from every retained carrier for every package',
+      400,
+      'CARTONIZATION_RATE_EVIDENCE_CARRIER_COVERAGE_INVALID',
+    )
+  }
+  for (const quote of input.quotes) {
+    if (
+      !packageKeys.has(quote.packageKey)
+      || !requiredCarrierProviders.includes(quote.provider)
+    ) {
+      fail(
+        'Cartonization rate evidence contains a quote outside its retained package and carrier set',
+        400,
+        'CARTONIZATION_RATE_EVIDENCE_CARRIER_COVERAGE_INVALID',
+      )
+    }
+    const key = `${quote.packageKey}:${quote.provider}`
+    quoteCounts.set(key, (quoteCounts.get(key) || 0) + 1)
+  }
+  for (const packageKey of packageKeys) {
+    for (const provider of requiredCarrierProviders) {
+      if (quoteCounts.get(`${packageKey}:${provider}`) !== 1) {
+        fail(
+          'Cartonization rate evidence requires exactly one quote from every retained carrier for every package',
+          400,
+          'CARTONIZATION_RATE_EVIDENCE_CARRIER_COVERAGE_INVALID',
+        )
+      }
+    }
+  }
+}
+
 export function assertCartonizationRateEvidenceMaterialAssumptions(
   input: Pick<
     CartonizationRateEvidenceWriteInput,
@@ -543,6 +617,7 @@ export function cartonizationRateEvidenceRequestHash(
     warehouseGlobalId: input.warehouseGlobalId,
     inventorySyncRunGlobalId: input.inventorySyncRunGlobalId,
     evidenceMode: input.evidenceMode,
+    requiredCarrierProviders: input.requiredCarrierProviders,
     rateScope: 'multi_package_shipment',
     carrierRatePurpose: 'cartonization_shipment_rate',
     policyVersion: input.policyVersion,
@@ -557,7 +632,7 @@ export function cartonizationRateEvidenceRequestHash(
 }
 
 export function cartonizationPackageRateContextHash(input: {
-  provider: 'ups_rest' | 'fedex_rest'
+  provider: CartonizationRateEvidenceCarrierProvider
   destinationFingerprint: string
   parcel: CarrierSandboxParcel
 }) {
@@ -571,7 +646,7 @@ export function cartonizationPackageRateContextHash(input: {
 }
 
 export function cartonizationShipmentRateContextHash(input: {
-  provider: 'ups_rest' | 'fedex_rest'
+  provider: CartonizationRateEvidenceCarrierProvider
   destinationFingerprint: string
   parcels: CarrierSandboxParcel[]
 }) {
@@ -767,9 +842,7 @@ function mapEvidence(
     current.push(recipe)
     recipesByPackage.set(recipe.package_key, current)
   }
-  const shipmentRates = (
-    ['ups_rest', 'fedex_rest'] as const
-  ).flatMap((provider) => {
+  const shipmentRates = header.required_carrier_providers.flatMap((provider) => {
     const providerQuotes = quoteRows.filter(
       (quote) => quote.provider === provider,
     )
@@ -822,6 +895,7 @@ function mapEvidence(
     },
     inventorySyncRunGlobalId: header.inventory_sync_run_global_id,
     evidenceMode: header.evidence_mode,
+    requiredCarrierProviders: header.required_carrier_providers,
     policyVersion: header.policy_version,
     algorithmVersion: header.algorithm_version,
     planInputHash: header.plan_input_hash,
@@ -933,6 +1007,7 @@ async function readEvidenceRows(
          warehouse.name AS warehouse_name,
          inventory_run.global_id AS inventory_sync_run_global_id,
          evidence.evidence_mode,
+         evidence.required_carrier_providers,
          evidence.policy_version,
          evidence.algorithm_version,
          evidence.plan_input_hash,
@@ -1220,15 +1295,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
       400,
     )
   }
-  if (
-    !Array.isArray(input.quotes)
-    || input.quotes.length !== input.packages.length * 2
-  ) {
-    fail(
-      'Cartonization rate evidence requires one UPS and one FedEx quote per package',
-      400,
-    )
-  }
+  assertCartonizationRateEvidenceCarrierCoverage(input)
   assertCartonizationRateEvidenceMaterialAssumptions(input)
   const inputPlanResultHash = cartonizationRateEvidenceHash(input.planSnapshot)
   if (inputPlanResultHash !== input.planResultHash) {
@@ -1721,7 +1788,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
       ))
       .map((packageInput) => packageInput.carrierParcel)
     const rateEvidenceByProvider = new Map<
-      'ups_rest' | 'fedex_rest',
+      CartonizationRateEvidenceCarrierProvider,
       string
     >()
     for (const quote of input.quotes) {
@@ -1845,11 +1912,13 @@ export async function writeCartonizationRateEvidenceInPostgres(
          inventory_sync_run_id, evidence_mode, policy_version,
          algorithm_version, plan_input_hash, plan_result_hash,
          plan_snapshot, assumption_snapshot, status, idempotency_key,
-         actor_email, request_hash, write_token_hash
+         actor_email, request_hash, write_token_hash,
+         required_carrier_providers
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7::uuid,
          $8::uuid, $9, $10, $11, $12, $13,
-         $14::jsonb, $15::jsonb, $16, $17, $18, $19, $20
+         $14::jsonb, $15::jsonb, $16, $17, $18, $19, $20,
+         $21::text[]
        )
        RETURNING id::text, global_id`,
       [
@@ -1873,6 +1942,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
         input.actorEmail,
         requestHash,
         writeTokenHash,
+        input.requiredCarrierProviders,
       ],
     )
     const evidence = inserted.rows[0]
@@ -2025,6 +2095,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
         candidateGlobalId: input.candidateGlobalId,
         packageCount: input.packages.length,
         quoteCount: input.quotes.length,
+        requiredCarrierProviders: input.requiredCarrierProviders,
         evidenceMode: input.evidenceMode,
         status: input.status,
         requestHash,

@@ -109,6 +109,7 @@ type CartonizationRateEvidence = {
   }
   inventorySyncRunGlobalId: string | null
   evidenceMode: 'operational' | 'assumption_backed_sandbox'
+  requiredCarrierProviders: Array<'ups_rest' | 'fedex_rest'>
   policyVersion: string
   algorithmVersion: string
   planInputHash: string
@@ -448,7 +449,8 @@ export default function CartonizationRateEvidencePanel({
             </Stack>
             <Typography variant="body2" color="text.secondary">
               Reloadable evidence joins one exact order candidate to its
-              carton plan and read-only UPS and FedEx rate responses.
+              carton plan and the exact enabled UPS/FedEx sandbox rate
+              responses retained for that comparison.
             </Typography>
           </Box>
           <Button

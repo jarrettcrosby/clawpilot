@@ -6,7 +6,10 @@ import type {
   HybridCartonizationRecipe,
 } from '@/lib/operations/hybridCartonization'
 import { getPostgresPool } from '@/lib/persistence/postgres'
-import { shopifyCheckoutRatingHash } from '@/lib/persistence/shopifyCheckoutRating'
+import {
+  shopifyCheckoutRateLineageIsRequired,
+  shopifyCheckoutRatingHash,
+} from '@/lib/persistence/shopifyCheckoutRating'
 
 export type HybridCartonizationMaterialSelection = {
   materialGlobalId: string
@@ -453,8 +456,9 @@ export function resolveOperationalShopifyCheckoutReconciliation(input: {
   receipt_global_id: string
   receipt_status: 'succeeded'
 }) | null {
-  const clawPilotCheckout =
-    input.candidateServiceCode?.startsWith('clawpilot:') === true
+  const clawPilotCheckout = shopifyCheckoutRateLineageIsRequired(
+    input.candidateServiceCode,
+  )
   if (input.rows.length === 0) {
     if (clawPilotCheckout) {
       fail(

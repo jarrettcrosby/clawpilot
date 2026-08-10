@@ -411,6 +411,8 @@ export async function GET() {
           operations_recipe_pack_association_migration_applied: boolean
           operations_cartonization_evidence_scale_applied: boolean
           operations_cartonization_shipment_rates_applied: boolean
+          operations_one_off_shipments_applied: boolean
+          operations_cartonization_enabled_carriers_applied: boolean
           operations_cartonization_rate_constraint_repair_applied: boolean
           operations_two_pass_pack_rate_runs_applied: boolean
           operations_pack_rate_pricing_semantics_applied: boolean
@@ -1088,6 +1090,18 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0143_operations_cartonization_shipment_rates.sql'
               ) AS operations_cartonization_shipment_rates_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0258_operations_one_off_shipments.sql'
+              ) AS operations_one_off_shipments_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0259_operations_cartonization_enabled_carriers.sql'
+              ) AS operations_cartonization_enabled_carriers_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -2458,6 +2472,8 @@ export async function GET() {
             && row?.operations_recipe_pack_association_migration_applied
             && row?.operations_cartonization_evidence_scale_applied
             && row?.operations_cartonization_shipment_rates_applied
+            && row?.operations_one_off_shipments_applied
+            && row?.operations_cartonization_enabled_carriers_applied
             && row?.operations_cartonization_rate_constraint_repair_applied
             && row?.operations_two_pass_pack_rate_runs_applied
             && row?.operations_pack_rate_pricing_semantics_applied
@@ -2639,6 +2655,8 @@ export async function GET() {
           || !row?.operations_recipe_pack_association_migration_applied
           || !row?.operations_cartonization_evidence_scale_applied
           || !row?.operations_cartonization_shipment_rates_applied
+          || !row?.operations_one_off_shipments_applied
+          || !row?.operations_cartonization_enabled_carriers_applied
           || !row?.operations_cartonization_rate_constraint_repair_applied
           || !row?.operations_two_pass_pack_rate_runs_applied
           || !row?.operations_pack_rate_pricing_semantics_applied

@@ -25,6 +25,7 @@ import {
 } from '@/lib/operations/hybridCartonization'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
+  CARTONIZATION_RATE_EVIDENCE_CARRIER_PROVIDERS,
   cartonizationRateEvidenceHash,
   CartonizationRateEvidencePersistenceError,
   claimCartonizationRateEvidenceCommandInPostgres,
@@ -36,6 +37,7 @@ import {
   type CartonizationRateEvidenceMaterialRateAssumption,
   type CartonizationRateEvidencePackageInput,
   type CartonizationRateEvidenceQuoteInput,
+  type CartonizationRateEvidenceCarrierProvider,
 } from '@/lib/persistence/cartonizationRateEvidence'
 import {
   HybridCartonizationPersistenceError,
@@ -832,14 +834,32 @@ export async function POST(req: NextRequest) {
 
     const carrierState = await getCarrierIntegrationsState(organizationId)
     const carrierAccountGlobalIds = new Map<
-      'ups_rest' | 'fedex_rest',
+      CartonizationRateEvidenceCarrierProvider,
       string
     >()
-    for (const provider of ['ups_rest', 'fedex_rest'] as const) {
+    const providers = CARTONIZATION_RATE_EVIDENCE_CARRIER_PROVIDERS.filter(
+      (provider) => carrierState.accounts.some((account) => (
+        account.provider === provider
+        && account.environment === 'sandbox'
+        && account.status === 'active'
+        && account.configured
+        && account.verificationStatus === 'verified'
+      )),
+    )
+    if (providers.length < 1) {
+      throw new RateEvidenceRequestError(
+        'At least one enabled and verified UPS or FedEx sandbox rating connection is required',
+        422,
+        'CARTONIZATION_RATE_EVIDENCE_CARRIER_REQUIRED',
+      )
+    }
+    for (const provider of providers) {
       const connection = carrierState.accounts.find((account) => (
         account.provider === provider
         && account.environment === 'sandbox'
         && account.status === 'active'
+        && account.configured
+        && account.verificationStatus === 'verified'
       ))
       if (!connection) {
         throw new RateEvidenceRequestError(
@@ -995,6 +1015,7 @@ export async function POST(req: NextRequest) {
         ? 'production'
         : 'sandbox_demo',
       carrierReadEnvironment: 'sandbox',
+      requiredCarrierProviders: providers,
       policyVersion: plan.policyVersion,
       algorithmVersion: plan.algorithmVersion,
       inputHash: plan.inputHash,
@@ -1068,7 +1089,6 @@ export async function POST(req: NextRequest) {
         },
         grossPounds: packageInput.carrierParcel.weight,
       }))
-    const providers = ['ups_rest', 'fedex_rest'] as const
     const rateResults = await Promise.all(
       providers.map(async (provider) => {
         const carrierAccountGlobalId =
@@ -1114,7 +1134,7 @@ export async function POST(req: NextRequest) {
           shipmentRateEvidenceByProvider.get(provider)
         if (!rateEvidenceGlobalId) {
           throw new CarrierIntegrationRequestError(
-            'Shipment-rate evidence was not retained for both carriers',
+            'Shipment-rate evidence was not retained for all selected carriers',
             503,
             'CARTONIZATION_RATE_EVIDENCE_CARRIER_WRITE_MISSING',
           )
@@ -1134,6 +1154,7 @@ export async function POST(req: NextRequest) {
       warehouseGlobalId: read.warehouse.globalId,
       inventorySyncRunGlobalId: read.inventory.syncRunGlobalId,
       evidenceMode: request.evidenceMode,
+      requiredCarrierProviders: providers,
       policyVersion: plan.policyVersion,
       algorithmVersion: plan.algorithmVersion,
       planInputHash: plan.inputHash,
