@@ -12,6 +12,10 @@ import {
   assertCommerceIntakeRuntime,
 } from '@/lib/integrations/commerceIntake'
 import {
+  inspectShopifyOrderPlanningAuthority,
+  ShopifyOrderPlanningAuthorityError,
+} from '@/lib/integrations/shopifyOrderPlanningAuthority'
+import {
   CommerceIntegrationRequestError,
   sanitizedCommerceIntegrationError,
 } from '@/lib/integrations/commerceIntegrations'
@@ -43,6 +47,10 @@ import {
   HybridCartonizationPersistenceError,
   readHybridCartonizationInputFromPostgres,
 } from '@/lib/persistence/hybridCartonization'
+import {
+  readOperationalOrderPlanningProviderFromPostgres,
+  ShopifyOrderPlanningAuthorityPersistenceError,
+} from '@/lib/persistence/shopifyOrderPlanningAuthority'
 import { requireRequestUser } from '@/lib/requestUser'
 
 export const dynamic = 'force-dynamic'
@@ -470,6 +478,8 @@ function errorResponse(error: unknown) {
   if (
     error instanceof RateEvidenceRequestError
     || error instanceof HybridCartonizationPersistenceError
+    || error instanceof ShopifyOrderPlanningAuthorityError
+    || error instanceof ShopifyOrderPlanningAuthorityPersistenceError
   ) {
     return json(
       { ok: false, error: error.message, code: error.code },
@@ -669,6 +679,7 @@ export async function POST(req: NextRequest) {
           labelCalls: 0,
           postagePurchases: 0,
           providerWrites: 0,
+          providerOrderReads: 0,
           carrierRateReads: 0,
         },
       })
@@ -692,6 +703,26 @@ export async function POST(req: NextRequest) {
       idempotencyKey: request.idempotencyKey,
       semanticRequestHash,
     }
+    const operationalProvider = request.evidenceMode === 'operational'
+      ? await readOperationalOrderPlanningProviderFromPostgres({
+          organizationId,
+          accountGlobalId: request.accountGlobalId,
+          candidateGlobalId: request.candidateGlobalId,
+          expectedCandidateRowVersion:
+            request.expectedCandidateRowVersion,
+        })
+      : null
+    const shopifyOrderPlanningAuthority =
+      operationalProvider === 'shopify'
+        ? await inspectShopifyOrderPlanningAuthority({
+            organizationId,
+            accountGlobalId: request.accountGlobalId,
+            candidateGlobalId: request.candidateGlobalId,
+            expectedCandidateRowVersion:
+              request.expectedCandidateRowVersion,
+            warehouseGlobalId: request.warehouseGlobalId,
+          })
+        : null
     const read = await readHybridCartonizationInputFromPostgres({
       organizationId,
       accountGlobalId: request.accountGlobalId,
@@ -1025,6 +1056,14 @@ export async function POST(req: NextRequest) {
       geometryFallbackLines: plan.geometryFallbackLines,
       assumptions: plan.assumptions,
       blockers: plan.blockers,
+      ...(shopifyOrderPlanningAuthority
+        ? {
+            shopifyOrderPlanningAuthorityHash:
+              shopifyOrderPlanningAuthority.authorityHash,
+            shopifyOrderPlanningAuthority:
+              shopifyOrderPlanningAuthority.snapshot,
+          }
+        : {}),
       readContext: {
         readAt: read.readAt,
         account: read.account,
@@ -1043,6 +1082,8 @@ export async function POST(req: NextRequest) {
       labelCalls: 0,
       postagePurchases: 0,
       providerWrites: 0,
+      providerOrderReads:
+        shopifyOrderPlanningAuthority?.providerReads || 0,
     }
     const assumptionSnapshot = request.evidenceMode === 'operational'
       ? {
@@ -1054,6 +1095,13 @@ export async function POST(req: NextRequest) {
           inventoryAuthority: read.account.provider === 'shopify'
             ? 'shopify_provider_commitment_preflight'
             : 'projected_atp_only',
+          orderEligibilityAuthority: read.account.provider === 'shopify'
+            ? 'live_shopify_order_fulfillment_preflight'
+            : 'canonical_commerce_order',
+          shopifyOrderPlanningAuthorityHash:
+            shopifyOrderPlanningAuthority?.authorityHash || null,
+          providerOrderReads:
+            shopifyOrderPlanningAuthority?.providerReads || 0,
           planClaimAuthority: read.account.provider === 'shopify'
             ? 'transactional_provider_commitment_lock'
             : 'transactional_local_balance_lock',
@@ -1073,6 +1121,9 @@ export async function POST(req: NextRequest) {
             request.sandboxAssumptions.assumedMinimumInputQuantity,
           minimumOverrides: plan.assumptions,
           committedInventory: read.inventory.lines,
+          orderEligibilityAuthority: 'sandbox_assumption_only',
+          shopifyOrderPlanningAuthorityHash: null,
+          providerOrderReads: 0,
           databaseEffects,
         }
     const orderedParcels = [...packageInputs]
@@ -1179,6 +1230,8 @@ export async function POST(req: NextRequest) {
         labelCalls: 0,
         postagePurchases: 0,
         providerWrites: 0,
+        providerOrderReads:
+          shopifyOrderPlanningAuthority?.providerReads || 0,
         carrierRateReads: rateResults.length,
         carrierQuoteEdges: quotes.length,
       },

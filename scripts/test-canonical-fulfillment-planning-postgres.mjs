@@ -32,6 +32,73 @@ function sha(value) {
   return createHash('sha256').update(String(value)).digest('hex')
 }
 
+function normalizeTestShopifyPlanningAuthority(value) {
+  return {
+    version: value.version,
+    shopId: value.shopId,
+    credentialVersion: value.credentialVersion,
+    accountGlobalId: value.accountGlobalId,
+    candidate: {
+      globalId: value.candidate.globalId,
+      rowVersion: value.candidate.rowVersion,
+      sourceHash: value.candidate.sourceHash,
+    },
+    warehouse: {
+      globalId: value.warehouse.globalId,
+      locationMappingGlobalId:
+        value.warehouse.locationMappingGlobalId,
+      locationMappingRowVersion:
+        value.warehouse.locationMappingRowVersion,
+      shopifyLocationId: value.warehouse.shopifyLocationId,
+    },
+    order: {
+      externalOrderId: value.order.externalOrderId,
+      name: value.order.name,
+      updatedAt: new Date(value.order.updatedAt).toISOString(),
+      confirmed: true,
+      cancelledAt: null,
+      closedAt: null,
+      fulfillmentStatus: value.order.fulfillmentStatus,
+      fulfillable: true,
+    },
+    lines: value.lines.map((line) => ({
+      candidateLineGlobalId: line.candidateLineGlobalId,
+      canonicalLineGlobalId: line.canonicalLineGlobalId,
+      externalLineId: line.externalLineId,
+      quantity: line.quantity,
+    })).sort((left, right) => (
+      left.externalLineId.localeCompare(right.externalLineId)
+      || left.candidateLineGlobalId.localeCompare(
+        right.candidateLineGlobalId,
+      )
+    )),
+    fulfillmentOrders: value.fulfillmentOrders.map((order) => ({
+      fulfillmentOrderId: order.fulfillmentOrderId,
+      status: 'OPEN',
+      requestStatus: 'UNSUBMITTED',
+      updatedAt: new Date(order.updatedAt).toISOString(),
+      assignedLocationId: order.assignedLocationId,
+      lines: order.lines.map((line) => ({
+        fulfillmentOrderLineItemId:
+          line.fulfillmentOrderLineItemId,
+        externalLineId: line.externalLineId,
+        quantity: line.quantity,
+      })).sort((left, right) => (
+        left.externalLineId.localeCompare(right.externalLineId)
+        || left.fulfillmentOrderLineItemId.localeCompare(
+          right.fulfillmentOrderLineItemId,
+        )
+      )),
+    })).sort((left, right) => (
+      left.fulfillmentOrderId.localeCompare(right.fulfillmentOrderId)
+    )),
+  }
+}
+
+function testShopifyPlanningAuthorityHash(value) {
+  return sha(JSON.stringify(normalizeTestShopifyPlanningAuthority(value)))
+}
+
 function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
   const output = ts.transpileModule(read(path), {
     compilerOptions: {
@@ -154,6 +221,7 @@ async function seedCanonicalPlanningFixture(
   } = {},
 ) {
   const suffix = randomUUID().slice(0, 8)
+  const shopifyNumericId = BigInt(`0x${suffix}`).toString()
   const localSplitAuthority = inventoryAuthority === 'clawpilot_split'
   assert.ok(
     localSplitAuthority || inventoryAuthority === 'shopify',
@@ -273,11 +341,37 @@ async function seedCanonicalPlanningFixture(
       organizationId,
       commerceProvider,
       commerceEnvironment,
-      `canonical-${commerceProvider}-${suffix}`,
+      commerceProvider === 'shopify'
+        ? `gid://shopify/Shop/${shopifyNumericId}`
+        : `canonical-${commerceProvider}-${suffix}`,
       email,
     ],
   )
   const commerceAccount = commerceAccountResult.rows[0]
+  if (commerceProvider === 'shopify') {
+    await pool.query(
+      `INSERT INTO operations_commerce_credentials (
+         organization_id, integration_account_id, external_account_id,
+         auth_mode, credential_ciphertext, credential_iv, credential_tag,
+         credential_version, credential_identifier_last_four,
+         verification_status, verified_at, webhook_verification_status,
+         created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3,
+         'shopify_client_credentials', $4, $5, $6,
+         1, '1234', 'verified', now(), 'unverified', $7, $7
+       )`,
+      [
+        organizationId,
+        commerceAccount.id,
+        `gid://shopify/Shop/${shopifyNumericId}`,
+        Buffer.from(`canonical-shopify-credential-${suffix}`),
+        Buffer.alloc(12, 3),
+        Buffer.alloc(16, 4),
+        email,
+      ],
+    )
+  }
   const upsAccountResult = await pool.query(
     `INSERT INTO operations_integration_accounts (
        organization_id, provider, integration_type, environment,
@@ -624,7 +718,9 @@ async function seedCanonicalPlanningFixture(
       customer.id,
       commerceAccount.id,
       commerceProvider,
-      `canonical-${commerceProvider}-order-${suffix}`,
+      commerceProvider === 'shopify'
+        ? `gid://shopify/Order/${shopifyNumericId}`
+        : `canonical-${commerceProvider}-order-${suffix}`,
       `CANON-${suffix}`,
       JSON.stringify({
         name: 'Canonical planning customer',
@@ -664,7 +760,7 @@ async function seedCanonicalPlanningFixture(
       order.id,
       pipelineId,
       product.id,
-      `gid://shopify/LineItem/${suffix}`,
+      `gid://shopify/LineItem/${shopifyNumericId}`,
       `CANON-${suffix}`,
     ],
   )
@@ -762,7 +858,9 @@ async function seedCanonicalPlanningFixture(
       commerceAccount.id,
       pipelineId,
       intakeRunId,
-      `gid://shopify/Order/${suffix}`,
+      commerceProvider === 'shopify'
+        ? `gid://shopify/Order/${shopifyNumericId}`
+        : `canonical-${commerceProvider}-order-${suffix}`,
       `CANON-${suffix}`,
       customer.id,
       Buffer.from('canonical confirmed ship-to'),
@@ -831,7 +929,7 @@ async function seedCanonicalPlanningFixture(
       pipelineId,
       intakeRunId,
       candidate.id,
-      `gid://shopify/LineItem/${suffix}`,
+      `gid://shopify/LineItem/${shopifyNumericId}`,
       `gid://shopify/Product/${suffix}`,
       `gid://shopify/ProductVariant/${suffix}`,
       `gid://shopify/InventoryItem/${suffix}`,
@@ -857,6 +955,7 @@ async function seedCanonicalPlanningFixture(
   let inventoryRun = null
   let inventoryLevel = null
   let inventoryPosition = null
+  let inventoryLocationMapping = null
   let splitInventoryPositions = []
   if (!localSplitAuthority) {
   const providerAttemptResult = await pool.query(
@@ -874,7 +973,7 @@ async function seedCanonicalPlanningFixture(
     [
       organizationId,
       commerceAccount.id,
-      `location-${suffix}`,
+      `gid://shopify/Location/${shopifyNumericId}`,
       `inventory-attempt-${suffix}`,
       sha(`inventory-attempt-${suffix}`),
       email,
@@ -893,19 +992,20 @@ async function seedCanonicalPlanningFixture(
        '{}'::jsonb, $4::uuid, $5::uuid, $6::uuid,
        'manual', true, $7, $7
      )
-     RETURNING id::text`,
+     RETURNING id::text, global_id, row_version::text,
+               external_location_id`,
     [
       organizationId,
       commerceAccount.id,
-      `location-${suffix}`,
+      `gid://shopify/Location/${shopifyNumericId}`,
       warehouse.id,
       location.id,
       inventoryPoolId,
       email,
     ],
   )
-  const inventoryLocationMappingId =
-    inventoryLocationMappingResult.rows[0].id
+  inventoryLocationMapping = inventoryLocationMappingResult.rows[0]
+  const inventoryLocationMappingId = inventoryLocationMapping.id
   const captureResult = await pool.query(
     `INSERT INTO operations_commerce_inventory_captures (
        organization_id, integration_account_id, provider_attempt_id,
@@ -927,7 +1027,7 @@ async function seedCanonicalPlanningFixture(
       location.id,
       sha(`inventory-request-${suffix}`),
       sha(`inventory-snapshot-${suffix}`),
-      `location-${suffix}`,
+      inventoryLocationMapping.external_location_id,
       email,
     ],
   )
@@ -967,7 +1067,7 @@ async function seedCanonicalPlanningFixture(
       `inventory-run-${suffix}`,
       sha(`inventory-run-request-${suffix}`),
       sha(`inventory-run-snapshot-${suffix}`),
-      `location-${suffix}`,
+      inventoryLocationMapping.external_location_id,
       email,
     ],
   )
@@ -1036,7 +1136,7 @@ async function seedCanonicalPlanningFixture(
       pipelineId,
       product.id,
       inventoryPosition.id,
-      `location-${suffix}`,
+      inventoryLocationMapping.external_location_id,
       `gid://shopify/InventoryItem/${suffix}`,
       `CANON-${suffix}`,
       sha(`inventory-level-${suffix}`),
@@ -1162,6 +1262,79 @@ async function seedCanonicalPlanningFixture(
     }
   }
 
+  const shopifyPlanningAuthority = commerceProvider === 'shopify'
+    ? {
+        version: 'shopify-order-planning-authority-v1',
+        shopId: `gid://shopify/Shop/${shopifyNumericId}`,
+        credentialVersion: 1,
+        accountGlobalId: commerceAccount.global_id,
+        candidate: {
+          globalId: candidate.global_id,
+          rowVersion: Number(candidate.row_version),
+          sourceHash,
+        },
+        warehouse: {
+          globalId: warehouse.global_id,
+          locationMappingGlobalId:
+            inventoryLocationMapping.global_id,
+          locationMappingRowVersion: Number(
+            inventoryLocationMapping.row_version,
+          ),
+          shopifyLocationId:
+            inventoryLocationMapping.external_location_id,
+        },
+        order: {
+          externalOrderId:
+            `gid://shopify/Order/${shopifyNumericId}`,
+          name: `#CANON-${suffix}`,
+          updatedAt: '2026-08-10T12:00:00.000Z',
+          confirmed: true,
+          cancelledAt: null,
+          closedAt: null,
+          fulfillmentStatus: 'UNFULFILLED',
+          fulfillable: true,
+        },
+        lines: [{
+          candidateLineGlobalId: candidateLine.global_id,
+          canonicalLineGlobalId: orderLine.global_id,
+          externalLineId:
+            `gid://shopify/LineItem/${shopifyNumericId}`,
+          quantity: 2,
+        }],
+        fulfillmentOrders: [{
+          fulfillmentOrderId:
+            `gid://shopify/FulfillmentOrder/${shopifyNumericId}1`,
+          status: 'OPEN',
+          requestStatus: 'UNSUBMITTED',
+          updatedAt: '2026-08-10T11:59:00.000Z',
+          assignedLocationId:
+            inventoryLocationMapping.external_location_id,
+          lines: [{
+            fulfillmentOrderLineItemId:
+              `gid://shopify/FulfillmentOrderLineItem/${shopifyNumericId}2`,
+            externalLineId:
+              `gid://shopify/LineItem/${shopifyNumericId}`,
+            quantity: 2,
+          }],
+        }],
+      }
+    : null
+  const planSnapshot = {
+    version: 'canonical-acceptance-v1',
+    carrierReadEnvironment,
+    packages: packageKeys,
+    ...(shopifyPlanningAuthority
+      ? {
+          shopifyOrderPlanningAuthorityHash:
+            testShopifyPlanningAuthorityHash(
+              shopifyPlanningAuthority,
+            ),
+          shopifyOrderPlanningAuthority:
+            shopifyPlanningAuthority,
+        }
+      : {}),
+  }
+
   const evidenceToken = `canonical-evidence-${randomUUID()}`
   const evidenceClient = await pool.connect()
   let evidence
@@ -1184,7 +1357,7 @@ async function seedCanonicalPlanningFixture(
          idempotency_key, actor_email, write_token_hash
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid,
-         0, $4, $5, $6::uuid, $7::uuid,
+         1, $4, $5, $6::uuid, $7::uuid,
          'operational', 'canonical-acceptance-v1', 'or-tools-v1',
          $8, $9, $10, $11::jsonb, $12::jsonb, 'succeeded',
          $13, $14, $15
@@ -1201,14 +1374,10 @@ async function seedCanonicalPlanningFixture(
         sha(`evidence-request-${suffix}`),
         sha(`plan-input-${suffix}`),
         sha(`plan-result-${suffix}`),
-        JSON.stringify({
-          version: 'canonical-acceptance-v1',
-          carrierReadEnvironment,
-          packages: packageKeys,
-        }),
+        JSON.stringify(planSnapshot),
         JSON.stringify({
           inventorySyncRunGlobalId: inventoryRun?.global_id || null,
-          candidateRowVersion: 0,
+          candidateRowVersion: 1,
         }),
         `canonical-evidence-${suffix}`,
         email,
@@ -1318,6 +1487,7 @@ async function seedCanonicalPlanningFixture(
     inventoryPoolId,
     commerceAccount,
     commercePackMapping,
+    shopifyPlanningAuthority,
     expected: {
       checkoutChargeMinor:
         customerChargeUse === 'eligible' ? 1500 : null,
@@ -2646,6 +2816,185 @@ async function verifyCanonicalPlanning(databaseUrl) {
         },
       },
     )
+    let shopifyPlanningAuthorityReadCount = 0
+    let shopifyPlanningAuthorityMode = 'match'
+    class TestShopifyOrderPlanningAuthorityError extends Error {
+      constructor(message, status = 409, code = 'TEST_SHOPIFY_ERROR') {
+        super(message)
+        this.name = 'ShopifyOrderPlanningAuthorityError'
+        this.status = status
+        this.code = code
+      }
+    }
+    const shopifyOrderPlanningAuthority = {
+      ShopifyOrderPlanningAuthorityError:
+        TestShopifyOrderPlanningAuthorityError,
+      assertShopifyOrderPlanningAuthorityHash(value) {
+        if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) {
+          throw new TestShopifyOrderPlanningAuthorityError(
+            'Shopify order planning authority hash is invalid',
+            400,
+            'SHOPIFY_ORDER_PLANNING_HASH_INVALID',
+          )
+        }
+        return value
+      },
+      normalizeShopifyOrderPlanningAuthoritySnapshot:
+        normalizeTestShopifyPlanningAuthority,
+      shopifyOrderPlanningAuthorityHash:
+        testShopifyPlanningAuthorityHash,
+      async inspectShopifyOrderPlanningAuthority(input) {
+        shopifyPlanningAuthorityReadCount += 1
+        const retained = await pool.query(
+          `SELECT evidence.id::text,
+                  account.id::text AS account_id,
+                  candidate.id::text AS candidate_id,
+                  mapping.id::text AS mapping_id,
+                  evidence.plan_snapshot
+                    -> 'shopifyOrderPlanningAuthority' AS snapshot
+           FROM operations_cartonization_rate_evidence evidence
+           JOIN operations_integration_accounts account
+             ON account.organization_id = evidence.organization_id
+            AND account.id = evidence.integration_account_id
+           JOIN operations_commerce_order_candidates candidate
+             ON candidate.organization_id = evidence.organization_id
+            AND candidate.id = evidence.order_candidate_id
+           JOIN operations_warehouses warehouse
+             ON warehouse.organization_id = evidence.organization_id
+            AND warehouse.id = evidence.warehouse_id
+           JOIN operations_commerce_inventory_location_mappings mapping
+             ON mapping.organization_id = evidence.organization_id
+            AND mapping.integration_account_id =
+                  evidence.integration_account_id
+            AND mapping.warehouse_id = evidence.warehouse_id
+            AND mapping.active = true
+           WHERE evidence.organization_id = $1::uuid
+             AND account.global_id = $2
+             AND candidate.global_id = $3
+             AND evidence.candidate_row_version = $4::bigint
+             AND warehouse.global_id = $5
+             AND evidence.sealed_at IS NOT NULL
+           ORDER BY evidence.id DESC
+           LIMIT 1`,
+          [
+            input.organizationId,
+            input.accountGlobalId,
+            input.candidateGlobalId,
+            input.expectedCandidateRowVersion,
+            input.warehouseGlobalId,
+          ],
+        )
+        if (!retained.rows[0]?.snapshot) {
+          throw new TestShopifyOrderPlanningAuthorityError(
+            'Test Shopify authority target was not found',
+            409,
+            'SHOPIFY_ORDER_PLANNING_CONTEXT_UNAVAILABLE',
+          )
+        }
+        const snapshot = normalizeTestShopifyPlanningAuthority(
+          retained.rows[0].snapshot,
+        )
+        if (shopifyPlanningAuthorityMode === 'changed') {
+          snapshot.fulfillmentOrders[0].updatedAt = new Date(
+            new Date(
+              snapshot.fulfillmentOrders[0].updatedAt,
+            ).getTime() + 1_000,
+          ).toISOString()
+        }
+        if (shopifyPlanningAuthorityMode === 'locked-changed') {
+          const changedRetained = normalizeTestShopifyPlanningAuthority(
+            snapshot,
+          )
+          changedRetained.order.updatedAt = new Date(
+            new Date(changedRetained.order.updatedAt).getTime() + 1_000,
+          ).toISOString()
+          await pool.query(
+            `ALTER TABLE operations_cartonization_rate_evidence
+             DISABLE TRIGGER USER`,
+          )
+          try {
+            await pool.query(
+              `UPDATE operations_cartonization_rate_evidence
+               SET plan_snapshot = jsonb_set(
+                 jsonb_set(
+                   plan_snapshot,
+                   '{shopifyOrderPlanningAuthority}',
+                   $2::jsonb,
+                   true
+                 ),
+                 '{shopifyOrderPlanningAuthorityHash}',
+                 to_jsonb($3::text),
+                 true
+               )
+               WHERE id = $1::uuid`,
+              [
+                retained.rows[0].id,
+                JSON.stringify(changedRetained),
+                testShopifyPlanningAuthorityHash(changedRetained),
+              ],
+            )
+          } finally {
+            await pool.query(
+              `ALTER TABLE operations_cartonization_rate_evidence
+               ENABLE TRIGGER USER`,
+            )
+          }
+        }
+        if (shopifyPlanningAuthorityMode === 'locked-account-changed') {
+          await pool.query(
+            `ALTER TABLE operations_integration_accounts
+             DISABLE TRIGGER USER`,
+          )
+          try {
+            await pool.query(
+              `UPDATE operations_integration_accounts
+               SET commerce_credential_generation =
+                     commerce_credential_generation + 1
+               WHERE id = $1::uuid`,
+              [retained.rows[0].account_id],
+            )
+          } finally {
+            await pool.query(
+              `ALTER TABLE operations_integration_accounts
+               ENABLE TRIGGER USER`,
+            )
+          }
+        }
+        if (shopifyPlanningAuthorityMode === 'locked-candidate-changed') {
+          await pool.query(
+            `ALTER TABLE operations_commerce_order_candidates
+             DISABLE TRIGGER USER`,
+          )
+          try {
+            await pool.query(
+              `UPDATE operations_commerce_order_candidates
+               SET row_version = row_version + 1
+               WHERE id = $1::uuid`,
+              [retained.rows[0].candidate_id],
+            )
+          } finally {
+            await pool.query(
+              `ALTER TABLE operations_commerce_order_candidates
+               ENABLE TRIGGER USER`,
+            )
+          }
+        }
+        if (shopifyPlanningAuthorityMode === 'locked-mapping-changed') {
+          await pool.query(
+            `UPDATE operations_commerce_inventory_location_mappings
+             SET row_version = row_version + 1
+             WHERE id = $1::uuid`,
+            [retained.rows[0].mapping_id],
+          )
+        }
+        return {
+          authorityHash: testShopifyPlanningAuthorityHash(snapshot),
+          snapshot,
+          providerReads: 1,
+          providerWrites: 0,
+        }
+      },
+    }
     const operations = loadTypeScriptModule(
       'app_src/lib/persistence/operations.ts',
       {
@@ -2673,6 +3022,8 @@ async function verifyCanonicalPlanning(databaseUrl) {
               )
             },
           },
+          '@/lib/integrations/shopifyOrderPlanningAuthority':
+            shopifyOrderPlanningAuthority,
           '@/lib/integrations/faireFulfillmentRuntime': {
             prepareCurrentFaireFulfillmentAuthority: async () => {
               throw new Error(
@@ -3187,6 +3538,7 @@ async function verifyCanonicalPlanning(databaseUrl) {
       evidenceGlobalId: fixture.evidence.global_id,
       expectedRowVersion: Number(unrelatedOrder.row_version),
     })
+    const unpromotedFixture = await seedCanonicalPlanningFixture(pool)
     await pool.query(
       `ALTER TABLE operations_commerce_order_candidates
        DISABLE TRIGGER protect_operations_commerce_order_candidate`,
@@ -3200,20 +3552,20 @@ async function verifyCanonicalPlanning(databaseUrl) {
         `UPDATE operations_commerce_order_candidates
          SET workflow_state = 'ready', row_version = row_version + 1
          WHERE organization_id = $1::uuid AND id = $2::uuid`,
-        [fixture.organizationId, fixture.candidate.id],
+        [unpromotedFixture.organizationId, unpromotedFixture.candidate.id],
       )
       await assertPlanningAuthorityRejected({
         label: 'unpromoted same-organization candidate',
-        orderGlobalId: fixture.order.global_id,
-        evidenceGlobalId: fixture.evidence.global_id,
-        expectedRowVersion: Number(fixture.order.row_version),
+        orderGlobalId: unpromotedFixture.order.global_id,
+        evidenceGlobalId: unpromotedFixture.evidence.global_id,
+        expectedRowVersion: Number(unpromotedFixture.order.row_version),
       })
     } finally {
       await pool.query(
         `UPDATE operations_commerce_order_candidates
          SET workflow_state = 'promoted', row_version = row_version + 1
          WHERE organization_id = $1::uuid AND id = $2::uuid`,
-        [fixture.organizationId, fixture.candidate.id],
+        [unpromotedFixture.organizationId, unpromotedFixture.candidate.id],
       )
       await pool.query(
         `ALTER TABLE operations_commerce_order_candidates
@@ -3244,6 +3596,85 @@ async function verifyCanonicalPlanning(databaseUrl) {
       )
     }
 
+    for (const changedAuthority of [
+      {
+        mode: 'locked-changed',
+        label: 'sealed evidence',
+        code: 'OPERATIONS_CARTONIZATION_SHOPIFY_AUTHORITY_STALE',
+      },
+      {
+        mode: 'locked-account-changed',
+        label: 'integration account credential generation',
+        code: 'OPERATIONS_CARTONIZATION_SHOPIFY_AUTHORITY_STALE',
+      },
+      {
+        mode: 'locked-candidate-changed',
+        label: 'promoted candidate row version',
+        code: 'OPERATIONS_CARTONIZATION_EVIDENCE_STALE',
+      },
+      {
+        mode: 'locked-mapping-changed',
+        label: 'active Shopify location mapping row version',
+        code: 'OPERATIONS_CARTONIZATION_SHOPIFY_AUTHORITY_STALE',
+      },
+    ]) {
+      const changedAuthorityFixture =
+        await seedCanonicalPlanningFixture(pool)
+      const changedAuthorityKey = `authority-changed-${randomUUID()}`
+      const readsBeforeChangedAuthority = shopifyPlanningAuthorityReadCount
+      shopifyPlanningAuthorityMode = changedAuthority.mode
+      try {
+        await assert.rejects(
+          () => operations.planOperationsOrderFromPostgres({
+            organizationId: changedAuthorityFixture.organizationId,
+            actorEmail: changedAuthorityFixture.email,
+            orderGlobalId: changedAuthorityFixture.order.global_id,
+            cartonizationEvidenceGlobalId:
+              changedAuthorityFixture.evidence.global_id,
+            expectedRowVersion: Number(
+              changedAuthorityFixture.order.row_version,
+            ),
+            reason: `Reject changed ${changedAuthority.label}`,
+            idempotencyKey: changedAuthorityKey,
+          }),
+          (error) => {
+            assert.equal(error.code, changedAuthority.code)
+            assert.equal(error.status, 409)
+            return true
+          },
+        )
+      } finally {
+        shopifyPlanningAuthorityMode = 'match'
+      }
+      assert.equal(
+        shopifyPlanningAuthorityReadCount,
+        readsBeforeChangedAuthority + 1,
+        `A ${changedAuthority.label} race must follow one live read`,
+      )
+      const changedAuthorityEffects = await pool.query(
+        `SELECT
+           (SELECT count(*)::int
+            FROM operations_fulfillment_plans
+            WHERE organization_id = $1::uuid) AS plans,
+           (SELECT count(*)::int
+            FROM operations_reservations
+            WHERE organization_id = $1::uuid) AS reservations,
+           receipt.status,
+           receipt.error_code
+         FROM operations_command_receipts receipt
+         WHERE receipt.organization_id = $1::uuid
+           AND receipt.command_type = 'plan_operations_order'
+           AND receipt.idempotency_key = $2`,
+        [changedAuthorityFixture.organizationId, changedAuthorityKey],
+      )
+      assert.deepEqual(changedAuthorityEffects.rows[0], {
+        plans: 0,
+        reservations: 0,
+        status: 'failed',
+        error_code: changedAuthority.code,
+      })
+    }
+
     const idempotencyKey = (
       `operations-plan:${foreignFixture.order.global_id}:${randomUUID()}`
     )
@@ -3256,7 +3687,13 @@ async function verifyCanonicalPlanning(databaseUrl) {
       reason: 'Accept sealed operational evidence in focused PostgreSQL',
       idempotencyKey,
     }
+    const readsBeforePlan = shopifyPlanningAuthorityReadCount
     const result = await operations.planOperationsOrderFromPostgres(input)
+    assert.equal(
+      shopifyPlanningAuthorityReadCount,
+      readsBeforePlan + 1,
+      'A newly claimed Shopify plan must perform one live authority read',
+    )
     assert.equal(result.orderGlobalId, fixture.order.global_id)
     assert.equal(result.orderStatus, 'planned')
     assert.equal(result.rowVersion, Number(fixture.order.row_version) + 1)
@@ -3413,7 +3850,13 @@ async function verifyCanonicalPlanning(databaseUrl) {
       null,
       'Legacy target fill must happen only after request-hash equality',
     )
+    const readsBeforeReplay = shopifyPlanningAuthorityReadCount
     const replayed = await operations.planOperationsOrderFromPostgres(input)
+    assert.equal(
+      shopifyPlanningAuthorityReadCount,
+      readsBeforeReplay,
+      'A completed planning receipt must replay without a provider read',
+    )
     assert.deepEqual(
       {
         ...JSON.parse(JSON.stringify(replayed)),

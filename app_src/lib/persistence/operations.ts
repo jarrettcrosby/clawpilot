@@ -8,6 +8,15 @@ import {
   reconcileShopifyFulfillmentWriteback,
 } from '@/lib/integrations/shopifyFulfillmentWriteback'
 import {
+  assertShopifyOrderPlanningAuthorityHash,
+  inspectShopifyOrderPlanningAuthority,
+  normalizeShopifyOrderPlanningAuthoritySnapshot,
+  shopifyOrderPlanningAuthorityHash,
+  ShopifyOrderPlanningAuthorityError,
+  type ShopifyOrderPlanningAuthorityEvidence,
+  type ShopifyOrderPlanningAuthoritySnapshot,
+} from '@/lib/integrations/shopifyOrderPlanningAuthority'
+import {
   executeCurrentFaireFulfillmentWriteback,
   prepareCurrentFaireFulfillmentAuthority,
 } from '@/lib/integrations/faireFulfillmentRuntime'
@@ -9714,9 +9723,12 @@ async function resolvePlanningOrderTarget(input: {
   organizationId: string
   requestedOrderGlobalId: string
   evidenceGlobalId: string
-}): Promise<string> {
-  const result = await query<{ global_id: string }>(
-    `SELECT source_order.global_id
+}): Promise<{ orderGlobalId: string; sourceProvider: string }> {
+  const result = await query<{
+    global_id: string
+    source_provider: string
+  }>(
+    `SELECT source_order.global_id, source_order.source_provider
      FROM operations_orders source_order
      JOIN operations_commerce_order_candidates candidate
        ON candidate.organization_id = source_order.organization_id
@@ -9742,7 +9754,76 @@ async function resolvePlanningOrderTarget(input: {
   if (!authoritativeOrderGlobalId) {
     throw planningOrderEvidenceMismatch()
   }
-  return authoritativeOrderGlobalId
+  return {
+    orderGlobalId: authoritativeOrderGlobalId,
+    sourceProvider: String(result.rows[0]?.source_provider || '').trim(),
+  }
+}
+
+type RetainedShopifyPlanningAuthority = {
+  authorityHash: string
+  snapshot: ShopifyOrderPlanningAuthoritySnapshot
+}
+
+function retainedShopifyPlanningAuthority(
+  planSnapshot: Record<string, unknown>,
+): RetainedShopifyPlanningAuthority {
+  if (
+    !Object.hasOwn(planSnapshot, 'shopifyOrderPlanningAuthority')
+    || !Object.hasOwn(planSnapshot, 'shopifyOrderPlanningAuthorityHash')
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_CARTONIZATION_SHOPIFY_AUTHORITY_REQUIRED',
+      'Re-run cartonization to seal current Shopify order and fulfillment authority before planning.',
+      409,
+    )
+  }
+  const authorityHash = assertShopifyOrderPlanningAuthorityHash(
+    planSnapshot.shopifyOrderPlanningAuthorityHash,
+  )
+  const snapshot = normalizeShopifyOrderPlanningAuthoritySnapshot(
+    planSnapshot.shopifyOrderPlanningAuthority,
+  )
+  if (shopifyOrderPlanningAuthorityHash(snapshot) !== authorityHash) {
+    throw new OperationsRequestError(
+      'OPERATIONS_CARTONIZATION_SHOPIFY_AUTHORITY_CORRUPT',
+      'The sealed Shopify planning authority no longer matches its retained hash. Re-run cartonization.',
+      409,
+    )
+  }
+  return { authorityHash, snapshot }
+}
+
+function exactShopifyPlanningAuthorityMatch(
+  retained: RetainedShopifyPlanningAuthority,
+  live: ShopifyOrderPlanningAuthorityEvidence,
+) {
+  const liveHash = assertShopifyOrderPlanningAuthorityHash(
+    live.authorityHash,
+  )
+  const liveSnapshot = normalizeShopifyOrderPlanningAuthoritySnapshot(
+    live.snapshot,
+  )
+  return (
+    retained.authorityHash === liveHash
+    && shopifyOrderPlanningAuthorityHash(liveSnapshot) === liveHash
+    && canonicalJson(retained.snapshot) === canonicalJson(liveSnapshot)
+  )
+}
+
+function shopifyPlanningAuthorityChanged(): OperationsRequestError {
+  return new OperationsRequestError(
+    'OPERATIONS_CARTONIZATION_SHOPIFY_AUTHORITY_STALE',
+    'Shopify order or fulfillment authority changed after cartonization. Re-run cartonization and compare rates.',
+    409,
+  )
+}
+
+function normalizeShopifyPlanningError(error: unknown): unknown {
+  if (error instanceof ShopifyOrderPlanningAuthorityError) {
+    return new OperationsRequestError(error.code, error.message, error.status)
+  }
+  return error
 }
 
 export async function planOperationsOrderFromPostgres(input: {
@@ -9803,11 +9884,12 @@ export async function planOperationsOrderFromPostgres(input: {
     )
   }
 
-  const orderGlobalId = await resolvePlanningOrderTarget({
+  const planningTarget = await resolvePlanningOrderTarget({
     organizationId,
     requestedOrderGlobalId,
     evidenceGlobalId,
   })
+  const { orderGlobalId } = planningTarget
   const evidence = await readCartonizationRateEvidenceByGlobalId({
     organizationId,
     evidenceGlobalId,
@@ -9845,6 +9927,27 @@ export async function planOperationsOrderFromPostgres(input: {
   }
 
   try {
+    let liveShopifyPlanningAuthority:
+      ShopifyOrderPlanningAuthorityEvidence | null = null
+    if (planningTarget.sourceProvider === 'shopify') {
+      const retainedAuthority = retainedShopifyPlanningAuthority(
+        evidence.planSnapshot,
+      )
+      liveShopifyPlanningAuthority =
+        await inspectShopifyOrderPlanningAuthority({
+          organizationId,
+          accountGlobalId: evidence.accountGlobalId,
+          candidateGlobalId: evidence.candidateGlobalId,
+          expectedCandidateRowVersion: evidence.candidateRowVersion,
+          warehouseGlobalId: evidence.warehouse.globalId,
+        })
+      if (!exactShopifyPlanningAuthorityMatch(
+        retainedAuthority,
+        liveShopifyPlanningAuthority,
+      )) {
+        throw shopifyPlanningAuthorityChanged()
+      }
+    }
     return await withTransaction(async (client) => {
       await acquireTransactionAdvisoryLock(
         client,
@@ -9873,8 +9976,14 @@ export async function planOperationsOrderFromPostgres(input: {
         source_payload: Record<string, unknown>
         candidate_id: string
         candidate_global_id: string
+        candidate_row_version: string
         candidate_workflow_state: string
         candidate_source_hash: string
+        account_global_id: string
+        account_provider: string
+        account_status: string
+        account_credential_version: number
+        account_external_account_id: string | null
         evidence_id: string
         evidence_candidate_source_hash: string
         evidence_mode: string
@@ -9901,8 +10010,15 @@ export async function planOperationsOrderFromPostgres(input: {
            orders.source_payload,
            candidate.id::text AS candidate_id,
            candidate.global_id AS candidate_global_id,
+           candidate.row_version::text AS candidate_row_version,
            candidate.workflow_state AS candidate_workflow_state,
            candidate.source_hash AS candidate_source_hash,
+           account.global_id AS account_global_id,
+           account.provider AS account_provider,
+           account.status AS account_status,
+           account.commerce_credential_generation
+             AS account_credential_version,
+           account.external_account_id AS account_external_account_id,
            evidence.id::text AS evidence_id,
            evidence.candidate_source_hash
              AS evidence_candidate_source_hash,
@@ -9921,6 +10037,9 @@ export async function planOperationsOrderFromPostgres(input: {
           AND candidate.integration_account_id =
                 orders.integration_account_id
           AND candidate.canonical_order_id = orders.id
+         JOIN operations_integration_accounts account
+           ON account.organization_id = candidate.organization_id
+          AND account.id = candidate.integration_account_id
          JOIN operations_cartonization_rate_evidence evidence
            ON evidence.organization_id = candidate.organization_id
           AND evidence.integration_account_id =
@@ -9932,7 +10051,7 @@ export async function planOperationsOrderFromPostgres(input: {
           AND warehouse.id = evidence.warehouse_id
          WHERE orders.organization_id = $1::uuid
            AND orders.global_id = $2
-         FOR UPDATE OF orders, candidate, evidence, warehouse`,
+         FOR UPDATE OF orders, candidate, account, evidence, warehouse`,
         [organizationId, orderGlobalId, evidenceGlobalId],
       )
       const order = orderResult.rows[0]
@@ -9956,7 +10075,10 @@ export async function planOperationsOrderFromPostgres(input: {
       if (
         order.candidate_workflow_state !== 'promoted'
         || order.candidate_global_id !== evidence.candidateGlobalId
+        || Number(order.candidate_row_version)
+          !== evidence.candidateRowVersion
         || order.candidate_source_hash !== evidence.candidateSourceHash
+        || order.account_global_id !== evidence.accountGlobalId
         || order.evidence_candidate_source_hash
           !== evidence.candidateSourceHash
         || order.evidence_mode !== 'operational'
@@ -9968,6 +10090,128 @@ export async function planOperationsOrderFromPostgres(input: {
         throw new OperationsRequestError(
           'OPERATIONS_CARTONIZATION_EVIDENCE_STALE',
           'Cartonization evidence is no longer the sealed operational version for this order and warehouse',
+          409,
+        )
+      }
+      if (order.source_provider === 'shopify') {
+        if (!liveShopifyPlanningAuthority) {
+          throw new OperationsRequestError(
+            'OPERATIONS_CARTONIZATION_SHOPIFY_AUTHORITY_REQUIRED',
+            'Current Shopify order authority is required before planning.',
+            409,
+          )
+        }
+        const lockedAuthority = retainedShopifyPlanningAuthority(
+          order.evidence_plan_snapshot,
+        )
+        type LockedShopifyAuthorityRow = {
+          credential_version: number
+          credential_external_account_id: string
+          credential_verification_status: string
+          mapping_global_id: string
+          mapping_row_version: string
+          mapping_external_location_id: string
+          mapping_warehouse_id: string
+        }
+        const lockedShopifyAuthority =
+          await client.query<LockedShopifyAuthorityRow>(
+            `SELECT
+               credential.credential_version,
+               credential.external_account_id
+                 AS credential_external_account_id,
+               credential.verification_status
+                 AS credential_verification_status,
+               mapping.global_id AS mapping_global_id,
+               mapping.row_version::text AS mapping_row_version,
+               mapping.external_location_id
+                 AS mapping_external_location_id,
+               mapping.warehouse_id::text AS mapping_warehouse_id
+             FROM operations_commerce_credentials credential
+             JOIN operations_commerce_inventory_location_mappings mapping
+               ON mapping.organization_id = credential.organization_id
+              AND mapping.integration_account_id =
+                    credential.integration_account_id
+             WHERE credential.organization_id = $1::uuid
+               AND credential.integration_account_id = $2::uuid
+               AND mapping.warehouse_id = $3::uuid
+               AND mapping.active = true
+             FOR UPDATE OF credential, mapping`,
+            [
+              organizationId,
+              order.integration_account_id,
+              order.warehouse_id,
+            ],
+          )
+        const lockedProvider = lockedShopifyAuthority.rows[0]
+        const sealedSnapshot = lockedAuthority.snapshot
+        const liveSnapshot =
+          normalizeShopifyOrderPlanningAuthoritySnapshot(
+            liveShopifyPlanningAuthority.snapshot,
+          )
+        if (
+          lockedShopifyAuthority.rows.length !== 1
+          || !lockedProvider
+          || order.candidate_global_id
+            !== sealedSnapshot.candidate.globalId
+          || order.candidate_global_id
+            !== liveSnapshot.candidate.globalId
+          || Number(order.candidate_row_version)
+            !== sealedSnapshot.candidate.rowVersion
+          || Number(order.candidate_row_version)
+            !== liveSnapshot.candidate.rowVersion
+          || order.candidate_source_hash
+            !== sealedSnapshot.candidate.sourceHash
+          || order.candidate_source_hash
+            !== liveSnapshot.candidate.sourceHash
+          || order.account_global_id !== sealedSnapshot.accountGlobalId
+          || order.account_global_id !== liveSnapshot.accountGlobalId
+          || order.account_provider !== 'shopify'
+          || order.account_status !== 'active'
+          || order.account_credential_version
+            !== sealedSnapshot.credentialVersion
+          || order.account_credential_version
+            !== liveSnapshot.credentialVersion
+          || order.account_external_account_id !== sealedSnapshot.shopId
+          || order.account_external_account_id !== liveSnapshot.shopId
+          || lockedProvider.credential_version
+            !== sealedSnapshot.credentialVersion
+          || lockedProvider.credential_version
+            !== liveSnapshot.credentialVersion
+          || lockedProvider.credential_external_account_id
+            !== sealedSnapshot.shopId
+          || lockedProvider.credential_external_account_id
+            !== liveSnapshot.shopId
+          || lockedProvider.credential_verification_status !== 'verified'
+          || order.warehouse_global_id
+            !== sealedSnapshot.warehouse.globalId
+          || order.warehouse_global_id
+            !== liveSnapshot.warehouse.globalId
+          || lockedProvider.mapping_global_id
+            !== sealedSnapshot.warehouse.locationMappingGlobalId
+          || lockedProvider.mapping_global_id
+            !== liveSnapshot.warehouse.locationMappingGlobalId
+          || Number(lockedProvider.mapping_row_version)
+            !== sealedSnapshot.warehouse.locationMappingRowVersion
+          || Number(lockedProvider.mapping_row_version)
+            !== liveSnapshot.warehouse.locationMappingRowVersion
+          || lockedProvider.mapping_external_location_id
+            !== sealedSnapshot.warehouse.shopifyLocationId
+          || lockedProvider.mapping_external_location_id
+            !== liveSnapshot.warehouse.shopifyLocationId
+          || lockedProvider.mapping_warehouse_id !== order.warehouse_id
+        ) {
+          throw shopifyPlanningAuthorityChanged()
+        }
+        if (!exactShopifyPlanningAuthorityMatch(
+          lockedAuthority,
+          liveShopifyPlanningAuthority,
+        )) {
+          throw shopifyPlanningAuthorityChanged()
+        }
+      } else if (liveShopifyPlanningAuthority) {
+        throw new OperationsRequestError(
+          'OPERATIONS_CARTONIZATION_SHOPIFY_AUTHORITY_MISMATCH',
+          'Shopify planning authority cannot be applied to a non-Shopify order.',
           409,
         )
       }
@@ -10845,6 +11089,10 @@ export async function planOperationsOrderFromPostgres(input: {
             checkoutShippingChargeMinor: actualCheckoutCharge,
             customerPaidVarianceMinor:
               rateSelection.customerPaidVarianceMinor,
+            shopifyOrderPlanningAuthorityHash:
+              liveShopifyPlanningAuthority?.authorityHash || null,
+            planningAuthorityProviderReads:
+              liveShopifyPlanningAuthority?.providerReads || 0,
             mudApplied: false,
             providerWrites: 0,
             labelWrites: 0,
@@ -11075,6 +11323,10 @@ export async function planOperationsOrderFromPostgres(input: {
           customerPaidVarianceMinor:
             rateSelection.customerPaidVarianceMinor,
           selectionPolicy: rateSelection.policy,
+          shopifyOrderPlanningAuthorityHash:
+            liveShopifyPlanningAuthority?.authorityHash || null,
+          planningAuthorityProviderReads:
+            liveShopifyPlanningAuthority?.providerReads || 0,
           mudApplied: false,
           providerWrites: 0,
           labelsCreated: 0,
@@ -11117,6 +11369,10 @@ export async function planOperationsOrderFromPostgres(input: {
           ...result,
           candidateGlobalId: order.candidate_global_id,
           reason,
+          shopifyOrderPlanningAuthorityHash:
+            liveShopifyPlanningAuthority?.authorityHash || null,
+          planningAuthorityProviderReads:
+            liveShopifyPlanningAuthority?.providerReads || 0,
           providerWrites: 0,
           labelsCreated: 0,
           shipmentsCreated: 0,
@@ -11131,8 +11387,9 @@ export async function planOperationsOrderFromPostgres(input: {
       return result
     })
   } catch (error) {
-    await failCommandReceipt(command.receipt.id, error)
-    throw error
+    const normalizedError = normalizeShopifyPlanningError(error)
+    await failCommandReceipt(command.receipt.id, normalizedError)
+    throw normalizedError
   }
 }
 

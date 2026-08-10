@@ -289,6 +289,14 @@ function loadOperationalFaireRoute(
       CommerceIntegrationRequestError: IntegrationError,
       sanitizedCommerceIntegrationError: (error) => error,
     },
+    '@/lib/integrations/shopifyOrderPlanningAuthority': {
+      ShopifyOrderPlanningAuthorityError: IntegrationError,
+      inspectShopifyOrderPlanningAuthority: async () => {
+        throw new Error(
+          'Faire operational evidence must not read Shopify authority',
+        )
+      },
+    },
     '@/lib/operations/authorization': {
       activeOperationsOrganizationId: () => (
         '00000000-0000-4000-8000-000000000001'
@@ -339,6 +347,10 @@ function loadOperationalFaireRoute(
         observed.readInput = input
         return cartonizationRead
       },
+    },
+    '@/lib/persistence/shopifyOrderPlanningAuthority': {
+      ShopifyOrderPlanningAuthorityPersistenceError: PersistenceError,
+      readOperationalOrderPlanningProviderFromPostgres: async () => 'faire',
     },
     '@/lib/requestUser': {
       requireRequestUser: async () => ({ email: 'operator@example.com' }),
@@ -1111,6 +1123,7 @@ assert.deepEqual(
       labelCalls: 0,
       postagePurchases: 0,
       providerWrites: 0,
+      providerOrderReads: 0,
       carrierRateReads: 2,
       carrierQuoteEdges: 2,
     },
