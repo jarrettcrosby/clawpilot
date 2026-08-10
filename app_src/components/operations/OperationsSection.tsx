@@ -14,10 +14,15 @@ import {
   DialogTitle,
   Divider,
   Drawer,
+  FormControl,
   FormControlLabel,
+  FormHelperText,
   IconButton,
+  InputLabel,
   InputAdornment,
+  ListItemText,
   MenuItem,
+  Select,
   Stack,
   Tab,
   Table,
@@ -78,6 +83,7 @@ import CommerceImportsPanel from '@/components/operations/CommerceImportsPanel'
 import PackagingMaterialsPanel from '@/components/operations/PackagingMaterialsPanel'
 import PrinterConfigurationPanel from '@/components/operations/PrinterConfigurationPanel'
 import PackRateReplayPanel from '@/components/operations/PackRateReplayPanel'
+import CartonizationRateEvidencePanel from '@/components/operations/CartonizationRateEvidencePanel'
 import ReceivingPanel from '@/components/operations/ReceivingPanel'
 import WarehouseSetupPanel from '@/components/operations/WarehouseSetupPanel'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
@@ -90,6 +96,10 @@ import {
 } from '@/lib/operations/commerceActiveSelection'
 import { SANDBOX_COMMERCE_E2E_CONFIRMATION } from '@/lib/operations/sandboxCommerceE2e'
 import { formatUserDateTime } from '@/lib/userDateTime'
+import type {
+  PackagingMaterial,
+  PackagingMaterialsWorkspace,
+} from '@/lib/operations/packagingMaterials'
 
 type SandboxCommerceE2eAuthorizationResult = {
   authorizationGlobalId: string
@@ -124,6 +134,22 @@ type OperationsPayload = {
     | OperationsShadowFulfillmentExecutionResult
     | OperationsShipmentCommandResult
     | OperationsCommerceFulfillmentRetryResult
+}
+
+type PackagingMaterialsPayload = {
+  ok?: boolean
+  error?: string
+  packagingMaterials?: PackagingMaterialsWorkspace
+}
+
+type PlanningEvidencePayload = {
+  ok?: boolean
+  error?: string
+  code?: string
+  evidence?: {
+    globalId: string
+    status: 'succeeded' | 'partial' | 'failed'
+  }
 }
 
 export type OperationsView =
@@ -418,6 +444,43 @@ function money(minor: string | null | undefined, currency = 'USD') {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   }).format(Number.isFinite(value) ? value : 0)
+}
+
+function operationalPlanningMaterialBlockers(
+  material: PackagingMaterial,
+  warehouseGlobalId: string,
+) {
+  const blockers: string[] = []
+  const ratedOuter = material.ratedOuterDimensionsMm
+  if (material.status !== 'active') blockers.push('not active')
+  if (!ratedOuter.length || !ratedOuter.width || !ratedOuter.height) {
+    blockers.push('rated exterior dimensions missing')
+  }
+  if (
+    !['customer_confirmed', 'measured', 'provider'].includes(
+      material.ratedOuterDimensionEvidenceType || '',
+    )
+    || !material.ratedOuterDimensionEvidenceReference
+    || !material.ratedOuterDimensionConfirmedAt
+  ) {
+    blockers.push('factual exterior evidence missing')
+  }
+  if (!material.tareWeightGrams || material.tareWeightGrams <= 0) {
+    blockers.push('tare weight missing')
+  }
+  const stock = material.stock.find((item) => (
+    item.warehouseGlobalId === warehouseGlobalId
+  ))
+  if (
+    !stock
+    || stock.warehouseStatus !== 'active'
+    || !stock.isAvailable
+    || !stock.onHandQuantity
+    || stock.onHandQuantity <= 0
+  ) {
+    blockers.push('available warehouse stock missing')
+  }
+  return blockers
 }
 
 function metric(label: string, value: string | number, tone = 'text.primary') {
@@ -998,7 +1061,7 @@ function OrderDetailDrawer({
                         disabled={!canExecute || busy}
                         onClick={onPlan}
                       >
-                        {busy ? 'Planning' : 'Plan order'}
+                        {busy ? 'Preparing' : 'Prepare order'}
                       </Button>
                     </span>
                   </Tooltip>
@@ -1997,6 +2060,13 @@ export default function OperationsSection({
   const [commerceActivePrepareKey, setCommerceActivePrepareKey] = useState('')
   const [commerceActiveActivateKey, setCommerceActiveActivateKey] = useState('')
   const [planOpen, setPlanOpen] = useState(false)
+  const [planPreparationLoading, setPlanPreparationLoading] = useState(false)
+  const [planPackagingWorkspace, setPlanPackagingWorkspace] =
+    useState<PackagingMaterialsWorkspace | null>(null)
+  const [planWarehouseGlobalId, setPlanWarehouseGlobalId] = useState('')
+  const [planMaterialGlobalIds, setPlanMaterialGlobalIds] = useState<string[]>([])
+  const [creatingPlanEvidence, setCreatingPlanEvidence] = useState(false)
+  const [planEvidenceIdempotencyKey, setPlanEvidenceIdempotencyKey] = useState('')
   const [
     planCartonizationEvidenceGlobalId,
     setPlanCartonizationEvidenceGlobalId,
@@ -2144,23 +2214,160 @@ export default function OperationsSection({
     setDrawerOpen(true)
   }
 
+  const loadPlanPreparation = async (order: OperationsOrderDetail) => {
+    if (!order.planningPreparation) {
+      setPlanError(
+        'This imported order is missing its promoted sales-channel candidate. Refresh the order or reopen Commerce imports.',
+      )
+      return
+    }
+    setPlanPreparationLoading(true)
+    try {
+      const response = await fetch('/api/operations/packaging-materials', {
+        cache: 'no-store',
+      })
+      const payload = await response.json().catch(() => ({})) as
+        PackagingMaterialsPayload
+      if (!response.ok || !payload.ok || !payload.packagingMaterials) {
+        throw new Error(payload.error || 'Packaging materials could not be loaded')
+      }
+      const packaging = payload.packagingMaterials
+      const warehouseGlobalId = packaging.warehouses.find(
+        (warehouse) => warehouse.status === 'active',
+      )?.globalId || ''
+      const operationalMaterials = warehouseGlobalId
+        ? packaging.materials.filter((material) => (
+            operationalPlanningMaterialBlockers(
+              material,
+              warehouseGlobalId,
+            ).length === 0
+          ))
+        : []
+      setPlanPackagingWorkspace(packaging)
+      setPlanWarehouseGlobalId(warehouseGlobalId)
+      setPlanMaterialGlobalIds(
+        operationalMaterials[0] ? [operationalMaterials[0].globalId] : [],
+      )
+      if (!warehouseGlobalId) {
+        setPlanError('Configure an active warehouse before preparing this order.')
+      } else if (!operationalMaterials.length) {
+        setPlanError(
+          'No active stocked packaging has factual exterior dimensions and tare for this warehouse.',
+        )
+      }
+    } catch (caught) {
+      setPlanError(
+        caught instanceof Error
+          ? caught.message
+          : 'Packaging materials could not be loaded',
+      )
+    } finally {
+      setPlanPreparationLoading(false)
+    }
+  }
+
   const openPlan = () => {
     setPlanCartonizationEvidenceGlobalId('')
+    setPlanPackagingWorkspace(null)
+    setPlanWarehouseGlobalId('')
+    setPlanMaterialGlobalIds([])
+    setPlanEvidenceIdempotencyKey(
+      `operations-rate-plan:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+    )
     setPlanReason(
-      'Accept the reviewed cartonization evidence as the canonical warehouse plan',
+      'Rate, cartonize, and accept the reviewed warehouse plan',
     )
     setPlanIdempotencyKey(
       `operations-plan:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
     )
     setPlanError('')
     setPlanOpen(true)
+    if (detail) void loadPlanPreparation(detail)
   }
 
   const closePlan = () => {
-    if (planningOrder) return
+    if (planningOrder || creatingPlanEvidence) return
     setPlanOpen(false)
+    setPlanPackagingWorkspace(null)
+    setPlanWarehouseGlobalId('')
+    setPlanMaterialGlobalIds([])
+    setPlanCartonizationEvidenceGlobalId('')
+    setPlanEvidenceIdempotencyKey('')
     setPlanIdempotencyKey('')
     setPlanError('')
+  }
+
+  const createPlanEvidence = async () => {
+    const preparation = detail?.planningPreparation
+    const selectedMaterials = planPackagingWorkspace?.materials.filter(
+      (material) => planMaterialGlobalIds.includes(material.globalId),
+    ) || []
+    if (
+      !detail
+      || !preparation
+      || !planWarehouseGlobalId
+      || selectedMaterials.length < 1
+      || selectedMaterials.length > 8
+      || !planEvidenceIdempotencyKey
+    ) return
+    const blocker = selectedMaterials.flatMap((material) => (
+      operationalPlanningMaterialBlockers(material, planWarehouseGlobalId)
+        .map((reason) => `${material.code}: ${reason}`)
+    ))[0]
+    if (blocker) {
+      setPlanError(blocker)
+      return
+    }
+    setCreatingPlanEvidence(true)
+    setPlanCartonizationEvidenceGlobalId('')
+    setPlanError('')
+    try {
+      const response = await fetch(
+        '/api/integrations/commerce/intake/cartonization-rate-evidence',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            evidenceMode: 'operational',
+            accountGlobalId: preparation.accountGlobalId,
+            candidateGlobalId: preparation.candidateGlobalId,
+            expectedCandidateRowVersion: preparation.candidateRowVersion,
+            warehouseGlobalId: planWarehouseGlobalId,
+            selectedMaterials: selectedMaterials.map((material) => ({
+              materialGlobalId: material.globalId,
+              expectedRowVersion: material.rowVersion,
+            })),
+            idempotencyKey: planEvidenceIdempotencyKey,
+          }),
+        },
+      )
+      const payload = await response.json().catch(() => ({})) as
+        PlanningEvidencePayload
+      if (
+        !response.ok
+        || !payload.ok
+        || !payload.evidence
+        || payload.evidence.status === 'failed'
+      ) {
+        throw new Error(
+          `${payload.error || 'Cartonization and carrier rating failed'}${
+            payload.code ? ` [${payload.code}]` : ''
+          }`,
+        )
+      }
+      setPlanCartonizationEvidenceGlobalId(payload.evidence.globalId)
+    } catch (caught) {
+      setPlanEvidenceIdempotencyKey(
+        `operations-rate-plan:${detail.globalId}:${crypto.randomUUID()}`,
+      )
+      setPlanError(
+        caught instanceof Error
+          ? caught.message
+          : 'Cartonization and carrier rating failed',
+      )
+    } finally {
+      setCreatingPlanEvidence(false)
+    }
   }
 
   const planOrder = async (event: FormEvent) => {
@@ -2254,6 +2461,11 @@ export default function OperationsSection({
       }
 
       setPlanOpen(false)
+      setPlanPackagingWorkspace(null)
+      setPlanWarehouseGlobalId('')
+      setPlanMaterialGlobalIds([])
+      setPlanCartonizationEvidenceGlobalId('')
+      setPlanEvidenceIdempotencyKey('')
       setPlanIdempotencyKey('')
       setPlanError('')
       setNotice(
@@ -3625,6 +3837,8 @@ export default function OperationsSection({
         open={drawerOpen}
         busy={
           planningOrder
+          || planPreparationLoading
+          || creatingPlanEvidence
           || releasingOrder
           || confirmingPicks
           || verifyingPack
@@ -4026,48 +4240,173 @@ export default function OperationsSection({
         </DialogActions>
       </Dialog>
 
-      <Dialog open={planOpen} onClose={closePlan} fullWidth maxWidth="sm">
+      <Dialog open={planOpen} onClose={closePlan} fullWidth maxWidth="md">
         <Box component="form" onSubmit={planOrder}>
-          <DialogTitle>Plan imported order</DialogTitle>
+          <DialogTitle>Prepare and plan imported order</DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2}>
               <Alert severity="info">
-                Accept reviewed immutable cartonization evidence for{' '}
-                {detail?.orderNumber || 'this imported order'} into its canonical
-                warehouse plan. This command does not purchase postage, create a
-                label, print a packing slip, or confirm a shipment.
+                Select the fulfillment warehouse and factual packaging for{' '}
+                {detail?.orderNumber || 'this imported order'}. ClawPilot will
+                cartonize the order, compare read-only UPS and FedEx rates, and
+                retain immutable evidence before creating the warehouse plan.
+                Nothing here purchases postage, creates a label, releases a wave,
+                or assigns a picker.
               </Alert>
               {planError && (
                 <Alert severity="error" onClose={() => setPlanError('')}>
                   {planError}
                 </Alert>
               )}
-              <TextField
-                required
-                autoFocus
-                label="Cartonization evidence Global ID"
-                value={planCartonizationEvidenceGlobalId}
-                onChange={(event) => {
-                  setPlanCartonizationEvidenceGlobalId(
-                    event.target.value.toLowerCase(),
-                  )
-                  setPlanError('')
-                }}
-                error={Boolean(
-                  planCartonizationEvidenceGlobalId.trim()
-                  && !planEvidenceValid
-                )}
-                inputProps={{
-                  maxLength: 16,
-                  pattern: 'gcte(?:[0-9]{7}|[0-9a-v]{12})',
-                  autoCapitalize: 'none',
-                  autoCorrect: 'off',
-                  spellCheck: false,
-                }}
-                helperText={planEvidenceValid
-                  ? 'Valid immutable cartonization evidence reference'
-                  : 'Enter gcte0000001 or a compact 12-character suffix'}
-              />
+              {planPreparationLoading ? (
+                <Stack direction="row" spacing={1.5} alignItems="center" sx={{ py: 2 }}>
+                  <CircularProgress size={22} />
+                  <Typography>Loading warehouses and factual packaging…</Typography>
+                </Stack>
+              ) : planPackagingWorkspace ? (
+                <>
+                  <Typography variant="overline" color="text.secondary">
+                    Step 1 · Choose fulfillment facts
+                  </Typography>
+                  <FormControl fullWidth>
+                    <InputLabel id="order-planning-warehouse-label">Warehouse</InputLabel>
+                    <Select
+                      id="order-planning-warehouse"
+                      labelId="order-planning-warehouse-label"
+                      label="Warehouse"
+                      value={planWarehouseGlobalId}
+                      disabled={creatingPlanEvidence || planEvidenceValid}
+                      onChange={(event) => {
+                        const warehouseGlobalId = event.target.value
+                        const eligible = planPackagingWorkspace.materials.filter(
+                          (material) => operationalPlanningMaterialBlockers(
+                            material,
+                            warehouseGlobalId,
+                          ).length === 0,
+                        )
+                        setPlanWarehouseGlobalId(warehouseGlobalId)
+                        setPlanMaterialGlobalIds(
+                          eligible[0] ? [eligible[0].globalId] : [],
+                        )
+                        setPlanCartonizationEvidenceGlobalId('')
+                        setPlanEvidenceIdempotencyKey(
+                          `operations-rate-plan:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+                        )
+                        setPlanError(eligible.length
+                          ? ''
+                          : 'No factual stocked packaging is ready at this warehouse.')
+                      }}
+                    >
+                      {planPackagingWorkspace.warehouses
+                        .filter((warehouse) => warehouse.status === 'active')
+                        .map((warehouse) => (
+                          <MenuItem key={warehouse.globalId} value={warehouse.globalId}>
+                            {warehouse.name} · {warehouse.globalId}
+                          </MenuItem>
+                        ))}
+                    </Select>
+                    <FormHelperText>
+                      Inventory and carrier sender accounts must resolve to this warehouse.
+                    </FormHelperText>
+                  </FormControl>
+                  <FormControl fullWidth>
+                    <InputLabel id="order-planning-materials-label">
+                      Packaging materials (1–8)
+                    </InputLabel>
+                    <Select
+                      id="order-planning-materials"
+                      labelId="order-planning-materials-label"
+                      multiple
+                      label="Packaging materials (1–8)"
+                      value={planMaterialGlobalIds}
+                      disabled={creatingPlanEvidence || planEvidenceValid}
+                      onChange={(event) => {
+                        const values = typeof event.target.value === 'string'
+                          ? event.target.value.split(',')
+                          : event.target.value
+                        setPlanMaterialGlobalIds(
+                          Array.from(new Set(values)).slice(0, 8),
+                        )
+                        setPlanCartonizationEvidenceGlobalId('')
+                        setPlanEvidenceIdempotencyKey(
+                          `operations-rate-plan:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+                        )
+                        setPlanError('')
+                      }}
+                      renderValue={(selected) => selected.map((globalId) => (
+                        planPackagingWorkspace.materials.find(
+                          (material) => material.globalId === globalId,
+                        )?.code || globalId
+                      )).join(', ')}
+                    >
+                      {planPackagingWorkspace.materials.map((material) => {
+                        const blockers = operationalPlanningMaterialBlockers(
+                          material,
+                          planWarehouseGlobalId,
+                        )
+                        const selected = planMaterialGlobalIds.includes(material.globalId)
+                        return (
+                          <MenuItem
+                            key={material.globalId}
+                            value={material.globalId}
+                            disabled={blockers.length > 0 || (
+                              !selected && planMaterialGlobalIds.length >= 8
+                            )}
+                          >
+                            <Checkbox checked={selected} />
+                            <ListItemText
+                              primary={`${material.code} · ${material.name}`}
+                              secondary={blockers.length
+                                ? blockers.join(', ')
+                                : 'Operationally ready'}
+                            />
+                          </MenuItem>
+                        )
+                      })}
+                    </Select>
+                    <FormHelperText>
+                      Only active, stocked materials with factual exterior dimensions and tare can be rated.
+                    </FormHelperText>
+                  </FormControl>
+                  {!planEvidenceValid ? (
+                    <Button
+                      type="button"
+                      variant="contained"
+                      startIcon={creatingPlanEvidence
+                        ? <CircularProgress size={16} color="inherit" />
+                        : <ScienceRounded />}
+                      disabled={
+                        creatingPlanEvidence
+                        || !planWarehouseGlobalId
+                        || planMaterialGlobalIds.length < 1
+                        || planMaterialGlobalIds.length > 8
+                      }
+                      onClick={() => void createPlanEvidence()}
+                    >
+                      {creatingPlanEvidence
+                        ? 'Cartonizing and rating'
+                        : 'Run cartonization and compare rates'}
+                    </Button>
+                  ) : (
+                    <>
+                      <Typography variant="overline" color="text.secondary">
+                        Step 2 · Review the carton plan and carrier rates
+                      </Typography>
+                      <CartonizationRateEvidencePanel
+                        evidenceGlobalId={planCartonizationEvidenceGlobalId}
+                      />
+                      <Alert severity="info" variant="outlined">
+                        Confirming the plan uses the lowest-cost whole-shipment
+                        service that meets the requested delivery time. The
+                        selected service and all alternatives remain in the audit record.
+                      </Alert>
+                    </>
+                  )}
+                </>
+              ) : null}
+              <Typography variant="overline" color="text.secondary">
+                Step 3 · Record the planning decision
+              </Typography>
               <TextField
                 required
                 multiline
@@ -4084,12 +4423,18 @@ export default function OperationsSection({
             </Stack>
           </DialogContent>
           <DialogActions>
-            <Button onClick={closePlan} disabled={planningOrder}>Cancel</Button>
+            <Button
+              onClick={closePlan}
+              disabled={planningOrder || creatingPlanEvidence}
+            >
+              Cancel
+            </Button>
             <Button
               type="submit"
               variant="contained"
               disabled={
                 planningOrder
+                || creatingPlanEvidence
                 || !planEvidenceValid
                 || !planReason.trim()
               }
@@ -4097,7 +4442,7 @@ export default function OperationsSection({
                 ? <CircularProgress size={16} />
                 : <Inventory2Rounded />}
             >
-              {planningOrder ? 'Planning order' : 'Confirm plan'}
+              {planningOrder ? 'Planning order' : 'Confirm warehouse plan'}
             </Button>
           </DialogActions>
         </Box>

@@ -2067,6 +2067,9 @@ async function readOrderDetail(
     customer_global_id: string
     source_provider: string
     integration_account_id: string
+    integration_account_global_id: string | null
+    planning_candidate_global_id: string | null
+    planning_candidate_row_version: string | null
     notify_customer_default: boolean | null
     notification_policy_revision: string | number | null
     status: OperationsOrderStatus
@@ -2105,6 +2108,10 @@ async function readOrderDetail(
        orders.id::text, orders.global_id, orders.order_number, orders.external_order_id,
        customer.name AS customer_name, customer.reference_code AS customer_global_id,
        orders.source_provider, orders.integration_account_id::text,
+       source_account.global_id AS integration_account_global_id,
+       planning_candidate.global_id AS planning_candidate_global_id,
+       planning_candidate.row_version::text
+         AS planning_candidate_row_version,
        notification_policy.notify_customer_default,
        notification_policy.revision::text AS notification_policy_revision,
        orders.status, orders.currency, orders.ship_to,
@@ -2194,6 +2201,19 @@ async function readOrderDetail(
        shipment.tracking_number, orders.updated_at
      FROM operations_orders orders
      JOIN crm_organizations customer ON customer.id = orders.customer_id AND customer.pipeline_id = orders.pipeline_id
+     LEFT JOIN operations_integration_accounts source_account
+       ON source_account.organization_id = orders.organization_id
+      AND source_account.id = orders.integration_account_id
+     LEFT JOIN LATERAL (
+       SELECT candidate.global_id, candidate.row_version
+       FROM operations_commerce_order_candidates candidate
+       WHERE candidate.organization_id = orders.organization_id
+         AND candidate.integration_account_id = orders.integration_account_id
+         AND candidate.canonical_order_id = orders.id
+         AND candidate.workflow_state = 'promoted'
+       ORDER BY candidate.promoted_at DESC, candidate.id DESC
+       LIMIT 1
+     ) planning_candidate ON true
      LEFT JOIN operations_shopify_fulfillment_notification_policies notification_policy
        ON notification_policy.organization_id = orders.organization_id
       AND notification_policy.integration_account_id = orders.integration_account_id
@@ -2629,6 +2649,16 @@ async function readOrderDetail(
         }
       : null,
     fulfillmentPreparation,
+    planningPreparation:
+      row.integration_account_global_id
+      && row.planning_candidate_global_id
+      && row.planning_candidate_row_version !== null
+        ? {
+            accountGlobalId: row.integration_account_global_id,
+            candidateGlobalId: row.planning_candidate_global_id,
+            candidateRowVersion: Number(row.planning_candidate_row_version),
+          }
+        : null,
     fulfillmentNotificationPolicy: row.source_provider === 'shopify'
       ? {
           mode: 'clawpilot_explicit',

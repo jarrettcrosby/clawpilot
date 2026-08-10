@@ -709,6 +709,11 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     expiresAt: string
   } | null
   fulfillmentPreparation: OperationsShadowFulfillmentPreparation | null
+  planningPreparation: {
+    accountGlobalId: string
+    candidateGlobalId: string
+    candidateRowVersion: number
+  } | null
   fulfillmentNotificationPolicy:
     | {
       mode: 'clawpilot_explicit'
