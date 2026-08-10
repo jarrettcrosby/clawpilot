@@ -145,10 +145,12 @@ async function seedCanonicalPlanningFixture(
   {
     activationState = 'shadow',
     carrierReadEnvironment = 'sandbox',
+    checkoutServiceCode = null,
     customerChargeUse = 'eligible',
     duplicatePackageLine = false,
     packagingStockOnHand = 2,
     inventoryAuthority = 'shopify',
+    shopifyUnlistedChannel = false,
   } = {},
 ) {
   const suffix = randomUUID().slice(0, 8)
@@ -161,6 +163,23 @@ async function seedCanonicalPlanningFixture(
   const commerceEnvironment = localSplitAuthority
     ? 'production'
     : 'sandbox'
+  assert.equal(
+    localSplitAuthority && checkoutServiceCode !== null,
+    false,
+    'Only Shopify fixtures may retain a Shopify checkout service code',
+  )
+  assert.equal(
+    localSplitAuthority && shopifyUnlistedChannel,
+    false,
+    'Only Shopify fixtures may use an UNLISTED channel state',
+  )
+  const channelProviderStatusRaw = shopifyUnlistedChannel
+    ? 'UNLISTED'
+    : 'PUBLISHED'
+  const channelNormalizedStatus = shopifyUnlistedChannel
+    ? 'unlisted'
+    : 'active'
+  const channelProviderActive = !shopifyUnlistedChannel
   const email = `canonical-planning-${suffix}@example.com`
   await pool.query(
     `INSERT INTO app_users (email, role, status, display_name)
@@ -443,7 +462,7 @@ async function seedCanonicalPlanningFixture(
          $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7,
          $8::uuid, $9::uuid,
          'Canonical 6 oz test product', 'Default', $10,
-         'PUBLISHED', 'active', true, true, 170, now(), $11, $12,
+         $14, $15, $16, true, 170, now(), $11, $12,
          $13, $13
        )
        RETURNING id::text, pack_evidence_hash`,
@@ -461,6 +480,9 @@ async function seedCanonicalPlanningFixture(
         channelRevision,
         channelHash,
         email,
+        channelProviderStatusRaw,
+        channelNormalizedStatus,
+        channelProviderActive,
       ],
     )
     const packProfileResult = await pool.query(
@@ -510,7 +532,7 @@ async function seedCanonicalPlanningFixture(
          pack_evidence_hash, observed_at, is_current, created_by, updated_by
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-         $5, $6, $7, $8::uuid, 'active',
+         $5, $6, $7, $8::uuid, $13,
          'current', 'catalog', $9, $10, $11, now(), true, $12, $12
        )
        RETURNING id::text, global_id, row_version::text`,
@@ -527,6 +549,7 @@ async function seedCanonicalPlanningFixture(
         channelHash,
         channelStateResult.rows[0].pack_evidence_hash,
         email,
+        channelNormalizedStatus,
       ],
     )
     commercePackMapping = packMappingResult.rows[0]
@@ -700,6 +723,7 @@ async function seedCanonicalPlanningFixture(
     `INSERT INTO operations_commerce_order_candidates (
        organization_id, integration_account_id, pipeline_id, run_id,
        provider, external_order_id, order_number_snapshot, source_channel,
+       checkout_shipping_service_code,
        provider_order_status_raw, provider_financial_status_raw,
        provider_fulfillment_status_raw, provider_return_status_raw,
        normalized_order_status, normalized_payment_status,
@@ -719,7 +743,7 @@ async function seedCanonicalPlanningFixture(
        row_version, created_by, updated_by, expires_at
      ) VALUES (
        $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-       '${commerceProvider}', $5, $6, 'online_store',
+       '${commerceProvider}', $5, $6, 'online_store', $19,
        'open', 'paid', 'unfulfilled', 'none',
        'open', 'paid', 'unfulfilled', 'none',
        true, true, 'USD', 2000,
@@ -752,6 +776,7 @@ async function seedCanonicalPlanningFixture(
       `promote-${suffix}`,
       sha(`promote-request-${suffix}`),
       email,
+      checkoutServiceCode,
     ],
   )
   const candidate = candidateResult.rows[0]
@@ -1291,6 +1316,8 @@ async function seedCanonicalPlanningFixture(
     location,
     reserveLocation,
     inventoryPoolId,
+    commerceAccount,
+    commercePackMapping,
     expected: {
       checkoutChargeMinor:
         customerChargeUse === 'eligible' ? 1500 : null,
@@ -1299,6 +1326,126 @@ async function seedCanonicalPlanningFixture(
         customerChargeUse === 'eligible' ? 250 : null,
       packageCount: 2,
     },
+  }
+}
+
+async function installReceiptExemptUnlistedCheckoutMapping(pool, fixture) {
+  const retired = await pool.query(
+    `UPDATE operations_commerce_variant_pack_mappings
+     SET projection_state = 'stale',
+         is_current = false,
+         effective_to = GREATEST(
+           now(), effective_from + interval '1 microsecond'
+         ),
+         row_version = row_version + 1,
+         updated_at = now(),
+         updated_by = $5
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid
+       AND row_version = $3::bigint
+       AND is_current = true
+       AND projection_state = 'current'
+     RETURNING id::text, row_version::text, $4::text AS captured_global_id`,
+    [
+      fixture.organizationId,
+      fixture.commercePackMapping.id,
+      fixture.commercePackMapping.row_version,
+      fixture.commercePackMapping.global_id,
+      fixture.email,
+    ],
+  )
+  assert.equal(
+    retired.rowCount,
+    1,
+    'Candidate-captured catalog mapping must retire as stale',
+  )
+  const channel = await pool.query(
+    `SELECT
+       state.source_revision, state.source_hash, state.pack_evidence_hash,
+       state.normalized_status
+     FROM operations_product_channel_states state
+     WHERE state.organization_id = $1::uuid
+       AND state.integration_account_id = $2::uuid
+       AND state.product_id = $3::uuid
+       AND state.provider = 'shopify'
+     LIMIT 1`,
+    [
+      fixture.organizationId,
+      fixture.commerceAccount.id,
+      fixture.product.id,
+    ],
+  )
+  assert.equal(
+    channel.rows[0]?.normalized_status,
+    'unlisted',
+    'Late exact mapping fixture must retain the truthful UNLISTED channel',
+  )
+
+  // The checkout-mapping trigger's activation fences have their own dedicated
+  // PostgreSQL acceptance. This fixture injects only the current exact mapping
+  // needed to isolate the promoted-order cartonization read boundary.
+  await pool.query(
+    `ALTER TABLE operations_commerce_variant_pack_mappings
+       DISABLE TRIGGER validate_operations_commerce_variant_pack_mapping`,
+  )
+  let mapping
+  try {
+    mapping = await pool.query(
+      `INSERT INTO operations_commerce_variant_pack_mappings (
+         organization_id, integration_account_id, pipeline_id, product_id,
+         provider, external_product_id, external_variant_id,
+         default_pack_profile_version_id, provider_lifecycle_state,
+         projection_state, mapping_purpose, source_revision, source_hash,
+         pack_evidence_hash, observed_at, is_current, created_by, updated_by
+       )
+       SELECT
+         old.organization_id, old.integration_account_id,
+         old.pipeline_id, old.product_id, old.provider,
+         old.external_product_id, old.external_variant_id,
+         old.default_pack_profile_version_id, $3,
+         'current', 'shopify_checkout', $4, $5, $6,
+         now(), true, $7, $7
+       FROM operations_commerce_variant_pack_mappings old
+       WHERE old.organization_id = $1::uuid
+         AND old.id = $2::uuid
+       RETURNING id::text, global_id, row_version::text`,
+      [
+        fixture.organizationId,
+        fixture.commercePackMapping.id,
+        channel.rows[0].normalized_status,
+        channel.rows[0].source_revision,
+        channel.rows[0].source_hash,
+        channel.rows[0].pack_evidence_hash,
+        fixture.email,
+      ],
+    )
+  } finally {
+    await pool.query(
+      `ALTER TABLE operations_commerce_variant_pack_mappings
+         ENABLE TRIGGER validate_operations_commerce_variant_pack_mapping`,
+    )
+  }
+  assert.equal(mapping.rowCount, 1)
+  const receipts = await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_shopify_checkout_rate_current_reconciliations
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND order_candidate_id = $3::uuid`,
+    [
+      fixture.organizationId,
+      fixture.commerceAccount.id,
+      fixture.candidate.id,
+    ],
+  )
+  assert.equal(
+    receipts.rows[0].count,
+    0,
+    'Receipt-exempt fixture must not invent checkout reconciliation',
+  )
+  return {
+    mapping: mapping.rows[0],
+    retiredCapture: retired.rows[0],
   }
 }
 
@@ -2475,10 +2622,15 @@ async function verifyCanonicalPlanning(databaseUrl) {
         },
       },
     )
+    const shopifyCheckoutChannelEligibility = loadTypeScriptModule(
+      'app_src/lib/integrations/shopifyCheckoutChannelEligibility.ts',
+    )
     const hybridCartonizationPersistence = loadTypeScriptModule(
       'app_src/lib/persistence/hybridCartonization.ts',
       {
         mocks: {
+          '@/lib/integrations/shopifyCheckoutChannelEligibility':
+            shopifyCheckoutChannelEligibility,
           '@/lib/persistence/postgres': postgres,
           '@/lib/persistence/shopifyCheckoutRating': {
             shopifyCheckoutRateLineageIsRequired: (serviceCode) => (
@@ -2701,7 +2853,14 @@ async function verifyCanonicalPlanning(databaseUrl) {
         .sort(),
     )
 
-    const shopifyInventoryFixture = await seedCanonicalPlanningFixture(pool)
+    const shopifyInventoryFixture = await seedCanonicalPlanningFixture(pool, {
+      checkoutServiceCode: 'clawpilot:dev:test-zero',
+      shopifyUnlistedChannel: true,
+    })
+    const lateMapping = await installReceiptExemptUnlistedCheckoutMapping(
+      pool,
+      shopifyInventoryFixture,
+    )
     const shopifyAccount = await pool.query(
       `SELECT global_id
        FROM operations_integration_accounts
@@ -2744,6 +2903,104 @@ async function verifyCanonicalPlanning(databaseUrl) {
       shopifyCartonizationInput.inventory.products[0]
         .availabilityAuthority,
       'shopify_provider_commitment',
+    )
+
+    const capturedMappingState = await pool.query(
+      `SELECT
+         line.commerce_variant_pack_mapping_id::text AS captured_mapping_id,
+         line.commerce_variant_pack_mapping_row_version::text
+           AS captured_mapping_row_version,
+         mapping.projection_state,
+         mapping.is_current,
+         mapping.row_version::text AS current_mapping_row_version
+       FROM operations_commerce_order_candidate_lines line
+       JOIN operations_commerce_variant_pack_mappings mapping
+         ON mapping.organization_id = line.organization_id
+        AND mapping.id = line.commerce_variant_pack_mapping_id
+       WHERE line.organization_id = $1::uuid
+         AND line.id = $2::uuid`,
+      [
+        shopifyInventoryFixture.organizationId,
+        shopifyInventoryFixture.candidateLine.id,
+      ],
+    )
+    assert.deepEqual(capturedMappingState.rows[0], {
+      captured_mapping_id: shopifyInventoryFixture.commercePackMapping.id,
+      captured_mapping_row_version:
+        shopifyInventoryFixture.commercePackMapping.row_version,
+      projection_state: 'stale',
+      is_current: false,
+      current_mapping_row_version:
+        lateMapping.retiredCapture.row_version,
+    })
+    assert.equal(shopifyCartonizationInput.lineEvidence.length, 1)
+    assert.deepEqual(
+      {
+        mappingGlobalId:
+          shopifyCartonizationInput.lineEvidence[0]
+            .variantPackMappingGlobalId,
+        checkoutReceiptGlobalId:
+          shopifyCartonizationInput.lineEvidence[0]
+            .checkoutReceiptGlobalId,
+        fulfillmentPackSource:
+          shopifyCartonizationInput.lineEvidence[0]
+            .fulfillmentPackSource,
+        accountEnvironment:
+          shopifyCartonizationInput.lineEvidence[0]
+            .fulfillmentPackEvidence.accountEnvironment,
+        providerStatusRaw:
+          shopifyCartonizationInput.lineEvidence[0]
+            .fulfillmentPackEvidence.channelProviderStatusRaw,
+        normalizedStatus:
+          shopifyCartonizationInput.lineEvidence[0]
+            .fulfillmentPackEvidence.channelNormalizedStatus,
+        providerActive:
+          shopifyCartonizationInput.lineEvidence[0]
+            .fulfillmentPackEvidence.channelProviderActive,
+      },
+      {
+        mappingGlobalId: lateMapping.mapping.global_id,
+        checkoutReceiptGlobalId: null,
+        fulfillmentPackSource: 'current_shopify_checkout_mapping',
+        accountEnvironment: 'sandbox',
+        providerStatusRaw: 'UNLISTED',
+        normalizedStatus: 'unlisted',
+        providerActive: false,
+      },
+      'Receipt-exempt promoted Shopify order must replace stale capture with the current exact UNLISTED mapping without a receipt',
+    )
+    const genuineClawPilotFixture = await seedCanonicalPlanningFixture(pool, {
+      checkoutServiceCode: 'clawpilot:ups:03',
+    })
+    await assert.rejects(
+      () => hybridCartonizationPersistence
+        .readHybridCartonizationInputFromPostgres({
+          organizationId: genuineClawPilotFixture.organizationId,
+          accountGlobalId:
+            genuineClawPilotFixture.commerceAccount.global_id,
+          candidateGlobalId: genuineClawPilotFixture.candidate.global_id,
+          expectedCandidateRowVersion: Number(
+            genuineClawPilotFixture.candidate.row_version,
+          ),
+          warehouseGlobalId: genuineClawPilotFixture.warehouse.global_id,
+          mode: 'production',
+          selectedMaterials: [{
+            materialGlobalId: genuineClawPilotFixture.material.global_id,
+            expectedRowVersion: Number(
+              genuineClawPilotFixture.material.row_version,
+            ),
+          }],
+          assumedCommittedQuantities: [],
+        }),
+      (error) => {
+        assert.equal(
+          error.code,
+          'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID',
+        )
+        assert.equal(error.status, 409)
+        return true
+      },
+      'A genuine ClawPilot carrier rate must remain fail-closed without its exact checkout receipt',
     )
 
     const upgradeFixture = await seedCanonicalPlanningFixture(pool)

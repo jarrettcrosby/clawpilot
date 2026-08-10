@@ -5,6 +5,9 @@ import type {
   HybridCartonizationMaterial,
   HybridCartonizationRecipe,
 } from '@/lib/operations/hybridCartonization'
+import {
+  isShopifySandboxCheckoutChannelEligible,
+} from '@/lib/integrations/shopifyCheckoutChannelEligibility'
 import { getPostgresPool } from '@/lib/persistence/postgres'
 import {
   shopifyCheckoutRateLineageIsRequired,
@@ -166,6 +169,7 @@ export type ShopifyCheckoutPackBaseline = {
 export type ShopifyFulfillmentPackEvidence = {
   providerProductId: string
   providerVariantId: string
+  accountEnvironment: 'mock' | 'sandbox' | 'production'
   mappingPurpose: 'shopify_checkout'
   mappingGlobalId: string
   mappingRowVersion: number
@@ -175,8 +179,9 @@ export type ShopifyFulfillmentPackEvidence = {
   channelSourceRevision: string
   channelSourceHash: string
   channelPackEvidenceHash: string
-  channelNormalizedStatus: 'active'
-  channelProviderActive: true
+  channelProviderStatusRaw: string
+  channelNormalizedStatus: 'active' | 'unlisted'
+  channelProviderActive: boolean
   channelRequiresShipping: true
   profileVersionGlobalId: string
   profileRowVersion: number
@@ -199,6 +204,7 @@ type AccountRow = {
   id: string
   global_id: string
   provider: 'shopify' | 'faire'
+  environment: 'mock' | 'sandbox' | 'production'
   status: 'active' | 'disabled' | 'error'
 }
 
@@ -271,6 +277,7 @@ type InventoryRunRow = {
 type CandidateLineRow = {
   global_id: string
   provider: 'shopify' | 'faire'
+  account_environment: AccountRow['environment']
   product_id: string | null
   product_global_id: string | null
   product_title_snapshot: string
@@ -395,6 +402,7 @@ type CurrentFulfillmentPackRow = {
   channel_source_revision: string | null
   channel_source_hash: string | null
   channel_pack_evidence_hash: string | null
+  channel_provider_status_raw: string | null
   channel_normalized_status: string | null
   channel_provider_active: boolean | null
   channel_requires_shipping: boolean | null
@@ -991,9 +999,17 @@ export function buildShopifyFulfillmentPackEvidence(
     || !row.channel_source_revision
     || !row.channel_source_hash
     || !row.channel_pack_evidence_hash
-    || row.channel_normalized_status !== 'active'
-    || row.channel_provider_active !== true
-    || row.channel_requires_shipping !== true
+    || !row.channel_provider_status_raw
+    || !isHybridCartonizationFulfillmentChannelEligible({
+      provider: row.provider,
+      accountEnvironment: row.account_environment,
+      providerStatusRaw: row.channel_provider_status_raw,
+      normalizedStatus: row.channel_normalized_status,
+      providerActive: row.channel_provider_active,
+      requiresShipping: row.channel_requires_shipping,
+      weightGrams: row.channel_weight_grams,
+      mappingPurpose: row.pack_mapping_purpose,
+    })
     || !row.pack_profile_version_global_id
     || row.current_pack_profile_row_version === null
     || !row.pack_profile_fit_model
@@ -1013,6 +1029,7 @@ export function buildShopifyFulfillmentPackEvidence(
   return {
     providerProductId: row.external_product_id,
     providerVariantId: row.external_variant_id,
+    accountEnvironment: row.account_environment,
     mappingPurpose: 'shopify_checkout',
     mappingGlobalId: row.pack_mapping_global_id,
     mappingRowVersion: exactInteger(
@@ -1025,8 +1042,10 @@ export function buildShopifyFulfillmentPackEvidence(
     channelSourceRevision: row.channel_source_revision,
     channelSourceHash: row.channel_source_hash,
     channelPackEvidenceHash: row.channel_pack_evidence_hash,
-    channelNormalizedStatus: 'active',
-    channelProviderActive: true,
+    channelProviderStatusRaw: row.channel_provider_status_raw,
+    channelNormalizedStatus: row.channel_normalized_status as
+      'active' | 'unlisted',
+    channelProviderActive: row.channel_provider_active as boolean,
     channelRequiresShipping: true,
     profileVersionGlobalId: row.pack_profile_version_global_id,
     profileRowVersion: exactInteger(
@@ -1385,6 +1404,55 @@ export function hybridCartonizationInventoryProjectionStates(
     : ['projected']
 }
 
+export function isHybridCartonizationFulfillmentChannelEligible(input: {
+  provider: CandidateLineRow['provider']
+  accountEnvironment: AccountRow['environment']
+  providerStatusRaw: string | null
+  normalizedStatus: string | null
+  providerActive: boolean | null
+  requiresShipping: boolean | null
+  weightGrams: number | null
+  mappingPurpose: CandidateLineRow['pack_mapping_purpose']
+}) {
+  const provider = input.provider.trim().toLowerCase()
+  const providerStatusRaw = input.providerStatusRaw?.trim().toLowerCase()
+  const activeChannel = (
+    input.normalizedStatus === 'active'
+    && input.providerActive === true
+    && input.requiresShipping === true
+    && (provider !== 'shopify' || providerStatusRaw === 'active')
+  )
+  return activeChannel || (
+    input.mappingPurpose === 'shopify_checkout'
+    && isShopifySandboxCheckoutChannelEligible({
+      provider: input.provider,
+      accountEnvironment: input.accountEnvironment,
+      providerStatusRaw: input.providerStatusRaw,
+      normalizedStatus: input.normalizedStatus,
+      providerActive: input.providerActive,
+      requiresShipping: input.requiresShipping,
+      weightGrams: input.weightGrams,
+    })
+  )
+}
+
+export function shouldResolveCurrentShopifyFulfillmentPackLineage(input: {
+  mode: HybridCartonizationReadRequest['mode']
+  provider: AccountRow['provider']
+  accountEnvironment: AccountRow['environment']
+  checkoutServiceCode: string | null
+  hasMatchedCheckoutReceipt: boolean
+}) {
+  return input.provider === 'shopify' && (
+    input.hasMatchedCheckoutReceipt
+    || (
+      input.mode === 'production'
+      && input.accountEnvironment === 'sandbox'
+      && !shopifyCheckoutRateLineageIsRequired(input.checkoutServiceCode)
+    )
+  )
+}
+
 async function readAccount(
   client: PoolClient,
   input: HybridCartonizationReadRequest,
@@ -1394,6 +1462,7 @@ async function readAccount(
        account.id::text,
        account.global_id,
        account.provider,
+       account.environment,
        account.status
      FROM operations_integration_accounts account
      WHERE account.organization_id = $1::uuid
@@ -1796,6 +1865,7 @@ async function readCurrentFulfillmentPackLineage(
        channel_state.source_revision AS channel_source_revision,
        channel_state.source_hash AS channel_source_hash,
        channel_state.pack_evidence_hash AS channel_pack_evidence_hash,
+       channel_state.provider_status_raw AS channel_provider_status_raw,
        channel_state.normalized_status AS channel_normalized_status,
        channel_state.provider_active AS channel_provider_active,
        channel_state.requires_shipping AS channel_requires_shipping,
@@ -1881,6 +1951,7 @@ async function readCurrentFulfillmentPackLineage(
 export function applyCurrentFulfillmentPackLineage(
   candidateRows: CandidateLineRow[],
   currentRows: CurrentFulfillmentPackRow[],
+  options: { preserveCandidateWhenMissing?: boolean } = {},
 ) {
   const currentByLine = new Map<string, CurrentFulfillmentPackRow>()
   for (const row of currentRows) {
@@ -1896,6 +1967,7 @@ export function applyCurrentFulfillmentPackLineage(
   return candidateRows.map((row): CandidateLineRow => {
     const current = currentByLine.get(row.global_id)
     if (!current?.pack_mapping_id) {
+      if (options.preserveCandidateWhenMissing) return row
       return {
         ...row,
         mapping_state: 'unresolved',
@@ -1913,6 +1985,7 @@ export function applyCurrentFulfillmentPackLineage(
         channel_source_revision: null,
         channel_source_hash: null,
         channel_pack_evidence_hash: null,
+        channel_provider_status_raw: null,
         channel_normalized_status: null,
         channel_provider_active: null,
         channel_requires_shipping: null,
@@ -1989,6 +2062,8 @@ export function applyCurrentFulfillmentPackLineage(
       channel_source_revision: current.channel_source_revision,
       channel_source_hash: current.channel_source_hash,
       channel_pack_evidence_hash: current.channel_pack_evidence_hash,
+      channel_provider_status_raw:
+        current.channel_provider_status_raw,
       channel_normalized_status: current.channel_normalized_status,
       channel_provider_active: current.channel_provider_active,
       channel_requires_shipping: current.channel_requires_shipping,
@@ -2041,6 +2116,7 @@ async function readCandidateLines(
     `SELECT
        line.global_id,
        line.provider,
+       $4::text AS account_environment,
        line.product_id::text,
        product.reference_code AS product_global_id,
        line.product_title_snapshot,
@@ -2145,7 +2221,7 @@ async function readCandidateLines(
        AND line.order_candidate_id = $3::uuid
        AND line.requires_shipping = true
      ORDER BY line.created_at, line.id`,
-    [input.organizationId, account.id, candidate.id],
+    [input.organizationId, account.id, candidate.id, account.environment],
   )
   if (result.rows.length === 0) {
     fail(
@@ -2163,7 +2239,15 @@ async function readCandidateLines(
   const checkoutLineageRows = matched
     ? applyMatchedCheckoutPackLineage(result.rows, matched)
     : result.rows
-  const lineageRows = matched
+  const resolveCurrentFulfillment =
+    shouldResolveCurrentShopifyFulfillmentPackLineage({
+      mode: input.mode,
+      provider: account.provider,
+      accountEnvironment: account.environment,
+      checkoutServiceCode: candidate.checkout_shipping_service_code,
+      hasMatchedCheckoutReceipt: matched !== null,
+    })
+  const lineageRows = resolveCurrentFulfillment
     ? applyCurrentFulfillmentPackLineage(
         checkoutLineageRows,
         await readCurrentFulfillmentPackLineage(
@@ -2172,6 +2256,7 @@ async function readCandidateLines(
           account,
           candidate,
         ),
+        { preserveCandidateWhenMissing: matched === null },
       )
     : checkoutLineageRows
   const unfulfilledRows = lineageRows.filter((row) => (
@@ -2234,6 +2319,17 @@ export function mapCandidateLines(
       && row.channel_requires_shipping === null
       && row.requires_shipping === true
     )
+    const eligibleCurrentChannel =
+      isHybridCartonizationFulfillmentChannelEligible({
+        provider: row.provider,
+        accountEnvironment: row.account_environment,
+        providerStatusRaw: row.channel_provider_status_raw,
+        normalizedStatus: row.channel_normalized_status,
+        providerActive: row.channel_provider_active,
+        requiresShipping: row.channel_requires_shipping,
+        weightGrams: row.channel_weight_grams,
+        mappingPurpose: row.pack_mapping_purpose,
+      })
     if (
       !row.product_id
       || !row.product_global_id
@@ -2253,18 +2349,7 @@ export function mapCandidateLines(
       || !row.channel_pack_evidence_hash
       || !row.channel_source_revision
       || !row.channel_source_hash
-      || (
-        !publishedFaireOrderCapture
-        && row.channel_normalized_status !== 'active'
-      )
-      || (
-        !publishedFaireOrderCapture
-        && row.channel_provider_active !== true
-      )
-      || (
-        !publishedFaireOrderCapture
-        && row.channel_requires_shipping !== true
-      )
+      || (!publishedFaireOrderCapture && !eligibleCurrentChannel)
       || !row.pack_profile_version_id
       || !row.pack_profile_version_global_id
       || row.captured_pack_profile_row_version === null

@@ -88,6 +88,39 @@ vm.runInNewContext(output, {
         shopifyCheckoutRatingHash,
       }
     }
+    if (
+      specifier ===
+      '@/lib/integrations/shopifyCheckoutChannelEligibility'
+    ) {
+      return {
+        isShopifySandboxCheckoutChannelEligible(input) {
+          const normalizedStatus = String(
+            input.normalizedStatus || '',
+          ).trim().toLowerCase()
+          const providerStatusRaw = String(
+            input.providerStatusRaw || '',
+          ).trim().toLowerCase()
+          const lifecycleEligible = (
+            normalizedStatus === 'active'
+            && providerStatusRaw === 'active'
+            && input.providerActive === true
+          ) || (
+            normalizedStatus === 'unlisted'
+            && providerStatusRaw === 'unlisted'
+            && input.providerActive === false
+          )
+          return (
+            String(input.provider || '').trim().toLowerCase() === 'shopify'
+            && String(input.accountEnvironment || '')
+              .trim().toLowerCase() === 'sandbox'
+            && lifecycleEligible
+            && input.requiresShipping === true
+            && Number.isSafeInteger(input.weightGrams)
+            && Number(input.weightGrams) > 0
+          )
+        },
+      }
+    }
     return requireFromApp(specifier)
   },
 }, { filename: sourcePath })
@@ -102,9 +135,11 @@ const {
   HybridCartonizationPersistenceError,
   evaluateHybridCartonizationInventoryAvailability,
   hybridCartonizationInventoryProjectionStates,
+  isHybridCartonizationFulfillmentChannelEligible,
   mapCandidateLines,
   normalizeHybridCartonizationReadRequest,
   resolveOperationalShopifyCheckoutReconciliation,
+  shouldResolveCurrentShopifyFulfillmentPackLineage,
 } = module.exports
 
 const matchedCheckoutDecision = {
@@ -155,6 +190,61 @@ assert.equal(
   }),
   null,
   'A test or manually entered shipping code must not impersonate genuine ClawPilot carrier-rate lineage',
+)
+assert.equal(
+  shouldResolveCurrentShopifyFulfillmentPackLineage({
+    mode: 'production',
+    provider: 'shopify',
+    accountEnvironment: 'sandbox',
+    checkoutServiceCode: 'clawpilot:dev:test-zero',
+    hasMatchedCheckoutReceipt: false,
+  }),
+  true,
+  'A promoted receipt-exempt Shopify order must resolve its exact current fulfillment mapping',
+)
+assert.equal(
+  shouldResolveCurrentShopifyFulfillmentPackLineage({
+    mode: 'production',
+    provider: 'shopify',
+    accountEnvironment: 'sandbox',
+    checkoutServiceCode: 'clawpilot:ups:03',
+    hasMatchedCheckoutReceipt: false,
+  }),
+  false,
+  'A genuine ClawPilot rate must never resolve current mapping without its required receipt',
+)
+assert.equal(
+  shouldResolveCurrentShopifyFulfillmentPackLineage({
+    mode: 'production',
+    provider: 'shopify',
+    accountEnvironment: 'production',
+    checkoutServiceCode: 'clawpilot:ups:03',
+    hasMatchedCheckoutReceipt: true,
+  }),
+  true,
+  'A matched genuine checkout must preserve receipt A while resolving current fulfillment mapping B',
+)
+assert.equal(
+  shouldResolveCurrentShopifyFulfillmentPackLineage({
+    mode: 'sandbox_demo',
+    provider: 'shopify',
+    accountEnvironment: 'sandbox',
+    checkoutServiceCode: 'clawpilot:dev:test-zero',
+    hasMatchedCheckoutReceipt: false,
+  }),
+  false,
+  'The late-mapping exception is only for promoted operational planning',
+)
+assert.equal(
+  shouldResolveCurrentShopifyFulfillmentPackLineage({
+    mode: 'production',
+    provider: 'shopify',
+    accountEnvironment: 'production',
+    checkoutServiceCode: 'clawpilot:dev:test-zero',
+    hasMatchedCheckoutReceipt: false,
+  }),
+  false,
+  'A production Shopify account must retain candidate-captured evidence for receipt-exempt imports',
 )
 
 const matchedCheckoutLineage = {
@@ -329,6 +419,7 @@ for (const missingField of [
 const fulfillmentCandidate = {
   global_id: 'gcol0000001',
   provider: 'shopify',
+  account_environment: 'sandbox',
   product_id: '00000000-0000-4000-8000-000000000010',
   product_global_id: 'gp0000001',
   product_title_snapshot: 'Test Product',
@@ -533,6 +624,7 @@ const currentFulfillmentRow = {
     channel_source_revision: 'source-revision-b',
     channel_source_hash: 'source-hash-b',
     channel_pack_evidence_hash: 'b'.repeat(64),
+    channel_provider_status_raw: 'ACTIVE',
     channel_normalized_status: 'active',
     channel_provider_active: true,
     channel_requires_shipping: true,
@@ -585,6 +677,7 @@ assert.deepEqual(
   {
     providerProductId: 'gid://shopify/Product/10',
     providerVariantId: 'gid://shopify/ProductVariant/20',
+    accountEnvironment: 'sandbox',
     mappingPurpose: 'shopify_checkout',
     mappingGlobalId: 'gcvm0000002',
     mappingRowVersion: 1,
@@ -594,6 +687,7 @@ assert.deepEqual(
     channelSourceRevision: 'source-revision-b',
     channelSourceHash: 'source-hash-b',
     channelPackEvidenceHash: 'b'.repeat(64),
+    channelProviderStatusRaw: 'ACTIVE',
     channelNormalizedStatus: 'active',
     channelProviderActive: true,
     channelRequiresShipping: true,
@@ -611,10 +705,195 @@ assert.deepEqual(
   },
   'Fulfillment evidence must durably retain mapping B hashes, identity, version, and physical facts',
 )
+const lateMappedReceiptExempt = applyCurrentFulfillmentPackLineage(
+  [{
+    ...fulfillmentCandidate,
+    mapping_state: 'unresolved',
+    packaging_state: 'unresolved',
+    packaging_source: 'manual_package',
+    packaging_weight_source: 'provider_order',
+    pack_mapping_id: null,
+    pack_mapping_global_id: null,
+    captured_pack_mapping_row_version: null,
+    current_pack_mapping_row_version: null,
+    pack_profile_version_id: null,
+    pack_profile_version_global_id: null,
+    captured_pack_profile_row_version: null,
+    current_pack_profile_row_version: null,
+    pack_lineage_source: 'order_candidate_capture',
+    checkout_receipt_global_id: null,
+    checkout_pack_baseline: null,
+  }],
+  [currentFulfillmentRow],
+)[0]
+const mappedLateReceiptExempt = mapCandidateLines(
+  { mode: 'production' },
+  [lateMappedReceiptExempt],
+)[0]
+assert.equal(
+  mappedLateReceiptExempt.evidence.variantPackMappingGlobalId,
+  'gcvm0000002',
+  'A receipt-exempt promoted Shopify order must use the exact late current mapping',
+)
+assert.equal(
+  mappedLateReceiptExempt.evidence.checkoutReceiptGlobalId,
+  null,
+  'Late current fulfillment mapping must not invent checkout receipt lineage',
+)
+assert.equal(
+  mappedLateReceiptExempt.evidence.fulfillmentPackSource,
+  'current_shopify_checkout_mapping',
+  'Late current mapping authority must be explicit in durable line evidence',
+)
+const preservedReceiptExemptCapture =
+  applyCurrentFulfillmentPackLineage(
+    [{
+      ...fulfillmentCandidate,
+      channel_normalized_status: 'active',
+      channel_provider_active: true,
+      channel_requires_shipping: true,
+      pack_lineage_source: 'order_candidate_capture',
+      checkout_receipt_global_id: null,
+      checkout_pack_baseline: null,
+    }],
+    [],
+    { preserveCandidateWhenMissing: true },
+  )[0]
+assert.equal(
+  preservedReceiptExemptCapture.pack_mapping_global_id,
+  fulfillmentCandidate.pack_mapping_global_id,
+  'A receipt-exempt import must retain valid candidate capture when no current checkout mapping exists',
+)
+assert.doesNotThrow(
+  () => mapCandidateLines(
+    { mode: 'production' },
+    [preservedReceiptExemptCapture],
+  ),
+  'Valid candidate-captured pack evidence remains usable for receipt-exempt imports',
+)
+
+const sandboxUnlistedFulfillment = applyCurrentFulfillmentPackLineage(
+  [fulfillmentCandidate],
+  [{
+    ...currentFulfillmentRow,
+    channel_provider_status_raw: 'UNLISTED',
+    channel_normalized_status: 'unlisted',
+    channel_provider_active: false,
+  }],
+)[0]
+assert.equal(
+  isHybridCartonizationFulfillmentChannelEligible({
+    provider: sandboxUnlistedFulfillment.provider,
+    accountEnvironment: sandboxUnlistedFulfillment.account_environment,
+    providerStatusRaw:
+      sandboxUnlistedFulfillment.channel_provider_status_raw,
+    normalizedStatus:
+      sandboxUnlistedFulfillment.channel_normalized_status,
+    providerActive: sandboxUnlistedFulfillment.channel_provider_active,
+    requiresShipping:
+      sandboxUnlistedFulfillment.channel_requires_shipping,
+    weightGrams: sandboxUnlistedFulfillment.channel_weight_grams,
+    mappingPurpose: sandboxUnlistedFulfillment.pack_mapping_purpose,
+  }),
+  true,
+  'Truthful Shopify sandbox UNLISTED evidence is eligible for fulfillment',
+)
+const mappedSandboxUnlisted = mapCandidateLines(
+  { mode: 'production' },
+  [sandboxUnlistedFulfillment],
+)[0]
+assert.deepEqual(
+  {
+    accountEnvironment:
+      mappedSandboxUnlisted.evidence.fulfillmentPackEvidence
+        .accountEnvironment,
+    providerStatusRaw:
+      mappedSandboxUnlisted.evidence.fulfillmentPackEvidence
+        .channelProviderStatusRaw,
+    normalizedStatus:
+      mappedSandboxUnlisted.evidence.fulfillmentPackEvidence
+        .channelNormalizedStatus,
+    providerActive:
+      mappedSandboxUnlisted.evidence.fulfillmentPackEvidence
+        .channelProviderActive,
+  },
+  {
+    accountEnvironment: 'sandbox',
+    providerStatusRaw: 'UNLISTED',
+    normalizedStatus: 'unlisted',
+    providerActive: false,
+  },
+  'Fulfillment evidence must retain truthful sandbox UNLISTED lifecycle facts',
+)
+for (const [label, candidatePatch, currentPatch] of [
+  ['production environment', { account_environment: 'production' }, {}],
+  ['mock environment', { account_environment: 'mock' }, {}],
+  ['raw lifecycle mismatch', {}, { channel_provider_status_raw: 'ACTIVE' }],
+  ['provider-active mismatch', {}, { channel_provider_active: true }],
+  ['non-shipping variant', {}, { channel_requires_shipping: false }],
+  ['zero provider weight', {}, { channel_weight_grams: 0 }],
+]) {
+  const invalidUnlistedFulfillment =
+    applyCurrentFulfillmentPackLineage(
+      [{ ...fulfillmentCandidate, ...candidatePatch }],
+      [{
+        ...currentFulfillmentRow,
+        channel_provider_status_raw: 'UNLISTED',
+        channel_normalized_status: 'unlisted',
+        channel_provider_active: false,
+        ...currentPatch,
+      }],
+    )[0]
+  assert.throws(
+    () => mapCandidateLines(
+      { mode: 'production' },
+      [invalidUnlistedFulfillment],
+    ),
+    (error) => (
+      error instanceof HybridCartonizationPersistenceError
+      && error.code
+        === 'HYBRID_CARTONIZATION_FULFILLMENT_PACK_EVIDENCE_INVALID'
+    ),
+    `Shopify UNLISTED fulfillment must reject ${label}`,
+  )
+}
+const sandboxUnlistedCatalogMapping =
+  applyCurrentFulfillmentPackLineage(
+    [fulfillmentCandidate],
+    [{
+      ...currentFulfillmentRow,
+      pack_mapping_purpose: 'catalog',
+      channel_provider_status_raw: 'UNLISTED',
+      channel_normalized_status: 'unlisted',
+      channel_provider_active: false,
+    }],
+  )[0]
+assert.throws(
+  () => mapCandidateLines(
+    { mode: 'production' },
+    [sandboxUnlistedCatalogMapping],
+  ),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code
+      === 'HYBRID_CARTONIZATION_FULFILLMENT_PACK_MAPPING_REQUIRED'
+  ),
+  'Shopify sandbox UNLISTED must not accept a catalog mapping as checkout authority',
+)
+assert.doesNotThrow(
+  () => mapCandidateLines(
+    { mode: 'production' },
+    [{ ...currentFulfillment, account_environment: 'production' }],
+  ),
+  'A truthful ACTIVE Shopify production channel remains eligible',
+)
 for (const [label, channelEligibilityPatch] of [
   ['inactive channel status', { channel_normalized_status: 'archived' }],
   ['provider-inactive channel', { channel_provider_active: false }],
   ['non-shipping channel', { channel_requires_shipping: false }],
+  ['raw active lifecycle mismatch', {
+    channel_provider_status_raw: 'UNLISTED',
+  }],
 ]) {
   const ineligibleCurrentFulfillment = applyCurrentFulfillmentPackLineage(
     [fulfillmentCandidate],
