@@ -133,6 +133,8 @@ for (const fragment of [
   "'/api/auth/google/link'",
   "'Idempotency-Key'",
   'expectedPolicyRowVersion: policy.rowVersion',
+  'Retry Google link',
+  'existing?.remove()',
 ]) {
   assert.ok(settings.includes(fragment), `Google security settings UI missing ${fragment}`)
 }
@@ -147,6 +149,7 @@ for (const fragment of [
   'endpoint("/api/auth/google/link")',
   'expectedPolicyRowVersion',
   'forHTTPHeaderField: "Idempotency-Key"',
+  'if let envelope, let code = envelope.code',
 ]) {
   assert.ok(nativeAdapter.includes(fragment), `Native Google account-link API missing ${fragment}`)
 }
@@ -158,6 +161,9 @@ for (const fragment of [
   'GIDSignIn.sharedInstance.signOut()',
   'expectedPolicyRowVersion: state.rowVersion',
   'Other users must link their own account.',
+  'where code == "GOOGLE_SSO_LINK_REQUIRED"',
+  'expectedPolicyRowVersion: state.rowVersion',
+  'idempotencyKey: UUID().uuidString',
 ]) {
   assert.ok(nativeModel.includes(fragment), `Native per-user Google linking flow missing ${fragment}`)
 }

@@ -13,11 +13,24 @@ const help = args.has('--help') || args.has('-h')
 const pollIntervalMs = positiveInteger(process.env.CLAWPILOT_PRINT_AGENT_POLL_MS, 2_000)
 const printerPort = positiveInteger(process.env.CLAWPILOT_PRINTER_PORT, 9_100)
 const printerHost = String(process.env.CLAWPILOT_PRINTER_HOST || '').trim()
+const bundledLabelMedia = Object.freeze([
+  'label_2x1',
+  'label_3x1',
+  'label_4x2',
+  'label_4x6',
+  'label_4x8',
+])
 const workerCapabilities = Object.freeze({
+  formats: ['ZPL'],
+  media: bundledLabelMedia,
+  documentTypes: ['shipping_label', 'product_label', 'location_label'],
+})
+const legacyWorkerCapabilities = Object.freeze({
   formats: ['ZPL'],
   media: ['label_4x6'],
   documentTypes: ['shipping_label'],
 })
+let activeWorkerCapabilities = workerCapabilities
 const ledgerPath = expandHome(
   process.env.CLAWPILOT_PRINT_AGENT_LEDGER
     || '~/.clawpilot/print-agent-ledger.json',
@@ -43,7 +56,8 @@ Options:
   --probe   Test the raw printer connection without claiming work
 
 Runtime capability:
-  Raw UTF-8 ZPL shipping labels on 4 x 6 label media only
+  Raw UTF-8 ZPL carrier labels on 4 x 6 or 4 x 8 media, plus product and
+  location barcode labels on 2 x 1, 3 x 1, 4 x 2, 4 x 6, or 4 x 8 media
 `)
   process.exit(0)
 }
@@ -142,9 +156,21 @@ async function agentRequest(config, action, payload, key) {
   const result = await response.json().catch(() => ({}))
   if (!response.ok || result.ok !== true) {
     const code = String(result.code || `HTTP_${response.status}`)
-    throw new Error(`Print-agent ${action} failed (${code})`)
+    const error = new Error(`Print-agent ${action} failed (${code})`)
+    error.code = code
+    throw error
   }
   return result
+}
+
+function documentMediaIsSupported(document) {
+  if (document?.type === 'shipping_label') {
+    return document.media === 'label_4x6' || document.media === 'label_4x8'
+  }
+  if (document?.type === 'product_label' || document?.type === 'location_label') {
+    return bundledLabelMedia.includes(document.media)
+  }
+  return false
 }
 
 function decodeAndVerify(job) {
@@ -155,8 +181,11 @@ function decodeAndVerify(job) {
     || document?.format !== 'ZPL'
     || document?.encoding !== 'utf8'
     || typeof document?.inlinePayload !== 'string'
+    || !documentMediaIsSupported(document)
   ) {
-    throw new Error('This Zebra worker only accepts inline UTF-8 ZPL artifacts')
+    throw new Error(
+      'This Zebra worker only accepts supported inline UTF-8 ZPL carrier or barcode label artifacts',
+    )
   }
   const payload = Buffer.from(document.inlinePayload, 'utf8')
   const digest = createHash('sha256').update(payload).digest('hex')
@@ -331,11 +360,31 @@ async function handleJob(config, ledger, job) {
 }
 
 async function cycle(config, ledger) {
-  const response = await agentRequest(config, 'claim', {
-    limit: 1,
-    leaseSeconds: 120,
-    capabilities: workerCapabilities,
-  }, `claim:${os.hostname()}:${randomUUID()}`)
+  const claimId = `claim:${os.hostname()}:${randomUUID()}`
+  let response
+  try {
+    response = await agentRequest(config, 'claim', {
+      limit: 1,
+      leaseSeconds: 120,
+      capabilities: activeWorkerCapabilities,
+    }, `${claimId}:${activeWorkerCapabilities === workerCapabilities
+      ? 'bundled-v2'
+      : 'legacy-shipping'}`)
+  } catch (error) {
+    if (
+      activeWorkerCapabilities !== workerCapabilities
+      || error?.code !== 'OPERATIONS_PRINT_AGENT_CAPABILITIES_MISMATCH'
+    ) throw error
+    activeWorkerCapabilities = legacyWorkerCapabilities
+    response = await agentRequest(config, 'claim', {
+      limit: 1,
+      leaseSeconds: 120,
+      capabilities: activeWorkerCapabilities,
+    }, `${claimId}:legacy-shipping`)
+    log('legacy_enrollment_capability_fallback', {
+      detail: 'Upgrade this enrolled agent in ClawPilot to claim bundled barcode-label jobs',
+    })
+  }
   const jobs = Array.isArray(response.jobs) ? response.jobs : []
   if (jobs[0]) await handleJob(config, ledger, jobs[0])
   return jobs.length

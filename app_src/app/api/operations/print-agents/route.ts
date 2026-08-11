@@ -16,6 +16,7 @@ import {
   readOperationsPrintAgentWorkspaceFromPostgres,
   revokeOperationsPrintAgentInPostgres,
   rotateOperationsPrintAgentCredentialInPostgres,
+  upgradeOperationsPrintAgentToBundledCapabilitiesInPostgres,
 } from '@/lib/persistence/operationPrintDelivery'
 import { OperationsRequestError } from '@/lib/persistence/operations'
 import { requireRequestUser } from '@/lib/requestUser'
@@ -36,6 +37,7 @@ const ACTION_FIELDS: Record<string, Set<string>> = {
     'supportedMedia',
     'supportedDocumentTypes',
   ]),
+  'upgrade-bundled-capabilities': new Set(['action', 'printAgentGlobalId']),
   'rotate-credential': new Set(['action', 'printAgentGlobalId']),
   'revoke-agent': new Set(['action', 'printAgentGlobalId']),
 }
@@ -265,6 +267,15 @@ export async function POST(req: NextRequest) {
         idempotencyKey: idempotencyKey(req),
       })
       return json({ ok: true, ...result })
+    }
+    if (command.action === 'upgrade-bundled-capabilities') {
+      const agent = await upgradeOperationsPrintAgentToBundledCapabilitiesInPostgres({
+        organizationId,
+        printAgentGlobalId: agentGlobalId(command.value.printAgentGlobalId),
+        actorEmail: actor.email,
+        idempotencyKey: idempotencyKey(req),
+      })
+      return json({ ok: true, agent })
     }
     if (command.action === 'revoke-agent') {
       const agent = await revokeOperationsPrintAgentInPostgres({

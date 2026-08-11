@@ -46,6 +46,7 @@ import {
 } from '@/lib/measurements'
 import {
   DEFAULT_PRINT_AGENT_CAPABILITIES,
+  LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES,
   PRINT_DOCUMENT_TYPES,
   PRINT_FORMATS,
   PRINT_MEDIA,
@@ -104,6 +105,13 @@ type View = 'jobs' | 'printers' | 'agents'
 const BUNDLED_AGENT_FORMATS = DEFAULT_PRINT_AGENT_CAPABILITIES.supportedFormats
 const BUNDLED_AGENT_MEDIA = DEFAULT_PRINT_AGENT_CAPABILITIES.supportedMedia
 const BUNDLED_AGENT_DOCUMENT_TYPES = DEFAULT_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes
+const LEGACY_BUNDLED_AGENT_FORMATS = LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES.supportedFormats
+const LEGACY_BUNDLED_AGENT_MEDIA = LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES.supportedMedia
+const LEGACY_BUNDLED_AGENT_DOCUMENT_TYPES =
+  LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes
+const BUNDLED_PRINTER_DEFAULT_FORMATS = LEGACY_BUNDLED_AGENT_FORMATS
+const BUNDLED_PRINTER_DEFAULT_MEDIA = LEGACY_BUNDLED_AGENT_MEDIA
+const BUNDLED_PRINTER_DEFAULT_DOCUMENT_TYPES = LEGACY_BUNDLED_AGENT_DOCUMENT_TYPES
 
 const fieldSx = {
   minWidth: 0,
@@ -242,6 +250,15 @@ function isBundledRawZplCapability(agent: OperationsPrintAgentProfile) {
     && containsAll(agent.supportedDocumentTypes, BUNDLED_AGENT_DOCUMENT_TYPES)
 }
 
+function isLegacyBundledRawZplCapability(agent: OperationsPrintAgentProfile) {
+  return agent.supportedFormats.length === LEGACY_BUNDLED_AGENT_FORMATS.length
+    && containsAll(agent.supportedFormats, LEGACY_BUNDLED_AGENT_FORMATS)
+    && agent.supportedMedia.length === LEGACY_BUNDLED_AGENT_MEDIA.length
+    && containsAll(agent.supportedMedia, LEGACY_BUNDLED_AGENT_MEDIA)
+    && agent.supportedDocumentTypes.length === LEGACY_BUNDLED_AGENT_DOCUMENT_TYPES.length
+    && containsAll(agent.supportedDocumentTypes, LEGACY_BUNDLED_AGENT_DOCUMENT_TYPES)
+}
+
 function DetailField({ term, value }: { term: string; value: ReactNode }) {
   return (
     <Box sx={{ minWidth: 0 }}>
@@ -272,9 +289,9 @@ function defaultForm(warehouseId: string): PrinterForm {
     stationType: 'shipping',
     printerType: 'thermal',
     connectionMode: 'local_agent',
-    supportedFormats: [...BUNDLED_AGENT_FORMATS],
-    supportedMedia: [...BUNDLED_AGENT_MEDIA],
-    supportedDocumentTypes: [...BUNDLED_AGENT_DOCUMENT_TYPES],
+    supportedFormats: [...BUNDLED_PRINTER_DEFAULT_FORMATS],
+    supportedMedia: [...BUNDLED_PRINTER_DEFAULT_MEDIA],
+    supportedDocumentTypes: [...BUNDLED_PRINTER_DEFAULT_DOCUMENT_TYPES],
     defaultDocumentTypes: [],
     fallbackPrinterGlobalId: null,
     localPrintAgentGlobalId: null,
@@ -390,7 +407,7 @@ export default function PrinterConfigurationPanel() {
   const [enrollForm, setEnrollForm] = useState<AgentEnrollmentForm | null>(null)
   const [agentAction, setAgentAction] = useState<{
     agent: OperationsPrintAgentProfile
-    action: 'rotate-credential' | 'revoke-agent'
+    action: 'upgrade-bundled-capabilities' | 'rotate-credential' | 'revoke-agent'
   } | null>(null)
   const [jobAction, setJobAction] = useState<{
     job: OperationsPrintJobListItem
@@ -549,9 +566,9 @@ export default function PrinterConfigurationPanel() {
         ...current,
         printerType,
         stationType: current.stationType === 'office' ? 'shipping' : current.stationType,
-        supportedFormats: [...BUNDLED_AGENT_FORMATS],
-        supportedMedia: [...BUNDLED_AGENT_MEDIA],
-        supportedDocumentTypes: [...BUNDLED_AGENT_DOCUMENT_TYPES],
+        supportedFormats: [...BUNDLED_PRINTER_DEFAULT_FORMATS],
+        supportedMedia: [...BUNDLED_PRINTER_DEFAULT_MEDIA],
+        supportedDocumentTypes: [...BUNDLED_PRINTER_DEFAULT_DOCUMENT_TYPES],
         defaultDocumentTypes: [],
         fallbackPrinterGlobalId: null,
         localPrintAgentGlobalId: null,
@@ -727,7 +744,7 @@ export default function PrinterConfigurationPanel() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(agentAction.action === 'rotate-credential'
+          ...(agentAction.action !== 'revoke-agent'
             ? { 'Idempotency-Key': crypto.randomUUID() }
             : {}),
         },
@@ -742,11 +759,15 @@ export default function PrinterConfigurationPanel() {
       }
       setAgentAction(null)
       if (result.credential) setCredential(result.credential)
-      setNotice(agentAction.action === 'rotate-credential'
-        ? result.credential
-          ? `${result.agent.name} credential was rotated`
-          : 'Credential was already issued; rotate again with a new request to replace it'
-        : `${result.agent.name} was revoked and its printers were set offline`)
+      setNotice(
+        agentAction.action === 'upgrade-bundled-capabilities'
+          ? `${result.agent.name} now supports bundled carrier, product-barcode, and location-barcode ZPL printing`
+          : agentAction.action === 'rotate-credential'
+            ? result.credential
+              ? `${result.agent.name} credential was rotated`
+              : 'Credential was already issued; rotate again with a new request to replace it'
+            : `${result.agent.name} was revoked and its printers were set offline`,
+      )
       await load()
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Local print-agent action failed')
@@ -1078,10 +1099,14 @@ export default function PrinterConfigurationPanel() {
                       <Chip size="small" label={`Credential v${agent.credentialVersion}`} variant="outlined" />
                       <Chip
                         size="small"
-                        color={isBundledRawZplCapability(agent) ? 'info' : 'secondary'}
+                        color={isBundledRawZplCapability(agent)
+                          ? 'info'
+                          : isLegacyBundledRawZplCapability(agent) ? 'warning' : 'secondary'}
                         label={isBundledRawZplCapability(agent)
-                          ? 'Bundled-compatible raw ZPL'
-                          : 'Custom capability agent'}
+                          ? 'Bundled Zebra raw ZPL'
+                          : isLegacyBundledRawZplCapability(agent)
+                            ? 'Legacy bundled shipping only'
+                            : 'Custom capability agent'}
                         variant="outlined"
                       />
                     </Stack>
@@ -1111,6 +1136,22 @@ export default function PrinterConfigurationPanel() {
                   </Box>
                   {agents.capabilities.canManage && agent.status === 'active' && (
                     <Stack direction="row" spacing={0.5} justifyContent="flex-end">
+                      {isLegacyBundledRawZplCapability(agent) && (
+                        <Tooltip title={`Enable bundled barcode printing for ${agent.name}`}>
+                          <Button
+                            size="small"
+                            variant="outlined"
+                            startIcon={<TokenRounded />}
+                            aria-label={`Enable bundled barcode printing for ${agent.name}`}
+                            onClick={() => setAgentAction({
+                              agent,
+                              action: 'upgrade-bundled-capabilities',
+                            })}
+                          >
+                            Enable barcode printing
+                          </Button>
+                        </Tooltip>
+                      )}
                       <Tooltip title={`Rotate ${agent.name} credential`}>
                         <IconButton
                           aria-label={`Rotate ${agent.name} credential`}
@@ -1569,6 +1610,15 @@ export default function PrinterConfigurationPanel() {
                   {PRINTER_CONNECTION_MODES.map((item) => <MenuItem key={item} value={item}>{label(item)}</MenuItem>)}
                 </TextField>
               </Stack>
+              {printerForm.printerType === 'thermal'
+                && printerForm.connectionMode === 'local_agent' && (
+                <Alert severity="info">
+                  New Zebra profiles retain the 4 x 6 carrier-label preset. For barcode
+                  printing, select only the label sizes this physical device is ready to use,
+                  then add Product barcode label and Location barcode label. The bundled agent
+                  supports all five listed Zebra label sizes without a custom runtime.
+                </Alert>
+              )}
               <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
                 <MultiSelect
                   label="Printer formats"
@@ -1633,8 +1683,10 @@ export default function PrinterConfigurationPanel() {
                   {agentOptions.map((agent) => (
                     <MenuItem key={agent.globalId} value={agent.globalId}>
                       {agent.name} — {isBundledRawZplCapability(agent)
-                        ? 'bundled-compatible raw ZPL'
-                        : 'custom capabilities'}
+                        ? 'bundled Zebra raw ZPL'
+                        : isLegacyBundledRawZplCapability(agent)
+                          ? 'legacy bundled shipping only'
+                          : 'custom capabilities'}
                     </MenuItem>
                   ))}
                 </TextField>
@@ -1737,9 +1789,10 @@ export default function PrinterConfigurationPanel() {
                   Bundled Zebra runtime: raw UTF-8 ZPL only
                 </Typography>
                 <Typography variant="body2">
-                  The safe preset accepts 4 x 6 carrier shipping labels. Declare PDF, PNG,
-                  4 x 8, return labels, or office documents only for a separately maintained
-                  custom agent that you have tested.
+                  The safe preset accepts raw ZPL carrier labels on 4 x 6 or 4 x 8 media and
+                  product or location barcode labels on 2 x 1, 3 x 1, 4 x 2, 4 x 6, or 4 x 8
+                  media. Declare PDF, PNG, return labels, or office documents only for a
+                  separately maintained custom agent that you have tested.
                 </Typography>
               </Alert>
               <TextField
@@ -1783,7 +1836,7 @@ export default function PrinterConfigurationPanel() {
                     ...enrollForm,
                     supportedMedia: next as PrintMedia[],
                   })}
-                  helperText="4 x 6 labels are the bundled runtime default."
+                  helperText="All five Zebra barcode-label sizes are included in the bundled runtime."
                 />
               </Stack>
               <MultiSelect
@@ -1794,7 +1847,7 @@ export default function PrinterConfigurationPanel() {
                   ...enrollForm,
                   supportedDocumentTypes: next as PrintDocumentType[],
                 })}
-                helperText="Carrier shipping labels are the bundled runtime default."
+                helperText="Carrier, product barcode, and location barcode labels are bundled."
               />
               <Box>
                 <Button
@@ -1839,13 +1892,19 @@ export default function PrinterConfigurationPanel() {
         maxWidth="sm"
       >
         <DialogTitle>
-          {agentAction?.action === 'rotate-credential' ? 'Rotate agent credential' : 'Revoke local print agent'}
+          {agentAction?.action === 'upgrade-bundled-capabilities'
+            ? 'Enable bundled barcode printing'
+            : agentAction?.action === 'rotate-credential'
+              ? 'Rotate agent credential'
+              : 'Revoke local print agent'}
         </DialogTitle>
         <DialogContent dividers>
           <Typography variant="body2" color="text.secondary">
-            {agentAction?.action === 'rotate-credential'
-              ? `The current credential for ${agentAction.agent.name} will stop working immediately.`
-              : `${agentAction?.agent.name || 'This agent'} will be revoked and every assigned local-agent printer will be set offline.`}
+            {agentAction?.action === 'upgrade-bundled-capabilities'
+              ? `${agentAction.agent.name} will retain its credential and shipping support while adding the exact bundled product-label, location-label, and Zebra media capabilities. Reinstall the macOS LaunchAgent, or restart a repo-run bundled agent, before queueing barcode jobs.`
+              : agentAction?.action === 'rotate-credential'
+                ? `The current credential for ${agentAction.agent.name} will stop working immediately.`
+                : `${agentAction?.agent.name || 'This agent'} will be revoked and every assigned local-agent printer will be set offline.`}
           </Typography>
         </DialogContent>
         <DialogActions>
@@ -1858,7 +1917,9 @@ export default function PrinterConfigurationPanel() {
           >
             {saving
               ? 'Working...'
-              : agentAction?.action === 'rotate-credential' ? 'Rotate' : 'Revoke'}
+              : agentAction?.action === 'upgrade-bundled-capabilities'
+                ? 'Enable barcode printing'
+                : agentAction?.action === 'rotate-credential' ? 'Rotate' : 'Revoke'}
           </Button>
         </DialogActions>
       </Dialog>

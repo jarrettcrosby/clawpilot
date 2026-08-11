@@ -39,11 +39,30 @@ function loadPrinting() {
 }
 
 const {
+  DEFAULT_PRINT_AGENT_CAPABILITIES,
+  LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES,
   isDocumentMediaCompatible,
   isPrinterCapabilitySetValid,
   printerCanFallbackFor,
   selectPrinterRoute,
 } = loadPrinting()
+
+assert.deepEqual(JSON.parse(JSON.stringify(DEFAULT_PRINT_AGENT_CAPABILITIES)), {
+  supportedFormats: ['ZPL'],
+  supportedMedia: [
+    'label_2x1',
+    'label_3x1',
+    'label_4x2',
+    'label_4x6',
+    'label_4x8',
+  ],
+  supportedDocumentTypes: ['shipping_label', 'product_label', 'location_label'],
+})
+assert.deepEqual(JSON.parse(JSON.stringify(LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES)), {
+  supportedFormats: ['ZPL'],
+  supportedMedia: ['label_4x6'],
+  supportedDocumentTypes: ['shipping_label'],
+})
 
 function printer(overrides = {}) {
   return {
@@ -185,6 +204,22 @@ assert.equal(isDocumentMediaCompatible({
   ...packingRequest,
   media: 'label_4x6',
 }), false)
+assert.equal(isDocumentMediaCompatible({
+  warehouseId: 'warehouse-id',
+  documentType: 'product_label',
+  format: 'ZPL',
+  media: 'label_2x1',
+}), true)
+assert.equal(isDocumentMediaCompatible({
+  warehouseId: 'warehouse-id',
+  documentType: 'location_label',
+  format: 'PDF',
+  media: 'label_3x1',
+}), false)
+assert.equal(isDocumentMediaCompatible({
+  ...labelRequest,
+  media: 'label_2x1',
+}), false)
 assert.equal(isPrinterCapabilitySetValid({
   printerType: 'nonthermal',
   supportedFormats: ['PDF'],
@@ -270,6 +305,8 @@ for (const fragment of [
   'retryOperationsPrintJobInPostgres',
   'cancelOperationsPrintJobInPostgres',
   'reprintOperationsPrintJobInPostgres',
+  'upgradeOperationsPrintAgentToBundledCapabilitiesInPostgres',
+  'LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES',
   'operations:print-attempt:',
   'OPERATIONS_PRINT_REPRINT_LABEL_INACTIVE',
   'scheduleRetry',
@@ -344,6 +381,7 @@ for (const fragment of [
   'const BUNDLED_AGENT_FORMATS = DEFAULT_PRINT_AGENT_CAPABILITIES.supportedFormats',
   'const BUNDLED_AGENT_MEDIA = DEFAULT_PRINT_AGENT_CAPABILITIES.supportedMedia',
   'const BUNDLED_AGENT_DOCUMENT_TYPES = DEFAULT_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes',
+  'const BUNDLED_PRINTER_DEFAULT_MEDIA = LEGACY_BUNDLED_AGENT_MEDIA',
   'function agentSupportsPrinter(',
   'containsAll(agent.supportedFormats, printer.supportedFormats)',
   'containsAll(agent.supportedMedia, printer.supportedMedia)',
@@ -353,22 +391,32 @@ for (const fragment of [
   'options={printerDocumentOptions}',
   'Bundled Zebra runtime: raw UTF-8 ZPL only',
   'Use bundled Zebra defaults',
-  'Bundled-compatible raw ZPL',
+  'Bundled Zebra raw ZPL',
   'Custom capability agent',
   'This assignment is incompatible.',
   'Only agents whose declared capabilities cover this printer are available.',
+  'Enable bundled barcode printing',
+  'Legacy bundled shipping only',
+  'All five Zebra barcode-label sizes are included in the bundled runtime.',
+  'New Zebra profiles retain the 4 x 6 carrier-label preset.',
 ]) assert.ok(panel.includes(fragment), `Printer UI missing ${fragment}`)
 assert.ok(
   !panel.includes("supportedFormats: ['ZPL', 'PDF']"),
   'Bundled local-agent printer defaults must not claim PDF support',
 )
 assert.ok(
-  !panel.includes("supportedMedia: ['label_4x6', 'label_4x8']"),
-  'Bundled local-agent printer defaults must not claim unverified 4 x 8 support',
-)
-assert.ok(
   panel.includes("onClick={() => setPrinterForm(editForm(printer))}"),
   'Existing printer profiles must remain editable',
+)
+
+const printAgentsRoute = read('app_src/app/api/operations/print-agents/route.ts')
+for (const fragment of [
+  "'upgrade-bundled-capabilities'",
+  'upgradeOperationsPrintAgentToBundledCapabilitiesInPostgres',
+  'idempotencyKey(req)',
+]) assert.ok(
+  printAgentsRoute.includes(fragment),
+  `Print-agent management route missing ${fragment}`,
 )
 
 const operations = read('app_src/components/operations/OperationsSection.tsx')
