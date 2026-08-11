@@ -20,6 +20,7 @@ import VisibilityOffRounded from '@mui/icons-material/VisibilityOffRounded'
 import VisibilityRounded from '@mui/icons-material/VisibilityRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime } from '@/lib/userDateTime'
+import GoogleAuthSettingsPanel from './GoogleAuthSettingsPanel'
 
 type BrowserSession = {
   id: string
@@ -172,6 +173,9 @@ export default function SessionSecurityPanel() {
     <Box role="tabpanel" id="settings-panel-4" aria-labelledby="settings-tab-4" sx={{ maxWidth: 760, mx: 'auto' }}>
       {error ? <Alert severity="error" onClose={() => setError('')} sx={{ mb: 2, borderRadius: '8px' }}>{error}</Alert> : null}
       {notice ? <Alert severity="success" onClose={() => setNotice('')} sx={{ mb: 2, borderRadius: '8px' }}>{notice}</Alert> : null}
+
+      <GoogleAuthSettingsPanel />
+      <Divider sx={{ my: 3, borderColor: 'rgba(255,255,255,0.08)' }} />
 
       <Box component="section">
         <Box display="flex" alignItems="center" justifyContent="space-between" gap={2} mb={1.25}>

@@ -39,7 +39,9 @@ test('Product image import capability is explicit and provider flow is controlle
   assert.match(panel, /imageImportAvailable: boolean/)
   assert.match(panel, /typeof payload\.imageImportAvailable !== 'boolean'/)
   assert.match(panel, /Image flow is controlled, not a live mirror/)
-  assert.match(panel, /Faire image import \(development only\)/)
+  assert.match(panel, /Faire image import/)
+  assert.match(panel, /read-only Faire requests/)
+  assert.match(panel, /cannot write to Faire/)
   assert.match(panel, /state\?\.imageImportAvailable !== true/)
   assert.match(
     panel,

@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import { normalizeGlobalId } from '../app_src/lib/globalIds.mjs'
 
 const root = process.cwd()
 const contractsOnly = process.argv.includes('--contracts-only')
@@ -348,9 +349,10 @@ async function splitPackedOrderIntoTwoPackagesForFixture(pool, fixture, orderGlo
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
-    await client.query(
-      'ALTER TABLE operations_package_contents DISABLE TRIGGER protect_operations_package_content_write',
-    )
+    // This helper intentionally rewrites an immutable packed fixture into two
+    // packages. Replica mode keeps that setup isolated from both the legacy
+    // write guard and the deferred native one-off package-set validator.
+    await client.query('SET LOCAL session_replication_role = replica')
     await client.query(
       `UPDATE operations_package_contents SET quantity = 1
        WHERE organization_id = $1::uuid AND id = $2::uuid`,
@@ -378,9 +380,6 @@ async function splitPackedOrderIntoTwoPackagesForFixture(pool, fixture, orderGlo
         fixture.organizationId, row.plan_id, row.order_id, second.rows[0].id,
         row.order_line_id, fixture.email,
       ],
-    )
-    await client.query(
-      'ALTER TABLE operations_package_contents ENABLE TRIGGER protect_operations_package_content_write',
     )
     await client.query('COMMIT')
   } catch (error) {
@@ -447,6 +446,261 @@ async function addSandboxLabelsForAllPackages(
     trackingNumbers.push(trackingNumber)
   }
   return trackingNumbers
+}
+
+async function seedNativeOneOffCarrierGroup(
+  pool,
+  fixture,
+  orderGlobalId,
+  {
+    state = 'succeeded',
+    omitLastResult = false,
+    mismatchedAllocation = false,
+    wrongCarrier = false,
+    wrongService = false,
+    closed = false,
+  } = {},
+) {
+  const context = await pool.query(
+    `SELECT source_order.id::text AS order_id,
+            plan.id::text AS plan_id,
+            package.id::text AS package_id,
+            package.global_id AS package_global_id,
+            package.package_number,
+            package.length_mm, package.width_mm, package.height_mm,
+            package.weight_grams,
+            rate.id::text AS carrier_rate_id,
+            rate.carrier, rate.service_code
+     FROM operations_orders source_order
+     JOIN operations_fulfillment_plans plan
+       ON plan.organization_id = source_order.organization_id
+      AND plan.order_id = source_order.id
+     JOIN operations_packages package
+       ON package.organization_id = plan.organization_id
+      AND package.plan_id = plan.id
+     JOIN operations_carrier_rates rate
+       ON rate.organization_id = plan.organization_id
+      AND rate.plan_id = plan.id
+      AND rate.selected = true
+     WHERE source_order.organization_id = $1::uuid
+       AND source_order.global_id = $2
+     ORDER BY package.package_number`,
+    [fixture.organizationId, orderGlobalId],
+  )
+  assert.equal(context.rowCount, 2)
+  const first = context.rows[0]
+  const selectedAmountMinor = 1000
+  const allocated = mismatchedAllocation ? [400, 500] : [400, 600]
+  const client = await pool.connect()
+  let seededAttemptId = null
+  let seededAttemptGlobalId = null
+  try {
+    await client.query('BEGIN')
+    // This isolated fixture does not call a carrier. The execution migration
+    // has its own exact-authority/persistence acceptance; here we bypass only
+    // fixture-construction triggers so shipment confirmation can be exercised
+    // against complete and deliberately corrupt immutable group states.
+    await client.query('SET LOCAL session_replication_role = replica')
+    await client.query(
+      `UPDATE operations_orders
+       SET source_provider = 'clawpilot_native', order_type = 'one_off'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixture.organizationId, first.order_id],
+    )
+    await client.query(
+      `UPDATE operations_activation_scopes
+       SET state = 'shadow', revision = revision + 1,
+           reason = 'Focused native one-off TEST confirmation',
+           updated_by = $2, updated_at = now()
+       WHERE organization_id = $1::uuid`,
+      [fixture.organizationId, fixture.email],
+    )
+    const attempt = await client.query(
+      `INSERT INTO operations_one_off_carrier_group_attempts (
+         organization_id, order_id, plan_id,
+         planning_quote_id, planning_offer_id,
+         purchase_quote_id, purchase_offer_id, carrier_rate_id,
+         integration_account_id, carrier_account_id, create_attempt_id,
+         action, state, environment, provider, service_code,
+         package_count, selected_amount_minor, currency,
+         adapter_version, idempotency_key, request_hash,
+         redacted_request, redacted_response,
+         master_tracking_number, provider_shipment_id, provider_reference,
+         error_code, reason, actor_email, completed_at
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid,
+         $4::uuid, $5::uuid, $6::uuid, $7::uuid, $8::uuid,
+         $9::uuid, $10::uuid, NULL,
+         'create', $11, 'sandbox', 'ups_rest', $12,
+         2, $13, 'USD',
+         'focused-one-off-confirmation-v1', $14, $15,
+         $16::jsonb, $17::jsonb,
+         $18, $19, $19,
+         $20, 'Focused native one-off TEST carrier group', $21,
+         CASE WHEN $11 = 'prepared' THEN NULL ELSE now() END
+       )
+       RETURNING id::text, global_id`,
+      [
+        fixture.organizationId,
+        first.order_id,
+        first.plan_id,
+        randomUUID(), randomUUID(), randomUUID(), randomUUID(),
+        first.carrier_rate_id,
+        randomUUID(), randomUUID(),
+        state,
+        first.service_code,
+        selectedAmountMinor,
+        `native-confirm-${randomUUID()}`,
+        'a'.repeat(64),
+        JSON.stringify({ focusedAcceptance: true }),
+        JSON.stringify({ focusedAcceptance: true, state }),
+        state === 'succeeded' ? '1ZFOCUSEDMASTER000' : null,
+        state === 'succeeded' ? `focused-provider-${randomUUID()}` : null,
+        state === 'failed' || state === 'unknown'
+          ? `FOCUSED_${state.toUpperCase()}`
+          : null,
+        fixture.email,
+      ],
+    )
+    const attemptId = attempt.rows[0].id
+    seededAttemptId = attemptId
+    seededAttemptGlobalId = attempt.rows[0].global_id
+    for (const [index, packageRow] of context.rows.entries()) {
+      const member = await client.query(
+        `INSERT INTO operations_one_off_carrier_group_members (
+           organization_id, carrier_group_attempt_id, order_id, plan_id,
+           package_id, package_number, quote_package_key,
+           length_mm, width_mm, height_mm, weight_grams,
+           allocated_selected_cost_minor, parcel_snapshot_hash
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+           $5::uuid, $6, $7, $8, $9, $10, $11, $12, $13
+         ) RETURNING id::text`,
+        [
+          fixture.organizationId, attemptId, first.order_id, first.plan_id,
+          packageRow.package_id, packageRow.package_number,
+          `focused-package-${packageRow.package_number}`,
+          packageRow.length_mm, packageRow.width_mm, packageRow.height_mm,
+          packageRow.weight_grams, allocated[index], String(index + 1).repeat(64),
+        ],
+      )
+      assert.equal(member.rowCount, 1)
+      const trackingNumber = `TESTGROUP${index + 1}${randomUUID()
+        .replaceAll('-', '').slice(0, 15).toUpperCase()}`
+      const providerPackageReference = `focused-package-result-${randomUUID()}`
+      const label = await client.query(
+        `INSERT INTO operations_labels (
+           organization_id, package_id, carrier_rate_id,
+           carrier, service_code, tracking_number, format, label_payload,
+           provider_label_id, idempotency_key, status, environment,
+           redacted_provider_evidence, one_off_carrier_group_attempt_id
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, $4, $5, $6,
+           'PDF', $7, $8, $9, 'created', 'sandbox', $10::jsonb, $11::uuid
+         ) RETURNING id::text, global_id`,
+        [
+          fixture.organizationId, packageRow.package_id,
+          first.carrier_rate_id,
+          wrongCarrier ? 'FedEx' : 'UPS',
+          wrongService ? `${first.service_code}-wrong` : first.service_code,
+          trackingNumber,
+          Buffer.from(`%PDF-1.4 native one-off ${index + 1}`).toString('base64'),
+          providerPackageReference,
+          `native-one-off-label-${randomUUID()}`,
+          JSON.stringify({ focusedAcceptance: true, package: index + 1 }),
+          attemptId,
+        ],
+      )
+      await client.query(
+        `UPDATE operations_packages SET status = 'labeled'
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [fixture.organizationId, packageRow.package_id],
+      )
+      if (!(omitLastResult && index === context.rows.length - 1)) {
+        await client.query(
+          `INSERT INTO operations_one_off_carrier_group_results (
+             organization_id, carrier_group_attempt_id, package_id,
+             package_number, label_id, tracking_number,
+             provider_package_reference, redacted_provider_evidence
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6, $7, $8::jsonb
+           )`,
+          [
+            fixture.organizationId, attemptId, packageRow.package_id,
+            packageRow.package_number, label.rows[0].id, trackingNumber,
+            providerPackageReference,
+            JSON.stringify({ focusedAcceptance: true }),
+          ],
+        )
+      }
+    }
+    if (closed) {
+      await client.query(
+        `INSERT INTO operations_one_off_carrier_group_attempts (
+           organization_id, order_id, plan_id,
+           planning_quote_id, planning_offer_id,
+           purchase_quote_id, purchase_offer_id, carrier_rate_id,
+           integration_account_id, carrier_account_id, create_attempt_id,
+           action, state, environment, provider, service_code,
+           package_count, selected_amount_minor, currency,
+           adapter_version, idempotency_key, request_hash,
+           redacted_request, redacted_response,
+           master_tracking_number, provider_shipment_id, provider_reference,
+           error_code, reason, actor_email, completed_at
+         )
+         SELECT organization_id, order_id, plan_id,
+                planning_quote_id, planning_offer_id,
+                purchase_quote_id, purchase_offer_id, carrier_rate_id,
+                integration_account_id, carrier_account_id, id,
+                'void', 'succeeded', environment, provider, service_code,
+                package_count, selected_amount_minor, currency,
+                adapter_version, $3, $4, $5::jsonb, $6::jsonb,
+                master_tracking_number, provider_shipment_id,
+                provider_shipment_id, NULL,
+                'Focused whole-group void', $7, now()
+         FROM operations_one_off_carrier_group_attempts
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [
+          fixture.organizationId, attemptId, `native-void-${randomUUID()}`,
+          'b'.repeat(64), JSON.stringify({ focusedVoid: true }),
+          JSON.stringify({ focusedVoid: true }), fixture.email,
+        ],
+      )
+    }
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
+  await pool.query(
+    // Keep the confirmation fixture exact-mode aware without fabricating a
+    // real carrier quote. This disposable database is destroyed after the run.
+    `CREATE OR REPLACE FUNCTION operations_one_off_plan_execution_is_exact(
+       authority_organization_id uuid,
+       authority_plan_id uuid,
+       required_execution_mode text DEFAULT NULL
+     ) RETURNS boolean LANGUAGE sql STABLE AS $$
+       SELECT EXISTS (
+         SELECT 1
+         FROM operations_one_off_carrier_group_attempts attempt
+         WHERE attempt.organization_id = authority_organization_id
+           AND attempt.plan_id = authority_plan_id
+           AND attempt.action = 'create'
+           AND (
+             required_execution_mode IS NULL
+             OR (required_execution_mode = 'test' AND attempt.environment = 'sandbox')
+             OR (required_execution_mode = 'live' AND attempt.environment = 'production')
+           )
+       )
+     $$`,
+  )
+  return {
+    groupAttemptId: seededAttemptId,
+    groupAttemptGlobalId: seededAttemptGlobalId,
+    selectedAmountMinor,
+  }
 }
 
 async function addPackagingClaim(pool, fixture, orderGlobalId) {
@@ -683,6 +937,10 @@ async function verifyShipmentCompletion(databaseUrl) {
     })
     const stableId = loadTypeScriptModule('app_src/lib/crm/stableId.ts')
     const packingSlip = loadTypeScriptModule('app_src/lib/operations/packingSlip.ts')
+    const barcodeLabels = loadTypeScriptModule(
+      'app_src/lib/operations/barcodeLabels.ts',
+      { mocks: { '@/lib/globalIds.mjs': { normalizeGlobalId } } },
+    )
     const productPackaging = loadTypeScriptModule('app_src/lib/persistence/productPackaging.ts', {
       mocks: {
         '@/lib/auditWriter': auditWriter,
@@ -788,6 +1046,21 @@ async function verifyShipmentCompletion(databaseUrl) {
             return shopifyFulfillmentReconciliationResult
           },
         },
+        '@/lib/integrations/shopifyOrderPlanningAuthority': {
+          ShopifyOrderPlanningAuthorityError: class extends Error {},
+          assertShopifyOrderPlanningAuthorityHash: (value) => value,
+          normalizeShopifyOrderPlanningAuthoritySnapshot: (value) => value,
+          shopifyOrderPlanningAuthorityHash: () => {
+            throw new Error(
+              'Shipment completion acceptance does not hash Shopify planning authority',
+            )
+          },
+          inspectShopifyOrderPlanningAuthority: async () => {
+            throw new Error(
+              'Shipment completion acceptance does not read Shopify planning authority',
+            )
+          },
+        },
         '@/lib/integrations/faireFulfillmentRuntime': {
           prepareCurrentFaireFulfillmentAuthority: async () => {
             faireFulfillmentPreparationCalls += 1
@@ -822,6 +1095,7 @@ async function verifyShipmentCompletion(databaseUrl) {
         '@/lib/operations/canonicalFulfillmentPlanning':
           canonicalPlanning,
         '@/lib/operations/domain': domain,
+        '@/lib/operations/barcodeLabels': barcodeLabels,
         '@/lib/operations/packingSlip': packingSlip,
         '@/lib/persistence/cartonizationRateEvidence': {
           readCartonizationRateEvidenceByGlobalId: async () => null,
@@ -3000,6 +3274,149 @@ async function verifyShipmentCompletion(databaseUrl) {
       immutableExportEvidence.rows[0].decision,
       JSON.parse(JSON.stringify(failedImmutableExport.customerNotification)),
     )
+
+    const nativeFixture = await createFixture('native-one-off-multi-package')
+    const nativeOrder = await advanceOrderToPacked(
+      persistence,
+      nativeFixture,
+      'native-one-off-multi-package',
+    )
+    await splitPackedOrderIntoTwoPackagesForFixture(
+      pool,
+      nativeFixture,
+      nativeOrder.planned.orderGlobalId,
+    )
+    await addPackagingClaim(
+      pool,
+      nativeFixture,
+      nativeOrder.planned.orderGlobalId,
+    )
+    const nativeGroup = await seedNativeOneOffCarrierGroup(
+      pool,
+      nativeFixture,
+      nativeOrder.planned.orderGlobalId,
+    )
+    const nativeConfirmInput = {
+      organizationId: nativeFixture.organizationId,
+      actorEmail: nativeFixture.email,
+      orderGlobalId: nativeOrder.planned.orderGlobalId,
+      expectedRowVersion: nativeOrder.packed.rowVersion,
+      reason: 'Confirm complete native one-off TEST carrier group',
+      idempotencyKey: `confirm-native-one-off-${randomUUID()}`,
+    }
+    const nativeConfirmed = await persistence
+      .confirmOperationsOrderShipmentFromPostgres(nativeConfirmInput)
+    assert.equal(nativeConfirmed.orderStatus, 'shipped')
+    assert.equal(nativeConfirmed.replayed, false)
+    const nativeShipmentEvidence = await pool.query(
+      `SELECT shipment.global_id, shipment.package_id::text,
+              shipment.quoted_carrier_cost_minor::text,
+              carrier_group.global_id AS carrier_group_global_id
+       FROM operations_shipments shipment
+       JOIN operations_orders source_order
+         ON source_order.organization_id = shipment.organization_id
+        AND source_order.id = shipment.order_id
+       JOIN operations_one_off_carrier_group_attempts carrier_group
+         ON carrier_group.organization_id = shipment.organization_id
+        AND carrier_group.id = shipment.one_off_carrier_group_attempt_id
+       WHERE source_order.organization_id = $1::uuid
+         AND source_order.global_id = $2
+       ORDER BY shipment.package_id`,
+      [nativeFixture.organizationId, nativeOrder.planned.orderGlobalId],
+    )
+    assert.equal(nativeShipmentEvidence.rowCount, 2)
+    assert.deepEqual(
+      [...new Set(nativeShipmentEvidence.rows.map(
+        (row) => row.carrier_group_global_id,
+      ))],
+      [nativeGroup.groupAttemptGlobalId],
+    )
+    assert.equal(
+      nativeShipmentEvidence.rows.reduce(
+        (sum, row) => sum + Number(row.quoted_carrier_cost_minor),
+        0,
+      ),
+      nativeGroup.selectedAmountMinor,
+      'Per-package shipment allocations must sum to the whole-group selected amount',
+    )
+    const nativeReplay = await persistence
+      .confirmOperationsOrderShipmentFromPostgres(nativeConfirmInput)
+    assert.equal(nativeReplay.replayed, true)
+    assert.equal(nativeReplay.shipmentGlobalId, nativeConfirmed.shipmentGlobalId)
+    const nativeShipmentCountAfterReplay = await pool.query(
+      `SELECT count(*)::int AS count
+       FROM operations_shipments shipment
+       JOIN operations_orders source_order
+         ON source_order.organization_id = shipment.organization_id
+        AND source_order.id = shipment.order_id
+       WHERE source_order.organization_id = $1::uuid
+         AND source_order.global_id = $2`,
+      [nativeFixture.organizationId, nativeOrder.planned.orderGlobalId],
+    )
+    assert.equal(nativeShipmentCountAfterReplay.rows[0].count, 2)
+
+    for (const scenario of [
+      {
+        name: 'partial',
+        seed: { omitLastResult: true },
+        errorCode: 'OPERATIONS_ONE_OFF_GROUP_PARTIAL',
+      },
+      {
+        name: 'allocation-mismatch',
+        seed: { mismatchedAllocation: true },
+        errorCode: 'OPERATIONS_ONE_OFF_GROUP_PARTIAL',
+      },
+      {
+        name: 'carrier-mismatch',
+        seed: { wrongCarrier: true },
+        errorCode: 'OPERATIONS_ONE_OFF_GROUP_PARTIAL',
+      },
+      {
+        name: 'service-mismatch',
+        seed: { wrongService: true },
+        errorCode: 'OPERATIONS_ONE_OFF_GROUP_PARTIAL',
+      },
+      {
+        name: 'unknown',
+        seed: { state: 'unknown' },
+        errorCode: 'OPERATIONS_ONE_OFF_GROUP_UNRESOLVED',
+      },
+      {
+        name: 'voided',
+        seed: { closed: true },
+        errorCode: 'OPERATIONS_ONE_OFF_GROUP_CLOSED',
+      },
+    ]) {
+      const fixture = await createFixture(`native-one-off-${scenario.name}`)
+      const order = await advanceOrderToPacked(
+        persistence,
+        fixture,
+        `native-one-off-${scenario.name}`,
+      )
+      await splitPackedOrderIntoTwoPackagesForFixture(
+        pool,
+        fixture,
+        order.planned.orderGlobalId,
+      )
+      await seedNativeOneOffCarrierGroup(
+        pool,
+        fixture,
+        order.planned.orderGlobalId,
+        scenario.seed,
+      )
+      await expectRejected(
+        () => persistence.confirmOperationsOrderShipmentFromPostgres({
+          organizationId: fixture.organizationId,
+          actorEmail: fixture.email,
+          orderGlobalId: order.planned.orderGlobalId,
+          expectedRowVersion: order.packed.rowVersion,
+          reason: `Reject ${scenario.name} native one-off carrier group`,
+          idempotencyKey: `confirm-native-${scenario.name}-${randomUUID()}`,
+        }),
+        (error) => error?.code === scenario.errorCode,
+        `${scenario.name} native one-off carrier group must not confirm`,
+      )
+    }
   } finally {
     await pool.end()
   }
@@ -3014,6 +3431,22 @@ async function main() {
     'UNIQUE (organization_id, idempotency_key)',
   ]) {
     assert.ok(migration.includes(fragment), `Shipment completion migration is missing ${fragment}`)
+  }
+  const oneOffExecutionMigration = read(
+    'db/migrations/0263_operations_one_off_execution.sql',
+  )
+  for (const fragment of [
+    'operations_one_off_carrier_group_attempts',
+    'operations_one_off_carrier_group_members',
+    'allocated_selected_cost_minor',
+    'operations_one_off_carrier_group_results',
+    'one_off_carrier_group_attempt_id',
+    'validate_operations_one_off_group_shipment',
+  ]) {
+    assert.ok(
+      oneOffExecutionMigration.includes(fragment),
+      `One-off shipment confirmation migration is missing ${fragment}`,
+    )
   }
   const notificationMigration = read(
     'db/migrations/0201_operations_fulfillment_notification_policy.sql',
@@ -3056,6 +3489,10 @@ async function main() {
     "mode: 'unavailable'",
     'customerNotification: resolvedCustomerNotification',
     'OPERATIONS_FAIRE_FULFILLMENT_SIGNATURE_REQUIRED',
+    'lockNativeOneOffShipmentAuthority',
+    'allocatedCostByPackageId',
+    'one_off_carrier_group_attempt_id',
+    'OPERATIONS_ONE_OFF_GROUP_PARTIAL',
   ]) {
     assert.ok(
       operationsSource.includes(fragment),

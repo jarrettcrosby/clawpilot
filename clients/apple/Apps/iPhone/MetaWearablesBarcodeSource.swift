@@ -195,6 +195,12 @@ actor MetaWearablesBarcodeSource {
         deviceSession = nil
     }
 
+    func prepareForNextBarcode() {
+        guard active else { return }
+        processor.reset()
+        captureFollowupPhoto()
+    }
+
     private func handleSessionState(_ state: DeviceSessionState) {
         guard active else { return }
         switch state {

@@ -62,6 +62,9 @@ function loadPersistence() {
         normalizeCarrierSandboxParty: (value) => value,
       }
     }
+    if (specifier === '@/lib/operations/fulfillmentOptimizerContract') {
+      return fulfillmentOptimizerContract
+    }
     if (specifier === '@/lib/persistence/postgres') {
       return {
         acquireTransactionAdvisoryLock: async () => {},
@@ -97,7 +100,119 @@ function loadPersistence() {
   return module.exports
 }
 
-function loadOperationalFaireRoute(observed) {
+function loadSandboxGeometryRatePlan() {
+  const path =
+    'app_src/lib/operations/sandboxCartonizationRatePlan.ts'
+  const output = ts.transpileModule(read(path), {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+    fileName: path,
+  }).outputText
+  const module = { exports: {} }
+  vm.runInNewContext(output, {
+    Array,
+    Boolean,
+    Error,
+    Map,
+    Math,
+    Number,
+    Object,
+    Promise,
+    RegExp,
+    Set,
+    String,
+    console,
+    exports: module.exports,
+    module,
+    require: requireFromApp,
+  }, { filename: path })
+  return module.exports
+}
+
+function loadFulfillmentOptimizerContract() {
+  const path = 'app_src/lib/operations/fulfillmentOptimizerContract.ts'
+  const output = ts.transpileModule(read(path), {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+    fileName: path,
+  }).outputText
+  const module = { exports: {} }
+  vm.runInNewContext(output, {
+    Array,
+    BigInt,
+    Boolean,
+    Buffer,
+    Date,
+    Error,
+    Map,
+    Math,
+    Number,
+    Object,
+    RegExp,
+    Set,
+    String,
+    console,
+    exports: module.exports,
+    module,
+    require: requireFromApp,
+  }, { filename: path })
+  return module.exports
+}
+
+const fulfillmentOptimizerContract = loadFulfillmentOptimizerContract()
+
+function loadOperationalGeometryRatePlan() {
+  const path =
+    'app_src/lib/operations/operationalGeometryCartonization.ts'
+  const output = ts.transpileModule(read(path), {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+    fileName: path,
+  }).outputText
+  const module = { exports: {} }
+  vm.runInNewContext(output, {
+    Array,
+    Boolean,
+    Date,
+    Error,
+    Map,
+    Math,
+    Number,
+    Object,
+    Promise,
+    RegExp,
+    Set,
+    String,
+    console,
+    exports: module.exports,
+    module,
+    require(specifier) {
+      if (specifier === '@/lib/operations/fulfillmentOptimizerContract') {
+        return fulfillmentOptimizerContract
+      }
+      return requireFromApp(specifier)
+    },
+  }, { filename: path })
+  return module.exports
+}
+
+function loadOperationalFaireRoute(
+  observed,
+  {
+    providers = ['ups_rest', 'fedex_rest'],
+    sandboxGeometry = false,
+    planTransform = null,
+  } = {},
+) {
   const path =
     'app_src/app/api/integrations/commerce/intake/cartonization-rate-evidence/route.ts'
   const output = ts.transpileModule(read(path), {
@@ -117,10 +232,23 @@ function loadOperationalFaireRoute(observed) {
     }
   }
   class IntegrationError extends Error {}
+  const canonicalEvidenceValue = (value) => {
+    if (Array.isArray(value)) return value.map(canonicalEvidenceValue)
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.entries(value)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, item]) => [key, canonicalEvidenceValue(item)]),
+      )
+    }
+    return value
+  }
   const evidenceHash = (value) => createHash('sha256')
-    .update(JSON.stringify(value))
+    .update(JSON.stringify(canonicalEvidenceValue(value)))
     .digest('hex')
   const cartonizationRead = {
+    organizationGlobalId: 'ga0000001',
+    activationState: 'shadow',
     readAt: '2026-08-02T20:00:00.000Z',
     account: {
       globalId: 'gia0000001',
@@ -133,6 +261,7 @@ function loadOperationalFaireRoute(observed) {
       rowVersion: 1,
       sourceHash: 'c'.repeat(64),
       workflowState: 'promoted',
+      currency: 'USD',
     },
     warehouse: {
       globalId: 'gwh0000001',
@@ -154,6 +283,7 @@ function loadOperationalFaireRoute(observed) {
         availabilityAuthority: 'operational_available',
         operationalAvailableQuantity: 3,
         providerCommittedQuantity: 0,
+        activeReservedQuantity: 0,
         assumedCommittedQuantity: 0,
         effectiveAvailableQuantity: 3,
         sourceLevelGlobalIds: [],
@@ -164,13 +294,71 @@ function loadOperationalFaireRoute(observed) {
     materialEvidence: [],
     recipeEvidence: [],
     lineEvidence: [],
-    input: {
-      mode: 'production',
-      lines: [],
+    input: sandboxGeometry ? {
+      mode: 'sandbox_demo',
+      lines: [{
+        lineGlobalId: 'gcol0000001',
+        productGlobalId: 'gpr0000001',
+        title: 'Sandbox mapped product',
+        quantity: 1,
+        unitWeightGrams: 400,
+        profile: {
+          versionGlobalId: 'gppv0000001',
+          capturedRowVersion: 3,
+          currentRowVersion: 3,
+          isCurrent: true,
+          lifecycleState: 'customer_confirmed',
+          fitModel: 'rigid_3d',
+          evidenceType: 'customer_confirmed',
+          evidenceReference: 'sandbox-product-pack-proof',
+          confirmedAt: '2026-08-02T19:00:00.000Z',
+          outerDimensionsMm: {
+            length: 180,
+            width: 120,
+            height: 80,
+          },
+        },
+      }],
       recipes: [],
       materials: [{
         materialGlobalId: 'gmat0000001',
+        capturedRowVersion: 2,
         currentRowVersion: 2,
+        isCurrent: true,
+        status: 'draft',
+        innerDimensionsMm: {
+          length: 200,
+          width: 150,
+          height: 100,
+        },
+        dimensionBasis: 'unconfirmed',
+        dimensionEvidenceType: 'customer_confirmed',
+        dimensionEvidenceReference: 'sandbox-material-proof',
+        dimensionConfirmedAt: '2026-08-02T19:00:00.000Z',
+        tareWeightGrams: null,
+        maximumGrossWeightGrams: 2_000,
+        availableQuantity: 0,
+        ratedOuterDimensionsMm: null,
+      }],
+    } : {
+      mode: 'production',
+      lines: [{
+        lineGlobalId: 'gcol0000001',
+        quantity: 1,
+      }],
+      recipes: [],
+      materials: [{
+        materialGlobalId: 'gmat0000001',
+        materialType: 'carton',
+        capturedRowVersion: 2,
+        currentRowVersion: 2,
+        isCurrent: true,
+        status: 'active',
+        innerDimensionsMm: {
+          length: 270,
+          width: 220,
+          height: 170,
+        },
         ratedOuterDimensionsMm: {
           length: 280,
           width: 230,
@@ -178,15 +366,38 @@ function loadOperationalFaireRoute(observed) {
         },
         tareWeightGrams: 120,
         maximumGrossWeightGrams: 5000,
+        unitCostMinor: 50,
+        currency: 'USD',
+        stockRowVersion: 1,
+        stockOnHandQuantity: 5,
+        activeClaimedQuantity: 0,
+        availableQuantity: 5,
       }],
     },
   }
-  const plan = {
+  let plan = sandboxGeometry ? {
     policyVersion: 'hybrid-cartonization-policy-v1',
     algorithmVersion: 'approved-recipe-v1',
     inputHash: 'a'.repeat(64),
     resultHash: 'b'.repeat(64),
     status: 'ready',
+    selfPackages: [],
+    recipePackages: [],
+    geometryFallbackLines: [{
+      lineGlobalId: 'gcol0000001',
+      productGlobalId: 'gpr0000001',
+      quantity: 1,
+      fitModel: 'rigid_3d',
+    }],
+    assumptions: [],
+    blockers: [],
+  } : {
+    policyVersion: 'hybrid-cartonization-policy-v1',
+    algorithmVersion: 'approved-recipe-v1',
+    inputHash: 'a'.repeat(64),
+    resultHash: 'b'.repeat(64),
+    status: 'ready',
+    selfPackages: [],
     recipePackages: [{
       packageKey: 'package-1',
       sequence: 1,
@@ -226,10 +437,13 @@ function loadOperationalFaireRoute(observed) {
     assumptions: [],
     blockers: [],
   }
-  const carrierAccounts = ['ups_rest', 'fedex_rest'].map((provider) => ({
+  if (planTransform) plan = planTransform(plan)
+  const carrierAccounts = providers.map((provider) => ({
     provider,
     environment: 'sandbox',
     status: 'active',
+    configured: true,
+    verificationStatus: 'verified',
     senderOriginWarehouseGlobalId: 'gwh0000001',
     carrierAccounts: [{
       globalId: provider === 'ups_rest'
@@ -284,6 +498,14 @@ function loadOperationalFaireRoute(observed) {
       CommerceIntegrationRequestError: IntegrationError,
       sanitizedCommerceIntegrationError: (error) => error,
     },
+    '@/lib/integrations/shopifyOrderPlanningAuthority': {
+      ShopifyOrderPlanningAuthorityError: IntegrationError,
+      inspectShopifyOrderPlanningAuthority: async () => {
+        throw new Error(
+          'Faire operational evidence must not read Shopify authority',
+        )
+      },
+    },
     '@/lib/operations/authorization': {
       activeOperationsOrganizationId: () => (
         '00000000-0000-4000-8000-000000000001'
@@ -293,17 +515,42 @@ function loadOperationalFaireRoute(observed) {
     '@/lib/operations/hybridCartonization': {
       planHybridCartonization: () => plan,
     },
+    '@/lib/operations/operationalGeometryCartonization': {
+      planOperationalGeometryRatePackages: async () => {
+        throw new Error(
+          'The recipe and sandbox route fixtures must not use operational geometry',
+        )
+      },
+    },
+    '@/lib/operations/orToolsFulfillmentOptimizer': {
+      configuredOrToolsFulfillmentOptimizer: () => null,
+    },
+    '@/lib/operations/sandboxCartonizationRatePlan': {
+      planSandboxGeometryRatePackages: sandboxGeometry
+        ? loadSandboxGeometryRatePlan()
+          .planSandboxGeometryRatePackages
+        : () => {
+            throw new Error(
+              'The operational Faire acceptance must not use sandbox geometry',
+            )
+          },
+    },
     '@/lib/persistence/config': {
       isPostgresStorageEnabled: () => true,
     },
     '@/lib/persistence/cartonizationRateEvidence': {
+      CARTONIZATION_RATE_EVIDENCE_CARRIER_PROVIDERS: [
+        'ups_rest',
+        'fedex_rest',
+      ],
       cartonizationRateEvidenceHash: evidenceHash,
       CartonizationRateEvidencePersistenceError: PersistenceError,
       claimCartonizationRateEvidenceCommandInPostgres: async () => ({
         state: 'created',
       }),
-      failCartonizationRateEvidenceCommandInPostgres: async () => {
-        throw new Error('Successful route acceptance must not fail its claim')
+      failCartonizationRateEvidenceCommandInPostgres: async (input) => {
+        if (!observed.commandFailures) observed.commandFailures = []
+        observed.commandFailures.push(input)
       },
       MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES: 50,
       readCartonizationRateCandidateContext: async () => ({
@@ -330,6 +577,10 @@ function loadOperationalFaireRoute(observed) {
         observed.readInput = input
         return cartonizationRead
       },
+    },
+    '@/lib/persistence/shopifyOrderPlanningAuthority': {
+      ShopifyOrderPlanningAuthorityPersistenceError: PersistenceError,
+      readOperationalOrderPlanningProviderFromPostgres: async () => 'faire',
     },
     '@/lib/requestUser': {
       requireRequestUser: async () => ({ email: 'operator@example.com' }),
@@ -386,6 +637,15 @@ const shipmentRateMigration = read(
 const shipmentRateConstraintRepairMigration = read(
   'db/migrations/0144_operations_cartonization_shipment_rate_constraint_repair.sql',
 )
+const enabledCarrierMigration = read(
+  'db/migrations/0259_operations_cartonization_enabled_carriers.sql',
+)
+const sandboxFixedAxisMigration = read(
+  'db/migrations/0260_operations_cartonization_sandbox_fixed_axis.sql',
+)
+const orToolsProfileMigration = read(
+  'db/migrations/0261_operations_cartonization_or_tools_profile_evidence.sql',
+)
 const persistence = read(
   'app_src/lib/persistence/cartonizationRateEvidence.ts',
 )
@@ -394,6 +654,9 @@ const route = read(
 )
 const workflow = read(
   'app_src/components/settings/CommerceIntakeWorkflow.tsx',
+)
+const operationsPersistence = read(
+  'app_src/lib/persistence/operations.ts',
 )
 
 assertIncludes(migration, [
@@ -488,11 +751,55 @@ assertIncludes(shipmentRateConstraintRepairMigration, [
   'DROP CONSTRAINT IF EXISTS',
   'operations_cartonization_rate_evidence_quote_rate_purpose_check',
 ], 'Whole-shipment quote-purpose constraint repair')
+assertIncludes(enabledCarrierMigration, [
+  'required_carrier_providers text[] NOT NULL',
+  "ARRAY['ups_rest']::text[]",
+  "ARRAY['fedex_rest']::text[]",
+  "ARRAY['ups_rest', 'fedex_rest']::text[]",
+  'cardinality(required_carrier_providers)',
+  'quote.provider = ANY(required_carrier_providers)',
+  'one supporting edge from every retained carrier per package',
+], 'Enabled-carrier cartonization evidence migration')
+assertIncludes(sandboxFixedAxisMigration, [
+  "'sandbox_fixed_axis'",
+  'pg_get_constraintdef(constraint_record.oid)',
+  'matching_constraint_count <> 1',
+  'ops_cart_rate_pkg_planning_method_check',
+  "planning_method IN ('or_tools', 'sandbox_fixed_axis')",
+  'validate_operations_cartonization_sandbox_fixed_axis_recipe_edges()',
+  'DEFERRABLE INITIALLY DEFERRED',
+  "evidence.evidence_mode = 'assumption_backed_sandbox'",
+  'Sandbox fixed-axis packages require assumption-backed sandbox evidence',
+  'Sandbox fixed-axis cartonization packages cannot retain approved recipe edges',
+], 'Sandbox fixed-axis planner provenance migration')
+assertIncludes(orToolsProfileMigration, [
+  'operations_cartonization_rate_evidence_package_profiles',
+  'input_pack_profile_version_id',
+  "fit_model = 'rigid_3d'",
+  'validate_operations_cartonization_rate_evidence_child_insert()',
+  'protect_operations_append_only()',
+  'validate_operations_cartonization_rate_profile_evidence_complete()',
+  'DEFERRABLE INITIALLY DEFERRED',
+  "evidence.evidence_mode <> 'operational'",
+  "package.planning_method = 'or_tools'",
+  'jsonb_array_length(package.allocations)',
+  "profile_version.dimension_basis = 'outer'",
+  "profile_version.lifecycle_state = 'active'",
+  'profile_version.is_current = true',
+], 'Operational OR-Tools profile evidence migration')
 
 assertIncludes(persistence, [
   'export function cartonizationRateEvidenceHash',
   'MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES = 50',
   'CartonizationRateEvidenceMaterialRateAssumption',
+  'CARTONIZATION_RATE_EVIDENCE_CARRIER_PROVIDERS',
+  'assertCartonizationRateEvidenceCarrierCoverage',
+  'assertCartonizationRateEvidenceOrToolsProfiles',
+  'assertCartonizationRateEvidenceOperationalGeometryProvenance',
+  'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROVENANCE_INVALID',
+  'canonicalOptimizerHash(optimizerInput)',
+  'parseFulfillmentOptimizationResult(',
+  'requiredCarrierProviders',
   'assertCartonizationRateEvidenceMaterialAssumptions',
   'materialRateAssumptions',
   'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_ASSUMPTIONS_FORBIDDEN',
@@ -500,6 +807,9 @@ assertIncludes(persistence, [
   'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_STALE',
   'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_STOCK_STALE',
   'CARTONIZATION_RATE_EVIDENCE_MATERIAL_ASSUMPTION_MISMATCH',
+  "planningMethod === 'sandbox_fixed_axis'",
+  "packageInput.planningMethod !== 'approved_recipe'",
+  'CARTONIZATION_RATE_EVIDENCE_SANDBOX_GEOMETRY_EVIDENCE_INVALID',
   'rateContextsByEvidence',
   'export function cartonizationRateEvidenceRequestHash',
   'const packages = [...input.packages].sort(',
@@ -538,6 +848,28 @@ assert.doesNotMatch(
   /\bcanonicalHash\(/,
   'The retired hash helper must not remain referenced',
 )
+const warehousePlanningBoundary = section(
+  operationsPersistence,
+  'export async function planOperationsOrderFromPostgres(',
+  'export async function releaseOperationsOrderFromPostgres(',
+  'Warehouse planning evidence boundary',
+)
+assertIncludes(warehousePlanningBoundary, [
+  "item.planningMethod === 'sandbox_fixed_axis'",
+  "package.planning_method,",
+  "item.planning_method === 'sandbox_fixed_axis'",
+  'OPERATIONS_CARTONIZATION_SANDBOX_PACKAGE_FORBIDDEN',
+  'Assumption-backed sandbox fixed-axis packages cannot become warehouse work',
+  'operations_cartonization_rate_evidence_package_profiles',
+  'operations_commerce_order_candidate_lines candidate_line',
+  'candidate_line.pack_profile_version_id',
+  'candidate_line.pack_profile_version_row_version',
+  "candidate_line.mapping_state AS candidate_line_mapping_state",
+  'FOR UPDATE OF candidate_line, profile_version',
+  'OPERATIONS_CARTONIZATION_PROFILE_EVIDENCE_STALE',
+  'AND position_id = $2::uuid',
+  "AND reservation_authority = 'provider_commitment'",
+], 'Warehouse planning must reject sandbox fixed-axis evidence before stock work')
 assert.doesNotMatch(
   persistence,
   /product\.global_id/,
@@ -573,7 +905,8 @@ assertIncludes(route, [
   'semanticRequestHash',
   'const orderedParcels = [...packageInputs]',
   'left.packageSequence - right.packageSequence',
-  "const providers = ['ups_rest', 'fedex_rest'] as const",
+  'CARTONIZATION_RATE_EVIDENCE_CARRIER_PROVIDERS.filter(',
+  "account.verificationStatus === 'verified'",
   'testCarrierSandboxShipmentRate',
   'parcels: orderedParcels',
   'shipmentRateEvidenceByProvider',
@@ -587,7 +920,40 @@ assertIncludes(route, [
   'labelCalls: 0',
   'postagePurchases: 0',
   'providerWrites: 0',
+  'planSandboxGeometryRatePackages',
+  "request.evidenceMode === 'operational'",
+  'sandboxGeometryRatePlan',
+  'packagePlan.planningMethod',
+  'CARTONIZATION_RATE_EVIDENCE_SELF_PACKAGE_UNSUPPORTED',
+  'CARTONIZATION_RATE_EVIDENCE_ALLOCATION_COVERAGE_INVALID',
 ], 'Executable package-and-rate workflow')
+const operationalGeometryFence = section(
+  route,
+  "request.evidenceMode === 'operational'\n      && plan.geometryFallbackLines.length > 0",
+  'const sandboxGeometryRatePlan =',
+  'Operational geometry fence',
+)
+assertIncludes(operationalGeometryFence, [
+  "read.activationState !== 'shadow'",
+  'CARTONIZATION_RATE_EVIDENCE_SHADOW_REQUIRED',
+  'configuredOrToolsFulfillmentOptimizer()',
+  'planOperationalGeometryRatePackages({',
+  'optimizer,',
+  "operationalGeometryRatePlan.status === 'blocked'",
+], 'Operational geometry must use one fail-closed OR-Tools plan in Shadow')
+const sandboxGeometrySection = section(
+  route,
+  'const sandboxGeometryRatePlan =',
+  'const packagePlanCount =',
+  'Sandbox geometry package construction',
+)
+assertIncludes(sandboxGeometrySection, [
+  "request.evidenceMode === 'assumption_backed_sandbox'",
+  'planSandboxGeometryRatePackages({',
+  'lines: read.input.lines',
+  'materialAssumptions: selectedMaterialRateAssumptions',
+  'MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES',
+], 'Sandbox geometry package construction')
 assert.ok(
   route.indexOf('claimCartonizationRateEvidenceCommandInPostgres({')
     < route.indexOf('readHybridCartonizationInputFromPostgres({'),
@@ -748,12 +1114,556 @@ assert.doesNotMatch(
 )
 
 const {
+  assertCartonizationRateEvidenceCarrierCoverage,
   assertCartonizationRateEvidenceMaterialAssumptions,
+  assertCartonizationRateEvidenceOperationalGeometryProvenance,
+  assertCartonizationRateEvidenceOrToolsProfiles,
   cartonizationRateEvidenceHash,
   cartonizationRateEvidenceRequestHash,
   cartonizationShipmentRateContextHash,
   CartonizationRateEvidencePersistenceError,
 } = loadPersistence()
+
+const {
+  SANDBOX_GEOMETRY_RATE_POLICY_VERSION,
+  planSandboxGeometryRatePackages,
+} = loadSandboxGeometryRatePlan()
+
+const sandboxLine = {
+  lineGlobalId: 'gcol0000001',
+  productGlobalId: 'gp0000001',
+  title: 'Mapped test product',
+  quantity: 2,
+  unitWeightGrams: 400,
+  profile: {
+    versionGlobalId: 'gppv0000001',
+    capturedRowVersion: 3,
+    currentRowVersion: 3,
+    isCurrent: true,
+    lifecycleState: 'customer_confirmed',
+    fitModel: 'rigid_3d',
+    evidenceType: 'customer_confirmed',
+    evidenceReference: 'customer-pack-proof',
+    confirmedAt: '2026-08-10T12:00:00.000Z',
+    outerDimensionsMm: { length: 180, width: 120, height: 80 },
+  },
+}
+const sandboxMaterials = [
+  {
+    materialGlobalId: 'gmat0000002',
+    capturedRowVersion: 4,
+    currentRowVersion: 4,
+    isCurrent: true,
+    status: 'draft',
+    innerDimensionsMm: { length: 300, width: 250, height: 200 },
+    dimensionBasis: 'inner',
+    dimensionEvidenceType: 'customer_confirmed',
+    dimensionEvidenceReference: 'customer-box-proof-large',
+    dimensionConfirmedAt: '2026-08-10T12:00:00.000Z',
+    tareWeightGrams: null,
+    maximumGrossWeightGrams: null,
+    availableQuantity: null,
+    ratedOuterDimensionsMm: null,
+  },
+  {
+    materialGlobalId: 'gmat0000001',
+    capturedRowVersion: 2,
+    currentRowVersion: 2,
+    isCurrent: true,
+    status: 'draft',
+    innerDimensionsMm: { length: 200, width: 150, height: 100 },
+    dimensionBasis: 'unconfirmed',
+    dimensionEvidenceType: 'customer_confirmed',
+    dimensionEvidenceReference: 'customer-box-proof-small',
+    dimensionConfirmedAt: '2026-08-10T12:00:00.000Z',
+    tareWeightGrams: null,
+    maximumGrossWeightGrams: 2_000,
+    availableQuantity: 0,
+    ratedOuterDimensionsMm: null,
+  },
+]
+const sandboxMaterialAssumptions = [
+  {
+    materialGlobalId: 'gmat0000002',
+    expectedRowVersion: 4,
+    ratedOuterDimensionsMm: { length: 310, width: 260, height: 210 },
+    tareWeightGrams: 150,
+  },
+  {
+    materialGlobalId: 'gmat0000001',
+    expectedRowVersion: 2,
+    ratedOuterDimensionsMm: { length: 210, width: 160, height: 110 },
+    tareWeightGrams: 100,
+  },
+]
+const sandboxGeometryPlan = planSandboxGeometryRatePackages({
+  lines: [sandboxLine],
+  fallbackLines: [{
+    lineGlobalId: sandboxLine.lineGlobalId,
+    productGlobalId: sandboxLine.productGlobalId,
+    quantity: 2,
+    fitModel: 'rigid_3d',
+  }],
+  materials: sandboxMaterials,
+  materialAssumptions: sandboxMaterialAssumptions,
+  startingSequence: 1,
+  maximumPackages: 50,
+})
+assert.equal(sandboxGeometryPlan.status, 'ready')
+assert.equal(sandboxGeometryPlan.packages.length, 2)
+assert.equal(
+  sandboxGeometryPlan.packages[0].packagingMaterialGlobalId,
+  'gmat0000001',
+  'Sandbox geometry must choose the smallest exact fixed-axis fit deterministically',
+)
+assert.equal(sandboxGeometryPlan.packages[0].allocations[0].quantity, 1)
+assert.equal(sandboxGeometryPlan.packages[0].contentWeightGrams, 400)
+assert.equal(sandboxGeometryPlan.packages[0].tareWeightGrams, 100)
+assert.equal(sandboxGeometryPlan.packages[0].ratedGrossWeightGrams, 500)
+assert.equal(
+  sandboxGeometryPlan.packages[0].planningMethod,
+  'sandbox_fixed_axis',
+)
+assert.equal(
+  sandboxGeometryPlan.packages[0].geometryEvidence.policyVersion,
+  SANDBOX_GEOMETRY_RATE_POLICY_VERSION,
+)
+assert.equal(
+  sandboxGeometryPlan.packages[0].geometryEvidence.materialDimensionBasis,
+  'unconfirmed',
+  'Sandbox geometry must retain the actual material dimension basis without upgrading it to inner evidence',
+)
+assert.equal(
+  sandboxGeometryPlan.evidence.materialStockAuthority,
+  'not_used_for_sandbox_comparison',
+  'Draft/zero-stock material must remain a comparison assumption, not operational stock authority',
+)
+const reorderedSandboxGeometryPlan = planSandboxGeometryRatePackages({
+  lines: [sandboxLine],
+  fallbackLines: [{
+    lineGlobalId: sandboxLine.lineGlobalId,
+    productGlobalId: sandboxLine.productGlobalId,
+    quantity: 2,
+    fitModel: 'rigid_3d',
+  }],
+  materials: [...sandboxMaterials].reverse(),
+  materialAssumptions: [...sandboxMaterialAssumptions].reverse(),
+  startingSequence: 1,
+  maximumPackages: 50,
+})
+assert.deepEqual(
+  JSON.parse(JSON.stringify(reorderedSandboxGeometryPlan)),
+  JSON.parse(JSON.stringify(sandboxGeometryPlan)),
+  'Sandbox geometry must not depend on selected-material request order',
+)
+const sandboxNoFit = planSandboxGeometryRatePackages({
+  lines: [sandboxLine],
+  fallbackLines: [{
+    lineGlobalId: sandboxLine.lineGlobalId,
+    productGlobalId: sandboxLine.productGlobalId,
+    quantity: 1,
+    fitModel: 'rigid_3d',
+  }],
+  materials: [{
+    ...sandboxMaterials[1],
+    innerDimensionsMm: { length: 179, width: 150, height: 100 },
+  }],
+  materialAssumptions: [{
+    ...sandboxMaterialAssumptions[1],
+    ratedOuterDimensionsMm: { length: 210, width: 160, height: 110 },
+  }],
+  startingSequence: 1,
+  maximumPackages: 50,
+})
+assert.equal(sandboxNoFit.status, 'blocked')
+assert.equal(
+  sandboxNoFit.blocker.code,
+  'CARTONIZATION_RATE_EVIDENCE_SANDBOX_GEOMETRY_NO_FIT',
+)
+const sandboxOuterSmallerThanFit = planSandboxGeometryRatePackages({
+  lines: [sandboxLine],
+  fallbackLines: [{
+    lineGlobalId: sandboxLine.lineGlobalId,
+    productGlobalId: sandboxLine.productGlobalId,
+    quantity: 1,
+    fitModel: 'rigid_3d',
+  }],
+  materials: [sandboxMaterials[1]],
+  materialAssumptions: [{
+    ...sandboxMaterialAssumptions[1],
+    ratedOuterDimensionsMm: { length: 199, width: 150, height: 100 },
+  }],
+  startingSequence: 1,
+  maximumPackages: 50,
+})
+assert.equal(sandboxOuterSmallerThanFit.status, 'blocked')
+assert.equal(
+  sandboxOuterSmallerThanFit.blocker.code,
+  'CARTONIZATION_RATE_EVIDENCE_MATERIAL_ASSUMPTIONS_MISSING',
+  'A rated exterior assumption cannot be smaller than retained fit dimensions',
+)
+const sandboxMissingPackDimensions = planSandboxGeometryRatePackages({
+  lines: [{
+    ...sandboxLine,
+    profile: { ...sandboxLine.profile, outerDimensionsMm: null },
+  }],
+  fallbackLines: [{
+    lineGlobalId: sandboxLine.lineGlobalId,
+    productGlobalId: sandboxLine.productGlobalId,
+    quantity: 1,
+    fitModel: 'rigid_3d',
+  }],
+  materials: sandboxMaterials,
+  materialAssumptions: sandboxMaterialAssumptions,
+  startingSequence: 1,
+  maximumPackages: 50,
+})
+assert.equal(sandboxMissingPackDimensions.status, 'blocked')
+assert.equal(
+  sandboxMissingPackDimensions.blocker.code,
+  'CARTONIZATION_RATE_EVIDENCE_SANDBOX_LINE_PACK_REQUIRED',
+  'Sandbox assumptions must never replace the current exact product pack profile',
+)
+
+const { planOperationalGeometryRatePackages } =
+  loadOperationalGeometryRatePlan()
+const operationalGeometryInput = {
+  organizationGlobalId: 'go0000001',
+  provider: 'shopify',
+  candidateGlobalId: 'gcoc0000001',
+  candidateRowVersion: 3,
+  currency: 'USD',
+  readAt: '2026-08-02T20:00:00.000Z',
+  warehouseGlobalId: 'gwh0000001',
+  lines: [{
+    lineGlobalId: 'gcol0000001',
+    productGlobalId: 'gp0000001',
+    title: 'Exact measured product',
+    quantity: 2,
+    unitWeightGrams: 200,
+    profile: {
+      versionGlobalId: 'gppv0000001',
+      capturedRowVersion: 3,
+      currentRowVersion: 3,
+      isCurrent: true,
+      lifecycleState: 'active',
+      fitModel: 'rigid_3d',
+      outerDimensionsMm: { length: 100, width: 80, height: 40 },
+      grossWeightGrams: 200,
+    },
+  }],
+  fallbackLines: [{
+    lineGlobalId: 'gcol0000001',
+    productGlobalId: 'gp0000001',
+    quantity: 2,
+    fitModel: 'rigid_3d',
+  }],
+  recipePackages: [],
+  materials: [{
+    materialGlobalId: 'gmat0000001',
+    materialType: 'carton',
+    capturedRowVersion: 2,
+    currentRowVersion: 2,
+    isCurrent: true,
+    status: 'active',
+    innerDimensionsMm: { length: 250, width: 200, height: 150 },
+    ratedOuterDimensionsMm: { length: 260, width: 210, height: 160 },
+    tareWeightGrams: 120,
+    maximumGrossWeightGrams: 10_000,
+    unitCostMinor: 55,
+    currency: 'USD',
+    stockRowVersion: 4,
+    stockOnHandQuantity: 5,
+    activeClaimedQuantity: 1,
+    availableQuantity: 4,
+  }],
+  inventoryProducts: [{
+    productGlobalId: 'gp0000001',
+    availabilityAuthority: 'shopify_provider_commitment',
+    providerCommittedQuantity: 3,
+    activeReservedQuantity: 1,
+    effectiveAvailableQuantity: 2,
+    sourceLevelGlobalIds: ['giil0000001'],
+    sourcePositionGlobalIds: ['giv0000001'],
+    sourcePositionVersion: 4,
+  }],
+  startingSequence: 1,
+  maximumPackages: 50,
+}
+function validOperationalOptimizerResult(input, options, method = 'or_tools') {
+  const selectedPlan = {
+    planId: 'plan-operational-1',
+    warehouseGlobalIds: ['gwh0000001'],
+    warehouseCount: 1,
+    shipmentCount: 1,
+    cartonCount: 1,
+    estimatedTotalCostMinor: 55,
+    unusedVolumeMm3: 6_860_000,
+    packages: [{
+      packageKey: 'package-operational-1',
+      warehouseGlobalId: 'gwh0000001',
+      cartonGlobalId: 'gmat0000001',
+      innerDimensionsMm: { length: 250, width: 200, height: 150 },
+      maxWeightGrams: 10_000,
+      emptyWeightGrams: 120,
+      totalWeightGrams: 520,
+      usedVolumeMm3: 640_000,
+      unusedVolumeMm3: 6_860_000,
+      estimatedCostMinor: 55,
+      allocations: [{
+        lineGlobalId: 'gcol0000001',
+        productGlobalId: 'gp0000001',
+        positionGlobalId: 'giv0000001',
+        quantity: 2,
+      }],
+      placements: [{
+        unitKey: 'unit-operational-1',
+        lineGlobalId: 'gcol0000001',
+        productGlobalId: 'gp0000001',
+        positionGlobalId: 'giv0000001',
+        dimensionsMm: { length: 100, width: 80, height: 40 },
+        coordinatesMm: { x: 0, y: 0, z: 0 },
+      }, {
+        unitKey: 'unit-operational-2',
+        lineGlobalId: 'gcol0000001',
+        productGlobalId: 'gp0000001',
+        positionGlobalId: 'giv0000001',
+        dimensionsMm: { length: 100, width: 80, height: 40 },
+        coordinatesMm: { x: 100, y: 0, z: 0 },
+      }],
+    }],
+  }
+  const inputHash = fulfillmentOptimizerContract.canonicalOptimizerHash(input)
+  return fulfillmentOptimizerContract.parseFulfillmentOptimizationResult({
+    schemaVersion: 1,
+    status: 'optimal',
+    method,
+    algorithmVersion: 'test-or-tools-v1',
+    inputHash,
+    durationMs: 1,
+    selectedPlan,
+    candidates: [selectedPlan],
+    rejectedAlternatives: [],
+    fallbackReason: method === 'or_tools' ? null : 'test-only fallback',
+    explanation: [],
+  }, input, options, inputHash)
+}
+let operationalOptimizerCalls = 0
+const operationalGeometryReady = await planOperationalGeometryRatePackages({
+  ...operationalGeometryInput,
+  optimizer: {
+    async optimize(input, options) {
+      operationalOptimizerCalls += 1
+      return validOperationalOptimizerResult(input, options)
+    },
+  },
+})
+assert.equal(operationalOptimizerCalls, 1)
+assert.equal(operationalGeometryReady.status, 'ready')
+assert.equal(
+  operationalGeometryReady.optimizerInput.eligiblePositions[0]
+    .availableQuantity,
+  2,
+  'Operational optimizer inventory must subtract active reservations',
+)
+assert.equal(
+  operationalGeometryReady.optimizerInput.cartons[0].availableQuantity,
+  4,
+  'Operational optimizer material stock must subtract active package claims',
+)
+const fullyRecipeConsumedMaterial = {
+  ...operationalGeometryInput.materials[0],
+  materialGlobalId: 'gmat0000002',
+  stockOnHandQuantity: 1,
+  activeClaimedQuantity: 0,
+  availableQuantity: 1,
+}
+const mixedRecipeGeometryReady = await planOperationalGeometryRatePackages({
+  ...operationalGeometryInput,
+  materials: [
+    ...operationalGeometryInput.materials,
+    fullyRecipeConsumedMaterial,
+  ],
+  recipePackages: [{
+    packageKey: 'package-recipe-1',
+    packagingMaterialGlobalId: 'gmat0000002',
+    lineAllocations: [{
+      productGlobalId: 'gp0000002',
+      quantity: 1,
+    }],
+  }],
+  startingSequence: 2,
+  optimizer: {
+    async optimize(input, options) {
+      return validOperationalOptimizerResult(input, options)
+    },
+  },
+})
+assert.equal(mixedRecipeGeometryReady.status, 'ready')
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    mixedRecipeGeometryReady.optimizerInput.cartons.map(
+      (carton) => carton.cartonGlobalId,
+    ),
+  )),
+  ['gmat0000001'],
+  'A valid material fully consumed by recipe packages must be excluded without blocking residual geometry',
+)
+assert.equal(operationalGeometryReady.packages[0].planningMethod, 'or_tools')
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    operationalGeometryReady.packages[0].orToolsProfiles,
+  )),
+  [{
+    lineGlobalId: 'gcol0000001',
+    productGlobalId: 'gp0000001',
+    inputProfileVersionGlobalId: 'gppv0000001',
+    inputProfileVersionRowVersion: 3,
+    fitModel: 'rigid_3d',
+    unitDimensionsMm: { length: 100, width: 80, height: 40 },
+    unitWeightGrams: 200,
+    quantity: 2,
+  }],
+  'Operational package evidence must retain the exact allocation profile edge',
+)
+const operationalWritePackages = operationalGeometryReady.packages.map(
+  (packagePlan) => {
+    const snapshot = {
+      ...packagePlan,
+      carrierParcel: {
+        description: 'Operational provenance test',
+        length: 10.236,
+        width: 8.268,
+        height: 6.299,
+        dimensionUnit: 'IN',
+        weight: 1.147,
+        weightUnit: 'LB',
+      },
+    }
+    return {
+      ...snapshot,
+      packageHash: cartonizationRateEvidenceHash(snapshot),
+    }
+  },
+)
+const operationalGeometryPlanSnapshot = {
+  operationalGeometryRatePlan: {
+    evidence: operationalGeometryReady.evidence,
+    optimizerInput: operationalGeometryReady.optimizerInput,
+    optimizerResult: operationalGeometryReady.optimizerResult,
+    packages: operationalGeometryReady.packages,
+  },
+}
+assert.doesNotThrow(
+  () => assertCartonizationRateEvidenceOperationalGeometryProvenance({
+    evidenceMode: 'operational',
+    packages: operationalWritePackages,
+    planSnapshot: operationalGeometryPlanSnapshot,
+  }),
+  'Write-time evidence must accept exact optimizer and transformation provenance',
+)
+assert.throws(
+  () => assertCartonizationRateEvidenceOperationalGeometryProvenance({
+    evidenceMode: 'operational',
+    packages: operationalWritePackages,
+    planSnapshot: {
+      operationalGeometryRatePlan: {
+        ...operationalGeometryPlanSnapshot.operationalGeometryRatePlan,
+        evidence: {
+          ...operationalGeometryReady.evidence,
+          transformationHash: 'f'.repeat(64),
+        },
+      },
+    },
+  }),
+  (error) => (
+    error instanceof CartonizationRateEvidencePersistenceError
+    && error.code
+      === 'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROVENANCE_INVALID'
+  ),
+  'Write-time evidence must reject transformed-package provenance tampering',
+)
+const tamperedOptimizerInput = {
+  ...operationalGeometryReady.optimizerInput,
+  lines: operationalGeometryReady.optimizerInput.lines.map((line) => ({
+    ...line,
+    unitWeightGrams: line.unitWeightGrams - 1,
+  })),
+}
+const tamperedSelectedPlan = {
+  ...operationalGeometryReady.optimizerResult.selectedPlan,
+  packages: operationalGeometryReady.optimizerResult.selectedPlan.packages.map(
+    (packagePlan) => ({
+      ...packagePlan,
+      totalWeightGrams: packagePlan.totalWeightGrams - 2,
+    }),
+  ),
+}
+const tamperedOptimizerInputHash =
+  fulfillmentOptimizerContract.canonicalOptimizerHash(tamperedOptimizerInput)
+assert.throws(
+  () => assertCartonizationRateEvidenceOperationalGeometryProvenance({
+    evidenceMode: 'operational',
+    packages: operationalWritePackages,
+    planSnapshot: {
+      operationalGeometryRatePlan: {
+        ...operationalGeometryPlanSnapshot.operationalGeometryRatePlan,
+        evidence: {
+          ...operationalGeometryReady.evidence,
+          optimizerInputHash: tamperedOptimizerInputHash,
+        },
+        optimizerInput: tamperedOptimizerInput,
+        optimizerResult: {
+          ...operationalGeometryReady.optimizerResult,
+          inputHash: tamperedOptimizerInputHash,
+          selectedPlan: tamperedSelectedPlan,
+          candidates: [tamperedSelectedPlan],
+        },
+      },
+    },
+  }),
+  (error) => (
+    error instanceof CartonizationRateEvidencePersistenceError
+    && error.code
+      === 'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROVENANCE_INVALID'
+  ),
+  'Optimizer demand weight cannot drift from exact retained product profiles',
+)
+assert.throws(
+  () => assertCartonizationRateEvidenceOperationalGeometryProvenance({
+    evidenceMode: 'operational',
+    packages: operationalWritePackages.map((packageInput) => ({
+      ...packageInput,
+      maxWeightGrams: packageInput.maxWeightGrams - 1,
+    })),
+    planSnapshot: operationalGeometryPlanSnapshot,
+  }),
+  (error) => (
+    error instanceof CartonizationRateEvidencePersistenceError
+    && error.code
+      === 'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROVENANCE_INVALID'
+  ),
+  'Write-time evidence must reject a package capacity drift from the optimizer transformation',
+)
+const operationalGeometryFallback =
+  await planOperationalGeometryRatePackages({
+    ...operationalGeometryInput,
+    optimizer: {
+      async optimize(input, options) {
+        return validOperationalOptimizerResult(
+          input,
+          options,
+          'deterministic_fallback',
+        )
+      },
+    },
+  })
+assert.equal(operationalGeometryFallback.status, 'blocked')
+assert.equal(
+  operationalGeometryFallback.blocker.code,
+  'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_RESULT_REQUIRED',
+  'Deterministic fallback must never become operational evidence',
+)
 
 assert.equal(
   cartonizationRateEvidenceHash({
@@ -787,6 +1697,7 @@ assert.throws(
 
 const planSnapshot = {
   carrierReadEnvironment: 'sandbox',
+  requiredCarrierProviders: ['ups_rest', 'fedex_rest'],
   warehouseGlobalId: 'gwh0000001',
   packages: [{ packageKey: 'package-1' }],
 }
@@ -797,6 +1708,16 @@ const packageOne = {
   packagingMaterialGlobalId: 'gmat0000001',
   materialRowVersion: 2,
   recipes: [],
+  orToolsProfiles: [{
+    lineGlobalId: 'gcol0000001',
+    productGlobalId: 'gp0000001',
+    inputProfileVersionGlobalId: 'gppv0000001',
+    inputProfileVersionRowVersion: 3,
+    fitModel: 'rigid_3d',
+    unitDimensionsMm: { length: 120, width: 80, height: 40 },
+    unitWeightGrams: 400,
+    quantity: 2,
+  }],
   innerDimensionsMm: { length: 250, width: 200, height: 150 },
   ratedOuterDimensionsMm: { length: 260, width: 210, height: 160 },
   contentWeightGrams: 800,
@@ -835,14 +1756,43 @@ const materialRateAssumptions = [
     expectedRowVersion: 2,
     ratedOuterDimensionsMm: packageOne.ratedOuterDimensionsMm,
     tareWeightGrams: packageOne.tareWeightGrams,
+    operationalFacts: {
+      materialType: 'carton',
+      innerDimensionsMm: packageOne.innerDimensionsMm,
+      maximumGrossWeightGrams: packageOne.maxWeightGrams,
+      unitCostMinor: 50,
+      currency: 'USD',
+      stock: {
+        rowVersion: 1,
+        onHandQuantity: 5,
+        activeClaimedQuantity: 0,
+        availableQuantity: 5,
+      },
+    },
   },
   {
     materialGlobalId: 'gmat0000002',
     expectedRowVersion: 2,
     ratedOuterDimensionsMm: packageTwo.ratedOuterDimensionsMm,
     tareWeightGrams: packageTwo.tareWeightGrams,
+    operationalFacts: {
+      materialType: 'carton',
+      innerDimensionsMm: packageTwo.innerDimensionsMm,
+      maximumGrossWeightGrams: packageTwo.maxWeightGrams,
+      unitCostMinor: 60,
+      currency: 'USD',
+      stock: {
+        rowVersion: 1,
+        onHandQuantity: 5,
+        activeClaimedQuantity: 0,
+        availableQuantity: 5,
+      },
+    },
   },
 ]
+const sandboxMaterialRateAssumptions = materialRateAssumptions.map(
+  (assumption) => ({ ...assumption, operationalFacts: null }),
+)
 const quotes = packages.flatMap((item) => ([
   {
     packageKey: item.packageKey,
@@ -864,6 +1814,7 @@ const request = {
   warehouseGlobalId: 'gwh0000001',
   inventorySyncRunGlobalId: 'gisr0000001',
   evidenceMode: 'operational',
+  requiredCarrierProviders: ['ups_rest', 'fedex_rest'],
   policyVersion: 'cartonization-rate-v1',
   algorithmVersion: 'or-tools-v1',
   planInputHash: 'a'.repeat(64),
@@ -880,8 +1831,86 @@ const request = {
   quotes,
 }
 assert.doesNotThrow(
+  () => assertCartonizationRateEvidenceCarrierCoverage(request),
+  'Dual-carrier evidence must retain exactly one quote edge per provider and package',
+)
+assert.doesNotThrow(
+  () => assertCartonizationRateEvidenceOrToolsProfiles(request),
+  'Every operational OR-Tools allocation must retain one exact rigid profile edge',
+)
+assert.throws(
+  () => assertCartonizationRateEvidenceOrToolsProfiles({
+    ...request,
+    packages: [{ ...packages[0], orToolsProfiles: [] }],
+  }),
+  (error) => (
+    error instanceof CartonizationRateEvidencePersistenceError
+    && error.code
+      === 'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROFILE_INVALID'
+  ),
+  'Operational OR-Tools evidence must reject a missing allocation profile edge',
+)
+assert.doesNotThrow(
+  () => assertCartonizationRateEvidenceCarrierCoverage({
+    ...request,
+    requiredCarrierProviders: ['ups_rest'],
+    quotes: quotes.filter((quote) => quote.provider === 'ups_rest'),
+  }),
+  'A single enabled carrier must be sufficient for complete evidence',
+)
+assert.throws(
+  () => assertCartonizationRateEvidenceCarrierCoverage({
+    ...request,
+    requiredCarrierProviders: ['ups_rest'],
+  }),
+  (error) => (
+    error instanceof CartonizationRateEvidencePersistenceError
+    && error.code
+      === 'CARTONIZATION_RATE_EVIDENCE_CARRIER_COVERAGE_INVALID'
+  ),
+  'Evidence must reject quote edges outside the retained carrier set',
+)
+assert.doesNotThrow(
   () => assertCartonizationRateEvidenceMaterialAssumptions(request),
   'Every operational package must match its retained factual material inputs',
+)
+assert.throws(
+  () => assertCartonizationRateEvidenceMaterialAssumptions({
+    ...request,
+    packages: packages.map((item, index) => (
+      index === 0
+        ? {
+            ...item,
+            innerDimensionsMm: {
+              ...item.innerDimensionsMm,
+              length: item.innerDimensionsMm.length + 1,
+            },
+          }
+        : item
+    )),
+  }),
+  (error) => (
+    error instanceof CartonizationRateEvidencePersistenceError
+    && error.code
+      === 'CARTONIZATION_RATE_EVIDENCE_MATERIAL_ASSUMPTION_MISMATCH'
+  ),
+  'Operational package fit dimensions cannot drift from exact material facts',
+)
+assert.throws(
+  () => assertCartonizationRateEvidenceMaterialAssumptions({
+    ...request,
+    packages: packages.map((item, index) => (
+      index === 0
+        ? { ...item, maxWeightGrams: item.maxWeightGrams - 1 }
+        : item
+    )),
+  }),
+  (error) => (
+    error instanceof CartonizationRateEvidencePersistenceError
+    && error.code
+      === 'CARTONIZATION_RATE_EVIDENCE_MATERIAL_ASSUMPTION_MISMATCH'
+  ),
+  'Operational package capacity cannot drift from exact material facts',
 )
 assert.throws(
   () => assertCartonizationRateEvidenceMaterialAssumptions({
@@ -917,9 +1946,72 @@ assert.doesNotThrow(
   () => assertCartonizationRateEvidenceMaterialAssumptions({
     ...request,
     evidenceMode: 'assumption_backed_sandbox',
-    assumptionSnapshot: { materialRateAssumptions },
+    assumptionSnapshot: {
+      materialRateAssumptions: sandboxMaterialRateAssumptions,
+    },
+    materialRateAssumptions: sandboxMaterialRateAssumptions,
   }),
   'The explicit assumption-backed sandbox path must remain supported',
+)
+const sandboxFixedAxisPackage = {
+  ...packages[0],
+  planningMethod: 'sandbox_fixed_axis',
+  orToolsProfiles: [],
+}
+assert.doesNotThrow(
+  () => assertCartonizationRateEvidenceOrToolsProfiles({
+    ...request,
+    evidenceMode: 'assumption_backed_sandbox',
+    packages: [sandboxFixedAxisPackage],
+  }),
+  'Sandbox fixed-axis packages must explicitly retain no OR-Tools profile edges',
+)
+const sandboxFixedAxisEvidence = {
+  policyVersion: 'sandbox-fixed-axis-one-unit-per-parcel-v1',
+  fitEnvelopeBasis: 'retained_material_fit_dimensions',
+  rotationAllowed: false,
+  unitsPerPackage: 1,
+  materialStockAuthority: 'not_used_for_sandbox_comparison',
+}
+const sandboxFixedAxisRequest = {
+  ...request,
+  evidenceMode: 'assumption_backed_sandbox',
+  packages: [sandboxFixedAxisPackage],
+  materialRateAssumptions: sandboxMaterialRateAssumptions,
+  planSnapshot: {
+    ...request.planSnapshot,
+    sandboxGeometryRatePlan: {
+      evidence: sandboxFixedAxisEvidence,
+      packages: [{ packageKey: sandboxFixedAxisPackage.packageKey }],
+    },
+  },
+  assumptionSnapshot: {
+    watermark:
+      'ASSUMPTION-BACKED SANDBOX EVIDENCE - NOT EXECUTABLE OR ACTUAL BILLED COST',
+    materialRateAssumptions: sandboxMaterialRateAssumptions,
+    sandboxGeometryRatePlan: {
+      ...sandboxFixedAxisEvidence,
+      packageKeys: [sandboxFixedAxisPackage.packageKey],
+    },
+  },
+}
+assert.doesNotThrow(
+  () => assertCartonizationRateEvidenceMaterialAssumptions(
+    sandboxFixedAxisRequest,
+  ),
+  'Watermarked sandbox fixed-axis provenance must support recipe-free comparison packages',
+)
+assert.throws(
+  () => assertCartonizationRateEvidenceMaterialAssumptions({
+    ...sandboxFixedAxisRequest,
+    evidenceMode: 'operational',
+  }),
+  (error) => (
+    error instanceof CartonizationRateEvidencePersistenceError
+    && error.code
+      === 'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_ASSUMPTIONS_FORBIDDEN'
+  ),
+  'Operational evidence must reject sandbox fixed-axis package provenance',
 )
 assert.equal(
   quotes.length,
@@ -982,6 +2074,14 @@ assert.equal(
     quotes: [...quotes].reverse(),
   }),
   'Exact evidence request hashing must ignore actor, command key, material order, and edge ordering',
+)
+assert.notEqual(
+  requestHash,
+  cartonizationRateEvidenceRequestHash({
+    ...request,
+    requiredCarrierProviders: ['ups_rest'],
+  }),
+  'Semantic request hashing must change with the retained carrier set',
 )
 assert.notEqual(
   requestHash,
@@ -1051,6 +2151,7 @@ assert.deepEqual(
       labelCalls: 0,
       postagePurchases: 0,
       providerWrites: 0,
+      providerOrderReads: 0,
       carrierRateReads: 2,
       carrierQuoteEdges: 2,
     },
@@ -1062,6 +2163,10 @@ assert.equal(
   0,
 )
 assert.equal(faireRouteObserved.carrierReads.length, 2)
+assert.deepEqual(
+  Array.from(faireRouteObserved.write.requiredCarrierProviders),
+  ['ups_rest', 'fedex_rest'],
+)
 assert.equal(faireRouteObserved.write.inventorySyncRunGlobalId, null)
 assert.equal(faireRouteObserved.write.evidenceMode, 'operational')
 assert.equal(
@@ -1080,5 +2185,210 @@ assert.equal(
 assert.equal(faireRouteObserved.write.packages[0].contentWeightGrams, 170)
 assert.equal(faireRouteObserved.write.packages[0].tareWeightGrams, 120)
 assert.equal(faireRouteObserved.write.packages[0].ratedGrossWeightGrams, 290)
+
+const upsOnlyObserved = {
+  carrierReads: [],
+  readInput: null,
+  write: null,
+}
+const upsOnlyRoute = loadOperationalFaireRoute(
+  upsOnlyObserved,
+  { providers: ['ups_rest'] },
+)
+const upsOnlyResponse = await upsOnlyRoute.POST(new Request(
+  'http://localhost/api/integrations/commerce/intake/cartonization-rate-evidence',
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      accountGlobalId: 'gia0000001',
+      candidateGlobalId: 'gcoc0000001',
+      expectedCandidateRowVersion: 1,
+      warehouseGlobalId: 'gwh0000001',
+      idempotencyKey: 'faire-ups-only-route-acceptance',
+      evidenceMode: 'operational',
+      selectedMaterials: [{
+        materialGlobalId: 'gmat0000001',
+        expectedRowVersion: 2,
+      }],
+    }),
+  },
+))
+assert.equal(upsOnlyResponse.status, 200)
+const upsOnlyPayload = await upsOnlyResponse.json()
+assert.equal(upsOnlyPayload.effects.carrierRateReads, 1)
+assert.equal(upsOnlyPayload.effects.carrierQuoteEdges, 1)
+assert.deepEqual(
+  Array.from(upsOnlyObserved.write.requiredCarrierProviders),
+  ['ups_rest'],
+)
+assert.deepEqual(
+  Array.from(upsOnlyObserved.write.planSnapshot.requiredCarrierProviders),
+  ['ups_rest'],
+)
+assert.equal(upsOnlyObserved.write.quotes.length, 1)
+assert.equal(upsOnlyObserved.write.quotes[0].provider, 'ups_rest')
+
+const sandboxRouteObserved = {
+  carrierReads: [],
+  readInput: null,
+  write: null,
+}
+const sandboxRoute = loadOperationalFaireRoute(
+  sandboxRouteObserved,
+  { providers: ['ups_rest'], sandboxGeometry: true },
+)
+const sandboxRouteBody = {
+  accountGlobalId: 'gia0000001',
+  candidateGlobalId: 'gcoc0000001',
+  expectedCandidateRowVersion: 1,
+  warehouseGlobalId: 'gwh0000001',
+  idempotencyKey: 'sandbox-fixed-axis-route-acceptance',
+  evidenceMode: 'assumption_backed_sandbox',
+  selectedMaterials: [{
+    materialGlobalId: 'gmat0000001',
+    expectedRowVersion: 2,
+    sandboxRateAssumptions: {
+      ratedOuterDimensionsMm: {
+        length: 220,
+        width: 170,
+        height: 120,
+      },
+      tareWeightGrams: 100,
+    },
+  }],
+  assumedCommittedQuantities: [{
+    lineGlobalId: 'gcol0000001',
+    quantity: 1,
+  }],
+  sandboxAssumptions: {
+    acknowledged: true,
+    reason: 'Exact development comparison proof',
+    allowUnderMinimum: false,
+    assumedMinimumInputQuantity: null,
+  },
+}
+const sandboxRouteResponse = await sandboxRoute.POST(new Request(
+  'http://localhost/api/integrations/commerce/intake/cartonization-rate-evidence',
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(sandboxRouteBody),
+  },
+))
+assert.equal(sandboxRouteResponse.status, 200)
+assert.equal(sandboxRouteObserved.readInput.mode, 'sandbox_demo')
+assert.equal(sandboxRouteObserved.carrierReads.length, 1)
+assert.equal(sandboxRouteObserved.write.evidenceMode, 'assumption_backed_sandbox')
+assert.equal(sandboxRouteObserved.write.packages.length, 1)
+const sandboxWrittenPackage = sandboxRouteObserved.write.packages[0]
+assert.equal(sandboxWrittenPackage.planningMethod, 'sandbox_fixed_axis')
+assert.equal(sandboxWrittenPackage.recipes.length, 0)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(sandboxWrittenPackage.innerDimensionsMm)),
+  { length: 200, width: 150, height: 100 },
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(sandboxWrittenPackage.ratedOuterDimensionsMm)),
+  { length: 220, width: 170, height: 120 },
+)
+assert.equal(sandboxWrittenPackage.contentWeightGrams, 400)
+assert.equal(sandboxWrittenPackage.tareWeightGrams, 100)
+assert.equal(sandboxWrittenPackage.ratedGrossWeightGrams, 500)
+const { packageHash: writtenPackageHash, ...writtenPackageSnapshot } =
+  sandboxWrittenPackage
+assert.equal(
+  writtenPackageHash,
+  cartonizationRateEvidenceHash(writtenPackageSnapshot),
+  'The route package hash must use exactly the canonical persistence fields',
+)
+assert.equal(
+  sandboxRouteObserved.write.planSnapshot
+    .sandboxGeometryRatePlan.evidence.fitEnvelopeBasis,
+  'retained_material_fit_dimensions',
+)
+assert.equal(
+  sandboxRouteObserved.write.assumptionSnapshot
+    .sandboxGeometryRatePlan.packageKeys[0],
+  sandboxWrittenPackage.packageKey,
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(sandboxRouteObserved.carrierReads[0].parcels)),
+  [{
+    description: sandboxWrittenPackage.carrierParcel.description,
+    exteriorInches: {
+      length: sandboxWrittenPackage.carrierParcel.length,
+      width: sandboxWrittenPackage.carrierParcel.width,
+      height: sandboxWrittenPackage.carrierParcel.height,
+    },
+    grossPounds: sandboxWrittenPackage.carrierParcel.weight,
+  }],
+)
+
+const selfPackageObserved = { carrierReads: [], readInput: null, write: null }
+const selfPackageRoute = loadOperationalFaireRoute(
+  selfPackageObserved,
+  {
+    providers: ['ups_rest'],
+    sandboxGeometry: true,
+    planTransform: (value) => ({
+      ...value,
+      selfPackages: [{ packageKey: 'self-package-1' }],
+    }),
+  },
+)
+const selfPackageResponse = await selfPackageRoute.POST(new Request(
+  'http://localhost/api/integrations/commerce/intake/cartonization-rate-evidence',
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      ...sandboxRouteBody,
+      idempotencyKey: 'sandbox-self-package-rejection',
+    }),
+  },
+))
+assert.equal(selfPackageResponse.status, 422)
+assert.equal(
+  (await selfPackageResponse.json()).code,
+  'CARTONIZATION_RATE_EVIDENCE_SELF_PACKAGE_UNSUPPORTED',
+)
+assert.equal(selfPackageObserved.carrierReads.length, 0)
+
+const allocationObserved = { carrierReads: [], readInput: null, write: null }
+const allocationRoute = loadOperationalFaireRoute(
+  allocationObserved,
+  {
+    providers: ['ups_rest'],
+    sandboxGeometry: true,
+    planTransform: (value) => ({
+      ...value,
+      recipePackages: [{
+        sequence: 1,
+        lineAllocations: [{
+          lineGlobalId: 'gcol0000001',
+          quantity: 1,
+        }],
+      }],
+    }),
+  },
+)
+const allocationResponse = await allocationRoute.POST(new Request(
+  'http://localhost/api/integrations/commerce/intake/cartonization-rate-evidence',
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      ...sandboxRouteBody,
+      idempotencyKey: 'sandbox-allocation-coverage-rejection',
+    }),
+  },
+))
+assert.equal(allocationResponse.status, 422)
+assert.equal(
+  (await allocationResponse.json()).code,
+  'CARTONIZATION_RATE_EVIDENCE_ALLOCATION_COVERAGE_INVALID',
+)
+assert.equal(allocationObserved.carrierReads.length, 0)
 
 console.log('cartonization rate evidence contract tests passed')

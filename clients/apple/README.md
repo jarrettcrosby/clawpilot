@@ -69,6 +69,15 @@ source revision. `ClawPilotPickingPhoneDev` builds **ClawPilot Dev** with the
 identifiers and `https://aiapp.eigenracing.com`. The environment is selected by
 the signed Xcode scheme, never by a picker on the login screen.
 
+The development scheme runs the `Development` debug configuration locally but
+profiles and archives with the release-optimized `DevelopmentRelease`
+configuration. Both configurations use `Development.xcconfig`, so a dev
+TestFlight build retains the dev identifiers and origin without compiling
+debug-only behavior. The iPhone and Watch targets each bundle their own
+`PrivacyInfo.xcprivacy`; the phone declares its app-container file metadata and
+app-local user-defaults access, while the Watch declares only its app-local
+user-defaults access.
+
 For DAT 0.9, each Meta Wearables Developer Center project must use the callback
 from its matching configuration: `clawpilot-meta-dev://` for development and
 `clawpilot-meta://` for production. Despite the portal label **Universal link**,
@@ -86,11 +95,15 @@ Signed builds keep environment-specific credentials in the ignored
 - `CLAWPILOT_GOOGLE_PRODUCTION_REVERSED_CLIENT_ID`
 - `CLAWPILOT_GOOGLE_SERVER_CLIENT_ID_SHARED`
 
-Google sign-in is additive to magic codes. The server verifies the Google ID
-token against `GOOGLE_SSO_SERVER_CLIENT_ID`, requires a verified email, and then
-requires an existing ClawPilot user with that exact normalized email. It never
-creates a user or grants an organization role. Face ID is a device-local unlock
-for an already authenticated ClawPilot session and cannot replace server login.
+Google sign-in is additive to magic codes. After an organization administrator
+enables the method, each user signs in with their existing account and links
+their own Google identity from the iPhone Session Security card or web Security
+settings. The server verifies the token against `GOOGLE_SSO_SERVER_CLIENT_ID`
+and requires both the stored Google subject and its verified email to match that
+exact existing ClawPilot user. One user's link cannot authenticate another user;
+Google never creates a user or grants an organization role. Face ID is a
+device-local unlock for an already authenticated ClawPilot session and cannot
+replace server login.
 
 The local file is optional for simulator compilation and must never be
 committed. Physical validation must still prove Meta registration, camera

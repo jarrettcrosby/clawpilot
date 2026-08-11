@@ -584,7 +584,7 @@ test('secret route authorizes in constant time and only returns safe aggregates'
           },
         },
         '@/lib/integrations/commerceIntake': {
-          commerceIntakeRuntimeAvailable() {
+          commerceReadRuntimeAvailable() {
             return runtimeAvailable
           },
         },

@@ -3,7 +3,15 @@ export const PRINTER_CONNECTION_MODES = ['local_agent', 'browser', 'system_servi
 export const PRINTER_STATUSES = ['online', 'offline', 'disabled'] as const
 export const PRINTER_STATION_TYPES = ['pack', 'shipping', 'receiving', 'office'] as const
 export const PRINT_FORMATS = ['ZPL', 'PDF', 'PNG'] as const
-export const PRINT_MEDIA = ['label_4x6', 'label_4x8', 'letter', 'a4'] as const
+export const PRINT_MEDIA = [
+  'label_2x1',
+  'label_3x1',
+  'label_4x2',
+  'label_4x6',
+  'label_4x8',
+  'letter',
+  'a4',
+] as const
 export const PRINT_DOCUMENT_TYPES = [
   'shipping_label',
   'packing_slip',
@@ -14,8 +22,15 @@ export const PRINT_DOCUMENT_TYPES = [
   'customs_document',
   'return_label',
   'customer_insert',
+  'product_label',
+  'location_label',
 ] as const
-export const DURABLE_PRINT_DOCUMENT_TYPES = ['shipping_label', 'packing_slip'] as const
+export const DURABLE_PRINT_DOCUMENT_TYPES = [
+  'shipping_label',
+  'packing_slip',
+  'product_label',
+  'location_label',
+] as const
 export const PRINT_PAYLOAD_ENCODINGS = ['utf8', 'base64'] as const
 export const PRINT_AGENT_STATUSES = ['active', 'revoked'] as const
 export const PRINT_JOB_STATUSES = [
@@ -289,7 +304,14 @@ export type PrinterRouteSelection = {
   reason: string
 }
 
-const LABEL_MEDIA = new Set<PrintMedia>(['label_4x6', 'label_4x8'])
+const LABEL_MEDIA = new Set<PrintMedia>([
+  'label_2x1',
+  'label_3x1',
+  'label_4x2',
+  'label_4x6',
+  'label_4x8',
+])
+const SHIPPING_LABEL_MEDIA = new Set<PrintMedia>(['label_4x6', 'label_4x8'])
 const DOCUMENT_MEDIA = new Set<PrintMedia>(['letter', 'a4'])
 
 export function isDocumentMediaCompatible(input: {
@@ -298,10 +320,13 @@ export function isDocumentMediaCompatible(input: {
   media: PrintMedia
 }) {
   if (input.documentType === 'shipping_label') {
-    return LABEL_MEDIA.has(input.media)
+    return SHIPPING_LABEL_MEDIA.has(input.media)
   }
   if (input.documentType === 'packing_slip') {
     return DOCUMENT_MEDIA.has(input.media) && input.format !== 'ZPL'
+  }
+  if (input.documentType === 'product_label' || input.documentType === 'location_label') {
+    return LABEL_MEDIA.has(input.media) && input.format === 'ZPL'
   }
   return true
 }

@@ -1,6 +1,9 @@
 import crypto from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
-import { commerceIntakeRuntimeAvailable } from '@/lib/integrations/commerceIntake'
+import {
+  commerceReadRuntimeAvailable,
+  commerceReadRuntimeMode,
+} from '@/lib/integrations/commerceIntake'
 import {
   faireAutomaticExactRefreshHealthSnapshot,
   faireAutomaticOrderPromotionHealthSnapshot,
@@ -133,11 +136,11 @@ export async function POST(req: NextRequest) {
   if (!authorized(req)) {
     return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
   }
-  if (!commerceIntakeRuntimeAvailable()) {
+  if (!commerceReadRuntimeAvailable()) {
     return NextResponse.json({
       ok: true,
       skipped: true,
-      reason: 'commerce-intake-disabled',
+      reason: 'commerce-read-reconciliation-disabled',
       automaticShopifyOrderPromotion:
         shopifyAutomaticOrderPromotionHealthSnapshot(),
       automaticFaireOrderPromotion:
@@ -165,7 +168,9 @@ export async function POST(req: NextRequest) {
     phase: 'started',
     workerId,
     providerReadOnly: true,
-    localCanonicalOrderWritesPossible: true,
+    localCanonicalOrderWritesPossible:
+      commerceReadRuntimeMode?.() === 'development',
+    runtimeMode: commerceReadRuntimeMode?.() || null,
     providerWrites: 0,
     ...startedAttentionHealth,
   })
@@ -196,7 +201,9 @@ export async function POST(req: NextRequest) {
       phase: 'failed',
       workerId,
       providerReadOnly: true,
-      localCanonicalOrderWritesPossible: true,
+      localCanonicalOrderWritesPossible:
+        commerceReadRuntimeMode?.() === 'development',
+      runtimeMode: commerceReadRuntimeMode?.() || null,
       providerWrites: 0,
       ...failedAttentionHealth,
     }).catch(() => undefined)

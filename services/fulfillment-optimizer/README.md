@@ -26,8 +26,24 @@ carton, invents inventory, or reads current runtime state.
   `127.0.0.1`.
 
 The health endpoint returns `503` until the secret is configured. The ClawPilot
-application adapter additionally requires an explicit feature flag and is not
-wired into hosted order planning by this service directory.
+application adapter additionally requires:
+
+- `CLAWPILOT_FULFILLMENT_OPTIMIZER_ENABLED=1`;
+- `CLAWPILOT_FULFILLMENT_OPTIMIZER_URL`, using HTTPS or the exact Railway
+  private endpoint `http://fulfillment-optimizer.railway.internal` with an
+  optional valid port such as `:8080`;
+- the same `CLAWPILOT_FULFILLMENT_OPTIMIZER_SECRET`; and
+- an optional `CLAWPILOT_FULFILLMENT_OPTIMIZER_TIMEOUT_MS` from 100 through
+  30,000 milliseconds.
+
+Other HTTP hosts, private HTTPS hosts, URL userinfo, query strings, fragments,
+and invalid ports fail closed. ClawPilot `/api/health` reports whether this
+configuration is disabled, ready, or invalid without making an optimizer
+network call. An enabled but invalid configuration makes application health
+fail, and a disabled optimizer makes Railway application health fail so an
+environment cannot silently lose the capability. `connectivity: not-probed`
+is intentional; verify the optimizer's own health endpoint separately after
+each environment deployment.
 
 ## Bounded model
 

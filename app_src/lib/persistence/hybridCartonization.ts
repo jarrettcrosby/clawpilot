@@ -5,8 +5,14 @@ import type {
   HybridCartonizationMaterial,
   HybridCartonizationRecipe,
 } from '@/lib/operations/hybridCartonization'
+import {
+  isShopifySandboxCheckoutChannelEligible,
+} from '@/lib/integrations/shopifyCheckoutChannelEligibility'
 import { getPostgresPool } from '@/lib/persistence/postgres'
-import { shopifyCheckoutRatingHash } from '@/lib/persistence/shopifyCheckoutRating'
+import {
+  shopifyCheckoutRateLineageIsRequired,
+  shopifyCheckoutRatingHash,
+} from '@/lib/persistence/shopifyCheckoutRating'
 
 export type HybridCartonizationMaterialSelection = {
   materialGlobalId: string
@@ -44,10 +50,12 @@ export type HybridCartonizationInventoryProductEvidence = {
     | 'shopify_provider_commitment'
   operationalAvailableQuantity: number
   providerCommittedQuantity: number
+  activeReservedQuantity: number
   assumedCommittedQuantity: number
   effectiveAvailableQuantity: number
   sourceLevelGlobalIds: string[]
   sourcePositionGlobalIds?: string[]
+  sourcePositionVersion?: number
   sourceProjectionStates: HybridCartonizationInventoryProjectionState[]
 }
 
@@ -57,6 +65,14 @@ export type HybridCartonizationInventoryProjectionState =
 
 export type HybridCartonizationReadResult = {
   readAt: string
+  organizationGlobalId: string
+  activationState:
+    | 'disabled'
+    | 'shadow'
+    | 'read_only'
+    | 'active'
+    | 'frozen'
+    | null
   account: {
     globalId: string
     provider: 'shopify' | 'faire'
@@ -68,6 +84,7 @@ export type HybridCartonizationReadResult = {
     rowVersion: number
     sourceHash: string
     workflowState: string
+    currency: string
   }
   warehouse: {
     globalId: string
@@ -86,6 +103,9 @@ export type HybridCartonizationReadResult = {
     rowVersion: number
     status: 'draft' | 'active'
     source: string
+    materialType: 'carton' | 'poly_mailer' | 'padded_mailer'
+    unitCostMinor: number | null
+    currency: string | null
     ratedOuterDimensionsMm: {
       length: number
       width: number
@@ -102,6 +122,8 @@ export type HybridCartonizationReadResult = {
     stock: {
       isAvailable: boolean
       onHandQuantity: number | null
+      activeClaimedQuantity: number
+      availableQuantity: number | null
       rowVersion: number | null
     } | null
   }>
@@ -163,6 +185,7 @@ export type ShopifyCheckoutPackBaseline = {
 export type ShopifyFulfillmentPackEvidence = {
   providerProductId: string
   providerVariantId: string
+  accountEnvironment: 'mock' | 'sandbox' | 'production'
   mappingPurpose: 'shopify_checkout'
   mappingGlobalId: string
   mappingRowVersion: number
@@ -172,8 +195,9 @@ export type ShopifyFulfillmentPackEvidence = {
   channelSourceRevision: string
   channelSourceHash: string
   channelPackEvidenceHash: string
-  channelNormalizedStatus: 'active'
-  channelProviderActive: true
+  channelProviderStatusRaw: string
+  channelNormalizedStatus: 'active' | 'unlisted'
+  channelProviderActive: boolean
   channelRequiresShipping: true
   profileVersionGlobalId: string
   profileRowVersion: number
@@ -194,8 +218,11 @@ export type ShopifyFulfillmentPackEvidence = {
 
 type AccountRow = {
   id: string
+  organization_global_id: string
+  activation_state: HybridCartonizationReadResult['activationState']
   global_id: string
   provider: 'shopify' | 'faire'
+  environment: 'mock' | 'sandbox' | 'production'
   status: 'active' | 'disabled' | 'error'
 }
 
@@ -208,6 +235,7 @@ type CandidateRow = {
   row_version: string
   source_hash: string
   workflow_state: string
+  currency_code: string
   expires_at: Date | string
   checkout_shipping_service_code: string | null
 }
@@ -268,6 +296,7 @@ type InventoryRunRow = {
 type CandidateLineRow = {
   global_id: string
   provider: 'shopify' | 'faire'
+  account_environment: AccountRow['environment']
   product_id: string | null
   product_global_id: string | null
   product_title_snapshot: string
@@ -392,6 +421,7 @@ type CurrentFulfillmentPackRow = {
   channel_source_revision: string | null
   channel_source_hash: string | null
   channel_pack_evidence_hash: string | null
+  channel_provider_status_raw: string | null
   channel_normalized_status: string | null
   channel_provider_active: boolean | null
   channel_requires_shipping: boolean | null
@@ -453,8 +483,9 @@ export function resolveOperationalShopifyCheckoutReconciliation(input: {
   receipt_global_id: string
   receipt_status: 'succeeded'
 }) | null {
-  const clawPilotCheckout =
-    input.candidateServiceCode?.startsWith('clawpilot:') === true
+  const clawPilotCheckout = shopifyCheckoutRateLineageIsRequired(
+    input.candidateServiceCode,
+  )
   if (input.rows.length === 0) {
     if (clawPilotCheckout) {
       fail(
@@ -509,6 +540,7 @@ type MaterialRow = {
   id: string
   global_id: string
   name: string
+  material_type: 'carton' | 'poly_mailer' | 'padded_mailer'
   status: 'draft' | 'active'
   source: string
   row_version: string
@@ -537,9 +569,12 @@ type MaterialRow = {
   dimension_confirmed_at: Date | string | null
   tare_weight_grams: number | null
   max_weight_grams: number | null
+  unit_cost_minor: string | null
+  currency: string | null
   stock_is_available: boolean | null
   stock_on_hand_quantity: number | null
   stock_row_version: string | null
+  active_claimed_quantity: string
 }
 
 type RecipeRow = {
@@ -575,8 +610,10 @@ type InventoryProductRow = {
   product_global_id: string
   operational_available_quantity: string
   provider_committed_quantity: string
+  active_reserved_quantity: string
   source_level_global_ids: string[]
   source_position_global_ids?: string[]
+  source_position_version?: string
   source_projection_states: HybridCartonizationInventoryProjectionState[]
 }
 
@@ -594,8 +631,10 @@ type InventoryEvaluationPosition = {
   productGlobalId: string
   operationalAvailableQuantity: number
   providerCommittedQuantity: number
+  activeReservedQuantity?: number
   sourceLevelGlobalIds: string[]
   sourcePositionGlobalIds?: string[]
+  sourcePositionVersion?: number
   sourceProjectionStates: HybridCartonizationInventoryProjectionState[]
 }
 
@@ -987,9 +1026,17 @@ export function buildShopifyFulfillmentPackEvidence(
     || !row.channel_source_revision
     || !row.channel_source_hash
     || !row.channel_pack_evidence_hash
-    || row.channel_normalized_status !== 'active'
-    || row.channel_provider_active !== true
-    || row.channel_requires_shipping !== true
+    || !row.channel_provider_status_raw
+    || !isHybridCartonizationFulfillmentChannelEligible({
+      provider: row.provider,
+      accountEnvironment: row.account_environment,
+      providerStatusRaw: row.channel_provider_status_raw,
+      normalizedStatus: row.channel_normalized_status,
+      providerActive: row.channel_provider_active,
+      requiresShipping: row.channel_requires_shipping,
+      weightGrams: row.channel_weight_grams,
+      mappingPurpose: row.pack_mapping_purpose,
+    })
     || !row.pack_profile_version_global_id
     || row.current_pack_profile_row_version === null
     || !row.pack_profile_fit_model
@@ -1009,6 +1056,7 @@ export function buildShopifyFulfillmentPackEvidence(
   return {
     providerProductId: row.external_product_id,
     providerVariantId: row.external_variant_id,
+    accountEnvironment: row.account_environment,
     mappingPurpose: 'shopify_checkout',
     mappingGlobalId: row.pack_mapping_global_id,
     mappingRowVersion: exactInteger(
@@ -1021,8 +1069,10 @@ export function buildShopifyFulfillmentPackEvidence(
     channelSourceRevision: row.channel_source_revision,
     channelSourceHash: row.channel_source_hash,
     channelPackEvidenceHash: row.channel_pack_evidence_hash,
-    channelNormalizedStatus: 'active',
-    channelProviderActive: true,
+    channelProviderStatusRaw: row.channel_provider_status_raw,
+    channelNormalizedStatus: row.channel_normalized_status as
+      'active' | 'unlisted',
+    channelProviderActive: row.channel_provider_active as boolean,
     channelRequiresShipping: true,
     profileVersionGlobalId: row.pack_profile_version_global_id,
     profileRowVersion: exactInteger(
@@ -1324,6 +1374,15 @@ export function evaluateHybridCartonizationInventoryAvailability(input: {
       position?.operationalAvailableQuantity ?? 0
     const providerCommittedQuantity =
       position?.providerCommittedQuantity ?? 0
+    const activeReservedQuantity =
+      position?.activeReservedQuantity ?? 0
+    if (activeReservedQuantity > providerCommittedQuantity) {
+      fail(
+        `Active provider inventory claims exceed committed evidence for ${productGlobalId}`,
+        409,
+        'HYBRID_CARTONIZATION_PROVIDER_COMMITMENT_EXHAUSTED',
+      )
+    }
     if (total.assumed > providerCommittedQuantity) {
       fail(
         `Assumed committed inventory for ${productGlobalId} exceeds the latest provider evidence`,
@@ -1339,7 +1398,7 @@ export function evaluateHybridCartonizationInventoryAvailability(input: {
       : 'operational_available'
     const effectiveAvailableQuantity =
       availabilityAuthority === 'shopify_provider_commitment'
-        ? providerCommittedQuantity
+        ? providerCommittedQuantity - activeReservedQuantity
         : operationalAvailableQuantity + total.assumed
     if (total.required > effectiveAvailableQuantity) {
       fail(
@@ -1354,11 +1413,15 @@ export function evaluateHybridCartonizationInventoryAvailability(input: {
       availabilityAuthority,
       operationalAvailableQuantity,
       providerCommittedQuantity,
+      activeReservedQuantity,
       assumedCommittedQuantity: total.assumed,
       effectiveAvailableQuantity,
       sourceLevelGlobalIds: position?.sourceLevelGlobalIds || [],
       ...(position?.sourcePositionGlobalIds
         ? { sourcePositionGlobalIds: position.sourcePositionGlobalIds }
+        : {}),
+      ...(position?.sourcePositionVersion !== undefined
+        ? { sourcePositionVersion: position.sourcePositionVersion }
         : {}),
       sourceProjectionStates: position?.sourceProjectionStates || [],
     })
@@ -1381,6 +1444,55 @@ export function hybridCartonizationInventoryProjectionStates(
     : ['projected']
 }
 
+export function isHybridCartonizationFulfillmentChannelEligible(input: {
+  provider: CandidateLineRow['provider']
+  accountEnvironment: AccountRow['environment']
+  providerStatusRaw: string | null
+  normalizedStatus: string | null
+  providerActive: boolean | null
+  requiresShipping: boolean | null
+  weightGrams: number | null
+  mappingPurpose: CandidateLineRow['pack_mapping_purpose']
+}) {
+  const provider = input.provider.trim().toLowerCase()
+  const providerStatusRaw = input.providerStatusRaw?.trim().toLowerCase()
+  const activeChannel = (
+    input.normalizedStatus === 'active'
+    && input.providerActive === true
+    && input.requiresShipping === true
+    && (provider !== 'shopify' || providerStatusRaw === 'active')
+  )
+  return activeChannel || (
+    input.mappingPurpose === 'shopify_checkout'
+    && isShopifySandboxCheckoutChannelEligible({
+      provider: input.provider,
+      accountEnvironment: input.accountEnvironment,
+      providerStatusRaw: input.providerStatusRaw,
+      normalizedStatus: input.normalizedStatus,
+      providerActive: input.providerActive,
+      requiresShipping: input.requiresShipping,
+      weightGrams: input.weightGrams,
+    })
+  )
+}
+
+export function shouldResolveCurrentShopifyFulfillmentPackLineage(input: {
+  mode: HybridCartonizationReadRequest['mode']
+  provider: AccountRow['provider']
+  accountEnvironment: AccountRow['environment']
+  checkoutServiceCode: string | null
+  hasMatchedCheckoutReceipt: boolean
+}) {
+  return input.provider === 'shopify' && (
+    input.hasMatchedCheckoutReceipt
+    || (
+      input.mode === 'production'
+      && input.accountEnvironment === 'sandbox'
+      && !shopifyCheckoutRateLineageIsRequired(input.checkoutServiceCode)
+    )
+  )
+}
+
 async function readAccount(
   client: PoolClient,
   input: HybridCartonizationReadRequest,
@@ -1388,10 +1500,17 @@ async function readAccount(
   const result = await client.query<AccountRow>(
     `SELECT
        account.id::text,
+       organization.reference_code AS organization_global_id,
+       activation.state AS activation_state,
        account.global_id,
        account.provider,
+       account.environment,
        account.status
      FROM operations_integration_accounts account
+     JOIN workspace_organizations organization
+       ON organization.id = account.organization_id
+     LEFT JOIN operations_activation_scopes activation
+       ON activation.organization_id = account.organization_id
      WHERE account.organization_id = $1::uuid
        AND account.global_id = $2
        AND account.integration_type = 'commerce'
@@ -1437,6 +1556,7 @@ async function readCandidate(
        candidate.row_version::text,
        candidate.source_hash,
        candidate.workflow_state,
+       candidate.currency_code,
        candidate.expires_at,
        candidate.checkout_shipping_service_code
      FROM operations_commerce_order_candidates candidate
@@ -1792,6 +1912,7 @@ async function readCurrentFulfillmentPackLineage(
        channel_state.source_revision AS channel_source_revision,
        channel_state.source_hash AS channel_source_hash,
        channel_state.pack_evidence_hash AS channel_pack_evidence_hash,
+       channel_state.provider_status_raw AS channel_provider_status_raw,
        channel_state.normalized_status AS channel_normalized_status,
        channel_state.provider_active AS channel_provider_active,
        channel_state.requires_shipping AS channel_requires_shipping,
@@ -1877,6 +1998,7 @@ async function readCurrentFulfillmentPackLineage(
 export function applyCurrentFulfillmentPackLineage(
   candidateRows: CandidateLineRow[],
   currentRows: CurrentFulfillmentPackRow[],
+  options: { preserveCandidateWhenMissing?: boolean } = {},
 ) {
   const currentByLine = new Map<string, CurrentFulfillmentPackRow>()
   for (const row of currentRows) {
@@ -1892,6 +2014,7 @@ export function applyCurrentFulfillmentPackLineage(
   return candidateRows.map((row): CandidateLineRow => {
     const current = currentByLine.get(row.global_id)
     if (!current?.pack_mapping_id) {
+      if (options.preserveCandidateWhenMissing) return row
       return {
         ...row,
         mapping_state: 'unresolved',
@@ -1909,6 +2032,7 @@ export function applyCurrentFulfillmentPackLineage(
         channel_source_revision: null,
         channel_source_hash: null,
         channel_pack_evidence_hash: null,
+        channel_provider_status_raw: null,
         channel_normalized_status: null,
         channel_provider_active: null,
         channel_requires_shipping: null,
@@ -1985,6 +2109,8 @@ export function applyCurrentFulfillmentPackLineage(
       channel_source_revision: current.channel_source_revision,
       channel_source_hash: current.channel_source_hash,
       channel_pack_evidence_hash: current.channel_pack_evidence_hash,
+      channel_provider_status_raw:
+        current.channel_provider_status_raw,
       channel_normalized_status: current.channel_normalized_status,
       channel_provider_active: current.channel_provider_active,
       channel_requires_shipping: current.channel_requires_shipping,
@@ -2037,6 +2163,7 @@ async function readCandidateLines(
     `SELECT
        line.global_id,
        line.provider,
+       $4::text AS account_environment,
        line.product_id::text,
        product.reference_code AS product_global_id,
        line.product_title_snapshot,
@@ -2141,7 +2268,7 @@ async function readCandidateLines(
        AND line.order_candidate_id = $3::uuid
        AND line.requires_shipping = true
      ORDER BY line.created_at, line.id`,
-    [input.organizationId, account.id, candidate.id],
+    [input.organizationId, account.id, candidate.id, account.environment],
   )
   if (result.rows.length === 0) {
     fail(
@@ -2159,7 +2286,15 @@ async function readCandidateLines(
   const checkoutLineageRows = matched
     ? applyMatchedCheckoutPackLineage(result.rows, matched)
     : result.rows
-  const lineageRows = matched
+  const resolveCurrentFulfillment =
+    shouldResolveCurrentShopifyFulfillmentPackLineage({
+      mode: input.mode,
+      provider: account.provider,
+      accountEnvironment: account.environment,
+      checkoutServiceCode: candidate.checkout_shipping_service_code,
+      hasMatchedCheckoutReceipt: matched !== null,
+    })
+  const lineageRows = resolveCurrentFulfillment
     ? applyCurrentFulfillmentPackLineage(
         checkoutLineageRows,
         await readCurrentFulfillmentPackLineage(
@@ -2168,6 +2303,7 @@ async function readCandidateLines(
           account,
           candidate,
         ),
+        { preserveCandidateWhenMissing: matched === null },
       )
     : checkoutLineageRows
   const unfulfilledRows = lineageRows.filter((row) => (
@@ -2230,6 +2366,17 @@ export function mapCandidateLines(
       && row.channel_requires_shipping === null
       && row.requires_shipping === true
     )
+    const eligibleCurrentChannel =
+      isHybridCartonizationFulfillmentChannelEligible({
+        provider: row.provider,
+        accountEnvironment: row.account_environment,
+        providerStatusRaw: row.channel_provider_status_raw,
+        normalizedStatus: row.channel_normalized_status,
+        providerActive: row.channel_provider_active,
+        requiresShipping: row.channel_requires_shipping,
+        weightGrams: row.channel_weight_grams,
+        mappingPurpose: row.pack_mapping_purpose,
+      })
     if (
       !row.product_id
       || !row.product_global_id
@@ -2249,18 +2396,7 @@ export function mapCandidateLines(
       || !row.channel_pack_evidence_hash
       || !row.channel_source_revision
       || !row.channel_source_hash
-      || (
-        !publishedFaireOrderCapture
-        && row.channel_normalized_status !== 'active'
-      )
-      || (
-        !publishedFaireOrderCapture
-        && row.channel_provider_active !== true
-      )
-      || (
-        !publishedFaireOrderCapture
-        && row.channel_requires_shipping !== true
-      )
+      || (!publishedFaireOrderCapture && !eligibleCurrentChannel)
       || !row.pack_profile_version_id
       || !row.pack_profile_version_global_id
       || row.captured_pack_profile_row_version === null
@@ -2483,6 +2619,7 @@ async function readSelectedMaterials(
        material.id::text,
        material.global_id,
        material.name,
+       material.material_type,
        material.status,
        material.source,
        material.row_version::text,
@@ -2501,14 +2638,26 @@ async function readSelectedMaterials(
        material.dimension_confirmed_at,
        material.tare_weight_grams,
        material.max_weight_grams,
+       material.unit_cost_minor::text,
+       material.currency,
        stock.is_available AS stock_is_available,
        stock.on_hand_quantity AS stock_on_hand_quantity,
-       stock.row_version::text AS stock_row_version
+       stock.row_version::text AS stock_row_version,
+       COALESCE(claims.active_claimed_quantity, 0)::text
+         AS active_claimed_quantity
      FROM operations_packaging_materials material
      LEFT JOIN operations_packaging_material_stock stock
        ON stock.organization_id = material.organization_id
       AND stock.packaging_material_id = material.id
       AND stock.warehouse_id = $3::uuid
+     LEFT JOIN LATERAL (
+       SELECT COALESCE(sum(claim.quantity), 0) AS active_claimed_quantity
+       FROM operations_packaging_material_claims claim
+       WHERE claim.organization_id = material.organization_id
+         AND claim.packaging_material_id = material.id
+         AND claim.warehouse_id = $3::uuid
+         AND claim.status = 'active'
+     ) claims ON true
      WHERE material.organization_id = $1::uuid
        AND material.global_id = ANY($2::text[])
      ORDER BY material.global_id`,
@@ -2653,12 +2802,20 @@ function mapSelectedMaterials(
           row.stock_row_version,
           `${row.global_id} stock row version`,
         )
+    const activeClaimedQuantity = exactInteger(
+      row.active_claimed_quantity,
+      `${row.global_id} active claimed quantity`,
+    )
+    const availableQuantity = row.stock_on_hand_quantity === null
+      ? null
+      : row.stock_on_hand_quantity - activeClaimedQuantity
     if (
       input.mode === 'production'
       && (
         row.stock_is_available !== true
         || row.stock_on_hand_quantity === null
-        || row.stock_on_hand_quantity <= 0
+        || availableQuantity === null
+        || availableQuantity <= 0
       )
     ) {
       fail(
@@ -2671,6 +2828,7 @@ function mapSelectedMaterials(
       id: row.id,
       input: {
         materialGlobalId: row.global_id,
+        materialType: row.material_type,
         capturedRowVersion: expectedRowVersion,
         currentRowVersion,
         isCurrent: true,
@@ -2683,8 +2841,19 @@ function mapSelectedMaterials(
         dimensionEvidenceReference: row.dimension_evidence_reference,
         dimensionConfirmedAt: confirmedAt,
         tareWeightGrams: row.tare_weight_grams,
+        unitCostMinor: row.unit_cost_minor === null
+          ? null
+          : exactInteger(
+              row.unit_cost_minor,
+              `${row.global_id} material unit cost`,
+              1,
+            ),
+        currency: row.currency,
+        stockRowVersion,
+        stockOnHandQuantity: row.stock_on_hand_quantity,
+        activeClaimedQuantity,
         maximumGrossWeightGrams: row.max_weight_grams,
-        availableQuantity: row.stock_on_hand_quantity,
+        availableQuantity,
         ratedOuterDimensionsMm,
       },
       evidence: {
@@ -2693,6 +2862,15 @@ function mapSelectedMaterials(
         rowVersion: currentRowVersion,
         status: row.status,
         source: row.source,
+        materialType: row.material_type,
+        unitCostMinor: row.unit_cost_minor === null
+          ? null
+          : exactInteger(
+              row.unit_cost_minor,
+              `${row.global_id} material unit cost`,
+              1,
+            ),
+        currency: row.currency,
         ratedOuterDimensionsMm,
         ratedOuterDimensionEvidenceType:
           row.rated_outer_dimension_evidence_type,
@@ -2704,6 +2882,8 @@ function mapSelectedMaterials(
           : {
               isAvailable: row.stock_is_available === true,
               onHandQuantity: row.stock_on_hand_quantity,
+              activeClaimedQuantity,
+              availableQuantity,
               rowVersion: stockRowVersion,
             },
       },
@@ -2852,8 +3032,19 @@ async function readInventoryProducts(
          AS operational_available_quantity,
        sum(level.provider_committed_quantity)::text
          AS provider_committed_quantity,
+       sum(COALESCE((
+         SELECT sum(reservation.quantity)
+         FROM operations_reservations reservation
+         WHERE reservation.organization_id = level.organization_id
+           AND reservation.position_id = position.id
+           AND reservation.reservation_authority = 'provider_commitment'
+           AND reservation.status = 'active'
+       ), 0))::text AS active_reserved_quantity,
        array_agg(level.global_id ORDER BY level.global_id)
          AS source_level_global_ids,
+       array_agg(DISTINCT position.global_id ORDER BY position.global_id)
+         AS source_position_global_ids,
+       min(position.version)::text AS source_position_version,
        array_agg(
          DISTINCT level.projection_state
          ORDER BY level.projection_state
@@ -2862,6 +3053,9 @@ async function readInventoryProducts(
      JOIN crm_products product
        ON product.pipeline_id = level.pipeline_id
       AND product.id = level.product_id
+     JOIN operations_inventory_positions position
+       ON position.organization_id = level.organization_id
+      AND position.id = level.inventory_position_id
      WHERE level.organization_id = $1::uuid
        AND level.integration_account_id = $2::uuid
        AND level.warehouse_id = $3::uuid
@@ -2888,7 +3082,16 @@ async function readInventoryProducts(
       row.provider_committed_quantity,
       `${row.product_global_id} provider committed quantity`,
     ),
+    activeReservedQuantity: exactInteger(
+      row.active_reserved_quantity,
+      `${row.product_global_id} active reserved quantity`,
+    ),
     sourceLevelGlobalIds: row.source_level_global_ids,
+    sourcePositionGlobalIds: row.source_position_global_ids || [],
+    sourcePositionVersion: exactInteger(
+      row.source_position_version || null,
+      `${row.product_global_id} source position version`,
+    ),
     sourceProjectionStates: row.source_projection_states,
   }))
 }
@@ -2909,9 +3112,11 @@ async function readLocalInventoryProducts(
            - position.damaged_quantity
        ))::text AS operational_available_quantity,
        0::text AS provider_committed_quantity,
+       0::text AS active_reserved_quantity,
        ARRAY[]::text[] AS source_level_global_ids,
        array_agg(position.global_id ORDER BY position.global_id)
          AS source_position_global_ids,
+       min(position.version)::text AS source_position_version,
        ARRAY['projected']::text[] AS source_projection_states
      FROM operations_inventory_positions position
      JOIN operations_locations location
@@ -2964,8 +3169,13 @@ async function readLocalInventoryProducts(
       `${row.product_global_id} operational available quantity`,
     ),
     providerCommittedQuantity: 0,
+    activeReservedQuantity: 0,
     sourceLevelGlobalIds: [],
     sourcePositionGlobalIds: row.source_position_global_ids || [],
+    sourcePositionVersion: exactInteger(
+      row.source_position_version || null,
+      `${row.product_global_id} source position version`,
+    ),
     sourceProjectionStates: ['projected'],
   }))
 }
@@ -3048,6 +3258,8 @@ export async function readHybridCartonizationInputFromPostgres(
         readTime.read_at,
         'Cartonization read timestamp',
       ),
+      organizationGlobalId: account.organization_global_id,
+      activationState: account.activation_state,
       account: {
         globalId: account.global_id,
         provider: account.provider,
@@ -3059,6 +3271,7 @@ export async function readHybridCartonizationInputFromPostgres(
         rowVersion,
         sourceHash: candidate.source_hash,
         workflowState: candidate.workflow_state,
+        currency: candidate.currency_code,
       },
       warehouse: {
         globalId: warehouse.global_id,

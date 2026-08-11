@@ -1127,6 +1127,102 @@ export async function setCarrierIntegrationEnabledInPostgres(input: {
   return { updated: result, state: await readCarrierIntegrationsStateFromPostgres(input.organizationId) }
 }
 
+export async function setCarrierProductionLabelCapabilityInPostgres(input: {
+  organizationId: string
+  provider: Extract<DirectCarrierProvider, 'ups_rest' | 'fedex_rest'>
+  enabled: boolean
+  reason: string
+  actorEmail: string
+}) {
+  await withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:activation:${input.organizationId}`,
+    )
+    const connection = await lockedUserManagedCarrierConnection(client, {
+      organizationId: input.organizationId,
+      provider: input.provider,
+      environment: 'production',
+    })
+    if (input.enabled) {
+      const readiness = await client.query<{
+        activation_state: string | null
+        verified: boolean
+        sender_account_count: string
+      }>(
+        `SELECT activation.state AS activation_state,
+                EXISTS (
+                  SELECT 1 FROM operations_carrier_credentials credential
+                  WHERE credential.organization_id = connection.organization_id
+                    AND credential.integration_account_id = connection.id
+                    AND credential.verification_status = 'verified'
+                ) AS verified,
+                count(carrier_account.id) FILTER (
+                  WHERE carrier_account.status = 'active'
+                    AND carrier_account.allow_sender_billing = true
+                )::text AS sender_account_count
+         FROM operations_integration_accounts connection
+         LEFT JOIN operations_activation_scopes activation
+           ON activation.organization_id = connection.organization_id
+         LEFT JOIN operations_carrier_accounts carrier_account
+           ON carrier_account.organization_id = connection.organization_id
+          AND carrier_account.integration_account_id = connection.id
+         WHERE connection.organization_id = $1::uuid
+           AND connection.id = $2::uuid
+           AND connection.environment = 'production'
+           AND connection.status = 'active'
+         GROUP BY connection.organization_id, connection.id, activation.state`,
+        [input.organizationId, connection.id],
+      )
+      const row = readiness.rows[0]
+      if (
+        !row
+        || row.activation_state !== 'active'
+        || !row.verified
+        || Number(row.sender_account_count) < 1
+      ) {
+        throw new Error(
+          'Live postage authorization requires Active Operations, an enabled verified production credential, and an active sender-billing account',
+        )
+      }
+    }
+    const current = Array.isArray(connection.configuration.allowedCapabilities)
+      ? connection.configuration.allowedCapabilities.filter(
+          (value): value is string => typeof value === 'string',
+        )
+      : []
+    const allowedCapabilities = [...new Set([
+      ...current.filter((value) => value !== 'production_label'),
+      'production_rate',
+      ...(input.enabled ? ['production_label'] : []),
+    ])]
+    await client.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = configuration || $3::jsonb,
+           updated_by = $4, updated_at = now()
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [
+        input.organizationId,
+        connection.id,
+        JSON.stringify({ allowedCapabilities }),
+        input.actorEmail,
+      ],
+    )
+    await auditCarrier(client, {
+      actorEmail: input.actorEmail,
+      organizationId: input.organizationId,
+      eventType: input.enabled
+        ? 'carrier.production_label.authorized'
+        : 'carrier.production_label.revoked',
+      globalId: connection.global_id,
+      provider: input.provider,
+      environment: 'production',
+      payload: { reason: input.reason, explicitOperatorAuthorization: true },
+    })
+  })
+  return readCarrierIntegrationsStateFromPostgres(input.organizationId)
+}
+
 export async function disconnectCarrierCredentialInPostgres(input: {
   organizationId: string
   provider: DirectCarrierProvider

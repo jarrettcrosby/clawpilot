@@ -6,6 +6,10 @@ import {
   CommerceIntegrationRequestError,
 } from '@/lib/integrations/commerceIntegrations'
 import {
+  commerceReadCredentialEligible,
+  commerceReadRuntimeAvailable,
+} from '@/lib/integrations/commerceReadRuntime'
+import {
   listFaireInventory,
   probeFaireBrandProfile,
   type FaireInventoryLevel,
@@ -29,19 +33,8 @@ import {
 
 const PROVIDER_READ_TIMEOUT_MS = 4_000
 
-function runtimeLane() {
-  return String(
-    process.env.CLAWPILOT_ENV
-    || process.env.RAILWAY_ENVIRONMENT_NAME
-    || process.env.VERCEL_ENV
-    || process.env.NODE_ENV
-    || '',
-  ).trim().toLowerCase()
-}
-
 export function faireInventoryPollingRuntimeAvailable() {
-  if (process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED !== '1') return false
-  return ['dev', 'development', 'local', 'preview'].includes(runtimeLane())
+  return commerceReadRuntimeAvailable()
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -164,8 +157,9 @@ async function faireRuntime(target: FaireInventoryPollTarget) {
     || runtime.integrationAccountId !== target.integrationAccountId
     || runtime.externalAccountId !== target.externalAccountId
     || runtime.credentialVersion !== target.credentialVersion
-    || runtime.status !== 'active'
-    || runtime.verificationStatus !== 'verified'
+    || !commerceReadCredentialEligible(runtime, {
+      developmentRequiresActive: true,
+    })
   ) {
     inventoryError(
       'FAIRE_INVENTORY_POLL_FENCE_CHANGED',

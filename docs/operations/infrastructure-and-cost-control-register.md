@@ -17,10 +17,10 @@ This is the durable operating record for ClawPilot infrastructure, cost controls
 
 ## Platform Baseline
 
-| Platform | Responsibility | Current boundary |
+| Platform | Responsibility | Intended boundary |
 | --- | --- | --- |
 | GitHub | Source and validation | `dev` is the development branch; promotion normally uses a pull request to `main`; Railway waits for successful GitHub Actions before deploying connected services. |
-| Railway | Stateful and service runtime | ClawPilot, Postgres, SuiteCRM, MariaDB, and the development fulfillment optimizer. |
+| Railway | Stateful and service runtime | ClawPilot, Postgres, SuiteCRM, MariaDB, and an isolated fulfillment optimizer in each active environment. |
 | Vercel | Protected web previews | Preview validation remains separate from Railway service and database health. |
 | Google Sheets | Operator-owned pipeline tables | Remains writable for pipeline workflows. |
 | Railway Postgres | Durable application-owned records | Requires `CLAWPILOT_STORAGE=postgres` and `DATABASE_URL`; production fallback must not silently mask database failure. |
@@ -45,8 +45,16 @@ This is the durable operating record for ClawPilot infrastructure, cost controls
 | Postgres | 2 vCPU / 4 GB | Keep PITR/WAL archiving and scheduled daily, weekly, and monthly volume backups. |
 | SuiteCRM | 2 vCPU / 2 GB | Supported by the production MariaDB service and persistent volume. |
 | MariaDB | 1 vCPU / 1 GB | Do not suspend independently while SuiteCRM is active. |
+| Fulfillment optimizer | Production ceiling set from measured load | Isolated production service; ClawPilot uses the exact private endpoint `http://fulfillment-optimizer.railway.internal:8080`. Missing service or invalid application configuration is capability drift and blocks parity sign-off. |
 
 Resource ceilings contain abnormal growth; they do not reduce charges when actual utilization is already below the ceiling.
+
+Development and production must expose the same application capabilities and
+service topology. Intentional infrastructure differences are limited to
+environment isolation, approved development cost controls, and recovery policy:
+development has no PITR/WAL archiving, while production retains PITR plus
+scheduled backups. A development-only optimizer is not an acceptable cost
+optimization because it removes a production capability.
 
 ## Cost Controls
 
@@ -71,11 +79,11 @@ Run this review weekly and before onboarding a customer:
 1. Record workspace current usage, monthly estimate, soft-limit state, and hard-limit state.
 2. Break project cost down by service and by CPU, memory, egress, volume, and backup.
 3. Confirm development and production service inventories, replica counts, deployment states, sleep/serverless settings, and resource ceilings.
-4. Confirm Wait for CI remains enabled and development optimizer traffic still uses private networking.
+4. Confirm Wait for CI remains enabled and both environments have an optimizer service using the exact Railway private endpoint.
 5. Confirm development Postgres has no `WAL_ARCHIVE_*` variables or external PITR traffic.
 6. Confirm production Postgres PITR remains enabled and scheduled provider backups are current.
 7. Inspect deployment churn, failed/restarted deployments, database archive errors, and unexpected public egress.
-8. Check development and production `/api/health` and `/api/persistence/status`, plus optimizer health when deployed.
+8. Check development and production `/api/health` and `/api/persistence/status`; require optimizer configuration readiness in the application response and separately check each optimizer service health endpoint.
 9. Compare against the previous review and record material drift, cost changes, decisions, and follow-up owners.
 
 Infrastructure changes require explicit approval. The weekly review reports recommendations and drift; it does not automatically mutate Railway.

@@ -38,6 +38,7 @@ import ReplayRounded from '@mui/icons-material/ReplayRounded'
 import RestartAltRounded from '@mui/icons-material/RestartAltRounded'
 import TokenRounded from '@mui/icons-material/TokenRounded'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
+import BarcodeLabelsDialog from '@/components/operations/BarcodeLabelsDialog'
 import {
   formatDimensionsMm,
   formatGrams,
@@ -134,6 +135,9 @@ const LABELS: Record<string, string> = {
   cancelled: 'Cancelled',
   printed: 'Legacy printed',
   rerouted: 'Legacy rerouted',
+  label_2x1: '2 x 1 label',
+  label_3x1: '3 x 1 label',
+  label_4x2: '4 x 2 label',
   label_4x6: '4 x 6 label',
   label_4x8: '4 x 8 label',
   letter: 'US Letter',
@@ -147,6 +151,8 @@ const LABELS: Record<string, string> = {
   customs_document: 'Customs document',
   return_label: 'Return label',
   customer_insert: 'Customer insert',
+  product_label: 'Product barcode label',
+  location_label: 'Location barcode label',
 }
 
 function label(value: string) {
@@ -392,6 +398,7 @@ export default function PrinterConfigurationPanel() {
     reason: string
   } | null>(null)
   const [credential, setCredential] = useState('')
+  const [barcodeLabelsOpen, setBarcodeLabelsOpen] = useState(false)
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true)
@@ -495,7 +502,7 @@ export default function PrinterConfigurationPanel() {
 
   const printerMediaOptions = useMemo(() => {
     const typeOptions: PrintMedia[] = printerForm?.printerType === 'thermal'
-      ? ['label_4x6', 'label_4x8']
+      ? ['label_2x1', 'label_3x1', 'label_4x2', 'label_4x6', 'label_4x8']
       : ['letter', 'a4']
     return selectedAgent && selectedAgentCompatible
       ? typeOptions.filter((item) => selectedAgent.supportedMedia.includes(item))
@@ -804,17 +811,28 @@ export default function PrinterConfigurationPanel() {
             Route durable documents, supervise local agents, and audit every delivery attempt.
           </Typography>
         </Box>
-        <Tooltip title="Refresh printing operations">
-          <span>
-            <IconButton
-              aria-label="Refresh printing operations"
-              disabled={loading}
-              onClick={() => void load()}
+        <Stack direction="row" spacing={1} alignItems="center">
+          {printers?.capabilities.canView && (
+            <Button
+              variant="outlined"
+              startIcon={<PrintRounded />}
+              onClick={() => setBarcodeLabelsOpen(true)}
             >
-              <RefreshRounded />
-            </IconButton>
-          </span>
-        </Tooltip>
+              Barcode labels
+            </Button>
+          )}
+          <Tooltip title="Refresh printing operations">
+            <span>
+              <IconButton
+                aria-label="Refresh printing operations"
+                disabled={loading}
+                onClick={() => void load()}
+              >
+                <RefreshRounded />
+              </IconButton>
+            </span>
+          </Tooltip>
+        </Stack>
       </Stack>
 
       <Alert severity="info" sx={{ mt: 2 }}>
@@ -1938,6 +1956,10 @@ export default function PrinterConfigurationPanel() {
           <Button variant="contained" onClick={() => setCredential('')}>Done</Button>
         </DialogActions>
       </Dialog>
+      <BarcodeLabelsDialog
+        open={barcodeLabelsOpen}
+        onClose={() => setBarcodeLabelsOpen(false)}
+      />
     </Box>
   )
 }

@@ -19,6 +19,7 @@ import {
 } from '@/lib/integrations/commerceIntegrations'
 import {
   commerceIntakeRuntimeAvailable,
+  commerceReadRuntimeAvailable,
 } from '@/lib/integrations/commerceIntake'
 import {
   CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION,
@@ -267,6 +268,7 @@ function capabilityCatalog() {
     activationBoundary: {
       receiptIntakeOnly: true,
       domainWorkersActivated: false,
+      readReconciliationWorkersActivated: commerceReadRuntimeAvailable(),
       canonicalOrderImport: commerceIntakeRuntimeAvailable(),
       inventoryMutation: false,
       fulfillmentExport: false,
@@ -289,6 +291,7 @@ export async function GET(req: NextRequest) {
       canActivate: capabilities.canActivate,
       canRevealCredentials: canRevealCredential(actor),
       intakeAvailable: commerceIntakeRuntimeAvailable(),
+      reconciliationAvailable: commerceReadRuntimeAvailable(),
       integrations: await getCommerceIntegrationsState(
         organizationId(actor),
       ),

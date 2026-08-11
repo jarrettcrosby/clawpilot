@@ -3081,6 +3081,16 @@ async function verifyPostgresAcceptance(databaseUrl) {
       'app_src/lib/operations/canonicalFulfillmentPlanning.ts',
       { mocks: { '../currency.ts': currency } },
     )
+    const fulfillmentOptimizerContract = loadTypeScriptModule(
+      'app_src/lib/operations/fulfillmentOptimizerContract.ts',
+    )
+    const globalIds = await import(
+      new URL('../app_src/lib/globalIds.mjs', import.meta.url)
+    )
+    const barcodeLabels = loadTypeScriptModule(
+      'app_src/lib/operations/barcodeLabels.ts',
+      { mocks: { '@/lib/globalIds.mjs': globalIds } },
+    )
     const cartonizationRateEvidence = loadTypeScriptModule(
       'app_src/lib/persistence/cartonizationRateEvidence.ts',
       {
@@ -3101,6 +3111,8 @@ async function verifyPostgresAcceptance(databaseUrl) {
             },
             normalizeCarrierSandboxParty: (value) => value,
           },
+          '@/lib/operations/fulfillmentOptimizerContract':
+            fulfillmentOptimizerContract,
           '@/lib/persistence/postgres': postgres,
         },
       },
@@ -3150,6 +3162,21 @@ async function verifyPostgresAcceptance(databaseUrl) {
             )
           },
         },
+        '@/lib/integrations/shopifyOrderPlanningAuthority': {
+          ShopifyOrderPlanningAuthorityError: class extends Error {},
+          assertShopifyOrderPlanningAuthorityHash: (value) => value,
+          normalizeShopifyOrderPlanningAuthoritySnapshot: (value) => value,
+          shopifyOrderPlanningAuthorityHash: () => {
+            throw new Error(
+              'Distributed Operations acceptance does not hash Shopify planning authority',
+            )
+          },
+          inspectShopifyOrderPlanningAuthority: async () => {
+            throw new Error(
+              'Distributed Operations acceptance does not read Shopify planning authority',
+            )
+          },
+        },
         '@/lib/integrations/faireFulfillmentRuntime': {
           prepareCurrentFaireFulfillmentAuthority: async () => {
             throw new Error(
@@ -3169,6 +3196,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
           canonicalFulfillmentPlanning,
         '@/lib/operations/domain': domain,
         '@/lib/operations/packingSlip': packingSlip,
+        '@/lib/operations/barcodeLabels': barcodeLabels,
         '@/lib/persistence/cartonizationRateEvidence':
           cartonizationRateEvidence,
         '@/lib/persistence/crm': {

@@ -13,6 +13,11 @@ import {
   type ShopifyAccessScope,
 } from '@/lib/integrations/commerceCapabilities'
 import {
+  commerceReadCredentialEligible,
+  commerceReadRuntimeAvailable,
+  commerceReadRuntimeMode,
+} from '@/lib/integrations/commerceReadRuntime'
+import {
   normalizeShopifyShopDomain,
   probeShopifyConnection,
   requestShopifyAccessToken,
@@ -66,29 +71,16 @@ function inventoryError(error: unknown): CommerceIntegrationRequestError {
   return sanitizedCommerceIntegrationError(error)
 }
 
-function runtimeLane() {
-  return String(
-    process.env.CLAWPILOT_ENV
-    || process.env.RAILWAY_ENVIRONMENT_NAME
-    || process.env.VERCEL_ENV
-    || process.env.NODE_ENV
-    || '',
-  ).trim().toLowerCase()
-}
-
 export function shopifyInventoryRuntimeAvailable() {
-  if (process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED !== '1') return false
-  return ['dev', 'development', 'local', 'preview'].includes(runtimeLane())
+  return commerceReadRuntimeAvailable()
 }
 
 export function assertShopifyInventoryRuntime() {
   if (!shopifyInventoryRuntimeAvailable()) {
     throw new CommerceIntegrationRequestError(
-      'Shopify inventory sync is restricted to enabled development environments',
-      runtimeLane() === 'production' ? 403 : 404,
-      runtimeLane() === 'production'
-        ? 'SHOPIFY_INVENTORY_DEVELOPMENT_ONLY'
-        : 'SHOPIFY_INVENTORY_DISABLED',
+      'Shopify inventory reconciliation is disabled in this environment',
+      404,
+      'SHOPIFY_INVENTORY_DISABLED',
     )
   }
 }
@@ -124,14 +116,15 @@ async function runtime(input: {
       'SHOPIFY_INVENTORY_ACCOUNT_REQUIRED',
     )
   }
-  if (
-    stored.verificationStatus !== 'verified'
-    || stored.status !== 'active'
-  ) {
+  if (!commerceReadCredentialEligible(stored, {
+    developmentRequiresActive: true,
+  })) {
     throw new CommerceIntegrationRequestError(
-      'Reconnect and verify Shopify before syncing inventory',
+      commerceReadRuntimeMode() === 'production'
+        ? 'Production inventory reconciliation requires an active verified production Shopify account'
+        : 'Reconnect and verify Shopify before syncing inventory',
       409,
-      'SHOPIFY_INVENTORY_VERIFICATION_REQUIRED',
+      'SHOPIFY_INVENTORY_ACCOUNT_INELIGIBLE',
     )
   }
   return stored
@@ -338,6 +331,7 @@ export async function syncShopifyInventory(input: {
     }
     const target = await readShopifyInventoryTargetFromPostgres({
       runtime: stored,
+      expectedWarehouseId: input.expectedRefreshFence?.warehouseId || null,
     })
     const hash = requestHash(stored, target)
     attempt = await prepareShopifyInventoryReadInPostgres({

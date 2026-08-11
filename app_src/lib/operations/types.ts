@@ -690,6 +690,7 @@ export type OperationsShadowFulfillmentPreparation = {
 }
 
 export type OperationsOrderDetail = OperationsOrderListItem & {
+  oneOffShippingMode: 'test' | 'live' | null
   externalOrderId: string
   currency: string
   rowVersion: number
@@ -709,6 +710,11 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     expiresAt: string
   } | null
   fulfillmentPreparation: OperationsShadowFulfillmentPreparation | null
+  planningPreparation: {
+    accountGlobalId: string
+    candidateGlobalId: string
+    candidateRowVersion: number
+  } | null
   fulfillmentNotificationPolicy:
     | {
       mode: 'clawpilot_explicit'
@@ -796,6 +802,8 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     carrier: string
     serviceCode: string
     trackingNumber: string
+    quotedCarrierCostMinor: string
+    oneOffCarrierGroupGlobalId: string | null
     shippedAt: string
   }>
   trackingObservations: Array<{

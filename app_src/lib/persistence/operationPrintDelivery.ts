@@ -208,7 +208,7 @@ type PrintArtifactPayloadRow = {
   media_size: PrintMedia
   content_sha256: string
   byte_length: string
-  payload_mime_type: 'application/pdf' | 'image/png' | null
+  payload_mime_type: 'application/vnd.zebra-zpl' | 'application/pdf' | 'image/png' | null
   payload_filename: string | null
   artifact_payload: Buffer | null
   template_version: string | null
@@ -253,6 +253,10 @@ export type EnqueueOperationsPrintJobInput = {
     }
     | {
       type: 'packing_slip_artifact'
+      sourceArtifactGlobalId: string
+    }
+    | {
+      type: 'barcode_label_artifact'
       sourceArtifactGlobalId: string
     }
 }
@@ -1035,6 +1039,8 @@ export async function readOperationsPrintArtifactPayloadInPostgres(input: {
   if (
     artifact.document_type !== 'packing_slip'
     && artifact.document_type !== 'shipping_label'
+    && artifact.document_type !== 'product_label'
+    && artifact.document_type !== 'location_label'
   ) {
     throw new OperationsRequestError(
       'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
@@ -1042,7 +1048,27 @@ export async function readOperationsPrintArtifactPayloadInPostgres(input: {
       500,
     )
   }
-  if (artifact.document_type === 'packing_slip') {
+  if (
+    artifact.document_type === 'product_label'
+    || artifact.document_type === 'location_label'
+  ) {
+    if (
+      artifact.format !== 'ZPL'
+      || artifact.payload_mime_type !== 'application/vnd.zebra-zpl'
+      || !artifact.payload_filename
+      || !artifact.artifact_payload
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
+        'Barcode label content failed integrity validation',
+        500,
+      )
+    }
+    payload = validateLabelBytes('ZPL', Buffer.from(artifact.artifact_payload))
+    filename = artifact.payload_filename
+    mimeType = 'application/vnd.zebra-zpl'
+    templateVersion = artifact.template_version
+  } else if (artifact.document_type === 'packing_slip') {
     const expectedMimeType = artifact.format === 'PDF'
       ? 'application/pdf'
       : artifact.format === 'PNG'
@@ -1861,7 +1887,10 @@ async function insertArtifact(
       id: string
       global_id: string
       format: PrintFormat
-      media_size: Extract<PrintMedia, 'label_4x6' | 'label_4x8'>
+      media_size: Extract<
+        PrintMedia,
+        'label_2x1' | 'label_3x1' | 'label_4x2' | 'label_4x6' | 'label_4x8'
+      >
       label_payload: Buffer
       content_sha256: string
       byte_length: string
@@ -1962,6 +1991,95 @@ async function insertArtifact(
         shipmentId: null,
         shipmentGlobalId: null,
         trackingNumber: row.tracking_number,
+      },
+    }
+  }
+
+  if (input.document.type === 'barcode_label_artifact') {
+    if (!ARTIFACT_GLOBAL_ID.test(input.document.sourceArtifactGlobalId)) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_ARTIFACT_INVALID',
+        'Barcode label artifact reference is invalid',
+      )
+    }
+    const artifactResult = await client.query<{
+      id: string
+      global_id: string
+      document_type: Extract<DurablePrintDocumentType, 'product_label' | 'location_label'>
+      format: 'ZPL'
+      media_size: Extract<
+        PrintMedia,
+        'label_2x1' | 'label_3x1' | 'label_4x2' | 'label_4x6' | 'label_4x8'
+      >
+      content_sha256: string
+      byte_length: string
+      payload: Buffer | null
+      warehouse_id: string
+    }>(
+      `SELECT artifact.id::text,
+              artifact.global_id,
+              artifact.document_type,
+              artifact.format,
+              artifact.media_size,
+              artifact.content_sha256,
+              artifact.byte_length::text,
+              payload.payload,
+              label_batch.warehouse_id::text
+       FROM operations_print_artifacts artifact
+       JOIN operations_print_artifact_payloads payload
+         ON payload.organization_id = artifact.organization_id
+        AND payload.artifact_id = artifact.id
+       JOIN operations_barcode_label_batches label_batch
+         ON label_batch.organization_id = artifact.organization_id
+        AND label_batch.id = artifact.source_barcode_label_batch_id
+       WHERE artifact.organization_id = $1::uuid
+         AND artifact.global_id = $2
+         AND artifact.document_type IN ('product_label', 'location_label')
+         AND artifact.format = 'ZPL'
+         AND artifact.media_size IN (
+           'label_2x1', 'label_3x1', 'label_4x2', 'label_4x6', 'label_4x8'
+         )
+         AND payload.mime_type = 'application/vnd.zebra-zpl'
+       FOR SHARE OF artifact, payload, label_batch`,
+      [organizationId, input.document.sourceArtifactGlobalId],
+    )
+    const artifact = artifactResult.rows[0]
+    if (!artifact || artifact.warehouse_id !== input.warehouseId) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_ARTIFACT_INVALID',
+        'Barcode labels were not found in the selected warehouse',
+        404,
+      )
+    }
+    const payload = artifact.payload
+      ? validateLabelBytes('ZPL', Buffer.from(artifact.payload))
+      : null
+    if (
+      !payload
+      || payload.byteLength !== Number(artifact.byte_length)
+      || contentHash(payload) !== artifact.content_sha256
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
+        'Barcode label content failed integrity validation',
+        500,
+      )
+    }
+    return {
+      id: artifact.id,
+      globalId: artifact.global_id,
+      labelId: null,
+      rateTestLabelId: null,
+      type: artifact.document_type,
+      format: artifact.format,
+      media: artifact.media_size,
+      source: {
+        orderId: null,
+        orderGlobalId: null,
+        orderNumber: null,
+        shipmentId: null,
+        shipmentGlobalId: null,
+        trackingNumber: null,
       },
     }
   }

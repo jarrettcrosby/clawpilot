@@ -7,6 +7,12 @@ import {
   type CarrierSandboxParcel,
 } from '@/lib/integrations/carrierSandboxRate'
 import {
+  canonicalOptimizerHash,
+  parseFulfillmentOptimizationResult,
+  validateFulfillmentOptimizationInput,
+  type FulfillmentOptimizationInputV1,
+} from '@/lib/operations/fulfillmentOptimizerContract'
+import {
   acquireTransactionAdvisoryLock,
   getPostgresPool,
   withTransaction,
@@ -16,6 +22,14 @@ import {
 // Cartonization comparisons are whole-shipment requests and must not split or
 // sum independent package rates, so the shared evidence bound is 50.
 export const MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES = 50
+
+export const CARTONIZATION_RATE_EVIDENCE_CARRIER_PROVIDERS = [
+  'ups_rest',
+  'fedex_rest',
+] as const
+
+export type CartonizationRateEvidenceCarrierProvider =
+  typeof CARTONIZATION_RATE_EVIDENCE_CARRIER_PROVIDERS[number]
 
 export type CartonizationRateEvidenceAllocation = {
   lineGlobalId: string
@@ -32,6 +46,17 @@ export type CartonizationRateEvidenceRecipeInput = {
   inputProfileVersionRowVersion: number
 }
 
+export type CartonizationRateEvidenceOrToolsProfileInput = {
+  lineGlobalId: string
+  productGlobalId: string
+  inputProfileVersionGlobalId: string
+  inputProfileVersionRowVersion: number
+  fitModel: 'rigid_3d'
+  unitDimensionsMm: CartonizationRateEvidenceDimensionsMm
+  unitWeightGrams: number
+  quantity: number
+}
+
 export type CartonizationRateEvidenceDimensionsMm = {
   length: number
   width: number
@@ -43,15 +68,32 @@ export type CartonizationRateEvidenceMaterialRateAssumption = {
   expectedRowVersion: number
   ratedOuterDimensionsMm: CartonizationRateEvidenceDimensionsMm
   tareWeightGrams: number
+  operationalFacts: {
+    materialType: 'carton' | 'poly_mailer' | 'padded_mailer'
+    innerDimensionsMm: CartonizationRateEvidenceDimensionsMm
+    maximumGrossWeightGrams: number
+    unitCostMinor: number
+    currency: string
+    stock: {
+      rowVersion: number
+      onHandQuantity: number
+      activeClaimedQuantity: number
+      availableQuantity: number
+    }
+  } | null
 }
 
 export type CartonizationRateEvidencePackageInput = {
   packageKey: string
   packageSequence: number
-  planningMethod: 'approved_recipe' | 'or_tools'
+  planningMethod:
+    | 'approved_recipe'
+    | 'or_tools'
+    | 'sandbox_fixed_axis'
   packagingMaterialGlobalId: string
   materialRowVersion: number
   recipes: CartonizationRateEvidenceRecipeInput[]
+  orToolsProfiles: CartonizationRateEvidenceOrToolsProfileInput[]
   innerDimensionsMm: CartonizationRateEvidenceDimensionsMm
   ratedOuterDimensionsMm: CartonizationRateEvidenceDimensionsMm
   contentWeightGrams: number
@@ -65,7 +107,7 @@ export type CartonizationRateEvidencePackageInput = {
 
 export type CartonizationRateEvidenceQuoteInput = {
   packageKey: string
-  provider: 'ups_rest' | 'fedex_rest'
+  provider: CartonizationRateEvidenceCarrierProvider
   rateEvidenceGlobalId: string
 }
 
@@ -78,6 +120,7 @@ export type CartonizationRateEvidenceWriteInput = {
   warehouseGlobalId: string
   inventorySyncRunGlobalId: string | null
   evidenceMode: 'operational' | 'assumption_backed_sandbox'
+  requiredCarrierProviders: CartonizationRateEvidenceCarrierProvider[]
   policyVersion: string
   algorithmVersion: string
   planInputHash: string
@@ -108,6 +151,7 @@ type EvidenceHeaderRow = {
   warehouse_name: string
   inventory_sync_run_global_id: string | null
   evidence_mode: 'operational' | 'assumption_backed_sandbox'
+  required_carrier_providers: CartonizationRateEvidenceCarrierProvider[]
   policy_version: string
   algorithm_version: string
   plan_input_hash: string
@@ -123,7 +167,10 @@ type EvidenceHeaderRow = {
 type EvidencePackageRow = {
   package_key: string
   package_sequence: number
-  planning_method: 'approved_recipe' | 'or_tools'
+  planning_method:
+    | 'approved_recipe'
+    | 'or_tools'
+    | 'sandbox_fixed_axis'
   packaging_material_global_id: string
   packaging_material_name: string
   approved_pack_recipe_global_id: string | null
@@ -159,9 +206,21 @@ type EvidenceRecipeRow = {
   input_profile_version_row_version: string
 }
 
+type EvidenceOrToolsProfileRow = {
+  package_key: string
+  line_global_id: string
+  product_global_id: string
+  input_profile_version_global_id: string
+  input_profile_version_row_version: string
+  fit_model: 'rigid_3d'
+  unit_dimensions_mm: CartonizationRateEvidenceDimensionsMm
+  unit_weight_grams: number
+  quantity: number
+}
+
 type EvidenceQuoteRow = {
   package_key: string
-  provider: 'ups_rest' | 'fedex_rest'
+  provider: CartonizationRateEvidenceCarrierProvider
   rate_evidence_global_id: string
   quote_status: 'succeeded' | 'failed'
   error_code: string | null
@@ -200,6 +259,7 @@ export type CartonizationRateEvidence = {
   }
   inventorySyncRunGlobalId: string | null
   evidenceMode: 'operational' | 'assumption_backed_sandbox'
+  requiredCarrierProviders: CartonizationRateEvidenceCarrierProvider[]
   policyVersion: string
   algorithmVersion: string
   planInputHash: string
@@ -211,7 +271,7 @@ export type CartonizationRateEvidence = {
   actorEmail: string | null
   createdAt: string
   shipmentRates: Array<{
-    provider: 'ups_rest' | 'fedex_rest'
+    provider: CartonizationRateEvidenceCarrierProvider
     rateEvidenceGlobalId: string
     status: 'succeeded' | 'failed'
     errorCode: string | null
@@ -234,7 +294,10 @@ export type CartonizationRateEvidence = {
   packages: Array<{
     packageKey: string
     packageSequence: number
-    planningMethod: 'approved_recipe' | 'or_tools'
+    planningMethod:
+      | 'approved_recipe'
+      | 'or_tools'
+      | 'sandbox_fixed_axis'
     packagingMaterialGlobalId: string
     packagingMaterialName: string
     approvedPackRecipeGlobalId: string | null
@@ -249,6 +312,7 @@ export type CartonizationRateEvidence = {
       recipeRowVersion: number
       inputProfileVersionRowVersion: number
     }>
+    orToolsProfiles: CartonizationRateEvidenceOrToolsProfileInput[]
     innerDimensionsMm: {
       length: number
       width: number
@@ -267,7 +331,7 @@ export type CartonizationRateEvidence = {
     carrierParcel: CarrierSandboxParcel
     packageHash: string
     quotes: Array<{
-      provider: 'ups_rest' | 'fedex_rest'
+      provider: CartonizationRateEvidenceCarrierProvider
       rateEvidenceGlobalId: string
       status: 'succeeded' | 'failed'
       errorCode: string | null
@@ -408,6 +472,346 @@ function sameMaterialRateDimensions(
   )
 }
 
+export function assertCartonizationRateEvidenceOrToolsProfiles(
+  input: Pick<
+    CartonizationRateEvidenceWriteInput,
+    'evidenceMode' | 'packages'
+  >,
+) {
+  for (const packageInput of input.packages) {
+    if (!Array.isArray(packageInput.orToolsProfiles)) {
+      fail(
+        `${packageInput.packageKey} requires an explicit OR-Tools profile evidence array`,
+        400,
+        'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROFILE_INVALID',
+      )
+    }
+    if (packageInput.planningMethod !== 'or_tools') {
+      if (packageInput.orToolsProfiles.length !== 0) {
+        fail(
+          `${packageInput.packageKey} cannot retain OR-Tools profile evidence`,
+          400,
+          'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROFILE_INVALID',
+        )
+      }
+      continue
+    }
+    if (input.evidenceMode !== 'operational') {
+      fail(
+        `${packageInput.packageKey} requires operational evidence for OR-Tools geometry`,
+        400,
+        'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROFILE_INVALID',
+      )
+    }
+    const allocationsByLine = new Map<
+      string,
+      CartonizationRateEvidenceAllocation
+    >()
+    for (const allocation of packageInput.allocations) {
+      if (allocationsByLine.has(allocation.lineGlobalId)) {
+        fail(
+          `${packageInput.packageKey} repeats allocation line ${allocation.lineGlobalId}`,
+          400,
+          'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROFILE_INVALID',
+        )
+      }
+      allocationsByLine.set(allocation.lineGlobalId, allocation)
+    }
+    if (
+      packageInput.orToolsProfiles.length !== allocationsByLine.size
+    ) {
+      fail(
+        `${packageInput.packageKey} requires one exact profile edge per allocation line`,
+        400,
+        'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROFILE_INVALID',
+      )
+    }
+    const retainedLines = new Set<string>()
+    for (const profile of packageInput.orToolsProfiles) {
+      const allocation = allocationsByLine.get(profile?.lineGlobalId)
+      if (
+        !/^gcol(?:[0-9]{7}|[0-9a-v]{12})$/.test(
+          profile?.lineGlobalId || '',
+        )
+        || !/^gp(?:[0-9]{7}|[0-9a-v]{12})$/.test(
+          profile?.productGlobalId || '',
+        )
+        || !/^gppv(?:[0-9]{7}|[0-9a-v]{12})$/.test(
+          profile?.inputProfileVersionGlobalId || '',
+        )
+        || !Number.isSafeInteger(profile?.inputProfileVersionRowVersion)
+        || profile.inputProfileVersionRowVersion < 0
+        || profile.fitModel !== 'rigid_3d'
+        || !exactMaterialRateDimensions(profile?.unitDimensionsMm)
+        || !Number.isSafeInteger(profile?.unitWeightGrams)
+        || profile.unitWeightGrams <= 0
+        || !Number.isSafeInteger(profile?.quantity)
+        || profile.quantity <= 0
+        || retainedLines.has(profile.lineGlobalId)
+        || !allocation
+        || allocation.productGlobalId !== profile.productGlobalId
+        || allocation.quantity !== profile.quantity
+      ) {
+        fail(
+          `${packageInput.packageKey} contains invalid or mismatched OR-Tools profile evidence`,
+          400,
+          'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROFILE_INVALID',
+        )
+      }
+      retainedLines.add(profile.lineGlobalId)
+    }
+  }
+}
+
+export function assertCartonizationRateEvidenceOperationalGeometryProvenance(
+  input: Pick<
+    CartonizationRateEvidenceWriteInput,
+    'evidenceMode' | 'packages' | 'planSnapshot'
+  >,
+) {
+  const orToolsPackages = input.packages.filter(
+    (packageInput) => packageInput.planningMethod === 'or_tools',
+  )
+  const retainedPlan = input.planSnapshot.operationalGeometryRatePlan
+  if (orToolsPackages.length === 0) {
+    if (retainedPlan !== null && retainedPlan !== undefined) {
+      fail(
+        'Operational geometry provenance cannot be retained without OR-Tools packages',
+        400,
+        'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROVENANCE_INVALID',
+      )
+    }
+    return
+  }
+  if (
+    input.evidenceMode !== 'operational'
+    || !retainedPlan
+    || typeof retainedPlan !== 'object'
+    || Array.isArray(retainedPlan)
+  ) {
+    fail(
+      'OR-Tools packages require one exact retained operational geometry plan',
+      400,
+      'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROVENANCE_INVALID',
+    )
+  }
+  const plan = retainedPlan as Record<string, unknown>
+  const evidence = plan.evidence
+  const optimizerInput = plan.optimizerInput
+  const optimizerResult = plan.optimizerResult
+  const transformedPackages = plan.packages
+  if (
+    !evidence
+    || typeof evidence !== 'object'
+    || Array.isArray(evidence)
+    || !optimizerInput
+    || typeof optimizerInput !== 'object'
+    || Array.isArray(optimizerInput)
+    || !optimizerResult
+    || typeof optimizerResult !== 'object'
+    || Array.isArray(optimizerResult)
+    || !Array.isArray(transformedPackages)
+  ) {
+    fail(
+      'Operational geometry provenance is incomplete',
+      400,
+      'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROVENANCE_INVALID',
+    )
+  }
+  const retainedEvidence = evidence as Record<string, unknown>
+  const retainedResult = optimizerResult as Record<string, unknown>
+  const selectedPlan = retainedResult.selectedPlan
+  const selectedPlanId = selectedPlan
+    && typeof selectedPlan === 'object'
+    && !Array.isArray(selectedPlan)
+    ? (selectedPlan as Record<string, unknown>).planId
+    : null
+  const writePackages = [...orToolsPackages].sort((left, right) => (
+    left.packageSequence - right.packageSequence
+    || left.packageKey.localeCompare(right.packageKey)
+  )).map((packageInput) => Object.fromEntries(
+    Object.entries(packageInput).filter(([key]) => (
+      key !== 'carrierParcel' && key !== 'packageHash'
+    )),
+  ))
+  const retainedPackages = [...transformedPackages].sort((left, right) => {
+    if (
+      !left
+      || typeof left !== 'object'
+      || Array.isArray(left)
+      || !right
+      || typeof right !== 'object'
+      || Array.isArray(right)
+    ) return 0
+    const leftPackage = left as Record<string, unknown>
+    const rightPackage = right as Record<string, unknown>
+    return Number(leftPackage.packageSequence)
+      - Number(rightPackage.packageSequence)
+      || String(leftPackage.packageKey)
+        .localeCompare(String(rightPackage.packageKey))
+  })
+  try {
+    const exactOptimizerInput = optimizerInput as FulfillmentOptimizationInputV1
+    validateFulfillmentOptimizationInput(exactOptimizerInput)
+    const retainedProfilesByLine = new Map<string, {
+      productGlobalId: string
+      quantity: number
+      unitDimensionsMm: CartonizationRateEvidenceDimensionsMm
+      unitWeightGrams: number
+    }>()
+    for (const packageInput of orToolsPackages) {
+      for (const profile of packageInput.orToolsProfiles) {
+        const retained = retainedProfilesByLine.get(profile.lineGlobalId)
+        if (
+          retained
+          && (
+            retained.productGlobalId !== profile.productGlobalId
+            || !sameMaterialRateDimensions(
+              retained.unitDimensionsMm,
+              profile.unitDimensionsMm,
+            )
+            || retained.unitWeightGrams !== profile.unitWeightGrams
+          )
+        ) {
+          fail(
+            'OR-Tools packages retain inconsistent profile facts for one order line',
+            400,
+            'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROVENANCE_INVALID',
+          )
+        }
+        retainedProfilesByLine.set(profile.lineGlobalId, {
+          productGlobalId: profile.productGlobalId,
+          quantity: (retained?.quantity || 0) + profile.quantity,
+          unitDimensionsMm: profile.unitDimensionsMm,
+          unitWeightGrams: profile.unitWeightGrams,
+        })
+      }
+    }
+    if (
+      exactOptimizerInput.lines.length !== retainedProfilesByLine.size
+      || exactOptimizerInput.lines.some((line) => {
+        const profile = retainedProfilesByLine.get(line.lineGlobalId)
+        return (
+          !profile
+          || line.productGlobalId !== profile.productGlobalId
+          || line.quantity !== profile.quantity
+          || line.rotationAllowed !== false
+          || !sameMaterialRateDimensions(
+            line.unitDimensionsMm,
+            profile.unitDimensionsMm,
+          )
+          || line.unitWeightGrams !== profile.unitWeightGrams
+        )
+      })
+    ) {
+      fail(
+        'Optimizer demand does not match the retained exact package profile evidence',
+        400,
+        'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROVENANCE_INVALID',
+      )
+    }
+    const optimizerInputHash = canonicalOptimizerHash(optimizerInput)
+    const parsedResult = parseFulfillmentOptimizationResult(
+      optimizerResult,
+      exactOptimizerInput,
+      { deadlineMs: 10_000, maxCandidates: 8 },
+      optimizerInputHash,
+      'or_tools',
+    )
+    const transformationHash = canonicalOptimizerHash(retainedPackages)
+    if (
+      retainedEvidence.optimizerMethod !== 'or_tools'
+      || retainedEvidence.optimizerInputHash !== optimizerInputHash
+      || parsedResult.inputHash !== optimizerInputHash
+      || !['optimal', 'feasible'].includes(parsedResult.status)
+      || !parsedResult.selectedPlan
+      || selectedPlanId !== retainedEvidence.selectedPlanId
+      || parsedResult.algorithmVersion
+        !== retainedEvidence.optimizerAlgorithmVersion
+      || retainedEvidence.transformationHash !== transformationHash
+      || canonicalOptimizerHash(writePackages) !== transformationHash
+    ) {
+      fail(
+        'Operational OR-Tools optimizer and transformed package provenance do not match',
+        400,
+        'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROVENANCE_INVALID',
+      )
+    }
+  } catch (error) {
+    if (error instanceof CartonizationRateEvidencePersistenceError) {
+      throw error
+    }
+    fail(
+      'Operational OR-Tools provenance is not canonical',
+      400,
+      'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROVENANCE_INVALID',
+    )
+  }
+}
+
+export function assertCartonizationRateEvidenceCarrierCoverage(
+  input: Pick<
+    CartonizationRateEvidenceWriteInput,
+    'requiredCarrierProviders' | 'packages' | 'quotes'
+  >,
+) {
+  const requiredCarrierProviders = input.requiredCarrierProviders
+  const providerSignature = Array.isArray(requiredCarrierProviders)
+    ? requiredCarrierProviders.join(',')
+    : ''
+  if (![
+    'ups_rest',
+    'fedex_rest',
+    'ups_rest,fedex_rest',
+  ].includes(providerSignature)) {
+    fail(
+      'Cartonization rate evidence requires a canonical nonempty UPS and/or FedEx provider set',
+      400,
+      'CARTONIZATION_RATE_EVIDENCE_CARRIER_COVERAGE_INVALID',
+    )
+  }
+
+  const packageKeys = new Set(input.packages.map((item) => item.packageKey))
+  const quoteCounts = new Map<string, number>()
+  if (
+    packageKeys.size !== input.packages.length
+    || !Array.isArray(input.quotes)
+    || input.quotes.length
+      !== input.packages.length * requiredCarrierProviders.length
+  ) {
+    fail(
+      'Cartonization rate evidence requires exactly one quote from every retained carrier for every package',
+      400,
+      'CARTONIZATION_RATE_EVIDENCE_CARRIER_COVERAGE_INVALID',
+    )
+  }
+  for (const quote of input.quotes) {
+    if (
+      !packageKeys.has(quote.packageKey)
+      || !requiredCarrierProviders.includes(quote.provider)
+    ) {
+      fail(
+        'Cartonization rate evidence contains a quote outside its retained package and carrier set',
+        400,
+        'CARTONIZATION_RATE_EVIDENCE_CARRIER_COVERAGE_INVALID',
+      )
+    }
+    const key = `${quote.packageKey}:${quote.provider}`
+    quoteCounts.set(key, (quoteCounts.get(key) || 0) + 1)
+  }
+  for (const packageKey of packageKeys) {
+    for (const provider of requiredCarrierProviders) {
+      if (quoteCounts.get(`${packageKey}:${provider}`) !== 1) {
+        fail(
+          'Cartonization rate evidence requires exactly one quote from every retained carrier for every package',
+          400,
+          'CARTONIZATION_RATE_EVIDENCE_CARRIER_COVERAGE_INVALID',
+        )
+      }
+    }
+  }
+}
+
 export function assertCartonizationRateEvidenceMaterialAssumptions(
   input: Pick<
     CartonizationRateEvidenceWriteInput,
@@ -418,6 +822,86 @@ export function assertCartonizationRateEvidenceMaterialAssumptions(
     | 'packages'
   >,
 ) {
+  const sandboxFixedAxisPackageKeys = input.packages
+    .filter((item) => item.planningMethod === 'sandbox_fixed_axis')
+    .map((item) => item.packageKey)
+    .sort()
+  if (
+    sandboxFixedAxisPackageKeys.length > 0
+    && input.evidenceMode !== 'assumption_backed_sandbox'
+  ) {
+    fail(
+      'Sandbox fixed-axis packages are forbidden in operational evidence',
+      400,
+      'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_ASSUMPTIONS_FORBIDDEN',
+    )
+  }
+  if (sandboxFixedAxisPackageKeys.length > 0) {
+    const assumptionGeometry = input.assumptionSnapshot
+      .sandboxGeometryRatePlan
+    const planGeometry = input.planSnapshot.sandboxGeometryRatePlan
+    if (
+      input.assumptionSnapshot.watermark
+        !== 'ASSUMPTION-BACKED SANDBOX EVIDENCE - NOT EXECUTABLE OR ACTUAL BILLED COST'
+      || !assumptionGeometry
+      || typeof assumptionGeometry !== 'object'
+      || Array.isArray(assumptionGeometry)
+      || !planGeometry
+      || typeof planGeometry !== 'object'
+      || Array.isArray(planGeometry)
+    ) {
+      fail(
+        'Sandbox fixed-axis packages require retained watermarked geometry evidence',
+        400,
+        'CARTONIZATION_RATE_EVIDENCE_SANDBOX_GEOMETRY_EVIDENCE_INVALID',
+      )
+    }
+    const assumptionRecord = assumptionGeometry as Record<string, unknown>
+    const planRecord = planGeometry as Record<string, unknown>
+    const planEvidence = planRecord.evidence
+    const planPackages = planRecord.packages
+    const retainedPackageKeys = Array.isArray(assumptionRecord.packageKeys)
+      ? [...assumptionRecord.packageKeys].sort()
+      : []
+    const plannedPackageKeys = Array.isArray(planPackages)
+      ? planPackages.map((item) => (
+          item && typeof item === 'object' && !Array.isArray(item)
+            ? (item as Record<string, unknown>).packageKey
+            : null
+        )).sort()
+      : []
+    if (
+      assumptionRecord.policyVersion
+        !== 'sandbox-fixed-axis-one-unit-per-parcel-v1'
+      || assumptionRecord.fitEnvelopeBasis
+        !== 'retained_material_fit_dimensions'
+      || assumptionRecord.rotationAllowed !== false
+      || assumptionRecord.unitsPerPackage !== 1
+      || assumptionRecord.materialStockAuthority
+        !== 'not_used_for_sandbox_comparison'
+      || !planEvidence
+      || typeof planEvidence !== 'object'
+      || cartonizationRateEvidenceHash(planEvidence)
+        !== cartonizationRateEvidenceHash({
+          policyVersion: assumptionRecord.policyVersion,
+          fitEnvelopeBasis: assumptionRecord.fitEnvelopeBasis,
+          rotationAllowed: assumptionRecord.rotationAllowed,
+          unitsPerPackage: assumptionRecord.unitsPerPackage,
+          materialStockAuthority:
+            assumptionRecord.materialStockAuthority,
+        })
+      || cartonizationRateEvidenceHash(retainedPackageKeys)
+        !== cartonizationRateEvidenceHash(sandboxFixedAxisPackageKeys)
+      || cartonizationRateEvidenceHash(plannedPackageKeys)
+        !== cartonizationRateEvidenceHash(sandboxFixedAxisPackageKeys)
+    ) {
+      fail(
+        'Sandbox fixed-axis package provenance does not match the retained plan',
+        400,
+        'CARTONIZATION_RATE_EVIDENCE_SANDBOX_GEOMETRY_EVIDENCE_INVALID',
+      )
+    }
+  }
   if (
     input.evidenceMode === 'operational'
     && input.planSnapshot.carrierReadEnvironment !== 'sandbox'
@@ -453,6 +937,52 @@ export function assertCartonizationRateEvidenceMaterialAssumptions(
       )
       || !Number.isSafeInteger(assumption?.tareWeightGrams)
       || assumption.tareWeightGrams <= 0
+      || (
+        input.evidenceMode === 'operational'
+        && (
+          !assumption.operationalFacts
+          || ![
+            'carton',
+            'poly_mailer',
+            'padded_mailer',
+          ].includes(assumption.operationalFacts.materialType)
+          || !exactMaterialRateDimensions(
+            assumption.operationalFacts.innerDimensionsMm,
+          )
+          || !Number.isSafeInteger(
+            assumption.operationalFacts.maximumGrossWeightGrams,
+          )
+          || assumption.operationalFacts.maximumGrossWeightGrams
+            <= assumption.tareWeightGrams
+          || !Number.isSafeInteger(
+            assumption.operationalFacts.unitCostMinor,
+          )
+          || assumption.operationalFacts.unitCostMinor <= 0
+          || !/^[A-Z]{3}$/.test(
+            assumption.operationalFacts.currency,
+          )
+          || !Number.isSafeInteger(
+            assumption.operationalFacts.stock.rowVersion,
+          )
+          || assumption.operationalFacts.stock.rowVersion < 0
+          || !Number.isSafeInteger(
+            assumption.operationalFacts.stock.onHandQuantity,
+          )
+          || assumption.operationalFacts.stock.onHandQuantity < 0
+          || !Number.isSafeInteger(
+            assumption.operationalFacts.stock.activeClaimedQuantity,
+          )
+          || assumption.operationalFacts.stock.activeClaimedQuantity < 0
+          || assumption.operationalFacts.stock.availableQuantity
+            !== assumption.operationalFacts.stock.onHandQuantity
+              - assumption.operationalFacts.stock.activeClaimedQuantity
+          || assumption.operationalFacts.stock.availableQuantity <= 0
+        )
+      )
+      || (
+        input.evidenceMode === 'assumption_backed_sandbox'
+        && assumption.operationalFacts !== null
+      )
       || assumptionsByMaterial.has(assumption.materialGlobalId)
     ) {
       fail(
@@ -506,6 +1036,18 @@ export function assertCartonizationRateEvidenceMaterialAssumptions(
       )
       || assumption.tareWeightGrams
         !== packageInput.tareWeightGrams
+      || (
+        input.evidenceMode === 'operational'
+        && (
+          !assumption.operationalFacts
+          || !sameMaterialRateDimensions(
+            assumption.operationalFacts.innerDimensionsMm,
+            packageInput.innerDimensionsMm,
+          )
+          || assumption.operationalFacts.maximumGrossWeightGrams
+            !== packageInput.maxWeightGrams
+        )
+      )
     ) {
       fail(
         `${packageInput.packageKey} does not match its selected material assumptions`,
@@ -543,6 +1085,7 @@ export function cartonizationRateEvidenceRequestHash(
     warehouseGlobalId: input.warehouseGlobalId,
     inventorySyncRunGlobalId: input.inventorySyncRunGlobalId,
     evidenceMode: input.evidenceMode,
+    requiredCarrierProviders: input.requiredCarrierProviders,
     rateScope: 'multi_package_shipment',
     carrierRatePurpose: 'cartonization_shipment_rate',
     policyVersion: input.policyVersion,
@@ -557,7 +1100,7 @@ export function cartonizationRateEvidenceRequestHash(
 }
 
 export function cartonizationPackageRateContextHash(input: {
-  provider: 'ups_rest' | 'fedex_rest'
+  provider: CartonizationRateEvidenceCarrierProvider
   destinationFingerprint: string
   parcel: CarrierSandboxParcel
 }) {
@@ -571,7 +1114,7 @@ export function cartonizationPackageRateContextHash(input: {
 }
 
 export function cartonizationShipmentRateContextHash(input: {
-  provider: 'ups_rest' | 'fedex_rest'
+  provider: CartonizationRateEvidenceCarrierProvider
   destinationFingerprint: string
   parcels: CarrierSandboxParcel[]
 }) {
@@ -753,6 +1296,7 @@ function mapEvidence(
   header: EvidenceHeaderRow,
   packageRows: EvidencePackageRow[],
   recipeRows: EvidenceRecipeRow[],
+  orToolsProfileRows: EvidenceOrToolsProfileRow[],
   quoteRows: EvidenceQuoteRow[],
 ): CartonizationRateEvidence {
   const quotesByPackage = new Map<string, EvidenceQuoteRow[]>()
@@ -767,9 +1311,16 @@ function mapEvidence(
     current.push(recipe)
     recipesByPackage.set(recipe.package_key, current)
   }
-  const shipmentRates = (
-    ['ups_rest', 'fedex_rest'] as const
-  ).flatMap((provider) => {
+  const orToolsProfilesByPackage = new Map<
+    string,
+    EvidenceOrToolsProfileRow[]
+  >()
+  for (const profile of orToolsProfileRows) {
+    const current = orToolsProfilesByPackage.get(profile.package_key) || []
+    current.push(profile)
+    orToolsProfilesByPackage.set(profile.package_key, current)
+  }
+  const shipmentRates = header.required_carrier_providers.flatMap((provider) => {
     const providerQuotes = quoteRows.filter(
       (quote) => quote.provider === provider,
     )
@@ -822,6 +1373,7 @@ function mapEvidence(
     },
     inventorySyncRunGlobalId: header.inventory_sync_run_global_id,
     evidenceMode: header.evidence_mode,
+    requiredCarrierProviders: header.required_carrier_providers,
     policyVersion: header.policy_version,
     algorithmVersion: header.algorithm_version,
     planInputHash: header.plan_input_hash,
@@ -850,6 +1402,22 @@ function mapEvidence(
             `${row.package_key} input profile row version`,
           ),
         }))
+      const orToolsProfiles = (
+        orToolsProfilesByPackage.get(row.package_key) || []
+      ).map((profile) => ({
+        lineGlobalId: profile.line_global_id,
+        productGlobalId: profile.product_global_id,
+        inputProfileVersionGlobalId:
+          profile.input_profile_version_global_id,
+        inputProfileVersionRowVersion: safeInteger(
+          profile.input_profile_version_row_version,
+          `${row.package_key} OR-Tools profile row version`,
+        ),
+        fitModel: profile.fit_model,
+        unitDimensionsMm: profile.unit_dimensions_mm,
+        unitWeightGrams: profile.unit_weight_grams,
+        quantity: profile.quantity,
+      }))
       return {
       packageKey: row.package_key,
       packageSequence: row.package_sequence,
@@ -873,6 +1441,7 @@ function mapEvidence(
             `${row.package_key} recipe row version`,
           ),
       recipes: packageRecipes,
+      orToolsProfiles,
       innerDimensionsMm: row.inner_dimensions_mm,
       ratedOuterDimensionsMm: row.rated_outer_dimensions_mm,
       contentWeightGrams: row.content_weight_grams,
@@ -933,6 +1502,7 @@ async function readEvidenceRows(
          warehouse.name AS warehouse_name,
          inventory_run.global_id AS inventory_sync_run_global_id,
          evidence.evidence_mode,
+         evidence.required_carrier_providers,
          evidence.policy_version,
          evidence.algorithm_version,
          evidence.plan_input_hash,
@@ -968,7 +1538,12 @@ async function readEvidenceRows(
       await client.query('COMMIT')
       return null
     }
-    const [packageResult, recipeResult, quoteResult] = await Promise.all([
+    const [
+      packageResult,
+      recipeResult,
+      orToolsProfileResult,
+      quoteResult,
+    ] = await Promise.all([
       client.query<EvidencePackageRow>(
         `SELECT
            package.package_key,
@@ -1019,6 +1594,25 @@ async function readEvidenceRows(
            recipe_edge.package_key, recipe_edge.recipe_global_id`,
         [organizationId, header.id],
       ),
+      client.query<EvidenceOrToolsProfileRow>(
+        `SELECT
+           profile_edge.package_key,
+           profile_edge.line_global_id,
+           profile_edge.product_global_id,
+           profile_edge.input_profile_version_global_id,
+           profile_edge.input_profile_version_row_version::text,
+           profile_edge.fit_model,
+           profile_edge.unit_dimensions_mm,
+           profile_edge.unit_weight_grams,
+           profile_edge.quantity
+         FROM operations_cartonization_rate_evidence_package_profiles
+           profile_edge
+         WHERE profile_edge.organization_id = $1::uuid
+           AND profile_edge.evidence_id = $2::uuid
+         ORDER BY
+           profile_edge.package_key, profile_edge.line_global_id`,
+        [organizationId, header.id],
+      ),
       client.query<EvidenceQuoteRow>(
         `SELECT
            quote.package_key,
@@ -1048,6 +1642,7 @@ async function readEvidenceRows(
       header,
       packageResult.rows,
       recipeResult.rows,
+      orToolsProfileResult.rows,
       quoteResult.rows,
     )
   } catch (error) {
@@ -1220,15 +1815,9 @@ export async function writeCartonizationRateEvidenceInPostgres(
       400,
     )
   }
-  if (
-    !Array.isArray(input.quotes)
-    || input.quotes.length !== input.packages.length * 2
-  ) {
-    fail(
-      'Cartonization rate evidence requires one UPS and one FedEx quote per package',
-      400,
-    )
-  }
+  assertCartonizationRateEvidenceCarrierCoverage(input)
+  assertCartonizationRateEvidenceOrToolsProfiles(input)
+  assertCartonizationRateEvidenceOperationalGeometryProvenance(input)
   assertCartonizationRateEvidenceMaterialAssumptions(input)
   const inputPlanResultHash = cartonizationRateEvidenceHash(input.planSnapshot)
   if (inputPlanResultHash !== input.planResultHash) {
@@ -1440,6 +2029,17 @@ export async function writeCartonizationRateEvidenceInPostgres(
         inputProfileVersionGlobalId: string
         inputProfileVersionRowVersion: number
       }>
+      orToolsProfiles: Array<{
+        lineGlobalId: string
+        productGlobalId: string
+        inputProfileVersionId: string
+        inputProfileVersionGlobalId: string
+        inputProfileVersionRowVersion: number
+        fitModel: 'rigid_3d'
+        unitDimensionsMm: CartonizationRateEvidenceDimensionsMm
+        unitWeightGrams: number
+        quantity: number
+      }>
     }>()
     const packageSequences = new Set<number>()
     const requiredMaterialQuantities = input.packages.reduce(
@@ -1470,6 +2070,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
             packageInput.packagingMaterialGlobalId,
           materialRowVersion: packageInput.materialRowVersion,
           recipes: packageInput.recipes,
+          orToolsProfiles: packageInput.orToolsProfiles,
           innerDimensionsMm: packageInput.innerDimensionsMm,
           ratedOuterDimensionsMm: packageInput.ratedOuterDimensionsMm,
           contentWeightGrams: packageInput.contentWeightGrams,
@@ -1491,7 +2092,14 @@ export async function writeCartonizationRateEvidenceInPostgres(
         rated_outer_dimension_evidence_type: string | null
         rated_outer_dimension_evidence_reference: string | null
         rated_outer_dimension_confirmed_at: Date | string | null
+        material_type: 'carton' | 'poly_mailer' | 'padded_mailer'
+        inner_length_mm: number | null
+        inner_width_mm: number | null
+        inner_height_mm: number | null
         tare_weight_grams: number | null
+        max_weight_grams: number | null
+        unit_cost_minor: string | null
+        currency: string | null
       }>(
         `SELECT
            material.id::text AS material_id,
@@ -1502,7 +2110,14 @@ export async function writeCartonizationRateEvidenceInPostgres(
            material.rated_outer_dimension_evidence_type,
            material.rated_outer_dimension_evidence_reference,
            material.rated_outer_dimension_confirmed_at,
-           material.tare_weight_grams
+           material.material_type,
+           material.inner_length_mm,
+           material.inner_width_mm,
+           material.inner_height_mm,
+           material.tare_weight_grams,
+           material.max_weight_grams,
+           material.unit_cost_minor::text,
+           material.currency
          FROM operations_packaging_materials material
          WHERE material.organization_id = $1::uuid
            AND material.global_id = $2
@@ -1526,7 +2141,11 @@ export async function writeCartonizationRateEvidenceInPostgres(
       if (
         input.evidenceMode === 'operational'
         && (
-          material.status !== 'active'
+          !input.materialRateAssumptions.find((assumption) => (
+            assumption.materialGlobalId
+              === packageInput.packagingMaterialGlobalId
+          ))?.operationalFacts
+          || material.status !== 'active'
           || material.rated_outer_length_mm
             !== packageInput.ratedOuterDimensionsMm.length
           || material.rated_outer_width_mm
@@ -1548,11 +2167,60 @@ export async function writeCartonizationRateEvidenceInPostgres(
         )
       }
       if (input.evidenceMode === 'operational') {
+        const operationalFacts = input.materialRateAssumptions.find(
+          (assumption) => (
+            assumption.materialGlobalId
+              === packageInput.packagingMaterialGlobalId
+          ),
+        )?.operationalFacts
+        if (
+          !operationalFacts
+          || material.material_type !== operationalFacts.materialType
+          || material.inner_length_mm
+            !== operationalFacts.innerDimensionsMm.length
+          || material.inner_width_mm
+            !== operationalFacts.innerDimensionsMm.width
+          || material.inner_height_mm
+            !== operationalFacts.innerDimensionsMm.height
+          || packageInput.innerDimensionsMm.length
+            !== operationalFacts.innerDimensionsMm.length
+          || packageInput.innerDimensionsMm.width
+            !== operationalFacts.innerDimensionsMm.width
+          || packageInput.innerDimensionsMm.height
+            !== operationalFacts.innerDimensionsMm.height
+          || material.max_weight_grams
+            !== operationalFacts.maximumGrossWeightGrams
+          || packageInput.maxWeightGrams
+            !== operationalFacts.maximumGrossWeightGrams
+          || Number(material.unit_cost_minor)
+            !== operationalFacts.unitCostMinor
+          || material.currency !== operationalFacts.currency
+        ) {
+          fail(
+            `${packageInput.packagingMaterialGlobalId} exact operational material facts changed before evidence sealing`,
+            409,
+            'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_STALE',
+          )
+        }
         const stock = await client.query<{
           is_available: boolean
           on_hand_quantity: number | null
+          row_version: string
+          active_claimed_quantity: string
         }>(
-          `SELECT stock.is_available, stock.on_hand_quantity
+          `SELECT
+             stock.is_available,
+             stock.on_hand_quantity,
+             stock.row_version::text,
+             COALESCE((
+               SELECT sum(claim.quantity)
+               FROM operations_packaging_material_claims claim
+               WHERE claim.organization_id = stock.organization_id
+                 AND claim.packaging_material_id =
+                      stock.packaging_material_id
+                 AND claim.warehouse_id = stock.warehouse_id
+                 AND claim.status = 'active'
+             ), 0)::text AS active_claimed_quantity
            FROM operations_packaging_material_stock stock
            WHERE stock.organization_id = $1::uuid
              AND stock.packaging_material_id = $2::uuid
@@ -1566,6 +2234,12 @@ export async function writeCartonizationRateEvidenceInPostgres(
           ],
         )
         const currentStock = stock.rows[0]
+        const activeClaimedQuantity = currentStock
+          ? safeInteger(
+              currentStock.active_claimed_quantity,
+              `${packageInput.packagingMaterialGlobalId} active claims`,
+            )
+          : 0
         const requiredQuantity = requiredMaterialQuantities.get(
           packageInput.packagingMaterialGlobalId,
         ) || 0
@@ -1573,7 +2247,18 @@ export async function writeCartonizationRateEvidenceInPostgres(
           !currentStock
           || currentStock.is_available !== true
           || currentStock.on_hand_quantity === null
-          || currentStock.on_hand_quantity < requiredQuantity
+          || safeInteger(
+            currentStock.row_version,
+            `${packageInput.packagingMaterialGlobalId} stock row version`,
+          ) !== operationalFacts.stock.rowVersion
+          || currentStock.on_hand_quantity
+            !== operationalFacts.stock.onHandQuantity
+          || activeClaimedQuantity
+            !== operationalFacts.stock.activeClaimedQuantity
+          || currentStock.on_hand_quantity - activeClaimedQuantity
+            !== operationalFacts.stock.availableQuantity
+          || currentStock.on_hand_quantity - activeClaimedQuantity
+            < requiredQuantity
         ) {
           fail(
             `${packageInput.packagingMaterialGlobalId} has insufficient current stock for ${requiredQuantity} planned package(s)`,
@@ -1586,7 +2271,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
         (packageInput.planningMethod === 'approved_recipe'
           && packageInput.recipes.length < 1)
         || (
-          packageInput.planningMethod === 'or_tools'
+          packageInput.planningMethod !== 'approved_recipe'
           && packageInput.recipes.length !== 0
         )
       ) {
@@ -1692,9 +2377,103 @@ export async function writeCartonizationRateEvidenceInPostgres(
           ),
         })
       }
+      const resolvedOrToolsProfiles: Array<{
+        lineGlobalId: string
+        productGlobalId: string
+        inputProfileVersionId: string
+        inputProfileVersionGlobalId: string
+        inputProfileVersionRowVersion: number
+        fitModel: 'rigid_3d'
+        unitDimensionsMm: CartonizationRateEvidenceDimensionsMm
+        unitWeightGrams: number
+        quantity: number
+      }> = []
+      for (const profileInput of packageInput.orToolsProfiles) {
+        const profileResult = await client.query<{
+          input_profile_version_id: string
+          input_profile_version_global_id: string
+          input_profile_version_row_version: string
+        }>(
+          `SELECT
+             profile_version.id::text AS input_profile_version_id,
+             profile_version.global_id
+               AS input_profile_version_global_id,
+             profile_version.row_version::text
+               AS input_profile_version_row_version
+           FROM operations_commerce_order_candidate_lines candidate_line
+           JOIN crm_products product
+             ON product.pipeline_id = candidate_line.pipeline_id
+            AND product.id = candidate_line.product_id
+           JOIN operations_product_pack_profile_versions profile_version
+             ON profile_version.organization_id =
+                  candidate_line.organization_id
+            AND profile_version.pipeline_id = candidate_line.pipeline_id
+            AND profile_version.product_id = candidate_line.product_id
+            AND profile_version.id = candidate_line.pack_profile_version_id
+           WHERE candidate_line.organization_id = $1::uuid
+             AND candidate_line.integration_account_id = $2::uuid
+             AND candidate_line.order_candidate_id = $3::uuid
+             AND candidate_line.global_id = $4
+             AND candidate_line.requires_shipping = true
+             AND candidate_line.mapping_state = 'resolved'
+             AND candidate_line.packaging_state = 'resolved'
+             AND product.reference_code = $5
+             AND profile_version.global_id = $6
+             AND profile_version.row_version = $7
+             AND candidate_line.pack_profile_version_row_version =
+                  profile_version.row_version
+             AND profile_version.lifecycle_state = 'active'
+             AND profile_version.is_current = true
+             AND profile_version.dimension_basis = 'outer'
+             AND profile_version.fit_model = 'rigid_3d'
+             AND profile_version.length_mm = $8
+             AND profile_version.width_mm = $9
+             AND profile_version.height_mm = $10
+             AND profile_version.gross_weight_grams = $11
+           LIMIT 1
+           FOR SHARE OF candidate_line, product, profile_version`,
+          [
+            input.organizationId,
+            exactContext.integration_account_id,
+            exactContext.candidate_id,
+            profileInput.lineGlobalId,
+            profileInput.productGlobalId,
+            profileInput.inputProfileVersionGlobalId,
+            profileInput.inputProfileVersionRowVersion,
+            profileInput.unitDimensionsMm.length,
+            profileInput.unitDimensionsMm.width,
+            profileInput.unitDimensionsMm.height,
+            profileInput.unitWeightGrams,
+          ],
+        )
+        const profile = profileResult.rows[0]
+        if (!profile) {
+          fail(
+            `${packageInput.packageKey} line ${profileInput.lineGlobalId} no longer has the exact active outer rigid profile used by OR-Tools`,
+            409,
+            'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROFILE_STALE',
+          )
+        }
+        resolvedOrToolsProfiles.push({
+          lineGlobalId: profileInput.lineGlobalId,
+          productGlobalId: profileInput.productGlobalId,
+          inputProfileVersionId: profile.input_profile_version_id,
+          inputProfileVersionGlobalId:
+            profile.input_profile_version_global_id,
+          inputProfileVersionRowVersion: safeInteger(
+            profile.input_profile_version_row_version,
+            `${packageInput.packageKey} OR-Tools profile row version`,
+          ),
+          fitModel: profileInput.fitModel,
+          unitDimensionsMm: profileInput.unitDimensionsMm,
+          unitWeightGrams: profileInput.unitWeightGrams,
+          quantity: profileInput.quantity,
+        })
+      }
       packageContexts.set(packageInput.packageKey, {
         materialId: material.material_id,
         recipes: resolvedRecipes,
+        orToolsProfiles: resolvedOrToolsProfiles,
       })
     }
 
@@ -1721,7 +2500,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
       ))
       .map((packageInput) => packageInput.carrierParcel)
     const rateEvidenceByProvider = new Map<
-      'ups_rest' | 'fedex_rest',
+      CartonizationRateEvidenceCarrierProvider,
       string
     >()
     for (const quote of input.quotes) {
@@ -1845,11 +2624,13 @@ export async function writeCartonizationRateEvidenceInPostgres(
          inventory_sync_run_id, evidence_mode, policy_version,
          algorithm_version, plan_input_hash, plan_result_hash,
          plan_snapshot, assumption_snapshot, status, idempotency_key,
-         actor_email, request_hash, write_token_hash
+         actor_email, request_hash, write_token_hash,
+         required_carrier_providers
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7::uuid,
          $8::uuid, $9, $10, $11, $12, $13,
-         $14::jsonb, $15::jsonb, $16, $17, $18, $19, $20
+         $14::jsonb, $15::jsonb, $16, $17, $18, $19, $20,
+         $21::text[]
        )
        RETURNING id::text, global_id`,
       [
@@ -1873,6 +2654,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
         input.actorEmail,
         requestHash,
         writeTokenHash,
+        input.requiredCarrierProviders,
       ],
     )
     const evidence = inserted.rows[0]
@@ -1944,6 +2726,36 @@ export async function writeCartonizationRateEvidenceInPostgres(
             recipe.inputProfileVersionGlobalId,
             recipe.recipeRowVersion,
             recipe.inputProfileVersionRowVersion,
+          ],
+        )
+      }
+      for (const profile of contextForPackage.orToolsProfiles) {
+        await client.query(
+          `INSERT INTO
+             operations_cartonization_rate_evidence_package_profiles (
+               organization_id, evidence_id, package_key,
+               line_global_id, product_global_id,
+               input_pack_profile_version_id,
+               input_profile_version_global_id,
+               input_profile_version_row_version, fit_model,
+               unit_dimensions_mm, unit_weight_grams, quantity
+             ) VALUES (
+               $1::uuid, $2::uuid, $3, $4, $5, $6::uuid, $7, $8,
+               $9, $10::jsonb, $11, $12
+             )`,
+          [
+            input.organizationId,
+            evidence.id,
+            packageInput.packageKey,
+            profile.lineGlobalId,
+            profile.productGlobalId,
+            profile.inputProfileVersionId,
+            profile.inputProfileVersionGlobalId,
+            profile.inputProfileVersionRowVersion,
+            profile.fitModel,
+            JSON.stringify(profile.unitDimensionsMm),
+            profile.unitWeightGrams,
+            profile.quantity,
           ],
         )
       }
@@ -2025,6 +2837,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
         candidateGlobalId: input.candidateGlobalId,
         packageCount: input.packages.length,
         quoteCount: input.quotes.length,
+        requiredCarrierProviders: input.requiredCarrierProviders,
         evidenceMode: input.evidenceMode,
         status: input.status,
         requestHash,

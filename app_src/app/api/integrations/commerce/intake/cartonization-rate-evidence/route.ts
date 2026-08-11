@@ -12,6 +12,10 @@ import {
   assertCommerceIntakeRuntime,
 } from '@/lib/integrations/commerceIntake'
 import {
+  inspectShopifyOrderPlanningAuthority,
+  ShopifyOrderPlanningAuthorityError,
+} from '@/lib/integrations/shopifyOrderPlanningAuthority'
+import {
   CommerceIntegrationRequestError,
   sanitizedCommerceIntegrationError,
 } from '@/lib/integrations/commerceIntegrations'
@@ -23,8 +27,18 @@ import {
   planHybridCartonization,
   type HybridCartonizationMinimumOverride,
 } from '@/lib/operations/hybridCartonization'
+import {
+  planOperationalGeometryRatePackages,
+} from '@/lib/operations/operationalGeometryCartonization'
+import {
+  configuredOrToolsFulfillmentOptimizer,
+} from '@/lib/operations/orToolsFulfillmentOptimizer'
+import {
+  planSandboxGeometryRatePackages,
+} from '@/lib/operations/sandboxCartonizationRatePlan'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
+  CARTONIZATION_RATE_EVIDENCE_CARRIER_PROVIDERS,
   cartonizationRateEvidenceHash,
   CartonizationRateEvidencePersistenceError,
   claimCartonizationRateEvidenceCommandInPostgres,
@@ -36,11 +50,16 @@ import {
   type CartonizationRateEvidenceMaterialRateAssumption,
   type CartonizationRateEvidencePackageInput,
   type CartonizationRateEvidenceQuoteInput,
+  type CartonizationRateEvidenceCarrierProvider,
 } from '@/lib/persistence/cartonizationRateEvidence'
 import {
   HybridCartonizationPersistenceError,
   readHybridCartonizationInputFromPostgres,
 } from '@/lib/persistence/hybridCartonization'
+import {
+  readOperationalOrderPlanningProviderFromPostgres,
+  ShopifyOrderPlanningAuthorityPersistenceError,
+} from '@/lib/persistence/shopifyOrderPlanningAuthority'
 import { requireRequestUser } from '@/lib/requestUser'
 
 export const dynamic = 'force-dynamic'
@@ -468,6 +487,8 @@ function errorResponse(error: unknown) {
   if (
     error instanceof RateEvidenceRequestError
     || error instanceof HybridCartonizationPersistenceError
+    || error instanceof ShopifyOrderPlanningAuthorityError
+    || error instanceof ShopifyOrderPlanningAuthorityPersistenceError
   ) {
     return json(
       { ok: false, error: error.message, code: error.code },
@@ -570,6 +591,7 @@ function sandboxMaterialRateAssumptions(
         material.sandboxRateAssumptions.ratedOuterDimensionsMm,
       tareWeightGrams:
         material.sandboxRateAssumptions.tareWeightGrams,
+      operationalFacts: null,
     }))
     .sort((left, right) => (
       left.materialGlobalId.localeCompare(right.materialGlobalId)
@@ -667,6 +689,7 @@ export async function POST(req: NextRequest) {
           labelCalls: 0,
           postagePurchases: 0,
           providerWrites: 0,
+          providerOrderReads: 0,
           carrierRateReads: 0,
         },
       })
@@ -690,6 +713,26 @@ export async function POST(req: NextRequest) {
       idempotencyKey: request.idempotencyKey,
       semanticRequestHash,
     }
+    const operationalProvider = request.evidenceMode === 'operational'
+      ? await readOperationalOrderPlanningProviderFromPostgres({
+          organizationId,
+          accountGlobalId: request.accountGlobalId,
+          candidateGlobalId: request.candidateGlobalId,
+          expectedCandidateRowVersion:
+            request.expectedCandidateRowVersion,
+        })
+      : null
+    const shopifyOrderPlanningAuthority =
+      operationalProvider === 'shopify'
+        ? await inspectShopifyOrderPlanningAuthority({
+            organizationId,
+            accountGlobalId: request.accountGlobalId,
+            candidateGlobalId: request.candidateGlobalId,
+            expectedCandidateRowVersion:
+              request.expectedCandidateRowVersion,
+            warehouseGlobalId: request.warehouseGlobalId,
+          })
+        : null
     const read = await readHybridCartonizationInputFromPostgres({
       organizationId,
       accountGlobalId: request.accountGlobalId,
@@ -715,6 +758,16 @@ export async function POST(req: NextRequest) {
               !material.ratedOuterDimensionsMm
               || material.tareWeightGrams === null
               || material.tareWeightGrams <= 0
+              || !material.materialType
+              || !material.maximumGrossWeightGrams
+              || !material.unitCostMinor
+              || !material.currency
+              || material.stockRowVersion === null
+              || material.stockRowVersion === undefined
+              || material.stockOnHandQuantity === null
+              || material.stockOnHandQuantity === undefined
+              || material.activeClaimedQuantity === undefined
+              || !material.availableQuantity
             ) {
               throw new RateEvidenceRequestError(
                 `${material.materialGlobalId} lacks factual rated exterior dimensions or tare`,
@@ -728,6 +781,21 @@ export async function POST(req: NextRequest) {
               ratedOuterDimensionsMm:
                 material.ratedOuterDimensionsMm,
               tareWeightGrams: material.tareWeightGrams,
+              operationalFacts: {
+                materialType: material.materialType,
+                innerDimensionsMm: material.innerDimensionsMm,
+                maximumGrossWeightGrams:
+                  material.maximumGrossWeightGrams,
+                unitCostMinor: material.unitCostMinor,
+                currency: material.currency,
+                stock: {
+                  rowVersion: material.stockRowVersion,
+                  onHandQuantity: material.stockOnHandQuantity,
+                  activeClaimedQuantity:
+                    material.activeClaimedQuantity,
+                  availableQuantity: material.availableQuantity,
+                },
+              },
             }
           }).sort((left, right) => (
             left.materialGlobalId.localeCompare(right.materialGlobalId)
@@ -794,20 +862,191 @@ export async function POST(req: NextRequest) {
         first?.code || 'HYBRID_CARTONIZATION_PLAN_BLOCKED',
       )
     }
-    if (plan.geometryFallbackLines.length > 0) {
+    if (plan.selfPackages.length > 0) {
       throw new RateEvidenceRequestError(
-        'Saved carrier evidence currently requires an approved-recipe package for every line',
+        'Saved carrier evidence does not yet support self-package lines',
         422,
-        'CARTONIZATION_RATE_EVIDENCE_RECIPE_PLAN_REQUIRED',
+        'CARTONIZATION_RATE_EVIDENCE_SELF_PACKAGE_UNSUPPORTED',
       )
     }
+    let operationalGeometryRatePlan = null
     if (
-      plan.recipePackages.length < 1
-      || plan.recipePackages.length
-        > MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES
+      request.evidenceMode === 'operational'
+      && plan.geometryFallbackLines.length > 0
+    ) {
+      if (read.activationState !== 'shadow') {
+        throw new RateEvidenceRequestError(
+          'Operational OR-Tools cartonization with sandbox carrier reads is limited to Operations Shadow mode',
+          422,
+          'CARTONIZATION_RATE_EVIDENCE_SHADOW_REQUIRED',
+        )
+      }
+      let optimizer = null
+      try {
+        optimizer = configuredOrToolsFulfillmentOptimizer()
+      } catch {
+        // The operational planner returns a fail-closed configuration blocker.
+      }
+      operationalGeometryRatePlan =
+        await planOperationalGeometryRatePackages({
+          organizationGlobalId: read.organizationGlobalId,
+          provider: read.account.provider,
+          candidateGlobalId: read.candidate.globalId,
+          candidateRowVersion: read.candidate.rowVersion,
+          currency: read.candidate.currency,
+          readAt: read.readAt,
+          warehouseGlobalId: read.warehouse.globalId,
+          lines: read.input.lines,
+          fallbackLines: plan.geometryFallbackLines,
+          recipePackages: plan.recipePackages,
+          materials: read.input.materials,
+          inventoryProducts: read.inventory.products,
+          startingSequence: (
+            Math.max(
+              0,
+              ...plan.recipePackages.map((item) => item.sequence),
+            ) + 1
+          ),
+          maximumPackages:
+            MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES
+              - plan.recipePackages.length,
+          optimizer,
+        })
+      if (operationalGeometryRatePlan.status === 'blocked') {
+        throw new RateEvidenceRequestError(
+          operationalGeometryRatePlan.blocker.detail,
+          422,
+          operationalGeometryRatePlan.blocker.code,
+        )
+      }
+    }
+    const sandboxGeometryRatePlan = (
+      request.evidenceMode === 'assumption_backed_sandbox'
+      && plan.geometryFallbackLines.length > 0
+    )
+      ? planSandboxGeometryRatePackages({
+          lines: read.input.lines,
+          fallbackLines: plan.geometryFallbackLines,
+          materials: read.input.materials,
+          materialAssumptions: selectedMaterialRateAssumptions,
+          startingSequence: (
+            Math.max(
+              0,
+              ...plan.recipePackages.map((item) => item.sequence),
+            ) + 1
+          ),
+          maximumPackages:
+            MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES
+              - plan.recipePackages.length,
+        })
+      : null
+    if (sandboxGeometryRatePlan?.status === 'blocked') {
+      throw new RateEvidenceRequestError(
+        sandboxGeometryRatePlan.blocker.detail,
+        422,
+        sandboxGeometryRatePlan.blocker.code,
+      )
+    }
+    const expectedQuantityByLine = new Map(
+      read.input.lines.map((line) => [
+        line.lineGlobalId,
+        line.quantity,
+      ]),
+    )
+    const allocatedQuantityByLine = new Map<string, number>()
+    const addAllocation = (lineGlobalId: string, quantity: number) => {
+      const next = (allocatedQuantityByLine.get(lineGlobalId) || 0)
+        + quantity
+      if (
+        !expectedQuantityByLine.has(lineGlobalId)
+        || !Number.isSafeInteger(quantity)
+        || quantity < 1
+        || !Number.isSafeInteger(next)
+      ) {
+        throw new RateEvidenceRequestError(
+          'The retained package plan contains an invalid line allocation',
+          422,
+          'CARTONIZATION_RATE_EVIDENCE_ALLOCATION_COVERAGE_INVALID',
+        )
+      }
+      allocatedQuantityByLine.set(lineGlobalId, next)
+    }
+    for (const packagePlan of plan.recipePackages) {
+      for (const allocation of packagePlan.lineAllocations) {
+        addAllocation(allocation.lineGlobalId, allocation.quantity)
+      }
+    }
+    for (const packagePlan of sandboxGeometryRatePlan?.packages || []) {
+      for (const allocation of packagePlan.allocations) {
+        addAllocation(allocation.lineGlobalId, allocation.quantity)
+      }
+    }
+    for (const packagePlan of operationalGeometryRatePlan?.status === 'ready'
+      ? operationalGeometryRatePlan.packages
+      : []) {
+      for (const allocation of packagePlan.allocations) {
+        addAllocation(allocation.lineGlobalId, allocation.quantity)
+      }
+    }
+    const uncoveredLine = [...expectedQuantityByLine].find(
+      ([lineGlobalId, quantity]) => (
+        allocatedQuantityByLine.get(lineGlobalId) !== quantity
+      ),
+    )
+    const fallbackQuantityByLine = new Map(
+      plan.geometryFallbackLines.map((line) => [
+        line.lineGlobalId,
+        line.quantity,
+      ]),
+    )
+    const sandboxQuantityByLine = new Map<string, number>()
+    for (const packagePlan of sandboxGeometryRatePlan?.packages || []) {
+      for (const allocation of packagePlan.allocations) {
+        sandboxQuantityByLine.set(
+          allocation.lineGlobalId,
+          (sandboxQuantityByLine.get(allocation.lineGlobalId) || 0)
+            + allocation.quantity,
+        )
+      }
+    }
+    for (const packagePlan of operationalGeometryRatePlan?.status === 'ready'
+      ? operationalGeometryRatePlan.packages
+      : []) {
+      for (const allocation of packagePlan.allocations) {
+        sandboxQuantityByLine.set(
+          allocation.lineGlobalId,
+          (sandboxQuantityByLine.get(allocation.lineGlobalId) || 0)
+            + allocation.quantity,
+        )
+      }
+    }
+    const uncoveredFallback = [...fallbackQuantityByLine].find(
+      ([lineGlobalId, quantity]) => (
+        sandboxQuantityByLine.get(lineGlobalId) !== quantity
+      ),
+    )
+    if (
+      uncoveredLine
+      || uncoveredFallback
+      || sandboxQuantityByLine.size !== fallbackQuantityByLine.size
     ) {
       throw new RateEvidenceRequestError(
-        `The approved-recipe plan must contain between one and ${
+        'The retained package plan does not allocate every shippable unit exactly once',
+        422,
+        'CARTONIZATION_RATE_EVIDENCE_ALLOCATION_COVERAGE_INVALID',
+      )
+    }
+    const packagePlanCount = plan.recipePackages.length
+      + (sandboxGeometryRatePlan?.packages.length || 0)
+      + (operationalGeometryRatePlan?.status === 'ready'
+        ? operationalGeometryRatePlan.packages.length
+        : 0)
+    if (
+      packagePlanCount < 1
+      || packagePlanCount > MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES
+    ) {
+      throw new RateEvidenceRequestError(
+        `The retained package plan must contain between one and ${
           MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES
         } packages`,
         422,
@@ -832,14 +1071,32 @@ export async function POST(req: NextRequest) {
 
     const carrierState = await getCarrierIntegrationsState(organizationId)
     const carrierAccountGlobalIds = new Map<
-      'ups_rest' | 'fedex_rest',
+      CartonizationRateEvidenceCarrierProvider,
       string
     >()
-    for (const provider of ['ups_rest', 'fedex_rest'] as const) {
+    const providers = CARTONIZATION_RATE_EVIDENCE_CARRIER_PROVIDERS.filter(
+      (provider) => carrierState.accounts.some((account) => (
+        account.provider === provider
+        && account.environment === 'sandbox'
+        && account.status === 'active'
+        && account.configured
+        && account.verificationStatus === 'verified'
+      )),
+    )
+    if (providers.length < 1) {
+      throw new RateEvidenceRequestError(
+        'At least one enabled and verified UPS or FedEx sandbox rating connection is required',
+        422,
+        'CARTONIZATION_RATE_EVIDENCE_CARRIER_REQUIRED',
+      )
+    }
+    for (const provider of providers) {
       const connection = carrierState.accounts.find((account) => (
         account.provider === provider
         && account.environment === 'sandbox'
         && account.status === 'active'
+        && account.configured
+        && account.verificationStatus === 'verified'
       ))
       if (!connection) {
         throw new RateEvidenceRequestError(
@@ -878,7 +1135,7 @@ export async function POST(req: NextRequest) {
       carrierAccountGlobalIds.set(provider, senderAccounts[0].globalId)
     }
 
-    const packageInputs: CartonizationRateEvidencePackageInput[] =
+    const recipePackageInputs: CartonizationRateEvidencePackageInput[] =
       plan.recipePackages.map((packagePlan) => {
         const ratedOuter =
           packagePlan.rateReadiness.ratedOuterDimensionsMm
@@ -964,6 +1221,7 @@ export async function POST(req: NextRequest) {
           materialRowVersion:
             packagePlan.packagingMaterialRowVersion,
           recipes,
+          orToolsProfiles: [],
           innerDimensionsMm:
             packagePlan.materialEvidence.innerDimensionsMm,
           ratedOuterDimensionsMm: ratedOuter,
@@ -989,12 +1247,131 @@ export async function POST(req: NextRequest) {
           packageHash: cartonizationRateEvidenceHash(snapshot),
         }
       })
+    const sandboxGeometryPackageInputs:
+      CartonizationRateEvidencePackageInput[] = (
+        sandboxGeometryRatePlan?.packages || []
+      ).map((packagePlan) => {
+        const carrierParcelRequest = {
+          description:
+            `Sandbox cartonized order ${
+              read.candidate.orderNumber
+            }`.slice(0, 120),
+          exteriorInches: {
+            length: roundCarrierDecimal(
+              packagePlan.ratedOuterDimensionsMm.length
+                / MILLIMETERS_PER_INCH,
+            ),
+            width: roundCarrierDecimal(
+              packagePlan.ratedOuterDimensionsMm.width
+                / MILLIMETERS_PER_INCH,
+            ),
+            height: roundCarrierDecimal(
+              packagePlan.ratedOuterDimensionsMm.height
+                / MILLIMETERS_PER_INCH,
+            ),
+          },
+          grossPounds: roundCarrierDecimal(
+            packagePlan.ratedGrossWeightGrams / GRAMS_PER_POUND,
+          ),
+        }
+        const snapshot = {
+          packageKey: packagePlan.packageKey,
+          packageSequence: packagePlan.packageSequence,
+          planningMethod: packagePlan.planningMethod,
+          packagingMaterialGlobalId:
+            packagePlan.packagingMaterialGlobalId,
+          materialRowVersion: packagePlan.materialRowVersion,
+          recipes: packagePlan.recipes,
+          orToolsProfiles: [],
+          innerDimensionsMm: packagePlan.innerDimensionsMm,
+          ratedOuterDimensionsMm:
+            packagePlan.ratedOuterDimensionsMm,
+          contentWeightGrams: packagePlan.contentWeightGrams,
+          tareWeightGrams: packagePlan.tareWeightGrams,
+          ratedGrossWeightGrams:
+            packagePlan.ratedGrossWeightGrams,
+          maxWeightGrams: packagePlan.maxWeightGrams,
+          allocations: packagePlan.allocations,
+          carrierParcel: normalizeCarrierSandboxParcel(
+            carrierParcelRequest,
+          ),
+        }
+        return {
+          ...snapshot,
+          packageHash: cartonizationRateEvidenceHash(snapshot),
+        }
+      })
+    const operationalGeometryPackageInputs:
+      CartonizationRateEvidencePackageInput[] = (
+        operationalGeometryRatePlan?.status === 'ready'
+          ? operationalGeometryRatePlan.packages
+          : []
+      ).map((packagePlan) => {
+        const carrierParcelRequest = {
+          description:
+            `Operational cartonized order ${
+              read.candidate.orderNumber
+            }`.slice(0, 120),
+          exteriorInches: {
+            length: roundCarrierDecimal(
+              packagePlan.ratedOuterDimensionsMm.length
+                / MILLIMETERS_PER_INCH,
+            ),
+            width: roundCarrierDecimal(
+              packagePlan.ratedOuterDimensionsMm.width
+                / MILLIMETERS_PER_INCH,
+            ),
+            height: roundCarrierDecimal(
+              packagePlan.ratedOuterDimensionsMm.height
+                / MILLIMETERS_PER_INCH,
+            ),
+          },
+          grossPounds: roundCarrierDecimal(
+            packagePlan.ratedGrossWeightGrams / GRAMS_PER_POUND,
+          ),
+        }
+        const snapshot = {
+          packageKey: packagePlan.packageKey,
+          packageSequence: packagePlan.packageSequence,
+          planningMethod: packagePlan.planningMethod,
+          packagingMaterialGlobalId:
+            packagePlan.packagingMaterialGlobalId,
+          materialRowVersion: packagePlan.materialRowVersion,
+          recipes: packagePlan.recipes,
+          orToolsProfiles: packagePlan.orToolsProfiles,
+          innerDimensionsMm: packagePlan.innerDimensionsMm,
+          ratedOuterDimensionsMm:
+            packagePlan.ratedOuterDimensionsMm,
+          contentWeightGrams: packagePlan.contentWeightGrams,
+          tareWeightGrams: packagePlan.tareWeightGrams,
+          ratedGrossWeightGrams:
+            packagePlan.ratedGrossWeightGrams,
+          maxWeightGrams: packagePlan.maxWeightGrams,
+          allocations: packagePlan.allocations,
+          carrierParcel: normalizeCarrierSandboxParcel(
+            carrierParcelRequest,
+          ),
+        }
+        return {
+          ...snapshot,
+          packageHash: cartonizationRateEvidenceHash(snapshot),
+        }
+      })
+    const packageInputs = [
+      ...recipePackageInputs,
+      ...operationalGeometryPackageInputs,
+      ...sandboxGeometryPackageInputs,
+    ].sort((left, right) => (
+      left.packageSequence - right.packageSequence
+      || left.packageKey.localeCompare(right.packageKey)
+    ))
 
     const planSnapshot = {
       mode: request.evidenceMode === 'operational'
         ? 'production'
         : 'sandbox_demo',
       carrierReadEnvironment: 'sandbox',
+      requiredCarrierProviders: providers,
       policyVersion: plan.policyVersion,
       algorithmVersion: plan.algorithmVersion,
       inputHash: plan.inputHash,
@@ -1002,8 +1379,33 @@ export async function POST(req: NextRequest) {
       status: plan.status,
       recipePackages: plan.recipePackages,
       geometryFallbackLines: plan.geometryFallbackLines,
+      sandboxGeometryRatePlan: sandboxGeometryRatePlan?.status === 'ready'
+        ? {
+            evidence: sandboxGeometryRatePlan.evidence,
+            packages: sandboxGeometryRatePlan.packages,
+          }
+        : null,
+      operationalGeometryRatePlan:
+        operationalGeometryRatePlan?.status === 'ready'
+          ? {
+              evidence: operationalGeometryRatePlan.evidence,
+              optimizerInput:
+                operationalGeometryRatePlan.optimizerInput,
+              optimizerResult:
+                operationalGeometryRatePlan.optimizerResult,
+              packages: operationalGeometryRatePlan.packages,
+            }
+          : null,
       assumptions: plan.assumptions,
       blockers: plan.blockers,
+      ...(shopifyOrderPlanningAuthority
+        ? {
+            shopifyOrderPlanningAuthorityHash:
+              shopifyOrderPlanningAuthority.authorityHash,
+            shopifyOrderPlanningAuthority:
+              shopifyOrderPlanningAuthority.snapshot,
+          }
+        : {}),
       readContext: {
         readAt: read.readAt,
         account: read.account,
@@ -1022,6 +1424,8 @@ export async function POST(req: NextRequest) {
       labelCalls: 0,
       postagePurchases: 0,
       providerWrites: 0,
+      providerOrderReads:
+        shopifyOrderPlanningAuthority?.providerReads || 0,
     }
     const assumptionSnapshot = request.evidenceMode === 'operational'
       ? {
@@ -1033,6 +1437,13 @@ export async function POST(req: NextRequest) {
           inventoryAuthority: read.account.provider === 'shopify'
             ? 'shopify_provider_commitment_preflight'
             : 'projected_atp_only',
+          orderEligibilityAuthority: read.account.provider === 'shopify'
+            ? 'live_shopify_order_fulfillment_preflight'
+            : 'canonical_commerce_order',
+          shopifyOrderPlanningAuthorityHash:
+            shopifyOrderPlanningAuthority?.authorityHash || null,
+          providerOrderReads:
+            shopifyOrderPlanningAuthority?.providerReads || 0,
           planClaimAuthority: read.account.provider === 'shopify'
             ? 'transactional_provider_commitment_lock'
             : 'transactional_local_balance_lock',
@@ -1051,7 +1462,19 @@ export async function POST(req: NextRequest) {
           assumedMinimumInputQuantity:
             request.sandboxAssumptions.assumedMinimumInputQuantity,
           minimumOverrides: plan.assumptions,
+          sandboxGeometryRatePlan:
+            sandboxGeometryRatePlan?.status === 'ready'
+              ? {
+                  ...sandboxGeometryRatePlan.evidence,
+                  packageKeys: sandboxGeometryRatePlan.packages.map(
+                    (item) => item.packageKey,
+                  ),
+                }
+              : null,
           committedInventory: read.inventory.lines,
+          orderEligibilityAuthority: 'sandbox_assumption_only',
+          shopifyOrderPlanningAuthorityHash: null,
+          providerOrderReads: 0,
           databaseEffects,
         }
     const orderedParcels = [...packageInputs]
@@ -1068,7 +1491,6 @@ export async function POST(req: NextRequest) {
         },
         grossPounds: packageInput.carrierParcel.weight,
       }))
-    const providers = ['ups_rest', 'fedex_rest'] as const
     const rateResults = await Promise.all(
       providers.map(async (provider) => {
         const carrierAccountGlobalId =
@@ -1114,7 +1536,7 @@ export async function POST(req: NextRequest) {
           shipmentRateEvidenceByProvider.get(provider)
         if (!rateEvidenceGlobalId) {
           throw new CarrierIntegrationRequestError(
-            'Shipment-rate evidence was not retained for both carriers',
+            'Shipment-rate evidence was not retained for all selected carriers',
             503,
             'CARTONIZATION_RATE_EVIDENCE_CARRIER_WRITE_MISSING',
           )
@@ -1134,6 +1556,7 @@ export async function POST(req: NextRequest) {
       warehouseGlobalId: read.warehouse.globalId,
       inventorySyncRunGlobalId: read.inventory.syncRunGlobalId,
       evidenceMode: request.evidenceMode,
+      requiredCarrierProviders: providers,
       policyVersion: plan.policyVersion,
       algorithmVersion: plan.algorithmVersion,
       planInputHash: plan.inputHash,
@@ -1158,6 +1581,8 @@ export async function POST(req: NextRequest) {
         labelCalls: 0,
         postagePurchases: 0,
         providerWrites: 0,
+        providerOrderReads:
+          shopifyOrderPlanningAuthority?.providerReads || 0,
         carrierRateReads: rateResults.length,
         carrierQuoteEdges: quotes.length,
       },

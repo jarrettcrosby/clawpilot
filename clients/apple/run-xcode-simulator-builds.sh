@@ -21,6 +21,21 @@ build_root="$(mktemp -d "${TMPDIR:-/tmp}/clawpilot-apple-phase1.XXXXXX")"
 trap 'rm -rf -- "${build_root}"' EXIT
 packages="${build_root}/packages"
 
+verify_privacy_manifests() {
+  local phone_app="$1"
+  local watch_app="${phone_app}/Watch/ClawPilotPickingWatch.app"
+  for manifest in \
+    "${phone_app}/PrivacyInfo.xcprivacy" \
+    "${watch_app}/PrivacyInfo.xcprivacy"
+  do
+    if [[ ! -f "${manifest}" ]]; then
+      echo "Expected app-owned privacy manifest at ${manifest}." >&2
+      exit 1
+    fi
+    plutil -lint "${manifest}" >/dev/null
+  done
+}
+
 xcodebuild -quiet -resolvePackageDependencies \
   -project "${project}" -scheme ClawPilotPickingPhoneDev \
   -packageAuthorizationProvider netrc \
@@ -35,19 +50,23 @@ if [[ "${version}" != "${expected_meta_version}" || "${revision}" != "${expected
 fi
 
 xcodebuild -quiet -project "${project}" -scheme ClawPilotPickingPhoneDev \
+  -configuration DevelopmentRelease \
   -destination 'generic/platform=iOS Simulator' \
   -derivedDataPath "${build_root}/phone-dev" \
   -packageAuthorizationProvider netrc \
   -clonedSourcePackagesDirPath "${packages}" \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
 
-embedded_watch="${build_root}/phone-dev/Build/Products/Development-iphonesimulator/ClawPilotPicking.app/Watch/ClawPilotPickingWatch.app"
+phone_app="${build_root}/phone-dev/Build/Products/DevelopmentRelease-iphonesimulator/ClawPilotPicking.app"
+embedded_watch="${phone_app}/Watch/ClawPilotPickingWatch.app"
 if [[ ! -d "${embedded_watch}" ]]; then
   echo "The development iPhone app did not embed its development Watch companion." >&2
   exit 1
 fi
+verify_privacy_manifests "${phone_app}"
 
 xcodebuild -quiet -project "${project}" -scheme ClawPilotPickingWatchDev \
+  -configuration DevelopmentRelease \
   -destination 'generic/platform=watchOS Simulator' \
   -derivedDataPath "${build_root}/watch-dev" \
   -packageAuthorizationProvider netrc \
@@ -61,11 +80,13 @@ xcodebuild -quiet -project "${project}" -scheme ClawPilotPickingPhone \
   -clonedSourcePackagesDirPath "${packages}" \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
 
-embedded_watch="${build_root}/phone-production/Build/Products/Production-iphonesimulator/ClawPilotPicking.app/Watch/ClawPilotPickingWatch.app"
+phone_app="${build_root}/phone-production/Build/Products/Production-iphonesimulator/ClawPilotPicking.app"
+embedded_watch="${phone_app}/Watch/ClawPilotPickingWatch.app"
 if [[ ! -d "${embedded_watch}" ]]; then
   echo "The production iPhone app did not embed its production Watch companion." >&2
   exit 1
 fi
+verify_privacy_manifests "${phone_app}"
 
 xcodebuild -quiet -project "${project}" -scheme ClawPilotPickingWatch \
   -destination 'generic/platform=watchOS Simulator' \

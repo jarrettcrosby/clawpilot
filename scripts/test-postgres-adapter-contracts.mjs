@@ -1723,6 +1723,16 @@ assertIncludes(healthRoute, '0140_operations_commerce_packaging_source_constrain
 assertIncludes(healthRoute, '0141_operations_recipe_only_pack_associations.sql', 'hosted recipe-only pack-association migration health')
 assertIncludes(healthRoute, '0142_operations_cartonization_evidence_scale.sql', 'hosted cartonization evidence scale migration health')
 assertIncludes(healthRoute, '0143_operations_cartonization_shipment_rates.sql', 'hosted cartonization shipment-rate migration health')
+assertIncludes(healthRoute, '0258_operations_one_off_shipments.sql', 'hosted one-off shipment migration health')
+assert.ok(
+  (healthRoute.match(/operations_one_off_shipments_applied/g) || []).length >= 4,
+  'One-off shipment readiness must gate both migrationsCurrent and health errors',
+)
+assertIncludes(healthRoute, '0259_operations_cartonization_enabled_carriers.sql', 'hosted cartonization enabled-carrier migration health')
+assert.ok(
+  (healthRoute.match(/operations_cartonization_enabled_carriers_applied/g) || []).length >= 4,
+  'Cartonization enabled-carrier readiness must gate both migrationsCurrent and health errors',
+)
 assertIncludes(healthRoute, '0144_operations_cartonization_shipment_rate_constraint_repair.sql', 'hosted cartonization shipment-rate constraint repair migration health')
 assertIncludes(healthRoute, '0145_operations_two_pass_pack_rate_runs.sql', 'hosted two-pass pack-rate replay migration health')
 assertIncludes(healthRoute, '0146_operations_pack_rate_pricing_semantics.sql', 'hosted corrected pack-rate pricing semantics migration health')

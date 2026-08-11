@@ -317,6 +317,307 @@ async function installOperationsRoutes(page: Page) {
   })
 }
 
+async function installImportedOrderPreparationRoutes(page: Page) {
+  const importedOrder = {
+    ...selectedOrder,
+    globalId: 'gor7654321',
+    orderNumber: '#6600',
+    externalOrderId: 'gid://shopify/Order/6600',
+    customerName: 'Warehouse Warehouse',
+    sourceProvider: 'shopify',
+    status: 'imported',
+    rowVersion: 0,
+    warehouseId: null,
+    warehouseName: null,
+    planStatus: null,
+    waveStatus: null,
+    promisedDeliveryAt: null,
+    packageCount: 0,
+    plannedPackageCount: 0,
+    packedPackageCount: 0,
+    packages: [],
+    rates: [],
+    billableEvents: [],
+    events: [],
+    availableActions: [],
+    sandboxCommerceE2eAuthorization: null,
+    fulfillmentPreparation: null,
+    fulfillmentNotificationPolicy: {
+      mode: 'clawpilot_explicit',
+      notifyCustomerDefault: false,
+      revision: 1,
+    },
+    planningPreparation: {
+      accountGlobalId: 'gia9286799',
+      candidateGlobalId: 'gcoc35vrs9qjtmee',
+      candidateRowVersion: 10,
+    },
+    lines: [{
+      globalId: 'gol7654321',
+      productGlobalId: 'gp4513844',
+      productName: 'Test Product',
+      channelSku: 'AG-Test-Test',
+      quantity: 1,
+      reservedQuantity: 0,
+      pickStatus: null,
+    }],
+  }
+  const evidence = {
+    globalId: 'gcte7654321',
+    accountGlobalId: 'gia9286799',
+    candidateGlobalId: 'gcoc35vrs9qjtmee',
+    candidateOrderNumber: '#6600',
+    candidateRowVersion: 10,
+    candidateSourceHash: 'a'.repeat(64),
+    destinationFingerprint: 'b'.repeat(64),
+    requestHash: 'c'.repeat(64),
+    warehouse: { globalId: 'gwh5366613', name: 'Ag-Alchemy' },
+    inventorySyncRunGlobalId: 'gisr7654321',
+    evidenceMode: 'operational',
+    policyVersion: 'warehouse-planning-v1',
+    algorithmVersion: 'approved-recipe-v1',
+    planInputHash: 'd'.repeat(64),
+    planResultHash: 'e'.repeat(64),
+    planSnapshot: {},
+    assumptionSnapshot: {},
+    status: 'succeeded',
+    idempotencyKey: 'operations-rate-plan:test',
+    actorEmail: 'manager@example.com',
+    createdAt: '2026-08-10T12:00:00.000Z',
+    packages: [{
+      packageKey: 'package-1',
+      packageSequence: 1,
+      planningMethod: 'approved_recipe',
+      packagingMaterialGlobalId: 'gmat9435485',
+      packagingMaterialName: 'Test shipping carton',
+      approvedPackRecipeGlobalId: 'gpre7187900',
+      approvedPackRecipeName: 'Test Product loose-item recipe',
+      materialRowVersion: 2,
+      recipeRowVersion: 1,
+      recipes: [],
+      innerDimensionsMm: { length: 280, width: 220, height: 190 },
+      ratedOuterDimensionsMm: { length: 292, width: 229, height: 203 },
+      contentWeightGrams: 170,
+      tareWeightGrams: 91,
+      ratedGrossWeightGrams: 261,
+      maxWeightGrams: 5000,
+      allocations: [{
+        lineGlobalId: 'gcol7654321',
+        productGlobalId: 'gp4513844',
+        title: 'Test Product',
+        quantity: 1,
+      }],
+      carrierParcel: {
+        description: 'Test shipping carton',
+        length: 11.5,
+        width: 9,
+        height: 8,
+        dimensionUnit: 'IN',
+        weight: 0.576,
+        weightUnit: 'LB',
+      },
+      packageHash: 'f'.repeat(64),
+      quotes: [
+        {
+          provider: 'ups_rest',
+          rateEvidenceGlobalId: 'gcre7654321',
+          status: 'succeeded',
+          errorCode: null,
+          carrierRequestHash: '1'.repeat(64),
+          packageRateContextHash: '2'.repeat(64),
+          shipmentRateContextHash: '3'.repeat(64),
+          rateScope: 'multi_package_shipment',
+          rates: [{
+            serviceCode: '03',
+            serviceName: 'UPS Ground',
+            amount: '12.34',
+            currency: 'USD',
+            rateType: null,
+            transitDays: 4,
+            deliveryDate: '2026-08-14',
+          }],
+          requestedAt: '2026-08-10T12:00:00.000Z',
+          completedAt: '2026-08-10T12:00:01.000Z',
+        },
+        {
+          provider: 'fedex_rest',
+          rateEvidenceGlobalId: 'gcre1234567',
+          status: 'succeeded',
+          errorCode: null,
+          carrierRequestHash: '4'.repeat(64),
+          packageRateContextHash: '5'.repeat(64),
+          shipmentRateContextHash: '6'.repeat(64),
+          rateScope: 'multi_package_shipment',
+          rates: [{
+            serviceCode: 'FEDEX_GROUND',
+            serviceName: 'FedEx Ground',
+            amount: '11.25',
+            currency: 'USD',
+            rateType: null,
+            transitDays: 5,
+            deliveryDate: '2026-08-15',
+          }],
+          requestedAt: '2026-08-10T12:00:00.000Z',
+          completedAt: '2026-08-10T12:00:01.000Z',
+        },
+      ],
+    }],
+  }
+  let planned = false
+
+  await page.route((url) => url.pathname === '/api/operations/packaging-materials', async (route) => {
+    await route.fulfill({
+      json: {
+        ok: true,
+        packagingMaterials: {
+          capabilities: { canView: true, canManage: true },
+          warehouses: [{
+            id: 'warehouse-id',
+            globalId: 'gwh5366613',
+            name: 'Ag-Alchemy',
+            status: 'active',
+          }],
+          materials: [{
+            id: 'material-id',
+            globalId: 'gmat9435485',
+            code: 'TEST-CARTON',
+            name: 'Test shipping carton',
+            materialType: 'carton',
+            innerDimensionsMm: { length: 280, width: 220, height: 190 },
+            ratedOuterDimensionsMm: { length: 292, width: 229, height: 203 },
+            ratedOuterDimensionEvidenceType: 'measured',
+            ratedOuterDimensionEvidenceReference: 'warehouse measurement',
+            ratedOuterDimensionConfirmedAt: '2026-08-01T12:00:00.000Z',
+            ratedOuterDimensionConfirmedBy: 'manager@example.com',
+            dimensionBasis: 'inner',
+            dimensionEvidenceType: 'measured',
+            dimensionEvidenceReference: 'warehouse measurement',
+            dimensionConfirmedAt: '2026-08-01T12:00:00.000Z',
+            dimensionConfirmedBy: 'manager@example.com',
+            tareWeightGrams: 91,
+            maxWeightGrams: 5000,
+            unitCostMinor: 50,
+            currency: 'USD',
+            status: 'active',
+            source: 'customer_supplied',
+            rowVersion: 2,
+            updatedAt: '2026-08-01T12:00:00.000Z',
+            stock: [{
+              id: 'stock-id',
+              globalId: 'gmst7654321',
+              warehouseId: 'warehouse-id',
+              warehouseGlobalId: 'gwh5366613',
+              warehouseName: 'Ag-Alchemy',
+              warehouseStatus: 'active',
+              isAvailable: true,
+              onHandQuantity: 10,
+              reorderPointQuantity: 2,
+              reorderToQuantity: 10,
+              reorderRecommendedQuantity: 0,
+              rowVersion: 1,
+              updatedAt: '2026-08-01T12:00:00.000Z',
+            }],
+            readiness: { eligibleForCartonization: true, missing: [] },
+          }],
+          optimizerReadiness: {
+            historyWindowDays: 365,
+            shippedDemandSampleCount: 1,
+            eligibleShippedDemandSampleCount: 1,
+            missingProductDimensionCount: 0,
+            missingMaterialCostCount: 0,
+            missingWarehouseStockCount: 0,
+            outOfStockAvailabilityCount: 0,
+            eligibleMaterialCount: 1,
+            reorderDueCount: 0,
+          },
+        },
+      },
+    })
+  })
+  await page.route(
+    (url) => url.pathname === '/api/integrations/commerce/intake/cartonization-rate-evidence',
+    async (route) => {
+      if (route.request().method() === 'POST') {
+        const request = route.request().postDataJSON()
+        expect(request).toMatchObject({
+          evidenceMode: 'operational',
+          accountGlobalId: 'gia9286799',
+          candidateGlobalId: 'gcoc35vrs9qjtmee',
+          expectedCandidateRowVersion: 10,
+          warehouseGlobalId: 'gwh5366613',
+          selectedMaterials: [{
+            materialGlobalId: 'gmat9435485',
+            expectedRowVersion: 2,
+          }],
+        })
+      }
+      await route.fulfill({ json: { ok: true, evidence } })
+    },
+  )
+  await page.route((url) => url.pathname === '/api/operations', async (route) => {
+    if (route.request().method() === 'POST') {
+      const request = route.request().postDataJSON()
+      expect(request).toMatchObject({
+        action: 'plan-order',
+        orderGlobalId: 'gor7654321',
+        cartonizationEvidenceGlobalId: 'gcte7654321',
+        expectedRowVersion: 0,
+      })
+      planned = true
+      return route.fulfill({
+        json: {
+          ok: true,
+          result: {
+            orderGlobalId: 'gor7654321',
+            orderStatus: 'planned',
+            rowVersion: 1,
+            fulfillmentPlanGlobalId: 'gfp7654321',
+            cartonizationEvidenceGlobalId: 'gcte7654321',
+            packageCount: 1,
+            carrier: 'FedEx',
+            serviceCode: 'fedex_ground',
+            serviceName: 'FedEx Ground',
+            carrierCostMinor: '1125',
+            currency: 'USD',
+            checkoutShippingChargeMinor: null,
+            checkoutVarianceMinor: null,
+            replayed: false,
+          },
+        },
+      })
+    }
+    const current = planned
+      ? {
+          ...importedOrder,
+          status: 'planned',
+          rowVersion: 1,
+          planStatus: 'planned',
+          warehouseName: 'Ag-Alchemy',
+          availableActions: [{
+            action: 'release_to_warehouse',
+            label: 'Release to warehouse',
+            enabled: true,
+            blockedReason: null,
+          }],
+          planningPreparation: null,
+        }
+      : importedOrder
+    return route.fulfill({
+      json: {
+        ok: true,
+        operations: {
+          ...workspace(),
+          summary: { ...workspace().summary, openOrders: 1 },
+          orders: [current],
+          selectedOrder: current,
+          exceptions: [],
+          shipping: { sandboxCarrierAccounts: [] },
+        },
+      },
+    })
+  })
+}
+
 async function installOperationsNavigationRoute(page: Page) {
   await page.route((url) => url.pathname.startsWith('/api/operations/'), async (route) => {
     await route.fulfill({
@@ -738,6 +1039,34 @@ test('operations workbench renders dense desktop evidence and order drill-in', a
   await expect(page.getByText('Replenish or move the line to another warehouse.')).toBeVisible()
   await page.getByRole('button', { name: 'Acknowledge' }).click()
   await expect(page.getByRole('tab', { name: 'Exceptions (1)' })).toBeVisible()
+})
+
+test('imported order preparation cartonizes, compares rates, and plans without releasing', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  await installImportedOrderPreparationRoutes(page)
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('row', { name: /#6600/ }).click()
+  await page.getByRole('button', { name: 'Prepare order' }).click()
+  await expect(
+    page.getByRole('heading', { name: 'Prepare and plan imported order' }),
+  ).toBeVisible()
+  await expect(page.getByRole('combobox', { name: /^Warehouse/ }))
+    .toContainText('Ag-Alchemy')
+  await expect(page.getByRole('combobox', { name: /^Packaging materials/ }))
+    .toContainText('TEST-CARTON')
+
+  await page.getByRole('button', {
+    name: 'Run cartonization and compare rates',
+  }).click()
+  await expect(page.getByText('UPS · UPS Ground')).toBeVisible()
+  await expect(page.getByText('FedEx · FedEx Ground')).toBeVisible()
+  await expect(page.getByText(/lowest-cost whole-shipment service/)).toBeVisible()
+
+  await page.getByRole('button', { name: 'Confirm warehouse plan' }).click()
+  await expect(page.getByText(/was planned from gcte7654321/)).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Release to warehouse' })).toBeVisible()
+  await expect(page.getByText('Not Released')).toBeVisible()
 })
 
 test('operations tabs support touch navigation without portrait or landscape overflow', async ({ page }) => {

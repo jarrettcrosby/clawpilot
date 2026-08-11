@@ -15,6 +15,7 @@ export const CARTONIZATION_INVENTORY_POLICY_VERSION =
 
 const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
 const CANDIDATE_GLOBAL_ID = /^gcoc(?:[0-9]{7}|[0-9a-v]{12})$/
+const WAREHOUSE_GLOBAL_ID = /^gwh(?:[0-9]{7}|[0-9a-v]{12})$/
 const LINE_GLOBAL_ID = /^gcol(?:[0-9]{7}|[0-9a-v]{12})$/
 const MATERIAL_GLOBAL_ID = /^gmat(?:[0-9]{7}|[0-9a-v]{12})$/
 const MAX_SELECTED_MATERIALS = 8
@@ -32,6 +33,7 @@ export type CartonizationPreviewRequest = {
   accountGlobalId: string
   candidateGlobalId: string
   expectedCandidateRowVersion: number
+  warehouseGlobalId: string
   materialGlobalIds: string[]
   assumedCommittedByLine: CartonizationAssumedCommittedLine[]
 }
@@ -274,6 +276,7 @@ export function normalizeCartonizationPreviewRequest(
     'accountGlobalId',
     'candidateGlobalId',
     'expectedCandidateRowVersion',
+    'warehouseGlobalId',
     'materialGlobalIds',
     'assumedCommittedByLine',
   ], 'CARTONIZATION_PREVIEW_REQUEST_INVALID')
@@ -360,6 +363,12 @@ export function normalizeCartonizationPreviewRequest(
       'Expected candidate row version',
       'CARTONIZATION_PREVIEW_CANDIDATE_REVISION_INVALID',
     ),
+    warehouseGlobalId: globalId(
+      source.warehouseGlobalId,
+      WAREHOUSE_GLOBAL_ID,
+      'Warehouse Global ID',
+      'CARTONIZATION_PREVIEW_WAREHOUSE_ID_INVALID',
+    ),
     materialGlobalIds,
     assumedCommittedByLine,
   }
@@ -405,8 +414,11 @@ function baseResult(
   snapshot: CartonizationPreviewSnapshot,
   blockers: CartonizationPreviewBlocker[],
 ): CartonizationPreviewResult {
-  const warehouse = snapshot.activeWarehouses.length === 1
-    ? snapshot.activeWarehouses[0]
+  const requestedWarehouses = snapshot.activeWarehouses.filter(
+    (warehouse) => warehouse.globalId === request.warehouseGlobalId,
+  )
+  const warehouse = requestedWarehouses.length === 1
+    ? requestedWarehouses[0]
     : null
   const assumedByLine = new Map(request.assumedCommittedByLine.map(
     (item) => [item.lineGlobalId, item.quantity],
@@ -524,6 +536,7 @@ function optimizerInput(input: {
     accountGlobalId: input.snapshot.account.globalId,
     candidateGlobalId: input.snapshot.candidate.globalId,
     candidateRowVersion: input.snapshot.candidate.rowVersion,
+    warehouseGlobalId: input.request.warehouseGlobalId,
     inventoryRunGlobalId: input.snapshot.latestInventoryRun?.globalId,
     materialGlobalIds: input.request.materialGlobalIds,
     assumedCommittedByLine: input.request.assumedCommittedByLine,
@@ -704,23 +717,21 @@ export async function createCartonizationPreview(input: {
       snapshot.candidate.globalId,
     ))
   }
-  if (snapshot.activeWarehouses.length !== 1) {
+  const requestedWarehouses = snapshot.activeWarehouses.filter(
+    (warehouse) => warehouse.globalId === request.warehouseGlobalId,
+  )
+  if (requestedWarehouses.length !== 1) {
     blockers.push(blocker(
-      snapshot.activeWarehouses.length
-        ? 'CARTONIZATION_SINGLE_WAREHOUSE_REQUIRED'
-        : 'CARTONIZATION_ACTIVE_WAREHOUSE_REQUIRED',
-      snapshot.activeWarehouses.length
-        ? 'Exactly one active warehouse is required'
-        : 'An active warehouse is required',
-      `Found ${snapshot.activeWarehouses.length} active warehouses in this organization.`,
-      snapshot.activeWarehouses.length
-        ? 'Select and activate only the development warehouse supported by this preview.'
-        : 'Create and activate the organization warehouse before previewing cartonization.',
+      'CARTONIZATION_SELECTED_WAREHOUSE_UNAVAILABLE',
+      'The selected warehouse is unavailable',
+      `Warehouse ${request.warehouseGlobalId} did not resolve to exactly one active warehouse in this preview.`,
+      'Select the active warehouse mapped to this sales channel and retry.',
       'warehouse',
+      request.warehouseGlobalId,
     ))
   }
-  const warehouse = snapshot.activeWarehouses.length === 1
-    ? snapshot.activeWarehouses[0]
+  const warehouse = requestedWarehouses.length === 1
+    ? requestedWarehouses[0]
     : null
   if (accountInventorySupported && !snapshot.latestInventoryRun) {
     blockers.push(blocker(

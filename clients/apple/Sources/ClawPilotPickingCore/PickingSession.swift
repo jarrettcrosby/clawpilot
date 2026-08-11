@@ -14,6 +14,9 @@ public actor PickingSession {
     private var queue: PickQueue?
     private var orderIndex = 0
     private var scannedTaskIDs: Set<String> = []
+    private var locationVerifiedTaskIDs: Set<String> = []
+    private var locationObservations: [String: BarcodeObservation] = [:]
+    private var productObservations: [String: BarcodeObservation] = [:]
 
     public init(cache: any PickCache) {
         self.cache = cache
@@ -24,6 +27,9 @@ public actor PickingSession {
         queue = restored
         orderIndex = 0
         scannedTaskIDs = []
+        locationVerifiedTaskIDs = []
+        locationObservations = [:]
+        productObservations = [:]
         return restored
     }
 
@@ -32,12 +38,18 @@ public actor PickingSession {
         self.queue = queue
         orderIndex = 0
         scannedTaskIDs = []
+        locationVerifiedTaskIDs = []
+        locationObservations = [:]
+        productObservations = [:]
     }
 
     public func clearQueue() async throws {
         queue = nil
         orderIndex = 0
         scannedTaskIDs = []
+        locationVerifiedTaskIDs = []
+        locationObservations = [:]
+        productObservations = [:]
         try await cache.clearQueue()
     }
 
@@ -51,17 +63,42 @@ public actor PickingSession {
         return queue.orders[orderIndex]
     }
 
-    public func accept(_ observation: BarcodeObservation, now: Date = Date()) throws -> PickTask {
+    public func currentScanStage() -> PickScanStage? {
+        guard let task = currentTask() else { return nil }
+        if task.locationScanRequired == true,
+           !locationVerifiedTaskIDs.contains(task.pickTaskGlobalId) {
+            return .location
+        }
+        return .product
+    }
+
+    public func accept(
+        _ observation: BarcodeObservation,
+        now: Date = Date()
+    ) throws -> PickScanAcceptance {
         guard now.timeIntervalSince(observation.capturedAt) <= 30 else {
             throw PickingContractError.staleQueue
         }
         guard let task = currentTask() else { throw PickingContractError.incompleteOrder }
+        if task.locationScanRequired == true,
+           !locationVerifiedTaskIDs.contains(task.pickTaskGlobalId) {
+            guard let expected = task.locationBarcode else {
+                throw PickingContractError.missingLocationBarcode
+            }
+            guard observation.value == expected else {
+                throw PickingContractError.locationBarcodeMismatch
+            }
+            locationVerifiedTaskIDs.insert(task.pickTaskGlobalId)
+            locationObservations[task.pickTaskGlobalId] = observation
+            return PickScanAcceptance(task: task, stage: .location)
+        }
         guard let expected = task.barcode else { throw PickingContractError.missingBarcode }
         guard BarcodeMatcher.matches(observed: observation.value, expected: expected) else {
-            throw PickingContractError.barcodeMismatch
+            throw PickingContractError.productBarcodeMismatch
         }
         scannedTaskIDs.insert(task.pickTaskGlobalId)
-        return task
+        productObservations[task.pickTaskGlobalId] = observation
+        return PickScanAcceptance(task: task, stage: .product)
     }
 
     public func makeWatchSnapshot(
@@ -72,11 +109,15 @@ public actor PickingSession {
         guard let order = currentOrder() else { return nil }
         let remaining = order.tasks.filter { !scannedTaskIDs.contains($0.pickTaskGlobalId) }
         func card(_ task: PickTask) -> WatchPickCard {
-            WatchPickCard(
+            let locationPending = task.locationScanRequired == true
+                && !locationVerifiedTaskIDs.contains(task.pickTaskGlobalId)
+            return WatchPickCard(
                 productName: task.productName,
                 channelSku: task.channelSku,
                 productImageURL: task.productImageURL,
                 locationCode: task.locationCode,
+                locationBarcode: task.locationBarcode,
+                locationScanRequired: locationPending,
                 quantity: task.quantity,
                 progress: "\(scannedTaskIDs.count + 1) of \(order.tasks.count)"
             )
@@ -104,7 +145,19 @@ public actor PickingSession {
             }
             return existing
         }
-        let command = ConfirmPicksCommand(order: order)
+        let scanEvidence: [PickTaskScanEvidence] = try order.tasks.compactMap { task in
+            guard task.locationScanRequired == true else { return nil }
+            guard let location = locationObservations[task.pickTaskGlobalId],
+                  let product = productObservations[task.pickTaskGlobalId] else {
+                throw PickingContractError.incompleteOrder
+            }
+            return try PickTaskScanEvidence(
+                task: task,
+                location: location,
+                product: product
+            )
+        }
+        let command = ConfirmPicksCommand(order: order, scanEvidence: scanEvidence)
         try await cache.saveOutbox(command)
         return command
     }
@@ -114,6 +167,9 @@ public actor PickingSession {
         guard let queue else { return }
         orderIndex += 1
         scannedTaskIDs = []
+        locationVerifiedTaskIDs = []
+        locationObservations = [:]
+        productObservations = [:]
         if orderIndex >= queue.orders.count {
             self.queue = nil
             orderIndex = 0
@@ -134,6 +190,21 @@ public enum PickVoice {
             productName: task.productName,
             locationCode: task.locationCode,
             quantity: task.quantity,
+            locationScanRequired: false,
+            languageCode: languageCode
+        )
+    }
+
+    public static func instruction(
+        for task: PickTask,
+        locationScanRequired: Bool,
+        languageCode: String = "en"
+    ) -> String {
+        instruction(
+            productName: task.productName,
+            locationCode: task.locationCode,
+            quantity: task.quantity,
+            locationScanRequired: locationScanRequired,
             languageCode: languageCode
         )
     }
@@ -142,10 +213,17 @@ public enum PickVoice {
         productName: String,
         locationCode: String,
         quantity: Double,
+        locationScanRequired: Bool = false,
         languageCode: String = "en"
     ) -> String {
         let location = spokenLocationCode(locationCode, languageCode: languageCode)
         let product = spokenProductName(productName, languageCode: languageCode)
+        if locationScanRequired {
+            if languageCode == "es" {
+                return "Ve a la ubicación \(location). Escanea la etiqueta de ubicación antes del producto."
+            }
+            return "Go to location \(location). Scan the location label before the product."
+        }
         if languageCode == "es" {
             return "Recoge \(quantity.formatted()) de \(product) en la ubicación \(location). Escanea el código de barras del producto."
         }

@@ -478,6 +478,7 @@ type CartonizationRateEvidenceSummary = {
   globalId: string
   status: 'succeeded' | 'partial' | 'failed'
   evidenceMode: 'operational' | 'assumption_backed_sandbox'
+  requiredCarrierProviders: Array<'ups_rest' | 'fedex_rest'>
   candidateOrderNumber: string
   warehouse: {
     globalId: string
@@ -3258,6 +3259,7 @@ export default function CommerceIntakeWorkflow({
     if (
       !candidate
       || !Number.isInteger(candidate.rowVersion)
+      || !selectedCartonizationWarehouseGlobalId
       || selectedCartonizationMaterialGlobalIds.length < 1
       || selectedCartonizationMaterialGlobalIds.length > 8
     ) return
@@ -3290,6 +3292,7 @@ export default function CommerceIntakeWorkflow({
             accountGlobalId,
             candidateGlobalId: candidate.globalId,
             expectedCandidateRowVersion: candidate.rowVersion,
+            warehouseGlobalId: selectedCartonizationWarehouseGlobalId,
             materialGlobalIds: selectedCartonizationMaterialGlobalIds,
             assumedCommittedByLine: (candidate.lines || [])
               .filter((line) => line.requiresShipping && line.quantity > 0)
@@ -7730,8 +7733,8 @@ export default function CommerceIntakeWorkflow({
                 ? `This order is already in ClawPilot as ${
                     cartonizationCandidate?.canonicalOrderGlobalId
                       || 'a canonical order'
-                  }. Select its exact warehouse and current factual packaging, then save operational pack facts for warehouse planning. ClawPilot records reloadable plan evidence and read-only UPS and FedEx sandbox estimates; it does not buy postage, create a shipment, print, reserve inventory, or change Shopify.`
-                : 'Start with the exact order, warehouse, inventory snapshot, and customer packaging recipe. You can run a fit-only preview or save a reloadable, read-only comparison of UPS and FedEx sandbox shipment rates covering every resulting package. Neither path buys postage, creates a shipment, prints, or changes inventory.'}
+                  }. Select its exact warehouse and current factual packaging, then save operational pack facts for warehouse planning. ClawPilot records reloadable plan evidence and read-only estimates from the enabled, verified UPS and/or FedEx sandbox connections; it does not buy postage, create a shipment, print, reserve inventory, or change Shopify.`
+                : 'Start with the exact order, warehouse, inventory snapshot, and customer packaging recipe. You can run a fit-only preview or save a reloadable, read-only comparison from the enabled, verified UPS and/or FedEx sandbox connections covering every resulting package. Neither path buys postage, creates a shipment, prints, or changes inventory.'}
             </Alert>
             {!canManage ? (
               <Alert severity="warning">
@@ -7977,7 +7980,8 @@ export default function CommerceIntakeWorkflow({
                 preflight; the later Plan action locks the exact claim.
               </Alert>
               <Alert severity="warning" variant="outlined" sx={{ mb: 1.5 }}>
-                Carrier reads still use UPS and FedEx sandbox accounts. This
+                Carrier reads use every enabled, verified UPS and/or FedEx
+                sandbox connection bound to this warehouse. This
                 development/shadow evidence is not an executable production
                 rate, postage purchase, label, shipment, or billed cost.
               </Alert>
@@ -8014,7 +8018,7 @@ export default function CommerceIntakeWorkflow({
             {!promotedWarehousePlanning ? (
             <Box component="section" aria-labelledby="sandbox-rating-title">
               <Typography variant="overline" color="text.secondary">
-                Step 3 · Compare UPS and FedEx without shipping
+                Step 3 · Compare enabled carriers without shipping
               </Typography>
               <Typography
                 id="sandbox-rating-title"
@@ -8218,7 +8222,7 @@ export default function CommerceIntakeWorkflow({
                 <CircularProgress size={20} />
                 <Typography variant="body2">
                   Reading exact revisions and, when requested, obtaining
-                  read-only UPS and FedEx sandbox rates…
+                  read-only rates from enabled UPS/FedEx sandbox connections…
                 </Typography>
               </Stack>
             ) : null}
@@ -8916,6 +8920,7 @@ export default function CommerceIntakeWorkflow({
               || cartonizationLoading
               || !canManage
               || !operatorCommandsAllowed
+              || !selectedCartonizationWarehouseGlobalId
               || selectedCartonizationMaterialGlobalIds.length < 1
               || selectedCartonizationMaterialGlobalIds.length > 8
             }

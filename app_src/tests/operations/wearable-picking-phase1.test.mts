@@ -22,6 +22,77 @@ test('wearable queue is signed-worker scoped and read only', () => {
   assert.doesNotMatch(persistence, /\b(?:INSERT|UPDATE|DELETE)\b/)
 })
 
+test('location-first scanning is an explicit audited per-warehouse policy that defaults off', () => {
+  const migration = read('../db/migrations/0264_operations_wearable_location_scan_policy.sql')
+  const policy = read('lib/persistence/wearableLocationScanPolicy.ts')
+  const labels = read('lib/persistence/operationBarcodeLabels.ts')
+  const route = read('app/api/operations/barcode-labels/route.ts')
+  const dialog = read('components/operations/BarcodeLabelsDialog.tsx')
+
+  assert.match(migration, /operations_wearable_location_scan_policies/)
+  assert.match(migration, /location_scan_required boolean NOT NULL DEFAULT false/)
+  assert.match(migration, /row_version bigint NOT NULL DEFAULT 0/)
+  assert.match(migration, /operations_wearable_location_scan_policy_commands/)
+  assert.match(migration, /PRIMARY KEY \(organization_id, idempotency_key\)/)
+  assert.match(migration, /rows are immutable/)
+  assert.doesNotMatch(
+    migration,
+    /INSERT INTO operations_wearable_location_scan_policies/,
+    'Migration must not silently enable or materialize a policy for any warehouse',
+  )
+
+  assert.match(policy, /locationScanRequired: row\.location_scan_required === true/)
+  assert.match(policy, /row_version = operations_wearable_location_scan_policies\.row_version \+ 1/)
+  assert.match(policy, /OPERATIONS_WEARABLE_LOCATION_SCAN_POLICY_STALE/)
+  assert.match(policy, /OPERATIONS_WEARABLE_LOCATION_SCAN_POLICY_IDEMPOTENCY_REUSED/)
+  assert.match(policy, /operations\.wearable_location_scan_policy\.updated/)
+  assert.match(labels, /readWearableLocationScanPoliciesFromPostgres/)
+  assert.match(route, /'update-location-scan-policy'/)
+  assert.match(route, /expectedRowVersion/)
+  assert.match(route, /capabilities\.canManage/)
+  assert.match(dialog, /Require location label before product scan/)
+  assert.match(dialog, /Warehouse-specific and off by default/)
+})
+
+test('wearable queue emits exact CP1L identity only for enabled warehouse policy', () => {
+  const contract = read('lib/operations/wearablePicking.ts')
+  const persistence = read('lib/persistence/wearablePicking.ts')
+
+  assert.match(contract, /locationBarcode\?: string/)
+  assert.match(contract, /locationScanRequired\?: true/)
+  assert.match(persistence, /location\.global_id AS location_global_id/)
+  assert.match(persistence, /LEFT JOIN operations_wearable_location_scan_policies scan_policy/)
+  assert.match(persistence, /COALESCE\(scan_policy\.location_scan_required, false\)/)
+  assert.match(persistence, /row\.location_scan_required \? \{/)
+  assert.match(persistence, /locationBarcode\(/)
+  assert.match(persistence, /locationScanRequired: true as const/)
+})
+
+test('native scan state requires location before product without giving Watch confirmation authority', () => {
+  const models = read('../clients/apple/Sources/ClawPilotPickingCore/PickingModels.swift')
+  const session = read('../clients/apple/Sources/ClawPilotPickingCore/PickingSession.swift')
+  const phone = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+  const camera = read('../clients/apple/Apps/iPhone/PhoneCameraScanner.swift')
+  const meta = read('../clients/apple/Apps/iPhone/MetaWearablesBarcodeSource.swift')
+  const watch = read('../clients/apple/Apps/Watch/ClawPilotPickingWatchApp.swift')
+
+  assert.match(models, /public let locationBarcode: String\?/)
+  assert.match(models, /public let locationScanRequired: Bool\?/)
+  assert.match(models, /enum PickScanStage/)
+  assert.match(session, /locationVerifiedTaskIDs/)
+  assert.match(session, /observation\.value == expected/)
+  assert.match(session, /PickScanAcceptance\(task: task, stage: \.location\)/)
+  assert.match(session, /PickScanAcceptance\(task: task, stage: \.product\)/)
+  assert.match(session, /locationScanRequired: locationPending/)
+  assert.match(phone, /Location matched\. Now scan the displayed product barcode/)
+  assert.match(phone, /acceptPhoneCameraBarcode/)
+  assert.match(camera, /onBarcode: @MainActor \(String\) async -> Bool/)
+  assert.match(meta, /prepareForNextBarcode/)
+  assert.match(phone, /await source\.prepareForNextBarcode\(\)/)
+  assert.match(watch, /current\.locationScanRequired == true/)
+  assert.doesNotMatch(watch, /ConfirmPicksCommand|PickingAPIClient/)
+})
+
 test('wearable route keeps existing ClawPilot authorization boundary', () => {
   const route = read('app/api/operations/picks/route.ts')
   assert.match(route, /requireRequestUser\(req\)/)
@@ -29,7 +100,9 @@ test('wearable route keeps existing ClawPilot authorization boundary', () => {
   assert.match(route, /capabilities\.canExecute/)
   assert.doesNotMatch(route, /!capabilities\.canManage/)
   assert.match(route, /Cache-Control': 'private, no-store'/)
-  assert.match(route, /publicOrigin: req\.nextUrl\.origin/)
+  assert.match(route, /import \{ appPublicUrl \} from '@\/lib\/publicUrl'/)
+  assert.match(route, /publicOrigin: appPublicUrl\(\)/)
+  assert.doesNotMatch(route, /publicOrigin: req\.nextUrl\.origin/)
 })
 
 test('Phase 1 confirmation reuses the audited Operations command', () => {
@@ -41,6 +114,56 @@ test('Phase 1 confirmation reuses the audited Operations command', () => {
   assert.match(persistence, /OPERATIONS_ORDER_VERSION_CONFLICT/)
   assert.match(persistence, /operations\.pick\.completed/)
   assert.match(persistence, /operations\.order\.picks_confirmed/)
+})
+
+test('location-first scans require durable acknowledged evidence before pick confirmation', () => {
+  const migration = read('../db/migrations/0266_operations_wearable_pick_scan_evidence.sql')
+  const route = read('app/api/operations/route.ts')
+  const persistence = read('lib/persistence/operations.ts')
+  const models = read('../clients/apple/Sources/ClawPilotPickingCore/PickingModels.swift')
+  const session = read('../clients/apple/Sources/ClawPilotPickingCore/PickingSession.swift')
+  const adapter = read('../clients/apple/Sources/ClawPilotPickingApple/AppleAdapters.swift')
+  const phone = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+  const watch = read('../clients/apple/Apps/Watch/ClawPilotPickingWatchApp.swift')
+
+  assert.match(migration, /operations_wearable_pick_scan_evidence/)
+  assert.match(migration, /server_observed_at timestamptz NOT NULL DEFAULT now\(\)/)
+  assert.match(migration, /location_source IN \('iphone_camera', 'meta'\)/)
+  assert.match(migration, /product_source IN \('iphone_camera', 'meta'\)/)
+  assert.match(migration, /expected_location_barcode = observed_location_barcode/)
+  assert.match(migration, /operations_wearable_pick_scan_evidence rows are immutable/)
+  assert.match(route, /action === 'record-pick-scan-evidence'/)
+  assert.match(
+    route,
+    /action === 'record-pick-scan-evidence'[\s\S]*!capabilities\.canView \|\| !capabilities\.canExecute/,
+  )
+  assert.match(
+    route,
+    /action === 'confirm-picks'[\s\S]*!capabilities\.canView \|\| !capabilities\.canExecute/,
+  )
+  assert.match(route, /wearablePickScanEvidenceValue\(body\.scanEvidence\)/)
+  assert.match(route, /scanEvidenceIdempotencyKey/)
+  assert.match(persistence, /commandType: 'record_wearable_pick_scan_evidence'/)
+  assert.match(persistence, /OPERATIONS_WEARABLE_LOCATION_SCAN_MISMATCH/)
+  assert.match(persistence, /OPERATIONS_WEARABLE_PRODUCT_SCAN_MISMATCH/)
+  assert.match(persistence, /OPERATIONS_WEARABLE_SCAN_EVIDENCE_STALE/)
+  assert.match(persistence, /context\.assigned_to !== input\.actorEmail/)
+  assert.match(persistence, /OPERATIONS_WEARABLE_SCAN_EVIDENCE_REQUIRED/)
+  assert.match(persistence, /receipt\.status !== 'succeeded'/)
+  assert.match(persistence, /if \(command\.completed\) \{[\s\S]*completedWearablePickScanEvidenceResult/)
+  assert.match(persistence, /scanEvidence: input\.scanEvidence/)
+  assert.match(persistence, /scanEvidenceIdempotencyKey: scanEvidenceIdempotencyKey \|\| null/)
+  assert.match(persistence, /if \(required\.length < 1\)[\s\S]*return \{ enforced: false/)
+  assert.match(models, /public let scanEvidence: \[PickTaskScanEvidence\]\?/)
+  assert.match(models, /case metaGlasses = "meta"/)
+  assert.match(session, /locationObservations/)
+  assert.match(session, /productObservations/)
+  assert.match(adapter, /func recordScanEvidence\(_ command: ConfirmPicksCommand\)/)
+  assert.match(phone, /Syncing location and product scan evidence with ClawPilot/)
+  assert.match(phone, /try await api\.recordScanEvidence\(command\)[\s\S]*try await api\.confirm\(command\)/)
+  assert.match(phone, /Scans are saved on this iPhone but are not yet acknowledged by ClawPilot/)
+  assert.match(phone, /Confirmation stays blocked; tap Retry exact confirmation when online/)
+  assert.doesNotMatch(watch, /recordScanEvidence|PickTaskScanEvidence|scanEvidenceIdempotencyKey/)
 })
 
 test('Meta universal-link metadata and callback remain public without exposing app data', () => {
@@ -93,7 +216,13 @@ test('Watch companion presents safe pick context and routes commands through iPh
   const bridge = read('../clients/apple/Apps/iPhone/PhoneWatchBridge.swift')
   const app = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
   assert.match(project, /ClawPilotPickingWatch:[\s\S]*ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon/)
-  assert.match(watch, /AsyncImage\(url: url/)
+  assert.match(watch, /productImage\(model\.productImage, isExpected:/)
+  assert.match(watch, /CGImageSourceCreateThumbnailAtIndex/)
+  assert.match(watch, /pickProductImageData/)
+  assert.match(bridge, /URLSession\.shared\.data\(for: request\)/)
+  assert.match(bridge, /kCGImageSourceThumbnailMaxPixelSize: 280/)
+  assert.match(bridge, /updateApplicationContext\(context\)/)
+  assert.doesNotMatch(watch, /AsyncImage|URLSession/)
   assert.match(watch, /model\.send\(\.requestMetaScan\)/)
   assert.match(watch, /model\.readInstruction\(\)/)
   assert.match(watch, /AVSpeechSynthesizer/)

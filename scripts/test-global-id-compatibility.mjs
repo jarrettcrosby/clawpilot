@@ -126,8 +126,13 @@ const operationsSection = readFileSync(
 )
 assert.match(
   operationsSection,
-  /maxLength: 16,\s+pattern: 'gcte\(\?:\[0-9\]\{7\}\|\[0-9a-v\]\{12\}\)'/,
-  'The cartonization evidence input must not truncate future-format Global IDs',
+  /const CARTONIZATION_EVIDENCE_GLOBAL_ID = \/\^gcte\(\?:\[0-9\]\{7\}\|\[0-9a-v\]\{12\}\)\$\//,
+  'Generated cartonization evidence must accept legacy and future-format Global IDs',
+)
+assert.match(
+  operationsSection,
+  /setPlanCartonizationEvidenceGlobalId\(payload\.evidence\.globalId\)/,
+  'Order planning must retain the generated cartonization evidence Global ID without truncation',
 )
 for (const name of deploymentAMigrationNames) {
   assert.match(predeploy, new RegExp(`db/migrations/${name.replaceAll('.', '\\.')}`))

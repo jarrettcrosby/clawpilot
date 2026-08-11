@@ -15,7 +15,7 @@ struct ClawPilotPickingPhoneApp: App {
             ClawPilotAppShellView(model: model)
                 .sheet(isPresented: $model.showPhoneScanner) {
                     PhoneCameraScanner(
-                        onBarcode: { value in Task { await model.accept(value, source: .iPhoneCamera) } },
+                        onBarcode: { value in await model.acceptPhoneCameraBarcode(value) },
                         onClose: { model.showPhoneScanner = false }
                     )
                 }
@@ -64,6 +64,7 @@ final class PickingPhoneModel: ObservableObject {
     @Published var managerStatus = "Loading Operations orders."
     @Published var isManagerBusy = false
     @Published var currentTask: PickTask?
+    @Published var currentScanStage: PickScanStage?
     @Published var readyToConfirm = false
     @Published var showPhoneScanner = false
     @Published var hasPendingConfirmation = false
@@ -85,6 +86,9 @@ final class PickingPhoneModel: ObservableObject {
     @Published var biometricUnlockEnabled = false
     @Published var isLocallyLocked = false
     @Published var biometricStatus = "Face ID can unlock an existing ClawPilot session on this iPhone."
+    @Published var googleAuthState: GoogleAuthState?
+    @Published var isGoogleLinkBusy = false
+    @Published var googleLinkStatus = "Each user links their own Google account after signing in with a magic code."
 
     private let cache: DurablePickCache
     private let api: PickingAPIClient
@@ -169,6 +173,13 @@ final class PickingPhoneModel: ObservableObject {
 
     var webOrigin: URL { api.webOrigin }
 
+    var environmentLabel: String? {
+        let value = String(
+            Bundle.main.object(forInfoDictionaryKey: "ClawPilotEnvironment") as? String ?? ""
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.lowercased() == "development" ? "DEV" : nil
+    }
+
     var walkthroughScreen: String? {
 #if DEBUG
         ProcessInfo.processInfo.arguments
@@ -218,7 +229,10 @@ final class PickingPhoneModel: ObservableObject {
 #endif
         }
         watch.onCommand = { [weak self] command in
-            Task { await self?.handleWatchCommand(command) }
+            guard let self else {
+                return .failure("ClawPilot is not available on the paired iPhone.")
+            }
+            return await self.handleWatchCommand(command)
         }
         do {
             try MetaWearablesAppBridge.configure()
@@ -372,6 +386,7 @@ final class PickingPhoneModel: ObservableObject {
         do {
             sessionProfile = try await api.fetchSessionProfile()
             isAuthenticated = true
+            await refreshGoogleAuthState()
             syncMetaConnection()
         } catch {
             sessionProfile = nil
@@ -383,13 +398,15 @@ final class PickingPhoneModel: ObservableObject {
             hasPendingConfirmation = true
             status = "A prior confirmation is pending. Replaying the same command."
             do {
-                try await api.confirm(pending)
+                try await syncEvidenceAndConfirm(pending)
                 isAuthenticated = true
                 try await picking.finishConfirmedOrder()
                 hasPendingConfirmation = false
                 status = "Prior confirmation reconciled."
             } catch {
-                status = "Prior confirmation remains pending; no new key was created."
+                status = pending.scanEvidenceIdempotencyKey == nil
+                    ? "Prior confirmation remains pending; no new key was created."
+                    : "Prior scans remain saved on this iPhone but are not yet acknowledged by ClawPilot. Confirmation stays blocked; retry when online."
             }
         } else {
             status = "Choose a workflow to begin."
@@ -435,15 +452,22 @@ final class PickingPhoneModel: ObservableObject {
         defer { isAuthBusy = false }
         do {
             try await api.verifyMagicCode(email: email, code: code)
+        } catch {
+            isAuthenticated = false
+            status = "Code could not be verified. Request a new code and try again."
+            return
+        }
+        do {
             sessionProfile = try await api.fetchSessionProfile()
             isAuthenticated = true
             biometrics.rememberAuthenticatedSession()
             codeRequested = false
             code = ""
             status = "Signed in. Choose a workflow to begin."
+            await refreshGoogleAuthState()
         } catch {
             isAuthenticated = false
-            status = "Sign-in failed: \(error.localizedDescription)"
+            status = "Code accepted, but the secure session could not be restored. Request a new code and try again."
         }
     }
 
@@ -481,9 +505,90 @@ final class PickingPhoneModel: ObservableObject {
             isLocallyLocked = false
             biometrics.rememberAuthenticatedSession()
             status = "Signed in with Google. Choose a workflow to begin."
+            await refreshGoogleAuthState()
         } catch {
             isAuthenticated = false
             status = "Google sign-in failed: \(error.localizedDescription)"
+        }
+    }
+
+    func refreshGoogleAuthState() async {
+        guard isAuthenticated, googleSSOAvailable else {
+            googleAuthState = nil
+            googleLinkStatus = googleSSOAvailable
+                ? "Sign in to manage your Google account link."
+                : "Google sign-in is not configured for this build. Magic codes remain available."
+            return
+        }
+        do {
+            let state = try await api.fetchGoogleAuthState()
+            googleAuthState = state
+            if state.identity.linked {
+                googleLinkStatus = "Google sign-in is linked only to \(state.identity.email). Other users must link their own account."
+            } else if !state.platformConfigured {
+                googleLinkStatus = "Google sign-in is not configured for this ClawPilot environment."
+            } else if !state.enabled {
+                googleLinkStatus = "An organization administrator must enable Google sign-in before you can link your account."
+            } else {
+                googleLinkStatus = "Link exactly \(state.identity.email). A different Google account will be rejected."
+            }
+        } catch {
+            googleAuthState = nil
+            googleLinkStatus = "Google sign-in settings could not be loaded: \(error.localizedDescription)"
+        }
+    }
+
+    func linkCurrentGoogleAccount() async {
+        guard googleSSOAvailable else {
+            googleLinkStatus = "Google sign-in is not configured for this build."
+            return
+        }
+        guard let state = googleAuthState else {
+            await refreshGoogleAuthState()
+            return
+        }
+        guard state.platformConfigured, state.enabled else {
+            googleLinkStatus = state.platformConfigured
+                ? "An organization administrator must enable Google sign-in first."
+                : "Google sign-in is not configured for this ClawPilot environment."
+            return
+        }
+        guard !state.identity.linked else {
+            googleLinkStatus = "Google sign-in is already linked only to \(state.identity.email)."
+            return
+        }
+        guard let presentingViewController = Self.presentingViewController else {
+            googleLinkStatus = "Google account linking could not open. Try again."
+            return
+        }
+        guard let clientID = Bundle.main.object(forInfoDictionaryKey: "GIDClientID") as? String,
+              let serverClientID = Bundle.main.object(forInfoDictionaryKey: "GIDServerClientID") as? String
+        else { return }
+
+        isGoogleLinkBusy = true
+        defer { isGoogleLinkBusy = false }
+        do {
+            GIDSignIn.sharedInstance.configuration = GIDConfiguration(
+                clientID: clientID,
+                serverClientID: serverClientID
+            )
+            GIDSignIn.sharedInstance.signOut()
+            let result = try await GIDSignIn.sharedInstance.signIn(
+                withPresenting: presentingViewController
+            )
+            guard let idToken = result.user.idToken?.tokenString else {
+                googleLinkStatus = "Google did not return a verified identity token."
+                return
+            }
+            let linked = try await api.linkGoogleIdentityToken(
+                idToken,
+                expectedPolicyRowVersion: state.rowVersion,
+                idempotencyKey: UUID().uuidString
+            )
+            await refreshGoogleAuthState()
+            googleLinkStatus = "Google sign-in is linked only to \(linked.email). Other users must link their own account."
+        } catch {
+            googleLinkStatus = "Google account was not linked: \(error.localizedDescription)"
         }
     }
 
@@ -569,6 +674,7 @@ final class PickingPhoneModel: ObservableObject {
 
             sessionProfile = try await api.fetchSessionProfile()
             isAuthenticated = true
+            await refreshGoogleAuthState()
 
             if canUseManager { await loadManagerOperations() }
             if canUsePicker {
@@ -691,12 +797,16 @@ final class PickingPhoneModel: ObservableObject {
         codeRequested = false
         code = ""
         currentTask = nil
+        currentScanStage = nil
         readyToConfirm = false
         status = "Signed out."
         managerOrders = []
         managerPickers = []
         pickerPerformance = []
         managerSelectedOrder = nil
+        googleAuthState = nil
+        isGoogleLinkBusy = false
+        googleLinkStatus = "Each user links their own Google account after signing in with a magic code."
     }
 
     private static var presentingViewController: UIViewController? {
@@ -740,24 +850,45 @@ final class PickingPhoneModel: ObservableObject {
         }
     }
 
-    func accept(_ value: String, source: BarcodeSource) async {
-        guard !hasPendingConfirmation else { return }
+    @discardableResult
+    func accept(_ value: String, source: BarcodeSource) async -> PickScanAcceptance? {
+        guard !hasPendingConfirmation else { return nil }
         do {
-            _ = try await picking.accept(BarcodeObservation(value: value, source: source))
-            status = "Barcode matched."
+            let acceptance = try await picking.accept(BarcodeObservation(value: value, source: source))
             if source == .metaGlasses {
-                ClawPilotScanDiagnostic.record("matched:\(value)")
+                ClawPilotScanDiagnostic.record("matched:\(acceptance.stage.rawValue):\(value)")
             }
             await updateProjection()
-            if source == .metaGlasses, readyToConfirm {
+            if acceptance.stage == .location {
+                status = "Location matched. Now scan the displayed product barcode."
+                voice.speak(
+                    "Location matched. Now scan the product barcode.",
+                    spanish: "Ubicación correcta. Ahora escanea el código del producto."
+                )
+                refreshAudioRouteStatus()
+            } else if source == .metaGlasses, readyToConfirm {
+                status = "Product barcode matched."
                 await beginHandsFreeConfirmation()
             } else {
+                status = "Product barcode matched."
                 readInstruction()
             }
-        } catch PickingContractError.barcodeMismatch {
+            return acceptance
+        } catch PickingContractError.locationBarcodeMismatch {
+            status = "Barcode does not match the current assigned location."
+            if source == .metaGlasses {
+                ClawPilotScanDiagnostic.record("location-mismatch:\(value)")
+            }
+            voice.speak(
+                "Wrong location. Scan the displayed location label.",
+                spanish: "Ubicación incorrecta. Escanea la etiqueta de ubicación mostrada."
+            )
+            refreshAudioRouteStatus()
+        } catch PickingContractError.productBarcodeMismatch,
+                PickingContractError.barcodeMismatch {
             status = "Barcode does not match the current assigned product."
             if source == .metaGlasses {
-                ClawPilotScanDiagnostic.record("mismatch:\(value)")
+                ClawPilotScanDiagnostic.record("product-mismatch:\(value)")
             }
             voice.speak(
                 "Wrong product. Scan the displayed product.",
@@ -765,23 +896,33 @@ final class PickingPhoneModel: ObservableObject {
             )
             refreshAudioRouteStatus()
         } catch { status = "Scan rejected: \(error.localizedDescription)" }
+        return nil
     }
 
-    func scanWithMeta() async {
+    func acceptPhoneCameraBarcode(_ value: String) async -> Bool {
+        let taskID = currentTask?.pickTaskGlobalId
+        _ = await accept(value, source: .iPhoneCamera)
+        // Keep the scanner open for location -> product and exact mismatch
+        // correction. It closes only after this task's product is accepted.
+        return taskID != nil && currentTask?.pickTaskGlobalId == taskID
+    }
+
+    @discardableResult
+    func scanWithMeta() async -> PickScanAcceptance? {
         guard !isMetaScanning else {
             ClawPilotScanDiagnostic.record("request-ignored:scan-already-active")
-            return
+            return nil
         }
         guard currentTask != nil else {
             metaStatus = "Load an assigned pick before starting the glasses camera."
             ClawPilotScanDiagnostic.record("blocked:no-assigned-pick")
-            return
+            return nil
         }
         guard metaScanReady else {
             metaStatus = "Waiting for one connected Meta glasses device. Open Meta AI once if it does not reconnect."
             ClawPilotScanDiagnostic.record("blocked:meta-not-ready")
             syncMetaConnection()
-            return
+            return nil
         }
         isMetaScanning = true
         defer { isMetaScanning = false }
@@ -810,32 +951,70 @@ final class PickingPhoneModel: ObservableObject {
                 throw startError ?? MetaScanError.sessionFailed
             }
             metaGlassesAppUpdateRequired = false
-            metaStatus = "Meta camera is live. Look directly at the product barcode; no photo is saved."
+            metaStatus = currentScanStage == .location
+                ? "Meta camera is live. Look directly at the displayed location label; no photo is saved."
+                : "Meta camera is live. Look directly at the product barcode; no photo is saved."
             ClawPilotScanDiagnostic.record("camera-live")
-            let value = await withTaskGroup(of: String?.self) { group in
-                group.addTask {
-                    for await value in source.barcodes { return value }
-                    return nil
+            var lastAcceptance: PickScanAcceptance?
+            var acceptedLocationValue: String?
+            for observedIndex in 0..<8 {
+                let value = await withTaskGroup(of: String?.self) { group in
+                    group.addTask {
+                        for await value in source.barcodes { return value }
+                        return nil
+                    }
+                    group.addTask {
+                        try? await Task.sleep(for: .seconds(15))
+                        return nil
+                    }
+                    let first = await group.next() ?? nil
+                    group.cancelAll()
+                    return first
                 }
-                group.addTask {
-                    try? await Task.sleep(for: .seconds(15))
-                    return nil
-                }
-                let first = await group.next() ?? nil
-                group.cancelAll()
-                return first
-            }
-            if let value {
+                guard let value else { break }
                 ClawPilotScanDiagnostic.record("decoded:\(value)")
-                await source.stop()
-                metaSource = nil
-                metaStatus = "Meta scan complete."
-                await accept(value, source: .metaGlasses)
-                return
+                if currentScanStage == .product, value == acceptedLocationValue {
+                    metaStatus = "Location verified. Move the barcode into view, then hold still on the product."
+                    try? await Task.sleep(for: .milliseconds(800))
+                    await source.prepareForNextBarcode()
+                    continue
+                }
+                if currentScanStage == .product {
+                    // End the camera stream before any product-match voice or
+                    // confirmation prompt so playback cannot overlap the DAT
+                    // session lifecycle.
+                    await source.stop()
+                    metaSource = nil
+                    let acceptance = await accept(value, source: .metaGlasses)
+                    if acceptance?.stage == .product {
+                        metaStatus = "Meta product scan complete."
+                        return acceptance
+                    }
+                    if lastAcceptance?.stage == .location {
+                        metaStatus = "Location is verified, but the product did not match. Start another scan at the product."
+                        return lastAcceptance
+                    }
+                    metaStatus = "The product did not match. Start another glasses scan at the displayed product."
+                    return nil
+                }
+                let acceptance = await accept(value, source: .metaGlasses)
+                if let acceptance {
+                    lastAcceptance = acceptance
+                    acceptedLocationValue = value
+                    metaStatus = "Location matched. Keep the camera live and look at the product barcode."
+                    try? await Task.sleep(for: .milliseconds(800))
+                } else if observedIndex == 7 {
+                    break
+                }
+                await source.prepareForNextBarcode()
             }
             await source.stop()
             metaSource = nil
-            metaStatus = "No barcode was found within 15 seconds. Start another glasses scan or use the iPhone camera."
+            if lastAcceptance?.stage == .location {
+                metaStatus = "Location matched, but no product barcode was found. Start another scan at the product or use the iPhone camera."
+                return lastAcceptance
+            }
+            metaStatus = "No matching barcode was found within 15 seconds. Start another glasses scan or use the iPhone camera."
             ClawPilotScanDiagnostic.record("timeout:no-barcode")
             voice.speak(
                 "No barcode found. Try the glasses scan again or use the iPhone camera.",
@@ -853,6 +1032,7 @@ final class PickingPhoneModel: ObservableObject {
             if let metaSource { await metaSource.stop() }
             metaSource = nil
         }
+        return nil
     }
 
     func handlePendingSystemScan() async {
@@ -975,6 +1155,7 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func refreshMetaStatus() async {
+        let previousConnectedDeviceCount = metaConnectedDeviceCount
         let snapshot = await MetaWearablesAppBridge.statusSnapshot()
         metaConnectedDeviceCount = snapshot.connectedDeviceCount
         let deviceLabel = snapshot.connectedDeviceCount == 1
@@ -1013,6 +1194,10 @@ final class PickingPhoneModel: ObservableObject {
             metaCameraGranted = false
             metaStatus = "Unknown Meta registration state. iPhone camera remains available."
         }
+        if previousConnectedDeviceCount != metaConnectedDeviceCount,
+           currentTask != nil || readyToConfirm {
+            await updateProjection()
+        }
     }
 
     func syncMetaConnection() {
@@ -1035,6 +1220,7 @@ final class PickingPhoneModel: ObservableObject {
         if let currentTask {
             voice.speak(PickVoice.instruction(
                 for: currentTask,
+                locationScanRequired: currentScanStage == .location,
                 languageCode: instructionLanguage.languageCode
             ), forceSystemVoice: forceSystemVoice)
         } else if readyToConfirm {
@@ -1077,17 +1263,28 @@ final class PickingPhoneModel: ObservableObject {
         status = "Voice command stopped."
     }
 
-    private func handleWatchCommand(_ command: WatchPickCommand) async {
+    private func handleWatchCommand(_ command: WatchPickCommand) async -> PhoneWatchCommandOutcome {
         switch command.action {
         case .requestMetaScan:
             status = "Apple Watch requested a glasses scan."
-            await scanWithMeta()
+            if let acceptance = await scanWithMeta() {
+                return acceptance.stage == .location
+                    ? .success("Location matched. Scan the displayed product next.")
+                    : .success("Product matched. The current pick advanced.")
+            }
+            return .failure(metaStatus)
         case .readInstruction:
             // Watch commands commonly wake the iPhone in the background. Use
             // Apple's lightweight synthesizer for this path instead of
             // starting the large optional CoreML voice model while backgrounded.
             status = "Apple Watch requested the current pick instruction."
+            guard currentTask != nil || readyToConfirm else {
+                return .failure("No current pick instruction is available.")
+            }
             readInstruction(forceSystemVoice: true)
+            return .success(metaConnectedDeviceCount == 1
+                ? "Instruction is playing through the current iPhone audio route."
+                : "Instruction playback started on the paired iPhone.")
         case .confirmPick:
             guard readyToConfirm else {
                 status = "Scan every assigned product before confirming from Apple Watch."
@@ -1095,11 +1292,23 @@ final class PickingPhoneModel: ObservableObject {
                     "Scan every assigned product before confirming.",
                     spanish: "Escanea todos los productos asignados antes de confirmar."
                 )
-                return
+                return .failure("Scan every assigned product before confirming.")
             }
             await confirmOrder()
+            return hasPendingConfirmation
+                ? .failure(status)
+                : .success("Picks confirmed and audited by ClawPilot.")
         case .refreshQueue:
             await loadQueue(readAloud: false)
+            if !isAuthenticated {
+                return .failure("Open ClawPilot on iPhone and sign in before refreshing.")
+            }
+            if status.hasPrefix("Pick queue refresh failed") {
+                return .failure(status)
+            }
+            return .success(currentTask == nil
+                ? status
+                : "Picks refreshed. The current item is ready on Apple Watch.")
         }
     }
 
@@ -1231,7 +1440,7 @@ final class PickingPhoneModel: ObservableObject {
         do {
             let command = try await picking.persistConfirmation()
             hasPendingConfirmation = true
-            try await api.confirm(command)
+            try await syncEvidenceAndConfirm(command)
             try await picking.finishConfirmedOrder()
             hasPendingConfirmation = false
             status = "ClawPilot confirmed and audited the picks."
@@ -1240,8 +1449,22 @@ final class PickingPhoneModel: ObservableObject {
             await loadPickerPerformance()
             await loadQueue(readAloud: false)
         } catch {
-            status = "Confirmation is pending or rejected. Refresh before new work: \(error.localizedDescription)"
+            let pending = try? await cache.loadOutbox()
+            status = pending?.scanEvidenceIdempotencyKey == nil
+                ? "Confirmation is pending or rejected. Refresh before new work: \(error.localizedDescription)"
+                : "Scans are saved on this iPhone but are not yet acknowledged by ClawPilot. Confirmation stays blocked; tap Retry exact confirmation when online."
         }
+    }
+
+    private func syncEvidenceAndConfirm(_ command: ConfirmPicksCommand) async throws {
+        if command.scanEvidenceIdempotencyKey != nil {
+            status = "Syncing location and product scan evidence with ClawPilot…"
+            try await api.recordScanEvidence(command)
+            status = "Scan evidence acknowledged. Confirming picks…"
+        } else {
+            status = "Confirming picks…"
+        }
+        try await api.confirm(command)
     }
 
     func retryPendingConfirmation() async {
@@ -1250,18 +1473,21 @@ final class PickingPhoneModel: ObservableObject {
             return
         }
         do {
-            try await api.confirm(pending)
+            try await syncEvidenceAndConfirm(pending)
             try await picking.finishConfirmedOrder()
             hasPendingConfirmation = false
             status = "Pending confirmation reconciled."
             await loadQueue()
         } catch {
-            status = "The exact confirmation remains unresolved."
+            status = pending.scanEvidenceIdempotencyKey == nil
+                ? "The exact confirmation remains unresolved."
+                : "Scans remain saved on this iPhone and unacknowledged. Confirmation stays blocked; retry when online."
         }
     }
 
     private func updateProjection() async {
         currentTask = await picking.currentTask()
+        currentScanStage = await picking.currentScanStage()
         let activeOrder = await picking.currentOrder()
         readyToConfirm = currentTask == nil && activeOrder != nil
         watch.publish(await picking.makeWatchSnapshot(

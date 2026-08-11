@@ -50,8 +50,18 @@ type CandidateLineRow = {
 }
 
 type WarehouseRow = {
+  id: string
   global_id: string
   name: string
+}
+
+type InventoryLocationMappingRow = {
+  id: string
+  warehouse_id: string
+}
+
+type CarrierServiceWarehouseRow = {
+  warehouse_id: string
 }
 
 type InventoryRunRow = {
@@ -312,19 +322,107 @@ async function readCandidateLines(
   return result.rows
 }
 
-async function readActiveWarehouses(
+async function readSelectedWarehouseAuthority(
   client: PoolClient,
-  organizationId: string,
+  input: {
+    organizationId: string
+    account: AccountRow
+    warehouseGlobalId: string
+  },
 ) {
   const result = await client.query<WarehouseRow>(
-    `SELECT warehouse.global_id, warehouse.name
+    `SELECT warehouse.id::text, warehouse.global_id, warehouse.name
      FROM operations_warehouses warehouse
      WHERE warehouse.organization_id = $1::uuid
+       AND warehouse.global_id = $2
        AND warehouse.status = 'active'
-     ORDER BY lower(warehouse.name), warehouse.id`,
-    [organizationId],
+     LIMIT 2`,
+    [input.organizationId, input.warehouseGlobalId],
   )
-  return result.rows
+  if (result.rows.length !== 1) {
+    persistenceError(
+      'The selected warehouse is not exactly one active warehouse in this organization',
+      409,
+      'CARTONIZATION_PREVIEW_WAREHOUSE_UNAVAILABLE',
+    )
+  }
+  const warehouse = result.rows[0]
+  if (input.account.provider !== 'shopify') {
+    return { warehouse, locationMappingId: null }
+  }
+
+  const [mappingResult, carrierConfigResult] = await Promise.all([
+    client.query<InventoryLocationMappingRow>(
+      `SELECT mapping.id::text, mapping.warehouse_id::text
+       FROM operations_commerce_inventory_location_mappings mapping
+       WHERE mapping.organization_id = $1::uuid
+         AND mapping.integration_account_id = $2::uuid
+         AND mapping.warehouse_id = $3::uuid
+         AND mapping.active = true
+       ORDER BY mapping.id
+       LIMIT 2`,
+      [
+        input.organizationId,
+        input.account.integration_account_id,
+        warehouse.id,
+      ],
+    ),
+    client.query<CarrierServiceWarehouseRow>(
+      `SELECT DISTINCT config.warehouse_id::text AS warehouse_id
+       FROM operations_shopify_carrier_service_configs config
+       WHERE config.organization_id = $1::uuid
+         AND config.integration_account_id = $2::uuid
+         AND config.registration_state IN ('shadow_simulated', 'registered')
+       ORDER BY config.warehouse_id::text
+       LIMIT 2`,
+      [input.organizationId, input.account.integration_account_id],
+    ),
+  ])
+  if (mappingResult.rows.length > 1) {
+    persistenceError(
+      'More than one active Shopify inventory location mapping exists for the selected warehouse',
+      409,
+      'CARTONIZATION_PREVIEW_LOCATION_MAPPING_AMBIGUOUS',
+    )
+  }
+  if (carrierConfigResult.rows.length > 1) {
+    persistenceError(
+      'More than one active Shopify carrier-service warehouse requires review',
+      409,
+      'CARTONIZATION_PREVIEW_CARRIER_CONFIG_AMBIGUOUS',
+    )
+  }
+  const mapping = mappingResult.rows[0] || null
+  const carrierWarehouseId =
+    carrierConfigResult.rows[0]?.warehouse_id || null
+  if (!mapping) {
+    persistenceError(
+      'The selected Shopify account has no current active inventory location mapping',
+      409,
+      'CARTONIZATION_PREVIEW_LOCATION_MAPPING_REQUIRED',
+    )
+  }
+  if (
+    carrierWarehouseId
+    && carrierWarehouseId !== mapping.warehouse_id
+  ) {
+    persistenceError(
+      'The saved Shopify inventory mapping and carrier-service configuration target different warehouses',
+      409,
+      'CARTONIZATION_PREVIEW_WAREHOUSE_AUTHORITY_CONFLICT',
+    )
+  }
+  if (
+    mapping.warehouse_id !== warehouse.id
+    || (carrierWarehouseId && carrierWarehouseId !== warehouse.id)
+  ) {
+    persistenceError(
+      'The selected warehouse does not match current Shopify inventory authority',
+      409,
+      'CARTONIZATION_PREVIEW_WAREHOUSE_AUTHORITY_MISMATCH',
+    )
+  }
+  return { warehouse, locationMappingId: mapping.id }
 }
 
 async function readLatestInventoryRun(
@@ -332,6 +430,8 @@ async function readLatestInventoryRun(
   input: {
     organizationId: string
     integrationAccountId: string
+    warehouseId: string
+    locationMappingId: string
   },
 ) {
   const result = await client.query<InventoryRunRow>(
@@ -347,13 +447,20 @@ async function readLatestInventoryRun(
       AND warehouse.id = run.warehouse_id
      WHERE run.organization_id = $1::uuid
        AND run.integration_account_id = $2::uuid
+       AND run.warehouse_id = $3::uuid
+       AND run.location_mapping_id = $4::uuid
        AND run.status = 'succeeded'
      ORDER BY
        run.provider_fetched_at DESC,
        run.completed_at DESC,
        run.id DESC
      LIMIT 1`,
-    [input.organizationId, input.integrationAccountId],
+    [
+      input.organizationId,
+      input.integrationAccountId,
+      input.warehouseId,
+      input.locationMappingId,
+    ],
   )
   return result.rows[0] || null
 }
@@ -527,9 +634,30 @@ export async function readCartonizationPreviewSnapshotFromPostgres(input: {
       candidateGlobalId: input.request.candidateGlobalId,
       expectedRowVersion: input.request.expectedCandidateRowVersion,
     })
+    const warehouseAuthority = await readSelectedWarehouseAuthority(client, {
+      organizationId: input.organizationId,
+      account,
+      warehouseGlobalId: input.request.warehouseGlobalId,
+    })
+    let inventoryRunRead: Promise<InventoryRunRow | null> =
+      Promise.resolve(null)
+    if (account.provider === 'shopify') {
+      if (!warehouseAuthority.locationMappingId) {
+        persistenceError(
+          'Shopify preview warehouse authority lost its exact location mapping',
+          500,
+          'CARTONIZATION_PREVIEW_EVIDENCE_INVALID',
+        )
+      }
+      inventoryRunRead = readLatestInventoryRun(client, {
+        organizationId: input.organizationId,
+        integrationAccountId: account.integration_account_id,
+        warehouseId: warehouseAuthority.warehouse.id,
+        locationMappingId: warehouseAuthority.locationMappingId,
+      })
+    }
     const [
       lineRows,
-      activeWarehouseRows,
       inventoryRun,
       materialRows,
     ] = await Promise.all([
@@ -538,11 +666,7 @@ export async function readCartonizationPreviewSnapshotFromPostgres(input: {
         integrationAccountId: account.integration_account_id,
         orderCandidateId: candidate.order_candidate_id,
       }),
-      readActiveWarehouses(client, input.organizationId),
-      readLatestInventoryRun(client, {
-        organizationId: input.organizationId,
-        integrationAccountId: account.integration_account_id,
-      }),
+      inventoryRunRead,
       readSelectedMaterials(
         client,
         input.organizationId,
@@ -631,10 +755,10 @@ export async function readCartonizationPreviewSnapshotFromPostgres(input: {
             : null,
         }
       }),
-      activeWarehouses: activeWarehouseRows.map((warehouse) => ({
-        globalId: warehouse.global_id,
-        name: warehouse.name,
-      })),
+      activeWarehouses: [{
+        globalId: warehouseAuthority.warehouse.global_id,
+        name: warehouseAuthority.warehouse.name,
+      }],
       latestInventoryRun: inventoryRun
         ? {
             globalId: inventoryRun.global_id,

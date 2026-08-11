@@ -9,7 +9,27 @@ export type WearablePickTask = {
   productImageURL: string | null
   barcode: string | null
   locationCode: string
+  warehouseGlobalId?: string
+  locationGlobalId?: string
+  locationBarcode?: string
+  locationScanRequired?: true
+  locationScanPolicyRowVersion?: number
   quantity: number
+}
+
+export type WearableScanSource = 'iphone_camera' | 'meta'
+
+export type WearableScanObservationInput = {
+  barcode: string
+  capturedAt: string
+  source: WearableScanSource
+}
+
+export type WearablePickTaskScanEvidenceInput = {
+  pickTaskGlobalId: string
+  policyRowVersion: number
+  location: WearableScanObservationInput
+  product: WearableScanObservationInput
 }
 
 export type WearablePickOrder = {

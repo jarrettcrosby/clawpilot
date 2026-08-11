@@ -27,8 +27,13 @@ import type {
   PackagingAssortmentOptimizationInputV1,
   PackagingAssortmentResultV1,
 } from '@/lib/operations/fulfillmentOptimizerContract'
+import {
+  DEFAULT_FULFILLMENT_OPTIMIZER_TIMEOUT_MS,
+  FulfillmentOptimizerRuntimeConfigError,
+  normalizeFulfillmentOptimizerBaseUrl,
+  resolveFulfillmentOptimizerRuntimeConfiguration,
+} from '@/lib/operations/fulfillmentOptimizerRuntimeConfig'
 
-const DEFAULT_REQUEST_TIMEOUT_MS = 10_000
 const DETERMINISTIC_ALGORITHM_VERSION = 'clawpilot-deterministic-one-unit-carton-v1'
 
 type FetchImplementation = typeof fetch
@@ -375,23 +380,6 @@ async function deterministicFallback(
   )
 }
 
-function normalizedBaseUrl(value: string): string {
-  let parsed: URL
-  try {
-    parsed = new URL(value)
-  } catch {
-    throw new OptimizerContractError('ORTOOLS_URL_INVALID')
-  }
-  const local = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '::1'
-  if (parsed.protocol !== 'https:' && !(local && parsed.protocol === 'http:')) {
-    throw new OptimizerContractError('ORTOOLS_TLS_REQUIRED')
-  }
-  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
-    throw new OptimizerContractError('ORTOOLS_URL_INVALID')
-  }
-  return parsed.toString().replace(/\/$/, '')
-}
-
 export class OrToolsFulfillmentOptimizer implements FulfillmentOptimizerV1 {
   private readonly baseUrl: string
   private readonly secret: string
@@ -399,13 +387,20 @@ export class OrToolsFulfillmentOptimizer implements FulfillmentOptimizerV1 {
   private readonly fetchImplementation: FetchImplementation
 
   constructor(config: OrToolsFulfillmentOptimizerConfig) {
-    this.baseUrl = normalizedBaseUrl(config.baseUrl)
+    try {
+      this.baseUrl = normalizeFulfillmentOptimizerBaseUrl(config.baseUrl)
+    } catch (error) {
+      if (error instanceof FulfillmentOptimizerRuntimeConfigError) {
+        throw new OptimizerContractError(error.code)
+      }
+      throw error
+    }
     if (Buffer.byteLength(config.secret || '', 'utf8') < 32) {
       throw new OptimizerContractError('ORTOOLS_SECRET_INVALID')
     }
     this.secret = config.secret
     this.requestTimeoutMs = safeInteger(
-      config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+      config.requestTimeoutMs ?? DEFAULT_FULFILLMENT_OPTIMIZER_TIMEOUT_MS,
       'ORTOOLS_TIMEOUT_INVALID',
       100,
       30_000,
@@ -519,16 +514,20 @@ export class OrToolsFulfillmentOptimizer implements FulfillmentOptimizerV1 {
 export function configuredOrToolsFulfillmentOptimizer(
   fetchImplementation?: FetchImplementation,
 ): OrToolsFulfillmentOptimizer | null {
-  if (process.env.CLAWPILOT_FULFILLMENT_OPTIMIZER_ENABLED !== '1') return null
-  const baseUrl = String(process.env.CLAWPILOT_FULFILLMENT_OPTIMIZER_URL || '').trim()
-  const secret = String(process.env.CLAWPILOT_FULFILLMENT_OPTIMIZER_SECRET || '')
-  const timeoutValue = Number(
-    process.env.CLAWPILOT_FULFILLMENT_OPTIMIZER_TIMEOUT_MS || DEFAULT_REQUEST_TIMEOUT_MS,
-  )
+  let configuration
+  try {
+    configuration = resolveFulfillmentOptimizerRuntimeConfiguration()
+  } catch (error) {
+    if (error instanceof FulfillmentOptimizerRuntimeConfigError) {
+      throw new OptimizerContractError(error.code)
+    }
+    throw error
+  }
+  if (!configuration) return null
   return new OrToolsFulfillmentOptimizer({
-    baseUrl,
-    secret,
-    requestTimeoutMs: timeoutValue,
+    baseUrl: configuration.baseUrl,
+    secret: configuration.secret,
+    requestTimeoutMs: configuration.requestTimeoutMs,
     fetchImplementation,
   })
 }

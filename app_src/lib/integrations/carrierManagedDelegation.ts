@@ -75,7 +75,7 @@ export function managedCarrierDelegationProfile(
 
 export function managedCarrierDelegationAllows(
   configuration: ManagedCarrierConfiguration,
-  capability: 'sandbox_rate' | 'sandbox_label' | 'production_rate',
+  capability: 'sandbox_rate' | 'sandbox_label' | 'production_rate' | 'production_label',
 ) {
   const profile = managedCarrierDelegationProfile(configuration)
   if (profile === 'rating_only') return capability === 'sandbox_rate'

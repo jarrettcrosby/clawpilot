@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
+import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
 import {
   acquireTransactionAdvisoryLock,
   query,
@@ -9,6 +10,10 @@ import {
 
 const WORKER_HEARTBEAT_KEY =
   'commerce.shopify_inventory_refresh.worker.heartbeat'
+const SHOPIFY_INVENTORY_READ_ACCOUNT_SQL = commerceReadAccountSql(
+  'account',
+  { developmentRequiresActive: true },
+)
 const INVENTORY_READABLE_CONNECTION_SQL = `(
   COALESCE(account.configuration->'grantedScopes', '[]'::jsonb)
     ?| ARRAY['read_inventory', 'write_inventory']
@@ -351,7 +356,7 @@ function currentFenceSql(jobAlias = 'job') {
      AND account.id = ${jobAlias}.integration_account_id
      AND account.integration_type = 'commerce'
      AND account.provider = 'shopify'
-     AND account.status = 'active'
+     AND ${SHOPIFY_INVENTORY_READ_ACCOUNT_SQL}
      AND account.commerce_credential_generation =
          ${jobAlias}.credential_generation
     JOIN operations_commerce_credentials credential
@@ -415,7 +420,7 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
                  job.inventory_max_age_seconds
              AND account.integration_type = 'commerce'
              AND account.provider = 'shopify'
-             AND account.status = 'active'
+             AND ${SHOPIFY_INVENTORY_READ_ACCOUNT_SQL}
              AND account.commerce_credential_generation =
                  job.credential_generation
              AND credential.credential_version =
@@ -473,7 +478,7 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
          )
          AND account.integration_type = 'commerce'
          AND account.provider = 'shopify'
-         AND account.status = 'active'
+         AND ${SHOPIFY_INVENTORY_READ_ACCOUNT_SQL}
          AND account.commerce_credential_generation =
              config.credential_generation
          AND credential.credential_version =
@@ -1143,7 +1148,7 @@ export async function readShopifyInventoryRefreshHealthFromPostgres() {
          )
          AND account.integration_type = 'commerce'
          AND account.provider = 'shopify'
-         AND account.status = 'active'
+         AND ${SHOPIFY_INVENTORY_READ_ACCOUNT_SQL}
          AND account.commerce_credential_generation =
              config.credential_generation
          AND credential.credential_version =

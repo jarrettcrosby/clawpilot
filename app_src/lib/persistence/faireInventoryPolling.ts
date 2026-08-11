@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { CommerceIntegrationRequestError } from '@/lib/integrations/commerceIntegrations'
+import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
 import {
   acquireTransactionAdvisoryLock,
   query,
@@ -12,6 +13,10 @@ const POLL_INTERVAL = '30 minutes'
 const POLL_LEASE = '10 minutes'
 const WORKER_HEARTBEAT_KEY = 'faire_inventory_poll_worker_heartbeat'
 const SELECTOR_LIMIT = 50
+const FAIRE_INVENTORY_READ_ACCOUNT_SQL = commerceReadAccountSql(
+  'account',
+  { developmentRequiresActive: true },
+)
 
 // This is only a scheduler/configuration hint. Faire's inventory endpoint is
 // the authority for whether the current credential can actually read inventory.
@@ -188,7 +193,7 @@ export async function queueAutomaticFaireInventoryPollsInPostgres() {
              AND account.id = job.integration_account_id
              AND account.integration_type = 'commerce'
              AND account.provider = 'faire'
-             AND account.status = 'active'
+             AND ${FAIRE_INVENTORY_READ_ACCOUNT_SQL}
              AND account.commerce_credential_generation =
                  job.credential_version
              AND credential.credential_version = job.credential_version
@@ -212,7 +217,7 @@ export async function queueAutomaticFaireInventoryPollsInPostgres() {
            ON activation.organization_id = account.organization_id
          WHERE account.integration_type = 'commerce'
            AND account.provider = 'faire'
-           AND account.status = 'active'
+           AND ${FAIRE_INVENTORY_READ_ACCOUNT_SQL}
            AND account.commerce_credential_generation > 0
            AND credential.credential_version =
                account.commerce_credential_generation
@@ -324,7 +329,7 @@ export async function claimFaireInventoryPollJobsInPostgres(input: {
            )
            AND account.integration_type = 'commerce'
            AND account.provider = 'faire'
-           AND account.status = 'active'
+           AND ${FAIRE_INVENTORY_READ_ACCOUNT_SQL}
            AND account.commerce_credential_generation =
                job.credential_version
            AND credential.credential_version = job.credential_version
@@ -453,7 +458,7 @@ export async function readFaireInventoryPollSelectorsInPostgres(input: {
        AND job.activation_revision = $7
        AND account.integration_type = 'commerce'
        AND account.provider = 'faire'
-       AND account.status = 'active'
+       AND ${FAIRE_INVENTORY_READ_ACCOUNT_SQL}
        AND account.commerce_credential_generation = job.credential_version
        AND credential.credential_version = job.credential_version
        AND credential.verification_status = 'verified'
@@ -542,7 +547,7 @@ async function lockCurrentJob(
          AND job.lease_expires_at > clock_timestamp()
          AND job.credential_version = $5
          AND job.activation_revision = $6
-         AND account.status = 'active'
+         AND ${FAIRE_INVENTORY_READ_ACCOUNT_SQL}
          AND account.commerce_credential_generation = job.credential_version
          AND credential.credential_version = job.credential_version
          AND credential.verification_status = 'verified'
@@ -590,7 +595,7 @@ export async function withFaireInventoryPollProviderReadFenceInPostgres<T>(
          AND job.activation_revision = $6
          AND account.integration_type = 'commerce'
          AND account.provider = 'faire'
-         AND account.status = 'active'
+         AND ${FAIRE_INVENTORY_READ_ACCOUNT_SQL}
          AND account.commerce_credential_generation = job.credential_version
          AND credential.credential_version = job.credential_version
          AND credential.verification_status = 'verified'
@@ -977,7 +982,7 @@ export async function recoverFaireInventoryPollInPostgres(input: {
            AND job.credential_version = $4
            AND job.last_error_code = $5
            AND account.provider = 'faire'
-           AND account.status = 'active'
+           AND ${FAIRE_INVENTORY_READ_ACCOUNT_SQL}
            AND account.commerce_credential_generation = job.credential_version
            AND credential.credential_version = job.credential_version
            AND credential.verification_status = 'verified'
@@ -1306,7 +1311,7 @@ export async function readFaireInventoryPollHealthFromPostgres() {
          ON activation.organization_id = account.organization_id
        WHERE account.integration_type = 'commerce'
          AND account.provider = 'faire'
-         AND account.status = 'active'
+         AND ${FAIRE_INVENTORY_READ_ACCOUNT_SQL}
          AND account.commerce_credential_generation > 0
          AND credential.credential_version =
              account.commerce_credential_generation

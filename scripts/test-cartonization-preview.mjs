@@ -96,6 +96,209 @@ function loadDomain() {
   return module.exports
 }
 
+function loadPersistence({
+  mappingRows = [{
+    id: '55555555-5555-4555-8555-555555555555',
+    warehouse_id: '44444444-4444-4444-8444-444444444444',
+  }],
+  carrierConfigRows = [{
+    warehouse_id: '44444444-4444-4444-8444-444444444444',
+  }],
+  warehouseRows = [{
+    id: '44444444-4444-4444-8444-444444444444',
+    global_id: 'gwh0000001',
+    name: 'AG Alchemy',
+  }],
+} = {}) {
+  const path = 'app_src/lib/persistence/cartonizationPreview.ts'
+  const output = ts.transpileModule(read(path), {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+    fileName: path,
+  }).outputText
+  const module = { exports: {} }
+  const queries = []
+  const client = {
+    async query(sql, values = []) {
+      queries.push({ sql, values })
+      if (
+        sql.startsWith('BEGIN')
+        || sql === 'COMMIT'
+        || sql === 'ROLLBACK'
+      ) return { rowCount: 0, rows: [] }
+      if (sql.includes('transaction_timestamp() AS read_at')) {
+        return {
+          rowCount: 1,
+          rows: [{ read_at: '2026-08-10T21:00:00.000Z' }],
+        }
+      }
+      if (sql.includes('FROM operations_integration_accounts account')) {
+        return {
+          rowCount: 1,
+          rows: [{
+            integration_account_id:
+              '22222222-2222-4222-8222-222222222222',
+            organization_global_id: 'go0000001',
+            global_id: 'gia0000001',
+            provider: 'shopify',
+            status: 'active',
+            activation_state: 'shadow',
+            data_pipeline_id: null,
+          }],
+        }
+      }
+      if (sql.includes('FROM operations_commerce_order_candidates candidate')) {
+        return {
+          rowCount: 1,
+          rows: [{
+            order_candidate_id:
+              '33333333-3333-4333-8333-333333333333',
+            global_id: 'gcoc0000001',
+            order_number_snapshot: '#6603',
+            source_hash: 'a'.repeat(64),
+            row_version: '3',
+            workflow_state: 'ready',
+            currency_code: 'USD',
+            requires_shipping: true,
+            expires_at: '2026-08-30T21:00:00.000Z',
+          }],
+        }
+      }
+      if (sql.includes('FROM operations_warehouses warehouse')) {
+        assert.ok(
+          sql.includes('warehouse.global_id = $2'),
+          'Fit preview must query the exact selected warehouse',
+        )
+        return { rowCount: warehouseRows.length, rows: warehouseRows }
+      }
+      if (sql.includes(
+        'FROM operations_commerce_inventory_location_mappings mapping',
+      )) {
+        return { rowCount: mappingRows.length, rows: mappingRows }
+      }
+      if (sql.includes(
+        'FROM operations_shopify_carrier_service_configs config',
+      )) {
+        return {
+          rowCount: carrierConfigRows.length,
+          rows: carrierConfigRows,
+        }
+      }
+      if (sql.includes(
+        'FROM operations_commerce_order_candidate_lines line',
+      )) {
+        return {
+          rowCount: 1,
+          rows: [{
+            global_id: 'gcol0000001',
+            product_title_snapshot: 'Test Product',
+            requires_shipping: true,
+            unfulfilled_quantity: '1',
+            mapping_state: 'resolved',
+            packaging_state: 'resolved',
+            product_global_id: 'gp0000001',
+            weight_grams: 200,
+            length_mm: 100,
+            width_mm: 80,
+            height_mm: 40,
+            packaging_source: 'manual',
+            packaging_weight_source: 'manual',
+            commerce_variant_pack_mapping_global_id: null,
+            commerce_variant_pack_mapping_row_version: null,
+            pack_profile_version_global_id: null,
+            pack_profile_version_row_version: null,
+            pack_profile_package_level: null,
+            pack_profile_base_each_quantity: null,
+          }],
+        }
+      }
+      if (sql.includes('FROM operations_commerce_inventory_sync_runs run')) {
+        return {
+          rowCount: 1,
+          rows: [{
+            sync_run_id: '66666666-6666-4666-8666-666666666666',
+            global_id: 'gisr0000001',
+            warehouse_global_id: 'gwh0000001',
+            provider_fetched_at: '2026-08-10T20:55:00.000Z',
+            completed_at: '2026-08-10T20:56:00.000Z',
+          }],
+        }
+      }
+      if (sql.includes('FROM operations_commerce_inventory_levels level')) {
+        return {
+          rowCount: 1,
+          rows: [{
+            position_global_id: 'giv0000001',
+            warehouse_global_id: 'gwh0000001',
+            product_global_id: 'gp0000001',
+            atp_quantity: '1',
+            provider_committed_quantity: '1',
+            source_level_global_ids: ['giil0000001'],
+          }],
+        }
+      }
+      if (sql.includes('FROM operations_packaging_materials material')) {
+        return {
+          rowCount: 1,
+          rows: [{
+            global_id: 'gmat0000001',
+            name: 'Small carton',
+            material_type: 'carton',
+            status: 'active',
+            inner_length_mm: 250,
+            inner_width_mm: 200,
+            inner_height_mm: 150,
+            tare_weight_grams: 120,
+            max_weight_grams: 10_000,
+            unit_cost_minor: '55',
+            currency: 'USD',
+            row_version: '1',
+            stock_warehouse_global_id: 'gwh0000001',
+            stock_warehouse_status: 'active',
+            stock_is_available: true,
+            stock_on_hand_quantity: 20,
+            stock_row_version: '1',
+          }],
+        }
+      }
+      assert.fail(`Unexpected cartonization preview query: ${sql}`)
+    },
+    release() {},
+  }
+  const requireModule = (specifier) => {
+    if (specifier === '@/lib/persistence/postgres') {
+      return {
+        getPostgresPool: () => ({
+          connect: async () => client,
+        }),
+      }
+    }
+    return requireFromApp(specifier)
+  }
+  vm.runInNewContext(output, {
+    Array,
+    Boolean,
+    Date,
+    Error,
+    Map,
+    Math,
+    Number,
+    Object,
+    Promise,
+    RegExp,
+    Set,
+    String,
+    console,
+    exports: module.exports,
+    module,
+    require: requireModule,
+  }, { filename: path })
+  return { loaded: module.exports, queries }
+}
+
 const {
   createCartonizationPreview,
   normalizeCartonizationPreviewRequest,
@@ -105,6 +308,7 @@ const request = {
   accountGlobalId: 'gia0000001',
   candidateGlobalId: 'gcoc0000001',
   expectedCandidateRowVersion: 3,
+  warehouseGlobalId: 'gwh0000001',
   materialGlobalIds: ['gmat0000001'],
   assumedCommittedByLine: [],
 }
@@ -149,6 +353,9 @@ const snapshot = {
   activeWarehouses: [{
     globalId: 'gwh0000001',
     name: 'AG Alchemy',
+  }, {
+    globalId: 'gwh0000002',
+    name: 'Proof warehouse',
   }],
   latestInventoryRun: {
     globalId: 'gisr0000001',
@@ -191,6 +398,7 @@ const snapshot = {
 
 const normalized = normalizeCartonizationPreviewRequest(request)
 assert.equal(normalized.expectedCandidateRowVersion, 3)
+assert.equal(normalized.warehouseGlobalId, 'gwh0000001')
 assert.deepEqual(
   Array.from(normalized.materialGlobalIds),
   ['gmat0000001'],
@@ -201,6 +409,13 @@ assert.throws(
     expectedCandidateRowVersion: '3',
   }),
   /Expected candidate row version is invalid/,
+)
+assert.throws(
+  () => normalizeCartonizationPreviewRequest({
+    ...request,
+    warehouseGlobalId: 'gwh-invalid',
+  }),
+  /Warehouse Global ID is invalid/,
 )
 assert.throws(
   () => normalizeCartonizationPreviewRequest({
@@ -322,10 +537,30 @@ assert.equal(ready.optimizer?.method, 'or_tools')
 assert.equal(ready.optimizer?.selectedPlan?.shipmentCount, 1)
 assert.equal(ready.optimizer?.selectedPlan?.cartonCount, 1)
 assert.equal(ready.optimizer?.selectedPlan?.packages.length, 1)
+assert.equal(ready.warehouse?.globalId, 'gwh0000001')
 assert.equal(
   ready.optimizer?.selectedPlan?.packages[0].allocations[0].quantity,
   2,
 )
+let unavailableWarehouseOptimizerCalled = false
+const unavailableWarehouse = await createCartonizationPreview({
+  request: {
+    ...normalized,
+    warehouseGlobalId: 'gwh0000003',
+  },
+  snapshot,
+  optimizer: {
+    async optimize(input, options) {
+      unavailableWarehouseOptimizerCalled = true
+      return validOptimizerResult(input, options)
+    },
+  },
+})
+assert.equal(unavailableWarehouse.status, 'blocked')
+assert.equal(unavailableWarehouseOptimizerCalled, false)
+assert.ok(unavailableWarehouse.blockers.some((item) => (
+  item.code === 'CARTONIZATION_SELECTED_WAREHOUSE_UNAVAILABLE'
+)))
 assert.deepEqual(
   JSON.parse(JSON.stringify(ready.evidence)),
   {
@@ -646,6 +881,139 @@ assert.ok(missingMeasurements.blockers.some((item) => (
   item.code === 'CARTONIZATION_CANONICAL_PACKAGE_REQUIRED'
 )))
 
+const previewOrganizationId =
+  '11111111-1111-4111-8111-111111111111'
+const persistenceScenario = loadPersistence()
+const persistedSnapshot = await persistenceScenario.loaded
+  .readCartonizationPreviewSnapshotFromPostgres({
+    organizationId: previewOrganizationId,
+    request: normalized,
+  })
+assert.deepEqual(
+  JSON.parse(JSON.stringify(persistedSnapshot.activeWarehouses)),
+  [{ globalId: 'gwh0000001', name: 'AG Alchemy' }],
+  'A multi-warehouse organization must retain only the exact selected active warehouse in preview evidence',
+)
+const selectedWarehouseQuery = persistenceScenario.queries.find(
+  ({ sql }) => sql.includes('FROM operations_warehouses warehouse'),
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(selectedWarehouseQuery?.values)),
+  [previewOrganizationId, 'gwh0000001'],
+)
+const selectedMappingQuery = persistenceScenario.queries.find(
+  ({ sql }) => sql.includes(
+    'FROM operations_commerce_inventory_location_mappings mapping',
+  ),
+)
+assert.ok(selectedMappingQuery)
+assert.ok(selectedMappingQuery.sql.includes(
+  'mapping.warehouse_id = $3::uuid',
+))
+assert.deepEqual(
+  JSON.parse(JSON.stringify(selectedMappingQuery.values)),
+  [
+    previewOrganizationId,
+    '22222222-2222-4222-8222-222222222222',
+    '44444444-4444-4444-8444-444444444444',
+  ],
+  'Location mapping authority must be scoped to the selected warehouse',
+)
+const selectedInventoryQuery = persistenceScenario.queries.find(
+  ({ sql }) => sql.includes(
+    'FROM operations_commerce_inventory_sync_runs run',
+  ),
+)
+assert.ok(selectedInventoryQuery)
+assert.ok(selectedInventoryQuery.sql.includes('run.warehouse_id = $3::uuid'))
+assert.ok(selectedInventoryQuery.sql.includes(
+  'run.location_mapping_id = $4::uuid',
+))
+assert.deepEqual(
+  JSON.parse(JSON.stringify(selectedInventoryQuery.values)),
+  [
+    previewOrganizationId,
+    '22222222-2222-4222-8222-222222222222',
+    '44444444-4444-4444-8444-444444444444',
+    '55555555-5555-4555-8555-555555555555',
+  ],
+  'Inventory evidence must be scoped to the exact account, selected warehouse, and current active mapping',
+)
+
+const mappingAmbiguity = loadPersistence({
+  mappingRows: [{
+    id: '55555555-5555-4555-8555-555555555555',
+    warehouse_id: '44444444-4444-4444-8444-444444444444',
+  }, {
+    id: '77777777-7777-4777-8777-777777777777',
+    warehouse_id: '44444444-4444-4444-8444-444444444444',
+  }],
+})
+await assert.rejects(
+  () => mappingAmbiguity.loaded
+    .readCartonizationPreviewSnapshotFromPostgres({
+      organizationId: previewOrganizationId,
+      request: normalized,
+    }),
+  (error) => (
+    error.code === 'CARTONIZATION_PREVIEW_LOCATION_MAPPING_AMBIGUOUS'
+  ),
+)
+
+const carrierConfigAmbiguity = loadPersistence({
+  carrierConfigRows: [{
+    warehouse_id: '44444444-4444-4444-8444-444444444444',
+  }, {
+    warehouse_id: '88888888-8888-4888-8888-888888888888',
+  }],
+})
+await assert.rejects(
+  () => carrierConfigAmbiguity.loaded
+    .readCartonizationPreviewSnapshotFromPostgres({
+      organizationId: previewOrganizationId,
+      request: normalized,
+    }),
+  (error) => (
+    error.code === 'CARTONIZATION_PREVIEW_CARRIER_CONFIG_AMBIGUOUS'
+  ),
+)
+
+const warehouseAuthorityConflict = loadPersistence({
+  carrierConfigRows: [{
+    warehouse_id: '88888888-8888-4888-8888-888888888888',
+  }],
+})
+await assert.rejects(
+  () => warehouseAuthorityConflict.loaded
+    .readCartonizationPreviewSnapshotFromPostgres({
+      organizationId: previewOrganizationId,
+      request: normalized,
+    }),
+  (error) => (
+    error.code === 'CARTONIZATION_PREVIEW_WAREHOUSE_AUTHORITY_CONFLICT'
+  ),
+)
+
+const selectedWarehouseMismatch = loadPersistence({
+  mappingRows: [{
+    id: '55555555-5555-4555-8555-555555555555',
+    warehouse_id: '88888888-8888-4888-8888-888888888888',
+  }],
+  carrierConfigRows: [{
+    warehouse_id: '88888888-8888-4888-8888-888888888888',
+  }],
+})
+await assert.rejects(
+  () => selectedWarehouseMismatch.loaded
+    .readCartonizationPreviewSnapshotFromPostgres({
+      organizationId: previewOrganizationId,
+      request: normalized,
+    }),
+  (error) => (
+    error.code === 'CARTONIZATION_PREVIEW_WAREHOUSE_AUTHORITY_MISMATCH'
+  ),
+)
+
 const persistence = read(
   'app_src/lib/persistence/cartonizationPreview.ts',
 )
@@ -670,12 +1038,22 @@ for (const fragment of [
   'line.pack_profile_version_row_version',
   'pack_mapping.global_id',
   'pack_version.global_id',
+  'operations_commerce_inventory_location_mappings',
+  'operations_shopify_carrier_service_configs',
+  'mapping.warehouse_id = $3::uuid',
+  'run.warehouse_id = $3::uuid',
+  'run.location_mapping_id = $4::uuid',
 ]) {
   assert.ok(
     persistence.includes(fragment),
     `Cartonization persistence missing ${fragment}`,
   )
 }
+assert.equal(
+  persistence.includes('readActiveWarehouses'),
+  false,
+  'Fit preview must not fall back to an organization-wide active warehouse count',
+)
 assert.match(
   persistence,
   /ORDER BY\s+run\.provider_fetched_at DESC,\s+run\.completed_at DESC,\s+run\.id DESC/,
@@ -733,6 +1111,7 @@ for (const fragment of [
   'packing documents must remain grouped',
   'inventoryEvidence.products',
   'blocked until exactly one inventory position is resolved',
+  'warehouseGlobalId: selectedCartonizationWarehouseGlobalId',
 ]) {
   assert.ok(
     workflow.includes(fragment),

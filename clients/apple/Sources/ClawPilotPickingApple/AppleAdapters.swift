@@ -172,6 +172,31 @@ public struct ClawPilotSessionProfile: Decodable, Equatable, Sendable {
     }
 }
 
+public struct GoogleAuthState: Decodable, Equatable, Sendable {
+    public struct Identity: Decodable, Equatable, Sendable {
+        public let linked: Bool
+        public let email: String
+        public let linkedAt: String?
+    }
+
+    public let organizationId: String
+    public let organizationName: String
+    public let enabled: Bool
+    public let rowVersion: Int
+    public let canManage: Bool
+    public let platformConfigured: Bool
+    public let webClientId: String?
+    public let identity: Identity
+    public let impersonating: Bool?
+}
+
+public struct GoogleIdentityLinkState: Decodable, Equatable, Sendable {
+    public let linked: Bool
+    public let email: String
+    public let linkedAt: String
+    public let alreadyLinked: Bool
+}
+
 public struct ManagerOrderSummary: Decodable, Equatable, Identifiable, Sendable {
     public let id: String
     public let globalId: String
@@ -295,6 +320,25 @@ public actor PickingAPIClient {
         let error: String?
     }
 
+    private struct GooglePolicyEnvelope: Decodable {
+        let ok: Bool
+        let policy: GoogleAuthState?
+        let code: String?
+        let error: String?
+    }
+
+    private struct GoogleLinkEnvelope: Decodable {
+        let ok: Bool
+        let identity: GoogleIdentityLinkState?
+        let code: String?
+        let error: String?
+    }
+
+    private struct GoogleLinkBody: Encodable {
+        let idToken: String
+        let expectedPolicyRowVersion: Int
+    }
+
     private struct WorkspaceSwitchBody: Encodable {
         let action: String
         let organizationId: String
@@ -339,6 +383,14 @@ public actor PickingAPIClient {
         let orderGlobalId: String
         let expectedRowVersion: Int
         let reason: String
+        let scanEvidenceIdempotencyKey: String?
+    }
+
+    private struct ScanEvidenceBody: Encodable {
+        let action: String
+        let orderGlobalId: String
+        let expectedRowVersion: Int
+        let scanEvidence: [PickTaskScanEvidence]
     }
 
     public nonisolated let webOrigin: URL
@@ -346,7 +398,7 @@ public actor PickingAPIClient {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
-    public init(origin: URL, session: URLSession = .shared, allowDebugHTTP: Bool = false) throws {
+    public init(origin: URL, session: URLSession? = nil, allowDebugHTTP: Bool = false) throws {
         guard origin.path.isEmpty || origin.path == "/",
               origin.query == nil,
               origin.fragment == nil,
@@ -356,7 +408,15 @@ public actor PickingAPIClient {
             throw PickingAPIError.invalidOrigin
         }
         self.webOrigin = origin
-        self.session = session
+        if let session {
+            self.session = session
+        } else {
+            let configuration = URLSessionConfiguration.default
+            configuration.httpShouldSetCookies = true
+            configuration.httpCookieStorage = .shared
+            HTTPCookieStorage.shared.cookieAcceptPolicy = .always
+            self.session = URLSession(configuration: configuration)
+        }
         encoder.dateEncodingStrategy = .iso8601
         decoder.dateDecodingStrategy = .iso8601
     }
@@ -377,6 +437,55 @@ public actor PickingAPIClient {
             path: "/api/auth/google/native",
             body: ["idToken": idToken]
         )
+    }
+
+    public func fetchGoogleAuthState() async throws -> GoogleAuthState {
+        var request = URLRequest(url: try endpoint("/api/auth/google/policy"))
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await session.data(for: request)
+        try validateHTTP(response)
+        let envelope = try decoder.decode(GooglePolicyEnvelope.self, from: data)
+        guard envelope.ok, let policy = envelope.policy else {
+            throw PickingAPIError.rejected(
+                code: envelope.code ?? "GOOGLE_SSO_POLICY_UNAVAILABLE",
+                message: envelope.error ?? "Google sign-in settings are unavailable"
+            )
+        }
+        return policy
+    }
+
+    public func linkGoogleIdentityToken(
+        _ idToken: String,
+        expectedPolicyRowVersion: Int,
+        idempotencyKey: String
+    ) async throws -> GoogleIdentityLinkState {
+        var request = URLRequest(url: try endpoint("/api/auth/google/link"))
+        request.httpMethod = "POST"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
+        request.httpBody = try encoder.encode(GoogleLinkBody(
+            idToken: idToken,
+            expectedPolicyRowVersion: expectedPolicyRowVersion
+        ))
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw PickingAPIError.invalidResponse
+        }
+        if http.statusCode == 401 { throw PickingAPIError.unauthorized }
+        if http.statusCode == 429 {
+            let seconds = Int(http.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 60
+            throw PickingAPIError.rateLimited(retryAfterSeconds: max(1, seconds))
+        }
+        let envelope = try decoder.decode(GoogleLinkEnvelope.self, from: data)
+        guard (200..<300).contains(http.statusCode), envelope.ok, let identity = envelope.identity else {
+            throw PickingAPIError.rejected(
+                code: envelope.code ?? "GOOGLE_SSO_LINK_UNAVAILABLE",
+                message: envelope.error ?? "Google account linking is unavailable"
+            )
+        }
+        return identity
     }
 
     public func fetchSessionProfile() async throws -> ClawPilotSessionProfile {
@@ -540,7 +649,8 @@ public actor PickingAPIClient {
             action: command.action,
             orderGlobalId: command.orderGlobalId,
             expectedRowVersion: command.expectedRowVersion,
-            reason: command.reason
+            reason: command.reason,
+            scanEvidenceIdempotencyKey: command.scanEvidenceIdempotencyKey
         ))
         let (data, response) = try await session.data(for: request)
         try validateHTTP(response)
@@ -553,6 +663,31 @@ public actor PickingAPIClient {
         }
     }
 
+    public func recordScanEvidence(_ command: ConfirmPicksCommand) async throws {
+        guard let idempotencyKey = command.scanEvidenceIdempotencyKey,
+              let scanEvidence = command.scanEvidence,
+              !scanEvidence.isEmpty else { return }
+        var request = URLRequest(url: try endpoint("/api/operations"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
+        request.httpBody = try encoder.encode(ScanEvidenceBody(
+            action: "record-pick-scan-evidence",
+            orderGlobalId: command.orderGlobalId,
+            expectedRowVersion: command.expectedRowVersion,
+            scanEvidence: scanEvidence
+        ))
+        let (data, response) = try await session.data(for: request)
+        try validateHTTP(response)
+        let envelope = try decoder.decode(BasicEnvelope.self, from: data)
+        guard envelope.ok else {
+            throw PickingAPIError.rejected(
+                code: envelope.code ?? "OPERATIONS_WEARABLE_SCAN_EVIDENCE_FAILED",
+                message: envelope.error ?? "Scan evidence could not be acknowledged"
+            )
+        }
+    }
+
     private func postAuth(path: String, body: [String: String]) async throws {
         var request = URLRequest(url: try endpoint(path))
         request.httpMethod = "POST"
@@ -560,6 +695,7 @@ public actor PickingAPIClient {
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await session.data(for: request)
         try validateHTTP(response)
+        persistResponseCookies(response)
         let envelope = try decoder.decode(BasicEnvelope.self, from: data)
         guard envelope.ok else {
             throw PickingAPIError.rejected(
@@ -567,6 +703,20 @@ public actor PickingAPIClient {
                 message: envelope.error ?? "Authentication failed"
             )
         }
+    }
+
+    private func persistResponseCookies(_ response: URLResponse) {
+        guard let http = response as? HTTPURLResponse,
+              let responseURL = http.url,
+              let storage = session.configuration.httpCookieStorage else { return }
+        let fields = http.allHeaderFields.reduce(into: [String: String]()) { result, entry in
+            guard let key = entry.key as? String else { return }
+            result[key] = String(describing: entry.value)
+        }
+        let cookies = HTTPCookie.cookies(withResponseHeaderFields: fields, for: responseURL)
+        guard !cookies.isEmpty else { return }
+        storage.cookieAcceptPolicy = .always
+        storage.setCookies(cookies, for: responseURL, mainDocumentURL: webOrigin)
     }
 
     private func managerOrderCommand(

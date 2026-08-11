@@ -163,13 +163,15 @@ private struct LoginGateView: View {
                         .foregroundStyle(AppShellTheme.muted)
                 }
                 Spacer()
-                Text("DEV")
-                    .font(.caption2.weight(.bold))
-                    .tracking(0.8)
-                    .foregroundStyle(AppShellTheme.primary)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
-                    .background(AppShellTheme.primary.opacity(0.12), in: Capsule())
+                if let environmentLabel = model.environmentLabel {
+                    Text(environmentLabel)
+                        .font(.caption2.weight(.bold))
+                        .tracking(0.8)
+                        .foregroundStyle(AppShellTheme.primary)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(AppShellTheme.primary.opacity(0.12), in: Capsule())
+                }
             }
 
             if model.isLocallyLocked {
@@ -380,13 +382,15 @@ private struct ModuleHomeView: View {
                     .foregroundStyle(AppShellTheme.muted)
             }
             Spacer()
-            Text("DEV")
-                .font(.caption2.weight(.bold))
-                .tracking(0.8)
-                .foregroundStyle(AppShellTheme.primary)
-                .padding(.horizontal, 9)
-                .padding(.vertical, 5)
-                .background(AppShellTheme.primary.opacity(0.12), in: Capsule())
+            if let environmentLabel = model.environmentLabel {
+                Text(environmentLabel)
+                    .font(.caption2.weight(.bold))
+                    .tracking(0.8)
+                    .foregroundStyle(AppShellTheme.primary)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(AppShellTheme.primary.opacity(0.12), in: Capsule())
+            }
         }
     }
 
@@ -415,6 +419,53 @@ private struct ModuleHomeView: View {
                 Text(model.biometricStatus)
                     .font(.caption2)
                     .foregroundStyle(AppShellTheme.muted)
+            }
+
+            if model.googleSSOAvailable {
+                Divider()
+                    .overlay(AppShellTheme.outline)
+                    .padding(.vertical, 3)
+
+                HStack(spacing: 8) {
+                    Label("Google sign-in", systemImage: "person.badge.key.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(AppShellTheme.text)
+                    Spacer()
+                    if let state = model.googleAuthState {
+                        Text(state.identity.linked ? "LINKED" : "NOT LINKED")
+                            .font(.caption2.weight(.bold))
+                            .tracking(0.6)
+                            .foregroundStyle(state.identity.linked ? AppShellTheme.mint : AppShellTheme.muted)
+                    }
+                }
+
+                Text(model.googleLinkStatus)
+                    .font(.caption2)
+                    .foregroundStyle(AppShellTheme.muted)
+
+                if let state = model.googleAuthState,
+                   state.platformConfigured,
+                   state.enabled,
+                   !state.identity.linked {
+                    Button {
+                        Task { await model.linkCurrentGoogleAccount() }
+                    } label: {
+                        HStack(spacing: 8) {
+                            if model.isGoogleLinkBusy { ProgressView() }
+                            Text("Link my Google account")
+                            Image(systemName: "arrow.up.right.square")
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(ShellSecondaryButtonStyle())
+                    .disabled(model.isGoogleLinkBusy)
+                } else if model.googleAuthState == nil {
+                    Button("Refresh Google status") {
+                        Task { await model.refreshGoogleAuthState() }
+                    }
+                    .font(.caption.weight(.semibold))
+                    .disabled(model.isGoogleLinkBusy)
+                }
             }
         }
         .padding(16)

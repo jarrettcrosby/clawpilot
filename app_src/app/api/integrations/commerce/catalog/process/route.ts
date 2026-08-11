@@ -1,6 +1,9 @@
 import crypto from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
-import { commerceIntakeRuntimeAvailable } from '@/lib/integrations/commerceIntake'
+import {
+  commerceReadRuntimeAvailable,
+  commerceReadRuntimeMode,
+} from '@/lib/integrations/commerceIntake'
 import { processCommerceCatalogSyncOutbox } from '@/lib/commerceCatalogSyncWorker'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
@@ -31,11 +34,11 @@ export async function POST(req: NextRequest) {
       { status: 401 },
     )
   }
-  if (!commerceIntakeRuntimeAvailable()) {
+  if (!commerceReadRuntimeAvailable()) {
     return NextResponse.json({
       ok: true,
       skipped: true,
-      reason: 'commerce-intake-disabled',
+      reason: 'commerce-read-reconciliation-disabled',
     })
   }
   if (!isPostgresStorageEnabled()) {
@@ -56,6 +59,9 @@ export async function POST(req: NextRequest) {
   await recordCommerceCatalogWorkerHeartbeatInPostgres({
     phase: 'started',
     workerId,
+    runtimeMode: commerceReadRuntimeMode?.() || null,
+    providerReadOnly: true,
+    providerWrites: 0,
   })
   const result = await processCommerceCatalogSyncOutbox({
     limit: body.limit,
@@ -65,6 +71,9 @@ export async function POST(req: NextRequest) {
     phase: 'completed',
     workerId,
     ...result,
+    runtimeMode: commerceReadRuntimeMode?.() || null,
+    providerReadOnly: true,
+    providerWrites: 0,
   })
   return NextResponse.json({
     ok: true,

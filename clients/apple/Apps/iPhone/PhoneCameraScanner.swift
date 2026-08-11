@@ -2,7 +2,7 @@ import SwiftUI
 import VisionKit
 
 struct PhoneCameraScanner: UIViewControllerRepresentable {
-    let onBarcode: @MainActor (String) -> Void
+    let onBarcode: @MainActor (String) async -> Bool
     let onClose: @MainActor () -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
@@ -41,10 +41,13 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
             accepted = true
             dataScanner.stopScanning()
             Task { @MainActor in
-                parent.onBarcode(value)
-                parent.onClose()
+                if await parent.onBarcode(value) {
+                    accepted = false
+                    try? dataScanner.startScanning()
+                } else {
+                    parent.onClose()
+                }
             }
         }
     }
 }
-

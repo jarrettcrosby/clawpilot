@@ -10,6 +10,7 @@ import {
   sanitizedCarrierIntegrationError,
   setCarrierAccountStatus,
   setCarrierIntegrationEnabled,
+  setCarrierProductionLabelEnabled,
   testCarrierSandboxRate,
   testCarrierCredential,
   updateCarrierAccount,
@@ -745,6 +746,38 @@ export async function PATCH(req: NextRequest) {
         provider: body.provider,
         environment: body.environment,
         enabled: body.enabled,
+        actorEmail: actor.email,
+      })
+      return json({ ok: true, canManage: true, integrations })
+    }
+    if (action === 'set-production-label-enabled') {
+      only(body, [
+        'action', 'provider', 'enabled', 'reason', 'confirmation',
+      ])
+      requireCredentialViewer(actor)
+      const capabilities = operationsCapabilities(actor)
+      if (!capabilities.canActivate) {
+        throw new CarrierIntegrationRequestError(
+          'Operations activation permission is required to authorize live postage',
+          403,
+          'CARRIER_PRODUCTION_LABEL_AUTHORIZATION_FORBIDDEN',
+        )
+      }
+      if (
+        body.enabled === true
+        && body.confirmation !== 'AUTHORIZE LIVE POSTAGE'
+      ) {
+        throw new CarrierIntegrationRequestError(
+          'Type AUTHORIZE LIVE POSTAGE to enable production label purchase',
+          400,
+          'CARRIER_PRODUCTION_LABEL_CONFIRMATION_REQUIRED',
+        )
+      }
+      const integrations = await setCarrierProductionLabelEnabled({
+        organizationId: organization,
+        provider: body.provider,
+        enabled: body.enabled,
+        reason: plainText(body.reason, 'Authorization reason', 500),
         actorEmail: actor.email,
       })
       return json({ ok: true, canManage: true, integrations })

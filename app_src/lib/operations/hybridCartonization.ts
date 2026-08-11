@@ -76,6 +76,7 @@ export type HybridCartonizationMinimumOverride = {
 
 export type HybridCartonizationMaterial = {
   materialGlobalId: string
+  materialType?: 'carton' | 'poly_mailer' | 'padded_mailer'
   capturedRowVersion: number
   currentRowVersion: number
   isCurrent: boolean
@@ -95,6 +96,11 @@ export type HybridCartonizationMaterial = {
   dimensionEvidenceReference: string | null
   dimensionConfirmedAt: string | null
   tareWeightGrams: number | null
+  unitCostMinor?: number | null
+  currency?: string | null
+  stockRowVersion?: number | null
+  stockOnHandQuantity?: number | null
+  activeClaimedQuantity?: number
   /**
    * Optional planning fences supplied by the caller. When present, carton
    * construction must honor them; they are not post-plan advisory checks.

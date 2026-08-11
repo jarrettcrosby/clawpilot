@@ -12,6 +12,11 @@ import {
   hasEffectiveShopifyScope,
 } from '@/lib/integrations/commerceCapabilities'
 import {
+  commerceReadCredentialEligible,
+  commerceReadRuntimeAvailable,
+  commerceReadRuntimeMode,
+} from '@/lib/integrations/commerceReadRuntime'
+import {
   getFaireProduct,
   getFaireOrder,
   listFaireInventory,
@@ -437,15 +442,23 @@ type IntakeCommandAction =
   | 'validate'
 
 export function commerceIntakeRuntimeAvailable() {
-  if (process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED !== '1') return false
-  const lane = String(
-    process.env.CLAWPILOT_ENV
-    || process.env.RAILWAY_ENVIRONMENT_NAME
-    || process.env.VERCEL_ENV
-    || process.env.NODE_ENV
-    || '',
-  ).trim().toLowerCase()
-  return ['dev', 'development', 'local', 'preview'].includes(lane)
+  return commerceReadRuntimeMode() === 'development'
+}
+
+export function shopifyTestOrderSearchConstraint(
+  runtime: Pick<
+    CommerceRuntimeCredentialRecord,
+    'environment' | 'provider' | 'status' | 'verificationStatus'
+  >,
+) {
+  const includeTestOrders = (
+    commerceIntakeRuntimeAvailable()
+    && runtime.provider === 'shopify'
+    && runtime.environment === 'sandbox'
+    && runtime.status === 'active'
+    && runtime.verificationStatus === 'verified'
+  )
+  return includeTestOrders ? '' : 'test:false '
 }
 
 export function assertCommerceIntakeRuntime() {
@@ -456,17 +469,7 @@ export function assertCommerceIntakeRuntime() {
       'COMMERCE_INTAKE_DISABLED',
     )
   }
-  const lane = String(
-    process.env.CLAWPILOT_ENV
-    || process.env.RAILWAY_ENVIRONMENT_NAME
-    || process.env.VERCEL_ENV
-    || process.env.NODE_ENV
-    || '',
-  ).trim().toLowerCase()
-  if (
-    !commerceIntakeRuntimeAvailable()
-    && !['dev', 'development', 'local', 'preview'].includes(lane)
-  ) {
+  if (commerceReadRuntimeMode() !== 'development') {
     throw new CommerceIntegrationRequestError(
       'Commerce intake is restricted to development environments',
       403,
@@ -474,6 +477,18 @@ export function assertCommerceIntakeRuntime() {
     )
   }
 }
+
+export function assertCommerceReadRuntime() {
+  if (!commerceReadRuntimeAvailable()) {
+    throw new CommerceIntegrationRequestError(
+      'Commerce read and reconciliation workers are not enabled in this environment',
+      404,
+      'COMMERCE_READ_RECONCILIATION_DISABLED',
+    )
+  }
+}
+
+export { commerceReadRuntimeAvailable, commerceReadRuntimeMode }
 
 function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -1283,7 +1298,7 @@ function normalizationContext(
 async function runtimeFor(input: {
   organizationId: unknown
   accountGlobalId: unknown
-}) {
+}, options: { reconciliationRead?: boolean } = {}) {
   const organizationId = normalizeCommerceOrganizationId(input.organizationId)
   const accountGlobalId = normalizeCommerceAccountGlobalId(input.accountGlobalId)
   const runtime = await readCommerceRuntimeCredentialFromPostgres({
@@ -1304,6 +1319,18 @@ async function runtimeFor(input: {
       'COMMERCE_INTAKE_CONNECTION_ERROR',
     )
   }
+  if (
+    options.reconciliationRead
+    && !commerceReadCredentialEligible(runtime)
+  ) {
+    throw new CommerceIntegrationRequestError(
+      commerceReadRuntimeMode() === 'production'
+        ? 'Production reconciliation requires an active verified production commerce account'
+        : 'The commerce connection is not eligible for reconciliation reads',
+      409,
+      'COMMERCE_READ_ACCOUNT_INELIGIBLE',
+    )
+  }
   return runtime
 }
 
@@ -1312,6 +1339,8 @@ async function shopifyEnvelope(
   page: OperationalPageRequest,
   targetExternalOrderId: string | null = null,
 ): Promise<OperationalPageResult> {
+  const testOrderSearchConstraint = shopifyTestOrderSearchConstraint(runtime)
+  const testOrdersAllowed = testOrderSearchConstraint === ''
   const credential = decryptCommerceCredential(
     runtime.encrypted,
     runtime.organizationId,
@@ -1380,7 +1409,7 @@ async function shopifyEnvelope(
           operationName: 'ClawPilotCommerceOrders',
           variables: {
             after: page.orderCursor,
-            query: `test:false status:open${currentOrderWindow} updated_at:<='${page.windowEnd}'`,
+            query: `${testOrderSearchConstraint}status:open${currentOrderWindow} updated_at:<='${page.windowEnd}'`,
           },
         },
         { timeoutMs: SHOPIFY_GRAPHQL_TIMEOUT_MS },
@@ -1395,6 +1424,16 @@ async function shopifyEnvelope(
           : []
       )
     : providerNodes(connection, 'Shopify orders')
+  if (
+    !testOrdersAllowed
+    && orderNodes.some((order) => order.test === true)
+  ) {
+    throw new CommerceIntegrationRequestError(
+      'Shopify test orders require an active verified sandbox connection in a development intake runtime',
+      409,
+      'COMMERCE_INTAKE_SHOPIFY_TEST_ORDER_RESTRICTED',
+    )
+  }
   const nextOrderCursor = targetExternalOrderId
     ? null
     : nextShopifyCursor(connection, 'Shopify orders')
@@ -2685,6 +2724,7 @@ type ExecuteCommerceIntakeInput = {
 type CommerceIntakeExecutionOptions = {
   includeIntakeState: boolean
   hydrateProductInventory: boolean
+  runtimeAuthority?: 'development_interactive' | 'read_reconciliation'
   providerAttemptActorEmail?: string | null
   expectedCredentialVersion?: number
   refreshTargetExpectation?: {
@@ -2700,7 +2740,9 @@ async function executeCommerceIntakeCommandInternal(
   input: ExecuteCommerceIntakeInput,
   options: CommerceIntakeExecutionOptions,
 ) {
-  assertCommerceIntakeRuntime()
+  const reconciliationRead = options.runtimeAuthority === 'read_reconciliation'
+  if (reconciliationRead) assertCommerceReadRuntime()
+  else assertCommerceIntakeRuntime()
   const commandAction = action(input.body.action)
   const key = idempotencyKey(input.body.idempotencyKey)
   if (commandAction === 'reset-order-reconciliation') {
@@ -2850,7 +2892,7 @@ async function executeCommerceIntakeCommandInternal(
   const runtime = await runtimeFor({
     organizationId: input.organizationId,
     accountGlobalId: input.body.accountGlobalId,
-  })
+  }, { reconciliationRead })
   if (
     options.expectedCredentialVersion !== undefined
     && (
@@ -3054,31 +3096,40 @@ async function executeCommerceIntakeCommandInternal(
           action: commandAction,
         },
       )
-      const commandWithCustomers = await withAutomaticCustomerResolution(
-        commandWithProducts,
-        {
-          runtime,
-          actorEmail: input.actorEmail,
-          action: commandAction,
-        },
+      const automaticOrderHooksEnabled = !(
+        reconciliationRead
+        && commerceReadRuntimeMode() === 'production'
       )
-      const commandWithShopifyPromotion =
-        await withAutomaticShopifyOrderPromotion(
-          commandWithCustomers,
-          {
-            runtime,
-            actorEmail: input.actorEmail,
-            action: commandAction,
-          },
-        )
-      const command = await withAutomaticFaireOrderPromotion(
-        commandWithShopifyPromotion,
-        {
-          runtime,
-          actorEmail: input.actorEmail,
-          action: commandAction,
-        },
-      )
+      const commandWithCustomers = automaticOrderHooksEnabled
+        ? await withAutomaticCustomerResolution(
+            commandWithProducts,
+            {
+              runtime,
+              actorEmail: input.actorEmail,
+              action: commandAction,
+            },
+          )
+        : commandWithProducts
+      const commandWithShopifyPromotion = automaticOrderHooksEnabled
+        ? await withAutomaticShopifyOrderPromotion(
+            commandWithCustomers,
+            {
+              runtime,
+              actorEmail: input.actorEmail,
+              action: commandAction,
+            },
+          )
+        : commandWithCustomers
+      const command = automaticOrderHooksEnabled
+        ? await withAutomaticFaireOrderPromotion(
+            commandWithShopifyPromotion,
+            {
+              runtime,
+              actorEmail: input.actorEmail,
+              action: commandAction,
+            },
+          )
+        : commandWithShopifyPromotion
       return {
         command,
         intake: options.includeIntakeState
@@ -3332,33 +3383,40 @@ async function executeCommerceIntakeCommandInternal(
         action: commandAction,
       },
     )
-    const commandWithAutomaticResolution =
-      await withAutomaticCustomerResolution(
-        commandWithAutomaticCreation,
-        {
-          runtime,
-          actorEmail: input.actorEmail,
-          action: commandAction,
-        },
-      )
-    const commandWithAutomaticShopifyPromotion =
-      await withAutomaticShopifyOrderPromotion(
-        commandWithAutomaticResolution,
-        {
-          runtime,
-          actorEmail: input.actorEmail,
-          action: commandAction,
-        },
-      )
-    const commandWithAutomaticPromotion =
-      await withAutomaticFaireOrderPromotion(
-        commandWithAutomaticShopifyPromotion,
-        {
-          runtime,
-          actorEmail: input.actorEmail,
-          action: commandAction,
-        },
-      )
+    const automaticOrderHooksEnabled = !(
+      reconciliationRead
+      && commerceReadRuntimeMode() === 'production'
+    )
+    const commandWithAutomaticResolution = automaticOrderHooksEnabled
+      ? await withAutomaticCustomerResolution(
+          commandWithAutomaticCreation,
+          {
+            runtime,
+            actorEmail: input.actorEmail,
+            action: commandAction,
+          },
+        )
+      : commandWithAutomaticCreation
+    const commandWithAutomaticShopifyPromotion = automaticOrderHooksEnabled
+      ? await withAutomaticShopifyOrderPromotion(
+          commandWithAutomaticResolution,
+          {
+            runtime,
+            actorEmail: input.actorEmail,
+            action: commandAction,
+          },
+        )
+      : commandWithAutomaticResolution
+    const commandWithAutomaticPromotion = automaticOrderHooksEnabled
+      ? await withAutomaticFaireOrderPromotion(
+          commandWithAutomaticShopifyPromotion,
+          {
+            runtime,
+            actorEmail: input.actorEmail,
+            action: commandAction,
+          },
+        )
+      : commandWithAutomaticShopifyPromotion
     return {
       command: commandWithAutomaticPromotion,
       intake: options.includeIntakeState
@@ -3768,6 +3826,7 @@ export async function executeCommerceCatalogProductPage(input: {
     includeIntakeState: false,
     // Product reconciliation deliberately does not query or stage inventory.
     hydrateProductInventory: false,
+    runtimeAuthority: 'read_reconciliation',
   })
 }
 
@@ -3803,6 +3862,7 @@ export async function executeCommerceOrderPage(input: {
     // Provider-attempt attribution is nullable for an unattended system read;
     // never borrow a historical human merely to satisfy optional evidence.
     providerAttemptActorEmail: null,
+    runtimeAuthority: 'read_reconciliation',
   })
 }
 
@@ -3861,5 +3921,6 @@ export async function executeCommerceFaireOrderExactRefresh(input: {
       sourceHash: input.sourceHash,
     },
     afterStageBeforeAutomaticHooks: input.afterStageBeforeAutomaticHooks,
+    runtimeAuthority: 'read_reconciliation',
   })
 }

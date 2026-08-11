@@ -23,8 +23,8 @@ const VOID_ENDPOINTS = {
   fedex_rest: 'https://apis-sandbox.fedex.com/ship/v1/shipments/cancel',
 } as const
 
-type SandboxLabelProvider = keyof typeof LABEL_ENDPOINTS
-type SandboxBillingRelationship = 'sender' | 'recipient' | 'third_party'
+export type SandboxLabelProvider = keyof typeof LABEL_ENDPOINTS
+export type SandboxBillingRelationship = 'sender' | 'recipient' | 'third_party'
 export type CarrierLabelOutputFormat = 'ZPL' | 'PDF' | 'PNG'
 export type CarrierSandboxLabelOutputOption = {
   format: CarrierLabelOutputFormat
@@ -33,8 +33,17 @@ export type CarrierSandboxLabelOutputOption = {
   providerImageType: 'ZPL' | 'ZPLII' | 'PDF' | 'PNG'
   providerStockType: 'HEIGHT_6_WIDTH_4' | 'STOCK_4X6' | 'PAPER_4X6'
 }
-export type CarrierSandboxLabelShipmentFixture = CarrierSandboxRateFixture
-type CarrierSandboxLabelRuntime = CarrierRuntimeCredential & {
+export type CarrierSandboxLabelShipmentFixture = Omit<
+  CarrierSandboxRateFixture,
+  'destination'
+> & {
+  destination: CarrierSandboxRateFixture['destination'] & {
+    // Legacy sandbox diagnostics predate address-type selection. New one-off
+    // shipment inputs require this explicitly before reaching the adapter.
+    residential?: boolean
+  }
+}
+export type CarrierSandboxLabelRuntime = CarrierRuntimeCredential & {
   billingRelationship?: SandboxBillingRelationship
   billingSelectionSnapshot?: Record<string, unknown>
   shipmentFixture?: CarrierSandboxLabelShipmentFixture
@@ -416,13 +425,18 @@ function normalizeShipmentFixture(
   const fixture = record(value)
   return {
     origin: fixtureAddress(fixture.origin, 'The sandbox origin'),
-    destination: fixtureAddress(fixture.destination, 'The sandbox destination'),
+    destination: {
+      ...fixtureAddress(fixture.destination, 'The sandbox destination'),
+      // Legacy sandbox fixtures predate the explicit address-type contract.
+      // They remain commercial; every new one-off quote supplies this field.
+      residential: record(fixture.destination).residential === true,
+    },
     parcel: fixtureParcel(fixture.parcel),
   }
 }
 
 function fixtureParty(
-  address: CarrierSandboxRateFixture['origin'],
+  address: CarrierSandboxRateFixture['origin'] & { residential?: boolean },
   phoneNumber: string,
 ) {
   return {
@@ -435,6 +449,7 @@ function fixtureParty(
       StateProvinceCode: address.region,
       PostalCode: address.postalCode,
       CountryCode: address.countryCode,
+      ...(address.residential ? { ResidentialAddressIndicator: '' } : {}),
     },
   }
 }
@@ -561,14 +576,16 @@ function fedexContact(name: string, phoneNumber: string) {
   }
 }
 
-function fedexAddress(address: CarrierSandboxRateFixture['origin']) {
+function fedexAddress(
+  address: CarrierSandboxRateFixture['origin'] & { residential?: boolean },
+) {
   return {
     streetLines: [address.line1, ...(address.line2 ? [address.line2] : [])],
     city: address.city,
     stateOrProvinceCode: address.region,
     postalCode: address.postalCode,
     countryCode: address.countryCode,
-    residential: false,
+    residential: address.residential === true,
   }
 }
 
@@ -898,8 +915,14 @@ function parseFedexCreate(
   }
 }
 
-async function readProviderPayload(response: Response) {
-  const limit = 2 * 1024 * 1024
+async function readProviderPayload(
+  response: Response,
+  maximumBytes = 2 * 1024 * 1024,
+) {
+  const limit = Math.max(
+    64 * 1024,
+    Math.min(maximumBytes, 24 * 1024 * 1024),
+  )
   const contentLength = Number(response.headers.get('content-length') || 0)
   if (Number.isFinite(contentLength) && contentLength > limit) {
     throw new CarrierSandboxLabelError(
@@ -1157,4 +1180,20 @@ export async function voidCarrierSandboxLabel(
 
 export function carrierSandboxLabelEndpoints() {
   return { create: LABEL_ENDPOINTS, void: VOID_ENDPOINTS }
+}
+
+/**
+ * Request construction and response parsing are shared with the production
+ * adapter.  They are intentionally auth-free; environment selection and
+ * provider I/O remain in the two public executors.
+ */
+export const carrierLabelAdapterInternals = {
+  labelOutputOption,
+  serviceCode,
+  normalizeShipmentFixture,
+  upsCreateRequest,
+  fedexCreateRequest,
+  parseUpsCreate,
+  parseFedexCreate,
+  readProviderPayload,
 }

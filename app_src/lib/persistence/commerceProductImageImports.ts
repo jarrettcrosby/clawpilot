@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
+import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
 import {
   CRM_PRODUCT_IMAGE_MAX_BYTES,
   validateCrmProductImage,
@@ -806,7 +807,9 @@ async function accountCredentialIsCurrent(
          AND account.id = $2::uuid
          AND account.integration_type = 'commerce'
          AND account.provider = $3
-         AND account.status = 'active'
+         AND ${commerceReadAccountSql('account', {
+           developmentRequiresActive: true,
+         })}
          AND account.commerce_credential_generation = $4
          AND credential.credential_version = $4
          AND credential.verification_status = 'verified'

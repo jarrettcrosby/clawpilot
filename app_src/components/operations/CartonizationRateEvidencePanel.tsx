@@ -51,7 +51,10 @@ type EvidenceQuote = {
 type EvidencePackage = {
   packageKey: string
   packageSequence: number
-  planningMethod: 'approved_recipe' | 'or_tools'
+  planningMethod:
+    | 'approved_recipe'
+    | 'or_tools'
+    | 'sandbox_fixed_axis'
   packagingMaterialGlobalId: string
   packagingMaterialName: string
   approvedPackRecipeGlobalId: string | null
@@ -109,6 +112,7 @@ type CartonizationRateEvidence = {
   }
   inventorySyncRunGlobalId: string | null
   evidenceMode: 'operational' | 'assumption_backed_sandbox'
+  requiredCarrierProviders: Array<'ups_rest' | 'fedex_rest'>
   policyVersion: string
   algorithmVersion: string
   planInputHash: string
@@ -159,9 +163,16 @@ function providerLabel(provider: EvidenceQuote['provider']) {
 
 function planningMethodLabel(
   method: EvidencePackage['planningMethod'],
+  evidenceMode: CartonizationRateEvidence['evidenceMode'],
 ) {
-  return method === 'approved_recipe'
-    ? 'Customer-approved pack recipe'
+  if (method === 'approved_recipe') {
+    return 'Customer-approved pack recipe'
+  }
+  if (method === 'sandbox_fixed_axis') {
+    return 'Sandbox fixed-axis comparison'
+  }
+  return evidenceMode === 'assumption_backed_sandbox'
+    ? 'Sandbox OR-Tools comparison'
     : 'OR-Tools geometry'
 }
 
@@ -448,7 +459,8 @@ export default function CartonizationRateEvidencePanel({
             </Stack>
             <Typography variant="body2" color="text.secondary">
               Reloadable evidence joins one exact order candidate to its
-              carton plan and read-only UPS and FedEx rate responses.
+              carton plan and the exact enabled UPS/FedEx sandbox rate
+              responses retained for that comparison.
             </Typography>
           </Box>
           <Button
@@ -777,9 +789,14 @@ export default function CartonizationRateEvidencePanel({
                         size="small"
                         color={item.planningMethod === 'approved_recipe'
                           ? 'info'
-                          : 'secondary'}
+                          : evidence.evidenceMode === 'assumption_backed_sandbox'
+                            ? 'warning'
+                            : 'secondary'}
                         variant="outlined"
-                        label={planningMethodLabel(item.planningMethod)}
+                        label={planningMethodLabel(
+                          item.planningMethod,
+                          evidence.evidenceMode,
+                        )}
                       />
                     </Stack>
 
@@ -800,6 +817,16 @@ export default function CartonizationRateEvidencePanel({
                             {recipe.productGlobalId}
                           </Typography>
                         ))}
+                      </Alert>
+                    ) : item.planningMethod
+                      === 'sandbox_fixed_axis' ? (
+                      <Alert severity="warning">
+                        One exact mapped product pack per parcel passed a
+                        fixed-axis fit check against the retained material
+                        dimensions and their recorded basis. Carrier rating
+                        used the separately entered sandbox exterior and tare
+                        assumptions. This is not an OR-Tools operational pack
+                        plan.
                       </Alert>
                     ) : (
                       <Alert severity="info">

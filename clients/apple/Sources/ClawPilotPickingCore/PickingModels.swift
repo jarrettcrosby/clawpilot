@@ -9,6 +9,11 @@ public struct PickTask: Codable, Equatable, Identifiable, Sendable {
     public let productImageURL: URL?
     public let barcode: String?
     public let locationCode: String
+    public let warehouseGlobalId: String?
+    public let locationGlobalId: String?
+    public let locationBarcode: String?
+    public let locationScanRequired: Bool?
+    public let locationScanPolicyRowVersion: Int?
     public let quantity: Double
 
     public var id: String { pickTaskGlobalId }
@@ -22,6 +27,11 @@ public struct PickTask: Codable, Equatable, Identifiable, Sendable {
         productImageURL: URL? = nil,
         barcode: String?,
         locationCode: String,
+        warehouseGlobalId: String? = nil,
+        locationGlobalId: String? = nil,
+        locationBarcode: String? = nil,
+        locationScanRequired: Bool? = nil,
+        locationScanPolicyRowVersion: Int? = nil,
         quantity: Double
     ) throws {
         guard pickTaskGlobalId.range(of: #"^gpk(?:[0-9]{7}|[0-9a-v]{12})$"#, options: .regularExpression) != nil,
@@ -30,6 +40,21 @@ public struct PickTask: Codable, Equatable, Identifiable, Sendable {
               !productName.isEmpty,
               !channelSku.isEmpty,
               !locationCode.isEmpty,
+              locationScanRequired != true || (
+                warehouseGlobalId?.range(
+                    of: #"^gwh(?:[0-9]{7}|[0-9a-v]{12})$"#,
+                    options: .regularExpression
+                ) != nil
+                && locationGlobalId?.range(
+                    of: #"^gwl(?:[0-9]{7}|[0-9a-v]{12})$"#,
+                    options: .regularExpression
+                ) != nil
+                && locationBarcode?.range(
+                    of: #"^CP1L-GWL(?:[0-9]{7}|[0-9A-V]{12})$"#,
+                    options: .regularExpression
+                ) != nil
+                && (locationScanPolicyRowVersion ?? 0) > 0
+              ),
               quantity > 0 else {
             throw PickingContractError.invalidTask
         }
@@ -41,6 +66,11 @@ public struct PickTask: Codable, Equatable, Identifiable, Sendable {
         self.productImageURL = productImageURL
         self.barcode = barcode
         self.locationCode = locationCode
+        self.warehouseGlobalId = warehouseGlobalId
+        self.locationGlobalId = locationGlobalId
+        self.locationBarcode = locationBarcode
+        self.locationScanRequired = locationScanRequired
+        self.locationScanPolicyRowVersion = locationScanPolicyRowVersion
         self.quantity = quantity
     }
 }
@@ -102,11 +132,11 @@ public struct PickQueue: Codable, Equatable, Sendable {
 }
 
 public enum BarcodeSource: String, Codable, Equatable, Sendable {
-    case metaGlasses = "meta_glasses"
+    case metaGlasses = "meta"
     case iPhoneCamera = "iphone_camera"
 }
 
-public struct BarcodeObservation: Equatable, Sendable {
+public struct BarcodeObservation: Codable, Equatable, Sendable {
     public let value: String
     public let source: BarcodeSource
     public let capturedAt: Date
@@ -121,6 +151,41 @@ public struct BarcodeObservation: Equatable, Sendable {
     }
 }
 
+public struct PickScanObservationEvidence: Codable, Equatable, Sendable {
+    public let barcode: String
+    public let capturedAt: Date
+    public let source: BarcodeSource
+
+    public init(_ observation: BarcodeObservation) {
+        barcode = observation.value
+        capturedAt = observation.capturedAt
+        source = observation.source
+    }
+}
+
+public struct PickTaskScanEvidence: Codable, Equatable, Sendable {
+    public let pickTaskGlobalId: String
+    public let policyRowVersion: Int
+    public let location: PickScanObservationEvidence
+    public let product: PickScanObservationEvidence
+
+    public init(
+        task: PickTask,
+        location: BarcodeObservation,
+        product: BarcodeObservation
+    ) throws {
+        guard task.locationScanRequired == true,
+              let policyRowVersion = task.locationScanPolicyRowVersion,
+              policyRowVersion > 0 else {
+            throw PickingContractError.contextMismatch
+        }
+        pickTaskGlobalId = task.pickTaskGlobalId
+        self.policyRowVersion = policyRowVersion
+        self.location = PickScanObservationEvidence(location)
+        self.product = PickScanObservationEvidence(product)
+    }
+}
+
 public enum PickingContractError: Error, Equatable, Sendable {
     case invalidTask
     case invalidOrder
@@ -128,9 +193,27 @@ public enum PickingContractError: Error, Equatable, Sendable {
     case invalidBarcode
     case missingBarcode
     case barcodeMismatch
+    case missingLocationBarcode
+    case locationBarcodeMismatch
+    case productBarcodeMismatch
     case staleQueue
     case incompleteOrder
     case contextMismatch
+}
+
+public enum PickScanStage: String, Codable, Equatable, Sendable {
+    case location
+    case product
+}
+
+public struct PickScanAcceptance: Equatable, Sendable {
+    public let task: PickTask
+    public let stage: PickScanStage
+
+    public init(task: PickTask, stage: PickScanStage) {
+        self.task = task
+        self.stage = stage
+    }
 }
 
 public enum BarcodeMatcher {
@@ -154,8 +237,30 @@ public struct WatchPickCard: Codable, Equatable, Sendable {
     public let channelSku: String?
     public let productImageURL: URL?
     public let locationCode: String
+    public let locationBarcode: String?
+    public let locationScanRequired: Bool?
     public let quantity: Double
     public let progress: String
+
+    public init(
+        productName: String,
+        channelSku: String?,
+        productImageURL: URL?,
+        locationCode: String,
+        locationBarcode: String? = nil,
+        locationScanRequired: Bool? = nil,
+        quantity: Double,
+        progress: String
+    ) {
+        self.productName = productName
+        self.channelSku = channelSku
+        self.productImageURL = productImageURL
+        self.locationCode = locationCode
+        self.locationBarcode = locationBarcode
+        self.locationScanRequired = locationScanRequired
+        self.quantity = quantity
+        self.progress = progress
+    }
 }
 
 public struct WatchPickSnapshot: Codable, Equatable, Sendable {
@@ -185,23 +290,71 @@ public struct WatchPickCommand: Codable, Equatable, Sendable {
     }
 }
 
+public struct WatchPickCommandResult: Codable, Equatable, Sendable {
+    public let schemaVersion: Int
+    public let commandId: String
+    public let action: WatchPickAction
+    public let succeeded: Bool
+    public let message: String
+    public let completedAt: Date
+
+    public init(
+        command: WatchPickCommand,
+        succeeded: Bool,
+        message: String,
+        completedAt: Date = Date()
+    ) {
+        schemaVersion = 1
+        commandId = command.id
+        action = command.action
+        self.succeeded = succeeded
+        self.message = String(message.prefix(240))
+        self.completedAt = completedAt
+    }
+}
+
+public enum WatchConnectivityPayloadBudget {
+    // Keep current-state transfers below a conservative 60 KiB ceiling so
+    // the snapshot, command result, keys, and a thumbnail all fit together.
+    public static let maximumApplicationContextBytes = 60 * 1_024
+    public static let maximumProductImageBytes = 40 * 1_024
+    public static let reservedNonImageBytes = 16 * 1_024
+
+    public static func fits(productImageBytes: Int, nonImageBytes: Int) -> Bool {
+        productImageBytes >= 0
+            && nonImageBytes >= 0
+            && productImageBytes + nonImageBytes <= maximumApplicationContextBytes
+    }
+}
+
 public struct ConfirmPicksCommand: Codable, Equatable, Sendable {
     public let action: String
     public let orderGlobalId: String
     public let expectedRowVersion: Int
     public let reason: String
     public let idempotencyKey: String
+    public let scanEvidenceIdempotencyKey: String?
+    public let scanEvidence: [PickTaskScanEvidence]?
 
-    public init(order: PickOrder, idempotencyKey: String = UUID().uuidString.lowercased()) {
+    public init(
+        order: PickOrder,
+        scanEvidence: [PickTaskScanEvidence] = [],
+        idempotencyKey: String = UUID().uuidString.lowercased()
+    ) {
         action = "confirm-picks"
         orderGlobalId = order.orderGlobalId
         expectedRowVersion = order.rowVersion
         reason = "Voice-assisted wearable pick confirmation"
         self.idempotencyKey = "wearable-pick:\(idempotencyKey)"
+        self.scanEvidenceIdempotencyKey = scanEvidence.isEmpty
+            ? nil
+            : "wearable-scan:\(idempotencyKey)"
+        self.scanEvidence = scanEvidence.isEmpty ? nil : scanEvidence
     }
 
     private enum CodingKeys: String, CodingKey {
         case action, orderGlobalId, expectedRowVersion, reason, idempotencyKey
+        case scanEvidenceIdempotencyKey, scanEvidence
     }
 
     public init(from decoder: Decoder) throws {
@@ -215,5 +368,16 @@ public struct ConfirmPicksCommand: Codable, Equatable, Sendable {
         expectedRowVersion = try values.decode(Int.self, forKey: .expectedRowVersion)
         reason = try values.decode(String.self, forKey: .reason)
         idempotencyKey = try values.decode(String.self, forKey: .idempotencyKey)
+        scanEvidenceIdempotencyKey = try values.decodeIfPresent(
+            String.self,
+            forKey: .scanEvidenceIdempotencyKey
+        )
+        scanEvidence = try values.decodeIfPresent(
+            [PickTaskScanEvidence].self,
+            forKey: .scanEvidence
+        )
+        guard (scanEvidenceIdempotencyKey == nil) == (scanEvidence == nil) else {
+            throw PickingContractError.contextMismatch
+        }
     }
 }

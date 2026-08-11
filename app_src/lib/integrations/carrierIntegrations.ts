@@ -50,6 +50,7 @@ import {
   readCarrierIntegrationsStateFromPostgres,
   readCarrierRuntimeCredentialFromPostgres,
   setCarrierAccountStatusInPostgres,
+  setCarrierProductionLabelCapabilityInPostgres,
   setCarrierIntegrationEnabledInPostgres,
   updateCarrierAccountInPostgres,
   writeCarrierSandboxRateEvidenceInPostgres,
@@ -269,7 +270,7 @@ export async function revealCarrierCredential(input: {
 
 function requiresConfiguredCapability(
   runtime: Pick<Awaited<ReturnType<typeof storedRuntimeCredential>>, 'configuration'>,
-  capability: 'sandbox_rate' | 'sandbox_label' | 'production_rate',
+  capability: 'sandbox_rate' | 'sandbox_label' | 'production_rate' | 'production_label',
 ) {
   const configured = runtime.configuration.allowedCapabilities
   if (isSourceManagedCarrierConfiguration(runtime.configuration)) {
@@ -280,7 +281,9 @@ function requiresConfiguredCapability(
           ? 'This managed carrier rating connection requires repair'
           : capability === 'production_rate'
             ? 'This managed carrier connection is not authorized for production rating'
-            : 'This carrier connection is authorized for sandbox rating only',
+            : capability === 'production_label'
+              ? 'Managed carrier delegation never authorizes live postage purchase'
+              : 'This carrier connection is authorized for sandbox rating only',
         403,
         'CARRIER_CAPABILITY_NOT_AUTHORIZED',
       )
@@ -288,9 +291,11 @@ function requiresConfiguredCapability(
     return
   }
   if (!Array.isArray(configured)) {
-    if (capability !== 'production_rate') return
+    if (capability !== 'production_rate' && capability !== 'production_label') return
     throw new CarrierIntegrationRequestError(
-      'This carrier connection is not authorized for production rating',
+      capability === 'production_label'
+        ? 'This carrier connection is not authorized for live label purchase'
+        : 'This carrier connection is not authorized for production rating',
       403,
       'CARRIER_CAPABILITY_NOT_AUTHORIZED',
     )
@@ -301,7 +306,9 @@ function requiresConfiguredCapability(
         ? 'This carrier connection is not authorized for sandbox rating'
         : capability === 'production_rate'
           ? 'This carrier connection is not authorized for production rating'
-          : 'This carrier connection is authorized for sandbox rating only',
+          : capability === 'production_label'
+            ? 'This carrier connection is not authorized for live label purchase'
+            : 'This carrier connection is authorized for sandbox rating only',
       403,
       'CARRIER_CAPABILITY_NOT_AUTHORIZED',
     )
@@ -614,9 +621,10 @@ export type CarrierSandboxShippingRuntime = {
   integrationAccountId: string
   integrationGlobalId: string
   credentialVersion: number
+  credentialFingerprint: string
   provider: 'ups_rest' | 'fedex_rest'
   environment: 'sandbox'
-  credential: CarrierRuntimeCredential['credential']
+  credential: CarrierRuntimeCredential['credential'] & { accountNumber: string }
   carrierAccountId: string
   carrierAccountGlobalId: string
   carrierAccountDisplayName: string
@@ -737,6 +745,179 @@ export async function resolveCarrierProductionRatingRuntime(input: {
       accountNumberFingerprint: account.accountNumberFingerprint,
       billingRelationship: 'sender',
     }
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
+/**
+ * Resolve a production Ship binding. `production_label` is deliberately a
+ * second capability in addition to read-only `production_rate`; reconnecting
+ * or verifying a production credential never silently authorizes postage.
+ */
+export async function resolveCarrierProductionShippingRuntime(input: {
+  organizationId: unknown
+  provider: unknown
+  integrationAccountGlobalId: unknown
+  carrierAccountGlobalId: unknown
+}): Promise<CarrierProductionRatingRuntime> {
+  try {
+    const organizationId = normalizeCarrierOrganizationId(input.organizationId)
+    const provider = normalizeDirectCarrierProvider(input.provider)
+    const runtime = await storedRuntimeCredential({
+      organizationId,
+      provider,
+      environment: 'production',
+    })
+    if (runtime.status !== 'active' || !runtime.verified) {
+      throw new CarrierIntegrationRequestError(
+        'The selected production carrier credential is not active and verified',
+        409,
+        'CARRIER_CREDENTIAL_INACTIVE',
+      )
+    }
+    requiresConfiguredCapability(runtime, 'production_label')
+    return await resolveCarrierProductionRatingRuntime(input)
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
+/**
+ * Resolve the exact account needed to cancel an already purchased one-off
+ * shipment. Revoking the purchase capability must stop new postage, but must
+ * not strand a paid label. Cancellation therefore requires a current active,
+ * verified credential and the same active sender account without rechecking
+ * the label-purchase capability flag.
+ */
+export async function resolveCarrierOneOffVoidRuntime(input: {
+  organizationId: unknown
+  provider: unknown
+  environment: unknown
+  integrationAccountGlobalId: unknown
+  carrierAccountGlobalId: unknown
+}): Promise<CarrierSandboxShippingRuntime | (CarrierProductionRatingRuntime & {
+  billingSelectionSnapshot: Record<string, unknown>
+})> {
+  try {
+    const organizationId = normalizeCarrierOrganizationId(input.organizationId)
+    const provider = normalizeDirectCarrierProvider(input.provider)
+    const environment = normalizeCarrierEnvironment(input.environment)
+    if (provider !== 'ups_rest' && provider !== 'fedex_rest') {
+      throw new CarrierIntegrationRequestError(
+        'Whole-shipment cancellation is available only for UPS and FedEx',
+        409,
+        'CARRIER_ONE_OFF_VOID_UNSUPPORTED',
+      )
+    }
+    const integrationAccountGlobalId = String(
+      input.integrationAccountGlobalId || '',
+    ).trim()
+    const carrierAccountGlobalId = normalizeCarrierAccountGlobalId(
+      input.carrierAccountGlobalId,
+    )
+    const runtime = await storedRuntimeCredential({
+      organizationId,
+      provider,
+      environment,
+    })
+    if (
+      runtime.integrationGlobalId !== integrationAccountGlobalId
+      || runtime.status !== 'active'
+      || !runtime.verified
+    ) {
+      throw new CarrierIntegrationRequestError(
+        'Reconnect and verify the original carrier credential before cancelling this shipment',
+        409,
+        'CARRIER_ONE_OFF_VOID_CREDENTIAL_UNAVAILABLE',
+      )
+    }
+    const accounts = await readActiveCarrierAccountsFromPostgres({
+      organizationId,
+      integrationAccountId: runtime.integrationAccountId,
+    })
+    const account = accounts.find(
+      (candidate) => candidate.globalId === carrierAccountGlobalId,
+    )
+    if (!account || !account.allowSenderBilling) {
+      throw new CarrierIntegrationRequestError(
+        'Restore the original active sender account before cancelling this shipment',
+        409,
+        'CARRIER_ONE_OFF_VOID_ACCOUNT_UNAVAILABLE',
+      )
+    }
+    const accountNumber = decryptCarrierAccountNumber(
+      account.encrypted,
+      organizationId,
+      provider,
+      environment,
+      account.globalId,
+    )
+    const common = {
+      organizationId,
+      integrationAccountId: runtime.integrationAccountId,
+      integrationGlobalId: runtime.integrationGlobalId,
+      credentialVersion: runtime.credentialVersion,
+      credentialFingerprint: runtime.credentialFingerprint,
+      provider,
+      environment,
+      credential: { ...runtime.credential, accountNumber },
+      carrierAccountId: account.id,
+      carrierAccountGlobalId: account.globalId,
+      carrierAccountDisplayName: account.displayName,
+      accountNumberLastFour: account.accountNumberLastFour,
+      accountNumberFingerprint: account.accountNumberFingerprint,
+      billingRelationship: 'sender' as const,
+      billingSelectionSnapshot: {
+        mode: 'original_one_off_shipment_account',
+        carrierAccountGlobalId: account.globalId,
+        registeredAddressFingerprint: account.registeredAddressFingerprint,
+      },
+    }
+    return environment === 'production'
+      ? {
+          ...common,
+          environment,
+          senderName: account.senderName,
+          registeredAddress: account.registeredAddress,
+          registeredAddressFingerprint: account.registeredAddressFingerprint,
+        }
+      : { ...common, environment }
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
+export async function setCarrierProductionLabelEnabled(input: {
+  organizationId: unknown
+  provider: unknown
+  enabled: unknown
+  reason: unknown
+  actorEmail: string
+}) {
+  try {
+    const organizationId = normalizeCarrierOrganizationId(input.organizationId)
+    const provider = normalizeDirectCarrierProvider(input.provider)
+    if (provider !== 'ups_rest' && provider !== 'fedex_rest') {
+      throw new CarrierIntegrationRequestError(
+        'Live postage is available only for UPS and FedEx production connections',
+        409,
+        'CARRIER_PRODUCTION_LABEL_UNSUPPORTED',
+      )
+    }
+    const reason = String(input.reason || '').trim()
+    if (typeof input.enabled !== 'boolean' || reason.length < 3 || reason.length > 500) {
+      throw new CarrierIntegrationRequestError(
+        'A valid live-postage authorization decision and reason are required',
+      )
+    }
+    return await setCarrierProductionLabelCapabilityInPostgres({
+      organizationId,
+      provider,
+      enabled: input.enabled,
+      reason,
+      actorEmail: input.actorEmail,
+    })
   } catch (error) {
     throw sanitize(error)
   }
@@ -911,6 +1092,7 @@ export async function resolveCarrierSandboxShippingRuntime(input: {
       integrationAccountId: runtime.integrationAccountId,
       integrationGlobalId: runtime.integrationGlobalId,
       credentialVersion: runtime.credentialVersion,
+      credentialFingerprint: runtime.credentialFingerprint,
       provider,
       environment: 'sandbox',
       credential: { ...runtime.credential, accountNumber },

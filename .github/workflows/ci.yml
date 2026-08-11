@@ -19,6 +19,9 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    # Normal validation completes in roughly six minutes. Bound an abnormal
+    # stall so one wedged test cannot consume an unbounded Actions budget.
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v5
