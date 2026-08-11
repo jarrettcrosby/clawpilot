@@ -339,6 +339,7 @@ for (const requiredPath of [
   'db/migrations/0257_google_sso_sessions.sql',
   'db/migrations/0258_operations_one_off_shipments.sql',
   'db/migrations/0259_operations_cartonization_enabled_carriers.sql',
+  'db/migrations/0267_operations_commerce_inventory_content_addressing.sql',
   'app_src/app/api/operations/one-off-shipments/route.ts',
   'app_src/lib/operations/oneOffShipments.ts',
   'app_src/lib/persistence/oneOffShipments.ts',

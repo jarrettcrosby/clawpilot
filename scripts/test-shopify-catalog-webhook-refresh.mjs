@@ -245,7 +245,11 @@ const receiptPersistenceModule = loadTypeScriptModule(
           'products/update',
         ],
         SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS: [
+          'inventory_items/create',
+          'inventory_items/delete',
           'inventory_items/update',
+          'inventory_levels/connect',
+          'inventory_levels/disconnect',
           'inventory_levels/update',
         ],
         SHOPIFY_RECEIPT_PROOF_SCOPES: [

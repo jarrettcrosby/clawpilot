@@ -647,6 +647,68 @@ for (const fragment of [
     `Shopify inventory migration missing ${fragment}`,
   )
 }
+const inventoryContentMigration = read(
+  'db/migrations/0267_operations_commerce_inventory_content_addressing.sql',
+)
+const inventoryAdapterSource = read(
+  'app_src/lib/integrations/shopifyInventory.ts',
+)
+const maxLevelPages = Number(
+  inventoryAdapterSource.match(/const MAX_LEVEL_PAGES = (\d+)/)?.[1],
+)
+assert.equal(maxLevelPages, 400)
+assert.ok(
+  inventoryContentMigration.includes(
+    `provider_page_count BETWEEN 1 AND ${maxLevelPages}`,
+  ),
+  'Stored provider page-count bound must match the Shopify adapter bound',
+)
+assert.match(
+  inventoryContentMigration,
+  /operations_inventory_captures_provider_page_count_valid[\s\S]*?CHECK \([\s\S]*?provider_page_count BETWEEN 1 AND 400[\s\S]*?\) NOT VALID/,
+  'Provider page-count validation must protect new writes without scanning historical captures',
+)
+assert.match(
+  inventoryContentMigration,
+  /operations_commerce_inventory_captures_snapshot_content_fkey[\s\S]*?ON DELETE RESTRICT NOT VALID/,
+  'Capture-content FK must protect new writes without scanning historical captures',
+)
+assert.match(
+  inventoryContentMigration,
+  /operations_commerce_inventory_captures_storage_mode_valid[\s\S]*?\) NOT VALID/,
+  'Capture storage-mode validation must protect new writes without scanning historical captures',
+)
+for (const fragment of [
+  'operations_commerce_inventory_snapshot_contents',
+  "AND NOT snapshot_content ? 'fetchedAt'",
+  "AND NOT snapshot_content ? 'pageCount'",
+  "snapshot_content->>'snapshotHash' = snapshot_hash",
+  "snapshot_content#>>'{location,id}' = provider_location_id",
+  'jsonb_array_length(snapshot_content->\'levels\') = level_count',
+  'operations_commerce_inventory_snapshot_contents_hash_unique',
+  'snapshot_content_id uuid',
+  'provider_page_count integer',
+  ') ON DELETE RESTRICT NOT VALID',
+  'operations_commerce_inventory_captures_storage_mode_valid',
+  ') NOT VALID;',
+  'validate_operations_commerce_inventory_capture_content',
+  'content.provider = NEW.provider',
+  'content.adapter_version = NEW.adapter_version',
+  'content.provider_location_id = NEW.provider_location_id',
+  'content.snapshot_hash = NEW.snapshot_hash',
+  'content.level_count = NEW.level_count',
+  'Strict cross-row validation applies only to the',
+]) {
+  assert.ok(
+    inventoryContentMigration.includes(fragment),
+    `Inventory content-addressing migration missing ${fragment}`,
+  )
+}
+assert.ok(
+  !inventoryContentMigration.includes('evidence_sync_run_id')
+    && !inventoryContentMigration.includes('evidence_mode'),
+  'Content addressing must not change sync-run or level identity semantics',
+)
 const inventoryPersistence = read(
   'app_src/lib/persistence/commerceInventory.ts',
 )
@@ -685,6 +747,100 @@ assert.ok(
     && !inventoryPersistence.includes('0n'),
   'Inventory projection must compile for the repository ES2017 target',
 )
+for (const fragment of [
+  'inventorySnapshotContent',
+  'capturedSnapshotFromStorage',
+  'operations_commerce_inventory_snapshot_contents',
+  'ON CONFLICT (',
+  'snapshot_content = $7::jsonb',
+  'content_bytes = $8',
+  'captured_snapshot, snapshot_content_id, provider_page_count',
+  'capture.snapshot_content_id',
+]) {
+  assert.ok(
+    inventoryPersistence.includes(fragment),
+    `Inventory content-addressing persistence missing ${fragment}`,
+  )
+}
+assert.ok(
+  !inventoryPersistence.includes('evidence_sync_run_id')
+    && !inventoryPersistence.includes('reusedEvidence'),
+  'Persistence must retain one complete run-scoped level set per refresh',
+)
+
+const contentHelpers = loadTypeScriptModule(
+  'app_src/lib/persistence/commerceInventory.ts',
+  {
+    mocks: {
+      '@/lib/auditWriter': { async recordAuditEvent() {} },
+      '@/lib/integrations/commerceReadRuntime': {
+        commerceReadAccountSql() { return 'TRUE' },
+      },
+      '@/lib/integrations/shopifyInventory': {
+        SHOPIFY_INVENTORY_ADAPTER_VERSION:
+          'shopify-admin-graphql-inventory-v1',
+      },
+      '@/lib/operations/shopifyInventoryProjection': {
+        projectShopifyInventoryBalance() {
+          throw new Error('Projection is not used by content helper tests')
+        },
+      },
+      '@/lib/persistence/commerceIntegrations': {},
+      '@/lib/persistence/postgres': {},
+    },
+  },
+)
+const firstContent = contentHelpers.inventorySnapshotContent(firstSnapshot)
+const reverseContent = contentHelpers.inventorySnapshotContent(reverseSnapshot)
+assert.equal(Object.hasOwn(firstContent, 'fetchedAt'), false)
+assert.equal(Object.hasOwn(firstContent, 'pageCount'), false)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(firstContent)),
+  JSON.parse(JSON.stringify(reverseContent)),
+  'Equivalent snapshots must canonicalize to identical stored content',
+)
+assert.equal(
+  firstContent.levels.map((level) => level.inventoryItemId).join('\n'),
+  [...firstContent.levels]
+    .map((level) => level.inventoryItemId)
+    .sort((left, right) => left.localeCompare(right))
+    .join('\n'),
+  'Stored snapshot levels must use deterministic inventory-item order',
+)
+const reconstructed = contentHelpers.capturedSnapshotFromStorage({
+  capturedSnapshot: null,
+  snapshotContent: firstContent,
+  providerFetchedAt: '2026-08-11T12:34:56.000Z',
+  providerPageCount: 7,
+})
+assert.equal(reconstructed.fetchedAt, '2026-08-11T12:34:56.000Z')
+assert.equal(reconstructed.pageCount, 7)
+assert.equal(reconstructed.snapshotHash, firstSnapshot.snapshotHash)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(reconstructed.levels)),
+  JSON.parse(JSON.stringify(firstContent.levels)),
+)
+const inlineCapture = contentHelpers.capturedSnapshotFromStorage({
+  capturedSnapshot: firstSnapshot,
+  snapshotContent: null,
+  providerFetchedAt: '2026-08-11T12:34:56.000Z',
+  providerPageCount: null,
+})
+assert.equal(inlineCapture, firstSnapshot)
+
+const refreshPostgresAcceptance = read(
+  'scripts/test-shopify-inventory-refresh-postgres.mjs',
+)
+for (const fragment of [
+  'source.captured_snapshot',
+  'source.snapshot_content_id',
+  'source.provider_page_count',
+]) {
+  assert.ok(
+    refreshPostgresAcceptance.includes(fragment),
+    `Inventory refresh capture fixture missing ${fragment}`,
+  )
+}
 const inventoryOrchestration = read(
   'app_src/lib/integrations/commerceInventory.ts',
 )

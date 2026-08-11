@@ -563,7 +563,11 @@ const SHOPIFY_WEBHOOK_SUBSCRIPTIONS_QUERY = `query ClawPilotWebhookSubscriptions
 
 const SHOPIFY_WEBHOOK_TOPIC_ENUMS = {
   'app/scopes_update': 'APP_SCOPES_UPDATE',
+  'inventory_items/create': 'INVENTORY_ITEMS_CREATE',
+  'inventory_items/delete': 'INVENTORY_ITEMS_DELETE',
   'inventory_items/update': 'INVENTORY_ITEMS_UPDATE',
+  'inventory_levels/connect': 'INVENTORY_LEVELS_CONNECT',
+  'inventory_levels/disconnect': 'INVENTORY_LEVELS_DISCONNECT',
   'inventory_levels/update': 'INVENTORY_LEVELS_UPDATE',
   'products/create': 'PRODUCTS_CREATE',
   'products/delete': 'PRODUCTS_DELETE',

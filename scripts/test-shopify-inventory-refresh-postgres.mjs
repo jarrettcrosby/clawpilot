@@ -463,6 +463,8 @@ async function insertLeaseFixture(
          provider_fetched_at,
          level_count,
          captured_snapshot,
+         snapshot_content_id,
+         provider_page_count,
          snapshot_bytes,
          created_by
        )
@@ -481,6 +483,8 @@ async function insertLeaseFixture(
          source.provider_fetched_at,
          source.level_count,
          source.captured_snapshot,
+         source.snapshot_content_id,
+         source.provider_page_count,
          source.snapshot_bytes,
          source.created_by
        FROM operations_commerce_inventory_captures source

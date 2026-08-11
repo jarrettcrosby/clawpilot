@@ -800,6 +800,40 @@ function capturedSnapshot(value: unknown): ShopifyInventorySnapshot {
   return value as ShopifyInventorySnapshot
 }
 
+export function inventorySnapshotContent(
+  snapshot: ShopifyInventorySnapshot,
+): Omit<ShopifyInventorySnapshot, 'fetchedAt' | 'pageCount'> {
+  return {
+    location: snapshot.location,
+    levels: [...snapshot.levels].sort((left, right) => (
+      left.inventoryItemId.localeCompare(right.inventoryItemId)
+    )),
+    enrichment: snapshot.enrichment,
+    snapshotHash: snapshot.snapshotHash,
+  }
+}
+
+export function capturedSnapshotFromStorage(input: {
+  capturedSnapshot: unknown
+  snapshotContent: unknown
+  providerFetchedAt: Date | string
+  providerPageCount: number | null
+}) {
+  if (input.capturedSnapshot) return capturedSnapshot(input.capturedSnapshot)
+  if (
+    !input.snapshotContent
+    || typeof input.snapshotContent !== 'object'
+    || Array.isArray(input.snapshotContent)
+  ) {
+    return capturedSnapshot(input.snapshotContent)
+  }
+  return capturedSnapshot({
+    ...input.snapshotContent,
+    fetchedAt: new Date(input.providerFetchedAt).toISOString(),
+    pageCount: input.providerPageCount,
+  })
+}
+
 export async function readShopifyInventoryCaptureFromPostgres(input: {
   runtime: CommerceRuntimeCredentialRecord
   attempt: ShopifyInventoryAttempt
@@ -808,12 +842,21 @@ export async function readShopifyInventoryCaptureFromPostgres(input: {
     id: string
     global_id: string
     captured_snapshot: unknown
+    snapshot_content: unknown
+    provider_fetched_at: Date | string
+    provider_page_count: number | null
   }>(
-    `SELECT id::text, global_id, captured_snapshot
-     FROM operations_commerce_inventory_captures
-     WHERE organization_id = $1::uuid
-       AND integration_account_id = $2::uuid
-       AND provider_attempt_id = $3::uuid
+    `SELECT capture.id::text, capture.global_id,
+            capture.captured_snapshot, content.snapshot_content,
+            capture.provider_fetched_at, capture.provider_page_count
+     FROM operations_commerce_inventory_captures capture
+     LEFT JOIN operations_commerce_inventory_snapshot_contents content
+       ON content.organization_id = capture.organization_id
+      AND content.integration_account_id = capture.integration_account_id
+      AND content.id = capture.snapshot_content_id
+     WHERE capture.organization_id = $1::uuid
+       AND capture.integration_account_id = $2::uuid
+       AND capture.provider_attempt_id = $3::uuid
      LIMIT 1`,
     [
       input.runtime.organizationId,
@@ -832,7 +875,12 @@ export async function readShopifyInventoryCaptureFromPostgres(input: {
   return {
     id: row.id,
     globalId: row.global_id,
-    snapshot: capturedSnapshot(row.captured_snapshot),
+    snapshot: capturedSnapshotFromStorage({
+      capturedSnapshot: row.captured_snapshot,
+      snapshotContent: row.snapshot_content,
+      providerFetchedAt: row.provider_fetched_at,
+      providerPageCount: row.provider_page_count,
+    }),
   }
 }
 
@@ -853,6 +901,9 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
   }
   const serialized = JSON.stringify(input.snapshot)
   const snapshotBytes = Buffer.byteLength(serialized, 'utf8')
+  const content = inventorySnapshotContent(input.snapshot)
+  const serializedContent = JSON.stringify(content)
+  const contentBytes = Buffer.byteLength(serializedContent, 'utf8')
   if (snapshotBytes < 2 || snapshotBytes > 16 * 1024 * 1024) {
     persistenceError(
       'SHOPIFY_INVENTORY_CAPTURE_SIZE_INVALID',
@@ -876,13 +927,22 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
       request_hash: string
       snapshot_hash: string
       captured_snapshot: unknown
+      snapshot_content: unknown
+      provider_fetched_at: Date | string
+      provider_page_count: number | null
     }>(
-      `SELECT id::text, global_id, request_hash, snapshot_hash,
-              captured_snapshot
-       FROM operations_commerce_inventory_captures
-       WHERE organization_id = $1::uuid
-         AND integration_account_id = $2::uuid
-         AND provider_attempt_id = $3::uuid
+      `SELECT capture.id::text, capture.global_id,
+              capture.request_hash, capture.snapshot_hash,
+              capture.captured_snapshot, content.snapshot_content,
+              capture.provider_fetched_at, capture.provider_page_count
+       FROM operations_commerce_inventory_captures capture
+       LEFT JOIN operations_commerce_inventory_snapshot_contents content
+         ON content.organization_id = capture.organization_id
+        AND content.integration_account_id = capture.integration_account_id
+        AND content.id = capture.snapshot_content_id
+       WHERE capture.organization_id = $1::uuid
+         AND capture.integration_account_id = $2::uuid
+         AND capture.provider_attempt_id = $3::uuid
        LIMIT 1`,
       [
         input.runtime.organizationId,
@@ -905,7 +965,12 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
       return {
         id: row.id,
         globalId: row.global_id,
-        snapshot: capturedSnapshot(row.captured_snapshot),
+        snapshot: capturedSnapshotFromStorage({
+          capturedSnapshot: row.captured_snapshot,
+          snapshotContent: row.snapshot_content,
+          providerFetchedAt: row.provider_fetched_at,
+          providerPageCount: row.provider_page_count,
+        }),
       }
     }
     const lease = await client.query(
@@ -937,6 +1002,62 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
         409,
       )
     }
+    await client.query(
+      `INSERT INTO operations_commerce_inventory_snapshot_contents (
+         organization_id, integration_account_id, provider, adapter_version,
+         provider_location_id, snapshot_hash, level_count,
+         snapshot_content, content_bytes, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, 'shopify', $3, $4, $5, $6,
+         $7::jsonb, $8, $9
+       )
+       ON CONFLICT (
+         organization_id, integration_account_id, provider_location_id,
+         adapter_version, snapshot_hash
+       ) DO NOTHING`,
+      [
+        input.runtime.organizationId,
+        input.runtime.integrationAccountId,
+        SHOPIFY_INVENTORY_ADAPTER_VERSION,
+        input.snapshot.location.id,
+        input.snapshot.snapshotHash,
+        input.snapshot.levels.length,
+        serializedContent,
+        contentBytes,
+        input.actorEmail,
+      ],
+    )
+    const storedContent = await client.query<{ id: string }>(
+      `SELECT id::text
+       FROM operations_commerce_inventory_snapshot_contents
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND provider = 'shopify'
+         AND adapter_version = $3
+         AND provider_location_id = $4
+         AND snapshot_hash = $5
+         AND level_count = $6
+         AND snapshot_content = $7::jsonb
+         AND content_bytes = $8
+       LIMIT 1`,
+      [
+        input.runtime.organizationId,
+        input.runtime.integrationAccountId,
+        SHOPIFY_INVENTORY_ADAPTER_VERSION,
+        input.snapshot.location.id,
+        input.snapshot.snapshotHash,
+        input.snapshot.levels.length,
+        serializedContent,
+        contentBytes,
+      ],
+    )
+    if (!storedContent.rows[0]) {
+      persistenceError(
+        'SHOPIFY_INVENTORY_SNAPSHOT_HASH_CONFLICT',
+        'The Shopify inventory snapshot hash matched different durable content',
+        409,
+      )
+    }
     const inserted = await client.query<{
       id: string
       global_id: string
@@ -946,11 +1067,12 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
          warehouse_id, location_id, provider, adapter_version,
          credential_version, request_hash, snapshot_hash,
          provider_location_id, provider_fetched_at, level_count,
-         captured_snapshot, snapshot_bytes, created_by
+         captured_snapshot, snapshot_content_id, provider_page_count,
+         snapshot_bytes, created_by
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 'shopify',
          $6, $7, $8, $9, $10, $11::timestamptz, $12, $13::jsonb,
-         $14, $15
+         $14::uuid, $15, $16, $17
        )
        RETURNING id::text, global_id`,
       [
@@ -966,7 +1088,9 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
         input.snapshot.location.id,
         input.snapshot.fetchedAt,
         input.snapshot.levels.length,
-        serialized,
+        null,
+        storedContent.rows[0].id,
+        input.snapshot.pageCount,
         snapshotBytes,
         input.actorEmail,
       ],
@@ -2267,8 +2391,14 @@ export async function readShopifyInventoryStateFromPostgres(input: {
             warehouse.name AS warehouse_name,
             location.global_id AS location_global_id,
             location.code AS location_code,
-            capture.captured_snapshot -> 'location' AS provider_location,
-            capture.captured_snapshot -> 'enrichment' AS enrichment,
+            COALESCE(
+              capture.captured_snapshot,
+              content.snapshot_content
+            ) -> 'location' AS provider_location,
+            COALESCE(
+              capture.captured_snapshot,
+              content.snapshot_content
+            ) -> 'enrichment' AS enrichment,
             run.levels_seen, run.levels_mapped, run.levels_projected,
             run.levels_unmapped,
             run.levels_untracked, run.negative_available_levels,
@@ -2292,6 +2422,10 @@ export async function readShopifyInventoryStateFromPostgres(input: {
       AND capture.integration_account_id = run.integration_account_id
       AND capture.provider_attempt_id = run.provider_attempt_id
       AND capture.id = run.capture_id
+     LEFT JOIN operations_commerce_inventory_snapshot_contents content
+       ON content.organization_id = capture.organization_id
+      AND content.integration_account_id = capture.integration_account_id
+      AND content.id = capture.snapshot_content_id
      WHERE run.organization_id = $1::uuid
        AND run.integration_account_id = $2::uuid
      ORDER BY run.completed_at DESC, run.id DESC

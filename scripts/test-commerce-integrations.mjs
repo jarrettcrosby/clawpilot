@@ -1187,7 +1187,11 @@ assert.deepEqual(
   )),
   [
     'app/scopes_update',
+    'inventory_items/create',
+    'inventory_items/delete',
     'inventory_items/update',
+    'inventory_levels/connect',
+    'inventory_levels/disconnect',
     'inventory_levels/update',
     'products/create',
     'products/delete',
