@@ -60,6 +60,13 @@ struct ClawPilotPickingPhoneApp: App {
 
 @MainActor
 final class PickingPhoneModel: ObservableObject {
+    private enum MetaBarcodeWaitOutcome: Sendable {
+        case value(String)
+        case timedOut
+        case sourceEnded
+        case cancelled
+    }
+
     @Published var email = ""
     @Published var code = ""
     @Published var canRequestCode = true
@@ -111,6 +118,10 @@ final class PickingPhoneModel: ObservableObject {
     private let voice = VoiceConfirmationController()
     private let biometrics = BiometricUnlockController()
     private var metaSource: MetaWearablesBarcodeSource?
+    private var activeMetaScanID: UUID?
+    private var isMetaScanStopping = false
+    private var mostRecentlyCancelledMetaScanID: UUID?
+    private var cancelledMetaAcceptanceStage: PickScanStage?
     private var codeRequestCooldown: Task<Void, Never>?
     private var metaConnectionRefreshTask: Task<Void, Never>?
     private var isHandlingPendingSystemScan = false
@@ -913,12 +924,34 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     @discardableResult
-    func accept(_ value: String, source: BarcodeSource) async -> PickScanAcceptance? {
+    func accept(
+        _ value: String,
+        source: BarcodeSource,
+        metaScanID: UUID? = nil
+    ) async -> PickScanAcceptance? {
         guard !hasPendingConfirmation else { return nil }
+        guard shouldApplyMetaScanResult(metaScanID) else { return nil }
         do {
             let acceptance = try await picking.accept(BarcodeObservation(value: value, source: source))
+            guard shouldApplyMetaScanResult(metaScanID) else {
+                // The actor may have accepted the observation immediately before
+                // the user stopped the camera. Reconcile the projection, but do
+                // not speak completion feedback after cancellation. An observation
+                // yielded before Stop remains committed warehouse evidence, so the
+                // non-voice Meta status must say what actually happened.
+                await updateProjection()
+                if mostRecentlyCancelledMetaScanID == metaScanID {
+                    cancelledMetaAcceptanceStage = acceptance.stage
+                    if activeMetaScanID == nil {
+                        metaStatus = acceptance.stage == .location
+                            ? "Location matched just before the Meta scan stopped. Scan the product next."
+                            : "Product matched just before the Meta scan stopped."
+                    }
+                }
+                return nil
+            }
             if source == .metaGlasses {
-                ClawPilotScanDiagnostic.record("matched:\(acceptance.stage.rawValue):\(value)")
+                ClawPilotScanDiagnostic.record("matched:stage=\(acceptance.stage.rawValue)")
             }
             await updateProjection()
             if acceptance.stage == .location {
@@ -937,9 +970,10 @@ final class PickingPhoneModel: ObservableObject {
             }
             return acceptance
         } catch PickingContractError.locationBarcodeMismatch {
+            guard shouldApplyMetaScanResult(metaScanID) else { return nil }
             status = "Barcode does not match the current assigned location."
             if source == .metaGlasses {
-                ClawPilotScanDiagnostic.record("location-mismatch:\(value)")
+                ClawPilotScanDiagnostic.record("mismatch:stage=location")
             }
             voice.speak(
                 "Wrong location. Scan the displayed location label.",
@@ -948,16 +982,20 @@ final class PickingPhoneModel: ObservableObject {
             refreshAudioRouteStatus()
         } catch PickingContractError.productBarcodeMismatch,
                 PickingContractError.barcodeMismatch {
+            guard shouldApplyMetaScanResult(metaScanID) else { return nil }
             status = "Barcode does not match the current assigned product."
             if source == .metaGlasses {
-                ClawPilotScanDiagnostic.record("product-mismatch:\(value)")
+                ClawPilotScanDiagnostic.record("mismatch:stage=product")
             }
             voice.speak(
                 "Wrong product. Scan the displayed product.",
                 spanish: "Producto incorrecto. Escanea el producto mostrado."
             )
             refreshAudioRouteStatus()
-        } catch { status = "Scan rejected: \(error.localizedDescription)" }
+        } catch {
+            guard shouldApplyMetaScanResult(metaScanID) else { return nil }
+            status = "Scan rejected: \(error.localizedDescription)"
+        }
         return nil
     }
 
@@ -985,6 +1023,20 @@ final class PickingPhoneModel: ObservableObject {
         )
     }
 
+    private func shouldApplyMetaScanResult(_ scanID: UUID?) -> Bool {
+        guard let scanID else { return true }
+        return activeMetaScanID == scanID
+    }
+
+    private func metaDecodeTarget(
+        for task: PickTask,
+        stage: PickScanStage
+    ) -> MetaBarcodeDecodeTarget {
+        stage == .location
+            ? .location(expectedValue: task.locationBarcode)
+            : .product(expectedValue: task.barcode)
+    }
+
     @discardableResult
     func announcePhoneCameraMismatch(_ stage: PickScanStage) -> Bool {
         let english = stage == .location ? "Wrong location." : "Wrong product."
@@ -1009,7 +1061,8 @@ final class PickingPhoneModel: ObservableObject {
             ClawPilotScanDiagnostic.record("request-ignored:scan-already-active")
             return nil
         }
-        guard currentTask != nil else {
+        guard let initialTask = currentTask,
+              let initialStage = currentScanStage else {
             metaStatus = "Load an assigned pick before starting the glasses camera."
             ClawPilotScanDiagnostic.record("blocked:no-assigned-pick")
             return nil
@@ -1020,31 +1073,57 @@ final class PickingPhoneModel: ObservableObject {
             syncMetaConnection()
             return nil
         }
+        let scanID = UUID()
+        activeMetaScanID = scanID
         isMetaScanning = true
-        defer { isMetaScanning = false }
+        defer {
+            // A stopped scan may already have been replaced by a new one. Never
+            // let the older task clear the newer scan's source or busy state.
+            if activeMetaScanID == scanID {
+                activeMetaScanID = nil
+                metaSource = nil
+                isMetaScanning = false
+            }
+        }
+
+        var startedSource: MetaWearablesBarcodeSource?
         do {
-            var startedSource: MetaWearablesBarcodeSource?
             var startError: Error?
             for attempt in 1...3 {
-                let candidate = MetaWearablesBarcodeSource()
+                guard activeMetaScanID == scanID else { return nil }
+                let candidate = MetaWearablesBarcodeSource(
+                    target: metaDecodeTarget(for: initialTask, stage: initialStage)
+                )
                 metaSource = candidate
                 metaStatus = "Starting the Meta glasses camera (attempt \(attempt)/3)…"
                 ClawPilotScanDiagnostic.record("camera-starting:\(attempt)")
                 do {
                     try await candidate.start()
+                    guard activeMetaScanID == scanID else {
+                        await candidate.stop()
+                        return nil
+                    }
                     startedSource = candidate
                     break
                 } catch {
                     startError = error
-                    ClawPilotScanDiagnostic.record("camera-start-failed:\(attempt):\(error.localizedDescription)")
                     await candidate.stop()
+                    guard activeMetaScanID == scanID else { return nil }
                     metaSource = nil
+                    ClawPilotScanDiagnostic.record("camera-start-failed:\(attempt):\(error.localizedDescription)")
                     if error as? MetaScanError == .glassesAppUpdateRequired { break }
-                    if attempt < 3 { try? await Task.sleep(for: .seconds(1)) }
+                    if attempt < 3 {
+                        try? await Task.sleep(for: .seconds(1))
+                        guard activeMetaScanID == scanID else { return nil }
+                    }
                 }
             }
             guard let source = startedSource else {
                 throw startError ?? MetaScanError.sessionFailed
+            }
+            guard activeMetaScanID == scanID else {
+                await source.stop()
+                return nil
             }
             metaGlassesAppUpdateRequired = false
             metaStatus = currentScanStage == .location
@@ -1053,26 +1132,65 @@ final class PickingPhoneModel: ObservableObject {
             ClawPilotScanDiagnostic.record("camera-live")
             var lastAcceptance: PickScanAcceptance?
             var acceptedLocationValue: String?
-            for observedIndex in 0..<8 {
-                let value = await withTaskGroup(of: String?.self) { group in
+            var didTimeOut = false
+            scanLoop: for observedIndex in 0..<8 {
+                let outcome = await withTaskGroup(of: MetaBarcodeWaitOutcome.self) { group in
                     group.addTask {
-                        for await value in source.barcodes { return value }
-                        return nil
+                        for await value in source.barcodes {
+                            if Task.isCancelled { return .cancelled }
+                            return .value(value)
+                        }
+                        return Task.isCancelled ? .cancelled : .sourceEnded
                     }
                     group.addTask {
-                        try? await Task.sleep(for: .seconds(15))
-                        return nil
+                        do {
+                            try await Task.sleep(for: .seconds(15))
+                            return .timedOut
+                        } catch {
+                            return .cancelled
+                        }
                     }
-                    let first = await group.next() ?? nil
+                    let first = await group.next() ?? .cancelled
                     group.cancelAll()
                     return first
                 }
-                guard let value else { break }
-                ClawPilotScanDiagnostic.record("decoded:\(value)")
+                guard activeMetaScanID == scanID else { return nil }
+
+                let value: String
+                switch outcome {
+                case .value(let observedValue):
+                    value = observedValue
+                case .timedOut:
+                    didTimeOut = true
+                    break scanLoop
+                case .sourceEnded:
+                    await source.stop()
+                    guard activeMetaScanID == scanID else { return nil }
+                    metaSource = nil
+                    ClawPilotScanDiagnostic.record("source-ended:no-barcode")
+                    if lastAcceptance?.stage == .location {
+                        metaStatus = "Location matched, but the Meta camera ended before the product barcode was found. Start another scan at the product or use the iPhone camera."
+                        return lastAcceptance
+                    }
+                    metaStatus = "The Meta camera ended before a barcode was found. Start another glasses scan or use the iPhone camera."
+                    return nil
+                case .cancelled:
+                    await source.stop()
+                    return nil
+                }
+
+                ClawPilotScanDiagnostic.record(
+                    "decoded:stage=\(currentScanStage?.rawValue ?? "unknown")"
+                )
                 if currentScanStage == .product, value == acceptedLocationValue {
                     metaStatus = "Location verified. Move the barcode into view, then hold still on the product."
                     try? await Task.sleep(for: .milliseconds(800))
-                    await source.prepareForNextBarcode()
+                    guard activeMetaScanID == scanID,
+                          let task = currentTask,
+                          let stage = currentScanStage else { return nil }
+                    await source.prepareForNextBarcode(
+                        target: metaDecodeTarget(for: task, stage: stage)
+                    )
                     continue
                 }
                 if currentScanStage == .product {
@@ -1080,8 +1198,14 @@ final class PickingPhoneModel: ObservableObject {
                     // confirmation prompt so playback cannot overlap the DAT
                     // session lifecycle.
                     await source.stop()
+                    guard activeMetaScanID == scanID else { return nil }
                     metaSource = nil
-                    let acceptance = await accept(value, source: .metaGlasses)
+                    let acceptance = await accept(
+                        value,
+                        source: .metaGlasses,
+                        metaScanID: scanID
+                    )
+                    guard activeMetaScanID == scanID else { return nil }
                     if acceptance?.stage == .product {
                         metaStatus = "Meta product scan complete."
                         return acceptance
@@ -1093,31 +1217,49 @@ final class PickingPhoneModel: ObservableObject {
                     metaStatus = "The product did not match. Start another glasses scan at the displayed product."
                     return nil
                 }
-                let acceptance = await accept(value, source: .metaGlasses)
+                let acceptance = await accept(
+                    value,
+                    source: .metaGlasses,
+                    metaScanID: scanID
+                )
+                guard activeMetaScanID == scanID else { return nil }
                 if let acceptance {
                     lastAcceptance = acceptance
                     acceptedLocationValue = value
                     metaStatus = "Location matched. Keep the camera live and look at the product barcode."
                     try? await Task.sleep(for: .milliseconds(800))
+                    guard activeMetaScanID == scanID else { return nil }
                 } else if observedIndex == 7 {
                     break
                 }
-                await source.prepareForNextBarcode()
+                guard let task = currentTask,
+                      let stage = currentScanStage else { break }
+                await source.prepareForNextBarcode(
+                    target: metaDecodeTarget(for: task, stage: stage)
+                )
             }
             await source.stop()
+            guard activeMetaScanID == scanID else { return nil }
             metaSource = nil
             if lastAcceptance?.stage == .location {
                 metaStatus = "Location matched, but no product barcode was found. Start another scan at the product or use the iPhone camera."
                 return lastAcceptance
             }
-            metaStatus = "No matching barcode was found within 15 seconds. Start another glasses scan or use the iPhone camera."
-            ClawPilotScanDiagnostic.record("timeout:no-barcode")
-            voice.speak(
-                "No barcode found. Try the glasses scan again or use the iPhone camera.",
-                spanish: "No se encontró un código de barras. Intenta otra vez con las gafas o usa la cámara del iPhone."
-            )
-            refreshAudioRouteStatus()
+            if didTimeOut {
+                metaStatus = "No matching barcode was found within 15 seconds. Start another glasses scan or use the iPhone camera."
+                ClawPilotScanDiagnostic.record("timeout:no-barcode")
+                voice.speak(
+                    "No barcode found. Try the glasses scan again or use the iPhone camera.",
+                    spanish: "No se encontró un código de barras. Intenta otra vez con las gafas o usa la cámara del iPhone."
+                )
+                refreshAudioRouteStatus()
+            } else {
+                metaStatus = "No matching barcode was found after several scans. Try again or use the iPhone camera."
+                ClawPilotScanDiagnostic.record("attempt-limit:no-match")
+            }
         } catch {
+            if let startedSource { await startedSource.stop() }
+            guard activeMetaScanID == scanID else { return nil }
             if error as? MetaScanError == .glassesAppUpdateRequired {
                 metaGlassesAppUpdateRequired = true
                 metaStatus = "Camera software update required. Tap Update camera software, finish the update in Meta AI, then return to ClawPilot. Do not reset or re-pair the glasses."
@@ -1125,7 +1267,6 @@ final class PickingPhoneModel: ObservableObject {
                 metaStatus = "Meta scan unavailable. Use iPhone camera: \(error.localizedDescription)"
             }
             ClawPilotScanDiagnostic.record("error:\(error.localizedDescription)")
-            if let metaSource { await metaSource.stop() }
             metaSource = nil
         }
         return nil
@@ -1174,11 +1315,33 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func cancelMetaScan() async {
-        guard let metaSource else { return }
-        await metaSource.stop()
-        self.metaSource = nil
+        guard activeMetaScanID != nil || isMetaScanning || metaSource != nil else { return }
+        guard !isMetaScanStopping else { return }
+        isMetaScanStopping = true
+        defer { isMetaScanStopping = false }
+        let source = metaSource
+        let cancelledScanID = activeMetaScanID
+        // Invalidate the generation before the actor hop. Stopping the source
+        // finishes its AsyncStream, so the waiting scan task can resume while
+        // this method is suspended; it must already know that result is stale.
+        mostRecentlyCancelledMetaScanID = cancelledScanID
+        cancelledMetaAcceptanceStage = nil
+        activeMetaScanID = nil
+        metaSource = nil
+        metaStatus = "Stopping Meta scan…"
+        ClawPilotScanDiagnostic.record("cancelled:user")
+        if let source { await source.stop() }
+        // Keep the scan busy until DAT has fully stopped so a quick second tap
+        // cannot overlap a new camera start with the old session's teardown.
         isMetaScanning = false
-        metaStatus = "Meta scan stopped."
+        if mostRecentlyCancelledMetaScanID == cancelledScanID,
+           let committedStage = cancelledMetaAcceptanceStage {
+            metaStatus = committedStage == .location
+                ? "Location matched just before the Meta scan stopped. Scan the product next."
+                : "Product matched just before the Meta scan stopped."
+        } else {
+            metaStatus = "Meta scan stopped."
+        }
     }
 
     func registerMeta() async {

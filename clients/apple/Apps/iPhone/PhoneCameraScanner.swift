@@ -4,6 +4,7 @@ import SwiftUI
 import UIKit
 import Vision
 import VisionKit
+import ClawPilotPickingApple
 import ClawPilotPickingCore
 
 struct PhoneCameraScanContext: Equatable, Sendable {
@@ -187,7 +188,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
         private var parent: PhoneCameraScanner
         private weak var scanner: DataScannerViewController?
         private var activeContext: PhoneCameraScanContext
-        private var isSubmitting = false
+        private var lifecycle = PhoneCameraScanLifecycle()
         private var isCapturingPhoto = false
         private var latestPayloads: [String] = []
         private var lastSubmission: (contextID: String, payload: String, at: Date)?
@@ -199,6 +200,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
         private var recognizedItemsTask: Task<Void, Never>?
         private var photoTask: Task<Void, Never>?
         private var mismatchRetryTask: Task<Void, Never>?
+        private var submissionTask: Task<Void, Never>?
 
         private let stageLabel = UILabel()
         private let headlineLabel = UILabel()
@@ -222,6 +224,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
         func update(parent: PhoneCameraScanner, scanner: DataScannerViewController) {
             self.parent = parent
             self.scanner = scanner
+            guard lifecycle.isPresented else { return }
             guard parent.scanContext.identity != activeContext.identity else { return }
             mismatchRetryTask?.cancel()
             mismatchRetryTask = nil
@@ -233,10 +236,12 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
         }
 
         func startWhenAuthorized(_ scanner: DataScannerViewController) {
-            guard authorizationTask == nil else { return }
+            guard authorizationTask == nil,
+                  let operationToken = lifecycle.operationToken() else { return }
             authorizationTask = Task { @MainActor [weak self, weak scanner] in
                 guard let self, let scanner else { return }
                 defer { self.authorizationTask = nil }
+                guard self.lifecycle.permitsCompletion(of: operationToken) else { return }
 
                 guard DataScannerViewController.isSupported else {
                     self.showUnavailable("This iPhone does not support live barcode scanning.")
@@ -253,6 +258,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
                 default:
                     granted = false
                 }
+                guard self.lifecycle.permitsCompletion(of: operationToken) else { return }
                 guard granted else {
                     self.showUnavailable("Camera access is off. Enable it in iPhone Settings, then tap Retry camera.")
                     return
@@ -281,14 +287,24 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
         }
 
         func shutdown(_ scanner: DataScannerViewController) {
+            lifecycle.dismiss()
+            stopAllWork(scanner)
+        }
+
+        private func stopAllWork(_ scanner: DataScannerViewController) {
             authorizationTask?.cancel()
             recognizedItemsTask?.cancel()
             photoTask?.cancel()
             mismatchRetryTask?.cancel()
+            submissionTask?.cancel()
             authorizationTask = nil
             recognizedItemsTask = nil
             photoTask = nil
             mismatchRetryTask = nil
+            submissionTask = nil
+            isCapturingPhoto = false
+            latestPayloads.removeAll(keepingCapacity: false)
+            scanner.delegate = nil
             if scanner.isScanning { scanner.stopScanning() }
         }
 
@@ -297,6 +313,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
             didAdd addedItems: [RecognizedItem],
             allItems: [RecognizedItem]
         ) {
+            guard lifecycle.isPresented else { return }
             observe(allItems.isEmpty ? addedItems : allItems, origin: .live)
         }
 
@@ -305,6 +322,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
             didUpdate updatedItems: [RecognizedItem],
             allItems: [RecognizedItem]
         ) {
+            guard lifecycle.isPresented else { return }
             observe(allItems.isEmpty ? updatedItems : allItems, origin: .live)
         }
 
@@ -313,6 +331,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
             didRemove removedItems: [RecognizedItem],
             allItems: [RecognizedItem]
         ) {
+            guard lifecycle.isPresented else { return }
             observe(allItems, origin: .live)
         }
 
@@ -320,6 +339,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
             _ dataScanner: DataScannerViewController,
             becameUnavailableWithError error: DataScannerViewController.ScanningUnavailable
         ) {
+            guard lifecycle.isPresented else { return }
             recognizedItemsTask?.cancel()
             recognizedItemsTask = nil
             showUnavailable("Live scanning stopped because the camera became unavailable. Tap Retry camera.")
@@ -330,7 +350,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
             recognizedItemsTask = Task { @MainActor [weak self, weak scanner] in
                 guard let self, let scanner else { return }
                 for await items in scanner.recognizedItems {
-                    if Task.isCancelled { break }
+                    if Task.isCancelled || !self.lifecycle.isPresented { break }
                     self.observe(items, origin: .live)
                 }
             }
@@ -349,11 +369,13 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
         }
 
         private func observe(_ items: [RecognizedItem], origin: ObservationOrigin) {
+            guard lifecycle.isPresented else { return }
             let payloads = uniquePayloads(in: items)
             observe(payloads, origin: origin)
         }
 
         private func observe(_ payloads: [String], origin: ObservationOrigin) {
+            guard lifecycle.isPresented else { return }
             latestPayloads = payloads
             if origin == .live,
                !payloads.isEmpty,
@@ -369,7 +391,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
         }
 
         private func evaluateLatestPayloads(origin: ObservationOrigin) {
-            guard !isSubmitting else { return }
+            guard lifecycle.canBeginSubmission else { return }
             guard !latestPayloads.isEmpty else {
                 mismatchRetryTask?.cancel()
                 mismatchRetryTask = nil
@@ -412,7 +434,8 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
         }
 
         private func scheduleMismatchRetry(for contextIdentity: String) {
-            guard mismatchRetryTask == nil else { return }
+            guard mismatchRetryTask == nil,
+                  let operationToken = lifecycle.operationToken() else { return }
             mismatchRetryTask = Task { @MainActor [weak self] in
                 do {
                     try await Task.sleep(for: .milliseconds(300))
@@ -421,15 +444,14 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
                 }
                 guard let self else { return }
                 self.mismatchRetryTask = nil
+                guard self.lifecycle.permitsCompletion(of: operationToken) else { return }
                 guard self.activeContext.identity == contextIdentity else { return }
                 self.evaluateLatestPayloads(origin: .live)
             }
         }
 
         private func submit(_ payload: String, origin: ObservationOrigin) {
-            guard !isSubmitting else { return }
-            isSubmitting = true
-            closeButton.isEnabled = false
+            guard let submissionToken = lifecycle.beginSubmission() else { return }
             let submittedStage = activeContext.stage
             let submittedOrigin = origin
             lastSubmission = (activeContext.identity, payload, Date())
@@ -438,11 +460,14 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
                 tone: .neutral
             )
 
-            Task { @MainActor [weak self] in
+            submissionTask = Task { @MainActor [weak self] in
                 guard let self else { return }
+                guard !Task.isCancelled,
+                      self.lifecycle.permitsCompletion(of: submissionToken) else { return }
                 let outcome = await self.parent.onBarcode(payload)
-                self.isSubmitting = false
-                self.closeButton.isEnabled = true
+                guard !Task.isCancelled,
+                      self.lifecycle.completeSubmission(submissionToken) else { return }
+                self.submissionTask = nil
                 if case .success = outcome.tone {
                     self.recordDiagnostic(
                         "accepted:stage=\(submittedStage.rawValue):source=\(submittedOrigin.diagnosticName)"
@@ -450,7 +475,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
                 }
                 if outcome.shouldClose {
                     self.setFeedback(outcome.feedback, tone: outcome.tone)
-                    self.parent.onClose()
+                    self.dismissScanner(reason: "accepted")
                     return
                 }
                 if let context = outcome.context {
@@ -466,11 +491,13 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
 
         @objc private func captureCurrentFrame() {
             guard let scanner else { return }
+            guard let operationToken = lifecycle.operationToken(),
+                  lifecycle.canBeginSubmission else { return }
             guard scanner.isScanning else {
                 startWhenAuthorized(scanner)
                 return
             }
-            guard !isCapturingPhoto, !isSubmitting else { return }
+            guard !isCapturingPhoto else { return }
             guard activeContext.expectedBarcode != nil else {
                 setFeedback("This assignment has no expected barcode to match.", tone: .error)
                 return
@@ -486,12 +513,15 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
                 defer {
                     self.isCapturingPhoto = false
                     self.photoTask = nil
-                    self.captureButton.isEnabled = self.activeContext.expectedBarcode != nil
-                    self.captureButton.setTitle("Scan current frame", for: .normal)
+                    if self.lifecycle.permitsCompletion(of: operationToken) {
+                        self.captureButton.isEnabled = self.activeContext.expectedBarcode != nil
+                        self.captureButton.setTitle("Scan current frame", for: .normal)
+                    }
                 }
                 do {
                     let image = try await scanner.capturePhoto()
                     try Task.checkCancellation()
+                    guard self.lifecycle.permitsCompletion(of: operationToken) else { return }
                     guard let cgImage = image.cgImage else {
                         self.setFeedback("The camera frame could not be read. Hold steady and try again.", tone: .error)
                         return
@@ -501,6 +531,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
                         try Self.decodeBarcodes(in: cgImage, orientation: orientation)
                     }.value
                     try Task.checkCancellation()
+                    guard self.lifecycle.permitsCompletion(of: operationToken) else { return }
                     guard !payloads.isEmpty else {
                         self.recordDiagnostic("fallback-result:none")
                         self.setFeedback("No barcode was found in that frame. Fill the guide with the label and try again.", tone: .warning)
@@ -511,6 +542,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
                 } catch is CancellationError {
                     return
                 } catch {
+                    guard self.lifecycle.permitsCompletion(of: operationToken) else { return }
                     self.recordDiagnostic("fallback-result:error")
                     self.setFeedback("The high-resolution frame could not be scanned. Live scanning is still active.", tone: .error)
                 }
@@ -530,6 +562,15 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
         }
 
         @objc private func closeScanner() {
+            dismissScanner(reason: "user")
+        }
+
+        private func dismissScanner(reason: String) {
+            guard lifecycle.dismiss() else { return }
+            recordDiagnostic("closed:reason=\(reason)")
+            closeButton.isEnabled = false
+            captureButton.isEnabled = false
+            if let scanner { stopAllWork(scanner) }
             parent.onClose()
         }
 

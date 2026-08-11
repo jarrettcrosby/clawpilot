@@ -87,14 +87,95 @@ test('native scan state requires location before product without giving Watch co
   assert.match(phone, /Location matched\. Now scan the displayed product barcode/)
   assert.match(phone, /acceptPhoneCameraBarcode/)
   assert.match(camera, /onBarcode: @MainActor \(String\) async -> PhoneCameraScanOutcome/)
+  assert.match(meta, /struct MetaBarcodeDecodeTarget/)
+  assert.match(meta, /static func location\(expectedValue: String\?\)/)
+  assert.match(meta, /static func product\(expectedValue: String\?\)/)
+  assert.match(meta, /init\(target: MetaBarcodeDecodeTarget\)/)
+  assert.match(phone, /\.location\(expectedValue: task\.locationBarcode\)/)
+  assert.match(phone, /\.product\(expectedValue: task\.barcode\)/)
+  assert.match(
+    phone,
+    /MetaWearablesBarcodeSource\(\s*target: metaDecodeTarget\(for: initialTask, stage: initialStage\)\s*\)/,
+  )
   assert.match(meta, /prepareForNextBarcode/)
-  assert.match(phone, /await source\.prepareForNextBarcode\(\)/)
+  assert.match(
+    phone,
+    /await source\.prepareForNextBarcode\(\s*target: metaDecodeTarget\(for: task, stage: stage\)\s*\)/,
+  )
   assert.match(watch, /current\.locationScanRequired == true/)
   assert.doesNotMatch(watch, /ConfirmPicksCommand|PickingAPIClient/)
 })
 
+test('Meta stop invalidates the active scan before stopping its source and cannot become a timeout', () => {
+  const phone = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+  const meta = read('../clients/apple/Apps/iPhone/MetaWearablesBarcodeSource.swift')
+  const cancel = phone.match(/func cancelMetaScan\(\) async \{[\s\S]*?\n    \}/)?.[0] ?? ''
+
+  assert.match(phone, /private var activeMetaScanID: UUID\?/)
+  assert.match(phone, /private enum MetaBarcodeWaitOutcome: Sendable/)
+  assert.match(phone, /case timedOut/)
+  assert.match(phone, /case sourceEnded/)
+  assert.match(phone, /case cancelled/)
+  assert.match(
+    phone,
+    /if activeMetaScanID == scanID \{\s*activeMetaScanID = nil\s*metaSource = nil\s*isMetaScanning = false/,
+  )
+  assert.match(
+    cancel,
+    /activeMetaScanID = nil[\s\S]*metaStatus = "Stopping Meta scan…"[\s\S]*await source\.stop\(\)[\s\S]*isMetaScanning = false/,
+  )
+  assert.doesNotMatch(cancel, /timeout:no-barcode|voice\.speak/)
+  assert.match(
+    phone,
+    /let outcome = await withTaskGroup\(of: MetaBarcodeWaitOutcome\.self\)[\s\S]*guard activeMetaScanID == scanID else \{ return nil \}[\s\S]*switch outcome/,
+  )
+  assert.match(
+    phone,
+    /case \.sourceEnded:[\s\S]*source-ended:no-barcode[\s\S]*case \.cancelled:/,
+  )
+  assert.match(
+    phone,
+    /if didTimeOut \{[\s\S]*timeout:no-barcode[\s\S]*voice\.speak/,
+  )
+  assert.match(phone, /metaScanID: UUID\? = nil/)
+  assert.match(
+    phone,
+    /let acceptance = try await picking\.accept[\s\S]*guard shouldApplyMetaScanResult\(metaScanID\) else/,
+  )
+  assert.match(phone, /Location matched just before the Meta scan stopped\. Scan the product next\./)
+  assert.match(phone, /Product matched just before the Meta scan stopped\./)
+  assert.match(phone, /source: \.metaGlasses,\s*metaScanID: scanID/)
+  assert.match(phone, /let acceptance = await accept\(value, source: \.iPhoneCamera\)/)
+  assert.match(phone, /matched:stage=\\\(acceptance\.stage\.rawValue\)/)
+  assert.match(phone, /mismatch:stage=location/)
+  assert.match(phone, /mismatch:stage=product/)
+  assert.match(phone, /decoded:stage=\\\(currentScanStage\?\.rawValue \?\? "unknown"\)/)
+  assert.equal(phone.includes('ClawPilotScanDiagnostic.record("decoded:\\(value)'), false)
+  assert.equal(phone.includes('ClawPilotScanDiagnostic.record("matched:\\(acceptance.stage.rawValue):\\(value)'), false)
+  assert.equal(phone.includes('ClawPilotScanDiagnostic.record("location-mismatch:\\(value)'), false)
+  assert.equal(phone.includes('ClawPilotScanDiagnostic.record("product-mismatch:\\(value)'), false)
+  assert.match(meta, /private var teardownTask: Task<Void, Never>\?/)
+  assert.match(meta, /private var stopRequested = false/)
+  assert.match(meta, /guard !stopRequested, teardownTask == nil else/)
+  assert.match(
+    meta,
+    /guard try await Wearables\.shared\.checkPermissionStatus\(\.camera\) == \.granted[\s\S]*guard !stopRequested else/,
+  )
+  assert.match(meta, /func stop\(\) async \{\s*if let task = failStart\(\) \{\s*await task\.value/)
+  assert.match(
+    meta,
+    /let states = session\.stateStream\(\)\s*session\.stop\(\)[\s\S]*timeout: \.seconds\(4\)/,
+  )
+  assert.match(meta, /if session\.state == \.stopped \{ return true \}/)
+  assert.match(meta, /for await state in states \{\s*if state == \.stopped \{ return true \}/)
+  assert.match(meta, /group\.cancelAll\(\)/)
+  assert.match(meta, /session-teardown:outcome=stopped/)
+  assert.match(meta, /session-teardown:outcome=timeout:state=/)
+})
+
 test('iPhone camera keeps a fast stage-aware live scan with an in-memory still fallback', () => {
   const camera = read('../clients/apple/Apps/iPhone/PhoneCameraScanner.swift')
+  const lifecycle = read('../clients/apple/Sources/ClawPilotPickingApple/PhoneCameraScanLifecycle.swift')
   const phone = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
 
   assert.match(camera, /qualityLevel: \.fast/)
@@ -117,9 +198,27 @@ test('iPhone camera keeps a fast stage-aware live scan with an in-memory still f
   assert.match(phone, /Location matched\. The live camera is still on/)
   assert.match(phone, /PhoneCameraScanOutcome/)
   assert.match(phone, /interactiveDismissDisabled\(\)/)
-  assert.match(camera, /closeButton\.isEnabled = false/)
-  assert.match(camera, /closeButton\.isEnabled = true/)
-  assert.equal(camera.match(/Task\.checkCancellation\(\)/g)?.length, 2)
+  assert.match(camera, /import ClawPilotPickingApple/)
+  assert.match(lifecycle, /public struct PhoneCameraScanLifecycle: Sendable/)
+  assert.match(camera, /let submissionToken = lifecycle\.beginSubmission\(\)/)
+  assert.match(camera, /guard !Task\.isCancelled,[\s\S]*lifecycle\.completeSubmission\(submissionToken\)/)
+  assert.match(camera, /closeScanner\(\) \{\s*dismissScanner\(reason: "user"\)/)
+  assert.match(
+    camera,
+    /private func dismissScanner\(reason: String\) \{\s*guard lifecycle\.dismiss\(\) else \{ return \}[\s\S]*stopAllWork\(scanner\)[\s\S]*parent\.onClose\(\)/,
+  )
+  const stopAllWork = camera.match(/private func stopAllWork[\s\S]*?\n        \}/)?.[0] ?? ''
+  assert.match(stopAllWork, /authorizationTask\?\.cancel\(\)/)
+  assert.match(stopAllWork, /recognizedItemsTask\?\.cancel\(\)/)
+  assert.match(stopAllWork, /photoTask\?\.cancel\(\)/)
+  assert.match(stopAllWork, /mismatchRetryTask\?\.cancel\(\)/)
+  assert.match(stopAllWork, /submissionTask\?\.cancel\(\)/)
+  assert.match(stopAllWork, /scanner\.delegate = nil/)
+  assert.match(stopAllWork, /scanner\.stopScanning\(\)/)
+  assert.match(
+    camera,
+    /let image = try await scanner\.capturePhoto\(\)[\s\S]*lifecycle\.permitsCompletion\(of: operationToken\)[\s\S]*let payloads = try await Task\.detached[\s\S]*lifecycle\.permitsCompletion\(of: operationToken\)/,
+  )
 })
 
 test('iPhone camera gives privacy-safe deduped voice feedback for a wrong barcode', () => {
@@ -307,7 +406,10 @@ test('picker audio routing and Meta scan feedback stay explicit and bounded', ()
   assert.match(voice, /\.first \?\? systemVoice/)
   assert.match(app, /Task\.sleep\(for: \.seconds\(15\)\)/)
   assert.match(app, /Hey Siri, scan with ClawPilot/)
-  assert.match(app, /await source\.stop\(\)[\s\S]*await accept\(value, source: \.metaGlasses\)/)
+  assert.match(
+    app,
+    /await source\.stop\(\)[\s\S]*let acceptance = await accept\(\s*value,\s*source: \.metaGlasses,/,
+  )
   assert.match(app, /await voice\.speakAndWait\(\s*"Item matched\. Say confirm pick to submit\.",\s*spanish: "Producto correcto\. Di confirmar pedido para enviarlo\."\s*\)/)
   assert.match(app, /await listenForConfirmation\(automatic: true\)/)
   assert.match(app, /timeout: automatic \? \.seconds\(8\) : nil/)
@@ -344,8 +446,10 @@ test('picker audio routing and Meta scan feedback stay explicit and bounded', ()
   assert.match(voice, /Enhanced voice storage could not be prepared/)
   assert.match(meta, /resolution: \.high/)
   assert.match(meta, /photoDataPublisher\.listen[\s\S]*videoFramePublisher\.listen[\s\S]*camera\.stream\.start\(\)/)
-  assert.match(meta, /photo-received:bytes=/)
-  assert.match(meta, /video-received:/)
+  assert.match(meta, /vision-decode:kind=\\\(item\.kind\.rawValue\):outcome=\\\(outcome\)/)
+  assert.match(meta, /case photo/)
+  assert.match(meta, /case video/)
+  assert.doesNotMatch(meta, /photo-received:bytes=|video-received:/)
   assert.match(meta, /\.ean8, \.ean13, \.upce/)
   assert.match(meta, /\.code128, \.code39, \.code93/)
   assert.match(meta, /\.gs1DataBar, \.gs1DataBarExpanded, \.gs1DataBarLimited/)
@@ -359,8 +463,10 @@ test('picker audio routing and Meta scan feedback stay explicit and bounded', ()
   assert.match(meta, /startContinuation\?\.resume\(\)/)
   assert.match(meta, /photoDataPublisher/)
   assert.match(meta, /capturePhoto\(format: \.jpeg\)/)
-  assert.match(meta, /for _ in 0\.\.<6/)
-  assert.match(meta, /VNImageRequestHandler\(\s*data: photo\.data/)
+  assert.match(meta, /photoCaptureAttempt < 3/)
+  assert.match(meta, /handlePhotoDelivered\(\)/)
+  assert.match(meta, /trigger: "photo-delivered"/)
+  assert.match(meta, /VNImageRequestHandler\(\s*data: data/)
   assert.match(intent, /StartClawPilotGlassesScanIntent/)
   assert.match(intent, /Scan with \\\(.applicationName\)/)
   assert.match(intent, /OpenURLIntent\(ClawPilotSystemActionLink\.scanURL\(\)\)/)
