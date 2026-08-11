@@ -18,6 +18,7 @@ struct ClawPilotPickingPhoneApp: App {
                         PhoneCameraScanner(
                             scanContext: scanContext,
                             onBarcode: { value in await model.acceptPhoneCameraBarcode(value) },
+                            onMismatch: { stage in model.announcePhoneCameraMismatch(stage) },
                             onClose: { model.showPhoneScanner = false }
                         )
                         .ignoresSafeArea()
@@ -537,21 +538,20 @@ final class PickingPhoneModel: ObservableObject {
                 // A locally restored, recently authenticated magic-code session may
                 // still be valid even when the shell is showing its signed-out
                 // state. In that case the user's Google tap is an explicit link
-                // request, and the normal policy/version/idempotency fences remain
-                // authoritative. With no valid session, preserve the link-required
-                // response and direct the user through the first-time flow.
+                // request. Exact email/subject matching, recent authentication,
+                // active membership, and idempotency remain authoritative. With no
+                // valid session, preserve the first-time link-required response.
                 do {
                     let state = try await api.fetchGoogleAuthState()
-                    guard state.platformConfigured, state.enabled else {
+                    guard state.platformConfigured, state.canLinkCurrentUser else {
                         throw PickingAPIError.rejected(
-                            code: "GOOGLE_SSO_DISABLED",
-                            message: "Google sign-in is not enabled for this organization."
+                            code: "GOOGLE_SSO_NOT_CONFIGURED",
+                            message: "Google sign-in is not configured for this ClawPilot environment."
                         )
                     }
                     if !state.identity.linked {
                         _ = try await api.linkGoogleIdentityToken(
                             idToken,
-                            expectedPolicyRowVersion: state.rowVersion,
                             idempotencyKey: UUID().uuidString
                         )
                     }
@@ -591,13 +591,11 @@ final class PickingPhoneModel: ObservableObject {
             let state = try await api.fetchGoogleAuthState()
             googleAuthState = state
             if state.identity.linked {
-                googleLinkStatus = "Google sign-in is linked only to \(state.identity.email). Other users must link their own account."
+                googleLinkStatus = "Google is linked only to \(state.identity.email) across this user's direct organization memberships. Other users must link their own account."
             } else if !state.platformConfigured {
                 googleLinkStatus = "Google sign-in is not configured for this ClawPilot environment."
-            } else if !state.enabled {
-                googleLinkStatus = "An organization administrator must enable Google sign-in before you can link your account."
             } else {
-                googleLinkStatus = "Link exactly \(state.identity.email). A different Google account will be rejected."
+                googleLinkStatus = "Link exactly \(state.identity.email) for this user. A different Google account will be rejected."
             }
         } catch {
             googleAuthState = nil
@@ -614,14 +612,12 @@ final class PickingPhoneModel: ObservableObject {
             await refreshGoogleAuthState()
             return
         }
-        guard state.platformConfigured, state.enabled else {
-            googleLinkStatus = state.platformConfigured
-                ? "An organization administrator must enable Google sign-in first."
-                : "Google sign-in is not configured for this ClawPilot environment."
+        guard state.platformConfigured, state.canLinkCurrentUser else {
+            googleLinkStatus = "Google sign-in is not configured for this ClawPilot environment."
             return
         }
         guard !state.identity.linked else {
-            googleLinkStatus = "Google sign-in is already linked only to \(state.identity.email)."
+            googleLinkStatus = "Google is already linked only to \(state.identity.email) for this user."
             return
         }
         guard let presentingViewController = Self.presentingViewController else {
@@ -649,11 +645,10 @@ final class PickingPhoneModel: ObservableObject {
             }
             let linked = try await api.linkGoogleIdentityToken(
                 idToken,
-                expectedPolicyRowVersion: state.rowVersion,
                 idempotencyKey: UUID().uuidString
             )
             await refreshGoogleAuthState()
-            googleLinkStatus = "Google sign-in is linked only to \(linked.email). Other users must link their own account."
+            googleLinkStatus = "Google is linked only to \(linked.email) across this user's direct organization memberships. Other users must link their own account."
         } catch {
             googleLinkStatus = "Google account was not linked: \(error.localizedDescription)"
         }
@@ -988,6 +983,24 @@ final class PickingPhoneModel: ObservableObject {
             feedback: "The assigned pick changed. Reopen the camera from the current item.",
             tone: .error
         )
+    }
+
+    @discardableResult
+    func announcePhoneCameraMismatch(_ stage: PickScanStage) -> Bool {
+        let english = stage == .location ? "Wrong location." : "Wrong product."
+        let spanish = stage == .location ? "Ubicación incorrecta." : "Producto incorrecto."
+        if UIAccessibility.isVoiceOverRunning {
+            UIAccessibility.post(
+                notification: .announcement,
+                argument: instructionLanguage == .spanish ? spanish : english
+            )
+            return true
+        }
+        if voice.speakIfIdle(english, spanish: spanish) {
+            refreshAudioRouteStatus()
+            return true
+        }
+        return false
     }
 
     @discardableResult

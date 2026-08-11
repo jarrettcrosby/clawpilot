@@ -19,9 +19,12 @@ import { requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
 
 const IDEMPOTENCY_KEY = /^[\x21-\x7e]{8,200}$/
 
-export type GoogleOrganizationAuthState = {
+export type GoogleUserAuthState = {
   organizationId: string
   organizationName: string
+  linkingAvailable: boolean
+  // Compatibility fields for native/web clients released while Google
+  // enablement was organization-scoped. They no longer grant authority.
   enabled: boolean
   rowVersion: number
   canManage: boolean
@@ -47,10 +50,9 @@ export type GoogleIdentityLinkResult = {
   alreadyLinked: boolean
 }
 
-type PolicyStateRow = {
+type GoogleUserStateRow = {
   organization_id: string
   organization_name: string
-  google_sign_in_enabled: boolean
   row_version: number | string
   linked_at: string | null
 }
@@ -139,17 +141,20 @@ function assertReceipt(
   }
 }
 
-export async function getGoogleOrganizationAuthState(
+export async function getGoogleUserAuthState(
   actor: AppUser,
-): Promise<GoogleOrganizationAuthState> {
+): Promise<GoogleUserAuthState> {
   const organizationId = activeOrganization(actor)
-  const result = await query<PolicyStateRow>(
+  const result = await query<GoogleUserStateRow>(
     `SELECT organization.id::text AS organization_id,
        organization.name AS organization_name,
-       COALESCE(policy.google_sign_in_enabled, false) AS google_sign_in_enabled,
        COALESCE(policy.row_version, 0)::text AS row_version,
        identity.linked_at::text
      FROM workspace_organizations organization
+     JOIN app_user_organization_memberships membership
+       ON membership.organization_id = organization.id
+      AND membership.user_email = $2
+      AND membership.status = 'active'
      LEFT JOIN app_organization_auth_policies policy
        ON policy.organization_id = organization.id
      LEFT JOIN app_user_external_identities identity
@@ -171,9 +176,10 @@ export async function getGoogleOrganizationAuthState(
   return {
     organizationId: state.organization_id,
     organizationName: state.organization_name,
-    enabled: state.google_sign_in_enabled,
+    linkingAvailable: client.configured,
+    enabled: client.configured,
     rowVersion: integerVersion(state.row_version, 'rowVersion'),
-    canManage: canManageUserAccess(actor),
+    canManage: false,
     platformConfigured: client.configured,
     webClientId: client.clientId,
     identity: {
@@ -183,6 +189,10 @@ export async function getGoogleOrganizationAuthState(
     },
   }
 }
+
+// Retained for source/API compatibility while callers migrate to the
+// user-scoped name. Organization policy rows no longer authorize Google login.
+export const getGoogleOrganizationAuthState = getGoogleUserAuthState
 
 export async function updateGoogleOrganizationPolicy(input: {
   actor: AppUser
@@ -334,7 +344,6 @@ export async function updateGoogleOrganizationPolicy(input: {
 export async function linkGoogleIdentity(input: {
   actor: AppUser
   identity: VerifiedGoogleIdentity
-  expectedPolicyRowVersion: unknown
   idempotencyKey: unknown
 }): Promise<GoogleIdentityLinkResult> {
   const organizationId = activeOrganization(input.actor)
@@ -346,17 +355,12 @@ export async function linkGoogleIdentity(input: {
       403,
     )
   }
-  const expectedPolicyRowVersion = integerVersion(
-    input.expectedPolicyRowVersion,
-    'expectedPolicyRowVersion',
-  )
   const idempotencyKey = commandKey(input.idempotencyKey)
   const hash = requestHash({
     command: 'google_identity_link',
     organizationId,
     email: actorEmail,
     subject: input.identity.subject,
-    expectedPolicyRowVersion,
   })
 
   return withTransaction(async (client) => {
@@ -381,33 +385,22 @@ export async function linkGoogleIdentity(input: {
       return linkFromReceipt(receipt.rows[0].result)
     }
 
-    const policy = await client.query<{
-      google_sign_in_enabled: boolean
-      row_version: number | string
-    }>(
-      `SELECT policy.google_sign_in_enabled, policy.row_version::text
-       FROM app_organization_auth_policies policy
-       JOIN app_user_organization_memberships membership
-         ON membership.organization_id = policy.organization_id
-        AND membership.user_email = $2
-        AND membership.status = 'active'
-       WHERE policy.organization_id = $1::uuid
-       FOR UPDATE OF policy`,
+    const membership = await client.query<{ organization_id: string }>(
+      `SELECT membership.organization_id::text
+       FROM app_user_organization_memberships membership
+       JOIN app_users app_user ON app_user.email = membership.user_email
+       WHERE membership.organization_id = $1::uuid
+         AND membership.user_email = $2
+         AND membership.status = 'active'
+         AND app_user.status = 'active'
+       FOR SHARE OF membership, app_user`,
       [organizationId, actorEmail],
     )
-    const policyRow = policy.rows[0]
-    if (!policyRow?.google_sign_in_enabled) {
+    if (!membership.rows[0]) {
       throw new GoogleSsoError(
-        'GOOGLE_SSO_DISABLED',
-        'Google sign-in is not enabled for this organization',
+        'GOOGLE_SSO_ACCESS_DENIED',
+        'An active ClawPilot organization membership is required to link Google',
         403,
-      )
-    }
-    if (integerVersion(policyRow.row_version, 'rowVersion') !== expectedPolicyRowVersion) {
-      throw new GoogleSsoError(
-        'GOOGLE_SSO_POLICY_CHANGED',
-        'Google sign-in settings changed. Reload before linking your account',
-        409,
       )
     }
 
@@ -497,9 +490,6 @@ export async function resolveLinkedGoogleIdentity(
      LEFT JOIN LATERAL (
        SELECT membership.organization_id
        FROM app_user_organization_memberships membership
-       JOIN app_organization_auth_policies policy
-         ON policy.organization_id = membership.organization_id
-        AND policy.google_sign_in_enabled = true
        WHERE membership.user_email = identity.user_email
          AND membership.status = 'active'
        ORDER BY
@@ -533,8 +523,8 @@ export async function resolveLinkedGoogleIdentity(
   }
   if (!linked.organization_id) {
     throw new GoogleSsoError(
-      'GOOGLE_SSO_DISABLED',
-      'Google sign-in is not enabled for an active ClawPilot organization',
+      'GOOGLE_SSO_ACCESS_DENIED',
+      'This Google account has no active ClawPilot organization membership',
       403,
     )
   }

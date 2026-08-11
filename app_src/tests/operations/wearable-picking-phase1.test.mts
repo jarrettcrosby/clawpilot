@@ -122,6 +122,29 @@ test('iPhone camera keeps a fast stage-aware live scan with an in-memory still f
   assert.equal(camera.match(/Task\.checkCancellation\(\)/g)?.length, 2)
 })
 
+test('iPhone camera gives privacy-safe deduped voice feedback for a wrong barcode', () => {
+  const camera = read('../clients/apple/Apps/iPhone/PhoneCameraScanner.swift')
+  const phone = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+  const voice = read('../clients/apple/Apps/iPhone/VoiceConfirmationController.swift')
+
+  assert.match(camera, /struct PhoneCameraMismatchSpeechGate/)
+  assert.match(camera, /minimumRetryAttemptInterval: TimeInterval = 0\.25/)
+  assert.match(camera, /minimumAnnouncementInterval: TimeInterval = 1\.5/)
+  assert.match(camera, /samePayloadRepeatInterval: TimeInterval = 10/)
+  assert.match(camera, /pendingPayloads\.formUnion\(currentPayloads\.subtracting\(visiblePayloads\)\)/)
+  assert.match(camera, /if parent\.onMismatch\(activeContext\.stage\) \{[\s\S]*recordAnnouncement\(\)/)
+  assert.match(camera, /scheduleMismatchRetry\(for: activeContext\.identity\)/)
+  assert.match(camera, /Task\.sleep\(for: \.milliseconds\(300\)\)/)
+  assert.match(camera, /preferredPayload\(in: latestPayloads\)[\s\S]*parent\.onMismatch\(activeContext\.stage\)/)
+  assert.match(camera, /values stay in memory only for dedupe and are never spoken or logged/)
+  assert.match(phone, /onMismatch: \{ stage in model\.announcePhoneCameraMismatch\(stage\) \}/)
+  assert.match(phone, /stage == \.location \? "Wrong location\." : "Wrong product\."/)
+  assert.match(phone, /UIAccessibility\.isVoiceOverRunning/)
+  assert.match(phone, /notification: \.announcement/)
+  assert.match(phone, /voice\.speakIfIdle\(english, spanish: spanish\)/)
+  assert.match(voice, /func speakIfIdle\([\s\S]*activeSpeechID == nil[\s\S]*recognitionTask == nil/)
+})
+
 test('wearable route keeps existing ClawPilot authorization boundary', () => {
   const route = read('app/api/operations/picks/route.ts')
   assert.match(route, /requireRequestUser\(req\)/)

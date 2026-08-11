@@ -70,9 +70,81 @@ struct PhoneCameraScanOutcome: Sendable {
     }
 }
 
+struct PhoneCameraMismatchSpeechGate {
+    static let minimumRetryAttemptInterval: TimeInterval = 0.25
+    static let minimumAnnouncementInterval: TimeInterval = 1.5
+    static let samePayloadRepeatInterval: TimeInterval = 10
+
+    private var contextIdentity: String?
+    private var visiblePayloads: Set<String> = []
+    private var pendingPayloads: Set<String> = []
+    private var lastAttemptAt: Date?
+    private var lastAnnouncementAt: Date?
+    private var lastAnnouncementAtByPayload: [String: Date] = [:]
+
+    mutating func reset(for context: PhoneCameraScanContext) {
+        contextIdentity = context.identity
+        visiblePayloads.removeAll(keepingCapacity: true)
+        pendingPayloads.removeAll(keepingCapacity: true)
+        lastAttemptAt = nil
+        lastAnnouncementAt = nil
+        lastAnnouncementAtByPayload.removeAll(keepingCapacity: true)
+    }
+
+    mutating func observe(
+        mismatchedPayloads: [String],
+        in context: PhoneCameraScanContext,
+        now: Date = Date()
+    ) -> Bool {
+        if contextIdentity != context.identity {
+            reset(for: context)
+        }
+
+        let currentPayloads = Set(mismatchedPayloads)
+        pendingPayloads.formUnion(currentPayloads.subtracting(visiblePayloads))
+        pendingPayloads.formIntersection(currentPayloads)
+        visiblePayloads = currentPayloads
+
+        guard !pendingPayloads.isEmpty else { return false }
+        if let lastAttemptAt,
+           now.timeIntervalSince(lastAttemptAt) < Self.minimumRetryAttemptInterval {
+            return false
+        }
+        if let lastAnnouncementAt,
+           now.timeIntervalSince(lastAnnouncementAt) < Self.minimumAnnouncementInterval {
+            return false
+        }
+
+        let hasEligiblePayload = pendingPayloads.contains { payload in
+            guard let lastPayloadAnnouncementAt = lastAnnouncementAtByPayload[payload] else {
+                return true
+            }
+            return now.timeIntervalSince(lastPayloadAnnouncementAt) >= Self.samePayloadRepeatInterval
+        }
+        guard hasEligiblePayload else { return false }
+
+        lastAttemptAt = now
+        return true
+    }
+
+    mutating func recordAnnouncement(now: Date = Date()) {
+        // One generic warning covers every wrong label currently in view. The
+        // values stay in memory only for dedupe and are never spoken or logged.
+        for payload in visiblePayloads {
+            lastAnnouncementAtByPayload[payload] = now
+        }
+        pendingPayloads.subtract(visiblePayloads)
+        lastAnnouncementAt = now
+        lastAnnouncementAtByPayload = lastAnnouncementAtByPayload.filter {
+            now.timeIntervalSince($0.value) < Self.samePayloadRepeatInterval
+        }
+    }
+}
+
 struct PhoneCameraScanner: UIViewControllerRepresentable {
     let scanContext: PhoneCameraScanContext
     let onBarcode: @MainActor (String) async -> PhoneCameraScanOutcome
+    let onMismatch: @MainActor (PickScanStage) -> Bool
     let onClose: @MainActor () -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
@@ -119,12 +191,14 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
         private var isCapturingPhoto = false
         private var latestPayloads: [String] = []
         private var lastSubmission: (contextID: String, payload: String, at: Date)?
+        private var mismatchSpeechGate = PhoneCameraMismatchSpeechGate()
         private let openedAt = Date()
         private var recordedLiveCandidateContexts: Set<String> = []
         private var recordedCameraLive = false
         private var authorizationTask: Task<Void, Never>?
         private var recognizedItemsTask: Task<Void, Never>?
         private var photoTask: Task<Void, Never>?
+        private var mismatchRetryTask: Task<Void, Never>?
 
         private let stageLabel = UILabel()
         private let headlineLabel = UILabel()
@@ -149,8 +223,11 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
             self.parent = parent
             self.scanner = scanner
             guard parent.scanContext.identity != activeContext.identity else { return }
+            mismatchRetryTask?.cancel()
+            mismatchRetryTask = nil
             activeContext = parent.scanContext
             lastSubmission = nil
+            mismatchSpeechGate.reset(for: activeContext)
             applyContext(activeContext, feedback: activeContext.initialFeedback, tone: .neutral)
             evaluateLatestPayloads(origin: .live)
         }
@@ -207,9 +284,11 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
             authorizationTask?.cancel()
             recognizedItemsTask?.cancel()
             photoTask?.cancel()
+            mismatchRetryTask?.cancel()
             authorizationTask = nil
             recognizedItemsTask = nil
             photoTask = nil
+            mismatchRetryTask = nil
             if scanner.isScanning { scanner.stopScanning() }
         }
 
@@ -290,7 +369,13 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
         }
 
         private func evaluateLatestPayloads(origin: ObservationOrigin) {
-            guard !isSubmitting, !latestPayloads.isEmpty else { return }
+            guard !isSubmitting else { return }
+            guard !latestPayloads.isEmpty else {
+                mismatchRetryTask?.cancel()
+                mismatchRetryTask = nil
+                _ = mismatchSpeechGate.observe(mismatchedPayloads: [], in: activeContext)
+                return
+            }
             guard let payload = activeContext.preferredPayload(in: latestPayloads) else {
                 let message = activeContext.expectedBarcode == nil
                     ? "This assignment has no expected barcode to match."
@@ -298,8 +383,24 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
                         ? "A different barcode is visible. \(activeContext.initialFeedback)"
                         : "Multiple barcodes are visible. Keep the expected label centered."
                 setFeedback(message, tone: .warning)
+                if activeContext.expectedBarcode != nil,
+                   mismatchSpeechGate.observe(
+                       mismatchedPayloads: latestPayloads,
+                       in: activeContext
+                   ) {
+                    if parent.onMismatch(activeContext.stage) {
+                        mismatchRetryTask?.cancel()
+                        mismatchRetryTask = nil
+                        mismatchSpeechGate.recordAnnouncement()
+                    } else {
+                        scheduleMismatchRetry(for: activeContext.identity)
+                    }
+                }
                 return
             }
+
+            mismatchRetryTask?.cancel()
+            mismatchRetryTask = nil
 
             if let lastSubmission,
                lastSubmission.contextID == activeContext.identity,
@@ -308,6 +409,21 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
                 return
             }
             submit(payload, origin: origin)
+        }
+
+        private func scheduleMismatchRetry(for contextIdentity: String) {
+            guard mismatchRetryTask == nil else { return }
+            mismatchRetryTask = Task { @MainActor [weak self] in
+                do {
+                    try await Task.sleep(for: .milliseconds(300))
+                } catch {
+                    return
+                }
+                guard let self else { return }
+                self.mismatchRetryTask = nil
+                guard self.activeContext.identity == contextIdentity else { return }
+                self.evaluateLatestPayloads(origin: .live)
+            }
         }
 
         private func submit(_ payload: String, origin: ObservationOrigin) {

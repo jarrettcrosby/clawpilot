@@ -46,6 +46,28 @@ private final class GoogleLinkRequiredURLProtocol: URLProtocol, @unchecked Senda
     override func stopLoading() {}
 }
 
+private final class WorkspaceRejectedURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 403,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(
+            self,
+            didLoad: Data(#"{"ok":false,"error":"Business access is not available"}"#.utf8)
+        )
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
 @Test("native authentication persists the secure session cookie")
 func nativeAuthenticationPersistsSessionCookie() async throws {
     let origin = try #require(URL(string: "https://native-auth-cookie.test"))
@@ -69,6 +91,52 @@ func nativeAuthenticationPersistsSessionCookie() async throws {
     })
     #expect(cookie.value == "test-token")
     #expect(cookie.isSecure)
+}
+
+@Test("native workspace switching persists the rotated secure session cookie")
+func nativeWorkspaceSwitchPersistsRotatedSessionCookie() async throws {
+    let origin = try #require(URL(string: "https://native-workspace-cookie.test"))
+    let storage = HTTPCookieStorage.shared
+    storage.cookies(for: origin)?.forEach(storage.deleteCookie)
+    defer { storage.cookies(for: origin)?.forEach(storage.deleteCookie) }
+
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [CookieResponseURLProtocol.self]
+    configuration.httpCookieStorage = storage
+    configuration.httpShouldSetCookies = false
+    let client = try PickingAPIClient(
+        origin: origin,
+        session: URLSession(configuration: configuration)
+    )
+
+    try await client.switchWorkspace(to: "22222222-2222-4222-8222-222222222222")
+
+    let cookie = try #require(storage.cookies(for: origin)?.first {
+        $0.name == "__Host-clawpilot_session"
+    })
+    #expect(cookie.value == "test-token")
+    #expect(cookie.isSecure)
+}
+
+@Test("native workspace switching preserves the server authorization reason")
+func nativeWorkspaceSwitchPreservesAuthorizationReason() async throws {
+    let origin = try #require(URL(string: "https://native-workspace-rejection.test"))
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [WorkspaceRejectedURLProtocol.self]
+    let client = try PickingAPIClient(
+        origin: origin,
+        session: URLSession(configuration: configuration)
+    )
+
+    do {
+        try await client.switchWorkspace(to: "22222222-2222-4222-8222-222222222222")
+        Issue.record("Expected a workspace authorization rejection")
+    } catch let error as PickingAPIError {
+        #expect(error == .rejected(
+            code: "WORKSPACE_SWITCH_FAILED",
+            message: "Business access is not available"
+        ))
+    }
 }
 
 @Test("native Google authentication preserves a structured link-required response")

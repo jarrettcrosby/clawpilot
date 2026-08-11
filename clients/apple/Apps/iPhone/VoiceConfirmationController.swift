@@ -382,6 +382,17 @@ final class VoiceConfirmationController {
         }
     }
 
+    @discardableResult
+    func speakIfIdle(_ english: String, spanish: String? = nil) -> Bool {
+        guard activeSpeechID == nil,
+              recognitionTask == nil,
+              !audioEngine.isRunning,
+              !synthesizer.isSpeaking,
+              offlinePlayer?.isPlaying != true else { return false }
+        speak(english, spanish: spanish)
+        return true
+    }
+
     func speakAndWait(_ english: String, spanish: String? = nil) async {
         speak(english, spanish: spanish)
         let speechID = activeSpeechID

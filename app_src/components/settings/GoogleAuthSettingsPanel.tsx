@@ -6,12 +6,9 @@ import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Chip from '@mui/material/Chip'
 import CircularProgress from '@mui/material/CircularProgress'
-import FormControlLabel from '@mui/material/FormControlLabel'
 import Stack from '@mui/material/Stack'
-import Switch from '@mui/material/Switch'
 import Typography from '@mui/material/Typography'
 import LinkRounded from '@mui/icons-material/LinkRounded'
-import SaveRounded from '@mui/icons-material/SaveRounded'
 import SecurityRounded from '@mui/icons-material/SecurityRounded'
 
 type GoogleCredentialResponse = { credential?: string }
@@ -42,6 +39,7 @@ declare global {
 type GooglePolicy = {
   organizationId: string
   organizationName: string
+  linkingAvailable: boolean
   enabled: boolean
   rowVersion: number
   canManage: boolean
@@ -127,7 +125,6 @@ function mutationKey(prefix: string) {
 export default function GoogleAuthSettingsPanel() {
   const buttonRef = useRef<HTMLDivElement | null>(null)
   const [policy, setPolicy] = useState<GooglePolicy | null>(null)
-  const [enabled, setEnabled] = useState(false)
   const [loading, setLoading] = useState(true)
   const [pending, setPending] = useState('')
   const [error, setError] = useState('')
@@ -142,7 +139,6 @@ export default function GoogleAuthSettingsPanel() {
       const payload = await jsonRequest<PolicyPayload>('/api/auth/google/policy')
       if (!payload.policy) throw new Error('Google sign-in settings were not returned')
       setPolicy(payload.policy)
-      setEnabled(payload.policy.enabled)
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : 'Unable to load Google sign-in settings')
     } finally {
@@ -156,7 +152,7 @@ export default function GoogleAuthSettingsPanel() {
     const button = buttonRef.current
     if (
       !button
-      || !policy?.enabled
+      || !policy?.linkingAvailable
       || !policy.platformConfigured
       || !policy.webClientId
       || policy.identity.linked
@@ -190,7 +186,6 @@ export default function GoogleAuthSettingsPanel() {
               },
               body: JSON.stringify({
                 idToken: credential,
-                expectedPolicyRowVersion: policy.rowVersion,
               }),
             }).then((payload) => {
               if (!payload.identity) throw new Error('Google account link was not returned')
@@ -231,39 +226,6 @@ export default function GoogleAuthSettingsPanel() {
     }
   }, [policy, scriptAttempt])
 
-  async function savePolicy() {
-    if (!policy?.canManage || pending || enabled === policy.enabled) return
-    setPending('policy')
-    setError('')
-    setNotice('')
-    try {
-      const payload = await jsonRequest<PolicyPayload>('/api/auth/google/policy', {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          'Idempotency-Key': mutationKey('google-policy'),
-        },
-        body: JSON.stringify({
-          enabled,
-          expectedRowVersion: policy.rowVersion,
-        }),
-      })
-      if (!payload.policy) throw new Error('Updated Google sign-in policy was not returned')
-      setPolicy((current) => current ? {
-        ...current,
-        enabled: payload.policy!.enabled,
-        rowVersion: payload.policy!.rowVersion,
-      } : current)
-      setEnabled(payload.policy.enabled)
-      setNotice(`Google sign-in ${payload.policy.enabled ? 'enabled' : 'disabled'} for ${policy.organizationName}.`)
-    } catch (saveError) {
-      setEnabled(policy.enabled)
-      setError(saveError instanceof Error ? saveError.message : 'Unable to save Google sign-in settings')
-    } finally {
-      setPending('')
-    }
-  }
-
   if (loading) {
     return <Box display="grid" sx={{ minHeight: 150, placeItems: 'center' }}><CircularProgress size={24} /></Box>
   }
@@ -284,42 +246,10 @@ export default function GoogleAuthSettingsPanel() {
 
       {policy ? (
         <Box sx={{ mt: 1.5, p: 1.5, border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px' }}>
-          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} justifyContent="space-between" alignItems={{ xs: 'stretch', sm: 'center' }}>
-            <Box>
-              <Typography variant="body2" color="text.primary" fontWeight={700}>{policy.organizationName}</Typography>
-              <Typography variant="caption" color="text.disabled">
-                Organization administrators control whether linked members may sign in with Google. OAuth app credentials remain platform managed.
-              </Typography>
-            </Box>
-            {policy.canManage ? (
-              <Stack direction="row" spacing={1} alignItems="center">
-                <FormControlLabel
-                  control={(
-                    <Switch
-                      size="small"
-                      checked={enabled}
-                      onChange={(event) => setEnabled(event.target.checked)}
-                      disabled={Boolean(pending) || policy.impersonating || (!policy.platformConfigured && !enabled)}
-                      inputProps={{ 'aria-label': `Enable Google sign-in for ${policy.organizationName}` }}
-                    />
-                  )}
-                  label={enabled ? 'Enabled' : 'Disabled'}
-                />
-                <Button
-                  size="small"
-                  variant="contained"
-                  startIcon={pending === 'policy' ? <CircularProgress size={15} color="inherit" /> : <SaveRounded />}
-                  onClick={() => { void savePolicy() }}
-                  disabled={Boolean(pending) || enabled === policy.enabled || policy.impersonating}
-                  sx={{ borderRadius: '8px', whiteSpace: 'nowrap' }}
-                >
-                  Save
-                </Button>
-              </Stack>
-            ) : (
-              <Chip size="small" label={policy.enabled ? 'Enabled by organization' : 'Disabled by organization'} />
-            )}
-          </Stack>
+          <Typography variant="body2" color="text.primary" fontWeight={700}>Your ClawPilot account</Typography>
+          <Typography variant="caption" color="text.disabled" display="block" sx={{ mt: 0.5 }}>
+            Google linking belongs only to this user. Once linked, this exact user can sign in and switch among every direct active organization membership. It does not enable Google for any other user.
+          </Typography>
 
           {!policy.platformConfigured ? (
             <Alert severity="warning" sx={{ mt: 1.5, borderRadius: '8px' }}>
@@ -328,7 +258,7 @@ export default function GoogleAuthSettingsPanel() {
           ) : null}
           {policy.impersonating ? (
             <Alert severity="warning" sx={{ mt: 1.5, borderRadius: '8px' }}>
-              Exit user view before changing Google sign-in or linking an account.
+              Exit user view before linking a Google account.
             </Alert>
           ) : null}
 
@@ -339,9 +269,9 @@ export default function GoogleAuthSettingsPanel() {
                 <Typography variant="body2" color="text.primary" sx={{ overflowWrap: 'anywhere' }}>
                   {policy.identity.email}
                 </Typography>
-                {!policy.enabled ? <Chip size="small" variant="outlined" label="Google login currently disabled" /> : null}
+                <Chip size="small" variant="outlined" label="This user only" />
               </Stack>
-            ) : policy.enabled && policy.platformConfigured && !policy.impersonating ? (
+            ) : policy.linkingAvailable && !policy.impersonating ? (
               <Box>
                 <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 1 }}>
                   Choose exactly {policy.identity.email}. A different Google email will be rejected and cannot create or merge another user.
@@ -368,7 +298,7 @@ export default function GoogleAuthSettingsPanel() {
               </Box>
             ) : (
               <Typography variant="caption" color="text.disabled">
-                An organization administrator must enable Google sign-in before this account can be linked.
+                Google account linking is unavailable until the platform OAuth client is configured.
               </Typography>
             )}
           </Box>

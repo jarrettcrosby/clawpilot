@@ -754,17 +754,13 @@ export async function switchBrowserSessionWorkspace(input: {
       organization_name: string
       organization_reference_code: string
       role: SessionRole
-      google_sign_in_enabled: boolean
     }>(
       `SELECT membership.organization_id::text,
          organization.name AS organization_name,
          organization.reference_code AS organization_reference_code,
-         membership.role,
-         COALESCE(auth_policy.google_sign_in_enabled, false) AS google_sign_in_enabled
+         membership.role
        FROM app_user_organization_memberships membership
        JOIN workspace_organizations organization ON organization.id = membership.organization_id
-       LEFT JOIN app_organization_auth_policies auth_policy
-         ON auth_policy.organization_id = membership.organization_id
        WHERE membership.user_email = $1
          AND membership.organization_id = $2::uuid
          AND membership.status = 'active'
@@ -772,9 +768,6 @@ export async function switchBrowserSessionWorkspace(input: {
       [input.session.effectiveUser, organizationId],
     )
     if (!membership.rows[0]) throw new Error('Business access is not available')
-    if (input.session.authMethod === 'google_sso' && !membership.rows[0].google_sign_in_enabled) {
-      throw new Error('Google sign-in is not enabled for that business. Sign in with a magic code to switch there')
-    }
     const updated = await client.query<SessionRow>(
       `WITH changed AS (
          UPDATE app_sessions
