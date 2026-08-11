@@ -86,11 +86,40 @@ test('native scan state requires location before product without giving Watch co
   assert.match(session, /locationScanRequired: locationPending/)
   assert.match(phone, /Location matched\. Now scan the displayed product barcode/)
   assert.match(phone, /acceptPhoneCameraBarcode/)
-  assert.match(camera, /onBarcode: @MainActor \(String\) async -> Bool/)
+  assert.match(camera, /onBarcode: @MainActor \(String\) async -> PhoneCameraScanOutcome/)
   assert.match(meta, /prepareForNextBarcode/)
   assert.match(phone, /await source\.prepareForNextBarcode\(\)/)
   assert.match(watch, /current\.locationScanRequired == true/)
   assert.doesNotMatch(watch, /ConfirmPicksCommand|PickingAPIClient/)
+})
+
+test('iPhone camera keeps a fast stage-aware live scan with an in-memory still fallback', () => {
+  const camera = read('../clients/apple/Apps/iPhone/PhoneCameraScanner.swift')
+  const phone = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+
+  assert.match(camera, /qualityLevel: \.fast/)
+  assert.match(camera, /recognizesMultipleItems: true/)
+  assert.match(camera, /isHighFrameRateTrackingEnabled: true/)
+  assert.match(camera, /\.barcode\(symbologies: \[\.code128, \.ean8, \.ean13, \.upce\]\)/)
+  assert.match(camera, /for await items in scanner\.recognizedItems/)
+  assert.match(camera, /didUpdate updatedItems/)
+  assert.match(camera, /preferredPayload\(in payloads:/)
+  assert.match(camera, /capturePhoto\(\)/)
+  assert.match(camera, /VNDetectBarcodesRequest\(\)/)
+  assert.match(camera, /Nothing is saved/)
+  assert.match(camera, /within two seconds/)
+  assert.match(camera, /fallback-start/)
+  assert.match(camera, /elapsed_ms/)
+  assert.doesNotMatch(
+    camera.match(/private func submit[\s\S]*?@objc private func captureCurrentFrame/)?.[0] ?? '',
+    /stopScanning\(\)/,
+  )
+  assert.match(phone, /Location matched\. The live camera is still on/)
+  assert.match(phone, /PhoneCameraScanOutcome/)
+  assert.match(phone, /interactiveDismissDisabled\(\)/)
+  assert.match(camera, /closeButton\.isEnabled = false/)
+  assert.match(camera, /closeButton\.isEnabled = true/)
+  assert.equal(camera.match(/Task\.checkCancellation\(\)/g)?.length, 2)
 })
 
 test('wearable route keeps existing ClawPilot authorization boundary', () => {

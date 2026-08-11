@@ -14,10 +14,23 @@ struct ClawPilotPickingPhoneApp: App {
         WindowGroup {
             ClawPilotAppShellView(model: model)
                 .sheet(isPresented: $model.showPhoneScanner) {
-                    PhoneCameraScanner(
-                        onBarcode: { value in await model.acceptPhoneCameraBarcode(value) },
-                        onClose: { model.showPhoneScanner = false }
-                    )
+                    if let scanContext = model.phoneCameraScanContext {
+                        PhoneCameraScanner(
+                            scanContext: scanContext,
+                            onBarcode: { value in await model.acceptPhoneCameraBarcode(value) },
+                            onClose: { model.showPhoneScanner = false }
+                        )
+                        .ignoresSafeArea()
+                        .interactiveDismissDisabled()
+                    } else {
+                        ContentUnavailableView {
+                            Label("No barcode to scan", systemImage: "barcode.viewfinder")
+                        } description: {
+                            Text("Close the camera and load an assigned pick before scanning.")
+                        } actions: {
+                            Button("Close") { model.showPhoneScanner = false }
+                        }
+                    }
                 }
                 .onOpenURL { url in
                     Task {
@@ -107,6 +120,26 @@ final class PickingPhoneModel: ObservableObject {
 
     var canVerifyCode: Bool {
         !isAuthBusy && code.count == 6 && code.allSatisfy(\.isNumber)
+    }
+
+    var phoneCameraScanContext: PhoneCameraScanContext? {
+        guard let task = currentTask, let stage = currentScanStage else { return nil }
+        if stage == .location {
+            return PhoneCameraScanContext(
+                taskGlobalID: task.pickTaskGlobalId,
+                stage: stage,
+                expectedBarcode: task.locationBarcode,
+                headline: "Scan location label",
+                detail: "\(task.locationCode) · \(task.locationBarcode ?? "No location barcode assigned")"
+            )
+        }
+        return PhoneCameraScanContext(
+            taskGlobalID: task.pickTaskGlobalId,
+            stage: stage,
+            expectedBarcode: task.barcode,
+            headline: "Scan product barcode",
+            detail: "\(task.productName) · SKU \(task.channelSku)"
+        )
     }
 
     var googleSSOAvailable: Bool {
@@ -933,12 +966,28 @@ final class PickingPhoneModel: ObservableObject {
         return nil
     }
 
-    func acceptPhoneCameraBarcode(_ value: String) async -> Bool {
+    func acceptPhoneCameraBarcode(_ value: String) async -> PhoneCameraScanOutcome {
         let taskID = currentTask?.pickTaskGlobalId
-        _ = await accept(value, source: .iPhoneCamera)
-        // Keep the scanner open for location -> product and exact mismatch
-        // correction. It closes only after this task's product is accepted.
-        return taskID != nil && currentTask?.pickTaskGlobalId == taskID
+        let acceptance = await accept(value, source: .iPhoneCamera)
+        if acceptance?.stage == .product {
+            return .close(feedback: "Product barcode matched.")
+        }
+        if acceptance?.stage == .location, let context = phoneCameraScanContext {
+            return .continueScanning(
+                context: context,
+                feedback: "Location matched. The live camera is still on—now scan the product barcode.",
+                tone: .success
+            )
+        }
+        if taskID != nil,
+           currentTask?.pickTaskGlobalId == taskID,
+           let context = phoneCameraScanContext {
+            return .continueScanning(context: context, feedback: status, tone: .warning)
+        }
+        return .close(
+            feedback: "The assigned pick changed. Reopen the camera from the current item.",
+            tone: .error
+        )
     }
 
     @discardableResult
