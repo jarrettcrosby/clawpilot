@@ -548,6 +548,7 @@ includes(adminRoute, [
   'requireRequestSession(req)',
   "'Cache-Control': 'no-store, max-age=0'",
   'domainWorkersActivated: false',
+  'readReconciliationWorkersActivated: commerceReadRuntimeAvailable()',
   'canonicalOrderImport: commerceIntakeRuntimeAvailable()',
   'inventoryMutation: false',
   'fulfillmentExport: false',
@@ -666,6 +667,9 @@ const routeUnderMutationTest = loadTypeScriptModule(
       },
       '@/lib/integrations/commerceIntake': {
         commerceIntakeRuntimeAvailable() {
+          return false
+        },
+        commerceReadRuntimeAvailable() {
           return false
         },
       },

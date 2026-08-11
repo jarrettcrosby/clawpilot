@@ -66,6 +66,12 @@ function loadTypeScriptModule(path, mocks = {}) {
   return loaded.exports
 }
 
+process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED = '1'
+process.env.CLAWPILOT_ENV = 'production'
+const commerceReadRuntime = loadTypeScriptModule(
+  'app_src/lib/integrations/commerceReadRuntime.ts',
+)
+
 const migration = read(
   'db/migrations/0223_operations_faire_inventory_observation_polling.sql',
 )
@@ -172,6 +178,7 @@ const selectors = [{
 const worker = loadTypeScriptModule(
   'app_src/lib/faireInventoryPollingWorker.ts',
   {
+    '@/lib/integrations/commerceReadRuntime': commerceReadRuntime,
     '@/lib/integrations/commerceCredentialCrypto': {
       decryptCommerceCredential() {
         return {
@@ -315,6 +322,7 @@ const deniedTrace = { completions: 0, failures: [] }
 const deniedWorker = loadTypeScriptModule(
   'app_src/lib/faireInventoryPollingWorker.ts',
   {
+    '@/lib/integrations/commerceReadRuntime': commerceReadRuntime,
     '@/lib/integrations/commerceCredentialCrypto': {
       decryptCommerceCredential() {
         return {

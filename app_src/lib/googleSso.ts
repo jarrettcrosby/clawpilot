@@ -17,16 +17,28 @@ export class GoogleSsoError extends Error {
   }
 }
 
-function serverClientId(): string {
+export type GoogleSsoClientConfiguration = {
+  configured: boolean
+  clientId: string | null
+}
+
+export function googleSsoClientConfiguration(): GoogleSsoClientConfiguration {
   const value = String(process.env.GOOGLE_SSO_SERVER_CLIENT_ID || '').trim()
-  if (!value.endsWith('.apps.googleusercontent.com')) {
+  return value.endsWith('.apps.googleusercontent.com')
+    ? { configured: true, clientId: value }
+    : { configured: false, clientId: null }
+}
+
+function serverClientId(): string {
+  const configuration = googleSsoClientConfiguration()
+  if (!configuration.clientId) {
     throw new GoogleSsoError(
       'GOOGLE_SSO_NOT_CONFIGURED',
       'Google sign-in is not configured',
       503,
     )
   }
-  return value
+  return configuration.clientId
 }
 
 export async function verifyGoogleIdentityToken(

@@ -4,7 +4,7 @@ import {
   processCommerceProductImageImports,
 } from '@/lib/commerceProductImageImportWorker'
 import {
-  commerceIntakeRuntimeAvailable,
+  commerceReadRuntimeAvailable,
 } from '@/lib/integrations/commerceIntake'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 
@@ -46,7 +46,7 @@ export async function POST(req: NextRequest) {
       { status: 401 },
     )
   }
-  if (!commerceIntakeRuntimeAvailable()) {
+  if (!commerceReadRuntimeAvailable()) {
     return NextResponse.json({
       ok: true,
       skipped: 1,

@@ -909,7 +909,7 @@ export default function ProductImagePanel({
   const refreshFromFaire = async () => {
     if (state?.imageImportAvailable !== true) {
       setError(
-        'Faire Product image import is available only while development commerce intake is enabled.',
+        'Faire Product image import is unavailable while commerce reconciliation is disabled.',
       )
       return
     }
@@ -1221,8 +1221,9 @@ export default function ProductImagePanel({
         <>
           <Alert severity="info">
             Image flow is controlled, not a live mirror. Shopify and Faire
-            images import as immutable ClawPilot revisions only while
-            development commerce intake is enabled. A ClawPilot primary image
+            images import as immutable ClawPilot revisions only while commerce
+            read reconciliation is enabled. Production reads require an active,
+            verified production connection. A ClawPilot primary image
             queues projection to SuiteCRM; SuiteCRM changes return as immutable
             revisions and remain secondary when an independently governed
             primary exists. Sending an image to Shopify or Faire always
@@ -1425,7 +1426,7 @@ export default function ProductImagePanel({
           <Stack spacing={1.25} data-testid="crm-faire-image-import">
             <Box>
               <Typography variant="subtitle2" fontWeight={700}>
-                Faire image import (development only)
+                Faire image import
               </Typography>
               <Typography variant="caption" color="text.secondary">
                 Re-read one exact mapped Faire Product and queue its current

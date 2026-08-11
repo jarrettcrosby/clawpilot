@@ -37,8 +37,16 @@ Use `http://localhost:4002`. The start script supplies isolated `data-dev` paths
 | Railway environment | `production` | `development` |
 | ClawPilot | `https://aiapp.eigenracing.com` | `https://dev.aiapp.eigenracing.com` |
 | SuiteCRM | `https://crm.eigenracing.com` | `https://dev.crm.eigenracing.com` |
+| Fulfillment optimizer | Isolated Railway service over `fulfillment-optimizer.railway.internal` | Isolated Railway service over `fulfillment-optimizer.railway.internal` |
 
 Railway runs the Next.js server, background outbox and agent workers, environment-specific Postgres, private SuiteCRM service, dedicated SuiteCRM MariaDB, and SuiteCRM volume. Vercel provides protected Next.js previews and an independent build/deployment check; it does not replace Railway workers or own durable writes.
+
+Development and production must keep capability and service-topology parity.
+Environment-specific data, credentials, endpoints, and approved resource
+ceilings remain isolated. Development may use the documented cost controls and
+omits PITR/WAL archiving; production retains PITR and scheduled backups. A
+service present only in development, including the fulfillment optimizer, is a
+release-blocking parity drift rather than an acceptable cost difference.
 
 The `eigenracing.com` DNS zone is managed through Squarespace. Each Railway custom domain uses the exact CNAME and verification TXT values Railway issues for that environment. Production standalone services use `<service>.eigenracing.com`; development uses `dev.<service>.eigenracing.com`. The shared domain is routing infrastructure only and does not import Eigen Racing product assumptions into ClawPilot.
 
@@ -88,6 +96,14 @@ Verify both development and production after release-facing changes:
 - `/api/agents`
 - `/api/pipeline/sync-status`
 - `/api/tasks`
+
+For the fulfillment optimizer, `/api/health` reports configuration readiness
+without a network probe. When enabled, `configurationStatus` must be `ready`,
+the endpoint hostname must be `fulfillment-optimizer.railway.internal`, and
+`connectivity` remains `not-probed`. A disabled or invalid optimizer
+configuration makes Railway application health fail. Verify each optimizer
+service's own health endpoint separately; do not infer production readiness
+from development.
 
 `/api/persistence/status` must return a non-empty `databaseFingerprint`. Railway and Vercel for the same environment must report the same fingerprint, while development and production must report different fingerprints. A missing or cross-environment identity is a release blocker.
 

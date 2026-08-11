@@ -7,6 +7,7 @@ import {
   SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
   SHOPIFY_RECEIPT_PROOF_SCOPES,
 } from '@/lib/integrations/commerceCapabilities'
+import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
 import {
   faireFulfillmentWriteReadiness,
   type FaireFulfillmentWriteReadiness,
@@ -2417,7 +2418,9 @@ export async function replayHeldShopifyProductDeletionsInPostgres(input: {
        AND ($3::text IS NULL OR account.global_id = $3)
        AND account.integration_type = 'commerce'
        AND account.provider = 'shopify'
-       AND account.status = 'active'
+       AND ${commerceReadAccountSql('account', {
+         developmentRequiresActive: true,
+       })}
        AND account.receipt_intake_enabled = true
        AND credential.external_account_id = account.external_account_id
        AND account.commerce_credential_generation = receipt.credential_version

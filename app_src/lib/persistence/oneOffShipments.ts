@@ -4,12 +4,21 @@ import { recordAuditEvent } from '@/lib/auditWriter'
 import {
   CarrierIntegrationRequestError,
   getCarrierIntegrationsState,
+  resolveCarrierProductionRatingRuntime,
   testCarrierSandboxShipmentRate,
 } from '@/lib/integrations/carrierIntegrations'
+import {
+  CarrierWholeShipmentRateClientError,
+  executeCarrierWholeShipmentRateRequest,
+} from '@/lib/integrations/carrierWholeShipmentRateClient'
+import {
+  prepareCarrierWholeShipmentRateRequest,
+} from '@/lib/integrations/carrierWholeShipmentRateFoundation'
 import {
   oneOffProviderLabel,
   oneOffRateEnvironment,
   oneOffShipmentHash,
+  ONE_OFF_MAX_SYNCHRONOUS_PACKAGES,
   type OneOffCarrierProvider,
   type OneOffRateEnvironment,
   type OneOffShipmentCreateResult,
@@ -110,6 +119,15 @@ function integer(
     )
   }
   return parsed
+}
+
+function phone(value: unknown, label: string) {
+  const normalized = String(value ?? '').trim()
+  const digits = normalized.replace(/[^0-9]/g, '')
+  if (digits.length < 7 || digits.length > 15) {
+    requestError('OPERATIONS_ONE_OFF_REQUEST_INVALID', `${label} is invalid`)
+  }
+  return digits
 }
 
 function globalId(value: unknown, label: string, pattern: RegExp) {
@@ -295,15 +313,25 @@ export function validateOneOffShipmentQuoteInput(value: unknown): OneOffShipment
     [
       'customerGlobalId', 'warehouseGlobalId', 'inventoryPoolGlobalId',
       'receivingLocationGlobalId', 'referenceNumber', 'currency',
-      'requestedDeliveryAt', 'shipTo', 'lines', 'packages',
+      'requestedDeliveryAt', 'shipFromPhone', 'shipToPhone',
+      'shipToResidential',
+      'shipTo', 'lines', 'packages', 'executionMode',
     ],
     'One-off shipment quote',
   )
   if (!Array.isArray(source.lines) || source.lines.length < 1 || source.lines.length > 25) {
     requestError('OPERATIONS_ONE_OFF_REQUEST_INVALID', 'A one-off shipment requires 1-25 lines')
   }
-  if (!Array.isArray(source.packages) || source.packages.length < 1 || source.packages.length > 50) {
-    requestError('OPERATIONS_ONE_OFF_REQUEST_INVALID', 'A one-off shipment requires 1-50 parcels')
+  if (
+    !Array.isArray(source.packages)
+    || source.packages.length < 1
+    || source.packages.length > ONE_OFF_MAX_SYNCHRONOUS_PACKAGES
+  ) {
+    requestError(
+      'OPERATIONS_ONE_OFF_PACKAGE_COUNT_UNSUPPORTED',
+      `One-off synchronous shipment execution requires 1-${ONE_OFF_MAX_SYNCHRONOUS_PACKAGES} parcels`,
+      409,
+    )
   }
   const lines = source.lines.map(line)
   const packages = source.packages.map(parcel)
@@ -372,6 +400,12 @@ export function validateOneOffShipmentQuoteInput(value: unknown): OneOffShipment
     requestedDeliveryAt = parsed.toISOString()
   }
   return {
+    executionMode: source.executionMode === 'live' ? 'live' : source.executionMode === 'test'
+      ? 'test'
+      : requestError(
+          'OPERATIONS_ONE_OFF_EXECUTION_MODE_INVALID',
+          'Choose test or live shipping explicitly',
+        ),
     customerGlobalId: globalId(source.customerGlobalId, 'Customer', CUSTOMER_GLOBAL_ID),
     warehouseGlobalId: globalId(source.warehouseGlobalId, 'Warehouse', WAREHOUSE_GLOBAL_ID),
     inventoryPoolGlobalId: globalId(
@@ -387,6 +421,14 @@ export function validateOneOffShipmentQuoteInput(value: unknown): OneOffShipment
     referenceNumber: text(source.referenceNumber, 'Shipment reference', 120),
     currency,
     requestedDeliveryAt,
+    shipFromPhone: phone(source.shipFromPhone, 'Sender phone'),
+    shipToPhone: phone(source.shipToPhone, 'Recipient phone'),
+    shipToResidential: typeof source.shipToResidential === 'boolean'
+      ? source.shipToResidential
+      : requestError(
+          'OPERATIONS_ONE_OFF_DESTINATION_TYPE_REQUIRED',
+          'Choose whether the recipient address is residential or commercial',
+        ),
     shipTo: address(source.shipTo),
     lines,
     packages,
@@ -505,17 +547,23 @@ type EnabledCarrier = {
 async function enabledCarriers(
   organizationId: string,
   warehouseGlobalId?: string,
+  environment: OneOffRateEnvironment = 'sandbox',
 ): Promise<EnabledCarrier[]> {
-  if (oneOffRateEnvironment() !== 'sandbox') return []
   const state = await getCarrierIntegrationsState(organizationId)
   const eligible = state.accounts.filter((account) => (
     (account.provider === 'ups_rest' || account.provider === 'fedex_rest')
-    && account.environment === 'sandbox'
+    && account.environment === environment
     && account.status === 'active'
     && account.configured
     && account.verificationStatus === 'verified'
     && account.credentialVersion > 0
-    && account.allowedCapabilities.includes('sandbox_rate')
+    && account.allowedCapabilities.includes(
+      environment === 'production' ? 'production_rate' : 'sandbox_rate',
+    )
+    && (
+      environment !== 'production'
+      || account.allowedCapabilities.includes('production_label')
+    )
     && (
       !warehouseGlobalId
       || !account.senderOriginWarehouseGlobalId
@@ -608,7 +656,7 @@ export async function readOneOffShipmentWorkspaceFromPostgres(input: {
 }): Promise<OneOffShipmentWorkspace> {
   const organizationId = requireOrganizationId(input.organizationId)
   const resolvedActivation = await withTransaction((client) => activation(client, organizationId))
-  const [customers, warehouses, pools, locations, products, carriers] = await Promise.all([
+  const [customers, warehouses, pools, locations, products, sandboxCarriers, productionCarriers] = await Promise.all([
     query<{ global_id: string; name: string }>(
       `SELECT reference_code AS global_id, name
        FROM crm_organizations
@@ -727,7 +775,8 @@ export async function readOneOffShipmentWorkspaceFromPostgres(input: {
        LIMIT 1000`,
       [organizationId, resolvedActivation.pipeline_id],
     ),
-    enabledCarriers(organizationId),
+    enabledCarriers(organizationId, undefined, 'sandbox'),
+    enabledCarriers(organizationId, undefined, 'production'),
   ])
   const locationsByWarehouse = new Map<string, Array<{ globalId: string; code: string }>>()
   for (const location of locations.rows) {
@@ -744,6 +793,39 @@ export async function readOneOffShipmentWorkspaceFromPostgres(input: {
   const idByGlobal = new Map(warehouseIds.rows.map((row) => [row.global_id, row.id]))
   return {
     environment: oneOffRateEnvironment(),
+    executionModes: [
+      {
+        mode: 'test',
+        environment: 'sandbox',
+        enabled: resolvedActivation.state === 'shadow' && sandboxCarriers.length > 0,
+        blockers: [
+          ...(resolvedActivation.state === 'shadow'
+            ? []
+            : ['TEST execution requires Operations Shadow']),
+          ...(sandboxCarriers.length
+            ? []
+            : ['Enable a verified sandbox UPS or FedEx sender account']),
+        ],
+      },
+      {
+        mode: 'live',
+        environment: 'production',
+        enabled: oneOffRateEnvironment() === 'production'
+          && resolvedActivation.state === 'active'
+          && productionCarriers.length > 0,
+        blockers: [
+          ...(oneOffRateEnvironment() === 'production'
+            ? []
+            : ['Live postage is available only in the production runtime']),
+          ...(resolvedActivation.state === 'active'
+            ? []
+            : ['Activate Operations before buying live postage']),
+          ...(productionCarriers.length
+            ? []
+            : ['Enable a verified production UPS or FedEx sender account with live-label authorization']),
+        ],
+      },
+    ],
     customers: customers.rows.map((customer) => ({
       globalId: customer.global_id,
       name: customer.name,
@@ -781,10 +863,10 @@ export async function readOneOffShipmentWorkspaceFromPostgres(input: {
         availableQuantity: numberValue(item.availableQuantity),
       })),
     })),
-    carriers: carriers.map((carrier) => ({
+    carriers: [...sandboxCarriers, ...productionCarriers].map((carrier) => ({
       provider: carrier.provider,
       providerLabel: oneOffProviderLabel(carrier.provider),
-      environment: 'sandbox',
+      environment: productionCarriers.includes(carrier) ? 'production' : 'sandbox',
       integrationAccountGlobalId: carrier.integrationAccountGlobalId,
       carrierAccountGlobalId: carrier.carrierAccountGlobalId,
       displayName: carrier.displayName,
@@ -795,11 +877,15 @@ export async function readOneOffShipmentWorkspaceFromPostgres(input: {
 
 type ResolvedQuoteScope = {
   pipelineId: string
+  activationState: ActivationRow['state']
   customerId: string
   warehouseId: string
   poolId: string
   locationId: string
+  warehouseAddress: Address
   linesSnapshot: ResolvedLineSnapshot[]
+  packedRerateOrderId: string | null
+  packedReratePlanId: string | null
 }
 
 type ResolvedLineSnapshot = {
@@ -825,6 +911,7 @@ type ResolvedLineSnapshot = {
     onHandQuantity: number
     reservedQuantity: number
     damagedQuantity: number
+    releasableReservedQuantity?: number
   }>
   physicalUnitsOnHandConfirmed?: true
   productSourceKey?: string
@@ -834,6 +921,7 @@ async function resolveQuoteScope(
   client: PoolClient,
   organizationId: string,
   quote: OneOffShipmentQuoteInput,
+  inventoryReservationOrderGlobalId: string | null = null,
 ): Promise<ResolvedQuoteScope> {
   const resolvedActivation = await activation(client, organizationId)
   const customer = await client.query<{ id: string }>(
@@ -848,8 +936,8 @@ async function resolveQuoteScope(
   if (!customer.rows[0]) {
     requestError('OPERATIONS_ONE_OFF_CUSTOMER_NOT_FOUND', 'Select an active CRM customer', 404)
   }
-  const warehouse = await client.query<{ id: string }>(
-    `SELECT id::text
+  const warehouse = await client.query<{ id: string; name: string; address: unknown }>(
+    `SELECT id::text, name, address
      FROM operations_warehouses
      WHERE organization_id = $1::uuid AND global_id = $2 AND status = 'active'
        AND code <> 'MOCK-01'
@@ -858,6 +946,35 @@ async function resolveQuoteScope(
   )
   if (!warehouse.rows[0]) {
     requestError('OPERATIONS_ONE_OFF_WAREHOUSE_NOT_FOUND', 'Select an active warehouse', 404)
+  }
+  const packedRerate = inventoryReservationOrderGlobalId
+    ? await client.query<{ order_id: string; plan_id: string }>(
+        `SELECT source_order.id::text AS order_id, plan.id::text AS plan_id
+         FROM operations_orders source_order
+         JOIN LATERAL (
+           SELECT candidate.id
+           FROM operations_fulfillment_plans candidate
+           WHERE candidate.organization_id = source_order.organization_id
+             AND candidate.order_id = source_order.id
+           ORDER BY candidate.version_number DESC, candidate.created_at DESC,
+                    candidate.id DESC
+           LIMIT 1
+         ) plan ON true
+         WHERE source_order.organization_id = $1::uuid
+           AND source_order.global_id = $2
+           AND source_order.source_provider = 'clawpilot_native'
+           AND source_order.order_type = 'one_off'
+           AND source_order.status = 'packed'
+         LIMIT 1`,
+        [organizationId, inventoryReservationOrderGlobalId],
+      )
+    : { rows: [] as Array<{ order_id: string; plan_id: string }> }
+  if (inventoryReservationOrderGlobalId && !packedRerate.rows[0]) {
+    requestError(
+      'OPERATIONS_ONE_OFF_PACKED_RERATE_CONTEXT_INVALID',
+      'Packed rerating requires the exact current native one-off order and plan',
+      409,
+    )
   }
   const pool = await client.query<{
     id: string
@@ -1001,11 +1118,23 @@ async function resolveQuoteScope(
         on_hand_quantity: string
         reserved_quantity: string
         damaged_quantity: string
+        releasable_reserved_quantity: string
       }>(
         `SELECT position.product_id::text, position.global_id,
                 location.global_id AS location_global_id,
                 position.version::text, position.on_hand_quantity::text,
-                position.reserved_quantity::text, position.damaged_quantity::text
+                position.reserved_quantity::text, position.damaged_quantity::text,
+                COALESCE((
+                  SELECT sum(reservation.quantity)
+                  FROM operations_reservations reservation
+                  JOIN operations_orders reserved_order
+                    ON reserved_order.organization_id = reservation.organization_id
+                   AND reserved_order.id = reservation.order_id
+                  WHERE reservation.organization_id = position.organization_id
+                    AND reservation.position_id = position.id
+                    AND reservation.status = 'active'
+                    AND reserved_order.global_id = $6
+                ), 0)::text AS releasable_reserved_quantity
          FROM operations_inventory_positions position
          JOIN operations_locations location
            ON location.organization_id = position.organization_id
@@ -1025,6 +1154,7 @@ async function resolveQuoteScope(
           warehouse.rows[0].id,
           pool.rows[0].id,
           productIds,
+          inventoryReservationOrderGlobalId || '',
         ],
       )
     : { rows: [] as Array<{
@@ -1035,6 +1165,7 @@ async function resolveQuoteScope(
         on_hand_quantity: string
         reserved_quantity: string
         damaged_quantity: string
+        releasable_reserved_quantity: string
       }> }
   const inventoryByProductId = new Map<string, ResolvedLineSnapshot['inventoryPositions']>()
   for (const position of inventory.rows) {
@@ -1046,6 +1177,9 @@ async function resolveQuoteScope(
       onHandQuantity: numberValue(position.on_hand_quantity),
       reservedQuantity: numberValue(position.reserved_quantity),
       damagedQuantity: numberValue(position.damaged_quantity),
+      releasableReservedQuantity: numberValue(
+        position.releasable_reserved_quantity,
+      ),
     })
     inventoryByProductId.set(position.product_id, current)
   }
@@ -1071,7 +1205,8 @@ async function resolveQuoteScope(
     const product = productByGlobalId.get(item.productGlobalId)!
     const inventoryPositions = inventoryByProductId.get(product.id) || []
     const availableQuantityAtQuote = inventoryPositions.reduce((sum, position) => (
-      sum + position.onHandQuantity - position.reservedQuantity - position.damagedQuantity
+      sum + position.onHandQuantity - position.reservedQuantity
+        - position.damagedQuantity + (position.releasableReservedQuantity || 0)
     ), 0)
     if (availableQuantityAtQuote < item.quantity) {
       requestError(
@@ -1118,11 +1253,18 @@ async function resolveQuoteScope(
   }
   return {
     pipelineId: resolvedActivation.pipeline_id,
+    activationState: resolvedActivation.state,
     customerId: customer.rows[0].id,
     warehouseId: warehouse.rows[0].id,
     poolId: pool.rows[0].id,
     locationId: location.rows[0].id,
+    warehouseAddress: {
+      ...workspaceAddress(warehouse.rows[0].address),
+      name: workspaceAddress(warehouse.rows[0].address).name || warehouse.rows[0].name,
+    },
     linesSnapshot,
+    packedRerateOrderId: packedRerate.rows[0]?.order_id || null,
+    packedReratePlanId: packedRerate.rows[0]?.plan_id || null,
   }
 }
 
@@ -1233,6 +1375,7 @@ type QuoteRow = QueryResultRow & {
   reference_number: string
   status: 'succeeded' | 'partial' | 'failed'
   rate_environment: OneOffRateEnvironment
+  execution_mode: 'test' | 'live'
   required_carrier_providers: OneOffCarrierProvider[]
   expires_at: Date
 }
@@ -1248,6 +1391,9 @@ type OfferRow = QueryResultRow & {
   transit_days: number | null
   estimated_delivery_at: Date | null
   rate_evidence_global_id: string
+  integration_account_global_id: string
+  carrier_account_global_id: string
+  credential_version: number
 }
 
 function quoteFromRows(row: QuoteRow, offers: OfferRow[]): OneOffShipmentQuote {
@@ -1256,6 +1402,7 @@ function quoteFromRows(row: QuoteRow, offers: OfferRow[]): OneOffShipmentQuote {
     referenceNumber: row.reference_number,
     status: row.status,
     environment: row.rate_environment,
+    executionMode: row.execution_mode,
     requiredCarrierProviders: row.required_carrier_providers,
     expiresAt: new Date(row.expires_at).toISOString(),
     offers: offers.map((offer) => ({
@@ -1272,6 +1419,9 @@ function quoteFromRows(row: QuoteRow, offers: OfferRow[]): OneOffShipmentQuote {
         ? new Date(offer.estimated_delivery_at).toISOString()
         : null,
       rateEvidenceGlobalId: offer.rate_evidence_global_id,
+      integrationAccountGlobalId: offer.integration_account_global_id,
+      carrierAccountGlobalId: offer.carrier_account_global_id,
+      credentialVersion: offer.credential_version,
     })),
     effects: {
       carrierRateReads: row.required_carrier_providers.length,
@@ -1289,6 +1439,7 @@ async function readQuoteById(
 ): Promise<OneOffShipmentQuote> {
   const quote = await query<QuoteRow>(
     `SELECT id::text, global_id, reference_number, status, rate_environment,
+            execution_mode,
             required_carrier_providers, expires_at
      FROM operations_one_off_shipment_quotes
      WHERE organization_id = $1::uuid AND id = $2::uuid
@@ -1299,15 +1450,53 @@ async function readQuoteById(
     requestError('OPERATIONS_ONE_OFF_QUOTE_NOT_FOUND', 'One-off shipment quote was not found', 404)
   }
   const offers = await query<OfferRow>(
-    `SELECT global_id, provider, environment, service_code, service_name,
-            amount_minor::text, currency, transit_days,
-            estimated_delivery_at, rate_evidence_global_id
-     FROM operations_one_off_shipment_quote_offers
-     WHERE organization_id = $1::uuid AND quote_id = $2::uuid
-     ORDER BY amount_minor, provider, service_code, id`,
+    `SELECT offer.global_id, offer.provider, offer.environment,
+            offer.service_code, offer.service_name, offer.amount_minor::text,
+            offer.currency, offer.transit_days, offer.estimated_delivery_at,
+            offer.rate_evidence_global_id,
+            integration.global_id AS integration_account_global_id,
+            carrier_account.global_id AS carrier_account_global_id,
+            offer.credential_version
+     FROM operations_one_off_shipment_quote_offers offer
+     JOIN operations_integration_accounts integration
+       ON integration.organization_id = offer.organization_id
+      AND integration.id = offer.integration_account_id
+     JOIN operations_carrier_accounts carrier_account
+       ON carrier_account.organization_id = offer.organization_id
+      AND carrier_account.integration_account_id = offer.integration_account_id
+      AND carrier_account.id = offer.carrier_account_id
+     WHERE offer.organization_id = $1::uuid AND offer.quote_id = $2::uuid
+     ORDER BY offer.amount_minor, offer.provider, offer.service_code, offer.id`,
     [organizationId, quoteId],
   )
   return quoteFromRows(quote.rows[0], offers.rows)
+}
+
+export async function readOneOffShipmentQuoteExecutionModeFromPostgres(input: {
+  organizationId: string
+  quoteGlobalId: string
+}) {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const quoteGlobalId = globalId(
+    input.quoteGlobalId,
+    'One-off shipment quote',
+    QUOTE_GLOBAL_ID,
+  )
+  const result = await query<{ execution_mode: 'test' | 'live' }>(
+    `SELECT execution_mode
+     FROM operations_one_off_shipment_quotes
+     WHERE organization_id = $1::uuid AND global_id = $2
+     LIMIT 1`,
+    [organizationId, quoteGlobalId],
+  )
+  if (!result.rows[0]) {
+    requestError(
+      'OPERATIONS_ONE_OFF_QUOTE_NOT_FOUND',
+      'One-off shipment quote was not found',
+      404,
+    )
+  }
+  return result.rows[0].execution_mode
 }
 
 type ProviderAttempt = {
@@ -1327,7 +1516,7 @@ type ProviderAttempt = {
   testedAt: string | null
 }
 
-async function attemptCarrierQuote(input: {
+async function attemptSandboxCarrierQuote(input: {
   organizationId: string
   actorEmail: string
   carrier: EnabledCarrier
@@ -1376,23 +1565,385 @@ async function attemptCarrierQuote(input: {
   }
 }
 
+function productionAddressMatches(
+  warehouse: Address,
+  registered: {
+    line1: string
+    line2: string | null
+    city: string
+    region: string
+    postalCode: string
+    countryCode: string
+  },
+) {
+  const normalized = (value: unknown) => String(value || '').trim().toUpperCase()
+  return normalized(warehouse.line1) === normalized(registered.line1)
+    && normalized(warehouse.line2) === normalized(registered.line2)
+    && normalized(warehouse.city) === normalized(registered.city)
+    && normalized(warehouse.region) === normalized(registered.region)
+    && normalized(warehouse.postalCode) === normalized(registered.postalCode)
+    && normalized(warehouse.country) === normalized(registered.countryCode)
+}
+
+function ratesFromProductionEvidence(value: unknown): ProviderAttempt['rates'] {
+  const source = value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+  const rows = Array.isArray(source.rates) ? source.rates : []
+  return rows.flatMap((value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return []
+    const rate = value as Record<string, unknown>
+    const serviceCode = String(rate.serviceCode || '').trim()
+    const serviceName = String(rate.serviceName || '').trim()
+    const amount = String(rate.amount || '').trim()
+    const currency = String(rate.currency || '').trim()
+    if (!serviceCode || !serviceName || !MONEY.test(amount) || !currency) return []
+    return [{
+      serviceCode,
+      serviceName,
+      amount,
+      currency,
+      rateType: typeof rate.rateType === 'string' ? rate.rateType : null,
+      transitDays: Number.isSafeInteger(rate.transitDays) ? Number(rate.transitDays) : null,
+      deliveryDate: typeof rate.deliveryDate === 'string' ? rate.deliveryDate : null,
+    }]
+  })
+}
+
+async function attemptProductionCarrierQuote(input: {
+  organizationId: string
+  actorEmail: string
+  idempotencyKey: string
+  carrier: EnabledCarrier
+  quote: OneOffShipmentQuoteInput
+  scope: ResolvedQuoteScope
+}): Promise<ProviderAttempt> {
+  const attemptIdempotencyKey = `one-off-rate:${oneOffShipmentHash({
+    organizationId: input.organizationId,
+    idempotencyKey: input.idempotencyKey,
+    provider: input.carrier.provider,
+  })}`
+  try {
+    if (input.quote.currency !== 'USD') {
+      requestError(
+        'OPERATIONS_ONE_OFF_LIVE_CURRENCY_UNSUPPORTED',
+        'Live UPS and FedEx one-off rating currently requires USD',
+        409,
+      )
+    }
+    const runtime = await resolveCarrierProductionRatingRuntime({
+      organizationId: input.organizationId,
+      provider: input.carrier.provider,
+      integrationAccountGlobalId: input.carrier.integrationAccountGlobalId,
+      carrierAccountGlobalId: input.carrier.carrierAccountGlobalId,
+    })
+    if (!productionAddressMatches(input.scope.warehouseAddress, runtime.registeredAddress)) {
+      requestError(
+        'OPERATIONS_ONE_OFF_LIVE_ORIGIN_MISMATCH',
+        'The selected warehouse address must exactly match the verified production carrier sender address',
+        409,
+      )
+    }
+    const prepared = prepareCarrierWholeShipmentRateRequest({
+      binding: {
+        organizationId: runtime.organizationId,
+        carrierAccountId: runtime.carrierAccountId,
+        integrationAccountId: runtime.integrationAccountId,
+        credentialRevision: runtime.credentialVersion,
+        credentialFingerprint: runtime.credentialFingerprint,
+        accountNumber: runtime.credential.accountNumber,
+        accountNumberFingerprint: runtime.accountNumberFingerprint,
+        provider: runtime.provider,
+        environment: 'production',
+      },
+      origin: {
+        name: input.scope.warehouseAddress.name,
+        phone: input.quote.shipFromPhone,
+        line1: input.scope.warehouseAddress.line1,
+        line2: input.scope.warehouseAddress.line2 || null,
+        city: input.scope.warehouseAddress.city,
+        region: input.scope.warehouseAddress.region,
+        postalCode: input.scope.warehouseAddress.postalCode,
+        countryCode: 'US',
+        residential: false,
+      },
+      destination: {
+        name: input.quote.shipTo.name,
+        line1: input.quote.shipTo.line1,
+        line2: input.quote.shipTo.line2 || null,
+        city: input.quote.shipTo.city,
+        region: input.quote.shipTo.region,
+        postalCode: input.quote.shipTo.postalCode,
+        countryCode: 'US',
+        residential: input.quote.shipToResidential,
+      },
+      parcels: carrierParcels(input.quote.packages),
+      billing: {
+        relationship: 'sender',
+        payerAccountNumber: runtime.credential.accountNumber,
+        payerAccountNumberFingerprint: runtime.accountNumberFingerprint,
+        payerPostalCode: input.scope.warehouseAddress.postalCode,
+        payerCountryCode: 'US',
+      },
+      expectedCurrency: 'USD',
+      fedexPickupType: runtime.provider === 'fedex_rest'
+        ? 'DROPOFF_AT_FEDEX_LOCATION'
+        : null,
+    })
+    const preparedAttempt = await withTransaction(async (client) => {
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:one-off-rate-attempt:${input.organizationId}:${runtime.provider}:${prepared.requestHash}`,
+      )
+      const exactAttempt = await client.query<{
+        id: string
+        state: 'prepared' | 'succeeded' | 'failed' | 'unknown'
+        rate_evidence_global_id: string | null
+        attempt_idempotency_key: string
+      }>(
+        `SELECT id::text, state, rate_evidence_global_id,
+                attempt_idempotency_key
+         FROM operations_one_off_shipment_rate_attempts
+         WHERE organization_id = $1::uuid
+           AND attempt_idempotency_key = $2
+         LIMIT 1
+         FOR UPDATE`,
+        [input.organizationId, attemptIdempotencyKey],
+      )
+      if (exactAttempt.rows[0]) {
+        return { ...exactAttempt.rows[0], replayed: true }
+      }
+      const unresolvedSemanticAttempt = await client.query<{
+        id: string
+        state: 'prepared' | 'unknown'
+        rate_evidence_global_id: null
+        attempt_idempotency_key: string
+      }>(
+        `SELECT id::text, state, rate_evidence_global_id,
+                attempt_idempotency_key
+         FROM operations_one_off_shipment_rate_attempts
+         WHERE organization_id = $1::uuid
+           AND provider = $2
+           AND request_hash = $3
+           AND state IN ('prepared', 'unknown')
+         ORDER BY requested_at DESC, id DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [input.organizationId, runtime.provider, prepared.requestHash],
+      )
+      if (unresolvedSemanticAttempt.rows[0]) {
+        // The semantic request fence is independent of the caller's quote
+        // key. Rotating Idempotency-Key after a timeout must never cause a
+        // second provider read. A prior success is deliberately not reused
+        // across keys because a fresh quote is an explicit fresh-rate read.
+        return { ...unresolvedSemanticAttempt.rows[0], replayed: true }
+      }
+      const inserted = await client.query<{ id: string; state: 'prepared' }>(
+        `INSERT INTO operations_one_off_shipment_rate_attempts (
+           organization_id, quote_idempotency_key, provider,
+           integration_account_id, carrier_account_id, environment,
+           adapter_version, attempt_idempotency_key, request_hash,
+           redacted_request, actor_email
+         ) VALUES (
+           $1::uuid, $2, $3, $4::uuid, $5::uuid, 'production',
+           $6, $7, $8, $9::jsonb, $10
+         )
+         RETURNING id::text, state`,
+        [
+          input.organizationId,
+          input.idempotencyKey,
+          runtime.provider,
+          runtime.integrationAccountId,
+          runtime.carrierAccountId,
+          prepared.adapterVersion,
+          attemptIdempotencyKey,
+          prepared.requestHash,
+          JSON.stringify(prepared.redactedRequest),
+          input.actorEmail,
+        ],
+      )
+      return { ...inserted.rows[0], rate_evidence_global_id: null, replayed: false }
+    })
+    if (preparedAttempt.replayed) {
+      if (preparedAttempt.state === 'succeeded' && preparedAttempt.rate_evidence_global_id) {
+        const evidence = await query<{
+          global_id: string
+          redacted_response: Record<string, unknown>
+          completed_at: Date
+        }>(
+          `SELECT global_id, redacted_response, completed_at
+           FROM operations_carrier_rate_requests
+           WHERE organization_id = $1::uuid AND global_id = $2
+             AND environment = 'production' AND status = 'succeeded'
+           LIMIT 1`,
+          [input.organizationId, preparedAttempt.rate_evidence_global_id],
+        )
+        if (evidence.rows[0]) {
+          return {
+            carrier: input.carrier,
+            status: 'succeeded',
+            evidenceGlobalId: evidence.rows[0].global_id,
+            errorCode: null,
+            rates: ratesFromProductionEvidence(evidence.rows[0].redacted_response),
+            testedAt: evidence.rows[0].completed_at.toISOString(),
+          }
+        }
+      }
+      requestError(
+        'OPERATIONS_ONE_OFF_LIVE_RATE_RECONCILIATION_REQUIRED',
+        'A durable live carrier-rate attempt already exists; reconcile it before another provider call',
+        409,
+      )
+    }
+    try {
+      const result = await executeCarrierWholeShipmentRateRequest({
+        preparedRequest: prepared,
+        runtimeCredential: {
+          provider: runtime.provider,
+          environment: 'production',
+          credential: runtime.credential,
+        },
+      })
+      const evidenceGlobalId = await withTransaction(async (client) => {
+        const evidence = await client.query<{ global_id: string }>(
+          `INSERT INTO operations_carrier_rate_requests (
+             organization_id, integration_account_id, carrier_account_id,
+             provider, environment, purpose, adapter_version,
+             credential_version, request_hash, billing_relationship,
+             billing_selection_snapshot, redacted_request, redacted_response,
+             status, provider_reference, error_code, actor_email,
+             requested_at, completed_at
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, $4, 'production',
+             'cartonization_shipment_rate', $5, $6, $7, 'sender',
+             $8::jsonb, $9::jsonb, $10::jsonb, 'succeeded', $11,
+             NULL, $12, $13::timestamptz, $14::timestamptz
+           )
+           RETURNING global_id`,
+          [
+            input.organizationId,
+            runtime.integrationAccountId,
+            runtime.carrierAccountId,
+            runtime.provider,
+            prepared.adapterVersion,
+            runtime.credentialVersion,
+            result.evidence.requestHash,
+            JSON.stringify({
+              relationship: 'sender',
+              carrierAccountGlobalId: runtime.carrierAccountGlobalId,
+              accountNumberLastFour: runtime.accountNumberLastFour,
+            }),
+            JSON.stringify(result.evidence.redactedRequest),
+            JSON.stringify(result.evidence.redactedResponse),
+            result.evidence.providerReference,
+            input.actorEmail,
+            result.evidence.requestedAt,
+            result.evidence.completedAt,
+          ],
+        )
+        await client.query(
+          `UPDATE operations_one_off_shipment_rate_attempts
+           SET state = 'succeeded', rate_evidence_global_id = $3,
+               redacted_response = $4::jsonb, provider_reference = $5,
+               completed_at = $6::timestamptz
+           WHERE organization_id = $1::uuid AND id = $2::uuid
+             AND state = 'prepared'`,
+          [
+            input.organizationId,
+            preparedAttempt.id,
+            evidence.rows[0].global_id,
+            JSON.stringify(result.evidence.redactedResponse),
+            result.evidence.providerReference,
+            result.evidence.completedAt,
+          ],
+        )
+        return evidence.rows[0].global_id
+      })
+      return {
+        carrier: input.carrier,
+        status: 'succeeded',
+        evidenceGlobalId,
+        errorCode: null,
+        rates: result.rates,
+        testedAt: result.evidence.completedAt,
+      }
+    } catch (error) {
+      const providerError = error instanceof CarrierWholeShipmentRateClientError
+        ? error
+        : null
+      const unknown = providerError?.code === 'CARRIER_PROVIDER_TIMEOUT'
+        || providerError?.code === 'CARRIER_PROVIDER_UNAVAILABLE'
+      await query(
+        `UPDATE operations_one_off_shipment_rate_attempts
+         SET state = $3, error_code = $4,
+             redacted_response = $5::jsonb, completed_at = now()
+         WHERE organization_id = $1::uuid AND id = $2::uuid
+           AND state = 'prepared'`,
+        [
+          input.organizationId,
+          preparedAttempt.id,
+          unknown ? 'unknown' : 'failed',
+          providerError?.code || 'CARRIER_PRODUCTION_RATE_EXECUTION_FAILED',
+          JSON.stringify({
+            provider: runtime.provider,
+            environment: 'production',
+            requestHash: prepared.requestHash,
+            errorCode: providerError?.code || 'CARRIER_PRODUCTION_RATE_EXECUTION_FAILED',
+          }),
+        ],
+      )
+      throw error
+    }
+  } catch (error) {
+    const carrierError = error instanceof CarrierIntegrationRequestError
+      || error instanceof CarrierWholeShipmentRateClientError
+      || error instanceof OneOffShipmentPersistenceError
+      ? error
+      : null
+    return {
+      carrier: input.carrier,
+      status: 'failed',
+      evidenceGlobalId: null,
+      errorCode: carrierError && 'code' in carrierError
+        ? String(carrierError.code)
+        : 'CARRIER_INTERNAL_ERROR',
+      rates: [],
+      testedAt: null,
+    }
+  }
+}
+
 export async function quoteOneOffShipmentInPostgres(input: {
   organizationId: string
   actorEmail: string
   idempotencyKey: string
   quote: unknown
+  /** Internal packed-rerate authority: include only this order's active
+   * reservations when rechecking inventory. This is never accepted from the
+   * public request payload. */
+  inventoryReservationOrderGlobalId?: string | null
 }): Promise<OneOffShipmentQuote> {
   const organizationId = requireOrganizationId(input.organizationId)
   const idempotencyKey = requireIdempotencyKey(input.idempotencyKey)
-  if (oneOffRateEnvironment() !== 'sandbox') {
+  const quote = validateOneOffShipmentQuoteInput(input.quote)
+  const inventoryReservationOrderGlobalId = input.inventoryReservationOrderGlobalId
+    ? globalId(
+        input.inventoryReservationOrderGlobalId,
+        'Reserved one-off order',
+        /^gor(?:[0-9]{7}|[0-9a-v]{12})$/,
+      )
+    : null
+  if (quote.executionMode === 'live' && oneOffRateEnvironment() !== 'production') {
     requestError(
-      'OPERATIONS_ONE_OFF_PRODUCTION_NOT_ENABLED',
-      'Production one-off carrier rating is not enabled; use the development sandbox workflow',
+      'OPERATIONS_ONE_OFF_LIVE_RUNTIME_REQUIRED',
+      'Live carrier rating and postage are available only in the production runtime',
       409,
     )
   }
-  const quote = validateOneOffShipmentQuoteInput(input.quote)
-  const requestHash = oneOffShipmentHash(quote)
+  const requestHash = oneOffShipmentHash({
+    quote,
+    inventoryReservationOrderGlobalId,
+  })
   const command = await prepareQuoteCommand({
     organizationId,
     idempotencyKey,
@@ -1411,22 +1962,58 @@ export async function quoteOneOffShipmentInPostgres(input: {
   }
   try {
     const [scope, carriers] = await Promise.all([
-      withTransaction((client) => resolveQuoteScope(client, organizationId, quote)),
-      enabledCarriers(organizationId, quote.warehouseGlobalId),
+      withTransaction((client) => resolveQuoteScope(
+        client,
+        organizationId,
+        quote,
+        inventoryReservationOrderGlobalId,
+      )),
+      enabledCarriers(
+        organizationId,
+        quote.warehouseGlobalId,
+        quote.executionMode === 'live' ? 'production' : 'sandbox',
+      ),
     ])
     if (!carriers.length) {
       requestError(
         'OPERATIONS_ONE_OFF_CARRIER_REQUIRED',
-        'Enable and verify a UPS or FedEx sandbox account for the selected warehouse',
+        quote.executionMode === 'live'
+          ? 'Enable a verified production UPS or FedEx sender account with live-label authorization for the selected warehouse'
+          : 'Enable and verify a UPS or FedEx sandbox account for the selected warehouse',
         409,
       )
     }
-    const attempts = await Promise.all(carriers.map((carrier) => attemptCarrierQuote({
-      organizationId,
-      actorEmail: input.actorEmail,
-      carrier,
-      quote,
-    })))
+    if (
+      (quote.executionMode === 'live' && scope.activationState !== 'active')
+      || (quote.executionMode === 'test' && scope.activationState !== 'shadow')
+    ) {
+      requestError(
+        quote.executionMode === 'live'
+          ? 'OPERATIONS_ONE_OFF_ACTIVE_REQUIRED'
+          : 'OPERATIONS_ONE_OFF_SHADOW_REQUIRED',
+        quote.executionMode === 'live'
+          ? 'Live one-off rating requires Active Operations'
+          : 'Test one-off rating requires Operations Shadow',
+        409,
+      )
+    }
+    const attempts = await Promise.all(carriers.map((carrier) => (
+      quote.executionMode === 'live'
+        ? attemptProductionCarrierQuote({
+            organizationId,
+            actorEmail: input.actorEmail,
+            idempotencyKey,
+            carrier,
+            quote,
+            scope,
+          })
+        : attemptSandboxCarrierQuote({
+            organizationId,
+            actorEmail: input.actorEmail,
+            carrier,
+            quote,
+          })
+    )))
     const evidenceGlobalIds = attempts.flatMap((attempt) => (
       attempt.evidenceGlobalId ? [attempt.evidenceGlobalId] : []
     ))
@@ -1559,19 +2146,23 @@ export async function quoteOneOffShipmentInPostgres(input: {
         `INSERT INTO operations_one_off_shipment_quotes (
            organization_id, pipeline_id, customer_id, warehouse_id,
            inventory_pool_id, receiving_location_id, rate_environment,
+           execution_mode,
            reference_number, currency, requested_delivery_at,
            destination_snapshot, destination_hash,
            lines_snapshot, lines_hash, packages_snapshot, packages_hash,
            required_carrier_providers, provider_results_snapshot,
-           request_hash, status, idempotency_key, actor_email, expires_at
+           request_hash, status, idempotency_key, actor_email, expires_at,
+           packed_rerate_order_id, packed_rerate_plan_id
          ) VALUES (
            $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-           $5::uuid, $6::uuid, 'sandbox', $7, $8, $9::timestamptz,
-           $10::jsonb, $11, $12::jsonb, $13, $14::jsonb, $15,
-           $16::text[], $17::jsonb, $18, $19, $20, $21, $22::timestamptz
+           $5::uuid, $6::uuid, $7, $8, $9, $10, $11::timestamptz,
+           $12::jsonb, $13, $14::jsonb, $15, $16::jsonb, $17,
+           $18::text[], $19::jsonb, $20, $21, $22, $23, $24::timestamptz,
+           $25::uuid, $26::uuid
          )
          RETURNING id::text, global_id, reference_number, status,
-                   rate_environment, required_carrier_providers, expires_at`,
+                   rate_environment, execution_mode,
+                   required_carrier_providers, expires_at`,
         [
           organizationId,
           scope.pipelineId,
@@ -1579,11 +2170,23 @@ export async function quoteOneOffShipmentInPostgres(input: {
           scope.warehouseId,
           scope.poolId,
           scope.locationId,
+          quote.executionMode === 'live' ? 'production' : 'sandbox',
+          quote.executionMode,
           quote.referenceNumber,
           quote.currency,
           quote.requestedDeliveryAt,
-          JSON.stringify(quote.shipTo),
-          oneOffShipmentHash(quote.shipTo),
+          JSON.stringify({
+            ...quote.shipTo,
+            phone: quote.shipToPhone,
+            shipFromPhone: quote.shipFromPhone,
+            residential: quote.shipToResidential,
+          }),
+          oneOffShipmentHash({
+            ...quote.shipTo,
+            phone: quote.shipToPhone,
+            shipFromPhone: quote.shipFromPhone,
+            residential: quote.shipToResidential,
+          }),
           JSON.stringify(scope.linesSnapshot),
           oneOffShipmentHash(scope.linesSnapshot),
           JSON.stringify(quote.packages),
@@ -1595,6 +2198,8 @@ export async function quoteOneOffShipmentInPostgres(input: {
           idempotencyKey,
           input.actorEmail,
           expiresAt,
+          scope.packedRerateOrderId,
+          scope.packedReratePlanId,
         ],
       )
       const savedOffers: OfferRow[] = []
@@ -1607,9 +2212,9 @@ export async function quoteOneOffShipmentInPostgres(input: {
              transit_days, estimated_delivery_at, rate_evidence_global_id,
              carrier_request_hash, carrier_response_hash, offer_snapshot
            ) VALUES (
-             $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, 'sandbox', $6,
-             $7, $8, $9, $10, $11, $12::timestamptz, $13, $14, $15,
-             $16::jsonb
+             $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7,
+             $8, $9, $10, $11, $12, $13::timestamptz, $14, $15, $16,
+             $17::jsonb
            )
            RETURNING global_id, provider, environment, service_code,
                      service_name, amount_minor::text, currency, transit_days,
@@ -1620,6 +2225,7 @@ export async function quoteOneOffShipmentInPostgres(input: {
             draft.carrier.integrationAccountId,
             draft.carrier.carrierAccountId,
             draft.carrier.provider,
+            quote.executionMode === 'live' ? 'production' : 'sandbox',
             draft.carrier.credentialVersion,
             draft.rate.serviceCode,
             draft.rate.serviceName,
@@ -1644,7 +2250,13 @@ export async function quoteOneOffShipmentInPostgres(input: {
             }),
           ],
         )
-        savedOffers.push(offer.rows[0])
+        savedOffers.push({
+          ...offer.rows[0],
+          integration_account_global_id:
+            draft.carrier.integrationAccountGlobalId,
+          carrier_account_global_id: draft.carrier.carrierAccountGlobalId,
+          credential_version: draft.carrier.credentialVersion,
+        })
       }
       await client.query(
         `UPDATE operations_one_off_shipment_quote_commands
@@ -1849,10 +2461,15 @@ type LockedQuoteRow = QueryResultRow & {
   inventory_pool_id: string
   receiving_location_id: string
   rate_environment: OneOffRateEnvironment
+  execution_mode: 'test' | 'live'
   reference_number: string
   currency: string
   requested_delivery_at: Date | null
-  destination_snapshot: Address
+  destination_snapshot: Address & {
+    phone?: string
+    shipFromPhone?: string
+    residential?: boolean
+  }
   lines_snapshot: ResolvedLineSnapshot[]
   packages_snapshot: OneOffShipmentPackageInput[]
   status: 'succeeded' | 'partial' | 'failed'
@@ -2381,21 +2998,10 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
     return await withTransaction(async (client) => {
       await acquireTransactionAdvisoryLock(client, `operations:activation:${organizationId}`)
       const active = await activation(client, organizationId, true)
-      if (active.state !== 'shadow') {
-        requestError(
-          active.state === 'active'
-            ? 'OPERATIONS_ONE_OFF_ACTIVE_PRODUCTION_EVIDENCE_REQUIRED'
-            : 'OPERATIONS_ONE_OFF_SHADOW_REQUIRED',
-          active.state === 'active'
-            ? 'Active Operations requires sealed production planning evidence; create sandbox one-off shipments in Shadow'
-            : 'One-off shipment creation is enabled only while Operations is in Shadow',
-          409,
-        )
-      }
       const quoteResult = await client.query<LockedQuoteRow>(
         `SELECT id::text, global_id, pipeline_id::text, customer_id::text,
                 warehouse_id::text, inventory_pool_id::text,
-                receiving_location_id::text, rate_environment,
+                receiving_location_id::text, rate_environment, execution_mode,
                 reference_number, currency, requested_delivery_at,
                 destination_snapshot, lines_snapshot, packages_snapshot,
                 status, expires_at
@@ -2409,10 +3015,21 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
       if (!quote) {
         requestError('OPERATIONS_ONE_OFF_QUOTE_NOT_FOUND', 'One-off shipment quote was not found', 404)
       }
-      if (quote.rate_environment !== 'sandbox') {
+      if (
+        (quote.execution_mode === 'test' && (
+          quote.rate_environment !== 'sandbox' || active.state !== 'shadow'
+        ))
+        || (quote.execution_mode === 'live' && (
+          quote.rate_environment !== 'production' || active.state !== 'active'
+        ))
+      ) {
         requestError(
-          'OPERATIONS_ONE_OFF_PRODUCTION_NOT_ENABLED',
-          'This safe one-off shipment slice accepts sandbox quotes only',
+          quote.execution_mode === 'live'
+            ? 'OPERATIONS_ONE_OFF_ACTIVE_REQUIRED'
+            : 'OPERATIONS_ONE_OFF_SHADOW_REQUIRED',
+          quote.execution_mode === 'live'
+            ? 'Live one-off shipment plans require Active Operations and production rate evidence'
+            : 'Test one-off shipment plans require Operations Shadow and sandbox rate evidence',
           409,
         )
       }
@@ -2505,7 +3122,7 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
         )
       }
       if (
-        selectedOffer.environment !== 'sandbox'
+        selectedOffer.environment !== quote.rate_environment
         || selectedOffer.currency !== quote.currency
         || !selectedOffer.estimated_delivery_at
       ) {
@@ -2595,13 +3212,19 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
            'ClawPilot native one-off shipments', 'active', $2::jsonb, $3, $3
          )
          ON CONFLICT (organization_id, integration_type, provider, environment)
-         DO NOTHING`,
+         DO UPDATE SET
+           configuration = operations_integration_accounts.configuration
+             || EXCLUDED.configuration,
+           updated_by = EXCLUDED.updated_by,
+           updated_at = now()`,
         [
           organizationId,
           JSON.stringify({
             sourceAuthority: 'clawpilot',
             oneOffShipmentMvp: true,
-            labelPurchaseEnabled: false,
+            labelPurchaseEnabled: true,
+            labelPurchaseBoundary: 'after_pick_and_pack',
+            supportedShippingModes: ['test', 'live'],
           }),
           input.actorEmail,
         ],
@@ -2882,17 +3505,35 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
         : Math.max(0, Math.ceil(
             (selectedDeliveryAt.getTime() - Date.now()) / DAY_MS,
           ))
+      // Bind the immutable consumed quote/offer before inserting the plan so
+      // the database can validate the plan's exact one-off rate authority in
+      // both Shadow and Active. The surrounding transaction rolls all of this
+      // back if any later planning step fails.
+      await client.query(
+        `INSERT INTO operations_one_off_shipment_quote_consumptions (
+           organization_id, quote_id, order_id, offer_id, reason, consumed_by
+         ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6)`,
+        [
+          organizationId,
+          quote.id,
+          order.id,
+          selectedOffer.id,
+          reason,
+          input.actorEmail,
+        ],
+      )
       const plan = await client.query<{ id: string; global_id: string }>(
         `INSERT INTO operations_fulfillment_plans (
            organization_id, order_id, warehouse_id, version_number, status,
            method, solver_status, fallback_reason, estimated_cost_minor,
            estimated_revenue_minor, estimated_margin_minor,
            promised_delivery_at, explanation, created_by,
-           cartonization_evidence_id
+           cartonization_evidence_id, one_off_quote_id, one_off_offer_id
          ) VALUES (
            $1::uuid, $2::uuid, $3::uuid, 1, 'planned',
            'manual_override', 'one_off_quote', NULL, $4,
-           NULL, NULL, $5::timestamptz, $6::jsonb, $7, NULL
+           NULL, NULL, $5::timestamptz, $6::jsonb, $7, NULL,
+           $8::uuid, $9::uuid
          )
          RETURNING id::text, global_id`,
         [
@@ -2908,9 +3549,13 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
             rateEvidenceGlobalId: selectedOffer.rate_evidence_global_id,
             inventoryAuthority: 'clawpilot',
             planningReason: reason,
-            labelPurchaseEnabled: false,
+            labelPurchaseEnabled: true,
+            labelPurchaseBoundary: 'after_pick_and_pack',
+            labelPurchaseExecutionMode: quote.execution_mode,
           }),
           input.actorEmail,
+          quote.id,
+          selectedOffer.id,
         ],
       )
       for (const reservation of reservations) {
@@ -2957,10 +3602,13 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
           `INSERT INTO operations_carrier_rates (
              organization_id, plan_id, carrier, service_code, service_name,
              internal_cost_minor, customer_charge_minor, transit_days,
-             estimated_delivery_at, meets_promise, selected, quote_snapshot
+             estimated_delivery_at, meets_promise, selected, quote_snapshot,
+             one_off_quote_id, one_off_offer_id,
+             one_off_rate_evidence_global_id, one_off_currency
            ) VALUES (
              $1::uuid, $2::uuid, $3, $4, $5, $6, NULL, $7,
-             $8::timestamptz, $9, $10, $11::jsonb
+             $8::timestamptz, $9, $10, $11::jsonb,
+             $12::uuid, $13::uuid, $14, $15
            )`,
           [
             organizationId,
@@ -2981,6 +3629,12 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
               offerGlobalId: offer.global_id,
               rateEvidenceGlobalId: offer.rate_evidence_global_id,
             }),
+            offer.global_id === selectedOffer.global_id ? quote.id : null,
+            offer.global_id === selectedOffer.global_id ? offer.id : null,
+            offer.global_id === selectedOffer.global_id
+              ? offer.rate_evidence_global_id
+              : null,
+            offer.global_id === selectedOffer.global_id ? offer.currency : null,
           ],
         )
       }
@@ -3107,22 +3761,11 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
           method: 'manual_override',
           planningReason: reason,
           selectedTransitDays,
-          labelPurchaseEnabled: false,
+          labelPurchaseEnabled: true,
+          labelPurchaseBoundary: 'after_pick_and_pack',
+          labelPurchaseExecutionMode: quote.execution_mode,
         },
       })
-      await client.query(
-        `INSERT INTO operations_one_off_shipment_quote_consumptions (
-           organization_id, quote_id, order_id, offer_id, reason, consumed_by
-         ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6)`,
-        [
-          organizationId,
-          quote.id,
-          order.id,
-          selectedOffer.id,
-          reason,
-          input.actorEmail,
-        ],
-      )
       const result: OneOffShipmentCreateResult = {
         orderGlobalId: order.global_id,
         orderStatus: 'planned',

@@ -83,6 +83,11 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
       }
+      if (specifier === '@/lib/integrations/commerceReadRuntime') {
+        return loadTypeScriptModule(
+          'app_src/lib/integrations/commerceReadRuntime.ts',
+        )
+      }
       if (
         specifier
         === '@/lib/integrations/commerceFaireAutomaticPromotion'
@@ -588,8 +593,8 @@ assert.equal(
 process.env.CLAWPILOT_ENV = 'production'
 assert.equal(
   catalogCredentialPolicyModule.automaticCommerceCatalogRuntimeAvailable(),
-  false,
-  'Connecting in production must not create a dormant development catalog job',
+  true,
+  'Production must expose the separately account-fenced catalog reconciliation worker',
 )
 if (savedAutomaticCatalogRuntime.enabled === undefined) {
   delete process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED
@@ -634,7 +639,7 @@ const catalogSyncRouteSource = read(
 includes(catalogSyncRouteSource, [
   'PIPELINE_OUTBOX_WORKER_SECRET',
   'timingSafeEqual',
-  'commerceIntakeRuntimeAvailable()',
+  'commerceReadRuntimeAvailable()',
   'processCommerceCatalogSyncOutbox',
   'recordCommerceCatalogWorkerHeartbeatInPostgres',
 ], 'Commerce catalog-sync worker route')
@@ -978,7 +983,7 @@ includes(serviceSource, [
 ], 'Bounded Shopify product-image intake')
 includes(serviceSource, [
   'shopifyTestOrderSearchConstraint(runtime)',
-  'commerceIntakeRuntimeAvailable()',
+  'commerceReadRuntimeAvailable()',
   "runtime.environment === 'sandbox'",
   "runtime.status === 'active'",
   "runtime.verificationStatus === 'verified'",

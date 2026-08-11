@@ -12,6 +12,9 @@ const requireFromApp = createRequire(
 )
 const ts = requireFromApp('typescript')
 
+process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED = '1'
+process.env.CLAWPILOT_ENV = 'development'
+
 function read(path) {
   return readFileSync(resolve(root, path), 'utf8')
 }
@@ -50,6 +53,11 @@ function loadTypeScriptModule(path, { mocks = {} } = {}) {
     require(specifier) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
+      }
+      if (specifier === '@/lib/integrations/commerceReadRuntime') {
+        return loadTypeScriptModule(
+          'app_src/lib/integrations/commerceReadRuntime.ts',
+        )
       }
       return nodeRequire(specifier)
     },

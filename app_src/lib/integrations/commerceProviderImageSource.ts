@@ -7,6 +7,9 @@ import {
   hasEffectiveShopifyScope,
 } from '@/lib/integrations/commerceCapabilities'
 import {
+  commerceReadCredentialEligible,
+} from '@/lib/integrations/commerceReadRuntime'
+import {
   getFaireProduct,
   probeFaireBrandProfile,
 } from '@/lib/integrations/faireCommerceClient'
@@ -503,8 +506,9 @@ export async function readCurrentCommerceProviderImageSources(input: {
   })
   if (
     !runtime
-    || runtime.verificationStatus !== 'verified'
-    || runtime.status !== 'active'
+    || !commerceReadCredentialEligible(runtime, {
+      developmentRequiresActive: true,
+    })
   ) {
     fail(
       'COMMERCE_PROVIDER_IMAGE_SOURCE_CONNECTION_REQUIRED',

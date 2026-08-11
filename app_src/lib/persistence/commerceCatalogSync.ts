@@ -2,6 +2,11 @@ import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
+  commerceReadAccountSql,
+  commerceReadCredentialEligible,
+  commerceReadRuntimeAvailable,
+} from '@/lib/integrations/commerceReadRuntime'
+import {
   acquireTransactionAdvisoryLock,
   query,
   withTransaction,
@@ -11,6 +16,7 @@ const CATALOG_SYNC_POLICY_VERSION = 'commerce-product-intake-policy-v1'
 const CATALOG_RECONCILIATION_INTERVAL = '6 hours'
 const CATALOG_SYNC_LEASE = '10 minutes'
 const WORKER_HEARTBEAT_KEY = 'commerce.catalog.worker.heartbeat'
+const CATALOG_READ_ACCOUNT_SQL = commerceReadAccountSql('account')
 const PRODUCT_READABLE_CONNECTION_SQL = `(
   (
     account.provider = 'shopify'
@@ -310,7 +316,7 @@ export async function applyCommerceCatalogSyncPolicyWithClient(
        AND account.id = $2::uuid
        AND account.integration_type = 'commerce'
        AND account.provider = $3
-       AND account.status <> 'error'
+       AND ${CATALOG_READ_ACCOUNT_SQL}
        AND account.commerce_credential_generation = $4
        AND credential.credential_version = $4
        AND credential.verification_status = 'verified'
@@ -362,15 +368,7 @@ function stringArray(value: unknown) {
 }
 
 export function automaticCommerceCatalogRuntimeAvailable() {
-  if (process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED !== '1') return false
-  const lane = String(
-    process.env.CLAWPILOT_ENV
-    || process.env.RAILWAY_ENVIRONMENT_NAME
-    || process.env.VERCEL_ENV
-    || process.env.NODE_ENV
-    || '',
-  ).trim().toLowerCase()
-  return ['dev', 'development', 'local', 'preview'].includes(lane)
+  return commerceReadRuntimeAvailable()
 }
 
 export async function signalShopifyCatalogRefreshWithClient(
@@ -470,6 +468,7 @@ export async function ensureAutomaticCommerceCatalogIntakeWithClient(
     await client.query<{
       global_id: string
       provider: 'shopify' | 'faire'
+      environment: 'sandbox' | 'production'
       status: 'active' | 'disabled' | 'error'
       configuration: Record<string, unknown>
       commerce_credential_generation: number
@@ -484,6 +483,7 @@ export async function ensureAutomaticCommerceCatalogIntakeWithClient(
       `SELECT
          account.global_id,
          account.provider,
+         account.environment,
          account.status,
          account.configuration,
          account.commerce_credential_generation,
@@ -511,8 +511,11 @@ export async function ensureAutomaticCommerceCatalogIntakeWithClient(
   ).rows[0]
   if (
     !account
-    || account.status === 'error'
-    || account.verification_status !== 'verified'
+    || !commerceReadCredentialEligible({
+      environment: account.environment,
+      status: account.status,
+      verificationStatus: account.verification_status,
+    })
     || account.credential_version
       !== account.commerce_credential_generation
   ) {
@@ -672,7 +675,7 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
         AND credential.integration_account_id = account.id
        WHERE account.integration_type = 'commerce'
          AND account.provider IN ('shopify', 'faire')
-         AND account.status <> 'error'
+         AND ${CATALOG_READ_ACCOUNT_SQL}
          AND account.commerce_credential_generation > 0
          AND credential.credential_version
            = account.commerce_credential_generation
@@ -732,7 +735,7 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
                AND policy.revision = job.policy_revision
                AND account.integration_type = 'commerce'
                AND account.provider = job.provider
-               AND account.status <> 'error'
+               AND ${CATALOG_READ_ACCOUNT_SQL}
                AND account.commerce_credential_generation
                  = job.credential_version
                AND credential.credential_version = job.credential_version
@@ -774,7 +777,7 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
        WHERE policy.policy_version = $1
          AND account.integration_type = 'commerce'
          AND account.provider IN ('shopify', 'faire')
-         AND account.status <> 'error'
+         AND ${CATALOG_READ_ACCOUNT_SQL}
          AND account.commerce_credential_generation > 0
          AND credential.credential_version
            = account.commerce_credential_generation
@@ -885,7 +888,7 @@ export async function claimCommerceCatalogSyncJobsInPostgres(input: {
            AND policy.revision = job.policy_revision
            AND account.integration_type = 'commerce'
            AND account.provider = job.provider
-           AND account.status <> 'error'
+           AND ${CATALOG_READ_ACCOUNT_SQL}
            AND account.commerce_credential_generation
              = job.credential_version
            AND credential.credential_version = job.credential_version
@@ -994,7 +997,7 @@ async function currentJobFence(
        AND policy.policy_version = $8
        AND policy.revision = queued.policy_revision
        AND account.provider = queued.provider
-       AND account.status <> 'error'
+       AND ${CATALOG_READ_ACCOUNT_SQL}
        AND account.commerce_credential_generation = queued.credential_version
        AND credential.credential_version = queued.credential_version
        AND credential.verification_status = 'verified'

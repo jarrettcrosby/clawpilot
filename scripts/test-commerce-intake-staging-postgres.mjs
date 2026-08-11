@@ -54,6 +54,11 @@ function loadTypeScriptModule(path, mocks = {}, globals = {}) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
       }
+      if (specifier === '@/lib/integrations/commerceReadRuntime') {
+        return loadTypeScriptModule(
+          'app_src/lib/integrations/commerceReadRuntime.ts',
+        )
+      }
       if (
         specifier
         === '@/lib/integrations/commerceFaireAutomaticPromotion'

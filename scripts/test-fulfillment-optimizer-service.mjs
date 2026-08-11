@@ -57,21 +57,51 @@ for (const fragment of [
 
 const adapter = read('app_src/lib/operations/orToolsFulfillmentOptimizer.ts')
 for (const fragment of [
-  'CLAWPILOT_FULFILLMENT_OPTIMIZER_ENABLED',
-  'CLAWPILOT_FULFILLMENT_OPTIMIZER_URL',
-  'CLAWPILOT_FULFILLMENT_OPTIMIZER_SECRET',
+  'resolveFulfillmentOptimizerRuntimeConfiguration',
+  'normalizeFulfillmentOptimizerBaseUrl',
   'DeterministicFulfillmentOptimizer',
   'parseFulfillmentOptimizationResult',
-  'ORTOOLS_TLS_REQUIRED',
   'AbortController',
   "redirect: 'error'",
   'one_unit_per_carton_safe_fallback',
 ]) {
   assert.ok(adapter.includes(fragment), `optimizer adapter missing ${fragment}`)
 }
+
+const runtimeConfig = read(
+  'app_src/lib/operations/fulfillmentOptimizerRuntimeConfig.ts',
+)
+for (const fragment of [
+  'CLAWPILOT_FULFILLMENT_OPTIMIZER_ENABLED',
+  'CLAWPILOT_FULFILLMENT_OPTIMIZER_URL',
+  'CLAWPILOT_FULFILLMENT_OPTIMIZER_SECRET',
+  'fulfillment-optimizer.railway.internal',
+  'ORTOOLS_TLS_REQUIRED',
+  'ORTOOLS_PRIVATE_URL_REJECTED',
+  "connectivity: 'not-probed'",
+]) {
+  assert.ok(
+    runtimeConfig.includes(fragment),
+    `optimizer runtime configuration missing ${fragment}`,
+  )
+}
 assert.ok(
-  adapter.includes("!== '1') return null"),
+  runtimeConfig.includes("if (enableValue !== '1') return null"),
   'hosted optimizer must remain disabled without explicit activation',
 )
+
+const health = read('app_src/app/api/health/route.ts')
+for (const fragment of [
+  'fulfillmentOptimizerRuntimeHealth()',
+  "fulfillmentOptimizer.configurationStatus === 'invalid'",
+  "fulfillmentOptimizer.configurationStatus === 'disabled'",
+  'Fulfillment optimizer is disabled in this Railway application environment.',
+  'fulfillmentOptimizer,',
+]) {
+  assert.ok(
+    health.includes(fragment),
+    `application health must report optimizer configuration: ${fragment}`,
+  )
+}
 
 console.log('Fulfillment optimizer service contract tests passed.')

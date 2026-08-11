@@ -114,13 +114,15 @@ struct PickingDashboardView: View {
 
             Spacer()
 
-            Text("DEV")
-                .font(.caption2.weight(.bold))
-                .tracking(0.8)
-                .foregroundStyle(PickingTheme.primary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(PickingTheme.primary.opacity(0.12), in: Capsule())
+            if let environmentLabel = model.environmentLabel {
+                Text(environmentLabel)
+                    .font(.caption2.weight(.bold))
+                    .tracking(0.8)
+                    .foregroundStyle(PickingTheme.primary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(PickingTheme.primary.opacity(0.12), in: Capsule())
+            }
         }
         .accessibilityElement(children: .combine)
     }
@@ -291,8 +293,9 @@ struct PickingDashboardView: View {
                     subtitle: "The iPhone controls the workflow; the glasses supply the camera."
                 )
                 guideStep(1, "Receive work", "A manager waves an order and assigns it to you.")
-                guideStep(2, "Scan the product", "Tap Start Meta scan, then look at the barcode. ClawPilot reads the live glasses camera; it does not take or save a photo.")
-                guideStep(3, "Confirm the order", "After every product matches, confirm once to write the audited result to ClawPilot.")
+                guideStep(2, "Verify location when required", "If your warehouse enables location-first picking, scan the printed location label before the product. ClawPilot never turns this on automatically.")
+                guideStep(3, "Scan the product", "Tap Start Meta scan, then look at the barcode. The same camera session continues from a matched location to its product; nothing is saved.")
+                guideStep(4, "Confirm the order", "After every product matches, confirm once to write the audited result to ClawPilot.")
             }
         }
     }
@@ -335,6 +338,23 @@ struct PickingDashboardView: View {
                 Text(task.locationCode)
                     .font(.system(size: 42, weight: .bold, design: .rounded))
                     .foregroundStyle(PickingTheme.text)
+            }
+
+            if model.currentScanStage == .location {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Scan location label first")
+                            .font(.subheadline.weight(.semibold))
+                        Text("ClawPilot will accept only \(task.locationBarcode ?? "the assigned CP1L label") before this product.")
+                            .font(.caption)
+                    }
+                } icon: {
+                    Image(systemName: "mappin.and.ellipse")
+                }
+                .foregroundStyle(Color.orange)
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
             }
 
             Divider().overlay(PickingTheme.outline)
@@ -382,7 +402,9 @@ struct PickingDashboardView: View {
             }
             .buttonStyle(SecondaryDashboardButtonStyle())
 
-            Text("Hands-free: say “Hey Siri, scan with ClawPilot.” In-app voice control also accepts “Start glasses scan.” ClawPilot analyzes one in-memory glasses photo first, then briefly checks live frames; nothing is saved.")
+            Text(model.currentScanStage == .location
+                ? "Hands-free: say “Hey Siri, scan with ClawPilot,” then look at the location label. After it matches, keep the glasses camera on the product barcode."
+                : "Hands-free: say “Hey Siri, scan with ClawPilot.” In-app voice control also accepts “Start glasses scan.” ClawPilot analyzes one in-memory glasses photo first, then briefly checks live frames; nothing is saved.")
                 .font(.caption)
                 .foregroundStyle(PickingTheme.muted)
 

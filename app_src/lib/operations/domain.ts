@@ -29,8 +29,11 @@ import type {
 export function availableOperationsOrderActions(input: {
   status: OperationsOrderStatus
   sourceProvider?: string
+  orderType?: string
+  oneOffShippingMode?: 'test' | 'live' | null
   activationState: OperationsActivationState
   canExecute: boolean
+  canActivate?: boolean
   planStatus: string | null
   waveStatus: string | null
   lineCount: number
@@ -52,6 +55,8 @@ export function availableOperationsOrderActions(input: {
   unresolvedLabelAttemptCount?: number
   existingShipmentCount?: number
   sandboxE2eAuthorized?: boolean
+  nativeOneOffGroupReady?: boolean
+  nativeOneOffGroupBlockedReason?: string | null
 }): OperationsOrderActionAvailability[] {
   let releaseBlockedReason: string | null = null
   if (!input.canExecute) {
@@ -110,11 +115,36 @@ export function availableOperationsOrderActions(input: {
     packBlockedReason = 'Resolve high or critical order exceptions before verifying packages.'
   }
 
+  const isNativeOneOff = input.sourceProvider === 'clawpilot_native'
+    && input.orderType === 'one_off'
   let shipmentBlockedReason: string | null = null
   if (!input.canExecute) {
     shipmentBlockedReason = 'Operations execute permission is required.'
-  } else if (input.activationState !== 'active') {
+  } else if (
+    !isNativeOneOff
+    && input.activationState !== 'active'
+  ) {
     shipmentBlockedReason = 'Set Operations to Active before confirming a shipment.'
+  } else if (
+    isNativeOneOff
+    && input.oneOffShippingMode === 'test'
+    && input.activationState !== 'shadow'
+  ) {
+    shipmentBlockedReason = 'TEST one-off shipments can be confirmed only in Operations Shadow.'
+  } else if (
+    isNativeOneOff
+    && input.oneOffShippingMode === 'live'
+    && input.activationState !== 'active'
+  ) {
+    shipmentBlockedReason = 'LIVE one-off shipments can be confirmed only in Operations Active.'
+  } else if (
+    isNativeOneOff
+    && input.oneOffShippingMode === 'live'
+    && input.canActivate !== true
+  ) {
+    shipmentBlockedReason = 'Operations activation permission is required to confirm LIVE postage.'
+  } else if (isNativeOneOff && !input.oneOffShippingMode) {
+    shipmentBlockedReason = 'Select TEST or LIVE and create the exact one-off shipment group first.'
   } else if ((input.existingShipmentCount || 0) > 0 || input.status === 'shipped') {
     shipmentBlockedReason = 'This order already has a confirmed shipment.'
   } else if (input.status !== 'packed') {
@@ -122,15 +152,26 @@ export function availableOperationsOrderActions(input: {
   } else if (input.planStatus !== 'released' || input.waveStatus !== 'completed') {
     shipmentBlockedReason = 'The fulfillment plan must be released and its wave completed before shipment.'
   } else if (
-    input.sandboxE2eAuthorized
+    input.sandboxE2eAuthorized || isNativeOneOff
       ? input.packageCount < 1 || input.packedPackageCount !== input.packageCount
       : input.packageCount !== 1 || input.packedPackageCount !== 1
   ) {
-    shipmentBlockedReason = input.sandboxE2eAuthorized
-      ? 'Authorized sandbox E2E completion requires every package to be verified.'
-      : 'This shipment-completion slice requires exactly one verified package.'
+    shipmentBlockedReason = isNativeOneOff
+      ? 'Every package in the one-off shipment must be verified before confirmation.'
+      : input.sandboxE2eAuthorized
+        ? 'Authorized sandbox E2E completion requires every package to be verified.'
+        : 'This shipment-completion slice requires exactly one verified package.'
+  } else if (isNativeOneOff && input.nativeOneOffGroupReady !== true) {
+    shipmentBlockedReason = input.nativeOneOffGroupBlockedReason
+      || 'Purchase one complete one-off carrier group before confirming shipment.'
   } else if ((input.unresolvedLabelAttemptCount || 0) > 0) {
     shipmentBlockedReason = 'Resolve the pending carrier label attempt before confirming shipment.'
+  } else if (isNativeOneOff) {
+    // Exact TEST/LIVE environment, selected-rate authority, group membership,
+    // result, and active-label coverage are verified by the durable group read.
+    shipmentBlockedReason = input.blockingExceptionCount > 0
+      ? 'Resolve high or critical order exceptions before confirming shipment.'
+      : null
   } else if (
     (input.activeLabelCount || 0)
       !== (input.sandboxE2eAuthorized ? input.packageCount : 1)

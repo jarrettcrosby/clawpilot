@@ -14,18 +14,9 @@ concurrency:
 
 jobs:
   monitor:
-    name: ${{ matrix.environment }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - environment: production
-            branch: main
-            base_url: https://aiapp.eigenracing.com
-          - environment: development
-            branch: dev
-            base_url: https://dev.aiapp.eigenracing.com
+    name: production and development
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -35,9 +26,16 @@ jobs:
         with:
           node-version: 24
 
-      - name: Verify public runtime contract
+      - name: Verify production runtime contract
         env:
-          CLAWPILOT_BASE_URL: ${{ matrix.base_url }}
-          CLAWPILOT_EXPECT_BRANCH: ${{ matrix.branch }}
-          CLAWPILOT_EXPECT_ENVIRONMENT: ${{ matrix.environment }}
+          CLAWPILOT_BASE_URL: https://aiapp.eigenracing.com
+          CLAWPILOT_EXPECT_BRANCH: main
+          CLAWPILOT_EXPECT_ENVIRONMENT: production
+        run: node scripts/monitor-deployed-runtime.mjs
+
+      - name: Verify development runtime contract
+        env:
+          CLAWPILOT_BASE_URL: https://dev.aiapp.eigenracing.com
+          CLAWPILOT_EXPECT_BRANCH: dev
+          CLAWPILOT_EXPECT_ENVIRONMENT: development
         run: node scripts/monitor-deployed-runtime.mjs

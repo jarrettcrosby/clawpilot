@@ -8,9 +8,18 @@ import {
   createAndPlanOneOffShipmentInPostgres,
   OneOffShipmentPersistenceError,
   quoteOneOffShipmentInPostgres,
+  readOneOffShipmentQuoteExecutionModeFromPostgres,
   readOneOffShipmentWorkspaceFromPostgres,
 } from '@/lib/persistence/oneOffShipments'
+import {
+  createOperationsOneOffCarrierGroupInPostgres,
+  readOneOffCarrierGroupExecutionModeInPostgres,
+  readOneOffShipmentExecutionStateFromPostgres,
+  refreshOperationsOneOffPackedRatesInPostgres,
+  voidOperationsOneOffCarrierGroupInPostgres,
+} from '@/lib/persistence/operationOneOffShipping'
 import { requireRequestUser } from '@/lib/requestUser'
+import { ONE_OFF_LIVE_POSTAGE_CONFIRMATION } from '@/lib/operations/oneOffShipments'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -33,6 +42,20 @@ function errorResponse(error: unknown) {
     return json({
       ok: false,
       error: error.message,
+      code: error.code,
+    }, error.status)
+  }
+  if (
+    error
+    && typeof error === 'object'
+    && 'code' in error
+    && 'status' in error
+    && typeof error.code === 'string'
+    && typeof error.status === 'number'
+  ) {
+    return json({
+      ok: false,
+      error: error instanceof Error ? error.message : error.code,
       code: error.code,
     }, error.status)
   }
@@ -110,9 +133,16 @@ export async function GET(req: NextRequest) {
         'OPERATIONS_ONE_OFF_PERMISSION_REQUIRED',
       )
     }
-    const workspace = await readOneOffShipmentWorkspaceFromPostgres({
-      organizationId: activeOperationsOrganizationId(actor),
-    })
+    const organizationId = activeOperationsOrganizationId(actor)
+    const orderGlobalId = String(req.nextUrl.searchParams.get('orderGlobalId') || '').trim()
+    if (orderGlobalId) {
+      const state = await readOneOffShipmentExecutionStateFromPostgres({
+        organizationId,
+        orderGlobalId,
+      })
+      return json({ ok: true, state })
+    }
+    const workspace = await readOneOffShipmentWorkspaceFromPostgres({ organizationId })
     return json({ ok: true, workspace })
   } catch (error) {
     return errorResponse(error)
@@ -141,6 +171,13 @@ export async function POST(req: NextRequest) {
           'One-off quote command is invalid',
         )
       }
+      const requestedQuote = body.quote as Record<string, unknown>
+      if (requestedQuote?.executionMode === 'live' && !capabilities.canActivate) {
+        return forbidden(
+          'Live carrier rating requires Operations activation permission',
+          'OPERATIONS_ONE_OFF_LIVE_RATE_PERMISSION_REQUIRED',
+        )
+      }
       const quote = await quoteOneOffShipmentInPostgres({
         organizationId,
         actorEmail: actor.email,
@@ -159,15 +196,126 @@ export async function POST(req: NextRequest) {
           'One-off create-and-plan command is invalid',
         )
       }
+      const quoteGlobalId = String(body.quoteGlobalId || '')
+      const executionMode = await readOneOffShipmentQuoteExecutionModeFromPostgres({
+        organizationId,
+        quoteGlobalId,
+      })
+      if (executionMode === 'live' && !capabilities.canActivate) {
+        return forbidden(
+          'Live one-off planning requires Operations activation permission',
+          'OPERATIONS_ONE_OFF_LIVE_PLAN_PERMISSION_REQUIRED',
+        )
+      }
       const result = await createAndPlanOneOffShipmentInPostgres({
         organizationId,
         actorEmail: actor.email,
         idempotencyKey: idempotencyKey(req),
-        quoteGlobalId: String(body.quoteGlobalId || ''),
+        quoteGlobalId,
         selectedOfferGlobalId: String(body.selectedOfferGlobalId || ''),
         reason: String(body.reason || ''),
       })
       return json({ ok: true, result }, result.replayed ? 200 : 201)
+    }
+    if (action === 'refresh-packed-rates') {
+      const unsupported = Object.keys(body).find((key) => ![
+        'action', 'orderGlobalId', 'expectedRowVersion',
+      ].includes(key))
+      if (unsupported) {
+        throw new OneOffShipmentPersistenceError(
+          'OPERATIONS_ONE_OFF_REQUEST_INVALID',
+          'Packed-rate refresh command is invalid',
+        )
+      }
+      const orderGlobalId = String(body.orderGlobalId || '')
+      const executionMode = await readOneOffCarrierGroupExecutionModeInPostgres({
+        organizationId,
+        orderGlobalId,
+      })
+      if (executionMode === 'live' && !capabilities.canActivate) {
+        return forbidden(
+          'Live packed carrier rating requires Operations activation permission',
+          'OPERATIONS_ONE_OFF_LIVE_RATE_PERMISSION_REQUIRED',
+        )
+      }
+      const result = await refreshOperationsOneOffPackedRatesInPostgres({
+        organizationId,
+        actorEmail: actor.email,
+        idempotencyKey: idempotencyKey(req),
+        orderGlobalId,
+        expectedRowVersion: Number(body.expectedRowVersion),
+      })
+      return json({ ok: true, result }, 201)
+    }
+    if (action === 'purchase-group') {
+      const unsupported = Object.keys(body).find((key) => ![
+        'action', 'orderGlobalId', 'purchaseQuoteGlobalId',
+        'selectedOfferGlobalId', 'expectedRowVersion', 'reason',
+        'preferredPrinterGlobalId', 'confirmation',
+      ].includes(key))
+      if (unsupported) {
+        throw new OneOffShipmentPersistenceError(
+          'OPERATIONS_ONE_OFF_REQUEST_INVALID',
+          'Whole-shipment postage purchase command is invalid',
+        )
+      }
+      const orderGlobalId = String(body.orderGlobalId || '')
+      const executionMode = await readOneOffCarrierGroupExecutionModeInPostgres({
+        organizationId,
+        orderGlobalId,
+      })
+      if (executionMode === 'live' && !capabilities.canActivate) {
+        return forbidden(
+          'Live postage purchase requires Operations activation permission',
+          'OPERATIONS_ONE_OFF_LIVE_PURCHASE_PERMISSION_REQUIRED',
+        )
+      }
+      if (
+        executionMode === 'live'
+        && body.confirmation !== ONE_OFF_LIVE_POSTAGE_CONFIRMATION
+      ) {
+        throw new OneOffShipmentPersistenceError(
+          'OPERATIONS_ONE_OFF_LIVE_PURCHASE_CONFIRMATION_REQUIRED',
+          'Explicit confirmation is required before buying live postage',
+          400,
+        )
+      }
+      const result = await createOperationsOneOffCarrierGroupInPostgres({
+        organizationId,
+        actorEmail: actor.email,
+        idempotencyKey: idempotencyKey(req),
+        orderGlobalId,
+        purchaseQuoteGlobalId: String(body.purchaseQuoteGlobalId || ''),
+        selectedOfferGlobalId: String(body.selectedOfferGlobalId || ''),
+        expectedRowVersion: Number(body.expectedRowVersion),
+        reason: String(body.reason || ''),
+        preferredPrinterGlobalId: body.preferredPrinterGlobalId === null
+          || body.preferredPrinterGlobalId === undefined
+          ? null
+          : String(body.preferredPrinterGlobalId),
+      })
+      return json({ ok: true, result }, result.replayed ? 200 : 201)
+    }
+    if (action === 'void-group') {
+      const unsupported = Object.keys(body).find((key) => ![
+        'action', 'orderGlobalId', 'expectedRowVersion', 'reason',
+      ].includes(key))
+      if (unsupported) {
+        throw new OneOffShipmentPersistenceError(
+          'OPERATIONS_ONE_OFF_REQUEST_INVALID',
+          'Whole-shipment carrier cancellation command is invalid',
+        )
+      }
+      const orderGlobalId = String(body.orderGlobalId || '')
+      const result = await voidOperationsOneOffCarrierGroupInPostgres({
+        organizationId,
+        actorEmail: actor.email,
+        idempotencyKey: idempotencyKey(req),
+        orderGlobalId,
+        expectedRowVersion: Number(body.expectedRowVersion),
+        reason: String(body.reason || ''),
+      })
+      return json({ ok: true, result })
     }
     throw new OneOffShipmentPersistenceError(
       'OPERATIONS_ONE_OFF_ACTION_INVALID',

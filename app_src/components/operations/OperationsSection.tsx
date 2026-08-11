@@ -22,6 +22,8 @@ import {
   InputAdornment,
   ListItemText,
   MenuItem,
+  Radio,
+  RadioGroup,
   Select,
   Stack,
   Tab,
@@ -79,6 +81,12 @@ import type {
   OperationsShipmentCommandResult,
   OperationsWorkspace,
 } from '@/lib/operations/types'
+import {
+  type OneOffCarrierGroupCommandResult,
+  type OneOffPackedRateRefresh,
+  type OneOffShipmentExecutionState,
+} from '@/lib/operations/oneOffShipments'
+import { ONE_OFF_LIVE_POSTAGE_CONFIRMATION } from '@/lib/operations/oneOffShipmentConstants'
 import GlCodingPanel from '@/components/operations/GlCodingPanel'
 import CommerceImportsPanel from '@/components/operations/CommerceImportsPanel'
 import PackagingMaterialsPanel from '@/components/operations/PackagingMaterialsPanel'
@@ -88,6 +96,7 @@ import CartonizationRateEvidencePanel from '@/components/operations/Cartonizatio
 import ReceivingPanel from '@/components/operations/ReceivingPanel'
 import WarehouseSetupPanel from '@/components/operations/WarehouseSetupPanel'
 import OneOffShipmentDialog from '@/components/operations/OneOffShipmentDialog'
+import OneOffShippingExecutionPanel from '@/components/operations/OneOffShippingExecutionPanel'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatDimensionsMm, formatGrams } from '@/lib/measurements'
@@ -152,6 +161,14 @@ type PlanningEvidencePayload = {
     globalId: string
     status: 'succeeded' | 'partial' | 'failed'
   }
+}
+
+type OneOffExecutionPayload = {
+  ok?: boolean
+  error?: string
+  code?: string
+  state?: OneOffShipmentExecutionState
+  result?: OneOffPackedRateRefresh | OneOffCarrierGroupCommandResult
 }
 
 export type OperationsView =
@@ -830,8 +847,13 @@ function OrderDetailDrawer({
   sandboxCarrierAccounts,
   commerceFulfillmentRecoveryEnabled,
   activationState,
+  canManage,
   canExecute,
+  canActivate,
   canAuthorizeSandboxE2e,
+  oneOffExecutionState,
+  oneOffExecutionLoading,
+  oneOffExecutionError,
   open,
   busy,
   onClose,
@@ -847,6 +869,9 @@ function OrderDetailDrawer({
   onAuthorizeSandboxE2e,
   onCreateSandboxLabel,
   onVoidSandboxLabel,
+  onRefreshOneOffPackedRates,
+  onReviewOneOffGroupPurchase,
+  onVoidOneOffGroup,
   generatingPackingSlipPackageId,
   printingPackingSlipArtifactId,
 }: {
@@ -854,8 +879,13 @@ function OrderDetailDrawer({
   sandboxCarrierAccounts: OperationsWorkspace['shipping']['sandboxCarrierAccounts']
   commerceFulfillmentRecoveryEnabled: boolean
   activationState: OperationsActivationState
+  canManage: boolean
   canExecute: boolean
+  canActivate: boolean
   canAuthorizeSandboxE2e: boolean
+  oneOffExecutionState: OneOffShipmentExecutionState | null
+  oneOffExecutionLoading: boolean
+  oneOffExecutionError: string
   open: boolean
   busy: boolean
   onClose: () => void
@@ -874,6 +904,9 @@ function OrderDetailDrawer({
   onAuthorizeSandboxE2e: () => void
   onCreateSandboxLabel: (packageGlobalId?: string) => void
   onVoidSandboxLabel: () => void
+  onRefreshOneOffPackedRates: () => void
+  onReviewOneOffGroupPurchase: () => void
+  onVoidOneOffGroup: () => void
   generatingPackingSlipPackageId: string | null
   printingPackingSlipArtifactId: string | null
 }) {
@@ -925,6 +958,8 @@ function OrderDetailDrawer({
   const unresolvedAttempt = labelAttempts.find(
     (attempt) => attempt.state === 'prepared' || attempt.state === 'unknown',
   ) || null
+  const nativeOneOff = order?.sourceProvider === 'clawpilot_native'
+    && Boolean(order.oneOffShippingMode)
   const activeExecutionRequiredReason = activationState !== 'active'
     ? 'Carrier label create and void actions require Operations Active mode.'
     : null
@@ -1421,7 +1456,24 @@ function OrderDetailDrawer({
 
             <DetailSection title="Shipping execution">
               <Stack spacing={1.5}>
-                {activeExecutionRequiredReason && (
+                {nativeOneOff ? (
+                  <OneOffShippingExecutionPanel
+                    order={order}
+                    state={oneOffExecutionState}
+                    loading={oneOffExecutionLoading}
+                    error={oneOffExecutionError}
+                    activationState={activationState}
+                    canManage={canManage}
+                    canExecute={canExecute}
+                    canActivate={canActivate}
+                    busy={busy}
+                    onRefreshPackedRates={onRefreshOneOffPackedRates}
+                    onReviewPurchase={onReviewOneOffGroupPurchase}
+                    onVoidGroup={onVoidOneOffGroup}
+                  />
+                ) : (
+                  <>
+                  {activeExecutionRequiredReason && (
                   <Alert
                     severity="info"
                     data-testid="carrier-label-active-mode-required"
@@ -1573,7 +1625,7 @@ function OrderDetailDrawer({
                     )}
                   </>
                 )}
-                {labelAttempts.length > 0 && (
+                  {labelAttempts.length > 0 && (
                   <Box>
                     <Typography variant="caption" color="text.secondary">Carrier command evidence</Typography>
                     <Stack divider={<Divider flexItem />}>
@@ -1597,6 +1649,8 @@ function OrderDetailDrawer({
                       ))}
                     </Stack>
                   </Box>
+                  )}
+                  </>
                 )}
               </Stack>
             </DetailSection>
@@ -2137,6 +2191,23 @@ export default function OperationsSection({
   const [voidLabelReason, setVoidLabelReason] = useState('Void the sandbox label after validation')
   const [voidLabelIdempotencyKey, setVoidLabelIdempotencyKey] = useState('')
   const [voidingLabel, setVoidingLabel] = useState(false)
+  const [oneOffExecutionState, setOneOffExecutionState] =
+    useState<OneOffShipmentExecutionState | null>(null)
+  const [oneOffExecutionLoading, setOneOffExecutionLoading] = useState(false)
+  const [oneOffExecutionError, setOneOffExecutionError] = useState('')
+  const [oneOffGroupAction, setOneOffGroupAction] = useState<'' | 'refresh' | 'purchase' | 'void'>('')
+  const [oneOffGroupPurchaseOpen, setOneOffGroupPurchaseOpen] = useState(false)
+  const [oneOffGroupPurchaseOfferGlobalId, setOneOffGroupPurchaseOfferGlobalId] = useState('')
+  const [oneOffGroupPurchaseReason, setOneOffGroupPurchaseReason] = useState(
+    'Purchase the reviewed fresh rate for the exact complete packed shipment group',
+  )
+  const [oneOffGroupPurchaseConfirmed, setOneOffGroupPurchaseConfirmed] = useState(false)
+  const [oneOffGroupPurchaseIdempotencyKey, setOneOffGroupPurchaseIdempotencyKey] = useState('')
+  const [oneOffGroupVoidOpen, setOneOffGroupVoidOpen] = useState(false)
+  const [oneOffGroupVoidReason, setOneOffGroupVoidReason] = useState(
+    'Cancel the exact complete one-off carrier shipment group before shipment confirmation',
+  )
+  const [oneOffGroupVoidIdempotencyKey, setOneOffGroupVoidIdempotencyKey] = useState('')
   const [
     generatingPackingSlipPackageId,
     setGeneratingPackingSlipPackageId,
@@ -2179,6 +2250,36 @@ export default function OperationsSection({
     }
   }, [exceptionStatus, search, status, view])
 
+  const loadOneOffExecutionState = useCallback(async (
+    orderGlobalId: string,
+    signal?: AbortSignal,
+  ) => {
+    setOneOffExecutionState((current) => (
+      current?.orderGlobalId === orderGlobalId ? current : null
+    ))
+    setOneOffExecutionLoading(true)
+    setOneOffExecutionError('')
+    try {
+      const params = new URLSearchParams({ orderGlobalId })
+      const response = await fetch(
+        `/api/operations/one-off-shipments?${params.toString()}`,
+        { cache: 'no-store', signal },
+      )
+      const payload = await response.json().catch(() => ({})) as OneOffExecutionPayload
+      if (!response.ok || !payload.ok || !payload.state) {
+        throw new Error(`${payload.error || 'One-off shipment-group state is unavailable'}${payload.code ? ` [${payload.code}]` : ''}`)
+      }
+      setOneOffExecutionState(payload.state)
+    } catch (caught) {
+      if (caught instanceof DOMException && caught.name === 'AbortError') return
+      setOneOffExecutionError(caught instanceof Error
+        ? caught.message
+        : 'One-off shipment-group state is unavailable')
+    } finally {
+      if (!signal?.aborted) setOneOffExecutionLoading(false)
+    }
+  }, [])
+
   useEffect(() => {
     const controller = new AbortController()
     const timer = window.setTimeout(() => {
@@ -2198,6 +2299,10 @@ export default function OperationsSection({
   const closeDrawer = () => {
     setDrawerOpen(false)
     setSelectedGlobalId(null)
+    setOneOffExecutionState(null)
+    setOneOffExecutionError('')
+    setOneOffGroupPurchaseOpen(false)
+    setOneOffGroupVoidOpen(false)
   }
 
   const chooseException = (exception: OperationsExceptionListItem) => {
@@ -3041,8 +3146,7 @@ export default function OperationsSection({
       || !createLabelReason.trim()
       || !createLabelIdempotencyKey
       || !carrierAccountGlobalId
-      || (createLabelPackageGlobalId
-        && !detail.sandboxCommerceE2eAuthorization)
+      || (createLabelPackageGlobalId && !detail.sandboxCommerceE2eAuthorization)
     ) return
     setCreatingLabel(true)
     setError('')
@@ -3079,7 +3183,7 @@ export default function OperationsSection({
       setNotice(
         result.printWarning
           ? `Sandbox label ${result.labelGlobalId} was created with tracking ${result.trackingNumber}. ${result.printWarning}`
-          : `Sandbox label ${result.labelGlobalId} was created with tracking ${result.trackingNumber} and print job ${result.printJobGlobalId}.`,
+          : `Sandbox label ${result.labelGlobalId} was created with tracking ${result.trackingNumber}${result.printJobGlobalId ? ` and print job ${result.printJobGlobalId}` : ''}.`,
       )
       await loadWorkspace(result.orderGlobalId)
     } catch (caught) {
@@ -3134,6 +3238,252 @@ export default function OperationsSection({
       setError(caught instanceof Error ? caught.message : 'Sandbox label could not be voided')
     } finally {
       setVoidingLabel(false)
+    }
+  }
+
+  const oneOffGroupPurchasePermissionsReady = () => Boolean(
+    capabilities?.canManage
+    && capabilities.canExecute
+    && (detail?.oneOffShippingMode !== 'live' || capabilities.canActivate)
+    && workspace?.activation.state === (
+      detail?.oneOffShippingMode === 'live' ? 'active' : 'shadow'
+    )
+  )
+
+  const oneOffGroupVoidPermissionsReady = () => Boolean(
+    capabilities?.canManage && capabilities.canExecute
+  )
+
+  const refreshOneOffPackedRates = async () => {
+    if (
+      !detail
+      || !oneOffExecutionState
+      || oneOffExecutionState.orderGlobalId !== detail.globalId
+      || !oneOffGroupPurchasePermissionsReady()
+    ) return
+    setOneOffGroupAction('refresh')
+    setOneOffExecutionError('')
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/one-off-shipments', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `operations-one-off-packed-rate:${detail.globalId}:${crypto.randomUUID()}`,
+        },
+        body: JSON.stringify({
+          action: 'refresh-packed-rates',
+          orderGlobalId: detail.globalId,
+          expectedRowVersion: oneOffExecutionState.rowVersion,
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as OneOffExecutionPayload
+      if (
+        !response.ok
+        || !payload.ok
+        || !payload.result
+        || !('quote' in payload.result)
+      ) {
+        throw new Error(`${payload.error || 'Packed-group rates could not be refreshed'}${payload.code ? ` [${payload.code}]` : ''}`)
+      }
+      const result = payload.result
+      setOneOffExecutionState((current) => current
+        && current.orderGlobalId === result.orderGlobalId ? {
+          ...current,
+          rowVersion: result.rowVersion,
+          packedRate: {
+            quoteGlobalId: result.quote.globalId,
+            expiresAt: result.quote.expiresAt,
+            status: result.quote.status,
+            consumed: false,
+            offers: result.quote.offers,
+          },
+        } : current)
+      setNotice(
+        `Fresh rates for all ${result.packageCount} packed parcels are ready. `
+        + `${result.quote.offers.length} matching ${result.quote.offers.length === 1 ? 'offer expires' : 'offers expire'} at ${new Date(result.quote.expiresAt).toLocaleString()}.`,
+      )
+    } catch (caught) {
+      setOneOffExecutionError(caught instanceof Error
+        ? caught.message
+        : 'Packed-group rates could not be refreshed')
+    } finally {
+      setOneOffGroupAction('')
+    }
+  }
+
+  const openOneOffGroupPurchase = () => {
+    if (
+      !detail
+      || oneOffExecutionState?.orderGlobalId !== detail.globalId
+    ) return
+    const offers = oneOffExecutionState?.packedRate?.offers || []
+    const lowest = [...offers].sort((left, right) => left.amountMinor - right.amountMinor)[0]
+    setOneOffGroupPurchaseOfferGlobalId(lowest?.globalId || '')
+    setOneOffGroupPurchaseReason(
+      `Purchase the reviewed fresh rate for all ${oneOffExecutionState?.packageCount || 0} exact packed parcels as one carrier shipment group`,
+    )
+    setOneOffGroupPurchaseConfirmed(false)
+    setOneOffGroupPurchaseIdempotencyKey(
+      `operations-one-off-group-purchase:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+    )
+    setOneOffGroupPurchaseOpen(true)
+  }
+
+  const closeOneOffGroupPurchase = () => {
+    if (oneOffGroupAction === 'purchase') return
+    setOneOffGroupPurchaseOpen(false)
+    setOneOffGroupPurchaseConfirmed(false)
+    setOneOffGroupPurchaseIdempotencyKey('')
+  }
+
+  const purchaseOneOffCarrierGroup = async (event: FormEvent) => {
+    event.preventDefault()
+    const packedRate = oneOffExecutionState?.packedRate
+    if (
+      !detail
+      || !oneOffExecutionState
+      || oneOffExecutionState.orderGlobalId !== detail.globalId
+      || !packedRate
+      || packedRate.consumed
+      || new Date(packedRate.expiresAt).getTime() <= Date.now()
+      || !oneOffGroupPurchaseOfferGlobalId
+      || !oneOffGroupPurchaseConfirmed
+      || !oneOffGroupPurchaseIdempotencyKey
+      || oneOffGroupPurchaseReason.trim().length < 10
+      || !oneOffGroupPurchasePermissionsReady()
+    ) return
+    setOneOffGroupAction('purchase')
+    setOneOffExecutionError('')
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/one-off-shipments', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': oneOffGroupPurchaseIdempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'purchase-group',
+          orderGlobalId: detail.globalId,
+          purchaseQuoteGlobalId: packedRate.quoteGlobalId,
+          selectedOfferGlobalId: oneOffGroupPurchaseOfferGlobalId,
+          expectedRowVersion: oneOffExecutionState.rowVersion,
+          reason: oneOffGroupPurchaseReason.trim(),
+          ...(detail.oneOffShippingMode === 'live'
+            ? { confirmation: ONE_OFF_LIVE_POSTAGE_CONFIRMATION }
+            : {}),
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as OneOffExecutionPayload
+      if (
+        !response.ok
+        || !payload.ok
+        || !payload.result
+        || !('groupAttemptGlobalId' in payload.result)
+      ) {
+        throw new Error(`${payload.error || 'The whole-shipment carrier group could not be purchased'}${payload.code ? ` [${payload.code}]` : ''}`)
+      }
+      const result = payload.result
+      setOneOffGroupPurchaseOpen(false)
+      setOneOffGroupPurchaseConfirmed(false)
+      setOneOffGroupPurchaseIdempotencyKey('')
+      const printWarnings = result.labels.filter((label) => label.printWarning).length
+      setNotice(
+        `${result.executionMode === 'live' ? 'LIVE' : 'TEST'} carrier group ${result.groupAttemptGlobalId} `
+        + `returned all ${result.labels.length} package labels. Master tracking ${result.masterTrackingNumber}.`
+        + (printWarnings ? ` ${printWarnings} print ${printWarnings === 1 ? 'job needs' : 'jobs need'} attention.` : ''),
+      )
+      await Promise.all([
+        loadWorkspace(result.orderGlobalId),
+        loadOneOffExecutionState(result.orderGlobalId),
+      ])
+    } catch (caught) {
+      setOneOffExecutionError(caught instanceof Error
+        ? caught.message
+        : 'The whole-shipment carrier group could not be purchased')
+    } finally {
+      setOneOffGroupAction('')
+    }
+  }
+
+  const openOneOffGroupVoid = () => {
+    if (
+      !detail
+      || oneOffExecutionState?.orderGlobalId !== detail.globalId
+    ) return
+    const closeSample = oneOffExecutionState.carrierGroup?.lifecycleMode
+      === 'local_sample_close'
+    setOneOffGroupVoidReason(closeSample
+      ? 'Close the complete UPS TEST sample group locally after validation with zero provider writes'
+      : 'Void the exact complete one-off carrier shipment group before shipment confirmation')
+    setOneOffGroupVoidIdempotencyKey(
+      `operations-one-off-group-void:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+    )
+    setOneOffGroupVoidOpen(true)
+  }
+
+  const closeOneOffGroupVoid = () => {
+    if (oneOffGroupAction === 'void') return
+    setOneOffGroupVoidOpen(false)
+    setOneOffGroupVoidIdempotencyKey('')
+  }
+
+  const voidOneOffCarrierGroup = async (event: FormEvent) => {
+    event.preventDefault()
+    if (
+      !detail
+      || !oneOffExecutionState
+      || oneOffExecutionState.orderGlobalId !== detail.globalId
+      || !oneOffGroupVoidIdempotencyKey
+      || oneOffGroupVoidReason.trim().length < 10
+      || !oneOffGroupVoidPermissionsReady()
+    ) return
+    setOneOffGroupAction('void')
+    setOneOffExecutionError('')
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/one-off-shipments', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': oneOffGroupVoidIdempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'void-group',
+          orderGlobalId: detail.globalId,
+          expectedRowVersion: oneOffExecutionState.rowVersion,
+          reason: oneOffGroupVoidReason.trim(),
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as OneOffExecutionPayload
+      if (
+        !response.ok
+        || !payload.ok
+        || !payload.result
+        || !('groupAttemptGlobalId' in payload.result)
+      ) {
+        throw new Error(`${payload.error || 'The whole-shipment carrier group could not be cancelled'}${payload.code ? ` [${payload.code}]` : ''}`)
+      }
+      const result = payload.result
+      setOneOffGroupVoidOpen(false)
+      setOneOffGroupVoidIdempotencyKey('')
+      setNotice(result.action === 'close_sample'
+        ? `TEST carrier group ${result.groupAttemptGlobalId} was closed locally with all ${result.labels.length} labels retired and no carrier write.`
+        : `Carrier group ${result.groupAttemptGlobalId} and all ${result.labels.length} package labels were voided together.`)
+      await Promise.all([
+        loadWorkspace(result.orderGlobalId),
+        loadOneOffExecutionState(result.orderGlobalId),
+      ])
+    } catch (caught) {
+      setOneOffExecutionError(caught instanceof Error
+        ? caught.message
+        : 'The whole-shipment carrier group could not be cancelled')
+    } finally {
+      setOneOffGroupAction('')
     }
   }
 
@@ -3452,6 +3802,35 @@ export default function OperationsSection({
         (account) => account.provider === detailSelectedProvider,
       ) || []
     : []
+  const detailNativeOneOff = detail?.sourceProvider === 'clawpilot_native'
+    && Boolean(detail.oneOffShippingMode)
+  const oneOffPackedOffers = oneOffExecutionState?.packedRate?.offers || []
+  const oneOffGroupSelectedOffer = oneOffPackedOffers.find(
+    (offer) => offer.globalId === oneOffGroupPurchaseOfferGlobalId,
+  ) || null
+  const oneOffPackedRateExpired = Boolean(
+    oneOffExecutionState?.packedRate
+    && new Date(oneOffExecutionState.packedRate.expiresAt).getTime() <= Date.now(),
+  )
+  const oneOffPackedRateConsumed = Boolean(oneOffExecutionState?.packedRate?.consumed)
+
+  useEffect(() => {
+    if (!drawerOpen || !detailNativeOneOff || !detail?.globalId) {
+      setOneOffExecutionState(null)
+      setOneOffExecutionError('')
+      return
+    }
+    const controller = new AbortController()
+    void loadOneOffExecutionState(detail.globalId, controller.signal)
+    return () => controller.abort()
+  }, [
+    detail?.globalId,
+    detail?.rowVersion,
+    detailNativeOneOff,
+    drawerOpen,
+    loadOneOffExecutionState,
+  ])
+
   const selectedException = workspace?.exceptions.find((item) => item.globalId === selectedExceptionGlobalId) || null
   const summary = workspace?.summary
   const empty = !loading && (
@@ -3861,12 +4240,17 @@ export default function OperationsSection({
         sandboxCarrierAccounts={workspace?.shipping?.sandboxCarrierAccounts || []}
         commerceFulfillmentRecoveryEnabled={commerceFulfillmentRecoveryEnabled}
         activationState={workspace?.activation.state || 'disabled'}
+        canManage={Boolean(capabilities?.canManage)}
         canExecute={Boolean(capabilities?.canManage && capabilities.canExecute)}
+        canActivate={Boolean(capabilities?.canActivate)}
         canAuthorizeSandboxE2e={Boolean(
           capabilities?.canActivate
           && capabilities.canManage
           && capabilities.canExecute
         )}
+        oneOffExecutionState={oneOffExecutionState}
+        oneOffExecutionLoading={oneOffExecutionLoading}
+        oneOffExecutionError={oneOffExecutionError}
         open={drawerOpen}
         busy={
           planningOrder
@@ -3881,6 +4265,7 @@ export default function OperationsSection({
           || authorizingSandboxE2e
           || creatingLabel
           || voidingLabel
+          || Boolean(oneOffGroupAction)
           || Boolean(generatingPackingSlipPackageId)
           || Boolean(printingPackingSlipArtifactId)
         }
@@ -3901,6 +4286,11 @@ export default function OperationsSection({
         onAuthorizeSandboxE2e={openSandboxE2eAuthorization}
         onCreateSandboxLabel={openCreateLabel}
         onVoidSandboxLabel={openVoidLabel}
+        onRefreshOneOffPackedRates={() => {
+          void refreshOneOffPackedRates()
+        }}
+        onReviewOneOffGroupPurchase={openOneOffGroupPurchase}
+        onVoidOneOffGroup={openOneOffGroupVoid}
         generatingPackingSlipPackageId={generatingPackingSlipPackageId}
         printingPackingSlipArtifactId={printingPackingSlipArtifactId}
       />
@@ -3918,6 +4308,7 @@ export default function OperationsSection({
         open={oneOffShipmentOpen}
         onClose={() => setOneOffShipmentOpen(false)}
         onCreated={openCreatedOneOffShipment}
+        canActivate={Boolean(capabilities?.canActivate)}
       />
 
       <Dialog
@@ -4925,6 +5316,247 @@ export default function OperationsSection({
         </Box>
       </Dialog>
 
+      <Dialog
+        open={oneOffGroupPurchaseOpen}
+        onClose={closeOneOffGroupPurchase}
+        fullWidth
+        maxWidth="sm"
+      >
+        <Box component="form" onSubmit={purchaseOneOffCarrierGroup}>
+          <DialogTitle>
+            Review whole-shipment purchase
+          </DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <Alert severity={detail?.oneOffShippingMode === 'live' ? 'error' : 'info'}>
+                <Typography fontWeight={800}>
+                  {detail?.oneOffShippingMode === 'live'
+                    ? 'LIVE · one production carrier charge'
+                    : 'TEST · carrier sandbox only'}
+                </Typography>
+                This submits all {oneOffExecutionState?.packageCount || 0} exact packed parcels as
+                one carrier shipment. Success requires a complete package-label set. There is no
+                per-package purchase or cancellation path.
+              </Alert>
+
+              {oneOffExecutionError && (
+                <Alert severity="error">{oneOffExecutionError}</Alert>
+              )}
+
+              {oneOffPackedRateExpired && (
+                <Alert severity="warning">
+                  This packed rate has expired. Close this dialog and refresh the complete group.
+                </Alert>
+              )}
+              {oneOffPackedRateConsumed && (
+                <Alert severity="warning">
+                  This packed rate was already consumed by a carrier-group attempt. Close this
+                  dialog and refresh the complete group before another purchase.
+                </Alert>
+              )}
+
+              <Box>
+                <Typography variant="caption" color="text.secondary">
+                  Planning selection
+                </Typography>
+                <Typography>
+                  {oneOffExecutionState
+                    ? `${oneOffExecutionState.planning.serviceName} · ${money(String(oneOffExecutionState.planning.amountMinor), oneOffExecutionState.planning.currency)}`
+                    : 'Unavailable'}
+                </Typography>
+              </Box>
+
+              <FormControl required>
+                <Typography variant="overline" color="text.secondary">
+                  Matching fresh packed rate
+                </Typography>
+                <RadioGroup
+                  value={oneOffGroupPurchaseOfferGlobalId}
+                  onChange={(event) => setOneOffGroupPurchaseOfferGlobalId(event.target.value)}
+                >
+                  <Stack spacing={1}>
+                    {oneOffPackedOffers.map((offer) => {
+                      const variance = oneOffExecutionState
+                        ? offer.amountMinor - oneOffExecutionState.planning.amountMinor
+                        : 0
+                      return (
+                        <Box
+                          key={offer.globalId}
+                          sx={{
+                            p: 1,
+                            border: `1px solid ${oneOffGroupPurchaseOfferGlobalId === offer.globalId ? '#A8C7FA' : 'rgba(255,255,255,0.12)'}`,
+                            borderRadius: 2,
+                          }}
+                        >
+                          <FormControlLabel
+                            value={offer.globalId}
+                            control={<Radio />}
+                            sx={{ m: 0, width: '100%' }}
+                            label={(
+                              <Stack direction="row" justifyContent="space-between" gap={1} sx={{ width: '100%' }}>
+                                <Box>
+                                  <Typography variant="body2" fontWeight={700}>
+                                    {offer.providerLabel} · {offer.serviceName}
+                                  </Typography>
+                                  <Typography variant="caption" color="text.secondary">
+                                    Exact planned service · {offer.globalId}
+                                  </Typography>
+                                </Box>
+                                <Box sx={{ textAlign: 'right' }}>
+                                  <Typography variant="body2" fontWeight={700}>
+                                    {money(String(offer.amountMinor), offer.currency)}
+                                  </Typography>
+                                  <Typography
+                                    variant="caption"
+                                    color={variance > 0 ? 'warning.main' : variance < 0 ? 'success.main' : 'text.secondary'}
+                                  >
+                                    {variance === 0
+                                      ? 'No change'
+                                      : `${variance > 0 ? '+' : '−'}${money(String(Math.abs(variance)), offer.currency)}`}
+                                  </Typography>
+                                </Box>
+                              </Stack>
+                            )}
+                          />
+                        </Box>
+                      )
+                    })}
+                  </Stack>
+                </RadioGroup>
+                <FormHelperText>
+                  Expires {oneOffExecutionState?.packedRate
+                    ? formatUserDateTime(oneOffExecutionState.packedRate.expiresAt, dateTime, {
+                      year: 'numeric',
+                      month: 'short',
+                      day: 'numeric',
+                      hour: 'numeric',
+                      minute: '2-digit',
+                      fallback: 'Unknown',
+                    })
+                    : 'unavailable'}.
+                </FormHelperText>
+              </FormControl>
+
+              <TextField
+                required
+                multiline
+                minRows={3}
+                label="Whole-shipment purchase reason"
+                value={oneOffGroupPurchaseReason}
+                onChange={(event) => setOneOffGroupPurchaseReason(event.target.value)}
+                inputProps={{ maxLength: 500 }}
+                helperText={`${oneOffGroupPurchaseReason.trim().length}/500 · Recorded with the group carrier attempt and audit event`}
+              />
+              <FormControlLabel
+                sx={{ alignItems: 'flex-start' }}
+                control={(
+                  <Checkbox
+                    checked={oneOffGroupPurchaseConfirmed}
+                    onChange={(event) => setOneOffGroupPurchaseConfirmed(event.target.checked)}
+                  />
+                )}
+                label={detail?.oneOffShippingMode === 'live'
+                  ? `I reviewed the fresh packed rate, variance, and all ${oneOffExecutionState?.packageCount || 0} parcels and authorize this LIVE whole-shipment postage purchase.`
+                  : `I reviewed the fresh packed rate, variance, and all ${oneOffExecutionState?.packageCount || 0} parcels and authorize this TEST whole-shipment command.`}
+              />
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={closeOneOffGroupPurchase} disabled={oneOffGroupAction === 'purchase'}>
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              variant="contained"
+              disabled={
+                oneOffGroupAction === 'purchase'
+                || !oneOffGroupSelectedOffer
+                || oneOffPackedRateExpired
+                || oneOffPackedRateConsumed
+                || oneOffGroupPurchaseReason.trim().length < 10
+                || !oneOffGroupPurchaseConfirmed
+                || !oneOffGroupPurchasePermissionsReady()
+              }
+              startIcon={oneOffGroupAction === 'purchase'
+                ? <CircularProgress size={16} />
+                : <LocalShippingRounded />}
+              data-testid="purchase-one-off-carrier-group"
+            >
+              {oneOffGroupAction === 'purchase'
+                ? 'Purchasing complete shipment'
+                : `Purchase ${oneOffExecutionState?.packageCount || 0}-parcel shipment`}
+            </Button>
+          </DialogActions>
+        </Box>
+      </Dialog>
+
+      <Dialog open={oneOffGroupVoidOpen} onClose={closeOneOffGroupVoid} fullWidth maxWidth="sm">
+        <Box component="form" onSubmit={voidOneOffCarrierGroup}>
+          <DialogTitle>
+            {oneOffExecutionState?.carrierGroup?.lifecycleMode
+              === 'local_sample_close'
+              ? 'Close complete UPS TEST sample'
+              : 'Void complete shipment group'}
+          </DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <Alert severity="warning">
+                {oneOffExecutionState?.carrierGroup?.lifecycleMode
+                  === 'local_sample_close'
+                  ? 'UPS CIE returns masked sample identifiers. ClawPilot will retire the complete test group and all package labels locally with zero provider writes.'
+                  : `ClawPilot will send one whole-shipment cancellation through the exact carrier account used for purchase. All ${oneOffExecutionState?.carrierGroup?.packageCount || 0} package labels must be retired together.`}
+              </Alert>
+              {oneOffExecutionError && (
+                <Alert severity="error">{oneOffExecutionError}</Alert>
+              )}
+              <Box>
+                <Typography variant="caption" color="text.secondary">Master tracking</Typography>
+                <Typography sx={{ overflowWrap: 'anywhere' }}>
+                  {oneOffExecutionState?.carrierGroup?.masterTrackingNumber || 'Unavailable'}
+                </Typography>
+              </Box>
+              <TextField
+                required
+                autoFocus
+                multiline
+                minRows={3}
+                label="Whole-shipment cancellation reason"
+                value={oneOffGroupVoidReason}
+                onChange={(event) => setOneOffGroupVoidReason(event.target.value)}
+                inputProps={{ maxLength: 500 }}
+                helperText={`${oneOffGroupVoidReason.trim().length}/500 · Recorded with the group carrier attempt and audit event`}
+              />
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={closeOneOffGroupVoid} disabled={oneOffGroupAction === 'void'}>
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              color="error"
+              variant="contained"
+              disabled={
+                oneOffGroupAction === 'void'
+                || oneOffGroupVoidReason.trim().length < 10
+                || !oneOffGroupVoidPermissionsReady()
+              }
+              startIcon={oneOffGroupAction === 'void'
+                ? <CircularProgress size={16} />
+                : <CancelRounded />}
+              data-testid="confirm-void-one-off-carrier-group"
+            >
+              {oneOffGroupAction === 'void'
+                ? 'Closing complete group'
+                : oneOffExecutionState?.carrierGroup?.lifecycleMode
+                  === 'local_sample_close'
+                  ? 'Close complete TEST group'
+                  : 'Void complete shipment group'}
+            </Button>
+          </DialogActions>
+        </Box>
+      </Dialog>
+
       <Dialog open={createLabelOpen} onClose={closeCreateLabel} fullWidth maxWidth="sm">
         <Box component="form" onSubmit={createSandboxLabel}>
           <DialogTitle>
@@ -5012,7 +5644,9 @@ export default function OperationsSection({
               }
               startIcon={creatingLabel ? <CircularProgress size={16} /> : <LocalShippingRounded />}
             >
-              {creatingLabel ? 'Creating label' : 'Create sandbox label'}
+              {creatingLabel
+                ? 'Creating label'
+                : 'Create sandbox label'}
             </Button>
           </DialogActions>
         </Box>
@@ -5020,7 +5654,9 @@ export default function OperationsSection({
 
       <Dialog open={voidLabelOpen} onClose={closeVoidLabel} fullWidth maxWidth="sm">
         <Box component="form" onSubmit={voidSandboxLabel}>
-          <DialogTitle>Void sandbox carrier label</DialogTitle>
+          <DialogTitle>
+            Void sandbox carrier label
+          </DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2}>
               <Alert severity="warning">

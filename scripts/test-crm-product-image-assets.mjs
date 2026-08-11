@@ -206,7 +206,7 @@ for (const contract of [
   'assertSameOrigin(req)',
   'isBrowserSameOriginRequest',
   'appPublicUrl()',
-  'commerceIntakeRuntimeAvailable()',
+  'commerceReadRuntimeAvailable()',
   'imageImportAvailable:',
   "'Cache-Control': 'private, no-store, max-age=0'",
 ]) {
@@ -217,7 +217,7 @@ assert.doesNotMatch(route, /body\.organizationId/)
 assert.doesNotMatch(route, /shopify/i)
 assert.doesNotMatch(route, /\bfetch\s*\(/)
 assert.equal(
-  (route.match(/imageImportAvailable: commerceIntakeRuntimeAvailable\(\)/g)
+  (route.match(/imageImportAvailable: commerceReadRuntimeAvailable\(\)/g)
     || []).length,
   3,
   'GET, POST, and PATCH must all return the current image-import capability',

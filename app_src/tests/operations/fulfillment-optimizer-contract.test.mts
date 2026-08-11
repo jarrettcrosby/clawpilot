@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 // @ts-expect-error Node's strip-types test runner requires the .ts extension.
 import * as contract from '../../lib/operations/fulfillmentOptimizerContract.ts'
+// @ts-expect-error Node's strip-types test runner requires the .ts extension.
+import * as runtimeConfig from '../../lib/operations/fulfillmentOptimizerRuntimeConfig.ts'
 
 const {
   ASSORTMENT_OBJECTIVE_SEQUENCE,
@@ -14,6 +16,148 @@ const {
   validateFulfillmentOptimizationOptions,
   validatePackagingAssortmentInput,
 } = contract
+
+const {
+  FULFILLMENT_OPTIMIZER_RAILWAY_PRIVATE_HOSTNAME,
+  FulfillmentOptimizerRuntimeConfigError,
+  fulfillmentOptimizerRuntimeHealth,
+  normalizeFulfillmentOptimizerBaseUrl,
+  resolveFulfillmentOptimizerRuntimeConfiguration,
+} = runtimeConfig
+
+function expectRuntimeConfigError(
+  callback: () => unknown,
+  expectedCode: string,
+) {
+  assert.throws(callback, (error: unknown) => (
+    error instanceof FulfillmentOptimizerRuntimeConfigError
+    && error.code === expectedCode
+  ))
+}
+
+test('optimizer URL permits only the exact Railway private HTTP endpoint', () => {
+  assert.equal(
+    normalizeFulfillmentOptimizerBaseUrl(
+      `http://${FULFILLMENT_OPTIMIZER_RAILWAY_PRIVATE_HOSTNAME}`,
+    ),
+    `http://${FULFILLMENT_OPTIMIZER_RAILWAY_PRIVATE_HOSTNAME}`,
+  )
+  assert.equal(
+    normalizeFulfillmentOptimizerBaseUrl(
+      `http://${FULFILLMENT_OPTIMIZER_RAILWAY_PRIVATE_HOSTNAME}:8080`,
+    ),
+    `http://${FULFILLMENT_OPTIMIZER_RAILWAY_PRIVATE_HOSTNAME}:8080`,
+  )
+  assert.equal(
+    normalizeFulfillmentOptimizerBaseUrl('https://optimizer.example.com'),
+    'https://optimizer.example.com',
+  )
+
+  for (const rejected of [
+    'http://optimizer.example.com',
+    'http://localhost:8080',
+    'http://127.0.0.1:8080',
+    'http://10.0.0.7:8080',
+    'http://other-optimizer.railway.internal:8080',
+    `http://${FULFILLMENT_OPTIMIZER_RAILWAY_PRIVATE_HOSTNAME}.:8080`,
+  ]) {
+    expectRuntimeConfigError(
+      () => normalizeFulfillmentOptimizerBaseUrl(rejected),
+      'ORTOOLS_TLS_REQUIRED',
+    )
+  }
+})
+
+test('optimizer URL rejects private HTTPS, userinfo, query, hash, and invalid ports', () => {
+  for (const rejected of [
+    'https://localhost:8080',
+    'https://127.0.0.1:8080',
+    'https://192.168.1.20:8080',
+    'https://other-optimizer.railway.internal:8080',
+    'https://other-optimizer.railway.internal.:8080',
+    'https://localhost.:8080',
+    'https://optimizer',
+  ]) {
+    expectRuntimeConfigError(
+      () => normalizeFulfillmentOptimizerBaseUrl(rejected),
+      'ORTOOLS_PRIVATE_URL_REJECTED',
+    )
+  }
+  for (const rejected of [
+    'https://user:password@optimizer.example.com',
+    'https://optimizer.example.com?mode=1',
+    'https://optimizer.example.com?',
+    'https://optimizer.example.com#status',
+    'https://optimizer.example.com#',
+    `http://${FULFILLMENT_OPTIMIZER_RAILWAY_PRIVATE_HOSTNAME}:0`,
+    `http://${FULFILLMENT_OPTIMIZER_RAILWAY_PRIVATE_HOSTNAME}:65536`,
+  ]) {
+    expectRuntimeConfigError(
+      () => normalizeFulfillmentOptimizerBaseUrl(rejected),
+      'ORTOOLS_URL_INVALID',
+    )
+  }
+})
+
+test('optimizer runtime health is configuration-only and fails closed when enabled', () => {
+  const disabled = fulfillmentOptimizerRuntimeHealth({})
+  assert.deepEqual(disabled, {
+    enabled: false,
+    configurationReady: false,
+    configurationStatus: 'disabled',
+    reason: null,
+    endpoint: null,
+    requestTimeoutMs: null,
+    connectivity: 'not-probed',
+  })
+
+  const readyEnvironment = {
+    CLAWPILOT_FULFILLMENT_OPTIMIZER_ENABLED: '1',
+    CLAWPILOT_FULFILLMENT_OPTIMIZER_URL:
+      `http://${FULFILLMENT_OPTIMIZER_RAILWAY_PRIVATE_HOSTNAME}:8080`,
+    CLAWPILOT_FULFILLMENT_OPTIMIZER_SECRET: 's'.repeat(32),
+    CLAWPILOT_FULFILLMENT_OPTIMIZER_TIMEOUT_MS: '2500',
+  }
+  assert.deepEqual(fulfillmentOptimizerRuntimeHealth(readyEnvironment), {
+    enabled: true,
+    configurationReady: true,
+    configurationStatus: 'ready',
+    reason: null,
+    endpoint: {
+      hostname: FULFILLMENT_OPTIMIZER_RAILWAY_PRIVATE_HOSTNAME,
+      port: 8080,
+      transport: 'railway_private_http',
+    },
+    requestTimeoutMs: 2500,
+    connectivity: 'not-probed',
+  })
+  assert.equal(
+    resolveFulfillmentOptimizerRuntimeConfiguration(readyEnvironment)?.secret,
+    readyEnvironment.CLAWPILOT_FULFILLMENT_OPTIMIZER_SECRET,
+  )
+
+  assert.deepEqual(
+    fulfillmentOptimizerRuntimeHealth({
+      ...readyEnvironment,
+      CLAWPILOT_FULFILLMENT_OPTIMIZER_SECRET: 'short',
+    }),
+    {
+      enabled: true,
+      configurationReady: false,
+      configurationStatus: 'invalid',
+      reason: 'ORTOOLS_SECRET_INVALID',
+      endpoint: null,
+      requestTimeoutMs: null,
+      connectivity: 'not-probed',
+    },
+  )
+  assert.equal(
+    fulfillmentOptimizerRuntimeHealth({
+      CLAWPILOT_FULFILLMENT_OPTIMIZER_ENABLED: 'true',
+    }).reason,
+    'ORTOOLS_ENABLED_INVALID',
+  )
+})
 
 function fulfillmentInput() {
   return {

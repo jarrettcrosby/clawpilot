@@ -6,7 +6,7 @@ import {
 import {
   FaireProductImageRefreshError,
 } from '@/lib/integrations/faireProductImageRefreshTypes'
-import { commerceIntakeRuntimeAvailable } from '@/lib/integrations/commerceIntake'
+import { commerceReadRuntimeAvailable } from '@/lib/integrations/commerceIntake'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { appPublicUrl } from '@/lib/publicUrl'
 import { requestSession, requireRequestUser } from '@/lib/requestUser'
@@ -180,10 +180,10 @@ export async function POST(
         404,
       )
     }
-    if (!commerceIntakeRuntimeAvailable()) {
+    if (!commerceReadRuntimeAvailable()) {
       fail(
-        'FAIRE_PRODUCT_IMAGE_REFRESH_DEVELOPMENT_ONLY',
-        'Faire Product image import is available only while development commerce intake is enabled',
+        'FAIRE_PRODUCT_IMAGE_REFRESH_DISABLED',
+        'Faire Product image import is unavailable while commerce reconciliation is disabled',
         409,
       )
     }

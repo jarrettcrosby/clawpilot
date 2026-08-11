@@ -54,9 +54,16 @@ function runModule(path, requireModule) {
   return module.exports
 }
 
+const oneOffConstants = runModule(
+  'app_src/lib/operations/oneOffShipmentConstants.ts',
+  (specifier) => requireFromApp(specifier),
+)
+
 const operationsContract = runModule(
   'app_src/lib/operations/oneOffShipments.ts',
-  (specifier) => requireFromApp(specifier),
+  (specifier) => specifier === '@/lib/operations/oneOffShipmentConstants'
+    ? oneOffConstants
+    : requireFromApp(specifier),
 )
 
 class CarrierIntegrationRequestError extends Error {
@@ -65,6 +72,15 @@ class CarrierIntegrationRequestError extends Error {
     this.status = status
     this.code = code
     this.rateEvidenceGlobalId = rateEvidenceGlobalId
+  }
+}
+
+class CarrierWholeShipmentRateClientError extends Error {
+  constructor(message, status = 409, code = 'CARRIER_RATE_ERROR', uncertain = false) {
+    super(message)
+    this.status = status
+    this.code = code
+    this.uncertain = uncertain
   }
 }
 
@@ -80,6 +96,21 @@ const persistence = runModule(
         getCarrierIntegrationsState: async () => ({ accounts: [] }),
         testCarrierSandboxShipmentRate: async () => {
           throw new Error('Carrier access is outside the validation contract')
+        },
+      }
+    }
+    if (specifier === '@/lib/integrations/carrierWholeShipmentRateClient') {
+      return {
+        CarrierWholeShipmentRateClientError,
+        executeCarrierWholeShipmentRateRequest: async () => {
+          throw new Error('Carrier access is outside the validation contract')
+        },
+      }
+    }
+    if (specifier === '@/lib/integrations/carrierWholeShipmentRateFoundation') {
+      return {
+        prepareCarrierWholeShipmentRateRequest: () => {
+          throw new Error('Carrier request preparation is outside the validation contract')
         },
       }
     }
@@ -112,6 +143,7 @@ const {
 
 function validQuote() {
   return {
+    executionMode: 'test',
     customerGlobalId: 'ga0000001',
     warehouseGlobalId: 'gwh0000001',
     inventoryPoolGlobalId: 'gip0000001',
@@ -119,6 +151,9 @@ function validQuote() {
     referenceNumber: 'ONE-OFF-TEST-1',
     currency: 'USD',
     requestedDeliveryAt: null,
+    shipFromPhone: '6175550100',
+    shipToPhone: '6175550101',
+    shipToResidential: false,
     shipTo: {
       name: 'Warehouse Customer',
       line1: '100 Test Street',
@@ -193,7 +228,8 @@ assert.ok(
 )
 
 for (const fragment of [
-  'OPERATIONS_ONE_OFF_PRODUCTION_NOT_ENABLED',
+  'OPERATIONS_ONE_OFF_LIVE_RUNTIME_REQUIRED',
+  "quote.executionMode === 'live' ? 'production' : 'sandbox'",
   "active.state !== 'shadow'",
   'OPERATIONS_ONE_OFF_QUOTE_STALE',
   'inventorySnapshotHash',

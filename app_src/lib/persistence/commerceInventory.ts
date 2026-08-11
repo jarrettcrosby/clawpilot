@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
+import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
 import {
   SHOPIFY_INVENTORY_ADAPTER_VERSION,
   type ShopifyInventoryLocation,
@@ -21,6 +22,10 @@ import {
 const INVENTORY_POOL_NAME = 'Shopify Available-to-Promise'
 const INVENTORY_LOT_CODE = 'SHOPIFY_ATP'
 const SYNC_ACTION = 'inventory.levels.read'
+const SHOPIFY_INVENTORY_READ_ACCOUNT_SQL = commerceReadAccountSql(
+  'account',
+  { developmentRequiresActive: true },
+)
 
 export class CommerceInventoryPersistenceError extends Error {
   constructor(
@@ -1177,7 +1182,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
           AND account.id = job.integration_account_id
           AND account.integration_type = 'commerce'
           AND account.provider = 'shopify'
-          AND account.status = 'active'
+          AND ${SHOPIFY_INVENTORY_READ_ACCOUNT_SQL}
           AND account.commerce_credential_generation =
               job.credential_generation
          JOIN operations_commerce_credentials credential

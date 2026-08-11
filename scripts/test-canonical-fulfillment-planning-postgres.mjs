@@ -2829,6 +2829,13 @@ async function verifyCanonicalPlanning(databaseUrl) {
     const fulfillmentOptimizerContract = loadTypeScriptModule(
       'app_src/lib/operations/fulfillmentOptimizerContract.ts',
     )
+    const globalIds = await import(
+      new URL('../app_src/lib/globalIds.mjs', import.meta.url)
+    )
+    const barcodeLabels = loadTypeScriptModule(
+      'app_src/lib/operations/barcodeLabels.ts',
+      { mocks: { '@/lib/globalIds.mjs': globalIds } },
+    )
     const cartonizationRateEvidence = loadTypeScriptModule(
       'app_src/lib/persistence/cartonizationRateEvidence.ts',
       {
@@ -3106,6 +3113,7 @@ async function verifyCanonicalPlanning(databaseUrl) {
             canonicalPlanning,
           '@/lib/operations/domain': domain,
           '@/lib/operations/packingSlip': packingSlip,
+          '@/lib/operations/barcodeLabels': barcodeLabels,
           '@/lib/persistence/cartonizationRateEvidence':
             cartonizationRateEvidence,
           '@/lib/persistence/crm': {

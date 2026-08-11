@@ -27,7 +27,7 @@ function errorResponse(error: unknown) {
   const message = error instanceof Error ? error.message : 'Workspace request failed'
   const status = message === 'Unauthorized'
     ? 401
-    : /access|required|available/i.test(message)
+    : /access|required|available|enabled/i.test(message)
       ? 403
       : 400
   return NextResponse.json({ ok: false, error: message }, { status })
@@ -61,6 +61,9 @@ export async function POST(req: NextRequest) {
     const action = String(body?.action || 'switch')
     let organizationId = String(body?.organizationId || '').trim()
     if (action === 'create-root') {
+      if (session.authMethod === 'google_sso') {
+        throw new Error('Sign in with a magic code before creating a business whose Google policy has not been configured')
+      }
       const actor = await requireRequestUser(req)
       const membership = await createIndependentRootWorkspace({ actor, name: body?.name })
       organizationId = membership.organizationId

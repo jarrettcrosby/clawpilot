@@ -9,12 +9,13 @@ options:
 
 configs:
   Development: debug
+  DevelopmentRelease: release
   Production: release
 
 settings:
   base:
     SWIFT_VERSION: "6.0"
-    CURRENT_PROJECT_VERSION: "3"
+    CURRENT_PROJECT_VERSION: "4"
     MARKETING_VERSION: "0.1.0"
     CLAWPILOT_APPLE_DEVELOPMENT_TEAM: "CN2T77JHQQ"
     DEVELOPMENT_TEAM: $(CLAWPILOT_APPLE_DEVELOPMENT_TEAM)
@@ -39,6 +40,7 @@ targets:
     deploymentTarget: "18.0"
     configFiles:
       Development: Config/Development.xcconfig
+      DevelopmentRelease: Config/Development.xcconfig
       Production: Config/Production.xcconfig
     sources:
       - path: Apps/iPhone
@@ -124,6 +126,7 @@ targets:
       - path: Assets/ClawPilotAssets.xcassets
     configFiles:
       Development: Config/Development.xcconfig
+      DevelopmentRelease: Config/Development.xcconfig
       Production: Config/Production.xcconfig
     settings:
       base:
@@ -150,8 +153,10 @@ schemes:
         ClawPilotPickingPhone: all
     run:
       config: Development
+    profile:
+      config: DevelopmentRelease
     archive:
-      config: Development
+      config: DevelopmentRelease
   ClawPilotPickingPhone:
     build:
       targets:
@@ -166,8 +171,10 @@ schemes:
         ClawPilotPickingWatch: all
     run:
       config: Development
+    profile:
+      config: DevelopmentRelease
     archive:
-      config: Development
+      config: DevelopmentRelease
   ClawPilotPickingWatch:
     build:
       targets:

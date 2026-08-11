@@ -4,6 +4,7 @@ import {
   type WearablePickOrder,
   type WearablePickQueue,
 } from '@/lib/operations/wearablePicking'
+import { locationBarcode, providerBarcodeIdentity } from '@/lib/operations/barcodeLabels'
 import { publicCrmProductImageUrl } from '@/lib/crm/productImagePublic'
 import { query } from '@/lib/persistence/postgres'
 
@@ -18,7 +19,12 @@ type WearablePickRow = QueryResultRow & {
   channel_sku: string
   product_image_content_sha256: string | null
   barcode_snapshot: string | null
+  assigned_barcode: string | null
+  warehouse_global_id: string
+  location_global_id: string
   location_code: string
+  location_scan_required: boolean
+  location_scan_policy_row_version: string
   quantity: string
 }
 
@@ -75,7 +81,12 @@ export async function readAssignedWearablePickQueueFromPostgres(input: {
             line.channel_sku,
             product_image.content_sha256 AS product_image_content_sha256,
             product_channel.provider_barcode AS barcode_snapshot,
+            product_barcode.barcode_value AS assigned_barcode,
+            warehouse.global_id AS warehouse_global_id,
+            location.global_id AS location_global_id,
             location.code AS location_code,
+            COALESCE(scan_policy.location_scan_required, false) AS location_scan_required,
+            COALESCE(scan_policy.row_version, 0)::text AS location_scan_policy_row_version,
             pick.quantity::text
      FROM operations_pick_tasks pick
      JOIN operations_fulfillment_allocations allocation
@@ -106,6 +117,10 @@ export async function readAssignedWearablePickQueueFromPostgres(input: {
        ORDER BY channel.observed_at DESC, channel.id DESC
        LIMIT 1
      ) product_channel ON true
+     LEFT JOIN operations_product_barcodes product_barcode
+       ON product_barcode.organization_id = pick.organization_id
+      AND product_barcode.pipeline_id = line.pipeline_id
+      AND product_barcode.product_id = line.product_id
      LEFT JOIN LATERAL (
        SELECT asset.content_sha256
        FROM crm_product_image_assets asset
@@ -125,6 +140,9 @@ export async function readAssignedWearablePickQueueFromPostgres(input: {
      JOIN operations_warehouses warehouse
        ON warehouse.organization_id = location.organization_id
       AND warehouse.id = location.warehouse_id
+     LEFT JOIN operations_wearable_location_scan_policies scan_policy
+       ON scan_policy.organization_id = warehouse.organization_id
+      AND scan_policy.warehouse_id = warehouse.id
      WHERE pick.organization_id = $1::uuid
        AND lower(pick.assigned_to) = $2
        AND pick.status = 'ready'
@@ -169,10 +187,22 @@ export async function readAssignedWearablePickQueueFromPostgres(input: {
             productReferenceCode: row.product_global_id,
             contentSha256: row.product_image_content_sha256,
           }),
-      barcode: row.barcode_snapshot === null
-        ? null
-        : requiredIdentity(row.barcode_snapshot, 'barcode'),
+      barcode: (row.assigned_barcode === null
+        ? providerBarcodeIdentity(row.barcode_snapshot)?.value || null
+        : requiredIdentity(row.assigned_barcode, 'assigned barcode')),
       locationCode: requiredIdentity(row.location_code, 'location'),
+      ...(row.location_scan_required ? {
+        warehouseGlobalId: requiredIdentity(row.warehouse_global_id, 'warehouse identity'),
+        locationGlobalId: requiredIdentity(row.location_global_id, 'location identity'),
+        locationBarcode: locationBarcode(
+          requiredIdentity(row.location_global_id, 'location identity'),
+        ),
+        locationScanRequired: true as const,
+        locationScanPolicyRowVersion: positiveNumber(
+          row.location_scan_policy_row_version,
+          'location scan policy version',
+        ),
+      } : {}),
       quantity: positiveNumber(row.quantity, 'quantity'),
     })
   }

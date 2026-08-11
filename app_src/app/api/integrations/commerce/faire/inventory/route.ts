@@ -3,7 +3,7 @@ import {
   normalizeCommerceAccountGlobalId,
 } from '@/lib/integrations/commerceCredentialCrypto'
 import {
-  assertCommerceIntakeRuntime,
+  assertCommerceReadRuntime,
 } from '@/lib/integrations/commerceIntake'
 import {
   CommerceIntegrationRequestError,
@@ -62,7 +62,7 @@ function organizationId(user: AppUser) {
 
 async function actor(req: NextRequest) {
   const user = await requireRequestUser(req)
-  assertCommerceIntakeRuntime()
+  assertCommerceReadRuntime()
   if (!isPostgresStorageEnabled()) {
     throw new CommerceIntegrationRequestError(
       'Faire inventory observation requires Postgres storage',

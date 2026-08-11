@@ -481,6 +481,8 @@ export default function CarrierIntegrationPanel() {
   const [reconciliationIdempotencyKey, setReconciliationIdempotencyKey] = useState('')
   const [canRevealCredentials, setCanRevealCredentials] = useState(false)
   const [revealedCredential, setRevealedCredential] = useState<RevealedCarrierCredential | null>(null)
+  const [livePostageReason, setLivePostageReason] = useState('')
+  const [livePostageConfirmation, setLivePostageConfirmation] = useState('')
 
   const key = accountKey(provider, environment)
   const form = forms[key] || emptyForm(provider, environment)
@@ -488,6 +490,9 @@ export default function CarrierIntegrationPanel() {
     () => integrations.accounts.find((entry) => entry.provider === provider && entry.environment === environment) || null,
     [environment, integrations.accounts, provider],
   )
+  const livePostageAuthorized = account?.allowedCapabilities.includes(
+    'production_label',
+  ) === true
   const activeCarrierAccounts = useMemo(
     () => (account?.carrierAccounts || []).filter((entry) => entry.status === 'active'),
     [account?.carrierAccounts],
@@ -1399,6 +1404,87 @@ export default function CarrierIntegrationPanel() {
             Provider credentials and carrier billing accounts are separate. The account number and its
             registered address determine sender, recipient, or third-party billing for the test request.
           </Typography>
+        </Alert>
+      ) : null}
+
+      {environment === 'production' && provider !== 'usps_rest' && account ? (
+        <Alert
+          severity={livePostageAuthorized ? 'success' : 'warning'}
+          sx={{ mb: 2, borderRadius: '8px' }}
+        >
+          <Typography variant="body2" fontWeight={700}>
+            Live postage {livePostageAuthorized ? 'authorized' : 'not authorized'}
+          </Typography>
+          <Typography variant="body2" sx={{ mb: 1.5 }}>
+            Production rate access does not authorize shipment creation. Enabling this capability allows
+            an explicitly confirmed, completely packed one-off shipment of up to 40 parcels to buy real
+            UPS or FedEx postage in one provider command. ClawPilot retains every package label and tracking
+            number as one audited group. The complete group is voided through the same production account;
+            individual package purchase and void controls are intentionally unavailable.
+          </Typography>
+          {canRevealCredentials ? (
+            <Stack spacing={1.25}>
+              <TextField
+                size="small"
+                label={livePostageAuthorized ? 'Revocation reason' : 'Authorization reason'}
+                value={livePostageReason}
+                onChange={(event) => setLivePostageReason(event.target.value)}
+                inputProps={{ maxLength: 500 }}
+                disabled={busy}
+                sx={fieldSx}
+              />
+              {!livePostageAuthorized ? (
+                <TextField
+                  size="small"
+                  label="Type AUTHORIZE LIVE POSTAGE"
+                  value={livePostageConfirmation}
+                  onChange={(event) => setLivePostageConfirmation(event.target.value)}
+                  disabled={busy}
+                  sx={fieldSx}
+                />
+              ) : null}
+              <Button
+                color={livePostageAuthorized ? 'warning' : 'error'}
+                variant={livePostageAuthorized ? 'outlined' : 'contained'}
+                disabled={
+                  busy
+                  || livePostageReason.trim().length < 3
+                  || (!livePostageAuthorized
+                    && livePostageConfirmation !== 'AUTHORIZE LIVE POSTAGE')
+                }
+                onClick={() => {
+                  void patch(
+                    'live-postage',
+                    {
+                      action: 'set-production-label-enabled',
+                      provider,
+                      enabled: !livePostageAuthorized,
+                      reason: livePostageReason,
+                      confirmation: livePostageAuthorized
+                        ? ''
+                        : livePostageConfirmation,
+                    },
+                    livePostageAuthorized
+                      ? 'Live postage authorization revoked.'
+                      : 'Live postage authorization enabled for this production carrier.',
+                  ).then((result) => {
+                    if (!result) return
+                    setLivePostageReason('')
+                    setLivePostageConfirmation('')
+                  })
+                }}
+                sx={buttonSx}
+              >
+                {livePostageAuthorized
+                  ? 'Revoke live postage'
+                  : 'Authorize live postage'}
+              </Button>
+            </Stack>
+          ) : (
+            <Typography variant="caption" color="text.secondary">
+              An organization owner or administrator with Operations activation permission must change this authorization.
+            </Typography>
+          )}
         </Alert>
       ) : null}
 

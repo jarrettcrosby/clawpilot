@@ -43,12 +43,13 @@ import DeleteOutlineRounded from '@mui/icons-material/DeleteOutlineRounded'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
 import LocalShippingRounded from '@mui/icons-material/LocalShippingRounded'
 import ScienceRounded from '@mui/icons-material/ScienceRounded'
-import type {
-  OneOffShipmentCreateResult,
-  OneOffShipmentQuote,
-  OneOffShipmentQuoteInput,
-  OneOffShipmentWorkspace,
+import {
+  type OneOffShipmentCreateResult,
+  type OneOffShipmentQuote,
+  type OneOffShipmentQuoteInput,
+  type OneOffShipmentWorkspace,
 } from '@/lib/operations/oneOffShipments'
+import { ONE_OFF_MAX_SYNCHRONOUS_PACKAGES } from '@/lib/operations/oneOffShipmentConstants'
 
 type DraftLine = {
   lineKey: string
@@ -97,7 +98,6 @@ type CreatePayload = {
 
 const STEPS = ['Shipment and units', 'Parcels', 'Review rates']
 const MAX_LINES = 25
-const MAX_PACKAGES = 50
 
 function nextKey(prefix: 'line' | 'parcel') {
   return `${prefix}-${crypto.randomUUID()}`
@@ -173,10 +173,12 @@ export default function OneOffShipmentDialog({
   open,
   onClose,
   onCreated,
+  canActivate,
 }: {
   open: boolean
   onClose: () => void
   onCreated: (result: OneOffShipmentCreateResult) => void | Promise<void>
+  canActivate: boolean
 }) {
   const theme = useTheme()
   const mobile = useMediaQuery(theme.breakpoints.down('sm'))
@@ -191,6 +193,10 @@ export default function OneOffShipmentDialog({
   const [receivingLocationGlobalId, setReceivingLocationGlobalId] = useState('')
   const [referenceNumber, setReferenceNumber] = useState('')
   const [requestedDeliveryAt, setRequestedDeliveryAt] = useState('')
+  const [executionMode, setExecutionMode] = useState<'test' | 'live'>('test')
+  const [shipFromPhone, setShipFromPhone] = useState('')
+  const [shipToPhone, setShipToPhone] = useState('')
+  const [shipToResidential, setShipToResidential] = useState<boolean | null>(null)
   const [recipientName, setRecipientName] = useState('')
   const [line1, setLine1] = useState('')
   const [line2, setLine2] = useState('')
@@ -217,10 +223,13 @@ export default function OneOffShipmentDialog({
 
   const enabledCarriers = useMemo(() => (
     workspace?.carriers.filter((carrier) => (
+      carrier.environment === (executionMode === 'live' ? 'production' : 'sandbox')
+      && (
       !carrier.senderOriginWarehouseGlobalId
       || carrier.senderOriginWarehouseGlobalId === warehouseGlobalId
+      )
     )) || []
-  ), [warehouseGlobalId, workspace])
+  ), [executionMode, warehouseGlobalId, workspace])
 
   const resetQuote = () => {
     setQuote(null)
@@ -349,7 +358,7 @@ export default function OneOffShipmentDialog({
   }
 
   const addPackage = () => {
-    if (packages.length >= MAX_PACKAGES) return
+    if (packages.length >= ONE_OFF_MAX_SYNCHRONOUS_PACKAGES) return
     const parcel = initialPackage([])
     parcel.description = `One-off shipment parcel ${packages.length + 1}`
     parcel.allocations = Object.fromEntries(lines.map((line) => [line.lineKey, '0']))
@@ -364,6 +373,11 @@ export default function OneOffShipmentDialog({
   }
 
   const shipmentError = () => {
+    const mode = workspace?.executionModes.find((entry) => entry.mode === executionMode)
+    if (!mode?.enabled) return mode?.blockers[0] || 'The selected shipping mode is unavailable.'
+    if (executionMode === 'live' && !canActivate) {
+      return 'LIVE shipment planning requires Operations activation permission.'
+    }
     if (!customerGlobalId) return 'Choose a customer.'
     if (!referenceNumber.trim()) return 'Enter an order or shipment reference.'
     if (!recipientName.trim() || !line1.trim() || !city.trim()) {
@@ -371,6 +385,9 @@ export default function OneOffShipmentDialog({
     }
     if (!/^[A-Za-z]{2}$/.test(region.trim())) return 'Enter a two-letter US state code.'
     if (!/^\d{5}(?:-\d{4})?$/.test(postalCode.trim())) return 'Enter a valid US ZIP code.'
+    if (shipFromPhone.replace(/\D/g, '').length < 7) return 'Enter a sender phone number.'
+    if (shipToPhone.replace(/\D/g, '').length < 7) return 'Enter a recipient phone number.'
+    if (shipToResidential === null) return 'Choose whether the recipient address is residential or commercial.'
     if (!warehouseGlobalId || !inventoryPoolGlobalId || !receivingLocationGlobalId) {
       return 'Choose a warehouse, inventory pool, and physical location.'
     }
@@ -410,8 +427,8 @@ export default function OneOffShipmentDialog({
   }
 
   const packageError = () => {
-    if (!packages.length || packages.length > MAX_PACKAGES) {
-      return `Add between 1 and ${MAX_PACKAGES} parcels.`
+    if (!packages.length || packages.length > ONE_OFF_MAX_SYNCHRONOUS_PACKAGES) {
+      return `Add between 1 and ${ONE_OFF_MAX_SYNCHRONOUS_PACKAGES} parcels.`
     }
     for (const [index, parcel] of packages.entries()) {
       if (!parcel.description.trim()) return `Parcel ${index + 1} needs a description.`
@@ -438,6 +455,7 @@ export default function OneOffShipmentDialog({
   }
 
   const buildQuoteInput = (): OneOffShipmentQuoteInput => ({
+    executionMode,
     customerGlobalId,
     warehouseGlobalId,
     inventoryPoolGlobalId,
@@ -447,6 +465,9 @@ export default function OneOffShipmentDialog({
     requestedDeliveryAt: requestedDeliveryAt
       ? new Date(requestedDeliveryAt).toISOString()
       : null,
+    shipFromPhone,
+    shipToPhone,
+    shipToResidential: shipToResidential === true,
     shipTo: {
       name: recipientName.trim(),
       line1: line1.trim(),
@@ -680,6 +701,80 @@ export default function OneOffShipmentDialog({
                   <Alert severity="info">
                     Existing products reserve physical inventory from the selected pool. A manually entered unit becomes a catalog product only when you create the planned order.
                   </Alert>
+                  <Alert severity={executionMode === 'live' ? 'warning' : 'info'}>
+                    {executionMode === 'live'
+                      ? 'LIVE uses production carrier rates. Planning does not buy postage. After every parcel is packed, ClawPilot rerates the complete group and requires one explicit whole-shipment purchase confirmation.'
+                      : 'TEST uses carrier sandbox rates and labels. It never buys production postage or mutates a production carrier shipment. The complete packed group is still purchased and closed as one audited command.'}
+                  </Alert>
+                  <Box
+                    data-testid="one-off-mode-readiness"
+                    sx={{
+                      display: 'grid',
+                      gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' },
+                      gap: 1,
+                    }}
+                  >
+                    {workspace.executionModes.map((mode) => {
+                      const permissionBlocked = mode.mode === 'live' && !canActivate
+                      const ready = mode.enabled && !permissionBlocked
+                      const blocker = permissionBlocked
+                        ? 'Your role does not have Operations activation permission.'
+                        : mode.blockers.join(' · ')
+                      return (
+                        <Box
+                          key={mode.mode}
+                          sx={{
+                            p: 1.5,
+                            border: '1px solid rgba(255,255,255,0.12)',
+                            borderRadius: 2,
+                          }}
+                        >
+                          <Stack direction="row" justifyContent="space-between" gap={1}>
+                            <Typography fontWeight={700}>
+                              {mode.mode === 'live' ? 'LIVE production' : 'TEST sandbox'}
+                            </Typography>
+                            <Chip
+                              size="small"
+                              color={ready ? 'success' : 'warning'}
+                              label={ready ? 'Ready' : 'Blocked'}
+                            />
+                          </Stack>
+                          <Typography variant="caption" color="text.secondary">
+                            {ready
+                              ? mode.mode === 'live'
+                                ? 'Rates and whole-shipment purchase use the authorized production account.'
+                                : 'Rates and whole-shipment purchase use a verified carrier sandbox.'
+                              : blocker || 'Carrier execution is not ready.'}
+                          </Typography>
+                        </Box>
+                      )
+                    })}
+                  </Box>
+                  <TextField
+                    select
+                    required
+                    label="Shipping mode"
+                    value={executionMode}
+                    onChange={(event) => {
+                      setExecutionMode(event.target.value as 'test' | 'live')
+                      resetQuote()
+                    }}
+                    helperText={workspace.executionModes
+                      .find((entry) => entry.mode === executionMode)
+                      ?.blockers.join(' · ') || 'Choose the carrier environment explicitly.'}
+                  >
+                    {workspace.executionModes.map((mode) => (
+                      <MenuItem
+                        key={mode.mode}
+                        value={mode.mode}
+                        disabled={!mode.enabled || (mode.mode === 'live' && !canActivate)}
+                      >
+                        {mode.mode === 'live'
+                          ? 'LIVE · production carrier integration'
+                          : 'TEST · sandbox carrier integration'}
+                      </MenuItem>
+                    ))}
+                  </TextField>
                   <Typography variant="overline" color="text.secondary">Order information</Typography>
                   <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 2 }}>
                     <TextField
@@ -713,6 +808,7 @@ export default function OneOffShipmentDialog({
                   <Typography variant="overline" color="text.secondary">US recipient</Typography>
                   <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(2, 1fr)' }, gap: 2 }}>
                     <TextField required label="Recipient name" value={recipientName} onChange={(event) => { setRecipientName(event.target.value); resetQuote() }} />
+                    <TextField required label="Recipient phone" value={shipToPhone} onChange={(event) => { setShipToPhone(event.target.value); resetQuote() }} inputProps={{ inputMode: 'tel' }} />
                     <TextField required label="Street address" value={line1} onChange={(event) => { setLine1(event.target.value); resetQuote() }} />
                     <TextField label="Apartment, suite, etc." value={line2} onChange={(event) => { setLine2(event.target.value); resetQuote() }} />
                     <TextField required label="City" value={city} onChange={(event) => { setCity(event.target.value); resetQuote() }} />
@@ -721,6 +817,21 @@ export default function OneOffShipmentDialog({
                       <TextField required label="ZIP code" value={postalCode} onChange={(event) => { setPostalCode(event.target.value); resetQuote() }} />
                     </Box>
                     <TextField label="Country" value="United States" disabled />
+                    <TextField required label="Warehouse sender phone" value={shipFromPhone} onChange={(event) => { setShipFromPhone(event.target.value); resetQuote() }} inputProps={{ inputMode: 'tel' }} />
+                    <TextField
+                      select
+                      required
+                      label="Recipient address type"
+                      value={shipToResidential === null ? '' : shipToResidential ? 'residential' : 'commercial'}
+                      onChange={(event) => {
+                        setShipToResidential(event.target.value === 'residential')
+                        resetQuote()
+                      }}
+                      helperText="UPS and FedEx can return different rates for homes and businesses."
+                    >
+                      <MenuItem value="residential">Residential</MenuItem>
+                      <MenuItem value="commercial">Commercial</MenuItem>
+                    </TextField>
                   </Box>
 
                   <Typography variant="overline" color="text.secondary">Inventory source</Typography>
@@ -849,9 +960,9 @@ export default function OneOffShipmentDialog({
                   <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ xs: 'stretch', sm: 'center' }} gap={1}>
                     <Box>
                       <Typography variant="overline" color="text.secondary">Physical parcels</Typography>
-                      <Typography variant="body2" color="text.secondary">{packages.length} of {MAX_PACKAGES} parcels</Typography>
+                      <Typography variant="body2" color="text.secondary">{packages.length} of {ONE_OFF_MAX_SYNCHRONOUS_PACKAGES} parcels</Typography>
                     </Box>
-                    <Button startIcon={<AddRounded />} onClick={addPackage} disabled={packages.length >= MAX_PACKAGES}>Add parcel</Button>
+                    <Button startIcon={<AddRounded />} onClick={addPackage} disabled={packages.length >= ONE_OFF_MAX_SYNCHRONOUS_PACKAGES}>Add parcel</Button>
                   </Stack>
                   {packages.map((parcel, packageIndex) => (
                     <Box key={parcel.packageKey} sx={{ p: { xs: 1.5, sm: 2 }, border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2 }}>
@@ -944,8 +1055,8 @@ export default function OneOffShipmentDialog({
                     helperText={`${reason.trim().length}/500 · Recorded in the immutable audit history`}
                   />
                   <Alert severity="warning" icon={<Inventory2Rounded />}>
-                    Confirming creates a planned Operations order, reserves the selected inventory, records the parcels and selected rate, and creates any reviewed new products. It does <strong>not</strong> purchase postage, create a label or tracking number, release a warehouse wave, or assign a picker.
-                    {' '}This Phase 1 workflow is Shadow-only; an open one-off plan must be completed or cancelled before Operations can move to Active.
+                    Confirming creates a planned Operations order, reserves the selected inventory, records the parcels and selected rate, and creates any reviewed new products. It does <strong>not</strong> buy postage during planning.
+                    {' '}Release and assign the plan, complete every pick, and verify every package. ClawPilot then rerates the exact packed group and, after your explicit confirmation, submits one {packages.length}-parcel {executionMode === 'live' ? 'LIVE production' : 'TEST sandbox'} shipment command. Every returned package label is retained and the whole group is voided or closed together.
                   </Alert>
                 </>
               )}

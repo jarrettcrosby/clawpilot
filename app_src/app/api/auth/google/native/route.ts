@@ -2,8 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createBrowserSession, setBrowserSessionCookie } from '@/lib/authSessions'
 import { recordAuthActivity } from '@/lib/authAudit'
 import { GoogleSsoError, verifyGoogleIdentityToken } from '@/lib/googleSso'
+import { resolveLinkedGoogleIdentity } from '@/lib/persistence/googleIdentityLinking'
 import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
-import { requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -56,9 +56,10 @@ export async function POST(req: NextRequest) {
     const identity = await verifyGoogleIdentityToken(body.idToken)
     email = identity.email
 
-    // Google proves control of an email; ClawPilot still decides whether that
-    // existing user and workspace membership are authorized.
-    const actor = await requireWorkspaceAppUser(identity.email)
+    // Google proves the provider identity. ClawPilot only signs in a durable,
+    // explicitly linked subject whose existing membership organization has
+    // enabled Google sign-in. This route never creates users or memberships.
+    const actor = await resolveLinkedGoogleIdentity(identity)
     await ensureDefaultResourcesForUser(actor)
     const issued = await createBrowserSession({
       email: actor.email,

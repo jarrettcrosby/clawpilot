@@ -51,6 +51,11 @@ import {
   renderPackingSlip,
 } from '@/lib/operations/packingSlip'
 import {
+  locationBarcode,
+  providerBarcodeIdentity,
+} from '@/lib/operations/barcodeLabels'
+import type { WearablePickTaskScanEvidenceInput } from '@/lib/operations/wearablePicking'
+import {
   authorizedCheckoutShippingChargeMinor,
   CANONICAL_FULFILLMENT_RATE_POLICY_VERSION,
   CanonicalFulfillmentPlanningError,
@@ -2057,12 +2062,198 @@ async function revalidateProviderCommitmentsForPlan(
   }
 }
 
+type NativeOneOffShipmentAvailability = {
+  ready: boolean
+  blockedReason: string | null
+}
+
+async function readNativeOneOffShipmentAvailability(input: {
+  organizationId: string
+  orderId: string
+  planId: string | null
+  executionMode: 'test' | 'live' | null
+  activationState: OperationsActivationState
+}): Promise<NativeOneOffShipmentAvailability> {
+  if (!input.planId || !input.executionMode) {
+    return {
+      ready: false,
+      blockedReason: 'Select TEST or LIVE and purchase the exact packed shipment first.',
+    }
+  }
+  const result = await query<QueryResultRow & {
+    state: 'prepared' | 'succeeded' | 'failed' | 'unknown'
+    environment: 'sandbox' | 'production'
+    package_count: string
+    authority_exact: boolean
+    canonical_package_count: string
+    canonical_labeled_package_count: string
+    member_count: string
+    result_count: string
+    active_group_label_count: string
+    active_plan_label_count: string
+    invalid_member_result_count: string
+    close_blocker_count: string
+    allocated_total_matches: boolean
+  }>(
+    `WITH latest_create AS (
+       SELECT attempt.*
+       FROM operations_one_off_carrier_group_attempts attempt
+       WHERE attempt.organization_id = $1::uuid
+         AND attempt.order_id = $2::uuid
+         AND attempt.plan_id = $3::uuid
+         AND attempt.action = 'create'
+       ORDER BY attempt.requested_at DESC, attempt.id DESC
+       LIMIT 1
+     )
+     SELECT attempt.state, attempt.environment,
+            attempt.package_count::text,
+            operations_one_off_plan_execution_is_exact(
+              attempt.organization_id,
+              attempt.plan_id,
+              CASE WHEN attempt.environment = 'sandbox' THEN 'test' ELSE 'live' END
+            ) AS authority_exact,
+            (SELECT count(*)::text
+             FROM operations_packages package
+             WHERE package.organization_id = attempt.organization_id
+               AND package.plan_id = attempt.plan_id) AS canonical_package_count,
+            (SELECT count(*)::text
+             FROM operations_packages package
+             WHERE package.organization_id = attempt.organization_id
+               AND package.plan_id = attempt.plan_id
+               AND package.status = 'labeled') AS canonical_labeled_package_count,
+            (SELECT count(*)::text
+             FROM operations_one_off_carrier_group_members member
+             WHERE member.organization_id = attempt.organization_id
+               AND member.carrier_group_attempt_id = attempt.id) AS member_count,
+            (SELECT count(*)::text
+             FROM operations_one_off_carrier_group_results package_result
+             WHERE package_result.organization_id = attempt.organization_id
+               AND package_result.carrier_group_attempt_id = attempt.id) AS result_count,
+            (SELECT count(*)::text
+             FROM operations_labels label
+             WHERE label.organization_id = attempt.organization_id
+               AND label.one_off_carrier_group_attempt_id = attempt.id
+               AND label.status = 'created'
+               AND label.one_off_void_group_attempt_id IS NULL)
+              AS active_group_label_count,
+            (SELECT count(*)::text
+             FROM operations_labels label
+             JOIN operations_packages package
+               ON package.organization_id = label.organization_id
+              AND package.id = label.package_id
+             WHERE label.organization_id = attempt.organization_id
+               AND package.plan_id = attempt.plan_id
+               AND label.status = 'created') AS active_plan_label_count,
+            (SELECT count(*)::text
+             FROM operations_one_off_carrier_group_members member
+             LEFT JOIN operations_packages package
+               ON package.organization_id = member.organization_id
+              AND package.id = member.package_id
+              AND package.plan_id = member.plan_id
+             LEFT JOIN operations_one_off_carrier_group_results package_result
+               ON package_result.organization_id = member.organization_id
+              AND package_result.carrier_group_attempt_id = member.carrier_group_attempt_id
+              AND package_result.package_id = member.package_id
+             LEFT JOIN operations_labels label
+               ON label.organization_id = package_result.organization_id
+              AND label.id = package_result.label_id
+             WHERE member.organization_id = attempt.organization_id
+               AND member.carrier_group_attempt_id = attempt.id
+               AND (
+                 package.id IS NULL
+                 OR package.status <> 'labeled'
+                 OR package.package_number <> member.package_number
+                 OR package_result.id IS NULL
+                 OR package_result.package_number <> member.package_number
+                 OR label.id IS NULL
+                 OR label.package_id <> member.package_id
+                 OR label.one_off_carrier_group_attempt_id <> attempt.id
+                 OR label.one_off_void_group_attempt_id IS NOT NULL
+                 OR label.status <> 'created'
+                 OR label.environment <> attempt.environment
+                 OR label.tracking_number <> package_result.tracking_number
+               )) AS invalid_member_result_count,
+            (SELECT count(*)::text
+             FROM operations_one_off_carrier_group_attempts closed
+             WHERE closed.organization_id = attempt.organization_id
+               AND closed.create_attempt_id = attempt.id
+               AND closed.action IN ('void', 'close_sample')
+               AND closed.state IN ('prepared', 'succeeded', 'unknown'))
+              AS close_blocker_count,
+            COALESCE((
+              SELECT sum(member.allocated_selected_cost_minor)
+              FROM operations_one_off_carrier_group_members member
+              WHERE member.organization_id = attempt.organization_id
+                AND member.carrier_group_attempt_id = attempt.id
+            ), 0) = attempt.selected_amount_minor AS allocated_total_matches
+     FROM latest_create attempt`,
+    [input.organizationId, input.orderId, input.planId],
+  )
+  const row = result.rows[0]
+  if (!row) {
+    return {
+      ready: false,
+      blockedReason: 'Purchase one complete one-off carrier shipment group first.',
+    }
+  }
+  if (row.state === 'prepared' || row.state === 'unknown') {
+    return {
+      ready: false,
+      blockedReason: 'Resolve the pending one-off carrier group before confirming shipment.',
+    }
+  }
+  if (row.state !== 'succeeded') {
+    return {
+      ready: false,
+      blockedReason: 'The latest one-off carrier group did not succeed. Re-rate and retry the group.',
+    }
+  }
+  const expectedEnvironment = input.executionMode === 'test'
+    ? 'sandbox'
+    : 'production'
+  const expectedActivation = input.executionMode === 'test'
+    ? 'shadow'
+    : 'active'
+  if (
+    row.environment !== expectedEnvironment
+    || input.activationState !== expectedActivation
+    || !row.authority_exact
+  ) {
+    return {
+      ready: false,
+      blockedReason: input.executionMode === 'test'
+        ? 'TEST confirmation requires exact sandbox authority in Operations Shadow.'
+        : 'LIVE confirmation requires exact production authority in Operations Active.',
+    }
+  }
+  const packageCount = Number(row.package_count)
+  if (
+    packageCount < 1
+    || Number(row.canonical_package_count) !== packageCount
+    || Number(row.canonical_labeled_package_count) !== packageCount
+    || Number(row.member_count) !== packageCount
+    || Number(row.result_count) !== packageCount
+    || Number(row.active_group_label_count) !== packageCount
+    || Number(row.active_plan_label_count) !== packageCount
+    || Number(row.invalid_member_result_count) !== 0
+    || Number(row.close_blocker_count) !== 0
+    || !row.allocated_total_matches
+  ) {
+    return {
+      ready: false,
+      blockedReason: 'The one-off carrier group is partial, closed, or no longer matches every packed package.',
+    }
+  }
+  return { ready: true, blockedReason: null }
+}
+
 async function readOrderDetail(
   organizationId: string,
   orderGlobalId: string,
   context: {
     activationState: OperationsActivationState
     canExecute: boolean
+    canActivate: boolean
     actorEmail: string | null
     canAuthorizeSandboxCommerceE2e: boolean
   },
@@ -2075,6 +2266,7 @@ async function readOrderDetail(
     customer_name: string
     customer_global_id: string
     source_provider: string
+    order_type: string
     integration_account_id: string
     integration_account_global_id: string | null
     planning_candidate_global_id: string | null
@@ -2112,11 +2304,13 @@ async function readOrderDetail(
     tracking_number: string | null
     ship_to: Record<string, unknown>
     updated_at: Date
+    one_off_shipping_mode: 'test' | 'live' | null
   }>(
     `SELECT
        orders.id::text, orders.global_id, orders.order_number, orders.external_order_id,
        customer.name AS customer_name, customer.reference_code AS customer_global_id,
-       orders.source_provider, orders.integration_account_id::text,
+       orders.source_provider, orders.order_type,
+       orders.integration_account_id::text,
        source_account.global_id AS integration_account_global_id,
        planning_candidate.global_id AS planning_candidate_global_id,
        planning_candidate.row_version::text
@@ -2126,6 +2320,7 @@ async function readOrderDetail(
        orders.status, orders.currency, orders.ship_to,
        orders.row_version::text, plan.id::text AS plan_id,
        plan.warehouse_id::text AS warehouse_id,
+       one_off_quote.execution_mode AS one_off_shipping_mode,
        plan.status AS plan_status, wave.status AS wave_status,
        plan_warehouse.name AS warehouse_name, orders.promised_delivery_at,
        (SELECT count(*) FROM operations_order_lines line WHERE line.order_id = orders.id)::text AS line_count,
@@ -2231,6 +2426,9 @@ async function readOrderDetail(
        WHERE candidate.order_id = orders.id ORDER BY candidate.version_number DESC LIMIT 1
      ) plan ON true
      LEFT JOIN operations_warehouses plan_warehouse ON plan_warehouse.id = plan.warehouse_id
+     LEFT JOIN operations_one_off_shipment_quotes one_off_quote
+       ON one_off_quote.organization_id = plan.organization_id
+      AND one_off_quote.id = plan.one_off_quote_id
      LEFT JOIN LATERAL (
        SELECT candidate.status FROM operations_pick_tasks pick
        JOIN operations_waves candidate
@@ -2264,6 +2462,7 @@ async function readOrderDetail(
     eventResult,
     fulfillmentPreparation,
     sandboxCommerceE2eAuthorization,
+    nativeOneOffShipmentAvailability,
   ] = await Promise.all([
     query<QueryResultRow & {
       global_id: string
@@ -2457,14 +2656,22 @@ async function readOrderDetail(
       carrier: string
       service_code: string
       tracking_number: string
+      quoted_carrier_cost_minor: string
+      one_off_carrier_group_global_id: string | null
       shipped_at: Date
     }>(
       `SELECT shipment.global_id, shipment.status, label.carrier,
-              label.service_code, shipment.tracking_number, shipment.shipped_at
+              label.service_code, shipment.tracking_number,
+              shipment.quoted_carrier_cost_minor::text,
+              carrier_group.global_id AS one_off_carrier_group_global_id,
+              shipment.shipped_at
        FROM operations_shipments shipment
        JOIN operations_labels label
          ON label.organization_id = shipment.organization_id
         AND label.id = shipment.label_id
+       LEFT JOIN operations_one_off_carrier_group_attempts carrier_group
+         ON carrier_group.organization_id = shipment.organization_id
+        AND carrier_group.id = shipment.one_off_carrier_group_attempt_id
        WHERE shipment.organization_id = $1::uuid
          AND shipment.order_id = $2::uuid
        ORDER BY shipment.shipped_at DESC, shipment.id DESC`,
@@ -2575,6 +2782,18 @@ async function readOrderDetail(
           actorEmail: context.actorEmail,
         })
       : Promise.resolve(null),
+    row.source_provider === 'clawpilot_native' && row.order_type === 'one_off'
+      ? readNativeOneOffShipmentAvailability({
+          organizationId,
+          orderId: row.id,
+          planId: row.plan_id,
+          executionMode: row.one_off_shipping_mode,
+          activationState: context.activationState,
+        })
+      : Promise.resolve<NativeOneOffShipmentAvailability>({
+          ready: false,
+          blockedReason: null,
+        }),
   ])
 
   let shadowPreparationReady = false
@@ -2613,6 +2832,7 @@ async function readOrderDetail(
     status: row.status,
     currency: row.currency,
     rowVersion: Number(row.row_version),
+    oneOffShippingMode: row.one_off_shipping_mode,
     warehouseId: row.warehouse_id,
     planStatus: row.plan_status,
     waveStatus: row.wave_status,
@@ -2626,6 +2846,7 @@ async function readOrderDetail(
       status: row.status,
       activationState: context.activationState,
       canExecute: context.canExecute,
+      canActivate: context.canActivate,
       planStatus: row.plan_status,
       waveStatus: row.wave_status,
       lineCount: Number(row.line_count),
@@ -2640,6 +2861,8 @@ async function readOrderDetail(
       blockingExceptionCount: Number(row.blocking_exception_count),
       openExceptionCount: Number(row.exception_count),
       sourceProvider: row.source_provider,
+      orderType: row.order_type,
+      oneOffShippingMode: row.one_off_shipping_mode,
       shadowPreparationReady,
       shadowPreparationBlockedReason,
       activeLabelCount: Number(row.active_label_count),
@@ -2648,6 +2871,9 @@ async function readOrderDetail(
       unresolvedLabelAttemptCount: Number(row.unresolved_label_attempt_count),
       existingShipmentCount: Number(row.existing_shipment_count),
       sandboxE2eAuthorized: Boolean(sandboxCommerceE2eAuthorization),
+      nativeOneOffGroupReady: nativeOneOffShipmentAvailability.ready,
+      nativeOneOffGroupBlockedReason:
+        nativeOneOffShipmentAvailability.blockedReason,
     }),
     sandboxCommerceE2eAuthorization: sandboxCommerceE2eAuthorization
       ? {
@@ -2771,6 +2997,8 @@ async function readOrderDetail(
       carrier: item.carrier,
       serviceCode: item.service_code,
       trackingNumber: item.tracking_number,
+      quotedCarrierCostMinor: item.quoted_carrier_cost_minor,
+      oneOffCarrierGroupGlobalId: item.one_off_carrier_group_global_id,
       shippedAt: item.shipped_at.toISOString(),
     })),
     trackingObservations: trackingResult.rows.map((item) => ({
@@ -3371,6 +3599,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     selectedOrder: selectedGlobalId ? await readOrderDetail(organizationId, selectedGlobalId, {
       activationState: activation.state,
       canExecute: input.capabilities.canExecute,
+      canActivate: input.capabilities.canActivate,
       actorEmail: input.actorEmail || null,
       canAuthorizeSandboxCommerceE2e: Boolean(
         input.capabilities.canActivate
@@ -4490,6 +4719,10 @@ export async function updateOperationsActivationInPostgres(input: {
              plan.cartonization_evidence_id IS NULL
              OR evidence.plan_snapshot->>'carrierReadEnvironment'
                   IS DISTINCT FROM 'production'
+           )
+           AND NOT operations_one_off_plan_authority_is_valid(
+             plan.organization_id, plan.order_id, plan.warehouse_id,
+             plan.one_off_quote_id, plan.one_off_offer_id, 'live'
            )
            AND NOT EXISTS (
              SELECT 1
@@ -11640,7 +11873,6 @@ export async function releaseOperationsOrderFromPostgres(input: {
   if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
     throw new OperationsRequestError('OPERATIONS_IDEMPOTENCY_KEY_INVALID', 'A valid idempotency key is required')
   }
-
   const command = await prepareCommandReceipt({
     organizationId,
     commandType: 'release_operations_order',
@@ -11777,12 +12009,17 @@ export async function releaseOperationsOrderFromPostgres(input: {
         method: string
         cartonization_evidence_id: string | null
         carrier_read_environment: string | null
+        one_off_live_authority: boolean
       }>(
         `SELECT plan.id::text, plan.global_id, plan.warehouse_id::text,
                 plan.status, plan.method,
                 plan.cartonization_evidence_id::text,
                 evidence.plan_snapshot->>'carrierReadEnvironment'
-                  AS carrier_read_environment
+                  AS carrier_read_environment,
+                operations_one_off_plan_authority_is_valid(
+                  plan.organization_id, plan.order_id, plan.warehouse_id,
+                  plan.one_off_quote_id, plan.one_off_offer_id, 'live'
+                ) AS one_off_live_authority
          FROM operations_fulfillment_plans plan
          LEFT JOIN operations_cartonization_rate_evidence evidence
            ON evidence.organization_id = plan.organization_id
@@ -11808,6 +12045,7 @@ export async function releaseOperationsOrderFromPostgres(input: {
           !plan.cartonization_evidence_id
           || plan.carrier_read_environment !== 'production'
         )
+        && !plan.one_off_live_authority
       ) {
         throw new OperationsRequestError(
           'OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION',
@@ -12216,18 +12454,739 @@ export async function assignOperationsOrderPicksFromPostgres(input: {
   }
 }
 
+type WearablePickScanContextRow = QueryResultRow & {
+  pick_task_id: string
+  pick_task_global_id: string
+  pick_status: string
+  assigned_to: string | null
+  assigned_at: string | Date | null
+  pick_created_at: string | Date
+  warehouse_id: string
+  warehouse_global_id: string
+  location_id: string
+  location_global_id: string
+  policy_location_scan_required: boolean
+  policy_row_version: string
+  policy_updated_at: string | Date | null
+  wave_released_at: string | Date | null
+  assigned_product_barcode: string | null
+  provider_product_barcode: string | null
+}
+
+type WearablePickScanEvidenceRow = QueryResultRow & {
+  pick_task_id: string
+  order_id: string
+  order_row_version: string
+  warehouse_id: string
+  location_id: string
+  policy_row_version: string
+  expected_location_barcode: string
+  observed_location_barcode: string
+  location_captured_at: string | Date
+  location_source: 'iphone_camera' | 'meta'
+  expected_product_barcode: string
+  observed_product_barcode: string
+  product_captured_at: string | Date
+  product_source: 'iphone_camera' | 'meta'
+  evidence_hash: string
+}
+
+export type WearablePickScanEvidenceCommandResult = {
+  orderGlobalId: string
+  orderRowVersion: number
+  evidenceCount: number
+  serverObservedAt: string
+  replayed: boolean
+}
+
+const WEARABLE_SCAN_MAX_AGE_MS = 24 * 60 * 60 * 1_000
+const WEARABLE_SCAN_CLOCK_SKEW_MS = 5 * 60 * 1_000
+const WEARABLE_LOCATION_TO_PRODUCT_MAX_MS = 30 * 60 * 1_000
+
+function wearableScanExpectedProductBarcode(row: WearablePickScanContextRow) {
+  if (row.assigned_product_barcode) return row.assigned_product_barcode
+  return providerBarcodeIdentity(row.provider_product_barcode)?.value || null
+}
+
+function wearableProductBarcodeMatches(observed: string, expected: string) {
+  if (observed === expected) return true
+  if (
+    observed.length === 13
+    && observed.startsWith('0')
+    && observed.slice(1) === expected
+    && /^\d+$/.test(observed)
+    && /^\d+$/.test(expected)
+  ) return true
+  return expected.length === 13
+    && expected.startsWith('0')
+    && expected.slice(1) === observed
+    && /^\d+$/.test(observed)
+    && /^\d+$/.test(expected)
+}
+
+function wearableScanTime(value: string | Date | null, label: string) {
+  if (value === null) return null
+  const parsed = value instanceof Date ? value : new Date(value)
+  if (!Number.isFinite(parsed.getTime())) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_SCAN_EVIDENCE_INVALID',
+      `${label} is invalid`,
+      409,
+    )
+  }
+  return parsed
+}
+
+async function readWearablePickScanContexts(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    orderId: string
+    planId: string
+    waveId: string
+  },
+) {
+  const result = await client.query<WearablePickScanContextRow>(
+    `SELECT pick.id::text AS pick_task_id,
+            pick.global_id AS pick_task_global_id,
+            pick.status AS pick_status,
+            lower(pick.assigned_to) AS assigned_to,
+            pick.assigned_at,
+            pick.created_at AS pick_created_at,
+            warehouse.id::text AS warehouse_id,
+            warehouse.global_id AS warehouse_global_id,
+            location.id::text AS location_id,
+            location.global_id AS location_global_id,
+            COALESCE(scan_policy.location_scan_required, false)
+              AS policy_location_scan_required,
+            COALESCE(scan_policy.row_version, 0)::text AS policy_row_version,
+            scan_policy.updated_at AS policy_updated_at,
+            wave.released_at AS wave_released_at,
+            product_barcode.barcode_value AS assigned_product_barcode,
+            product_channel.provider_barcode AS provider_product_barcode
+     FROM operations_pick_tasks pick
+     JOIN operations_fulfillment_allocations allocation
+       ON allocation.organization_id = pick.organization_id
+      AND allocation.id = pick.allocation_id
+     JOIN operations_order_lines line
+       ON line.organization_id = allocation.organization_id
+      AND line.id = allocation.order_line_id
+     JOIN operations_orders orders
+       ON orders.organization_id = line.organization_id
+      AND orders.id = line.order_id
+     JOIN operations_waves wave
+       ON wave.organization_id = pick.organization_id
+      AND wave.id = pick.wave_id
+     JOIN operations_locations location
+       ON location.organization_id = pick.organization_id
+      AND location.id = pick.from_location_id
+     JOIN operations_warehouses warehouse
+       ON warehouse.organization_id = location.organization_id
+      AND warehouse.id = location.warehouse_id
+      AND warehouse.id = wave.warehouse_id
+     LEFT JOIN operations_wearable_location_scan_policies scan_policy
+       ON scan_policy.organization_id = warehouse.organization_id
+      AND scan_policy.warehouse_id = warehouse.id
+     LEFT JOIN operations_product_barcodes product_barcode
+       ON product_barcode.organization_id = line.organization_id
+      AND product_barcode.pipeline_id = line.pipeline_id
+      AND product_barcode.product_id = line.product_id
+     LEFT JOIN LATERAL (
+       SELECT channel.provider_barcode
+       FROM operations_product_channel_states channel
+       WHERE channel.organization_id = line.organization_id
+         AND channel.integration_account_id = orders.integration_account_id
+         AND channel.pipeline_id = line.pipeline_id
+         AND channel.product_id = line.product_id
+         AND channel.provider_sku = line.channel_sku
+         AND channel.provider_active = true
+         AND channel.provider_barcode IS NOT NULL
+       ORDER BY channel.observed_at DESC, channel.id DESC
+       LIMIT 1
+     ) product_channel ON true
+     WHERE pick.organization_id = $1::uuid
+       AND orders.id = $2::uuid
+       AND pick.plan_id = $3::uuid
+       AND pick.wave_id = $4::uuid
+     ORDER BY pick.sequence_number, pick.id`,
+    [input.organizationId, input.orderId, input.planId, input.waveId],
+  )
+  return result.rows
+}
+
+function requiredWearablePickScanContexts(rows: WearablePickScanContextRow[]) {
+  return rows.filter((row) => row.policy_location_scan_required === true)
+}
+
+function validateWearablePickScanEvidence(
+  input: {
+    actorEmail: string
+    scanEvidence: WearablePickTaskScanEvidenceInput[]
+    contexts: WearablePickScanContextRow[]
+    now?: Date
+  },
+) {
+  const required = requiredWearablePickScanContexts(input.contexts)
+  if (required.length < 1) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_SCAN_POLICY_DISABLED',
+      'This order does not currently require location-first scan evidence',
+      409,
+    )
+  }
+  if (input.scanEvidence.length !== required.length) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_SCAN_EVIDENCE_INCOMPLETE',
+      'Every policy-required pick task needs one location and one product scan',
+      409,
+    )
+  }
+  const evidenceByTask = new Map(
+    input.scanEvidence.map((evidence) => [evidence.pickTaskGlobalId, evidence]),
+  )
+  if (evidenceByTask.size !== input.scanEvidence.length) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_SCAN_EVIDENCE_DUPLICATE',
+      'Scan evidence contains the same pick task more than once',
+      409,
+    )
+  }
+  const now = input.now || new Date()
+  const validated = required.map((context) => {
+    const evidence = evidenceByTask.get(context.pick_task_global_id)
+    if (!evidence) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_SCAN_EVIDENCE_INCOMPLETE',
+        `Scan evidence is missing for pick task ${context.pick_task_global_id}`,
+        409,
+      )
+    }
+    if (context.pick_status !== 'ready') {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_SCAN_EVIDENCE_STALE',
+        'A pick task changed after it was scanned. Refresh and scan again.',
+        409,
+      )
+    }
+    if (context.assigned_to !== input.actorEmail) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_SCAN_EVIDENCE_ACTOR_MISMATCH',
+        'Only the picker assigned to every task may submit its scan evidence',
+        403,
+      )
+    }
+    const policyRowVersion = Number(context.policy_row_version)
+    if (
+      !Number.isSafeInteger(policyRowVersion)
+      || policyRowVersion < 1
+      || evidence.policyRowVersion !== policyRowVersion
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_SCAN_EVIDENCE_STALE',
+        'The warehouse location scan policy changed. Refresh and scan again.',
+        409,
+      )
+    }
+    const expectedLocationBarcode = locationBarcode(context.location_global_id)
+    if (evidence.location.barcode !== expectedLocationBarcode) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_LOCATION_SCAN_MISMATCH',
+        `Location scan does not match pick task ${context.pick_task_global_id}`,
+        409,
+      )
+    }
+    const expectedProductBarcode = wearableScanExpectedProductBarcode(context)
+    if (!expectedProductBarcode) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_PRODUCT_BARCODE_REQUIRED',
+        `Pick task ${context.pick_task_global_id} has no authoritative product barcode`,
+        409,
+      )
+    }
+    if (!wearableProductBarcodeMatches(evidence.product.barcode, expectedProductBarcode)) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_PRODUCT_SCAN_MISMATCH',
+        `Product scan does not match pick task ${context.pick_task_global_id}`,
+        409,
+      )
+    }
+    const locationCapturedAt = wearableScanTime(
+      evidence.location.capturedAt,
+      'Location capture time',
+    )!
+    const productCapturedAt = wearableScanTime(
+      evidence.product.capturedAt,
+      'Product capture time',
+    )!
+    const minimumContextTime = [
+      wearableScanTime(context.assigned_at, 'Pick assignment time'),
+      wearableScanTime(context.pick_created_at, 'Pick creation time'),
+      wearableScanTime(context.policy_updated_at, 'Scan policy update time'),
+      wearableScanTime(context.wave_released_at, 'Wave release time'),
+    ].filter((value): value is Date => value !== null)
+      .reduce((latest, value) => value > latest ? value : latest, new Date(0))
+    if (
+      locationCapturedAt.getTime() < minimumContextTime.getTime() - WEARABLE_SCAN_CLOCK_SKEW_MS
+      || locationCapturedAt.getTime() < now.getTime() - WEARABLE_SCAN_MAX_AGE_MS
+      || locationCapturedAt.getTime() > now.getTime() + WEARABLE_SCAN_CLOCK_SKEW_MS
+      || productCapturedAt.getTime() < locationCapturedAt.getTime()
+      || productCapturedAt.getTime() - locationCapturedAt.getTime()
+        > WEARABLE_LOCATION_TO_PRODUCT_MAX_MS
+      || productCapturedAt.getTime() > now.getTime() + WEARABLE_SCAN_CLOCK_SKEW_MS
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_SCAN_EVIDENCE_STALE',
+        `Scan timing is stale or out of sequence for pick task ${context.pick_task_global_id}`,
+        409,
+      )
+    }
+    return {
+      context,
+      evidence,
+      policyRowVersion,
+      expectedLocationBarcode,
+      expectedProductBarcode,
+      locationCapturedAt,
+      productCapturedAt,
+    }
+  })
+  if (validated.length !== evidenceByTask.size) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_SCAN_EVIDENCE_CONTEXT_MISMATCH',
+      'Scan evidence includes a task outside the current policy-required order',
+      409,
+    )
+  }
+  return validated
+}
+
+function completedWearablePickScanEvidenceResult(
+  receipt: Pick<CommandReceiptRow, 'result_payload'>,
+): WearablePickScanEvidenceCommandResult {
+  const payload = receipt.result_payload
+  const orderGlobalId = String(payload?.orderGlobalId || '')
+  const orderRowVersion = Number(payload?.orderRowVersion)
+  const evidenceCount = Number(payload?.evidenceCount)
+  const serverObservedAt = String(payload?.serverObservedAt || '')
+  if (
+    !/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)
+    || !Number.isSafeInteger(orderRowVersion)
+    || orderRowVersion < 0
+    || !Number.isSafeInteger(evidenceCount)
+    || evidenceCount < 1
+    || !Number.isFinite(new Date(serverObservedAt).getTime())
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_SCAN_EVIDENCE_RECEIPT_INVALID',
+      'Stored wearable scan evidence receipt is invalid',
+      500,
+    )
+  }
+  return {
+    orderGlobalId,
+    orderRowVersion,
+    evidenceCount,
+    serverObservedAt,
+    replayed: true,
+  }
+}
+
+export async function recordWearablePickScanEvidenceFromPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  orderGlobalId: string
+  expectedRowVersion: number
+  scanEvidence: WearablePickTaskScanEvidenceInput[]
+  idempotencyKey: string
+}): Promise<WearablePickScanEvidenceCommandResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
+  const orderGlobalId = String(input.orderGlobalId || '').trim()
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
+    throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
+  }
+  if (!Number.isSafeInteger(input.expectedRowVersion) || input.expectedRowVersion < 0) {
+    throw new OperationsRequestError('OPERATIONS_ORDER_VERSION_INVALID', 'Order version is invalid')
+  }
+  if (!Array.isArray(input.scanEvidence) || input.scanEvidence.length < 1 || input.scanEvidence.length > 200) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_SCAN_EVIDENCE_INVALID',
+      'Scan evidence must contain between one and 200 pick tasks',
+    )
+  }
+  if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
+    throw new OperationsRequestError('OPERATIONS_IDEMPOTENCY_KEY_INVALID', 'A valid idempotency key is required')
+  }
+
+  const command = await prepareCommandReceipt({
+    organizationId,
+    commandType: 'record_wearable_pick_scan_evidence',
+    idempotencyKey,
+    requestHash: commandRequestHash({
+      orderGlobalId,
+      expectedRowVersion: input.expectedRowVersion,
+      scanEvidence: input.scanEvidence,
+    }),
+    actorEmail,
+    targetGlobalId: orderGlobalId,
+  })
+  if (command.completed) {
+    return completedWearablePickScanEvidenceResult(command.receipt)
+  }
+
+  try {
+    return await withTransaction(async (client) => {
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:order:${organizationId}:${orderGlobalId}`,
+      )
+      const activation = await resolveActivation(client, organizationId)
+      if (!['shadow', 'active'].includes(activation.state)) {
+        throw new OperationsRequestError(
+          'OPERATIONS_EXECUTION_STATE_INVALID',
+          'Set Operations to Shadow or Active before recording warehouse scans',
+          409,
+        )
+      }
+      const orderResult = await client.query<OrderIdentityRow>(
+        `SELECT id::text, global_id, status, row_version::text
+         FROM operations_orders
+         WHERE organization_id = $1::uuid AND global_id = $2
+         FOR UPDATE`,
+        [organizationId, orderGlobalId],
+      )
+      const order = orderResult.rows[0]
+      if (!order || order.row_version === undefined) {
+        throw new OperationsRequestError('OPERATIONS_ORDER_NOT_FOUND', 'Operations order was not found', 404)
+      }
+      if (
+        Number(order.row_version) !== input.expectedRowVersion
+        || order.status !== 'released'
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_WEARABLE_SCAN_EVIDENCE_STALE',
+          'The order changed after its scan queue was loaded. Refresh and scan again.',
+          409,
+        )
+      }
+      const planResult = await client.query<QueryResultRow & {
+        id: string
+        global_id: string
+        status: string
+      }>(
+        `SELECT id::text, global_id, status
+         FROM operations_fulfillment_plans
+         WHERE organization_id = $1::uuid AND order_id = $2::uuid
+         ORDER BY version_number DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [organizationId, order.id],
+      )
+      const plan = planResult.rows[0]
+      if (!plan || plan.status !== 'released') {
+        throw new OperationsRequestError(
+          'OPERATIONS_WEARABLE_SCAN_EVIDENCE_STALE',
+          'The released fulfillment plan changed. Refresh and scan again.',
+          409,
+        )
+      }
+      const waveResult = await client.query<IdRow & {
+        status: string
+        warehouse_global_id: string
+      }>(
+        `SELECT wave.id::text, wave.global_id, wave.status,
+                warehouse.global_id AS warehouse_global_id
+         FROM operations_waves wave
+         JOIN operations_warehouses warehouse
+           ON warehouse.organization_id = wave.organization_id
+          AND warehouse.id = wave.warehouse_id
+         WHERE wave.organization_id = $1::uuid
+           AND wave.id = (
+             SELECT pick.wave_id
+             FROM operations_pick_tasks pick
+             WHERE pick.organization_id = $1::uuid AND pick.plan_id = $2::uuid
+             ORDER BY pick.created_at, pick.id
+             LIMIT 1
+           )
+         FOR UPDATE OF wave`,
+        [organizationId, plan.id],
+      )
+      const wave = waveResult.rows[0]
+      if (!wave || wave.status !== 'released') {
+        throw new OperationsRequestError(
+          'OPERATIONS_WEARABLE_SCAN_EVIDENCE_STALE',
+          'The released wave changed. Refresh and scan again.',
+          409,
+        )
+      }
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:wearable-location-scan-policy:${organizationId}:${wave.warehouse_global_id}`,
+      )
+      const contexts = await readWearablePickScanContexts(client, {
+        organizationId,
+        orderId: order.id,
+        planId: plan.id,
+        waveId: wave.id,
+      })
+      const validated = validateWearablePickScanEvidence({
+        actorEmail,
+        scanEvidence: input.scanEvidence,
+        contexts,
+      })
+      for (const item of validated) {
+        const hash = commandRequestHash({
+          orderGlobalId,
+          orderRowVersion: input.expectedRowVersion,
+          pickTaskGlobalId: item.context.pick_task_global_id,
+          warehouseGlobalId: item.context.warehouse_global_id,
+          locationGlobalId: item.context.location_global_id,
+          policyRowVersion: item.policyRowVersion,
+          expectedLocationBarcode: item.expectedLocationBarcode,
+          observedLocationBarcode: item.evidence.location.barcode,
+          locationCapturedAt: item.evidence.location.capturedAt,
+          locationSource: item.evidence.location.source,
+          expectedProductBarcode: item.expectedProductBarcode,
+          observedProductBarcode: item.evidence.product.barcode,
+          productCapturedAt: item.evidence.product.capturedAt,
+          productSource: item.evidence.product.source,
+        })
+        await client.query(
+          `INSERT INTO operations_wearable_pick_scan_evidence (
+             organization_id, command_receipt_id, order_id, order_row_version,
+             pick_task_id, warehouse_id, location_id, policy_row_version,
+             expected_location_barcode, observed_location_barcode,
+             location_captured_at, location_source,
+             expected_product_barcode, observed_product_barcode,
+             product_captured_at, product_source, evidence_hash, recorded_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, $4,
+             $5::uuid, $6::uuid, $7::uuid, $8,
+             $9, $10, $11::timestamptz, $12,
+             $13, $14, $15::timestamptz, $16, $17, $18
+           )`,
+          [
+            organizationId,
+            command.receipt.id,
+            order.id,
+            input.expectedRowVersion,
+            item.context.pick_task_id,
+            item.context.warehouse_id,
+            item.context.location_id,
+            item.policyRowVersion,
+            item.expectedLocationBarcode,
+            item.evidence.location.barcode,
+            item.evidence.location.capturedAt,
+            item.evidence.location.source,
+            item.expectedProductBarcode,
+            item.evidence.product.barcode,
+            item.evidence.product.capturedAt,
+            item.evidence.product.source,
+            hash,
+            actorEmail,
+          ],
+        )
+      }
+      const observed = await client.query<{ server_observed_at: Date }>(
+        `SELECT now() AS server_observed_at`,
+      )
+      const serverObservedAt = observed.rows[0].server_observed_at.toISOString()
+      const result: WearablePickScanEvidenceCommandResult = {
+        orderGlobalId,
+        orderRowVersion: input.expectedRowVersion,
+        evidenceCount: validated.length,
+        serverObservedAt,
+        replayed: false,
+      }
+      await appendDomainEvent(client, {
+        organizationId,
+        aggregateType: 'operations.order',
+        aggregateId: order.id,
+        aggregateGlobalId: order.global_id,
+        eventType: 'operations.pick.scan_evidence_recorded',
+        actorEmail,
+        correlationId: command.receipt.correlation_id,
+        idempotencyKey: `wearable-scan-evidence:${command.receipt.id}`,
+        payload: {
+          orderRowVersion: input.expectedRowVersion,
+          planGlobalId: plan.global_id,
+          waveGlobalId: wave.global_id,
+          pickTaskGlobalIds: validated.map((item) => item.context.pick_task_global_id),
+          policyRowVersions: [...new Set(validated.map((item) => item.policyRowVersion))],
+          evidenceHashes: validated.map((item) => commandRequestHash({
+            pickTaskGlobalId: item.context.pick_task_global_id,
+            locationCapturedAt: item.evidence.location.capturedAt,
+            productCapturedAt: item.evidence.product.capturedAt,
+          })),
+          serverObservedAt,
+        },
+      })
+      await recordAuditEvent({
+        actor: actorEmail,
+        eventType: 'operations.pick.scan_evidence_recorded',
+        aggregateType: 'operations.order',
+        aggregateId: order.global_id,
+        subject: `Recorded scan evidence for ${order.global_id}`,
+        organizationId,
+        eventKey: `operations:wearable-pick-scan-evidence:${command.receipt.id}`,
+        payload: {
+          orderRowVersion: input.expectedRowVersion,
+          evidenceCount: validated.length,
+          pickTaskGlobalIds: validated.map((item) => item.context.pick_task_global_id),
+          sources: [...new Set(validated.flatMap((item) => [
+            item.evidence.location.source,
+            item.evidence.product.source,
+          ]))],
+          serverObservedAt,
+        },
+      }, client)
+      await completeCommandReceipt(
+        client,
+        command.receipt.id,
+        order.global_id,
+        result,
+      )
+      return result
+    })
+  } catch (error) {
+    await failCommandReceipt(command.receipt.id, error)
+    throw error
+  }
+}
+
+async function requireAcknowledgedWearablePickScanEvidence(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    actorEmail: string
+    orderId: string
+    orderGlobalId: string
+    orderRowVersion: number
+    contexts: WearablePickScanContextRow[]
+    scanEvidenceIdempotencyKey?: string
+  },
+) {
+  const required = requiredWearablePickScanContexts(input.contexts)
+  if (required.length < 1) {
+    if (input.scanEvidenceIdempotencyKey) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_SCAN_EVIDENCE_STALE',
+        'The warehouse scan policy changed. Refresh before confirming picks.',
+        409,
+      )
+    }
+    return { enforced: false, evidenceCount: 0, receiptId: null as string | null }
+  }
+  const idempotencyKey = String(input.scanEvidenceIdempotencyKey || '').trim()
+  if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_SCAN_EVIDENCE_REQUIRED',
+      'Sync and acknowledge the required location and product scans before confirming picks',
+      409,
+    )
+  }
+  const receiptResult = await client.query<CommandReceiptRow>(
+    `SELECT id::text, request_hash, target_global_id,
+            status, correlation_id::text,
+            result_global_id, result_payload, attempts, updated_at
+     FROM operations_command_receipts
+     WHERE organization_id = $1::uuid
+       AND command_type = 'record_wearable_pick_scan_evidence'
+       AND idempotency_key = $2
+       AND actor_email = $3
+       AND target_global_id = $4
+     LIMIT 1`,
+    [
+      input.organizationId,
+      idempotencyKey,
+      input.actorEmail,
+      input.orderGlobalId,
+    ],
+  )
+  const receipt = receiptResult.rows[0]
+  if (!receipt || receipt.status !== 'succeeded') {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_SCAN_EVIDENCE_REQUIRED',
+      'Scan evidence has not been durably acknowledged by ClawPilot',
+      409,
+    )
+  }
+  const evidenceResult = await client.query<WearablePickScanEvidenceRow>(
+    `SELECT pick_task_id::text, order_id::text, order_row_version::text,
+            warehouse_id::text, location_id::text, policy_row_version::text,
+            expected_location_barcode, observed_location_barcode,
+            location_captured_at, location_source,
+            expected_product_barcode, observed_product_barcode,
+            product_captured_at, product_source, evidence_hash
+     FROM operations_wearable_pick_scan_evidence
+     WHERE organization_id = $1::uuid
+       AND command_receipt_id = $2::uuid
+     ORDER BY pick_task_id`,
+    [input.organizationId, receipt.id],
+  )
+  if (evidenceResult.rows.length !== required.length) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_SCAN_EVIDENCE_INCOMPLETE',
+      'Acknowledged scan evidence does not cover every policy-required pick task',
+      409,
+    )
+  }
+  const byTask = new Map(evidenceResult.rows.map((row) => [row.pick_task_id, row]))
+  for (const context of required) {
+    const evidence = byTask.get(context.pick_task_id)
+    const expectedProductBarcode = wearableScanExpectedProductBarcode(context)
+    if (
+      !evidence
+      || evidence.order_id !== input.orderId
+      || context.assigned_to !== input.actorEmail
+      || Number(evidence.order_row_version) !== input.orderRowVersion
+      || evidence.warehouse_id !== context.warehouse_id
+      || evidence.location_id !== context.location_id
+      || Number(evidence.policy_row_version) !== Number(context.policy_row_version)
+      || evidence.expected_location_barcode !== locationBarcode(context.location_global_id)
+      || evidence.observed_location_barcode !== evidence.expected_location_barcode
+      || !expectedProductBarcode
+      || evidence.expected_product_barcode !== expectedProductBarcode
+      || !wearableProductBarcodeMatches(
+        evidence.observed_product_barcode,
+        expectedProductBarcode,
+      )
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_SCAN_EVIDENCE_STALE',
+        'Acknowledged scan evidence no longer matches the current pick context',
+        409,
+      )
+    }
+  }
+  if (byTask.size !== required.length) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_SCAN_EVIDENCE_CONTEXT_MISMATCH',
+      'Acknowledged scan evidence includes a task outside the current order',
+      409,
+    )
+  }
+  return { enforced: true, evidenceCount: required.length, receiptId: receipt.id }
+}
+
 export async function confirmOperationsOrderPicksFromPostgres(input: {
   organizationId: string
   actorEmail: string
   orderGlobalId: string
   expectedRowVersion: number
   reason: string
+  scanEvidenceIdempotencyKey?: string
   idempotencyKey: string
 }): Promise<OperationsOrderCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
   const orderGlobalId = String(input.orderGlobalId || '').trim()
   const reason = String(input.reason || '').trim()
+  const scanEvidenceIdempotencyKey = String(
+    input.scanEvidenceIdempotencyKey || '',
+  ).trim() || undefined
   const idempotencyKey = String(input.idempotencyKey || '').trim()
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
   if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
@@ -12242,13 +13201,28 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
   if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
     throw new OperationsRequestError('OPERATIONS_IDEMPOTENCY_KEY_INVALID', 'A valid idempotency key is required')
   }
+  if (
+    scanEvidenceIdempotencyKey
+    && !/^[A-Za-z0-9._:-]{8,200}$/.test(scanEvidenceIdempotencyKey)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_SCAN_EVIDENCE_INVALID',
+      'Scan evidence idempotency key is invalid',
+    )
+  }
 
   const command = await prepareCommandReceipt({
     organizationId,
     commandType: 'confirm_operations_order_picks',
     idempotencyKey,
-    requestHash: commandRequestHash({ orderGlobalId, expectedRowVersion: input.expectedRowVersion, reason }),
+    requestHash: commandRequestHash({
+      orderGlobalId,
+      expectedRowVersion: input.expectedRowVersion,
+      reason,
+      scanEvidenceIdempotencyKey: scanEvidenceIdempotencyKey || null,
+    }),
     actorEmail,
+    targetGlobalId: orderGlobalId,
   })
   if (command.completed) {
     return completedOrderCommandResult(organizationId, command.receipt)
@@ -12314,9 +13288,16 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
         )
       }
 
-      const waveResult = await client.query<IdRow & { status: string }>(
-        `SELECT wave.id::text, wave.global_id, wave.status
+      const waveResult = await client.query<IdRow & {
+        status: string
+        warehouse_global_id: string
+      }>(
+        `SELECT wave.id::text, wave.global_id, wave.status,
+                warehouse.global_id AS warehouse_global_id
          FROM operations_waves wave
+         JOIN operations_warehouses warehouse
+           ON warehouse.organization_id = wave.organization_id
+          AND warehouse.id = wave.warehouse_id
          WHERE wave.organization_id = $1::uuid
            AND wave.id = (
              SELECT pick.wave_id
@@ -12325,7 +13306,7 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
              ORDER BY pick.created_at, pick.id
              LIMIT 1
            )
-         FOR UPDATE`,
+         FOR UPDATE OF wave`,
         [organizationId, plan.id],
       )
       const wave = waveResult.rows[0]
@@ -12336,6 +13317,10 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           409,
         )
       }
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:wearable-location-scan-policy:${organizationId}:${wave.warehouse_global_id}`,
+      )
 
       const pickResult = await client.query<QueryResultRow & {
         id: string
@@ -12428,6 +13413,30 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           409,
         )
       }
+
+      const wearableScanContexts = await readWearablePickScanContexts(client, {
+        organizationId,
+        orderId: order.id,
+        planId: plan.id,
+        waveId: wave.id,
+      })
+      if (wearableScanContexts.length !== pickResult.rows.length) {
+        throw new OperationsRequestError(
+          'OPERATIONS_WEARABLE_SCAN_EVIDENCE_CONTEXT_MISMATCH',
+          'Warehouse scan context no longer matches every ready pick task',
+          409,
+        )
+      }
+      const scanEvidenceAcknowledgement =
+        await requireAcknowledgedWearablePickScanEvidence(client, {
+          organizationId,
+          actorEmail,
+          orderId: order.id,
+          orderGlobalId: order.global_id,
+          orderRowVersion: input.expectedRowVersion,
+          contexts: wearableScanContexts,
+          scanEvidenceIdempotencyKey,
+        })
 
       const blockingResult = await client.query<QueryResultRow & { count: string }>(
         `SELECT count(*)::text AS count
@@ -12561,6 +13570,9 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           reservationsRetained: true,
           localPickLedgerCount,
           providerCommitmentPickCount,
+          scanEvidenceEnforced: scanEvidenceAcknowledgement.enforced,
+          scanEvidenceCount: scanEvidenceAcknowledgement.evidenceCount,
+          scanEvidenceReceiptId: scanEvidenceAcknowledgement.receiptId,
         },
       })
       await recordAuditEvent({
@@ -12583,6 +13595,9 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           reservationsRetained: true,
           localPickLedgerCount,
           providerCommitmentPickCount,
+          scanEvidenceEnforced: scanEvidenceAcknowledgement.enforced,
+          scanEvidenceCount: scanEvidenceAcknowledgement.evidenceCount,
+          scanEvidenceReceiptId: scanEvidenceAcknowledgement.receiptId,
         },
       }, client)
       const result: OperationsOrderCommandResult = {
@@ -14570,6 +15585,285 @@ export async function retryOperationsCommerceFulfillmentExportFromPostgres(input
   }
 }
 
+type NativeOneOffShipmentAuthority = {
+  groupAttemptId: string
+  groupAttemptGlobalId: string
+  environment: 'sandbox' | 'production'
+  selectedAmountMinor: number
+  currency: string
+  allocatedCostByPackageId: Map<string, number>
+}
+
+async function lockNativeOneOffShipmentAuthority(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    orderId: string
+    planId: string
+    activationState: OperationsActivationState
+    canActivate: boolean
+    packages: Array<{ id: string; global_id: string; status: string }>
+  },
+): Promise<NativeOneOffShipmentAuthority> {
+  const attemptResult = await client.query<QueryResultRow & {
+    id: string
+    global_id: string
+    state: 'prepared' | 'succeeded' | 'failed' | 'unknown'
+    environment: 'sandbox' | 'production'
+    provider: 'ups_rest' | 'fedex_rest'
+    service_code: string
+    package_count: number
+    selected_amount_minor: string
+    currency: string
+  }>(
+    `SELECT attempt.id::text, attempt.global_id, attempt.state,
+            attempt.environment, attempt.provider, attempt.service_code,
+            attempt.package_count,
+            attempt.selected_amount_minor::text, attempt.currency
+     FROM operations_one_off_carrier_group_attempts attempt
+     WHERE attempt.organization_id = $1::uuid
+       AND attempt.order_id = $2::uuid
+       AND attempt.plan_id = $3::uuid
+       AND attempt.action = 'create'
+     ORDER BY attempt.requested_at DESC, attempt.id DESC
+     LIMIT 1
+     FOR UPDATE`,
+    [input.organizationId, input.orderId, input.planId],
+  )
+  const attempt = attemptResult.rows[0]
+  if (!attempt) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ONE_OFF_GROUP_REQUIRED',
+      'Purchase one complete one-off carrier shipment group before confirmation',
+      409,
+    )
+  }
+  if (attempt.state === 'prepared' || attempt.state === 'unknown') {
+    throw new OperationsRequestError(
+      'OPERATIONS_ONE_OFF_GROUP_UNRESOLVED',
+      'Resolve the pending one-off carrier group before confirming shipment',
+      409,
+    )
+  }
+  if (attempt.state !== 'succeeded') {
+    throw new OperationsRequestError(
+      'OPERATIONS_ONE_OFF_GROUP_FAILED',
+      'The latest one-off carrier group did not succeed. Re-rate and retry the group.',
+      409,
+    )
+  }
+
+  const executionMode = attempt.environment === 'sandbox' ? 'test' : 'live'
+  const requiredActivation = executionMode === 'test' ? 'shadow' : 'active'
+  if (input.activationState !== requiredActivation) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ONE_OFF_GROUP_ACTIVATION_MISMATCH',
+      executionMode === 'test'
+        ? 'TEST confirmation requires Operations Shadow'
+        : 'LIVE confirmation requires Operations Active',
+      409,
+    )
+  }
+  if (executionMode === 'live' && !input.canActivate) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ACTIVATE_REQUIRED',
+      'Operations activation permission is required to confirm LIVE postage',
+      403,
+    )
+  }
+  const authorityResult = await client.query<{ exact: boolean }>(
+    `SELECT operations_one_off_plan_execution_is_exact(
+       $1::uuid, $2::uuid, $3
+     ) AS exact`,
+    [input.organizationId, input.planId, executionMode],
+  )
+  if (authorityResult.rows[0]?.exact !== true) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ONE_OFF_GROUP_AUTHORITY_INVALID',
+      'The one-off carrier group no longer matches the exact selected rate and plan authority',
+      409,
+    )
+  }
+
+  const closeResult = await client.query<QueryResultRow & {
+    id: string
+    state: 'prepared' | 'succeeded' | 'failed' | 'unknown'
+  }>(
+    `SELECT closed.id::text, closed.state
+     FROM operations_one_off_carrier_group_attempts closed
+     WHERE closed.organization_id = $1::uuid
+       AND closed.create_attempt_id = $2::uuid
+       AND closed.action IN ('void', 'close_sample')
+       AND closed.state IN ('prepared', 'succeeded', 'unknown')
+     ORDER BY closed.requested_at DESC, closed.id DESC
+     FOR UPDATE`,
+    [input.organizationId, attempt.id],
+  )
+  if (closeResult.rows.length > 0) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ONE_OFF_GROUP_CLOSED',
+      closeResult.rows.some((row) => row.state === 'succeeded')
+        ? 'The one-off carrier group was voided and cannot confirm shipment'
+        : 'Resolve the pending whole-shipment void before confirming shipment',
+      409,
+    )
+  }
+
+  const lockedLabels = await client.query<QueryResultRow & {
+    id: string
+    one_off_carrier_group_attempt_id: string | null
+  }>(
+    `SELECT label.id::text,
+            label.one_off_carrier_group_attempt_id::text
+     FROM operations_labels label
+     JOIN operations_packages package
+       ON package.organization_id = label.organization_id
+      AND package.id = label.package_id
+     WHERE label.organization_id = $1::uuid
+       AND package.plan_id = $2::uuid
+       AND label.status = 'created'
+     ORDER BY label.created_at, label.id
+     FOR UPDATE OF label`,
+    [input.organizationId, input.planId],
+  )
+
+  const memberResult = await client.query<QueryResultRow & {
+    package_id: string
+    package_global_id: string
+    package_status: string
+    package_number: number
+    allocated_selected_cost_minor: string
+    result_id: string | null
+    result_package_number: number | null
+    label_id: string | null
+    label_package_id: string | null
+    label_status: string | null
+    label_environment: 'sandbox' | 'production' | 'mock' | null
+    label_group_attempt_id: string | null
+    label_void_group_attempt_id: string | null
+    label_tracking_number: string | null
+    result_tracking_number: string | null
+    label_carrier: string | null
+    label_service_code: string | null
+  }>(
+    `SELECT member.package_id::text, package.global_id AS package_global_id,
+            package.status AS package_status, member.package_number,
+            member.allocated_selected_cost_minor::text,
+            package_result.id::text AS result_id,
+            package_result.package_number AS result_package_number,
+            label.id::text AS label_id,
+            label.package_id::text AS label_package_id,
+            label.status AS label_status,
+            label.environment AS label_environment,
+            label.one_off_carrier_group_attempt_id::text
+              AS label_group_attempt_id,
+            label.one_off_void_group_attempt_id::text
+              AS label_void_group_attempt_id,
+            label.tracking_number AS label_tracking_number,
+            package_result.tracking_number AS result_tracking_number,
+            label.carrier AS label_carrier,
+            label.service_code AS label_service_code
+     FROM operations_one_off_carrier_group_members member
+     JOIN operations_packages package
+       ON package.organization_id = member.organization_id
+      AND package.id = member.package_id
+      AND package.plan_id = member.plan_id
+     LEFT JOIN operations_one_off_carrier_group_results package_result
+       ON package_result.organization_id = member.organization_id
+      AND package_result.carrier_group_attempt_id = member.carrier_group_attempt_id
+      AND package_result.package_id = member.package_id
+     LEFT JOIN operations_labels label
+       ON label.organization_id = package_result.organization_id
+      AND label.id = package_result.label_id
+     WHERE member.organization_id = $1::uuid
+       AND member.carrier_group_attempt_id = $2::uuid
+     ORDER BY member.package_number, member.id`,
+    [input.organizationId, attempt.id],
+  )
+
+  const canonicalPackageIds = new Set(input.packages.map((item) => item.id))
+  const allocatedCostByPackageId = new Map<string, number>()
+  let allocatedTotal = BigInt(0)
+  for (const row of memberResult.rows) {
+    let allocatedCost: bigint
+    try {
+      allocatedCost = BigInt(row.allocated_selected_cost_minor)
+    } catch {
+      throw new OperationsRequestError(
+        'OPERATIONS_ONE_OFF_GROUP_COST_INVALID',
+        'The one-off group contains an invalid package cost allocation',
+        409,
+      )
+    }
+    if (
+      allocatedCost < BigInt(0)
+      || allocatedCost > BigInt(Number.MAX_SAFE_INTEGER)
+      || !canonicalPackageIds.has(row.package_id)
+      || row.package_status !== 'labeled'
+      || !row.result_id
+      || row.result_package_number !== row.package_number
+      || !row.label_id
+      || row.label_package_id !== row.package_id
+      || row.label_status !== 'created'
+      || row.label_environment !== attempt.environment
+      || row.label_group_attempt_id !== attempt.id
+      || row.label_void_group_attempt_id !== null
+      || row.label_tracking_number !== row.result_tracking_number
+      || row.label_carrier !== (
+        attempt.provider === 'ups_rest' ? 'UPS' : 'FedEx'
+      )
+      || row.label_service_code !== attempt.service_code
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_ONE_OFF_GROUP_PARTIAL',
+        'The one-off carrier group does not have one exact active result and label for every package',
+        409,
+      )
+    }
+    allocatedTotal += allocatedCost
+    allocatedCostByPackageId.set(row.package_id, Number(allocatedCost))
+  }
+
+  let selectedAmount: bigint
+  try {
+    selectedAmount = BigInt(attempt.selected_amount_minor)
+  } catch {
+    throw new OperationsRequestError(
+      'OPERATIONS_ONE_OFF_GROUP_COST_INVALID',
+      'The one-off group selected amount is invalid',
+      409,
+    )
+  }
+  if (
+    input.packages.length < 1
+    || input.packages.some((item) => item.status !== 'labeled')
+    || attempt.package_count !== input.packages.length
+    || memberResult.rows.length !== input.packages.length
+    || allocatedCostByPackageId.size !== input.packages.length
+    || lockedLabels.rows.length !== input.packages.length
+    || lockedLabels.rows.some((label) => (
+      label.one_off_carrier_group_attempt_id !== attempt.id
+    ))
+    || allocatedTotal !== selectedAmount
+    || selectedAmount > BigInt(Number.MAX_SAFE_INTEGER)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ONE_OFF_GROUP_PARTIAL',
+      'The one-off carrier group is partial or no longer matches every canonical package',
+      409,
+    )
+  }
+
+  return {
+    groupAttemptId: attempt.id,
+    groupAttemptGlobalId: attempt.global_id,
+    environment: attempt.environment,
+    selectedAmountMinor: Number(selectedAmount),
+    currency: attempt.currency,
+    allocatedCostByPackageId,
+  }
+}
+
 export async function confirmOperationsOrderShipmentFromPostgres(input: {
   organizationId: string
   actorEmail: string
@@ -14582,6 +15876,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
   expectedNotificationPolicyRevision?: number | null
   customerNotificationOverride?: boolean | null
   customerNotificationOverrideReason?: string | null
+  canActivate?: boolean
 }): Promise<OperationsShipmentCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
@@ -14729,6 +16024,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         customer_global_id: string
         customer_name: string
         source_provider: string
+        order_type: string
         integration_account_id: string | null
         integration_account_global_id: string
         external_order_id: string
@@ -14742,7 +16038,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
                 source_order.customer_id::text,
                 customer.reference_code AS customer_global_id,
                 customer.name AS customer_name,
-                source_order.source_provider,
+                source_order.source_provider, source_order.order_type,
                 source_order.integration_account_id::text,
                 integration.global_id AS integration_account_global_id,
                 source_order.external_order_id,
@@ -14783,6 +16079,15 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         throw new OperationsRequestError(
           'OPERATIONS_ORDER_TRANSITION_INVALID',
           `Shipment cannot be confirmed from ${order.status}`,
+          409,
+        )
+      }
+      const nativeOneOff = order.source_provider === 'clawpilot_native'
+        && order.order_type === 'one_off'
+      if (nativeOneOff && sandboxE2eAuthorizationGlobalId) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ONE_OFF_SANDBOX_AUTHORITY_CONFLICT',
+          'Native one-off TEST shipments use their exact carrier-group authority and cannot mix sandbox E2E authorization',
           409,
         )
       }
@@ -14981,6 +16286,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         || packageResult.rows.some((item) => item.status !== 'labeled')
         || (
           !sandboxE2eAuthorizationGlobalId
+          && !nativeOneOff
           && order.source_provider !== 'faire'
           && packageResult.rows.length !== 1
         )
@@ -14993,6 +16299,16 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           409,
         )
       }
+      const nativeOneOffAuthority = nativeOneOff
+        ? await lockNativeOneOffShipmentAuthority(client, {
+            organizationId,
+            orderId: order.id,
+            planId: plan.id,
+            activationState: activation.state,
+            canActivate: input.canActivate === true,
+            packages: packageResult.rows,
+          })
+        : null
       const unresolvedAttempts = await client.query<QueryResultRow & {
         id: string
         state: string
@@ -15057,6 +16373,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
       if (
         labelResult.rows.some((item) => item.environment === 'sandbox')
         && !sandboxE2eAuthorizationGlobalId
+        && !nativeOneOffAuthority
       ) {
         throw new OperationsRequestError(
           'OPERATIONS_SANDBOX_LABEL_CANNOT_SHIP',
@@ -15064,9 +16381,11 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           409,
         )
       }
-      const allowedLabelEnvironments = sandboxE2eAuthorizationGlobalId
-        ? ['sandbox']
-        : ['mock', 'production']
+      const allowedLabelEnvironments = nativeOneOffAuthority
+        ? [nativeOneOffAuthority.environment]
+        : sandboxE2eAuthorizationGlobalId
+          ? ['sandbox']
+          : ['mock', 'production']
       if (labelResult.rows.some((item) => (
         !allowedLabelEnvironments.includes(item.environment)
       ))) {
@@ -15274,18 +16593,29 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         service_code: string
         environment: 'mock' | 'sandbox' | 'production'
         quoted_carrier_cost_minor: number
+        one_off_carrier_group_global_id: string | null
       }> = []
       for (const packageRow of packageResult.rows) {
         const packageLabel = labelResult.rows.find(
           (item) => item.package_id === packageRow.id,
         )!
+        const oneOffAllocatedCost = nativeOneOffAuthority
+          ?.allocatedCostByPackageId.get(packageRow.id)
+        if (nativeOneOffAuthority && oneOffAllocatedCost === undefined) {
+          throw new OperationsRequestError(
+            'OPERATIONS_ONE_OFF_GROUP_PARTIAL',
+            'The one-off carrier group is missing a deterministic package cost allocation',
+            409,
+          )
+        }
         const shipmentResult = await client.query<IdRow & { shipped_at: Date }>(
           `INSERT INTO operations_shipments (
              organization_id, order_id, plan_id, package_id, label_id, status,
-             tracking_number, shipped_at, quoted_carrier_cost_minor, confirmed_by
+             tracking_number, shipped_at, quoted_carrier_cost_minor, confirmed_by,
+             one_off_carrier_group_attempt_id
            ) VALUES (
              $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 'confirmed',
-             $6, now(), $7, $8
+             $6, now(), $7, $8, $9::uuid
            )
            RETURNING id::text, global_id, shipped_at`,
           [
@@ -15295,10 +16625,13 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
             packageRow.id,
             packageLabel.id,
             packageLabel.tracking_number,
-            sandboxE2eAuthorizationGlobalId
-              ? 0
-              : packageLabel.internal_cost_minor,
+            nativeOneOffAuthority
+              ? oneOffAllocatedCost
+              : sandboxE2eAuthorizationGlobalId
+                ? 0
+                : packageLabel.internal_cost_minor,
             actorEmail,
+            nativeOneOffAuthority?.groupAttemptId || null,
           ],
         )
         shipments.push({
@@ -15311,9 +16644,13 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           carrier: packageLabel.carrier,
           service_code: packageLabel.service_code,
           environment: packageLabel.environment,
-          quoted_carrier_cost_minor: sandboxE2eAuthorizationGlobalId
-            ? 0
-            : Number(packageLabel.internal_cost_minor),
+          quoted_carrier_cost_minor: nativeOneOffAuthority
+            ? oneOffAllocatedCost!
+            : sandboxE2eAuthorizationGlobalId
+              ? 0
+              : Number(packageLabel.internal_cost_minor),
+          one_off_carrier_group_global_id:
+            nativeOneOffAuthority?.groupAttemptGlobalId || null,
         })
       }
       const shipment = shipments[0]
@@ -15398,6 +16735,10 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           carrier: packageShipment.carrier,
           serviceCode: packageShipment.service_code,
           shippedAt: packageShipment.shipped_at.toISOString(),
+          oneOffCarrierGroupGlobalId:
+            packageShipment.one_off_carrier_group_global_id,
+          quotedCarrierCostMinor:
+            packageShipment.quoted_carrier_cost_minor,
           shipTo: address(order.ship_to),
           lines: packageContentResult.rows
             .filter((line) => line.package_id === packageShipment.package_id)
@@ -15462,6 +16803,10 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
               labelGlobalId: packageShipment.label_global_id,
               trackingNumber: packageShipment.tracking_number,
               environment: packageShipment.environment,
+              oneOffCarrierGroupGlobalId:
+                packageShipment.one_off_carrier_group_global_id,
+              quotedCarrierCostMinor:
+                packageShipment.quoted_carrier_cost_minor,
               sandboxE2eAuthorizationGlobalId,
             }), `${packageShipment.global_id}:tracking:confirmed`, actorEmail,
           ],
@@ -15507,6 +16852,11 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         serviceCode: shipment.service_code,
         shippedAt,
         sandboxE2eAuthorizationGlobalId,
+        oneOffCarrierGroupGlobalId:
+          nativeOneOffAuthority?.groupAttemptGlobalId || null,
+        oneOffSelectedAmountMinor:
+          nativeOneOffAuthority?.selectedAmountMinor ?? null,
+        oneOffSelectedCurrency: nativeOneOffAuthority?.currency || null,
         customerNotification: resolvedCustomerNotification,
         ...(order.source_provider === 'shopify'
           ? {
@@ -15632,6 +16982,15 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           carrier: shipment.carrier,
           serviceCode: shipment.service_code,
           labelEnvironment: shipment.environment,
+          oneOffCarrierGroupGlobalId:
+            nativeOneOffAuthority?.groupAttemptGlobalId || null,
+          oneOffSelectedAmountMinor:
+            nativeOneOffAuthority?.selectedAmountMinor ?? null,
+          oneOffShipmentAllocations: shipments.map((item) => ({
+            packageGlobalId: item.package_global_id,
+            shipmentGlobalId: item.global_id,
+            quotedCarrierCostMinor: item.quoted_carrier_cost_minor,
+          })),
           sandboxE2eAuthorizationGlobalId,
           packingSlipArtifactGlobalId: artifact.global_id,
           packingSlipArtifactGlobalIds: artifactContexts.map(
@@ -15663,6 +17022,8 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         payload: {
           shipmentGlobalId: shipment.global_id,
           shipmentGlobalIds: shipments.map((item) => item.global_id),
+          oneOffCarrierGroupGlobalId:
+            nativeOneOffAuthority?.groupAttemptGlobalId || null,
           allocations: allocations.map((allocation) => ({
             inventoryPositionGlobalId: allocation.position_global_id,
             productGlobalId: allocation.product_global_id,
@@ -15711,6 +17072,15 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           labelGlobalId: shipment.label_global_id,
           labelGlobalIds: shipments.map((item) => item.label_global_id),
           labelEnvironment: shipment.environment,
+          oneOffCarrierGroupGlobalId:
+            nativeOneOffAuthority?.groupAttemptGlobalId || null,
+          oneOffSelectedAmountMinor:
+            nativeOneOffAuthority?.selectedAmountMinor ?? null,
+          oneOffShipmentAllocations: shipments.map((item) => ({
+            packageGlobalId: item.package_global_id,
+            shipmentGlobalId: item.global_id,
+            quotedCarrierCostMinor: item.quoted_carrier_cost_minor,
+          })),
           trackingNumber: shipment.tracking_number,
           trackingNumbers: shipments.map((item) => item.tracking_number),
           sandboxE2eAuthorizationGlobalId,

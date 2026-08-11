@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { CommerceIntegrationRequestError } from '@/lib/integrations/commerceIntegrations'
+import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
 import {
   AUTOMATIC_FAIRE_EXACT_REFRESH_ATTENTION_MARKER,
   AUTOMATIC_FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_MARKER,
@@ -19,6 +20,7 @@ import {
 const ORDER_RECONCILIATION_INTERVAL = '30 minutes'
 const ORDER_RECONCILIATION_LEASE = '10 minutes'
 const WORKER_HEARTBEAT_KEY = 'commerce_order_reconciliation_worker_heartbeat'
+const ORDER_READ_ACCOUNT_SQL = commerceReadAccountSql('account')
 export const FAIRE_AUTO_PROMOTION_ATTENTION_CODE =
   AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER
 export const FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_CODE =
@@ -219,7 +221,7 @@ export async function readCommerceOrderReconciliationHealthFromPostgres() {
          ON activation.organization_id = account.organization_id
        WHERE account.integration_type = 'commerce'
          AND account.provider IN ('shopify', 'faire')
-         AND account.status <> 'error'
+         AND ${ORDER_READ_ACCOUNT_SQL}
          AND account.commerce_credential_generation > 0
          AND credential.credential_version =
              account.commerce_credential_generation
@@ -442,11 +444,10 @@ export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
          ) continuation ON true
          WHERE account.integration_type = 'commerce'
            AND account.provider IN ('shopify', 'faire')
-           -- Commerce API polling is authorized by the verified organization
-           -- credential and readable scope. Active is reserved for the
-           -- separate signed-receipt path, so a verified polling-only
-           -- connection may remain disabled without suppressing order reads.
-           AND account.status <> 'error'
+           -- Development preserves verified polling-only connections. Hosted
+           -- production is narrowed by ORDER_READ_ACCOUNT_SQL to active
+           -- production accounts before any provider read can be claimed.
+           AND ${ORDER_READ_ACCOUNT_SQL}
            AND account.commerce_credential_generation > 0
            AND credential.credential_version
              = account.commerce_credential_generation

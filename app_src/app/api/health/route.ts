@@ -40,7 +40,13 @@ import {
 import {
   readFaireProductImageProjectionHealthInPostgres,
 } from '@/lib/persistence/faireProductImageProjection'
-import { commerceIntakeRuntimeAvailable } from '@/lib/integrations/commerceIntake'
+import {
+  commerceReadRuntimeAvailable,
+} from '@/lib/integrations/commerceIntake'
+import {
+  commerceReadAccountSql,
+  commerceReadRuntimeSummary,
+} from '@/lib/integrations/commerceReadRuntime'
 import {
   faireAutomaticExactRefreshHealthSnapshot,
   faireAutomaticOrderPromotionHealthSnapshot,
@@ -59,6 +65,9 @@ import {
 import {
   suiteCrmNativeProductImageProjectionConfiguration,
 } from '@/lib/crm/suiteCrmNativeProductImageClient'
+import {
+  fulfillmentOptimizerRuntimeHealth,
+} from '@/lib/operations/fulfillmentOptimizerRuntimeConfig'
 import {
   readSuiteCrmProductImageIngestionHealthInPostgres,
 } from '@/lib/persistence/suiteCrmProductImageIngestion'
@@ -122,6 +131,20 @@ export async function GET() {
     const errors: string[] = []
     const warnings: string[] = []
     const storage = getStorageDriver()
+    const commerceReadReconciliation = commerceReadRuntimeSummary()
+    const fulfillmentOptimizer = fulfillmentOptimizerRuntimeHealth()
+    if (fulfillmentOptimizer.configurationStatus === 'invalid') {
+      errors.push(
+        `Fulfillment optimizer runtime configuration is invalid (${fulfillmentOptimizer.reason || 'ORTOOLS_CONFIGURATION_INVALID'}).`,
+      )
+    } else if (
+      railwayRuntime
+      && fulfillmentOptimizer.configurationStatus === 'disabled'
+    ) {
+      errors.push(
+        'Fulfillment optimizer is disabled in this Railway application environment.',
+      )
+    }
     let database: Record<string, unknown> = { status: 'not-configured' }
     let credentialStore: Record<string, unknown> = { status: 'not-configured' }
     let worker: Record<string, unknown> = { status: 'not-owned' }
@@ -131,9 +154,11 @@ export async function GET() {
     let quickBooksWorker: Record<string, unknown> = { status: 'not-owned' }
     let commerceCatalogWorker: Record<string, unknown> = {
       status: 'disabled',
+      runtimeAuthority: commerceReadReconciliation,
     }
     let commerceOrderReconciliationWorker: Record<string, unknown> = {
       status: 'disabled',
+      runtimeAuthority: commerceReadReconciliation,
       automaticShopifyOrderPromotion:
         shopifyAutomaticOrderPromotionHealthSnapshot(),
       automaticFaireOrderPromotion:
@@ -145,6 +170,7 @@ export async function GET() {
     }
     let shopifyInventoryRefreshWorker: Record<string, unknown> = {
       status: 'disabled',
+      runtimeAuthority: commerceReadReconciliation,
     }
     let shopifyWebhookReceipts: Record<string, unknown> = {
       status: 'disabled',
@@ -160,9 +186,11 @@ export async function GET() {
     }
     let faireInventoryPollWorker: Record<string, unknown> = {
       status: 'disabled',
+      runtimeAuthority: commerceReadReconciliation,
     }
     let commerceProductImageImportWorker: Record<string, unknown> = {
       status: 'disabled',
+      runtimeAuthority: commerceReadReconciliation,
     }
     let faireProductImageProjection: Record<string, unknown> = {
       status: 'unavailable',
@@ -3055,7 +3083,7 @@ export async function GET() {
           }
 
           if (
-            commerceIntakeRuntimeAvailable()
+            commerceReadRuntimeAvailable()
             && row?.operations_commerce_catalog_sync_migration_applied
           ) {
             const commerceHeartbeat =
@@ -3080,6 +3108,10 @@ export async function GET() {
               ? checkedAt - commerceHeartbeatAt
               : null
             const commerceQueue = (
+              // The health view must use the same lane-specific account
+              // authority as the worker. Historical work from a sandbox or a
+              // disabled account remains visible separately, but cannot make
+              // a production runtime unhealthy.
               await query<{
                 queued: number
                 retrying: number
@@ -3109,7 +3141,7 @@ export async function GET() {
                               AND account.id = job.integration_account_id
                               AND account.integration_type = 'commerce'
                               AND account.provider = job.provider
-                              AND account.status <> 'error'
+                              AND ${commerceReadAccountSql('account')}
                               AND account.commerce_credential_generation
                                 = job.credential_version
                               AND credential.credential_version
@@ -3175,7 +3207,7 @@ export async function GET() {
                      ON activation.organization_id = account.organization_id
                    WHERE account.integration_type = 'commerce'
                      AND account.provider = 'shopify'
-                     AND account.status <> 'error'
+                     AND ${commerceReadAccountSql('account')}
                      AND account.commerce_credential_generation
                        = refresh.credential_generation
                      AND credential.credential_version
@@ -3190,12 +3222,12 @@ export async function GET() {
                      ) ?| ARRAY['read_products', 'write_products']
                  )
                  SELECT
-                   count(*) FILTER (
-                     WHERE status = 'pending'
-                   )::integer AS queued,
-                   count(*) FILTER (
-                     WHERE status = 'failed'
-                   )::integer AS retrying,
+                  count(*) FILTER (
+                    WHERE status = 'pending' AND authoritative
+                  )::integer AS queued,
+                  count(*) FILTER (
+                    WHERE status = 'failed' AND authoritative
+                  )::integer AS retrying,
                    count(*) FILTER (
                      WHERE status = 'dead' AND authoritative
                    )::integer AS dead,
@@ -3203,19 +3235,59 @@ export async function GET() {
                      WHERE status = 'dead'
                    )::integer AS historical_dead,
                    count(*) FILTER (
-                     WHERE status = 'processing'
-                       AND locked_at < now() - interval '10 minutes'
+                    WHERE status = 'processing'
+                      AND authoritative
+                      AND locked_at < now() - interval '10 minutes'
                    )::integer AS stale_processing,
                    count(*) FILTER (
-                     WHERE status IN ('pending', 'failed')
-                       AND available_at < now() - interval '5 minutes'
+                    WHERE status IN ('pending', 'failed')
+                      AND authoritative
+                      AND available_at < now() - interval '5 minutes'
                    )::integer AS overdue,
                    (
-                     SELECT count(*)::integer
-                     FROM operations_commerce_sync_cursors cursor
-                     WHERE cursor.resource = 'products'
-                       AND cursor.reconciliation_status = 'running'
-                       AND NOT EXISTS (
+                    SELECT count(*)::integer
+                    FROM operations_commerce_sync_cursors cursor
+                    JOIN operations_integration_accounts account
+                      ON account.organization_id = cursor.organization_id
+                     AND account.id = cursor.integration_account_id
+                    JOIN operations_commerce_credentials credential
+                      ON credential.organization_id = account.organization_id
+                     AND credential.integration_account_id = account.id
+                    JOIN operations_commerce_product_intake_policies policy
+                      ON policy.organization_id = account.organization_id
+                     AND policy.integration_account_id = account.id
+                    JOIN operations_activation_scopes activation
+                      ON activation.organization_id = account.organization_id
+                    WHERE cursor.resource = 'products'
+                      AND cursor.reconciliation_status = 'running'
+                      AND account.integration_type = 'commerce'
+                      AND ${commerceReadAccountSql('account')}
+                      AND credential.credential_version
+                        = account.commerce_credential_generation
+                      AND credential.verification_status = 'verified'
+                      AND policy.policy_version
+                        = 'commerce-product-intake-policy-v1'
+                      AND activation.state IN ('shadow', 'active')
+                      AND (
+                        (
+                          account.provider = 'shopify'
+                          AND COALESCE(
+                            account.configuration->'grantedScopes',
+                            '[]'::jsonb
+                          ) ?| ARRAY['read_products', 'write_products']
+                        )
+                        OR (
+                          account.provider = 'faire'
+                          AND (
+                            credential.auth_mode = 'faire_brand_token'
+                            OR COALESCE(
+                              account.configuration->'requestedScopes',
+                              '[]'::jsonb
+                            ) ? 'READ_PRODUCTS'
+                          )
+                        )
+                      )
+                      AND NOT EXISTS (
                          SELECT 1
                          FROM operations_commerce_catalog_sync_jobs active
                          WHERE active.organization_id = cursor.organization_id
@@ -3287,6 +3359,7 @@ export async function GET() {
                 : 'stale',
               livenessStatus: loopReachable ? 'reachable' : 'stale',
               operationalStatus: operationalDegraded ? 'degraded' : 'ready',
+              runtimeAuthority: commerceReadReconciliation,
               heartbeatAt: commerceHeartbeat?.checkedAt || null,
               phase: commerceHeartbeat?.phase || null,
               ageMs: commerceAgeMs,
@@ -3337,7 +3410,7 @@ export async function GET() {
           }
 
           if (
-            commerceIntakeRuntimeAvailable()
+            commerceReadRuntimeAvailable()
             && row?.operations_commerce_continuations_migration_applied
             && row?.operations_commerce_normalization_migration_applied
             && row?.operations_commerce_order_attention_kinds_applied
@@ -3378,6 +3451,7 @@ export async function GET() {
                 : 'stale',
               livenessStatus: loopReachable ? 'reachable' : 'stale',
               operationalStatus: operationalDegraded ? 'degraded' : 'ready',
+              runtimeAuthority: commerceReadReconciliation,
               heartbeatAt: orderHeartbeat?.checkedAt || null,
               phase: orderHeartbeat?.phase || null,
               ageMs: orderAgeMs,
@@ -3446,7 +3520,7 @@ export async function GET() {
           }
 
           if (
-            commerceIntakeRuntimeAvailable()
+            commerceReadRuntimeAvailable()
             && row?.operations_shopify_inventory_refresh_migration_applied
             && row?.operations_shopify_inventory_webhook_refresh_applied
             && row?.operations_shopify_catalog_webhook_refresh_applied
@@ -3494,6 +3568,7 @@ export async function GET() {
                 : 'stale',
               livenessStatus: loopReachable ? 'reachable' : 'stale',
               operationalStatus: operationalDegraded ? 'degraded' : 'ready',
+              runtimeAuthority: commerceReadReconciliation,
               heartbeatAt: inventoryHeartbeat?.checkedAt || null,
               phase: inventoryHeartbeat?.phase || null,
               ageMs: inventoryAgeMs,
@@ -3535,7 +3610,7 @@ export async function GET() {
           }
 
           if (
-            commerceIntakeRuntimeAvailable()
+            commerceReadRuntimeAvailable()
             && row?.operations_faire_inventory_polling_applied
           ) {
             const faireHeartbeat =
@@ -3577,6 +3652,7 @@ export async function GET() {
                 : 'stale',
               livenessStatus: loopReachable ? 'reachable' : 'stale',
               operationalStatus: operationalDegraded ? 'degraded' : 'ready',
+              runtimeAuthority: commerceReadReconciliation,
               heartbeatAt: faireHeartbeat?.checkedAt || null,
               phase: faireHeartbeat?.phase || null,
               ageMs: faireAgeMs,
@@ -3615,7 +3691,7 @@ export async function GET() {
           }
 
           if (
-            commerceIntakeRuntimeAvailable()
+            commerceReadRuntimeAvailable()
             && row?.operations_commerce_product_image_imports_applied
             && row?.operations_commerce_product_image_fanout_applied
             && row?.operations_commerce_product_image_source_normalization_applied
@@ -3675,6 +3751,7 @@ export async function GET() {
                 : 'stale',
               livenessStatus: loopReachable ? 'reachable' : 'stale',
               operationalStatus: operationalDegraded ? 'degraded' : 'ready',
+              runtimeAuthority: commerceReadReconciliation,
               heartbeatAt: imageQueue.heartbeat?.checkedAt || null,
               phase: imageQueue.heartbeat?.phase || null,
               ageMs: imageAgeMs,
@@ -3934,6 +4011,7 @@ export async function GET() {
       agentResearchWorker,
       toastWorker,
       quickBooksWorker,
+      commerceReadReconciliation,
       commerceCatalogWorker,
       commerceOrderReconciliationWorker,
       shopifyInventoryRefreshWorker,
@@ -3943,6 +4021,7 @@ export async function GET() {
       faireProductImageProjection,
       suiteCrmNativeProductImageProjection,
       suiteCrmProductImageIngestion,
+      fulfillmentOptimizer,
       integrationQueues,
       operationsCommands,
       crm,

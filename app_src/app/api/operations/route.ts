@@ -40,6 +40,7 @@ import {
   planOperationsOrderFromPostgres,
   prepareOperationsShipmentExecutionFromPostgres,
   readOperationsWorkspaceFromPostgres,
+  recordWearablePickScanEvidenceFromPostgres,
   releaseOperationsOrderFromPostgres,
   retryOperationsCommerceFulfillmentExportFromPostgres,
   runMockOperationsProofFromPostgres,
@@ -67,16 +68,19 @@ import {
   prepareActiveFulfillmentExecutionFromShadowInPostgres,
 } from '@/lib/operations/activeFulfillmentExecutionPreparation'
 import type { ActiveCarrierDispatchAddressSnapshot } from '@/lib/operations/activeCarrierDispatchSnapshot'
+import type { WearablePickTaskScanEvidenceInput } from '@/lib/operations/wearablePicking'
 import { requireRequestUser } from '@/lib/requestUser'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
 export const runtime = 'nodejs'
 
-const MAX_REQUEST_BYTES = 64 * 1024
+const MAX_STANDARD_REQUEST_BYTES = 64 * 1024
+const MAX_REQUEST_BYTES = 384 * 1024
 const CUSTOMER_GLOBAL_ID = /^ga(?:[0-9]{7}|[0-9a-v]{12})$/
 const PRODUCT_GLOBAL_ID = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/
 const ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/
+const PICK_TASK_GLOBAL_ID = /^gpk(?:[0-9]{7}|[0-9a-v]{12})$/
 const CARTONIZATION_EVIDENCE_GLOBAL_ID = /^gcte(?:[0-9]{7}|[0-9a-v]{12})$/
 const PACKAGE_GLOBAL_ID = /^gpa(?:[0-9]{7}|[0-9a-v]{12})$/
 const EXCEPTION_GLOBAL_ID = /^gex(?:[0-9]{7}|[0-9a-v]{12})$/
@@ -174,6 +178,122 @@ function integerValue(value: unknown, label: string, minimum: number, maximum: n
     requestError('OPERATIONS_REQUEST_INVALID', `${label} must be an integer from ${minimum} to ${maximum}`)
   }
   return parsed
+}
+
+function wearableScanBarcodeValue(value: unknown, label: string) {
+  if (
+    typeof value !== 'string'
+    || value.length < 1
+    || value.length > 512
+    || value !== value.trim()
+    || /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    requestError('OPERATIONS_WEARABLE_SCAN_EVIDENCE_INVALID', `${label} is invalid`)
+  }
+  return value
+}
+
+function wearableScanCapturedAtValue(value: unknown, label: string) {
+  if (
+    typeof value !== 'string'
+    || value.length < 20
+    || value.length > 40
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value)
+  ) {
+    requestError('OPERATIONS_WEARABLE_SCAN_EVIDENCE_INVALID', `${label} is invalid`)
+  }
+  const parsed = new Date(value)
+  if (!Number.isFinite(parsed.getTime())) {
+    requestError('OPERATIONS_WEARABLE_SCAN_EVIDENCE_INVALID', `${label} is invalid`)
+  }
+  return parsed.toISOString()
+}
+
+function wearableScanObservationValue(
+  value: unknown,
+  label: string,
+): WearablePickTaskScanEvidenceInput['location'] {
+  const observation = record(
+    value,
+    'OPERATIONS_WEARABLE_SCAN_EVIDENCE_INVALID',
+    label,
+  )
+  assertFields(
+    observation,
+    new Set(['barcode', 'capturedAt', 'source']),
+    'OPERATIONS_WEARABLE_SCAN_EVIDENCE_INVALID',
+    label,
+  )
+  const source = String(observation.source || '')
+  if (source !== 'iphone_camera' && source !== 'meta') {
+    requestError(
+      'OPERATIONS_WEARABLE_SCAN_EVIDENCE_INVALID',
+      `${label} source is invalid`,
+    )
+  }
+  return {
+    barcode: wearableScanBarcodeValue(observation.barcode, `${label} barcode`),
+    capturedAt: wearableScanCapturedAtValue(
+      observation.capturedAt,
+      `${label} capture time`,
+    ),
+    source,
+  }
+}
+
+function wearablePickScanEvidenceValue(
+  value: unknown,
+): WearablePickTaskScanEvidenceInput[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 200) {
+    requestError(
+      'OPERATIONS_WEARABLE_SCAN_EVIDENCE_INVALID',
+      'Scan evidence must contain between one and 200 pick tasks',
+    )
+  }
+  const seen = new Set<string>()
+  return value.map((entry, index) => {
+    const evidence = record(
+      entry,
+      'OPERATIONS_WEARABLE_SCAN_EVIDENCE_INVALID',
+      `Scan evidence ${index + 1}`,
+    )
+    assertFields(
+      evidence,
+      new Set(['pickTaskGlobalId', 'policyRowVersion', 'location', 'product']),
+      'OPERATIONS_WEARABLE_SCAN_EVIDENCE_INVALID',
+      `Scan evidence ${index + 1}`,
+    )
+    const pickTaskGlobalId = globalIdValue(
+      evidence.pickTaskGlobalId,
+      `Scan evidence ${index + 1} pick task`,
+      PICK_TASK_GLOBAL_ID,
+    )
+    if (seen.has(pickTaskGlobalId)) {
+      requestError(
+        'OPERATIONS_WEARABLE_SCAN_EVIDENCE_DUPLICATE',
+        'Scan evidence contains the same pick task more than once',
+        409,
+      )
+    }
+    seen.add(pickTaskGlobalId)
+    return {
+      pickTaskGlobalId,
+      policyRowVersion: integerValue(
+        evidence.policyRowVersion,
+        `Scan evidence ${index + 1} policy version`,
+        1,
+        2_147_483_647,
+      ),
+      location: wearableScanObservationValue(
+        evidence.location,
+        `Scan evidence ${index + 1} location observation`,
+      ),
+      product: wearableScanObservationValue(
+        evidence.product,
+        `Scan evidence ${index + 1} product observation`,
+      ),
+    }
+  })
 }
 
 function optionalNumberValue(value: unknown, label: string, minimum: number, maximum: number): number | null {
@@ -652,7 +772,22 @@ async function requestBody(req: NextRequest): Promise<Record<string, unknown>> {
     requestError('OPERATIONS_REQUEST_TOO_LARGE', 'Operations command exceeded the supported size', 413)
   }
   try {
-    return record(JSON.parse(raw) as unknown, 'OPERATIONS_REQUEST_INVALID', 'Operations command')
+    const parsed = record(
+      JSON.parse(raw) as unknown,
+      'OPERATIONS_REQUEST_INVALID',
+      'Operations command',
+    )
+    if (
+      Buffer.byteLength(raw, 'utf8') > MAX_STANDARD_REQUEST_BYTES
+      && parsed.action !== 'record-pick-scan-evidence'
+    ) {
+      requestError(
+        'OPERATIONS_REQUEST_TOO_LARGE',
+        'Operations command exceeded the supported size',
+        413,
+      )
+    }
+    return parsed
   } catch (error) {
     if (error instanceof OperationsRequestError) throw error
     requestError('OPERATIONS_REQUEST_INVALID', 'A valid operations command is required')
@@ -1173,8 +1308,37 @@ export async function POST(req: NextRequest) {
       })
       return json({ ok: true, capabilities, result })
     }
+    if (action === 'record-pick-scan-evidence') {
+      if (!capabilities.canView || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to record warehouse scan evidence',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'orderGlobalId',
+          'expectedRowVersion',
+          'scanEvidence',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await recordWearablePickScanEvidenceFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
+        expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
+        scanEvidence: wearablePickScanEvidenceValue(body.scanEvidence),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
     if (action === 'confirm-picks') {
-      if (!capabilities.canManage || !capabilities.canExecute) {
+      if (!capabilities.canView || !capabilities.canExecute) {
         return json({
           ok: false,
           error: 'You do not have permission to confirm warehouse picks',
@@ -1183,7 +1347,13 @@ export async function POST(req: NextRequest) {
       }
       assertFields(
         body,
-        new Set(['action', 'orderGlobalId', 'expectedRowVersion', 'reason']),
+        new Set([
+          'action',
+          'orderGlobalId',
+          'expectedRowVersion',
+          'reason',
+          'scanEvidenceIdempotencyKey',
+        ]),
         'OPERATIONS_REQUEST_INVALID',
         'Operations command',
       )
@@ -1193,6 +1363,12 @@ export async function POST(req: NextRequest) {
         orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
         expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
         reason: textValue(body.reason, 'Pick confirmation reason', 500),
+        scanEvidenceIdempotencyKey: textValue(
+          body.scanEvidenceIdempotencyKey,
+          'Scan evidence idempotency key',
+          200,
+          false,
+        ) || undefined,
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })
@@ -1594,6 +1770,7 @@ export async function POST(req: NextRequest) {
               'Customer notification exception reason',
               500,
             ),
+        canActivate: capabilities.canActivate,
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })

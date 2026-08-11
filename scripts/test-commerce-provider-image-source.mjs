@@ -14,6 +14,9 @@ const requireFromApp = createRequire(
 )
 const ts = requireFromApp('typescript')
 
+process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED = '1'
+process.env.CLAWPILOT_ENV = 'production'
+
 function loadTypeScriptModule(path, { mocks = {} } = {}) {
   const output = ts.transpileModule(
     readFileSync(resolve(root, path), 'utf8'),
@@ -134,6 +137,9 @@ function fixture(overrides = {}) {
     'app_src/lib/integrations/commerceProviderImageSource.ts',
     {
       mocks: {
+        '@/lib/integrations/commerceReadRuntime': loadTypeScriptModule(
+          'app_src/lib/integrations/commerceReadRuntime.ts',
+        ),
         '@/lib/integrations/commerceCredentialCrypto': {
           decryptCommerceCredential() {
             return values.runtime.provider === 'shopify'

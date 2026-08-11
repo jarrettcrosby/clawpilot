@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import {
-  commerceIntakeRuntimeAvailable,
+  commerceReadRuntimeAvailable,
+  commerceReadRuntimeMode,
   executeCommerceFaireOrderExactRefresh,
   executeCommerceOrderPage,
 } from '@/lib/integrations/commerceIntake'
@@ -117,7 +118,10 @@ function count(value: unknown) {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0
 }
 
-function assertReconciliationFence(command: Record<string, unknown>) {
+function assertReconciliationFence(
+  command: Record<string, unknown>,
+  productionReadOnly = false,
+) {
   const automaticCustomerResolution = record(
     command.automaticCustomerResolution,
   )
@@ -137,6 +141,14 @@ function assertReconciliationFence(command: Record<string, unknown>) {
       && (
         automaticCustomerResolution.providerWrites !== 0
         || automaticCustomerResolution.syncCursorAdvanced !== false
+      )
+    )
+    || (
+      productionReadOnly
+      && (
+        Object.keys(automaticCustomerResolution).length > 0
+        || Object.keys(automaticShopifyOrderPromotion).length > 0
+        || Object.keys(automaticFaireOrderPromotion).length > 0
       )
     )
     || (
@@ -267,7 +279,7 @@ export async function processCommerceOrderReconciliation(input: {
   /** Deterministic test seam; API callers never supply this. */
   clock?: () => number
 }) {
-  if (!commerceIntakeRuntimeAvailable()) {
+  if (!commerceReadRuntimeAvailable()) {
     return {
       skipped: true,
       reason: 'commerce-intake-disabled',
@@ -345,6 +357,9 @@ export async function processCommerceOrderReconciliation(input: {
   const customerResolutionFailureCodes: Record<string, number> = {}
   const failureCodes: Record<string, number> = {}
   const clock = input.clock || Date.now
+  // Optional chaining keeps isolated VM contract tests compatible with their
+  // intentionally minimal integration mock; the real module always exports it.
+  const productionReadOnly = commerceReadRuntimeMode?.() === 'production'
   for (const claimedTarget of targets) {
     let target = claimedTarget
     try {
@@ -564,7 +579,7 @@ export async function processCommerceOrderReconciliation(input: {
           recordsHeld: projection.recordsHeld,
           continuationBatchNumber: projection.continuationBatchNumber,
         }
-        assertReconciliationFence(command)
+        assertReconciliationFence(command, productionReadOnly)
         if (pageProviderRecordsSeen > maximumNextPageRecords) {
           throw reconciliationError(
             'COMMERCE_ORDER_RECONCILIATION_PAGE_RECORD_LIMIT_EXCEEDED',
@@ -630,6 +645,7 @@ export async function processCommerceOrderReconciliation(input: {
 
         if (
           target.provider === 'faire'
+          && !productionReadOnly
           && !targetFaireExactRefreshPaused
           && targetFaireExactRefreshAttempted
             < MAX_FAIRE_EXACT_REFRESHES_PER_RECONCILIATION

@@ -1,12 +1,43 @@
 import Foundation
+import ImageIO
+import UIKit
 import WatchConnectivity
 import ClawPilotPickingCore
 
+struct PhoneWatchCommandOutcome: Sendable {
+    let succeeded: Bool
+    let message: String
+
+    static func success(_ message: String) -> Self {
+        Self(succeeded: true, message: message)
+    }
+
+    static func failure(_ message: String) -> Self {
+        Self(succeeded: false, message: message)
+    }
+}
+
 @MainActor
 final class PhoneWatchBridge: NSObject, WCSessionDelegate {
+    private enum Key {
+        static let pickSnapshot = "pickSnapshot"
+        static let productImageData = "pickProductImageData"
+        static let productImageSource = "pickProductImageSource"
+        static let commandResult = "pickCommandResult"
+    }
+
+    private static let maximumSourceImageBytes = 12 * 1_024 * 1_024
+    private static let maximumWatchImageBytes =
+        WatchConnectivityPayloadBudget.maximumProductImageBytes
+
     private let session: WCSession? = WCSession.isSupported() ? .default : nil
     private var handledCommandIDs: [String] = []
-    var onCommand: (@MainActor (WatchPickCommand) -> Void)?
+    private var latestSnapshotData = Data()
+    private var latestProductImageURL: URL?
+    private var latestProductImageData: Data?
+    private var latestCommandResultData: Data?
+    private var imageTask: Task<Void, Never>?
+    var onCommand: (@MainActor (WatchPickCommand) async -> PhoneWatchCommandOutcome)?
 
     override init() {
         super.init()
@@ -14,20 +45,147 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate {
         session?.activate()
     }
 
+    deinit {
+        imageTask?.cancel()
+    }
+
     func publish(_ snapshot: WatchPickSnapshot?) {
-        guard let session else { return }
-        let data = snapshot.flatMap { try? JSONEncoder.clawPilot.encode($0) } ?? Data()
-        try? session.updateApplicationContext(["pickSnapshot": data])
-        if session.isReachable {
-            session.sendMessageData(data, replyHandler: nil, errorHandler: nil)
+        latestSnapshotData = snapshot.flatMap { try? JSONEncoder.clawPilot.encode($0) } ?? Data()
+        let productImageURL = snapshot?.current?.productImageURL
+
+        if productImageURL != latestProductImageURL {
+            imageTask?.cancel()
+            imageTask = nil
+            latestProductImageURL = productImageURL
+            latestProductImageData = nil
+            publishCurrentContext()
+            prepareProductImage(productImageURL)
+            return
         }
+
+        publishCurrentContext()
+        if latestProductImageData == nil {
+            prepareProductImage(productImageURL)
+        }
+    }
+
+    private func prepareProductImage(_ url: URL?) {
+        guard let url, imageTask == nil else { return }
+        imageTask = Task { [weak self] in
+            defer {
+                if self?.latestProductImageURL == url {
+                    self?.imageTask = nil
+                }
+            }
+            do {
+                var request = URLRequest(url: url)
+                request.timeoutInterval = 15
+                request.setValue("image/*", forHTTPHeaderField: "Accept")
+                let (sourceData, response) = try await URLSession.shared.data(for: request)
+                guard !Task.isCancelled,
+                      let response = response as? HTTPURLResponse,
+                      (200..<300).contains(response.statusCode),
+                      !sourceData.isEmpty,
+                      sourceData.count <= Self.maximumSourceImageBytes,
+                      let jpeg = Self.watchJPEGThumbnail(from: sourceData),
+                      jpeg.count <= Self.maximumWatchImageBytes,
+                      self?.latestProductImageURL == url else { return }
+                self?.latestProductImageData = jpeg
+                self?.publishCurrentContext()
+            } catch {
+                // The URL remains in the pick snapshot. A later refresh retries
+                // preparation without making the Watch download a full-size asset.
+            }
+        }
+    }
+
+    private func publishCurrentContext() {
+        guard let session, session.activationState == .activated else { return }
+        var context: [String: Any] = [Key.pickSnapshot: latestSnapshotData]
+        if let latestProductImageURL, let latestProductImageData {
+            context[Key.productImageSource] = latestProductImageURL.absoluteString
+            context[Key.productImageData] = latestProductImageData
+        }
+        if let latestCommandResultData {
+            context[Key.commandResult] = latestCommandResultData
+        }
+        if Self.contextByteCount(context) > WatchConnectivityPayloadBudget.maximumApplicationContextBytes {
+            context.removeValue(forKey: Key.productImageData)
+            context.removeValue(forKey: Key.productImageSource)
+        }
+        assert(
+            Self.contextByteCount(context)
+                <= WatchConnectivityPayloadBudget.maximumApplicationContextBytes,
+            "Watch current-state context exceeded the ClawPilot transfer budget."
+        )
+        try? session.updateApplicationContext(context)
+        if session.isReachable {
+            session.sendMessage(context, replyHandler: nil, errorHandler: nil)
+        }
+    }
+
+    private static func watchJPEGThumbnail(from sourceData: Data) -> Data? {
+        guard let imageSource = CGImageSourceCreateWithData(sourceData as CFData, nil),
+              let sourceThumbnail = CGImageSourceCreateThumbnailAtIndex(
+                imageSource,
+                0,
+                [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: 280,
+                    kCGImageSourceShouldCacheImmediately: true,
+                ] as CFDictionary
+              ) else { return nil }
+        let sourceImage = UIImage(cgImage: sourceThumbnail)
+
+        for maximumDimension in [280.0, 220.0, 160.0] {
+            let ratio = min(
+                1,
+                maximumDimension / max(sourceImage.size.width, sourceImage.size.height)
+            )
+            let size = CGSize(
+                width: max(1, (sourceImage.size.width * ratio).rounded()),
+                height: max(1, (sourceImage.size.height * ratio).rounded())
+            )
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1
+            format.opaque = true
+            let thumbnail = UIGraphicsImageRenderer(size: size, format: format).image { context in
+                UIColor.white.setFill()
+                context.fill(CGRect(origin: .zero, size: size))
+                sourceImage.draw(in: CGRect(origin: .zero, size: size))
+            }
+            for quality in [0.78, 0.62, 0.46] {
+                if let data = thumbnail.jpegData(compressionQuality: quality),
+                   data.count <= maximumWatchImageBytes {
+                    return data
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func contextByteCount(_ context: [String: Any]) -> Int {
+        (try? PropertyListSerialization.data(
+            fromPropertyList: context,
+            format: .binary,
+            options: 0
+        ).count) ?? .max
     }
 
     nonisolated func session(
         _ session: WCSession,
         activationDidCompleteWith activationState: WCSessionActivationState,
         error: Error?
-    ) {}
+    ) {
+        guard activationState == .activated, error == nil else { return }
+        Task { @MainActor in
+            self.publishCurrentContext()
+            if self.latestProductImageData == nil {
+                self.prepareProductImage(self.latestProductImageURL)
+            }
+        }
+    }
 
     nonisolated func sessionDidBecomeInactive(_ session: WCSession) {}
     nonisolated func sessionDidDeactivate(_ session: WCSession) { session.activate() }
@@ -47,7 +205,7 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate {
             replyHandler(Data("The Watch command was invalid.".utf8))
             return
         }
-        replyHandler(Data("Command received by iPhone.".utf8))
+        replyHandler(Data("Command accepted by iPhone.".utf8))
         Task { @MainActor in self.receiveCommand(command) }
     }
 
@@ -55,7 +213,25 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate {
         guard !handledCommandIDs.contains(command.id) else { return }
         handledCommandIDs.append(command.id)
         if handledCommandIDs.count > 32 { handledCommandIDs.removeFirst() }
-        onCommand?(command)
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let outcome = await self.onCommand?(command)
+                ?? .failure("The iPhone could not handle this Watch command.")
+            self.publishCommandResult(WatchPickCommandResult(
+                command: command,
+                succeeded: outcome.succeeded,
+                message: outcome.message
+            ))
+        }
+    }
+
+    private func publishCommandResult(_ result: WatchPickCommandResult) {
+        guard let session,
+              session.activationState == .activated,
+              let data = try? JSONEncoder.clawPilot.encode(result) else { return }
+        latestCommandResultData = data
+        publishCurrentContext()
     }
 }
 

@@ -8,9 +8,12 @@ const development = read('clients/apple/Config/Development.xcconfig')
 const production = read('clients/apple/Config/Production.xcconfig')
 const association = read('app_src/lib/appleAppLinks.ts')
 const simulatorBuilds = read('clients/apple/run-xcode-simulator-builds.sh')
+const phonePrivacy = read('clients/apple/Apps/iPhone/PrivacyInfo.xcprivacy')
+const watchPrivacy = read('clients/apple/Apps/Watch/PrivacyInfo.xcprivacy')
 
 for (const fragment of [
   'Development: debug',
+  'DevelopmentRelease: release',
   'Production: release',
   'ClawPilotPickingPhoneDev:',
   'ClawPilotPickingWatchDev:',
@@ -19,6 +22,20 @@ for (const fragment of [
 ]) {
   assert.ok(project.includes(fragment), `Xcode project is missing ${fragment}`)
 }
+
+assert.match(
+  project,
+  /ClawPilotPickingPhoneDev:[\s\S]*?run:\n\s+config: Development[\s\S]*?profile:\n\s+config: DevelopmentRelease[\s\S]*?archive:\n\s+config: DevelopmentRelease/,
+)
+assert.match(
+  project,
+  /ClawPilotPickingWatchDev:[\s\S]*?run:\n\s+config: Development[\s\S]*?profile:\n\s+config: DevelopmentRelease[\s\S]*?archive:\n\s+config: DevelopmentRelease/,
+)
+assert.equal(
+  (project.match(/DevelopmentRelease: Config\/Development\.xcconfig/g) || []).length,
+  2,
+  'Both app targets must use development IDs and origin for DevelopmentRelease',
+)
 
 for (const fragment of [
   'CLAWPILOT_DISPLAY_NAME = ClawPilot Dev',
@@ -53,5 +70,34 @@ for (const scheme of [
 ]) {
   assert.ok(simulatorBuilds.includes(scheme), `Simulator gate is missing ${scheme}`)
 }
+
+assert.match(
+  simulatorBuilds,
+  /-scheme ClawPilotPickingPhoneDev \\\n+\s+-configuration DevelopmentRelease/,
+)
+assert.match(
+  simulatorBuilds,
+  /DevelopmentRelease-iphonesimulator\/ClawPilotPicking\.app/,
+)
+assert.match(simulatorBuilds, /verify_privacy_manifests "\$\{phone_app\}"/)
+
+for (const fragment of [
+  'NSPrivacyAccessedAPICategoryUserDefaults',
+  'CA92.1',
+  'NSPrivacyAccessedAPICategoryFileTimestamp',
+  'C617.1',
+]) {
+  assert.ok(phonePrivacy.includes(fragment), `iPhone privacy manifest is missing ${fragment}`)
+}
+for (const fragment of [
+  'NSPrivacyAccessedAPICategoryUserDefaults',
+  'CA92.1',
+]) {
+  assert.ok(watchPrivacy.includes(fragment), `Watch privacy manifest is missing ${fragment}`)
+}
+assert.ok(
+  !watchPrivacy.includes('NSPrivacyAccessedAPICategoryFileTimestamp'),
+  'Watch must not declare the iPhone-only file metadata reason',
+)
 
 console.log('Apple development/production environment split contract passed')

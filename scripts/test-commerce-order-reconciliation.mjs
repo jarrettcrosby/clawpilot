@@ -49,6 +49,11 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
     ...globals,
     require(specifier) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) return mocks[specifier]
+      if (specifier === '@/lib/integrations/commerceReadRuntime') {
+        return loadTypeScriptModule(
+          'app_src/lib/integrations/commerceReadRuntime.ts',
+        )
+      }
       if (specifier === '@/lib/persistence/commerceIntake') {
         return {
           async markAutomaticFaireOrderPromotionAttentionInPostgres() {
@@ -796,7 +801,7 @@ includes(persistence, [
   "? 'read_orders'",
   "credential.auth_mode = 'faire_brand_token'",
   "? 'READ_ORDERS'",
-  "account.status <> 'error'",
+  'ORDER_READ_ACCOUNT_SQL',
   "activation.state IN ('shadow', 'active')",
   "reconciliation_status = 'running'",
   "reconciliation_status = 'succeeded'",
@@ -1568,7 +1573,7 @@ const disabledWorker = loadTypeScriptModule(
   {
     mocks: {
       '@/lib/integrations/commerceIntake': {
-        commerceIntakeRuntimeAvailable: () => false,
+        commerceReadRuntimeAvailable: () => false,
         async executeCommerceOrderPage() {
           assert.fail('A disabled runtime must not read a provider page')
         },
@@ -1623,7 +1628,7 @@ let page = 0
 const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWorker.ts', {
   mocks: {
     '@/lib/integrations/commerceIntake': {
-      commerceIntakeRuntimeAvailable: () => true,
+      commerceReadRuntimeAvailable: () => true,
       async executeCommerceOrderPage(input) {
         assert.equal(input.actorEmail, 'system:commerce-order-reconciliation')
         assert.ok(
@@ -1831,7 +1836,7 @@ const shopifyWorker = loadTypeScriptModule(
   {
     mocks: {
       '@/lib/integrations/commerceIntake': {
-        commerceIntakeRuntimeAvailable: () => true,
+        commerceReadRuntimeAvailable: () => true,
         async executeCommerceOrderPage() {
           return {
             command: {
@@ -1972,7 +1977,7 @@ const recoveredWorker = loadTypeScriptModule(
   {
     mocks: {
       '@/lib/integrations/commerceIntake': {
-        commerceIntakeRuntimeAvailable: () => true,
+        commerceReadRuntimeAvailable: () => true,
         async executeCommerceOrderPage(input) {
           recoveredTrace.requestedKeys.push(input.idempotencyKey)
           assert.equal(input.continuationRunGlobalId, 'gcir0000099')
@@ -2055,7 +2060,7 @@ const exactRefreshWorker = loadTypeScriptModule(
   {
     mocks: {
       '@/lib/integrations/commerceIntake': {
-        commerceIntakeRuntimeAvailable: () => true,
+        commerceReadRuntimeAvailable: () => true,
         async executeCommerceOrderPage() {
           exactRefreshTrace.listPages += 1
           return {
@@ -2352,7 +2357,7 @@ const markerFailureWorker = loadTypeScriptModule(
   {
     mocks: {
       '@/lib/integrations/commerceIntake': {
-        commerceIntakeRuntimeAvailable: () => true,
+        commerceReadRuntimeAvailable: () => true,
         async executeCommerceOrderPage() {
           return {
             command: {
@@ -2449,7 +2454,7 @@ const boundedWorker = loadTypeScriptModule(
   {
     mocks: {
       '@/lib/integrations/commerceIntake': {
-        commerceIntakeRuntimeAvailable: () => true,
+        commerceReadRuntimeAvailable: () => true,
         async executeCommerceOrderPage() {
           boundedTrace.pages += 1
           const batchNumber = boundedTrace.pages
@@ -2519,7 +2524,7 @@ const timeWorker = loadTypeScriptModule(
   {
     mocks: {
       '@/lib/integrations/commerceIntake': {
-        commerceIntakeRuntimeAvailable: () => true,
+        commerceReadRuntimeAvailable: () => true,
         async executeCommerceOrderPage() {
           timeTrace.pages += 1
           return {
@@ -2583,7 +2588,7 @@ const repeatedWorker = loadTypeScriptModule(
   {
     mocks: {
       '@/lib/integrations/commerceIntake': {
-        commerceIntakeRuntimeAvailable: () => true,
+        commerceReadRuntimeAvailable: () => true,
         async executeCommerceOrderPage() {
           repeatedTrace.pages += 1
           const first = repeatedTrace.pages === 1
@@ -2649,7 +2654,7 @@ const oversizedWorker = loadTypeScriptModule(
   {
     mocks: {
       '@/lib/integrations/commerceIntake': {
-        commerceIntakeRuntimeAvailable: () => true,
+        commerceReadRuntimeAvailable: () => true,
         async executeCommerceOrderPage() {
           oversizedProviderCalls += 1
           throw new Error('The terminal budget must stop before provider I/O')
@@ -2689,7 +2694,7 @@ const failedWorker = loadTypeScriptModule(
   {
     mocks: {
       '@/lib/integrations/commerceIntake': {
-        commerceIntakeRuntimeAvailable: () => true,
+        commerceReadRuntimeAvailable: () => true,
         async executeCommerceOrderPage() {
           const error = new Error('sensitive provider response omitted')
           error.code = '23514'
@@ -2761,7 +2766,7 @@ const completedRouteModule = loadTypeScriptModule(
         },
       },
       '@/lib/integrations/commerceIntake': {
-        commerceIntakeRuntimeAvailable: () => true,
+        commerceReadRuntimeAvailable: () => true,
       },
       '@/lib/commerceOrderReconciliationWorker': {
         async processCommerceOrderReconciliation() {
@@ -2859,7 +2864,7 @@ const route = read('app_src/app/api/integrations/commerce/orders/process/route.t
 includes(route, [
   'PIPELINE_OUTBOX_WORKER_SECRET',
   'timingSafeEqual',
-  'commerceIntakeRuntimeAvailable()',
+  'commerceReadRuntimeAvailable()',
   'isPostgresStorageEnabled()',
   'processCommerceOrderReconciliation',
   'recordCommerceOrderReconciliationWorkerHeartbeatInPostgres',
@@ -2874,7 +2879,7 @@ includes(route, [
   "phase: 'completed'",
   "phase: 'failed'",
   'providerReadOnly: true',
-  'localCanonicalOrderWritesPossible: true',
+  "commerceReadRuntimeMode?.() === 'development'",
   'shopifyAutomaticOrderPromotionHealthSnapshot',
   'faireAutomaticOrderPromotionHealthSnapshot',
   'faireAutomaticExactRefreshHealthSnapshot',
