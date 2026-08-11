@@ -69,6 +69,7 @@ import type {
   OperationsExceptionListItem,
   OperationsExceptionStatus,
   OperationsExceptionUpdateResult,
+  OperationsExternalFulfillmentReconciliationResult,
   OperationsOrderCommandResult,
   OperationsOrderDetail,
   OperationsOrderListItem,
@@ -138,6 +139,7 @@ type OperationsPayload = {
     | OperationsActivationUpdateResult
     | OperationsCommerceActivePreparationResult
     | OperationsCommerceActiveTransitionResult
+    | OperationsExternalFulfillmentReconciliationResult
     | OperationsOrderCommandResult
     | OperationsPackingSlipCommandResult
     | OperationsSandboxLabelCommandResult
@@ -860,6 +862,7 @@ function OrderDetailDrawer({
   onPlan,
   onRelease,
   onConfirmPicks,
+  onReconcileExternalFulfillment,
   onVerifyPack,
   onPrepareFulfillment,
   onGeneratePackingSlip,
@@ -892,6 +895,7 @@ function OrderDetailDrawer({
   onPlan: () => void
   onRelease: () => void
   onConfirmPicks: () => void
+  onReconcileExternalFulfillment: () => void
   onVerifyPack: () => void
   onPrepareFulfillment: () => void
   onGeneratePackingSlip: (packageGlobalId: string) => void
@@ -916,6 +920,9 @@ function OrderDetailDrawer({
   const { measurementSystem } = useMeasurementSystem()
   const releaseAction = order?.availableActions?.find((item) => item.action === 'release_to_warehouse')
   const confirmPicksAction = order?.availableActions?.find((item) => item.action === 'confirm_picks')
+  const reconcileExternalFulfillmentAction = order?.availableActions?.find(
+    (item) => item.action === 'reconcile_external_fulfillment',
+  )
   const verifyPackAction = order?.availableActions?.find((item) => item.action === 'verify_pack')
   const prepareFulfillmentAction = order?.availableActions?.find((item) => item.action === 'prepare_fulfillment')
   const confirmShipmentAction = order?.availableActions?.find((item) => item.action === 'confirm_shipment')
@@ -927,7 +934,9 @@ function OrderDetailDrawer({
   const primaryAction = canPlanImportedOrder
     ? undefined
     : order?.status === 'released'
-      ? confirmPicksAction
+      ? order.shopifyExternalFulfillmentReconciliationRequired
+        ? reconcileExternalFulfillmentAction
+        : confirmPicksAction
       : order?.status === 'picking'
         ? verifyPackAction
         : order?.status === 'packed'
@@ -938,6 +947,8 @@ function OrderDetailDrawer({
             ? releaseAction
             : undefined
   const confirmingPicks = primaryAction?.action === 'confirm_picks'
+  const reconcilingExternalFulfillment =
+    primaryAction?.action === 'reconcile_external_fulfillment'
   const verifyingPack = primaryAction?.action === 'verify_pack'
   const preparingFulfillment = primaryAction?.action === 'prepare_fulfillment'
   const confirmingShipment = primaryAction?.action === 'confirm_shipment'
@@ -1110,8 +1121,10 @@ function OrderDetailDrawer({
               )}
               {primaryAction?.blockedReason && <Alert severity="info" sx={{ mb: 1.5 }}>{primaryAction.blockedReason}</Alert>}
               {primaryAction && (
-                <Tooltip title={primaryAction.blockedReason || (confirmingPicks
-                  ? 'Confirm every ready pick task and complete the released wave'
+                <Tooltip title={primaryAction.blockedReason || (reconcilingExternalFulfillment
+                  ? 'Read exact live Shopify fulfillment authority, then cancel stale unpicked warehouse work without writing to Shopify or notifying the customer again'
+                  : confirmingPicks
+                    ? 'Confirm every ready pick task and complete the released wave'
                   : verifyingPack
                     ? 'Verify the carton plan and record package-level billing evidence'
                     : preparingFulfillment
@@ -1125,8 +1138,10 @@ function OrderDetailDrawer({
                       variant="contained"
                       startIcon={busy
                         ? <CircularProgress size={16} />
-                        : confirmingPicks
-                          ? <TaskAltRounded />
+                        : reconcilingExternalFulfillment
+                          ? <ReplayRounded />
+                          : confirmingPicks
+                            ? <TaskAltRounded />
                           : verifyingPack
                             ? <Inventory2Rounded />
                             : preparingFulfillment
@@ -1135,8 +1150,10 @@ function OrderDetailDrawer({
                                 ? <LocalShippingRounded />
                                 : <WarehouseRounded />}
                       disabled={!primaryAction.enabled || busy}
-                      onClick={confirmingPicks
-                        ? onConfirmPicks
+                      onClick={reconcilingExternalFulfillment
+                        ? onReconcileExternalFulfillment
+                        : confirmingPicks
+                          ? onConfirmPicks
                         : verifyingPack
                           ? onVerifyPack
                           : preparingFulfillment
@@ -1146,8 +1163,10 @@ function OrderDetailDrawer({
                               : onRelease}
                     >
                       {busy
-                        ? confirmingPicks
-                          ? 'Confirming picks'
+                        ? reconcilingExternalFulfillment
+                          ? 'Reconciling fulfillment'
+                          : confirmingPicks
+                            ? 'Confirming picks'
                           : verifyingPack
                             ? 'Verifying packages'
                             : preparingFulfillment
@@ -2142,6 +2161,14 @@ export default function OperationsSection({
   const [confirmPicksReason, setConfirmPicksReason] = useState('Confirm all ready pick tasks for the released wave')
   const [confirmPicksIdempotencyKey, setConfirmPicksIdempotencyKey] = useState('')
   const [confirmingPicks, setConfirmingPicks] = useState(false)
+  const [externalFulfillmentOpen, setExternalFulfillmentOpen] = useState(false)
+  const [externalFulfillmentReason, setExternalFulfillmentReason] = useState(
+    'Reconcile exact Shopify fulfillment and cancel stale unpicked warehouse work',
+  )
+  const [externalFulfillmentIdempotencyKey, setExternalFulfillmentIdempotencyKey] =
+    useState('')
+  const [reconcilingExternalFulfillment, setReconcilingExternalFulfillment] =
+    useState(false)
   const [verifyPackOpen, setVerifyPackOpen] = useState(false)
   const [verifyPackReason, setVerifyPackReason] = useState('Verify the carton plan after all warehouse picks are complete')
   const [verifyPackIdempotencyKey, setVerifyPackIdempotencyKey] = useState('')
@@ -2684,6 +2711,74 @@ export default function OperationsSection({
       setError(caught instanceof Error ? caught.message : 'Warehouse picks could not be confirmed')
     } finally {
       setConfirmingPicks(false)
+    }
+  }
+
+  const openExternalFulfillmentReconciliation = () => {
+    setExternalFulfillmentReason(
+      'Reconcile exact Shopify fulfillment and cancel stale unpicked warehouse work',
+    )
+    setExternalFulfillmentIdempotencyKey(
+      `operations-shopify-external-fulfillment:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+    )
+    setExternalFulfillmentOpen(true)
+  }
+
+  const closeExternalFulfillmentReconciliation = () => {
+    if (reconcilingExternalFulfillment) return
+    setExternalFulfillmentOpen(false)
+    setExternalFulfillmentIdempotencyKey('')
+  }
+
+  const reconcileExternalFulfillment = async (event: FormEvent) => {
+    event.preventDefault()
+    if (
+      !detail
+      || !externalFulfillmentReason.trim()
+      || !externalFulfillmentIdempotencyKey
+    ) return
+    setReconcilingExternalFulfillment(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': externalFulfillmentIdempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'reconcile-external-fulfillment',
+          orderGlobalId: detail.globalId,
+          expectedRowVersion: detail.rowVersion,
+          reason: externalFulfillmentReason.trim(),
+        }),
+      })
+      const payload = await response.json() as OperationsPayload
+      if (
+        !response.ok
+        || !payload.result
+        || !('reconciliationGlobalId' in payload.result)
+        || !('providerFulfillmentName' in payload.result)
+      ) {
+        throw new Error(
+          payload.error || 'Shopify fulfillment could not be reconciled',
+        )
+      }
+      setExternalFulfillmentOpen(false)
+      setExternalFulfillmentIdempotencyKey('')
+      setNotice(
+        `Shopify ${payload.result.providerFulfillmentName} was reconciled as ${payload.result.reconciliationGlobalId}. Stale unpicked warehouse work was cancelled; ClawPilot made no Shopify write and sent no customer notification.`,
+      )
+      await loadWorkspace(payload.result.orderGlobalId)
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'Shopify fulfillment could not be reconciled',
+      )
+    } finally {
+      setReconcilingExternalFulfillment(false)
     }
   }
 
@@ -4258,6 +4353,7 @@ export default function OperationsSection({
           || creatingPlanEvidence
           || releasingOrder
           || confirmingPicks
+          || reconcilingExternalFulfillment
           || verifyingPack
           || preparingFulfillment
           || confirmingShipment
@@ -4273,6 +4369,9 @@ export default function OperationsSection({
         onPlan={openPlan}
         onRelease={openRelease}
         onConfirmPicks={openConfirmPicks}
+        onReconcileExternalFulfillment={
+          openExternalFulfillmentReconciliation
+        }
         onVerifyPack={openVerifyPack}
         onPrepareFulfillment={openPrepareFulfillment}
         onGeneratePackingSlip={(packageGlobalId) => {
@@ -4942,6 +5041,69 @@ export default function OperationsSection({
               startIcon={confirmingPicks ? <CircularProgress size={16} /> : <TaskAltRounded />}
             >
               {confirmingPicks ? 'Confirming picks' : 'Confirm picks'}
+            </Button>
+          </DialogActions>
+        </Box>
+      </Dialog>
+
+      <Dialog
+        open={externalFulfillmentOpen}
+        onClose={closeExternalFulfillmentReconciliation}
+        fullWidth
+        maxWidth="sm"
+      >
+        <Box component="form" onSubmit={reconcileExternalFulfillment}>
+          <DialogTitle>Reconcile Shopify fulfillment</DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <Alert severity="warning">
+                ClawPilot will read the live Shopify order and proceed only if
+                one exact successful fulfillment covers every released line at
+                the released location. It will then cancel the wholly unpicked
+                wave and plan and release their provider and packaging claims.
+              </Alert>
+              <Alert severity="info">
+                This command does not write to Shopify, create a ClawPilot
+                shipment or fulfillment export, or send another customer
+                notification.
+              </Alert>
+              <TextField
+                required
+                autoFocus
+                multiline
+                minRows={3}
+                label="Reconciliation reason"
+                value={externalFulfillmentReason}
+                onChange={(event) => setExternalFulfillmentReason(event.target.value)}
+                inputProps={{ maxLength: 500 }}
+                helperText={`${externalFulfillmentReason.trim().length}/500 · Recorded with immutable Shopify evidence`}
+              />
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button
+              onClick={closeExternalFulfillmentReconciliation}
+              disabled={reconcilingExternalFulfillment}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              variant="contained"
+              color="warning"
+              disabled={
+                reconcilingExternalFulfillment
+                || !externalFulfillmentReason.trim()
+              }
+              startIcon={
+                reconcilingExternalFulfillment
+                  ? <CircularProgress size={16} />
+                  : <ReplayRounded />
+              }
+            >
+              {reconcilingExternalFulfillment
+                ? 'Reconciling fulfillment'
+                : 'Confirm reconciliation'}
             </Button>
           </DialogActions>
         </Box>

@@ -33,6 +33,7 @@ export function availableOperationsOrderActions(input: {
   oneOffShippingMode?: 'test' | 'live' | null
   activationState: OperationsActivationState
   canExecute: boolean
+  canManage?: boolean
   canActivate?: boolean
   planStatus: string | null
   waveStatus: string | null
@@ -57,6 +58,7 @@ export function availableOperationsOrderActions(input: {
   sandboxE2eAuthorized?: boolean
   nativeOneOffGroupReady?: boolean
   nativeOneOffGroupBlockedReason?: string | null
+  shopifyExternalFulfillmentReconciliationRequired?: boolean
 }): OperationsOrderActionAvailability[] {
   let releaseBlockedReason: string | null = null
   if (!input.canExecute) {
@@ -88,10 +90,35 @@ export function availableOperationsOrderActions(input: {
       : 'Release the order to warehouse execution before confirming picks.'
   } else if (input.planStatus !== 'released' || input.waveStatus !== 'released') {
     pickBlockedReason = 'The fulfillment plan and wave must both be released before picking.'
+  } else if (input.shopifyExternalFulfillmentReconciliationRequired) {
+    pickBlockedReason = 'Newer Shopify evidence no longer supports this provider commitment. Reconcile the external fulfillment before picking.'
   } else if (input.pickTaskCount < 1 || input.readyPickTaskCount !== input.pickTaskCount) {
     pickBlockedReason = 'Every pick task must be ready before confirming this wave.'
   } else if (input.blockingExceptionCount > 0) {
     pickBlockedReason = 'Resolve high or critical order exceptions before confirming picks.'
+  }
+
+  let externalFulfillmentBlockedReason: string | null = null
+  if (input.canManage !== true) {
+    externalFulfillmentBlockedReason = 'Operations manage permission is required.'
+  } else if (!input.canExecute) {
+    externalFulfillmentBlockedReason = 'Operations execute permission is required.'
+  } else if (!['shadow', 'active'].includes(input.activationState)) {
+    externalFulfillmentBlockedReason = 'Set Operations to Shadow or Active before reconciling warehouse work.'
+  } else if (input.sourceProvider !== 'shopify') {
+    externalFulfillmentBlockedReason = 'External fulfillment reconciliation requires a Shopify order.'
+  } else if (!input.shopifyExternalFulfillmentReconciliationRequired) {
+    externalFulfillmentBlockedReason = 'No newer Shopify evidence requires external fulfillment reconciliation.'
+  } else if (input.status !== 'released') {
+    externalFulfillmentBlockedReason = 'Only a released order can be reconciled as externally fulfilled.'
+  } else if (input.planStatus !== 'released' || input.waveStatus !== 'released') {
+    externalFulfillmentBlockedReason = 'The fulfillment plan and wave must both remain released.'
+  } else if (
+    input.pickTaskCount < 1
+    || input.readyPickTaskCount !== input.pickTaskCount
+    || input.pickedPickTaskCount !== 0
+  ) {
+    externalFulfillmentBlockedReason = 'Every warehouse pick must remain ready and wholly unpicked.'
   }
 
   let packBlockedReason: string | null = null
@@ -227,6 +254,12 @@ export function availableOperationsOrderActions(input: {
       label: 'Confirm all picks',
       enabled: pickBlockedReason === null,
       blockedReason: pickBlockedReason,
+    },
+    {
+      action: 'reconcile_external_fulfillment',
+      label: 'Reconcile Shopify fulfillment',
+      enabled: externalFulfillmentBlockedReason === null,
+      blockedReason: externalFulfillmentBlockedReason,
     },
     {
       action: 'verify_pack',

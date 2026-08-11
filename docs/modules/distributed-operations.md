@@ -308,6 +308,7 @@ The implemented slice provides:
 - an internal test-only deterministic order, reservation, planning, cartonization, carrier, and print harness that cannot create hosted workspace records without an explicit automated-test feature flag;
 - operator-controlled warehouse release with exact-version concurrency, readiness and exception checks, transactionally serialized revalidation of every active Shopify provider commitment against the newest sufficient successful inventory projection while preserving its original acceptance evidence, one released wave, ready pick tasks, domain event, audit evidence, and replay-safe command receipts;
 - operator-controlled bulk pick confirmation with exact-version concurrency, affected-position locks, all-ready validation, one completed wave, picked tasks, retained reservations, immutable local-authority pick-ledger evidence, no second local ledger movement for Shopify-authoritative picks, domain event, audit evidence, and replay-safe exact result payloads;
+- a narrow Shopify external-fulfillment reconciliation for released, wholly unpicked work when a newer immutable inventory capture no longer supports its provider commitment: one bounded live Shopify read must prove an exact successful post-release fulfillment for every canonical line at the released location; the command retains immutable evidence, cancels the tasks/wave/plan/order, releases provider and packaging claims, and creates no Shopify write, shipment, fulfillment export, or customer notification;
 - operator-controlled pack verification with exact-version concurrency, released-plan and completed-pick validation, one packed package, retained reservations for shipment consumption, immutable pack-fee evidence, domain event, audit evidence, and replay-safe exact result payloads;
 - a shared CRM product catalog that authorized pipeline editors can maintain individually or import from CSV, with a permanent `gp` product identity, duplicate prevention by SKU or case-insensitive name, per-row validation, and bounded partial-import results;
 - one organization-scoped default package profile per product in this slice, with permanent `gpp` identity, package type, unit of measure, units per package, preferred metric or imperial entry system, dimensions, weight, active state, source, optimistic row version, and audit history; fulfillment planning consumes canonical millimeters and grams from the active profile and records its provenance, while products without a profile retain the explicit conservative fallback;
@@ -1311,6 +1312,8 @@ The provider response is durably captured before projection, and a successful ru
 
 Migration `0267` content-addresses the wide provider snapshot body while preserving one immutable attempt, capture, sync run, and run-scoped level row per fetch. Repeated bodies for the same account, provider location, adapter version, and snapshot hash are stored once; each capture still retains its own fetch time, page count, credential generation, request identity, and replay relationship. This reduces duplicate capture JSON storage only. It does not change the Shopify call cadence, webhook-triggered immediate refresh, periodic freshness backstop, or the continued growth of per-run level and audit rows; deduplicating wide per-item evidence is a separate future optimization.
 
+Migration `0269` adds shadow-only targetability evidence for the six signed Shopify inventory-item and inventory-level topics. After raw-body HMAC verification, ClawPilot may normalize at most one exact InventoryItem target and, for level topics, one exact source Location target. Missing, malformed, oversized, plural, or conflicting identities are retained as `full_required` rather than rejecting the signed receipt. The receipt insert, monotonic dirty-version increment, and append-only classification row commit in one transaction and retain the receipt's actual provider-triggered and received timestamps. Hourly metrics report targeted versus full-required classifications, stable reasons, distinct targets, and delivery lag. This phase does not read a targeted provider node, trust or project a webhook quantity, select worker behavior, register a webhook, change the 900-second freshness policy, or authorize a Shopify write: every signal still executes the existing complete authoritative inventory refresh.
+
 Shopify is the source authority for projected positions in this slice. For a consistent level, ClawPilot projects `on hand = available + committed`, `reserved = committed`, and `available = Shopify available`. Imported or staged order demand is not subtracted again because Shopify's committed state already represents allocated demand. Shopify-authoritative positions and ledger rows are fenced from ordinary ClawPilot reservation and adjustment paths; only the reconciliation transaction may replace their balances. Each worker execution is one point-in-time read and reconciliation; automatic scheduling does not make this multi-location allocation, an inventory adjustment/export path, a Faire inventory import, bidirectional synchronization, or production activation.
 
 The public Shopify checkout callback never fetches inventory from Shopify. It
@@ -1503,9 +1506,16 @@ the projected position. The existing queued Shopify fulfillment export remains
 the sole provider-write path. Consumed or released provider commitments are
 terminal and cannot become active again. Active mode also rejects any planned
 or released order whose sealed production cartonization/rate evidence link is
-missing. The current slice does not expose the guarded plan-cancellation
-command needed to release abandoned inventory and packaging claims, so
-accepted real plans must not be cancelled through direct SQL.
+missing. Migration `0268` exposes only the exact external-fulfillment recovery
+case: a newer immutable Shopify capture must first show lost commitment
+support, then a fresh bounded Shopify read must prove one successful
+post-release fulfillment covering every canonical line at the released
+location. The command records immutable provider evidence, cancels wholly
+unpicked tasks plus their wave, plan, and order, releases provider and
+packaging claims, and performs no provider write or customer notification.
+Generic abandonment, cancellation after any pick, provider cancellation, and
+partial-fulfillment recovery remain unavailable and must not be performed by
+direct SQL.
 
 The selected carrier estimate, the immutable amount actually charged at
 checkout when available, and their signed variance remain separate facts.

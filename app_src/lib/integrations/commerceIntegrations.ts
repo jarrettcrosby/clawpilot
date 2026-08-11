@@ -48,6 +48,10 @@ import {
   shopifyDeletedProductEvidence,
 } from '@/lib/integrations/shopifyCatalogWebhook'
 import {
+  shopifyInventoryWebhookTargeting,
+  type ShopifyInventoryWebhookTargeting,
+} from '@/lib/integrations/shopifyInventoryWebhook'
+import {
   assertShopifyOrderPreviewRuntime,
   fetchShopifyOrderPreview,
   normalizeShopifyOrderPreviewIdempotencyKey,
@@ -1828,7 +1832,14 @@ export async function receiveShopifyWebhook(input: {
         'SHOPIFY_WEBHOOK_JSON_INVALID',
       )
     }
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    const isInventoryRefreshTopic =
+      SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS.some(
+        (inventoryTopic) => inventoryTopic === topic,
+      )
+    if (
+      (!payload || typeof payload !== 'object' || Array.isArray(payload))
+      && !isInventoryRefreshTopic
+    ) {
       throw new CommerceIntegrationRequestError(
         'Shopify webhook payload must be a JSON object',
         400,
@@ -1868,6 +1879,14 @@ export async function receiveShopifyWebhook(input: {
         'SHOPIFY_WEBHOOK_JSON_INVALID',
       )
     }
+    let inventoryTargeting: ShopifyInventoryWebhookTargeting | null = null
+    if (isInventoryRefreshTopic) {
+      inventoryTargeting = shopifyInventoryWebhookTargeting({
+        topic,
+        verifiedPayload: payload,
+        verifiedRawPayload: input.rawBody,
+      })
+    }
     const encryptedPayload = encryptCommerceWebhookPayload(
       input.rawBody,
       runtime.globalId,
@@ -1886,6 +1905,7 @@ export async function receiveShopifyWebhook(input: {
       providerTriggeredAt,
       scopeAudit,
       productDeletion,
+      inventoryTargeting,
     })
     await markShopifyWebhookSecretVerifiedInPostgres({ runtime })
     return receipt

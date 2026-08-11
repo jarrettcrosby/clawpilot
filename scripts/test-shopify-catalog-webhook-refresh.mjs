@@ -156,7 +156,7 @@ includes(receiptPersistence, [
   'inventoryTouched: 0',
   'reconcileCommerceProductImageSetWithClient',
   "productLifecycle: 'deleted'",
-  'RETURNING global_id, received_at',
+  'id::text,\n         global_id,\n         received_at',
   'existing.rows[0].received_at',
   'productDeletionReconciled',
 ], 'Shopify product webhook receipt boundary')
@@ -482,6 +482,11 @@ const receiptPersistenceModule = loadTypeScriptModule(
       '@/lib/persistence/shopifyInventoryRefresh': {
         async signalShopifyInventoryRefreshWithClient() {
           assert.fail('A product deletion must not mutate inventory')
+        },
+      },
+      '@/lib/persistence/shopifyInventoryTargetSignals': {
+        async recordShopifyInventoryTargetSignalWithClient() {
+          assert.fail('A product deletion must not create inventory evidence')
         },
       },
       '@/lib/persistence/commerceProductImageImports': {
