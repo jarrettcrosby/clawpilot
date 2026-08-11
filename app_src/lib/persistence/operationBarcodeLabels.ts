@@ -821,6 +821,7 @@ export async function readOperationsBarcodeLabelBatchPreviewFromPostgres(input: 
     global_id: string
     target_type: BarcodeLabelTargetType
     media_size: BarcodeLabelMedia
+    template_version: string
     items_snapshot: unknown
     warehouse_global_id: string
     warehouse_name: string
@@ -828,6 +829,7 @@ export async function readOperationsBarcodeLabelBatchPreviewFromPostgres(input: 
     `SELECT label_batch.global_id,
             label_batch.target_type,
             label_batch.media_size,
+            label_batch.template_version,
             label_batch.items_snapshot,
             warehouse.global_id AS warehouse_global_id,
             warehouse.name AS warehouse_name
@@ -856,7 +858,7 @@ export async function readOperationsBarcodeLabelBatchPreviewFromPostgres(input: 
   }
   return {
     batchGlobalId,
-    html: renderBarcodeLabelsPreviewHtml(batchGlobalId, snapshot),
+    html: renderBarcodeLabelsPreviewHtml(batchGlobalId, snapshot, row.template_version),
   }
 }
 

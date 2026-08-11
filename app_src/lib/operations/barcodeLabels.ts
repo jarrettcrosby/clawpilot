@@ -9,7 +9,7 @@ export const BARCODE_LABEL_MEDIA = [
   'label_4x6',
   'label_4x8',
 ] as const
-export const BARCODE_LABEL_TEMPLATE_VERSION = 'warehouse-barcode-zpl-v1' as const
+export const BARCODE_LABEL_TEMPLATE_VERSION = 'warehouse-barcode-zpl-v2' as const
 export const INTERNAL_PRODUCT_BARCODE_PREFIX = 'CP1P-' as const
 export const LOCATION_BARCODE_PREFIX = 'CP1L-' as const
 
@@ -160,18 +160,266 @@ function safeZplText(value: string, maximum: number) {
     .slice(0, maximum)
 }
 
-const MEDIA_GEOMETRY: Record<BarcodeLabelMedia, {
+type BarcodeLabelMediaGeometry = {
   widthDots: number
   lengthDots: number
   widthInches: number
   heightInches: number
-  compact: boolean
-}> = {
-  label_2x1: { widthDots: 406, lengthDots: 203, widthInches: 2, heightInches: 1, compact: true },
-  label_3x1: { widthDots: 609, lengthDots: 203, widthInches: 3, heightInches: 1, compact: true },
-  label_4x2: { widthDots: 812, lengthDots: 406, widthInches: 4, heightInches: 2, compact: false },
-  label_4x6: { widthDots: 812, lengthDots: 1218, widthInches: 4, heightInches: 6, compact: false },
-  label_4x8: { widthDots: 812, lengthDots: 1624, widthInches: 4, heightInches: 8, compact: false },
+  zpl: {
+    marginX: number
+    titleY: number
+    titleHeight: number
+    titleWidth: number
+    titleLines: number
+    barcodeY: number
+    barcodeHeight: number
+    maximumModuleWidth: number
+    valueY: number
+    valueHeight: number
+    valueWidth: number
+    detailsY: number
+    detailsHeight: number
+    detailsWidth: number
+    identityY: number
+    identityHeight: number
+    identityWidth: number
+    footerY: number
+    footerHeight: number
+    footerWidth: number
+  }
+  preview: {
+    paddingXInches: number
+    paddingYInches: number
+    titleHeightInches: number
+    barcodeHeightInches: number
+    valueHeightInches: number
+    detailsHeightInches: number
+    metaHeightInches: number
+    gapInches: number
+    titleFontPoints: number
+    titleLines: number
+    valueFontPoints: number
+    detailsFontPoints: number
+    metaFontPoints: number
+  }
+}
+
+const MEDIA_GEOMETRY: Record<BarcodeLabelMedia, BarcodeLabelMediaGeometry> = {
+  label_2x1: {
+    widthDots: 406,
+    lengthDots: 203,
+    widthInches: 2,
+    heightInches: 1,
+    zpl: {
+      marginX: 12,
+      titleY: 5,
+      titleHeight: 22,
+      titleWidth: 18,
+      titleLines: 1,
+      barcodeY: 32,
+      barcodeHeight: 76,
+      maximumModuleWidth: 3,
+      valueY: 113,
+      valueHeight: 16,
+      valueWidth: 13,
+      detailsY: 135,
+      detailsHeight: 16,
+      detailsWidth: 13,
+      identityY: 157,
+      identityHeight: 13,
+      identityWidth: 10,
+      footerY: 178,
+      footerHeight: 11,
+      footerWidth: 9,
+    },
+    preview: {
+      paddingXInches: 0.08,
+      paddingYInches: 0.04,
+      titleHeightInches: 0.14,
+      barcodeHeightInches: 0.4,
+      valueHeightInches: 0.1,
+      detailsHeightInches: 0.11,
+      metaHeightInches: 0.09,
+      gapInches: 0.02,
+      titleFontPoints: 9.25,
+      titleLines: 1,
+      valueFontPoints: 6.4,
+      detailsFontPoints: 6.6,
+      metaFontPoints: 4.25,
+    },
+  },
+  label_3x1: {
+    widthDots: 609,
+    lengthDots: 203,
+    widthInches: 3,
+    heightInches: 1,
+    zpl: {
+      marginX: 14,
+      titleY: 5,
+      titleHeight: 24,
+      titleWidth: 20,
+      titleLines: 1,
+      barcodeY: 34,
+      barcodeHeight: 84,
+      maximumModuleWidth: 5,
+      valueY: 122,
+      valueHeight: 18,
+      valueWidth: 15,
+      detailsY: 144,
+      detailsHeight: 17,
+      detailsWidth: 14,
+      identityY: 166,
+      identityHeight: 14,
+      identityWidth: 11,
+      footerY: 184,
+      footerHeight: 11,
+      footerWidth: 9,
+    },
+    preview: {
+      paddingXInches: 0.1,
+      paddingYInches: 0.04,
+      titleHeightInches: 0.15,
+      barcodeHeightInches: 0.42,
+      valueHeightInches: 0.09,
+      detailsHeightInches: 0.11,
+      metaHeightInches: 0.07,
+      gapInches: 0.02,
+      titleFontPoints: 9.5,
+      titleLines: 1,
+      valueFontPoints: 6,
+      detailsFontPoints: 7.2,
+      metaFontPoints: 4.5,
+    },
+  },
+  label_4x2: {
+    widthDots: 812,
+    lengthDots: 406,
+    widthInches: 4,
+    heightInches: 2,
+    zpl: {
+      marginX: 24,
+      titleY: 15,
+      titleHeight: 38,
+      titleWidth: 32,
+      titleLines: 1,
+      barcodeY: 65,
+      barcodeHeight: 180,
+      maximumModuleWidth: 7,
+      valueY: 256,
+      valueHeight: 28,
+      valueWidth: 24,
+      detailsY: 293,
+      detailsHeight: 30,
+      detailsWidth: 26,
+      identityY: 334,
+      identityHeight: 22,
+      identityWidth: 18,
+      footerY: 373,
+      footerHeight: 16,
+      footerWidth: 13,
+    },
+    preview: {
+      paddingXInches: 0.14,
+      paddingYInches: 0.12,
+      titleHeightInches: 0.28,
+      barcodeHeightInches: 0.82,
+      valueHeightInches: 0.16,
+      detailsHeightInches: 0.22,
+      metaHeightInches: 0.14,
+      gapInches: 0.035,
+      titleFontPoints: 16,
+      titleLines: 1,
+      valueFontPoints: 10,
+      detailsFontPoints: 13,
+      metaFontPoints: 7.5,
+    },
+  },
+  label_4x6: {
+    widthDots: 812,
+    lengthDots: 1218,
+    widthInches: 4,
+    heightInches: 6,
+    zpl: {
+      marginX: 36,
+      titleY: 35,
+      titleHeight: 62,
+      titleWidth: 52,
+      titleLines: 2,
+      barcodeY: 185,
+      barcodeHeight: 720,
+      maximumModuleWidth: 7,
+      valueY: 930,
+      valueHeight: 42,
+      valueWidth: 34,
+      detailsY: 990,
+      detailsHeight: 50,
+      detailsWidth: 42,
+      identityY: 1060,
+      identityHeight: 32,
+      identityWidth: 26,
+      footerY: 1120,
+      footerHeight: 24,
+      footerWidth: 20,
+    },
+    preview: {
+      paddingXInches: 0.24,
+      paddingYInches: 0.24,
+      titleHeightInches: 0.8,
+      barcodeHeightInches: 3.5,
+      valueHeightInches: 0.3,
+      detailsHeightInches: 0.4,
+      metaHeightInches: 0.37,
+      gapInches: 0.0375,
+      titleFontPoints: 26,
+      titleLines: 2,
+      valueFontPoints: 16,
+      detailsFontPoints: 20,
+      metaFontPoints: 9,
+    },
+  },
+  label_4x8: {
+    widthDots: 812,
+    lengthDots: 1624,
+    widthInches: 4,
+    heightInches: 8,
+    zpl: {
+      marginX: 36,
+      titleY: 45,
+      titleHeight: 72,
+      titleWidth: 60,
+      titleLines: 2,
+      barcodeY: 230,
+      barcodeHeight: 1020,
+      maximumModuleWidth: 7,
+      valueY: 1280,
+      valueHeight: 48,
+      valueWidth: 39,
+      detailsY: 1350,
+      detailsHeight: 58,
+      detailsWidth: 48,
+      identityY: 1430,
+      identityHeight: 38,
+      identityWidth: 31,
+      footerY: 1500,
+      footerHeight: 28,
+      footerWidth: 23,
+    },
+    preview: {
+      paddingXInches: 0.26,
+      paddingYInches: 0.28,
+      titleHeightInches: 0.9,
+      barcodeHeightInches: 5,
+      valueHeightInches: 0.35,
+      detailsHeightInches: 0.5,
+      metaHeightInches: 0.37,
+      gapInches: 0.08,
+      titleFontPoints: 30,
+      titleLines: 2,
+      valueFontPoints: 18,
+      detailsFontPoints: 24,
+      metaFontPoints: 9,
+    },
+  },
 }
 
 function zplBarcode(item: BarcodeLabelItem, height: number) {
@@ -186,31 +434,117 @@ function zplBarcode(item: BarcodeLabelItem, height: number) {
   return `^BCN,${height},N,N,N^FD${item.barcodeValue}^FS`
 }
 
+function barcodeModuleCount(item: BarcodeLabelItem) {
+  if (item.symbology === 'EAN-8') return 67
+  if (item.symbology === 'UPC-A' || item.symbology === 'EAN-13') return 95
+  // Code 128 subset B: start, one symbol per character, checksum, stop, and
+  // termination bar. The conservative extra two modules keep the right quiet
+  // zone intact across Zebra firmware variants.
+  return 11 * (item.barcodeValue.length + 2) + 15
+}
+
+function zplBarcodeGeometry(
+  item: BarcodeLabelItem,
+  geometry: BarcodeLabelMediaGeometry,
+) {
+  const modules = barcodeModuleCount(item)
+  const quietZone = item.symbology === 'EAN-13'
+    ? { left: 11, right: 7 }
+    : { left: 10, right: 10 }
+  const fittingModuleWidth = Math.floor(
+    geometry.widthDots / (modules + quietZone.left + quietZone.right),
+  )
+  const moduleWidth = Math.max(
+    1,
+    Math.min(geometry.zpl.maximumModuleWidth, fittingModuleWidth),
+  )
+  const occupiedWidth = (modules + quietZone.left + quietZone.right) * moduleWidth
+  return {
+    moduleWidth,
+    x: quietZone.left * moduleWidth
+      + Math.floor((geometry.widthDots - occupiedWidth) / 2),
+  }
+}
+
+function zplTextField(input: {
+  x: number
+  y: number
+  width: number
+  fontHeight: number
+  fontWidth: number
+  lines?: number
+  alignment?: 'L' | 'C' | 'R' | 'J'
+  value: string
+}) {
+  return `^FO${input.x},${input.y}^A0N,${input.fontHeight},${input.fontWidth}`
+    + `^FB${input.width},${input.lines || 1},0,${input.alignment || 'L'},0`
+    + `^FD${input.value}^FS`
+}
+
 export function renderBarcodeLabelsZpl(snapshot: BarcodeLabelBatchSnapshot) {
   const geometry = MEDIA_GEOMETRY[snapshot.media]
+  const layout = geometry.zpl
+  const textWidth = geometry.widthDots - layout.marginX * 2
   const labels: string[] = []
   for (const item of snapshot.items) {
     const title = safeZplText(item.displayName, 54)
     const humanCode = safeZplText(item.humanCode, 60)
+    const barcode = zplBarcodeGeometry(item, geometry)
+    const identity = safeZplText(
+      `${item.targetGlobalId.toUpperCase()} - ${item.symbology}/${item.sourceIdentity}`,
+      80,
+    )
+    const footer = safeZplText(
+      `ClawPilot ${snapshot.targetType} (${item.barcodeSource}) - ${BARCODE_LABEL_TEMPLATE_VERSION}`,
+      90,
+    )
     for (let copy = 0; copy < item.copies; copy += 1) {
-      const content = geometry.compact
-        ? [
-            `^FO14,8^A0N,24,20^FB${geometry.widthDots - 28},1,0,L,0^FD${title}^FS`,
-            `^BY${snapshot.media === 'label_2x1' ? 1 : 2},2,58`,
-            `^FO14,38${zplBarcode(item, 58)}`,
-            `^FO14,120^A0N,18,16^FD${safeZplText(item.barcodeValue, 45)}^FS`,
-            `^FO14,145^A0N,17,15^FD${humanCode}^FS`,
-            `^FO14,170^A0N,14,12^FD${item.targetGlobalId.toUpperCase()} - ${item.symbology}^FS`,
-          ]
-        : [
-            `^FO32,25^A0N,36,31^FB${geometry.widthDots - 64},2,0,L,0^FD${title}^FS`,
-            '^BY2,2,105',
-            `^FO32,100${zplBarcode(item, 105)}`,
-            `^FO32,235^A0N,25,22^FD${safeZplText(item.barcodeValue, 70)}^FS`,
-            `^FO32,275^A0N,26,23^FD${humanCode}^FS`,
-            `^FO32,315^A0N,20,18^FD${item.targetGlobalId.toUpperCase()} - ${item.symbology} (${item.sourceIdentity})^FS`,
-            `^FO32,350^A0N,16,14^FDClawPilot ${snapshot.targetType} - ${BARCODE_LABEL_TEMPLATE_VERSION}^FS`,
-          ]
+      const content = [
+        zplTextField({
+          x: layout.marginX,
+          y: layout.titleY,
+          width: textWidth,
+          fontHeight: layout.titleHeight,
+          fontWidth: layout.titleWidth,
+          lines: layout.titleLines,
+          value: title,
+        }),
+        `^BY${barcode.moduleWidth},2,${layout.barcodeHeight}`,
+        `^FO${barcode.x},${layout.barcodeY}${zplBarcode(item, layout.barcodeHeight)}`,
+        zplTextField({
+          x: layout.marginX,
+          y: layout.valueY,
+          width: textWidth,
+          fontHeight: layout.valueHeight,
+          fontWidth: layout.valueWidth,
+          alignment: 'C',
+          value: safeZplText(item.barcodeValue, 70),
+        }),
+        zplTextField({
+          x: layout.marginX,
+          y: layout.detailsY,
+          width: textWidth,
+          fontHeight: layout.detailsHeight,
+          fontWidth: layout.detailsWidth,
+          value: humanCode,
+        }),
+        zplTextField({
+          x: layout.marginX,
+          y: layout.identityY,
+          width: textWidth,
+          fontHeight: layout.identityHeight,
+          fontWidth: layout.identityWidth,
+          value: identity,
+        }),
+        zplTextField({
+          x: layout.marginX,
+          y: layout.footerY,
+          width: textWidth,
+          fontHeight: layout.footerHeight,
+          fontWidth: layout.footerWidth,
+          value: footer,
+        }),
+      ]
       labels.push([
         '^XA',
         '^CI28',
@@ -257,12 +591,15 @@ const EAN_G = ['0100111', '0110011', '0011011', '0100001', '0011101', '0111001',
 const EAN_R = ['1110010', '1100110', '1101100', '1000010', '1011100', '1001110', '1010000', '1000100', '1001000', '1110100']
 const EAN13_PARITY = ['LLLLLL', 'LLGLGG', 'LLGGLG', 'LLGGGL', 'LGLLGG', 'LGGLLG', 'LGGGLL', 'LGLGLG', 'LGLGGL', 'LGGLGL']
 
-function linearBarcodeSvg(bits: string, value: string) {
-  const quiet = 10
+function linearBarcodeSvg(
+  bits: string,
+  value: string,
+  quiet: { left: number; right: number } = { left: 10, right: 10 },
+) {
   const bars = [...bits].map((bit, index) => (
-    bit === '1' ? `<rect x="${index + quiet}" y="0" width="1" height="90"/>` : ''
+    bit === '1' ? `<rect x="${index + quiet.left}" y="0" width="1" height="90"/>` : ''
   )).join('')
-  return `<svg class="barcode" viewBox="0 0 ${bits.length + quiet * 2} 90" role="img" aria-label="Barcode ${html(value)}" preserveAspectRatio="none">${bars}</svg>`
+  return `<svg class="barcode" viewBox="0 0 ${bits.length + quiet.left + quiet.right} 90" role="img" aria-label="Barcode ${html(value)}" preserveAspectRatio="none">${bars}</svg>`
 }
 
 function retailBarcodeSvg(item: BarcodeLabelItem) {
@@ -283,15 +620,21 @@ function retailBarcodeSvg(item: BarcodeLabelItem) {
       parity[index] === 'G' ? EAN_G[digit] : EAN_L[digit]
     )).join('')
     const right = digits.slice(7).map((digit) => EAN_R[digit]).join('')
-    return linearBarcodeSvg(`101${left}01010${right}101`, item.barcodeValue)
+    return linearBarcodeSvg(
+      `101${left}01010${right}101`,
+      item.barcodeValue,
+      { left: 11, right: 7 },
+    )
   }
   return code128Svg(item.barcodeValue)
 }
 
-export function renderBarcodeLabelsPreviewHtml(
+function renderBarcodeLabelsPreviewHtmlV1(
   batchGlobalId: string,
   snapshot: BarcodeLabelBatchSnapshot,
 ) {
+  const geometry = MEDIA_GEOMETRY[snapshot.media]
+  const compact = geometry.heightInches === 1 ? ' compact' : ''
   const labels = snapshot.items.flatMap((item) => Array.from(
     { length: item.copies },
     () => `<section class="label">
@@ -302,8 +645,6 @@ export function renderBarcodeLabelsPreviewHtml(
       <div class="meta">Printed ${html(item.symbology)} &middot; Source ${html(item.sourceIdentity)} &middot; ClawPilot ${html(snapshot.targetType)} label</div>
     </section>`,
   )).join('\n')
-  const geometry = MEDIA_GEOMETRY[snapshot.media]
-  const compact = geometry.compact ? ' compact' : ''
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>ClawPilot barcode labels ${html(batchGlobalId)}</title>
@@ -329,5 +670,71 @@ h1 { min-height: .75in; margin: 0 0 .12in; font-size: 25pt; line-height: 1.08; }
 </style></head><body>
 <div class="toolbar"><button type="button" onclick="window.print()">Print labels</button><span>${html(snapshot.warehouseName)} &middot; ${snapshot.items.reduce((sum, item) => sum + item.copies, 0)} labels</span></div>
 ${labels.replaceAll('class="label"', `class="label${compact}"`)}
+</body></html>`
+}
+
+export function renderBarcodeLabelsPreviewHtml(
+  batchGlobalId: string,
+  snapshot: BarcodeLabelBatchSnapshot,
+  templateVersion: string = BARCODE_LABEL_TEMPLATE_VERSION,
+) {
+  if (templateVersion === 'warehouse-barcode-zpl-v1') {
+    return renderBarcodeLabelsPreviewHtmlV1(batchGlobalId, snapshot)
+  }
+  if (templateVersion !== BARCODE_LABEL_TEMPLATE_VERSION) {
+    throw new Error('Barcode label template version is not supported')
+  }
+  const geometry = MEDIA_GEOMETRY[snapshot.media]
+  const layout = geometry.preview
+  const labels = snapshot.items.flatMap((item) => Array.from(
+    { length: item.copies },
+    () => `<section class="label" data-media="${snapshot.media}">
+      <h1>${html(item.displayName)}</h1>
+      ${retailBarcodeSvg(item)}
+      <div class="value">${html(item.barcodeValue)}</div>
+      <div class="details">${html(item.humanCode)} &middot; ${html(item.targetGlobalId.toUpperCase())}</div>
+      <div class="meta">Printed ${html(item.symbology)} &middot; Source ${html(item.sourceIdentity)} (${html(item.barcodeSource)}) &middot; ClawPilot ${html(snapshot.targetType)} label &middot; ${BARCODE_LABEL_TEMPLATE_VERSION}</div>
+    </section>`,
+  )).join('\n')
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>ClawPilot barcode labels ${html(batchGlobalId)}</title>
+<style>
+@page { size: ${geometry.widthInches}in ${geometry.heightInches}in; margin: 0; }
+* { box-sizing: border-box; }
+body { margin: 0; color: #050505; background: #e9edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+.toolbar { position: sticky; top: 0; z-index: 2; display: flex; gap: 12px; align-items: center; padding: 12px 16px; color: white; background: #111827; }
+.toolbar button { padding: 9px 15px; border: 0; border-radius: 8px; color: #08162b; background: #9ec5ff; font-weight: 700; cursor: pointer; }
+.label {
+  width: ${geometry.widthInches}in;
+  height: ${geometry.heightInches}in;
+  margin: 18px auto;
+  padding: ${layout.paddingYInches}in ${layout.paddingXInches}in;
+  display: grid;
+  grid-template-rows: ${layout.titleHeightInches}in ${layout.barcodeHeightInches}in ${layout.valueHeightInches}in ${layout.detailsHeightInches}in ${layout.metaHeightInches}in;
+  row-gap: ${layout.gapInches}in;
+  overflow: hidden;
+  background: white;
+  break-after: page;
+}
+h1 {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-size: ${layout.titleFontPoints}pt;
+  line-height: 1.08;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: ${layout.titleLines};
+}
+.barcode { display: block; width: 100%; height: 100%; margin: 0; fill: #000; shape-rendering: crispEdges; }
+.value, .details, .meta { min-width: 0; overflow: hidden; display: flex; align-items: center; line-height: 1.08; }
+.value { justify-content: center; font: 700 ${layout.valueFontPoints}pt ui-monospace, SFMono-Regular, Menlo, monospace; text-align: center; white-space: nowrap; }
+.details { font-size: ${layout.detailsFontPoints}pt; font-weight: 700; overflow-wrap: anywhere; }
+.meta { color: #374151; font-size: ${layout.metaFontPoints}pt; overflow-wrap: anywhere; }
+@media print { body { background: white; } .toolbar { display: none; } .label { margin: 0; } }
+</style></head><body>
+<div class="toolbar"><button type="button" onclick="window.print()">Print labels</button><span>${html(snapshot.warehouseName)} &middot; ${snapshot.items.reduce((sum, item) => sum + item.copies, 0)} labels</span></div>
+${labels}
 </body></html>`
 }
