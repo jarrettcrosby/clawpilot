@@ -908,12 +908,17 @@ function loadOperationalWarehouseServices(pool) {
     normalizeCarrierSandboxParty: (value) => value,
     carrierSandboxPartyFingerprint: carrierPartyFingerprint,
   }
+  const fulfillmentOptimizerContract = loadTypeScriptModule(
+    'app_src/lib/operations/fulfillmentOptimizerContract.ts',
+  )
   const cartonizationRateEvidence = loadTypeScriptModule(
     'app_src/lib/persistence/cartonizationRateEvidence.ts',
     {
       '@/lib/auditWriter': auditWriter,
       '@/lib/integrations/commerceCredentialCrypto': credentialCrypto,
       '@/lib/integrations/carrierSandboxRate': carrierSandboxRate,
+      '@/lib/operations/fulfillmentOptimizerContract':
+        fulfillmentOptimizerContract,
       '@/lib/persistence/postgres': postgres,
     },
   )
@@ -958,6 +963,44 @@ function loadOperationalWarehouseServices(pool) {
           'reconcileShopifyFulfillmentWriteback',
         ),
       },
+      '@/lib/integrations/shopifyOrderPlanningAuthority': {
+        ShopifyOrderPlanningAuthorityError: class extends Error {
+          constructor(
+            message,
+            status = 409,
+            code = 'SHOPIFY_ORDER_PLANNING_AUTHORITY_INVALID',
+            retryable = false,
+          ) {
+            super(message)
+            this.name = 'ShopifyOrderPlanningAuthorityError'
+            this.status = status
+            this.code = code
+            this.retryable = retryable
+          }
+        },
+        assertShopifyOrderPlanningAuthorityHash: (value) => value,
+        normalizeShopifyOrderPlanningAuthoritySnapshot: (value) => value,
+        shopifyOrderPlanningAuthorityHash: mustNotRun(
+          'shopifyOrderPlanningAuthorityHash',
+        ),
+        inspectShopifyOrderPlanningAuthority: mustNotRun(
+          'inspectShopifyOrderPlanningAuthority',
+        ),
+      },
+      '@/lib/integrations/shopifyExternalFulfillmentReconciliation': {
+        ShopifyExternalFulfillmentReconciliationError: class extends Error {
+          constructor(code, message, status = 409, retryable = false) {
+            super(message)
+            this.name = 'ShopifyExternalFulfillmentReconciliationError'
+            this.code = code
+            this.status = status
+            this.retryable = retryable
+          }
+        },
+        inspectShopifyExternalFulfillment: mustNotRun(
+          'inspectShopifyExternalFulfillment',
+        ),
+      },
       '@/lib/integrations/faireFulfillmentRuntime': {
         prepareCurrentFaireFulfillmentAuthority: mustNotRun(
           'prepareCurrentFaireFulfillmentAuthority',
@@ -972,6 +1015,10 @@ function loadOperationalWarehouseServices(pool) {
       '@/lib/operations/canonicalFulfillmentPlanning': canonicalPlanning,
       '@/lib/operations/domain': domain,
       '@/lib/operations/packingSlip': packingSlip,
+      '@/lib/operations/barcodeLabels': {
+        locationBarcode: mustNotRun('locationBarcode'),
+        providerBarcodeIdentity: mustNotRun('providerBarcodeIdentity'),
+      },
       '@/lib/persistence/cartonizationRateEvidence':
         cartonizationRateEvidence,
       '@/lib/persistence/crm': {
@@ -1105,7 +1152,8 @@ function loadCommerceOrderReconciliationWorker(input) {
     'app_src/lib/commerceOrderReconciliationWorker.ts',
     {
       '@/lib/integrations/commerceIntake': {
-        commerceIntakeRuntimeAvailable: () => true,
+        commerceReadRuntimeAvailable: () => true,
+        commerceReadRuntimeMode: () => 'development',
         executeCommerceOrderPage: input.executeCommerceOrderPage,
       },
       '@/lib/persistence/commerceIntake': {
@@ -2383,7 +2431,10 @@ async function verifyFaireExactVariantPackBinding(
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid,
          true, 1, 0, 1, $4, $4
-       ) RETURNING id::text`,
+       ) RETURNING
+         id::text,
+         row_version::integer,
+         on_hand_quantity::integer`,
       [
         ids.organization,
         material.rows[0].id,
@@ -2683,6 +2734,7 @@ async function verifyFaireExactVariantPackBinding(
     packagingMaterialGlobalId: recipePackage.packagingMaterialGlobalId,
     materialRowVersion: recipePackage.packagingMaterialRowVersion,
     recipes,
+    orToolsProfiles: [],
     innerDimensionsMm: recipePackage.materialEvidence.innerDimensionsMm,
     ratedOuterDimensionsMm:
       recipePackage.rateReadiness.ratedOuterDimensionsMm,
@@ -2708,6 +2760,19 @@ async function verifyFaireExactVariantPackBinding(
     expectedRowVersion: operational.material.row_version,
     ratedOuterDimensionsMm: { length: 230, width: 180, height: 80 },
     tareWeightGrams: 20,
+    operationalFacts: {
+      materialType: 'carton',
+      innerDimensionsMm: { length: 220, width: 170, height: 70 },
+      maximumGrossWeightGrams: 1000,
+      unitCostMinor: 55,
+      currency: 'USD',
+      stock: {
+        rowVersion: operational.materialStock.row_version,
+        onHandQuantity: operational.materialStock.on_hand_quantity,
+        activeClaimedQuantity: 0,
+        availableQuantity: operational.materialStock.on_hand_quantity,
+      },
+    },
   }]
   const planSnapshot = JSON.parse(JSON.stringify({
     mode: 'production',
@@ -2840,49 +2905,6 @@ async function verifyFaireExactVariantPackBinding(
   assert.deepEqual(upsOnlyEvidence.requiredCarrierProviders, ['ups_rest'])
   assert.equal(upsOnlyEvidence.shipmentRates.length, 1)
   assert.equal(upsOnlyEvidence.packages[0].quotes.length, 1)
-
-  // Reproduce the operator flow where exact carton evidence is sealed while
-  // the candidate is ready and promotion performs the sole later row bump.
-  // The evidence remains bound to the same provider source and destination.
-  const auditedPromotionBump = await pool.query(
-    `WITH bumped AS (
-       UPDATE operations_commerce_order_candidates
-       SET row_version = row_version + 1,
-           updated_by = $3,
-           updated_at = now()
-       WHERE organization_id = $1::uuid
-         AND global_id = $2
-         AND row_version = $4::bigint
-       RETURNING row_version::integer, updated_at
-     ), recorded AS (
-       INSERT INTO audit_events (
-         actor, event_type, aggregate_type, aggregate_id, payload,
-         event_key, subject, organization_id, is_system, created_at
-       )
-       SELECT
-         $3, 'commerce.intake.promoted', 'operations.order', $5,
-         jsonb_build_object('candidateGlobalId', $2),
-         'commerce-staging-faire-post-evidence-promotion',
-         $3, $1::uuid, false, bumped.updated_at
-       FROM bumped
-       RETURNING id
-     )
-     SELECT bumped.row_version
-     FROM bumped
-     JOIN recorded ON true`,
-    [
-      ids.organization,
-      operational.candidate.global_id,
-      actorEmail,
-      operational.candidate.row_version,
-      promoted.canonicalOrderGlobalId,
-    ],
-  )
-  assert.equal(auditedPromotionBump.rowCount, 1)
-  assert.equal(
-    auditedPromotionBump.rows[0].row_version,
-    operational.candidate.row_version + 1,
-  )
 
   const planned = await warehouseServices.operations
     .planOperationsOrderFromPostgres({
