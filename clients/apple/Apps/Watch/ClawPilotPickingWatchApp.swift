@@ -313,22 +313,23 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
         actionStatus = Self.pendingMessage(for: action)
         startCommandTimeout(for: command)
 
-        session.sendMessageData(data) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, self.pendingCommandID == command.id else { return }
-                self.isReachable = true
-                self.actionStatus = Self.acceptedMessage(for: action)
-            }
-        } errorHandler: { [weak self] _ in
-            Task { @MainActor in
-                guard let self, self.pendingCommandID == command.id else { return }
+        // WCSession runs reply and error blocks on its own operation queue. A
+        // reply closure formed in this @MainActor type inherits main-actor
+        // isolation under Swift 6 and traps before its body can hop back to the
+        // main actor. The iPhone already returns the authoritative typed result
+        // through WatchPickCommandResult, so an inline reply is redundant.
+        let commandID = command.id
+        let errorHandler: @Sendable (Error) -> Void = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.pendingCommandID == commandID else { return }
                 self.finishPendingCommand(
                     succeeded: false,
                     message: "The iPhone did not receive the command. Open ClawPilot and try again."
                 )
-                self.isReachable = session.isReachable
+                self.isReachable = self.session?.isReachable == true
             }
         }
+        session.sendMessageData(data, replyHandler: nil, errorHandler: errorHandler)
     }
 
     func readInstruction() {
@@ -509,15 +510,6 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
         case .readInstruction: "Starting instruction audio…"
         case .confirmPick: "Confirming picks…"
         case .refreshQueue: "Refreshing picks…"
-        }
-    }
-
-    private static func acceptedMessage(for action: WatchPickAction) -> String {
-        switch action {
-        case .requestMetaScan: "iPhone is running the glasses scan…"
-        case .readInstruction: "iPhone is starting instruction audio…"
-        case .confirmPick: "iPhone is confirming picks…"
-        case .refreshQueue: "iPhone is refreshing picks…"
         }
     }
 

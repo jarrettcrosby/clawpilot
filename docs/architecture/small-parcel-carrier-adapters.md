@@ -140,8 +140,9 @@ Migration `0117_operations_print_agent_capabilities.sql` closes the delivery
 capability boundary after carrier label creation. A bound printer profile must
 be a subset of the enrolled agent's declared format, media, and document
 capabilities, and the claiming runtime repeats that profile before ClawPilot
-returns immutable bytes. The bundled Zebra runtime declares only provider-native
-ZPL, 4 x 6 media, and shipping labels. PDF/PNG remain valid carrier artifacts
+returns immutable bytes. The bundled Zebra runtime declares raw ZPL carrier
+labels on 4 x 6 or 4 x 8 media plus product and location barcode labels on
+2 x 1, 3 x 1, 4 x 2, 4 x 6, or 4 x 8 media. PDF/PNG remain valid carrier artifacts
 only for a separately enrolled native print service; carrier bytes are never
 rasterized, scaled, or converted merely to satisfy a mismatched printer.
 

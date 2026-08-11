@@ -78,19 +78,29 @@ function loadGoogleIdentityServices(): Promise<void> {
     const existing = document.querySelector<HTMLScriptElement>(
       'script[src="https://accounts.google.com/gsi/client"]',
     )
-    const script = existing || document.createElement('script')
-    const loaded = () => window.google?.accounts.id
+    // A failed dynamic script element never fires load/error again when a user
+    // revisits Security or taps retry. Replace it so iOS standalone/Safari can
+    // recover from a transient GIS or network load failure without a reload.
+    existing?.remove()
+    const script = document.createElement('script')
+    let settled = false
+    const finish = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      window.clearTimeout(timeout)
+      callback()
+    }
+    const loaded = () => finish(() => window.google?.accounts.id
       ? resolve()
-      : reject(new Error('Google account linking did not initialize'))
-    const failed = () => reject(new Error('Google account linking could not be loaded'))
+      : reject(new Error('Google account linking did not initialize')))
+    const failed = () => finish(() => reject(new Error('Google account linking could not be loaded')))
+    const timeout = window.setTimeout(failed, 12_000)
     script.addEventListener('load', loaded, { once: true })
     script.addEventListener('error', failed, { once: true })
-    if (!existing) {
-      script.src = 'https://accounts.google.com/gsi/client'
-      script.async = true
-      script.defer = true
-      document.head.appendChild(script)
-    }
+    script.src = 'https://accounts.google.com/gsi/client'
+    script.async = true
+    script.defer = true
+    document.head.appendChild(script)
   }).catch((error) => {
     googleIdentityScript = null
     throw error
@@ -122,6 +132,8 @@ export default function GoogleAuthSettingsPanel() {
   const [pending, setPending] = useState('')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const [scriptFailed, setScriptFailed] = useState(false)
+  const [scriptAttempt, setScriptAttempt] = useState(0)
 
   async function load() {
     setLoading(true)
@@ -152,6 +164,7 @@ export default function GoogleAuthSettingsPanel() {
     ) return
 
     let active = true
+    setScriptFailed(false)
     button.replaceChildren()
     void loadGoogleIdentityServices()
       .then(() => {
@@ -207,6 +220,7 @@ export default function GoogleAuthSettingsPanel() {
       })
       .catch((scriptError) => {
         if (active) {
+          setScriptFailed(true)
           setError(scriptError instanceof Error ? scriptError.message : 'Unable to load Google account linking')
         }
       })
@@ -215,7 +229,7 @@ export default function GoogleAuthSettingsPanel() {
       window.google?.accounts.id.cancel()
       button.replaceChildren()
     }
-  }, [policy])
+  }, [policy, scriptAttempt])
 
   async function savePolicy() {
     if (!policy?.canManage || pending || enabled === policy.enabled) return
@@ -333,6 +347,23 @@ export default function GoogleAuthSettingsPanel() {
                   Choose exactly {policy.identity.email}. A different Google email will be rejected and cannot create or merge another user.
                 </Typography>
                 <Box ref={buttonRef} sx={{ minHeight: 44, maxWidth: 360, opacity: pending === 'link' ? 0.55 : 1 }} />
+                {scriptFailed ? (
+                  <Stack spacing={0.75} alignItems="flex-start" sx={{ mt: 1 }}>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      onClick={() => {
+                        setError('')
+                        setScriptAttempt((attempt) => attempt + 1)
+                      }}
+                    >
+                      Retry Google link
+                    </Button>
+                    <Typography variant="caption" color="text.secondary">
+                      You can also sign in to the iPhone app with a magic code, then open Settings → Security and tap Link my Google account.
+                    </Typography>
+                  </Stack>
+                ) : null}
                 {pending === 'link' ? <CircularProgress size={18} sx={{ mt: 1 }} /> : null}
               </Box>
             ) : (

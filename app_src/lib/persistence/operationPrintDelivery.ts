@@ -11,6 +11,7 @@ import {
 } from '@/lib/integrations/carrierManagedDelegation'
 import {
   DEFAULT_PRINT_AGENT_CAPABILITIES,
+  LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES,
   PRINT_DOCUMENT_TYPES,
   PRINT_FORMATS,
   PRINT_MEDIA,
@@ -1371,6 +1372,148 @@ export async function enrollOperationsPrintAgentInPostgres(input: {
       },
     }, client)
     return { agent, credential: generated.credential }
+  })
+}
+
+export async function upgradeOperationsPrintAgentToBundledCapabilitiesInPostgres(input: {
+  organizationId: string
+  printAgentGlobalId: string
+  actorEmail: string
+  idempotencyKey: string
+}) {
+  const organizationId = requiredOrganizationId(input.organizationId)
+  const actorEmail = requiredActor(input.actorEmail)
+  requiredIdempotencyKey(input.idempotencyKey)
+  if (!AGENT_GLOBAL_ID.test(input.printAgentGlobalId)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_AGENT_NOT_FOUND',
+      'Local print agent was not found',
+      404,
+    )
+  }
+  const requestFingerprint = fingerprint({
+    action: 'upgrade-print-agent-bundled-capabilities',
+    printAgentGlobalId: input.printAgentGlobalId,
+    ...DEFAULT_PRINT_AGENT_CAPABILITIES,
+  })
+  const auditKey =
+    `operations:print-agent:bundled-capabilities:${organizationId}:${input.printAgentGlobalId}`
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:print-agent-capabilities:${organizationId}:${input.printAgentGlobalId}`,
+    )
+    const replay = await client.query<{
+      payload: { requestFingerprint?: string } | null
+    }>(
+      `SELECT payload
+       FROM audit_events
+       WHERE event_key = $1
+       LIMIT 1`,
+      [auditKey],
+    )
+    if (replay.rows[0]) {
+      if (replay.rows[0].payload?.requestFingerprint !== requestFingerprint) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PRINT_IDEMPOTENCY_REUSED',
+          'Idempotency-Key was already used for a different bundled capability upgrade',
+          409,
+        )
+      }
+      return oneAgent(organizationId, input.printAgentGlobalId, client)
+    }
+
+    const current = await client.query<{
+      status: OperationsPrintAgentProfile['status']
+      supported_formats: OperationsPrintAgentProfile['supportedFormats']
+      supported_media: OperationsPrintAgentProfile['supportedMedia']
+      supported_document_types: OperationsPrintAgentProfile['supportedDocumentTypes']
+    }>(
+      `SELECT status, supported_formats, supported_media,
+         supported_document_types
+       FROM operations_print_agents
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+       FOR UPDATE`,
+      [organizationId, input.printAgentGlobalId],
+    )
+    if (!current.rows[0]) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_AGENT_NOT_FOUND',
+        'Local print agent was not found',
+        404,
+      )
+    }
+    if (current.rows[0].status !== 'active') {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_AGENT_REVOKED',
+        'Revoked print agents cannot change capabilities',
+        409,
+      )
+    }
+    const currentCapabilities = {
+      supportedFormats: current.rows[0].supported_formats,
+      supportedMedia: current.rows[0].supported_media,
+      supportedDocumentTypes: current.rows[0].supported_document_types,
+    }
+    const isLegacyBundled = printAgentCapabilitiesAreSubset(
+      currentCapabilities,
+      LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES,
+    ) && printAgentCapabilitiesAreSubset(
+      LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES,
+      currentCapabilities,
+    )
+    const isCurrentBundled = printAgentCapabilitiesAreSubset(
+      currentCapabilities,
+      DEFAULT_PRINT_AGENT_CAPABILITIES,
+    ) && printAgentCapabilitiesAreSubset(
+      DEFAULT_PRINT_AGENT_CAPABILITIES,
+      currentCapabilities,
+    )
+    if (!isLegacyBundled && !isCurrentBundled) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_AGENT_CAPABILITIES_CUSTOM',
+        'Only the exact legacy bundled Zebra capability profile can be upgraded automatically',
+        409,
+      )
+    }
+    if (isLegacyBundled) {
+      await client.query(
+        `UPDATE operations_print_agents
+         SET supported_formats = $3::text[],
+             supported_media = $4::text[],
+             supported_document_types = $5::text[]
+         WHERE organization_id = $1::uuid
+           AND global_id = $2`,
+        [
+          organizationId,
+          input.printAgentGlobalId,
+          DEFAULT_PRINT_AGENT_CAPABILITIES.supportedFormats,
+          DEFAULT_PRINT_AGENT_CAPABILITIES.supportedMedia,
+          DEFAULT_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes,
+        ],
+      )
+    }
+    const agent = await oneAgent(organizationId, input.printAgentGlobalId, client)
+    await recordAuditEvent({
+      actor: actorEmail,
+      eventType: 'operations.print_agent.bundled_capabilities_upgraded',
+      aggregateType: 'operations.print_agent',
+      aggregateId: agent.globalId,
+      eventKey: auditKey,
+      subject: agent.name,
+      organizationId,
+      payload: {
+        printAgentGlobalId: agent.globalId,
+        warehouseGlobalId: agent.warehouseGlobalId,
+        supportedFormats: agent.supportedFormats,
+        supportedMedia: agent.supportedMedia,
+        supportedDocumentTypes: agent.supportedDocumentTypes,
+        requestFingerprint,
+      },
+    }, client)
+    return agent
   })
 }
 

@@ -828,6 +828,7 @@ async function verifyAgentCapabilityBackfill(connectionString) {
       ),
       /subset of its local print agent capabilities/,
     )
+    await pool.query(read('db/migrations/0262_operations_barcode_label_printing.sql'))
   } finally {
     await pool.end()
   }
@@ -853,6 +854,44 @@ async function verifyRuntime(connectionString) {
       },
     )
     const fixture = await seedBase(pool)
+    const legacyBundledEnrollment = await persistence.enrollOperationsPrintAgentInPostgres({
+      organizationId: fixture.organizationId,
+      warehouseId: fixture.warehouseId,
+      name: 'Legacy bundled Zebra agent',
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `legacy-bundled-agent-${fixture.suffix}`,
+      ...printing.LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES,
+    })
+    const upgradedBundledAgent = await persistence
+      .upgradeOperationsPrintAgentToBundledCapabilitiesInPostgres({
+        organizationId: fixture.organizationId,
+        printAgentGlobalId: legacyBundledEnrollment.agent.globalId,
+        actorEmail: fixture.actorEmail,
+        idempotencyKey: `upgrade-bundled-agent-${fixture.suffix}`,
+      })
+    assert.deepEqual(
+      structuredClone(upgradedBundledAgent.supportedFormats),
+      structuredClone(printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedFormats),
+    )
+    assert.deepEqual(
+      structuredClone(upgradedBundledAgent.supportedMedia),
+      structuredClone(printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedMedia),
+    )
+    assert.deepEqual(
+      structuredClone(upgradedBundledAgent.supportedDocumentTypes),
+      structuredClone(printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes),
+    )
+    const replayedBundledUpgrade = await persistence
+      .upgradeOperationsPrintAgentToBundledCapabilitiesInPostgres({
+        organizationId: fixture.organizationId,
+        printAgentGlobalId: legacyBundledEnrollment.agent.globalId,
+        actorEmail: fixture.actorEmail,
+        idempotencyKey: `upgrade-bundled-agent-replay-${fixture.suffix}`,
+      })
+    assert.equal(replayedBundledUpgrade.globalId, upgradedBundledAgent.globalId)
+    assert.ok(await persistence.authenticateOperationsPrintAgentInPostgres(
+      legacyBundledEnrollment.credential,
+    ))
     const packingCapabilities = {
       supportedFormats: ['PDF'],
       supportedMedia: ['letter', 'a4'],
@@ -897,6 +936,15 @@ async function verifyRuntime(connectionString) {
     assert.deepEqual(
       structuredClone(fallbackEnrollment.agent.supportedMedia),
       packingCapabilities.supportedMedia,
+    )
+    await expectRejected(
+      () => persistence.upgradeOperationsPrintAgentToBundledCapabilitiesInPostgres({
+        organizationId: fixture.organizationId,
+        printAgentGlobalId: fallbackEnrollment.agent.globalId,
+        actorEmail: fixture.actorEmail,
+        idempotencyKey: `reject-custom-agent-upgrade-${fixture.suffix}`,
+      }),
+      /Only the exact legacy bundled Zebra capability profile/,
     )
 
     const fallback = await createPrinter(pool, fixture, {

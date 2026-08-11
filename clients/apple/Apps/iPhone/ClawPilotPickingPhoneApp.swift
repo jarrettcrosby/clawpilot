@@ -498,7 +498,38 @@ final class PickingPhoneModel: ObservableObject {
                 status = "Google did not return a verified identity token."
                 return
             }
-            try await api.verifyGoogleIdentityToken(idToken)
+            do {
+                try await api.verifyGoogleIdentityToken(idToken)
+            } catch PickingAPIError.rejected(let code, _) where code == "GOOGLE_SSO_LINK_REQUIRED" {
+                // A locally restored, recently authenticated magic-code session may
+                // still be valid even when the shell is showing its signed-out
+                // state. In that case the user's Google tap is an explicit link
+                // request, and the normal policy/version/idempotency fences remain
+                // authoritative. With no valid session, preserve the link-required
+                // response and direct the user through the first-time flow.
+                do {
+                    let state = try await api.fetchGoogleAuthState()
+                    guard state.platformConfigured, state.enabled else {
+                        throw PickingAPIError.rejected(
+                            code: "GOOGLE_SSO_DISABLED",
+                            message: "Google sign-in is not enabled for this organization."
+                        )
+                    }
+                    if !state.identity.linked {
+                        _ = try await api.linkGoogleIdentityToken(
+                            idToken,
+                            expectedPolicyRowVersion: state.rowVersion,
+                            idempotencyKey: UUID().uuidString
+                        )
+                    }
+                    try await api.verifyGoogleIdentityToken(idToken)
+                } catch PickingAPIError.unauthorized {
+                    throw PickingAPIError.rejected(
+                        code: "GOOGLE_SSO_LINK_REQUIRED",
+                        message: "First sign in with a magic code, then open Settings > Security and link your Google account."
+                    )
+                }
+            }
             sessionProfile = try await api.fetchSessionProfile()
             email = sessionProfile?.effectiveUser.email ?? result.user.profile?.email ?? ""
             isAuthenticated = true
@@ -506,6 +537,9 @@ final class PickingPhoneModel: ObservableObject {
             biometrics.rememberAuthenticatedSession()
             status = "Signed in with Google. Choose a workflow to begin."
             await refreshGoogleAuthState()
+        } catch PickingAPIError.rejected(let code, _) where code == "GOOGLE_SSO_LINK_REQUIRED" {
+            isAuthenticated = false
+            status = "Google is not linked yet. Sign in with a magic code, then open Settings > Security and tap Link my Google account."
         } catch {
             isAuthenticated = false
             status = "Google sign-in failed: \(error.localizedDescription)"

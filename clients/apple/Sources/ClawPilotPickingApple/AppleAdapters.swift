@@ -694,9 +694,26 @@ public actor PickingAPIClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await session.data(for: request)
-        try validateHTTP(response)
+        guard let http = response as? HTTPURLResponse else {
+            throw PickingAPIError.invalidResponse
+        }
+        if http.statusCode == 429 {
+            let seconds = Int(http.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 60
+            throw PickingAPIError.rateLimited(retryAfterSeconds: max(1, seconds))
+        }
+        let envelope = try? decoder.decode(BasicEnvelope.self, from: data)
+        guard (200..<300).contains(http.statusCode) else {
+            if let envelope, let code = envelope.code {
+                throw PickingAPIError.rejected(
+                    code: code,
+                    message: envelope.error ?? "Authentication failed"
+                )
+            }
+            if http.statusCode == 401 { throw PickingAPIError.unauthorized }
+            throw PickingAPIError.invalidResponse
+        }
+        guard let envelope else { throw PickingAPIError.invalidResponse }
         persistResponseCookies(response)
-        let envelope = try decoder.decode(BasicEnvelope.self, from: data)
         guard envelope.ok else {
             throw PickingAPIError.rejected(
                 code: envelope.code ?? "AUTH_FAILED",

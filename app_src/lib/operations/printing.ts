@@ -61,10 +61,26 @@ export type PrintAgentCapabilities = {
   supportedDocumentTypes: PrintDocumentType[]
 }
 
-export const DEFAULT_PRINT_AGENT_CAPABILITIES: PrintAgentCapabilities = {
+export const LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES: PrintAgentCapabilities = {
   supportedFormats: ['ZPL'],
   supportedMedia: ['label_4x6'],
   supportedDocumentTypes: ['shipping_label'],
+}
+
+export const DEFAULT_PRINT_AGENT_CAPABILITIES: PrintAgentCapabilities = {
+  supportedFormats: ['ZPL'],
+  supportedMedia: [
+    'label_2x1',
+    'label_3x1',
+    'label_4x2',
+    'label_4x6',
+    'label_4x8',
+  ],
+  supportedDocumentTypes: [
+    'shipping_label',
+    'product_label',
+    'location_label',
+  ],
 }
 
 export type OperationsPrinterProfile = {
