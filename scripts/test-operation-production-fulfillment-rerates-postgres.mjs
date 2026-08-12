@@ -679,10 +679,12 @@ async function seedPrerequisiteLineage(client, ids) {
          organization_id, integration_account_id, credential_ciphertext,
          credential_iv, credential_tag, credential_version,
          client_id_last_four, account_number_last_four,
+         credential_kind, credential_identifier_last_four,
          verification_status, verified_at, credential_fingerprint
        ) VALUES (
          $1, $2, decode('010203', 'hex'), decode('040506', 'hex'),
-         decode('070809', 'hex'), 1, 'c123', '1234', 'verified', now(),
+         decode('070809', 'hex'), 1, 'c123', '1234',
+         'oauth_client_credentials', 'c123', 'verified', now(),
          operations_carrier_credential_fingerprint(
            1, decode('010203', 'hex'), decode('040506', 'hex'),
            decode('070809', 'hex')
