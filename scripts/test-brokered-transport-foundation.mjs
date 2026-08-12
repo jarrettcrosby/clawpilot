@@ -574,6 +574,11 @@ assert.match(
   migration,
   /provider = 'wwex_speedship'[\s\S]{0,500}executing_carrier_scac IS NOT NULL/,
 )
+assert.match(
+  migration,
+  /operations_carrier_rate_requests_provider_account_valid[\s\S]{0,500}\) NOT VALID;/,
+  'Legacy append-only direct-carrier evidence may remain account-null while the stricter provider/account rule is enforced for new writes',
+)
 
 function configuredCapabilityAllowlist(provider) {
   const marker = `input_provider = '${provider}'\n         AND capability #>> '{}' NOT IN (`

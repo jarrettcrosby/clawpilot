@@ -373,7 +373,7 @@ ALTER TABLE operations_carrier_rate_requests
         provider NOT IN ('wwex_speedship', 'rl_carriers')
         AND carrier_account_id IS NOT NULL
       )
-    );
+    ) NOT VALID;
 
 CREATE OR REPLACE FUNCTION operations_one_off_transport_provider_set_is_valid(
   input_providers text[]
