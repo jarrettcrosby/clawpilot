@@ -16,6 +16,9 @@ import PosSection from '@/components/pos/PosSection'
 import OperationsSection, {
   type OperationsView,
 } from '@/components/operations/OperationsSection'
+import ShippingSection, {
+  type ShippingView,
+} from '@/components/shipping/ShippingSection'
 import ShortcutsModal from '@/components/help/ShortcutsModal'
 import SessionGuard from '@/components/auth/SessionGuard'
 import ImpersonationBanner from '@/components/auth/ImpersonationBanner'
@@ -25,7 +28,7 @@ import { emptyFilter } from '@/components/projects/FilterBar'
 import { WORKSPACE_CHANGED_EVENT, type WorkspaceChangedDetail } from '@/lib/workspaceClient'
 import { accountingSectionFromNavigationUrl } from '@/lib/accountingDraftNavigation'
 
-const SECTIONS = ['dashboard', 'docs', 'projects', 'pipeline', 'crm', 'accounting', 'pos', 'operations', 'links', 'agents', 'versions']
+const SECTIONS = ['dashboard', 'docs', 'projects', 'pipeline', 'crm', 'accounting', 'pos', 'operations', 'shipping', 'links', 'agents', 'versions']
 const OPERATIONS_TARGETS: Record<string, OperationsView> = {
   operations: 'orders',
   'operations/exceptions': 'exceptions',
@@ -38,6 +41,11 @@ const OPERATIONS_TARGETS: Record<string, OperationsView> = {
   'operations/gl-coding': 'gl-coding',
   'operations/printing': 'printing',
 }
+const SHIPPING_TARGETS: Record<string, ShippingView> = {
+  shipping: 'create',
+  'shipping/shipments': 'shipments',
+  'shipping/pickups': 'pickups',
+}
 const DESKTOP_NAV_COLLAPSED_KEY = 'clawpilot_desktop_nav_collapsed'
 const DESKTOP_NAV_PREFERENCE_EVENT = 'clawpilot:desktop-nav-preference'
 
@@ -47,6 +55,7 @@ function getNavigationTargetFromHash(): string {
   if (accountingSection) return accountingSection
   const hash = window.location.hash.replace('#', '')
   if (hash in OPERATIONS_TARGETS) return hash
+  if (hash in SHIPPING_TARGETS) return hash
   return SECTIONS.includes(hash) ? hash : 'dashboard'
 }
 
@@ -246,8 +255,8 @@ export default function HomeClient({
           key={`workspace-${workspaceRevision}`}
           sx={{
             flex: 1,
-            overflow: ['docs', 'projects', 'pipeline', 'crm', 'accounting', 'pos', 'operations'].includes(section) ? 'hidden' : 'auto',
-            pb: ['docs', 'projects', 'pipeline', 'crm', 'accounting', 'pos', 'operations'].includes(section)
+            overflow: ['docs', 'projects', 'pipeline', 'crm', 'accounting', 'pos', 'operations', 'shipping'].includes(section) ? 'hidden' : 'auto',
+            pb: ['docs', 'projects', 'pipeline', 'crm', 'accounting', 'pos', 'operations', 'shipping'].includes(section)
               ? { xs: 'calc(var(--mobile-navigation-height) + env(safe-area-inset-bottom) + 8px)', md: 0 }
               : { xs: 'calc(var(--mobile-navigation-height) + env(safe-area-inset-bottom) + 16px)', md: 2 },
           }}
@@ -295,6 +304,14 @@ export default function HomeClient({
             <Box sx={{ height: '100%', overflow: 'hidden' }}>
               <OperationsSection
                 initialView={OPERATIONS_TARGETS[navigationTarget] || 'orders'}
+              />
+            </Box>
+          )}
+          {section === 'shipping' && (
+            <Box sx={{ height: '100%', overflow: 'hidden' }}>
+              <ShippingSection
+                view={SHIPPING_TARGETS[navigationTarget] || 'create'}
+                onNavigate={navigate}
               />
             </Box>
           )}

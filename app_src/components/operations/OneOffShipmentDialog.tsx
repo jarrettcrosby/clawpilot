@@ -50,7 +50,6 @@ import {
   type OneOffShipmentWorkspace,
 } from '@/lib/operations/oneOffShipments'
 import { ONE_OFF_MAX_SYNCHRONOUS_PACKAGES } from '@/lib/operations/oneOffShipmentConstants'
-import LtlFreightClassAssessmentPanel from '@/components/operations/LtlFreightClassAssessmentPanel'
 
 type DraftLine = {
   lineKey: string
@@ -651,9 +650,9 @@ export default function OneOffShipmentDialog({
       <Box component="form" onSubmit={createAndPlan} sx={{ display: 'flex', flexDirection: 'column', minHeight: 0, flex: 1 }}>
         <DialogTitle sx={{ display: 'flex', alignItems: 'flex-start', gap: 1 }}>
           <Box sx={{ flex: 1 }}>
-            <Typography component="span" variant="h6" fontWeight={700}>Create one-off shipment</Typography>
+            <Typography component="span" variant="h6" fontWeight={700}>Create parcel shipment</Typography>
             <Typography display="block" variant="body2" color="text.secondary">
-              Build a planned warehouse order and compare rates from enabled carriers.
+              Build a parcel plan and compare enabled direct UPS and FedEx rates.
             </Typography>
           </Box>
           <IconButton aria-label="Close one-off shipment" onClick={close} disabled={Boolean(busy)}>
@@ -1000,7 +999,6 @@ export default function OneOffShipmentDialog({
                       </Stack>
                     </Box>
                   ))}
-                  <LtlFreightClassAssessmentPanel />
                   <Box sx={{ p: 2, borderRadius: 2, backgroundColor: 'rgba(168,199,250,0.07)' }}>
                     <Typography variant="subtitle2">Enabled rate sources</Typography>
                     <Stack direction="row" gap={1} flexWrap="wrap" useFlexGap sx={{ mt: 1 }}>

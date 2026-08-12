@@ -36,6 +36,7 @@ app_visible: true
 
 ## Distributed Operations
 
+- [Shipping](../modules/shipping.md): separate Parcel and LTL creation, shipment-record views, and pickup-readiness boundaries.
 - [Distributed Operations](../modules/distributed-operations.md): domain authority, state machines, shipment-safety invariants, packing-slip and tracking evidence, and adapter contracts.
 - [Distributed Operations Runbook](../operations/distributed-operations-runbook.md): target activation, sandbox/production shipment boundaries, artifact and commerce-export diagnostics, monitoring, incidents, recovery, and rollback.
 - [Distributed Operations Delivery, Migration, and Test Plan](../architecture/distributed-operations-delivery-plan.md): phased gates, migration/cutover strategy, and S01-S25 acceptance.

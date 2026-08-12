@@ -31,6 +31,10 @@ import MoveToInboxRounded from '@mui/icons-material/MoveToInboxRounded'
 import PrintRounded from '@mui/icons-material/PrintRounded'
 import ReceiptLongRounded from '@mui/icons-material/ReceiptLongRounded'
 import ScienceRounded from '@mui/icons-material/ScienceRounded'
+import AddCircleOutlineRounded from '@mui/icons-material/AddCircleOutlineRounded'
+import EventAvailableRounded from '@mui/icons-material/EventAvailableRounded'
+import FlightTakeoffRounded from '@mui/icons-material/FlightTakeoffRounded'
+import ListAltRounded from '@mui/icons-material/ListAltRounded'
 import SpaceDashboardRounded from '@mui/icons-material/SpaceDashboardRounded'
 import WarningAmberRounded from '@mui/icons-material/WarningAmberRounded'
 import WarehouseRounded from '@mui/icons-material/WarehouseRounded'
@@ -103,6 +107,24 @@ const OPERATIONS_CHILDREN: NavigationChild[] = [
   },
 ]
 
+const SHIPPING_CHILDREN: NavigationChild[] = [
+  {
+    id: 'shipping',
+    label: 'Create shipment',
+    Icon: AddCircleOutlineRounded,
+  },
+  {
+    id: 'shipping/shipments',
+    label: 'Shipments',
+    Icon: ListAltRounded,
+  },
+  {
+    id: 'shipping/pickups',
+    label: 'Schedule pickups',
+    Icon: EventAvailableRounded,
+  },
+]
+
 const NAV_ITEMS: NavigationItem[] = [
   { id: 'dashboard', label: 'Dashboard', Icon: DashboardIcon },
   { id: 'docs', label: 'Docs', Icon: DocsIcon },
@@ -116,6 +138,12 @@ const NAV_ITEMS: NavigationItem[] = [
     label: 'Operations',
     Icon: LocalShippingRounded,
     children: OPERATIONS_CHILDREN,
+  },
+  {
+    id: 'shipping',
+    label: 'Shipping',
+    Icon: FlightTakeoffRounded,
+    children: SHIPPING_CHILDREN,
   },
   { id: 'links', label: 'Links', Icon: LinkRounded },
   { id: 'agents', label: 'Agents', Icon: AgentsIcon },
@@ -146,10 +174,13 @@ type NavigationListProps = {
 function NavigationList({ activeSection, collapsed = false, onSelect, surface, showLinks }: NavigationListProps) {
   const items = showLinks ? NAV_ITEMS : NAV_ITEMS.filter((item) => item.id !== 'links')
   const activeRoot = activeSection.split('/')[0]
-  const [flyoutAnchor, setFlyoutAnchor] = useState<HTMLElement | null>(null)
+  const [flyout, setFlyout] = useState<{
+    anchor: HTMLElement
+    item: NavigationItem
+  } | null>(null)
 
   const selectFlyoutItem = (section: string) => {
-    setFlyoutAnchor(null)
+    setFlyout(null)
     onSelect(section)
   }
 
@@ -171,13 +202,13 @@ function NavigationList({ activeSection, collapsed = false, onSelect, surface, s
                   aria-haspopup={collapsed && item.children ? 'menu' : undefined}
                   aria-expanded={
                     collapsed && item.children
-                      ? Boolean(flyoutAnchor)
+                      ? flyout?.item.id === item.id
                       : undefined
                   }
                   selected={activeRoot === item.id}
                   onClick={(event: MouseEvent<HTMLElement>) => {
                     if (collapsed && item.children) {
-                      setFlyoutAnchor(event.currentTarget)
+                      setFlyout({ anchor: event.currentTarget, item })
                       return
                     }
                     onSelect(item.id)
@@ -271,14 +302,16 @@ function NavigationList({ activeSection, collapsed = false, onSelect, surface, s
         ))}
       </List>
       <Menu
-        anchorEl={flyoutAnchor}
-        open={Boolean(flyoutAnchor)}
-        onClose={() => setFlyoutAnchor(null)}
+        anchorEl={flyout?.anchor || null}
+        open={Boolean(flyout)}
+        onClose={() => setFlyout(null)}
         anchorOrigin={{ vertical: 'top', horizontal: 'right' }}
         transformOrigin={{ vertical: 'top', horizontal: 'left' }}
-        MenuListProps={{ 'aria-label': 'Operations submodules' }}
+        MenuListProps={{
+          'aria-label': `${flyout?.item.label || 'Module'} submodules`,
+        }}
       >
-        {OPERATIONS_CHILDREN.map((child) => (
+        {(flyout?.item.children || []).map((child) => (
           <MenuItem
             key={child.id}
             selected={activeSection === child.id}
