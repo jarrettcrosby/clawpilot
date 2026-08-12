@@ -4,6 +4,7 @@ import MWDATCamera
 import MWDATCore
 import UIKit
 import Vision
+import ClawPilotPickingApple
 
 @MainActor
 enum MetaWearablesAppBridge {
@@ -109,6 +110,33 @@ enum MetaScanError: LocalizedError, Sendable, Equatable {
     }
 }
 
+struct MetaBarcodeDecodeTarget: @unchecked Sendable {
+    let expectedValue: String?
+    fileprivate let symbologies: [VNBarcodeSymbology]
+
+    init(expectedValue: String?, symbologies: [VNBarcodeSymbology]) {
+        self.expectedValue = expectedValue
+        self.symbologies = symbologies
+    }
+
+    static func location(expectedValue: String?) -> Self {
+        Self(expectedValue: expectedValue, symbologies: [.code128, .qr])
+    }
+
+    static func product(expectedValue: String?) -> Self {
+        Self(
+            expectedValue: expectedValue,
+            symbologies: [
+                .ean8, .ean13, .upce,
+                .code128, .code39, .code93,
+                .i2of5, .itf14,
+                .gs1DataBar, .gs1DataBarExpanded, .gs1DataBarLimited,
+                .dataMatrix, .qr, .pdf417, .aztec,
+            ]
+        )
+    }
+}
+
 actor MetaWearablesBarcodeSource {
     nonisolated let barcodes: AsyncStream<String>
     private nonisolated let continuation: AsyncStream<String>.Continuation
@@ -119,24 +147,38 @@ actor MetaWearablesBarcodeSource {
     private var camera: MWDATCamera.Camera?
     private var active = false
     private var startContinuation: CheckedContinuation<Void, any Error>?
-    private var photoRequested = false
-    private var photoRetryTask: Task<Void, Never>?
+    private var photoCaptureSequence = 0
+    private var photoCaptureAttempt = 0
+    private var photoCaptureSequenceStartedAtNanoseconds: UInt64 = 0
+    private var photoCaptureTask: Task<Void, Never>?
+    private var teardownTask: Task<Void, Never>?
+    private var stopRequested = false
 
-    init() {
+    init(target: MetaBarcodeDecodeTarget) {
         var continuation: AsyncStream<String>.Continuation!
         barcodes = AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation = $0 }
         self.continuation = continuation
-        processor = MetaVisionFrameProcessor(continuation: continuation)
+        processor = MetaVisionFrameProcessor(
+            continuation: continuation,
+            target: target
+        )
     }
 
     func start() async throws {
         guard !active else { return }
+        guard !stopRequested, teardownTask == nil else {
+            throw MetaScanError.sessionFailed
+        }
         guard Wearables.shared.registrationState == .registered else {
             throw MetaScanError.registrationRequired
         }
         guard try await Wearables.shared.checkPermissionStatus(.camera) == .granted else {
             throw MetaScanError.cameraPermissionRequired
         }
+        // Camera permission is an actor suspension point. A user stop issued
+        // while it is in flight must prevent this one-shot source from later
+        // creating a session whose AsyncStream has already been finished.
+        guard !stopRequested else { throw MetaScanError.sessionFailed }
         let registeredDevices = Wearables.shared.devices
         ClawPilotScanDiagnostic.record("device-count:\(registeredDevices.count)")
         let devices = registeredDevices.filter { identifier in
@@ -161,7 +203,6 @@ actor MetaWearablesBarcodeSource {
         active = true
         deviceSession = session
         processor.reset()
-        photoRequested = false
         session.statePublisher.listen { [weak self] state in
             ClawPilotScanDiagnostic.record("session-state:\(String(describing: state))")
             Task { await self?.handleSessionState(state) }
@@ -175,46 +216,37 @@ actor MetaWearablesBarcodeSource {
             do {
                 try session.start()
             } catch {
-                failStart()
+                _ = failStart()
             }
         }
     }
 
-    func stop() {
-        continuation.finish()
-        failStart()
-        guard active else { return }
-        active = false
-        streamTokens.clear()
-        sessionTokens.clear()
-        photoRetryTask?.cancel()
-        photoRetryTask = nil
-        camera?.stop()
-        deviceSession?.stop()
-        camera = nil
-        deviceSession = nil
+    func stop() async {
+        if let task = failStart() {
+            await task.value
+        }
     }
 
-    func prepareForNextBarcode() {
+    func prepareForNextBarcode(target: MetaBarcodeDecodeTarget) {
         guard active else { return }
-        processor.reset()
-        captureFollowupPhoto()
+        processor.reset(target: target)
+        beginPhotoCaptureSequence()
     }
 
     private func handleSessionState(_ state: DeviceSessionState) {
         guard active else { return }
         switch state {
         case .started: attachCamera()
-        case .stopped: stop()
+        case .stopped: _ = failStart()
         case .idle, .starting, .paused, .stopping: break
         }
     }
 
     private func handleSessionError(_ error: DeviceSessionError) {
         if error == .datAppOnTheGlassesUpdateRequired {
-            failStart(MetaScanError.glassesAppUpdateRequired)
+            _ = failStart(MetaScanError.glassesAppUpdateRequired)
         } else {
-            failStart(MetaScanError.sessionFailed)
+            _ = failStart(MetaScanError.sessionFailed)
         }
     }
 
@@ -227,13 +259,14 @@ actor MetaWearablesBarcodeSource {
                 frameRate: 15
             )
             guard let camera = try deviceSession.addCamera(config: configuration) else {
-                stop()
+                _ = failStart()
                 return
             }
             self.camera = camera
             let processor = processor
-            camera.stream.photoDataPublisher.listen { photo in
+            camera.stream.photoDataPublisher.listen { [weak self] photo in
                 processor.consume(photo)
+                Task { await self?.handlePhotoDelivered() }
             }.store(in: streamTokens)
             camera.stream.videoFramePublisher.listen { frame in
                 processor.consume(frame)
@@ -248,35 +281,19 @@ actor MetaWearablesBarcodeSource {
             }.store(in: streamTokens)
             camera.stream.start()
         } catch {
-            failStart()
+            _ = failStart()
         }
     }
 
     private func handleStreamState(_ state: StreamState) {
-        guard active, let camera else { return }
+        guard active, camera != nil else { return }
         switch state {
         case .streaming:
-            if !photoRequested {
-                photoRequested = true
-                let accepted = camera.stream.capturePhoto(format: .jpeg)
-                if accepted {
-                    photoRetryTask?.cancel()
-                    photoRetryTask = Task { [weak self] in
-                        // The first photo can occur before the worker has the
-                        // barcode centered. Retry high-resolution capture while
-                        // live frames continue as a lower-latency fallback.
-                        for _ in 0..<6 {
-                            try? await Task.sleep(for: .seconds(2))
-                            guard !Task.isCancelled else { return }
-                            await self?.captureFollowupPhoto()
-                        }
-                    }
-                }
-            }
+            beginPhotoCaptureSequence()
             startContinuation?.resume()
             startContinuation = nil
         case .stopped:
-            stop()
+            _ = failStart()
         case .stopping, .waitingForDevice, .starting, .paused:
             break
         }
@@ -284,161 +301,845 @@ actor MetaWearablesBarcodeSource {
 
     private func handleStreamError(_ error: StreamError) {
         if error == .photoCaptureFailed {
-            captureFollowupPhoto()
+            ClawPilotScanDiagnostic.record("photo-capture-result:outcome=error")
+            scheduleNextPhotoCapture(
+                sequence: photoCaptureSequence,
+                delayMilliseconds: 750,
+                trigger: "capture-error"
+            )
         } else {
-            stop()
+            _ = failStart()
         }
     }
 
-    private func captureFollowupPhoto() {
-        guard active, let camera else { return }
-        _ = camera.stream.capturePhoto(format: .jpeg)
+    private func beginPhotoCaptureSequence() {
+        guard active else { return }
+        photoCaptureTask?.cancel()
+        photoCaptureSequence += 1
+        photoCaptureAttempt = 0
+        photoCaptureSequenceStartedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
+        let sequence = photoCaptureSequence
+        requestNextPhotoCapture(sequence: sequence, trigger: "initial")
     }
 
-    private func failStart(_ error: any Error = MetaScanError.sessionFailed) {
+    private func handlePhotoDelivered() {
+        guard active, photoCaptureAttempt > 0 else { return }
+        let elapsedMilliseconds = photoCaptureElapsedMilliseconds()
+        ClawPilotScanDiagnostic.record(
+            "photo-capture-result:attempt=\(photoCaptureAttempt):outcome=delivered:elapsed_ms=\(elapsedMilliseconds)"
+        )
+        scheduleNextPhotoCapture(
+            sequence: photoCaptureSequence,
+            delayMilliseconds: 650,
+            trigger: "photo-delivered"
+        )
+    }
+
+    private func scheduleNextPhotoCapture(
+        sequence: Int,
+        delayMilliseconds: Int,
+        trigger: String
+    ) {
+        guard active,
+              sequence == photoCaptureSequence,
+              photoCaptureAttempt < 3
+        else { return }
+        photoCaptureTask?.cancel()
+        photoCaptureTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(delayMilliseconds))
+            guard !Task.isCancelled else { return }
+            await self?.requestNextPhotoCapture(
+                sequence: sequence,
+                trigger: trigger
+            )
+        }
+    }
+
+    private func requestNextPhotoCapture(
+        sequence: Int,
+        trigger: String
+    ) {
+        guard active,
+              sequence == photoCaptureSequence,
+              photoCaptureAttempt < 3,
+              let camera
+        else { return }
+        photoCaptureAttempt += 1
+        let attempt = photoCaptureAttempt
+        let accepted = camera.stream.capturePhoto(format: .jpeg)
+        let outcome = accepted ? "accepted" : "rejected"
+        ClawPilotScanDiagnostic.record(
+            "photo-capture-request:attempt=\(attempt):trigger=\(trigger):outcome=\(outcome):elapsed_ms=\(photoCaptureElapsedMilliseconds())"
+        )
+        scheduleNextPhotoCapture(
+            sequence: sequence,
+            delayMilliseconds: accepted ? 4_000 : 750,
+            trigger: accepted ? "delivery-timeout" : "request-rejected"
+        )
+    }
+
+    private func photoCaptureElapsedMilliseconds() -> UInt64 {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now >= photoCaptureSequenceStartedAtNanoseconds else { return 0 }
+        return (now - photoCaptureSequenceStartedAtNanoseconds) / 1_000_000
+    }
+
+    @discardableResult
+    private func failStart(
+        _ error: any Error = MetaScanError.sessionFailed
+    ) -> Task<Void, Never>? {
+        stopRequested = true
+        processor.cancel()
+        continuation.finish()
         if let startContinuation {
             self.startContinuation = nil
             startContinuation.resume(throwing: error)
         }
-        guard active else { return }
         active = false
+        photoCaptureTask?.cancel()
+        photoCaptureTask = nil
+
+        if let teardownTask { return teardownTask }
+
         streamTokens.clear()
         sessionTokens.clear()
-        photoRetryTask?.cancel()
-        photoRetryTask = nil
         camera?.stop()
-        deviceSession?.stop()
+
+        guard let session = deviceSession else {
+            camera = nil
+            return nil
+        }
+
+        // Capture the terminal stream before requesting stop. DAT documents
+        // that it delivers `.stopped` and then finishes, while a stream created
+        // after an already-stopped session finishes immediately.
+        let states = session.stateStream()
+        session.stop()
+        let task = Task { [weak self] in
+            let reachedStopped = await Self.waitForStopped(
+                session: session,
+                states: states,
+                timeout: .seconds(4)
+            )
+            await self?.completeTeardown(
+                session: session,
+                reachedStopped: reachedStopped
+            )
+        }
+        teardownTask = task
+        return task
+    }
+
+    private func completeTeardown(
+        session: DeviceSession,
+        reachedStopped: Bool
+    ) {
+        guard deviceSession === session else { return }
+        if reachedStopped {
+            ClawPilotScanDiagnostic.record("session-teardown:outcome=stopped")
+        } else {
+            ClawPilotScanDiagnostic.record(
+                "session-teardown:outcome=timeout:state=\(String(describing: session.state))"
+            )
+        }
         camera = nil
         deviceSession = nil
-        continuation.finish()
+        teardownTask = nil
+    }
+
+    private nonisolated static func waitForStopped(
+        session: DeviceSession,
+        states: AsyncStream<DeviceSessionState>,
+        timeout: Duration
+    ) async -> Bool {
+        if session.state == .stopped { return true }
+        return await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                for await state in states {
+                    if state == .stopped { return true }
+                }
+                return session.state == .stopped
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: timeout)
+                    return false
+                } catch {
+                    return false
+                }
+            }
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
+        }
     }
 }
 
 private final class MetaVisionFrameProcessor: @unchecked Sendable {
+    private enum InputKind: String, Sendable {
+        case photo
+        case video
+    }
+
+    private enum InputContent: @unchecked Sendable {
+        case photo(data: Data, orientations: [UInt32])
+        case video(VideoFrame)
+    }
+
+    private struct OrientationDecodeResult {
+        let decision: MetaBarcodeDecodeDecision
+        let attemptedOrientations: [UInt32]
+        let winningOrientation: UInt32?
+        let diagnosticDetails: [String]
+    }
+
+    private enum ProcessingAbort: Error {
+        case staleGeneration
+    }
+
+    private struct WorkItem: @unchecked Sendable {
+        let kind: InputKind
+        let content: InputContent
+        let dimensions: String
+        let queuedAtNanoseconds: UInt64
+        let generation: UInt64
+        let target: MetaBarcodeDecodeTarget
+    }
+
+    private static let videoThrottleNanoseconds: UInt64 = 250_000_000
+    private static let photoPriorityNanoseconds: UInt64 = 4_500_000_000
+    private static let maximumPendingPhotos = 3
+
     private let lock = NSLock()
     private let continuation: AsyncStream<String>.Continuation
-    private var decoding = false
-    private var emitted = false
-    private var recordedVideoInput = false
-    private var recordedPhotoInput = false
-    private var recordedCandidate = false
+    private let processingQueue = DispatchQueue(
+        label: "com.clawpilot.meta-barcode-vision",
+        qos: .userInitiated
+    )
+    private let arbitrator = MetaBarcodeDecodeArbitrator()
+    private var reducer = MetaBarcodeEmissionReducer()
+    private var target: MetaBarcodeDecodeTarget
+    private var generation: UInt64 = 0
+    private var terminal = false
+    private var workerRunning = false
+    private var pendingPhotos: [WorkItem] = []
+    private var pendingVideo: WorkItem?
+    private var lastAcceptedVideoNanoseconds: UInt64 = 0
+    private var photoPriorityUntilNanoseconds: UInt64 = 0
+    private var droppedCounts: [String: Int] = [:]
+    private var sampledResultCounts: [String: Int] = [:]
 
-    init(continuation: AsyncStream<String>.Continuation) {
+    init(
+        continuation: AsyncStream<String>.Continuation,
+        target: MetaBarcodeDecodeTarget
+    ) {
         self.continuation = continuation
+        self.target = target
+        photoPriorityUntilNanoseconds = Self.nowNanoseconds() + Self.photoPriorityNanoseconds
     }
 
     func reset() {
+        reset(target: nil)
+    }
+
+    func reset(target newTarget: MetaBarcodeDecodeTarget) {
+        reset(target: Optional(newTarget))
+    }
+
+    private func reset(target newTarget: MetaBarcodeDecodeTarget?) {
+        var diagnostics: [String] = []
+        let now = Self.nowNanoseconds()
         lock.lock()
-        emitted = false
-        decoding = false
-        recordedVideoInput = false
-        recordedPhotoInput = false
-        recordedCandidate = false
+        terminal = false
+        if let newTarget { target = newTarget }
+        for item in pendingPhotos {
+            if let diagnostic = droppedDiagnosticLocked(item, reason: "reset", now: now) {
+                diagnostics.append(diagnostic)
+            }
+        }
+        if let pendingVideo {
+            if let diagnostic = droppedDiagnosticLocked(
+                pendingVideo,
+                reason: "reset",
+                now: now
+            ) {
+                diagnostics.append(diagnostic)
+            }
+        }
+        generation &+= 1
+        reducer.reset()
+        pendingPhotos.removeAll(keepingCapacity: true)
+        pendingVideo = nil
+        lastAcceptedVideoNanoseconds = 0
+        photoPriorityUntilNanoseconds = now + Self.photoPriorityNanoseconds
+        droppedCounts.removeAll(keepingCapacity: true)
+        sampledResultCounts.removeAll(keepingCapacity: true)
+        lock.unlock()
+        diagnostics.forEach(ClawPilotScanDiagnostic.record)
+    }
+
+    func cancel() {
+        lock.lock()
+        guard !terminal else {
+            lock.unlock()
+            return
+        }
+        terminal = true
+        generation &+= 1
+        reducer.reset()
+        pendingPhotos.removeAll(keepingCapacity: false)
+        pendingVideo = nil
+        lastAcceptedVideoNanoseconds = 0
+        photoPriorityUntilNanoseconds = 0
         lock.unlock()
     }
 
     func consume(_ frame: VideoFrame) {
-        if markFirstInput(isPhoto: false) {
-            var dimensions = "unknown"
-            if let buffer = CMSampleBufferGetImageBuffer(frame.sampleBuffer) {
-                dimensions = "\(CVPixelBufferGetWidth(buffer))x\(CVPixelBufferGetHeight(buffer))"
-            }
-            ClawPilotScanDiagnostic.record("video-received:\(dimensions)")
+        let now = Self.nowNanoseconds()
+        var dimensions = "unknown"
+        if let buffer = CMSampleBufferGetImageBuffer(frame.sampleBuffer) {
+            dimensions = "\(CVPixelBufferGetWidth(buffer))x\(CVPixelBufferGetHeight(buffer))"
         }
-        guard beginDecoding() else { return }
-
-        let request = barcodeRequest()
-        try? VNImageRequestHandler(
-            cmSampleBuffer: frame.sampleBuffer,
-            orientation: .up
-        ).perform([request])
-        finishDecoding(request)
+        enqueueVideo(frame, dimensions: dimensions, now: now)
     }
 
     func consume(_ photo: PhotoData) {
-        if markFirstInput(isPhoto: true) {
-            ClawPilotScanDiagnostic.record("photo-received:bytes=\(photo.data.count)")
-        }
-        guard beginDecoding() else { return }
-
-        let request = barcodeRequest()
-        try? VNImageRequestHandler(
-            data: photo.data,
-            orientation: imageOrientation(in: photo.data)
-        ).perform([request])
-        finishDecoding(request)
+        let properties = imageProperties(in: photo.data)
+        enqueuePhoto(
+            photo.data,
+            dimensions: properties.dimensions,
+            orientations: MetaBarcodeOrientationPlan.photo(
+                metadataRawValue: properties.orientationRawValue
+            ),
+            now: Self.nowNanoseconds()
+        )
     }
 
-    private func markFirstInput(isPhoto: Bool) -> Bool {
+    private func enqueueVideo(
+        _ frame: VideoFrame,
+        dimensions: String,
+        now: UInt64
+    ) {
+        var shouldStartWorker = false
+        var diagnostics: [String] = []
         lock.lock()
-        defer { lock.unlock() }
-        if isPhoto {
-            guard !recordedPhotoInput else { return false }
-            recordedPhotoInput = true
+        let item = WorkItem(
+            kind: .video,
+            content: .video(frame),
+            dimensions: dimensions,
+            queuedAtNanoseconds: now,
+            generation: generation,
+            target: target
+        )
+        if terminal {
+            // Publisher teardown can race one final callback. Do not retain or
+            // diagnose input after the scan has been cancelled.
+        } else if reducer.hasEmitted {
+            if let diagnostic = droppedDiagnosticLocked(
+                item,
+                reason: "already-emitted",
+                now: now
+            ) {
+                diagnostics.append(diagnostic)
+            }
+        } else if lastAcceptedVideoNanoseconds > 0,
+                  now - lastAcceptedVideoNanoseconds < Self.videoThrottleNanoseconds {
+            if let diagnostic = droppedDiagnosticLocked(
+                item,
+                reason: "throttled",
+                now: now
+            ) {
+                diagnostics.append(diagnostic)
+            }
         } else {
-            guard !recordedVideoInput else { return false }
-            recordedVideoInput = true
-        }
-        return true
-    }
-
-    private func beginDecoding() -> Bool {
-        lock.lock()
-        guard !decoding, !emitted else {
-            lock.unlock()
-            return false
-        }
-        decoding = true
-        lock.unlock()
-        return true
-    }
-
-    private func barcodeRequest() -> VNDetectBarcodesRequest {
-        let request = VNDetectBarcodesRequest()
-        request.symbologies = [
-            .ean8, .ean13, .upce,
-            .code128, .code39, .code93,
-            .i2of5, .itf14,
-            .gs1DataBar, .gs1DataBarExpanded, .gs1DataBarLimited,
-            .dataMatrix, .qr, .pdf417, .aztec,
-        ]
-        return request
-    }
-
-    private func finishDecoding(_ request: VNDetectBarcodesRequest) {
-        let observations = (request.results ?? []).filter { $0.confidence >= 0.25 }
-        let values = Set(observations.compactMap(\.payloadStringValue).filter { !$0.isEmpty })
-        let value = values.count == 1 ? values.first : nil
-        let bestConfidence = observations.map(\.confidence).max()
-
-        lock.lock()
-        decoding = false
-        let shouldRecordCandidate = !values.isEmpty && !recordedCandidate
-        if shouldRecordCandidate { recordedCandidate = true }
-        if let value, !value.isEmpty, !emitted {
-            emitted = true
-            lock.unlock()
-            ClawPilotScanDiagnostic.record(
-                "vision-decoded:\(value):confidence=\(bestConfidence ?? 0)"
-            )
-            continuation.yield(value)
-        } else {
-            lock.unlock()
-            if shouldRecordCandidate {
-                ClawPilotScanDiagnostic.record(
-                    "vision-candidates:\(values.count):confidence=\(bestConfidence ?? 0)"
-                )
+            lastAcceptedVideoNanoseconds = now
+            if let replaced = pendingVideo {
+                if let diagnostic = droppedDiagnosticLocked(
+                    replaced,
+                    reason: "coalesced",
+                    now: now
+                ) {
+                    diagnostics.append(diagnostic)
+                }
+            }
+            pendingVideo = item
+            if !workerRunning {
+                workerRunning = true
+                shouldStartWorker = true
             }
         }
+        lock.unlock()
+        diagnostics.forEach(ClawPilotScanDiagnostic.record)
+        if shouldStartWorker { startWorker() }
     }
 
-    private func imageOrientation(in data: Data) -> CGImagePropertyOrientation {
+    private func enqueuePhoto(
+        _ data: Data,
+        dimensions: String,
+        orientations: [UInt32],
+        now: UInt64
+    ) {
+        var shouldStartWorker = false
+        var diagnostic: String?
+        lock.lock()
+        let item = WorkItem(
+            kind: .photo,
+            content: .photo(data: data, orientations: orientations),
+            dimensions: dimensions,
+            queuedAtNanoseconds: now,
+            generation: generation,
+            target: target
+        )
+        if terminal {
+            // See the video callback race above.
+        } else if reducer.hasEmitted {
+            diagnostic = droppedDiagnosticLocked(
+                item,
+                reason: "already-emitted",
+                now: now
+            )
+        } else if pendingPhotos.count >= Self.maximumPendingPhotos {
+            diagnostic = droppedDiagnosticLocked(
+                item,
+                reason: "photo-queue-full",
+                now: now
+            )
+        } else {
+            pendingPhotos.append(item)
+            if !workerRunning {
+                workerRunning = true
+                shouldStartWorker = true
+            }
+        }
+        lock.unlock()
+        if let diagnostic { ClawPilotScanDiagnostic.record(diagnostic) }
+        if shouldStartWorker { startWorker() }
+    }
+
+    private func startWorker() {
+        processingQueue.async { [weak self] in
+            self?.drainPendingInputs()
+        }
+    }
+
+    private func drainPendingInputs() {
+        while let item = takeNextInput() {
+            process(item)
+        }
+    }
+
+    private func takeNextInput() -> WorkItem? {
+        lock.lock()
+        if terminal || reducer.hasEmitted {
+            pendingPhotos.removeAll(keepingCapacity: true)
+            pendingVideo = nil
+            workerRunning = false
+            lock.unlock()
+            return nil
+        }
+        if !pendingPhotos.isEmpty {
+            let item = pendingPhotos.removeFirst()
+            lock.unlock()
+            return item
+        }
+        if let item = pendingVideo {
+            pendingVideo = nil
+            lock.unlock()
+            return item
+        }
+        workerRunning = false
+        lock.unlock()
+        return nil
+    }
+
+    private func process(_ item: WorkItem) {
+        guard isCurrent(item) else { return }
+        let startedAt = Self.nowNanoseconds()
+        do {
+            let result: OrientationDecodeResult
+            switch item.content {
+            case let .photo(data, orientations):
+                result = try decodePhoto(
+                    data,
+                    orientations: orientations,
+                    item: item
+                )
+            case let .video(frame):
+                result = try decodeVideo(frame, item: item)
+            }
+            guard isCurrent(item) else { return }
+            finish(
+                item,
+                decision: result.decision,
+                startedAt: startedAt,
+                diagnosticDetails: result.diagnosticDetails
+            )
+        } catch ProcessingAbort.staleGeneration {
+            return
+        } catch {
+            guard isCurrent(item) else { return }
+            recordResult(
+                item,
+                outcome: "error",
+                startedAt: startedAt,
+                details: "error_type=\(String(describing: type(of: error)))"
+            )
+            return
+        }
+    }
+
+    private func decodePhoto(
+        _ data: Data,
+        orientations: [UInt32],
+        item: WorkItem
+    ) throws -> OrientationDecodeResult {
+        let barcodeSearch = try MetaBarcodeOrientationPlan.firstResult(
+            orientations: orientations
+        ) { rawOrientation -> MetaBarcodeDecodeDecision? in
+            guard isCurrent(item) else { throw ProcessingAbort.staleGeneration }
+            guard let orientation = CGImagePropertyOrientation(rawValue: rawOrientation) else {
+                return nil
+            }
+            let decision = try decodeBarcodes(
+                handler: VNImageRequestHandler(data: data, orientation: orientation),
+                target: item.target
+            )
+            return Self.hasBarcodeCandidates(decision) ? decision : nil
+        }
+        var diagnosticDetails = Self.orientationDiagnosticDetails(
+            prefix: "",
+            attempted: barcodeSearch.attemptedOrientations,
+            winner: barcodeSearch.winningOrientation
+        )
+        if let decision = barcodeSearch.result {
+            diagnosticDetails.append("ocr_outcome=not-needed")
+            return OrientationDecodeResult(
+                decision: decision,
+                attemptedOrientations: barcodeSearch.attemptedOrientations,
+                winningOrientation: barcodeSearch.winningOrientation,
+                diagnosticDetails: diagnosticDetails
+            )
+        }
+
+        guard let expectedValue = item.target.expectedValue,
+              !expectedValue.isEmpty
+        else {
+            diagnosticDetails.append(contentsOf: [
+                "ocr_outcome=disabled",
+                "ocr_candidates=0",
+                "ocr_ms=0",
+            ])
+            return OrientationDecodeResult(
+                decision: .zeroCandidates,
+                attemptedOrientations: barcodeSearch.attemptedOrientations,
+                winningOrientation: nil,
+                diagnosticDetails: diagnosticDetails
+            )
+        }
+
+        let ocrStartedAt = Self.nowNanoseconds()
+        var recognizedCandidateCount = 0
+        let ocrSearch = try MetaBarcodeOrientationPlan.firstResult(
+            orientations: orientations
+        ) { rawOrientation -> Float? in
+            guard isCurrent(item) else { throw ProcessingAbort.staleGeneration }
+            guard let orientation = CGImagePropertyOrientation(rawValue: rawOrientation) else {
+                return nil
+            }
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = false
+            try VNImageRequestHandler(
+                data: data,
+                orientation: orientation
+            ).perform([request])
+            let candidates = (request.results ?? []).flatMap { observation in
+                observation.topCandidates(3)
+            }
+            recognizedCandidateCount += candidates.count
+            return candidates.first(where: {
+                MetaExpectedBarcodeTextMatcher.matches(
+                    observed: $0.string,
+                    expectedValue: expectedValue
+                )
+            })?.confidence
+        }
+        diagnosticDetails.append(contentsOf: Self.orientationDiagnosticDetails(
+            prefix: "ocr_",
+            attempted: ocrSearch.attemptedOrientations,
+            winner: ocrSearch.winningOrientation
+        ))
+        diagnosticDetails.append(
+            "ocr_outcome=\(ocrSearch.result == nil ? "no-exact-match" : "matched")"
+        )
+        diagnosticDetails.append("ocr_candidates=\(recognizedCandidateCount)")
+        diagnosticDetails.append(
+            "ocr_ms=\(Self.milliseconds(from: ocrStartedAt, to: Self.nowNanoseconds()))"
+        )
+        let decision = ocrSearch.result.map { confidence in
+            MetaBarcodeDecodeDecision.selected(
+                MetaBarcodeCandidate(payload: expectedValue, confidence: confidence)
+            )
+        } ?? .zeroCandidates
+        return OrientationDecodeResult(
+            decision: decision,
+            attemptedOrientations: barcodeSearch.attemptedOrientations,
+            winningOrientation: nil,
+            diagnosticDetails: diagnosticDetails
+        )
+    }
+
+    private func decodeVideo(
+        _ frame: VideoFrame,
+        item: WorkItem
+    ) throws -> OrientationDecodeResult {
+        guard isCurrent(item) else { throw ProcessingAbort.staleGeneration }
+        let handler: VNImageRequestHandler
+        let orientation: CGImagePropertyOrientation
+        if let image = frame.makeUIImage(),
+           let cgImage = image.cgImage {
+            orientation = Self.cgImagePropertyOrientation(image.imageOrientation)
+            handler = VNImageRequestHandler(
+                cgImage: cgImage,
+                orientation: orientation
+            )
+        } else {
+            orientation = .up
+            handler = VNImageRequestHandler(
+                cmSampleBuffer: frame.sampleBuffer,
+                orientation: orientation
+            )
+        }
+        let decision = try decodeBarcodes(handler: handler, target: item.target)
+        let winningOrientation = Self.hasBarcodeCandidates(decision)
+            ? orientation.rawValue
+            : nil
+        return OrientationDecodeResult(
+            decision: decision,
+            attemptedOrientations: [orientation.rawValue],
+            winningOrientation: winningOrientation,
+            diagnosticDetails: Self.orientationDiagnosticDetails(
+                prefix: "",
+                attempted: [orientation.rawValue],
+                winner: winningOrientation
+            )
+        )
+    }
+
+    private func decodeBarcodes(
+        handler: VNImageRequestHandler,
+        target: MetaBarcodeDecodeTarget
+    ) throws -> MetaBarcodeDecodeDecision {
+        let request = VNDetectBarcodesRequest()
+        request.symbologies = target.symbologies
+        try handler.perform([request])
+        let candidates = (request.results ?? []).compactMap { observation -> MetaBarcodeCandidate? in
+            guard let payload = observation.payloadStringValue,
+                  !payload.isEmpty
+            else { return nil }
+            return MetaBarcodeCandidate(
+                payload: payload,
+                confidence: observation.confidence
+            )
+        }
+        let decision = arbitrator.decide(
+            candidates: candidates,
+            expectedValue: target.expectedValue
+        )
+        return decision
+    }
+
+    private static func hasBarcodeCandidates(_ decision: MetaBarcodeDecodeDecision) -> Bool {
+        switch decision {
+        case .zeroCandidates: false
+        case .selected, .ambiguous: true
+        }
+    }
+
+    private static func orientationDiagnosticDetails(
+        prefix: String,
+        attempted: [UInt32],
+        winner: UInt32?
+    ) -> [String] {
+        let attempts = attempted.isEmpty
+            ? "none"
+            : attempted.map(String.init).joined(separator: ",")
+        return [
+            "\(prefix)orientation_attempts=\(attempts)",
+            "\(prefix)orientation_winner=\(winner.map(String.init) ?? "none")",
+        ]
+    }
+
+    private static func cgImagePropertyOrientation(
+        _ orientation: UIImage.Orientation
+    ) -> CGImagePropertyOrientation {
+        switch orientation {
+        case .up: .up
+        case .upMirrored: .upMirrored
+        case .down: .down
+        case .downMirrored: .downMirrored
+        case .left: .left
+        case .leftMirrored: .leftMirrored
+        case .right: .right
+        case .rightMirrored: .rightMirrored
+        @unknown default: .up
+        }
+    }
+
+    private func finish(
+        _ item: WorkItem,
+        decision: MetaBarcodeDecodeDecision,
+        startedAt: UInt64,
+        diagnosticDetails: [String]
+    ) {
+        let now = Self.nowNanoseconds()
+        var emittedValue: String?
+        var outcome: String
+        var detailParts = diagnosticDetails
+        lock.lock()
+        if terminal {
+            lock.unlock()
+            return
+        } else if item.generation != generation {
+            outcome = "dropped"
+            detailParts.append("reason=stale-generation")
+        } else {
+            switch decision {
+            case .zeroCandidates:
+                outcome = "zero"
+            case let .ambiguous(candidateCount):
+                outcome = "processed"
+                detailParts.append("selection=ambiguous:candidates=\(candidateCount)")
+            case let .selected(candidate):
+                let isExpected = arbitrator.isExpected(
+                    candidate.payload,
+                    expectedValue: item.target.expectedValue
+                )
+                if item.kind == .video,
+                   !isExpected,
+                   (!pendingPhotos.isEmpty || now < photoPriorityUntilNanoseconds) {
+                    // A live frame must never pre-empt an accepted high-resolution
+                    // photo with a wrong candidate. Exact expected matches remain
+                    // immediate so photo priority does not add scan latency.
+                    outcome = "processed"
+                    detailParts.append("selection=deferred-nonexpected-for-photo")
+                } else {
+                    emittedValue = reducer.accept(decision)
+                    if emittedValue == nil {
+                        outcome = "dropped"
+                        detailParts.append("reason=already-emitted")
+                    } else {
+                        outcome = "processed"
+                        detailParts.append("selection=emitted:confidence=\(candidate.confidence)")
+                        pendingPhotos.removeAll(keepingCapacity: true)
+                        pendingVideo = nil
+                    }
+                }
+            }
+        }
+        lock.unlock()
+        recordResult(
+            item,
+            outcome: outcome,
+            startedAt: startedAt,
+            details: detailParts.joined(separator: ":")
+        )
+        if let emittedValue { continuation.yield(emittedValue) }
+    }
+
+    private func recordResult(
+        _ item: WorkItem,
+        outcome: String,
+        startedAt: UInt64,
+        details: String
+    ) {
+        guard shouldRecordResult(item, outcome: outcome, details: details) else {
+            return
+        }
+        let finishedAt = Self.nowNanoseconds()
+        let queueMilliseconds = Self.milliseconds(
+            from: item.queuedAtNanoseconds,
+            to: startedAt
+        )
+        let decodeMilliseconds = Self.milliseconds(
+            from: startedAt,
+            to: finishedAt
+        )
+        let suffix = details.isEmpty ? "" : ":\(details)"
+        ClawPilotScanDiagnostic.record(
+            "vision-decode:kind=\(item.kind.rawValue):outcome=\(outcome):dimensions=\(item.dimensions):queue_ms=\(queueMilliseconds):decode_ms=\(decodeMilliseconds)\(suffix)"
+        )
+    }
+
+    private func shouldRecordResult(
+        _ item: WorkItem,
+        outcome: String,
+        details: String
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !terminal, item.generation == generation else { return false }
+        guard item.kind == .video,
+              outcome == "zero" || details.contains("deferred-nonexpected-for-photo")
+        else { return true }
+        let key = outcome == "zero" ? "video-zero" : "video-deferred"
+        let count = (sampledResultCounts[key] ?? 0) + 1
+        sampledResultCounts[key] = count
+        // Keep repetitive live-frame evidence useful without displacing every
+        // high-resolution photo result from the bounded diagnostic history.
+        return count == 1 || count.isMultiple(of: 16)
+    }
+
+    private func droppedDiagnosticLocked(
+        _ item: WorkItem,
+        reason: String,
+        now: UInt64
+    ) -> String? {
+        let key = "\(item.kind.rawValue):\(reason)"
+        let count = (droppedCounts[key] ?? 0) + 1
+        droppedCounts[key] = count
+        // A 15-fps stream would otherwise perform roughly eleven UserDefaults
+        // writes per second and evict useful photo/result evidence. Preserve the
+        // first example and a periodic aggregate for each drop reason.
+        guard count == 1 || count.isMultiple(of: 25) else { return nil }
+        return "vision-decode:kind=\(item.kind.rawValue):outcome=dropped:reason=\(reason):dimensions=\(item.dimensions):elapsed_ms=\(Self.milliseconds(from: item.queuedAtNanoseconds, to: now)):count=\(count)"
+    }
+
+    private func isCurrent(_ item: WorkItem) -> Bool {
+        lock.lock()
+        let current = !terminal && item.generation == generation && !reducer.hasEmitted
+        lock.unlock()
+        return current
+    }
+
+    private func imageProperties(
+        in data: Data
+    ) -> (dimensions: String, orientationRawValue: UInt32?) {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
-                as? [CFString: Any],
-              let rawValue = properties[kCGImagePropertyOrientation] as? UInt32,
-              let orientation = CGImagePropertyOrientation(rawValue: rawValue)
-        else { return .up }
-        return orientation
+                as? [CFString: Any]
+        else { return ("unknown", nil) }
+        let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue
+        let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue
+        let dimensions: String
+        if let width, let height {
+            dimensions = "\(width)x\(height)"
+        } else {
+            dimensions = "unknown"
+        }
+        let rawOrientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.uint32Value
+        let orientationRawValue = rawOrientation
+            .flatMap(CGImagePropertyOrientation.init(rawValue:))?
+            .rawValue
+        return (dimensions, orientationRawValue)
+    }
+
+    private static func nowNanoseconds() -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds
+    }
+
+    private static func milliseconds(from start: UInt64, to end: UInt64) -> UInt64 {
+        guard end >= start else { return 0 }
+        return (end - start) / 1_000_000
     }
 }

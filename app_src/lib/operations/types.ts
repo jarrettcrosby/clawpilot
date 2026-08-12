@@ -42,6 +42,7 @@ export type CommerceActiveWriteCapability =
 export type OperationsOrderAction =
   | 'release_to_warehouse'
   | 'confirm_picks'
+  | 'reconcile_external_fulfillment'
   | 'verify_pack'
   | 'prepare_fulfillment'
   | 'confirm_shipment'
@@ -51,6 +52,18 @@ export type OperationsOrderActionAvailability = {
   label: string
   enabled: boolean
   blockedReason: string | null
+}
+
+export type OperationsExternalFulfillmentReconciliationResult = {
+  orderGlobalId: string
+  orderStatus: 'cancelled'
+  rowVersion: number
+  reconciliationGlobalId: string
+  providerFulfillmentId: string
+  providerFulfillmentName: string
+  providerReads: 2
+  providerWrites: 0
+  replayed: boolean
 }
 
 export type OperationsLabelAttemptState = 'prepared' | 'succeeded' | 'failed' | 'unknown'
@@ -703,6 +716,7 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
   packageCount: number
   plannedPackageCount: number
   packedPackageCount: number
+  shopifyExternalFulfillmentReconciliationRequired: boolean
   availableActions: OperationsOrderActionAvailability[]
   sandboxCommerceE2eAuthorization: {
     authorizationGlobalId: string

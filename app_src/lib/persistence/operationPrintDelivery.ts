@@ -556,9 +556,14 @@ export function encodeOperationsPrintClaimPayload(input: {
     }
   }
   if (input.artifactPayload !== undefined && input.artifactPayload !== null) {
+    const bytes = input.format === 'ZPL'
+      ? validateLabelBytes('ZPL', Buffer.from(input.artifactPayload))
+      : Buffer.from(input.artifactPayload)
     return {
-      inlinePayload: Buffer.from(input.artifactPayload).toString('base64'),
-      encoding: 'base64',
+      inlinePayload: input.format === 'ZPL'
+        ? bytes.toString('utf8')
+        : bytes.toString('base64'),
+      encoding: input.format === 'ZPL' ? 'utf8' : 'base64',
     }
   }
   return {

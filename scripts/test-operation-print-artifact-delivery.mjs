@@ -106,7 +106,7 @@ function verifyStaticContracts() {
     "'application/vnd.zebra-zpl'",
     "encoding: format === 'ZPL' ? 'utf8' : 'base64'",
     "encoding: input.format === 'ZPL' ? 'utf8' : 'base64'",
-    'encoding: \'base64\'',
+    "validateLabelBytes('ZPL', Buffer.from(input.artifactPayload))",
   ]) {
     assert.ok(
       persistence.includes(fragment),
@@ -271,6 +271,7 @@ async function verifyPersistenceContracts() {
   assert.equal(labelClaim.encoding, 'utf8')
 
   const artifactClaim = persistence.encodeOperationsPrintClaimPayload({
+    format: 'PDF',
     labelPayload: null,
     artifactPayload: pdf,
   })
@@ -280,6 +281,44 @@ async function verifyPersistenceContracts() {
     'Binary artifacts must be base64 encoded for JSON claims',
   )
   assert.equal(artifactClaim.encoding, 'base64')
+
+  for (const barcodeCase of [
+    { documentType: 'product_label', media: 'label_3x1', width: 609, length: 203 },
+    { documentType: 'product_label', media: 'label_4x6', width: 812, length: 1218 },
+    { documentType: 'location_label', media: 'label_3x1', width: 609, length: 203 },
+    { documentType: 'location_label', media: 'label_4x6', width: 812, length: 1218 },
+  ]) {
+    const barcodeZpl = Buffer.from(
+      `^XA\n^CI28\n^PW${barcodeCase.width}\n^LL${barcodeCase.length}`
+        + `\n^FD${barcodeCase.documentType}-${barcodeCase.media}^FS\n^XZ`,
+      'utf8',
+    )
+    const barcodeClaim = persistence.encodeOperationsPrintClaimPayload({
+      format: 'ZPL',
+      labelPayload: null,
+      artifactPayload: barcodeZpl,
+    })
+    assert.equal(
+      barcodeClaim.inlinePayload,
+      barcodeZpl.toString('utf8'),
+      `${barcodeCase.documentType} ${barcodeCase.media} must use the worker UTF-8 contract`,
+    )
+    assert.equal(barcodeClaim.encoding, 'utf8')
+    const claimedBytes = Buffer.from(barcodeClaim.inlinePayload, barcodeClaim.encoding)
+    assert.equal(claimedBytes.byteLength, barcodeZpl.byteLength)
+    assert.equal(
+      createHash('sha256').update(claimedBytes).digest('hex'),
+      createHash('sha256').update(barcodeZpl).digest('hex'),
+    )
+  }
+  assert.throws(
+    () => persistence.encodeOperationsPrintClaimPayload({
+      format: 'ZPL',
+      labelPayload: null,
+      artifactPayload: Buffer.from('not-zpl', 'utf8'),
+    }),
+    /do not match the declared format/,
+  )
 
   const referenceClaim = persistence.encodeOperationsPrintClaimPayload({
     labelPayload: null,

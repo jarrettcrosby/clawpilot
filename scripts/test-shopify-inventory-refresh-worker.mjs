@@ -156,6 +156,7 @@ includes(persistence, [
   'dirty_version =',
   'reconciled_version',
   'requested_dirty_version',
+  'EXCLUDED.requested_dirty_version >',
   'followUpRequired',
   'started_at = now()',
   'provider_attempt_created_at',
@@ -175,6 +176,16 @@ includes(persistence, [
   'providerWrites: 0',
   'orderQuantityAdjustment: 0',
 ], 'Shopify inventory refresh persistence')
+assert.match(
+  persistence,
+  /DO UPDATE SET[\s\S]*?requested_dirty_version = EXCLUDED\.requested_dirty_version[\s\S]*?status = 'pending'[\s\S]*?available_at = now\(\)[\s\S]*?EXCLUDED\.requested_dirty_version >[\s\S]*?operations_shopify_inventory_refresh_jobs[\s\S]*?\.requested_dirty_version/,
+  'Automatic scheduling may only expedite a failed refresh for a newer webhook dirty version',
+)
+assert.match(
+  persistence,
+  /const PERMANENT_ERROR_CODES = new Set\(\[[\s\S]*?'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT'[\s\S]*?\]\)/,
+  'A provider-commitment conflict must stop automatic retries until an operator reconciles the affected plan',
+)
 
 let recoveryRow = {
   status: 'dead',
@@ -321,6 +332,41 @@ includes(signalUpsert, [
   '.dirty_version + 1',
   'RETURNING dirty_version::text, reconciled_version::text',
 ], 'Shopify inventory webhook dirty signal')
+
+const providerCommitmentConflict = new Error(
+  'Current Shopify committed quantity no longer supports the claim',
+)
+providerCommitmentConflict.code =
+  'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT'
+const stoppedConflict = await refreshPersistence
+  .failShopifyInventoryRefreshJobInPostgres({
+    job: {
+      id: '99999999-9999-4999-8999-999999999999',
+      organizationId: recoveryInput.organizationId,
+      integrationAccountId:
+        '33333333-3333-4333-8333-333333333333',
+      accountGlobalId: 'gia0000001',
+      carrierServiceConfigId:
+        '44444444-4444-4444-8444-444444444444',
+      warehouseId: '55555555-5555-4555-8555-555555555555',
+      credentialGeneration: 2,
+      activationRevision: 3,
+      configRowVersion: 4,
+      policyRevision: 5,
+      policyHash: 'a'.repeat(64),
+      inventoryMaxAgeSeconds: 900,
+      requestedDirtyVersion: 6,
+      attemptCount: 1,
+      maxAttempts: 8,
+      lockToken: '88888888-8888-4888-8888-888888888888',
+      startedAt: '2026-07-30T12:00:00.000Z',
+    },
+    error: providerCommitmentConflict,
+  })
+assert.equal(stoppedConflict.code, providerCommitmentConflict.code)
+assert.equal(stoppedConflict.dead, true)
+assert.equal(stoppedConflict.leaseLost, false)
+assert.equal(stoppedConflict.retryAt, null)
 
 const completionQueries = []
 const completionPersistence = loadTypeScriptModule(

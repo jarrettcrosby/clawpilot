@@ -17,6 +17,14 @@ import {
   type ShopifyOrderPlanningAuthoritySnapshot,
 } from '@/lib/integrations/shopifyOrderPlanningAuthority'
 import {
+  inspectShopifyExternalFulfillment,
+  ShopifyExternalFulfillmentReconciliationError,
+} from '@/lib/integrations/shopifyExternalFulfillmentReconciliation'
+import type {
+  ShopifyExternalFulfillmentEvidence,
+  ShopifyExternalFulfillmentTarget,
+} from '@/lib/integrations/shopifyExternalFulfillmentEvidence'
+import {
   executeCurrentFaireFulfillmentWriteback,
   prepareCurrentFaireFulfillmentAuthority,
 } from '@/lib/integrations/faireFulfillmentRuntime'
@@ -87,6 +95,7 @@ import type {
   OperationsExceptionListItem,
   OperationsExceptionStatus,
   OperationsExceptionUpdateResult,
+  OperationsExternalFulfillmentReconciliationResult,
   OperationsInboundReceiptCommandResult,
   OperationsInboundReceiptCompletionInput,
   OperationsInboundReceiptCreationResult,
@@ -2253,6 +2262,7 @@ async function readOrderDetail(
   context: {
     activationState: OperationsActivationState
     canExecute: boolean
+    canManage: boolean
     canActivate: boolean
     actorEmail: string | null
     canAuthorizeSandboxCommerceE2e: boolean
@@ -2305,6 +2315,7 @@ async function readOrderDetail(
     ship_to: Record<string, unknown>
     updated_at: Date
     one_off_shipping_mode: 'test' | 'live' | null
+    shopify_external_fulfillment_reconciliation_required: boolean
   }>(
     `SELECT
        orders.id::text, orders.global_id, orders.order_number, orders.external_order_id,
@@ -2322,6 +2333,10 @@ async function readOrderDetail(
        plan.warehouse_id::text AS warehouse_id,
        one_off_quote.execution_mode AS one_off_shipping_mode,
        plan.status AS plan_status, wave.status AS wave_status,
+       operations_shopify_external_fulfillment_reconciliation_required(
+         orders.organization_id,
+         plan.id
+       ) AS shopify_external_fulfillment_reconciliation_required,
        plan_warehouse.name AS warehouse_name, orders.promised_delivery_at,
        (SELECT count(*) FROM operations_order_lines line WHERE line.order_id = orders.id)::text AS line_count,
        (SELECT count(*) FROM operations_order_lines line
@@ -2842,10 +2857,13 @@ async function readOrderDetail(
     packageCount: Number(row.package_count),
     plannedPackageCount: Number(row.planned_package_count),
     packedPackageCount: Number(row.packed_package_count),
+    shopifyExternalFulfillmentReconciliationRequired:
+      row.shopify_external_fulfillment_reconciliation_required,
     availableActions: availableOperationsOrderActions({
       status: row.status,
       activationState: context.activationState,
       canExecute: context.canExecute,
+      canManage: context.canManage,
       canActivate: context.canActivate,
       planStatus: row.plan_status,
       waveStatus: row.wave_status,
@@ -2874,6 +2892,8 @@ async function readOrderDetail(
       nativeOneOffGroupReady: nativeOneOffShipmentAvailability.ready,
       nativeOneOffGroupBlockedReason:
         nativeOneOffShipmentAvailability.blockedReason,
+      shopifyExternalFulfillmentReconciliationRequired:
+        row.shopify_external_fulfillment_reconciliation_required,
     }),
     sandboxCommerceE2eAuthorization: sandboxCommerceE2eAuthorization
       ? {
@@ -3599,6 +3619,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     selectedOrder: selectedGlobalId ? await readOrderDetail(organizationId, selectedGlobalId, {
       activationState: activation.state,
       canExecute: input.capabilities.canExecute,
+      canManage: input.capabilities.canManage,
       canActivate: input.capabilities.canActivate,
       actorEmail: input.actorEmail || null,
       canAuthorizeSandboxCommerceE2e: Boolean(
@@ -8565,6 +8586,40 @@ async function completedOrderCommandResult(
   }
 }
 
+function completedExternalFulfillmentReconciliationResult(
+  receipt: Pick<CommandReceiptRow, 'result_payload'>,
+): OperationsExternalFulfillmentReconciliationResult {
+  const payload = receipt.result_payload
+  if (
+    payload
+    && typeof payload.orderGlobalId === 'string'
+    && payload.orderStatus === 'cancelled'
+    && Number.isSafeInteger(Number(payload.rowVersion))
+    && typeof payload.reconciliationGlobalId === 'string'
+    && typeof payload.providerFulfillmentId === 'string'
+    && typeof payload.providerFulfillmentName === 'string'
+    && Number(payload.providerReads) === 2
+    && Number(payload.providerWrites) === 0
+  ) {
+    return {
+      orderGlobalId: payload.orderGlobalId,
+      orderStatus: 'cancelled',
+      rowVersion: Number(payload.rowVersion),
+      reconciliationGlobalId: payload.reconciliationGlobalId,
+      providerFulfillmentId: payload.providerFulfillmentId,
+      providerFulfillmentName: payload.providerFulfillmentName,
+      providerReads: 2,
+      providerWrites: 0,
+      replayed: true,
+    }
+  }
+  throw new OperationsRequestError(
+    'OPERATIONS_COMMAND_RECEIPT_INVALID',
+    'Completed Shopify external-fulfillment reconciliation is unavailable',
+    409,
+  )
+}
+
 function completedPlanCommandResult(
   receipt: Pick<CommandReceiptRow, 'result_payload'>,
 ): OperationsPlanCommandResult {
@@ -13171,6 +13226,776 @@ async function requireAcknowledgedWearablePickScanEvidence(
   return { enforced: true, evidenceCount: required.length, receiptId: receipt.id }
 }
 
+type ShopifyExternalFulfillmentDatabaseTarget = {
+  orderId: string
+  orderGlobalId: string
+  orderRowVersion: number
+  integrationAccountId: string
+  integrationAccountGlobalId: string
+  planId: string
+  planGlobalId: string
+  waveId: string
+  waveGlobalId: string
+  positionIds: string[]
+  reservationIds: string[]
+  pickTaskIds: string[]
+  reconciliationRequired: boolean
+  target: ShopifyExternalFulfillmentTarget
+}
+
+async function readShopifyExternalFulfillmentDatabaseTarget(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    orderGlobalId: string
+    lock: boolean
+  },
+): Promise<ShopifyExternalFulfillmentDatabaseTarget> {
+  const orderResult = await client.query<QueryResultRow & {
+    id: string
+    global_id: string
+    external_order_id: string
+    order_number: string
+    source_provider: string
+    status: OperationsOrderStatus
+    row_version: string
+    integration_account_id: string
+    integration_account_global_id: string
+  }>(
+    `SELECT orders.id::text, orders.global_id, orders.external_order_id,
+            orders.order_number, orders.source_provider, orders.status,
+            orders.row_version::text, orders.integration_account_id::text,
+            account.global_id AS integration_account_global_id
+     FROM operations_orders orders
+     JOIN operations_integration_accounts account
+       ON account.organization_id = orders.organization_id
+      AND account.id = orders.integration_account_id
+     WHERE orders.organization_id = $1::uuid
+       AND orders.global_id = $2
+       AND orders.archived_at IS NULL
+     LIMIT 1
+     ${input.lock ? 'FOR UPDATE OF orders' : ''}`,
+    [input.organizationId, input.orderGlobalId],
+  )
+  const order = orderResult.rows[0]
+  if (!order) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_NOT_FOUND',
+      'Operations order was not found',
+      404,
+    )
+  }
+  if (order.source_provider !== 'shopify' || order.status !== 'released') {
+    throw new OperationsRequestError(
+      'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_ORDER_INVALID',
+      'Only a released Shopify order can be reconciled as externally fulfilled',
+      409,
+    )
+  }
+
+  const planResult = await client.query<QueryResultRow & {
+    id: string
+    global_id: string
+    status: string
+  }>(
+    `SELECT id::text, global_id, status
+     FROM operations_fulfillment_plans
+     WHERE organization_id = $1::uuid AND order_id = $2::uuid
+     ORDER BY version_number DESC
+     LIMIT 1
+     ${input.lock ? 'FOR UPDATE' : ''}`,
+    [input.organizationId, order.id],
+  )
+  const plan = planResult.rows[0]
+  if (!plan || plan.status !== 'released') {
+    throw new OperationsRequestError(
+      'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_PLAN_INVALID',
+      'The latest fulfillment plan must remain released',
+      409,
+    )
+  }
+
+  const pickResult = await client.query<QueryResultRow & {
+    id: string
+    global_id: string
+    allocation_id: string
+    status: string
+    picked_quantity: string | null
+    picked_at: Date | null
+    wave_id: string
+    wave_global_id: string
+    wave_status: string
+    wave_released_at: Date | string | null
+  }>(
+    `SELECT pick.id::text, pick.global_id,
+            pick.allocation_id::text, pick.status,
+            pick.picked_quantity::text, pick.picked_at,
+            wave.id::text AS wave_id, wave.global_id AS wave_global_id,
+            wave.status AS wave_status,
+            wave.released_at AS wave_released_at
+     FROM operations_pick_tasks pick
+     JOIN operations_waves wave
+       ON wave.organization_id = pick.organization_id
+      AND wave.id = pick.wave_id
+     WHERE pick.organization_id = $1::uuid
+       AND pick.plan_id = $2::uuid
+     ORDER BY pick.sequence_number, pick.id
+     ${input.lock ? 'FOR UPDATE OF pick, wave' : ''}`,
+    [input.organizationId, plan.id],
+  )
+  const waveIds = new Set(pickResult.rows.map((pick) => pick.wave_id))
+  const wave = pickResult.rows[0]
+  if (
+    !wave
+    || waveIds.size !== 1
+    || wave.wave_status !== 'released'
+    || !wave.wave_released_at
+    || pickResult.rows.some((pick) => (
+      pick.status !== 'ready'
+      || numberValue(pick.picked_quantity) !== 0
+      || pick.picked_at !== null
+    ))
+    || new Set(pickResult.rows.map((pick) => pick.allocation_id)).size
+      !== pickResult.rows.length
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_PICKS_INVALID',
+      'External fulfillment reconciliation requires one released wave whose picks are all ready and wholly unpicked',
+      409,
+    )
+  }
+
+  if (input.lock) {
+    await client.query(
+      `SELECT reservation.id
+       FROM operations_fulfillment_allocations allocation
+       JOIN operations_reservations reservation
+         ON reservation.organization_id = allocation.organization_id
+        AND reservation.id = allocation.reservation_id
+       WHERE allocation.organization_id = $1::uuid
+         AND allocation.plan_id = $2::uuid
+       ORDER BY reservation.id
+       FOR UPDATE OF reservation`,
+      [input.organizationId, plan.id],
+    )
+  }
+
+  const lineResult = await client.query<QueryResultRow & {
+    external_line_id: string
+    quantity: string
+    allocation_count: string
+    allocation_quantity: string
+    active_reservation_count: string
+    active_reservation_quantity: string
+    authority_exact: boolean | null
+    provider_location_ids: string[] | null
+    position_ids: string[] | null
+    reservation_ids: string[] | null
+  }>(
+    `SELECT line.external_line_id, line.quantity::text,
+            count(allocation.id)::text AS allocation_count,
+            COALESCE(sum(allocation.quantity), 0)::text
+              AS allocation_quantity,
+            count(reservation.id) FILTER (
+              WHERE reservation.status = 'active'
+            )::text AS active_reservation_count,
+            COALESCE(sum(reservation.quantity) FILTER (
+              WHERE reservation.status = 'active'
+            ), 0)::text AS active_reservation_quantity,
+            bool_and(
+              reservation.status = 'active'
+              AND reservation.reservation_authority = 'provider_commitment'
+              AND reservation.order_id = line.order_id
+              AND reservation.order_line_id = line.id
+              AND reservation.position_id = allocation.position_id
+              AND reservation.quantity = allocation.quantity
+              AND position.source_authority = 'shopify'
+              AND source_level.integration_account_id =
+                    orders.integration_account_id
+              AND source_level.inventory_position_id = reservation.position_id
+            ) AS authority_exact,
+            array_agg(DISTINCT source_level.provider_location_id) FILTER (
+              WHERE source_level.provider_location_id IS NOT NULL
+            ) AS provider_location_ids,
+            array_agg(DISTINCT reservation.position_id::text) FILTER (
+              WHERE reservation.id IS NOT NULL
+            ) AS position_ids,
+            array_agg(DISTINCT reservation.id::text) FILTER (
+              WHERE reservation.id IS NOT NULL
+            ) AS reservation_ids
+     FROM operations_order_lines line
+     JOIN operations_orders orders
+       ON orders.organization_id = line.organization_id
+      AND orders.id = line.order_id
+     LEFT JOIN operations_fulfillment_allocations allocation
+       ON allocation.organization_id = line.organization_id
+      AND allocation.order_line_id = line.id
+      AND allocation.plan_id = $3::uuid
+     LEFT JOIN operations_reservations reservation
+       ON reservation.organization_id = allocation.organization_id
+      AND reservation.id = allocation.reservation_id
+     LEFT JOIN operations_inventory_positions position
+       ON position.organization_id = reservation.organization_id
+      AND position.id = reservation.position_id
+     LEFT JOIN operations_commerce_inventory_levels source_level
+       ON source_level.organization_id = reservation.organization_id
+      AND source_level.id = reservation.provider_inventory_level_id
+      AND source_level.sync_run_id =
+            reservation.provider_inventory_sync_run_id
+     WHERE line.organization_id = $1::uuid
+       AND line.order_id = $2::uuid
+     GROUP BY line.id, line.external_line_id, line.quantity
+     ORDER BY line.external_line_id`,
+    [input.organizationId, order.id, plan.id],
+  )
+  const allocationCount = lineResult.rows.reduce(
+    (total, line) => total + Number(line.allocation_count || 0),
+    0,
+  )
+  if (
+    lineResult.rows.length < 1
+    || allocationCount !== pickResult.rows.length
+    || lineResult.rows.some((line) => (
+      Number(line.allocation_count || 0) < 1
+      || Number(line.active_reservation_count || 0)
+        !== Number(line.allocation_count || 0)
+      || numberValue(line.allocation_quantity) !== numberValue(line.quantity)
+      || numberValue(line.active_reservation_quantity)
+        !== numberValue(line.quantity)
+      || line.authority_exact !== true
+      || !Number.isSafeInteger(numberValue(line.quantity))
+      || numberValue(line.quantity) < 1
+    ))
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RESERVATIONS_INVALID',
+      'Every released line must have exact active Shopify provider-commitment allocations before reconciliation',
+      409,
+    )
+  }
+  const providerLocationIds = new Set(
+    lineResult.rows.flatMap((line) => line.provider_location_ids || []),
+  )
+  if (providerLocationIds.size !== 1) {
+    throw new OperationsRequestError(
+      'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_LOCATION_INVALID',
+      'External fulfillment reconciliation requires one exact Shopify fulfillment location',
+      409,
+    )
+  }
+
+  const blockerResult = await client.query<QueryResultRow & {
+    fulfillment_execution_count: string
+    active_execution_count: string
+    shipment_count: string
+    label_attempt_count: string
+    label_count: string
+    commerce_export_count: string
+  }>(
+    `SELECT
+       (SELECT count(*) FROM operations_fulfillment_executions execution
+        WHERE execution.organization_id = $1::uuid
+          AND execution.order_id = $2::uuid)::text
+         AS fulfillment_execution_count,
+       (SELECT count(*) FROM operations_active_fulfillment_executions execution
+        WHERE execution.organization_id = $1::uuid
+          AND execution.order_id = $2::uuid)::text AS active_execution_count,
+       (SELECT count(*) FROM operations_shipments shipment
+        WHERE shipment.organization_id = $1::uuid
+          AND shipment.order_id = $2::uuid)::text AS shipment_count,
+       (SELECT count(*) FROM operations_label_attempts attempt
+        WHERE attempt.organization_id = $1::uuid
+          AND attempt.order_id = $2::uuid)::text AS label_attempt_count,
+       (SELECT count(*) FROM operations_labels label
+        JOIN operations_packages package
+          ON package.organization_id = label.organization_id
+         AND package.id = label.package_id
+        WHERE package.organization_id = $1::uuid
+          AND package.plan_id = $3::uuid)::text AS label_count,
+       (SELECT count(*) FROM operations_commerce_fulfillment_exports export
+        WHERE export.organization_id = $1::uuid
+          AND export.order_id = $2::uuid)::text AS commerce_export_count`,
+    [input.organizationId, order.id, plan.id],
+  )
+  const blockers = blockerResult.rows[0]
+  if (
+    !blockers
+    || Object.values(blockers).some((count) => Number(count || 0) !== 0)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_EXECUTION_EXISTS',
+      'ClawPilot fulfillment, label, shipment, or export evidence already exists for this order',
+      409,
+    )
+  }
+
+  const signalResult = await client.query<{ required: boolean }>(
+    `SELECT operations_shopify_external_fulfillment_reconciliation_required(
+       $1::uuid,
+       $2::uuid
+     ) AS required`,
+    [input.organizationId, plan.id],
+  )
+  return {
+    orderId: order.id,
+    orderGlobalId: order.global_id,
+    orderRowVersion: Number(order.row_version),
+    integrationAccountId: order.integration_account_id,
+    integrationAccountGlobalId: order.integration_account_global_id,
+    planId: plan.id,
+    planGlobalId: plan.global_id,
+    waveId: wave.wave_id,
+    waveGlobalId: wave.wave_global_id,
+    positionIds: [...new Set(
+      lineResult.rows.flatMap((line) => line.position_ids || []),
+    )].sort(),
+    reservationIds: [...new Set(
+      lineResult.rows.flatMap((line) => line.reservation_ids || []),
+    )].sort(),
+    pickTaskIds: pickResult.rows.map((pick) => pick.id),
+    reconciliationRequired: signalResult.rows[0]?.required === true,
+    target: {
+      externalOrderId: order.external_order_id,
+      orderName: order.order_number,
+      releasedAt: new Date(wave.wave_released_at).toISOString(),
+      providerLocationId: [...providerLocationIds][0],
+      lines: lineResult.rows.map((line) => ({
+        externalLineId: line.external_line_id,
+        quantity: numberValue(line.quantity),
+      })),
+    },
+  }
+}
+
+export async function reconcileShopifyExternalFulfillmentFromPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  orderGlobalId: string
+  expectedRowVersion: number
+  reason: string
+  idempotencyKey: string
+}): Promise<OperationsExternalFulfillmentReconciliationResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
+  const orderGlobalId = String(input.orderGlobalId || '').trim()
+  const reason = String(input.reason || '').trim()
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  if (!actorEmail) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ACTOR_REQUIRED',
+      'A signed-in user is required',
+      401,
+    )
+  }
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_INVALID',
+      'Order is invalid',
+    )
+  }
+  if (!Number.isSafeInteger(input.expectedRowVersion) || input.expectedRowVersion < 0) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_VERSION_INVALID',
+      'Order version is invalid',
+    )
+  }
+  if (!reason || reason.length > 500 || /[\u0000-\u001f\u007f]/u.test(reason)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_EXTERNAL_FULFILLMENT_REASON_INVALID',
+      'An external-fulfillment reconciliation reason is required',
+    )
+  }
+  if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_IDEMPOTENCY_KEY_INVALID',
+      'A valid idempotency key is required',
+    )
+  }
+
+  const command = await prepareCommandReceipt({
+    organizationId,
+    commandType: 'reconcile_shopify_external_fulfillment',
+    idempotencyKey,
+    requestHash: commandRequestHash({
+      orderGlobalId,
+      expectedRowVersion: input.expectedRowVersion,
+      reason,
+    }),
+    actorEmail,
+    targetGlobalId: orderGlobalId,
+  })
+  if (command.completed) {
+    return completedExternalFulfillmentReconciliationResult(command.receipt)
+  }
+
+  try {
+    const preflight = await withTransaction((client) => (
+      readShopifyExternalFulfillmentDatabaseTarget(client, {
+        organizationId,
+        orderGlobalId,
+        lock: false,
+      })
+    ))
+    if (preflight.orderRowVersion !== input.expectedRowVersion) {
+      throw new OperationsRequestError(
+        'OPERATIONS_ORDER_VERSION_CONFLICT',
+        'This order changed after it was opened. Refresh before reconciling fulfillment.',
+        409,
+      )
+    }
+    if (!preflight.reconciliationRequired) {
+      throw new OperationsRequestError(
+        'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILIATION_NOT_REQUIRED',
+        'No newer Shopify inventory evidence requires external-fulfillment reconciliation',
+        409,
+      )
+    }
+
+    let evidence: ShopifyExternalFulfillmentEvidence & {
+      providerReads: 2
+      providerWrites: 0
+    }
+    try {
+      evidence = await inspectShopifyExternalFulfillment({
+        organizationId,
+        accountGlobalId: preflight.integrationAccountGlobalId,
+        target: preflight.target,
+      })
+    } catch (error) {
+      if (error instanceof ShopifyExternalFulfillmentReconciliationError) {
+        throw new OperationsRequestError(
+          error.code,
+          error.message,
+          error.status,
+        )
+      }
+      throw error
+    }
+
+    return await withTransaction(async (client) => {
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:order:${organizationId}:${orderGlobalId}`,
+      )
+      const activation = await resolveActivation(client, organizationId)
+      if (!['shadow', 'active'].includes(activation.state)) {
+        throw new OperationsRequestError(
+          'OPERATIONS_EXECUTION_STATE_INVALID',
+          'Set Operations to Shadow or Active before reconciling warehouse work',
+          409,
+        )
+      }
+      const current = await readShopifyExternalFulfillmentDatabaseTarget(
+        client,
+        { organizationId, orderGlobalId, lock: true },
+      )
+      if (current.orderRowVersion !== input.expectedRowVersion) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_VERSION_CONFLICT',
+          'This order changed before fulfillment could be reconciled. Refresh and try again.',
+          409,
+        )
+      }
+      if (
+        current.integrationAccountId !== preflight.integrationAccountId
+        || current.planId !== preflight.planId
+        || current.waveId !== preflight.waveId
+        || canonicalJson(current.target) !== canonicalJson(preflight.target)
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_TARGET_CHANGED',
+          'Released Shopify fulfillment authority changed during reconciliation',
+          409,
+        )
+      }
+
+      for (const positionId of current.positionIds) {
+        await acquireTransactionAdvisoryLock(
+          client,
+          `operations:inventory-reservation:${organizationId}:${positionId}`,
+        )
+      }
+      const lockedPositions = await client.query<{ id: string }>(
+        `SELECT id::text
+         FROM operations_inventory_positions
+         WHERE organization_id = $1::uuid
+           AND id = ANY($2::uuid[])
+         ORDER BY id
+         FOR UPDATE`,
+        [organizationId, current.positionIds],
+      )
+      if (Number(lockedPositions.rowCount || 0) !== current.positionIds.length) {
+        throw new OperationsRequestError(
+          'OPERATIONS_INVENTORY_POSITION_CHANGED',
+          'Reserved inventory changed before fulfillment could be reconciled',
+          409,
+        )
+      }
+
+      const packagingClaims = await client.query<{ id: string }>(
+        `SELECT id::text
+         FROM operations_packaging_material_claims
+         WHERE organization_id = $1::uuid
+           AND plan_id = $2::uuid
+           AND status = 'active'
+         ORDER BY id
+         FOR UPDATE`,
+        [organizationId, current.planId],
+      )
+
+      const fulfillment = evidence.snapshot.fulfillment
+      const inserted = await client.query<{
+        id: string
+        global_id: string
+      }>(
+        `INSERT INTO
+           operations_shopify_external_fulfillment_reconciliations (
+             organization_id, command_receipt_id, order_id,
+             integration_account_id, plan_id, wave_id,
+             external_order_id, provider_order_name,
+             provider_order_updated_at, provider_order_closed_at,
+             provider_fulfillment_id, provider_fulfillment_name,
+             provider_fulfillment_created_at,
+             provider_fulfillment_updated_at, provider_location_id,
+             provider_fulfillment_order_ids, evidence_hash,
+             evidence_snapshot, provider_read_count,
+             provider_write_count, reason, reconciled_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+             $6::uuid, $7, $8, $9::timestamptz, $10::timestamptz,
+             $11, $12, $13::timestamptz, $14::timestamptz, $15,
+             $16::text[], $17, $18::jsonb, 2, 0, $19, $20
+           )
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          command.receipt.id,
+          current.orderId,
+          current.integrationAccountId,
+          current.planId,
+          current.waveId,
+          current.target.externalOrderId,
+          evidence.snapshot.order.name,
+          evidence.snapshot.order.updatedAt,
+          evidence.snapshot.order.closedAt,
+          fulfillment.id,
+          fulfillment.name,
+          fulfillment.createdAt,
+          fulfillment.updatedAt,
+          evidence.snapshot.locationId,
+          evidence.snapshot.fulfillmentOrders.map((item) => item.id),
+          evidence.evidenceHash,
+          JSON.stringify(evidence.snapshot),
+          reason,
+          actorEmail,
+        ],
+      )
+      const reconciliation = inserted.rows[0]
+      if (!reconciliation) {
+        throw new OperationsRequestError(
+          'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_EVIDENCE_FAILED',
+          'Shopify external-fulfillment evidence could not be retained',
+          500,
+        )
+      }
+
+      const cancelledPicks = await client.query<{ global_id: string }>(
+        `UPDATE operations_pick_tasks
+         SET status = 'cancelled', updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = ANY($2::uuid[])
+           AND status = 'ready'
+           AND COALESCE(picked_quantity, 0) = 0
+           AND picked_at IS NULL
+         RETURNING global_id`,
+        [organizationId, current.pickTaskIds],
+      )
+      if (Number(cancelledPicks.rowCount || 0) !== current.pickTaskIds.length) {
+        throw new OperationsRequestError(
+          'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_PICKS_CHANGED',
+          'Pick tasks changed before fulfillment could be reconciled',
+          409,
+        )
+      }
+
+      const cancelledWave = await client.query(
+        `UPDATE operations_waves
+         SET status = 'cancelled'
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND status = 'released'
+         RETURNING id`,
+        [organizationId, current.waveId],
+      )
+      const cancelledPlan = await client.query(
+        `UPDATE operations_fulfillment_plans
+         SET status = 'cancelled', updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND status = 'released'
+         RETURNING id`,
+        [organizationId, current.planId],
+      )
+      if (cancelledWave.rowCount !== 1 || cancelledPlan.rowCount !== 1) {
+        throw new OperationsRequestError(
+          'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_WAREHOUSE_CHANGED',
+          'Released warehouse work changed before it could be reconciled',
+          409,
+        )
+      }
+
+      const releasedReservations = await client.query<{ global_id: string }>(
+        `UPDATE operations_reservations
+         SET status = 'released', released_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = ANY($2::uuid[])
+           AND status = 'active'
+           AND reservation_authority = 'provider_commitment'
+         RETURNING global_id`,
+        [organizationId, current.reservationIds],
+      )
+      if (
+        Number(releasedReservations.rowCount || 0)
+          !== current.reservationIds.length
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RESERVATIONS_CHANGED',
+          'Provider commitments changed before fulfillment could be reconciled',
+          409,
+        )
+      }
+
+      const releasedPackagingClaims = await client.query<{ global_id: string }>(
+        `UPDATE operations_packaging_material_claims
+         SET status = 'released', released_at = now(),
+             updated_by = $3, updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND plan_id = $2::uuid
+           AND status = 'active'
+         RETURNING global_id`,
+        [organizationId, current.planId, actorEmail],
+      )
+      if (
+        Number(releasedPackagingClaims.rowCount || 0)
+          !== Number(packagingClaims.rowCount || 0)
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_PACKAGING_CHANGED',
+          'Packaging claims changed before fulfillment could be reconciled',
+          409,
+        )
+      }
+
+      const updatedOrder = await client.query<OrderIdentityRow>(
+        `UPDATE operations_orders
+         SET status = 'cancelled',
+             hold_reason = $4,
+             updated_by = $5,
+             updated_at = now(),
+             row_version = row_version + 1
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND status = 'released'
+           AND row_version = $3
+         RETURNING id::text, global_id, status, row_version::text`,
+        [
+          organizationId,
+          current.orderId,
+          input.expectedRowVersion,
+          `Shopify ${fulfillment.name} was fulfilled externally; reconciled by ${reconciliation.global_id}`,
+          actorEmail,
+        ],
+      )
+      const cancelledOrder = updatedOrder.rows[0]
+      if (!cancelledOrder || cancelledOrder.row_version === undefined) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_VERSION_CONFLICT',
+          'This order changed before fulfillment could be reconciled',
+          409,
+        )
+      }
+
+      const eventPayload = {
+        previousStatus: 'released',
+        status: 'cancelled',
+        planGlobalId: current.planGlobalId,
+        waveGlobalId: current.waveGlobalId,
+        reconciliationGlobalId: reconciliation.global_id,
+        providerOrderId: evidence.snapshot.order.id,
+        providerOrderName: evidence.snapshot.order.name,
+        providerFulfillmentId: fulfillment.id,
+        providerFulfillmentName: fulfillment.name,
+        providerFulfillmentCreatedAt: fulfillment.createdAt,
+        providerLocationId: evidence.snapshot.locationId,
+        providerFulfillmentOrderIds:
+          evidence.snapshot.fulfillmentOrders.map((item) => item.id),
+        evidenceHash: evidence.evidenceHash,
+        cancelledPickTaskCount: Number(cancelledPicks.rowCount || 0),
+        releasedProviderCommitmentCount:
+          Number(releasedReservations.rowCount || 0),
+        releasedPackagingClaimCount:
+          Number(releasedPackagingClaims.rowCount || 0),
+        providerReads: evidence.providerReads,
+        providerWrites: evidence.providerWrites,
+        shipmentCreated: false,
+        commerceExportCreated: false,
+        customerNotificationSent: false,
+        providerNotificationNotRepeated: true,
+        reason,
+      }
+      await appendDomainEvent(client, {
+        organizationId,
+        aggregateType: 'operations.order',
+        aggregateId: current.orderId,
+        aggregateGlobalId: current.orderGlobalId,
+        eventType: 'operations.shopify.external_fulfillment_reconciled',
+        actorEmail,
+        correlationId: command.receipt.correlation_id,
+        idempotencyKey:
+          `${current.orderGlobalId}:shopify-external-fulfillment:${command.receipt.id}`,
+        payload: eventPayload,
+      })
+      await recordAuditEvent({
+        actor: actorEmail,
+        eventType: 'operations.order.shopify_external_fulfillment_reconciled',
+        aggregateType: 'operations.order',
+        aggregateId: current.orderGlobalId,
+        subject: `Reconciled Shopify fulfillment for ${current.orderGlobalId}`,
+        organizationId,
+        eventKey:
+          `operations:shopify-external-fulfillment:${command.receipt.id}`,
+        payload: {
+          ...eventPayload,
+          previousRowVersion: input.expectedRowVersion,
+          rowVersion: Number(cancelledOrder.row_version),
+        },
+      }, client)
+
+      const result: OperationsExternalFulfillmentReconciliationResult = {
+        orderGlobalId: cancelledOrder.global_id,
+        orderStatus: 'cancelled',
+        rowVersion: Number(cancelledOrder.row_version),
+        reconciliationGlobalId: reconciliation.global_id,
+        providerFulfillmentId: fulfillment.id,
+        providerFulfillmentName: fulfillment.name,
+        providerReads: 2,
+        providerWrites: 0,
+        replayed: false,
+      }
+      await completeCommandReceipt(
+        client,
+        command.receipt.id,
+        cancelledOrder.global_id,
+        result,
+      )
+      return result
+    })
+  } catch (error) {
+    await failCommandReceipt(command.receipt.id, error)
+    throw error
+  }
+}
+
 export async function confirmOperationsOrderPicksFromPostgres(input: {
   organizationId: string
   actorEmail: string
@@ -13284,6 +14109,23 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
         throw new OperationsRequestError(
           'OPERATIONS_FULFILLMENT_PLAN_INVALID',
           'The released fulfillment plan is unavailable for picking',
+          409,
+        )
+      }
+
+      const externalFulfillmentConflict = await client.query<{
+        required: boolean
+      }>(
+        `SELECT operations_shopify_external_fulfillment_reconciliation_required(
+           $1::uuid,
+           $2::uuid
+         ) AS required`,
+        [organizationId, plan.id],
+      )
+      if (externalFulfillmentConflict.rows[0]?.required) {
+        throw new OperationsRequestError(
+          'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILIATION_REQUIRED',
+          'Newer Shopify evidence no longer supports this provider commitment. Reconcile the external fulfillment before confirming picks.',
           409,
         )
       }

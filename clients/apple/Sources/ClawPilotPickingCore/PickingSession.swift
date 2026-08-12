@@ -35,7 +35,24 @@ public actor PickingSession {
 
     public func replaceQueue(_ queue: PickQueue) async throws {
         try await cache.saveQueue(queue)
+        let previousQueue = self.queue
+        let previousOrder = currentOrder()
         self.queue = queue
+
+        // A refresh or Picker navigation must not erase an already-verified
+        // location or product when the server returned the exact same work.
+        // Preserve progress only across the narrow, fail-closed identity fence:
+        // same organization, worker, and complete current order contract. Any
+        // row version, task, policy, location, or barcode drift resets progress.
+        if let previousQueue,
+           let previousOrder,
+           previousQueue.organizationId == queue.organizationId,
+           previousQueue.workerEmail == queue.workerEmail,
+           let refreshedIndex = queue.orders.firstIndex(of: previousOrder) {
+            orderIndex = refreshedIndex
+            return
+        }
+
         orderIndex = 0
         scannedTaskIDs = []
         locationVerifiedTaskIDs = []

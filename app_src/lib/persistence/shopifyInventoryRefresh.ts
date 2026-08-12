@@ -319,6 +319,7 @@ const PERMANENT_ERROR_CODES = new Set([
   'SHOPIFY_INVENTORY_DISABLED',
   'SHOPIFY_INVENTORY_LOCATION_MAPPING_AMBIGUOUS',
   'SHOPIFY_INVENTORY_LOCATION_REQUIRED',
+  'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT',
   'SHOPIFY_INVENTORY_SCOPE_REQUIRED',
   'SHOPIFY_INVENTORY_VERIFICATION_REQUIRED',
   'SHOPIFY_STORE_IDENTITY_CHANGED',
@@ -544,32 +545,19 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
          organization_id, integration_account_id
        ) WHERE status IN ('pending', 'processing', 'failed')
        DO UPDATE SET
-         requested_dirty_version = GREATEST(
-           operations_shopify_inventory_refresh_jobs
-             .requested_dirty_version,
-           EXCLUDED.requested_dirty_version
-         ),
-         status = CASE
-           WHEN operations_shopify_inventory_refresh_jobs.status = 'failed'
-             THEN 'pending'
-           ELSE operations_shopify_inventory_refresh_jobs.status
-         END,
-         available_at = CASE
-           WHEN operations_shopify_inventory_refresh_jobs.status IN (
-             'pending', 'failed'
-           ) THEN now()
-           ELSE operations_shopify_inventory_refresh_jobs.available_at
-         END,
-         last_error_code = CASE
-           WHEN operations_shopify_inventory_refresh_jobs.status IN (
-             'pending', 'failed'
-           ) THEN NULL
-           ELSE operations_shopify_inventory_refresh_jobs.last_error_code
-         END,
+         requested_dirty_version = EXCLUDED.requested_dirty_version,
+         status = 'pending',
+         available_at = now(),
+         last_error_code = NULL,
          updated_at = now()
        WHERE operations_shopify_inventory_refresh_jobs.status IN (
          'pending', 'failed'
-       )`,
+       )
+         -- Only a genuinely newer webhook signal may supersede a failed
+         -- job's exponential retry delay.
+         AND EXCLUDED.requested_dirty_version >
+           operations_shopify_inventory_refresh_jobs
+             .requested_dirty_version`,
     )
     return {
       queued: queued.rowCount || 0,

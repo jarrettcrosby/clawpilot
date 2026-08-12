@@ -181,6 +181,9 @@ public struct GoogleAuthState: Decodable, Equatable, Sendable {
 
     public let organizationId: String
     public let organizationName: String
+    public let linkingAvailable: Bool?
+    // Compatibility fields retained while older servers and clients migrate
+    // from organization-scoped Google policy controls.
     public let enabled: Bool
     public let rowVersion: Int
     public let canManage: Bool
@@ -188,6 +191,10 @@ public struct GoogleAuthState: Decodable, Equatable, Sendable {
     public let webClientId: String?
     public let identity: Identity
     public let impersonating: Bool?
+
+    public var canLinkCurrentUser: Bool {
+        linkingAvailable ?? enabled
+    }
 }
 
 public struct GoogleIdentityLinkState: Decodable, Equatable, Sendable {
@@ -336,7 +343,6 @@ public actor PickingAPIClient {
 
     private struct GoogleLinkBody: Encodable {
         let idToken: String
-        let expectedPolicyRowVersion: Int
     }
 
     private struct WorkspaceSwitchBody: Encodable {
@@ -457,7 +463,6 @@ public actor PickingAPIClient {
 
     public func linkGoogleIdentityToken(
         _ idToken: String,
-        expectedPolicyRowVersion: Int,
         idempotencyKey: String
     ) async throws -> GoogleIdentityLinkState {
         var request = URLRequest(url: try endpoint("/api/auth/google/link"))
@@ -466,8 +471,7 @@ public actor PickingAPIClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
         request.httpBody = try encoder.encode(GoogleLinkBody(
-            idToken: idToken,
-            expectedPolicyRowVersion: expectedPolicyRowVersion
+            idToken: idToken
         ))
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
@@ -507,8 +511,22 @@ public actor PickingAPIClient {
             organizationId: organizationId
         ))
         let (data, response) = try await session.data(for: request)
-        try validateHTTP(response)
-        let envelope = try decoder.decode(BasicEnvelope.self, from: data)
+        guard let http = response as? HTTPURLResponse else {
+            throw PickingAPIError.invalidResponse
+        }
+        if http.statusCode == 401 { throw PickingAPIError.unauthorized }
+        let envelope = try? decoder.decode(BasicEnvelope.self, from: data)
+        guard (200..<300).contains(http.statusCode), let envelope else {
+            throw PickingAPIError.rejected(
+                code: envelope?.code ?? "WORKSPACE_SWITCH_FAILED",
+                message: envelope?.error ?? "The organization could not be changed"
+            )
+        }
+        // Workspace switching rotates the durable browser-session token. URLSession
+        // normally accepts Set-Cookie automatically, but native/custom sessions do
+        // not consistently do so. Persist the rotated token before the profile
+        // refresh so the first request in the selected organization is authorized.
+        persistResponseCookies(response)
         guard envelope.ok else {
             throw PickingAPIError.rejected(
                 code: envelope.code ?? "WORKSPACE_SWITCH_FAILED",

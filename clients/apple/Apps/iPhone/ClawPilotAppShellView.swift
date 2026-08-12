@@ -445,7 +445,7 @@ private struct ModuleHomeView: View {
 
                 if let state = model.googleAuthState,
                    state.platformConfigured,
-                   state.enabled,
+                   state.canLinkCurrentUser,
                    !state.identity.linked {
                     Button {
                         Task { await model.linkCurrentGoogleAccount() }

@@ -83,6 +83,8 @@ export async function POST(req: NextRequest) {
       )
     }
     const body = await boundedBody(req)
+    // `expectedPolicyRowVersion` is accepted and ignored for released-client
+    // compatibility. It is not part of user-link authorization or idempotency.
     if (Object.keys(body).some((key) => !['idToken', 'expectedPolicyRowVersion'].includes(key))) {
       throw new GoogleSsoError(
         'GOOGLE_SSO_REQUEST_INVALID',
@@ -98,7 +100,6 @@ export async function POST(req: NextRequest) {
     const link = await linkGoogleIdentity({
       actor,
       identity,
-      expectedPolicyRowVersion: body.expectedPolicyRowVersion,
       idempotencyKey: req.headers.get('idempotency-key'),
     })
     return json({ ok: true, identity: link })

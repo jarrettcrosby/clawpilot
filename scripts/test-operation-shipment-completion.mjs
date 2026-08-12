@@ -1061,6 +1061,22 @@ async function verifyShipmentCompletion(databaseUrl) {
             )
           },
         },
+        '@/lib/integrations/shopifyExternalFulfillmentReconciliation': {
+          ShopifyExternalFulfillmentReconciliationError: class extends Error {
+            constructor(code, message, status = 409, retryable = false) {
+              super(message)
+              this.name = 'ShopifyExternalFulfillmentReconciliationError'
+              this.code = code
+              this.status = status
+              this.retryable = retryable
+            }
+          },
+          inspectShopifyExternalFulfillment: async () => {
+            throw new Error(
+              'Shipment completion acceptance does not read Shopify external fulfillment',
+            )
+          },
+        },
         '@/lib/integrations/faireFulfillmentRuntime': {
           prepareCurrentFaireFulfillmentAuthority: async () => {
             faireFulfillmentPreparationCalls += 1

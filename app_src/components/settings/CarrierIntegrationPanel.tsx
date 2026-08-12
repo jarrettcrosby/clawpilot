@@ -53,6 +53,7 @@ import {
 } from '@/lib/measurements'
 import { formatUserDateTime } from '@/lib/userDateTime'
 import IntegrationSetupJourney from '@/components/settings/IntegrationSetupJourney'
+import BrokeredTransportIntegrationPanel from '@/components/settings/BrokeredTransportIntegrationPanel'
 import {
   isSourceManagedCarrierConfiguration,
   managedCarrierDelegationProfile,
@@ -2867,6 +2868,8 @@ export default function CarrierIntegrationPanel() {
           Remove the encrypted credential for this account?
         </Alert>
       ) : null}
+
+      <BrokeredTransportIntegrationPanel />
     </Box>
   )
 }

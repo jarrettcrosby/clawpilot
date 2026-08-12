@@ -95,15 +95,18 @@ Signed builds keep environment-specific credentials in the ignored
 - `CLAWPILOT_GOOGLE_PRODUCTION_REVERSED_CLIENT_ID`
 - `CLAWPILOT_GOOGLE_SERVER_CLIENT_ID_SHARED`
 
-Google sign-in is additive to magic codes. After an organization administrator
-enables the method, each user signs in with their existing account and links
-their own Google identity from the iPhone Session Security card or web Security
-settings. The server verifies the token against `GOOGLE_SSO_SERVER_CLIENT_ID`
-and requires both the stored Google subject and its verified email to match that
-exact existing ClawPilot user. One user's link cannot authenticate another user;
-Google never creates a user or grants an organization role. Face ID is a
-device-local unlock for an already authenticated ClawPilot session and cannot
-replace server login.
+Google sign-in is additive to magic codes and is linked separately by each
+existing user from the iPhone Session Security card or web Security settings.
+The server verifies the token against `GOOGLE_SSO_SERVER_CLIENT_ID` and requires
+both the stored Google subject and its verified email to match that exact active
+ClawPilot user. The linked user can switch among all of their direct active
+organization memberships; legacy organization Google-policy flags do not limit
+that user-scoped link. Root or parent relationships do not grant implicit
+membership access. One user's link cannot authenticate another user, and Google
+never creates a user, membership, or organization role. A Google-authenticated
+session also cannot create a new business membership. Face ID is a device-local
+unlock for an already authenticated ClawPilot session and cannot replace server
+login.
 
 The local file is optional for simulator compilation and must never be
 committed. Physical validation must still prove Meta registration, camera

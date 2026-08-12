@@ -5,7 +5,11 @@ export const SHOPIFY_API_VERSION = SHOPIFY_ADMIN_API_VERSION
 // retention/purge worker. Keep intake limited to non-customer operational
 // topics until that privacy lifecycle and canonical processors exist.
 export const SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS = [
+  'inventory_items/create',
+  'inventory_items/delete',
   'inventory_items/update',
+  'inventory_levels/connect',
+  'inventory_levels/disconnect',
   'inventory_levels/update',
 ] as const
 

@@ -546,6 +546,86 @@ async function seedRateTestLabel(pool, fixture, connection, discriminator) {
   return { ...label, payload }
 }
 
+async function seedBarcodeLabelArtifact(pool, fixture, input) {
+  const payload = Buffer.from(
+    `^XA\n^CI28\n^PW${input.media === 'label_3x1' ? 609 : 812}`
+      + `\n^FD${input.documentType}-${input.media}-${fixture.suffix}^FS\n^XZ`,
+    'utf8',
+  )
+  const contentSha256 = createHash('sha256').update(payload).digest('hex')
+  const targetType = input.documentType === 'product_label' ? 'product' : 'location'
+  const batch = await insertReturning(
+    pool,
+    `INSERT INTO operations_barcode_label_batches (
+       organization_id, warehouse_id, target_type, media_size,
+       label_count, items_snapshot, template_version, request_hash,
+       idempotency_key, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3, $4,
+       1, $5::jsonb, 'print-runtime-v1', $6,
+       $7, $8
+     )
+     RETURNING id, global_id, target_type, media_size`,
+    [
+      fixture.organizationId,
+      fixture.warehouseId,
+      targetType,
+      input.media,
+      JSON.stringify([{
+        displayName: `${targetType} ${input.media}`,
+        barcodeValue: `PRINT-${fixture.suffix}`,
+        copies: 1,
+      }]),
+      createHash('sha256')
+        .update(`${input.documentType}:${input.media}:${fixture.suffix}`)
+        .digest('hex'),
+      `barcode-${input.documentType}-${input.media}-${fixture.suffix}`,
+      fixture.actorEmail,
+    ],
+  )
+  const artifact = await insertReturning(
+    pool,
+    `INSERT INTO operations_print_artifacts (
+       organization_id, source_barcode_label_batch_id, document_type,
+       format, media_size, content_sha256, byte_length,
+       storage_reference, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3,
+       'ZPL', $4, $5, $6,
+       $7, $8
+     )
+     RETURNING id, global_id, document_type, media_size,
+       content_sha256, byte_length::text`,
+    [
+      fixture.organizationId,
+      batch.id,
+      input.documentType,
+      input.media,
+      contentSha256,
+      payload.byteLength,
+      `clawpilot-document:barcode-label/${batch.global_id}`,
+      fixture.actorEmail,
+    ],
+  )
+  await pool.query(
+    `INSERT INTO operations_print_artifact_payloads (
+       artifact_id, organization_id, mime_type, filename, payload,
+       template_version, render_snapshot
+     ) VALUES (
+       $1::uuid, $2::uuid, 'application/vnd.zebra-zpl', $3, $4,
+       'print-runtime-v1', $5::jsonb
+     )`,
+    [
+      artifact.id,
+      fixture.organizationId,
+      `${targetType}-${input.media}.zpl`,
+      payload,
+      JSON.stringify({ targetType, media: input.media, items: [{}] }),
+    ],
+  )
+  return { artifact, batch, contentSha256, payload }
+}
+
 async function seedPrintSource(pool, fixture) {
   const pipeline = await insertReturning(
     pool,
@@ -1200,6 +1280,82 @@ async function verifyRuntime(connectionString) {
       idempotencyKey: `cancel-label-reprint-${fixture.suffix}`,
       reason: 'Controlled label reprint proof completed without physical output',
     })
+
+    const barcodeAgent = await persistence.authenticateOperationsPrintAgentInPostgres(
+      legacyBundledEnrollment.credential,
+    )
+    const barcodePrinter = await createPrinter(pool, fixture, {
+      code: `BARCODE-${fixture.suffix}`,
+      name: 'Product and location barcode printer',
+      priority: 4,
+      printerType: 'thermal',
+      formats: ['ZPL'],
+      media: ['label_3x1', 'label_4x6'],
+      documents: ['product_label', 'location_label'],
+      agentId: barcodeAgent.id,
+      isDefault: true,
+    })
+    const barcodeCases = [
+      { documentType: 'product_label', media: 'label_3x1' },
+      { documentType: 'product_label', media: 'label_4x6' },
+      { documentType: 'location_label', media: 'label_3x1' },
+      { documentType: 'location_label', media: 'label_4x6' },
+    ]
+    const barcodeEvidence = []
+    for (const barcodeCase of barcodeCases) {
+      const seeded = await seedBarcodeLabelArtifact(pool, fixture, barcodeCase)
+      assert.equal(seeded.batch.media_size, barcodeCase.media)
+      assert.equal(seeded.artifact.document_type, barcodeCase.documentType)
+      assert.equal(seeded.artifact.media_size, barcodeCase.media)
+      assert.equal(seeded.artifact.content_sha256, seeded.contentSha256)
+      assert.equal(Number(seeded.artifact.byte_length), seeded.payload.byteLength)
+      const job = await persistence.enqueueOperationsPrintJobInPostgres({
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.actorEmail,
+        idempotencyKey:
+          `barcode-job-${barcodeCase.documentType}-${barcodeCase.media}-${fixture.suffix}`,
+        warehouseId: fixture.warehouseId,
+        preferredPrinterGlobalId: barcodePrinter.global_id,
+        maxAttempts: 3,
+        document: {
+          type: 'barcode_label_artifact',
+          sourceArtifactGlobalId: seeded.artifact.global_id,
+        },
+      })
+      assert.equal(job.documentType, barcodeCase.documentType)
+      assert.equal(job.media, barcodeCase.media)
+      assert.equal(job.artifactContentSha256, seeded.contentSha256)
+      assert.equal(job.artifactByteLength, seeded.payload.byteLength)
+      barcodeEvidence.push({ ...seeded, ...barcodeCase, job })
+    }
+    const barcodeClaims = await persistence.claimOperationsPrintJobsInPostgres({
+      agent: barcodeAgent,
+      idempotencyKey: `barcode-claims-${fixture.suffix}`,
+      limit: barcodeCases.length,
+      leaseSeconds: 120,
+      runtimeCapabilities: {
+        supportedFormats: ['ZPL'],
+        supportedMedia: ['label_3x1', 'label_4x6'],
+        supportedDocumentTypes: ['product_label', 'location_label'],
+      },
+    })
+    assert.equal(barcodeClaims.length, barcodeCases.length)
+    for (const evidence of barcodeEvidence) {
+      const claim = barcodeClaims.find((candidate) => (
+        candidate.globalId === evidence.job.globalId
+      ))
+      assert.ok(claim)
+      assert.equal(claim.document.type, evidence.documentType)
+      assert.equal(claim.document.media, evidence.media)
+      assert.equal(claim.document.encoding, 'utf8')
+      assert.equal(claim.document.inlinePayload, evidence.payload.toString('utf8'))
+      assert.equal(claim.document.contentSha256, evidence.contentSha256)
+      assert.equal(claim.document.byteLength, evidence.payload.byteLength)
+      assert.equal(
+        createHash('sha256').update(claim.document.inlinePayload, 'utf8').digest('hex'),
+        claim.document.contentSha256,
+      )
+    }
 
     const managedRateTestConnection = await seedRateTestConnection(
       pool,

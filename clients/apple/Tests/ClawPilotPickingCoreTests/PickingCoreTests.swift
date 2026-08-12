@@ -61,31 +61,37 @@ private func fixtureQueue() throws -> PickQueue {
     )
 }
 
-private func locationFirstQueue() throws -> PickQueue {
+private func locationFirstQueue(
+    generatedAt: Date = Date(),
+    orderRowVersion: Int = 3,
+    productBarcode: String = "4006381333931",
+    locationBarcode: String = "CP1L-GWL0000003",
+    locationScanPolicyRowVersion: Int = 2
+) throws -> PickQueue {
     let task = try PickTask(
         pickTaskGlobalId: "gpk0000003",
         sequence: 1,
         productGlobalId: "gp0000003",
         productName: "Green Widget",
         channelSku: "GREEN-1",
-        barcode: "4006381333931",
+        barcode: productBarcode,
         locationCode: "B-02-03",
         warehouseGlobalId: "gwh0000003",
         locationGlobalId: "gwl0000003",
-        locationBarcode: "CP1L-GWL0000003",
+        locationBarcode: locationBarcode,
         locationScanRequired: true,
-        locationScanPolicyRowVersion: 2,
+        locationScanPolicyRowVersion: locationScanPolicyRowVersion,
         quantity: 3
     )
     return try PickQueue(
         schemaVersion: 1,
         organizationId: "11111111-1111-4111-8111-111111111111",
         workerEmail: "picker@example.com",
-        generatedAt: Date(),
+        generatedAt: generatedAt,
         orders: [try PickOrder(
             orderGlobalId: "gor0000002",
             orderNumber: "1002",
-            rowVersion: 3,
+            rowVersion: orderRowVersion,
             tasks: [task]
         )]
     )
@@ -184,6 +190,66 @@ func locationFirstAcceptance() async throws {
     #expect(evidence[0].location.source == .metaGlasses)
     #expect(evidence[0].product.barcode == "4006381333931")
     #expect(evidence[0].product.source == .iPhoneCamera)
+}
+
+@Test("refresh preserves exact current-order scan progress")
+func exactQueueRefreshPreservesScanProgress() async throws {
+    let session = PickingSession(cache: MemoryCache())
+    let firstGeneratedAt = Date(timeIntervalSince1970: 1_700_000_000)
+    try await session.replaceQueue(locationFirstQueue(generatedAt: firstGeneratedAt))
+
+    _ = try await session.accept(BarcodeObservation(
+        value: "CP1L-GWL0000003",
+        source: .iPhoneCamera,
+        capturedAt: firstGeneratedAt
+    ), now: firstGeneratedAt)
+    #expect(await session.currentScanStage() == .product)
+
+    try await session.replaceQueue(locationFirstQueue(
+        generatedAt: firstGeneratedAt.addingTimeInterval(60)
+    ))
+
+    #expect(await session.currentTask()?.pickTaskGlobalId == "gpk0000003")
+    #expect(await session.currentScanStage() == .product)
+    #expect(await session.makeWatchSnapshot()?.current?.locationScanRequired == false)
+}
+
+@Test("refresh resets scan progress on any current-order authority drift")
+func changedQueueRefreshResetsScanProgress() async throws {
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+    let rowVersionSession = PickingSession(cache: MemoryCache())
+    try await rowVersionSession.replaceQueue(locationFirstQueue(generatedAt: now))
+    _ = try await rowVersionSession.accept(BarcodeObservation(
+        value: "CP1L-GWL0000003", source: .iPhoneCamera, capturedAt: now
+    ), now: now)
+    try await rowVersionSession.replaceQueue(locationFirstQueue(
+        generatedAt: now.addingTimeInterval(60),
+        orderRowVersion: 4
+    ))
+    #expect(await rowVersionSession.currentScanStage() == .location)
+
+    let policySession = PickingSession(cache: MemoryCache())
+    try await policySession.replaceQueue(locationFirstQueue(generatedAt: now))
+    _ = try await policySession.accept(BarcodeObservation(
+        value: "CP1L-GWL0000003", source: .iPhoneCamera, capturedAt: now
+    ), now: now)
+    try await policySession.replaceQueue(locationFirstQueue(
+        generatedAt: now.addingTimeInterval(60),
+        locationScanPolicyRowVersion: 3
+    ))
+    #expect(await policySession.currentScanStage() == .location)
+
+    let barcodeSession = PickingSession(cache: MemoryCache())
+    try await barcodeSession.replaceQueue(locationFirstQueue(generatedAt: now))
+    _ = try await barcodeSession.accept(BarcodeObservation(
+        value: "CP1L-GWL0000003", source: .iPhoneCamera, capturedAt: now
+    ), now: now)
+    try await barcodeSession.replaceQueue(locationFirstQueue(
+        generatedAt: now.addingTimeInterval(60),
+        productBarcode: "4006381333932"
+    ))
+    #expect(await barcodeSession.currentScanStage() == .location)
 }
 
 @Test("legacy cached tasks decode with location verification disabled")

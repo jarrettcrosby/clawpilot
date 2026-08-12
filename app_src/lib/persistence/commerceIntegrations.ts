@@ -23,6 +23,9 @@ import {
   shopifyDeletedProductEvidence,
   type ShopifyDeletedProductEvidence,
 } from '@/lib/integrations/shopifyCatalogWebhook'
+import type {
+  ShopifyInventoryWebhookTargeting,
+} from '@/lib/integrations/shopifyInventoryWebhook'
 import {
   acquireTransactionAdvisoryLock,
   query,
@@ -35,6 +38,9 @@ import {
 import {
   signalShopifyInventoryRefreshWithClient,
 } from '@/lib/persistence/shopifyInventoryRefresh'
+import {
+  recordShopifyInventoryTargetSignalWithClient,
+} from '@/lib/persistence/shopifyInventoryTargetSignals'
 import {
   reconcileCommerceProductImageSetWithClient,
 } from '@/lib/persistence/commerceProductImageImports'
@@ -1755,6 +1761,7 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
     restrictedScopes: string[]
   } | null
   productDeletion?: ShopifyDeletedProductEvidence | null
+  inventoryTargeting?: ShopifyInventoryWebhookTargeting | null
 }) {
   return withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
@@ -1826,6 +1833,14 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
     if (isProductDeletion !== Boolean(input.productDeletion)) {
       throw new Error(
         'Shopify product-delete receipt evidence is incomplete',
+      )
+    }
+    const isInventoryRefresh = SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS.some(
+      (topic) => topic === input.topic,
+    )
+    if (isInventoryRefresh !== Boolean(input.inventoryTargeting)) {
+      throw new Error(
+        'Shopify inventory webhook target evidence is incomplete',
       )
     }
     const activationState = isProductDeletion
@@ -2088,8 +2103,10 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
       ? 'queued'
       : 'held'
     const inserted = await client.query<{
+      id: string
       global_id: string
       received_at: string | Date
+      provider_triggered_at: string | Date | null
     }>(
       `INSERT INTO operations_commerce_webhook_receipts (
          organization_id, integration_account_id, provider,
@@ -2101,7 +2118,11 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
          $1::uuid, $2::uuid, 'shopify', $3, $4, $5, $6, $7, $8,
          $9, $10, $11, $12, $13::timestamptz, $14
        )
-       RETURNING global_id, received_at`,
+       RETURNING
+         id::text,
+         global_id,
+         received_at,
+         provider_triggered_at`,
       [
         input.runtime.organizationId,
         input.runtime.integrationAccountId,
@@ -2198,6 +2219,11 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
     if (SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS.some(
       (topic) => topic === input.topic,
     )) {
+      if (!input.inventoryTargeting) {
+        throw new Error(
+          'Shopify inventory webhook target evidence is incomplete',
+        )
+      }
       inventoryRefreshSignal =
         await signalShopifyInventoryRefreshWithClient(client, {
           organizationId: input.runtime.organizationId,
@@ -2206,6 +2232,16 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
           receiptGlobalId: globalId,
           providerTriggeredAt: input.providerTriggeredAt,
         })
+      await recordShopifyInventoryTargetSignalWithClient(client, {
+        organizationId: input.runtime.organizationId,
+        integrationAccountId: input.runtime.integrationAccountId,
+        credentialGeneration: input.runtime.credentialVersion,
+        receiptId: inserted.rows[0].id,
+        receiptGlobalId: globalId,
+        dirtyVersion: inventoryRefreshSignal.dirtyVersion,
+        topic: input.topic,
+        targeting: input.inventoryTargeting,
+      })
       if (receiptState === 'queued') {
         const finalized = await client.query(
           `UPDATE operations_commerce_webhook_receipts
@@ -2242,7 +2278,15 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
           topic: input.topic,
           dirtyVersion: inventoryRefreshSignal.dirtyVersion,
           reconciledVersion: inventoryRefreshSignal.reconciledVersion,
+          targetingState: input.inventoryTargeting.targetingState,
+          targetingReasonCode: input.inventoryTargeting.reasonCode,
+          targetedItemCount:
+            input.inventoryTargeting.targetingState === 'targeted' ? 1 : 0,
+          sourceLocationTargeted:
+            input.inventoryTargeting.sourceLocationGid !== null,
+          refreshExecutionMode: 'full_authoritative',
           webhookQuantityApplied: false,
+          providerWrites: 0,
         },
       })
     }

@@ -41,6 +41,7 @@ import {
   prepareOperationsShipmentExecutionFromPostgres,
   readOperationsWorkspaceFromPostgres,
   recordWearablePickScanEvidenceFromPostgres,
+  reconcileShopifyExternalFulfillmentFromPostgres,
   releaseOperationsOrderFromPostgres,
   retryOperationsCommerceFulfillmentExportFromPostgres,
   runMockOperationsProofFromPostgres,
@@ -1369,6 +1370,39 @@ export async function POST(req: NextRequest) {
           200,
           false,
         ) || undefined,
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'reconcile-external-fulfillment') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to reconcile external fulfillment',
+          code: 'OPERATIONS_MANAGE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set(['action', 'orderGlobalId', 'expectedRowVersion', 'reason']),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await reconcileShopifyExternalFulfillmentFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+        expectedRowVersion: integerValue(
+          body.expectedRowVersion,
+          'Order version',
+          0,
+          2_147_483_647,
+        ),
+        reason: textValue(body.reason, 'Reconciliation reason', 500),
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })

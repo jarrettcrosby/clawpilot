@@ -62,7 +62,7 @@ export async function POST(req: NextRequest) {
     let organizationId = String(body?.organizationId || '').trim()
     if (action === 'create-root') {
       if (session.authMethod === 'google_sso') {
-        throw new Error('Sign in with a magic code before creating a business whose Google policy has not been configured')
+        throw new Error('Sign in with a magic code before creating a new business membership')
       }
       const actor = await requireRequestUser(req)
       const membership = await createIndependentRootWorkspace({ actor, name: body?.name })

@@ -312,7 +312,10 @@ export default function BarcodeLabelsDialog({ open, onClose }: Props) {
               label="Label size"
               value={media}
               onChange={(event) => setMedia(event.target.value as typeof media)}
-              sx={{ minWidth: 150 }}
+              helperText={media === 'label_2x1' || media === 'label_3x1'
+                ? 'Compact stock prints the primary linear barcode only.'
+                : 'Prints the primary linear barcode plus a QR copy for phone and glasses cameras.'}
+              sx={{ minWidth: 280 }}
             >
               <MenuItem value="label_2x1">2 × 1</MenuItem>
               <MenuItem value="label_3x1">3 × 1</MenuItem>

@@ -3177,6 +3177,14 @@ async function verifyPostgresAcceptance(databaseUrl) {
             )
           },
         },
+        '@/lib/integrations/shopifyExternalFulfillmentReconciliation': {
+          ShopifyExternalFulfillmentReconciliationError: class extends Error {},
+          inspectShopifyExternalFulfillment: async () => {
+            throw new Error(
+              'Distributed Operations acceptance does not read Shopify external fulfillment',
+            )
+          },
+        },
         '@/lib/integrations/faireFulfillmentRuntime': {
           prepareCurrentFaireFulfillmentAuthority: async () => {
             throw new Error(

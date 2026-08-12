@@ -3065,6 +3065,28 @@ async function verifyCanonicalPlanning(databaseUrl) {
         }
       },
     }
+    class TestShopifyExternalFulfillmentReconciliationError extends Error {
+      constructor(
+        message,
+        status = 409,
+        code = 'TEST_SHOPIFY_EXTERNAL_FULFILLMENT_ERROR',
+      ) {
+        super(message)
+        this.name = 'ShopifyExternalFulfillmentReconciliationError'
+        this.status = status
+        this.code = code
+        this.retryable = false
+      }
+    }
+    const shopifyExternalFulfillmentReconciliation = {
+      ShopifyExternalFulfillmentReconciliationError:
+        TestShopifyExternalFulfillmentReconciliationError,
+      async inspectShopifyExternalFulfillment() {
+        throw new TestShopifyExternalFulfillmentReconciliationError(
+          'Canonical planning acceptance does not reconcile external fulfillment',
+        )
+      },
+    }
     const operations = loadTypeScriptModule(
       'app_src/lib/persistence/operations.ts',
       {
@@ -3094,6 +3116,8 @@ async function verifyCanonicalPlanning(databaseUrl) {
           },
           '@/lib/integrations/shopifyOrderPlanningAuthority':
             shopifyOrderPlanningAuthority,
+          '@/lib/integrations/shopifyExternalFulfillmentReconciliation':
+            shopifyExternalFulfillmentReconciliation,
           '@/lib/integrations/faireFulfillmentRuntime': {
             prepareCurrentFaireFulfillmentAuthority: async () => {
               throw new Error(
