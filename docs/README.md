@@ -71,11 +71,12 @@ Current product behavior is defined by active module and operating contracts. Op
 
 ### Distributed Operations Design
 
-These documents define the accepted authority boundary and the pre-activation design for DOM, WMS, shipping, and 3PL billing. Bounded development workflows exist for order execution, sandbox rating, carrier-bill import, GL Coding, settlement evidence, and local print delivery; they do not claim production commerce or carrier mutations, accounting export, invoice/AR, payments, optimization, or live warehouse workers.
+These documents define the accepted authority boundary and staged activation design for DOM, WMS, shipping, and 3PL billing. Bounded development workflows exist for order execution, read-only carrier rating, carrier-bill import, GL Coding, settlement evidence, and local print delivery; they do not claim production commerce or carrier mutations, accounting export, invoice/AR, payments, optimization, or live warehouse workers.
 
 - [Distributed operations integration and gap map](maps/distributed-operations-integration-gap-map.md)
 - [Distributed operations domain and architecture contract](modules/distributed-operations.md)
 - [Distributed operations delivery, migration, and test plan](architecture/distributed-operations-delivery-plan.md)
+- [Brokered parcel and LTL carrier adapters](architecture/brokered-parcel-and-ltl-carrier-adapters.md)
 - [Distributed operations runbook](operations/distributed-operations-runbook.md)
 - [Native distributed operations authority and adapter boundaries](decisions/0006-native-distributed-operations-authority.md)
 

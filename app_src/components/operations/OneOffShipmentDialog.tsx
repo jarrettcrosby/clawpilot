@@ -50,6 +50,7 @@ import {
   type OneOffShipmentWorkspace,
 } from '@/lib/operations/oneOffShipments'
 import { ONE_OFF_MAX_SYNCHRONOUS_PACKAGES } from '@/lib/operations/oneOffShipmentConstants'
+import LtlFreightClassAssessmentPanel from '@/components/operations/LtlFreightClassAssessmentPanel'
 
 type DraftLine = {
   lineKey: string
@@ -999,6 +1000,7 @@ export default function OneOffShipmentDialog({
                       </Stack>
                     </Box>
                   ))}
+                  <LtlFreightClassAssessmentPanel />
                   <Box sx={{ p: 2, borderRadius: 2, backgroundColor: 'rgba(168,199,250,0.07)' }}>
                     <Typography variant="subtitle2">Enabled rate sources</Typography>
                     <Stack direction="row" gap={1} flexWrap="wrap" useFlexGap sx={{ mt: 1 }}>
