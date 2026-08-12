@@ -104,6 +104,7 @@ const auditEvents = []
 const advisoryLocks = []
 const credentialWrites = []
 const verificationCalls = []
+const activationLockQueries = []
 let timestampSequence = 0
 
 function timestamp() {
@@ -142,6 +143,27 @@ function selectedConnectionRow() {
 }
 
 async function databaseQuery(source, params = []) {
+  if (source.includes('FOR UPDATE OF account, credential')) {
+    const normalizedSource = source.replace(/\s+/g, ' ').trim()
+    if (
+      normalizedSource.includes(
+        'LEFT JOIN operations_carrier_credentials credential',
+      )
+    ) {
+      const error = new Error(
+        'FOR UPDATE cannot be applied to the nullable side of an outer join',
+      )
+      error.code = '0A000'
+      throw error
+    }
+    assert.match(
+      normalizedSource,
+      /FROM operations_integration_accounts account (?:INNER )?JOIN operations_carrier_credentials credential ON/,
+      'Rate activation must use an inner credential join before locking both rows',
+    )
+    activationLockQueries.push(normalizedSource)
+  }
+
   if (
     source.includes('FROM operations_command_receipts')
     && source.includes("command_type = 'update_brokered_transport_credential'")
@@ -641,6 +663,11 @@ const activationResponse = await route.PATCH(patchRequest({
   ratingModes: ['small_parcel', 'ltl'],
 }))
 assert.equal(activationResponse.status, 200)
+assert.equal(
+  activationLockQueries.length,
+  1,
+  'Successful rate activation must execute one PostgreSQL-safe account and credential lock',
+)
 const activationSerialized = await activationResponse.text()
 const activationPayload = JSON.parse(activationSerialized)
 assert.equal(verificationCalls.length, 1)
