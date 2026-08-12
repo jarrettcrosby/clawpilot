@@ -128,7 +128,8 @@ const PROVIDER_CAPABILITIES: Record<BrokeredTransportProvider, string[]> = {
   ],
 }
 
-const CONNECTION_SELECT = `SELECT
+function connectionSelect(credentialJoin: 'LEFT JOIN' | 'INNER JOIN') {
+  return `SELECT
     account.id::text,
     account.global_id,
     account.provider,
@@ -151,9 +152,13 @@ const CONNECTION_SELECT = `SELECT
       COALESCE(credential.updated_at, account.updated_at)
     ) AS updated_at
   FROM operations_integration_accounts account
-  LEFT JOIN operations_carrier_credentials credential
+  ${credentialJoin} operations_carrier_credentials credential
     ON credential.organization_id = account.organization_id
    AND credential.integration_account_id = account.id`
+}
+
+const CONNECTION_SELECT = connectionSelect('LEFT JOIN')
+const LOCKED_CREDENTIAL_CONNECTION_SELECT = connectionSelect('INNER JOIN')
 
 function providerLabel(provider: BrokeredTransportProvider) {
   return provider === 'wwex_speedship'
@@ -832,7 +837,7 @@ export async function verifyAndActivateBrokeredTransportRates(input: {
       `brokered-transport:${input.organizationId}:${provider}:${environment}`,
     )
     const current = await client.query<ConnectionRow>(
-      `${CONNECTION_SELECT}
+      `${LOCKED_CREDENTIAL_CONNECTION_SELECT}
        WHERE account.organization_id = $1::uuid
          AND account.integration_type = 'carrier'
          AND account.provider = $2
