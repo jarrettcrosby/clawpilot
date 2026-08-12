@@ -20,6 +20,10 @@ import type { OperationsSandboxLabelCommandResult } from '@/lib/operations/types
 import { enqueueOperationsPrintJobInPostgres } from '@/lib/persistence/operationPrintDelivery'
 import { OperationsRequestError } from '@/lib/persistence/operations'
 import {
+  assertCommerceOrderRevisionExecutionCurrent,
+  CommerceOrderRevisionGateError,
+} from '@/lib/persistence/commerceOrderRevisions'
+import {
   requireActiveSandboxCommerceE2eAuthorization,
 } from '@/lib/persistence/sandboxCommerceE2eAuthorization'
 import {
@@ -112,6 +116,25 @@ type PreparedAttemptResult =
       attempt: AttemptRow
       replay: null
     }
+
+async function requireCurrentCommerceRevisionForLabel(
+  client: PoolClient,
+  organizationId: string,
+  orderId: string,
+) {
+  try {
+    await assertCommerceOrderRevisionExecutionCurrent(client, {
+      organizationId,
+      orderId,
+      operation: 'label',
+    })
+  } catch (error) {
+    if (error instanceof CommerceOrderRevisionGateError) {
+      throw new OperationsRequestError(error.code, error.message, error.status)
+    }
+    throw error
+  }
+}
 
 type CreateSandboxLabelInput = {
   organizationId: string
@@ -873,6 +896,11 @@ async function prepareAttempt(input: {
       true,
     )
     if (input.action === 'create') {
+      await requireCurrentCommerceRevisionForLabel(
+        client,
+        input.organizationId,
+        context.order.id,
+      )
       if (input.sandboxE2eAuthorizationGlobalId) {
         await requireActiveSandboxCommerceE2eAuthorization(client, {
           organizationId: input.organizationId,

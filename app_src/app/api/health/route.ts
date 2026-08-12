@@ -21,6 +21,9 @@ import {
   readCommerceOrderReconciliationWorkerHeartbeatFromPostgres,
 } from '@/lib/persistence/commerceOrderReconciliation'
 import {
+  readCommerceOrderRevisionHealthFromPostgres,
+} from '@/lib/persistence/commerceOrderRevisions'
+import {
   readShopifyInventoryRefreshHealthFromPostgres,
   readShopifyInventoryRefreshWorkerHeartbeatFromPostgres,
 } from '@/lib/persistence/shopifyInventoryRefresh'
@@ -167,6 +170,11 @@ export async function GET() {
         faireAutomaticExactRefreshHealthSnapshot(),
       automaticFaireUnattributedAttention:
         faireUnattributedAttentionHealthSnapshot(),
+      canonicalOrderRevisions: {
+        status: 'migration-pending',
+        heartbeat: null,
+        durable: null,
+      },
     }
     let shopifyInventoryRefreshWorker: Record<string, unknown> = {
       status: 'disabled',
@@ -483,6 +491,7 @@ export async function GET() {
           operations_faire_product_image_projection_applied: boolean
           operations_faire_inventory_polling_applied: boolean
           suitecrm_product_image_reverse_ingestion_applied: boolean
+          operations_commerce_order_revisions_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -2362,6 +2371,22 @@ export async function GET() {
                   AND constraint_row.contype = 'f'
                   AND constraint_row.convalidated
               ) AS suitecrm_product_image_reverse_ingestion_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0273_operations_commerce_order_revisions.sql'
+              )
+              AND to_regclass(
+                'operations_commerce_order_revision_targets'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_order_revision_observations'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_order_revision_dispositions'
+              ) IS NOT NULL
+                AS operations_commerce_order_revisions_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -2544,6 +2569,7 @@ export async function GET() {
             && row?.operations_faire_product_image_projection_applied
             && row?.operations_faire_inventory_polling_applied
             && row?.suitecrm_product_image_reverse_ingestion_applied
+            && row?.operations_commerce_order_revisions_applied
             && row?.migration_checksums_present
           ),
         }
@@ -2727,6 +2753,7 @@ export async function GET() {
           || !row?.operations_faire_product_image_projection_applied
           || !row?.operations_faire_inventory_polling_applied
           || !row?.suitecrm_product_image_reverse_ingestion_applied
+          || !row?.operations_commerce_order_revisions_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -3435,6 +3462,10 @@ export async function GET() {
               : null
             const orderState =
               await readCommerceOrderReconciliationHealthFromPostgres()
+            const canonicalOrderRevisionHealth =
+              row?.operations_commerce_order_revisions_applied
+                ? await readCommerceOrderRevisionHealthFromPostgres()
+                : null
             const loopReachable = (
               orderAgeMs !== null
               && orderAgeMs <= maxOrderHeartbeatAgeMs
@@ -3444,6 +3475,7 @@ export async function GET() {
               || orderState.operatorAttentionRequired > 0
               || orderState.staleProcessing > 0
               || orderState.overdue > 0
+              || canonicalOrderRevisionHealth?.status === 'degraded'
             )
             commerceOrderReconciliationWorker = {
               status: loopReachable
@@ -3473,6 +3505,12 @@ export async function GET() {
                 faireUnattributedAttentionHealthSnapshot(
                   orderHeartbeat?.automaticFaireUnattributedAttention,
                 ),
+              canonicalOrderRevisions: {
+                status: canonicalOrderRevisionHealth?.status
+                  || 'migration-pending',
+                heartbeat: orderHeartbeat?.canonicalOrderRevisions || null,
+                durable: canonicalOrderRevisionHealth,
+              },
               ...orderState,
             }
             if (!loopReachable) {
@@ -3515,6 +3553,33 @@ export async function GET() {
             if (orderState.overdue > 0) {
               warnings.push(
                 'Commerce order reconciliation has overdue accounts.',
+              )
+            }
+            if (canonicalOrderRevisionHealth?.summary.failed) {
+              warnings.push(
+                'Canonical commerce order revision checks have retryable failures.',
+              )
+            }
+            if (canonicalOrderRevisionHealth?.summary.deadLetter) {
+              warnings.push(
+                'Canonical commerce order revision checks have terminal failed targets.',
+              )
+            }
+            if (
+              canonicalOrderRevisionHealth?.summary.materialReviewRequired
+            ) {
+              warnings.push(
+                'Canonical Shopify or Faire order revisions require manager review.',
+              )
+            }
+            if (canonicalOrderRevisionHealth?.summary.overdue) {
+              warnings.push(
+                'Canonical commerce order revision checks are overdue.',
+              )
+            }
+            if (canonicalOrderRevisionHealth?.summary.stale) {
+              warnings.push(
+                'Canonical commerce order revision coverage is stale or has not completed.',
               )
             }
           }

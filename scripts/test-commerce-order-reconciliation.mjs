@@ -91,6 +91,41 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
           'app_src/lib/integrations/commerceShopifyAutomaticPromotion.ts',
         )
       }
+      if (specifier === '@/lib/commerceShopifyOrderRevisionWorker') {
+        return {
+          async processShopifyOrderRevisions() {
+            return {
+              provider: 'shopify',
+              claimed: 0,
+              captured: 0,
+              changed: 0,
+              failed: 0,
+              failureCodes: {},
+              providerWrites: 0,
+              canonicalOrderWrites: 0,
+              managerDispositionRequired: 0,
+            }
+          },
+        }
+      }
+      if (specifier === '@/lib/commerceFaireOrderRevisionWorker') {
+        return {
+          async processFaireOrderRevisions() {
+            return {
+              provider: 'faire',
+              claimed: 0,
+              captured: 0,
+              changed: 0,
+              failed: 0,
+              failureCodes: {},
+              providerReadsPerCapture: 2,
+              providerWrites: 0,
+              canonicalOrderWrites: 0,
+              managerDispositionRequired: 0,
+            }
+          },
+        }
+      }
       return nodeRequire(specifier)
     },
   }
@@ -1441,6 +1476,10 @@ includes(workerSource, [
   'shopifyAutomaticOrderPromotionHealthSnapshot',
   'rollbackFenced',
   'canonicalOrderWrites: shopifyOrdersPromoted + faireOrdersPromoted',
+  'processShopifyOrderRevisions',
+  'processFaireOrderRevisions',
+  'MAX_PROVIDER_REVISION_TARGETS_PER_RECONCILIATION = 2',
+  'canonicalOrderRevisions',
 ], 'Bounded order reconciliation worker')
 assert.ok(
   workerSource.includes('permits a bounded')
@@ -1623,6 +1662,84 @@ assert.deepEqual(
     inventoryWrites: 0,
     syncCursorAdvanced: false,
   },
+)
+const revisionCompositionCalls = []
+const revisionCompositionWorker = loadTypeScriptModule(
+  'app_src/lib/commerceOrderReconciliationWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceIntake': {
+        commerceReadRuntimeAvailable: () => true,
+        commerceReadRuntimeMode: () => 'production',
+        async executeCommerceOrderPage() {
+          assert.fail('No provider page should run without a root claim')
+        },
+        async executeCommerceFaireOrderExactRefresh() {
+          assert.fail('No candidate exact refresh should run without a root claim')
+        },
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async claimCommerceOrderReconciliationTargetsInPostgres() {
+          return []
+        },
+      },
+      '@/lib/commerceShopifyOrderRevisionWorker': {
+        async processShopifyOrderRevisions(input) {
+          revisionCompositionCalls.push({ provider: 'shopify', input })
+          return {
+            provider: 'shopify',
+            claimed: 2,
+            captured: 2,
+            changed: 2,
+            failed: 0,
+            failureCodes: {},
+            providerWrites: 0,
+            canonicalOrderWrites: 0,
+            managerDispositionRequired: 2,
+          }
+        },
+      },
+      '@/lib/commerceFaireOrderRevisionWorker': {
+        async processFaireOrderRevisions(input) {
+          revisionCompositionCalls.push({ provider: 'faire', input })
+          return {
+            provider: 'faire',
+            claimed: 1,
+            captured: 1,
+            changed: 1,
+            failed: 0,
+            failureCodes: {},
+            providerReadsPerCapture: 2,
+            providerWrites: 0,
+            canonicalOrderWrites: 0,
+            managerDispositionRequired: 1,
+          }
+        },
+      },
+    },
+  },
+)
+const revisionComposition = await revisionCompositionWorker
+  .processCommerceOrderReconciliation({ limit: 9 })
+assert.deepEqual(
+  revisionCompositionCalls.map(({ provider, input }) => ({
+    provider,
+    limit: input.limit,
+  })),
+  [
+    { provider: 'shopify', limit: 2 },
+    { provider: 'faire', limit: 2 },
+  ],
+  'One bounded exact-read backstop per provider must follow every order poll',
+)
+assert.equal(revisionComposition.canonicalOrderRevisions.providerWrites, 0)
+assert.equal(
+  revisionComposition.canonicalOrderRevisions.canonicalOrderWrites,
+  0,
+)
+assert.equal(
+  revisionComposition.canonicalOrderRevisions.managerDispositionRequired,
+  3,
 )
 let page = 0
 const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWorker.ts', {

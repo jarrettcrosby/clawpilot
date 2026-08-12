@@ -126,6 +126,27 @@ type SandboxCommerceE2eAuthorizationResult = {
   consumedBy: string | null
 }
 
+type ProviderOrderCancellationCommand = {
+  orderGlobalId: string
+  observationGlobalId: string
+  expectedSourceHash: string
+  expectedRevisionHash: string
+  expectedRowVersion: number
+  reason: string
+}
+
+type ProviderOrderCancellationResult = {
+  dispositionGlobalId: string
+  orderGlobalId: string
+  observationGlobalId: string
+  status: 'cancelled'
+  previousRowVersion: number
+  newRowVersion: number
+  replayed: boolean
+  providerReads: number
+  providerWrites: 0
+}
+
 type OperationsPayload = {
   ok?: boolean
   error?: string
@@ -147,6 +168,7 @@ type OperationsPayload = {
     | OperationsShadowFulfillmentExecutionResult
     | OperationsShipmentCommandResult
     | OperationsCommerceFulfillmentRetryResult
+    | ProviderOrderCancellationResult
 }
 
 type PackagingMaterialsPayload = {
@@ -1946,22 +1968,30 @@ function ExceptionDetailDrawer({
   exception,
   open,
   canManage,
+  canExecute,
   busy,
   onClose,
   onTransition,
+  onAcceptProviderCancellation,
   onOpenOrder,
 }: {
   exception: OperationsExceptionListItem | null
   open: boolean
   canManage: boolean
+  canExecute: boolean
   busy: boolean
   onClose: () => void
   onTransition: (status: OperationsExceptionStatus) => void
+  onAcceptProviderCancellation: (input: ProviderOrderCancellationCommand) => void
   onOpenOrder: (orderGlobalId: string) => void
 }) {
   const theme = useTheme()
   const mobile = useMediaQuery(theme.breakpoints.down('md'))
   const dateTime = useUserDateTime()
+  const [cancellationOpen, setCancellationOpen] = useState(false)
+  const [cancellationReason, setCancellationReason] = useState(
+    'Accept the exact provider cancellation for this unstarted imported order',
+  )
   const recommendedAction = typeof exception?.details.recommendedAction === 'string'
     ? exception.details.recommendedAction
     : ''
@@ -1969,11 +1999,34 @@ function ExceptionDetailDrawer({
   const evidenceText = evidence && typeof evidence === 'object' && Object.keys(evidence).length > 0
     ? JSON.stringify(evidence, null, 2)
     : ''
-  const transitions: Array<{ status: OperationsExceptionStatus; label: string }> = exception?.status === 'open'
-    ? [{ status: 'acknowledged', label: 'Acknowledge' }, { status: 'resolved', label: 'Resolve' }, { status: 'dismissed', label: 'Dismiss' }]
-    : exception?.status === 'acknowledged'
-      ? [{ status: 'resolved', label: 'Resolve' }, { status: 'open', label: 'Reopen' }, { status: 'dismissed', label: 'Dismiss' }]
+  const providerRevisionException = exception?.exceptionType === 'commerce_order_revision_required'
+  const transitions: Array<{ status: OperationsExceptionStatus; label: string }> = providerRevisionException
+    ? exception?.status === 'open'
+      ? [{ status: 'acknowledged', label: 'Acknowledge' }]
       : [{ status: 'open', label: 'Reopen' }]
+    : exception?.status === 'open'
+      ? [{ status: 'acknowledged', label: 'Acknowledge' }, { status: 'resolved', label: 'Resolve' }, { status: 'dismissed', label: 'Dismiss' }]
+      : exception?.status === 'acknowledged'
+        ? [{ status: 'resolved', label: 'Resolve' }, { status: 'open', label: 'Reopen' }, { status: 'dismissed', label: 'Dismiss' }]
+        : [{ status: 'open', label: 'Reopen' }]
+  const observedRowVersion = Number(exception?.details.canonicalRowVersion)
+  const providerCancellationCommand = (
+    providerRevisionException
+    && exception?.details.cancellationDispositionAvailable === true
+    && exception.details.materialState === 'provider_cancelled'
+    && typeof exception.orderGlobalId === 'string'
+    && typeof exception.details.observationGlobalId === 'string'
+    && typeof exception.details.sourceHash === 'string'
+    && typeof exception.details.revisionHash === 'string'
+    && Number.isSafeInteger(observedRowVersion)
+    && observedRowVersion >= 0
+  ) ? {
+      orderGlobalId: exception.orderGlobalId,
+      observationGlobalId: exception.details.observationGlobalId,
+      expectedSourceHash: exception.details.sourceHash,
+      expectedRevisionHash: exception.details.revisionHash,
+      expectedRowVersion: observedRowVersion,
+    } : null
 
   return (
     <Drawer
@@ -2039,7 +2092,18 @@ function ExceptionDetailDrawer({
             </DetailSection>
             {canManage && (
               <DetailSection title="Disposition">
-                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} flexWrap="wrap" useFlexGap>
+                  {providerCancellationCommand && (
+                    <Button
+                      variant="contained"
+                      color="error"
+                      disabled={busy || !canExecute}
+                      startIcon={<CancelRounded />}
+                      onClick={() => setCancellationOpen(true)}
+                    >
+                      Accept provider cancellation
+                    </Button>
+                  )}
                   {transitions.map((transition) => (
                     <Button
                       key={transition.status}
@@ -2053,11 +2117,59 @@ function ExceptionDetailDrawer({
                     </Button>
                   ))}
                 </Stack>
+                {providerRevisionException && !providerCancellationCommand && (
+                  <Alert severity="warning" sx={{ mt: 1.5 }}>
+                    This revision cannot be resolved manually. Refresh exact provider evidence or review the order outside this bounded cancellation workflow.
+                  </Alert>
+                )}
               </DetailSection>
             )}
           </Stack>
         </Box>
       )}
+      <Dialog
+        open={cancellationOpen}
+        onClose={() => { if (!busy) setCancellationOpen(false) }}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle>Accept provider cancellation?</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={2}>
+            <Alert severity="warning">
+              ClawPilot will cancel this order locally only if it is still imported and has no plan, reservation, pick, package, label, shipment, or fulfillment export evidence. No Shopify or Faire write will occur.
+            </Alert>
+            <TextField
+              label="Manager reason"
+              value={cancellationReason}
+              onChange={(event) => setCancellationReason(event.target.value)}
+              multiline
+              minRows={3}
+              inputProps={{ maxLength: 500 }}
+              helperText="Recorded with the immutable provider revision disposition."
+              fullWidth
+              required
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button disabled={busy} onClick={() => setCancellationOpen(false)}>Keep order</Button>
+          <Button
+            color="error"
+            variant="contained"
+            disabled={busy || !providerCancellationCommand || cancellationReason.trim().length < 10}
+            onClick={() => {
+              if (!providerCancellationCommand) return
+              onAcceptProviderCancellation({
+                ...providerCancellationCommand,
+                reason: cancellationReason.trim(),
+              })
+            }}
+          >
+            {busy ? 'Checking exact evidence…' : 'Cancel unstarted order'}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Drawer>
   )
 }
@@ -3616,6 +3728,47 @@ export default function OperationsSection({
     }
   }
 
+  const acceptProviderOrderCancellation = async (
+    command: ProviderOrderCancellationCommand,
+  ) => {
+    setUpdatingException(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `operations-provider-cancel:${command.observationGlobalId}`,
+        },
+        body: JSON.stringify({
+          action: 'accept-provider-order-cancellation',
+          ...command,
+        }),
+      })
+      const payload = await response.json() as OperationsPayload
+      if (
+        !response.ok
+        || !payload.result
+        || !('dispositionGlobalId' in payload.result)
+      ) {
+        throw new Error(`${payload.error || 'Provider cancellation could not be accepted'}${payload.code ? ` [${payload.code}]` : ''}`)
+      }
+      const result = payload.result
+      closeExceptionDrawer()
+      setNotice(
+        `${result.orderGlobalId} is cancelled from exact provider evidence (${result.dispositionGlobalId}). No provider write occurred.`,
+      )
+      await loadWorkspace()
+    } catch (caught) {
+      setError(caught instanceof Error
+        ? caught.message
+        : 'Provider cancellation could not be accepted')
+    } finally {
+      setUpdatingException(false)
+    }
+  }
+
   const commerceActiveIdempotencyKey = (phase: 'prepare' | 'activate') => (
     `operations-commerce-active-${phase}:${window.crypto.randomUUID()}`
   )
@@ -4421,12 +4574,17 @@ export default function OperationsSection({
         printingPackingSlipArtifactId={printingPackingSlipArtifactId}
       />
       <ExceptionDetailDrawer
+        key={selectedExceptionGlobalId || 'no-exception'}
         exception={selectedException}
         open={exceptionDrawerOpen}
         canManage={Boolean(capabilities?.canManage)}
+        canExecute={Boolean(capabilities?.canExecute)}
         busy={updatingException}
         onClose={closeExceptionDrawer}
         onTransition={(nextStatus) => void transitionException(nextStatus)}
+        onAcceptProviderCancellation={(command) => {
+          void acceptProviderOrderCancellation(command)
+        }}
         onOpenOrder={openExceptionOrder}
       />
       <OperationsGuide open={guideOpen} onClose={() => setGuideOpen(false)} />

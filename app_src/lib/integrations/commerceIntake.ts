@@ -3867,6 +3867,66 @@ export async function executeCommerceOrderPage(input: {
 }
 
 /**
+ * Worker-only exact Shopify order read for an already-promoted canonical
+ * order. Unlike the open-order poll, this reads the exact provider ID so
+ * cancellations, closures, fulfillment, and edits remain observable.
+ * It retains no provider payload and performs no provider write.
+ */
+export async function readCommerceShopifyOrderRevisionEnvelope(input: {
+  organizationId: string
+  accountGlobalId: string
+  integrationAccountId: string
+  externalAccountId: string
+  externalOrderId: string
+  expectedCredentialVersion: number
+}) {
+  const runtime = await runtimeFor(input, { reconciliationRead: true })
+  if (
+    runtime.provider !== 'shopify'
+    || runtime.integrationAccountId !== input.integrationAccountId
+    || runtime.externalAccountId !== input.externalAccountId
+    || runtime.credentialVersion !== input.expectedCredentialVersion
+  ) {
+    throw new CommerceIntegrationRequestError(
+      'Shopify order revision authority changed before the exact read',
+      409,
+      'SHOPIFY_ORDER_REVISION_AUTHORITY_STALE',
+    )
+  }
+  const observedAt = new Date().toISOString()
+  const result = await shopifyEnvelope(runtime, {
+    mode: 'operational',
+    resource: 'orders',
+    sessionId: `revision:${input.externalOrderId}`,
+    batchNumber: 0,
+    previousRunGlobalId: null,
+    windowStart: null,
+    windowEnd: observedAt,
+    queryHash: createHash('sha256')
+      .update(`revision:${input.externalOrderId}`)
+      .digest('hex'),
+    orderCursor: null,
+    cursorHash: null,
+  }, input.externalOrderId)
+  if (result.envelope.rejections.length || result.envelope.orders.length !== 1) {
+    throw new CommerceIntegrationRequestError(
+      'Shopify exact order revision could not be normalized completely',
+      409,
+      'SHOPIFY_ORDER_REVISION_NORMALIZATION_REJECTED',
+    )
+  }
+  return {
+    envelope: result.envelope,
+    observedAt,
+    // Probe + exact order, plus at most one bounded nested line page.
+    providerReads: result.envelope.orders[0].lines.length > SHOPIFY_ORDER_LINE_PAGE_SIZE
+      ? 3 as const
+      : 2 as const,
+    providerWrites: 0 as const,
+  }
+}
+
+/**
  * Worker-only exact Faire order read. It reuses the browser refresh pipeline's
  * durable read intent, capture, staging, customer, and promotion contracts,
  * while fencing the exact candidate revision selected before any provider

@@ -27,6 +27,10 @@ import {
   SandboxCommerceE2eAuthorizationError,
 } from '@/lib/persistence/sandboxCommerceE2eAuthorization'
 import {
+  cancelUnstartedCommerceOrderFromProviderRevisionInPostgres,
+  CommerceOrderRevisionDispositionError,
+} from '@/lib/persistence/commerceOrderRevisions'
+import {
   assignOperationsOrderPicksFromPostgres,
   confirmOperationsOrderShipmentFromPostgres,
   confirmOperationsOrderPicksFromPostgres,
@@ -90,6 +94,7 @@ const PICK_TASK_GLOBAL_ID = /^gpk(?:[0-9]{7}|[0-9a-v]{12})$/
 const CARTONIZATION_EVIDENCE_GLOBAL_ID = /^gcte(?:[0-9]{7}|[0-9a-v]{12})$/
 const PACKAGE_GLOBAL_ID = /^gpa(?:[0-9]{7}|[0-9a-v]{12})$/
 const EXCEPTION_GLOBAL_ID = /^gex(?:[0-9]{7}|[0-9a-v]{12})$/
+const COMMERCE_ORDER_REVISION_OBSERVATION_GLOBAL_ID = /^gcor(?:[0-9]{7}|[0-9a-v]{12})$/
 const RATE_GLOBAL_ID = /^grt(?:[0-9]{7}|[0-9a-v]{12})$/
 const CARRIER_ACCOUNT_GLOBAL_ID = /^gac(?:[0-9]{7}|[0-9a-v]{12})$/
 const PRINTER_GLOBAL_ID = /^gpr(?:[0-9]{7}|[0-9a-v]{12})$/
@@ -953,6 +958,9 @@ function errorResponse(error: unknown) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
   if (error instanceof SandboxCommerceE2eAuthorizationError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
+  if (error instanceof CommerceOrderRevisionDispositionError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
   if (
@@ -2126,6 +2134,50 @@ export async function POST(req: NextRequest) {
         orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
         expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
         reason: textValue(body.reason, 'Label void reason', 500),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'accept-provider-order-cancellation') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to accept provider order cancellations',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'orderGlobalId',
+          'observationGlobalId',
+          'expectedSourceHash',
+          'expectedRevisionHash',
+          'expectedRowVersion',
+          'reason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const expectedSourceHash = textValue(body.expectedSourceHash, 'Provider source hash', 64)
+      const expectedRevisionHash = textValue(body.expectedRevisionHash, 'Provider revision hash', 64)
+      if (!SHA256.test(expectedSourceHash) || !SHA256.test(expectedRevisionHash)) {
+        requestError('OPERATIONS_REQUEST_INVALID', 'Provider revision evidence is invalid')
+      }
+      const result = await cancelUnstartedCommerceOrderFromProviderRevisionInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
+        observationGlobalId: globalIdValue(
+          body.observationGlobalId,
+          'Provider order revision observation',
+          COMMERCE_ORDER_REVISION_OBSERVATION_GLOBAL_ID,
+        ),
+        expectedSourceHash,
+        expectedRevisionHash,
+        expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
+        reason: textValue(body.reason, 'Provider cancellation reason', 500),
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })

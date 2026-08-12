@@ -1442,6 +1442,15 @@ async function verifyRouteBehavior() {
           state: 'active',
         }),
       },
+      '@/lib/persistence/commerceOrderRevisions': {
+        CommerceOrderRevisionDispositionError: class extends Error {},
+        cancelUnstartedCommerceOrderFromProviderRevisionInPostgres:
+          async () => {
+            throw new Error(
+              'Distributed Operations route contract does not cancel provider orders',
+            )
+          },
+      },
       '@/lib/persistence/operations': {
         OperationsRequestError,
         readOperationsWorkspaceFromPostgres: async (input) => {
@@ -3041,26 +3050,124 @@ async function verifyWearableCountEvidenceAcceptance(
   )
   const locationCapturedAt = new Date(Date.now() - 2_000).toISOString()
   const productCapturedAt = new Date(Date.now() - 1_000).toISOString()
+  const scanEvidence = [{
+    pickTaskGlobalId: policyTask.global_id,
+    policyRowVersion: 1,
+    location: {
+      barcode: locationAcceptanceBarcode(policyTask.location_global_id),
+      capturedAt: locationCapturedAt,
+      source: 'iphone_camera',
+    },
+    product: {
+      barcode: internalAcceptanceBarcode(policyTask.product_global_id),
+      capturedAt: productCapturedAt,
+      source: 'meta',
+    },
+  }]
+  const sourceOrder = await pool.query(
+    `SELECT id::text, integration_account_id::text
+     FROM operations_orders
+     WHERE organization_id = $1::uuid AND global_id = $2`,
+    [fixture.organizationId, policyOrder.staged.orderGlobalId],
+  )
+  const revisionAccount = await pool.query(
+    `INSERT INTO operations_integration_accounts (
+       organization_id, provider, integration_type, environment,
+       display_name, status, configuration, created_by, updated_by
+     ) VALUES (
+       $1::uuid, 'shopify', 'commerce', 'sandbox',
+       'Wearable revision gate acceptance', 'active', '{}'::jsonb, $2, $2
+     ) RETURNING id::text`,
+    [fixture.organizationId, fixture.email],
+  )
+  await pool.query(
+    `UPDATE operations_orders
+     SET source_provider = 'shopify', integration_account_id = $3::uuid
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [fixture.organizationId, sourceOrder.rows[0].id, revisionAccount.rows[0].id],
+  )
+  await pool.query(
+    `INSERT INTO operations_commerce_order_revision_targets (
+       organization_id, integration_account_id, order_id, provider,
+       accepted_source_hash, latest_source_hash, material_state,
+       claim_state, checked_at, next_check_at
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, 'shopify',
+       $4, $5, 'provider_cancelled', 'ready', now(), now() + interval '30 minutes'
+     )`,
+    [
+      fixture.organizationId,
+      revisionAccount.rows[0].id,
+      sourceOrder.rows[0].id,
+      'a'.repeat(64),
+      'b'.repeat(64),
+    ],
+  )
+  const blockedScanKey = `wearable-scan-revision-block-${randomUUID()}`
+  const scanCountsBefore = await pool.query(
+    `SELECT
+       (SELECT count(*)::int FROM operations_wearable_pick_scan_evidence
+        WHERE organization_id = $1::uuid AND order_id = $2::uuid) AS evidence,
+       (SELECT count(*)::int FROM operations_command_receipts
+        WHERE organization_id = $1::uuid
+          AND command_type = 'record_wearable_pick_scan_evidence'
+          AND status = 'succeeded') AS succeeded_receipts`,
+    [fixture.organizationId, sourceOrder.rows[0].id],
+  )
+  await expectRejected(
+    () => persistence.recordWearablePickScanEvidenceFromPostgres({
+      organizationId: fixture.organizationId,
+      actorEmail: fixture.email,
+      orderGlobalId: policyOrder.staged.orderGlobalId,
+      expectedRowVersion: policyOrder.released.rowVersion,
+      scanEvidence,
+      idempotencyKey: blockedScanKey,
+    }),
+    (error) => error.code === 'COMMERCE_ORDER_REVISION_REVIEW_REQUIRED',
+    'Material provider revisions must block wearable scan evidence',
+  )
+  const scanCountsAfter = await pool.query(
+    `SELECT
+       (SELECT count(*)::int FROM operations_wearable_pick_scan_evidence
+        WHERE organization_id = $1::uuid AND order_id = $2::uuid) AS evidence,
+       (SELECT count(*)::int FROM operations_command_receipts
+        WHERE organization_id = $1::uuid
+          AND command_type = 'record_wearable_pick_scan_evidence'
+          AND status = 'succeeded') AS succeeded_receipts,
+       (SELECT count(*)::int FROM operations_command_receipts
+        WHERE organization_id = $1::uuid
+          AND command_type = 'record_wearable_pick_scan_evidence'
+          AND idempotency_key = $3 AND status = 'failed') AS failed_receipts`,
+    [fixture.organizationId, sourceOrder.rows[0].id, blockedScanKey],
+  )
+  assert.equal(scanCountsAfter.rows[0].evidence, scanCountsBefore.rows[0].evidence)
+  assert.equal(
+    scanCountsAfter.rows[0].succeeded_receipts,
+    scanCountsBefore.rows[0].succeeded_receipts,
+  )
+  assert.equal(scanCountsAfter.rows[0].failed_receipts, 1)
+  await pool.query(
+    `DELETE FROM operations_commerce_order_revision_targets
+     WHERE organization_id = $1::uuid AND order_id = $2::uuid`,
+    [fixture.organizationId, sourceOrder.rows[0].id],
+  )
+  await pool.query(
+    `UPDATE operations_orders
+     SET source_provider = 'mock-commerce', integration_account_id = $3::uuid
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [
+      fixture.organizationId,
+      sourceOrder.rows[0].id,
+      sourceOrder.rows[0].integration_account_id,
+    ],
+  )
   const scanEvidenceKey = `wearable-scan-count-${randomUUID()}`
   await persistence.recordWearablePickScanEvidenceFromPostgres({
     organizationId: fixture.organizationId,
     actorEmail: fixture.email,
     orderGlobalId: policyOrder.staged.orderGlobalId,
     expectedRowVersion: policyOrder.released.rowVersion,
-    scanEvidence: [{
-      pickTaskGlobalId: policyTask.global_id,
-      policyRowVersion: 1,
-      location: {
-        barcode: locationAcceptanceBarcode(policyTask.location_global_id),
-        capturedAt: locationCapturedAt,
-        source: 'iphone_camera',
-      },
-      product: {
-        barcode: internalAcceptanceBarcode(policyTask.product_global_id),
-        capturedAt: productCapturedAt,
-        source: 'meta',
-      },
-    }],
+    scanEvidence,
     idempotencyKey: scanEvidenceKey,
   })
   const policyCountEvidence = {
@@ -3669,6 +3776,24 @@ async function verifyPostgresAcceptance(databaseUrl) {
     await pool.query('SELECT 1')
     const postgres = postgresMock(pool)
     const auditWriter = auditWriterMock()
+    const commerceOrderRevisionEvidence = loadTypeScriptModule(
+      'app_src/lib/integrations/commerceOrderRevisionEvidence.ts',
+    )
+    const commerceOrderRevisions = loadTypeScriptModule(
+      'app_src/lib/persistence/commerceOrderRevisions.ts',
+      {
+        mocks: {
+          '@/lib/auditWriter': auditWriter,
+          '@/lib/integrations/commerceOrderRevisionEvidence':
+            commerceOrderRevisionEvidence,
+          '@/lib/integrations/commerceReadRuntime': {
+            commerceReadAccountSql: () => "account.status <> 'error'",
+            commerceReadRuntimeAvailable: () => true,
+          },
+          '@/lib/persistence/postgres': postgres,
+        },
+      },
+    )
     const domain = loadTypeScriptModule('app_src/lib/operations/domain.ts')
     const adapters = loadTypeScriptModule('app_src/lib/operations/adapters.ts', {
       mocks: { '@/lib/operations/domain': domain },
@@ -3840,6 +3965,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
             )
           },
         },
+        '@/lib/persistence/commerceOrderRevisions': commerceOrderRevisions,
         '@/lib/persistence/postgres': postgres,
         '@/lib/persistence/productPackaging': productPackaging,
         '@/lib/persistence/shopifyCheckoutRating': shopifyCheckoutRating,

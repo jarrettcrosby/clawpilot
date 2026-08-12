@@ -1,5 +1,11 @@
 import { createHash } from 'node:crypto'
 import {
+  processFaireOrderRevisions,
+} from '@/lib/commerceFaireOrderRevisionWorker'
+import {
+  processShopifyOrderRevisions,
+} from '@/lib/commerceShopifyOrderRevisionWorker'
+import {
   commerceReadRuntimeAvailable,
   commerceReadRuntimeMode,
   executeCommerceFaireOrderExactRefresh,
@@ -187,6 +193,7 @@ const MAX_PROVIDER_RECORDS_PER_RECONCILIATION = 250
 const MAX_RECONCILIATION_RUNTIME_MS = 180_000
 const MIN_REMAINING_RUNTIME_FOR_PAGE_MS = 30_000
 const MIN_REMAINING_RUNTIME_FOR_EXACT_REFRESH_MS = 30_000
+const MAX_PROVIDER_REVISION_TARGETS_PER_RECONCILIATION = 2
 const PROVIDER_PAGE_RECORD_LIMIT = {
   shopify: 25,
   faire: 50,
@@ -310,6 +317,34 @@ export async function processCommerceOrderReconciliation(input: {
         operatorReviewRequired: 0,
         providerWrites: 0,
         syncCursorAdvanced: false,
+      },
+      canonicalOrderRevisions: {
+        shopify: {
+          provider: 'shopify' as const,
+          claimed: 0,
+          captured: 0,
+          changed: 0,
+          failed: 0,
+          failureCodes: {},
+          providerWrites: 0 as const,
+          canonicalOrderWrites: 0 as const,
+          managerDispositionRequired: 0,
+        },
+        faire: {
+          provider: 'faire' as const,
+          claimed: 0,
+          captured: 0,
+          changed: 0,
+          failed: 0,
+          failureCodes: {},
+          providerReadsPerCapture: 2 as const,
+          providerWrites: 0 as const,
+          canonicalOrderWrites: 0 as const,
+          managerDispositionRequired: 0,
+        },
+        providerWrites: 0 as const,
+        canonicalOrderWrites: 0 as const,
+        managerDispositionRequired: 0,
       },
       failureCodes: {},
     }
@@ -1007,6 +1042,14 @@ export async function processCommerceOrderReconciliation(input: {
       }
     }
   }
+  const revisionLimit = Math.max(1, Math.min(
+    Number(input.limit || 1),
+    MAX_PROVIDER_REVISION_TARGETS_PER_RECONCILIATION,
+  ))
+  const [shopifyOrderRevisions, faireOrderRevisions] = await Promise.all([
+    processShopifyOrderRevisions({ limit: revisionLimit }),
+    processFaireOrderRevisions({ limit: revisionLimit }),
+  ])
   return {
     skipped: false,
     claimed: targets.length,
@@ -1112,6 +1155,15 @@ export async function processCommerceOrderReconciliation(input: {
         operatorReviewRequired:
           faireUnattributedAttentionRequiredAccounts,
       }),
+    canonicalOrderRevisions: {
+      shopify: shopifyOrderRevisions,
+      faire: faireOrderRevisions,
+      providerWrites: 0 as const,
+      canonicalOrderWrites: 0 as const,
+      managerDispositionRequired:
+        shopifyOrderRevisions.managerDispositionRequired
+        + faireOrderRevisions.managerDispositionRequired,
+    },
     failureCodes,
   }
 }

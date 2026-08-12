@@ -38,6 +38,10 @@ import {
   requireActiveSandboxCommerceE2eAuthorization,
 } from '@/lib/persistence/sandboxCommerceE2eAuthorization'
 import {
+  assertCommerceOrderRevisionExecutionCurrent,
+  CommerceOrderRevisionGateError,
+} from '@/lib/persistence/commerceOrderRevisions'
+import {
   MockCarrierAdapter,
   MockCommerceAdapter,
   MockPrintAdapter,
@@ -447,6 +451,20 @@ export class OperationsRequestError extends Error {
     readonly status = 400,
   ) {
     super(message)
+  }
+}
+
+async function requireCurrentCommerceOrderRevision(
+  client: PoolClient,
+  input: Parameters<typeof assertCommerceOrderRevisionExecutionCurrent>[1],
+) {
+  try {
+    await assertCommerceOrderRevisionExecutionCurrent(client, input)
+  } catch (error) {
+    if (error instanceof CommerceOrderRevisionGateError) {
+      throw new OperationsRequestError(error.code, error.message, error.status)
+    }
+    throw error
   }
 }
 
@@ -4924,6 +4942,16 @@ export async function updateOperationsExceptionInPostgres(input: {
     if (!current) {
       throw new OperationsRequestError('OPERATIONS_EXCEPTION_NOT_FOUND', 'Operations exception was not found', 404)
     }
+    if (
+      current.exception_type === 'commerce_order_revision_required'
+      && !['open', 'acknowledged'].includes(input.status)
+    ) {
+      throw new OperationsRequestError(
+        'COMMERCE_ORDER_REVISION_DISPOSITION_REQUIRED',
+        'Provider order revisions can be resolved only by an immutable authorized disposition',
+        409,
+      )
+    }
     if (current.status === input.status) {
       return { exception: exceptionListItem(current), changed: false }
     }
@@ -5324,6 +5352,11 @@ async function readShadowExecutionContext(
       409,
     )
   }
+  await requireCurrentCommerceOrderRevision(client, {
+    organizationId: input.organizationId,
+    orderId: order.id,
+    operation: 'prepare_fulfillment',
+  })
   if (
     order.status !== 'packed'
     || order.source_provider !== 'shopify'
@@ -10407,6 +10440,11 @@ export async function planOperationsOrderFromPostgres(input: {
           409,
         )
       }
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId,
+        orderId: order.id,
+        operation: 'plan',
+      })
       if (order.status !== 'imported') {
         throw new OperationsRequestError(
           'OPERATIONS_ORDER_TRANSITION_INVALID',
@@ -12030,6 +12068,11 @@ export async function releaseOperationsOrderFromPostgres(input: {
           409,
         )
       }
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId,
+        orderId: order.id,
+        operation: 'release',
+      })
       if (order.status !== 'planned') {
         throw new OperationsRequestError(
           'OPERATIONS_ORDER_TRANSITION_INVALID',
@@ -12432,6 +12475,11 @@ export async function assignOperationsOrderPicksFromPostgres(input: {
           409,
         )
       }
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId,
+        orderId: order.id,
+        operation: 'assign',
+      })
       if (order.status !== 'released') {
         throw new OperationsRequestError(
           'OPERATIONS_PICK_ASSIGNMENT_INVALID',
@@ -13715,6 +13763,11 @@ export async function recordWearablePickScanEvidenceFromPostgres(input: {
           409,
         )
       }
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId,
+        orderId: order.id,
+        operation: 'pick',
+      })
       const planResult = await client.query<QueryResultRow & {
         id: string
         global_id: string
@@ -14920,6 +14973,11 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           409,
         )
       }
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId,
+        orderId: order.id,
+        operation: 'pick',
+      })
       if (order.status !== 'released') {
         throw new OperationsRequestError(
           'OPERATIONS_ORDER_TRANSITION_INVALID',
@@ -15452,6 +15510,11 @@ export async function verifyOperationsOrderPackFromPostgres(input: {
           409,
         )
       }
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId,
+        orderId: order.id,
+        operation: 'pack',
+      })
       if (order.status !== 'picking') {
         throw new OperationsRequestError(
           'OPERATIONS_ORDER_TRANSITION_INVALID',
@@ -15886,6 +15949,11 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
           409,
         )
       }
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId,
+        orderId: source.order_id,
+        operation: 'packing_slip',
+      })
       if (
         source.plan_status !== 'released'
         || !['packed', 'labeled'].includes(source.package_status)
@@ -16683,6 +16751,11 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
         404,
       )
     }
+    await requireCurrentCommerceOrderRevision(client, {
+      organizationId: input.organizationId,
+      orderId: row.order_id,
+      operation: 'export',
+    })
     const decision = commerceExportCustomerNotificationDecision(
       row.payload_snapshot,
       row.provider,
@@ -17837,6 +17910,11 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           409,
         )
       }
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId,
+        orderId: order.id,
+        operation: 'ship',
+      })
       if (order.status !== 'packed') {
         throw new OperationsRequestError(
           'OPERATIONS_ORDER_TRANSITION_INVALID',
