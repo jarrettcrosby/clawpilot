@@ -294,7 +294,7 @@ struct PickingDashboardView: View {
                 )
                 guideStep(1, "Receive work", "A manager waves an order and assigns it to you.")
                 guideStep(2, "Verify location when required", "If your warehouse enables location-first picking, scan the printed location label before the product. ClawPilot never turns this on automatically.")
-                guideStep(3, "Scan the product", "Tap Start Meta scan, then look at the barcode. The same camera session continues from a matched location to its product; nothing is saved.")
+                guideStep(3, "Scan the product", "After the location matches, ClawPilot pauses on that step. Deliberately tap Scan product, then scan with the still-live glasses session or the iPhone camera.")
                 guideStep(4, "Confirm the order", "After every product matches, confirm once to write the audited result to ClawPilot.")
             }
         }
@@ -368,7 +368,45 @@ struct PickingDashboardView: View {
                     .foregroundStyle(PickingTheme.muted)
             }
 
-            if model.isMetaScanning {
+            if model.currentWorkflowStage == .productReady,
+               let context = model.currentStageContext {
+                statePanel(
+                    icon: "checkmark.circle.fill",
+                    color: PickingTheme.mint,
+                    title: "Location verified",
+                    detail: "Confirm the product is in hand, then deliberately start its barcode scan."
+                )
+                Button {
+                    Task { await model.beginProductScanWithMeta(contextToken: context.token) }
+                } label: {
+                    Label("Scan product with Meta glasses", systemImage: "eyeglasses")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(PrimaryDashboardButtonStyle())
+                .disabled(!model.metaScanReady && !model.isMetaScanning)
+                Button {
+                    Task { await model.beginProductScanWithPhone(contextToken: context.token) }
+                } label: {
+                    Label("Scan product with iPhone", systemImage: "iphone.gen3")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(SecondaryDashboardButtonStyle())
+            } else if model.currentWorkflowStage == .count,
+                      let context = model.currentStageContext {
+                statePanel(
+                    icon: "number.square.fill",
+                    color: Color.orange,
+                    title: "Product matched",
+                    detail: "Required quantity: \(context.requiredQuantity). Enter what you actually picked before this item can advance."
+                )
+                Button {
+                    model.showCountEntry = true
+                } label: {
+                    Label("Enter picked count", systemImage: "number.square.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(PrimaryDashboardButtonStyle())
+            } else if model.isMetaScanning {
                 Button {
                     Task { await model.cancelMetaScan() }
                 } label: {
@@ -387,34 +425,36 @@ struct PickingDashboardView: View {
                 .disabled(!model.metaScanReady)
             }
 
-            Button {
-                if model.isListeningForPickCommand {
-                    model.stopListeningForPickCommand()
-                } else {
-                    Task { await model.listenForPickCommand() }
-                }
-            } label: {
-                Label(
-                    model.isListeningForPickCommand ? "Stop voice command" : "Listen for voice command",
-                    systemImage: model.isListeningForPickCommand ? "waveform.slash" : "waveform.and.mic"
-                )
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(SecondaryDashboardButtonStyle())
-
-            Text(model.currentScanStage == .location
-                ? "Hands-free: say “Hey Siri, scan with ClawPilot,” then look at the location label. After it matches, keep the glasses camera on the product barcode."
-                : "Hands-free: say “Hey Siri, scan with ClawPilot.” In-app voice control also accepts “Start glasses scan.” ClawPilot analyzes one in-memory glasses photo first, then briefly checks live frames; nothing is saved.")
-                .font(.caption)
-                .foregroundStyle(PickingTheme.muted)
-
-            Button {
-                model.showPhoneScanner = true
-            } label: {
-                Label("Use iPhone camera instead", systemImage: "iphone.gen3")
+            if model.currentWorkflowStage == .location || model.currentWorkflowStage == .product {
+                Button {
+                    if model.isListeningForPickCommand {
+                        model.stopListeningForPickCommand()
+                    } else {
+                        Task { await model.listenForPickCommand() }
+                    }
+                } label: {
+                    Label(
+                        model.isListeningForPickCommand ? "Stop voice command" : "Listen for voice command",
+                        systemImage: model.isListeningForPickCommand ? "waveform.slash" : "waveform.and.mic"
+                    )
                     .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(SecondaryDashboardButtonStyle())
+
+                Text(model.currentScanStage == .location
+                    ? "Hands-free: scan the location first. ClawPilot pauses on a verified location until you deliberately start the product scan."
+                    : "Hands-free: say “Hey Siri, scan with ClawPilot.” ClawPilot analyzes in-memory camera frames; nothing is saved.")
+                    .font(.caption)
+                    .foregroundStyle(PickingTheme.muted)
+
+                Button {
+                    model.showPhoneScanner = true
+                } label: {
+                    Label("Use iPhone camera instead", systemImage: "iphone.gen3")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(SecondaryDashboardButtonStyle())
             }
-            .buttonStyle(SecondaryDashboardButtonStyle())
 
             Button {
                 model.readInstruction()
@@ -554,7 +594,7 @@ struct PickingDashboardView: View {
                     .buttonStyle(SecondaryDashboardButtonStyle())
                 }
 
-                Text("To scan: say “Hey Siri, scan with ClawPilot,” or tap Start Meta scan. Look steadily at one item barcode. ClawPilot checks a high-resolution photo first and live frames second; use the iPhone camera only as a fallback.")
+                Text("To scan: say “Hey Siri, scan with ClawPilot,” or tap Start Meta scan. Look steadily at one barcode. ClawPilot prioritizes the latest live video frame and uses one bounded high-resolution photo only as a fallback; nothing is saved.")
                     .font(.caption2)
                     .foregroundStyle(PickingTheme.muted)
             }
@@ -872,6 +912,69 @@ struct PickingDashboardView: View {
         guard model.canVerifyCode else { return }
         authenticationField = nil
         Task { await model.verifyCode() }
+    }
+}
+
+struct PickedCountEntrySheet: View {
+    @ObservedObject var model: PickingPhoneModel
+    let context: PickStageContext
+    @State private var enteredCount = ""
+    @FocusState private var countFocused: Bool
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 18) {
+                Label("Verify picked quantity", systemImage: "number.square.fill")
+                    .font(.title2.weight(.bold))
+                Text("Required count: \(context.requiredQuantity)")
+                    .font(.title3.weight(.semibold))
+                Text("Enter the number physically picked. The item advances only when it exactly matches the required count.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                TextField("Picked count", text: $enteredCount)
+                    .keyboardType(.numberPad)
+                    .font(.system(size: 34, weight: .bold, design: .monospaced))
+                    .textFieldStyle(.roundedBorder)
+                    .focused($countFocused)
+                    .onChange(of: enteredCount) { _, value in
+                        let sanitized = String(value.filter(\.isNumber).prefix(16))
+                        if sanitized != value { enteredCount = sanitized }
+                    }
+                if model.status.contains("under") || model.status.contains("over") {
+                    Text(model.status)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.red)
+                }
+                Button("Verify count") {
+                    guard let count = Int(enteredCount) else {
+                        model.status = "Enter a positive whole-number count."
+                        return
+                    }
+                    Task {
+                        _ = await model.submitPickedCount(
+                            count,
+                            contextToken: context.token
+                        )
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .frame(maxWidth: .infinity)
+                .disabled(enteredCount.isEmpty)
+                Spacer()
+            }
+            .padding(22)
+            .navigationTitle("Picked count")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { model.cancelCountEntry() }
+                }
+            }
+            .interactiveDismissDisabled()
+            .onAppear { countFocused = true }
+        }
+        .presentationDetents([.medium])
     }
 }
 

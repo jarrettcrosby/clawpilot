@@ -32,6 +32,17 @@ export type WearablePickTaskScanEvidenceInput = {
   product: WearableScanObservationInput
 }
 
+export type WearableCountSource = 'iphone' | 'watch'
+
+export type WearablePickTaskCountEvidenceInput = {
+  pickTaskGlobalId: string
+  requiredQuantity: number
+  enteredQuantity: number
+  product: WearableScanObservationInput
+  countedAt: string
+  countSource: WearableCountSource
+}
+
 export type WearablePickOrder = {
   orderGlobalId: string
   orderNumber: string

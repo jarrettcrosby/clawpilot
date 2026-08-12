@@ -62,7 +62,10 @@ import {
   locationBarcode,
   providerBarcodeIdentity,
 } from '@/lib/operations/barcodeLabels'
-import type { WearablePickTaskScanEvidenceInput } from '@/lib/operations/wearablePicking'
+import type {
+  WearablePickTaskCountEvidenceInput,
+  WearablePickTaskScanEvidenceInput,
+} from '@/lib/operations/wearablePicking'
 import {
   authorizedCheckoutShippingChargeMinor,
   CANONICAL_FULFILLMENT_RATE_POLICY_VERSION,
@@ -12513,6 +12516,7 @@ type WearablePickScanContextRow = QueryResultRow & {
   pick_task_id: string
   pick_task_global_id: string
   pick_status: string
+  quantity: string
   assigned_to: string | null
   assigned_at: string | Date | null
   pick_created_at: string | Date
@@ -12557,6 +12561,7 @@ export type WearablePickScanEvidenceCommandResult = {
 const WEARABLE_SCAN_MAX_AGE_MS = 24 * 60 * 60 * 1_000
 const WEARABLE_SCAN_CLOCK_SKEW_MS = 5 * 60 * 1_000
 const WEARABLE_LOCATION_TO_PRODUCT_MAX_MS = 30 * 60 * 1_000
+const WEARABLE_PRODUCT_TO_COUNT_MAX_MS = 30 * 60 * 1_000
 
 function wearableScanExpectedProductBarcode(row: WearablePickScanContextRow) {
   if (row.assigned_product_barcode) return row.assigned_product_barcode
@@ -12592,6 +12597,19 @@ function wearableScanTime(value: string | Date | null, label: string) {
   return parsed
 }
 
+function wearableCountTime(value: string | Date | null, label: string) {
+  if (value === null) return null
+  const parsed = value instanceof Date ? value : new Date(value)
+  if (!Number.isFinite(parsed.getTime())) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+      `${label} is invalid`,
+      409,
+    )
+  }
+  return parsed
+}
+
 async function readWearablePickScanContexts(
   client: PoolClient,
   input: {
@@ -12605,6 +12623,7 @@ async function readWearablePickScanContexts(
     `SELECT pick.id::text AS pick_task_id,
             pick.global_id AS pick_task_global_id,
             pick.status AS pick_status,
+            pick.quantity::text,
             lower(pick.assigned_to) AS assigned_to,
             pick.assigned_at,
             pick.created_at AS pick_created_at,
@@ -12813,6 +12832,231 @@ function validateWearablePickScanEvidence(
     )
   }
   return validated
+}
+
+function validateWearablePickCountEvidence(input: {
+  actorEmail: string
+  countEvidenceIdempotencyKey?: string
+  countEvidence?: WearablePickTaskCountEvidenceInput[]
+  contexts: WearablePickScanContextRow[]
+  acknowledgedScanProductObservations?: Array<{
+    pickTaskId: string
+    barcode: string
+    capturedAt: string
+    source: 'iphone_camera' | 'meta'
+  }>
+  now?: Date
+}) {
+  const idempotencyKey = String(
+    input.countEvidenceIdempotencyKey || '',
+  ).trim() || undefined
+  const evidence = input.countEvidence
+  if (idempotencyKey === undefined && evidence === undefined) {
+    return {
+      enforced: false as const,
+      countEvidenceIdempotencyKey: null as string | null,
+      validated: [],
+    }
+  }
+  if (
+    !idempotencyKey
+    || !/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)
+    || !Array.isArray(evidence)
+    || evidence.length < 1
+    || evidence.length > 200
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+      'Count evidence and its valid idempotency key must be supplied together',
+    )
+  }
+
+  for (const context of input.contexts) {
+    const quantity = Number(context.quantity)
+    if (!Number.isSafeInteger(quantity) || quantity < 1) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_REQUIRED_QUANTITY_INVALID',
+        `Pick task ${context.pick_task_global_id} does not have a positive whole-unit quantity`,
+        409,
+      )
+    }
+  }
+  const required = input.contexts.filter((context) => Number(context.quantity) > 1)
+  if (required.length < 1) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_NOT_REQUIRED',
+      'This order has no multi-unit pick task requiring exact count evidence',
+      409,
+    )
+  }
+  if (evidence.length !== required.length) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INCOMPLETE',
+      'Every multi-unit pick task needs one exact count before confirmation',
+      409,
+    )
+  }
+  const evidenceByTask = new Map(
+    evidence.map((item) => [item.pickTaskGlobalId, item]),
+  )
+  if (evidenceByTask.size !== evidence.length) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_DUPLICATE',
+      'Count evidence contains the same pick task more than once',
+      409,
+    )
+  }
+  const now = input.now || new Date()
+  const scanProductByTask = new Map(
+    (input.acknowledgedScanProductObservations || []).map(
+      (observation) => [observation.pickTaskId, observation],
+    ),
+  )
+  const validated = required.map((context) => {
+    const item = evidenceByTask.get(context.pick_task_global_id)
+    if (!item) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INCOMPLETE',
+        `Count evidence is missing for pick task ${context.pick_task_global_id}`,
+        409,
+      )
+    }
+    if (context.pick_status !== 'ready') {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_EVIDENCE_STALE',
+        'A pick task changed after it was counted. Refresh and scan again.',
+        409,
+      )
+    }
+    if (context.assigned_to !== input.actorEmail) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_EVIDENCE_ACTOR_MISMATCH',
+        'Only the picker assigned to every task may submit its count evidence',
+        403,
+      )
+    }
+    const requiredQuantity = Number(context.quantity)
+    if (
+      !Number.isSafeInteger(item.requiredQuantity)
+      || item.requiredQuantity < 1
+      || item.requiredQuantity !== requiredQuantity
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_REQUIRED_QUANTITY_STALE',
+        `Required quantity changed for pick task ${context.pick_task_global_id}`,
+        409,
+      )
+    }
+    if (
+      !Number.isSafeInteger(item.enteredQuantity)
+      || item.enteredQuantity < 1
+      || item.enteredQuantity !== requiredQuantity
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_MISMATCH',
+        `Entered quantity must exactly equal ${requiredQuantity} for pick task ${context.pick_task_global_id}`,
+        409,
+      )
+    }
+    if (
+      item.countSource !== 'iphone'
+      && item.countSource !== 'watch'
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+        `Count source is invalid for pick task ${context.pick_task_global_id}`,
+      )
+    }
+    if (
+      item.product.source !== 'iphone_camera'
+      && item.product.source !== 'meta'
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+        `Product scan source is invalid for pick task ${context.pick_task_global_id}`,
+      )
+    }
+    const expectedProductBarcode = wearableScanExpectedProductBarcode(context)
+    if (!expectedProductBarcode) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_PRODUCT_BARCODE_REQUIRED',
+        `Pick task ${context.pick_task_global_id} has no authoritative product barcode`,
+        409,
+      )
+    }
+    if (!wearableProductBarcodeMatches(item.product.barcode, expectedProductBarcode)) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_PRODUCT_SCAN_MISMATCH',
+        `Product scan does not match pick task ${context.pick_task_global_id}`,
+        409,
+      )
+    }
+    const acknowledgedScanProduct = scanProductByTask.get(context.pick_task_id)
+    if (
+      context.policy_location_scan_required
+      && (
+        !acknowledgedScanProduct
+        || acknowledgedScanProduct.barcode !== item.product.barcode
+        || acknowledgedScanProduct.capturedAt !== item.product.capturedAt
+        || acknowledgedScanProduct.source !== item.product.source
+      )
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_SCAN_EVIDENCE_MISMATCH',
+        `Count evidence does not reference the acknowledged product scan for pick task ${context.pick_task_global_id}`,
+        409,
+      )
+    }
+    const productCapturedAt = wearableCountTime(
+      item.product.capturedAt,
+      'Product capture time',
+    )!
+    const countedAt = wearableCountTime(item.countedAt, 'Count time')!
+    const minimumContextTime = [
+      wearableCountTime(context.assigned_at, 'Pick assignment time'),
+      wearableCountTime(context.pick_created_at, 'Pick creation time'),
+      wearableCountTime(context.wave_released_at, 'Wave release time'),
+    ].filter((value): value is Date => value !== null)
+      .reduce((latest, value) => value > latest ? value : latest, new Date(0))
+    if (
+      productCapturedAt.getTime()
+        < minimumContextTime.getTime() - WEARABLE_SCAN_CLOCK_SKEW_MS
+      || productCapturedAt.getTime()
+        < now.getTime() - WEARABLE_SCAN_MAX_AGE_MS
+      || productCapturedAt.getTime()
+        > now.getTime() + WEARABLE_SCAN_CLOCK_SKEW_MS
+      || countedAt.getTime() <= productCapturedAt.getTime()
+      || countedAt.getTime() - productCapturedAt.getTime()
+        > WEARABLE_PRODUCT_TO_COUNT_MAX_MS
+      || countedAt.getTime() > now.getTime() + WEARABLE_SCAN_CLOCK_SKEW_MS
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_EVIDENCE_STALE',
+        `Count timing is stale or out of sequence for pick task ${context.pick_task_global_id}`,
+        409,
+      )
+    }
+    return {
+      context,
+      evidence: item,
+      requiredQuantity,
+      expectedProductBarcode,
+      productCapturedAt,
+      countedAt,
+    }
+  })
+  if (evidenceByTask.size !== required.length) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_CONTEXT_MISMATCH',
+      'Count evidence includes a task outside the current multi-unit order',
+      409,
+    )
+  }
+  return {
+    enforced: true as const,
+    countEvidenceIdempotencyKey: idempotencyKey,
+    validated,
+  }
 }
 
 function completedWearablePickScanEvidenceResult(
@@ -13132,7 +13376,13 @@ async function requireAcknowledgedWearablePickScanEvidence(
         409,
       )
     }
-    return { enforced: false, evidenceCount: 0, receiptId: null as string | null }
+    const productObservations: Array<{
+      pickTaskId: string
+      barcode: string
+      capturedAt: string
+      source: 'iphone_camera' | 'meta'
+    }> = []
+    return { enforced: false, evidenceCount: 0, receiptId: null as string | null, productObservations }
   }
   const idempotencyKey = String(input.scanEvidenceIdempotencyKey || '').trim()
   if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
@@ -13223,7 +13473,17 @@ async function requireAcknowledgedWearablePickScanEvidence(
       409,
     )
   }
-  return { enforced: true, evidenceCount: required.length, receiptId: receipt.id }
+  return {
+    enforced: true,
+    evidenceCount: required.length,
+    receiptId: receipt.id,
+    productObservations: evidenceResult.rows.map((row) => ({
+      pickTaskId: row.pick_task_id,
+      barcode: row.observed_product_barcode,
+      capturedAt: new Date(row.product_captured_at).toISOString(),
+      source: row.product_source,
+    })),
+  }
 }
 
 type ShopifyExternalFulfillmentDatabaseTarget = {
@@ -14003,6 +14263,8 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
   expectedRowVersion: number
   reason: string
   scanEvidenceIdempotencyKey?: string
+  countEvidenceIdempotencyKey?: string
+  countEvidence?: WearablePickTaskCountEvidenceInput[]
   idempotencyKey: string
 }): Promise<OperationsOrderCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
@@ -14012,6 +14274,10 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
   const scanEvidenceIdempotencyKey = String(
     input.scanEvidenceIdempotencyKey || '',
   ).trim() || undefined
+  const countEvidenceIdempotencyKey = String(
+    input.countEvidenceIdempotencyKey || '',
+  ).trim() || undefined
+  const countEvidence = input.countEvidence
   const idempotencyKey = String(input.idempotencyKey || '').trim()
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
   if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
@@ -14035,6 +14301,24 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
       'Scan evidence idempotency key is invalid',
     )
   }
+  if (
+    (countEvidenceIdempotencyKey === undefined)
+      !== (countEvidence === undefined)
+    || (
+      countEvidenceIdempotencyKey
+      && !/^[A-Za-z0-9._:-]{8,200}$/.test(countEvidenceIdempotencyKey)
+    )
+    || (countEvidence !== undefined && (
+      !Array.isArray(countEvidence)
+      || countEvidence.length < 1
+      || countEvidence.length > 200
+    ))
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+      'Count evidence and its valid idempotency key must be supplied together',
+    )
+  }
 
   const command = await prepareCommandReceipt({
     organizationId,
@@ -14045,6 +14329,8 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
       expectedRowVersion: input.expectedRowVersion,
       reason,
       scanEvidenceIdempotencyKey: scanEvidenceIdempotencyKey || null,
+      countEvidenceIdempotencyKey: countEvidenceIdempotencyKey || null,
+      countEvidence: countEvidence || null,
     }),
     actorEmail,
     targetGlobalId: orderGlobalId,
@@ -14056,6 +14342,12 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
   try {
     return await withTransaction(async (client) => {
       await acquireTransactionAdvisoryLock(client, `operations:order:${organizationId}:${orderGlobalId}`)
+      if (countEvidenceIdempotencyKey) {
+        await acquireTransactionAdvisoryLock(
+          client,
+          `operations:wearable-count-evidence:${organizationId}:${countEvidenceIdempotencyKey}`,
+        )
+      }
       const activation = await resolveActivation(client, organizationId)
       if (!['shadow', 'active'].includes(activation.state)) {
         throw new OperationsRequestError(
@@ -14279,6 +14571,14 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           contexts: wearableScanContexts,
           scanEvidenceIdempotencyKey,
         })
+      const countEvidenceAcknowledgement = validateWearablePickCountEvidence({
+        actorEmail,
+        countEvidenceIdempotencyKey,
+        countEvidence,
+        contexts: wearableScanContexts,
+        acknowledgedScanProductObservations:
+          scanEvidenceAcknowledgement.productObservations,
+      })
 
       const blockingResult = await client.query<QueryResultRow & { count: string }>(
         `SELECT count(*)::text AS count
@@ -14310,6 +14610,55 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           'OPERATIONS_INVENTORY_POSITION_CHANGED',
           'Reserved inventory changed before picks could be confirmed. Refresh and try again.',
           409,
+        )
+      }
+
+      for (const item of countEvidenceAcknowledgement.validated) {
+        const evidenceHash = commandRequestHash({
+          orderGlobalId,
+          orderRowVersion: input.expectedRowVersion,
+          pickTaskGlobalId: item.context.pick_task_global_id,
+          requiredQuantity: item.requiredQuantity,
+          enteredQuantity: item.evidence.enteredQuantity,
+          expectedProductBarcode: item.expectedProductBarcode,
+          observedProductBarcode: item.evidence.product.barcode,
+          productCapturedAt: item.evidence.product.capturedAt,
+          productSource: item.evidence.product.source,
+          countedAt: item.evidence.countedAt,
+          countSource: item.evidence.countSource,
+        })
+        await client.query(
+          `INSERT INTO operations_wearable_pick_count_evidence (
+             organization_id, command_receipt_id,
+             count_evidence_idempotency_key, order_id, order_row_version,
+             pick_task_id, required_quantity, entered_quantity,
+             expected_product_barcode, observed_product_barcode,
+             product_captured_at, product_source, counted_at, count_source,
+             evidence_hash, recorded_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3, $4::uuid, $5,
+             $6::uuid, $7, $8,
+             $9, $10, $11::timestamptz, $12, $13::timestamptz, $14,
+             $15, $16
+           )`,
+          [
+            organizationId,
+            command.receipt.id,
+            countEvidenceAcknowledgement.countEvidenceIdempotencyKey,
+            order.id,
+            input.expectedRowVersion,
+            item.context.pick_task_id,
+            item.requiredQuantity,
+            item.evidence.enteredQuantity,
+            item.expectedProductBarcode,
+            item.evidence.product.barcode,
+            item.evidence.product.capturedAt,
+            item.evidence.product.source,
+            item.evidence.countedAt,
+            item.evidence.countSource,
+            evidenceHash,
+            actorEmail,
+          ],
         )
       }
 
@@ -14415,6 +14764,19 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           scanEvidenceEnforced: scanEvidenceAcknowledgement.enforced,
           scanEvidenceCount: scanEvidenceAcknowledgement.evidenceCount,
           scanEvidenceReceiptId: scanEvidenceAcknowledgement.receiptId,
+          countEvidenceEnforced: countEvidenceAcknowledgement.enforced,
+          countEvidenceCount: countEvidenceAcknowledgement.validated.length,
+          countEvidenceIdempotencyKey:
+            countEvidenceAcknowledgement.countEvidenceIdempotencyKey,
+          countedPickTaskGlobalIds:
+            countEvidenceAcknowledgement.validated.map(
+              (item) => item.context.pick_task_global_id,
+            ),
+          countSources: [...new Set(
+            countEvidenceAcknowledgement.validated.map(
+              (item) => item.evidence.countSource,
+            ),
+          )],
         },
       })
       await recordAuditEvent({
@@ -14440,6 +14802,19 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           scanEvidenceEnforced: scanEvidenceAcknowledgement.enforced,
           scanEvidenceCount: scanEvidenceAcknowledgement.evidenceCount,
           scanEvidenceReceiptId: scanEvidenceAcknowledgement.receiptId,
+          countEvidenceEnforced: countEvidenceAcknowledgement.enforced,
+          countEvidenceCount: countEvidenceAcknowledgement.validated.length,
+          countEvidenceIdempotencyKey:
+            countEvidenceAcknowledgement.countEvidenceIdempotencyKey,
+          countedPickTaskGlobalIds:
+            countEvidenceAcknowledgement.validated.map(
+              (item) => item.context.pick_task_global_id,
+            ),
+          countSources: [...new Set(
+            countEvidenceAcknowledgement.validated.map(
+              (item) => item.evidence.countSource,
+            ),
+          )],
         },
       }, client)
       const result: OperationsOrderCommandResult = {

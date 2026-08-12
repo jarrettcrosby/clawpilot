@@ -2,9 +2,15 @@ import Foundation
 import Testing
 @testable import ClawPilotPickingCore
 
+private enum InjectedCacheError: Error {
+    case progressWrite
+}
+
 private actor MemoryCache: PickCache {
     var queue: PickQueue?
     var outbox: ConfirmPicksCommand?
+    var progress: PickSessionProgress?
+    var failProgressWrites = false
 
     func loadQueue() async throws -> PickQueue? { queue }
     func saveQueue(_ queue: PickQueue) async throws { self.queue = queue }
@@ -12,6 +18,53 @@ private actor MemoryCache: PickCache {
     func saveOutbox(_ command: ConfirmPicksCommand) async throws { outbox = command }
     func loadOutbox() async throws -> ConfirmPicksCommand? { outbox }
     func clearOutbox() async throws { outbox = nil }
+    func loadProgress() async throws -> PickSessionProgress? { progress }
+    func saveProgress(_ progress: PickSessionProgress) async throws {
+        guard !failProgressWrites else { throw InjectedCacheError.progressWrite }
+        self.progress = progress
+    }
+    func clearProgress() async throws { progress = nil }
+    func setProgressWriteFailure(_ enabled: Bool) { failProgressWrites = enabled }
+}
+
+private actor BlockingProgressCache: PickCache {
+    private var queue: PickQueue?
+    private var progress: PickSessionProgress?
+    private var shouldBlockNextProgressWrite = false
+    private var blockedContinuation: CheckedContinuation<Void, Never>?
+    private var writeStartedContinuation: CheckedContinuation<Void, Never>?
+
+    func loadQueue() async throws -> PickQueue? { queue }
+    func saveQueue(_ queue: PickQueue) async throws { self.queue = queue }
+    func clearQueue() async throws { queue = nil }
+    func saveOutbox(_: ConfirmPicksCommand) async throws {}
+    func loadOutbox() async throws -> ConfirmPicksCommand? { nil }
+    func clearOutbox() async throws {}
+    func loadProgress() async throws -> PickSessionProgress? { progress }
+    func saveProgress(_ progress: PickSessionProgress) async throws {
+        if shouldBlockNextProgressWrite {
+            shouldBlockNextProgressWrite = false
+            writeStartedContinuation?.resume()
+            writeStartedContinuation = nil
+            await withCheckedContinuation { continuation in
+                blockedContinuation = continuation
+            }
+        }
+        self.progress = progress
+    }
+    func clearProgress() async throws { progress = nil }
+
+    func blockNextProgressWrite() { shouldBlockNextProgressWrite = true }
+    func waitUntilProgressWriteStarts() async {
+        if blockedContinuation != nil { return }
+        await withCheckedContinuation { continuation in
+            writeStartedContinuation = continuation
+        }
+    }
+    func releaseProgressWrite() {
+        blockedContinuation?.resume()
+        blockedContinuation = nil
+    }
 }
 
 @Test("workspace changes clear cached pick identity and progress")
@@ -105,6 +158,494 @@ func barcodeMatching() {
     #expect(!BarcodeMatcher.matches(observed: "012345678906", expected: "012345678905"))
 }
 
+@Test("pick quantities must be positive whole JavaScript-safe integers")
+func safeIntegerPickQuantity() throws {
+    for invalid in [0, 0.5, 1.5, 9_007_199_254_740_992] {
+        #expect(throws: PickingContractError.invalidTask) {
+            _ = try PickTask(
+                pickTaskGlobalId: "gpk0000009", sequence: 1,
+                productGlobalId: "gp0000009", productName: "Invalid",
+                channelSku: "INVALID", barcode: "123", locationCode: "A-1",
+                quantity: invalid
+            )
+        }
+    }
+    let maximum = try PickTask(
+        pickTaskGlobalId: "gpk0000010", sequence: 1,
+        productGlobalId: "gp0000010", productName: "Maximum",
+        channelSku: "MAX", barcode: "123", locationCode: "A-1",
+        quantity: 9_007_199_254_740_991
+    )
+    #expect(maximum.quantity == 9_007_199_254_740_991)
+}
+
+@Test("multi-unit product scan waits for exact token-bound count")
+func multiUnitExactCount() async throws {
+    let session = PickingSession(cache: MemoryCache())
+    try await session.replaceQueue(fixtureQueue())
+    let capturedAt = Date(timeIntervalSince1970: 1_700_000_000)
+    _ = try await session.accept(BarcodeObservation(
+        value: "012345678905",
+        source: .metaGlasses,
+        capturedAt: capturedAt
+    ), now: capturedAt)
+
+    #expect(await session.currentTask()?.pickTaskGlobalId == "gpk0000001")
+    #expect(await session.currentWorkflowStage() == .count)
+    let context = try #require(await session.currentStageContext())
+    await #expect(throws: PickingContractError.countMismatch(required: 2, entered: 1)) {
+        _ = try await session.verifyCount(
+            enteredCount: 1,
+            source: .watch,
+            contextToken: context.token,
+            countedAt: capturedAt.addingTimeInterval(1)
+        )
+    }
+    #expect(await session.currentTask()?.pickTaskGlobalId == "gpk0000001")
+    _ = try await session.verifyCount(
+        enteredCount: 2,
+        source: .watch,
+        contextToken: context.token,
+        countedAt: capturedAt.addingTimeInterval(2)
+    )
+    #expect(await session.currentTask()?.pickTaskGlobalId == "gpk0000002")
+
+    await #expect(throws: PickingContractError.contextMismatch) {
+        _ = try await session.verifyCount(
+            enteredCount: 2,
+            source: .watch,
+            contextToken: context.token,
+            countedAt: capturedAt.addingTimeInterval(3)
+        )
+    }
+}
+
+@Test("location match requires deliberate token-bound product arming")
+func deliberateProductTransition() async throws {
+    let session = PickingSession(cache: MemoryCache())
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    try await session.replaceQueue(locationFirstQueue(generatedAt: now))
+    _ = try await session.accept(BarcodeObservation(
+        value: "CP1L-GWL0000003", source: .metaGlasses, capturedAt: now
+    ), now: now)
+
+    #expect(await session.currentWorkflowStage() == .productReady)
+    await #expect(throws: PickingContractError.contextMismatch) {
+        _ = try await session.accept(BarcodeObservation(
+            value: "4006381333931", source: .metaGlasses, capturedAt: now
+        ), now: now)
+    }
+    await #expect(throws: PickingContractError.contextMismatch) {
+        try await session.beginProductScan(contextToken: UUID().uuidString)
+    }
+    let context = try #require(await session.currentStageContext())
+    try await session.beginProductScan(contextToken: context.token, now: now)
+    #expect(await session.currentWorkflowStage() == .product)
+    await #expect(throws: PickingContractError.contextMismatch) {
+        try await session.beginProductScan(contextToken: context.token)
+    }
+}
+
+@Test("failed progress write cannot accept a location")
+func locationAcceptanceIsDurableBeforeVisible() async throws {
+    let cache = MemoryCache()
+    let session = PickingSession(cache: cache)
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    try await session.replaceQueue(locationFirstQueue(generatedAt: now))
+    let before = try #require(await session.makeWatchSnapshot(now: now))
+    await cache.setProgressWriteFailure(true)
+
+    await #expect(throws: InjectedCacheError.progressWrite) {
+        _ = try await session.accept(BarcodeObservation(
+            value: "CP1L-GWL0000003",
+            source: .metaGlasses,
+            capturedAt: now
+        ), now: now)
+    }
+
+    #expect(await session.currentWorkflowStage() == .location)
+    #expect(await session.currentScanStage() == .location)
+    #expect(await session.currentStageContext() == nil)
+    #expect(await session.makeWatchSnapshot(now: now) == before)
+    #expect(try await cache.loadProgress() == nil)
+}
+
+@Test("failed progress write cannot consume product-ready context")
+func productArmingIsDurableBeforeVisible() async throws {
+    let cache = MemoryCache()
+    let session = PickingSession(cache: cache)
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    try await session.replaceQueue(locationFirstQueue(generatedAt: now))
+    _ = try await session.accept(BarcodeObservation(
+        value: "CP1L-GWL0000003",
+        source: .metaGlasses,
+        capturedAt: now
+    ), now: now)
+    let context = try #require(await session.currentStageContext())
+    let before = try #require(await session.makeWatchSnapshot(now: now))
+    let durableBefore = try #require(try await cache.loadProgress())
+    await cache.setProgressWriteFailure(true)
+
+    await #expect(throws: InjectedCacheError.progressWrite) {
+        try await session.beginProductScan(contextToken: context.token)
+    }
+
+    #expect(await session.currentWorkflowStage() == .productReady)
+    #expect(await session.currentScanStage() == nil)
+    #expect(await session.currentStageContext() == context)
+    #expect(await session.makeWatchSnapshot(now: now) == before)
+    #expect(try await cache.loadProgress() == durableBefore)
+}
+
+@Test("failed progress write cannot accept a product")
+func productAcceptanceIsDurableBeforeVisible() async throws {
+    let cache = MemoryCache()
+    let session = PickingSession(cache: cache)
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    try await session.replaceQueue(fixtureQueue())
+    let before = try #require(await session.makeWatchSnapshot(now: now))
+    await cache.setProgressWriteFailure(true)
+
+    await #expect(throws: InjectedCacheError.progressWrite) {
+        _ = try await session.accept(BarcodeObservation(
+            value: "012345678905",
+            source: .iPhoneCamera,
+            capturedAt: now
+        ), now: now)
+    }
+
+    #expect(await session.currentTask()?.pickTaskGlobalId == "gpk0000001")
+    #expect(await session.currentWorkflowStage() == .product)
+    #expect(await session.currentScanStage() == .product)
+    #expect(await session.currentStageContext() == nil)
+    #expect(await session.makeWatchSnapshot(now: now) == before)
+    #expect(try await cache.loadProgress() == nil)
+}
+
+@Test("failed progress write cannot verify a picked count")
+func countVerificationIsDurableBeforeVisible() async throws {
+    let cache = MemoryCache()
+    let session = PickingSession(cache: cache)
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    try await session.replaceQueue(fixtureQueue())
+    _ = try await session.accept(BarcodeObservation(
+        value: "012345678905",
+        source: .iPhoneCamera,
+        capturedAt: now
+    ), now: now)
+    let context = try #require(await session.currentStageContext())
+    let before = try #require(await session.makeWatchSnapshot(now: now))
+    let durableBefore = try #require(try await cache.loadProgress())
+    await cache.setProgressWriteFailure(true)
+
+    await #expect(throws: InjectedCacheError.progressWrite) {
+        _ = try await session.verifyCount(
+            enteredCount: 2,
+            source: .watch,
+            contextToken: context.token,
+            countedAt: now.addingTimeInterval(1)
+        )
+    }
+
+    #expect(await session.currentTask()?.pickTaskGlobalId == "gpk0000001")
+    #expect(await session.currentWorkflowStage() == .count)
+    #expect(await session.currentScanStage() == nil)
+    #expect(await session.currentStageContext() == context)
+    #expect(await session.makeWatchSnapshot(now: now) == before)
+    #expect(try await cache.loadProgress() == durableBefore)
+}
+
+@Test("overlapping workflow mutations fail closed while progress persistence is suspended")
+func concurrentWorkflowMutationIsRejected() async throws {
+    let cache = BlockingProgressCache()
+    let session = PickingSession(cache: cache)
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    try await session.replaceQueue(locationFirstQueue(generatedAt: now))
+    await cache.blockNextProgressWrite()
+    let first = Task {
+        try await session.accept(BarcodeObservation(
+            value: "CP1L-GWL0000003",
+            source: .metaGlasses,
+            capturedAt: now
+        ), now: now)
+    }
+    await cache.waitUntilProgressWriteStarts()
+
+    await #expect(throws: PickingContractError.persistenceInFlight) {
+        _ = try await session.accept(BarcodeObservation(
+            value: "CP1L-GWL0000003",
+            source: .iPhoneCamera,
+            capturedAt: now
+        ), now: now)
+    }
+    await #expect(throws: PickingContractError.persistenceInFlight) {
+        try await session.replaceQueue(locationFirstQueue(generatedAt: now.addingTimeInterval(1)))
+    }
+    #expect(await session.currentWorkflowStage() == .location)
+
+    await cache.releaseProgressWrite()
+    _ = try await first.value
+    #expect(await session.currentWorkflowStage() == .productReady)
+}
+
+@Test("stale restored partial progress is cleared to a recoverable scan stage")
+func stalePartialRestoreResetsForRescan() async throws {
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+    let locationCache = MemoryCache()
+    let locationSession = PickingSession(cache: locationCache)
+    try await locationSession.replaceQueue(locationFirstQueue(generatedAt: now))
+    _ = try await locationSession.accept(BarcodeObservation(
+        value: "CP1L-GWL0000003",
+        source: .metaGlasses,
+        capturedAt: now
+    ), now: now)
+    let restoredLocation = PickingSession(cache: locationCache)
+    _ = try await restoredLocation.restore(now: now.addingTimeInterval(30 * 60 + 1))
+    #expect(await restoredLocation.currentWorkflowStage() == .location)
+    #expect(await restoredLocation.currentStageContext() == nil)
+    #expect(try await locationCache.loadProgress() == nil)
+
+    let productCache = MemoryCache()
+    let productSession = PickingSession(cache: productCache)
+    try await productSession.replaceQueue(fixtureQueue())
+    _ = try await productSession.accept(BarcodeObservation(
+        value: "012345678905",
+        source: .iPhoneCamera,
+        capturedAt: now
+    ), now: now)
+    let restoredProduct = PickingSession(cache: productCache)
+    _ = try await restoredProduct.restore(now: now.addingTimeInterval(30 * 60 + 1))
+    #expect(await restoredProduct.currentWorkflowStage() == .product)
+    #expect(await restoredProduct.currentStageContext() == nil)
+    #expect(try await productCache.loadProgress() == nil)
+}
+
+@Test("stale live location or product context resets only the current task")
+func staleLiveContextResetsCurrentTask() async throws {
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+    let locationSession = PickingSession(cache: MemoryCache())
+    try await locationSession.replaceQueue(locationFirstQueue(generatedAt: now))
+    _ = try await locationSession.accept(BarcodeObservation(
+        value: "CP1L-GWL0000003",
+        source: .metaGlasses,
+        capturedAt: now
+    ), now: now)
+    let locationContext = try #require(await locationSession.currentStageContext())
+    await #expect(throws: PickingContractError.staleProgress) {
+        try await locationSession.beginProductScan(
+            contextToken: locationContext.token,
+            now: now.addingTimeInterval(30 * 60 + 1)
+        )
+    }
+    #expect(await locationSession.currentWorkflowStage() == .location)
+
+    let productSession = PickingSession(cache: MemoryCache())
+    try await productSession.replaceQueue(fixtureQueue())
+    _ = try await productSession.accept(BarcodeObservation(
+        value: "012345678905",
+        source: .iPhoneCamera,
+        capturedAt: now
+    ), now: now)
+    let countContext = try #require(await productSession.currentStageContext())
+    await #expect(throws: PickingContractError.staleProgress) {
+        _ = try await productSession.verifyCount(
+            enteredCount: 2,
+            source: .watch,
+            contextToken: countContext.token,
+            countedAt: now.addingTimeInterval(30 * 60 + 1)
+        )
+    }
+    #expect(await productSession.currentTask()?.pickTaskGlobalId == "gpk0000001")
+    #expect(await productSession.currentWorkflowStage() == .product)
+}
+
+@Test("expired evidence cannot create an outbox and resets for a full rescan")
+func expiredConfirmationEvidenceIsRecoverable() async throws {
+    let cache = MemoryCache()
+    let session = PickingSession(cache: cache)
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    try await session.replaceQueue(fixtureQueue())
+    _ = try await session.accept(BarcodeObservation(
+        value: "012345678905", source: .metaGlasses, capturedAt: now
+    ), now: now)
+    let context = try #require(await session.currentStageContext())
+    _ = try await session.verifyCount(
+        enteredCount: 2,
+        source: .iPhone,
+        contextToken: context.token,
+        countedAt: now.addingTimeInterval(1)
+    )
+    _ = try await session.accept(BarcodeObservation(
+        value: "998877665544", source: .iPhoneCamera, capturedAt: now
+    ), now: now)
+
+    await #expect(throws: PickingContractError.staleProgress) {
+        _ = try await session.persistConfirmation(
+            now: now.addingTimeInterval(24 * 60 * 60 + 1)
+        )
+    }
+    #expect(try await cache.loadOutbox() == nil)
+    #expect(await session.currentTask()?.pickTaskGlobalId == "gpk0000001")
+    #expect(await session.currentWorkflowStage() == .product)
+    #expect(try await cache.loadProgress()?.scannedTaskIDs.isEmpty == true)
+}
+
+@Test("durable progress restores an awaiting count without losing product evidence")
+func durableCountProgressRestore() async throws {
+    let cache = MemoryCache()
+    let first = PickingSession(cache: cache)
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    try await first.replaceQueue(fixtureQueue())
+    _ = try await first.accept(BarcodeObservation(
+        value: "012345678905", source: .iPhoneCamera, capturedAt: now
+    ), now: now)
+    let originalContext = try #require(await first.currentStageContext())
+
+    let restored = PickingSession(cache: cache)
+    _ = try await restored.restore(now: now.addingTimeInterval(1))
+    #expect(await restored.currentWorkflowStage() == .count)
+    #expect(await restored.currentStageContext()?.token == originalContext.token)
+    _ = try await restored.verifyCount(
+        enteredCount: 2,
+        source: .iPhone,
+        contextToken: originalContext.token,
+        countedAt: now.addingTimeInterval(1)
+    )
+    #expect(await restored.currentTask()?.pickTaskGlobalId == "gpk0000002")
+}
+
+@Test("tampered durable progress cannot restore scan or count authority")
+func tamperedProgressIsRejected() async throws {
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    let queue = try fixtureQueue()
+
+    let unitTask = try PickTask(
+        pickTaskGlobalId: "gpk0000011", sequence: 1,
+        productGlobalId: "gp0000011", productName: "Single",
+        channelSku: "SINGLE", barcode: "111", locationCode: "A-11", quantity: 1
+    )
+    let unitQueue = try PickQueue(
+        schemaVersion: 1,
+        organizationId: queue.organizationId,
+        workerEmail: queue.workerEmail,
+        generatedAt: now,
+        orders: [try PickOrder(
+            orderGlobalId: "gor0000011", orderNumber: "1011", rowVersion: 1, tasks: [unitTask]
+        )]
+    )
+    let missingProductCache = MemoryCache()
+    try await missingProductCache.saveQueue(unitQueue)
+    try await missingProductCache.saveProgress(PickSessionProgress(
+        organizationId: unitQueue.organizationId,
+        workerEmail: unitQueue.workerEmail,
+        order: unitQueue.orders[0],
+        scannedTaskIDs: [unitTask.pickTaskGlobalId],
+        locationVerifiedTaskIDs: [],
+        productStartPendingTaskIDs: [],
+        locationObservations: [:],
+        productObservations: [:],
+        countEvidence: [:],
+        stageContextTokens: [:]
+    ))
+    let missingProductSession = PickingSession(cache: missingProductCache)
+    _ = try await missingProductSession.restore()
+    #expect(await missingProductSession.currentTask()?.pickTaskGlobalId == unitTask.pickTaskGlobalId)
+    #expect(try await missingProductCache.loadProgress() == nil)
+
+    let locationQueue = try locationFirstQueue(generatedAt: now)
+    let wrongLocationCache = MemoryCache()
+    try await wrongLocationCache.saveQueue(locationQueue)
+    try await wrongLocationCache.saveProgress(PickSessionProgress(
+        organizationId: locationQueue.organizationId,
+        workerEmail: locationQueue.workerEmail,
+        order: locationQueue.orders[0],
+        scannedTaskIDs: [],
+        locationVerifiedTaskIDs: ["gpk0000003"],
+        productStartPendingTaskIDs: ["gpk0000003"],
+        locationObservations: ["gpk0000003": try BarcodeObservation(
+            value: "CP1L-GWL9999999", source: .metaGlasses, capturedAt: now
+        )],
+        productObservations: [:],
+        countEvidence: [:],
+        stageContextTokens: ["gpk0000003": UUID().uuidString.lowercased()]
+    ))
+    let wrongLocationSession = PickingSession(cache: wrongLocationCache)
+    _ = try await wrongLocationSession.restore()
+    #expect(await wrongLocationSession.currentWorkflowStage() == .location)
+    #expect(try await wrongLocationCache.loadProgress() == nil)
+
+    let wrongCountCache = MemoryCache()
+    try await wrongCountCache.saveQueue(queue)
+    let product = try BarcodeObservation(
+        value: "012345678905", source: .iPhoneCamera, capturedAt: now
+    )
+    let mismatchedCountProduct = try BarcodeObservation(
+        value: "wrong-product", source: .iPhoneCamera, capturedAt: now
+    )
+    let wrongCount = try PickTaskCountEvidence(
+        task: queue.orders[0].tasks[0],
+        enteredQuantity: 2,
+        product: mismatchedCountProduct,
+        countedAt: now.addingTimeInterval(1),
+        countSource: .iPhone
+    )
+    try await wrongCountCache.saveProgress(PickSessionProgress(
+        organizationId: queue.organizationId,
+        workerEmail: queue.workerEmail,
+        order: queue.orders[0],
+        scannedTaskIDs: ["gpk0000001"],
+        locationVerifiedTaskIDs: [],
+        productStartPendingTaskIDs: [],
+        locationObservations: [:],
+        productObservations: ["gpk0000001": product],
+        countEvidence: ["gpk0000001": wrongCount],
+        stageContextTokens: [:]
+    ))
+    let wrongCountSession = PickingSession(cache: wrongCountCache)
+    _ = try await wrongCountSession.restore()
+    #expect(await wrongCountSession.currentTask()?.pickTaskGlobalId == "gpk0000001")
+    #expect(try await wrongCountCache.loadProgress() == nil)
+
+    let strayTokenCache = MemoryCache()
+    try await strayTokenCache.saveQueue(unitQueue)
+    try await strayTokenCache.saveProgress(PickSessionProgress(
+        organizationId: unitQueue.organizationId,
+        workerEmail: unitQueue.workerEmail,
+        order: unitQueue.orders[0],
+        scannedTaskIDs: [],
+        locationVerifiedTaskIDs: [],
+        productStartPendingTaskIDs: [],
+        locationObservations: [:],
+        productObservations: [:],
+        countEvidence: [:],
+        stageContextTokens: [unitTask.pickTaskGlobalId: UUID().uuidString.lowercased()]
+    ))
+    let strayTokenSession = PickingSession(cache: strayTokenCache)
+    _ = try await strayTokenSession.restore()
+    #expect(await strayTokenSession.currentTask()?.pickTaskGlobalId == unitTask.pickTaskGlobalId)
+    #expect(try await strayTokenCache.loadProgress() == nil)
+}
+
+@Test("count evidence timestamp must be strictly after its product scan")
+func strictCountTimestamp() throws {
+    let task = try fixtureQueue().orders[0].tasks[0]
+    let capturedAt = Date(timeIntervalSince1970: 1_700_000_000)
+    let product = try BarcodeObservation(
+        value: "012345678905", source: .iPhoneCamera, capturedAt: capturedAt
+    )
+    #expect(throws: PickingContractError.invalidCount) {
+        _ = try PickTaskCountEvidence(
+            task: task,
+            enteredQuantity: 2,
+            product: product,
+            countedAt: capturedAt,
+            countSource: .iPhone
+        )
+    }
+}
+
 @Test("session scans in order and persists one exact confirmation command")
 func persistedConfirmation() async throws {
     let cache = MemoryCache()
@@ -114,6 +655,13 @@ func persistedConfirmation() async throws {
     _ = try await session.accept(BarcodeObservation(
         value: "0012345678905", source: .metaGlasses, capturedAt: now
     ), now: now)
+    let firstCount = try #require(await session.currentStageContext())
+    _ = try await session.verifyCount(
+        enteredCount: 2,
+        source: .watch,
+        contextToken: firstCount.token,
+        countedAt: now.addingTimeInterval(1)
+    )
     _ = try await session.accept(BarcodeObservation(
         value: "998877665544", source: .iPhoneCamera, capturedAt: now
     ), now: now)
@@ -130,6 +678,9 @@ func persistedConfirmation() async throws {
     #expect((body["idempotencyKey"] as? String)?.hasPrefix("wearable-pick:") == true)
     #expect(body["scanEvidence"] == nil)
     #expect(body["scanEvidenceIdempotencyKey"] == nil)
+    #expect(first.countEvidenceIdempotencyKey?.hasPrefix("wearable-count:") == true)
+    #expect(first.countEvidence?.first?.enteredQuantity == 2)
+    #expect(first.countEvidence?.first?.countSource == .watch)
 }
 
 @Test("location-first tasks require an exact location label before product acceptance")
@@ -162,8 +713,13 @@ func locationFirstAcceptance() async throws {
     #expect(location.stage == .location)
     #expect(location.task.pickTaskGlobalId == "gpk0000003")
     #expect(await session.currentTask()?.pickTaskGlobalId == "gpk0000003")
-    #expect(await session.currentScanStage() == .product)
+    #expect(await session.currentScanStage() == nil)
+    #expect(await session.currentWorkflowStage() == .productReady)
     #expect(await session.makeWatchSnapshot()?.current?.locationScanRequired == false)
+
+    let transition = try #require(await session.currentStageContext())
+    try await session.beginProductScan(contextToken: transition.token)
+    #expect(await session.currentScanStage() == .product)
 
     await #expect(throws: PickingContractError.productBarcodeMismatch) {
         _ = try await session.accept(BarcodeObservation(
@@ -178,6 +734,14 @@ func locationFirstAcceptance() async throws {
         capturedAt: now
     ), now: now)
     #expect(product.stage == .product)
+    #expect(await session.currentWorkflowStage() == .count)
+    let count = try #require(await session.currentStageContext())
+    _ = try await session.verifyCount(
+        enteredCount: 3,
+        source: .iPhone,
+        contextToken: count.token,
+        countedAt: now.addingTimeInterval(1)
+    )
     #expect(await session.currentTask() == nil)
 
     let command = try await session.persistConfirmation()
@@ -190,6 +754,9 @@ func locationFirstAcceptance() async throws {
     #expect(evidence[0].location.source == .metaGlasses)
     #expect(evidence[0].product.barcode == "4006381333931")
     #expect(evidence[0].product.source == .iPhoneCamera)
+    #expect(command.countEvidence?.first?.requiredQuantity == 3)
+    #expect(command.countEvidence?.first?.enteredQuantity == 3)
+    #expect(command.countEvidence?.first?.countSource == .iPhone)
 }
 
 @Test("refresh preserves exact current-order scan progress")
@@ -203,14 +770,14 @@ func exactQueueRefreshPreservesScanProgress() async throws {
         source: .iPhoneCamera,
         capturedAt: firstGeneratedAt
     ), now: firstGeneratedAt)
-    #expect(await session.currentScanStage() == .product)
+    #expect(await session.currentWorkflowStage() == .productReady)
 
     try await session.replaceQueue(locationFirstQueue(
         generatedAt: firstGeneratedAt.addingTimeInterval(60)
     ))
 
     #expect(await session.currentTask()?.pickTaskGlobalId == "gpk0000003")
-    #expect(await session.currentScanStage() == .product)
+    #expect(await session.currentWorkflowStage() == .productReady)
     #expect(await session.makeWatchSnapshot()?.current?.locationScanRequired == false)
 }
 
@@ -318,6 +885,49 @@ func safeWatchCommand() throws {
     #expect(text.contains("confirm_pick"))
     #expect(!text.contains("orderGlobalId"))
     #expect(!text.contains("pickTaskGlobalId"))
+}
+
+@Test("Watch mutation commands require only their exact stage-bound fields")
+func stageBoundWatchCommands() throws {
+    let token = UUID().uuidString.lowercased()
+    let begin = WatchPickCommand(
+        id: "watch-begin-1",
+        action: .beginProductScan,
+        stageContextToken: token
+    )
+    #expect(begin.isValid)
+    _ = try JSONEncoder().encode(begin)
+
+    let count = WatchPickCommand(
+        id: "watch-count-1",
+        action: .submitCount,
+        enteredCount: 4,
+        stageContextToken: token
+    )
+    #expect(count.isValid)
+    _ = try JSONEncoder().encode(count)
+
+    let invalidCount = WatchPickCommand(
+        id: "watch-count-invalid",
+        action: .submitCount,
+        enteredCount: 0,
+        stageContextToken: token
+    )
+    #expect(!invalidCount.isValid)
+    #expect(throws: PickingContractError.contextMismatch) {
+        _ = try JSONEncoder().encode(invalidCount)
+    }
+
+    let smuggledField = WatchPickCommand(
+        id: "watch-refresh-invalid",
+        action: .refreshQueue,
+        enteredCount: 4,
+        stageContextToken: token
+    )
+    #expect(!smuggledField.isValid)
+    #expect(throws: PickingContractError.contextMismatch) {
+        _ = try JSONEncoder().encode(smuggledField)
+    }
 }
 
 @Test("Watch command results acknowledge the exact command without mutation authority")

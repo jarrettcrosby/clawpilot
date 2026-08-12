@@ -55,7 +55,9 @@ public struct PickTask: Codable, Equatable, Identifiable, Sendable {
                 ) != nil
                 && (locationScanPolicyRowVersion ?? 0) > 0
               ),
-              quantity > 0 else {
+              quantity >= 1,
+              quantity <= 9_007_199_254_740_991,
+              quantity.rounded(.towardZero) == quantity else {
             throw PickingContractError.invalidTask
         }
         self.pickTaskGlobalId = pickTaskGlobalId
@@ -186,6 +188,41 @@ public struct PickTaskScanEvidence: Codable, Equatable, Sendable {
     }
 }
 
+public enum PickCountSource: String, Codable, Equatable, Sendable {
+    case iPhone = "iphone"
+    case watch = "watch"
+}
+
+public struct PickTaskCountEvidence: Codable, Equatable, Sendable {
+    public let pickTaskGlobalId: String
+    public let requiredQuantity: Int
+    public let enteredQuantity: Int
+    public let product: PickScanObservationEvidence
+    public let countedAt: Date
+    public let countSource: PickCountSource
+
+    public init(
+        task: PickTask,
+        enteredQuantity: Int,
+        product: BarcodeObservation,
+        countedAt: Date,
+        countSource: PickCountSource
+    ) throws {
+        let requiredQuantity = Int(task.quantity)
+        guard requiredQuantity > 1,
+              enteredQuantity == requiredQuantity,
+              countedAt > product.capturedAt else {
+            throw PickingContractError.invalidCount
+        }
+        pickTaskGlobalId = task.pickTaskGlobalId
+        self.requiredQuantity = requiredQuantity
+        self.enteredQuantity = enteredQuantity
+        self.product = PickScanObservationEvidence(product)
+        self.countedAt = countedAt
+        self.countSource = countSource
+    }
+}
+
 public enum PickingContractError: Error, Equatable, Sendable {
     case invalidTask
     case invalidOrder
@@ -196,7 +233,11 @@ public enum PickingContractError: Error, Equatable, Sendable {
     case missingLocationBarcode
     case locationBarcodeMismatch
     case productBarcodeMismatch
+    case invalidCount
+    case countMismatch(required: Int, entered: Int)
     case staleQueue
+    case persistenceInFlight
+    case staleProgress
     case incompleteOrder
     case contextMismatch
 }
@@ -204,6 +245,43 @@ public enum PickingContractError: Error, Equatable, Sendable {
 public enum PickScanStage: String, Codable, Equatable, Sendable {
     case location
     case product
+}
+
+public enum PickWorkflowStage: String, Codable, Equatable, Sendable {
+    case location
+    case productReady = "product_ready"
+    case product
+    case count
+}
+
+public struct PickStageContext: Codable, Equatable, Identifiable, Sendable {
+    public let pickTaskGlobalId: String
+    public let stage: PickWorkflowStage
+    public let token: String
+    public let requiredQuantity: Int
+
+    public var id: String { token }
+
+    public init(
+        pickTaskGlobalId: String,
+        stage: PickWorkflowStage,
+        token: String,
+        requiredQuantity: Int
+    ) throws {
+        guard pickTaskGlobalId.range(
+            of: #"^gpk(?:[0-9]{7}|[0-9a-v]{12})$"#,
+            options: .regularExpression
+        ) != nil,
+        stage == .productReady || stage == .count,
+        UUID(uuidString: token) != nil,
+        requiredQuantity > 0 else {
+            throw PickingContractError.contextMismatch
+        }
+        self.pickTaskGlobalId = pickTaskGlobalId
+        self.stage = stage
+        self.token = token.lowercased()
+        self.requiredQuantity = requiredQuantity
+    }
 }
 
 public struct PickScanAcceptance: Equatable, Sendable {
@@ -241,6 +319,8 @@ public struct WatchPickCard: Codable, Equatable, Sendable {
     public let locationScanRequired: Bool?
     public let quantity: Double
     public let progress: String
+    public let workflowStage: PickWorkflowStage?
+    public let stageContextToken: String?
 
     public init(
         productName: String,
@@ -250,7 +330,9 @@ public struct WatchPickCard: Codable, Equatable, Sendable {
         locationBarcode: String? = nil,
         locationScanRequired: Bool? = nil,
         quantity: Double,
-        progress: String
+        progress: String,
+        workflowStage: PickWorkflowStage? = nil,
+        stageContextToken: String? = nil
     ) {
         self.productName = productName
         self.channelSku = channelSku
@@ -260,6 +342,8 @@ public struct WatchPickCard: Codable, Equatable, Sendable {
         self.locationScanRequired = locationScanRequired
         self.quantity = quantity
         self.progress = progress
+        self.workflowStage = workflowStage
+        self.stageContextToken = stageContextToken
     }
 }
 
@@ -278,15 +362,62 @@ public enum WatchPickAction: String, Codable, Equatable, Sendable {
     case readInstruction = "read_instruction"
     case confirmPick = "confirm_pick"
     case refreshQueue = "refresh_queue"
+    case beginProductScan = "begin_product_scan"
+    case submitCount = "submit_count"
 }
 
 public struct WatchPickCommand: Codable, Equatable, Sendable {
     public let id: String
     public let action: WatchPickAction
+    public let enteredCount: Int?
+    public let stageContextToken: String?
 
-    public init(id: String = UUID().uuidString.lowercased(), action: WatchPickAction) {
+    public init(
+        id: String = UUID().uuidString.lowercased(),
+        action: WatchPickAction,
+        enteredCount: Int? = nil,
+        stageContextToken: String? = nil
+    ) {
         self.id = id
         self.action = action
+        self.enteredCount = enteredCount
+        self.stageContextToken = stageContextToken
+    }
+
+    public var isValid: Bool {
+        guard !id.isEmpty, id.utf8.count <= 128 else { return false }
+        switch action {
+        case .beginProductScan:
+            return enteredCount == nil
+                && stageContextToken.flatMap(UUID.init(uuidString:)) != nil
+        case .submitCount:
+            return (enteredCount ?? 0) > 0
+                && stageContextToken.flatMap(UUID.init(uuidString:)) != nil
+        case .requestMetaScan, .readInstruction, .confirmPick, .refreshQueue:
+            return enteredCount == nil && stageContextToken == nil
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, action, enteredCount, stageContextToken
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        action = try values.decode(WatchPickAction.self, forKey: .action)
+        enteredCount = try values.decodeIfPresent(Int.self, forKey: .enteredCount)
+        stageContextToken = try values.decodeIfPresent(String.self, forKey: .stageContextToken)
+        guard isValid else { throw PickingContractError.contextMismatch }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        guard isValid else { throw PickingContractError.contextMismatch }
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id)
+        try values.encode(action, forKey: .action)
+        try values.encodeIfPresent(enteredCount, forKey: .enteredCount)
+        try values.encodeIfPresent(stageContextToken, forKey: .stageContextToken)
     }
 }
 
@@ -335,10 +466,13 @@ public struct ConfirmPicksCommand: Codable, Equatable, Sendable {
     public let idempotencyKey: String
     public let scanEvidenceIdempotencyKey: String?
     public let scanEvidence: [PickTaskScanEvidence]?
+    public let countEvidenceIdempotencyKey: String?
+    public let countEvidence: [PickTaskCountEvidence]?
 
     public init(
         order: PickOrder,
         scanEvidence: [PickTaskScanEvidence] = [],
+        countEvidence: [PickTaskCountEvidence] = [],
         idempotencyKey: String = UUID().uuidString.lowercased()
     ) {
         action = "confirm-picks"
@@ -350,11 +484,16 @@ public struct ConfirmPicksCommand: Codable, Equatable, Sendable {
             ? nil
             : "wearable-scan:\(idempotencyKey)"
         self.scanEvidence = scanEvidence.isEmpty ? nil : scanEvidence
+        self.countEvidenceIdempotencyKey = countEvidence.isEmpty
+            ? nil
+            : "wearable-count:\(idempotencyKey)"
+        self.countEvidence = countEvidence.isEmpty ? nil : countEvidence
     }
 
     private enum CodingKeys: String, CodingKey {
         case action, orderGlobalId, expectedRowVersion, reason, idempotencyKey
         case scanEvidenceIdempotencyKey, scanEvidence
+        case countEvidenceIdempotencyKey, countEvidence
     }
 
     public init(from decoder: Decoder) throws {
@@ -376,7 +515,18 @@ public struct ConfirmPicksCommand: Codable, Equatable, Sendable {
             [PickTaskScanEvidence].self,
             forKey: .scanEvidence
         )
+        countEvidenceIdempotencyKey = try values.decodeIfPresent(
+            String.self,
+            forKey: .countEvidenceIdempotencyKey
+        )
+        countEvidence = try values.decodeIfPresent(
+            [PickTaskCountEvidence].self,
+            forKey: .countEvidence
+        )
         guard (scanEvidenceIdempotencyKey == nil) == (scanEvidence == nil) else {
+            throw PickingContractError.contextMismatch
+        }
+        guard (countEvidenceIdempotencyKey == nil) == (countEvidence == nil) else {
             throw PickingContractError.contextMismatch
         }
     }

@@ -35,6 +35,24 @@ and inventory positions, then records its existing domain, audit, command
 receipt, and ledger evidence. Ambiguous results block new work and replay only
 the original command/key.
 
+For a multi-unit task, the iPhone/Watch workflow presents a focused count
+prompt after the product scan. The confirm command supplies paired
+`countEvidenceIdempotencyKey` and `countEvidence` fields. Each immutable entry
+identifies the task, repeats the locked required quantity, records the entered
+quantity, references the exact product observation, and records whether the
+count was entered on iPhone or Watch. ClawPilot accepts only positive whole
+units with `enteredQuantity === requiredQuantity`, checks the signed picker and
+current order/task context, requires the count after the product scan, and
+commits the evidence in the same transaction as the confirm command receipt.
+Short and excess counts fail closed and never change allocation, reservation,
+or inventory semantics.
+
+This enforcement is deliberately scoped to iPhone/Watch confirmations that
+supply both count fields. Omitting both fields preserves the existing web and
+legacy confirmation contract, and unit-one tasks do not create count evidence.
+When location-first policy also applies, the count must reference the same
+immutable product observation that ClawPilot already acknowledged with the
+location/product scan evidence.
+
 Passing source, Swift, Meta fixture, iPhone simulator, and Watch simulator gates
 is development proof only. A signed device pilot remains mandatory.
-

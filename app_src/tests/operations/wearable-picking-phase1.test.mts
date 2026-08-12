@@ -84,7 +84,7 @@ test('native scan state requires location before product without giving Watch co
   assert.match(session, /PickScanAcceptance\(task: task, stage: \.location\)/)
   assert.match(session, /PickScanAcceptance\(task: task, stage: \.product\)/)
   assert.match(session, /locationScanRequired: locationPending/)
-  assert.match(phone, /Location matched\. Now scan the displayed product barcode/)
+  assert.match(phone, /Location matched\. Confirm when you are ready to scan the product/)
   assert.match(phone, /acceptPhoneCameraBarcode/)
   assert.match(camera, /onBarcode: @MainActor \(String\) async -> PhoneCameraScanOutcome/)
   assert.match(meta, /struct MetaBarcodeDecodeTarget/)
@@ -100,7 +100,7 @@ test('native scan state requires location before product without giving Watch co
   assert.match(meta, /prepareForNextBarcode/)
   assert.match(
     phone,
-    /await source\.prepareForNextBarcode\(\s*target: metaDecodeTarget\(for: task, stage: stage\)\s*\)/,
+    /await source\.prepareForNextBarcode\(\s*target: metaDecodeTarget\(for: task, stage: stage\),\s*suppressedValue: acceptedLocationValue\s*\)/,
   )
   assert.match(watch, /current\.locationScanRequired == true/)
   assert.doesNotMatch(watch, /ConfirmPicksCommand|PickingAPIClient/)
@@ -195,7 +195,7 @@ test('iPhone camera keeps a fast stage-aware live scan with an in-memory still f
     camera.match(/private func submit[\s\S]*?@objc private func captureCurrentFrame/)?.[0] ?? '',
     /stopScanning\(\)/,
   )
-  assert.match(phone, /Location matched\. The live camera is still on/)
+  assert.match(phone, /Location matched\. Continue deliberately when you are ready to scan the product/)
   assert.match(phone, /PhoneCameraScanOutcome/)
   assert.match(phone, /interactiveDismissDisabled\(\)/)
   assert.match(camera, /import ClawPilotPickingApple/)
@@ -398,8 +398,85 @@ test('Watch companion presents safe pick context and routes commands through iPh
   assert.match(bridge, /decode\(WatchPickCommand\.self/)
   assert.match(bridge, /handledCommandIDs/)
   assert.match(app, /private func handleWatchCommand/)
-  assert.match(app, /readInstructionOnPhone: metaConnectedDeviceCount == 1/)
+  assert.match(
+    app,
+    /case \.readInstruction:[\s\S]*?guard currentTask != nil \|\| readyToConfirm[\s\S]*?readInstruction\(\)/,
+  )
+  assert.doesNotMatch(
+    app,
+    /case \.readInstruction:[\s\S]*?readInstruction\(forceSystemVoice: true\)/,
+  )
+  assert.match(app, /readInstructionOnPhone: true/)
   assert.doesNotMatch(watch, /PickingAPIClient|ConfirmPicksCommand/)
+})
+
+test('multi-unit picks require a deliberate popup count on iPhone or Watch', () => {
+  const models = read('../clients/apple/Sources/ClawPilotPickingCore/PickingModels.swift')
+  const session = read('../clients/apple/Sources/ClawPilotPickingCore/PickingSession.swift')
+  const adapters = read('../clients/apple/Sources/ClawPilotPickingApple/AppleAdapters.swift')
+  const phone = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+  const dashboard = read('../clients/apple/Apps/iPhone/PickingDashboardView.swift')
+  const watch = read('../clients/apple/Apps/Watch/ClawPilotPickingWatchApp.swift')
+
+  assert.match(models, /quantity\.rounded\(\.towardZero\) == quantity/)
+  assert.match(models, /public struct PickTaskCountEvidence/)
+  assert.match(models, /public let countEvidenceIdempotencyKey: String\?/)
+  assert.match(models, /public let countEvidence: \[PickTaskCountEvidence\]\?/)
+  assert.match(models, /case iPhone = "iphone"/)
+  assert.match(models, /case watch = "watch"/)
+  assert.match(session, /case \.count|return \.count/)
+  assert.match(session, /func verifyCount\(/)
+  assert.match(session, /enteredCount == required/)
+  assert.match(session, /stageContextTokens\[task\.pickTaskGlobalId\] == contextToken/)
+  assert.match(
+    session,
+    /func commitWorkflowProgress\(_ candidate: WorkflowProgressState\) async throws \{[\s\S]*?try await persistProgress\(candidate\)[\s\S]*?applyWorkflowProgress\(candidate\)/,
+  )
+  assert.match(adapters, /pick-progress\.json/)
+  assert.match(adapters, /countEvidenceIdempotencyKey: command\.countEvidenceIdempotencyKey/)
+  assert.match(adapters, /countEvidence: command\.countEvidence/)
+  assert.match(phone, /\.sheet\(isPresented: \$model\.showCountEntry\)/)
+  assert.match(dashboard, /struct PickedCountEntrySheet/)
+  assert.match(dashboard, /TextField\("Picked count"/)
+  assert.match(dashboard, /prefix\(16\)/)
+  assert.match(watch, /struct WatchCountEntryView/)
+  assert.match(watch, /Stepper\(/)
+  assert.match(watch, /_enteredCount = State\(initialValue: 1\)/)
+  assert.match(watch, /case \.submitCount|\.submitCount/)
+})
+
+test('location to product transition is explicit and keeps the Meta session alive', () => {
+  const models = read('../clients/apple/Sources/ClawPilotPickingCore/PickingModels.swift')
+  const session = read('../clients/apple/Sources/ClawPilotPickingCore/PickingSession.swift')
+  const phone = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+  const dashboard = read('../clients/apple/Apps/iPhone/PickingDashboardView.swift')
+  const watch = read('../clients/apple/Apps/Watch/ClawPilotPickingWatchApp.swift')
+
+  assert.match(models, /case productReady = "product_ready"/)
+  assert.match(
+    session,
+    /func beginProductScan\(\s*contextToken: String,\s*now: Date = Date\(\)\s*\) async throws/,
+  )
+  assert.match(phone, /metaProductStartContinuation/)
+  assert.match(phone, /metaProductStartRequestedScanID/)
+  assert.match(phone, /await withCheckedContinuation/)
+  assert.match(phone, /suppressedValue: acceptedLocationValue/)
+  assert.match(
+    phone,
+    /metaProductStartRequestedScanID == scanID[\s\S]*?currentWorkflowStage == \.product/,
+  )
+  assert.doesNotMatch(
+    phone.match(/guard acceptance\.stage == \.location[\s\S]*?suppressedValue: acceptedLocationValue/)?.[0] ?? '',
+    /Task\.sleep/,
+  )
+  assert.match(dashboard, /Scan product with Meta glasses/)
+  assert.match(dashboard, /Scan product with iPhone/)
+  assert.match(watch, /Label\("Scan product"/)
+  assert.match(phone, /case \.beginProductScan:/)
+  assert.match(
+    phone,
+    /func beginProductScanWithMeta[\s\S]*?guard isMetaScanning \|\| metaScanReady[\s\S]*?picking\.beginProductScan/,
+  )
 })
 
 test('picker audio routing and Meta scan feedback stay explicit and bounded', () => {
@@ -461,6 +538,14 @@ test('picker audio routing and Meta scan feedback stay explicit and bounded', ()
   assert.match(voice, /Apple speech remains the fallback/)
   assert.match(voice, /Enhanced voice storage could not be prepared/)
   assert.match(meta, /resolution: \.high/)
+  assert.match(meta, /frameRate: 15/)
+  assert.match(metaPolicy, /liveFrameCadenceNanoseconds: UInt64 = 100_000_000/)
+  assert.match(metaPolicy, /liveFrameDelayNanoseconds/)
+  assert.match(meta, /videoProcessingQueue\.asyncAfter/)
+  assert.match(metaPolicy, /maximumPendingPhotos = 1/)
+  assert.match(metaPolicy, /ordinal > 1/)
+  assert.match(metaPolicy, /allowsAccurateOCR: false/)
+  assert.match(metaPolicy, /allowsAccurateOCR: true/)
   assert.match(meta, /photoDataPublisher\.listen[\s\S]*videoFramePublisher\.listen[\s\S]*camera\.stream\.start\(\)/)
   assert.match(meta, /vision-decode:kind=\\\(item\.kind\.rawValue\):outcome=\\\(outcome\)/)
   assert.match(meta, /case photo/)
@@ -476,9 +561,9 @@ test('picker audio routing and Meta scan feedback stay explicit and bounded', ()
   assert.match(meta, /orientation_winner=/)
   assert.match(meta, /VNRecognizeTextRequest\(\)/)
   assert.match(meta, /request\.recognitionLevel = \.accurate/)
-  assert.match(meta, /guard let expectedValue = item\.target\.expectedValue/)
+  assert.match(meta, /let expectedValue = item\.target\.expectedValue/)
   assert.match(meta, /MetaExpectedBarcodeTextMatcher\.matches/)
-  assert.match(meta, /MetaBarcodeCandidate\(payload: expectedValue/)
+  assert.match(meta, /MetaBarcodeCandidate\(\s*payload: expectedValue/)
   assert.match(metaPolicy, /String\(value\.filter \{ !\$0\.isWhitespace \}\)\.uppercased\(\)/)
   assert.doesNotMatch(meta, /ocr_(?:text|payload)=|orientation_(?:text|payload)=/i)
   assert.doesNotMatch(meta, /photo\.data\.write|write\(to:/)

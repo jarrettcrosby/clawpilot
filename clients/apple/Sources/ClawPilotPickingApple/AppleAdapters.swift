@@ -8,7 +8,7 @@ public actor DurablePickCache: PickCache {
 
     public init(directory: URL) throws {
         self.directory = directory
-        encoder.dateEncodingStrategy = .iso8601
+        encoder.dateEncodingStrategy = .clawPilotFractionalISO8601
         decoder.dateDecodingStrategy = .iso8601
         try FileManager.default.createDirectory(
             at: directory,
@@ -44,6 +44,21 @@ public actor DurablePickCache: PickCache {
 
     public func clearOutbox() async throws {
         let url = directory.appendingPathComponent("pick-outbox.json")
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+
+    public func loadProgress() async throws -> PickSessionProgress? {
+        try read(PickSessionProgress.self, name: "pick-progress.json")
+    }
+
+    public func saveProgress(_ progress: PickSessionProgress) async throws {
+        try write(progress, name: "pick-progress.json")
+    }
+
+    public func clearProgress() async throws {
+        let url = directory.appendingPathComponent("pick-progress.json")
         if FileManager.default.fileExists(atPath: url.path) {
             try FileManager.default.removeItem(at: url)
         }
@@ -390,6 +405,8 @@ public actor PickingAPIClient {
         let expectedRowVersion: Int
         let reason: String
         let scanEvidenceIdempotencyKey: String?
+        let countEvidenceIdempotencyKey: String?
+        let countEvidence: [PickTaskCountEvidence]?
     }
 
     private struct ScanEvidenceBody: Encodable {
@@ -423,7 +440,7 @@ public actor PickingAPIClient {
             HTTPCookieStorage.shared.cookieAcceptPolicy = .always
             self.session = URLSession(configuration: configuration)
         }
-        encoder.dateEncodingStrategy = .iso8601
+        encoder.dateEncodingStrategy = .clawPilotFractionalISO8601
         decoder.dateDecodingStrategy = .iso8601
     }
 
@@ -668,7 +685,9 @@ public actor PickingAPIClient {
             orderGlobalId: command.orderGlobalId,
             expectedRowVersion: command.expectedRowVersion,
             reason: command.reason,
-            scanEvidenceIdempotencyKey: command.scanEvidenceIdempotencyKey
+            scanEvidenceIdempotencyKey: command.scanEvidenceIdempotencyKey,
+            countEvidenceIdempotencyKey: command.countEvidenceIdempotencyKey,
+            countEvidence: command.countEvidence
         ))
         let (data, response) = try await session.data(for: request)
         try validateHTTP(response)
@@ -802,6 +821,17 @@ public actor PickingAPIClient {
         }
         guard (200..<300).contains(http.statusCode) else {
             throw PickingAPIError.invalidResponse
+        }
+    }
+}
+
+private extension JSONEncoder.DateEncodingStrategy {
+    static var clawPilotFractionalISO8601: Self {
+        .custom { date, encoder in
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            var container = encoder.singleValueContainer()
+            try container.encode(formatter.string(from: date))
         }
     }
 }

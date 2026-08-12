@@ -1751,6 +1751,77 @@ async function verifyRouteBehavior() {
     idempotencyKey: 'picks-route-proof-1',
   })
 
+  const productCapturedAt = new Date(Date.now() - 1_000).toISOString()
+  const countedAt = new Date().toISOString()
+  const countEvidence = [{
+    pickTaskGlobalId: 'gpk1234567',
+    requiredQuantity: 3,
+    enteredQuantity: 3,
+    product: {
+      barcode: 'CP1P-GP1234567',
+      capturedAt: productCapturedAt,
+      source: 'iphone_camera',
+    },
+    countedAt,
+    countSource: 'watch',
+  }]
+  const countWithoutPairedKey = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'picks-count-unpaired-1' },
+    body: JSON.stringify({
+      action: 'confirm-picks',
+      orderGlobalId: 'gor1234567',
+      expectedRowVersion: 5,
+      reason: 'Picker verified the multi-unit count',
+      countEvidence,
+    }),
+  }))
+  assert.equal(countWithoutPairedKey.status, 400)
+  assert.equal(
+    (await payload(countWithoutPairedKey)).code,
+    'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+  )
+
+  const invalidFractionalCount = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'picks-count-fractional-1' },
+    body: JSON.stringify({
+      action: 'confirm-picks',
+      orderGlobalId: 'gor1234567',
+      expectedRowVersion: 5,
+      reason: 'Picker verified the multi-unit count',
+      countEvidenceIdempotencyKey: 'wearable-count-route-fractional-1',
+      countEvidence: [{ ...countEvidence[0], enteredQuantity: 2.5 }],
+    }),
+  }))
+  assert.equal(invalidFractionalCount.status, 400)
+  assert.equal(
+    (await payload(invalidFractionalCount)).code,
+    'OPERATIONS_REQUEST_INVALID',
+  )
+
+  const validCountConfirmation = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'picks-count-route-proof-1' },
+    body: JSON.stringify({
+      action: 'confirm-picks',
+      orderGlobalId: 'gor1234567',
+      expectedRowVersion: 5,
+      reason: 'Picker verified the multi-unit count',
+      countEvidenceIdempotencyKey: 'wearable-count-route-proof-1',
+      countEvidence,
+    }),
+  }))
+  assert.equal(validCountConfirmation.status, 200)
+  assert.equal(calls.picks.length, 2)
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.picks[1])), {
+    organizationId: actor.organizationId,
+    actorEmail: actor.email,
+    orderGlobalId: 'gor1234567',
+    expectedRowVersion: 5,
+    reason: 'Picker verified the multi-unit count',
+    countEvidenceIdempotencyKey: 'wearable-count-route-proof-1',
+    countEvidence,
+    idempotencyKey: 'picks-count-route-proof-1',
+  })
+
   const deniedPackVerification = await route.POST(request('http://localhost/api/operations', {
     actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: false, canActivate: false } },
     headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'pack-route-denied-1' },
@@ -2503,6 +2574,538 @@ function proofInput(fixture, externalOrderId, overrides = {}) {
     },
     ...overrides,
   }
+}
+
+function internalAcceptanceBarcode(productGlobalId) {
+  return `CP1P-${String(productGlobalId).toUpperCase()}`
+}
+
+function locationAcceptanceBarcode(locationGlobalId) {
+  return `CP1L-${String(locationGlobalId).toUpperCase()}`
+}
+
+async function assignAcceptanceBarcode(pool, fixture, product) {
+  const barcode = internalAcceptanceBarcode(product.reference_code)
+  await pool.query(
+    `INSERT INTO operations_product_barcodes (
+       organization_id, pipeline_id, product_id, barcode_value,
+       symbology, source_identity, barcode_source, assigned_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4,
+       'CODE128', 'CODE128', 'internal', $5
+     ) ON CONFLICT (organization_id, pipeline_id, product_id) DO NOTHING`,
+    [
+      fixture.organizationId,
+      fixture.pipelineId,
+      product.id,
+      barcode,
+      fixture.email,
+    ],
+  )
+  return barcode
+}
+
+async function stageReleasedCountOrder(
+  pool,
+  persistence,
+  fixture,
+  { quantity = 3, lines = null } = {},
+) {
+  const externalOrderId = `wearable-count-${randomUUID()}`
+  const proof = lines
+    ? proofInput(fixture, externalOrderId, {
+        productGlobalId: undefined,
+        quantity: undefined,
+        openingQuantity: undefined,
+        lines,
+        executionMode: 'planned',
+      })
+    : proofInput(fixture, externalOrderId, {
+        quantity,
+        openingQuantity: 20,
+        executionMode: 'planned',
+      })
+  const staged = await persistence.runMockOperationsProofFromPostgres({
+    organizationId: fixture.organizationId,
+    actorEmail: fixture.email,
+    proof,
+  })
+  const workspace = await persistence.readOperationsWorkspaceFromPostgres({
+    organizationId: fixture.organizationId,
+    capabilities: { canView: true, canManage: true, canExecute: true },
+    selectedOrderGlobalId: staged.orderGlobalId,
+  })
+  const released = await persistence.releaseOperationsOrderFromPostgres({
+    organizationId: fixture.organizationId,
+    actorEmail: fixture.email,
+    orderGlobalId: staged.orderGlobalId,
+    expectedRowVersion: workspace.selectedOrder.rowVersion,
+    reason: 'Release exact-count wearable acceptance order',
+    idempotencyKey: `wearable-count-release-${randomUUID()}`,
+  })
+  const taskResult = await pool.query(
+    `SELECT pick.id::text, pick.global_id, pick.quantity::int,
+            pick.assigned_at, product.reference_code AS product_global_id,
+            warehouse.id::text AS warehouse_id,
+            warehouse.global_id AS warehouse_global_id,
+            location.id::text AS location_id,
+            location.global_id AS location_global_id
+     FROM operations_pick_tasks pick
+     JOIN operations_fulfillment_allocations allocation
+       ON allocation.organization_id = pick.organization_id
+      AND allocation.id = pick.allocation_id
+     JOIN operations_order_lines line
+       ON line.organization_id = allocation.organization_id
+      AND line.id = allocation.order_line_id
+     JOIN crm_products product
+       ON product.pipeline_id = line.pipeline_id
+      AND product.id = line.product_id
+     JOIN operations_fulfillment_plans plan
+       ON plan.organization_id = pick.organization_id
+      AND plan.id = pick.plan_id
+     JOIN operations_orders orders
+       ON orders.organization_id = plan.organization_id
+      AND orders.id = plan.order_id
+     JOIN operations_locations location
+       ON location.organization_id = pick.organization_id
+      AND location.id = pick.from_location_id
+     JOIN operations_warehouses warehouse
+       ON warehouse.organization_id = location.organization_id
+      AND warehouse.id = location.warehouse_id
+     WHERE orders.organization_id = $1::uuid
+       AND orders.global_id = $2
+     ORDER BY pick.sequence_number, pick.id`,
+    [fixture.organizationId, staged.orderGlobalId],
+  )
+  assert.ok(taskResult.rows.length > 0)
+  return { staged, released, tasks: taskResult.rows }
+}
+
+function exactCountEvidence(task, overrides = {}) {
+  const capturedMs = Math.max(
+    new Date(task.assigned_at).getTime() + 10,
+    Date.now() - 1_000,
+  )
+  const productCapturedAt = new Date(capturedMs).toISOString()
+  return {
+    pickTaskGlobalId: task.global_id,
+    requiredQuantity: task.quantity,
+    enteredQuantity: task.quantity,
+    product: {
+      barcode: internalAcceptanceBarcode(task.product_global_id),
+      capturedAt: productCapturedAt,
+      source: 'iphone_camera',
+    },
+    countedAt: new Date(capturedMs + 1_000).toISOString(),
+    countSource: 'iphone',
+    ...overrides,
+  }
+}
+
+async function verifyWearableCountEvidenceAcceptance(
+  pool,
+  persistence,
+  fixture,
+  otherFixture,
+) {
+  await assignAcceptanceBarcode(pool, fixture, fixture.product)
+  await assignAcceptanceBarcode(pool, fixture, fixture.secondProduct)
+
+  const exactOrder = await stageReleasedCountOrder(
+    pool,
+    persistence,
+    fixture,
+    { quantity: 3 },
+  )
+  const task = exactOrder.tasks[0]
+  const baseEvidence = exactCountEvidence(task)
+  const baseInput = {
+    organizationId: fixture.organizationId,
+    actorEmail: fixture.email,
+    orderGlobalId: exactOrder.staged.orderGlobalId,
+    expectedRowVersion: exactOrder.released.rowVersion,
+    reason: 'Wearable picker entered the exact physical count',
+    countEvidenceIdempotencyKey: `wearable-count-evidence-${randomUUID()}`,
+    countEvidence: [baseEvidence],
+    idempotencyKey: `wearable-count-confirm-${randomUUID()}`,
+  }
+
+  for (const [label, changes, expectedCode] of [
+    [
+      'short count',
+      { countEvidence: [{ ...baseEvidence, enteredQuantity: task.quantity - 1 }] },
+      'OPERATIONS_WEARABLE_COUNT_MISMATCH',
+    ],
+    [
+      'excess count',
+      { countEvidence: [{ ...baseEvidence, enteredQuantity: task.quantity + 1 }] },
+      'OPERATIONS_WEARABLE_COUNT_MISMATCH',
+    ],
+    [
+      'stale required quantity',
+      {
+        countEvidence: [{
+          ...baseEvidence,
+          requiredQuantity: task.quantity - 1,
+          enteredQuantity: task.quantity - 1,
+        }],
+      },
+      'OPERATIONS_WEARABLE_COUNT_REQUIRED_QUANTITY_STALE',
+    ],
+    [
+      'wrong product barcode',
+      {
+        countEvidence: [{
+          ...baseEvidence,
+          product: { ...baseEvidence.product, barcode: 'WRONG-BARCODE' },
+        }],
+      },
+      'OPERATIONS_WEARABLE_PRODUCT_SCAN_MISMATCH',
+    ],
+    [
+      'count before product scan',
+      { countEvidence: [{ ...baseEvidence, countedAt: baseEvidence.product.capturedAt }] },
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_STALE',
+    ],
+  ]) {
+    await expectRejected(
+      () => persistence.confirmOperationsOrderPicksFromPostgres({
+        ...baseInput,
+        ...changes,
+        countEvidenceIdempotencyKey: `wearable-count-evidence-${randomUUID()}`,
+        idempotencyKey: `wearable-count-confirm-${randomUUID()}`,
+      }),
+      (error) => error.code === expectedCode,
+      `${label} must fail closed`,
+    )
+  }
+  await expectRejected(
+    () => persistence.confirmOperationsOrderPicksFromPostgres({
+      ...baseInput,
+      actorEmail: otherFixture.email,
+      countEvidenceIdempotencyKey: `wearable-count-evidence-${randomUUID()}`,
+      idempotencyKey: `wearable-count-confirm-${randomUUID()}`,
+    }),
+    (error) => error.code === 'OPERATIONS_WEARABLE_COUNT_EVIDENCE_ACTOR_MISMATCH',
+    'A different actor must not submit the assigned picker count',
+  )
+
+  const multiple = await stageReleasedCountOrder(pool, persistence, fixture, {
+    lines: [
+      {
+        productGlobalId: fixture.product.reference_code,
+        quantity: 2,
+        openingQuantity: 20,
+      },
+      {
+        productGlobalId: fixture.secondProduct.reference_code,
+        quantity: 3,
+        openingQuantity: 20,
+      },
+    ],
+  })
+  assert.equal(multiple.tasks.length, 2)
+  await expectRejected(
+    () => persistence.confirmOperationsOrderPicksFromPostgres({
+      organizationId: fixture.organizationId,
+      actorEmail: fixture.email,
+      orderGlobalId: multiple.staged.orderGlobalId,
+      expectedRowVersion: multiple.released.rowVersion,
+      reason: 'Incomplete count coverage must fail closed',
+      countEvidenceIdempotencyKey: `wearable-count-evidence-${randomUUID()}`,
+      countEvidence: [exactCountEvidence(multiple.tasks[0])],
+      idempotencyKey: `wearable-count-confirm-${randomUUID()}`,
+    }),
+    (error) => error.code === 'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INCOMPLETE',
+    'Every locked multi-unit task must have exact count evidence',
+  )
+
+  const mismatchedReceipt = await pool.query(
+    `INSERT INTO operations_command_receipts (
+       organization_id, command_type, idempotency_key, request_hash,
+       actor_email, correlation_id, target_global_id
+     ) VALUES (
+       $1::uuid, 'confirm_operations_order_picks', $2, $3, $4, $5::uuid, $6
+     ) RETURNING id::text`,
+    [
+      fixture.organizationId,
+      `wearable-count-cross-order-${randomUUID()}`,
+      'd'.repeat(64),
+      fixture.email,
+      randomUUID(),
+      exactOrder.staged.orderGlobalId,
+    ],
+  )
+  const mismatchedTaskEvidence = exactCountEvidence(multiple.tasks[0])
+  const directCountInsert = (overrides = {}) => pool.query(
+    `INSERT INTO operations_wearable_pick_count_evidence (
+       organization_id, command_receipt_id,
+       count_evidence_idempotency_key, order_id, order_row_version,
+       pick_task_id, required_quantity, entered_quantity,
+       expected_product_barcode, observed_product_barcode,
+       product_captured_at, product_source, counted_at, count_source,
+       evidence_hash, recorded_by
+     ) SELECT
+       $1::uuid, $2::uuid, $3, orders.id, $4,
+       $5::uuid, $6, $7, $8, $8,
+       $9::timestamptz, 'iphone_camera', $10::timestamptz, 'iphone',
+       $11, $12
+     FROM operations_orders orders
+     WHERE orders.organization_id = $1::uuid
+       AND orders.global_id = $13`,
+    [
+      fixture.organizationId,
+      mismatchedReceipt.rows[0].id,
+      overrides.countEvidenceIdempotencyKey
+        || `wearable-count-direct-${randomUUID()}`,
+      overrides.orderRowVersion ?? exactOrder.released.rowVersion,
+      overrides.taskId || task.id,
+      overrides.requiredQuantity ?? task.quantity,
+      overrides.enteredQuantity ?? task.quantity,
+      overrides.barcode || baseEvidence.product.barcode,
+      baseEvidence.product.capturedAt,
+      baseEvidence.countedAt,
+      overrides.evidenceHash || 'f'.repeat(64),
+      overrides.recordedBy || fixture.email,
+      exactOrder.staged.orderGlobalId,
+    ],
+  )
+  await expectRejected(
+    () => directCountInsert({
+      taskId: multiple.tasks[0].id,
+      requiredQuantity: multiple.tasks[0].quantity,
+      enteredQuantity: multiple.tasks[0].quantity,
+      barcode: mismatchedTaskEvidence.product.barcode,
+    }),
+    (error) => error.code === 'P0001'
+      && /processing confirm-picks receipt/.test(error.message),
+    'A confirm receipt must not accept a task from another order',
+  )
+  for (const [label, overrides] of [
+    ['stale order row version', { orderRowVersion: exactOrder.released.rowVersion - 1 }],
+    ['wrong assigned actor', { recordedBy: otherFixture.email }],
+    ['stale required quantity', { requiredQuantity: task.quantity + 1, enteredQuantity: task.quantity + 1 }],
+  ]) {
+    await expectRejected(
+      () => directCountInsert(overrides),
+      (error) => error.code === 'P0001'
+        && /processing confirm-picks receipt/.test(error.message),
+      `Direct count evidence must reject ${label}`,
+    )
+  }
+
+  const confirmed = await persistence.confirmOperationsOrderPicksFromPostgres(baseInput)
+  assert.equal(confirmed.orderStatus, 'picking')
+  assert.equal(confirmed.replayed, false)
+  const replayed = await persistence.confirmOperationsOrderPicksFromPostgres(baseInput)
+  assert.equal(replayed.orderGlobalId, confirmed.orderGlobalId)
+  assert.equal(replayed.rowVersion, confirmed.rowVersion)
+  assert.equal(replayed.replayed, true)
+  await expectRejected(
+    () => persistence.confirmOperationsOrderPicksFromPostgres({
+      ...baseInput,
+      countEvidence: [{ ...baseEvidence, countSource: 'watch' }],
+    }),
+    (error) => error.code === 'OPERATIONS_IDEMPOTENCY_CONFLICT',
+    'The confirm receipt hash must reject a changed replay body',
+  )
+
+  const persisted = await pool.query(
+    `SELECT evidence.id::text, evidence.required_quantity::int,
+            evidence.entered_quantity::int, evidence.product_source,
+            evidence.count_source, evidence.recorded_by,
+            receipt.command_type, receipt.idempotency_key,
+            receipt.request_hash,
+            event.payload AS domain_payload,
+            audit.payload AS audit_payload
+     FROM operations_wearable_pick_count_evidence evidence
+     JOIN operations_command_receipts receipt
+       ON receipt.organization_id = evidence.organization_id
+      AND receipt.id = evidence.command_receipt_id
+     JOIN operations_orders orders
+       ON orders.organization_id = evidence.organization_id
+      AND orders.id = evidence.order_id
+     JOIN operations_domain_events event
+       ON event.organization_id = orders.organization_id
+      AND event.aggregate_global_id = orders.global_id
+      AND event.event_type = 'operations.pick.completed'
+     JOIN audit_events audit
+       ON audit.organization_id = orders.organization_id
+      AND audit.aggregate_id = orders.global_id
+      AND audit.event_type = 'operations.order.picks_confirmed'
+     WHERE evidence.organization_id = $1::uuid
+       AND orders.global_id = $2`,
+    [fixture.organizationId, exactOrder.staged.orderGlobalId],
+  )
+  assert.equal(persisted.rowCount, 1)
+  assert.deepEqual({
+    requiredQuantity: persisted.rows[0].required_quantity,
+    enteredQuantity: persisted.rows[0].entered_quantity,
+    productSource: persisted.rows[0].product_source,
+    countSource: persisted.rows[0].count_source,
+    recordedBy: persisted.rows[0].recorded_by,
+    commandType: persisted.rows[0].command_type,
+    commandKey: persisted.rows[0].idempotency_key,
+  }, {
+    requiredQuantity: 3,
+    enteredQuantity: 3,
+    productSource: 'iphone_camera',
+    countSource: 'iphone',
+    recordedBy: fixture.email,
+    commandType: 'confirm_operations_order_picks',
+    commandKey: baseInput.idempotencyKey,
+  })
+  assert.match(persisted.rows[0].request_hash, /^[a-f0-9]{64}$/)
+  assert.equal(persisted.rows[0].domain_payload.countEvidenceEnforced, true)
+  assert.equal(persisted.rows[0].domain_payload.countEvidenceCount, 1)
+  assert.equal(persisted.rows[0].audit_payload.countEvidenceEnforced, true)
+
+  await expectRejected(
+    () => pool.query(
+      `UPDATE operations_wearable_pick_count_evidence
+       SET count_source = 'watch' WHERE id = $1::uuid`,
+      [persisted.rows[0].id],
+    ),
+    (error) => error.code === 'P0001' && /immutable/.test(error.message),
+    'Count evidence must reject updates',
+  )
+  await expectRejected(
+    () => pool.query(
+      `DELETE FROM operations_wearable_pick_count_evidence
+       WHERE id = $1::uuid`,
+      [persisted.rows[0].id],
+    ),
+    (error) => error.code === 'P0001' && /immutable/.test(error.message),
+    'Count evidence must reject deletes',
+  )
+
+  const legacy = await stageReleasedCountOrder(
+    pool,
+    persistence,
+    fixture,
+    { quantity: 2 },
+  )
+  const legacyConfirmed = await persistence.confirmOperationsOrderPicksFromPostgres({
+    organizationId: fixture.organizationId,
+    actorEmail: fixture.email,
+    orderGlobalId: legacy.staged.orderGlobalId,
+    expectedRowVersion: legacy.released.rowVersion,
+    reason: 'Legacy web confirmation remains backward compatible',
+    idempotencyKey: `legacy-count-omission-${randomUUID()}`,
+  })
+  assert.equal(legacyConfirmed.orderStatus, 'picking')
+  const legacyEvidence = await pool.query(
+    `SELECT
+       (SELECT count(*)::int
+        FROM operations_wearable_pick_count_evidence evidence
+        JOIN operations_orders orders
+          ON orders.organization_id = evidence.organization_id
+         AND orders.id = evidence.order_id
+        WHERE orders.organization_id = $1::uuid
+          AND orders.global_id = $2) AS count_evidence,
+       event.payload ->> 'countEvidenceEnforced' AS enforced
+     FROM operations_domain_events event
+     WHERE event.organization_id = $1::uuid
+       AND event.aggregate_global_id = $2
+       AND event.event_type = 'operations.pick.completed'`,
+    [fixture.organizationId, legacy.staged.orderGlobalId],
+  )
+  assert.deepEqual(legacyEvidence.rows[0], {
+    count_evidence: 0,
+    enforced: 'false',
+  })
+
+  const policyOrder = await stageReleasedCountOrder(
+    pool,
+    persistence,
+    fixture,
+    { quantity: 2 },
+  )
+  const policyTask = policyOrder.tasks[0]
+  await pool.query(
+    `INSERT INTO operations_wearable_location_scan_policies (
+       organization_id, warehouse_id, location_scan_required,
+       row_version, created_by, updated_by
+     ) VALUES ($1::uuid, $2::uuid, true, 1, $3, $3)
+     ON CONFLICT (organization_id, warehouse_id) DO UPDATE SET
+       location_scan_required = true,
+       row_version = 1,
+       updated_by = EXCLUDED.updated_by,
+       updated_at = now()`,
+    [fixture.organizationId, policyTask.warehouse_id, fixture.email],
+  )
+  const locationCapturedAt = new Date(Date.now() - 2_000).toISOString()
+  const productCapturedAt = new Date(Date.now() - 1_000).toISOString()
+  const scanEvidenceKey = `wearable-scan-count-${randomUUID()}`
+  await persistence.recordWearablePickScanEvidenceFromPostgres({
+    organizationId: fixture.organizationId,
+    actorEmail: fixture.email,
+    orderGlobalId: policyOrder.staged.orderGlobalId,
+    expectedRowVersion: policyOrder.released.rowVersion,
+    scanEvidence: [{
+      pickTaskGlobalId: policyTask.global_id,
+      policyRowVersion: 1,
+      location: {
+        barcode: locationAcceptanceBarcode(policyTask.location_global_id),
+        capturedAt: locationCapturedAt,
+        source: 'iphone_camera',
+      },
+      product: {
+        barcode: internalAcceptanceBarcode(policyTask.product_global_id),
+        capturedAt: productCapturedAt,
+        source: 'meta',
+      },
+    }],
+    idempotencyKey: scanEvidenceKey,
+  })
+  const policyCountEvidence = {
+    pickTaskGlobalId: policyTask.global_id,
+    requiredQuantity: 2,
+    enteredQuantity: 2,
+    product: {
+      barcode: internalAcceptanceBarcode(policyTask.product_global_id),
+      capturedAt: productCapturedAt,
+      source: 'meta',
+    },
+    countedAt: new Date().toISOString(),
+    countSource: 'watch',
+  }
+  await expectRejected(
+    () => persistence.confirmOperationsOrderPicksFromPostgres({
+      organizationId: fixture.organizationId,
+      actorEmail: fixture.email,
+      orderGlobalId: policyOrder.staged.orderGlobalId,
+      expectedRowVersion: policyOrder.released.rowVersion,
+      reason: 'Contradictory count product observation must fail closed',
+      scanEvidenceIdempotencyKey: scanEvidenceKey,
+      countEvidenceIdempotencyKey: `wearable-count-evidence-${randomUUID()}`,
+      countEvidence: [{
+        ...policyCountEvidence,
+        product: { ...policyCountEvidence.product, source: 'iphone_camera' },
+      }],
+      idempotencyKey: `wearable-count-confirm-${randomUUID()}`,
+    }),
+    (error) => error.code
+      === 'OPERATIONS_WEARABLE_COUNT_SCAN_EVIDENCE_MISMATCH',
+    'Location-policy count must reference the acknowledged product observation',
+  )
+  const policyConfirmed = await persistence.confirmOperationsOrderPicksFromPostgres({
+    organizationId: fixture.organizationId,
+    actorEmail: fixture.email,
+    orderGlobalId: policyOrder.staged.orderGlobalId,
+    expectedRowVersion: policyOrder.released.rowVersion,
+    reason: 'Matching acknowledged scan and count evidence',
+    scanEvidenceIdempotencyKey: scanEvidenceKey,
+    countEvidenceIdempotencyKey: `wearable-count-evidence-${randomUUID()}`,
+    countEvidence: [policyCountEvidence],
+    idempotencyKey: `wearable-count-confirm-${randomUUID()}`,
+  })
+  assert.equal(policyConfirmed.orderStatus, 'picking')
+  await pool.query(
+    `DELETE FROM operations_wearable_location_scan_policies
+     WHERE organization_id = $1::uuid AND warehouse_id = $2::uuid`,
+    [fixture.organizationId, policyTask.warehouse_id],
+  )
 }
 
 async function verifyInboundReceivingAcceptance(pool, persistence, fixture) {
@@ -4183,6 +4786,12 @@ async function verifyPostgresAcceptance(databaseUrl) {
       )
     }
 
+    await verifyWearableCountEvidenceAcceptance(
+      pool,
+      persistence,
+      primary,
+      other,
+    )
     await verifyInboundReceivingAcceptance(pool, persistence, primary)
     await verifyReplenishmentExecutionAcceptance(pool, persistence, primary)
   } finally {

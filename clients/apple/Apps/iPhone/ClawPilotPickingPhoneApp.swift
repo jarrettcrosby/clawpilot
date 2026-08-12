@@ -33,6 +33,17 @@ struct ClawPilotPickingPhoneApp: App {
                         }
                     }
                 }
+                .sheet(isPresented: $model.showCountEntry) {
+                    if let context = model.currentStageContext,
+                       context.stage == .count {
+                        PickedCountEntrySheet(model: model, context: context)
+                    } else {
+                        ContentUnavailableView(
+                            "Count no longer needed",
+                            systemImage: "checkmark.circle"
+                        )
+                    }
+                }
                 .onOpenURL { url in
                     Task {
                         if GIDSignIn.sharedInstance.handle(url) {
@@ -86,6 +97,9 @@ final class PickingPhoneModel: ObservableObject {
     @Published var isManagerBusy = false
     @Published var currentTask: PickTask?
     @Published var currentScanStage: PickScanStage?
+    @Published var currentWorkflowStage: PickWorkflowStage?
+    @Published var currentStageContext: PickStageContext?
+    @Published var showCountEntry = false
     @Published var readyToConfirm = false
     @Published var showPhoneScanner = false
     @Published var hasPendingConfirmation = false
@@ -125,6 +139,10 @@ final class PickingPhoneModel: ObservableObject {
     private var codeRequestCooldown: Task<Void, Never>?
     private var metaConnectionRefreshTask: Task<Void, Never>?
     private var isHandlingPendingSystemScan = false
+    private var metaProductStartContinuation: CheckedContinuation<Bool, Never>?
+    private var metaProductStartScanID: UUID?
+    private var metaProductStartRequestedScanID: UUID?
+    private var dismissedCountContextToken: String?
 
     var canSendCode: Bool {
         canRequestCode && !isAuthBusy && email.contains("@") && email.count <= 254
@@ -955,10 +973,18 @@ final class PickingPhoneModel: ObservableObject {
             }
             await updateProjection()
             if acceptance.stage == .location {
-                status = "Location matched. Now scan the displayed product barcode."
+                status = "Location matched. Confirm when you are ready to scan the product."
                 voice.speak(
-                    "Location matched. Now scan the product barcode.",
-                    spanish: "Ubicación correcta. Ahora escanea el código del producto."
+                    "Location matched. Tap scan product when you are ready.",
+                    spanish: "Ubicación correcta. Toca escanear producto cuando estés listo."
+                )
+                refreshAudioRouteStatus()
+            } else if currentWorkflowStage == .count {
+                status = "Product matched. Enter the quantity you actually picked."
+                showCountEntry = true
+                voice.speak(
+                    "Product matched. Enter the picked quantity.",
+                    spanish: "Producto correcto. Ingresa la cantidad recogida."
                 )
                 refreshAudioRouteStatus()
             } else if source == .metaGlasses, readyToConfirm {
@@ -992,6 +1018,21 @@ final class PickingPhoneModel: ObservableObject {
                 spanish: "Producto incorrecto. Escanea el producto mostrado."
             )
             refreshAudioRouteStatus()
+        } catch PickingContractError.staleProgress {
+            guard shouldApplyMetaScanResult(metaScanID) else { return nil }
+            await updateProjection()
+            status = currentWorkflowStage == .location
+                ? "That scan step expired. Scan the location again."
+                : "That scan step expired. Scan the product again."
+            voice.speak(
+                currentWorkflowStage == .location
+                    ? "Scan step expired. Scan the location again."
+                    : "Scan step expired. Scan the product again.",
+                spanish: currentWorkflowStage == .location
+                    ? "El paso expiró. Escanea la ubicación otra vez."
+                    : "El paso expiró. Escanea el producto otra vez."
+            )
+            refreshAudioRouteStatus()
         } catch {
             guard shouldApplyMetaScanResult(metaScanID) else { return nil }
             status = "Scan rejected: \(error.localizedDescription)"
@@ -1005,10 +1046,9 @@ final class PickingPhoneModel: ObservableObject {
         if acceptance?.stage == .product {
             return .close(feedback: "Product barcode matched.")
         }
-        if acceptance?.stage == .location, let context = phoneCameraScanContext {
-            return .continueScanning(
-                context: context,
-                feedback: "Location matched. The live camera is still on—now scan the product barcode.",
+        if acceptance?.stage == .location {
+            return .close(
+                feedback: "Location matched. Continue deliberately when you are ready to scan the product.",
                 tone: .success
             )
         }
@@ -1026,6 +1066,122 @@ final class PickingPhoneModel: ObservableObject {
     private func shouldApplyMetaScanResult(_ scanID: UUID?) -> Bool {
         guard let scanID else { return true }
         return activeMetaScanID == scanID
+    }
+
+    @discardableResult
+    func beginProductScanWithMeta(contextToken: String) async -> Bool {
+        guard isMetaScanning || metaScanReady else {
+            status = "Keep one camera-ready Meta glasses connection before starting the product scan."
+            return false
+        }
+        do {
+            try await picking.beginProductScan(contextToken: contextToken)
+            await updateProjection()
+            status = "Product scan armed. Look directly at the displayed product barcode."
+            if let activeMetaScanID,
+               metaProductStartScanID == activeMetaScanID,
+               let continuation = metaProductStartContinuation {
+                metaProductStartContinuation = nil
+                metaProductStartScanID = nil
+                continuation.resume(returning: true)
+            } else if let activeMetaScanID {
+                // A very fast tap can arrive after location acceptance but
+                // before the scan loop installs its continuation. Remember
+                // that exact scan generation so it can arm in place.
+                metaProductStartRequestedScanID = activeMetaScanID
+            } else {
+                Task { [weak self] in await self?.scanWithMeta() }
+            }
+            return true
+        } catch PickingContractError.staleProgress {
+            await updateProjection()
+            status = "That location scan expired. Scan the location again before the product."
+            return false
+        } catch {
+            status = "The pick changed before product scanning started. Refresh the current item."
+            return false
+        }
+    }
+
+    func beginProductScanWithPhone(contextToken: String) async {
+        if isMetaScanning { await cancelMetaScan() }
+        do {
+            try await picking.beginProductScan(contextToken: contextToken)
+            await updateProjection()
+            status = "Product scan armed. Use the iPhone camera on the displayed product."
+            showPhoneScanner = true
+        } catch PickingContractError.staleProgress {
+            await updateProjection()
+            status = "That location scan expired. Scan the location again before the product."
+        } catch {
+            status = "The pick changed before product scanning started. Refresh the current item."
+        }
+    }
+
+    @discardableResult
+    func submitPickedCount(
+        _ enteredCount: Int,
+        source: PickCountSource = .iPhone,
+        contextToken: String? = nil
+    ) async -> Bool {
+        guard let context = currentStageContext,
+              context.stage == .count,
+              contextToken == nil || context.token == contextToken?.lowercased() else {
+            status = "The item changed before that count was submitted."
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            return false
+        }
+        do {
+            _ = try await picking.verifyCount(
+                enteredCount: enteredCount,
+                source: source,
+                contextToken: context.token
+            )
+            showCountEntry = false
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            status = "Count verified. The current pick advanced."
+            voice.speak(
+                "Count verified.",
+                spanish: "Cantidad verificada."
+            )
+            refreshAudioRouteStatus()
+            await updateProjection()
+            if source == .iPhone { readInstruction() }
+            return true
+        } catch PickingContractError.countMismatch(let required, let entered) {
+            let direction = entered < required ? "under" : "over"
+            status = "Count is \(direction). Enter exactly \(required); \(entered) was entered."
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            voice.speak(
+                "Count is \(direction). Enter \(required).",
+                spanish: entered < required
+                    ? "La cantidad es menor. Ingresa \(required)."
+                    : "La cantidad es mayor. Ingresa \(required)."
+            )
+            refreshAudioRouteStatus()
+            return false
+        } catch PickingContractError.staleProgress {
+            await updateProjection()
+            showCountEntry = false
+            status = "That product scan expired. Scan the product again, then enter the count."
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            voice.speak(
+                "Product scan expired. Scan the product again.",
+                spanish: "El escaneo del producto expiró. Escanea el producto otra vez."
+            )
+            refreshAudioRouteStatus()
+            return false
+        } catch {
+            status = "Enter a positive whole-number count for the current item."
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            return false
+        }
+    }
+
+    func cancelCountEntry() {
+        dismissedCountContextToken = currentStageContext?.token
+        showCountEntry = false
+        status = "Product remains matched. Reopen Enter picked count to finish this item."
     }
 
     private func metaDecodeTarget(
@@ -1077,6 +1233,9 @@ final class PickingPhoneModel: ObservableObject {
         activeMetaScanID = scanID
         isMetaScanning = true
         defer {
+            if metaProductStartRequestedScanID == scanID {
+                metaProductStartRequestedScanID = nil
+            }
             // A stopped scan may already have been replaced by a new one. Never
             // let the older task clear the newer scan's source or busy state.
             if activeMetaScanID == scanID {
@@ -1182,17 +1341,6 @@ final class PickingPhoneModel: ObservableObject {
                 ClawPilotScanDiagnostic.record(
                     "decoded:stage=\(currentScanStage?.rawValue ?? "unknown")"
                 )
-                if currentScanStage == .product, value == acceptedLocationValue {
-                    metaStatus = "Location verified. Move the barcode into view, then hold still on the product."
-                    try? await Task.sleep(for: .milliseconds(800))
-                    guard activeMetaScanID == scanID,
-                          let task = currentTask,
-                          let stage = currentScanStage else { return nil }
-                    await source.prepareForNextBarcode(
-                        target: metaDecodeTarget(for: task, stage: stage)
-                    )
-                    continue
-                }
                 if currentScanStage == .product {
                     // End the camera stream before any product-match voice or
                     // confirmation prompt so playback cannot overlap the DAT
@@ -1226,16 +1374,32 @@ final class PickingPhoneModel: ObservableObject {
                 if let acceptance {
                     lastAcceptance = acceptance
                     acceptedLocationValue = value
-                    metaStatus = "Location matched. Keep the camera live and look at the product barcode."
-                    try? await Task.sleep(for: .milliseconds(800))
-                    guard activeMetaScanID == scanID else { return nil }
+                    guard acceptance.stage == .location else { continue }
+                    let shouldContinue: Bool
+                    if metaProductStartRequestedScanID == scanID,
+                       currentWorkflowStage == .product {
+                        metaProductStartRequestedScanID = nil
+                        shouldContinue = true
+                    } else {
+                        guard let context = currentStageContext,
+                              context.stage == .productReady else { return lastAcceptance }
+                        metaStatus = "Location matched. The camera is paused on this step—tap Scan product when ready."
+                        shouldContinue = await withCheckedContinuation { continuation in
+                            metaProductStartScanID = scanID
+                            metaProductStartContinuation = continuation
+                        }
+                    }
+                    metaProductStartScanID = nil
+                    metaProductStartContinuation = nil
+                    guard shouldContinue, activeMetaScanID == scanID else { return lastAcceptance }
                 } else if observedIndex == 7 {
                     break
                 }
                 guard let task = currentTask,
                       let stage = currentScanStage else { break }
                 await source.prepareForNextBarcode(
-                    target: metaDecodeTarget(for: task, stage: stage)
+                    target: metaDecodeTarget(for: task, stage: stage),
+                    suppressedValue: acceptedLocationValue
                 )
             }
             await source.stop()
@@ -1328,6 +1492,12 @@ final class PickingPhoneModel: ObservableObject {
         cancelledMetaAcceptanceStage = nil
         activeMetaScanID = nil
         metaSource = nil
+        metaProductStartRequestedScanID = nil
+        if let continuation = metaProductStartContinuation {
+            metaProductStartContinuation = nil
+            metaProductStartScanID = nil
+            continuation.resume(returning: false)
+        }
         metaStatus = "Stopping Meta scan…"
         ClawPilotScanDiagnostic.record("cancelled:user")
         if let source { await source.stop() }
@@ -1533,14 +1703,15 @@ final class PickingPhoneModel: ObservableObject {
             }
             return .failure(metaStatus)
         case .readInstruction:
-            // Watch commands commonly wake the iPhone in the background. Use
-            // Apple's lightweight synthesizer for this path instead of
-            // starting the large optional CoreML voice model while backgrounded.
+            // Reuse the same installed voice selected on iPhone so Watch and
+            // phone instruction requests stay consistent. `voice.speak`
+            // keeps Apple speech as the safe fallback and never installs the
+            // optional model implicitly.
             status = "Apple Watch requested the current pick instruction."
             guard currentTask != nil || readyToConfirm else {
                 return .failure("No current pick instruction is available.")
             }
-            readInstruction(forceSystemVoice: true)
+            readInstruction()
             return .success(metaConnectedDeviceCount == 1
                 ? "Instruction is playing through the current iPhone audio route."
                 : "Instruction playback started on the paired iPhone.")
@@ -1568,6 +1739,31 @@ final class PickingPhoneModel: ObservableObject {
             return .success(currentTask == nil
                 ? status
                 : "Picks refreshed. The current item is ready on Apple Watch.")
+        case .beginProductScan:
+            guard let token = command.stageContextToken else {
+                return .failure("The product scan step expired. Refresh Apple Watch.")
+            }
+            guard currentStageContext?.stage == .productReady,
+                  currentStageContext?.token == token.lowercased() else {
+                return .failure("That product scan step is no longer current. Refresh Apple Watch.")
+            }
+            let started = await beginProductScanWithMeta(contextToken: token)
+            return started
+                ? .success("Product scan armed on the existing glasses camera.")
+                : .failure(status)
+        case .submitCount:
+            guard let enteredCount = command.enteredCount,
+                  let token = command.stageContextToken else {
+                return .failure("Enter a whole-number count for the current item.")
+            }
+            let succeeded = await submitPickedCount(
+                enteredCount,
+                source: .watch,
+                contextToken: token
+            )
+            return succeeded
+                ? .success("Count verified. The current pick advanced.")
+                : .failure(status)
         }
     }
 
@@ -1707,6 +1903,17 @@ final class PickingPhoneModel: ObservableObject {
             refreshAudioRouteStatus()
             await loadPickerPerformance()
             await loadQueue(readAloud: false)
+        } catch PickingContractError.staleProgress {
+            hasPendingConfirmation = false
+            showPhoneScanner = false
+            showCountEntry = false
+            await updateProjection()
+            status = "Saved scan evidence expired before confirmation. Scan this order again."
+            voice.speak(
+                "Scan evidence expired. Scan the order again.",
+                spanish: "La evidencia expiró. Escanea el pedido otra vez."
+            )
+            refreshAudioRouteStatus()
         } catch {
             let pending = try? await cache.loadOutbox()
             status = pending?.scanEvidenceIdempotencyKey == nil
@@ -1747,11 +1954,23 @@ final class PickingPhoneModel: ObservableObject {
     private func updateProjection() async {
         currentTask = await picking.currentTask()
         currentScanStage = await picking.currentScanStage()
+        currentWorkflowStage = await picking.currentWorkflowStage()
+        currentStageContext = await picking.currentStageContext()
+        if currentStageContext?.stage == .count {
+            showCountEntry = currentStageContext?.token != dismissedCountContextToken
+        } else {
+            showCountEntry = false
+            dismissedCountContextToken = nil
+        }
         let activeOrder = await picking.currentOrder()
         readyToConfirm = currentTask == nil && activeOrder != nil
         watch.publish(await picking.makeWatchSnapshot(
             instructionLanguageCode: instructionLanguage.languageCode,
-            readInstructionOnPhone: metaConnectedDeviceCount == 1
+            // The optional voice pack is installed only on iPhone. Route a
+            // reachable Watch request through iPhone regardless of whether
+            // Meta glasses are connected so it can use that pack consistently.
+            // The Watch keeps its local Apple-speech fallback while unreachable.
+            readInstructionOnPhone: true
         ))
     }
 }

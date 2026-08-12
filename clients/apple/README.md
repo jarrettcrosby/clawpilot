@@ -19,15 +19,27 @@ completion timestamps. The one-time-code keyboard can be
 dismissed with its **Done** control or by dragging the screen, while iOS AutoFill
 remains enabled for codes received by email.
 
-The picker screen explains the three-step operating loop. When one registered
+The picker screen explains the deliberate operating loop. When one registered
 device is connected, **Start Meta scan** opens a live glasses camera stream and
-reads one barcode locally without saving a photo. Returning from Meta AI starts
+reads barcodes locally without saving photos. A verified location pauses the
+workflow at **Scan product**; the picker explicitly advances from the iPhone or
+Watch while the existing Meta camera session stays alive. A multi-unit product
+scan opens a focused count popup on both devices. The picker punches in the
+physical count, and only an exact match advances the item; a short or excess
+count stays open with voice and haptic feedback. Unit-one products retain the
+existing immediate scan path. Location, product, awaiting-count, and exact-count
+progress is durably cached behind the complete queue/order identity fence so an
+app restart cannot silently skip or transfer a step.
+
+Returning from Meta AI starts
 a bounded reconnection poll; **Reconnect glasses** retries it without requiring
 the worker to leave ClawPilot. The iPhone camera remains an explicit fallback.
-The Watch reads its cached current instruction through the Watch speaker when
-glasses are unavailable, without waking the iPhone voice runtime. When one Meta
-glasses connection is active, the Watch delegates that read request to the
-iPhone so iOS can route playback to the glasses.
+The Watch delegates a read request to the iPhone whenever the paired app is
+reachable, regardless of whether Meta glasses are connected. This keeps Watch-
+initiated instructions on the same installed voice as iPhone instructions while
+letting iOS choose the active phone or Bluetooth output route. When the iPhone
+is unreachable, the Watch still reads its cached instruction through its own
+Apple speech fallback.
 
 Instruction audio can use the optional Supertonic-3 FP16 voice pack through
 SpeechSwift 0.0.23. The pack is installed explicitly from the Picker audio card,
@@ -37,6 +49,9 @@ validated voice profiles; Apple speech remains the safe fallback while the pack 
 absent, downloading, invalid, or unavailable. The approximately 332 MB model is
 derived from Supertone's Supertonic-3 under the OpenRAIL-M license. Supertonic
 requires iOS 18 while the Watch target remains watchOS 10.2.
+The model is installed only on iPhone; the Watch cannot install or run this iOS
+CoreML package. Consistent enhanced speech therefore uses the reachable iPhone,
+while Watch-only playback remains Apple speech.
 The Picker audio card also maintains a device-local pronunciation dictionary;
 operators can add, preview, replace, and remove written-term to spoken-term
 corrections, which apply to both the enhanced voice and Apple fallback speech.
