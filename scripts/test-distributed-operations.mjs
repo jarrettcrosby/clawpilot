@@ -1331,6 +1331,11 @@ async function verifyRouteBehavior() {
           return actor.organizationId
         },
       },
+      '@/lib/operations/types': {
+        canRequestOperationsPickHandoff: (capabilities) => (
+          capabilities.canView && capabilities.canExecute
+        ),
+      },
       '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
       '@/lib/integrations/carrierIntegrations': {
         CarrierIntegrationRequestError,
