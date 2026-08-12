@@ -94,6 +94,29 @@ struct PickingDashboardView: View {
         } message: {
             Text("ClawPilot will immediately return to Apple speech. You can download the enhanced voice again later.")
         }
+        .alert(
+            "Request manager handoff?",
+            isPresented: $model.showPickHandoffConfirmation
+        ) {
+            TextField("Reason for manager", text: $model.pickHandoffReason)
+            Button("Request handoff", role: .destructive) {
+                Task { await model.submitPickHandoff() }
+            }
+            .disabled(
+                model.pickHandoffReason
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty
+            )
+            Button("Cancel", role: .cancel) {
+                model.pickHandoffReason = ""
+            }
+        } message: {
+            Text("The current order will be unassigned and sent to a manager exception. ClawPilot will preserve the order, inventory, reservations, and any external provider state.")
+        }
+        .onChange(of: model.pickHandoffReason) { _, reason in
+            let bounded = String(reason.prefix(500))
+            if bounded != reason { model.pickHandoffReason = bounded }
+        }
     }
 
     private var header: some View {
@@ -239,22 +262,89 @@ struct PickingDashboardView: View {
                         .buttonStyle(.plain)
                         .foregroundStyle(PickingTheme.primary)
                         .background(PickingTheme.primary.opacity(0.1), in: Circle())
-                        .disabled(model.isQueueBusy)
+                        .disabled(model.isQueueBusy || model.hasPendingConfirmation)
                         .accessibilityLabel("Refresh assigned picks")
                     }
                 }
 
-                if model.hasPendingConfirmation {
+                if model.hasPendingPickHandoff {
                     statePanel(
-                        icon: "exclamationmark.shield.fill",
-                        color: PickingTheme.danger,
-                        title: "Confirmation needs attention",
-                        detail: "New work is blocked until the exact prior command is reconciled."
+                        icon: "person.2.badge.gearshape.fill",
+                        color: Color.orange,
+                        title: "Manager handoff pending",
+                        detail: model.pendingPickHandoffDetail
+                            ?? "The exact audited handoff request is saved on this iPhone."
                     )
-                    Button("Retry exact confirmation") {
-                        Task { await model.retryPendingConfirmation() }
+                    Button {
+                        Task { await model.retryPendingPickHandoff() }
+                    } label: {
+                        HStack(spacing: 8) {
+                            if model.isRequestingPickHandoff {
+                                ProgressView().tint(PickingTheme.primaryText)
+                            }
+                            Text("Retry exact handoff")
+                        }
+                        .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(PrimaryDashboardButtonStyle())
+                    .disabled(model.isRequestingPickHandoff)
+                    Text("Retry reuses the saved request and idempotency key. This phone will not clear the pick from a missing queue row alone.")
+                        .font(.caption)
+                        .foregroundStyle(PickingTheme.muted)
+                } else if model.hasPendingConfirmation {
+                    if model.pendingConfirmationIdentityMismatch {
+                        statePanel(
+                            icon: "person.crop.circle.badge.exclamationmark",
+                            color: PickingTheme.danger,
+                            title: "Saved confirmation protected",
+                            detail: model.pendingConfirmationDetail
+                                ?? "ClawPilot cannot safely read or match this confirmation to the signed-in picker."
+                        )
+                        Text("No confirmation was sent. Return to the original picker account and organization, or ask a manager to review the order.")
+                            .font(.caption)
+                            .foregroundStyle(PickingTheme.muted)
+                    } else if model.pendingConfirmationRequiresManagerAction {
+                        statePanel(
+                            icon: "person.badge.shield.checkmark.fill",
+                            color: Color.orange,
+                            title: "Manager reconciliation required",
+                            detail: model.pendingConfirmationDetail
+                                ?? "A manager must reconcile this Shopify order in Operations before picking can continue."
+                        )
+                        Button {
+                            Task { await model.recheckPendingConfirmationAfterManagerAction() }
+                        } label: {
+                            HStack(spacing: 8) {
+                                if model.isRecheckingPendingConfirmation {
+                                    ProgressView().tint(PickingTheme.primaryText)
+                                }
+                                Text("Refresh after manager reconciliation")
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(PrimaryDashboardButtonStyle())
+                        .disabled(model.isRecheckingPendingConfirmation)
+                        Button("Request manager handoff instead") {
+                            model.presentBlockedConfirmationHandoff()
+                        }
+                        .buttonStyle(SecondaryDashboardButtonStyle())
+                        .disabled(model.isRequestingPickHandoff)
+                        Text("Refresh only checks ClawPilot’s read-only reconciliation evidence. It does not change Shopify or repeat a provider action.")
+                            .font(.caption)
+                            .foregroundStyle(PickingTheme.muted)
+                    } else {
+                        statePanel(
+                            icon: "exclamationmark.shield.fill",
+                            color: PickingTheme.danger,
+                            title: "Confirmation needs attention",
+                            detail: "New work is blocked until the exact prior command is reconciled."
+                        )
+                        Button("Retry exact confirmation") {
+                            Task { await model.retryPendingConfirmation() }
+                        }
+                        .buttonStyle(PrimaryDashboardButtonStyle())
+                        .disabled(model.isConfirmingOrder)
+                    }
                 } else if let task = model.currentTask {
                     currentTaskView(task)
                 } else if model.readyToConfirm {
@@ -462,6 +552,14 @@ struct PickingDashboardView: View {
                 Label("Read instruction aloud", systemImage: "speaker.wave.2.fill")
             }
             .font(.subheadline.weight(.semibold))
+
+            if model.canRequestActivePickHandoff {
+                Button("Hand off this unstarted order") {
+                    Task { await model.presentActivePickHandoff() }
+                }
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(PickingTheme.danger)
+            }
         }
     }
 

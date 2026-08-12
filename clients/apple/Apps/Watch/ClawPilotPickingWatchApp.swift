@@ -467,7 +467,11 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
             lastActionSucceeded = false
             return
         }
-        if snapshot.readInstructionOnPhone == true, session?.isReachable == true {
+        let playbackTarget = WatchInstructionPlaybackTarget.resolve(
+            prefersPairedIPhone: snapshot.readInstructionOnPhone == true,
+            pairedIPhoneIsReachable: session?.isReachable == true
+        )
+        if playbackTarget == .pairedIPhone {
             send(.readInstruction)
             return
         }

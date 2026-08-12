@@ -3972,7 +3972,19 @@ export default function OperationsSection({
       : `Distributed fulfillment${workspace ? ` · CRM: ${workspace.dataPipeline.name}` : ''}`
 
   return (
-    <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', minWidth: 0, overflow: 'hidden' }}>
+    <Box
+      data-testid="operations-workbench"
+      sx={{
+        height: '100%',
+        display: 'flex',
+        flexDirection: 'column',
+        minWidth: 0,
+        overflowX: 'hidden',
+        overflowY: mainWorkspaceView ? { xs: 'auto', md: 'hidden' } : 'hidden',
+        WebkitOverflowScrolling: 'touch',
+        overscrollBehaviorY: 'contain',
+      }}
+    >
       <Box sx={{ px: { xs: 2, md: 3 }, pt: { xs: 2, md: 2.5 }, pb: 1.5, borderBottom: '1px solid rgba(255,255,255,0.07)', flexShrink: 0 }}>
         <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ xs: 'stretch', sm: 'center' }} gap={1.5}>
           <Box>
@@ -4187,7 +4199,22 @@ export default function OperationsSection({
         </Alert>
       )}
 
-      <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', WebkitOverflowScrolling: 'touch' }}>
+      <Box
+        data-testid="operations-workspace-content"
+        sx={mainWorkspaceView
+          ? {
+              flex: { xs: '0 0 auto', md: 1 },
+              minHeight: { xs: 'auto', md: 0 },
+              overflow: { xs: 'visible', md: 'auto' },
+              WebkitOverflowScrolling: 'touch',
+            }
+          : {
+              flex: 1,
+              minHeight: 0,
+              overflow: 'auto',
+              WebkitOverflowScrolling: 'touch',
+            }}
+      >
         {view === 'imports' ? (
           <CommerceImportsPanel />
         ) : view === 'receiving' ? (

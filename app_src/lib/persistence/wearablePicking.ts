@@ -1,6 +1,8 @@
 import type { QueryResultRow } from 'pg'
 import {
+  resolveWearablePendingConfirmationState,
   WEARABLE_PICK_QUEUE_SCHEMA_VERSION,
+  type WearablePendingConfirmationState,
   type WearablePickOrder,
   type WearablePickQueue,
 } from '@/lib/operations/wearablePicking'
@@ -46,6 +48,16 @@ export type PickerPerformanceMetric = {
   ordersSevenDays: number
   uphToday: number | null
   uphSevenDays: number | null
+}
+
+type WearablePendingConfirmationRow = QueryResultRow & {
+  order_status: string
+  order_row_version: string
+  plan_status: string | null
+  reconciliation_required: boolean
+  reconciliation_global_id: string | null
+  provider_write_count: number | null
+  reconciliation_is_authoritative: boolean
 }
 
 function requiredIdentity(value: string, label: string): string {
@@ -214,6 +226,141 @@ export async function readAssignedWearablePickQueueFromPostgres(input: {
     generatedAt: new Date().toISOString(),
     orders: [...orderById.values()],
   }
+}
+
+/**
+ * Read-only recovery signal for a native confirmation that was blocked by
+ * newer Shopify fulfillment evidence. This deliberately performs no provider
+ * call and no reconciliation command. The client may retire its exact local
+ * command only when the immutable, zero-write reconciliation evidence matches
+ * the same order and pre-reconciliation row version.
+ */
+export async function readWearablePendingConfirmationStateFromPostgres(input: {
+  organizationId: string
+  workerEmail: string
+  orderGlobalId: string
+  expectedRowVersion: number
+  idempotencyKey: string
+}): Promise<WearablePendingConfirmationState> {
+  const organizationId = requiredIdentity(input.organizationId, 'organization')
+  const workerEmail = requiredIdentity(input.workerEmail, 'worker').toLowerCase()
+  const orderGlobalId = requiredIdentity(input.orderGlobalId, 'order')
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
+    throw new Error('Wearable picking order is invalid')
+  }
+  if (!Number.isSafeInteger(input.expectedRowVersion) || input.expectedRowVersion < 0) {
+    throw new Error('Wearable picking order version is invalid')
+  }
+  if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
+    throw new Error('Wearable picking confirmation idempotency key is invalid')
+  }
+
+  const result = await query<WearablePendingConfirmationRow>(
+    `WITH target AS (
+       SELECT orders.id, orders.global_id, orders.status,
+              orders.row_version,
+              plan.id AS plan_id, plan.status AS plan_status
+       FROM operations_orders orders
+       LEFT JOIN LATERAL (
+         SELECT candidate.id, candidate.status
+         FROM operations_fulfillment_plans candidate
+         WHERE candidate.organization_id = orders.organization_id
+           AND candidate.order_id = orders.id
+         ORDER BY candidate.version_number DESC
+         LIMIT 1
+       ) plan ON true
+       WHERE orders.organization_id = $1::uuid
+         AND orders.global_id = $2
+         AND EXISTS (
+           SELECT 1
+           FROM operations_command_receipts confirmation_receipt
+           WHERE confirmation_receipt.organization_id =
+                   orders.organization_id
+             AND confirmation_receipt.command_type =
+                   'confirm_operations_order_picks'
+             AND confirmation_receipt.idempotency_key = $4
+             AND lower(confirmation_receipt.actor_email) = $3
+             AND confirmation_receipt.target_global_id = orders.global_id
+             AND confirmation_receipt.status = 'failed'
+             AND confirmation_receipt.error_code =
+                   'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILIATION_REQUIRED'
+         )
+         AND EXISTS (
+           SELECT 1
+           FROM operations_pick_tasks assigned_pick
+           WHERE assigned_pick.organization_id = orders.organization_id
+             AND assigned_pick.plan_id = plan.id
+             AND lower(assigned_pick.assigned_to) = $3
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM operations_pick_tasks other_pick
+           WHERE other_pick.organization_id = orders.organization_id
+             AND other_pick.plan_id = plan.id
+             AND lower(COALESCE(other_pick.assigned_to, '')) <> $3
+         )
+       LIMIT 1
+     )
+     SELECT target.status AS order_status,
+            target.row_version::text AS order_row_version,
+            target.plan_status,
+            CASE
+              WHEN target.status = 'released'
+                AND target.plan_status = 'released'
+                AND target.plan_id IS NOT NULL
+              THEN operations_shopify_external_fulfillment_reconciliation_required(
+                $1::uuid,
+                target.plan_id
+              )
+              ELSE false
+            END AS reconciliation_required,
+            reconciliation.global_id AS reconciliation_global_id,
+            reconciliation.provider_write_count,
+            COALESCE(
+              reconciliation.provider_write_count = 0
+              AND receipt.status = 'succeeded'
+              AND receipt.command_type =
+                    'reconcile_shopify_external_fulfillment'
+              AND receipt.target_global_id = target.global_id
+              AND receipt.result_payload->>'orderGlobalId' = target.global_id
+              AND receipt.result_payload->>'orderStatus' = 'cancelled'
+              AND receipt.result_payload->>'rowVersion' =
+                    target.row_version::text
+              AND receipt.result_payload->>'reconciliationGlobalId' =
+                    reconciliation.global_id
+              AND receipt.result_payload->>'providerWrites' = '0',
+              false
+            ) AS reconciliation_is_authoritative
+     FROM target
+     LEFT JOIN LATERAL (
+       SELECT candidate.*
+       FROM operations_shopify_external_fulfillment_reconciliations candidate
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.order_id = target.id
+       ORDER BY candidate.reconciled_at DESC, candidate.id DESC
+       LIMIT 2
+     ) reconciliation ON true
+     LEFT JOIN operations_command_receipts receipt
+       ON receipt.organization_id = reconciliation.organization_id
+      AND receipt.id = reconciliation.command_receipt_id
+     ORDER BY reconciliation.reconciled_at DESC, reconciliation.id DESC`,
+    [organizationId, orderGlobalId, workerEmail, idempotencyKey],
+  )
+  return resolveWearablePendingConfirmationState({
+    orderGlobalId,
+    expectedRowVersion: input.expectedRowVersion,
+    candidates: result.rows.map((row) => ({
+      orderStatus: row.order_status,
+      orderRowVersion: Number(row.order_row_version),
+      planStatus: row.plan_status,
+      reconciliationRequired: row.reconciliation_required === true,
+      reconciliationGlobalId: row.reconciliation_global_id,
+      providerWriteCount: row.provider_write_count,
+      reconciliationIsAuthoritative:
+        row.reconciliation_is_authoritative === true,
+    })),
+  })
 }
 
 function uph(units: number, activeSeconds: number): number | null {

@@ -1156,6 +1156,23 @@ test('operations mobile workflow has no page overflow and omits hosted proof gen
   await expect.poll(async () => page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(1)
 })
 
+test('operations mobile workbench scrolls the header and orders as one touch surface', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await installOperationsRoutes(page)
+  await gotoApp(page, '/#operations')
+
+  const workbench = page.getByTestId('operations-workbench')
+  const firstOrder = page.getByRole('button', { name: /PROOF-1042/ })
+  await expect.poll(async () => workbench.evaluate((element) => getComputedStyle(element).overflowY)).toBe('auto')
+  await expect.poll(async () => workbench.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true)
+  await workbench.evaluate((element) => {
+    element.scrollTop = element.scrollHeight
+  })
+  await expect.poll(async () => workbench.evaluate((element) => element.scrollTop)).toBeGreaterThan(0)
+  await expect.poll(async () => isFullyVisibleWithin(firstOrder, workbench)).toBe(true)
+  await expect.poll(async () => page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(1)
+})
+
 test('pack and rate replay runs, persists, and reloads two-pass package evidence', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 900 })
   await installOperationsNavigationRoute(page)

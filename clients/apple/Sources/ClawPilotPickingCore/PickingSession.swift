@@ -7,6 +7,9 @@ public protocol PickCache: Sendable {
     func saveOutbox(_ command: ConfirmPicksCommand) async throws
     func loadOutbox() async throws -> ConfirmPicksCommand?
     func clearOutbox() async throws
+    func saveHandoffOutbox(_ command: PickHandoffCommand) async throws
+    func loadHandoffOutbox() async throws -> PickHandoffCommand?
+    func clearHandoffOutbox() async throws
     func loadProgress() async throws -> PickSessionProgress?
     func saveProgress(_ progress: PickSessionProgress) async throws
     func clearProgress() async throws
@@ -16,6 +19,11 @@ public extension PickCache {
     func loadProgress() async throws -> PickSessionProgress? { nil }
     func saveProgress(_ progress: PickSessionProgress) async throws {}
     func clearProgress() async throws {}
+    func saveHandoffOutbox(_: PickHandoffCommand) async throws {
+        throw PickingContractError.contextMismatch
+    }
+    func loadHandoffOutbox() async throws -> PickHandoffCommand? { nil }
+    func clearHandoffOutbox() async throws {}
 }
 
 public struct PickSessionProgress: Codable, Equatable, Sendable {
@@ -129,6 +137,15 @@ public actor PickingSession {
     public func currentOrder() -> PickOrder? {
         guard let queue, queue.orders.indices.contains(orderIndex) else { return nil }
         return queue.orders[orderIndex]
+    }
+
+    public func queueIdentityMatches(
+        organizationId: String,
+        workerEmail: String
+    ) -> Bool {
+        guard let queue else { return false }
+        return queue.organizationId == organizationId.lowercased()
+            && queue.workerEmail == workerEmail.lowercased()
     }
 
     public func currentScanStage() -> PickScanStage? {
@@ -290,10 +307,16 @@ public actor PickingSession {
     }
 
     public func makeWatchSnapshot(
+        authorizedOrganizationId: String,
+        authorizedWorkerEmail: String,
         now: Date = Date(),
         instructionLanguageCode: String = "en",
         readInstructionOnPhone: Bool = false
     ) -> WatchPickSnapshot? {
+        guard queueIdentityMatches(
+            organizationId: authorizedOrganizationId,
+            workerEmail: authorizedWorkerEmail
+        ) else { return nil }
         guard let order = currentOrder() else { return nil }
         let remaining = order.tasks.filter { !scannedTaskIDs.contains($0.pickTaskGlobalId) }
         func card(_ task: PickTask) -> WatchPickCard {
@@ -400,23 +423,442 @@ public actor PickingSession {
         return command
     }
 
-    public func finishConfirmedOrder() async throws {
+    public func finishConfirmedOrder(_ command: ConfirmPicksCommand) async throws {
         try requireNoWorkflowPersistence()
-        try await cache.clearOutbox()
-        guard let queue else { return }
-        orderIndex += 1
-        scannedTaskIDs = []
-        locationVerifiedTaskIDs = []
-        locationObservations = [:]
-        productObservations = [:]
-        productStartPendingTaskIDs = []
-        countEvidence = [:]
-        stageContextTokens = [:]
-        try await cache.clearProgress()
-        if orderIndex >= queue.orders.count {
-            self.queue = nil
-            orderIndex = 0
+        workflowPersistenceInFlight = true
+        defer { workflowPersistenceInFlight = false }
+        guard let currentQueue = queue,
+              try await cache.loadOutbox() == command else {
+            throw PickingContractError.contextMismatch
         }
+        let matchingOrders = currentQueue.orders.filter {
+            $0.orderGlobalId == command.orderGlobalId
+        }
+        guard matchingOrders.count <= 1 else {
+            throw PickingContractError.contextMismatch
+        }
+        let exactOrderIsPresent = matchingOrders.first?.rowVersion
+            == command.expectedRowVersion
+        let exactCurrentOrderIndex = currentQueue.orders.firstIndex(where: {
+            $0.orderGlobalId == command.orderGlobalId
+                && $0.rowVersion == command.expectedRowVersion
+        })
+        let durableQueue = try await cache.loadQueue()
+        let durableProgress = try await cache.loadProgress()
+        if let durableProgress {
+            guard durableProgress.order.orderGlobalId == command.orderGlobalId,
+                  durableProgress.order.rowVersion == command.expectedRowVersion else {
+                throw PickingContractError.contextMismatch
+            }
+        }
+        let recoveringInterruptedRetirement = matchingOrders.isEmpty
+            && durableQueue == currentQueue
+            && durableProgress == nil
+        guard (exactOrderIsPresent
+                && exactCurrentOrderIndex == orderIndex)
+                || recoveringInterruptedRetirement else {
+            throw PickingContractError.contextMismatch
+        }
+        let remainingOrders = exactCurrentOrderIndex.map {
+            Array(currentQueue.orders.dropFirst($0 + 1))
+        } ?? currentQueue.orders
+        let replacementQueue = try PickQueue(
+            schemaVersion: currentQueue.schemaVersion,
+            organizationId: currentQueue.organizationId,
+            workerEmail: currentQueue.workerEmail,
+            generatedAt: currentQueue.generatedAt,
+            orders: remainingOrders
+        )
+
+        // The successful exact idempotent server response is the authority.
+        // Retire by order identity, persist the replacement queue, and clear
+        // the exact outbox last. A replay after any interrupted write can only
+        // finish this same command and can never advance a second order.
+        try await cache.clearProgress()
+        try await cache.saveQueue(replacementQueue)
+        try await cache.clearOutbox()
+        queue = replacementQueue
+        resetProgress()
+    }
+
+    public func pendingConfirmationContext(
+        for command: ConfirmPicksCommand
+    ) async throws -> PendingConfirmationContext {
+        let durableCommand = try await cache.loadOutbox()
+        guard let queue,
+              let durableCommand,
+              durableCommand == command else {
+            throw PickingContractError.contextMismatch
+        }
+        let matchingOrders = queue.orders.filter {
+            $0.orderGlobalId == command.orderGlobalId
+        }
+        guard matchingOrders.count <= 1,
+              matchingOrders.first.map({
+                  $0.rowVersion == command.expectedRowVersion
+              }) != false else {
+            throw PickingContractError.contextMismatch
+        }
+        let durableQueue = try await cache.loadQueue()
+        let durableProgress = try await cache.loadProgress()
+        let interruptedExactRetirement = matchingOrders.isEmpty
+            && durableQueue == queue
+            && durableProgress == nil
+        return PendingConfirmationContext(
+            organizationId: queue.organizationId,
+            workerEmail: queue.workerEmail,
+            orderGlobalId: command.orderGlobalId,
+            expectedRowVersion: command.expectedRowVersion,
+            containsExactOrder: matchingOrders.count == 1,
+            allowsExactReplay: matchingOrders.count == 1
+                || interruptedExactRetirement
+        )
+    }
+
+    public func retireExternallyReconciledConfirmation(
+        _ command: ConfirmPicksCommand,
+        evidence: ExternallyReconciledConfirmationEvidence,
+        replacementQueue: PickQueue
+    ) async throws {
+        try requireNoWorkflowPersistence()
+        guard let currentQueue = queue,
+              let durableCommand = try await cache.loadOutbox(),
+              durableCommand == command,
+              evidence.orderGlobalId == command.orderGlobalId,
+              evidence.expectedRowVersion == command.expectedRowVersion,
+              currentQueue.organizationId == replacementQueue.organizationId,
+              currentQueue.workerEmail == replacementQueue.workerEmail,
+              !replacementQueue.orders.contains(where: {
+                  $0.orderGlobalId == command.orderGlobalId
+              }) else {
+            throw PickingContractError.contextMismatch
+        }
+
+        let currentOrderMatches = currentOrder().map {
+            $0.orderGlobalId == command.orderGlobalId
+                && $0.rowVersion == command.expectedRowVersion
+        } == true
+        let durableProgress = try await cache.loadProgress()
+        let durableQueue = try await cache.loadQueue()
+        let recoveringBeforeReplacementQueue = durableProgress == nil
+            && durableQueue == currentQueue
+            && currentQueue.orders.contains(where: {
+                $0.orderGlobalId == command.orderGlobalId
+                    && $0.rowVersion == command.expectedRowVersion
+            })
+        let recoveringInterruptedRetirement: Bool
+        if let durableQueue,
+           durableProgress == nil,
+           durableQueue == currentQueue,
+           !durableQueue.orders.contains(where: {
+               $0.orderGlobalId == command.orderGlobalId
+           }) {
+            recoveringInterruptedRetirement = true
+        } else {
+            recoveringInterruptedRetirement = false
+        }
+        guard currentOrderMatches
+                || recoveringBeforeReplacementQueue
+                || recoveringInterruptedRetirement else {
+            throw PickingContractError.contextMismatch
+        }
+
+        // Clear progress first, then install the authoritative replacement
+        // queue, and retire the exact outbox last. Failures before the queue
+        // write leave the old order plus its self-contained outbox recoverable.
+        // A crash after the queue write leaves a detectable partial state:
+        // replacement queue, no progress, and the exact outbox. The same
+        // immutable server evidence can safely finish only that retirement on
+        // restart. A missing queue row alone is never authority.
+        try await cache.clearProgress()
+        try await cache.saveQueue(replacementQueue)
+        try await cache.clearOutbox()
+        queue = replacementQueue
+        resetProgress()
+    }
+
+    public func canRequestActivePickHandoff() -> Bool {
+        !workflowPersistenceInFlight
+            && currentOrder() != nil
+            && localPickingProgressIsEmpty()
+    }
+
+    public func persistPickHandoff(
+        reason: String,
+        blockedConfirmation: ConfirmPicksCommand? = nil
+    ) async throws -> PickHandoffCommand {
+        try requireNoWorkflowPersistence()
+        workflowPersistenceInFlight = true
+        defer { workflowPersistenceInFlight = false }
+        guard let queue,
+              let order = currentOrder() else {
+            throw PickingContractError.contextMismatch
+        }
+        if let existing = try await cache.loadHandoffOutbox() {
+            guard existing.organizationId == queue.organizationId,
+                  existing.workerEmail == queue.workerEmail,
+                  existing.orderGlobalId == order.orderGlobalId,
+                  existing.expectedRowVersion == order.rowVersion,
+                  existing.expectedAssignedTaskCount == order.tasks.count,
+                  existing.blockedConfirmationIdempotencyKey
+                    == blockedConfirmation?.idempotencyKey else {
+                throw PickingContractError.contextMismatch
+            }
+            return existing
+        }
+
+        let durableConfirmation = try await cache.loadOutbox()
+        if let blockedConfirmation {
+            guard durableConfirmation == blockedConfirmation,
+                  blockedConfirmation.orderGlobalId == order.orderGlobalId,
+                  blockedConfirmation.expectedRowVersion == order.rowVersion else {
+                throw PickingContractError.contextMismatch
+            }
+        } else {
+            guard durableConfirmation == nil,
+                  localPickingProgressIsEmpty(),
+                  try await cache.loadProgress() == nil else {
+                throw PickingContractError.contextMismatch
+            }
+        }
+
+        let command = try PickHandoffCommand(
+            queue: queue,
+            order: order,
+            reason: reason,
+            blockedConfirmationIdempotencyKey: blockedConfirmation?.idempotencyKey
+        )
+        try await cache.saveHandoffOutbox(command)
+        return command
+    }
+
+    public func pendingPickHandoffContext(
+        for command: PickHandoffCommand
+    ) async throws -> PendingConfirmationContext {
+        guard let queue,
+              try await cache.loadHandoffOutbox() == command,
+              queue.organizationId == command.organizationId,
+              queue.workerEmail == command.workerEmail else {
+            throw PickingContractError.contextMismatch
+        }
+        let matchingOrders = queue.orders.filter {
+            $0.orderGlobalId == command.orderGlobalId
+        }
+        guard matchingOrders.count <= 1 else {
+            throw PickingContractError.contextMismatch
+        }
+        let containsExactOrder = matchingOrders.first.map {
+            $0.rowVersion == command.expectedRowVersion
+                && $0.tasks.count == command.expectedAssignedTaskCount
+        } == true
+        return PendingConfirmationContext(
+            organizationId: command.organizationId,
+            workerEmail: command.workerEmail,
+            orderGlobalId: command.orderGlobalId,
+            expectedRowVersion: command.expectedRowVersion,
+            containsExactOrder: containsExactOrder,
+            allowsExactReplay: containsExactOrder
+        )
+    }
+
+    public func retireHandedOffOrder(
+        _ command: PickHandoffCommand,
+        evidence: PickHandoffEvidence,
+        replacementQueue: PickQueue
+    ) async throws {
+        try requireNoWorkflowPersistence()
+        guard let currentQueue = queue,
+              try await cache.loadHandoffOutbox() == command,
+              evidence.orderGlobalId == command.orderGlobalId,
+              evidence.previousRowVersion == command.expectedRowVersion,
+              currentQueue.organizationId == command.organizationId,
+              currentQueue.workerEmail == command.workerEmail,
+              replacementQueue.organizationId == command.organizationId,
+              replacementQueue.workerEmail == command.workerEmail else {
+            throw PickingContractError.contextMismatch
+        }
+        let replacementMatches = replacementQueue.orders.filter {
+            $0.orderGlobalId == command.orderGlobalId
+        }
+        guard replacementMatches.count <= 1,
+              replacementMatches.first.map({
+                  $0.rowVersion > evidence.rowVersion
+              }) != false else {
+            throw PickingContractError.contextMismatch
+        }
+
+        let durableQueue = try await cache.loadQueue()
+        let durableProgress = try await cache.loadProgress()
+        let exactOrderIsPresent = currentQueue.orders.contains(where: {
+            $0.orderGlobalId == command.orderGlobalId
+                && $0.rowVersion == command.expectedRowVersion
+                && $0.tasks.count == command.expectedAssignedTaskCount
+        })
+        let recoveringInterruptedRetirement = durableProgress == nil
+            && durableQueue == currentQueue
+            && currentQueue.orders.filter({
+                $0.orderGlobalId == command.orderGlobalId
+            }).count <= 1
+            && currentQueue.orders.first(where: {
+                $0.orderGlobalId == command.orderGlobalId
+            }).map({ $0.rowVersion > evidence.rowVersion }) != false
+        guard exactOrderIsPresent || recoveringInterruptedRetirement else {
+            throw PickingContractError.contextMismatch
+        }
+
+        let durableConfirmation = try await cache.loadOutbox()
+        if let blockedKey = command.blockedConfirmationIdempotencyKey {
+            guard durableConfirmation?.idempotencyKey == blockedKey
+                    || (recoveringInterruptedRetirement && durableConfirmation == nil) else {
+                throw PickingContractError.contextMismatch
+            }
+        } else {
+            guard durableConfirmation == nil,
+                  recoveringInterruptedRetirement || localPickingProgressIsEmpty() else {
+                throw PickingContractError.contextMismatch
+            }
+        }
+
+        // The handoff receipt is the authority; queue omission alone is never
+        // sufficient. Install the exact replacement queue before clearing either
+        // outbox. The handoff outbox is last so a crash can replay the same POST
+        // and complete any interrupted local retirement without a new command.
+        try await cache.clearProgress()
+        try await cache.saveQueue(replacementQueue)
+        if durableConfirmation != nil {
+            try await cache.clearOutbox()
+        }
+        try await cache.clearHandoffOutbox()
+        queue = replacementQueue
+        resetProgress()
+    }
+
+    public func retireRejectedActivePickHandoff(
+        _ command: PickHandoffCommand,
+        replacementQueue: PickQueue
+    ) async throws {
+        try requireNoWorkflowPersistence()
+        guard command.blockedConfirmationIdempotencyKey == nil,
+              try await cache.loadHandoffOutbox() == command,
+              try await cache.loadOutbox() == nil,
+              let currentQueue = queue,
+              currentQueue.organizationId == command.organizationId,
+              currentQueue.workerEmail == command.workerEmail,
+              replacementQueue.organizationId == command.organizationId,
+              replacementQueue.workerEmail == command.workerEmail,
+              localPickingProgressIsEmpty(),
+              try await cache.loadProgress() == nil else {
+            throw PickingContractError.contextMismatch
+        }
+
+        // A structured server rejection proves this command did not commit.
+        // Refresh the signed worker's authoritative queue, then retire only
+        // this active-handoff outbox last. No confirmation record is touched.
+        try await cache.saveQueue(replacementQueue)
+        try await cache.clearHandoffOutbox()
+        queue = replacementQueue
+        resetProgress()
+    }
+
+    public func retireBlockedHandoffAfterExternalReconciliation(
+        _ handoff: PickHandoffCommand,
+        confirmation: ConfirmPicksCommand?,
+        evidence: ExternallyReconciledConfirmationEvidence,
+        replacementQueue: PickQueue
+    ) async throws {
+        try requireNoWorkflowPersistence()
+        guard let blockedConfirmationKey = handoff.blockedConfirmationIdempotencyKey,
+              confirmation.map({
+                  $0.idempotencyKey == blockedConfirmationKey
+                    && $0.orderGlobalId == handoff.orderGlobalId
+                    && $0.expectedRowVersion == handoff.expectedRowVersion
+              }) != false,
+              try await cache.loadHandoffOutbox() == handoff,
+              evidence.orderGlobalId == handoff.orderGlobalId,
+              evidence.expectedRowVersion == handoff.expectedRowVersion,
+              let currentQueue = queue,
+              currentQueue.organizationId == handoff.organizationId,
+              currentQueue.workerEmail == handoff.workerEmail,
+              replacementQueue.organizationId == handoff.organizationId,
+              replacementQueue.workerEmail == handoff.workerEmail else {
+            throw PickingContractError.contextMismatch
+        }
+        let replacementMatches = replacementQueue.orders.filter {
+            $0.orderGlobalId == handoff.orderGlobalId
+        }
+        // A reconciliation receipt says the blocked order was externally
+        // completed/cancelled. The independently fetched queue must therefore
+        // exclude that exact order; accepting a stale mixed-snapshot queue
+        // would reinstall work that the receipt proves is no longer pickable.
+        guard replacementMatches.isEmpty else {
+            throw PickingContractError.contextMismatch
+        }
+
+        let durableQueue = try await cache.loadQueue()
+        let durableProgress = try await cache.loadProgress()
+        let durableConfirmation = try await cache.loadOutbox()
+        let exactOrderIsPresent = currentQueue.orders.contains(where: {
+            $0.orderGlobalId == handoff.orderGlobalId
+                && $0.rowVersion == handoff.expectedRowVersion
+                && $0.tasks.count == handoff.expectedAssignedTaskCount
+        })
+        let recoveringInterruptedRetirement = durableProgress == nil
+            && durableQueue == currentQueue
+            && !currentQueue.orders.contains(where: {
+                $0.orderGlobalId == handoff.orderGlobalId
+            })
+        guard exactOrderIsPresent || recoveringInterruptedRetirement else {
+            throw PickingContractError.contextMismatch
+        }
+        if let durableConfirmation {
+            guard durableConfirmation.idempotencyKey == blockedConfirmationKey,
+                  durableConfirmation.orderGlobalId == handoff.orderGlobalId,
+                  durableConfirmation.expectedRowVersion == handoff.expectedRowVersion,
+                  confirmation == durableConfirmation else {
+                throw PickingContractError.contextMismatch
+            }
+        } else {
+            guard recoveringInterruptedRetirement, confirmation == nil else {
+                throw PickingContractError.contextMismatch
+            }
+        }
+
+        // The external reconciliation proof, not queue omission, is authority.
+        // Keep the handoff outbox until the queue and matching confirmation have
+        // both retired so a crash always resumes this higher-priority command.
+        try await cache.clearProgress()
+        try await cache.saveQueue(replacementQueue)
+        if durableConfirmation != nil {
+            try await cache.clearOutbox()
+        }
+        try await cache.clearHandoffOutbox()
+        queue = replacementQueue
+        resetProgress()
+    }
+
+    public func retireRejectedBlockedPickHandoff(
+        _ handoff: PickHandoffCommand,
+        confirmation: ConfirmPicksCommand
+    ) async throws {
+        try requireNoWorkflowPersistence()
+        guard handoff.blockedConfirmationIdempotencyKey == confirmation.idempotencyKey,
+              handoff.orderGlobalId == confirmation.orderGlobalId,
+              handoff.expectedRowVersion == confirmation.expectedRowVersion,
+              try await cache.loadHandoffOutbox() == handoff,
+              try await cache.loadOutbox() == confirmation,
+              let currentQueue = queue,
+              currentQueue.organizationId == handoff.organizationId,
+              currentQueue.workerEmail == handoff.workerEmail,
+              currentQueue.orders.contains(where: {
+                  $0.orderGlobalId == handoff.orderGlobalId
+                    && $0.rowVersion == handoff.expectedRowVersion
+              }) else {
+            throw PickingContractError.contextMismatch
+        }
+        // A deterministic handoff rejection did not mutate server state. Retire
+        // only the exact handoff request; the original terminal confirmation is
+        // still authoritative and remains protected for manager reconciliation.
+        try await cache.clearHandoffOutbox()
     }
 
     private func resetProgress() {
@@ -428,6 +870,16 @@ public actor PickingSession {
         productStartPendingTaskIDs = []
         countEvidence = [:]
         stageContextTokens = [:]
+    }
+
+    private func localPickingProgressIsEmpty() -> Bool {
+        scannedTaskIDs.isEmpty
+            && locationVerifiedTaskIDs.isEmpty
+            && locationObservations.isEmpty
+            && productObservations.isEmpty
+            && productStartPendingTaskIDs.isEmpty
+            && countEvidence.isEmpty
+            && stageContextTokens.isEmpty
     }
 
     private func progressStateIsValid(

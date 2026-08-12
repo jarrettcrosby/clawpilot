@@ -18,8 +18,8 @@ complete receiving.
 
 `GET /api/operations/picks` returns at most 200 ready tasks whose
 `assigned_to` matches the signed worker. The projection requires Operations
-view, management, and warehouse execution capabilities and is fenced by the
-released order, plan, wave, active warehouse, and active location states.
+view and warehouse execution capabilities and is fenced by the released
+order, plan, wave, active warehouse, and active location states.
 
 The iPhone caches the queue, matches each observed barcode in task sequence,
 speaks the current instruction, and sends a barcode-free current/next
@@ -34,6 +34,73 @@ order row version, released plan/wave, ready tasks, reservations, exceptions,
 and inventory positions, then records its existing domain, audit, command
 receipt, and ledger evidence. Ambiguous results block new work and replay only
 the original command/key.
+
+## Audited picker handoff
+
+A picker who cannot safely finish wholly unpicked work may send
+`request-pick-handoff` to `POST /api/operations` with the order global ID,
+current `expectedRowVersion`, a human reason, and a stable `Idempotency-Key`.
+It also supplies the exact assigned task count from the durable queue; a
+truncated or changed assignment fails before any task is unassigned.
+The signed actor needs Operations view and warehouse execution capabilities.
+The optional `blockedConfirmationIdempotencyKey` binds the request to an exact
+failed `confirm_operations_order_picks` receipt for the same organization,
+actor, and order whose error is
+`OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILIATION_REQUIRED`. Omitting it
+is the deliberate pre-confirmation abandon path.
+
+ClawPilot locks the order, latest plan, wave, tasks, packages, labels, and label
+attempts before accepting the request. The order, plan, and single wave must
+all still be released. Every task must be ready, wholly unpicked, and assigned
+to the requesting actor. Any mixed assignment, non-ready task, picked quantity,
+pick timestamp, started pack, label, or label attempt fails closed. A generic
+handoff also fails after wearable scan evidence is acknowledged. The exact
+blocked-confirmation path is the narrow exception: it requires succeeded scan
+evidence for that organization, order version, and picker because it deliberately
+retains the terminal scan-backed command for manager reconciliation.
+
+Success is deliberately narrow and local:
+
+- every task remains `ready`, but `assigned_to` and `assigned_at` are cleared;
+- the released order row version increments exactly once;
+- one open, high-severity `picker_handoff_requested` exception is created;
+- a terminal blocked-confirmation handoff records the exact scan-evidence and
+  evidence-receipt linkage on the exception;
+- the command receipt result records the exception, old/new row versions, task
+  count, optional blocked confirmation key, and `providerWrites: 0`;
+- domain and audit events retain the actor, reason, receipt, plan, wave, and
+  exact failure code when a blocked confirmation supplied one; and
+- `recommendedAction` tells the manager to review the reason and provider
+  state, then either reassign ready tasks before resolving the exception or use
+  the separate external-fulfillment reconciliation/cancel path when supported.
+
+The command does not call Shopify, Faire, or a carrier. It does not cancel the
+order, plan, wave, tasks, reservations, or packages; change inventory; buy or
+void postage; or notify a customer. Because the tasks are now unassigned, the
+normal signed-worker queue no longer returns the order. The high exception
+keeps pick confirmation manager-blocked until a manager deliberately resolves
+or dismisses it after choosing the proper disposition. Standalone
+`assign-picks` is not composed into the request and must not be treated as
+handoff approval. Resolving the exception alone does not reassign the work.
+
+Clients must persist a handoff command and stable key before sending it. An
+offline request remains queued with the current pick protected; the client
+must not advance or erase scan/count state merely because a refreshed queue
+omits the order. It may retire that local state only from the exact successful
+handoff receipt (including matching blocked confirmation key when present),
+then load the replacement queue. Organization switching must retain the
+outbox and allow recovery only in the organization that owns it.
+
+Shopify state changes follow a separate authority path. The desired policy is
+for pre-release update ingestion to reproject and replan an order once an
+explicit revision-sync path exists; the current generic handoff neither
+performs nor proves that sync. After release, wholly unpicked work becomes a
+manager-visible exception or audited handoff; generic handoff never claims
+Shopify changed and never auto-cancels the order.
+`OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILIATION_REQUIRED` continues to
+use the existing manager reconciliation and its read-only native recheck. Any
+recorded physical pick, pack, or label evidence fails closed for generic
+handoff and requires manager review.
 
 For a multi-unit task, the iPhone/Watch workflow presents a focused count
 prompt after the product scan. The confirm command supplies paired

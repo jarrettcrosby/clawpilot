@@ -23,6 +23,46 @@ func durableOutbox() async throws {
     #expect(try await cache.loadOutbox() == command)
 }
 
+@Test("durable cache preserves the exact picker handoff independently")
+func durablePickHandoffOutbox() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("clawpilot-pick-handoff-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let cache = try DurablePickCache(directory: directory)
+    let task = try PickTask(
+        pickTaskGlobalId: "gpk0000001", sequence: 1,
+        productGlobalId: "gp0000001", productName: "Widget",
+        channelSku: "W-1", barcode: "123", locationCode: "A-1", quantity: 1
+    )
+    let order = try PickOrder(
+        orderGlobalId: "gor0000001", orderNumber: "1001",
+        rowVersion: 2, tasks: [task]
+    )
+    let queue = try PickQueue(
+        schemaVersion: 1,
+        organizationId: "11111111-1111-4111-8111-111111111111",
+        workerEmail: "picker@example.com",
+        generatedAt: Date(),
+        orders: [order]
+    )
+    let confirmation = ConfirmPicksCommand(order: order, idempotencyKey: "blocked-key")
+    let handoff = try PickHandoffCommand(
+        queue: queue,
+        order: order,
+        reason: "Manager review requested.",
+        blockedConfirmationIdempotencyKey: confirmation.idempotencyKey,
+        idempotencyKey: "fixed-handoff-key"
+    )
+    try await cache.saveOutbox(confirmation)
+    try await cache.saveHandoffOutbox(handoff)
+
+    #expect(try await cache.loadOutbox() == confirmation)
+    #expect(try await cache.loadHandoffOutbox() == handoff)
+    try await cache.clearHandoffOutbox()
+    #expect(try await cache.loadHandoffOutbox() == nil)
+    #expect(try await cache.loadOutbox() == confirmation)
+}
+
 @Test("durable outbox preserves offline scan facts until server acknowledgement")
 func durableScanEvidenceOutbox() async throws {
     let directory = FileManager.default.temporaryDirectory

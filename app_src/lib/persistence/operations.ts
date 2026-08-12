@@ -108,6 +108,7 @@ import type {
   OperationsPlanCommandResult,
   OperationsOrderListItem,
   OperationsPackingSlipCommandResult,
+  OperationsPickHandoffResult,
   OperationsOrderStatus,
   OperationsPutawayPlacement,
   OperationsReplenishmentExecutionInput,
@@ -8589,6 +8590,47 @@ async function completedOrderCommandResult(
   }
 }
 
+function completedPickHandoffResult(
+  receipt: Pick<CommandReceiptRow, 'result_payload'>,
+): OperationsPickHandoffResult {
+  const payload = receipt.result_payload
+  if (
+    payload
+    && typeof payload.orderGlobalId === 'string'
+    && payload.orderStatus === 'released'
+    && Number.isSafeInteger(Number(payload.previousRowVersion))
+    && Number.isSafeInteger(Number(payload.rowVersion))
+    && Number(payload.rowVersion) === Number(payload.previousRowVersion) + 1
+    && typeof payload.exceptionGlobalId === 'string'
+    && /^gex(?:[0-9]{7}|[0-9a-v]{12})$/.test(payload.exceptionGlobalId)
+    && Number.isSafeInteger(Number(payload.assignedTaskCount))
+    && Number(payload.assignedTaskCount) > 0
+    && (
+      payload.blockedConfirmationIdempotencyKey === null
+      || typeof payload.blockedConfirmationIdempotencyKey === 'string'
+    )
+    && Number(payload.providerWrites) === 0
+  ) {
+    return {
+      orderGlobalId: payload.orderGlobalId,
+      orderStatus: 'released',
+      previousRowVersion: Number(payload.previousRowVersion),
+      rowVersion: Number(payload.rowVersion),
+      exceptionGlobalId: payload.exceptionGlobalId,
+      assignedTaskCount: Number(payload.assignedTaskCount),
+      blockedConfirmationIdempotencyKey:
+        payload.blockedConfirmationIdempotencyKey as string | null,
+      providerWrites: 0,
+      replayed: true,
+    }
+  }
+  throw new OperationsRequestError(
+    'OPERATIONS_COMMAND_RECEIPT_INVALID',
+    'Completed picker handoff result is unavailable',
+    409,
+  )
+}
+
 function completedExternalFulfillmentReconciliationResult(
   receipt: Pick<CommandReceiptRow, 'result_payload'>,
 ): OperationsExternalFulfillmentReconciliationResult {
@@ -12504,6 +12546,509 @@ export async function assignOperationsOrderPicksFromPostgres(input: {
         },
       }, client)
       await completeCommandReceipt(client, command.receipt.id, order.global_id, result)
+      return result
+    })
+  } catch (error) {
+    await failCommandReceipt(command.receipt.id, error)
+    throw error
+  }
+}
+
+type PickHandoffTaskRow = QueryResultRow & {
+  id: string
+  global_id: string
+  wave_id: string
+  status: string
+  assigned_to: string | null
+  picked_quantity: string | null
+  picked_at: string | Date | null
+}
+
+type BlockedPickConfirmationReceiptRow = QueryResultRow & {
+  id: string
+  target_global_id: string | null
+  actor_email: string
+  status: 'processing' | 'succeeded' | 'failed'
+  error_code: string | null
+  request_hash: string
+}
+
+export async function requestOperationsPickHandoffFromPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  orderGlobalId: string
+  expectedRowVersion: number
+  expectedAssignedTaskCount: number
+  reason: string
+  blockedConfirmationIdempotencyKey?: string
+  idempotencyKey: string
+}): Promise<OperationsPickHandoffResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
+  const orderGlobalId = String(input.orderGlobalId || '').trim()
+  const reason = String(input.reason || '').trim()
+  const blockedConfirmationIdempotencyKey = String(
+    input.blockedConfirmationIdempotencyKey || '',
+  ).trim() || undefined
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  if (!actorEmail) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ACTOR_REQUIRED',
+      'A signed-in user is required',
+      401,
+    )
+  }
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_INVALID',
+      'Order is invalid',
+    )
+  }
+  if (!Number.isSafeInteger(input.expectedRowVersion) || input.expectedRowVersion < 0) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_VERSION_INVALID',
+      'Order version is invalid',
+    )
+  }
+  if (
+    !Number.isSafeInteger(input.expectedAssignedTaskCount)
+    || input.expectedAssignedTaskCount < 1
+    || input.expectedAssignedTaskCount > 200
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_HANDOFF_TASKS_CHANGED',
+      'Assigned task count is invalid',
+    )
+  }
+  if (!reason || reason.length > 500 || /[\u0000-\u001f\u007f]/u.test(reason)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_HANDOFF_REASON_INVALID',
+      'A picker handoff reason is required',
+    )
+  }
+  if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_IDEMPOTENCY_KEY_INVALID',
+      'A valid idempotency key is required',
+    )
+  }
+  if (
+    blockedConfirmationIdempotencyKey
+    && !/^[A-Za-z0-9._:-]{8,200}$/.test(blockedConfirmationIdempotencyKey)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_HANDOFF_CONFIRMATION_INVALID',
+      'Blocked confirmation idempotency key is invalid',
+    )
+  }
+
+  const command = await prepareCommandReceipt({
+    organizationId,
+    commandType: 'request_operations_pick_handoff',
+    idempotencyKey,
+    requestHash: commandRequestHash({
+      orderGlobalId,
+      expectedRowVersion: input.expectedRowVersion,
+      expectedAssignedTaskCount: input.expectedAssignedTaskCount,
+      actorEmail,
+      reason,
+      blockedConfirmationIdempotencyKey:
+        blockedConfirmationIdempotencyKey || null,
+    }),
+    actorEmail,
+    targetGlobalId: orderGlobalId,
+  })
+  if (command.completed) return completedPickHandoffResult(command.receipt)
+
+  try {
+    return await withTransaction(async (client) => {
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:order:${organizationId}:${orderGlobalId}`,
+      )
+      const orderResult = await client.query<OrderIdentityRow>(
+        `SELECT id::text, global_id, status, row_version::text
+         FROM operations_orders
+         WHERE organization_id = $1::uuid AND global_id = $2
+         FOR UPDATE`,
+        [organizationId, orderGlobalId],
+      )
+      const order = orderResult.rows[0]
+      if (!order || order.row_version === undefined) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_NOT_FOUND',
+          'Operations order was not found',
+          404,
+        )
+      }
+      if (Number(order.row_version) !== input.expectedRowVersion) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_VERSION_CONFLICT',
+          'This order changed before the picker handoff was requested. Refresh and try again.',
+          409,
+        )
+      }
+      if (order.status !== 'released') {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_INVALID',
+          'Only a released order with wholly unpicked work can be handed off',
+          409,
+        )
+      }
+
+      const planResult = await client.query<IdRow & { status: string }>(
+        `SELECT id::text, global_id, status
+         FROM operations_fulfillment_plans
+         WHERE organization_id = $1::uuid AND order_id = $2::uuid
+         ORDER BY version_number DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [organizationId, order.id],
+      )
+      const plan = planResult.rows[0]
+      if (!plan || plan.status !== 'released') {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_INVALID',
+          'The released fulfillment plan is unavailable for picker handoff',
+          409,
+        )
+      }
+
+      const waveResult = await client.query<IdRow & { status: string }>(
+        `SELECT wave.id::text, wave.global_id, wave.status
+         FROM operations_waves wave
+         WHERE wave.organization_id = $1::uuid
+           AND wave.id IN (
+             SELECT DISTINCT pick.wave_id
+             FROM operations_pick_tasks pick
+             WHERE pick.organization_id = $1::uuid
+               AND pick.plan_id = $2::uuid
+           )
+         ORDER BY wave.id
+         FOR UPDATE`,
+        [organizationId, plan.id],
+      )
+      if (waveResult.rows.length !== 1 || waveResult.rows[0].status !== 'released') {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_INVALID',
+          'Exactly one released warehouse wave is required for picker handoff',
+          409,
+        )
+      }
+      const wave = waveResult.rows[0]
+
+      const pickResult = await client.query<PickHandoffTaskRow>(
+        `SELECT pick.id::text, pick.global_id,
+                pick.wave_id::text, pick.status,
+                lower(pick.assigned_to) AS assigned_to,
+                pick.picked_quantity::text, pick.picked_at
+         FROM operations_pick_tasks pick
+         WHERE pick.organization_id = $1::uuid
+           AND pick.plan_id = $2::uuid
+         ORDER BY pick.sequence_number, pick.id
+         FOR UPDATE`,
+        [organizationId, plan.id],
+      )
+      if (pickResult.rows.length < 1) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_INVALID',
+          'No assigned pick tasks are available for handoff',
+          409,
+        )
+      }
+      if (pickResult.rows.length !== input.expectedAssignedTaskCount) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_TASKS_CHANGED',
+          'Assigned pick tasks changed before handoff could be recorded',
+          409,
+        )
+      }
+      if (pickResult.rows.some((pick) => (
+        pick.wave_id !== wave.id
+        || pick.status !== 'ready'
+        || Number(pick.picked_quantity || 0) !== 0
+        || pick.picked_at !== null
+      ))) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_ALREADY_STARTED',
+          'Picker handoff is blocked after any task has started or recorded a picked quantity',
+          409,
+        )
+      }
+      if (pickResult.rows.some((pick) => pick.assigned_to !== actorEmail)) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_ACTOR_MISMATCH',
+          'Every pick task must be assigned to the signed-in picker requesting handoff',
+          409,
+        )
+      }
+
+      const acknowledgedScanResult = await client.query<{
+        id: string
+        command_receipt_id: string
+      }>(
+        `SELECT evidence.id::text, receipt.id::text AS command_receipt_id
+         FROM operations_wearable_pick_scan_evidence evidence
+         JOIN operations_command_receipts receipt
+           ON receipt.organization_id = evidence.organization_id
+          AND receipt.id = evidence.command_receipt_id
+         WHERE evidence.organization_id = $1::uuid
+           AND evidence.order_id = $2::uuid
+           AND evidence.order_row_version = $3::bigint
+           AND lower(evidence.recorded_by) = $4
+           AND receipt.command_type = 'record_wearable_pick_scan_evidence'
+           AND receipt.status = 'succeeded'
+           AND lower(receipt.actor_email) = $4
+           AND receipt.target_global_id = $5
+         ORDER BY evidence.server_observed_at, evidence.id
+         LIMIT 1
+         FOR SHARE OF evidence, receipt`,
+        [
+          organizationId,
+          order.id,
+          input.expectedRowVersion,
+          actorEmail,
+          orderGlobalId,
+        ],
+      )
+      const acknowledgedScan = acknowledgedScanResult.rows[0]
+      if (blockedConfirmationIdempotencyKey && !acknowledgedScan) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_CONFIRMATION_INVALID',
+          'Blocked confirmation handoff requires exact acknowledged wearable scan evidence for this picker, order, and version',
+          409,
+        )
+      }
+      if (!blockedConfirmationIdempotencyKey && acknowledgedScan) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_ALREADY_STARTED',
+          'Picker handoff is blocked after wearable scan evidence was acknowledged',
+          409,
+        )
+      }
+
+      const packageResult = await client.query<QueryResultRow & {
+        id: string
+        status: string
+        packed_at: string | Date | null
+      }>(
+        `SELECT package.id::text, package.status, package.packed_at
+         FROM operations_packages package
+         WHERE package.organization_id = $1::uuid
+           AND package.plan_id = $2::uuid
+         ORDER BY package.id
+         FOR UPDATE`,
+        [organizationId, plan.id],
+      )
+      if (packageResult.rows.some((item) => (
+        item.status !== 'planned' || item.packed_at !== null
+      ))) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_ALREADY_STARTED',
+          'Picker handoff is blocked after packing has started',
+          409,
+        )
+      }
+      const labelResult = await client.query<{ id: string }>(
+        `SELECT label.id::text
+         FROM operations_labels label
+         JOIN operations_packages package
+           ON package.organization_id = label.organization_id
+          AND package.id = label.package_id
+         WHERE label.organization_id = $1::uuid
+           AND package.plan_id = $2::uuid
+         ORDER BY label.id
+         FOR UPDATE OF label`,
+        [organizationId, plan.id],
+      )
+      const labelAttemptResult = await client.query<{ id: string }>(
+        `SELECT attempt.id::text
+         FROM operations_label_attempts attempt
+         WHERE attempt.organization_id = $1::uuid
+           AND attempt.order_id = $2::uuid
+         ORDER BY attempt.id
+         FOR UPDATE`,
+        [organizationId, order.id],
+      )
+      if (labelResult.rows.length > 0 || labelAttemptResult.rows.length > 0) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_ALREADY_STARTED',
+          'Picker handoff is blocked after label preparation has started',
+          409,
+        )
+      }
+
+      let blockedConfirmationErrorCode: string | null = null
+      let blockedConfirmationRequestHash: string | null = null
+      if (blockedConfirmationIdempotencyKey) {
+        const blockedReceiptResult = await client.query<
+          BlockedPickConfirmationReceiptRow
+        >(
+          `SELECT id::text, target_global_id, lower(actor_email) AS actor_email,
+                  status, error_code, request_hash
+           FROM operations_command_receipts
+           WHERE organization_id = $1::uuid
+             AND command_type = 'confirm_operations_order_picks'
+             AND idempotency_key = $2
+           LIMIT 1
+           FOR UPDATE`,
+          [organizationId, blockedConfirmationIdempotencyKey],
+        )
+        const blockedReceipt = blockedReceiptResult.rows[0]
+        if (
+          !blockedReceipt
+          || blockedReceipt.target_global_id !== orderGlobalId
+          || blockedReceipt.actor_email !== actorEmail
+          || blockedReceipt.status !== 'failed'
+          || blockedReceipt.error_code
+            !== 'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILIATION_REQUIRED'
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_PICK_HANDOFF_CONFIRMATION_INVALID',
+            'Blocked confirmation must be the exact Shopify reconciliation conflict for this picker and order',
+            409,
+          )
+        }
+        blockedConfirmationErrorCode = blockedReceipt.error_code
+        blockedConfirmationRequestHash = blockedReceipt.request_hash
+      }
+
+      const taskIds = pickResult.rows.map((pick) => pick.id)
+      const unassigned = await client.query(
+        `UPDATE operations_pick_tasks
+         SET assigned_to = NULL, assigned_at = NULL, updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = ANY($2::uuid[])
+           AND status = 'ready'
+           AND COALESCE(picked_quantity, 0) = 0
+           AND picked_at IS NULL
+           AND lower(assigned_to) = $3
+         RETURNING id`,
+        [organizationId, taskIds, actorEmail],
+      )
+      if (Number(unassigned.rowCount || 0) !== taskIds.length) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_TASKS_CHANGED',
+          'Pick tasks changed before handoff could be recorded',
+          409,
+        )
+      }
+
+      const updatedOrder = await client.query<OrderIdentityRow>(
+        `UPDATE operations_orders
+         SET updated_by = $4, updated_at = now(), row_version = row_version + 1
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND status = 'released'
+           AND row_version = $3
+         RETURNING id::text, global_id, status, row_version::text`,
+        [organizationId, order.id, input.expectedRowVersion, actorEmail],
+      )
+      const handedOffOrder = updatedOrder.rows[0]
+      if (!handedOffOrder || handedOffOrder.row_version === undefined) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_VERSION_CONFLICT',
+          'This order changed before the picker handoff was saved',
+          409,
+        )
+      }
+
+      const rowVersion = Number(handedOffOrder.row_version)
+      const recommendedAction = [
+        'Review the picker reason and current provider state.',
+        'Either reassign every ready task to an eligible picker, then resolve this exception,',
+        'or use the separate external-fulfillment reconciliation/cancel path when its evidence supports that disposition.',
+        'This handoff did not modify Shopify, and resolving the exception alone does not reassign work.',
+      ].join(' ')
+      const exceptionDetails = {
+        commandReceiptId: command.receipt.id,
+        orderGlobalId,
+        actorEmail,
+        assignedTaskCount: taskIds.length,
+        reason,
+        previousRowVersion: input.expectedRowVersion,
+        rowVersion,
+        blockedConfirmationIdempotencyKey:
+          blockedConfirmationIdempotencyKey || null,
+        blockedConfirmationErrorCode,
+        blockedConfirmationRequestHash,
+        blockedConfirmationScanEvidenceId: acknowledgedScan?.id || null,
+        blockedConfirmationScanEvidenceReceiptId:
+          acknowledgedScan?.command_receipt_id || null,
+        recommendedAction,
+        providerWrites: 0,
+      }
+      const exceptionResult = await client.query<IdRow>(
+        `INSERT INTO operations_exceptions (
+           organization_id, order_id, exception_type, severity, status,
+           title, details, assigned_to
+         ) VALUES (
+           $1::uuid, $2::uuid, 'picker_handoff_requested', 'high', 'open',
+           $3, $4::jsonb, NULL
+         )
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          order.id,
+          `Picker handoff requested for ${order.global_id}`,
+          JSON.stringify(exceptionDetails),
+        ],
+      )
+      const exception = exceptionResult.rows[0]
+      if (!exception) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_EXCEPTION_FAILED',
+          'Picker handoff exception could not be retained',
+          500,
+        )
+      }
+
+      const eventPayload = {
+        exceptionGlobalId: exception.global_id,
+        planGlobalId: plan.global_id,
+        waveGlobalId: wave.global_id,
+        ...exceptionDetails,
+      }
+      await appendDomainEvent(client, {
+        organizationId,
+        aggregateType: 'operations.order',
+        aggregateId: order.id,
+        aggregateGlobalId: order.global_id,
+        eventType: 'operations.pick.handoff_requested',
+        actorEmail,
+        correlationId: command.receipt.correlation_id,
+        idempotencyKey: `${order.global_id}:pick-handoff:${command.receipt.id}`,
+        payload: eventPayload,
+      })
+      await recordAuditEvent({
+        actor: actorEmail,
+        eventType: 'operations.order.pick_handoff_requested',
+        aggregateType: 'operations.order',
+        aggregateId: order.global_id,
+        subject: `Picker handoff requested for ${order.global_id}`,
+        organizationId,
+        eventKey: `operations:pick-handoff:${command.receipt.id}`,
+        payload: eventPayload,
+      }, client)
+
+      const result: OperationsPickHandoffResult = {
+        orderGlobalId: handedOffOrder.global_id,
+        orderStatus: 'released',
+        previousRowVersion: input.expectedRowVersion,
+        rowVersion,
+        exceptionGlobalId: exception.global_id,
+        assignedTaskCount: taskIds.length,
+        blockedConfirmationIdempotencyKey:
+          blockedConfirmationIdempotencyKey || null,
+        providerWrites: 0,
+        replayed: false,
+      }
+      await completeCommandReceipt(
+        client,
+        command.receipt.id,
+        order.global_id,
+        result,
+      )
       return result
     })
   } catch (error) {

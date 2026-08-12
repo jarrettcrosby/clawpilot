@@ -357,6 +357,20 @@ public struct WatchPickSnapshot: Codable, Equatable, Sendable {
     public let readInstructionOnPhone: Bool?
 }
 
+public enum WatchInstructionPlaybackTarget: Equatable, Sendable {
+    case appleWatch
+    case pairedIPhone
+
+    public static func resolve(
+        prefersPairedIPhone: Bool,
+        pairedIPhoneIsReachable: Bool
+    ) -> Self {
+        prefersPairedIPhone && pairedIPhoneIsReachable
+            ? .pairedIPhone
+            : .appleWatch
+    }
+}
+
 public enum WatchPickAction: String, Codable, Equatable, Sendable {
     case requestMetaScan = "request_meta_scan"
     case readInstruction = "read_instruction"
@@ -458,6 +472,62 @@ public enum WatchConnectivityPayloadBudget {
     }
 }
 
+public struct ExternallyReconciledConfirmationEvidence: Equatable, Sendable {
+    public let orderGlobalId: String
+    public let expectedRowVersion: Int
+    public let reconciliationGlobalId: String
+    public let providerWrites: Int
+
+    public init(
+        orderGlobalId: String,
+        expectedRowVersion: Int,
+        reconciliationGlobalId: String,
+        providerWrites: Int
+    ) throws {
+        guard orderGlobalId.range(
+            of: #"^gor(?:[0-9]{7}|[0-9a-v]{12})$"#,
+            options: .regularExpression
+        ) != nil,
+        expectedRowVersion >= 0,
+        reconciliationGlobalId.range(
+            of: #"^gsfr(?:[0-9]{7}|[0-9a-v]{12})$"#,
+            options: .regularExpression
+        ) != nil,
+        providerWrites == 0 else {
+            throw PickingContractError.contextMismatch
+        }
+        self.orderGlobalId = orderGlobalId
+        self.expectedRowVersion = expectedRowVersion
+        self.reconciliationGlobalId = reconciliationGlobalId
+        self.providerWrites = providerWrites
+    }
+}
+
+public struct PendingConfirmationContext: Equatable, Sendable {
+    public let organizationId: String
+    public let workerEmail: String
+    public let orderGlobalId: String
+    public let expectedRowVersion: Int
+    public let containsExactOrder: Bool
+    public let allowsExactReplay: Bool
+
+    public init(
+        organizationId: String,
+        workerEmail: String,
+        orderGlobalId: String,
+        expectedRowVersion: Int,
+        containsExactOrder: Bool,
+        allowsExactReplay: Bool? = nil
+    ) {
+        self.organizationId = organizationId
+        self.workerEmail = workerEmail.lowercased()
+        self.orderGlobalId = orderGlobalId
+        self.expectedRowVersion = expectedRowVersion
+        self.containsExactOrder = containsExactOrder
+        self.allowsExactReplay = allowsExactReplay ?? containsExactOrder
+    }
+}
+
 public struct ConfirmPicksCommand: Codable, Equatable, Sendable {
     public let action: String
     public let orderGlobalId: String
@@ -529,5 +599,150 @@ public struct ConfirmPicksCommand: Codable, Equatable, Sendable {
         guard (countEvidenceIdempotencyKey == nil) == (countEvidence == nil) else {
             throw PickingContractError.contextMismatch
         }
+    }
+}
+
+public struct PickHandoffCommand: Codable, Equatable, Sendable {
+    public let action: String
+    public let organizationId: String
+    public let workerEmail: String
+    public let orderGlobalId: String
+    public let expectedRowVersion: Int
+    public let expectedAssignedTaskCount: Int
+    public let reason: String
+    public let blockedConfirmationIdempotencyKey: String?
+    public let idempotencyKey: String
+
+    public init(
+        queue: PickQueue,
+        order: PickOrder,
+        reason: String,
+        blockedConfirmationIdempotencyKey: String? = nil,
+        idempotencyKey: String = UUID().uuidString.lowercased()
+    ) throws {
+        let normalizedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard queue.orders.contains(order),
+              !normalizedReason.isEmpty,
+              normalizedReason.utf8.count <= 500,
+              normalizedReason.unicodeScalars.allSatisfy({
+                  $0.value >= 0x20 && $0.value != 0x7f
+              }),
+              blockedConfirmationIdempotencyKey.map({
+                  $0.range(
+                      of: #"^[A-Za-z0-9._:-]{8,200}$"#,
+                      options: .regularExpression
+                  ) != nil
+              }) != false,
+              idempotencyKey.range(
+                  of: #"^[A-Za-z0-9._:-]{8,185}$"#,
+                  options: .regularExpression
+              ) != nil else {
+            throw PickingContractError.contextMismatch
+        }
+        action = "request-pick-handoff"
+        organizationId = queue.organizationId
+        workerEmail = queue.workerEmail
+        orderGlobalId = order.orderGlobalId
+        expectedRowVersion = order.rowVersion
+        expectedAssignedTaskCount = order.tasks.count
+        self.reason = normalizedReason
+        self.blockedConfirmationIdempotencyKey = blockedConfirmationIdempotencyKey
+        self.idempotencyKey = "picker-handoff:\(idempotencyKey)"
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case action, organizationId, workerEmail, orderGlobalId
+        case expectedRowVersion, expectedAssignedTaskCount, reason
+        case blockedConfirmationIdempotencyKey, idempotencyKey
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        action = try values.decode(String.self, forKey: .action)
+        organizationId = try values.decode(String.self, forKey: .organizationId).lowercased()
+        workerEmail = try values.decode(String.self, forKey: .workerEmail).lowercased()
+        orderGlobalId = try values.decode(String.self, forKey: .orderGlobalId)
+        expectedRowVersion = try values.decode(Int.self, forKey: .expectedRowVersion)
+        expectedAssignedTaskCount = try values.decode(
+            Int.self,
+            forKey: .expectedAssignedTaskCount
+        )
+        reason = try values.decode(String.self, forKey: .reason)
+        blockedConfirmationIdempotencyKey = try values.decodeIfPresent(
+            String.self,
+            forKey: .blockedConfirmationIdempotencyKey
+        )
+        idempotencyKey = try values.decode(String.self, forKey: .idempotencyKey)
+        guard action == "request-pick-handoff",
+              UUID(uuidString: organizationId) != nil,
+              workerEmail.contains("@"),
+              orderGlobalId.range(
+                  of: #"^gor(?:[0-9]{7}|[0-9a-v]{12})$"#,
+                  options: .regularExpression
+              ) != nil,
+              expectedRowVersion >= 0,
+              expectedAssignedTaskCount > 0,
+              !reason.isEmpty,
+              reason == reason.trimmingCharacters(in: .whitespacesAndNewlines),
+              reason.utf8.count <= 500,
+              reason.unicodeScalars.allSatisfy({
+                  $0.value >= 0x20 && $0.value != 0x7f
+              }),
+              blockedConfirmationIdempotencyKey.map({
+                  $0.range(
+                      of: #"^[A-Za-z0-9._:-]{8,200}$"#,
+                      options: .regularExpression
+                  ) != nil
+              }) != false,
+              idempotencyKey.range(
+                  of: #"^picker-handoff:[A-Za-z0-9._:-]{8,185}$"#,
+                  options: .regularExpression
+              ) != nil else {
+            throw PickingContractError.contextMismatch
+        }
+    }
+}
+
+public struct PickHandoffEvidence: Equatable, Sendable {
+    public let orderGlobalId: String
+    public let previousRowVersion: Int
+    public let rowVersion: Int
+    public let exceptionGlobalId: String
+    public let assignedTaskCount: Int
+    public let blockedConfirmationIdempotencyKey: String?
+    public let providerWrites: Int
+
+    public init(
+        command: PickHandoffCommand,
+        orderGlobalId: String,
+        orderStatus: String,
+        previousRowVersion: Int,
+        rowVersion: Int,
+        exceptionGlobalId: String,
+        assignedTaskCount: Int,
+        blockedConfirmationIdempotencyKey: String?,
+        providerWrites: Int
+    ) throws {
+        guard orderGlobalId == command.orderGlobalId,
+              orderStatus == "released",
+              previousRowVersion == command.expectedRowVersion,
+              rowVersion == command.expectedRowVersion + 1,
+              exceptionGlobalId.range(
+                  of: #"^gex(?:[0-9]{7}|[0-9a-v]{12})$"#,
+                  options: .regularExpression
+              ) != nil,
+              assignedTaskCount == command.expectedAssignedTaskCount,
+              blockedConfirmationIdempotencyKey
+                == command.blockedConfirmationIdempotencyKey,
+              providerWrites == 0 else {
+            throw PickingContractError.contextMismatch
+        }
+        self.orderGlobalId = orderGlobalId
+        self.previousRowVersion = previousRowVersion
+        self.rowVersion = rowVersion
+        self.exceptionGlobalId = exceptionGlobalId
+        self.assignedTaskCount = assignedTaskCount
+        self.blockedConfirmationIdempotencyKey = blockedConfirmationIdempotencyKey
+        self.providerWrites = providerWrites
     }
 }

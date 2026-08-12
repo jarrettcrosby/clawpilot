@@ -4,7 +4,10 @@ import {
   operationsCapabilities,
 } from '@/lib/operations/authorization'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
-import { readAssignedWearablePickQueueFromPostgres } from '@/lib/persistence/wearablePicking'
+import {
+  readAssignedWearablePickQueueFromPostgres,
+  readWearablePendingConfirmationStateFromPostgres,
+} from '@/lib/persistence/wearablePicking'
 import { appPublicUrl } from '@/lib/publicUrl'
 import { requireRequestUser } from '@/lib/requestUser'
 
@@ -37,12 +40,49 @@ export async function GET(req: NextRequest) {
         error: 'Wearable picking requires Operations view and warehouse execution permission',
       }, 403)
     }
+    const pendingOrderGlobalId = String(
+      req.nextUrl.searchParams.get('pendingConfirmationOrderGlobalId') || '',
+    ).trim()
+    const pendingRowVersionValue = String(
+      req.nextUrl.searchParams.get('pendingConfirmationExpectedRowVersion') || '',
+    ).trim()
+    const pendingIdempotencyKey = String(
+      req.nextUrl.searchParams.get('pendingConfirmationIdempotencyKey') || '',
+    ).trim()
+    const hasPendingConfirmationQuery = Boolean(
+      pendingOrderGlobalId || pendingRowVersionValue || pendingIdempotencyKey,
+    )
+    if (
+      hasPendingConfirmationQuery
+      && (
+        !/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(pendingOrderGlobalId)
+        || !/^(?:0|[1-9][0-9]{0,14})$/.test(pendingRowVersionValue)
+        || !Number.isSafeInteger(Number(pendingRowVersionValue))
+        || !/^[A-Za-z0-9._:-]{8,200}$/.test(pendingIdempotencyKey)
+      )
+    ) {
+      return json({
+        ok: false,
+        code: 'OPERATIONS_PENDING_CONFIRMATION_QUERY_INVALID',
+        error: 'Pending confirmation order and row version must be supplied together',
+      }, 400)
+    }
+
     const queue = await readAssignedWearablePickQueueFromPostgres({
       organizationId: activeOperationsOrganizationId(actor),
       workerEmail: actor.email,
       publicOrigin: appPublicUrl(),
     })
-    return json({ ok: true, capabilities, queue })
+    const pendingConfirmation = hasPendingConfirmationQuery
+      ? await readWearablePendingConfirmationStateFromPostgres({
+          organizationId: activeOperationsOrganizationId(actor),
+          workerEmail: actor.email,
+          orderGlobalId: pendingOrderGlobalId,
+          expectedRowVersion: Number(pendingRowVersionValue),
+          idempotencyKey: pendingIdempotencyKey,
+        })
+      : null
+    return json({ ok: true, capabilities, queue, pendingConfirmation })
   } catch (error) {
     if (error instanceof Error && error.message === 'Unauthorized') {
       return json({ ok: false, code: 'UNAUTHORIZED', error: 'Unauthorized' }, 401)

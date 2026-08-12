@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
+import { resolveWearablePendingConfirmationState } from '../../lib/operations/wearablePicking.ts'
 
 const root = new URL('../../', import.meta.url)
 const read = (path: string) => readFileSync(new URL(path, root), 'utf8')
@@ -20,6 +21,40 @@ test('wearable queue is signed-worker scoped and read only', () => {
   assert.match(persistence, /publicCrmProductImageUrl/)
   assert.doesNotMatch(persistence, /line\.barcode_snapshot/)
   assert.doesNotMatch(persistence, /\b(?:INSERT|UPDATE|DELETE)\b/)
+})
+
+test('pending confirmation recovery rejects duplicate evidence and requires exact zero-write reconciliation', () => {
+  const exact = {
+    orderStatus: 'cancelled',
+    orderRowVersion: 8,
+    planStatus: 'cancelled',
+    reconciliationRequired: false,
+    reconciliationGlobalId: 'gsfr0000001',
+    providerWriteCount: 0,
+    reconciliationIsAuthoritative: true,
+  }
+  const resolved = resolveWearablePendingConfirmationState({
+    orderGlobalId: 'gor0000001',
+    expectedRowVersion: 7,
+    candidates: [exact],
+  })
+  assert.equal(resolved.state, 'reconciled_external_fulfillment')
+  assert.equal(resolved.providerWrites, 0)
+
+  const duplicates = resolveWearablePendingConfirmationState({
+    orderGlobalId: 'gor0000001',
+    expectedRowVersion: 7,
+    candidates: [exact, { ...exact, reconciliationGlobalId: 'gsfr0000002' }],
+  })
+  assert.equal(duplicates.state, 'unresolved')
+  assert.equal(duplicates.reconciliationGlobalId, null)
+
+  const providerWrite = resolveWearablePendingConfirmationState({
+    orderGlobalId: 'gor0000001',
+    expectedRowVersion: 7,
+    candidates: [{ ...exact, providerWriteCount: 1 }],
+  })
+  assert.equal(providerWrite.state, 'unresolved')
 })
 
 test('location-first scanning is an explicit audited per-warehouse policy that defaults off', () => {
@@ -282,6 +317,88 @@ test('Phase 1 confirmation reuses the audited Operations command', () => {
   assert.match(persistence, /operations\.order\.picks_confirmed/)
 })
 
+test('terminal Shopify confirmation conflicts require manager action and read-only exact recovery', () => {
+  const picksRoute = read('app/api/operations/picks/route.ts')
+  const wearablePersistence = read('lib/persistence/wearablePicking.ts')
+  const adapter = read('../clients/apple/Sources/ClawPilotPickingApple/AppleAdapters.swift')
+  const session = read('../clients/apple/Sources/ClawPilotPickingCore/PickingSession.swift')
+  const phone = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+  const dashboard = read('../clients/apple/Apps/iPhone/PickingDashboardView.swift')
+
+  assert.match(picksRoute, /pendingConfirmationOrderGlobalId/)
+  assert.match(picksRoute, /pendingConfirmationExpectedRowVersion/)
+  assert.match(picksRoute, /pendingConfirmationIdempotencyKey/)
+  assert.match(picksRoute, /readWearablePendingConfirmationStateFromPostgres/)
+  assert.doesNotMatch(picksRoute, /reconcileShopifyExternalFulfillmentFromPostgres/)
+  assert.match(wearablePersistence, /provider_write_count = 0/)
+  assert.match(wearablePersistence, /confirmation_receipt\.idempotency_key = \$4/)
+  assert.match(wearablePersistence, /lower\(confirmation_receipt\.actor_email\) = \$3/)
+  assert.match(wearablePersistence, /confirmation_receipt\.target_global_id = orders\.global_id/)
+  assert.match(wearablePersistence, /confirmation_receipt\.status = 'failed'/)
+  assert.match(wearablePersistence, /confirmation_receipt\.error_code =\s*'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILIATION_REQUIRED'/)
+  assert.match(wearablePersistence, /lower\(assigned_pick\.assigned_to\) = \$3/)
+  assert.match(wearablePersistence, /lower\(COALESCE\(other_pick\.assigned_to, ''\)\) <> \$3/)
+  assert.match(wearablePersistence, /receipt\.command_type =\s*'reconcile_shopify_external_fulfillment'/)
+  assert.match(wearablePersistence, /ORDER BY candidate\.reconciled_at DESC, candidate\.id DESC\s*LIMIT 2/)
+  assert.match(adapter, /if !\(200\.\.<300\)\.contains\(http\.statusCode\)[\s\S]*PickingAPIError\.rejected\(code: code, message: message\)/)
+  assert.match(adapter, /func recheckPendingConfirmation/)
+  assert.match(session, /durableCommand == command/)
+  assert.match(session, /evidence\.orderGlobalId == command\.orderGlobalId/)
+  assert.match(session, /public func finishConfirmedOrder\(_ command: ConfirmPicksCommand\)/)
+  assert.match(session, /try await cache\.loadOutbox\(\) == command[\s\S]*try await cache\.saveQueue\(replacementQueue\)[\s\S]*try await cache\.clearOutbox\(\)/)
+  assert.match(session, /try await cache\.clearProgress\(\)[\s\S]*try await cache\.saveQueue\(replacementQueue\)[\s\S]*try await cache\.clearOutbox\(\)/)
+  assert.match(phone, /OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILIATION_REQUIRED/)
+  assert.match(phone, /recheckPendingConfirmationAfterManagerAction/)
+  assert.doesNotMatch(phone, /try\? await cache\.loadOutbox/)
+  assert.match(phone, /func protectUnreadablePendingConfirmation[\s\S]*hasPendingConfirmation = true/)
+  assert.match(phone, /resumeDurableConfirmationIfNeeded\(\)[\s\S]*recheckPendingConfirmation\(pending\)[\s\S]*Prior confirmation remains pending/)
+  assert.match(phone, /func verifyCode\(\)[\s\S]*sessionProfile = try await api\.fetchSessionProfile\(\)[\s\S]*isRestoringSession = true[\s\S]*isAuthenticated = true[\s\S]*resumeDurableConfirmationIfNeeded\(\)/)
+  assert.match(phone, /func signInWithGoogle\(\)[\s\S]*sessionProfile = try await api\.fetchSessionProfile\(\)[\s\S]*isRestoringSession = true[\s\S]*isAuthenticated = true[\s\S]*resumeDurableConfirmationIfNeeded\(\)/)
+  assert.match(phone, /var canSwitchWorkspace:[\s\S]*!isRestoringSession[\s\S]*!isRecheckingPendingConfirmation[\s\S]*!isConfirmingOrder[\s\S]*!isRequestingPickHandoff[\s\S]*!hasPendingConfirmation/)
+  assert.match(phone, /func retryPendingConfirmation\(\) async \{[\s\S]*guard !isConfirmingOrder else \{ return \}[\s\S]*isConfirmingOrder = true[\s\S]*finishConfirmedOrder\(pending\)/)
+  assert.match(dashboard, /Manager reconciliation required/)
+  assert.match(dashboard, /Refresh after manager reconciliation/)
+  assert.match(dashboard, /does not change Shopify or repeat a provider action/)
+  assert.match(dashboard, /Saved confirmation protected/)
+  assert.doesNotMatch(dashboard, /Abandon blocked pick|Clear blocked pick/)
+})
+
+test('native picker handoff is durable, identity fenced, deliberate, and crash recoverable', () => {
+  const route = read('app/api/operations/route.ts')
+  const models = read('../clients/apple/Sources/ClawPilotPickingCore/PickingModels.swift')
+  const session = read('../clients/apple/Sources/ClawPilotPickingCore/PickingSession.swift')
+  const adapter = read('../clients/apple/Sources/ClawPilotPickingApple/AppleAdapters.swift')
+  const phone = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+  const dashboard = read('../clients/apple/Apps/iPhone/PickingDashboardView.swift')
+
+  assert.match(route, /action === 'request-pick-handoff'/)
+  assert.match(route, /blockedConfirmationIdempotencyKey/)
+  assert.match(models, /public struct PickHandoffCommand: Codable, Equatable, Sendable/)
+  assert.match(models, /expectedAssignedTaskCount/)
+  assert.match(models, /blockedConfirmationIdempotencyKey/)
+  assert.match(session, /saveHandoffOutbox\(_ command: PickHandoffCommand\)/)
+  assert.match(session, /persistPickHandoff/)
+  assert.match(session, /localPickingProgressIsEmpty\(\)/)
+  assert.match(session, /try await cache\.saveQueue\(replacementQueue\)[\s\S]*try await cache\.clearHandoffOutbox\(\)/)
+  assert.match(session, /retireBlockedHandoffAfterExternalReconciliation/)
+  assert.match(adapter, /func requestPickHandoff/)
+  assert.match(adapter, /request\.setValue\(command\.idempotencyKey, forHTTPHeaderField: "Idempotency-Key"\)/)
+  assert.match(adapter, /expectedAssignedTaskCount: command\.expectedAssignedTaskCount/)
+  assert.match(phone, /resumeDurablePickHandoffIfNeeded\(\)[\s\S]*resumeDurableConfirmationIfNeeded\(\)/)
+  assert.match(phone, /pendingPickHandoffRecoveryWorkspaceId/)
+  assert.match(phone, /isPendingHandoffRecoverySwitch/)
+  assert.match(phone, /showPhoneScanner = false[\s\S]*stopListeningForPickCommand\(\)[\s\S]*await cancelMetaScan\(\)[\s\S]*canRequestActivePickHandoff\(\)/)
+  assert.match(phone, /guard !hasPendingPickHandoff, !isRequestingPickHandoff else/)
+  assert.match(phone, /let queue = try await api\.fetchQueue\(\)[\s\S]*guard !hasPendingConfirmation,[\s\S]*!hasPendingPickHandoff,[\s\S]*!isRequestingPickHandoff else/)
+  assert.match(phone, /recheckPendingConfirmation\(for: command\)/)
+  assert.match(dashboard, /\.alert\([\s\S]*"Request manager handoff\?"/)
+  assert.match(dashboard, /TextField\("Reason for manager"/)
+  assert.match(dashboard, /Request manager handoff instead/)
+  assert.match(dashboard, /Hand off this unstarted order/)
+  assert.match(dashboard, /Retry exact handoff/)
+  assert.match(dashboard, /will not clear the pick from a missing queue row alone/)
+})
+
 test('location-first scans require durable acknowledged evidence before pick confirmation', () => {
   const migration = read('../db/migrations/0266_operations_wearable_pick_scan_evidence.sql')
   const route = read('app/api/operations/route.ts')
@@ -406,7 +523,10 @@ test('Watch companion presents safe pick context and routes commands through iPh
     app,
     /case \.readInstruction:[\s\S]*?readInstruction\(forceSystemVoice: true\)/,
   )
-  assert.match(app, /readInstructionOnPhone: true/)
+  assert.match(app, /readInstructionOnPhone: metaConnectedDeviceCount == 1/)
+  assert.match(watch, /WatchInstructionPlaybackTarget\.resolve/)
+  assert.match(project, /UIBackgroundModes:[\s\S]*?- audio/)
+  assert.match(app, /connected Meta glasses audio route/)
   assert.doesNotMatch(watch, /PickingAPIClient|ConfirmPicksCommand/)
 })
 
@@ -671,9 +791,17 @@ test('mobile organization changes reuse the session workspace boundary and clear
   assert.match(workspace, /switchBrowserSessionWorkspace/)
   assert.match(workspace, /clearWorkspaceSelectionCookies\(response\)/)
   assert.match(adapters, /api\/auth\/workspace/)
+  assert.match(adapters, /workspaceConfiguration\.httpShouldSetCookies = false/)
+  assert.match(adapters, /private func authenticatedData[\s\S]*attachStoredCookies\(to: &request\)[\s\S]*session\.data\(for: request\)/)
+  assert.match(adapters, /let operationGeneration = authenticatedOperationGeneration[\s\S]*operationGeneration == authenticatedOperationGeneration[\s\S]*persistResponseCookies\(response\)/)
+  assert.match(adapters, /public func logout\(\) async throws \{[\s\S]*authenticatedOperationGeneration &\+= 1/)
   assert.match(app, /guard canSwitchWorkspace else/)
+  assert.match(app, /func logout\(\) async \{[\s\S]*authenticationGeneration &\+= 1[\s\S]*await waitForWorkspaceSwitchToFinish\(\)[\s\S]*try await api\.logout\(\)/)
+  assert.match(app, /func restoreAndRefresh\(\) async \{[\s\S]*clearPublishedPickProjection\(\)[\s\S]*api\.fetchSessionProfile\(\)[\s\S]*picking\.restore\(\)[\s\S]*resumeDurablePickHandoffIfNeeded\(\)[\s\S]*resumeDurableConfirmationIfNeeded\(\)[\s\S]*updateProjection\(\)/)
+  assert.match(app, /private func updateProjection\(\) async \{[\s\S]*queueIdentityMatches[\s\S]*authorizedOrganizationId:[\s\S]*authorizedWorkerEmail:/)
   assert.match(app, /try await picking\.clearQueue\(\)/)
   assert.match(pickingSession, /public func clearQueue\(\) async throws/)
+  assert.match(pickingSession, /public func queueIdentityMatches/)
   assert.match(shell, /WorkspaceSwitcherCard\(model: model\)/)
   assert.match(shell, /WorkspaceSwitcherCard\(model: model, compact: true\)/)
 })

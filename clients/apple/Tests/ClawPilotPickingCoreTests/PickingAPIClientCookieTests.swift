@@ -69,6 +69,68 @@ private final class WorkspaceRejectedURLProtocol: URLProtocol, @unchecked Sendab
     override func stopLoading() {}
 }
 
+private final class WorkspaceLogoutRaceURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        if request.url?.path == "/api/auth/workspace" {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.15) { [self] in
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: [
+                        "Content-Type": "application/json",
+                        "Set-Cookie": "__Host-clawpilot_session=late-workspace-token; Path=/; Secure; HttpOnly; SameSite=Lax",
+                    ]
+                )!
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                client?.urlProtocol(self, didLoad: Data(#"{"ok":true}"#.utf8))
+                client?.urlProtocolDidFinishLoading(self)
+            }
+            return
+        }
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(#"{"ok":true}"#.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class AuthenticatedCookieEchoURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let sentCookie = request.value(forHTTPHeaderField: "Cookie")
+        let authorized = sentCookie?.contains(
+            "__Host-clawpilot_session=existing-auth-token"
+        ) == true
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: authorized ? 200 : 401,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        let body = authorized
+            ? #"{"user":"picker@example.com","effectiveUser":{"email":"picker@example.com","displayName":"Picker","role":"member","organizationName":"Test Org","organizationRole":"picker"},"mobileCapabilities":{"canUsePicker":true,"canUseManager":false},"activeWorkspace":{"organizationId":"11111111-1111-4111-8111-111111111111","referenceCode":"test","name":"Test Org","organizationType":"business","role":"picker","isDefault":true},"availableWorkspaces":[{"organizationId":"11111111-1111-4111-8111-111111111111","referenceCode":"test","name":"Test Org","organizationType":"business","role":"picker","isDefault":true}]}"#
+            : #"{"ok":false}"#
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
 private final class FractionalCountURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -117,6 +179,133 @@ private final class FractionalCountURLProtocol: URLProtocol, @unchecked Sendable
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(#"{"ok":true}"#.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class StructuredConfirmationConflictURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 409,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(
+            self,
+            didLoad: Data(#"{"ok":false,"code":"OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILIATION_REQUIRED","error":"Manager reconciliation required"}"#.utf8)
+        )
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class PendingConfirmationRecheckURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)
+        let query = Dictionary(uniqueKeysWithValues: (components?.queryItems ?? []).map {
+            ($0.name, $0.value ?? "")
+        })
+        let queryIsExact = query["pendingConfirmationOrderGlobalId"] == "gor0000008"
+            && query["pendingConfirmationExpectedRowVersion"] == "4"
+            && query["pendingConfirmationIdempotencyKey"]?.hasPrefix("wearable-pick:") == true
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: queryIsExact ? 200 : 400,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        let body = queryIsExact
+            ? #"{"ok":true,"queue":{"schemaVersion":1,"organizationId":"11111111-1111-4111-8111-111111111111","workerEmail":"picker@example.com","generatedAt":"2026-08-12T14:00:00Z","orders":[]},"pendingConfirmation":{"orderGlobalId":"gor0000008","expectedRowVersion":4,"state":"reconciled_external_fulfillment","code":"OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILED","message":"Manager reconciliation verified","reconciliationGlobalId":"gsfr0000008","providerWrites":0}}"#
+            : #"{"ok":false,"code":"BAD_QUERY","error":"Bad query"}"#
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private func requestBodyData(_ request: URLRequest) -> Data {
+    if let body = request.httpBody { return body }
+    guard let stream = request.httpBodyStream else { return Data() }
+    stream.open()
+    defer { stream.close() }
+    var collected = Data()
+    let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4_096)
+    defer { buffer.deallocate() }
+    while stream.hasBytesAvailable {
+        let count = stream.read(buffer, maxLength: 4_096)
+        if count <= 0 { break }
+        collected.append(buffer, count: count)
+    }
+    return collected
+}
+
+private final class PickHandoffURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let body = try? JSONSerialization.jsonObject(
+            with: requestBodyData(request)
+        ) as? [String: Any]
+        let valid = request.httpMethod == "POST"
+            && request.url?.path == "/api/operations"
+            && request.value(forHTTPHeaderField: "Idempotency-Key")
+                == "picker-handoff:fixed-handoff"
+            && body?["action"] as? String == "request-pick-handoff"
+            && body?["orderGlobalId"] as? String == "gor0000008"
+            && body?["expectedRowVersion"] as? Int == 4
+            && body?["expectedAssignedTaskCount"] as? Int == 1
+            && body?["reason"] as? String == "Manager help requested."
+            && body?["blockedConfirmationIdempotencyKey"] as? String
+                == "wearable-pick:blocked-fixed-key"
+            && body?["organizationId"] == nil
+            && body?["workerEmail"] == nil
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: valid ? 200 : 422,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        let responseBody = valid
+            ? #"{"ok":true,"result":{"orderGlobalId":"gor0000008","orderStatus":"released","previousRowVersion":4,"rowVersion":5,"exceptionGlobalId":"gex0000008","assignedTaskCount":1,"blockedConfirmationIdempotencyKey":"wearable-pick:blocked-fixed-key","providerWrites":0,"replayed":false}}"#
+            : #"{"ok":false,"code":"BAD_HANDOFF","error":"Bad handoff"}"#
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(responseBody.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class InvalidPickHandoffResultURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(
+            self,
+            didLoad: Data(#"{"ok":true,"result":{"orderGlobalId":"gor0000008","orderStatus":"released","previousRowVersion":4,"rowVersion":5,"exceptionGlobalId":"gex0000008","assignedTaskCount":2,"blockedConfirmationIdempotencyKey":null,"providerWrites":0,"replayed":false}}"#.utf8)
+        )
         client?.urlProtocolDidFinishLoading(self)
     }
 
@@ -194,6 +383,67 @@ func nativeWorkspaceSwitchPreservesAuthorizationReason() async throws {
     }
 }
 
+@Test("logout generation rejects a late workspace cookie")
+func logoutRejectsLateWorkspaceCookie() async throws {
+    let origin = try #require(URL(string: "https://native-workspace-logout-race.test"))
+    let storage = HTTPCookieStorage.shared
+    storage.cookies(for: origin)?.forEach(storage.deleteCookie)
+    defer { storage.cookies(for: origin)?.forEach(storage.deleteCookie) }
+
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [WorkspaceLogoutRaceURLProtocol.self]
+    configuration.httpCookieStorage = storage
+    configuration.httpShouldSetCookies = false
+    let client = try PickingAPIClient(
+        origin: origin,
+        session: URLSession(configuration: configuration)
+    )
+
+    let switching = Task {
+        try await client.switchWorkspace(
+            to: "22222222-2222-4222-8222-222222222222"
+        )
+    }
+    try await Task.sleep(for: .milliseconds(25))
+    try await client.logout()
+    await #expect(throws: PickingAPIError.sessionSuperseded) {
+        try await switching.value
+    }
+    #expect(storage.cookies(for: origin)?.contains(where: {
+        $0.name == "__Host-clawpilot_session"
+    }) != true)
+}
+
+@Test("ordinary authenticated requests still send the stored session cookie")
+func authenticatedProfileRequestSendsStoredCookie() async throws {
+    let origin = try #require(URL(string: "https://native-authenticated-cookie.test"))
+    let storage = HTTPCookieStorage.shared
+    storage.cookies(for: origin)?.forEach(storage.deleteCookie)
+    defer { storage.cookies(for: origin)?.forEach(storage.deleteCookie) }
+    let cookie = try #require(HTTPCookie(properties: [
+        .domain: origin.host!,
+        .path: "/",
+        .name: "__Host-clawpilot_session",
+        .value: "existing-auth-token",
+        .secure: "TRUE",
+    ]))
+    storage.setCookie(cookie)
+
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [AuthenticatedCookieEchoURLProtocol.self]
+    configuration.httpCookieStorage = storage
+    configuration.httpShouldSetCookies = true
+    let client = try PickingAPIClient(
+        origin: origin,
+        session: URLSession(configuration: configuration)
+    )
+
+    let profile = try await client.fetchSessionProfile()
+    #expect(profile.effectiveUser.email == "picker@example.com")
+    #expect(profile.activeWorkspace.organizationId
+        == "11111111-1111-4111-8111-111111111111")
+}
+
 @Test("native Google authentication preserves a structured link-required response")
 func nativeGoogleAuthenticationReportsLinkRequired() async throws {
     let origin = try #require(URL(string: "https://native-google-error.test"))
@@ -212,6 +462,140 @@ func nativeGoogleAuthenticationReportsLinkRequired() async throws {
             code: "GOOGLE_SSO_LINK_REQUIRED",
             message: "Sign in with a magic code, then link this Google account in Security settings"
         ))
+    }
+}
+
+@Test("native confirmation preserves a structured non-2xx Operations response")
+func nativeConfirmationPreservesStructuredConflict() async throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [StructuredConfirmationConflictURLProtocol.self]
+    let client = try PickingAPIClient(
+        origin: URL(string: "https://native-confirmation-conflict.test")!,
+        session: URLSession(configuration: configuration)
+    )
+    let task = try PickTask(
+        pickTaskGlobalId: "gpk0000008", sequence: 1,
+        productGlobalId: "gp0000008", productName: "Eight pack",
+        channelSku: "EIGHT", barcode: "888", locationCode: "A-8", quantity: 1
+    )
+    let order = try PickOrder(
+        orderGlobalId: "gor0000008", orderNumber: "1008", rowVersion: 4, tasks: [task]
+    )
+
+    do {
+        try await client.confirm(ConfirmPicksCommand(order: order))
+        Issue.record("Expected a structured reconciliation conflict")
+    } catch let error as PickingAPIError {
+        #expect(error == .rejected(
+            code: "OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILIATION_REQUIRED",
+            message: "Manager reconciliation required"
+        ))
+    }
+}
+
+@Test("native pending confirmation recheck binds exact order and row version")
+func nativePendingConfirmationRecheckIsExactAndReadOnly() async throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [PendingConfirmationRecheckURLProtocol.self]
+    let client = try PickingAPIClient(
+        origin: URL(string: "https://native-confirmation-recheck.test")!,
+        session: URLSession(configuration: configuration)
+    )
+    let task = try PickTask(
+        pickTaskGlobalId: "gpk0000008", sequence: 1,
+        productGlobalId: "gp0000008", productName: "Eight pack",
+        channelSku: "EIGHT", barcode: "888", locationCode: "A-8", quantity: 1
+    )
+    let order = try PickOrder(
+        orderGlobalId: "gor0000008", orderNumber: "1008", rowVersion: 4, tasks: [task]
+    )
+    let result = try await client.recheckPendingConfirmation(
+        ConfirmPicksCommand(order: order)
+    )
+
+    #expect(result.queue.orders.isEmpty)
+    #expect(result.pendingConfirmation.state == .reconciledExternalFulfillment)
+    let evidence = try result.pendingConfirmation.reconciliationEvidence()
+    #expect(evidence.orderGlobalId == order.orderGlobalId)
+    #expect(evidence.expectedRowVersion == order.rowVersion)
+    #expect(evidence.providerWrites == 0)
+}
+
+@Test("native picker handoff sends exact durable command and validates exact result")
+func nativePickHandoffIsExact() async throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [PickHandoffURLProtocol.self]
+    let client = try PickingAPIClient(
+        origin: URL(string: "https://native-pick-handoff.test")!,
+        session: URLSession(configuration: configuration)
+    )
+    let task = try PickTask(
+        pickTaskGlobalId: "gpk0000008", sequence: 1,
+        productGlobalId: "gp0000008", productName: "Eight pack",
+        channelSku: "EIGHT", barcode: "888", locationCode: "A-8", quantity: 1
+    )
+    let order = try PickOrder(
+        orderGlobalId: "gor0000008", orderNumber: "1008", rowVersion: 4, tasks: [task]
+    )
+    let queue = try PickQueue(
+        schemaVersion: 1,
+        organizationId: "11111111-1111-4111-8111-111111111111",
+        workerEmail: "picker@example.com",
+        generatedAt: Date(),
+        orders: [order]
+    )
+    let confirmation = ConfirmPicksCommand(
+        order: order,
+        idempotencyKey: "blocked-fixed-key"
+    )
+    let command = try PickHandoffCommand(
+        queue: queue,
+        order: order,
+        reason: "Manager help requested.",
+        blockedConfirmationIdempotencyKey: confirmation.idempotencyKey,
+        idempotencyKey: "fixed-handoff"
+    )
+
+    let result = try await client.requestPickHandoff(command)
+    let evidence = try result.evidence(for: command)
+    #expect(evidence.orderGlobalId == command.orderGlobalId)
+    #expect(evidence.rowVersion == 5)
+    #expect(evidence.assignedTaskCount == 1)
+    #expect(evidence.providerWrites == 0)
+}
+
+@Test("native picker handoff rejects a non-exact success envelope")
+func nativePickHandoffRejectsMismatchedSuccess() async throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [InvalidPickHandoffResultURLProtocol.self]
+    let client = try PickingAPIClient(
+        origin: URL(string: "https://native-pick-handoff-invalid.test")!,
+        session: URLSession(configuration: configuration)
+    )
+    let task = try PickTask(
+        pickTaskGlobalId: "gpk0000008", sequence: 1,
+        productGlobalId: "gp0000008", productName: "Eight pack",
+        channelSku: "EIGHT", barcode: "888", locationCode: "A-8", quantity: 1
+    )
+    let order = try PickOrder(
+        orderGlobalId: "gor0000008", orderNumber: "1008", rowVersion: 4, tasks: [task]
+    )
+    let queue = try PickQueue(
+        schemaVersion: 1,
+        organizationId: "11111111-1111-4111-8111-111111111111",
+        workerEmail: "picker@example.com",
+        generatedAt: Date(),
+        orders: [order]
+    )
+    let command = try PickHandoffCommand(
+        queue: queue,
+        order: order,
+        reason: "Manager help requested.",
+        idempotencyKey: "fixed-handoff"
+    )
+
+    await #expect(throws: PickingContractError.contextMismatch) {
+        _ = try await client.requestPickHandoff(command)
     }
 }
 

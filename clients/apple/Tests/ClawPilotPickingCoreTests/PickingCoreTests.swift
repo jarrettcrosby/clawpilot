@@ -4,11 +4,13 @@ import Testing
 
 private enum InjectedCacheError: Error {
     case progressWrite
+    case retirementWrite
 }
 
 private actor MemoryCache: PickCache {
     var queue: PickQueue?
     var outbox: ConfirmPicksCommand?
+    var handoffOutbox: PickHandoffCommand?
     var progress: PickSessionProgress?
     var failProgressWrites = false
 
@@ -18,6 +20,14 @@ private actor MemoryCache: PickCache {
     func saveOutbox(_ command: ConfirmPicksCommand) async throws { outbox = command }
     func loadOutbox() async throws -> ConfirmPicksCommand? { outbox }
     func clearOutbox() async throws { outbox = nil }
+    func saveHandoffOutbox(_ command: PickHandoffCommand) async throws {
+        if let handoffOutbox, handoffOutbox != command {
+            throw PickingContractError.contextMismatch
+        }
+        handoffOutbox = command
+    }
+    func loadHandoffOutbox() async throws -> PickHandoffCommand? { handoffOutbox }
+    func clearHandoffOutbox() async throws { handoffOutbox = nil }
     func loadProgress() async throws -> PickSessionProgress? { progress }
     func saveProgress(_ progress: PickSessionProgress) async throws {
         guard !failProgressWrites else { throw InjectedCacheError.progressWrite }
@@ -25,6 +35,123 @@ private actor MemoryCache: PickCache {
     }
     func clearProgress() async throws { progress = nil }
     func setProgressWriteFailure(_ enabled: Bool) { failProgressWrites = enabled }
+}
+
+private actor HandoffRetirementFailureCache: PickCache {
+    enum FailurePoint: Equatable {
+        case clearProgress
+        case saveReplacementQueue
+        case clearConfirmationOutbox
+        case clearHandoffOutbox
+    }
+
+    var queue: PickQueue?
+    var outbox: ConfirmPicksCommand?
+    var handoffOutbox: PickHandoffCommand?
+    var progress: PickSessionProgress?
+    var failurePoint: FailurePoint?
+    var handedOffOrderGlobalId: String?
+
+    func loadQueue() async throws -> PickQueue? { queue }
+    func saveQueue(_ queue: PickQueue) async throws {
+        if failurePoint == .saveReplacementQueue,
+           !queue.orders.contains(where: {
+               $0.orderGlobalId == handedOffOrderGlobalId
+           }) {
+            failurePoint = nil
+            throw InjectedCacheError.retirementWrite
+        }
+        self.queue = queue
+    }
+    func clearQueue() async throws { queue = nil }
+    func saveOutbox(_ command: ConfirmPicksCommand) async throws { outbox = command }
+    func loadOutbox() async throws -> ConfirmPicksCommand? { outbox }
+    func clearOutbox() async throws {
+        if failurePoint == .clearConfirmationOutbox {
+            failurePoint = nil
+            throw InjectedCacheError.retirementWrite
+        }
+        outbox = nil
+    }
+    func saveHandoffOutbox(_ command: PickHandoffCommand) async throws {
+        handoffOutbox = command
+    }
+    func loadHandoffOutbox() async throws -> PickHandoffCommand? { handoffOutbox }
+    func clearHandoffOutbox() async throws {
+        if failurePoint == .clearHandoffOutbox {
+            failurePoint = nil
+            throw InjectedCacheError.retirementWrite
+        }
+        handoffOutbox = nil
+    }
+    func loadProgress() async throws -> PickSessionProgress? { progress }
+    func saveProgress(_ progress: PickSessionProgress) async throws {
+        self.progress = progress
+    }
+    func clearProgress() async throws {
+        if failurePoint == .clearProgress {
+            failurePoint = nil
+            throw InjectedCacheError.retirementWrite
+        }
+        progress = nil
+    }
+
+    func failNextRetirementWrite(
+        at point: FailurePoint,
+        orderGlobalId: String
+    ) {
+        failurePoint = point
+        handedOffOrderGlobalId = orderGlobalId
+    }
+}
+
+private actor BlockingHandoffCache: PickCache {
+    var queue: PickQueue?
+    var outbox: ConfirmPicksCommand?
+    var handoffOutbox: PickHandoffCommand?
+    var progress: PickSessionProgress?
+    private var shouldBlockHandoffRead = false
+    private var blockedContinuation: CheckedContinuation<Void, Never>?
+    private var readStartedContinuation: CheckedContinuation<Void, Never>?
+
+    func loadQueue() async throws -> PickQueue? { queue }
+    func saveQueue(_ queue: PickQueue) async throws { self.queue = queue }
+    func clearQueue() async throws { queue = nil }
+    func saveOutbox(_ command: ConfirmPicksCommand) async throws { outbox = command }
+    func loadOutbox() async throws -> ConfirmPicksCommand? { outbox }
+    func clearOutbox() async throws { outbox = nil }
+    func saveHandoffOutbox(_ command: PickHandoffCommand) async throws {
+        handoffOutbox = command
+    }
+    func loadHandoffOutbox() async throws -> PickHandoffCommand? {
+        if shouldBlockHandoffRead {
+            shouldBlockHandoffRead = false
+            readStartedContinuation?.resume()
+            readStartedContinuation = nil
+            await withCheckedContinuation { continuation in
+                blockedContinuation = continuation
+            }
+        }
+        return handoffOutbox
+    }
+    func clearHandoffOutbox() async throws { handoffOutbox = nil }
+    func loadProgress() async throws -> PickSessionProgress? { progress }
+    func saveProgress(_ progress: PickSessionProgress) async throws {
+        self.progress = progress
+    }
+    func clearProgress() async throws { progress = nil }
+
+    func blockNextHandoffRead() { shouldBlockHandoffRead = true }
+    func waitUntilHandoffReadStarts() async {
+        if blockedContinuation != nil { return }
+        await withCheckedContinuation { continuation in
+            readStartedContinuation = continuation
+        }
+    }
+    func releaseHandoffRead() {
+        blockedContinuation?.resume()
+        blockedContinuation = nil
+    }
 }
 
 private actor BlockingProgressCache: PickCache {
@@ -65,6 +192,75 @@ private actor BlockingProgressCache: PickCache {
         blockedContinuation?.resume()
         blockedContinuation = nil
     }
+}
+
+private actor RetirementFailureCache: PickCache {
+    enum FailurePoint: Equatable {
+        case clearProgress
+        case saveReplacementQueue
+        case clearOutbox
+    }
+
+    var queue: PickQueue?
+    var outbox: ConfirmPicksCommand?
+    var progress: PickSessionProgress?
+    var failurePoint: FailurePoint?
+    var replacementOrderGlobalId: String?
+
+    func loadQueue() async throws -> PickQueue? { queue }
+    func saveQueue(_ queue: PickQueue) async throws {
+        if failurePoint == .saveReplacementQueue,
+           !queue.orders.contains(where: {
+               $0.orderGlobalId == replacementOrderGlobalId
+           }) {
+            failurePoint = nil
+            throw InjectedCacheError.retirementWrite
+        }
+        self.queue = queue
+    }
+    func clearQueue() async throws { queue = nil }
+    func saveOutbox(_ command: ConfirmPicksCommand) async throws { outbox = command }
+    func loadOutbox() async throws -> ConfirmPicksCommand? { outbox }
+    func clearOutbox() async throws {
+        if failurePoint == .clearOutbox {
+            failurePoint = nil
+            throw InjectedCacheError.retirementWrite
+        }
+        outbox = nil
+    }
+    func loadProgress() async throws -> PickSessionProgress? { progress }
+    func saveProgress(_ progress: PickSessionProgress) async throws {
+        self.progress = progress
+    }
+    func clearProgress() async throws {
+        if failurePoint == .clearProgress {
+            failurePoint = nil
+            throw InjectedCacheError.retirementWrite
+        }
+        progress = nil
+    }
+
+    func failNextRetirementWrite(
+        at point: FailurePoint,
+        pendingOrderGlobalId: String
+    ) {
+        failurePoint = point
+        replacementOrderGlobalId = pendingOrderGlobalId
+    }
+}
+
+private actor OutboxReadFailureCache: PickCache {
+    func loadQueue() async throws -> PickQueue? { nil }
+    func saveQueue(_: PickQueue) async throws {}
+    func clearQueue() async throws {}
+    func saveOutbox(_: ConfirmPicksCommand) async throws {}
+    func loadOutbox() async throws -> ConfirmPicksCommand? {
+        throw InjectedCacheError.retirementWrite
+    }
+    func clearOutbox() async throws {}
+    func loadProgress() async throws -> PickSessionProgress? { nil }
+    func saveProgress(_: PickSessionProgress) async throws {}
+    func clearProgress() async throws {}
 }
 
 @Test("workspace changes clear cached pick identity and progress")
@@ -112,6 +308,786 @@ private func fixtureQueue() throws -> PickQueue {
             tasks: tasks
         )]
     )
+}
+
+@Test("restored prior-workspace queue cannot produce an authorized Watch projection")
+func restoredQueueRequiresFreshWorkspaceIdentity() async throws {
+    let cache = MemoryCache()
+    let oldQueue = try fixtureQueue()
+    try await cache.saveQueue(oldQueue)
+    let restored = PickingSession(cache: cache)
+    _ = try await restored.restore()
+
+    #expect(await restored.queueIdentityMatches(
+        organizationId: oldQueue.organizationId,
+        workerEmail: oldQueue.workerEmail
+    ))
+    #expect(await restored.queueIdentityMatches(
+        organizationId: "22222222-2222-4222-8222-222222222222",
+        workerEmail: oldQueue.workerEmail
+    ) == false)
+    #expect(await restored.makeWatchSnapshot(
+        authorizedOrganizationId: "22222222-2222-4222-8222-222222222222",
+        authorizedWorkerEmail: oldQueue.workerEmail
+    ) == nil)
+    #expect(await restored.makeWatchSnapshot(
+        authorizedOrganizationId: oldQueue.organizationId,
+        authorizedWorkerEmail: "different-picker@example.com"
+    ) == nil)
+    // Preserve the old queue internally so an exact durable confirmation or
+    // handoff can still guide the user back to its owning workspace.
+    #expect(await restored.currentOrder() == oldQueue.orders.first)
+}
+
+@Test("exact confirmation retirement advances once under duplicate completion")
+func exactConfirmationRetirementIsSingleAdvance() async throws {
+    let cache = MemoryCache()
+    let fixture = try fixtureQueue()
+    let template = try #require(fixture.orders.first)
+    let second = try PickOrder(
+        orderGlobalId: "gor0000021",
+        orderNumber: "1021",
+        rowVersion: 21,
+        tasks: template.tasks
+    )
+    let third = try PickOrder(
+        orderGlobalId: "gor0000022",
+        orderNumber: "1022",
+        rowVersion: 22,
+        tasks: template.tasks
+    )
+    let queue = try PickQueue(
+        schemaVersion: fixture.schemaVersion,
+        organizationId: fixture.organizationId,
+        workerEmail: fixture.workerEmail,
+        generatedAt: fixture.generatedAt,
+        orders: [template, second, third]
+    )
+    let session = PickingSession(cache: cache)
+    try await session.replaceQueue(queue)
+    let command = ConfirmPicksCommand(
+        order: template,
+        idempotencyKey: "single-advance"
+    )
+    try await cache.saveOutbox(command)
+
+    try await session.finishConfirmedOrder(command)
+    #expect(await session.currentOrder() == second)
+    #expect(try await cache.loadQueue()?.orders == [second, third])
+    #expect(try await cache.loadOutbox() == nil)
+
+    await #expect(throws: PickingContractError.contextMismatch) {
+        try await session.finishConfirmedOrder(command)
+    }
+    #expect(await session.currentOrder() == second)
+    #expect(try await cache.loadQueue()?.orders == [second, third])
+}
+
+@Test("unstarted pick handoff persists exact owning context before transport")
+func unstartedPickHandoffIsDurableAndProgressFenced() async throws {
+    let cache = MemoryCache()
+    let session = PickingSession(cache: cache)
+    let queue = try fixtureQueue()
+    try await session.replaceQueue(queue)
+    #expect(await session.canRequestActivePickHandoff())
+
+    let command = try await session.persistPickHandoff(
+        reason: "Location is inaccessible; manager review requested."
+    )
+    #expect(command.organizationId == queue.organizationId)
+    #expect(command.workerEmail == queue.workerEmail)
+    #expect(command.orderGlobalId == queue.orders[0].orderGlobalId)
+    #expect(command.expectedRowVersion == queue.orders[0].rowVersion)
+    #expect(command.expectedAssignedTaskCount == queue.orders[0].tasks.count)
+    #expect(command.blockedConfirmationIdempotencyKey == nil)
+    #expect(command.idempotencyKey.hasPrefix("picker-handoff:"))
+    #expect(try await cache.loadHandoffOutbox() == command)
+
+    let progressedCache = MemoryCache()
+    let progressed = PickingSession(cache: progressedCache)
+    try await progressed.replaceQueue(queue)
+    _ = try await progressed.accept(BarcodeObservation(
+        value: "012345678905",
+        source: .iPhoneCamera
+    ))
+    #expect(!(await progressed.canRequestActivePickHandoff()))
+    await #expect(throws: PickingContractError.contextMismatch) {
+        _ = try await progressed.persistPickHandoff(reason: "Too late")
+    }
+    #expect(try await progressedCache.loadHandoffOutbox() == nil)
+}
+
+@Test("handoff persistence blocks late scans and queue replacement")
+func handoffPersistenceHasAReentrancyFence() async throws {
+    let cache = BlockingHandoffCache()
+    let session = PickingSession(cache: cache)
+    let queue = try fixtureQueue()
+    try await session.replaceQueue(queue)
+    await cache.blockNextHandoffRead()
+
+    let persistence = Task {
+        try await session.persistPickHandoff(reason: "Manager help requested.")
+    }
+    await cache.waitUntilHandoffReadStarts()
+    await #expect(throws: PickingContractError.persistenceInFlight) {
+        _ = try await session.accept(BarcodeObservation(
+            value: "012345678905",
+            source: .iPhoneCamera
+        ))
+    }
+    await #expect(throws: PickingContractError.persistenceInFlight) {
+        try await session.replaceQueue(queue)
+    }
+    await cache.releaseHandoffRead()
+    _ = try await persistence.value
+    #expect(await session.currentTask()?.pickTaskGlobalId == "gpk0000001")
+}
+
+@Test("terminal confirmation handoff durably binds the exact blocked command")
+func blockedConfirmationHandoffBindsBothOutboxes() async throws {
+    let cache = MemoryCache()
+    let session = PickingSession(cache: cache)
+    let queue = try fixtureQueue()
+    try await session.replaceQueue(queue)
+    let confirmation = ConfirmPicksCommand(
+        order: queue.orders[0],
+        idempotencyKey: "terminal-confirmation"
+    )
+    try await cache.saveOutbox(confirmation)
+
+    let handoff = try await session.persistPickHandoff(
+        reason: "Shopify conflict needs a manager handoff.",
+        blockedConfirmation: confirmation
+    )
+
+    #expect(handoff.blockedConfirmationIdempotencyKey == confirmation.idempotencyKey)
+    #expect(try await cache.loadOutbox() == confirmation)
+    #expect(try await cache.loadHandoffOutbox() == handoff)
+}
+
+@Test("validated handoff result retires exact records and no queue omission alone can")
+func exactPickHandoffRetirementIsAuthorityFenced() async throws {
+    let cache = MemoryCache()
+    let session = PickingSession(cache: cache)
+    let queue = try fixtureQueue()
+    try await session.replaceQueue(queue)
+    let handoff = try await session.persistPickHandoff(reason: "Manager help requested.")
+    let replacement = try PickQueue(
+        schemaVersion: 1,
+        organizationId: queue.organizationId,
+        workerEmail: queue.workerEmail,
+        generatedAt: Date(),
+        orders: []
+    )
+    let evidence = try PickHandoffEvidence(
+        command: handoff,
+        orderGlobalId: handoff.orderGlobalId,
+        orderStatus: "released",
+        previousRowVersion: handoff.expectedRowVersion,
+        rowVersion: handoff.expectedRowVersion + 1,
+        exceptionGlobalId: "gex0000001",
+        assignedTaskCount: handoff.expectedAssignedTaskCount,
+        blockedConfirmationIdempotencyKey: nil,
+        providerWrites: 0
+    )
+
+    await #expect(throws: PickingContractError.contextMismatch) {
+        try await session.retireHandedOffOrder(
+            handoff,
+            evidence: evidence,
+            replacementQueue: queue
+        )
+    }
+    #expect(try await cache.loadHandoffOutbox() == handoff)
+
+    try await session.retireHandedOffOrder(
+        handoff,
+        evidence: evidence,
+        replacementQueue: replacement
+    )
+    #expect(try await cache.loadHandoffOutbox() == nil)
+    #expect(try await cache.loadQueue() == replacement)
+    #expect(await session.currentOrder() == nil)
+}
+
+@Test("handoff retirement accepts only a strictly newer reassignment")
+func handedOffOrderCanReturnOnlyAsFreshAssignment() async throws {
+    let cache = MemoryCache()
+    let session = PickingSession(cache: cache)
+    let queue = try fixtureQueue()
+    try await session.replaceQueue(queue)
+    let handoff = try await session.persistPickHandoff(reason: "Manager help requested.")
+    let evidence = try PickHandoffEvidence(
+        command: handoff,
+        orderGlobalId: handoff.orderGlobalId,
+        orderStatus: "released",
+        previousRowVersion: handoff.expectedRowVersion,
+        rowVersion: handoff.expectedRowVersion + 1,
+        exceptionGlobalId: "gex0000001",
+        assignedTaskCount: handoff.expectedAssignedTaskCount,
+        blockedConfirmationIdempotencyKey: nil,
+        providerWrites: 0
+    )
+    let staleOrder = try PickOrder(
+        orderGlobalId: queue.orders[0].orderGlobalId,
+        orderNumber: queue.orders[0].orderNumber,
+        rowVersion: evidence.rowVersion,
+        tasks: queue.orders[0].tasks
+    )
+    let staleReplacement = try PickQueue(
+        schemaVersion: 1,
+        organizationId: queue.organizationId,
+        workerEmail: queue.workerEmail,
+        generatedAt: Date(),
+        orders: [staleOrder]
+    )
+    await #expect(throws: PickingContractError.contextMismatch) {
+        try await session.retireHandedOffOrder(
+            handoff,
+            evidence: evidence,
+            replacementQueue: staleReplacement
+        )
+    }
+
+    let freshOrder = try PickOrder(
+        orderGlobalId: queue.orders[0].orderGlobalId,
+        orderNumber: queue.orders[0].orderNumber,
+        rowVersion: evidence.rowVersion + 1,
+        tasks: queue.orders[0].tasks
+    )
+    let freshReplacement = try PickQueue(
+        schemaVersion: 1,
+        organizationId: queue.organizationId,
+        workerEmail: queue.workerEmail,
+        generatedAt: Date().addingTimeInterval(1),
+        orders: [freshOrder]
+    )
+    try await session.retireHandedOffOrder(
+        handoff,
+        evidence: evidence,
+        replacementQueue: freshReplacement
+    )
+    #expect(await session.currentOrder() == freshOrder)
+    #expect(try await cache.loadHandoffOutbox() == nil)
+}
+
+@Test("deterministic blocked handoff rejection restores confirmation blocker")
+func rejectedBlockedHandoffRetiresOnlyHandoff() async throws {
+    let cache = MemoryCache()
+    let session = PickingSession(cache: cache)
+    let queue = try fixtureQueue()
+    try await session.replaceQueue(queue)
+    let confirmation = ConfirmPicksCommand(
+        order: queue.orders[0],
+        idempotencyKey: "still-terminal"
+    )
+    try await cache.saveOutbox(confirmation)
+    let handoff = try await session.persistPickHandoff(
+        reason: "Manager handoff requested.",
+        blockedConfirmation: confirmation
+    )
+
+    try await session.retireRejectedBlockedPickHandoff(
+        handoff,
+        confirmation: confirmation
+    )
+    #expect(try await cache.loadHandoffOutbox() == nil)
+    #expect(try await cache.loadOutbox() == confirmation)
+    #expect(await session.currentOrder() == queue.orders[0])
+}
+
+@Test("interrupted blocked handoff replays one durable command and retires recoverably")
+func interruptedBlockedPickHandoffIsRecoverable() async throws {
+    for failurePoint in [
+        HandoffRetirementFailureCache.FailurePoint.clearProgress,
+        HandoffRetirementFailureCache.FailurePoint.saveReplacementQueue,
+        .clearConfirmationOutbox,
+        .clearHandoffOutbox,
+    ] {
+        let cache = HandoffRetirementFailureCache()
+        let initial = PickingSession(cache: cache)
+        let queue = try fixtureQueue()
+        try await initial.replaceQueue(queue)
+        let confirmation = ConfirmPicksCommand(
+            order: queue.orders[0],
+            idempotencyKey: "blocked-\(String(describing: failurePoint))"
+        )
+        try await cache.saveOutbox(confirmation)
+        let handoff = try await initial.persistPickHandoff(
+            reason: "Manager must take over this blocked pick.",
+            blockedConfirmation: confirmation
+        )
+        let replacement = try PickQueue(
+            schemaVersion: 1,
+            organizationId: queue.organizationId,
+            workerEmail: queue.workerEmail,
+            generatedAt: Date(),
+            orders: []
+        )
+        let evidence = try PickHandoffEvidence(
+            command: handoff,
+            orderGlobalId: handoff.orderGlobalId,
+            orderStatus: "released",
+            previousRowVersion: handoff.expectedRowVersion,
+            rowVersion: handoff.expectedRowVersion + 1,
+            exceptionGlobalId: "gex0000001",
+            assignedTaskCount: handoff.expectedAssignedTaskCount,
+            blockedConfirmationIdempotencyKey: confirmation.idempotencyKey,
+            providerWrites: 0
+        )
+        await cache.failNextRetirementWrite(
+            at: failurePoint,
+            orderGlobalId: handoff.orderGlobalId
+        )
+
+        await #expect(throws: InjectedCacheError.retirementWrite) {
+            try await initial.retireHandedOffOrder(
+                handoff,
+                evidence: evidence,
+                replacementQueue: replacement
+            )
+        }
+        #expect(try await cache.loadHandoffOutbox() == handoff)
+
+        let restored = PickingSession(cache: cache)
+        _ = try await restored.restore()
+        try await restored.retireHandedOffOrder(
+            handoff,
+            evidence: evidence,
+            replacementQueue: replacement
+        )
+        #expect(try await cache.loadHandoffOutbox() == nil)
+        #expect(try await cache.loadOutbox() == nil)
+        #expect(try await cache.loadQueue() == replacement)
+    }
+}
+
+@Test("interrupted handoff retirement recovers a newer reassignment with fresh queue time")
+func interruptedHandoffWithFreshReassignmentIsRecoverable() async throws {
+    let cache = HandoffRetirementFailureCache()
+    let initial = PickingSession(cache: cache)
+    let queue = try fixtureQueue()
+    try await initial.replaceQueue(queue)
+    let handoff = try await initial.persistPickHandoff(reason: "Manager help requested.")
+    let evidence = try PickHandoffEvidence(
+        command: handoff,
+        orderGlobalId: handoff.orderGlobalId,
+        orderStatus: "released",
+        previousRowVersion: handoff.expectedRowVersion,
+        rowVersion: handoff.expectedRowVersion + 1,
+        exceptionGlobalId: "gex0000001",
+        assignedTaskCount: handoff.expectedAssignedTaskCount,
+        blockedConfirmationIdempotencyKey: nil,
+        providerWrites: 0
+    )
+    let reassignedOrder = try PickOrder(
+        orderGlobalId: queue.orders[0].orderGlobalId,
+        orderNumber: queue.orders[0].orderNumber,
+        rowVersion: evidence.rowVersion + 1,
+        tasks: queue.orders[0].tasks
+    )
+    let firstReplacement = try PickQueue(
+        schemaVersion: 1,
+        organizationId: queue.organizationId,
+        workerEmail: queue.workerEmail,
+        generatedAt: Date(timeIntervalSince1970: 1_700_000_100),
+        orders: [reassignedOrder]
+    )
+    await cache.failNextRetirementWrite(
+        at: .clearHandoffOutbox,
+        orderGlobalId: handoff.orderGlobalId
+    )
+    await #expect(throws: InjectedCacheError.retirementWrite) {
+        try await initial.retireHandedOffOrder(
+            handoff,
+            evidence: evidence,
+            replacementQueue: firstReplacement
+        )
+    }
+
+    let freshReplacement = try PickQueue(
+        schemaVersion: 1,
+        organizationId: queue.organizationId,
+        workerEmail: queue.workerEmail,
+        generatedAt: Date(timeIntervalSince1970: 1_700_000_200),
+        orders: [reassignedOrder]
+    )
+    let restored = PickingSession(cache: cache)
+    _ = try await restored.restore()
+    try await restored.retireHandedOffOrder(
+        handoff,
+        evidence: evidence,
+        replacementQueue: freshReplacement
+    )
+    #expect(try await cache.loadHandoffOutbox() == nil)
+    #expect(try await cache.loadQueue() == freshReplacement)
+    #expect(await restored.currentOrder() == reassignedOrder)
+}
+
+@Test("manager reconciliation wins a blocked handoff race and remains crash recoverable")
+func blockedHandoffExternalReconciliationRaceIsRecoverable() async throws {
+    for failurePoint in [
+        HandoffRetirementFailureCache.FailurePoint.clearProgress,
+        HandoffRetirementFailureCache.FailurePoint.saveReplacementQueue,
+        .clearConfirmationOutbox,
+        .clearHandoffOutbox,
+    ] {
+        let cache = HandoffRetirementFailureCache()
+        let initial = PickingSession(cache: cache)
+        let queue = try fixtureQueue()
+        try await initial.replaceQueue(queue)
+        let confirmation = ConfirmPicksCommand(
+            order: queue.orders[0],
+            idempotencyKey: "reconciled-\(String(describing: failurePoint))"
+        )
+        try await cache.saveOutbox(confirmation)
+        let handoff = try await initial.persistPickHandoff(
+            reason: "Hand off unless manager reconciliation wins the race.",
+            blockedConfirmation: confirmation
+        )
+        let replacement = try PickQueue(
+            schemaVersion: 1,
+            organizationId: queue.organizationId,
+            workerEmail: queue.workerEmail,
+            generatedAt: Date(),
+            orders: []
+        )
+        let evidence = try ExternallyReconciledConfirmationEvidence(
+            orderGlobalId: confirmation.orderGlobalId,
+            expectedRowVersion: confirmation.expectedRowVersion,
+            reconciliationGlobalId: "gsfr0000001",
+            providerWrites: 0
+        )
+        await cache.failNextRetirementWrite(
+            at: failurePoint,
+            orderGlobalId: handoff.orderGlobalId
+        )
+
+        await #expect(throws: InjectedCacheError.retirementWrite) {
+            try await initial.retireBlockedHandoffAfterExternalReconciliation(
+                handoff,
+                confirmation: confirmation,
+                evidence: evidence,
+                replacementQueue: replacement
+            )
+        }
+        #expect(try await cache.loadHandoffOutbox() == handoff)
+
+        let freshReplacement = try PickQueue(
+            schemaVersion: replacement.schemaVersion,
+            organizationId: replacement.organizationId,
+            workerEmail: replacement.workerEmail,
+            generatedAt: replacement.generatedAt.addingTimeInterval(1),
+            orders: []
+        )
+        let restored = PickingSession(cache: cache)
+        _ = try await restored.restore()
+        try await restored.retireBlockedHandoffAfterExternalReconciliation(
+            handoff,
+            confirmation: try await cache.loadOutbox(),
+            evidence: evidence,
+            replacementQueue: freshReplacement
+        )
+        #expect(try await cache.loadHandoffOutbox() == nil)
+        #expect(try await cache.loadOutbox() == nil)
+        #expect(try await cache.loadQueue() == freshReplacement)
+    }
+}
+
+@Test("external reconciliation rejects a stale queue that still contains the blocked order")
+func blockedHandoffReconciliationRejectsMixedSnapshot() async throws {
+    let cache = MemoryCache()
+    let session = PickingSession(cache: cache)
+    let queue = try fixtureQueue()
+    try await session.replaceQueue(queue)
+    let confirmation = ConfirmPicksCommand(
+        order: queue.orders[0],
+        idempotencyKey: "mixed-snapshot-confirmation"
+    )
+    try await cache.saveOutbox(confirmation)
+    let handoff = try await session.persistPickHandoff(
+        reason: "Manager should take over this blocked pick.",
+        blockedConfirmation: confirmation
+    )
+    let evidence = try ExternallyReconciledConfirmationEvidence(
+        orderGlobalId: confirmation.orderGlobalId,
+        expectedRowVersion: confirmation.expectedRowVersion,
+        reconciliationGlobalId: "gsfr0000004",
+        providerWrites: 0
+    )
+
+    await #expect(throws: PickingContractError.contextMismatch) {
+        try await session.retireBlockedHandoffAfterExternalReconciliation(
+            handoff,
+            confirmation: confirmation,
+            evidence: evidence,
+            replacementQueue: queue
+        )
+    }
+    #expect(try await cache.loadHandoffOutbox() == handoff)
+    #expect(try await cache.loadOutbox() == confirmation)
+    #expect(try await cache.loadQueue() == queue)
+}
+
+@Test("structured active handoff rejection retires only its exact outbox")
+func rejectedActiveHandoffRetiresNoConfirmation() async throws {
+    let cache = MemoryCache()
+    let session = PickingSession(cache: cache)
+    let queue = try fixtureQueue()
+    try await session.replaceQueue(queue)
+    let handoff = try await session.persistPickHandoff(reason: "Manager help requested.")
+    let replacement = try PickQueue(
+        schemaVersion: 1,
+        organizationId: queue.organizationId,
+        workerEmail: queue.workerEmail,
+        generatedAt: Date(),
+        orders: queue.orders
+    )
+
+    try await session.retireRejectedActivePickHandoff(
+        handoff,
+        replacementQueue: replacement
+    )
+    #expect(try await cache.loadHandoffOutbox() == nil)
+    #expect(try await cache.loadOutbox() == nil)
+    #expect(try await cache.loadQueue() == replacement)
+}
+
+@Test("external reconciliation retires only the exact durable confirmation")
+func exactExternalReconciliationRetiresPendingConfirmation() async throws {
+    let cache = MemoryCache()
+    let session = PickingSession(cache: cache)
+    let queue = try fixtureQueue()
+    try await session.replaceQueue(queue)
+    let order = try #require(queue.orders.first)
+    let command = ConfirmPicksCommand(
+        order: order,
+        idempotencyKey: "exact-reconciliation"
+    )
+    try await cache.saveOutbox(command)
+    let replacement = try PickQueue(
+        schemaVersion: queue.schemaVersion,
+        organizationId: queue.organizationId,
+        workerEmail: queue.workerEmail,
+        generatedAt: Date(),
+        orders: []
+    )
+    let evidence = try ExternallyReconciledConfirmationEvidence(
+        orderGlobalId: order.orderGlobalId,
+        expectedRowVersion: order.rowVersion,
+        reconciliationGlobalId: "gsfr0000001",
+        providerWrites: 0
+    )
+
+    try await session.retireExternallyReconciledConfirmation(
+        command,
+        evidence: evidence,
+        replacementQueue: replacement
+    )
+
+    #expect(try await cache.loadOutbox() == nil)
+    #expect(try await cache.loadProgress() == nil)
+    #expect(try await cache.loadQueue() == replacement)
+    #expect(await session.currentOrder() == nil)
+}
+
+@Test("external reconciliation cannot retire a mismatched outbox or active order")
+func externalReconciliationRetirementFailsClosed() async throws {
+    let cache = MemoryCache()
+    let session = PickingSession(cache: cache)
+    let queue = try fixtureQueue()
+    try await session.replaceQueue(queue)
+    let order = try #require(queue.orders.first)
+    let durable = ConfirmPicksCommand(order: order, idempotencyKey: "durable-command")
+    let different = ConfirmPicksCommand(order: order, idempotencyKey: "different-command")
+    try await cache.saveOutbox(durable)
+    let evidence = try ExternallyReconciledConfirmationEvidence(
+        orderGlobalId: order.orderGlobalId,
+        expectedRowVersion: order.rowVersion,
+        reconciliationGlobalId: "gsfr0000002",
+        providerWrites: 0
+    )
+    let emptyReplacement = try PickQueue(
+        schemaVersion: queue.schemaVersion,
+        organizationId: queue.organizationId,
+        workerEmail: queue.workerEmail,
+        generatedAt: Date(),
+        orders: []
+    )
+
+    await #expect(throws: PickingContractError.contextMismatch) {
+        try await session.retireExternallyReconciledConfirmation(
+            different,
+            evidence: evidence,
+            replacementQueue: emptyReplacement
+        )
+    }
+    await #expect(throws: PickingContractError.contextMismatch) {
+        try await session.retireExternallyReconciledConfirmation(
+            durable,
+            evidence: evidence,
+            replacementQueue: queue
+        )
+    }
+    #expect(try await cache.loadOutbox() == durable)
+    #expect(await session.currentOrder() == order)
+    #expect(throws: PickingContractError.contextMismatch) {
+        _ = try ExternallyReconciledConfirmationEvidence(
+            orderGlobalId: order.orderGlobalId,
+            expectedRowVersion: order.rowVersion,
+            reconciliationGlobalId: "gsfr0000003",
+            providerWrites: 1
+        )
+    }
+}
+
+@Test("unreadable outbox cannot produce a pending confirmation context")
+func unreadableOutboxFailsPendingContextClosed() async {
+    let session = PickingSession(cache: OutboxReadFailureCache())
+    let task = try! PickTask(
+        pickTaskGlobalId: "gpk0000012", sequence: 1,
+        productGlobalId: "gp0000012", productName: "Protected",
+        channelSku: "PROTECTED", barcode: "12", locationCode: "A-12", quantity: 1
+    )
+    let order = try! PickOrder(
+        orderGlobalId: "gor0000012", orderNumber: "1012", rowVersion: 12, tasks: [task]
+    )
+    let command = ConfirmPicksCommand(order: order)
+    await #expect(throws: InjectedCacheError.retirementWrite) {
+        _ = try await session.pendingConfirmationContext(for: command)
+    }
+}
+
+@Test("interrupted external retirement remains blocked and recoverable")
+func interruptedExternalReconciliationRetirementIsRecoverable() async throws {
+    for failurePoint in [
+        RetirementFailureCache.FailurePoint.clearProgress,
+        .saveReplacementQueue,
+        .clearOutbox,
+    ] {
+        let cache = RetirementFailureCache()
+        let initialSession = PickingSession(cache: cache)
+        let queue = try fixtureQueue()
+        try await initialSession.replaceQueue(queue)
+        let order = try #require(queue.orders.first)
+        let command = ConfirmPicksCommand(
+            order: order,
+            idempotencyKey: "interrupted-\(String(describing: failurePoint))"
+        )
+        try await cache.saveOutbox(command)
+        let replacement = try PickQueue(
+            schemaVersion: queue.schemaVersion,
+            organizationId: queue.organizationId,
+            workerEmail: queue.workerEmail,
+            generatedAt: Date(timeIntervalSince1970: 1_700_000_100),
+            orders: []
+        )
+        let evidence = try ExternallyReconciledConfirmationEvidence(
+            orderGlobalId: order.orderGlobalId,
+            expectedRowVersion: order.rowVersion,
+            reconciliationGlobalId: "gsfr0000004",
+            providerWrites: 0
+        )
+        await cache.failNextRetirementWrite(
+            at: failurePoint,
+            pendingOrderGlobalId: order.orderGlobalId
+        )
+
+        await #expect(throws: InjectedCacheError.retirementWrite) {
+            try await initialSession.retireExternallyReconciledConfirmation(
+                command,
+                evidence: evidence,
+                replacementQueue: replacement
+            )
+        }
+        #expect(try await cache.loadOutbox() == command)
+
+        let restoredSession = PickingSession(cache: cache)
+        _ = try await restoredSession.restore()
+        try await restoredSession.retireExternallyReconciledConfirmation(
+            command,
+            evidence: evidence,
+            replacementQueue: replacement
+        )
+        #expect(try await cache.loadOutbox() == nil)
+        #expect(try await cache.loadProgress() == nil)
+        #expect(try await cache.loadQueue() == replacement)
+        #expect(await restoredSession.currentOrder() == nil)
+    }
+}
+
+@Test("interrupted retirement recovers an exact pending order that was not first")
+func interruptedNonFirstExternalRetirementIsRecoverable() async throws {
+    let cache = RetirementFailureCache()
+    let session = PickingSession(cache: cache)
+    let firstQueue = try fixtureQueue()
+    let secondTask = try PickTask(
+        pickTaskGlobalId: "gpk0000011",
+        sequence: 1,
+        productGlobalId: "gp0000011",
+        productName: "Second order item",
+        channelSku: "SECOND-1",
+        barcode: "111111111111",
+        locationCode: "B-11",
+        quantity: 1
+    )
+    let pendingOrder = try PickOrder(
+        orderGlobalId: "gor0000011",
+        orderNumber: "1011",
+        rowVersion: 11,
+        tasks: [secondTask]
+    )
+    let queue = try PickQueue(
+        schemaVersion: firstQueue.schemaVersion,
+        organizationId: firstQueue.organizationId,
+        workerEmail: firstQueue.workerEmail,
+        generatedAt: firstQueue.generatedAt,
+        orders: firstQueue.orders + [pendingOrder]
+    )
+    try await session.replaceQueue(queue)
+    let command = ConfirmPicksCommand(
+        order: pendingOrder,
+        idempotencyKey: "non-first-interrupted"
+    )
+    try await cache.saveOutbox(command)
+    let replacement = try PickQueue(
+        schemaVersion: queue.schemaVersion,
+        organizationId: queue.organizationId,
+        workerEmail: queue.workerEmail,
+        generatedAt: Date(timeIntervalSince1970: 1_700_000_200),
+        orders: firstQueue.orders
+    )
+    let evidence = try ExternallyReconciledConfirmationEvidence(
+        orderGlobalId: pendingOrder.orderGlobalId,
+        expectedRowVersion: pendingOrder.rowVersion,
+        reconciliationGlobalId: "gsfr0000011",
+        providerWrites: 0
+    )
+    await cache.failNextRetirementWrite(
+        at: .saveReplacementQueue,
+        pendingOrderGlobalId: pendingOrder.orderGlobalId
+    )
+
+    await #expect(throws: InjectedCacheError.retirementWrite) {
+        try await session.retireExternallyReconciledConfirmation(
+            command,
+            evidence: evidence,
+            replacementQueue: replacement
+        )
+    }
+    #expect(try await cache.loadOutbox() == command)
+
+    let restoredSession = PickingSession(cache: cache)
+    _ = try await restoredSession.restore()
+    #expect(await restoredSession.currentOrder() == firstQueue.orders.first)
+    try await restoredSession.retireExternallyReconciledConfirmation(
+        command,
+        evidence: evidence,
+        replacementQueue: replacement
+    )
+    #expect(try await cache.loadOutbox() == nil)
+    #expect(try await cache.loadQueue() == replacement)
+    #expect(await restoredSession.currentOrder() == firstQueue.orders.first)
 }
 
 private func locationFirstQueue(
@@ -252,7 +1228,11 @@ func locationAcceptanceIsDurableBeforeVisible() async throws {
     let session = PickingSession(cache: cache)
     let now = Date(timeIntervalSince1970: 1_700_000_000)
     try await session.replaceQueue(locationFirstQueue(generatedAt: now))
-    let before = try #require(await session.makeWatchSnapshot(now: now))
+    let before = try #require(await session.makeWatchSnapshot(
+        authorizedOrganizationId: "11111111-1111-4111-8111-111111111111",
+        authorizedWorkerEmail: "picker@example.com",
+        now: now
+    ))
     await cache.setProgressWriteFailure(true)
 
     await #expect(throws: InjectedCacheError.progressWrite) {
@@ -266,7 +1246,11 @@ func locationAcceptanceIsDurableBeforeVisible() async throws {
     #expect(await session.currentWorkflowStage() == .location)
     #expect(await session.currentScanStage() == .location)
     #expect(await session.currentStageContext() == nil)
-    #expect(await session.makeWatchSnapshot(now: now) == before)
+    #expect(await session.makeWatchSnapshot(
+        authorizedOrganizationId: "11111111-1111-4111-8111-111111111111",
+        authorizedWorkerEmail: "picker@example.com",
+        now: now
+    ) == before)
     #expect(try await cache.loadProgress() == nil)
 }
 
@@ -282,7 +1266,11 @@ func productArmingIsDurableBeforeVisible() async throws {
         capturedAt: now
     ), now: now)
     let context = try #require(await session.currentStageContext())
-    let before = try #require(await session.makeWatchSnapshot(now: now))
+    let before = try #require(await session.makeWatchSnapshot(
+        authorizedOrganizationId: "11111111-1111-4111-8111-111111111111",
+        authorizedWorkerEmail: "picker@example.com",
+        now: now
+    ))
     let durableBefore = try #require(try await cache.loadProgress())
     await cache.setProgressWriteFailure(true)
 
@@ -293,7 +1281,11 @@ func productArmingIsDurableBeforeVisible() async throws {
     #expect(await session.currentWorkflowStage() == .productReady)
     #expect(await session.currentScanStage() == nil)
     #expect(await session.currentStageContext() == context)
-    #expect(await session.makeWatchSnapshot(now: now) == before)
+    #expect(await session.makeWatchSnapshot(
+        authorizedOrganizationId: "11111111-1111-4111-8111-111111111111",
+        authorizedWorkerEmail: "picker@example.com",
+        now: now
+    ) == before)
     #expect(try await cache.loadProgress() == durableBefore)
 }
 
@@ -303,7 +1295,11 @@ func productAcceptanceIsDurableBeforeVisible() async throws {
     let session = PickingSession(cache: cache)
     let now = Date(timeIntervalSince1970: 1_700_000_000)
     try await session.replaceQueue(fixtureQueue())
-    let before = try #require(await session.makeWatchSnapshot(now: now))
+    let before = try #require(await session.makeWatchSnapshot(
+        authorizedOrganizationId: "11111111-1111-4111-8111-111111111111",
+        authorizedWorkerEmail: "picker@example.com",
+        now: now
+    ))
     await cache.setProgressWriteFailure(true)
 
     await #expect(throws: InjectedCacheError.progressWrite) {
@@ -318,7 +1314,11 @@ func productAcceptanceIsDurableBeforeVisible() async throws {
     #expect(await session.currentWorkflowStage() == .product)
     #expect(await session.currentScanStage() == .product)
     #expect(await session.currentStageContext() == nil)
-    #expect(await session.makeWatchSnapshot(now: now) == before)
+    #expect(await session.makeWatchSnapshot(
+        authorizedOrganizationId: "11111111-1111-4111-8111-111111111111",
+        authorizedWorkerEmail: "picker@example.com",
+        now: now
+    ) == before)
     #expect(try await cache.loadProgress() == nil)
 }
 
@@ -334,7 +1334,11 @@ func countVerificationIsDurableBeforeVisible() async throws {
         capturedAt: now
     ), now: now)
     let context = try #require(await session.currentStageContext())
-    let before = try #require(await session.makeWatchSnapshot(now: now))
+    let before = try #require(await session.makeWatchSnapshot(
+        authorizedOrganizationId: "11111111-1111-4111-8111-111111111111",
+        authorizedWorkerEmail: "picker@example.com",
+        now: now
+    ))
     let durableBefore = try #require(try await cache.loadProgress())
     await cache.setProgressWriteFailure(true)
 
@@ -351,7 +1355,11 @@ func countVerificationIsDurableBeforeVisible() async throws {
     #expect(await session.currentWorkflowStage() == .count)
     #expect(await session.currentScanStage() == nil)
     #expect(await session.currentStageContext() == context)
-    #expect(await session.makeWatchSnapshot(now: now) == before)
+    #expect(await session.makeWatchSnapshot(
+        authorizedOrganizationId: "11111111-1111-4111-8111-111111111111",
+        authorizedWorkerEmail: "picker@example.com",
+        now: now
+    ) == before)
     #expect(try await cache.loadProgress() == durableBefore)
 }
 
@@ -715,7 +1723,10 @@ func locationFirstAcceptance() async throws {
     #expect(await session.currentTask()?.pickTaskGlobalId == "gpk0000003")
     #expect(await session.currentScanStage() == nil)
     #expect(await session.currentWorkflowStage() == .productReady)
-    #expect(await session.makeWatchSnapshot()?.current?.locationScanRequired == false)
+    #expect(await session.makeWatchSnapshot(
+        authorizedOrganizationId: "11111111-1111-4111-8111-111111111111",
+        authorizedWorkerEmail: "picker@example.com"
+    )?.current?.locationScanRequired == false)
 
     let transition = try #require(await session.currentStageContext())
     try await session.beginProductScan(contextToken: transition.token)
@@ -778,7 +1789,10 @@ func exactQueueRefreshPreservesScanProgress() async throws {
 
     #expect(await session.currentTask()?.pickTaskGlobalId == "gpk0000003")
     #expect(await session.currentWorkflowStage() == .productReady)
-    #expect(await session.makeWatchSnapshot()?.current?.locationScanRequired == false)
+    #expect(await session.makeWatchSnapshot(
+        authorizedOrganizationId: "11111111-1111-4111-8111-111111111111",
+        authorizedWorkerEmail: "picker@example.com"
+    )?.current?.locationScanRequired == false)
 }
 
 @Test("refresh resets scan progress on any current-order authority drift")
@@ -844,6 +1858,8 @@ func safeWatchProjection() async throws {
     let session = PickingSession(cache: MemoryCache())
     try await session.replaceQueue(fixtureQueue())
     let snapshot = try #require(await session.makeWatchSnapshot(
+        authorizedOrganizationId: "11111111-1111-4111-8111-111111111111",
+        authorizedWorkerEmail: "picker@example.com",
         instructionLanguageCode: "es",
         readInstructionOnPhone: true
     ))
@@ -865,6 +1881,22 @@ func watchInstructionText() {
         locationCode: "PICK-01",
         quantity: 2
     ) == "Pick 2 of Blue Widget from location pick zero one. Scan the product barcode.")
+}
+
+@Test("Watch instruction audio stays local unless reachable iPhone playback is requested")
+func watchInstructionPlaybackRouting() {
+    #expect(WatchInstructionPlaybackTarget.resolve(
+        prefersPairedIPhone: false,
+        pairedIPhoneIsReachable: true
+    ) == .appleWatch)
+    #expect(WatchInstructionPlaybackTarget.resolve(
+        prefersPairedIPhone: true,
+        pairedIPhoneIsReachable: false
+    ) == .appleWatch)
+    #expect(WatchInstructionPlaybackTarget.resolve(
+        prefersPairedIPhone: true,
+        pairedIPhoneIsReachable: true
+    ) == .pairedIPhone)
 }
 
 @Test("location-first voice instruction never asks for the product first")

@@ -49,6 +49,24 @@ public actor DurablePickCache: PickCache {
         }
     }
 
+    public func saveHandoffOutbox(_ command: PickHandoffCommand) async throws {
+        if let existing = try await loadHandoffOutbox(), existing != command {
+            throw PickingContractError.contextMismatch
+        }
+        try write(command, name: "pick-handoff-outbox.json")
+    }
+
+    public func loadHandoffOutbox() async throws -> PickHandoffCommand? {
+        try read(PickHandoffCommand.self, name: "pick-handoff-outbox.json")
+    }
+
+    public func clearHandoffOutbox() async throws {
+        let url = directory.appendingPathComponent("pick-handoff-outbox.json")
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+
     public func loadProgress() async throws -> PickSessionProgress? {
         try read(PickSessionProgress.self, name: "pick-progress.json")
     }
@@ -90,6 +108,7 @@ public actor DurablePickCache: PickCache {
 public enum PickingAPIError: Error, Equatable, Sendable {
     case invalidOrigin
     case unauthorized
+    case sessionSuperseded
     case rateLimited(retryAfterSeconds: Int)
     case rejected(code: String, message: String)
     case invalidResponse
@@ -100,10 +119,75 @@ extension PickingAPIError: LocalizedError {
         switch self {
         case .invalidOrigin: "The ClawPilot server address is invalid."
         case .unauthorized: "Sign in to continue."
+        case .sessionSuperseded: "This signed-in operation was cancelled because the session changed."
         case .rateLimited(let seconds): "Too many code requests. Try again in \(seconds) seconds."
         case .rejected(_, let message): message
         case .invalidResponse: "ClawPilot returned an unexpected response."
         }
+    }
+}
+
+public struct PendingConfirmationRecheck: Decodable, Equatable, Sendable {
+    public enum State: String, Decodable, Equatable, Sendable {
+        case managerActionRequired = "manager_action_required"
+        case reconciledExternalFulfillment = "reconciled_external_fulfillment"
+        case unresolved
+    }
+
+    public let orderGlobalId: String
+    public let expectedRowVersion: Int
+    public let state: State
+    public let code: String
+    public let message: String
+    public let reconciliationGlobalId: String?
+    public let providerWrites: Int?
+
+    public func reconciliationEvidence()
+        throws -> ExternallyReconciledConfirmationEvidence
+    {
+        guard state == .reconciledExternalFulfillment,
+              code == "OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILED",
+              let reconciliationGlobalId,
+              let providerWrites else {
+            throw PickingAPIError.invalidResponse
+        }
+        return try ExternallyReconciledConfirmationEvidence(
+            orderGlobalId: orderGlobalId,
+            expectedRowVersion: expectedRowVersion,
+            reconciliationGlobalId: reconciliationGlobalId,
+            providerWrites: providerWrites
+        )
+    }
+}
+
+public struct PendingConfirmationRecheckResult: Equatable, Sendable {
+    public let queue: PickQueue
+    public let pendingConfirmation: PendingConfirmationRecheck
+}
+
+public struct PickHandoffResult: Decodable, Equatable, Sendable {
+    public let orderGlobalId: String
+    public let orderStatus: String
+    public let previousRowVersion: Int
+    public let rowVersion: Int
+    public let exceptionGlobalId: String
+    public let assignedTaskCount: Int
+    public let blockedConfirmationIdempotencyKey: String?
+    public let providerWrites: Int
+    public let replayed: Bool
+
+    public func evidence(for command: PickHandoffCommand) throws -> PickHandoffEvidence {
+        try PickHandoffEvidence(
+            command: command,
+            orderGlobalId: orderGlobalId,
+            orderStatus: orderStatus,
+            previousRowVersion: previousRowVersion,
+            rowVersion: rowVersion,
+            exceptionGlobalId: exceptionGlobalId,
+            assignedTaskCount: assignedTaskCount,
+            blockedConfirmationIdempotencyKey: blockedConfirmationIdempotencyKey,
+            providerWrites: providerWrites
+        )
     }
 }
 
@@ -332,12 +416,20 @@ public actor PickingAPIClient {
     private struct QueueEnvelope: Decodable {
         let ok: Bool
         let queue: PickQueue?
+        let pendingConfirmation: PendingConfirmationRecheck?
         let code: String?
         let error: String?
     }
 
     private struct BasicEnvelope: Decodable {
         let ok: Bool
+        let code: String?
+        let error: String?
+    }
+
+    private struct PickHandoffEnvelope: Decodable {
+        let ok: Bool
+        let result: PickHandoffResult?
         let code: String?
         let error: String?
     }
@@ -416,10 +508,20 @@ public actor PickingAPIClient {
         let scanEvidence: [PickTaskScanEvidence]
     }
 
+    private struct PickHandoffBody: Encodable {
+        let action: String
+        let orderGlobalId: String
+        let expectedRowVersion: Int
+        let expectedAssignedTaskCount: Int
+        let reason: String
+        let blockedConfirmationIdempotencyKey: String?
+    }
+
     public nonisolated let webOrigin: URL
     private let session: URLSession
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private var authenticatedOperationGeneration: UInt64 = 0
 
     public init(origin: URL, session: URLSession? = nil, allowDebugHTTP: Bool = false) throws {
         guard origin.path.isEmpty || origin.path == "/",
@@ -466,7 +568,7 @@ public actor PickingAPIClient {
         var request = URLRequest(url: try endpoint("/api/auth/google/policy"))
         request.httpMethod = "GET"
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await authenticatedData(for: request)
         try validateHTTP(response)
         let envelope = try decoder.decode(GooglePolicyEnvelope.self, from: data)
         guard envelope.ok, let policy = envelope.policy else {
@@ -490,7 +592,7 @@ public actor PickingAPIClient {
         request.httpBody = try encoder.encode(GoogleLinkBody(
             idToken: idToken
         ))
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await authenticatedData(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw PickingAPIError.invalidResponse
         }
@@ -513,12 +615,13 @@ public actor PickingAPIClient {
         var request = URLRequest(url: try endpoint("/api/auth/session"))
         request.httpMethod = "GET"
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await authenticatedData(for: request)
         try validateHTTP(response)
         return try decoder.decode(ClawPilotSessionProfile.self, from: data)
     }
 
     public func switchWorkspace(to organizationId: String) async throws {
+        let operationGeneration = authenticatedOperationGeneration
         var request = URLRequest(url: try endpoint("/api/auth/workspace"))
         request.httpMethod = "POST"
         request.cachePolicy = .reloadIgnoringLocalCacheData
@@ -527,7 +630,19 @@ public actor PickingAPIClient {
             action: "switch",
             organizationId: organizationId
         ))
-        let (data, response) = try await session.data(for: request)
+        attachStoredCookies(to: &request)
+        // Only workspace rotation uses a non-cookie-handling transport. Normal
+        // authenticated requests keep URLSession's automatic request Cookie
+        // header behavior. This isolated request sends the current cookie
+        // explicitly, then installs Set-Cookie only after the generation fence.
+        let workspaceConfiguration = session.configuration
+        workspaceConfiguration.httpShouldSetCookies = false
+        let workspaceSession = URLSession(configuration: workspaceConfiguration)
+        defer { workspaceSession.finishTasksAndInvalidate() }
+        let (data, response) = try await workspaceSession.data(for: request)
+        guard operationGeneration == authenticatedOperationGeneration else {
+            throw PickingAPIError.sessionSuperseded
+        }
         guard let http = response as? HTTPURLResponse else {
             throw PickingAPIError.invalidResponse
         }
@@ -539,23 +654,26 @@ public actor PickingAPIClient {
                 message: envelope?.error ?? "The organization could not be changed"
             )
         }
-        // Workspace switching rotates the durable browser-session token. URLSession
-        // normally accepts Set-Cookie automatically, but native/custom sessions do
-        // not consistently do so. Persist the rotated token before the profile
-        // refresh so the first request in the selected organization is authorized.
-        persistResponseCookies(response)
         guard envelope.ok else {
             throw PickingAPIError.rejected(
                 code: envelope.code ?? "WORKSPACE_SWITCH_FAILED",
                 message: envelope.error ?? "The organization could not be changed"
             )
         }
+        // Workspace switching rotates the durable browser-session token. Only
+        // the still-current authenticated generation may install it; logout
+        // increments the generation before its own network request begins.
+        guard operationGeneration == authenticatedOperationGeneration else {
+            throw PickingAPIError.sessionSuperseded
+        }
+        persistResponseCookies(response)
     }
 
     public func logout() async throws {
+        authenticatedOperationGeneration &+= 1
         var request = URLRequest(url: try endpoint("/api/auth/logout"))
         request.httpMethod = "POST"
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await authenticatedData(for: request)
         try validateHTTP(response)
         let envelope = try decoder.decode(BasicEnvelope.self, from: data)
         guard envelope.ok else {
@@ -570,7 +688,7 @@ public actor PickingAPIClient {
         var request = URLRequest(url: try endpoint("/api/operations/picks"))
         request.httpMethod = "GET"
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await authenticatedData(for: request)
         try validateHTTP(response)
         let envelope = try decoder.decode(QueueEnvelope.self, from: data)
         guard envelope.ok, let queue = envelope.queue else {
@@ -582,11 +700,81 @@ public actor PickingAPIClient {
         return queue
     }
 
+    public func recheckPendingConfirmation(
+        _ command: ConfirmPicksCommand
+    ) async throws -> PendingConfirmationRecheckResult {
+        try await recheckPendingConfirmation(
+            orderGlobalId: command.orderGlobalId,
+            expectedRowVersion: command.expectedRowVersion,
+            idempotencyKey: command.idempotencyKey
+        )
+    }
+
+    public func recheckPendingConfirmation(
+        for handoff: PickHandoffCommand
+    ) async throws -> PendingConfirmationRecheckResult {
+        guard let blockedConfirmationIdempotencyKey =
+                handoff.blockedConfirmationIdempotencyKey else {
+            throw PickingAPIError.invalidResponse
+        }
+        return try await recheckPendingConfirmation(
+            orderGlobalId: handoff.orderGlobalId,
+            expectedRowVersion: handoff.expectedRowVersion,
+            idempotencyKey: blockedConfirmationIdempotencyKey
+        )
+    }
+
+    private func recheckPendingConfirmation(
+        orderGlobalId: String,
+        expectedRowVersion: Int,
+        idempotencyKey: String
+    ) async throws -> PendingConfirmationRecheckResult {
+        var components = URLComponents(
+            url: try endpoint("/api/operations/picks"),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(
+                name: "pendingConfirmationOrderGlobalId",
+                value: orderGlobalId
+            ),
+            URLQueryItem(
+                name: "pendingConfirmationExpectedRowVersion",
+                value: String(expectedRowVersion)
+            ),
+            URLQueryItem(
+                name: "pendingConfirmationIdempotencyKey",
+                value: idempotencyKey
+            ),
+        ]
+        guard let url = components.url else { throw PickingAPIError.invalidOrigin }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await authenticatedData(for: request)
+        try validateHTTP(response)
+        let envelope = try decoder.decode(QueueEnvelope.self, from: data)
+        guard envelope.ok,
+              let queue = envelope.queue,
+              let pending = envelope.pendingConfirmation,
+              pending.orderGlobalId == orderGlobalId,
+              pending.expectedRowVersion == expectedRowVersion else {
+            throw PickingAPIError.rejected(
+                code: envelope.code ?? "OPERATIONS_PENDING_CONFIRMATION_RECHECK_FAILED",
+                message: envelope.error ?? "Pending confirmation status is unavailable"
+            )
+        }
+        return PendingConfirmationRecheckResult(
+            queue: queue,
+            pendingConfirmation: pending
+        )
+    }
+
     public func fetchManagerOrders() async throws -> [ManagerOrderSummary] {
         var request = URLRequest(url: try endpoint("/api/operations"))
         request.httpMethod = "GET"
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await authenticatedData(for: request)
         try validateHTTP(response)
         let envelope = try decoder.decode(ManagerOperationsEnvelope.self, from: data)
         guard envelope.ok, let operations = envelope.operations else {
@@ -605,7 +793,7 @@ public actor PickingAPIClient {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await authenticatedData(for: request)
         try validateHTTP(response)
         let envelope = try decoder.decode(ManagerOperationsEnvelope.self, from: data)
         guard envelope.ok, let detail = envelope.operations?.selectedOrder else {
@@ -621,7 +809,7 @@ public actor PickingAPIClient {
         var request = URLRequest(url: try endpoint("/api/operations/pickers"))
         request.httpMethod = "GET"
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await authenticatedData(for: request)
         try validateHTTP(response)
         let envelope = try decoder.decode(PickerEnvelope.self, from: data)
         guard envelope.ok, let pickers = envelope.pickers else {
@@ -637,7 +825,7 @@ public actor PickingAPIClient {
         var request = URLRequest(url: try endpoint("/api/operations/picker-performance"))
         request.httpMethod = "GET"
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await authenticatedData(for: request)
         try validateHTTP(response)
         let envelope = try decoder.decode(PickerPerformanceEnvelope.self, from: data)
         guard envelope.ok, let metrics = envelope.metrics else {
@@ -689,8 +877,23 @@ public actor PickingAPIClient {
             countEvidenceIdempotencyKey: command.countEvidenceIdempotencyKey,
             countEvidence: command.countEvidence
         ))
-        let (data, response) = try await session.data(for: request)
-        try validateHTTP(response)
+        let (data, response) = try await authenticatedData(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw PickingAPIError.invalidResponse
+        }
+        if http.statusCode == 401 { throw PickingAPIError.unauthorized }
+        if http.statusCode == 429 {
+            let seconds = Int(http.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 60
+            throw PickingAPIError.rateLimited(retryAfterSeconds: max(1, seconds))
+        }
+        if !(200..<300).contains(http.statusCode) {
+            if let envelope = try? decoder.decode(BasicEnvelope.self, from: data),
+               let code = envelope.code,
+               let message = envelope.error {
+                throw PickingAPIError.rejected(code: code, message: message)
+            }
+            throw PickingAPIError.invalidResponse
+        }
         let envelope = try decoder.decode(BasicEnvelope.self, from: data)
         guard envelope.ok else {
             throw PickingAPIError.rejected(
@@ -698,6 +901,48 @@ public actor PickingAPIClient {
                 message: envelope.error ?? "Pick confirmation failed"
             )
         }
+    }
+
+    public func requestPickHandoff(
+        _ command: PickHandoffCommand
+    ) async throws -> PickHandoffResult {
+        var request = URLRequest(url: try endpoint("/api/operations"))
+        request.httpMethod = "POST"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(command.idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
+        request.httpBody = try encoder.encode(PickHandoffBody(
+            action: command.action,
+            orderGlobalId: command.orderGlobalId,
+            expectedRowVersion: command.expectedRowVersion,
+            expectedAssignedTaskCount: command.expectedAssignedTaskCount,
+            reason: command.reason,
+            blockedConfirmationIdempotencyKey: command.blockedConfirmationIdempotencyKey
+        ))
+        let (data, response) = try await authenticatedData(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw PickingAPIError.invalidResponse
+        }
+        if http.statusCode == 401 { throw PickingAPIError.unauthorized }
+        if http.statusCode == 429 {
+            let seconds = Int(http.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 60
+            throw PickingAPIError.rateLimited(retryAfterSeconds: max(1, seconds))
+        }
+        let envelope = try? decoder.decode(PickHandoffEnvelope.self, from: data)
+        guard (200..<300).contains(http.statusCode),
+              let envelope,
+              envelope.ok,
+              let result = envelope.result else {
+            if let envelope {
+                throw PickingAPIError.rejected(
+                    code: envelope.code ?? "OPERATIONS_PICK_HANDOFF_FAILED",
+                    message: envelope.error ?? "Picker handoff could not be requested"
+                )
+            }
+            throw PickingAPIError.invalidResponse
+        }
+        _ = try result.evidence(for: command)
+        return result
     }
 
     public func recordScanEvidence(_ command: ConfirmPicksCommand) async throws {
@@ -714,7 +959,7 @@ public actor PickingAPIClient {
             expectedRowVersion: command.expectedRowVersion,
             scanEvidence: scanEvidence
         ))
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await authenticatedData(for: request)
         try validateHTTP(response)
         let envelope = try decoder.decode(BasicEnvelope.self, from: data)
         guard envelope.ok else {
@@ -730,7 +975,7 @@ public actor PickingAPIClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await authenticatedData(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw PickingAPIError.invalidResponse
         }
@@ -773,6 +1018,24 @@ public actor PickingAPIClient {
         storage.setCookies(cookies, for: responseURL, mainDocumentURL: webOrigin)
     }
 
+    private func attachStoredCookies(to request: inout URLRequest) {
+        guard let requestURL = request.url,
+              let storage = session.configuration.httpCookieStorage,
+              let cookies = storage.cookies(for: requestURL),
+              !cookies.isEmpty else { return }
+        for (field, value) in HTTPCookie.requestHeaderFields(with: cookies) {
+            request.setValue(value, forHTTPHeaderField: field)
+        }
+    }
+
+    private func authenticatedData(
+        for originalRequest: URLRequest
+    ) async throws -> (Data, URLResponse) {
+        var request = originalRequest
+        attachStoredCookies(to: &request)
+        return try await session.data(for: request)
+    }
+
     private func managerOrderCommand(
         action: String,
         order: ManagerOrderDetail,
@@ -790,7 +1053,7 @@ public actor PickingAPIClient {
             assignedTo: assignedTo,
             reason: reason
         ))
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await authenticatedData(for: request)
         try validateHTTP(response)
         let envelope = try decoder.decode(BasicEnvelope.self, from: data)
         guard envelope.ok else {

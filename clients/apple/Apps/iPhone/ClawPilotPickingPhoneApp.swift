@@ -101,8 +101,20 @@ final class PickingPhoneModel: ObservableObject {
     @Published var currentStageContext: PickStageContext?
     @Published var showCountEntry = false
     @Published var readyToConfirm = false
+    @Published private(set) var activePickHandoffEligible = false
     @Published var showPhoneScanner = false
     @Published var hasPendingConfirmation = false
+    @Published private(set) var pendingConfirmationRequiresManagerAction = false
+    @Published private(set) var pendingConfirmationIdentityMismatch = false
+    @Published private(set) var pendingConfirmationRecoveryWorkspaceId: String?
+    @Published private(set) var pendingConfirmationDetail: String?
+    @Published private(set) var isRecheckingPendingConfirmation = false
+    @Published private(set) var hasPendingPickHandoff = false
+    @Published private(set) var isRequestingPickHandoff = false
+    @Published private(set) var pendingPickHandoffDetail: String?
+    @Published private(set) var pendingPickHandoffRecoveryWorkspaceId: String?
+    @Published var showPickHandoffConfirmation = false
+    @Published var pickHandoffReason = ""
     @Published var status = "Sign in to continue."
     @Published var metaStatus = "Meta setup not checked. iPhone camera remains available."
     @Published var canRegisterMeta = false
@@ -143,6 +155,8 @@ final class PickingPhoneModel: ObservableObject {
     private var metaProductStartScanID: UUID?
     private var metaProductStartRequestedScanID: UUID?
     private var dismissedCountContextToken: String?
+    private var authenticationGeneration: UInt64 = 0
+    private var workspaceSwitchCompletionWaiters: [CheckedContinuation<Void, Never>] = []
 
     var canSendCode: Bool {
         canRequestCode && !isAuthBusy && email.contains("@") && email.count <= 254
@@ -202,10 +216,35 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     var canSwitchWorkspace: Bool {
-        !isWorkspaceBusy
+        let idle = !isRestoringSession
+            && !isRecheckingPendingConfirmation
+            && !isConfirmingOrder
+            && !isRequestingPickHandoff
+            && !isWorkspaceBusy
             && !isManagerBusy
             && !isQueueBusy
+        guard idle else { return false }
+        if hasPendingPickHandoff {
+            guard let recoveryWorkspaceId = pendingPickHandoffRecoveryWorkspaceId else {
+                return false
+            }
+            return activeWorkspace?.organizationId != recoveryWorkspaceId
+        }
+        if hasPendingConfirmation {
+            guard let recoveryWorkspaceId = pendingConfirmationRecoveryWorkspaceId else {
+                return false
+            }
+            return activeWorkspace?.organizationId != recoveryWorkspaceId
+        }
+        return true
+    }
+
+    var canRequestActivePickHandoff: Bool {
+        isAuthenticated
             && !hasPendingConfirmation
+            && !hasPendingPickHandoff
+            && !isRequestingPickHandoff
+            && activePickHandoffEligible
     }
 
     var metaScanReady: Bool {
@@ -443,11 +482,15 @@ final class PickingPhoneModel: ObservableObject {
         }
         isRestoringSession = true
         defer { isRestoringSession = false }
+        // A Watch can retain its last application context across a phone-app
+        // crash. Clear it before reading any cached queue; only a freshly
+        // authenticated profile is allowed to authorize a new projection.
+        clearPublishedPickProjection()
         await refreshMetaStatus()
-        _ = try? await picking.restore()
-        await updateProjection()
+        let restoredProfile: ClawPilotSessionProfile
         do {
-            sessionProfile = try await api.fetchSessionProfile()
+            restoredProfile = try await api.fetchSessionProfile()
+            sessionProfile = restoredProfile
             isAuthenticated = true
             await refreshGoogleAuthState()
             syncMetaConnection()
@@ -457,21 +500,17 @@ final class PickingPhoneModel: ObservableObject {
             status = "Sign in to continue."
             return
         }
-        if let pending = try? await cache.loadOutbox() {
-            hasPendingConfirmation = true
-            status = "A prior confirmation is pending. Replaying the same command."
-            do {
-                try await syncEvidenceAndConfirm(pending)
-                isAuthenticated = true
-                try await picking.finishConfirmedOrder()
-                hasPendingConfirmation = false
-                status = "Prior confirmation reconciled."
-            } catch {
-                status = pending.scanEvidenceIdempotencyKey == nil
-                    ? "Prior confirmation remains pending; no new key was created."
-                    : "Prior scans remain saved on this iPhone but are not yet acknowledged by ClawPilot. Confirmation stays blocked; retry when online."
-            }
-        } else {
+        _ = try? await picking.restore()
+        let resumedPendingHandoff = await resumeDurablePickHandoffIfNeeded()
+        let resumedPendingConfirmation = resumedPendingHandoff
+            ? true
+            : await resumeDurableConfirmationIfNeeded()
+        if !resumedPendingHandoff && !resumedPendingConfirmation {
+            resetPendingConfirmationBlocker()
+            // Only an outbox-free queue reaches presentation here.
+            // updateProjection independently checks it against the freshly
+            // authenticated profile before publishing to iPhone or Watch.
+            await updateProjection()
             status = "Choose a workflow to begin."
         }
         isRestoringSession = false
@@ -522,12 +561,20 @@ final class PickingPhoneModel: ObservableObject {
         }
         do {
             sessionProfile = try await api.fetchSessionProfile()
+            isRestoringSession = true
+            defer { isRestoringSession = false }
             isAuthenticated = true
             biometrics.rememberAuthenticatedSession()
             codeRequested = false
             code = ""
-            status = "Signed in. Choose a workflow to begin."
             await refreshGoogleAuthState()
+            let resumedPendingHandoff = await resumeDurablePickHandoffIfNeeded()
+            let resumedPendingConfirmation = resumedPendingHandoff
+                ? true
+                : await resumeDurableConfirmationIfNeeded()
+            if !resumedPendingHandoff && !resumedPendingConfirmation {
+                status = "Signed in. Choose a workflow to begin."
+            }
         } catch {
             isAuthenticated = false
             status = "Code accepted, but the secure session could not be restored. Request a new code and try again."
@@ -593,12 +640,20 @@ final class PickingPhoneModel: ObservableObject {
                 }
             }
             sessionProfile = try await api.fetchSessionProfile()
+            isRestoringSession = true
+            defer { isRestoringSession = false }
             email = sessionProfile?.effectiveUser.email ?? result.user.profile?.email ?? ""
             isAuthenticated = true
             isLocallyLocked = false
             biometrics.rememberAuthenticatedSession()
-            status = "Signed in with Google. Choose a workflow to begin."
             await refreshGoogleAuthState()
+            let resumedPendingHandoff = await resumeDurablePickHandoffIfNeeded()
+            let resumedPendingConfirmation = resumedPendingHandoff
+                ? true
+                : await resumeDurableConfirmationIfNeeded()
+            if !resumedPendingHandoff && !resumedPendingConfirmation {
+                status = "Signed in with Google. Choose a workflow to begin."
+            }
         } catch PickingAPIError.rejected(let code, _) where code == "GOOGLE_SSO_LINK_REQUIRED" {
             isAuthenticated = false
             status = "Google is not linked yet. Sign in with a magic code, then open Settings > Security and tap Link my Google account."
@@ -735,24 +790,44 @@ final class PickingPhoneModel: ObservableObject {
     func switchWorkspace(to organizationId: String) async {
         guard let activeWorkspace,
               organizationId != activeWorkspace.organizationId else { return }
+        let isPendingHandoffRecoverySwitch = hasPendingPickHandoff
+            && organizationId == pendingPickHandoffRecoveryWorkspaceId
+        let isPendingConfirmationRecoverySwitch = hasPendingConfirmation
+            && organizationId == pendingConfirmationRecoveryWorkspaceId
+        let isPendingRecoverySwitch = isPendingHandoffRecoverySwitch
+            || isPendingConfirmationRecoverySwitch
         guard canSwitchWorkspace else {
-            workspaceStatus = hasPendingConfirmation
-                ? "Confirm or reconcile the current pick before changing organizations."
-                : "Wait for the current operation to finish before changing organizations."
+            workspaceStatus = hasPendingPickHandoff
+                ? "Only the organization that owns the saved handoff can be selected until it finishes."
+                : (hasPendingConfirmation
+                    ? "Only the organization that owns the saved confirmation can be selected until it is resolved."
+                    : "Wait for the current operation to finish before changing organizations.")
+            return
+        }
+        guard (!hasPendingConfirmation && !hasPendingPickHandoff)
+                || isPendingRecoverySwitch else {
+            workspaceStatus = "The saved confirmation must be resolved in its original organization."
             return
         }
         guard availableWorkspaces.contains(where: { $0.organizationId == organizationId }) else {
             workspaceStatus = "That organization is not available to this account."
             return
         }
+        let operationGeneration = authenticationGeneration
 
         isWorkspaceBusy = true
-        workspaceStatus = "Changing organization and clearing scoped mobile data…"
-        defer { isWorkspaceBusy = false }
+        workspaceStatus = isPendingRecoverySwitch
+            ? "Returning to the organization that owns the saved picker command…"
+            : "Changing organization and clearing scoped mobile data…"
+        defer { finishWorkspaceSwitch() }
 
         do {
-            if isMetaScanning { await cancelMetaScan() }
+            if isMetaScanning {
+                await cancelMetaScan()
+                guard authenticationIsCurrent(operationGeneration) else { return }
+            }
             try await api.switchWorkspace(to: organizationId)
+            guard authenticationIsCurrent(operationGeneration) else { return }
 
             managerOrders = []
             managerPickers = []
@@ -760,28 +835,58 @@ final class PickingPhoneModel: ObservableObject {
             managerSelectedOrder = nil
             currentTask = nil
             readyToConfirm = false
-            try await picking.clearQueue()
-            await updateProjection()
+            if !isPendingRecoverySwitch {
+                try await picking.clearQueue()
+                guard authenticationIsCurrent(operationGeneration) else { return }
+                await updateProjection()
+                guard authenticationIsCurrent(operationGeneration) else { return }
+            }
 
-            sessionProfile = try await api.fetchSessionProfile()
+            let refreshedProfile = try await api.fetchSessionProfile()
+            guard authenticationIsCurrent(operationGeneration) else { return }
+            sessionProfile = refreshedProfile
             isAuthenticated = true
             await refreshGoogleAuthState()
+            guard authenticationIsCurrent(operationGeneration) else { return }
+            let resumedPendingHandoff = isPendingHandoffRecoverySwitch
+                ? await resumeDurablePickHandoffIfNeeded()
+                : false
+            guard authenticationIsCurrent(operationGeneration) else { return }
+            let resumedPendingConfirmation = isPendingConfirmationRecoverySwitch
+                && !resumedPendingHandoff
+                ? await resumeDurableConfirmationIfNeeded()
+                : false
+            guard authenticationIsCurrent(operationGeneration) else { return }
 
-            if canUseManager { await loadManagerOperations() }
-            if canUsePicker {
+            if canUseManager {
+                await loadManagerOperations()
+                guard authenticationIsCurrent(operationGeneration) else { return }
+            }
+            if canUsePicker && !resumedPendingHandoff && !resumedPendingConfirmation {
                 await loadQueue(readAloud: false)
+                guard authenticationIsCurrent(operationGeneration) else { return }
                 await loadPickerPerformance()
+                guard authenticationIsCurrent(operationGeneration) else { return }
             }
 
             let name = sessionProfile?.activeWorkspace.name ?? "the selected organization"
-            workspaceStatus = "Now using " + name + ". Organization-scoped data is refreshed."
-            status = "Organization changed to " + name + "."
+            workspaceStatus = resumedPendingHandoff || resumedPendingConfirmation
+                ? "Now using " + name + ". The saved picker command remains protected until its server status is resolved."
+                : "Now using " + name + ". Organization-scoped data is refreshed."
+            if !resumedPendingHandoff && !resumedPendingConfirmation {
+                status = "Organization changed to " + name + "."
+            }
+        } catch PickingAPIError.sessionSuperseded {
+            // Logout or a replacement authentication flow owns presentation.
+            return
         } catch PickingAPIError.unauthorized {
+            guard authenticationIsCurrent(operationGeneration) else { return }
             sessionProfile = nil
             isAuthenticated = false
             workspaceStatus = "Your session expired while changing organizations. Sign in again."
             status = "Sign in to continue."
         } catch {
+            guard authenticationIsCurrent(operationGeneration) else { return }
             workspaceStatus = "Organization change failed: " + error.localizedDescription
         }
     }
@@ -873,24 +978,43 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func logout() async {
+        // Logout wins presentation immediately, but an already-committed
+        // workspace switch may have rotated the server session token. Wait for
+        // that one authenticated mutation to finish installing its token, then
+        // log out that exact session. The stale switch continuation is fenced
+        // by this generation and cannot repopulate local UI.
+        authenticationGeneration &+= 1
+        isAuthBusy = true
+        defer { isAuthBusy = false }
+        isAuthenticated = false
+        sessionProfile = nil
+        clearPublishedPickProjection()
+        await waitForWorkspaceSwitchToFinish()
+        var serverLogoutError: Error?
         do {
             try await api.logout()
         } catch {
-            status = "Sign out failed: \(error.localizedDescription)"
-            return
+            serverLogoutError = error
         }
         await WebSessionBridge.clearCookies()
         GIDSignIn.sharedInstance.signOut()
         biometrics.forgetAuthenticatedSession()
         isLocallyLocked = false
-        sessionProfile = nil
-        isAuthenticated = false
         codeRequested = false
         code = ""
         currentTask = nil
         currentScanStage = nil
         readyToConfirm = false
-        status = "Signed out."
+        hasPendingConfirmation = false
+        hasPendingPickHandoff = false
+        pendingPickHandoffDetail = nil
+        pendingPickHandoffRecoveryWorkspaceId = nil
+        showPickHandoffConfirmation = false
+        pickHandoffReason = ""
+        resetPendingConfirmationBlocker()
+        status = serverLogoutError == nil
+            ? "Signed out."
+            : "Signed out on this device. The server sign-out response was unavailable."
         managerOrders = []
         managerPickers = []
         pickerPerformance = []
@@ -898,6 +1022,24 @@ final class PickingPhoneModel: ObservableObject {
         googleAuthState = nil
         isGoogleLinkBusy = false
         googleLinkStatus = "Each user links their own Google account after signing in with a magic code."
+    }
+
+    private func authenticationIsCurrent(_ generation: UInt64) -> Bool {
+        generation == authenticationGeneration && isAuthenticated
+    }
+
+    private func waitForWorkspaceSwitchToFinish() async {
+        guard isWorkspaceBusy else { return }
+        await withCheckedContinuation { continuation in
+            workspaceSwitchCompletionWaiters.append(continuation)
+        }
+    }
+
+    private func finishWorkspaceSwitch() {
+        isWorkspaceBusy = false
+        let waiters = workspaceSwitchCompletionWaiters
+        workspaceSwitchCompletionWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 
     private static var presentingViewController: UIViewController? {
@@ -912,14 +1054,25 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func loadQueue(readAloud: Bool = true) async {
-        guard !hasPendingConfirmation else {
-            status = "Resolve the pending confirmation before loading new work."
+        guard !hasPendingConfirmation,
+              !hasPendingPickHandoff,
+              !isRequestingPickHandoff else {
+            status = "Resolve the saved confirmation or handoff before loading new work."
             return
         }
         isQueueBusy = true
         defer { isQueueBusy = false }
         do {
             let queue = try await api.fetchQueue()
+            // A refresh may have started just before a durable handoff was
+            // persisted. Recheck after transport so its late response cannot
+            // replace protected workflow state while the exact POST is active.
+            guard !hasPendingConfirmation,
+                  !hasPendingPickHandoff,
+                  !isRequestingPickHandoff else {
+                status = "Resolve the saved confirmation or handoff before loading new work."
+                return
+            }
             isAuthenticated = true
             try await picking.replaceQueue(queue)
             status = queue.orders.isEmpty ? "No released picks are assigned to this worker." : "Assigned picks cached."
@@ -947,7 +1100,9 @@ final class PickingPhoneModel: ObservableObject {
         source: BarcodeSource,
         metaScanID: UUID? = nil
     ) async -> PickScanAcceptance? {
-        guard !hasPendingConfirmation else { return nil }
+        guard !hasPendingConfirmation,
+              !hasPendingPickHandoff,
+              !isRequestingPickHandoff else { return nil }
         guard shouldApplyMetaScanResult(metaScanID) else { return nil }
         do {
             let acceptance = try await picking.accept(BarcodeObservation(value: value, source: source))
@@ -1070,6 +1225,7 @@ final class PickingPhoneModel: ObservableObject {
 
     @discardableResult
     func beginProductScanWithMeta(contextToken: String) async -> Bool {
+        guard !hasPendingPickHandoff, !isRequestingPickHandoff else { return false }
         guard isMetaScanning || metaScanReady else {
             status = "Keep one camera-ready Meta glasses connection before starting the product scan."
             return false
@@ -1104,6 +1260,7 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func beginProductScanWithPhone(contextToken: String) async {
+        guard !hasPendingPickHandoff, !isRequestingPickHandoff else { return }
         if isMetaScanning { await cancelMetaScan() }
         do {
             try await picking.beginProductScan(contextToken: contextToken)
@@ -1124,6 +1281,7 @@ final class PickingPhoneModel: ObservableObject {
         source: PickCountSource = .iPhone,
         contextToken: String? = nil
     ) async -> Bool {
+        guard !hasPendingPickHandoff, !isRequestingPickHandoff else { return false }
         guard let context = currentStageContext,
               context.stage == .count,
               contextToken == nil || context.token == contextToken?.lowercased() else {
@@ -1213,6 +1371,10 @@ final class PickingPhoneModel: ObservableObject {
 
     @discardableResult
     func scanWithMeta() async -> PickScanAcceptance? {
+        guard !hasPendingPickHandoff, !isRequestingPickHandoff else {
+            ClawPilotScanDiagnostic.record("blocked:pick-handoff-active")
+            return nil
+        }
         guard !isMetaScanning else {
             ClawPilotScanDiagnostic.record("request-ignored:scan-already-active")
             return nil
@@ -1439,6 +1601,10 @@ final class PickingPhoneModel: ObservableObject {
     func handlePendingSystemScan() async {
         guard PendingMobileAction.hasMetaScanRequest else { return }
         guard !isRestoringSession else { return }
+        guard !hasPendingPickHandoff, !isRequestingPickHandoff else {
+            ClawPilotScanDiagnostic.record("blocked:pick-handoff-active")
+            return
+        }
         guard !isHandlingPendingSystemScan else {
             ClawPilotScanDiagnostic.record("request-ignored:handoff-already-active")
             return
@@ -1663,6 +1829,7 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func listenForPickCommand() async {
+        guard !hasPendingPickHandoff, !isRequestingPickHandoff else { return }
         guard currentTask != nil || readyToConfirm || isMetaScanning else {
             status = "Load an assigned pick before starting voice control."
             return
@@ -1703,18 +1870,15 @@ final class PickingPhoneModel: ObservableObject {
             }
             return .failure(metaStatus)
         case .readInstruction:
-            // Reuse the same installed voice selected on iPhone so Watch and
-            // phone instruction requests stay consistent. `voice.speak`
-            // keeps Apple speech as the safe fallback and never installs the
-            // optional model implicitly.
+            // The Watch requests iPhone playback only while one Meta glasses
+            // session is connected. iOS owns the final Bluetooth route and the
+            // audio background mode keeps playback eligible under screen lock.
             status = "Apple Watch requested the current pick instruction."
             guard currentTask != nil || readyToConfirm else {
                 return .failure("No current pick instruction is available.")
             }
             readInstruction()
-            return .success(metaConnectedDeviceCount == 1
-                ? "Instruction is playing through the current iPhone audio route."
-                : "Instruction playback started on the paired iPhone.")
+            return .success("Instruction requested on the connected Meta glasses audio route.")
         case .confirmPick:
             guard readyToConfirm else {
                 status = "Scan every assigned product before confirming from Apple Watch."
@@ -1891,13 +2055,14 @@ final class PickingPhoneModel: ObservableObject {
     func confirmOrder() async {
         guard readyToConfirm, !hasPendingConfirmation, !isConfirmingOrder else { return }
         isConfirmingOrder = true
+        hasPendingConfirmation = true
         defer { isConfirmingOrder = false }
         do {
             let command = try await picking.persistConfirmation()
-            hasPendingConfirmation = true
             try await syncEvidenceAndConfirm(command)
-            try await picking.finishConfirmedOrder()
+            try await picking.finishConfirmedOrder(command)
             hasPendingConfirmation = false
+            resetPendingConfirmationBlocker()
             status = "ClawPilot confirmed and audited the picks."
             voice.speak("Picks confirmed.", spanish: "Pedido confirmado.")
             refreshAudioRouteStatus()
@@ -1915,10 +2080,13 @@ final class PickingPhoneModel: ObservableObject {
             )
             refreshAudioRouteStatus()
         } catch {
-            let pending = try? await cache.loadOutbox()
-            status = pending?.scanEvidenceIdempotencyKey == nil
-                ? "Confirmation is pending or rejected. Refresh before new work: \(error.localizedDescription)"
-                : "Scans are saved on this iPhone but are not yet acknowledged by ClawPilot. Confirmation stays blocked; tap Retry exact confirmation when online."
+            let confirmationError = error
+            do {
+                let pending = try await cache.loadOutbox()
+                applyConfirmationFailure(confirmationError, command: pending)
+            } catch {
+                protectUnreadablePendingConfirmation(error)
+            }
         }
     }
 
@@ -1933,44 +2101,592 @@ final class PickingPhoneModel: ObservableObject {
         try await api.confirm(command)
     }
 
-    func retryPendingConfirmation() async {
-        guard let pending = try? await cache.loadOutbox() else {
+    func presentActivePickHandoff() async {
+        guard !hasPendingConfirmation,
+              !hasPendingPickHandoff,
+              await picking.canRequestActivePickHandoff() else {
+            status = "Only a wholly unpicked current order can be handed to a manager."
+            return
+        }
+        showPhoneScanner = false
+        showCountEntry = false
+        stopListeningForPickCommand()
+        if isMetaScanning { await cancelMetaScan() }
+        guard await picking.canRequestActivePickHandoff() else {
+            status = "This order changed before handoff could be prepared."
+            return
+        }
+        pickHandoffReason = ""
+        showPickHandoffConfirmation = true
+        status = "Enter a reason for the manager handoff."
+    }
+
+    func presentBlockedConfirmationHandoff() {
+        guard hasPendingConfirmation,
+              pendingConfirmationRequiresManagerAction,
+              !hasPendingPickHandoff else { return }
+        pickHandoffReason = ""
+        showPickHandoffConfirmation = true
+    }
+
+    func submitPickHandoff() async {
+        let reason = pickHandoffReason.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !reason.isEmpty, !isRequestingPickHandoff else {
+            status = "Enter a reason for the manager before requesting handoff."
+            return
+        }
+        isRequestingPickHandoff = true
+        defer { isRequestingPickHandoff = false }
+
+        do {
+            let blockedConfirmation: ConfirmPicksCommand?
+            if hasPendingConfirmation {
+                guard pendingConfirmationRequiresManagerAction,
+                      let pending = try await cache.loadOutbox() else {
+                    throw PickingContractError.contextMismatch
+                }
+                blockedConfirmation = pending
+            } else {
+                showPhoneScanner = false
+                showCountEntry = false
+                stopListeningForPickCommand()
+                if isMetaScanning { await cancelMetaScan() }
+                guard await picking.canRequestActivePickHandoff() else {
+                    throw PickingContractError.contextMismatch
+                }
+                blockedConfirmation = nil
+            }
+            let command = try await picking.persistPickHandoff(
+                reason: reason,
+                blockedConfirmation: blockedConfirmation
+            )
+            hasPendingPickHandoff = true
+            showPickHandoffConfirmation = false
+            pickHandoffReason = ""
+            try await executePendingPickHandoff(command)
+        } catch {
+            do {
+                if let command = try await cache.loadHandoffOutbox() {
+                    hasPendingPickHandoff = true
+                    showPickHandoffConfirmation = false
+                    pendingPickHandoffDetail = pendingPickHandoffDetail
+                        ?? "The exact handoff request is saved. Retry will reuse the same command and idempotency key."
+                    status = "Picker handoff remains protected: \(error.localizedDescription)"
+                    _ = command
+                } else {
+                    hasPendingPickHandoff = false
+                    status = "Picker handoff was not requested: \(error.localizedDescription)"
+                }
+            } catch {
+                protectUnreadablePendingPickHandoff(error)
+            }
+        }
+    }
+
+    func retryPendingPickHandoff() async {
+        guard hasPendingPickHandoff, !isRequestingPickHandoff else { return }
+        isRequestingPickHandoff = true
+        defer { isRequestingPickHandoff = false }
+        do {
+            guard let command = try await cache.loadHandoffOutbox() else {
+                throw PickingContractError.contextMismatch
+            }
+            guard pickHandoffIdentityMatchesCurrentSession(command) else {
+                pendingPickHandoffDetail = "Sign in as \(command.workerEmail) in the organization that owns this saved handoff."
+                status = "Saved handoff identity does not match this session."
+                return
+            }
+            try await executePendingPickHandoff(command)
+        } catch {
+            pendingPickHandoffDetail = pendingPickHandoffDetail
+                ?? "The exact handoff remains saved and was not cleared."
+            status = "Picker handoff remains pending: \(error.localizedDescription)"
+        }
+    }
+
+    @discardableResult
+    private func resumeDurablePickHandoffIfNeeded() async -> Bool {
+        let command: PickHandoffCommand
+        do {
+            guard let loaded = try await cache.loadHandoffOutbox() else {
+                hasPendingPickHandoff = false
+                pendingPickHandoffDetail = nil
+                pendingPickHandoffRecoveryWorkspaceId = nil
+                return false
+            }
+            command = loaded
+        } catch {
+            protectUnreadablePendingPickHandoff(error)
+            return true
+        }
+        hasPendingPickHandoff = true
+        _ = try? await picking.restore()
+        await updateProjection()
+        guard let profile = sessionProfile else {
+            pendingPickHandoffRecoveryWorkspaceId = nil
+            pendingPickHandoffDetail = "Sign in with the picker account that created this saved handoff."
+            status = "Saved picker handoff is protected."
+            return true
+        }
+        guard profile.effectiveUser.email.lowercased() == command.workerEmail else {
+            pendingPickHandoffRecoveryWorkspaceId = nil
+            pendingPickHandoffDetail = "This saved handoff belongs to \(command.workerEmail) and its original organization. It was not sent under the current session."
+            status = "Saved picker handoff is protected."
+            return true
+        }
+        guard profile.activeWorkspace.organizationId == command.organizationId else {
+            pendingPickHandoffRecoveryWorkspaceId = profile.availableWorkspaces.contains {
+                $0.organizationId == command.organizationId
+            } ? command.organizationId : nil
+            pendingPickHandoffDetail = pendingPickHandoffRecoveryWorkspaceId == nil
+                ? "This account no longer has access to the organization that owns the saved handoff. Ask an administrator to restore access."
+                : "Return to the organization that owns this saved handoff. Its command and picking evidence remain untouched."
+            status = "Saved picker handoff belongs to a different organization."
+            return true
+        }
+        pendingPickHandoffRecoveryWorkspaceId = nil
+        guard (try? await picking.pendingPickHandoffContext(for: command)) != nil else {
+            pendingPickHandoffDetail = "The exact saved handoff context could not be verified and was not sent."
+            status = "Saved picker handoff is protected."
+            return true
+        }
+        // A handoff outbox takes precedence over confirmation recovery. Replaying
+        // this exact idempotent command is safe after either a transport failure
+        // or a crash after the server committed but before local retirement.
+        do {
+            try await executePendingPickHandoff(command)
+            return hasPendingPickHandoff
+        } catch {
+            pendingPickHandoffDetail = "The exact handoff request is saved. Tap Retry handoff when ClawPilot is reachable."
+            status = "Saved picker handoff remains pending: \(error.localizedDescription)"
+        }
+        return true
+    }
+
+    private func executePendingPickHandoff(
+        _ command: PickHandoffCommand
+    ) async throws {
+        guard pickHandoffIdentityMatchesCurrentSession(command) else {
+            throw PickingContractError.contextMismatch
+        }
+        status = "Requesting audited manager handoff…"
+        let result: PickHandoffResult
+        do {
+            result = try await api.requestPickHandoff(command)
+        } catch PickingAPIError.rejected(let code, let message) {
+            if try await recoverFromRejectedPickHandoff(
+                command,
+                code: code,
+                message: message
+            ) {
+                return
+            }
+            throw PickingAPIError.rejected(code: code, message: message)
+        }
+        let evidence = try result.evidence(for: command)
+        let replacementQueue = try await api.fetchQueue()
+        try await picking.retireHandedOffOrder(
+            command,
+            evidence: evidence,
+            replacementQueue: replacementQueue
+        )
+        hasPendingPickHandoff = false
+        hasPendingConfirmation = false
+        pendingPickHandoffDetail = nil
+        pendingPickHandoffRecoveryWorkspaceId = nil
+        resetPendingConfirmationBlocker()
+        await updateProjection()
+        status = replacementQueue.orders.isEmpty
+            ? "Manager handoff recorded. No other assigned picks are ready."
+            : "Manager handoff recorded. The next assigned pick is ready."
+        await loadPickerPerformance()
+        if currentTask != nil { readInstruction() }
+    }
+
+    private func recoverFromRejectedPickHandoff(
+        _ command: PickHandoffCommand,
+        code: String,
+        message: String
+    ) async throws -> Bool {
+        guard Self.isDeterministicPickHandoffRejection(code) else {
+            return false
+        }
+        if command.blockedConfirmationIdempotencyKey != nil {
+            // A manager may reconcile Shopify after the phone persisted its
+            // handoff but before the POST arrived. Only the existing exact,
+            // read-only confirmation proof may resolve that race.
+            let recheck = try await api.recheckPendingConfirmation(for: command)
+            guard recheck.pendingConfirmation.state == .reconciledExternalFulfillment else {
+                guard let durableConfirmation = try await cache.loadOutbox() else {
+                    throw PickingContractError.contextMismatch
+                }
+                try await picking.retireRejectedBlockedPickHandoff(
+                    command,
+                    confirmation: durableConfirmation
+                )
+                hasPendingPickHandoff = false
+                pendingPickHandoffDetail = nil
+                pendingPickHandoffRecoveryWorkspaceId = nil
+                applyConfirmationFailure(
+                    PickingAPIError.rejected(
+                        code: "OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILIATION_REQUIRED",
+                        message: "Handoff was rejected: \(message)"
+                    ),
+                    command: durableConfirmation
+                )
+                return true
+            }
+            let evidence = try recheck.pendingConfirmation.reconciliationEvidence()
+            let durableConfirmation = try await cache.loadOutbox()
+            try await picking.retireBlockedHandoffAfterExternalReconciliation(
+                command,
+                confirmation: durableConfirmation,
+                evidence: evidence,
+                replacementQueue: recheck.queue
+            )
+            hasPendingPickHandoff = false
             hasPendingConfirmation = false
+            pendingPickHandoffDetail = nil
+            pendingPickHandoffRecoveryWorkspaceId = nil
+            resetPendingConfirmationBlocker()
+            await updateProjection()
+            status = recheck.queue.orders.isEmpty
+                ? "Manager reconciliation verified. No other assigned picks are ready."
+                : "Manager reconciliation verified. The next assigned pick is ready."
+            await loadPickerPerformance()
+            if currentTask != nil { readInstruction() }
+            return true
+        }
+
+        // This structured response proves the active handoff did not commit.
+        // Replace only with the signed worker's authoritative queue and retire
+        // only the exact handoff outbox; confirmation state is never touched.
+        let replacementQueue = try await api.fetchQueue()
+        try await picking.retireRejectedActivePickHandoff(
+            command,
+            replacementQueue: replacementQueue
+        )
+        hasPendingPickHandoff = false
+        pendingPickHandoffDetail = nil
+        pendingPickHandoffRecoveryWorkspaceId = nil
+        await updateProjection()
+        status = "Handoff was not completed: \(message) Assigned work was refreshed."
+        return true
+    }
+
+    private static func isDeterministicPickHandoffRejection(_ code: String) -> Bool {
+        [
+            "OPERATIONS_ORDER_NOT_FOUND",
+            "OPERATIONS_ORDER_VERSION_CONFLICT",
+            "OPERATIONS_PICK_HANDOFF_INVALID",
+            "OPERATIONS_PICK_HANDOFF_ALREADY_STARTED",
+            "OPERATIONS_PICK_HANDOFF_ACTOR_MISMATCH",
+            "OPERATIONS_PICK_HANDOFF_CONFIRMATION_INVALID",
+            "OPERATIONS_PICK_HANDOFF_TASKS_CHANGED",
+            "OPERATIONS_PICK_HANDOFF_EXCEPTION_FAILED",
+        ].contains(code)
+    }
+
+    private func pickHandoffIdentityMatchesCurrentSession(
+        _ command: PickHandoffCommand
+    ) -> Bool {
+        guard let profile = sessionProfile else { return false }
+        return profile.activeWorkspace.organizationId == command.organizationId
+            && profile.effectiveUser.email.lowercased() == command.workerEmail
+    }
+
+    private func protectUnreadablePendingPickHandoff(_ error: Error) {
+        hasPendingPickHandoff = true
+        pendingPickHandoffRecoveryWorkspaceId = nil
+        pendingPickHandoffDetail = "The saved handoff could not be read safely. New work and organization changes remain blocked."
+        status = "Saved handoff storage needs attention: \(error.localizedDescription)"
+    }
+
+    @discardableResult
+    private func resumeDurableConfirmationIfNeeded() async -> Bool {
+        let pending: ConfirmPicksCommand
+        do {
+            guard let loaded = try await cache.loadOutbox() else {
+                hasPendingConfirmation = false
+                resetPendingConfirmationBlocker()
+                return false
+            }
+            pending = loaded
+        } catch {
+            protectUnreadablePendingConfirmation(error)
+            return true
+        }
+        hasPendingConfirmation = true
+        _ = try? await picking.restore()
+        await updateProjection()
+        guard let context = try? await picking.pendingConfirmationContext(
+            for: pending
+        ), let profile = sessionProfile else {
+            pendingConfirmationIdentityMismatch = true
+            pendingConfirmationDetail = "The saved confirmation context could not be verified. Sign in with the original picker account and ask a manager to review the order."
+            status = "Saved confirmation context is protected and was not replayed."
+            return true
+        }
+
+        let signedInWorker = profile.effectiveUser.email.lowercased()
+        guard signedInWorker == context.workerEmail else {
+            pendingConfirmationIdentityMismatch = true
+            pendingConfirmationRecoveryWorkspaceId = nil
+            pendingConfirmationDetail = "This confirmation belongs to \(context.workerEmail). Sign in as that picker; ClawPilot will not replay it under \(signedInWorker)."
+            status = "Different picker account required. The saved command was not sent."
+            return true
+        }
+        guard profile.activeWorkspace.organizationId == context.organizationId else {
+            pendingConfirmationIdentityMismatch = false
+            pendingConfirmationRecoveryWorkspaceId = profile.availableWorkspaces.contains {
+                $0.organizationId == context.organizationId
+            } ? context.organizationId : nil
+            pendingConfirmationDetail = pendingConfirmationRecoveryWorkspaceId == nil
+                ? "The saved confirmation belongs to an organization this account cannot currently access. Ask an administrator to restore access."
+                : "Return to the organization where this pick was assigned. The saved command will remain untouched until then."
+            status = "Saved confirmation belongs to a different organization and was not sent."
+            return true
+        }
+
+        pendingConfirmationIdentityMismatch = false
+        pendingConfirmationRecoveryWorkspaceId = nil
+        status = "Checking the exact prior confirmation with ClawPilot."
+        do {
+            let recheck = try await api.recheckPendingConfirmation(pending)
+            if try await applyPendingConfirmationRecheck(
+                recheck,
+                command: pending
+            ) {
+                return true
+            }
+        } catch {
+            // Restoration is read-only. A network failure or unrecognized
+            // server state never silently replays a command that may already
+            // have received a terminal response. The worker may explicitly
+            // retry the exact durable command below only after seeing this UI.
+        }
+        guard context.containsExactOrder else {
+            pendingConfirmationIdentityMismatch = true
+            pendingConfirmationDetail = "ClawPilot could not verify the server resolution for this interrupted local retirement. The saved command remains protected for manager review."
+            status = "Server resolution could not be verified; no confirmation was sent."
+            return true
+        }
+        resetPendingConfirmationBlocker()
+        hasPendingConfirmation = true
+        pendingConfirmationDetail = "The saved command was not sent automatically. Retry explicitly to replay its exact bytes and idempotency key."
+        status = "Prior confirmation remains pending. Review it, then tap Retry exact confirmation."
+        return true
+    }
+
+    func retryPendingConfirmation() async {
+        guard !isConfirmingOrder else { return }
+        isConfirmingOrder = true
+        defer { isConfirmingOrder = false }
+        guard !pendingConfirmationRequiresManagerAction else {
+            await recheckPendingConfirmationAfterManagerAction()
+            return
+        }
+        let pending: ConfirmPicksCommand
+        do {
+            guard let loaded = try await cache.loadOutbox() else {
+                hasPendingConfirmation = false
+                resetPendingConfirmationBlocker()
+                return
+            }
+            pending = loaded
+        } catch {
+            protectUnreadablePendingConfirmation(error)
+            return
+        }
+        guard let profile = sessionProfile,
+              let context = try? await picking.pendingConfirmationContext(for: pending),
+              context.allowsExactReplay,
+              profile.activeWorkspace.organizationId == context.organizationId,
+              profile.effectiveUser.email.lowercased() == context.workerEmail else {
+            _ = await resumeDurableConfirmationIfNeeded()
             return
         }
         do {
             try await syncEvidenceAndConfirm(pending)
-            try await picking.finishConfirmedOrder()
+            try await picking.finishConfirmedOrder(pending)
             hasPendingConfirmation = false
+            resetPendingConfirmationBlocker()
             status = "Pending confirmation reconciled."
             await loadQueue()
         } catch {
-            status = pending.scanEvidenceIdempotencyKey == nil
-                ? "The exact confirmation remains unresolved."
-                : "Scans remain saved on this iPhone and unacknowledged. Confirmation stays blocked; retry when online."
+            applyConfirmationFailure(error, command: pending)
         }
     }
 
+    func recheckPendingConfirmationAfterManagerAction() async {
+        guard hasPendingConfirmation, !isRecheckingPendingConfirmation else { return }
+        let pending: ConfirmPicksCommand
+        do {
+            guard let loaded = try await cache.loadOutbox() else {
+                hasPendingConfirmation = false
+                resetPendingConfirmationBlocker()
+                await updateProjection()
+                return
+            }
+            pending = loaded
+        } catch {
+            protectUnreadablePendingConfirmation(error)
+            return
+        }
+        isRecheckingPendingConfirmation = true
+        defer { isRecheckingPendingConfirmation = false }
+        status = "Checking whether a manager reconciled this order."
+        do {
+            let recheck = try await api.recheckPendingConfirmation(pending)
+            _ = try await applyPendingConfirmationRecheck(
+                recheck,
+                command: pending,
+                keepUnresolvedBlocked: true
+            )
+        } catch {
+            pendingConfirmationRequiresManagerAction = true
+            pendingConfirmationDetail = "ClawPilot could not verify manager reconciliation. The saved confirmation remains protected on this iPhone."
+            status = "Manager reconciliation has not been verified: \(error.localizedDescription)"
+        }
+    }
+
+    @discardableResult
+    private func applyPendingConfirmationRecheck(
+        _ result: PendingConfirmationRecheckResult,
+        command: ConfirmPicksCommand,
+        keepUnresolvedBlocked: Bool = false
+    ) async throws -> Bool {
+        let pending = result.pendingConfirmation
+        switch pending.state {
+        case .managerActionRequired:
+            pendingConfirmationRequiresManagerAction = true
+            pendingConfirmationDetail = pending.message
+            status = "Manager action required before this pick can continue."
+            return true
+        case .reconciledExternalFulfillment:
+            let evidence = try pending.reconciliationEvidence()
+            try await picking.retireExternallyReconciledConfirmation(
+                command,
+                evidence: evidence,
+                replacementQueue: result.queue
+            )
+            hasPendingConfirmation = false
+            resetPendingConfirmationBlocker()
+            await updateProjection()
+            status = result.queue.orders.isEmpty
+                ? "Manager reconciliation verified. No other assigned picks are ready."
+                : "Manager reconciliation verified. The next assigned pick is ready."
+            await loadPickerPerformance()
+            if currentTask != nil { readInstruction() }
+            return true
+        case .unresolved:
+            if keepUnresolvedBlocked {
+                pendingConfirmationRequiresManagerAction = true
+                pendingConfirmationDetail = pending.message
+                status = "Manager reconciliation is not yet verified."
+                return true
+            }
+            return false
+        }
+    }
+
+    private func applyConfirmationFailure(
+        _ error: Error,
+        command: ConfirmPicksCommand?,
+        restoring: Bool = false
+    ) {
+        if case PickingAPIError.rejected(let code, let message) = error,
+           code == "OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILIATION_REQUIRED" {
+            hasPendingConfirmation = command != nil
+            pendingConfirmationRequiresManagerAction = true
+            pendingConfirmationDetail = "\(message) A manager must reconcile the order in Operations; this phone will only recheck the read-only server result."
+            status = "Manager action required. Retrying this confirmation cannot resolve the Shopify conflict."
+            return
+        }
+        resetPendingConfirmationBlocker()
+        status = command?.scanEvidenceIdempotencyKey == nil
+            ? "The exact confirmation remains unresolved: \(error.localizedDescription)"
+            : (restoring
+                ? "Prior scans remain saved on this iPhone but are not yet acknowledged by ClawPilot. Confirmation stays blocked; retry when online."
+                : "Scans are saved on this iPhone but are not yet acknowledged by ClawPilot. Confirmation stays blocked; tap Retry exact confirmation when online.")
+    }
+
+    private func resetPendingConfirmationBlocker() {
+        pendingConfirmationRequiresManagerAction = false
+        pendingConfirmationIdentityMismatch = false
+        pendingConfirmationRecoveryWorkspaceId = nil
+        pendingConfirmationDetail = nil
+    }
+
+    private func protectUnreadablePendingConfirmation(_ error: Error) {
+        hasPendingConfirmation = true
+        pendingConfirmationIdentityMismatch = true
+        pendingConfirmationRecoveryWorkspaceId = nil
+        pendingConfirmationDetail = "The saved confirmation could not be read safely. New work and organization changes remain blocked so no picking evidence is lost."
+        status = "Saved confirmation storage needs attention: \(error.localizedDescription)"
+    }
+
     private func updateProjection() async {
-        currentTask = await picking.currentTask()
-        currentScanStage = await picking.currentScanStage()
-        currentWorkflowStage = await picking.currentWorkflowStage()
-        currentStageContext = await picking.currentStageContext()
+        guard let profile = sessionProfile,
+              await picking.queueIdentityMatches(
+                  organizationId: profile.activeWorkspace.organizationId,
+                  workerEmail: profile.effectiveUser.email
+              ) else {
+            clearPublishedPickProjection()
+            return
+        }
+        let projectedTask = await picking.currentTask()
+        let projectedScanStage = await picking.currentScanStage()
+        let projectedWorkflowStage = await picking.currentWorkflowStage()
+        let projectedStageContext = await picking.currentStageContext()
+        let activeOrder = await picking.currentOrder()
+        let projectedHandoffEligibility = await picking.canRequestActivePickHandoff()
+        let watchSnapshot = await picking.makeWatchSnapshot(
+            authorizedOrganizationId: profile.activeWorkspace.organizationId,
+            authorizedWorkerEmail: profile.effectiveUser.email,
+            instructionLanguageCode: instructionLanguage.languageCode,
+            // A Watch tap stays on the Watch when the phone is locked or in a
+            // pocket. One connected Meta session opts into iPhone playback so
+            // AVAudioSession can select the glasses Bluetooth route and reuse
+            // the installed enhanced voice pack. If the phone is unreachable,
+            // the Watch policy still falls back to local Apple speech.
+            readInstructionOnPhone: metaConnectedDeviceCount == 1
+        )
+        // Recheck after the actor awaits so a concurrent workspace transition
+        // cannot publish fields gathered from a queue that is no longer owned
+        // by the freshly authenticated profile.
+        guard profile == sessionProfile,
+              await picking.queueIdentityMatches(
+                  organizationId: profile.activeWorkspace.organizationId,
+                  workerEmail: profile.effectiveUser.email
+              ) else {
+            clearPublishedPickProjection()
+            return
+        }
+        currentTask = projectedTask
+        currentScanStage = projectedScanStage
+        currentWorkflowStage = projectedWorkflowStage
+        currentStageContext = projectedStageContext
         if currentStageContext?.stage == .count {
             showCountEntry = currentStageContext?.token != dismissedCountContextToken
         } else {
             showCountEntry = false
             dismissedCountContextToken = nil
         }
-        let activeOrder = await picking.currentOrder()
         readyToConfirm = currentTask == nil && activeOrder != nil
-        watch.publish(await picking.makeWatchSnapshot(
-            instructionLanguageCode: instructionLanguage.languageCode,
-            // The optional voice pack is installed only on iPhone. Route a
-            // reachable Watch request through iPhone regardless of whether
-            // Meta glasses are connected so it can use that pack consistently.
-            // The Watch keeps its local Apple-speech fallback while unreachable.
-            readInstructionOnPhone: true
-        ))
+        activePickHandoffEligible = projectedHandoffEligibility
+        watch.publish(watchSnapshot)
+    }
+
+    private func clearPublishedPickProjection() {
+        currentTask = nil
+        currentScanStage = nil
+        currentWorkflowStage = nil
+        currentStageContext = nil
+        showCountEntry = false
+        dismissedCountContextToken = nil
+        readyToConfirm = false
+        activePickHandoffEligible = false
+        watch.publish(nil)
     }
 }

@@ -14,6 +14,7 @@ import type {
   OperationsOrderStatus,
   OperationsWorkspace,
 } from '@/lib/operations/types'
+import { canRequestOperationsPickHandoff } from '@/lib/operations/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   authorizeCommerceActiveTransitionInPostgres,
@@ -43,6 +44,7 @@ import {
   recordWearablePickScanEvidenceFromPostgres,
   reconcileShopifyExternalFulfillmentFromPostgres,
   releaseOperationsOrderFromPostgres,
+  requestOperationsPickHandoffFromPostgres,
   retryOperationsCommerceFulfillmentExportFromPostgres,
   runMockOperationsProofFromPostgres,
   updateOperationsActivationInPostgres,
@@ -1447,6 +1449,58 @@ export async function POST(req: NextRequest) {
         expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
         assignedTo: textValue(body.assignedTo, 'Assigned picker', 254),
         reason: textValue(body.reason, 'Assignment reason', 500),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'request-pick-handoff') {
+      if (!canRequestOperationsPickHandoff(capabilities)) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to request a picker handoff',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'orderGlobalId',
+          'expectedRowVersion',
+          'expectedAssignedTaskCount',
+          'reason',
+          'blockedConfirmationIdempotencyKey',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await requestOperationsPickHandoffFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+        expectedRowVersion: integerValue(
+          body.expectedRowVersion,
+          'Order version',
+          0,
+          2_147_483_647,
+        ),
+        expectedAssignedTaskCount: integerValue(
+          body.expectedAssignedTaskCount,
+          'Assigned task count',
+          1,
+          200,
+        ),
+        reason: textValue(body.reason, 'Picker handoff reason', 500),
+        blockedConfirmationIdempotencyKey: textValue(
+          body.blockedConfirmationIdempotencyKey,
+          'Blocked confirmation idempotency key',
+          200,
+          false,
+        ) || undefined,
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })
