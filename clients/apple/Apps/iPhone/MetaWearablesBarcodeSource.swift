@@ -120,7 +120,7 @@ struct MetaBarcodeDecodeTarget: @unchecked Sendable {
     }
 
     static func location(expectedValue: String?) -> Self {
-        Self(expectedValue: expectedValue, symbologies: [.code128])
+        Self(expectedValue: expectedValue, symbologies: [.code128, .qr])
     }
 
     static func product(expectedValue: String?) -> Self {
@@ -482,8 +482,19 @@ private final class MetaVisionFrameProcessor: @unchecked Sendable {
     }
 
     private enum InputContent: @unchecked Sendable {
-        case photo(data: Data, orientation: CGImagePropertyOrientation)
+        case photo(data: Data, orientations: [UInt32])
         case video(VideoFrame)
+    }
+
+    private struct OrientationDecodeResult {
+        let decision: MetaBarcodeDecodeDecision
+        let attemptedOrientations: [UInt32]
+        let winningOrientation: UInt32?
+        let diagnosticDetails: [String]
+    }
+
+    private enum ProcessingAbort: Error {
+        case staleGeneration
     }
 
     private struct WorkItem: @unchecked Sendable {
@@ -597,7 +608,9 @@ private final class MetaVisionFrameProcessor: @unchecked Sendable {
         enqueuePhoto(
             photo.data,
             dimensions: properties.dimensions,
-            orientation: properties.orientation,
+            orientations: MetaBarcodeOrientationPlan.photo(
+                metadataRawValue: properties.orientationRawValue
+            ),
             now: Self.nowNanoseconds()
         )
     }
@@ -663,7 +676,7 @@ private final class MetaVisionFrameProcessor: @unchecked Sendable {
     private func enqueuePhoto(
         _ data: Data,
         dimensions: String,
-        orientation: CGImagePropertyOrientation,
+        orientations: [UInt32],
         now: UInt64
     ) {
         var shouldStartWorker = false
@@ -671,7 +684,7 @@ private final class MetaVisionFrameProcessor: @unchecked Sendable {
         lock.lock()
         let item = WorkItem(
             kind: .photo,
-            content: .photo(data: data, orientation: orientation),
+            content: .photo(data: data, orientations: orientations),
             dimensions: dimensions,
             queuedAtNanoseconds: now,
             generation: generation,
@@ -742,21 +755,27 @@ private final class MetaVisionFrameProcessor: @unchecked Sendable {
     private func process(_ item: WorkItem) {
         guard isCurrent(item) else { return }
         let startedAt = Self.nowNanoseconds()
-        let request = VNDetectBarcodesRequest()
-        request.symbologies = item.target.symbologies
         do {
+            let result: OrientationDecodeResult
             switch item.content {
-            case let .photo(data, orientation):
-                try VNImageRequestHandler(
-                    data: data,
-                    orientation: orientation
-                ).perform([request])
+            case let .photo(data, orientations):
+                result = try decodePhoto(
+                    data,
+                    orientations: orientations,
+                    item: item
+                )
             case let .video(frame):
-                try VNImageRequestHandler(
-                    cmSampleBuffer: frame.sampleBuffer,
-                    orientation: .up
-                ).perform([request])
+                result = try decodeVideo(frame, item: item)
             }
+            guard isCurrent(item) else { return }
+            finish(
+                item,
+                decision: result.decision,
+                startedAt: startedAt,
+                diagnosticDetails: result.diagnosticDetails
+            )
+        } catch ProcessingAbort.staleGeneration {
+            return
         } catch {
             guard isCurrent(item) else { return }
             recordResult(
@@ -767,7 +786,153 @@ private final class MetaVisionFrameProcessor: @unchecked Sendable {
             )
             return
         }
+    }
 
+    private func decodePhoto(
+        _ data: Data,
+        orientations: [UInt32],
+        item: WorkItem
+    ) throws -> OrientationDecodeResult {
+        let barcodeSearch = try MetaBarcodeOrientationPlan.firstResult(
+            orientations: orientations
+        ) { rawOrientation -> MetaBarcodeDecodeDecision? in
+            guard isCurrent(item) else { throw ProcessingAbort.staleGeneration }
+            guard let orientation = CGImagePropertyOrientation(rawValue: rawOrientation) else {
+                return nil
+            }
+            let decision = try decodeBarcodes(
+                handler: VNImageRequestHandler(data: data, orientation: orientation),
+                target: item.target
+            )
+            return Self.hasBarcodeCandidates(decision) ? decision : nil
+        }
+        var diagnosticDetails = Self.orientationDiagnosticDetails(
+            prefix: "",
+            attempted: barcodeSearch.attemptedOrientations,
+            winner: barcodeSearch.winningOrientation
+        )
+        if let decision = barcodeSearch.result {
+            diagnosticDetails.append("ocr_outcome=not-needed")
+            return OrientationDecodeResult(
+                decision: decision,
+                attemptedOrientations: barcodeSearch.attemptedOrientations,
+                winningOrientation: barcodeSearch.winningOrientation,
+                diagnosticDetails: diagnosticDetails
+            )
+        }
+
+        guard let expectedValue = item.target.expectedValue,
+              !expectedValue.isEmpty
+        else {
+            diagnosticDetails.append(contentsOf: [
+                "ocr_outcome=disabled",
+                "ocr_candidates=0",
+                "ocr_ms=0",
+            ])
+            return OrientationDecodeResult(
+                decision: .zeroCandidates,
+                attemptedOrientations: barcodeSearch.attemptedOrientations,
+                winningOrientation: nil,
+                diagnosticDetails: diagnosticDetails
+            )
+        }
+
+        let ocrStartedAt = Self.nowNanoseconds()
+        var recognizedCandidateCount = 0
+        let ocrSearch = try MetaBarcodeOrientationPlan.firstResult(
+            orientations: orientations
+        ) { rawOrientation -> Float? in
+            guard isCurrent(item) else { throw ProcessingAbort.staleGeneration }
+            guard let orientation = CGImagePropertyOrientation(rawValue: rawOrientation) else {
+                return nil
+            }
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = false
+            try VNImageRequestHandler(
+                data: data,
+                orientation: orientation
+            ).perform([request])
+            let candidates = (request.results ?? []).flatMap { observation in
+                observation.topCandidates(3)
+            }
+            recognizedCandidateCount += candidates.count
+            return candidates.first(where: {
+                MetaExpectedBarcodeTextMatcher.matches(
+                    observed: $0.string,
+                    expectedValue: expectedValue
+                )
+            })?.confidence
+        }
+        diagnosticDetails.append(contentsOf: Self.orientationDiagnosticDetails(
+            prefix: "ocr_",
+            attempted: ocrSearch.attemptedOrientations,
+            winner: ocrSearch.winningOrientation
+        ))
+        diagnosticDetails.append(
+            "ocr_outcome=\(ocrSearch.result == nil ? "no-exact-match" : "matched")"
+        )
+        diagnosticDetails.append("ocr_candidates=\(recognizedCandidateCount)")
+        diagnosticDetails.append(
+            "ocr_ms=\(Self.milliseconds(from: ocrStartedAt, to: Self.nowNanoseconds()))"
+        )
+        let decision = ocrSearch.result.map { confidence in
+            MetaBarcodeDecodeDecision.selected(
+                MetaBarcodeCandidate(payload: expectedValue, confidence: confidence)
+            )
+        } ?? .zeroCandidates
+        return OrientationDecodeResult(
+            decision: decision,
+            attemptedOrientations: barcodeSearch.attemptedOrientations,
+            winningOrientation: nil,
+            diagnosticDetails: diagnosticDetails
+        )
+    }
+
+    private func decodeVideo(
+        _ frame: VideoFrame,
+        item: WorkItem
+    ) throws -> OrientationDecodeResult {
+        guard isCurrent(item) else { throw ProcessingAbort.staleGeneration }
+        let handler: VNImageRequestHandler
+        let orientation: CGImagePropertyOrientation
+        if let image = frame.makeUIImage(),
+           let cgImage = image.cgImage {
+            orientation = Self.cgImagePropertyOrientation(image.imageOrientation)
+            handler = VNImageRequestHandler(
+                cgImage: cgImage,
+                orientation: orientation
+            )
+        } else {
+            orientation = .up
+            handler = VNImageRequestHandler(
+                cmSampleBuffer: frame.sampleBuffer,
+                orientation: orientation
+            )
+        }
+        let decision = try decodeBarcodes(handler: handler, target: item.target)
+        let winningOrientation = Self.hasBarcodeCandidates(decision)
+            ? orientation.rawValue
+            : nil
+        return OrientationDecodeResult(
+            decision: decision,
+            attemptedOrientations: [orientation.rawValue],
+            winningOrientation: winningOrientation,
+            diagnosticDetails: Self.orientationDiagnosticDetails(
+                prefix: "",
+                attempted: [orientation.rawValue],
+                winner: winningOrientation
+            )
+        )
+    }
+
+    private func decodeBarcodes(
+        handler: VNImageRequestHandler,
+        target: MetaBarcodeDecodeTarget
+    ) throws -> MetaBarcodeDecodeDecision {
+        let request = VNDetectBarcodesRequest()
+        request.symbologies = target.symbologies
+        try handler.perform([request])
         let candidates = (request.results ?? []).compactMap { observation -> MetaBarcodeCandidate? in
             guard let payload = observation.payloadStringValue,
                   !payload.isEmpty
@@ -779,34 +944,72 @@ private final class MetaVisionFrameProcessor: @unchecked Sendable {
         }
         let decision = arbitrator.decide(
             candidates: candidates,
-            expectedValue: item.target.expectedValue
+            expectedValue: target.expectedValue
         )
-        finish(item, decision: decision, startedAt: startedAt)
+        return decision
+    }
+
+    private static func hasBarcodeCandidates(_ decision: MetaBarcodeDecodeDecision) -> Bool {
+        switch decision {
+        case .zeroCandidates: false
+        case .selected, .ambiguous: true
+        }
+    }
+
+    private static func orientationDiagnosticDetails(
+        prefix: String,
+        attempted: [UInt32],
+        winner: UInt32?
+    ) -> [String] {
+        let attempts = attempted.isEmpty
+            ? "none"
+            : attempted.map(String.init).joined(separator: ",")
+        return [
+            "\(prefix)orientation_attempts=\(attempts)",
+            "\(prefix)orientation_winner=\(winner.map(String.init) ?? "none")",
+        ]
+    }
+
+    private static func cgImagePropertyOrientation(
+        _ orientation: UIImage.Orientation
+    ) -> CGImagePropertyOrientation {
+        switch orientation {
+        case .up: .up
+        case .upMirrored: .upMirrored
+        case .down: .down
+        case .downMirrored: .downMirrored
+        case .left: .left
+        case .leftMirrored: .leftMirrored
+        case .right: .right
+        case .rightMirrored: .rightMirrored
+        @unknown default: .up
+        }
     }
 
     private func finish(
         _ item: WorkItem,
         decision: MetaBarcodeDecodeDecision,
-        startedAt: UInt64
+        startedAt: UInt64,
+        diagnosticDetails: [String]
     ) {
         let now = Self.nowNanoseconds()
         var emittedValue: String?
         var outcome: String
-        var details = ""
+        var detailParts = diagnosticDetails
         lock.lock()
         if terminal {
             lock.unlock()
             return
         } else if item.generation != generation {
             outcome = "dropped"
-            details = "reason=stale-generation"
+            detailParts.append("reason=stale-generation")
         } else {
             switch decision {
             case .zeroCandidates:
                 outcome = "zero"
             case let .ambiguous(candidateCount):
                 outcome = "processed"
-                details = "selection=ambiguous:candidates=\(candidateCount)"
+                detailParts.append("selection=ambiguous:candidates=\(candidateCount)")
             case let .selected(candidate):
                 let isExpected = arbitrator.isExpected(
                     candidate.payload,
@@ -819,15 +1022,15 @@ private final class MetaVisionFrameProcessor: @unchecked Sendable {
                     // photo with a wrong candidate. Exact expected matches remain
                     // immediate so photo priority does not add scan latency.
                     outcome = "processed"
-                    details = "selection=deferred-nonexpected-for-photo"
+                    detailParts.append("selection=deferred-nonexpected-for-photo")
                 } else {
                     emittedValue = reducer.accept(decision)
                     if emittedValue == nil {
                         outcome = "dropped"
-                        details = "reason=already-emitted"
+                        detailParts.append("reason=already-emitted")
                     } else {
                         outcome = "processed"
-                        details = "selection=emitted:confidence=\(candidate.confidence)"
+                        detailParts.append("selection=emitted:confidence=\(candidate.confidence)")
                         pendingPhotos.removeAll(keepingCapacity: true)
                         pendingVideo = nil
                     }
@@ -839,7 +1042,7 @@ private final class MetaVisionFrameProcessor: @unchecked Sendable {
             item,
             outcome: outcome,
             startedAt: startedAt,
-            details: details
+            details: detailParts.joined(separator: ":")
         )
         if let emittedValue { continuation.yield(emittedValue) }
     }
@@ -911,11 +1114,11 @@ private final class MetaVisionFrameProcessor: @unchecked Sendable {
 
     private func imageProperties(
         in data: Data
-    ) -> (dimensions: String, orientation: CGImagePropertyOrientation) {
+    ) -> (dimensions: String, orientationRawValue: UInt32?) {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
                 as? [CFString: Any]
-        else { return ("unknown", .up) }
+        else { return ("unknown", nil) }
         let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue
         let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue
         let dimensions: String
@@ -925,8 +1128,10 @@ private final class MetaVisionFrameProcessor: @unchecked Sendable {
             dimensions = "unknown"
         }
         let rawOrientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.uint32Value
-        let orientation = rawOrientation.flatMap(CGImagePropertyOrientation.init(rawValue:)) ?? .up
-        return (dimensions, orientation)
+        let orientationRawValue = rawOrientation
+            .flatMap(CGImagePropertyOrientation.init(rawValue:))?
+            .rawValue
+        return (dimensions, orientationRawValue)
     }
 
     private static func nowNanoseconds() -> UInt64 {

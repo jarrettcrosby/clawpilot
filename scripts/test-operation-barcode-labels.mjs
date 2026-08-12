@@ -77,6 +77,8 @@ const labels = loadBarcodeLabels()
 
 const plain = (value) => JSON.parse(JSON.stringify(value))
 
+assert.equal(labels.BARCODE_LABEL_TEMPLATE_VERSION, 'warehouse-barcode-zpl-v3')
+
 assert.deepEqual(
   plain(labels.providerBarcodeIdentity('657227000247')),
   { value: '657227000247', symbology: 'UPC-A', sourceIdentity: 'UPC-A' },
@@ -113,208 +115,328 @@ assert.deepEqual(plain(labels.parseClawPilotWarehouseBarcode('CP1L-GWL0123456789
 })
 assert.equal(labels.parseClawPilotWarehouseBarcode('657227000247'), null)
 
+const boxesOverlap = (left, right) => (
+  left[0] < right[0] + right[2]
+  && left[0] + left[2] > right[0]
+  && left[1] < right[1] + right[3]
+  && left[1] + left[3] > right[1]
+)
+
 const mediaContracts = [
   {
-    media: 'label_2x1', width: 406, length: 203, moduleWidth: 3, barcodeHeight: 76,
-    widthInches: 2, heightInches: 1, previewBarcodeHeight: 0.4,
-    previewRows: [0.14, 0.4, 0.1, 0.11, 0.09], previewGap: 0.02, previewPaddingY: 0.04,
+    media: 'label_2x1', width: 406, length: 203, widthInches: 2, heightInches: 1,
+    minimumModuleWidth: 1, maximumModuleWidth: 3,
+    boxes: {
+      title: [12, 5, 382, 22], linear: [0, 32, 406, 76], value: [12, 113, 382, 16],
+      details: [12, 135, 382, 16], identity: [12, 157, 382, 13], footer: [12, 178, 382, 11],
+    },
   },
   {
-    media: 'label_3x1', width: 609, length: 203, moduleWidth: 5, barcodeHeight: 84,
-    widthInches: 3, heightInches: 1, previewBarcodeHeight: 0.42,
-    previewRows: [0.15, 0.42, 0.09, 0.11, 0.07], previewGap: 0.02, previewPaddingY: 0.04,
+    media: 'label_3x1', width: 609, length: 203, widthInches: 3, heightInches: 1,
+    minimumModuleWidth: 1, maximumModuleWidth: 5,
+    boxes: {
+      title: [14, 5, 581, 24], linear: [0, 34, 609, 84], value: [14, 122, 581, 18],
+      details: [14, 144, 581, 17], identity: [14, 166, 581, 14], footer: [14, 184, 581, 11],
+    },
   },
   {
-    media: 'label_4x2', width: 812, length: 406, moduleWidth: 7, barcodeHeight: 180,
-    widthInches: 4, heightInches: 2, previewBarcodeHeight: 0.82,
-    previewRows: [0.28, 0.82, 0.16, 0.22, 0.14], previewGap: 0.035, previewPaddingY: 0.12,
+    media: 'label_4x2', width: 812, length: 406, widthInches: 4, heightInches: 2,
+    minimumModuleWidth: 2, maximumModuleWidth: 4, qrMagnification: 7,
+    boxes: {
+      title: [24, 12, 764, 36], linear: [0, 60, 812, 92], value: [24, 160, 764, 24],
+      qr: [24, 198, 203, 203], details: [250, 202, 538, 50],
+      identity: [250, 270, 538, 26], footer: [250, 324, 538, 52],
+    },
   },
   {
-    media: 'label_4x6', width: 812, length: 1218, moduleWidth: 7, barcodeHeight: 720,
-    widthInches: 4, heightInches: 6, previewBarcodeHeight: 3.5,
-    previewRows: [0.8, 3.5, 0.3, 0.4, 0.37], previewGap: 0.0375, previewPaddingY: 0.24,
+    media: 'label_4x6', width: 812, length: 1218, widthInches: 4, heightInches: 6,
+    minimumModuleWidth: 2, maximumModuleWidth: 5, qrMagnification: 10,
+    boxes: {
+      title: [36, 30, 740, 80], linear: [0, 130, 812, 600], value: [36, 750, 740, 50],
+      qr: [36, 850, 290, 290], details: [370, 850, 406, 90],
+      identity: [370, 970, 406, 55], footer: [370, 1050, 406, 80],
+    },
   },
   {
-    media: 'label_4x8', width: 812, length: 1624, moduleWidth: 7, barcodeHeight: 1020,
-    widthInches: 4, heightInches: 8, previewBarcodeHeight: 5,
-    previewRows: [0.9, 5, 0.35, 0.5, 0.37], previewGap: 0.08, previewPaddingY: 0.28,
+    media: 'label_4x8', width: 812, length: 1624, widthInches: 4, heightInches: 8,
+    minimumModuleWidth: 2, maximumModuleWidth: 5, qrMagnification: 10,
+    boxes: {
+      title: [36, 40, 740, 100], linear: [0, 170, 812, 900], value: [36, 1090, 740, 60],
+      qr: [36, 1260, 290, 290], details: [370, 1260, 406, 105],
+      identity: [370, 1395, 406, 65], footer: [370, 1480, 406, 90],
+    },
   },
 ]
 
-const renderedMedia = new Map()
+function testQrFormatBits(mask) {
+  let remainder = mask
+  for (let index = 0; index < 10; index += 1) {
+    remainder = (remainder << 1) ^ ((remainder >>> 9) * 0x537)
+  }
+  return ((mask << 10) | remainder) ^ 0x5412
+}
+
+function testQrMask(mask, x, y) {
+  if (mask === 0) return (x + y) % 2 === 0
+  if (mask === 1) return y % 2 === 0
+  if (mask === 2) return x % 3 === 0
+  if (mask === 3) return (x + y) % 3 === 0
+  if (mask === 4) return (Math.floor(y / 2) + Math.floor(x / 3)) % 2 === 0
+  if (mask === 5) return (x * y) % 2 + (x * y) % 3 === 0
+  if (mask === 6) return ((x * y) % 2 + (x * y) % 3) % 2 === 0
+  return ((x + y) % 2 + (x * y) % 3) % 2 === 0
+}
+
+function decodeQrV1M(matrix) {
+  assert.equal(matrix.length, 21)
+  assert.ok(matrix.every((row) => row.length === 21))
+  let format = 0
+  for (let index = 0; index <= 5; index += 1) if (matrix[index][8]) format |= 1 << index
+  if (matrix[7][8]) format |= 1 << 6
+  if (matrix[8][8]) format |= 1 << 7
+  if (matrix[8][7]) format |= 1 << 8
+  for (let index = 9; index < 15; index += 1) if (matrix[8][14 - index]) format |= 1 << index
+  const mask = Array.from({ length: 8 }, (_, current) => current)
+    .find((current) => testQrFormatBits(current) === format)
+  assert.notEqual(mask, undefined, 'QR format information must identify a valid M-level mask')
+
+  const functions = Array.from({ length: 21 }, () => Array(21).fill(false))
+  const mark = (x, y) => { if (x >= 0 && y >= 0 && x < 21 && y < 21) functions[y][x] = true }
+  for (let index = 0; index < 21; index += 1) { mark(6, index); mark(index, 6) }
+  for (const [centerX, centerY] of [[3, 3], [17, 3], [3, 17]]) {
+    for (let y = -4; y <= 4; y += 1) for (let x = -4; x <= 4; x += 1) mark(centerX + x, centerY + y)
+  }
+  for (let index = 0; index <= 5; index += 1) mark(8, index)
+  mark(8, 7); mark(8, 8); mark(7, 8)
+  for (let index = 9; index < 15; index += 1) mark(14 - index, 8)
+  for (let index = 0; index < 8; index += 1) mark(20 - index, 8)
+  for (let index = 8; index < 15; index += 1) mark(8, 6 + index)
+  mark(8, 13)
+
+  const bits = []
+  for (let right = 20; right >= 1; right -= 2) {
+    if (right === 6) right = 5
+    for (let vertical = 0; vertical < 21; vertical += 1) {
+      const y = ((right + 1) & 2) === 0 ? 20 - vertical : vertical
+      for (let offset = 0; offset < 2; offset += 1) {
+        const x = right - offset
+        if (!functions[y][x]) bits.push(Number(matrix[y][x] !== testQrMask(mask, x, y)))
+      }
+    }
+  }
+  assert.equal(bits.length, 208, 'Version 1 has exactly 26 codewords and no remainder modules')
+  const codewords = Array.from({ length: 26 }, (_, index) => (
+    Number.parseInt(bits.slice(index * 8, index * 8 + 8).join(''), 2)
+  ))
+  const dataBits = codewords.slice(0, 16).flatMap((codeword) => (
+    Array.from({ length: 8 }, (_, bit) => (codeword >>> (7 - bit)) & 1)
+  ))
+  let cursor = 0
+  const readBits = (length) => {
+    const result = Number.parseInt(dataBits.slice(cursor, cursor + length).join(''), 2)
+    cursor += length
+    return result
+  }
+  const mode = readBits(4)
+  let decoded = ''
+  if (mode === 0b0001) {
+    let remaining = readBits(10)
+    while (remaining >= 3) { decoded += String(readBits(10)).padStart(3, '0'); remaining -= 3 }
+    if (remaining === 2) decoded += String(readBits(7)).padStart(2, '0')
+    if (remaining === 1) decoded += String(readBits(4))
+  } else {
+    assert.equal(mode, 0b0010)
+    let remaining = readBits(9)
+    while (remaining >= 2) {
+      const pair = readBits(11)
+      decoded += '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:'[Math.floor(pair / 45)]
+      decoded += '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:'[pair % 45]
+      remaining -= 2
+    }
+    if (remaining === 1) decoded += '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:'[readBits(6)]
+  }
+  return { decoded, mask, codewords }
+}
+
+const qrConformanceVectors = new Map([
+  ['657227000247', '76fb3c73762cc789810028fcbbf3b21a36671ec8b2abd40995d1ddba2dfcdc3e'],
+  ['CP1L-GWL0123456789AV', '4ac3733fd71b3fcb5aaf9c111e3d88633a3a064e34ad1e4b016351208be895cc'],
+])
+for (const [value, expectedDigest] of qrConformanceVectors) {
+  const modules = plain(labels.warehouseBarcodeQrModules(value))
+  const digest = crypto.createHash('sha256')
+    .update(modules.map((row) => row.map(Number).join('')).join('\n'))
+    .digest('hex')
+  assert.equal(digest, expectedDigest, 'QR modules must match the independently generated qrcode 1.5.4 vector')
+  assert.equal(decodeQrV1M(modules).decoded, value, 'QR modules must independently decode to the exact barcode value')
+}
+
+const representativeItems = [
+  item(),
+  item({ barcodeValue: '96385074', symbology: 'EAN-8', sourceIdentity: 'EAN-8' }),
+  item({ barcodeValue: '4006381333931', symbology: 'EAN-13', sourceIdentity: 'EAN-13' }),
+  item({ barcodeValue: '10012345000017', symbology: 'CODE128', sourceIdentity: 'GTIN-14' }),
+  item({
+    targetGlobalId: 'gp0123456789av', barcodeValue: 'CP1P-GP0123456789AV',
+    symbology: 'CODE128', sourceIdentity: 'CODE128', barcodeSource: 'internal',
+  }),
+  item({
+    targetGlobalId: 'gwl0123456789av', displayName: 'PICKFACE-01', humanCode: 'FULFILLMENT - pick',
+    barcodeValue: 'CP1L-GWL0123456789AV', symbology: 'CODE128',
+    sourceIdentity: 'LOCATION', barcodeSource: 'location',
+  }),
+]
 
 for (const contract of mediaContracts) {
-  const { media, width, length } = contract
-  const zpl = labels.renderBarcodeLabelsZpl({
-    targetType: 'product',
-    warehouseGlobalId: 'gwh1234567',
-    warehouseName: 'Main Warehouse',
-    media,
-    items: [item()],
-  })
-  assert.match(zpl, new RegExp(`\\^PW${width}`))
-  assert.match(zpl, new RegExp(`\\^LL${length}`))
-  assert.match(zpl, /\^BUN,/)
-  assert.match(zpl, /\^BUN,[^\n]*\^FD65722700024\^FS/)
-  assert.doesNotMatch(zpl, /\^BUN,[^\n]*\^FD657227000247\^FS/)
-  assert.doesNotMatch(zpl, /\^BCN,/)
-
-  const by = zpl.match(/\^BY(\d+),2,(\d+)/)
-  assert.ok(by, `${media} must declare barcode module width and height`)
-  assert.equal(Number(by[1]), contract.moduleWidth, `${media} module width must scale with media width`)
-  assert.equal(Number(by[2]), contract.barcodeHeight, `${media} barcode height must scale with media height`)
-
-  const barcode = zpl.match(/\^FO(\d+),(\d+)\^BUN,(\d+),/)
-  assert.ok(barcode, `${media} must place the UPC-A barcode explicitly`)
-  const barcodeX = Number(barcode[1])
-  const barcodeY = Number(barcode[2])
-  const barcodeHeight = Number(barcode[3])
-  const quietZoneDots = contract.moduleWidth * 10
-  const barcodeWidth = contract.moduleWidth * 95
-  assert.ok(barcodeX >= quietZoneDots, `${media} must preserve the left UPC quiet zone`)
-  assert.ok(
-    width - barcodeX - barcodeWidth >= quietZoneDots,
-    `${media} must preserve the right UPC quiet zone`,
-  )
-  assert.ok(barcodeY + barcodeHeight <= length, `${media} barcode must not overflow vertically`)
-
-  for (const field of zpl.matchAll(/\^FO(\d+),(\d+)\^A0N,(\d+),(\d+)\^FB(\d+),(\d+),/g)) {
-    const [, x, y, fontHeight, , fieldWidth, lines] = field.map(Number)
-    assert.ok(x + fieldWidth <= width, `${media} text field must not overflow horizontally`)
-    assert.ok(y + fontHeight * lines <= length, `${media} text field must not overflow vertically`)
+  const entries = Object.entries(contract.boxes)
+  for (const [name, box] of entries) {
+    assert.ok(box[0] >= 0 && box[1] >= 0, `${contract.media} ${name} must start in bounds`)
+    assert.ok(box[0] + box[2] <= contract.width, `${contract.media} ${name} must fit horizontally`)
+    assert.ok(box[1] + box[3] <= contract.length, `${contract.media} ${name} must fit vertically`)
+  }
+  for (let left = 0; left < entries.length; left += 1) {
+    for (let right = left + 1; right < entries.length; right += 1) {
+      assert.ok(
+        !boxesOverlap(entries[left][1], entries[right][1]),
+        `${contract.media} ${entries[left][0]} and ${entries[right][0]} must not overlap`,
+      )
+    }
+  }
+  if (contract.qrMagnification) {
+    assert.equal(contract.boxes.qr[2], 29 * contract.qrMagnification)
+    assert.equal(contract.boxes.qr[3], 29 * contract.qrMagnification)
+  } else {
+    assert.equal(contract.boxes.qr, undefined)
   }
 
-  const preview = labels.renderBarcodeLabelsPreviewHtml(`gbl-${media}`, {
-    targetType: 'product',
-    warehouseGlobalId: 'gwh1234567',
-    warehouseName: 'Main Warehouse',
-    media,
-    items: [item()],
+  for (const representative of representativeItems) {
+    const zpl = labels.renderBarcodeLabelsZpl({
+      targetType: representative.barcodeSource === 'location' ? 'location' : 'product',
+      warehouseGlobalId: 'gwh1234567', warehouseName: 'Main Warehouse',
+      media: contract.media, items: [representative],
+    })
+    assert.match(zpl, new RegExp(`\\^PW${contract.width}`))
+    assert.match(zpl, new RegExp(`\\^LL${contract.length}`))
+    const by = zpl.match(/\^BY(\d+),2,(\d+)/)
+    const barcodeLine = zpl.split('\n').find((line) => /\^(?:BU|B8|BE|BC)N,/.test(line)) || ''
+    const position = barcodeLine.match(/\^FO(\d+),(\d+)/)
+    assert.ok(by && position, `${contract.media} must place the primary linear barcode`)
+    const moduleWidth = Number(by[1])
+    const barcodeHeight = Number(by[2])
+    const barcodeX = Number(position[1])
+    const barcodeY = Number(position[2])
+    const modules = representative.symbology === 'EAN-8'
+      ? 67
+      : representative.symbology === 'UPC-A' || representative.symbology === 'EAN-13'
+        ? 95
+        : 11 * (representative.barcodeValue.length + 2) + 15
+    const quiet = representative.symbology === 'EAN-13' ? { left: 11, right: 7 } : { left: 10, right: 10 }
+    const linear = contract.boxes.linear
+    assert.ok(moduleWidth >= contract.minimumModuleWidth, `${contract.media} must preserve minimum linear module width`)
+    assert.equal(barcodeY, linear[1])
+    assert.equal(barcodeHeight, linear[3])
+    assert.ok(barcodeX - linear[0] >= quiet.left * moduleWidth, `${contract.media} must preserve left quiet zone`)
+    assert.ok(
+      linear[0] + linear[2] - barcodeX - modules * moduleWidth >= quiet.right * moduleWidth,
+      `${contract.media} must preserve right quiet zone`,
+    )
+
+    if (contract.qrMagnification) {
+      const qr = contract.boxes.qr
+      assert.match(
+        zpl,
+        new RegExp(`\\^FO${qr[0] + 4 * contract.qrMagnification},${qr[1] + 4 * contract.qrMagnification}`
+          + `\\^BQN,2,${contract.qrMagnification}\\^FDMA,${representative.barcodeValue}\\^FS`),
+      )
+      assert.match(zpl, /QR same value/)
+    } else {
+      assert.doesNotMatch(zpl, /\^BQN,/)
+      assert.match(zpl, /linear only/)
+    }
+    assert.match(zpl, /warehouse-barcode-zpl-v3/)
+  }
+
+  const preview = labels.renderBarcodeLabelsPreviewHtml(`gbl-${contract.media}`, {
+    targetType: 'location', warehouseGlobalId: 'gwh1234567', warehouseName: 'Main Warehouse',
+    media: contract.media, items: [representativeItems.at(-1)],
   })
   assert.match(preview, new RegExp(`@page \\{ size: ${contract.widthInches}in ${contract.heightInches}in`))
-  assert.match(preview, new RegExp(`data-media="${media}"`))
-  assert.match(preview, new RegExp(`${contract.previewBarcodeHeight}in`))
-  const occupiedPreviewHeight = contract.previewRows.reduce((sum, row) => sum + row, 0)
-    + contract.previewGap * 4
-    + contract.previewPaddingY * 2
-  assert.ok(
-    occupiedPreviewHeight <= contract.heightInches + Number.EPSILON * 4,
-    `${media} preview layout must not overflow its physical page`,
+  assert.match(preview, new RegExp(`data-media="${contract.media}"`))
+  for (const [name, box] of entries) {
+    assert.match(preview, new RegExp(`data-${name}-box="${box.join(',')}"`))
+  }
+  const previewLinear = contract.boxes.linear
+  const previewModules = 11 * ('CP1L-GWL0123456789AV'.length + 2) + 15
+  const previewModuleWidth = Math.min(
+    contract.maximumModuleWidth,
+    Math.floor(previewLinear[2] / (previewModules + 20)),
   )
-  assert.ok(
-    occupiedPreviewHeight >= contract.heightInches * 0.99,
-    `${media} preview layout must use the available physical page`,
+  const previewLinearWidth = (previewModules + 20) * previewModuleWidth
+  const previewLinearX = previewLinear[0] + Math.floor((previewLinear[2] - previewLinearWidth) / 2)
+  assert.match(
+    preview,
+    new RegExp(`data-linear-render-box="${previewLinearX},${previewLinear[1]},${previewLinearWidth},${previewLinear[3]}"`),
   )
-  renderedMedia.set(media, { zpl, preview })
+  assert.match(preview, new RegExp(`data-linear-module-width="${previewModuleWidth}"`))
+  if (contract.qrMagnification) {
+    assert.match(preview, /data-code-mode="linear-and-qr"/)
+    assert.match(preview, /<svg class="qr-code" viewBox="0 0 29 29"/)
+    assert.match(preview, /data-version="1" data-modules="21" data-quiet-zone="4"/)
+    assert.match(preview, /aria-label="QR barcode CP1L-GWL0123456789AV"/)
+    assert.doesNotMatch(preview, /https?:\/\//)
+  } else {
+    assert.match(preview, /data-code-mode="linear-only"/)
+    assert.doesNotMatch(preview, /class="qr-code"/)
+  }
 }
 
-assert.ok(
-  mediaContracts.find(({ media }) => media === 'label_4x6').barcodeHeight
-    >= mediaContracts.find(({ media }) => media === 'label_3x1').barcodeHeight * 8,
-  '4 x 6 ZPL must render a substantially taller barcode than 3 x 1',
-)
-assert.ok(
-  mediaContracts.find(({ media }) => media === 'label_4x6').previewBarcodeHeight
-    >= mediaContracts.find(({ media }) => media === 'label_3x1').previewBarcodeHeight * 8,
-  '4 x 6 browser preview must render a substantially taller barcode than 3 x 1',
-)
-assert.match(
-  renderedMedia.get('label_4x6').zpl,
-  /ClawPilot product \(provider\) - warehouse-barcode-zpl-v2/,
-)
-
-const compactCode128 = labels.renderBarcodeLabelsZpl({
-  targetType: 'location',
-  warehouseGlobalId: 'gwh1234567',
-  warehouseName: 'Main Warehouse',
-  media: 'label_2x1',
-  items: [item({
-    targetGlobalId: 'gwl0123456789av',
-    displayName: 'PICKFACE-01',
-    humanCode: 'FULFILLMENT - pick',
-    barcodeValue: 'CP1L-GWL0123456789AV',
-    symbology: 'CODE128',
-    sourceIdentity: 'LOCATION',
-    barcodeSource: 'location',
-  })],
-})
-const compactCode128By = compactCode128.match(/\^BY(\d+),2,(\d+)/)
-const compactCode128Barcode = compactCode128.match(/\^FO(\d+),(\d+)\^BCN,(\d+),/)
-assert.ok(compactCode128By && compactCode128Barcode)
-const compactCode128ModuleWidth = Number(compactCode128By[1])
-const compactCode128Modules = 11 * ('CP1L-GWL0123456789AV'.length + 2) + 15
-const compactCode128X = Number(compactCode128Barcode[1])
-assert.ok(compactCode128X >= compactCode128ModuleWidth * 10)
-assert.ok(
-  406 - compactCode128X - compactCode128Modules * compactCode128ModuleWidth
-    >= compactCode128ModuleWidth * 10,
-  '2 x 1 must preserve Code 128 quiet zones without overflowing',
-)
-assert.match(compactCode128, /GWL0123456789AV - CODE128\/LOCATION/)
-assert.match(compactCode128, /ClawPilot location \(location\) - warehouse-barcode-zpl-v2/)
-
-for (const [symbology, barcodeValue, command, encodedData] of [
-  ['EAN-8', '96385074', '^B8N,', '9638507'],
-  ['EAN-13', '4006381333931', '^BEN,', '400638133393'],
+const legacySnapshot = {
+  targetType: 'product', warehouseGlobalId: 'gwh1234567', warehouseName: 'Main Warehouse',
+  media: 'label_4x6', items: [item()],
+}
+for (const [version, expectedDigest] of [
+  ['warehouse-barcode-zpl-v1', '83619ef06f6a27101230c148c7e3fe1d470ccbfc67c3e9c7a51b043cd47c0f41'],
+  ['warehouse-barcode-zpl-v2', '0ea5c26a44eefef4ac27a33e99fc69e029593aa426947ec6fda8ef413c18ddeb'],
 ]) {
-  const zpl = labels.renderBarcodeLabelsZpl({
-    targetType: 'product',
-    warehouseGlobalId: 'gwh1234567',
-    warehouseName: 'Main Warehouse',
-    media: 'label_3x1',
-    items: [item({ barcodeValue, symbology, sourceIdentity: symbology })],
-  })
-  assert.ok(zpl.includes(command))
-  const barcodeCommand = zpl.split('\n').find((line) => line.includes(command)) || ''
-  assert.ok(barcodeCommand.includes(`^FD${encodedData}^FS`))
-  assert.ok(!barcodeCommand.includes(`^FD${barcodeValue}^FS`))
+  const preview = labels.renderBarcodeLabelsPreviewHtml('gbl1234567', legacySnapshot, version)
+  assert.equal(
+    crypto.createHash('sha256').update(preview).digest('hex'),
+    expectedDigest,
+    `${version} preview must remain byte-for-byte compatible with its immutable batch`,
+  )
+  assert.doesNotMatch(preview, /class="qr-code"/)
 }
-
-const upcPreview = labels.renderBarcodeLabelsPreviewHtml('gbl1234567', {
-  targetType: 'product',
-  warehouseGlobalId: 'gwh1234567',
-  warehouseName: 'Main Warehouse',
-  media: 'label_3x1',
-  items: [item()],
-})
-assert.match(upcPreview, /@page \{ size: 3in 1in/)
-assert.match(upcPreview, /viewBox="0 0 115 90"/)
-assert.match(upcPreview, /Printed UPC-A &middot; Source UPC-A/)
-assert.match(upcPreview, /warehouse-barcode-zpl-v2/)
-
-const legacyPreview = labels.renderBarcodeLabelsPreviewHtml('gbl1234567', {
-  targetType: 'product',
-  warehouseGlobalId: 'gwh1234567',
-  warehouseName: 'Main Warehouse',
-  media: 'label_4x6',
-  items: [item()],
-}, 'warehouse-barcode-zpl-v1')
-assert.match(legacyPreview, /\.barcode \{ display: block; width: 100%; height: 1\.25in;/)
-assert.doesNotMatch(legacyPreview, /data-media="label_4x6"/)
 assert.throws(
-  () => labels.renderBarcodeLabelsPreviewHtml('gbl1234567', {
-    targetType: 'product',
-    warehouseGlobalId: 'gwh1234567',
-    warehouseName: 'Main Warehouse',
-    media: 'label_4x6',
-    items: [item()],
-  }, 'warehouse-barcode-zpl-unknown'),
+  () => labels.renderBarcodeLabelsPreviewHtml(
+    'gbl1234567', legacySnapshot, 'warehouse-barcode-zpl-unknown',
+  ),
   /template version is not supported/,
 )
+assert.throws(
+  () => labels.renderBarcodeLabelsZpl({
+    ...legacySnapshot,
+    items: [item({ barcodeValue: 'CP1^XZ' })],
+  }),
+  /barcode value is invalid/,
+  'ZPL control characters must never be interpolated into barcode data',
+)
+assert.throws(
+  () => labels.warehouseBarcodeQrModules('CP1L-GWL0123456789AVX'),
+  /barcode value is invalid/,
+  'The QR version bound must reject values beyond the normalized Global ID contract',
+)
 
-const gtinPreview = labels.renderBarcodeLabelsPreviewHtml('gbl1234568', {
-  targetType: 'product',
-  warehouseGlobalId: 'gwh1234567',
-  warehouseName: 'Main Warehouse',
-  media: 'label_4x2',
-  items: [item({
-    barcodeValue: '10012345000017',
-    symbology: 'CODE128',
-    sourceIdentity: 'GTIN-14',
-  })],
-})
-assert.match(gtinPreview, /Printed CODE128 &middot; Source GTIN-14/)
-assert.doesNotMatch(gtinPreview, /Printed GTIN-14/)
+const phoneCameraScanner = read('clients/apple/Apps/iPhone/PhoneCameraScanner.swift')
+assert.match(
+  phoneCameraScanner,
+  /recognizedDataTypes: \[\.barcode\(symbologies: \[\.code128, \.ean8, \.ean13, \.upce, \.qr\]\)\]/,
+  'The iPhone live scanner must accept the QR duplicate as well as primary retail and Code 128 labels',
+)
+assert.match(
+  phoneCameraScanner,
+  /request\.symbologies = \[\.code128, \.ean8, \.ean13, \.upce, \.qr\]/,
+  'The iPhone high-resolution fallback must accept the same QR symbology set',
+)
 
 const migration = read('db/migrations/0262_operations_barcode_label_printing.sql')
 const legacyGlobalIdSuffix = '[0-9]' + '{7}'
@@ -394,6 +516,9 @@ for (const fragment of [
   "preferredPrinters[labelBatch.globalId]",
   'label="Label size"',
   'setMedia(event.target.value as typeof media)',
+  "media === 'label_2x1' || media === 'label_3x1'",
+  'Compact stock prints the primary linear barcode only.',
+  'Prints the primary linear barcode plus a QR copy for phone and glasses cameras.',
 ]) {
   assert.ok(dialog.includes(fragment), `Missing batch-specific printer routing UI: ${fragment}`)
 }

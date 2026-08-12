@@ -102,4 +102,96 @@ final class MetaBarcodeDecodeArbitrationTests: XCTestCase {
         reducer.reset()
         XCTAssertEqual(reducer.accept(second), "CP1P-SECOND")
     }
+
+    func testPhotoOrientationPlanUsesMetadataFirstAndDeduplicatesCardinals() {
+        XCTAssertEqual(
+            MetaBarcodeOrientationPlan.photo(metadataRawValue: 6),
+            [6, 1, 8, 3]
+        )
+        XCTAssertEqual(
+            MetaBarcodeOrientationPlan.photo(metadataRawValue: 5),
+            [5, 1, 6, 8, 3]
+        )
+        XCTAssertEqual(
+            MetaBarcodeOrientationPlan.photo(metadataRawValue: nil),
+            [1, 6, 8, 3]
+        )
+        XCTAssertEqual(
+            MetaBarcodeOrientationPlan.photo(metadataRawValue: 99),
+            [1, 6, 8, 3]
+        )
+    }
+
+    func testOrientationSearchStopsAtFirstCandidate() {
+        var evaluated: [UInt32] = []
+        let search = MetaBarcodeOrientationPlan.firstResult(
+            orientations: [6, 1, 8, 3]
+        ) { orientation -> String? in
+            evaluated.append(orientation)
+            return orientation == 8 ? "candidate" : nil
+        }
+
+        XCTAssertEqual(evaluated, [6, 1, 8])
+        XCTAssertEqual(search.attemptedOrientations, [6, 1, 8])
+        XCTAssertEqual(search.winningOrientation, 8)
+        XCTAssertEqual(search.result, "candidate")
+    }
+
+    func testOrientationSearchReportsAllAttemptsWhenNoCandidateExists() {
+        let search = MetaBarcodeOrientationPlan.firstResult(
+            orientations: [1, 6, 8, 3]
+        ) { _ -> String? in nil }
+
+        XCTAssertEqual(search.attemptedOrientations, [1, 6, 8, 3])
+        XCTAssertNil(search.winningOrientation)
+        XCTAssertNil(search.result)
+    }
+
+    func testOrientationSearchStopsOnAmbiguousBarcodeDecision() {
+        let search = MetaBarcodeOrientationPlan.firstResult(
+            orientations: [1, 6, 8, 3]
+        ) { orientation -> MetaBarcodeDecodeDecision? in
+            orientation == 6 ? .ambiguous(candidateCount: 2) : nil
+        }
+
+        XCTAssertEqual(search.attemptedOrientations, [1, 6])
+        XCTAssertEqual(search.winningOrientation, 6)
+        XCTAssertEqual(search.result, .ambiguous(candidateCount: 2))
+    }
+
+    func testExpectedOCRTextAllowsOnlyCaseAndWhitespaceDifferences() {
+        XCTAssertTrue(
+            MetaExpectedBarcodeTextMatcher.matches(
+                observed: " cp1l  -  gwl9449010\n",
+                expectedValue: "CP1L-GWL9449010"
+            )
+        )
+        XCTAssertFalse(
+            MetaExpectedBarcodeTextMatcher.matches(
+                observed: "CP1L-GWL9449011",
+                expectedValue: "CP1L-GWL9449010"
+            )
+        )
+        XCTAssertFalse(
+            MetaExpectedBarcodeTextMatcher.matches(
+                observed: "CP1LGWL9449010",
+                expectedValue: "CP1L-GWL9449010"
+            )
+        )
+    }
+
+    func testExpectedOCRTextIsDisabledWithoutExpectedValue() {
+        XCTAssertFalse(
+            MetaExpectedBarcodeTextMatcher.matches(
+                observed: "CP1L-GWL9449010",
+                expectedValue: nil
+            )
+        )
+        XCTAssertFalse(
+            MetaExpectedBarcodeTextMatcher.matches(
+                observed: "",
+                expectedValue: ""
+            )
+        )
+    }
 }

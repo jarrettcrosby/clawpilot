@@ -152,7 +152,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
 
     func makeUIViewController(context: Context) -> PhoneCameraScannerContainerViewController {
         let scanner = DataScannerViewController(
-            recognizedDataTypes: [.barcode(symbologies: [.code128, .ean8, .ean13, .upce])],
+            recognizedDataTypes: [.barcode(symbologies: [.code128, .ean8, .ean13, .upce, .qr])],
             qualityLevel: .fast,
             recognizesMultipleItems: true,
             isHighFrameRateTrackingEnabled: true,
@@ -554,7 +554,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
             orientation: CGImagePropertyOrientation
         ) throws -> [String] {
             let request = VNDetectBarcodesRequest()
-            request.symbologies = [.code128, .ean8, .ean13, .upce]
+            request.symbologies = [.code128, .ean8, .ean13, .upce, .qr]
             let handler = VNImageRequestHandler(cgImage: image, orientation: orientation)
             try handler.perform([request])
             var seen: Set<String> = []

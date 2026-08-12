@@ -1246,11 +1246,11 @@ final class PickingPhoneModel: ObservableObject {
                 return lastAcceptance
             }
             if didTimeOut {
-                metaStatus = "No matching barcode was found within 15 seconds. Start another glasses scan or use the iPhone camera."
+                metaStatus = "No barcode found. Move closer until the barcode fills at least one-third of your view, then try again or use the iPhone camera."
                 ClawPilotScanDiagnostic.record("timeout:no-barcode")
                 voice.speak(
-                    "No barcode found. Try the glasses scan again or use the iPhone camera.",
-                    spanish: "No se encontró un código de barras. Intenta otra vez con las gafas o usa la cámara del iPhone."
+                    "No barcode found. Move closer until the barcode fills at least one-third of your view, then try again or use the iPhone camera.",
+                    spanish: "No se encontró un código de barras. Acércate hasta que el código ocupe al menos un tercio de tu campo de visión, luego intenta otra vez o usa la cámara del iPhone."
                 )
                 refreshAudioRouteStatus()
             } else {
