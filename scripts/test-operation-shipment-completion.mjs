@@ -986,6 +986,10 @@ async function verifyShipmentCompletion(databaseUrl) {
       mocks: {
         '@/lib/auditWriter': auditWriter,
         '@/lib/crm/stableId': stableId,
+        '@/lib/persistence/commerceOrderRevisions': {
+          async assertCommerceOrderRevisionExecutionCurrent() {},
+          CommerceOrderRevisionGateError: class extends Error {},
+        },
         '@/lib/integrations/carrierCheckoutRate': {
           rateCheckoutShipment: async () => {
             throw new Error(

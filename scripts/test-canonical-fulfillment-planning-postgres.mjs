@@ -3140,6 +3140,10 @@ async function verifyCanonicalPlanning(databaseUrl) {
           '@/lib/operations/barcodeLabels': barcodeLabels,
           '@/lib/persistence/cartonizationRateEvidence':
             cartonizationRateEvidence,
+          '@/lib/persistence/commerceOrderRevisions': {
+            async assertCommerceOrderRevisionExecutionCurrent() {},
+            CommerceOrderRevisionGateError: class extends Error {},
+          },
           '@/lib/persistence/crm': {
             stageCrmRecordWithClient: async () => {
               throw new Error(
