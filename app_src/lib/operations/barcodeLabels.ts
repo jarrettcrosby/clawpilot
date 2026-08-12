@@ -9,7 +9,8 @@ export const BARCODE_LABEL_MEDIA = [
   'label_4x6',
   'label_4x8',
 ] as const
-export const BARCODE_LABEL_TEMPLATE_VERSION = 'warehouse-barcode-zpl-v3' as const
+export const BARCODE_LABEL_TEMPLATE_VERSION = 'warehouse-barcode-zpl-v4' as const
+const LEGACY_BARCODE_LABEL_TEMPLATE_VERSION_V3 = 'warehouse-barcode-zpl-v3' as const
 const LEGACY_BARCODE_LABEL_TEMPLATE_VERSION_V2 = 'warehouse-barcode-zpl-v2' as const
 export const INTERNAL_PRODUCT_BARCODE_PREFIX = 'CP1P-' as const
 export const LOCATION_BARCODE_PREFIX = 'CP1L-' as const
@@ -566,6 +567,93 @@ const V3_MEDIA_GEOMETRY: Record<BarcodeLabelMedia, BarcodeLabelV3Geometry> = {
   },
 }
 
+// Version 4 leaves the proven one-inch media unchanged. On larger stock it
+// gives the linear symbol a standards-friendly height without allowing it to
+// dominate the label, and makes the duplicate camera code the primary visual
+// target. QR boxes include the required four-module quiet zone.
+const V4_MEDIA_GEOMETRY: Record<BarcodeLabelMedia, BarcodeLabelV3Geometry> = {
+  label_2x1: V3_MEDIA_GEOMETRY.label_2x1,
+  label_3x1: V3_MEDIA_GEOMETRY.label_3x1,
+  label_4x2: {
+    title: { x: 24, y: 12, width: 764, height: 36, fontHeight: 32, fontWidth: 27 },
+    linear: {
+      x: 0, y: 58, width: 812, height: 84,
+      maximumModuleWidth: 4, minimumModuleWidth: 2,
+    },
+    value: {
+      x: 24, y: 150, width: 764, height: 24,
+      fontHeight: 22, fontWidth: 18, alignment: 'C',
+    },
+    qr: { x: 24, y: 183, width: 203, height: 203, magnification: 7 },
+    details: {
+      x: 250, y: 188, width: 538, height: 50,
+      fontHeight: 30, fontWidth: 25, lines: 1,
+    },
+    identity: {
+      x: 250, y: 260, width: 538, height: 26,
+      fontHeight: 20, fontWidth: 16,
+    },
+    footer: {
+      x: 250, y: 316, width: 538, height: 52,
+      fontHeight: 15, fontWidth: 12, lines: 2,
+    },
+  },
+  label_4x6: {
+    title: {
+      x: 36, y: 28, width: 740, height: 78,
+      fontHeight: 38, fontWidth: 32, lines: 2,
+    },
+    linear: {
+      x: 0, y: 128, width: 812, height: 240,
+      maximumModuleWidth: 5, minimumModuleWidth: 2,
+    },
+    value: {
+      x: 36, y: 388, width: 740, height: 48,
+      fontHeight: 40, fontWidth: 32, alignment: 'C',
+    },
+    qr: { x: 232, y: 470, width: 348, height: 348, magnification: 12 },
+    details: {
+      x: 36, y: 850, width: 740, height: 62,
+      fontHeight: 44, fontWidth: 36, lines: 1, alignment: 'C',
+    },
+    identity: {
+      x: 36, y: 936, width: 740, height: 42,
+      fontHeight: 27, fontWidth: 22, lines: 1, alignment: 'C',
+    },
+    footer: {
+      x: 80, y: 1020, width: 652, height: 90,
+      fontHeight: 21, fontWidth: 17, lines: 3, alignment: 'C',
+    },
+  },
+  label_4x8: {
+    title: {
+      x: 36, y: 38, width: 740, height: 94,
+      fontHeight: 46, fontWidth: 38, lines: 2,
+    },
+    linear: {
+      x: 0, y: 160, width: 812, height: 300,
+      maximumModuleWidth: 5, minimumModuleWidth: 2,
+    },
+    value: {
+      x: 36, y: 480, width: 740, height: 56,
+      fontHeight: 46, fontWidth: 37, alignment: 'C',
+    },
+    qr: { x: 203, y: 590, width: 406, height: 406, magnification: 14 },
+    details: {
+      x: 36, y: 1050, width: 740, height: 74,
+      fontHeight: 50, fontWidth: 41, lines: 1, alignment: 'C',
+    },
+    identity: {
+      x: 36, y: 1150, width: 740, height: 52,
+      fontHeight: 31, fontWidth: 25, lines: 1, alignment: 'C',
+    },
+    footer: {
+      x: 80, y: 1240, width: 652, height: 96,
+      fontHeight: 23, fontWidth: 19, lines: 3, alignment: 'C',
+    },
+  },
+}
+
 function zplBarcode(item: BarcodeLabelItem, height: number) {
   const barcodeValue = safeWarehouseBarcodeValue(item.barcodeValue)
   // Zebra's retail barcode commands calculate the check digit themselves:
@@ -642,7 +730,7 @@ function zplTextField(input: {
 
 export function renderBarcodeLabelsZpl(snapshot: BarcodeLabelBatchSnapshot) {
   const geometry = MEDIA_GEOMETRY[snapshot.media]
-  const layout = V3_MEDIA_GEOMETRY[snapshot.media]
+  const layout = V4_MEDIA_GEOMETRY[snapshot.media]
   const labels: string[] = []
   for (const item of snapshot.items) {
     const barcodeValue = safeWarehouseBarcodeValue(item.barcodeValue)
@@ -664,6 +752,9 @@ export function renderBarcodeLabelsZpl(snapshot: BarcodeLabelBatchSnapshot) {
         : `Primary ${item.symbology}; linear only - ClawPilot ${snapshot.targetType} (${item.barcodeSource}) - ${BARCODE_LABEL_TEMPLATE_VERSION}`,
       130,
     )
+    const qrGraphic = layout.qr
+      ? qrCodeZplGraphic(barcodeValue, layout.qr.magnification)
+      : null
     for (let copy = 0; copy < item.copies; copy += 1) {
       const content = [
         zplTextField({
@@ -676,12 +767,12 @@ export function renderBarcodeLabelsZpl(snapshot: BarcodeLabelBatchSnapshot) {
           ...layout.value,
           value: barcodeValue,
         }),
-        ...(layout.qr ? [
-          // Model 2 + M error correction + automatic numeric/alphanumeric
-          // encoding. The validated 20-character ceiling keeps this at QR
-          // version 1; the reserved box adds four blank modules on every side.
-          `^FO${layout.qr.x + 4 * layout.qr.magnification},${layout.qr.y + 4 * layout.qr.magnification}`
-            + `^BQN,2,${layout.qr.magnification}^FDMA,${barcodeValue}^FS`,
+        ...(layout.qr && qrGraphic ? [
+          // Render the validated QR matrix as one deterministic raster graphic.
+          // This avoids model- and firmware-specific ^BQ parsing while making
+          // the physical ZPL bytes match the browser preview module-for-module.
+          `^FO${layout.qr.x + QR_QUIET_ZONE_MODULES * layout.qr.magnification},${layout.qr.y + QR_QUIET_ZONE_MODULES * layout.qr.magnification}`
+            + `${qrGraphic}^FS`,
         ] : []),
         zplTextField({
           ...layout.details,
@@ -979,13 +1070,75 @@ export function warehouseBarcodeQrModules(value: string) {
   return selected
 }
 
-function qrCodeSvg(value: string) {
+function qrCodeSvgV3(value: string) {
   const modules = warehouseBarcodeQrModules(value)
   const viewSize = QR_SIZE + QR_QUIET_ZONE_MODULES * 2
   const path = modules.flatMap((row, y) => row.flatMap((dark, x) => (
     dark ? [`M${x + QR_QUIET_ZONE_MODULES} ${y + QR_QUIET_ZONE_MODULES}h1v1h-1z`] : []
   ))).join('')
   return `<svg class="qr-code" viewBox="0 0 ${viewSize} ${viewSize}" role="img" aria-label="QR barcode ${html(value)}" data-version="${QR_VERSION}" data-modules="${QR_SIZE}" data-quiet-zone="${QR_QUIET_ZONE_MODULES}" shape-rendering="crispEdges"><rect width="${viewSize}" height="${viewSize}" fill="#fff"/><path d="${path}" fill="#000"/></svg>`
+}
+
+function qrCodeSvg(value: string) {
+  const modules = warehouseBarcodeQrModules(value)
+  const viewSize = QR_SIZE + QR_QUIET_ZONE_MODULES * 2
+  const rectangles = modules.flatMap((row, y) => row.flatMap((dark, x) => (
+    dark
+      ? [`<rect x="${x + QR_QUIET_ZONE_MODULES}" y="${y + QR_QUIET_ZONE_MODULES}" width="1" height="1" fill="#000"/>`]
+      : []
+  ))).join('')
+  return `<svg class="qr-code" viewBox="0 0 ${viewSize} ${viewSize}" role="img" aria-label="QR barcode ${html(value)}" data-version="${QR_VERSION}" data-modules="${QR_SIZE}" data-quiet-zone="${QR_QUIET_ZONE_MODULES}" shape-rendering="crispEdges"><rect width="${viewSize}" height="${viewSize}" fill="#fff"/>${rectangles}</svg>`
+}
+
+function qrCodeZplGraphic(value: string, magnification: number) {
+  const modules = warehouseBarcodeQrModules(value)
+  const dimension = QR_SIZE * magnification
+  const bytesPerRow = Math.ceil(dimension / 8)
+  const rows: string[] = []
+  for (let pixelY = 0; pixelY < dimension; pixelY += 1) {
+    const moduleY = Math.floor(pixelY / magnification)
+    let row = ''
+    for (let byteX = 0; byteX < bytesPerRow; byteX += 1) {
+      let byte = 0
+      for (let bit = 0; bit < 8; bit += 1) {
+        const pixelX = byteX * 8 + bit
+        const moduleX = Math.floor(pixelX / magnification)
+        if (
+          pixelX < dimension
+          && modules[moduleY][moduleX]
+        ) byte |= 1 << (7 - bit)
+      }
+      row += byte.toString(16).padStart(2, '0').toUpperCase()
+    }
+    rows.push(row)
+  }
+  const repeatCount = (count: number) => {
+    const high = Math.floor(count / 20)
+    const low = count % 20
+    return `${high ? String.fromCharCode('g'.charCodeAt(0) + high - 1) : ''}`
+      + `${low ? String.fromCharCode('G'.charCodeAt(0) + low - 1) : ''}`
+  }
+  const compressRow = (row: string) => {
+    let encoded = ''
+    for (let start = 0; start < row.length;) {
+      let end = start + 1
+      while (end < row.length && row[end] === row[start]) end += 1
+      const count = end - start
+      encoded += count < 4 ? row[start].repeat(count) : `${repeatCount(count)}${row[start]}`
+      start = end
+    }
+    return encoded
+  }
+  const compressedRows: string[] = []
+  let previous = ''
+  for (const row of rows) {
+    if (row === previous) compressedRows.push(':')
+    else if (/^0+$/.test(row)) compressedRows.push(',')
+    else compressedRows.push(compressRow(row))
+    previous = row
+  }
+  const byteCount = bytesPerRow * dimension
+  return `^GFA,${byteCount},${byteCount},${bytesPerRow},${compressedRows.join('')}`
 }
 
 function code128Svg(value: string) {
@@ -1173,12 +1326,14 @@ function boxContract(box: BarcodeLabelBox) {
   return `${box.x},${box.y},${box.width},${box.height}`
 }
 
-function renderBarcodeLabelsPreviewHtmlV3(
+function renderBarcodeLabelsPreviewHtmlPositioned(
   batchGlobalId: string,
   snapshot: BarcodeLabelBatchSnapshot,
+  templateVersion: typeof BARCODE_LABEL_TEMPLATE_VERSION | typeof LEGACY_BARCODE_LABEL_TEMPLATE_VERSION_V3,
+  layouts: Record<BarcodeLabelMedia, BarcodeLabelV3Geometry>,
 ) {
   const media = MEDIA_GEOMETRY[snapshot.media]
-  const layout = V3_MEDIA_GEOMETRY[snapshot.media]
+  const layout = layouts[snapshot.media]
   const labels = snapshot.items.flatMap((item) => Array.from(
     { length: item.copies },
     () => {
@@ -1197,12 +1352,12 @@ function renderBarcodeLabelsPreviewHtmlV3(
       }
       const mode = layout.qr ? 'linear-and-qr' : 'linear-only'
       const qr = layout.qr
-        ? `<div class="qr-code-box" style="${previewBoxStyle(layout.qr)}">${qrCodeSvg(barcodeValue)}</div>`
+        ? `<div class="qr-code-box" style="${previewBoxStyle(layout.qr)}">${templateVersion === LEGACY_BARCODE_LABEL_TEMPLATE_VERSION_V3 ? qrCodeSvgV3(barcodeValue) : qrCodeSvg(barcodeValue)}</div>`
         : ''
       const footer = layout.qr
-        ? `Primary ${html(item.symbology)} &middot; QR duplicates the same value &middot; ClawPilot ${html(snapshot.targetType)} (${html(item.barcodeSource)}) &middot; ${BARCODE_LABEL_TEMPLATE_VERSION}`
-        : `Primary ${html(item.symbology)} &middot; Compact linear-only label &middot; ClawPilot ${html(snapshot.targetType)} (${html(item.barcodeSource)}) &middot; ${BARCODE_LABEL_TEMPLATE_VERSION}`
-      return `<section class="label" data-media="${snapshot.media}" data-template="${BARCODE_LABEL_TEMPLATE_VERSION}" data-code-mode="${mode}" data-title-box="${boxContract(layout.title)}" data-linear-box="${boxContract(layout.linear)}" data-linear-render-box="${boxContract(linearRenderBox)}" data-linear-module-width="${linearBarcode.moduleWidth}" data-value-box="${boxContract(layout.value)}" data-details-box="${boxContract(layout.details)}" data-identity-box="${boxContract(layout.identity)}" data-footer-box="${boxContract(layout.footer)}"${layout.qr ? ` data-qr-box="${boxContract(layout.qr)}" data-qr-magnification="${layout.qr.magnification}"` : ''}>
+        ? `Primary ${html(item.symbology)} &middot; QR duplicates the same value &middot; ClawPilot ${html(snapshot.targetType)} (${html(item.barcodeSource)}) &middot; ${templateVersion}`
+        : `Primary ${html(item.symbology)} &middot; Compact linear-only label &middot; ClawPilot ${html(snapshot.targetType)} (${html(item.barcodeSource)}) &middot; ${templateVersion}`
+      return `<section class="label" data-media="${snapshot.media}" data-template="${templateVersion}" data-code-mode="${mode}" data-title-box="${boxContract(layout.title)}" data-linear-box="${boxContract(layout.linear)}" data-linear-render-box="${boxContract(linearRenderBox)}" data-linear-module-width="${linearBarcode.moduleWidth}" data-value-box="${boxContract(layout.value)}" data-details-box="${boxContract(layout.details)}" data-identity-box="${boxContract(layout.identity)}" data-footer-box="${boxContract(layout.footer)}"${layout.qr ? ` data-qr-box="${boxContract(layout.qr)}" data-qr-magnification="${layout.qr.magnification}"` : ''}>
       <h1 style="${previewTextStyle(layout.title)}">${html(item.displayName)}</h1>
       <div class="linear-code" style="${previewBoxStyle(linearRenderBox)}">${retailBarcodeSvg(item)}</div>
       <div class="value" style="${previewTextStyle(layout.value)}">${html(barcodeValue)}</div>
@@ -1238,6 +1393,30 @@ ${labels}
 </body></html>`
 }
 
+function renderBarcodeLabelsPreviewHtmlV3(
+  batchGlobalId: string,
+  snapshot: BarcodeLabelBatchSnapshot,
+) {
+  return renderBarcodeLabelsPreviewHtmlPositioned(
+    batchGlobalId,
+    snapshot,
+    LEGACY_BARCODE_LABEL_TEMPLATE_VERSION_V3,
+    V3_MEDIA_GEOMETRY,
+  )
+}
+
+function renderBarcodeLabelsPreviewHtmlV4(
+  batchGlobalId: string,
+  snapshot: BarcodeLabelBatchSnapshot,
+) {
+  return renderBarcodeLabelsPreviewHtmlPositioned(
+    batchGlobalId,
+    snapshot,
+    BARCODE_LABEL_TEMPLATE_VERSION,
+    V4_MEDIA_GEOMETRY,
+  )
+}
+
 export function renderBarcodeLabelsPreviewHtml(
   batchGlobalId: string,
   snapshot: BarcodeLabelBatchSnapshot,
@@ -1249,8 +1428,11 @@ export function renderBarcodeLabelsPreviewHtml(
   if (templateVersion === LEGACY_BARCODE_LABEL_TEMPLATE_VERSION_V2) {
     return renderBarcodeLabelsPreviewHtmlV2(batchGlobalId, snapshot)
   }
-  if (templateVersion === BARCODE_LABEL_TEMPLATE_VERSION) {
+  if (templateVersion === LEGACY_BARCODE_LABEL_TEMPLATE_VERSION_V3) {
     return renderBarcodeLabelsPreviewHtmlV3(batchGlobalId, snapshot)
+  }
+  if (templateVersion === BARCODE_LABEL_TEMPLATE_VERSION) {
+    return renderBarcodeLabelsPreviewHtmlV4(batchGlobalId, snapshot)
   }
   throw new Error('Barcode label template version is not supported')
 }

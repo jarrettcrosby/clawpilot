@@ -202,7 +202,22 @@ test('iPhone camera keeps a fast stage-aware live scan with an in-memory still f
   assert.match(lifecycle, /public struct PhoneCameraScanLifecycle: Sendable/)
   assert.match(camera, /let submissionToken = lifecycle\.beginSubmission\(\)/)
   assert.match(camera, /guard !Task\.isCancelled,[\s\S]*lifecycle\.completeSubmission\(submissionToken\)/)
-  assert.match(camera, /closeScanner\(\) \{\s*dismissScanner\(reason: "user"\)/)
+  assert.match(
+    camera,
+    /closeScanner\(\) \{\s*recordDiagnostic\("close-tapped"\)\s*dismissScanner\(reason: "user"\)/,
+  )
+  assert.match(camera, /closeButton\.addTarget\(self, action: #selector\(closeScanner\), for: \.touchUpInside\)/)
+  assert.doesNotMatch(camera, /scanner\.overlayContainerView/)
+  assert.match(camera, /let controlsOverlayView = PhoneCameraControlsOverlayView\(\)/)
+  assert.match(
+    camera,
+    /view\.addSubview\(scanner\.view\)[\s\S]*view\.addSubview\(controlsOverlayView\)/,
+  )
+  assert.match(camera, /view\.bringSubviewToFront\(controlsOverlayView\)/)
+  assert.match(
+    camera,
+    /final class PhoneCameraControlsOverlayView: UIView[\s\S]*override func hitTest[\s\S]*return hitView === self \? nil : hitView/,
+  )
   assert.match(
     camera,
     /private func dismissScanner\(reason: String\) \{\s*guard lifecycle\.dismiss\(\) else \{ return \}[\s\S]*stopAllWork\(scanner\)[\s\S]*parent\.onClose\(\)/,

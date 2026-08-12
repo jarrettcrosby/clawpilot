@@ -77,7 +77,7 @@ const labels = loadBarcodeLabels()
 
 const plain = (value) => JSON.parse(JSON.stringify(value))
 
-assert.equal(labels.BARCODE_LABEL_TEMPLATE_VERSION, 'warehouse-barcode-zpl-v3')
+assert.equal(labels.BARCODE_LABEL_TEMPLATE_VERSION, 'warehouse-barcode-zpl-v4')
 
 assert.deepEqual(
   plain(labels.providerBarcodeIdentity('657227000247')),
@@ -143,27 +143,27 @@ const mediaContracts = [
     media: 'label_4x2', width: 812, length: 406, widthInches: 4, heightInches: 2,
     minimumModuleWidth: 2, maximumModuleWidth: 4, qrMagnification: 7,
     boxes: {
-      title: [24, 12, 764, 36], linear: [0, 60, 812, 92], value: [24, 160, 764, 24],
-      qr: [24, 198, 203, 203], details: [250, 202, 538, 50],
-      identity: [250, 270, 538, 26], footer: [250, 324, 538, 52],
+      title: [24, 12, 764, 36], linear: [0, 58, 812, 84], value: [24, 150, 764, 24],
+      qr: [24, 183, 203, 203], details: [250, 188, 538, 50],
+      identity: [250, 260, 538, 26], footer: [250, 316, 538, 52],
     },
   },
   {
     media: 'label_4x6', width: 812, length: 1218, widthInches: 4, heightInches: 6,
-    minimumModuleWidth: 2, maximumModuleWidth: 5, qrMagnification: 10,
+    minimumModuleWidth: 2, maximumModuleWidth: 5, qrMagnification: 12,
     boxes: {
-      title: [36, 30, 740, 80], linear: [0, 130, 812, 600], value: [36, 750, 740, 50],
-      qr: [36, 850, 290, 290], details: [370, 850, 406, 90],
-      identity: [370, 970, 406, 55], footer: [370, 1050, 406, 80],
+      title: [36, 28, 740, 78], linear: [0, 128, 812, 240], value: [36, 388, 740, 48],
+      qr: [232, 470, 348, 348], details: [36, 850, 740, 62],
+      identity: [36, 936, 740, 42], footer: [80, 1020, 652, 90],
     },
   },
   {
     media: 'label_4x8', width: 812, length: 1624, widthInches: 4, heightInches: 8,
-    minimumModuleWidth: 2, maximumModuleWidth: 5, qrMagnification: 10,
+    minimumModuleWidth: 2, maximumModuleWidth: 5, qrMagnification: 14,
     boxes: {
-      title: [36, 40, 740, 100], linear: [0, 170, 812, 900], value: [36, 1090, 740, 60],
-      qr: [36, 1260, 290, 290], details: [370, 1260, 406, 105],
-      identity: [370, 1395, 406, 65], footer: [370, 1480, 406, 90],
+      title: [36, 38, 740, 94], linear: [0, 160, 812, 300], value: [36, 480, 740, 56],
+      qr: [203, 590, 406, 406], details: [36, 1050, 740, 74],
+      identity: [36, 1150, 740, 52], footer: [80, 1240, 652, 96],
     },
   },
 ]
@@ -258,6 +258,51 @@ function decodeQrV1M(matrix) {
   return { decoded, mask, codewords }
 }
 
+function decodeZplAsciiGraphic(data, bytesPerRow, height) {
+  const rowCharacters = bytesPerRow * 2
+  const rows = []
+  let current = ''
+  let repeat = 0
+  const finish = () => {
+    assert.equal(current.length, rowCharacters, 'A decoded GFA row must have the declared width')
+    rows.push(current)
+    current = ''
+  }
+  for (const character of data) {
+    if (character === ':') {
+      assert.equal(current, '', 'GFA repeated-row shorthand must start at a row boundary')
+      assert.ok(rows.length > 0, 'GFA cannot repeat a missing prior row')
+      rows.push(rows.at(-1))
+      continue
+    }
+    if (character === ',' || character === '!') {
+      current += (character === ',' ? '0' : 'F').repeat(rowCharacters - current.length)
+      finish()
+      continue
+    }
+    if (character >= 'G' && character <= 'Y') {
+      repeat += character.charCodeAt(0) - 'G'.charCodeAt(0) + 1
+      continue
+    }
+    if (character >= 'g' && character <= 'z') {
+      repeat += (character.charCodeAt(0) - 'g'.charCodeAt(0) + 1) * 20
+      continue
+    }
+    assert.match(character, /^[0-9A-F]$/, 'GFA data must use Zebra ASCII hexadecimal encoding')
+    current += character.repeat(repeat || 1)
+    repeat = 0
+    if (current.length === rowCharacters) finish()
+    else assert.ok(current.length < rowCharacters, 'GFA run must not cross a row boundary')
+  }
+  assert.equal(repeat, 0)
+  assert.equal(current, '')
+  assert.equal(rows.length, height, 'GFA must decode to its declared height')
+  return rows.map((row) => Array.from(
+    { length: bytesPerRow * 8 },
+    (_, x) => (Number.parseInt(row[Math.floor(x / 4)], 16) & (8 >> (x % 4))) !== 0,
+  ))
+}
+
 const qrConformanceVectors = new Map([
   ['657227000247', '76fb3c73762cc789810028fcbbf3b21a36671ec8b2abd40995d1ddba2dfcdc3e'],
   ['CP1L-GWL0123456789AV', '4ac3733fd71b3fcb5aaf9c111e3d88633a3a064e34ad1e4b016351208be895cc'],
@@ -343,17 +388,41 @@ for (const contract of mediaContracts) {
 
     if (contract.qrMagnification) {
       const qr = contract.boxes.qr
-      assert.match(
-        zpl,
-        new RegExp(`\\^FO${qr[0] + 4 * contract.qrMagnification},${qr[1] + 4 * contract.qrMagnification}`
-          + `\\^BQN,2,${contract.qrMagnification}\\^FDMA,${representative.barcodeValue}\\^FS`),
+      const symbolDimension = 21 * contract.qrMagnification
+      const symbolX = qr[0] + 4 * contract.qrMagnification
+      const symbolY = qr[1] + 4 * contract.qrMagnification
+      const qrBytesPerRow = Math.ceil(symbolDimension / 8)
+      const qrByteCount = qrBytesPerRow * symbolDimension
+      const graphic = zpl.match(new RegExp(
+        `\\^FO${symbolX},${symbolY}\\^GFA,${qrByteCount},${qrByteCount},${qrBytesPerRow},([^\\^]+)\\^FS`,
+      ))
+      assert.ok(graphic, `${contract.media} must contain its deterministic QR raster`)
+      assert.match(graphic[1], /^[0-9A-FG-Yg-z:,!]+$/)
+      assert.ok(
+        graphic[1].length < qrByteCount * 2,
+        `${contract.media} QR raster must remain compressed for bounded batches`,
       )
+      const pixels = decodeZplAsciiGraphic(graphic[1], qrBytesPerRow, symbolDimension)
+      const modules = plain(labels.warehouseBarcodeQrModules(representative.barcodeValue))
+      for (let y = 0; y < symbolDimension; y += 1) {
+        for (let x = 0; x < symbolDimension; x += 1) {
+          const moduleX = Math.floor(x / contract.qrMagnification)
+          const moduleY = Math.floor(y / contract.qrMagnification)
+          const expected = modules[moduleY][moduleX]
+          assert.equal(pixels[y][x], expected, `${contract.media} QR raster pixel ${x},${y}`)
+        }
+        assert.ok(
+          pixels[y].slice(symbolDimension).every((pixel) => !pixel),
+          `${contract.media} QR byte padding must remain white`,
+        )
+      }
+      assert.doesNotMatch(zpl, /\^BQN,/, 'v4 must not depend on Zebra firmware QR generation')
       assert.match(zpl, /QR same value/)
     } else {
       assert.doesNotMatch(zpl, /\^BQN,/)
       assert.match(zpl, /linear only/)
     }
-    assert.match(zpl, /warehouse-barcode-zpl-v3/)
+    assert.match(zpl, /warehouse-barcode-zpl-v4/)
   }
 
   const preview = labels.renderBarcodeLabelsPreviewHtml(`gbl-${contract.media}`, {
@@ -383,6 +452,8 @@ for (const contract of mediaContracts) {
     assert.match(preview, /<svg class="qr-code" viewBox="0 0 29 29"/)
     assert.match(preview, /data-version="1" data-modules="21" data-quiet-zone="4"/)
     assert.match(preview, /aria-label="QR barcode CP1L-GWL0123456789AV"/)
+    assert.match(preview, /<rect x="[4-9]" y="[4-9]" width="1" height="1" fill="#000"\/>/)
+    assert.doesNotMatch(preview, /<path d=/, 'Safari print output must not depend on a compound SVG path')
     assert.doesNotMatch(preview, /https?:\/\//)
   } else {
     assert.match(preview, /data-code-mode="linear-only"/)
@@ -390,10 +461,43 @@ for (const contract of mediaContracts) {
   }
 }
 
+for (const media of ['label_4x2', 'label_4x6', 'label_4x8']) {
+  const maximumBatch = labels.renderBarcodeLabelsZpl({
+    targetType: 'location',
+    warehouseGlobalId: 'gwh1234567',
+    warehouseName: 'Main Warehouse',
+    media,
+    items: [item({
+      targetGlobalId: 'gwl0123456789av',
+      displayName: 'PICKFACE-01',
+      humanCode: 'FULFILLMENT - pick',
+      barcodeValue: 'CP1L-GWL0123456789AV',
+      symbology: 'CODE128',
+      sourceIdentity: 'LOCATION',
+      barcodeSource: 'location',
+      copies: 500,
+    })],
+  })
+  assert.ok(
+    Buffer.byteLength(maximumBatch) <= 10 * 1024 * 1024,
+    `${media} maximum batch must fit the durable artifact byte limit`,
+  )
+  assert.equal(maximumBatch.match(/\^XA/g)?.length, 500)
+}
+
 const legacySnapshot = {
   targetType: 'product', warehouseGlobalId: 'gwh1234567', warehouseName: 'Main Warehouse',
   media: 'label_4x6', items: [item()],
 }
+const legacyV3Preview = labels.renderBarcodeLabelsPreviewHtml(
+  'gbl1234567', legacySnapshot, 'warehouse-barcode-zpl-v3',
+)
+assert.equal(
+  crypto.createHash('sha256').update(legacyV3Preview).digest('hex'),
+  '78557a9b63b907569bd149b358109621a2f06d9e6a25345b6ec570f494825bfe',
+  'warehouse-barcode-zpl-v3 preview must remain byte-for-byte compatible with its immutable batch',
+)
+assert.match(legacyV3Preview, /data-template="warehouse-barcode-zpl-v3"/)
 for (const [version, expectedDigest] of [
   ['warehouse-barcode-zpl-v1', '83619ef06f6a27101230c148c7e3fe1d470ccbfc67c3e9c7a51b043cd47c0f41'],
   ['warehouse-barcode-zpl-v2', '0ea5c26a44eefef4ac27a33e99fc69e029593aa426947ec6fda8ef413c18ddeb'],

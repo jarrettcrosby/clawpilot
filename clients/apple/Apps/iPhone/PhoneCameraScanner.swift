@@ -161,8 +161,11 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
             isHighlightingEnabled: true
         )
         scanner.delegate = context.coordinator
-        context.coordinator.install(on: scanner)
         let container = PhoneCameraScannerContainerViewController(scanner: scanner)
+        context.coordinator.install(
+            on: scanner,
+            controlsOverlay: container.controlsOverlayView
+        )
         container.onViewDidAppear = { [weak coordinator = context.coordinator] scanner in
             coordinator?.startWhenAuthorized(scanner)
         }
@@ -214,10 +217,13 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
             activeContext = parent.scanContext
         }
 
-        func install(on scanner: DataScannerViewController) {
+        func install(
+            on scanner: DataScannerViewController,
+            controlsOverlay: UIView
+        ) {
             self.scanner = scanner
             ClawPilotScanDiagnostic.begin("iphone:open:stage=\(activeContext.stage.rawValue)")
-            installOverlay(on: scanner)
+            installOverlay(in: controlsOverlay)
             applyContext(activeContext, feedback: activeContext.initialFeedback, tone: .neutral)
         }
 
@@ -562,6 +568,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
         }
 
         @objc private func closeScanner() {
+            recordDiagnostic("close-tapped")
             dismissScanner(reason: "user")
         }
 
@@ -618,9 +625,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
             ClawPilotScanDiagnostic.record("iphone:\(event):elapsed_ms=\(elapsedMilliseconds)")
         }
 
-        private func installOverlay(on scanner: DataScannerViewController) {
-            let overlay = scanner.overlayContainerView
-
+        private func installOverlay(in overlay: UIView) {
             closeButton.configuration = .filled()
             closeButton.configuration?.image = UIImage(systemName: "xmark")
             closeButton.configuration?.cornerStyle = .capsule
@@ -707,6 +712,7 @@ struct PhoneCameraScanner: UIViewControllerRepresentable {
 @MainActor
 final class PhoneCameraScannerContainerViewController: UIViewController {
     let scanner: DataScannerViewController
+    let controlsOverlayView = PhoneCameraControlsOverlayView()
     var onViewDidAppear: ((DataScannerViewController) -> Void)?
 
     init(scanner: DataScannerViewController) {
@@ -724,18 +730,37 @@ final class PhoneCameraScannerContainerViewController: UIViewController {
         addChild(scanner)
         scanner.view.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(scanner.view)
+        controlsOverlayView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(controlsOverlayView)
         NSLayoutConstraint.activate([
             scanner.view.topAnchor.constraint(equalTo: view.topAnchor),
             scanner.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             scanner.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             scanner.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            controlsOverlayView.topAnchor.constraint(equalTo: view.topAnchor),
+            controlsOverlayView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            controlsOverlayView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            controlsOverlayView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
         ])
         scanner.didMove(toParent: self)
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        view.bringSubviewToFront(controlsOverlayView)
     }
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         onViewDidAppear?(scanner)
+    }
+}
+
+@MainActor
+final class PhoneCameraControlsOverlayView: UIView {
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let hitView = super.hitTest(point, with: event)
+        return hitView === self ? nil : hitView
     }
 }
 
