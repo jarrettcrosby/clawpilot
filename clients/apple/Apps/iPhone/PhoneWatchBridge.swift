@@ -7,13 +7,41 @@ import ClawPilotPickingCore
 struct PhoneWatchCommandOutcome: Sendable {
     let succeeded: Bool
     let message: String
+    let phonePlaybackStartedAt: Date?
 
     static func success(_ message: String) -> Self {
-        Self(succeeded: true, message: message)
+        Self(succeeded: true, message: message, phonePlaybackStartedAt: nil)
     }
 
     static func failure(_ message: String) -> Self {
-        Self(succeeded: false, message: message)
+        Self(succeeded: false, message: message, phonePlaybackStartedAt: nil)
+    }
+
+    static func phonePlaybackStarted(_ message: String, startedAt: Date) -> Self {
+        Self(succeeded: true, message: message, phonePlaybackStartedAt: startedAt)
+    }
+}
+
+private actor PhoneWatchOutcomeRace {
+    private var outcome: PhoneWatchCommandOutcome?
+    private var continuation: CheckedContinuation<PhoneWatchCommandOutcome, Never>?
+
+    func wait() async -> PhoneWatchCommandOutcome {
+        if let outcome { return outcome }
+        return await withCheckedContinuation { continuation in
+            if let outcome {
+                continuation.resume(returning: outcome)
+            } else {
+                self.continuation = continuation
+            }
+        }
+    }
+
+    func resolve(_ outcome: PhoneWatchCommandOutcome) {
+        guard self.outcome == nil else { return }
+        self.outcome = outcome
+        continuation?.resume(returning: outcome)
+        continuation = nil
     }
 }
 
@@ -29,7 +57,6 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate {
     private static let maximumSourceImageBytes = 12 * 1_024 * 1_024
     private static let maximumWatchImageBytes =
         WatchConnectivityPayloadBudget.maximumProductImageBytes
-
     private let session: WCSession? = WCSession.isSupported() ? .default : nil
     private var handledCommandIDs: [String] = []
     private var latestSnapshotData = Data()
@@ -214,16 +241,97 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate {
         handledCommandIDs.append(command.id)
         if handledCommandIDs.count > 32 { handledCommandIDs.removeFirst() }
 
+        let receivedAt = Date()
+        let effectivePlaybackDeadline =
+            WatchInstructionPlaybackTiming.effectivePhonePlaybackStartDeadline(
+                for: command,
+                receivedAt: receivedAt
+            )
+        guard effectivePlaybackDeadline.map({ receivedAt < $0 }) != false else {
+            publishCommandResult(WatchPickCommandResult(
+                command: command,
+                succeeded: false,
+                message: "The iPhone audio window expired before the Watch fallback."
+            ))
+            return
+        }
+
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let outcome = await self.onCommand?(command)
-                ?? .failure("The iPhone could not handle this Watch command.")
+            let outcome = await self.performCommandWithinPlaybackWindow(
+                command,
+                effectivePlaybackDeadline: effectivePlaybackDeadline
+            )
             self.publishCommandResult(WatchPickCommandResult(
                 command: command,
                 succeeded: outcome.succeeded,
                 message: outcome.message
             ))
         }
+    }
+
+    private func performCommandWithinPlaybackWindow(
+        _ command: WatchPickCommand,
+        effectivePlaybackDeadline: Date?
+    ) async -> PhoneWatchCommandOutcome {
+        guard command.action == .readInstruction,
+              let deadline = effectivePlaybackDeadline else {
+            return await onCommand?(command)
+                ?? .failure("The iPhone could not handle this Watch command.")
+        }
+
+        // The handler and strict audio layer receive the same deadline that
+        // this bridge enforces. This bounds legacy commands with no deadline
+        // and clamps a corrupt or clock-skewed distant caller deadline.
+        let boundedCommand = WatchPickCommand(
+            id: command.id,
+            action: command.action,
+            phonePlaybackStartDeadline: deadline
+        )
+        let handlerTask = Task { @MainActor [onCommand] in
+            await onCommand?(boundedCommand)
+                ?? .failure("The iPhone could not handle this Watch command.")
+        }
+        let race = PhoneWatchOutcomeRace()
+        let handlerResultTask = Task {
+            let handlerOutcome = await handlerTask.value
+            await race.resolve(Self.validatedReadInstructionOutcome(
+                handlerOutcome,
+                deadline: deadline
+            ))
+        }
+        let deadlineTask = Task {
+            let remaining = deadline.timeIntervalSinceNow
+            if remaining > 0 {
+                try? await Task.sleep(for: .seconds(remaining))
+            }
+            guard !Task.isCancelled else { return }
+            handlerTask.cancel()
+            let handlerOutcome = await handlerTask.value
+            await race.resolve(Self.validatedReadInstructionOutcome(
+                handlerOutcome,
+                deadline: deadline
+            ))
+        }
+        let outcome = await race.wait()
+        deadlineTask.cancel()
+        handlerResultTask.cancel()
+        if !outcome.succeeded { handlerTask.cancel() }
+        return outcome
+    }
+
+    private static func validatedReadInstructionOutcome(
+        _ outcome: PhoneWatchCommandOutcome,
+        deadline: Date
+    ) -> PhoneWatchCommandOutcome {
+        guard outcome.succeeded else { return outcome }
+        guard WatchInstructionPlaybackTiming.acceptsAcknowledgedPhonePlaybackStart(
+            startedAt: outcome.phonePlaybackStartedAt,
+            deadline: deadline
+        ) else {
+            return .failure("The iPhone audio window expired before the Watch fallback.")
+        }
+        return outcome
     }
 
     private func publishCommandResult(_ result: WatchPickCommandResult) {

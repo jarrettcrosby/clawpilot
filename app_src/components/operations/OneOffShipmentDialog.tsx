@@ -50,6 +50,10 @@ import {
   type OneOffShipmentQuoteInput,
   type OneOffShipmentWorkspace,
 } from '@/lib/operations/oneOffShipments'
+import {
+  type OneOffShipmentCreateAttempt,
+  resolveOneOffShipmentCreateAttempt,
+} from '@/lib/operations/oneOffShipmentClientAttempts'
 import { ONE_OFF_MAX_SYNCHRONOUS_PACKAGES } from '@/lib/operations/oneOffShipmentConstants'
 import {
   PACKAGE_CATALOG_CONTRACT_VERSION,
@@ -139,6 +143,36 @@ type CreatePayload = {
   error?: string
   code?: string
   result?: OneOffShipmentCreateResult
+}
+
+function quoteFailureMessage(payload: QuotePayload) {
+  switch (payload.code) {
+    case 'OPERATIONS_ONE_OFF_NEW_PRODUCT_SKU_EXISTS':
+      return 'That product already exists. Choose it under Existing product and try again.'
+    case 'OPERATIONS_ONE_OFF_PRODUCT_PROFILE_REQUIRED':
+      return 'The selected product needs package setup before it can be shipped.'
+    case 'OPERATIONS_IDEMPOTENCY_CONFLICT':
+      return 'The shipment details changed. Review them and compare rates again.'
+    default:
+      return payload.error && !/idempotency/i.test(payload.error)
+        ? payload.error
+        : 'Carrier rates could not be returned. Review the shipment and try again.'
+  }
+}
+
+function createFailureMessage(payload: CreatePayload) {
+  if (payload.code === 'OPERATIONS_IDEMPOTENCY_CONFLICT'
+    || (payload.error && /idempotency/i.test(payload.error))) {
+    return 'The shipment details changed. Review them and try creating the plan again.'
+  }
+  return payload.error || 'The one-off shipment could not be planned.'
+}
+
+function quoteFailureNeedsFreshKey(code: string | undefined) {
+  return code === 'OPERATIONS_ONE_OFF_NEW_PRODUCT_SKU_EXISTS'
+    || code === 'OPERATIONS_ONE_OFF_PRODUCT_PROFILE_REQUIRED'
+    || code === 'OPERATIONS_COMMAND_EXPIRED'
+    || code === 'OPERATIONS_IDEMPOTENCY_CONFLICT'
 }
 
 const STEPS = ['Shipment and units', 'Parcels', 'Review rates']
@@ -296,7 +330,7 @@ export default function OneOffShipmentDialog({
   const [reason, setReason] = useState(
     'Create and plan this reviewed one-off shipment from the selected physical inventory',
   )
-  const [createIdempotencyKey, setCreateIdempotencyKey] = useState('')
+  const [createAttempt, setCreateAttempt] = useState<OneOffShipmentCreateAttempt | null>(null)
 
   const sortedQuoteOffers = useMemo(() => (
     [...(quote?.offers || [])].sort((left, right) => (
@@ -437,7 +471,7 @@ export default function OneOffShipmentDialog({
     setSelectedOfferGlobalId('')
     setQuoteIdempotencyKey(nextQuoteIdempotencyKey())
     setFreshRateRetryAvailable(false)
-    setCreateIdempotencyKey('')
+    setCreateAttempt(null)
   }
 
   const updateCarrierSelection = (nextRefs: string[]) => {
@@ -718,6 +752,12 @@ export default function OneOffShipmentDialog({
       if (!quantity) return `Line ${index + 1} needs a whole-unit quantity.`
       if (line.kind === 'existing') {
         if (!line.productGlobalId) return `Choose an existing product for line ${index + 1}.`
+        const product = workspace?.products.find((entry) => (
+          entry.globalId === line.productGlobalId
+        ))
+        if (!product?.defaultPackage) {
+          return `${product?.name || `Line ${index + 1}`} needs package setup before shipping.`
+        }
         if (usedExisting.has(line.productGlobalId)) {
           return 'Use one line per existing product; increase its quantity instead of duplicating it.'
         }
@@ -728,6 +768,14 @@ export default function OneOffShipmentDialog({
       } else {
         if (!line.name.trim() || !line.sku.trim()) return `Name and SKU are required for new product line ${index + 1}.`
         const normalizedSku = line.sku.trim().toLowerCase()
+        const existingProduct = workspace?.products.find((product) => (
+          product.sku?.trim().toLowerCase() === normalizedSku
+        ))
+        if (existingProduct) {
+          return existingProduct.defaultPackage
+            ? `${existingProduct.name} already exists. Choose it under Existing product.`
+            : `${existingProduct.name} already exists and needs package setup before shipping.`
+        }
         if (usedSkus.has(normalizedSku)) return 'Each new product SKU must be unique in this shipment.'
         usedSkus.add(normalizedSku)
         if (nonNegativeInteger(line.unitPriceMinor) === null) return `Line ${index + 1} needs a valid unit value.`
@@ -946,11 +994,17 @@ export default function OneOffShipmentDialog({
         body: JSON.stringify({ action: 'quote', quote: buildQuoteInput() }),
       })
       const payload = await response.json().catch(() => ({})) as QuotePayload
-      if (!response.ok || !payload.ok || !payload.quote) {
+      if (!response.ok) {
         if (payload.code === 'OPERATIONS_COMMAND_EXPIRED') {
           setFreshRateRetryAvailable(true)
         }
-        throw new Error(`${payload.error || 'Carrier rates could not be returned'}${payload.code ? ` [${payload.code}]` : ''}`)
+        if (quoteFailureNeedsFreshKey(payload.code)) {
+          setQuoteIdempotencyKey(nextQuoteIdempotencyKey())
+        }
+        throw new Error(quoteFailureMessage(payload))
+      }
+      if (!payload.ok || !payload.quote) {
+        throw new Error('Carrier rates could not be returned.')
       }
       const nextQuote = payload.quote
       if (!nextQuote.offers.length) {
@@ -964,7 +1018,7 @@ export default function OneOffShipmentDialog({
       setSelectedOfferGlobalId(lowest?.globalId || '')
       setQuoteIdempotencyKey(nextQuoteIdempotencyKey())
       setFreshRateRetryAvailable(false)
-      setCreateIdempotencyKey(`operations-one-off-create:${nextQuote.globalId}:${crypto.randomUUID()}`)
+      setCreateAttempt(null)
       setStep(2)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Carrier rates could not be returned')
@@ -981,7 +1035,7 @@ export default function OneOffShipmentDialog({
 
   const createAndPlan = async (event: FormEvent) => {
     event.preventDefault()
-    if (!quote || !selectedOfferGlobalId || reason.trim().length < 10 || !createIdempotencyKey) return
+    if (!quote || !selectedOfferGlobalId || reason.trim().length < 10) return
     const selectedOffer = quote.offers.find((offer) => (
       offer.globalId === selectedOfferGlobalId
     ))
@@ -991,12 +1045,25 @@ export default function OneOffShipmentDialog({
     }
     setBusy('create')
     setError('')
+    const fingerprint = JSON.stringify({
+      quoteGlobalId: quote.globalId,
+      selectedOfferGlobalId,
+      reason: reason.trim(),
+    })
+    const attempt = resolveOneOffShipmentCreateAttempt({
+      current: createAttempt,
+      fingerprint,
+      nextIdempotencyKey: () => (
+        `operations-one-off-create:${quote.globalId}:${crypto.randomUUID()}`
+      ),
+    })
+    if (attempt !== createAttempt) setCreateAttempt(attempt)
     try {
       const response = await fetch('/api/operations/one-off-shipments', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Idempotency-Key': createIdempotencyKey,
+          'Idempotency-Key': attempt.idempotencyKey,
         },
         body: JSON.stringify({
           action: 'create-and-plan',
@@ -1007,7 +1074,10 @@ export default function OneOffShipmentDialog({
       })
       const payload = await response.json().catch(() => ({})) as CreatePayload
       if (!response.ok || !payload.ok || !payload.result) {
-        throw new Error(`${payload.error || 'The one-off shipment could not be planned'}${payload.code ? ` [${payload.code}]` : ''}`)
+        if (!response.ok && payload.code === 'OPERATIONS_IDEMPOTENCY_CONFLICT') {
+          setCreateAttempt(null)
+        }
+        throw new Error(createFailureMessage(payload))
       }
       const result = payload.result
       const firstLine = initialLine()
@@ -1024,7 +1094,7 @@ export default function OneOffShipmentDialog({
       setPackages([initialPackage([firstLine])])
       setQuote(null)
       setSelectedOfferGlobalId('')
-      setCreateIdempotencyKey('')
+      setCreateAttempt(null)
       await onCreated(result)
       onClose()
     } catch (caught) {
@@ -1040,6 +1110,43 @@ export default function OneOffShipmentDialog({
     if (busy) return
     onClose()
   }
+
+  const goBack = () => {
+    setError('')
+    if (step === 2) resetQuote()
+    setStep((current) => current - 1)
+  }
+
+  const primaryStepAction = step === 0 ? (
+    <Button
+      variant="contained"
+      onClick={continueToParcels}
+      disabled={loading || !workspace}
+      endIcon={<LocalShippingRounded />}
+    >
+      Continue to parcels
+    </Button>
+  ) : step === 1 ? (
+    <Button
+      variant="contained"
+      onClick={() => void requestQuote()}
+      disabled={Boolean(busy) || !workspace}
+      startIcon={busy === 'quote' ? <CircularProgress size={16} /> : <ScienceRounded />}
+    >
+      {busy === 'quote' ? 'Reading carrier rates' : 'Compare selected carrier rates'}
+    </Button>
+  ) : (
+    <Button
+      type="submit"
+      variant="contained"
+      disabled={busy === 'create'
+        || selectedRateOffer?.executionCapability !== 'direct_purchase_later'
+        || reason.trim().length < 10}
+      startIcon={busy === 'create' ? <CircularProgress size={16} /> : <Inventory2Rounded />}
+    >
+      {busy === 'create' ? 'Creating planned order' : 'Create and plan shipment'}
+    </Button>
+  )
 
   const lineLabel = (line: DraftLine, index: number) => {
     if (line.kind === 'new') return line.name.trim() || `New product ${index + 1}`
@@ -1310,9 +1417,14 @@ export default function OneOffShipmentDialog({
                             >
                               {workspace.products.map((product) => {
                                 const available = selectedPoolAvailability(product.globalId)
+                                const packageReady = product.defaultPackage !== null
                                 return (
-                                  <MenuItem key={product.globalId} value={product.globalId} disabled={available < 1}>
-                                    {product.name}{product.sku ? ` · ${product.sku}` : ''} · {available} available
+                                  <MenuItem
+                                    key={product.globalId}
+                                    value={product.globalId}
+                                    disabled={available < 1 || !packageReady}
+                                  >
+                                    {product.name}{product.sku ? ` · ${product.sku}` : ''} · {packageReady ? `${available} available` : 'package setup needed'}
                                   </MenuItem>
                                 )
                               })}
@@ -1619,7 +1731,7 @@ export default function OneOffShipmentDialog({
             px: { xs: 2, sm: 3 },
             py: 2,
             gap: 1,
-            flexDirection: { xs: 'column-reverse', sm: 'row' },
+            flexDirection: { xs: 'column', sm: 'row' },
             alignItems: 'stretch',
             '& .MuiButton-root': {
               minHeight: 44,
@@ -1627,37 +1739,37 @@ export default function OneOffShipmentDialog({
             },
           }}
         >
-          <Button onClick={close} disabled={Boolean(busy)}>Cancel</Button>
-          <Box sx={{ flex: { xs: 0, sm: 1 } }} />
-          <Stack
-            direction={{ xs: 'column-reverse', sm: 'row' }}
-            spacing={1}
-            sx={{ width: { xs: '100%', sm: 'auto' } }}
-          >
-            {step > 0 && (
-              <Button
-                onClick={() => {
-                  setError('')
-                  if (step === 2) resetQuote()
-                  setStep((current) => current - 1)
-                }}
-                disabled={Boolean(busy)}
+          {mobile ? (
+            <Stack spacing={1} sx={{ width: '100%' }}>
+              {primaryStepAction}
+              <Stack
+                data-testid="one-off-shipment-mobile-secondary-actions"
+                direction="row"
+                spacing={1}
+                sx={{ width: '100%' }}
               >
-                Back
-              </Button>
-            )}
-            {step === 0 ? (
-              <Button variant="contained" onClick={continueToParcels} disabled={loading || !workspace} endIcon={<LocalShippingRounded />}>Continue to parcels</Button>
-            ) : step === 1 ? (
-              <Button variant="contained" onClick={() => void requestQuote()} disabled={Boolean(busy) || !workspace} startIcon={busy === 'quote' ? <CircularProgress size={16} /> : <ScienceRounded />}>
-                {busy === 'quote' ? 'Reading carrier rates' : 'Compare selected carrier rates'}
-              </Button>
-            ) : (
-              <Button type="submit" variant="contained" disabled={busy === 'create' || selectedRateOffer?.executionCapability !== 'direct_purchase_later' || reason.trim().length < 10} startIcon={busy === 'create' ? <CircularProgress size={16} /> : <Inventory2Rounded />}>
-                {busy === 'create' ? 'Creating planned order' : 'Create and plan shipment'}
-              </Button>
-            )}
-          </Stack>
+                {step > 0 && (
+                  <Button onClick={goBack} disabled={Boolean(busy)} sx={{ flex: 1 }}>
+                    Back
+                  </Button>
+                )}
+                <Button onClick={close} disabled={Boolean(busy)} sx={{ flex: 1 }}>
+                  Cancel
+                </Button>
+              </Stack>
+            </Stack>
+          ) : (
+            <>
+              <Button onClick={close} disabled={Boolean(busy)}>Cancel</Button>
+              <Box sx={{ flex: 1 }} />
+              <Stack direction="row" spacing={1}>
+                {step > 0 && (
+                  <Button onClick={goBack} disabled={Boolean(busy)}>Back</Button>
+                )}
+                {primaryStepAction}
+              </Stack>
+            </>
+          )}
         </DialogActions>
       </Box>
     </Dialog>

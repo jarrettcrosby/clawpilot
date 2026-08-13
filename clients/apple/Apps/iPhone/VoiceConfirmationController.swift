@@ -8,6 +8,7 @@ import UIKit
 struct EnhancedVoicePlaybackResult: Equatable, Sendable {
     let outputName: String
     let startedWhilePhoneBackgrounded: Bool
+    let startedAt: Date
 }
 
 @MainActor
@@ -17,12 +18,11 @@ private final class PhoneAudioBackgroundLease {
 
     init(name: String) {
         identifier = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.expired = true
-                self.end()
-            }
+            guard let self else { return }
+            self.expired = true
+            self.end()
         }
+        if identifier == .invalid { expired = true }
     }
 
     func end() {
@@ -73,20 +73,24 @@ struct PronunciationCorrection: Codable, Equatable, Identifiable {
 
 enum OfflineVoicePackState: Equatable {
     case unavailable
+    case checking
     case notInstalled
     case downloading(progress: Double, status: String)
     case preparing
     case ready
-    case failed(String)
+    case loadFailed(String)
+    case installFailed(String)
 
     var title: String {
         switch self {
         case .unavailable: "Enhanced voice requires a physical iPhone"
+        case .checking: "Checking enhanced voice"
         case .notInstalled: "Enhanced voice pack not installed"
         case .downloading(let progress, _): "Installing enhanced voice · \(Int(progress * 100))%"
         case .preparing: "Preparing enhanced voice"
         case .ready: "Enhanced voice is ready offline"
-        case .failed: "Enhanced voice needs attention"
+        case .loadFailed: "Enhanced voice needs retry"
+        case .installFailed: "Voice install needs retry"
         }
     }
 
@@ -94,6 +98,8 @@ enum OfflineVoicePackState: Equatable {
         switch self {
         case .unavailable:
             "Simulator builds use Apple speech. Install the enhanced voice on a physical iPhone."
+        case .checking:
+            "Checking the installed voice pack."
         case .notInstalled:
             "Download the approximately 332 MB English and Spanish pack once."
         case .downloading(_, let status):
@@ -102,7 +108,7 @@ enum OfflineVoicePackState: Equatable {
             "Loading the on-device CoreML model."
         case .ready:
             "Instructions are generated on this iPhone. Apple speech remains the fallback."
-        case .failed(let message):
+        case .loadFailed(let message), .installFailed(let message):
             message
         }
     }
@@ -114,14 +120,21 @@ enum OfflineVoicePackState: Equatable {
 
     var canInstall: Bool {
         switch self {
-        case .notInstalled, .failed: true
+        case .notInstalled, .installFailed: true
         default: false
         }
+    }
+
+    var canRetryLoad: Bool {
+        if case .loadFailed = self { return true }
+        return false
     }
 }
 
 private actor OfflineSpeechRuntime {
     private var model: SupertonicTTSModel?
+    private var loadTask: Task<SupertonicTTSModel, Error>?
+    private var loadGeneration: UInt64 = 0
 
     func load(
         cacheDirectory: URL,
@@ -129,13 +142,36 @@ private actor OfflineSpeechRuntime {
         progress: @escaping @Sendable (Double, String) -> Void
     ) async throws {
         guard model == nil else { return }
-        model = try await SupertonicTTSModel.fromPretrained(
-            modelId: "aufklarer/Supertonic-3-CoreML-FP16",
-            cacheDir: cacheDirectory,
-            offlineMode: offlineMode,
-            computeUnits: .cpuAndGPU,
-            progressHandler: progress
-        )
+        let generation = loadGeneration
+        let task: Task<SupertonicTTSModel, Error>
+        if let loadTask {
+            task = loadTask
+        } else {
+            task = Task.detached(priority: .userInitiated) {
+                try await SupertonicTTSModel.fromPretrained(
+                    modelId: "aufklarer/Supertonic-3-CoreML-FP16",
+                    cacheDir: cacheDirectory,
+                    offlineMode: offlineMode,
+                    // Locked-phone Watch commands run while iOS denies new GPU
+                    // work. One CPU-only model is slower but valid in both app
+                    // states and avoids a second 350 MB in-memory model graph.
+                    computeUnits: .cpuOnly,
+                    progressHandler: progress
+                )
+            }
+            loadTask = task
+        }
+
+        do {
+            let loaded = try await task.value
+            try Task.checkCancellation()
+            guard generation == loadGeneration else { throw CancellationError() }
+            model = loaded
+            loadTask = nil
+        } catch {
+            if generation == loadGeneration { loadTask = nil }
+            throw error
+        }
     }
 
     func synthesize(text: String, language: InstructionVoiceLanguage) throws -> [Float] {
@@ -149,6 +185,9 @@ private actor OfflineSpeechRuntime {
     }
 
     func unload() {
+        loadGeneration &+= 1
+        loadTask?.cancel()
+        loadTask = nil
         model = nil
     }
 
@@ -166,6 +205,7 @@ final class VoiceConfirmationController {
     private let audioEngine = AVAudioEngine()
     private let offlineSpeech = OfflineSpeechRuntime()
     private var offlinePlayer: AVAudioPlayer?
+    private var strictPlaybackTask: Task<Void, Never>?
     private var speechTask: Task<Void, Never>?
     private var activeSpeechID: UUID?
     private var request: SFSpeechAudioBufferRecognitionRequest?
@@ -184,7 +224,7 @@ final class VoiceConfirmationController {
 #if targetEnvironment(simulator)
         voicePackState = .unavailable
 #else
-        voicePackState = .notInstalled
+        voicePackState = .checking
 #endif
         if UserDefaults.standard.data(forKey: Self.pronunciationDefaultsKey) == nil {
             savePronunciationCorrections([.clawPilot])
@@ -297,8 +337,8 @@ final class VoiceConfirmationController {
                 try FileManager.default.removeItem(at: Self.legacyKokoroDirectory)
             }
         } catch {
-            setVoicePackState(.failed(
-                "Enhanced voice storage could not be prepared: \(error.localizedDescription)"
+            setVoicePackState(.loadFailed(
+                "Voice storage is unavailable. \(error.localizedDescription)"
             ))
             return
         }
@@ -313,10 +353,14 @@ final class VoiceConfirmationController {
                 offlineMode: true,
                 progress: { _, _ in }
             )
+            try Self.applyLockedPlaybackProtection(to: Self.voicePackDirectory)
             setVoicePackState(.ready)
+        } catch is CancellationError {
+            return
         } catch {
-            setVoicePackState(.failed(
-                "The enhanced voice pack could not be loaded; Apple speech is active. \(error.localizedDescription)"
+            await offlineSpeech.unload()
+            setVoicePackState(.loadFailed(
+                "Could not load the installed voice. \(error.localizedDescription)"
             ))
         }
 #endif
@@ -341,11 +385,14 @@ final class VoiceConfirmationController {
             guard Self.isVoicePackInstalled else {
                 throw VoiceError.incompleteVoicePack
             }
+            try Self.applyLockedPlaybackProtection(to: Self.voicePackDirectory)
             setVoicePackState(.ready)
+        } catch is CancellationError {
+            return
         } catch {
             await offlineSpeech.unload()
-            setVoicePackState(.failed(
-                "The enhanced voice install did not finish. Retry on a stable connection. \(error.localizedDescription)"
+            setVoicePackState(.installFailed(
+                "Install did not finish. Retry on a stable connection. \(error.localizedDescription)"
             ))
         }
 #endif
@@ -364,7 +411,9 @@ final class VoiceConfirmationController {
             }
             setVoicePackState(.notInstalled)
         } catch {
-            setVoicePackState(.failed("The enhanced voice pack could not be removed: \(error.localizedDescription)"))
+            setVoicePackState(.loadFailed(
+                "Could not remove the voice pack. \(error.localizedDescription)"
+            ))
         }
 #endif
     }
@@ -390,9 +439,24 @@ final class VoiceConfirmationController {
                 }
             }
             if self.voicePackState == .ready && !forceSystemVoice {
+                let samples: [Float]
                 do {
-                    let samples = try await self.offlineSpeech.synthesize(text: text, language: language)
+                    samples = try await self.offlineSpeech.synthesize(text: text, language: language)
                     try Task.checkCancellation()
+                } catch is CancellationError {
+                    return
+                } catch {
+                    await self.offlineSpeech.unload()
+                    self.setVoicePackState(.loadFailed(
+                        "Enhanced voice failed. Tap Retry to reload it."
+                    ))
+                    self.speakWithApple(text, language: language)
+                    while self.synthesizer.isSpeaking, !Task.isCancelled {
+                        try? await Task.sleep(for: .milliseconds(50))
+                    }
+                    return
+                }
+                do {
                     try self.playOffline(samples: samples)
                     while self.offlinePlayer?.isPlaying == true, !Task.isCancelled {
                         try? await Task.sleep(for: .milliseconds(50))
@@ -401,7 +465,7 @@ final class VoiceConfirmationController {
                 } catch is CancellationError {
                     return
                 } catch {
-                    self.setVoicePackState(.failed("Enhanced voice playback failed; Apple speech is active. \(error.localizedDescription)"))
+                    // Playback routing can fail without invalidating the model.
                 }
             }
             self.speakWithApple(text, language: language)
@@ -437,13 +501,32 @@ final class VoiceConfirmationController {
     /// effective, which is essential when the paired iPhone is locked.
     func speakEnhancedThroughBluetoothAndWait(
         _ english: String,
-        spanish: String? = nil
+        spanish: String? = nil,
+        deadline: Date? = nil
     ) async throws -> EnhancedVoicePlaybackResult {
+        try Self.checkDeadline(deadline)
         let startedWhilePhoneBackgrounded = UIApplication.shared.applicationState != .active
         let backgroundLease = PhoneAudioBackgroundLease(
             name: "ClawPilot Watch instruction audio"
         )
-        defer { backgroundLease.end() }
+        var playbackOwnershipTransferred = false
+        var ownedSpeechID: UUID?
+        defer {
+            if !playbackOwnershipTransferred {
+                backgroundLease.end()
+                if let ownedSpeechID, activeSpeechID == ownedSpeechID {
+                    strictPlaybackTask?.cancel()
+                    strictPlaybackTask = nil
+                    activeSpeechID = nil
+                    offlinePlayer?.stop()
+                    offlinePlayer = nil
+                    try? AVAudioSession.sharedInstance().setActive(
+                        false,
+                        options: .notifyOthersOnDeactivation
+                    )
+                }
+            }
+        }
 
         stopListening()
         stopSpeech()
@@ -458,46 +541,50 @@ final class VoiceConfirmationController {
         let sourceText = language == .spanish ? (spanish ?? english) : english
         let text = applyPronunciationCorrections(to: sourceText)
         let speechID = UUID()
+        ownedSpeechID = speechID
         activeSpeechID = speechID
-        defer {
-            if activeSpeechID == speechID { activeSpeechID = nil }
-            offlinePlayer?.stop()
-            offlinePlayer = nil
-        }
 
+        try ensureEnhancedPlaybackAuthority(
+            speechID: speechID,
+            backgroundLease: backgroundLease,
+            deadline: deadline
+        )
         let samples: [Float]
         do {
             samples = try await offlineSpeech.synthesize(text: text, language: language)
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            setVoicePackState(.failed(
-                "Enhanced voice synthesis failed; Watch-local speech is active. \(error.localizedDescription)"
+            await offlineSpeech.unload()
+            setVoicePackState(.loadFailed(
+                "Enhanced voice failed. Tap Retry to reload it."
             ))
             throw error
         }
         try Task.checkCancellation()
-        guard !backgroundLease.expired else {
-            throw VoiceError.backgroundTimeExpired
-        }
-        guard activeSpeechID == speechID else {
-            throw VoiceError.playbackInterrupted
-        }
+        try ensureEnhancedPlaybackAuthority(
+            speechID: speechID,
+            backgroundLease: backgroundLease,
+            deadline: deadline
+        )
 
-        let outputName = try await playOfflineThroughBluetooth(samples: samples)
-        while offlinePlayer?.isPlaying == true {
-            try Task.checkCancellation()
-            guard !backgroundLease.expired, activeSpeechID == speechID else {
-                offlinePlayer?.stop()
-                throw backgroundLease.expired
-                    ? VoiceError.backgroundTimeExpired
-                    : VoiceError.playbackInterrupted
-            }
-            try await Task.sleep(for: .milliseconds(50))
-        }
+        let startedPlayback = try await playOfflineThroughBluetooth(
+            samples: samples,
+            speechID: speechID,
+            backgroundLease: backgroundLease,
+            deadline: deadline
+        )
+        try validateStartedBluetoothPlayback(
+            startedPlayback,
+            speechID: speechID,
+            backgroundLease: backgroundLease,
+            deadline: deadline
+        )
+        playbackOwnershipTransferred = true
         return EnhancedVoicePlaybackResult(
-            outputName: outputName,
-            startedWhilePhoneBackgrounded: startedWhilePhoneBackgrounded
+            outputName: startedPlayback.outputName,
+            startedWhilePhoneBackgrounded: startedWhilePhoneBackgrounded,
+            startedAt: startedPlayback.startedAt
         )
     }
 
@@ -523,7 +610,7 @@ final class VoiceConfirmationController {
         var options: AVAudioSession.CategoryOptions = [.allowBluetoothHFP, .allowBluetoothA2DP]
         if playbackPreference == .iPhoneSpeaker { options.insert(.defaultToSpeaker) }
         try session.setCategory(.playAndRecord, mode: .measurement, options: options)
-        try session.setActive(true, options: .notifyOthersOnDeactivation)
+        try session.setActive(true)
         if playbackPreference == .iPhoneSpeaker {
             if let builtInMic = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
                 try session.setPreferredInput(builtInMic)
@@ -644,12 +731,21 @@ final class VoiceConfirmationController {
     }
 
     private func stopSpeech() {
+        let stoppedStrictBluetoothPlayback = strictPlaybackTask != nil
+        strictPlaybackTask?.cancel()
+        strictPlaybackTask = nil
         speechTask?.cancel()
         speechTask = nil
         activeSpeechID = nil
         offlinePlayer?.stop()
         offlinePlayer = nil
         synthesizer.stopSpeaking(at: .immediate)
+        if stoppedStrictBluetoothPlayback {
+            try? AVAudioSession.sharedInstance().setActive(
+                false,
+                options: .notifyOthersOnDeactivation
+            )
+        }
     }
 
     private func playOffline(samples: [Float]) throws {
@@ -661,7 +757,20 @@ final class VoiceConfirmationController {
         offlinePlayer = player
     }
 
-    private func playOfflineThroughBluetooth(samples: [Float]) async throws -> String {
+    private struct StartedBluetoothPlayback {
+        let player: AVAudioPlayer
+        let outputName: String
+        let outputUID: String
+        let outputPortType: AVAudioSession.Port
+        let startedAt: Date
+    }
+
+    private func playOfflineThroughBluetooth(
+        samples: [Float],
+        speechID: UUID,
+        backgroundLease: PhoneAudioBackgroundLease,
+        deadline: Date?
+    ) async throws -> StartedBluetoothPlayback {
         guard !samples.isEmpty else { throw VoiceError.emptyAudio }
         let session = AVAudioSession.sharedInstance()
         try session.setActive(false, options: .notifyOthersOnDeactivation)
@@ -670,31 +779,184 @@ final class VoiceConfirmationController {
             mode: .spokenAudio,
             options: [.duckOthers, .interruptSpokenAudioAndMixWithOthers]
         )
-        try session.setActive(true, options: .notifyOthersOnDeactivation)
+        try session.setActive(true)
 
+        // AVAudioSession may not settle an A2DP route until playback has begun.
+        // Looping zero PCM primes that decision without exposing instruction
+        // audio to the iPhone speaker while route authority is still unknown.
+        let primer = try AVAudioPlayer(data: Self.bluetoothRoutePrimerData)
+        primer.numberOfLoops = -1
+        primer.prepareToPlay()
+        guard primer.play() else { throw VoiceError.playbackFailed }
+        defer { primer.stop() }
+
+        let routeDeadline = Date().addingTimeInterval(3)
         var bluetoothOutput: AVAudioSessionPortDescription?
-        for attempt in 0..<10 {
-            bluetoothOutput = session.currentRoute.outputs.first(where: Self.isBluetoothOutput)
-            if bluetoothOutput != nil { break }
-            if attempt < 9 { try await Task.sleep(for: .milliseconds(100)) }
+        while Date() < routeDeadline {
+            try Task.checkCancellation()
+            try ensureEnhancedPlaybackAuthority(
+                speechID: speechID,
+                backgroundLease: backgroundLease,
+                deadline: deadline
+            )
+            if let output = session.currentRoute.outputs.first(where: Self.isBluetoothOutput) {
+                bluetoothOutput = output
+                break
+            }
+            try await Task.sleep(for: .milliseconds(100))
         }
-        guard bluetoothOutput != nil else {
+        guard let bluetoothOutput else {
             let current = session.currentRoute.outputs.first?.portName ?? "no active output"
-            try? session.setActive(false, options: .notifyOthersOnDeactivation)
             throw VoiceError.bluetoothRouteUnavailable(current)
         }
 
         let player = try AVAudioPlayer(data: Self.wavData(samples: samples, sampleRate: 44_100))
         player.prepareToPlay()
+        try ensureEnhancedPlaybackAuthority(
+            speechID: speechID,
+            backgroundLease: backgroundLease,
+            deadline: deadline
+        )
+        guard Self.isBluetoothOutputStillCurrent(bluetoothOutput, session: session) else {
+            let current = session.currentRoute.outputs.first?.portName ?? "no active output"
+            throw VoiceError.bluetoothRouteUnavailable(current)
+        }
+        try Task.checkCancellation()
         guard player.play() else { throw VoiceError.playbackFailed }
-        guard let startedOutput = session.currentRoute.outputs.first(where: Self.isBluetoothOutput)
+        let startedAt = Date()
+        guard deadline.map({ startedAt < $0 }) ?? true else {
+            player.stop()
+            throw VoiceError.commandExpired
+        }
+        guard let startedOutput = session.currentRoute.outputs.first(where: {
+            Self.isBluetoothOutput($0)
+                && $0.uid == bluetoothOutput.uid
+                && $0.portType == bluetoothOutput.portType
+        })
         else {
             player.stop()
             let current = session.currentRoute.outputs.first?.portName ?? "no active output"
             throw VoiceError.bluetoothRouteUnavailable(current)
         }
         offlinePlayer = player
-        return startedOutput.portName
+        let startedPlayback = StartedBluetoothPlayback(
+            player: player,
+            outputName: startedOutput.portName,
+            outputUID: startedOutput.uid,
+            outputPortType: startedOutput.portType,
+            startedAt: startedAt
+        )
+        startStrictPlaybackMonitor(
+            startedPlayback,
+            speechID: speechID,
+            backgroundLease: backgroundLease
+        )
+        return startedPlayback
+    }
+
+    private func validateStartedBluetoothPlayback(
+        _ playback: StartedBluetoothPlayback,
+        speechID: UUID,
+        backgroundLease: PhoneAudioBackgroundLease,
+        deadline: Date?
+    ) throws {
+        guard !backgroundLease.expired,
+              activeSpeechID == speechID,
+              offlinePlayer === playback.player,
+              playback.player.isPlaying,
+              deadline.map({ playback.startedAt < $0 }) ?? true,
+              Self.isBluetoothOutputStillCurrent(
+                uid: playback.outputUID,
+                portType: playback.outputPortType,
+                session: AVAudioSession.sharedInstance()
+              ) else {
+            throw VoiceError.playbackInterrupted
+        }
+    }
+
+    private func startStrictPlaybackMonitor(
+        _ playback: StartedBluetoothPlayback,
+        speechID: UUID,
+        backgroundLease: PhoneAudioBackgroundLease
+    ) {
+        strictPlaybackTask?.cancel()
+        strictPlaybackTask = Task { @MainActor [weak self, weak player = playback.player] in
+            guard let self, let player else {
+                backgroundLease.end()
+                return
+            }
+            defer {
+                let ownedAudioSession = self.offlinePlayer === player
+                    || self.activeSpeechID == speechID
+                player.stop()
+                if self.offlinePlayer === player {
+                    self.offlinePlayer = nil
+                }
+                if self.activeSpeechID == speechID {
+                    self.activeSpeechID = nil
+                    self.strictPlaybackTask = nil
+                }
+                backgroundLease.end()
+                if ownedAudioSession {
+                    try? AVAudioSession.sharedInstance().setActive(
+                        false,
+                        options: .notifyOthersOnDeactivation
+                    )
+                }
+            }
+
+            while player.isPlaying {
+                guard !Task.isCancelled,
+                      !backgroundLease.expired,
+                      self.activeSpeechID == speechID,
+                      self.offlinePlayer === player,
+                      Self.isBluetoothOutputStillCurrent(
+                        uid: playback.outputUID,
+                        portType: playback.outputPortType,
+                        session: AVAudioSession.sharedInstance()
+                      ) else {
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+        }
+    }
+
+    private func ensureEnhancedPlaybackAuthority(
+        speechID: UUID,
+        backgroundLease: PhoneAudioBackgroundLease,
+        deadline: Date?
+    ) throws {
+        try Self.checkDeadline(deadline)
+        guard !backgroundLease.expired else { throw VoiceError.backgroundTimeExpired }
+        guard activeSpeechID == speechID else { throw VoiceError.playbackInterrupted }
+    }
+
+    private static func checkDeadline(_ deadline: Date?) throws {
+        guard deadline.map({ Date() < $0 }) ?? true else { throw VoiceError.commandExpired }
+    }
+
+    private static func isBluetoothOutputStillCurrent(
+        _ expected: AVAudioSessionPortDescription,
+        session: AVAudioSession
+    ) -> Bool {
+        isBluetoothOutputStillCurrent(
+            uid: expected.uid,
+            portType: expected.portType,
+            session: session
+        )
+    }
+
+    private static func isBluetoothOutputStillCurrent(
+        uid: String,
+        portType: AVAudioSession.Port,
+        session: AVAudioSession
+    ) -> Bool {
+        session.currentRoute.outputs.contains {
+            isBluetoothOutput($0)
+                && $0.uid == uid
+                && $0.portType == portType
+        }
     }
 
     private static func isBluetoothOutput(_ output: AVAudioSessionPortDescription) -> Bool {
@@ -705,6 +967,11 @@ final class VoiceConfirmationController {
             false
         }
     }
+
+    private static let bluetoothRoutePrimerData = wavData(
+        samples: [Float](repeating: 0, count: 4_410),
+        sampleRate: 44_100
+    )
 
     private func speakWithApple(_ text: String, language: InstructionVoiceLanguage) {
         try? configurePlaybackSession()
@@ -734,7 +1001,7 @@ final class VoiceConfirmationController {
                 options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP]
             )
         }
-        try session.setActive(true, options: .notifyOthersOnDeactivation)
+        try session.setActive(true)
         if playbackPreference == .iPhoneSpeaker {
             try session.overrideOutputAudioPort(.speaker)
         }
@@ -834,29 +1101,61 @@ final class VoiceConfirmationController {
             .deletingLastPathComponent()
         try FileManager.default.createDirectory(
             at: root,
-            withIntermediateDirectories: true
+            withIntermediateDirectories: true,
+            attributes: lockedPlaybackAttributes
+        )
+        try FileManager.default.setAttributes(
+            lockedPlaybackAttributes,
+            ofItemAtPath: root.path
         )
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
         var mutableRoot = root
         try mutableRoot.setResourceValues(values)
 
-        guard isVoicePackInstalled(at: purgeableVoicePackDirectory) else { return }
-        if isVoicePackInstalled(at: voicePackDirectory) {
-            try? FileManager.default.removeItem(at: purgeableVoicePackDirectory)
-            return
+        if isVoicePackInstalled(at: purgeableVoicePackDirectory) {
+            if isVoicePackInstalled(at: voicePackDirectory) {
+                try? FileManager.default.removeItem(at: purgeableVoicePackDirectory)
+            } else {
+                if FileManager.default.fileExists(atPath: voicePackDirectory.path) {
+                    try FileManager.default.removeItem(at: voicePackDirectory)
+                }
+                try FileManager.default.createDirectory(
+                    at: voicePackDirectory.deletingLastPathComponent(),
+                    withIntermediateDirectories: true,
+                    attributes: lockedPlaybackAttributes
+                )
+                try FileManager.default.moveItem(
+                    at: purgeableVoicePackDirectory,
+                    to: voicePackDirectory
+                )
+            }
         }
-        if FileManager.default.fileExists(atPath: voicePackDirectory.path) {
-            try FileManager.default.removeItem(at: voicePackDirectory)
+        try applyLockedPlaybackProtection(to: voicePackDirectory)
+    }
+
+    private static let lockedPlaybackAttributes: [FileAttributeKey: Any] = [
+        .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication,
+    ]
+
+    private static func applyLockedPlaybackProtection(to directory: URL) throws {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: directory.path) else { return }
+        try fileManager.setAttributes(
+            lockedPlaybackAttributes,
+            ofItemAtPath: directory.path
+        )
+        guard let contents = fileManager.enumerator(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: []
+        ) else { throw VoiceError.voicePackProtectionUnavailable }
+        for case let url as URL in contents {
+            try fileManager.setAttributes(
+                lockedPlaybackAttributes,
+                ofItemAtPath: url.path
+            )
         }
-        try FileManager.default.createDirectory(
-            at: voicePackDirectory.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try FileManager.default.moveItem(
-            at: purgeableVoicePackDirectory,
-            to: voicePackDirectory
-        )
     }
 
     private static var isVoicePackInstalled: Bool {
@@ -924,11 +1223,13 @@ final class VoiceConfirmationController {
         case emptyAudio
         case playbackFailed
         case incompleteVoicePack
+        case voicePackProtectionUnavailable
         case microphoneUnavailable
         case enhancedVoiceUnavailable
         case bluetoothRouteUnavailable(String)
         case backgroundTimeExpired
         case playbackInterrupted
+        case commandExpired
 
         var errorDescription: String? {
             switch self {
@@ -940,6 +1241,8 @@ final class VoiceConfirmationController {
                 "The enhanced voice audio player could not start."
             case .incompleteVoicePack:
                 "The downloaded voice pack is incomplete or failed validation."
+            case .voicePackProtectionUnavailable:
+                "The voice pack protection metadata could not be applied."
             case .microphoneUnavailable:
                 "The microphone is not ready. Reconnect the audio device and try again."
             case .enhancedVoiceUnavailable:
@@ -950,6 +1253,8 @@ final class VoiceConfirmationController {
                 "The locked iPhone did not have enough background time to prepare the instruction."
             case .playbackInterrupted:
                 "Instruction playback was interrupted before it completed."
+            case .commandExpired:
+                "The Watch audio request expired."
             }
         }
     }

@@ -396,10 +396,19 @@ for (const fragment of [
   'selectedMaterialUnits',
   'PACKAGE_CATALOG_CONTRACT_VERSION',
   'data-testid="one-off-shipment-actions"',
+  'data-testid="one-off-shipment-mobile-secondary-actions"',
   'disableSpacing',
-  "flexDirection: { xs: 'column-reverse', sm: 'row' }",
-  "direction={{ xs: 'column-reverse', sm: 'row' }}",
+  "flexDirection: { xs: 'column', sm: 'row' }",
+  'const primaryStepAction = step === 0',
+  'const goBack = () =>',
   "minHeight: 44",
+  'That product already exists. Choose it under Existing product and try again.',
+  'needs package setup before shipping.',
+  'setQuoteIdempotencyKey(nextQuoteIdempotencyKey())',
+  'const [createAttempt, setCreateAttempt] = useState<OneOffShipmentCreateAttempt | null>(null)',
+  'resolveOneOffShipmentCreateAttempt({',
+  "'Idempotency-Key': attempt.idempotencyKey",
+  "payload.code === 'OPERATIONS_IDEMPOTENCY_CONFLICT'",
   "const fedExPackageCodes = packages.map",
   'new Set(fedExPackageCodes).size > 1',
   'FedEx requires one package type across every parcel in this shipment.',
@@ -420,8 +429,32 @@ for (const fragment of [
   assert.ok(parcelDialog.includes(fragment), `Parcel package catalog UI is missing ${fragment}`)
 }
 assert.ok(
+  !parcelDialog.includes('if (!response.ok && payload.code) setCreateAttempt(null)'),
+  'Create retries must retain the same body-bound key for in-progress or ambiguous outcomes',
+)
+assert.ok(
   parcelDialog.includes("entry.providerScope !== 'canonical'\n        && entry.kind === 'custom'"),
   'Single-carrier menus must not duplicate a provider customer-supplied code beside the common Custom package choice',
+)
+assert.doesNotMatch(
+  parcelDialog,
+  /payload\.code \? ` \[\$\{payload\.code\}\]`/,
+  'Customer-facing one-off shipment errors must not expose internal error codes',
+)
+assert.doesNotMatch(
+  persistence,
+  /submit a new idempotency key/i,
+  'Failed quote replay copy must explain the corrective action without idempotency jargon',
+)
+assert.match(
+  parcelDialog,
+  /payload\.error && !\/idempotency\/i\.test\(payload\.error\)/,
+  'Unknown quote failures must not leak idempotency vocabulary',
+)
+assert.match(
+  parcelDialog,
+  /payload\.error && \/idempotency\/i\.test\(payload\.error\)/,
+  'Create failures must replace idempotency vocabulary with customer-facing recovery copy',
 )
 assert.ok(
   !/(?:WWEX reference|provider packaging|Worldwide Express .*code)/.test(parcelDialog),

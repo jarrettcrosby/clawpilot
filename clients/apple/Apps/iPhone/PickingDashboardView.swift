@@ -758,6 +758,15 @@ struct PickingDashboardView: View {
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(PrimaryDashboardButtonStyle())
+                    } else if model.voicePackState.canRetryLoad {
+                        Button {
+                            Task { await model.retryEnhancedVoicePack() }
+                        } label: {
+                            Label("Retry", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .tint(PickingTheme.primary)
                     } else if model.voicePackState == .ready {
                         Button(role: .destructive) {
                             showVoicePackRemovalConfirmation = true

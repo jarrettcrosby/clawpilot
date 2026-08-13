@@ -534,6 +534,24 @@ test('Watch companion keeps local audio unless exact enhanced Meta playback star
   assert.match(voice, /guard voicePackState == \.ready/)
   assert.match(voice, /case \.bluetoothA2DP, \.bluetoothHFP, \.bluetoothLE/)
   assert.match(voice, /guard let startedOutput = session\.currentRoute\.outputs/)
+  assert.match(voice, /startStrictPlaybackMonitor\([\s\S]*?return startedPlayback/)
+  assert.match(
+    voice,
+    /validateStartedBluetoothPlayback\([\s\S]*?playbackOwnershipTransferred = true[\s\S]*?startedAt: startedPlayback\.startedAt/,
+  )
+  const strictPlaybackMonitor = voice.slice(
+    voice.indexOf('private func startStrictPlaybackMonitor'),
+    voice.indexOf('private func ensureEnhancedPlaybackAuthority'),
+  )
+  assert.match(strictPlaybackMonitor, /while player\.isPlaying/)
+  assert.match(strictPlaybackMonitor, /uid: playback\.outputUID/)
+  assert.match(strictPlaybackMonitor, /portType: playback\.outputPortType/)
+  assert.doesNotMatch(strictPlaybackMonitor, /deadline/)
+  assert.match(bridge, /private actor PhoneWatchOutcomeRace/)
+  assert.match(bridge, /handlerTask\.cancel\(\)[\s\S]*?let handlerOutcome = await handlerTask\.value/)
+  assert.match(bridge, /validatedReadInstructionOutcome/)
+  assert.match(bridge, /acceptsAcknowledgedPhonePlaybackStart/)
+  assert.match(app, /return \.phonePlaybackStarted\(status, startedAt: playback\.startedAt\)/)
   assert.doesNotMatch(app, /Instruction requested on the connected Meta glasses audio route/)
   assert.doesNotMatch(watch, /PickingAPIClient|ConfirmPicksCommand/)
 })
@@ -550,7 +568,7 @@ test('Watch instruction falls back locally after the paired iPhone command times
   const watch = read('../clients/apple/Apps/Watch/ClawPilotPickingWatchApp.swift')
   assert.match(
     watch,
-    /private func startCommandTimeout\(for command: WatchPickCommand\)[\s\S]*?case \.readInstruction: \.seconds\(45\)[\s\S]*?if command\.action == \.readInstruction \{[\s\S]*?finishPendingCommand\(succeeded: false, message: message\)[\s\S]*?playInstructionLocally\(fallbackReason: message\)[\s\S]*?return[\s\S]*?\}[\s\S]*?message: "The iPhone action is taking too long\. Keep ClawPilot open and try again\."/,
+    /private func startCommandTimeout\(for command: WatchPickCommand\)[\s\S]*?case \.readInstruction: \.seconds\(\s*Int64\(WatchInstructionPlaybackTiming\.watchFallbackDelay\)\s*\)[\s\S]*?if command\.action == \.readInstruction \{[\s\S]*?finishPendingCommand\(succeeded: false, message: message\)[\s\S]*?playInstructionLocally\(fallbackReason: message\)[\s\S]*?return[\s\S]*?\}[\s\S]*?message: "The iPhone action is taking too long\. Keep ClawPilot open and try again\."/,
   )
 })
 
@@ -667,7 +685,18 @@ test('picker audio routing and Meta scan feedback stay explicit and bounded', ()
   assert.match(dashboard, /Pronunciation corrections/)
   assert.match(dashboard, /Save and preview/)
   assert.match(dashboard, /model\.removePronunciationCorrection/)
-  assert.match(voice, /computeUnits: \.cpuAndGPU/)
+  assert.match(voice, /computeUnits: \.cpuOnly/)
+  assert.doesNotMatch(voice, /computeUnits: \.cpuAndGPU/)
+  assert.match(voice, /private var loadTask: Task<SupertonicTTSModel, Error>\?/)
+  assert.match(voice, /FileProtectionType\.completeUntilFirstUserAuthentication/)
+  assert.match(voice, /applyLockedPlaybackProtection\(to: Self\.voicePackDirectory\)/)
+  assert.match(voice, /case loadFailed\(String\)/)
+  assert.match(voice, /var canRetryLoad: Bool/)
+  assert.match(dashboard, /model\.retryEnhancedVoicePack\(\)/)
+  assert.match(voice, /deadline: Date\? = nil/)
+  assert.match(voice, /let routeDeadline = Date\(\)\.addingTimeInterval\(3\)/)
+  assert.match(voice, /bluetoothRoutePrimerData/)
+  assert.doesNotMatch(voice, /setActive\(true, options:/)
   assert.match(voice, /sampleRate: 44_100/)
   assert.match(voice, /runOfflineVoiceSelfTest/)
   assert.match(voice, /nonisolated private static func requestSpeechAuthorization/)
@@ -680,7 +709,7 @@ test('picker audio routing and Meta scan feedback stay explicit and bounded', ()
   assert.match(voice, /VectorEstimator\.mlpackage\/Data\/com\.apple\.CoreML\/weights\/weight\.bin": 255_276_032/)
   assert.match(voice, /voice_styles\/F2\.json": 292_423/)
   assert.match(voice, /Apple speech remains the fallback/)
-  assert.match(voice, /Enhanced voice storage could not be prepared/)
+  assert.match(voice, /Voice storage is unavailable/)
   assert.match(meta, /resolution: \.high/)
   assert.match(meta, /frameRate: 15/)
   assert.match(metaPolicy, /liveFrameCadenceNanoseconds: UInt64 = 100_000_000/)

@@ -1829,6 +1829,17 @@ type QuoteCommandRow = QueryResultRow & {
   created_at: Date
 }
 
+function failedQuoteCommandMessage(code: string | null) {
+  switch (code) {
+    case 'OPERATIONS_ONE_OFF_NEW_PRODUCT_SKU_EXISTS':
+      return 'That product already exists. Select the existing product and try again.'
+    case 'OPERATIONS_ONE_OFF_PRODUCT_PROFILE_REQUIRED':
+      return 'The selected product needs an active physical package profile before shipping.'
+    default:
+      return 'The previous rate request failed. Correct the issue and try again.'
+  }
+}
+
 async function prepareQuoteCommand(input: {
   organizationId: string
   idempotencyKey: string
@@ -1862,7 +1873,7 @@ async function prepareQuoteCommand(input: {
       if (row.state === 'failed') {
         requestError(
           row.error_code || 'OPERATIONS_ONE_OFF_QUOTE_FAILED',
-          'This quote attempt failed; submit a new idempotency key after correcting the issue',
+          failedQuoteCommandMessage(row.error_code),
           409,
         )
       }

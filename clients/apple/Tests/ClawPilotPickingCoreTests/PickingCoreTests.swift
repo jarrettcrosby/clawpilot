@@ -2004,6 +2004,96 @@ func watchInstructionPlaybackRouting() {
     ))
 }
 
+@Test("Watch instruction deadline leaves a bounded gap before local fallback")
+func watchInstructionPlaybackDeadline() throws {
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    let deadline = WatchInstructionPlaybackTiming.phonePlaybackStartDeadline(now: now)
+    let command = WatchPickCommand(
+        id: "watch-audio-1",
+        action: .readInstruction,
+        phonePlaybackStartDeadline: deadline
+    )
+
+    #expect(command.isValid)
+    #expect(
+        deadline.timeIntervalSince(now)
+            == WatchInstructionPlaybackTiming.phonePlaybackStartWindow
+    )
+    #expect(
+        WatchInstructionPlaybackTiming.watchFallbackDelay
+            - WatchInstructionPlaybackTiming.phonePlaybackStartWindow
+            == WatchInstructionPlaybackTiming.latePlaybackSafetyMargin
+    )
+    #expect(WatchInstructionPlaybackTiming.permitsPhonePlaybackStart(
+        for: command,
+        now: deadline.addingTimeInterval(-0.001)
+    ))
+    #expect(!WatchInstructionPlaybackTiming.permitsPhonePlaybackStart(
+        for: command,
+        now: deadline
+    ))
+    #expect(WatchInstructionPlaybackTiming.acceptsAcknowledgedPhonePlaybackStart(
+        startedAt: deadline.addingTimeInterval(-0.001),
+        deadline: deadline
+    ))
+    #expect(!WatchInstructionPlaybackTiming.acceptsAcknowledgedPhonePlaybackStart(
+        startedAt: nil,
+        deadline: deadline
+    ))
+    #expect(!WatchInstructionPlaybackTiming.acceptsAcknowledgedPhonePlaybackStart(
+        startedAt: deadline,
+        deadline: deadline
+    ))
+    #expect(!WatchInstructionPlaybackTiming.acceptsAcknowledgedPhonePlaybackStart(
+        startedAt: deadline.addingTimeInterval(0.001),
+        deadline: deadline
+    ))
+    let overlong = WatchPickCommand(
+        id: "watch-audio-overlong",
+        action: .readInstruction,
+        phonePlaybackStartDeadline: now.addingTimeInterval(4_000)
+    )
+    #expect(
+        WatchInstructionPlaybackTiming.effectivePhonePlaybackStartDeadline(
+            for: overlong,
+            receivedAt: now
+        ) == deadline
+    )
+
+    let encoded = try JSONEncoder().encode(command)
+    let decoded = try JSONDecoder().decode(WatchPickCommand.self, from: encoded)
+    #expect(decoded == command)
+}
+
+@Test("legacy Watch instruction commands decode without a playback deadline")
+func legacyWatchInstructionCommandDeadline() throws {
+    let legacy = Data(#"{"id":"legacy-watch-audio","action":"read_instruction"}"#.utf8)
+    let command = try JSONDecoder().decode(WatchPickCommand.self, from: legacy)
+
+    #expect(command.isValid)
+    #expect(command.phonePlaybackStartDeadline == nil)
+    let receivedAt = Date(timeIntervalSince1970: 1_700_000_000)
+    #expect(
+        WatchInstructionPlaybackTiming.effectivePhonePlaybackStartDeadline(
+            for: command,
+            receivedAt: receivedAt
+        ) == WatchInstructionPlaybackTiming.phonePlaybackStartDeadline(now: receivedAt)
+    )
+}
+
+@Test("only read-instruction commands may carry a phone playback deadline")
+func watchInstructionDeadlineIsActionBound() {
+    let invalid = WatchPickCommand(
+        id: "watch-refresh-with-audio-deadline",
+        action: .refreshQueue,
+        phonePlaybackStartDeadline: Date().addingTimeInterval(40)
+    )
+    #expect(!invalid.isValid)
+    #expect(throws: PickingContractError.contextMismatch) {
+        _ = try JSONEncoder().encode(invalid)
+    }
+}
+
 @Test("location-first voice instruction never asks for the product first")
 func locationFirstInstructionText() {
     #expect(PickVoice.instruction(

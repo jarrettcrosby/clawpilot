@@ -66,6 +66,30 @@ const operationsContract = runModule(
     : requireFromApp(specifier),
 )
 
+const clientAttempts = runModule(
+  'app_src/lib/operations/oneOffShipmentClientAttempts.ts',
+  (specifier) => requireFromApp(specifier),
+)
+
+const firstCreateAttempt = clientAttempts.resolveOneOffShipmentCreateAttempt({
+  current: null,
+  fingerprint: 'quote-1:offer-1:reason-1',
+  nextIdempotencyKey: () => 'create-key-1',
+})
+const sameBodyRetry = clientAttempts.resolveOneOffShipmentCreateAttempt({
+  current: firstCreateAttempt,
+  fingerprint: 'quote-1:offer-1:reason-1',
+  nextIdempotencyKey: () => 'must-not-be-used',
+})
+const changedBodyRetry = clientAttempts.resolveOneOffShipmentCreateAttempt({
+  current: firstCreateAttempt,
+  fingerprint: 'quote-1:offer-1:reason-2',
+  nextIdempotencyKey: () => 'create-key-2',
+})
+assert.equal(sameBodyRetry.idempotencyKey, 'create-key-1')
+assert.equal(changedBodyRetry.idempotencyKey, 'create-key-2')
+assert.notEqual(changedBodyRetry.idempotencyKey, firstCreateAttempt.idempotencyKey)
+
 const packageCatalog = runModule(
   'app_src/lib/operations/packageCatalog.ts',
   (specifier) => requireFromApp(specifier),

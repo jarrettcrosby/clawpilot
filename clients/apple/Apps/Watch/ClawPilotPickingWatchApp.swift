@@ -488,7 +488,11 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
             pairedIPhoneIsReachable: session?.isReachable == true
         )
         if playbackTarget == .pairedIPhone {
-            send(.readInstruction)
+            send(WatchPickCommand(
+                action: .readInstruction,
+                phonePlaybackStartDeadline:
+                    WatchInstructionPlaybackTiming.phonePlaybackStartDeadline()
+            ))
             return
         }
         playInstructionLocally()
@@ -532,7 +536,9 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
         commandTimeoutTask?.cancel()
         let timeout: Duration = switch command.action {
         case .requestMetaScan: .seconds(35)
-        case .readInstruction: .seconds(45)
+        case .readInstruction: .seconds(
+            Int64(WatchInstructionPlaybackTiming.watchFallbackDelay)
+        )
         default: .seconds(15)
         }
         commandTimeoutTask = Task { [weak self] in

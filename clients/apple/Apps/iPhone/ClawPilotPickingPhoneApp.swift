@@ -136,7 +136,7 @@ final class PickingPhoneModel: ObservableObject {
     @Published var isListeningForPickCommand = false
     @Published private(set) var isConfirmingOrder = false
     @Published var audioRouteStatus = "Automatic audio uses the iPhone speaker when no accessory is connected."
-    @Published var voicePackState: OfflineVoicePackState = .notInstalled
+    @Published var voicePackState: OfflineVoicePackState = .checking
     @Published var instructionLanguage: InstructionVoiceLanguage = .english
     @Published var pronunciationCorrections: [PronunciationCorrection] = []
     @Published var biometricUnlockEnabled = false
@@ -2230,13 +2230,14 @@ final class PickingPhoneModel: ObservableObject {
             do {
                 let playback = try await voice.speakEnhancedThroughBluetoothAndWait(
                     instruction.english,
-                    spanish: instruction.spanish
+                    spanish: instruction.spanish,
+                    deadline: command.phonePlaybackStartDeadline
                 )
                 refreshAudioRouteStatus()
                 status = playback.startedWhilePhoneBackgrounded
-                    ? "Enhanced instruction played while iPhone was backgrounded through iOS audio output: \(playback.outputName)."
-                    : "Enhanced instruction played through iOS audio output: \(playback.outputName)."
-                return .success(status)
+                    ? "Enhanced instruction started while iPhone was backgrounded through iOS audio output: \(playback.outputName)."
+                    : "Enhanced instruction started through iOS audio output: \(playback.outputName)."
+                return .phonePlaybackStarted(status, startedAt: playback.startedAt)
             } catch {
                 refreshAudioRouteStatus()
                 status = "Enhanced iPhone audio was unavailable: \(error.localizedDescription)"
@@ -2380,6 +2381,10 @@ final class PickingPhoneModel: ObservableObject {
 
     func installEnhancedVoicePack() async {
         await voice.installVoicePack()
+    }
+
+    func retryEnhancedVoicePack() async {
+        await voice.prepareInstalledVoicePack()
     }
 
     func removeEnhancedVoicePack() async {

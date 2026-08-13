@@ -380,6 +380,56 @@ public enum WatchInstructionPhonePlaybackPolicy {
     }
 }
 
+/// Keeps a Watch-local timeout from racing a late iPhone audio start.
+///
+/// A Watch request gives the iPhone forty seconds to establish playback, while
+/// the Watch retains its existing forty-five-second command timeout. The phone
+/// also refuses any audio start at or after that boundary, so the five-second
+/// gap is reserved for returning failure and beginning local Watch speech. A missing
+/// deadline remains valid for commands produced by an older Watch build, but
+/// current Watch builds always include one.
+public enum WatchInstructionPlaybackTiming {
+    public static let watchFallbackDelay: TimeInterval = 45
+    public static let latePlaybackSafetyMargin: TimeInterval = 5
+    public static let phonePlaybackStartWindow =
+        watchFallbackDelay - latePlaybackSafetyMargin
+
+    public static func phonePlaybackStartDeadline(now: Date = Date()) -> Date {
+        now.addingTimeInterval(phonePlaybackStartWindow)
+    }
+
+    public static func effectivePhonePlaybackStartDeadline(
+        for command: WatchPickCommand,
+        receivedAt: Date = Date()
+    ) -> Date? {
+        guard command.action == .readInstruction else { return nil }
+        let localMaximum = phonePlaybackStartDeadline(now: receivedAt)
+        guard let requested = command.phonePlaybackStartDeadline else {
+            // Keep commands from an older Watch build bounded after decoding.
+            return localMaximum
+        }
+        return min(requested, localMaximum)
+    }
+
+    public static func permitsPhonePlaybackStart(
+        for command: WatchPickCommand,
+        now: Date = Date()
+    ) -> Bool {
+        guard command.action == .readInstruction else { return true }
+        let deadline = command.phonePlaybackStartDeadline
+            ?? phonePlaybackStartDeadline(now: now)
+        return now < deadline
+    }
+
+    public static func acceptsAcknowledgedPhonePlaybackStart(
+        startedAt: Date?,
+        deadline: Date
+    ) -> Bool {
+        guard let startedAt else { return false }
+        return startedAt < deadline
+    }
+}
+
 public enum WatchPickAction: String, Codable, Equatable, Sendable {
     case requestMetaScan = "request_meta_scan"
     case readInstruction = "read_instruction"
@@ -394,17 +444,20 @@ public struct WatchPickCommand: Codable, Equatable, Sendable {
     public let action: WatchPickAction
     public let enteredCount: Int?
     public let stageContextToken: String?
+    public let phonePlaybackStartDeadline: Date?
 
     public init(
         id: String = UUID().uuidString.lowercased(),
         action: WatchPickAction,
         enteredCount: Int? = nil,
-        stageContextToken: String? = nil
+        stageContextToken: String? = nil,
+        phonePlaybackStartDeadline: Date? = nil
     ) {
         self.id = id
         self.action = action
         self.enteredCount = enteredCount
         self.stageContextToken = stageContextToken
+        self.phonePlaybackStartDeadline = phonePlaybackStartDeadline
     }
 
     public var isValid: Bool {
@@ -413,16 +466,24 @@ public struct WatchPickCommand: Codable, Equatable, Sendable {
         case .beginProductScan:
             return enteredCount == nil
                 && stageContextToken.flatMap(UUID.init(uuidString:)) != nil
+                && phonePlaybackStartDeadline == nil
         case .submitCount:
             return (enteredCount ?? 0) > 0
                 && stageContextToken.flatMap(UUID.init(uuidString:)) != nil
-        case .requestMetaScan, .readInstruction, .confirmPick, .refreshQueue:
-            return enteredCount == nil && stageContextToken == nil
+                && phonePlaybackStartDeadline == nil
+        case .readInstruction:
+            return enteredCount == nil
+                && stageContextToken == nil
+                && (phonePlaybackStartDeadline?.timeIntervalSinceReferenceDate.isFinite ?? true)
+        case .requestMetaScan, .confirmPick, .refreshQueue:
+            return enteredCount == nil
+                && stageContextToken == nil
+                && phonePlaybackStartDeadline == nil
         }
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, action, enteredCount, stageContextToken
+        case id, action, enteredCount, stageContextToken, phonePlaybackStartDeadline
     }
 
     public init(from decoder: Decoder) throws {
@@ -431,6 +492,10 @@ public struct WatchPickCommand: Codable, Equatable, Sendable {
         action = try values.decode(WatchPickAction.self, forKey: .action)
         enteredCount = try values.decodeIfPresent(Int.self, forKey: .enteredCount)
         stageContextToken = try values.decodeIfPresent(String.self, forKey: .stageContextToken)
+        phonePlaybackStartDeadline = try values.decodeIfPresent(
+            Date.self,
+            forKey: .phonePlaybackStartDeadline
+        )
         guard isValid else { throw PickingContractError.contextMismatch }
     }
 
@@ -441,6 +506,10 @@ public struct WatchPickCommand: Codable, Equatable, Sendable {
         try values.encode(action, forKey: .action)
         try values.encodeIfPresent(enteredCount, forKey: .enteredCount)
         try values.encodeIfPresent(stageContextToken, forKey: .stageContextToken)
+        try values.encodeIfPresent(
+            phonePlaybackStartDeadline,
+            forKey: .phonePlaybackStartDeadline
+        )
     }
 }
 
