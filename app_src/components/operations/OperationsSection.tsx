@@ -1,6 +1,6 @@
 'use client'
 
-import { FormEvent, forwardRef, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useState } from 'react'
+import { FormEvent, forwardRef, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useRef, useState } from 'react'
 import {
   Alert,
   Box,
@@ -2268,6 +2268,7 @@ export default function OperationsSection({
   const [exceptionStatus, setExceptionStatus] = useState<'' | OperationsExceptionStatus>('')
   const [selectedGlobalId, setSelectedGlobalId] = useState<string | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
+  const pendingOrderGlobalIdRef = useRef<string | null>(null)
   const [selectedExceptionGlobalId, setSelectedExceptionGlobalId] = useState<string | null>(null)
   const [exceptionDrawerOpen, setExceptionDrawerOpen] = useState(false)
   const [updatingException, setUpdatingException] = useState(false)
@@ -2413,10 +2414,17 @@ export default function OperationsSection({
   ] = useState<string | null>(null)
 
   useEffect(() => {
+    const pendingOrderGlobalId = pendingOrderGlobalIdRef.current
     setView(initialView)
     setSearch('')
-    setSelectedGlobalId(null)
-    setDrawerOpen(false)
+    if (initialView === 'orders' && pendingOrderGlobalId) {
+      pendingOrderGlobalIdRef.current = null
+      setSelectedGlobalId(pendingOrderGlobalId)
+      setDrawerOpen(true)
+    } else {
+      setSelectedGlobalId(null)
+      setDrawerOpen(false)
+    }
     setSelectedExceptionGlobalId(null)
     setExceptionDrawerOpen(false)
   }, [initialView])
@@ -2569,11 +2577,14 @@ export default function OperationsSection({
   }
 
   const openPickingOrder = (orderGlobalId: string) => {
-    setView('orders')
-    setSearch('')
-    setStatus('')
-    setSelectedGlobalId(orderGlobalId)
-    setDrawerOpen(true)
+    if (view === 'orders') {
+      setSearch('')
+      setStatus('')
+      setSelectedGlobalId(orderGlobalId)
+      setDrawerOpen(true)
+      return
+    }
+    pendingOrderGlobalIdRef.current = orderGlobalId
     window.location.hash = 'operations'
   }
 

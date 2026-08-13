@@ -821,9 +821,13 @@ const operationsSection = read(
 )
 includes(operationsSection, [
   '<CommerceImportsPanel onOpenOrder={openPickingOrder} />',
+  'const pendingOrderGlobalIdRef = useRef<string | null>(null)',
   'const openPickingOrder = (orderGlobalId: string) => {',
-  "setView('orders')",
+  "if (view === 'orders')",
+  'pendingOrderGlobalIdRef.current = orderGlobalId',
+  "if (initialView === 'orders' && pendingOrderGlobalId)",
   'setSelectedGlobalId(orderGlobalId)',
+  'setSelectedGlobalId(pendingOrderGlobalId)',
   'setDrawerOpen(true)',
   "window.location.hash = 'operations'",
 ], 'Shopify inventory affected-order Operations drawer navigation')
