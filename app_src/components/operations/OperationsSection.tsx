@@ -1,6 +1,6 @@
 'use client'
 
-import { FormEvent, forwardRef, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useRef, useState } from 'react'
+import { FormEvent, forwardRef, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useState } from 'react'
 import {
   Alert,
   Box,
@@ -270,6 +270,8 @@ const ACTIVATION_OPTIONS: Array<{
 ]
 
 const CARTONIZATION_EVIDENCE_GLOBAL_ID = /^gcte(?:[0-9]{7}|[0-9a-v]{12})$/
+const OPERATIONS_ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/
+const OPERATIONS_ORDER_QUERY = 'operationsOrder'
 const COMMERCE_FULFILLMENT_RECONCILIATION_REQUIRED =
   'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
 const COMMERCE_FULFILLMENT_AUTOMATIC_ATTEMPT_LIMIT = 8
@@ -2268,7 +2270,6 @@ export default function OperationsSection({
   const [exceptionStatus, setExceptionStatus] = useState<'' | OperationsExceptionStatus>('')
   const [selectedGlobalId, setSelectedGlobalId] = useState<string | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
-  const pendingOrderGlobalIdRef = useRef<string | null>(null)
   const [selectedExceptionGlobalId, setSelectedExceptionGlobalId] = useState<string | null>(null)
   const [exceptionDrawerOpen, setExceptionDrawerOpen] = useState(false)
   const [updatingException, setUpdatingException] = useState(false)
@@ -2414,11 +2415,14 @@ export default function OperationsSection({
   ] = useState<string | null>(null)
 
   useEffect(() => {
-    const pendingOrderGlobalId = pendingOrderGlobalIdRef.current
+    const pendingOrderGlobalId = new URL(window.location.href).searchParams
+      .get(OPERATIONS_ORDER_QUERY)?.trim() || ''
     setView(initialView)
     setSearch('')
-    if (initialView === 'orders' && pendingOrderGlobalId) {
-      pendingOrderGlobalIdRef.current = null
+    if (
+      initialView === 'orders'
+      && OPERATIONS_ORDER_GLOBAL_ID.test(pendingOrderGlobalId)
+    ) {
       setSelectedGlobalId(pendingOrderGlobalId)
       setDrawerOpen(true)
     } else {
@@ -2502,6 +2506,11 @@ export default function OperationsSection({
   const closeDrawer = () => {
     setDrawerOpen(false)
     setSelectedGlobalId(null)
+    const nextUrl = new URL(window.location.href)
+    if (nextUrl.searchParams.has(OPERATIONS_ORDER_QUERY)) {
+      nextUrl.searchParams.delete(OPERATIONS_ORDER_QUERY)
+      window.history.replaceState(window.history.state, '', nextUrl)
+    }
     setOneOffExecutionState(null)
     setOneOffExecutionError('')
     setOneOffGroupPurchaseOpen(false)
@@ -2577,6 +2586,10 @@ export default function OperationsSection({
   }
 
   const openPickingOrder = (orderGlobalId: string) => {
+    if (!OPERATIONS_ORDER_GLOBAL_ID.test(orderGlobalId)) return
+    const nextUrl = new URL(window.location.href)
+    nextUrl.searchParams.set(OPERATIONS_ORDER_QUERY, orderGlobalId)
+    window.history.replaceState(window.history.state, '', nextUrl)
     if (view === 'orders') {
       setSearch('')
       setStatus('')
@@ -2584,7 +2597,6 @@ export default function OperationsSection({
       setDrawerOpen(true)
       return
     }
-    pendingOrderGlobalIdRef.current = orderGlobalId
     window.location.hash = 'operations'
   }
 

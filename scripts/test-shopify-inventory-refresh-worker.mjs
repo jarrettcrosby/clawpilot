@@ -821,11 +821,12 @@ const operationsSection = read(
 )
 includes(operationsSection, [
   '<CommerceImportsPanel onOpenOrder={openPickingOrder} />',
-  'const pendingOrderGlobalIdRef = useRef<string | null>(null)',
+  "const OPERATIONS_ORDER_QUERY = 'operationsOrder'",
+  'OPERATIONS_ORDER_GLOBAL_ID.test(pendingOrderGlobalId)',
   'const openPickingOrder = (orderGlobalId: string) => {',
   "if (view === 'orders')",
-  'pendingOrderGlobalIdRef.current = orderGlobalId',
-  "if (initialView === 'orders' && pendingOrderGlobalId)",
+  'nextUrl.searchParams.set(OPERATIONS_ORDER_QUERY, orderGlobalId)',
+  'nextUrl.searchParams.delete(OPERATIONS_ORDER_QUERY)',
   'setSelectedGlobalId(orderGlobalId)',
   'setSelectedGlobalId(pendingOrderGlobalId)',
   'setDrawerOpen(true)',
