@@ -457,6 +457,7 @@ const railwayPredeploy = read('scripts/predeploy-railway.sh')
 for (const fragment of [
   'npm run mail:verify',
   'npm run db:migrate',
+  'npm run verify:commerce-order-revision-evidence-keys',
   'npm run demo:seed',
   'npm run demo:verify',
 ]) {
@@ -467,6 +468,13 @@ assert.ok(!railwayPredeploy.includes('RAILWAY_ENVIRONMENT_NAME'))
 assert.ok(
   railwayPredeploy.indexOf('npm run db:migrate') < railwayPredeploy.indexOf('npm run demo:seed'),
   'demo data must only be seeded after migrations complete',
+)
+assert.ok(
+  railwayPredeploy.indexOf('npm run db:migrate')
+    < railwayPredeploy.indexOf('npm run verify:commerce-order-revision-evidence-keys')
+  && railwayPredeploy.indexOf('npm run verify:commerce-order-revision-evidence-keys')
+    < railwayPredeploy.indexOf('npm run demo:seed'),
+  'revision evidence keys must be verified after migrations and before seeding',
 )
 const railwayStart = read('scripts/start-railway.sh')
 assert.ok(railwayStart.indexOf('/api/health') < railwayStart.indexOf('npm run release:record'))

@@ -515,7 +515,7 @@ export class WwexSpeedshipPartialTenderOutcomeError extends Error {
   }
 }
 
-const SMALLPACK_PACKAGING: Record<string, string> = {
+export const WWEX_SMALLPACK_PACKAGING_TYPES = Object.freeze({
   '01': 'UPS Express Envelope',
   '02': 'Custom',
   '03': 'UPS Express Tube',
@@ -526,12 +526,15 @@ const SMALLPACK_PACKAGING: Record<string, string> = {
   '2a': 'UPS Express Box Small',
   '2b': 'UPS Express Box Medium',
   '2c': 'UPS Express Box Large',
-}
+} as const)
 
-const LTL_PACKAGING = new Set([
+export const WWEX_LTL_PACKAGING_TYPES = Object.freeze([
   'BAG', 'BALE', 'BOX', 'BUNDLE', 'CARTON', 'CASE', 'CRATE', 'DRUM',
   'PAIL', 'PLT', 'PIECES', 'REEL', 'ROLL', 'SKID', 'TANK', 'TRAILER',
-])
+] as const)
+const SMALLPACK_PACKAGING: Readonly<Record<string, string>> =
+  WWEX_SMALLPACK_PACKAGING_TYPES
+const LTL_PACKAGING = new Set<string>(WWEX_LTL_PACKAGING_TYPES)
 const SMALLPACK_LOCATION_TYPES = new Set([
   'AIRPORT', 'CARRIER_TERMINAL', 'CEMETERY', 'CHURCH',
   'CONTAINER_FREIGHT_STATION', 'CONSTRUCTION', 'COUNTRY_OR_GOLF_CLUB',

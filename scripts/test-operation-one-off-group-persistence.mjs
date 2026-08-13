@@ -11,6 +11,8 @@ const requireFromApp = createRequire(
 const { Pool } = requireFromApp('pg')
 const root = process.cwd()
 const actorEmail = 'one-off-group-persistence@example.com'
+const PACKAGE_CATALOG_VERSION = 'operations.package_catalog.v1'
+const UPS_SELECTION_KEY = 'ups_rest:gia0009302:gac0009301:v1'
 
 const HASH = Object.freeze({
   account: 'a'.repeat(64),
@@ -132,18 +134,42 @@ function quoteSnapshots(ids) {
   const packages = [
     {
       packageKey: 'package-1',
+      packageProfile: {
+        catalogEntryId: 'box',
+        contractVersion: PACKAGE_CATALOG_VERSION,
+      },
       dimensionsMm: { length: 300, width: 200, height: 100 },
       grossWeightGrams: 1_000,
       allocations: [{ lineKey: 'line-1', quantity: 1 }],
     },
     {
       packageKey: 'package-2',
+      packageProfile: {
+        catalogEntryId: 'box',
+        contractVersion: PACKAGE_CATALOG_VERSION,
+      },
       dimensionsMm: { length: 400, width: 250, height: 150 },
       grossWeightGrams: 2_000,
       allocations: [{ lineKey: 'line-2', quantity: 1 }],
     },
   ]
   return { lines, packages }
+}
+
+function exactUpsSelection(packages) {
+  return {
+    selectionKey: UPS_SELECTION_KEY,
+    provider: 'ups_rest',
+    integrationAccountGlobalId: 'gia0009302',
+    carrierAccountGlobalId: 'gac0009301',
+    credentialVersion: 1,
+    packageCodes: packages.map((oneOffPackage) => ({
+      packageKey: oneOffPackage.packageKey,
+      catalogEntryId: oneOffPackage.packageProfile.catalogEntryId,
+      catalogVersion: oneOffPackage.packageProfile.contractVersion,
+      providerPackageCode: '02',
+    })),
+  }
 }
 
 async function seedPrerequisites(client, ids) {
@@ -265,28 +291,57 @@ async function seedPrerequisites(client, ids) {
       ],
     )
   await client.query(
+      `INSERT INTO operations_carrier_credentials (
+         organization_id, integration_account_id, credential_ciphertext,
+         credential_iv, credential_tag, credential_version,
+         client_id_last_four, account_number_last_four,
+         credential_kind, credential_identifier_last_four,
+         verification_status, verified_at, credential_fingerprint
+       ) VALUES (
+         $1, $2, decode('010203', 'hex'), decode('040506', 'hex'),
+         decode('070809', 'hex'), 1, 'c123', '1234',
+         'oauth_client_credentials', 'c123', 'verified', now(),
+         operations_carrier_credential_fingerprint(
+           1, decode('010203', 'hex'), decode('040506', 'hex'),
+           decode('070809', 'hex')
+         )
+       )`,
+      [ids.organization, ids.carrierIntegration],
+    )
+  const exactRateRequest = JSON.stringify({
+    shipment: {
+      parcels: quoteSnapshots(ids).packages.map((oneOffPackage) => ({
+        packageKey: oneOffPackage.packageKey,
+        packageCode: '02',
+      })),
+    },
+  })
+  await client.query(
       `INSERT INTO operations_carrier_rate_requests (
          global_id, organization_id, integration_account_id,
          carrier_account_id, provider, environment, purpose,
-         adapter_version, credential_version, request_hash,
+         adapter_version, credential_version, carrier_selection_key, request_hash,
          redacted_request, redacted_response, status, requested_at,
          completed_at
        ) VALUES
          ('grq0009301', $1, $2, $3, 'ups_rest', 'sandbox',
-          'cartonization_shipment_rate', 'fixture-v1', 1, $4,
-          '{}'::jsonb, $5::jsonb, 'succeeded', now(), now()),
+          'cartonization_shipment_rate', 'fixture-v1', 1, $4, $5,
+          $6::jsonb, $7::jsonb, 'succeeded', now(), now()),
          ('grq0009302', $1, $2, $3, 'ups_rest', 'sandbox',
-          'cartonization_shipment_rate', 'fixture-v1', 1, $6,
-          '{}'::jsonb, $7::jsonb, 'succeeded', now(), now())`,
+          'cartonization_shipment_rate', 'fixture-v1', 1, $4, $8,
+          $9::jsonb, $10::jsonb, 'succeeded', now(), now())`,
       [
         ids.organization,
         ids.carrierIntegration,
         ids.carrierAccount,
+        UPS_SELECTION_KEY,
         HASH.planningCarrierRequest,
+        exactRateRequest,
         JSON.stringify({
           rates: [{ serviceCode: '03', currency: 'USD', amount: '12.00' }],
         }),
         HASH.purchaseCarrierRequest,
+        exactRateRequest,
         JSON.stringify({
           rates: [{ serviceCode: '03', currency: 'USD', amount: '13.00' }],
         }),
@@ -416,6 +471,12 @@ async function insertQuoteAuthority(
   },
 ) {
   const snapshots = quoteSnapshots(ids)
+  const selection = exactUpsSelection(snapshots.packages)
+  const result = {
+    status: 'succeeded',
+    eligibleOfferCount: 1,
+    errorCode: null,
+  }
   await client.query(
     `INSERT INTO operations_one_off_shipment_quote_commands (
        organization_id, idempotency_key, request_hash, actor_email
@@ -428,14 +489,19 @@ async function insertQuoteAuthority(
        inventory_pool_id, receiving_location_id, rate_environment,
        reference_number, currency, destination_snapshot, destination_hash,
        lines_snapshot, lines_hash, packages_snapshot, packages_hash,
-       required_carrier_providers, provider_results_snapshot, request_hash,
+       required_carrier_providers, provider_results_snapshot,
+       required_transport_sources, transport_results_snapshot,
+       required_carrier_selections, carrier_selection_results_snapshot,
+       carrier_selection_schema_version, request_hash,
        status, idempotency_key, actor_email, expires_at, execution_mode,
        packed_rerate_order_id, packed_rerate_plan_id
      ) VALUES (
        $1, $2, $3, $4, $5, $6, $7, 'sandbox', $8, 'USD',
        $9::jsonb, $10, $11::jsonb, $12, $13::jsonb, $14,
-       ARRAY['ups_rest']::text[], $15::jsonb, $16, 'succeeded', $17,
-       $18, now() + interval '1 hour', 'test', $19, $20
+       ARRAY['ups_rest']::text[], $15::jsonb,
+       ARRAY['ups_rest:small_parcel']::text[], $16::jsonb,
+       $17::jsonb, $18::jsonb, 1, $19, 'succeeded', $20,
+       $21, now() + interval '1 hour', 'test', $22, $23
      )`,
     [
       quoteId,
@@ -452,7 +518,10 @@ async function insertQuoteAuthority(
       HASH.lines,
       JSON.stringify(snapshots.packages),
       HASH.packages,
-      JSON.stringify({ ups_rest: { status: 'succeeded' } }),
+      JSON.stringify({ ups_rest: result }),
+      JSON.stringify({ 'ups_rest:small_parcel': result }),
+      JSON.stringify([selection]),
+      JSON.stringify({ [UPS_SELECTION_KEY]: result }),
       quoteRequestHash,
       idempotencyKey,
       actorEmail,
@@ -464,13 +533,14 @@ async function insertQuoteAuthority(
     `INSERT INTO operations_one_off_shipment_quote_offers (
        id, organization_id, quote_id, integration_account_id,
        carrier_account_id, provider, environment, credential_version,
+       carrier_selection_key,
        service_code, service_name, amount_minor, currency, transit_days,
        estimated_delivery_at, rate_evidence_global_id,
        carrier_request_hash, carrier_response_hash, offer_snapshot
      ) VALUES (
-       $1, $2, $3, $4, $5, 'ups_rest', 'sandbox', 1, '03',
-       'UPS Ground', $6, 'USD', 3, now() + interval '3 days',
-       $7, $8, $9, $10::jsonb
+       $1, $2, $3, $4, $5, 'ups_rest', 'sandbox', 1, $6, '03',
+       'UPS Ground', $7, 'USD', 3, now() + interval '3 days',
+       $8, $9, $10, $11::jsonb
      )`,
     [
       offerId,
@@ -478,6 +548,7 @@ async function insertQuoteAuthority(
       quoteId,
       ids.carrierIntegration,
       ids.carrierAccount,
+      UPS_SELECTION_KEY,
       amountMinor,
       evidenceGlobalId,
       carrierRequestHash,

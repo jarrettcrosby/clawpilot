@@ -1,13 +1,39 @@
 import { createHash } from 'node:crypto'
 import type { Address, Millimeters } from '@/lib/operations/types'
+import type { CanonicalPackageProfile } from '@/lib/operations/packageCatalog'
 
-export type OneOffCarrierProvider = 'ups_rest' | 'fedex_rest'
+export type OneOffCarrierProvider = 'ups_rest' | 'fedex_rest' | 'wwex_speedship'
 export type OneOffRateEnvironment = 'sandbox' | 'production'
 export type OneOffExecutionMode = 'test' | 'live'
 export {
   ONE_OFF_LIVE_POSTAGE_CONFIRMATION,
   ONE_OFF_MAX_SYNCHRONOUS_PACKAGES,
 } from '@/lib/operations/oneOffShipmentConstants'
+
+export type OneOffCarrierSelectionInput = {
+  provider: OneOffCarrierProvider
+  integrationAccountGlobalId: string
+  carrierAccountGlobalId: string | null
+}
+
+export type OneOffCarrierPackageCode = {
+  packageKey: string
+  catalogEntryId: CanonicalPackageProfile['catalogEntryId']
+  catalogVersion: CanonicalPackageProfile['contractVersion']
+  providerPackageCode: string
+}
+
+export type OneOffResolvedCarrierSelection = OneOffCarrierSelectionInput & {
+  selectionKey: string
+  credentialVersion: number
+  packageCodes: OneOffCarrierPackageCode[]
+}
+
+export type OneOffCarrierSelectionResult = {
+  status: 'succeeded' | 'failed'
+  eligibleOfferCount: number
+  errorCode: string | null
+}
 
 export type OneOffExistingProductLine = {
   kind: 'existing'
@@ -34,6 +60,7 @@ export type OneOffShipmentLineInput =
 
 export type OneOffShipmentPackageInput = {
   packageKey: string
+  packageProfile: CanonicalPackageProfile
   description: string
   dimensionsMm: Millimeters
   grossWeightGrams: number
@@ -55,6 +82,7 @@ export type OneOffShipmentQuoteInput = {
   shipFromPhone: string
   shipToPhone: string
   shipToResidential: boolean
+  selectedCarriers: OneOffCarrierSelectionInput[]
   shipTo: Address
   lines: OneOffShipmentLineInput[]
   packages: OneOffShipmentPackageInput[]
@@ -63,7 +91,8 @@ export type OneOffShipmentQuoteInput = {
 export type OneOffShipmentQuoteOffer = {
   globalId: string
   provider: OneOffCarrierProvider
-  providerLabel: 'UPS' | 'FedEx'
+  providerLabel: 'UPS' | 'FedEx' | 'Worldwide Express'
+  executionCapability: 'direct_purchase_later' | 'rate_only'
   environment: OneOffRateEnvironment
   serviceCode: string
   serviceName: string
@@ -73,7 +102,7 @@ export type OneOffShipmentQuoteOffer = {
   estimatedDeliveryAt: string | null
   rateEvidenceGlobalId: string
   integrationAccountGlobalId: string
-  carrierAccountGlobalId: string
+  carrierAccountGlobalId: string | null
   credentialVersion: number
 }
 
@@ -181,6 +210,8 @@ export type OneOffShipmentQuote = {
   environment: OneOffRateEnvironment
   executionMode: OneOffExecutionMode
   requiredCarrierProviders: OneOffCarrierProvider[]
+  requiredCarrierSelections: OneOffResolvedCarrierSelection[]
+  carrierSelectionResults: Record<string, OneOffCarrierSelectionResult>
   expiresAt: string
   offers: OneOffShipmentQuoteOffer[]
   effects: {
@@ -240,10 +271,10 @@ export type OneOffShipmentWorkspace = {
   }>
   carriers: Array<{
     provider: OneOffCarrierProvider
-    providerLabel: 'UPS' | 'FedEx'
+    providerLabel: 'UPS' | 'FedEx' | 'Worldwide Express'
     environment: OneOffRateEnvironment
     integrationAccountGlobalId: string
-    carrierAccountGlobalId: string
+    carrierAccountGlobalId: string | null
     displayName: string
     senderOriginWarehouseGlobalId: string | null
   }>
@@ -267,7 +298,38 @@ export function oneOffShipmentHash(value: unknown) {
 }
 
 export function oneOffProviderLabel(provider: OneOffCarrierProvider) {
-  return provider === 'ups_rest' ? 'UPS' as const : 'FedEx' as const
+  return provider === 'ups_rest'
+    ? 'UPS' as const
+    : provider === 'fedex_rest'
+      ? 'FedEx' as const
+      : 'Worldwide Express' as const
+}
+
+export function oneOffCarrierSelectionKey(input: {
+  provider: OneOffCarrierProvider
+  integrationAccountGlobalId: string
+  carrierAccountGlobalId: string | null
+  credentialVersion: number
+}) {
+  return `${input.provider}:${input.integrationAccountGlobalId}:${input.carrierAccountGlobalId || 'none'}:v${input.credentialVersion}`
+}
+
+export function canonicalOneOffCarrierSelections<
+  T extends OneOffCarrierSelectionInput,
+>(selections: readonly T[]): T[] {
+  return [...selections].sort((left, right) => {
+    const providerRank = (provider: OneOffCarrierProvider) => (
+      provider === 'ups_rest' ? 0 : provider === 'fedex_rest' ? 1 : 2
+    )
+    const providerOrder = providerRank(left.provider) - providerRank(right.provider)
+    if (providerOrder) return providerOrder
+    const accountOrder = left.integrationAccountGlobalId.localeCompare(
+      right.integrationAccountGlobalId,
+    )
+    return accountOrder || (left.carrierAccountGlobalId || '').localeCompare(
+      right.carrierAccountGlobalId || '',
+    )
+  })
 }
 
 export function oneOffRateEnvironment(

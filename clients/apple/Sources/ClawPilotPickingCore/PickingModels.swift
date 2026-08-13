@@ -371,6 +371,15 @@ public enum WatchInstructionPlaybackTarget: Equatable, Sendable {
     }
 }
 
+public enum WatchInstructionPhonePlaybackPolicy {
+    public static func isEligible(
+        metaConnectedDeviceCount: Int,
+        enhancedVoiceReady: Bool
+    ) -> Bool {
+        metaConnectedDeviceCount == 1 && enhancedVoiceReady
+    }
+}
+
 public enum WatchPickAction: String, Codable, Equatable, Sendable {
     case requestMetaScan = "request_meta_scan"
     case readInstruction = "read_instruction"

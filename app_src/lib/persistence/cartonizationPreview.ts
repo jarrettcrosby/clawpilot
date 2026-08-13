@@ -299,7 +299,7 @@ async function readCandidateLines(
        line.pack_profile_version_row_version::text,
        line.pack_profile_package_level,
        line.pack_profile_base_each_quantity
-     FROM operations_commerce_order_candidate_lines line
+     FROM operations_commerce_current_planning_lines line
      LEFT JOIN crm_products product
       ON product.pipeline_id = line.pipeline_id
       AND product.id = line.product_id

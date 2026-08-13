@@ -82,12 +82,22 @@ const railwayPredeploy = readFileSync(resolve(root, 'scripts/predeploy-railway.s
 for (const requiredCommand of [
   'npm run mail:verify',
   'npm run db:migrate',
+  'npm run verify:commerce-order-revision-evidence-keys',
   'npm run demo:seed',
   'npm run demo:verify',
 ]) {
   if (!railwayPredeploy.includes(requiredCommand)) {
     fail(`scripts/predeploy-railway.sh must run "${requiredCommand}"`)
   }
+}
+const revisionEvidenceKeyGatePosition = railwayPredeploy.indexOf(
+  'npm run verify:commerce-order-revision-evidence-keys',
+)
+if (
+  revisionEvidenceKeyGatePosition <= railwayPredeploy.indexOf('npm run db:migrate')
+  || revisionEvidenceKeyGatePosition >= railwayPredeploy.indexOf('npm run demo:seed')
+) {
+  fail('Railway must verify revision evidence keys after migrations and before seeding')
 }
 
 const railwayStart = readFileSync(resolve(root, 'scripts/start-railway.sh'), 'utf8')
@@ -110,6 +120,14 @@ if (releaseRecordPosition < healthGatePosition) {
 }
 
 for (const requiredPath of [
+  'db/migrations/0274_operations_commerce_order_revision_apply.sql',
+  'db/migrations/0275_operations_one_off_carrier_selection.sql',
+  'app_src/app/api/operations/order-revisions/route.ts',
+  'app_src/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs',
+  'scripts/verify-commerce-order-revision-evidence-keys.mjs',
+  'scripts/test-commerce-order-revision-authority-postgres.mjs',
+  'scripts/test-shipping-ui-fixture.mjs',
+  'scripts/test-apple-manager-pick-management.mjs',
   'db/migrations/0002_pipeline_outbox_worker.sql',
   'db/migrations/0009_agent_dispatch_outbox.sql',
   'db/migrations/0003_auth_magic_codes.sql',

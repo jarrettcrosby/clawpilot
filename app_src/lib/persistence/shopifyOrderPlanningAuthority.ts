@@ -287,8 +287,8 @@ async function readTarget(
        candidate_line.unfulfilled_quantity::text
          AS candidate_unfulfilled_quantity,
        canonical_line.quantity::text AS canonical_quantity
-     FROM operations_commerce_order_candidate_lines candidate_line
-     LEFT JOIN operations_order_lines canonical_line
+     FROM operations_commerce_current_planning_lines candidate_line
+     LEFT JOIN operations_current_order_lines canonical_line
        ON canonical_line.organization_id = candidate_line.organization_id
       AND canonical_line.id = candidate_line.canonical_order_line_id
       AND canonical_line.order_id = $4::uuid

@@ -1,9 +1,11 @@
 import {
+  commerceOrderRevisionProtectedContentFingerprint,
   decryptCommerceCredential,
-  encryptCommerceCandidateSnapshot,
+  encryptCommerceOrderRevisionProtectedSnapshot,
   normalizeCommerceAccountGlobalId,
   normalizeCommerceOrganizationId,
 } from '@/lib/integrations/commerceCredentialCrypto'
+import type { EncryptedCommerceOrderRevisionValue } from '@/lib/integrations/commerceCredentialCrypto'
 import {
   getFaireOrder,
   probeFaireBrandProfile,
@@ -16,6 +18,7 @@ import {
   commerceReadCredentialEligible,
 } from '@/lib/integrations/commerceReadRuntime'
 import {
+  commerceOrderRevisionProtectedPlaintext,
   commerceOrderRevisionHash,
 } from '@/lib/integrations/commerceOrderRevisionEvidence'
 import type {
@@ -23,7 +26,6 @@ import type {
   CommerceMoneySet,
   CommerceNormalizedOrder,
 } from '@/lib/operations/commerceNormalization'
-import { commerceSourceHash } from '@/lib/operations/commerceNormalization'
 import {
   readCommerceRuntimeCredentialFromPostgres,
 } from '@/lib/persistence/commerceIntegrations'
@@ -48,7 +50,7 @@ export type FaireCanonicalOrderRevisionTarget = {
 }
 
 export type FaireCanonicalOrderRevisionSnapshot = {
-  version: 'faire-canonical-order-revision-v1'
+  version: 'faire-canonical-order-revision-v2'
   provider: 'faire'
   accountGlobalId: string
   integrationAccountId: string
@@ -70,6 +72,12 @@ export type FaireCanonicalOrderRevisionSnapshot = {
     rawStates: CommerceNormalizedOrder['rawStates']
     canonicalStates: CommerceNormalizedOrder['canonicalStates']
     currency: string
+    providerRevisionState: {
+      orderState: string | null
+      shipmentCount: number | null
+      lineStateBasis: 'all_processing' | 'not_all_processing' | 'incomplete'
+      quantityBasis: 'exact_order_item_quantity' | 'unavailable'
+    }
     money: {
       subtotalMinor: string | null
       shippingMinor: string | null
@@ -77,6 +85,10 @@ export type FaireCanonicalOrderRevisionSnapshot = {
       discountMinor: string | null
       totalMinor: string | null
       headerState: CommerceNormalizedOrder['headerMoney']['state']
+      reconciliationMode:
+        | 'discount_separate'
+        | 'discount_in_subtotal'
+        | 'unreconciled'
     }
     requestedDeliveryAt: string | null
     partyFingerprint: string
@@ -86,6 +98,8 @@ export type FaireCanonicalOrderRevisionSnapshot = {
       externalProductId: string | null
       externalVariantId: string | null
       sku: string | null
+      titleSnapshot: string
+      variantTitleSnapshot: string | null
       orderedQuantity: number
       currentQuantity: number | null
       cancelledQuantity: number | null
@@ -108,8 +122,14 @@ export type FaireCanonicalOrderRevisionEvidence = {
   sourceHash: string
   revisionHash: string
   snapshot: FaireCanonicalOrderRevisionSnapshot
+  protectedParty: ProtectedRevisionSnapshot | null
+  protectedShipTo: ProtectedRevisionSnapshot | null
   providerReads: 2
   providerWrites: 0
+}
+
+export type ProtectedRevisionSnapshot = EncryptedCommerceOrderRevisionValue & {
+  contentFingerprint: string
 }
 
 export class FaireOrderRevisionError extends Error {
@@ -364,17 +384,48 @@ function optionsForCredential(
 function protectedFingerprint<T>(input: {
   field: CommerceDataField<T>
   target: FaireCanonicalOrderRevisionTarget
+  sourceHash: string
   kind: 'party' | 'ship_to'
 }) {
-  const value = input.field as unknown as Record<string, unknown>
-  return encryptCommerceCandidateSnapshot(
+  const value = commerceOrderRevisionProtectedPlaintext(input.field, input.kind)
+  return value ? commerceOrderRevisionProtectedContentFingerprint(
     value,
     input.target.organizationId,
     input.target.accountGlobalId,
     input.target.externalOrderId,
-    commerceSourceHash(value),
     input.kind,
-  ).hash
+  ) : commerceOrderRevisionHash({
+    kind: input.kind,
+    state: input.field.state,
+  })
+}
+
+function protectedRevisionSnapshot<T>(input: {
+  field: CommerceDataField<T>
+  target: FaireCanonicalOrderRevisionTarget
+  sourceHash: string
+  kind: 'party' | 'ship_to'
+}) {
+  const value = commerceOrderRevisionProtectedPlaintext(input.field, input.kind)
+  if (!value) return null
+  const encrypted = encryptCommerceOrderRevisionProtectedSnapshot(
+    value,
+    input.target.organizationId,
+    input.target.accountGlobalId,
+    input.target.externalOrderId,
+    input.sourceHash,
+    input.kind,
+  )
+  return {
+    ...encrypted,
+    contentFingerprint: commerceOrderRevisionProtectedContentFingerprint(
+      value,
+      input.target.organizationId,
+      input.target.accountGlobalId,
+      input.target.externalOrderId,
+      input.kind,
+    ),
+  }
 }
 
 function identityValue<T extends { value: string }>(
@@ -389,9 +440,167 @@ function moneyMinor(field: CommerceDataField<CommerceMoneySet>) {
     : null
 }
 
+function moneyReconciliationMode(order: CommerceNormalizedOrder) {
+  const values = [
+    moneyMinor(order.subtotal),
+    moneyMinor(order.shipping),
+    moneyMinor(order.tax),
+    moneyMinor(order.discount),
+    moneyMinor(order.total),
+  ]
+  if (values.some((value) => value === null)) return 'unreconciled' as const
+  const [subtotal, shipping, tax, discount, total] = values.map((value) => (
+    BigInt(value as string)
+  ))
+  if (discount === BigInt(0)) {
+    return total === subtotal + shipping + tax
+      ? 'discount_separate' as const
+      : 'unreconciled' as const
+  }
+  if (total === subtotal - discount + shipping + tax) {
+    return 'discount_separate' as const
+  }
+  if (total === subtotal + shipping + tax) {
+    return 'discount_in_subtotal' as const
+  }
+  return 'unreconciled' as const
+}
+
+type FaireExactUnstartedLine = Readonly<{
+  externalLineId: string
+  quantity: number
+}>
+
+type FaireExactUnstartedRevisionFacts = Readonly<{
+  eligible: boolean
+  orderState: string | null
+  shipmentCount: number | null
+  lineStateBasis: 'all_processing' | 'not_all_processing' | 'incomplete'
+  lines: ReadonlyMap<string, FaireExactUnstartedLine> | null
+}>
+
+function exactConnectionValues(value: unknown) {
+  if (Array.isArray(value)) return value
+  const connection = record(value)
+  if (Array.isArray(connection?.nodes)) return connection.nodes
+  if (Array.isArray(connection?.edges)) {
+    return connection.edges.map((edge) => record(edge)?.node ?? edge)
+  }
+  return null
+}
+
+function exactFaireUnstartedRevisionFacts(
+  providerOrder: unknown,
+  normalizedOrder: CommerceNormalizedOrder,
+): FaireExactUnstartedRevisionFacts {
+  const source = record(providerOrder)
+  const rawOrderState = typeof source?.state === 'string'
+    ? source.state.trim().toUpperCase()
+    : null
+  const normalizedOrderState = typeof normalizedOrder.rawStates.lifecycle === 'string'
+    ? normalizedOrder.rawStates.lifecycle.trim().toUpperCase()
+    : null
+  if (rawOrderState !== normalizedOrderState) {
+    fail(
+      'FAIRE_ORDER_REVISION_PROVIDER_FACTS_INCOMPLETE',
+      'Faire exact order lifecycle state is mismatched',
+    )
+  }
+  const shipmentCount = Array.isArray(source?.shipments)
+    ? source.shipments.length
+    : null
+  const rawLines = exactConnectionValues(source?.items ?? source?.order_items)
+  const potentiallyEligible = (
+    rawOrderState === 'NEW'
+    && shipmentCount === 0
+  )
+  if (!potentiallyEligible || !rawLines || rawLines.length !== normalizedOrder.lines.length) {
+    return {
+      eligible: false,
+      orderState: rawOrderState,
+      shipmentCount,
+      lineStateBasis: rawLines ? 'not_all_processing' : 'incomplete',
+      lines: null,
+    }
+  }
+  const normalizedById = new Map(normalizedOrder.lines.map((line) => (
+    [line.identity.value, line] as const
+  )))
+  if (normalizedById.size !== normalizedOrder.lines.length) {
+    fail(
+      'FAIRE_ORDER_REVISION_PROVIDER_FACTS_INCOMPLETE',
+      'Faire exact order revision line identities are not unique',
+    )
+  }
+  const lines = new Map<string, FaireExactUnstartedLine>()
+  for (const rawValue of rawLines) {
+    const rawLine = record(rawValue)
+    const externalLineId = rawLine?.id ?? rawLine?.order_item_id ?? rawLine?.item_id
+    const state = typeof rawLine?.state === 'string'
+      ? rawLine.state.trim().toUpperCase()
+      : ''
+    if (
+      typeof externalLineId !== 'string'
+      || !normalizedById.has(externalLineId)
+      || lines.has(externalLineId)
+      || state !== 'PROCESSING'
+    ) {
+      return {
+        eligible: false,
+        orderState: rawOrderState,
+        shipmentCount,
+        lineStateBasis: state && state !== 'PROCESSING'
+          ? 'not_all_processing'
+          : 'incomplete',
+        lines: null,
+      }
+    }
+    const quantity = rawLine?.quantity
+    if (!Number.isSafeInteger(quantity) || Number(quantity) < 1) {
+      return {
+        eligible: false,
+        orderState: rawOrderState,
+        shipmentCount,
+        lineStateBasis: 'incomplete',
+        lines: null,
+      }
+    }
+    const normalizedLine = normalizedById.get(externalLineId)
+    if (
+      normalizedLine?.orderedQuantity !== Number(quantity)
+      || normalizedLine.productIdentity.state !== 'available'
+      || normalizedLine.variantIdentity.state !== 'available'
+      || rawLine?.product_id !== normalizedLine.productIdentity.value.value
+      || rawLine?.variant_id !== normalizedLine.variantIdentity.value.value
+      || typeof rawLine?.sku !== 'string'
+      || rawLine.sku !== normalizedLine.sku
+    ) {
+      return {
+        eligible: false,
+        orderState: rawOrderState,
+        shipmentCount,
+        lineStateBasis: 'incomplete',
+        lines: null,
+      }
+    }
+    lines.set(externalLineId, {
+      externalLineId,
+      quantity: Number(quantity),
+    })
+  }
+  return {
+    eligible: true,
+    orderState: rawOrderState,
+    shipmentCount,
+    lineStateBasis: 'all_processing',
+    lines,
+  }
+}
+
 export function faireCanonicalOrderRevisionSnapshot(input: {
   target: FaireCanonicalOrderRevisionTarget
   order: CommerceNormalizedOrder
+  providerOrder: unknown
   observedAt: string
 }): FaireCanonicalOrderRevisionSnapshot {
   const target = normalizeTarget(input.target)
@@ -415,18 +624,30 @@ export function faireCanonicalOrderRevisionSnapshot(input: {
       'Faire exact order revision observation time is invalid',
     )
   }
+  const exactFacts = exactFaireUnstartedRevisionFacts(
+    input.providerOrder,
+    input.order,
+  )
   const lines = input.order.lines.map((line) => ({
     externalLineId: line.identity.value,
     externalProductId: identityValue(line.productIdentity),
     externalVariantId: identityValue(line.variantIdentity),
     sku: line.sku,
+    titleSnapshot: line.titleSnapshot,
+    variantTitleSnapshot: line.variantTitleSnapshot,
     orderedQuantity: line.orderedQuantity,
-    currentQuantity: line.currentQuantity,
-    cancelledQuantity: line.cancelledQuantity,
-    fulfilledQuantity: line.fulfilledQuantity,
-    unfulfilledQuantity: line.unfulfilledQuantity,
-    returnedQuantity: line.returnedQuantity,
-    removedOrRefundedQuantity: line.removedOrRefundedQuantity,
+    currentQuantity: exactFacts.eligible
+      ? exactFacts.lines?.get(line.identity.value)?.quantity ?? null
+      : line.currentQuantity,
+    cancelledQuantity: exactFacts.eligible ? 0 : line.cancelledQuantity,
+    fulfilledQuantity: exactFacts.eligible ? 0 : line.fulfilledQuantity,
+    unfulfilledQuantity: exactFacts.eligible
+      ? exactFacts.lines?.get(line.identity.value)?.quantity ?? null
+      : line.unfulfilledQuantity,
+    returnedQuantity: exactFacts.eligible ? 0 : line.returnedQuantity,
+    removedOrRefundedQuantity: exactFacts.eligible
+      ? 0
+      : line.removedOrRefundedQuantity,
     unitMultiplier: line.unitMultiplier,
     physicalUnitQuantity: line.physicalUnitQuantity,
     requiresShipping: line.requiresShipping,
@@ -437,7 +658,7 @@ export function faireCanonicalOrderRevisionSnapshot(input: {
     left.externalLineId.localeCompare(right.externalLineId)
   ))
   return {
-    version: 'faire-canonical-order-revision-v1',
+    version: 'faire-canonical-order-revision-v2',
     provider: 'faire',
     accountGlobalId: target.accountGlobalId,
     integrationAccountId: target.integrationAccountId,
@@ -457,8 +678,21 @@ export function faireCanonicalOrderRevisionSnapshot(input: {
       providerCancelledAt: input.order.providerCancelledAt,
       providerClosedAt: input.order.providerClosedAt,
       rawStates: input.order.rawStates,
-      canonicalStates: input.order.canonicalStates,
+      canonicalStates: exactFacts.eligible ? {
+          ...input.order.canonicalStates,
+          lifecycle: 'open',
+          fulfillment: 'unfulfilled',
+          returns: 'none',
+        } : input.order.canonicalStates,
       currency: input.order.currency,
+      providerRevisionState: {
+        orderState: exactFacts.orderState,
+        shipmentCount: exactFacts.shipmentCount,
+        lineStateBasis: exactFacts.lineStateBasis,
+        quantityBasis: exactFacts.eligible
+          ? 'exact_order_item_quantity'
+          : 'unavailable',
+      },
       money: {
         subtotalMinor: moneyMinor(input.order.subtotal),
         shippingMinor: moneyMinor(input.order.shipping),
@@ -466,6 +700,7 @@ export function faireCanonicalOrderRevisionSnapshot(input: {
         discountMinor: moneyMinor(input.order.discount),
         totalMinor: moneyMinor(input.order.total),
         headerState: input.order.headerMoney.state,
+        reconciliationMode: moneyReconciliationMode(input.order),
       },
       requestedDeliveryAt: input.order.requestedDeliveryAt.state === 'available'
         ? input.order.requestedDeliveryAt.value
@@ -473,11 +708,13 @@ export function faireCanonicalOrderRevisionSnapshot(input: {
       partyFingerprint: protectedFingerprint({
         field: input.order.party,
         target,
+        sourceHash: input.order.sourceHash,
         kind: 'party',
       }),
       shipToFingerprint: protectedFingerprint({
         field: input.order.shipTo,
         target,
+        sourceHash: input.order.sourceHash,
         kind: 'ship_to',
       }),
       lines,
@@ -585,13 +822,28 @@ export async function inspectFaireCanonicalOrderRevision(
   const snapshot = faireCanonicalOrderRevisionSnapshot({
     target,
     order: envelope.orders[0],
+    providerOrder: orderSource,
     observedAt,
+  })
+  const protectedParty = protectedRevisionSnapshot({
+    field: envelope.orders[0].party,
+    target,
+    sourceHash: snapshot.order.sourceHash,
+    kind: 'party',
+  })
+  const protectedShipTo = protectedRevisionSnapshot({
+    field: envelope.orders[0].shipTo,
+    target,
+    sourceHash: snapshot.order.sourceHash,
+    kind: 'ship_to',
   })
   return {
     sourceRevision: snapshot.order.sourceRevision,
     sourceHash: snapshot.order.sourceHash,
     revisionHash: faireCanonicalOrderRevisionHash(snapshot),
     snapshot,
+    protectedParty,
+    protectedShipTo,
     providerReads: 2,
     providerWrites: 0,
   }

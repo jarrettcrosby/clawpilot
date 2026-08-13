@@ -78,6 +78,12 @@ final class PickingPhoneModel: ObservableObject {
         case cancelled
     }
 
+    private enum WorkspaceTransitionRecoveryOutcome: Equatable {
+        case none
+        case resolved
+        case blocked
+    }
+
     @Published var email = ""
     @Published var code = ""
     @Published var canRequestCode = true
@@ -87,11 +93,14 @@ final class PickingPhoneModel: ObservableObject {
     @Published var isAuthBusy = false
     @Published var isQueueBusy = false
     @Published var isWorkspaceBusy = false
+    @Published private(set) var hasPendingWorkspaceTransition = false
     @Published var workspaceStatus = "Orders, assigned picks, people, and UPH follow this organization."
     @Published var sessionProfile: ClawPilotSessionProfile?
     @Published var managerOrders: [ManagerOrderSummary] = []
     @Published var managerPickers: [ManagerPicker] = []
     @Published var pickerPerformance: [PickerPerformanceMetric] = []
+    @Published var managerPickManagement: ManagerPickManagementWorkspace?
+    @Published var managerSelectedPickAssignment: ManagerCurrentPickAssignment?
     @Published var managerSelectedOrder: ManagerOrderDetail?
     @Published var managerStatus = "Loading Operations orders."
     @Published var isManagerBusy = false
@@ -223,6 +232,7 @@ final class PickingPhoneModel: ObservableObject {
             && !isWorkspaceBusy
             && !isManagerBusy
             && !isQueueBusy
+            && !hasPendingWorkspaceTransition
         guard idle else { return false }
         if hasPendingPickHandoff {
             guard let recoveryWorkspaceId = pendingPickHandoffRecoveryWorkspaceId else {
@@ -244,6 +254,8 @@ final class PickingPhoneModel: ObservableObject {
             && !hasPendingConfirmation
             && !hasPendingPickHandoff
             && !isRequestingPickHandoff
+            && !hasPendingWorkspaceTransition
+            && !isWorkspaceBusy
             && activePickHandoffEligible
     }
 
@@ -313,7 +325,14 @@ final class PickingPhoneModel: ObservableObject {
             status = "Unlock with \(biometrics.title), or use another sign-in method."
         }
         voice.onVoicePackStateChange = { [weak self] state in
-            self?.voicePackState = state
+            guard let self else { return }
+            let phonePlaybackAvailabilityChanged = (self.voicePackState == .ready)
+                != (state == .ready)
+            self.voicePackState = state
+            if phonePlaybackAvailabilityChanged,
+               self.currentTask != nil || self.readyToConfirm {
+                Task { await self.updateProjection() }
+            }
         }
         Task { [weak self] in
             guard let self else { return }
@@ -492,15 +511,21 @@ final class PickingPhoneModel: ObservableObject {
             restoredProfile = try await api.fetchSessionProfile()
             sessionProfile = restoredProfile
             isAuthenticated = true
-            await refreshGoogleAuthState()
-            syncMetaConnection()
         } catch {
             sessionProfile = nil
             isAuthenticated = false
             status = "Sign in to continue."
             return
         }
-        _ = try? await picking.restore()
+        let transitionRecovery = await recoverWorkspaceTransitionIfNeeded(
+            authenticatedProfile: restoredProfile
+        )
+        guard transitionRecovery != .blocked else { return }
+        if transitionRecovery == .none {
+            _ = try? await picking.restore()
+        }
+        await refreshGoogleAuthState()
+        syncMetaConnection()
         let resumedPendingHandoff = await resumeDurablePickHandoffIfNeeded()
         let resumedPendingConfirmation = resumedPendingHandoff
             ? true
@@ -560,13 +585,21 @@ final class PickingPhoneModel: ObservableObject {
             return
         }
         do {
-            sessionProfile = try await api.fetchSessionProfile()
+            let restoredProfile = try await api.fetchSessionProfile()
+            sessionProfile = restoredProfile
             isRestoringSession = true
             defer { isRestoringSession = false }
             isAuthenticated = true
             biometrics.rememberAuthenticatedSession()
             codeRequested = false
             code = ""
+            let transitionRecovery = await recoverWorkspaceTransitionIfNeeded(
+                authenticatedProfile: restoredProfile
+            )
+            guard transitionRecovery != .blocked else { return }
+            if transitionRecovery == .none {
+                _ = try? await picking.restore()
+            }
             await refreshGoogleAuthState()
             let resumedPendingHandoff = await resumeDurablePickHandoffIfNeeded()
             let resumedPendingConfirmation = resumedPendingHandoff
@@ -639,13 +672,21 @@ final class PickingPhoneModel: ObservableObject {
                     )
                 }
             }
-            sessionProfile = try await api.fetchSessionProfile()
+            let restoredProfile = try await api.fetchSessionProfile()
+            sessionProfile = restoredProfile
             isRestoringSession = true
             defer { isRestoringSession = false }
-            email = sessionProfile?.effectiveUser.email ?? result.user.profile?.email ?? ""
+            email = restoredProfile.effectiveUser.email
             isAuthenticated = true
             isLocallyLocked = false
             biometrics.rememberAuthenticatedSession()
+            let transitionRecovery = await recoverWorkspaceTransitionIfNeeded(
+                authenticatedProfile: restoredProfile
+            )
+            guard transitionRecovery != .blocked else { return }
+            if transitionRecovery == .none {
+                _ = try? await picking.restore()
+            }
             await refreshGoogleAuthState()
             let resumedPendingHandoff = await resumeDurablePickHandoffIfNeeded()
             let resumedPendingConfirmation = resumedPendingHandoff
@@ -813,6 +854,21 @@ final class PickingPhoneModel: ObservableObject {
             workspaceStatus = "That organization is not available to this account."
             return
         }
+        guard let profile = sessionProfile else { return }
+        let transition: WorkspaceTransition
+        do {
+            transition = try WorkspaceTransition(
+                sourceOrganizationId: profile.activeWorkspace.organizationId,
+                targetOrganizationId: organizationId,
+                workerEmail: profile.effectiveUser.email,
+                pickerCachePolicy: isPendingRecoverySwitch
+                    ? .preserveProtectedCommand
+                    : .clearScopedData
+            )
+        } catch {
+            workspaceStatus = "Organization change could not be prepared safely."
+            return
+        }
         let operationGeneration = authenticationGeneration
 
         isWorkspaceBusy = true
@@ -822,6 +878,13 @@ final class PickingPhoneModel: ObservableObject {
         defer { finishWorkspaceSwitch() }
 
         do {
+            // Persist intent before transport and hide all picker presentation.
+            // A relaunch can then reconcile source versus target without ever
+            // exposing a queue under the wrong authenticated workspace.
+            try await cache.saveWorkspaceTransition(transition)
+            hasPendingWorkspaceTransition = true
+            clearPublishedPickProjection()
+            guard authenticationIsCurrent(operationGeneration) else { return }
             if isMetaScanning {
                 await cancelMetaScan()
                 guard authenticationIsCurrent(operationGeneration) else { return }
@@ -832,20 +895,26 @@ final class PickingPhoneModel: ObservableObject {
             managerOrders = []
             managerPickers = []
             pickerPerformance = []
+            managerPickManagement = nil
+            managerSelectedPickAssignment = nil
             managerSelectedOrder = nil
-            currentTask = nil
-            readyToConfirm = false
-            if !isPendingRecoverySwitch {
-                try await picking.clearQueue()
-                guard authenticationIsCurrent(operationGeneration) else { return }
-                await updateProjection()
-                guard authenticationIsCurrent(operationGeneration) else { return }
-            }
 
             let refreshedProfile = try await api.fetchSessionProfile()
             guard authenticationIsCurrent(operationGeneration) else { return }
+            guard refreshedProfile.effectiveUser.email.lowercased()
+                    == transition.workerEmail,
+                  refreshedProfile.activeWorkspace.organizationId
+                    == transition.targetOrganizationId else {
+                throw PickingContractError.contextMismatch
+            }
             sessionProfile = refreshedProfile
             isAuthenticated = true
+            guard await recoverWorkspaceTransitionIfNeeded(
+                authenticatedProfile: refreshedProfile
+            ) == .resolved else {
+                throw PickingContractError.contextMismatch
+            }
+            guard authenticationIsCurrent(operationGeneration) else { return }
             await refreshGoogleAuthState()
             guard authenticationIsCurrent(operationGeneration) else { return }
             let resumedPendingHandoff = isPendingHandoffRecoverySwitch
@@ -887,30 +956,66 @@ final class PickingPhoneModel: ObservableObject {
             status = "Sign in to continue."
         } catch {
             guard authenticationIsCurrent(operationGeneration) else { return }
-            workspaceStatus = "Organization change failed: " + error.localizedDescription
+            if let authoritativeProfile = try? await api.fetchSessionProfile(),
+               authenticationIsCurrent(operationGeneration) {
+                sessionProfile = authoritativeProfile
+                _ = await recoverWorkspaceTransitionIfNeeded(
+                    authenticatedProfile: authoritativeProfile
+                )
+            }
+            workspaceStatus = hasPendingWorkspaceTransition
+                ? "Organization change needs recovery. Relaunch or sign in again; cached picker evidence remains hidden and protected."
+                : "Organization change failed: " + error.localizedDescription
         }
     }
 
     func loadManagerOperations() async {
-        if walkthroughScreen != nil { return }
+        if walkthroughScreen != nil {
+#if DEBUG
+            installManagerPickManagementWalkthroughFixture()
+#endif
+            return
+        }
         guard canUseManager else {
             managerStatus = "Manager access is not assigned to this account."
             return
         }
         isManagerBusy = true
         defer { isManagerBusy = false }
+        var failures: [String] = []
         do {
-            async let orders = api.fetchManagerOrders()
-            async let pickers = api.fetchManagerPickers()
-            async let performance = api.fetchPickerPerformance()
-            managerOrders = try await orders
-            managerPickers = try await pickers
-            pickerPerformance = try await performance
+            managerOrders = try await api.fetchManagerOrders()
+        } catch {
+            failures.append("orders: \(error.localizedDescription)")
+        }
+        do {
+            managerPickers = try await api.fetchManagerPickers()
+        } catch {
+            failures.append("picker access: \(error.localizedDescription)")
+        }
+        do {
+            pickerPerformance = try await api.fetchPickerPerformance()
+        } catch {
+            failures.append("performance: \(error.localizedDescription)")
+        }
+        do {
+            managerPickManagement = try await api.fetchManagerPickManagement()
+            if let eligible = managerPickManagement?.eligiblePickers,
+               eligible.isEmpty == false {
+                managerPickers = eligible
+            }
+        } catch {
+            managerPickManagement = nil
+            failures.append("current assignments/history: \(error.localizedDescription)")
+        }
+        if failures.isEmpty == false {
+            managerStatus = "Some manager data is unavailable (\(failures.joined(separator: "; "))). Available orders remain usable."
+        } else if managerPickManagement?.current.isEmpty == false {
+            managerStatus = "Review current picker progress or open a planned order."
+        } else {
             managerStatus = managerOrders.isEmpty
                 ? "No Operations orders are available."
                 : "Review an order to wave and assign its picks."
-        } catch {
-            managerStatus = "Manager orders could not be loaded: \(error.localizedDescription)"
         }
     }
 
@@ -977,6 +1082,223 @@ final class PickingPhoneModel: ObservableObject {
         }
     }
 
+    func managePickerAssignment(
+        _ assignment: ManagerCurrentPickAssignment,
+        assignedTo: String?,
+        reason: String,
+        idempotencyKey: String
+    ) async -> Bool {
+        if walkthroughScreen != nil {
+#if DEBUG
+            managerStatus = assignedTo == nil
+                ? "Walkthrough: unassign would create a high-priority manager exception."
+                : "Walkthrough: exact ready picks would be assigned to \(assignedTo!)."
+            managerSelectedPickAssignment = nil
+            return true
+#endif
+        }
+        isManagerBusy = true
+        defer { isManagerBusy = false }
+        do {
+            let command = try ManagerPickAssignmentCommand(
+                assignment: assignment,
+                assignedTo: assignedTo,
+                reason: reason,
+                idempotencyKey: idempotencyKey
+            )
+            let result = try await api.managePickerAssignment(command)
+            managerStatus = result.assignedTo.map {
+                "Exact ready picks assigned to \($0). Existing exceptions remain open for review."
+            } ?? "Exact ready picks unassigned. Manager exception \(result.interventionExceptionGlobalId ?? "retained") keeps the order visible."
+            managerSelectedPickAssignment = nil
+            await loadManagerOperations()
+            return true
+        } catch {
+            managerStatus = "Picker intervention failed: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+#if DEBUG
+    private func installManagerPickManagementWalkthroughFixture() {
+        let fingerprint = String(repeating: "a", count: 64)
+        let assigned = ManagerCurrentPickAssignment(
+            orderGlobalId: "gor0000001",
+            orderNumber: "1001",
+            rowVersion: 4,
+            orderStatus: "released",
+            planGlobalId: "gfp0000001",
+            waveGlobalId: "gwv0000001",
+            warehouseName: "Main warehouse",
+            assignmentState: "assigned",
+            assignedTo: "picker@example.com",
+            assignedDisplayName: "Pat Picker",
+            assignedPickers: [ManagerPickAssignmentPerson(
+                email: "picker@example.com",
+                displayName: "Pat Picker",
+                taskCount: 3
+            )],
+            unassignedTaskCount: 0,
+            assignmentFingerprint: fingerprint,
+            taskCount: 3,
+            readyTaskCount: 3,
+            pickedTaskCount: 0,
+            requiredUnits: 8,
+            pickedUnits: 0,
+            scanEvidenceTaskCount: 0,
+            countEvidenceTaskCount: 0,
+            assignedAt: "2026-08-12T14:15:00Z",
+            latestActivityAt: "2026-08-12T14:18:00Z",
+            handoffExceptionGlobalId: nil,
+            interventionExceptionGlobalId: nil,
+            managementBlockedReason: nil
+        )
+        let unassigned = ManagerCurrentPickAssignment(
+            orderGlobalId: "gor0000002",
+            orderNumber: "1002",
+            rowVersion: 6,
+            orderStatus: "released",
+            planGlobalId: "gfp0000002",
+            waveGlobalId: "gwv0000002",
+            warehouseName: "Main warehouse",
+            assignmentState: "unassigned",
+            assignedTo: nil,
+            assignedDisplayName: nil,
+            assignedPickers: [],
+            unassignedTaskCount: 2,
+            assignmentFingerprint: String(repeating: "b", count: 64),
+            taskCount: 2,
+            readyTaskCount: 2,
+            pickedTaskCount: 0,
+            requiredUnits: 2,
+            pickedUnits: 0,
+            scanEvidenceTaskCount: 0,
+            countEvidenceTaskCount: 0,
+            assignedAt: nil,
+            latestActivityAt: "2026-08-12T14:20:00Z",
+            handoffExceptionGlobalId: "gex0000002",
+            interventionExceptionGlobalId: "gex0000003",
+            managementBlockedReason: nil
+        )
+        let history = ManagerCompletedPickHistory(
+            orderGlobalId: "gor0000003",
+            orderNumber: "0998",
+            orderStatus: "picking",
+            planGlobalId: "gfp0000003",
+            waveGlobalId: "gwv0000003",
+            pickerEmail: "picker@example.com",
+            pickerDisplayName: "Pat Picker",
+            taskCount: 4,
+            unitCount: 12,
+            assignedAt: "2026-08-12T12:00:00Z",
+            completedAt: "2026-08-12T12:36:00Z"
+        )
+        let picker = ManagerPicker(email: "picker@example.com", displayName: "Pat Picker")
+        managerPickManagement = ManagerPickManagementWorkspace(
+            generatedAt: "2026-08-12T14:30:00Z",
+            current: [assigned, unassigned],
+            history: [history],
+            eligiblePickers: [
+                picker,
+                ManagerPicker(email: "second@example.com", displayName: "Sam Second")
+            ]
+        )
+        managerPickers = managerPickManagement?.eligiblePickers ?? []
+        managerOrders = [
+            ManagerOrderSummary(
+                id: "order-fixture",
+                globalId: "gor0000004",
+                orderNumber: "1004",
+                customerName: "Walkthrough customer",
+                status: "planned",
+                warehouseName: "Main warehouse",
+                lineCount: 2
+            )
+        ]
+        managerStatus = "Walkthrough data · no server write will be sent."
+        if walkthroughScreen == "pick-intervention" {
+            managerSelectedPickAssignment = assigned
+        }
+    }
+#endif
+
+    private func recoverWorkspaceTransitionIfNeeded(
+        authenticatedProfile profile: ClawPilotSessionProfile
+    ) async -> WorkspaceTransitionRecoveryOutcome {
+        let transition: WorkspaceTransition
+        do {
+            guard let loaded = try await cache.loadWorkspaceTransition() else {
+                hasPendingWorkspaceTransition = false
+                return .none
+            }
+            transition = loaded
+        } catch {
+            hasPendingWorkspaceTransition = true
+            clearPublishedPickProjection()
+            workspaceStatus = "Saved organization-change state could not be read safely."
+            status = "Picker data remains hidden until organization recovery is verified."
+            return .blocked
+        }
+
+        hasPendingWorkspaceTransition = true
+        let resolution = transition.resolution(
+            activeOrganizationId: profile.activeWorkspace.organizationId,
+            effectiveWorkerEmail: profile.effectiveUser.email
+        )
+        guard resolution != .blockedIdentity else {
+            clearPublishedPickProjection()
+            workspaceStatus = "The saved organization change does not match this signed-in workspace and user."
+            status = "Picker data remains hidden. Sign in with the original account to recover it."
+            return .blocked
+        }
+
+        do {
+            switch resolution {
+            case .sourceWorkspace:
+                _ = try await picking.restore()
+            case .targetWorkspaceClearScopedData:
+                // A normal switch was admitted only with no protected command.
+                // Recheck before destructive cleanup in case another callback
+                // raced the journal write; never strand an outbox without queue
+                // ownership context.
+                guard try await cache.loadOutbox() == nil,
+                      try await cache.loadHandoffOutbox() == nil else {
+                    throw PickingContractError.contextMismatch
+                }
+                try await picking.clearQueue()
+            case .targetWorkspacePreserveProtectedCommand:
+                _ = try await picking.restore()
+            case .blockedIdentity:
+                throw PickingContractError.contextMismatch
+            }
+
+            if transition.pickerCachePolicy == .preserveProtectedCommand {
+                guard await picking.queueIdentityMatches(
+                    organizationId: transition.targetOrganizationId,
+                    workerEmail: transition.workerEmail
+                ) else {
+                    throw PickingContractError.contextMismatch
+                }
+            }
+
+            // Keep both phone and Watch nil while the transition is durable.
+            // Retire the exact journal only after scoped cache recovery. A
+            // crash before this point replays recovery; a crash after it leaves
+            // a safe nil projection that startup can republish after profile
+            // authorization.
+            try await cache.clearWorkspaceTransition(transition)
+            hasPendingWorkspaceTransition = false
+            await updateProjection()
+            return .resolved
+        } catch {
+            hasPendingWorkspaceTransition = true
+            clearPublishedPickProjection()
+            workspaceStatus = "Organization recovery could not safely finish."
+            status = "Picker data and saved commands remain protected for retry."
+            return .blocked
+        }
+    }
+
     func logout() async {
         // Logout wins presentation immediately, but an already-committed
         // workspace switch may have rotated the server session token. Wait for
@@ -1018,6 +1340,8 @@ final class PickingPhoneModel: ObservableObject {
         managerOrders = []
         managerPickers = []
         pickerPerformance = []
+        managerPickManagement = nil
+        managerSelectedPickAssignment = nil
         managerSelectedOrder = nil
         googleAuthState = nil
         isGoogleLinkBusy = false
@@ -1056,8 +1380,10 @@ final class PickingPhoneModel: ObservableObject {
     func loadQueue(readAloud: Bool = true) async {
         guard !hasPendingConfirmation,
               !hasPendingPickHandoff,
-              !isRequestingPickHandoff else {
-            status = "Resolve the saved confirmation or handoff before loading new work."
+              !isRequestingPickHandoff,
+              !hasPendingWorkspaceTransition,
+              !isRestoringSession else {
+            status = "Resolve the saved confirmation, handoff, or organization change before loading new work."
             return
         }
         isQueueBusy = true
@@ -1069,8 +1395,10 @@ final class PickingPhoneModel: ObservableObject {
             // replace protected workflow state while the exact POST is active.
             guard !hasPendingConfirmation,
                   !hasPendingPickHandoff,
-                  !isRequestingPickHandoff else {
-                status = "Resolve the saved confirmation or handoff before loading new work."
+                  !isRequestingPickHandoff,
+                  !hasPendingWorkspaceTransition,
+                  !isRestoringSession else {
+                status = "Resolve the saved confirmation, handoff, or organization change before loading new work."
                 return
             }
             isAuthenticated = true
@@ -1102,7 +1430,10 @@ final class PickingPhoneModel: ObservableObject {
     ) async -> PickScanAcceptance? {
         guard !hasPendingConfirmation,
               !hasPendingPickHandoff,
-              !isRequestingPickHandoff else { return nil }
+              !isRequestingPickHandoff,
+              !hasPendingWorkspaceTransition,
+              !isWorkspaceBusy,
+              !isRestoringSession else { return nil }
         guard shouldApplyMetaScanResult(metaScanID) else { return nil }
         do {
             let acceptance = try await picking.accept(BarcodeObservation(value: value, source: source))
@@ -1812,20 +2143,35 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func readInstruction(forceSystemVoice: Bool = false) {
+        guard let instruction = currentInstructionCopy() else { return }
+        voice.speak(
+            instruction.english,
+            spanish: instruction.spanish,
+            forceSystemVoice: forceSystemVoice
+        )
+        refreshAudioRouteStatus()
+    }
+
+    private func currentInstructionCopy() -> (english: String, spanish: String)? {
         if let currentTask {
-            voice.speak(PickVoice.instruction(
-                for: currentTask,
-                locationScanRequired: currentScanStage == .location,
-                languageCode: instructionLanguage.languageCode
-            ), forceSystemVoice: forceSystemVoice)
-        } else if readyToConfirm {
-            voice.speak(
-                "All products scanned. Say confirm pick to submit the order.",
-                spanish: "Todos los productos están escaneados. Di confirmar pedido para enviarlo.",
-                forceSystemVoice: forceSystemVoice
+            return (
+                PickVoice.instruction(
+                    for: currentTask,
+                    locationScanRequired: currentScanStage == .location,
+                    languageCode: "en"
+                ),
+                PickVoice.instruction(
+                    for: currentTask,
+                    locationScanRequired: currentScanStage == .location,
+                    languageCode: "es"
+                )
             )
         }
-        refreshAudioRouteStatus()
+        guard readyToConfirm else { return nil }
+        return (
+            "All products scanned. Say confirm pick to submit the order.",
+            "Todos los productos están escaneados. Di confirmar pedido para enviarlo."
+        )
     }
 
     func listenForPickCommand() async {
@@ -1870,15 +2216,32 @@ final class PickingPhoneModel: ObservableObject {
             }
             return .failure(metaStatus)
         case .readInstruction:
-            // The Watch requests iPhone playback only while one Meta glasses
-            // session is connected. iOS owns the final Bluetooth route and the
-            // audio background mode keeps playback eligible under screen lock.
             status = "Apple Watch requested the current pick instruction."
-            guard currentTask != nil || readyToConfirm else {
+            guard let instruction = currentInstructionCopy() else {
                 return .failure("No current pick instruction is available.")
             }
-            readInstruction()
-            return .success("Instruction requested on the connected Meta glasses audio route.")
+            // The Watch snapshot may outlive a Bluetooth disconnect while the
+            // phone is locked. Refresh Meta's current session authority before
+            // attempting phone playback instead of trusting cached projection.
+            await refreshMetaStatus()
+            guard metaConnectedDeviceCount == 1 else {
+                return .failure("Meta glasses are no longer connected.")
+            }
+            do {
+                let playback = try await voice.speakEnhancedThroughBluetoothAndWait(
+                    instruction.english,
+                    spanish: instruction.spanish
+                )
+                refreshAudioRouteStatus()
+                status = playback.startedWhilePhoneBackgrounded
+                    ? "Enhanced instruction played while iPhone was backgrounded through iOS audio output: \(playback.outputName)."
+                    : "Enhanced instruction played through iOS audio output: \(playback.outputName)."
+                return .success(status)
+            } catch {
+                refreshAudioRouteStatus()
+                status = "Enhanced iPhone audio was unavailable: \(error.localizedDescription)"
+                return .failure(status)
+            }
         case .confirmPick:
             guard readyToConfirm else {
                 status = "Scan every assigned product before confirming from Apple Watch."
@@ -2053,7 +2416,12 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func confirmOrder() async {
-        guard readyToConfirm, !hasPendingConfirmation, !isConfirmingOrder else { return }
+        guard readyToConfirm,
+              !hasPendingConfirmation,
+              !isConfirmingOrder,
+              !hasPendingWorkspaceTransition,
+              !isWorkspaceBusy,
+              !isRestoringSession else { return }
         isConfirmingOrder = true
         hasPendingConfirmation = true
         defer { isConfirmingOrder = false }
@@ -2184,7 +2552,9 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func retryPendingPickHandoff() async {
-        guard hasPendingPickHandoff, !isRequestingPickHandoff else { return }
+        guard hasPendingPickHandoff,
+              !isRequestingPickHandoff,
+              !hasPendingWorkspaceTransition else { return }
         isRequestingPickHandoff = true
         defer { isRequestingPickHandoff = false }
         do {
@@ -2479,7 +2849,7 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     func retryPendingConfirmation() async {
-        guard !isConfirmingOrder else { return }
+        guard !isConfirmingOrder, !hasPendingWorkspaceTransition else { return }
         isConfirmingOrder = true
         defer { isConfirmingOrder = false }
         guard !pendingConfirmationRequiresManagerAction else {
@@ -2627,7 +2997,8 @@ final class PickingPhoneModel: ObservableObject {
     }
 
     private func updateProjection() async {
-        guard let profile = sessionProfile,
+        guard !hasPendingWorkspaceTransition,
+              let profile = sessionProfile,
               await picking.queueIdentityMatches(
                   organizationId: profile.activeWorkspace.organizationId,
                   workerEmail: profile.effectiveUser.email
@@ -2645,17 +3016,20 @@ final class PickingPhoneModel: ObservableObject {
             authorizedOrganizationId: profile.activeWorkspace.organizationId,
             authorizedWorkerEmail: profile.effectiveUser.email,
             instructionLanguageCode: instructionLanguage.languageCode,
-            // A Watch tap stays on the Watch when the phone is locked or in a
-            // pocket. One connected Meta session opts into iPhone playback so
-            // AVAudioSession can select the glasses Bluetooth route and reuse
-            // the installed enhanced voice pack. If the phone is unreachable,
-            // the Watch policy still falls back to local Apple speech.
-            readInstructionOnPhone: metaConnectedDeviceCount == 1
+            // Phone playback is advertised only when the enhanced pack is
+            // actually ready and one current Meta session exists. The iPhone
+            // revalidates both the session and Bluetooth output on every Watch
+            // command; otherwise the Watch speaks locally.
+            readInstructionOnPhone: WatchInstructionPhonePlaybackPolicy.isEligible(
+                metaConnectedDeviceCount: metaConnectedDeviceCount,
+                enhancedVoiceReady: voicePackState == .ready
+            )
         )
         // Recheck after the actor awaits so a concurrent workspace transition
         // cannot publish fields gathered from a queue that is no longer owned
         // by the freshly authenticated profile.
-        guard profile == sessionProfile,
+        guard !hasPendingWorkspaceTransition,
+              profile == sessionProfile,
               await picking.queueIdentityMatches(
                   organizationId: profile.activeWorkspace.organizationId,
                   workerEmail: profile.effectiveUser.email

@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
 import * as globalIds from '../app_src/lib/globalIds.mjs'
+import * as commerceOrderRevisionEvidenceKeyConfig from '../app_src/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs'
 
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
@@ -1357,6 +1358,8 @@ const cryptoModule = loadTypeScriptModule(
   {
     mocks: {
       '@/lib/globalIds.mjs': globalIds,
+      '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs':
+        commerceOrderRevisionEvidenceKeyConfig,
       '@/lib/persistence/config': { isHostedRuntime: () => false },
     },
   },

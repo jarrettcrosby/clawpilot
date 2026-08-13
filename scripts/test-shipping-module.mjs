@@ -101,7 +101,7 @@ assertIncludes(shippingSection, [
   'pickupAvailability',
   'blocker',
   'LTL preparation only',
-  'rating and tender are still gated',
+  'Rating, tender, and pickup are not connected yet.',
   'Pickup scheduling is not yet available',
 ], 'Pickup readiness gating')
 assert.doesNotMatch(

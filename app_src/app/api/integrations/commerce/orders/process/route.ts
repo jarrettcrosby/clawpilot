@@ -18,6 +18,9 @@ import {
   readCommerceOrderReconciliationHealthFromPostgres,
   recordCommerceOrderReconciliationWorkerHeartbeatInPostgres,
 } from '@/lib/persistence/commerceOrderReconciliation'
+import {
+  purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres,
+} from '@/lib/persistence/commerceOrderRevisions'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
@@ -137,10 +140,14 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
   }
   if (!commerceReadRuntimeAvailable()) {
+    const protectedSnapshotPurge = isPostgresStorageEnabled()
+      ? await purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres()
+      : null
     return NextResponse.json({
       ok: true,
       skipped: true,
       reason: 'commerce-read-reconciliation-disabled',
+      protectedSnapshotPurge,
       automaticShopifyOrderPromotion:
         shopifyAutomaticOrderPromotionHealthSnapshot(),
       automaticFaireOrderPromotion:

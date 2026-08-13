@@ -1,6 +1,157 @@
 import Foundation
 import ClawPilotPickingCore
 
+public struct WorkspaceTransition: Codable, Equatable, Sendable {
+    public enum PickerCachePolicy: String, Codable, Equatable, Sendable {
+        case clearScopedData = "clear_scoped_data"
+        case preserveProtectedCommand = "preserve_protected_command"
+    }
+
+    public enum Resolution: Equatable, Sendable {
+        case sourceWorkspace
+        case targetWorkspaceClearScopedData
+        case targetWorkspacePreserveProtectedCommand
+        case blockedIdentity
+    }
+
+    public let schemaVersion: Int
+    public let sourceOrganizationId: String
+    public let targetOrganizationId: String
+    public let workerEmail: String
+    public let pickerCachePolicy: PickerCachePolicy
+    public let startedAt: Date
+    public let startedAtEpochMilliseconds: Int64
+
+    public init(
+        sourceOrganizationId: String,
+        targetOrganizationId: String,
+        workerEmail: String,
+        pickerCachePolicy: PickerCachePolicy,
+        startedAt: Date = Date()
+    ) throws {
+        let source = sourceOrganizationId.lowercased()
+        let target = targetOrganizationId.lowercased()
+        let worker = workerEmail.lowercased()
+        guard UUID(uuidString: source) != nil,
+              UUID(uuidString: target) != nil,
+              source != target,
+              worker.contains("@"),
+              worker.utf8.count <= 254,
+              startedAt.timeIntervalSince1970.isFinite else {
+            throw PickingContractError.contextMismatch
+        }
+        let startedAtMilliseconds = floor(
+            startedAt.timeIntervalSince1970 * 1_000
+        )
+        guard startedAtMilliseconds >= 0,
+              startedAtMilliseconds <= 253_402_300_799_999 else {
+            throw PickingContractError.contextMismatch
+        }
+        schemaVersion = 1
+        self.sourceOrganizationId = source
+        self.targetOrganizationId = target
+        self.workerEmail = worker
+        self.pickerCachePolicy = pickerCachePolicy
+        // The durable encoder writes ISO-8601 milliseconds. Normalize before
+        // first persistence so an in-memory journal remains exactly equal to
+        // its decoded form for conflict detection and exact retirement.
+        let startedAtEpochMilliseconds = Int64(startedAtMilliseconds)
+        self.startedAtEpochMilliseconds = startedAtEpochMilliseconds
+        self.startedAt = Date(
+            timeIntervalSince1970: Double(startedAtEpochMilliseconds) / 1_000
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, sourceOrganizationId, targetOrganizationId
+        case workerEmail, pickerCachePolicy, startedAt, startedAtEpochMilliseconds
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let schemaVersion = try values.decode(Int.self, forKey: .schemaVersion)
+        let source = try values.decode(String.self, forKey: .sourceOrganizationId)
+        let target = try values.decode(String.self, forKey: .targetOrganizationId)
+        let worker = try values.decode(String.self, forKey: .workerEmail)
+        let policy = try values.decode(PickerCachePolicy.self, forKey: .pickerCachePolicy)
+        let legacyStartedAt = try values.decode(Date.self, forKey: .startedAt)
+        let exactStartedAt = try values.decodeIfPresent(
+            Int64.self,
+            forKey: .startedAtEpochMilliseconds
+        )
+        guard schemaVersion == 1 else {
+            throw PickingContractError.contextMismatch
+        }
+        if let exactStartedAt {
+            guard exactStartedAt >= 0,
+                  exactStartedAt <= 253_402_300_799_999,
+                  abs(
+                      legacyStartedAt.timeIntervalSince1970 * 1_000
+                          - Double(exactStartedAt)
+                  ) <= 1.1 else {
+                throw PickingContractError.contextMismatch
+            }
+        }
+        try self.init(
+            sourceOrganizationId: source,
+            targetOrganizationId: target,
+            workerEmail: worker,
+            pickerCachePolicy: policy,
+            startedAt: exactStartedAt.map {
+                Date(timeIntervalSince1970: Double($0) / 1_000)
+            } ?? legacyStartedAt
+        )
+        if let exactStartedAt,
+           startedAtEpochMilliseconds != exactStartedAt {
+            throw PickingContractError.contextMismatch
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(schemaVersion, forKey: .schemaVersion)
+        try values.encode(sourceOrganizationId, forKey: .sourceOrganizationId)
+        try values.encode(targetOrganizationId, forKey: .targetOrganizationId)
+        try values.encode(workerEmail, forKey: .workerEmail)
+        try values.encode(pickerCachePolicy, forKey: .pickerCachePolicy)
+        // Keep the date field for compatibility with installed builds while
+        // making the integer epoch authoritative for exact journal identity.
+        try values.encode(startedAt, forKey: .startedAt)
+        try values.encode(
+            startedAtEpochMilliseconds,
+            forKey: .startedAtEpochMilliseconds
+        )
+    }
+
+    public func resolution(
+        activeOrganizationId: String,
+        effectiveWorkerEmail: String
+    ) -> Resolution {
+        guard effectiveWorkerEmail.lowercased() == workerEmail else {
+            return .blockedIdentity
+        }
+        switch activeOrganizationId.lowercased() {
+        case sourceOrganizationId:
+            return .sourceWorkspace
+        case targetOrganizationId:
+            return pickerCachePolicy == .clearScopedData
+                ? .targetWorkspaceClearScopedData
+                : .targetWorkspacePreserveProtectedCommand
+        default:
+            return .blockedIdentity
+        }
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.schemaVersion == rhs.schemaVersion
+            && lhs.sourceOrganizationId == rhs.sourceOrganizationId
+            && lhs.targetOrganizationId == rhs.targetOrganizationId
+            && lhs.workerEmail == rhs.workerEmail
+            && lhs.pickerCachePolicy == rhs.pickerCachePolicy
+            && lhs.startedAtEpochMilliseconds == rhs.startedAtEpochMilliseconds
+    }
+}
+
 public actor DurablePickCache: PickCache {
     private let directory: URL
     private let encoder = JSONEncoder()
@@ -80,6 +231,63 @@ public actor DurablePickCache: PickCache {
         if FileManager.default.fileExists(atPath: url.path) {
             try FileManager.default.removeItem(at: url)
         }
+    }
+
+    public func saveWorkspaceTransition(_ transition: WorkspaceTransition) async throws {
+        if let existing = try await loadWorkspaceTransition() {
+            guard existing == transition else {
+                throw PickingContractError.contextMismatch
+            }
+            return
+        }
+        let confirmation = try await loadOutbox()
+        let handoff = try await loadHandoffOutbox()
+        switch transition.pickerCachePolicy {
+        case .clearScopedData:
+            guard confirmation == nil, handoff == nil else {
+                throw PickingContractError.contextMismatch
+            }
+        case .preserveProtectedCommand:
+            guard confirmation != nil || handoff != nil,
+                  let queue = try await loadQueue(),
+                  queue.organizationId == transition.targetOrganizationId,
+                  queue.workerEmail == transition.workerEmail,
+                  confirmation.map({ command in
+                      queue.orders.contains(where: {
+                          $0.orderGlobalId == command.orderGlobalId
+                              && $0.rowVersion == command.expectedRowVersion
+                      })
+                  }) != false,
+                  handoff.map({ command in
+                      command.organizationId == transition.targetOrganizationId
+                          && command.workerEmail == transition.workerEmail
+                          && queue.orders.contains(where: { order in
+                              order.orderGlobalId == command.orderGlobalId
+                                  && order.rowVersion == command.expectedRowVersion
+                                  && order.tasks.count == command.expectedAssignedTaskCount
+                          })
+                          && command.blockedConfirmationIdempotencyKey
+                              == confirmation?.idempotencyKey
+                  }) != false else {
+                throw PickingContractError.contextMismatch
+            }
+        }
+        try write(transition, name: "workspace-transition.json")
+    }
+
+    public func loadWorkspaceTransition() async throws -> WorkspaceTransition? {
+        try read(WorkspaceTransition.self, name: "workspace-transition.json")
+    }
+
+    public func clearWorkspaceTransition(_ transition: WorkspaceTransition) async throws {
+        guard try await loadWorkspaceTransition() == transition else {
+            throw PickingContractError.contextMismatch
+        }
+        let url = directory.appendingPathComponent("workspace-transition.json")
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw PickingContractError.contextMismatch
+        }
+        try FileManager.default.removeItem(at: url)
     }
 
     private func read<T: Decodable>(_ type: T.Type, name: String) throws -> T? {
@@ -412,6 +620,303 @@ public struct PickerPerformanceMetric: Decodable, Equatable, Identifiable, Senda
     }
 }
 
+public struct ManagerPickAssignmentPerson: Decodable, Equatable, Identifiable, Sendable {
+    public var id: String { email }
+    public let email: String
+    public let displayName: String?
+    public let taskCount: Int
+
+    public init(email: String, displayName: String?, taskCount: Int) {
+        self.email = email
+        self.displayName = displayName
+        self.taskCount = taskCount
+    }
+}
+
+public struct ManagerCurrentPickAssignment: Decodable, Equatable, Identifiable, Sendable {
+    public var id: String { orderGlobalId }
+    public let orderGlobalId: String
+    public let orderNumber: String
+    public let rowVersion: Int
+    public let orderStatus: String
+    public let planGlobalId: String
+    public let waveGlobalId: String
+    public let warehouseName: String
+    public let assignmentState: String
+    public let assignedTo: String?
+    public let assignedDisplayName: String?
+    public let assignedPickers: [ManagerPickAssignmentPerson]
+    public let unassignedTaskCount: Int
+    public let assignmentFingerprint: String
+    public let taskCount: Int
+    public let readyTaskCount: Int
+    public let pickedTaskCount: Int
+    public let requiredUnits: Double
+    public let pickedUnits: Double
+    public let scanEvidenceTaskCount: Int
+    public let countEvidenceTaskCount: Int
+    public let assignedAt: String?
+    public let latestActivityAt: String
+    public let handoffExceptionGlobalId: String?
+    public let interventionExceptionGlobalId: String?
+    public let managementBlockedReason: String?
+
+    public var pickerLabel: String {
+        if assignmentState == "mixed" { return "Mixed assignment" }
+        return assignedDisplayName ?? assignedTo ?? "Unassigned"
+    }
+
+    public var canManageAssignment: Bool {
+        managementBlockedReason == nil
+            && taskCount > 0
+            && assignmentFingerprint.range(
+                of: #"^[a-f0-9]{64}$"#,
+                options: .regularExpression
+            ) != nil
+    }
+
+    public init(
+        orderGlobalId: String,
+        orderNumber: String,
+        rowVersion: Int,
+        orderStatus: String,
+        planGlobalId: String,
+        waveGlobalId: String,
+        warehouseName: String,
+        assignmentState: String,
+        assignedTo: String?,
+        assignedDisplayName: String?,
+        assignedPickers: [ManagerPickAssignmentPerson],
+        unassignedTaskCount: Int,
+        assignmentFingerprint: String,
+        taskCount: Int,
+        readyTaskCount: Int,
+        pickedTaskCount: Int,
+        requiredUnits: Double,
+        pickedUnits: Double,
+        scanEvidenceTaskCount: Int,
+        countEvidenceTaskCount: Int,
+        assignedAt: String?,
+        latestActivityAt: String,
+        handoffExceptionGlobalId: String?,
+        interventionExceptionGlobalId: String?,
+        managementBlockedReason: String?
+    ) {
+        self.orderGlobalId = orderGlobalId
+        self.orderNumber = orderNumber
+        self.rowVersion = rowVersion
+        self.orderStatus = orderStatus
+        self.planGlobalId = planGlobalId
+        self.waveGlobalId = waveGlobalId
+        self.warehouseName = warehouseName
+        self.assignmentState = assignmentState
+        self.assignedTo = assignedTo
+        self.assignedDisplayName = assignedDisplayName
+        self.assignedPickers = assignedPickers
+        self.unassignedTaskCount = unassignedTaskCount
+        self.assignmentFingerprint = assignmentFingerprint
+        self.taskCount = taskCount
+        self.readyTaskCount = readyTaskCount
+        self.pickedTaskCount = pickedTaskCount
+        self.requiredUnits = requiredUnits
+        self.pickedUnits = pickedUnits
+        self.scanEvidenceTaskCount = scanEvidenceTaskCount
+        self.countEvidenceTaskCount = countEvidenceTaskCount
+        self.assignedAt = assignedAt
+        self.latestActivityAt = latestActivityAt
+        self.handoffExceptionGlobalId = handoffExceptionGlobalId
+        self.interventionExceptionGlobalId = interventionExceptionGlobalId
+        self.managementBlockedReason = managementBlockedReason
+    }
+}
+
+public struct ManagerCompletedPickHistory: Decodable, Equatable, Identifiable, Sendable {
+    public var id: String { "\(planGlobalId):\(waveGlobalId):\(pickerEmail)" }
+    public let orderGlobalId: String
+    public let orderNumber: String
+    public let orderStatus: String
+    public let planGlobalId: String
+    public let waveGlobalId: String
+    public let pickerEmail: String
+    public let pickerDisplayName: String?
+    public let taskCount: Int
+    public let unitCount: Double
+    public let assignedAt: String
+    public let completedAt: String
+
+    public init(
+        orderGlobalId: String,
+        orderNumber: String,
+        orderStatus: String,
+        planGlobalId: String,
+        waveGlobalId: String,
+        pickerEmail: String,
+        pickerDisplayName: String?,
+        taskCount: Int,
+        unitCount: Double,
+        assignedAt: String,
+        completedAt: String
+    ) {
+        self.orderGlobalId = orderGlobalId
+        self.orderNumber = orderNumber
+        self.orderStatus = orderStatus
+        self.planGlobalId = planGlobalId
+        self.waveGlobalId = waveGlobalId
+        self.pickerEmail = pickerEmail
+        self.pickerDisplayName = pickerDisplayName
+        self.taskCount = taskCount
+        self.unitCount = unitCount
+        self.assignedAt = assignedAt
+        self.completedAt = completedAt
+    }
+}
+
+public struct ManagerPickManagementWorkspace: Decodable, Equatable, Sendable {
+    public let generatedAt: String
+    public let current: [ManagerCurrentPickAssignment]
+    public let history: [ManagerCompletedPickHistory]
+    public let eligiblePickers: [ManagerPicker]
+    public let pagination: ManagerPickManagementPagination?
+
+    public init(
+        generatedAt: String,
+        current: [ManagerCurrentPickAssignment],
+        history: [ManagerCompletedPickHistory],
+        eligiblePickers: [ManagerPicker],
+        pagination: ManagerPickManagementPagination? = nil
+    ) {
+        self.generatedAt = generatedAt
+        self.current = current
+        self.history = history
+        self.eligiblePickers = eligiblePickers
+        self.pagination = pagination
+    }
+}
+
+public struct ManagerPickManagementPageInfo: Decodable, Equatable, Sendable {
+    public let hasMore: Bool
+    public let nextCursor: String?
+
+    public init(hasMore: Bool, nextCursor: String?) {
+        self.hasMore = hasMore
+        self.nextCursor = nextCursor
+    }
+}
+
+public struct ManagerPickManagementPagination: Decodable, Equatable, Sendable {
+    public let current: ManagerPickManagementPageInfo
+    public let history: ManagerPickManagementPageInfo
+
+    public init(
+        current: ManagerPickManagementPageInfo,
+        history: ManagerPickManagementPageInfo
+    ) {
+        self.current = current
+        self.history = history
+    }
+}
+
+public struct ManagerPickAssignmentCommand: Equatable, Sendable {
+    public let orderGlobalId: String
+    public let expectedRowVersion: Int
+    public let expectedTaskCount: Int
+    public let expectedAssignmentFingerprint: String
+    public let expectedPreviousAssignedTo: String?
+    public let assignedTo: String?
+    public let reason: String
+    public let idempotencyKey: String
+
+    public init(
+        assignment: ManagerCurrentPickAssignment,
+        assignedTo: String?,
+        reason: String,
+        idempotencyKey: String = UUID().uuidString
+    ) throws {
+        let normalizedPicker = assignedTo?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let normalizedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedKey = idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard assignment.canManageAssignment,
+              assignment.rowVersion >= 0,
+              assignment.taskCount <= 200,
+              normalizedReason.isEmpty == false,
+              normalizedReason.count <= 500,
+              normalizedReason.rangeOfCharacter(from: .controlCharacters) == nil,
+              normalizedKey.range(
+                of: #"^[A-Za-z0-9._:-]{8,200}$"#,
+                options: .regularExpression
+              ) != nil else {
+            throw PickingContractError.contextMismatch
+        }
+        self.orderGlobalId = assignment.orderGlobalId
+        self.expectedRowVersion = assignment.rowVersion
+        self.expectedTaskCount = assignment.taskCount
+        self.expectedAssignmentFingerprint = assignment.assignmentFingerprint
+        self.expectedPreviousAssignedTo = assignment.assignmentState == "mixed"
+            ? "mixed"
+            : assignment.assignedTo?.lowercased()
+        self.assignedTo = normalizedPicker.flatMap { $0.isEmpty ? nil : $0 }
+        self.reason = normalizedReason
+        self.idempotencyKey = "manager-pick-assignment:\(normalizedKey)"
+    }
+}
+
+public struct ManagerPickAssignmentResult: Decodable, Equatable, Sendable {
+    public let orderGlobalId: String
+    public let orderStatus: String
+    public let previousRowVersion: Int
+    public let rowVersion: Int
+    public let taskCount: Int
+    public let previousAssignedTo: String?
+    public let assignedTo: String?
+    public let interventionExceptionGlobalId: String?
+    public let providerWrites: Int
+    public let replayed: Bool
+
+    public init(
+        orderGlobalId: String,
+        orderStatus: String,
+        previousRowVersion: Int,
+        rowVersion: Int,
+        taskCount: Int,
+        previousAssignedTo: String?,
+        assignedTo: String?,
+        interventionExceptionGlobalId: String?,
+        providerWrites: Int,
+        replayed: Bool
+    ) {
+        self.orderGlobalId = orderGlobalId
+        self.orderStatus = orderStatus
+        self.previousRowVersion = previousRowVersion
+        self.rowVersion = rowVersion
+        self.taskCount = taskCount
+        self.previousAssignedTo = previousAssignedTo
+        self.assignedTo = assignedTo
+        self.interventionExceptionGlobalId = interventionExceptionGlobalId
+        self.providerWrites = providerWrites
+        self.replayed = replayed
+    }
+
+    public func validated(
+        for command: ManagerPickAssignmentCommand
+    ) throws -> ManagerPickAssignmentResult {
+        guard orderGlobalId == command.orderGlobalId,
+              orderStatus == "released",
+              previousRowVersion == command.expectedRowVersion,
+              rowVersion == previousRowVersion + 1,
+              taskCount == command.expectedTaskCount,
+              previousAssignedTo?.lowercased()
+                == command.expectedPreviousAssignedTo?.lowercased(),
+              assignedTo?.lowercased() == command.assignedTo?.lowercased(),
+              providerWrites == 0,
+              command.assignedTo != nil || interventionExceptionGlobalId != nil else {
+            throw PickingContractError.contextMismatch
+        }
+        return self
+    }
+}
+
 public actor PickingAPIClient {
     private struct QueueEnvelope: Decodable {
         let ok: Bool
@@ -483,11 +988,35 @@ public actor PickingAPIClient {
         let error: String?
     }
 
+    private struct PickManagementEnvelope: Decodable {
+        let ok: Bool
+        let pickManagement: ManagerPickManagementWorkspace?
+        let code: String?
+        let error: String?
+    }
+
+    private struct ManagerPickAssignmentEnvelope: Decodable {
+        let ok: Bool
+        let result: ManagerPickAssignmentResult?
+        let code: String?
+        let error: String?
+    }
+
     private struct ManagerOrderCommandBody: Encodable {
         let action: String
         let orderGlobalId: String
         let expectedRowVersion: Int
         let assignedTo: String
+        let reason: String
+    }
+
+    private struct ManagerPickAssignmentBody: Encodable {
+        let action: String
+        let orderGlobalId: String
+        let expectedRowVersion: Int
+        let expectedTaskCount: Int
+        let expectedAssignmentFingerprint: String
+        let assignedTo: String?
         let reason: String
     }
 
@@ -521,7 +1050,8 @@ public actor PickingAPIClient {
     private let session: URLSession
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
-    private var authenticatedOperationGeneration: UInt64 = 0
+    private var authenticatedMutationInFlight = false
+    private var authenticatedMutationWaiters: [CheckedContinuation<Void, Never>] = []
 
     public init(origin: URL, session: URLSession? = nil, allowDebugHTTP: Bool = false) throws {
         guard origin.path.isEmpty || origin.path == "/",
@@ -621,7 +1151,8 @@ public actor PickingAPIClient {
     }
 
     public func switchWorkspace(to organizationId: String) async throws {
-        let operationGeneration = authenticatedOperationGeneration
+        await beginAuthenticatedMutation()
+        defer { finishAuthenticatedMutation() }
         var request = URLRequest(url: try endpoint("/api/auth/workspace"))
         request.httpMethod = "POST"
         request.cachePolicy = .reloadIgnoringLocalCacheData
@@ -640,9 +1171,6 @@ public actor PickingAPIClient {
         let workspaceSession = URLSession(configuration: workspaceConfiguration)
         defer { workspaceSession.finishTasksAndInvalidate() }
         let (data, response) = try await workspaceSession.data(for: request)
-        guard operationGeneration == authenticatedOperationGeneration else {
-            throw PickingAPIError.sessionSuperseded
-        }
         guard let http = response as? HTTPURLResponse else {
             throw PickingAPIError.invalidResponse
         }
@@ -660,17 +1188,16 @@ public actor PickingAPIClient {
                 message: envelope.error ?? "The organization could not be changed"
             )
         }
-        // Workspace switching rotates the durable browser-session token. Only
-        // the still-current authenticated generation may install it; logout
-        // increments the generation before its own network request begins.
-        guard operationGeneration == authenticatedOperationGeneration else {
-            throw PickingAPIError.sessionSuperseded
-        }
+        // Workspace switching rotates the durable browser-session token. The
+        // authenticated-mutation gate keeps logout behind this installation so
+        // its POST revokes the newly rotated session rather than the obsolete
+        // token that authorized this request.
         persistResponseCookies(response)
     }
 
     public func logout() async throws {
-        authenticatedOperationGeneration &+= 1
+        await beginAuthenticatedMutation()
+        defer { finishAuthenticatedMutation() }
         var request = URLRequest(url: try endpoint("/api/auth/logout"))
         request.httpMethod = "POST"
         let (data, response) = try await authenticatedData(for: request)
@@ -682,6 +1209,24 @@ public actor PickingAPIClient {
                 message: envelope.error ?? "Sign out failed"
             )
         }
+    }
+
+    private func beginAuthenticatedMutation() async {
+        guard authenticatedMutationInFlight else {
+            authenticatedMutationInFlight = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            authenticatedMutationWaiters.append(continuation)
+        }
+    }
+
+    private func finishAuthenticatedMutation() {
+        guard !authenticatedMutationWaiters.isEmpty else {
+            authenticatedMutationInFlight = false
+            return
+        }
+        authenticatedMutationWaiters.removeFirst().resume()
     }
 
     public func fetchQueue() async throws -> PickQueue {
@@ -835,6 +1380,168 @@ public actor PickingAPIClient {
             )
         }
         return metrics
+    }
+
+    public func fetchManagerPickManagement() async throws -> ManagerPickManagementWorkspace {
+        let first = try await fetchManagerPickManagementPage()
+        if first.pagination == nil,
+           first.current.count >= 100 || first.history.count >= 100 {
+            // Older servers did not expose page metadata. Refuse an exactly
+            // full legacy page rather than silently presenting a truncated
+            // manager workspace as complete.
+            throw PickingAPIError.invalidResponse
+        }
+        var current = first.current
+        var currentIds = Set(current.map(\.id))
+        var history = first.history
+        var historyIds = Set(history.map(\.id))
+        var currentCursor = try nextPickManagementCursor(
+            first.pagination?.current
+        )
+        var historyCursor = try nextPickManagementCursor(
+            first.pagination?.history
+        )
+        var seenCurrentCursors = Set<String>()
+        var seenHistoryCursors = Set<String>()
+
+        while let cursor = currentCursor {
+            guard seenCurrentCursors.count < 10_000,
+                  seenCurrentCursors.insert(cursor).inserted else {
+                throw PickingAPIError.invalidResponse
+            }
+            let page = try await fetchManagerPickManagementPage(
+                section: "current",
+                cursor: cursor
+            )
+            for assignment in page.current where currentIds.insert(assignment.id).inserted {
+                current.append(assignment)
+            }
+            currentCursor = try nextPickManagementCursor(
+                page.pagination?.current
+            )
+        }
+
+        while let cursor = historyCursor {
+            guard seenHistoryCursors.count < 10_000,
+                  seenHistoryCursors.insert(cursor).inserted else {
+                throw PickingAPIError.invalidResponse
+            }
+            let page = try await fetchManagerPickManagementPage(
+                section: "history",
+                cursor: cursor
+            )
+            for item in page.history where historyIds.insert(item.id).inserted {
+                history.append(item)
+            }
+            historyCursor = try nextPickManagementCursor(
+                page.pagination?.history
+            )
+        }
+
+        return ManagerPickManagementWorkspace(
+            generatedAt: first.generatedAt,
+            current: current,
+            history: history,
+            eligiblePickers: first.eligiblePickers,
+            pagination: ManagerPickManagementPagination(
+                current: ManagerPickManagementPageInfo(
+                    hasMore: false,
+                    nextCursor: nil
+                ),
+                history: ManagerPickManagementPageInfo(
+                    hasMore: false,
+                    nextCursor: nil
+                )
+            )
+        )
+    }
+
+    private func fetchManagerPickManagementPage(
+        section: String? = nil,
+        cursor: String? = nil
+    ) async throws -> ManagerPickManagementWorkspace {
+        var components = URLComponents(
+            url: try endpoint("/api/operations/pick-management"),
+            resolvingAgainstBaseURL: false
+        )
+        if let section {
+            let cursorName = section == "current"
+                ? "currentCursor"
+                : "historyCursor"
+            components?.queryItems = [
+                URLQueryItem(name: "section", value: section),
+                URLQueryItem(name: cursorName, value: cursor),
+            ]
+        }
+        guard let url = components?.url else {
+            throw PickingAPIError.invalidOrigin
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await authenticatedData(for: request)
+        try validateHTTP(response)
+        let envelope = try decoder.decode(PickManagementEnvelope.self, from: data)
+        guard envelope.ok, let workspace = envelope.pickManagement else {
+            throw PickingAPIError.rejected(
+                code: envelope.code ?? "OPERATIONS_PICK_MANAGEMENT_FAILED",
+                message: envelope.error ?? "Picker assignments are unavailable"
+            )
+        }
+        return workspace
+    }
+
+    private func nextPickManagementCursor(
+        _ page: ManagerPickManagementPageInfo?
+    ) throws -> String? {
+        guard let page, page.hasMore else { return nil }
+        guard let cursor = page.nextCursor,
+              cursor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+            throw PickingAPIError.invalidResponse
+        }
+        return cursor
+    }
+
+    public func managePickerAssignment(
+        _ command: ManagerPickAssignmentCommand
+    ) async throws -> ManagerPickAssignmentResult {
+        var request = URLRequest(url: try endpoint("/api/operations"))
+        request.httpMethod = "POST"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(command.idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
+        request.httpBody = try encoder.encode(ManagerPickAssignmentBody(
+            action: "manage-pick-assignment",
+            orderGlobalId: command.orderGlobalId,
+            expectedRowVersion: command.expectedRowVersion,
+            expectedTaskCount: command.expectedTaskCount,
+            expectedAssignmentFingerprint: command.expectedAssignmentFingerprint,
+            assignedTo: command.assignedTo,
+            reason: command.reason
+        ))
+        let (data, response) = try await authenticatedData(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw PickingAPIError.invalidResponse
+        }
+        let envelope = try? decoder.decode(ManagerPickAssignmentEnvelope.self, from: data)
+        guard (200..<300).contains(http.statusCode),
+              let envelope,
+              envelope.ok,
+              let result = envelope.result else {
+            if let envelope {
+                throw PickingAPIError.rejected(
+                    code: envelope.code ?? "OPERATIONS_PICK_MANAGEMENT_FAILED",
+                    message: envelope.error ?? "Picker assignment could not be changed"
+                )
+            }
+            if http.statusCode == 401 { throw PickingAPIError.unauthorized }
+            if http.statusCode == 429 {
+                let seconds = Int(http.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 60
+                throw PickingAPIError.rateLimited(retryAfterSeconds: max(1, seconds))
+            }
+            throw PickingAPIError.invalidResponse
+        }
+        return try result.validated(for: command)
     }
 
     public func releaseManagerOrder(

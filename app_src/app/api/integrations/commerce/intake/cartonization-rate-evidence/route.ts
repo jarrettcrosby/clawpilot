@@ -374,7 +374,7 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
       return {
         lineGlobalId: exactReference(
           item.lineGlobalId,
-          /^gcol(?:[0-9]{7}|[0-9a-v]{12})$/,
+          /^(?:gcol|gcal)(?:[0-9]{7}|[0-9a-v]{12})$/,
           `Committed inventory assumption ${index + 1} line`,
         ),
         quantity: exactInteger(

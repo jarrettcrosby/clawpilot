@@ -31,6 +31,7 @@ import { accountingSectionFromNavigationUrl } from '@/lib/accountingDraftNavigat
 const SECTIONS = ['dashboard', 'docs', 'projects', 'pipeline', 'crm', 'accounting', 'pos', 'operations', 'shipping', 'links', 'agents', 'versions']
 const OPERATIONS_TARGETS: Record<string, OperationsView> = {
   operations: 'orders',
+  'operations/picking': 'picking',
   'operations/exceptions': 'exceptions',
   'operations/imports': 'imports',
   'operations/receiving': 'receiving',

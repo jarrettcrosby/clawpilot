@@ -21,6 +21,33 @@ export type CarrierWholeShipmentFedexPickupType =
   | 'CONTACT_FEDEX_TO_SCHEDULE'
   | 'USE_SCHEDULED_PICKUP'
 
+export const UPS_WHOLE_SHIPMENT_PACKAGING_TYPES = Object.freeze({
+  '01': 'Letter',
+  '02': 'Customer supplied package',
+  '03': 'Tube',
+  '04': 'PAK',
+  '21': 'Express box',
+  '24': '25KG box',
+  '25': '10KG box',
+  '2a': 'Small express box',
+  '2b': 'Medium express box',
+  '2c': 'Large express box',
+} as const)
+export const FEDEX_WHOLE_SHIPMENT_PACKAGING_TYPES = Object.freeze({
+  YOUR_PACKAGING: 'Your packaging',
+  FEDEX_ENVELOPE: 'Envelope',
+  FEDEX_BOX: 'Box',
+  FEDEX_EXTRA_SMALL_BOX: 'Extra small box',
+  FEDEX_SMALL_BOX: 'Small box',
+  FEDEX_MEDIUM_BOX: 'Medium box',
+  FEDEX_LARGE_BOX: 'Large box',
+  FEDEX_EXTRA_LARGE_BOX: 'Extra large box',
+  FEDEX_10KG_BOX: '10KG box',
+  FEDEX_25KG_BOX: '25KG box',
+  FEDEX_PAK: 'PAK',
+  FEDEX_TUBE: 'Tube',
+} as const)
+
 export type CarrierWholeShipmentRateParty = {
   name: string
   phone: string
@@ -46,6 +73,7 @@ export type CarrierWholeShipmentRateDestination = {
 
 export type CarrierWholeShipmentRateParcel = {
   description: string
+  packageCode?: string
   length: number
   width: number
   height: number
@@ -53,6 +81,10 @@ export type CarrierWholeShipmentRateParcel = {
   weight: number
   weightUnit: 'LB'
 }
+type NormalizedCarrierWholeShipmentRateParcel = Omit<
+  CarrierWholeShipmentRateParcel,
+  'packageCode'
+> & { packageCode: string }
 
 export type CarrierWholeShipmentRateBindingInput = {
   organizationId: string
@@ -135,7 +167,7 @@ export type CarrierWholeShipmentRateRequestEvidence = {
       residential: boolean
     }
     fedexPickupType: CarrierWholeShipmentFedexPickupType | null
-    parcels: CarrierWholeShipmentRateParcel[]
+    parcels: NormalizedCarrierWholeShipmentRateParcel[]
   }
 }
 
@@ -491,13 +523,32 @@ export function carrierWholeShipmentRateAddressFingerprints(input: {
   })
 }
 
-function normalizeParcel(value: unknown): CarrierWholeShipmentRateParcel {
+function packageName(
+  provider: CarrierWholeShipmentRateProvider,
+  value: unknown,
+) {
+  const code = value === undefined || value === null
+    ? provider === 'ups_rest' ? '02' : 'YOUR_PACKAGING'
+    : plainText(value, 'Carrier package code', 32)
+  const name = provider === 'ups_rest'
+    ? (UPS_WHOLE_SHIPMENT_PACKAGING_TYPES as Record<string, string>)[code]
+    : (FEDEX_WHOLE_SHIPMENT_PACKAGING_TYPES as Record<string, string>)[code]
+  if (!name) throw new Error('Carrier package type is not supported')
+  return { code, name }
+}
+
+function normalizeParcel(
+  value: unknown,
+  provider: CarrierWholeShipmentRateProvider,
+): NormalizedCarrierWholeShipmentRateParcel {
   const input = record(value)
   if (input.dimensionUnit !== 'IN' || input.weightUnit !== 'LB') {
     throw new Error('Whole-shipment carrier rating requires IN and LB canonical units')
   }
+  const packaging = packageName(provider, input.packageCode)
   return {
     description: plainText(input.description, 'Parcel description', 120),
+    packageCode: packaging.code,
     length: positiveDecimal(input.length, 'Parcel length', 108),
     width: positiveDecimal(input.width, 'Parcel width', 108),
     height: positiveDecimal(input.height, 'Parcel height', 108),
@@ -652,9 +703,13 @@ function fedexRequest(
   payerAccountNumber: string,
   origin: CarrierWholeShipmentRateParty,
   destination: CarrierWholeShipmentRateDestination,
-  parcels: CarrierWholeShipmentRateParcel[],
+  parcels: NormalizedCarrierWholeShipmentRateParcel[],
   pickupType: CarrierWholeShipmentFedexPickupType,
 ) {
+  const packagingType = parcels[0]?.packageCode
+  if (!packagingType || parcels.some((parcel) => parcel.packageCode !== packagingType)) {
+    throw new Error('FedEx whole-shipment rating requires one package type for every parcel')
+  }
   return {
     // The FedEx Rate API expresses the account whose rates are requested only
     // through this top-level accountNumber. It has no shipping-payment mutation
@@ -698,7 +753,7 @@ function fedexRequest(
       },
       pickupType,
       rateRequestType: ['ACCOUNT', 'LIST'],
-      packagingType: 'YOUR_PACKAGING',
+      packagingType,
       totalPackageCount: parcels.length,
       requestedPackageLineItems: parcels.map((parcel, index) => ({
         sequenceNumber: index + 1,
@@ -783,7 +838,7 @@ function upsRequest(
   accountNumber: string,
   origin: CarrierWholeShipmentRateParty,
   destination: CarrierWholeShipmentRateDestination,
-  parcels: CarrierWholeShipmentRateParcel[],
+  parcels: NormalizedCarrierWholeShipmentRateParcel[],
   billing: ReturnType<typeof normalizeBilling>,
 ) {
   return {
@@ -802,8 +857,8 @@ function upsRequest(
         NumOfPieces: String(parcels.length),
         Package: parcels.map((parcel) => ({
           PackagingType: {
-            Code: '02',
-            Description: 'Customer supplied package',
+            Code: parcel.packageCode,
+            Description: packageName('ups_rest', parcel.packageCode).name,
           },
           Description: parcel.description,
           Dimensions: {
@@ -867,7 +922,10 @@ export function prepareCarrierWholeShipmentRateRequest(
       } ordered packages`,
     )
   }
-  const parcels = input.parcels.map(normalizeParcel)
+  const parcels = input.parcels.map((parcel) => normalizeParcel(
+    parcel,
+    binding.provider,
+  ))
   const endpoint = carrierWholeShipmentRateEndpoint(
     binding.provider,
     binding.environment,
@@ -1250,7 +1308,7 @@ function upsAddress(
   }
 }
 
-function parcelsFromUpsBody(value: unknown): CarrierWholeShipmentRateParcel[] {
+function parcelsFromUpsBody(value: unknown): NormalizedCarrierWholeShipmentRateParcel[] {
   return exactList(value, 'UPS packages').map((candidate, index) => {
     const item = exactObject(
       candidate,
@@ -1282,9 +1340,9 @@ function parcelsFromUpsBody(value: unknown): CarrierWholeShipmentRateParcel[] {
       ['Code'],
       `UPS package ${index + 1} weight unit`,
     )
+    const carrierPackaging = packageName('ups_rest', packaging.Code)
     if (
-      packaging.Code !== '02'
-      || packaging.Description !== 'Customer supplied package'
+      packaging.Description !== carrierPackaging.name
       || dimensionUnit.Code !== 'IN'
       || weightUnit.Code !== 'LBS'
     ) {
@@ -1292,13 +1350,14 @@ function parcelsFromUpsBody(value: unknown): CarrierWholeShipmentRateParcel[] {
     }
     return normalizeParcel({
       description: item.Description,
+      packageCode: carrierPackaging.code,
       length: Number(dimensions.Length),
       width: Number(dimensions.Width),
       height: Number(dimensions.Height),
       dimensionUnit: 'IN',
       weight: Number(weight.Weight),
       weightUnit: 'LB',
-    })
+    }, 'ups_rest')
   })
 }
 
@@ -1520,7 +1579,10 @@ function fedexAddress(value: unknown, label: string, destination: boolean) {
   }
 }
 
-function parcelsFromFedexBody(value: unknown): CarrierWholeShipmentRateParcel[] {
+function parcelsFromFedexBody(
+  value: unknown,
+  packageCode: string,
+): NormalizedCarrierWholeShipmentRateParcel[] {
   return exactList(value, 'FedEx package lines').map((candidate, index) => {
     const item = exactObject(
       candidate,
@@ -1553,13 +1615,14 @@ function parcelsFromFedexBody(value: unknown): CarrierWholeShipmentRateParcel[] 
     }
     return normalizeParcel({
       description: item.itemDescription,
+      packageCode,
       length: dimensions.length,
       width: dimensions.width,
       height: dimensions.height,
       dimensionUnit: dimensions.units,
       weight: weight.value,
       weightUnit: weight.units,
-    })
+    }, 'fedex_rest')
   })
 }
 
@@ -1622,12 +1685,15 @@ function assertFedexBodyIntegrity(
     name: null,
     ...fedexAddress(recipient.address, 'FedEx destination address', true),
   })
-  const parcels = parcelsFromFedexBody(shipment.requestedPackageLineItems)
+  const fedexPackaging = packageName('fedex_rest', shipment.packagingType)
+  const parcels = parcelsFromFedexBody(
+    shipment.requestedPackageLineItems,
+    fedexPackaging.code,
+  )
   const pickupType = fedexPickupType('fedex_rest', shipment.pickupType)
   const rateTypes = exactList(shipment.rateRequestType, 'FedEx rate request types')
   if (
     stable(rateTypes) !== stable(['ACCOUNT', 'LIST'])
-    || shipment.packagingType !== 'YOUR_PACKAGING'
     || shipment.totalPackageCount !== parcels.length
     || stable(parcels) !== stable(redacted.shipment.parcels)
     || stable(fedexRequest(
@@ -1744,7 +1810,7 @@ function normalizeRequestEvidence(
   }
   const pickupType = fedexPickupType(prepared.provider, shipmentSource.fedexPickupType)
   const parcels = exactList(shipmentSource.parcels, 'Carrier request parcels')
-    .map(normalizeParcel)
+    .map((parcel) => normalizeParcel(parcel, prepared.provider))
   const destinationRegion = destinationSource.region === null
     ? null
     : usRegion(destinationSource.region, 'Destination evidence region')

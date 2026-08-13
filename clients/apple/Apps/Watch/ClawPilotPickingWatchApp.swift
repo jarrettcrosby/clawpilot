@@ -397,9 +397,14 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
         guard let session,
               session.activationState == .activated,
               session.isReachable else {
+            let message = "The paired iPhone is no longer reachable."
+            isReachable = session?.isReachable == true
+            if command.action == .readInstruction {
+                playInstructionLocally(fallbackReason: message)
+                return
+            }
             actionStatus = "Open ClawPilot on the paired iPhone, then try again."
             lastActionSucceeded = false
-            isReachable = session?.isReachable == true
             return
         }
         guard let data = try? JSONEncoder().encode(command) else {
@@ -421,9 +426,20 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
         // main actor. The iPhone already returns the authoritative typed result
         // through WatchPickCommandResult, so an inline reply is redundant.
         let commandID = command.id
+        let commandAction = command.action
         let errorHandler: @Sendable (Error) -> Void = { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.pendingCommandID == commandID else { return }
+                if commandAction == .readInstruction {
+                    self.finishPendingCommand(
+                        succeeded: false,
+                        message: "The iPhone audio route was unavailable."
+                    )
+                    self.playInstructionLocally(
+                        fallbackReason: "The iPhone audio route was unavailable."
+                    )
+                    return
+                }
                 self.finishPendingCommand(
                     succeeded: false,
                     message: "The iPhone did not receive the command. Open ClawPilot and try again."
@@ -462,7 +478,7 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
     }
 
     func readInstruction() {
-        guard let snapshot, let current = snapshot.current else {
+        guard let snapshot, snapshot.current != nil else {
             actionStatus = "No current pick instruction is available."
             lastActionSucceeded = false
             return
@@ -473,6 +489,15 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
         )
         if playbackTarget == .pairedIPhone {
             send(.readInstruction)
+            return
+        }
+        playInstructionLocally()
+    }
+
+    private func playInstructionLocally(fallbackReason: String? = nil) {
+        guard let snapshot, let current = snapshot.current else {
+            actionStatus = "No current pick instruction is available."
+            lastActionSucceeded = false
             return
         }
         guard !speech.isSpeaking, !isSpeaking else {
@@ -495,17 +520,32 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
         utterance.rate = 0.48
         isSpeaking = true
         lastActionSucceeded = nil
-        actionStatus = "Playing instruction on Apple Watch."
+        if let fallbackReason {
+            actionStatus = "\(fallbackReason) Playing on Apple Watch instead."
+        } else {
+            actionStatus = "Playing instruction on Apple Watch."
+        }
         speech.speak(utterance)
     }
 
     private func startCommandTimeout(for command: WatchPickCommand) {
         commandTimeoutTask?.cancel()
+        let timeout: Duration = switch command.action {
+        case .requestMetaScan: .seconds(35)
+        case .readInstruction: .seconds(45)
+        default: .seconds(15)
+        }
         commandTimeoutTask = Task { [weak self] in
-            try? await Task.sleep(for: command.action == .requestMetaScan ? .seconds(35) : .seconds(15))
+            try? await Task.sleep(for: timeout)
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard let self, self.pendingCommandID == command.id else { return }
+                if command.action == .readInstruction {
+                    let message = "The iPhone audio request timed out."
+                    self.finishPendingCommand(succeeded: false, message: message)
+                    self.playInstructionLocally(fallbackReason: message)
+                    return
+                }
                 self.finishPendingCommand(
                     succeeded: false,
                     message: "The iPhone action is taking too long. Keep ClawPilot open and try again."
@@ -577,6 +617,10 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
               result.schemaVersion == 1,
               result.commandId == pendingCommandID else { return }
         finishPendingCommand(succeeded: result.succeeded, message: result.message)
+        if result.action == .readInstruction, !result.succeeded {
+            playInstructionLocally(fallbackReason: result.message)
+            return
+        }
         if result.action == .submitCount {
             if result.succeeded {
                 showCountEntry = false
@@ -662,7 +706,7 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
     private static func pendingMessage(for action: WatchPickAction) -> String {
         switch action {
         case .requestMetaScan: "Starting the glasses scan…"
-        case .readInstruction: "Starting instruction audio…"
+        case .readInstruction: "Preparing enhanced audio on the paired iPhone…"
         case .confirmPick: "Confirming picks…"
         case .refreshQueue: "Refreshing picks…"
         case .beginProductScan: "Arming the product scan…"

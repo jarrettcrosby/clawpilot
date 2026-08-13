@@ -194,6 +194,49 @@ private actor BlockingProgressCache: PickCache {
     }
 }
 
+private actor BlockingConfirmationRetirementCache: PickCache {
+    private var queue: PickQueue?
+    private var outbox: ConfirmPicksCommand?
+    private var progress: PickSessionProgress?
+    private var shouldBlockNextOutboxRead = false
+    private var blockedContinuation: CheckedContinuation<Void, Never>?
+    private var readStartedContinuation: CheckedContinuation<Void, Never>?
+
+    func loadQueue() async throws -> PickQueue? { queue }
+    func saveQueue(_ queue: PickQueue) async throws { self.queue = queue }
+    func clearQueue() async throws { queue = nil }
+    func saveOutbox(_ command: ConfirmPicksCommand) async throws { outbox = command }
+    func loadOutbox() async throws -> ConfirmPicksCommand? {
+        if shouldBlockNextOutboxRead {
+            shouldBlockNextOutboxRead = false
+            readStartedContinuation?.resume()
+            readStartedContinuation = nil
+            await withCheckedContinuation { continuation in
+                blockedContinuation = continuation
+            }
+        }
+        return outbox
+    }
+    func clearOutbox() async throws { outbox = nil }
+    func loadProgress() async throws -> PickSessionProgress? { progress }
+    func saveProgress(_ progress: PickSessionProgress) async throws {
+        self.progress = progress
+    }
+    func clearProgress() async throws { progress = nil }
+
+    func blockNextOutboxRead() { shouldBlockNextOutboxRead = true }
+    func waitUntilOutboxReadStarts() async {
+        if blockedContinuation != nil { return }
+        await withCheckedContinuation { continuation in
+            readStartedContinuation = continuation
+        }
+    }
+    func releaseOutboxRead() {
+        blockedContinuation?.resume()
+        blockedContinuation = nil
+    }
+}
+
 private actor RetirementFailureCache: PickCache {
     enum FailurePoint: Equatable {
         case clearProgress
@@ -381,6 +424,52 @@ func exactConfirmationRetirementIsSingleAdvance() async throws {
     }
     #expect(await session.currentOrder() == second)
     #expect(try await cache.loadQueue()?.orders == [second, third])
+}
+
+@Test("concurrent exact confirmation retry advances once and fails the duplicate closed")
+func concurrentExactConfirmationRetirementIsSingleAdvance() async throws {
+    let cache = BlockingConfirmationRetirementCache()
+    let fixture = try fixtureQueue()
+    let first = try #require(fixture.orders.first)
+    let second = try PickOrder(
+        orderGlobalId: "gor0000023",
+        orderNumber: "1023",
+        rowVersion: 23,
+        tasks: first.tasks
+    )
+    let queue = try PickQueue(
+        schemaVersion: fixture.schemaVersion,
+        organizationId: fixture.organizationId,
+        workerEmail: fixture.workerEmail,
+        generatedAt: fixture.generatedAt,
+        orders: [first, second]
+    )
+    let command = ConfirmPicksCommand(
+        order: first,
+        idempotencyKey: "concurrent-single-advance"
+    )
+    let session = PickingSession(cache: cache)
+    try await session.replaceQueue(queue)
+    try await cache.saveOutbox(command)
+    await cache.blockNextOutboxRead()
+
+    let acceptedRetry = Task {
+        try await session.finishConfirmedOrder(command)
+    }
+    await cache.waitUntilOutboxReadStarts()
+    let duplicateRetry = Task {
+        try await session.finishConfirmedOrder(command)
+    }
+
+    await #expect(throws: PickingContractError.persistenceInFlight) {
+        try await duplicateRetry.value
+    }
+    await cache.releaseOutboxRead()
+    try await acceptedRetry.value
+
+    #expect(await session.currentOrder() == second)
+    #expect(try await cache.loadQueue()?.orders == [second])
+    #expect(try await cache.loadOutbox() == nil)
 }
 
 @Test("unstarted pick handoff persists exact owning context before transport")
@@ -1897,6 +1986,22 @@ func watchInstructionPlaybackRouting() {
         prefersPairedIPhone: true,
         pairedIPhoneIsReachable: true
     ) == .pairedIPhone)
+    #expect(!WatchInstructionPhonePlaybackPolicy.isEligible(
+        metaConnectedDeviceCount: 0,
+        enhancedVoiceReady: true
+    ))
+    #expect(!WatchInstructionPhonePlaybackPolicy.isEligible(
+        metaConnectedDeviceCount: 1,
+        enhancedVoiceReady: false
+    ))
+    #expect(WatchInstructionPhonePlaybackPolicy.isEligible(
+        metaConnectedDeviceCount: 1,
+        enhancedVoiceReady: true
+    ))
+    #expect(!WatchInstructionPhonePlaybackPolicy.isEligible(
+        metaConnectedDeviceCount: 2,
+        enhancedVoiceReady: true
+    ))
 }
 
 @Test("location-first voice instruction never asks for the product first")

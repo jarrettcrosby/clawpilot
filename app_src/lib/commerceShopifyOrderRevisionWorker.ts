@@ -44,6 +44,8 @@ export async function processShopifyOrderRevisions(input: {
         sourceHash: evidence.sourceHash,
         revisionHash: evidence.revisionHash,
         normalizedSnapshot: JSON.parse(JSON.stringify(evidence.snapshot)) as Record<string, unknown>,
+        protectedParty: evidence.protectedParty,
+        protectedShipTo: evidence.protectedShipTo,
         providerReads: evidence.providerReads,
         providerWrites: 0,
         observedAt: evidence.snapshot.observedAt,

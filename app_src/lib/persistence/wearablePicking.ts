@@ -104,7 +104,7 @@ export async function readAssignedWearablePickQueueFromPostgres(input: {
      JOIN operations_fulfillment_allocations allocation
        ON allocation.organization_id = pick.organization_id
       AND allocation.id = pick.allocation_id
-     JOIN operations_order_lines line
+     JOIN operations_current_order_lines line
        ON line.organization_id = allocation.organization_id
       AND line.id = allocation.order_line_id
      JOIN crm_products product

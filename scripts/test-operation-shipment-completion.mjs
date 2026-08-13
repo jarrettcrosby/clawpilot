@@ -929,6 +929,9 @@ async function verifyShipmentCompletion(databaseUrl) {
       },
     )
     const domain = loadTypeScriptModule('app_src/lib/operations/domain.ts')
+    const pickManagement = loadTypeScriptModule(
+      'app_src/lib/operations/pickManagement.ts',
+    )
     const commerceFulfillmentRecoveryPolicy = loadTypeScriptModule(
       'app_src/lib/commerceFulfillmentRecoveryPolicy.ts',
     )
@@ -1115,6 +1118,7 @@ async function verifyShipmentCompletion(databaseUrl) {
         '@/lib/operations/canonicalFulfillmentPlanning':
           canonicalPlanning,
         '@/lib/operations/domain': domain,
+        '@/lib/operations/pickManagement': pickManagement,
         '@/lib/operations/barcodeLabels': barcodeLabels,
         '@/lib/operations/packingSlip': packingSlip,
         '@/lib/persistence/cartonizationRateEvidence': {

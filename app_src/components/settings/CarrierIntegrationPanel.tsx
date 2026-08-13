@@ -357,11 +357,13 @@ const fieldSx = {
 }
 
 const buttonSx = {
-  minHeight: 40,
+  minHeight: 44,
   borderRadius: '8px',
   px: 1.5,
   width: { xs: '100%', sm: 'auto' },
 }
+
+const iconActionSx = { minWidth: 44, minHeight: 44 }
 
 function accountKey(provider: CarrierProvider, environment: CarrierEnvironment) {
   return `${provider}:${environment}`
@@ -436,7 +438,11 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : 'Carrier integration request failed'
 }
 
-export default function CarrierIntegrationPanel() {
+export default function CarrierIntegrationPanel({
+  brokeredFocus = 'all',
+}: {
+  brokeredFocus?: 'small_parcel' | 'all'
+}) {
   const dateTimeSettings = useUserDateTime()
   const { measurementSystem } = useMeasurementSystem()
   const [provider, setProvider] = useState<CarrierProvider>('ups_rest')
@@ -1061,7 +1067,11 @@ export default function CarrierIntegrationPanel() {
         <Box>
           <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
             <LocalShippingRounded color="primary" />
-            <Typography variant="h6" fontWeight={700}>Carrier integrations</Typography>
+            <Typography variant="h6" fontWeight={700}>
+              {brokeredFocus === 'small_parcel'
+                ? 'Small Parcel direct accounts'
+                : 'Carrier integrations'}
+            </Typography>
             <Chip
               size="small"
               color={account?.verificationStatus === 'verified' ? 'success' : account?.verificationStatus === 'failed' ? 'error' : 'default'}
@@ -1070,7 +1080,11 @@ export default function CarrierIntegrationPanel() {
             />
           </Stack>
           <Typography variant="caption" color="text.disabled">
-            {verifiedLabel ? `Verified ${verifiedLabel}` : 'UPS, FedEx, and USPS direct accounts'}
+            {verifiedLabel
+              ? `Verified ${verifiedLabel}`
+              : brokeredFocus === 'small_parcel'
+                ? 'UPS and FedEx power Create Shipment; existing USPS credential administration remains available but is not executable there.'
+                : 'UPS, FedEx, and USPS direct accounts'}
           </Typography>
         </Box>
         <Tooltip
@@ -1315,7 +1329,7 @@ export default function CarrierIntegrationPanel() {
         variant="scrollable"
         scrollButtons="auto"
         aria-label="Carrier provider"
-        sx={{ mt: 2, minHeight: 42, '& .MuiTab-root': { minHeight: 42 } }}
+        sx={{ mt: 2, minHeight: 44, '& .MuiTab-root': { minHeight: 44 } }}
       >
         {PROVIDERS.map((entry) => <Tab key={entry.value} value={entry.value} label={entry.label} />)}
       </Tabs>
@@ -1339,7 +1353,11 @@ export default function CarrierIntegrationPanel() {
           }
         }}
         aria-label="Carrier environment"
-        sx={{ maxWidth: 420, mb: 2, '& .MuiToggleButton-root': { borderRadius: '8px' } }}
+        sx={{
+          maxWidth: 420,
+          mb: 2,
+          '& .MuiToggleButton-root': { borderRadius: '8px', minHeight: 44 },
+        }}
       >
         <ToggleButton
           value="sandbox"
@@ -1605,6 +1623,7 @@ export default function CarrierIntegrationPanel() {
             action={(
               <Tooltip title="Hide credentials">
                 <IconButton
+                  sx={iconActionSx}
                   color="inherit"
                   size="small"
                   onClick={() => setRevealedCredential(null)}
@@ -1631,6 +1650,7 @@ export default function CarrierIntegrationPanel() {
                     <InputAdornment position="end">
                       <Tooltip title="Copy client ID">
                         <IconButton
+                          sx={iconActionSx}
                           edge="end"
                           onClick={() => void copyCredential('Client ID', revealedCredential.clientId)}
                           aria-label="Copy carrier client ID"
@@ -1652,6 +1672,7 @@ export default function CarrierIntegrationPanel() {
                     <InputAdornment position="end">
                       <Tooltip title="Copy client secret">
                         <IconButton
+                          sx={iconActionSx}
                           edge="end"
                           onClick={() => void copyCredential('Client secret', revealedCredential.clientSecret)}
                           aria-label="Copy carrier client secret"
@@ -1742,6 +1763,7 @@ export default function CarrierIntegrationPanel() {
                         startIcon={<EditRounded />}
                         onClick={() => editCarrierAccount(entry)}
                         disabled={busy || ratingOnlyDelegation}
+                        sx={{ minHeight: 44, minWidth: 44 }}
                       >
                         Edit
                       </Button>
@@ -1754,6 +1776,7 @@ export default function CarrierIntegrationPanel() {
                         color="error"
                         startIcon={<DeleteOutlineRounded />}
                         disabled={busy || ratingOnlyDelegation}
+                        sx={{ minHeight: 44, minWidth: 44 }}
                         onClick={() => {
                           if (!window.confirm(`Delete ${entry.displayName}?`)) return
                           void patch(
@@ -2845,11 +2868,12 @@ export default function CarrierIntegrationPanel() {
           sx={{ mt: 2, borderRadius: '8px' }}
           action={(
             <Stack direction="row" spacing={0.5}>
-              <Button color="inherit" size="small" onClick={() => setConfirmDisconnect(false)}>Cancel</Button>
+              <Button color="inherit" size="small" sx={{ minHeight: 44 }} onClick={() => setConfirmDisconnect(false)}>Cancel</Button>
               <Button
                 color="error"
                 size="small"
                 startIcon={<PowerSettingsNewRounded />}
+                sx={{ minHeight: 44 }}
                 onClick={() => {
                   setConfirmDisconnect(false)
                   setRevealedCredential(null)
@@ -2869,7 +2893,7 @@ export default function CarrierIntegrationPanel() {
         </Alert>
       ) : null}
 
-      <BrokeredTransportIntegrationPanel />
+      <BrokeredTransportIntegrationPanel focus={brokeredFocus} />
     </Box>
   )
 }

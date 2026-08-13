@@ -29,6 +29,11 @@ import {
   failCommerceOrderReconciliationInPostgres,
   projectCommerceOrderReconciliationPageInPostgres,
 } from '@/lib/persistence/commerceOrderReconciliation'
+import {
+  purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres,
+} from '@/lib/persistence/commerceOrderRevisions'
+
+const PROTECTED_SNAPSHOT_PURGE_LIMIT_PER_CYCLE = 250
 
 function deterministicRunUuid(input: {
   organizationId: string
@@ -286,6 +291,10 @@ export async function processCommerceOrderReconciliation(input: {
   /** Deterministic test seam; API callers never supply this. */
   clock?: () => number
 }) {
+  const protectedSnapshotPurge =
+    await purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres({
+      limit: PROTECTED_SNAPSHOT_PURGE_LIMIT_PER_CYCLE,
+    })
   if (!commerceReadRuntimeAvailable()) {
     return {
       skipped: true,
@@ -299,6 +308,7 @@ export async function processCommerceOrderReconciliation(input: {
       providerWrites: 0,
       canonicalOrderWrites: 0,
       inventoryWrites: 0,
+      protectedSnapshotPurge,
       automaticShopifyOrderPromotion:
         shopifyAutomaticOrderPromotionHealthSnapshot(),
       automaticFaireOrderPromotion:
@@ -1079,6 +1089,7 @@ export async function processCommerceOrderReconciliation(input: {
     providerWrites: 0,
     canonicalOrderWrites: shopifyOrdersPromoted + faireOrdersPromoted,
     inventoryWrites: 0,
+    protectedSnapshotPurge,
     automaticCustomerResolution: {
       matched: customersMatched,
       created: customersCreated,

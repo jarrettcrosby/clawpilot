@@ -1,10 +1,9 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import AddCircleOutlineRounded from '@mui/icons-material/AddCircleOutlineRounded'
 import CloseRounded from '@mui/icons-material/CloseRounded'
 import EventAvailableRounded from '@mui/icons-material/EventAvailableRounded'
-import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
 import LocalShippingRounded from '@mui/icons-material/LocalShippingRounded'
 import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
@@ -30,6 +29,8 @@ import {
   TableRow,
   Tabs,
   Tooltip,
+  ToggleButton,
+  ToggleButtonGroup,
   Typography,
   useMediaQuery,
   useTheme,
@@ -58,6 +59,7 @@ const SHIPPING_TARGETS: Record<ShippingView, string> = {
   shipments: 'shipping/shipments',
   pickups: 'shipping/pickups',
 }
+const iconActionSx = { minWidth: 44, minHeight: 44 }
 
 function display(value: string) {
   return value
@@ -90,64 +92,6 @@ function recordStageColor(record: ShippingRecord) {
   return 'default' as const
 }
 
-function ModeButton({
-  mode,
-  selected,
-  onSelect,
-  icon,
-  title,
-  description,
-  badge,
-}: {
-  mode: ShippingTransportMode
-  selected: boolean
-  onSelect: (mode: ShippingTransportMode) => void
-  icon: ReactNode
-  title: string
-  description: string
-  badge: string
-}) {
-  return (
-    <Button
-      data-testid={`shipping-mode-${mode}`}
-      aria-pressed={selected}
-      variant={selected ? 'contained' : 'outlined'}
-      color={selected ? 'primary' : 'inherit'}
-      onClick={() => onSelect(mode)}
-      sx={{
-        minHeight: 104,
-        justifyContent: 'flex-start',
-        alignItems: 'stretch',
-        p: 2,
-        textAlign: 'left',
-        textTransform: 'none',
-        borderColor: selected ? undefined : 'rgba(255,255,255,0.14)',
-      }}
-    >
-      <Stack direction="row" spacing={1.5} alignItems="flex-start" width="100%">
-        <Box sx={{ mt: 0.25, display: 'grid', placeItems: 'center' }}>{icon}</Box>
-        <Box sx={{ flex: 1, minWidth: 0 }}>
-          <Stack direction="row" gap={1} alignItems="center" flexWrap="wrap" useFlexGap>
-            <Typography fontWeight={800}>{title}</Typography>
-            <Chip
-              size="small"
-              label={badge}
-              color={selected ? 'default' : 'info'}
-              variant={selected ? 'filled' : 'outlined'}
-            />
-          </Stack>
-          <Typography
-            variant="body2"
-            sx={{ mt: 0.5, color: selected ? 'inherit' : 'text.secondary' }}
-          >
-            {description}
-          </Typography>
-        </Box>
-      </Stack>
-    </Button>
-  )
-}
-
 function ModeSelector({
   mode,
   onChange,
@@ -156,33 +100,38 @@ function ModeSelector({
   onChange: (mode: ShippingTransportMode) => void
 }) {
   return (
-    <Box
+    <ToggleButtonGroup
       data-testid="shipping-mode-selector"
+      aria-label="Shipment type"
+      value={mode}
+      exclusive
+      size="small"
+      color="primary"
+      onChange={(_, nextMode: ShippingTransportMode | null) => {
+        if (nextMode) onChange(nextMode)
+      }}
       sx={{
-        display: 'grid',
-        gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' },
-        gap: 1.25,
+        width: { xs: '100%', sm: 'auto' },
+        alignSelf: 'flex-start',
+        '& .MuiToggleButton-root': {
+          minWidth: { xs: 0, sm: 120 },
+          minHeight: 44,
+          flex: { xs: 1, sm: '0 0 auto' },
+          px: 2,
+          py: 0.75,
+          fontWeight: 750,
+          textTransform: 'none',
+          borderColor: 'rgba(255,255,255,0.16)',
+        },
       }}
     >
-      <ModeButton
-        mode="parcel"
-        selected={mode === 'parcel'}
-        onSelect={onChange}
-        icon={<Inventory2Rounded />}
-        title="Parcel"
-        badge="Loose packages"
-        description="Cartons and poly bags remain loose. Direct UPS and FedEx execution is available through the existing one-off workflow."
-      />
-      <ModeButton
-        mode="ltl"
-        selected={mode === 'ltl'}
-        onSelect={onChange}
-        icon={<LocalShippingRounded />}
-        title="LTL"
-        badge="Preparation only"
-        description="Cartons are palletized into outbound handling units. Classification can be prepared now; rating and tender are still gated."
-      />
-    </Box>
+      <ToggleButton data-testid="shipping-mode-parcel" value="parcel">
+        Parcel
+      </ToggleButton>
+      <ToggleButton data-testid="shipping-mode-ltl" value="ltl">
+        LTL
+      </ToggleButton>
+    </ToggleButtonGroup>
   )
 }
 
@@ -284,7 +233,7 @@ function ShipmentRecords({
               <TableCell>{formatDate(record.occurredAt)}</TableCell>
               <TableCell padding="checkbox">
                 <Tooltip title="View shipment record">
-                  <IconButton size="small" aria-label={`View shipment ${record.orderNumber}`}>
+                  <IconButton sx={iconActionSx} size="small" aria-label={`View shipment ${record.orderNumber}`}>
                     <OpenInNewRounded fontSize="small" />
                   </IconButton>
                 </Tooltip>
@@ -321,7 +270,7 @@ function RecordDialog({
             </Typography>
           )}
         </Box>
-        <IconButton aria-label="Close shipment record" onClick={onClose}><CloseRounded /></IconButton>
+        <IconButton sx={iconActionSx} aria-label="Close shipment record" onClick={onClose}><CloseRounded /></IconButton>
       </DialogTitle>
       {record && (
         <DialogContent dividers>
@@ -414,23 +363,16 @@ export default function ShippingSection({
     : view === 'shipments'
       ? 'Shipments'
       : 'Schedule Pickups'
-  const subtitle = view === 'create'
-    ? 'Choose Parcel or LTL before entering shipment facts'
-    : view === 'shipments'
-      ? 'View planned and carrier-confirmed shipping records by transport mode'
-      : 'Pickup workflows remain separated by transport mode and carrier authority'
-
   return (
     <Box data-testid="shipping-section" sx={{ height: '100%', display: 'flex', flexDirection: 'column', minWidth: 0, overflow: 'hidden' }}>
       <Box sx={{ px: { xs: 2, md: 3 }, pt: { xs: 2, md: 2.5 }, borderBottom: '1px solid rgba(255,255,255,0.07)', flexShrink: 0 }}>
         <Stack direction="row" justifyContent="space-between" gap={2} alignItems="flex-start">
           <Box>
             <Typography variant="h5" fontWeight={750}>{title}</Typography>
-            <Typography variant="body2" color="text.secondary">{subtitle}</Typography>
           </Box>
           <Tooltip title="Refresh Shipping">
             <span>
-              <IconButton aria-label="Refresh shipping" disabled={loading} onClick={() => { void loadWorkspace() }}>
+              <IconButton sx={iconActionSx} aria-label="Refresh shipping" disabled={loading} onClick={() => { void loadWorkspace() }}>
                 <RefreshRounded />
               </IconButton>
             </span>
@@ -460,40 +402,29 @@ export default function ShippingSection({
             <Box sx={{ py: 8, display: 'grid', placeItems: 'center' }}><CircularProgress size={28} /></Box>
           ) : view === 'create' ? (
             mode === 'parcel' ? (
-              <Paper variant="outlined" sx={{ p: { xs: 2, md: 3 } }}>
-                <Stack spacing={2} alignItems="flex-start">
-                  <Chip label="Parcel workflow" color="info" variant="outlined" />
-                  <Box>
-                    <Typography variant="h6" fontWeight={750}>Create parcel shipment</Typography>
-                    <Typography color="text.secondary" sx={{ mt: 0.5 }}>
-                      Enter loose cartons or poly bags, compare direct UPS and FedEx rates,
-                      and create a planned Operations order. Postage is purchased only in the
-                      later whole-shipment execution step.
-                    </Typography>
-                  </Box>
-                  {!workspace?.capabilities.canCreate && (
-                    <Alert severity="warning">
-                      Operations management and warehouse execution permission are required.
-                    </Alert>
-                  )}
-                  <Button
-                    data-testid="create-parcel-shipment"
-                    variant="contained"
-                    startIcon={<AddCircleOutlineRounded />}
-                    disabled={!workspace?.capabilities.canCreate}
-                    onClick={() => setParcelDialogOpen(true)}
-                  >
-                    Create parcel shipment
-                  </Button>
-                </Stack>
-              </Paper>
+              <Stack spacing={1.25} alignItems="flex-start">
+                {!workspace?.capabilities.canCreate && (
+                  <Alert severity="warning">
+                    Operations management and warehouse execution permission are required.
+                  </Alert>
+                )}
+                <Button
+                  data-testid="create-parcel-shipment"
+                  variant="contained"
+                  size="small"
+                  startIcon={<AddCircleOutlineRounded />}
+                  disabled={!workspace?.capabilities.canCreate}
+                  onClick={() => setParcelDialogOpen(true)}
+                  sx={{ minHeight: { xs: 44, sm: 40 } }}
+                >
+                  Create parcel shipment
+                </Button>
+              </Stack>
             ) : (
               <Stack spacing={2}>
                 <Alert severity="warning">
                   <Typography fontWeight={750}>LTL preparation only</Typography>
-                  Cartons must be assigned to pallet handling units. You can calculate and attest
-                  density-class evidence now, but LTL carrier rates, bill of lading/tender, and
-                  pickup scheduling are not connected to Create Shipment yet.
+                  Rating, tender, and pickup are not connected yet.
                 </Alert>
                 {workspace?.capabilities.canCreate ? (
                   <LtlFreightClassAssessmentPanel />
@@ -510,11 +441,6 @@ export default function ShippingSection({
                 <Stack direction="row" justifyContent="space-between" gap={1} alignItems="center">
                   <Box>
                     <Typography fontWeight={750}>{mode === 'parcel' ? 'Parcel' : 'LTL'} shipments</Typography>
-                    <Typography variant="body2" color="text.secondary">
-                      {mode === 'parcel'
-                        ? 'Planned one-off records are labeled separately from carrier-confirmed shipments.'
-                        : 'Only successful freight tenders are treated as LTL shipments.'}
-                    </Typography>
                   </Box>
                   <Chip label={`${records.length} records`} variant="outlined" />
                 </Stack>
@@ -534,11 +460,6 @@ export default function ShippingSection({
                         : 'LTL pickup will be scheduled only with the exact rated pallet plan and tender.')}
                   </Typography>
                 </Box>
-                <Alert severity="info">
-                  {mode === 'parcel'
-                    ? 'Worldwide Express parcel pickup must be scheduled against the exact packed shipment and selected offer before integrated tender.'
-                    : 'LTL pickup belongs with the selected provider and exact freight tender; it is not a free-standing calendar action.'}
-                </Alert>
                 <Button disabled variant="contained" startIcon={<EventAvailableRounded />}>
                   Schedule {mode === 'parcel' ? 'Parcel' : 'LTL'} pickup
                 </Button>

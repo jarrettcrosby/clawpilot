@@ -108,7 +108,9 @@ assert.deepEqual(
   Object.keys(foundation).sort(),
   [
     'CARRIER_WHOLE_SHIPMENT_RATE_ENDPOINTS',
+    'FEDEX_WHOLE_SHIPMENT_PACKAGING_TYPES',
     'MAX_CARRIER_WHOLE_SHIPMENT_RATE_PACKAGES',
+    'UPS_WHOLE_SHIPMENT_PACKAGING_TYPES',
     'carrierWholeShipmentRateAddressFingerprints',
     'carrierWholeShipmentRateEndpoint',
     'parseCarrierWholeShipmentRateResponse',
@@ -119,7 +121,9 @@ assert.deepEqual(
 )
 
 const {
+  FEDEX_WHOLE_SHIPMENT_PACKAGING_TYPES,
   MAX_CARRIER_WHOLE_SHIPMENT_RATE_PACKAGES,
+  UPS_WHOLE_SHIPMENT_PACKAGING_TYPES,
   carrierWholeShipmentRateAddressFingerprints,
   carrierWholeShipmentRateEndpoint,
   parseCarrierWholeShipmentRateResponse,
@@ -128,6 +132,32 @@ const {
 } = foundation
 
 assert.equal(MAX_CARRIER_WHOLE_SHIPMENT_RATE_PACKAGES, 50)
+assert.deepEqual(plain(UPS_WHOLE_SHIPMENT_PACKAGING_TYPES), {
+  '01': 'Letter',
+  '02': 'Customer supplied package',
+  '03': 'Tube',
+  '04': 'PAK',
+  '21': 'Express box',
+  '24': '25KG box',
+  '25': '10KG box',
+  '2a': 'Small express box',
+  '2b': 'Medium express box',
+  '2c': 'Large express box',
+})
+assert.deepEqual(plain(FEDEX_WHOLE_SHIPMENT_PACKAGING_TYPES), {
+  YOUR_PACKAGING: 'Your packaging',
+  FEDEX_ENVELOPE: 'Envelope',
+  FEDEX_BOX: 'Box',
+  FEDEX_EXTRA_SMALL_BOX: 'Extra small box',
+  FEDEX_SMALL_BOX: 'Small box',
+  FEDEX_MEDIUM_BOX: 'Medium box',
+  FEDEX_LARGE_BOX: 'Large box',
+  FEDEX_EXTRA_LARGE_BOX: 'Extra large box',
+  FEDEX_10KG_BOX: '10KG box',
+  FEDEX_25KG_BOX: '25KG box',
+  FEDEX_PAK: 'PAK',
+  FEDEX_TUBE: 'Tube',
+})
 assert.equal(
   carrierWholeShipmentRateEndpoint('ups_rest', 'sandbox'),
   'https://wwwcie.ups.com/api/rating/v2409/Shop',
@@ -187,6 +217,7 @@ const base = {
   parcels: [
     {
       description: 'AG12V2 case pack',
+      packageCode: '02',
       length: 11,
       width: 9,
       height: 7,
@@ -196,6 +227,7 @@ const base = {
     },
     {
       description: '20lb bulk case',
+      packageCode: '02',
       length: 17,
       width: 11,
       height: 7,
@@ -338,6 +370,7 @@ assert.equal(hashVariants[0].redactedRequest.environment, 'sandbox')
 
 const fedexInput = clone(base)
 fedexInput.binding.provider = 'fedex_rest'
+for (const parcel of fedexInput.parcels) parcel.packageCode = 'YOUR_PACKAGING'
 fedexInput.fedexPickupType = 'USE_SCHEDULED_PICKUP'
 const fedexProduction = prepareCarrierWholeShipmentRateRequest(fedexInput)
 const boundFedexSeal = sealPreparedCarrierWholeShipmentRateRequest(
@@ -418,6 +451,9 @@ assert.equal(
 
 const fedexThirdPartyInput = clone(upsThirdPartyInput)
 fedexThirdPartyInput.binding.provider = 'fedex_rest'
+for (const parcel of fedexThirdPartyInput.parcels) {
+  parcel.packageCode = 'YOUR_PACKAGING'
+}
 fedexThirdPartyInput.fedexPickupType = 'CONTACT_FEDEX_TO_SCHEDULE'
 const fedexThirdParty = prepareCarrierWholeShipmentRateRequest(
   fedexThirdPartyInput,
@@ -609,6 +645,9 @@ assert.throws(
 
 const falselyClaimedFedexAccount = clone(falselyClaimedAccount)
 falselyClaimedFedexAccount.binding.provider = 'fedex_rest'
+for (const parcel of falselyClaimedFedexAccount.parcels) {
+  parcel.packageCode = 'YOUR_PACKAGING'
+}
 falselyClaimedFedexAccount.fedexPickupType = 'USE_SCHEDULED_PICKUP'
 assert.throws(
   () => sealPreparedCarrierWholeShipmentRateRequest(

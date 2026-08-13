@@ -4,6 +4,10 @@ import {
   requestCarrierAccessToken,
   type CarrierRuntimeCredential,
 } from '@/lib/integrations/carrierCredentialClient'
+import {
+  FEDEX_WHOLE_SHIPMENT_PACKAGING_TYPES,
+  UPS_WHOLE_SHIPMENT_PACKAGING_TYPES,
+} from '@/lib/integrations/carrierWholeShipmentRateFoundation'
 
 export type CarrierSandboxParty = {
   name: string
@@ -32,6 +36,10 @@ export type CarrierSandboxRateDestination = {
 
 export type CarrierSandboxParcel = {
   description: string
+  /** Exact selected package code when the caller has carrier/package
+   * authority. Legacy provider-neutral callers may omit it and the request
+   * builder applies the carrier's customer-supplied default. */
+  packageCode?: string | null
   length: number
   width: number
   height: number
@@ -42,6 +50,7 @@ export type CarrierSandboxParcel = {
 
 export type CarrierSandboxParcelRequest = {
   description: string
+  packageCode?: string | null
   exteriorInches: {
     length: number
     width: number
@@ -110,6 +119,7 @@ export const CARRIER_SANDBOX_RATE_FIXTURE: LegacyCarrierSandboxRateFixture = {
   },
   parcel: {
     description: 'Test Product',
+    packageCode: null,
     length: 12,
     width: 10,
     height: 6,
@@ -307,6 +317,7 @@ const PARCEL_FIELDS = new Set([
   'exteriorInches',
   'grossPounds',
 ])
+const PARCEL_WITH_CODE_FIELDS = new Set([...PARCEL_FIELDS, 'packageCode'])
 
 const EXTERIOR_INCH_FIELDS = new Set([
   'length',
@@ -470,7 +481,14 @@ function normalizeUsRegion(value: unknown) {
 export function normalizeCarrierSandboxParcel(
   value: unknown,
 ): CarrierSandboxParcel {
-  const input = exactObject(value, PARCEL_FIELDS, 'parcel')
+  const source = value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+  const input = exactObject(
+    value,
+    Object.hasOwn(source, 'packageCode') ? PARCEL_WITH_CODE_FIELDS : PARCEL_FIELDS,
+    'parcel',
+  )
   const exterior = exactObject(
     input.exteriorInches,
     EXTERIOR_INCH_FIELDS,
@@ -478,6 +496,9 @@ export function normalizeCarrierSandboxParcel(
   )
   return {
     description: partyText(input.description, 'parcel description', 120),
+    packageCode: input.packageCode === undefined || input.packageCode === null
+      ? null
+      : partyText(input.packageCode, 'parcel package code', 32),
     length: boundedParcelDecimal(
       exterior.length,
       'parcel exterior length in inches',
@@ -761,10 +782,28 @@ function providerError(status: number) {
   )
 }
 
+function carrierPackageCode(
+  provider: 'ups_rest' | 'fedex_rest',
+  value: string | null | undefined,
+) {
+  const code = value || (provider === 'ups_rest' ? '02' : 'YOUR_PACKAGING')
+  const name = provider === 'ups_rest'
+    ? (UPS_WHOLE_SHIPMENT_PACKAGING_TYPES as Record<string, string>)[code]
+    : (FEDEX_WHOLE_SHIPMENT_PACKAGING_TYPES as Record<string, string>)[code]
+  if (!name) throw new Error('Carrier package type is not supported')
+  return { code, name }
+}
+
 function fedexRequest(
   accountNumber: string,
   fixture: CarrierSandboxShipmentRateFixture,
 ) {
+  const packageCodes = fixture.parcels.map((parcel) => (
+    carrierPackageCode('fedex_rest', parcel.packageCode).code
+  ))
+  if (new Set(packageCodes).size !== 1) {
+    throw new Error('FedEx whole-shipment rating requires one package type for every parcel')
+  }
   return {
     accountNumber: { value: accountNumber },
     rateRequestControlParameters: { returnTransitTimes: true },
@@ -804,7 +843,7 @@ function fedexRequest(
       } },
       pickupType: 'DROPOFF_AT_FEDEX_LOCATION',
       rateRequestType: ['ACCOUNT', 'LIST'],
-      packagingType: 'YOUR_PACKAGING',
+      packagingType: packageCodes[0],
       totalPackageCount: fixture.parcels.length,
       requestedPackageLineItems: fixture.parcels.map((parcel, index) => ({
         sequenceNumber: index + 1,
@@ -871,8 +910,10 @@ function upsRequest(
           ShipmentCharge: [{ Type: '01', BillShipper: { AccountNumber: accountNumber } }],
         },
         NumOfPieces: String(fixture.parcels.length),
-        Package: fixture.parcels.map((parcel) => ({
-          PackagingType: { Code: '02', Description: 'Customer supplied package' },
+        Package: fixture.parcels.map((parcel) => {
+          const packaging = carrierPackageCode('ups_rest', parcel.packageCode)
+          return ({
+          PackagingType: { Code: packaging.code, Description: packaging.name },
           Description: parcel.description,
           Dimensions: {
             UnitOfMeasurement: { Code: parcel.dimensionUnit },
@@ -882,7 +923,7 @@ function upsRequest(
             UnitOfMeasurement: { Code: 'LBS' },
             Weight: String(parcel.weight),
           },
-        })),
+        })}),
         ShipmentRatingOptions: { NegotiatedRatesIndicator: '' },
       },
     },

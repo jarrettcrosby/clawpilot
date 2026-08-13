@@ -352,10 +352,10 @@ test('terminal Shopify confirmation conflicts require manager action and read-on
   assert.doesNotMatch(phone, /try\? await cache\.loadOutbox/)
   assert.match(phone, /func protectUnreadablePendingConfirmation[\s\S]*hasPendingConfirmation = true/)
   assert.match(phone, /resumeDurableConfirmationIfNeeded\(\)[\s\S]*recheckPendingConfirmation\(pending\)[\s\S]*Prior confirmation remains pending/)
-  assert.match(phone, /func verifyCode\(\)[\s\S]*sessionProfile = try await api\.fetchSessionProfile\(\)[\s\S]*isRestoringSession = true[\s\S]*isAuthenticated = true[\s\S]*resumeDurableConfirmationIfNeeded\(\)/)
-  assert.match(phone, /func signInWithGoogle\(\)[\s\S]*sessionProfile = try await api\.fetchSessionProfile\(\)[\s\S]*isRestoringSession = true[\s\S]*isAuthenticated = true[\s\S]*resumeDurableConfirmationIfNeeded\(\)/)
+  assert.match(phone, /func verifyCode\(\)[\s\S]*let restoredProfile = try await api\.fetchSessionProfile\(\)[\s\S]*isRestoringSession = true[\s\S]*isAuthenticated = true[\s\S]*recoverWorkspaceTransitionIfNeeded[\s\S]*resumeDurableConfirmationIfNeeded\(\)/)
+  assert.match(phone, /func signInWithGoogle\(\)[\s\S]*let restoredProfile = try await api\.fetchSessionProfile\(\)[\s\S]*isRestoringSession = true[\s\S]*isAuthenticated = true[\s\S]*recoverWorkspaceTransitionIfNeeded[\s\S]*resumeDurableConfirmationIfNeeded\(\)/)
   assert.match(phone, /var canSwitchWorkspace:[\s\S]*!isRestoringSession[\s\S]*!isRecheckingPendingConfirmation[\s\S]*!isConfirmingOrder[\s\S]*!isRequestingPickHandoff[\s\S]*!hasPendingConfirmation/)
-  assert.match(phone, /func retryPendingConfirmation\(\) async \{[\s\S]*guard !isConfirmingOrder else \{ return \}[\s\S]*isConfirmingOrder = true[\s\S]*finishConfirmedOrder\(pending\)/)
+  assert.match(phone, /func retryPendingConfirmation\(\) async \{[\s\S]*guard !isConfirmingOrder,[\s\S]*!hasPendingWorkspaceTransition else \{ return \}[\s\S]*isConfirmingOrder = true[\s\S]*finishConfirmedOrder\(pending\)/)
   assert.match(dashboard, /Manager reconciliation required/)
   assert.match(dashboard, /Refresh after manager reconciliation/)
   assert.match(dashboard, /does not change Shopify or repeat a provider action/)
@@ -493,11 +493,13 @@ test('iPhone picking UI supports a dismissible one-time-code flow and branded ic
   assert.match(dashboard, /\.scrollDismissesKeyboard\(\.interactively\)/)
 })
 
-test('Watch companion presents safe pick context and routes commands through iPhone', () => {
+test('Watch companion keeps local audio unless exact enhanced Meta playback starts', () => {
   const project = read('../clients/apple/project.yml')
   const watch = read('../clients/apple/Apps/Watch/ClawPilotPickingWatchApp.swift')
   const bridge = read('../clients/apple/Apps/iPhone/PhoneWatchBridge.swift')
   const app = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+  const voice = read('../clients/apple/Apps/iPhone/VoiceConfirmationController.swift')
+  const models = read('../clients/apple/Sources/ClawPilotPickingCore/PickingModels.swift')
   assert.match(project, /ClawPilotPickingWatch:[\s\S]*ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon/)
   assert.match(watch, /productImage\(model\.productImage, isExpected:/)
   assert.match(watch, /CGImageSourceCreateThumbnailAtIndex/)
@@ -517,17 +519,39 @@ test('Watch companion presents safe pick context and routes commands through iPh
   assert.match(app, /private func handleWatchCommand/)
   assert.match(
     app,
-    /case \.readInstruction:[\s\S]*?guard currentTask != nil \|\| readyToConfirm[\s\S]*?readInstruction\(\)/,
+    /case \.readInstruction:[\s\S]*?await refreshMetaStatus\(\)[\s\S]*?guard metaConnectedDeviceCount == 1[\s\S]*?speakEnhancedThroughBluetoothAndWait/,
   )
   assert.doesNotMatch(
     app,
     /case \.readInstruction:[\s\S]*?readInstruction\(forceSystemVoice: true\)/,
   )
-  assert.match(app, /readInstructionOnPhone: metaConnectedDeviceCount == 1/)
+  assert.match(app, /readInstructionOnPhone: WatchInstructionPhonePlaybackPolicy\.isEligible/)
+  assert.match(models, /metaConnectedDeviceCount == 1 && enhancedVoiceReady/)
   assert.match(watch, /WatchInstructionPlaybackTarget\.resolve/)
+  assert.match(watch, /playInstructionLocally\(fallbackReason: result\.message\)/)
   assert.match(project, /UIBackgroundModes:[\s\S]*?- audio/)
-  assert.match(app, /connected Meta glasses audio route/)
+  assert.match(voice, /beginBackgroundTask\(withName:/)
+  assert.match(voice, /guard voicePackState == \.ready/)
+  assert.match(voice, /case \.bluetoothA2DP, \.bluetoothHFP, \.bluetoothLE/)
+  assert.match(voice, /guard let startedOutput = session\.currentRoute\.outputs/)
+  assert.doesNotMatch(app, /Instruction requested on the connected Meta glasses audio route/)
   assert.doesNotMatch(watch, /PickingAPIClient|ConfirmPicksCommand/)
+})
+
+test('Watch instruction falls back locally when iPhone reachability drops before send', () => {
+  const watch = read('../clients/apple/Apps/Watch/ClawPilotPickingWatchApp.swift')
+  assert.match(
+    watch,
+    /guard let session,[\s\S]*?session\.isReachable else \{[\s\S]*?if command\.action == \.readInstruction \{[\s\S]*?playInstructionLocally\(fallbackReason: message\)[\s\S]*?return[\s\S]*?\}[\s\S]*?actionStatus = "Open ClawPilot on the paired iPhone, then try again\."/,
+  )
+})
+
+test('Watch instruction falls back locally after the paired iPhone command times out', () => {
+  const watch = read('../clients/apple/Apps/Watch/ClawPilotPickingWatchApp.swift')
+  assert.match(
+    watch,
+    /private func startCommandTimeout\(for command: WatchPickCommand\)[\s\S]*?case \.readInstruction: \.seconds\(45\)[\s\S]*?if command\.action == \.readInstruction \{[\s\S]*?finishPendingCommand\(succeeded: false, message: message\)[\s\S]*?playInstructionLocally\(fallbackReason: message\)[\s\S]*?return[\s\S]*?\}[\s\S]*?message: "The iPhone action is taking too long\. Keep ClawPilot open and try again\."/,
+  )
 })
 
 test('multi-unit picks require a deliberate popup count on iPhone or Watch', () => {
@@ -779,7 +803,7 @@ test('mobile app gates workflows behind the shared ClawPilot session', () => {
   assert.match(shell, /Wave and assign order/)
 })
 
-test('mobile organization changes reuse the session workspace boundary and clear scoped picks', () => {
+test('mobile organization changes are serialized, journaled, and profile fenced', () => {
   const session = read('app/api/auth/session/route.ts')
   const workspace = read('app/api/auth/workspace/route.ts')
   const app = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
@@ -793,11 +817,18 @@ test('mobile organization changes reuse the session workspace boundary and clear
   assert.match(adapters, /api\/auth\/workspace/)
   assert.match(adapters, /workspaceConfiguration\.httpShouldSetCookies = false/)
   assert.match(adapters, /private func authenticatedData[\s\S]*attachStoredCookies\(to: &request\)[\s\S]*session\.data\(for: request\)/)
-  assert.match(adapters, /let operationGeneration = authenticatedOperationGeneration[\s\S]*operationGeneration == authenticatedOperationGeneration[\s\S]*persistResponseCookies\(response\)/)
-  assert.match(adapters, /public func logout\(\) async throws \{[\s\S]*authenticatedOperationGeneration &\+= 1/)
+  assert.match(adapters, /public struct WorkspaceTransition: Codable, Equatable, Sendable/)
+  assert.match(adapters, /workspace-transition\.json/)
+  assert.match(adapters, /public func saveWorkspaceTransition[\s\S]*loadOutbox\(\)[\s\S]*loadHandoffOutbox\(\)/)
+  assert.match(adapters, /public func clearWorkspaceTransition[\s\S]*loadWorkspaceTransition\(\) == transition/)
+  assert.match(adapters, /public func switchWorkspace[\s\S]*await beginAuthenticatedMutation\(\)[\s\S]*persistResponseCookies\(response\)/)
+  assert.match(adapters, /public func logout\(\) async throws \{[\s\S]*await beginAuthenticatedMutation\(\)[\s\S]*authenticatedData\(for: request\)/)
   assert.match(app, /guard canSwitchWorkspace else/)
+  assert.match(app, /cache\.saveWorkspaceTransition\(transition\)[\s\S]*clearPublishedPickProjection\(\)[\s\S]*api\.switchWorkspace\(to: organizationId\)/)
+  assert.match(app, /recoverWorkspaceTransitionIfNeeded[\s\S]*cache\.clearWorkspaceTransition\(transition\)[\s\S]*hasPendingWorkspaceTransition = false[\s\S]*updateProjection\(\)/)
   assert.match(app, /func logout\(\) async \{[\s\S]*authenticationGeneration &\+= 1[\s\S]*await waitForWorkspaceSwitchToFinish\(\)[\s\S]*try await api\.logout\(\)/)
-  assert.match(app, /func restoreAndRefresh\(\) async \{[\s\S]*clearPublishedPickProjection\(\)[\s\S]*api\.fetchSessionProfile\(\)[\s\S]*picking\.restore\(\)[\s\S]*resumeDurablePickHandoffIfNeeded\(\)[\s\S]*resumeDurableConfirmationIfNeeded\(\)[\s\S]*updateProjection\(\)/)
+  assert.match(app, /func logout\(\) async \{[\s\S]*isAuthenticated = false[\s\S]*sessionProfile = nil[\s\S]*clearPublishedPickProjection\(\)[\s\S]*await waitForWorkspaceSwitchToFinish\(\)/)
+  assert.match(app, /func restoreAndRefresh\(\) async \{[\s\S]*clearPublishedPickProjection\(\)[\s\S]*api\.fetchSessionProfile\(\)[\s\S]*recoverWorkspaceTransitionIfNeeded[\s\S]*picking\.restore\(\)[\s\S]*resumeDurablePickHandoffIfNeeded\(\)[\s\S]*resumeDurableConfirmationIfNeeded\(\)[\s\S]*updateProjection\(\)/)
   assert.match(app, /private func updateProjection\(\) async \{[\s\S]*queueIdentityMatches[\s\S]*authorizedOrganizationId:[\s\S]*authorizedWorkerEmail:/)
   assert.match(app, /try await picking\.clearQueue\(\)/)
   assert.match(pickingSession, /public func clearQueue\(\) async throws/)

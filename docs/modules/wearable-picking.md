@@ -102,6 +102,57 @@ use the existing manager reconciliation and its read-only native recheck. Any
 recorded physical pick, pack, or label evidence fails closed for generic
 handoff and requires manager review.
 
+## Manager picking control
+
+The Operations `Picking` view is a manager-only projection of current released
+pick assignments and bounded completed-pick history. Current cards show the
+exact order row version and assignment fingerprint, picker or mixed assignment,
+ready/picked tasks, required/picked units, current-version scan and count
+evidence, and any open picker-handoff or manager-intervention exception. The
+picker selector contains only active organization members who may both view
+Operations and execute warehouse work (plus organization owners).
+
+`manage-pick-assignment` is the explicit assign, reassign, or unassign command.
+It requires Operations manage and warehouse execute capabilities, a stable
+`Idempotency-Key`, `expectedRowVersion`, `expectedTaskCount`, the exact SHA-256
+`expectedAssignmentFingerprint`, and a retained manager reason. ClawPilot takes
+the order advisory lock and row locks the latest plan, single wave, and full
+task set. The order, plan, and wave must remain released; every task must remain
+ready with zero picked quantity and no pick timestamp. Any current-version scan
+or count evidence, started package, label, label attempt, or shipment fails
+closed. A target picker is revalidated against current organization membership
+and permissions inside the command.
+
+Success changes only `assigned_to`, `assigned_at`, task update timestamps, and
+the order row version. It never clears wearable evidence, picked state, physical
+work, provider state, or reservations. Unassigning also creates an open,
+high-severity `manager_pick_intervention` exception so work cannot disappear
+from manager attention. The domain event, audit event, and command receipt
+retain the prior/new assignment, exact task IDs, plan and wave, old/new row
+versions, reason, related handoff/intervention exceptions, and
+`providerWrites: 0`.
+
+Reassigning after a picker handoff deliberately leaves the handoff exception
+and old-version scan evidence intact. Likewise, assigning work after a manager
+unassign leaves the manager-intervention exception open. A manager must review
+and resolve those exceptions separately before confirmation; assignment is not
+treated as silent approval of prior physical work or provider state.
+
+The native iPhone Manager surface consumes this same read/command contract. It
+shows current assignment, task/unit/scan/count progress, related open
+exceptions, and completed history from only the authoritative latest plan and
+its exact wave. Its in-context sheet requires a manager reason and supplies the
+same exact row-version, task-count, assignment-fingerprint, and stable-key
+fences used by the web view. Explicit “Unassign and flag” remains available;
+it cannot be confused with closing the sheet or leaving the order detail. A
+failure of the pick-management projection is reported as partial manager data
+and does not hide otherwise available legacy order planning/release controls.
+
+Development simulator walkthroughs are local fixtures only. Debug builds accept
+`--walkthrough=pick-management` for the assigned/unassigned/history screen and
+`--walkthrough=pick-intervention` for the popup. The fixture is compiled behind
+`#if DEBUG`, includes no backend credentials, and never sends a manager command.
+
 For a multi-unit task, the iPhone/Watch workflow presents a focused count
 prompt after the product scan. The confirm command supplies paired
 `countEvidenceIdempotencyKey` and `countEvidence` fields. Each immutable entry

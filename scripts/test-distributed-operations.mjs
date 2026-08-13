@@ -3786,15 +3786,49 @@ async function verifyPostgresAcceptance(databaseUrl) {
           '@/lib/auditWriter': auditWriter,
           '@/lib/integrations/commerceOrderRevisionEvidence':
             commerceOrderRevisionEvidence,
+          '@/lib/integrations/commerceCredentialCrypto': {
+            commerceOrderRevisionEvidenceKeyAvailable: () => false,
+            commerceOrderRevisionProtectedContentFingerprint: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not fingerprint protected revision evidence',
+              )
+            },
+            commerceOrderRevisionProtectedSnapshotDigest: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not digest protected revision evidence',
+              )
+            },
+            decryptCommerceOrderRevisionProtectedSnapshot: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not decrypt protected revision evidence',
+              )
+            },
+          },
+          '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs': {
+            resolveCommerceOrderRevisionEvidenceKeyConfig: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not resolve revision evidence keys',
+              )
+            },
+            summarizeCommerceOrderRevisionEvidenceKeyReadiness: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not summarize revision evidence keys',
+              )
+            },
+          },
           '@/lib/integrations/commerceReadRuntime': {
             commerceReadAccountSql: () => "account.status <> 'error'",
             commerceReadRuntimeAvailable: () => true,
           },
+          '@/lib/persistence/config': { isHostedRuntime: () => false },
           '@/lib/persistence/postgres': postgres,
         },
       },
     )
     const domain = loadTypeScriptModule('app_src/lib/operations/domain.ts')
+    const pickManagement = loadTypeScriptModule(
+      'app_src/lib/operations/pickManagement.ts',
+    )
     const adapters = loadTypeScriptModule('app_src/lib/operations/adapters.ts', {
       mocks: { '@/lib/operations/domain': domain },
     })
@@ -3936,6 +3970,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
         '@/lib/operations/canonicalFulfillmentPlanning':
           canonicalFulfillmentPlanning,
         '@/lib/operations/domain': domain,
+        '@/lib/operations/pickManagement': pickManagement,
         '@/lib/operations/packingSlip': packingSlip,
         '@/lib/operations/barcodeLabels': barcodeLabels,
         '@/lib/persistence/cartonizationRateEvidence':

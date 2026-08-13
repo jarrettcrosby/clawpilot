@@ -299,7 +299,7 @@ async function readiness(
        SELECT shipped.id AS order_id,
               bool_and(profile.id IS NOT NULL) AS dimensions_complete
        FROM shipped_orders shipped
-       JOIN operations_order_lines line
+       JOIN operations_current_order_lines line
          ON line.organization_id = $1::uuid
         AND line.order_id = shipped.id
        LEFT JOIN LATERAL (
@@ -321,7 +321,7 @@ async function readiness(
      missing_products AS (
        SELECT count(DISTINCT line.product_id)::bigint AS count
        FROM shipped_orders shipped
-       JOIN operations_order_lines line
+       JOIN operations_current_order_lines line
          ON line.organization_id = $1::uuid
         AND line.order_id = shipped.id
        WHERE NOT EXISTS (

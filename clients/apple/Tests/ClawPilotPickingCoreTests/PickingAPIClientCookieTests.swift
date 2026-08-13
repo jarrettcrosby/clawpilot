@@ -69,13 +69,45 @@ private final class WorkspaceRejectedURLProtocol: URLProtocol, @unchecked Sendab
     override func stopLoading() {}
 }
 
+private actor AsyncTestSignal {
+    private var isSignaled = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isSignaled else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func signal() {
+        isSignaled = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+}
+
 private final class WorkspaceLogoutRaceURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let workspaceRequestStarted = DispatchSemaphore(value: 0)
+    private static let workspaceResponseGate = DispatchSemaphore(value: 0)
+
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
+    static func releaseWorkspaceResponse() {
+        workspaceResponseGate.signal()
+    }
+
+    static func waitUntilWorkspaceRequestStarts() -> Bool {
+        workspaceRequestStarted.wait(timeout: .now() + 2) == .success
+    }
+
     override func startLoading() {
         if request.url?.path == "/api/auth/workspace" {
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.15) { [self] in
+            Self.workspaceRequestStarted.signal()
+            DispatchQueue.global().async { [self] in
+                Self.workspaceResponseGate.wait()
                 let response = HTTPURLResponse(
                     url: request.url!,
                     statusCode: 200,
@@ -91,18 +123,32 @@ private final class WorkspaceLogoutRaceURLProtocol: URLProtocol, @unchecked Send
             }
             return
         }
+        let logoutUsesRotatedCookie = request.url?.path == "/api/auth/logout"
+            && request.value(forHTTPHeaderField: "Cookie")?.contains(
+                "__Host-clawpilot_session=late-workspace-token"
+            ) == true
         let response = HTTPURLResponse(
             url: request.url!,
-            statusCode: 200,
+            statusCode: logoutUsesRotatedCookie ? 200 : 401,
             httpVersion: "HTTP/1.1",
-            headerFields: ["Content-Type": "application/json"]
+            headerFields: [
+                "Content-Type": "application/json",
+                "Set-Cookie": "__Host-clawpilot_session=; Path=/; Secure; HttpOnly; Max-Age=0; SameSite=Lax",
+            ]
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data(#"{"ok":true}"#.utf8))
+        client?.urlProtocol(
+            self,
+            didLoad: Data((logoutUsesRotatedCookie
+                ? #"{"ok":true}"#
+                : #"{"ok":false}"#).utf8)
+        )
         client?.urlProtocolDidFinishLoading(self)
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        Self.workspaceResponseGate.signal()
+    }
 }
 
 private final class AuthenticatedCookieEchoURLProtocol: URLProtocol, @unchecked Sendable {
@@ -383,17 +429,25 @@ func nativeWorkspaceSwitchPreservesAuthorizationReason() async throws {
     }
 }
 
-@Test("logout generation rejects a late workspace cookie")
-func logoutRejectsLateWorkspaceCookie() async throws {
+@Test("logout waits for workspace rotation and revokes the rotated session")
+func logoutSerializesBehindWorkspaceRotation() async throws {
     let origin = try #require(URL(string: "https://native-workspace-logout-race.test"))
     let storage = HTTPCookieStorage.shared
     storage.cookies(for: origin)?.forEach(storage.deleteCookie)
     defer { storage.cookies(for: origin)?.forEach(storage.deleteCookie) }
+    let original = try #require(HTTPCookie(properties: [
+        .domain: origin.host!,
+        .path: "/",
+        .name: "__Host-clawpilot_session",
+        .value: "original-session-token",
+        .secure: "TRUE",
+    ]))
+    storage.setCookie(original)
 
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [WorkspaceLogoutRaceURLProtocol.self]
     configuration.httpCookieStorage = storage
-    configuration.httpShouldSetCookies = false
+    configuration.httpShouldSetCookies = true
     let client = try PickingAPIClient(
         origin: origin,
         session: URLSession(configuration: configuration)
@@ -404,14 +458,24 @@ func logoutRejectsLateWorkspaceCookie() async throws {
             to: "22222222-2222-4222-8222-222222222222"
         )
     }
-    try await Task.sleep(for: .milliseconds(25))
-    try await client.logout()
-    await #expect(throws: PickingAPIError.sessionSuperseded) {
-        try await switching.value
+    #expect(WorkspaceLogoutRaceURLProtocol.waitUntilWorkspaceRequestStarts())
+    let logoutAttempted = AsyncTestSignal()
+    let loggingOut = Task {
+        await logoutAttempted.signal()
+        try await client.logout()
     }
+    await logoutAttempted.wait()
+    WorkspaceLogoutRaceURLProtocol.releaseWorkspaceResponse()
+    try await switching.value
+    try await loggingOut.value
+    // The protocol returns 401 unless logout carries the rotated cookie, so
+    // successful completion is the server-revocation assertion. A custom
+    // URLProtocol does not reliably apply a deletion Set-Cookie to shared
+    // storage; the phone logout flow clears that storage explicitly.
     #expect(storage.cookies(for: origin)?.contains(where: {
         $0.name == "__Host-clawpilot_session"
-    }) != true)
+            && $0.value == "late-workspace-token"
+    }) == true)
 }
 
 @Test("ordinary authenticated requests still send the stored session cookie")

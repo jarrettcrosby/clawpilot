@@ -43,6 +43,7 @@ import {
 import TabScrollButton, { type TabScrollButtonProps } from '@mui/material/TabScrollButton'
 import AddRounded from '@mui/icons-material/AddRounded'
 import CheckCircleRounded from '@mui/icons-material/CheckCircleRounded'
+import AssignmentIndRounded from '@mui/icons-material/AssignmentIndRounded'
 import CancelRounded from '@mui/icons-material/CancelRounded'
 import CloseRounded from '@mui/icons-material/CloseRounded'
 import HelpOutlineRounded from '@mui/icons-material/HelpOutlineRounded'
@@ -91,9 +92,11 @@ import { ONE_OFF_LIVE_POSTAGE_CONFIRMATION } from '@/lib/operations/oneOffShipme
 import GlCodingPanel from '@/components/operations/GlCodingPanel'
 import CommerceImportsPanel from '@/components/operations/CommerceImportsPanel'
 import PackagingMaterialsPanel from '@/components/operations/PackagingMaterialsPanel'
+import PickManagementPanel from '@/components/operations/PickManagementPanel'
 import PrinterConfigurationPanel from '@/components/operations/PrinterConfigurationPanel'
 import PackRateReplayPanel from '@/components/operations/PackRateReplayPanel'
 import CartonizationRateEvidencePanel from '@/components/operations/CartonizationRateEvidencePanel'
+import CommerceOrderRevisionManagerPanel from '@/components/operations/CommerceOrderRevisionManagerPanel'
 import ReceivingPanel from '@/components/operations/ReceivingPanel'
 import WarehouseSetupPanel from '@/components/operations/WarehouseSetupPanel'
 import OneOffShipmentDialog from '@/components/operations/OneOffShipmentDialog'
@@ -129,6 +132,7 @@ type SandboxCommerceE2eAuthorizationResult = {
 type ProviderOrderCancellationCommand = {
   orderGlobalId: string
   observationGlobalId: string
+  readGlobalId: string
   expectedSourceHash: string
   expectedRevisionHash: string
   expectedRowVersion: number
@@ -139,6 +143,7 @@ type ProviderOrderCancellationResult = {
   dispositionGlobalId: string
   orderGlobalId: string
   observationGlobalId: string
+  readGlobalId: string | null
   status: 'cancelled'
   previousRowVersion: number
   newRowVersion: number
@@ -197,6 +202,7 @@ type OneOffExecutionPayload = {
 
 export type OperationsView =
   | 'orders'
+  | 'picking'
   | 'exceptions'
   | 'imports'
   | 'receiving'
@@ -231,12 +237,36 @@ const EXCEPTION_STATUSES: Array<{ value: '' | OperationsExceptionStatus; label: 
   { value: 'dismissed', label: 'Dismissed' },
 ]
 
-const ACTIVATION_OPTIONS: Array<{ value: OperationsActivationState; label: string }> = [
-  { value: 'disabled', label: 'Disabled' },
-  { value: 'shadow', label: 'Shadow' },
-  { value: 'read_only', label: 'Read only' },
-  { value: 'active', label: 'Active' },
-  { value: 'frozen', label: 'Frozen' },
+const ACTIVATION_OPTIONS: Array<{
+  value: OperationsActivationState
+  label: string
+  description: string
+}> = [
+  {
+    value: 'disabled',
+    label: 'Disabled',
+    description: 'Stops Operations; only health and migration checks remain.',
+  },
+  {
+    value: 'shadow',
+    label: 'Shadow',
+    description: 'Validates workflows and stores read evidence with no provider writes.',
+  },
+  {
+    value: 'read_only',
+    label: 'Read only',
+    description: 'Allows viewing, health checks, reconciliation, and evidence export only.',
+  },
+  {
+    value: 'active',
+    label: 'Active',
+    description: 'Allows approved commands and provider actions. Select Shadow first.',
+  },
+  {
+    value: 'frozen',
+    label: 'Frozen',
+    description: 'Keeps evidence viewable while stopping new consequential work.',
+  },
 ]
 
 const CARTONIZATION_EVIDENCE_GLOBAL_ID = /^gcte(?:[0-9]{7}|[0-9a-v]{12})$/
@@ -897,6 +927,9 @@ function OrderDetailDrawer({
   onRefreshOneOffPackedRates,
   onReviewOneOffGroupPurchase,
   onVoidOneOffGroup,
+  onOrderRevisionBusyChange,
+  onOrderRevisionChanged,
+  onReviewOrderRevisionRecovery,
   generatingPackingSlipPackageId,
   printingPackingSlipArtifactId,
 }: {
@@ -933,6 +966,9 @@ function OrderDetailDrawer({
   onRefreshOneOffPackedRates: () => void
   onReviewOneOffGroupPurchase: () => void
   onVoidOneOffGroup: () => void
+  onOrderRevisionBusyChange: (busy: boolean) => void
+  onOrderRevisionChanged: () => void | Promise<void>
+  onReviewOrderRevisionRecovery: (exceptionGlobalId: string) => void | Promise<void>
   generatingPackingSlipPackageId: string | null
   printingPackingSlipArtifactId: string | null
 }) {
@@ -1098,6 +1134,23 @@ function OrderDetailDrawer({
                 {order.shipTo.name} · {order.shipTo.line1}{order.shipTo.line2 ? `, ${order.shipTo.line2}` : ''}, {order.shipTo.city}, {order.shipTo.region} {order.shipTo.postalCode}
               </Typography>
             </DetailSection>
+
+            {(order.sourceProvider === 'shopify' || order.sourceProvider === 'faire') && (
+              <DetailSection title="Sales-channel revision">
+                <CommerceOrderRevisionManagerPanel
+                  orderGlobalId={order.globalId}
+                  provider={order.sourceProvider}
+                  orderRowVersion={order.rowVersion}
+                  orderStatus={order.status}
+                  canManage={canManage}
+                  canExecute={canExecute}
+                  disabled={busy}
+                  onBusyChange={onOrderRevisionBusyChange}
+                  onOrderChanged={onOrderRevisionChanged}
+                  onReviewRecovery={onReviewOrderRevisionRecovery}
+                />
+              </DetailSection>
+            )}
 
             <DetailSection title="Financial plan">
               <Box sx={{ display: 'flex', flexWrap: 'wrap', columnGap: 2, rowGap: 0.5 }}>
@@ -2016,6 +2069,7 @@ function ExceptionDetailDrawer({
     && exception.details.materialState === 'provider_cancelled'
     && typeof exception.orderGlobalId === 'string'
     && typeof exception.details.observationGlobalId === 'string'
+    && typeof exception.details.readGlobalId === 'string'
     && typeof exception.details.sourceHash === 'string'
     && typeof exception.details.revisionHash === 'string'
     && Number.isSafeInteger(observedRowVersion)
@@ -2023,6 +2077,7 @@ function ExceptionDetailDrawer({
   ) ? {
       orderGlobalId: exception.orderGlobalId,
       observationGlobalId: exception.details.observationGlobalId,
+      readGlobalId: exception.details.readGlobalId,
       expectedSourceHash: exception.details.sourceHash,
       expectedRevisionHash: exception.details.revisionHash,
       expectedRowVersion: observedRowVersion,
@@ -2216,6 +2271,7 @@ export default function OperationsSection({
   const [selectedExceptionGlobalId, setSelectedExceptionGlobalId] = useState<string | null>(null)
   const [exceptionDrawerOpen, setExceptionDrawerOpen] = useState(false)
   const [updatingException, setUpdatingException] = useState(false)
+  const [orderRevisionBusy, setOrderRevisionBusy] = useState(false)
   const [guideOpen, setGuideOpen] = useState(false)
   const [oneOffShipmentOpen, setOneOffShipmentOpen] = useState(false)
   const [updatingActivation, setUpdatingActivation] = useState(false)
@@ -2449,6 +2505,57 @@ export default function OperationsSection({
     setExceptionDrawerOpen(true)
   }
 
+  const reviewOrderRevisionRecovery = async (exceptionGlobalId: string) => {
+    const orderGlobalId = selectedGlobalId
+    const matchesExactRecovery = (item: OperationsExceptionListItem) => (
+      item.globalId === exceptionGlobalId
+      && item.orderGlobalId === orderGlobalId
+      && item.exceptionType === 'commerce_order_revision_required'
+      && (item.status === 'open' || item.status === 'acknowledged')
+    )
+    const loadedException = workspace?.exceptions.find(matchesExactRecovery)
+    if (loadedException) {
+      chooseException(loadedException)
+      return
+    }
+    if (!orderGlobalId) return
+
+    setOrderRevisionBusy(true)
+    setError('')
+    try {
+      const params = new URLSearchParams({
+        search: exceptionGlobalId,
+        order: orderGlobalId,
+      })
+      const response = await fetch(
+        `/api/operations?${params.toString()}`,
+        { cache: 'no-store' },
+      )
+      const payload = await response.json().catch(() => ({})) as OperationsPayload
+      if (!response.ok || !payload.operations) {
+        throw new Error(payload.error || 'The exact recovery case is unavailable')
+      }
+      const exactException = payload.operations.exceptions.find(matchesExactRecovery)
+      if (!exactException) {
+        throw new Error('The exact recovery case is no longer open for this order')
+      }
+      setWorkspace((current) => current ? {
+        ...current,
+        exceptions: [
+          exactException,
+          ...current.exceptions.filter((item) => item.globalId !== exceptionGlobalId),
+        ],
+      } : payload.operations || null)
+      chooseException(exactException)
+    } catch (caught) {
+      setError(caught instanceof Error
+        ? caught.message
+        : 'The exact recovery case is unavailable')
+    } finally {
+      setOrderRevisionBusy(false)
+    }
+  }
+
   const closeExceptionDrawer = () => {
     setExceptionDrawerOpen(false)
     setSelectedExceptionGlobalId(null)
@@ -2459,6 +2566,15 @@ export default function OperationsSection({
     setView('orders')
     setSelectedGlobalId(orderGlobalId)
     setDrawerOpen(true)
+  }
+
+  const openPickingOrder = (orderGlobalId: string) => {
+    setView('orders')
+    setSearch('')
+    setStatus('')
+    setSelectedGlobalId(orderGlobalId)
+    setDrawerOpen(true)
+    window.location.hash = 'operations'
   }
 
   const loadPlanPreparation = async (order: OperationsOrderDetail) => {
@@ -3739,7 +3855,7 @@ export default function OperationsSection({
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Idempotency-Key': `operations-provider-cancel:${command.observationGlobalId}`,
+          'Idempotency-Key': `operations-provider-cancel:${command.readGlobalId}`,
         },
         body: JSON.stringify({
           action: 'accept-provider-order-cancellation',
@@ -4105,6 +4221,8 @@ export default function OperationsSection({
         ? 'Packaging materials'
       : view === 'replays'
         ? 'Pack & rate replay'
+      : view === 'picking'
+        ? 'Picking control'
       : 'Order Workbench'
   const subheading = view === 'carrier-invoices'
     ? 'Import carrier bills and preserve account, shipment-match, and actual-cost evidence'
@@ -4122,6 +4240,8 @@ export default function OperationsSection({
         ? 'Cartons, mailers, warehouse stock, reorder readiness, and optimizer evidence'
       : view === 'replays'
         ? 'Replay historical orders through checkout estimation and fulfillment execution using recorded carrier responses'
+      : view === 'picking'
+        ? 'Current picker assignments, evidence progress, manager interventions, and completed work'
       : `Distributed fulfillment${workspace ? ` · CRM: ${workspace.dataPipeline.name}` : ''}`
 
   return (
@@ -4168,33 +4288,75 @@ export default function OperationsSection({
               </Button>
             )}
             {workspace?.capabilities.canActivate && (
-              <Tooltip title="Controls whether Operations is disabled, validating mock flows, read only, live, or frozen">
-                <TextField
-                  select
-                  size="small"
-                  value={workspace.activation.state}
-                  onChange={(event) => requestActivationChange(
-                    event.target.value as OperationsActivationState,
-                  )}
-                  disabled={updatingActivation}
-                  inputProps={{ 'aria-label': 'Operations activation mode' }}
-                  sx={{ ...controlSx, minWidth: 118 }}
-                >
-                  {ACTIVATION_OPTIONS.map((option) => (
-                    <MenuItem
-                      key={option.value}
-                      value={option.value}
-                      disabled={
-                        option.value === 'active'
-                        && workspace.activation.state !== 'shadow'
-                        && workspace.activation.state !== 'active'
-                      }
-                    >
-                      {option.label}
-                    </MenuItem>
-                  ))}
-                </TextField>
-              </Tooltip>
+              <TextField
+                select
+                size="small"
+                value={workspace.activation.state}
+                onChange={(event) => requestActivationChange(
+                  event.target.value as OperationsActivationState,
+                )}
+                disabled={updatingActivation}
+                inputProps={{ 'aria-label': 'Operations activation mode' }}
+                SelectProps={{
+                  renderValue: (selected) => ACTIVATION_OPTIONS.find(
+                    (option) => option.value === selected,
+                  )?.label || displayStatus(String(selected)),
+                  MenuProps: {
+                    variant: 'menu',
+                    anchorOrigin: { vertical: 'bottom', horizontal: 'right' },
+                    transformOrigin: { vertical: 'top', horizontal: 'right' },
+                    marginThreshold: 12,
+                    disablePortal: false,
+                    PaperProps: {
+                      sx: {
+                        mt: 0.75,
+                        width: 'min(340px, calc(100vw - 24px))',
+                        maxHeight: 'min(360px, calc(100dvh - 24px))',
+                        overflowY: 'auto',
+                        overscrollBehavior: 'contain',
+                      },
+                    },
+                    MenuListProps: {
+                      'aria-label': 'Operations activation statuses',
+                      sx: { p: 0.5 },
+                    },
+                  },
+                }}
+                sx={{ ...controlSx, minWidth: 118 }}
+              >
+                {ACTIVATION_OPTIONS.map((option) => (
+                  <MenuItem
+                    key={option.value}
+                    value={option.value}
+                    disabled={
+                      option.value === 'active'
+                      && workspace.activation.state !== 'shadow'
+                      && workspace.activation.state !== 'active'
+                    }
+                    sx={{
+                      minHeight: 58,
+                      alignItems: 'flex-start',
+                      borderRadius: 1,
+                      px: 1.25,
+                      py: 1,
+                      whiteSpace: 'normal',
+                    }}
+                  >
+                    <Box sx={{ minWidth: 0 }}>
+                      <Typography variant="body2" fontWeight={700}>
+                        {option.label}
+                      </Typography>
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        sx={{ display: 'block', lineHeight: 1.35 }}
+                      >
+                        {option.description}
+                      </Typography>
+                    </Box>
+                  </MenuItem>
+                ))}
+              </TextField>
             )}
             <Tooltip title="Operations guide"><IconButton aria-label="Open operations guide" onClick={() => setGuideOpen(true)}><HelpOutlineRounded /></IconButton></Tooltip>
             {mainWorkspaceView && (
@@ -4281,6 +4443,12 @@ export default function OperationsSection({
             }}
           >
             <Tab value="orders" label={`Orders${workspace ? ` (${workspace.orders.length})` : ''}`} />
+            <Tab
+              value="picking"
+              icon={<AssignmentIndRounded fontSize="small" />}
+              iconPosition="start"
+              label="Picking"
+            />
             <Tab value="exceptions" label={`Exceptions${workspace ? ` (${workspace.summary.exceptions})` : ''}`} />
             <Tab
               value="imports"
@@ -4368,7 +4536,16 @@ export default function OperationsSection({
               WebkitOverflowScrolling: 'touch',
             }}
       >
-        {view === 'imports' ? (
+        {view === 'picking' ? (
+          <PickManagementPanel
+            canManage={Boolean(workspace?.capabilities.canManage)}
+            canExecute={Boolean(
+              workspace?.capabilities.canManage
+              && workspace.capabilities.canExecute
+            )}
+            onOpenOrder={openPickingOrder}
+          />
+        ) : view === 'imports' ? (
           <CommerceImportsPanel />
         ) : view === 'receiving' ? (
           <ReceivingPanel workspace={workspace} onRefresh={() => loadWorkspace()} />
@@ -4541,6 +4718,7 @@ export default function OperationsSection({
           || authorizingSandboxE2e
           || creatingLabel
           || voidingLabel
+          || orderRevisionBusy
           || Boolean(oneOffGroupAction)
           || Boolean(generatingPackingSlipPackageId)
           || Boolean(printingPackingSlipArtifactId)
@@ -4570,6 +4748,9 @@ export default function OperationsSection({
         }}
         onReviewOneOffGroupPurchase={openOneOffGroupPurchase}
         onVoidOneOffGroup={openOneOffGroupVoid}
+        onOrderRevisionBusyChange={setOrderRevisionBusy}
+        onOrderRevisionChanged={() => loadWorkspace(detail?.globalId || selectedGlobalId)}
+        onReviewOrderRevisionRecovery={reviewOrderRevisionRecovery}
         generatingPackingSlipPackageId={generatingPackingSlipPackageId}
         printingPackingSlipArtifactId={printingPackingSlipArtifactId}
       />

@@ -1,6 +1,9 @@
 import crypto from 'node:crypto'
 import { normalizeGlobalId } from '@/lib/globalIds.mjs'
 import { isHostedRuntime } from '@/lib/persistence/config'
+import {
+  resolveCommerceOrderRevisionEvidenceKeyConfig,
+} from '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs'
 
 export type CommerceProvider = 'shopify' | 'faire'
 export type CommerceEnvironment = 'sandbox' | 'production'
@@ -48,6 +51,12 @@ export type EncryptedCommerceValue = {
   ciphertext: Buffer
   iv: Buffer
   tag: Buffer
+}
+
+export type EncryptedCommerceOrderRevisionValue = EncryptedCommerceValue & {
+  keyId: string
+  hash: string
+  encryptionVersion: 1
 }
 
 export type CommerceIntakeContinuationPayload = {
@@ -253,6 +262,40 @@ function encryptionKey() {
     throw new Error('Commerce credential encryption is not configured')
   }
   return crypto.createHash('sha256').update(secret).digest()
+}
+
+const REVISION_KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+
+function evidenceFingerprintKey() {
+  const secret = resolveCommerceOrderRevisionEvidenceKeyConfig({
+    environment: process.env,
+    hosted: isHostedRuntime(),
+  }).getFingerprintKeyMaterial()
+  return crypto.createHash('sha256').update(secret).digest()
+}
+
+function revisionEvidenceKeyRing() {
+  const configuration = resolveCommerceOrderRevisionEvidenceKeyConfig({
+    environment: process.env,
+    hosted: isHostedRuntime(),
+  })
+  const keys = new Map<string, Buffer>()
+  for (const keyId of configuration.keyIds) {
+    const value = configuration.getEncryptionKeyMaterial(keyId)
+    if (!value) throw new Error('Commerce revision evidence key is unavailable')
+    keys.set(keyId, crypto.createHash('sha256').update(value).digest())
+  }
+  return { activeKeyId: configuration.activeKeyId, keys }
+}
+
+export function commerceOrderRevisionEvidenceActiveKeyId() {
+  return revisionEvidenceKeyRing().activeKeyId
+}
+
+export function commerceOrderRevisionEvidenceKeyAvailable(value: unknown) {
+  const keyId = String(value || '').trim()
+  return REVISION_KEY_ID.test(keyId)
+    && revisionEvidenceKeyRing().keys.has(keyId)
 }
 
 function normalizedCheckoutDestinationPart(
@@ -488,6 +531,100 @@ function candidateSnapshotAuthenticatedData(
     `clawpilot:commerce:${organizationId}:${accountGlobalId}:${externalOrderId}:${sourceHash}:${kind}:candidate-snapshot:v1`,
     'utf8',
   )
+}
+
+function canonicalSnapshotJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalSnapshotJson).join(',')}]`
+  }
+  if (value && typeof value === 'object') {
+    const source = value as Record<string, unknown>
+    return `{${Object.keys(source).sort().map((key) => (
+      `${JSON.stringify(key)}:${canonicalSnapshotJson(source[key])}`
+    )).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
+/**
+ * A stable digest of protected provider content. Unlike the ciphertext digest,
+ * this deliberately excludes the whole-order source hash so an unrelated line
+ * edit cannot look like a party or destination edit. The tenant, account,
+ * provider-order identity, and protected-field kind remain cryptographically
+ * bound to the plaintext.
+ */
+export function commerceCandidateSnapshotContentFingerprint(
+  value: Record<string, unknown>,
+  organizationIdValue: unknown,
+  accountGlobalIdValue: unknown,
+  externalOrderIdValue: unknown,
+  kindValue: 'party' | 'ship_to',
+) {
+  const organizationId = normalizeCommerceOrganizationId(organizationIdValue)
+  const accountGlobalId = normalizeCommerceAccountGlobalId(accountGlobalIdValue)
+  const externalOrderId = printable(
+    externalOrderIdValue,
+    'External order identity',
+    1,
+    512,
+  )
+  if (kindValue !== 'party' && kindValue !== 'ship_to') {
+    throw new Error('Commerce candidate snapshot kind is invalid')
+  }
+  const payload = canonicalSnapshotJson(value)
+  if (Buffer.byteLength(payload, 'utf8') < 2 || Buffer.byteLength(payload, 'utf8') > 65_536) {
+    throw new Error('Commerce candidate snapshot must be 2-65536 bytes')
+  }
+  return crypto.createHmac('sha256', encryptionKey())
+    .update('clawpilot:commerce:candidate-snapshot-content:v1\0', 'utf8')
+    .update(organizationId, 'utf8')
+    .update('\0', 'utf8')
+    .update(accountGlobalId, 'utf8')
+    .update('\0', 'utf8')
+    .update(externalOrderId, 'utf8')
+    .update('\0', 'utf8')
+    .update(kindValue, 'utf8')
+    .update('\0', 'utf8')
+    .update(payload, 'utf8')
+    .digest('hex')
+}
+
+/**
+ * Stable order-revision protected-content digest. Its dedicated long-lived
+ * key is intentionally independent from the rotating encryption key ring so
+ * key rotation cannot make unchanged provider content a new revision.
+ */
+export function commerceOrderRevisionProtectedContentFingerprint(
+  value: Record<string, unknown>,
+  organizationIdValue: unknown,
+  accountGlobalIdValue: unknown,
+  externalOrderIdValue: unknown,
+  kindValue: 'party' | 'ship_to',
+) {
+  const organizationId = normalizeCommerceOrganizationId(organizationIdValue)
+  const accountGlobalId = normalizeCommerceAccountGlobalId(accountGlobalIdValue)
+  const externalOrderId = printable(
+    externalOrderIdValue,
+    'External order identity',
+    1,
+    512,
+  )
+  const payload = canonicalSnapshotJson(value)
+  if (Buffer.byteLength(payload, 'utf8') < 2 || Buffer.byteLength(payload, 'utf8') > 65_536) {
+    throw new Error('Commerce order revision snapshot must be 2-65536 bytes')
+  }
+  return crypto.createHmac('sha256', evidenceFingerprintKey())
+    .update('clawpilot:commerce:order-revision-content:v1\0', 'utf8')
+    .update(organizationId, 'utf8')
+    .update('\0', 'utf8')
+    .update(accountGlobalId, 'utf8')
+    .update('\0', 'utf8')
+    .update(externalOrderId, 'utf8')
+    .update('\0', 'utf8')
+    .update(kindValue, 'utf8')
+    .update('\0', 'utf8')
+    .update(payload, 'utf8')
+    .digest('hex')
 }
 
 function intakeContinuationAuthenticatedData(
@@ -845,6 +982,121 @@ export function decryptCommerceCandidateSnapshot(
   } catch {
     throw new Error('Stored commerce candidate snapshot could not be decrypted')
   }
+}
+
+export function encryptCommerceOrderRevisionProtectedSnapshot(
+  value: Record<string, unknown>,
+  organizationId: unknown,
+  accountGlobalId: unknown,
+  externalOrderId: unknown,
+  sourceHash: unknown,
+  kind: 'party' | 'ship_to',
+): EncryptedCommerceOrderRevisionValue {
+  const payload = Buffer.from(JSON.stringify(value), 'utf8')
+  if (payload.byteLength < 2 || payload.byteLength > 65_536) {
+    throw new Error('Commerce order revision snapshot must be 2-65536 bytes')
+  }
+  const { activeKeyId, keys } = revisionEvidenceKeyRing()
+  const key = keys.get(activeKeyId)
+  if (!key) throw new Error('Commerce revision evidence active key is unavailable')
+  const authenticatedData = candidateSnapshotAuthenticatedData(
+    organizationId,
+    accountGlobalId,
+    externalOrderId,
+    sourceHash,
+    kind,
+  )
+  const keyBoundAad = Buffer.concat([
+    authenticatedData,
+    Buffer.from(`\0order-revision-key:${activeKeyId}:v1`, 'utf8'),
+  ])
+  const iv = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+  cipher.setAAD(keyBoundAad)
+  const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()])
+  return {
+    ciphertext,
+    iv,
+    tag: cipher.getAuthTag(),
+    keyId: activeKeyId,
+    hash: crypto.createHmac('sha256', key)
+      .update('clawpilot:commerce:order-revision-digest:v1\0', 'utf8')
+      .update(keyBoundAad)
+      .update(payload)
+      .digest('hex'),
+    encryptionVersion: 1,
+  }
+}
+
+export function decryptCommerceOrderRevisionProtectedSnapshot(
+  fields: EncryptedCommerceValue & { keyId: string },
+  organizationId: unknown,
+  accountGlobalId: unknown,
+  externalOrderId: unknown,
+  sourceHash: unknown,
+  kind: 'party' | 'ship_to',
+): Record<string, unknown> {
+  try {
+    const keyId = String(fields.keyId || '').trim()
+    if (!REVISION_KEY_ID.test(keyId)) throw new Error('invalid key ID')
+    const key = revisionEvidenceKeyRing().keys.get(keyId)
+    if (!key) throw new Error('missing key')
+    const authenticatedData = candidateSnapshotAuthenticatedData(
+      organizationId,
+      accountGlobalId,
+      externalOrderId,
+      sourceHash,
+      kind,
+    )
+    const keyBoundAad = Buffer.concat([
+      authenticatedData,
+      Buffer.from(`\0order-revision-key:${keyId}:v1`, 'utf8'),
+    ])
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, fields.iv)
+    decipher.setAAD(keyBoundAad)
+    decipher.setAuthTag(fields.tag)
+    const value = JSON.parse(Buffer.concat([
+      decipher.update(fields.ciphertext),
+      decipher.final(),
+    ]).toString('utf8'))
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('invalid snapshot')
+    }
+    return value as Record<string, unknown>
+  } catch {
+    throw new Error('Stored commerce order revision snapshot could not be decrypted')
+  }
+}
+
+export function commerceOrderRevisionProtectedSnapshotDigest(
+  value: Record<string, unknown>,
+  keyIdValue: unknown,
+  organizationId: unknown,
+  accountGlobalId: unknown,
+  externalOrderId: unknown,
+  sourceHash: unknown,
+  kind: 'party' | 'ship_to',
+) {
+  const keyId = String(keyIdValue || '').trim()
+  const key = revisionEvidenceKeyRing().keys.get(keyId)
+  if (!key) throw new Error('Commerce revision evidence key is unavailable')
+  const payload = Buffer.from(JSON.stringify(value), 'utf8')
+  const authenticatedData = candidateSnapshotAuthenticatedData(
+    organizationId,
+    accountGlobalId,
+    externalOrderId,
+    sourceHash,
+    kind,
+  )
+  const keyBoundAad = Buffer.concat([
+    authenticatedData,
+    Buffer.from(`\0order-revision-key:${keyId}:v1`, 'utf8'),
+  ])
+  return crypto.createHmac('sha256', key)
+    .update('clawpilot:commerce:order-revision-digest:v1\0', 'utf8')
+    .update(keyBoundAad)
+    .update(payload)
+    .digest('hex')
 }
 
 export function encryptCommerceIntakeReadResult(

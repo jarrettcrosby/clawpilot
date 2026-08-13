@@ -24,6 +24,11 @@ import {
   readCommerceOrderRevisionHealthFromPostgres,
 } from '@/lib/persistence/commerceOrderRevisions'
 import {
+  CommerceOrderRevisionEvidenceKeyConfigError,
+  resolveCommerceOrderRevisionEvidenceKeyConfig,
+  summarizeCommerceOrderRevisionEvidenceKeyReadiness,
+} from '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs'
+import {
   readShopifyInventoryRefreshHealthFromPostgres,
   readShopifyInventoryRefreshWorkerHeartbeatFromPostgres,
 } from '@/lib/persistence/shopifyInventoryRefresh'
@@ -89,6 +94,46 @@ const FAIRE_SCOPE_CURRENT_PROSRC_SHA256 =
   'be9c9d5ce1442cf6c1df2aaffcf1dd075eeb24172fe1f7ec2e6d2002b98bea49'
 const FAIRE_SCOPE_TRIGGER_PROSRC_SHA256 =
   '022f71dfd366bf18bc263d8dcfee07d96e9c4e199f797c25b085403105906a03'
+function commerceRevisionEvidenceConfiguration() {
+  try {
+    const configuration = resolveCommerceOrderRevisionEvidenceKeyConfig({
+      environment: process.env,
+      hosted: isHostedRuntime(),
+    })
+    const readiness = summarizeCommerceOrderRevisionEvidenceKeyReadiness(
+      configuration,
+      { referencedKeyIds: [], unpurgedProtectedReadCount: 0 },
+    )
+    return {
+      status: readiness.ready ? 'ready' : 'invalid',
+      activeKeyId: readiness.activeKeyId,
+      keyCount: readiness.configuredKeyIds.length,
+      reason: readiness.ready ? null : 'key_configuration_invalid',
+    }
+  } catch (error) {
+    const reason = error instanceof CommerceOrderRevisionEvidenceKeyConfigError
+      ? ({
+          COMMERCE_ORDER_REVISION_EVIDENCE_FINGERPRINT_KEY_REQUIRED:
+            'fingerprint_key_missing',
+          COMMERCE_ORDER_REVISION_EVIDENCE_ACTIVE_KEY_ID_REQUIRED:
+            'active_key_id_invalid',
+          COMMERCE_ORDER_REVISION_EVIDENCE_ACTIVE_KEY_ID_INVALID:
+            'active_key_id_invalid',
+          COMMERCE_ORDER_REVISION_EVIDENCE_KEY_RING_REQUIRED:
+            'key_ring_invalid',
+          COMMERCE_ORDER_REVISION_EVIDENCE_KEY_RING_INVALID:
+            'key_ring_invalid',
+          COMMERCE_ORDER_REVISION_EVIDENCE_ACTIVE_KEY_UNAVAILABLE:
+            'active_key_unavailable',
+        } as Record<string, string>)[error.code]
+        || 'key_configuration_invalid'
+      : 'key_configuration_invalid'
+    return {
+      status: 'invalid', activeKeyId: null, keyCount: 0,
+      reason,
+    }
+  }
+}
 
 function resolveLogPath(): { path: string; expectedDevLogPresent: boolean; usedFallback: boolean } {
   const expectedDevLogPresent = fs.existsSync(DEV_LOG_PATH)
@@ -235,6 +280,8 @@ export async function GET() {
     let crm: Record<string, unknown> = { status: 'disabled' }
     let knowledgeWorkers: Array<Record<string, unknown>> = []
     const repositoryRunner = getRepositoryRunnerConfiguration()
+    const commerceRevisionEvidence =
+      commerceRevisionEvidenceConfiguration()
 
     if (cloudProvider === 'railway' && storage !== 'postgres') {
       errors.push('Railway runtime requires Postgres storage.')
@@ -253,6 +300,9 @@ export async function GET() {
     }
     if (String(process.env.AGENT_CREDENTIAL_ENCRYPTION_KEY || '').length < 32) {
       errors.push('Hosted runtime agent credential encryption key is missing or too short.')
+    }
+    if (commerceRevisionEvidence.status !== 'ready') {
+      errors.push('Hosted runtime commerce revision evidence encryption is not configured.')
     }
     if (String(process.env.AGENT_CREDENTIAL_DATABASE_URL || '').length < 16) {
       errors.push('Hosted runtime agent credential database is not configured.')
@@ -492,6 +542,8 @@ export async function GET() {
           operations_faire_inventory_polling_applied: boolean
           suitecrm_product_image_reverse_ingestion_applied: boolean
           operations_commerce_order_revisions_applied: boolean
+          operations_commerce_order_revision_apply_applied: boolean
+          operations_one_off_carrier_selection_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -2387,6 +2439,43 @@ export async function GET() {
                 'operations_commerce_order_revision_dispositions'
               ) IS NOT NULL
                 AS operations_commerce_order_revisions_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0274_operations_commerce_order_revision_apply.sql'
+              )
+              AND to_regclass(
+                'operations_commerce_order_revision_reads'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_order_revision_applications'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_order_revision_application_lines'
+              ) IS NOT NULL
+                AS operations_commerce_order_revision_apply_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0275_operations_one_off_carrier_selection.sql'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'operations_one_off_shipment_quotes'
+                  AND column_name = 'carrier_selection_schema_version'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'operations_one_off_shipment_quotes'
+                  AND column_name = 'required_carrier_selections'
+              )
+                AS operations_one_off_carrier_selection_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -2395,6 +2484,10 @@ export async function GET() {
           `,
         )
         const row = result.rows[0]
+        const canonicalOrderRevisionHealth =
+          row?.operations_commerce_order_revision_apply_applied
+            ? await readCommerceOrderRevisionHealthFromPostgres()
+            : null
         database = {
           status: 'reachable',
           checkedAt: row?.now || new Date(checkedAt).toISOString(),
@@ -2570,8 +2663,35 @@ export async function GET() {
             && row?.operations_faire_inventory_polling_applied
             && row?.suitecrm_product_image_reverse_ingestion_applied
             && row?.operations_commerce_order_revisions_applied
+            && row?.operations_commerce_order_revision_apply_applied
+            && row?.operations_one_off_carrier_selection_applied
             && row?.migration_checksums_present
           ),
+        }
+        if (canonicalOrderRevisionHealth) {
+          commerceOrderReconciliationWorker = {
+            ...commerceOrderReconciliationWorker,
+            status: canonicalOrderRevisionHealth.status === 'degraded'
+              ? 'degraded'
+              : 'disabled',
+            livenessStatus: 'disabled',
+            operationalStatus: canonicalOrderRevisionHealth.status,
+            canonicalOrderRevisions: {
+              status: canonicalOrderRevisionHealth.status,
+              heartbeat: null,
+              durable: canonicalOrderRevisionHealth,
+            },
+          }
+          if (canonicalOrderRevisionHealth.expiredProtectedReadBacklog > 0) {
+            warnings.push(
+              'Expired canonical-order protected evidence is awaiting bounded purge.',
+            )
+          }
+          if (canonicalOrderRevisionHealth.protectedEvidenceKeys.ready !== true) {
+            warnings.push(
+              'Canonical-order protected evidence key readiness requires attention.',
+            )
+          }
         }
         if (row?.operations_commerce_integrations_migration_applied) {
           shopifyWebhookReceipts =
@@ -2754,6 +2874,8 @@ export async function GET() {
           || !row?.operations_faire_inventory_polling_applied
           || !row?.suitecrm_product_image_reverse_ingestion_applied
           || !row?.operations_commerce_order_revisions_applied
+          || !row?.operations_commerce_order_revision_apply_applied
+          || !row?.operations_one_off_carrier_selection_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -3462,10 +3584,6 @@ export async function GET() {
               : null
             const orderState =
               await readCommerceOrderReconciliationHealthFromPostgres()
-            const canonicalOrderRevisionHealth =
-              row?.operations_commerce_order_revisions_applied
-                ? await readCommerceOrderRevisionHealthFromPostgres()
-                : null
             const loopReachable = (
               orderAgeMs !== null
               && orderAgeMs <= maxOrderHeartbeatAgeMs
@@ -4077,6 +4195,7 @@ export async function GET() {
       toastWorker,
       quickBooksWorker,
       commerceReadReconciliation,
+      commerceRevisionEvidence,
       commerceCatalogWorker,
       commerceOrderReconciliationWorker,
       shopifyInventoryRefreshWorker,

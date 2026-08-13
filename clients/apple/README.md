@@ -34,12 +34,12 @@ app restart cannot silently skip or transfer a step.
 Returning from Meta AI starts
 a bounded reconnection poll; **Reconnect glasses** retries it without requiring
 the worker to leave ClawPilot. The iPhone camera remains an explicit fallback.
-The Watch delegates a read request to the iPhone whenever the paired app is
-reachable, regardless of whether Meta glasses are connected. This keeps Watch-
-initiated instructions on the same installed voice as iPhone instructions while
-letting iOS choose the active phone or Bluetooth output route. When the iPhone
-is unreachable, the Watch still reads its cached instruction through its own
-Apple speech fallback.
+The Watch delegates a read request to the iPhone only when the enhanced voice
+pack is ready and exactly one current Meta glasses session is connected. The
+iPhone rechecks both conditions for every request and plays only after iOS has
+selected a Bluetooth output. If the glasses disconnect, the route is not
+Bluetooth, the phone is unreachable, or enhanced playback fails, the Watch
+reads its cached instruction locally through Apple speech instead.
 
 Instruction audio can use the optional Supertonic-3 FP16 voice pack through
 SpeechSwift 0.0.23. The pack is installed explicitly from the Picker audio card,

@@ -149,7 +149,7 @@ echo "Installing dependencies (safe if already installed)..."
 npm install
 
 echo "Building dev runtime..."
-npm run build
+LOCAL_UI_FIXTURES="1" NEXT_PUBLIC_LOCAL_UI_FIXTURES="1" npm run build
 
 echo "Starting dev runtime on port 4002..."
 BUILD_COMMIT="$(git -C "$DEV_REPO" rev-parse HEAD)"
@@ -163,6 +163,8 @@ RUNTIME_PORT="$PORT" \
 CLAWPILOT_REPO_ROOT="$DEV_REPO" \
 CLAWPILOT_STORAGE="file" \
 APP_AUTH_REQUIRED="0" \
+LOCAL_UI_FIXTURES="1" \
+NEXT_PUBLIC_LOCAL_UI_FIXTURES="1" \
 TASKS_PATH="$DEV_DATA_ROOT/tasks.json" \
 PIPELINE_NORMALIZED_PATH="$DEV_DATA_ROOT/pipeline/normalized/current.json" \
 PIPELINE_LOG_PATH="$DEV_DATA_ROOT/logs/pipeline-events.jsonl" \

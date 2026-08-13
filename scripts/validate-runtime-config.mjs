@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+import {
+  CommerceOrderRevisionEvidenceKeyConfigError,
+  resolveCommerceOrderRevisionEvidenceKeyConfig,
+} from '../app_src/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs'
+
 const sourcePattern = /^[a-z][a-z0-9-]{1,39}$/
 const ownerDomainPattern = /^[a-z0-9.-]+$/
 
@@ -139,9 +144,28 @@ function validateRepositoryRunnerConfiguration() {
   return 'enabled'
 }
 
+function validateRevisionEvidenceConfiguration() {
+  try {
+    const configuration = resolveCommerceOrderRevisionEvidenceKeyConfig({
+      environment: process.env,
+      hosted: true,
+    })
+    return {
+      activeKeyId: configuration.activeKeyId,
+      keyCount: configuration.keyIds.length,
+    }
+  } catch (error) {
+    if (error instanceof CommerceOrderRevisionEvidenceKeyConfigError) {
+      fail(error.message)
+    }
+    throw error
+  }
+}
+
 const origin = validateShortLinkOrigin()
 const clients = validateServiceClients()
 const embeddingProvider = validateEmbeddingConfiguration()
 const suiteCrm = validateSuiteCrmConfiguration()
 const repositoryRunner = validateRepositoryRunnerConfiguration()
-console.log(`[runtime-config] valid shortLinkOrigin=${origin} clients=${clients} embeddingProvider=${embeddingProvider} suiteCrm=${suiteCrm} repositoryRunner=${repositoryRunner}`)
+const revisionEvidence = validateRevisionEvidenceConfiguration()
+console.log(`[runtime-config] valid shortLinkOrigin=${origin} clients=${clients} embeddingProvider=${embeddingProvider} suiteCrm=${suiteCrm} repositoryRunner=${repositoryRunner} revisionEvidenceActiveKeyId=${revisionEvidence.activeKeyId} revisionEvidenceKeyCount=${revisionEvidence.keyCount}`)

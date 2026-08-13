@@ -68,7 +68,7 @@ for (const fragment of [
   'fulfillmentCarrierDestinationFingerprint',
   'providerVariantId: line.provider_variant_id',
   'operations_commerce_order_candidates candidate',
-  'operations_commerce_order_candidate_lines candidate_line',
+  'operations_commerce_current_planning_lines candidate_line',
   "candidate.workflow_state = 'promoted'",
   "candidate_line.workflow_state = 'promoted'",
 ]) {

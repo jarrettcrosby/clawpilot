@@ -71,7 +71,14 @@ const module = loadTypeScriptModule(
         applicationSecret: 'application-secret-value',
         scopes: ['READ_BRAND', 'READ_ORDERS'],
       }),
-      encryptCommerceCandidateSnapshot: (
+      commerceOrderRevisionProtectedContentFingerprint: (
+        _value,
+        _organizationId,
+        _accountGlobalId,
+        _externalOrderId,
+        kind,
+      ) => (kind === 'party' ? 'd' : 'e').repeat(64),
+      encryptCommerceOrderRevisionProtectedSnapshot: (
         _value,
         _organizationId,
         _accountGlobalId,
@@ -79,7 +86,12 @@ const module = loadTypeScriptModule(
         _sourceHash,
         kind,
       ) => ({
+        ciphertext: Buffer.from('revision-test'),
+        iv: Buffer.alloc(12),
+        tag: Buffer.alloc(16),
+        keyId: 'revision-test-k1',
         hash: (kind === 'party' ? 'd' : 'e').repeat(64),
+        encryptionVersion: 1,
       }),
       normalizeCommerceAccountGlobalId(value) {
         if (!/^gia(?:[0-9]{7}|[0-9a-v]{12})$/u.test(value)) {
@@ -111,6 +123,9 @@ const module = loadTypeScriptModule(
       readCommerceRuntimeCredentialFromPostgres: async () => null,
     },
     '@/lib/integrations/commerceOrderRevisionEvidence': {
+      commerceOrderRevisionProtectedPlaintext(field) {
+        return field?.state === 'available' ? field.value : null
+      },
       commerceOrderRevisionHash(value) {
         return createHash('sha256').update(JSON.stringify({
           version: value.version,
@@ -239,7 +254,18 @@ const normalizedOrder = (overrides = {}) => ({
 const providerOrder = (overrides = {}) => ({
   id: externalOrderId,
   brand_id: externalAccountId,
-  items: [{ id: 'oi_1' }, { id: 'oi_2' }],
+  state: 'NEW',
+  shipments: [],
+  items: [
+    {
+      id: 'oi_1', product_id: 'product_oi_1', variant_id: 'variant_oi_1',
+      sku: 'SKU-oi_1', quantity: 1, state: 'PROCESSING',
+    },
+    {
+      id: 'oi_2', product_id: 'product_oi_2', variant_id: 'variant_oi_2',
+      sku: 'SKU-oi_2', quantity: 2, state: 'PROCESSING',
+    },
+  ],
   ...overrides,
 })
 
@@ -298,6 +324,32 @@ function dependencies(overrides = {}) {
     evidence.snapshot.order.lines.map((item) => item.externalLineId),
     ['oi_1', 'oi_2'],
   )
+  assert.equal(evidence.snapshot.version, 'faire-canonical-order-revision-v2')
+  assert.deepEqual(JSON.parse(JSON.stringify(
+    evidence.snapshot.order.providerRevisionState,
+  )), {
+    orderState: 'NEW',
+    shipmentCount: 0,
+    lineStateBasis: 'all_processing',
+    quantityBasis: 'exact_order_item_quantity',
+  })
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(evidence.snapshot.order.lines.map((item) => ({
+      id: item.externalLineId,
+      current: item.currentQuantity,
+      cancelled: item.cancelledQuantity,
+      fulfilled: item.fulfilledQuantity,
+      unfulfilled: item.unfulfilledQuantity,
+      returned: item.returnedQuantity,
+      removed: item.removedOrRefundedQuantity,
+    })))),
+    [
+      { id: 'oi_1', current: 1, cancelled: 0, fulfilled: 0,
+        unfulfilled: 1, returned: 0, removed: 0 },
+      { id: 'oi_2', current: 2, cancelled: 0, fulfilled: 0,
+        unfulfilled: 2, returned: 0, removed: 0 },
+    ],
+  )
   assert.match(evidence.snapshot.order.partyFingerprint, /^[a-f0-9]{64}$/u)
   assert.match(evidence.snapshot.order.shipToFingerprint, /^[a-f0-9]{64}$/u)
   assert.notEqual(
@@ -322,6 +374,7 @@ function dependencies(overrides = {}) {
   const one = module.faireCanonicalOrderRevisionSnapshot({
     target,
     order: normalizedOrder(),
+    providerOrder: providerOrder(),
     observedAt,
   })
   const two = module.faireCanonicalOrderRevisionSnapshot({
@@ -329,6 +382,7 @@ function dependencies(overrides = {}) {
     order: normalizedOrder({
       lines: [...normalizedOrder().lines].reverse(),
     }),
+    providerOrder: providerOrder(),
     observedAt,
   })
   assert.equal(
@@ -360,6 +414,30 @@ function dependencies(overrides = {}) {
 }
 
 {
+  const processing = module.faireCanonicalOrderRevisionSnapshot({
+    target,
+    order: normalizedOrder({
+      rawStates: {
+        lifecycle: 'PROCESSING',
+        payment: null,
+        fulfillment: 'UNFULFILLED',
+        returns: null,
+      },
+    }),
+    providerOrder: providerOrder({ state: 'PROCESSING' }),
+    observedAt: '2026-08-12T16:05:00.000Z',
+  })
+  assert.equal(
+    processing.order.providerRevisionState.quantityBasis,
+    'unavailable',
+    'PROCESSING must remain fail-closed for wholly-unstarted structural Apply',
+  )
+  assert.ok(processing.order.lines.every((item) => (
+    item.currentQuantity === null && item.unfulfilledQuantity === null
+  )))
+}
+
+{
   const cancelled = normalizedOrder({
     providerCancelledAt: '2026-08-12T15:05:00.000Z',
     rawStates: {
@@ -376,6 +454,13 @@ function dependencies(overrides = {}) {
     },
   })
   const { deps } = dependencies({
+    getOrder: async () => providerOrder({
+      state: 'CANCELED',
+      items: providerOrder().items.map((item) => ({
+        ...item,
+        state: 'CANCELED',
+      })),
+    }),
     normalize: () => ({
       provider: 'faire',
       orders: [cancelled],
@@ -510,6 +595,7 @@ const workerModule = loadTypeScriptModule(
         const snapshot = module.faireCanonicalOrderRevisionSnapshot({
           target: claim,
           order: normalizedOrder(),
+          providerOrder: providerOrder(),
           observedAt: '2026-08-12T16:30:00.000Z',
         })
         return {

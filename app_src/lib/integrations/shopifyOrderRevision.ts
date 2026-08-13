@@ -2,15 +2,17 @@ import {
   readCommerceShopifyOrderRevisionEnvelope,
 } from '@/lib/integrations/commerceIntake'
 import {
-  encryptCommerceCandidateSnapshot,
+  commerceOrderRevisionProtectedContentFingerprint,
+  encryptCommerceOrderRevisionProtectedSnapshot,
+  type EncryptedCommerceOrderRevisionValue,
 } from '@/lib/integrations/commerceCredentialCrypto'
 import type {
   CommerceDataField,
   CommerceMoneySet,
   CommerceNormalizedOrder,
 } from '@/lib/operations/commerceNormalization'
-import { commerceSourceHash } from '@/lib/operations/commerceNormalization'
 import {
+  commerceOrderRevisionProtectedPlaintext,
   commerceOrderRevisionHash,
 } from '@/lib/integrations/commerceOrderRevisionEvidence'
 import type {
@@ -49,6 +51,10 @@ export type ShopifyCanonicalOrderRevisionSnapshot = Readonly<{
       discountMinor: string | null
       totalMinor: string | null
       headerState: CommerceNormalizedOrder['headerMoney']['state']
+      reconciliationMode:
+        | 'discount_separate'
+        | 'discount_in_subtotal'
+        | 'unreconciled'
     }>
     requestedDeliveryAt: string | null
     partyFingerprint: string
@@ -58,6 +64,8 @@ export type ShopifyCanonicalOrderRevisionSnapshot = Readonly<{
       externalProductId: string | null
       externalVariantId: string | null
       sku: string | null
+      titleSnapshot: string
+      variantTitleSnapshot: string | null
       orderedQuantity: number
       currentQuantity: number | null
       cancelledQuantity: number | null
@@ -80,8 +88,14 @@ export type ShopifyCanonicalOrderRevisionEvidence = Readonly<{
   sourceRevision: string
   revisionHash: string
   snapshot: ShopifyCanonicalOrderRevisionSnapshot
+  protectedParty: ProtectedRevisionSnapshot | null
+  protectedShipTo: ProtectedRevisionSnapshot | null
   providerReads: 2 | 3
   providerWrites: 0
+}>
+
+export type ProtectedRevisionSnapshot = EncryptedCommerceOrderRevisionValue & Readonly<{
+  contentFingerprint: string
 }>
 
 export function shopifyCanonicalOrderRevisionHash(
@@ -112,17 +126,48 @@ export class ShopifyOrderRevisionError extends Error {
 function protectedFingerprint<T>(input: {
   field: CommerceDataField<T>
   claim: CommerceOrderRevisionClaim
+  sourceHash: string
   kind: 'party' | 'ship_to'
 }) {
-  const value = input.field as unknown as Record<string, unknown>
-  return encryptCommerceCandidateSnapshot(
+  const value = commerceOrderRevisionProtectedPlaintext(input.field, input.kind)
+  return value ? commerceOrderRevisionProtectedContentFingerprint(
     value,
     input.claim.organizationId,
     input.claim.accountGlobalId,
     input.claim.externalOrderId,
-    commerceSourceHash(value),
     input.kind,
-  ).hash
+  ) : commerceOrderRevisionHash({
+    kind: input.kind,
+    state: input.field.state,
+  })
+}
+
+function protectedRevisionSnapshot<T>(input: {
+  field: CommerceDataField<T>
+  claim: CommerceOrderRevisionClaim
+  sourceHash: string
+  kind: 'party' | 'ship_to'
+}) {
+  const value = commerceOrderRevisionProtectedPlaintext(input.field, input.kind)
+  if (!value) return null
+  const encrypted = encryptCommerceOrderRevisionProtectedSnapshot(
+    value,
+    input.claim.organizationId,
+    input.claim.accountGlobalId,
+    input.claim.externalOrderId,
+    input.sourceHash,
+    input.kind,
+  )
+  return {
+    ...encrypted,
+    contentFingerprint: commerceOrderRevisionProtectedContentFingerprint(
+      value,
+      input.claim.organizationId,
+      input.claim.accountGlobalId,
+      input.claim.externalOrderId,
+      input.kind,
+    ),
+  }
 }
 
 function identityValue<T extends { value: string }>(field: CommerceDataField<T>) {
@@ -133,6 +178,32 @@ function moneyMinor(field: CommerceDataField<CommerceMoneySet>) {
   return field.state === 'available'
     ? field.value.primary.amountMinor.toString()
     : null
+}
+
+function moneyReconciliationMode(order: CommerceNormalizedOrder) {
+  const values = [
+    moneyMinor(order.subtotal),
+    moneyMinor(order.shipping),
+    moneyMinor(order.tax),
+    moneyMinor(order.discount),
+    moneyMinor(order.total),
+  ]
+  if (values.some((value) => value === null)) return 'unreconciled' as const
+  const [subtotal, shipping, tax, discount, total] = values.map((value) => (
+    BigInt(value as string)
+  ))
+  if (discount === BigInt(0)) {
+    return total === subtotal + shipping + tax
+      ? 'discount_separate' as const
+      : 'unreconciled' as const
+  }
+  if (total === subtotal - discount + shipping + tax) {
+    return 'discount_separate' as const
+  }
+  if (total === subtotal + shipping + tax) {
+    return 'discount_in_subtotal' as const
+  }
+  return 'unreconciled' as const
 }
 
 function assertTarget(claim: CommerceOrderRevisionClaim) {
@@ -170,6 +241,8 @@ export function shopifyCanonicalOrderRevisionSnapshot(input: {
     externalProductId: identityValue(line.productIdentity),
     externalVariantId: identityValue(line.variantIdentity),
     sku: line.sku,
+    titleSnapshot: line.titleSnapshot,
+    variantTitleSnapshot: line.variantTitleSnapshot,
     orderedQuantity: line.orderedQuantity,
     currentQuantity: line.currentQuantity,
     cancelledQuantity: line.cancelledQuantity,
@@ -214,6 +287,7 @@ export function shopifyCanonicalOrderRevisionSnapshot(input: {
         discountMinor: moneyMinor(input.order.discount),
         totalMinor: moneyMinor(input.order.total),
         headerState: input.order.headerMoney.state,
+        reconciliationMode: moneyReconciliationMode(input.order),
       }),
       requestedDeliveryAt: input.order.requestedDeliveryAt.state === 'available'
         ? input.order.requestedDeliveryAt.value
@@ -221,11 +295,13 @@ export function shopifyCanonicalOrderRevisionSnapshot(input: {
       partyFingerprint: protectedFingerprint({
         field: input.order.party,
         claim: input.claim,
+        sourceHash: input.order.sourceHash,
         kind: 'party',
       }),
       shipToFingerprint: protectedFingerprint({
         field: input.order.shipTo,
         claim: input.claim,
+        sourceHash: input.order.sourceHash,
         kind: 'ship_to',
       }),
       lines: Object.freeze(lines),
@@ -272,11 +348,25 @@ export async function inspectShopifyCanonicalOrderRevision(
     order: exact.envelope.orders[0],
     observedAt: exact.observedAt,
   })
+  const protectedParty = protectedRevisionSnapshot({
+    field: exact.envelope.orders[0].party,
+    claim,
+    sourceHash: snapshot.order.sourceHash,
+    kind: 'party',
+  })
+  const protectedShipTo = protectedRevisionSnapshot({
+    field: exact.envelope.orders[0].shipTo,
+    claim,
+    sourceHash: snapshot.order.sourceHash,
+    kind: 'ship_to',
+  })
   return Object.freeze({
     sourceHash: snapshot.order.sourceHash,
     sourceRevision: snapshot.order.sourceRevision,
     revisionHash: shopifyCanonicalOrderRevisionHash(snapshot),
     snapshot,
+    protectedParty,
+    protectedShipTo,
     providerReads: exact.providerReads,
     providerWrites: 0 as const,
   })

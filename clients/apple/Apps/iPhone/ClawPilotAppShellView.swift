@@ -56,6 +56,8 @@ struct ClawPilotAppShellView: View {
             NavigationStack { PickingDashboardView(model: model) }
         case "orders":
             NavigationStack { ManagerPickingOperationsView(model: model) }
+        case "pick-management", "pick-intervention":
+            NavigationStack { ManagerPickingOperationsView(model: model) }
         case "assignment":
             if let order = model.managerSelectedOrder {
                 ManagerOrderAssignmentView(model: model, order: order)
@@ -582,7 +584,7 @@ private struct WorkspaceSwitcherCard: View {
             Label("Change", systemImage: "chevron.up.chevron.down")
                 .font(.subheadline.weight(.semibold))
                 .padding(.horizontal, 12)
-                .frame(minHeight: 38)
+                .frame(minHeight: 44)
                 .background(AppShellTheme.raised, in: Capsule())
         }
         .disabled(!model.canSwitchWorkspace)
@@ -684,7 +686,8 @@ private struct ManagerPickingOperationsView: View {
         ScrollView {
             LazyVStack(spacing: 13) {
                 WorkspaceSwitcherCard(model: model, compact: true)
-                workflowExplanation
+                currentAssignments
+                completedPickHistory
                 pickerPerformance
 
                 if model.isManagerBusy && model.managerOrders.isEmpty {
@@ -738,24 +741,148 @@ private struct ManagerPickingOperationsView: View {
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
         }
+        .sheet(item: $model.managerSelectedPickAssignment) { assignment in
+            ManagerPickInterventionView(model: model, assignment: assignment)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+        }
     }
 
-    private var workflowExplanation: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: "person.2.badge.gearshape.fill")
-                .foregroundStyle(AppShellTheme.mint)
-                .font(.title2)
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Manager handoff")
+    private var currentAssignments: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Current assignments")
+                        .font(.headline)
+                        .foregroundStyle(AppShellTheme.text)
+                    Text("Released work")
+                        .font(.caption)
+                        .foregroundStyle(AppShellTheme.muted)
+                }
+                Spacer()
+                Text("\(model.managerPickManagement?.current.count ?? 0)")
                     .font(.headline)
-                    .foregroundStyle(AppShellTheme.text)
-                Text("Review planned orders, release a warehouse wave, and assign every ready pick to one eligible worker.")
+                    .foregroundStyle(AppShellTheme.mint)
+            }
+
+            if let assignments = model.managerPickManagement?.current,
+               assignments.isEmpty == false {
+                ForEach(assignments) { assignment in
+                    Button {
+                        model.managerSelectedPickAssignment = assignment
+                    } label: {
+                        currentAssignmentCard(assignment)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!assignment.canManageAssignment)
+                    .accessibilityHint(assignment.canManageAssignment
+                        ? "Opens exact picker assignment controls"
+                        : "Picker assignment is locked because work has started")
+                }
+            } else {
+                Text("No active pick assignments.")
                     .font(.subheadline)
                     .foregroundStyle(AppShellTheme.muted)
             }
         }
         .padding(16)
-        .background(AppShellTheme.mint.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
+        .background(AppShellTheme.surface, in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private func currentAssignmentCard(
+        _ assignment: ManagerCurrentPickAssignment
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Order \(assignment.orderNumber)")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(AppShellTheme.text)
+                    Text(assignment.pickerLabel)
+                        .font(.caption)
+                        .foregroundStyle(assignment.assignedTo == nil
+                            ? Color.orange
+                            : AppShellTheme.mint)
+                }
+                Spacer()
+                Image(systemName: assignment.canManageAssignment
+                    ? "slider.horizontal.3"
+                    : "lock.fill")
+                    .foregroundStyle(assignment.canManageAssignment
+                        ? AppShellTheme.primary
+                        : AppShellTheme.muted)
+            }
+            HStack(spacing: 14) {
+                evidenceMetric("TASKS", "\(assignment.readyTaskCount)/\(assignment.taskCount)")
+                evidenceMetric("UNITS", "\(assignment.pickedUnits.formatted())/\(assignment.requiredUnits.formatted())")
+                evidenceMetric("SCANS", "\(assignment.scanEvidenceTaskCount)/\(assignment.taskCount)")
+                evidenceMetric("COUNTS", "\(assignment.countEvidenceTaskCount)/\(assignment.taskCount)")
+            }
+            if assignment.handoffExceptionGlobalId != nil
+                || assignment.interventionExceptionGlobalId != nil {
+                Label("Manager exception remains open", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Color.orange)
+            }
+            if let blocked = assignment.managementBlockedReason {
+                Text(blocked)
+                    .font(.caption2)
+                    .foregroundStyle(AppShellTheme.muted)
+            }
+        }
+        .padding(.vertical, 11)
+        .overlay(alignment: .bottom) {
+            Divider().overlay(AppShellTheme.outline)
+        }
+    }
+
+    private var completedPickHistory: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            Text("Completed picks")
+                .font(.headline)
+                .foregroundStyle(AppShellTheme.text)
+            if let history = model.managerPickManagement?.history,
+               history.isEmpty == false {
+                ForEach(history) { item in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Order \(item.orderNumber)")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(AppShellTheme.text)
+                            Text(item.pickerDisplayName ?? item.pickerEmail)
+                                .font(.caption)
+                                .foregroundStyle(AppShellTheme.muted)
+                        }
+                        Spacer()
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text("\(item.taskCount) tasks")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(AppShellTheme.mint)
+                            Text("\(item.unitCount.formatted()) units")
+                                .font(.caption2)
+                                .foregroundStyle(AppShellTheme.muted)
+                        }
+                    }
+                }
+            } else {
+                Text("No completed picks yet.")
+                    .font(.subheadline)
+                    .foregroundStyle(AppShellTheme.muted)
+            }
+        }
+        .padding(16)
+        .background(AppShellTheme.surface, in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private func evidenceMetric(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 8, weight: .bold))
+                .foregroundStyle(AppShellTheme.muted)
+            Text(value)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(AppShellTheme.text)
+        }
     }
 
     private var pickerPerformance: some View {
@@ -999,6 +1126,263 @@ private struct ManagerOrderAssignmentView: View {
                 .tracking(0.5)
                 .foregroundStyle(AppShellTheme.muted)
             Text(value.replacingOccurrences(of: "_", with: " ").capitalized)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(AppShellTheme.text)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct ManagerPickInterventionView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: PickingPhoneModel
+    let assignment: ManagerCurrentPickAssignment
+    @State private var pickerEmail: String
+    @State private var reason = ""
+    @State private var idempotencyKey = UUID().uuidString
+
+    init(model: PickingPhoneModel, assignment: ManagerCurrentPickAssignment) {
+        self.model = model
+        self.assignment = assignment
+        _pickerEmail = State(initialValue: assignment.assignedTo ?? "")
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    assignmentSummary
+                    evidenceFence
+                    pickerSelection
+                    primaryAction
+                }
+                .padding(20)
+            }
+            .background(AppShellTheme.canvas)
+            .navigationTitle("Manage order \(assignment.orderNumber)")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }
+                        .disabled(model.isManagerBusy)
+                }
+            }
+            .interactiveDismissDisabled(model.isManagerBusy)
+            .onChange(of: pickerEmail) { _, _ in rotateIdempotencyKey() }
+            .onChange(of: reason) { _, _ in rotateIdempotencyKey() }
+        }
+    }
+
+    private var assignmentSummary: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(assignment.pickerLabel)
+                        .font(.title3.weight(.bold))
+                        .foregroundStyle(AppShellTheme.text)
+                    Text(assignment.warehouseName)
+                        .font(.subheadline)
+                        .foregroundStyle(AppShellTheme.muted)
+                }
+                Spacer()
+                Text("v\(assignment.rowVersion)")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(AppShellTheme.primary)
+            }
+            HStack {
+                summaryMetric("TASKS", "\(assignment.readyTaskCount)/\(assignment.taskCount)")
+                summaryMetric("UNITS", "\(assignment.pickedUnits.formatted())/\(assignment.requiredUnits.formatted())")
+                summaryMetric("SCANNED", "\(assignment.scanEvidenceTaskCount)/\(assignment.taskCount)")
+                summaryMetric("COUNTED", "\(assignment.countEvidenceTaskCount)/\(assignment.taskCount)")
+            }
+        }
+        .padding(17)
+        .background(AppShellTheme.surface, in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private var evidenceFence: some View {
+        HStack(spacing: 8) {
+            Label("Unstarted work only", systemImage: "checkmark.shield.fill")
+                .foregroundStyle(AppShellTheme.mint)
+            Spacer(minLength: 8)
+            if assignment.managementBlockedReason != nil {
+                Label("Blocked", systemImage: "lock.fill")
+                    .foregroundStyle(Color.orange)
+            } else if assignment.handoffExceptionGlobalId != nil
+                || assignment.interventionExceptionGlobalId != nil {
+                Label("Exception retained", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(Color.orange)
+            }
+        }
+        .font(.subheadline.weight(.semibold))
+        .padding(.horizontal, 13)
+        .frame(minHeight: 44)
+        .background(AppShellTheme.mint.opacity(0.08), in: Capsule())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Unstarted work only")
+        .accessibilityValue(evidenceFenceAccessibilityValue)
+    }
+
+    private var evidenceFenceAccessibilityValue: String {
+        var details = [
+            "The server blocks this change after any scan, count, picked, packed, label, or shipment evidence."
+        ]
+        if assignment.handoffExceptionGlobalId != nil
+            || assignment.interventionExceptionGlobalId != nil {
+            details.append("Existing exceptions stay open for review.")
+        }
+        if let blocked = assignment.managementBlockedReason {
+            details.append("Blocked: \(blocked)")
+        }
+        return details.joined(separator: " ")
+    }
+
+    private var pickerSelection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Picker intervention")
+                .font(.headline)
+                .foregroundStyle(AppShellTheme.text)
+
+            HStack(spacing: 12) {
+                Text("Picker")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(AppShellTheme.text)
+                Spacer(minLength: 8)
+                pickerMenu
+            }
+            .frame(minHeight: 44)
+
+            if pickerEmail.isEmpty {
+                Label("Manager exception · evidence retained", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Color.orange)
+                .accessibilityValue("Unassign creates or retains a high-priority manager exception; it never clears scan/count evidence or physical work.")
+            }
+
+            Text("Reason")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(AppShellTheme.text)
+            TextField("Required", text: $reason)
+                .shellInputSurface()
+                .accessibilityLabel("Manager reason")
+                .accessibilityHint("Required for the audited assignment command.")
+        }
+    }
+
+    private var pickerMenu: some View {
+        Menu {
+            Button(role: .destructive) {
+                pickerEmail = ""
+            } label: {
+                Label("Unassign", systemImage: "person.crop.circle.badge.minus")
+            }
+            ForEach(model.managerPickManagement?.eligiblePickers
+                ?? model.managerPickers) { picker in
+                Button {
+                    pickerEmail = picker.email
+                } label: {
+                    if picker.email == pickerEmail {
+                        Label(picker.displayName ?? picker.email, systemImage: "checkmark")
+                    } else {
+                        Text(picker.displayName ?? picker.email)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Text(selectedPickerLabel)
+                    .lineLimit(1)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption.weight(.semibold))
+            }
+            .frame(minHeight: 44)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.regular)
+        .accessibilityLabel("Picker")
+        .accessibilityValue(selectedPickerLabel)
+    }
+
+    private var selectedPickerLabel: String {
+        guard !pickerEmail.isEmpty else { return "Unassigned" }
+        return (model.managerPickManagement?.eligiblePickers ?? model.managerPickers)
+            .first(where: { $0.email == pickerEmail })?
+            .displayName ?? pickerEmail
+    }
+
+    private var primaryAction: some View {
+        HStack {
+            Spacer(minLength: 0)
+            Button {
+                let selected = pickerEmail.isEmpty ? nil : pickerEmail
+                Task {
+                    if await model.managePickerAssignment(
+                        assignment,
+                        assignedTo: selected,
+                        reason: reason,
+                        idempotencyKey: idempotencyKey
+                    ) {
+                        dismiss()
+                    }
+                }
+            } label: {
+                HStack(spacing: 7) {
+                    if model.isManagerBusy {
+                        ProgressView()
+                    }
+                    Text(actionTitle)
+                    Image(systemName: pickerEmail.isEmpty
+                        ? "person.crop.circle.badge.minus"
+                        : "person.crop.circle.badge.checkmark")
+                }
+                .frame(minHeight: 44)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.regular)
+            .tint(pickerEmail.isEmpty ? Color.red : AppShellTheme.primary)
+            .disabled(saveDisabled)
+            .accessibilityLabel(actionAccessibilityLabel)
+            .accessibilityHint("Uses the exact order version, ready-task count, and assignment fingerprint.")
+        }
+    }
+
+    private var actionTitle: String {
+        if pickerEmail.isEmpty { return "Unassign" }
+        return assignment.assignedTo == nil
+            ? "Assign"
+            : "Reassign"
+    }
+
+    private var actionAccessibilityLabel: String {
+        if pickerEmail.isEmpty {
+            return "Unassign exact ready tasks and flag for manager"
+        }
+        return assignment.assignedTo == nil
+            ? "Assign exact ready tasks"
+            : "Reassign exact ready tasks"
+    }
+
+    private var saveDisabled: Bool {
+        let normalizedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        let assignmentUnchanged = assignment.assignmentState != "mixed"
+            && (assignment.assignedTo ?? "") == pickerEmail
+        return model.isManagerBusy
+            || assignment.canManageAssignment == false
+            || normalizedReason.isEmpty
+            || normalizedReason.count > 500
+            || assignmentUnchanged
+    }
+
+    private func rotateIdempotencyKey() {
+        idempotencyKey = UUID().uuidString
+    }
+
+    private func summaryMetric(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.system(size: 8, weight: .bold))
+                .foregroundStyle(AppShellTheme.muted)
+            Text(value)
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(AppShellTheme.text)
         }

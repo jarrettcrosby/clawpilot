@@ -41,6 +41,7 @@ import {
   deleteOperationsLocationInPostgres,
   executeOperationsReplenishmentInPostgres,
   generateOperationsPackagePackingSlipInPostgres,
+  manageOperationsOrderPickAssignmentFromPostgres,
   OperationsRequestError,
   planOperationsOrderFromPostgres,
   prepareOperationsShipmentExecutionFromPostgres,
@@ -95,6 +96,7 @@ const CARTONIZATION_EVIDENCE_GLOBAL_ID = /^gcte(?:[0-9]{7}|[0-9a-v]{12})$/
 const PACKAGE_GLOBAL_ID = /^gpa(?:[0-9]{7}|[0-9a-v]{12})$/
 const EXCEPTION_GLOBAL_ID = /^gex(?:[0-9]{7}|[0-9a-v]{12})$/
 const COMMERCE_ORDER_REVISION_OBSERVATION_GLOBAL_ID = /^gcor(?:[0-9]{7}|[0-9a-v]{12})$/
+const COMMERCE_ORDER_REVISION_READ_GLOBAL_ID = /^gcrr(?:[0-9]{7}|[0-9a-v]{12})$/
 const RATE_GLOBAL_ID = /^grt(?:[0-9]{7}|[0-9a-v]{12})$/
 const CARRIER_ACCOUNT_GLOBAL_ID = /^gac(?:[0-9]{7}|[0-9a-v]{12})$/
 const PRINTER_GLOBAL_ID = /^gpr(?:[0-9]{7}|[0-9a-v]{12})$/
@@ -1461,6 +1463,64 @@ export async function POST(req: NextRequest) {
       })
       return json({ ok: true, capabilities, result })
     }
+    if (action === 'manage-pick-assignment') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to manage warehouse pick assignments',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'orderGlobalId',
+          'expectedRowVersion',
+          'expectedTaskCount',
+          'expectedAssignmentFingerprint',
+          'assignedTo',
+          'reason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await manageOperationsOrderPickAssignmentFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+        expectedRowVersion: integerValue(
+          body.expectedRowVersion,
+          'Order version',
+          0,
+          2_147_483_647,
+        ),
+        expectedTaskCount: integerValue(
+          body.expectedTaskCount,
+          'Expected pick task count',
+          1,
+          200,
+        ),
+        expectedAssignmentFingerprint: textValue(
+          body.expectedAssignmentFingerprint,
+          'Expected picker-assignment fingerprint',
+          64,
+        ).toLowerCase(),
+        assignedTo: textValue(
+          body.assignedTo,
+          'Assigned picker',
+          254,
+          false,
+        ).toLowerCase() || null,
+        reason: textValue(body.reason, 'Manager intervention reason', 500),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
     if (action === 'request-pick-handoff') {
       if (!canRequestOperationsPickHandoff(capabilities)) {
         return json({
@@ -2152,6 +2212,7 @@ export async function POST(req: NextRequest) {
           'action',
           'orderGlobalId',
           'observationGlobalId',
+          'readGlobalId',
           'expectedSourceHash',
           'expectedRevisionHash',
           'expectedRowVersion',
@@ -2173,6 +2234,11 @@ export async function POST(req: NextRequest) {
           body.observationGlobalId,
           'Provider order revision observation',
           COMMERCE_ORDER_REVISION_OBSERVATION_GLOBAL_ID,
+        ),
+        readGlobalId: globalIdValue(
+          body.readGlobalId,
+          'Provider order revision exact read',
+          COMMERCE_ORDER_REVISION_READ_GLOBAL_ID,
         ),
         expectedSourceHash,
         expectedRevisionHash,

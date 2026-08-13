@@ -422,7 +422,7 @@ async function productIdentityRows(pipelineId: string) {
        ) AS inventory_levels,
        (
          SELECT count(*)::text
-         FROM operations_order_lines line
+         FROM operations_current_order_lines line
          WHERE line.pipeline_id = product.pipeline_id
            AND line.product_id = product.id
        ) AS order_lines,
@@ -902,7 +902,7 @@ async function duplicateOperationalReferenceCount(
          WHERE pipeline_id = $1::uuid AND product_id = $2::uuid)
        + (SELECT count(*) FROM operations_commerce_inventory_levels
          WHERE pipeline_id = $1::uuid AND product_id = $2::uuid)
-       + (SELECT count(*) FROM operations_order_lines
+       + (SELECT count(*) FROM operations_current_order_lines
          WHERE pipeline_id = $1::uuid AND product_id = $2::uuid)
        + (SELECT count(*) FROM operations_receipt_lines
          WHERE pipeline_id = $1::uuid AND product_id = $2::uuid)

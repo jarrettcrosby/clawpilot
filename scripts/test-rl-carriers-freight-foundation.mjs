@@ -98,6 +98,8 @@ const foundation = loadFoundation()
 assert.deepEqual(
   Object.keys(foundation).sort(),
   [
+    'RL_CARRIERS_CONFIRMED_HANDLING_UNIT_TYPES',
+    'RL_CARRIERS_CONFIRMED_ITEM_PACKAGE_TYPES',
     'RL_CARRIERS_EXECUTING_CARRIER',
     'RL_CARRIERS_FREIGHT_ENDPOINTS',
     'RL_CARRIERS_FREIGHT_PROVIDER',

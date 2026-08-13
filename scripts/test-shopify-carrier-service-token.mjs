@@ -6,6 +6,7 @@ import { resolve } from 'node:path'
 import vm from 'node:vm'
 
 import * as globalIds from '../app_src/lib/globalIds.mjs'
+import * as commerceOrderRevisionEvidenceKeyConfig from '../app_src/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs'
 
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
@@ -51,6 +52,9 @@ const sandbox = {
     }
     if (specifier === '@/lib/persistence/config') {
       return { isHostedRuntime: () => false }
+    }
+    if (specifier === '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs') {
+      return commerceOrderRevisionEvidenceKeyConfig
     }
     return nodeRequire(specifier)
   },

@@ -929,6 +929,9 @@ function loadOperationalWarehouseServices(pool) {
   )
   const stableId = loadTypeScriptModule('app_src/lib/crm/stableId.ts')
   const domain = loadTypeScriptModule('app_src/lib/operations/domain.ts')
+  const pickManagement = loadTypeScriptModule(
+    'app_src/lib/operations/pickManagement.ts',
+  )
   const adapters = loadTypeScriptModule(
     'app_src/lib/operations/adapters.ts',
     { '@/lib/operations/domain': domain },
@@ -1014,6 +1017,7 @@ function loadOperationalWarehouseServices(pool) {
       '@/lib/operations/adapters': adapters,
       '@/lib/operations/canonicalFulfillmentPlanning': canonicalPlanning,
       '@/lib/operations/domain': domain,
+      '@/lib/operations/pickManagement': pickManagement,
       '@/lib/operations/packingSlip': packingSlip,
       '@/lib/persistence/commerceOrderRevisions': {
         async assertCommerceOrderRevisionExecutionCurrent() {},

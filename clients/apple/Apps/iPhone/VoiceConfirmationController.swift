@@ -3,6 +3,35 @@
 import CoreML
 import Foundation
 import SupertonicTTS
+import UIKit
+
+struct EnhancedVoicePlaybackResult: Equatable, Sendable {
+    let outputName: String
+    let startedWhilePhoneBackgrounded: Bool
+}
+
+@MainActor
+private final class PhoneAudioBackgroundLease {
+    private var identifier: UIBackgroundTaskIdentifier = .invalid
+    private(set) var expired = false
+
+    init(name: String) {
+        identifier = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.expired = true
+                self.end()
+            }
+        }
+    }
+
+    func end() {
+        guard identifier != .invalid else { return }
+        let current = identifier
+        identifier = .invalid
+        UIApplication.shared.endBackgroundTask(current)
+    }
+}
 
 enum AudioPlaybackPreference: String, CaseIterable {
     case automatic
@@ -401,6 +430,77 @@ final class VoiceConfirmationController {
         }
     }
 
+    /// Plays only the installed enhanced voice and only after iOS has selected
+    /// a Bluetooth output. This is the strict path used by a Watch tap while
+    /// exactly one Meta camera session is connected. The bounded background
+    /// lease covers CoreML synthesis before the audio background mode becomes
+    /// effective, which is essential when the paired iPhone is locked.
+    func speakEnhancedThroughBluetoothAndWait(
+        _ english: String,
+        spanish: String? = nil
+    ) async throws -> EnhancedVoicePlaybackResult {
+        let startedWhilePhoneBackgrounded = UIApplication.shared.applicationState != .active
+        let backgroundLease = PhoneAudioBackgroundLease(
+            name: "ClawPilot Watch instruction audio"
+        )
+        defer { backgroundLease.end() }
+
+        stopListening()
+        stopSpeech()
+        if voicePackState != .ready {
+            await prepareInstalledVoicePack()
+        }
+        guard voicePackState == .ready else {
+            throw VoiceError.enhancedVoiceUnavailable
+        }
+
+        let language = instructionLanguage
+        let sourceText = language == .spanish ? (spanish ?? english) : english
+        let text = applyPronunciationCorrections(to: sourceText)
+        let speechID = UUID()
+        activeSpeechID = speechID
+        defer {
+            if activeSpeechID == speechID { activeSpeechID = nil }
+            offlinePlayer?.stop()
+            offlinePlayer = nil
+        }
+
+        let samples: [Float]
+        do {
+            samples = try await offlineSpeech.synthesize(text: text, language: language)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            setVoicePackState(.failed(
+                "Enhanced voice synthesis failed; Watch-local speech is active. \(error.localizedDescription)"
+            ))
+            throw error
+        }
+        try Task.checkCancellation()
+        guard !backgroundLease.expired else {
+            throw VoiceError.backgroundTimeExpired
+        }
+        guard activeSpeechID == speechID else {
+            throw VoiceError.playbackInterrupted
+        }
+
+        let outputName = try await playOfflineThroughBluetooth(samples: samples)
+        while offlinePlayer?.isPlaying == true {
+            try Task.checkCancellation()
+            guard !backgroundLease.expired, activeSpeechID == speechID else {
+                offlinePlayer?.stop()
+                throw backgroundLease.expired
+                    ? VoiceError.backgroundTimeExpired
+                    : VoiceError.playbackInterrupted
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        return EnhancedVoicePlaybackResult(
+            outputName: outputName,
+            startedWhilePhoneBackgrounded: startedWhilePhoneBackgrounded
+        )
+    }
+
     func listen(
         preferBluetoothInput: Bool,
         timeout: Duration? = nil,
@@ -559,6 +659,51 @@ final class VoiceConfirmationController {
         player.prepareToPlay()
         guard player.play() else { throw VoiceError.playbackFailed }
         offlinePlayer = player
+    }
+
+    private func playOfflineThroughBluetooth(samples: [Float]) async throws -> String {
+        guard !samples.isEmpty else { throw VoiceError.emptyAudio }
+        let session = AVAudioSession.sharedInstance()
+        try session.setActive(false, options: .notifyOthersOnDeactivation)
+        try session.setCategory(
+            .playback,
+            mode: .spokenAudio,
+            options: [.duckOthers, .interruptSpokenAudioAndMixWithOthers]
+        )
+        try session.setActive(true, options: .notifyOthersOnDeactivation)
+
+        var bluetoothOutput: AVAudioSessionPortDescription?
+        for attempt in 0..<10 {
+            bluetoothOutput = session.currentRoute.outputs.first(where: Self.isBluetoothOutput)
+            if bluetoothOutput != nil { break }
+            if attempt < 9 { try await Task.sleep(for: .milliseconds(100)) }
+        }
+        guard bluetoothOutput != nil else {
+            let current = session.currentRoute.outputs.first?.portName ?? "no active output"
+            try? session.setActive(false, options: .notifyOthersOnDeactivation)
+            throw VoiceError.bluetoothRouteUnavailable(current)
+        }
+
+        let player = try AVAudioPlayer(data: Self.wavData(samples: samples, sampleRate: 44_100))
+        player.prepareToPlay()
+        guard player.play() else { throw VoiceError.playbackFailed }
+        guard let startedOutput = session.currentRoute.outputs.first(where: Self.isBluetoothOutput)
+        else {
+            player.stop()
+            let current = session.currentRoute.outputs.first?.portName ?? "no active output"
+            throw VoiceError.bluetoothRouteUnavailable(current)
+        }
+        offlinePlayer = player
+        return startedOutput.portName
+    }
+
+    private static func isBluetoothOutput(_ output: AVAudioSessionPortDescription) -> Bool {
+        switch output.portType {
+        case .bluetoothA2DP, .bluetoothHFP, .bluetoothLE:
+            true
+        default:
+            false
+        }
     }
 
     private func speakWithApple(_ text: String, language: InstructionVoiceLanguage) {
@@ -780,6 +925,10 @@ final class VoiceConfirmationController {
         case playbackFailed
         case incompleteVoicePack
         case microphoneUnavailable
+        case enhancedVoiceUnavailable
+        case bluetoothRouteUnavailable(String)
+        case backgroundTimeExpired
+        case playbackInterrupted
 
         var errorDescription: String? {
             switch self {
@@ -793,6 +942,14 @@ final class VoiceConfirmationController {
                 "The downloaded voice pack is incomplete or failed validation."
             case .microphoneUnavailable:
                 "The microphone is not ready. Reconnect the audio device and try again."
+            case .enhancedVoiceUnavailable:
+                "The enhanced iPhone voice pack is not ready."
+            case .bluetoothRouteUnavailable(let current):
+                "iOS did not select Bluetooth audio; the current output is \(current)."
+            case .backgroundTimeExpired:
+                "The locked iPhone did not have enough background time to prepare the instruction."
+            case .playbackInterrupted:
+                "Instruction playback was interrupted before it completed."
             }
         }
     }

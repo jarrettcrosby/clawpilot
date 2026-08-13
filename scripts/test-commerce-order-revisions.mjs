@@ -8,6 +8,7 @@ const read = (relative) => readFile(path.join(root, relative), 'utf8')
 
 const [
   migration,
+  applyMigration,
   persistence,
   evidence,
   intake,
@@ -19,8 +20,10 @@ const [
   operationShipping,
   productionRerates,
   healthRoute,
+  reconciliationWorker,
 ] = await Promise.all([
   read('db/migrations/0273_operations_commerce_order_revisions.sql'),
+  read('db/migrations/0274_operations_commerce_order_revision_apply.sql'),
   read('app_src/lib/persistence/commerceOrderRevisions.ts'),
   read('app_src/lib/integrations/commerceOrderRevisionEvidence.ts'),
   read('app_src/lib/integrations/commerceIntake.ts'),
@@ -32,12 +35,14 @@ const [
   read('app_src/lib/persistence/operationShipping.ts'),
   read('app_src/lib/operations/productionFulfillmentRerates.ts'),
   read('app_src/app/api/health/route.ts'),
+  read('app_src/lib/commerceOrderReconciliationWorker.ts'),
 ])
 
 assert.match(migration, /operations_commerce_order_revision_observations/u)
 assert.match(migration, /BEFORE UPDATE OR DELETE/u)
 assert.match(migration, /commerce order revision observations are immutable/u)
 assert.match(migration, /provider_write_count integer NOT NULL CHECK \(provider_write_count = 0\)/u)
+assert.match(applyMigration, /purge_expired_ocr_protected_snapshots/u)
 assert.match(migration, /UNIQUE \(organization_id, integration_account_id, order_id, source_hash\)/u)
 assert.match(migration, /AFTER INSERT ON operations_orders/u)
 assert.match(migration, /WHERE order_row\.source_provider IN \('shopify', 'faire'\)/u)
@@ -56,6 +61,7 @@ for (const exportedContract of [
   'failCommerceOrderRevisionTargetInPostgres',
   'assertCommerceOrderRevisionExecutionCurrent',
   'readCommerceOrderRevisionHealthFromPostgres',
+  'purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres',
   'cancelUnstartedCommerceOrderFromProviderRevisionInPostgres',
   'CommerceOrderRevisionDispositionError',
 ]) {
@@ -89,6 +95,27 @@ for (const downstreamTable of [
 ]) assert.match(persistence, new RegExp(downstreamTable))
 assert.match(persistence, /status = 'cancelled', row_version = row_version \+ 1/u)
 assert.match(persistence, /providerWrites: 0 as const/u)
+assert.match(
+  persistence,
+  /WHERE filename = \$1[\s\S]{0,100}\[REVISION_APPLY_MIGRATION\]/u,
+  'protected snapshot purge must skip safely before 0274 is recorded',
+)
+assert.match(
+  persistence,
+  /purge_expired_ocr_protected_snapshots\(\$1\)::integer/u,
+)
+assert.match(persistence, /PROTECTED_SNAPSHOT_PURGE_MAX_LIMIT = 500/u)
+assert.match(persistence, /expiredProtectedReadBacklog/u)
+assert.match(
+  reconciliationWorker,
+  /purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres\(\{[\s\S]{0,100}limit: PROTECTED_SNAPSHOT_PURGE_LIMIT_PER_CYCLE/u,
+)
+assert.ok(
+  reconciliationWorker.indexOf(
+    'purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres({',
+  ) < reconciliationWorker.indexOf('if (!commerceReadRuntimeAvailable())'),
+  'protected snapshot retention must run before the commerce-intake early return',
+)
 assert.match(persistence, /operations:order:\$\{input\.organizationId\}:\$\{input\.orderGlobalId\}/u)
 assert.match(operations, /COMMERCE_ORDER_REVISION_DISPOSITION_REQUIRED/u)
 assert.match(evidence, /externalAccountId: source\.externalAccountId/u)
@@ -111,7 +138,8 @@ assert.doesNotMatch(adapter, /shippingAddress/u)
 assert.match(adapter, /sourceRevision: input\.order\.providerUpdatedAt \|\| input\.order\.sourceHash/u)
 assert.match(adapter, /providerWrites: 0 as const/u)
 assert.match(adapter, /commerceOrderRevisionHash\(snapshot\)/u)
-assert.match(adapter, /encryptCommerceCandidateSnapshot/u)
+assert.match(adapter, /encryptCommerceOrderRevisionProtectedSnapshot/u)
+assert.match(adapter, /commerceOrderRevisionProtectedContentFingerprint/u)
 assert.doesNotMatch(adapter, /shippingAddress/u)
 
 assert.match(worker, /claimCommerceOrderRevisionTargetsInPostgres/u)
@@ -170,16 +198,22 @@ for (const operation of ['rate', 'select_rate', 'label']) {
 assert.match(route, /action === 'accept-provider-order-cancellation'/u)
 assert.match(route, /idempotencyKeyValue\(req\)/u)
 assert.match(workspace, /Accept provider cancellation/u)
-assert.match(workspace, /operations-provider-cancel:\$\{command\.observationGlobalId\}/u)
+assert.match(workspace, /operations-provider-cancel:\$\{command\.readGlobalId\}/u)
 
 assert.match(healthRoute, /readCommerceOrderRevisionHealthFromPostgres/u)
 assert.match(healthRoute, /0273_operations_commerce_order_revisions\.sql/u)
 assert.match(healthRoute, /operations_commerce_order_revisions_applied/u)
 assert.match(
   healthRoute,
-  /row\?\.operations_commerce_order_revisions_applied\s*\? await readCommerceOrderRevisionHealthFromPostgres\(\)\s*: null/u,
+  /row\?\.operations_commerce_order_revision_apply_applied\s*\? await readCommerceOrderRevisionHealthFromPostgres\(\)\s*: null/u,
+)
+assert.ok(
+  healthRoute.indexOf('const canonicalOrderRevisionHealth =')
+    < healthRoute.indexOf('commerceReadRuntimeAvailable()'),
+  'protected revision evidence health must remain visible when provider reads are disabled',
 )
 assert.match(healthRoute, /canonicalOrderRevisions: \{[\s\S]{0,220}heartbeat:[\s\S]{0,120}durable:/u)
+assert.match(healthRoute, /expiredProtectedReadBacklog/u)
 assert.match(healthRoute, /canonicalOrderRevisionHealth\?\.summary\.failed/u)
 assert.match(healthRoute, /canonicalOrderRevisionHealth\?\.summary\.deadLetter/u)
 assert.match(healthRoute, /canonicalOrderRevisionHealth\?\.summary\.materialReviewRequired/u)

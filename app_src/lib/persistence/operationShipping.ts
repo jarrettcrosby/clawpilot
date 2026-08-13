@@ -378,7 +378,7 @@ async function readShippingContext(
   const lineResult = await dbQuery<LineRow>(
     client,
     `SELECT line.description, product.name AS product_name, line.quantity::text
-     FROM operations_order_lines line
+     FROM operations_current_order_lines line
      JOIN crm_products product
        ON product.pipeline_id = line.pipeline_id AND product.id = line.product_id
      WHERE line.organization_id = $1::uuid AND line.order_id = $2::uuid
