@@ -9,6 +9,7 @@ public struct PickTask: Codable, Equatable, Identifiable, Sendable {
     public let productImageURL: URL?
     public let barcode: String?
     public let locationCode: String
+    public let warehouseCode: String?
     public let warehouseGlobalId: String?
     public let locationGlobalId: String?
     public let locationBarcode: String?
@@ -27,6 +28,7 @@ public struct PickTask: Codable, Equatable, Identifiable, Sendable {
         productImageURL: URL? = nil,
         barcode: String?,
         locationCode: String,
+        warehouseCode: String? = nil,
         warehouseGlobalId: String? = nil,
         locationGlobalId: String? = nil,
         locationBarcode: String? = nil,
@@ -40,6 +42,7 @@ public struct PickTask: Codable, Equatable, Identifiable, Sendable {
               !productName.isEmpty,
               !channelSku.isEmpty,
               !locationCode.isEmpty,
+              warehouseCode.map({ !$0.isEmpty && $0.count <= 80 }) ?? true,
               locationScanRequired != true || (
                 warehouseGlobalId?.range(
                     of: #"^gwh(?:[0-9]{7}|[0-9a-v]{12})$"#,
@@ -68,6 +71,7 @@ public struct PickTask: Codable, Equatable, Identifiable, Sendable {
         self.productImageURL = productImageURL
         self.barcode = barcode
         self.locationCode = locationCode
+        self.warehouseCode = warehouseCode
         self.warehouseGlobalId = warehouseGlobalId
         self.locationGlobalId = locationGlobalId
         self.locationBarcode = locationBarcode

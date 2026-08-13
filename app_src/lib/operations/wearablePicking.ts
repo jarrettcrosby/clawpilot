@@ -9,6 +9,7 @@ export type WearablePickTask = {
   productImageURL: string | null
   barcode: string | null
   locationCode: string
+  warehouseCode?: string
   warehouseGlobalId?: string
   locationGlobalId?: string
   locationBarcode?: string

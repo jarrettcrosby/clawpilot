@@ -105,6 +105,7 @@ final class PickingPhoneModel: ObservableObject {
     @Published var managerStatus = "Loading Operations orders."
     @Published var isManagerBusy = false
     @Published var currentTask: PickTask?
+    @Published var currentOrderNumber: String?
     @Published var currentScanStage: PickScanStage?
     @Published var currentWorkflowStage: PickWorkflowStage?
     @Published var currentStageContext: PickStageContext?
@@ -3043,6 +3044,7 @@ final class PickingPhoneModel: ObservableObject {
             return
         }
         currentTask = projectedTask
+        currentOrderNumber = activeOrder?.orderNumber
         currentScanStage = projectedScanStage
         currentWorkflowStage = projectedWorkflowStage
         currentStageContext = projectedStageContext
@@ -3059,6 +3061,7 @@ final class PickingPhoneModel: ObservableObject {
 
     private func clearPublishedPickProjection() {
         currentTask = nil
+        currentOrderNumber = nil
         currentScanStage = nil
         currentWorkflowStage = nil
         currentStageContext = nil

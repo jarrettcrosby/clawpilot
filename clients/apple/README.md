@@ -69,6 +69,7 @@ From the repository root:
 npm run test:wearable-phase1
 npm run build:apple-picking-simulators
 npm run pilot:apple-wearable-readiness
+clients/apple/verify-development-archive.sh /absolute/path/to/ClawPilot-Dev.xcarchive
 ```
 
 The simulator build pins `facebook/meta-wearables-dat-ios` exactly to 0.9.0 and
@@ -76,6 +77,10 @@ compiles the iPhone and Watch targets unsigned, then asserts that the phone app
 contains the Watch companion. The readiness command prints only whether each
 build-owned setting is present; it never prints configured values or
 credentials.
+The archive verifier is mandatory before every development TestFlight upload.
+It compares the signed Google and Meta configuration to the ignored local
+overlay without printing either value and rejects an archive whose build does
+not match the checked-out `project.yml`.
 
 The source-controlled project produces two fixed environments from the same
 source revision. `ClawPilotPickingPhoneDev` builds **ClawPilot Dev** with the

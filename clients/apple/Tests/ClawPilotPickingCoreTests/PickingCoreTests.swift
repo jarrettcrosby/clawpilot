@@ -330,7 +330,7 @@ private func fixtureQueue() throws -> PickQueue {
             channelSku: "BLUE-1",
             productImageURL: URL(string: "https://example.com/product.png"),
             barcode: "012345678905",
-            locationCode: "A-01-01", quantity: 2
+            locationCode: "A-01-01", warehouseCode: "MAIN-01", quantity: 2
         ),
         PickTask(
             pickTaskGlobalId: "gpk0000002", sequence: 2,
@@ -1184,7 +1184,8 @@ private func locationFirstQueue(
     orderRowVersion: Int = 3,
     productBarcode: String = "4006381333931",
     locationBarcode: String = "CP1L-GWL0000003",
-    locationScanPolicyRowVersion: Int = 2
+    locationScanPolicyRowVersion: Int = 2,
+    warehouseCode: String? = nil
 ) throws -> PickQueue {
     let task = try PickTask(
         pickTaskGlobalId: "gpk0000003",
@@ -1194,6 +1195,7 @@ private func locationFirstQueue(
         channelSku: "GREEN-1",
         barcode: productBarcode,
         locationCode: "B-02-03",
+        warehouseCode: warehouseCode,
         warehouseGlobalId: "gwh0000003",
         locationGlobalId: "gwl0000003",
         locationBarcode: locationBarcode,
@@ -1884,6 +1886,28 @@ func exactQueueRefreshPreservesScanProgress() async throws {
     )?.current?.locationScanRequired == false)
 }
 
+@Test("display-only warehouse code enrichment preserves legacy scan progress")
+func warehouseCodeUpgradePreservesScanProgress() async throws {
+    let session = PickingSession(cache: MemoryCache())
+    let firstGeneratedAt = Date(timeIntervalSince1970: 1_700_000_000)
+    try await session.replaceQueue(locationFirstQueue(generatedAt: firstGeneratedAt))
+
+    _ = try await session.accept(BarcodeObservation(
+        value: "CP1L-GWL0000003",
+        source: .iPhoneCamera,
+        capturedAt: firstGeneratedAt
+    ), now: firstGeneratedAt)
+    #expect(await session.currentWorkflowStage() == .productReady)
+
+    try await session.replaceQueue(locationFirstQueue(
+        generatedAt: firstGeneratedAt.addingTimeInterval(60),
+        warehouseCode: "AG-ALCHEMY-01"
+    ))
+
+    #expect(await session.currentTask()?.warehouseCode == "AG-ALCHEMY-01")
+    #expect(await session.currentWorkflowStage() == .productReady)
+}
+
 @Test("refresh resets scan progress on any current-order authority drift")
 func changedQueueRefreshResetsScanProgress() async throws {
     let now = Date(timeIntervalSince1970: 1_700_000_000)
@@ -1937,9 +1961,22 @@ func legacyCachedTaskLocationPolicyIsOff() throws {
     }
     """#.utf8)
     let task = try JSONDecoder().decode(PickTask.self, from: legacy)
+    #expect(task.warehouseCode == nil)
     #expect(task.locationBarcode == nil)
     #expect(task.locationScanRequired == nil)
     #expect(task.locationScanPolicyRowVersion == nil)
+}
+
+@Test("warehouse display code round-trips without changing task authority")
+func pickTaskWarehouseCodeRoundTrip() throws {
+    let queue = try fixtureQueue()
+    let task = try #require(queue.orders.first?.tasks.first)
+    #expect(task.warehouseCode == "MAIN-01")
+
+    let data = try JSONEncoder().encode(task)
+    let decoded = try JSONDecoder().decode(PickTask.self, from: data)
+    #expect(decoded == task)
+    #expect(decoded.warehouseCode == "MAIN-01")
 }
 
 @Test("Watch projection carries display data but no barcode or mutation authority")

@@ -420,6 +420,19 @@ struct PickingDashboardView: View {
         VStack(alignment: .leading, spacing: 16) {
             productImage(task.productImageURL, productName: task.productName)
 
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    if let orderNumber = model.currentOrderNumber {
+                        pickContextChip("Order \(orderNumber)", color: PickingTheme.primary)
+                    }
+                    if let warehouseCode = task.warehouseCode {
+                        pickContextChip(warehouseCode, color: PickingTheme.muted)
+                    }
+                    Spacer(minLength: 0)
+                }
+                currentPickStageChip
+            }
+
             VStack(alignment: .leading, spacing: 4) {
                 Text("GO TO")
                     .font(.caption2.weight(.bold))
@@ -560,6 +573,32 @@ struct PickingDashboardView: View {
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(PickingTheme.danger)
             }
+        }
+    }
+
+    private func pickContextChip(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption2.weight(.bold))
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+            .background(color.opacity(0.1), in: Capsule())
+    }
+
+    @ViewBuilder
+    private var currentPickStageChip: some View {
+        switch model.currentWorkflowStage {
+        case .location:
+            pickContextChip("Location scan first", color: Color.orange)
+        case .productReady:
+            pickContextChip("Location verified", color: PickingTheme.mint)
+        case .product:
+            pickContextChip("Product scan", color: PickingTheme.mint)
+        case .count:
+            pickContextChip("Enter picked count", color: Color.orange)
+        case nil:
+            pickContextChip("Pick ready", color: PickingTheme.muted)
         }
     }
 

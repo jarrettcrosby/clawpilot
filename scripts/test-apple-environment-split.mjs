@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, statSync } from 'node:fs'
 
 const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8')
 const project = read('clients/apple/project.yml')
@@ -10,6 +10,7 @@ const association = read('app_src/lib/appleAppLinks.ts')
 const simulatorBuilds = read('clients/apple/run-xcode-simulator-builds.sh')
 const phonePrivacy = read('clients/apple/Apps/iPhone/PrivacyInfo.xcprivacy')
 const watchPrivacy = read('clients/apple/Apps/Watch/PrivacyInfo.xcprivacy')
+const developmentArchiveVerifier = read('clients/apple/verify-development-archive.sh')
 
 for (const fragment of [
   'Development: debug',
@@ -99,5 +100,79 @@ assert.ok(
   !watchPrivacy.includes('NSPrivacyAccessedAPICategoryFileTimestamp'),
   'Watch must not declare the iPhone-only file metadata reason',
 )
+
+assert.ok(
+  (statSync(new URL('../clients/apple/verify-development-archive.sh', import.meta.url)).mode & 0o111) !== 0,
+  'Development archive verifier must be executable',
+)
+for (const fragment of [
+  'set +x',
+  'CLAWPILOT_GOOGLE_DEV_IOS_CLIENT_ID',
+  'CLAWPILOT_GOOGLE_SERVER_CLIENT_ID_SHARED',
+  'CLAWPILOT_GOOGLE_DEV_REVERSED_CLIENT_ID',
+  'CLAWPILOT_META_DEV_APP_ID',
+  'CLAWPILOT_META_DEV_CLIENT_TOKEN',
+  'the ignored Local.xcconfig credential overlay is missing',
+  '*not-configured*',
+  '*placeholder*',
+  'GIDClientID',
+  'GIDServerClientID',
+  'MWDAT:MetaAppID',
+  'MWDAT:ClientToken',
+  'plist_has_url_scheme',
+  'com.eigenracing.ios.picking.dev',
+  'com.eigenracing.ios.picking.dev.watch',
+  'https://dev.aiapp.eigenracing.com',
+  'ApplicationProperties:CFBundleVersion',
+  'CURRENT_PROJECT_VERSION:',
+  'the current project build number',
+  'ApplicationProperties:CFBundleIdentifier',
+  'ClawPilotPickingPhoneDev',
+  'codesign --verify --deep --strict',
+]) {
+  assert.ok(
+    developmentArchiveVerifier.includes(fragment),
+    `Development archive verifier is missing ${fragment}`,
+  )
+}
+assert.match(
+  developmentArchiveVerifier,
+  /require_plist_equal "\$\{phone_plist\}" GIDClientID "\$\{google_client_id\}"/,
+  'Signed Google iOS client ID must exactly match the ignored local overlay',
+)
+assert.match(project, /CURRENT_PROJECT_VERSION: "15"/)
+assert.match(
+  developmentArchiveVerifier,
+  /require_plist_equal "\$\{phone_plist\}" GIDServerClientID "\$\{google_server_client_id\}"/,
+  'Signed Google server client ID must exactly match the ignored local overlay',
+)
+assert.match(
+  developmentArchiveVerifier,
+  /plist_has_url_scheme "\$\{phone_plist\}" "\$\{google_callback\}"/,
+  'Signed Google callback must exactly match the ignored local overlay',
+)
+assert.match(
+  developmentArchiveVerifier,
+  /require_plist_equal "\$\{phone_plist\}" MWDAT:MetaAppID "\$\{meta_app_id\}"/,
+  'Signed Meta app ID must exactly match the ignored local overlay',
+)
+assert.match(
+  developmentArchiveVerifier,
+  /require_plist_equal "\$\{phone_plist\}" MWDAT:ClientToken "\$\{meta_client_token\}"/,
+  'Signed Meta client token must exactly match the ignored local overlay',
+)
+for (const secretName of [
+  'google_client_id',
+  'google_server_client_id',
+  'google_callback',
+  'meta_app_id',
+  'meta_client_token',
+]) {
+  assert.doesNotMatch(
+    developmentArchiveVerifier,
+    new RegExp(`(?:echo|printf)[^\\n]*\\$\\{${secretName}\\}`),
+    `Development archive verifier must never print ${secretName}`,
+  )
+}
 
 console.log('Apple development/production environment split contract passed')

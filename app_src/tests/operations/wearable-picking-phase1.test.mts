@@ -92,15 +92,33 @@ test('location-first scanning is an explicit audited per-warehouse policy that d
 test('wearable queue emits exact CP1L identity only for enabled warehouse policy', () => {
   const contract = read('lib/operations/wearablePicking.ts')
   const persistence = read('lib/persistence/wearablePicking.ts')
+  const phone = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+  const dashboard = read('../clients/apple/Apps/iPhone/PickingDashboardView.swift')
 
+  assert.match(contract, /warehouseCode\?: string/)
   assert.match(contract, /locationBarcode\?: string/)
   assert.match(contract, /locationScanRequired\?: true/)
+  assert.match(persistence, /warehouse\.code AS warehouse_code/)
+  assert.match(persistence, /warehouseCode: requiredIdentity\(row\.warehouse_code, 'warehouse code'\)/)
   assert.match(persistence, /location\.global_id AS location_global_id/)
   assert.match(persistence, /LEFT JOIN operations_wearable_location_scan_policies scan_policy/)
   assert.match(persistence, /COALESCE\(scan_policy\.location_scan_required, false\)/)
   assert.match(persistence, /row\.location_scan_required \? \{/)
   assert.match(persistence, /locationBarcode\(/)
   assert.match(persistence, /locationScanRequired: true as const/)
+  assert.match(phone, /@Published var currentOrderNumber: String\?/)
+  assert.match(phone, /currentOrderNumber = activeOrder\?\.orderNumber/)
+  assert.match(dashboard, /if let orderNumber = model\.currentOrderNumber/)
+  assert.match(dashboard, /if let warehouseCode = task\.warehouseCode/)
+  assert.match(dashboard, /"Location scan first"/)
+  assert.match(dashboard, /"Location verified"/)
+  assert.match(dashboard, /"Product scan"/)
+  assert.match(dashboard, /"Enter picked count"/)
+  assert.match(dashboard, /switch model\.currentWorkflowStage/)
+  assert.match(
+    read('../clients/apple/Sources/ClawPilotPickingCore/PickingSession.swift'),
+    /private static func progressAuthorityMatches[\s\S]*leftTask\.locationCode == rightTask\.locationCode[\s\S]*leftTask\.warehouseGlobalId == rightTask\.warehouseGlobalId/,
+  )
 })
 
 test('native scan state requires location before product without giving Watch confirmation authority', () => {

@@ -23,6 +23,7 @@ type WearablePickRow = QueryResultRow & {
   barcode_snapshot: string | null
   assigned_barcode: string | null
   warehouse_global_id: string
+  warehouse_code: string
   location_global_id: string
   location_code: string
   location_scan_required: boolean
@@ -95,6 +96,7 @@ export async function readAssignedWearablePickQueueFromPostgres(input: {
             product_channel.provider_barcode AS barcode_snapshot,
             product_barcode.barcode_value AS assigned_barcode,
             warehouse.global_id AS warehouse_global_id,
+            warehouse.code AS warehouse_code,
             location.global_id AS location_global_id,
             location.code AS location_code,
             COALESCE(scan_policy.location_scan_required, false) AS location_scan_required,
@@ -203,6 +205,7 @@ export async function readAssignedWearablePickQueueFromPostgres(input: {
         ? providerBarcodeIdentity(row.barcode_snapshot)?.value || null
         : requiredIdentity(row.assigned_barcode, 'assigned barcode')),
       locationCode: requiredIdentity(row.location_code, 'location'),
+      warehouseCode: requiredIdentity(row.warehouse_code, 'warehouse code'),
       ...(row.location_scan_required ? {
         warehouseGlobalId: requiredIdentity(row.warehouse_global_id, 'warehouse identity'),
         locationGlobalId: requiredIdentity(row.location_global_id, 'location identity'),

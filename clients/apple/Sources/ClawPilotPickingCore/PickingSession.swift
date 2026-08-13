@@ -79,7 +79,9 @@ public actor PickingSession {
            let progress = try await cache.loadProgress(),
            progress.organizationId == restored.organizationId,
            progress.workerEmail == restored.workerEmail,
-           let restoredIndex = restored.orders.firstIndex(of: progress.order),
+           let restoredIndex = restored.orders.firstIndex(where: {
+               Self.progressAuthorityMatches($0, progress.order)
+           }),
            progressStateIsValid(progress, now: now) {
             orderIndex = restoredIndex
             scannedTaskIDs = progress.scannedTaskIDs
@@ -111,7 +113,9 @@ public actor PickingSession {
            let previousOrder,
            previousQueue.organizationId == queue.organizationId,
            previousQueue.workerEmail == queue.workerEmail,
-           let refreshedIndex = queue.orders.firstIndex(of: previousOrder) {
+           let refreshedIndex = queue.orders.firstIndex(where: {
+               Self.progressAuthorityMatches($0, previousOrder)
+           }) {
             orderIndex = refreshedIndex
             try await persistProgress()
             return
@@ -1011,6 +1015,36 @@ public actor PickingSession {
             countEvidence: countEvidence,
             stageContextTokens: stageContextTokens
         )
+    }
+
+    /// Warehouse code is display-only metadata introduced after the durable
+    /// scan contract. Its first appearance on refresh must not erase otherwise
+    /// exact location, product, or count progress from an older cached queue.
+    private static func progressAuthorityMatches(
+        _ left: PickOrder,
+        _ right: PickOrder
+    ) -> Bool {
+        guard left.orderGlobalId == right.orderGlobalId,
+              left.orderNumber == right.orderNumber,
+              left.rowVersion == right.rowVersion,
+              left.tasks.count == right.tasks.count else { return false }
+        return zip(left.tasks, right.tasks).allSatisfy { leftTask, rightTask in
+            leftTask.pickTaskGlobalId == rightTask.pickTaskGlobalId
+                && leftTask.sequence == rightTask.sequence
+                && leftTask.productGlobalId == rightTask.productGlobalId
+                && leftTask.productName == rightTask.productName
+                && leftTask.channelSku == rightTask.channelSku
+                && leftTask.productImageURL == rightTask.productImageURL
+                && leftTask.barcode == rightTask.barcode
+                && leftTask.locationCode == rightTask.locationCode
+                && leftTask.warehouseGlobalId == rightTask.warehouseGlobalId
+                && leftTask.locationGlobalId == rightTask.locationGlobalId
+                && leftTask.locationBarcode == rightTask.locationBarcode
+                && leftTask.locationScanRequired == rightTask.locationScanRequired
+                && leftTask.locationScanPolicyRowVersion
+                    == rightTask.locationScanPolicyRowVersion
+                && leftTask.quantity == rightTask.quantity
+        }
     }
 
     private func applyWorkflowProgress(_ state: WorkflowProgressState) {
