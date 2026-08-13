@@ -4546,7 +4546,7 @@ export default function OperationsSection({
             onOpenOrder={openPickingOrder}
           />
         ) : view === 'imports' ? (
-          <CommerceImportsPanel />
+          <CommerceImportsPanel onOpenOrder={openPickingOrder} />
         ) : view === 'receiving' ? (
           <ReceivingPanel workspace={workspace} onRefresh={() => loadWorkspace()} />
         ) : view === 'warehouses' ? (

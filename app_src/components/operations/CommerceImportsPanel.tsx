@@ -51,7 +51,11 @@ function humanize(value: string) {
     .replace(/\b\w/g, (letter) => letter.toUpperCase())
 }
 
-export default function CommerceImportsPanel() {
+export default function CommerceImportsPanel({
+  onOpenOrder,
+}: {
+  onOpenOrder: (orderGlobalId: string) => void
+}) {
   const [payload, setPayload] = useState<CommercePayload | null>(null)
   const [selectedAccountGlobalId, setSelectedAccountGlobalId] = useState('')
   const [requestedAccountGlobalId, setRequestedAccountGlobalId] = useState('')
@@ -277,6 +281,7 @@ export default function CommerceImportsPanel() {
                 <ShopifyInventoryPanel
                   accountGlobalId={selectedAccount.globalId}
                   displayName={selectedAccount.displayName}
+                  onOpenOrder={onOpenOrder}
                 />
               ) : null}
             </>

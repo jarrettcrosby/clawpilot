@@ -136,15 +136,18 @@ function iso(value: unknown, label: string): string {
 }
 
 function wholeQuantity(value: unknown, label: string): number {
-  const quantity = Number(value)
-  if (!Number.isSafeInteger(quantity) || quantity < 0) {
+  if (
+    typeof value !== 'number'
+    || !Number.isSafeInteger(value)
+    || value < 0
+  ) {
     fail(
       'SHOPIFY_EXTERNAL_FULFILLMENT_RESPONSE_INVALID',
       `Shopify returned malformed ${label}`,
       502,
     )
   }
-  return quantity
+  return value
 }
 
 function connection(value: unknown, label: string) {
@@ -233,39 +236,44 @@ export function normalizeShopifyExternalFulfillmentEvidence(input: {
     line.externalLineId,
     line.quantity,
   ]))
-  const providerLines = connection(order.lineItems, 'order lines')
-  if (
-    providerLines.length !== targetByLine.size
-    || providerLines.some((line) => !targetByLine.has(String(line.id || '')))
-  ) {
+  const providerFulfillments = records(
+    order.fulfillments,
+    'fulfillments',
+  )
+  if (providerFulfillments.length >= 250) {
     fail(
-      'SHOPIFY_EXTERNAL_FULFILLMENT_LINE_CHANGED',
-      'Shopify no longer has the exact released order line set',
+      'SHOPIFY_EXTERNAL_FULFILLMENT_PAGINATION_REQUIRED',
+      'Shopify fulfillments exceed the bounded reconciliation read',
     )
   }
-  for (const [externalLineId, quantity] of targetByLine) {
-    const matches = providerLines.filter((line) => line.id === externalLineId)
-    if (matches.length !== 1) {
-      fail(
-        'SHOPIFY_EXTERNAL_FULFILLMENT_LINE_CHANGED',
-        'Shopify no longer has the exact released order line',
+  const fulfilledAllocationByLine = new Map<string, number>()
+  for (const [index, fulfillment] of providerFulfillments.entries()) {
+    const fulfillmentLines = connection(
+      fulfillment.fulfillmentLineItems,
+      `fulfillment ${index + 1} lines`,
+    )
+    for (const fulfillmentLine of fulfillmentLines) {
+      const orderLine = record(
+        fulfillmentLine.lineItem,
+        'fulfillment source line',
       )
-    }
-    const line = matches[0]
-    if (
-      wholeQuantity(line.currentQuantity, 'current line quantity') !== quantity
-      || wholeQuantity(line.unfulfilledQuantity, 'unfulfilled line quantity')
-        !== 0
-      || line.requiresShipping !== true
-    ) {
-      fail(
-        'SHOPIFY_EXTERNAL_FULFILLMENT_LINE_CHANGED',
-        'Shopify line quantities no longer match the released warehouse work',
+      const externalLineId = text(
+        orderLine.id,
+        'fulfillment source line ID',
+        SHOPIFY_LINE_ITEM_GID,
+      )
+      const quantity = wholeQuantity(
+        fulfillmentLine.quantity,
+        'fulfillment line quantity',
+      )
+      fulfilledAllocationByLine.set(
+        externalLineId,
+        (fulfilledAllocationByLine.get(externalLineId) || 0) + quantity,
       )
     }
   }
 
-  const normalizedFulfillmentOrders = connection(
+  const allFulfillmentOrders = connection(
     order.fulfillmentOrders,
     'fulfillment orders',
   ).map((value) => {
@@ -310,12 +318,91 @@ export function normalizeShopifyExternalFulfillmentEvidence(input: {
         'fulfillment-order request status',
       ),
       updatedAt: iso(value.updatedAt, 'fulfillment-order update time'),
-      locationId: text(location.id, 'fulfillment-order location ID', SHOPIFY_LOCATION_GID),
+      locationId: text(
+        location.id,
+        'fulfillment-order location ID',
+        SHOPIFY_LOCATION_GID,
+      ),
       lines,
     }
-  }).filter((fulfillmentOrder) => fulfillmentOrder.lines.some(
+  })
+  const fulfillmentOrderLinesByExternalId = new Map<
+    string,
+    Array<{ totalQuantity: number; remainingQuantity: number }>
+  >()
+  for (const fulfillmentOrder of allFulfillmentOrders) {
+    for (const line of fulfillmentOrder.lines) {
+      const prior = fulfillmentOrderLinesByExternalId.get(
+        line.externalLineId,
+      ) || []
+      prior.push({
+        totalQuantity: line.totalQuantity,
+        remainingQuantity: line.remainingQuantity,
+      })
+      fulfillmentOrderLinesByExternalId.set(line.externalLineId, prior)
+    }
+  }
+  const providerLines = connection(order.lineItems, 'order lines').filter(
+    (line) => {
+      const externalLineId = text(
+        line.id,
+        'order line ID',
+        SHOPIFY_LINE_ITEM_GID,
+      )
+      if (targetByLine.has(externalLineId)) return true
+      const fullyRemoved = (
+        wholeQuantity(line.currentQuantity, 'current line quantity') === 0
+        && wholeQuantity(
+          line.unfulfilledQuantity,
+          'unfulfilled line quantity',
+        ) === 0
+        && line.requiresShipping === false
+        && (fulfilledAllocationByLine.get(externalLineId) || 0) === 0
+        && (fulfillmentOrderLinesByExternalId.get(externalLineId) || [])
+          .every((allocation) => (
+            allocation.totalQuantity === 0
+            && allocation.remainingQuantity === 0
+          ))
+      )
+      return !fullyRemoved
+    },
+  )
+  if (
+    providerLines.length !== targetByLine.size
+    || providerLines.some((line) => !targetByLine.has(String(line.id || '')))
+  ) {
+    fail(
+      'SHOPIFY_EXTERNAL_FULFILLMENT_LINE_CHANGED',
+      'Shopify no longer has the exact released order line set',
+    )
+  }
+  for (const [externalLineId, quantity] of targetByLine) {
+    const matches = providerLines.filter((line) => line.id === externalLineId)
+    if (matches.length !== 1) {
+      fail(
+        'SHOPIFY_EXTERNAL_FULFILLMENT_LINE_CHANGED',
+        'Shopify no longer has the exact released order line',
+      )
+    }
+    const line = matches[0]
+    if (
+      wholeQuantity(line.currentQuantity, 'current line quantity') !== quantity
+      || wholeQuantity(line.unfulfilledQuantity, 'unfulfilled line quantity')
+        !== 0
+      || line.requiresShipping !== true
+    ) {
+      fail(
+        'SHOPIFY_EXTERNAL_FULFILLMENT_LINE_CHANGED',
+        'Shopify line quantities no longer match the released warehouse work',
+      )
+    }
+  }
+
+  const normalizedFulfillmentOrders = allFulfillmentOrders.filter(
+    (fulfillmentOrder) => fulfillmentOrder.lines.some(
     (line) => targetByLine.has(line.externalLineId),
-  ))
+    ),
+  )
 
   const fulfillmentOrderCoverage = new Map<string, number>()
   for (const fulfillmentOrder of normalizedFulfillmentOrders) {
@@ -353,16 +440,6 @@ export function normalizeShopifyExternalFulfillmentEvidence(input: {
     }
   }
 
-  const providerFulfillments = records(
-    order.fulfillments,
-    'fulfillments',
-  )
-  if (providerFulfillments.length >= 250) {
-    fail(
-      'SHOPIFY_EXTERNAL_FULFILLMENT_PAGINATION_REQUIRED',
-      'Shopify fulfillments exceed the bounded reconciliation read',
-    )
-  }
   const successfulFulfillments = providerFulfillments.filter((value) => (
     value.status === 'SUCCESS'
     && value.displayStatus === 'FULFILLED'
