@@ -73,10 +73,16 @@ async function loadCandidates(client, lock = false) {
      WHERE outbox.target_system = 'suitecrm'
        AND outbox.aggregate_type = 'crm_interactions'
        AND outbox.operation = 'reproject_record'
-       AND outbox.status = 'dead'
+       AND pipeline.sync_enabled = true
+       AND (
+         outbox.status = 'dead'
+         OR (outbox.status = 'failed' AND outbox.attempts >= 8)
+       )
        AND outbox.last_error = ANY($1::text[])
-       AND interaction.sync_status = 'failed'
-       AND interaction.sync_error = outbox.last_error
+       AND (
+         (interaction.sync_status = 'failed' AND interaction.sync_error = outbox.last_error)
+         OR (interaction.sync_status = 'syncing' AND interaction.sync_error IS NULL)
+       )
        AND interaction.suitecrm_module = 'Emails'
        AND outbox.payload->>'suiteCrmModule' = 'Emails'
        AND outbox.payload->>'localId' = interaction.id::text
@@ -120,16 +126,19 @@ async function applyRepair(client, actor, expectedDigest) {
            lock_token = NULL,
            updated_at = now()
        WHERE id = ANY($1::uuid[])
-         AND status = 'dead'
+         AND (
+           status = 'dead'
+           OR (status = 'failed' AND attempts >= 8)
+         )
        RETURNING id::text`,
       [outboxIds],
     )
     if (requeued.rowCount !== candidates.length) fail('Email projection outbox repair count changed')
     const reset = await client.query(
-      `UPDATE crm_interactions
+     `UPDATE crm_interactions
        SET sync_status = 'pending', sync_error = NULL, updated_at = now()
        WHERE id = ANY($1::uuid[])
-         AND sync_status = 'failed'
+         AND sync_status IN ('failed', 'syncing')
        RETURNING id::text`,
       [interactionIds],
     )
