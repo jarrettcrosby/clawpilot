@@ -2904,6 +2904,9 @@ assert.deepEqual(
 )
 
 const completedRouteHeartbeats = []
+let completedRouteReconciliationCalls = 0
+const completedRouteWorkerOrder = []
+let completedRouteHistoryShouldFail = false
 const completedRouteRunResult = {
   automaticShopifyOrderPromotion:
     shopifyPromotionPolicy.shopifyAutomaticOrderPromotionHealthSnapshot({
@@ -2946,11 +2949,47 @@ const completedRouteModule = loadTypeScriptModule(
       },
       '@/lib/commerceOrderReconciliationWorker': {
         async processCommerceOrderReconciliation() {
+          completedRouteReconciliationCalls += 1
           return completedRouteRunResult
+        },
+      },
+      '@/lib/commerceOrderHistoryWorker': {
+        async processCommerceOrderHistory() {
+          completedRouteWorkerOrder.push('history:start')
+          if (completedRouteHistoryShouldFail) {
+            const error = new Error('provider secret response must not escape')
+            error.code = 'COMMERCE_ORDER_HISTORY_CURSOR_INVALID'
+            throw error
+          }
+          completedRouteWorkerOrder.push('history:complete')
+          return {
+            claimed: 0,
+            providerReads: 0,
+            providerReadOnly: true,
+            operationsOrderWrites: 0,
+            providerWrites: 0,
+          }
+        },
+      },
+      '@/lib/shopifyOrderWebhookWorker': {
+        async processShopifyOrderWebhookSignals() {
+          completedRouteWorkerOrder.push('webhook:start')
+          return {
+            claimed: 0,
+            providerReads: 0,
+            providerReadOnly: true,
+            operationsOrderWrites: 0,
+            providerWrites: 0,
+          }
         },
       },
       '@/lib/persistence/config': {
         isPostgresStorageEnabled: () => true,
+      },
+      '@/lib/persistence/commerceOrderSync': {
+        async redactExpiredCommerceOrderSensitiveEvidenceInPostgres() {
+          return { redacted: 0, providerWrites: 0 }
+        },
       },
       '@/lib/persistence/commerceOrderReconciliation': {
         async readCommerceOrderReconciliationHealthFromPostgres() {
@@ -2999,7 +3038,13 @@ try {
   }
 }
 assert.equal(completedRouteResponse.status, 200)
+assert.ok(
+  completedRouteWorkerOrder.indexOf('webhook:start')
+    > completedRouteWorkerOrder.indexOf('history:complete'),
+  'Webhook exact reads must start after history policy transitions complete',
+)
 assert.equal(completedRouteHeartbeats.length, 2)
+assert.equal(completedRouteReconciliationCalls, 1)
 const completedRouteHeartbeat = completedRouteHeartbeats[1]
 assert.equal(completedRouteHeartbeat.phase, 'completed')
 assert.equal(
@@ -3031,7 +3076,52 @@ assert.equal(
   'Legacy unattributed attention must survive a completed limited batch',
 )
 
+completedRouteHistoryShouldFail = true
+process.env.PIPELINE_OUTBOX_WORKER_SECRET = completedRouteSecret
+let isolatedHistoryFailureResponse
+try {
+  isolatedHistoryFailureResponse = await completedRouteModule.POST({
+    headers: {
+      get(name) {
+        return name === 'authorization'
+          ? `Bearer ${completedRouteSecret}`
+          : null
+      },
+    },
+    async json() {
+      return { limit: 1 }
+    },
+  })
+} finally {
+  completedRouteHistoryShouldFail = false
+  if (priorWorkerSecret === undefined) {
+    delete process.env.PIPELINE_OUTBOX_WORKER_SECRET
+  } else {
+    process.env.PIPELINE_OUTBOX_WORKER_SECRET = priorWorkerSecret
+  }
+}
+assert.equal(isolatedHistoryFailureResponse.status, 200)
+assert.equal(completedRouteReconciliationCalls, 2)
+assert.equal(isolatedHistoryFailureResponse.body.orderHistory.degraded, true)
+assert.equal(
+  isolatedHistoryFailureResponse.body.orderHistory.errorCode,
+  'COMMERCE_ORDER_HISTORY_CURSOR_INVALID',
+)
+assert.equal(isolatedHistoryFailureResponse.body.orderHistory.providerWrites, 0)
+assert.equal(
+  isolatedHistoryFailureResponse.body.orderHistory.operationsOrderWrites,
+  0,
+)
+assert.equal(
+  JSON.stringify(isolatedHistoryFailureResponse.body).includes(
+    'provider secret response must not escape',
+  ),
+  false,
+)
+assert.equal(completedRouteHeartbeats.at(-1).phase, 'completed')
+
 let disabledRoutePurgeCalls = 0
+let disabledRouteRedactionCalls = 0
 let disabledRouteWorkerCalls = 0
 const disabledRouteModule = loadTypeScriptModule(
   'app_src/app/api/integrations/commerce/orders/process/route.ts',
@@ -3054,6 +3144,18 @@ const disabledRouteModule = loadTypeScriptModule(
           assert.fail('disabled commerce intake must not start provider reconciliation')
         },
       },
+      '@/lib/commerceOrderHistoryWorker': {
+        async processCommerceOrderHistory() {
+          disabledRouteWorkerCalls += 1
+          assert.fail('disabled commerce intake must not start order history')
+        },
+      },
+      '@/lib/shopifyOrderWebhookWorker': {
+        async processShopifyOrderWebhookSignals() {
+          disabledRouteWorkerCalls += 1
+          assert.fail('disabled commerce intake must not start Shopify order webhook reads')
+        },
+      },
       '@/lib/persistence/config': {
         isPostgresStorageEnabled: () => true,
       },
@@ -3068,6 +3170,12 @@ const disabledRouteModule = loadTypeScriptModule(
             expiredProtectedReadBacklog: 0,
             backlogTruncated: false,
           }
+        },
+      },
+      '@/lib/persistence/commerceOrderSync': {
+        async redactExpiredCommerceOrderSensitiveEvidenceInPostgres() {
+          disabledRouteRedactionCalls += 1
+          return { redacted: 2, providerWrites: 0 }
         },
       },
       '@/lib/persistence/commerceOrderReconciliation': {
@@ -3103,8 +3211,17 @@ try {
 assert.equal(disabledRouteResponse.status, 200)
 assert.equal(disabledRouteResponse.body.skipped, true)
 assert.equal(disabledRouteResponse.body.protectedSnapshotPurge.purged, 1)
+assert.equal(
+  disabledRouteResponse.body.orderSensitiveEvidenceRedaction.redacted,
+  2,
+)
 assert.equal(disabledRoutePurgeCalls, 1)
+assert.equal(disabledRouteRedactionCalls, 1)
 assert.equal(disabledRouteWorkerCalls, 0)
+assert.equal(
+  disabledRouteResponse.body.orderSensitiveEvidenceRedaction.providerWrites,
+  0,
+)
 assert.notEqual(
   completedRouteHeartbeat.automaticFaireExactRefresh.operatorReviewRequired,
   8,
@@ -3118,6 +3235,7 @@ includes(route, [
   'commerceReadRuntimeAvailable()',
   'isPostgresStorageEnabled()',
   'processCommerceOrderReconciliation',
+  'processShopifyOrderWebhookSignals',
   'recordCommerceOrderReconciliationWorkerHeartbeatInPostgres',
   'readCommerceOrderReconciliationHealthFromPostgres',
   'durableAutomaticAttentionHealth',

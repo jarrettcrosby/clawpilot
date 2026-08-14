@@ -4,7 +4,7 @@ export const PACKAGING_MATERIAL_TYPES = [
   'padded_mailer',
 ] as const
 
-export const PACKAGING_MATERIAL_STATUSES = ['draft', 'active'] as const
+export const PACKAGING_MATERIAL_STATUSES = ['draft', 'active', 'retired'] as const
 export const PACKAGING_DIMENSION_BASES = [
   'inner',
   'outer',
@@ -22,6 +22,7 @@ export const PACKAGING_MATERIAL_SOURCES = [
   'starter_assortment',
   'customer_supplied',
   'csv_import',
+  'shopify_import',
 ] as const
 
 export type PackagingMaterialType = typeof PACKAGING_MATERIAL_TYPES[number]
@@ -80,6 +81,14 @@ export type PackagingMaterial = {
   currency: string | null
   status: PackagingMaterialStatus
   source: PackagingMaterialSource
+  shopifyImport?: {
+    accountGlobalId: string
+    accountDisplayName: string
+    externalPackageId: string | null
+    isDefault: boolean
+    importedAt: string
+    fileSha256: string
+  } | null
   rowVersion: number
   updatedAt: string
   stock: PackagingMaterialStock[]
@@ -110,6 +119,15 @@ export type PackagingMaterialsWorkspace = {
     status: 'active' | 'inactive'
   }>
   materials: PackagingMaterial[]
+  shopifyPackageImport?: {
+    providerListApiAvailable: false
+    importMethod: 'csv'
+    accounts: Array<{
+      globalId: string
+      displayName: string
+      canonicalDomain: string
+    }>
+  }
   optimizerReadiness: {
     historyWindowDays: number
     shippedDemandSampleCount: number

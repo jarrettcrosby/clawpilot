@@ -16,6 +16,8 @@ import StorefrontRounded from '@mui/icons-material/StorefrontRounded'
 import CommerceIntakeWorkflow from '@/components/settings/CommerceIntakeWorkflow'
 import ShopifyInventoryPanel from '@/components/operations/ShopifyInventoryPanel'
 import CartonizationRateEvidencePanel from '@/components/operations/CartonizationRateEvidencePanel'
+import CommerceAuthoritySummaryPanel from '@/components/operations/CommerceAuthoritySummaryPanel'
+import CommerceOrderHistoryPanel from '@/components/operations/CommerceOrderHistoryPanel'
 
 type CommerceProvider = 'shopify' | 'faire'
 
@@ -277,6 +279,22 @@ export default function CommerceImportsPanel({
                 canManage={payload.canManage === true}
                 canActivate={payload.canActivate === true}
               />
+              {payload.canManage === true ? (
+                <>
+                  <CommerceAuthoritySummaryPanel
+                    key={`authority:${selectedAccount.globalId}`}
+                    accountGlobalId={selectedAccount.globalId}
+                    provider={selectedAccount.provider}
+                  />
+                  <CommerceOrderHistoryPanel
+                    key={`history:${selectedAccount.globalId}`}
+                    accountGlobalId={selectedAccount.globalId}
+                    provider={selectedAccount.provider}
+                    canManage
+                    onOpenOrder={onOpenOrder}
+                  />
+                </>
+              ) : null}
               {selectedAccount.provider === 'shopify' ? (
                 <ShopifyInventoryPanel
                   accountGlobalId={selectedAccount.globalId}

@@ -28,7 +28,7 @@ export function resolveCommerceSetupPermissionGuidance(input: {
       mode: 'shopify_app_scopes',
       heading: 'Exact Shopify app scopes ClawPilot expects',
       description:
-        'Copy this list into the Shopify app-version permission screen. ClawPilot verifies the granted scopes before enabling each capability.',
+        'Copy this list into the Shopify app-version permission screen. This profile intentionally reserves future customer, inventory, order, fulfillment, return, shipping, and app-proxy paths. Shopify write scopes include the matching read access, so write_inventory covers both inventory reads and a future separately authorized write path. ClawPilot still blocks every provider write unless its exact outbound workflow is implemented, activated, and authorized.',
       scopes: input.shopifyScopes,
       copyable: true,
     }

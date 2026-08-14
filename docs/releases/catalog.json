@@ -3,24 +3,23 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Toast closeout-safe preorder posting",
-      "summary": "ClawPilot now keeps prepaid-order accounting visible while preventing QuickBooks posting until Toast payment and fulfillment evidence is final.",
+      "title": "Commerce order history and Shopify package imports",
+      "summary": "ClawPilot now keeps provider-sourced Shopify and Faire order history, monitors bounded continuous updates, and lets operators import Shopify saved-package CSV files as reviewed packaging drafts.",
       "features": [
-        "A visible provisional Payment Exceptions journal while the payment business day is active",
-        "Separate Paid and Closed evidence in the Toast order drawer",
-        "Actionable reload states for day closeout, payment capture, Toast check closeout, and batch details",
-        "Linked payment-date capture and fulfillment-date release without duplicate sales"
+        "A read-only 60-day Shopify order-history backfill with provider lifecycle, shipment, return, and line evidence",
+        "Provider-available Faire order history with five-minute overlap polling and truthful polling-only readiness",
+        "Seven signed core Shopify order signals with exact order reads and a scheduled polling backstop",
+        "Per-connection commerce authority and readiness evidence without enabling provider writes",
+        "CSV preview and draft import for Shopify saved packages, including dimensions, empty weight, and default-package evidence"
       ],
       "fixes": [
-        "Payment journals cannot post before the restaurant's Toast business-day cutoff",
-        "Card payment journals remain held until Toast reports CAPTURED",
-        "Sales Receipts and release journals remain held until every active Toast check is CLOSED",
-        "Voided Toast activity no longer contributes accounting dates, totals, or closeout holds",
-        "Predeployment drafts now fail closed until regenerated through the current closeout rules",
-        "Payments without paidBusinessDate use the exact Toast cutoff or remain blocked",
-        "Missing or invalid restaurant timezones now block posting instead of falling back to UTC",
-        "Stored orders must be refreshed from Toast after closeout before a posting becomes ready",
-        "A prepared posting cannot be reused or approved after its accounting content changes"
+        "Shopify order synchronization remains read-only and reports non-exhaustive signal coverage instead of claiming every provider change is webhook-driven",
+        "Faire no longer reports unavailable webhook capability as a realtime failure",
+        "Sensitive tracking and provider-staff evidence expires after the bounded retention window while minimized order history remains",
+        "Packaging materials can be removed safely: unused drafts are deleted and referenced materials are retired",
+        "Retired packaging materials cannot be restored through ordinary edits, imports, or stock updates",
+        "Shopify package imports are tenant-scoped, previewed, idempotent, draft-only, and perform no provider reads or writes",
+        "Shopify setup now exposes the complete required scope string with a reliable clipboard fallback and canonical store-domain handling"
       ]
     }
   }

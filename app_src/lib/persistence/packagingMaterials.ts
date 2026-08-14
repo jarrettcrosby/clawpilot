@@ -10,6 +10,9 @@ import {
   type PackagingMaterialStock,
   type PackagingMaterialStockInput,
 } from '@/lib/operations/packagingMaterials'
+import type {
+  ShopifyPackagingImportPreview,
+} from '@/lib/operations/shopifyPackagingImport'
 import {
   acquireTransactionAdvisoryLock,
   query,
@@ -66,6 +69,12 @@ type MaterialRow = QueryResultRow & {
   currency: string | null
   status: PackagingMaterial['status']
   source: PackagingMaterial['source']
+  source_account_global_id: string | null
+  source_account_display_name: string | null
+  source_external_package_id: string | null
+  source_is_default: boolean
+  source_imported_at: Date | null
+  source_file_sha256: string | null
   row_version: string
   updated_at: Date
   stock_id: string | null
@@ -206,6 +215,20 @@ function materialsFromRows(rows: MaterialRow[]): PackagingMaterial[] {
         currency: row.currency,
         status: row.status,
         source: row.source,
+        shopifyImport: row.source === 'shopify_import'
+          && row.source_account_global_id
+          && row.source_account_display_name
+          && row.source_imported_at
+          && row.source_file_sha256
+          ? {
+            accountGlobalId: row.source_account_global_id,
+            accountDisplayName: row.source_account_display_name,
+            externalPackageId: row.source_external_package_id,
+            isDefault: row.source_is_default,
+            importedAt: iso(row.source_imported_at),
+            fileSha256: row.source_file_sha256,
+          }
+          : null,
         rowVersion: integer(row.row_version),
         updatedAt: iso(row.updated_at),
         stock: [],
@@ -255,7 +278,11 @@ async function materialRows(
       material.dimension_confirmed_by,
       material.tare_weight_grams, material.max_weight_grams,
       material.unit_cost_minor::text, material.currency, material.status,
-      material.source, material.row_version::text, material.updated_at,
+      material.source, source_account.global_id AS source_account_global_id,
+      source_account.display_name AS source_account_display_name,
+      material.source_external_package_id, material.source_is_default,
+      material.source_imported_at, material.source_file_sha256,
+      material.row_version::text, material.updated_at,
       stock.id::text AS stock_id, stock.global_id AS stock_global_id,
       stock.warehouse_id::text, warehouse.global_id AS warehouse_global_id,
       warehouse.name AS warehouse_name, warehouse.status AS warehouse_status,
@@ -270,7 +297,11 @@ async function materialRows(
     LEFT JOIN operations_warehouses warehouse
       ON warehouse.organization_id = stock.organization_id
      AND warehouse.id = stock.warehouse_id
+    LEFT JOIN operations_integration_accounts source_account
+      ON source_account.organization_id = material.organization_id
+     AND source_account.id = material.source_integration_account_id
     WHERE material.organization_id = $1::uuid
+      AND material.status <> 'retired'
     ORDER BY
       CASE material.status WHEN 'active' THEN 0 ELSE 1 END,
       material.material_type, lower(material.name), material.id,
@@ -367,6 +398,7 @@ async function readiness(
          )::bigint AS eligible_materials
        FROM operations_packaging_materials material
        WHERE material.organization_id = $1::uuid
+         AND material.status <> 'retired'
      ),
      warehouse_stock_summary AS (
        SELECT
@@ -392,6 +424,7 @@ async function readiness(
         AND stock.packaging_material_id = material.id
         AND stock.warehouse_id = warehouse.id
        WHERE material.organization_id = $1::uuid
+         AND material.status <> 'retired'
          AND warehouse.organization_id = $1::uuid
          AND warehouse.status = 'active'
      )
@@ -449,7 +482,7 @@ export async function readPackagingMaterialsWorkspaceFromPostgres(input: {
       403,
     )
   }
-  const [warehouseResult, rows, optimizerReadiness] = await Promise.all([
+  const [warehouseResult, rows, optimizerReadiness, shopifyAccounts] = await Promise.all([
     query<WarehouseRow>(
       `SELECT id::text, global_id, name, status
        FROM operations_warehouses
@@ -459,6 +492,31 @@ export async function readPackagingMaterialsWorkspaceFromPostgres(input: {
     ),
     materialRows(input.organizationId),
     readiness(input.organizationId),
+    query<{
+      global_id: string
+      display_name: string
+      canonical_domain: string
+    }>(
+      `SELECT account.global_id, account.display_name,
+              account.configuration->>'shopDomain' AS canonical_domain
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+        AND credential.credential_version =
+              account.commerce_credential_generation
+        AND credential.external_account_id = account.external_account_id
+        AND credential.auth_mode = 'shopify_client_credentials'
+        AND credential.verification_status = 'verified'
+       WHERE account.organization_id = $1::uuid
+         AND account.integration_type = 'commerce'
+         AND account.provider = 'shopify'
+         AND account.status = 'active'
+         AND account.configuration->>'shopDomain' ~
+               '^[a-z0-9][a-z0-9-]*[.]myshopify[.]com$'
+       ORDER BY lower(account.display_name), account.id`,
+      [input.organizationId],
+    ),
   ])
   return {
     capabilities: {
@@ -472,6 +530,15 @@ export async function readPackagingMaterialsWorkspaceFromPostgres(input: {
       status: warehouse.status,
     })),
     materials: materialsFromRows(rows),
+    shopifyPackageImport: {
+      providerListApiAvailable: false,
+      importMethod: 'csv',
+      accounts: shopifyAccounts.rows.map((account) => ({
+        globalId: account.global_id,
+        displayName: account.display_name,
+        canonicalDomain: account.canonical_domain,
+      })),
+    },
     optimizerReadiness,
   }
 }
@@ -518,8 +585,10 @@ export async function savePackagingMaterialInPostgres(input: {
           id: string
           row_version: string
           status: PackagingMaterial['status']
+          source: PackagingMaterial['source']
+          code: string
         }>(
-          `SELECT id::text, row_version::text, status
+          `SELECT id::text, row_version::text, status, source, code
            FROM operations_packaging_materials
            WHERE organization_id = $1::uuid AND global_id = $2
            FOR UPDATE`,
@@ -542,6 +611,40 @@ export async function savePackagingMaterialInPostgres(input: {
         }
         materialId = row.id
         previousStatus = row.status
+        if (row.status === 'retired') {
+          throw new PackagingMaterialRequestError(
+            'PACKAGING_MATERIAL_RETIRED',
+            'Retired packaging materials cannot be restored through the generic editor',
+            409,
+          )
+        }
+        if (
+          (row.source === 'shopify_import'
+            || input.material.source === 'shopify_import')
+          && row.source !== input.material.source
+        ) {
+          throw new PackagingMaterialRequestError(
+            'PACKAGING_MATERIAL_SOURCE_IMMUTABLE',
+            'Shopify import provenance can only be established or changed by the verified import workflow',
+            409,
+          )
+        }
+        if (
+          row.source === 'shopify_import'
+          && row.code !== input.material.code
+        ) {
+          throw new PackagingMaterialRequestError(
+            'PACKAGING_MATERIAL_SHOPIFY_CODE_IMMUTABLE',
+            'A Shopify-imported package code is stable so later imports can update the same material',
+            409,
+          )
+        }
+      } else if (input.material.source === 'shopify_import') {
+        throw new PackagingMaterialRequestError(
+          'PACKAGING_MATERIAL_SOURCE_IMMUTABLE',
+          'Create Shopify package materials through the verified import workflow',
+          409,
+        )
       }
 
       let saved: SavedRow
@@ -800,11 +903,15 @@ export async function savePackagingMaterialStockInPostgres(input: {
   stock: PackagingMaterialStockInput
 }) {
   return withTransaction(async (client) => {
-    const material = await client.query<{ id: string; name: string }>(
-      `SELECT id::text, name
+    const material = await client.query<{
+      id: string
+      name: string
+      status: PackagingMaterial['status']
+    }>(
+      `SELECT id::text, name, status
        FROM operations_packaging_materials
        WHERE organization_id = $1::uuid AND global_id = $2
-       FOR SHARE`,
+       FOR UPDATE`,
       [input.organizationId, input.stock.materialGlobalId],
     )
     if (!material.rows[0]) {
@@ -812,6 +919,13 @@ export async function savePackagingMaterialStockInPostgres(input: {
         'PACKAGING_MATERIAL_NOT_FOUND',
         'Packaging material was not found',
         404,
+      )
+    }
+    if (material.rows[0].status === 'retired') {
+      throw new PackagingMaterialRequestError(
+        'PACKAGING_MATERIAL_RETIRED',
+        'Retired packaging materials cannot receive warehouse stock updates',
+        409,
       )
     }
     const warehouse = await client.query<{ id: string; global_id: string; name: string }>(
@@ -967,6 +1081,530 @@ export async function savePackagingMaterialStockInPostgres(input: {
       warehouseGlobalId: warehouse.rows[0].global_id,
       rowVersion: integer(row.row_version),
     }
+  })
+}
+
+export async function removePackagingMaterialInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  materialGlobalId: string
+  expectedRowVersion: number
+  idempotencyKey: string
+}) {
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `packaging-material-remove:${input.organizationId}:${input.materialGlobalId}`,
+    )
+    const commandType = 'operations.packaging_material.remove'
+    const requestHash = createHash('sha256').update(JSON.stringify({
+      version: 1,
+      materialGlobalId: input.materialGlobalId,
+      expectedRowVersion: input.expectedRowVersion,
+    })).digest('hex')
+    const existingReceipt = await client.query<{
+      request_hash: string
+      status: string
+      result_payload: Record<string, unknown> | null
+    }>(
+      `SELECT request_hash, status, result_payload
+       FROM operations_command_receipts
+       WHERE organization_id = $1::uuid
+         AND command_type = $2
+         AND idempotency_key = $3
+       FOR UPDATE`,
+      [input.organizationId, commandType, input.idempotencyKey],
+    )
+    const priorReceipt = existingReceipt.rows[0]
+    if (priorReceipt) {
+      if (priorReceipt.request_hash !== requestHash) {
+        throw new PackagingMaterialRequestError(
+          'PACKAGING_MATERIAL_IDEMPOTENCY_CONFLICT',
+          'This Idempotency-Key was already used for another removal',
+          409,
+        )
+      }
+      if (priorReceipt.status === 'succeeded' && priorReceipt.result_payload) {
+        return { ...priorReceipt.result_payload, replayed: true }
+      }
+      throw new PackagingMaterialRequestError(
+        'PACKAGING_MATERIAL_COMMAND_IN_PROGRESS',
+        'Packaging material removal is already in progress',
+        409,
+      )
+    }
+    const createdReceipt = await client.query<{ id: string }>(
+      `INSERT INTO operations_command_receipts (
+         organization_id, command_type, idempotency_key, request_hash,
+         actor_email, status, correlation_id
+       ) VALUES ($1::uuid, $2, $3, $4, $5, 'processing', gen_random_uuid())
+       RETURNING id::text`,
+      [
+        input.organizationId,
+        commandType,
+        input.idempotencyKey,
+        requestHash,
+        input.actorEmail,
+      ],
+    )
+    const currentResult = await client.query<{
+      id: string
+      global_id: string
+      code: string
+      name: string
+      row_version: string
+      status: PackagingMaterial['status']
+    }>(
+      `SELECT id::text, global_id, code, name, row_version::text, status
+       FROM operations_packaging_materials
+       WHERE organization_id = $1::uuid AND global_id = $2
+       FOR UPDATE`,
+      [input.organizationId, input.materialGlobalId],
+    )
+    const current = currentResult.rows[0]
+    if (!current || current.status === 'retired') {
+      throw new PackagingMaterialRequestError(
+        'PACKAGING_MATERIAL_NOT_FOUND',
+        'Packaging material was not found',
+        404,
+      )
+    }
+    if (integer(current.row_version) !== input.expectedRowVersion) {
+      throw new PackagingMaterialRequestError(
+        'PACKAGING_MATERIAL_VERSION_CONFLICT',
+        'Packaging material changed. Refresh and try again.',
+        409,
+      )
+    }
+    const activeClaims = await client.query<{ quantity: string }>(
+      `SELECT COALESCE(sum(quantity), 0)::text AS quantity
+       FROM operations_packaging_material_claims
+       WHERE organization_id = $1::uuid
+         AND packaging_material_id = $2::uuid
+         AND status = 'active'`,
+      [input.organizationId, current.id],
+    )
+    if (integer(activeClaims.rows[0]?.quantity || 0) > 0) {
+      throw new PackagingMaterialRequestError(
+        'PACKAGING_MATERIAL_ACTIVE_CLAIMS_CONFLICT',
+        'Release or complete active fulfillment plans that claim this material before removing it',
+        409,
+      )
+    }
+
+    let outcome: 'deleted' | 'retired' = 'deleted'
+    await client.query('SAVEPOINT remove_packaging_material')
+    try {
+      await client.query(
+        `DELETE FROM operations_packaging_material_stock
+         WHERE organization_id = $1::uuid
+           AND packaging_material_id = $2::uuid`,
+        [input.organizationId, current.id],
+      )
+      await client.query(
+        `DELETE FROM operations_packaging_materials
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [input.organizationId, current.id],
+      )
+      await client.query('RELEASE SAVEPOINT remove_packaging_material')
+    } catch (error) {
+      await client.query('ROLLBACK TO SAVEPOINT remove_packaging_material')
+      if ((error as { code?: string }).code !== '23503') {
+        await client.query('RELEASE SAVEPOINT remove_packaging_material')
+        throw error
+      }
+      await client.query('RELEASE SAVEPOINT remove_packaging_material')
+      outcome = 'retired'
+      await client.query(
+        `UPDATE operations_packaging_material_stock
+         SET is_available = false, row_version = row_version + 1,
+             updated_by = $3, updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND packaging_material_id = $2::uuid`,
+        [input.organizationId, current.id, input.actorEmail],
+      )
+      await client.query(
+        `UPDATE operations_packaging_materials
+         SET status = 'retired', row_version = row_version + 1,
+             source_is_default = false,
+             updated_by = $3, updated_at = now()
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [input.organizationId, current.id, input.actorEmail],
+      )
+    }
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: outcome === 'deleted'
+        ? 'operations.packaging_material.deleted'
+        : 'operations.packaging_material.retired',
+      aggregateType: 'operations.packaging_material',
+      aggregateId: current.global_id,
+      subject: current.name,
+      organizationId: input.organizationId,
+      eventKey: `operations:packaging-material:${current.global_id}:${outcome}:v${current.row_version}`,
+      payload: {
+        materialGlobalId: current.global_id,
+        code: current.code,
+        outcome,
+        providerWrites: 0,
+      },
+    }, client)
+    const payload = {
+      materialGlobalId: current.global_id,
+      outcome,
+      providerWrites: 0 as const,
+      replayed: false,
+    }
+    await client.query(
+      `UPDATE operations_command_receipts
+       SET status = 'succeeded', result_global_id = $2,
+           result_payload = $3::jsonb, completed_at = now(), updated_at = now()
+       WHERE id = $1::uuid`,
+      [createdReceipt.rows[0].id, current.global_id, JSON.stringify(payload)],
+    )
+    return payload
+  })
+}
+
+function shopifyImportRequestHash(input: {
+  accountGlobalId: string
+  preview: ShopifyPackagingImportPreview
+}) {
+  return createHash('sha256').update(JSON.stringify({
+    version: 1,
+    accountGlobalId: input.accountGlobalId,
+    fileSha256: input.preview.fileSha256,
+    rows: input.preview.rows,
+  })).digest('hex')
+}
+
+export async function importShopifyPackagingMaterialsInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  accountGlobalId: string
+  idempotencyKey: string
+  preview: ShopifyPackagingImportPreview
+}) {
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `packaging-material-shopify-import:${input.organizationId}:${input.accountGlobalId}`,
+    )
+    const accountResult = await client.query<{
+      id: string
+      global_id: string
+      display_name: string
+      external_account_id: string
+      shop_domain: string
+    }>(
+      `SELECT account.id::text, account.global_id, account.display_name,
+              account.external_account_id,
+              account.configuration->>'shopDomain' AS shop_domain
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+        AND credential.credential_version =
+              account.commerce_credential_generation
+        AND credential.external_account_id = account.external_account_id
+        AND credential.auth_mode = 'shopify_client_credentials'
+        AND credential.verification_status = 'verified'
+       WHERE account.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND account.integration_type = 'commerce'
+         AND account.provider = 'shopify'
+         AND account.status = 'active'
+         AND account.configuration->>'shopDomain' ~
+               '^[a-z0-9][a-z0-9-]*[.]myshopify[.]com$'
+       FOR SHARE`,
+      [input.organizationId, input.accountGlobalId],
+    )
+    const account = accountResult.rows[0]
+    if (!account) {
+      throw new PackagingMaterialRequestError(
+        'SHOPIFY_PACKAGING_IMPORT_ACCOUNT_UNAVAILABLE',
+        'Select a current verified Shopify connection in this workspace',
+        409,
+      )
+    }
+    const commandType = 'operations.packaging_materials.import_shopify_csv'
+    const requestHash = shopifyImportRequestHash(input)
+    const existing = await client.query<{
+      request_hash: string
+      status: string
+      result_payload: Record<string, unknown> | null
+    }>(
+      `SELECT request_hash, status, result_payload
+       FROM operations_command_receipts
+       WHERE organization_id = $1::uuid
+         AND command_type = $2
+         AND idempotency_key = $3
+       FOR UPDATE`,
+      [input.organizationId, commandType, input.idempotencyKey],
+    )
+    const receipt = existing.rows[0]
+    if (receipt) {
+      if (receipt.request_hash !== requestHash) {
+        throw new PackagingMaterialRequestError(
+          'PACKAGING_MATERIAL_IDEMPOTENCY_CONFLICT',
+          'This Idempotency-Key was already used for a different Shopify package file',
+          409,
+        )
+      }
+      if (receipt.status === 'succeeded' && receipt.result_payload) {
+        return { ...receipt.result_payload, replayed: true }
+      }
+      throw new PackagingMaterialRequestError(
+        'PACKAGING_MATERIAL_COMMAND_IN_PROGRESS',
+        'Shopify package import is already in progress',
+        409,
+      )
+    }
+    const createdReceipt = await client.query<{ id: string }>(
+      `INSERT INTO operations_command_receipts (
+         organization_id, command_type, idempotency_key, request_hash,
+         actor_email, status, correlation_id
+       ) VALUES ($1::uuid, $2, $3, $4, $5, 'processing', gen_random_uuid())
+       RETURNING id::text`,
+      [
+        input.organizationId,
+        commandType,
+        input.idempotencyKey,
+        requestHash,
+        input.actorEmail,
+      ],
+    )
+    if (input.preview.defaultCount === 1) {
+      await client.query(
+        `UPDATE operations_packaging_materials
+         SET source_is_default = false, row_version = row_version + 1,
+             updated_by = $3, updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND source_integration_account_id = $2::uuid
+           AND source = 'shopify_import'
+           AND source_is_default = true
+           AND source_external_key <> $4`,
+        [
+          input.organizationId,
+          account.id,
+          input.actorEmail,
+          input.preview.rows.find((row) => row.isDefault)!.sourceExternalKey,
+        ],
+      )
+    }
+    let createdCount = 0
+    let updatedCount = 0
+    const materialGlobalIds: string[] = []
+    for (const row of input.preview.rows) {
+      const codeOwner = await client.query<{
+        id: string
+        global_id: string
+        status: PackagingMaterial['status']
+        source: string
+        source_integration_account_id: string | null
+        source_external_key: string | null
+      }>(
+        `SELECT id::text, global_id, status, source,
+                source_integration_account_id::text, source_external_key
+         FROM operations_packaging_materials
+         WHERE organization_id = $1::uuid AND code = $2
+         FOR UPDATE`,
+        [input.organizationId, row.code],
+      )
+      const existingMaterial = codeOwner.rows[0]
+      const sourceOwner = await client.query<{
+        id: string
+        code: string
+        source: string
+      }>(
+        `SELECT id::text, code, source
+         FROM operations_packaging_materials
+         WHERE organization_id = $1::uuid
+           AND source_integration_account_id = $2::uuid
+           AND source_external_key = $3
+         FOR UPDATE`,
+        [input.organizationId, account.id, row.sourceExternalKey],
+      )
+      const existingSource = sourceOwner.rows[0]
+      if (existingMaterial?.status === 'retired') {
+        throw new PackagingMaterialRequestError(
+          'SHOPIFY_PACKAGING_IMPORT_RETIRED_CONFLICT',
+          `Packaging material ${row.code} was retired and cannot be restored by an import. Remove it from the file or use a new Shopify package identity.`,
+          409,
+        )
+      }
+      if (
+        existingSource
+        && (
+          existingSource.source !== 'shopify_import'
+          || existingSource.code !== row.code
+        )
+      ) {
+        throw new PackagingMaterialRequestError(
+          'SHOPIFY_PACKAGING_IMPORT_SOURCE_CONFLICT',
+          `Shopify package ${row.sourceExternalKey} was previously imported as code ${existingSource.code}. Keep that code or remove the prior draft first.`,
+          409,
+        )
+      }
+      if (
+        existingMaterial
+        && (
+          existingMaterial.source !== 'shopify_import'
+          || existingMaterial.source_integration_account_id !== account.id
+          || existingMaterial.source_external_key !== row.sourceExternalKey
+        )
+      ) {
+        throw new PackagingMaterialRequestError(
+          'SHOPIFY_PACKAGING_IMPORT_CODE_CONFLICT',
+          `Packaging material code ${row.code} already belongs to a different material`,
+          409,
+        )
+      }
+      if (
+        existingSource
+        && existingMaterial
+        && existingSource.id !== existingMaterial.id
+      ) {
+        throw new PackagingMaterialRequestError(
+          'SHOPIFY_PACKAGING_IMPORT_SOURCE_CONFLICT',
+          `Shopify package ${row.sourceExternalKey} conflicts with packaging material code ${row.code}`,
+          409,
+        )
+      }
+      const saved = existingMaterial
+        ? await client.query<{ global_id: string }>(
+          `UPDATE operations_packaging_materials
+           SET name = $4, material_type = $5,
+               rated_outer_length_mm = $6,
+               rated_outer_width_mm = $7,
+               rated_outer_height_mm = $8,
+               rated_outer_dimension_evidence_type = 'provider',
+               rated_outer_dimension_evidence_reference = $9,
+               rated_outer_dimension_confirmed_at = now(),
+               rated_outer_dimension_confirmed_by = $10,
+               tare_weight_grams = $11,
+               source_external_package_id = $12,
+               source_is_default = $13,
+               source_imported_at = now(), source_file_sha256 = $14,
+               status = 'draft',
+               row_version = row_version + 1,
+               updated_by = $10, updated_at = now()
+           WHERE organization_id = $1::uuid AND id = $2::uuid
+             AND source_external_key = $3
+           RETURNING global_id`,
+          [
+            input.organizationId,
+            existingMaterial.id,
+            row.sourceExternalKey,
+            row.name,
+            row.materialType,
+            row.ratedOuterLengthMm,
+            row.ratedOuterWidthMm,
+            row.ratedOuterHeightMm,
+            `Operator-supplied Shopify saved-package CSV for ${account.shop_domain}; SHA-256 ${input.preview.fileSha256}`,
+            input.actorEmail,
+            row.tareWeightGrams,
+            row.shopifyPackageId,
+            row.isDefault,
+            input.preview.fileSha256,
+          ],
+        )
+        : await client.query<{ global_id: string }>(
+          `INSERT INTO operations_packaging_materials (
+             organization_id, code, name, material_type,
+             rated_outer_length_mm, rated_outer_width_mm,
+             rated_outer_height_mm,
+             rated_outer_dimension_evidence_type,
+             rated_outer_dimension_evidence_reference,
+             rated_outer_dimension_confirmed_at,
+             rated_outer_dimension_confirmed_by,
+             dimension_basis, dimension_evidence_type,
+             tare_weight_grams, status, source,
+             source_integration_account_id, source_external_key,
+             source_external_package_id, source_is_default,
+             source_imported_at, source_file_sha256,
+             created_by, updated_by
+           ) VALUES (
+             $1::uuid, $2, $3, $4, $5, $6, $7, 'provider', $8,
+             now(), $9, 'unspecified', 'unknown', $10, 'draft',
+             'shopify_import', $11::uuid, $12, $13, $14, now(), $15,
+             $9, $9
+           ) RETURNING global_id`,
+          [
+            input.organizationId,
+            row.code,
+            row.name,
+            row.materialType,
+            row.ratedOuterLengthMm,
+            row.ratedOuterWidthMm,
+            row.ratedOuterHeightMm,
+            `Operator-supplied Shopify saved-package CSV for ${account.shop_domain}; SHA-256 ${input.preview.fileSha256}`,
+            input.actorEmail,
+            row.tareWeightGrams,
+            account.id,
+            row.sourceExternalKey,
+            row.shopifyPackageId,
+            row.isDefault,
+            input.preview.fileSha256,
+          ],
+        )
+      if (!saved.rows[0]) {
+        throw new PackagingMaterialRequestError(
+          'SHOPIFY_PACKAGING_IMPORT_LINEAGE_CONFLICT',
+          `Shopify package ${row.code} changed during import. Refresh and try again.`,
+          409,
+        )
+      }
+      if (existingMaterial) updatedCount += 1
+      else createdCount += 1
+      materialGlobalIds.push(saved.rows[0].global_id)
+    }
+    const payload = {
+      accountGlobalId: account.global_id,
+      accountDisplayName: account.display_name,
+      fileSha256: input.preview.fileSha256,
+      createdCount,
+      updatedCount,
+      totalCount: input.preview.totalCount,
+      defaultCount: input.preview.defaultCount,
+      materialGlobalIds,
+      status: 'draft',
+      replayed: false,
+      providerListApiAvailable: false,
+      providerReads: 0,
+      providerWrites: 0,
+    }
+    await client.query(
+      `UPDATE operations_command_receipts
+       SET status = 'succeeded', result_global_id = $2,
+           result_payload = $3::jsonb, completed_at = now(), updated_at = now()
+       WHERE id = $1::uuid`,
+      [createdReceipt.rows[0].id, materialGlobalIds[0], JSON.stringify(payload)],
+    )
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'operations.packaging_material.shopify_csv_imported',
+      aggregateType: 'operations.integration_account',
+      aggregateId: account.global_id,
+      subject: account.display_name,
+      organizationId: input.organizationId,
+      eventKey: `operations:shopify-packaging-import:${account.global_id}:${createdReceipt.rows[0].id}`,
+      payload: {
+        commandReceiptId: createdReceipt.rows[0].id,
+        idempotencyKeyHash: createHash('sha256')
+          .update(input.idempotencyKey)
+          .digest('hex'),
+        fileSha256: input.preview.fileSha256,
+        createdCount,
+        updatedCount,
+        totalCount: input.preview.totalCount,
+        defaultCount: input.preview.defaultCount,
+        createsDraftsOnly: true,
+        providerReads: 0,
+        providerWrites: 0,
+      },
+    }, client)
+    return payload
   })
 }
 

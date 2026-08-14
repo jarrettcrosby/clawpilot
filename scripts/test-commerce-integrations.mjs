@@ -350,6 +350,7 @@ includes(service, [
   'auditShopifyScopeUpdatePayload',
   "scopeProfile: 'distributed_operations_v1'",
   'SHOPIFY_SCOPE_PROFILE_INCOMPLETE',
+  'SHOPIFY_CANONICAL_DOMAIN_REQUIRED',
   'missingShopifyReceiptProofScopes',
   "runtime.status === 'error'",
   'verifyShopifyWebhookHmac',
@@ -360,6 +361,10 @@ includes(service, [
   'created.filter((subscription) => subscription.created).length',
   "topic === 'app/scopes_update'",
   'SHOPIFY_WEBHOOK_TOPIC_UNSUPPORTED',
+  'accountGlobalId: runtime.globalId',
+  'credentialGeneration: runtime.credentialVersion',
+  "discoveryState: 'succeeded'",
+  'discoveryErrorCode: null',
   'Faire does not use Shopify signed-receipt intake',
   'revealCommerceCredential',
   'recordCommerceCredentialRevealInPostgres',
@@ -411,6 +416,11 @@ const shopifyConnectSource = service.slice(
   service.indexOf('export async function connectShopifyCommerce'),
   service.indexOf('export async function connectFaireCommerce'),
 )
+includes(shopifyConnectSource, [
+  'resolveCanonicalShopDomain: true',
+  'submittedShopDomain: shopDomain',
+  'shopDomainResolvedFromAlias: probe.shopDomain !== shopDomain',
+], 'Shopify authenticated alias resolution')
 assert.ok(
   shopifyConnectSource.indexOf('await probeShopifyConnection')
     < shopifyConnectSource.indexOf('const encrypted = encryptCommerceCredential'),
@@ -465,12 +475,36 @@ const verifyStoredConnectionSource = service.slice(
   service.indexOf('export async function testCommerceConnection'),
 )
 includes(verifyStoredConnectionSource, [
+  'accountGlobalId: runtime.globalId',
+  'credentialGeneration: runtime.credentialVersion',
   "credential.authMode === 'faire_oauth'",
   "runtime.configuration.scopeVerification === 'oauth_grant'",
   "? 'oauth_grant'",
   ": 'not_exposed_by_provider'",
   'scopeEvidenceRefreshed: false',
 ], 'Faire connection-test persisted grant reporting')
+const markVerificationSource = persistence.slice(
+  persistence.indexOf(
+    'export async function markCommerceCredentialVerificationInPostgres',
+  ),
+  persistence.indexOf(
+    'export async function setCommerceIntegrationEnabledInPostgres',
+  ),
+)
+includes(markVerificationSource, [
+  'commerceOrderSyncAccountLockKey({',
+  'downgradeShopifyOrderWebhookPolicyAfterDiscoveryWithClient(',
+  "'commerce.order_webhook.transport_downgraded'",
+  "reason: 'successful_subscription_discovery_not_ready'",
+  'providerWrites: 0',
+], 'Successful not-ready Shopify order webhook discovery downgrade')
+assert.ok(
+  markVerificationSource.indexOf('commerceOrderSyncAccountLockKey({')
+    < markVerificationSource.indexOf(
+      'UPDATE operations_integration_accounts account',
+    ),
+  'Verification must serialize the account before configuration and policy mutation',
+)
 const faireApiKeyConnectSource = service.slice(
   service.indexOf('export async function connectFaireCommerce'),
   service.indexOf('function decryptStoredCredential'),
@@ -830,7 +864,7 @@ includes(webhookRoute, [
 ], 'Shopify webhook route')
 assert.ok(
   webhookRoute.indexOf('normalizeCommerceAccountGlobalId')
-    < webhookRoute.indexOf('boundedRequestBody(req)'),
+    < webhookRoute.indexOf('boundedRequestBody(req, maximumBytes)'),
   'Shopify webhook account path must be validated before reading the body',
 )
 
@@ -980,6 +1014,10 @@ includes(panel, [
   'resolveCommerceSetupPermissionGuidance',
   'setupPermissionGuidance.copyable',
   'setupPermissionGuidance.scopes',
+  'copyPlainTextToClipboard',
+  "setupPermissionGuidance.scopes.join(',')",
+  'Comma-separated scope list',
+  'press Command+C to copy it',
   'Separate restricted-scope approval · <code>read_all_orders</code>',
   'Protected customer-data approval · <code>read_customers</code>',
   'Shopify read-all-orders approval',
@@ -993,6 +1031,10 @@ includes(panel, [
   'Signed receipt setup',
   'Register scope safety webhook',
   'Current Shopify webhook receipts need attention',
+  'Run Test',
+  'connection at least every 24 hours',
+  'readiness',
+  'fails closed when that evidence expires',
   'Copy URL',
   'Distributed Operations scope profile',
   "action: 'set-receipt-intake'",
@@ -1006,7 +1048,8 @@ includes(panel, [
   'Canonical order import',
   'Provider availability is shown separately',
   'Order-domain workers',
-  'Order and customer topics are rejected',
+  'Core order topics use a separate payload-free exact-read lane',
+  'Customer-bearing topics remain rejected',
   "clientId: ''",
   "applicationId: ''",
   "applicationSecret: ''",
@@ -1027,6 +1070,68 @@ includes(panel, [
   'const revealOrganizationId = organizationIdRef.current',
   'organizationIdRef.current === revealOrganizationId',
 ], 'Commerce settings UI')
+const browserClipboard = loadTypeScriptModule(
+  'app_src/lib/browserClipboard.ts',
+  {
+    globals: {
+      navigator: {
+        clipboard: {
+          async writeText(value) {
+            assert.equal(value, 'read_products,read_orders')
+          },
+        },
+      },
+    },
+  },
+)
+assert.equal(
+  await browserClipboard.copyPlainTextToClipboard(
+    'read_products,read_orders',
+  ),
+  true,
+  'The modern clipboard path must copy the exact comma-separated scope list',
+)
+let fallbackValue = ''
+const fallbackTextarea = {
+  value: '',
+  style: {},
+  setAttribute() {},
+  focus() {},
+  select() {},
+  setSelectionRange() {},
+  remove() {},
+}
+const fallbackClipboard = loadTypeScriptModule(
+  'app_src/lib/browserClipboard.ts',
+  {
+    globals: {
+      navigator: {
+        clipboard: {
+          async writeText() {
+            throw new Error('clipboard permission denied')
+          },
+        },
+      },
+      document: {
+        body: { appendChild() {} },
+        createElement() { return fallbackTextarea },
+        execCommand(command) {
+          assert.equal(command, 'copy')
+          fallbackValue = fallbackTextarea.value
+          return true
+        },
+      },
+    },
+  },
+)
+assert.equal(
+  await fallbackClipboard.copyPlainTextToClipboard(
+    'read_products,read_orders',
+  ),
+  true,
+  'A browser that blocks the modern clipboard API must use the selection fallback',
+)
+assert.equal(fallbackValue, 'read_products,read_orders')
 const setupGuidance = read(
   'app_src/lib/integrations/commerceSetupGuidance.ts',
 )
@@ -1097,16 +1202,24 @@ assert.deepEqual(
   )),
   [
     'read_all_orders',
+    'write_app_proxy',
+    'write_assigned_fulfillment_orders',
+    'write_custom_fulfillment_services',
     'read_customers',
+    'write_customers',
     'write_inventory',
     'read_locations',
     'read_markets',
     'write_merchant_managed_fulfillment_orders',
+    'write_order_edits',
     'read_orders',
+    'write_orders',
     'write_products',
     'write_publications',
+    'read_returns',
+    'write_returns',
     'write_shipping',
-    'write_app_proxy',
+    'write_third_party_fulfillment_orders',
   ],
 )
 assert.equal(
@@ -1234,12 +1347,20 @@ assert.deepEqual(
       'read_locations',
       'read_markets',
       'read_orders',
+      'read_returns',
       'write_app_proxy',
+      'write_assigned_fulfillment_orders',
+      'write_custom_fulfillment_services',
+      'write_customers',
       'write_inventory',
       'write_merchant_managed_fulfillment_orders',
+      'write_order_edits',
+      'write_orders',
       'write_products',
       'write_publications',
+      'write_returns',
       'write_shipping',
+      'write_third_party_fulfillment_orders',
     ],
     grantedScopes: [
       'read_all_orders',
@@ -1247,11 +1368,19 @@ assert.deepEqual(
       'read_locations',
       'read_markets',
       'read_orders',
+      'read_returns',
       'write_app_proxy',
+      'write_assigned_fulfillment_orders',
+      'write_custom_fulfillment_services',
+      'write_customers',
       'write_merchant_managed_fulfillment_orders',
+      'write_order_edits',
+      'write_orders',
       'write_products',
       'write_publications',
+      'write_returns',
       'write_shipping',
+      'write_third_party_fulfillment_orders',
     ],
     missingScopes: ['write_inventory'],
     restrictedScopes: ['read_all_orders'],
@@ -1705,6 +1834,46 @@ assert.equal(
   shopifyRequests[0].init.headers['X-Shopify-Access-Token'],
   issuedAccessToken,
 )
+const canonicalAliasResponse = () => new Response(JSON.stringify({
+  data: {
+    shop: {
+      id: externalAccountId,
+      myshopifyDomain: 'canonical-store.myshopify.com',
+      name: 'Canonical Store',
+    },
+    currentAppInstallation: {
+      accessScopes: [
+        { handle: 'read_orders' },
+        { handle: 'read_products' },
+      ],
+    },
+  },
+}), {
+  status: 200,
+  headers: { 'content-type': 'application/json' },
+})
+await assert.rejects(
+  shopifyClient.probeShopifyConnection(
+    {
+      shopDomain: 'store-alias.myshopify.com',
+      accessToken: issuedAccessToken,
+    },
+    { fetchImpl: async () => canonicalAliasResponse() },
+  ),
+  (error) => error?.code === 'SHOPIFY_CANONICAL_DOMAIN_REQUIRED',
+  'Stored connection checks must continue to fail closed on a domain change.',
+)
+const canonicalAliasProbe = await shopifyClient.probeShopifyConnection(
+  {
+    shopDomain: 'store-alias.myshopify.com',
+    accessToken: issuedAccessToken,
+  },
+  {
+    fetchImpl: async () => canonicalAliasResponse(),
+    resolveCanonicalShopDomain: true,
+  },
+)
+assert.equal(canonicalAliasProbe.shopDomain, 'canonical-store.myshopify.com')
 await assert.rejects(
   shopifyClient.probeShopifyConnection(
     {
@@ -1734,6 +1903,113 @@ await assert.rejects(
   ),
   (error) => error?.code === 'SHOPIFY_PROBE_INVALID',
   'Provider identity must be NFKC-normalized before the 255-character bound.',
+)
+
+const inventoryWebhookUri =
+  'https://clawpilot.example/api/integrations/commerce/shopify/webhooks/gia1234567'
+const inventoryWebhookNodes = [
+  {
+    id: 'gid://shopify/WebhookSubscription/101',
+    topic: 'INVENTORY_ITEMS_UPDATE',
+    uri: inventoryWebhookUri,
+    format: 'JSON',
+  },
+  {
+    id: 'gid://shopify/WebhookSubscription/102',
+    topic: 'INVENTORY_LEVELS_UPDATE',
+    uri: inventoryWebhookUri,
+    format: 'JSON',
+  },
+]
+const inventoryWebhookDiscoveryResponse = (input = {}) => new Response(
+  JSON.stringify({
+    data: {
+      webhookSubscriptions: {
+        nodes: input.nodes ?? inventoryWebhookNodes,
+        pageInfo: input.pageInfo ?? { hasNextPage: false, endCursor: null },
+      },
+    },
+  }),
+  { status: 200, headers: { 'content-type': 'application/json' } },
+)
+const inventoryWebhookReadiness =
+  await shopifyClient.discoverShopifyWebhookSubscriptions(
+    {
+      shopDomain: 'example-store.myshopify.com',
+      accessToken: issuedAccessToken,
+    },
+    {
+      desiredUri: inventoryWebhookUri,
+      topics: ['inventory_items/update', 'inventory_levels/update'],
+    },
+    { fetchImpl: async () => inventoryWebhookDiscoveryResponse() },
+  )
+assert.equal(inventoryWebhookReadiness.ready, true)
+assert.equal(inventoryWebhookReadiness.subscriptions.length, 2)
+assert.ok(inventoryWebhookReadiness.subscriptions.every(
+  (subscription) => subscription.format === 'JSON',
+))
+await assert.rejects(
+  shopifyClient.discoverShopifyWebhookSubscriptions(
+    {
+      shopDomain: 'example-store.myshopify.com',
+      accessToken: issuedAccessToken,
+    },
+    {
+      desiredUri: inventoryWebhookUri,
+      topics: ['inventory_items/update', 'inventory_levels/update'],
+    },
+    {
+      fetchImpl: async () => inventoryWebhookDiscoveryResponse({
+        pageInfo: { hasNextPage: true, endCursor: 'cursor-100' },
+      }),
+    },
+  ),
+  (error) => error?.code === 'SHOPIFY_WEBHOOK_SUBSCRIPTION_DISCOVERY_TRUNCATED',
+  'Inventory subscription readiness must fail closed beyond the first 100 rows',
+)
+await assert.rejects(
+  shopifyClient.discoverShopifyWebhookSubscriptions(
+    {
+      shopDomain: 'example-store.myshopify.com',
+      accessToken: issuedAccessToken,
+    },
+    {
+      desiredUri: inventoryWebhookUri,
+      topics: ['inventory_items/update', 'inventory_levels/update'],
+    },
+    {
+      fetchImpl: async () => inventoryWebhookDiscoveryResponse({
+        nodes: [{ ...inventoryWebhookNodes[0], format: 'XML' }],
+      }),
+    },
+  ),
+  (error) => error?.code === 'SHOPIFY_WEBHOOK_SUBSCRIPTION_RESPONSE_INVALID',
+  'Malformed or non-JSON subscription rows must not be silently dropped',
+)
+const duplicateInventoryWebhookReadiness =
+  await shopifyClient.discoverShopifyWebhookSubscriptions(
+    {
+      shopDomain: 'example-store.myshopify.com',
+      accessToken: issuedAccessToken,
+    },
+    {
+      desiredUri: inventoryWebhookUri,
+      topics: ['inventory_items/update', 'inventory_levels/update'],
+    },
+    {
+      fetchImpl: async () => inventoryWebhookDiscoveryResponse({
+        nodes: [
+          ...inventoryWebhookNodes,
+          { ...inventoryWebhookNodes[0], id: 'gid://shopify/WebhookSubscription/103' },
+        ],
+      }),
+    },
+  )
+assert.equal(duplicateInventoryWebhookReadiness.ready, false)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(duplicateInventoryWebhookReadiness.conflictingTopics)),
+  ['inventory_items/update'],
 )
 
 const faireClient = loadTypeScriptModule(

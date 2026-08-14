@@ -42,6 +42,36 @@ function loadDomain() {
   return module.exports
 }
 
+function loadShopifyPackagingImport() {
+  const path = 'app_src/lib/operations/shopifyPackagingImport.ts'
+  const output = ts.transpileModule(read(path), {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+    fileName: path,
+  }).outputText
+  const module = { exports: {} }
+  vm.runInNewContext(output, {
+    Array,
+    Boolean,
+    Buffer,
+    Error,
+    Map,
+    Math,
+    Number,
+    Object,
+    Set,
+    String,
+    console,
+    exports: module.exports,
+    module,
+    require: requireFromApp,
+  }, { filename: path })
+  return module.exports
+}
+
 const {
   PACKAGING_DIMENSION_BASES,
   PACKAGING_DIMENSION_EVIDENCE_TYPES,
@@ -50,6 +80,18 @@ const {
   STARTER_PACKAGING_MATERIALS,
   packagingMaterialReadiness,
 } = loadDomain()
+const {
+  SHOPIFY_PACKAGING_IMPORT_HEADERS,
+  SHOPIFY_PACKAGING_IMPORT_TEMPLATE,
+  parseShopifyPackagingImportCsv,
+} = loadShopifyPackagingImport()
+
+function expectImportError(csv, code) {
+  assert.throws(
+    () => parseShopifyPackagingImportCsv(csv),
+    (error) => error?.code === code,
+  )
+}
 
 assert.deepEqual(
   Array.from(PACKAGING_MATERIAL_TYPES),
@@ -61,6 +103,7 @@ assert.deepEqual(
 )
 assert.ok(PACKAGING_DIMENSION_EVIDENCE_TYPES.includes('customer_confirmed'))
 assert.ok(PACKAGING_MATERIAL_SOURCES.includes('customer_supplied'))
+assert.ok(PACKAGING_MATERIAL_SOURCES.includes('shopify_import'))
 assert.equal(STARTER_PACKAGING_MATERIALS.length, 6)
 assert.equal(
   new Set(STARTER_PACKAGING_MATERIALS.map((material) => material.code)).size,
@@ -92,6 +135,60 @@ assert.deepEqual(
     stock: [],
   }).missing),
   ['unit_cost', 'warehouse_stock'],
+)
+
+assert.equal(SHOPIFY_PACKAGING_IMPORT_HEADERS.join(','), [
+  'shopify_package_id',
+  'code',
+  'name',
+  'type',
+  'length',
+  'width',
+  'height',
+  'length_unit',
+  'empty_weight',
+  'weight_unit',
+  'is_default',
+].join(','))
+const shopifyPreview = parseShopifyPackagingImportCsv(
+  SHOPIFY_PACKAGING_IMPORT_TEMPLATE,
+)
+assert.equal(shopifyPreview.totalCount, 1)
+assert.equal(shopifyPreview.defaultCount, 1)
+assert.equal(shopifyPreview.providerListApiAvailable, false)
+assert.equal(shopifyPreview.createsDraftsOnly, true)
+assert.equal(shopifyPreview.providerWrites, 0)
+assert.equal(shopifyPreview.rows[0].code, 'CYL5505BK')
+assert.equal(shopifyPreview.rows[0].materialType, 'carton')
+assert.equal(shopifyPreview.rows[0].ratedOuterLengthMm, 483)
+assert.equal(shopifyPreview.rows[0].ratedOuterWidthMm, 305)
+assert.equal(shopifyPreview.rows[0].ratedOuterHeightMm, 305)
+assert.equal(shopifyPreview.rows[0].tareWeightGrams, 454)
+assert.match(shopifyPreview.fileSha256, /^[0-9a-f]{64}$/)
+const importHeader = `${SHOPIFY_PACKAGING_IMPORT_HEADERS.join(',')}\n`
+expectImportError(
+  `name,code\nPackage,PKG\n`,
+  'SHOPIFY_PACKAGING_IMPORT_HEADERS_INVALID',
+)
+expectImportError(
+  `${importHeader},DUP,First,BOX,1,1,1,INCHES,1,POUNDS,true\n,DUP,Second,BOX,1,1,1,INCHES,1,POUNDS,false\n`,
+  'SHOPIFY_PACKAGING_IMPORT_CODE_CONFLICT',
+)
+expectImportError(
+  `${importHeader},ONE,First,BOX,1,1,1,INCHES,1,POUNDS,true\n,TWO,Second,BOX,1,1,1,INCHES,1,POUNDS,true\n`,
+  'SHOPIFY_PACKAGING_IMPORT_DEFAULT_CONFLICT',
+)
+expectImportError(
+  `${importHeader}gid://shopify/ShippingPackage/nope,ONE,First,BOX,1,1,1,INCHES,1,POUNDS,false\n`,
+  'SHOPIFY_PACKAGING_IMPORT_PACKAGE_ID_INVALID',
+)
+expectImportError(
+  `${importHeader},ONE,First,TUBE,1,1,1,INCHES,1,POUNDS,false\n`,
+  'SHOPIFY_PACKAGING_IMPORT_TYPE_INVALID',
+)
+expectImportError(
+  `${importHeader},ONE,First,BOX,1,1,1,FEET,1,POUNDS,false\n`,
+  'SHOPIFY_PACKAGING_IMPORT_LENGTH_UNIT_INVALID',
 )
 assert.deepEqual(
   Array.from(packagingMaterialReadiness({
@@ -232,6 +329,19 @@ for (const fragment of [
   'THEN $22',
   'input.material.dimensionBasis',
   'input.material.source',
+  'removePackagingMaterialInPostgres',
+  'importShopifyPackagingMaterialsInPostgres',
+  'PACKAGING_MATERIAL_ACTIVE_CLAIMS_CONFLICT',
+  "outcome: 'deleted' | 'retired'",
+  "status = 'retired'",
+  "'shopify_import', $11::uuid",
+  'providerListApiAvailable: false',
+  'providerReads: 0',
+  'providerWrites: 0',
+  'PACKAGING_MATERIAL_SOURCE_IMMUTABLE',
+  'PACKAGING_MATERIAL_SHOPIFY_CODE_IMMUTABLE',
+  'SHOPIFY_PACKAGING_IMPORT_SOURCE_CONFLICT',
+  "row.source === 'shopify_import'",
 ]) {
   assert.ok(persistence.includes(fragment), `Persistence missing ${fragment}`)
 }
@@ -268,6 +378,10 @@ for (const fragment of [
   'PACKAGING_MATERIAL_PHYSICAL_FACTS_REQUIRED',
   'PACKAGING_MATERIAL_EVIDENCE_REQUIRED',
   'dimensionEvidenceReference',
+  "action === 'remove-material'",
+  'idempotencyKey: idempotencyKey(req)',
+  'Use Remove material to retire a packaging material safely',
+  'Create Shopify package materials through the verified import workflow',
 ]) {
   assert.ok(route.includes(fragment), `API route missing ${fragment}`)
 }
@@ -285,8 +399,56 @@ for (const fragment of [
   'Record only the measurements the customer or supplier actually supplied',
   'You may save an incomplete draft',
   'Customer-supplied draft',
+  'Import Shopify packages',
+  'Import Shopify saved packages',
+  'Download CSV template',
+  'Remove material',
+  'Idempotency-Key',
+  'Shopify default',
+  'globalThis.crypto.randomUUID()',
+  'if (terminalResponse) importCommandKey.current = null',
 ]) {
   assert.ok(panel.includes(fragment), `Packaging materials panel missing ${fragment}`)
+}
+assert.equal(
+  panel.includes('shopify-packages:${importAccountGlobalId}:${importPreview.fileSha256}'),
+  false,
+  'A file hash cannot permanently pin intentional reapply commands to the first receipt',
+)
+
+const lifecycleMigration = read(
+  'db/migrations/0279_operations_packaging_material_lifecycle.sql',
+)
+for (const fragment of [
+  "status IN ('draft', 'active', 'retired')",
+  "'shopify_import'",
+  'operations_packaging_materials_shopify_source_valid',
+  'operations_packaging_materials_shopify_source_unique',
+  'operations_packaging_materials_shopify_default_unique',
+  'packaging_material_source_lineage_guard',
+  'packaging_material_retirement_guard',
+  'retired_packaging_material_stock_guard',
+  'Retired packaging materials cannot be restored by a generic update',
+  'Shopify packaging import source account lineage is invalid',
+  'source_file_sha256',
+]) {
+  assert.ok(
+    lifecycleMigration.includes(fragment),
+    `Packaging lifecycle migration missing ${fragment}`,
+  )
+}
+const importRoute = read(
+  'app_src/app/api/operations/packaging-materials/import/route.ts',
+)
+for (const fragment of [
+  'SHOPIFY_PACKAGING_IMPORT_TEMPLATE',
+  "['preview', 'apply']",
+  'PACKAGING_MATERIAL_MANAGE_REQUIRED',
+  'Idempotency-Key',
+  'parseShopifyPackagingImportCsv',
+  'importShopifyPackagingMaterialsInPostgres',
+]) {
+  assert.ok(importRoute.includes(fragment), `Shopify package import route missing ${fragment}`)
 }
 
 const operationsSection = read('app_src/components/operations/OperationsSection.tsx')
@@ -300,12 +462,15 @@ const health = read('app_src/app/api/health/route.ts')
 for (const fragment of [
   "WHERE filename = '0123_operations_packaging_materials.sql'",
   'row?.operations_packaging_materials_migration_applied',
+  "'0279_operations_packaging_material_lifecycle.sql'",
+  'row?.operations_packaging_material_lifecycle_migration_applied',
 ]) {
   assert.ok(health.includes(fragment), `Health migration gate missing ${fragment}`)
 }
 const predeploy = read('scripts/verify-predeploy.mjs')
 for (const fragment of [
   "'db/migrations/0123_operations_packaging_materials.sql'",
+  "'db/migrations/0279_operations_packaging_material_lifecycle.sql'",
   "'db/migrations/0126_packaging_material_unit_neutral_names.sql'",
   "'db/migrations/0133_operations_pack_runtime_association.sql'",
   "'scripts/test-operations-packaging-materials.mjs'",
