@@ -1,0 +1,559 @@
+#!/usr/bin/env node
+import assert from 'node:assert/strict'
+import { createRequire } from 'node:module'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import vm from 'node:vm'
+
+const root = process.cwd()
+const requireFromApp = createRequire(
+  new URL('../app_src/package.json', import.meta.url),
+)
+const ts = requireFromApp('typescript')
+const routePath =
+  'app_src/app/api/operations/shopify-order-management/route.ts'
+
+class MockTypedError extends Error {
+  constructor(code, message, status = 409) {
+    super(message)
+    this.code = code
+    this.status = status
+  }
+}
+
+function managementFixture(globalId = 'gor1234567') {
+  return {
+    runtimeAvailable: true,
+    blockerCode: null,
+    accountLabel: 'AG Alchemy',
+    shopDomain: 'ag-alchemy.myshopify.com',
+    order: {
+      globalId,
+      externalOrderId: 'gid://shopify/Order/6909860774088',
+      name: '#6600',
+      rowVersion: 7,
+      test: true,
+      closed: false,
+      cancelledAt: null,
+      financialStatus: 'PENDING',
+      fulfillmentStatus: 'UNFULFILLED',
+      merchantEditable: true,
+      tags: [],
+      lines: [{
+        lineItemId: 'gid://shopify/LineItem/123',
+        title: 'Test line',
+        quantity: 2,
+        unfulfilledQuantity: 2,
+        fulfilledQuantity: 0,
+      }],
+    },
+    eligibility: {
+      addTag: { allowed: true, reason: null },
+      cancel: { allowed: true, reason: null },
+      lineEdits: [{
+        lineItemId: 'gid://shopify/LineItem/123',
+        allowed: true,
+        reason: null,
+        minQuantity: 0,
+        maxQuantity: 1,
+      }],
+    },
+    openAttempt: null,
+  }
+}
+
+function authorizationFixture() {
+  return {
+    authorizationGlobalId: 'gsom1234567',
+    intentHash: 'a'.repeat(64),
+    expiresAt: '2026-08-14T03:30:00.000Z',
+    confirmationStatement:
+      'AUTHORIZE SHOPIFY WRITE gsom1234567 ADD_TAG #6600',
+    preview: {
+      accountLabel: 'AG Alchemy',
+      shopDomain: 'ag-alchemy.myshopify.com',
+      orderName: '#6600',
+      orderTest: true,
+      orderUpdatedAt: '2026-08-14T03:20:00.000Z',
+      action: 'add_tag',
+      lineItemId: null,
+      previousQuantity: null,
+      requestedQuantity: null,
+    },
+    replayed: false,
+    providerReads: 2,
+    providerWrites: 0,
+  }
+}
+
+function resultFixture(state = 'succeeded') {
+  return {
+    authorizationGlobalId: 'gsom1234567',
+    attemptGlobalId: 'gsoa1234567',
+    state,
+    providerReference: null,
+    replayed: false,
+    providerReads: 3,
+    providerWrites: 1,
+    management: managementFixture(),
+  }
+}
+
+const calls = []
+const routeErrors = []
+let postgresEnabled = true
+let actor = null
+let requestUserError = null
+let readImpl = async (input) => {
+  calls.push(['read', input])
+  return managementFixture(input.orderGlobalId)
+}
+let prepareImpl = async (input) => {
+  calls.push(['prepare', input])
+  return authorizationFixture()
+}
+let executeImpl = async (input) => {
+  calls.push(['execute', input])
+  return resultFixture('succeeded')
+}
+let reconcileImpl = async (input) => {
+  calls.push(['reconcile', input])
+  return resultFixture('reconciled')
+}
+
+function loadRoute() {
+  const source = readFileSync(resolve(root, routePath), 'utf8')
+  const transpiled = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+    fileName: routePath,
+    reportDiagnostics: true,
+  })
+  const diagnostics = (transpiled.diagnostics || []).filter(
+    (diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error,
+  )
+  assert.deepEqual(diagnostics, [], 'Shopify order management route must transpile')
+  const module = { exports: {} }
+  vm.runInNewContext(transpiled.outputText, {
+    Array,
+    Boolean,
+    Buffer,
+    Date,
+    Error,
+    Map,
+    Math,
+    Number,
+    Object,
+    Promise,
+    RegExp,
+    Set,
+    String,
+    URL,
+    console: {
+      ...console,
+      error(...args) {
+        routeErrors.push(args)
+      },
+    },
+    exports: module.exports,
+    module,
+    process,
+    require(specifier) {
+      if (specifier === 'next/server') {
+        return {
+          NextRequest: class NextRequest {},
+          NextResponse: {
+            json(payload, init = {}) {
+              return Response.json(payload, init)
+            },
+          },
+        }
+      }
+      if (specifier === '@/lib/operations/authorization') {
+        return {
+          activeOperationsOrganizationId(value) {
+            if (!value.activeOrganizationId) {
+              throw new Error('ACTIVE_ORGANIZATION_REQUIRED')
+            }
+            return value.activeOrganizationId
+          },
+          operationsCapabilities(value) {
+            return value.capabilities
+          },
+        }
+      }
+      if (
+        specifier === '@/lib/operations/shopifyOrderManagementCommands'
+      ) {
+        return {
+          executeShopifyOrderManagementCommand: (...args) => executeImpl(...args),
+          prepareShopifyOrderManagementCommand: (...args) => prepareImpl(...args),
+          readShopifyOrderManagementState: (...args) => readImpl(...args),
+          reconcileShopifyOrderManagementCommand: (...args) => reconcileImpl(...args),
+          ShopifyOrderManagementCommandError: MockTypedError,
+        }
+      }
+      if (specifier === '@/lib/integrations/shopifyOrderManagement') {
+        return { ShopifyOrderManagementError: MockTypedError }
+      }
+      if (specifier === '@/lib/persistence/config') {
+        return { isPostgresStorageEnabled: () => postgresEnabled }
+      }
+      if (specifier === '@/lib/persistence/shopifyOrderManagement') {
+        return { ShopifyOrderManagementPersistenceError: MockTypedError }
+      }
+      if (specifier === '@/lib/requestUser') {
+        return {
+          async requireRequestUser() {
+            if (requestUserError) throw requestUserError
+            return actor
+          },
+        }
+      }
+      throw new Error(`unexpected route dependency: ${specifier}`)
+    },
+  }, { filename: routePath })
+  return module.exports
+}
+
+const route = loadRoute()
+const organizationA = '11111111-1111-4111-8111-111111111111'
+const organizationB = '22222222-2222-4222-8222-222222222222'
+const orderGlobalId = 'gor1234567'
+const authorizationGlobalId = 'gsom1234567'
+const attemptGlobalId = 'gsoa1234567'
+const intentHash = 'a'.repeat(64)
+const reason = 'Verify the exact Shopify test order mutation'
+const idempotency = 'shopify-order-test-0001'
+const fullCapabilities = Object.freeze({
+  canActivate: true,
+  canManage: true,
+  canExecute: true,
+})
+
+function reset(overrides = {}) {
+  calls.length = 0
+  routeErrors.length = 0
+  postgresEnabled = true
+  requestUserError = null
+  actor = {
+    email: 'owner@example.com',
+    activeOrganizationId: organizationA,
+    capabilities: { ...fullCapabilities },
+  }
+  readImpl = async (input) => {
+    calls.push(['read', input])
+    return managementFixture(input.orderGlobalId)
+  }
+  prepareImpl = async (input) => {
+    calls.push(['prepare', input])
+    return authorizationFixture()
+  }
+  executeImpl = async (input) => {
+    calls.push(['execute', input])
+    return resultFixture('succeeded')
+  }
+  reconcileImpl = async (input) => {
+    calls.push(['reconcile', input])
+    return resultFixture('reconciled')
+  }
+  Object.assign(actor, overrides.actor || {})
+  if (overrides.capabilities) {
+    actor.capabilities = { ...overrides.capabilities }
+  }
+}
+
+function request(url, { method = 'GET', body, headers = {} } = {}) {
+  const finalHeaders = new Headers(headers)
+  const init = { method, headers: finalHeaders }
+  if (body !== undefined) {
+    const serialized = typeof body === 'string' ? body : JSON.stringify(body)
+    init.body = serialized
+    if (!finalHeaders.has('content-type')) {
+      finalHeaders.set('content-type', 'application/json')
+    }
+  }
+  const req = new Request(url, init)
+  Object.defineProperty(req, 'nextUrl', { value: new URL(url) })
+  return req
+}
+
+async function responseJson(response) {
+  return {
+    status: response.status,
+    headers: response.headers,
+    payload: await response.json(),
+  }
+}
+
+function plain(value) {
+  return JSON.parse(JSON.stringify(value))
+}
+
+async function get(order = orderGlobalId, suffix = '') {
+  return responseJson(await route.GET(request(
+    `https://clawpilot.test/api/operations/shopify-order-management?orderGlobalId=${order}${suffix}`,
+  )))
+}
+
+async function post(body, options = {}) {
+  return responseJson(await route.POST(request(
+    'https://clawpilot.test/api/operations/shopify-order-management',
+    {
+      method: 'POST',
+      body,
+      headers: {
+        'idempotency-key': idempotency,
+        ...(options.headers || {}),
+      },
+    },
+  )))
+}
+
+// All three existing Operations capabilities are a conjunctive write gate.
+for (const capability of ['canActivate', 'canManage', 'canExecute']) {
+  reset({ capabilities: { ...fullCapabilities, [capability]: false } })
+  const result = await get()
+  assert.equal(result.status, 403, `${capability} must be required`)
+  assert.equal(result.payload.code, 'SHOPIFY_ORDER_MANAGEMENT_AUTHORITY_REQUIRED')
+  assert.equal(calls.length, 0, 'authority rejection must precede command reads')
+}
+
+reset()
+requestUserError = new Error('Unauthorized')
+let result = await get()
+assert.equal(result.status, 401)
+assert.equal(result.payload.code, 'UNAUTHORIZED')
+assert.equal(calls.length, 0)
+
+reset({ actor: { activeOrganizationId: null } })
+result = await get()
+assert.equal(result.status, 409)
+assert.equal(result.payload.code, 'ACTIVE_ORGANIZATION_REQUIRED')
+assert.equal(calls.length, 0)
+
+reset()
+postgresEnabled = false
+result = await get()
+assert.equal(result.status, 503)
+assert.equal(result.payload.code, 'SHOPIFY_ORDER_MANAGEMENT_POSTGRES_REQUIRED')
+assert.equal(calls.length, 0)
+
+// The route derives tenant scope from the authenticated actor and accepts no
+// organization identifier from either query or body.
+reset({ actor: { activeOrganizationId: organizationB } })
+result = await get()
+assert.equal(result.status, 200, JSON.stringify(result.payload))
+assert.deepEqual(plain(calls), [['read', {
+  organizationId: organizationB,
+  orderGlobalId,
+}]])
+assert.equal(result.headers.get('cache-control'), 'private, no-store')
+assert.equal(result.headers.get('vary'), 'Cookie')
+
+result = await get(orderGlobalId, `&organizationId=${organizationA}`)
+assert.equal(result.status, 400)
+assert.equal(result.payload.code, 'SHOPIFY_ORDER_MANAGEMENT_QUERY_INVALID')
+result = await get(orderGlobalId, `&orderGlobalId=${orderGlobalId}`)
+assert.equal(result.status, 400)
+assert.equal(result.payload.code, 'SHOPIFY_ORDER_MANAGEMENT_QUERY_INVALID')
+result = await get('gid://shopify/Order/123')
+assert.equal(result.status, 400)
+assert.equal(result.payload.code, 'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID')
+
+const addTagMutation = Object.freeze({ kind: 'add_tag', tag: 'ClawPilot test' })
+reset({ actor: { activeOrganizationId: organizationB } })
+result = await post({
+  action: 'prepare',
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: addTagMutation,
+  reason,
+})
+assert.equal(result.status, 200)
+assert.deepEqual(plain(calls), [['prepare', {
+  organizationId: organizationB,
+  actorEmail: 'owner@example.com',
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: addTagMutation,
+  reason,
+  idempotencyKey: idempotency,
+}]])
+assert.equal(JSON.stringify(result.payload).includes(organizationB), false)
+
+// Execute repeats and binds the mutation, reason, intent, and typed
+// confirmation rather than accepting only an authorization identifier.
+reset()
+const confirmationStatement =
+  'AUTHORIZE SHOPIFY WRITE gsom1234567 ADD_TAG #6600'
+result = await post({
+  action: 'execute',
+  authorizationGlobalId,
+  intentHash,
+  confirmationStatement,
+  mutation: addTagMutation,
+  reason,
+})
+assert.equal(result.status, 200)
+assert.deepEqual(plain(calls), [['execute', {
+  organizationId: organizationA,
+  actorEmail: 'owner@example.com',
+  authorizationGlobalId,
+  intentHash,
+  confirmationStatement,
+  mutation: addTagMutation,
+  reason,
+  idempotencyKey: idempotency,
+}]])
+
+reset()
+result = await post({ action: 'reconcile', attemptGlobalId })
+assert.equal(result.status, 200)
+assert.deepEqual(plain(calls), [['reconcile', {
+  organizationId: organizationA,
+  actorEmail: 'owner@example.com',
+  attemptGlobalId,
+  idempotencyKey: idempotency,
+}]])
+
+// Strict field and value allowlists prevent tenant injection, action
+// smuggling, multi-tag ambiguity, and malformed idempotency keys.
+for (const [body, expectedCode] of [
+  [{
+    action: 'prepare', orderGlobalId, expectedRowVersion: 7,
+    mutation: addTagMutation, reason, organizationId: organizationB,
+  }, 'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID'],
+  [{
+    action: 'prepare', orderGlobalId, expectedRowVersion: 7,
+    mutation: { kind: 'add_tag', tag: 'one,two' }, reason,
+  }, 'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID'],
+  [{
+    action: 'prepare', orderGlobalId, expectedRowVersion: 7,
+    mutation: { kind: 'cancel', restock: true }, reason,
+  }, 'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID'],
+  [{
+    action: 'execute', authorizationGlobalId, intentHash,
+    confirmationStatement, mutation: addTagMutation, reason,
+    providerWrites: 1,
+  }, 'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID'],
+  [{ action: 'delete', attemptGlobalId },
+    'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID'],
+]) {
+  reset()
+  result = await post(body)
+  assert.equal(result.status, 400)
+  assert.equal(result.payload.code, expectedCode)
+  assert.equal(calls.length, 0)
+}
+
+reset()
+result = await responseJson(await route.POST(request(
+  'https://clawpilot.test/api/operations/shopify-order-management',
+  {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'prepare', orderGlobalId, expectedRowVersion: 7,
+      mutation: addTagMutation, reason,
+    }),
+    headers: { 'content-type': 'application/json' },
+  },
+)))
+assert.equal(result.status, 400)
+assert.equal(result.payload.code, 'SHOPIFY_ORDER_MANAGEMENT_IDEMPOTENCY_KEY_INVALID')
+assert.equal(calls.length, 0)
+
+reset()
+result = await post({ action: 'reconcile', attemptGlobalId }, {
+  headers: { 'idempotency-key': 'short' },
+})
+assert.equal(result.status, 400)
+assert.equal(result.payload.code, 'SHOPIFY_ORDER_MANAGEMENT_IDEMPOTENCY_KEY_INVALID')
+assert.equal(calls.length, 0)
+
+reset()
+result = await responseJson(await route.POST(request(
+  'https://clawpilot.test/api/operations/shopify-order-management',
+  {
+    method: 'POST',
+    body: '{}',
+    headers: {
+      'content-type': 'text/plain',
+      'idempotency-key': idempotency,
+    },
+  },
+)))
+assert.equal(result.status, 415)
+assert.equal(result.payload.code, 'SHOPIFY_ORDER_MANAGEMENT_CONTENT_TYPE_INVALID')
+assert.equal(calls.length, 0)
+
+// Unexpected failures are projected to a stable error and never reflect
+// secrets or upstream exception detail.
+reset()
+readImpl = async () => {
+  throw new Error('client-secret-value must never be returned')
+}
+result = await get()
+assert.equal(result.status, 500)
+assert.equal(result.payload.code, 'SHOPIFY_ORDER_MANAGEMENT_INTERNAL_ERROR')
+assert.equal(JSON.stringify(result.payload).includes('client-secret-value'), false)
+assert.equal(JSON.stringify(routeErrors).includes('client-secret-value'), false)
+
+// Successful responses are explicit public projections rather than a spread
+// of command objects. Unknown credential/evidence fields cannot cross the API.
+reset()
+readImpl = async (input) => ({
+  ...managementFixture(input.orderGlobalId),
+  clientSecret: 'client-secret-value',
+  encryptedCredential: 'encrypted-secret-value',
+})
+result = await get()
+assert.equal(result.status, 200)
+assert.equal(JSON.stringify(result.payload).includes('client-secret-value'), false)
+assert.equal(JSON.stringify(result.payload).includes('encrypted-secret-value'), false)
+
+reset()
+prepareImpl = async () => ({
+  ...authorizationFixture(),
+  clientSecret: 'client-secret-value',
+  preview: {
+    ...authorizationFixture().preview,
+    encryptedCredential: 'encrypted-secret-value',
+  },
+})
+result = await post({
+  action: 'prepare',
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: addTagMutation,
+  reason,
+})
+assert.equal(result.status, 200)
+assert.equal(JSON.stringify(result.payload).includes('client-secret-value'), false)
+assert.equal(JSON.stringify(result.payload).includes('encrypted-secret-value'), false)
+
+reset()
+executeImpl = async () => ({
+  ...resultFixture('succeeded'),
+  clientSecret: 'client-secret-value',
+  management: {
+    ...managementFixture(),
+    encryptedCredential: 'encrypted-secret-value',
+  },
+})
+result = await post({
+  action: 'execute',
+  authorizationGlobalId,
+  intentHash,
+  confirmationStatement,
+  mutation: addTagMutation,
+  reason,
+})
+assert.equal(result.status, 200)
+assert.equal(JSON.stringify(result.payload).includes('client-secret-value'), false)
+assert.equal(JSON.stringify(result.payload).includes('encrypted-secret-value'), false)
+
+console.log('Shopify order management API tests passed')

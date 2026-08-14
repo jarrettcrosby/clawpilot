@@ -1,0 +1,2260 @@
+import { createHash } from 'node:crypto'
+import type { PoolClient } from 'pg'
+import { recordAuditEvent } from '@/lib/auditWriter'
+import {
+  acquireTransactionAdvisoryLock,
+  query,
+  withTransaction,
+} from '@/lib/persistence/postgres'
+
+export const SHOPIFY_ORDER_MANAGEMENT_AUTHORIZATION_TTL_SECONDS = 300 as const
+export const SHOPIFY_ORDER_MANAGEMENT_PROCESSING_LEASE_SECONDS = 300 as const
+export const SHOPIFY_ORDER_MANAGEMENT_PROCESSING_LEASE_EXPIRED_CODE =
+  'SHOPIFY_ORDER_MANAGEMENT_PROCESSING_LEASE_EXPIRED' as const
+
+export type ShopifyOrderManagementAction =
+  | { type: 'add_tag'; tag: string }
+  | {
+      type: 'cancel'
+      reason?: 'STAFF' | 'OTHER'
+      staffNote?: string
+    }
+  | {
+      type: 'set_line_quantity'
+      lineItemGid: string
+      quantity: number
+      staffNote?: string
+    }
+
+export type ShopifyOrderManagementStatus =
+  | 'prepared'
+  | 'processing'
+  | 'succeeded'
+  | 'failed'
+  | 'unknown'
+  | 'reconciled'
+  | 'expired'
+
+export type ShopifyOrderManagementAuthorization = {
+  authorizationGlobalId: string
+  organizationId: string
+  accountGlobalId: string
+  provider: 'shopify'
+  accountEnvironment: 'sandbox'
+  externalAccountId: string
+  shopDomain: string
+  credentialGeneration: number
+  activationState: 'shadow' | 'active'
+  activationRevision: number
+  orderGlobalId: string
+  externalOrderId: string
+  orderNumber: string
+  expectedOrderRowVersion: number
+  expectedSourceHash: string
+  acceptedObservationId: string | null
+  acceptedProviderOrderUpdatedAt: string | null
+  providerOrderUpdatedAt: string
+  providerOrderObservedAt: string
+  providerOrderTest: boolean
+  providerSnapshotHash: string
+  action: ShopifyOrderManagementAction['type']
+  lineItemGid: string | null
+  expectedLineQuantity: number | null
+  requestedQuantity: number | null
+  tagHash: string | null
+  cancelReason: 'STAFF' | 'OTHER' | null
+  staffNoteHash: string | null
+  authorizationReason: string
+  intentHash: string
+  idempotencyKey: string
+  requestHash: string
+  status: ShopifyOrderManagementStatus
+  storedStatus: ShopifyOrderManagementStatus
+  authorizedBy: string
+  authorizedRole: 'owner' | 'admin'
+  providerAttemptGlobalId: string | null
+  processingLeaseExpiresAt: string | null
+  latestOutcomeGlobalId: string | null
+  latestOutcomeState:
+    | 'succeeded'
+    | 'failed'
+    | 'unknown'
+    | 'reconciled'
+    | null
+  reconciliationResolution: 'applied' | 'not_applied' | null
+  providerWriteCount: number | null
+  providerReference: string | null
+  errorCode: string | null
+  preparedAt: string
+  expiresAt: string
+  processingAt: string | null
+  completedAt: string | null
+  replayed: boolean
+}
+
+export type ClaimedShopifyOrderManagementAction =
+  ShopifyOrderManagementAuthorization & {
+    status: 'processing'
+    storedStatus: 'processing'
+    providerAttemptGlobalId: string
+    processingLeaseExpiresAt: string
+    attemptHash: string
+    claimedAt: string
+    actionInput: ShopifyOrderManagementAction
+  }
+
+export type ShopifyOrderManagementTarget = {
+  organizationId: string
+  accountGlobalId: string
+  accountDisplayName: string
+  accountEnvironment: string
+  externalAccountId: string | null
+  shopDomain: string | null
+  credentialGeneration: number
+  credentialCurrent: boolean
+  activationState: string
+  activationRevision: number
+  orderGlobalId: string
+  externalOrderId: string
+  orderNumber: string
+  orderRowVersion: number
+  orderStatus: string
+  sourceHash: string | null
+  acceptedSourceHash: string
+  acceptedProviderUpdatedAt: string | null
+  latestSourceHash: string | null
+  materialState: string
+  latestObservedAt: string | null
+  latestProviderUpdatedAt: string | null
+  latestProviderOrderTest: boolean | null
+  zeroDownstream: boolean
+  latestOpenAuthorization: ShopifyOrderManagementAuthorization | null
+}
+
+export type PrepareShopifyOrderManagementInput = {
+  organizationId: unknown
+  actorEmail: unknown
+  accountGlobalId: unknown
+  orderGlobalId: unknown
+  expectedOrderRowVersion: unknown
+  expectedSourceHash: unknown
+  providerOrderUpdatedAt: unknown
+  providerOrderObservedAt: unknown
+  providerOrderTest: unknown
+  action: unknown
+  expectedLineQuantity?: unknown
+  reason: unknown
+  idempotencyKey: unknown
+}
+
+export type ClaimShopifyOrderManagementInput = {
+  organizationId: unknown
+  actorEmail: unknown
+  authorizationGlobalId: unknown
+  action: unknown
+  expectedLineQuantity?: unknown
+  reason: unknown
+}
+
+export type RecordShopifyOrderManagementOutcomeInput = {
+  organizationId: unknown
+  actorEmail: unknown
+  authorizationGlobalId: unknown
+  providerAttemptGlobalId: unknown
+  outcome: 'succeeded' | 'failed' | 'unknown'
+  evidence: unknown
+  providerReference?: unknown
+  errorCode?: unknown
+  providerWriteCount: unknown
+}
+
+export type ReconcileShopifyOrderManagementOutcomeInput = {
+  organizationId: unknown
+  actorEmail: unknown
+  authorizationGlobalId: unknown
+  providerAttemptGlobalId: unknown
+  resolution: 'applied' | 'not_applied'
+  evidence: unknown
+  providerReference?: unknown
+  providerWriteCount: unknown
+}
+
+export type RecoverStaleShopifyOrderManagementAttemptInput = {
+  organizationId: unknown
+  actorEmail: unknown
+  authorizationGlobalId: unknown
+  providerAttemptGlobalId: unknown
+}
+
+export type RecoverStaleShopifyOrderManagementAttemptResult = Readonly<{
+  authorization: ShopifyOrderManagementAuthorization
+  recovered: boolean
+}>
+
+export type ShopifyOrderManagementHealth = Readonly<{
+  prepared: number
+  processing: number
+  staleProcessing: number
+  unknown: number
+  latestUnknownAt: string | null
+  lastCompletedAt: string | null
+  knownProviderWriteOutcomeCount: number
+  knownProviderWriteSum: number
+}>
+
+type TimestampValue = string | Date
+
+type AuthorizationRow = {
+  id: string
+  global_id: string
+  organization_id: string
+  integration_account_id: string
+  integration_account_global_id: string
+  provider: 'shopify'
+  account_environment: 'sandbox'
+  external_account_id: string
+  shop_domain: string
+  credential_generation: number
+  activation_state: 'shadow' | 'active'
+  activation_revision: number
+  order_id: string
+  order_global_id: string
+  external_order_id: string
+  order_number: string
+  expected_order_row_version: string | number
+  expected_source_hash: string
+  accepted_observation_id: string | null
+  accepted_provider_order_updated_at: TimestampValue | null
+  provider_order_updated_at: TimestampValue
+  provider_order_observed_at: TimestampValue
+  provider_order_test: boolean
+  provider_snapshot_hash: string
+  action: ShopifyOrderManagementAction['type']
+  line_item_id: string | null
+  expected_line_quantity: number | null
+  requested_quantity: number | null
+  tag_hash: string | null
+  cancel_reason: 'STAFF' | 'OTHER' | null
+  staff_note_hash: string | null
+  authorization_reason: string
+  intent_hash: string
+  idempotency_key: string
+  request_hash: string
+  status: ShopifyOrderManagementStatus
+  effective_status?: ShopifyOrderManagementStatus
+  authorized_by: string
+  authorized_role: 'owner' | 'admin'
+  provider_attempt_id: string | null
+  provider_attempt_global_id?: string | null
+  provider_attempt_hash?: string | null
+  processing_lease_expires_at?: TimestampValue | null
+  processing_lease_expired?: boolean | null
+  latest_outcome_id: string | null
+  latest_outcome_global_id?: string | null
+  latest_outcome_state?:
+    | 'succeeded'
+    | 'failed'
+    | 'unknown'
+    | 'reconciled'
+    | null
+  reconciliation_resolution?: 'applied' | 'not_applied' | null
+  provider_write_count?: number | null
+  provider_reference?: string | null
+  error_code?: string | null
+  prepared_at: TimestampValue
+  expires_at: TimestampValue
+  processing_at: TimestampValue | null
+  completed_at: TimestampValue | null
+}
+
+type BindingRow = {
+  integration_account_id: string
+  integration_account_global_id: string
+  account_environment: 'sandbox'
+  external_account_id: string
+  shop_domain: string
+  credential_generation: number
+  credential_external_account_id: string
+  credential_version: number
+  auth_mode: string
+  verification_status: string
+  activation_state: 'shadow' | 'active'
+  activation_revision: number
+  order_id: string
+  order_global_id: string
+  external_order_id: string
+  order_number: string
+  order_row_version: string | number
+  order_status: string
+  archived_at: TimestampValue | null
+  source_hash: string | null
+  accepted_source_hash: string
+  accepted_observation_id: string | null
+  accepted_provider_order_updated_at: TimestampValue | null
+  latest_source_hash: string | null
+  material_state: string
+  zero_downstream: boolean
+}
+
+export class ShopifyOrderManagementPersistenceError extends Error {
+  code: string
+  status: number
+
+  constructor(code: string, message: string, status = 409) {
+    super(message)
+    this.name = 'ShopifyOrderManagementPersistenceError'
+    this.code = code
+    this.status = status
+  }
+}
+
+const UUID =
+  /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/
+const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
+const ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/
+const AUTHORIZATION_GLOBAL_ID = /^gsom(?:[0-9]{7}|[0-9a-v]{12})$/
+const ATTEMPT_GLOBAL_ID = /^gsoa(?:[0-9]{7}|[0-9a-v]{12})$/
+const SHOPIFY_LINE_ITEM_GID = /^gid:\/\/shopify\/LineItem\/[1-9][0-9]{0,20}$/
+const SHA256 = /^[a-f0-9]{64}$/
+const ERROR_CODE = /^[A-Z][A-Z0-9_]{1,127}$/
+const SAFE_TEXT = /^[^\u0000-\u001f\u007f]+$/
+
+function fail(code: string, message: string, status = 409): never {
+  throw new ShopifyOrderManagementPersistenceError(code, message, status)
+}
+
+function canonicalJson(value: unknown, ancestors = new Set<object>()): string {
+  if (value === null) return 'null'
+  if (typeof value === 'string' || typeof value === 'boolean') {
+    return JSON.stringify(value)
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_EVIDENCE_INVALID',
+        'Shopify order management evidence contains a non-finite number',
+        400,
+      )
+    }
+    return JSON.stringify(Object.is(value, -0) ? 0 : value)
+  }
+  if (typeof value !== 'object' || value === undefined) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_EVIDENCE_INVALID',
+      'Shopify order management evidence must be valid JSON',
+      400,
+    )
+  }
+  if (ancestors.has(value)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_EVIDENCE_INVALID',
+      'Shopify order management evidence cannot be recursive',
+      400,
+    )
+  }
+  ancestors.add(value)
+  try {
+    if (Array.isArray(value)) {
+      return `[${value.map((entry) => canonicalJson(entry, ancestors)).join(',')}]`
+    }
+    const prototype = Object.getPrototypeOf(value)
+    if (
+      prototype !== Object.prototype
+      && prototype !== null
+      && Object.prototype.toString.call(value) !== '[object Object]'
+    ) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_EVIDENCE_INVALID',
+        'Shopify order management evidence must contain plain JSON objects',
+        400,
+      )
+    }
+    const source = value as Record<string, unknown>
+    return `{${Object.keys(source).sort().map((key) => (
+      `${JSON.stringify(key)}:${canonicalJson(source[key], ancestors)}`
+    )).join(',')}}`
+  } finally {
+    ancestors.delete(value)
+  }
+}
+
+export function shopifyOrderManagementEvidenceHash(value: unknown) {
+  return createHash('sha256').update(canonicalJson(value)).digest('hex')
+}
+
+function organizationId(value: unknown) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!UUID.test(normalized)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ORGANIZATION_REQUIRED',
+      'A valid workspace organization is required',
+      400,
+    )
+  }
+  return normalized
+}
+
+function globalId(
+  value: unknown,
+  pattern: RegExp,
+  code: string,
+  message: string,
+) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!pattern.test(normalized)) fail(code, message, 400)
+  return normalized
+}
+
+function actorEmail(value: unknown) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (
+    normalized.length < 3
+    || normalized.length > 320
+    || !SAFE_TEXT.test(normalized)
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTOR_REQUIRED',
+      'A signed-in owner or operations administrator is required',
+      401,
+    )
+  }
+  return normalized
+}
+
+function integer(value: unknown, label: string, minimum = 0) {
+  const normalized = Number(value)
+  if (!Number.isSafeInteger(normalized) || normalized < minimum) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
+      `${label} is invalid`,
+      400,
+    )
+  }
+  return normalized
+}
+
+function sourceHash(value: unknown) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!SHA256.test(normalized)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_SOURCE_HASH_REQUIRED',
+      'A valid current order source hash is required',
+      400,
+    )
+  }
+  return normalized
+}
+
+function idempotencyKey(value: unknown) {
+  const normalized = String(value || '').trim()
+  if (
+    normalized.length < 8
+    || normalized.length > 200
+    || !SAFE_TEXT.test(normalized)
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_IDEMPOTENCY_REQUIRED',
+      'A stable idempotency key of 8-200 characters is required',
+      400,
+    )
+  }
+  return normalized
+}
+
+function authorizationReason(value: unknown) {
+  const normalized = String(value || '').trim()
+  if (
+    normalized.length < 10
+    || normalized.length > 500
+    || !SAFE_TEXT.test(normalized)
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_REASON_REQUIRED',
+      'An operator reason of 10-500 characters is required',
+      400,
+    )
+  }
+  return normalized
+}
+
+function timestamp(value: unknown, label: string) {
+  const normalized = new Date(String(value || ''))
+  if (!Number.isFinite(normalized.getTime())) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_SNAPSHOT_INVALID',
+      `${label} is invalid`,
+      400,
+    )
+  }
+  return normalized.toISOString()
+}
+
+function optionalText(
+  value: unknown,
+  label: string,
+  maximum: number,
+): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined
+  const normalized = String(value).trim()
+  if (
+    normalized.length < 1
+    || normalized.length > maximum
+    || !SAFE_TEXT.test(normalized)
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      `${label} is invalid`,
+      400,
+    )
+  }
+  return normalized
+}
+
+export function normalizeShopifyOrderManagementAction(
+  value: unknown,
+): ShopifyOrderManagementAction {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      'A supported Shopify order action is required',
+      400,
+    )
+  }
+  const input = value as Record<string, unknown>
+  if (input.type === 'add_tag') {
+    const tag = optionalText(input.tag, 'Shopify order tag', 255)
+    if (!tag) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+        'A non-empty Shopify order tag is required',
+        400,
+      )
+    }
+    return { type: 'add_tag', tag }
+  }
+  if (input.type === 'cancel') {
+    const reason = input.reason === undefined ? 'STAFF' : input.reason
+    if (reason !== 'STAFF' && reason !== 'OTHER') {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+        'Cancellation reason must be STAFF or OTHER',
+        400,
+      )
+    }
+    const staffNote = optionalText(
+      input.staffNote,
+      'Cancellation staff note',
+      255,
+    )
+    return {
+      type: 'cancel',
+      reason,
+      ...(staffNote ? { staffNote } : {}),
+    }
+  }
+  if (input.type === 'set_line_quantity') {
+    const lineItemGid = String(input.lineItemGid || '').trim()
+    if (!SHOPIFY_LINE_ITEM_GID.test(lineItemGid)) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+        'A valid Shopify LineItem GID is required',
+        400,
+      )
+    }
+    const staffNote = optionalText(
+      input.staffNote,
+      'Order edit staff note',
+      255,
+    )
+    return {
+      type: 'set_line_quantity',
+      lineItemGid,
+      quantity: integer(input.quantity, 'Shopify line quantity'),
+      ...(staffNote ? { staffNote } : {}),
+    }
+  }
+  fail(
+    'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+    'Supported actions are add_tag, cancel, and set_line_quantity',
+    400,
+  )
+}
+
+function actionEvidence(action: ShopifyOrderManagementAction) {
+  if (action.type === 'add_tag') {
+    return {
+      action: action.type,
+      lineItemGid: null,
+      requestedQuantity: null,
+      tagHash: shopifyOrderManagementEvidenceHash({
+        schema: 'shopify-order-management-tag-v1',
+        tag: action.tag,
+      }),
+      cancelReason: null,
+      staffNoteHash: null,
+    }
+  }
+  if (action.type === 'cancel') {
+    return {
+      action: action.type,
+      lineItemGid: null,
+      requestedQuantity: null,
+      tagHash: null,
+      cancelReason: action.reason || 'STAFF',
+      staffNoteHash: action.staffNote
+        ? shopifyOrderManagementEvidenceHash({
+            schema: 'shopify-order-management-staff-note-v1',
+            staffNote: action.staffNote,
+          })
+        : null,
+    }
+  }
+  return {
+    action: action.type,
+    lineItemGid: action.lineItemGid,
+    requestedQuantity: action.quantity,
+    tagHash: null,
+    cancelReason: null,
+    staffNoteHash: action.staffNote
+      ? shopifyOrderManagementEvidenceHash({
+          schema: 'shopify-order-management-staff-note-v1',
+          staffNote: action.staffNote,
+        })
+      : null,
+  }
+}
+
+function expectedLineQuantity(
+  value: unknown,
+  action: ShopifyOrderManagementAction,
+) {
+  if (action.type !== 'set_line_quantity') {
+    if (value !== undefined && value !== null) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+        'Expected line quantity applies only to a line quantity action',
+        400,
+      )
+    }
+    return null
+  }
+  const expected = integer(value, 'Expected current Shopify line quantity', 1)
+  if (action.quantity >= expected) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      'The first line-edit slice permits only a quantity decrease or removal',
+      400,
+    )
+  }
+  return expected
+}
+
+function intentHash(
+  action: ShopifyOrderManagementAction,
+  reason: string,
+  expectedLineQuantityValue: number | null,
+) {
+  return shopifyOrderManagementEvidenceHash({
+    schema: 'shopify-order-management-intent-v1',
+    action,
+    reason,
+    expectedLineQuantity: expectedLineQuantityValue,
+  })
+}
+
+function iso(value: TimestampValue | null | undefined) {
+  return value ? new Date(value).toISOString() : null
+}
+
+function authorization(
+  row: AuthorizationRow,
+  replayed = false,
+): ShopifyOrderManagementAuthorization {
+  const expectedOrderRowVersion = Number(row.expected_order_row_version)
+  if (!Number.isSafeInteger(expectedOrderRowVersion)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_EVIDENCE_INVALID',
+      'Stored Shopify order management row version is invalid',
+      500,
+    )
+  }
+  const providerWriteCount = row.provider_write_count === null
+    || row.provider_write_count === undefined
+    ? null
+    : Number(row.provider_write_count)
+  return {
+    authorizationGlobalId: row.global_id,
+    organizationId: row.organization_id,
+    accountGlobalId: row.integration_account_global_id,
+    provider: 'shopify',
+    accountEnvironment: 'sandbox',
+    externalAccountId: row.external_account_id,
+    shopDomain: row.shop_domain,
+    credentialGeneration: Number(row.credential_generation),
+    activationState: row.activation_state,
+    activationRevision: Number(row.activation_revision),
+    orderGlobalId: row.order_global_id,
+    externalOrderId: row.external_order_id,
+    orderNumber: row.order_number,
+    expectedOrderRowVersion,
+    expectedSourceHash: row.expected_source_hash,
+    acceptedObservationId: row.accepted_observation_id,
+    acceptedProviderOrderUpdatedAt:
+      iso(row.accepted_provider_order_updated_at),
+    providerOrderUpdatedAt: iso(row.provider_order_updated_at)!,
+    providerOrderObservedAt: iso(row.provider_order_observed_at)!,
+    providerOrderTest: row.provider_order_test,
+    providerSnapshotHash: row.provider_snapshot_hash,
+    action: row.action,
+    lineItemGid: row.line_item_id,
+    expectedLineQuantity: row.expected_line_quantity === null
+      ? null : Number(row.expected_line_quantity),
+    requestedQuantity: row.requested_quantity === null
+      ? null : Number(row.requested_quantity),
+    tagHash: row.tag_hash,
+    cancelReason: row.cancel_reason,
+    staffNoteHash: row.staff_note_hash,
+    authorizationReason: row.authorization_reason,
+    intentHash: row.intent_hash,
+    idempotencyKey: row.idempotency_key,
+    requestHash: row.request_hash,
+    status: row.effective_status || row.status,
+    storedStatus: row.status,
+    authorizedBy: row.authorized_by,
+    authorizedRole: row.authorized_role,
+    providerAttemptGlobalId: row.provider_attempt_global_id || null,
+    processingLeaseExpiresAt: iso(row.processing_lease_expires_at),
+    latestOutcomeGlobalId: row.latest_outcome_global_id || null,
+    latestOutcomeState: row.latest_outcome_state || null,
+    reconciliationResolution: row.reconciliation_resolution || null,
+    providerWriteCount,
+    providerReference: row.provider_reference || null,
+    errorCode: row.error_code || null,
+    preparedAt: iso(row.prepared_at)!,
+    expiresAt: iso(row.expires_at)!,
+    processingAt: iso(row.processing_at),
+    completedAt: iso(row.completed_at),
+    replayed,
+  }
+}
+
+const AUTHORIZATION_SELECT = `SELECT
+  authz.*,
+  CASE
+    WHEN authz.status = 'prepared'
+     AND authz.expires_at <= clock_timestamp()
+    THEN 'expired'
+    ELSE authz.status
+  END AS effective_status,
+  attempt.global_id AS provider_attempt_global_id,
+  attempt.attempt_hash AS provider_attempt_hash,
+  attempt.processing_lease_expires_at,
+  CASE
+    WHEN attempt.processing_lease_expires_at IS NULL THEN NULL
+    ELSE attempt.processing_lease_expires_at <= clock_timestamp()
+  END AS processing_lease_expired,
+  outcome.global_id AS latest_outcome_global_id,
+  outcome.outcome_state AS latest_outcome_state,
+  outcome.reconciliation_resolution,
+  outcome.provider_write_count,
+  outcome.provider_reference,
+  outcome.error_code
+FROM operations_shopify_order_management_authorizations authz
+LEFT JOIN operations_shopify_order_management_attempts attempt
+  ON attempt.organization_id = authz.organization_id
+ AND attempt.id = authz.provider_attempt_id
+LEFT JOIN operations_shopify_order_management_outcomes outcome
+  ON outcome.organization_id = authz.organization_id
+ AND outcome.id = authz.latest_outcome_id`
+
+async function requireActorRole(
+  client: PoolClient,
+  input: { organizationId: string; actorEmail: string },
+) {
+  const result = await client.query<{ role: 'owner' | 'admin' }>(
+    `SELECT membership.role
+     FROM app_user_organization_memberships membership
+     WHERE membership.organization_id = $1::uuid
+       AND membership.user_email = $2
+       AND membership.status = 'active'
+       AND (
+         membership.role = 'owner'
+         OR (
+           membership.role = 'admin'
+           AND COALESCE(
+             (membership.permissions->>'manageOperations')::boolean,
+             false
+           )
+           AND COALESCE(
+             (membership.permissions->>'executeWarehouse')::boolean,
+             false
+           )
+         )
+       )
+     FOR SHARE`,
+    [input.organizationId, input.actorEmail],
+  )
+  const role = result.rows[0]?.role
+  if (role !== 'owner' && role !== 'admin') {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_FORBIDDEN',
+      'Shopify order management requires an owner or a fully authorized operations administrator',
+      403,
+    )
+  }
+  return role
+}
+
+async function readBinding(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    accountGlobalId: string
+    orderGlobalId: string
+  },
+) {
+  const result = await client.query<BindingRow>(
+    `SELECT
+       account.id::text AS integration_account_id,
+       account.global_id AS integration_account_global_id,
+       account.environment AS account_environment,
+       account.external_account_id,
+       account.configuration->>'shopDomain' AS shop_domain,
+       account.commerce_credential_generation AS credential_generation,
+       credential.external_account_id AS credential_external_account_id,
+       credential.credential_version,
+       credential.auth_mode,
+       credential.verification_status,
+       activation.state AS activation_state,
+       activation.revision AS activation_revision,
+       order_row.id::text AS order_id,
+       order_row.global_id AS order_global_id,
+       order_row.external_order_id,
+       order_row.order_number,
+       order_row.row_version::text AS order_row_version,
+       order_row.status AS order_status,
+       order_row.archived_at,
+       order_row.source_payload->>'sourceHash' AS source_hash,
+       target.accepted_source_hash,
+       accepted.id::text AS accepted_observation_id,
+       operations_shopify_order_management_snapshot_updated_at(
+         accepted.normalized_snapshot
+       ) AS accepted_provider_order_updated_at,
+       target.latest_source_hash,
+       target.material_state,
+       ocr_order_has_zero_downstream(
+         order_row.organization_id, order_row.id
+       ) AS zero_downstream
+     FROM operations_orders order_row
+     JOIN operations_integration_accounts account
+       ON account.organization_id = order_row.organization_id
+      AND account.id = order_row.integration_account_id
+     JOIN operations_commerce_credentials credential
+       ON credential.organization_id = account.organization_id
+      AND credential.integration_account_id = account.id
+     JOIN operations_activation_scopes activation
+       ON activation.organization_id = order_row.organization_id
+     JOIN operations_commerce_order_revision_targets target
+       ON target.organization_id = order_row.organization_id
+      AND target.order_id = order_row.id
+     LEFT JOIN operations_commerce_order_revision_observations accepted
+       ON accepted.organization_id = target.organization_id
+      AND accepted.id = target.accepted_observation_id
+      AND accepted.integration_account_id = target.integration_account_id
+      AND accepted.target_id = target.id
+      AND accepted.order_id = target.order_id
+      AND accepted.provider = target.provider
+      AND accepted.external_order_id = order_row.external_order_id
+      AND accepted.source_hash = target.accepted_source_hash
+      AND accepted.canonical_row_version = order_row.row_version
+     WHERE order_row.organization_id = $1::uuid
+       AND account.global_id = $2
+       AND order_row.global_id = $3
+     FOR UPDATE OF order_row, account, credential, activation, target`,
+    [input.organizationId, input.accountGlobalId, input.orderGlobalId],
+  )
+  const row = result.rows[0]
+  if (!row) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ORDER_NOT_FOUND',
+      'The exact imported Shopify order was not found',
+      404,
+    )
+  }
+  return row
+}
+
+function assertCurrentBinding(
+  row: BindingRow,
+  input: {
+    expectedOrderRowVersion: number
+    expectedSourceHash: string
+    action: ShopifyOrderManagementAction['type']
+    providerOrderUpdatedAt: string
+  },
+) {
+  if (
+    row.account_environment !== 'sandbox'
+    || !row.external_account_id
+    || !row.shop_domain
+    || row.credential_generation < 1
+    || row.credential_external_account_id !== row.external_account_id
+    || row.credential_version !== row.credential_generation
+    || row.auth_mode !== 'shopify_client_credentials'
+    || row.verification_status !== 'verified'
+    || !['shadow', 'active'].includes(row.activation_state)
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACCOUNT_NOT_CURRENT',
+      'The Shopify sandbox account, credential, or activation is not current',
+    )
+  }
+  if (
+    Number(row.order_row_version) !== input.expectedOrderRowVersion
+    || row.order_status !== 'imported'
+    || row.archived_at !== null
+    || row.source_hash !== input.expectedSourceHash
+    || row.accepted_source_hash !== input.expectedSourceHash
+    || (
+      input.action === 'add_tag'
+        ? ![
+            'current',
+            'review_required',
+            'provider_cancelled',
+            'provider_fulfilled',
+          ].includes(row.material_state)
+        : (
+            !row.accepted_observation_id
+            || !row.accepted_provider_order_updated_at
+            || iso(row.accepted_provider_order_updated_at)
+              !== input.providerOrderUpdatedAt
+            || (row.latest_source_hash !== null
+              && row.latest_source_hash !== input.expectedSourceHash)
+            || row.material_state !== 'current'
+          )
+    )
+    || row.zero_downstream !== true
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ORDER_NOT_CURRENT',
+      'The order changed, left Imported status, or has downstream warehouse work',
+    )
+  }
+}
+
+export async function prepareShopifyOrderManagementInPostgres(
+  input: PrepareShopifyOrderManagementInput,
+): Promise<ShopifyOrderManagementAuthorization> {
+  const scopedOrganizationId = organizationId(input.organizationId)
+  const authorizedBy = actorEmail(input.actorEmail)
+  const accountGlobalId = globalId(
+    input.accountGlobalId,
+    ACCOUNT_GLOBAL_ID,
+    'SHOPIFY_ORDER_MANAGEMENT_ACCOUNT_REQUIRED',
+    'A valid Shopify commerce account Global ID is required',
+  )
+  const orderGlobalId = globalId(
+    input.orderGlobalId,
+    ORDER_GLOBAL_ID,
+    'SHOPIFY_ORDER_MANAGEMENT_ORDER_REQUIRED',
+    'A valid Operations order Global ID is required',
+  )
+  const expectedOrderRowVersion = integer(
+    input.expectedOrderRowVersion,
+    'Expected order row version',
+  )
+  const expectedSourceHash = sourceHash(input.expectedSourceHash)
+  const action = normalizeShopifyOrderManagementAction(input.action)
+  const expectedLineQuantityValue = expectedLineQuantity(
+    input.expectedLineQuantity,
+    action,
+  )
+  const key = idempotencyKey(input.idempotencyKey)
+  const reason = authorizationReason(input.reason)
+  const actionFacts = actionEvidence(action)
+  const exactIntentHash = intentHash(
+    action,
+    reason,
+    expectedLineQuantityValue,
+  )
+  const requestHash = shopifyOrderManagementEvidenceHash({
+    schema: 'shopify-order-management-preparation-request-v1',
+    organizationId: scopedOrganizationId,
+    actorEmail: authorizedBy,
+    accountGlobalId,
+    orderGlobalId,
+    expectedOrderRowVersion,
+    expectedSourceHash,
+    intentHash: exactIntentHash,
+  })
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shopify-order-management:${scopedOrganizationId}:${accountGlobalId}:${key}`,
+    )
+    const role = await requireActorRole(client, {
+      organizationId: scopedOrganizationId,
+      actorEmail: authorizedBy,
+    })
+    const existing = await client.query<AuthorizationRow>(
+      `${AUTHORIZATION_SELECT}
+       WHERE authz.organization_id = $1::uuid
+         AND authz.integration_account_global_id = $2
+         AND authz.idempotency_key = $3
+       FOR UPDATE OF authz`,
+      [scopedOrganizationId, accountGlobalId, key],
+    )
+    if (existing.rows[0]) {
+      if (existing.rows[0].request_hash !== requestHash) {
+        fail(
+          'SHOPIFY_ORDER_MANAGEMENT_IDEMPOTENCY_CONFLICT',
+          'The idempotency key was already used for a different order action',
+        )
+      }
+      return authorization(existing.rows[0], true)
+    }
+
+    const providerOrderUpdatedAt = timestamp(
+      input.providerOrderUpdatedAt,
+      'Provider order update time',
+    )
+    const providerOrderObservedAt = timestamp(
+      input.providerOrderObservedAt,
+      'Provider order observation time',
+    )
+    if (typeof input.providerOrderTest !== 'boolean') {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_SNAPSHOT_INVALID',
+        'The exact Shopify order test flag is required',
+        400,
+      )
+    }
+    const providerOrderTest = input.providerOrderTest
+    if (action.type !== 'add_tag' && !providerOrderTest) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_TEST_ORDER_REQUIRED',
+        'Cancellation and quantity changes require a Shopify test order',
+        409,
+      )
+    }
+    const providerSnapshotHash = shopifyOrderManagementEvidenceHash({
+      schema: 'shopify-order-management-provider-snapshot-v1',
+      orderGlobalId,
+      expectedSourceHash,
+      providerOrderUpdatedAt,
+      providerOrderObservedAt,
+      providerOrderTest,
+      expectedLineQuantity: expectedLineQuantityValue,
+    })
+
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shopify-order-management-order:${scopedOrganizationId}:${orderGlobalId}`,
+    )
+    const unresolved = await client.query<{ global_id: string; status: string }>(
+      `SELECT global_id, status
+       FROM operations_shopify_order_management_authorizations
+       WHERE organization_id = $1::uuid
+         AND order_global_id = $2
+         AND status IN ('processing', 'unknown')
+       LIMIT 1
+       FOR UPDATE`,
+      [scopedOrganizationId, orderGlobalId],
+    )
+    if (unresolved.rows[0]) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_UNRESOLVED_WRITE',
+        'A processing or unknown Shopify write must be reconciled before another action',
+      )
+    }
+    const binding = await readBinding(client, {
+      organizationId: scopedOrganizationId,
+      accountGlobalId,
+      orderGlobalId,
+    })
+    assertCurrentBinding(binding, {
+      expectedOrderRowVersion,
+      expectedSourceHash,
+      action: action.type,
+      providerOrderUpdatedAt,
+    })
+    const acceptedObservationId = action.type === 'add_tag'
+      ? null : binding.accepted_observation_id
+    const acceptedProviderOrderUpdatedAt = action.type === 'add_tag'
+      ? null : iso(binding.accepted_provider_order_updated_at)
+
+    const inserted = await client.query<AuthorizationRow>(
+      `WITH prepared_clock AS (
+         SELECT clock_timestamp() AS prepared_at
+       )
+       INSERT INTO operations_shopify_order_management_authorizations (
+         organization_id, integration_account_id,
+         integration_account_global_id, provider, account_environment,
+         external_account_id, shop_domain, credential_generation,
+         activation_state, activation_revision, order_id, order_global_id,
+         external_order_id, order_number, expected_order_row_version,
+         expected_source_hash, provider_order_updated_at,
+         provider_order_observed_at, provider_order_test,
+         provider_snapshot_hash, action, line_item_id,
+         expected_line_quantity, requested_quantity,
+         tag_hash, cancel_reason, staff_note_hash, authorization_reason,
+         intent_hash,
+         idempotency_key, request_hash, status, authorized_by,
+         authorized_role, accepted_observation_id,
+         accepted_provider_order_updated_at, prepared_at, expires_at
+       )
+       SELECT
+         $1::uuid, $2::uuid, $3, 'shopify', $4, $5, $6, $7,
+         $8, $9, $10::uuid, $11, $12, $13, $14::bigint, $15,
+         $16::timestamptz, $17::timestamptz, $18, $19, $20, $21,
+         $22, $23, $24, $25, $26, $27, $28, $29, $30, 'prepared',
+         $31, $32, $33::uuid, $34::timestamptz,
+         prepared_clock.prepared_at,
+         prepared_clock.prepared_at + interval '5 minutes'
+       FROM prepared_clock
+       RETURNING *`,
+      [
+        scopedOrganizationId,
+        binding.integration_account_id,
+        binding.integration_account_global_id,
+        binding.account_environment,
+        binding.external_account_id,
+        binding.shop_domain,
+        binding.credential_generation,
+        binding.activation_state,
+        binding.activation_revision,
+        binding.order_id,
+        binding.order_global_id,
+        binding.external_order_id,
+        binding.order_number,
+        expectedOrderRowVersion,
+        expectedSourceHash,
+        providerOrderUpdatedAt,
+        providerOrderObservedAt,
+        providerOrderTest,
+        providerSnapshotHash,
+        actionFacts.action,
+        actionFacts.lineItemGid,
+        expectedLineQuantityValue,
+        actionFacts.requestedQuantity,
+        actionFacts.tagHash,
+        actionFacts.cancelReason,
+        actionFacts.staffNoteHash,
+        reason,
+        exactIntentHash,
+        key,
+        requestHash,
+        authorizedBy,
+        role,
+        acceptedObservationId,
+        acceptedProviderOrderUpdatedAt,
+      ],
+    )
+    const row = inserted.rows[0]
+    await recordAuditEvent({
+      actor: authorizedBy,
+      eventType: 'operations.shopify_order_management.prepared',
+      aggregateType: 'operations.shopify_order_management_authorization',
+      aggregateId: row.global_id,
+      subject: row.order_global_id,
+      organizationId: scopedOrganizationId,
+      eventKey: `operations:shopify-order-management:${row.global_id}:prepared`,
+      payload: {
+        accountGlobalId: row.integration_account_global_id,
+        orderGlobalId: row.order_global_id,
+        externalOrderId: row.external_order_id,
+        action: row.action,
+        credentialGeneration: row.credential_generation,
+        activationRevision: row.activation_revision,
+        expectedOrderRowVersion,
+        expectedSourceHash,
+        acceptedObservationId,
+        acceptedProviderOrderUpdatedAt,
+        providerSnapshotHash,
+        intentHash: exactIntentHash,
+        authorizationReason: reason,
+        expectedLineQuantity: expectedLineQuantityValue,
+        expiresAt: iso(row.expires_at),
+        providerWrites: 0,
+      },
+    }, client)
+    return authorization(row)
+  })
+}
+
+export async function claimShopifyOrderManagementInPostgres(
+  input: ClaimShopifyOrderManagementInput,
+): Promise<ClaimedShopifyOrderManagementAction> {
+  const scopedOrganizationId = organizationId(input.organizationId)
+  const claimedBy = actorEmail(input.actorEmail)
+  const authorizationGlobalId = globalId(
+    input.authorizationGlobalId,
+    AUTHORIZATION_GLOBAL_ID,
+    'SHOPIFY_ORDER_MANAGEMENT_AUTHORIZATION_REQUIRED',
+    'A valid Shopify order management authorization is required',
+  )
+  const action = normalizeShopifyOrderManagementAction(input.action)
+  const expectedLineQuantityValue = expectedLineQuantity(
+    input.expectedLineQuantity,
+    action,
+  )
+  const reason = authorizationReason(input.reason)
+  const exactIntentHash = intentHash(
+    action,
+    reason,
+    expectedLineQuantityValue,
+  )
+
+  const result = await withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shopify-order-management-claim:${scopedOrganizationId}:${authorizationGlobalId}`,
+    )
+    const role = await requireActorRole(client, {
+      organizationId: scopedOrganizationId,
+      actorEmail: claimedBy,
+    })
+    const selected = await client.query<AuthorizationRow>(
+      `${AUTHORIZATION_SELECT}
+       WHERE authz.organization_id = $1::uuid
+         AND authz.global_id = $2
+       FOR UPDATE OF authz`,
+      [scopedOrganizationId, authorizationGlobalId],
+    )
+    const row = selected.rows[0]
+    if (!row) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_AUTHORIZATION_NOT_FOUND',
+        'The Shopify order management authorization was not found',
+        404,
+      )
+    }
+    if (
+      row.authorized_by !== claimedBy
+      || row.authorized_role !== role
+      || row.authorization_reason !== reason
+      || row.expected_line_quantity !== expectedLineQuantityValue
+      || row.intent_hash !== exactIntentHash
+    ) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_AUTHORIZATION_MISMATCH',
+        'Actor, role, or exact order action changed after preparation',
+      )
+    }
+    if (row.status !== 'prepared') {
+      fail(
+        row.status === 'processing' || row.status === 'unknown'
+          ? 'SHOPIFY_ORDER_MANAGEMENT_UNRESOLVED_WRITE'
+          : 'SHOPIFY_ORDER_MANAGEMENT_AUTHORIZATION_CONSUMED',
+        'This authorization cannot dispatch another Shopify write',
+      )
+    }
+    if (new Date(row.expires_at).getTime() <= Date.now()) {
+      const expired = await client.query<AuthorizationRow>(
+        `UPDATE operations_shopify_order_management_authorizations
+         SET status = 'expired', completed_at = clock_timestamp(),
+             updated_at = clock_timestamp()
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND status = 'prepared'
+         RETURNING *`,
+        [scopedOrganizationId, row.id],
+      )
+      await recordAuditEvent({
+        actor: claimedBy,
+        eventType: 'operations.shopify_order_management.expired',
+        aggregateType: 'operations.shopify_order_management_authorization',
+        aggregateId: row.global_id,
+        subject: row.order_global_id,
+        organizationId: scopedOrganizationId,
+        eventKey: `operations:shopify-order-management:${row.global_id}:expired`,
+        payload: { action: row.action, providerWrites: 0 },
+      }, client)
+      return { expired: true as const, row: expired.rows[0] }
+    }
+    const current = await client.query<{ current: boolean }>(
+      `SELECT operations_shopify_order_management_is_current(
+         $1::uuid, $2::uuid, true
+       ) AS current`,
+      [scopedOrganizationId, row.id],
+    )
+    if (current.rows[0]?.current !== true) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_ORDER_NOT_CURRENT',
+        'The account, credential, activation, order, source, or warehouse state changed',
+      )
+    }
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shopify-order-management-order:${scopedOrganizationId}:${row.order_global_id}`,
+    )
+    const attemptHash = shopifyOrderManagementEvidenceHash({
+      schema: 'shopify-order-management-provider-attempt-v1',
+      authorizationGlobalId: row.global_id,
+      organizationId: row.organization_id,
+      accountGlobalId: row.integration_account_global_id,
+      credentialGeneration: row.credential_generation,
+      activationRevision: row.activation_revision,
+      orderGlobalId: row.order_global_id,
+      externalOrderId: row.external_order_id,
+      expectedOrderRowVersion: Number(row.expected_order_row_version),
+      expectedSourceHash: row.expected_source_hash,
+      acceptedObservationId: row.accepted_observation_id,
+      acceptedProviderOrderUpdatedAt:
+        iso(row.accepted_provider_order_updated_at),
+      providerSnapshotHash: row.provider_snapshot_hash,
+      expectedLineQuantity: row.expected_line_quantity,
+      intentHash: row.intent_hash,
+    })
+    const attempted = await client.query<{
+      id: string
+      global_id: string
+      claimed_at: TimestampValue
+      processing_lease_expires_at: TimestampValue
+    }>(
+      `WITH claim_clock AS (
+         SELECT clock_timestamp() AS claimed_at
+       )
+       INSERT INTO operations_shopify_order_management_attempts (
+         organization_id, authorization_id, integration_account_id,
+         integration_account_global_id, provider, external_account_id,
+         credential_generation, activation_revision, order_id,
+         order_global_id, external_order_id, expected_order_row_version,
+         expected_source_hash, provider_snapshot_hash, action, intent_hash,
+         expected_line_quantity, attempt_hash, dispatch_state, claimed_by,
+         accepted_observation_id, accepted_provider_order_updated_at,
+         claimed_at, processing_lease_expires_at
+       ) SELECT
+         $1::uuid, $2::uuid, $3::uuid, $4, 'shopify', $5, $6, $7,
+         $8::uuid, $9, $10, $11::bigint, $12, $13, $14, $15, $16,
+         $17, 'authorized', $18, $19::uuid, $20::timestamptz,
+         claim_clock.claimed_at,
+         claim_clock.claimed_at + interval '5 minutes'
+       FROM claim_clock
+       RETURNING id::text, global_id, claimed_at,
+                 processing_lease_expires_at`,
+      [
+        scopedOrganizationId,
+        row.id,
+        row.integration_account_id,
+        row.integration_account_global_id,
+        row.external_account_id,
+        row.credential_generation,
+        row.activation_revision,
+        row.order_id,
+        row.order_global_id,
+        row.external_order_id,
+        row.expected_order_row_version,
+        row.expected_source_hash,
+        row.provider_snapshot_hash,
+        row.action,
+        row.intent_hash,
+        row.expected_line_quantity,
+        attemptHash,
+        claimedBy,
+        row.accepted_observation_id,
+        row.accepted_provider_order_updated_at,
+      ],
+    )
+    const attempt = attempted.rows[0]
+    const updated = await client.query<AuthorizationRow>(
+      `UPDATE operations_shopify_order_management_authorizations
+       SET status = 'processing', provider_attempt_id = $3::uuid,
+           processing_at = $4::timestamptz, updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND status = 'prepared'
+       RETURNING *`,
+      [scopedOrganizationId, row.id, attempt.id, attempt.claimed_at],
+    )
+    if (updated.rowCount !== 1) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_CLAIM_CONFLICT',
+        'The Shopify provider attempt could not be claimed atomically',
+      )
+    }
+    await recordAuditEvent({
+      actor: claimedBy,
+      eventType: 'operations.shopify_order_management.provider_attempt_committed',
+      aggregateType: 'operations.shopify_order_management_authorization',
+      aggregateId: row.global_id,
+      subject: row.order_global_id,
+      organizationId: scopedOrganizationId,
+      eventKey: `operations:shopify-order-management:${attempt.global_id}:committed`,
+      payload: {
+        providerAttemptGlobalId: attempt.global_id,
+        accountGlobalId: row.integration_account_global_id,
+        orderGlobalId: row.order_global_id,
+        externalOrderId: row.external_order_id,
+        action: row.action,
+        credentialGeneration: row.credential_generation,
+        activationRevision: row.activation_revision,
+        expectedOrderRowVersion: Number(row.expected_order_row_version),
+        expectedSourceHash: row.expected_source_hash,
+        acceptedObservationId: row.accepted_observation_id,
+        acceptedProviderOrderUpdatedAt:
+          iso(row.accepted_provider_order_updated_at),
+        providerSnapshotHash: row.provider_snapshot_hash,
+        expectedLineQuantity: row.expected_line_quantity,
+        intentHash: row.intent_hash,
+        authorizationReason: row.authorization_reason,
+        attemptHash,
+        processingLeaseExpiresAt: iso(attempt.processing_lease_expires_at),
+        providerWrites: 0,
+        networkCalls: 0,
+      },
+    }, client)
+    return {
+      expired: false as const,
+      row: updated.rows[0],
+      attempt,
+      attemptHash,
+    }
+  })
+
+  if (result.expired) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_AUTHORIZATION_EXPIRED',
+      'The five-minute Shopify order authorization expired before dispatch',
+      410,
+    )
+  }
+  const mapped = authorization({
+    ...result.row,
+    provider_attempt_global_id: result.attempt.global_id,
+    processing_lease_expires_at:
+      result.attempt.processing_lease_expires_at,
+  })
+  return {
+    ...mapped,
+    status: 'processing',
+    storedStatus: 'processing',
+    providerAttemptGlobalId: result.attempt.global_id,
+    processingLeaseExpiresAt:
+      iso(result.attempt.processing_lease_expires_at)!,
+    attemptHash: result.attemptHash,
+    claimedAt: iso(result.attempt.claimed_at)!,
+    actionInput: action,
+  }
+}
+
+function optionalProviderReference(value: unknown) {
+  if (value === undefined || value === null || value === '') return null
+  const normalized = String(value).trim()
+  if (
+    normalized.length < 1
+    || normalized.length > 512
+    || !SAFE_TEXT.test(normalized)
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_OUTCOME_INVALID',
+      'Provider result reference is invalid',
+      400,
+    )
+  }
+  return normalized
+}
+
+function normalizedErrorCode(value: unknown, required: boolean) {
+  if (!required && (value === undefined || value === null || value === '')) {
+    return null
+  }
+  const normalized = String(value || '').trim().toUpperCase()
+  if (!ERROR_CODE.test(normalized)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_OUTCOME_INVALID',
+      'A safe provider outcome error code is required',
+      400,
+    )
+  }
+  return normalized
+}
+
+function providerWriteCount(
+  value: unknown,
+  input: {
+    outcome: 'succeeded' | 'failed' | 'unknown' | 'reconciled'
+  },
+) {
+  if (value === null || value === undefined) {
+    if (input.outcome === 'unknown' || input.outcome === 'reconciled') {
+      return null
+    }
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_OUTCOME_INVALID',
+      'A known provider write count is required for this outcome',
+      400,
+    )
+  }
+  const normalized = Number(value)
+  if (!Number.isSafeInteger(normalized) || normalized < 0 || normalized > 3) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_OUTCOME_INVALID',
+      'Provider write count must be an integer from zero through three',
+      400,
+    )
+  }
+  return normalized
+}
+
+async function selectAuthorizationForOutcome(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    authorizationGlobalId: string
+    providerAttemptGlobalId: string
+  },
+) {
+  const selected = await client.query<AuthorizationRow & {
+    provider_attempt_global_id: string | null
+  }>(
+    `${AUTHORIZATION_SELECT}
+     WHERE authz.organization_id = $1::uuid
+       AND authz.global_id = $2
+       AND attempt.global_id = $3
+     FOR UPDATE OF authz`,
+    [
+      input.organizationId,
+      input.authorizationGlobalId,
+      input.providerAttemptGlobalId,
+    ],
+  )
+  const row = selected.rows[0]
+  if (!row) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ATTEMPT_NOT_FOUND',
+      'The exact Shopify provider attempt was not found',
+      404,
+    )
+  }
+  return row
+}
+
+export async function recordShopifyOrderManagementOutcomeInPostgres(
+  input: RecordShopifyOrderManagementOutcomeInput,
+): Promise<ShopifyOrderManagementAuthorization> {
+  const scopedOrganizationId = organizationId(input.organizationId)
+  const recordedBy = actorEmail(input.actorEmail)
+  const authorizationGlobalId = globalId(
+    input.authorizationGlobalId,
+    AUTHORIZATION_GLOBAL_ID,
+    'SHOPIFY_ORDER_MANAGEMENT_AUTHORIZATION_REQUIRED',
+    'A valid Shopify order management authorization is required',
+  )
+  const providerAttemptGlobalId = globalId(
+    input.providerAttemptGlobalId,
+    ATTEMPT_GLOBAL_ID,
+    'SHOPIFY_ORDER_MANAGEMENT_ATTEMPT_REQUIRED',
+    'A valid Shopify provider attempt is required',
+  )
+  if (!['succeeded', 'failed', 'unknown'].includes(input.outcome)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_OUTCOME_INVALID',
+      'Provider outcome must be succeeded, failed, or unknown',
+      400,
+    )
+  }
+  const providerReference = optionalProviderReference(input.providerReference)
+  const errorCode = normalizedErrorCode(
+    input.errorCode,
+    input.outcome !== 'succeeded',
+  )
+  const evidenceHash = shopifyOrderManagementEvidenceHash({
+    schema: 'shopify-order-management-provider-outcome-v1',
+    outcome: input.outcome,
+    evidence: input.evidence,
+  })
+  const exactProviderWriteCount = providerWriteCount(
+    input.providerWriteCount,
+    { outcome: input.outcome },
+  )
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shopify-order-management-outcome:${scopedOrganizationId}:${authorizationGlobalId}`,
+    )
+    const row = await selectAuthorizationForOutcome(client, {
+      organizationId: scopedOrganizationId,
+      authorizationGlobalId,
+      providerAttemptGlobalId,
+    })
+    if (
+      row.status !== 'processing'
+      || row.authorized_by !== recordedBy
+    ) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_OUTCOME_CONFLICT',
+        'The exact processing attempt does not belong to this actor',
+      )
+    }
+    const inserted = await client.query<{
+      id: string
+      global_id: string
+      recorded_at: TimestampValue
+    }>(
+      `INSERT INTO operations_shopify_order_management_outcomes (
+         organization_id, authorization_id, provider_attempt_id,
+         outcome_state, reconciliation_resolution, provider_write_count,
+         provider_reference, evidence_hash, error_code, recorded_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4, NULL, $5, $6, $7, $8, $9
+       )
+       RETURNING id::text, global_id, recorded_at`,
+      [
+        scopedOrganizationId,
+        row.id,
+        row.provider_attempt_id,
+        input.outcome,
+        exactProviderWriteCount,
+        providerReference,
+        evidenceHash,
+        errorCode,
+        recordedBy,
+      ],
+    )
+    const outcome = inserted.rows[0]
+    const updated = await client.query<AuthorizationRow>(
+      `UPDATE operations_shopify_order_management_authorizations
+       SET status = $3, latest_outcome_id = $4::uuid,
+           completed_at = $5::timestamptz, updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND status = 'processing'
+       RETURNING *`,
+      [
+        scopedOrganizationId,
+        row.id,
+        input.outcome,
+        outcome.id,
+        outcome.recorded_at,
+      ],
+    )
+    if (updated.rowCount !== 1) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_OUTCOME_CONFLICT',
+        'The provider outcome could not be committed atomically',
+      )
+    }
+    await recordAuditEvent({
+      actor: recordedBy,
+      eventType: `operations.shopify_order_management.${input.outcome}`,
+      aggregateType: 'operations.shopify_order_management_authorization',
+      aggregateId: row.global_id,
+      subject: row.order_global_id,
+      organizationId: scopedOrganizationId,
+      eventKey: `operations:shopify-order-management:${outcome.global_id}:recorded`,
+      payload: {
+        providerAttemptGlobalId,
+        outcomeGlobalId: outcome.global_id,
+        accountGlobalId: row.integration_account_global_id,
+        orderGlobalId: row.order_global_id,
+        externalOrderId: row.external_order_id,
+        action: row.action,
+        evidenceHash,
+        providerReference,
+        errorCode,
+        providerWrites: exactProviderWriteCount,
+      },
+    }, client)
+    return authorization({
+      ...updated.rows[0],
+      provider_attempt_global_id: providerAttemptGlobalId,
+      latest_outcome_global_id: outcome.global_id,
+      latest_outcome_state: input.outcome,
+      provider_write_count: exactProviderWriteCount,
+      provider_reference: providerReference,
+      error_code: errorCode,
+    })
+  })
+}
+
+export async function recoverStaleShopifyOrderManagementAttemptInPostgres(
+  input: RecoverStaleShopifyOrderManagementAttemptInput,
+): Promise<RecoverStaleShopifyOrderManagementAttemptResult> {
+  const scopedOrganizationId = organizationId(input.organizationId)
+  const recoveredBy = actorEmail(input.actorEmail)
+  const authorizationGlobalId = globalId(
+    input.authorizationGlobalId,
+    AUTHORIZATION_GLOBAL_ID,
+    'SHOPIFY_ORDER_MANAGEMENT_AUTHORIZATION_REQUIRED',
+    'A valid Shopify order management authorization is required',
+  )
+  const providerAttemptGlobalId = globalId(
+    input.providerAttemptGlobalId,
+    ATTEMPT_GLOBAL_ID,
+    'SHOPIFY_ORDER_MANAGEMENT_ATTEMPT_REQUIRED',
+    'A valid Shopify provider attempt is required',
+  )
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shopify-order-management-outcome:${scopedOrganizationId}:${authorizationGlobalId}`,
+    )
+    const role = await requireActorRole(client, {
+      organizationId: scopedOrganizationId,
+      actorEmail: recoveredBy,
+    })
+    const row = await selectAuthorizationForOutcome(client, {
+      organizationId: scopedOrganizationId,
+      authorizationGlobalId,
+      providerAttemptGlobalId,
+    })
+    if (row.status !== 'processing') {
+      return Object.freeze({
+        authorization: authorization(row),
+        recovered: false,
+      })
+    }
+    if (row.processing_lease_expired !== true) {
+      return Object.freeze({
+        authorization: authorization(row),
+        recovered: false,
+      })
+    }
+    const processingLeaseExpiresAt = iso(row.processing_lease_expires_at)
+    if (!processingLeaseExpiresAt || !row.provider_attempt_hash) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_EVIDENCE_INVALID',
+        'The durable Shopify processing lease evidence is incomplete',
+        500,
+      )
+    }
+    const evidenceHash = shopifyOrderManagementEvidenceHash({
+      schema: 'shopify-order-management-stale-processing-recovery-v1',
+      authorizationGlobalId: row.global_id,
+      providerAttemptGlobalId,
+      attemptHash: row.provider_attempt_hash,
+      processingLeaseExpiresAt,
+    })
+    const inserted = await client.query<{
+      id: string
+      global_id: string
+      recorded_at: TimestampValue
+    }>(
+      `INSERT INTO operations_shopify_order_management_outcomes (
+         organization_id, authorization_id, provider_attempt_id,
+         outcome_state, reconciliation_resolution, provider_write_count,
+         provider_reference, evidence_hash, error_code, recorded_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'unknown', NULL, NULL, NULL,
+         $4, $5, $6
+       )
+       RETURNING id::text, global_id, recorded_at`,
+      [
+        scopedOrganizationId,
+        row.id,
+        row.provider_attempt_id,
+        evidenceHash,
+        SHOPIFY_ORDER_MANAGEMENT_PROCESSING_LEASE_EXPIRED_CODE,
+        recoveredBy,
+      ],
+    )
+    const outcome = inserted.rows[0]
+    const updated = await client.query<AuthorizationRow>(
+      `UPDATE operations_shopify_order_management_authorizations
+       SET status = 'unknown', latest_outcome_id = $3::uuid,
+           completed_at = $4::timestamptz, updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND status = 'processing'
+       RETURNING *`,
+      [scopedOrganizationId, row.id, outcome.id, outcome.recorded_at],
+    )
+    if (updated.rowCount !== 1) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_RECOVERY_CONFLICT',
+        'The stale Shopify processing attempt could not be recovered atomically',
+      )
+    }
+    await recordAuditEvent({
+      actor: recoveredBy,
+      eventType:
+        'operations.shopify_order_management.processing_lease_expired',
+      aggregateType: 'operations.shopify_order_management_authorization',
+      aggregateId: row.global_id,
+      subject: row.order_global_id,
+      organizationId: scopedOrganizationId,
+      eventKey: `operations:shopify-order-management:${outcome.global_id}:processing-lease-expired`,
+      payload: {
+        providerAttemptGlobalId,
+        outcomeGlobalId: outcome.global_id,
+        accountGlobalId: row.integration_account_global_id,
+        orderGlobalId: row.order_global_id,
+        externalOrderId: row.external_order_id,
+        action: row.action,
+        authorizedBy: row.authorized_by,
+        authorizedRole: row.authorized_role,
+        recoveredBy,
+        recoveredRole: role,
+        evidenceHash,
+        processingLeaseExpiresAt,
+        errorCode: SHOPIFY_ORDER_MANAGEMENT_PROCESSING_LEASE_EXPIRED_CODE,
+        providerWrites: null,
+        providerRetryAuthorized: false,
+      },
+    }, client)
+    return Object.freeze({
+      authorization: authorization({
+        ...updated.rows[0],
+        provider_attempt_global_id: providerAttemptGlobalId,
+        provider_attempt_hash: row.provider_attempt_hash,
+        processing_lease_expires_at: row.processing_lease_expires_at,
+        processing_lease_expired: true,
+        latest_outcome_global_id: outcome.global_id,
+        latest_outcome_state: 'unknown',
+        reconciliation_resolution: null,
+        provider_write_count: null,
+        provider_reference: null,
+        error_code:
+          SHOPIFY_ORDER_MANAGEMENT_PROCESSING_LEASE_EXPIRED_CODE,
+      }),
+      recovered: true,
+    })
+  })
+}
+
+export async function reconcileShopifyOrderManagementOutcomeInPostgres(
+  input: ReconcileShopifyOrderManagementOutcomeInput,
+): Promise<ShopifyOrderManagementAuthorization> {
+  const scopedOrganizationId = organizationId(input.organizationId)
+  const recordedBy = actorEmail(input.actorEmail)
+  const authorizationGlobalId = globalId(
+    input.authorizationGlobalId,
+    AUTHORIZATION_GLOBAL_ID,
+    'SHOPIFY_ORDER_MANAGEMENT_AUTHORIZATION_REQUIRED',
+    'A valid Shopify order management authorization is required',
+  )
+  const providerAttemptGlobalId = globalId(
+    input.providerAttemptGlobalId,
+    ATTEMPT_GLOBAL_ID,
+    'SHOPIFY_ORDER_MANAGEMENT_ATTEMPT_REQUIRED',
+    'A valid Shopify provider attempt is required',
+  )
+  if (input.resolution !== 'applied' && input.resolution !== 'not_applied') {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_RECONCILIATION_INVALID',
+      'Reconciliation must prove applied or not_applied',
+      400,
+    )
+  }
+  const providerReference = optionalProviderReference(input.providerReference)
+  const evidenceHash = shopifyOrderManagementEvidenceHash({
+    schema: 'shopify-order-management-reconciliation-v1',
+    resolution: input.resolution,
+    evidence: input.evidence,
+  })
+  const requestedProviderWriteCount = providerWriteCount(
+    input.providerWriteCount,
+    { outcome: 'reconciled' },
+  )
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shopify-order-management-outcome:${scopedOrganizationId}:${authorizationGlobalId}`,
+    )
+    await requireActorRole(client, {
+      organizationId: scopedOrganizationId,
+      actorEmail: recordedBy,
+    })
+    const row = await selectAuthorizationForOutcome(client, {
+      organizationId: scopedOrganizationId,
+      authorizationGlobalId,
+      providerAttemptGlobalId,
+    })
+    if (row.status !== 'unknown') {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_RECONCILIATION_CONFLICT',
+        'Only the exact unknown attempt can be reconciled by a qualified operator',
+      )
+    }
+    const exactProviderWriteCount = requestedProviderWriteCount
+      ?? (row.provider_write_count === null
+        || row.provider_write_count === undefined
+        ? null
+        : Number(row.provider_write_count))
+    const inserted = await client.query<{
+      id: string
+      global_id: string
+      recorded_at: TimestampValue
+    }>(
+      `INSERT INTO operations_shopify_order_management_outcomes (
+         organization_id, authorization_id, provider_attempt_id,
+         outcome_state, reconciliation_resolution, provider_write_count,
+         provider_reference, evidence_hash, error_code, recorded_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'reconciled', $4, $5, $6, $7,
+         NULL, $8
+       )
+       RETURNING id::text, global_id, recorded_at`,
+      [
+        scopedOrganizationId,
+        row.id,
+        row.provider_attempt_id,
+        input.resolution,
+        exactProviderWriteCount,
+        providerReference,
+        evidenceHash,
+        recordedBy,
+      ],
+    )
+    const outcome = inserted.rows[0]
+    const updated = await client.query<AuthorizationRow>(
+      `UPDATE operations_shopify_order_management_authorizations
+       SET status = 'reconciled', latest_outcome_id = $3::uuid,
+           completed_at = $4::timestamptz, updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND status = 'unknown'
+       RETURNING *`,
+      [scopedOrganizationId, row.id, outcome.id, outcome.recorded_at],
+    )
+    if (updated.rowCount !== 1) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_RECONCILIATION_CONFLICT',
+        'The provider reconciliation could not be committed atomically',
+      )
+    }
+    await recordAuditEvent({
+      actor: recordedBy,
+      eventType: 'operations.shopify_order_management.reconciled',
+      aggregateType: 'operations.shopify_order_management_authorization',
+      aggregateId: row.global_id,
+      subject: row.order_global_id,
+      organizationId: scopedOrganizationId,
+      eventKey: `operations:shopify-order-management:${outcome.global_id}:recorded`,
+      payload: {
+        providerAttemptGlobalId,
+        outcomeGlobalId: outcome.global_id,
+        accountGlobalId: row.integration_account_global_id,
+        orderGlobalId: row.order_global_id,
+        externalOrderId: row.external_order_id,
+        action: row.action,
+        resolution: input.resolution,
+        authorizedBy: row.authorized_by,
+        reconciledBy: recordedBy,
+        evidenceHash,
+        providerReference,
+        providerWrites: exactProviderWriteCount,
+      },
+    }, client)
+    return authorization({
+      ...updated.rows[0],
+      provider_attempt_global_id: providerAttemptGlobalId,
+      latest_outcome_global_id: outcome.global_id,
+      latest_outcome_state: 'reconciled',
+      reconciliation_resolution: input.resolution,
+      provider_write_count: exactProviderWriteCount,
+      provider_reference: providerReference,
+      error_code: null,
+    })
+  })
+}
+
+export async function readShopifyOrderManagementHealthFromPostgres(): Promise<
+  ShopifyOrderManagementHealth
+> {
+  const result = await query<{
+    prepared: string | number
+    processing: string | number
+    stale_processing: string | number
+    unknown: string | number
+    latest_unknown_at: TimestampValue | null
+    last_completed_at: TimestampValue | null
+    known_provider_write_outcome_count: string | number
+    known_provider_write_sum: string | number
+  }>(
+    `SELECT
+       count(*) FILTER (
+         WHERE authz.status = 'prepared'
+           AND authz.expires_at > clock_timestamp()
+       ) AS prepared,
+       count(*) FILTER (WHERE authz.status = 'processing') AS processing,
+       count(*) FILTER (
+         WHERE authz.status = 'processing'
+           AND attempt.processing_lease_expires_at <= clock_timestamp()
+       ) AS stale_processing,
+       count(*) FILTER (WHERE authz.status = 'unknown') AS unknown,
+       (
+         SELECT max(unknown_outcome.recorded_at)
+         FROM operations_shopify_order_management_outcomes unknown_outcome
+         WHERE unknown_outcome.outcome_state = 'unknown'
+       ) AS latest_unknown_at,
+       max(authz.completed_at) FILTER (
+         WHERE authz.status IN (
+           'succeeded', 'failed', 'unknown', 'reconciled', 'expired'
+         )
+       ) AS last_completed_at,
+       count(outcome.provider_write_count)
+         AS known_provider_write_outcome_count,
+       COALESCE(sum(outcome.provider_write_count), 0)
+         AS known_provider_write_sum
+     FROM operations_shopify_order_management_authorizations authz
+     LEFT JOIN operations_shopify_order_management_attempts attempt
+       ON attempt.organization_id = authz.organization_id
+      AND attempt.id = authz.provider_attempt_id
+     LEFT JOIN operations_shopify_order_management_outcomes outcome
+       ON outcome.organization_id = authz.organization_id
+      AND outcome.id = authz.latest_outcome_id`,
+  )
+  const row = result.rows[0]
+  return Object.freeze({
+    prepared: Number(row?.prepared || 0),
+    processing: Number(row?.processing || 0),
+    staleProcessing: Number(row?.stale_processing || 0),
+    unknown: Number(row?.unknown || 0),
+    latestUnknownAt: iso(row?.latest_unknown_at),
+    lastCompletedAt: iso(row?.last_completed_at),
+    knownProviderWriteOutcomeCount: Number(
+      row?.known_provider_write_outcome_count || 0,
+    ),
+    knownProviderWriteSum: Number(row?.known_provider_write_sum || 0),
+  })
+}
+
+export async function readShopifyOrderManagementAuthorizationInPostgres(input: {
+  organizationId: unknown
+  authorizationGlobalId: unknown
+}): Promise<ShopifyOrderManagementAuthorization | null> {
+  const scopedOrganizationId = organizationId(input.organizationId)
+  const authorizationGlobalId = globalId(
+    input.authorizationGlobalId,
+    AUTHORIZATION_GLOBAL_ID,
+    'SHOPIFY_ORDER_MANAGEMENT_AUTHORIZATION_REQUIRED',
+    'A valid Shopify order management authorization is required',
+  )
+  const result = await query<AuthorizationRow>(
+    `${AUTHORIZATION_SELECT}
+     WHERE authz.organization_id = $1::uuid
+       AND authz.global_id = $2
+     LIMIT 1`,
+    [scopedOrganizationId, authorizationGlobalId],
+  )
+  return result.rows[0] ? authorization(result.rows[0]) : null
+}
+
+export async function readShopifyOrderManagementAuthorizationByAttemptInPostgres(
+  input: {
+    organizationId: unknown
+    attemptGlobalId: unknown
+  },
+): Promise<ShopifyOrderManagementAuthorization | null> {
+  const scopedOrganizationId = organizationId(input.organizationId)
+  const attemptGlobalId = globalId(
+    input.attemptGlobalId,
+    ATTEMPT_GLOBAL_ID,
+    'SHOPIFY_ORDER_MANAGEMENT_ATTEMPT_REQUIRED',
+    'A valid Shopify provider attempt is required',
+  )
+  const result = await query<AuthorizationRow>(
+    `${AUTHORIZATION_SELECT}
+     WHERE authz.organization_id = $1::uuid
+       AND attempt.global_id = $2
+     LIMIT 1`,
+    [scopedOrganizationId, attemptGlobalId],
+  )
+  return result.rows[0] ? authorization(result.rows[0]) : null
+}
+
+export async function listShopifyOrderManagementAuthorizationsInPostgres(input: {
+  organizationId: unknown
+  orderGlobalId?: unknown
+  limit?: unknown
+}): Promise<ShopifyOrderManagementAuthorization[]> {
+  const scopedOrganizationId = organizationId(input.organizationId)
+  const orderGlobalId = input.orderGlobalId === undefined
+    ? null
+    : globalId(
+        input.orderGlobalId,
+        ORDER_GLOBAL_ID,
+        'SHOPIFY_ORDER_MANAGEMENT_ORDER_REQUIRED',
+        'A valid Operations order Global ID is required',
+      )
+  const requestedLimit = input.limit === undefined
+    ? 25 : integer(input.limit, 'Order management read limit', 1)
+  const limit = Math.min(requestedLimit, 100)
+  const result = await query<AuthorizationRow>(
+    `${AUTHORIZATION_SELECT}
+     WHERE authz.organization_id = $1::uuid
+       AND ($2::text IS NULL OR authz.order_global_id = $2)
+     ORDER BY authz.prepared_at DESC, authz.id DESC
+     LIMIT $3`,
+    [scopedOrganizationId, orderGlobalId, limit],
+  )
+  return result.rows.map((row) => authorization(row))
+}
+
+export async function readShopifyOrderManagementTargetInPostgres(input: {
+  organizationId: unknown
+  orderGlobalId: unknown
+}): Promise<ShopifyOrderManagementTarget | null> {
+  const scopedOrganizationId = organizationId(input.organizationId)
+  const orderGlobalId = globalId(
+    input.orderGlobalId,
+    ORDER_GLOBAL_ID,
+    'SHOPIFY_ORDER_MANAGEMENT_ORDER_REQUIRED',
+    'A valid Operations order Global ID is required',
+  )
+  const result = await query<{
+    account_global_id: string
+    account_display_name: string
+    account_environment: string
+    external_account_id: string | null
+    shop_domain: string | null
+    commerce_credential_generation: number
+    credential_current: boolean
+    activation_state: string
+    activation_revision: number
+    order_global_id: string
+    external_order_id: string
+    order_number: string
+    order_row_version: string | number
+    order_status: string
+    source_hash: string | null
+    accepted_source_hash: string
+    accepted_provider_updated_at: TimestampValue | null
+    latest_source_hash: string | null
+    material_state: string
+    latest_observed_at: TimestampValue | null
+    latest_provider_updated_at: string | null
+    latest_provider_order_test: string | null
+    zero_downstream: boolean
+  }>(
+    `SELECT
+       account.global_id AS account_global_id,
+       account.display_name AS account_display_name,
+       account.environment AS account_environment,
+       account.external_account_id,
+       account.configuration->>'shopDomain' AS shop_domain,
+       account.commerce_credential_generation,
+       (
+         account.provider = 'shopify'
+         AND account.integration_type = 'commerce'
+         AND account.status = 'active'
+         AND account.external_account_id IS NOT NULL
+         AND credential.external_account_id = account.external_account_id
+         AND credential.credential_version =
+               account.commerce_credential_generation
+         AND credential.auth_mode = 'shopify_client_credentials'
+         AND credential.verification_status = 'verified'
+       ) AS credential_current,
+       activation.state AS activation_state,
+       activation.revision AS activation_revision,
+       order_row.global_id AS order_global_id,
+       order_row.external_order_id,
+       order_row.order_number,
+       order_row.row_version::text AS order_row_version,
+       order_row.status AS order_status,
+       order_row.source_payload->>'sourceHash' AS source_hash,
+       target.accepted_source_hash,
+       operations_shopify_order_management_snapshot_updated_at(
+         accepted_observation.normalized_snapshot
+       ) AS accepted_provider_updated_at,
+       target.latest_source_hash,
+       target.material_state,
+       COALESCE(latest_read.observed_at, observation.observed_at)
+         AS latest_observed_at,
+       observation.normalized_snapshot #>> '{order,providerUpdatedAt}'
+         AS latest_provider_updated_at,
+       observation.normalized_snapshot #>> '{order,providerFacts,testOrder}'
+         AS latest_provider_order_test,
+       ocr_order_has_zero_downstream(
+         order_row.organization_id, order_row.id
+       ) AS zero_downstream
+     FROM operations_orders order_row
+     JOIN operations_integration_accounts account
+       ON account.organization_id = order_row.organization_id
+      AND account.id = order_row.integration_account_id
+     LEFT JOIN operations_commerce_credentials credential
+       ON credential.organization_id = account.organization_id
+      AND credential.integration_account_id = account.id
+     JOIN operations_activation_scopes activation
+       ON activation.organization_id = order_row.organization_id
+     JOIN operations_commerce_order_revision_targets target
+       ON target.organization_id = order_row.organization_id
+      AND target.order_id = order_row.id
+     LEFT JOIN operations_commerce_order_revision_observations observation
+       ON observation.organization_id = target.organization_id
+      AND observation.id = target.latest_observation_id
+     LEFT JOIN operations_commerce_order_revision_observations
+       accepted_observation
+       ON accepted_observation.organization_id = target.organization_id
+      AND accepted_observation.id = target.accepted_observation_id
+      AND accepted_observation.integration_account_id =
+            target.integration_account_id
+      AND accepted_observation.target_id = target.id
+      AND accepted_observation.order_id = target.order_id
+      AND accepted_observation.provider = target.provider
+      AND accepted_observation.external_order_id = order_row.external_order_id
+      AND accepted_observation.source_hash = target.accepted_source_hash
+      AND accepted_observation.canonical_row_version = order_row.row_version
+     LEFT JOIN operations_commerce_order_revision_reads latest_read
+       ON latest_read.organization_id = target.organization_id
+      AND latest_read.id = target.latest_read_id
+     WHERE order_row.organization_id = $1::uuid
+       AND order_row.global_id = $2
+       AND order_row.source_provider = 'shopify'
+       AND account.provider = 'shopify'
+       AND account.integration_type = 'commerce'
+     LIMIT 1`,
+    [scopedOrganizationId, orderGlobalId],
+  )
+  const row = result.rows[0]
+  if (!row) return null
+  const latestOpen = await query<AuthorizationRow>(
+    `${AUTHORIZATION_SELECT}
+     WHERE authz.organization_id = $1::uuid
+       AND authz.order_global_id = $2
+       AND (
+         authz.status IN ('processing', 'unknown')
+         OR (
+           authz.status = 'prepared'
+           AND authz.expires_at > clock_timestamp()
+         )
+       )
+     ORDER BY authz.prepared_at DESC, authz.id DESC
+     LIMIT 1`,
+    [scopedOrganizationId, orderGlobalId],
+  )
+  const providerUpdatedAtDate = row.latest_provider_updated_at
+    ? new Date(row.latest_provider_updated_at)
+    : null
+  const providerUpdatedAt = providerUpdatedAtDate
+    && Number.isFinite(providerUpdatedAtDate.getTime())
+    ? providerUpdatedAtDate.toISOString()
+    : null
+  const providerOrderTest = row.latest_provider_order_test === 'true'
+    ? true
+    : row.latest_provider_order_test === 'false' ? false : null
+  return {
+    organizationId: scopedOrganizationId,
+    accountGlobalId: row.account_global_id,
+    accountDisplayName: row.account_display_name,
+    accountEnvironment: row.account_environment,
+    externalAccountId: row.external_account_id,
+    shopDomain: row.shop_domain,
+    credentialGeneration: Number(row.commerce_credential_generation),
+    credentialCurrent: row.credential_current === true,
+    activationState: row.activation_state,
+    activationRevision: Number(row.activation_revision),
+    orderGlobalId: row.order_global_id,
+    externalOrderId: row.external_order_id,
+    orderNumber: row.order_number,
+    orderRowVersion: Number(row.order_row_version),
+    orderStatus: row.order_status,
+    sourceHash: row.source_hash,
+    acceptedSourceHash: row.accepted_source_hash,
+    acceptedProviderUpdatedAt: iso(row.accepted_provider_updated_at),
+    latestSourceHash: row.latest_source_hash,
+    materialState: row.material_state,
+    latestObservedAt: iso(row.latest_observed_at),
+    latestProviderUpdatedAt: providerUpdatedAt,
+    latestProviderOrderTest: providerOrderTest,
+    zeroDownstream: row.zero_downstream === true,
+    latestOpenAuthorization: latestOpen.rows[0]
+      ? authorization(latestOpen.rows[0]) : null,
+  }
+}
