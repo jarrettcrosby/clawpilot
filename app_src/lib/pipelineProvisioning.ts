@@ -140,6 +140,7 @@ const GENERATED_REPORT_CLEAR_RANGES = [
   "'Calculations'!B4:ZZZ",
   "'Dashboard'!B4:ZZZ",
 ] as const
+const GENERATED_DROPDOWN_CLEAR_RANGE = "'Dropdowns'!B4:ZZZ"
 const GENERATED_HEADER_CLEAR_RANGES = EXPECTED_TABS.map((title) => `'${title}'!A1:ZZ3`)
 
 const WORKBOOK_THEME = {
@@ -1648,7 +1649,6 @@ export async function configurePipelineTabsWithRequest(
   let metadata = await spreadsheetMetadata(request, sheetId)
   const current = metadata.sheets || []
   const currentTitles = new Set(current.map((sheet) => sheet.properties?.title).filter(Boolean))
-  const newlyProvisionedTitles = new Set<string>()
   const requests: unknown[] = []
 
   if (!currentTitles.has(EXPECTED_TABS[0])) {
@@ -1664,14 +1664,12 @@ export async function configurePipelineTabsWithRequest(
         },
       })
       currentTitles.add(EXPECTED_TABS[0])
-      newlyProvisionedTitles.add(EXPECTED_TABS[0])
     }
   }
   for (const title of EXPECTED_TABS) {
     if (!currentTitles.has(title)) {
       requests.push({ addSheet: { properties: { title } } })
       currentTitles.add(title)
-      newlyProvisionedTitles.add(title)
     }
   }
   if (requests.length > 0) {
@@ -1700,7 +1698,42 @@ export async function configurePipelineTabsWithRequest(
       },
       idempotent: false,
     })
-    newlyProvisionedTitles.add('Dashboard')
+    metadata = await spreadsheetMetadata(request, sheetId)
+  }
+
+  const currentDropdownResult = await request<{ values?: unknown[][] }>(
+    `/v4/spreadsheets/${sheetId}/values/${encodeURIComponent("'Dropdowns'!B4:ZZ2000")}?majorDimension=ROWS`,
+  )
+  const configuredDropdownRows = canonicalConfiguredDropdownRows(currentDropdownResult.values || [])
+
+  const gridExpansionRequests = (metadata.sheets || []).flatMap((sheet) => {
+    const id = sheet.properties?.sheetId
+    const title = sheet.properties?.title as (typeof EXPECTED_TABS)[number]
+    if (id === undefined || !EXPECTED_TABS.includes(title)) return []
+    const tableStartColumnIndex = title === 'Start Here' ? 2 : 1
+    const minimumRows = title === 'Dashboard' ? 44 : title === 'Start Here' ? 30 : title === 'Calculations' ? 40 : 1000
+    const minimumColumns = title === 'Dashboard'
+      ? DASHBOARD_HELPER_END_COLUMN_INDEX
+      : tableStartColumnIndex + (title === 'Dropdowns' ? configuredDropdownRows[0].length : TAB_HEADERS[title].length)
+    const rowCount = Math.max(minimumRows, sheet.properties?.gridProperties?.rowCount || 0)
+    const columnCount = Math.max(minimumColumns, sheet.properties?.gridProperties?.columnCount || 0)
+    if (
+      rowCount === sheet.properties?.gridProperties?.rowCount
+      && columnCount === sheet.properties?.gridProperties?.columnCount
+    ) return []
+    return [{
+      updateSheetProperties: {
+        properties: { sheetId: id, gridProperties: { rowCount, columnCount } },
+        fields: 'gridProperties(rowCount,columnCount)',
+      },
+    }]
+  })
+  if (gridExpansionRequests.length > 0) {
+    await request(`/v4/spreadsheets/${sheetId}:batchUpdate`, {
+      method: 'POST',
+      body: { requests: gridExpansionRequests, includeSpreadsheetInResponse: false },
+      idempotent: false,
+    })
     metadata = await spreadsheetMetadata(request, sheetId)
   }
 
@@ -1722,7 +1755,13 @@ export async function configurePipelineTabsWithRequest(
 
   await request(`/v4/spreadsheets/${sheetId}/values:batchClear`, {
     method: 'POST',
-    body: { ranges: [...GENERATED_HEADER_CLEAR_RANGES, ...GENERATED_REPORT_CLEAR_RANGES] },
+    body: {
+      ranges: [
+        ...GENERATED_HEADER_CLEAR_RANGES,
+        ...GENERATED_REPORT_CLEAR_RANGES,
+        GENERATED_DROPDOWN_CLEAR_RANGE,
+      ],
+    },
     idempotent: true,
   })
 
@@ -1739,8 +1778,14 @@ export async function configurePipelineTabsWithRequest(
             values: [['ClawPilot Record ID']],
           })
         }
-        const preserveConfiguredDropdowns = title === 'Dropdowns' && !newlyProvisionedTitles.has(title)
-        if (preserveConfiguredDropdowns) return writes
+        if (title === 'Dropdowns') {
+          writes.push({
+            range: "'Dropdowns'!B4",
+            majorDimension: 'ROWS',
+            values: configuredDropdownRows,
+          })
+          return writes
+        }
 
         const dataColumn = title === 'Dashboard' ? 'P' : title === 'Start Here' ? 'C' : 'B'
         writes.push({
@@ -1762,13 +1807,7 @@ export async function configurePipelineTabsWithRequest(
   })
 
   metadata = await spreadsheetMetadata(request, sheetId)
-  const dropdownHeaderResult = await request<{ values?: unknown[][] }>(
-    `/v4/spreadsheets/${sheetId}/values/${encodeURIComponent("'Dropdowns'!B4:ZZ4")}?majorDimension=ROWS`,
-  )
-  const configuredDropdownColumnCount = Math.max(
-    TAB_HEADERS.Dropdowns.length,
-    populatedColumnCount(dropdownHeaderResult.values?.[0] || []),
-  )
+  const configuredDropdownColumnCount = Math.max(TAB_HEADERS.Dropdowns.length, configuredDropdownRows[0].length)
   const managedSheets = (metadata.sheets || []).filter((sheet) => (
     typeof sheet.properties?.sheetId === 'number'
     && EXPECTED_TABS.includes(sheet.properties?.title as (typeof EXPECTED_TABS)[number])
@@ -2909,6 +2948,18 @@ function catalogFromDropdownRows(values: unknown[][]): Record<string, string[]> 
     })
     return [[key, options] as const]
   }))
+}
+
+function canonicalConfiguredDropdownRows(values: unknown[][]) {
+  const defaults = catalogFromDropdownRows([
+    TAB_HEADERS.Dropdowns,
+    ...(INITIAL_TAB_ROWS.Dropdowns || []),
+  ])
+  const configured = catalogFromDropdownRows(values)
+  for (const [key, options] of Object.entries(configured)) {
+    if (options.length > 0 || !(key in defaults)) defaults[key] = options
+  }
+  return dropdownRows(defaults)
 }
 
 function dropdownRows(catalog: Record<string, string[]>) {

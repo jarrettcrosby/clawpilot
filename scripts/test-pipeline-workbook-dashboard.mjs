@@ -57,7 +57,14 @@ const configureBlock = source.slice(
 )
 assert.match(source, /const GENERATED_HEADER_CLEAR_RANGES = EXPECTED_TABS\.map/)
 assert.match(source, /const GENERATED_REPORT_CLEAR_RANGES = \[\s*"'Start Here'!B4:ZZZ",\s*"'Calculations'!B4:ZZZ",\s*"'Dashboard'!B4:ZZZ",\s*\] as const/)
-assert.match(configureBlock, /body: \{ ranges: \[\.\.\.GENERATED_HEADER_CLEAR_RANGES, \.\.\.GENERATED_REPORT_CLEAR_RANGES\] \}/)
+assert.match(source, /const GENERATED_DROPDOWN_CLEAR_RANGE = "'Dropdowns'!B4:ZZZ"/)
+assert.match(configureBlock, /\.\.\.GENERATED_HEADER_CLEAR_RANGES,\s*\.\.\.GENERATED_REPORT_CLEAR_RANGES,\s*GENERATED_DROPDOWN_CLEAR_RANGE/)
+assert.match(configureBlock, /const gridExpansionRequests =/)
+assert.match(configureBlock, /title === 'Dashboard'\s*\? DASHBOARD_HELPER_END_COLUMN_INDEX/)
+assert.ok(
+  configureBlock.indexOf('gridExpansionRequests.length > 0') < configureBlock.indexOf('/values:batchClear'),
+  'dashboard helper columns must exist before generated values are written',
+)
 assert.ok(configureBlock.indexOf('unmergeCells') < configureBlock.indexOf('/values:batchClear'))
 assert.ok(configureBlock.indexOf('/values:batchClear') < configureBlock.indexOf('/values:batchUpdate'))
 assert.match(configureBlock, /const dataColumn = title === 'Dashboard' \? 'P' : title === 'Start Here' \? 'C' : 'B'/)
@@ -187,12 +194,14 @@ assert.ok(
   'branding cells must be written after header merges are reconciled',
 )
 
-assert.match(source, /title === 'Dropdowns' && !newlyProvisionedTitles\.has\(title\)/)
-assert.match(source, /if \(preserveConfiguredDropdowns\) return writes/)
+assert.match(configureBlock, /const configuredDropdownRows = canonicalConfiguredDropdownRows/)
+assert.match(configureBlock, /range: "'Dropdowns'!B4"[\s\S]{0,120}values: configuredDropdownRows/)
+assert.doesNotMatch(source, /preserveConfiguredDropdowns/)
+assert.match(source, /function canonicalConfiguredDropdownRows/)
 assert.match(source, /const CANONICAL_DROPDOWN_KEYS = \['owner', 'product', 'stage', 'priority', 'status', 'source', 'loss_reason'\]/)
 assert.match(source, /const keys = orderedDropdownKeys\(catalog\)/)
 assert.match(configureBlock, /configuredDropdownColumnCount/)
-assert.match(configureBlock, /populatedColumnCount/)
+assert.match(configureBlock, /Math\.max\(TAB_HEADERS\.Dropdowns\.length, configuredDropdownRows\[0\]\.length\)/)
 assert.doesNotMatch(source.slice(initialRowsStart, source.indexOf('export class PipelineProvisioningRequestError')), /\n\s+Opportunities\s*:/)
 assert.match(projectionSource, /await configurePipelineTabs\(runtime, input\.context\.sheetId\)[\s\S]{0,260}await applyPipelineWorkbookBranding/)
 assert.match(projectionSource, /const branding = await readPipelineWorkbookBranding\(input\.context\.pipelineId\)/)
