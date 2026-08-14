@@ -148,6 +148,41 @@ function ensure_global_id_search_field(string $module): void
     }
 }
 
+function ensure_email_unified_search_support(): void
+{
+    $directory = 'custom/Extension/modules/Emails/Ext/Vardefs';
+    $path = $directory . '/zz_clawpilot_unified_search.php';
+    $definition = <<<'PHP'
+<?php
+// SuiteCRM's native Email bean does not opt into unified search even though
+// its basic-template fields and custom SearchFields metadata support it.
+$dictionary['Email']['unified_search'] = true;
+PHP;
+    $definition .= "\n";
+
+    mkdir_recursive($directory, true);
+    $current = is_file($path) ? file_get_contents($path) : false;
+    $changed = $current === false || !hash_equals($definition, $current);
+    if ($changed && file_put_contents($path, $definition, LOCK_EX) === false) {
+        throw new RuntimeException('Could not write the SuiteCRM Email unified-search vardef extension');
+    }
+
+    if ($changed || empty($GLOBALS['dictionary']['Email']['unified_search'])) {
+        require_once 'ModuleInstall/ModuleInstaller.php';
+        $installer = new ModuleInstaller();
+        $installer->silent = true;
+        $installer->rebuild_vardefs();
+
+        VardefManager::clearVardef('Emails', 'Email');
+        unset($GLOBALS['dictionary']['Email']);
+        VardefManager::refreshVardefs('Emails', 'Email');
+    }
+
+    if (empty($GLOBALS['dictionary']['Email']['unified_search'])) {
+        throw new RuntimeException('SuiteCRM Emails module is not enabled for unified search');
+    }
+}
+
 /** @param array<string, mixed> $definition */
 function global_id_definition_is_current(array $definition, bool $unifiedSearch = true): bool
 {
@@ -661,8 +696,10 @@ foreach ($modules as $module) {
 }
 
 // Emails accepts DynamicFields and unified-search metadata, but its legacy list
-// metadata is not compatible with the generic Studio layout writer. Keep the
-// managed field searchable without rewriting Email detail or list layouts.
+// metadata is not compatible with the generic Studio layout writer. Opt the
+// native bean into unified search, then keep the managed field searchable
+// without rewriting Email detail or list layouts.
+ensure_email_unified_search_support();
 ensure_global_id_field('Emails', true, false);
 
 // Users are administered separately from business-record global search, but

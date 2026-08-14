@@ -104,6 +104,16 @@ assert.match(
 )
 assert.match(
   source,
+  /function ensure_email_unified_search_support\(\): void[\s\S]*custom\/Extension\/modules\/Emails\/Ext\/Vardefs[\s\S]*\$dictionary\['Email'\]\['unified_search'\] = true;[\s\S]*rebuild_vardefs\(\);/,
+  'native SuiteCRM Emails module is persistently opted into unified search',
+)
+assert.match(
+  source,
+  /ensure_email_unified_search_support\(\);\s*ensure_global_id_field\('Emails', true, false\);/,
+  'Email unified-search module support is installed before its Global ID field is indexed',
+)
+assert.match(
+  source,
   /ensure_global_id_field\('Emails', true, false\);/,
   'native SuiteCRM Emails receive a searchable Global ID without unsafe layout rewrites',
 )
