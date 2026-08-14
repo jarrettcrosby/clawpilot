@@ -11,6 +11,7 @@ import {
 } from '@/lib/integrations/carrierManagedDelegation'
 import {
   DEFAULT_PRINT_AGENT_CAPABILITIES,
+  hasConnectedLocalPrintAgent,
   LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES,
   PRINT_DOCUMENT_TYPES,
   PRINT_FORMATS,
@@ -2675,15 +2676,47 @@ export async function enqueueOperationsPrintJobInPostgres(
       })
     }
     const profiles = await listOperationsPrinterProfilesInPostgres(organizationId, client)
-    const route = selectPrinterRoute(profiles, {
+    const routeRequest = {
       warehouseId: input.warehouseId,
       documentType: artifact.type,
       format: artifact.format,
       media: artifact.media,
       durable: true,
       preferredPrinterGlobalId: input.preferredPrinterGlobalId,
-    })
+    } as const
+    const configuredAgentNeverConnected = (printer: OperationsPrinterProfile) => (
+      printer.status === 'online'
+      && printer.connectionMode === 'local_agent'
+      && Boolean(printer.localPrintAgentGlobalId)
+      && printer.localPrintAgentStatus === 'active'
+      && !hasConnectedLocalPrintAgent(printer)
+      && supportsPrinterRoute(printer, { ...routeRequest, durable: false })
+    )
+    const preferredNeverConnected = input.preferredPrinterGlobalId
+      ? profiles.some((printer) => (
+        printer.globalId === input.preferredPrinterGlobalId
+        && configuredAgentNeverConnected(printer)
+      ))
+      : false
+    if (preferredNeverConnected) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_AGENT_NEVER_CONNECTED',
+        'The selected printer is configured, but its local print agent has never connected',
+        409,
+      )
+    }
+    const route = selectPrinterRoute(profiles, routeRequest)
     if (!route) {
+      const compatibleNeverConnected = profiles.some((printer) => (
+        configuredAgentNeverConnected(printer)
+      ))
+      if (compatibleNeverConnected) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PRINT_AGENT_NEVER_CONNECTED',
+          'A compatible printer is configured, but its local print agent has never connected',
+          409,
+        )
+      }
       throw new OperationsRequestError(
         'OPERATIONS_PRINT_ROUTE_UNAVAILABLE',
         'No online local-agent printer supports this document format and media',

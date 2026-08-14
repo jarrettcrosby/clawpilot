@@ -46,6 +46,7 @@ import {
 } from '@/lib/measurements'
 import {
   DEFAULT_PRINT_AGENT_CAPABILITIES,
+  hasConnectedLocalPrintAgent,
   LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES,
   PRINT_DOCUMENT_TYPES,
   PRINT_FORMATS,
@@ -1008,6 +1009,14 @@ export default function PrinterConfigurationPanel() {
                       <Typography fontWeight={700}>{printer.name}</Typography>
                       <Chip size="small" label={label(printer.printerType)} variant="outlined" />
                       <Chip size="small" label={label(printer.status)} color={statusColor(printer.status)} />
+                      {printer.connectionMode === 'local_agent' && (
+                        <Chip
+                          size="small"
+                          label={hasConnectedLocalPrintAgent(printer) ? 'Agent connected' : 'Configured'}
+                          color={hasConnectedLocalPrintAgent(printer) ? 'success' : 'warning'}
+                          variant="outlined"
+                        />
+                      )}
                     </Stack>
                     <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
                       {printer.warehouseName} · {label(printer.stationType)} · {label(printer.connectionMode)}
@@ -1027,10 +1036,17 @@ export default function PrinterConfigurationPanel() {
                       ))}
                     </Stack>
                     <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.75 }}>
-                      Agent: {printer.localPrintAgentName || 'Not assigned'} · Agent heartbeat: {timestamp(printer.localPrintAgentLastSeenAt)}
+                      Agent: {printer.localPrintAgentName || 'Not assigned'} · Agent heartbeat:{' '}
+                      {printer.localPrintAgentLastSeenAt
+                        ? timestamp(printer.localPrintAgentLastSeenAt)
+                        : 'Agent never connected'}
                     </Typography>
                     <Typography variant="caption" color="text.secondary" display="block">
-                      Last device delivery: {timestamp(printer.lastSeenAt)}
+                      Last device delivery: {printer.lastSeenAt
+                        ? timestamp(printer.lastSeenAt)
+                        : printer.localPrintAgentLastSeenAt
+                          ? 'No device delivery yet'
+                          : 'Agent never connected'}
                     </Typography>
                     {printer.fallbackPrinterName && (
                       <Typography variant="caption" color="text.secondary" display="block">
@@ -1111,7 +1127,8 @@ export default function PrinterConfigurationPanel() {
                       />
                     </Stack>
                     <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                      {agent.warehouseName} · Last seen {timestamp(agent.lastSeenAt)}
+                      {agent.warehouseName} · Last seen{' '}
+                      {agent.lastSeenAt ? timestamp(agent.lastSeenAt) : 'Agent never connected'}
                     </Typography>
                     <Typography variant="caption" color="#A8C7FA">{agent.globalId}</Typography>
                     <Stack direction="row" gap={0.75} flexWrap="wrap" useFlexGap sx={{ mt: 1 }}>

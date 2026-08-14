@@ -295,6 +295,15 @@ async function createPrinter(pool, fixture, input) {
   const media = input.media || ['letter']
   const documents = input.documents || ['packing_slip']
   const printerType = input.printerType || 'nonthermal'
+  if (input.agentId && input.agentConnected !== false) {
+    await pool.query(
+      `UPDATE operations_print_agents
+       SET last_seen_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [fixture.organizationId, input.agentId],
+    )
+  }
   return insertReturning(
     pool,
     `INSERT INTO operations_printers (
@@ -1027,6 +1036,40 @@ async function verifyRuntime(connectionString) {
       /Only the exact legacy bundled Zebra capability profile/,
     )
 
+    const printSource = await seedPrintSource(pool, fixture)
+    const neverConnectedPrinter = await createPrinter(pool, fixture, {
+      code: `NEVER-CONNECTED-${fixture.suffix}`,
+      name: 'Configured printer whose agent never connected',
+      priority: 1,
+      agentId: primaryEnrollment.agent.id,
+      agentConnected: false,
+      isDefault: false,
+    })
+    const neverConnectedContent = `never-connected-${fixture.suffix}`
+    await assert.rejects(
+      () => persistence.enqueueOperationsPrintJobInPostgres({
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.actorEmail,
+        idempotencyKey: `never-connected-${fixture.suffix}`,
+        warehouseId: fixture.warehouseId,
+        preferredPrinterGlobalId: neverConnectedPrinter.global_id,
+        document: {
+          type: 'packing_slip',
+          format: 'PDF',
+          media: 'letter',
+          contentSha256: createHash('sha256').update(neverConnectedContent).digest('hex'),
+          byteLength: Buffer.byteLength(neverConnectedContent),
+          storageReference: `clawpilot-document:never-connected-${fixture.suffix}`,
+          sourceOrderGlobalId: printSource.order.global_id,
+        },
+      }),
+      (error) => (
+        error.code === 'OPERATIONS_PRINT_AGENT_NEVER_CONNECTED'
+        && error.status === 409
+      ),
+      'Durable enqueue must fail closed until the configured agent first connects',
+    )
+
     const fallback = await createPrinter(pool, fixture, {
       code: `FALLBACK-${fixture.suffix}`,
       name: 'Fallback packing-slip printer',
@@ -1042,8 +1085,6 @@ async function verifyRuntime(connectionString) {
       isDefault: true,
       fallbackId: fallback.id,
     })
-    const printSource = await seedPrintSource(pool, fixture)
-
     const content = `packing-slip-${fixture.suffix}`
     const queued = await persistence.enqueueOperationsPrintJobInPostgres({
       organizationId: fixture.organizationId,
