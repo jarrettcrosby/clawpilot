@@ -48,7 +48,7 @@ type CallInteractionRow = {
   meeting_id: string | null
   campaign_id: string | null
   interaction_type: string | null
-  suitecrm_module: 'Notes' | 'Calls' | 'Meetings' | null
+  suitecrm_module: 'Notes' | 'Calls' | 'Meetings' | 'Emails' | null
   subject: string
   agent_email: string | null
   agent_name: string | null

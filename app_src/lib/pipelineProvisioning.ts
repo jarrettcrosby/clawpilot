@@ -18,6 +18,7 @@ import {
   markPipelineProvisioningStartedInPostgres,
   readPipelineGooglePermissionContextInPostgres,
   readPipelineProvisioningRecordInPostgres,
+  replacePipelineSheetBindingInPostgres,
   recordPipelineProvisioningFailureInPostgres,
   storePipelineDriveFolderIdInPostgres,
   storePipelineProvisioningSheetIdInPostgres,
@@ -28,7 +29,7 @@ import {
 } from '@/lib/persistence/pipeline'
 import { getPostgresPool } from '@/lib/persistence/postgres'
 import { syncAppUserProfileToCrm } from '@/lib/persistence/crm'
-import { createShortLink, listShortLinks, type ShortLinkActor } from '@/lib/shortlinks'
+import { createShortLink, listShortLinks, updateShortLink, type ShortLinkActor } from '@/lib/shortlinks'
 import {
   readPipelineWorkbookBranding,
   type OrganizationBranding,
@@ -165,6 +166,21 @@ const WORKBOOK_THEME = {
   infoFill: '#E8F0FE',
 } as const
 
+const DASHBOARD_MATERIAL = {
+  primary: '#315C9B',
+  activity: '#00796B',
+  potential: '#C75B39',
+  probable: '#00796B',
+  success: '#2E7D32',
+  warning: '#C29415',
+  canvas: '#F4F7FB',
+  surface: '#FFFFFF',
+  surfaceVariant: '#F8FAFD',
+  outline: '#D8DEE9',
+  ink: '#172033',
+  muted: '#5E687B',
+} as const
+
 const WORKBOOK_TAB_COLORS: Record<(typeof EXPECTED_TABS)[number], string> = {
   'Start Here': WORKBOOK_THEME.accent,
   Organizations: '#79A8F5',
@@ -189,7 +205,29 @@ const WORKBOOK_COLUMN_WIDTHS: Record<(typeof EXPECTED_TABS)[number], number[]> =
 
 const FILTERED_TABLE_TABS = ['Organizations', 'Contacts', 'Opportunities', 'Interactions'] as const
 const DASHBOARD_HELPER_COLUMN_INDEX = 15
+const DASHBOARD_STAGE_HELPER_COLUMN_INDEX = 18
+const DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX = 21
+const DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX = 30
+const DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX = 39
+const DASHBOARD_HELPER_END_COLUMN_INDEX = 42
 const DASHBOARD_LAST_VISIBLE_COLUMN_INDEX = 13
+const CANONICAL_DROPDOWN_KEYS = ['owner', 'product', 'stage', 'priority', 'status', 'source', 'loss_reason'] as const
+
+function orderedDropdownKeys(catalog: Record<string, unknown>) {
+  const available = new Set(Object.keys(catalog))
+  return [
+    ...CANONICAL_DROPDOWN_KEYS.filter((key) => available.delete(key)),
+    ...Array.from(available).sort((left, right) => left.localeCompare(right)),
+  ]
+}
+
+function populatedColumnCount(row: unknown[]) {
+  let lastPopulated = -1
+  row.forEach((value, index) => {
+    if (String(value ?? '').trim()) lastPopulated = index
+  })
+  return lastPopulated + 1
+}
 
 const INITIAL_TAB_ROWS: Partial<Record<(typeof EXPECTED_TABS)[number], unknown[][]>> = {
   'Start Here': [
@@ -217,9 +255,7 @@ const INITIAL_TAB_ROWS: Partial<Record<(typeof EXPECTED_TABS)[number], unknown[]
     ['Organizations', '=COUNTA(Organizations!C5:C)'],
     ['Contacts', '=COUNTA(Contacts!C5:C)'],
     ['Interactions', '=COUNTA(Interactions!C5:C)'],
-    ['Interactions 61-90 days', '=COUNTIFS(Interactions!C5:C,"<>",Interactions!G5:G,">="&TODAY()-90,Interactions!G5:G,"<"&TODAY()-60)'],
-    ['Interactions 31-60 days', '=COUNTIFS(Interactions!C5:C,"<>",Interactions!G5:G,">="&TODAY()-60,Interactions!G5:G,"<"&TODAY()-30)'],
-    ['Interactions last 30 days', '=COUNTIFS(Interactions!C5:C,"<>",Interactions!G5:G,">="&TODAY()-30,Interactions!G5:G,"<="&TODAY())'],
+    ['Open opportunities value', '=SUMIFS(Opportunities!J5:J,Opportunities!C5:C,"<>",Opportunities!F5:F,"Open")'],
   ],
   Dashboard: [
     ['Total opportunities', '=Calculations!C5'],
@@ -235,9 +271,7 @@ const INITIAL_TAB_ROWS: Partial<Record<(typeof EXPECTED_TABS)[number], unknown[]
     ['Organizations', '=Calculations!C15'],
     ['Contacts', '=Calculations!C16'],
     ['Interactions', '=Calculations!C17'],
-    ['Interactions 61-90 days', '=Calculations!C18'],
-    ['Interactions 31-60 days', '=Calculations!C19'],
-    ['Interactions last 30 days', '=Calculations!C20'],
+    ['Open opportunities value', '=Calculations!C18'],
   ],
   Dropdowns: [
     ['', '', 'Identified Lead', 'A+', 'Open', 'Inbound', 'No Decision'],
@@ -925,21 +959,25 @@ async function legacyDashboardHasUnmanagedHeader(request: SheetsJsonRequest, she
 }
 
 function dashboardChartRequests(sheetId: number) {
-  const chart = (input: {
+  const chartShell = (input: {
     title: string
+    chartType: 'BAR' | 'COLUMN'
+    stackedType?: 'NOT_STACKED' | 'STACKED'
+    legendPosition: 'NO_LEGEND' | 'BOTTOM_LEGEND' | 'TOP_LEGEND'
+    valueAxisTitle: string
+    domainColumnIndex: number
+    seriesColumnIndex: number
+    seriesColors: string[]
     startRowIndex: number
     endRowIndex: number
     anchorRowIndex: number
     anchorColumnIndex: number
-    chartType: 'BAR' | 'COLUMN'
-    valueAxisTitle: string
-    seriesColor: string
   }) => ({
     addChart: {
       chart: {
         spec: {
           title: input.title,
-          fontName: 'Arial',
+          fontName: 'Roboto',
           hiddenDimensionStrategy: 'SHOW_ALL',
           backgroundColor: googleColor(WORKBOOK_THEME.paper),
           titleTextFormat: {
@@ -949,8 +987,9 @@ function dashboardChartRequests(sheetId: number) {
           },
           basicChart: {
             chartType: input.chartType,
-            legendPosition: 'NO_LEGEND',
-            headerCount: 0,
+            stackedType: input.stackedType || 'NOT_STACKED',
+            legendPosition: input.legendPosition,
+            headerCount: 1,
             axis: input.chartType === 'BAR'
               ? [
                 {
@@ -960,14 +999,14 @@ function dashboardChartRequests(sheetId: number) {
                 },
                 {
                   position: 'LEFT_AXIS',
-                  title: 'Metric',
+                  title: 'Stage',
                   format: { foregroundColor: googleColor(WORKBOOK_THEME.muted), fontSize: 9 },
                 },
               ]
               : [
                 {
                   position: 'BOTTOM_AXIS',
-                  title: 'Metric',
+                  title: 'Month ending',
                   format: { foregroundColor: googleColor(WORKBOOK_THEME.muted), fontSize: 9 },
                 },
                 {
@@ -983,27 +1022,27 @@ function dashboardChartRequests(sheetId: number) {
                     sheetId,
                     startRowIndex: input.startRowIndex,
                     endRowIndex: input.endRowIndex,
-                    startColumnIndex: DASHBOARD_HELPER_COLUMN_INDEX,
-                    endColumnIndex: DASHBOARD_HELPER_COLUMN_INDEX + 1,
+                    startColumnIndex: input.domainColumnIndex,
+                    endColumnIndex: input.domainColumnIndex + 1,
                   }],
                 },
               },
             }],
-            series: [{
+            series: input.seriesColors.map((color, index) => ({
               series: {
                 sourceRange: {
                   sources: [{
                     sheetId,
                     startRowIndex: input.startRowIndex,
                     endRowIndex: input.endRowIndex,
-                    startColumnIndex: DASHBOARD_HELPER_COLUMN_INDEX + 1,
-                    endColumnIndex: DASHBOARD_HELPER_COLUMN_INDEX + 2,
+                    startColumnIndex: input.seriesColumnIndex + index,
+                    endColumnIndex: input.seriesColumnIndex + index + 1,
                   }],
                 },
               },
               targetAxis: input.chartType === 'BAR' ? 'BOTTOM_AXIS' : 'LEFT_AXIS',
-              color: googleColor(input.seriesColor),
-            }],
+              color: googleColor(color),
+            })),
           },
         },
         position: {
@@ -1021,66 +1060,147 @@ function dashboardChartRequests(sheetId: number) {
     },
   })
 
+  const interactionSeriesColors = ['#5C6BC0', '#356BB3', '#7CB342', '#008C95', '#8E55A6', '#C29415', '#C75B39']
+  const forecastStageColors = ['#2E7D32', '#C29415', '#D66D24', '#1597C1', '#A45A9C', '#59A14F', '#4E79A7']
+
   return [
-    chart({
-      title: 'Opportunity lifecycle',
-      startRowIndex: 6,
-      endRowIndex: 10,
-      anchorRowIndex: 9,
-      anchorColumnIndex: 1,
-      chartType: 'COLUMN',
-      valueAxisTitle: 'Opportunities',
-      seriesColor: WORKBOOK_THEME.accent,
-    }),
-    chart({
-      title: 'Pipeline value',
-      startRowIndex: 11,
-      endRowIndex: 14,
-      anchorRowIndex: 9,
-      anchorColumnIndex: 7,
-      chartType: 'COLUMN',
-      valueAxisTitle: 'Value',
-      seriesColor: WORKBOOK_THEME.success,
-    }),
-    chart({
-      title: 'CRM records',
-      startRowIndex: 14,
-      endRowIndex: 17,
-      anchorRowIndex: 24,
-      anchorColumnIndex: 1,
+    chartShell({
+      title: 'Opportunities by stage',
       chartType: 'BAR',
-      valueAxisTitle: 'Records',
-      seriesColor: WORKBOOK_THEME.secondary,
+      legendPosition: 'NO_LEGEND',
+      valueAxisTitle: 'Opportunities',
+      domainColumnIndex: DASHBOARD_STAGE_HELPER_COLUMN_INDEX,
+      seriesColumnIndex: DASHBOARD_STAGE_HELPER_COLUMN_INDEX + 1,
+      seriesColors: [DASHBOARD_MATERIAL.primary],
+      startRowIndex: 3,
+      endRowIndex: 13,
+      anchorRowIndex: 9,
+      anchorColumnIndex: 1,
     }),
-    chart({
-      title: 'Interactions, last 90 days',
-      startRowIndex: 17,
-      endRowIndex: 20,
+    chartShell({
+      title: 'Interactions, last quarter',
+      chartType: 'COLUMN',
+      stackedType: 'NOT_STACKED',
+      legendPosition: 'BOTTOM_LEGEND',
+      valueAxisTitle: 'Interactions',
+      domainColumnIndex: DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX,
+      seriesColumnIndex: DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX + 1,
+      seriesColors: interactionSeriesColors,
+      startRowIndex: 3,
+      endRowIndex: 7,
+      anchorRowIndex: 9,
+      anchorColumnIndex: 7,
+    }),
+    chartShell({
+      title: 'Potential Revenue by Stage, Next 2 Quarters',
+      chartType: 'COLUMN',
+      stackedType: 'STACKED',
+      legendPosition: 'TOP_LEGEND',
+      valueAxisTitle: 'Potential revenue',
+      domainColumnIndex: DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX,
+      seriesColumnIndex: DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX + 1,
+      seriesColors: forecastStageColors,
+      startRowIndex: 3,
+      endRowIndex: 10,
+      anchorRowIndex: 24,
+      anchorColumnIndex: 1,
+    }),
+    chartShell({
+      title: 'Potential vs probable value',
+      chartType: 'COLUMN',
+      stackedType: 'NOT_STACKED',
+      legendPosition: 'BOTTOM_LEGEND',
+      valueAxisTitle: 'Value',
+      domainColumnIndex: DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX,
+      seriesColumnIndex: DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX + 1,
+      seriesColors: [DASHBOARD_MATERIAL.potential, DASHBOARD_MATERIAL.probable],
+      startRowIndex: 3,
+      endRowIndex: 10,
       anchorRowIndex: 24,
       anchorColumnIndex: 7,
-      chartType: 'COLUMN',
-      valueAxisTitle: 'Interactions',
-      seriesColor: '#66CDBD',
     }),
   ]
 }
 
 function dashboardValueWrites() {
+  const interactionTypes = ['Direct Mail', 'LinkedIn', 'Email', 'Call', 'In Person', 'Note', 'Campaign']
+  const opportunityStages = ['Identified Lead', 'Qualified Lead', 'Needs Analysis', 'Demo', 'Proposal', 'Negotiation', 'Closed', 'Closed Delayed', 'Loss']
+  const forecastStages = ['Closed', 'Closed Delayed', 'Proposal', 'Demo', 'Needs Analysis', 'Qualified Lead', 'Identified Lead']
+  const interactionMonthColumn = columnName(DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX)
+  const interactionTrackerRows = [-2, -1, 0].map((monthOffset, rowIndex) => {
+    const dateFormula = monthOffset === 0 ? '=TODAY()' : `=EOMONTH(TODAY(),${monthOffset})`
+    const sheetRow = 5 + rowIndex
+    return [
+      dateFormula,
+      ...interactionTypes.map((_, typeIndex) => {
+        const typeColumn = columnName(DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX + 1 + typeIndex)
+        return `=COUNTIFS(Interactions!$C$5:$C,${typeColumn}$4,Interactions!$G$5:$G,">="&EOMONTH($${interactionMonthColumn}${sheetRow},-1)+1,Interactions!$G$5:$G,"<="&$${interactionMonthColumn}${sheetRow})`
+      }),
+    ]
+  })
+  const forecastMonthColumn = columnName(DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX)
+  const forecastStageRows = Array.from({ length: 6 }, (_, rowIndex) => {
+    const sheetRow = 5 + rowIndex
+    return [
+      `=EOMONTH(TODAY(),${rowIndex})`,
+      ...forecastStages.map((_, stageIndex) => {
+        const stageColumn = columnName(DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX + 1 + stageIndex)
+        return `=SUMIFS(Opportunities!$J$5:$J,Opportunities!$C$5:$C,"<>",Opportunities!$G$5:$G,${stageColumn}$4,Opportunities!$L$5:$L,">="&EOMONTH($${forecastMonthColumn}${sheetRow},-1)+1,Opportunities!$L$5:$L,"<="&$${forecastMonthColumn}${sheetRow})`
+      }),
+    ]
+  })
+  const forecastValueMonthColumn = columnName(DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX)
+  const forecastValueRows = Array.from({ length: 6 }, (_, rowIndex) => {
+    const sheetRow = 5 + rowIndex
+    const monthCell = `$${forecastValueMonthColumn}${sheetRow}`
+    return [
+      `=EOMONTH(TODAY(),${rowIndex})`,
+      `=SUMIFS(Opportunities!$J$5:$J,Opportunities!$C$5:$C,"<>",Opportunities!$L$5:$L,">="&EOMONTH(${monthCell},-1)+1,Opportunities!$L$5:$L,"<="&${monthCell},Opportunities!$F$5:$F,"<>Won",Opportunities!$F$5:$F,"<>Lost",Opportunities!$F$5:$F,"<>Closed",Opportunities!$F$5:$F,"<>Abandoned")`,
+      `=SUMPRODUCT(Opportunities!$J$5:$J,Opportunities!$K$5:$K/100,--(Opportunities!$C$5:$C<>""),--(Opportunities!$L$5:$L>=EOMONTH(${monthCell},-1)+1),--(Opportunities!$L$5:$L<=${monthCell}),--(Opportunities!$F$5:$F<>"Won"),--(Opportunities!$F$5:$F<>"Lost"),--(Opportunities!$F$5:$F<>"Closed"),--(Opportunities!$F$5:$F<>"Abandoned"))`,
+    ]
+  })
   return [
-    { range: "'Dashboard'!B5", majorDimension: 'ROWS' as const, values: [['ACTIVE PIPELINE']] },
-    { range: "'Dashboard'!B6", majorDimension: 'ROWS' as const, values: [['=Calculations!C9']] },
-    { range: "'Dashboard'!E5", majorDimension: 'ROWS' as const, values: [['WEIGHTED PIPELINE']] },
-    { range: "'Dashboard'!E6", majorDimension: 'ROWS' as const, values: [['=Calculations!C10']] },
-    { range: "'Dashboard'!H5", majorDimension: 'ROWS' as const, values: [['WON VALUE']] },
-    { range: "'Dashboard'!H6", majorDimension: 'ROWS' as const, values: [['=Calculations!C12']] },
-    { range: "'Dashboard'!K5", majorDimension: 'ROWS' as const, values: [['WIN RATE']] },
-    { range: "'Dashboard'!K6", majorDimension: 'ROWS' as const, values: [['=Calculations!C14']] },
-    { range: "'Dashboard'!B9", majorDimension: 'ROWS' as const, values: [['PIPELINE PERFORMANCE']] },
-    { range: "'Dashboard'!B24", majorDimension: 'ROWS' as const, values: [['CUSTOMER ACTIVITY']] },
+    { range: "'Dashboard'!B5", majorDimension: 'ROWS' as const, values: [['OPEN OPPORTUNITIES VALUE']] },
+    { range: "'Dashboard'!B6", majorDimension: 'ROWS' as const, values: [['=Calculations!C18']] },
+    { range: "'Dashboard'!H5", majorDimension: 'ROWS' as const, values: [['POTENTIAL VALUE']] },
+    { range: "'Dashboard'!H6", majorDimension: 'ROWS' as const, values: [['=Calculations!C9']] },
+    { range: "'Dashboard'!B8", majorDimension: 'ROWS' as const, values: [['="CONTACTS  "&TEXT(Calculations!C16,"#,##0")']] },
+    { range: "'Dashboard'!D8", majorDimension: 'ROWS' as const, values: [['="INTERACTIONS  "&TEXT(Calculations!C17,"#,##0")']] },
+    { range: "'Dashboard'!F8", majorDimension: 'ROWS' as const, values: [['="OPPS PURSUED  "&TEXT(Calculations!C5,"#,##0")']] },
+    { range: "'Dashboard'!I8", majorDimension: 'ROWS' as const, values: [['="OPPS CLOSED  "&TEXT(Calculations!C11,"#,##0")']] },
+    { range: "'Dashboard'!K8", majorDimension: 'ROWS' as const, values: [['="WIN RATE  "&TEXT(Calculations!C14,"0.0%")']] },
+    { range: "'Dashboard'!B9", majorDimension: 'ROWS' as const, values: [['PIPELINE AND CUSTOMER ACTIVITY']] },
+    { range: "'Dashboard'!B24", majorDimension: 'ROWS' as const, values: [['SALES FORECAST']] },
+    {
+      range: "'Dashboard'!S4",
+      majorDimension: 'ROWS' as const,
+      values: [
+        ['Stage', 'Opportunities'],
+        ...opportunityStages.map((stage, rowIndex) => [
+          stage,
+          `=COUNTIFS(Opportunities!$C$5:$C,"<>",Opportunities!$G$5:$G,$S${5 + rowIndex})`,
+        ]),
+      ],
+    },
+    {
+      range: "'Dashboard'!V4",
+      majorDimension: 'ROWS' as const,
+      values: [['Month ending', ...interactionTypes], ...interactionTrackerRows],
+    },
+    {
+      range: "'Dashboard'!AE4",
+      majorDimension: 'ROWS' as const,
+      values: [['Month ending', ...forecastStages], ...forecastStageRows],
+    },
+    {
+      range: "'Dashboard'!AN4",
+      majorDimension: 'ROWS' as const,
+      values: [['Month ending', 'Potential', 'Probable'], ...forecastValueRows],
+    },
     {
       range: "'Dashboard'!B40",
       majorDimension: 'ROWS' as const,
-      values: [['Generated from ClawPilot CRM records. Update live sales data on the Opportunities tab.']],
+      values: [['Generated from ClawPilot CRM records. Grouped interactions use CRM activity type; forecasts use expected close month.']],
     },
   ]
 }
@@ -1263,10 +1383,8 @@ function opportunityValidationRequests(sheetId: number, rowCount: number) {
 function dashboardLayoutRequests(sheetId: number) {
   const requests: unknown[] = []
   const cards = [
-    { startColumnIndex: 1, endColumnIndex: 4, valueColumnIndex: 1, color: WORKBOOK_THEME.accent },
-    { startColumnIndex: 4, endColumnIndex: 7, valueColumnIndex: 4, color: WORKBOOK_THEME.secondary },
-    { startColumnIndex: 7, endColumnIndex: 10, valueColumnIndex: 7, color: '#76C98D' },
-    { startColumnIndex: 10, endColumnIndex: 13, valueColumnIndex: 10, color: '#E7B867' },
+    { startColumnIndex: 1, endColumnIndex: 7, color: DASHBOARD_MATERIAL.primary },
+    { startColumnIndex: 7, endColumnIndex: 13, color: DASHBOARD_MATERIAL.potential },
   ]
   for (const card of cards) {
     requests.push(
@@ -1287,12 +1405,12 @@ function dashboardLayoutRequests(sheetId: number) {
           range: { sheetId, startRowIndex: 4, endRowIndex: 7, startColumnIndex: card.startColumnIndex, endColumnIndex: card.endColumnIndex },
           cell: {
             userEnteredFormat: {
-              backgroundColor: googleColor(WORKBOOK_THEME.surface),
+              backgroundColor: googleColor(DASHBOARD_MATERIAL.surface),
               borders: {
                 top: googleBorder(card.color, 'SOLID_THICK'),
-                bottom: googleBorder(WORKBOOK_THEME.outline),
-                left: googleBorder(WORKBOOK_THEME.outline),
-                right: googleBorder(WORKBOOK_THEME.outline),
+                bottom: googleBorder(DASHBOARD_MATERIAL.outline),
+                left: googleBorder(DASHBOARD_MATERIAL.outline),
+                right: googleBorder(DASHBOARD_MATERIAL.outline),
               },
             },
           },
@@ -1304,7 +1422,7 @@ function dashboardLayoutRequests(sheetId: number) {
           range: { sheetId, startRowIndex: 4, endRowIndex: 5, startColumnIndex: card.startColumnIndex, endColumnIndex: card.endColumnIndex },
           cell: {
             userEnteredFormat: {
-              textFormat: { foregroundColor: googleColor(WORKBOOK_THEME.accent), fontSize: 9, bold: true },
+              textFormat: { foregroundColor: googleColor(DASHBOARD_MATERIAL.muted), fontFamily: 'Roboto', fontSize: 9, bold: true },
               horizontalAlignment: 'LEFT',
               verticalAlignment: 'BOTTOM',
             },
@@ -1317,12 +1435,49 @@ function dashboardLayoutRequests(sheetId: number) {
           range: { sheetId, startRowIndex: 5, endRowIndex: 7, startColumnIndex: card.startColumnIndex, endColumnIndex: card.endColumnIndex },
           cell: {
             userEnteredFormat: {
-              textFormat: { foregroundColor: googleColor(card.color), fontSize: 20, bold: true },
+              textFormat: { foregroundColor: googleColor(card.color), fontFamily: 'Roboto Mono', fontSize: 22, bold: true },
               horizontalAlignment: 'LEFT',
               verticalAlignment: 'MIDDLE',
             },
           },
           fields: 'userEnteredFormat(textFormat,horizontalAlignment,verticalAlignment)',
+        },
+      },
+    )
+  }
+  const compactCards = [
+    { startColumnIndex: 1, endColumnIndex: 3, color: '#A45A9C' },
+    { startColumnIndex: 3, endColumnIndex: 5, color: DASHBOARD_MATERIAL.activity },
+    { startColumnIndex: 5, endColumnIndex: 8, color: DASHBOARD_MATERIAL.primary },
+    { startColumnIndex: 8, endColumnIndex: 10, color: DASHBOARD_MATERIAL.success },
+    { startColumnIndex: 10, endColumnIndex: 13, color: DASHBOARD_MATERIAL.warning },
+  ]
+  for (const card of compactCards) {
+    requests.push(
+      {
+        mergeCells: {
+          range: { sheetId, startRowIndex: 7, endRowIndex: 8, startColumnIndex: card.startColumnIndex, endColumnIndex: card.endColumnIndex },
+          mergeType: 'MERGE_ALL',
+        },
+      },
+      {
+        repeatCell: {
+          range: { sheetId, startRowIndex: 7, endRowIndex: 8, startColumnIndex: card.startColumnIndex, endColumnIndex: card.endColumnIndex },
+          cell: {
+            userEnteredFormat: {
+              backgroundColor: googleColor(DASHBOARD_MATERIAL.surfaceVariant),
+              textFormat: { foregroundColor: googleColor(card.color), fontFamily: 'Roboto', fontSize: 9, bold: true },
+              horizontalAlignment: 'CENTER',
+              verticalAlignment: 'MIDDLE',
+              borders: {
+                top: googleBorder(card.color, 'SOLID_MEDIUM'),
+                bottom: googleBorder(DASHBOARD_MATERIAL.outline),
+                left: googleBorder(DASHBOARD_MATERIAL.outline),
+                right: googleBorder(DASHBOARD_MATERIAL.outline),
+              },
+            },
+          },
+          fields: 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment,borders)',
         },
       },
     )
@@ -1351,8 +1506,8 @@ function dashboardLayoutRequests(sheetId: number) {
         range: { sheetId, startRowIndex: 8, endRowIndex: 9, startColumnIndex: 1, endColumnIndex: DASHBOARD_LAST_VISIBLE_COLUMN_INDEX },
         cell: {
           userEnteredFormat: {
-            textFormat: { foregroundColor: googleColor(WORKBOOK_THEME.ink), fontSize: 11, bold: true },
-            borders: { bottom: googleBorder(WORKBOOK_THEME.outline, 'SOLID_MEDIUM') },
+            textFormat: { foregroundColor: googleColor(DASHBOARD_MATERIAL.ink), fontFamily: 'Roboto', fontSize: 11, bold: true },
+            borders: { bottom: googleBorder(DASHBOARD_MATERIAL.outline, 'SOLID_MEDIUM') },
             verticalAlignment: 'MIDDLE',
           },
         },
@@ -1364,8 +1519,8 @@ function dashboardLayoutRequests(sheetId: number) {
         range: { sheetId, startRowIndex: 23, endRowIndex: 24, startColumnIndex: 1, endColumnIndex: DASHBOARD_LAST_VISIBLE_COLUMN_INDEX },
         cell: {
           userEnteredFormat: {
-            textFormat: { foregroundColor: googleColor(WORKBOOK_THEME.ink), fontSize: 11, bold: true },
-            borders: { bottom: googleBorder(WORKBOOK_THEME.outline, 'SOLID_MEDIUM') },
+            textFormat: { foregroundColor: googleColor(DASHBOARD_MATERIAL.ink), fontFamily: 'Roboto', fontSize: 11, bold: true },
+            borders: { bottom: googleBorder(DASHBOARD_MATERIAL.outline, 'SOLID_MEDIUM') },
             verticalAlignment: 'MIDDLE',
           },
         },
@@ -1377,7 +1532,7 @@ function dashboardLayoutRequests(sheetId: number) {
         range: { sheetId, startRowIndex: 39, endRowIndex: 40, startColumnIndex: 1, endColumnIndex: DASHBOARD_LAST_VISIBLE_COLUMN_INDEX },
         cell: {
           userEnteredFormat: {
-            textFormat: { foregroundColor: googleColor(WORKBOOK_THEME.muted), fontSize: 9, italic: true },
+            textFormat: { foregroundColor: googleColor(DASHBOARD_MATERIAL.muted), fontFamily: 'Roboto', fontSize: 9, italic: true },
             horizontalAlignment: 'LEFT',
           },
         },
@@ -1385,9 +1540,52 @@ function dashboardLayoutRequests(sheetId: number) {
       },
     },
     setRangeNumberFormat({ sheetId, startRowIndex: 5, endRowIndex: 6, startColumnIndex: 1, endColumnIndex: 2, type: 'CURRENCY', pattern: '$#,##0' }),
-    setRangeNumberFormat({ sheetId, startRowIndex: 5, endRowIndex: 6, startColumnIndex: 4, endColumnIndex: 5, type: 'CURRENCY', pattern: '$#,##0' }),
     setRangeNumberFormat({ sheetId, startRowIndex: 5, endRowIndex: 6, startColumnIndex: 7, endColumnIndex: 8, type: 'CURRENCY', pattern: '$#,##0' }),
-    setRangeNumberFormat({ sheetId, startRowIndex: 5, endRowIndex: 6, startColumnIndex: 10, endColumnIndex: 11, type: 'PERCENT', pattern: '0.0%' }),
+    setRangeNumberFormat({
+      sheetId,
+      startRowIndex: 3,
+      endRowIndex: 7,
+      startColumnIndex: DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX,
+      endColumnIndex: DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX + 1,
+      type: 'DATE',
+      pattern: 'mmm d',
+    }),
+    setRangeNumberFormat({
+      sheetId,
+      startRowIndex: 3,
+      endRowIndex: 10,
+      startColumnIndex: DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX,
+      endColumnIndex: DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX + 1,
+      type: 'DATE',
+      pattern: 'mmm yyyy',
+    }),
+    setRangeNumberFormat({
+      sheetId,
+      startRowIndex: 4,
+      endRowIndex: 10,
+      startColumnIndex: DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX + 1,
+      endColumnIndex: DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX + 8,
+      type: 'CURRENCY',
+      pattern: '$#,##0',
+    }),
+    setRangeNumberFormat({
+      sheetId,
+      startRowIndex: 3,
+      endRowIndex: 10,
+      startColumnIndex: DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX,
+      endColumnIndex: DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX + 1,
+      type: 'DATE',
+      pattern: 'mmm yyyy',
+    }),
+    setRangeNumberFormat({
+      sheetId,
+      startRowIndex: 4,
+      endRowIndex: 10,
+      startColumnIndex: DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX + 1,
+      endColumnIndex: DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX + 3,
+      type: 'CURRENCY',
+      pattern: '$#,##0',
+    }),
     {
       updateDimensionProperties: {
         range: { sheetId, dimension: 'COLUMNS', startIndex: 1, endIndex: DASHBOARD_LAST_VISIBLE_COLUMN_INDEX },
@@ -1395,17 +1593,24 @@ function dashboardLayoutRequests(sheetId: number) {
         fields: 'pixelSize',
       },
     },
-    {
-      updateDimensionProperties: {
-        range: { sheetId, dimension: 'COLUMNS', startIndex: DASHBOARD_HELPER_COLUMN_INDEX, endIndex: DASHBOARD_HELPER_COLUMN_INDEX + 2 },
-        properties: { hiddenByUser: true },
-        fields: 'hiddenByUser',
+      {
+        updateDimensionProperties: {
+          range: { sheetId, dimension: 'COLUMNS', startIndex: DASHBOARD_HELPER_COLUMN_INDEX, endIndex: DASHBOARD_HELPER_END_COLUMN_INDEX },
+          properties: { hiddenByUser: true },
+          fields: 'hiddenByUser',
+        },
       },
-    },
     {
       updateDimensionProperties: {
         range: { sheetId, dimension: 'ROWS', startIndex: 4, endIndex: 7 },
         properties: { pixelSize: 30 },
+        fields: 'pixelSize',
+      },
+    },
+    {
+      updateDimensionProperties: {
+        range: { sheetId, dimension: 'ROWS', startIndex: 7, endIndex: 8 },
+        properties: { pixelSize: 26 },
         fields: 'pixelSize',
       },
     },
@@ -1557,6 +1762,13 @@ export async function configurePipelineTabsWithRequest(
   })
 
   metadata = await spreadsheetMetadata(request, sheetId)
+  const dropdownHeaderResult = await request<{ values?: unknown[][] }>(
+    `/v4/spreadsheets/${sheetId}/values/${encodeURIComponent("'Dropdowns'!B4:ZZ4")}?majorDimension=ROWS`,
+  )
+  const configuredDropdownColumnCount = Math.max(
+    TAB_HEADERS.Dropdowns.length,
+    populatedColumnCount(dropdownHeaderResult.values?.[0] || []),
+  )
   const managedSheets = (metadata.sheets || []).filter((sheet) => (
     typeof sheet.properties?.sheetId === 'number'
     && EXPECTED_TABS.includes(sheet.properties?.title as (typeof EXPECTED_TABS)[number])
@@ -1574,7 +1786,10 @@ export async function configurePipelineTabsWithRequest(
     const title = sheet.properties?.title as (typeof EXPECTED_TABS)[number]
     if (sheetIdValue === undefined) return
     const tableStartColumnIndex = title === 'Start Here' ? 2 : 1
-    const tableEndColumnIndex = tableStartColumnIndex + TAB_HEADERS[title].length
+    const tableColumnCount = title === 'Dropdowns'
+      ? configuredDropdownColumnCount
+      : TAB_HEADERS[title].length
+    const tableEndColumnIndex = tableStartColumnIndex + tableColumnCount
     const visibleEndColumnIndex = title === 'Dashboard'
       ? DASHBOARD_LAST_VISIBLE_COLUMN_INDEX
       : Math.max(8, tableEndColumnIndex)
@@ -1582,7 +1797,7 @@ export async function configurePipelineTabsWithRequest(
     const rowCount = Math.max(minimumRows, sheet.properties?.gridProperties?.rowCount || 0)
     const columnCount = Math.max(
       sheet.properties?.gridProperties?.columnCount || 0,
-      title === 'Dashboard' ? DASHBOARD_HELPER_COLUMN_INDEX + 2 : tableEndColumnIndex,
+      title === 'Dashboard' ? DASHBOARD_HELPER_END_COLUMN_INDEX : tableEndColumnIndex,
     )
     for (const range of sheet.protectedRanges || []) {
       if (range.protectedRangeId !== undefined && String(range.description || '').startsWith(PROTECTION_PREFIX)) {
@@ -1639,7 +1854,7 @@ export async function configurePipelineTabsWithRequest(
           cell: {
             userEnteredFormat: {
               backgroundColor: googleColor(WORKBOOK_THEME.canvas),
-              textFormat: { foregroundColor: googleColor(WORKBOOK_THEME.ink), fontFamily: 'Arial', fontSize: 10 },
+              textFormat: { foregroundColor: googleColor(WORKBOOK_THEME.ink), fontFamily: 'Roboto', fontSize: 10 },
               verticalAlignment: 'MIDDLE',
               wrapStrategy: 'CLIP',
             },
@@ -1653,7 +1868,7 @@ export async function configurePipelineTabsWithRequest(
           cell: {
             userEnteredFormat: {
               backgroundColor: googleColor(WORKBOOK_THEME.shell),
-              textFormat: { foregroundColor: googleColor('#FFFFFF'), fontFamily: 'Arial' },
+              textFormat: { foregroundColor: googleColor('#FFFFFF'), fontFamily: 'Roboto' },
             },
           },
           fields: 'userEnteredFormat(backgroundColor,textFormat)',
@@ -1697,7 +1912,7 @@ export async function configurePipelineTabsWithRequest(
             cell: {
               userEnteredFormat: {
                 backgroundColor: googleColor(WORKBOOK_THEME.surface),
-                textFormat: { foregroundColor: googleColor('#FFFFFF'), fontFamily: 'Arial', fontSize: 10, bold: true },
+                textFormat: { foregroundColor: googleColor('#FFFFFF'), fontFamily: 'Roboto', fontSize: 10, bold: true },
                 horizontalAlignment: 'LEFT',
                 verticalAlignment: 'MIDDLE',
                 borders: { bottom: googleBorder(WORKBOOK_THEME.accent, 'SOLID_THICK') },
@@ -1712,7 +1927,7 @@ export async function configurePipelineTabsWithRequest(
             range: { sheetId: sheetIdValue, startRowIndex: 4, endRowIndex: rowCount, startColumnIndex: tableStartColumnIndex, endColumnIndex: tableEndColumnIndex },
             cell: {
               userEnteredFormat: {
-                textFormat: { foregroundColor: googleColor(WORKBOOK_THEME.ink), fontFamily: 'Arial', fontSize: 10 },
+                textFormat: { foregroundColor: googleColor(WORKBOOK_THEME.ink), fontFamily: 'Roboto', fontSize: 10 },
                 verticalAlignment: 'MIDDLE',
                 borders: { bottom: googleBorder(WORKBOOK_THEME.outline) },
                 wrapStrategy: title === 'Start Here' ? 'WRAP' : 'CLIP',
@@ -1736,7 +1951,10 @@ export async function configurePipelineTabsWithRequest(
           },
         },
       )
-      WORKBOOK_COLUMN_WIDTHS[title].forEach((pixelSize, column) => {
+      Array.from(
+        { length: Math.max(tableColumnCount, WORKBOOK_COLUMN_WIDTHS[title].length) },
+        (_, column) => WORKBOOK_COLUMN_WIDTHS[title][column] || 160,
+      ).forEach((pixelSize, column) => {
         formattingRequests.push({
           updateDimensionProperties: {
             range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 1 + column, endIndex: 2 + column },
@@ -1916,6 +2134,13 @@ export async function applyPipelineWorkbookBrandingWithRequest(
   branding: OrganizationBranding,
 ) {
   const metadata = await spreadsheetMetadata(request, sheetId)
+  const dropdownHeaderResult = await request<{ values?: unknown[][] }>(
+    `/v4/spreadsheets/${sheetId}/values/${encodeURIComponent("'Dropdowns'!B4:ZZ4")}?majorDimension=ROWS`,
+  )
+  const configuredDropdownColumnCount = Math.max(
+    TAB_HEADERS.Dropdowns.length,
+    populatedColumnCount(dropdownHeaderResult.values?.[0] || []),
+  )
   const managedSheets = (metadata.sheets || []).filter((sheet) => (
     typeof sheet.properties?.sheetId === 'number'
     && EXPECTED_TABS.includes(sheet.properties?.title as (typeof EXPECTED_TABS)[number])
@@ -1937,9 +2162,12 @@ export async function applyPipelineWorkbookBrandingWithRequest(
     const title = sheet.properties?.title as (typeof EXPECTED_TABS)[number]
     if (id === undefined) continue
     const tableStartColumnIndex = title === 'Start Here' ? 2 : 1
+    const tableColumnCount = title === 'Dropdowns'
+      ? configuredDropdownColumnCount
+      : TAB_HEADERS[title].length
     const endColumnIndex = title === 'Dashboard'
       ? DASHBOARD_LAST_VISIBLE_COLUMN_INDEX
-      : Math.max(8, tableStartColumnIndex + TAB_HEADERS[title].length)
+      : Math.max(8, tableStartColumnIndex + tableColumnCount)
     for (const merge of sheet.merges || []) {
       if ((merge.startRowIndex || 0) < 3 && (merge.endRowIndex || 0) <= 3) {
         requests.push({ unmergeCells: { range: merge } })
@@ -2196,15 +2424,20 @@ const shortLinkActor = async (pipeline: PipelineProvisioningRecord): Promise<Sho
 async function ensurePipelineShortLink(pipeline: PipelineProvisioningRecord, sheetId: string) {
   const destinationUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/edit`
   const actor = await shortLinkActor(pipeline)
+  if (pipeline.shortLinkId) {
+    const updated = await updateShortLink(actor, {
+      id: pipeline.shortLinkId,
+      destinationUrl,
+      title: `${pipeline.name} pipeline`,
+      tags: ['pipeline', 'google-sheet'],
+    })
+    return updated.id
+  }
   const existing = (await listShortLinks(actor, {
     query: destinationUrl,
     status: 'active',
     sourceApp: 'clawpilot',
   })).filter((link) => link.ownerEmail === pipeline.ownerEmail && link.destinationUrl === destinationUrl)
-  const bound = pipeline.shortLinkId
-    ? existing.find((link) => link.id === pipeline.shortLinkId)
-    : null
-  if (bound) return bound.id
   if (existing[0]) return existing[0].id
   const created = await createShortLink(actor, {
     destinationUrl,
@@ -2450,6 +2683,112 @@ export function sanitizePipelineProvisioningError(error: unknown) {
   return 'Google Workspace provisioning failed'
 }
 
+export async function rebuildPipelineGoogleWorkbook(input: {
+  pipelineId: string
+  actorEmail: string
+}) {
+  return withPipelineGoogleLock(`hierarchy:${managedEnvironmentName()}`, async () => {
+    let pipeline = await readPipelineProvisioningRecordInPostgres(input.pipelineId)
+    const actorEmail = normalizeUserEmail(input.actorEmail)
+    if (pipeline.ownerEmail !== actorEmail) {
+      throw new PipelineProvisioningRequestError(
+        'Only the pipeline owner can rebuild its CRM workbook', 403, 'PIPELINE_OWNER_REQUIRED',
+      )
+    }
+    if (!pipeline.sheetId || !pipeline.driveFolderId || pipeline.provisioningStatus !== 'ready') {
+      throw new PipelineProvisioningRequestError(
+        'Pipeline workbook must finish provisioning before it can be rebuilt',
+        409,
+        'GOOGLE_PIPELINE_NOT_READY',
+      )
+    }
+    const previousSheetId = pipeline.sheetId
+    const runtime = await runtimeForPipeline(pipeline)
+    await validateGoogleSheetsAccess(runtime)
+    const folder = await getDriveFile(runtime, pipeline.driveFolderId)
+    verifyPipelineFolder(folder, pipeline.id, runtimeSharedDriveId(runtime))
+    const previousSheet = await getDriveFile(runtime, previousSheetId)
+    verifyPipelineFile(previousSheet, pipeline.id, pipeline.driveFolderId, runtimeSharedDriveId(runtime))
+    const identity = await syncAppUserProfileToCrm({ email: pipeline.ownerEmail, pipelineId: pipeline.id })
+    const sheetName = pipelineDriveName(pipeline, identity)
+    const parameters = new URLSearchParams({ supportsAllDrives: 'true', fields: 'id' })
+    const created = await googleDriveJson<DriveFile>(runtime, `/drive/v3/files?${parameters.toString()}`, {
+      method: 'POST',
+      body: {
+        name: sheetName,
+        mimeType: SHEET_MIME_TYPE,
+        parents: [pipeline.driveFolderId],
+        appProperties: fileProperties('pipeline-sheet-replacement', { pipelineId: pipeline.id }),
+      },
+      idempotent: false,
+    })
+    const sheetId = validResourceId(created.id, 'Replacement pipeline Sheet ID')
+    let rebound = false
+    try {
+      await configurePipelineTabs(runtime, sheetId)
+      await applyPipelineWorkbookBranding(runtime, sheetId, await readPipelineWorkbookBranding(pipeline.id))
+      await verifyPipelineTabsAndHeaders(runtime, sheetId)
+      const fileParameters = new URLSearchParams({ supportsAllDrives: 'true', fields: 'id,name,appProperties' })
+      await googleDriveJson(runtime, `/drive/v3/files/${previousSheetId}?${fileParameters.toString()}`, {
+        method: 'PATCH',
+        body: {
+          name: `${sheetName} (retired ${new Date().toISOString().slice(0, 10)})`,
+          appProperties: fileProperties('pipeline-sheet-retired', { pipelineId: pipeline.id }),
+        },
+        idempotent: true,
+      })
+      await googleDriveJson(runtime, `/drive/v3/files/${sheetId}?${fileParameters.toString()}`, {
+        method: 'PATCH',
+        body: { name: sheetName, appProperties: fileProperties('pipeline-sheet', { pipelineId: pipeline.id }) },
+        idempotent: true,
+      })
+      pipeline = await replacePipelineSheetBindingInPostgres({
+        pipelineId: pipeline.id,
+        expectedSheetId: previousSheetId,
+        sheetId,
+        actorEmail,
+      })
+      rebound = true
+      await reconcilePipelineGooglePermissionsUnlocked(pipeline.id, runtime)
+      const shortLinkId = await ensurePipelineShortLink(pipeline, sheetId)
+      if (pipeline.shortLinkId !== shortLinkId) {
+        pipeline = await storePipelineShortLinkIdInPostgres({
+          pipelineId: pipeline.id,
+          expectedShortLinkId: pipeline.shortLinkId,
+          shortLinkId,
+        })
+      }
+      return {
+        pipelineId: pipeline.id,
+        previousSheetId,
+        sheetId,
+        url: `https://docs.google.com/spreadsheets/d/${sheetId}/edit`,
+      }
+    } catch (error) {
+      if (!rebound) {
+        const fileParameters = new URLSearchParams({ supportsAllDrives: 'true', fields: 'id,name,appProperties' })
+        await googleDriveJson(runtime, `/drive/v3/files/${previousSheetId}?${fileParameters.toString()}`, {
+          method: 'PATCH',
+          body: {
+            name: previousSheet.name || sheetName,
+            appProperties: fileProperties('pipeline-sheet', { pipelineId: pipeline.id }),
+          },
+          idempotent: true,
+        }).catch(() => null)
+        await googleDriveJson(runtime, `/drive/v3/files/${sheetId}?${fileParameters.toString()}`, {
+          method: 'PATCH',
+          body: {
+            name: `${sheetName} (replacement failed ${new Date().toISOString().slice(0, 10)})`,
+            appProperties: fileProperties('pipeline-sheet-replacement-failed', { pipelineId: pipeline.id }),
+          },
+          idempotent: true,
+        }).catch(() => null)
+      }
+      throw error
+    }
+  })
+}
+
 export async function provisionPipelineGoogleResources(pipelineId: string) {
   try {
     return await withPipelineGoogleLock(`hierarchy:${managedEnvironmentName()}`, async () => {
@@ -2573,7 +2912,7 @@ function catalogFromDropdownRows(values: unknown[][]): Record<string, string[]> 
 }
 
 function dropdownRows(catalog: Record<string, string[]>) {
-  const keys = Object.keys(catalog).sort((left, right) => left.localeCompare(right))
+  const keys = orderedDropdownKeys(catalog)
   const rowCount = Math.max(1, ...keys.map((key) => catalog[key].length))
   return [
     keys,

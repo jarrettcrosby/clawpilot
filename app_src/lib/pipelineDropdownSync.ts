@@ -24,6 +24,7 @@ const DROPDOWN_TAB = process.env.PIPELINE_DROPDOWN_TAB || 'Dropdowns'
 const HEADER_ROW = Number(process.env.PIPELINE_DROPDOWN_HEADER_ROW || 4)
 const START_COL_LETTER = process.env.PIPELINE_DROPDOWN_START_COL || 'B'
 const END_COL_LETTER = process.env.PIPELINE_DROPDOWN_END_COL || 'ZZ'
+const CANONICAL_DROPDOWN_KEYS = ['owner', 'product', 'stage', 'priority', 'status', 'source', 'loss_reason'] as const
 
 const READ_RANGE = `${DROPDOWN_TAB}!${START_COL_LETTER}${HEADER_ROW}:${END_COL_LETTER}2000`
 const CACHE_FILE = process.env.PIPELINE_DROPDOWN_CACHE_PATH
@@ -72,6 +73,14 @@ function normalizeKey(input: string) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '')
+}
+
+function orderedDropdownKeys(catalog: Record<string, unknown>) {
+  const available = new Set(Object.keys(catalog))
+  return [
+    ...CANONICAL_DROPDOWN_KEYS.filter((key) => available.delete(key)),
+    ...Array.from(available).sort((left, right) => left.localeCompare(right)),
+  ]
 }
 
 function hashCatalogEntry(key: string, values: string[]) {
@@ -301,7 +310,7 @@ function parseColumnarValues(values: string[][]): PipelineDropdownCatalog {
 }
 
 function toColumnarRows(catalog: PipelineDropdownCatalog) {
-  const keys = Object.keys(catalog.dropdowns || {}).sort((a, b) => a.localeCompare(b))
+  const keys = orderedDropdownKeys(catalog.dropdowns || {})
   const headers = keys.map((k) => k)
   const columns = keys.map((k) => {
     const opts = (catalog.dropdowns[k] || [])

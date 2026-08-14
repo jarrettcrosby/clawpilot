@@ -97,16 +97,38 @@ function opportunityRow(record: CrmOpportunity): unknown[] {
   ]
 }
 
+export function googleSheetsDateTime(value: string | null | undefined): number | '' {
+  const timestamp = Date.parse(String(value || ''))
+  if (!Number.isFinite(timestamp)) return ''
+  return (timestamp / 86_400_000) + 25_569
+}
+
+function workbookInteractionType(record: CrmInteraction) {
+  const normalized = record.interactionType.trim().toLowerCase().replace(/[\s_-]+/g, ' ')
+  if (normalized === 'meeting' || normalized === 'in person') return 'In Person'
+  if (normalized === 'linkedin') return 'LinkedIn'
+  if (normalized === 'direct mail') return 'Direct Mail'
+  if (normalized === 'email') return 'Email'
+  if (normalized === 'call') return 'Call'
+  if (normalized === 'campaign') return 'Campaign'
+  if (normalized === 'note') return 'Note'
+  return record.interactionType || 'Note'
+}
+
 function interactionRow(
   record: CrmInteraction,
   contacts: Map<string, string>,
   opportunities: Map<string, string>,
 ): unknown[] {
+  const interactionType = workbookInteractionType(record)
+  const notes = [record.subject && record.subject !== interactionType ? record.subject : '', record.description]
+    .filter(Boolean)
+    .join(' — ')
   return [
-    record.sourceKey, '', record.subject, '', record.organizationName, record.agentName, record.occurredAt || '',
+    record.sourceKey, '', interactionType, '', record.organizationName, record.agentName, googleSheetsDateTime(record.occurredAt),
     record.opportunityId ? opportunities.get(record.opportunityId) || '' : '',
     record.contactId ? contacts.get(record.contactId) || '' : '',
-    record.description,
+    notes,
   ]
 }
 

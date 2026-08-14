@@ -11,7 +11,7 @@ export const CRM_ENTITIES = [
 
 export type CrmEntity = (typeof CRM_ENTITIES)[number]
 export type CrmSyncStatus = 'pending' | 'syncing' | 'synced' | 'failed'
-export type SuiteCrmInteractionModule = 'Notes' | 'Calls' | 'Meetings'
+export type SuiteCrmInteractionModule = 'Notes' | 'Calls' | 'Meetings' | 'Emails'
 export type CrmActivityStatus = 'planned' | 'held' | 'not_held'
 
 export type CrmOrganization = {
@@ -94,6 +94,7 @@ export type CrmProduct = {
   name: string
   sku: string
   productType: string
+  categoryId: string | null
   category: string
   status: string
   price: number
@@ -107,6 +108,16 @@ export type CrmProduct = {
   syncStatus: CrmSyncStatus
   syncError: string | null
   updatedAt: string
+}
+
+export type CrmProductCategory = {
+  id: string
+  pipelineId: string
+  parentId: string | null
+  name: string
+  path: string
+  depth: number
+  productCount: number
 }
 
 export type ProductSalesChannelState = {

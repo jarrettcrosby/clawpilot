@@ -1081,7 +1081,7 @@ assertIncludes(suiteCrmClient, 'alreadyLinked', 'idempotent SuiteCRM relationshi
 assertIncludes(suiteCrmClient, "'filter[date_modified][gte]'", 'incremental SuiteCRM meeting polling')
 assertIncludes(suiteCrmClient, 'listSuiteCrmCallsUpdatedSince', 'incremental SuiteCRM Call polling')
 assertIncludes(suiteCrmClient, 'suiteCrmRecordModule(record)', 'persisted SuiteCRM outbox module resolution')
-assertIncludes(suiteCrmClient, "explicitModule === 'Notes' || explicitModule === 'Calls' || explicitModule === 'Meetings'", 'bounded interaction module transport')
+assertIncludes(suiteCrmClient, "|| explicitModule === 'Emails'", 'bounded interaction email module transport')
 assertIncludes(suiteCrmClient, 'return canonicalModule', 'legacy SuiteCRM interaction module fallback')
 assertIncludes(suiteCrmClient, 'listSuiteCrmAccountContactRecordsUpdatedSince', 'incremental SuiteCRM account/contact polling')
 assertIncludes(suiteCrmClient, 'findSuiteCrmUser', 'SuiteCRM app-user mapping lookup')

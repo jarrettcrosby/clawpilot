@@ -36,9 +36,7 @@ const formulaContract = [
   ['Organizations', '=COUNTA(Organizations!C5:C)'],
   ['Contacts', '=COUNTA(Contacts!C5:C)'],
   ['Interactions', '=COUNTA(Interactions!C5:C)'],
-  ['Interactions 61-90 days', 'Interactions!G5:G,">="&TODAY()-90', 'Interactions!G5:G,"<"&TODAY()-60'],
-  ['Interactions 31-60 days', 'Interactions!G5:G,">="&TODAY()-60', 'Interactions!G5:G,"<"&TODAY()-30'],
-  ['Interactions last 30 days', 'Interactions!G5:G,">="&TODAY()-30', 'Interactions!G5:G,"<="&TODAY()'],
+  ['Open opportunities value', '=SUMIFS(Opportunities!J5:J', 'Opportunities!F5:F,"Open"'],
 ]
 const initialRowsStart = source.indexOf('const INITIAL_TAB_ROWS')
 const calculationsBlock = source.slice(
@@ -96,17 +94,16 @@ const chartRequestBlock = source.slice(
   source.indexOf('function dashboardChartRequests'),
   source.indexOf('function dashboardValueWrites'),
 )
-assert.equal((chartRequestBlock.match(/\n\s+chart\(\{/g) || []).length, 4)
-assert.match(chartRequestBlock, /startColumnIndex: DASHBOARD_HELPER_COLUMN_INDEX/)
-assert.match(chartRequestBlock, /startColumnIndex: DASHBOARD_HELPER_COLUMN_INDEX \+ 1/)
+assert.equal((chartRequestBlock.match(/\n\s+chartShell\(\{/g) || []).length, 4)
 assert.match(chartRequestBlock, /hiddenDimensionStrategy: 'SHOW_ALL'/)
+assert.match(chartRequestBlock, /fontName: 'Roboto'/)
 assert.match(chartRequestBlock, /widthPixels: 440/)
 assert.match(chartRequestBlock, /heightPixels: 250/)
 for (const chartContract of [
-  { title: 'Opportunity lifecycle', start: 6, end: 10, row: 9, column: 1, type: 'COLUMN' },
-  { title: 'Pipeline value', start: 11, end: 14, row: 9, column: 7, type: 'COLUMN' },
-  { title: 'CRM records', start: 14, end: 17, row: 24, column: 1, type: 'BAR' },
-  { title: 'Interactions, last 90 days', start: 17, end: 20, row: 24, column: 7, type: 'COLUMN' },
+  { title: 'Opportunities by stage', start: 3, end: 13, row: 9, column: 1, type: 'BAR', helper: 'DASHBOARD_STAGE_HELPER_COLUMN_INDEX' },
+  { title: 'Interactions, last quarter', start: 3, end: 7, row: 9, column: 7, type: 'COLUMN', helper: 'DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX' },
+  { title: 'Potential Revenue by Stage, Next 2 Quarters', start: 3, end: 10, row: 24, column: 1, type: 'COLUMN', helper: 'DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX' },
+  { title: 'Potential vs probable value', start: 3, end: 10, row: 24, column: 7, type: 'COLUMN', helper: 'DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX' },
 ]) {
   const chartStart = chartRequestBlock.indexOf(`title: '${chartContract.title}'`)
   const chartDefinition = chartRequestBlock.slice(chartStart, chartRequestBlock.indexOf('}),', chartStart) + 3)
@@ -116,16 +113,40 @@ for (const chartContract of [
   assert.ok(chartDefinition.includes(`anchorRowIndex: ${chartContract.row}`))
   assert.ok(chartDefinition.includes(`anchorColumnIndex: ${chartContract.column}`))
   assert.ok(chartDefinition.includes(`chartType: '${chartContract.type}'`))
+  assert.ok(chartDefinition.includes(`domainColumnIndex: ${chartContract.helper}`))
 }
+assert.match(chartRequestBlock, /title: 'Interactions, last quarter'/)
+assert.match(chartRequestBlock, /stackedType: 'NOT_STACKED'/)
+assert.match(chartRequestBlock, /title: 'Potential Revenue by Stage, Next 2 Quarters'[\s\S]*stackedType: 'STACKED'/)
+assert.match(chartRequestBlock, /title: 'Potential Revenue by Stage, Next 2 Quarters'[\s\S]*legendPosition: 'TOP_LEGEND'/)
+assert.match(chartRequestBlock, /title: 'Potential Revenue by Stage, Next 2 Quarters'[\s\S]*valueAxisTitle: 'Potential revenue'/)
+assert.match(chartRequestBlock, /title: 'Month ending'/)
 
 const dashboardWrites = source.slice(
   source.indexOf('function dashboardValueWrites'),
   source.indexOf('function googleBorder'),
 )
-for (const cell of ['B5', 'B6', 'E5', 'E6', 'H5', 'H6', 'K5', 'K6', 'B9', 'B24', 'B40']) {
+assert.match(dashboardWrites, /const interactionTypes = \['Direct Mail', 'LinkedIn', 'Email', 'Call', 'In Person', 'Note', 'Campaign'\]/)
+assert.match(dashboardWrites, /Interactions!\$C\$5:\$C/)
+assert.match(dashboardWrites, /Interactions!\$G\$5:\$G/)
+assert.match(dashboardWrites, /const forecastStages = \['Closed', 'Closed Delayed', 'Proposal', 'Demo', 'Needs Analysis', 'Qualified Lead', 'Identified Lead'\]/)
+assert.match(dashboardWrites, /forecastStageRows/)
+assert.match(dashboardWrites, /=SUMIFS\(Opportunities!\$J\$5:\$J/)
+assert.match(dashboardWrites, /Potential|forecastValueRows/)
+for (const cell of ['B5', 'B6', 'H5', 'H6', 'B8', 'D8', 'F8', 'I8', 'K8', 'B9', 'B24', 'B40']) {
   assert.ok(dashboardWrites.includes(`'Dashboard'!${cell}`), `Dashboard write missing ${cell}`)
 }
+assert.match(source, /const DASHBOARD_MATERIAL =/)
+assert.match(source, /fontFamily: 'Roboto Mono'/)
+for (const range of ['S4', 'V4', 'AE4', 'AN4']) {
+  assert.ok(dashboardWrites.includes(`'Dashboard'!${range}`), `Dashboard helper write missing ${range}`)
+}
 assert.match(source, /const DASHBOARD_HELPER_COLUMN_INDEX = 15/)
+assert.match(source, /const DASHBOARD_STAGE_HELPER_COLUMN_INDEX = 18/)
+assert.match(source, /const DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX = 21/)
+assert.match(source, /const DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX = 30/)
+assert.match(source, /const DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX = 39/)
+assert.match(source, /const DASHBOARD_HELPER_END_COLUMN_INDEX = 42/)
 assert.match(source, /properties: \{ hiddenByUser: true \}/)
 assert.match(source, /hideGridlines: true/)
 assert.match(source, /tabColor: googleColor\(WORKBOOK_TAB_COLORS\[title\]\)/)
@@ -168,10 +189,19 @@ assert.ok(
 
 assert.match(source, /title === 'Dropdowns' && !newlyProvisionedTitles\.has\(title\)/)
 assert.match(source, /if \(preserveConfiguredDropdowns\) return writes/)
+assert.match(source, /const CANONICAL_DROPDOWN_KEYS = \['owner', 'product', 'stage', 'priority', 'status', 'source', 'loss_reason'\]/)
+assert.match(source, /const keys = orderedDropdownKeys\(catalog\)/)
+assert.match(configureBlock, /configuredDropdownColumnCount/)
+assert.match(configureBlock, /populatedColumnCount/)
 assert.doesNotMatch(source.slice(initialRowsStart, source.indexOf('export class PipelineProvisioningRequestError')), /\n\s+Opportunities\s*:/)
 assert.match(projectionSource, /await configurePipelineTabs\(runtime, input\.context\.sheetId\)[\s\S]{0,260}await applyPipelineWorkbookBranding/)
 assert.match(projectionSource, /const branding = await readPipelineWorkbookBranding\(input\.context\.pipelineId\)/)
 assert.match(projectionSource, /await configureLegacyPipelineTabs\(input\.context\.sheetId\)[\s\S]{0,180}await applyLegacyPipelineWorkbookBranding\(input\.context\.sheetId, branding\)/)
 assert.match(legacySource, /applyPipelineWorkbookBrandingWithRequest\(matonSheetsJson, sheetId, branding\)/)
+assert.match(projectionSource, /function workbookInteractionType/)
+assert.match(projectionSource, /googleSheetsDateTime\(record\.occurredAt\)/)
+assert.match(projectionSource, /timestamp \/ 86_400_000\) \+ 25_569/)
+assert.match(source, /export async function rebuildPipelineGoogleWorkbook/)
+assert.match(source, /pipeline-sheet-retired/)
 
 console.log('pipeline workbook dashboard contract tests passed')

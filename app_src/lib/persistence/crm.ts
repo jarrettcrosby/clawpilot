@@ -27,6 +27,7 @@ import type {
   CrmOpportunity,
   CrmOrganization,
   CrmProduct,
+  CrmProductCategory,
   CrmRecord,
   CrmSummary,
   SuiteCrmOutboxRecord,
@@ -151,6 +152,7 @@ export type StageProductInput = CommonStageInput & {
     name: string
     sku?: string
     productType?: string
+    categoryId?: string | null
     category?: string
     status?: string
     price?: number
@@ -328,6 +330,7 @@ function interactionSuiteCrmModule(fields: StageInteractionInput['fields']): Sui
   const interactionType = normalizedInteractionType(fields.interactionType)
   if (interactionType === 'call') return 'Calls'
   if (interactionType === 'meeting') return fields.meetingId ? null : 'Meetings'
+  if (interactionType === 'email') return 'Emails'
   return 'Notes'
 }
 
@@ -510,6 +513,20 @@ function suiteCrmAttributes(input: StageCrmRecordInput, referenceCode: string) {
   }
   const fields = input.fields
   const moduleName = interactionSuiteCrmModule(fields)
+  if (moduleName === 'Emails') {
+    return {
+      ...globalId,
+      name: clean(fields.subject),
+      date_sent_received: suiteCrmDateTime(fields.occurredAt),
+      type: 'archived',
+      status: clean(fields.deliveryStatus).toLowerCase() === 'received' ? 'read' : 'sent',
+      parent_type: fields.parentSuiteCrmId ? clean(fields.parentSuiteCrmType) : '',
+      parent_id: clean(fields.parentSuiteCrmId),
+      ...(fields.agentSuiteCrmUserId ? { assigned_user_id: clean(fields.agentSuiteCrmUserId) } : {}),
+      description: clean(fields.description),
+      description_html: '',
+    }
+  }
   if (moduleName === 'Calls' || moduleName === 'Meetings') {
     const duration = interactionDurationMinutes(fields)
     const activityStatus = interactionActivityStatus(fields)
@@ -609,8 +626,8 @@ async function suiteCrmRelationships(
             ],
           )
         : { rows: [] }
-    // Notes expose one canonical Contact link. Calls and Meetings use their
-    // native activity relationships so every selected Contact remains visible.
+    // Notes expose one canonical Contact link. Emails, Calls, and Meetings use
+    // their native activity relationships so every selected Contact remains visible.
     return result.rows.map((row) => ({
       linkFieldName: row.link_field_name,
       relatedModuleName: row.related_module_name,
@@ -1090,6 +1107,68 @@ async function stageContact(
   )
 }
 
+async function resolveProductCategory(
+  client: PoolClient,
+  input: StageProductInput,
+): Promise<{ id: string | null; name: string }> {
+  const requestedId = input.fields.categoryId
+  const requestedName = clean(input.fields.category)
+  if (requestedId !== undefined) {
+    if (!requestedId) return { id: null, name: '' }
+    const category = await client.query<{ id: string; name: string }>(
+      `SELECT id::text, name
+       FROM crm_product_categories
+       WHERE pipeline_id = $1::uuid AND id = $2::uuid AND active = true
+       LIMIT 1`,
+      [input.pipelineId, requestedId],
+    )
+    if (!category.rows[0]) throw new Error('CRM product category was not found in this pipeline')
+    return category.rows[0]
+  }
+
+  const current = await client.query<{ category_id: string | null; category: string | null }>(
+    `SELECT category_id::text, category
+     FROM crm_products
+     WHERE pipeline_id = $1::uuid AND source_key = $2
+     LIMIT 1`,
+    [input.pipelineId, input.sourceKey],
+  )
+  if (input.fields.category === undefined) {
+    return {
+      id: current.rows[0]?.category_id || null,
+      name: clean(current.rows[0]?.category),
+    }
+  }
+  if (!requestedName) return { id: null, name: '' }
+  if (
+    current.rows[0]?.category_id
+    && clean(current.rows[0].category).toLowerCase() === requestedName.toLowerCase()
+  ) {
+    return { id: current.rows[0].category_id, name: requestedName }
+  }
+
+  const category = await client.query<{ id: string; name: string }>(
+    `WITH inserted AS (
+       INSERT INTO crm_product_categories (pipeline_id, parent_id, name, created_by, updated_by)
+       VALUES ($1::uuid, NULL, $2, $3, $3)
+       ON CONFLICT DO NOTHING
+       RETURNING id::text, name
+     )
+     SELECT id, name FROM inserted
+     UNION ALL
+     SELECT id::text, name
+     FROM crm_product_categories
+     WHERE pipeline_id = $1::uuid
+       AND parent_id IS NULL
+       AND active = true
+       AND lower(btrim(name)) = lower(btrim($2))
+     LIMIT 1`,
+    [input.pipelineId, requestedName, input.actorEmail],
+  )
+  if (!category.rows[0]) throw new Error('CRM product category could not be resolved')
+  return category.rows[0]
+}
+
 async function stageProduct(client: PoolClient, input: StageProductInput, suiteCrmId: string, sourceHash: string) {
   const fields = input.fields
   const currency = clean(fields.currency).toUpperCase()
@@ -1099,18 +1178,19 @@ async function stageProduct(client: PoolClient, input: StageProductInput, suiteC
   }
   const sku = clean(fields.sku)
   if (sku.length > 25) throw new Error('CRM product SKU must be 25 characters or fewer')
+  const category = await resolveProductCategory(client, input)
   const result = await client.query<{ id: string; suitecrm_id: string; reference_code: string }>(
     `
       INSERT INTO crm_products (
         pipeline_id, suitecrm_id, source_key, source_sheet_id, source_row_number, reference_code,
-        name, sku, product_type, category, status, price, cost, currency, url, description, active,
+        name, sku, product_type, category_id, category, status, price, cost, currency, url, description, active,
         source_payload, source_hash, sync_status, sync_error, created_by, updated_by
       )
       VALUES (
         $1::uuid, $2, $3, $4, $5,
         COALESCE((SELECT reference_code FROM crm_products WHERE pipeline_id = $1::uuid AND source_key = $3), allocate_crm_reference('gp')),
-        $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-        $17::jsonb, $18, 'pending', NULL, $19, $19
+        $6, $7, $8, $9::uuid, $10, $11, $12, $13, $14, $15, $16, $17,
+        $18::jsonb, $19, 'pending', NULL, $20, $20
       )
       ON CONFLICT (pipeline_id, source_key) DO UPDATE SET
         suitecrm_id = COALESCE(crm_products.suitecrm_id, EXCLUDED.suitecrm_id),
@@ -1119,6 +1199,7 @@ async function stageProduct(client: PoolClient, input: StageProductInput, suiteC
         name = EXCLUDED.name,
         sku = EXCLUDED.sku,
         product_type = EXCLUDED.product_type,
+        category_id = EXCLUDED.category_id,
         category = EXCLUDED.category,
         status = EXCLUDED.status,
         price = EXCLUDED.price,
@@ -1138,7 +1219,7 @@ async function stageProduct(client: PoolClient, input: StageProductInput, suiteC
     [
       input.pipelineId, suiteCrmId, input.sourceKey, input.sourceSheetId || null,
       input.sourceRowNumber || null, clean(fields.name), nullable(sku), clean(fields.productType) || 'Good',
-      nullable(fields.category), clean(fields.status) || 'Active', Math.max(0, finite(fields.price)),
+      category.id, nullable(category.name), clean(fields.status) || 'Active', Math.max(0, finite(fields.price)),
       Math.max(0, finite(fields.cost)), currency, nullable(fields.url), nullable(fields.description), fields.active !== false,
       JSON.stringify(input.sourcePayload || {}), sourceHash, input.actorEmail,
     ],
@@ -3392,7 +3473,8 @@ function productFromRow(row: Record<string, unknown>): CrmProduct {
     id: String(row.id), referenceCode: clean(row.reference_code), shortUrl: crmReferenceShortUrl(row.reference_code),
     pipelineId: String(row.pipeline_id), suiteCrmId: nullable(row.suitecrm_id), sourceKey: String(row.source_key),
     sourceRowNumber: row.source_row_number === null ? null : Number(row.source_row_number), name: clean(row.name),
-    sku: clean(row.sku), productType: clean(row.product_type), category: clean(row.category), status: clean(row.status),
+    sku: clean(row.sku), productType: clean(row.product_type), categoryId: nullable(row.category_id),
+    category: clean(row.category), status: clean(row.status),
     price: finite(row.price), cost: finite(row.cost), currency: clean(row.currency) || 'USD', url: clean(row.url),
     description: clean(row.description),
     active: row.active !== false, packaging: null, salesChannels: [],
@@ -3598,6 +3680,110 @@ async function hydrateInteractionRows(
 
 function hydrateInteractionRowsWithPool(rows: Record<string, unknown>[], pipelineId: string) {
   return hydrateInteractionRows(rows, pipelineId, (text, values) => query<Record<string, unknown>>(text, values))
+}
+
+export async function listCrmProductCategoriesInPostgres(
+  pipelineId: string,
+): Promise<CrmProductCategory[]> {
+  const result = await query<Record<string, unknown>>(
+    `WITH RECURSIVE category_tree AS (
+       SELECT category.id, category.pipeline_id, category.parent_id, category.name,
+         category.name::text AS path, 0 AS depth, ARRAY[category.id] AS ancestry
+       FROM crm_product_categories category
+       WHERE category.pipeline_id = $1::uuid
+         AND category.parent_id IS NULL
+         AND category.active = true
+       UNION ALL
+       SELECT child.id, child.pipeline_id, child.parent_id, child.name,
+         parent.path || ' / ' || child.name, parent.depth + 1,
+         parent.ancestry || child.id
+       FROM crm_product_categories child
+       JOIN category_tree parent
+         ON parent.pipeline_id = child.pipeline_id
+        AND parent.id = child.parent_id
+       WHERE child.active = true
+         AND NOT child.id = ANY(parent.ancestry)
+         AND parent.depth < 8
+     )
+     SELECT tree.id::text, tree.pipeline_id::text, tree.parent_id::text,
+       tree.name, tree.path, tree.depth, count(product.id)::int AS product_count
+     FROM category_tree tree
+     LEFT JOIN crm_products product
+       ON product.pipeline_id = tree.pipeline_id
+      AND product.category_id = tree.id
+      AND ${activeCrmRecordSql('product')}
+     GROUP BY tree.id, tree.pipeline_id, tree.parent_id, tree.name, tree.path, tree.depth
+     ORDER BY lower(tree.path), tree.id`,
+    [pipelineId],
+  )
+  return result.rows.map((row) => ({
+    id: String(row.id),
+    pipelineId: String(row.pipeline_id),
+    parentId: nullable(row.parent_id),
+    name: clean(row.name),
+    path: clean(row.path),
+    depth: finite(row.depth),
+    productCount: finite(row.product_count),
+  }))
+}
+
+export async function createCrmProductCategoryInPostgres(input: {
+  pipelineId: string
+  parentId?: string | null
+  name: string
+  actorEmail: string
+}): Promise<CrmProductCategory> {
+  const name = clean(input.name)
+  if (!name || name.length > 100) throw new Error('Product category name must be 1 to 100 characters')
+  const id = await withTransaction(async (client) => {
+    let parentDepth = -1
+    if (input.parentId) {
+      const parent = await client.query<{ depth: number }>(
+        `WITH RECURSIVE ancestors AS (
+           SELECT id, parent_id, 0 AS depth
+           FROM crm_product_categories
+           WHERE pipeline_id = $1::uuid AND id = $2::uuid AND active = true
+           UNION ALL
+           SELECT parent.id, parent.parent_id, ancestors.depth + 1
+           FROM crm_product_categories parent
+           JOIN ancestors ON ancestors.parent_id = parent.id
+           WHERE parent.pipeline_id = $1::uuid AND parent.active = true AND ancestors.depth < 8
+         )
+         SELECT max(depth)::int AS depth FROM ancestors`,
+        [input.pipelineId, input.parentId],
+      )
+      if (parent.rows[0]?.depth === null || parent.rows[0]?.depth === undefined) {
+        throw new Error('Parent product category was not found in this pipeline')
+      }
+      parentDepth = Number(parent.rows[0].depth)
+      if (parentDepth >= 7) throw new Error('Product category hierarchy cannot exceed 8 levels')
+    }
+    const inserted = await client.query<{ id: string }>(
+      `INSERT INTO crm_product_categories (
+         pipeline_id, parent_id, name, created_by, updated_by
+       ) VALUES ($1::uuid, $2::uuid, $3, $4, $4)
+       RETURNING id::text`,
+      [input.pipelineId, input.parentId || null, name, input.actorEmail],
+    ).catch((error: unknown) => {
+      if ((error as { code?: string })?.code === '23505') {
+        throw new Error('A product category with this name already exists under the selected parent')
+      }
+      throw error
+    })
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'crm.product_category.created',
+      aggregateType: 'crm_product_categories',
+      aggregateId: inserted.rows[0].id,
+      eventKey: `crm-product-category-created:${inserted.rows[0].id}`,
+      payload: { pipelineId: input.pipelineId, parentId: input.parentId || null, name },
+    }, client)
+    return inserted.rows[0].id
+  })
+  const categories = await listCrmProductCategoriesInPostgres(input.pipelineId)
+  const category = categories.find((item) => item.id === id)
+  if (!category) throw new Error('Created product category could not be loaded')
+  return category
 }
 
 function leadFromRow(row: Record<string, unknown>): CrmLead {

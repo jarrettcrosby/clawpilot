@@ -1457,6 +1457,77 @@ export async function storePipelineProvisioningSheetIdInPostgres(input: {
   return readPipelineProvisioningRecordInPostgres(pipelineId)
 }
 
+export async function replacePipelineSheetBindingInPostgres(input: {
+  pipelineId: unknown
+  expectedSheetId: unknown
+  sheetId: unknown
+  actorEmail: unknown
+}): Promise<PipelineProvisioningRecord> {
+  const pipelineId = requirePipelineId(input.pipelineId)
+  const expectedSheetId = requireGoogleResourceId(input.expectedSheetId, 'Existing pipeline Sheet ID')
+  const sheetId = requireGoogleResourceId(input.sheetId, 'Replacement pipeline Sheet ID')
+  const actorEmail = cleanString(input.actorEmail)?.toLowerCase()
+  if (!actorEmail) throw new Error('Pipeline workbook replacement actor is required')
+  if (sheetId === expectedSheetId) throw new Error('Replacement pipeline Sheet must be a new file')
+  return withTransaction(async (client) => {
+    const pipeline = await readPipelineProvisioningWithClient(client, pipelineId, true)
+    if (!pipeline) throw new Error('Pipeline was not found')
+    if (pipeline.ownerEmail !== actorEmail) throw new Error('Only the pipeline owner can rebuild its CRM workbook')
+    if (pipeline.sheetId !== expectedSheetId || pipeline.provisioningSheetId !== expectedSheetId) {
+      throw new Error('Pipeline Sheet state changed during workbook replacement')
+    }
+    const processing = await client.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM sync_outbox
+       WHERE target_system = 'google_sheets'
+         AND aggregate_type LIKE 'pipeline%'
+         AND status = 'processing'
+         AND payload->>'pipelineId' = $1
+         AND payload->>'sheetId' = $2`,
+      [pipelineId, expectedSheetId],
+    )
+    if (Number(processing.rows[0]?.count || 0) > 0) {
+      throw new Error('Pipeline workbook replacement is waiting for active Sheet synchronization to finish')
+    }
+    await client.query(
+      `UPDATE sync_outbox
+       SET status = 'dead', last_error = 'superseded by clean workbook replacement',
+         processed_at = now(), updated_at = now()
+       WHERE target_system = 'google_sheets'
+         AND aggregate_type LIKE 'pipeline%'
+         AND status IN ('queued', 'failed')
+         AND payload->>'pipelineId' = $1
+         AND payload->>'sheetId' = $2`,
+      [pipelineId, expectedSheetId],
+    )
+    await client.query('DELETE FROM pipeline_sheet_rows WHERE sheet_id = $1', [expectedSheetId])
+    await client.query('DELETE FROM pipeline_sheet_sources WHERE sheet_id = $1', [expectedSheetId])
+    await client.query(
+      `UPDATE pipeline_spaces
+       SET sheet_id = $2,
+         provisioning_sheet_id = $2,
+         crm_last_synced_at = NULL,
+         updated_at = now()
+       WHERE id = $1::uuid`,
+      [pipelineId, sheetId],
+    )
+    await client.query(
+      `INSERT INTO audit_events (
+         actor, event_type, aggregate_type, aggregate_id, event_key, payload
+       ) VALUES ($1, 'pipeline.workbook.rebuilt', 'pipeline_space', $2::uuid, $3, $4::jsonb)`,
+      [
+        actorEmail,
+        pipelineId,
+        `pipeline-workbook-rebuilt:${pipelineId}:${sheetId}`,
+        JSON.stringify({ previousSheetId: expectedSheetId, sheetId }),
+      ],
+    )
+    const replaced = await readPipelineProvisioningWithClient(client, pipelineId)
+    if (!replaced) throw new Error('Pipeline was not found')
+    return replaced
+  })
+}
+
 export async function storePipelineShortLinkIdInPostgres(input: {
   pipelineId: unknown
   expectedShortLinkId: string | null

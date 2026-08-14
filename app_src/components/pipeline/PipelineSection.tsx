@@ -34,12 +34,14 @@ import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import ReplayRounded from '@mui/icons-material/ReplayRounded'
 import TuneRounded from '@mui/icons-material/TuneRounded'
 import InsightsRounded from '@mui/icons-material/InsightsRounded'
+import DashboardRounded from '@mui/icons-material/DashboardRounded'
 import HelpOutlineRounded from '@mui/icons-material/HelpOutlineRounded'
 import Tabs from '@mui/material/Tabs'
 import Tab from '@mui/material/Tab'
 import useMediaQuery from '@mui/material/useMediaQuery'
 import WorkspaceSelector from '@/components/workspaces/WorkspaceSelector'
 import PipelineInsights from '@/components/pipeline/PipelineInsights'
+import PipelineDashboard from '@/components/pipeline/PipelineDashboard'
 import PipelineCatalogDialog, {
   type PipelineCatalogPerson,
   type PipelineCatalogProduct,
@@ -733,7 +735,7 @@ export default function PipelineSection() {
   const [deals, setDeals] = useState<Deal[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [view, setView] = useState<'insights' | 'board' | 'list'>('board')
+  const [view, setView] = useState<'dashboard' | 'insights' | 'board' | 'list'>('board')
   const [filterStatus, setFilterStatus] = useState<'all' | 'active' | 'terminal'>('all')
   const [selectedDeal, setSelectedDeal] = useState<Deal | null>(null)
   const [stageOptions, setStageOptions] = useState<string[]>(DEFAULT_STAGES)
@@ -1169,15 +1171,19 @@ export default function PipelineSection() {
             '& > *': { flexShrink: 0 },
           } : undefined}
         >
-          <Box><Typography variant="caption" color="text.disabled">Active Pipeline</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15} color="#66BB6A">{fmt$(pipelineSummary.activeValue)}</Typography></Box>
-          <Box>
-            <Typography variant="caption" color="text.disabled">Weighted Value</Typography>
-            <Typography variant="h6" fontWeight={700} lineHeight={1.15} color="#A8C7FA">{fmt$(pipelineSummary.weightedActiveValue)}</Typography>
-            {!compactLandscapeBoard && <Typography variant="caption" color="text.secondary">Σ(value × win probability)</Typography>}
-          </Box>
-          <Box><Typography variant="caption" color="text.disabled">Active</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{pipelineSummary.activeCount}</Typography></Box>
-          <Box><Typography variant="caption" color="text.disabled">High Priority</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{highPriorityActiveDeals.length}</Typography></Box>
-          <Box><Typography variant="caption" color="text.disabled">Won</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{pipelineSummary.wonCount}</Typography></Box>
+          {view !== 'dashboard' ? (
+            <>
+              <Box><Typography variant="caption" color="text.disabled">Active Pipeline</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15} color="#66BB6A">{fmt$(pipelineSummary.activeValue)}</Typography></Box>
+              <Box>
+                <Typography variant="caption" color="text.disabled">Weighted Value</Typography>
+                <Typography variant="h6" fontWeight={700} lineHeight={1.15} color="#A8C7FA">{fmt$(pipelineSummary.weightedActiveValue)}</Typography>
+                {!compactLandscapeBoard && <Typography variant="caption" color="text.secondary">Σ(value × win probability)</Typography>}
+              </Box>
+              <Box><Typography variant="caption" color="text.disabled">Active</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{pipelineSummary.activeCount}</Typography></Box>
+              <Box><Typography variant="caption" color="text.disabled">High Priority</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{highPriorityActiveDeals.length}</Typography></Box>
+              <Box><Typography variant="caption" color="text.disabled">Won</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{pipelineSummary.wonCount}</Typography></Box>
+            </>
+          ) : null}
 
           <Stack spacing={0.45} sx={{ minWidth: compactLandscapeBoard ? 170 : { xs: '100%', sm: 260 }, maxWidth: compactLandscapeBoard ? 220 : { xs: '100%', md: 460 } }}>
             <Typography variant="caption" sx={{ color: '#A8C7FA', fontWeight: 700 }}>{pipelineSyncEnabled ? 'Pipeline sync' : 'Pipeline storage'}</Typography>
@@ -1324,6 +1330,7 @@ export default function PipelineSection() {
               <ToggleButton value="terminal">Terminal</ToggleButton>
             </ToggleButtonGroup>
             <ToggleButtonGroup size="small" value={view} exclusive onChange={(_, v) => v && setView(v)}>
+              <Tooltip title="Dashboard view"><ToggleButton value="dashboard"><DashboardRounded sx={{ fontSize: 18 }} /></ToggleButton></Tooltip>
               <Tooltip title="Pipeline insights"><ToggleButton value="insights"><InsightsRounded sx={{ fontSize: 18 }} /></ToggleButton></Tooltip>
               <Tooltip title="Board view"><ToggleButton value="board"><ViewColumnRounded sx={{ fontSize: 18 }} /></ToggleButton></Tooltip>
               <Tooltip title="List view"><ToggleButton value="list"><TableRowsRounded sx={{ fontSize: 18 }} /></ToggleButton></Tooltip>
@@ -1358,7 +1365,14 @@ export default function PipelineSection() {
           touchAction: singleStageBoard ? 'pan-y' : 'auto',
         }}
       >
-        {view === 'insights' ? (
+        {view === 'dashboard' ? (
+          <PipelineDashboard
+            deals={deals}
+            stages={stageOptions}
+            lastSyncedLabel={fmtSyncTime(syncSurface.lastSyncedAt, dateTimeSettings)}
+            syncState={syncSurface.state}
+          />
+        ) : view === 'insights' ? (
           <PipelineInsights
             deals={deals}
             stages={stageOptions}
