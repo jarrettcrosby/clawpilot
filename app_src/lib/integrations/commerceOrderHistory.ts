@@ -156,7 +156,10 @@ function assertCollectionLimit(
 }
 
 function strictOptionalTextFact(value: unknown, label: string) {
-  if (value === null || value === undefined) return
+  // Shopify can return an exact empty string for optional String fields such
+  // as an order-line SKU. Treat that provider-valid representation the same
+  // as null while continuing to reject whitespace-only and non-string facts.
+  if (value === null || value === undefined || value === '') return
   if (!exactString(value)) providerResponseInvalid(label)
 }
 

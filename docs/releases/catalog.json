@@ -3,23 +3,16 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Commerce order history and Shopify package imports",
-      "summary": "ClawPilot now keeps provider-sourced Shopify and Faire order history, monitors bounded continuous updates, and lets operators import Shopify saved-package CSV files as reviewed packaging drafts.",
+      "title": "Shopify order import reliability",
+      "summary": "ClawPilot now accepts valid Shopify orders with blank optional line fields and no longer treats an absent sales-channel requested-delivery date as an import exception.",
       "features": [
-        "A read-only 60-day Shopify order-history backfill with provider lifecycle, shipment, return, and line evidence",
-        "Provider-available Faire order history with five-minute overlap polling and truthful polling-only readiness",
-        "Seven signed core Shopify order signals with exact order reads and a scheduled polling backstop",
-        "Per-connection commerce authority and readiness evidence without enabling provider writes",
-        "CSV preview and draft import for Shopify saved packages, including dimensions, empty weight, and default-package evidence"
+        "Shippable orders without a sales-channel requested-delivery date keep an explicit null date and can continue through review and promotion",
+        "Operators can still add a manual delivery date or versioned default SLA when the workflow needs one"
       ],
       "fixes": [
-        "Shopify order synchronization remains read-only and reports non-exhaustive signal coverage instead of claiming every provider change is webhook-driven",
-        "Faire no longer reports unavailable webhook capability as a realtime failure",
-        "Sensitive tracking and provider-staff evidence expires after the bounded retention window while minimized order history remains",
-        "Packaging materials can be removed safely: unused drafts are deleted and referenced materials are retired",
-        "Retired packaging materials cannot be restored through ordinary edits, imports, or stock updates",
-        "Shopify package imports are tenant-scoped, previewed, idempotent, draft-only, and perform no provider reads or writes",
-        "Shopify setup now exposes the complete required scope string with a reliable clipboard fallback and canonical store-domain handling"
+        "Valid empty Shopify SKU, vendor, and variant-title values no longer fail a 60-day order-history import",
+        "Only a truly absent requested-delivery date is nonblocking; malformed nonempty provider evidence still requires attention",
+        "Normalizer revisions ensure refreshed Shopify and Faire candidates use the corrected delivery-date semantics"
       ]
     }
   }

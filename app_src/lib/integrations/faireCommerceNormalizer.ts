@@ -48,7 +48,7 @@ import {
 } from '@/lib/operations/commerceNormalization'
 
 export const FAIRE_COMMERCE_NORMALIZER_VERSION =
-  'faire-commerce-normalizer-v7' as const
+  'faire-commerce-normalizer-v8' as const
 
 type FaireSource = Readonly<Record<string, unknown>>
 
@@ -1331,15 +1331,24 @@ function normalizeOrder(
   const shipTo = commerceAddressFromRecord(
     order.address ?? order.shipping_address ?? order.ship_to,
   )
-  const deliveryValue = providerDateTime(
-    order.requested_delivery_at
-      ?? order.expected_delivery_at
-      ?? order.ship_after
-      ?? order.expected_ship_date,
-  )
+  const rawDeliveryValue = [
+    order.requested_delivery_at,
+    order.expected_delivery_at,
+    order.ship_after,
+    order.expected_ship_date,
+  ].find((candidate) => (
+    candidate !== null && candidate !== undefined && candidate !== ''
+  ))
+  const deliveryValue = providerDateTime(rawDeliveryValue)
   const requestedDeliveryAt = deliveryValue
     ? availableCommerceField(deliveryValue)
-    : unavailableCommerceField<string>()
+    : unavailableCommerceField<string>(
+        rawDeliveryValue === null
+          || rawDeliveryValue === undefined
+          || rawDeliveryValue === ''
+          ? 'not_requested'
+          : 'not_provided',
+      )
   const lineItemsTruncated = (
     rootTruncated
     || order.items_truncated === true

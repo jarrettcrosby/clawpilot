@@ -2590,7 +2590,6 @@ assert.deepEqual(
     'line_items_truncated',
     'order_already_fulfilled',
     'order_cancelled',
-    'requested_delivery_not_mapped',
     'ship_to_not_ingested',
     'sku_missing',
   ],
@@ -2603,7 +2602,6 @@ assert.deepEqual(
     'customer_resolution_not_evaluated',
     'line_items_empty',
     'non_shippable_order',
-    'requested_delivery_not_mapped',
   ],
 )
 assert.equal(parsedPreview.candidates[0].lineItemsTruncated, true)

@@ -114,7 +114,6 @@ export type ShopifyOrderPreviewGapCode =
   | 'package_profile_missing'
   | 'product_mapping_inactive'
   | 'product_mapping_missing'
-  | 'requested_delivery_not_mapped'
   | 'ship_to_not_ingested'
   | 'sku_missing'
 
@@ -387,7 +386,6 @@ function parseCandidate(
   const gaps = new Set<ShopifyOrderPreviewGapCode>([
     'canonical_import_not_implemented',
     'customer_resolution_not_evaluated',
-    'requested_delivery_not_mapped',
   ])
   if (requiresShipping) gaps.add('ship_to_not_ingested')
   else gaps.add('non_shippable_order')

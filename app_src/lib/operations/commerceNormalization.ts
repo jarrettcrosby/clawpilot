@@ -340,6 +340,7 @@ export type CommerceReadinessCode =
   | 'customer_unavailable'
   | 'delivery_available'
   | 'delivery_decision_required'
+  | 'delivery_not_supplied'
   | 'order_already_fulfilled'
   | 'order_cancellation_state_unknown'
   | 'order_cancelled'
@@ -1389,7 +1390,10 @@ export function buildCommerceReadinessFacts(input: Readonly<{
 
   facts.push(input.requestedDeliveryAt.state === 'available'
     ? fact('delivery', 'delivery_available', false)
-    : fact('delivery', 'delivery_decision_required', true))
+    : input.requestedDeliveryAt.state === 'unavailable'
+        && input.requestedDeliveryAt.reason === 'not_requested'
+      ? fact('delivery', 'delivery_not_supplied', false)
+      : fact('delivery', 'delivery_decision_required', true))
   facts.push(input.canonicalStates.lifecycle === 'cancelled'
     ? fact('cancelled', 'order_cancelled', true)
     : input.canonicalStates.lifecycle === 'unknown'

@@ -7383,13 +7383,21 @@ export default function CommerceIntakeWorkflow({
                                 variant="caption"
                                 color="text.secondary"
                               >
-                                Provider date, explicit UTC instant, or the
-                                versioned default SLA.
+                                Provider date when supplied, optional explicit
+                                UTC instant, or the versioned default SLA.
                               </Typography>
                             </Box>
                           </AccordionSummary>
                           <AccordionDetails>
                             <Stack spacing={1.5}>
+                              {candidate.delivery?.status === 'not_supplied' ? (
+                                <Alert severity="info">
+                                  {providerLabel(provider)} did not supply a
+                                  requested delivery date. This is not an
+                                  exception; leave it unset or optionally add
+                                  a manual date or default SLA.
+                                </Alert>
+                              ) : null}
                               <FormControl fullWidth sx={fieldSx}>
                                 <InputLabel>Delivery decision</InputLabel>
                                 <Select

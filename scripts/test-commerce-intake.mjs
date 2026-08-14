@@ -2225,6 +2225,20 @@ includes(workflowSource, [
   'href="#operations"',
 ], 'Commerce intake activation recovery')
 includes(workflowSource, [
+  "candidate.delivery?.status === 'not_supplied'",
+  'This is not an',
+  'exception; leave it unset or optionally add',
+], 'Missing requested delivery date is not presented as an exception')
+includes(persistenceSource, [
+  "? 'not_supplied'",
+  "candidate.delivery_resolution_state !== 'not_supplied'",
+], 'Missing requested delivery date is nonblocking through staging and promotion')
+assert.doesNotMatch(
+  persistenceSource,
+  /candidate\.provider_requested_delivery_at\s*\?\s*'provider'\s*:\s*candidate\.provider_created_at/u,
+  'Malformed or redacted delivery evidence must not silently use a default SLA',
+)
+includes(workflowSource, [
   'const totalRejectionCount = rejectionSummary?.total ?? rejections.length',
   'Export loaded issues CSV',
   'current provider rejections',
@@ -2872,7 +2886,7 @@ const service = loadTypeScriptModule(
       },
       '@/lib/integrations/faireCommerceNormalizer': {
         FAIRE_COMMERCE_NORMALIZER_VERSION:
-          'faire-commerce-normalizer-v7',
+          'faire-commerce-normalizer-v8',
         normalizeFaireCommerce(source) {
           normalizedSources.faire = source
           if (source.inventories) {
@@ -2920,7 +2934,7 @@ const service = loadTypeScriptModule(
       },
       '@/lib/integrations/shopifyCommerceNormalizer': {
         SHOPIFY_COMMERCE_NORMALIZER_VERSION:
-          'shopify-commerce-normalizer-v4',
+          'shopify-commerce-normalizer-v5',
         normalizeShopifyCommerce(source) {
           normalizedSources.shopify = source
           const result = envelope(
@@ -4885,14 +4899,14 @@ try {
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'faire'
-      && reservation.adapterVersion === 'faire-commerce-normalizer-v7'
+      && reservation.adapterVersion === 'faire-commerce-normalizer-v8'
     )),
     'Faire provider-attempt evidence must record the current normalizer',
   )
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'shopify'
-      && reservation.adapterVersion === 'shopify-commerce-normalizer-v4'
+      && reservation.adapterVersion === 'shopify-commerce-normalizer-v5'
     )),
     'Shopify provider-attempt evidence must record its current normalizer',
   )
