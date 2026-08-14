@@ -6,6 +6,7 @@ import { resolve } from 'node:path'
 const source = readFileSync(resolve(process.cwd(), 'app_src/lib/pipelineProvisioning.ts'), 'utf8')
 const projectionSource = readFileSync(resolve(process.cwd(), 'app_src/lib/crm/workbookProjection.ts'), 'utf8')
 const legacySource = readFileSync(resolve(process.cwd(), 'app_src/lib/pipelineLegacyWorkbook.ts'), 'utf8')
+const rebuildRoute = readFileSync(resolve(process.cwd(), 'app_src/app/api/crm/workbook/rebuild/route.ts'), 'utf8')
 
 for (const tutorialText of [
   'Only the Opportunities tab is operator-editable.',
@@ -134,6 +135,7 @@ const dashboardWrites = source.slice(
   source.indexOf('function googleBorder'),
 )
 assert.match(dashboardWrites, /const interactionTypes = \['Direct Mail', 'LinkedIn', 'Email', 'Call', 'In Person', 'Note', 'Campaign'\]/)
+assert.match(source, /Interactions: \['Priority', 'Type', 'Owner', 'Organization', 'Agent', 'Date', 'Opportunity', 'Contact', 'Notes'\]/)
 assert.match(dashboardWrites, /Interactions!\$C\$5:\$C/)
 assert.match(dashboardWrites, /Interactions!\$G\$5:\$G/)
 assert.match(dashboardWrites, /const forecastStages = \['Closed', 'Closed Delayed', 'Proposal', 'Demo', 'Needs Analysis', 'Qualified Lead', 'Identified Lead'\]/)
@@ -212,6 +214,19 @@ assert.match(projectionSource, /googleSheetsDateTime\(record\.occurredAt\)/)
 assert.match(projectionSource, /timestamp \/ 86_400_000\) \+ 25_569/)
 assert.match(source, /export async function rebuildPipelineGoogleWorkbook/)
 assert.match(source, /pipeline-sheet-retired/)
+assert.match(source, /export async function rebuildPipelineTabsWithRequest/)
+const resetBlock = source.slice(
+  source.indexOf('export async function rebuildPipelineTabsWithRequest'),
+  source.indexOf('function googleColor'),
+)
+assert.match(resetBlock, /addSheet: \{ properties: \{ sheetId: scratchSheetId, title: 'ClawPilot rebuild' \} \}/)
+assert.match(resetBlock, /deleteSheet: \{ sheetId: sheet\.properties\?\.sheetId \}/)
+assert.match(resetBlock, /EXPECTED_TABS\.forEach/)
+assert.match(resetBlock, /await configurePipelineTabsWithRequest/)
+assert.match(legacySource, /export async function rebuildLegacyPipelineTabs/)
+assert.match(rebuildRoute, /isLegacyOwnerSheetPipeline\(pipeline\)/)
+assert.match(rebuildRoute, /await rebuildLegacyPipelineTabs\(previousContext\.sheetId\)/)
+assert.match(rebuildRoute, /await pushDropdownsToSheet\(dropdownCatalog/)
 const rebuildBlock = source.slice(
   source.indexOf('export async function rebuildPipelineGoogleWorkbook'),
   source.indexOf('export async function provisionPipelineGoogleResources'),

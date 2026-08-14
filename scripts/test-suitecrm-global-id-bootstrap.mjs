@@ -104,13 +104,18 @@ assert.match(
 )
 assert.match(
   source,
-  /ensure_global_id_field\('Emails', false, false\);/,
-  'native SuiteCRM Emails receive an API-visible Global ID without unsafe layout rewrites',
+  /ensure_global_id_field\('Emails', true, false\);/,
+  'native SuiteCRM Emails receive a searchable Global ID without unsafe layout rewrites',
 )
 assert.doesNotMatch(
   source,
-  /\$modules = \[[\s\S]*'Emails',[\s\S]*\];/,
-  'Emails is excluded from generic layout and unified-search management',
+  /\$modules = \[[^\]]*'Emails'/,
+  'Emails is excluded from generic layout management',
+)
+assert.match(
+  source,
+  /\$globalSearchModules = \[\.\.\.\$modules, 'Emails'\];[\s\S]*rebuild_and_verify_global_search\(\$globalSearchModules\);[\s\S]*enable_and_verify_global_search_modules\(\[CLAWPILOT_PRODUCT_MODULE, 'Emails'\]\);/,
+  'Emails is indexed and enabled in SuiteCRM global search',
 )
 assert.match(
   entrypoint,

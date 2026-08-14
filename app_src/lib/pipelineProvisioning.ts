@@ -65,7 +65,7 @@ const TAB_HEADERS: Record<(typeof EXPECTED_TABS)[number], string[]> = {
     'Priority', 'Opportunity', 'Owner', 'Organization', 'Status', 'Stage',
     'Loss Reason', 'Source', 'Value', 'Probability', 'Expected Close', 'Notes',
   ],
-  Interactions: ['Priority', 'Interaction', 'Owner', 'Organization', 'Agent', 'Date', 'Opportunity', 'Contact', 'Notes'],
+  Interactions: ['Priority', 'Type', 'Owner', 'Organization', 'Agent', 'Date', 'Opportunity', 'Contact', 'Notes'],
   Calculations: ['Metric', 'Value'],
   Dashboard: ['Metric', 'Value'],
   Dropdowns: ['Owner', 'Product', 'Stage', 'Priority', 'Status', 'Source', 'Loss Reason'],
@@ -2139,6 +2139,48 @@ export async function configurePipelineTabsWithRequest(
 export async function configurePipelineTabs(runtime: GoogleWorkspaceRuntime, sheetId: string) {
   const request: SheetsJsonRequest = (pathname, input) => googleSheetsJson(runtime, pathname, input)
   return configurePipelineTabsWithRequest(request, sheetId, runtime.serviceAccountEmail)
+}
+
+export async function rebuildPipelineTabsWithRequest(
+  request: SheetsJsonRequest,
+  sheetId: string,
+  protectionEditor?: string,
+) {
+  const metadata = await spreadsheetMetadata(request, sheetId)
+  const existingSheets = metadata.sheets || []
+  const managedSheets = existingSheets.filter((sheet) => (
+    typeof sheet.properties?.sheetId === 'number'
+    && EXPECTED_TABS.includes(sheet.properties?.title as (typeof EXPECTED_TABS)[number])
+  ))
+  const unmanagedSheets = existingSheets.filter((sheet) => (
+    !EXPECTED_TABS.includes(sheet.properties?.title as (typeof EXPECTED_TABS)[number])
+  ))
+  const usedIds = new Set(existingSheets.flatMap((sheet) => (
+    typeof sheet.properties?.sheetId === 'number' ? [sheet.properties.sheetId] : []
+  )))
+  let scratchSheetId: number | null = null
+  while (unmanagedSheets.length === 0 && (scratchSheetId === null || usedIds.has(scratchSheetId))) {
+    scratchSheetId = crypto.randomInt(1, 2_000_000_000)
+  }
+  const resetRequests: unknown[] = []
+  if (scratchSheetId !== null) {
+    resetRequests.push({ addSheet: { properties: { sheetId: scratchSheetId, title: 'ClawPilot rebuild' } } })
+  }
+  managedSheets.forEach((sheet) => {
+    resetRequests.push({ deleteSheet: { sheetId: sheet.properties?.sheetId } })
+  })
+  EXPECTED_TABS.forEach((title, index) => {
+    resetRequests.push({ addSheet: { properties: { title, index } } })
+  })
+  if (scratchSheetId !== null) resetRequests.push({ deleteSheet: { sheetId: scratchSheetId } })
+
+  await request(`/v4/spreadsheets/${sheetId}:batchUpdate`, {
+    method: 'POST',
+    body: { requests: resetRequests, includeSpreadsheetInResponse: false },
+    idempotent: false,
+  })
+  await configurePipelineTabsWithRequest(request, sheetId, protectionEditor)
+  return { sheetId, replacedTabs: managedSheets.length }
 }
 
 function googleColor(hex: string) {

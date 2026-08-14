@@ -2,6 +2,7 @@ import { matonFetch } from '@/lib/maton'
 import {
   applyPipelineWorkbookBrandingWithRequest,
   configurePipelineTabsWithRequest,
+  rebuildPipelineTabsWithRequest,
   type SheetsRequestInput,
 } from '@/lib/pipelineProvisioning'
 import type { OrganizationBranding } from '@/lib/organizationBranding'
@@ -44,6 +45,10 @@ async function matonSheetsJson<T>(pathname: string, input: SheetsRequestInput = 
 
 export async function configureLegacyPipelineTabs(sheetId: string) {
   return configurePipelineTabsWithRequest(matonSheetsJson, sheetId)
+}
+
+export async function rebuildLegacyPipelineTabs(sheetId: string) {
+  return rebuildPipelineTabsWithRequest(matonSheetsJson, sheetId)
 }
 
 export async function applyLegacyPipelineWorkbookBranding(

@@ -660,10 +660,10 @@ foreach ($modules as $module) {
     ensure_global_id_field($module);
 }
 
-// Emails accepts DynamicFields through Api/V8, but its legacy list metadata is
-// not compatible with the generic Studio layout writer. Keep the managed field
-// API-visible without rewriting Email detail, list, or search layouts.
-ensure_global_id_field('Emails', false, false);
+// Emails accepts DynamicFields and unified-search metadata, but its legacy list
+// metadata is not compatible with the generic Studio layout writer. Keep the
+// managed field searchable without rewriting Email detail or list layouts.
+ensure_global_id_field('Emails', true, false);
 
 // Users are administered separately from business-record global search, but
 // still need a visible, reportable gu identity for ClawPilot assignment maps.
@@ -673,7 +673,8 @@ ensure_note_occurred_at_field();
 ensure_product_image_field();
 hide_unowned_product_purchases_subpanel();
 
-rebuild_and_verify_global_search($modules);
-enable_and_verify_global_search_modules([CLAWPILOT_PRODUCT_MODULE]);
+$globalSearchModules = [...$modules, 'Emails'];
+rebuild_and_verify_global_search($globalSearchModules);
+enable_and_verify_global_search_modules([CLAWPILOT_PRODUCT_MODULE, 'Emails']);
 
 fwrite(STDOUT, "SuiteCRM Global ID fields, native product image, owned layouts, and search metadata are ready\n");

@@ -1,10 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { importCrmWorkbook } from '@/lib/crm/workbookImport'
 import { projectCrmWorkbook } from '@/lib/crm/workbookProjection'
+import { rebuildLegacyPipelineTabs } from '@/lib/pipelineLegacyWorkbook'
+import { pushDropdownsToSheet } from '@/lib/pipelineDropdownSync'
 import { rebuildPipelineGoogleWorkbook } from '@/lib/pipelineProvisioning'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
+import { readPipelineDropdownCatalogForSpaceInPostgres } from '@/lib/persistence/pipeline'
 import { requireRequestUser } from '@/lib/requestUser'
 import {
+  isLegacyOwnerSheetPipeline,
   PIPELINE_SELECTION_COOKIE,
   requirePipelineSheetContext,
   resolvePipelineSpaceAccess,
@@ -25,7 +29,29 @@ export async function POST(req: NextRequest) {
 
     const previousContext = requirePipelineSheetContext(pipeline)
     const imported = await importCrmWorkbook({ context: previousContext, actorEmail: actor.email })
-    const rebuilt = await rebuildPipelineGoogleWorkbook({ pipelineId: pipeline.id, actorEmail: actor.email })
+    const legacyOwnerSheet = isLegacyOwnerSheetPipeline(pipeline)
+    let rebuilt
+    if (legacyOwnerSheet) {
+      const reset = await rebuildLegacyPipelineTabs(previousContext.sheetId)
+      rebuilt = {
+        pipelineId: pipeline.id,
+        previousSheetId: previousContext.sheetId,
+        sheetId: reset.sheetId,
+        url: `https://docs.google.com/spreadsheets/d/${reset.sheetId}/edit`,
+        replacedTabs: reset.replacedTabs,
+      }
+    } else {
+      rebuilt = await rebuildPipelineGoogleWorkbook({ pipelineId: pipeline.id, actorEmail: actor.email })
+    }
+    if (legacyOwnerSheet) {
+      const dropdownCatalog = await readPipelineDropdownCatalogForSpaceInPostgres(pipeline.id)
+      if (dropdownCatalog) {
+        await pushDropdownsToSheet(dropdownCatalog, {
+          ...previousContext,
+          legacyOwnerFallback: true,
+        })
+      }
+    }
     const projected = await projectCrmWorkbook({
       context: { pipelineId: pipeline.id, sheetId: rebuilt.sheetId },
       actorEmail: actor.email,
