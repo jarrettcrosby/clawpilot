@@ -3,16 +3,17 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Shopify order import reliability",
-      "summary": "ClawPilot now accepts valid Shopify orders with blank optional line fields and no longer treats an absent sales-channel requested-delivery date as an import exception.",
+      "title": "Real Shopify test-order management",
+      "summary": "ClawPilot now has a tightly controlled development lane for real, auditable Shopify order changes while production provider writes remain disabled.",
       "features": [
-        "Shippable orders without a sales-channel requested-delivery date keep an explicit null date and can continue through review and promotion",
-        "Operators can still add a manual delivery date or versioned default SLA when the workflow needs one"
+        "Authorized operators can add one exact Shopify order tag on an allowlisted development sandbox account, including fulfilled test-workflow orders such as order 6600",
+        "Fresh, wholly unfulfilled Shopify test orders can be cancelled or have an existing line quantity decreased or removed after exact provider eligibility checks",
+        "Every provider action uses a five-minute typed confirmation, immutable attempt evidence, exact readback, and read-only reconciliation for uncertain outcomes"
       ],
       "fixes": [
-        "Valid empty Shopify SKU, vendor, and variant-title values no longer fail a 60-day order-history import",
-        "Only a truly absent requested-delivery date is nonblocking; malformed nonempty provider evidence still requires attention",
-        "Normalizer revisions ensure refreshed Shopify and Faire candidates use the corrected delivery-date semantics"
+        "Destructive changes require the accepted Shopify revision, matching store currency, coherent staged totals, and no downstream warehouse work",
+        "Planning, reservation, billing, and sandbox execution records cannot race an in-flight Shopify order write",
+        "Unknown or abandoned provider outcomes block further writes and appear in operational health instead of being retried or silently cleared"
       ]
     }
   }

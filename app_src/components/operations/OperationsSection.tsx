@@ -97,6 +97,7 @@ import PrinterConfigurationPanel from '@/components/operations/PrinterConfigurat
 import PackRateReplayPanel from '@/components/operations/PackRateReplayPanel'
 import CartonizationRateEvidencePanel from '@/components/operations/CartonizationRateEvidencePanel'
 import CommerceOrderRevisionManagerPanel from '@/components/operations/CommerceOrderRevisionManagerPanel'
+import ShopifyOrderManagementPanel from '@/components/operations/ShopifyOrderManagementPanel'
 import ReceivingPanel from '@/components/operations/ReceivingPanel'
 import WarehouseSetupPanel from '@/components/operations/WarehouseSetupPanel'
 import OneOffShipmentDialog from '@/components/operations/OneOffShipmentDialog'
@@ -1136,6 +1137,21 @@ function OrderDetailDrawer({
                 {order.shipTo.name} · {order.shipTo.line1}{order.shipTo.line2 ? `, ${order.shipTo.line2}` : ''}, {order.shipTo.city}, {order.shipTo.region} {order.shipTo.postalCode}
               </Typography>
             </DetailSection>
+
+            {order.sourceProvider === 'shopify' && (
+              <DetailSection title="Provider writes">
+                <ShopifyOrderManagementPanel
+                  orderGlobalId={order.globalId}
+                  orderRowVersion={order.rowVersion}
+                  canManage={canManage}
+                  canExecute={canExecute}
+                  canActivate={canActivate}
+                  disabled={busy}
+                  onBusyChange={onOrderRevisionBusyChange}
+                  onOrderChanged={onOrderRevisionChanged}
+                />
+              </DetailSection>
+            )}
 
             {(order.sourceProvider === 'shopify' || order.sourceProvider === 'faire') && (
               <DetailSection title="Sales-channel revision">
