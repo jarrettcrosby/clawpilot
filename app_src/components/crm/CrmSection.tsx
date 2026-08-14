@@ -61,6 +61,7 @@ import CrmDataTransferDialog from '@/components/crm/CrmDataTransferDialog'
 import ProductIdentityDialog from '@/components/crm/ProductIdentityDialog'
 import ProductImagePanel from '@/components/crm/ProductImagePanel'
 import ProductPackProfilePanel from '@/components/crm/ProductPackProfilePanel'
+import ContextHelp from '@/components/ContextHelp'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { annotateInteractionEventHistory } from '@/lib/crm/interactionHistory.mjs'
@@ -165,6 +166,14 @@ type EditorHistoryItem = {
   fields: Record<string, string>
 }
 type DropdownOption = { active?: boolean; sort_order?: number; label?: string; value?: string }
+type ProductCategory = {
+  id: string
+  parentId: string | null
+  name: string
+  path: string
+  depth: number
+  productCount: number
+}
 
 const DEFAULT_PRIORITIES = ['A+', 'A', 'B', 'C', 'D']
 const LEGACY_CONTACT_OWNER = '__legacy_contact_owner__'
@@ -208,6 +217,17 @@ const ENTITY_LABELS: Record<CrmEntity, string> = {
   meetings: 'Meetings',
   interactions: 'Interactions',
   campaigns: 'Campaigns',
+}
+
+const ENTITY_SINGULAR_LABELS: Record<CrmEntity, string> = {
+  organizations: 'Organization',
+  contacts: 'Contact',
+  leads: 'Lead',
+  opportunities: 'Opportunity',
+  products: 'Product',
+  meetings: 'Meeting',
+  interactions: 'Interaction',
+  campaigns: 'Campaign',
 }
 
 const EMPTY_SUMMARY: CrmSummary = {
@@ -266,6 +286,16 @@ function displayValue(record: RecordValue, key: string, settings: UserDateTimeSe
     })
   }
   return textValue(record, key) || '—'
+}
+
+function interactionCrmRecordLabel(record: RecordValue) {
+  if (textValue(record, 'meetingId')) return 'Meeting (linked)'
+  const suiteCrmModule = textValue(record, 'suiteCrmModule')
+  if (suiteCrmModule === 'Calls') return 'Call'
+  if (suiteCrmModule === 'Meetings') return 'Meeting'
+  if (suiteCrmModule === 'Emails') return 'Email'
+  if (suiteCrmModule === 'Notes') return 'Note'
+  return 'Not projected'
 }
 
 function emailOptedOut(record: RecordValue) {
@@ -441,7 +471,7 @@ function columns(entity: CrmEntity) {
   ] as const
   return [
     ['referenceCode', 'ID'], ['subject', 'Interaction'], ['organizationName', 'Organization'], ['interactionType', 'Type'],
-    ['eventAction', 'Event action'], ['occurredAt', 'Date'], ['agentName', 'Agent'],
+    ['crmRecord', 'CRM record'], ['eventAction', 'Event action'], ['occurredAt', 'Date'], ['agentName', 'Agent'],
   ] as const
 }
 
@@ -491,13 +521,17 @@ function initialFields(
   }
   if (entity === 'opportunities') return {
     name: textValue(source, 'name'), organizationId: textValue(source, 'organizationId'),
-    stage: textValue(source, 'stage'), status: textValue(source, 'status'), value: textValue(source, 'value'),
+    contactIds: recordIdList(source, 'contactIds').join(','),
+    productIds: recordIdList(source, 'productIds').join(','),
+    priority: textValue(source, 'priority'), owner: textValue(source, 'owner'),
+    stage: textValue(source, 'stage'), status: textValue(source, 'status'),
+    lossReason: textValue(source, 'lossReason'), source: textValue(source, 'source'), value: textValue(source, 'value'),
     probability: textValue(source, 'probability'), expectedClose: textValue(source, 'expectedClose'),
     notes: textValue(source, 'notes'),
   }
   if (entity === 'products') return {
     name: textValue(source, 'name'), sku: textValue(source, 'sku'), productType: textValue(source, 'productType') || 'Good',
-    category: textValue(source, 'category'), status: textValue(source, 'status') || 'Active',
+    categoryId: textValue(source, 'categoryId'), category: textValue(source, 'category'), status: textValue(source, 'status') || 'Active',
     price: textValue(source, 'price'), cost: textValue(source, 'cost'),
     currency: textValue(source, 'currency') || (record ? '' : defaultCurrencyCode),
     url: textValue(source, 'url'), active: textValue(source, 'active') || 'true', description: textValue(source, 'description'),
@@ -619,12 +653,21 @@ export default function CrmSection() {
   const [contacts, setContacts] = useState<RecordValue[]>([])
   const [leads, setLeads] = useState<RecordValue[]>([])
   const [opportunities, setOpportunities] = useState<RecordValue[]>([])
+  const [products, setProducts] = useState<RecordValue[]>([])
   const [campaigns, setCampaigns] = useState<RecordValue[]>([])
   const [relatedActivity, setRelatedActivity] = useState<RecordValue[]>([])
   const [campaignRecipients, setCampaignRecipients] = useState<CampaignRecipient[]>([])
   const [relatedActivityLoading, setRelatedActivityLoading] = useState(false)
   const [priorityOptions, setPriorityOptions] = useState<string[]>(DEFAULT_PRIORITIES)
+  const [stageOptions, setStageOptions] = useState<string[]>([])
+  const [statusOptions, setStatusOptions] = useState<string[]>([])
+  const [sourceOptions, setSourceOptions] = useState<string[]>([])
+  const [lossReasonOptions, setLossReasonOptions] = useState<string[]>([])
   const [organizationTypeOptions, setOrganizationTypeOptions] = useState<string[]>(DEFAULT_ORGANIZATION_TYPES)
+  const [productCategories, setProductCategories] = useState<ProductCategory[]>([])
+  const [productCategoryOpen, setProductCategoryOpen] = useState(false)
+  const [productCategoryName, setProductCategoryName] = useState('')
+  const [productCategoryParentId, setProductCategoryParentId] = useState('')
   const [pipelineUsers, setPipelineUsers] = useState<CrmPipelineUser[]>([])
   const [workspaceHierarchy, setWorkspaceHierarchy] = useState<WorkspaceOrganization[]>([])
   const [canManageHierarchy, setCanManageHierarchy] = useState(false)
@@ -824,8 +867,18 @@ export default function CrmSection() {
           .filter(Boolean)
         const priorities = valuesFor('priority')
         const organizationTypes = valuesFor('account_type')
+        const stages = valuesFor('stage')
+        const statuses = valuesFor('status')
+        const sources = valuesFor('source')
+        const lossReasons = valuesFor('loss_reason')
         if (!cancelled && priorities.length > 0) setPriorityOptions(priorities)
         if (!cancelled && organizationTypes.length > 0) setOrganizationTypeOptions(organizationTypes)
+        if (!cancelled) {
+          setStageOptions(stages)
+          setStatusOptions(statuses)
+          setSourceOptions(sources)
+          setLossReasonOptions(lossReasons)
+        }
       } catch {
         // Base CRM catalogs remain usable when the optional Sheet catalog is unavailable.
       }
@@ -854,6 +907,28 @@ export default function CrmSection() {
         if (editorRecord && (editorEntity === 'organizations' || editorEntity === 'contacts')) {
           const opportunityRecords = await loadCrmOptions('opportunities')
           if (!cancelled) setOpportunities(opportunityRecords)
+        }
+        if (editorEntity === 'opportunities') {
+          const [organizationRecords, contactRecords, productRecords] = await Promise.all([
+            loadCrmOptions('organizations'),
+            loadCrmOptions('contacts'),
+            loadCrmOptions('products'),
+          ])
+          if (!cancelled) {
+            setOrganizations(organizationRecords)
+            setContacts(contactRecords)
+            setProducts(productRecords)
+          }
+        }
+        if (editorEntity === 'products') {
+          const response = await fetch('/api/crm/product-categories')
+          const payload = await response.json().catch(() => ({})) as {
+            ok?: boolean
+            error?: string
+            categories?: ProductCategory[]
+          }
+          if (!response.ok || !payload.ok) throw new Error(payload.error || 'Unable to load product categories')
+          if (!cancelled) setProductCategories(payload.categories || [])
         }
         if (['contacts', 'leads', 'meetings', 'interactions'].includes(editorEntity)) {
           const organizationRecords = await loadCrmOptions('organizations')
@@ -934,7 +1009,7 @@ export default function CrmSection() {
     return () => { cancelled = true }
   }, [editorEntity, editorRecord])
 
-  const editable = Boolean(pipeline && pipeline.accessRole !== 'viewer' && entity !== 'opportunities')
+  const editable = Boolean(pipeline && pipeline.accessRole !== 'viewer')
   const canTransfer = Boolean(pipeline && pipeline.accessRole !== 'viewer')
   const canImportCsv = canTransfer && (
     entity === 'organizations'
@@ -943,7 +1018,7 @@ export default function CrmSection() {
     || entity === 'leads'
     || entity === 'opportunities'
   )
-  const editorEditable = Boolean(pipeline && pipeline.accessRole !== 'viewer' && editorEntity !== 'opportunities')
+  const editorEditable = Boolean(pipeline && pipeline.accessRole !== 'viewer')
   const convertedLead = editorEntity === 'leads'
     && Boolean(editorRecord?.convertedContactId || editorRecord?.convertedOpportunityId)
   const recordEditable = editorEditable
@@ -1177,7 +1252,7 @@ export default function CrmSection() {
       setEditorHistory([])
       setNotice(wasConversion
         ? `Lead converted to ${payload.result?.accountReferenceCode}, ${payload.result?.contactReferenceCode}, and ${payload.result?.opportunityReferenceCode}`
-        : `${ENTITY_LABELS[editorEntity].slice(0, -1)} archived`)
+        : `${ENTITY_SINGULAR_LABELS[editorEntity]} archived`)
       await load(entity, query, needsReviewOnly)
     } catch (lifecycleError) {
       setError(lifecycleError instanceof Error ? lifecycleError.message : 'CRM lifecycle action failed')
@@ -1213,6 +1288,14 @@ export default function CrmSection() {
                   agentEmail: interactionAgentEmail,
                   occurredAt,
                 }
+              : editorEntity === 'opportunities'
+                ? {
+                    ...fields,
+                    contactIds: idList(fields.contactIds),
+                    productIds: idList(fields.productIds),
+                    value: Number(fields.value || 0),
+                    probability: Number(fields.probability || 0),
+                  }
               : editorEntity === 'products'
                 ? {
                     ...fields,
@@ -1235,6 +1318,40 @@ export default function CrmSection() {
       await load(entity, query, needsReviewOnly)
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Unable to save CRM record')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function createProductCategory() {
+    const name = productCategoryName.trim()
+    if (!name) return
+    setBusy(true)
+    setError('')
+    try {
+      const response = await fetch('/api/crm/product-categories', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, parentId: productCategoryParentId || null }),
+      })
+      const payload = await response.json().catch(() => ({})) as {
+        ok?: boolean
+        error?: string
+        category?: ProductCategory
+      }
+      if (!response.ok || !payload.ok || !payload.category) {
+        throw new Error(payload.error || 'Unable to create product category')
+      }
+      const category = payload.category
+      setProductCategories((current) => [...current, category]
+        .sort((left, right) => left.path.localeCompare(right.path)))
+      setFields((current) => ({ ...current, categoryId: category.id, category: category.name }))
+      setProductCategoryOpen(false)
+      setProductCategoryName('')
+      setProductCategoryParentId('')
+      setNotice(`Category ${category.path} created`)
+    } catch (categoryError) {
+      setError(categoryError instanceof Error ? categoryError.message : 'Unable to create product category')
     } finally {
       setBusy(false)
     }
@@ -1350,6 +1467,11 @@ export default function CrmSection() {
     } finally {
       setBusy(false)
     }
+  }
+
+  function confirmWorkbookRebuild() {
+    if (!window.confirm('Build a new clean Google Sheet, import current opportunity edits, and keep the existing workbook as a retired backup?')) return
+    void runWorkbookAction('/api/crm/workbook/rebuild', 'Clean workbook created; the previous workbook was kept as a retired backup')
   }
 
   async function updateHierarchyParent(organizationId: string, parentId: string) {
@@ -1592,6 +1714,11 @@ export default function CrmSection() {
                       <RefreshRounded />
                     </IconButton>
                   </Tooltip>
+                  <Tooltip title="Build a clean workbook and retire the current file">
+                    <IconButton aria-label="Rebuild workbook from scratch" disabled={busy} onClick={confirmWorkbookRebuild}>
+                      <SyncAltRounded />
+                    </IconButton>
+                  </Tooltip>
                 </>
               )}
               {editable && (
@@ -1648,7 +1775,17 @@ export default function CrmSection() {
           }}>
             <TableHead>
               <TableRow>
-                {tableColumns.map(([, label]) => <TableCell key={label}>{label}</TableCell>)}
+                {tableColumns.map(([, label]) => <TableCell key={label}>
+                  {label === 'CRM record' ? (
+                    <Stack direction="row" alignItems="center" gap={0.25}>
+                      {label}
+                      <ContextHelp
+                        label="CRM record mapping help"
+                        title="Email maps to SuiteCRM Email, Call maps to Call, and unlinked In Person maps to Meeting. Notes, LinkedIn, and campaign activity remain Notes. A linked meeting uses its canonical Meeting record."
+                      />
+                    </Stack>
+                  ) : label}
+                </TableCell>)}
                 <TableCell width={110}>Sync</TableCell>
               </TableRow>
             </TableHead>
@@ -1708,6 +1845,8 @@ export default function CrmSection() {
                           )
                         : entity === 'opportunities' && key === 'value'
                           ? money(record[key])
+                        : entity === 'interactions' && key === 'crmRecord'
+                          ? interactionCrmRecordLabel(record)
                         : displayValue(record, key, dateTimeSettings)}
                     </TableCell>
                   ))}
@@ -1991,14 +2130,14 @@ export default function CrmSection() {
         <Box sx={{ p: shortLandscape ? 1.5 : 2.5, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1, minWidth: 0 }}>
           <Stack direction="row" alignItems="center" gap={0.5} sx={{ minWidth: 0 }}>
             {editorHistory.length > 0 && (
-              <Tooltip title={`Back to ${ENTITY_LABELS[editorHistory[editorHistory.length - 1].entity].slice(0, -1).toLowerCase()}`}>
-                <IconButton aria-label={`Back to ${ENTITY_LABELS[editorHistory[editorHistory.length - 1].entity].slice(0, -1).toLowerCase()}`} onClick={returnToPreviousEditor} disabled={busy}>
+              <Tooltip title={`Back to ${ENTITY_SINGULAR_LABELS[editorHistory[editorHistory.length - 1].entity].toLowerCase()}`}>
+                <IconButton aria-label={`Back to ${ENTITY_SINGULAR_LABELS[editorHistory[editorHistory.length - 1].entity].toLowerCase()}`} onClick={returnToPreviousEditor} disabled={busy}>
                   <ArrowBackRounded />
                 </IconButton>
               </Tooltip>
             )}
             <Typography variant="h6" fontWeight={700} sx={{ overflowWrap: 'anywhere' }}>
-              {editorRecord ? 'Edit' : 'Add'} {ENTITY_LABELS[editorEntity].slice(0, -1)}
+              {editorRecord ? 'Edit' : 'Add'} {ENTITY_SINGULAR_LABELS[editorEntity]}
             </Typography>
           </Stack>
           <IconButton aria-label="Close editor" onClick={closeEditor} disabled={busy}><CloseRounded /></IconButton>
@@ -2050,9 +2189,9 @@ export default function CrmSection() {
                 </Button>
               )}
               {(editorEntity === 'leads' || editorEntity === 'interactions' || editorEntity === 'campaigns') && (
-                <Tooltip title={`Archive ${ENTITY_LABELS[editorEntity].slice(0, -1).toLowerCase()}`}>
+                <Tooltip title={`Archive ${ENTITY_SINGULAR_LABELS[editorEntity].toLowerCase()}`}>
                   <IconButton
-                    aria-label={`Archive ${ENTITY_LABELS[editorEntity].slice(0, -1).toLowerCase()}`}
+                    aria-label={`Archive ${ENTITY_SINGULAR_LABELS[editorEntity].toLowerCase()}`}
                     color="error"
                     onClick={() => openLifecycleDialog('archive', editorRecord)}
                   >
@@ -2265,12 +2404,70 @@ export default function CrmSection() {
             </TextField>
           </>}
           {editorEntity === 'opportunities' && <>
-            <TextField disabled label="Opportunity" value={fields.name || ''} />
-            <TextField disabled label="Stage" value={fields.stage || ''} />
-            <TextField disabled label="Status" value={fields.status || ''} />
-            <TextField disabled label="Value" value={fields.value || ''} />
-            <TextField disabled label="Probability" value={fields.probability || ''} />
-            <TextField disabled label="Expected close" value={fields.expectedClose || ''} />
+            <TextField disabled={!recordEditable} label="Opportunity" value={fields.name || ''} onChange={(event) => setFields({ ...fields, name: event.target.value })} required />
+            <TextField disabled={!recordEditable} select label="Organization" value={fields.organizationId || ''} onChange={(event) => setFields({ ...fields, organizationId: event.target.value, contactIds: '' })} required>
+              <MenuItem value="">Select organization</MenuItem>
+              {organizations.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'name')}</MenuItem>)}
+            </TextField>
+            <Autocomplete
+              multiple
+              disabled={!recordEditable}
+              options={recordsForOrganization(contacts, fields.organizationId || '')}
+              value={contacts.filter((record) => idList(fields.contactIds).includes(textValue(record, 'id')))}
+              isOptionEqualToValue={(option, value) => textValue(option, 'id') === textValue(value, 'id')}
+              getOptionLabel={(option) => textValue(option, 'fullName') || textValue(option, 'referenceCode')}
+              onChange={(_, selected) => setFields({ ...fields, contactIds: selected.map((record) => textValue(record, 'id')).join(',') })}
+              renderInput={(params) => <TextField {...params} label="Contacts" placeholder="Link contacts" />}
+            />
+            <Autocomplete
+              multiple
+              disabled={!recordEditable}
+              options={products}
+              value={products.filter((record) => idList(fields.productIds).includes(textValue(record, 'id')))}
+              isOptionEqualToValue={(option, value) => textValue(option, 'id') === textValue(value, 'id')}
+              getOptionLabel={(option) => textValue(option, 'name') || textValue(option, 'referenceCode')}
+              onChange={(_, selected) => setFields({ ...fields, productIds: selected.map((record) => textValue(record, 'id')).join(',') })}
+              renderInput={(params) => <TextField {...params} label="Products" placeholder="Select products" />}
+            />
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2}>
+              <TextField fullWidth disabled={!recordEditable} select label="Priority" value={fields.priority || ''} onChange={(event) => setFields({ ...fields, priority: event.target.value })}>
+                <MenuItem value="">Unspecified</MenuItem>
+                {fields.priority && !priorityOptions.includes(fields.priority) ? <MenuItem value={fields.priority}>{fields.priority}</MenuItem> : null}
+                {priorityOptions.map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}
+              </TextField>
+              <TextField fullWidth disabled={!recordEditable} select label="Owner" value={fields.owner || ''} onChange={(event) => setFields({ ...fields, owner: event.target.value })}>
+                <MenuItem value="">Unassigned</MenuItem>
+                {fields.owner && !pipelineUsers.some((user) => user.displayName === fields.owner || user.email === fields.owner) ? <MenuItem value={fields.owner}>{fields.owner} (legacy)</MenuItem> : null}
+                {pipelineUsers.map((user) => <MenuItem key={user.email} value={user.displayName}>{user.displayName} ({user.email})</MenuItem>)}
+              </TextField>
+            </Stack>
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2}>
+              <TextField fullWidth disabled={!recordEditable} select label="Stage" value={fields.stage || ''} onChange={(event) => setFields({ ...fields, stage: event.target.value })}>
+                {fields.stage && !stageOptions.includes(fields.stage) ? <MenuItem value={fields.stage}>{fields.stage} (current)</MenuItem> : null}
+                {stageOptions.map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}
+              </TextField>
+              <TextField fullWidth disabled={!recordEditable} select label="Status" value={fields.status || ''} onChange={(event) => setFields({ ...fields, status: event.target.value })}>
+                {fields.status && !statusOptions.includes(fields.status) ? <MenuItem value={fields.status}>{fields.status} (current)</MenuItem> : null}
+                {statusOptions.map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}
+              </TextField>
+            </Stack>
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2}>
+              <TextField fullWidth disabled={!recordEditable} select label="Source" value={fields.source || ''} onChange={(event) => setFields({ ...fields, source: event.target.value })}>
+                <MenuItem value="">Unspecified</MenuItem>
+                {fields.source && !sourceOptions.includes(fields.source) ? <MenuItem value={fields.source}>{fields.source} (current)</MenuItem> : null}
+                {sourceOptions.map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}
+              </TextField>
+              <TextField fullWidth disabled={!recordEditable} select label="Loss reason" value={fields.lossReason || ''} onChange={(event) => setFields({ ...fields, lossReason: event.target.value })}>
+                <MenuItem value="">None</MenuItem>
+                {fields.lossReason && !lossReasonOptions.includes(fields.lossReason) ? <MenuItem value={fields.lossReason}>{fields.lossReason} (current)</MenuItem> : null}
+                {lossReasonOptions.map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}
+              </TextField>
+            </Stack>
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2}>
+              <TextField fullWidth disabled={!recordEditable} label="Value" type="number" inputProps={{ min: 0, step: '0.01' }} value={fields.value || ''} onChange={(event) => setFields({ ...fields, value: event.target.value })} />
+              <TextField fullWidth disabled={!recordEditable} label="Probability" type="number" inputProps={{ min: 0, max: 100, step: 1 }} value={fields.probability || ''} onChange={(event) => setFields({ ...fields, probability: event.target.value })} />
+            </Stack>
+            <TextField disabled={!recordEditable} label="Expected close" type="date" value={fields.expectedClose || ''} onChange={(event) => setFields({ ...fields, expectedClose: event.target.value })} InputLabelProps={{ shrink: true }} />
           </>}
           {editorEntity === 'products' && <>
             <Stack direction="row" gap={1} alignItems="center">
@@ -2279,14 +2476,15 @@ export default function CrmSection() {
             </Stack>
             {editorRecord ? (
               <Stack spacing={1}>
-                <Typography variant="subtitle2" fontWeight={700}>
-                  Sales channel presence
-                </Typography>
-                <Alert severity="info">
-                  Provider lifecycle is read-only and separate from this
-                  product&apos;s ClawPilot availability. “Source active” does
-                  not by itself prove storefront publication.
-                </Alert>
+                <Stack direction="row" alignItems="center" gap={0.5}>
+                  <Typography variant="subtitle2" fontWeight={700}>
+                    Sales channel presence
+                  </Typography>
+                  <ContextHelp
+                    label="Provider lifecycle help"
+                    title="Provider lifecycle is read-only and separate from this product’s ClawPilot availability. Source active does not by itself prove storefront publication."
+                  />
+                </Stack>
                 {productSalesChannels(editorRecord).map((channel) => (
                   <Box
                     key={channel.id}
@@ -2415,8 +2613,36 @@ export default function CrmSection() {
               <TextField fullWidth disabled={!recordEditable} label="Type" value={fields.productType || ''} onChange={(event) => setFields({ ...fields, productType: event.target.value })} />
             </Stack>
             <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
-              <TextField fullWidth disabled={!recordEditable} label="Category" value={fields.category || ''} onChange={(event) => setFields({ ...fields, category: event.target.value })} />
-              <TextField fullWidth disabled={!recordEditable} label="Status" value={fields.status || ''} onChange={(event) => setFields({ ...fields, status: event.target.value })} />
+              <Stack direction="row" gap={0.5} alignItems="center" sx={{ flex: 1, minWidth: 0 }}>
+                <TextField fullWidth disabled={!recordEditable} select label="Category" value={fields.categoryId || ''} onChange={(event) => {
+                  const selected = productCategories.find((category) => category.id === event.target.value)
+                  setFields({ ...fields, categoryId: selected?.id || '', category: selected?.name || '' })
+                }}>
+                  <MenuItem value="">Uncategorized</MenuItem>
+                  {fields.categoryId && !productCategories.some((category) => category.id === fields.categoryId) ? (
+                    <MenuItem value={fields.categoryId}>{fields.category || 'Current category'}</MenuItem>
+                  ) : null}
+                  {productCategories.map((category) => (
+                    <MenuItem key={category.id} value={category.id} sx={{ pl: 2 + category.depth * 2 }}>
+                      {category.path} ({category.productCount})
+                    </MenuItem>
+                  ))}
+                </TextField>
+                <Tooltip title="Add category">
+                  <span>
+                    <IconButton disabled={!recordEditable} aria-label="Add product category" onClick={() => setProductCategoryOpen(true)}>
+                      <AddRounded />
+                    </IconButton>
+                  </span>
+                </Tooltip>
+              </Stack>
+              <TextField
+                disabled={!recordEditable}
+                label="Status"
+                value={fields.status || ''}
+                onChange={(event) => setFields({ ...fields, status: event.target.value })}
+                sx={{ flex: 1, minWidth: 0 }}
+              />
             </Stack>
             <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
               <TextField fullWidth disabled={!recordEditable} label="Price" type="number" inputProps={{ min: 0, step: '0.01' }} value={fields.price || ''} onChange={(event) => setFields({ ...fields, price: event.target.value })} />
@@ -2644,9 +2870,13 @@ export default function CrmSection() {
               </TextField>
             )}
             {fields.interactionType === 'meeting' && fields.meetingId && (
-              <Alert severity="info">
-                This history entry is linked to a canonical meeting. Its native SuiteCRM activity comes from the meeting record.
-              </Alert>
+              <Stack direction="row" alignItems="center" gap={0.5}>
+                <Typography variant="body2" color="text.secondary">Linked to canonical meeting</Typography>
+                <ContextHelp
+                  label="Linked meeting history help"
+                  title="This history entry does not create a duplicate activity. Its native SuiteCRM activity comes from the linked Meeting record."
+                />
+              </Stack>
             )}
             <TextField disabled={!recordEditable} label="Date" type="datetime-local" value={fields.occurredAt || ''} onChange={(event) => setFields({ ...fields, occurredAt: event.target.value })} InputLabelProps={{ shrink: true }} />
             <TextField
@@ -2887,6 +3117,35 @@ export default function CrmSection() {
           {recordEditable && <Button variant="contained" onClick={saveRecord} disabled={busy}>{busy ? 'Saving…' : 'Save'}</Button>}
         </Stack>
       </Drawer>
+      <Dialog open={productCategoryOpen} onClose={() => { if (!busy) setProductCategoryOpen(false) }} fullWidth maxWidth="sm">
+        <DialogTitle>Add product category</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ pt: 1 }}>
+            <TextField
+              autoFocus
+              label="Category name"
+              value={productCategoryName}
+              inputProps={{ maxLength: 100 }}
+              onChange={(event) => setProductCategoryName(event.target.value)}
+              required
+            />
+            <TextField select label="Parent category" value={productCategoryParentId} onChange={(event) => setProductCategoryParentId(event.target.value)}>
+              <MenuItem value="">Top level</MenuItem>
+              {productCategories.filter((category) => category.depth < 7).map((category) => (
+                <MenuItem key={category.id} value={category.id} sx={{ pl: 2 + category.depth * 2 }}>
+                  {category.path}
+                </MenuItem>
+              ))}
+            </TextField>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setProductCategoryOpen(false)} disabled={busy}>Cancel</Button>
+          <Button variant="contained" onClick={createProductCategory} disabled={busy || !productCategoryName.trim()}>
+            {busy ? 'Creating…' : 'Create'}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   )
 }

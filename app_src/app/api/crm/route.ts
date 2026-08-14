@@ -344,6 +344,7 @@ export async function POST(req: NextRequest) {
           organizationId: organization?.id || null, organizationSuiteCrmId: organization?.suiteCrmId || null,
           contactIds: fields.contactIds === undefined ? undefined : uuidList(fields.contactIds, 'Opportunity contacts'),
           name, organization: organizationName, priority: stringValue(fields.priority, 50), owner: stringValue(fields.owner, 200),
+          productIds: fields.productIds === undefined ? undefined : uuidList(fields.productIds, 'Opportunity products'),
           status: stringValue(fields.status, 100), stage: stringValue(fields.stage, 100), lossReason: stringValue(fields.lossReason, 250),
           source: stringValue(fields.source, 150), value: numberValue(fields.value), probability: numberValue(fields.probability, 0, 100),
           expectedClose: stringValue(fields.expectedClose, 20) || null, notes: stringValue(fields.notes, 10_000),
@@ -386,6 +387,9 @@ export async function POST(req: NextRequest) {
           name,
           sku,
           productType: stringValue(fields.productType, 100) || 'Good',
+          categoryId: fields.categoryId === undefined
+            ? undefined
+            : fields.categoryId ? uuidValue(fields.categoryId, 'Product category') : null,
           category: stringValue(fields.category, 100),
           status: stringValue(fields.status, 100) || 'Active',
           price: numberValue(fields.price),
@@ -565,7 +569,9 @@ export async function POST(req: NextRequest) {
       ? 'Calls'
       : interactionType === 'meeting'
         ? meetingId ? null : 'Meetings'
-        : 'Notes'
+        : interactionType === 'email'
+          ? 'Emails'
+          : 'Notes'
     const nativeActivity = suiteCrmModule === 'Calls' || suiteCrmModule === 'Meetings'
     const activityStatus = nativeActivity
       ? activityStatusValue(fields.activityStatus, 'held')

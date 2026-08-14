@@ -367,8 +367,8 @@ assert.equal(
 )
 assert.equal(
   (crmPersistence.match(/activeCrmRecordSql\('product'\)/g) || []).length,
-  5,
-  'CRM product list, summary, sync summary, and links must exclude archives',
+  6,
+  'CRM product list, category summary, sync summary, and links must exclude archives',
 )
 assert.equal(
   (crmPersistence.match(/activeCrmRecordSql\('customer'\)/g) || []).length,

@@ -16,6 +16,7 @@ type SuiteCrmRecordModule =
   | 'Meetings'
   | 'Notes'
   | 'Calls'
+  | 'Emails'
   | 'Campaigns'
 
 const ENTITY_MODULE: Record<CrmEntity, SuiteCrmRecordModule> = {
@@ -53,6 +54,7 @@ export type SuiteCrmRecordSnapshot = {
 export type SuiteCrmMeetingSnapshot = SuiteCrmRecordSnapshot
 export type SuiteCrmNoteSnapshot = SuiteCrmRecordSnapshot
 export type SuiteCrmCallSnapshot = SuiteCrmRecordSnapshot
+export type SuiteCrmEmailSnapshot = SuiteCrmRecordSnapshot
 export type SuiteCrmAccountContactModule = 'Accounts' | 'Contacts'
 export type SuiteCrmUserMatch = {
   id: string
@@ -388,7 +390,12 @@ function suiteCrmRecordModule(record: SuiteCrmOutboxRecord): SuiteCrmRecordModul
   const explicitModule = record.suiteCrmModule
   if (explicitModule === undefined) return canonicalModule
   if (record.entity === 'interactions') {
-    if (explicitModule === 'Notes' || explicitModule === 'Calls' || explicitModule === 'Meetings') {
+    if (
+      explicitModule === 'Notes'
+      || explicitModule === 'Calls'
+      || explicitModule === 'Meetings'
+      || explicitModule === 'Emails'
+    ) {
       return explicitModule
     }
     throw new Error('SuiteCRM interaction module is invalid')
