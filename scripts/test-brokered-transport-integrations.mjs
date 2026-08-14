@@ -656,11 +656,25 @@ assert.equal((await conflictResponse.json()).code, 'TRANSPORT_IDEMPOTENCY_CONFLI
 assert.equal(database.credential.version, 2)
 assert.equal(credentialWrites.length, 2)
 
+// Model an LTL activation committed by another capability tab. The stale
+// Small Parcel command below intentionally submits only its target mode; the
+// locked server row must preserve LTL instead of trusting browser state.
+database.account.status = 'active'
+database.credential.verificationStatus = 'verified'
+database.credential.verifiedAt = timestamp()
+database.account.configuration.allowedCapabilities = ['ltl_rate']
+database.account.configuration.transportActivation = {
+  small_parcel: { ratingEnabled: false, tenderEnabled: false },
+  ltl: { ratingEnabled: true, tenderEnabled: false },
+}
+database.account.configuration.activationStatus = 'active'
+database.account.configuration.activationBlockers = []
+
 const activationResponse = await route.PATCH(patchRequest({
   action: 'verify-and-activate-rates',
   provider: 'wwex_speedship',
   environment: 'sandbox',
-  ratingModes: ['small_parcel', 'ltl'],
+  ratingModes: ['small_parcel'],
 }))
 assert.equal(activationResponse.status, 200)
 assert.equal(
@@ -686,6 +700,13 @@ assert.deepEqual(
   ['small_parcel_rate', 'ltl_rate'],
 )
 assert.deepEqual(activationPayload.integrations.accounts[0].activationBlockers, [])
+const activationAudit = auditEvents.at(-1)
+assert.deepEqual(plain(activationAudit.payload.requestedRatingModes), ['small_parcel'])
+assert.deepEqual(
+  plain(activationAudit.payload.ratingModes),
+  ['small_parcel', 'ltl'],
+  'Server-side activation must monotonically preserve the other locked WWEX mode',
+)
 assert.ok(
   activationPayload.integrations.accounts[0].tenderActivationBlockers
     .includes('one_off_tender_orchestration_required'),

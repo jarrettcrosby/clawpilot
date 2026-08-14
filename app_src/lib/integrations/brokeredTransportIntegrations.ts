@@ -857,7 +857,29 @@ export async function verifyAndActivateBrokeredTransportRates(input: {
         'TRANSPORT_CREDENTIAL_CHANGED',
       )
     }
-    const allowedCapabilities = ratingModes.map((mode) => (
+    // Preserve a genuinely active WWEX mode from the locked server row. Two
+    // stale capability tabs can verify concurrently; browser state must never
+    // be able to turn off the mode committed by the other transaction.
+    const previouslyActiveRatingModes = provider === 'wwex_speedship'
+      && locked.status === 'active'
+      && locked.verification_status === 'verified'
+      && locked.configuration.activationStatus === 'active'
+      && strings(locked.configuration.activationBlockers).length === 0
+      ? (['small_parcel', 'ltl'] as const).filter((mode) => (
+          modeActivation(locked.configuration, mode).ratingEnabled
+          && strings(locked.configuration.allowedCapabilities).includes(
+            mode === 'small_parcel' ? 'small_parcel_rate' : 'ltl_rate',
+          )
+        ))
+      : []
+    const requestedOrActive = new Set([
+      ...previouslyActiveRatingModes,
+      ...ratingModes,
+    ])
+    const effectiveRatingModes = (['small_parcel', 'ltl'] as const).filter(
+      (mode) => requestedOrActive.has(mode),
+    )
+    const allowedCapabilities = effectiveRatingModes.map((mode) => (
       mode === 'small_parcel' ? 'small_parcel_rate' : 'ltl_rate'
     ))
     const configuration = {
@@ -865,11 +887,11 @@ export async function verifyAndActivateBrokeredTransportRates(input: {
       allowedCapabilities,
       transportActivation: {
         small_parcel: {
-          ratingEnabled: ratingModes.includes('small_parcel'),
+          ratingEnabled: effectiveRatingModes.includes('small_parcel'),
           tenderEnabled: false,
         },
         ltl: {
-          ratingEnabled: ratingModes.includes('ltl'),
+          ratingEnabled: effectiveRatingModes.includes('ltl'),
           tenderEnabled: false,
         },
       },
@@ -916,7 +938,8 @@ export async function verifyAndActivateBrokeredTransportRates(input: {
         provider,
         environment,
         credentialVersion: locked.credential_version,
-        ratingModes,
+        requestedRatingModes: ratingModes,
+        ratingModes: effectiveRatingModes,
         verificationType: verification.verificationType,
       },
     }, client)

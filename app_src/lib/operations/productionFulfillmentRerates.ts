@@ -29,6 +29,10 @@ import {
   acquireTransactionAdvisoryLock,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  assertCommerceOrderRevisionExecutionCurrent,
+  CommerceOrderRevisionGateError,
+} from '@/lib/persistence/commerceOrderRevisions'
 
 type JsonObject = Record<string, unknown>
 type RerateTerminalState = 'succeeded' | 'failed' | 'unknown'
@@ -248,6 +252,24 @@ const PRODUCTION_RERATE_MAX_TTL_MS = 15 * 60 * 1000
 
 function fail(code: string, message: string, status = 409): never {
   throw new ProductionFulfillmentReratePersistenceError(code, message, status)
+}
+
+async function requireCurrentCommerceRevision(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    orderId: string
+    operation: 'rate' | 'select_rate' | 'label'
+  },
+) {
+  try {
+    await assertCommerceOrderRevisionExecutionCurrent(client, input)
+  } catch (error) {
+    if (error instanceof CommerceOrderRevisionGateError) {
+      fail(error.code, error.message, error.status)
+    }
+    throw error
+  }
 }
 
 function canonicalize(value: unknown): unknown {
@@ -980,6 +1002,11 @@ export async function prepareProductionFulfillmentRerateInPostgres(
           404,
         )
       }
+      await requireCurrentCommerceRevision(client, {
+        organizationId,
+        orderId: context.order_id,
+        operation: 'rate',
+      })
       if (
         context.current_activation_state !== 'active'
         || Number(context.current_activation_revision) !== expectedRevision
@@ -2749,6 +2776,11 @@ export async function selectProductionFulfillmentRerateOfferInPostgres(
           409,
         )
       }
+      await requireCurrentCommerceRevision(client, {
+        organizationId,
+        orderId: candidate.order_id,
+        operation: 'select_rate',
+      })
       const integrationResult = await client.query<{
         integration_type: string
         provider: string
@@ -3093,6 +3125,11 @@ export async function loadProductionFulfillmentRerateDispatchContextInPostgres(
     if (!row) {
       fail('OPERATIONS_PRODUCTION_RERATE_SELECTION_NOT_FOUND', 'Rerate selection was not found', 404)
     }
+    await requireCurrentCommerceRevision(client, {
+      organizationId,
+      orderId: row.order_id,
+      operation: 'label',
+    })
     const serverNow = Date.parse(new Date(row.server_now).toISOString())
     if (
       row.result_state !== 'succeeded'

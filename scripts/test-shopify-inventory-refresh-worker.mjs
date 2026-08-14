@@ -189,12 +189,16 @@ assert.match(
 
 let recoveryRow = {
   status: 'dead',
-  last_error_code: 'SHOPIFY_INVENTORY_REFRESH_FAILED',
+  last_error_code: 'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT',
   attempt_count: 8,
   max_attempts: 8,
   available_at: '2026-08-01T12:00:00.000Z',
   completed_at: '2026-08-01T12:05:00.000Z',
   recovered_after_dead: false,
+  affected_orders: [{
+    globalId: 'gor0006603',
+    orderNumber: '#6603',
+  }],
 }
 const recoveryQueries = []
 const recoveryPersistence = loadTypeScriptModule(
@@ -228,11 +232,15 @@ assert.deepEqual(JSON.parse(JSON.stringify(deadRecovery)), {
   automaticSchedulingBlocked: true,
   managerRecoveryRequired: true,
   recoveredAfterDead: false,
-  lastErrorCode: 'SHOPIFY_INVENTORY_REFRESH_FAILED',
+  lastErrorCode: 'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT',
   attemptCount: 8,
   maxAttempts: 8,
   availableAt: '2026-08-01T12:00:00.000Z',
   completedAt: '2026-08-01T12:05:00.000Z',
+  affectedOrders: [{
+    globalId: 'gor0006603',
+    orderNumber: '#6603',
+  }],
 })
 assert.equal(recoveryQueries.length, 1)
 assert.deepEqual(
@@ -252,6 +260,19 @@ includes(recoveryQueries[0].sql, [
   "job.status <> 'dead'",
   "recovered.status = 'succeeded'",
   'recovered.completed_at > job.completed_at',
+  "reservation.reservation_authority = 'provider_commitment'",
+  'JOIN LATERAL (',
+  'ORDER BY plan.version_number DESC, plan.id DESC',
+  "source_order.status = 'released'",
+  "latest_plan.status = 'released'",
+  'operations_shopify_external_fulfillment_reconciliation_required(',
+  'latest_plan.id',
+  'source_level.integration_account_id =',
+  'position.warehouse_id = current.warehouse_id',
+  "job.last_error_code =",
+  "'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT'",
+  'source_order.archived_at IS NULL',
+  'LIMIT 10',
 ], 'Tenant-scoped Shopify inventory dead-fence recovery projection')
 assert.doesNotMatch(
   recoveryQueries[0].sql,
@@ -269,6 +290,27 @@ assert.equal(recoveredState.status, 'dead')
 assert.equal(recoveredState.recoveredAfterDead, true)
 assert.equal(recoveredState.managerRecoveryRequired, false)
 assert.equal(recoveredState.automaticSchedulingBlocked, false)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(recoveredState.affectedOrders)),
+  [],
+  'Recovered jobs must not continue projecting stale affected-order actions',
+)
+
+recoveryRow = {
+  ...recoveryRow,
+  recovered_after_dead: false,
+  affected_orders: [
+    { globalId: '../../orders/6603', orderNumber: '#6603' },
+    { globalId: 'gor0006603', orderNumber: 'bad\u0000number' },
+  ],
+}
+const sanitizedRecovery = await recoveryPersistence
+  .readShopifyInventoryRefreshRecoveryStateFromPostgres(recoveryInput)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(sanitizedRecovery.affectedOrders)),
+  [],
+  'Affected-order links must reject malformed Global IDs and labels',
+)
 
 const signalQueries = []
 const refreshPersistence = loadTypeScriptModule(
@@ -754,12 +796,42 @@ const inventoryPanel = read(
 )
 includes(inventoryPanel, [
   'refreshRecovery?.managerRecoveryRequired',
+  'refreshRecovery?.affectedOrders || []',
+  'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT',
+  'Open order {order.orderNumber}',
+  'onOpenOrder(order.globalId)',
+  'Resolve affected order first',
   'Retry inventory sync',
   'Automatic sync in progress',
   'window.setInterval',
   'automatic scheduling is eligible again',
   'The failed job remains preserved as audit evidence.',
 ], 'Shopify inventory recovery user experience')
+
+const commerceImportsPanel = read(
+  'app_src/components/operations/CommerceImportsPanel.tsx',
+)
+includes(commerceImportsPanel, [
+  'onOpenOrder: (orderGlobalId: string) => void',
+  'onOpenOrder={onOpenOrder}',
+], 'Shopify inventory affected-order navigation handoff')
+
+const operationsSection = read(
+  'app_src/components/operations/OperationsSection.tsx',
+)
+includes(operationsSection, [
+  '<CommerceImportsPanel onOpenOrder={openPickingOrder} />',
+  "const OPERATIONS_ORDER_QUERY = 'operationsOrder'",
+  'OPERATIONS_ORDER_GLOBAL_ID.test(pendingOrderGlobalId)',
+  'const openPickingOrder = (orderGlobalId: string) => {',
+  "if (view === 'orders')",
+  'nextUrl.searchParams.set(OPERATIONS_ORDER_QUERY, orderGlobalId)',
+  'nextUrl.searchParams.delete(OPERATIONS_ORDER_QUERY)',
+  'setSelectedGlobalId(orderGlobalId)',
+  'setSelectedGlobalId(pendingOrderGlobalId)',
+  'setDrawerOpen(true)',
+  "window.location.hash = 'operations'",
+], 'Shopify inventory affected-order Operations drawer navigation')
 
 const job = {
   id: '22222222-2222-4222-8222-222222222222',

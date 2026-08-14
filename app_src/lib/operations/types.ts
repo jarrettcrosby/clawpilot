@@ -66,6 +66,25 @@ export type OperationsExternalFulfillmentReconciliationResult = {
   replayed: boolean
 }
 
+export type OperationsPickHandoffResult = {
+  orderGlobalId: string
+  orderStatus: 'released'
+  previousRowVersion: number
+  rowVersion: number
+  exceptionGlobalId: string
+  assignedTaskCount: number
+  blockedConfirmationIdempotencyKey: string | null
+  providerWrites: 0
+  replayed: boolean
+}
+
+export function canRequestOperationsPickHandoff(capabilities: {
+  canView: boolean
+  canExecute: boolean
+}): boolean {
+  return capabilities.canView && capabilities.canExecute
+}
+
 export type OperationsLabelAttemptState = 'prepared' | 'succeeded' | 'failed' | 'unknown'
 
 export type OperationsSandboxLabelCommandResult = {

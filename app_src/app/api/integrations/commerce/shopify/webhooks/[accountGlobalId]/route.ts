@@ -7,6 +7,10 @@ import {
 import {
   normalizeCommerceAccountGlobalId,
 } from '@/lib/integrations/commerceCredentialCrypto'
+import {
+  isShopifyOrderSignalWebhookTopic,
+  SHOPIFY_ORDER_SIGNAL_MAX_BYTES,
+} from '@/lib/integrations/shopifyOrderWebhook'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 
 export const dynamic = 'force-dynamic'
@@ -35,7 +39,7 @@ function errorResponse(error: unknown) {
   )
 }
 
-async function boundedRequestBody(req: NextRequest) {
+async function boundedRequestBody(req: NextRequest, maximumBytes: number) {
   if (!req.body) return Buffer.alloc(0)
   const reader = req.body.getReader()
   const chunks: Uint8Array[] = []
@@ -44,7 +48,7 @@ async function boundedRequestBody(req: NextRequest) {
     const { done, value } = await reader.read()
     if (done) break
     length += value.byteLength
-    if (length > MAX_WEBHOOK_BYTES) {
+    if (length > maximumBytes) {
       await reader.cancel().catch(() => undefined)
       throw new CommerceIntegrationRequestError(
         'Shopify webhook payload is too large',
@@ -82,9 +86,12 @@ export async function POST(
       )
     }
     const declaredLength = Number(req.headers.get('content-length') || 0)
+    const maximumBytes = isShopifyOrderSignalWebhookTopic(topic)
+      ? SHOPIFY_ORDER_SIGNAL_MAX_BYTES
+      : MAX_WEBHOOK_BYTES
     if (
       Number.isFinite(declaredLength)
-      && declaredLength > MAX_WEBHOOK_BYTES
+      && declaredLength > maximumBytes
     ) {
       throw new CommerceIntegrationRequestError(
         'Shopify webhook payload is too large',
@@ -92,7 +99,7 @@ export async function POST(
         'SHOPIFY_WEBHOOK_TOO_LARGE',
       )
     }
-    const bytes = await boundedRequestBody(req)
+    const bytes = await boundedRequestBody(req, maximumBytes)
     const result = await receiveShopifyWebhook({
       accountGlobalId,
       rawBody: bytes,

@@ -45,6 +45,7 @@ export type ShopifyGraphqlRequest = {
 export type ShopifyCommerceClientOptions = {
   fetchImpl?: typeof fetch
   timeoutMs?: number
+  resolveCanonicalShopDomain?: boolean
 }
 
 export type ShopifyConnectionProbe = {
@@ -60,6 +61,7 @@ export type ShopifyWebhookSubscriptionObservation = {
   providerId: string
   topic: string
   uri: string
+  format: 'JSON'
 }
 
 export type ShopifyWebhookSubscriptionReadiness = {
@@ -557,7 +559,9 @@ const SHOPIFY_WEBHOOK_SUBSCRIPTIONS_QUERY = `query ClawPilotWebhookSubscriptions
       id
       topic
       uri
+      format
     }
+    pageInfo { hasNextPage endCursor }
   }
 }`
 
@@ -663,35 +667,81 @@ export async function discoverShopifyWebhookSubscriptions(
   const requiredTopics = [...new Set(input.topics)].sort()
   const providerTopics = requiredTopics.map(shopifyWebhookTopicEnum)
   const data = await shopifyAdminGraphql<{
-    webhookSubscriptions?: { nodes?: unknown[] }
+    webhookSubscriptions?: unknown
   }>(credential, {
     query: SHOPIFY_WEBHOOK_SUBSCRIPTIONS_QUERY,
     operationName: 'ClawPilotWebhookSubscriptions',
     variables: { topics: providerTopics },
   }, options)
+  const connection = safeRecord(data.webhookSubscriptions)
+  const pageInfo = safeRecord(connection?.pageInfo)
+  if (
+    !connection
+    || !Array.isArray(connection.nodes)
+    || !pageInfo
+    || typeof pageInfo.hasNextPage !== 'boolean'
+    || !(
+      pageInfo.endCursor === null
+      || typeof pageInfo.endCursor === 'string'
+    )
+  ) {
+    throw new ShopifyCommerceClientError(
+      'Shopify returned incomplete webhook subscription evidence',
+      502,
+      'SHOPIFY_WEBHOOK_SUBSCRIPTION_RESPONSE_INVALID',
+    )
+  }
+  if (pageInfo.hasNextPage) {
+    throw new ShopifyCommerceClientError(
+      'Shopify webhook subscription discovery exceeded the bounded profile',
+      409,
+      'SHOPIFY_WEBHOOK_SUBSCRIPTION_DISCOVERY_TRUNCATED',
+    )
+  }
   const observations: ShopifyWebhookSubscriptionObservation[] = []
-  for (const value of data.webhookSubscriptions?.nodes || []) {
+  for (const value of connection.nodes) {
     const node = safeRecord(value)
     if (
       !node
       || typeof node.id !== 'string'
       || typeof node.topic !== 'string'
       || typeof node.uri !== 'string'
+      || node.format !== 'JSON'
       || !/^gid:\/\/shopify\/WebhookSubscription\/[1-9][0-9]*$/.test(node.id)
-    ) continue
+    ) {
+      throw new ShopifyCommerceClientError(
+        'Shopify returned invalid webhook subscription evidence',
+        502,
+        'SHOPIFY_WEBHOOK_SUBSCRIPTION_RESPONSE_INVALID',
+      )
+    }
     const topic = Object.entries(SHOPIFY_WEBHOOK_TOPIC_ENUMS)
       .find(([, providerTopic]) => providerTopic === node.topic)?.[0]
-    if (!topic || !requiredTopics.includes(topic)) continue
-    observations.push({ providerId: node.id, topic, uri: node.uri })
+    if (!topic || !requiredTopics.includes(topic)) {
+      throw new ShopifyCommerceClientError(
+        'Shopify returned unexpected webhook subscription evidence',
+        502,
+        'SHOPIFY_WEBHOOK_SUBSCRIPTION_RESPONSE_INVALID',
+      )
+    }
+    observations.push({
+      providerId: node.id,
+      topic,
+      uri: node.uri,
+      format: 'JSON',
+    })
   }
   observations.sort((left, right) => left.topic.localeCompare(right.topic)
     || left.providerId.localeCompare(right.providerId))
   const missingTopics = requiredTopics.filter((topic) =>
     !observations.some((observation) =>
       observation.topic === topic && observation.uri === desiredUri))
-  const conflictingTopics = requiredTopics.filter((topic) =>
-    observations.some((observation) =>
-      observation.topic === topic && observation.uri !== desiredUri))
+  const conflictingTopics = requiredTopics.filter((topic) => {
+    const matching = observations.filter((observation) =>
+      observation.topic === topic)
+    return matching.length !== 1
+      || matching.some((observation) => observation.uri !== desiredUri)
+  })
   return {
     desiredUri,
     requiredTopics,
@@ -787,11 +837,21 @@ export async function probeShopifyConnection(
       'SHOPIFY_PROBE_INVALID',
     )
   }
-  if (shopDomain !== requestedDomain || !installation) {
+  if (!installation) {
     throw new ShopifyCommerceClientError(
       'Shopify returned invalid store identity data',
       502,
       'SHOPIFY_PROBE_INVALID',
+    )
+  }
+  if (
+    shopDomain !== requestedDomain
+    && options.resolveCanonicalShopDomain !== true
+  ) {
+    throw new ShopifyCommerceClientError(
+      'Shopify returned a different canonical store domain',
+      409,
+      'SHOPIFY_CANONICAL_DOMAIN_REQUIRED',
     )
   }
 

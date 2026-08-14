@@ -1,6 +1,7 @@
 @preconcurrency import AVFoundation
 import ImageIO
 import SwiftUI
+import WatchKit
 import WatchConnectivity
 import ClawPilotPickingCore
 
@@ -37,6 +38,19 @@ private struct WatchPickView: View {
         }
         .containerBackground(.black.gradient, for: .navigation)
         .onAppear { model.activate() }
+        .sheet(isPresented: $model.showCountEntry) {
+            if let current = model.snapshot?.current,
+               current.workflowStage == .count,
+               let token = current.stageContextToken {
+                WatchCountEntryView(
+                    requiredCount: Int(current.quantity),
+                    status: model.actionStatus,
+                    isSubmitting: model.isCommandPending,
+                    onSubmit: { model.submitCount($0, contextToken: token) },
+                    onCancel: { model.dismissCountEntry(contextToken: token) }
+                )
+            }
+        }
     }
 
     private var brandHeader: some View {
@@ -119,14 +133,39 @@ private struct WatchPickView: View {
             .font(.caption)
             .foregroundStyle(.secondary)
 
-            Button {
-                model.send(.requestMetaScan)
-            } label: {
-                Label("Scan with glasses", systemImage: "eyeglasses")
+            if current.workflowStage == .productReady,
+               let token = current.stageContextToken {
+                Button {
+                    model.beginProductScan(contextToken: token)
+                } label: {
+                    Label("Scan product", systemImage: "barcode.viewfinder")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color.orange)
+                .disabled(!model.isReachable || model.isCommandPending)
+                Text("Location verified. Start the product scan deliberately when it is in hand.")
+                    .font(.caption2)
+                    .foregroundStyle(Color.orange)
+            } else if current.workflowStage == .count,
+                      let token = current.stageContextToken {
+                Button {
+                    model.presentCountEntry(contextToken: token)
+                } label: {
+                    Label("Enter picked count", systemImage: "number.square.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color.orange)
+                .disabled(model.isCommandPending)
+            } else {
+                Button {
+                    model.send(.requestMetaScan)
+                } label: {
+                    Label("Scan with glasses", systemImage: "eyeglasses")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color.blue)
+                .disabled(!model.isReachable || model.isCommandPending)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(Color.blue)
-            .disabled(!model.isReachable || model.isCommandPending)
 
             HStack {
                 Button {
@@ -234,6 +273,64 @@ private struct WatchPickView: View {
     }
 }
 
+private struct WatchCountEntryView: View {
+    let requiredCount: Int
+    let status: String
+    let isSubmitting: Bool
+    let onSubmit: (Int) -> Void
+    let onCancel: () -> Void
+    @State private var enteredCount: Int
+
+    init(
+        requiredCount: Int,
+        status: String,
+        isSubmitting: Bool,
+        onSubmit: @escaping (Int) -> Void,
+        onCancel: @escaping () -> Void
+    ) {
+        self.requiredCount = requiredCount
+        self.status = status
+        self.isSubmitting = isSubmitting
+        self.onSubmit = onSubmit
+        self.onCancel = onCancel
+        // Never prefill the authority value: the picker must deliberately
+        // punch in what was physically picked.
+        _enteredCount = State(initialValue: 1)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 10) {
+                Text("Picked quantity")
+                    .font(.headline)
+                Text("Required: \(requiredCount)")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Stepper(
+                    "Picked \(enteredCount)",
+                    value: $enteredCount,
+                    in: 1...max(requiredCount * 2, requiredCount + 10)
+                )
+                .font(.title3.monospacedDigit().weight(.bold))
+                Text("Turn the Digital Crown or use + and −.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                if !status.isEmpty {
+                    Text(status)
+                        .font(.caption2)
+                        .foregroundStyle(status.contains("under") || status.contains("over") ? .red : .secondary)
+                }
+                Button("Verify count") { onSubmit(enteredCount) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isSubmitting)
+                Button("Cancel", role: .cancel) { onCancel() }
+                    .disabled(isSubmitting)
+            }
+            .padding(.horizontal, 4)
+        }
+    }
+}
+
 @MainActor
 final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpeechSynthesizerDelegate {
     private enum Key {
@@ -250,6 +347,7 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
     @Published private(set) var isSpeaking = false
     @Published private(set) var actionStatus = ""
     @Published private(set) var lastActionSucceeded: Bool?
+    @Published var showCountEntry = false
 
     private let snapshotDefaultsKey = "clawpilot.pick.snapshot.v1"
     private let imageSourceDefaultsKey = "clawpilot.pick.image.source.v1"
@@ -258,6 +356,7 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
     private var pendingCommandID: String?
     private var pendingAction: WatchPickAction?
     private var commandTimeoutTask: Task<Void, Never>?
+    private var dismissedCountContextToken: String?
 
     override init() {
         super.init()
@@ -287,6 +386,10 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
     }
 
     func send(_ action: WatchPickAction) {
+        send(WatchPickCommand(action: action))
+    }
+
+    private func send(_ command: WatchPickCommand) {
         guard !isCommandPending else {
             actionStatus = "Wait for the current iPhone action to finish."
             return
@@ -294,12 +397,16 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
         guard let session,
               session.activationState == .activated,
               session.isReachable else {
+            let message = "The paired iPhone is no longer reachable."
+            isReachable = session?.isReachable == true
+            if command.action == .readInstruction {
+                playInstructionLocally(fallbackReason: message)
+                return
+            }
             actionStatus = "Open ClawPilot on the paired iPhone, then try again."
             lastActionSucceeded = false
-            isReachable = session?.isReachable == true
             return
         }
-        let command = WatchPickCommand(action: action)
         guard let data = try? JSONEncoder().encode(command) else {
             actionStatus = "The Watch command could not be prepared."
             lastActionSucceeded = false
@@ -307,10 +414,10 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
         }
 
         pendingCommandID = command.id
-        pendingAction = action
+        pendingAction = command.action
         isCommandPending = true
         lastActionSucceeded = nil
-        actionStatus = Self.pendingMessage(for: action)
+        actionStatus = Self.pendingMessage(for: command.action)
         startCommandTimeout(for: command)
 
         // WCSession runs reply and error blocks on its own operation queue. A
@@ -319,9 +426,20 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
         // main actor. The iPhone already returns the authoritative typed result
         // through WatchPickCommandResult, so an inline reply is redundant.
         let commandID = command.id
+        let commandAction = command.action
         let errorHandler: @Sendable (Error) -> Void = { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.pendingCommandID == commandID else { return }
+                if commandAction == .readInstruction {
+                    self.finishPendingCommand(
+                        succeeded: false,
+                        message: "The iPhone audio route was unavailable."
+                    )
+                    self.playInstructionLocally(
+                        fallbackReason: "The iPhone audio route was unavailable."
+                    )
+                    return
+                }
                 self.finishPendingCommand(
                     succeeded: false,
                     message: "The iPhone did not receive the command. Open ClawPilot and try again."
@@ -332,14 +450,58 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
         session.sendMessageData(data, replyHandler: nil, errorHandler: errorHandler)
     }
 
+    func beginProductScan(contextToken: String) {
+        send(WatchPickCommand(
+            action: .beginProductScan,
+            stageContextToken: contextToken
+        ))
+    }
+
+    func presentCountEntry(contextToken: String) {
+        dismissedCountContextToken = nil
+        guard snapshot?.current?.stageContextToken == contextToken else { return }
+        showCountEntry = true
+    }
+
+    func dismissCountEntry(contextToken: String) {
+        dismissedCountContextToken = contextToken
+        showCountEntry = false
+        actionStatus = "Product remains matched. Reopen the count popup to finish."
+    }
+
+    func submitCount(_ enteredCount: Int, contextToken: String) {
+        send(WatchPickCommand(
+            action: .submitCount,
+            enteredCount: enteredCount,
+            stageContextToken: contextToken
+        ))
+    }
+
     func readInstruction() {
-        guard let snapshot, let current = snapshot.current else {
+        guard let snapshot, snapshot.current != nil else {
             actionStatus = "No current pick instruction is available."
             lastActionSucceeded = false
             return
         }
-        if snapshot.readInstructionOnPhone == true, session?.isReachable == true {
-            send(.readInstruction)
+        let playbackTarget = WatchInstructionPlaybackTarget.resolve(
+            prefersPairedIPhone: snapshot.readInstructionOnPhone == true,
+            pairedIPhoneIsReachable: session?.isReachable == true
+        )
+        if playbackTarget == .pairedIPhone {
+            send(WatchPickCommand(
+                action: .readInstruction,
+                phonePlaybackStartDeadline:
+                    WatchInstructionPlaybackTiming.phonePlaybackStartDeadline()
+            ))
+            return
+        }
+        playInstructionLocally()
+    }
+
+    private func playInstructionLocally(fallbackReason: String? = nil) {
+        guard let snapshot, let current = snapshot.current else {
+            actionStatus = "No current pick instruction is available."
+            lastActionSucceeded = false
             return
         }
         guard !speech.isSpeaking, !isSpeaking else {
@@ -362,17 +524,34 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
         utterance.rate = 0.48
         isSpeaking = true
         lastActionSucceeded = nil
-        actionStatus = "Playing instruction on Apple Watch."
+        if let fallbackReason {
+            actionStatus = "\(fallbackReason) Playing on Apple Watch instead."
+        } else {
+            actionStatus = "Playing instruction on Apple Watch."
+        }
         speech.speak(utterance)
     }
 
     private func startCommandTimeout(for command: WatchPickCommand) {
         commandTimeoutTask?.cancel()
+        let timeout: Duration = switch command.action {
+        case .requestMetaScan: .seconds(35)
+        case .readInstruction: .seconds(
+            Int64(WatchInstructionPlaybackTiming.watchFallbackDelay)
+        )
+        default: .seconds(15)
+        }
         commandTimeoutTask = Task { [weak self] in
-            try? await Task.sleep(for: command.action == .requestMetaScan ? .seconds(35) : .seconds(15))
+            try? await Task.sleep(for: timeout)
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard let self, self.pendingCommandID == command.id else { return }
+                if command.action == .readInstruction {
+                    let message = "The iPhone audio request timed out."
+                    self.finishPendingCommand(succeeded: false, message: message)
+                    self.playInstructionLocally(fallbackReason: message)
+                    return
+                }
                 self.finishPendingCommand(
                     succeeded: false,
                     message: "The iPhone action is taking too long. Keep ClawPilot open and try again."
@@ -406,12 +585,24 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
         snapshot = decoded
         restoreProductImageIfCurrent()
 
+        let countToken = decoded.current?.workflowStage == .count
+            ? decoded.current?.stageContextToken
+            : nil
+        showCountEntry = countToken != nil && countToken != dismissedCountContextToken
+        if countToken == nil { dismissedCountContextToken = nil }
+
         if pendingAction == .refreshQueue {
             finishPendingCommand(
                 succeeded: true,
                 message: decoded.current == nil
                     ? "Picks refreshed. No item is currently assigned."
                     : "Picks refreshed. The current item is ready."
+            )
+        } else if pendingAction == .requestMetaScan,
+                  decoded.current?.workflowStage == .productReady {
+            finishPendingCommand(
+                succeeded: true,
+                message: "Location matched. Tap Scan product when ready."
             )
         } else if actionStatus.isEmpty {
             actionStatus = "Pick synced from iPhone."
@@ -432,6 +623,20 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
               result.schemaVersion == 1,
               result.commandId == pendingCommandID else { return }
         finishPendingCommand(succeeded: result.succeeded, message: result.message)
+        if result.action == .readInstruction, !result.succeeded {
+            playInstructionLocally(fallbackReason: result.message)
+            return
+        }
+        if result.action == .submitCount {
+            if result.succeeded {
+                showCountEntry = false
+                dismissedCountContextToken = nil
+                WKInterfaceDevice.current().play(.success)
+            } else {
+                showCountEntry = true
+                WKInterfaceDevice.current().play(.failure)
+            }
+        }
     }
 
     private func applyContext(_ context: [String: Any]) {
@@ -507,9 +712,11 @@ final class WatchPickModel: NSObject, ObservableObject, WCSessionDelegate, AVSpe
     private static func pendingMessage(for action: WatchPickAction) -> String {
         switch action {
         case .requestMetaScan: "Starting the glasses scan…"
-        case .readInstruction: "Starting instruction audio…"
+        case .readInstruction: "Preparing enhanced audio on the paired iPhone…"
         case .confirmPick: "Confirming picks…"
         case .refreshQueue: "Refreshing picks…"
+        case .beginProductScan: "Arming the product scan…"
+        case .submitCount: "Verifying picked quantity…"
         }
     }
 

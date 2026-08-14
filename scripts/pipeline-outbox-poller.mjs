@@ -20,7 +20,6 @@ const commerceProductImageImportIntervalMs = Math.max(5000, Math.min(Number(proc
 const commerceFulfillmentRecoveryIntervalMs = Math.max(5000, Math.min(Number(process.env.COMMERCE_FULFILLMENT_RECOVERY_POLL_MS || 60000), 300000))
 const commerceCatalogEnabled = String(process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED || '0') === '1'
 const shopifyInventoryRefreshEnabled = commerceCatalogEnabled
-const commerceOrderReconciliationEnabled = commerceCatalogEnabled
 const commerceProductImageImportEnabled = commerceCatalogEnabled
 const commerceFulfillmentRecoveryEnabled = String(process.env.CLAWPILOT_COMMERCE_FULFILLMENT_RECOVERY_ENABLED || '0') === '1'
 const repositoryIntervalMs = Math.max(1000, Math.min(Number(process.env.REPOSITORY_RUNNER_POLL_MS || 5000), 300000))
@@ -83,9 +82,7 @@ await Promise.all([
   ...(shopifyInventoryRefreshEnabled
     ? [runLoop('shopify-inventory-refresh', '/api/integrations/commerce/inventory/process', 2, shopifyInventoryRefreshIntervalMs)]
     : []),
-  ...(commerceOrderReconciliationEnabled
-    ? [runLoop('commerce-order-reconciliation', '/api/integrations/commerce/orders/process', 1, commerceOrderReconciliationIntervalMs)]
-    : []),
+  runLoop('commerce-order-reconciliation', '/api/integrations/commerce/orders/process', 1, commerceOrderReconciliationIntervalMs),
   ...(commerceProductImageImportEnabled
     ? [runLoop('commerce-product-images', '/api/integrations/commerce/images/process', 5, commerceProductImageImportIntervalMs)]
     : []),

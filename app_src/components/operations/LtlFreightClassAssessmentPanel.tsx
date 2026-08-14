@@ -15,10 +15,16 @@ import {
   Chip,
   CircularProgress,
   FormControlLabel,
+  MenuItem,
   Stack,
   TextField,
   Typography,
 } from '@mui/material'
+import {
+  packageCatalogEntries,
+  packageCatalogEntry,
+  type PackageCatalogEntryId,
+} from '@/lib/operations/packageCatalog'
 
 type ClassificationInput = {
   handlingUnitKey: string
@@ -72,6 +78,7 @@ const BLOCKER_LABELS: Record<string, string> = {
 }
 
 type Draft = {
+  catalogEntryId: PackageCatalogEntryId
   handlingUnitKey: string
   description: string
   lengthMm: string
@@ -89,10 +96,13 @@ type Draft = {
 }
 
 const INITIAL_DRAFT: Draft = {
+  catalogEntryId: 'pallet_48x40',
+  // Internal assessment correlation only. It must not encode the prefill
+  // catalog choice because that choice is deliberately not attested.
   handlingUnitKey: 'proposed-pallet-1',
-  description: 'Proposed one-off LTL pallet',
-  lengthMm: '',
-  widthMm: '',
+  description: '48 × 40 in pallet',
+  lengthMm: '1219',
+  widthMm: '1016',
   heightMm: '',
   grossWeightGrams: '',
   mixedCommodities: false,
@@ -104,6 +114,13 @@ const INITIAL_DRAFT: Draft = {
   nmfcCode: '',
   attestation: '',
 }
+
+// The assessment persists physical pallet facts, not a carrier booking. Keep
+// its selectable set to common ClawPilot pallet footprints.
+const LTL_HANDLING_UNIT_OPTIONS = packageCatalogEntries({
+  usage: 'ltl_handling_unit',
+  includeCanonical: true,
+})
 
 async function postClassification(
   body: Record<string, unknown>,
@@ -141,7 +158,33 @@ export default function LtlFreightClassAssessmentPanel() {
     setError('')
   }
 
+  function chooseHandlingUnit(catalogEntryId: PackageCatalogEntryId) {
+    const entry = packageCatalogEntry(catalogEntryId)
+    if (!entry || !entry.usages.includes('ltl_handling_unit')) return
+    setDraft((current) => ({
+      ...current,
+      catalogEntryId,
+      description: entry.label,
+      lengthMm: entry.defaultDimensionsMm.length === null
+        ? ''
+        : String(entry.defaultDimensionsMm.length),
+      widthMm: entry.defaultDimensionsMm.width === null
+        ? ''
+        : String(entry.defaultDimensionsMm.width),
+      heightMm: entry.defaultDimensionsMm.height === null
+        ? ''
+        : String(entry.defaultDimensionsMm.height),
+    }))
+    setAssessment(null)
+    setAssessmentGlobalId('')
+    setIdempotencyKey('')
+    setError('')
+  }
+
   function classificationInput(): ClassificationInput {
+    // catalogEntryId is intentionally a UI prefill choice, not attested
+    // evidence. Operators may edit every physical fact after choosing a
+    // footprint; the immutable assessment seals those final facts instead.
     return {
       handlingUnitKey: draft.handlingUnitKey,
       description: draft.description,
@@ -221,25 +264,27 @@ export default function LtlFreightClassAssessmentPanel() {
       </AccordionSummary>
       <AccordionDetails>
         <Stack spacing={2}>
-          <Alert severity="info">
-            Enter the proposed pallet&apos;s greatest exterior dimensions and actual
-            gross weight, including the pallet. The result is a density-based class
-            candidate—not an NMFC item lookup—and does not add LTL rates to this
-            parcel quote yet.
-          </Alert>
-
           <Box sx={{
             display: 'grid',
             gridTemplateColumns: { xs: '1fr', md: '1fr 1.6fr' },
             gap: 2,
           }}>
             <TextField
+              data-testid="ltl-handling-unit-select"
+              select
               required
-              label="Pallet key"
-              value={draft.handlingUnitKey}
-              onChange={(event) => update('handlingUnitKey', event.target.value)}
-              inputProps={{ maxLength: 120 }}
-            />
+              label="Pallet footprint preset (prefill only)"
+              value={draft.catalogEntryId}
+              onChange={(event) => chooseHandlingUnit(
+                event.target.value as PackageCatalogEntryId,
+              )}
+            >
+              {LTL_HANDLING_UNIT_OPTIONS.map((entry) => (
+                <MenuItem key={entry.id} value={entry.id}>
+                  {entry.label}
+                </MenuItem>
+              ))}
+            </TextField>
             <TextField
               required
               label="Commodity / pallet description"

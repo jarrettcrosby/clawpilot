@@ -16,6 +16,8 @@ import StorefrontRounded from '@mui/icons-material/StorefrontRounded'
 import CommerceIntakeWorkflow from '@/components/settings/CommerceIntakeWorkflow'
 import ShopifyInventoryPanel from '@/components/operations/ShopifyInventoryPanel'
 import CartonizationRateEvidencePanel from '@/components/operations/CartonizationRateEvidencePanel'
+import CommerceAuthoritySummaryPanel from '@/components/operations/CommerceAuthoritySummaryPanel'
+import CommerceOrderHistoryPanel from '@/components/operations/CommerceOrderHistoryPanel'
 
 type CommerceProvider = 'shopify' | 'faire'
 
@@ -51,7 +53,11 @@ function humanize(value: string) {
     .replace(/\b\w/g, (letter) => letter.toUpperCase())
 }
 
-export default function CommerceImportsPanel() {
+export default function CommerceImportsPanel({
+  onOpenOrder,
+}: {
+  onOpenOrder: (orderGlobalId: string) => void
+}) {
   const [payload, setPayload] = useState<CommercePayload | null>(null)
   const [selectedAccountGlobalId, setSelectedAccountGlobalId] = useState('')
   const [requestedAccountGlobalId, setRequestedAccountGlobalId] = useState('')
@@ -273,10 +279,27 @@ export default function CommerceImportsPanel() {
                 canManage={payload.canManage === true}
                 canActivate={payload.canActivate === true}
               />
+              {payload.canManage === true ? (
+                <>
+                  <CommerceAuthoritySummaryPanel
+                    key={`authority:${selectedAccount.globalId}`}
+                    accountGlobalId={selectedAccount.globalId}
+                    provider={selectedAccount.provider}
+                  />
+                  <CommerceOrderHistoryPanel
+                    key={`history:${selectedAccount.globalId}`}
+                    accountGlobalId={selectedAccount.globalId}
+                    provider={selectedAccount.provider}
+                    canManage
+                    onOpenOrder={onOpenOrder}
+                  />
+                </>
+              ) : null}
               {selectedAccount.provider === 'shopify' ? (
                 <ShopifyInventoryPanel
                   accountGlobalId={selectedAccount.globalId}
                   displayName={selectedAccount.displayName}
+                  onOpenOrder={onOpenOrder}
                 />
               ) : null}
             </>

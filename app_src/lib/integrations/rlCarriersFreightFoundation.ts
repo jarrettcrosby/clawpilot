@@ -11,6 +11,17 @@ import { createHash } from 'node:crypto'
 
 export const RL_CARRIERS_FREIGHT_PROVIDER = 'rl_carriers' as const
 
+// The public Swagger contract permits a free-text item package value. These
+// are the only package/handling codes confirmed by the supplied request
+// examples and current deterministic adapter tests; catalog callers must not
+// infer additional R+L mappings from that free-text field.
+export const RL_CARRIERS_CONFIRMED_HANDLING_UNIT_TYPES = Object.freeze([
+  'PLT',
+] as const)
+export const RL_CARRIERS_CONFIRMED_ITEM_PACKAGE_TYPES = Object.freeze([
+  'CTN',
+] as const)
+
 export const RL_CARRIERS_EXECUTING_CARRIER = Object.freeze({
   code: 'RL_CARRIERS',
   name: 'R+L Carriers',

@@ -94,6 +94,29 @@ struct PickingDashboardView: View {
         } message: {
             Text("ClawPilot will immediately return to Apple speech. You can download the enhanced voice again later.")
         }
+        .alert(
+            "Request manager handoff?",
+            isPresented: $model.showPickHandoffConfirmation
+        ) {
+            TextField("Reason for manager", text: $model.pickHandoffReason)
+            Button("Request handoff", role: .destructive) {
+                Task { await model.submitPickHandoff() }
+            }
+            .disabled(
+                model.pickHandoffReason
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty
+            )
+            Button("Cancel", role: .cancel) {
+                model.pickHandoffReason = ""
+            }
+        } message: {
+            Text("The current order will be unassigned and sent to a manager exception. ClawPilot will preserve the order, inventory, reservations, and any external provider state.")
+        }
+        .onChange(of: model.pickHandoffReason) { _, reason in
+            let bounded = String(reason.prefix(500))
+            if bounded != reason { model.pickHandoffReason = bounded }
+        }
     }
 
     private var header: some View {
@@ -239,22 +262,89 @@ struct PickingDashboardView: View {
                         .buttonStyle(.plain)
                         .foregroundStyle(PickingTheme.primary)
                         .background(PickingTheme.primary.opacity(0.1), in: Circle())
-                        .disabled(model.isQueueBusy)
+                        .disabled(model.isQueueBusy || model.hasPendingConfirmation)
                         .accessibilityLabel("Refresh assigned picks")
                     }
                 }
 
-                if model.hasPendingConfirmation {
+                if model.hasPendingPickHandoff {
                     statePanel(
-                        icon: "exclamationmark.shield.fill",
-                        color: PickingTheme.danger,
-                        title: "Confirmation needs attention",
-                        detail: "New work is blocked until the exact prior command is reconciled."
+                        icon: "person.2.badge.gearshape.fill",
+                        color: Color.orange,
+                        title: "Manager handoff pending",
+                        detail: model.pendingPickHandoffDetail
+                            ?? "The exact audited handoff request is saved on this iPhone."
                     )
-                    Button("Retry exact confirmation") {
-                        Task { await model.retryPendingConfirmation() }
+                    Button {
+                        Task { await model.retryPendingPickHandoff() }
+                    } label: {
+                        HStack(spacing: 8) {
+                            if model.isRequestingPickHandoff {
+                                ProgressView().tint(PickingTheme.primaryText)
+                            }
+                            Text("Retry exact handoff")
+                        }
+                        .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(PrimaryDashboardButtonStyle())
+                    .disabled(model.isRequestingPickHandoff)
+                    Text("Retry reuses the saved request and idempotency key. This phone will not clear the pick from a missing queue row alone.")
+                        .font(.caption)
+                        .foregroundStyle(PickingTheme.muted)
+                } else if model.hasPendingConfirmation {
+                    if model.pendingConfirmationIdentityMismatch {
+                        statePanel(
+                            icon: "person.crop.circle.badge.exclamationmark",
+                            color: PickingTheme.danger,
+                            title: "Saved confirmation protected",
+                            detail: model.pendingConfirmationDetail
+                                ?? "ClawPilot cannot safely read or match this confirmation to the signed-in picker."
+                        )
+                        Text("No confirmation was sent. Return to the original picker account and organization, or ask a manager to review the order.")
+                            .font(.caption)
+                            .foregroundStyle(PickingTheme.muted)
+                    } else if model.pendingConfirmationRequiresManagerAction {
+                        statePanel(
+                            icon: "person.badge.shield.checkmark.fill",
+                            color: Color.orange,
+                            title: "Manager reconciliation required",
+                            detail: model.pendingConfirmationDetail
+                                ?? "A manager must reconcile this Shopify order in Operations before picking can continue."
+                        )
+                        Button {
+                            Task { await model.recheckPendingConfirmationAfterManagerAction() }
+                        } label: {
+                            HStack(spacing: 8) {
+                                if model.isRecheckingPendingConfirmation {
+                                    ProgressView().tint(PickingTheme.primaryText)
+                                }
+                                Text("Refresh after manager reconciliation")
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(PrimaryDashboardButtonStyle())
+                        .disabled(model.isRecheckingPendingConfirmation)
+                        Button("Request manager handoff instead") {
+                            model.presentBlockedConfirmationHandoff()
+                        }
+                        .buttonStyle(SecondaryDashboardButtonStyle())
+                        .disabled(model.isRequestingPickHandoff)
+                        Text("Refresh only checks ClawPilot’s read-only reconciliation evidence. It does not change Shopify or repeat a provider action.")
+                            .font(.caption)
+                            .foregroundStyle(PickingTheme.muted)
+                    } else {
+                        statePanel(
+                            icon: "exclamationmark.shield.fill",
+                            color: PickingTheme.danger,
+                            title: "Confirmation needs attention",
+                            detail: "New work is blocked until the exact prior command is reconciled."
+                        )
+                        Button("Retry exact confirmation") {
+                            Task { await model.retryPendingConfirmation() }
+                        }
+                        .buttonStyle(PrimaryDashboardButtonStyle())
+                        .disabled(model.isConfirmingOrder)
+                    }
                 } else if let task = model.currentTask {
                     currentTaskView(task)
                 } else if model.readyToConfirm {
@@ -294,7 +384,7 @@ struct PickingDashboardView: View {
                 )
                 guideStep(1, "Receive work", "A manager waves an order and assigns it to you.")
                 guideStep(2, "Verify location when required", "If your warehouse enables location-first picking, scan the printed location label before the product. ClawPilot never turns this on automatically.")
-                guideStep(3, "Scan the product", "Tap Start Meta scan, then look at the barcode. The same camera session continues from a matched location to its product; nothing is saved.")
+                guideStep(3, "Scan the product", "After the location matches, ClawPilot pauses on that step. Deliberately tap Scan product, then scan with the still-live glasses session or the iPhone camera.")
                 guideStep(4, "Confirm the order", "After every product matches, confirm once to write the audited result to ClawPilot.")
             }
         }
@@ -329,6 +419,19 @@ struct PickingDashboardView: View {
     private func currentTaskView(_ task: PickTask) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             productImage(task.productImageURL, productName: task.productName)
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    if let orderNumber = model.currentOrderNumber {
+                        pickContextChip("Order \(orderNumber)", color: PickingTheme.primary)
+                    }
+                    if let warehouseCode = task.warehouseCode {
+                        pickContextChip(warehouseCode, color: PickingTheme.muted)
+                    }
+                    Spacer(minLength: 0)
+                }
+                currentPickStageChip
+            }
 
             VStack(alignment: .leading, spacing: 4) {
                 Text("GO TO")
@@ -368,7 +471,45 @@ struct PickingDashboardView: View {
                     .foregroundStyle(PickingTheme.muted)
             }
 
-            if model.isMetaScanning {
+            if model.currentWorkflowStage == .productReady,
+               let context = model.currentStageContext {
+                statePanel(
+                    icon: "checkmark.circle.fill",
+                    color: PickingTheme.mint,
+                    title: "Location verified",
+                    detail: "Confirm the product is in hand, then deliberately start its barcode scan."
+                )
+                Button {
+                    Task { await model.beginProductScanWithMeta(contextToken: context.token) }
+                } label: {
+                    Label("Scan product with Meta glasses", systemImage: "eyeglasses")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(PrimaryDashboardButtonStyle())
+                .disabled(!model.metaScanReady && !model.isMetaScanning)
+                Button {
+                    Task { await model.beginProductScanWithPhone(contextToken: context.token) }
+                } label: {
+                    Label("Scan product with iPhone", systemImage: "iphone.gen3")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(SecondaryDashboardButtonStyle())
+            } else if model.currentWorkflowStage == .count,
+                      let context = model.currentStageContext {
+                statePanel(
+                    icon: "number.square.fill",
+                    color: Color.orange,
+                    title: "Product matched",
+                    detail: "Required quantity: \(context.requiredQuantity). Enter what you actually picked before this item can advance."
+                )
+                Button {
+                    model.showCountEntry = true
+                } label: {
+                    Label("Enter picked count", systemImage: "number.square.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(PrimaryDashboardButtonStyle())
+            } else if model.isMetaScanning {
                 Button {
                     Task { await model.cancelMetaScan() }
                 } label: {
@@ -387,34 +528,36 @@ struct PickingDashboardView: View {
                 .disabled(!model.metaScanReady)
             }
 
-            Button {
-                if model.isListeningForPickCommand {
-                    model.stopListeningForPickCommand()
-                } else {
-                    Task { await model.listenForPickCommand() }
-                }
-            } label: {
-                Label(
-                    model.isListeningForPickCommand ? "Stop voice command" : "Listen for voice command",
-                    systemImage: model.isListeningForPickCommand ? "waveform.slash" : "waveform.and.mic"
-                )
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(SecondaryDashboardButtonStyle())
-
-            Text(model.currentScanStage == .location
-                ? "Hands-free: say “Hey Siri, scan with ClawPilot,” then look at the location label. After it matches, keep the glasses camera on the product barcode."
-                : "Hands-free: say “Hey Siri, scan with ClawPilot.” In-app voice control also accepts “Start glasses scan.” ClawPilot analyzes one in-memory glasses photo first, then briefly checks live frames; nothing is saved.")
-                .font(.caption)
-                .foregroundStyle(PickingTheme.muted)
-
-            Button {
-                model.showPhoneScanner = true
-            } label: {
-                Label("Use iPhone camera instead", systemImage: "iphone.gen3")
+            if model.currentWorkflowStage == .location || model.currentWorkflowStage == .product {
+                Button {
+                    if model.isListeningForPickCommand {
+                        model.stopListeningForPickCommand()
+                    } else {
+                        Task { await model.listenForPickCommand() }
+                    }
+                } label: {
+                    Label(
+                        model.isListeningForPickCommand ? "Stop voice command" : "Listen for voice command",
+                        systemImage: model.isListeningForPickCommand ? "waveform.slash" : "waveform.and.mic"
+                    )
                     .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(SecondaryDashboardButtonStyle())
+
+                Text(model.currentScanStage == .location
+                    ? "Hands-free: scan the location first. ClawPilot pauses on a verified location until you deliberately start the product scan."
+                    : "Hands-free: say “Hey Siri, scan with ClawPilot.” ClawPilot analyzes in-memory camera frames; nothing is saved.")
+                    .font(.caption)
+                    .foregroundStyle(PickingTheme.muted)
+
+                Button {
+                    model.showPhoneScanner = true
+                } label: {
+                    Label("Use iPhone camera instead", systemImage: "iphone.gen3")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(SecondaryDashboardButtonStyle())
             }
-            .buttonStyle(SecondaryDashboardButtonStyle())
 
             Button {
                 model.readInstruction()
@@ -422,6 +565,40 @@ struct PickingDashboardView: View {
                 Label("Read instruction aloud", systemImage: "speaker.wave.2.fill")
             }
             .font(.subheadline.weight(.semibold))
+
+            if model.canRequestActivePickHandoff {
+                Button("Hand off this unstarted order") {
+                    Task { await model.presentActivePickHandoff() }
+                }
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(PickingTheme.danger)
+            }
+        }
+    }
+
+    private func pickContextChip(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption2.weight(.bold))
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+            .background(color.opacity(0.1), in: Capsule())
+    }
+
+    @ViewBuilder
+    private var currentPickStageChip: some View {
+        switch model.currentWorkflowStage {
+        case .location:
+            pickContextChip("Location scan first", color: Color.orange)
+        case .productReady:
+            pickContextChip("Location verified", color: PickingTheme.mint)
+        case .product:
+            pickContextChip("Product scan", color: PickingTheme.mint)
+        case .count:
+            pickContextChip("Enter picked count", color: Color.orange)
+        case nil:
+            pickContextChip("Pick ready", color: PickingTheme.muted)
         }
     }
 
@@ -554,7 +731,7 @@ struct PickingDashboardView: View {
                     .buttonStyle(SecondaryDashboardButtonStyle())
                 }
 
-                Text("To scan: say “Hey Siri, scan with ClawPilot,” or tap Start Meta scan. Look steadily at one item barcode. ClawPilot checks a high-resolution photo first and live frames second; use the iPhone camera only as a fallback.")
+                Text("To scan: say “Hey Siri, scan with ClawPilot,” or tap Start Meta scan. Look steadily at one barcode. ClawPilot prioritizes the latest live video frame and uses one bounded high-resolution photo only as a fallback; nothing is saved.")
                     .font(.caption2)
                     .foregroundStyle(PickingTheme.muted)
             }
@@ -620,6 +797,15 @@ struct PickingDashboardView: View {
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(PrimaryDashboardButtonStyle())
+                    } else if model.voicePackState.canRetryLoad {
+                        Button {
+                            Task { await model.retryEnhancedVoicePack() }
+                        } label: {
+                            Label("Retry", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .tint(PickingTheme.primary)
                     } else if model.voicePackState == .ready {
                         Button(role: .destructive) {
                             showVoicePackRemovalConfirmation = true
@@ -872,6 +1058,69 @@ struct PickingDashboardView: View {
         guard model.canVerifyCode else { return }
         authenticationField = nil
         Task { await model.verifyCode() }
+    }
+}
+
+struct PickedCountEntrySheet: View {
+    @ObservedObject var model: PickingPhoneModel
+    let context: PickStageContext
+    @State private var enteredCount = ""
+    @FocusState private var countFocused: Bool
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 18) {
+                Label("Verify picked quantity", systemImage: "number.square.fill")
+                    .font(.title2.weight(.bold))
+                Text("Required count: \(context.requiredQuantity)")
+                    .font(.title3.weight(.semibold))
+                Text("Enter the number physically picked. The item advances only when it exactly matches the required count.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                TextField("Picked count", text: $enteredCount)
+                    .keyboardType(.numberPad)
+                    .font(.system(size: 34, weight: .bold, design: .monospaced))
+                    .textFieldStyle(.roundedBorder)
+                    .focused($countFocused)
+                    .onChange(of: enteredCount) { _, value in
+                        let sanitized = String(value.filter(\.isNumber).prefix(16))
+                        if sanitized != value { enteredCount = sanitized }
+                    }
+                if model.status.contains("under") || model.status.contains("over") {
+                    Text(model.status)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.red)
+                }
+                Button("Verify count") {
+                    guard let count = Int(enteredCount) else {
+                        model.status = "Enter a positive whole-number count."
+                        return
+                    }
+                    Task {
+                        _ = await model.submitPickedCount(
+                            count,
+                            contextToken: context.token
+                        )
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .frame(maxWidth: .infinity)
+                .disabled(enteredCount.isEmpty)
+                Spacer()
+            }
+            .padding(22)
+            .navigationTitle("Picked count")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { model.cancelCountEntry() }
+                }
+            }
+            .interactiveDismissDisabled()
+            .onAppear { countFocused = true }
+        }
+        .presentationDetents([.medium])
     }
 }
 

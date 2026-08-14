@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
 import * as globalIds from '../app_src/lib/globalIds.mjs'
+import * as commerceOrderRevisionEvidenceKeyConfig from '../app_src/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs'
 import {
   APPROVED_SHOPIFY_READ_SCOPES,
   DISPOSABLE_REHEARSAL_CONFIRMATION,
@@ -61,6 +62,9 @@ function loadCommerceCrypto() {
       }
       if (specifier === '@/lib/persistence/config') {
         return { isHostedRuntime: () => true }
+      }
+      if (specifier === '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs') {
+        return commerceOrderRevisionEvidenceKeyConfig
       }
       return nodeRequire(specifier)
     },

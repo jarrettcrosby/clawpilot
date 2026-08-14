@@ -61,6 +61,12 @@ import type {
 import {
   readCommerceActiveContinuationInPostgres,
 } from '@/lib/persistence/commerceActiveTransitionAuthorization'
+import {
+  commerceOrderSyncAccountLockKey,
+} from '@/lib/persistence/commerceOrderSync'
+import {
+  downgradeShopifyOrderWebhookPolicyAfterDiscoveryWithClient,
+} from '@/lib/persistence/shopifyOrderWebhookSignals'
 
 type TimestampValue = string | Date
 
@@ -636,8 +642,13 @@ function runtimeCredential(
     || !row.credential_tag
     || !row.credential_version
     || row.credential_version !== row.commerce_credential_generation
+    || row.credential_external_account_id !== row.external_account_id
     || !row.auth_mode
     || !row.external_account_id
+    || (row.provider === 'shopify'
+      && row.auth_mode !== 'shopify_client_credentials')
+    || (row.provider === 'faire'
+      && !['faire_brand_token', 'faire_oauth'].includes(row.auth_mode))
   ) return null
   return {
     organizationId: row.organization_id,
@@ -1294,6 +1305,13 @@ export async function markCommerceCredentialVerificationInPostgres(input: {
   holdReceiptIntake?: boolean
 }) {
   await withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      commerceOrderSyncAccountLockKey({
+        organizationId: input.organizationId,
+        accountGlobalId: input.accountGlobalId,
+      }),
+    )
     const result = await client.query<{
       global_id: string
       provider: CommerceProvider
@@ -1387,6 +1405,20 @@ export async function markCommerceCredentialVerificationInPostgres(input: {
         actorEmail: input.actorEmail,
       })
     }
+    const orderWebhookPolicyAlignment = (
+      !input.errorCode
+      && row.provider === 'shopify'
+      && input.configuration
+    )
+      ? await downgradeShopifyOrderWebhookPolicyAfterDiscoveryWithClient(
+          client,
+          {
+            organizationId: input.organizationId,
+            accountGlobalId: input.accountGlobalId,
+            credentialGeneration: input.credentialVersion,
+          },
+        )
+      : null
     await auditCommerce(client, {
       actorEmail: input.actorEmail,
       organizationId: input.organizationId,
@@ -1398,6 +1430,24 @@ export async function markCommerceCredentialVerificationInPostgres(input: {
       environment: row.environment,
       payload: input.errorCode ? { errorCode: input.errorCode } : {},
     })
+    if (orderWebhookPolicyAlignment?.downgraded) {
+      await auditCommerce(client, {
+        actorEmail: input.actorEmail,
+        organizationId: input.organizationId,
+        eventType: 'commerce.order_webhook.transport_downgraded',
+        globalId: row.global_id,
+        provider: row.provider,
+        environment: row.environment,
+        payload: {
+          credentialGeneration: input.credentialVersion,
+          policyRevision: orderWebhookPolicyAlignment.policyRevision,
+          reason: 'successful_subscription_discovery_not_ready',
+          continuousTransport: 'scheduled_poll',
+          providerEventProcessorState: 'processor_pending',
+          providerWrites: 0,
+        },
+      })
+    }
     if (input.holdReceiptIntake) {
       await auditCommerce(client, {
         actorEmail: input.actorEmail,

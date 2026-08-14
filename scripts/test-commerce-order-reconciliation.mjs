@@ -64,6 +64,20 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
           },
         }
       }
+      if (specifier === '@/lib/persistence/commerceOrderRevisions') {
+        return {
+          async purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres() {
+            return {
+              schemaAvailable: false,
+              skipped: true,
+              limit: 250,
+              purged: 0,
+              expiredProtectedReadBacklog: null,
+              backlogTruncated: false,
+            }
+          },
+        }
+      }
       if (specifier === '@/lib/integrations/commerceIntegrations') {
         return {
           CommerceIntegrationRequestError: class CommerceIntegrationRequestError extends Error {
@@ -90,6 +104,41 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
         return loadTypeScriptModule(
           'app_src/lib/integrations/commerceShopifyAutomaticPromotion.ts',
         )
+      }
+      if (specifier === '@/lib/commerceShopifyOrderRevisionWorker') {
+        return {
+          async processShopifyOrderRevisions() {
+            return {
+              provider: 'shopify',
+              claimed: 0,
+              captured: 0,
+              changed: 0,
+              failed: 0,
+              failureCodes: {},
+              providerWrites: 0,
+              canonicalOrderWrites: 0,
+              managerDispositionRequired: 0,
+            }
+          },
+        }
+      }
+      if (specifier === '@/lib/commerceFaireOrderRevisionWorker') {
+        return {
+          async processFaireOrderRevisions() {
+            return {
+              provider: 'faire',
+              claimed: 0,
+              captured: 0,
+              changed: 0,
+              failed: 0,
+              failureCodes: {},
+              providerReadsPerCapture: 2,
+              providerWrites: 0,
+              canonicalOrderWrites: 0,
+              managerDispositionRequired: 0,
+            }
+          },
+        }
       }
       return nodeRequire(specifier)
     },
@@ -1441,6 +1490,10 @@ includes(workerSource, [
   'shopifyAutomaticOrderPromotionHealthSnapshot',
   'rollbackFenced',
   'canonicalOrderWrites: shopifyOrdersPromoted + faireOrdersPromoted',
+  'processShopifyOrderRevisions',
+  'processFaireOrderRevisions',
+  'MAX_PROVIDER_REVISION_TARGETS_PER_RECONCILIATION = 2',
+  'canonicalOrderRevisions',
 ], 'Bounded order reconciliation worker')
 assert.ok(
   workerSource.includes('permits a bounded')
@@ -1568,6 +1621,7 @@ assert.ok(
 )
 
 const trace = { claims: 0, complete: [], failed: [] }
+let disabledRuntimePurgeCalls = 0
 const disabledWorker = loadTypeScriptModule(
   'app_src/lib/commerceOrderReconciliationWorker.ts',
   {
@@ -1595,11 +1649,31 @@ const disabledWorker = loadTypeScriptModule(
           assert.fail('A disabled runtime must not project reconciliation work')
         },
       },
+      '@/lib/persistence/commerceOrderRevisions': {
+        async purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres(input) {
+          disabledRuntimePurgeCalls += 1
+          assert.equal(input.limit, 250)
+          return {
+            schemaAvailable: true,
+            skipped: false,
+            limit: 250,
+            purged: 1,
+            expiredProtectedReadBacklog: 0,
+            backlogTruncated: false,
+          }
+        },
+      },
     },
   },
 )
 const disabledSummary = await disabledWorker
   .processCommerceOrderReconciliation({ limit: 1 })
+assert.equal(
+  disabledRuntimePurgeCalls,
+  1,
+  'Protected snapshot retention must run even when commerce intake is disabled',
+)
+assert.equal(disabledSummary.protectedSnapshotPurge.purged, 1)
 const currentFaireGateHealth = JSON.parse(JSON.stringify(
   fairePromotionPolicy.faireAutomaticOrderPromotionGateHealth(),
 ))
@@ -1623,6 +1697,108 @@ assert.deepEqual(
     inventoryWrites: 0,
     syncCursorAdvanced: false,
   },
+)
+const revisionCompositionCalls = []
+const revisionPurgeCalls = []
+const revisionCompositionWorker = loadTypeScriptModule(
+  'app_src/lib/commerceOrderReconciliationWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceIntake': {
+        commerceReadRuntimeAvailable: () => true,
+        commerceReadRuntimeMode: () => 'production',
+        async executeCommerceOrderPage() {
+          assert.fail('No provider page should run without a root claim')
+        },
+        async executeCommerceFaireOrderExactRefresh() {
+          assert.fail('No candidate exact refresh should run without a root claim')
+        },
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async claimCommerceOrderReconciliationTargetsInPostgres() {
+          return []
+        },
+      },
+      '@/lib/persistence/commerceOrderRevisions': {
+        async purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres(input) {
+          revisionPurgeCalls.push(input)
+          return {
+            schemaAvailable: true,
+            skipped: false,
+            limit: input.limit,
+            purged: 2,
+            expiredProtectedReadBacklog: 1,
+            backlogTruncated: false,
+          }
+        },
+      },
+      '@/lib/commerceShopifyOrderRevisionWorker': {
+        async processShopifyOrderRevisions(input) {
+          revisionCompositionCalls.push({ provider: 'shopify', input })
+          return {
+            provider: 'shopify',
+            claimed: 2,
+            captured: 2,
+            changed: 2,
+            failed: 0,
+            failureCodes: {},
+            providerWrites: 0,
+            canonicalOrderWrites: 0,
+            managerDispositionRequired: 2,
+          }
+        },
+      },
+      '@/lib/commerceFaireOrderRevisionWorker': {
+        async processFaireOrderRevisions(input) {
+          revisionCompositionCalls.push({ provider: 'faire', input })
+          return {
+            provider: 'faire',
+            claimed: 1,
+            captured: 1,
+            changed: 1,
+            failed: 0,
+            failureCodes: {},
+            providerReadsPerCapture: 2,
+            providerWrites: 0,
+            canonicalOrderWrites: 0,
+            managerDispositionRequired: 1,
+          }
+        },
+      },
+    },
+  },
+)
+const revisionComposition = await revisionCompositionWorker
+  .processCommerceOrderReconciliation({ limit: 9 })
+assert.deepEqual(
+  JSON.parse(JSON.stringify(revisionPurgeCalls)),
+  [{ limit: 250 }],
+  'Protected revision snapshots must be purged once with a bounded cycle limit',
+)
+assert.equal(revisionComposition.protectedSnapshotPurge.purged, 2)
+assert.equal(
+  revisionComposition.protectedSnapshotPurge.expiredProtectedReadBacklog,
+  1,
+)
+assert.deepEqual(
+  revisionCompositionCalls.map(({ provider, input }) => ({
+    provider,
+    limit: input.limit,
+  })),
+  [
+    { provider: 'shopify', limit: 2 },
+    { provider: 'faire', limit: 2 },
+  ],
+  'One bounded exact-read backstop per provider must follow every order poll',
+)
+assert.equal(revisionComposition.canonicalOrderRevisions.providerWrites, 0)
+assert.equal(
+  revisionComposition.canonicalOrderRevisions.canonicalOrderWrites,
+  0,
+)
+assert.equal(
+  revisionComposition.canonicalOrderRevisions.managerDispositionRequired,
+  3,
 )
 let page = 0
 const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWorker.ts', {
@@ -2728,6 +2904,9 @@ assert.deepEqual(
 )
 
 const completedRouteHeartbeats = []
+let completedRouteReconciliationCalls = 0
+const completedRouteWorkerOrder = []
+let completedRouteHistoryShouldFail = false
 const completedRouteRunResult = {
   automaticShopifyOrderPromotion:
     shopifyPromotionPolicy.shopifyAutomaticOrderPromotionHealthSnapshot({
@@ -2770,11 +2949,47 @@ const completedRouteModule = loadTypeScriptModule(
       },
       '@/lib/commerceOrderReconciliationWorker': {
         async processCommerceOrderReconciliation() {
+          completedRouteReconciliationCalls += 1
           return completedRouteRunResult
+        },
+      },
+      '@/lib/commerceOrderHistoryWorker': {
+        async processCommerceOrderHistory() {
+          completedRouteWorkerOrder.push('history:start')
+          if (completedRouteHistoryShouldFail) {
+            const error = new Error('provider secret response must not escape')
+            error.code = 'COMMERCE_ORDER_HISTORY_CURSOR_INVALID'
+            throw error
+          }
+          completedRouteWorkerOrder.push('history:complete')
+          return {
+            claimed: 0,
+            providerReads: 0,
+            providerReadOnly: true,
+            operationsOrderWrites: 0,
+            providerWrites: 0,
+          }
+        },
+      },
+      '@/lib/shopifyOrderWebhookWorker': {
+        async processShopifyOrderWebhookSignals() {
+          completedRouteWorkerOrder.push('webhook:start')
+          return {
+            claimed: 0,
+            providerReads: 0,
+            providerReadOnly: true,
+            operationsOrderWrites: 0,
+            providerWrites: 0,
+          }
         },
       },
       '@/lib/persistence/config': {
         isPostgresStorageEnabled: () => true,
+      },
+      '@/lib/persistence/commerceOrderSync': {
+        async redactExpiredCommerceOrderSensitiveEvidenceInPostgres() {
+          return { redacted: 0, providerWrites: 0 }
+        },
       },
       '@/lib/persistence/commerceOrderReconciliation': {
         async readCommerceOrderReconciliationHealthFromPostgres() {
@@ -2823,7 +3038,13 @@ try {
   }
 }
 assert.equal(completedRouteResponse.status, 200)
+assert.ok(
+  completedRouteWorkerOrder.indexOf('webhook:start')
+    > completedRouteWorkerOrder.indexOf('history:complete'),
+  'Webhook exact reads must start after history policy transitions complete',
+)
 assert.equal(completedRouteHeartbeats.length, 2)
+assert.equal(completedRouteReconciliationCalls, 1)
 const completedRouteHeartbeat = completedRouteHeartbeats[1]
 assert.equal(completedRouteHeartbeat.phase, 'completed')
 assert.equal(
@@ -2854,6 +3075,153 @@ assert.equal(
   5,
   'Legacy unattributed attention must survive a completed limited batch',
 )
+
+completedRouteHistoryShouldFail = true
+process.env.PIPELINE_OUTBOX_WORKER_SECRET = completedRouteSecret
+let isolatedHistoryFailureResponse
+try {
+  isolatedHistoryFailureResponse = await completedRouteModule.POST({
+    headers: {
+      get(name) {
+        return name === 'authorization'
+          ? `Bearer ${completedRouteSecret}`
+          : null
+      },
+    },
+    async json() {
+      return { limit: 1 }
+    },
+  })
+} finally {
+  completedRouteHistoryShouldFail = false
+  if (priorWorkerSecret === undefined) {
+    delete process.env.PIPELINE_OUTBOX_WORKER_SECRET
+  } else {
+    process.env.PIPELINE_OUTBOX_WORKER_SECRET = priorWorkerSecret
+  }
+}
+assert.equal(isolatedHistoryFailureResponse.status, 200)
+assert.equal(completedRouteReconciliationCalls, 2)
+assert.equal(isolatedHistoryFailureResponse.body.orderHistory.degraded, true)
+assert.equal(
+  isolatedHistoryFailureResponse.body.orderHistory.errorCode,
+  'COMMERCE_ORDER_HISTORY_CURSOR_INVALID',
+)
+assert.equal(isolatedHistoryFailureResponse.body.orderHistory.providerWrites, 0)
+assert.equal(
+  isolatedHistoryFailureResponse.body.orderHistory.operationsOrderWrites,
+  0,
+)
+assert.equal(
+  JSON.stringify(isolatedHistoryFailureResponse.body).includes(
+    'provider secret response must not escape',
+  ),
+  false,
+)
+assert.equal(completedRouteHeartbeats.at(-1).phase, 'completed')
+
+let disabledRoutePurgeCalls = 0
+let disabledRouteRedactionCalls = 0
+let disabledRouteWorkerCalls = 0
+const disabledRouteModule = loadTypeScriptModule(
+  'app_src/app/api/integrations/commerce/orders/process/route.ts',
+  {
+    mocks: {
+      'next/server': {
+        NextRequest: class NextRequest {},
+        NextResponse: {
+          json(body, init = {}) {
+            return { body, status: init.status || 200 }
+          },
+        },
+      },
+      '@/lib/integrations/commerceIntake': {
+        commerceReadRuntimeAvailable: () => false,
+      },
+      '@/lib/commerceOrderReconciliationWorker': {
+        async processCommerceOrderReconciliation() {
+          disabledRouteWorkerCalls += 1
+          assert.fail('disabled commerce intake must not start provider reconciliation')
+        },
+      },
+      '@/lib/commerceOrderHistoryWorker': {
+        async processCommerceOrderHistory() {
+          disabledRouteWorkerCalls += 1
+          assert.fail('disabled commerce intake must not start order history')
+        },
+      },
+      '@/lib/shopifyOrderWebhookWorker': {
+        async processShopifyOrderWebhookSignals() {
+          disabledRouteWorkerCalls += 1
+          assert.fail('disabled commerce intake must not start Shopify order webhook reads')
+        },
+      },
+      '@/lib/persistence/config': {
+        isPostgresStorageEnabled: () => true,
+      },
+      '@/lib/persistence/commerceOrderRevisions': {
+        async purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres() {
+          disabledRoutePurgeCalls += 1
+          return {
+            schemaAvailable: true,
+            skipped: false,
+            limit: 250,
+            purged: 1,
+            expiredProtectedReadBacklog: 0,
+            backlogTruncated: false,
+          }
+        },
+      },
+      '@/lib/persistence/commerceOrderSync': {
+        async redactExpiredCommerceOrderSensitiveEvidenceInPostgres() {
+          disabledRouteRedactionCalls += 1
+          return { redacted: 2, providerWrites: 0 }
+        },
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async readCommerceOrderReconciliationHealthFromPostgres() {
+          assert.fail('disabled retention-only route must not read reconciliation health')
+        },
+        async recordCommerceOrderReconciliationWorkerHeartbeatInPostgres() {
+          assert.fail('disabled retention-only route must not write a reconciliation heartbeat')
+        },
+      },
+    },
+  },
+)
+process.env.PIPELINE_OUTBOX_WORKER_SECRET = completedRouteSecret
+let disabledRouteResponse
+try {
+  disabledRouteResponse = await disabledRouteModule.POST({
+    headers: {
+      get(name) {
+        return name === 'authorization'
+          ? `Bearer ${completedRouteSecret}`
+          : null
+      },
+    },
+  })
+} finally {
+  if (priorWorkerSecret === undefined) {
+    delete process.env.PIPELINE_OUTBOX_WORKER_SECRET
+  } else {
+    process.env.PIPELINE_OUTBOX_WORKER_SECRET = priorWorkerSecret
+  }
+}
+assert.equal(disabledRouteResponse.status, 200)
+assert.equal(disabledRouteResponse.body.skipped, true)
+assert.equal(disabledRouteResponse.body.protectedSnapshotPurge.purged, 1)
+assert.equal(
+  disabledRouteResponse.body.orderSensitiveEvidenceRedaction.redacted,
+  2,
+)
+assert.equal(disabledRoutePurgeCalls, 1)
+assert.equal(disabledRouteRedactionCalls, 1)
+assert.equal(disabledRouteWorkerCalls, 0)
+assert.equal(
+  disabledRouteResponse.body.orderSensitiveEvidenceRedaction.providerWrites,
+  0,
+)
 assert.notEqual(
   completedRouteHeartbeat.automaticFaireExactRefresh.operatorReviewRequired,
   8,
@@ -2867,6 +3235,7 @@ includes(route, [
   'commerceReadRuntimeAvailable()',
   'isPostgresStorageEnabled()',
   'processCommerceOrderReconciliation',
+  'processShopifyOrderWebhookSignals',
   'recordCommerceOrderReconciliationWorkerHeartbeatInPostgres',
   'readCommerceOrderReconciliationHealthFromPostgres',
   'durableAutomaticAttentionHealth',
@@ -2895,10 +3264,13 @@ assert.ok(
 )
 const poller = read('scripts/pipeline-outbox-poller.mjs')
 includes(poller, [
-  'commerceOrderReconciliationEnabled',
   "runLoop('commerce-order-reconciliation'",
   '/api/integrations/commerce/orders/process',
 ], 'Order reconciliation poller')
+assert.ok(
+  !/commerceOrderReconciliationEnabled[\s\S]{0,2000}runLoop\('commerce-order-reconciliation'/u.test(poller),
+  'retention maintenance must schedule independently of commerce intake',
+)
 const proxy = read('app_src/proxy.ts')
 includes(proxy, ['/api/integrations/commerce/orders/process'], 'Order reconciliation proxy allowlist')
 const health = read('app_src/app/api/health/route.ts')

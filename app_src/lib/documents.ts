@@ -322,6 +322,7 @@ function applicationUserGuideContent(user: ApplicationGuideUser): string {
     '| Accounting | QuickBooks reports, invoices, receipts, attachments, products, customers, and controlled write reviews | [Open Accounting](/#accounting) |',
     '| POS | Toast orders, menu reporting, accounting mappings, draft generation, parity evidence, and posting controls | [Open POS](/#pos) |',
     '| Operations | Distributed orders, inventory reservations, warehouse execution, carrier rates, shipments, billable events, and fulfillment history | [Open Operations](/#operations) |',
+    '| Shipping | Create Parcel shipment plans, prepare LTL classification evidence, view shipment records by mode, and review pickup readiness | [Open Shipping](/#shipping) |',
     '| Links | Organization-scoped short links, slugs, expiration, click limits, and search | [Open Links](/#links) |',
     '| Agents | Task-specific discussion, durable work dispatches, execution state, and working-document results | [Open Agents](/#agents) |',
     '| Versions | User-facing releases, fixes, checkpoints, and authorized activity history | [Open Versions](/#versions) |',

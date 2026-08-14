@@ -467,7 +467,7 @@ assertIncludes(documentsAdapter, "sourceKey: 'system:pipeline-brief'", 'generate
 assertIncludes(documentsAdapter, "APPLICATION_USER_GUIDE_SOURCE_KEY = 'system:application-user-guide'", 'stable application user guide identity')
 assertIncludes(documentsAdapter, "title: 'ClawPilot User Guide'", 'application user guide document')
 assertIncludes(documentsAdapter, 'ensureApplicationUserGuide(user)', 'active membership user guide refresh')
-for (const moduleName of ['Dashboard', 'Docs', 'Projects', 'Pipeline', 'CRM', 'Accounting', 'POS', 'Operations', 'Links', 'Agents', 'Versions']) {
+for (const moduleName of ['Dashboard', 'Docs', 'Projects', 'Pipeline', 'CRM', 'Accounting', 'POS', 'Operations', 'Shipping', 'Links', 'Agents', 'Versions']) {
   assertIncludes(documentsAdapter, `| ${moduleName} |`, `${moduleName} user guide coverage`)
 }
 assertIncludes(documentsAdapter, 'document.content', 'local full-document search')
@@ -1481,6 +1481,9 @@ for (const requiredVariable of [
     'APP_LOGIN_PASSWORD',
   'APP_SESSION_SECRET',
   'AGENT_CREDENTIAL_ENCRYPTION_KEY',
+  'INTEGRATION_EVIDENCE_FINGERPRINT_KEY',
+  'INTEGRATION_EVIDENCE_ACTIVE_KEY_ID',
+  'INTEGRATION_EVIDENCE_ENCRYPTION_KEYS',
   'AGENT_CREDENTIAL_DATABASE_URL',
     'DATABASE_URL',
     'MATON_API_KEY',

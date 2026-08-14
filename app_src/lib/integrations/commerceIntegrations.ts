@@ -52,6 +52,15 @@ import {
   type ShopifyInventoryWebhookTargeting,
 } from '@/lib/integrations/shopifyInventoryWebhook'
 import {
+  discoverShopifyOrderWebhookSubscriptions,
+  isShopifyOrderSignalWebhookTopic,
+  shopifyOrderWebhookSignalEvidence,
+  SHOPIFY_ORDER_SIGNAL_INCLUDE_FIELDS,
+  SHOPIFY_ORDER_SIGNAL_WEBHOOK_TOPICS,
+  ShopifyOrderWebhookError,
+  type ShopifyOrderWebhookSubscriptionReadiness,
+} from '@/lib/integrations/shopifyOrderWebhook'
+import {
   assertShopifyOrderPreviewRuntime,
   fetchShopifyOrderPreview,
   normalizeShopifyOrderPreviewIdempotencyKey,
@@ -89,6 +98,10 @@ import {
   ShopifyFulfillmentNotificationPolicyError,
   updateShopifyFulfillmentNotificationPolicyInPostgres,
 } from '@/lib/persistence/shopifyFulfillmentNotifications'
+import {
+  recordShopifyOrderWebhookSignalInPostgres,
+  ShopifyOrderWebhookSignalPersistenceError,
+} from '@/lib/persistence/shopifyOrderWebhookSignals'
 import { appPublicUrl } from '@/lib/publicUrl'
 
 const SHOPIFY_ADAPTER_VERSION = `shopify-graphql-${SHOPIFY_ADMIN_API_VERSION}-control-v1`
@@ -155,6 +168,20 @@ export class CommerceIntegrationRequestError extends Error {
 function sanitize(error: unknown): CommerceIntegrationRequestError {
   if (error instanceof CommerceIntegrationRequestError) return error
   if (error instanceof ShopifyFulfillmentNotificationPolicyError) {
+    return new CommerceIntegrationRequestError(
+      error.message,
+      error.status,
+      error.code,
+    )
+  }
+  if (error instanceof ShopifyOrderWebhookError) {
+    return new CommerceIntegrationRequestError(
+      error.message,
+      error.status,
+      error.code,
+    )
+  }
+  if (error instanceof ShopifyOrderWebhookSignalPersistenceError) {
     return new CommerceIntegrationRequestError(
       error.message,
       error.status,
@@ -756,10 +783,13 @@ export async function connectShopifyCommerce(input: {
       clientId: appClientId,
       clientSecret: secret,
     })
-    const probe = await probeShopifyConnection({
-      shopDomain,
-      accessToken: grant.accessToken,
-    })
+    const probe = await probeShopifyConnection(
+      {
+        shopDomain,
+        accessToken: grant.accessToken,
+      },
+      { resolveCanonicalShopDomain: true },
+    )
     const scopeAudit = auditShopifyScopeRequirements(
       SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
       probe.grantedScopes,
@@ -775,6 +805,8 @@ export async function connectShopifyCommerce(input: {
       accountName: probe.shopName,
       providerAccountId: probe.shopId,
       shopDomain: probe.shopDomain,
+      submittedShopDomain: shopDomain,
+      shopDomainResolvedFromAlias: probe.shopDomain !== shopDomain,
       adapterVersion: SHOPIFY_ADAPTER_VERSION,
       apiVersion: probe.apiVersion,
       authMode: credential.authMode,
@@ -911,6 +943,7 @@ function revokesCredentialVerification(
     'SHOPIFY_SHOP_NOT_PERMITTED',
     'SHOPIFY_STORE_NOT_FOUND',
     'SHOPIFY_PROBE_INVALID',
+    'SHOPIFY_CANONICAL_DOMAIN_REQUIRED',
     'SHOPIFY_STORE_IDENTITY_CHANGED',
     'FAIRE_ACCESS_DENIED',
     'FAIRE_RESOURCE_NOT_FOUND',
@@ -1225,6 +1258,55 @@ async function verifyStoredConnection(
         topics: SHOPIFY_CATALOG_REFRESH_WEBHOOK_TOPICS,
       },
     )
+    let orderWebhookSubscriptions: (
+      ShopifyOrderWebhookSubscriptionReadiness & {
+        discoveryState: 'succeeded'
+        discoveryErrorCode: null
+      }
+    ) | {
+      desiredUri: string
+      requiredTopics: typeof SHOPIFY_ORDER_SIGNAL_WEBHOOK_TOPICS[number][]
+      requiredIncludeFields: string[]
+      subscriptions: []
+      matchingTopics: []
+      missingTopics: typeof SHOPIFY_ORDER_SIGNAL_WEBHOOK_TOPICS[number][]
+      conflictingTopics: []
+      ready: false
+      processorState: 'available'
+      providerWrites: 0
+      discoveryState: 'failed'
+      discoveryErrorCode: string
+    }
+    try {
+      orderWebhookSubscriptions = {
+        ...(await discoverShopifyOrderWebhookSubscriptions(
+          { shopDomain, accessToken: grant.accessToken },
+          { desiredUri: webhookUrl(runtime.globalId) },
+        )),
+        discoveryState: 'succeeded',
+        discoveryErrorCode: null,
+      }
+    } catch (error) {
+      const code = error instanceof ShopifyCommerceClientError
+        || error instanceof ShopifyOrderWebhookError
+        ? error.code
+        : 'SHOPIFY_ORDER_WEBHOOK_DISCOVERY_FAILED'
+      orderWebhookSubscriptions = {
+        desiredUri: webhookUrl(runtime.globalId),
+        requiredTopics: [...SHOPIFY_ORDER_SIGNAL_WEBHOOK_TOPICS],
+        requiredIncludeFields: [...SHOPIFY_ORDER_SIGNAL_INCLUDE_FIELDS],
+        subscriptions: [],
+        matchingTopics: [],
+        missingTopics: [...SHOPIFY_ORDER_SIGNAL_WEBHOOK_TOPICS],
+        conflictingTopics: [],
+        ready: false,
+        processorState: 'available',
+        providerWrites: 0,
+        discoveryState: 'failed',
+        discoveryErrorCode: code,
+      }
+    }
+    const orderWebhookObservedAt = new Date().toISOString()
     return {
       configuration: {
         ...runtime.configuration,
@@ -1256,6 +1338,8 @@ async function verifyStoredConnection(
           providerWrites: 0,
         },
         webhookSubscriptions: {
+          accountGlobalId: runtime.globalId,
+          credentialGeneration: runtime.credentialVersion,
           desiredUri: webhookSubscriptions.desiredUri,
           requiredTopics: webhookSubscriptions.requiredTopics,
           observedCount: webhookSubscriptions.subscriptions.length,
@@ -1266,6 +1350,8 @@ async function verifyStoredConnection(
           conflictingTopics: webhookSubscriptions.conflictingTopics,
           ready: webhookSubscriptions.ready,
           observedAt: new Date().toISOString(),
+          discoveryState: 'succeeded',
+          discoveryErrorCode: null,
           providerWrites: 0,
         },
         catalogWebhookSubscriptions: {
@@ -1280,6 +1366,27 @@ async function verifyStoredConnection(
           conflictingTopics: catalogWebhookSubscriptions.conflictingTopics,
           ready: catalogWebhookSubscriptions.ready,
           observedAt: new Date().toISOString(),
+          providerWrites: 0,
+        },
+        orderWebhookSubscriptions: {
+          accountGlobalId: runtime.globalId,
+          credentialGeneration: runtime.credentialVersion,
+          desiredUri: orderWebhookSubscriptions.desiredUri,
+          requiredTopics: orderWebhookSubscriptions.requiredTopics,
+          requiredIncludeFields:
+            orderWebhookSubscriptions.requiredIncludeFields,
+          observedCount: orderWebhookSubscriptions.subscriptions.length,
+          matchingCount: orderWebhookSubscriptions.matchingTopics.length,
+          missingTopics: orderWebhookSubscriptions.missingTopics,
+          conflictingTopics: orderWebhookSubscriptions.conflictingTopics,
+          subscriptionReady: orderWebhookSubscriptions.ready,
+          processorState: orderWebhookSubscriptions.processorState,
+          exactReadProcessorReady: true,
+          scheduledPollBackstop: true,
+          ready: orderWebhookSubscriptions.ready,
+          observedAt: orderWebhookObservedAt,
+          discoveryState: orderWebhookSubscriptions.discoveryState,
+          discoveryErrorCode: orderWebhookSubscriptions.discoveryErrorCode,
           providerWrites: 0,
         },
         lastVerifiedAt: new Date().toISOString(),
@@ -1307,6 +1414,20 @@ async function verifyStoredConnection(
           catalogWebhookSubscriptions.subscriptions.length,
         catalogWebhookSubscriptionMissingCount:
           catalogWebhookSubscriptions.missingTopics.length,
+        orderWebhookSubscriptionReady: orderWebhookSubscriptions.ready,
+        orderWebhookSubscriptionObservedCount:
+          orderWebhookSubscriptions.subscriptions.length,
+        orderWebhookSubscriptionMatchingCount:
+          orderWebhookSubscriptions.matchingTopics.length,
+        orderWebhookSubscriptionMissingCount:
+          orderWebhookSubscriptions.missingTopics.length,
+        orderWebhookSubscriptionConflictingCount:
+          orderWebhookSubscriptions.conflictingTopics.length,
+        orderWebhookExactReadProcessorReady: true,
+        orderWebhookDiscoveryState:
+          orderWebhookSubscriptions.discoveryState,
+        orderWebhookDiscoveryErrorCode:
+          orderWebhookSubscriptions.discoveryErrorCode,
         providerWrites: 0,
       },
     }
@@ -1796,7 +1917,11 @@ export async function receiveShopifyWebhook(input: {
       'topic',
       /^[a-z][a-z0-9_]*(?:\/[a-z0-9_]+)+$/,
     )
-    if (!SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPIC_SET.has(topic)) {
+    const isOrderSignalTopic = isShopifyOrderSignalWebhookTopic(topic)
+    if (
+      !SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPIC_SET.has(topic)
+      && !isOrderSignalTopic
+    ) {
       throw new CommerceIntegrationRequestError(
         'Shopify webhook topic is not accepted by the current control-plane privacy boundary',
         422,
@@ -1822,6 +1947,21 @@ export async function receiveShopifyWebhook(input: {
     const providerTriggeredAt = input.providerTriggeredAt
       ? new Date(String(input.providerTriggeredAt)).toISOString()
       : null
+    if (isOrderSignalTopic) {
+      const signal = await recordShopifyOrderWebhookSignalInPostgres({
+        runtime,
+        providerEventId,
+        sourceDomain,
+        providerApiVersion,
+        providerTriggeredAt,
+        evidence: shopifyOrderWebhookSignalEvidence({
+          topic,
+          verifiedRawBody: input.rawBody,
+        }),
+      })
+      await markShopifyWebhookSecretVerifiedInPostgres({ runtime })
+      return signal
+    }
     let payload: unknown
     try {
       payload = JSON.parse(input.rawBody.toString('utf8'))

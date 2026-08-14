@@ -38,6 +38,10 @@ import {
   requireActiveSandboxCommerceE2eAuthorization,
 } from '@/lib/persistence/sandboxCommerceE2eAuthorization'
 import {
+  assertCommerceOrderRevisionExecutionCurrent,
+  CommerceOrderRevisionGateError,
+} from '@/lib/persistence/commerceOrderRevisions'
+import {
   MockCarrierAdapter,
   MockCommerceAdapter,
   MockPrintAdapter,
@@ -62,7 +66,10 @@ import {
   locationBarcode,
   providerBarcodeIdentity,
 } from '@/lib/operations/barcodeLabels'
-import type { WearablePickTaskScanEvidenceInput } from '@/lib/operations/wearablePicking'
+import type {
+  WearablePickTaskCountEvidenceInput,
+  WearablePickTaskScanEvidenceInput,
+} from '@/lib/operations/wearablePicking'
 import {
   authorizedCheckoutShippingChargeMinor,
   CANONICAL_FULFILLMENT_RATE_POLICY_VERSION,
@@ -80,6 +87,10 @@ import {
   testCarrierSandboxShipmentRate,
 } from '@/lib/integrations/carrierIntegrations'
 import type { OperationsCapabilities } from '@/lib/operations/authorization'
+import {
+  pickAssignmentFingerprint,
+  type OperationsManagePickAssignmentResult,
+} from '@/lib/operations/pickManagement'
 import type {
   Address,
   CommerceCustomerIdentity,
@@ -105,6 +116,7 @@ import type {
   OperationsPlanCommandResult,
   OperationsOrderListItem,
   OperationsPackingSlipCommandResult,
+  OperationsPickHandoffResult,
   OperationsOrderStatus,
   OperationsPutawayPlacement,
   OperationsReplenishmentExecutionInput,
@@ -446,6 +458,20 @@ export class OperationsRequestError extends Error {
   }
 }
 
+async function requireCurrentCommerceOrderRevision(
+  client: PoolClient,
+  input: Parameters<typeof assertCommerceOrderRevisionExecutionCurrent>[1],
+) {
+  try {
+    await assertCommerceOrderRevisionExecutionCurrent(client, input)
+  } catch (error) {
+    if (error instanceof CommerceOrderRevisionGateError) {
+      throw new OperationsRequestError(error.code, error.message, error.status)
+    }
+    throw error
+  }
+}
+
 function numberValue(value: unknown): number {
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : 0
@@ -759,6 +785,268 @@ async function requireEligibleOperationsPicker(
       'The selected worker needs Operations view and warehouse execution permission',
       409,
     )
+  }
+}
+
+type ManageablePickTaskRow = QueryResultRow & {
+  id: string
+  global_id: string
+  wave_id: string
+  status: string
+  quantity: string
+  picked_quantity: string | null
+  picked_at: string | Date | null
+  assigned_to: string | null
+}
+
+type ManageablePickAssignmentContext = {
+  plan: IdRow & { status: string }
+  wave: IdRow & { status: string }
+  tasks: ManageablePickTaskRow[]
+  previousAssignedTo: string | null | 'mixed'
+  assignmentFingerprint: string
+  openHandoffExceptionGlobalId: string | null
+  openManagerInterventionExceptionGlobalId: string | null
+}
+
+async function lockManageablePickAssignment(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    orderId: string
+    orderRowVersion: number
+    expectedTaskCount?: number
+    expectedAssignmentFingerprint?: string
+  },
+): Promise<ManageablePickAssignmentContext> {
+  const planResult = await client.query<IdRow & { status: string }>(
+    `SELECT id::text, global_id, status
+     FROM operations_fulfillment_plans
+     WHERE organization_id = $1::uuid AND order_id = $2::uuid
+     ORDER BY version_number DESC, id DESC
+     LIMIT 1
+     FOR UPDATE`,
+    [input.organizationId, input.orderId],
+  )
+  const plan = planResult.rows[0]
+  if (!plan || plan.status !== 'released') {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_ASSIGNMENT_INVALID',
+      'The released fulfillment plan is unavailable for assignment',
+      409,
+    )
+  }
+
+  const waveResult = await client.query<IdRow & { status: string }>(
+    `SELECT wave.id::text, wave.global_id, wave.status
+     FROM operations_waves wave
+     WHERE wave.organization_id = $1::uuid
+       AND wave.id IN (
+         SELECT DISTINCT pick.wave_id
+         FROM operations_pick_tasks pick
+         WHERE pick.organization_id = $1::uuid
+           AND pick.plan_id = $2::uuid
+       )
+     ORDER BY wave.id
+     FOR UPDATE`,
+    [input.organizationId, plan.id],
+  )
+  if (waveResult.rows.length !== 1 || waveResult.rows[0].status !== 'released') {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_ASSIGNMENT_INVALID',
+      'Exactly one released warehouse wave is required for assignment',
+      409,
+    )
+  }
+  const wave = waveResult.rows[0]
+
+  const taskResult = await client.query<ManageablePickTaskRow>(
+    `SELECT pick.id::text, pick.global_id, pick.wave_id::text,
+            pick.status, pick.quantity::text,
+            pick.picked_quantity::text, pick.picked_at,
+            lower(pick.assigned_to) AS assigned_to
+     FROM operations_pick_tasks pick
+     WHERE pick.organization_id = $1::uuid
+       AND pick.plan_id = $2::uuid
+     ORDER BY pick.sequence_number, pick.id
+     FOR UPDATE`,
+    [input.organizationId, plan.id],
+  )
+  const tasks = taskResult.rows
+  if (tasks.length < 1) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_ASSIGNMENT_INVALID',
+      'No pick tasks are available for assignment',
+      409,
+    )
+  }
+  if (
+    input.expectedTaskCount !== undefined
+    && tasks.length !== input.expectedTaskCount
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_ASSIGNMENT_TASKS_CHANGED',
+      'Pick tasks changed before the manager intervention could be saved',
+      409,
+    )
+  }
+  if (tasks.some((task) => (
+    task.wave_id !== wave.id
+    || task.status !== 'ready'
+    || Number(task.picked_quantity || 0) !== 0
+    || task.picked_at !== null
+  ))) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_ASSIGNMENT_ALREADY_STARTED',
+      'Assignment changes stop after any pick task has started or recorded a picked quantity',
+      409,
+    )
+  }
+
+  const assignmentFingerprint = pickAssignmentFingerprint(tasks.map((task) => ({
+    pickTaskGlobalId: task.global_id,
+    assignedTo: task.assigned_to,
+  })))
+  if (
+    input.expectedAssignmentFingerprint
+    && assignmentFingerprint !== input.expectedAssignmentFingerprint
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_ASSIGNMENT_CHANGED',
+      'The picker assignment changed before the manager intervention was saved. Refresh and try again.',
+      409,
+    )
+  }
+
+  const evidenceResult = await client.query<{
+    scan_count: string
+    count_count: string
+  }>(
+    `SELECT
+       (SELECT count(*)::text
+        FROM operations_wearable_pick_scan_evidence scan
+        WHERE scan.organization_id = $1::uuid
+          AND scan.order_id = $2::uuid
+          AND scan.order_row_version = $3::bigint
+          AND scan.pick_task_id = ANY($4::uuid[])) AS scan_count,
+       (SELECT count(*)::text
+        FROM operations_wearable_pick_count_evidence count_evidence
+        WHERE count_evidence.organization_id = $1::uuid
+          AND count_evidence.order_id = $2::uuid
+          AND count_evidence.order_row_version = $3::bigint
+          AND count_evidence.pick_task_id = ANY($4::uuid[])) AS count_count`,
+    [
+      input.organizationId,
+      input.orderId,
+      input.orderRowVersion,
+      tasks.map((task) => task.id),
+    ],
+  )
+  if (Number(evidenceResult.rows[0]?.scan_count || 0) > 0) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_ASSIGNMENT_SCAN_EVIDENCE_EXISTS',
+      'Current-version scan evidence exists. Use picker handoff or resolve the physical work before changing assignment.',
+      409,
+    )
+  }
+  if (Number(evidenceResult.rows[0]?.count_count || 0) > 0) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_ASSIGNMENT_COUNT_EVIDENCE_EXISTS',
+      'Current-version count evidence exists. Resolve the physical work before changing assignment.',
+      409,
+    )
+  }
+
+  const physicalWorkResult = await client.query<{
+    package_started: string
+    label_started: string
+    shipment_started: string
+  }>(
+    `SELECT
+       (SELECT count(*)::text
+        FROM operations_packages package
+        WHERE package.organization_id = $1::uuid
+          AND package.plan_id = $2::uuid
+          AND (package.status <> 'planned' OR package.packed_at IS NOT NULL))
+         AS package_started,
+       ((SELECT count(*)
+         FROM operations_labels label
+         JOIN operations_packages package
+           ON package.organization_id = label.organization_id
+          AND package.id = label.package_id
+         WHERE label.organization_id = $1::uuid
+           AND package.plan_id = $2::uuid)
+        +
+        (SELECT count(*)
+         FROM operations_label_attempts attempt
+         WHERE attempt.organization_id = $1::uuid
+           AND attempt.order_id = $3::uuid))::text AS label_started,
+       (SELECT count(*)::text
+        FROM operations_shipments shipment
+        WHERE shipment.organization_id = $1::uuid
+          AND shipment.order_id = $3::uuid) AS shipment_started`,
+    [input.organizationId, plan.id, input.orderId],
+  )
+  const physicalWork = physicalWorkResult.rows[0]
+  if (Number(physicalWork?.package_started || 0) > 0) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_ASSIGNMENT_PACKING_STARTED',
+      'Assignment changes stop after packing has started',
+      409,
+    )
+  }
+  if (Number(physicalWork?.label_started || 0) > 0) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_ASSIGNMENT_LABEL_STARTED',
+      'Assignment changes stop after label preparation has started',
+      409,
+    )
+  }
+  if (Number(physicalWork?.shipment_started || 0) > 0) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_ASSIGNMENT_SHIPMENT_STARTED',
+      'Assignment changes stop after shipment evidence exists',
+      409,
+    )
+  }
+
+  const assignments = new Set(tasks.map((task) => task.assigned_to || null))
+  const previousAssignedTo = assignments.size === 1
+    ? [...assignments][0]
+    : 'mixed' as const
+  const handoffResult = await client.query<{ global_id: string }>(
+    `SELECT global_id
+     FROM operations_exceptions
+     WHERE organization_id = $1::uuid
+       AND order_id = $2::uuid
+       AND exception_type = 'picker_handoff_requested'
+       AND status IN ('open', 'acknowledged')
+     ORDER BY created_at DESC, id DESC
+     LIMIT 1
+     FOR SHARE`,
+    [input.organizationId, input.orderId],
+  )
+  const managerInterventionResult = await client.query<{ global_id: string }>(
+    `SELECT global_id
+     FROM operations_exceptions
+     WHERE organization_id = $1::uuid
+       AND order_id = $2::uuid
+       AND exception_type = 'manager_pick_intervention'
+       AND status IN ('open', 'acknowledged')
+     ORDER BY created_at DESC, id DESC
+     LIMIT 1
+     FOR SHARE`,
+    [input.organizationId, input.orderId],
+  )
+  return {
+    plan,
+    wave,
+    tasks,
+    previousAssignedTo,
+    assignmentFingerprint,
+    openHandoffExceptionGlobalId: handoffResult.rows[0]?.global_id || null,
+    openManagerInterventionExceptionGlobalId:
+      managerInterventionResult.rows[0]?.global_id || null,
   }
 }
 
@@ -2338,8 +2626,8 @@ async function readOrderDetail(
          plan.id
        ) AS shopify_external_fulfillment_reconciliation_required,
        plan_warehouse.name AS warehouse_name, orders.promised_delivery_at,
-       (SELECT count(*) FROM operations_order_lines line WHERE line.order_id = orders.id)::text AS line_count,
-       (SELECT count(*) FROM operations_order_lines line
+       (SELECT count(*) FROM operations_current_order_lines line WHERE line.order_id = orders.id)::text AS line_count,
+       (SELECT count(*) FROM operations_current_order_lines line
         WHERE line.organization_id = orders.organization_id
           AND line.order_id = orders.id
           AND COALESCE((
@@ -2357,7 +2645,7 @@ async function readOrderDetail(
               AND reservation.quantity = allocation.quantity
               AND reservation.status = 'active'
           ), 0) = line.quantity)::text AS fully_reserved_line_count,
-       (SELECT count(*) FROM operations_order_lines line
+       (SELECT count(*) FROM operations_current_order_lines line
         WHERE line.organization_id = orders.organization_id AND line.order_id = orders.id
           AND COALESCE((
             SELECT sum(allocation.quantity)
@@ -2492,7 +2780,7 @@ async function readOrderDetail(
               line.channel_sku, line.quantity::text,
               reservation.reserved_quantity,
               pick.status AS pick_status
-       FROM operations_order_lines line
+       FROM operations_current_order_lines line
        JOIN crm_products product ON product.id = line.product_id AND product.pipeline_id = line.pipeline_id
        LEFT JOIN LATERAL (
          SELECT COALESCE(sum(candidate.quantity), 0)::text
@@ -2604,7 +2892,7 @@ async function readOrderDetail(
        JOIN operations_packages package
          ON package.organization_id = content.organization_id
         AND package.id = content.package_id
-       JOIN operations_order_lines source_line
+       JOIN operations_current_order_lines source_line
          ON source_line.organization_id = content.organization_id
         AND source_line.id = content.order_line_id
        JOIN crm_products product
@@ -3207,7 +3495,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
               customer.name AS customer_name, customer.reference_code AS customer_global_id,
               orders.source_provider, orders.status, warehouse.name AS warehouse_name,
               orders.promised_delivery_at,
-              (SELECT count(*) FROM operations_order_lines line WHERE line.order_id = orders.id)::text AS line_count,
+              (SELECT count(*) FROM operations_current_order_lines line WHERE line.order_id = orders.id)::text AS line_count,
               (SELECT count(*) FROM operations_exceptions exception WHERE exception.order_id = orders.id AND exception.status IN ('open', 'acknowledged'))::text AS exception_count,
               plan.estimated_cost_minor::text, plan.estimated_revenue_minor::text,
               plan.estimated_margin_minor::text, shipment.tracking_number, orders.updated_at
@@ -3428,7 +3716,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
            ON demand_order.organization_id = plan.organization_id
           AND demand_order.id = plan.order_id
           AND demand_order.status IN ('planned', 'released', 'picking')
-         JOIN operations_order_lines demand_line
+         JOIN operations_current_order_lines demand_line
            ON demand_line.organization_id = allocation.organization_id
           AND demand_line.id = allocation.order_line_id
           AND demand_line.product_id = rule.product_id
@@ -4920,6 +5208,16 @@ export async function updateOperationsExceptionInPostgres(input: {
     if (!current) {
       throw new OperationsRequestError('OPERATIONS_EXCEPTION_NOT_FOUND', 'Operations exception was not found', 404)
     }
+    if (
+      current.exception_type === 'commerce_order_revision_required'
+      && !['open', 'acknowledged'].includes(input.status)
+    ) {
+      throw new OperationsRequestError(
+        'COMMERCE_ORDER_REVISION_DISPOSITION_REQUIRED',
+        'Provider order revisions can be resolved only by an immutable authorized disposition',
+        409,
+      )
+    }
     if (current.status === input.status) {
       return { exception: exceptionListItem(current), changed: false }
     }
@@ -5320,6 +5618,11 @@ async function readShadowExecutionContext(
       409,
     )
   }
+  await requireCurrentCommerceOrderRevision(client, {
+    organizationId: input.organizationId,
+    orderId: order.id,
+    operation: 'prepare_fulfillment',
+  })
   if (
     order.status !== 'packed'
     || order.source_provider !== 'shopify'
@@ -5408,7 +5711,7 @@ async function readShadowExecutionContext(
        line.description,
        line.quantity::text,
        line.weight_grams
-     FROM operations_order_lines line
+     FROM operations_current_order_lines line
      JOIN crm_products product
        ON product.pipeline_id = line.pipeline_id
       AND product.id = line.product_id
@@ -5418,7 +5721,7 @@ async function readShadowExecutionContext(
       AND candidate.integration_account_id = $3::uuid
       AND candidate.provider = 'shopify'
       AND candidate.workflow_state = 'promoted'
-     JOIN operations_commerce_order_candidate_lines candidate_line
+     JOIN operations_commerce_current_planning_lines candidate_line
        ON candidate_line.organization_id = line.organization_id
       AND candidate_line.order_candidate_id = candidate.id
       AND candidate_line.canonical_order_line_id = line.id
@@ -5533,7 +5836,7 @@ async function readShadowExecutionContext(
        line.description AS title,
        content.quantity::text
      FROM operations_package_contents content
-     JOIN operations_order_lines line
+     JOIN operations_current_order_lines line
        ON line.organization_id = content.organization_id
       AND line.id = content.order_line_id
      JOIN crm_products product
@@ -8251,7 +8554,7 @@ export async function executeOperationsReplenishmentInPostgres(input: {
            ON demand_order.organization_id = plan.organization_id
           AND demand_order.id = plan.order_id
           AND demand_order.status IN ('planned', 'released', 'picking')
-         JOIN operations_order_lines demand_line
+         JOIN operations_current_order_lines demand_line
            ON demand_line.organization_id = allocation.organization_id
           AND demand_line.id = allocation.order_line_id
           AND demand_line.product_id = $3::uuid
@@ -8584,6 +8887,102 @@ async function completedOrderCommandResult(
     rowVersion: Number(order.row_version),
     replayed: true,
   }
+}
+
+function completedPickHandoffResult(
+  receipt: Pick<CommandReceiptRow, 'result_payload'>,
+): OperationsPickHandoffResult {
+  const payload = receipt.result_payload
+  if (
+    payload
+    && typeof payload.orderGlobalId === 'string'
+    && payload.orderStatus === 'released'
+    && Number.isSafeInteger(Number(payload.previousRowVersion))
+    && Number.isSafeInteger(Number(payload.rowVersion))
+    && Number(payload.rowVersion) === Number(payload.previousRowVersion) + 1
+    && typeof payload.exceptionGlobalId === 'string'
+    && /^gex(?:[0-9]{7}|[0-9a-v]{12})$/.test(payload.exceptionGlobalId)
+    && Number.isSafeInteger(Number(payload.assignedTaskCount))
+    && Number(payload.assignedTaskCount) > 0
+    && (
+      payload.blockedConfirmationIdempotencyKey === null
+      || typeof payload.blockedConfirmationIdempotencyKey === 'string'
+    )
+    && Number(payload.providerWrites) === 0
+  ) {
+    return {
+      orderGlobalId: payload.orderGlobalId,
+      orderStatus: 'released',
+      previousRowVersion: Number(payload.previousRowVersion),
+      rowVersion: Number(payload.rowVersion),
+      exceptionGlobalId: payload.exceptionGlobalId,
+      assignedTaskCount: Number(payload.assignedTaskCount),
+      blockedConfirmationIdempotencyKey:
+        payload.blockedConfirmationIdempotencyKey as string | null,
+      providerWrites: 0,
+      replayed: true,
+    }
+  }
+  throw new OperationsRequestError(
+    'OPERATIONS_COMMAND_RECEIPT_INVALID',
+    'Completed picker handoff result is unavailable',
+    409,
+  )
+}
+
+function completedManagePickAssignmentResult(
+  receipt: Pick<CommandReceiptRow, 'result_payload'>,
+): OperationsManagePickAssignmentResult {
+  const payload = receipt.result_payload
+  if (
+    payload
+    && typeof payload.orderGlobalId === 'string'
+    && payload.orderStatus === 'released'
+    && Number.isSafeInteger(Number(payload.previousRowVersion))
+    && Number.isSafeInteger(Number(payload.rowVersion))
+    && Number(payload.rowVersion) === Number(payload.previousRowVersion) + 1
+    && Number.isSafeInteger(Number(payload.taskCount))
+    && Number(payload.taskCount) > 0
+    && (
+      payload.previousAssignedTo === null
+      || payload.previousAssignedTo === 'mixed'
+      || typeof payload.previousAssignedTo === 'string'
+    )
+    && (
+      payload.assignedTo === null
+      || typeof payload.assignedTo === 'string'
+    )
+    && (
+      payload.interventionExceptionGlobalId === null
+      || (
+        typeof payload.interventionExceptionGlobalId === 'string'
+        && /^gex(?:[0-9]{7}|[0-9a-v]{12})$/.test(
+          payload.interventionExceptionGlobalId,
+        )
+      )
+    )
+    && Number(payload.providerWrites) === 0
+  ) {
+    return {
+      orderGlobalId: payload.orderGlobalId,
+      orderStatus: 'released',
+      previousRowVersion: Number(payload.previousRowVersion),
+      rowVersion: Number(payload.rowVersion),
+      taskCount: Number(payload.taskCount),
+      previousAssignedTo:
+        payload.previousAssignedTo as string | null | 'mixed',
+      assignedTo: payload.assignedTo as string | null,
+      interventionExceptionGlobalId:
+        payload.interventionExceptionGlobalId as string | null,
+      providerWrites: 0,
+      replayed: true,
+    }
+  }
+  throw new OperationsRequestError(
+    'OPERATIONS_COMMAND_RECEIPT_INVALID',
+    'Completed manager pick-assignment result is unavailable',
+    409,
+  )
 }
 
 function completedExternalFulfillmentReconciliationResult(
@@ -10362,6 +10761,11 @@ export async function planOperationsOrderFromPostgres(input: {
           409,
         )
       }
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId,
+        orderId: order.id,
+        operation: 'plan',
+      })
       if (order.status !== 'imported') {
         throw new OperationsRequestError(
           'OPERATIONS_ORDER_TRANSITION_INVALID',
@@ -10697,7 +11101,7 @@ export async function planOperationsOrderFromPostgres(input: {
            JOIN operations_cartonization_rate_evidence evidence
              ON evidence.organization_id = profile_edge.organization_id
             AND evidence.id = profile_edge.evidence_id
-           JOIN operations_commerce_order_candidate_lines candidate_line
+           JOIN operations_commerce_current_planning_lines candidate_line
              ON candidate_line.organization_id = evidence.organization_id
             AND candidate_line.integration_account_id =
                  evidence.integration_account_id
@@ -10720,7 +11124,7 @@ export async function planOperationsOrderFromPostgres(input: {
            ORDER BY candidate_line.id, profile_version.id,
                     profile_edge.package_key,
                     profile_edge.line_global_id
-           FOR UPDATE OF candidate_line, profile_version`,
+           FOR UPDATE OF profile_version`,
           [organizationId, order.evidence_id],
         )
       const expectedProfileByKey = new Map(
@@ -11083,11 +11487,11 @@ export async function planOperationsOrderFromPostgres(input: {
            product.reference_code AS product_global_id,
            line.quantity::text,
            candidate_line.global_id AS candidate_line_global_id
-         FROM operations_order_lines line
+         FROM operations_current_order_lines line
          JOIN crm_products product
            ON product.pipeline_id = line.pipeline_id
           AND product.id = line.product_id
-         JOIN operations_commerce_order_candidate_lines candidate_line
+         JOIN operations_commerce_current_planning_lines candidate_line
            ON candidate_line.organization_id = line.organization_id
           AND candidate_line.order_candidate_id = $3::uuid
           AND candidate_line.canonical_order_line_id = line.id
@@ -11095,7 +11499,7 @@ export async function planOperationsOrderFromPostgres(input: {
          WHERE line.organization_id = $1::uuid
            AND line.order_id = $2::uuid
          ORDER BY line.global_id
-         FOR UPDATE OF line, candidate_line`,
+         FOR UPDATE OF line`,
         [organizationId, order.id, order.candidate_id],
       )
       if (!lineResult.rows.length) {
@@ -11985,6 +12389,11 @@ export async function releaseOperationsOrderFromPostgres(input: {
           409,
         )
       }
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId,
+        orderId: order.id,
+        operation: 'release',
+      })
       if (order.status !== 'planned') {
         throw new OperationsRequestError(
           'OPERATIONS_ORDER_TRANSITION_INVALID',
@@ -12122,7 +12531,7 @@ export async function releaseOperationsOrderFromPostgres(input: {
                AND allocation.row_count > 0
            )::text AS ready_line_count,
            COALESCE(sum(allocation.row_count), 0)::text AS allocation_row_count
-         FROM operations_order_lines line
+         FROM operations_current_order_lines line
          LEFT JOIN LATERAL (
            SELECT sum(allocation.quantity) AS quantity,
                   count(*) AS row_count,
@@ -12357,6 +12766,7 @@ export async function assignOperationsOrderPicksFromPostgres(input: {
       reason,
     }),
     actorEmail,
+    targetGlobalId: orderGlobalId,
   })
   if (command.completed) {
     return completedOrderCommandResult(organizationId, command.receipt)
@@ -12387,6 +12797,11 @@ export async function assignOperationsOrderPicksFromPostgres(input: {
           409,
         )
       }
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId,
+        orderId: order.id,
+        operation: 'assign',
+      })
       if (order.status !== 'released') {
         throw new OperationsRequestError(
           'OPERATIONS_PICK_ASSIGNMENT_INVALID',
@@ -12395,51 +12810,27 @@ export async function assignOperationsOrderPicksFromPostgres(input: {
         )
       }
 
-      const taskSummary = await client.query<{
-        task_count: string
-        ready_count: string
-      }>(
-        `SELECT count(*)::text AS task_count,
-                count(*) FILTER (WHERE pick.status = 'ready')::text AS ready_count
-         FROM operations_pick_tasks pick
-         JOIN operations_fulfillment_plans plan
-           ON plan.organization_id = pick.organization_id
-          AND plan.id = pick.plan_id
-         JOIN operations_waves wave
-           ON wave.organization_id = pick.organization_id
-          AND wave.id = pick.wave_id
-         WHERE pick.organization_id = $1::uuid
-           AND plan.order_id = $2::uuid
-           AND plan.status = 'released'
-           AND wave.status = 'released'`,
-        [organizationId, order.id],
-      )
-      const taskCount = Number(taskSummary.rows[0]?.task_count || 0)
-      const readyCount = Number(taskSummary.rows[0]?.ready_count || 0)
-      if (taskCount < 1 || readyCount !== taskCount) {
-        throw new OperationsRequestError(
-          'OPERATIONS_PICK_ASSIGNMENT_INVALID',
-          'Every pick must still be ready before reassigning this order',
-          409,
-        )
-      }
+      const assignmentContext = await lockManageablePickAssignment(client, {
+        organizationId,
+        orderId: order.id,
+        orderRowVersion: input.expectedRowVersion,
+      })
+      const taskCount = assignmentContext.tasks.length
 
       const assignment = await client.query(
-        `UPDATE operations_pick_tasks pick
+        `UPDATE operations_pick_tasks
          SET assigned_to = $3, assigned_at = now(), updated_at = now()
-         FROM operations_fulfillment_plans plan,
-              operations_waves wave
-         WHERE pick.organization_id = $1::uuid
-           AND plan.organization_id = pick.organization_id
-           AND plan.id = pick.plan_id
-           AND plan.order_id = $2::uuid
-           AND plan.status = 'released'
-           AND wave.organization_id = pick.organization_id
-           AND wave.id = pick.wave_id
-           AND wave.status = 'released'
-           AND pick.status = 'ready'
-         RETURNING pick.id`,
-        [organizationId, order.id, assignedTo],
+         WHERE organization_id = $1::uuid
+           AND id = ANY($2::uuid[])
+           AND status = 'ready'
+           AND COALESCE(picked_quantity, 0) = 0
+           AND picked_at IS NULL
+         RETURNING id`,
+        [
+          organizationId,
+          assignmentContext.tasks.map((task) => task.id),
+          assignedTo,
+        ],
       )
       if (Number(assignment.rowCount || 0) !== taskCount) {
         throw new OperationsRequestError(
@@ -12482,7 +12873,15 @@ export async function assignOperationsOrderPicksFromPostgres(input: {
         actorEmail,
         correlationId: command.receipt.correlation_id,
         idempotencyKey: `picker-assignment:${command.receipt.id}`,
-        payload: { assignedTo, taskCount, reason },
+        payload: {
+          previousAssignedTo: assignmentContext.previousAssignedTo,
+          assignedTo,
+          taskCount,
+          reason,
+          scanEvidenceCount: 0,
+          countEvidenceCount: 0,
+          physicalWorkStarted: false,
+        },
       })
       await recordAuditEvent({
         actor: actorEmail,
@@ -12494,6 +12893,7 @@ export async function assignOperationsOrderPicksFromPostgres(input: {
         eventKey: `operations:pick-assignment:${command.receipt.id}`,
         payload: {
           assignedTo,
+          previousAssignedTo: assignmentContext.previousAssignedTo,
           taskCount,
           reason,
           previousRowVersion: input.expectedRowVersion,
@@ -12509,10 +12909,852 @@ export async function assignOperationsOrderPicksFromPostgres(input: {
   }
 }
 
+export async function manageOperationsOrderPickAssignmentFromPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  orderGlobalId: string
+  expectedRowVersion: number
+  expectedTaskCount: number
+  expectedAssignmentFingerprint: string
+  assignedTo: string | null
+  reason: string
+  idempotencyKey: string
+}): Promise<OperationsManagePickAssignmentResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
+  const orderGlobalId = String(input.orderGlobalId || '').trim()
+  const assignedTo = String(input.assignedTo || '').trim().toLowerCase() || null
+  const expectedAssignmentFingerprint = String(
+    input.expectedAssignmentFingerprint || '',
+  ).trim().toLowerCase()
+  const reason = String(input.reason || '').trim()
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  if (!actorEmail) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ACTOR_REQUIRED',
+      'A signed-in user is required',
+      401,
+    )
+  }
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_INVALID',
+      'Order is invalid',
+    )
+  }
+  if (
+    !Number.isSafeInteger(input.expectedRowVersion)
+    || input.expectedRowVersion < 0
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_VERSION_INVALID',
+      'Order version is invalid',
+    )
+  }
+  if (
+    !Number.isSafeInteger(input.expectedTaskCount)
+    || input.expectedTaskCount < 1
+    || input.expectedTaskCount > 200
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_ASSIGNMENT_TASKS_CHANGED',
+      'Expected pick task count is invalid',
+    )
+  }
+  if (!/^[a-f0-9]{64}$/.test(expectedAssignmentFingerprint)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_ASSIGNMENT_CHANGED',
+      'Expected picker-assignment fingerprint is invalid',
+    )
+  }
+  if (assignedTo && (!assignedTo.includes('@') || assignedTo.length > 254)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICKER_INVALID',
+      'Choose a valid picker or explicitly leave the work unassigned',
+    )
+  }
+  if (!reason || reason.length > 500 || /[\u0000-\u001f\u007f]/u.test(reason)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ASSIGNMENT_REASON_INVALID',
+      'A manager intervention reason is required',
+    )
+  }
+  if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_IDEMPOTENCY_KEY_INVALID',
+      'A valid idempotency key is required',
+    )
+  }
+
+  const command = await prepareCommandReceipt({
+    organizationId,
+    commandType: 'manage_operations_order_pick_assignment',
+    idempotencyKey,
+    requestHash: commandRequestHash({
+      orderGlobalId,
+      expectedRowVersion: input.expectedRowVersion,
+      expectedTaskCount: input.expectedTaskCount,
+      expectedAssignmentFingerprint,
+      assignedTo,
+      reason,
+    }),
+    actorEmail,
+    targetGlobalId: orderGlobalId,
+  })
+  if (command.completed) {
+    return completedManagePickAssignmentResult(command.receipt)
+  }
+
+  try {
+    return await withTransaction(async (client) => {
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:order:${organizationId}:${orderGlobalId}`,
+      )
+      const orderResult = await client.query<OrderIdentityRow>(
+        `SELECT id::text, global_id, status, row_version::text
+         FROM operations_orders
+         WHERE organization_id = $1::uuid AND global_id = $2
+         FOR UPDATE`,
+        [organizationId, orderGlobalId],
+      )
+      const order = orderResult.rows[0]
+      if (!order || order.row_version === undefined) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_NOT_FOUND',
+          'Operations order was not found',
+          404,
+        )
+      }
+      if (Number(order.row_version) !== input.expectedRowVersion) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_VERSION_CONFLICT',
+          'This order changed before the manager intervention was saved. Refresh and try again.',
+          409,
+        )
+      }
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId,
+        orderId: order.id,
+        operation: 'assign',
+      })
+      if (order.status !== 'released') {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_ASSIGNMENT_INVALID',
+          'Only a released order with unstarted picks can change assignment',
+          409,
+        )
+      }
+      if (assignedTo) {
+        await requireEligibleOperationsPicker(client, organizationId, assignedTo)
+      }
+
+      const assignmentContext = await lockManageablePickAssignment(client, {
+        organizationId,
+        orderId: order.id,
+        orderRowVersion: input.expectedRowVersion,
+        expectedTaskCount: input.expectedTaskCount,
+        expectedAssignmentFingerprint,
+      })
+      if (
+        assignmentContext.previousAssignedTo !== 'mixed'
+        && assignmentContext.previousAssignedTo === assignedTo
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_ASSIGNMENT_UNCHANGED',
+          assignedTo
+            ? 'This picker is already assigned to every task'
+            : 'Every pick task is already unassigned',
+          409,
+        )
+      }
+
+      const assignment = await client.query(
+        `UPDATE operations_pick_tasks
+         SET assigned_to = $3,
+             assigned_at = CASE WHEN $3::text IS NULL THEN NULL ELSE now() END,
+             updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = ANY($2::uuid[])
+           AND status = 'ready'
+           AND COALESCE(picked_quantity, 0) = 0
+           AND picked_at IS NULL
+         RETURNING id`,
+        [
+          organizationId,
+          assignmentContext.tasks.map((task) => task.id),
+          assignedTo,
+        ],
+      )
+      if (
+        Number(assignment.rowCount || 0) !== assignmentContext.tasks.length
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_ASSIGNMENT_TASKS_CHANGED',
+          'Pick tasks changed before the manager intervention was saved',
+          409,
+        )
+      }
+
+      const updatedOrder = await client.query<OrderIdentityRow>(
+        `UPDATE operations_orders
+         SET updated_by = $4, updated_at = now(), row_version = row_version + 1
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND status = 'released'
+           AND row_version = $3
+         RETURNING id::text, global_id, status, row_version::text`,
+        [organizationId, order.id, input.expectedRowVersion, actorEmail],
+      )
+      const managedOrder = updatedOrder.rows[0]
+      if (!managedOrder || managedOrder.row_version === undefined) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_VERSION_CONFLICT',
+          'This order changed before the manager intervention was saved',
+          409,
+        )
+      }
+      const rowVersion = Number(managedOrder.row_version)
+
+      let interventionExceptionGlobalId =
+        assignmentContext.openManagerInterventionExceptionGlobalId
+      if (!assignedTo && !interventionExceptionGlobalId) {
+        const exceptionDetails = {
+          commandReceiptId: command.receipt.id,
+          orderGlobalId,
+          previousAssignedTo: assignmentContext.previousAssignedTo,
+          assignedTaskCount: assignmentContext.tasks.length,
+          reason,
+          previousRowVersion: input.expectedRowVersion,
+          rowVersion,
+          openHandoffExceptionGlobalId:
+            assignmentContext.openHandoffExceptionGlobalId,
+          priorManagerInterventionExceptionGlobalId:
+            assignmentContext.openManagerInterventionExceptionGlobalId,
+          scanEvidenceCount: 0,
+          countEvidenceCount: 0,
+          durableEvidenceCleared: false,
+          physicalWorkChanged: false,
+          providerWrites: 0,
+          recommendedAction: [
+            'Review why the manager removed the picker.',
+            'Assign every exact ready task to an eligible picker before work resumes.',
+            'If physical picking has begun outside ClawPilot, reconcile that work instead of assigning over it.',
+          ].join(' '),
+        }
+        const exceptionResult = await client.query<IdRow>(
+          `INSERT INTO operations_exceptions (
+             organization_id, order_id, exception_type, severity, status,
+             title, details, assigned_to
+           ) VALUES (
+             $1::uuid, $2::uuid, 'manager_pick_intervention', 'high', 'open',
+             $3, $4::jsonb, $5
+           )
+           RETURNING id::text, global_id`,
+          [
+            organizationId,
+            order.id,
+            `Manager removed picker from ${order.global_id}`,
+            JSON.stringify(exceptionDetails),
+            actorEmail,
+          ],
+        )
+        const exception = exceptionResult.rows[0]
+        if (!exception) {
+          throw new OperationsRequestError(
+            'OPERATIONS_PICK_INTERVENTION_EXCEPTION_FAILED',
+            'Manager intervention could not be retained',
+            500,
+          )
+        }
+        interventionExceptionGlobalId = exception.global_id
+      }
+
+      const previousAssignedTo = assignmentContext.previousAssignedTo
+      const eventType = !assignedTo
+        ? 'operations.pick.manager_unassigned'
+        : previousAssignedTo === null
+          ? 'operations.pick.assigned'
+          : 'operations.pick.reassigned'
+      const eventPayload = {
+        previousAssignedTo,
+        assignedTo,
+        taskCount: assignmentContext.tasks.length,
+        pickTaskGlobalIds:
+          assignmentContext.tasks.map((task) => task.global_id),
+        planGlobalId: assignmentContext.plan.global_id,
+        waveGlobalId: assignmentContext.wave.global_id,
+        openHandoffExceptionGlobalId:
+          assignmentContext.openHandoffExceptionGlobalId,
+        interventionExceptionGlobalId,
+        previousRowVersion: input.expectedRowVersion,
+        rowVersion,
+        reason,
+        scanEvidenceCount: 0,
+        countEvidenceCount: 0,
+        durableEvidenceCleared: false,
+        physicalWorkChanged: false,
+        providerWrites: 0,
+      }
+      await appendDomainEvent(client, {
+        organizationId,
+        aggregateType: 'operations.order',
+        aggregateId: order.id,
+        aggregateGlobalId: order.global_id,
+        eventType,
+        actorEmail,
+        correlationId: command.receipt.correlation_id,
+        idempotencyKey:
+          `${order.global_id}:manager-pick-assignment:${command.receipt.id}`,
+        payload: eventPayload,
+      })
+      await recordAuditEvent({
+        actor: actorEmail,
+        eventType: `operations.order.${eventType.split('.').slice(1).join('_')}`,
+        aggregateType: 'operations.order',
+        aggregateId: order.global_id,
+        subject: assignedTo
+          ? `Assigned ${order.global_id} picks to ${assignedTo}`
+          : `Manager removed picker from ${order.global_id}`,
+        organizationId,
+        eventKey: `operations:manager-pick-assignment:${command.receipt.id}`,
+        payload: eventPayload,
+      }, client)
+
+      const result: OperationsManagePickAssignmentResult = {
+        orderGlobalId: managedOrder.global_id,
+        orderStatus: 'released',
+        previousRowVersion: input.expectedRowVersion,
+        rowVersion,
+        taskCount: assignmentContext.tasks.length,
+        previousAssignedTo,
+        assignedTo,
+        interventionExceptionGlobalId,
+        providerWrites: 0,
+        replayed: false,
+      }
+      await completeCommandReceipt(
+        client,
+        command.receipt.id,
+        order.global_id,
+        result,
+      )
+      return result
+    })
+  } catch (error) {
+    await failCommandReceipt(command.receipt.id, error)
+    throw error
+  }
+}
+
+type PickHandoffTaskRow = QueryResultRow & {
+  id: string
+  global_id: string
+  wave_id: string
+  status: string
+  assigned_to: string | null
+  picked_quantity: string | null
+  picked_at: string | Date | null
+}
+
+type BlockedPickConfirmationReceiptRow = QueryResultRow & {
+  id: string
+  target_global_id: string | null
+  actor_email: string
+  status: 'processing' | 'succeeded' | 'failed'
+  error_code: string | null
+  request_hash: string
+}
+
+export async function requestOperationsPickHandoffFromPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  orderGlobalId: string
+  expectedRowVersion: number
+  expectedAssignedTaskCount: number
+  reason: string
+  blockedConfirmationIdempotencyKey?: string
+  idempotencyKey: string
+}): Promise<OperationsPickHandoffResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
+  const orderGlobalId = String(input.orderGlobalId || '').trim()
+  const reason = String(input.reason || '').trim()
+  const blockedConfirmationIdempotencyKey = String(
+    input.blockedConfirmationIdempotencyKey || '',
+  ).trim() || undefined
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  if (!actorEmail) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ACTOR_REQUIRED',
+      'A signed-in user is required',
+      401,
+    )
+  }
+  if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_INVALID',
+      'Order is invalid',
+    )
+  }
+  if (!Number.isSafeInteger(input.expectedRowVersion) || input.expectedRowVersion < 0) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_VERSION_INVALID',
+      'Order version is invalid',
+    )
+  }
+  if (
+    !Number.isSafeInteger(input.expectedAssignedTaskCount)
+    || input.expectedAssignedTaskCount < 1
+    || input.expectedAssignedTaskCount > 200
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_HANDOFF_TASKS_CHANGED',
+      'Assigned task count is invalid',
+    )
+  }
+  if (!reason || reason.length > 500 || /[\u0000-\u001f\u007f]/u.test(reason)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_HANDOFF_REASON_INVALID',
+      'A picker handoff reason is required',
+    )
+  }
+  if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_IDEMPOTENCY_KEY_INVALID',
+      'A valid idempotency key is required',
+    )
+  }
+  if (
+    blockedConfirmationIdempotencyKey
+    && !/^[A-Za-z0-9._:-]{8,200}$/.test(blockedConfirmationIdempotencyKey)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PICK_HANDOFF_CONFIRMATION_INVALID',
+      'Blocked confirmation idempotency key is invalid',
+    )
+  }
+
+  const command = await prepareCommandReceipt({
+    organizationId,
+    commandType: 'request_operations_pick_handoff',
+    idempotencyKey,
+    requestHash: commandRequestHash({
+      orderGlobalId,
+      expectedRowVersion: input.expectedRowVersion,
+      expectedAssignedTaskCount: input.expectedAssignedTaskCount,
+      actorEmail,
+      reason,
+      blockedConfirmationIdempotencyKey:
+        blockedConfirmationIdempotencyKey || null,
+    }),
+    actorEmail,
+    targetGlobalId: orderGlobalId,
+  })
+  if (command.completed) return completedPickHandoffResult(command.receipt)
+
+  try {
+    return await withTransaction(async (client) => {
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:order:${organizationId}:${orderGlobalId}`,
+      )
+      const orderResult = await client.query<OrderIdentityRow>(
+        `SELECT id::text, global_id, status, row_version::text
+         FROM operations_orders
+         WHERE organization_id = $1::uuid AND global_id = $2
+         FOR UPDATE`,
+        [organizationId, orderGlobalId],
+      )
+      const order = orderResult.rows[0]
+      if (!order || order.row_version === undefined) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_NOT_FOUND',
+          'Operations order was not found',
+          404,
+        )
+      }
+      if (Number(order.row_version) !== input.expectedRowVersion) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_VERSION_CONFLICT',
+          'This order changed before the picker handoff was requested. Refresh and try again.',
+          409,
+        )
+      }
+      if (order.status !== 'released') {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_INVALID',
+          'Only a released order with wholly unpicked work can be handed off',
+          409,
+        )
+      }
+
+      const planResult = await client.query<IdRow & { status: string }>(
+        `SELECT id::text, global_id, status
+         FROM operations_fulfillment_plans
+         WHERE organization_id = $1::uuid AND order_id = $2::uuid
+         ORDER BY version_number DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [organizationId, order.id],
+      )
+      const plan = planResult.rows[0]
+      if (!plan || plan.status !== 'released') {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_INVALID',
+          'The released fulfillment plan is unavailable for picker handoff',
+          409,
+        )
+      }
+
+      const waveResult = await client.query<IdRow & { status: string }>(
+        `SELECT wave.id::text, wave.global_id, wave.status
+         FROM operations_waves wave
+         WHERE wave.organization_id = $1::uuid
+           AND wave.id IN (
+             SELECT DISTINCT pick.wave_id
+             FROM operations_pick_tasks pick
+             WHERE pick.organization_id = $1::uuid
+               AND pick.plan_id = $2::uuid
+           )
+         ORDER BY wave.id
+         FOR UPDATE`,
+        [organizationId, plan.id],
+      )
+      if (waveResult.rows.length !== 1 || waveResult.rows[0].status !== 'released') {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_INVALID',
+          'Exactly one released warehouse wave is required for picker handoff',
+          409,
+        )
+      }
+      const wave = waveResult.rows[0]
+
+      const pickResult = await client.query<PickHandoffTaskRow>(
+        `SELECT pick.id::text, pick.global_id,
+                pick.wave_id::text, pick.status,
+                lower(pick.assigned_to) AS assigned_to,
+                pick.picked_quantity::text, pick.picked_at
+         FROM operations_pick_tasks pick
+         WHERE pick.organization_id = $1::uuid
+           AND pick.plan_id = $2::uuid
+         ORDER BY pick.sequence_number, pick.id
+         FOR UPDATE`,
+        [organizationId, plan.id],
+      )
+      if (pickResult.rows.length < 1) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_INVALID',
+          'No assigned pick tasks are available for handoff',
+          409,
+        )
+      }
+      if (pickResult.rows.length !== input.expectedAssignedTaskCount) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_TASKS_CHANGED',
+          'Assigned pick tasks changed before handoff could be recorded',
+          409,
+        )
+      }
+      if (pickResult.rows.some((pick) => (
+        pick.wave_id !== wave.id
+        || pick.status !== 'ready'
+        || Number(pick.picked_quantity || 0) !== 0
+        || pick.picked_at !== null
+      ))) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_ALREADY_STARTED',
+          'Picker handoff is blocked after any task has started or recorded a picked quantity',
+          409,
+        )
+      }
+      if (pickResult.rows.some((pick) => pick.assigned_to !== actorEmail)) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_ACTOR_MISMATCH',
+          'Every pick task must be assigned to the signed-in picker requesting handoff',
+          409,
+        )
+      }
+
+      const acknowledgedScanResult = await client.query<{
+        id: string
+        command_receipt_id: string
+      }>(
+        `SELECT evidence.id::text, receipt.id::text AS command_receipt_id
+         FROM operations_wearable_pick_scan_evidence evidence
+         JOIN operations_command_receipts receipt
+           ON receipt.organization_id = evidence.organization_id
+          AND receipt.id = evidence.command_receipt_id
+         WHERE evidence.organization_id = $1::uuid
+           AND evidence.order_id = $2::uuid
+           AND evidence.order_row_version = $3::bigint
+           AND lower(evidence.recorded_by) = $4
+           AND receipt.command_type = 'record_wearable_pick_scan_evidence'
+           AND receipt.status = 'succeeded'
+           AND lower(receipt.actor_email) = $4
+           AND receipt.target_global_id = $5
+         ORDER BY evidence.server_observed_at, evidence.id
+         LIMIT 1
+         FOR SHARE OF evidence, receipt`,
+        [
+          organizationId,
+          order.id,
+          input.expectedRowVersion,
+          actorEmail,
+          orderGlobalId,
+        ],
+      )
+      const acknowledgedScan = acknowledgedScanResult.rows[0]
+      if (blockedConfirmationIdempotencyKey && !acknowledgedScan) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_CONFIRMATION_INVALID',
+          'Blocked confirmation handoff requires exact acknowledged wearable scan evidence for this picker, order, and version',
+          409,
+        )
+      }
+      if (!blockedConfirmationIdempotencyKey && acknowledgedScan) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_ALREADY_STARTED',
+          'Picker handoff is blocked after wearable scan evidence was acknowledged',
+          409,
+        )
+      }
+
+      const packageResult = await client.query<QueryResultRow & {
+        id: string
+        status: string
+        packed_at: string | Date | null
+      }>(
+        `SELECT package.id::text, package.status, package.packed_at
+         FROM operations_packages package
+         WHERE package.organization_id = $1::uuid
+           AND package.plan_id = $2::uuid
+         ORDER BY package.id
+         FOR UPDATE`,
+        [organizationId, plan.id],
+      )
+      if (packageResult.rows.some((item) => (
+        item.status !== 'planned' || item.packed_at !== null
+      ))) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_ALREADY_STARTED',
+          'Picker handoff is blocked after packing has started',
+          409,
+        )
+      }
+      const labelResult = await client.query<{ id: string }>(
+        `SELECT label.id::text
+         FROM operations_labels label
+         JOIN operations_packages package
+           ON package.organization_id = label.organization_id
+          AND package.id = label.package_id
+         WHERE label.organization_id = $1::uuid
+           AND package.plan_id = $2::uuid
+         ORDER BY label.id
+         FOR UPDATE OF label`,
+        [organizationId, plan.id],
+      )
+      const labelAttemptResult = await client.query<{ id: string }>(
+        `SELECT attempt.id::text
+         FROM operations_label_attempts attempt
+         WHERE attempt.organization_id = $1::uuid
+           AND attempt.order_id = $2::uuid
+         ORDER BY attempt.id
+         FOR UPDATE`,
+        [organizationId, order.id],
+      )
+      if (labelResult.rows.length > 0 || labelAttemptResult.rows.length > 0) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_ALREADY_STARTED',
+          'Picker handoff is blocked after label preparation has started',
+          409,
+        )
+      }
+
+      let blockedConfirmationErrorCode: string | null = null
+      let blockedConfirmationRequestHash: string | null = null
+      if (blockedConfirmationIdempotencyKey) {
+        const blockedReceiptResult = await client.query<
+          BlockedPickConfirmationReceiptRow
+        >(
+          `SELECT id::text, target_global_id, lower(actor_email) AS actor_email,
+                  status, error_code, request_hash
+           FROM operations_command_receipts
+           WHERE organization_id = $1::uuid
+             AND command_type = 'confirm_operations_order_picks'
+             AND idempotency_key = $2
+           LIMIT 1
+           FOR UPDATE`,
+          [organizationId, blockedConfirmationIdempotencyKey],
+        )
+        const blockedReceipt = blockedReceiptResult.rows[0]
+        if (
+          !blockedReceipt
+          || blockedReceipt.target_global_id !== orderGlobalId
+          || blockedReceipt.actor_email !== actorEmail
+          || blockedReceipt.status !== 'failed'
+          || blockedReceipt.error_code
+            !== 'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILIATION_REQUIRED'
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_PICK_HANDOFF_CONFIRMATION_INVALID',
+            'Blocked confirmation must be the exact Shopify reconciliation conflict for this picker and order',
+            409,
+          )
+        }
+        blockedConfirmationErrorCode = blockedReceipt.error_code
+        blockedConfirmationRequestHash = blockedReceipt.request_hash
+      }
+
+      const taskIds = pickResult.rows.map((pick) => pick.id)
+      const unassigned = await client.query(
+        `UPDATE operations_pick_tasks
+         SET assigned_to = NULL, assigned_at = NULL, updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = ANY($2::uuid[])
+           AND status = 'ready'
+           AND COALESCE(picked_quantity, 0) = 0
+           AND picked_at IS NULL
+           AND lower(assigned_to) = $3
+         RETURNING id`,
+        [organizationId, taskIds, actorEmail],
+      )
+      if (Number(unassigned.rowCount || 0) !== taskIds.length) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_TASKS_CHANGED',
+          'Pick tasks changed before handoff could be recorded',
+          409,
+        )
+      }
+
+      const updatedOrder = await client.query<OrderIdentityRow>(
+        `UPDATE operations_orders
+         SET updated_by = $4, updated_at = now(), row_version = row_version + 1
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND status = 'released'
+           AND row_version = $3
+         RETURNING id::text, global_id, status, row_version::text`,
+        [organizationId, order.id, input.expectedRowVersion, actorEmail],
+      )
+      const handedOffOrder = updatedOrder.rows[0]
+      if (!handedOffOrder || handedOffOrder.row_version === undefined) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_VERSION_CONFLICT',
+          'This order changed before the picker handoff was saved',
+          409,
+        )
+      }
+
+      const rowVersion = Number(handedOffOrder.row_version)
+      const recommendedAction = [
+        'Review the picker reason and current provider state.',
+        'Either reassign every ready task to an eligible picker, then resolve this exception,',
+        'or use the separate external-fulfillment reconciliation/cancel path when its evidence supports that disposition.',
+        'This handoff did not modify Shopify, and resolving the exception alone does not reassign work.',
+      ].join(' ')
+      const exceptionDetails = {
+        commandReceiptId: command.receipt.id,
+        orderGlobalId,
+        actorEmail,
+        assignedTaskCount: taskIds.length,
+        reason,
+        previousRowVersion: input.expectedRowVersion,
+        rowVersion,
+        blockedConfirmationIdempotencyKey:
+          blockedConfirmationIdempotencyKey || null,
+        blockedConfirmationErrorCode,
+        blockedConfirmationRequestHash,
+        blockedConfirmationScanEvidenceId: acknowledgedScan?.id || null,
+        blockedConfirmationScanEvidenceReceiptId:
+          acknowledgedScan?.command_receipt_id || null,
+        recommendedAction,
+        providerWrites: 0,
+      }
+      const exceptionResult = await client.query<IdRow>(
+        `INSERT INTO operations_exceptions (
+           organization_id, order_id, exception_type, severity, status,
+           title, details, assigned_to
+         ) VALUES (
+           $1::uuid, $2::uuid, 'picker_handoff_requested', 'high', 'open',
+           $3, $4::jsonb, NULL
+         )
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          order.id,
+          `Picker handoff requested for ${order.global_id}`,
+          JSON.stringify(exceptionDetails),
+        ],
+      )
+      const exception = exceptionResult.rows[0]
+      if (!exception) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_HANDOFF_EXCEPTION_FAILED',
+          'Picker handoff exception could not be retained',
+          500,
+        )
+      }
+
+      const eventPayload = {
+        exceptionGlobalId: exception.global_id,
+        planGlobalId: plan.global_id,
+        waveGlobalId: wave.global_id,
+        ...exceptionDetails,
+      }
+      await appendDomainEvent(client, {
+        organizationId,
+        aggregateType: 'operations.order',
+        aggregateId: order.id,
+        aggregateGlobalId: order.global_id,
+        eventType: 'operations.pick.handoff_requested',
+        actorEmail,
+        correlationId: command.receipt.correlation_id,
+        idempotencyKey: `${order.global_id}:pick-handoff:${command.receipt.id}`,
+        payload: eventPayload,
+      })
+      await recordAuditEvent({
+        actor: actorEmail,
+        eventType: 'operations.order.pick_handoff_requested',
+        aggregateType: 'operations.order',
+        aggregateId: order.global_id,
+        subject: `Picker handoff requested for ${order.global_id}`,
+        organizationId,
+        eventKey: `operations:pick-handoff:${command.receipt.id}`,
+        payload: eventPayload,
+      }, client)
+
+      const result: OperationsPickHandoffResult = {
+        orderGlobalId: handedOffOrder.global_id,
+        orderStatus: 'released',
+        previousRowVersion: input.expectedRowVersion,
+        rowVersion,
+        exceptionGlobalId: exception.global_id,
+        assignedTaskCount: taskIds.length,
+        blockedConfirmationIdempotencyKey:
+          blockedConfirmationIdempotencyKey || null,
+        providerWrites: 0,
+        replayed: false,
+      }
+      await completeCommandReceipt(
+        client,
+        command.receipt.id,
+        order.global_id,
+        result,
+      )
+      return result
+    })
+  } catch (error) {
+    await failCommandReceipt(command.receipt.id, error)
+    throw error
+  }
+}
+
 type WearablePickScanContextRow = QueryResultRow & {
   pick_task_id: string
   pick_task_global_id: string
   pick_status: string
+  quantity: string
   assigned_to: string | null
   assigned_at: string | Date | null
   pick_created_at: string | Date
@@ -12557,6 +13799,7 @@ export type WearablePickScanEvidenceCommandResult = {
 const WEARABLE_SCAN_MAX_AGE_MS = 24 * 60 * 60 * 1_000
 const WEARABLE_SCAN_CLOCK_SKEW_MS = 5 * 60 * 1_000
 const WEARABLE_LOCATION_TO_PRODUCT_MAX_MS = 30 * 60 * 1_000
+const WEARABLE_PRODUCT_TO_COUNT_MAX_MS = 30 * 60 * 1_000
 
 function wearableScanExpectedProductBarcode(row: WearablePickScanContextRow) {
   if (row.assigned_product_barcode) return row.assigned_product_barcode
@@ -12592,6 +13835,19 @@ function wearableScanTime(value: string | Date | null, label: string) {
   return parsed
 }
 
+function wearableCountTime(value: string | Date | null, label: string) {
+  if (value === null) return null
+  const parsed = value instanceof Date ? value : new Date(value)
+  if (!Number.isFinite(parsed.getTime())) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+      `${label} is invalid`,
+      409,
+    )
+  }
+  return parsed
+}
+
 async function readWearablePickScanContexts(
   client: PoolClient,
   input: {
@@ -12605,6 +13861,7 @@ async function readWearablePickScanContexts(
     `SELECT pick.id::text AS pick_task_id,
             pick.global_id AS pick_task_global_id,
             pick.status AS pick_status,
+            pick.quantity::text,
             lower(pick.assigned_to) AS assigned_to,
             pick.assigned_at,
             pick.created_at AS pick_created_at,
@@ -12623,7 +13880,7 @@ async function readWearablePickScanContexts(
      JOIN operations_fulfillment_allocations allocation
        ON allocation.organization_id = pick.organization_id
       AND allocation.id = pick.allocation_id
-     JOIN operations_order_lines line
+     JOIN operations_current_order_lines line
        ON line.organization_id = allocation.organization_id
       AND line.id = allocation.order_line_id
      JOIN operations_orders orders
@@ -12815,6 +14072,231 @@ function validateWearablePickScanEvidence(
   return validated
 }
 
+function validateWearablePickCountEvidence(input: {
+  actorEmail: string
+  countEvidenceIdempotencyKey?: string
+  countEvidence?: WearablePickTaskCountEvidenceInput[]
+  contexts: WearablePickScanContextRow[]
+  acknowledgedScanProductObservations?: Array<{
+    pickTaskId: string
+    barcode: string
+    capturedAt: string
+    source: 'iphone_camera' | 'meta'
+  }>
+  now?: Date
+}) {
+  const idempotencyKey = String(
+    input.countEvidenceIdempotencyKey || '',
+  ).trim() || undefined
+  const evidence = input.countEvidence
+  if (idempotencyKey === undefined && evidence === undefined) {
+    return {
+      enforced: false as const,
+      countEvidenceIdempotencyKey: null as string | null,
+      validated: [],
+    }
+  }
+  if (
+    !idempotencyKey
+    || !/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)
+    || !Array.isArray(evidence)
+    || evidence.length < 1
+    || evidence.length > 200
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+      'Count evidence and its valid idempotency key must be supplied together',
+    )
+  }
+
+  for (const context of input.contexts) {
+    const quantity = Number(context.quantity)
+    if (!Number.isSafeInteger(quantity) || quantity < 1) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_REQUIRED_QUANTITY_INVALID',
+        `Pick task ${context.pick_task_global_id} does not have a positive whole-unit quantity`,
+        409,
+      )
+    }
+  }
+  const required = input.contexts.filter((context) => Number(context.quantity) > 1)
+  if (required.length < 1) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_NOT_REQUIRED',
+      'This order has no multi-unit pick task requiring exact count evidence',
+      409,
+    )
+  }
+  if (evidence.length !== required.length) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INCOMPLETE',
+      'Every multi-unit pick task needs one exact count before confirmation',
+      409,
+    )
+  }
+  const evidenceByTask = new Map(
+    evidence.map((item) => [item.pickTaskGlobalId, item]),
+  )
+  if (evidenceByTask.size !== evidence.length) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_DUPLICATE',
+      'Count evidence contains the same pick task more than once',
+      409,
+    )
+  }
+  const now = input.now || new Date()
+  const scanProductByTask = new Map(
+    (input.acknowledgedScanProductObservations || []).map(
+      (observation) => [observation.pickTaskId, observation],
+    ),
+  )
+  const validated = required.map((context) => {
+    const item = evidenceByTask.get(context.pick_task_global_id)
+    if (!item) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INCOMPLETE',
+        `Count evidence is missing for pick task ${context.pick_task_global_id}`,
+        409,
+      )
+    }
+    if (context.pick_status !== 'ready') {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_EVIDENCE_STALE',
+        'A pick task changed after it was counted. Refresh and scan again.',
+        409,
+      )
+    }
+    if (context.assigned_to !== input.actorEmail) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_EVIDENCE_ACTOR_MISMATCH',
+        'Only the picker assigned to every task may submit its count evidence',
+        403,
+      )
+    }
+    const requiredQuantity = Number(context.quantity)
+    if (
+      !Number.isSafeInteger(item.requiredQuantity)
+      || item.requiredQuantity < 1
+      || item.requiredQuantity !== requiredQuantity
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_REQUIRED_QUANTITY_STALE',
+        `Required quantity changed for pick task ${context.pick_task_global_id}`,
+        409,
+      )
+    }
+    if (
+      !Number.isSafeInteger(item.enteredQuantity)
+      || item.enteredQuantity < 1
+      || item.enteredQuantity !== requiredQuantity
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_MISMATCH',
+        `Entered quantity must exactly equal ${requiredQuantity} for pick task ${context.pick_task_global_id}`,
+        409,
+      )
+    }
+    if (
+      item.countSource !== 'iphone'
+      && item.countSource !== 'watch'
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+        `Count source is invalid for pick task ${context.pick_task_global_id}`,
+      )
+    }
+    if (
+      item.product.source !== 'iphone_camera'
+      && item.product.source !== 'meta'
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+        `Product scan source is invalid for pick task ${context.pick_task_global_id}`,
+      )
+    }
+    const expectedProductBarcode = wearableScanExpectedProductBarcode(context)
+    if (!expectedProductBarcode) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_PRODUCT_BARCODE_REQUIRED',
+        `Pick task ${context.pick_task_global_id} has no authoritative product barcode`,
+        409,
+      )
+    }
+    if (!wearableProductBarcodeMatches(item.product.barcode, expectedProductBarcode)) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_PRODUCT_SCAN_MISMATCH',
+        `Product scan does not match pick task ${context.pick_task_global_id}`,
+        409,
+      )
+    }
+    const acknowledgedScanProduct = scanProductByTask.get(context.pick_task_id)
+    if (
+      context.policy_location_scan_required
+      && (
+        !acknowledgedScanProduct
+        || acknowledgedScanProduct.barcode !== item.product.barcode
+        || acknowledgedScanProduct.capturedAt !== item.product.capturedAt
+        || acknowledgedScanProduct.source !== item.product.source
+      )
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_SCAN_EVIDENCE_MISMATCH',
+        `Count evidence does not reference the acknowledged product scan for pick task ${context.pick_task_global_id}`,
+        409,
+      )
+    }
+    const productCapturedAt = wearableCountTime(
+      item.product.capturedAt,
+      'Product capture time',
+    )!
+    const countedAt = wearableCountTime(item.countedAt, 'Count time')!
+    const minimumContextTime = [
+      wearableCountTime(context.assigned_at, 'Pick assignment time'),
+      wearableCountTime(context.pick_created_at, 'Pick creation time'),
+      wearableCountTime(context.wave_released_at, 'Wave release time'),
+    ].filter((value): value is Date => value !== null)
+      .reduce((latest, value) => value > latest ? value : latest, new Date(0))
+    if (
+      productCapturedAt.getTime()
+        < minimumContextTime.getTime() - WEARABLE_SCAN_CLOCK_SKEW_MS
+      || productCapturedAt.getTime()
+        < now.getTime() - WEARABLE_SCAN_MAX_AGE_MS
+      || productCapturedAt.getTime()
+        > now.getTime() + WEARABLE_SCAN_CLOCK_SKEW_MS
+      || countedAt.getTime() <= productCapturedAt.getTime()
+      || countedAt.getTime() - productCapturedAt.getTime()
+        > WEARABLE_PRODUCT_TO_COUNT_MAX_MS
+      || countedAt.getTime() > now.getTime() + WEARABLE_SCAN_CLOCK_SKEW_MS
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_WEARABLE_COUNT_EVIDENCE_STALE',
+        `Count timing is stale or out of sequence for pick task ${context.pick_task_global_id}`,
+        409,
+      )
+    }
+    return {
+      context,
+      evidence: item,
+      requiredQuantity,
+      expectedProductBarcode,
+      productCapturedAt,
+      countedAt,
+    }
+  })
+  if (evidenceByTask.size !== required.length) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_CONTEXT_MISMATCH',
+      'Count evidence includes a task outside the current multi-unit order',
+      409,
+    )
+  }
+  return {
+    enforced: true as const,
+    countEvidenceIdempotencyKey: idempotencyKey,
+    validated,
+  }
+}
+
 function completedWearablePickScanEvidenceResult(
   receipt: Pick<CommandReceiptRow, 'result_payload'>,
 ): WearablePickScanEvidenceCommandResult {
@@ -12926,6 +14408,11 @@ export async function recordWearablePickScanEvidenceFromPostgres(input: {
           409,
         )
       }
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId,
+        orderId: order.id,
+        operation: 'pick',
+      })
       const planResult = await client.query<QueryResultRow & {
         id: string
         global_id: string
@@ -13132,7 +14619,13 @@ async function requireAcknowledgedWearablePickScanEvidence(
         409,
       )
     }
-    return { enforced: false, evidenceCount: 0, receiptId: null as string | null }
+    const productObservations: Array<{
+      pickTaskId: string
+      barcode: string
+      capturedAt: string
+      source: 'iphone_camera' | 'meta'
+    }> = []
+    return { enforced: false, evidenceCount: 0, receiptId: null as string | null, productObservations }
   }
   const idempotencyKey = String(input.scanEvidenceIdempotencyKey || '').trim()
   if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
@@ -13223,7 +14716,17 @@ async function requireAcknowledgedWearablePickScanEvidence(
       409,
     )
   }
-  return { enforced: true, evidenceCount: required.length, receiptId: receipt.id }
+  return {
+    enforced: true,
+    evidenceCount: required.length,
+    receiptId: receipt.id,
+    productObservations: evidenceResult.rows.map((row) => ({
+      pickTaskId: row.pick_task_id,
+      barcode: row.observed_product_barcode,
+      capturedAt: new Date(row.product_captured_at).toISOString(),
+      source: row.product_source,
+    })),
+  }
 }
 
 type ShopifyExternalFulfillmentDatabaseTarget = {
@@ -13423,7 +14926,7 @@ async function readShopifyExternalFulfillmentDatabaseTarget(
             array_agg(DISTINCT reservation.id::text) FILTER (
               WHERE reservation.id IS NOT NULL
             ) AS reservation_ids
-     FROM operations_order_lines line
+     FROM operations_current_order_lines line
      JOIN operations_orders orders
        ON orders.organization_id = line.organization_id
       AND orders.id = line.order_id
@@ -14003,6 +15506,8 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
   expectedRowVersion: number
   reason: string
   scanEvidenceIdempotencyKey?: string
+  countEvidenceIdempotencyKey?: string
+  countEvidence?: WearablePickTaskCountEvidenceInput[]
   idempotencyKey: string
 }): Promise<OperationsOrderCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
@@ -14012,6 +15517,10 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
   const scanEvidenceIdempotencyKey = String(
     input.scanEvidenceIdempotencyKey || '',
   ).trim() || undefined
+  const countEvidenceIdempotencyKey = String(
+    input.countEvidenceIdempotencyKey || '',
+  ).trim() || undefined
+  const countEvidence = input.countEvidence
   const idempotencyKey = String(input.idempotencyKey || '').trim()
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
   if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
@@ -14035,6 +15544,24 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
       'Scan evidence idempotency key is invalid',
     )
   }
+  if (
+    (countEvidenceIdempotencyKey === undefined)
+      !== (countEvidence === undefined)
+    || (
+      countEvidenceIdempotencyKey
+      && !/^[A-Za-z0-9._:-]{8,200}$/.test(countEvidenceIdempotencyKey)
+    )
+    || (countEvidence !== undefined && (
+      !Array.isArray(countEvidence)
+      || countEvidence.length < 1
+      || countEvidence.length > 200
+    ))
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+      'Count evidence and its valid idempotency key must be supplied together',
+    )
+  }
 
   const command = await prepareCommandReceipt({
     organizationId,
@@ -14045,6 +15572,8 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
       expectedRowVersion: input.expectedRowVersion,
       reason,
       scanEvidenceIdempotencyKey: scanEvidenceIdempotencyKey || null,
+      countEvidenceIdempotencyKey: countEvidenceIdempotencyKey || null,
+      countEvidence: countEvidence || null,
     }),
     actorEmail,
     targetGlobalId: orderGlobalId,
@@ -14056,6 +15585,12 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
   try {
     return await withTransaction(async (client) => {
       await acquireTransactionAdvisoryLock(client, `operations:order:${organizationId}:${orderGlobalId}`)
+      if (countEvidenceIdempotencyKey) {
+        await acquireTransactionAdvisoryLock(
+          client,
+          `operations:wearable-count-evidence:${organizationId}:${countEvidenceIdempotencyKey}`,
+        )
+      }
       const activation = await resolveActivation(client, organizationId)
       if (!['shadow', 'active'].includes(activation.state)) {
         throw new OperationsRequestError(
@@ -14083,6 +15618,11 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           409,
         )
       }
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId,
+        orderId: order.id,
+        operation: 'pick',
+      })
       if (order.status !== 'released') {
         throw new OperationsRequestError(
           'OPERATIONS_ORDER_TRANSITION_INVALID',
@@ -14279,6 +15819,14 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           contexts: wearableScanContexts,
           scanEvidenceIdempotencyKey,
         })
+      const countEvidenceAcknowledgement = validateWearablePickCountEvidence({
+        actorEmail,
+        countEvidenceIdempotencyKey,
+        countEvidence,
+        contexts: wearableScanContexts,
+        acknowledgedScanProductObservations:
+          scanEvidenceAcknowledgement.productObservations,
+      })
 
       const blockingResult = await client.query<QueryResultRow & { count: string }>(
         `SELECT count(*)::text AS count
@@ -14310,6 +15858,55 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           'OPERATIONS_INVENTORY_POSITION_CHANGED',
           'Reserved inventory changed before picks could be confirmed. Refresh and try again.',
           409,
+        )
+      }
+
+      for (const item of countEvidenceAcknowledgement.validated) {
+        const evidenceHash = commandRequestHash({
+          orderGlobalId,
+          orderRowVersion: input.expectedRowVersion,
+          pickTaskGlobalId: item.context.pick_task_global_id,
+          requiredQuantity: item.requiredQuantity,
+          enteredQuantity: item.evidence.enteredQuantity,
+          expectedProductBarcode: item.expectedProductBarcode,
+          observedProductBarcode: item.evidence.product.barcode,
+          productCapturedAt: item.evidence.product.capturedAt,
+          productSource: item.evidence.product.source,
+          countedAt: item.evidence.countedAt,
+          countSource: item.evidence.countSource,
+        })
+        await client.query(
+          `INSERT INTO operations_wearable_pick_count_evidence (
+             organization_id, command_receipt_id,
+             count_evidence_idempotency_key, order_id, order_row_version,
+             pick_task_id, required_quantity, entered_quantity,
+             expected_product_barcode, observed_product_barcode,
+             product_captured_at, product_source, counted_at, count_source,
+             evidence_hash, recorded_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3, $4::uuid, $5,
+             $6::uuid, $7, $8,
+             $9, $10, $11::timestamptz, $12, $13::timestamptz, $14,
+             $15, $16
+           )`,
+          [
+            organizationId,
+            command.receipt.id,
+            countEvidenceAcknowledgement.countEvidenceIdempotencyKey,
+            order.id,
+            input.expectedRowVersion,
+            item.context.pick_task_id,
+            item.requiredQuantity,
+            item.evidence.enteredQuantity,
+            item.expectedProductBarcode,
+            item.evidence.product.barcode,
+            item.evidence.product.capturedAt,
+            item.evidence.product.source,
+            item.evidence.countedAt,
+            item.evidence.countSource,
+            evidenceHash,
+            actorEmail,
+          ],
         )
       }
 
@@ -14415,6 +16012,19 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           scanEvidenceEnforced: scanEvidenceAcknowledgement.enforced,
           scanEvidenceCount: scanEvidenceAcknowledgement.evidenceCount,
           scanEvidenceReceiptId: scanEvidenceAcknowledgement.receiptId,
+          countEvidenceEnforced: countEvidenceAcknowledgement.enforced,
+          countEvidenceCount: countEvidenceAcknowledgement.validated.length,
+          countEvidenceIdempotencyKey:
+            countEvidenceAcknowledgement.countEvidenceIdempotencyKey,
+          countedPickTaskGlobalIds:
+            countEvidenceAcknowledgement.validated.map(
+              (item) => item.context.pick_task_global_id,
+            ),
+          countSources: [...new Set(
+            countEvidenceAcknowledgement.validated.map(
+              (item) => item.evidence.countSource,
+            ),
+          )],
         },
       })
       await recordAuditEvent({
@@ -14440,6 +16050,19 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           scanEvidenceEnforced: scanEvidenceAcknowledgement.enforced,
           scanEvidenceCount: scanEvidenceAcknowledgement.evidenceCount,
           scanEvidenceReceiptId: scanEvidenceAcknowledgement.receiptId,
+          countEvidenceEnforced: countEvidenceAcknowledgement.enforced,
+          countEvidenceCount: countEvidenceAcknowledgement.validated.length,
+          countEvidenceIdempotencyKey:
+            countEvidenceAcknowledgement.countEvidenceIdempotencyKey,
+          countedPickTaskGlobalIds:
+            countEvidenceAcknowledgement.validated.map(
+              (item) => item.context.pick_task_global_id,
+            ),
+          countSources: [...new Set(
+            countEvidenceAcknowledgement.validated.map(
+              (item) => item.evidence.countSource,
+            ),
+          )],
         },
       }, client)
       const result: OperationsOrderCommandResult = {
@@ -14532,6 +16155,11 @@ export async function verifyOperationsOrderPackFromPostgres(input: {
           409,
         )
       }
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId,
+        orderId: order.id,
+        operation: 'pack',
+      })
       if (order.status !== 'picking') {
         throw new OperationsRequestError(
           'OPERATIONS_ORDER_TRANSITION_INVALID',
@@ -14966,6 +16594,11 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
           409,
         )
       }
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId,
+        orderId: source.order_id,
+        operation: 'packing_slip',
+      })
       if (
         source.plan_status !== 'released'
         || !['packed', 'labeled'].includes(source.package_status)
@@ -14986,7 +16619,7 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
            count(*) FILTER (
              WHERE COALESCE(package_total.quantity, 0) = source_line.quantity
            )::text AS complete_line_count
-         FROM operations_order_lines source_line
+         FROM operations_current_order_lines source_line
          LEFT JOIN LATERAL (
            SELECT sum(content.quantity) AS quantity
            FROM operations_package_contents content
@@ -15023,7 +16656,7 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
            source_line.channel_sku,
            content.quantity::text
          FROM operations_package_contents content
-         JOIN operations_order_lines source_line
+         JOIN operations_current_order_lines source_line
            ON source_line.organization_id = content.organization_id
           AND source_line.id = content.order_line_id
          JOIN crm_products product
@@ -15763,6 +17396,11 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
         404,
       )
     }
+    await requireCurrentCommerceOrderRevision(client, {
+      organizationId: input.organizationId,
+      orderId: row.order_id,
+      operation: 'export',
+    })
     const decision = commerceExportCustomerNotificationDecision(
       row.payload_snapshot,
       row.provider,
@@ -16887,7 +18525,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
                 source_order.order_number, source_order.currency,
                 source_order.ship_to,
                 (SELECT count(*)::text
-                 FROM operations_order_lines source_line
+                 FROM operations_current_order_lines source_line
                  WHERE source_line.organization_id = source_order.organization_id
                    AND source_line.order_id = source_order.id) AS line_count
          FROM operations_orders source_order
@@ -16917,6 +18555,11 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           409,
         )
       }
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId,
+        orderId: order.id,
+        operation: 'ship',
+      })
       if (order.status !== 'packed') {
         throw new OperationsRequestError(
           'OPERATIONS_ORDER_TRANSITION_INVALID',
@@ -17338,7 +18981,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
                 position.reserved_quantity::text,
                 position.source_authority
          FROM operations_fulfillment_allocations allocation
-         JOIN operations_order_lines source_line
+         JOIN operations_current_order_lines source_line
            ON source_line.organization_id = allocation.organization_id
           AND source_line.id = allocation.order_line_id
          JOIN crm_products product
@@ -17549,7 +19192,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
                 product.name AS product_name, source_line.channel_sku,
                 content.quantity::text
          FROM operations_package_contents content
-         JOIN operations_order_lines source_line
+         JOIN operations_current_order_lines source_line
            ON source_line.organization_id = content.organization_id
           AND source_line.id = content.order_line_id
          JOIN crm_products product

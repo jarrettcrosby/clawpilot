@@ -139,6 +139,10 @@ const activeDispatchSnapshot = loadTypeScriptModule(
 )
 const providerBoundaryCallCount = { value: 0 }
 let activeDispatchTransactionPool = null
+const commerceOrderRevisionGate = {
+  async assertCommerceOrderRevisionExecutionCurrent() {},
+  CommerceOrderRevisionGateError: class extends Error {},
+}
 
 const productionRerates = loadTypeScriptModule(
   'app_src/lib/operations/productionFulfillmentRerates.ts',
@@ -165,6 +169,7 @@ const productionRerates = loadTypeScriptModule(
         throw new Error('Unexpected dispatch binding in finalizer test')
       },
     },
+    '@/lib/persistence/commerceOrderRevisions': commerceOrderRevisionGate,
     '@/lib/persistence/postgres': {
       acquireTransactionAdvisoryLock: (client, key) => client.query(
         'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
@@ -197,6 +202,7 @@ const productionReratesForDispatch = loadTypeScriptModule(
       },
     },
     '@/lib/operations/activeCarrierDispatchSnapshot': activeDispatchSnapshot,
+    '@/lib/persistence/commerceOrderRevisions': commerceOrderRevisionGate,
     '@/lib/persistence/postgres': {
       acquireTransactionAdvisoryLock: (client, key) => client.query(
         'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',

@@ -114,9 +114,21 @@ async function verifyRepair(databaseUrl) {
        )`,
     )
 
-    await client.query(unionRepairMigrationSql)
-    await client.query(parcelRepairMigrationSql)
-
+    const initialDefinitionResult = await client.query(
+      `SELECT pg_get_functiondef(
+         'validate_operations_fulfillment_execution()'::regprocedure
+       ) AS definition`,
+    )
+    const initialDefinition = String(
+      initialDefinitionResult.rows[0]?.definition || '',
+    )
+    const revisionCurrentLineAuthority = initialDefinition.includes(
+      'operations_current_order_lines',
+    )
+    if (!revisionCurrentLineAuthority) {
+      await client.query(unionRepairMigrationSql)
+      await client.query(parcelRepairMigrationSql)
+    }
     const firstDefinitionResult = await client.query(
       `SELECT pg_get_functiondef(
          'validate_operations_fulfillment_execution()'::regprocedure
@@ -126,8 +138,14 @@ async function verifyRepair(databaseUrl) {
       firstDefinitionResult.rows[0]?.definition || '',
     )
 
-    await client.query(unionRepairMigrationSql)
-    await client.query(parcelRepairMigrationSql)
+    // 0274 deliberately recompiles the repaired validator against the
+    // current-line view. Reapplying the historical 0194 template after that
+    // point would be a backwards migration, so verify the final definition in
+    // place. Pre-0274 schemas still prove byte-identical 0194/0195 replay.
+    if (!revisionCurrentLineAuthority) {
+      await client.query(unionRepairMigrationSql)
+      await client.query(parcelRepairMigrationSql)
+    }
     const secondDefinitionResult = await client.query(
       `SELECT pg_get_functiondef(
          'validate_operations_fulfillment_execution()'::regprocedure
@@ -139,8 +157,14 @@ async function verifyRepair(databaseUrl) {
     assert.equal(
       definition,
       firstDefinition,
-      'Reapplying the validator repair must be byte-identical',
+      'The authoritative validator repair must remain byte-identical',
     )
+    if (revisionCurrentLineAuthority) {
+      assert.ok(
+        definition.includes('operations_current_order_lines'),
+        'Post-0274 fulfillment validation must retain current-line authority',
+      )
+    }
 
     for (const fragment of [
       'canonical_line_mismatch',

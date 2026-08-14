@@ -94,6 +94,8 @@ assert.deepEqual(
     'WWEX_SPEEDSHIP_ADAPTER_VERSION',
     'WWEX_SPEEDSHIP_FLOW_PATHS',
     'WWEX_SPEEDSHIP_PROVIDER',
+    'WWEX_LTL_PACKAGING_TYPES',
+    'WWEX_SMALLPACK_PACKAGING_TYPES',
     'WwexSpeedshipPartialTenderOutcomeError',
     'parseWwexLtlShopResponse',
     'parseWwexLtlTenderResponse',

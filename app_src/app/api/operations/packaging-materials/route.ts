@@ -19,6 +19,7 @@ import {
   readPackagingMaterialsWorkspaceFromPostgres,
   savePackagingMaterialInPostgres,
   savePackagingMaterialStockInPostgres,
+  removePackagingMaterialInPostgres,
 } from '@/lib/persistence/packagingMaterials'
 import { requireRequestUser } from '@/lib/requestUser'
 
@@ -187,6 +188,12 @@ function materialInput(value: Record<string, unknown>): PackagingMaterialInput {
   ) as PackagingMaterialInput['status']
   if (!PACKAGING_MATERIAL_STATUSES.includes(status)) {
     fail('PACKAGING_MATERIAL_REQUEST_INVALID', 'Material status is invalid')
+  }
+  if (status === 'retired') {
+    fail(
+      'PACKAGING_MATERIAL_ACTION_INVALID',
+      'Use Remove material to retire a packaging material safely',
+    )
   }
   const innerLengthMm = optionalIntegerValue(
     value.innerLengthMm,
@@ -370,6 +377,12 @@ function materialInput(value: Record<string, unknown>): PackagingMaterialInput {
   ) as PackagingMaterialInput['source']
   if (!PACKAGING_MATERIAL_SOURCES.includes(source)) {
     fail('PACKAGING_MATERIAL_REQUEST_INVALID', 'Packaging material source is invalid')
+  }
+  if (source === 'shopify_import' && !globalId) {
+    fail(
+      'PACKAGING_MATERIAL_ACTION_INVALID',
+      'Create Shopify package materials through the verified import workflow',
+    )
   }
   if (
     status === 'active'
@@ -597,6 +610,24 @@ export async function POST(req: NextRequest) {
         idempotencyKey: idempotencyKey(req),
       })
       return json({ ok: true, capabilities, result }, result.replayed ? 200 : 201)
+    }
+    if (action === 'remove-material') {
+      assertFields(body, new Set([
+        'action', 'materialGlobalId', 'expectedRowVersion',
+      ]))
+      const result = await removePackagingMaterialInPostgres({
+        organizationId,
+        actorEmail: actor.email,
+        materialGlobalId: materialGlobalId(body.materialGlobalId),
+        expectedRowVersion: integerValue(
+          body.expectedRowVersion,
+          'Packaging material version',
+          0,
+          2_147_483_647,
+        ),
+        idempotencyKey: idempotencyKey(req),
+      })
+      return json({ ok: true, capabilities, result })
     }
     fail('PACKAGING_MATERIAL_ACTION_INVALID', 'Packaging material action is invalid')
   } catch (error) {

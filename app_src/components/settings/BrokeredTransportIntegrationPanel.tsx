@@ -92,7 +92,13 @@ async function requestTransport(init?: RequestInit) {
   return result.integrations
 }
 
-export default function BrokeredTransportIntegrationPanel() {
+export type BrokeredTransportFocus = 'small_parcel' | 'ltl' | 'all'
+
+export default function BrokeredTransportIntegrationPanel({
+  focus = 'all',
+}: {
+  focus?: BrokeredTransportFocus
+}) {
   const [provider, setProvider] = useState<Provider>('wwex_speedship')
   const [environment, setEnvironment] = useState<Environment>('sandbox')
   const [accounts, setAccounts] = useState<IntegrationAccount[]>([])
@@ -136,6 +142,12 @@ export default function BrokeredTransportIntegrationPanel() {
   useEffect(() => {
     if (account) setDisplayName(account.displayName)
   }, [account])
+
+  useEffect(() => {
+    if (focus === 'small_parcel' && provider !== 'wwex_speedship') {
+      chooseProvider('wwex_speedship')
+    }
+  }, [focus, provider])
 
   function chooseProvider(value: Provider) {
     const nextEnvironment = value === 'rl_carriers' ? 'production' : 'sandbox'
@@ -238,6 +250,13 @@ export default function BrokeredTransportIntegrationPanel() {
     setNotice('')
     setError('')
     try {
+      const ratingModes = provider === 'rl_carriers'
+        ? ['ltl']
+        : focus === 'small_parcel'
+          ? ['small_parcel']
+          : focus === 'ltl'
+            ? ['ltl']
+            : ['small_parcel', 'ltl']
       const result = await requestTransport({
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -245,9 +264,7 @@ export default function BrokeredTransportIntegrationPanel() {
           action: 'verify-and-activate-rates',
           provider,
           environment,
-          ratingModes: provider === 'wwex_speedship'
-            ? ['small_parcel', 'ltl']
-            : ['ltl'],
+          ratingModes,
           ...(provider === 'rl_carriers' ? {
             verificationPostalCode,
             verificationCountryCode,
@@ -256,7 +273,7 @@ export default function BrokeredTransportIntegrationPanel() {
       })
       setAccounts(result.accounts)
       setNotice(provider === 'wwex_speedship'
-        ? 'Worldwide Express sandbox authentication passed. UPS Small Parcel and brokered LTL rating are active; tendering remains disabled.'
+        ? `Worldwide Express sandbox authentication passed. ${focus === 'small_parcel' ? 'Small Parcel' : focus === 'ltl' ? 'LTL' : 'Small Parcel and LTL'} rating is active; any previously active mode was preserved and tendering remains disabled.`
         : 'R+L production authentication and service-point verification passed. LTL rating is active; BOL, pickup, and tendering remain disabled.')
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Unable to verify and activate carrier rates')
@@ -275,7 +292,11 @@ export default function BrokeredTransportIntegrationPanel() {
   const ratingActive = Boolean(
     account
     && (provider === 'wwex_speedship'
-      ? account.ratingActivation.smallParcel && account.ratingActivation.ltl
+      ? focus === 'small_parcel'
+        ? account.ratingActivation.smallParcel
+        : focus === 'ltl'
+          ? account.ratingActivation.ltl
+          : account.ratingActivation.smallParcel && account.ratingActivation.ltl
       : account.ratingActivation.ltl),
   )
   const canActivateRates = Boolean(
@@ -288,14 +309,24 @@ export default function BrokeredTransportIntegrationPanel() {
   )
 
   return (
-    <Box sx={{ mt: 4, pt: 3, borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+    <Box sx={focus === 'ltl'
+      ? { maxWidth: 840, mx: 'auto' }
+      : { mt: 4, pt: 3, borderTop: '1px solid rgba(255,255,255,0.08)' }}>
       <Stack spacing={2.25}>
         <Box>
           <Typography variant="h6" sx={{ fontWeight: 700 }}>
-            Brokered parcel and LTL
+            {focus === 'small_parcel'
+              ? 'Worldwide Express parcel'
+              : focus === 'ltl'
+                ? 'LTL carrier integrations'
+                : 'Brokered parcel and LTL'}
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            Worldwide Express provides UPS Small Parcel and brokered LTL offers. R+L is a direct LTL connection. Provider and executing carrier remain separate shipment facts.
+            {focus === 'small_parcel'
+              ? 'Worldwide Express provides UPS Small Parcel offers. This uses the same Worldwide Express account shown under LTL; credentials are stored once per environment.'
+              : focus === 'ltl'
+                ? 'Worldwide Express provides brokered LTL offers and R+L is a direct LTL connection. A Worldwide Express credential stored for parcel is reused here rather than duplicated.'
+                : 'Worldwide Express provides UPS Small Parcel and brokered LTL offers. R+L is a direct LTL connection. Provider and executing carrier remain separate shipment facts.'}
           </Typography>
         </Box>
 
@@ -325,7 +356,9 @@ export default function BrokeredTransportIntegrationPanel() {
                     disabled={Boolean(pending)}
                   >
                     <MenuItem value="wwex_speedship">Worldwide Express</MenuItem>
-                    <MenuItem value="rl_carriers">R+L Carriers</MenuItem>
+                    {focus !== 'small_parcel' ? (
+                      <MenuItem value="rl_carriers">R+L Carriers</MenuItem>
+                    ) : null}
                   </Select>
                 </FormControl>
                 <FormControl fullWidth sx={fieldSx}>
@@ -507,7 +540,7 @@ export default function BrokeredTransportIntegrationPanel() {
                   variant="contained"
                   startIcon={pending === 'save' ? <CircularProgress size={16} color="inherit" /> : <SaveRounded />}
                   disabled={Boolean(pending) || !canSave}
-                  sx={{ minHeight: 40, borderRadius: '8px' }}
+                  sx={{ minHeight: 44, borderRadius: '8px' }}
                 >
                   Store credential
                 </Button>
@@ -521,7 +554,7 @@ export default function BrokeredTransportIntegrationPanel() {
                       : <VerifiedRounded />}
                     disabled={Boolean(pending) || !canActivateRates}
                     onClick={() => void activateRates()}
-                    sx={{ minHeight: 40, borderRadius: '8px' }}
+                    sx={{ minHeight: 44, borderRadius: '8px' }}
                   >
                     {ratingActive ? 'Reverify active rates' : 'Verify and activate rates'}
                   </Button>
@@ -534,7 +567,7 @@ export default function BrokeredTransportIntegrationPanel() {
                     startIcon={<DeleteOutlineRounded />}
                     disabled={Boolean(pending)}
                     onClick={() => setConfirmDisconnect(true)}
-                    sx={{ minHeight: 40, borderRadius: '8px' }}
+                    sx={{ minHeight: 44, borderRadius: '8px' }}
                   >
                     Disconnect
                   </Button>
@@ -556,6 +589,7 @@ export default function BrokeredTransportIntegrationPanel() {
                       variant="contained"
                       disabled={Boolean(pending)}
                       onClick={() => void disconnect()}
+                      sx={{ minHeight: 44 }}
                     >
                       Confirm disconnect
                     </Button>

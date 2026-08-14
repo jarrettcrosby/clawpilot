@@ -43,6 +43,7 @@ Current product behavior is defined by active module and operating contracts. Op
 - [User integrations and credentials](modules/user-integrations.md)
 - [Toast POS and accounting](modules/toast-and-accounting.md)
 - [QuickBooks accounting connector](modules/quickbooks-accounting.md)
+- [Shipping](modules/shipping.md)
 - [Projects and tenancy](modules/projects-and-tenancy.md)
 - [Pipeline and synchronization](modules/pipeline-and-sync.md)
 - [CRM and workbook reporting](modules/crm-and-reporting.md)

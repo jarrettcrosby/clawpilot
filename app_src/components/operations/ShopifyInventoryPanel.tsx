@@ -28,6 +28,7 @@ import ToggleButton from '@mui/material/ToggleButton'
 import ToggleButtonGroup from '@mui/material/ToggleButtonGroup'
 import Typography from '@mui/material/Typography'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
+import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import {
@@ -193,6 +194,10 @@ type InventoryState = {
     maxAttempts: number
     availableAt: string | null
     completedAt: string | null
+    affectedOrders: Array<{
+      globalId: string
+      orderNumber: string
+    }>
   }
 }
 
@@ -588,9 +593,11 @@ function idempotencyKey() {
 export default function ShopifyInventoryPanel({
   accountGlobalId,
   displayName,
+  onOpenOrder,
 }: {
   accountGlobalId: string
   displayName: string
+  onOpenOrder: (orderGlobalId: string) => void
 }) {
   const {
     measurementSystem,
@@ -757,6 +764,13 @@ export default function ShopifyInventoryPanel({
 
   const run = inventory?.latestRun
   const refreshRecovery = inventory?.refreshRecovery
+  const affectedOrders = refreshRecovery?.affectedOrders || []
+  const providerCommitmentRecovery = Boolean(
+    refreshRecovery?.managerRecoveryRequired
+    && refreshRecovery.lastErrorCode
+      === 'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT'
+    && affectedOrders.length > 0,
+  )
   const automaticRefreshBusy = (
     refreshRecovery?.status === 'pending'
     || refreshRecovery?.status === 'processing'
@@ -888,12 +902,19 @@ export default function ShopifyInventoryPanel({
                 startIcon={syncing
                   ? <CircularProgress size={16} color="inherit" />
                   : <RefreshRounded />}
-                disabled={loading || syncing || automaticRefreshBusy}
+                disabled={
+                  loading
+                  || syncing
+                  || automaticRefreshBusy
+                  || providerCommitmentRecovery
+                }
                 onClick={() => { void sync() }}
                 sx={{ minHeight: 40, flexShrink: 0 }}
               >
                 {syncing
                   ? 'Syncing inventory…'
+                  : providerCommitmentRecovery
+                    ? 'Resolve affected order first'
                   : refreshRecovery?.managerRecoveryRequired
                     ? 'Retry inventory sync'
                     : automaticRefreshBusy
@@ -910,7 +931,31 @@ export default function ShopifyInventoryPanel({
             read-only and performs zero Shopify writes.
           </Alert>
 
-          {refreshRecovery?.managerRecoveryRequired ? (
+          {providerCommitmentRecovery ? (
+            <Alert severity="error">
+              <Stack spacing={1.25} alignItems="flex-start">
+                <Typography variant="body2">
+                  Shopify’s current inventory no longer covers units reserved
+                  for {affectedOrders.length === 1
+                    ? 'this Operations order'
+                    : 'these Operations orders'}. Open the affected order
+                  {affectedOrders.length === 1 ? '' : 's'},
+                  reconcile the Shopify fulfillment, then retry inventory sync.
+                </Typography>
+                {affectedOrders.map((order) => (
+                  <Button
+                    key={order.globalId}
+                    size="small"
+                    variant="outlined"
+                    startIcon={<OpenInNewRounded />}
+                    onClick={() => onOpenOrder(order.globalId)}
+                  >
+                    Open order {order.orderNumber}
+                  </Button>
+                ))}
+              </Stack>
+            </Alert>
+          ) : refreshRecovery?.managerRecoveryRequired ? (
             <Alert severity="error">
               Automatic Shopify inventory refresh is paused for this
               connection after {refreshRecovery.attemptCount} of{' '}

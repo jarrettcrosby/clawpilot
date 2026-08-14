@@ -59,6 +59,10 @@ function locationLabel(location: OperationsBarcodeLabelLocation) {
   return `${location.code} · ${location.zone} · ${location.locationType}`
 }
 
+function barcodeLabelPreviewUrl(batchGlobalId: string) {
+  return `/api/operations/barcode-labels/${encodeURIComponent(batchGlobalId)}/preview`
+}
+
 export default function BarcodeLabelsDialog({ open, onClose }: Props) {
   const [workspace, setWorkspace] = useState<OperationsBarcodeLabelWorkspace | null>(null)
   const [loading, setLoading] = useState(false)
@@ -144,14 +148,8 @@ export default function BarcodeLabelsDialog({ open, onClose }: Props) {
       })
       const payload = await response.json() as ApiPayload
       if (!response.ok || !payload.batch) throw new Error(payload.error || 'Barcode labels could not be generated')
-      setNotice(`${payload.batch.labelCount} ${targetType} labels generated. Preview or download them before explicitly queuing a printer.`)
       setSelected([])
-      await load()
-      window.open(
-        `/api/operations/barcode-labels/${encodeURIComponent(payload.batch.globalId)}/preview`,
-        '_blank',
-        'noopener,noreferrer',
-      )
+      window.location.assign(barcodeLabelPreviewUrl(payload.batch.globalId))
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Barcode labels could not be generated')
     } finally {
@@ -368,7 +366,7 @@ export default function BarcodeLabelsDialog({ open, onClose }: Props) {
           <Box>
             <Typography variant="h6">Generated batches</Typography>
             <Typography variant="body2" color="text.secondary">
-              Browser preview and ZPL download work without a local print agent. Printer delivery is always a separate operator action.
+              Browser preview and ZPL download work without a local print agent. Preview opens in this window; use your browser Back control to return. Printer delivery is always a separate operator action.
             </Typography>
           </Box>
           {(workspace?.batches || []).length === 0 && (
@@ -391,11 +389,10 @@ export default function BarcodeLabelsDialog({ open, onClose }: Props) {
                   <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
                     <Chip size="small" label={labelBatch.printJobStatus || 'Not queued'} color={labelBatch.printJobStatus === 'delivered' ? 'success' : 'default'} />
                     <Button
+                      component="a"
                       size="small"
                       startIcon={<VisibilityRounded />}
-                      href={`/api/operations/barcode-labels/${encodeURIComponent(labelBatch.globalId)}/preview`}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                      href={barcodeLabelPreviewUrl(labelBatch.globalId)}
                     >Preview</Button>
                     <Button
                       size="small"

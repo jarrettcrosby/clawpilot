@@ -15,11 +15,34 @@ import {
   prepareCarrierWholeShipmentRateRequest,
 } from '@/lib/integrations/carrierWholeShipmentRateFoundation'
 import {
+  getBrokeredTransportIntegrations,
+  readActiveBrokeredTransportRuntimeCredential,
+} from '@/lib/integrations/brokeredTransportIntegrations'
+import {
+  executeWwexSpeedshipShopRequest,
+  WwexSpeedshipClientError,
+} from '@/lib/integrations/wwexSpeedshipClient'
+import {
+  prepareWwexSmallpackShopRequest,
+  WWEX_SPEEDSHIP_ADAPTER_VERSION,
+} from '@/lib/integrations/wwexSpeedshipFoundation'
+import {
+  loosePackagePlanHash,
+  normalizeLoosePackagePlan,
+  transportRequestProfileHash,
+  TRANSPORT_PLAN_CONTRACT_VERSION,
+  type LoosePackagePlan,
+} from '@/lib/operations/transport'
+import {
   oneOffProviderLabel,
   oneOffRateEnvironment,
   oneOffShipmentHash,
+  canonicalOneOffCarrierSelections,
+  oneOffCarrierSelectionKey,
   ONE_OFF_MAX_SYNCHRONOUS_PACKAGES,
   type OneOffCarrierProvider,
+  type OneOffCarrierSelectionInput,
+  type OneOffResolvedCarrierSelection,
   type OneOffRateEnvironment,
   type OneOffShipmentCreateResult,
   type OneOffShipmentLineInput,
@@ -28,6 +51,15 @@ import {
   type OneOffShipmentQuoteInput,
   type OneOffShipmentWorkspace,
 } from '@/lib/operations/oneOffShipments'
+import {
+  defaultCanonicalPackageProfile,
+  normalizeCanonicalPackageProfile,
+  packageCatalogEntry,
+  packageKindForMaterialType,
+  packagingMaterialUnitCounts,
+  packageProviderCode,
+  type CanonicalPackageProfile,
+} from '@/lib/operations/packageCatalog'
 import type { Address, Millimeters } from '@/lib/operations/types'
 import { stageCrmRecordWithClient } from '@/lib/persistence/crm'
 import {
@@ -44,6 +76,8 @@ const LOCATION_GLOBAL_ID = /^gwl(?:[0-9]{7}|[0-9a-v]{12})$/
 const INVENTORY_POOL_GLOBAL_ID = /^gip(?:[0-9]{7}|[0-9a-v]{12})$/
 const QUOTE_GLOBAL_ID = /^goq(?:[0-9]{7}|[0-9a-v]{12})$/
 const OFFER_GLOBAL_ID = /^goo(?:[0-9]{7}|[0-9a-v]{12})$/
+const INTEGRATION_ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
+const CARRIER_ACCOUNT_GLOBAL_ID = /^gac(?:[0-9]{7}|[0-9a-v]{12})$/
 const IDEMPOTENCY_KEY = /^[^\u0000-\u001f\u007f]{8,160}$/
 const MONEY = /^(?:0|[1-9][0-9]{0,12})(?:\.[0-9]{1,2})?$/
 const QUOTE_TTL_MS = 20 * 60_000
@@ -256,7 +290,10 @@ function parcel(value: unknown, index: number): OneOffShipmentPackageInput {
   const source = record(value, `Parcel ${index + 1}`)
   exactFields(
     source,
-    ['packageKey', 'description', 'dimensionsMm', 'grossWeightGrams', 'allocations'],
+    [
+      'packageKey', 'packageProfile', 'description', 'dimensionsMm',
+      'grossWeightGrams', 'allocations',
+    ],
     `Parcel ${index + 1}`,
   )
   if (!Array.isArray(source.allocations) || source.allocations.length < 1 || source.allocations.length > 25) {
@@ -292,8 +329,39 @@ function parcel(value: unknown, index: number): OneOffShipmentPackageInput {
       `Parcel ${index + 1} contains a duplicate line allocation`,
     )
   }
+  let packageProfile: CanonicalPackageProfile
+  try {
+    packageProfile = source.packageProfile === undefined
+      ? defaultCanonicalPackageProfile()
+      : normalizeCanonicalPackageProfile(
+          source.packageProfile,
+          'small_parcel_package',
+        )
+  } catch (error) {
+    requestError(
+      'OPERATIONS_ONE_OFF_PACKAGE_PROFILE_INVALID',
+      error instanceof Error
+        ? `Parcel ${index + 1} package selection is invalid: ${error.message}`
+        : `Parcel ${index + 1} package selection is invalid`,
+    )
+  }
+  const catalogEntry = packageCatalogEntry(packageProfile.catalogEntryId)
+  if (!catalogEntry) {
+    requestError(
+      'OPERATIONS_ONE_OFF_PACKAGE_PROFILE_INVALID',
+      `Parcel ${index + 1} package selection is not supported by the direct UPS/FedEx quote workflow`,
+    )
+  }
+  const packageKey = text(source.packageKey, `Parcel ${index + 1} key`, 80)
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(packageKey)) {
+    requestError(
+      'OPERATIONS_ONE_OFF_PACKAGE_KEY_UNSUPPORTED',
+      `Parcel ${index + 1} key may contain letters, numbers, dots, underscores, colons, and hyphens only`,
+    )
+  }
   return {
-    packageKey: text(source.packageKey, `Parcel ${index + 1} key`, 80),
+    packageKey,
+    packageProfile,
     description: text(source.description, `Parcel ${index + 1} description`, 255),
     dimensionsMm: dimensions(source.dimensionsMm, `Parcel ${index + 1} dimensions`),
     grossWeightGrams: integer(
@@ -306,6 +374,49 @@ function parcel(value: unknown, index: number): OneOffShipmentPackageInput {
   }
 }
 
+function selectedCarrier(
+  value: unknown,
+  index: number,
+): OneOffCarrierSelectionInput {
+  const source = record(value, `Carrier selection ${index + 1}`)
+  exactFields(
+    source,
+    ['provider', 'integrationAccountGlobalId', 'carrierAccountGlobalId'],
+    `Carrier selection ${index + 1}`,
+  )
+  const provider = String(source.provider || '').trim()
+  if (
+    provider !== 'ups_rest'
+    && provider !== 'fedex_rest'
+    && provider !== 'wwex_speedship'
+  ) {
+    requestError(
+      'OPERATIONS_ONE_OFF_CARRIER_SELECTION_INVALID',
+      `Carrier selection ${index + 1} provider is invalid`,
+    )
+  }
+  return {
+    provider,
+    integrationAccountGlobalId: globalId(
+      source.integrationAccountGlobalId,
+      `Carrier selection ${index + 1} integration account`,
+      INTEGRATION_ACCOUNT_GLOBAL_ID,
+    ),
+    carrierAccountGlobalId: provider === 'wwex_speedship'
+      ? source.carrierAccountGlobalId === null
+        ? null
+        : requestError(
+            'OPERATIONS_ONE_OFF_CARRIER_SELECTION_INVALID',
+            'Worldwide Express carrier selection must not include a direct carrier account',
+          )
+      : globalId(
+          source.carrierAccountGlobalId,
+          `Carrier selection ${index + 1} carrier account`,
+          CARRIER_ACCOUNT_GLOBAL_ID,
+        ),
+  }
+}
+
 export function validateOneOffShipmentQuoteInput(value: unknown): OneOffShipmentQuoteInput {
   const source = record(value, 'One-off shipment quote')
   exactFields(
@@ -314,11 +425,41 @@ export function validateOneOffShipmentQuoteInput(value: unknown): OneOffShipment
       'customerGlobalId', 'warehouseGlobalId', 'inventoryPoolGlobalId',
       'receivingLocationGlobalId', 'referenceNumber', 'currency',
       'requestedDeliveryAt', 'shipFromPhone', 'shipToPhone',
-      'shipToResidential',
+      'shipToResidential', 'selectedCarriers',
       'shipTo', 'lines', 'packages', 'executionMode',
     ],
     'One-off shipment quote',
   )
+  if (
+    !Array.isArray(source.selectedCarriers)
+    || source.selectedCarriers.length < 1
+    || source.selectedCarriers.length > 3
+  ) {
+    requestError(
+      'OPERATIONS_ONE_OFF_CARRIER_SELECTION_REQUIRED',
+      'Select one or more enabled carriers',
+      409,
+    )
+  }
+  const selectedCarriers = canonicalOneOffCarrierSelections(
+    source.selectedCarriers.map(selectedCarrier),
+  )
+  if (new Set(selectedCarriers.map((selection) => selection.provider)).size !== selectedCarriers.length) {
+    requestError(
+      'OPERATIONS_ONE_OFF_CARRIER_PROVIDER_DUPLICATE',
+      'Select at most one account for each carrier',
+      409,
+    )
+  }
+  if (new Set(selectedCarriers.map((selection) => (
+    `${selection.integrationAccountGlobalId}:${selection.carrierAccountGlobalId}`
+  ))).size !== selectedCarriers.length) {
+    requestError(
+      'OPERATIONS_ONE_OFF_CARRIER_SELECTION_DUPLICATE',
+      'Carrier selections must be unique',
+      409,
+    )
+  }
   if (!Array.isArray(source.lines) || source.lines.length < 1 || source.lines.length > 25) {
     requestError('OPERATIONS_ONE_OFF_REQUEST_INVALID', 'A one-off shipment requires 1-25 lines')
   }
@@ -335,6 +476,37 @@ export function validateOneOffShipmentQuoteInput(value: unknown): OneOffShipment
   }
   const lines = source.lines.map(line)
   const packages = source.packages.map(parcel)
+  for (const [packageIndex, shipmentPackage] of packages.entries()) {
+    for (const selection of selectedCarriers) {
+      try {
+        packageProviderCode({
+          catalogEntryId: shipmentPackage.packageProfile.catalogEntryId,
+          provider: selection.provider,
+          usage: 'small_parcel_package',
+        })
+      } catch {
+        requestError(
+          'OPERATIONS_ONE_OFF_PACKAGE_SELECTION_UNSUPPORTED',
+          `Parcel ${packageIndex + 1} package is not supported by every selected carrier`,
+          409,
+        )
+      }
+    }
+  }
+  if (selectedCarriers.some((selection) => selection.provider === 'fedex_rest')) {
+    const fedexCodes = packages.map((shipmentPackage) => packageProviderCode({
+      catalogEntryId: shipmentPackage.packageProfile.catalogEntryId,
+      provider: 'fedex_rest',
+      usage: 'small_parcel_package',
+    }))
+    if (new Set(fedexCodes).size !== 1) {
+      requestError(
+        'OPERATIONS_ONE_OFF_FEDEX_MIXED_PACKAGING_UNSUPPORTED',
+        'FedEx requires one package type across every parcel in this rate request',
+        409,
+      )
+    }
+  }
   const lineKeys = new Set(lines.map((entry) => entry.lineKey))
   if (lineKeys.size !== lines.length) {
     requestError('OPERATIONS_ONE_OFF_REQUEST_INVALID', 'Shipment line keys must be unique')
@@ -429,6 +601,7 @@ export function validateOneOffShipmentQuoteInput(value: unknown): OneOffShipment
           'OPERATIONS_ONE_OFF_DESTINATION_TYPE_REQUIRED',
           'Choose whether the recipient address is residential or commercial',
         ),
+    selectedCarriers,
     shipTo: address(source.shipTo),
     lines,
     packages,
@@ -498,9 +671,43 @@ function carrierDestination(value: Address) {
   }
 }
 
-function carrierParcels(packages: OneOffShipmentPackageInput[]) {
+function wwexAddress(input: {
+  address: Address
+  phone: string
+  residential: boolean
+}) {
+  const parts = input.address.name.trim().split(/\s+/)
+  return {
+    line1: input.address.line1,
+    line2: input.address.line2 || null,
+    locality: input.address.city,
+    region: input.address.region,
+    postalCode: input.address.postalCode,
+    countryCode: input.address.country,
+    companyName: input.address.name,
+    phone: input.phone,
+    contact: {
+      firstName: parts.length > 1 ? parts.slice(0, -1).join(' ') : null,
+      lastName: parts.at(-1) || input.address.name,
+      phone: input.phone,
+      email: null,
+    },
+    residential: input.residential,
+    locationType: input.residential ? 'RESIDENTIAL' : 'OTHER',
+  }
+}
+
+function carrierParcels(
+  packages: OneOffShipmentPackageInput[],
+  provider: Extract<OneOffCarrierProvider, 'ups_rest' | 'fedex_rest'>,
+) {
   return packages.map((item) => ({
     description: item.description,
+    packageCode: packageProviderCode({
+      catalogEntryId: item.packageProfile.catalogEntryId,
+      provider,
+      usage: 'small_parcel_package',
+    }),
     length: Math.max(0.01, Number((item.dimensionsMm.length / 25.4).toFixed(3))),
     width: Math.max(0.01, Number((item.dimensionsMm.width / 25.4).toFixed(3))),
     height: Math.max(0.01, Number((item.dimensionsMm.height / 25.4).toFixed(3))),
@@ -508,6 +715,184 @@ function carrierParcels(packages: OneOffShipmentPackageInput[]) {
     weight: Math.max(0.01, Number((item.grossWeightGrams / 453.59237).toFixed(3))),
     weightUnit: 'LB' as const,
   }))
+}
+
+function carrierSandboxParcels(
+  packages: OneOffShipmentPackageInput[],
+  provider: Extract<OneOffCarrierProvider, 'ups_rest' | 'fedex_rest'>,
+) {
+  return carrierParcels(packages, provider).map((parcel) => ({
+    description: parcel.description,
+    packageCode: parcel.packageCode,
+    exteriorInches: {
+      length: parcel.length,
+      width: parcel.width,
+      height: parcel.height,
+    },
+    grossPounds: parcel.weight,
+  }))
+}
+
+function packageCodesForCarrier(
+  packages: OneOffShipmentPackageInput[],
+  provider: OneOffCarrierProvider,
+) {
+  return [...packages]
+    .sort((left, right) => (
+      left.packageKey < right.packageKey
+        ? -1
+        : left.packageKey > right.packageKey
+          ? 1
+          : 0
+    ))
+    .map((shipmentPackage) => ({
+      packageKey: shipmentPackage.packageKey,
+      catalogEntryId: shipmentPackage.packageProfile.catalogEntryId,
+      catalogVersion: shipmentPackage.packageProfile.contractVersion,
+      providerPackageCode: packageProviderCode({
+        catalogEntryId: shipmentPackage.packageProfile.catalogEntryId,
+        provider,
+        usage: 'small_parcel_package',
+      }),
+    }))
+}
+
+function resolvedCarrierSelection(
+  carrier: EnabledCarrier,
+  packages: OneOffShipmentPackageInput[],
+): OneOffResolvedCarrierSelection {
+  return {
+    selectionKey: oneOffCarrierSelectionKey(carrier),
+    provider: carrier.provider,
+    integrationAccountGlobalId: carrier.integrationAccountGlobalId,
+    carrierAccountGlobalId: carrier.carrierAccountGlobalId,
+    credentialVersion: carrier.credentialVersion,
+    packageCodes: packageCodesForCarrier(packages, carrier.provider),
+  }
+}
+
+function loosePackagePlanForQuote(
+  packages: OneOffShipmentPackageInput[],
+): LoosePackagePlan {
+  return normalizeLoosePackagePlan({
+    contractVersion: TRANSPORT_PLAN_CONTRACT_VERSION,
+    planVersion: 1,
+    transportMode: 'small_parcel',
+    handlingUnitMode: 'loose_packages',
+    requestProfile: {
+      hazardousMaterials: false,
+      declaredValue: null,
+      accessorials: [],
+      pickupRequired: false,
+    },
+    packages: packages.map((shipmentPackage, index) => {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/.test(shipmentPackage.packageKey)) {
+        requestError(
+          'OPERATIONS_ONE_OFF_PACKAGE_KEY_UNSUPPORTED',
+          `Parcel ${index + 1} key cannot be retained as transport evidence`,
+        )
+      }
+      const kind = packageCatalogEntry(
+        shipmentPackage.packageProfile.catalogEntryId,
+      )?.kind
+      return {
+        packageSequence: index + 1,
+        packageForm: kind === 'envelope' ? 'poly_bag' : 'carton',
+        packageReference: {
+          referenceType: 'quote_package',
+          packageGlobalId: null,
+          quotePackageKey: shipmentPackage.packageKey,
+        },
+        packageSnapshotHash: oneOffShipmentHash(shipmentPackage),
+        dimensionsMm: shipmentPackage.dimensionsMm,
+        grossWeightGrams: shipmentPackage.grossWeightGrams,
+      }
+    }),
+  })
+}
+
+async function insertLoosePackagePlanForQuote(input: {
+  client: PoolClient
+  organizationId: string
+  quoteId: string
+  packages: OneOffShipmentPackageInput[]
+  actorEmail: string
+}) {
+  const plan = loosePackagePlanForQuote(input.packages)
+  const insertedPlan = await input.client.query<{ id: string }>(
+    `INSERT INTO operations_outbound_handling_unit_plans (
+       organization_id, one_off_quote_id, contract_version,
+       version_number, transport_mode, handling_unit_mode, source,
+       handling_unit_count, package_count, total_gross_weight_grams,
+       request_profile, request_profile_hash, plan_hash, plan_snapshot,
+       created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3, $4, 'small_parcel', 'loose_packages',
+       'operator_explicit', $5, $6, $7, $8::jsonb, $9, $10, $11::jsonb, $12
+     )
+     RETURNING id::text`,
+    [
+      input.organizationId,
+      input.quoteId,
+      plan.contractVersion,
+      plan.planVersion,
+      plan.packages.length,
+      plan.packages.length,
+      plan.packages.reduce((sum, item) => sum + item.grossWeightGrams, 0),
+      JSON.stringify(plan.requestProfile),
+      transportRequestProfileHash(plan.requestProfile),
+      loosePackagePlanHash(plan),
+      JSON.stringify(plan),
+      input.actorEmail,
+    ],
+  )
+  const planId = insertedPlan.rows[0].id
+  for (const planPackage of plan.packages) {
+    const insertedUnit = await input.client.query<{ id: string }>(
+      `INSERT INTO operations_outbound_handling_units (
+         organization_id, handling_unit_plan_id, unit_key, unit_sequence,
+         unit_type, length_mm, width_mm, height_mm, tare_weight_grams,
+         gross_weight_grams, stackability, mixed_commodities,
+         unit_snapshot_hash
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, $4, 'package', $5, $6, $7,
+         0, $8, NULL, false, $9
+       )
+       RETURNING id::text`,
+      [
+        input.organizationId,
+        planId,
+        planPackage.packageReference.quotePackageKey,
+        planPackage.packageSequence,
+        planPackage.dimensionsMm.length,
+        planPackage.dimensionsMm.width,
+        planPackage.dimensionsMm.height,
+        planPackage.grossWeightGrams,
+        oneOffShipmentHash(planPackage),
+      ],
+    )
+    await input.client.query(
+      `INSERT INTO operations_outbound_handling_unit_memberships (
+         organization_id, handling_unit_plan_id, handling_unit_id,
+         membership_sequence, package_sequence, package_form,
+         quote_package_key, package_snapshot_hash,
+         allocated_gross_weight_grams
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 1, $4, $5, $6, $7, $8
+       )`,
+      [
+        input.organizationId,
+        planId,
+        insertedUnit.rows[0].id,
+        planPackage.packageSequence,
+        planPackage.packageForm,
+        planPackage.packageReference.quotePackageKey,
+        planPackage.packageSnapshotHash,
+        planPackage.grossWeightGrams,
+      ],
+    )
+  }
+  return planId
 }
 
 type ActivationRow = QueryResultRow & {
@@ -537,8 +922,8 @@ type EnabledCarrier = {
   provider: OneOffCarrierProvider
   integrationAccountGlobalId: string
   integrationAccountId: string
-  carrierAccountGlobalId: string
-  carrierAccountId: string
+  carrierAccountGlobalId: string | null
+  carrierAccountId: string | null
   credentialVersion: number
   displayName: string
   senderOriginWarehouseGlobalId: string | null
@@ -634,6 +1019,55 @@ async function enabledCarriers(
     (left.provider === 'ups_rest' ? 0 : 1)
     - (right.provider === 'ups_rest' ? 0 : 1)
   ))
+}
+
+async function enabledWwexCarrier(
+  organizationId: string,
+  environment: OneOffRateEnvironment,
+): Promise<EnabledCarrier[]> {
+  if (environment === 'production') return []
+  const state = await getBrokeredTransportIntegrations(organizationId)
+  const eligible = state.accounts
+    .filter((account) => (
+      account.provider === 'wwex_speedship'
+      && account.environment === environment
+      && account.status === 'active'
+      && account.configured
+      && account.verificationStatus === 'verified'
+      && account.credentialVersion > 0
+      && account.ratingActivation.smallParcel
+      && account.allowedCapabilities.includes('small_parcel_rate')
+    ))
+    .map((account): EnabledCarrier => ({
+      provider: 'wwex_speedship',
+      integrationAccountGlobalId: account.globalId,
+      integrationAccountId: '',
+      carrierAccountGlobalId: null,
+      carrierAccountId: null,
+      credentialVersion: account.credentialVersion,
+      displayName: account.displayName,
+      senderOriginWarehouseGlobalId: null,
+    }))
+  if (eligible.length > 1) {
+    requestError(
+      'OPERATIONS_ONE_OFF_WWEX_ACCOUNT_AMBIGUOUS',
+      'Multiple enabled small-parcel rate accounts are available; retain one active account before one-off rating',
+      409,
+    )
+  }
+  return eligible
+}
+
+async function enabledOneOffRateSources(
+  organizationId: string,
+  warehouseGlobalId?: string,
+  environment: OneOffRateEnvironment = 'sandbox',
+) {
+  const [direct, wwex] = await Promise.all([
+    enabledCarriers(organizationId, warehouseGlobalId, environment),
+    enabledWwexCarrier(organizationId, environment),
+  ])
+  return canonicalOneOffCarrierSelections([...direct, ...wwex])
 }
 
 function workspaceAddress(value: unknown): Address {
@@ -775,8 +1209,8 @@ export async function readOneOffShipmentWorkspaceFromPostgres(input: {
        LIMIT 1000`,
       [organizationId, resolvedActivation.pipeline_id],
     ),
-    enabledCarriers(organizationId, undefined, 'sandbox'),
-    enabledCarriers(organizationId, undefined, 'production'),
+    enabledOneOffRateSources(organizationId, undefined, 'sandbox'),
+    enabledOneOffRateSources(organizationId, undefined, 'production'),
   ])
   const locationsByWarehouse = new Map<string, Array<{ globalId: string; code: string }>>()
   for (const location of locations.rows) {
@@ -804,7 +1238,7 @@ export async function readOneOffShipmentWorkspaceFromPostgres(input: {
             : ['TEST execution requires Operations Shadow']),
           ...(sandboxCarriers.length
             ? []
-            : ['Enable a verified sandbox UPS or FedEx sender account']),
+            : ['Enable a verified sandbox parcel rate account']),
         ],
       },
       {
@@ -822,7 +1256,7 @@ export async function readOneOffShipmentWorkspaceFromPostgres(input: {
             : ['Activate Operations before buying live postage']),
           ...(productionCarriers.length
             ? []
-            : ['Enable a verified production UPS or FedEx sender account with live-label authorization']),
+            : ['Enable a verified production parcel rate account']),
         ],
       },
     ],
@@ -975,6 +1409,125 @@ async function resolveQuoteScope(
       'Packed rerating requires the exact current native one-off order and plan',
       409,
     )
+  }
+  const selectedMaterialGlobalIds = [...new Set(quote.packages.flatMap((item) => (
+    item.packageProfile.packagingMaterialGlobalId
+      ? [item.packageProfile.packagingMaterialGlobalId]
+      : []
+  )))]
+  const materialUseCounts = packagingMaterialUnitCounts(
+    quote.packages.map((shipmentPackage) => shipmentPackage.packageProfile),
+  )
+  const selectedMaterials = selectedMaterialGlobalIds.length
+    ? await client.query<{
+        id: string
+        global_id: string
+        material_type: 'carton' | 'poly_mailer' | 'padded_mailer'
+        status: 'draft' | 'active'
+        tare_weight_grams: number | null
+        max_weight_grams: number | null
+        is_available: boolean
+        on_hand_quantity: number | null
+      }>(
+        `SELECT material.id::text, material.global_id,
+                material.material_type, material.status,
+                material.tare_weight_grams, material.max_weight_grams,
+                stock.is_available, stock.on_hand_quantity
+         FROM operations_packaging_materials material
+         JOIN operations_packaging_material_stock stock
+           ON stock.organization_id = material.organization_id
+          AND stock.packaging_material_id = material.id
+          AND stock.warehouse_id = $2::uuid
+         WHERE material.organization_id = $1::uuid
+           AND material.global_id = ANY($3::text[])
+         FOR SHARE OF material, stock`,
+        [organizationId, warehouse.rows[0].id, selectedMaterialGlobalIds],
+      )
+    : { rows: [] as Array<{
+        id: string
+        global_id: string
+        material_type: 'carton' | 'poly_mailer' | 'padded_mailer'
+        status: 'draft' | 'active'
+        tare_weight_grams: number | null
+        max_weight_grams: number | null
+        is_available: boolean
+        on_hand_quantity: number | null
+      }> }
+  const activeClaims = selectedMaterials.rows.length
+    ? await client.query<{
+        packaging_material_id: string
+        active_claimed_quantity: string
+      }>(
+        `SELECT packaging_material_id::text,
+                COALESCE(sum(quantity), 0)::text AS active_claimed_quantity
+         FROM operations_packaging_material_claims
+         WHERE organization_id = $1::uuid
+           AND warehouse_id = $2::uuid
+           AND packaging_material_id = ANY($3::uuid[])
+           AND status = 'active'
+           AND ($4::uuid IS NULL OR plan_id <> $4::uuid)
+         GROUP BY packaging_material_id
+         ORDER BY packaging_material_id`,
+        [
+          organizationId,
+          warehouse.rows[0].id,
+          selectedMaterials.rows.map((material) => material.id),
+          packedRerate.rows[0]?.plan_id || null,
+        ],
+      )
+    : { rows: [] as Array<{
+        packaging_material_id: string
+        active_claimed_quantity: string
+      }> }
+  const activeClaimedByMaterialId = new Map(
+    activeClaims.rows.map((claim) => [
+      claim.packaging_material_id,
+      numberValue(claim.active_claimed_quantity),
+    ]),
+  )
+  const materialByGlobalId = new Map(
+    selectedMaterials.rows.map((material) => [material.global_id, material]),
+  )
+  for (const [packageIndex, shipmentPackage] of quote.packages.entries()) {
+    const materialGlobalId = shipmentPackage.packageProfile.packagingMaterialGlobalId
+    if (!materialGlobalId) continue
+    const material = materialByGlobalId.get(materialGlobalId)
+    if (
+      !material
+      || material.status !== 'active'
+      || !material.is_available
+      || Number(material.on_hand_quantity || 0)
+        - (activeClaimedByMaterialId.get(material.id) || 0)
+        < (materialUseCounts.get(materialGlobalId) || 0)
+      || packageKindForMaterialType(material.material_type)
+        !== shipmentPackage.packageProfile.packageKind
+    ) {
+      requestError(
+        'OPERATIONS_ONE_OFF_PACKAGING_MATERIAL_UNAVAILABLE',
+        `The selected packaging material is not active or does not have enough stock for all assigned parcels at the selected warehouse`,
+        409,
+      )
+    }
+    if (
+      material.tare_weight_grams !== null
+      && shipmentPackage.grossWeightGrams < material.tare_weight_grams
+    ) {
+      requestError(
+        'OPERATIONS_ONE_OFF_PACKAGING_MATERIAL_WEIGHT_INVALID',
+        `Parcel ${packageIndex + 1} gross weight is below the selected material tare weight`,
+        409,
+      )
+    }
+    if (
+      material.max_weight_grams !== null
+      && shipmentPackage.grossWeightGrams > material.max_weight_grams
+    ) {
+      requestError(
+        'OPERATIONS_ONE_OFF_PACKAGING_MATERIAL_WEIGHT_INVALID',
+        `Parcel ${packageIndex + 1} exceeds the selected material maximum weight`,
+        409,
+      )
+    }
   }
   const pool = await client.query<{
     id: string
@@ -1276,6 +1829,17 @@ type QuoteCommandRow = QueryResultRow & {
   created_at: Date
 }
 
+function failedQuoteCommandMessage(code: string | null) {
+  switch (code) {
+    case 'OPERATIONS_ONE_OFF_NEW_PRODUCT_SKU_EXISTS':
+      return 'That product already exists. Select the existing product and try again.'
+    case 'OPERATIONS_ONE_OFF_PRODUCT_PROFILE_REQUIRED':
+      return 'The selected product needs an active physical package profile before shipping.'
+    default:
+      return 'The previous rate request failed. Correct the issue and try again.'
+  }
+}
+
 async function prepareQuoteCommand(input: {
   organizationId: string
   idempotencyKey: string
@@ -1309,7 +1873,7 @@ async function prepareQuoteCommand(input: {
       if (row.state === 'failed') {
         requestError(
           row.error_code || 'OPERATIONS_ONE_OFF_QUOTE_FAILED',
-          'This quote attempt failed; submit a new idempotency key after correcting the issue',
+          failedQuoteCommandMessage(row.error_code),
           409,
         )
       }
@@ -1377,12 +1941,19 @@ type QuoteRow = QueryResultRow & {
   rate_environment: OneOffRateEnvironment
   execution_mode: 'test' | 'live'
   required_carrier_providers: OneOffCarrierProvider[]
+  required_carrier_selections: OneOffResolvedCarrierSelection[] | null
+  carrier_selection_results_snapshot: Record<string, {
+    status: 'succeeded' | 'failed'
+    eligibleOfferCount: number
+    errorCode: string | null
+  }> | null
   expires_at: Date
 }
 
 type OfferRow = QueryResultRow & {
   global_id: string
   provider: OneOffCarrierProvider
+  carrier_selection_key: string
   environment: OneOffRateEnvironment
   service_code: string
   service_name: string
@@ -1392,11 +1963,12 @@ type OfferRow = QueryResultRow & {
   estimated_delivery_at: Date | null
   rate_evidence_global_id: string
   integration_account_global_id: string
-  carrier_account_global_id: string
+  carrier_account_global_id: string | null
   credential_version: number
 }
 
 function quoteFromRows(row: QuoteRow, offers: OfferRow[]): OneOffShipmentQuote {
+  const retainedSelections = row.required_carrier_selections || []
   return {
     globalId: row.global_id,
     referenceNumber: row.reference_number,
@@ -1404,11 +1976,16 @@ function quoteFromRows(row: QuoteRow, offers: OfferRow[]): OneOffShipmentQuote {
     environment: row.rate_environment,
     executionMode: row.execution_mode,
     requiredCarrierProviders: row.required_carrier_providers,
+    requiredCarrierSelections: retainedSelections,
+    carrierSelectionResults: row.carrier_selection_results_snapshot || {},
     expiresAt: new Date(row.expires_at).toISOString(),
     offers: offers.map((offer) => ({
       globalId: offer.global_id,
       provider: offer.provider,
       providerLabel: oneOffProviderLabel(offer.provider),
+      executionCapability: offer.provider === 'wwex_speedship'
+        ? 'rate_only'
+        : 'direct_purchase_later',
       environment: offer.environment,
       serviceCode: offer.service_code,
       serviceName: offer.service_name,
@@ -1424,7 +2001,7 @@ function quoteFromRows(row: QuoteRow, offers: OfferRow[]): OneOffShipmentQuote {
       credentialVersion: offer.credential_version,
     })),
     effects: {
-      carrierRateReads: row.required_carrier_providers.length,
+      carrierRateReads: retainedSelections.length || row.required_carrier_providers.length,
       inventoryWrites: 0,
       shipmentWrites: 0,
       labelCalls: 0,
@@ -1440,7 +2017,8 @@ async function readQuoteById(
   const quote = await query<QuoteRow>(
     `SELECT id::text, global_id, reference_number, status, rate_environment,
             execution_mode,
-            required_carrier_providers, expires_at
+            required_carrier_providers, required_carrier_selections,
+            carrier_selection_results_snapshot, expires_at
      FROM operations_one_off_shipment_quotes
      WHERE organization_id = $1::uuid AND id = $2::uuid
      LIMIT 1`,
@@ -1453,7 +2031,7 @@ async function readQuoteById(
     `SELECT offer.global_id, offer.provider, offer.environment,
             offer.service_code, offer.service_name, offer.amount_minor::text,
             offer.currency, offer.transit_days, offer.estimated_delivery_at,
-            offer.rate_evidence_global_id,
+            offer.rate_evidence_global_id, offer.carrier_selection_key,
             integration.global_id AS integration_account_global_id,
             carrier_account.global_id AS carrier_account_global_id,
             offer.credential_version
@@ -1461,7 +2039,7 @@ async function readQuoteById(
      JOIN operations_integration_accounts integration
        ON integration.organization_id = offer.organization_id
       AND integration.id = offer.integration_account_id
-     JOIN operations_carrier_accounts carrier_account
+     LEFT JOIN operations_carrier_accounts carrier_account
        ON carrier_account.organization_id = offer.organization_id
       AND carrier_account.integration_account_id = offer.integration_account_id
       AND carrier_account.id = offer.carrier_account_id
@@ -1512,8 +2090,92 @@ type ProviderAttempt = {
     rateType: string | null
     transitDays: number | null
     deliveryDate: string | null
+    providerOfferId?: string | null
+    providerProductId?: string | null
+    providerTransactionId?: string | null
+    credentialFingerprint?: string | null
+    executingCarrierCode?: string | null
+    executingCarrierName?: string | null
+    executingCarrierScac?: string | null
   }>
   testedAt: string | null
+}
+
+export function nextOneOffWwexShipmentDateTime(now = new Date()) {
+  if (Number.isNaN(now.getTime())) {
+    throw new Error('WWEX shipment clock is invalid')
+  }
+  const shipmentDate = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() + 2,
+  ))
+  while (shipmentDate.getUTCDay() === 0 || shipmentDate.getUTCDay() === 6) {
+    shipmentDate.setUTCDate(shipmentDate.getUTCDate() + 1)
+  }
+  return `${shipmentDate.toISOString().slice(0, 10)} 10:30:00`
+}
+
+export function prepareOneOffWwexSmallpackRateRequest(input: {
+  organizationId: string
+  idempotencyKey: string
+  carrier: EnabledCarrier
+  quote: OneOffShipmentQuoteInput
+  scope: ResolvedQuoteScope
+  credentialVersion: number
+  credentialFingerprint: string
+}) {
+  const selection = resolvedCarrierSelection(input.carrier, input.quote.packages)
+  return prepareWwexSmallpackShopRequest({
+    credentialVersion: input.credentialVersion,
+    credentialFingerprint: input.credentialFingerprint,
+    planId: `one-off-${oneOffShipmentHash({
+      organizationId: input.organizationId,
+      idempotencyKey: input.idempotencyKey,
+      selectionKey: selection.selectionKey,
+    }).slice(0, 32)}`,
+    correlationId: `one-off-${oneOffShipmentHash({
+      idempotencyKey: input.idempotencyKey,
+      provider: 'wwex_speedship',
+    }).slice(0, 32)}`,
+    shipmentDate: nextOneOffWwexShipmentDateTime(),
+    shipmentDescription: input.quote.referenceNumber,
+    origin: wwexAddress({
+      address: input.scope.warehouseAddress,
+      phone: input.quote.shipFromPhone,
+      residential: false,
+    }),
+    destination: wwexAddress({
+      address: input.quote.shipTo,
+      phone: input.quote.shipToPhone,
+      residential: input.quote.shipToResidential,
+    }),
+    packages: input.quote.packages.map((shipmentPackage) => ({
+      packageKey: shipmentPackage.packageKey,
+      packagingType: packageProviderCode({
+        catalogEntryId: shipmentPackage.packageProfile.catalogEntryId,
+        provider: 'wwex_speedship',
+        usage: 'small_parcel_package',
+      }),
+      length: Math.max(1, Math.round(shipmentPackage.dimensionsMm.length / 25.4)),
+      width: Math.max(1, Math.round(shipmentPackage.dimensionsMm.width / 25.4)),
+      height: Math.max(1, Math.round(shipmentPackage.dimensionsMm.height / 25.4)),
+      weight: Math.max(1, Math.round(shipmentPackage.grossWeightGrams / 453.59237)),
+      references: [{
+        type: 'REFERENCE',
+        value: input.quote.referenceNumber,
+        isPrintAsBarCode: false,
+      }],
+    })),
+    deliveryConfirmation: false,
+    carbonNeutral: false,
+    adultSignatureRequired: false,
+    signatureRequired: false,
+    shipperRelease: false,
+    selfScheduled: false,
+    returnLabel: false,
+    returnServiceType: null,
+  })
 }
 
 async function attemptSandboxCarrierQuote(input: {
@@ -1529,7 +2191,11 @@ async function attemptSandboxCarrierQuote(input: {
       environment: 'sandbox',
       carrierAccountGlobalId: input.carrier.carrierAccountGlobalId,
       destination: carrierDestination(input.quote.shipTo),
-      parcels: carrierParcels(input.quote.packages),
+      parcels: carrierSandboxParcels(
+        input.quote.packages,
+        input.carrier.provider as 'ups_rest' | 'fedex_rest',
+      ),
+      carrierSelectionKey: oneOffCarrierSelectionKey(input.carrier),
       actorEmail: input.actorEmail,
       requireFailureEvidence: true,
     })
@@ -1559,6 +2225,141 @@ async function attemptSandboxCarrierQuote(input: {
       status: 'failed',
       evidenceGlobalId: carrierError?.rateEvidenceGlobalId || null,
       errorCode: carrierError?.code || 'CARRIER_INTERNAL_ERROR',
+      rates: [],
+      testedAt: null,
+    }
+  }
+}
+
+async function attemptWwexCarrierQuote(input: {
+  organizationId: string
+  actorEmail: string
+  idempotencyKey: string
+  carrier: EnabledCarrier
+  quote: OneOffShipmentQuoteInput
+  scope: ResolvedQuoteScope
+}): Promise<ProviderAttempt> {
+  try {
+    const runtime = await readActiveBrokeredTransportRuntimeCredential({
+      organizationId: input.organizationId,
+      provider: 'wwex_speedship',
+      environment: input.quote.executionMode === 'live' ? 'production' : 'sandbox',
+      capability: 'small_parcel_rate',
+    })
+    if (
+      !runtime
+      || runtime.provider !== 'wwex_speedship'
+      || runtime.integrationGlobalId !== input.carrier.integrationAccountGlobalId
+      || runtime.credentialVersion !== input.carrier.credentialVersion
+    ) {
+      requestError(
+        'OPERATIONS_ONE_OFF_CARRIER_SELECTION_STALE',
+        'The selected rate account changed; reload carriers and request new rates',
+        409,
+      )
+    }
+    const selection = resolvedCarrierSelection(input.carrier, input.quote.packages)
+    const prepared = prepareOneOffWwexSmallpackRateRequest({
+      organizationId: input.organizationId,
+      idempotencyKey: input.idempotencyKey,
+      carrier: input.carrier,
+      quote: input.quote,
+      scope: input.scope,
+      credentialVersion: runtime.credentialVersion,
+      credentialFingerprint: runtime.credentialFingerprint,
+    })
+    const executed = await executeWwexSpeedshipShopRequest({
+      preparedRequest: prepared,
+      runtimeCredential: runtime,
+    })
+    const evidenceGlobalId = await withTransaction(async (client) => {
+      const inserted = await client.query<{ global_id: string }>(
+        `INSERT INTO operations_carrier_rate_requests (
+           organization_id, integration_account_id, carrier_account_id,
+           provider, environment, purpose, adapter_version,
+           credential_version, request_hash, billing_relationship,
+           billing_selection_snapshot, redacted_request, redacted_response,
+           status, provider_reference, error_code, actor_email,
+           requested_at, completed_at, carrier_selection_key
+         ) VALUES (
+           $1::uuid, $2::uuid, NULL,
+           'wwex_speedship', $3, 'one_off_transport_rate', $4,
+           $5, $6, 'sender', $7::jsonb, $8::jsonb, $9::jsonb,
+           'succeeded', $10, NULL, $11,
+           $12::timestamptz, $13::timestamptz, $14
+         )
+         RETURNING global_id`,
+        [
+          input.organizationId,
+          runtime.integrationAccountId,
+          runtime.environment,
+          WWEX_SPEEDSHIP_ADAPTER_VERSION,
+          runtime.credentialVersion,
+          executed.requestHash,
+          JSON.stringify({
+            relationship: 'sender',
+            integrationAccountGlobalId: runtime.integrationGlobalId,
+            executionCapability: 'rate_only',
+          }),
+          JSON.stringify({
+            ...prepared.evidence,
+            requestHash: prepared.requestHash,
+            providerMutationCount: 0,
+          }),
+          JSON.stringify({
+            provider: 'wwex_speedship',
+            transportMode: 'small_parcel',
+            rates: executed.result.offers,
+            resultHash: executed.result.resultHash,
+            providerMutationCount: 0,
+          }),
+          executed.result.productTransactionId,
+          input.actorEmail,
+          executed.requestedAt,
+          executed.completedAt,
+          selection.selectionKey,
+        ],
+      )
+      return inserted.rows[0].global_id
+    })
+    return {
+      carrier: {
+        ...input.carrier,
+        integrationAccountId: runtime.integrationAccountId,
+      },
+      status: 'succeeded',
+      evidenceGlobalId,
+      errorCode: null,
+      rates: executed.result.offers
+        .filter((offer) => offer.eligible)
+        .map((offer) => ({
+          serviceCode: offer.serviceCode,
+          serviceName: offer.serviceName,
+          amount: offer.amount,
+          currency: offer.currency,
+          rateType: 'wwex_speedship',
+          transitDays: offer.transitDays,
+          deliveryDate: offer.estimatedDeliveryDate,
+          providerOfferId: offer.offerId,
+          providerProductId: offer.offeredProductId,
+          providerTransactionId: offer.productTransactionId,
+          credentialFingerprint: prepared.evidence.credentialFingerprint,
+          executingCarrierCode: offer.executingCarrier.vendorId,
+          executingCarrierName: offer.executingCarrier.name,
+          executingCarrierScac: offer.executingCarrier.scac,
+        })),
+      testedAt: executed.completedAt,
+    }
+  } catch (error) {
+    const known = error instanceof OneOffShipmentPersistenceError
+      || error instanceof WwexSpeedshipClientError
+    return {
+      carrier: input.carrier,
+      status: 'failed',
+      evidenceGlobalId: null,
+      errorCode: known && 'code' in error
+        ? String(error.code)
+        : 'WWEX_SMALL_PARCEL_RATE_FAILED',
       rates: [],
       testedAt: null,
     }
@@ -1618,10 +2419,11 @@ async function attemptProductionCarrierQuote(input: {
   quote: OneOffShipmentQuoteInput
   scope: ResolvedQuoteScope
 }): Promise<ProviderAttempt> {
+  const selectionKey = oneOffCarrierSelectionKey(input.carrier)
   const attemptIdempotencyKey = `one-off-rate:${oneOffShipmentHash({
     organizationId: input.organizationId,
     idempotencyKey: input.idempotencyKey,
-    provider: input.carrier.provider,
+    selectionKey,
   })}`
   try {
     if (input.quote.currency !== 'USD') {
@@ -1637,6 +2439,17 @@ async function attemptProductionCarrierQuote(input: {
       integrationAccountGlobalId: input.carrier.integrationAccountGlobalId,
       carrierAccountGlobalId: input.carrier.carrierAccountGlobalId,
     })
+    if (
+      runtime.integrationAccountId !== input.carrier.integrationAccountId
+      || runtime.carrierAccountId !== input.carrier.carrierAccountId
+      || runtime.credentialVersion !== input.carrier.credentialVersion
+    ) {
+      requestError(
+        'OPERATIONS_ONE_OFF_CARRIER_SELECTION_STALE',
+        'The selected rate account changed; reload carriers and request new rates',
+        409,
+      )
+    }
     if (!productionAddressMatches(input.scope.warehouseAddress, runtime.registeredAddress)) {
       requestError(
         'OPERATIONS_ONE_OFF_LIVE_ORIGIN_MISMATCH',
@@ -1677,7 +2490,10 @@ async function attemptProductionCarrierQuote(input: {
         countryCode: 'US',
         residential: input.quote.shipToResidential,
       },
-      parcels: carrierParcels(input.quote.packages),
+      parcels: carrierParcels(
+        input.quote.packages,
+        input.carrier.provider as 'ups_rest' | 'fedex_rest',
+      ),
       billing: {
         relationship: 'sender',
         payerAccountNumber: runtime.credential.accountNumber,
@@ -1774,9 +2590,24 @@ async function attemptProductionCarrierQuote(input: {
           `SELECT global_id, redacted_response, completed_at
            FROM operations_carrier_rate_requests
            WHERE organization_id = $1::uuid AND global_id = $2
+             AND provider = $3
+             AND integration_account_id = $4::uuid
+             AND carrier_account_id = $5::uuid
+             AND credential_version = $6
+             AND request_hash = $7
+             AND carrier_selection_key = $8
              AND environment = 'production' AND status = 'succeeded'
            LIMIT 1`,
-          [input.organizationId, preparedAttempt.rate_evidence_global_id],
+          [
+            input.organizationId,
+            preparedAttempt.rate_evidence_global_id,
+            runtime.provider,
+            runtime.integrationAccountId,
+            runtime.carrierAccountId,
+            runtime.credentialVersion,
+            prepared.requestHash,
+            selectionKey,
+          ],
         )
         if (evidence.rows[0]) {
           return {
@@ -1812,12 +2643,12 @@ async function attemptProductionCarrierQuote(input: {
              credential_version, request_hash, billing_relationship,
              billing_selection_snapshot, redacted_request, redacted_response,
              status, provider_reference, error_code, actor_email,
-             requested_at, completed_at
+             requested_at, completed_at, carrier_selection_key
            ) VALUES (
              $1::uuid, $2::uuid, $3::uuid, $4, 'production',
              'cartonization_shipment_rate', $5, $6, $7, 'sender',
              $8::jsonb, $9::jsonb, $10::jsonb, 'succeeded', $11,
-             NULL, $12, $13::timestamptz, $14::timestamptz
+             NULL, $12, $13::timestamptz, $14::timestamptz, $15
            )
            RETURNING global_id`,
           [
@@ -1839,6 +2670,7 @@ async function attemptProductionCarrierQuote(input: {
             input.actorEmail,
             result.evidence.requestedAt,
             result.evidence.completedAt,
+            selectionKey,
           ],
         )
         await client.query(
@@ -1968,7 +2800,7 @@ export async function quoteOneOffShipmentInPostgres(input: {
         quote,
         inventoryReservationOrderGlobalId,
       )),
-      enabledCarriers(
+      enabledOneOffRateSources(
         organizationId,
         quote.warehouseGlobalId,
         quote.executionMode === 'live' ? 'production' : 'sandbox',
@@ -1983,6 +2815,23 @@ export async function quoteOneOffShipmentInPostgres(input: {
         409,
       )
     }
+    const carrierBySelection = new Map(carriers.map((carrier) => [
+      `${carrier.provider}:${carrier.integrationAccountGlobalId}:${carrier.carrierAccountGlobalId || 'none'}`,
+      carrier,
+    ]))
+    const selectedCarriers = quote.selectedCarriers.map((selection) => {
+      const carrier = carrierBySelection.get(
+        `${selection.provider}:${selection.integrationAccountGlobalId}:${selection.carrierAccountGlobalId || 'none'}`,
+      )
+      if (!carrier) {
+        requestError(
+          'OPERATIONS_ONE_OFF_CARRIER_SELECTION_STALE',
+          'A selected carrier account is disabled, stale, or unavailable for this warehouse',
+          409,
+        )
+      }
+      return carrier
+    })
     if (
       (quote.executionMode === 'live' && scope.activationState !== 'active')
       || (quote.executionMode === 'test' && scope.activationState !== 'shadow')
@@ -1997,9 +2846,9 @@ export async function quoteOneOffShipmentInPostgres(input: {
         409,
       )
     }
-    const attempts = await Promise.all(carriers.map((carrier) => (
-      quote.executionMode === 'live'
-        ? attemptProductionCarrierQuote({
+    const attempts = await Promise.all(selectedCarriers.map((carrier) => (
+      carrier.provider === 'wwex_speedship'
+        ? attemptWwexCarrierQuote({
             organizationId,
             actorEmail: input.actorEmail,
             idempotencyKey,
@@ -2007,12 +2856,21 @@ export async function quoteOneOffShipmentInPostgres(input: {
             quote,
             scope,
           })
-        : attemptSandboxCarrierQuote({
+        : quote.executionMode === 'live'
+          ? attemptProductionCarrierQuote({
             organizationId,
             actorEmail: input.actorEmail,
+            idempotencyKey,
             carrier,
             quote,
+            scope,
           })
+          : attemptSandboxCarrierQuote({
+              organizationId,
+              actorEmail: input.actorEmail,
+              carrier,
+              quote,
+            })
     )))
     const evidenceGlobalIds = attempts.flatMap((attempt) => (
       attempt.evidenceGlobalId ? [attempt.evidenceGlobalId] : []
@@ -2022,7 +2880,7 @@ export async function quoteOneOffShipmentInPostgres(input: {
           global_id: string
           provider: OneOffCarrierProvider
           integration_account_id: string
-          carrier_account_id: string
+          carrier_account_id: string | null
           credential_version: number
           request_hash: string
           redacted_response: Record<string, unknown>
@@ -2034,14 +2892,14 @@ export async function quoteOneOffShipmentInPostgres(input: {
            FROM operations_carrier_rate_requests
            WHERE organization_id = $1::uuid
              AND global_id = ANY($2::text[])
-             AND purpose = 'cartonization_shipment_rate'`,
+             AND purpose IN ('cartonization_shipment_rate', 'one_off_transport_rate')`,
           [organizationId, evidenceGlobalIds],
         )
       : { rows: [] as Array<{
           global_id: string
           provider: OneOffCarrierProvider
           integration_account_id: string
-          carrier_account_id: string
+          carrier_account_id: string | null
           credential_version: number
           request_hash: string
           redacted_response: Record<string, unknown>
@@ -2049,6 +2907,8 @@ export async function quoteOneOffShipmentInPostgres(input: {
         }> }
     const evidenceByGlobalId = new Map(evidence.rows.map((row) => [row.global_id, row]))
     const providerResults: Record<string, unknown> = {}
+    const transportResults: Record<string, unknown> = {}
+    const carrierSelectionResults: Record<string, unknown> = {}
     const offerDrafts: Array<{
       carrier: EnabledCarrier
       rate: ProviderAttempt['rates'][number]
@@ -2101,7 +2961,7 @@ export async function quoteOneOffShipmentInPostgres(input: {
           })
         }
       }
-      providerResults[attempt.carrier.provider] = {
+      const retainedResult = {
         status: eligibleRates.length ? 'succeeded' : 'failed',
         errorCode: eligibleRates.length
           ? null
@@ -2110,19 +2970,21 @@ export async function quoteOneOffShipmentInPostgres(input: {
                 ? 'CARRIER_ELIGIBLE_RATE_UNAVAILABLE'
                 : 'CARRIER_RATE_EVIDENCE_MISMATCH'
             ),
-        integrationAccountGlobalId: attempt.carrier.integrationAccountGlobalId,
-        carrierAccountGlobalId: attempt.carrier.carrierAccountGlobalId,
-        credentialVersion: attempt.carrier.credentialVersion,
-        rateEvidenceGlobalId: attempt.evidenceGlobalId,
         eligibleOfferCount: eligibleRates.length,
       }
+      providerResults[attempt.carrier.provider] = retainedResult
+      transportResults[`${attempt.carrier.provider}:small_parcel`] = retainedResult
+      carrierSelectionResults[oneOffCarrierSelectionKey(attempt.carrier)] = retainedResult
     }
-    const status: QuoteRow['status'] = successfulProviders === carriers.length
+    const status: QuoteRow['status'] = successfulProviders === selectedCarriers.length
       ? 'succeeded'
       : successfulProviders > 0
         ? 'partial'
         : 'failed'
     const expiresAt = new Date(Date.now() + QUOTE_TTL_MS).toISOString()
+    const requiredCarrierSelections = selectedCarriers.map((carrier) => (
+      resolvedCarrierSelection(carrier, quote.packages)
+    ))
     const saved = await withTransaction(async (client) => {
       await acquireTransactionAdvisoryLock(
         client,
@@ -2151,18 +3013,23 @@ export async function quoteOneOffShipmentInPostgres(input: {
            destination_snapshot, destination_hash,
            lines_snapshot, lines_hash, packages_snapshot, packages_hash,
            required_carrier_providers, provider_results_snapshot,
+           required_transport_sources, transport_results_snapshot,
+           required_carrier_selections, carrier_selection_results_snapshot,
            request_hash, status, idempotency_key, actor_email, expires_at,
            packed_rerate_order_id, packed_rerate_plan_id
          ) VALUES (
            $1::uuid, $2::uuid, $3::uuid, $4::uuid,
            $5::uuid, $6::uuid, $7, $8, $9, $10, $11::timestamptz,
            $12::jsonb, $13, $14::jsonb, $15, $16::jsonb, $17,
-           $18::text[], $19::jsonb, $20, $21, $22, $23, $24::timestamptz,
-           $25::uuid, $26::uuid
+           $18::text[], $19::jsonb, $20::text[], $21::jsonb,
+           $22::jsonb, $23::jsonb,
+           $24, $25, $26, $27, $28::timestamptz,
+           $29::uuid, $30::uuid
          )
          RETURNING id::text, global_id, reference_number, status,
                    rate_environment, execution_mode,
-                   required_carrier_providers, expires_at`,
+                   required_carrier_providers, required_carrier_selections,
+                   carrier_selection_results_snapshot, expires_at`,
         [
           organizationId,
           scope.pipelineId,
@@ -2191,8 +3058,12 @@ export async function quoteOneOffShipmentInPostgres(input: {
           oneOffShipmentHash(scope.linesSnapshot),
           JSON.stringify(quote.packages),
           oneOffShipmentHash(quote.packages),
-          carriers.map((carrier) => carrier.provider),
+          selectedCarriers.map((carrier) => carrier.provider),
           JSON.stringify(providerResults),
+          selectedCarriers.map((carrier) => `${carrier.provider}:small_parcel`),
+          JSON.stringify(transportResults),
+          JSON.stringify(requiredCarrierSelections),
+          JSON.stringify(carrierSelectionResults),
           requestHash,
           status,
           idempotencyKey,
@@ -2202,6 +3073,17 @@ export async function quoteOneOffShipmentInPostgres(input: {
           scope.packedReratePlanId,
         ],
       )
+      const wwexHandlingPlanId = offerDrafts.some(
+        (draft) => draft.carrier.provider === 'wwex_speedship',
+      )
+        ? await insertLoosePackagePlanForQuote({
+            client,
+            organizationId,
+            quoteId: inserted.rows[0].id,
+            packages: quote.packages,
+            actorEmail: input.actorEmail,
+          })
+        : null
       const savedOffers: OfferRow[] = []
       for (const draft of offerDrafts) {
         const offer = await client.query<OfferRow>(
@@ -2210,15 +3092,23 @@ export async function quoteOneOffShipmentInPostgres(input: {
              carrier_account_id, provider, environment, credential_version,
              service_code, service_name, amount_minor, currency,
              transit_days, estimated_delivery_at, rate_evidence_global_id,
-             carrier_request_hash, carrier_response_hash, offer_snapshot
+             carrier_request_hash, carrier_response_hash, offer_snapshot,
+             carrier_selection_key, transport_mode, handling_unit_mode,
+             executing_carrier_code, executing_carrier_name,
+             executing_carrier_scac, provider_quote_reference,
+             provider_offer_id, provider_product_id,
+             provider_transaction_id, credential_fingerprint,
+             handling_unit_plan_id
            ) VALUES (
              $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7,
              $8, $9, $10, $11, $12, $13::timestamptz, $14, $15, $16,
-             $17::jsonb
+             $17::jsonb, $18, 'small_parcel', 'loose_packages',
+             $19, $20, $21, NULL, $22, $23, $24, $25, $26::uuid
            )
            RETURNING global_id, provider, environment, service_code,
                      service_name, amount_minor::text, currency, transit_days,
-                     estimated_delivery_at, rate_evidence_global_id`,
+                     estimated_delivery_at, rate_evidence_global_id,
+                     carrier_selection_key`,
           [
             organizationId,
             inserted.rows[0].id,
@@ -2247,7 +3137,21 @@ export async function quoteOneOffShipmentInPostgres(input: {
               deliveryDate: draft.rate.deliveryDate,
               estimatedDeliveryAt: draft.estimatedDeliveryAt,
               rateEvidenceGlobalId: draft.evidenceGlobalId,
+              executionCapability: draft.carrier.provider === 'wwex_speedship'
+                ? 'rate_only'
+                : 'direct_purchase_later',
             }),
+            oneOffCarrierSelectionKey(draft.carrier),
+            draft.rate.executingCarrierCode || null,
+            draft.rate.executingCarrierName || null,
+            draft.rate.executingCarrierScac || null,
+            draft.rate.providerOfferId || null,
+            draft.rate.providerProductId || null,
+            draft.rate.providerTransactionId || null,
+            draft.rate.credentialFingerprint || null,
+            draft.carrier.provider === 'wwex_speedship'
+              ? wwexHandlingPlanId
+              : null,
           ],
         )
         savedOffers.push({
@@ -2277,11 +3181,11 @@ export async function quoteOneOffShipmentInPostgres(input: {
           status,
           warehouseGlobalId: quote.warehouseGlobalId,
           customerGlobalId: quote.customerGlobalId,
-          requiredCarrierProviders: carriers.map((carrier) => carrier.provider),
+          requiredCarrierProviders: selectedCarriers.map((carrier) => carrier.provider),
           offerCount: savedOffers.length,
           expiresAt,
           effects: {
-            carrierRateReads: carriers.length,
+            carrierRateReads: selectedCarriers.length,
             inventoryWrites: 0,
             shipmentWrites: 0,
             labelCalls: 0,
@@ -2492,6 +3396,163 @@ type LockedOfferRow = QueryResultRow & {
   estimated_delivery_at: Date | null
   rate_evidence_global_id: string
   offer_snapshot: Record<string, unknown>
+}
+
+type OneOffPackagingClaimInput = {
+  materialId: string
+  materialGlobalId: string
+  stockId: string
+  quantity: number
+  stockRowVersion: number
+  onHandQuantity: number
+}
+
+async function lockOneOffPackagingMaterialClaims(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    warehouseId: string
+    packages: OneOffShipmentPackageInput[]
+  },
+): Promise<OneOffPackagingClaimInput[]> {
+  const requiredByGlobalId = packagingMaterialUnitCounts(
+    input.packages.map((shipmentPackage) => shipmentPackage.packageProfile),
+  )
+  const materialGlobalIds = [...requiredByGlobalId.keys()].sort()
+  if (!materialGlobalIds.length) return []
+
+  const stockResult = await client.query<{
+    material_id: string
+    material_global_id: string
+    material_type: 'carton' | 'poly_mailer' | 'padded_mailer'
+    material_status: 'draft' | 'active'
+    tare_weight_grams: number | null
+    max_weight_grams: number | null
+    stock_id: string
+    is_available: boolean
+    on_hand_quantity: number | null
+    stock_row_version: string
+  }>(
+    `SELECT material.id::text AS material_id,
+            material.global_id AS material_global_id,
+            material.material_type, material.status AS material_status,
+            material.tare_weight_grams, material.max_weight_grams,
+            stock.id::text AS stock_id, stock.is_available,
+            stock.on_hand_quantity, stock.row_version::text AS stock_row_version
+     FROM operations_packaging_materials material
+     JOIN operations_packaging_material_stock stock
+       ON stock.organization_id = material.organization_id
+      AND stock.packaging_material_id = material.id
+      AND stock.warehouse_id = $2::uuid
+     WHERE material.organization_id = $1::uuid
+       AND material.global_id = ANY($3::text[])
+     ORDER BY stock.id
+     FOR UPDATE OF material, stock`,
+    [input.organizationId, input.warehouseId, materialGlobalIds],
+  )
+  const stockByGlobalId = new Map(
+    stockResult.rows.map((stock) => [stock.material_global_id, stock]),
+  )
+  if (stockByGlobalId.size !== materialGlobalIds.length) {
+    requestError(
+      'OPERATIONS_ONE_OFF_PACKAGING_MATERIAL_UNAVAILABLE',
+      'A selected packaging material no longer has warehouse stock; request a new quote',
+      409,
+    )
+  }
+
+  for (const shipmentPackage of input.packages) {
+    const materialGlobalId =
+      shipmentPackage.packageProfile.packagingMaterialGlobalId
+    if (!materialGlobalId) continue
+    const stock = stockByGlobalId.get(materialGlobalId)
+    if (
+      !stock
+      || stock.material_status !== 'active'
+      || packageKindForMaterialType(stock.material_type)
+        !== shipmentPackage.packageProfile.packageKind
+    ) {
+      requestError(
+        'OPERATIONS_ONE_OFF_PACKAGING_MATERIAL_UNAVAILABLE',
+        'A selected packaging material changed after rating; request a new quote',
+        409,
+      )
+    }
+    if (
+      stock.tare_weight_grams !== null
+      && shipmentPackage.grossWeightGrams < stock.tare_weight_grams
+    ) {
+      requestError(
+        'OPERATIONS_ONE_OFF_PACKAGING_MATERIAL_WEIGHT_INVALID',
+        'A selected package gross weight is below the current material tare weight; request a new quote',
+        409,
+      )
+    }
+    if (
+      stock.max_weight_grams !== null
+      && shipmentPackage.grossWeightGrams > stock.max_weight_grams
+    ) {
+      requestError(
+        'OPERATIONS_ONE_OFF_PACKAGING_MATERIAL_WEIGHT_INVALID',
+        'A selected package exceeds the current material maximum weight; request a new quote',
+        409,
+      )
+    }
+  }
+
+  const materialIds = stockResult.rows.map((stock) => stock.material_id)
+  const activeClaims = await client.query<{
+    id: string
+    packaging_material_id: string
+    quantity: number
+  }>(
+    `SELECT id::text, packaging_material_id::text, quantity
+     FROM operations_packaging_material_claims
+     WHERE organization_id = $1::uuid
+       AND warehouse_id = $2::uuid
+       AND packaging_material_id = ANY($3::uuid[])
+       AND status = 'active'
+     ORDER BY id
+     FOR UPDATE`,
+    [input.organizationId, input.warehouseId, materialIds],
+  )
+  const activeClaimedByMaterialId = new Map<string, number>()
+  for (const claim of activeClaims.rows) {
+    activeClaimedByMaterialId.set(
+      claim.packaging_material_id,
+      (activeClaimedByMaterialId.get(claim.packaging_material_id) || 0)
+        + Number(claim.quantity),
+    )
+  }
+
+  return materialGlobalIds.map((materialGlobalId) => {
+    const stock = stockByGlobalId.get(materialGlobalId)
+    const quantity = requiredByGlobalId.get(materialGlobalId) || 0
+    if (!stock || quantity < 1) {
+      throw new Error('OPERATIONS_ONE_OFF_PACKAGING_CLAIM_INPUT_MISSING')
+    }
+    const activeClaimed = activeClaimedByMaterialId.get(stock.material_id) || 0
+    if (
+      stock.material_status !== 'active'
+      || stock.is_available !== true
+      || stock.on_hand_quantity === null
+      || stock.on_hand_quantity - activeClaimed < quantity
+    ) {
+      requestError(
+        'OPERATIONS_ONE_OFF_PACKAGING_MATERIAL_UNAVAILABLE',
+        `${materialGlobalId} does not have enough unclaimed warehouse stock for ${quantity} selected parcel${quantity === 1 ? '' : 's'}; request a new quote`,
+        409,
+      )
+    }
+    return {
+      materialId: stock.material_id,
+      materialGlobalId,
+      stockId: stock.stock_id,
+      quantity,
+      stockRowVersion: numberValue(stock.stock_row_version),
+      onHandQuantity: stock.on_hand_quantity,
+    }
+  })
 }
 
 async function appendDomainEvent(
@@ -2981,6 +4042,27 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
     OFFER_GLOBAL_ID,
   )
   const reason = text(input.reason, 'Planning reason', 500, 3)
+  const selectedOfferCapability = await query<{
+    provider: OneOffCarrierProvider
+  }>(
+    `SELECT offer.provider
+     FROM operations_one_off_shipment_quotes quote
+     JOIN operations_one_off_shipment_quote_offers offer
+       ON offer.organization_id = quote.organization_id
+      AND offer.quote_id = quote.id
+     WHERE quote.organization_id = $1::uuid
+       AND quote.global_id = $2
+       AND offer.global_id = $3
+     LIMIT 1`,
+    [organizationId, quoteGlobalId, selectedOfferGlobalId],
+  )
+  if (selectedOfferCapability.rows[0]?.provider === 'wwex_speedship') {
+    requestError(
+      'OPERATIONS_ONE_OFF_RATE_ONLY_OFFER',
+      'This rate is available for comparison only',
+      409,
+    )
+  }
   const requestHash = oneOffShipmentHash({
     quoteGlobalId,
     selectedOfferGlobalId,
@@ -3070,6 +4152,25 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
         requestError(
           'OPERATIONS_ONE_OFF_QUOTE_CONSUMED',
           `This quote already created ${alreadyConsumed.rows[0].order_global_id}`,
+          409,
+        )
+      }
+      const lockedSelectedCapability = await client.query<{
+        provider: OneOffCarrierProvider
+      }>(
+        `SELECT provider
+         FROM operations_one_off_shipment_quote_offers
+         WHERE organization_id = $1::uuid
+           AND quote_id = $2::uuid
+           AND global_id = $3
+         LIMIT 1
+         FOR UPDATE`,
+        [organizationId, quote.id, selectedOfferGlobalId],
+      )
+      if (lockedSelectedCapability.rows[0]?.provider === 'wwex_speedship') {
+        requestError(
+          'OPERATIONS_ONE_OFF_RATE_ONLY_OFFER',
+          'This rate is available for comparison only',
           409,
         )
       }
@@ -3180,6 +4281,14 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
           409,
         )
       }
+      const packagingClaimInputs = await lockOneOffPackagingMaterialClaims(
+        client,
+        {
+          organizationId,
+          warehouseId: quote.warehouse_id,
+          packages: quote.packages_snapshot,
+        },
+      )
       const existingProducts = new Map<string, {
         product: CreatedProduct
         positions: InventoryPosition[]
@@ -3549,6 +4658,8 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
             rateEvidenceGlobalId: selectedOffer.rate_evidence_global_id,
             inventoryAuthority: 'clawpilot',
             planningReason: reason,
+            packagingMaterialClaimCount: packagingClaimInputs.length,
+            packagingStockDecremented: false,
             labelPurchaseEnabled: true,
             labelPurchaseBoundary: 'after_pick_and_pack',
             labelPurchaseExecutionMode: quote.execution_mode,
@@ -3558,6 +4669,31 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
           selectedOffer.id,
         ],
       )
+      for (const claimInput of packagingClaimInputs) {
+        await client.query(
+          `INSERT INTO operations_packaging_material_claims (
+             organization_id, plan_id, packaging_material_id,
+             warehouse_id, packaging_material_stock_id, quantity,
+             status, stock_row_version_at_claim,
+             on_hand_quantity_at_claim, created_by, updated_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid,
+             $4::uuid, $5::uuid, $6,
+             'active', $7, $8, $9, $9
+           )`,
+          [
+            organizationId,
+            plan.rows[0].id,
+            claimInput.materialId,
+            quote.warehouse_id,
+            claimInput.stockId,
+            claimInput.quantity,
+            claimInput.stockRowVersion,
+            claimInput.onHandQuantity,
+            input.actorEmail,
+          ],
+        )
+      }
       for (const reservation of reservations) {
         await client.query(
           `INSERT INTO operations_fulfillment_allocations (

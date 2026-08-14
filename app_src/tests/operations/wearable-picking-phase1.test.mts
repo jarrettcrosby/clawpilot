@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
+import { resolveWearablePendingConfirmationState } from '../../lib/operations/wearablePicking.ts'
 
 const root = new URL('../../', import.meta.url)
 const read = (path: string) => readFileSync(new URL(path, root), 'utf8')
@@ -20,6 +21,40 @@ test('wearable queue is signed-worker scoped and read only', () => {
   assert.match(persistence, /publicCrmProductImageUrl/)
   assert.doesNotMatch(persistence, /line\.barcode_snapshot/)
   assert.doesNotMatch(persistence, /\b(?:INSERT|UPDATE|DELETE)\b/)
+})
+
+test('pending confirmation recovery rejects duplicate evidence and requires exact zero-write reconciliation', () => {
+  const exact = {
+    orderStatus: 'cancelled',
+    orderRowVersion: 8,
+    planStatus: 'cancelled',
+    reconciliationRequired: false,
+    reconciliationGlobalId: 'gsfr0000001',
+    providerWriteCount: 0,
+    reconciliationIsAuthoritative: true,
+  }
+  const resolved = resolveWearablePendingConfirmationState({
+    orderGlobalId: 'gor0000001',
+    expectedRowVersion: 7,
+    candidates: [exact],
+  })
+  assert.equal(resolved.state, 'reconciled_external_fulfillment')
+  assert.equal(resolved.providerWrites, 0)
+
+  const duplicates = resolveWearablePendingConfirmationState({
+    orderGlobalId: 'gor0000001',
+    expectedRowVersion: 7,
+    candidates: [exact, { ...exact, reconciliationGlobalId: 'gsfr0000002' }],
+  })
+  assert.equal(duplicates.state, 'unresolved')
+  assert.equal(duplicates.reconciliationGlobalId, null)
+
+  const providerWrite = resolveWearablePendingConfirmationState({
+    orderGlobalId: 'gor0000001',
+    expectedRowVersion: 7,
+    candidates: [{ ...exact, providerWriteCount: 1 }],
+  })
+  assert.equal(providerWrite.state, 'unresolved')
 })
 
 test('location-first scanning is an explicit audited per-warehouse policy that defaults off', () => {
@@ -57,15 +92,33 @@ test('location-first scanning is an explicit audited per-warehouse policy that d
 test('wearable queue emits exact CP1L identity only for enabled warehouse policy', () => {
   const contract = read('lib/operations/wearablePicking.ts')
   const persistence = read('lib/persistence/wearablePicking.ts')
+  const phone = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+  const dashboard = read('../clients/apple/Apps/iPhone/PickingDashboardView.swift')
 
+  assert.match(contract, /warehouseCode\?: string/)
   assert.match(contract, /locationBarcode\?: string/)
   assert.match(contract, /locationScanRequired\?: true/)
+  assert.match(persistence, /warehouse\.code AS warehouse_code/)
+  assert.match(persistence, /warehouseCode: requiredIdentity\(row\.warehouse_code, 'warehouse code'\)/)
   assert.match(persistence, /location\.global_id AS location_global_id/)
   assert.match(persistence, /LEFT JOIN operations_wearable_location_scan_policies scan_policy/)
   assert.match(persistence, /COALESCE\(scan_policy\.location_scan_required, false\)/)
   assert.match(persistence, /row\.location_scan_required \? \{/)
   assert.match(persistence, /locationBarcode\(/)
   assert.match(persistence, /locationScanRequired: true as const/)
+  assert.match(phone, /@Published var currentOrderNumber: String\?/)
+  assert.match(phone, /currentOrderNumber = activeOrder\?\.orderNumber/)
+  assert.match(dashboard, /if let orderNumber = model\.currentOrderNumber/)
+  assert.match(dashboard, /if let warehouseCode = task\.warehouseCode/)
+  assert.match(dashboard, /"Location scan first"/)
+  assert.match(dashboard, /"Location verified"/)
+  assert.match(dashboard, /"Product scan"/)
+  assert.match(dashboard, /"Enter picked count"/)
+  assert.match(dashboard, /switch model\.currentWorkflowStage/)
+  assert.match(
+    read('../clients/apple/Sources/ClawPilotPickingCore/PickingSession.swift'),
+    /private static func progressAuthorityMatches[\s\S]*leftTask\.locationCode == rightTask\.locationCode[\s\S]*leftTask\.warehouseGlobalId == rightTask\.warehouseGlobalId/,
+  )
 })
 
 test('native scan state requires location before product without giving Watch confirmation authority', () => {
@@ -84,7 +137,7 @@ test('native scan state requires location before product without giving Watch co
   assert.match(session, /PickScanAcceptance\(task: task, stage: \.location\)/)
   assert.match(session, /PickScanAcceptance\(task: task, stage: \.product\)/)
   assert.match(session, /locationScanRequired: locationPending/)
-  assert.match(phone, /Location matched\. Now scan the displayed product barcode/)
+  assert.match(phone, /Location matched\. Confirm when you are ready to scan the product/)
   assert.match(phone, /acceptPhoneCameraBarcode/)
   assert.match(camera, /onBarcode: @MainActor \(String\) async -> PhoneCameraScanOutcome/)
   assert.match(meta, /struct MetaBarcodeDecodeTarget/)
@@ -100,7 +153,7 @@ test('native scan state requires location before product without giving Watch co
   assert.match(meta, /prepareForNextBarcode/)
   assert.match(
     phone,
-    /await source\.prepareForNextBarcode\(\s*target: metaDecodeTarget\(for: task, stage: stage\)\s*\)/,
+    /await source\.prepareForNextBarcode\(\s*target: metaDecodeTarget\(for: task, stage: stage\),\s*suppressedValue: acceptedLocationValue\s*\)/,
   )
   assert.match(watch, /current\.locationScanRequired == true/)
   assert.doesNotMatch(watch, /ConfirmPicksCommand|PickingAPIClient/)
@@ -195,14 +248,29 @@ test('iPhone camera keeps a fast stage-aware live scan with an in-memory still f
     camera.match(/private func submit[\s\S]*?@objc private func captureCurrentFrame/)?.[0] ?? '',
     /stopScanning\(\)/,
   )
-  assert.match(phone, /Location matched\. The live camera is still on/)
+  assert.match(phone, /Location matched\. Continue deliberately when you are ready to scan the product/)
   assert.match(phone, /PhoneCameraScanOutcome/)
   assert.match(phone, /interactiveDismissDisabled\(\)/)
   assert.match(camera, /import ClawPilotPickingApple/)
   assert.match(lifecycle, /public struct PhoneCameraScanLifecycle: Sendable/)
   assert.match(camera, /let submissionToken = lifecycle\.beginSubmission\(\)/)
   assert.match(camera, /guard !Task\.isCancelled,[\s\S]*lifecycle\.completeSubmission\(submissionToken\)/)
-  assert.match(camera, /closeScanner\(\) \{\s*dismissScanner\(reason: "user"\)/)
+  assert.match(
+    camera,
+    /closeScanner\(\) \{\s*recordDiagnostic\("close-tapped"\)\s*dismissScanner\(reason: "user"\)/,
+  )
+  assert.match(camera, /closeButton\.addTarget\(self, action: #selector\(closeScanner\), for: \.touchUpInside\)/)
+  assert.doesNotMatch(camera, /scanner\.overlayContainerView/)
+  assert.match(camera, /let controlsOverlayView = PhoneCameraControlsOverlayView\(\)/)
+  assert.match(
+    camera,
+    /view\.addSubview\(scanner\.view\)[\s\S]*view\.addSubview\(controlsOverlayView\)/,
+  )
+  assert.match(camera, /view\.bringSubviewToFront\(controlsOverlayView\)/)
+  assert.match(
+    camera,
+    /final class PhoneCameraControlsOverlayView: UIView[\s\S]*override func hitTest[\s\S]*return hitView === self \? nil : hitView/,
+  )
   assert.match(
     camera,
     /private func dismissScanner\(reason: String\) \{\s*guard lifecycle\.dismiss\(\) else \{ return \}[\s\S]*stopAllWork\(scanner\)[\s\S]*parent\.onClose\(\)/,
@@ -265,6 +333,88 @@ test('Phase 1 confirmation reuses the audited Operations command', () => {
   assert.match(persistence, /OPERATIONS_ORDER_VERSION_CONFLICT/)
   assert.match(persistence, /operations\.pick\.completed/)
   assert.match(persistence, /operations\.order\.picks_confirmed/)
+})
+
+test('terminal Shopify confirmation conflicts require manager action and read-only exact recovery', () => {
+  const picksRoute = read('app/api/operations/picks/route.ts')
+  const wearablePersistence = read('lib/persistence/wearablePicking.ts')
+  const adapter = read('../clients/apple/Sources/ClawPilotPickingApple/AppleAdapters.swift')
+  const session = read('../clients/apple/Sources/ClawPilotPickingCore/PickingSession.swift')
+  const phone = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+  const dashboard = read('../clients/apple/Apps/iPhone/PickingDashboardView.swift')
+
+  assert.match(picksRoute, /pendingConfirmationOrderGlobalId/)
+  assert.match(picksRoute, /pendingConfirmationExpectedRowVersion/)
+  assert.match(picksRoute, /pendingConfirmationIdempotencyKey/)
+  assert.match(picksRoute, /readWearablePendingConfirmationStateFromPostgres/)
+  assert.doesNotMatch(picksRoute, /reconcileShopifyExternalFulfillmentFromPostgres/)
+  assert.match(wearablePersistence, /provider_write_count = 0/)
+  assert.match(wearablePersistence, /confirmation_receipt\.idempotency_key = \$4/)
+  assert.match(wearablePersistence, /lower\(confirmation_receipt\.actor_email\) = \$3/)
+  assert.match(wearablePersistence, /confirmation_receipt\.target_global_id = orders\.global_id/)
+  assert.match(wearablePersistence, /confirmation_receipt\.status = 'failed'/)
+  assert.match(wearablePersistence, /confirmation_receipt\.error_code =\s*'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILIATION_REQUIRED'/)
+  assert.match(wearablePersistence, /lower\(assigned_pick\.assigned_to\) = \$3/)
+  assert.match(wearablePersistence, /lower\(COALESCE\(other_pick\.assigned_to, ''\)\) <> \$3/)
+  assert.match(wearablePersistence, /receipt\.command_type =\s*'reconcile_shopify_external_fulfillment'/)
+  assert.match(wearablePersistence, /ORDER BY candidate\.reconciled_at DESC, candidate\.id DESC\s*LIMIT 2/)
+  assert.match(adapter, /if !\(200\.\.<300\)\.contains\(http\.statusCode\)[\s\S]*PickingAPIError\.rejected\(code: code, message: message\)/)
+  assert.match(adapter, /func recheckPendingConfirmation/)
+  assert.match(session, /durableCommand == command/)
+  assert.match(session, /evidence\.orderGlobalId == command\.orderGlobalId/)
+  assert.match(session, /public func finishConfirmedOrder\(_ command: ConfirmPicksCommand\)/)
+  assert.match(session, /try await cache\.loadOutbox\(\) == command[\s\S]*try await cache\.saveQueue\(replacementQueue\)[\s\S]*try await cache\.clearOutbox\(\)/)
+  assert.match(session, /try await cache\.clearProgress\(\)[\s\S]*try await cache\.saveQueue\(replacementQueue\)[\s\S]*try await cache\.clearOutbox\(\)/)
+  assert.match(phone, /OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILIATION_REQUIRED/)
+  assert.match(phone, /recheckPendingConfirmationAfterManagerAction/)
+  assert.doesNotMatch(phone, /try\? await cache\.loadOutbox/)
+  assert.match(phone, /func protectUnreadablePendingConfirmation[\s\S]*hasPendingConfirmation = true/)
+  assert.match(phone, /resumeDurableConfirmationIfNeeded\(\)[\s\S]*recheckPendingConfirmation\(pending\)[\s\S]*Prior confirmation remains pending/)
+  assert.match(phone, /func verifyCode\(\)[\s\S]*let restoredProfile = try await api\.fetchSessionProfile\(\)[\s\S]*isRestoringSession = true[\s\S]*isAuthenticated = true[\s\S]*recoverWorkspaceTransitionIfNeeded[\s\S]*resumeDurableConfirmationIfNeeded\(\)/)
+  assert.match(phone, /func signInWithGoogle\(\)[\s\S]*let restoredProfile = try await api\.fetchSessionProfile\(\)[\s\S]*isRestoringSession = true[\s\S]*isAuthenticated = true[\s\S]*recoverWorkspaceTransitionIfNeeded[\s\S]*resumeDurableConfirmationIfNeeded\(\)/)
+  assert.match(phone, /var canSwitchWorkspace:[\s\S]*!isRestoringSession[\s\S]*!isRecheckingPendingConfirmation[\s\S]*!isConfirmingOrder[\s\S]*!isRequestingPickHandoff[\s\S]*!hasPendingConfirmation/)
+  assert.match(phone, /func retryPendingConfirmation\(\) async \{[\s\S]*guard !isConfirmingOrder,[\s\S]*!hasPendingWorkspaceTransition else \{ return \}[\s\S]*isConfirmingOrder = true[\s\S]*finishConfirmedOrder\(pending\)/)
+  assert.match(dashboard, /Manager reconciliation required/)
+  assert.match(dashboard, /Refresh after manager reconciliation/)
+  assert.match(dashboard, /does not change Shopify or repeat a provider action/)
+  assert.match(dashboard, /Saved confirmation protected/)
+  assert.doesNotMatch(dashboard, /Abandon blocked pick|Clear blocked pick/)
+})
+
+test('native picker handoff is durable, identity fenced, deliberate, and crash recoverable', () => {
+  const route = read('app/api/operations/route.ts')
+  const models = read('../clients/apple/Sources/ClawPilotPickingCore/PickingModels.swift')
+  const session = read('../clients/apple/Sources/ClawPilotPickingCore/PickingSession.swift')
+  const adapter = read('../clients/apple/Sources/ClawPilotPickingApple/AppleAdapters.swift')
+  const phone = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+  const dashboard = read('../clients/apple/Apps/iPhone/PickingDashboardView.swift')
+
+  assert.match(route, /action === 'request-pick-handoff'/)
+  assert.match(route, /blockedConfirmationIdempotencyKey/)
+  assert.match(models, /public struct PickHandoffCommand: Codable, Equatable, Sendable/)
+  assert.match(models, /expectedAssignedTaskCount/)
+  assert.match(models, /blockedConfirmationIdempotencyKey/)
+  assert.match(session, /saveHandoffOutbox\(_ command: PickHandoffCommand\)/)
+  assert.match(session, /persistPickHandoff/)
+  assert.match(session, /localPickingProgressIsEmpty\(\)/)
+  assert.match(session, /try await cache\.saveQueue\(replacementQueue\)[\s\S]*try await cache\.clearHandoffOutbox\(\)/)
+  assert.match(session, /retireBlockedHandoffAfterExternalReconciliation/)
+  assert.match(adapter, /func requestPickHandoff/)
+  assert.match(adapter, /request\.setValue\(command\.idempotencyKey, forHTTPHeaderField: "Idempotency-Key"\)/)
+  assert.match(adapter, /expectedAssignedTaskCount: command\.expectedAssignedTaskCount/)
+  assert.match(phone, /resumeDurablePickHandoffIfNeeded\(\)[\s\S]*resumeDurableConfirmationIfNeeded\(\)/)
+  assert.match(phone, /pendingPickHandoffRecoveryWorkspaceId/)
+  assert.match(phone, /isPendingHandoffRecoverySwitch/)
+  assert.match(phone, /showPhoneScanner = false[\s\S]*stopListeningForPickCommand\(\)[\s\S]*await cancelMetaScan\(\)[\s\S]*canRequestActivePickHandoff\(\)/)
+  assert.match(phone, /guard !hasPendingPickHandoff, !isRequestingPickHandoff else/)
+  assert.match(phone, /let queue = try await api\.fetchQueue\(\)[\s\S]*guard !hasPendingConfirmation,[\s\S]*!hasPendingPickHandoff,[\s\S]*!isRequestingPickHandoff else/)
+  assert.match(phone, /recheckPendingConfirmation\(for: command\)/)
+  assert.match(dashboard, /\.alert\([\s\S]*"Request manager handoff\?"/)
+  assert.match(dashboard, /TextField\("Reason for manager"/)
+  assert.match(dashboard, /Request manager handoff instead/)
+  assert.match(dashboard, /Hand off this unstarted order/)
+  assert.match(dashboard, /Retry exact handoff/)
+  assert.match(dashboard, /will not clear the pick from a missing queue row alone/)
 })
 
 test('location-first scans require durable acknowledged evidence before pick confirmation', () => {
@@ -361,11 +511,13 @@ test('iPhone picking UI supports a dismissible one-time-code flow and branded ic
   assert.match(dashboard, /\.scrollDismissesKeyboard\(\.interactively\)/)
 })
 
-test('Watch companion presents safe pick context and routes commands through iPhone', () => {
+test('Watch companion keeps local audio unless exact enhanced Meta playback starts', () => {
   const project = read('../clients/apple/project.yml')
   const watch = read('../clients/apple/Apps/Watch/ClawPilotPickingWatchApp.swift')
   const bridge = read('../clients/apple/Apps/iPhone/PhoneWatchBridge.swift')
   const app = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+  const voice = read('../clients/apple/Apps/iPhone/VoiceConfirmationController.swift')
+  const models = read('../clients/apple/Sources/ClawPilotPickingCore/PickingModels.swift')
   assert.match(project, /ClawPilotPickingWatch:[\s\S]*ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon/)
   assert.match(watch, /productImage\(model\.productImage, isExpected:/)
   assert.match(watch, /CGImageSourceCreateThumbnailAtIndex/)
@@ -383,8 +535,128 @@ test('Watch companion presents safe pick context and routes commands through iPh
   assert.match(bridge, /decode\(WatchPickCommand\.self/)
   assert.match(bridge, /handledCommandIDs/)
   assert.match(app, /private func handleWatchCommand/)
-  assert.match(app, /readInstructionOnPhone: metaConnectedDeviceCount == 1/)
+  assert.match(
+    app,
+    /case \.readInstruction:[\s\S]*?await refreshMetaStatus\(\)[\s\S]*?guard metaConnectedDeviceCount == 1[\s\S]*?speakEnhancedThroughBluetoothAndWait/,
+  )
+  assert.doesNotMatch(
+    app,
+    /case \.readInstruction:[\s\S]*?readInstruction\(forceSystemVoice: true\)/,
+  )
+  assert.match(app, /readInstructionOnPhone: WatchInstructionPhonePlaybackPolicy\.isEligible/)
+  assert.match(models, /metaConnectedDeviceCount == 1 && enhancedVoiceReady/)
+  assert.match(watch, /WatchInstructionPlaybackTarget\.resolve/)
+  assert.match(watch, /playInstructionLocally\(fallbackReason: result\.message\)/)
+  assert.match(project, /UIBackgroundModes:[\s\S]*?- audio/)
+  assert.match(voice, /beginBackgroundTask\(withName:/)
+  assert.match(voice, /guard voicePackState == \.ready/)
+  assert.match(voice, /case \.bluetoothA2DP, \.bluetoothHFP, \.bluetoothLE/)
+  assert.match(voice, /guard let startedOutput = session\.currentRoute\.outputs/)
+  assert.match(voice, /startStrictPlaybackMonitor\([\s\S]*?return startedPlayback/)
+  assert.match(
+    voice,
+    /validateStartedBluetoothPlayback\([\s\S]*?playbackOwnershipTransferred = true[\s\S]*?startedAt: startedPlayback\.startedAt/,
+  )
+  const strictPlaybackMonitor = voice.slice(
+    voice.indexOf('private func startStrictPlaybackMonitor'),
+    voice.indexOf('private func ensureEnhancedPlaybackAuthority'),
+  )
+  assert.match(strictPlaybackMonitor, /while player\.isPlaying/)
+  assert.match(strictPlaybackMonitor, /uid: playback\.outputUID/)
+  assert.match(strictPlaybackMonitor, /portType: playback\.outputPortType/)
+  assert.doesNotMatch(strictPlaybackMonitor, /deadline/)
+  assert.match(bridge, /private actor PhoneWatchOutcomeRace/)
+  assert.match(bridge, /handlerTask\.cancel\(\)[\s\S]*?let handlerOutcome = await handlerTask\.value/)
+  assert.match(bridge, /validatedReadInstructionOutcome/)
+  assert.match(bridge, /acceptsAcknowledgedPhonePlaybackStart/)
+  assert.match(app, /return \.phonePlaybackStarted\(status, startedAt: playback\.startedAt\)/)
+  assert.doesNotMatch(app, /Instruction requested on the connected Meta glasses audio route/)
   assert.doesNotMatch(watch, /PickingAPIClient|ConfirmPicksCommand/)
+})
+
+test('Watch instruction falls back locally when iPhone reachability drops before send', () => {
+  const watch = read('../clients/apple/Apps/Watch/ClawPilotPickingWatchApp.swift')
+  assert.match(
+    watch,
+    /guard let session,[\s\S]*?session\.isReachable else \{[\s\S]*?if command\.action == \.readInstruction \{[\s\S]*?playInstructionLocally\(fallbackReason: message\)[\s\S]*?return[\s\S]*?\}[\s\S]*?actionStatus = "Open ClawPilot on the paired iPhone, then try again\."/,
+  )
+})
+
+test('Watch instruction falls back locally after the paired iPhone command times out', () => {
+  const watch = read('../clients/apple/Apps/Watch/ClawPilotPickingWatchApp.swift')
+  assert.match(
+    watch,
+    /private func startCommandTimeout\(for command: WatchPickCommand\)[\s\S]*?case \.readInstruction: \.seconds\(\s*Int64\(WatchInstructionPlaybackTiming\.watchFallbackDelay\)\s*\)[\s\S]*?if command\.action == \.readInstruction \{[\s\S]*?finishPendingCommand\(succeeded: false, message: message\)[\s\S]*?playInstructionLocally\(fallbackReason: message\)[\s\S]*?return[\s\S]*?\}[\s\S]*?message: "The iPhone action is taking too long\. Keep ClawPilot open and try again\."/,
+  )
+})
+
+test('multi-unit picks require a deliberate popup count on iPhone or Watch', () => {
+  const models = read('../clients/apple/Sources/ClawPilotPickingCore/PickingModels.swift')
+  const session = read('../clients/apple/Sources/ClawPilotPickingCore/PickingSession.swift')
+  const adapters = read('../clients/apple/Sources/ClawPilotPickingApple/AppleAdapters.swift')
+  const phone = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+  const dashboard = read('../clients/apple/Apps/iPhone/PickingDashboardView.swift')
+  const watch = read('../clients/apple/Apps/Watch/ClawPilotPickingWatchApp.swift')
+
+  assert.match(models, /quantity\.rounded\(\.towardZero\) == quantity/)
+  assert.match(models, /public struct PickTaskCountEvidence/)
+  assert.match(models, /public let countEvidenceIdempotencyKey: String\?/)
+  assert.match(models, /public let countEvidence: \[PickTaskCountEvidence\]\?/)
+  assert.match(models, /case iPhone = "iphone"/)
+  assert.match(models, /case watch = "watch"/)
+  assert.match(session, /case \.count|return \.count/)
+  assert.match(session, /func verifyCount\(/)
+  assert.match(session, /enteredCount == required/)
+  assert.match(session, /stageContextTokens\[task\.pickTaskGlobalId\] == contextToken/)
+  assert.match(
+    session,
+    /func commitWorkflowProgress\(_ candidate: WorkflowProgressState\) async throws \{[\s\S]*?try await persistProgress\(candidate\)[\s\S]*?applyWorkflowProgress\(candidate\)/,
+  )
+  assert.match(adapters, /pick-progress\.json/)
+  assert.match(adapters, /countEvidenceIdempotencyKey: command\.countEvidenceIdempotencyKey/)
+  assert.match(adapters, /countEvidence: command\.countEvidence/)
+  assert.match(phone, /\.sheet\(isPresented: \$model\.showCountEntry\)/)
+  assert.match(dashboard, /struct PickedCountEntrySheet/)
+  assert.match(dashboard, /TextField\("Picked count"/)
+  assert.match(dashboard, /prefix\(16\)/)
+  assert.match(watch, /struct WatchCountEntryView/)
+  assert.match(watch, /Stepper\(/)
+  assert.match(watch, /_enteredCount = State\(initialValue: 1\)/)
+  assert.match(watch, /case \.submitCount|\.submitCount/)
+})
+
+test('location to product transition is explicit and keeps the Meta session alive', () => {
+  const models = read('../clients/apple/Sources/ClawPilotPickingCore/PickingModels.swift')
+  const session = read('../clients/apple/Sources/ClawPilotPickingCore/PickingSession.swift')
+  const phone = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+  const dashboard = read('../clients/apple/Apps/iPhone/PickingDashboardView.swift')
+  const watch = read('../clients/apple/Apps/Watch/ClawPilotPickingWatchApp.swift')
+
+  assert.match(models, /case productReady = "product_ready"/)
+  assert.match(
+    session,
+    /func beginProductScan\(\s*contextToken: String,\s*now: Date = Date\(\)\s*\) async throws/,
+  )
+  assert.match(phone, /metaProductStartContinuation/)
+  assert.match(phone, /metaProductStartRequestedScanID/)
+  assert.match(phone, /await withCheckedContinuation/)
+  assert.match(phone, /suppressedValue: acceptedLocationValue/)
+  assert.match(
+    phone,
+    /metaProductStartRequestedScanID == scanID[\s\S]*?currentWorkflowStage == \.product/,
+  )
+  assert.doesNotMatch(
+    phone.match(/guard acceptance\.stage == \.location[\s\S]*?suppressedValue: acceptedLocationValue/)?.[0] ?? '',
+    /Task\.sleep/,
+  )
+  assert.match(dashboard, /Scan product with Meta glasses/)
+  assert.match(dashboard, /Scan product with iPhone/)
+  assert.match(watch, /Label\("Scan product"/)
+  assert.match(phone, /case \.beginProductScan:/)
+  assert.match(
+    phone,
+    /func beginProductScanWithMeta[\s\S]*?guard isMetaScanning \|\| metaScanReady[\s\S]*?picking\.beginProductScan/,
+  )
 })
 
 test('picker audio routing and Meta scan feedback stay explicit and bounded', () => {
@@ -431,7 +703,18 @@ test('picker audio routing and Meta scan feedback stay explicit and bounded', ()
   assert.match(dashboard, /Pronunciation corrections/)
   assert.match(dashboard, /Save and preview/)
   assert.match(dashboard, /model\.removePronunciationCorrection/)
-  assert.match(voice, /computeUnits: \.cpuAndGPU/)
+  assert.match(voice, /computeUnits: \.cpuOnly/)
+  assert.doesNotMatch(voice, /computeUnits: \.cpuAndGPU/)
+  assert.match(voice, /private var loadTask: Task<SupertonicTTSModel, Error>\?/)
+  assert.match(voice, /FileProtectionType\.completeUntilFirstUserAuthentication/)
+  assert.match(voice, /applyLockedPlaybackProtection\(to: Self\.voicePackDirectory\)/)
+  assert.match(voice, /case loadFailed\(String\)/)
+  assert.match(voice, /var canRetryLoad: Bool/)
+  assert.match(dashboard, /model\.retryEnhancedVoicePack\(\)/)
+  assert.match(voice, /deadline: Date\? = nil/)
+  assert.match(voice, /let routeDeadline = Date\(\)\.addingTimeInterval\(3\)/)
+  assert.match(voice, /bluetoothRoutePrimerData/)
+  assert.doesNotMatch(voice, /setActive\(true, options:/)
   assert.match(voice, /sampleRate: 44_100/)
   assert.match(voice, /runOfflineVoiceSelfTest/)
   assert.match(voice, /nonisolated private static func requestSpeechAuthorization/)
@@ -444,8 +727,16 @@ test('picker audio routing and Meta scan feedback stay explicit and bounded', ()
   assert.match(voice, /VectorEstimator\.mlpackage\/Data\/com\.apple\.CoreML\/weights\/weight\.bin": 255_276_032/)
   assert.match(voice, /voice_styles\/F2\.json": 292_423/)
   assert.match(voice, /Apple speech remains the fallback/)
-  assert.match(voice, /Enhanced voice storage could not be prepared/)
+  assert.match(voice, /Voice storage is unavailable/)
   assert.match(meta, /resolution: \.high/)
+  assert.match(meta, /frameRate: 15/)
+  assert.match(metaPolicy, /liveFrameCadenceNanoseconds: UInt64 = 100_000_000/)
+  assert.match(metaPolicy, /liveFrameDelayNanoseconds/)
+  assert.match(meta, /videoProcessingQueue\.asyncAfter/)
+  assert.match(metaPolicy, /maximumPendingPhotos = 1/)
+  assert.match(metaPolicy, /ordinal > 1/)
+  assert.match(metaPolicy, /allowsAccurateOCR: false/)
+  assert.match(metaPolicy, /allowsAccurateOCR: true/)
   assert.match(meta, /photoDataPublisher\.listen[\s\S]*videoFramePublisher\.listen[\s\S]*camera\.stream\.start\(\)/)
   assert.match(meta, /vision-decode:kind=\\\(item\.kind\.rawValue\):outcome=\\\(outcome\)/)
   assert.match(meta, /case photo/)
@@ -461,9 +752,9 @@ test('picker audio routing and Meta scan feedback stay explicit and bounded', ()
   assert.match(meta, /orientation_winner=/)
   assert.match(meta, /VNRecognizeTextRequest\(\)/)
   assert.match(meta, /request\.recognitionLevel = \.accurate/)
-  assert.match(meta, /guard let expectedValue = item\.target\.expectedValue/)
+  assert.match(meta, /let expectedValue = item\.target\.expectedValue/)
   assert.match(meta, /MetaExpectedBarcodeTextMatcher\.matches/)
-  assert.match(meta, /MetaBarcodeCandidate\(payload: expectedValue/)
+  assert.match(meta, /MetaBarcodeCandidate\(\s*payload: expectedValue/)
   assert.match(metaPolicy, /String\(value\.filter \{ !\$0\.isWhitespace \}\)\.uppercased\(\)/)
   assert.doesNotMatch(meta, /ocr_(?:text|payload)=|orientation_(?:text|payload)=/i)
   assert.doesNotMatch(meta, /photo\.data\.write|write\(to:/)
@@ -559,7 +850,7 @@ test('mobile app gates workflows behind the shared ClawPilot session', () => {
   assert.match(shell, /Wave and assign order/)
 })
 
-test('mobile organization changes reuse the session workspace boundary and clear scoped picks', () => {
+test('mobile organization changes are serialized, journaled, and profile fenced', () => {
   const session = read('app/api/auth/session/route.ts')
   const workspace = read('app/api/auth/workspace/route.ts')
   const app = read('../clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
@@ -571,9 +862,24 @@ test('mobile organization changes reuse the session workspace boundary and clear
   assert.match(workspace, /switchBrowserSessionWorkspace/)
   assert.match(workspace, /clearWorkspaceSelectionCookies\(response\)/)
   assert.match(adapters, /api\/auth\/workspace/)
+  assert.match(adapters, /workspaceConfiguration\.httpShouldSetCookies = false/)
+  assert.match(adapters, /private func authenticatedData[\s\S]*attachStoredCookies\(to: &request\)[\s\S]*session\.data\(for: request\)/)
+  assert.match(adapters, /public struct WorkspaceTransition: Codable, Equatable, Sendable/)
+  assert.match(adapters, /workspace-transition\.json/)
+  assert.match(adapters, /public func saveWorkspaceTransition[\s\S]*loadOutbox\(\)[\s\S]*loadHandoffOutbox\(\)/)
+  assert.match(adapters, /public func clearWorkspaceTransition[\s\S]*loadWorkspaceTransition\(\) == transition/)
+  assert.match(adapters, /public func switchWorkspace[\s\S]*await beginAuthenticatedMutation\(\)[\s\S]*persistResponseCookies\(response\)/)
+  assert.match(adapters, /public func logout\(\) async throws \{[\s\S]*await beginAuthenticatedMutation\(\)[\s\S]*authenticatedData\(for: request\)/)
   assert.match(app, /guard canSwitchWorkspace else/)
+  assert.match(app, /cache\.saveWorkspaceTransition\(transition\)[\s\S]*clearPublishedPickProjection\(\)[\s\S]*api\.switchWorkspace\(to: organizationId\)/)
+  assert.match(app, /recoverWorkspaceTransitionIfNeeded[\s\S]*cache\.clearWorkspaceTransition\(transition\)[\s\S]*hasPendingWorkspaceTransition = false[\s\S]*updateProjection\(\)/)
+  assert.match(app, /func logout\(\) async \{[\s\S]*authenticationGeneration &\+= 1[\s\S]*await waitForWorkspaceSwitchToFinish\(\)[\s\S]*try await api\.logout\(\)/)
+  assert.match(app, /func logout\(\) async \{[\s\S]*isAuthenticated = false[\s\S]*sessionProfile = nil[\s\S]*clearPublishedPickProjection\(\)[\s\S]*await waitForWorkspaceSwitchToFinish\(\)/)
+  assert.match(app, /func restoreAndRefresh\(\) async \{[\s\S]*clearPublishedPickProjection\(\)[\s\S]*api\.fetchSessionProfile\(\)[\s\S]*recoverWorkspaceTransitionIfNeeded[\s\S]*picking\.restore\(\)[\s\S]*resumeDurablePickHandoffIfNeeded\(\)[\s\S]*resumeDurableConfirmationIfNeeded\(\)[\s\S]*updateProjection\(\)/)
+  assert.match(app, /private func updateProjection\(\) async \{[\s\S]*queueIdentityMatches[\s\S]*authorizedOrganizationId:[\s\S]*authorizedWorkerEmail:/)
   assert.match(app, /try await picking\.clearQueue\(\)/)
   assert.match(pickingSession, /public func clearQueue\(\) async throws/)
+  assert.match(pickingSession, /public func queueIdentityMatches/)
   assert.match(shell, /WorkspaceSwitcherCard\(model: model\)/)
   assert.match(shell, /WorkspaceSwitcherCard\(model: model, compact: true\)/)
 })

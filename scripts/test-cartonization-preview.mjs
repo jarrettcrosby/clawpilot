@@ -188,7 +188,7 @@ function loadPersistence({
         }
       }
       if (sql.includes(
-        'FROM operations_commerce_order_candidate_lines line',
+        'FROM operations_commerce_current_planning_lines line',
       )) {
         return {
           rowCount: 1,
@@ -1020,7 +1020,7 @@ const persistence = read(
 for (const fragment of [
   'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY',
   'operations_commerce_order_candidates',
-  'operations_commerce_order_candidate_lines',
+  'operations_commerce_current_planning_lines',
   'operations_commerce_inventory_sync_runs',
   'operations_commerce_inventory_levels',
   'operations_inventory_positions',

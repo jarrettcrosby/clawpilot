@@ -31,7 +31,9 @@ import {
 } from '@mui/material'
 import AddRounded from '@mui/icons-material/AddRounded'
 import AutoAwesomeRounded from '@mui/icons-material/AutoAwesomeRounded'
+import DeleteOutlineRounded from '@mui/icons-material/DeleteOutlineRounded'
 import EditRounded from '@mui/icons-material/EditRounded'
+import FileUploadRounded from '@mui/icons-material/FileUploadRounded'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
 import type {
@@ -64,6 +66,24 @@ type Payload = {
     createdCount?: number
     totalCount?: number
     replayed?: boolean
+    outcome?: 'deleted' | 'retired'
+    updatedCount?: number
+  }
+  preview?: {
+    fileSha256: string
+    totalCount: number
+    defaultCount: number
+    warnings: string[]
+    rows: Array<{
+      code: string
+      name: string
+      shopifyType: string
+      ratedOuterLengthMm: number
+      ratedOuterWidthMm: number
+      ratedOuterHeightMm: number
+      tareWeightGrams: number
+      isDefault: boolean
+    }>
   }
 }
 
@@ -187,6 +207,7 @@ const materialSourceOptions: Array<{
   { value: 'manual', label: 'Operator entered' },
   { value: 'customer_supplied', label: 'Customer supplied' },
   { value: 'csv_import', label: 'CSV import' },
+  { value: 'shopify_import', label: 'Shopify package import' },
   { value: 'starter_assortment', label: 'Starter assortment' },
 ]
 
@@ -502,6 +523,12 @@ export default function PackagingMaterialsPanel() {
   const [stockOpen, setStockOpen] = useState(false)
   const [stockMaterial, setStockMaterial] = useState<PackagingMaterial | null>(null)
   const [stockDraft, setStockDraft] = useState<StockForm>(emptyStock)
+  const [removeMaterial, setRemoveMaterial] = useState<PackagingMaterial | null>(null)
+  const [importOpen, setImportOpen] = useState(false)
+  const [importCsv, setImportCsv] = useState('')
+  const [importAccountGlobalId, setImportAccountGlobalId] = useState('')
+  const [importPreview, setImportPreview] = useState<Payload['preview']>(undefined)
+  const importCommandKey = useRef<string | null>(null)
   const previousMeasurementSystem = useRef(measurementSystem)
 
   const load = useCallback(async () => {
@@ -988,6 +1015,107 @@ export default function PackagingMaterialsPanel() {
     }
   }
 
+  const previewShopifyPackages = async () => {
+    setBusy(true)
+    setError('')
+    setImportPreview(undefined)
+    try {
+      const response = await fetch('/api/operations/packaging-materials/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'preview', csv: importCsv, accountGlobalId: '' }),
+      })
+      const payload = await response.json() as Payload
+      if (!response.ok || !payload.preview) {
+        throw new Error(payload.error || 'Shopify package CSV could not be previewed')
+      }
+      importCommandKey.current = null
+      setImportPreview(payload.preview)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Shopify package CSV could not be previewed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const applyShopifyPackages = async () => {
+    if (!importPreview || !importAccountGlobalId) return
+    setBusy(true)
+    setError('')
+    const commandKey = importCommandKey.current
+      ?? `shopify-packages:${globalThis.crypto.randomUUID()}`
+    importCommandKey.current = commandKey
+    let terminalResponse = false
+    try {
+      const response = await fetch('/api/operations/packaging-materials/import', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': commandKey,
+        },
+        body: JSON.stringify({
+          action: 'apply',
+          accountGlobalId: importAccountGlobalId,
+          csv: importCsv,
+        }),
+      })
+      terminalResponse = true
+      const payload = await response.json() as Payload
+      if (!response.ok || payload.result?.totalCount === undefined) {
+        throw new Error(payload.error || 'Shopify packages could not be imported')
+      }
+      setNotice(
+        `${payload.result.totalCount} Shopify packages are available as drafts. `
+        + `${payload.result.createdCount || 0} were added and ${payload.result.updatedCount || 0} were refreshed.`,
+      )
+      setImportOpen(false)
+      setImportCsv('')
+      setImportPreview(undefined)
+      await load()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Shopify packages could not be imported')
+    } finally {
+      if (terminalResponse) importCommandKey.current = null
+      setBusy(false)
+    }
+  }
+
+  const confirmRemoveMaterial = async () => {
+    if (!removeMaterial) return
+    const removal = removeMaterial
+    setBusy(true)
+    setError('')
+    try {
+      const response = await fetch('/api/operations/packaging-materials', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `remove-packaging:${removal.globalId}:v${removal.rowVersion}`,
+        },
+        body: JSON.stringify({
+          action: 'remove-material',
+          materialGlobalId: removal.globalId,
+          expectedRowVersion: removal.rowVersion,
+        }),
+      })
+      const payload = await response.json() as Payload
+      if (!response.ok || !payload.result?.outcome) {
+        throw new Error(payload.error || 'Packaging material could not be removed')
+      }
+      setNotice(
+        payload.result.outcome === 'deleted'
+          ? `${removal.name} was deleted.`
+          : `${removal.name} was removed from use. Historical references were preserved.`,
+      )
+      setRemoveMaterial(null)
+      await load()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Packaging material could not be removed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const canManage = workspace?.capabilities.canManage === true
   const readiness = workspace?.optimizerReadiness
 
@@ -1123,6 +1251,19 @@ export default function PackagingMaterialsPanel() {
           />
           <Button
             variant="outlined"
+            startIcon={<FileUploadRounded />}
+            disabled={!canManage || busy || !(workspace?.shopifyPackageImport?.accounts.length)}
+            onClick={() => {
+              const first = workspace?.shopifyPackageImport?.accounts[0]
+              setImportAccountGlobalId(first?.globalId || '')
+              importCommandKey.current = null
+              setImportOpen(true)
+            }}
+          >
+            Import Shopify packages
+          </Button>
+          <Button
+            variant="outlined"
             startIcon={busy ? <CircularProgress size={16} /> : <AutoAwesomeRounded />}
             disabled={!canManage || busy}
             onClick={() => void createStarterAssortment()}
@@ -1214,6 +1355,9 @@ export default function PackagingMaterialsPanel() {
                           color="secondary"
                           variant="outlined"
                         />
+                      ) : null}
+                      {material.shopifyImport?.isDefault ? (
+                        <Chip size="small" label="Shopify default" color="primary" variant="outlined" />
                       ) : null}
                     </Stack>
                     <Typography variant="caption" color="text.secondary">
@@ -1364,6 +1508,15 @@ export default function PackagingMaterialsPanel() {
                       Return to draft
                     </Button>
                   )}
+                  <Button
+                    variant="text"
+                    color="error"
+                    startIcon={<DeleteOutlineRounded />}
+                    disabled={!canManage || busy}
+                    onClick={() => setRemoveMaterial(material)}
+                  >
+                    Remove
+                  </Button>
                   <Typography variant="caption" color="text.secondary" sx={{ alignSelf: 'center' }}>
                     {material.source === 'starter_assortment'
                       ? 'Starter specification — verify against the selected supplier.'
@@ -1471,7 +1624,10 @@ export default function PackagingMaterialsPanel() {
                     ...materialDraft,
                     source: event.target.value as PackagingMaterialSource,
                   })}
-                  disabled={editingMaterial?.source === 'starter_assortment'}
+                  disabled={
+                    editingMaterial?.source === 'starter_assortment'
+                    || editingMaterial?.source === 'shopify_import'
+                  }
                 >
                   {materialSourceOptions.map((option) => (
                     <MenuItem key={option.value} value={option.value}>
@@ -1808,6 +1964,123 @@ export default function PackagingMaterialsPanel() {
             </Button>
           </DialogActions>
         </Box>
+      </Dialog>
+
+      <Dialog
+        open={importOpen}
+        onClose={() => !busy && setImportOpen(false)}
+        fullWidth
+        maxWidth="md"
+      >
+        <DialogTitle>Import Shopify saved packages</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={2}>
+            <Alert severity="info">
+              Shopify’s public Admin API currently exposes saved-package mutations but no supported package-list query. Export or transcribe the store package list into this template; ClawPilot performs no Shopify write and stages every row as a draft.
+            </Alert>
+            <TextField
+              select
+              label="Shopify connection"
+              value={importAccountGlobalId}
+              onChange={(event) => {
+                setImportAccountGlobalId(event.target.value)
+                importCommandKey.current = null
+              }}
+              required
+            >
+              {(workspace?.shopifyPackageImport?.accounts || []).map((account) => (
+                <MenuItem key={account.globalId} value={account.globalId}>
+                  {account.displayName} · {account.canonicalDomain}
+                </MenuItem>
+              ))}
+            </TextField>
+            <Button
+              component="a"
+              href="/api/operations/packaging-materials/import"
+              variant="outlined"
+              sx={{ alignSelf: 'flex-start' }}
+            >
+              Download CSV template
+            </Button>
+            <Button component="label" variant="outlined" sx={{ alignSelf: 'flex-start' }}>
+              Choose completed CSV
+              <input
+                hidden
+                type="file"
+                accept=".csv,text/csv"
+                onChange={(event) => {
+                  const file = event.target.files?.[0]
+                  if (!file) return
+                  void file.text().then((csv) => {
+                    setImportCsv(csv)
+                    setImportPreview(undefined)
+                    importCommandKey.current = null
+                  })
+                }}
+              />
+            </Button>
+            {importCsv ? (
+              <Typography variant="caption" color="text.secondary">
+                {new Blob([importCsv]).size.toLocaleString()} bytes loaded
+              </Typography>
+            ) : null}
+            {importPreview ? (
+              <Stack spacing={1}>
+                <Alert severity="warning">
+                  {importPreview.totalCount} package{importPreview.totalCount === 1 ? '' : 's'} · {importPreview.defaultCount} default. Outer dimensions and empty weights are evidence only; verify inner capacity, cost, and stock before activation.
+                </Alert>
+                <Box sx={{ maxHeight: 280, overflow: 'auto' }}>
+                  {importPreview.rows.map((row) => (
+                    <Typography key={row.code} variant="body2" sx={{ py: 0.5 }}>
+                      {row.code} · {row.name} · {row.shopifyType} · {row.ratedOuterLengthMm} × {row.ratedOuterWidthMm} × {row.ratedOuterHeightMm} mm · {row.tareWeightGrams} g{row.isDefault ? ' · default' : ''}
+                    </Typography>
+                  ))}
+                </Box>
+              </Stack>
+            ) : null}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setImportOpen(false)} disabled={busy}>Cancel</Button>
+          <Button
+            onClick={() => void previewShopifyPackages()}
+            disabled={busy || !importCsv}
+          >
+            Preview
+          </Button>
+          <Button
+            variant="contained"
+            onClick={() => void applyShopifyPackages()}
+            disabled={busy || !importPreview || !importAccountGlobalId}
+          >
+            Import drafts
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(removeMaterial)}
+        onClose={() => !busy && setRemoveMaterial(null)}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Remove packaging material?</DialogTitle>
+        <DialogContent dividers>
+          <Typography>
+            {removeMaterial?.name} will disappear from the packaging catalog. Unused records are deleted; materials referenced by historical rates, recipes, or shipments are retired so audit evidence remains intact.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setRemoveMaterial(null)} disabled={busy}>Cancel</Button>
+          <Button
+            color="error"
+            variant="contained"
+            onClick={() => void confirmRemoveMaterial()}
+            disabled={busy}
+          >
+            Remove material
+          </Button>
+        </DialogActions>
       </Dialog>
 
       <Dialog

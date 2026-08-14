@@ -56,6 +56,9 @@ import IntegrationSetupJourney, {
 import CommerceIntakeWorkflow from '@/components/settings/CommerceIntakeWorkflow'
 import ShopifyCarrierServiceSetupPanel
   from '@/components/settings/ShopifyCarrierServiceSetupPanel'
+import { copyPlainTextToClipboard } from '@/lib/browserClipboard'
+import { SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES }
+  from '@/lib/integrations/commerceCapabilities'
 import { resolveCommerceSetupPermissionGuidance }
   from '@/lib/integrations/commerceSetupGuidance'
 
@@ -424,9 +427,13 @@ function actionableCommerceError(error: unknown) {
     SHOPIFY_STORE_NOT_FOUND:
       'Confirm the permanent myshopify.com domain in Shopify store settings; do not use a storefront or admin URL.',
     SHOPIFY_CLIENT_CREDENTIALS_REJECTED:
-      'Confirm the canonical myshopify.com domain and copy the current client ID and secret from the installed Dev Dashboard app.',
+      'Confirm the myshopify.com domain and copy the current client ID and secret from the installed Dev Dashboard app.',
+    SHOPIFY_CANONICAL_DOMAIN_REQUIRED:
+      'Shopify verified this store under a different permanent myshopify.com domain. Reconnect with that permanent domain.',
     SHOPIFY_ACCESS_DENIED:
       'Update the app version scopes, release it, approve the change in Shopify, then test the connection again.',
+    SHOPIFY_PROBE_INVALID:
+      'Shopify authenticated the app but did not return a complete installed-store identity. Confirm the app is installed on this store, then retry.',
     SHOPIFY_SCOPE_PROFILE_INCOMPLETE:
       'Add the listed least-privilege receipt scopes to the Shopify app version, release it, approve the change, and test again.',
     SHOPIFY_ORDER_READ_SCOPE_REQUIRED:
@@ -624,6 +631,9 @@ export default function CommerceIntegrationPanel() {
     confirmLiveAccess: false,
   })
   const [setupChecklistProvider, setSetupChecklistProvider] = useState<CommerceProvider | null>(null)
+  const setupScopeInputRef = useRef<
+    HTMLInputElement | HTMLTextAreaElement | null
+  >(null)
   const [copiedSetupScopes, setCopiedSetupScopes] = useState<null | string>(null)
 
   function applyPayload(payload: CommercePayload) {
@@ -1065,16 +1075,22 @@ export default function CommerceIntegrationPanel() {
   async function copySetupChecklistScopes() {
     if (!setupChecklistProvider || !setupPermissionGuidance?.copyable) return
     const provider = setupChecklistProvider
-    const value = setupPermissionGuidance.scopes.join(', ')
+    const value = setupPermissionGuidance.scopes.join(',')
     if (!value) return
-    try {
-      await navigator.clipboard.writeText(value)
+    setError('')
+    if (await copyPlainTextToClipboard(value)) {
       setCopiedSetupScopes(setupPermissionGuidanceKey)
       setTimeout(() => setCopiedSetupScopes(null), 1_200)
-      setNotice(`${providerLabel(provider)} setup scopes copied.`)
-    } catch {
-      setError('Could not copy setup scopes. Select and copy the list manually.')
+      setNotice(
+        `${providerLabel(provider)} comma-separated setup scopes copied.`,
+      )
+      return
     }
+    setupScopeInputRef.current?.focus()
+    setupScopeInputRef.current?.select()
+    setError(
+      'The browser blocked clipboard access. The comma-separated scope list is selected; press Command+C to copy it.',
+    )
   }
 
   if (loading) {
@@ -1138,7 +1154,7 @@ export default function CommerceIntegrationPanel() {
       : []
   const setupPermissionGuidance = resolveCommerceSetupPermissionGuidance({
     provider: setupChecklistProvider,
-    shopifyScopes: catalog?.providers.shopify.providerScopes || [],
+    shopifyScopes: SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
     faireAuthPath: faire.authPath,
     faireScopeProfile: faire.scopeProfile,
     faireScopeProfiles: catalog?.onboarding.faire.scopeProfiles || {
@@ -1240,6 +1256,21 @@ export default function CommerceIntegrationPanel() {
               <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
                 {setupPermissionGuidance.description}
               </Typography>
+              {setupPermissionGuidance.copyable
+                && setupPermissionGuidance.scopes.length ? (
+                  <TextField
+                    inputRef={setupScopeInputRef}
+                    fullWidth
+                    multiline
+                    minRows={2}
+                    label="Comma-separated scope list"
+                    value={setupPermissionGuidance.scopes.join(',')}
+                    onFocus={(event) => event.currentTarget.select()}
+                    slotProps={{ htmlInput: { readOnly: true } }}
+                    helperText="Use Copy scope list, or select this field and press Command+C."
+                    sx={{ mt: 1.25 }}
+                  />
+                ) : null}
               {setupPermissionGuidance.scopes.length ? (
                 <Stack direction="row" gap={0.75} flexWrap="wrap" sx={{ mt: 1 }}>
                   {setupPermissionGuidance.scopes.map((scope) => (
@@ -1647,13 +1678,14 @@ export default function CommerceIntegrationPanel() {
               </FormControl>
               <TextField
                 required
-                label="Canonical Shopify domain"
+                label="Shopify .myshopify.com domain"
                 value={shopify.shopDomain}
                 onChange={(event) => setShopify((current) => ({
                   ...current,
                   shopDomain: event.target.value,
                 }))}
                 placeholder="store-name.myshopify.com"
+                helperText="A store-owned alias is accepted; ClawPilot verifies and stores Shopify's permanent canonical domain."
                 autoComplete="off"
                 sx={fieldSx}
               />
@@ -2538,7 +2570,10 @@ export default function CommerceIntegrationPanel() {
                             live, read-only discovery and reports whether every
                             required subscription points to this exact URL. One
                             valid signed delivery separately verifies the stored
-                            app secret; neither check writes to Shopify.
+                            app secret; neither check writes to Shopify. Run Test
+                            connection at least every 24 hours until automated
+                            subscription rediscovery is available; readiness
+                            fails closed when that evidence expires.
                           </Typography>
                           <Stack spacing={1} sx={{ mb: 1 }}>
                             {webhookSubscriptionGroups.map((group) => (
@@ -2608,7 +2643,7 @@ export default function CommerceIntegrationPanel() {
                               label="Signed webhook receipt URL"
                               value={account.webhookUrl}
                               InputProps={{ readOnly: true }}
-                              helperText="Order and customer topics are rejected."
+                              helperText="Core order topics use a separate payload-free exact-read lane. Customer-bearing topics remain rejected until their protected-data lifecycle is implemented."
                               sx={fieldSx}
                             />
                             <Button

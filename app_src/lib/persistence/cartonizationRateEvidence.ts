@@ -530,7 +530,7 @@ export function assertCartonizationRateEvidenceOrToolsProfiles(
     for (const profile of packageInput.orToolsProfiles) {
       const allocation = allocationsByLine.get(profile?.lineGlobalId)
       if (
-        !/^gcol(?:[0-9]{7}|[0-9a-v]{12})$/.test(
+        !/^(?:gcol|gcal)(?:[0-9]{7}|[0-9a-v]{12})$/.test(
           profile?.lineGlobalId || '',
         )
         || !/^gp(?:[0-9]{7}|[0-9a-v]{12})$/.test(
@@ -2400,7 +2400,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
                AS input_profile_version_global_id,
              profile_version.row_version::text
                AS input_profile_version_row_version
-           FROM operations_commerce_order_candidate_lines candidate_line
+           FROM operations_commerce_current_planning_lines candidate_line
            JOIN crm_products product
              ON product.pipeline_id = candidate_line.pipeline_id
             AND product.id = candidate_line.product_id
@@ -2431,7 +2431,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
              AND profile_version.height_mm = $10
              AND profile_version.gross_weight_grams = $11
            LIMIT 1
-           FOR SHARE OF candidate_line, product, profile_version`,
+           FOR SHARE OF product, profile_version`,
           [
             input.organizationId,
             exactContext.integration_account_id,

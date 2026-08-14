@@ -1233,7 +1233,7 @@ export function normalizeHybridCartonizationReadRequest(
     (assumption, index) => {
       const lineGlobalId = exactReference(
         assumption?.lineGlobalId,
-        /^gcol(?:[0-9]{7}|[0-9a-v]{12})$/,
+        /^(?:gcol|gcal)(?:[0-9]{7}|[0-9a-v]{12})$/,
         `Committed assumption ${index + 1} line Global ID`,
       )
       if (lineIds.has(lineGlobalId)) {
@@ -1940,7 +1940,7 @@ async function readCurrentFulfillmentPackLineage(
        pack_version.gross_weight_grams
          AS pack_profile_gross_weight_grams,
        pack_version.weight_basis AS pack_profile_weight_basis
-     FROM operations_commerce_order_candidate_lines line
+     FROM operations_commerce_current_planning_lines line
      LEFT JOIN operations_product_mappings product_mapping
        ON product_mapping.organization_id = line.organization_id
       AND product_mapping.integration_account_id =
@@ -2230,7 +2230,7 @@ async function readCandidateLines(
        NULL::text AS checkout_receipt_global_id,
        'candidate_capture'::text AS fulfillment_pack_source,
        NULL::jsonb AS checkout_pack_baseline
-     FROM operations_commerce_order_candidate_lines line
+     FROM operations_commerce_current_planning_lines line
      LEFT JOIN crm_products product
        ON product.pipeline_id = line.pipeline_id
       AND product.id = line.product_id

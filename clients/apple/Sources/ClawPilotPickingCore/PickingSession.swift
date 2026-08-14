@@ -7,9 +7,53 @@ public protocol PickCache: Sendable {
     func saveOutbox(_ command: ConfirmPicksCommand) async throws
     func loadOutbox() async throws -> ConfirmPicksCommand?
     func clearOutbox() async throws
+    func saveHandoffOutbox(_ command: PickHandoffCommand) async throws
+    func loadHandoffOutbox() async throws -> PickHandoffCommand?
+    func clearHandoffOutbox() async throws
+    func loadProgress() async throws -> PickSessionProgress?
+    func saveProgress(_ progress: PickSessionProgress) async throws
+    func clearProgress() async throws
+}
+
+public extension PickCache {
+    func loadProgress() async throws -> PickSessionProgress? { nil }
+    func saveProgress(_ progress: PickSessionProgress) async throws {}
+    func clearProgress() async throws {}
+    func saveHandoffOutbox(_: PickHandoffCommand) async throws {
+        throw PickingContractError.contextMismatch
+    }
+    func loadHandoffOutbox() async throws -> PickHandoffCommand? { nil }
+    func clearHandoffOutbox() async throws {}
+}
+
+public struct PickSessionProgress: Codable, Equatable, Sendable {
+    public let organizationId: String
+    public let workerEmail: String
+    public let order: PickOrder
+    public let scannedTaskIDs: Set<String>
+    public let locationVerifiedTaskIDs: Set<String>
+    public let productStartPendingTaskIDs: Set<String>
+    public let locationObservations: [String: BarcodeObservation]
+    public let productObservations: [String: BarcodeObservation]
+    public let countEvidence: [String: PickTaskCountEvidence]
+    public let stageContextTokens: [String: String]
 }
 
 public actor PickingSession {
+    private static let locationToProductMaximumInterval: TimeInterval = 30 * 60
+    private static let productToCountMaximumInterval: TimeInterval = 30 * 60
+    private static let evidenceMaximumAge: TimeInterval = 24 * 60 * 60
+
+    private struct WorkflowProgressState: Sendable {
+        var scannedTaskIDs: Set<String>
+        var locationVerifiedTaskIDs: Set<String>
+        var locationObservations: [String: BarcodeObservation]
+        var productObservations: [String: BarcodeObservation]
+        var productStartPendingTaskIDs: Set<String>
+        var countEvidence: [String: PickTaskCountEvidence]
+        var stageContextTokens: [String: String]
+    }
+
     private let cache: any PickCache
     private var queue: PickQueue?
     private var orderIndex = 0
@@ -17,23 +61,44 @@ public actor PickingSession {
     private var locationVerifiedTaskIDs: Set<String> = []
     private var locationObservations: [String: BarcodeObservation] = [:]
     private var productObservations: [String: BarcodeObservation] = [:]
+    private var productStartPendingTaskIDs: Set<String> = []
+    private var countEvidence: [String: PickTaskCountEvidence] = [:]
+    private var stageContextTokens: [String: String] = [:]
+    private var workflowPersistenceInFlight = false
 
     public init(cache: any PickCache) {
         self.cache = cache
     }
 
-    public func restore() async throws -> PickQueue? {
+    public func restore(now: Date = Date()) async throws -> PickQueue? {
+        try requireNoWorkflowPersistence()
         let restored = try await cache.loadQueue()
         queue = restored
-        orderIndex = 0
-        scannedTaskIDs = []
-        locationVerifiedTaskIDs = []
-        locationObservations = [:]
-        productObservations = [:]
+        resetProgress()
+        if let restored,
+           let progress = try await cache.loadProgress(),
+           progress.organizationId == restored.organizationId,
+           progress.workerEmail == restored.workerEmail,
+           let restoredIndex = restored.orders.firstIndex(where: {
+               Self.progressAuthorityMatches($0, progress.order)
+           }),
+           progressStateIsValid(progress, now: now) {
+            orderIndex = restoredIndex
+            scannedTaskIDs = progress.scannedTaskIDs
+            locationVerifiedTaskIDs = progress.locationVerifiedTaskIDs
+            productStartPendingTaskIDs = progress.productStartPendingTaskIDs
+            locationObservations = progress.locationObservations
+            productObservations = progress.productObservations
+            countEvidence = progress.countEvidence
+            stageContextTokens = progress.stageContextTokens
+        } else {
+            try await cache.clearProgress()
+        }
         return restored
     }
 
     public func replaceQueue(_ queue: PickQueue) async throws {
+        try requireNoWorkflowPersistence()
         try await cache.saveQueue(queue)
         let previousQueue = self.queue
         let previousOrder = currentOrder()
@@ -48,26 +113,24 @@ public actor PickingSession {
            let previousOrder,
            previousQueue.organizationId == queue.organizationId,
            previousQueue.workerEmail == queue.workerEmail,
-           let refreshedIndex = queue.orders.firstIndex(of: previousOrder) {
+           let refreshedIndex = queue.orders.firstIndex(where: {
+               Self.progressAuthorityMatches($0, previousOrder)
+           }) {
             orderIndex = refreshedIndex
+            try await persistProgress()
             return
         }
 
-        orderIndex = 0
-        scannedTaskIDs = []
-        locationVerifiedTaskIDs = []
-        locationObservations = [:]
-        productObservations = [:]
+        resetProgress()
+        try await cache.clearProgress()
     }
 
     public func clearQueue() async throws {
+        try requireNoWorkflowPersistence()
         queue = nil
-        orderIndex = 0
-        scannedTaskIDs = []
-        locationVerifiedTaskIDs = []
-        locationObservations = [:]
-        productObservations = [:]
+        resetProgress()
         try await cache.clearQueue()
+        try await cache.clearProgress()
     }
 
     public func currentTask() -> PickTask? {
@@ -80,19 +143,83 @@ public actor PickingSession {
         return queue.orders[orderIndex]
     }
 
+    public func queueIdentityMatches(
+        organizationId: String,
+        workerEmail: String
+    ) -> Bool {
+        guard let queue else { return false }
+        return queue.organizationId == organizationId.lowercased()
+            && queue.workerEmail == workerEmail.lowercased()
+    }
+
     public func currentScanStage() -> PickScanStage? {
         guard let task = currentTask() else { return nil }
         if task.locationScanRequired == true,
            !locationVerifiedTaskIDs.contains(task.pickTaskGlobalId) {
             return .location
         }
+        if productStartPendingTaskIDs.contains(task.pickTaskGlobalId)
+            || productObservations[task.pickTaskGlobalId] != nil {
+            return nil
+        }
         return .product
+    }
+
+    public func currentWorkflowStage() -> PickWorkflowStage? {
+        guard let task = currentTask() else { return nil }
+        if task.locationScanRequired == true,
+           !locationVerifiedTaskIDs.contains(task.pickTaskGlobalId) {
+            return .location
+        }
+        if productStartPendingTaskIDs.contains(task.pickTaskGlobalId) {
+            return .productReady
+        }
+        if productObservations[task.pickTaskGlobalId] != nil {
+            return .count
+        }
+        return .product
+    }
+
+    public func currentStageContext() -> PickStageContext? {
+        guard let task = currentTask(),
+              let stage = currentWorkflowStage(),
+              stage == .productReady || stage == .count,
+              let token = stageContextTokens[task.pickTaskGlobalId] else { return nil }
+        return try? PickStageContext(
+            pickTaskGlobalId: task.pickTaskGlobalId,
+            stage: stage,
+            token: token,
+            requiredQuantity: Int(task.quantity)
+        )
+    }
+
+    public func beginProductScan(
+        contextToken: String,
+        now: Date = Date()
+    ) async throws {
+        try requireNoWorkflowPersistence()
+        guard let task = currentTask(),
+              currentWorkflowStage() == .productReady,
+              stageContextTokens[task.pickTaskGlobalId] == contextToken.lowercased() else {
+            throw PickingContractError.contextMismatch
+        }
+        guard let location = locationObservations[task.pickTaskGlobalId],
+              now.timeIntervalSince(location.capturedAt) >= 0,
+              now.timeIntervalSince(location.capturedAt) <= Self.locationToProductMaximumInterval else {
+            try await resetCurrentTaskProgress()
+            throw PickingContractError.staleProgress
+        }
+        var candidate = workflowProgressState()
+        candidate.productStartPendingTaskIDs.remove(task.pickTaskGlobalId)
+        candidate.stageContextTokens.removeValue(forKey: task.pickTaskGlobalId)
+        try await commitWorkflowProgress(candidate)
     }
 
     public func accept(
         _ observation: BarcodeObservation,
         now: Date = Date()
-    ) throws -> PickScanAcceptance {
+    ) async throws -> PickScanAcceptance {
+        try requireNoWorkflowPersistence()
         guard now.timeIntervalSince(observation.capturedAt) <= 30 else {
             throw PickingContractError.staleQueue
         }
@@ -105,29 +232,110 @@ public actor PickingSession {
             guard observation.value == expected else {
                 throw PickingContractError.locationBarcodeMismatch
             }
-            locationVerifiedTaskIDs.insert(task.pickTaskGlobalId)
-            locationObservations[task.pickTaskGlobalId] = observation
+            var candidate = workflowProgressState()
+            candidate.locationVerifiedTaskIDs.insert(task.pickTaskGlobalId)
+            candidate.locationObservations[task.pickTaskGlobalId] = observation
+            candidate.productStartPendingTaskIDs.insert(task.pickTaskGlobalId)
+            candidate.stageContextTokens[task.pickTaskGlobalId] = UUID().uuidString.lowercased()
+            try await commitWorkflowProgress(candidate)
             return PickScanAcceptance(task: task, stage: .location)
         }
+        guard !productStartPendingTaskIDs.contains(task.pickTaskGlobalId),
+              productObservations[task.pickTaskGlobalId] == nil else {
+            throw PickingContractError.contextMismatch
+        }
         guard let expected = task.barcode else { throw PickingContractError.missingBarcode }
+        if task.locationScanRequired == true {
+            guard let location = locationObservations[task.pickTaskGlobalId],
+                  observation.capturedAt.timeIntervalSince(location.capturedAt) >= 0,
+                  observation.capturedAt.timeIntervalSince(location.capturedAt)
+                    <= Self.locationToProductMaximumInterval else {
+                try await resetCurrentTaskProgress()
+                throw PickingContractError.staleProgress
+            }
+        }
         guard BarcodeMatcher.matches(observed: observation.value, expected: expected) else {
             throw PickingContractError.productBarcodeMismatch
         }
-        scannedTaskIDs.insert(task.pickTaskGlobalId)
-        productObservations[task.pickTaskGlobalId] = observation
+        var candidate = workflowProgressState()
+        candidate.productObservations[task.pickTaskGlobalId] = observation
+        if task.quantity > 1 {
+            candidate.stageContextTokens[task.pickTaskGlobalId] = UUID().uuidString.lowercased()
+        } else {
+            candidate.scannedTaskIDs.insert(task.pickTaskGlobalId)
+        }
+        try await commitWorkflowProgress(candidate)
         return PickScanAcceptance(task: task, stage: .product)
     }
 
+    public func verifyCount(
+        enteredCount: Int,
+        source: PickCountSource,
+        contextToken: String,
+        countedAt: Date = Date()
+    ) async throws -> PickTaskCountEvidence {
+        try requireNoWorkflowPersistence()
+        guard let task = currentTask(),
+              currentWorkflowStage() == .count,
+              stageContextTokens[task.pickTaskGlobalId] == contextToken.lowercased(),
+              let product = productObservations[task.pickTaskGlobalId] else {
+            throw PickingContractError.contextMismatch
+        }
+        guard countedAt.timeIntervalSince(product.capturedAt) > 0,
+              countedAt.timeIntervalSince(product.capturedAt)
+                <= Self.productToCountMaximumInterval else {
+            try await resetCurrentTaskProgress()
+            throw PickingContractError.staleProgress
+        }
+        let required = Int(task.quantity)
+        guard enteredCount > 0 else { throw PickingContractError.invalidCount }
+        guard enteredCount == required else {
+            throw PickingContractError.countMismatch(required: required, entered: enteredCount)
+        }
+        let effectiveCountedAt = countedAt > product.capturedAt
+            ? countedAt
+            : product.capturedAt.addingTimeInterval(0.001)
+        let evidence = try PickTaskCountEvidence(
+            task: task,
+            enteredQuantity: enteredCount,
+            product: product,
+            countedAt: effectiveCountedAt,
+            countSource: source
+        )
+        var candidate = workflowProgressState()
+        candidate.countEvidence[task.pickTaskGlobalId] = evidence
+        candidate.scannedTaskIDs.insert(task.pickTaskGlobalId)
+        candidate.stageContextTokens.removeValue(forKey: task.pickTaskGlobalId)
+        try await commitWorkflowProgress(candidate)
+        return evidence
+    }
+
     public func makeWatchSnapshot(
+        authorizedOrganizationId: String,
+        authorizedWorkerEmail: String,
         now: Date = Date(),
         instructionLanguageCode: String = "en",
         readInstructionOnPhone: Bool = false
     ) -> WatchPickSnapshot? {
+        guard queueIdentityMatches(
+            organizationId: authorizedOrganizationId,
+            workerEmail: authorizedWorkerEmail
+        ) else { return nil }
         guard let order = currentOrder() else { return nil }
         let remaining = order.tasks.filter { !scannedTaskIDs.contains($0.pickTaskGlobalId) }
         func card(_ task: PickTask) -> WatchPickCard {
             let locationPending = task.locationScanRequired == true
                 && !locationVerifiedTaskIDs.contains(task.pickTaskGlobalId)
+            let workflowStage: PickWorkflowStage
+            if locationPending {
+                workflowStage = .location
+            } else if productStartPendingTaskIDs.contains(task.pickTaskGlobalId) {
+                workflowStage = .productReady
+            } else if productObservations[task.pickTaskGlobalId] != nil {
+                workflowStage = .count
+            } else {
+                workflowStage = .product
+            }
             return WatchPickCard(
                 productName: task.productName,
                 channelSku: task.channelSku,
@@ -136,7 +344,9 @@ public actor PickingSession {
                 locationBarcode: task.locationBarcode,
                 locationScanRequired: locationPending,
                 quantity: task.quantity,
-                progress: "\(scannedTaskIDs.count + 1) of \(order.tasks.count)"
+                progress: "\(scannedTaskIDs.count + 1) of \(order.tasks.count)",
+                workflowStage: workflowStage,
+                stageContextToken: stageContextTokens[task.pickTaskGlobalId]
             )
         }
         return WatchPickSnapshot(
@@ -150,7 +360,8 @@ public actor PickingSession {
         )
     }
 
-    public func persistConfirmation() async throws -> ConfirmPicksCommand {
+    public func persistConfirmation(now: Date = Date()) async throws -> ConfirmPicksCommand {
+        try requireNoWorkflowPersistence()
         guard let order = currentOrder(),
               scannedTaskIDs.count == order.tasks.count else {
             throw PickingContractError.incompleteOrder
@@ -161,6 +372,32 @@ public actor PickingSession {
                 throw PickingContractError.contextMismatch
             }
             return existing
+        }
+        let observations = order.tasks.compactMap { productObservations[$0.pickTaskGlobalId] }
+            + order.tasks.compactMap { locationObservations[$0.pickTaskGlobalId] }
+        guard observations.allSatisfy({
+            now.timeIntervalSince($0.capturedAt) >= 0
+                && now.timeIntervalSince($0.capturedAt) <= Self.evidenceMaximumAge
+        }), order.tasks.allSatisfy({ task in
+            let id = task.pickTaskGlobalId
+            if task.locationScanRequired == true {
+                guard let location = locationObservations[id],
+                      let product = productObservations[id],
+                      product.capturedAt.timeIntervalSince(location.capturedAt) >= 0,
+                      product.capturedAt.timeIntervalSince(location.capturedAt)
+                        <= Self.locationToProductMaximumInterval else { return false }
+            }
+            if task.quantity > 1 {
+                guard let product = productObservations[id],
+                      let count = countEvidence[id],
+                      count.countedAt.timeIntervalSince(product.capturedAt) > 0,
+                      count.countedAt.timeIntervalSince(product.capturedAt)
+                        <= Self.productToCountMaximumInterval else { return false }
+            }
+            return true
+        }) else {
+            try await resetAllWorkflowProgress()
+            throw PickingContractError.staleProgress
         }
         let scanEvidence: [PickTaskScanEvidence] = try order.tasks.compactMap { task in
             guard task.locationScanRequired == true else { return nil }
@@ -174,23 +411,713 @@ public actor PickingSession {
                 product: product
             )
         }
-        let command = ConfirmPicksCommand(order: order, scanEvidence: scanEvidence)
+        let multiQuantityEvidence: [PickTaskCountEvidence] = try order.tasks.compactMap { task in
+            guard task.quantity > 1 else { return nil }
+            guard let evidence = countEvidence[task.pickTaskGlobalId] else {
+                throw PickingContractError.incompleteOrder
+            }
+            return evidence
+        }
+        let command = ConfirmPicksCommand(
+            order: order,
+            scanEvidence: scanEvidence,
+            countEvidence: multiQuantityEvidence
+        )
         try await cache.saveOutbox(command)
         return command
     }
 
-    public func finishConfirmedOrder() async throws {
+    public func finishConfirmedOrder(_ command: ConfirmPicksCommand) async throws {
+        try requireNoWorkflowPersistence()
+        workflowPersistenceInFlight = true
+        defer { workflowPersistenceInFlight = false }
+        guard let currentQueue = queue,
+              try await cache.loadOutbox() == command else {
+            throw PickingContractError.contextMismatch
+        }
+        let matchingOrders = currentQueue.orders.filter {
+            $0.orderGlobalId == command.orderGlobalId
+        }
+        guard matchingOrders.count <= 1 else {
+            throw PickingContractError.contextMismatch
+        }
+        let exactOrderIsPresent = matchingOrders.first?.rowVersion
+            == command.expectedRowVersion
+        let exactCurrentOrderIndex = currentQueue.orders.firstIndex(where: {
+            $0.orderGlobalId == command.orderGlobalId
+                && $0.rowVersion == command.expectedRowVersion
+        })
+        let durableQueue = try await cache.loadQueue()
+        let durableProgress = try await cache.loadProgress()
+        if let durableProgress {
+            guard durableProgress.order.orderGlobalId == command.orderGlobalId,
+                  durableProgress.order.rowVersion == command.expectedRowVersion else {
+                throw PickingContractError.contextMismatch
+            }
+        }
+        let recoveringInterruptedRetirement = matchingOrders.isEmpty
+            && durableQueue == currentQueue
+            && durableProgress == nil
+        guard (exactOrderIsPresent
+                && exactCurrentOrderIndex == orderIndex)
+                || recoveringInterruptedRetirement else {
+            throw PickingContractError.contextMismatch
+        }
+        let remainingOrders = exactCurrentOrderIndex.map {
+            Array(currentQueue.orders.dropFirst($0 + 1))
+        } ?? currentQueue.orders
+        let replacementQueue = try PickQueue(
+            schemaVersion: currentQueue.schemaVersion,
+            organizationId: currentQueue.organizationId,
+            workerEmail: currentQueue.workerEmail,
+            generatedAt: currentQueue.generatedAt,
+            orders: remainingOrders
+        )
+
+        // The successful exact idempotent server response is the authority.
+        // Retire by order identity, persist the replacement queue, and clear
+        // the exact outbox last. A replay after any interrupted write can only
+        // finish this same command and can never advance a second order.
+        try await cache.clearProgress()
+        try await cache.saveQueue(replacementQueue)
         try await cache.clearOutbox()
-        guard let queue else { return }
-        orderIndex += 1
+        queue = replacementQueue
+        resetProgress()
+    }
+
+    public func pendingConfirmationContext(
+        for command: ConfirmPicksCommand
+    ) async throws -> PendingConfirmationContext {
+        let durableCommand = try await cache.loadOutbox()
+        guard let queue,
+              let durableCommand,
+              durableCommand == command else {
+            throw PickingContractError.contextMismatch
+        }
+        let matchingOrders = queue.orders.filter {
+            $0.orderGlobalId == command.orderGlobalId
+        }
+        guard matchingOrders.count <= 1,
+              matchingOrders.first.map({
+                  $0.rowVersion == command.expectedRowVersion
+              }) != false else {
+            throw PickingContractError.contextMismatch
+        }
+        let durableQueue = try await cache.loadQueue()
+        let durableProgress = try await cache.loadProgress()
+        let interruptedExactRetirement = matchingOrders.isEmpty
+            && durableQueue == queue
+            && durableProgress == nil
+        return PendingConfirmationContext(
+            organizationId: queue.organizationId,
+            workerEmail: queue.workerEmail,
+            orderGlobalId: command.orderGlobalId,
+            expectedRowVersion: command.expectedRowVersion,
+            containsExactOrder: matchingOrders.count == 1,
+            allowsExactReplay: matchingOrders.count == 1
+                || interruptedExactRetirement
+        )
+    }
+
+    public func retireExternallyReconciledConfirmation(
+        _ command: ConfirmPicksCommand,
+        evidence: ExternallyReconciledConfirmationEvidence,
+        replacementQueue: PickQueue
+    ) async throws {
+        try requireNoWorkflowPersistence()
+        guard let currentQueue = queue,
+              let durableCommand = try await cache.loadOutbox(),
+              durableCommand == command,
+              evidence.orderGlobalId == command.orderGlobalId,
+              evidence.expectedRowVersion == command.expectedRowVersion,
+              currentQueue.organizationId == replacementQueue.organizationId,
+              currentQueue.workerEmail == replacementQueue.workerEmail,
+              !replacementQueue.orders.contains(where: {
+                  $0.orderGlobalId == command.orderGlobalId
+              }) else {
+            throw PickingContractError.contextMismatch
+        }
+
+        let currentOrderMatches = currentOrder().map {
+            $0.orderGlobalId == command.orderGlobalId
+                && $0.rowVersion == command.expectedRowVersion
+        } == true
+        let durableProgress = try await cache.loadProgress()
+        let durableQueue = try await cache.loadQueue()
+        let recoveringBeforeReplacementQueue = durableProgress == nil
+            && durableQueue == currentQueue
+            && currentQueue.orders.contains(where: {
+                $0.orderGlobalId == command.orderGlobalId
+                    && $0.rowVersion == command.expectedRowVersion
+            })
+        let recoveringInterruptedRetirement: Bool
+        if let durableQueue,
+           durableProgress == nil,
+           durableQueue == currentQueue,
+           !durableQueue.orders.contains(where: {
+               $0.orderGlobalId == command.orderGlobalId
+           }) {
+            recoveringInterruptedRetirement = true
+        } else {
+            recoveringInterruptedRetirement = false
+        }
+        guard currentOrderMatches
+                || recoveringBeforeReplacementQueue
+                || recoveringInterruptedRetirement else {
+            throw PickingContractError.contextMismatch
+        }
+
+        // Clear progress first, then install the authoritative replacement
+        // queue, and retire the exact outbox last. Failures before the queue
+        // write leave the old order plus its self-contained outbox recoverable.
+        // A crash after the queue write leaves a detectable partial state:
+        // replacement queue, no progress, and the exact outbox. The same
+        // immutable server evidence can safely finish only that retirement on
+        // restart. A missing queue row alone is never authority.
+        try await cache.clearProgress()
+        try await cache.saveQueue(replacementQueue)
+        try await cache.clearOutbox()
+        queue = replacementQueue
+        resetProgress()
+    }
+
+    public func canRequestActivePickHandoff() -> Bool {
+        !workflowPersistenceInFlight
+            && currentOrder() != nil
+            && localPickingProgressIsEmpty()
+    }
+
+    public func persistPickHandoff(
+        reason: String,
+        blockedConfirmation: ConfirmPicksCommand? = nil
+    ) async throws -> PickHandoffCommand {
+        try requireNoWorkflowPersistence()
+        workflowPersistenceInFlight = true
+        defer { workflowPersistenceInFlight = false }
+        guard let queue,
+              let order = currentOrder() else {
+            throw PickingContractError.contextMismatch
+        }
+        if let existing = try await cache.loadHandoffOutbox() {
+            guard existing.organizationId == queue.organizationId,
+                  existing.workerEmail == queue.workerEmail,
+                  existing.orderGlobalId == order.orderGlobalId,
+                  existing.expectedRowVersion == order.rowVersion,
+                  existing.expectedAssignedTaskCount == order.tasks.count,
+                  existing.blockedConfirmationIdempotencyKey
+                    == blockedConfirmation?.idempotencyKey else {
+                throw PickingContractError.contextMismatch
+            }
+            return existing
+        }
+
+        let durableConfirmation = try await cache.loadOutbox()
+        if let blockedConfirmation {
+            guard durableConfirmation == blockedConfirmation,
+                  blockedConfirmation.orderGlobalId == order.orderGlobalId,
+                  blockedConfirmation.expectedRowVersion == order.rowVersion else {
+                throw PickingContractError.contextMismatch
+            }
+        } else {
+            guard durableConfirmation == nil,
+                  localPickingProgressIsEmpty(),
+                  try await cache.loadProgress() == nil else {
+                throw PickingContractError.contextMismatch
+            }
+        }
+
+        let command = try PickHandoffCommand(
+            queue: queue,
+            order: order,
+            reason: reason,
+            blockedConfirmationIdempotencyKey: blockedConfirmation?.idempotencyKey
+        )
+        try await cache.saveHandoffOutbox(command)
+        return command
+    }
+
+    public func pendingPickHandoffContext(
+        for command: PickHandoffCommand
+    ) async throws -> PendingConfirmationContext {
+        guard let queue,
+              try await cache.loadHandoffOutbox() == command,
+              queue.organizationId == command.organizationId,
+              queue.workerEmail == command.workerEmail else {
+            throw PickingContractError.contextMismatch
+        }
+        let matchingOrders = queue.orders.filter {
+            $0.orderGlobalId == command.orderGlobalId
+        }
+        guard matchingOrders.count <= 1 else {
+            throw PickingContractError.contextMismatch
+        }
+        let containsExactOrder = matchingOrders.first.map {
+            $0.rowVersion == command.expectedRowVersion
+                && $0.tasks.count == command.expectedAssignedTaskCount
+        } == true
+        return PendingConfirmationContext(
+            organizationId: command.organizationId,
+            workerEmail: command.workerEmail,
+            orderGlobalId: command.orderGlobalId,
+            expectedRowVersion: command.expectedRowVersion,
+            containsExactOrder: containsExactOrder,
+            allowsExactReplay: containsExactOrder
+        )
+    }
+
+    public func retireHandedOffOrder(
+        _ command: PickHandoffCommand,
+        evidence: PickHandoffEvidence,
+        replacementQueue: PickQueue
+    ) async throws {
+        try requireNoWorkflowPersistence()
+        guard let currentQueue = queue,
+              try await cache.loadHandoffOutbox() == command,
+              evidence.orderGlobalId == command.orderGlobalId,
+              evidence.previousRowVersion == command.expectedRowVersion,
+              currentQueue.organizationId == command.organizationId,
+              currentQueue.workerEmail == command.workerEmail,
+              replacementQueue.organizationId == command.organizationId,
+              replacementQueue.workerEmail == command.workerEmail else {
+            throw PickingContractError.contextMismatch
+        }
+        let replacementMatches = replacementQueue.orders.filter {
+            $0.orderGlobalId == command.orderGlobalId
+        }
+        guard replacementMatches.count <= 1,
+              replacementMatches.first.map({
+                  $0.rowVersion > evidence.rowVersion
+              }) != false else {
+            throw PickingContractError.contextMismatch
+        }
+
+        let durableQueue = try await cache.loadQueue()
+        let durableProgress = try await cache.loadProgress()
+        let exactOrderIsPresent = currentQueue.orders.contains(where: {
+            $0.orderGlobalId == command.orderGlobalId
+                && $0.rowVersion == command.expectedRowVersion
+                && $0.tasks.count == command.expectedAssignedTaskCount
+        })
+        let recoveringInterruptedRetirement = durableProgress == nil
+            && durableQueue == currentQueue
+            && currentQueue.orders.filter({
+                $0.orderGlobalId == command.orderGlobalId
+            }).count <= 1
+            && currentQueue.orders.first(where: {
+                $0.orderGlobalId == command.orderGlobalId
+            }).map({ $0.rowVersion > evidence.rowVersion }) != false
+        guard exactOrderIsPresent || recoveringInterruptedRetirement else {
+            throw PickingContractError.contextMismatch
+        }
+
+        let durableConfirmation = try await cache.loadOutbox()
+        if let blockedKey = command.blockedConfirmationIdempotencyKey {
+            guard durableConfirmation?.idempotencyKey == blockedKey
+                    || (recoveringInterruptedRetirement && durableConfirmation == nil) else {
+                throw PickingContractError.contextMismatch
+            }
+        } else {
+            guard durableConfirmation == nil,
+                  recoveringInterruptedRetirement || localPickingProgressIsEmpty() else {
+                throw PickingContractError.contextMismatch
+            }
+        }
+
+        // The handoff receipt is the authority; queue omission alone is never
+        // sufficient. Install the exact replacement queue before clearing either
+        // outbox. The handoff outbox is last so a crash can replay the same POST
+        // and complete any interrupted local retirement without a new command.
+        try await cache.clearProgress()
+        try await cache.saveQueue(replacementQueue)
+        if durableConfirmation != nil {
+            try await cache.clearOutbox()
+        }
+        try await cache.clearHandoffOutbox()
+        queue = replacementQueue
+        resetProgress()
+    }
+
+    public func retireRejectedActivePickHandoff(
+        _ command: PickHandoffCommand,
+        replacementQueue: PickQueue
+    ) async throws {
+        try requireNoWorkflowPersistence()
+        guard command.blockedConfirmationIdempotencyKey == nil,
+              try await cache.loadHandoffOutbox() == command,
+              try await cache.loadOutbox() == nil,
+              let currentQueue = queue,
+              currentQueue.organizationId == command.organizationId,
+              currentQueue.workerEmail == command.workerEmail,
+              replacementQueue.organizationId == command.organizationId,
+              replacementQueue.workerEmail == command.workerEmail,
+              localPickingProgressIsEmpty(),
+              try await cache.loadProgress() == nil else {
+            throw PickingContractError.contextMismatch
+        }
+
+        // A structured server rejection proves this command did not commit.
+        // Refresh the signed worker's authoritative queue, then retire only
+        // this active-handoff outbox last. No confirmation record is touched.
+        try await cache.saveQueue(replacementQueue)
+        try await cache.clearHandoffOutbox()
+        queue = replacementQueue
+        resetProgress()
+    }
+
+    public func retireBlockedHandoffAfterExternalReconciliation(
+        _ handoff: PickHandoffCommand,
+        confirmation: ConfirmPicksCommand?,
+        evidence: ExternallyReconciledConfirmationEvidence,
+        replacementQueue: PickQueue
+    ) async throws {
+        try requireNoWorkflowPersistence()
+        guard let blockedConfirmationKey = handoff.blockedConfirmationIdempotencyKey,
+              confirmation.map({
+                  $0.idempotencyKey == blockedConfirmationKey
+                    && $0.orderGlobalId == handoff.orderGlobalId
+                    && $0.expectedRowVersion == handoff.expectedRowVersion
+              }) != false,
+              try await cache.loadHandoffOutbox() == handoff,
+              evidence.orderGlobalId == handoff.orderGlobalId,
+              evidence.expectedRowVersion == handoff.expectedRowVersion,
+              let currentQueue = queue,
+              currentQueue.organizationId == handoff.organizationId,
+              currentQueue.workerEmail == handoff.workerEmail,
+              replacementQueue.organizationId == handoff.organizationId,
+              replacementQueue.workerEmail == handoff.workerEmail else {
+            throw PickingContractError.contextMismatch
+        }
+        let replacementMatches = replacementQueue.orders.filter {
+            $0.orderGlobalId == handoff.orderGlobalId
+        }
+        // A reconciliation receipt says the blocked order was externally
+        // completed/cancelled. The independently fetched queue must therefore
+        // exclude that exact order; accepting a stale mixed-snapshot queue
+        // would reinstall work that the receipt proves is no longer pickable.
+        guard replacementMatches.isEmpty else {
+            throw PickingContractError.contextMismatch
+        }
+
+        let durableQueue = try await cache.loadQueue()
+        let durableProgress = try await cache.loadProgress()
+        let durableConfirmation = try await cache.loadOutbox()
+        let exactOrderIsPresent = currentQueue.orders.contains(where: {
+            $0.orderGlobalId == handoff.orderGlobalId
+                && $0.rowVersion == handoff.expectedRowVersion
+                && $0.tasks.count == handoff.expectedAssignedTaskCount
+        })
+        let recoveringInterruptedRetirement = durableProgress == nil
+            && durableQueue == currentQueue
+            && !currentQueue.orders.contains(where: {
+                $0.orderGlobalId == handoff.orderGlobalId
+            })
+        guard exactOrderIsPresent || recoveringInterruptedRetirement else {
+            throw PickingContractError.contextMismatch
+        }
+        if let durableConfirmation {
+            guard durableConfirmation.idempotencyKey == blockedConfirmationKey,
+                  durableConfirmation.orderGlobalId == handoff.orderGlobalId,
+                  durableConfirmation.expectedRowVersion == handoff.expectedRowVersion,
+                  confirmation == durableConfirmation else {
+                throw PickingContractError.contextMismatch
+            }
+        } else {
+            guard recoveringInterruptedRetirement, confirmation == nil else {
+                throw PickingContractError.contextMismatch
+            }
+        }
+
+        // The external reconciliation proof, not queue omission, is authority.
+        // Keep the handoff outbox until the queue and matching confirmation have
+        // both retired so a crash always resumes this higher-priority command.
+        try await cache.clearProgress()
+        try await cache.saveQueue(replacementQueue)
+        if durableConfirmation != nil {
+            try await cache.clearOutbox()
+        }
+        try await cache.clearHandoffOutbox()
+        queue = replacementQueue
+        resetProgress()
+    }
+
+    public func retireRejectedBlockedPickHandoff(
+        _ handoff: PickHandoffCommand,
+        confirmation: ConfirmPicksCommand
+    ) async throws {
+        try requireNoWorkflowPersistence()
+        guard handoff.blockedConfirmationIdempotencyKey == confirmation.idempotencyKey,
+              handoff.orderGlobalId == confirmation.orderGlobalId,
+              handoff.expectedRowVersion == confirmation.expectedRowVersion,
+              try await cache.loadHandoffOutbox() == handoff,
+              try await cache.loadOutbox() == confirmation,
+              let currentQueue = queue,
+              currentQueue.organizationId == handoff.organizationId,
+              currentQueue.workerEmail == handoff.workerEmail,
+              currentQueue.orders.contains(where: {
+                  $0.orderGlobalId == handoff.orderGlobalId
+                    && $0.rowVersion == handoff.expectedRowVersion
+              }) else {
+            throw PickingContractError.contextMismatch
+        }
+        // A deterministic handoff rejection did not mutate server state. Retire
+        // only the exact handoff request; the original terminal confirmation is
+        // still authoritative and remains protected for manager reconciliation.
+        try await cache.clearHandoffOutbox()
+    }
+
+    private func resetProgress() {
+        orderIndex = 0
         scannedTaskIDs = []
         locationVerifiedTaskIDs = []
         locationObservations = [:]
         productObservations = [:]
-        if orderIndex >= queue.orders.count {
-            self.queue = nil
-            orderIndex = 0
+        productStartPendingTaskIDs = []
+        countEvidence = [:]
+        stageContextTokens = [:]
+    }
+
+    private func localPickingProgressIsEmpty() -> Bool {
+        scannedTaskIDs.isEmpty
+            && locationVerifiedTaskIDs.isEmpty
+            && locationObservations.isEmpty
+            && productObservations.isEmpty
+            && productStartPendingTaskIDs.isEmpty
+            && countEvidence.isEmpty
+            && stageContextTokens.isEmpty
+    }
+
+    private func progressStateIsValid(
+        _ progress: PickSessionProgress,
+        now: Date
+    ) -> Bool {
+        let tasks = progress.order.tasks
+        let taskIDs = Set(tasks.map(\.pickTaskGlobalId))
+        let allStateIDs = progress.scannedTaskIDs
+            .union(progress.locationVerifiedTaskIDs)
+            .union(progress.productStartPendingTaskIDs)
+            .union(progress.locationObservations.keys)
+            .union(progress.productObservations.keys)
+            .union(progress.countEvidence.keys)
+            .union(progress.stageContextTokens.keys)
+        guard allStateIDs.isSubset(of: taskIDs) else { return false }
+
+        let scannedPrefix = Array(tasks.prefix { task in
+            progress.scannedTaskIDs.contains(task.pickTaskGlobalId)
+        })
+        guard Set(scannedPrefix.map(\.pickTaskGlobalId)) == progress.scannedTaskIDs else {
+            return false
         }
+
+        for task in tasks {
+            let id = task.pickTaskGlobalId
+            let scanned = progress.scannedTaskIDs.contains(id)
+            let locationVerified = progress.locationVerifiedTaskIDs.contains(id)
+            let productReady = progress.productStartPendingTaskIDs.contains(id)
+            let location = progress.locationObservations[id]
+            let product = progress.productObservations[id]
+            let count = progress.countEvidence[id]
+            let token = progress.stageContextTokens[id]
+
+            if task.locationScanRequired == true {
+                guard locationVerified == (location != nil) else { return false }
+                if let location {
+                    guard location.value == task.locationBarcode else { return false }
+                }
+                if scanned || productReady || product != nil {
+                    guard locationVerified else { return false }
+                }
+            } else if locationVerified || location != nil || productReady {
+                return false
+            }
+
+            if let product {
+                guard let barcode = task.barcode,
+                      BarcodeMatcher.matches(observed: product.value, expected: barcode) else {
+                    return false
+                }
+            }
+
+            if productReady, let location {
+                guard now.timeIntervalSince(location.capturedAt) >= 0,
+                      now.timeIntervalSince(location.capturedAt)
+                        <= Self.locationToProductMaximumInterval else { return false }
+            }
+            if !scanned, product != nil {
+                guard let product,
+                      now.timeIntervalSince(product.capturedAt) >= 0,
+                      now.timeIntervalSince(product.capturedAt)
+                        <= Self.productToCountMaximumInterval else { return false }
+            }
+            if scanned {
+                if let location {
+                    guard now.timeIntervalSince(location.capturedAt) >= 0,
+                          now.timeIntervalSince(location.capturedAt) <= Self.evidenceMaximumAge else {
+                        return false
+                    }
+                }
+                if let product {
+                    guard now.timeIntervalSince(product.capturedAt) >= 0,
+                          now.timeIntervalSince(product.capturedAt) <= Self.evidenceMaximumAge else {
+                        return false
+                    }
+                }
+            }
+
+            if scanned {
+                guard product != nil, !productReady, token == nil else { return false }
+                if let location, let product {
+                    guard product.capturedAt.timeIntervalSince(location.capturedAt) >= 0,
+                          product.capturedAt.timeIntervalSince(location.capturedAt)
+                            <= Self.locationToProductMaximumInterval else { return false }
+                }
+                if task.quantity > 1 {
+                    guard let count, let product,
+                          count.pickTaskGlobalId == id,
+                          count.requiredQuantity == Int(task.quantity),
+                          count.enteredQuantity == Int(task.quantity),
+                          count.product == PickScanObservationEvidence(product),
+                          count.countedAt > product.capturedAt,
+                          count.countedAt.timeIntervalSince(product.capturedAt)
+                            <= Self.productToCountMaximumInterval else { return false }
+                } else if count != nil {
+                    return false
+                }
+                continue
+            }
+
+            guard count == nil else { return false }
+            if productReady {
+                guard product == nil,
+                      token.flatMap(UUID.init(uuidString:)) != nil else { return false }
+            } else if product != nil {
+                guard task.quantity > 1,
+                      token.flatMap(UUID.init(uuidString:)) != nil else { return false }
+            } else if token != nil {
+                return false
+            }
+        }
+
+        let currentIndex = scannedPrefix.count
+        for task in tasks.dropFirst(currentIndex + 1) {
+            let id = task.pickTaskGlobalId
+            guard !allStateIDs.contains(id) else { return false }
+        }
+        return true
+    }
+
+    private func workflowProgressState() -> WorkflowProgressState {
+        WorkflowProgressState(
+            scannedTaskIDs: scannedTaskIDs,
+            locationVerifiedTaskIDs: locationVerifiedTaskIDs,
+            locationObservations: locationObservations,
+            productObservations: productObservations,
+            productStartPendingTaskIDs: productStartPendingTaskIDs,
+            countEvidence: countEvidence,
+            stageContextTokens: stageContextTokens
+        )
+    }
+
+    /// Warehouse code is display-only metadata introduced after the durable
+    /// scan contract. Its first appearance on refresh must not erase otherwise
+    /// exact location, product, or count progress from an older cached queue.
+    private static func progressAuthorityMatches(
+        _ left: PickOrder,
+        _ right: PickOrder
+    ) -> Bool {
+        guard left.orderGlobalId == right.orderGlobalId,
+              left.orderNumber == right.orderNumber,
+              left.rowVersion == right.rowVersion,
+              left.tasks.count == right.tasks.count else { return false }
+        return zip(left.tasks, right.tasks).allSatisfy { leftTask, rightTask in
+            leftTask.pickTaskGlobalId == rightTask.pickTaskGlobalId
+                && leftTask.sequence == rightTask.sequence
+                && leftTask.productGlobalId == rightTask.productGlobalId
+                && leftTask.productName == rightTask.productName
+                && leftTask.channelSku == rightTask.channelSku
+                && leftTask.productImageURL == rightTask.productImageURL
+                && leftTask.barcode == rightTask.barcode
+                && leftTask.locationCode == rightTask.locationCode
+                && leftTask.warehouseGlobalId == rightTask.warehouseGlobalId
+                && leftTask.locationGlobalId == rightTask.locationGlobalId
+                && leftTask.locationBarcode == rightTask.locationBarcode
+                && leftTask.locationScanRequired == rightTask.locationScanRequired
+                && leftTask.locationScanPolicyRowVersion
+                    == rightTask.locationScanPolicyRowVersion
+                && leftTask.quantity == rightTask.quantity
+        }
+    }
+
+    private func applyWorkflowProgress(_ state: WorkflowProgressState) {
+        scannedTaskIDs = state.scannedTaskIDs
+        locationVerifiedTaskIDs = state.locationVerifiedTaskIDs
+        locationObservations = state.locationObservations
+        productObservations = state.productObservations
+        productStartPendingTaskIDs = state.productStartPendingTaskIDs
+        countEvidence = state.countEvidence
+        stageContextTokens = state.stageContextTokens
+    }
+
+    private func commitWorkflowProgress(_ candidate: WorkflowProgressState) async throws {
+        // Keep observable actor state on the last durable snapshot until the
+        // candidate has been written. A failed cache write therefore cannot
+        // advance the phone/Watch projection or consume a stage token.
+        try requireNoWorkflowPersistence()
+        workflowPersistenceInFlight = true
+        defer { workflowPersistenceInFlight = false }
+        try await persistProgress(candidate)
+        applyWorkflowProgress(candidate)
+    }
+
+    private func requireNoWorkflowPersistence() throws {
+        guard !workflowPersistenceInFlight else {
+            throw PickingContractError.persistenceInFlight
+        }
+    }
+
+    private func resetCurrentTaskProgress() async throws {
+        guard let task = currentTask() else { return }
+        var candidate = workflowProgressState()
+        let id = task.pickTaskGlobalId
+        candidate.scannedTaskIDs.remove(id)
+        candidate.locationVerifiedTaskIDs.remove(id)
+        candidate.locationObservations.removeValue(forKey: id)
+        candidate.productObservations.removeValue(forKey: id)
+        candidate.productStartPendingTaskIDs.remove(id)
+        candidate.countEvidence.removeValue(forKey: id)
+        candidate.stageContextTokens.removeValue(forKey: id)
+        try await commitWorkflowProgress(candidate)
+    }
+
+    private func resetAllWorkflowProgress() async throws {
+        var candidate = workflowProgressState()
+        candidate.scannedTaskIDs = []
+        candidate.locationVerifiedTaskIDs = []
+        candidate.locationObservations = [:]
+        candidate.productObservations = [:]
+        candidate.productStartPendingTaskIDs = []
+        candidate.countEvidence = [:]
+        candidate.stageContextTokens = [:]
+        try await commitWorkflowProgress(candidate)
+    }
+
+    private func persistProgress(_ state: WorkflowProgressState? = nil) async throws {
+        guard let queue, let order = currentOrder() else {
+            try await cache.clearProgress()
+            return
+        }
+        let state = state ?? workflowProgressState()
+        try await cache.saveProgress(PickSessionProgress(
+            organizationId: queue.organizationId,
+            workerEmail: queue.workerEmail,
+            order: order,
+            scannedTaskIDs: state.scannedTaskIDs,
+            locationVerifiedTaskIDs: state.locationVerifiedTaskIDs,
+            productStartPendingTaskIDs: state.productStartPendingTaskIDs,
+            locationObservations: state.locationObservations,
+            productObservations: state.productObservations,
+            countEvidence: state.countEvidence,
+            stageContextTokens: state.stageContextTokens
+        ))
     }
 }
 

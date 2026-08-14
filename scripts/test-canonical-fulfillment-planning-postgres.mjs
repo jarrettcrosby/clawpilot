@@ -2813,6 +2813,9 @@ async function verifyCanonicalPlanning(databaseUrl) {
     )
     const stableId = loadTypeScriptModule('app_src/lib/crm/stableId.ts')
     const domain = loadTypeScriptModule('app_src/lib/operations/domain.ts')
+    const pickManagement = loadTypeScriptModule(
+      'app_src/lib/operations/pickManagement.ts',
+    )
     const adapters = loadTypeScriptModule(
       'app_src/lib/operations/adapters.ts',
       { mocks: { '@/lib/operations/domain': domain } },
@@ -3136,10 +3139,15 @@ async function verifyCanonicalPlanning(databaseUrl) {
           '@/lib/operations/canonicalFulfillmentPlanning':
             canonicalPlanning,
           '@/lib/operations/domain': domain,
+          '@/lib/operations/pickManagement': pickManagement,
           '@/lib/operations/packingSlip': packingSlip,
           '@/lib/operations/barcodeLabels': barcodeLabels,
           '@/lib/persistence/cartonizationRateEvidence':
             cartonizationRateEvidence,
+          '@/lib/persistence/commerceOrderRevisions': {
+            async assertCommerceOrderRevisionExecutionCurrent() {},
+            CommerceOrderRevisionGateError: class extends Error {},
+          },
           '@/lib/persistence/crm': {
             stageCrmRecordWithClient: async () => {
               throw new Error(

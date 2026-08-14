@@ -323,6 +323,7 @@ const SHOPIFY_ORDER_LINES_QUERY =
   `query ClawPilotCommerceOrderLines($id: ID!, $after: String) {
     order(id: $id) {
       id
+      updatedAt
       lineItems(first: ${SHOPIFY_ORDER_LINE_PAGE_SIZE}, after: $after) {
         nodes {
           ${SHOPIFY_LINE_ITEM_FIELDS}
@@ -1012,6 +1013,17 @@ async function completeShopifyOrderLines(input: {
   try {
     const initial = input.order.lineItems
     const nodes = [...providerNodes(initial, 'Shopify order lines')]
+    const initialRevision = typeof input.order.updatedAt === 'string'
+      ? input.order.updatedAt.trim()
+      : ''
+    const lineIds = new Set<string>()
+    for (const node of nodes) {
+      const lineId = typeof node.id === 'string' ? node.id.trim() : ''
+      if (!lineId || lineIds.has(lineId)) {
+        return rejected('COMMERCE_ORDER_RECORD_INVALID')
+      }
+      lineIds.add(lineId)
+    }
     if (nodes.length > input.budget.remainingLines) {
       return rejected('COMMERCE_ORDER_LINE_PAGINATION_LIMIT')
     }
@@ -1040,13 +1052,24 @@ async function completeShopifyOrderLines(input: {
         { timeoutMs: SHOPIFY_GRAPHQL_TIMEOUT_MS },
       )
       const order = providerRecord(data.order, 'Shopify order')
-      if (order.id !== identity) {
+      if (
+        order.id !== identity
+        || !initialRevision
+        || order.updatedAt !== initialRevision
+      ) {
         return rejected('COMMERCE_ORDER_RECORD_INVALID')
       }
       const connection = order.lineItems
       const pageNodes = providerNodes(connection, 'Shopify order lines')
       if (nodes.length + pageNodes.length > input.budget.remainingLines) {
         return rejected('COMMERCE_ORDER_LINE_PAGINATION_LIMIT')
+      }
+      for (const node of pageNodes) {
+        const lineId = typeof node.id === 'string' ? node.id.trim() : ''
+        if (!lineId || lineIds.has(lineId)) {
+          return rejected('COMMERCE_ORDER_RECORD_INVALID')
+        }
+        lineIds.add(lineId)
       }
       nodes.push(...pageNodes)
       pages += 1
@@ -1338,7 +1361,7 @@ async function shopifyEnvelope(
   runtime: CommerceRuntimeCredentialRecord,
   page: OperationalPageRequest,
   targetExternalOrderId: string | null = null,
-): Promise<OperationalPageResult> {
+): Promise<OperationalPageResult & { providerReads: number }> {
   const testOrderSearchConstraint = shopifyTestOrderSearchConstraint(runtime)
   const testOrdersAllowed = testOrderSearchConstraint === ''
   const credential = decryptCommerceCredential(
@@ -1447,6 +1470,7 @@ async function shopifyEnvelope(
       ? SHOPIFY_ORDER_LINE_PAGE_SIZE * SHOPIFY_MAX_ORDER_LINE_PAGES
       : SHOPIFY_MAX_BATCH_ORDER_LINES,
   }
+  const initialNestedRequestBudget = lineBudget.remainingRequests
   for (const order of orderNodes) {
     const result = await completeShopifyOrderLines({
       credential: providerCredential,
@@ -1468,6 +1492,8 @@ async function shopifyEnvelope(
   })
   return {
     envelope: normalized,
+    providerReads:
+      2 + initialNestedRequestBudget - lineBudget.remainingRequests,
     page: {
       mode: 'operational',
       resource: 'orders',
@@ -3864,6 +3890,65 @@ export async function executeCommerceOrderPage(input: {
     providerAttemptActorEmail: null,
     runtimeAuthority: 'read_reconciliation',
   })
+}
+
+/**
+ * Worker-only exact Shopify order read for an already-promoted canonical
+ * order. Unlike the open-order poll, this reads the exact provider ID so
+ * cancellations, closures, fulfillment, and edits remain observable.
+ * It retains no provider payload and performs no provider write.
+ */
+export async function readCommerceShopifyOrderRevisionEnvelope(input: {
+  organizationId: string
+  accountGlobalId: string
+  integrationAccountId: string
+  externalAccountId: string
+  externalOrderId: string
+  expectedCredentialVersion: number
+}) {
+  const runtime = await runtimeFor(input, { reconciliationRead: true })
+  if (
+    runtime.provider !== 'shopify'
+    || runtime.integrationAccountId !== input.integrationAccountId
+    || runtime.externalAccountId !== input.externalAccountId
+    || runtime.credentialVersion !== input.expectedCredentialVersion
+  ) {
+    throw new CommerceIntegrationRequestError(
+      'Shopify order revision authority changed before the exact read',
+      409,
+      'SHOPIFY_ORDER_REVISION_AUTHORITY_STALE',
+    )
+  }
+  const observedAt = new Date().toISOString()
+  const result = await shopifyEnvelope(runtime, {
+    mode: 'operational',
+    resource: 'orders',
+    sessionId: `revision:${input.externalOrderId}`,
+    batchNumber: 0,
+    previousRunGlobalId: null,
+    windowStart: null,
+    windowEnd: observedAt,
+    queryHash: createHash('sha256')
+      .update(`revision:${input.externalOrderId}`)
+      .digest('hex'),
+    orderCursor: null,
+    cursorHash: null,
+  }, input.externalOrderId)
+  if (result.envelope.rejections.length || result.envelope.orders.length !== 1) {
+    throw new CommerceIntegrationRequestError(
+      'Shopify exact order revision could not be normalized completely',
+      409,
+      'SHOPIFY_ORDER_REVISION_NORMALIZATION_REJECTED',
+    )
+  }
+  return {
+    envelope: result.envelope,
+    observedAt,
+    // Probe + exact order, plus the actual bounded nested line reads. Counting
+    // requests rather than normalized rows also covers underfilled pages.
+    providerReads: result.providerReads as 2 | 3,
+    providerWrites: 0 as const,
+  }
 }
 
 /**

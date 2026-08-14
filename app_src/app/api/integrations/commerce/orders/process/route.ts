@@ -13,11 +13,21 @@ import {
   shopifyAutomaticOrderPromotionHealthSnapshot,
 } from '@/lib/integrations/commerceShopifyAutomaticPromotion'
 import { processCommerceOrderReconciliation } from '@/lib/commerceOrderReconciliationWorker'
+import { processCommerceOrderHistory } from '@/lib/commerceOrderHistoryWorker'
+import {
+  processShopifyOrderWebhookSignals,
+} from '@/lib/shopifyOrderWebhookWorker'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   readCommerceOrderReconciliationHealthFromPostgres,
   recordCommerceOrderReconciliationWorkerHeartbeatInPostgres,
 } from '@/lib/persistence/commerceOrderReconciliation'
+import {
+  purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres,
+} from '@/lib/persistence/commerceOrderRevisions'
+import {
+  redactExpiredCommerceOrderSensitiveEvidenceInPostgres,
+} from '@/lib/persistence/commerceOrderSync'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
@@ -30,6 +40,60 @@ function authorized(req: NextRequest) {
   const left = Buffer.from(expected)
   const right = Buffer.from(provided)
   return left.length === right.length && crypto.timingSafeEqual(left, right)
+}
+
+function safeCommerceOrderHistoryFailureCode(error: unknown) {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? String(error.code || '')
+    : ''
+  return /^COMMERCE_ORDER_[A-Z0-9_]{1,96}$/u.test(code)
+    ? code
+    : 'COMMERCE_ORDER_HISTORY_WORKER_FAILED'
+}
+
+async function processCommerceOrderHistoryIsolated(input: {
+  workerId: string
+  limit?: number
+}) {
+  try {
+    return await processCommerceOrderHistory(input)
+  } catch (error) {
+    return {
+      degraded: true as const,
+      errorCode: safeCommerceOrderHistoryFailureCode(error),
+      providerReadOnly: true as const,
+      operationsOrderWrites: 0 as const,
+      providerWrites: 0 as const,
+    }
+  }
+}
+
+function safeShopifyOrderWebhookFailureCode(error: unknown) {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? String(error.code || '')
+    : ''
+  return /^SHOPIFY_ORDER_WEBHOOK_[A-Z0-9_]{1,96}$/u.test(code)
+    ? code
+    : 'SHOPIFY_ORDER_WEBHOOK_WORKER_FAILED'
+}
+
+async function processShopifyOrderWebhookSignalsIsolated(input: {
+  workerId: string
+  limit?: number
+}) {
+  try {
+    return await processShopifyOrderWebhookSignals(input)
+  } catch (error) {
+    return {
+      degraded: true as const,
+      errorCode: safeShopifyOrderWebhookFailureCode(error),
+      eventDrivenDrainCadenceSeconds: 60 as const,
+      scheduledPollBackstopMinutes: 30 as const,
+      providerReadOnly: true as const,
+      operationsOrderWrites: 0 as const,
+      providerWrites: 0 as const,
+    }
+  }
 }
 
 async function durableAutomaticAttentionHealth() {
@@ -137,10 +201,19 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
   }
   if (!commerceReadRuntimeAvailable()) {
+    const [protectedSnapshotPurge, orderSensitiveEvidenceRedaction] =
+      isPostgresStorageEnabled()
+        ? await Promise.all([
+            purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres(),
+            redactExpiredCommerceOrderSensitiveEvidenceInPostgres(),
+          ])
+        : [null, null]
     return NextResponse.json({
       ok: true,
       skipped: true,
       reason: 'commerce-read-reconciliation-disabled',
+      protectedSnapshotPurge,
+      orderSensitiveEvidenceRedaction,
       automaticShopifyOrderPromotion:
         shopifyAutomaticOrderPromotionHealthSnapshot(),
       automaticFaireOrderPromotion:
@@ -175,7 +248,18 @@ export async function POST(req: NextRequest) {
     ...startedAttentionHealth,
   })
   try {
-    const result = await processCommerceOrderReconciliation({ limit: body.limit })
+    const [result, orderHistory] = await Promise.all([
+      processCommerceOrderReconciliation({ limit: body.limit }),
+      processCommerceOrderHistoryIsolated({ workerId, limit: body.limit }),
+    ])
+    // History may advance the shared order-observation policy revision. Drain
+    // exact Shopify targets only after that transition so claim/append lineage
+    // cannot be invalidated mid-read by this same process invocation.
+    const shopifyOrderWebhooks =
+      await processShopifyOrderWebhookSignalsIsolated({
+        workerId,
+        limit: body.limit,
+      })
     const completedAttentionHealth = mergeDurableAutomaticAttentionHealth(
       result,
       await durableAutomaticAttentionHealth(),
@@ -183,6 +267,8 @@ export async function POST(req: NextRequest) {
     const completedResult = {
       ...result,
       ...completedAttentionHealth,
+      orderHistory,
+      shopifyOrderWebhooks,
     }
     const heartbeat =
       await recordCommerceOrderReconciliationWorkerHeartbeatInPostgres({

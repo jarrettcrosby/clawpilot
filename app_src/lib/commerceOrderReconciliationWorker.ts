@@ -1,5 +1,11 @@
 import { createHash } from 'node:crypto'
 import {
+  processFaireOrderRevisions,
+} from '@/lib/commerceFaireOrderRevisionWorker'
+import {
+  processShopifyOrderRevisions,
+} from '@/lib/commerceShopifyOrderRevisionWorker'
+import {
   commerceReadRuntimeAvailable,
   commerceReadRuntimeMode,
   executeCommerceFaireOrderExactRefresh,
@@ -23,6 +29,11 @@ import {
   failCommerceOrderReconciliationInPostgres,
   projectCommerceOrderReconciliationPageInPostgres,
 } from '@/lib/persistence/commerceOrderReconciliation'
+import {
+  purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres,
+} from '@/lib/persistence/commerceOrderRevisions'
+
+const PROTECTED_SNAPSHOT_PURGE_LIMIT_PER_CYCLE = 250
 
 function deterministicRunUuid(input: {
   organizationId: string
@@ -187,6 +198,7 @@ const MAX_PROVIDER_RECORDS_PER_RECONCILIATION = 250
 const MAX_RECONCILIATION_RUNTIME_MS = 180_000
 const MIN_REMAINING_RUNTIME_FOR_PAGE_MS = 30_000
 const MIN_REMAINING_RUNTIME_FOR_EXACT_REFRESH_MS = 30_000
+const MAX_PROVIDER_REVISION_TARGETS_PER_RECONCILIATION = 2
 const PROVIDER_PAGE_RECORD_LIMIT = {
   shopify: 25,
   faire: 50,
@@ -279,6 +291,10 @@ export async function processCommerceOrderReconciliation(input: {
   /** Deterministic test seam; API callers never supply this. */
   clock?: () => number
 }) {
+  const protectedSnapshotPurge =
+    await purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres({
+      limit: PROTECTED_SNAPSHOT_PURGE_LIMIT_PER_CYCLE,
+    })
   if (!commerceReadRuntimeAvailable()) {
     return {
       skipped: true,
@@ -292,6 +308,7 @@ export async function processCommerceOrderReconciliation(input: {
       providerWrites: 0,
       canonicalOrderWrites: 0,
       inventoryWrites: 0,
+      protectedSnapshotPurge,
       automaticShopifyOrderPromotion:
         shopifyAutomaticOrderPromotionHealthSnapshot(),
       automaticFaireOrderPromotion:
@@ -310,6 +327,34 @@ export async function processCommerceOrderReconciliation(input: {
         operatorReviewRequired: 0,
         providerWrites: 0,
         syncCursorAdvanced: false,
+      },
+      canonicalOrderRevisions: {
+        shopify: {
+          provider: 'shopify' as const,
+          claimed: 0,
+          captured: 0,
+          changed: 0,
+          failed: 0,
+          failureCodes: {},
+          providerWrites: 0 as const,
+          canonicalOrderWrites: 0 as const,
+          managerDispositionRequired: 0,
+        },
+        faire: {
+          provider: 'faire' as const,
+          claimed: 0,
+          captured: 0,
+          changed: 0,
+          failed: 0,
+          failureCodes: {},
+          providerReadsPerCapture: 2 as const,
+          providerWrites: 0 as const,
+          canonicalOrderWrites: 0 as const,
+          managerDispositionRequired: 0,
+        },
+        providerWrites: 0 as const,
+        canonicalOrderWrites: 0 as const,
+        managerDispositionRequired: 0,
       },
       failureCodes: {},
     }
@@ -1007,6 +1052,14 @@ export async function processCommerceOrderReconciliation(input: {
       }
     }
   }
+  const revisionLimit = Math.max(1, Math.min(
+    Number(input.limit || 1),
+    MAX_PROVIDER_REVISION_TARGETS_PER_RECONCILIATION,
+  ))
+  const [shopifyOrderRevisions, faireOrderRevisions] = await Promise.all([
+    processShopifyOrderRevisions({ limit: revisionLimit }),
+    processFaireOrderRevisions({ limit: revisionLimit }),
+  ])
   return {
     skipped: false,
     claimed: targets.length,
@@ -1036,6 +1089,7 @@ export async function processCommerceOrderReconciliation(input: {
     providerWrites: 0,
     canonicalOrderWrites: shopifyOrdersPromoted + faireOrdersPromoted,
     inventoryWrites: 0,
+    protectedSnapshotPurge,
     automaticCustomerResolution: {
       matched: customersMatched,
       created: customersCreated,
@@ -1112,6 +1166,15 @@ export async function processCommerceOrderReconciliation(input: {
         operatorReviewRequired:
           faireUnattributedAttentionRequiredAccounts,
       }),
+    canonicalOrderRevisions: {
+      shopify: shopifyOrderRevisions,
+      faire: faireOrderRevisions,
+      providerWrites: 0 as const,
+      canonicalOrderWrites: 0 as const,
+      managerDispositionRequired:
+        shopifyOrderRevisions.managerDispositionRequired
+        + faireOrderRevisions.managerDispositionRequired,
+    },
     failureCodes,
   }
 }

@@ -179,6 +179,7 @@ export type CarrierSandboxRateEvidenceInput = {
   actorEmail: string
   requestedAt: string
   completedAt: string
+  carrierSelectionKey?: string | null
 }
 
 function iso(value: TimestampValue | null | undefined) {
@@ -1268,7 +1269,8 @@ export async function writeCarrierSandboxRateEvidenceInPostgres(
          provider, environment, purpose, adapter_version, credential_version, request_hash,
          billing_relationship, billing_selection_snapshot,
          redacted_request, redacted_response, status, provider_reference,
-         error_code, actor_email, requested_at, completed_at
+         error_code, actor_email, requested_at, completed_at,
+         carrier_selection_key
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4, 'sandbox',
          $5, $6, $7, $8, $9, $10::jsonb,
@@ -1278,7 +1280,7 @@ export async function writeCarrierSandboxRateEvidenceInPostgres(
            WHEN $16 = 'system:shopify-carrier-service' THEN NULL
            ELSE $16
          END,
-         $17::timestamptz, $18::timestamptz
+         $17::timestamptz, $18::timestamptz, $19
        )
        RETURNING global_id`,
       [
@@ -1300,6 +1302,7 @@ export async function writeCarrierSandboxRateEvidenceInPostgres(
         input.actorEmail,
         input.requestedAt,
         input.completedAt,
+        input.carrierSelectionKey || null,
       ],
     )
     const globalId = result.rows[0].global_id

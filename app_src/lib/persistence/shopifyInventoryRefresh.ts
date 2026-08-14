@@ -60,6 +60,33 @@ export type ShopifyInventoryRefreshRecoveryState = {
   maxAttempts: number
   availableAt: string | null
   completedAt: string | null
+  affectedOrders: Array<{
+    globalId: string
+    orderNumber: string
+  }>
+}
+
+const OPERATIONS_ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/
+
+function projectedAffectedOrders(value: unknown) {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((candidate) => {
+    if (!candidate || typeof candidate !== 'object') return []
+    const record = candidate as Record<string, unknown>
+    const globalId = typeof record.globalId === 'string'
+      ? record.globalId.trim()
+      : ''
+    const orderNumber = typeof record.orderNumber === 'string'
+      ? record.orderNumber.trim()
+      : ''
+    if (
+      !OPERATIONS_ORDER_GLOBAL_ID.test(globalId)
+      || !orderNumber
+      || orderNumber.length > 100
+      || /[\u0000-\u001f\u007f]/u.test(orderNumber)
+    ) return []
+    return [{ globalId, orderNumber }]
+  })
 }
 
 function refreshTimestamp(value: Date | string | null | undefined) {
@@ -87,6 +114,7 @@ export async function readShopifyInventoryRefreshRecoveryStateFromPostgres(
     available_at: Date | string | null
     completed_at: Date | string | null
     recovered_after_dead: boolean | null
+    affected_orders: unknown
   }>(
     `WITH current_config AS (
        SELECT
@@ -117,6 +145,7 @@ export async function readShopifyInventoryRefreshRecoveryStateFromPostgres(
        job.max_attempts,
        job.available_at,
        job.completed_at,
+       COALESCE(affected.orders, '[]'::jsonb) AS affected_orders,
        CASE
          WHEN job.status <> 'dead' THEN false
          ELSE EXISTS (
@@ -148,7 +177,55 @@ export async function readShopifyInventoryRefreshRecoveryStateFromPostgres(
              current.inventory_max_age_seconds
        ORDER BY job.created_at DESC, job.id DESC
        LIMIT 1
-     ) job ON true`,
+     ) job ON true
+     LEFT JOIN LATERAL (
+       SELECT jsonb_agg(
+         jsonb_build_object(
+           'globalId', affected_order.global_id,
+           'orderNumber', affected_order.order_number
+         )
+         ORDER BY affected_order.order_number, affected_order.global_id
+       ) AS orders
+       FROM (
+         SELECT DISTINCT source_order.global_id, source_order.order_number
+         FROM operations_reservations reservation
+         JOIN operations_orders source_order
+           ON source_order.organization_id = reservation.organization_id
+          AND source_order.id = reservation.order_id
+         JOIN LATERAL (
+           SELECT plan.id, plan.status
+           FROM operations_fulfillment_plans plan
+           WHERE plan.organization_id = source_order.organization_id
+             AND plan.order_id = source_order.id
+           ORDER BY plan.version_number DESC, plan.id DESC
+           LIMIT 1
+         ) latest_plan ON true
+         JOIN operations_inventory_positions position
+           ON position.organization_id = reservation.organization_id
+          AND position.id = reservation.position_id
+         JOIN operations_commerce_inventory_levels source_level
+           ON source_level.organization_id = reservation.organization_id
+          AND source_level.id = reservation.provider_inventory_level_id
+         WHERE reservation.organization_id = current.organization_id
+           AND reservation.status = 'active'
+           AND reservation.reservation_authority = 'provider_commitment'
+           AND source_order.archived_at IS NULL
+           AND source_order.status = 'released'
+           AND latest_plan.status = 'released'
+           AND position.warehouse_id = current.warehouse_id
+           AND source_level.integration_account_id =
+               current.integration_account_id
+           AND job.status = 'dead'
+           AND job.last_error_code =
+               'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT'
+           AND operations_shopify_external_fulfillment_reconciliation_required(
+                 current.organization_id,
+                 latest_plan.id
+               )
+         ORDER BY source_order.order_number, source_order.global_id
+         LIMIT 10
+       ) affected_order
+     ) affected ON true`,
     [input.organizationId, input.accountGlobalId],
   )
   const row = result.rows[0]
@@ -157,16 +234,21 @@ export async function readShopifyInventoryRefreshRecoveryStateFromPostgres(
   const managerRecoveryRequired = (
     status === 'dead' && !recoveredAfterDead
   )
+  const lastErrorCode = projectedRefreshErrorCode(row?.last_error_code)
   return {
     status,
     automaticSchedulingBlocked: managerRecoveryRequired,
     managerRecoveryRequired,
     recoveredAfterDead,
-    lastErrorCode: projectedRefreshErrorCode(row?.last_error_code),
+    lastErrorCode,
     attemptCount: Number(row?.attempt_count || 0),
     maxAttempts: Number(row?.max_attempts || 0),
     availableAt: refreshTimestamp(row?.available_at),
     completedAt: refreshTimestamp(row?.completed_at),
+    affectedOrders: managerRecoveryRequired
+      && lastErrorCode === 'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT'
+      ? projectedAffectedOrders(row?.affected_orders)
+      : [],
   }
 }
 

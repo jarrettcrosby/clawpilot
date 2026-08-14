@@ -24,12 +24,15 @@ import {
   oneOffProviderLabel,
   oneOffShipmentHash,
   type OneOffCarrierGroupCommandResult,
+  type OneOffCarrierProvider,
+  type OneOffCarrierSelectionInput,
   type OneOffExecutionMode,
   type OneOffPackedRateRefresh,
   type OneOffShipmentExecutionState,
   type OneOffShipmentPackageInput,
   type OneOffShipmentQuoteInput,
 } from '@/lib/operations/oneOffShipments'
+import { defaultCanonicalPackageProfile } from '@/lib/operations/packageCatalog'
 import { enqueueOperationsPrintJobInPostgres } from '@/lib/persistence/operationPrintDelivery'
 import {
   OneOffShipmentPersistenceError,
@@ -170,6 +173,8 @@ type GroupContext = QueryResultRow & {
   requested_delivery_at: Date | null
   destination_snapshot: JsonObject
   planning_packages_snapshot: OneOffShipmentPackageInput[]
+  planning_carrier_selection_schema_version: number | null
+  planning_required_carrier_selections: unknown
   provider: Provider
   service_code: string
   service_name: string
@@ -218,6 +223,10 @@ async function readGroupContext(
             planning_quote.requested_delivery_at,
             planning_quote.destination_snapshot,
             planning_quote.packages_snapshot AS planning_packages_snapshot,
+            planning_quote.carrier_selection_schema_version
+              AS planning_carrier_selection_schema_version,
+            planning_quote.required_carrier_selections
+              AS planning_required_carrier_selections,
             planning_offer.provider, planning_offer.service_code,
             planning_offer.service_name,
             planning_offer.amount_minor::text AS planning_amount_minor,
@@ -302,7 +311,7 @@ async function readPackedLines(
     client,
     `SELECT line.external_line_id, product.reference_code AS product_global_id,
             line.quantity::text
-     FROM operations_order_lines line
+     FROM operations_current_order_lines line
      JOIN crm_products product
        ON product.pipeline_id = line.pipeline_id AND product.id = line.product_id
      WHERE line.organization_id = $1::uuid AND line.order_id = $2::uuid
@@ -332,7 +341,7 @@ async function readPackedPackages(
                 'quantity', content.quantity
               ) ORDER BY order_line.external_line_id)
               FROM operations_package_contents content
-              JOIN operations_order_lines order_line
+              JOIN operations_current_order_lines order_line
                 ON order_line.organization_id = content.organization_id
                AND order_line.id = content.order_line_id
               WHERE content.organization_id = package.organization_id
@@ -391,6 +400,96 @@ function assertPackedContext(
   }
 }
 
+export function packedRerateCarrierSelections(
+  schemaVersion: unknown,
+  value: unknown,
+): OneOffCarrierSelectionInput[] {
+  const unavailable = (): never => fail(
+    'OPERATIONS_ONE_OFF_PACKED_RATE_CARRIER_SELECTION_UNAVAILABLE',
+    'The planning quote does not contain exact carrier selection evidence; create a new one-off plan before refreshing packed rates',
+  )
+  if (schemaVersion !== 1 || !Array.isArray(value) || value.length < 1 || value.length > 3) {
+    return unavailable()
+  }
+
+  const providerRank = {
+    ups_rest: 0,
+    fedex_rest: 1,
+    wwex_speedship: 2,
+  } as const
+  let priorProviderRank = -1
+  const selections: OneOffCarrierSelectionInput[] = []
+
+  for (const candidate of value) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+      return unavailable()
+    }
+    const selection = candidate as Record<string, unknown>
+    const provider = selection.provider
+    if (
+      provider !== 'ups_rest'
+      && provider !== 'fedex_rest'
+      && provider !== 'wwex_speedship'
+    ) {
+      return unavailable()
+    }
+    const rank = providerRank[provider]
+    if (rank <= priorProviderRank) return unavailable()
+    priorProviderRank = rank
+
+    const integrationAccountGlobalId = selection.integrationAccountGlobalId
+    const carrierAccountGlobalId = selection.carrierAccountGlobalId
+    const credentialVersion = selection.credentialVersion
+    if (
+      typeof integrationAccountGlobalId !== 'string'
+      || !/^gia(?:[0-9]{7}|[0-9a-v]{12})$/.test(integrationAccountGlobalId)
+      || !Number.isSafeInteger(credentialVersion)
+      || Number(credentialVersion) < 1
+      || (
+        provider === 'wwex_speedship'
+          ? carrierAccountGlobalId !== null
+          : typeof carrierAccountGlobalId !== 'string'
+            || !/^gac(?:[0-9]{7}|[0-9a-v]{12})$/.test(carrierAccountGlobalId)
+      )
+      || selection.selectionKey !== (
+        `${provider}:${integrationAccountGlobalId}:${carrierAccountGlobalId || 'none'}:v${credentialVersion}`
+      )
+      || !Array.isArray(selection.packageCodes)
+      || selection.packageCodes.length < 1
+    ) {
+      return unavailable()
+    }
+
+    let priorPackageKey: string | null = null
+    for (const packageCode of selection.packageCodes) {
+      if (!packageCode || typeof packageCode !== 'object' || Array.isArray(packageCode)) {
+        return unavailable()
+      }
+      const code = packageCode as Record<string, unknown>
+      if (
+        typeof code.packageKey !== 'string'
+        || !code.packageKey
+        || typeof code.catalogEntryId !== 'string'
+        || !code.catalogEntryId
+        || code.catalogVersion !== 'operations.package_catalog.v1'
+        || typeof code.providerPackageCode !== 'string'
+        || !code.providerPackageCode
+        || (priorPackageKey !== null && priorPackageKey >= code.packageKey)
+      ) {
+        return unavailable()
+      }
+      priorPackageKey = code.packageKey
+    }
+
+    selections.push({
+      provider,
+      integrationAccountGlobalId,
+      carrierAccountGlobalId: carrierAccountGlobalId as string | null,
+    })
+  }
+  return selections
+}
+
 function quoteInput(
   context: GroupContext,
   lines: PackedLineRow[],
@@ -419,6 +518,10 @@ function quoteInput(
     shipFromPhone,
     shipToPhone,
     shipToResidential: destination.residential,
+    selectedCarriers: packedRerateCarrierSelections(
+      context.planning_carrier_selection_schema_version,
+      context.planning_required_carrier_selections,
+    ),
     shipTo: {
       name: String(destination.name || '').trim(),
       line1: String(destination.line1 || '').trim(),
@@ -436,6 +539,9 @@ function quoteInput(
     })),
     packages: packages.map((item, index) => ({
       packageKey: item.quote_package_key,
+      packageProfile:
+        context.planning_packages_snapshot[index]?.packageProfile
+        || defaultCanonicalPackageProfile(),
       description: String(
         context.planning_packages_snapshot[index]?.description
         || `Parcel ${item.package_number}`,
@@ -482,7 +588,7 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
     status: 'succeeded' | 'partial' | 'failed'
     consumed: boolean
     offer_global_id: string
-    provider: Provider
+    provider: OneOffCarrierProvider
     environment: Environment
     service_code: string
     service_name: string
@@ -492,7 +598,7 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
     estimated_delivery_at: Date | null
     rate_evidence_global_id: string
     integration_account_global_id: string
-    carrier_account_global_id: string
+    carrier_account_global_id: string | null
     credential_version: number
   }>(
     `SELECT packed_quote.global_id AS quote_global_id,
@@ -669,6 +775,9 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
         globalId: offer.offer_global_id,
         provider: offer.provider,
         providerLabel: oneOffProviderLabel(offer.provider),
+        executionCapability: offer.provider === 'wwex_speedship'
+          ? 'rate_only' as const
+          : 'direct_purchase_later' as const,
         environment: offer.environment,
         serviceCode: offer.service_code,
         serviceName: offer.service_name,

@@ -305,13 +305,13 @@ async function readExactFaireEvidence(
        ON candidate.organization_id = source_order.organization_id
       AND candidate.integration_account_id = account.id
       AND candidate.canonical_order_id = source_order.id
-     JOIN operations_commerce_order_candidate_lines candidate_line
+     JOIN operations_commerce_current_planning_lines candidate_line
        ON candidate_line.organization_id = candidate.organization_id
       AND candidate_line.integration_account_id = candidate.integration_account_id
       AND candidate_line.pipeline_id = candidate.pipeline_id
       AND candidate_line.run_id = candidate.run_id
       AND candidate_line.order_candidate_id = candidate.id
-     JOIN operations_order_lines canonical_line
+     JOIN operations_current_order_lines canonical_line
        ON canonical_line.organization_id = source_order.organization_id
       AND canonical_line.order_id = source_order.id
       AND canonical_line.id = candidate_line.canonical_order_line_id
@@ -496,7 +496,7 @@ async function readExactFaireEvidence(
        )
        AND NOT EXISTS (
          SELECT 1
-         FROM operations_commerce_order_candidate_lines other_line
+         FROM operations_commerce_current_planning_lines other_line
          WHERE other_line.organization_id = candidate.organization_id
            AND other_line.order_candidate_id = candidate.id
            AND other_line.unfulfilled_quantity > 0
@@ -504,7 +504,7 @@ async function readExactFaireEvidence(
        )
        AND NOT EXISTS (
          SELECT 1
-         FROM operations_order_lines other_order_line
+         FROM operations_current_order_lines other_order_line
          WHERE other_order_line.organization_id = source_order.organization_id
            AND other_order_line.order_id = source_order.id
            AND other_order_line.id <> canonical_line.id
@@ -524,7 +524,7 @@ async function readExactFaireEvidence(
            AND other_content.id <> content.id
        )
      FOR SHARE OF
-       account, candidate, candidate_line, canonical_line, pack_mapping,
+       account, candidate, canonical_line, pack_mapping,
        pack_version, plan, warehouse, cartonization, carton_package,
        material, recipe, package, content`,
     [input.organizationId, input.orderId],

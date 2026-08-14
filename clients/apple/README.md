@@ -19,15 +19,27 @@ completion timestamps. The one-time-code keyboard can be
 dismissed with its **Done** control or by dragging the screen, while iOS AutoFill
 remains enabled for codes received by email.
 
-The picker screen explains the three-step operating loop. When one registered
+The picker screen explains the deliberate operating loop. When one registered
 device is connected, **Start Meta scan** opens a live glasses camera stream and
-reads one barcode locally without saving a photo. Returning from Meta AI starts
+reads barcodes locally without saving photos. A verified location pauses the
+workflow at **Scan product**; the picker explicitly advances from the iPhone or
+Watch while the existing Meta camera session stays alive. A multi-unit product
+scan opens a focused count popup on both devices. The picker punches in the
+physical count, and only an exact match advances the item; a short or excess
+count stays open with voice and haptic feedback. Unit-one products retain the
+existing immediate scan path. Location, product, awaiting-count, and exact-count
+progress is durably cached behind the complete queue/order identity fence so an
+app restart cannot silently skip or transfer a step.
+
+Returning from Meta AI starts
 a bounded reconnection poll; **Reconnect glasses** retries it without requiring
 the worker to leave ClawPilot. The iPhone camera remains an explicit fallback.
-The Watch reads its cached current instruction through the Watch speaker when
-glasses are unavailable, without waking the iPhone voice runtime. When one Meta
-glasses connection is active, the Watch delegates that read request to the
-iPhone so iOS can route playback to the glasses.
+The Watch delegates a read request to the iPhone only when the enhanced voice
+pack is ready and exactly one current Meta glasses session is connected. The
+iPhone rechecks both conditions for every request and plays only after iOS has
+selected a Bluetooth output. If the glasses disconnect, the route is not
+Bluetooth, the phone is unreachable, or enhanced playback fails, the Watch
+reads its cached instruction locally through Apple speech instead.
 
 Instruction audio can use the optional Supertonic-3 FP16 voice pack through
 SpeechSwift 0.0.23. The pack is installed explicitly from the Picker audio card,
@@ -37,6 +49,9 @@ validated voice profiles; Apple speech remains the safe fallback while the pack 
 absent, downloading, invalid, or unavailable. The approximately 332 MB model is
 derived from Supertone's Supertonic-3 under the OpenRAIL-M license. Supertonic
 requires iOS 18 while the Watch target remains watchOS 10.2.
+The model is installed only on iPhone; the Watch cannot install or run this iOS
+CoreML package. Consistent enhanced speech therefore uses the reachable iPhone,
+while Watch-only playback remains Apple speech.
 The Picker audio card also maintains a device-local pronunciation dictionary;
 operators can add, preview, replace, and remove written-term to spoken-term
 corrections, which apply to both the enhanced voice and Apple fallback speech.
@@ -54,6 +69,7 @@ From the repository root:
 npm run test:wearable-phase1
 npm run build:apple-picking-simulators
 npm run pilot:apple-wearable-readiness
+clients/apple/verify-development-archive.sh /absolute/path/to/ClawPilot-Dev.xcarchive
 ```
 
 The simulator build pins `facebook/meta-wearables-dat-ios` exactly to 0.9.0 and
@@ -61,6 +77,10 @@ compiles the iPhone and Watch targets unsigned, then asserts that the phone app
 contains the Watch companion. The readiness command prints only whether each
 build-owned setting is present; it never prints configured values or
 credentials.
+The archive verifier is mandatory before every development TestFlight upload.
+It compares the signed Google and Meta configuration to the ignored local
+overlay without printing either value and rejects an archive whose build does
+not match the checked-out `project.yml`.
 
 The source-controlled project produces two fixed environments from the same
 source revision. `ClawPilotPickingPhoneDev` builds **ClawPilot Dev** with the

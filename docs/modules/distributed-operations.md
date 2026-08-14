@@ -2479,6 +2479,31 @@ The adapter reads approved immutable billable facts and credits, produces a vers
 
 ## Foundation Limitations
 
+Migration `0273` is the first bounded post-import order-revision substrate. It
+enqueues already-promoted Shopify and Faire orders, leases exact-ID read work,
+retains each normalized observation immutably with an explicit zero-provider-
+write count, and projects a changed, cancelled, or externally fulfilled source
+revision into a critical manager-visible Operations exception. The execution
+gate fails closed on a material projection at planning, release, assignment,
+picking, packing, fulfillment preparation, rating/selection, label, packing-
+slip, shipping, and commerce-export boundaries. Missing or stale exact-read
+coverage remains health-visible but shadow-only by default so applying `0273`
+does not black out existing work; a separately promoted
+`CLAWPILOT_COMMERCE_ORDER_REVISION_STRICT=1` runtime makes coverage freshness a
+hard execution prerequisite.
+
+The one bounded manager disposition accepts an exact Shopify or Faire provider
+cancellation only while the canonical order is still `imported` and no plan,
+reservation, pick, package, label, shipment, fulfillment export, or execution
+evidence exists. It uses the exact immutable observation and hashes, canonical
+row version, actor, stable idempotency key, and shared order lock to atomically
+cancel the local order, accept the source revision, retain an immutable
+disposition, and resolve the critical exception. It performs zero provider
+writes. Provider line, address, money, quantity, fulfillment, and other header
+changes are **not** applied; they remain manager-visible and execution-blocked.
+This bounded cancellation path therefore must not be described as general
+Shopify or Faire update synchronization.
+
 Before this contract can become active, implementation must close the blockers in the [integration and gap map](../maps/distributed-operations-integration-gap-map.md), especially fine-grained permissions, canonical commerce receipt/poll processing, carrier tracking ingestion, generic provider-agnostic commerce-export expansion, queue/throughput health, quote and optimizer snapshots, multi-warehouse split-plan representation, advanced inventory dimensions, billable lifecycle separation, and shared-service adapters. `0111` and `0112` close bounded credential, OAuth-staging, signed-receipt, cursor, and evidence-schema portions. `0113` adds only a disposable Shopify diagnostic preview. `0114` and `0115` close the bounded manager-driven catalog-mapping and operational-order workflow through durable pre-call read intent, resource-scoped pagination, row-versioned rejection disposition, explicit resolution, exact Faire order refresh, canonical-money reconciliation, and promotion. `0124` adds the bounded development Shopify location mapping, provider capture, all-state inventory evidence, and source-authority projection described above; `0169`, `0171`, and `0172` add only its single-account, single-location, read-only automatic freshness worker and recovery/health fences. `0176` accepts one exact promoted order into a single-warehouse `planned` state and preserves the bounded Shadow-local provider-commitment lifecycle through release, pick, and consumption. Migrations `0177`, `0179`, and `0180` then preserve the Shadow execution estimate, derive the exact Active package set, and add append-only production rerate attempts, terminal outcomes, offers, selection, and dispatch authority without rewriting that estimate. The authenticated Operations commands close the narrow read-only UPS/FedEx token/network rerate producer and manual local one-service whole-shipment selection for one exact Active package set. Separate later migrations and services implement exact Shopify/Faire fulfillment and tracking dispatch, operator reconciliation, and bounded scheduled recovery, but do not production-activate the full lifecycle: generic carrier shipment-label dispatch/finalization, carrier tracking ingestion, generic commerce export, continuous reverse catalog synchronization, and production activation remain later work. `0125` adds only the tenant-safe organization/user preference store, optimistic organization-default command, pure conversion/formatting boundary, and application provider; it does not convert stored domain facts or claim every Operations surface has completed its display migration. `0127` adds the organization ISO 4217 default, guarded update and SuiteCRM Product currency projection; it does not invent exchange rates, convert existing amounts, assign currency to currency-less historical records, or change provider-owned money. These migrations do not close historical import, continuous multi-location or production provider inventory synchronization, unattended receipt/poll processing beyond the explicitly named development catalog, order-staging, and inventory workers, Faire inventory reconciliation, provider inventory writes, returns or full fulfillment-order coverage, generic recurring reconciliation operations, or production activation.
 
 Migration `0126` changes no measurement fact and does not activate any starter

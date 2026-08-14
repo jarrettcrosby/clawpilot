@@ -929,6 +929,9 @@ function loadOperationalWarehouseServices(pool) {
   )
   const stableId = loadTypeScriptModule('app_src/lib/crm/stableId.ts')
   const domain = loadTypeScriptModule('app_src/lib/operations/domain.ts')
+  const pickManagement = loadTypeScriptModule(
+    'app_src/lib/operations/pickManagement.ts',
+  )
   const adapters = loadTypeScriptModule(
     'app_src/lib/operations/adapters.ts',
     { '@/lib/operations/domain': domain },
@@ -1014,7 +1017,12 @@ function loadOperationalWarehouseServices(pool) {
       '@/lib/operations/adapters': adapters,
       '@/lib/operations/canonicalFulfillmentPlanning': canonicalPlanning,
       '@/lib/operations/domain': domain,
+      '@/lib/operations/pickManagement': pickManagement,
       '@/lib/operations/packingSlip': packingSlip,
+      '@/lib/persistence/commerceOrderRevisions': {
+        async assertCommerceOrderRevisionExecutionCurrent() {},
+        CommerceOrderRevisionGateError: class extends Error {},
+      },
       '@/lib/operations/barcodeLabels': {
         locationBarcode: mustNotRun('locationBarcode'),
         providerBarcodeIdentity: mustNotRun('providerBarcodeIdentity'),
@@ -1151,6 +1159,37 @@ function loadCommerceOrderReconciliationWorker(input) {
   return loadTypeScriptModule(
     'app_src/lib/commerceOrderReconciliationWorker.ts',
     {
+      '@/lib/commerceShopifyOrderRevisionWorker': {
+        async processShopifyOrderRevisions() {
+          return {
+            provider: 'shopify',
+            claimed: 0,
+            captured: 0,
+            changed: 0,
+            failed: 0,
+            failureCodes: {},
+            providerWrites: 0,
+            canonicalOrderWrites: 0,
+            managerDispositionRequired: 0,
+          }
+        },
+      },
+      '@/lib/commerceFaireOrderRevisionWorker': {
+        async processFaireOrderRevisions() {
+          return {
+            provider: 'faire',
+            claimed: 0,
+            captured: 0,
+            changed: 0,
+            failed: 0,
+            failureCodes: {},
+            providerReadsPerCapture: 2,
+            providerWrites: 0,
+            canonicalOrderWrites: 0,
+            managerDispositionRequired: 0,
+          }
+        },
+      },
       '@/lib/integrations/commerceIntake': {
         commerceReadRuntimeAvailable: () => true,
         commerceReadRuntimeMode: () => 'development',

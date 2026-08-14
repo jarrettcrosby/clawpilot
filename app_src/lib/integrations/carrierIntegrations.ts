@@ -1285,6 +1285,7 @@ export async function testCarrierSandboxShipmentRate(input: {
   timeoutMs?: number
   signal?: AbortSignal
   requireFailureEvidence?: boolean
+  carrierSelectionKey?: string | null
 }) {
   const requestedAt = new Date().toISOString()
   const purpose = 'cartonization_shipment_rate' as const
@@ -1380,6 +1381,7 @@ export async function testCarrierSandboxShipmentRate(input: {
       actorEmail: input.actorEmail,
       requestedAt: rate.evidence.requestedAt,
       completedAt: rate.evidence.completedAt,
+      carrierSelectionKey: input.carrierSelectionKey || null,
     })
     return {
       ...rate.result,
@@ -1434,7 +1436,8 @@ export async function testCarrierSandboxShipmentRate(input: {
             errorCode: sanitized.code,
             actorEmail: input.actorEmail,
             requestedAt,
-            completedAt: new Date().toISOString(),
+          completedAt: new Date().toISOString(),
+          carrierSelectionKey: input.carrierSelectionKey || null,
           })
       } catch {
         if (

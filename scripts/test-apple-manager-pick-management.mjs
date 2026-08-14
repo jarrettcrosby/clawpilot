@@ -1,0 +1,105 @@
+#!/usr/bin/env node
+
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+
+const root = process.cwd()
+const read = (path) => readFileSync(resolve(root, path), 'utf8')
+
+const adapters = read(
+  'clients/apple/Sources/ClawPilotPickingApple/AppleAdapters.swift',
+)
+for (const fragment of [
+  'public struct ManagerPickManagementWorkspace',
+  'public struct ManagerPickManagementPagination',
+  'public struct ManagerPickAssignmentCommand',
+  'expectedAssignmentFingerprint',
+  'expectedPreviousAssignedTo',
+  'public func fetchManagerPickManagement()',
+  'fetchManagerPickManagementPage(',
+  'nextPickManagementCursor(',
+  'section: "current"',
+  'section: "history"',
+  'public func managePickerAssignment(',
+  'action: "manage-pick-assignment"',
+  'request.setValue(command.idempotencyKey, forHTTPHeaderField: "Idempotency-Key")',
+  'previousAssignedTo?.lowercased()',
+  'providerWrites == 0',
+  'command.assignedTo != nil || interventionExceptionGlobalId != nil',
+]) {
+  assert.ok(adapters.includes(fragment), `Apple adapter is missing ${fragment}`)
+}
+
+const model = read('clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+for (const fragment of [
+  '@Published var managerPickManagement',
+  '@Published var managerSelectedPickAssignment',
+  'managerOrders = try await api.fetchManagerOrders()',
+  'managerPickManagement = try await api.fetchManagerPickManagement()',
+  'Some manager data is unavailable',
+  'Available orders remain usable.',
+  'func managePickerAssignment(',
+  '#if DEBUG',
+  'installManagerPickManagementWalkthroughFixture()',
+  'walkthroughScreen == "pick-intervention"',
+]) {
+  assert.ok(model.includes(fragment), `iPhone manager model is missing ${fragment}`)
+}
+
+const shell = read('clients/apple/Apps/iPhone/ClawPilotAppShellView.swift')
+for (const fragment of [
+  'case "pick-management", "pick-intervention"',
+  'private var currentAssignments',
+  'private var completedPickHistory',
+  'ForEach(history) { item in',
+  '.disabled(!assignment.canManageAssignment)',
+  'ScrollView {',
+  'LazyVStack(spacing: 13)',
+  '.padding(.bottom, 30)',
+  'ManagerPickInterventionView',
+  'Unstarted work only',
+  'Manager exception · evidence retained',
+  'Text("Reason")',
+  'TextField("Required", text: $reason)',
+  '.accessibilityLabel("Manager reason")',
+  'private var primaryAction',
+  '.buttonStyle(.borderedProminent)',
+  '.controlSize(.regular)',
+  '.tint(pickerEmail.isEmpty ? Color.red : AppShellTheme.primary)',
+  'return "Unassign"',
+  '? "Assign"',
+  ': "Reassign"',
+  'Unassign exact ready tasks and flag for manager',
+  'Uses the exact order version, ready-task count, and assignment fingerprint.',
+  '.frame(minHeight: 44)',
+  'never clears scan/count evidence or physical work',
+  'Existing exceptions stay open for review.',
+]) {
+  assert.ok(shell.includes(fragment), `iPhone manager UI is missing ${fragment}`)
+}
+for (const paragraph of [
+  'Exact unstarted-work fence',
+  'The server rechecks this order version, exact task count and assignment fingerprint.',
+  'The reason is retained in command, domain, and audit history.',
+  'Back without changes',
+  'Unassign and flag for manager',
+]) {
+  assert.ok(!shell.includes(paragraph), `iPhone manager UI still shows ${paragraph}`)
+}
+
+const tests = read(
+  'clients/apple/Tests/ClawPilotPickingCoreTests/ManagerPickManagementTests.swift',
+)
+for (const fragment of [
+  'manager assignment command retains exact optimistic fences',
+  'native manager reads progress and sends exact unassign-and-flag command',
+  'native manager rejects non-exact unassign success without an exception',
+  'native manager preserves a structured assignment conflict',
+  'native manager follows every assignment and history page',
+  'OPERATIONS_PICK_ASSIGNMENT_SCAN_EVIDENCE_EXISTS',
+]) {
+  assert.ok(tests.includes(fragment), `Native manager tests are missing ${fragment}`)
+}
+
+console.log('Apple manager pick-management source acceptance passed')

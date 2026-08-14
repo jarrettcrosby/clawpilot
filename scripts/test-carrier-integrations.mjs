@@ -1588,6 +1588,9 @@ class MockCarrierCredentialClientError extends Error {
 }
 
 const rateRequests = []
+const wholeShipmentRateFoundation = loadTypeScriptModule(
+  'app_src/lib/integrations/carrierWholeShipmentRateFoundation.ts',
+)
 const sandboxRateModule = loadTypeScriptModule('app_src/lib/integrations/carrierSandboxRate.ts', {
   mocks: {
     '@/lib/integrations/carrierCredentialClient': {
@@ -1598,6 +1601,8 @@ const sandboxRateModule = loadTypeScriptModule('app_src/lib/integrations/carrier
         scope: 'rate',
       }),
     },
+    '@/lib/integrations/carrierWholeShipmentRateFoundation':
+      wholeShipmentRateFoundation,
   },
 })
 
@@ -1621,6 +1626,7 @@ assert.deepEqual(JSON.parse(JSON.stringify(fixture)), {
   },
   parcel: {
     description: 'Test Product',
+    packageCode: null,
     length: 12,
     width: 10,
     height: 6,
@@ -1682,6 +1688,7 @@ const cartonizationFixture = sandboxRateModule.buildCarrierSandboxRateFixture({
 })
 assert.deepEqual(JSON.parse(JSON.stringify(cartonizationFixture.parcel)), {
   description: 'AG12V2 optimized carton',
+  packageCode: null,
   length: 11,
   width: 9,
   height: 7,
@@ -1711,6 +1718,7 @@ assert.deepEqual(
     JSON.parse(JSON.stringify(cartonizationFixture.parcel)),
     {
       description: '20lb optimized carton',
+      packageCode: null,
       length: 17,
       width: 11,
       height: 7,

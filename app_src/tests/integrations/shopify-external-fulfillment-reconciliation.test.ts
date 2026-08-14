@@ -89,6 +89,15 @@ function evidenceError(action: () => unknown) {
   ))
 }
 
+function fullyRemovedOrderLine() {
+  return {
+    id: 'gid://shopify/LineItem/201',
+    currentQuantity: 0,
+    unfulfilledQuantity: 0,
+    requiresShipping: false,
+  }
+}
+
 test('accepts one exact successful Shopify fulfillment after warehouse release', () => {
   const evidence = normalizeShopifyExternalFulfillmentEvidence({
     target,
@@ -140,6 +149,166 @@ test('rejects unfulfilled, wrong-location, and extra-line authority', () => {
     target,
     providerOrder: extraLine,
   }))
+})
+
+test('ignores only a fully removed unfulfilled non-shipping historical line', () => {
+  const replacedLineOrder = providerOrder()
+  replacedLineOrder.lineItems.nodes.unshift(fullyRemovedOrderLine())
+  replacedLineOrder.fulfillmentOrders.nodes.unshift({
+    id: 'gid://shopify/FulfillmentOrder/401',
+    status: 'CLOSED',
+    requestStatus: 'UNSUBMITTED',
+    updatedAt: '2026-08-11T13:31:25.000Z',
+    assignedLocation: {
+      location: { id: target.providerLocationId },
+    },
+    lineItems: {
+      nodes: [{
+        lineItem: { id: fullyRemovedOrderLine().id },
+        totalQuantity: 0,
+        remainingQuantity: 0,
+      }],
+      pageInfo: { hasNextPage: false },
+    },
+  })
+  const evidence = normalizeShopifyExternalFulfillmentEvidence({
+    target,
+    providerOrder: replacedLineOrder,
+    observedAt: '2026-08-11T13:35:00.000Z',
+  })
+  assert.deepEqual(evidence.snapshot.fulfillment.lines, target.lines)
+  assert.equal(evidence.snapshot.fulfillment.name, '#6603-F1')
+})
+
+test('rejects active, shipping, fulfilled, and ambiguous historical lines', () => {
+  const activeLineOrder = providerOrder()
+  activeLineOrder.lineItems.nodes.unshift({
+    ...fullyRemovedOrderLine(),
+    currentQuantity: 1,
+  })
+  evidenceError(() => normalizeShopifyExternalFulfillmentEvidence({
+    target,
+    providerOrder: activeLineOrder,
+  }))
+
+  const unfulfilledLineOrder = providerOrder()
+  unfulfilledLineOrder.lineItems.nodes.unshift({
+    ...fullyRemovedOrderLine(),
+    unfulfilledQuantity: 1,
+  })
+  evidenceError(() => normalizeShopifyExternalFulfillmentEvidence({
+    target,
+    providerOrder: unfulfilledLineOrder,
+  }))
+
+  const shippingLineOrder = providerOrder()
+  shippingLineOrder.lineItems.nodes.unshift({
+    ...fullyRemovedOrderLine(),
+    requiresShipping: true,
+  })
+  evidenceError(() => normalizeShopifyExternalFulfillmentEvidence({
+    target,
+    providerOrder: shippingLineOrder,
+  }))
+
+  const fulfilledLineOrder = providerOrder()
+  fulfilledLineOrder.lineItems.nodes.unshift(fullyRemovedOrderLine())
+  fulfilledLineOrder.fulfillments.push({
+    id: 'gid://shopify/Fulfillment/501',
+    name: '#6603-F2',
+    status: 'CANCELLED',
+    displayStatus: 'CANCELLED',
+    createdAt: '2026-08-11T13:31:25.000Z',
+    updatedAt: '2026-08-11T13:31:25.000Z',
+    trackingInfo: [],
+    fulfillmentOrders: {
+      nodes: [],
+      pageInfo: { hasNextPage: false },
+    },
+    fulfillmentLineItems: {
+      nodes: [{
+        quantity: 1,
+        lineItem: { id: fullyRemovedOrderLine().id },
+      }],
+      pageInfo: { hasNextPage: false },
+    },
+  })
+  evidenceError(() => normalizeShopifyExternalFulfillmentEvidence({
+    target,
+    providerOrder: fulfilledLineOrder,
+  }))
+
+  const ambiguousLineOrder = providerOrder()
+  ambiguousLineOrder.lineItems.nodes.unshift({
+    ...fullyRemovedOrderLine(),
+    requiresShipping: 'false' as unknown as boolean,
+  })
+  evidenceError(() => normalizeShopifyExternalFulfillmentEvidence({
+    target,
+    providerOrder: ambiguousLineOrder,
+  }))
+
+  const changedTargetLineOrder = providerOrder()
+  changedTargetLineOrder.lineItems.nodes[0] = fullyRemovedOrderLine()
+  changedTargetLineOrder.lineItems.nodes[0].id = target.lines[0].externalLineId
+  evidenceError(() => normalizeShopifyExternalFulfillmentEvidence({
+    target,
+    providerOrder: changedTargetLineOrder,
+  }))
+})
+
+test('rejects non-numeric zero-like historical line quantities', () => {
+  for (const ambiguousValue of [null, false, '', '0']) {
+    const ambiguousCurrent = providerOrder()
+    ambiguousCurrent.lineItems.nodes.unshift({
+      ...fullyRemovedOrderLine(),
+      currentQuantity: ambiguousValue as unknown as number,
+    })
+    evidenceError(() => normalizeShopifyExternalFulfillmentEvidence({
+      target,
+      providerOrder: ambiguousCurrent,
+    }))
+
+    const ambiguousUnfulfilled = providerOrder()
+    ambiguousUnfulfilled.lineItems.nodes.unshift({
+      ...fullyRemovedOrderLine(),
+      unfulfilledQuantity: ambiguousValue as unknown as number,
+    })
+    evidenceError(() => normalizeShopifyExternalFulfillmentEvidence({
+      target,
+      providerOrder: ambiguousUnfulfilled,
+    }))
+  }
+})
+
+test('rejects historical lines with fulfillment-order demand', () => {
+  for (const quantities of [
+    { totalQuantity: 1, remainingQuantity: 0 },
+    { totalQuantity: 0, remainingQuantity: 1 },
+  ]) {
+    const order = providerOrder()
+    order.lineItems.nodes.unshift(fullyRemovedOrderLine())
+    order.fulfillmentOrders.nodes.unshift({
+      id: 'gid://shopify/FulfillmentOrder/401',
+      status: 'CLOSED',
+      requestStatus: 'UNSUBMITTED',
+      updatedAt: '2026-08-11T13:31:25.000Z',
+      assignedLocation: {
+        location: { id: target.providerLocationId },
+      },
+      lineItems: {
+        nodes: [{
+          lineItem: { id: fullyRemovedOrderLine().id },
+          ...quantities,
+        }],
+        pageInfo: { hasNextPage: false },
+      },
+    })
+    evidenceError(() => normalizeShopifyExternalFulfillmentEvidence({
+      target,
+      providerOrder: order,
+    }))
+  }
 })
 
 test('rejects a fulfillment that predates the released warehouse work', () => {

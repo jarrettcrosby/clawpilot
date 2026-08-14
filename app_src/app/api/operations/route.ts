@@ -14,6 +14,7 @@ import type {
   OperationsOrderStatus,
   OperationsWorkspace,
 } from '@/lib/operations/types'
+import { canRequestOperationsPickHandoff } from '@/lib/operations/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   authorizeCommerceActiveTransitionInPostgres,
@@ -26,6 +27,10 @@ import {
   SandboxCommerceE2eAuthorizationError,
 } from '@/lib/persistence/sandboxCommerceE2eAuthorization'
 import {
+  cancelUnstartedCommerceOrderFromProviderRevisionInPostgres,
+  CommerceOrderRevisionDispositionError,
+} from '@/lib/persistence/commerceOrderRevisions'
+import {
   assignOperationsOrderPicksFromPostgres,
   confirmOperationsOrderShipmentFromPostgres,
   confirmOperationsOrderPicksFromPostgres,
@@ -36,6 +41,7 @@ import {
   deleteOperationsLocationInPostgres,
   executeOperationsReplenishmentInPostgres,
   generateOperationsPackagePackingSlipInPostgres,
+  manageOperationsOrderPickAssignmentFromPostgres,
   OperationsRequestError,
   planOperationsOrderFromPostgres,
   prepareOperationsShipmentExecutionFromPostgres,
@@ -43,6 +49,7 @@ import {
   recordWearablePickScanEvidenceFromPostgres,
   reconcileShopifyExternalFulfillmentFromPostgres,
   releaseOperationsOrderFromPostgres,
+  requestOperationsPickHandoffFromPostgres,
   retryOperationsCommerceFulfillmentExportFromPostgres,
   runMockOperationsProofFromPostgres,
   updateOperationsActivationInPostgres,
@@ -69,7 +76,10 @@ import {
   prepareActiveFulfillmentExecutionFromShadowInPostgres,
 } from '@/lib/operations/activeFulfillmentExecutionPreparation'
 import type { ActiveCarrierDispatchAddressSnapshot } from '@/lib/operations/activeCarrierDispatchSnapshot'
-import type { WearablePickTaskScanEvidenceInput } from '@/lib/operations/wearablePicking'
+import type {
+  WearablePickTaskCountEvidenceInput,
+  WearablePickTaskScanEvidenceInput,
+} from '@/lib/operations/wearablePicking'
 import { requireRequestUser } from '@/lib/requestUser'
 
 export const dynamic = 'force-dynamic'
@@ -85,6 +95,8 @@ const PICK_TASK_GLOBAL_ID = /^gpk(?:[0-9]{7}|[0-9a-v]{12})$/
 const CARTONIZATION_EVIDENCE_GLOBAL_ID = /^gcte(?:[0-9]{7}|[0-9a-v]{12})$/
 const PACKAGE_GLOBAL_ID = /^gpa(?:[0-9]{7}|[0-9a-v]{12})$/
 const EXCEPTION_GLOBAL_ID = /^gex(?:[0-9]{7}|[0-9a-v]{12})$/
+const COMMERCE_ORDER_REVISION_OBSERVATION_GLOBAL_ID = /^gcor(?:[0-9]{7}|[0-9a-v]{12})$/
+const COMMERCE_ORDER_REVISION_READ_GLOBAL_ID = /^gcrr(?:[0-9]{7}|[0-9a-v]{12})$/
 const RATE_GLOBAL_ID = /^grt(?:[0-9]{7}|[0-9a-v]{12})$/
 const CARRIER_ACCOUNT_GLOBAL_ID = /^gac(?:[0-9]{7}|[0-9a-v]{12})$/
 const PRINTER_GLOBAL_ID = /^gpr(?:[0-9]{7}|[0-9a-v]{12})$/
@@ -293,6 +305,145 @@ function wearablePickScanEvidenceValue(
         evidence.product,
         `Scan evidence ${index + 1} product observation`,
       ),
+    }
+  })
+}
+
+function wearableCountCapturedAtValue(value: unknown, label: string) {
+  if (
+    typeof value !== 'string'
+    || value.length < 20
+    || value.length > 40
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value)
+  ) {
+    requestError('OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID', `${label} is invalid`)
+  }
+  const parsed = new Date(value)
+  if (!Number.isFinite(parsed.getTime())) {
+    requestError('OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID', `${label} is invalid`)
+  }
+  return parsed.toISOString()
+}
+
+function wearableCountProductObservationValue(
+  value: unknown,
+  label: string,
+): WearablePickTaskCountEvidenceInput['product'] {
+  const observation = record(
+    value,
+    'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+    label,
+  )
+  assertFields(
+    observation,
+    new Set(['barcode', 'capturedAt', 'source']),
+    'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+    label,
+  )
+  const barcode = observation.barcode
+  if (
+    typeof barcode !== 'string'
+    || barcode.length < 1
+    || barcode.length > 512
+    || barcode !== barcode.trim()
+    || /[\u0000-\u001f\u007f]/.test(barcode)
+  ) {
+    requestError(
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+      `${label} barcode is invalid`,
+    )
+  }
+  const source = String(observation.source || '')
+  if (source !== 'iphone_camera' && source !== 'meta') {
+    requestError(
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+      `${label} source is invalid`,
+    )
+  }
+  return {
+    barcode,
+    capturedAt: wearableCountCapturedAtValue(
+      observation.capturedAt,
+      `${label} capture time`,
+    ),
+    source,
+  }
+}
+
+function wearablePickCountEvidenceValue(
+  value: unknown,
+): WearablePickTaskCountEvidenceInput[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 200) {
+    requestError(
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+      'Count evidence must contain between one and 200 multi-unit pick tasks',
+    )
+  }
+  const seen = new Set<string>()
+  return value.map((entry, index) => {
+    const label = `Count evidence ${index + 1}`
+    const evidence = record(
+      entry,
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+      label,
+    )
+    assertFields(
+      evidence,
+      new Set([
+        'pickTaskGlobalId',
+        'requiredQuantity',
+        'enteredQuantity',
+        'product',
+        'countedAt',
+        'countSource',
+      ]),
+      'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+      label,
+    )
+    const pickTaskGlobalId = globalIdValue(
+      evidence.pickTaskGlobalId,
+      `${label} pick task`,
+      PICK_TASK_GLOBAL_ID,
+    )
+    if (seen.has(pickTaskGlobalId)) {
+      requestError(
+        'OPERATIONS_WEARABLE_COUNT_EVIDENCE_DUPLICATE',
+        'Count evidence contains the same pick task more than once',
+        409,
+      )
+    }
+    seen.add(pickTaskGlobalId)
+    const product = wearableCountProductObservationValue(
+      evidence.product,
+      `${label} product observation`,
+    )
+    const countSource = String(evidence.countSource || '')
+    if (countSource !== 'iphone' && countSource !== 'watch') {
+      requestError(
+        'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+        `${label} count source is invalid`,
+      )
+    }
+    return {
+      pickTaskGlobalId,
+      requiredQuantity: integerValue(
+        evidence.requiredQuantity,
+        `${label} required quantity`,
+        1,
+        Number.MAX_SAFE_INTEGER,
+      ),
+      enteredQuantity: integerValue(
+        evidence.enteredQuantity,
+        `${label} entered quantity`,
+        1,
+        Number.MAX_SAFE_INTEGER,
+      ),
+      product,
+      countedAt: wearableCountCapturedAtValue(
+        evidence.countedAt,
+        `${label} count time`,
+      ),
+      countSource,
     }
   })
 }
@@ -811,6 +962,9 @@ function errorResponse(error: unknown) {
   if (error instanceof SandboxCommerceE2eAuthorizationError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
+  if (error instanceof CommerceOrderRevisionDispositionError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
   if (
     error instanceof CarrierIntegrationRequestError
     || error instanceof ActiveFulfillmentExecutionPreparationError
@@ -1309,6 +1463,116 @@ export async function POST(req: NextRequest) {
       })
       return json({ ok: true, capabilities, result })
     }
+    if (action === 'manage-pick-assignment') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to manage warehouse pick assignments',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'orderGlobalId',
+          'expectedRowVersion',
+          'expectedTaskCount',
+          'expectedAssignmentFingerprint',
+          'assignedTo',
+          'reason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await manageOperationsOrderPickAssignmentFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+        expectedRowVersion: integerValue(
+          body.expectedRowVersion,
+          'Order version',
+          0,
+          2_147_483_647,
+        ),
+        expectedTaskCount: integerValue(
+          body.expectedTaskCount,
+          'Expected pick task count',
+          1,
+          200,
+        ),
+        expectedAssignmentFingerprint: textValue(
+          body.expectedAssignmentFingerprint,
+          'Expected picker-assignment fingerprint',
+          64,
+        ).toLowerCase(),
+        assignedTo: textValue(
+          body.assignedTo,
+          'Assigned picker',
+          254,
+          false,
+        ).toLowerCase() || null,
+        reason: textValue(body.reason, 'Manager intervention reason', 500),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'request-pick-handoff') {
+      if (!canRequestOperationsPickHandoff(capabilities)) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to request a picker handoff',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'orderGlobalId',
+          'expectedRowVersion',
+          'expectedAssignedTaskCount',
+          'reason',
+          'blockedConfirmationIdempotencyKey',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await requestOperationsPickHandoffFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+        expectedRowVersion: integerValue(
+          body.expectedRowVersion,
+          'Order version',
+          0,
+          2_147_483_647,
+        ),
+        expectedAssignedTaskCount: integerValue(
+          body.expectedAssignedTaskCount,
+          'Assigned task count',
+          1,
+          200,
+        ),
+        reason: textValue(body.reason, 'Picker handoff reason', 500),
+        blockedConfirmationIdempotencyKey: textValue(
+          body.blockedConfirmationIdempotencyKey,
+          'Blocked confirmation idempotency key',
+          200,
+          false,
+        ) || undefined,
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
     if (action === 'record-pick-scan-evidence') {
       if (!capabilities.canView || !capabilities.canExecute) {
         return json({
@@ -1354,10 +1618,27 @@ export async function POST(req: NextRequest) {
           'expectedRowVersion',
           'reason',
           'scanEvidenceIdempotencyKey',
+          'countEvidenceIdempotencyKey',
+          'countEvidence',
         ]),
         'OPERATIONS_REQUEST_INVALID',
         'Operations command',
       )
+      const countEvidenceIdempotencyKey = textValue(
+        body.countEvidenceIdempotencyKey,
+        'Count evidence idempotency key',
+        200,
+        false,
+      ) || undefined
+      const countEvidence = body.countEvidence === undefined
+        ? undefined
+        : wearablePickCountEvidenceValue(body.countEvidence)
+      if ((countEvidenceIdempotencyKey === undefined) !== (countEvidence === undefined)) {
+        requestError(
+          'OPERATIONS_WEARABLE_COUNT_EVIDENCE_INVALID',
+          'Count evidence and its idempotency key must be supplied together',
+        )
+      }
       const result = await confirmOperationsOrderPicksFromPostgres({
         organizationId: activeOperationsOrganizationId(actor),
         actorEmail: actor.email,
@@ -1370,6 +1651,8 @@ export async function POST(req: NextRequest) {
           200,
           false,
         ) || undefined,
+        countEvidenceIdempotencyKey,
+        countEvidence,
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })
@@ -1911,6 +2194,56 @@ export async function POST(req: NextRequest) {
         orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
         expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
         reason: textValue(body.reason, 'Label void reason', 500),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'accept-provider-order-cancellation') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to accept provider order cancellations',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'orderGlobalId',
+          'observationGlobalId',
+          'readGlobalId',
+          'expectedSourceHash',
+          'expectedRevisionHash',
+          'expectedRowVersion',
+          'reason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const expectedSourceHash = textValue(body.expectedSourceHash, 'Provider source hash', 64)
+      const expectedRevisionHash = textValue(body.expectedRevisionHash, 'Provider revision hash', 64)
+      if (!SHA256.test(expectedSourceHash) || !SHA256.test(expectedRevisionHash)) {
+        requestError('OPERATIONS_REQUEST_INVALID', 'Provider revision evidence is invalid')
+      }
+      const result = await cancelUnstartedCommerceOrderFromProviderRevisionInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
+        observationGlobalId: globalIdValue(
+          body.observationGlobalId,
+          'Provider order revision observation',
+          COMMERCE_ORDER_REVISION_OBSERVATION_GLOBAL_ID,
+        ),
+        readGlobalId: globalIdValue(
+          body.readGlobalId,
+          'Provider order revision exact read',
+          COMMERCE_ORDER_REVISION_READ_GLOBAL_ID,
+        ),
+        expectedSourceHash,
+        expectedRevisionHash,
+        expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
+        reason: textValue(body.reason, 'Provider cancellation reason', 500),
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })
