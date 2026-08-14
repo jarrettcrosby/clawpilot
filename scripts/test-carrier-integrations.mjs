@@ -1626,7 +1626,6 @@ assert.deepEqual(JSON.parse(JSON.stringify(fixture)), {
   },
   parcel: {
     description: 'Test Product',
-    packageCode: null,
     length: 12,
     width: 10,
     height: 6,
@@ -1688,7 +1687,6 @@ const cartonizationFixture = sandboxRateModule.buildCarrierSandboxRateFixture({
 })
 assert.deepEqual(JSON.parse(JSON.stringify(cartonizationFixture.parcel)), {
   description: 'AG12V2 optimized carton',
-  packageCode: null,
   length: 11,
   width: 9,
   height: 7,
@@ -1718,7 +1716,6 @@ assert.deepEqual(
     JSON.parse(JSON.stringify(cartonizationFixture.parcel)),
     {
       description: '20lb optimized carton',
-      packageCode: null,
       length: 17,
       width: 11,
       height: 7,
@@ -1728,6 +1725,22 @@ assert.deepEqual(
     },
   ],
   'Multi-package fixtures must retain caller package order',
+)
+assert.deepEqual(
+  sandboxRateModule.normalizeCarrierSandboxParcel({
+    ...cartonizationParcel,
+    packageCode: null,
+  }),
+  cartonizationFixture.parcel,
+  'Provider-neutral parcels must omit a null package code from retained evidence',
+)
+assert.equal(
+  sandboxRateModule.normalizeCarrierSandboxParcel({
+    ...cartonizationParcel,
+    packageCode: '02',
+  }).packageCode,
+  '02',
+  'An explicitly selected carrier package code must remain in retained evidence',
 )
 const rateOnlyDestination = {
   name: null,

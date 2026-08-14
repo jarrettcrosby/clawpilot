@@ -119,7 +119,6 @@ export const CARRIER_SANDBOX_RATE_FIXTURE: LegacyCarrierSandboxRateFixture = {
   },
   parcel: {
     description: 'Test Product',
-    packageCode: null,
     length: 12,
     width: 10,
     height: 6,
@@ -494,11 +493,13 @@ export function normalizeCarrierSandboxParcel(
     EXTERIOR_INCH_FIELDS,
     'parcel exterior inches',
   )
+  const packageCode = input.packageCode === undefined
+    || input.packageCode === null
+    ? null
+    : partyText(input.packageCode, 'parcel package code', 32)
   return {
     description: partyText(input.description, 'parcel description', 120),
-    packageCode: input.packageCode === undefined || input.packageCode === null
-      ? null
-      : partyText(input.packageCode, 'parcel package code', 32),
+    ...(packageCode === null ? {} : { packageCode }),
     length: boundedParcelDecimal(
       exterior.length,
       'parcel exterior length in inches',
