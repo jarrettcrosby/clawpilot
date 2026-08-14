@@ -3,17 +3,18 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Real Shopify test-order management",
-      "summary": "ClawPilot now has a tightly controlled development lane for real, auditable Shopify order changes while production provider writes remain disabled.",
+      "title": "Test-store setup and printer readiness",
+      "summary": "ClawPilot now makes Shopify test-store activation, package setup, UPS rate readiness, and local printer connectivity clearer and recoverable without enabling production labels.",
       "features": [
-        "Authorized operators can add one exact Shopify order tag on an allowlisted development sandbox account, including fulfilled test-workflow orders such as order 6600",
-        "Fresh, wholly unfulfilled Shopify test orders can be cancelled or have an existing line quantity decreased or removed after exact provider eligibility checks",
-        "Every provider action uses a five-minute typed confirmation, immutable attempt evidence, exact readback, and read-only reconciliation for uncertain outcomes"
+        "Deleted starter packaging assortments can be intentionally recreated with fresh material identities and audit evidence",
+        "Shopify fulfillment and tracking activation remain independently selectable when checkout-rate callbacks still need a registered CarrierService",
+        "UPS production credentials can be shown as rate-only ready in development while production label authorization and execution remain blocked",
+        "Printer settings distinguish a configured local printer from an agent that has actually connected"
       ],
       "fixes": [
-        "Destructive changes require the accepted Shopify revision, matching store currency, coherent staged totals, and no downstream warehouse work",
-        "Planning, reservation, billing, and sandbox execution records cannot race an in-flight Shopify order write",
-        "Unknown or abandoned provider outcomes block further writes and appear in operational health instead of being retried or silently cleared"
+        "A stale starter-assortment receipt no longer reports deleted packages as available",
+        "UPS live-postage readiness returns a precise blocked response instead of an opaque server error",
+        "Durable print jobs fail closed until the assigned local print agent records its first heartbeat"
       ]
     }
   }

@@ -234,6 +234,11 @@ for (const fragment of [
   'credentialRevealAllowed',
   'senderOriginWarehouseGlobalId',
   'CarrierIntegrationSourceManagedError',
+  'CarrierProductionLabelNotReadyError',
+  "readonly code = 'CARRIER_PRODUCTION_LABEL_NOT_READY'",
+  'Move Operations to Active before authorizing live postage',
+  'Verify the production carrier credential before authorizing live postage',
+  'Add and enable a production sender-billing account before authorizing live postage',
   'lockedUserManagedCarrierConnection',
   'FOR UPDATE OF account',
   'isSourceManagedCarrierConfiguration(configuration)',
@@ -303,6 +308,9 @@ for (const fragment of [
   'requireFailureEvidence',
   "'CARRIER_RATE_EVIDENCE_PERSISTENCE_FAILED'",
   "'system:shopify-carrier-service'",
+  'carrierProductionLabelAuthorizationAllowed',
+  "'CARRIER_PRODUCTION_LABEL_ENVIRONMENT_FORBIDDEN'",
+  "'CARRIER_PRODUCTION_LABEL_NOT_READY'",
 ]) {
   assert.ok(service.includes(fragment), `Carrier service contract missing ${fragment}`)
 }
@@ -356,6 +364,8 @@ for (const fragment of [
   'sanitizedCarrierIntegrationError',
   'operationsCapabilities(actor).canManage',
   'canRevealCredentials: canRevealCredential(actor)',
+  'productionLabelAuthorizationAllowed:',
+  'carrierProductionLabelAuthorizationAllowed()',
   'requireCredentialViewer(actor)',
   "return role === 'owner' || role === 'admin'",
   "'CARRIER_CREDENTIAL_REVEAL_FORBIDDEN'",
@@ -501,6 +511,13 @@ for (const fragment of [
   "delegationProfile === 'sandbox_fulfillment_diagnostic'",
   "account?.credentialRevealAllowed !== false",
   'Credentials, billing identity, labels, voids,',
+  'Production capabilities',
+  'Rate-only ready',
+  'Rate setup incomplete',
+  'Test it from a completely packed order through the sealed, read-only rerate flow',
+  'Live postage locked on development',
+  'Development can select and use production rating, but cannot authorize production labels.',
+  'Label creation remains sandbox-only.',
 ]) {
   assert.ok(panel.includes(fragment), `Carrier settings UI missing ${fragment}`)
 }
@@ -1021,6 +1038,76 @@ const delegatedCarrierServiceModule = loadTypeScriptModule(
     },
   },
 )
+
+assert.equal(
+  delegatedCarrierServiceModule.carrierProductionLabelAuthorizationAllowed({
+    CLAWPILOT_ENV: 'development',
+    NODE_ENV: 'production',
+  }),
+  false,
+  'A compiled development deployment must never authorize production label purchase',
+)
+assert.equal(
+  delegatedCarrierServiceModule.carrierProductionLabelAuthorizationAllowed({
+    CLAWPILOT_ENV: 'development',
+    RAILWAY_ENVIRONMENT_NAME: 'production',
+  }),
+  false,
+  'A contradictory development marker must fail closed even when another marker says production',
+)
+assert.equal(
+  delegatedCarrierServiceModule.carrierProductionLabelAuthorizationAllowed({
+    RAILWAY_ENVIRONMENT_NAME: 'production',
+  }),
+  true,
+  'A canonical production deployment marker must be required for live-postage authorization',
+)
+const sanitizedProductionLabelReadiness =
+  delegatedCarrierServiceModule.sanitizedCarrierIntegrationError(Object.assign(
+    new Error('Move Operations to Active before authorizing live postage'),
+    { status: 409, code: 'CARRIER_PRODUCTION_LABEL_NOT_READY' },
+  ))
+assert.equal(sanitizedProductionLabelReadiness.status, 409)
+assert.equal(
+  sanitizedProductionLabelReadiness.code,
+  'CARRIER_PRODUCTION_LABEL_NOT_READY',
+)
+assert.equal(
+  sanitizedProductionLabelReadiness.message,
+  'Move Operations to Active before authorizing live postage',
+)
+
+const previousClawPilotEnvironment = process.env.CLAWPILOT_ENV
+process.env.CLAWPILOT_ENV = 'development'
+await assert.rejects(
+  delegatedCarrierServiceModule.resolveCarrierProductionShippingRuntime({
+    organizationId,
+    provider: 'ups_rest',
+    integrationAccountGlobalId: 'gia7654321',
+    carrierAccountGlobalId,
+  }),
+  (error) => (
+    error.code === 'CARRIER_PRODUCTION_LABEL_ENVIRONMENT_FORBIDDEN'
+    && error.status === 403
+  ),
+  'Development must reject production label runtime resolution before credential use',
+)
+await assert.rejects(
+  delegatedCarrierServiceModule.setCarrierProductionLabelEnabled({
+    organizationId,
+    provider: 'ups_rest',
+    enabled: true,
+    reason: 'Development safety test',
+    actorEmail: 'owner@example.com',
+  }),
+  (error) => (
+    error.code === 'CARRIER_PRODUCTION_LABEL_ENVIRONMENT_FORBIDDEN'
+    && error.status === 403
+  ),
+  'Development must reject production label authorization before persistence',
+)
+if (previousClawPilotEnvironment === undefined) delete process.env.CLAWPILOT_ENV
+else process.env.CLAWPILOT_ENV = previousClawPilotEnvironment
 
 for (const configuration of [
   {},
