@@ -212,5 +212,11 @@ assert.match(projectionSource, /googleSheetsDateTime\(record\.occurredAt\)/)
 assert.match(projectionSource, /timestamp \/ 86_400_000\) \+ 25_569/)
 assert.match(source, /export async function rebuildPipelineGoogleWorkbook/)
 assert.match(source, /pipeline-sheet-retired/)
+const rebuildBlock = source.slice(
+  source.indexOf('export async function rebuildPipelineGoogleWorkbook'),
+  source.indexOf('export async function provisionPipelineGoogleResources'),
+)
+assert.match(rebuildBlock, /readPipelineDropdownCatalogForSpaceInPostgres\(pipeline\.id\)/)
+assert.match(rebuildBlock, /replaceManagedPipelineDropdowns\(\{ runtime, sheetId, catalog: dropdownCatalog \}\)/)
 
 console.log('pipeline workbook dashboard contract tests passed')

@@ -653,6 +653,7 @@ assertIncludes(pipelineProvisioning, 'canonicalConfiguredDropdownRows(currentDro
 assertIncludes(pipelineProvisioning, 'GENERATED_DROPDOWN_CLEAR_RANGE', 'legacy dropdown layout replacement')
 assertIncludes(pipelineProvisioning, 'values: configuredDropdownRows', 'configured dropdown projection ownership boundary')
 assertIncludes(pipelineProvisioning, '? DASHBOARD_HELPER_END_COLUMN_INDEX', 'dashboard helper grid expansion before value projection')
+assertIncludes(pipelineProvisioning, 'readPipelineDropdownCatalogForSpaceInPostgres(pipeline.id)', 'replacement workbook dropdown catalog restore')
 assertIncludes(pipelineProvisioning, 'applyPipelineWorkbookBrandingWithRequest', 'organization workbook branding')
 assertIncludes(pipelineProvisioning, 'workbookBrandMark(branding)', 'organization workbook brand mark')
 assert.ok(!pipelineProvisioning.includes('=IMAGE('), 'managed workbooks must not require external image approval')

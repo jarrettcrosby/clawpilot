@@ -17,6 +17,7 @@ import {
   enqueuePipelineProvisioningInPostgres,
   markPipelineProvisioningStartedInPostgres,
   readPipelineGooglePermissionContextInPostgres,
+  readPipelineDropdownCatalogForSpaceInPostgres,
   readPipelineProvisioningRecordInPostgres,
   replacePipelineSheetBindingInPostgres,
   recordPipelineProvisioningFailureInPostgres,
@@ -2765,6 +2766,10 @@ export async function rebuildPipelineGoogleWorkbook(input: {
     let rebound = false
     try {
       await configurePipelineTabs(runtime, sheetId)
+      const dropdownCatalog = await readPipelineDropdownCatalogForSpaceInPostgres(pipeline.id)
+      if (dropdownCatalog) {
+        await replaceManagedPipelineDropdowns({ runtime, sheetId, catalog: dropdownCatalog })
+      }
       await applyPipelineWorkbookBranding(runtime, sheetId, await readPipelineWorkbookBranding(pipeline.id))
       await verifyPipelineTabsAndHeaders(runtime, sheetId)
       const fileParameters = new URLSearchParams({ supportsAllDrives: 'true', fields: 'id,name,appProperties' })
