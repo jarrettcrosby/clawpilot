@@ -43,6 +43,12 @@ import {
   readShopifyOrderWebhookSignalHealthFromPostgres,
 } from '@/lib/persistence/shopifyOrderWebhookSignals'
 import {
+  readShopifyOrderManagementHealthFromPostgres,
+} from '@/lib/persistence/shopifyOrderManagement'
+import {
+  shopifyOrderManagementRuntime,
+} from '@/lib/integrations/shopifyOrderManagementRuntime'
+import {
   readFaireInventoryPollHealthFromPostgres,
   readFaireInventoryPollWorkerHeartbeatFromPostgres,
 } from '@/lib/persistence/faireInventoryPolling'
@@ -191,6 +197,24 @@ export async function GET() {
     const warnings: string[] = []
     const storage = getStorageDriver()
     const commerceReadReconciliation = commerceReadRuntimeSummary()
+    const shopifyOrderManagementRuntimeState =
+      shopifyOrderManagementRuntime()
+    const shopifyOrderManagementRuntimeSummary = {
+      available: shopifyOrderManagementRuntimeState.available,
+      mode: shopifyOrderManagementRuntimeState.mode,
+      blocker: shopifyOrderManagementRuntimeState.blockerCode,
+      providerWritesEnabled:
+        shopifyOrderManagementRuntimeState.providerWritesEnabled,
+      productionAvailable:
+        shopifyOrderManagementRuntimeState.productionAvailable,
+      allowlistedAccountCount:
+        shopifyOrderManagementRuntimeState.allowedAccountGlobalIds.length,
+    }
+    let shopifyOrderManagement: Record<string, unknown> = {
+      status: 'migration-pending',
+      runtime: shopifyOrderManagementRuntimeSummary,
+      durable: null,
+    }
     const fulfillmentOptimizer = fulfillmentOptimizerRuntimeHealth()
     if (fulfillmentOptimizer.configurationStatus === 'invalid') {
       errors.push(
@@ -564,6 +588,7 @@ export async function GET() {
           operations_commerce_order_sync_foundation_applied: boolean
           operations_commerce_authority_policies_applied: boolean
           operations_shopify_order_webhook_signals_applied: boolean
+          operations_shopify_order_management_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -2692,6 +2717,106 @@ export async function GET() {
                 )
               )
                 AS operations_shopify_order_webhook_signals_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0283_operations_shopify_order_management.sql'
+              )
+              AND to_regclass(
+                'operations_shopify_order_management_authorizations'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_shopify_order_management_attempts'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_shopify_order_management_outcomes'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_shopify_order_management_snapshot_updated_at(jsonb)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_shopify_order_management_is_current(uuid,uuid,boolean)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_shopify_order_management_authorization()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_shopify_order_management_attempt()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_shopify_order_management_outcome()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_shopify_order_management_downstream_race()'
+              ) IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1
+                FROM (
+                  VALUES
+                    (
+                      'operations_shopify_order_management_authorizations',
+                      'protect_shopify_order_management_authorization_write',
+                      'protect_shopify_order_management_authorization()'
+                    ),
+                    (
+                      'operations_shopify_order_management_attempts',
+                      'protect_shopify_order_management_attempt_write',
+                      'protect_shopify_order_management_attempt()'
+                    ),
+                    (
+                      'operations_shopify_order_management_outcomes',
+                      'protect_shopify_order_management_outcome_write',
+                      'protect_shopify_order_management_outcome()'
+                    ),
+                    (
+                      'operations_orders',
+                      'protect_shopify_order_management_order_status_race',
+                      'protect_shopify_order_management_downstream_race()'
+                    ),
+                    (
+                      'operations_fulfillment_plans',
+                      'protect_shopify_order_management_plan_race',
+                      'protect_shopify_order_management_downstream_race()'
+                    ),
+                    (
+                      'operations_reservations',
+                      'protect_shopify_order_management_reservation_race',
+                      'protect_shopify_order_management_downstream_race()'
+                    ),
+                    (
+                      'operations_billable_events',
+                      'protect_shopify_order_management_billable_event_race',
+                      'protect_shopify_order_management_downstream_race()'
+                    ),
+                    (
+                      'operations_sandbox_commerce_e2e_authorizations',
+                      'block_shopify_order_management_sandbox_e2e_authorization_race',
+                      'protect_shopify_order_management_downstream_race()'
+                    )
+                ) AS required_shopify_order_management_trigger(
+                  table_name, trigger_name, function_signature
+                )
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM pg_trigger installed_shopify_order_management_trigger
+                  WHERE installed_shopify_order_management_trigger.tgrelid =
+                    to_regclass(
+                      required_shopify_order_management_trigger.table_name
+                    )
+                    AND installed_shopify_order_management_trigger.tgname =
+                      required_shopify_order_management_trigger.trigger_name
+                    AND installed_shopify_order_management_trigger.tgfoid =
+                      to_regprocedure(
+                        required_shopify_order_management_trigger.function_signature
+                      )
+                    AND NOT
+                      installed_shopify_order_management_trigger.tgisinternal
+                    AND installed_shopify_order_management_trigger.tgenabled =
+                      'O'
+                )
+              )
+                AS operations_shopify_order_management_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -2895,6 +3020,7 @@ export async function GET() {
             && row?.operations_commerce_order_sync_foundation_applied
             && row?.operations_commerce_authority_policies_applied
             && row?.operations_shopify_order_webhook_signals_applied
+            && row?.operations_shopify_order_management_applied
             && row?.migration_checksums_present
           ),
         }
@@ -3056,6 +3182,35 @@ export async function GET() {
           if (Number(shopifyWebhookReceipts.actionable || 0) > 0) {
             warnings.push(
               'Current Shopify webhook receipts require operator attention.',
+            )
+          }
+        }
+        if (row?.operations_shopify_order_management_applied) {
+          const durable =
+            await readShopifyOrderManagementHealthFromPostgres()
+          const degraded = (
+            durable.staleProcessing > 0
+            || durable.unknown > 0
+          )
+          shopifyOrderManagement = {
+            status: degraded
+              ? 'degraded'
+              : durable.processing > 0
+                ? 'processing'
+                : shopifyOrderManagementRuntimeState.available
+                  ? 'ready'
+                  : 'disabled',
+            runtime: shopifyOrderManagementRuntimeSummary,
+            durable,
+          }
+          if (durable.staleProcessing > 0) {
+            warnings.push(
+              'Shopify order management has stale provider-write attempts requiring reconciliation.',
+            )
+          }
+          if (durable.unknown > 0) {
+            warnings.push(
+              'Shopify order management has unknown provider-write outcomes requiring reconciliation.',
             )
           }
         }
@@ -3237,6 +3392,7 @@ export async function GET() {
           || !row?.operations_commerce_order_sync_foundation_applied
           || !row?.operations_commerce_authority_policies_applied
           || !row?.operations_shopify_order_webhook_signals_applied
+          || !row?.operations_shopify_order_management_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -4560,6 +4716,7 @@ export async function GET() {
       commerceCatalogWorker,
       commerceOrderReconciliationWorker,
       commerceOrderHistory,
+      shopifyOrderManagement,
       shopifyInventoryRefreshWorker,
       shopifyWebhookReceipts,
       faireInventoryPollWorker,
