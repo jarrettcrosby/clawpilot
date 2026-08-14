@@ -233,7 +233,11 @@ function refresh_and_verify_global_id_field(string $module): void
     }
 }
 
-function ensure_global_id_field(string $module, bool $unifiedSearch = true): void
+function ensure_global_id_field(
+    string $module,
+    bool $unifiedSearch = true,
+    bool $managedLayouts = true
+): void
 {
     $bean = BeanFactory::newBean($module);
     if (!$bean) {
@@ -285,10 +289,12 @@ function ensure_global_id_field(string $module, bool $unifiedSearch = true): voi
     if ($unifiedSearch) {
         ensure_global_id_search_field($module);
     }
-    expose_global_id_in_detail_view($module);
-    expose_global_id_in_list_view($module);
-    expose_global_id_in_search_view($module, 'basic_search');
-    expose_global_id_in_search_view($module, 'advanced_search');
+    if ($managedLayouts) {
+        expose_global_id_in_detail_view($module);
+        expose_global_id_in_list_view($module);
+        expose_global_id_in_search_view($module, 'basic_search');
+        expose_global_id_in_search_view($module, 'advanced_search');
+    }
 }
 
 /** @param mixed $metadata */
@@ -646,7 +652,6 @@ $modules = [
     'Opportunities',
     'Meetings',
     'Calls',
-    'Emails',
     'Notes',
     'Campaigns',
 ];
@@ -654,6 +659,11 @@ $modules = [
 foreach ($modules as $module) {
     ensure_global_id_field($module);
 }
+
+// Emails accepts DynamicFields through Api/V8, but its legacy list metadata is
+// not compatible with the generic Studio layout writer. Keep the managed field
+// API-visible without rewriting Email detail, list, or search layouts.
+ensure_global_id_field('Emails', false, false);
 
 // Users are administered separately from business-record global search, but
 // still need a visible, reportable gu identity for ClawPilot assignment maps.

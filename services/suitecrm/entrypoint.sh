@@ -178,6 +178,15 @@ chown -R www-data:www-data "$KEY_DIR"
 chmod 0600 "$KEY_DIR/private.key" "$KEY_DIR/public.key"
 
 php /opt/clawpilot/bootstrap-client.php
+
+# A prior bootstrap may have attempted to send Emails through SuiteCRM's
+# generic Studio list-layout writer. Preserve any syntactically invalid output
+# outside the PHP load path so the corrected field-only bootstrap can start.
+EMAILS_LISTVIEW_METADATA="$APP_ROOT/public/legacy/custom/modules/Emails/metadata/listviewdefs.php"
+if [[ -f "$EMAILS_LISTVIEW_METADATA" ]] && ! php -l "$EMAILS_LISTVIEW_METADATA" >/dev/null 2>&1; then
+  mv "$EMAILS_LISTVIEW_METADATA" "${EMAILS_LISTVIEW_METADATA}.clawpilot-invalid"
+fi
+
 su -s /bin/bash www-data -c "cd '$APP_ROOT/public/legacy' && php /opt/clawpilot/bootstrap-global-id.php"
 su -s /bin/bash www-data -c "cd '$APP_ROOT/public/legacy' && php /opt/clawpilot/bootstrap-image-principals.php"
 su -s /bin/bash www-data -c "cd '$APP_ROOT' && APP_ENV=prod php bin/console cache:clear --no-warmup"

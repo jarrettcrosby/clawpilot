@@ -51,7 +51,7 @@ assert.match(suiteCrmClient, /explicitModule === 'Emails'/)
 assert.match(emailProjectionMigration, /suitecrm_module IN \('Notes', 'Calls', 'Meetings', 'Emails'\)/)
 assert.match(emailProjectionMigration, /'previousSuiteCrmModule', email\.previous_suitecrm_module/)
 assert.match(emailProjectionMigration, /SET suitecrm_module = 'Emails'/)
-assert.match(suiteCrmBootstrap, /'Calls',[\s\S]*'Emails',[\s\S]*'Notes'/)
+assert.match(suiteCrmBootstrap, /ensure_global_id_field\('Emails', false, false\);/)
 assert.match(
   suiteCrmWorker,
   /operation === 'reproject_record'[\s\S]*await upsertSuiteCrmRecordWithResult\(item\.payload\)[\s\S]*await deleteSuiteCrmRecord/,
