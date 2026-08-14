@@ -7,7 +7,10 @@ import {
   isPostgresPipelineStoreEnabled,
   readPipelineSyncDiagnosticsFromPostgres,
 } from '@/lib/persistence/pipeline'
-import { readCrmSummaryFromPostgres } from '@/lib/persistence/crm'
+import {
+  readCrmLastSyncedAtFromPostgres,
+  readCrmSummaryFromPostgres,
+} from '@/lib/persistence/crm'
 import { requireRequestUser } from '@/lib/requestUser'
 import {
   PIPELINE_SELECTION_COOKIE,
@@ -32,7 +35,7 @@ export async function GET(req: NextRequest) {
         const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: selected })
           .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor }))
         selectedPipeline = pipeline
-        const [projection, diagnostics, crmSummary] = await Promise.all([
+        const [projection, diagnostics, crmSummary, crmLastSyncedAt] = await Promise.all([
           readPipelineProjectionForSpace(pipeline),
           pipeline.syncEnabled
             ? readPipelineSyncDiagnosticsFromPostgres({
@@ -41,12 +44,13 @@ export async function GET(req: NextRequest) {
               })
             : Promise.resolve({ outbox: {}, oldestPendingAt: null }),
           readCrmSummaryFromPostgres(pipeline.id),
+          readCrmLastSyncedAtFromPostgres(pipeline.id),
         ])
 
         logPipelineEvent({ module: 'pipeline-sync', action: 'status', result: 'ok', actor: actor.email, pipelineId: pipeline.id })
         return NextResponse.json({
           ok: true,
-          syncedAt: projection?.syncedAt || null,
+          syncedAt: crmLastSyncedAt || projection?.syncedAt || null,
           summary: {
             ...(projection?.summary || {}),
             opportunities: crmSummary.opportunities,
@@ -59,7 +63,12 @@ export async function GET(req: NextRequest) {
           },
           diagnostics: {
             ...diagnostics,
-            crm: { pending: crmSummary.pendingSync, failed: crmSummary.failedSync },
+            crm: {
+              pending: crmSummary.pendingSync,
+              failed: crmSummary.failedSync,
+              lastSyncedAt: crmLastSyncedAt,
+            },
+            sheet: { lastImportedAt: projection?.syncedAt || null },
           },
           storage: 'postgres',
           pipeline: { id: pipeline.id, name: pipeline.name, accessRole: pipeline.accessRole, syncEnabled: pipeline.syncEnabled },

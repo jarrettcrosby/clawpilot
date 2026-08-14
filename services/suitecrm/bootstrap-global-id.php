@@ -646,6 +646,7 @@ $modules = [
     'Opportunities',
     'Meetings',
     'Calls',
+    'Emails',
     'Notes',
     'Campaigns',
 ];

@@ -98,5 +98,10 @@ assert.match(
   /ensure_global_id_field\('Users', false\);/,
   'the same widening and postconditions cover Users',
 )
+assert.match(
+  source,
+  /\$modules = \[[\s\S]*'Calls',[\s\S]*'Emails',[\s\S]*'Notes',[\s\S]*\];/,
+  'native SuiteCRM Emails receive the same managed Global ID field as other CRM modules',
+)
 
 console.log('SuiteCRM Global ID bootstrap contract passed')

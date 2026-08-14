@@ -4964,6 +4964,17 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
   }
 }
 
+export async function readCrmLastSyncedAtFromPostgres(pipelineId: string): Promise<string | null> {
+  const result = await query<{ crm_last_synced_at: string | null }>(
+    `SELECT crm_last_synced_at::text
+     FROM pipeline_spaces
+     WHERE id = $1::uuid
+     LIMIT 1`,
+    [pipelineId],
+  )
+  return result.rows[0]?.crm_last_synced_at || null
+}
+
 export async function readCrmRecordReference(input: {
   pipelineId: string
   entity: CrmEntity
