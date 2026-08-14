@@ -37,6 +37,9 @@ const checkoutRate = read(
 const checkoutPersistence = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
 )
+const checkoutParcelEvidenceMigration = read(
+  'db/migrations/0164_shopify_checkout_offer_parcel_evidence.sql',
+)
 
 for (const required of [
   'readShopifyCarrierServiceRateRequest(input.request, {',
@@ -546,6 +549,17 @@ assert.ok(
 assert.ok(
   sandboxRate.includes('signal: options.signal'),
   'carrier rate calls must propagate the checkout abort signal',
+)
+assert.ok(
+  sandboxRate.includes(
+    '...(packageCode === null ? {} : { packageCode })',
+  ),
+  'provider-neutral checkout evidence must omit a null package code',
+)
+assert.equal(
+  checkoutParcelEvidenceMigration.includes("'packageCode'"),
+  false,
+  'provider-neutral checkout evidence must retain the historical parcel shape expected by PostgreSQL',
 )
 assert.ok(
   checkoutRate.includes("const ACCOUNT_GLOBAL_ID = /^gac(?:[0-9]{7}|[0-9a-v]{12})$/"),
