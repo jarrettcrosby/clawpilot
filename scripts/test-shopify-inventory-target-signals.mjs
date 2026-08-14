@@ -451,6 +451,31 @@ const integrationService = loadTypeScriptModule(
       '@/lib/integrations/shopifyInventoryWebhook': {
         shopifyInventoryWebhookTargeting: parser,
       },
+      '@/lib/integrations/shopifyOrderWebhook': {
+        async discoverShopifyOrderWebhookSubscriptions() {
+          throw new Error('Order webhook discovery is outside this inventory test')
+        },
+        isShopifyOrderSignalWebhookTopic() {
+          return false
+        },
+        shopifyOrderWebhookSignalEvidence() {
+          throw new Error('Order webhook evidence is outside this inventory test')
+        },
+        SHOPIFY_ORDER_SIGNAL_INCLUDE_FIELDS: [
+          'admin_graphql_api_id',
+          'updated_at',
+        ],
+        SHOPIFY_ORDER_SIGNAL_WEBHOOK_TOPICS: [
+          'orders/create',
+          'orders/updated',
+          'orders/edited',
+          'orders/cancelled',
+          'orders/paid',
+          'orders/fulfilled',
+          'orders/partially_fulfilled',
+        ],
+        ShopifyOrderWebhookError: StubProviderError,
+      },
       '@/lib/integrations/shopifyOrderPreview': {
         SHOPIFY_ORDER_PREVIEW_MAX_ORDERS: 25,
         SHOPIFY_ORDER_PREVIEW_POLICY_VERSION: 'test-v1',
@@ -467,6 +492,12 @@ const integrationService = loadTypeScriptModule(
         async markShopifyWebhookSecretVerifiedInPostgres() {},
       },
       '@/lib/persistence/commerceOrderPreviews': {},
+      '@/lib/persistence/shopifyOrderWebhookSignals': {
+        async recordShopifyOrderWebhookSignalInPostgres() {
+          throw new Error('Order webhook persistence is outside this inventory test')
+        },
+        ShopifyOrderWebhookSignalPersistenceError: StubProviderError,
+      },
       '@/lib/persistence/shopifyFulfillmentNotifications': {
         ShopifyFulfillmentNotificationPolicyError: StubProviderError,
       },

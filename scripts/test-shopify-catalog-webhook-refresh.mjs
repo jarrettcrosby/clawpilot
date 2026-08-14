@@ -346,6 +346,8 @@ const receiptPersistenceModule = loadTypeScriptModule(
                 provider: 'shopify',
                 environment: 'production',
                 external_account_id: 'gid://shopify/Shop/123456789',
+                credential_external_account_id:
+                  'gid://shopify/Shop/123456789',
                 display_name: 'Example store',
                 status: 'active',
                 receipt_intake_enabled: true,
@@ -502,7 +504,19 @@ const receiptPersistenceModule = loadTypeScriptModule(
           }
         },
       },
+      '@/lib/persistence/commerceOrderSync': {
+        commerceOrderSyncAccountLockKey(accountGlobalId) {
+          return `commerce-order-sync:${accountGlobalId}`
+        },
+      },
       '@/lib/persistence/shopifyFulfillmentNotifications': {},
+      '@/lib/persistence/shopifyOrderWebhookSignals': {
+        async downgradeShopifyOrderWebhookPolicyAfterDiscoveryWithClient() {
+          assert.fail(
+            'Catalog webhook receipt tests must not change order webhook policy',
+          )
+        },
+      },
       '@/lib/persistence/shopifyWebhookReceiptHealth': {
         async readShopifyWebhookReceiptAccountHealthFromPostgres() {
           return []
