@@ -47,6 +47,8 @@ const MATERIAL = {
   probable: '#4DB6AC',
   success: '#66BB6A',
   warning: '#F4BE62',
+  summary: '#C7D2FE',
+  summarySurface: 'rgba(199, 210, 254, 0.06)',
   surface: '#181A22',
   surfaceHigh: '#20232D',
   outline: '#353A48',
@@ -142,7 +144,7 @@ function Panel({ title, subtitle, children }: { title: string; subtitle: string;
   )
 }
 
-function MetricCard({ label, value, color, primary = false }: { label: string; value: string; color: string; primary?: boolean }) {
+function MetricCard({ label, value, primary = false }: { label: string; value: string; primary?: boolean }) {
   return (
     <Box
       sx={{
@@ -150,7 +152,7 @@ function MetricCard({ label, value, color, primary = false }: { label: string; v
         p: primary ? { xs: 2, md: 2.5 } : { xs: 1.5, md: 1.75 },
         borderRadius: '12px',
         border: `1px solid ${MATERIAL.outline}`,
-        borderTop: `3px solid ${color}`,
+        borderTop: `3px solid ${MATERIAL.summary}`,
         backgroundColor: MATERIAL.surface,
       }}
     >
@@ -160,7 +162,7 @@ function MetricCard({ label, value, color, primary = false }: { label: string; v
       <Typography
         sx={{
           mt: primary ? 1 : 0.75,
-          color,
+          color: MATERIAL.summary,
           fontFamily: NUMBER_FONT,
           fontSize: primary ? { xs: 25, md: 30 } : { xs: 18, md: 21 },
           fontWeight: 500,
@@ -399,17 +401,28 @@ export default function PipelineDashboard({ deals, stages, lastSyncedLabel, sync
         </Stack>
       </Stack>
 
-      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }, gap: 1.5 }}>
-        <MetricCard primary label="Open opportunities value" value={money(openValue)} color={MATERIAL.primary} />
-        <MetricCard primary label="Potential value" value={money(summary.activeValue)} color={MATERIAL.potential} />
-      </Box>
+      <Box
+        component="section"
+        aria-label="Pipeline summary"
+        sx={{
+          p: 1.5,
+          borderRadius: '14px',
+          border: `1px solid rgba(199, 210, 254, 0.18)`,
+          backgroundColor: MATERIAL.summarySurface,
+        }}
+      >
+        <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }, gap: 1.5 }}>
+          <MetricCard primary label="Open opportunities value" value={money(openValue)} />
+          <MetricCard primary label="Potential value" value={money(summary.activeValue)} />
+        </Box>
 
-      <Box sx={{ mt: 1.5, display: 'grid', gridTemplateColumns: { xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(5, minmax(0, 1fr))' }, gap: 1.5 }}>
-        <MetricCard label="Contacts" value={numeric(crm.summary.contacts)} color="#A45A9C" />
-        <MetricCard label="Interactions" value={numeric(crm.summary.interactions)} color={MATERIAL.secondary} />
-        <MetricCard label="Opps pursued" value={numeric(summary.totalCount)} color={MATERIAL.primary} />
-        <MetricCard label="Opps closed" value={numeric(wonCount)} color={MATERIAL.success} />
-        <MetricCard label="Win rate" value={`${summary.winRate.toFixed(1)}%`} color={MATERIAL.warning} />
+        <Box sx={{ mt: 1.5, display: 'grid', gridTemplateColumns: { xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(5, minmax(0, 1fr))' }, gap: 1.5 }}>
+          <MetricCard label="Contacts" value={numeric(crm.summary.contacts)} />
+          <MetricCard label="Interactions" value={numeric(crm.summary.interactions)} />
+          <MetricCard label="Opps pursued" value={numeric(summary.totalCount)} />
+          <MetricCard label="Opps closed" value={numeric(wonCount)} />
+          <MetricCard label="Win rate" value={`${summary.winRate.toFixed(1)}%`} />
+        </Box>
       </Box>
 
       {crmError ? (

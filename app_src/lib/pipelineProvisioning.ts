@@ -17,6 +17,7 @@ import {
   enqueuePipelineProvisioningInPostgres,
   markPipelineProvisioningStartedInPostgres,
   readPipelineGooglePermissionContextInPostgres,
+  readPipelineDropdownCatalogForSpaceInPostgres,
   readPipelineProvisioningRecordInPostgres,
   replacePipelineSheetBindingInPostgres,
   recordPipelineProvisioningFailureInPostgres,
@@ -64,7 +65,7 @@ const TAB_HEADERS: Record<(typeof EXPECTED_TABS)[number], string[]> = {
     'Priority', 'Opportunity', 'Owner', 'Organization', 'Status', 'Stage',
     'Loss Reason', 'Source', 'Value', 'Probability', 'Expected Close', 'Notes',
   ],
-  Interactions: ['Priority', 'Interaction', 'Owner', 'Organization', 'Agent', 'Date', 'Opportunity', 'Contact', 'Notes'],
+  Interactions: ['Priority', 'Type', 'Owner', 'Organization', 'Agent', 'Date', 'Opportunity', 'Contact', 'Notes'],
   Calculations: ['Metric', 'Value'],
   Dashboard: ['Metric', 'Value'],
   Dropdowns: ['Owner', 'Product', 'Stage', 'Priority', 'Status', 'Source', 'Loss Reason'],
@@ -140,6 +141,7 @@ const GENERATED_REPORT_CLEAR_RANGES = [
   "'Calculations'!B4:ZZZ",
   "'Dashboard'!B4:ZZZ",
 ] as const
+const GENERATED_DROPDOWN_CLEAR_RANGE = "'Dropdowns'!B4:ZZZ"
 const GENERATED_HEADER_CLEAR_RANGES = EXPECTED_TABS.map((title) => `'${title}'!A1:ZZ3`)
 
 const WORKBOOK_THEME = {
@@ -206,12 +208,24 @@ const WORKBOOK_COLUMN_WIDTHS: Record<(typeof EXPECTED_TABS)[number], number[]> =
 const FILTERED_TABLE_TABS = ['Organizations', 'Contacts', 'Opportunities', 'Interactions'] as const
 const DASHBOARD_HELPER_COLUMN_INDEX = 15
 const DASHBOARD_STAGE_HELPER_COLUMN_INDEX = 18
-const DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX = 21
-const DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX = 30
-const DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX = 39
-const DASHBOARD_HELPER_END_COLUMN_INDEX = 42
+const DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX = 28
+const DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX = 36
+const DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX = 44
+const DASHBOARD_HELPER_END_COLUMN_INDEX = 47
 const DASHBOARD_LAST_VISIBLE_COLUMN_INDEX = 13
 const CANONICAL_DROPDOWN_KEYS = ['owner', 'product', 'stage', 'priority', 'status', 'source', 'loss_reason'] as const
+
+const OPPORTUNITY_STAGE_PALETTE = [
+  { name: 'Identified Lead', chart: '#EF5350', fill: '#FDE8E7', foreground: '#9B2C2C' },
+  { name: 'Qualified Lead', chart: '#FF8A65', fill: '#FCECE6', foreground: '#9A452D' },
+  { name: 'Needs Analysis', chart: '#F6C85F', fill: '#FFF4D6', foreground: '#7A5600' },
+  { name: 'Demo', chart: '#26A69A', fill: '#DDF4F1', foreground: '#14665F' },
+  { name: 'Proposal', chart: '#5C6BC0', fill: '#E8EAF8', foreground: '#36428B' },
+  { name: 'Negotiation', chart: '#00ACC1', fill: '#DDF4F7', foreground: '#006D7A' },
+  { name: 'Closed', chart: '#2E7D32', fill: '#E2F3E7', foreground: '#2C6A3C' },
+  { name: 'Closed Delayed', chart: '#AB47BC', fill: '#F2E5F5', foreground: '#71327D' },
+  { name: 'Loss', chart: '#C62828', fill: '#FCE8E6', foreground: '#963D39' },
+] as const
 
 function orderedDropdownKeys(catalog: Record<string, unknown>) {
   const available = new Set(Object.keys(catalog))
@@ -1061,17 +1075,19 @@ function dashboardChartRequests(sheetId: number) {
   })
 
   const interactionSeriesColors = ['#5C6BC0', '#356BB3', '#7CB342', '#008C95', '#8E55A6', '#C29415', '#C75B39']
-  const forecastStageColors = ['#2E7D32', '#C29415', '#D66D24', '#1597C1', '#A45A9C', '#59A14F', '#4E79A7']
+  const opportunityStageColors = OPPORTUNITY_STAGE_PALETTE.map((stage) => stage.chart)
+  const forecastStageColors = ['Closed', 'Closed Delayed', 'Proposal', 'Demo', 'Needs Analysis', 'Qualified Lead', 'Identified Lead']
+    .map((name) => OPPORTUNITY_STAGE_PALETTE.find((stage) => stage.name === name)?.chart || DASHBOARD_MATERIAL.primary)
 
   return [
     chartShell({
       title: 'Opportunities by stage',
       chartType: 'BAR',
-      legendPosition: 'NO_LEGEND',
+      legendPosition: 'TOP_LEGEND',
       valueAxisTitle: 'Opportunities',
       domainColumnIndex: DASHBOARD_STAGE_HELPER_COLUMN_INDEX,
       seriesColumnIndex: DASHBOARD_STAGE_HELPER_COLUMN_INDEX + 1,
-      seriesColors: [DASHBOARD_MATERIAL.primary],
+      seriesColors: opportunityStageColors,
       startRowIndex: 3,
       endRowIndex: 13,
       anchorRowIndex: 9,
@@ -1124,7 +1140,7 @@ function dashboardChartRequests(sheetId: number) {
 
 function dashboardValueWrites() {
   const interactionTypes = ['Direct Mail', 'LinkedIn', 'Email', 'Call', 'In Person', 'Note', 'Campaign']
-  const opportunityStages = ['Identified Lead', 'Qualified Lead', 'Needs Analysis', 'Demo', 'Proposal', 'Negotiation', 'Closed', 'Closed Delayed', 'Loss']
+  const opportunityStages = OPPORTUNITY_STAGE_PALETTE.map((stage) => stage.name)
   const forecastStages = ['Closed', 'Closed Delayed', 'Proposal', 'Demo', 'Needs Analysis', 'Qualified Lead', 'Identified Lead']
   const interactionMonthColumn = columnName(DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX)
   const interactionTrackerRows = [-2, -1, 0].map((monthOffset, rowIndex) => {
@@ -1175,25 +1191,28 @@ function dashboardValueWrites() {
       range: "'Dashboard'!S4",
       majorDimension: 'ROWS' as const,
       values: [
-        ['Stage', 'Opportunities'],
+        ['Stage', ...opportunityStages],
         ...opportunityStages.map((stage, rowIndex) => [
           stage,
-          `=COUNTIFS(Opportunities!$C$5:$C,"<>",Opportunities!$G$5:$G,$S${5 + rowIndex})`,
+          ...opportunityStages.map((_, seriesIndex) => {
+            const seriesColumn = columnName(DASHBOARD_STAGE_HELPER_COLUMN_INDEX + 1 + seriesIndex)
+            return `=IF($S${5 + rowIndex}=${seriesColumn}$4,COUNTIFS(Opportunities!$C$5:$C,"<>",Opportunities!$G$5:$G,$S${5 + rowIndex}),NA())`
+          }),
         ]),
       ],
     },
     {
-      range: "'Dashboard'!V4",
+      range: "'Dashboard'!AC4",
       majorDimension: 'ROWS' as const,
       values: [['Month ending', ...interactionTypes], ...interactionTrackerRows],
     },
     {
-      range: "'Dashboard'!AE4",
+      range: "'Dashboard'!AK4",
       majorDimension: 'ROWS' as const,
       values: [['Month ending', ...forecastStages], ...forecastStageRows],
     },
     {
-      range: "'Dashboard'!AN4",
+      range: "'Dashboard'!AS4",
       majorDimension: 'ROWS' as const,
       values: [['Month ending', 'Potential', 'Probable'], ...forecastValueRows],
     },
@@ -1294,6 +1313,17 @@ function opportunityStatusConditionalFormatting(sheetId: number, rowCount: numbe
     conditionalTextRule({ sheetId, rowCount, columnIndex: 5, value: 'Lost', fill: WORKBOOK_THEME.dangerFill, foreground: '#963D39' }),
     conditionalTextRule({ sheetId, rowCount, columnIndex: 5, value: 'Abandoned', fill: WORKBOOK_THEME.dangerFill, foreground: '#963D39' }),
   ]
+}
+
+function opportunityStageConditionalFormatting(sheetId: number, rowCount: number) {
+  return OPPORTUNITY_STAGE_PALETTE.map((stage) => conditionalTextRule({
+    sheetId,
+    rowCount,
+    columnIndex: 6,
+    value: stage.name,
+    fill: stage.fill,
+    foreground: stage.foreground,
+  }))
 }
 
 function setRangeNumberFormat(input: {
@@ -1648,7 +1678,6 @@ export async function configurePipelineTabsWithRequest(
   let metadata = await spreadsheetMetadata(request, sheetId)
   const current = metadata.sheets || []
   const currentTitles = new Set(current.map((sheet) => sheet.properties?.title).filter(Boolean))
-  const newlyProvisionedTitles = new Set<string>()
   const requests: unknown[] = []
 
   if (!currentTitles.has(EXPECTED_TABS[0])) {
@@ -1664,14 +1693,12 @@ export async function configurePipelineTabsWithRequest(
         },
       })
       currentTitles.add(EXPECTED_TABS[0])
-      newlyProvisionedTitles.add(EXPECTED_TABS[0])
     }
   }
   for (const title of EXPECTED_TABS) {
     if (!currentTitles.has(title)) {
       requests.push({ addSheet: { properties: { title } } })
       currentTitles.add(title)
-      newlyProvisionedTitles.add(title)
     }
   }
   if (requests.length > 0) {
@@ -1700,7 +1727,42 @@ export async function configurePipelineTabsWithRequest(
       },
       idempotent: false,
     })
-    newlyProvisionedTitles.add('Dashboard')
+    metadata = await spreadsheetMetadata(request, sheetId)
+  }
+
+  const currentDropdownResult = await request<{ values?: unknown[][] }>(
+    `/v4/spreadsheets/${sheetId}/values/${encodeURIComponent("'Dropdowns'!B4:ZZ2000")}?majorDimension=ROWS`,
+  )
+  const configuredDropdownRows = canonicalConfiguredDropdownRows(currentDropdownResult.values || [])
+
+  const gridExpansionRequests = (metadata.sheets || []).flatMap((sheet) => {
+    const id = sheet.properties?.sheetId
+    const title = sheet.properties?.title as (typeof EXPECTED_TABS)[number]
+    if (id === undefined || !EXPECTED_TABS.includes(title)) return []
+    const tableStartColumnIndex = title === 'Start Here' ? 2 : 1
+    const minimumRows = title === 'Dashboard' ? 44 : title === 'Start Here' ? 30 : title === 'Calculations' ? 40 : 1000
+    const minimumColumns = title === 'Dashboard'
+      ? DASHBOARD_HELPER_END_COLUMN_INDEX
+      : tableStartColumnIndex + (title === 'Dropdowns' ? configuredDropdownRows[0].length : TAB_HEADERS[title].length)
+    const rowCount = Math.max(minimumRows, sheet.properties?.gridProperties?.rowCount || 0)
+    const columnCount = Math.max(minimumColumns, sheet.properties?.gridProperties?.columnCount || 0)
+    if (
+      rowCount === sheet.properties?.gridProperties?.rowCount
+      && columnCount === sheet.properties?.gridProperties?.columnCount
+    ) return []
+    return [{
+      updateSheetProperties: {
+        properties: { sheetId: id, gridProperties: { rowCount, columnCount } },
+        fields: 'gridProperties(rowCount,columnCount)',
+      },
+    }]
+  })
+  if (gridExpansionRequests.length > 0) {
+    await request(`/v4/spreadsheets/${sheetId}:batchUpdate`, {
+      method: 'POST',
+      body: { requests: gridExpansionRequests, includeSpreadsheetInResponse: false },
+      idempotent: false,
+    })
     metadata = await spreadsheetMetadata(request, sheetId)
   }
 
@@ -1722,7 +1784,13 @@ export async function configurePipelineTabsWithRequest(
 
   await request(`/v4/spreadsheets/${sheetId}/values:batchClear`, {
     method: 'POST',
-    body: { ranges: [...GENERATED_HEADER_CLEAR_RANGES, ...GENERATED_REPORT_CLEAR_RANGES] },
+    body: {
+      ranges: [
+        ...GENERATED_HEADER_CLEAR_RANGES,
+        ...GENERATED_REPORT_CLEAR_RANGES,
+        GENERATED_DROPDOWN_CLEAR_RANGE,
+      ],
+    },
     idempotent: true,
   })
 
@@ -1739,8 +1807,14 @@ export async function configurePipelineTabsWithRequest(
             values: [['ClawPilot Record ID']],
           })
         }
-        const preserveConfiguredDropdowns = title === 'Dropdowns' && !newlyProvisionedTitles.has(title)
-        if (preserveConfiguredDropdowns) return writes
+        if (title === 'Dropdowns') {
+          writes.push({
+            range: "'Dropdowns'!B4",
+            majorDimension: 'ROWS',
+            values: configuredDropdownRows,
+          })
+          return writes
+        }
 
         const dataColumn = title === 'Dashboard' ? 'P' : title === 'Start Here' ? 'C' : 'B'
         writes.push({
@@ -1762,13 +1836,7 @@ export async function configurePipelineTabsWithRequest(
   })
 
   metadata = await spreadsheetMetadata(request, sheetId)
-  const dropdownHeaderResult = await request<{ values?: unknown[][] }>(
-    `/v4/spreadsheets/${sheetId}/values/${encodeURIComponent("'Dropdowns'!B4:ZZ4")}?majorDimension=ROWS`,
-  )
-  const configuredDropdownColumnCount = Math.max(
-    TAB_HEADERS.Dropdowns.length,
-    populatedColumnCount(dropdownHeaderResult.values?.[0] || []),
-  )
+  const configuredDropdownColumnCount = Math.max(TAB_HEADERS.Dropdowns.length, configuredDropdownRows[0].length)
   const managedSheets = (metadata.sheets || []).filter((sheet) => (
     typeof sheet.properties?.sheetId === 'number'
     && EXPECTED_TABS.includes(sheet.properties?.title as (typeof EXPECTED_TABS)[number])
@@ -2027,6 +2095,7 @@ export async function configurePipelineTabsWithRequest(
     if (title === 'Opportunities') {
       formattingRequests.push(
         ...opportunityStatusConditionalFormatting(sheetIdValue, rowCount),
+        ...opportunityStageConditionalFormatting(sheetIdValue, rowCount),
         ...opportunityValidationRequests(sheetIdValue, rowCount),
         setRangeNumberFormat({ sheetId: sheetIdValue, startRowIndex: 4, startColumnIndex: 9, endColumnIndex: 10, type: 'CURRENCY', pattern: '$#,##0.00' }),
         setRangeNumberFormat({ sheetId: sheetIdValue, startRowIndex: 4, startColumnIndex: 10, endColumnIndex: 11, type: 'NUMBER', pattern: '0.0"%"' }),
@@ -2099,6 +2168,48 @@ export async function configurePipelineTabsWithRequest(
 export async function configurePipelineTabs(runtime: GoogleWorkspaceRuntime, sheetId: string) {
   const request: SheetsJsonRequest = (pathname, input) => googleSheetsJson(runtime, pathname, input)
   return configurePipelineTabsWithRequest(request, sheetId, runtime.serviceAccountEmail)
+}
+
+export async function rebuildPipelineTabsWithRequest(
+  request: SheetsJsonRequest,
+  sheetId: string,
+  protectionEditor?: string,
+) {
+  const metadata = await spreadsheetMetadata(request, sheetId)
+  const existingSheets = metadata.sheets || []
+  const managedSheets = existingSheets.filter((sheet) => (
+    typeof sheet.properties?.sheetId === 'number'
+    && EXPECTED_TABS.includes(sheet.properties?.title as (typeof EXPECTED_TABS)[number])
+  ))
+  const unmanagedSheets = existingSheets.filter((sheet) => (
+    !EXPECTED_TABS.includes(sheet.properties?.title as (typeof EXPECTED_TABS)[number])
+  ))
+  const usedIds = new Set(existingSheets.flatMap((sheet) => (
+    typeof sheet.properties?.sheetId === 'number' ? [sheet.properties.sheetId] : []
+  )))
+  let scratchSheetId: number | null = null
+  while (unmanagedSheets.length === 0 && (scratchSheetId === null || usedIds.has(scratchSheetId))) {
+    scratchSheetId = crypto.randomInt(1, 2_000_000_000)
+  }
+  const resetRequests: unknown[] = []
+  if (scratchSheetId !== null) {
+    resetRequests.push({ addSheet: { properties: { sheetId: scratchSheetId, title: 'ClawPilot rebuild' } } })
+  }
+  managedSheets.forEach((sheet) => {
+    resetRequests.push({ deleteSheet: { sheetId: sheet.properties?.sheetId } })
+  })
+  EXPECTED_TABS.forEach((title, index) => {
+    resetRequests.push({ addSheet: { properties: { title, index } } })
+  })
+  if (scratchSheetId !== null) resetRequests.push({ deleteSheet: { sheetId: scratchSheetId } })
+
+  await request(`/v4/spreadsheets/${sheetId}:batchUpdate`, {
+    method: 'POST',
+    body: { requests: resetRequests, includeSpreadsheetInResponse: false },
+    idempotent: false,
+  })
+  await configurePipelineTabsWithRequest(request, sheetId, protectionEditor)
+  return { sheetId, replacedTabs: managedSheets.length }
 }
 
 function googleColor(hex: string) {
@@ -2726,6 +2837,10 @@ export async function rebuildPipelineGoogleWorkbook(input: {
     let rebound = false
     try {
       await configurePipelineTabs(runtime, sheetId)
+      const dropdownCatalog = await readPipelineDropdownCatalogForSpaceInPostgres(pipeline.id)
+      if (dropdownCatalog) {
+        await replaceManagedPipelineDropdowns({ runtime, sheetId, catalog: dropdownCatalog })
+      }
       await applyPipelineWorkbookBranding(runtime, sheetId, await readPipelineWorkbookBranding(pipeline.id))
       await verifyPipelineTabsAndHeaders(runtime, sheetId)
       const fileParameters = new URLSearchParams({ supportsAllDrives: 'true', fields: 'id,name,appProperties' })
@@ -2909,6 +3024,18 @@ function catalogFromDropdownRows(values: unknown[][]): Record<string, string[]> 
     })
     return [[key, options] as const]
   }))
+}
+
+function canonicalConfiguredDropdownRows(values: unknown[][]) {
+  const defaults = catalogFromDropdownRows([
+    TAB_HEADERS.Dropdowns,
+    ...(INITIAL_TAB_ROWS.Dropdowns || []),
+  ])
+  const configured = catalogFromDropdownRows(values)
+  for (const [key, options] of Object.entries(configured)) {
+    if (options.length > 0 || !(key in defaults)) defaults[key] = options
+  }
+  return dropdownRows(defaults)
 }
 
 function dropdownRows(catalog: Record<string, string[]>) {

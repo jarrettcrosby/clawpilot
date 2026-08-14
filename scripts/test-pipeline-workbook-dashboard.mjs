@@ -6,6 +6,7 @@ import { resolve } from 'node:path'
 const source = readFileSync(resolve(process.cwd(), 'app_src/lib/pipelineProvisioning.ts'), 'utf8')
 const projectionSource = readFileSync(resolve(process.cwd(), 'app_src/lib/crm/workbookProjection.ts'), 'utf8')
 const legacySource = readFileSync(resolve(process.cwd(), 'app_src/lib/pipelineLegacyWorkbook.ts'), 'utf8')
+const rebuildRoute = readFileSync(resolve(process.cwd(), 'app_src/app/api/crm/workbook/rebuild/route.ts'), 'utf8')
 
 for (const tutorialText of [
   'Only the Opportunities tab is operator-editable.',
@@ -57,7 +58,14 @@ const configureBlock = source.slice(
 )
 assert.match(source, /const GENERATED_HEADER_CLEAR_RANGES = EXPECTED_TABS\.map/)
 assert.match(source, /const GENERATED_REPORT_CLEAR_RANGES = \[\s*"'Start Here'!B4:ZZZ",\s*"'Calculations'!B4:ZZZ",\s*"'Dashboard'!B4:ZZZ",\s*\] as const/)
-assert.match(configureBlock, /body: \{ ranges: \[\.\.\.GENERATED_HEADER_CLEAR_RANGES, \.\.\.GENERATED_REPORT_CLEAR_RANGES\] \}/)
+assert.match(source, /const GENERATED_DROPDOWN_CLEAR_RANGE = "'Dropdowns'!B4:ZZZ"/)
+assert.match(configureBlock, /\.\.\.GENERATED_HEADER_CLEAR_RANGES,\s*\.\.\.GENERATED_REPORT_CLEAR_RANGES,\s*GENERATED_DROPDOWN_CLEAR_RANGE/)
+assert.match(configureBlock, /const gridExpansionRequests =/)
+assert.match(configureBlock, /title === 'Dashboard'\s*\? DASHBOARD_HELPER_END_COLUMN_INDEX/)
+assert.ok(
+  configureBlock.indexOf('gridExpansionRequests.length > 0') < configureBlock.indexOf('/values:batchClear'),
+  'dashboard helper columns must exist before generated values are written',
+)
 assert.ok(configureBlock.indexOf('unmergeCells') < configureBlock.indexOf('/values:batchClear'))
 assert.ok(configureBlock.indexOf('/values:batchClear') < configureBlock.indexOf('/values:batchUpdate'))
 assert.match(configureBlock, /const dataColumn = title === 'Dashboard' \? 'P' : title === 'Start Here' \? 'C' : 'B'/)
@@ -117,6 +125,8 @@ for (const chartContract of [
 }
 assert.match(chartRequestBlock, /title: 'Interactions, last quarter'/)
 assert.match(chartRequestBlock, /stackedType: 'NOT_STACKED'/)
+assert.match(chartRequestBlock, /title: 'Opportunities by stage'[\s\S]*legendPosition: 'TOP_LEGEND'/)
+assert.match(chartRequestBlock, /seriesColors: opportunityStageColors/)
 assert.match(chartRequestBlock, /title: 'Potential Revenue by Stage, Next 2 Quarters'[\s\S]*stackedType: 'STACKED'/)
 assert.match(chartRequestBlock, /title: 'Potential Revenue by Stage, Next 2 Quarters'[\s\S]*legendPosition: 'TOP_LEGEND'/)
 assert.match(chartRequestBlock, /title: 'Potential Revenue by Stage, Next 2 Quarters'[\s\S]*valueAxisTitle: 'Potential revenue'/)
@@ -127,6 +137,10 @@ const dashboardWrites = source.slice(
   source.indexOf('function googleBorder'),
 )
 assert.match(dashboardWrites, /const interactionTypes = \['Direct Mail', 'LinkedIn', 'Email', 'Call', 'In Person', 'Note', 'Campaign'\]/)
+assert.match(dashboardWrites, /const opportunityStages = OPPORTUNITY_STAGE_PALETTE\.map/)
+assert.match(dashboardWrites, /\['Stage', \.\.\.opportunityStages\]/)
+assert.match(dashboardWrites, /=IF\(\$S\$\{5 \+ rowIndex\}=\$\{seriesColumn\}\$4,COUNTIFS/)
+assert.match(source, /Interactions: \['Priority', 'Type', 'Owner', 'Organization', 'Agent', 'Date', 'Opportunity', 'Contact', 'Notes'\]/)
 assert.match(dashboardWrites, /Interactions!\$C\$5:\$C/)
 assert.match(dashboardWrites, /Interactions!\$G\$5:\$G/)
 assert.match(dashboardWrites, /const forecastStages = \['Closed', 'Closed Delayed', 'Proposal', 'Demo', 'Needs Analysis', 'Qualified Lead', 'Identified Lead'\]/)
@@ -138,21 +152,24 @@ for (const cell of ['B5', 'B6', 'H5', 'H6', 'B8', 'D8', 'F8', 'I8', 'K8', 'B9', 
 }
 assert.match(source, /const DASHBOARD_MATERIAL =/)
 assert.match(source, /fontFamily: 'Roboto Mono'/)
-for (const range of ['S4', 'V4', 'AE4', 'AN4']) {
+for (const range of ['S4', 'AC4', 'AK4', 'AS4']) {
   assert.ok(dashboardWrites.includes(`'Dashboard'!${range}`), `Dashboard helper write missing ${range}`)
 }
 assert.match(source, /const DASHBOARD_HELPER_COLUMN_INDEX = 15/)
 assert.match(source, /const DASHBOARD_STAGE_HELPER_COLUMN_INDEX = 18/)
-assert.match(source, /const DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX = 21/)
-assert.match(source, /const DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX = 30/)
-assert.match(source, /const DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX = 39/)
-assert.match(source, /const DASHBOARD_HELPER_END_COLUMN_INDEX = 42/)
+assert.match(source, /const DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX = 28/)
+assert.match(source, /const DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX = 36/)
+assert.match(source, /const DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX = 44/)
+assert.match(source, /const DASHBOARD_HELPER_END_COLUMN_INDEX = 47/)
 assert.match(source, /properties: \{ hiddenByUser: true \}/)
 assert.match(source, /hideGridlines: true/)
 assert.match(source, /tabColor: googleColor\(WORKBOOK_TAB_COLORS\[title\]\)/)
 assert.match(source, /properties: \{ pixelSize \}/)
 assert.match(source, /tableBandingRequest/)
 assert.match(source, /setBasicFilter/)
+assert.match(source, /function opportunityStageConditionalFormatting/)
+assert.match(source, /columnIndex: 6/)
+assert.match(source, /\.\.\.opportunityStageConditionalFormatting\(sheetIdValue, rowCount\)/)
 
 assert.match(source, /pattern: '0\.0"%"'/)
 assert.match(source, /numeric\(10, 'NUMBER_BETWEEN', \['0', '100'\]\)/)
@@ -187,12 +204,14 @@ assert.ok(
   'branding cells must be written after header merges are reconciled',
 )
 
-assert.match(source, /title === 'Dropdowns' && !newlyProvisionedTitles\.has\(title\)/)
-assert.match(source, /if \(preserveConfiguredDropdowns\) return writes/)
+assert.match(configureBlock, /const configuredDropdownRows = canonicalConfiguredDropdownRows/)
+assert.match(configureBlock, /range: "'Dropdowns'!B4"[\s\S]{0,120}values: configuredDropdownRows/)
+assert.doesNotMatch(source, /preserveConfiguredDropdowns/)
+assert.match(source, /function canonicalConfiguredDropdownRows/)
 assert.match(source, /const CANONICAL_DROPDOWN_KEYS = \['owner', 'product', 'stage', 'priority', 'status', 'source', 'loss_reason'\]/)
 assert.match(source, /const keys = orderedDropdownKeys\(catalog\)/)
 assert.match(configureBlock, /configuredDropdownColumnCount/)
-assert.match(configureBlock, /populatedColumnCount/)
+assert.match(configureBlock, /Math\.max\(TAB_HEADERS\.Dropdowns\.length, configuredDropdownRows\[0\]\.length\)/)
 assert.doesNotMatch(source.slice(initialRowsStart, source.indexOf('export class PipelineProvisioningRequestError')), /\n\s+Opportunities\s*:/)
 assert.match(projectionSource, /await configurePipelineTabs\(runtime, input\.context\.sheetId\)[\s\S]{0,260}await applyPipelineWorkbookBranding/)
 assert.match(projectionSource, /const branding = await readPipelineWorkbookBranding\(input\.context\.pipelineId\)/)
@@ -203,5 +222,24 @@ assert.match(projectionSource, /googleSheetsDateTime\(record\.occurredAt\)/)
 assert.match(projectionSource, /timestamp \/ 86_400_000\) \+ 25_569/)
 assert.match(source, /export async function rebuildPipelineGoogleWorkbook/)
 assert.match(source, /pipeline-sheet-retired/)
+assert.match(source, /export async function rebuildPipelineTabsWithRequest/)
+const resetBlock = source.slice(
+  source.indexOf('export async function rebuildPipelineTabsWithRequest'),
+  source.indexOf('function googleColor'),
+)
+assert.match(resetBlock, /addSheet: \{ properties: \{ sheetId: scratchSheetId, title: 'ClawPilot rebuild' \} \}/)
+assert.match(resetBlock, /deleteSheet: \{ sheetId: sheet\.properties\?\.sheetId \}/)
+assert.match(resetBlock, /EXPECTED_TABS\.forEach/)
+assert.match(resetBlock, /await configurePipelineTabsWithRequest/)
+assert.match(legacySource, /export async function rebuildLegacyPipelineTabs/)
+assert.match(rebuildRoute, /isLegacyOwnerSheetPipeline\(pipeline\)/)
+assert.match(rebuildRoute, /await rebuildLegacyPipelineTabs\(previousContext\.sheetId\)/)
+assert.match(rebuildRoute, /await pushDropdownsToSheet\(dropdownCatalog/)
+const rebuildBlock = source.slice(
+  source.indexOf('export async function rebuildPipelineGoogleWorkbook'),
+  source.indexOf('export async function provisionPipelineGoogleResources'),
+)
+assert.match(rebuildBlock, /readPipelineDropdownCatalogForSpaceInPostgres\(pipeline\.id\)/)
+assert.match(rebuildBlock, /replaceManagedPipelineDropdowns\(\{ runtime, sheetId, catalog: dropdownCatalog \}\)/)
 
 console.log('pipeline workbook dashboard contract tests passed')

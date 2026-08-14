@@ -156,7 +156,7 @@ const bootstrapCalls = section(
 assertOrdered(bootstrapCalls, [
   'ensure_product_image_field();',
   'hide_unowned_product_purchases_subpanel();',
-  'rebuild_and_verify_global_search($modules);',
+  'rebuild_and_verify_global_search($globalSearchModules);',
 ], 'bootstrap execution')
 
 assert.match(
