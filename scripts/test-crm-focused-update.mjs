@@ -60,7 +60,11 @@ assert.match(syncStatusRoute, /syncedAt: crmLastSyncedAt \|\| projection\?\.sync
 assert.match(syncStatusRoute, /sheet: \{ lastImportedAt: projection\?\.syncedAt \|\| null \}/)
 assert.match(emailRepair, /CLAWPILOT_SUITECRM_EMAIL_REPROJECT_CONFIRM/)
 assert.match(emailRepair, /Property global_id_c in Email module is invalid/)
+assert.match(emailRepair, /pipeline\.sync_enabled = true/)
+assert.match(emailRepair, /outbox\.status = 'failed' AND outbox\.attempts >= 8/)
+assert.match(emailRepair, /interaction\.sync_status = 'syncing' AND interaction\.sync_error IS NULL/)
 assert.match(emailRepair, /status = 'queued',[\s\S]*attempts = 0/)
+assert.match(emailRepair, /sync_status IN \('failed', 'syncing'\)/)
 assert.match(ui, /Provider lifecycle is read-only/)
 assert.doesNotMatch(ui, /<Alert severity="info">\s*Provider lifecycle/)
 
