@@ -3,18 +3,22 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Test-store setup and printer readiness",
-      "summary": "ClawPilot now makes Shopify test-store activation, package setup, UPS rate readiness, and local printer connectivity clearer and recoverable without enabling production labels.",
+      "title": "Test-store shipping and printer setup",
+      "summary": "ClawPilot now makes Shopify test-store activation, cart-rate callbacks, guarded UPS label testing, package setup, and local printer pairing clearer and recoverable.",
       "features": [
         "Deleted starter packaging assortments can be intentionally recreated with fresh material identities and audit evidence",
         "Shopify fulfillment and tracking activation remain independently selectable when checkout-rate callbacks still need a registered CarrierService",
-        "UPS production credentials can be shown as rate-only ready in development while production label authorization and execution remain blocked",
-        "Printer settings distinguish a configured local printer from an agent that has actually connected"
+        "Shopify cart and checkout rates can use one selected UPS or FedEx sandbox account, or both, through an explicit CarrierService POST callback that is separate from event webhooks",
+        "The exact trusted Railway development service can exercise the LIVE UPS production-label path under the same Active Operations, sender-account, authorization, confirmation, audit, and void safeguards used for production",
+        "Printer settings distinguish a configured local printer from an agent that has actually connected",
+        "Mac pairing keeps each workspace credential and printer endpoint local while allowing one physical printer to serve separately enrolled workspaces"
       ],
       "fixes": [
         "A stale starter-assortment receipt no longer reports deleted packages as available",
-        "UPS live-postage readiness returns a precise blocked response instead of an opaque server error",
-        "Durable print jobs fail closed until the assigned local print agent records its first heartbeat"
+        "UPS live-postage readiness returns a precise blocked response instead of an opaque server error, while TEST and LIVE selections continue to route only to their fixed sandbox and production APIs",
+        "Durable print jobs fail closed until the assigned local print agent records its first heartbeat",
+        "Local print acknowledgements use opaque device references instead of persisting or displaying raw printer hostnames and IP addresses",
+        "A lost print acknowledgement response no longer downgrades a locally delivered artifact or permits an automatic resend"
       ]
     }
   }

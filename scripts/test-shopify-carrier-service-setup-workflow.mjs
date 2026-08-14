@@ -25,6 +25,9 @@ const setupPersistence = read(
 const checkoutRatingPersistence = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
 )
+const callbackExecution = read(
+  'app_src/lib/integrations/shopifyCarrierServiceCallback.ts',
+)
 const operationsPersistence = read(
   'app_src/lib/persistence/operations.ts',
 )
@@ -49,6 +52,11 @@ const receiptAuthorityMigration = read(
 const nameAlignmentMigration = read(
   'db/migrations/0166_shopify_carrier_service_name_alignment.sql',
 )
+const configuredCarriersMigration = read(
+  'db/migrations/0285_shopify_carrier_service_configured_carriers.sql',
+)
+const healthRoute = read('app_src/app/api/health/route.ts')
+const predeployVerification = read('scripts/verify-predeploy.mjs')
 const externalEffectsPersistence = read(
   'app_src/lib/persistence/commerceExternalEffects.ts',
 )
@@ -1110,6 +1118,71 @@ requireAll(setupPanel, [
   'Open Packaging Materials',
   'Use a signed-in Shopify customer covered by an unexpired Checkout audience allow policy',
 ], 'customer-facing setup panel')
+requireAll(setupPanel, [
+  "key: 'cart-rate-callback'",
+  "label: 'Shopify cart-rate callback'",
+  "label: 'Exact POST callback URL'",
+  'copyable: true',
+  "label: 'Shopify registration'",
+  "value: 'write_shipping'",
+  'This is not an event webhook',
+  'no manual webhook topic subscriptions belong on this URL',
+  'Do not add it as an orders, products, inventory, or app event webhook.',
+  'Checkout rate carriers · select 1 or 2',
+  '<MenuItem value="">Not used for checkout rates</MenuItem>',
+  'carriers: selectedCarrierBindings',
+], 'one-or-two-carrier callback setup UI')
+requireAll(commercePanel, [
+  'Shopify event webhook setup',
+  'It is separate from the',
+  'CarrierService POST callback used for live cart and',
+  'Signed Shopify event webhook URL',
+  'Do not use this URL for Shopify CarrierService cart rates.',
+], 'event webhook and cart-rate callback distinction')
+
+requireAll(checkoutRatingPersistence, [
+  'input.carriers.length < 1',
+  'input.carriers.length > 2',
+  'Checkout carrier providers and accounts must be unique',
+  'current.carriers.length < 1',
+  'current.carriers.length > 2',
+  ').size !== current.carriers.length',
+], 'one-or-two-carrier application persistence fence')
+requireAll(callbackExecution, [
+  'account.carriers.length < 1',
+  'account.carriers.length > 2',
+  'providers.size === account.carriers.length',
+  'configuredProviders.size !== carriers.length',
+  'Checkout carrier configuration is not rate-ready',
+], 'one-or-two-carrier callback execution fence')
+requireAll(operationsPersistence, [
+  'carrierRows.rows.length < 1',
+  'carrierRows.rows.length > 2',
+  "row.carrier_provider !== 'ups_rest'",
+  "row.carrier_provider !== 'fedex_rest'",
+  ').size !== carrierRows.rows.length',
+  'one or two unique configured UPS or FedEx sandbox accounts',
+], 'one-or-two-carrier downstream Shadow execution fence')
+requireAll(configuredCarriersMigration, [
+  'CREATE OR REPLACE FUNCTION',
+  'operations_shopify_carrier_service_config_is_ready(',
+  "carrier_integration.provider IN ('ups_rest', 'fedex_rest')",
+  ') BETWEEN 1 AND 2',
+  'one or two selected unique verified UPS/FedEx bindings are ready',
+], 'one-or-two-carrier canonical database readiness')
+assert.doesNotMatch(
+  configuredCarriersMigration,
+  /selected\.carrier_provider = '(?:ups_rest|fedex_rest)'/u,
+  'canonical readiness must not require both provider names',
+)
+requireAll(healthRoute, [
+  'shopify_carrier_configured_carriers_applied',
+  '0285_shopify_carrier_service_configured_carriers.sql',
+  "'operations_shopify_carrier_service_config_is_ready(uuid,uuid)'",
+], 'configured-carrier migration health gate')
+requireAll(predeployVerification, [
+  'db/migrations/0285_shopify_carrier_service_configured_carriers.sql',
+], 'configured-carrier predeploy path gate')
 assert.equal(
   /[A-Z0-9._%+-]+@(?:episcs\.com|gmail\.com)/iu.test(setupPanel),
   false,
@@ -1145,8 +1218,9 @@ assert.ok(
   'callback URL must be authorization-gated before it enters setup state',
 )
 requireAll(setupPanel, [
-  'facts: setup?.callbackUrl ? [{',
-  "label: 'Callback URL'",
+  "key: 'cart-rate-callback'",
+  "label: 'Exact POST callback URL'",
+  'value: setup.callbackUrl',
   'setup && !setup.canActivate',
   'Owner or authorized administrator permission is required to view the',
   'callback URL or change registration state.',

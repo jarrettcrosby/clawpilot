@@ -1216,6 +1216,27 @@ async function verifyRuntime(connectionString) {
     assert.equal(delivered.status, 'delivered')
     assert.ok(delivered.deliveredAt)
     assert.equal(duplicateAck.status, 'delivered')
+    const deliveredReference = delivered.attemptHistory.find((attempt) => (
+      attempt.state === 'delivered'
+    ))?.deviceJobReference
+    assert.match(
+      deliveredReference,
+      /^local-device\.legacy\.v1\.redacted$/,
+    )
+    assert.doesNotMatch(deliveredReference, new RegExp(`device-${fixture.suffix}`))
+    const storedReference = await pool.query(
+      `SELECT attempt.device_job_reference
+       FROM operations_print_delivery_attempts attempt
+       JOIN operations_print_jobs job
+         ON job.organization_id = attempt.organization_id
+        AND job.id = attempt.print_job_id
+       WHERE job.organization_id = $1::uuid
+         AND job.global_id = $2
+         AND attempt.state = 'delivered'
+       LIMIT 1`,
+      [fixture.organizationId, queued.globalId],
+    )
+    assert.equal(storedReference.rows[0].device_job_reference, deliveredReference)
 
     const reprint = await persistence.reprintOperationsPrintJobInPostgres({
       organizationId: fixture.organizationId,
@@ -1998,6 +2019,203 @@ async function verifyRuntime(connectionString) {
   }
 }
 
+async function verifyDeviceReferencePrivacyMigration(connectionString) {
+  const pool = new Pool({ connectionString, connectionTimeoutMillis: 5_000 })
+  try {
+    const oldWriterTarget = await insertReturning(
+      pool,
+      `SELECT
+         job.organization_id::text,
+         job.id::text AS print_job_id,
+         job.printer_id::text,
+         job.claimed_by_print_agent_id::text AS print_agent_id,
+         job.current_claim_attempt_id::text AS claim_attempt_id
+       FROM operations_print_jobs job
+       WHERE job.status = 'claimed'
+         AND job.claimed_by_print_agent_id IS NOT NULL
+         AND job.current_claim_attempt_id IS NOT NULL
+       ORDER BY job.updated_at DESC, job.id
+       LIMIT 1`,
+    )
+    const oldWriterAttempt = await insertReturning(
+      pool,
+      `INSERT INTO operations_print_delivery_attempts (
+         organization_id, print_job_id, printer_id,
+         state, actor_type, print_agent_id, claim_attempt_id,
+         idempotency_key, request_fingerprint,
+         device_job_reference, delivery_evidence
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid,
+         'delivered', 'local_print_agent', $4::uuid, $5::uuid,
+         $6, $7, '192.168.4.199:9100', 'local_agent_acknowledgement'
+       )
+       RETURNING id::text, device_job_reference`,
+      [
+        oldWriterTarget.organization_id,
+        oldWriterTarget.print_job_id,
+        oldWriterTarget.printer_id,
+        oldWriterTarget.print_agent_id,
+        oldWriterTarget.claim_attempt_id,
+        `old-writer-device-reference-${randomUUID()}`,
+        createHash('sha256')
+          .update(`old-writer-device-reference:${randomUUID()}`)
+          .digest('hex'),
+      ],
+    )
+    assert.equal(
+      oldWriterAttempt.device_job_reference,
+      'local-device.legacy.v1.redacted',
+      'Migration guard must normalize a rolling-deploy old-writer insert',
+    )
+
+    const candidates = await pool.query(
+      `SELECT id::text
+       FROM operations_print_delivery_attempts
+       WHERE state = 'delivered'
+         AND device_job_reference IS NOT NULL
+       ORDER BY occurred_at, id
+       LIMIT 3`,
+    )
+    assert.equal(candidates.rowCount, 3)
+    const rawAttemptId = candidates.rows[0].id
+    const opaqueAttemptId = candidates.rows[1].id
+    const malformedOpaqueAttemptId = candidates.rows[2].id
+    const opaqueReference = `local-device.v1.${'A'.repeat(43)}`
+
+    await pool.query('BEGIN')
+    try {
+      await pool.query(
+        `ALTER TABLE operations_print_delivery_attempts
+           DISABLE TRIGGER protect_operations_print_delivery_attempt_write`,
+      )
+      await pool.query(
+        `UPDATE operations_print_delivery_attempts
+         SET device_job_reference = CASE id
+           WHEN $1::uuid THEN '192.168.4.146:9100'
+           WHEN $2::uuid THEN $4
+           WHEN $3::uuid THEN 'local-device.v1.not-valid'
+           ELSE device_job_reference
+         END
+         WHERE id IN ($1::uuid, $2::uuid, $3::uuid)`,
+        [rawAttemptId, opaqueAttemptId, malformedOpaqueAttemptId, opaqueReference],
+      )
+      await pool.query(
+        `ALTER TABLE operations_print_delivery_attempts
+           ENABLE TRIGGER protect_operations_print_delivery_attempt_write`,
+      )
+      await pool.query('COMMIT')
+    } catch (error) {
+      await pool.query('ROLLBACK')
+      throw error
+    }
+
+    const before = await pool.query(
+      `SELECT id::text, to_jsonb(attempt) - 'device_job_reference' AS invariant
+       FROM operations_print_delivery_attempts attempt
+       WHERE id IN ($1::uuid, $2::uuid, $3::uuid)
+       ORDER BY id`,
+      [rawAttemptId, opaqueAttemptId, malformedOpaqueAttemptId],
+    )
+    await pool.query('BEGIN')
+    try {
+      await pool.query(
+        read('db/migrations/0284_operations_print_device_reference_privacy.sql'),
+      )
+      await pool.query('COMMIT')
+    } catch (error) {
+      await pool.query('ROLLBACK')
+      throw error
+    }
+    const after = await pool.query(
+      `SELECT
+         id::text,
+         device_job_reference,
+         to_jsonb(attempt) - 'device_job_reference' AS invariant
+       FROM operations_print_delivery_attempts attempt
+       WHERE id IN ($1::uuid, $2::uuid, $3::uuid)
+       ORDER BY id`,
+      [rawAttemptId, opaqueAttemptId, malformedOpaqueAttemptId],
+    )
+    assert.deepEqual(
+      after.rows.map((row) => ({ id: row.id, invariant: row.invariant })),
+      before.rows,
+      'Privacy migration must preserve every attempt fact except the local device reference',
+    )
+    const byId = new Map(after.rows.map((row) => [row.id, row.device_job_reference]))
+    assert.equal(byId.get(rawAttemptId), 'local-device.legacy.v1.redacted')
+    assert.equal(byId.get(opaqueAttemptId), opaqueReference)
+    assert.equal(
+      byId.get(malformedOpaqueAttemptId),
+      'local-device.legacy.v1.redacted',
+    )
+
+    const privacyEvidence = await pool.query(
+      `SELECT
+         NOT EXISTS (
+           SELECT 1
+           FROM operations_print_delivery_attempts
+           WHERE device_job_reference IS NOT NULL
+             AND NOT (
+               device_job_reference ~
+                 '^local-device[.]v1[.][A-Za-z0-9_-]{43}$'
+               OR device_job_reference = 'local-device.legacy.v1.redacted'
+             )
+         ) AS no_raw_references,
+         EXISTS (
+           SELECT 1
+           FROM schema_migrations
+           WHERE filename =
+             '0284_operations_print_device_reference_privacy.sql'
+             AND checksum ~ '^[0-9a-f]{64}$'
+         ) AS migration_recorded,
+         EXISTS (
+           SELECT 1
+           FROM pg_trigger guard
+           WHERE guard.tgrelid =
+             to_regclass('operations_print_delivery_attempts')
+             AND guard.tgname =
+               'protect_operations_print_delivery_attempt_write'
+             AND guard.tgfoid =
+               to_regprocedure('protect_operations_append_only()')
+             AND NOT guard.tgisinternal
+             AND guard.tgenabled = 'O'
+             AND guard.tgtype = 27
+         ) AS guard_enabled,
+         EXISTS (
+           SELECT 1
+           FROM pg_trigger normalization_guard
+           WHERE normalization_guard.tgrelid =
+             to_regclass('operations_print_delivery_attempts')
+             AND normalization_guard.tgname =
+               'normalize_operations_print_delivery_device_reference_write'
+             AND normalization_guard.tgfoid = to_regprocedure(
+               'normalize_operations_print_delivery_device_reference()'
+             )
+             AND NOT normalization_guard.tgisinternal
+             AND normalization_guard.tgenabled = 'O'
+             AND normalization_guard.tgtype = 7
+         ) AS normalization_guard_enabled`,
+    )
+    assert.deepEqual(privacyEvidence.rows[0], {
+      no_raw_references: true,
+      migration_recorded: true,
+      guard_enabled: true,
+      normalization_guard_enabled: true,
+    })
+    await expectRejected(
+      () => pool.query(
+        `UPDATE operations_print_delivery_attempts
+         SET device_job_reference = 'must-not-write'
+         WHERE id = $1::uuid`,
+        [rawAttemptId],
+      ),
+      /append-only/i,
+    )
+  } finally {
+    await pool.end()
+  }
+}
+
 async function main() {
   command('docker', ['info'], { timeout: 30_000 })
   const container = `clawpilot-print-agent-runtime-${process.pid}-${randomUUID().slice(0, 8)}`
@@ -2022,6 +2240,7 @@ async function main() {
     await verifyLegacyPrinterNormalization(connectionString)
     await verifyAgentCapabilityBackfill(connectionString)
     await verifyRuntime(connectionString)
+    await verifyDeviceReferencePrivacyMigration(connectionString)
   } finally {
     spawnSync('docker', ['stop', '-t', '1', container], {
       cwd: root,

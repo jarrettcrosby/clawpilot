@@ -5723,9 +5723,9 @@ export default function OperationsSection({
             <Stack spacing={2}>
               <Alert severity="warning">
                 This rerates every exact sealed package as one shipment with the
-                configured UPS and FedEx sandbox accounts. It stores immutable
-                checkout, pre-label fulfillment, variance, and carrier-attempt
-                evidence only.
+                one or two carriers selected in the Shopify callback setup. It
+                stores immutable checkout, pre-label fulfillment, variance, and
+                carrier-attempt evidence only.
               </Alert>
               <Alert severity="info">
                 No shipment, tracking number, carrier label, postage purchase,

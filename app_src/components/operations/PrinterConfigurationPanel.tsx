@@ -417,6 +417,12 @@ export default function PrinterConfigurationPanel() {
   } | null>(null)
   const [credential, setCredential] = useState('')
   const [barcodeLabelsOpen, setBarcodeLabelsOpen] = useState(false)
+  const [pairingBaseUrl, setPairingBaseUrl] = useState('https://dev.aiapp.eigenracing.com')
+  const pairingCommand = `npm run print-agent:pair:macos -- --base-url '${pairingBaseUrl}'`
+
+  useEffect(() => {
+    setPairingBaseUrl(window.location.origin)
+  }, [])
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true)
@@ -1452,7 +1458,7 @@ export default function PrinterConfigurationPanel() {
                         </Typography>
                         {attempt.deviceJobReference && (
                           <Typography variant="caption" color="text.secondary" display="block">
-                            Device job: {attempt.deviceJobReference}
+                            Local device reference: {attempt.deviceJobReference}
                           </Typography>
                         )}
                         {attempt.deliveryEvidence && (
@@ -2005,24 +2011,67 @@ export default function PrinterConfigurationPanel() {
       <Dialog open={Boolean(credential)} onClose={() => setCredential('')} fullWidth maxWidth="sm">
         <DialogTitle>One-time agent credential</DialogTitle>
         <DialogContent dividers>
-          <Alert severity="warning">
-            This credential is shown once. Rotate it if this dialog closes before the local agent is configured.
-          </Alert>
-          <Box
-            component="pre"
-            sx={{
-              mt: 2,
-              mb: 0,
-              p: 1.5,
-              border: '1px solid rgba(255,255,255,0.15)',
-              borderRadius: '6px',
-              overflowWrap: 'anywhere',
-              whiteSpace: 'pre-wrap',
-              fontSize: '0.8rem',
-            }}
-          >
-            {credential}
-          </Box>
+          <Stack spacing={2}>
+            <Alert severity="warning">
+              This credential is shown once. Rotate it if this dialog closes before the local agent is configured.
+            </Alert>
+            <Box
+              component="pre"
+              sx={{
+                m: 0,
+                p: 1.5,
+                border: '1px solid rgba(255,255,255,0.15)',
+                borderRadius: '6px',
+                overflowWrap: 'anywhere',
+                whiteSpace: 'pre-wrap',
+                fontSize: '0.8rem',
+              }}
+            >
+              {credential}
+            </Box>
+            <Divider />
+            <Box>
+              <Typography fontWeight={700}>Connect on this Mac</Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                Run this from the ClawPilot checkout on the always-on Mac. The local pairing
+                command securely prompts for this credential, a unique workspace instance
+                name, and the printer hostname or IP. The printer IP stays on this Mac and is
+                never submitted to the hosted printer-configuration API.
+              </Typography>
+              <Box
+                component="pre"
+                sx={{
+                  mt: 1,
+                  mb: 1,
+                  p: 1.5,
+                  border: '1px solid rgba(255,255,255,0.15)',
+                  borderRadius: '6px',
+                  overflowWrap: 'anywhere',
+                  whiteSpace: 'pre-wrap',
+                  fontSize: '0.8rem',
+                }}
+              >
+                {pairingCommand}
+              </Box>
+              <Button
+                size="small"
+                variant="outlined"
+                startIcon={<ContentCopyRounded />}
+                onClick={() => void navigator.clipboard.writeText(pairingCommand)}
+              >
+                Copy Mac pairing command
+              </Button>
+            </Box>
+            <Box>
+              <Typography fontWeight={700}>Pair another workspace</Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                Enroll an agent in that workspace and repeat pairing with a different local
+                instance name and that workspace&apos;s credential. You may enter the same local
+                printer IP; each workspace keeps its own agent identity, Keychain credential,
+                delivery ledger, and logical printer profile.
+              </Typography>
+            </Box>
+          </Stack>
         </DialogContent>
         <DialogActions>
           <Button

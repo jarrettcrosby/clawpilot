@@ -489,6 +489,8 @@ export async function GET() {
           operations_carrier_billing_integrity_migration_applied: boolean
           operations_carrier_billing_review_migration_applied: boolean
           operations_print_delivery_migration_applied: boolean
+          operations_print_device_reference_privacy_applied: boolean
+          shopify_carrier_configured_carriers_applied: boolean
           crm_native_activity_projection_migration_applied: boolean
           crm_contact_identity_aliases_migration_applied: boolean
           operations_settlement_lifecycle_migration_applied: boolean
@@ -2817,6 +2819,52 @@ export async function GET() {
                 )
               )
                 AS operations_shopify_order_management_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0284_operations_print_device_reference_privacy.sql'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger print_delivery_guard
+                WHERE print_delivery_guard.tgrelid =
+                  to_regclass('operations_print_delivery_attempts')
+                  AND print_delivery_guard.tgname =
+                    'protect_operations_print_delivery_attempt_write'
+                  AND print_delivery_guard.tgfoid =
+                    to_regprocedure('protect_operations_append_only()')
+                  AND NOT print_delivery_guard.tgisinternal
+                  AND print_delivery_guard.tgenabled = 'O'
+                  AND print_delivery_guard.tgtype = 27
+              )
+              AND to_regprocedure(
+                'normalize_operations_print_delivery_device_reference()'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger print_device_reference_guard
+                WHERE print_device_reference_guard.tgrelid =
+                  to_regclass('operations_print_delivery_attempts')
+                  AND print_device_reference_guard.tgname =
+                    'normalize_operations_print_delivery_device_reference_write'
+                  AND print_device_reference_guard.tgfoid = to_regprocedure(
+                    'normalize_operations_print_delivery_device_reference()'
+                  )
+                  AND NOT print_device_reference_guard.tgisinternal
+                  AND print_device_reference_guard.tgenabled = 'O'
+                  AND print_device_reference_guard.tgtype = 7
+              ) AS operations_print_device_reference_privacy_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0285_shopify_carrier_service_configured_carriers.sql'
+              )
+              AND to_regprocedure(
+                'operations_shopify_carrier_service_config_is_ready(uuid,uuid)'
+              ) IS NOT NULL
+                AS shopify_carrier_configured_carriers_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -2921,6 +2969,8 @@ export async function GET() {
             && row?.operations_carrier_billing_integrity_migration_applied
             && row?.operations_carrier_billing_review_migration_applied
             && row?.operations_print_delivery_migration_applied
+            && row?.operations_print_device_reference_privacy_applied
+            && row?.shopify_carrier_configured_carriers_applied
             && row?.crm_native_activity_projection_migration_applied
             && row?.crm_contact_identity_aliases_migration_applied
             && row?.operations_settlement_lifecycle_migration_applied
@@ -3293,6 +3343,8 @@ export async function GET() {
           || !row?.operations_carrier_billing_integrity_migration_applied
           || !row?.operations_carrier_billing_review_migration_applied
           || !row?.operations_print_delivery_migration_applied
+          || !row?.operations_print_device_reference_privacy_applied
+          || !row?.shopify_carrier_configured_carriers_applied
           || !row?.crm_native_activity_projection_migration_applied
           || !row?.crm_contact_identity_aliases_migration_applied
           || !row?.operations_settlement_lifecycle_migration_applied

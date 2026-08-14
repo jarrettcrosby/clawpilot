@@ -768,8 +768,8 @@ Otherwise an existing non-matched immutable decision remains
 warehouse-ineligible.
 
 The development callback has a sandbox-only checkout execution boundary:
-the Shopify account and the exact configured UPS and FedEx carrier accounts
-must all be sandbox identities before setup can become ready, registration can
+the Shopify account and the one or two selected unique configured UPS/FedEx
+carrier accounts must all be sandbox identities before setup can become ready, registration can
 be finalized, or a callback can rate. Production registration and checkout
 rating remain unsupported; an exact production CarrierService delete remains
 available only for removal and reconciliation. Receipt reuse is fenced by the
@@ -1530,7 +1530,7 @@ an eligible packed Shopify order while Operations remains in Shadow. **Prepare
 shipment in Shadow** revalidates the exact current Shopify reconciliation
 receipt, canonical lines, accepted fulfillment plan, complete package
 allocations, checkout pack/rate evidence, current warehouse and credential
-bindings, and configured UPS and FedEx sandbox accounts. Carrier reads occur
+bindings, and one or two selected unique configured UPS/FedEx sandbox accounts. Carrier reads occur
 outside the database transaction; every configured eligible sandbox carrier is
 attempted once with the same complete package array. Finalization then rechecks
 drift, selects one successful carrier/service for the entire shipment, records

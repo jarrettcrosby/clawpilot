@@ -1250,7 +1250,9 @@ export async function readOneOffShipmentWorkspaceFromPostgres(input: {
         blockers: [
           ...(oneOffRateEnvironment() === 'production'
             ? []
-            : ['Live postage is available only in the production runtime']),
+            : [
+                'Live postage is available only in production or the trusted Railway development service',
+              ]),
           ...(resolvedActivation.state === 'active'
             ? []
             : ['Activate Operations before buying live postage']),
@@ -2768,7 +2770,7 @@ export async function quoteOneOffShipmentInPostgres(input: {
   if (quote.executionMode === 'live' && oneOffRateEnvironment() !== 'production') {
     requestError(
       'OPERATIONS_ONE_OFF_LIVE_RUNTIME_REQUIRED',
-      'Live carrier rating and postage are available only in the production runtime',
+      'Live carrier rating and postage are available only in production or the trusted Railway development service',
       409,
     )
   }

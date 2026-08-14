@@ -1302,6 +1302,43 @@ assert.deepEqual(
     { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000001' },
   ],
 )
+for (const carrier of validConfig.carriers) {
+  const oneCarrier = normalizeShopifyCarrierServiceConfigInput({
+    ...validConfig,
+    carriers: [carrier],
+  })
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(oneCarrier.carriers)),
+    [carrier],
+    `${carrier.provider} must be independently valid for checkout rating`,
+  )
+}
+assert.throws(
+  () => normalizeShopifyCarrierServiceConfigInput({
+    ...validConfig,
+    carriers: [],
+  }),
+  (error) => (
+    error instanceof ShopifyCheckoutRatingPersistenceError
+    && error.code === 'SHOPIFY_CHECKOUT_CARRIER_BINDINGS_INVALID'
+  ),
+)
+assert.throws(
+  () => normalizeShopifyCarrierServiceConfigInput({
+    ...validConfig,
+    carriers: [
+      validConfig.carriers[0],
+      {
+        provider: 'ups_rest',
+        carrierAccountGlobalId: 'gac0000002',
+      },
+    ],
+  }),
+  (error) => (
+    error instanceof ShopifyCheckoutRatingPersistenceError
+    && error.code === 'SHOPIFY_CHECKOUT_CARRIER_BINDINGS_INVALID'
+  ),
+)
 assert.throws(
   () => normalizeShopifyCarrierServiceConfigInput({
     ...validConfig,

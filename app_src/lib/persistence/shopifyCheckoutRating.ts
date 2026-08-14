@@ -1581,31 +1581,49 @@ export function normalizeShopifyCarrierServiceConfigInput(
       ),
     }
   })
-  if (!Array.isArray(input.carriers) || input.carriers.length !== 2) {
-    fail(
-      'SHOPIFY_CHECKOUT_CARRIER_BINDINGS_INVALID',
-      'Exactly one UPS and one FedEx carrier account are required',
-    )
-  }
-  const carriers = input.carriers.map((binding) => ({
-    provider: binding.provider,
-    carrierAccountGlobalId: matchValue(
-      binding.carrierAccountGlobalId,
-      CARRIER_ACCOUNT_GLOBAL_ID,
-      'Carrier account Global ID',
-    ),
-  })).sort((left, right) => left.provider.localeCompare(right.provider))
   if (
-    carriers[0]?.provider !== 'fedex_rest'
-    || carriers[1]?.provider !== 'ups_rest'
-    || carriers[0].carrierAccountGlobalId
-      === carriers[1].carrierAccountGlobalId
+    !Array.isArray(input.carriers)
+    || input.carriers.length < 1
+    || input.carriers.length > 2
   ) {
     fail(
       'SHOPIFY_CHECKOUT_CARRIER_BINDINGS_INVALID',
-      'Exactly one distinct UPS and one distinct FedEx account are required',
+      'Select one or two configured UPS or FedEx carrier accounts',
     )
   }
+  const providerIds = new Set<ShopifyCheckoutCarrierProvider>()
+  const carrierAccountIds = new Set<string>()
+  const carriers = input.carriers.map((binding) => {
+    if (
+      binding?.provider !== 'ups_rest'
+      && binding?.provider !== 'fedex_rest'
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_CARRIER_BINDINGS_INVALID',
+        'Checkout carriers must be configured UPS or FedEx accounts',
+      )
+    }
+    const carrierAccountGlobalId = matchValue(
+      binding.carrierAccountGlobalId,
+      CARRIER_ACCOUNT_GLOBAL_ID,
+      'Carrier account Global ID',
+    )
+    if (
+      providerIds.has(binding.provider)
+      || carrierAccountIds.has(carrierAccountGlobalId)
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_CARRIER_BINDINGS_INVALID',
+        'Checkout carrier providers and accounts must be unique',
+      )
+    }
+    providerIds.add(binding.provider)
+    carrierAccountIds.add(carrierAccountGlobalId)
+    return {
+      provider: binding.provider,
+      carrierAccountGlobalId,
+    }
+  }).sort((left, right) => left.provider.localeCompare(right.provider))
   const inventoryMaxAgeSeconds = integer(
     input.inventoryMaxAgeSeconds,
     'Inventory maximum age',
@@ -3925,7 +3943,15 @@ export async function finalizeShopifyCarrierServiceRegistrationInPostgres(
       ['shadow_simulated', 'registered'].includes(input.registrationState)
       && (
         current.accountEnvironment !== 'sandbox'
-        || current.carriers.length !== 2
+        || current.carriers.length < 1
+        || current.carriers.length > 2
+        || new Set(
+          current.carriers.map((carrier) => carrier.provider),
+        ).size !== current.carriers.length
+        || current.carriers.some((carrier) => (
+          carrier.provider !== 'ups_rest'
+          && carrier.provider !== 'fedex_rest'
+        ))
         || current.carriers.some(
           (carrier) => carrier.environment !== 'sandbox',
         )

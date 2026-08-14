@@ -6056,13 +6056,20 @@ async function readShadowExecutionContext(
     ],
   )
   if (
-    carrierRows.rows.length !== 2
+    carrierRows.rows.length < 1
+    || carrierRows.rows.length > 2
     || carrierRows.rows.some((row) => row.environment !== 'sandbox')
-    || new Set(carrierRows.rows.map((row) => row.carrier_provider)).size !== 2
+    || carrierRows.rows.some((row) => (
+      row.carrier_provider !== 'ups_rest'
+      && row.carrier_provider !== 'fedex_rest'
+    ))
+    || new Set(
+      carrierRows.rows.map((row) => row.carrier_provider),
+    ).size !== carrierRows.rows.length
   ) {
     throw new OperationsRequestError(
       'OPERATIONS_SHADOW_CARRIERS_NOT_READY',
-      'Shadow execution requires the configured UPS and FedEx sandbox accounts',
+      'Shadow execution requires one or two unique configured UPS or FedEx sandbox accounts',
       409,
     )
   }

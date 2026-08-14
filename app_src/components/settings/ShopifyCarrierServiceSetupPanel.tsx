@@ -567,6 +567,13 @@ export default function ShopifyCarrierServiceSetupPanel({
     ),
     [setup],
   )
+  const selectedCarrierBindings = (['ups_rest', 'fedex_rest'] as const)
+    .flatMap((provider) => carrierAccounts[provider]
+      ? [{
+          provider,
+          carrierAccountGlobalId: carrierAccounts[provider],
+        }]
+      : [])
   const bindingsReady = Boolean(
     warehouseGlobalId
     && materialGlobalIds.length >= 1
@@ -574,8 +581,14 @@ export default function ShopifyCarrierServiceSetupPanel({
     && materialGlobalIds.every((globalId) => (
       eligibleMaterials.some((material) => material.globalId === globalId)
     ))
-    && carrierAccounts.ups_rest
-    && carrierAccounts.fedex_rest
+    && selectedCarrierBindings.length >= 1
+    && selectedCarrierBindings.length <= 2
+    && selectedCarrierBindings.every((binding) => (
+      environmentCarriers.some((carrier) => (
+        carrier.globalId === binding.carrierAccountGlobalId
+        && carrier.provider === binding.provider
+      ))
+    ))
   )
   const registered = setup?.config?.registrationState === 'registered'
   const activeRevisionBindingRequired = Boolean(
@@ -686,10 +699,7 @@ export default function ShopifyCarrierServiceSetupPanel({
         expectedRowVersion: material?.rowVersion,
       }
     }),
-    carriers: (['ups_rest', 'fedex_rest'] as const).map((provider) => ({
-      provider,
-      carrierAccountGlobalId: carrierAccounts[provider],
-    })),
+    carriers: selectedCarrierBindings,
     inventoryMaxAgeSeconds: 900,
     quoteTtlSeconds: 900,
     orderReconciliationWindowSeconds: 86400,
@@ -792,15 +802,24 @@ export default function ShopifyCarrierServiceSetupPanel({
         </Button>
       </Box>
 
+      <Box>
+        <Typography variant="body2" fontWeight={700}>
+          Checkout rate carriers · select 1 or 2
+        </Typography>
+        <Typography variant="caption" color="text.secondary">
+          Choose UPS, FedEx, or both. Each selected account must be active,
+          verified, and in the same sandbox environment as this Shopify store.
+        </Typography>
+      </Box>
       <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
         {(['ups_rest', 'fedex_rest'] as const).map((provider) => (
           <FormControl size="small" fullWidth key={provider}>
             <InputLabel id={`${provider}-${accountGlobalId}`}>
-              {providerLabel(provider)} account
+              {providerLabel(provider)} account (optional)
             </InputLabel>
             <Select
               labelId={`${provider}-${accountGlobalId}`}
-              label={`${providerLabel(provider)} account`}
+              label={`${providerLabel(provider)} account (optional)`}
               value={carrierAccounts[provider]}
               disabled={Boolean(registered) || Boolean(busy)}
               onChange={(event) => setCarrierAccounts((current) => ({
@@ -808,6 +827,7 @@ export default function ShopifyCarrierServiceSetupPanel({
                 [provider]: event.target.value,
               }))}
             >
+              <MenuItem value="">Not used for checkout rates</MenuItem>
               {environmentCarriers
                 .filter((carrier) => carrier.provider === provider)
                 .map((carrier) => (
@@ -1121,7 +1141,7 @@ export default function ShopifyCarrierServiceSetupPanel({
       key: 'bindings',
       label: 'Choose warehouse, materials, and carrier accounts',
       description:
-        'This exact revision controls inventory freshness, cartonization, and a single whole-shipment request to each configured carrier.',
+        'This exact revision controls inventory freshness, cartonization, and a single whole-shipment request to each of one or two selected carriers.',
       state: stepState(
         Boolean(setup?.config),
         Boolean(connectionReady),
@@ -1129,6 +1149,47 @@ export default function ShopifyCarrierServiceSetupPanel({
       ),
       action: configAction,
     },
+    ...(setup?.config ? [{
+      key: 'cart-rate-callback',
+      label: 'Shopify cart-rate callback',
+      description:
+        'Shopify sends an HTTPS POST to this exact CarrierService endpoint while calculating cart and checkout shipping rates. This is not an event webhook, and no manual webhook topic subscriptions belong on this URL.',
+      state: stepState(
+        Boolean(
+          registered
+          && setup.config.serviceGid
+          && setup.callbackUrl,
+        ),
+        Boolean(setup.callbackUrl),
+        Boolean(!setup.callbackUrl),
+      ),
+      facts: [
+        ...(setup.callbackUrl ? [{
+          label: 'Exact POST callback URL',
+          value: setup.callbackUrl,
+          copyable: true,
+        }] : []),
+        {
+          label: 'Shopify registration',
+          value: registered
+            ? `Registered · ${setup.config.serviceGid || 'ID unavailable'}`
+            : setup.config.registrationState === 'shadow_simulated'
+              ? 'Simulated · authorization still required'
+              : 'Not registered',
+        },
+        {
+          label: 'Required Shopify scope',
+          value: 'write_shipping',
+        },
+      ],
+      action: (
+        <Alert severity={registered ? 'success' : 'info'}>
+          {registered
+            ? 'Shopify has this callback registered on the exact CarrierService shown above. Cart and checkout rate requests use POST automatically.'
+            : 'ClawPilot registers this URL on a Shopify CarrierService only after the zero-write simulation and one-time authorization below. Do not add it as an orders, products, inventory, or app event webhook.'}
+        </Alert>
+      ),
+    }] : []),
     ...(setup?.config ? [{
       key: 'carrier-service-name',
       label: registered
@@ -1428,11 +1489,7 @@ export default function ShopifyCarrierServiceSetupPanel({
         Boolean(simulated),
         Boolean(recoveryRequired),
       ),
-      facts: setup?.callbackUrl ? [{
-        label: 'Callback URL',
-        value: setup.callbackUrl,
-        copyable: true,
-      }] : [],
+      facts: [],
       action: (
         <Stack spacing={1}>
           <Alert severity="warning">

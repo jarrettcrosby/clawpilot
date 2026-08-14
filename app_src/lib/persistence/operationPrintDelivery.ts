@@ -414,6 +414,18 @@ function contentHash(value: string | Buffer) {
   return crypto.createHash('sha256').update(value).digest('hex')
 }
 
+const OPAQUE_LOCAL_DEVICE_REFERENCE = /^local-device\.v1\.[A-Za-z0-9_-]{43}$/
+export const REDACTED_LEGACY_LOCAL_DEVICE_REFERENCE = 'local-device.legacy.v1.redacted'
+
+export function normalizeOperationsLocalDeviceReference(
+  value: string | null | undefined,
+) {
+  const reference = String(value || '').trim()
+  if (!reference) return null
+  if (OPAQUE_LOCAL_DEVICE_REFERENCE.test(reference)) return reference
+  return REDACTED_LEGACY_LOCAL_DEVICE_REFERENCE
+}
+
 function strictBase64Bytes(value: string) {
   const encoded = value.replace(/\s+/g, '')
   const unpadded = encoded.replace(/=+$/, '')
@@ -730,6 +742,9 @@ function jobItem(row: PrintJobRow): OperationsPrintJobListItem {
     enqueuedBy: row.enqueued_by,
     attemptHistory: (row.attempt_history || []).map((attempt) => ({
       ...attempt,
+      deviceJobReference: normalizeOperationsLocalDeviceReference(
+        attempt.deviceJobReference,
+      ),
       occurredAt: iso(attempt.occurredAt) as string,
     })),
     createdAt: iso(row.created_at) as string,
@@ -3987,21 +4002,26 @@ export async function acknowledgeOperationsPrintJobInPostgres(input: {
   }
   const callerKey = requiredIdempotencyKey(input.idempotencyKey)
   const idempotencyKey = `print-agent:${input.agent.globalId}:ack:${callerKey}`
-  const deviceJobReference = String(input.deviceJobReference || '').trim()
+  const suppliedDeviceJobReference = String(input.deviceJobReference || '').trim()
   if (
-    deviceJobReference.length > 200
-    || /[\u0000-\u001f\u007f]/.test(deviceJobReference)
+    suppliedDeviceJobReference.length > 200
+    || /[\u0000-\u001f\u007f]/.test(suppliedDeviceJobReference)
   ) {
     throw new OperationsRequestError(
       'OPERATIONS_PRINT_DEVICE_REFERENCE_INVALID',
       'Device job reference is invalid',
     )
   }
+  const deviceJobReference = normalizeOperationsLocalDeviceReference(
+    suppliedDeviceJobReference,
+  )
   const requestFingerprint = fingerprint({
     action: 'acknowledge',
     jobGlobalId: input.jobGlobalId,
     claimToken: input.claimToken,
-    deviceJobReference: deviceJobReference || null,
+    // Preserve the caller's canonical request hash so an acknowledgement made
+    // by an older runtime can still replay after endpoint redaction ships.
+    deviceJobReference: suppliedDeviceJobReference || null,
   })
   return withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
@@ -4042,7 +4062,7 @@ export async function acknowledgeOperationsPrintJobInPostgres(input: {
         input.claimToken,
         idempotencyKey,
         requestFingerprint,
-        deviceJobReference || null,
+        deviceJobReference,
       ],
     )
     await client.query(

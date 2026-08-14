@@ -120,6 +120,7 @@ type CarrierPayload = {
   canReconcile?: boolean
   canRevealCredentials?: boolean
   productionLabelAuthorizationAllowed?: boolean
+  productionLabelRuntimeLane?: 'production' | 'railway_development' | null
   integrations?: CarrierIntegrationsState
   rateTest?: CarrierSandboxRateTest
   rateTestLabel?: CarrierRateTestLabel
@@ -490,6 +491,9 @@ export default function CarrierIntegrationPanel({
   const [canRevealCredentials, setCanRevealCredentials] = useState(false)
   const [productionLabelAuthorizationAllowed, setProductionLabelAuthorizationAllowed] =
     useState(false)
+  const [productionLabelRuntimeLane, setProductionLabelRuntimeLane] = useState<
+    'production' | 'railway_development' | null
+  >(null)
   const [revealedCredential, setRevealedCredential] = useState<RevealedCarrierCredential | null>(null)
   const [livePostageReason, setLivePostageReason] = useState('')
   const [livePostageConfirmation, setLivePostageConfirmation] = useState('')
@@ -705,6 +709,7 @@ export default function CarrierIntegrationPanel({
         setProductionLabelAuthorizationAllowed(
           result.productionLabelAuthorizationAllowed === true,
         )
+        setProductionLabelRuntimeLane(result.productionLabelRuntimeLane || null)
         setCanExecute(result.canExecute === true)
         setCanReconcile(result.canReconcile === true)
         if (result.rateTestLabels) setRateTestLabels(result.rateTestLabels)
@@ -1472,8 +1477,14 @@ export default function CarrierIntegrationPanel({
               color={productionLabelAuthorizationAllowed && livePostageAuthorized ? 'warning' : 'default'}
               variant="outlined"
               label={productionLabelAuthorizationAllowed
-                ? livePostageAuthorized ? 'Live postage authorized' : 'Live postage off'
-                : 'Live postage locked on development'}
+                ? livePostageAuthorized
+                  ? productionLabelRuntimeLane === 'railway_development'
+                    ? 'Railway dev live postage authorized'
+                    : 'Live postage authorized'
+                  : productionLabelRuntimeLane === 'railway_development'
+                    ? 'Railway dev live postage off'
+                    : 'Live postage off'
+                : 'Live postage unavailable in this runtime'}
             />
           </Stack>
           <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
@@ -1483,12 +1494,21 @@ export default function CarrierIntegrationPanel({
           </Typography>
           {!productionLabelAuthorizationAllowed ? (
             <Typography variant="caption" color="text.disabled" display="block" sx={{ mt: 0.5 }}>
-              Development can select and use production rating, but cannot authorize production labels.
-              Label creation remains sandbox-only.
+              Production labels can be authorized only in production or the trusted Railway development
+              service. Vercel previews and local/browser-only runtimes remain blocked.
               {livePostageAuthorized
                 ? ' A stored authorization is ignored here and can only be revoked below.'
                 : ''}
             </Typography>
+          ) : null}
+          {productionLabelRuntimeLane === 'railway_development' ? (
+            <Alert severity="warning" sx={{ mt: 1, borderRadius: '8px' }}>
+              <Typography variant="caption">
+                Railway development uses the selected production UPS or FedEx connection. A successful
+                whole-shipment purchase creates real production postage and may incur charges. Use only an
+                approved packed test order, then void the complete group through ClawPilot.
+              </Typography>
+            </Alert>
           ) : null}
           {canRevealCredentials
           && (productionLabelAuthorizationAllowed || livePostageAuthorized) ? (

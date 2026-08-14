@@ -169,6 +169,28 @@ test('rates the complete package set exactly once per configured carrier', async
   )
 })
 
+test('rates one configured carrier without requiring the other provider', async () => {
+  const calls: string[] = []
+  const response = await rateCheckoutShipment({
+    destination,
+    parcels,
+    carriers: [carriers[0]!],
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    invoke: async (selection) => {
+      calls.push(selection.provider)
+      return result(selection, '42.85')
+    },
+  })
+
+  assert.deepEqual(calls, ['ups_rest'])
+  assert.deepEqual(response.configuredProviders, ['ups_rest'])
+  assert.deepEqual(response.successfulProviders, ['ups_rest'])
+  assert.equal(response.providerAttempts.length, 1)
+  assert.equal(response.offers.length, 1)
+  assert.equal(response.offers[0]?.carrierCode, 'ups')
+})
+
 function optimizedResult(
   selection: CheckoutRateCarrierSelection,
   packageCount: number,

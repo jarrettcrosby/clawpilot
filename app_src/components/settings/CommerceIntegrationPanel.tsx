@@ -2558,22 +2558,26 @@ export default function CommerceIntegrationPanel() {
                       {account.provider === 'shopify' && account.webhookUrl ? (
                         <Box>
                           <Typography variant="subtitle2" fontWeight={700}>
-                            Signed receipt setup
+                            Shopify event webhook setup
                           </Typography>
                           <Typography
                             variant="body2"
                             color="text.secondary"
                             sx={{ mb: 1 }}
                           >
-                            Use the account-specific URL below for shop-specific
-                            webhook subscriptions. Test connection performs a
+                            Use the account-specific URL below only for Shopify
+                            event subscriptions such as app scope, inventory,
+                            and product changes. It is separate from the
+                            CarrierService POST callback used for live cart and
+                            checkout rates above. Test connection performs a
                             live, read-only discovery and reports whether every
-                            required subscription points to this exact URL. One
-                            valid signed delivery separately verifies the stored
-                            app secret; neither check writes to Shopify. Run Test
-                            connection at least every 24 hours until automated
-                            subscription rediscovery is available; readiness
-                            fails closed when that evidence expires.
+                            required event subscription points to this exact
+                            URL. One valid signed delivery separately verifies
+                            the stored app secret; neither check writes to
+                            Shopify. Run Test connection at least every 24 hours
+                            until automated subscription rediscovery is
+                            available; readiness fails closed when that evidence
+                            expires.
                           </Typography>
                           <Stack spacing={1} sx={{ mb: 1 }}>
                             {webhookSubscriptionGroups.map((group) => (
@@ -2598,7 +2602,7 @@ export default function CommerceIntegrationPanel() {
                             <AccordionSummary expandIcon={<ExpandMoreRounded />}>
                               <Box>
                                 <Typography variant="subtitle2" fontWeight={700}>
-                                  Webhook setup plan
+                                  Event webhook setup plan
                                 </Typography>
                                 <Typography variant="caption" color="text.secondary">
                                   Provider registration and ClawPilot processing readiness are tracked separately.
@@ -2640,10 +2644,10 @@ export default function CommerceIntegrationPanel() {
                           >
                             <TextField
                               fullWidth
-                              label="Signed webhook receipt URL"
+                              label="Signed Shopify event webhook URL"
                               value={account.webhookUrl}
                               InputProps={{ readOnly: true }}
-                              helperText="Core order topics use a separate payload-free exact-read lane. Customer-bearing topics remain rejected until their protected-data lifecycle is implemented."
+                              helperText="Do not use this URL for Shopify CarrierService cart rates. Core order topics use a separate payload-free exact-read lane. Customer-bearing topics remain rejected until their protected-data lifecycle is implemented."
                               sx={fieldSx}
                             />
                             <Button

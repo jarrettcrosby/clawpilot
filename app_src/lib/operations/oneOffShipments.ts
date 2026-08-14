@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { carrierProductionLabelAuthorizationAllowed } from '@/lib/integrations/carrierProductionLabelRuntime'
 import type { Address, Millimeters } from '@/lib/operations/types'
 import type { CanonicalPackageProfile } from '@/lib/operations/packageCatalog'
 
@@ -335,11 +336,7 @@ export function canonicalOneOffCarrierSelections<
 export function oneOffRateEnvironment(
   environment: Record<string, string | undefined> = process.env,
 ): OneOffRateEnvironment {
-  const value = String(
-    environment.CLAWPILOT_ENV
-    || environment.RAILWAY_ENVIRONMENT_NAME
-    || environment.VERCEL_ENV
-    || '',
-  ).trim().toLowerCase()
-  return value === 'production' ? 'production' : 'sandbox'
+  return carrierProductionLabelAuthorizationAllowed(environment)
+    ? 'production'
+    : 'sandbox'
 }

@@ -204,7 +204,8 @@ function sandboxCheckoutAccountIsReady(
   if (
     !account
     || account.environment !== 'sandbox'
-    || account.carriers.length !== 2
+    || account.carriers.length < 1
+    || account.carriers.length > 2
   ) {
     return false
   }
@@ -215,9 +216,10 @@ function sandboxCheckoutAccountIsReady(
   }
   const providers = new Set(account.carriers.map((carrier) => carrier.provider))
   return (
-    providers.size === 2
-    && providers.has('ups_rest')
-    && providers.has('fedex_rest')
+    providers.size === account.carriers.length
+    && [...providers].every(
+      (provider) => provider === 'ups_rest' || provider === 'fedex_rest',
+    )
     && account.carriers.every((carrier) => (
       carrier.environment === 'sandbox'
       && carrier.accountStatus === 'active'
@@ -1429,10 +1431,16 @@ export async function executeShopifyCarrierServiceCallback(input: {
       provider: carrier.provider,
       carrierAccountGlobalId: carrier.carrierAccountGlobalId,
     }))
+    const configuredProviders = new Set(
+      carriers.map((carrier) => carrier.provider),
+    )
     if (
-      carriers.length !== 2
-      || !carriers.some((carrier) => carrier.provider === 'ups_rest')
-      || !carriers.some((carrier) => carrier.provider === 'fedex_rest')
+      carriers.length < 1
+      || carriers.length > 2
+      || configuredProviders.size !== carriers.length
+      || [...configuredProviders].some(
+        (provider) => provider !== 'ups_rest' && provider !== 'fedex_rest',
+      )
       || account.carriers.some((carrier) => carrier.environment !== 'sandbox')
     ) {
       throw new Error('Checkout carrier configuration is not rate-ready')

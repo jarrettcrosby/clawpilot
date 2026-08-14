@@ -2,7 +2,6 @@ import { NextRequest, NextResponse } from 'next/server'
 import { globalIdPattern } from '@/lib/globalIds.mjs'
 import {
   CarrierIntegrationRequestError,
-  carrierProductionLabelAuthorizationAllowed,
   createCarrierAccount,
   deleteCarrierAccount,
   disconnectCarrierCredential,
@@ -17,6 +16,7 @@ import {
   updateCarrierAccount,
   updateCarrierCredential,
 } from '@/lib/integrations/carrierIntegrations'
+import { carrierProductionLabelRuntimePolicy } from '@/lib/integrations/carrierProductionLabelRuntime'
 import {
   closeCarrierRateTestSampleLabel,
   createCarrierRateTestLabel,
@@ -419,6 +419,7 @@ export async function GET(req: NextRequest) {
       listCarrierRateTestLabelAttempts({ organizationId: organization }),
       listOperationsPrinterProfilesInPostgres(organization),
     ])
+    const productionLabelRuntime = carrierProductionLabelRuntimePolicy()
     return json({
       ok: true,
       canManage: true,
@@ -426,7 +427,8 @@ export async function GET(req: NextRequest) {
       canRevealCredentials: canRevealCredential(actor),
       canReconcile: capabilities.canExecute && canRevealCredential(actor),
       productionLabelAuthorizationAllowed:
-        carrierProductionLabelAuthorizationAllowed(),
+        productionLabelRuntime.allowed,
+      productionLabelRuntimeLane: productionLabelRuntime.lane,
       integrations,
       rateTestLabels: rateTestLabels.map(safeRateTestLabel),
       rateTestAttempts: rateTestAttempts.map(safeRateTestLabelAttempt),

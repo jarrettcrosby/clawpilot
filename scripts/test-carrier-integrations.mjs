@@ -365,7 +365,9 @@ for (const fragment of [
   'operationsCapabilities(actor).canManage',
   'canRevealCredentials: canRevealCredential(actor)',
   'productionLabelAuthorizationAllowed:',
-  'carrierProductionLabelAuthorizationAllowed()',
+  'productionLabelRuntime.allowed',
+  'productionLabelRuntimeLane: productionLabelRuntime.lane',
+  'carrierProductionLabelRuntimePolicy()',
   'requireCredentialViewer(actor)',
   "return role === 'owner' || role === 'admin'",
   "'CARRIER_CREDENTIAL_REVEAL_FORBIDDEN'",
@@ -515,9 +517,14 @@ for (const fragment of [
   'Rate-only ready',
   'Rate setup incomplete',
   'Test it from a completely packed order through the sealed, read-only rerate flow',
-  'Live postage locked on development',
-  'Development can select and use production rating, but cannot authorize production labels.',
-  'Label creation remains sandbox-only.',
+  'Railway dev live postage authorized',
+  'Railway dev live postage off',
+  'Live postage unavailable in this runtime',
+  'Production labels can be authorized only in production or the trusted Railway development',
+  'Vercel previews and local/browser-only runtimes remain blocked.',
+  'A successful',
+  'whole-shipment purchase creates real production postage and may incur charges.',
+  'void the complete group through ClawPilot.',
 ]) {
   assert.ok(panel.includes(fragment), `Carrier settings UI missing ${fragment}`)
 }
@@ -773,6 +780,106 @@ assert.equal(
   true,
 )
 
+const productionLabelRuntimeModule = loadTypeScriptModule(
+  'app_src/lib/integrations/carrierProductionLabelRuntime.ts',
+)
+const trustedRailwayDevelopment = {
+  CLAWPILOT_ENV: 'development',
+  NODE_ENV: 'production',
+  RAILWAY_ENVIRONMENT_NAME: 'development',
+  RAILWAY_PROJECT_ID:
+    productionLabelRuntimeModule.CARRIER_PRODUCTION_LABEL_RAILWAY_PROJECT_ID,
+  RAILWAY_SERVICE_ID:
+    productionLabelRuntimeModule.CARRIER_PRODUCTION_LABEL_RAILWAY_SERVICE_ID,
+  RAILWAY_ENVIRONMENT_ID:
+    productionLabelRuntimeModule
+      .CARRIER_PRODUCTION_LABEL_RAILWAY_DEVELOPMENT_ENVIRONMENT_ID,
+}
+assert.deepEqual(
+  { ...productionLabelRuntimeModule.carrierProductionLabelRuntimePolicy(
+    trustedRailwayDevelopment,
+  ) },
+  { allowed: true, lane: 'railway_development' },
+  'The exact Railway development service may expose an independently authorized production-label command',
+)
+for (const environment of [
+  { CLAWPILOT_ENV: 'development', NODE_ENV: 'production' },
+  { RAILWAY_ENVIRONMENT_NAME: 'development' },
+  {
+    ...trustedRailwayDevelopment,
+    RAILWAY_PROJECT_ID: '00000000-0000-4000-8000-000000000000',
+  },
+  {
+    ...trustedRailwayDevelopment,
+    RAILWAY_ENVIRONMENT_ID: '00000000-0000-4000-8000-000000000000',
+  },
+  {
+    ...trustedRailwayDevelopment,
+    RAILWAY_SERVICE_ID: '00000000-0000-4000-8000-000000000000',
+  },
+  { ...trustedRailwayDevelopment, VERCEL: '1', VERCEL_ENV: 'preview' },
+  { RAILWAY_ENVIRONMENT_NAME: 'production', VERCEL: '1', VERCEL_ENV: 'production' },
+  { CLAWPILOT_ENV: 'development', RAILWAY_ENVIRONMENT_NAME: 'production' },
+]) {
+  assert.equal(
+    productionLabelRuntimeModule
+      .carrierProductionLabelAuthorizationAllowed(environment),
+    false,
+    'Local, preview, untrusted Railway, Vercel, and contradictory runtimes must fail closed',
+  )
+}
+assert.deepEqual(
+  { ...productionLabelRuntimeModule.carrierProductionLabelRuntimePolicy({
+    RAILWAY_ENVIRONMENT_NAME: 'production',
+    RAILWAY_PROJECT_ID:
+      productionLabelRuntimeModule.CARRIER_PRODUCTION_LABEL_RAILWAY_PROJECT_ID,
+    RAILWAY_SERVICE_ID:
+      productionLabelRuntimeModule.CARRIER_PRODUCTION_LABEL_RAILWAY_SERVICE_ID,
+    RAILWAY_ENVIRONMENT_ID:
+      productionLabelRuntimeModule
+        .CARRIER_PRODUCTION_LABEL_RAILWAY_PRODUCTION_ENVIRONMENT_ID,
+  }) },
+  { allowed: true, lane: 'production' },
+)
+for (const environment of [
+  { CLAWPILOT_ENV: 'production' },
+  { RUNTIME_LANE: 'production' },
+  { RAILWAY_ENVIRONMENT_NAME: 'production' },
+  {
+    RAILWAY_ENVIRONMENT_NAME: 'production',
+    RAILWAY_PROJECT_ID: '00000000-0000-4000-8000-000000000000',
+    RAILWAY_SERVICE_ID:
+      productionLabelRuntimeModule.CARRIER_PRODUCTION_LABEL_RAILWAY_SERVICE_ID,
+    RAILWAY_ENVIRONMENT_ID:
+      productionLabelRuntimeModule
+        .CARRIER_PRODUCTION_LABEL_RAILWAY_PRODUCTION_ENVIRONMENT_ID,
+  },
+  {
+    RAILWAY_ENVIRONMENT_NAME: 'production',
+    RAILWAY_PROJECT_ID:
+      productionLabelRuntimeModule.CARRIER_PRODUCTION_LABEL_RAILWAY_PROJECT_ID,
+    RAILWAY_SERVICE_ID: '00000000-0000-4000-8000-000000000000',
+    RAILWAY_ENVIRONMENT_ID:
+      productionLabelRuntimeModule
+        .CARRIER_PRODUCTION_LABEL_RAILWAY_PRODUCTION_ENVIRONMENT_ID,
+  },
+  {
+    RAILWAY_ENVIRONMENT_NAME: 'production',
+    RAILWAY_PROJECT_ID:
+      productionLabelRuntimeModule.CARRIER_PRODUCTION_LABEL_RAILWAY_PROJECT_ID,
+    RAILWAY_SERVICE_ID:
+      productionLabelRuntimeModule.CARRIER_PRODUCTION_LABEL_RAILWAY_SERVICE_ID,
+    RAILWAY_ENVIRONMENT_ID: '00000000-0000-4000-8000-000000000000',
+  },
+]) {
+  assert.equal(
+    productionLabelRuntimeModule
+      .carrierProductionLabelAuthorizationAllowed(environment),
+    false,
+    'Production postage requires the exact ClawPilot Railway production identity',
+  )
+}
+
 const carrierServiceModule = loadTypeScriptModule('app_src/lib/integrations/carrierIntegrations.ts', {
   mocks: {
     '@/lib/integrations/carrierCredentialClient': {
@@ -801,6 +908,7 @@ const carrierServiceModule = loadTypeScriptModule('app_src/lib/integrations/carr
     },
     '@/lib/integrations/carrierCredentialCrypto': cryptoModule,
     '@/lib/integrations/carrierManagedDelegation': carrierManagedDelegationModule,
+    '@/lib/integrations/carrierProductionLabelRuntime': productionLabelRuntimeModule,
     '@/lib/persistence/carrierIntegrations': {},
   },
 })
@@ -952,6 +1060,7 @@ const delegatedCarrierServiceModule = loadTypeScriptModule(
       },
       '@/lib/integrations/carrierCredentialCrypto': cryptoModule,
       '@/lib/integrations/carrierManagedDelegation': carrierManagedDelegationModule,
+      '@/lib/integrations/carrierProductionLabelRuntime': productionLabelRuntimeModule,
       '@/lib/persistence/carrierIntegrations': {
         readCarrierRuntimeCredentialFromPostgres: async (input) => {
           const production = input.environment === 'production'
@@ -1032,6 +1141,10 @@ const delegatedCarrierServiceModule = loadTypeScriptModule(
         updateCarrierAccountInPostgres: async () => delegatedMutationCalls.push('update-account'),
         setCarrierAccountStatusInPostgres: async () => delegatedMutationCalls.push('account-status'),
         deleteCarrierAccountInPostgres: async () => delegatedMutationCalls.push('delete-account'),
+        setCarrierProductionLabelCapabilityInPostgres: async (input) => {
+          delegatedMutationCalls.push(`production-label:${input.enabled}`)
+          return { accounts: [] }
+        },
         setCarrierIntegrationEnabledInPostgres: async () => delegatedMutationCalls.push('integration-status'),
         disconnectCarrierCredentialInPostgres: async () => delegatedMutationCalls.push('disconnect'),
       },
@@ -1045,7 +1158,7 @@ assert.equal(
     NODE_ENV: 'production',
   }),
   false,
-  'A compiled development deployment must never authorize production label purchase',
+  'A generic development deployment must not authorize production label purchase',
 )
 assert.equal(
   delegatedCarrierServiceModule.carrierProductionLabelAuthorizationAllowed({
@@ -1058,9 +1171,23 @@ assert.equal(
 assert.equal(
   delegatedCarrierServiceModule.carrierProductionLabelAuthorizationAllowed({
     RAILWAY_ENVIRONMENT_NAME: 'production',
+    RAILWAY_PROJECT_ID:
+      productionLabelRuntimeModule.CARRIER_PRODUCTION_LABEL_RAILWAY_PROJECT_ID,
+    RAILWAY_SERVICE_ID:
+      productionLabelRuntimeModule.CARRIER_PRODUCTION_LABEL_RAILWAY_SERVICE_ID,
+    RAILWAY_ENVIRONMENT_ID:
+      productionLabelRuntimeModule
+        .CARRIER_PRODUCTION_LABEL_RAILWAY_PRODUCTION_ENVIRONMENT_ID,
   }),
   true,
-  'A canonical production deployment marker must be required for live-postage authorization',
+  'The exact ClawPilot Railway production identity must authorize live postage',
+)
+assert.equal(
+  delegatedCarrierServiceModule.carrierProductionLabelAuthorizationAllowed(
+    trustedRailwayDevelopment,
+  ),
+  true,
+  'The exact trusted Railway development identity must allow the separately gated production-label path',
 )
 const sanitizedProductionLabelReadiness =
   delegatedCarrierServiceModule.sanitizedCarrierIntegrationError(Object.assign(
@@ -1108,6 +1235,53 @@ await assert.rejects(
 )
 if (previousClawPilotEnvironment === undefined) delete process.env.CLAWPILOT_ENV
 else process.env.CLAWPILOT_ENV = previousClawPilotEnvironment
+
+const productionRuntimeEnvironmentKeys = [
+  'CLAWPILOT_ENV',
+  'RUNTIME_LANE',
+  'RAILWAY_ENVIRONMENT_NAME',
+  'RAILWAY_ENVIRONMENT',
+  'RAILWAY_PROJECT_ID',
+  'RAILWAY_SERVICE_ID',
+  'RAILWAY_ENVIRONMENT_ID',
+  'VERCEL',
+  'VERCEL_ENV',
+]
+const previousProductionRuntimeEnvironment = Object.fromEntries(
+  productionRuntimeEnvironmentKeys.map((key) => [key, process.env[key]]),
+)
+for (const key of productionRuntimeEnvironmentKeys) delete process.env[key]
+Object.assign(process.env, trustedRailwayDevelopment)
+productionConfiguration = {
+  allowedCapabilities: ['production_rate', 'production_label'],
+}
+const trustedDevelopmentRuntime = await delegatedCarrierServiceModule
+  .resolveCarrierProductionShippingRuntime({
+    organizationId,
+    provider: 'ups_rest',
+    integrationAccountGlobalId: 'gia7654321',
+    carrierAccountGlobalId,
+  })
+assert.equal(trustedDevelopmentRuntime.environment, 'production')
+assert.equal(trustedDevelopmentRuntime.integrationGlobalId, 'gia7654321')
+await delegatedCarrierServiceModule.setCarrierProductionLabelEnabled({
+  organizationId,
+  provider: 'ups_rest',
+  enabled: true,
+  reason: 'Approved Railway development production-label exercise',
+  actorEmail: 'owner@example.com',
+})
+assert.equal(
+  delegatedMutationCalls.filter((entry) => entry === 'production-label:true').length,
+  1,
+  'Trusted Railway development must reach the durable capability mutation only after runtime authorization',
+)
+delegatedMutationCalls.length = 0
+for (const key of productionRuntimeEnvironmentKeys) {
+  const previous = previousProductionRuntimeEnvironment[key]
+  if (previous === undefined) delete process.env[key]
+  else process.env[key] = previous
+}
 
 for (const configuration of [
   {},

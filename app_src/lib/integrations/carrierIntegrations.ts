@@ -10,6 +10,8 @@ import {
   managedCarrierDelegationAllows,
   managedCarrierDelegationProfile,
 } from '@/lib/integrations/carrierManagedDelegation'
+import { carrierProductionLabelAuthorizationAllowed } from '@/lib/integrations/carrierProductionLabelRuntime'
+export { carrierProductionLabelAuthorizationAllowed } from '@/lib/integrations/carrierProductionLabelRuntime'
 import {
   CARRIER_SANDBOX_RATE_FIXTURE,
   buildCarrierSandboxRateFixture,
@@ -173,35 +175,6 @@ function sanitize(error: unknown): CarrierIntegrationRequestError {
 
 export function sanitizedCarrierIntegrationError(error: unknown) {
   return sanitize(error)
-}
-
-export function carrierProductionLabelAuthorizationAllowed(
-  environment: Record<string, string | undefined> = process.env,
-) {
-  const rawMarkers = [
-    environment.CLAWPILOT_ENV,
-    environment.RAILWAY_ENVIRONMENT_NAME,
-    environment.VERCEL_ENV,
-    environment.RAILWAY_ENVIRONMENT,
-  ]
-  const markers = rawMarkers
-    .map((value) => String(value || '').trim().toLowerCase())
-    .filter(Boolean)
-  const nonProductionMarkers = new Set([
-    'dev',
-    'development',
-    'local',
-    'preview',
-    'sandbox',
-    'staging',
-    'test',
-    'testing',
-  ])
-  if (markers.some((value) => nonProductionMarkers.has(value))) return false
-  const canonicalMarker = rawMarkers
-    .map((value) => String(value || '').trim().toLowerCase())
-    .find(Boolean)
-  return canonicalMarker === 'production'
 }
 
 async function storedRuntimeCredential(input: {
@@ -810,7 +783,7 @@ export async function resolveCarrierProductionShippingRuntime(input: {
   try {
     if (!carrierProductionLabelAuthorizationAllowed()) {
       throw new CarrierIntegrationRequestError(
-        'Production label purchase is disabled outside the production deployment',
+        'Production label purchase is available only in production or the trusted Railway development service',
         403,
         'CARRIER_PRODUCTION_LABEL_ENVIRONMENT_FORBIDDEN',
       )
@@ -960,7 +933,7 @@ export async function setCarrierProductionLabelEnabled(input: {
     }
     if (input.enabled === true && !carrierProductionLabelAuthorizationAllowed()) {
       throw new CarrierIntegrationRequestError(
-        'Production label purchase cannot be authorized from a development deployment',
+        'Production label purchase can be authorized only in production or the trusted Railway development service',
         403,
         'CARRIER_PRODUCTION_LABEL_ENVIRONMENT_FORBIDDEN',
       )
