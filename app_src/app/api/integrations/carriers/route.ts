@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { globalIdPattern } from '@/lib/globalIds.mjs'
 import {
   CarrierIntegrationRequestError,
+  carrierProductionLabelAuthorizationAllowed,
   createCarrierAccount,
   deleteCarrierAccount,
   disconnectCarrierCredential,
@@ -424,6 +425,8 @@ export async function GET(req: NextRequest) {
       canExecute: capabilities.canExecute,
       canRevealCredentials: canRevealCredential(actor),
       canReconcile: capabilities.canExecute && canRevealCredential(actor),
+      productionLabelAuthorizationAllowed:
+        carrierProductionLabelAuthorizationAllowed(),
       integrations,
       rateTestLabels: rateTestLabels.map(safeRateTestLabel),
       rateTestAttempts: rateTestAttempts.map(safeRateTestLabelAttempt),

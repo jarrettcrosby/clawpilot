@@ -118,6 +118,89 @@ async function verify(databaseUrl) {
       [warehouseId, organizationId, actorEmail],
     )
 
+    const firstStarterCommand = await persistence
+      .createStarterPackagingAssortmentInPostgres({
+        organizationId,
+        actorEmail,
+        idempotencyKey: 'starter-assortment-acceptance-0001',
+      })
+    assert.equal(firstStarterCommand.createdCount, 6)
+    assert.equal(firstStarterCommand.totalCount, 6)
+    assert.equal(firstStarterCommand.replayed, false)
+    const firstStarterReplay = await persistence
+      .createStarterPackagingAssortmentInPostgres({
+        organizationId,
+        actorEmail,
+        idempotencyKey: 'starter-assortment-acceptance-0001',
+      })
+    assert.equal(firstStarterReplay.replayed, true)
+    assert.deepEqual(
+      firstStarterReplay.materialGlobalIds,
+      firstStarterCommand.materialGlobalIds,
+      'A network retry must replay the same starter-material identities',
+    )
+    const firstStarterRows = await pool.query(
+      `SELECT global_id, row_version::integer
+       FROM operations_packaging_materials
+       WHERE organization_id = $1::uuid
+         AND global_id = ANY($2::text[])
+       ORDER BY global_id`,
+      [organizationId, firstStarterCommand.materialGlobalIds],
+    )
+    assert.equal(firstStarterRows.rowCount, 6)
+    for (const row of firstStarterRows.rows) {
+      const removedStarter = await persistence
+        .removePackagingMaterialInPostgres({
+          organizationId,
+          actorEmail,
+          materialGlobalId: row.global_id,
+          expectedRowVersion: row.row_version,
+          idempotencyKey: `remove-starter-assortment-${row.global_id}`,
+        })
+      assert.equal(removedStarter.outcome, 'deleted')
+    }
+    await rejected(
+      persistence.createStarterPackagingAssortmentInPostgres({
+        organizationId,
+        actorEmail,
+        idempotencyKey: 'starter-assortment-acceptance-0001',
+      }),
+      'PACKAGING_MATERIAL_STARTER_REPLAY_STALE',
+    )
+    const recreatedStarterCommand = await persistence
+      .createStarterPackagingAssortmentInPostgres({
+        organizationId,
+        actorEmail,
+        idempotencyKey: 'starter-assortment-acceptance-0002',
+      })
+    assert.equal(recreatedStarterCommand.createdCount, 6)
+    assert.equal(recreatedStarterCommand.totalCount, 6)
+    assert.equal(recreatedStarterCommand.replayed, false)
+    assert.equal(
+      recreatedStarterCommand.materialGlobalIds.some(
+        (globalId) => firstStarterCommand.materialGlobalIds.includes(globalId),
+      ),
+      false,
+      'A new intentional command must recreate deleted starters with new identities',
+    )
+    const recreatedStarterReplay = await persistence
+      .createStarterPackagingAssortmentInPostgres({
+        organizationId,
+        actorEmail,
+        idempotencyKey: 'starter-assortment-acceptance-0002',
+      })
+    assert.equal(recreatedStarterReplay.replayed, true)
+    assert.deepEqual(
+      recreatedStarterReplay.materialGlobalIds,
+      recreatedStarterCommand.materialGlobalIds,
+    )
+    assert.equal(
+      auditEvents.filter((event) => event.eventType
+        === 'operations.packaging_material.starter_assortment_created').length,
+      2,
+      'Each intentional starter recreation must retain its own audit event',
+    )
+
     const editableMaterial = {
       code: `EDIT-${suffix}`,
       name: 'Editable packaging acceptance',

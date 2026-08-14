@@ -224,6 +224,26 @@ function display(value: string) {
   return value.replace(/[_.-]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())
 }
 
+const readinessGapLabels: Record<
+  PackagingMaterial['readiness']['missing'][number],
+  string
+> = {
+  dimensions: 'usable inner dimensions',
+  dimension_basis: 'inner-dimension confirmation',
+  dimension_evidence: 'dimension evidence',
+  tare_weight: 'tare weight',
+  max_weight: 'maximum weight',
+  unit_cost: 'unit cost',
+  warehouse_stock: 'warehouse stock',
+  available_stock: 'available stock',
+}
+
+function readinessGapSummary(material: PackagingMaterial) {
+  return material.readiness.missing
+    .map((gap) => readinessGapLabels[gap])
+    .join(', ')
+}
+
 function money(minor: number | null, currency = 'USD') {
   if (minor === null) return 'Cost required'
   return new Intl.NumberFormat('en-US', {
@@ -528,6 +548,7 @@ export default function PackagingMaterialsPanel() {
   const [importCsv, setImportCsv] = useState('')
   const [importAccountGlobalId, setImportAccountGlobalId] = useState('')
   const [importPreview, setImportPreview] = useState<Payload['preview']>(undefined)
+  const starterCommandKey = useRef<string | null>(null)
   const importCommandKey = useRef<string | null>(null)
   const previousMeasurementSystem = useRef(measurementSystem)
 
@@ -879,6 +900,17 @@ export default function PackagingMaterialsPanel() {
     setStockOpen(true)
   }
 
+  const openActivationSetup = (material: PackagingMaterial) => {
+    const stockOnly = material.readiness.missing.every(
+      (gap) => gap === 'warehouse_stock' || gap === 'available_stock',
+    )
+    if (stockOnly) {
+      openStock(material)
+      return
+    }
+    openEdit(material)
+  }
+
   const changeStockWarehouse = (warehouseId: string) => {
     setStockDraft(stockForm(
       warehouseId,
@@ -990,15 +1022,20 @@ export default function PackagingMaterialsPanel() {
     setBusy(true)
     setError('')
     setNotice('')
+    const commandKey = starterCommandKey.current
+      ?? `packaging-materials:starter-assortment:${globalThis.crypto.randomUUID()}`
+    starterCommandKey.current = commandKey
+    let terminalResponse = false
     try {
       const response = await fetch('/api/operations/packaging-materials', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Idempotency-Key': 'packaging-materials:starter-assortment:v1',
+          'Idempotency-Key': commandKey,
         },
         body: JSON.stringify({ action: 'create-starter-assortment' }),
       })
+      terminalResponse = true
       const payload = await response.json() as Payload
       if (!response.ok || payload.result?.totalCount === undefined) {
         throw new Error(payload.error || 'Starter assortment could not be created')
@@ -1011,6 +1048,7 @@ export default function PackagingMaterialsPanel() {
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Starter assortment could not be created')
     } finally {
+      if (terminalResponse) starterCommandKey.current = null
       setBusy(false)
     }
   }
@@ -1482,21 +1520,24 @@ export default function PackagingMaterialsPanel() {
                   )
                 })}
 
-                {material.readiness.missing.length > 0 && (
-                  <Alert severity="warning" sx={{ mt: 1.5 }}>
-                    Fix before use:{' '}
-                    {material.readiness.missing.map((gap) => display(gap)).join(', ')}.
-                  </Alert>
-                )}
-
                 <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mt: 1.5 }}>
                   {material.status === 'draft' ? (
                     <Button
-                      variant="contained"
+                      variant={material.readiness.missing.length > 0
+                        ? 'outlined'
+                        : 'contained'}
                       disabled={!canManage || busy}
-                      onClick={() => void changeStatus(material, 'active')}
+                      onClick={() => {
+                        if (material.readiness.missing.length > 0) {
+                          openActivationSetup(material)
+                          return
+                        }
+                        void changeStatus(material, 'active')
+                      }}
                     >
-                      Activate material
+                      {material.readiness.missing.length > 0
+                        ? 'Finish setup'
+                        : 'Activate material'}
                     </Button>
                   ) : (
                     <Button
@@ -1518,11 +1559,13 @@ export default function PackagingMaterialsPanel() {
                     Remove
                   </Button>
                   <Typography variant="caption" color="text.secondary" sx={{ alignSelf: 'center' }}>
-                    {material.source === 'starter_assortment'
-                      ? 'Starter specification — verify against the selected supplier.'
-                      : material.source === 'customer_supplied'
-                        ? 'Customer-supplied draft — verify basis, capacity, cost, and stock.'
-                        : `${display(material.source)} specification.`}
+                    {material.status === 'draft' && material.readiness.missing.length > 0
+                      ? `Needed before activation: ${readinessGapSummary(material)}.`
+                      : material.source === 'starter_assortment'
+                        ? 'Starter specification — verify against the selected supplier.'
+                        : material.source === 'customer_supplied'
+                          ? 'Customer-supplied draft — verify basis, capacity, cost, and stock.'
+                          : `${display(material.source)} specification.`}
                   </Typography>
                 </Stack>
               </Box>

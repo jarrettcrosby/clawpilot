@@ -134,6 +134,23 @@ function sanitize(error: unknown): CarrierIntegrationRequestError {
   if (error instanceof CarrierCredentialClientError) {
     return new CarrierIntegrationRequestError(error.message, error.status, error.code)
   }
+  if (
+    error
+    && typeof error === 'object'
+    && 'code' in error
+    && error.code === 'CARRIER_PRODUCTION_LABEL_NOT_READY'
+    && 'status' in error
+    && error.status === 409
+  ) {
+    const safeMessage = 'message' in error && typeof error.message === 'string'
+      ? error.message
+      : 'Live postage setup is not ready'
+    return new CarrierIntegrationRequestError(
+      safeMessage,
+      409,
+      'CARRIER_PRODUCTION_LABEL_NOT_READY',
+    )
+  }
   const message = error instanceof Error ? error.message : ''
   if (message === 'Carrier credential encryption is not configured') {
     return new CarrierIntegrationRequestError(message, 503, 'CARRIER_ENCRYPTION_UNAVAILABLE')
@@ -156,6 +173,35 @@ function sanitize(error: unknown): CarrierIntegrationRequestError {
 
 export function sanitizedCarrierIntegrationError(error: unknown) {
   return sanitize(error)
+}
+
+export function carrierProductionLabelAuthorizationAllowed(
+  environment: Record<string, string | undefined> = process.env,
+) {
+  const rawMarkers = [
+    environment.CLAWPILOT_ENV,
+    environment.RAILWAY_ENVIRONMENT_NAME,
+    environment.VERCEL_ENV,
+    environment.RAILWAY_ENVIRONMENT,
+  ]
+  const markers = rawMarkers
+    .map((value) => String(value || '').trim().toLowerCase())
+    .filter(Boolean)
+  const nonProductionMarkers = new Set([
+    'dev',
+    'development',
+    'local',
+    'preview',
+    'sandbox',
+    'staging',
+    'test',
+    'testing',
+  ])
+  if (markers.some((value) => nonProductionMarkers.has(value))) return false
+  const canonicalMarker = rawMarkers
+    .map((value) => String(value || '').trim().toLowerCase())
+    .find(Boolean)
+  return canonicalMarker === 'production'
 }
 
 async function storedRuntimeCredential(input: {
@@ -762,6 +808,13 @@ export async function resolveCarrierProductionShippingRuntime(input: {
   carrierAccountGlobalId: unknown
 }): Promise<CarrierProductionRatingRuntime> {
   try {
+    if (!carrierProductionLabelAuthorizationAllowed()) {
+      throw new CarrierIntegrationRequestError(
+        'Production label purchase is disabled outside the production deployment',
+        403,
+        'CARRIER_PRODUCTION_LABEL_ENVIRONMENT_FORBIDDEN',
+      )
+    }
     const organizationId = normalizeCarrierOrganizationId(input.organizationId)
     const provider = normalizeDirectCarrierProvider(input.provider)
     const runtime = await storedRuntimeCredential({
@@ -903,6 +956,13 @@ export async function setCarrierProductionLabelEnabled(input: {
         'Live postage is available only for UPS and FedEx production connections',
         409,
         'CARRIER_PRODUCTION_LABEL_UNSUPPORTED',
+      )
+    }
+    if (input.enabled === true && !carrierProductionLabelAuthorizationAllowed()) {
+      throw new CarrierIntegrationRequestError(
+        'Production label purchase cannot be authorized from a development deployment',
+        403,
+        'CARRIER_PRODUCTION_LABEL_ENVIRONMENT_FORBIDDEN',
       )
     }
     const reason = String(input.reason || '').trim()

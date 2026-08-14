@@ -26,6 +26,16 @@ export class CarrierIntegrationSourceManagedError extends Error {
   }
 }
 
+export class CarrierProductionLabelNotReadyError extends Error {
+  readonly status = 409
+  readonly code = 'CARRIER_PRODUCTION_LABEL_NOT_READY'
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'CarrierProductionLabelNotReadyError'
+  }
+}
+
 type CarrierConnectionRow = {
   id: string
   global_id: string
@@ -533,6 +543,7 @@ function assertUserManagedCarrierConnection(
 type LockedCarrierConnection = {
   id: string
   global_id: string
+  status: 'active' | 'disabled' | 'error'
   configuration: Record<string, unknown>
   credential_configured: boolean
 }
@@ -563,7 +574,8 @@ async function lockedUserManagedCarrierConnection(
 ) {
   const requireCredential = options.requireCredential !== false
   const result = await client.query<LockedCarrierConnection>(
-    `SELECT account.id::text, account.global_id, account.configuration,
+    `SELECT account.id::text, account.global_id, account.status,
+            account.configuration,
             EXISTS (
               SELECT 1
               FROM operations_carrier_credentials credential
@@ -1146,6 +1158,11 @@ export async function setCarrierProductionLabelCapabilityInPostgres(input: {
       environment: 'production',
     })
     if (input.enabled) {
+      if (connection.status !== 'active') {
+        throw new CarrierProductionLabelNotReadyError(
+          'Enable the production carrier connection before authorizing live postage',
+        )
+      }
       const readiness = await client.query<{
         activation_state: string | null
         verified: boolean
@@ -1176,14 +1193,19 @@ export async function setCarrierProductionLabelCapabilityInPostgres(input: {
         [input.organizationId, connection.id],
       )
       const row = readiness.rows[0]
-      if (
-        !row
-        || row.activation_state !== 'active'
-        || !row.verified
-        || Number(row.sender_account_count) < 1
-      ) {
-        throw new Error(
-          'Live postage authorization requires Active Operations, an enabled verified production credential, and an active sender-billing account',
+      if (!row || row.activation_state !== 'active') {
+        throw new CarrierProductionLabelNotReadyError(
+          'Move Operations to Active before authorizing live postage',
+        )
+      }
+      if (!row.verified) {
+        throw new CarrierProductionLabelNotReadyError(
+          'Verify the production carrier credential before authorizing live postage',
+        )
+      }
+      if (Number(row.sender_account_count) < 1) {
+        throw new CarrierProductionLabelNotReadyError(
+          'Add and enable a production sender-billing account before authorizing live postage',
         )
       }
     }

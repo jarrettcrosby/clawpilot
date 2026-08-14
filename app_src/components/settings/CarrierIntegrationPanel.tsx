@@ -119,6 +119,7 @@ type CarrierPayload = {
   canExecute?: boolean
   canReconcile?: boolean
   canRevealCredentials?: boolean
+  productionLabelAuthorizationAllowed?: boolean
   integrations?: CarrierIntegrationsState
   rateTest?: CarrierSandboxRateTest
   rateTestLabel?: CarrierRateTestLabel
@@ -487,6 +488,8 @@ export default function CarrierIntegrationPanel({
   const [reconciliationConfirmed, setReconciliationConfirmed] = useState(false)
   const [reconciliationIdempotencyKey, setReconciliationIdempotencyKey] = useState('')
   const [canRevealCredentials, setCanRevealCredentials] = useState(false)
+  const [productionLabelAuthorizationAllowed, setProductionLabelAuthorizationAllowed] =
+    useState(false)
   const [revealedCredential, setRevealedCredential] = useState<RevealedCarrierCredential | null>(null)
   const [livePostageReason, setLivePostageReason] = useState('')
   const [livePostageConfirmation, setLivePostageConfirmation] = useState('')
@@ -676,6 +679,21 @@ export default function CarrierIntegrationPanel({
           : !selectedCarrierAccountGlobalId
             ? 'Select the sandbox billing account to use for the test.'
             : ''
+  const productionSenderAccounts = activeCarrierAccounts.filter(
+    (entry) => entry.allowSenderBilling,
+  )
+  const productionRateBlocker = !account?.configured
+    ? 'Save and verify the production credential first.'
+    : account.verificationStatus !== 'verified'
+      ? 'Verify the production credential first.'
+      : account.status !== 'active'
+        ? 'Enable the production connection first.'
+        : !account.allowedCapabilities.includes('production_rate')
+          ? 'This connection is not authorized for production rating.'
+          : !productionSenderAccounts.length
+            ? 'Add and enable a production sender-billing account.'
+            : ''
+  const productionRateReady = !productionRateBlocker
 
   useEffect(() => {
     let active = true
@@ -684,6 +702,9 @@ export default function CarrierIntegrationPanel({
         if (!active) return
         if (result.integrations) setIntegrations(result.integrations)
         setCanRevealCredentials(result.canRevealCredentials === true)
+        setProductionLabelAuthorizationAllowed(
+          result.productionLabelAuthorizationAllowed === true,
+        )
         setCanExecute(result.canExecute === true)
         setCanReconcile(result.canReconcile === true)
         if (result.rateTestLabels) setRateTestLabels(result.rateTestLabels)
@@ -1427,22 +1448,51 @@ export default function CarrierIntegrationPanel({
       ) : null}
 
       {environment === 'production' && provider !== 'usps_rest' && account ? (
-        <Alert
-          severity={livePostageAuthorized ? 'success' : 'warning'}
-          sx={{ mb: 2, borderRadius: '8px' }}
+        <Box
+          sx={{
+            mb: 2,
+            p: 1.5,
+            border: '1px solid',
+            borderColor: 'divider',
+            borderRadius: '8px',
+          }}
         >
-          <Typography variant="body2" fontWeight={700}>
-            Live postage {livePostageAuthorized ? 'authorized' : 'not authorized'}
+          <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap" useFlexGap>
+            <Typography variant="subtitle2" fontWeight={700} sx={{ mr: 0.5 }}>
+              Production capabilities
+            </Typography>
+            <Chip
+              size="small"
+              color={productionRateReady ? 'success' : 'default'}
+              variant={productionRateReady ? 'filled' : 'outlined'}
+              label={productionRateReady ? 'Rate-only ready' : 'Rate setup incomplete'}
+            />
+            <Chip
+              size="small"
+              color={productionLabelAuthorizationAllowed && livePostageAuthorized ? 'warning' : 'default'}
+              variant="outlined"
+              label={productionLabelAuthorizationAllowed
+                ? livePostageAuthorized ? 'Live postage authorized' : 'Live postage off'
+                : 'Live postage locked on development'}
+            />
+          </Stack>
+          <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+            {productionRateReady
+              ? 'Production rating is ready. Test it from a completely packed order through the sealed, read-only rerate flow; a quote cannot create a label or shipment.'
+              : productionRateBlocker}
           </Typography>
-          <Typography variant="body2" sx={{ mb: 1.5 }}>
-            Production rate access does not authorize shipment creation. Enabling this capability allows
-            an explicitly confirmed, completely packed one-off shipment of up to 40 parcels to buy real
-            UPS or FedEx postage in one provider command. ClawPilot retains every package label and tracking
-            number as one audited group. The complete group is voided through the same production account;
-            individual package purchase and void controls are intentionally unavailable.
-          </Typography>
-          {canRevealCredentials ? (
-            <Stack spacing={1.25}>
+          {!productionLabelAuthorizationAllowed ? (
+            <Typography variant="caption" color="text.disabled" display="block" sx={{ mt: 0.5 }}>
+              Development can select and use production rating, but cannot authorize production labels.
+              Label creation remains sandbox-only.
+              {livePostageAuthorized
+                ? ' A stored authorization is ignored here and can only be revoked below.'
+                : ''}
+            </Typography>
+          ) : null}
+          {canRevealCredentials
+          && (productionLabelAuthorizationAllowed || livePostageAuthorized) ? (
+            <Stack spacing={1.25} sx={{ mt: 1.5 }}>
               <TextField
                 size="small"
                 label={livePostageAuthorized ? 'Revocation reason' : 'Authorization reason'}
@@ -1452,7 +1502,7 @@ export default function CarrierIntegrationPanel({
                 disabled={busy}
                 sx={fieldSx}
               />
-              {!livePostageAuthorized ? (
+              {productionLabelAuthorizationAllowed && !livePostageAuthorized ? (
                 <TextField
                   size="small"
                   label="Type AUTHORIZE LIVE POSTAGE"
@@ -1464,12 +1514,13 @@ export default function CarrierIntegrationPanel({
               ) : null}
               <Button
                 color={livePostageAuthorized ? 'warning' : 'error'}
-                variant={livePostageAuthorized ? 'outlined' : 'contained'}
+                variant="outlined"
                 disabled={
                   busy
                   || livePostageReason.trim().length < 3
                   || (!livePostageAuthorized
-                    && livePostageConfirmation !== 'AUTHORIZE LIVE POSTAGE')
+                    && (!productionLabelAuthorizationAllowed
+                      || livePostageConfirmation !== 'AUTHORIZE LIVE POSTAGE'))
                 }
                 onClick={() => {
                   void patch(
@@ -1499,12 +1550,12 @@ export default function CarrierIntegrationPanel({
                   : 'Authorize live postage'}
               </Button>
             </Stack>
-          ) : (
-            <Typography variant="caption" color="text.secondary">
-              An organization owner or administrator with Operations activation permission must change this authorization.
+          ) : productionLabelAuthorizationAllowed ? (
+            <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
+              An organization owner or administrator with Operations activation permission must change live-postage authorization.
             </Typography>
-          )}
-        </Alert>
+          ) : null}
+        </Box>
       ) : null}
 
       {!sourceManagedDelegation ? (
