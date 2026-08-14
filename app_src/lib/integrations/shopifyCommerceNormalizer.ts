@@ -47,7 +47,7 @@ import {
 } from '@/lib/operations/commerceNormalization'
 
 export const SHOPIFY_COMMERCE_NORMALIZER_VERSION =
-  'shopify-commerce-normalizer-v4' as const
+  'shopify-commerce-normalizer-v5' as const
 
 type ShopifySource = Readonly<Record<string, unknown>>
 
@@ -893,14 +893,20 @@ function normalizeLine(
 function requestedDelivery(
   order: Record<string, unknown>,
 ): CommerceDataField<string> {
-  const value = (
-    order.requestedDeliveryAt
-    ?? nestedText(order.deliveryMethod, ['requestedDeliveryAt'])
-  )
+  const value = [
+    order.requestedDeliveryAt,
+    nestedText(order.deliveryMethod, ['requestedDeliveryAt']),
+  ].find((candidate) => (
+    candidate !== null && candidate !== undefined && candidate !== ''
+  ))
   const timestamp = optionalCommerceTimestamp(value)
   return timestamp
     ? availableCommerceField(timestamp)
-    : unavailableCommerceField()
+    : unavailableCommerceField(
+        value === null || value === undefined || value === ''
+          ? 'not_requested'
+          : 'not_provided',
+      )
 }
 
 function ambiguousVariantSkus(

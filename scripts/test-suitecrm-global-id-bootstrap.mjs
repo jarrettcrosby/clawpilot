@@ -7,6 +7,10 @@ const source = readFileSync(
   resolve(process.cwd(), 'services/suitecrm/bootstrap-global-id.php'),
   'utf8',
 )
+const entrypoint = readFileSync(
+  resolve(process.cwd(), 'services/suitecrm/entrypoint.sh'),
+  'utf8',
+)
 
 function section(start, end) {
   const startIndex = source.indexOf(start)
@@ -97,6 +101,21 @@ assert.match(
   source,
   /ensure_global_id_field\('Users', false\);/,
   'the same widening and postconditions cover Users',
+)
+assert.match(
+  source,
+  /ensure_global_id_field\('Emails', false, false\);/,
+  'native SuiteCRM Emails receive an API-visible Global ID without unsafe layout rewrites',
+)
+assert.doesNotMatch(
+  source,
+  /\$modules = \[[\s\S]*'Emails',[\s\S]*\];/,
+  'Emails is excluded from generic layout and unified-search management',
+)
+assert.match(
+  entrypoint,
+  /php -l "\$EMAILS_LISTVIEW_METADATA"[\s\S]*\.clawpilot-invalid/,
+  'a syntactically invalid generated Email list layout is preserved outside the PHP load path',
 )
 
 console.log('SuiteCRM Global ID bootstrap contract passed')

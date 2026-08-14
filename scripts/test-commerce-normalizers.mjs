@@ -691,7 +691,7 @@ assert.deepEqual(
 )
 assert.equal(
   faireExternalOrderV2Normalized.normalizerVersion,
-  'faire-commerce-normalizer-v7',
+  'faire-commerce-normalizer-v8',
 )
 assert.deepEqual(
   headerMoneyProjection(faireExternalOrderV2NormalizedOrder),
@@ -1406,6 +1406,117 @@ assert.equal(
   missingSku.orders[0].lines[0].variantIdentity.value.value,
   'gid://shopify/ProductVariant/101',
   'Missing SKU must not erase the exact provider variant identity',
+)
+
+const missingRequestedDeliverySource = clone(shopifySource)
+delete missingRequestedDeliverySource.orders.nodes[0].requestedDeliveryAt
+const missingRequestedDelivery = shopify.normalizeShopifyCommerce(
+  missingRequestedDeliverySource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+const missingDeliveryFacts = new Map(
+  missingRequestedDelivery.orders[0].readinessFacts.map(
+    (fact) => [fact.code, fact],
+  ),
+)
+assert.equal(
+  missingDeliveryFacts.get('delivery_not_supplied')?.blocking,
+  false,
+  'A provider-absent requested delivery date must be a nonblocking fact',
+)
+assert.equal(
+  missingDeliveryFacts.has('delivery_decision_required'),
+  false,
+  'A provider-absent requested delivery date must not create an exception',
+)
+const malformedRequestedDeliverySource = clone(shopifySource)
+malformedRequestedDeliverySource.orders.nodes[0].requestedDeliveryAt =
+  'not-a-provider-date'
+const malformedRequestedDelivery = shopify.normalizeShopifyCommerce(
+  malformedRequestedDeliverySource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+const malformedDeliveryFacts = new Map(
+  malformedRequestedDelivery.orders[0].readinessFacts.map(
+    (fact) => [fact.code, fact],
+  ),
+)
+assert.equal(
+  malformedDeliveryFacts.get('delivery_decision_required')?.blocking,
+  true,
+  'A malformed nonempty provider delivery date must remain blocking',
+)
+assert.equal(
+  malformedDeliveryFacts.has('delivery_not_supplied'),
+  false,
+  'Malformed provider evidence must not be relabeled as absent',
+)
+
+const faireFallbackDeliverySource = clone(faireSource)
+faireFallbackDeliverySource.orders[0].requested_delivery_at = ''
+const faireFallbackDelivery = faire.normalizeFaireCommerce(
+  faireFallbackDeliverySource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+  },
+)
+assert.equal(
+  faireFallbackDelivery.orders[0].requestedDeliveryAt.state,
+  'available',
+)
+assert.equal(
+  faireFallbackDelivery.orders[0].requestedDeliveryAt.value,
+  '2026-08-01T15:00:00.000Z',
+  'An empty Faire primary date must not hide a valid fallback date',
+)
+
+const faireMissingDeliverySource = clone(faireSource)
+faireMissingDeliverySource.orders[0].requested_delivery_at = ''
+faireMissingDeliverySource.orders[0].expected_delivery_at = null
+faireMissingDeliverySource.orders[0].ship_after = ''
+faireMissingDeliverySource.orders[0].expected_ship_date = undefined
+const faireMissingDelivery = faire.normalizeFaireCommerce(
+  faireMissingDeliverySource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+  },
+)
+assert.equal(
+  faireMissingDelivery.orders[0].requestedDeliveryAt.state,
+  'unavailable',
+)
+assert.equal(
+  faireMissingDelivery.orders[0].requestedDeliveryAt.reason,
+  'not_requested',
+  'All-empty Faire date aliases must be nonblocking absence',
+)
+
+const faireMalformedDeliverySource = clone(faireSource)
+faireMalformedDeliverySource.orders[0].requested_delivery_at =
+  'not-a-provider-date'
+const faireMalformedDelivery = faire.normalizeFaireCommerce(
+  faireMalformedDeliverySource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+  },
+)
+assert.equal(
+  faireMalformedDelivery.orders[0].requestedDeliveryAt.state,
+  'unavailable',
+)
+assert.equal(
+  faireMalformedDelivery.orders[0].requestedDeliveryAt.reason,
+  'not_provided',
+  'A malformed nonempty Faire primary date must not fall through',
 )
 
 const ambiguousSkuSource = clone(shopifySource)

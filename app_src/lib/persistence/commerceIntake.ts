@@ -709,7 +709,12 @@ function initialOrderBlockingCodes(
         ? 'ship_to_redacted'
         : 'ship_to_unavailable')
     }
-    codes.add('delivery_decision_required')
+    if (
+      order.requestedDeliveryAt.state !== 'unavailable'
+      || order.requestedDeliveryAt.reason !== 'not_requested'
+    ) {
+      codes.add('delivery_decision_required')
+    }
   } else {
     for (const code of SHIPPING_ONLY_BLOCKING_CODES) codes.delete(code)
   }
@@ -6400,7 +6405,12 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           addressProtected?.tag || null,
           addressProtected?.hash || null,
           addressProtected?.encryptionVersion || null,
-          requiresShipping ? 'unresolved' : 'not_required',
+          requiresShipping
+            ? order.requestedDeliveryAt.state === 'unavailable'
+                && order.requestedDeliveryAt.reason === 'not_requested'
+              ? 'not_supplied'
+              : 'unresolved'
+            : 'not_required',
           requestedDelivery,
           order.providerCreatedAt,
           order.providerProcessedAt,
@@ -10756,9 +10766,7 @@ export async function readAutomaticShopifyOrderPromotionTargetsForRunInPostgres(
       if (requiresShipping && candidate.delivery_resolution_state === 'unresolved') {
         deliveryMode = candidate.provider_requested_delivery_at
           ? 'provider'
-          : candidate.provider_created_at
-            ? 'default_sla'
-            : null
+          : null
         if (!deliveryMode) {
           targets.push(heldAutomaticShopifyPromotionTarget(
             candidate,
@@ -10769,10 +10777,13 @@ export async function readAutomaticShopifyOrderPromotionTargetsForRunInPostgres(
       } else if (
         requiresShipping
         && (
-          !['provider', 'manual', 'policy'].includes(
-            candidate.delivery_resolution_state,
+          candidate.delivery_resolution_state !== 'not_supplied'
+          && (
+            !['provider', 'manual', 'policy'].includes(
+              candidate.delivery_resolution_state,
+            )
+            || !candidate.requested_delivery_at
           )
-          || !candidate.requested_delivery_at
         )
       ) {
         targets.push(heldAutomaticShopifyPromotionTarget(
@@ -11383,10 +11394,13 @@ export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
       } else if (
         requiresShipping
         && (
-          !['provider', 'manual', 'policy'].includes(
-            candidate.delivery_resolution_state,
+          candidate.delivery_resolution_state !== 'not_supplied'
+          && (
+            !['provider', 'manual', 'policy'].includes(
+              candidate.delivery_resolution_state,
+            )
+            || !candidate.requested_delivery_at
           )
-          || !candidate.requested_delivery_at
         )
       ) {
         targets.push(heldAutomaticFairePromotionTarget(

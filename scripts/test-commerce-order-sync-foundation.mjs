@@ -740,6 +740,25 @@ assert.doesNotThrow(
     false,
   ),
 )
+const blankOptionalShopifyDetail = {
+  ...validShopifyDetail,
+  lineItems: {
+    ...validShopifyDetail.lineItems,
+    nodes: [{
+      ...validShopifyDetail.lineItems.nodes[0],
+      sku: '',
+      vendor: '',
+      variantTitle: '',
+    }],
+  },
+}
+assert.doesNotThrow(
+  () => historyRuntime.assertShopifyOrderHistoryDetailEvidence(
+    blankOptionalShopifyDetail,
+    false,
+  ),
+  'Shopify empty optional String fields must normalize as unavailable',
+)
 const validShopifyReturnDetail = {
   ...validShopifyDetail,
   returns: {
@@ -779,6 +798,13 @@ for (const invalid of [
     lineItems: {
       ...validShopifyDetail.lineItems,
       nodes: [{ ...validShopifyDetail.lineItems.nodes[0], requiresShipping: null }],
+    },
+  },
+  {
+    ...validShopifyDetail,
+    lineItems: {
+      ...validShopifyDetail.lineItems,
+      nodes: [{ ...validShopifyDetail.lineItems.nodes[0], sku: '   ' }],
     },
   },
   { ...validShopifyDetail, fulfillments: [null] },

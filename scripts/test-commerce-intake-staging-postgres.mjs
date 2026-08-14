@@ -196,7 +196,7 @@ function orderFixture(input) {
     }),
     party: unavailable(),
     shipTo: unavailable(),
-    requestedDeliveryAt: unavailable(),
+    requestedDeliveryAt: unavailable('not_requested'),
     lines: Object.freeze([Object.freeze({
       schemaVersion: 'commerce-normalized-order-line-v1',
       identity: Object.freeze({
@@ -1216,6 +1216,11 @@ function loadCommerceOrderReconciliationWorker(input) {
           }
         },
       },
+      '@/lib/persistence/commerceOrderRevisions': {
+        async purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres() {
+          return { redacted: 0, providerWrites: 0 }
+        },
+      },
     },
   )
 }
@@ -2011,6 +2016,10 @@ async function verifyFaireExactVariantPackBinding(
        line.row_version::integer AS line_row_version,
        line.mapping_state,
        line.packaging_state,
+       candidate.delivery_resolution_state,
+       candidate.provider_requested_delivery_at,
+       candidate.requested_delivery_at,
+       candidate.blocking_codes,
        line.external_product_id,
        line.external_variant_id,
        line.product_id::text,
@@ -2041,6 +2050,14 @@ async function verifyFaireExactVariantPackBinding(
   for (const row of [successCandidate, staleCandidate]) {
     assert.equal(row.mapping_state, 'resolved')
     assert.equal(row.packaging_state, 'unresolved')
+    assert.equal(row.delivery_resolution_state, 'not_supplied')
+    assert.equal(row.provider_requested_delivery_at, null)
+    assert.equal(row.requested_delivery_at, null)
+    assert.equal(
+      row.blocking_codes.includes('delivery_decision_required'),
+      false,
+      'A provider-absent requested delivery date must not be an exception',
+    )
     assert.equal(row.product_id, ids.product)
     assert.ok(row.product_mapping_id)
     assert.equal(row.commerce_variant_pack_mapping_id, null)
@@ -4649,9 +4666,22 @@ async function verifyAutomaticShopifyCleanPromotion(
            ship_to_snapshot_tag = $6,
            ship_to_snapshot_hash = $7,
            ship_to_snapshot_encryption_version = 1,
-           delivery_resolution_state = 'policy',
-           requested_delivery_at = $8::timestamptz,
-           delivery_policy_version = 'shopify-clean-path-test-v1',
+           delivery_resolution_state = CASE
+             WHEN candidate.external_order_id = $10 THEN 'not_supplied'
+             ELSE 'policy'
+           END,
+           provider_requested_delivery_at = CASE
+             WHEN candidate.external_order_id = $10 THEN NULL
+             ELSE candidate.provider_requested_delivery_at
+           END,
+           requested_delivery_at = CASE
+             WHEN candidate.external_order_id = $10 THEN NULL
+             ELSE $8::timestamptz
+           END,
+           delivery_policy_version = CASE
+             WHEN candidate.external_order_id = $10 THEN NULL
+             ELSE 'shopify-clean-path-test-v1'
+           END,
            provider_created_at = $9::timestamptz,
            provider_updated_at = $9::timestamptz,
            observed_at = $9::timestamptz,
@@ -4791,6 +4821,9 @@ async function verifyAutomaticShopifyCleanPromotion(
        candidate.row_version::integer,
        candidate.provider_created_at,
        candidate.observed_at,
+       candidate.delivery_resolution_state,
+       candidate.provider_requested_delivery_at,
+       candidate.requested_delivery_at,
        candidate.checkout_destination_fingerprint,
        run.global_id AS run_global_id,
        operations_shopify_checkout_order_line_quantity_fingerprint(
@@ -4984,6 +5017,9 @@ async function verifyAutomaticShopifyCleanPromotion(
   const missingCandidate = byExternalId.get(candidateKeys.missing)
   const ambiguousCandidate = byExternalId.get(candidateKeys.ambiguous)
   const expiredCandidate = byExternalId.get(candidateKeys.expired)
+  assert.equal(successCandidate.delivery_resolution_state, 'not_supplied')
+  assert.equal(successCandidate.provider_requested_delivery_at, null)
+  assert.equal(successCandidate.requested_delivery_at, null)
   await insertCheckoutReceipt({
     candidate: successCandidate,
     key: 'success-a',
@@ -5265,6 +5301,18 @@ async function verifyAutomaticShopifyCleanPromotion(
     assert.equal(promoted.checkoutRateReconciliation.outcome, 'matched')
     assert.equal(promoted.providerWrites, 0)
     assert.equal(promoted.inventoryWrites, 0)
+    const promotedDelivery = (await pool.query(
+      `SELECT requested_delivery_at
+       FROM operations_orders
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [ids.organization, promoted.canonicalOrderGlobalId],
+    )).rows[0]
+    assert.equal(
+      promotedDelivery.requested_delivery_at,
+      null,
+      'A Shopify order without a sales-channel requested date promotes with a null canonical date',
+    )
     const authoritativeSubsidizedMatch = (await pool.query(
       `SELECT
          reconciliation.outcome,

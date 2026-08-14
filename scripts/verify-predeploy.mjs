@@ -126,6 +126,7 @@ for (const requiredPath of [
   'db/migrations/0277_operations_commerce_authority_policies.sql',
   'db/migrations/0278_operations_shopify_order_webhook_signals.sql',
   'db/migrations/0279_operations_packaging_material_lifecycle.sql',
+  'db/migrations/0282_operations_commerce_delivery_not_supplied.sql',
   'app_src/app/api/operations/order-revisions/route.ts',
   'app_src/app/api/integrations/commerce/order-history/route.ts',
   'app_src/app/api/integrations/commerce/authority-policies/route.ts',

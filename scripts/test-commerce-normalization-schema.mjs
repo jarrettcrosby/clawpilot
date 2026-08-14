@@ -12,6 +12,10 @@ const continuationMigration = readFileSync(resolve(
   process.cwd(),
   'db/migrations/0115_operations_commerce_intake_continuations.sql',
 ), 'utf8')
+const deliveryNotSuppliedMigration = readFileSync(resolve(
+  process.cwd(),
+  'db/migrations/0282_operations_commerce_delivery_not_supplied.sql',
+), 'utf8')
 const incompleteHeaderMoneyMigration = readFileSync(resolve(
   process.cwd(),
   'db/migrations/0122_operations_commerce_incomplete_header_money.sql',
@@ -90,17 +94,30 @@ assert.doesNotMatch(
   'Normalized product-image evidence must not expose provider URLs or bytes',
 )
 includesAllIn(shopifyNormalizer, [
-  "'shopify-commerce-normalizer-v4'",
+  "'shopify-commerce-normalizer-v5'",
   'shopifyProductImages',
   'shopifyProductSourceEvidence',
 ], 'Shopify product-image normalizer')
 includesAllIn(faireNormalizer, [
-  "'faire-commerce-normalizer-v7'",
+  "'faire-commerce-normalizer-v8'",
   'faireProductImages',
   'faireProductSourceEvidence',
   'optionalFaireSemanticText',
   'requiredFaireSemanticText',
 ], 'Faire product-image and semantic-text normalizer')
+
+includesAllIn(deliveryNotSuppliedMigration, [
+  "'not_supplied'",
+  "delivery_resolution_state = 'not_supplied'",
+  'provider_requested_delivery_at IS NULL',
+  'Do not rewrite pre-migration unresolved rows',
+  "'provider', 'manual', 'policy', 'not_required', 'not_supplied'",
+], 'Provider-absent requested delivery date schema')
+includesAllIn(normalizationContract, [
+  "| 'delivery_not_supplied'",
+  "input.requestedDeliveryAt.reason === 'not_requested'",
+  "fact('delivery', 'delivery_not_supplied', false)",
+], 'Provider-absent requested delivery date readiness')
 
 includesAll([
   "('gcir', 'operations.commerce_intake_run'",
