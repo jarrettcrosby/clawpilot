@@ -125,6 +125,8 @@ for (const chartContract of [
 }
 assert.match(chartRequestBlock, /title: 'Interactions, last quarter'/)
 assert.match(chartRequestBlock, /stackedType: 'NOT_STACKED'/)
+assert.match(chartRequestBlock, /title: 'Opportunities by stage'[\s\S]*legendPosition: 'TOP_LEGEND'/)
+assert.match(chartRequestBlock, /seriesColors: opportunityStageColors/)
 assert.match(chartRequestBlock, /title: 'Potential Revenue by Stage, Next 2 Quarters'[\s\S]*stackedType: 'STACKED'/)
 assert.match(chartRequestBlock, /title: 'Potential Revenue by Stage, Next 2 Quarters'[\s\S]*legendPosition: 'TOP_LEGEND'/)
 assert.match(chartRequestBlock, /title: 'Potential Revenue by Stage, Next 2 Quarters'[\s\S]*valueAxisTitle: 'Potential revenue'/)
@@ -135,6 +137,9 @@ const dashboardWrites = source.slice(
   source.indexOf('function googleBorder'),
 )
 assert.match(dashboardWrites, /const interactionTypes = \['Direct Mail', 'LinkedIn', 'Email', 'Call', 'In Person', 'Note', 'Campaign'\]/)
+assert.match(dashboardWrites, /const opportunityStages = OPPORTUNITY_STAGE_PALETTE\.map/)
+assert.match(dashboardWrites, /\['Stage', \.\.\.opportunityStages\]/)
+assert.match(dashboardWrites, /=IF\(\$S\$\{5 \+ rowIndex\}=\$\{seriesColumn\}\$4,COUNTIFS/)
 assert.match(source, /Interactions: \['Priority', 'Type', 'Owner', 'Organization', 'Agent', 'Date', 'Opportunity', 'Contact', 'Notes'\]/)
 assert.match(dashboardWrites, /Interactions!\$C\$5:\$C/)
 assert.match(dashboardWrites, /Interactions!\$G\$5:\$G/)
@@ -147,21 +152,24 @@ for (const cell of ['B5', 'B6', 'H5', 'H6', 'B8', 'D8', 'F8', 'I8', 'K8', 'B9', 
 }
 assert.match(source, /const DASHBOARD_MATERIAL =/)
 assert.match(source, /fontFamily: 'Roboto Mono'/)
-for (const range of ['S4', 'V4', 'AE4', 'AN4']) {
+for (const range of ['S4', 'AC4', 'AK4', 'AS4']) {
   assert.ok(dashboardWrites.includes(`'Dashboard'!${range}`), `Dashboard helper write missing ${range}`)
 }
 assert.match(source, /const DASHBOARD_HELPER_COLUMN_INDEX = 15/)
 assert.match(source, /const DASHBOARD_STAGE_HELPER_COLUMN_INDEX = 18/)
-assert.match(source, /const DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX = 21/)
-assert.match(source, /const DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX = 30/)
-assert.match(source, /const DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX = 39/)
-assert.match(source, /const DASHBOARD_HELPER_END_COLUMN_INDEX = 42/)
+assert.match(source, /const DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX = 28/)
+assert.match(source, /const DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX = 36/)
+assert.match(source, /const DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX = 44/)
+assert.match(source, /const DASHBOARD_HELPER_END_COLUMN_INDEX = 47/)
 assert.match(source, /properties: \{ hiddenByUser: true \}/)
 assert.match(source, /hideGridlines: true/)
 assert.match(source, /tabColor: googleColor\(WORKBOOK_TAB_COLORS\[title\]\)/)
 assert.match(source, /properties: \{ pixelSize \}/)
 assert.match(source, /tableBandingRequest/)
 assert.match(source, /setBasicFilter/)
+assert.match(source, /function opportunityStageConditionalFormatting/)
+assert.match(source, /columnIndex: 6/)
+assert.match(source, /\.\.\.opportunityStageConditionalFormatting\(sheetIdValue, rowCount\)/)
 
 assert.match(source, /pattern: '0\.0"%"'/)
 assert.match(source, /numeric\(10, 'NUMBER_BETWEEN', \['0', '100'\]\)/)
