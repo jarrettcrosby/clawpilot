@@ -9,19 +9,28 @@ const TOP_LEVEL_FIELDS = [
   'customerReleaseReady',
   'product',
   'schemaVersion',
+  'signature',
   'sourceCommit',
   'version',
 ]
 const ARTIFACT_FIELDS = [
   'architecture',
   'byteLength',
+  'credentialEmbedded',
   'customerReleaseReady',
+  'deliveryBackend',
   'filename',
+  'manifestSignature',
   'notarized',
   'platform',
+  'printerEndpointEmbedded',
+  'product',
+  'schemaVersion',
   'sha256',
   'signed',
+  'sourceCommit',
   'stapled',
+  'version',
 ]
 
 export class PrintAgentReleaseError extends Error {
@@ -109,6 +118,9 @@ function releaseAsset(value) {
   if (!Number.isSafeInteger(id) || id < 1 || !name || !Number.isSafeInteger(size) || size < 1 || asset.state !== 'uploaded') {
     fail('PRINT_AGENT_RELEASE_ASSET_INVALID', 'GitHub returned invalid release asset metadata')
   }
+  if (!/^sha256:[0-9a-f]{64}$/.test(digest)) {
+    fail('PRINT_AGENT_RELEASE_ASSET_INVALID', 'GitHub release asset digest is unavailable or invalid')
+  }
   return { id, name, size, digest }
 }
 
@@ -125,6 +137,7 @@ function validateIndex(configuration, value) {
     || index.version !== configuration.version
     || index.sourceCommit !== configuration.sourceCommit
     || index.customerReleaseReady !== true
+    || index.signature !== 'sigstore-bundle-required-before-publish'
     || !Array.isArray(index.artifacts)
     || index.artifacts.length !== 2) {
     fail('PRINT_AGENT_RELEASE_INDEX_INVALID', 'Release index does not match the configured customer release')
@@ -145,7 +158,11 @@ function validateIndex(configuration, value) {
     expectedPairs.delete(pair)
     const byteLength = Number(artifact.byteLength)
     const sha256 = String(artifact.sha256 || '').toLowerCase()
-    if (artifact.filename !== expectedArtifact(configuration, platform)
+    if (artifact.schemaVersion !== 1
+      || artifact.product !== 'ClawPilot Print Agent'
+      || artifact.version !== configuration.version
+      || artifact.sourceCommit !== configuration.sourceCommit
+      || artifact.filename !== expectedArtifact(configuration, platform)
       || !Number.isSafeInteger(byteLength)
       || byteLength < 1
       || !SHA256.test(sha256)
@@ -153,7 +170,11 @@ function validateIndex(configuration, value) {
       || artifact.signed !== true
       || artifact.notarized !== expected.notarized
       || artifact.stapled !== expected.stapled
-      || artifact.customerReleaseReady !== true) {
+      || artifact.customerReleaseReady !== true
+      || artifact.credentialEmbedded !== false
+      || artifact.printerEndpointEmbedded !== false
+      || artifact.deliveryBackend !== 'raw-network-zpl'
+      || artifact.manifestSignature !== 'sigstore-bundle-required-before-publish') {
       fail('PRINT_AGENT_RELEASE_INDEX_INVALID', 'Release artifact is not customer-ready or does not match the configured contract')
     }
     return {
@@ -284,7 +305,16 @@ export async function verifyPrintAgentRelease({ configuration, request, download
   const { artifacts } = validateIndex(configuration, parsedIndex)
   const expectedAssetNames = new Set([
     configuration.indexFilename,
-    ...artifacts.map((artifact) => artifact.filename),
+    `${configuration.indexFilename}.sigstore.json`,
+    'SHA256SUMS.txt',
+    'SHA256SUMS.txt.sigstore.json',
+    ...artifacts.flatMap((artifact) => [
+      artifact.filename,
+      `${artifact.filename}.artifact.json`,
+      `${artifact.filename}.artifact.json.sigstore.json`,
+      `${artifact.filename}.sha256`,
+      `${artifact.filename}.sha256.sigstore.json`,
+    ]),
   ])
   if (githubAssets.length !== expectedAssetNames.size
     || githubAssets.some((asset) => !expectedAssetNames.has(asset.name))) {

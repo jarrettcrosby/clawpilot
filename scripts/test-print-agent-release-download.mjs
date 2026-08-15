@@ -27,6 +27,10 @@ function artifact(platform) {
   const macos = platform === 'macos'
   const bytes = Buffer.from(macos ? 'signed notarized stapled dmg' : 'signed windows executable')
   return {
+    schemaVersion: 1,
+    product: 'ClawPilot Print Agent',
+    version,
+    sourceCommit,
     platform,
     architecture: macos ? 'universal' : 'x64',
     filename: `ClawPilot-Print-Agent-${version}-${macos ? 'mac-universal.dmg' : 'win-x64.exe'}`,
@@ -36,6 +40,20 @@ function artifact(platform) {
     notarized: macos,
     stapled: macos,
     customerReleaseReady: true,
+    credentialEmbedded: false,
+    printerEndpointEmbedded: false,
+    deliveryBackend: 'raw-network-zpl',
+    manifestSignature: 'sigstore-bundle-required-before-publish',
+  }
+}
+
+function uploadedAsset(id, name, bytes = Buffer.from(name)) {
+  return {
+    id,
+    name,
+    state: 'uploaded',
+    size: bytes.length,
+    digest: `sha256:${sha256(bytes)}`,
   }
 }
 
@@ -47,21 +65,34 @@ function fixture(mutateIndex) {
     sourceCommit,
     customerReleaseReady: true,
     artifacts: [artifact('macos'), artifact('windows')],
+    signature: 'sigstore-bundle-required-before-publish',
   }
   mutateIndex?.(index)
   const indexBytes = Buffer.from(JSON.stringify(index))
   const indexDigest = sha256(indexBytes)
   const indexFilename = `ClawPilot-Print-Agent-${version}-release.json`
-  const assets = [
-    { id: 10, name: indexFilename, state: 'uploaded', size: indexBytes.length, digest: `sha256:${indexDigest}` },
-    ...index.artifacts.filter((item) => item && typeof item === 'object').map((item, position) => ({
-      id: 11 + position,
-      name: item.filename,
-      state: 'uploaded',
-      size: item.byteLength,
+  let nextAssetId = 10
+  const assets = [uploadedAsset(nextAssetId++, indexFilename, indexBytes)]
+  for (const item of index.artifacts.filter((candidate) => candidate && typeof candidate === 'object')) {
+    const binaryBytes = Buffer.alloc(item.byteLength, item.platform === 'macos' ? 'm' : 'w')
+    assets.push({
+      ...uploadedAsset(nextAssetId++, item.filename, binaryBytes),
       digest: `sha256:${item.sha256}`,
-    })),
-  ]
+    })
+    for (const suffix of [
+      '.artifact.json',
+      '.artifact.json.sigstore.json',
+      '.sha256',
+      '.sha256.sigstore.json',
+    ]) {
+      assets.push(uploadedAsset(nextAssetId++, `${item.filename}${suffix}`))
+    }
+  }
+  assets.push(
+    uploadedAsset(nextAssetId++, `${indexFilename}.sigstore.json`),
+    uploadedAsset(nextAssetId++, 'SHA256SUMS.txt'),
+    uploadedAsset(nextAssetId++, 'SHA256SUMS.txt.sigstore.json'),
+  )
   return {
     indexBytes,
     configuration: {
