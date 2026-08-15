@@ -19,6 +19,9 @@ const health = readFileSync(
 
 const required0285Structure = [
   '0285_shopify_carrier_service_configured_carriers.sql',
+  '0292_shopify_registered_rate_source_refresh.sql',
+  "'operations_shopify_carrier_service_config_materials'",
+  "'operations_shopify_carrier_service_config_carriers'",
   'operations_shopify_carrier_service_config_carriers_pkey',
   'PRIMARY KEY (organization_id, config_id, carrier_account_id)',
   'operations_shopify_checkout_rate_receipt_provider_attempts_pkey',

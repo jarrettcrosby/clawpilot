@@ -4297,12 +4297,24 @@ export async function GET() {
                 WHERE filename =
                   '0285_shopify_carrier_service_configured_carriers.sql'
               )
+              AND EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0292_shopify_registered_rate_source_refresh.sql'
+              )
               AND to_regprocedure(
                 'operations_shopify_carrier_service_config_is_ready(uuid,uuid)'
               ) IS NOT NULL
               AND to_regprocedure(
                 'operations_shopify_carrier_service_config_environment_is_ready(uuid,uuid,text)'
               ) IS NOT NULL
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'validate_operations_shopify_carrier_service_config_child()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%TG_TABLE_NAME IN ( ''operations_shopify_carrier_service_config_materials'', ''operations_shopify_carrier_service_config_carriers'' )%'
               AND NOT EXISTS (
                 SELECT 1
                 FROM (VALUES

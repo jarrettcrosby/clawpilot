@@ -95,10 +95,15 @@ export type ShopifyCarrierServiceConfigWriteInput = {
   actorEmail: string
 }
 
-export type ShopifyCarrierServiceCarrierBindingsWriteInput = {
+export type ShopifyCarrierServiceRateSourcesWriteInput = {
   organizationId: string
   accountGlobalId: string
   expectedRowVersion: number
+  warehouseGlobalId: string
+  materials: Array<{
+    materialGlobalId: string
+    expectedRowVersion: number
+  }>
   carriers: Array<{
     provider: ShopifyCheckoutCarrierProvider
     carrierAccountGlobalId: string
@@ -1536,7 +1541,7 @@ function assertPolicyHash(
 }
 
 function normalizeShopifyCarrierServiceCarrierBindings(
-  carriers: ShopifyCarrierServiceCarrierBindingsWriteInput['carriers'],
+  carriers: ShopifyCarrierServiceRateSourcesWriteInput['carriers'],
 ) {
   if (
     !Array.isArray(carriers)
@@ -1585,6 +1590,46 @@ function normalizeShopifyCarrierServiceCarrierBindings(
   ))
 }
 
+function normalizeShopifyCarrierServiceMaterials(
+  materials: ShopifyCarrierServiceRateSourcesWriteInput['materials'],
+) {
+  if (
+    !Array.isArray(materials)
+    || materials.length < 1
+    || materials.length > MAX_SHOPIFY_CHECKOUT_MATERIALS
+  ) {
+    fail(
+      'SHOPIFY_CHECKOUT_MATERIAL_COUNT_INVALID',
+      `Select between 1 and ${MAX_SHOPIFY_CHECKOUT_MATERIALS} packaging materials`,
+    )
+  }
+  const materialIds = new Set<string>()
+  return materials.map((material, index) => {
+    const materialGlobalId = matchValue(
+      material.materialGlobalId,
+      MATERIAL_GLOBAL_ID,
+      'Packaging material Global ID',
+    )
+    if (materialIds.has(materialGlobalId)) {
+      fail(
+        'SHOPIFY_CHECKOUT_MATERIAL_DUPLICATE',
+        'A packaging material can be selected only once',
+      )
+    }
+    materialIds.add(materialGlobalId)
+    return {
+      selectionSequence: index + 1,
+      materialGlobalId,
+      expectedRowVersion: integer(
+        material.expectedRowVersion,
+        'Packaging material row version',
+        0,
+        Number.MAX_SAFE_INTEGER,
+      ),
+    }
+  })
+}
+
 export function normalizeShopifyCarrierServiceConfigInput(
   input: ShopifyCarrierServiceConfigWriteInput,
 ): NormalizedShopifyCarrierServiceConfigInput {
@@ -1618,41 +1663,7 @@ export function normalizeShopifyCarrierServiceConfigInput(
     'CarrierService policy snapshot',
   )
   assertPolicyHash(policyHash, input.policySnapshot)
-  if (
-    !Array.isArray(input.materials)
-    || input.materials.length < 1
-    || input.materials.length > MAX_SHOPIFY_CHECKOUT_MATERIALS
-  ) {
-    fail(
-      'SHOPIFY_CHECKOUT_MATERIAL_COUNT_INVALID',
-      `Select between 1 and ${MAX_SHOPIFY_CHECKOUT_MATERIALS} packaging materials`,
-    )
-  }
-  const materialIds = new Set<string>()
-  const materials = input.materials.map((material, index) => {
-    const materialGlobalId = matchValue(
-      material.materialGlobalId,
-      MATERIAL_GLOBAL_ID,
-      'Packaging material Global ID',
-    )
-    if (materialIds.has(materialGlobalId)) {
-      fail(
-        'SHOPIFY_CHECKOUT_MATERIAL_DUPLICATE',
-        'A packaging material can be selected only once',
-      )
-    }
-    materialIds.add(materialGlobalId)
-    return {
-      selectionSequence: index + 1,
-      materialGlobalId,
-      expectedRowVersion: integer(
-        material.expectedRowVersion,
-        'Packaging material row version',
-        0,
-        Number.MAX_SAFE_INTEGER,
-      ),
-    }
-  })
+  const materials = normalizeShopifyCarrierServiceMaterials(input.materials)
   const carriers = normalizeShopifyCarrierServiceCarrierBindings(
     input.carriers,
   )
@@ -3529,14 +3540,15 @@ export async function upsertShopifyCarrierServiceConfigInPostgres(
 }
 
 /**
- * Replace only the exact TEST/LIVE carrier-account bindings behind an already
- * registered Shopify CarrierService. Shopify registration and callback-token
- * identity are retained. The row-version advance invalidates cached callback
- * context, while the shared advisory lock and live-receipt check prevent an
- * account rotation from crossing an in-flight checkout claim.
+ * Replace the exact revision-fenced packaging materials and TEST/LIVE carrier
+ * accounts behind an already registered Shopify CarrierService. Shopify
+ * registration, callback-token identity, warehouse, and policy are retained.
+ * The row-version advance invalidates cached callback context, while the shared
+ * advisory lock and live-receipt check prevent the source refresh from crossing
+ * an in-flight checkout claim.
  */
-export async function updateRegisteredShopifyCarrierServiceCarrierBindingsInPostgres(
-  rawInput: ShopifyCarrierServiceCarrierBindingsWriteInput,
+export async function updateRegisteredShopifyCarrierServiceRateSourcesInPostgres(
+  rawInput: ShopifyCarrierServiceRateSourcesWriteInput,
 ) {
   const input = {
     organizationId: matchValue(
@@ -3555,6 +3567,12 @@ export async function updateRegisteredShopifyCarrierServiceCarrierBindingsInPost
       0,
       Number.MAX_SAFE_INTEGER,
     ),
+    warehouseGlobalId: matchValue(
+      rawInput.warehouseGlobalId,
+      WAREHOUSE_GLOBAL_ID,
+      'Warehouse Global ID',
+    ),
+    materials: normalizeShopifyCarrierServiceMaterials(rawInput.materials),
     carriers: normalizeShopifyCarrierServiceCarrierBindings(
       rawInput.carriers,
     ),
@@ -3613,6 +3631,7 @@ export async function updateRegisteredShopifyCarrierServiceCarrierBindingsInPost
       activation_revision: number
       current_activation_revision: number
       activation_state: 'shadow' | 'active'
+      warehouse_global_id: string
     }>(
       `SELECT
          config.id::text,
@@ -3622,13 +3641,17 @@ export async function updateRegisteredShopifyCarrierServiceCarrierBindingsInPost
          config.service_gid,
          config.activation_revision,
          activation.revision AS current_activation_revision,
-         activation.state AS activation_state
+         activation.state AS activation_state,
+         warehouse.global_id AS warehouse_global_id
        FROM operations_shopify_carrier_service_configs config
        JOIN operations_integration_accounts account
          ON account.organization_id = config.organization_id
         AND account.id = config.integration_account_id
        JOIN operations_activation_scopes activation
          ON activation.organization_id = config.organization_id
+       JOIN operations_warehouses warehouse
+         ON warehouse.organization_id = config.organization_id
+        AND warehouse.id = config.warehouse_id
        WHERE config.organization_id = $1::uuid
          AND config.id = $2::uuid
          AND account.global_id = $3
@@ -3649,6 +3672,13 @@ export async function updateRegisteredShopifyCarrierServiceCarrierBindingsInPost
       fail(
         'SHOPIFY_CHECKOUT_CONFIG_VERSION_CONFLICT',
         'CarrierService configuration changed. Refresh and try again.',
+        409,
+      )
+    }
+    if (current.warehouse_global_id !== input.warehouseGlobalId) {
+      fail(
+        'SHOPIFY_CHECKOUT_REGISTERED_WAREHOUSE_IMMUTABLE',
+        'Disable the provider CarrierService before changing its warehouse',
         409,
       )
     }
@@ -3729,6 +3759,36 @@ export async function updateRegisteredShopifyCarrierServiceCarrierBindingsInPost
         409,
       )
     }
+    const selectedMaterials = await client.query<{
+      id: string
+      global_id: string
+      row_version: string
+    }>(
+      `SELECT id::text, global_id, row_version::text
+       FROM operations_packaging_materials
+       WHERE organization_id = $1::uuid
+         AND global_id = ANY($2::text[])`,
+      [
+        input.organizationId,
+        input.materials.map((item) => item.materialGlobalId),
+      ],
+    )
+    const materialByGlobalId = new Map(
+      selectedMaterials.rows.map((row) => [row.global_id, row]),
+    )
+    for (const selected of input.materials) {
+      const row = materialByGlobalId.get(selected.materialGlobalId)
+      if (
+        !row
+        || Number(row.row_version) !== selected.expectedRowVersion
+      ) {
+        fail(
+          'SHOPIFY_CHECKOUT_MATERIAL_VERSION_CONFLICT',
+          `Packaging material ${selected.materialGlobalId} changed or is unavailable`,
+          409,
+        )
+      }
+    }
     const selectedCarriers = await client.query<{
       id: string
       global_id: string
@@ -3796,6 +3856,41 @@ export async function updateRegisteredShopifyCarrierServiceCarrierBindingsInPost
          true
        )`,
       [`${current.id}:${input.expectedRowVersion}`],
+    )
+    await client.query(
+      `DELETE FROM operations_shopify_carrier_service_config_materials
+       WHERE organization_id = $1::uuid
+         AND config_id = $2::uuid`,
+      [input.organizationId, current.id],
+    )
+    await client.query(
+      `INSERT INTO operations_shopify_carrier_service_config_materials (
+         organization_id, config_id, selection_sequence,
+         packaging_material_id, packaging_material_row_version
+       )
+       SELECT
+         $1::uuid,
+         $2::uuid,
+         selected.selection_sequence,
+         material.id,
+         selected.expected_row_version
+       FROM jsonb_to_recordset($3::jsonb) AS selected(
+         selection_sequence integer,
+         material_global_id text,
+         expected_row_version bigint
+       )
+       JOIN operations_packaging_materials material
+         ON material.organization_id = $1::uuid
+        AND material.global_id = selected.material_global_id`,
+      [
+        input.organizationId,
+        current.id,
+        JSON.stringify(input.materials.map((item) => ({
+          selection_sequence: item.selectionSequence,
+          material_global_id: item.materialGlobalId,
+          expected_row_version: item.expectedRowVersion,
+        }))),
+      ],
     )
     await client.query(
       `DELETE FROM operations_shopify_carrier_service_config_carriers
@@ -3882,15 +3977,20 @@ export async function updateRegisteredShopifyCarrierServiceCarrierBindingsInPost
     await recordAuditEvent({
       actor: input.actorEmail,
       eventType:
-        'operations.shopify_carrier_service.carrier_bindings_updated',
+        'operations.shopify_carrier_service.rate_sources_updated',
       aggregateType: 'operations.shopify_carrier_service_config',
       aggregateId: current.global_id,
       subject: input.accountGlobalId,
       organizationId: input.organizationId,
       eventKey:
-        `operations:shopify-carrier-service:${current.global_id}:version:${updated.rows[0].row_version}:carrier-bindings`,
+        `operations:shopify-carrier-service:${current.global_id}:version:${updated.rows[0].row_version}:rate-sources`,
       payload: {
         accountGlobalId: input.accountGlobalId,
+        warehouseGlobalId: input.warehouseGlobalId,
+        materials: input.materials.map((material) => ({
+          materialGlobalId: material.materialGlobalId,
+          rowVersion: material.expectedRowVersion,
+        })),
         carrierAccounts: selectedCarriers.rows.map((carrier) => ({
           provider: carrier.provider,
           environment: carrier.environment,
@@ -3909,6 +4009,7 @@ export async function updateRegisteredShopifyCarrierServiceCarrierBindingsInPost
         registrationState: current.registration_state,
         serviceGidRetained: current.service_gid,
         callbackTokenRetained: true,
+        policyRetained: true,
         providerWrites: 0,
       },
     }, client)
