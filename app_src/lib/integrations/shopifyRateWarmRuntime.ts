@@ -18,6 +18,9 @@ import {
   readShopifyCheckoutRateWarmPolicy,
 } from '@/lib/operations/shopifyCheckoutRateWarmPolicy'
 import {
+  readShopifyCheckoutAudiencePolicy,
+} from '@/lib/operations/shopifyCheckoutAudiencePolicy'
+import {
   loadShopifyRateWarmResponse,
   type ShopifyRateWarmDependencies,
   type ShopifyRateWarmResponse,
@@ -58,6 +61,7 @@ const DEFAULT_DEPENDENCIES: ShopifyRateWarmDependencies = {
   readShopHint: readShopifyAppProxyShopHint,
   verifyProxy: verifyShopifyAppProxyRequest,
   readPolicy: readShopifyCheckoutRateWarmPolicy,
+  readAudiencePolicy: readShopifyCheckoutAudiencePolicy,
   async isShadowCustomerAllowed(customerId, tenant) {
     const customerPolicy =
       await readActiveShopifyCustomerRatePolicyFromPostgres({

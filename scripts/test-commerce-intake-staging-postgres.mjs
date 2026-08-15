@@ -572,6 +572,10 @@ function loadShopifyCheckoutRatingPersistence(pool) {
         loadTypeScriptModule(
           'app_src/lib/operations/shopifyCheckoutRateWarmPolicy.ts',
         ),
+      '@/lib/operations/shopifyCheckoutAudiencePolicy':
+        loadTypeScriptModule(
+          'app_src/lib/operations/shopifyCheckoutAudiencePolicy.ts',
+        ),
       '@/lib/persistence/postgres': postgres,
     },
   )

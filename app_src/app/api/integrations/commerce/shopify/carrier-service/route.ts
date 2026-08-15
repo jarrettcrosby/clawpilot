@@ -35,6 +35,11 @@ import {
   ShopifyCheckoutRateWarmPolicyError,
 } from '@/lib/operations/shopifyCheckoutRateWarmPolicy'
 import {
+  normalizeShopifyCheckoutAudiencePolicy,
+  readShopifyCheckoutAudiencePolicy,
+  ShopifyCheckoutAudiencePolicyError,
+} from '@/lib/operations/shopifyCheckoutAudiencePolicy'
+import {
   activeOperationsOrganizationId,
   operationsCapabilities,
 } from '@/lib/operations/authorization'
@@ -57,6 +62,7 @@ import {
   ShopifyCheckoutRatingPersistenceError,
   updateShopifyCarrierServiceBrandNameOverrideInPostgres,
   updateRegisteredShopifyCarrierServiceRateSourcesInPostgres,
+  updateShopifyCarrierServiceAudiencePolicyInPostgres,
   updateShopifyCarrierServicePlanRatePolicyInPostgres,
   updateShopifyCarrierServiceRateWarmPolicyInPostgres,
   upsertShopifyCarrierServiceConfigInPostgres,
@@ -139,6 +145,12 @@ function errorResponse(error: unknown) {
     )
   }
   if (error instanceof ShopifyCheckoutRateWarmPolicyError) {
+    return json(
+      { ok: false, error: error.message, code: error.code },
+      400,
+    )
+  }
+  if (error instanceof ShopifyCheckoutAudiencePolicyError) {
     return json(
       { ok: false, error: error.message, code: error.code },
       400,
@@ -385,6 +397,9 @@ function publicCarrierServiceConfig(
       config.policySnapshot,
     ),
     checkoutRateWarm: readShopifyCheckoutRateWarmPolicy(
+      config.policySnapshot,
+    ),
+    shadowCheckoutAudience: readShopifyCheckoutAudiencePolicy(
       config.policySnapshot,
     ),
     inventoryMaxAgeSeconds: config.inventoryMaxAgeSeconds,
@@ -754,11 +769,26 @@ async function setupState(input: {
     && account.status === 'active'
     && account.verificationStatus === 'verified'
   )
+  const shadowCheckoutAudienceMode =
+    publicConfig?.shadowCheckoutAudience.mode || 'restricted_customers'
+  const callbackRegistrationReady = Boolean(
+    publicConfig?.registrationState === 'registered'
+    && publicConfig.serviceGid
+    && publicConfig.ready === true
+  )
   const shadowCheckoutIsolationBlockers = [
-    ...(customerPolicySummary.shadowAllowedCount < 1
+    ...(!callbackRegistrationReady
+      ? ['registered callback-ready CarrierService']
+      : []),
+    ...(shadowCheckoutAudienceMode === 'off'
+      ? ['checkout audience is Off']
+      : []),
+    ...(shadowCheckoutAudienceMode === 'restricted_customers'
+      && customerPolicySummary.shadowAllowedCount < 1
       ? ['at least one unexpired allow policy in Checkout audience']
       : []),
-    ...(!hasValidShopifyShadowVariantAllowlist()
+    ...(shadowCheckoutAudienceMode === 'restricted_customers'
+      && !hasValidShopifyShadowVariantAllowlist()
       ? ['SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS']
       : []),
   ]
@@ -790,13 +820,25 @@ async function setupState(input: {
     canManage: input.canManage,
     checkoutAudience: {
       state: reference.activation.state === 'shadow'
-        ? customerPolicySummary.shadowAllowedCount > 0
-          ? 'shadow_binary_ready'
-          : 'shadow_customer_required'
+        ? shadowCheckoutAudienceMode === 'off'
+          ? 'shadow_off'
+          : shadowCheckoutAudienceMode === 'all_eligible'
+            ? shadowSandboxAccountReady && callbackRegistrationReady
+              ? 'shadow_all_eligible_ready'
+              : 'shadow_all_eligible_unavailable'
+            : customerPolicySummary.shadowAllowedCount > 0
+              && shadowSandboxAccountReady
+              && callbackRegistrationReady
+              ? 'shadow_restricted_ready'
+              : 'shadow_customer_required'
         : reference.activation.state === 'active'
           ? 'active_default_ready_provider_overrides_blocked'
           : 'inactive',
-      defaultPolicy: customerPolicySummary.enforcement.defaultPolicy,
+      mode: shadowCheckoutAudienceMode,
+      defaultPolicy: reference.activation.state === 'shadow'
+        && shadowCheckoutAudienceMode === 'all_eligible'
+        ? 'show_all'
+        : customerPolicySummary.enforcement.defaultPolicy,
       policyCount: customerPolicySummary.policyCount,
       unexpiredShadowPolicyCount: customerPolicySummary.simulatedCount,
       shadowAllowedCustomerCount: customerPolicySummary.shadowAllowedCount,
@@ -807,7 +849,15 @@ async function setupState(input: {
       earliestShadowExpiresAt:
         customerPolicySummary.earliestShadowExpiresAt,
       shadowBinaryTestReady: reference.activation.state === 'shadow'
-        && customerPolicySummary.shadowAllowedCount > 0,
+        && shadowSandboxAccountReady
+        && callbackRegistrationReady
+        && (
+          shadowCheckoutAudienceMode === 'all_eligible'
+          || (
+            shadowCheckoutAudienceMode === 'restricted_customers'
+            && customerPolicySummary.shadowAllowedCount > 0
+          )
+        ),
       providerEnforcementState: customerPolicySummary.enforcement.state,
       providerEnforcementAvailable:
         customerPolicySummary.enforcement.providerWriteAvailable,
@@ -820,11 +870,13 @@ async function setupState(input: {
       deliveryCustomizationDurable: false,
       activationAllowed: shadowSandboxRateWarmReady,
       reason: shadowSandboxRateWarmReady
-        ? `Bounded Shadow cache preparation is available only for the isolated allowlisted test-variant proof${
-          customerPolicySummary.earliestShadowExpiresAt
-            ? ` until ${customerPolicySummary.earliestShadowExpiresAt}`
-            : ''
-        }. Shopify does not guarantee Customer GID in CarrierService callbacks, and its successful-rate cache is customer-neutral; this is not deterministic customer enforcement.`
+        ? shadowCheckoutAudienceMode === 'all_eligible'
+          ? 'Bounded Shadow cache preparation is available for signed-in customers on this sandbox store without a customer allow policy. Exact product mapping, inventory, packaging, and carrier readiness still fail closed.'
+          : `Bounded Shadow cache preparation is available only for the isolated allowlisted test-variant and allowed-customer proof${
+            customerPolicySummary.earliestShadowExpiresAt
+              ? ` until ${customerPolicySummary.earliestShadowExpiresAt}`
+              : ''
+          }. Shopify does not guarantee Customer GID in CarrierService callbacks, and its successful-rate cache is customer-neutral; this is not deterministic customer enforcement.`
         : !shadowSandboxAccountReady
           ? 'Use a verified sandbox Shopify account in Operations Shadow to enable allowlisted saved-address cache preparation.'
           : `Configure ${shadowCheckoutIsolationBlockers.join(', ')} before enabling saved-address cache preparation.`,
@@ -1321,6 +1373,18 @@ export async function POST(req: NextRequest) {
               current.config.checkoutRateWarm,
             )
           : normalizeShopifyCheckoutRateWarmPolicy(undefined)
+      const shadowCheckoutAudience = Object.prototype.hasOwnProperty.call(
+        body,
+        'shadowCheckoutAudience',
+      )
+        ? normalizeShopifyCheckoutAudiencePolicy(
+            body.shadowCheckoutAudience,
+          )
+        : current.config
+          ? normalizeShopifyCheckoutAudiencePolicy(
+              current.config.shadowCheckoutAudience,
+            )
+          : normalizeShopifyCheckoutAudiencePolicy(undefined)
       if (
         checkoutRateWarm.enabled
         && current.rateWarmReadiness.activationAllowed !== true
@@ -1328,6 +1392,16 @@ export async function POST(req: NextRequest) {
         fail(
           'SHOPIFY_CHECKOUT_RATE_WARM_POLICY_SHADOW_REQUIRED',
           current.rateWarmReadiness.reason,
+          409,
+        )
+      }
+      if (
+        shadowCheckoutAudience.mode === 'all_eligible'
+        && current.account.environment !== 'sandbox'
+      ) {
+        fail(
+          'SHOPIFY_CHECKOUT_AUDIENCE_SANDBOX_REQUIRED',
+          'All eligible Shadow checkouts require a sandbox Shopify store connection',
           409,
         )
       }
@@ -1343,6 +1417,7 @@ export async function POST(req: NextRequest) {
         algorithmVersion: HYBRID_CARTONIZATION_ALGORITHM_VERSION,
         planRateOptimization,
         checkoutRateWarm,
+        shadowCheckoutAudience,
       }
       const token = shopifyCarrierServiceCallbackToken({
         organizationId: context.organizationId,
@@ -1420,6 +1495,41 @@ export async function POST(req: NextRequest) {
         expectedRowVersion: current.config.rowVersion,
         planRateOptimization: normalizeShopifyCheckoutPlanRatePolicy(
           body.planRateOptimization,
+        ),
+        actorEmail: context.actor.email,
+      })
+    } else if (action === 'save-checkout-audience') {
+      requireActivator(context.capabilities.canActivate)
+      if (!current.config) {
+        fail(
+          'SHOPIFY_CARRIER_SERVICE_CONFIG_REQUIRED',
+          'Save the Shopify checkout-rating configuration first',
+          404,
+        )
+      }
+      if (current.reference.activation.state !== 'shadow') {
+        fail(
+          'SHOPIFY_CHECKOUT_AUDIENCE_SHADOW_REQUIRED',
+          'Set Operations to Shadow before changing its checkout audience',
+          409,
+        )
+      }
+      if (!Object.prototype.hasOwnProperty.call(
+        body,
+        'shadowCheckoutAudience',
+      )) {
+        fail(
+          'SHOPIFY_CHECKOUT_AUDIENCE_POLICY_REQUIRED',
+          'Checkout audience policy is required',
+          400,
+        )
+      }
+      await updateShopifyCarrierServiceAudiencePolicyInPostgres({
+        organizationId: context.organizationId,
+        accountGlobalId: accountId,
+        expectedRowVersion: current.config.rowVersion,
+        shadowCheckoutAudience: normalizeShopifyCheckoutAudiencePolicy(
+          body.shadowCheckoutAudience,
         ),
         actorEmail: context.actor.email,
       })

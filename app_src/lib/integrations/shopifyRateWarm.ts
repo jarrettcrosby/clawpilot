@@ -78,6 +78,11 @@ export type ShopifyRateWarmDependencies = {
   readPolicy: (
     policySnapshot: Record<string, unknown>,
   ) => ShopifyRateWarmPolicy
+  readAudiencePolicy: (
+    policySnapshot: Record<string, unknown>,
+  ) => {
+    mode: 'off' | 'restricted_customers' | 'all_eligible'
+  }
   isShadowCustomerAllowed: (
     customerId: string,
     tenant: ShopifyRateWarmTenant,
@@ -200,12 +205,32 @@ export async function loadShopifyRateWarmResponse(input: {
   }
 
   const policy = tenantPolicy(tenant, input.dependencies)
-  const shadowCustomerAllowed = tenant.activationState === 'shadow'
-    ? await input.dependencies.isShadowCustomerAllowed(
-        identity.customerId,
-        tenant,
-      )
-    : false
+  let shadowAudienceAllowed = false
+  if (tenant.activationState === 'shadow') {
+    let audienceMode: 'off' | 'restricted_customers' | 'all_eligible'
+    try {
+      audienceMode = input.dependencies.readAudiencePolicy(
+        tenant.policySnapshot,
+      ).mode
+    } catch {
+      audienceMode = 'off'
+    }
+    if (
+      tenant.environment === 'sandbox'
+      && audienceMode === 'all_eligible'
+    ) {
+      shadowAudienceAllowed = true
+    } else if (
+      tenant.environment === 'sandbox'
+      && audienceMode === 'restricted_customers'
+    ) {
+      shadowAudienceAllowed =
+        await input.dependencies.isShadowCustomerAllowed(
+          identity.customerId,
+          tenant,
+        )
+    }
+  }
   const enabled = (
     policy.enabled
     && policy.mode === 'hosted_ajax'
@@ -214,7 +239,7 @@ export async function loadShopifyRateWarmResponse(input: {
       || (
         tenant.activationState === 'shadow'
         && tenant.environment === 'sandbox'
-        && shadowCustomerAllowed
+        && shadowAudienceAllowed
       )
     )
   )

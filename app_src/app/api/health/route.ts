@@ -112,6 +112,70 @@ const FAIRE_SCOPE_CURRENT_PROSRC_SHA256 =
 const FAIRE_SCOPE_TRIGGER_PROSRC_SHA256 =
   '022f71dfd366bf18bc263d8dcfee07d96e9c4e199f797c25b085403105906a03'
 
+// Exact structural attestation for 0293. The migration checksum pins the
+// backfill, the pg_proc hash pins strict policy validation, and the catalog
+// constraint hash prevents a same-named but weakened CHECK from passing.
+const SHOPIFY_CHECKOUT_AUDIENCE_POLICY_HEALTH_SQL = String.raw`
+  EXISTS (
+    SELECT 1
+    FROM schema_migrations
+    WHERE filename = '0293_shopify_checkout_audience_policy.sql'
+      AND checksum =
+        'ad112694afea9286f28d38e6522224d44b36f5b32013f87483399e6da5ce8707'
+  )
+  AND (
+    SELECT encode(
+      digest(
+        convert_to(
+          trim(regexp_replace(
+            installed_function.prosrc,
+            '[[:space:]]+', ' ', 'g'
+          )),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM pg_proc installed_function
+    WHERE installed_function.oid = to_regprocedure(
+      'operations_shopify_checkout_audience_policy_is_valid(jsonb)'
+    )
+  ) = '69cf98f4440714e6907e8c9a56a9a87e57b5985dcce3909ce80fc5980c96974a'
+  AND (
+    SELECT encode(
+      digest(
+        convert_to(
+          concat_ws(
+            '|',
+            installed_check.conname,
+            installed_check.convalidated::text,
+            pg_get_constraintdef(installed_check.oid)
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM pg_constraint installed_check
+    WHERE installed_check.conrelid = to_regclass(
+      'operations_shopify_carrier_service_configs'
+    )
+      AND installed_check.conname =
+        'operations_shopify_configs_checkout_audience_valid'
+      AND installed_check.contype = 'c'
+  ) = '8c5a314298d629ea08b1f0df80b28001f8bc31d413fe10d547dd7eaaaf5845a9'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM operations_shopify_carrier_service_configs config
+    WHERE config.policy_snapshot ? 'shadowCheckoutAudience'
+      AND operations_shopify_checkout_audience_policy_is_valid(
+        config.policy_snapshot -> 'shadowCheckoutAudience'
+      ) IS NOT TRUE
+  )
+`
+
 // Exact structural attestation for 0288. This is intentionally stricter than
 // checking schema_migrations: mapped refresh work must not run if a column,
 // constraint, foreign key, or rolling-deployment single-flight index drifts.
@@ -1873,6 +1937,7 @@ export async function GET() {
           operations_print_device_reference_privacy_applied: boolean
           operations_print_agent_pairing_grants_applied: boolean
           shopify_carrier_configured_carriers_applied: boolean
+          shopify_checkout_audience_policy_applied: boolean
           carrier_shipping_diagnostics_applied: boolean
           carrier_shipping_diagnostic_attempt_counts: Record<
             'sandbox' | 'production',
@@ -4806,6 +4871,9 @@ export async function GET() {
                 )
               )
                 AS shopify_carrier_configured_carriers_applied,
+              (
+                ${SHOPIFY_CHECKOUT_AUDIENCE_POLICY_HEALTH_SQL}
+              ) AS shopify_checkout_audience_policy_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -5274,6 +5342,7 @@ export async function GET() {
             && row?.operations_print_device_reference_privacy_applied
             && row?.operations_print_agent_pairing_grants_applied
             && row?.shopify_carrier_configured_carriers_applied
+            && row?.shopify_checkout_audience_policy_applied
             && row?.carrier_shipping_diagnostics_applied
             && row?.crm_native_activity_projection_migration_applied
             && row?.crm_contact_identity_aliases_migration_applied
@@ -5391,6 +5460,11 @@ export async function GET() {
             status: row?.operations_print_agent_pairing_grants_applied
               ? 'ready'
               : 'migration-pending',
+          },
+          shopifyCheckoutAudiencePolicy: {
+            status: row?.shopify_checkout_audience_policy_applied
+              ? 'ready'
+              : 'migration-or-structure-pending',
           },
           shopifyLocationRouting: {
             status: row?.operations_shopify_location_routing_applied
@@ -5703,6 +5777,7 @@ export async function GET() {
           || !row?.operations_print_device_reference_privacy_applied
           || !row?.operations_print_agent_pairing_grants_applied
           || !row?.shopify_carrier_configured_carriers_applied
+          || !row?.shopify_checkout_audience_policy_applied
           || !row?.carrier_shipping_diagnostics_applied
           || !row?.crm_native_activity_projection_migration_applied
           || !row?.crm_contact_identity_aliases_migration_applied

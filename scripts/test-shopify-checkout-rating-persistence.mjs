@@ -131,6 +131,31 @@ function loadPersistence() {
         }, { filename: policyPath })
         return policyModule.exports
       }
+      if (
+        specifier
+        === '@/lib/operations/shopifyCheckoutAudiencePolicy'
+      ) {
+        const policyPath =
+          'app_src/lib/operations/shopifyCheckoutAudiencePolicy.ts'
+        const policyOutput = ts.transpileModule(read(policyPath), {
+          compilerOptions: {
+            module: ts.ModuleKind.CommonJS,
+            target: ts.ScriptTarget.ES2022,
+            esModuleInterop: true,
+          },
+          fileName: policyPath,
+        }).outputText
+        const policyModule = { exports: {} }
+        vm.runInNewContext(policyOutput, {
+          Array,
+          Error,
+          Object,
+          String,
+          exports: policyModule.exports,
+          module: policyModule,
+        }, { filename: policyPath })
+        return policyModule.exports
+      }
       if (specifier === '@/lib/persistence/postgres') {
         return {
           acquireTransactionAdvisoryLock: async () => {},

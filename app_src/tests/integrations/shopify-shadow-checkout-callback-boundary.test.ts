@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { registerHooks } from 'node:module'
 import test, { mock } from 'node:test'
 
@@ -26,7 +27,13 @@ let configuredVariantIds: ReadonlySet<string> | null = new Set([
   allowedVariantId,
 ])
 let customerPolicy: { mode: string } | null = { mode: 'show_all' }
+let checkoutAudienceMode:
+  | 'off'
+  | 'restricted_customers'
+  | 'all_eligible' = 'restricted_customers'
+let accountEnvironment: 'sandbox' | 'production' = 'sandbox'
 let policyLookupCount = 0
+let ratingAccountAvailable = true
 const downstreamCalls: string[] = []
 
 function unexpectedDownstreamCall(name: string) {
@@ -41,7 +48,9 @@ const account = {
   integrationAccountId: '22222222-2222-4222-8222-222222222222',
   accountGlobalId,
   storeEntityName: 'Pro Bakery Bites',
-  environment: 'sandbox',
+  get environment() {
+    return accountEnvironment
+  },
   externalAccountId: 'pro-bakery-bites.myshopify.com',
   registrationState: 'registered',
   configGlobalId: 'gscf0000001',
@@ -53,12 +62,25 @@ const account = {
   callbackTokenVersion: 1,
   policyRevision: 1,
   policyHash: 'policy-hash',
-  policySnapshot: {},
+  get policySnapshot() {
+    return {
+      shadowCheckoutAudience: {
+        version: 'shopify-checkout-audience-v1',
+        mode: checkoutAudienceMode,
+      },
+    }
+  },
   warehouseId: '33333333-3333-4333-8333-333333333333',
   warehouseGlobalId: 'gwh0000001',
   warehouseName: 'AG Alchemy',
   warehouseTimezone: 'America/Chicago',
-  warehouseAddress: {},
+  warehouseAddress: {
+    line1: '7009 S 108th St',
+    city: 'La Vista',
+    region: 'NE',
+    postalCode: '68128',
+    countryCode: 'US',
+  },
   inventoryMaxAgeSeconds: 300,
   quoteTtlSeconds: 900,
   orderReconciliationWindowSeconds: 900,
@@ -71,6 +93,24 @@ const account = {
       carrierAccountGlobalId: 'gac0000001',
       credentialVersion: 1,
       displayName: 'UPS sandbox',
+      registeredAddress: {
+        line1: '7009 S 108th St',
+        line2: null,
+        city: 'La Vista',
+        region: 'NE',
+        postalCode: '68128',
+        countryCode: 'US',
+      },
+      registeredAddressFingerprint: createHash('sha256')
+        .update(JSON.stringify({
+          line1: '7009 s 108th st',
+          line2: null,
+          city: 'la vista',
+          region: 'ne',
+          postalCode: '68128',
+          countryCode: 'US',
+        }))
+        .digest('hex'),
       accountStatus: 'active',
       integrationStatus: 'active',
       environment: 'sandbox',
@@ -81,6 +121,24 @@ const account = {
       carrierAccountGlobalId: 'gac0000002',
       credentialVersion: 1,
       displayName: 'FedEx sandbox',
+      registeredAddress: {
+        line1: '7009 S 108th St',
+        line2: null,
+        city: 'La Vista',
+        region: 'NE',
+        postalCode: '68128',
+        countryCode: 'US',
+      },
+      registeredAddressFingerprint: createHash('sha256')
+        .update(JSON.stringify({
+          line1: '7009 s 108th st',
+          line2: null,
+          city: 'la vista',
+          region: 'ne',
+          postalCode: '68128',
+          countryCode: 'US',
+        }))
+        .digest('hex'),
       accountStatus: 'active',
       integrationStatus: 'active',
       environment: 'sandbox',
@@ -109,8 +167,17 @@ mock.module('@/lib/persistence/shopifyCheckoutRating', {
   namedExports: {
     SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION:
       'shopify-checkout-line-pack-evidence-v1',
+    async lookupShopifyCarrierServiceCallbackPolicyByGlobalIdInPostgres() {
+      return {
+        organizationId: account.organizationId,
+        accountGlobalId,
+        environment: accountEnvironment,
+        activationState: account.activationState,
+        policySnapshot: account.policySnapshot,
+      }
+    },
     async lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres() {
-      return account
+      return ratingAccountAvailable ? account : null
     },
     claimShopifyCheckoutRateReceiptInPostgres:
       unexpectedDownstreamCall('receipt_claim'),
@@ -138,8 +205,14 @@ mock.module('@/lib/operations/shopifyCheckoutRating', {
   namedExports: {
     planShopifyCheckoutPackageCandidates:
       unexpectedDownstreamCall('cartonization_plan'),
-    shopifyProductGid: unexpectedDownstreamCall('cartonization_product_gid'),
-    shopifyVariantGid: unexpectedDownstreamCall('cartonization_variant_gid'),
+    shopifyProductGid(value: string | number) {
+      downstreamCalls.push('cartonization_product_gid')
+      return `gid://shopify/Product/${value}`
+    },
+    shopifyVariantGid(value: string | number) {
+      downstreamCalls.push('cartonization_variant_gid')
+      return `gid://shopify/ProductVariant/${value}`
+    },
   },
 })
 
@@ -167,8 +240,10 @@ mock.module('@/lib/integrations/carrierIntegrations', {
 
 mock.module('@/lib/integrations/carrierSandboxRate', {
   namedExports: {
-    carrierSandboxRateDestinationFingerprint:
-      unexpectedDownstreamCall('carrier_destination_fingerprint'),
+    carrierSandboxRateDestinationFingerprint() {
+      downstreamCalls.push('carrier_destination_fingerprint')
+      return 'd'.repeat(64)
+    },
   },
 })
 
@@ -244,8 +319,18 @@ function callbackRequest(payload: ReturnType<typeof callbackPayload>) {
 
 const scenarios = [
   {
+    name: 'checkout audience off',
+    reasonCode: ShopifyShadowCheckoutGuardDenialReason.AudienceOff,
+    audienceMode: 'off',
+    configured: new Set([allowedVariantId]),
+    policy: { mode: 'show_all' },
+    request: callbackPayload({}),
+    expectedPolicyLookups: 0,
+  },
+  {
     name: 'missing customer identity',
     reasonCode: ShopifyShadowCheckoutGuardDenialReason.MissingCustomer,
+    audienceMode: 'restricted_customers',
     configured: new Set([allowedVariantId]),
     policy: { mode: 'show_all' },
     request: callbackPayload({}),
@@ -255,6 +340,7 @@ const scenarios = [
     name: 'missing variant configuration',
     reasonCode:
       ShopifyShadowCheckoutGuardDenialReason.MissingVariantConfiguration,
+    audienceMode: 'restricted_customers',
     configured: null,
     policy: { mode: 'show_all' },
     request: callbackPayload({ customerId: 207119551 }),
@@ -263,6 +349,7 @@ const scenarios = [
   {
     name: 'no shippable items',
     reasonCode: ShopifyShadowCheckoutGuardDenialReason.NoShippableItems,
+    audienceMode: 'restricted_customers',
     configured: new Set([allowedVariantId]),
     policy: { mode: 'show_all' },
     request: callbackPayload({
@@ -274,6 +361,7 @@ const scenarios = [
   {
     name: 'unallowlisted variant',
     reasonCode: ShopifyShadowCheckoutGuardDenialReason.UnallowlistedVariant,
+    audienceMode: 'restricted_customers',
     configured: new Set([allowedVariantId]),
     policy: { mode: 'show_all' },
     request: callbackPayload({
@@ -286,6 +374,7 @@ const scenarios = [
     name: 'absent or ineligible customer policy',
     reasonCode:
       ShopifyShadowCheckoutGuardDenialReason.PolicyAbsentOrIneligible,
+    audienceMode: 'restricted_customers',
     configured: new Set([allowedVariantId]),
     policy: null,
     request: callbackPayload({ customerId: 207119551 }),
@@ -294,6 +383,7 @@ const scenarios = [
   {
     name: 'hide-all customer policy',
     reasonCode: ShopifyShadowCheckoutGuardDenialReason.HideAll,
+    audienceMode: 'restricted_customers',
     configured: new Set([allowedVariantId]),
     policy: { mode: 'hide_all' },
     request: callbackPayload({ customerId: 207119551 }),
@@ -310,6 +400,9 @@ test('every Shadow guard denial is a privacy-safe zero-work callback boundary',
     try {
       for (const scenario of scenarios) {
         await t.test(scenario.name, async () => {
+          accountEnvironment = 'sandbox'
+          ratingAccountAvailable = true
+          checkoutAudienceMode = scenario.audienceMode
           configuredVariantIds = scenario.configured
           customerPolicy = scenario.policy
           policyLookupCount = 0
@@ -338,7 +431,9 @@ test('every Shadow guard denial is a privacy-safe zero-work callback boundary',
             {
               accountGlobalId,
               stage: 'shadow_guard',
-              checkpoint: 'request_parsed',
+              checkpoint: scenario.audienceMode === 'off'
+                ? 'account_authenticated'
+                : 'request_parsed',
               reasonCode: scenario.reasonCode,
             },
           ]])
@@ -365,6 +460,183 @@ test('every Shadow guard denial is a privacy-safe zero-work callback boundary',
       }
     } finally {
       warn.mock.restore()
+    }
+  },
+)
+
+test('Shadow audience Off stays an authenticated 200 kill switch when full readiness drifts',
+  async () => {
+    const warningCalls: unknown[][] = []
+    const warn = mock.method(console, 'warn', (...args: unknown[]) => {
+      warningCalls.push(args)
+    })
+    try {
+      accountEnvironment = 'sandbox'
+      checkoutAudienceMode = 'off'
+      ratingAccountAvailable = false
+      policyLookupCount = 0
+      downstreamCalls.length = 0
+
+      const result = await executeShopifyCarrierServiceCallback({
+        accountGlobalId,
+        callbackToken,
+        request: callbackRequest(callbackPayload({})),
+      })
+
+      assert.deepEqual(result, {
+        authenticated: true,
+        httpStatus: 200,
+        response: { rates: [] },
+      })
+      assert.equal(policyLookupCount, 0)
+      assert.deepEqual(downstreamCalls, [])
+      assert.deepEqual(warningCalls, [[
+        '[shopify checkout rating] shadow guard denied',
+        {
+          accountGlobalId,
+          stage: 'shadow_guard',
+          checkpoint: 'account_authenticated',
+          reasonCode: 'SHOPIFY_SHADOW_GUARD_AUDIENCE_OFF',
+        },
+      ]])
+    } finally {
+      warn.mock.restore()
+      ratingAccountAvailable = true
+      checkoutAudienceMode = 'restricted_customers'
+    }
+  },
+)
+
+test('an authenticated non-Off callback retains strict full readiness', async () => {
+  try {
+    accountEnvironment = 'sandbox'
+    checkoutAudienceMode = 'restricted_customers'
+    ratingAccountAvailable = false
+    policyLookupCount = 0
+    downstreamCalls.length = 0
+
+    const result = await executeShopifyCarrierServiceCallback({
+      accountGlobalId,
+      callbackToken,
+      request: callbackRequest(callbackPayload({ customerId: 207119551 })),
+    })
+
+    assert.deepEqual(result, {
+      authenticated: true,
+      httpStatus: 503,
+      response: { rates: [] },
+    })
+    assert.equal(policyLookupCount, 0)
+    assert.deepEqual(downstreamCalls, [])
+  } finally {
+    ratingAccountAvailable = true
+  }
+})
+
+test('all-eligible audience on a production store fails before checkout work',
+  async () => {
+    const warningCalls: unknown[][] = []
+    const warn = mock.method(console, 'warn', (...args: unknown[]) => {
+      warningCalls.push(args)
+    })
+    try {
+      accountEnvironment = 'production'
+      ratingAccountAvailable = true
+      checkoutAudienceMode = 'all_eligible'
+      configuredVariantIds = null
+      policyLookupCount = 0
+      downstreamCalls.length = 0
+
+      const result = await executeShopifyCarrierServiceCallback({
+        accountGlobalId,
+        callbackToken,
+        request: callbackRequest(callbackPayload({})),
+      })
+
+      assert.deepEqual(result, {
+        authenticated: true,
+        httpStatus: 200,
+        response: { rates: [] },
+      })
+      assert.equal(policyLookupCount, 0)
+      assert.deepEqual(downstreamCalls, [])
+      assert.deepEqual(warningCalls, [[
+        '[shopify checkout rating] shadow guard denied',
+        {
+          accountGlobalId,
+          stage: 'shadow_guard',
+          checkpoint: 'request_parsed',
+          reasonCode:
+            'SHOPIFY_SHADOW_GUARD_ALL_ELIGIBLE_SANDBOX_REQUIRED',
+        },
+      ]])
+    } finally {
+      warn.mock.restore()
+      accountEnvironment = 'sandbox'
+      ratingAccountAvailable = true
+      checkoutAudienceMode = 'restricted_customers'
+    }
+  },
+)
+
+test('all-eligible audience bypasses customer-policy lookup but keeps later callback checks',
+  async () => {
+    const warningCalls: unknown[][] = []
+    const errorCalls: unknown[][] = []
+    const warn = mock.method(console, 'warn', (...args: unknown[]) => {
+      warningCalls.push(args)
+    })
+    const error = mock.method(console, 'error', (...args: unknown[]) => {
+      errorCalls.push(args)
+    })
+    const priorSessionSecret = process.env.APP_SESSION_SECRET
+    try {
+      process.env.APP_SESSION_SECRET = 'audience-callback-test-secret-32-bytes'
+      accountEnvironment = 'sandbox'
+      checkoutAudienceMode = 'all_eligible'
+      configuredVariantIds = null
+      customerPolicy = { mode: 'hide_all' }
+      policyLookupCount = 0
+      downstreamCalls.length = 0
+
+      const result = await executeShopifyCarrierServiceCallback({
+        accountGlobalId,
+        callbackToken,
+        request: callbackRequest(callbackPayload({})),
+      })
+
+      assert.equal(result.authenticated, true)
+      assert.notEqual(result.httpStatus, 200)
+      assert.deepEqual(result.response, { rates: [] })
+      assert.equal(policyLookupCount, 0)
+      assert.deepEqual(downstreamCalls, [
+        'cartonization_product_gid',
+        'cartonization_variant_gid',
+        'carrier_destination_fingerprint',
+        'cartonization_context',
+      ])
+      assert.equal(warningCalls.length, 1)
+      assert.equal(errorCalls.length, 0)
+      assert.equal(
+        (warningCalls[0]?.[1] as Record<string, unknown>)?.stage,
+        'checkout_context',
+      )
+      assert.equal(
+        JSON.stringify(warningCalls).includes(
+          'SHOPIFY_SHADOW_GUARD_MISSING_CUSTOMER',
+        ),
+        false,
+      )
+    } finally {
+      warn.mock.restore()
+      error.mock.restore()
+      if (priorSessionSecret === undefined) {
+        delete process.env.APP_SESSION_SECRET
+      } else {
+        process.env.APP_SESSION_SECRET = priorSessionSecret
+      }
+      accountEnvironment = 'sandbox'
+      checkoutAudienceMode = 'restricted_customers'
     }
   },
 )

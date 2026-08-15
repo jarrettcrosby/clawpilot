@@ -34,6 +34,9 @@ import {
   readShopifyCheckoutPlanRatePolicy,
   type ShopifyCheckoutPlanRatePolicy,
 } from '@/lib/operations/shopifyCheckoutPlanRatePolicy'
+import {
+  readShopifyCheckoutAudiencePolicy,
+} from '@/lib/operations/shopifyCheckoutAudiencePolicy'
 import { shopifyCheckoutDestinationFingerprint } from '@/lib/integrations/commerceCredentialCrypto'
 import {
   configuredShopifyNumericIdentifierSet,
@@ -45,6 +48,7 @@ import {
   claimShopifyCheckoutRateReceiptInPostgres,
   completeShopifyCheckoutRateReceiptInPostgres,
   failShopifyCheckoutRateReceiptInPostgres,
+  lookupShopifyCarrierServiceCallbackPolicyByGlobalIdInPostgres,
   lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres,
   readCachedShopifyCheckoutRateReceiptInPostgres,
   SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION,
@@ -73,9 +77,9 @@ import {
 import {
   evaluateShopifyShadowCheckoutPolicy,
   evaluateShopifyShadowCheckoutPrePolicy,
+  ShopifyShadowCheckoutGuardDenialReason,
   shopifyShadowCheckoutGuardDenialTelemetry,
   type ShopifyShadowCheckoutGuardDecision,
-  type ShopifyShadowCheckoutGuardDenialReason,
 } from '@/lib/integrations/shopifyShadowCheckoutGuard'
 import {
   applyShopifyShadowTestCharge,
@@ -294,8 +298,33 @@ async function shadowCheckoutRequestGuard(
   if (account.activationState !== 'shadow') {
     return { allowed: true, customerPolicy: null }
   }
+  const audience = readShopifyCheckoutAudiencePolicy(
+    account.policySnapshot,
+  )
+  if (audience.mode === 'off') {
+    return {
+      allowed: false,
+      reasonCode: ShopifyShadowCheckoutGuardDenialReason.AudienceOff,
+      customerPolicy: null,
+    }
+  }
+  if (
+    audience.mode === 'all_eligible'
+    && account.environment !== 'sandbox'
+  ) {
+    return {
+      allowed: false,
+      reasonCode:
+        ShopifyShadowCheckoutGuardDenialReason.AllEligibleSandboxRequired,
+      customerPolicy: null,
+    }
+  }
+  const customerRequired = audience.mode === 'restricted_customers'
   const prePolicy = evaluateShopifyShadowCheckoutPrePolicy({
     customerId: request.customer?.id,
+    customerRequired,
+    variantAllowlistRequired:
+      audience.mode === 'restricted_customers',
     configuredVariantIds: configuredShopifyNumericIdentifierSet(
       'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS',
     ),
@@ -305,6 +334,16 @@ async function shadowCheckoutRequestGuard(
     return {
       allowed: false,
       reasonCode: prePolicy.reasonCode,
+      customerPolicy: null,
+    }
+  }
+  if (audience.mode === 'all_eligible') {
+    return { allowed: true, customerPolicy: null }
+  }
+  if (!prePolicy.customerId) {
+    return {
+      allowed: false,
+      reasonCode: ShopifyShadowCheckoutGuardDenialReason.MissingCustomer,
       customerPolicy: null,
     }
   }
@@ -1202,6 +1241,7 @@ function recordCheckoutFailure(input: {
 function recordShadowCheckoutGuardDenial(input: {
   accountGlobalId: string
   reasonCode: ShopifyShadowCheckoutGuardDenialReason
+  checkpoint?: 'account_authenticated' | 'request_parsed'
 }) {
   console.warn(
     '[shopify checkout rating] shadow guard denied',
@@ -1323,14 +1363,60 @@ export async function executeShopifyCarrierServiceCallback(input: {
     cleanup()
     return authenticatedResult(EMPTY_RATE_RESPONSE, 504)
   }
+  const callbackTokenHash = createHash('sha256')
+    .update(input.callbackToken, 'ascii')
+    .digest('hex')
+  let callbackPolicyAccount
+  try {
+    callbackPolicyAccount = await awaitCallbackWork(
+      lookupShopifyCarrierServiceCallbackPolicyByGlobalIdInPostgres({
+        accountGlobalId: input.accountGlobalId,
+        callbackTokenHash,
+      }),
+      workController.signal,
+    )
+  } catch (error) {
+    const deadlineExceeded = workController.signal.aborted
+    cleanup()
+    return deadlineExceeded
+      ? authenticatedResult(EMPTY_RATE_RESPONSE, 504)
+      : authenticatedResult(
+          EMPTY_RATE_RESPONSE,
+          failedHttpStatus(error),
+        )
+  }
+  if (!callbackPolicyAccount) {
+    cleanup()
+    return { authenticated: false, response: EMPTY_RATE_RESPONSE }
+  }
+  try {
+    if (
+      callbackPolicyAccount.activationState === 'shadow'
+      && readShopifyCheckoutAudiencePolicy(
+        callbackPolicyAccount.policySnapshot,
+      ).mode === 'off'
+    ) {
+      recordShadowCheckoutGuardDenial({
+        accountGlobalId: callbackPolicyAccount.accountGlobalId,
+        reasonCode: ShopifyShadowCheckoutGuardDenialReason.AudienceOff,
+        checkpoint: 'account_authenticated',
+      })
+      cleanup()
+      return authenticatedResult(EMPTY_RATE_RESPONSE, 200)
+    }
+  } catch (error) {
+    cleanup()
+    return authenticatedResult(
+      EMPTY_RATE_RESPONSE,
+      failedHttpStatus(error),
+    )
+  }
   let account
   try {
     account = await awaitCallbackWork(
       lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres({
         accountGlobalId: input.accountGlobalId,
-        callbackTokenHash: createHash('sha256')
-          .update(input.callbackToken, 'ascii')
-          .digest('hex'),
+        callbackTokenHash,
         allowShadowSimulation: false,
       }),
       workController.signal,
@@ -1347,7 +1433,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
   }
   if (!account) {
     cleanup()
-    return { authenticated: false, response: EMPTY_RATE_RESPONSE }
+    return authenticatedResult(EMPTY_RATE_RESPONSE, 503)
   }
   if (!checkoutAccountIsReady(account)) {
     cleanup()

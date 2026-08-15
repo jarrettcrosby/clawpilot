@@ -250,7 +250,11 @@ requireAll(setupPanel, [
   "key: 'audience'",
   "key: 'rate-warm'",
   "key: 'evidence'",
-  'Only binary allow or hide is testable in Shadow.',
+  'Off — return no ClawPilot rates',
+  'Restricted customers — require an exact active policy',
+  'All eligible checkouts',
+  'Save checkout audience',
+  'Only customers with an unexpired non-hide policy are admitted',
   'Customer-specific and per-service Shopify enforcement requires an eligible Delivery Customization',
   'Refresh checkout-audience status',
 ], 'carrier-service setup integration')

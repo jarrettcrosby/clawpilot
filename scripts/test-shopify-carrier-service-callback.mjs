@@ -478,7 +478,8 @@ for (const required of [
   "HideAll: 'SHOPIFY_SHADOW_GUARD_HIDE_ALL'",
   'shopifyShadowCheckoutGuardDenialTelemetry',
   "stage: 'shadow_guard' as const",
-  "checkpoint: 'request_parsed' as const",
+  "checkpoint?: 'account_authenticated' | 'request_parsed'",
+  "checkpoint: input.checkpoint || 'request_parsed'",
 ]) {
   assert.ok(
     shadowGuardModule.includes(required),

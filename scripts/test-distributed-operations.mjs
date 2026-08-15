@@ -3899,6 +3899,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
     const shopifyCheckoutRateWarmPolicy = loadTypeScriptModule(
       'app_src/lib/operations/shopifyCheckoutRateWarmPolicy.ts',
     )
+    const shopifyCheckoutAudiencePolicy = loadTypeScriptModule(
+      'app_src/lib/operations/shopifyCheckoutAudiencePolicy.ts',
+    )
     const shopifyCheckoutRating = loadTypeScriptModule(
       'app_src/lib/persistence/shopifyCheckoutRating.ts',
       {
@@ -3908,6 +3911,8 @@ async function verifyPostgresAcceptance(databaseUrl) {
             shopifyCheckoutPlanRatePolicy,
           '@/lib/operations/shopifyCheckoutRateWarmPolicy':
             shopifyCheckoutRateWarmPolicy,
+          '@/lib/operations/shopifyCheckoutAudiencePolicy':
+            shopifyCheckoutAudiencePolicy,
           '@/lib/persistence/postgres': postgres,
         },
       },

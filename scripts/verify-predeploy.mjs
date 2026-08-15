@@ -41,6 +41,31 @@ if (!existsSync(resolve(root, 'app_src/package.json'))) {
 }
 
 const rootPackage = readJson('package.json')
+const checkoutAudienceTest = String(
+  rootPackage?.scripts?.['test:shopify-checkout-audience-policy'] || '',
+)
+for (const requiredCommand of [
+  'app_src/tests/integrations/shopify-checkout-audience-policy.test.ts',
+  'app_src/tests/integrations/shopify-shadow-checkout-guard.test.ts',
+  'app_src/tests/integrations/shopify-rate-warm.test.ts',
+  'app_src/tests/integrations/shopify-shadow-checkout-callback-boundary.test.ts',
+  'node scripts/test-shopify-checkout-audience-policy.mjs',
+  'node scripts/test-shopify-checkout-audience-persistence-postgres.mjs',
+  'node scripts/test-shopify-checkout-audience-health.mjs',
+]) {
+  if (!checkoutAudienceTest.includes(requiredCommand)) {
+    fail(`test:shopify-checkout-audience-policy must run "${requiredCommand}"`)
+  }
+}
+if (
+  !String(rootPackage?.scripts?.['test:shopify-customer-rate-policies'] || '')
+    .includes('npm run test:shopify-checkout-audience-policy')
+) {
+  fail(
+    'test:shopify-customer-rate-policies must run '
+    + 'test:shopify-checkout-audience-policy',
+  )
+}
 const shadowTrainingTest = String(
   rootPackage?.scripts?.['test:operation-shadow-training'] || '',
 )
@@ -178,6 +203,7 @@ for (const requiredPath of [
   'db/migrations/0284_operations_print_device_reference_privacy.sql',
   'db/migrations/0285_shopify_carrier_service_configured_carriers.sql',
   'db/migrations/0292_shopify_registered_rate_source_refresh.sql',
+  'db/migrations/0293_shopify_checkout_audience_policy.sql',
   'db/migrations/0286_carrier_shipping_account_diagnostics.sql',
   'db/migrations/0287_operations_print_agent_pairing_grants.sql',
   'db/migrations/0288_operations_shopify_location_routing.sql',
@@ -543,6 +569,11 @@ for (const requiredPath of [
   'scripts/test-shopify-customer-rate-policies.mjs',
   'scripts/test-shopify-customer-rate-policy-ui.mjs',
   'scripts/test-shopify-customer-rate-policies-postgres.mjs',
+  'app_src/lib/operations/shopifyCheckoutAudiencePolicy.ts',
+  'app_src/tests/integrations/shopify-checkout-audience-policy.test.ts',
+  'scripts/test-shopify-checkout-audience-policy.mjs',
+  'scripts/test-shopify-checkout-audience-persistence-postgres.mjs',
+  'scripts/test-shopify-checkout-audience-health.mjs',
   'app_src/lib/integrations/commercePackRuntime.ts',
   'app_src/lib/operations/hybridCartonization.ts',
   'app_src/tests/operations/hybrid-cartonization.test.mts',
