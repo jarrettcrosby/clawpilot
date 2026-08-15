@@ -430,7 +430,7 @@ for (const fragment of [
   'All five Zebra barcode-label sizes are included in the bundled runtime.',
   'retain the 4 x 6 carrier-label preset; select only the label sizes physically',
   'loaded and calibrated.',
-  'Zebra hostname/IP and raw port 9100',
+  'Zebra private network IP and raw port 9100',
   'This form defines routing',
   'Print delivery method',
   'Choose one: web app download/manual print or a durable background LAN agent.',
