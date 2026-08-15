@@ -3820,12 +3820,11 @@ async function recoverExpiredClaims(
       aggregateType: 'operations.print_job',
       aggregateId: job.global_id,
       eventKey: `operations:print-job:lease-outcome-uncertain:${job.current_claim_attempt_id}`,
-      subject: agent.globalId,
       organizationId: agent.organizationId,
       isSystem: true,
       payload: {
         printJobGlobalId: job.global_id,
-        printAgentGlobalId: agent.globalId,
+        recoveryAgentGlobalId: agent.globalId,
         printerGlobalId: job.printer_global_id,
         attempt: job.attempts,
         errorCode: 'PRINT_OUTCOME_UNCERTAIN',
