@@ -1543,7 +1543,10 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
            AND job.policy_revision = $9::bigint
            AND job.policy_hash = $10
            AND job.inventory_max_age_seconds = $11::integer
-           AND job.status = 'processing'
+           AND job.status = CASE
+             WHEN $14::uuid IS NULL THEN 'processing'
+             ELSE 'mapped_processing'
+           END
            AND job.cancel_requested = false
            AND job.lock_token = $12::uuid
            AND job.requested_dirty_version = $13::bigint

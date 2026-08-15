@@ -505,6 +505,11 @@ includes(inventoryPersistence, [
 ], 'Shopify inventory single-flight persistence')
 assert.match(
   inventoryPersistence,
+  /AND job\.status = CASE[\s\S]*?WHEN \$14::uuid IS NULL THEN 'processing'[\s\S]*?ELSE 'mapped_processing'[\s\S]*?END/,
+  'The projection fence must accept both legacy processing and mapped processing jobs without weakening the mapping fence',
+)
+assert.match(
+  inventoryPersistence,
   /const reservedLocally = await client\.query\([\s\S]*?reservation\.status = 'active'[\s\S]*?reservation\.reservation_authority = 'local_balance'[\s\S]*?SHOPIFY_INVENTORY_LOCAL_RESERVATION_CONFLICT/,
   'Shopify refresh must ignore provider-commitment claims already represented in Shopify committed quantity',
 )
