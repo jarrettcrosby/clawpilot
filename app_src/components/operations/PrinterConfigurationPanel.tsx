@@ -477,6 +477,15 @@ function statusColor(status: string): 'default' | 'success' | 'warning' | 'error
   return 'default'
 }
 
+function hasUncertainPrintOutcome(job: OperationsPrintJobListItem): boolean {
+  const latest = job.attemptHistory[job.attemptHistory.length - 1]
+  return job.status === 'failed'
+    && latest?.state === 'failed'
+    && latest.actorType === 'local_print_agent'
+    && latest.errorCode === 'PRINT_OUTCOME_UNCERTAIN'
+    && latest.physicalOutputVerified === false
+}
+
 export default function PrinterConfigurationPanel() {
   const { measurementSystem } = useMeasurementSystem()
   const theme = useTheme()
@@ -921,9 +930,11 @@ export default function PrinterConfigurationPanel() {
 
   async function runJobAction() {
     if (!jobAction) return
+    const uncertainOutcomeRecovery = jobAction.action === 'reprint-job'
+      && hasUncertainPrintOutcome(jobAction.job)
     if (!jobAction.reason.trim()) {
       const actionName = jobAction.action === 'reprint-job'
-        ? 'Reprint'
+        ? uncertainOutcomeRecovery ? 'New-print authorization' : 'Reprint'
         : jobAction.action === 'cancel-job'
           ? 'Cancellation'
           : 'Retry'
@@ -953,7 +964,9 @@ export default function PrinterConfigurationPanel() {
       setJobAction(null)
       setNotice(
         jobAction.action === 'reprint-job'
-          ? `Reprint ${result.job.globalId} was queued`
+          ? uncertainOutcomeRecovery
+            ? `New print ${result.job.globalId} was authorized and queued; ${jobAction.job.globalId} remains preserved as an uncertain outcome`
+            : `Reprint ${result.job.globalId} was queued`
           : jobAction.action === 'cancel-job'
             ? `${result.job.globalId} was cancelled`
             : `${result.job.globalId} was queued for retry`,
@@ -1084,7 +1097,10 @@ export default function PrinterConfigurationPanel() {
                     >
                       Details
                     </Button>
-                    {job.status === 'failed' && jobs.capabilities.canExecute && job.attempts < job.maxAttempts && (
+                    {job.status === 'failed'
+                      && !hasUncertainPrintOutcome(job)
+                      && jobs.capabilities.canExecute
+                      && job.attempts < job.maxAttempts && (
                       <Button
                         size="small"
                         variant="outlined"
@@ -1092,6 +1108,17 @@ export default function PrinterConfigurationPanel() {
                         onClick={() => setJobAction({ job, action: 'retry-job', reason: '' })}
                       >
                         Retry
+                      </Button>
+                    )}
+                    {hasUncertainPrintOutcome(job) && jobs.capabilities.canReprint && (
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        color="warning"
+                        startIcon={<ReplayRounded />}
+                        onClick={() => setJobAction({ job, action: 'reprint-job', reason: '' })}
+                      >
+                        Authorize new print
                       </Button>
                     )}
                     {job.status === 'delivered' && jobs.capabilities.canReprint && (
@@ -1775,6 +1802,7 @@ export default function PrinterConfigurationPanel() {
             </Button>
           )}
           {selectedJob?.status === 'failed'
+            && !hasUncertainPrintOutcome(selectedJob)
             && jobs?.capabilities.canExecute
             && selectedJob.attempts < selectedJob.maxAttempts && (
             <Button
@@ -1785,6 +1813,20 @@ export default function PrinterConfigurationPanel() {
               }}
             >
               Retry
+            </Button>
+          )}
+          {selectedJob
+            && hasUncertainPrintOutcome(selectedJob)
+            && jobs?.capabilities.canReprint && (
+            <Button
+              color="warning"
+              startIcon={<ReplayRounded />}
+              onClick={() => {
+                setSelectedJob(null)
+                setJobAction({ job: selectedJob, action: 'reprint-job', reason: '' })
+              }}
+            >
+              Authorize new print
             </Button>
           )}
           {selectedJob?.status === 'delivered' && jobs?.capabilities.canReprint && (
@@ -2259,7 +2301,9 @@ export default function PrinterConfigurationPanel() {
       >
         <DialogTitle>
           {jobAction?.action === 'reprint-job'
-            ? 'Authorize reprint'
+            ? hasUncertainPrintOutcome(jobAction.job)
+              ? 'Authorize new print after uncertain outcome'
+              : 'Authorize reprint'
             : jobAction?.action === 'cancel-job'
               ? 'Cancel print job'
               : 'Retry print job'}
@@ -2269,7 +2313,9 @@ export default function PrinterConfigurationPanel() {
             <Stack spacing={2}>
               <Typography variant="body2" color="text.secondary">
                 {jobAction.action === 'reprint-job'
-                  ? `This creates a new audited job from ${jobAction.job.globalId} without purchasing another carrier label.`
+                  ? hasUncertainPrintOutcome(jobAction.job)
+                    ? `The printer may already have produced ${jobAction.job.globalId}. Inspect the physical printer first. This preserves that uncertain job and creates a new audited job with the same immutable document; a duplicate physical print is possible, but no additional carrier label or postage is purchased.`
+                    : `This creates a new audited job from ${jobAction.job.globalId} without purchasing another carrier label.`
                   : jobAction.action === 'cancel-job'
                     ? `This fences ${jobAction.job.globalId} from further delivery. A claimed device may already have accepted the document.`
                     : `This requeues ${jobAction.job.globalId} within its existing bounded attempt limit.`}
@@ -2279,7 +2325,9 @@ export default function PrinterConfigurationPanel() {
                 multiline
                 minRows={3}
                 label={jobAction.action === 'reprint-job'
-                  ? 'Reprint reason'
+                  ? hasUncertainPrintOutcome(jobAction.job)
+                    ? 'Required duplicate-risk authorization reason'
+                    : 'Reprint reason'
                   : jobAction.action === 'cancel-job'
                     ? 'Cancellation reason'
                     : 'Retry reason'}
@@ -2304,7 +2352,9 @@ export default function PrinterConfigurationPanel() {
             {saving
               ? 'Working...'
               : jobAction?.action === 'reprint-job'
-                ? 'Queue reprint'
+                ? hasUncertainPrintOutcome(jobAction.job)
+                  ? 'Queue new print'
+                  : 'Queue reprint'
                 : jobAction?.action === 'cancel-job'
                   ? 'Cancel job'
                   : 'Queue retry'}

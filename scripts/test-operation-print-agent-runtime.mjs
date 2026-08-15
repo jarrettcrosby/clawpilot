@@ -1478,6 +1478,70 @@ async function verifyRuntime(connectionString) {
     assert.equal(cancelledReprint.status, 'cancelled')
     assert.equal(duplicateCancellation.status, 'cancelled')
 
+    const uncertainSource = await persistence.reprintOperationsPrintJobInPostgres({
+      organizationId: fixture.organizationId,
+      jobGlobalId: queued.globalId,
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `uncertain-source-${fixture.suffix}`,
+      reason: 'Create an isolated uncertain-outcome recovery fixture',
+    })
+    const uncertainClaim = await persistence.claimOperationsPrintJobsInPostgres({
+      agent: fallbackAgent,
+      idempotencyKey: `uncertain-claim-${fixture.suffix}`,
+      limit: 1,
+      leaseSeconds: 120,
+      runtimeCapabilities: packingCapabilities,
+    })
+    assert.equal(uncertainClaim.length, 1)
+    assert.equal(uncertainClaim[0].globalId, uncertainSource.globalId)
+    const uncertainFailure = await persistence.failOperationsPrintJobInPostgres({
+      agent: fallbackAgent,
+      jobGlobalId: uncertainSource.globalId,
+      claimToken: uncertainClaim[0].claimToken,
+      idempotencyKey: `uncertain-failure-${fixture.suffix}`,
+      errorCode: 'PRINT_OUTCOME_UNCERTAIN',
+      errorMessage: 'The raw socket accepted delivery but completion was not proven',
+      retryable: false,
+      printerUnavailable: false,
+      retryAfterSeconds: 0,
+    })
+    assert.equal(uncertainFailure.status, 'failed')
+    assert.equal(uncertainFailure.attemptHistory.at(-1).errorCode, 'PRINT_OUTCOME_UNCERTAIN')
+    await expectRejected(
+      () => persistence.retryOperationsPrintJobInPostgres({
+        organizationId: fixture.organizationId,
+        jobGlobalId: uncertainSource.globalId,
+        actorEmail: fixture.actorEmail,
+        idempotencyKey: `uncertain-retry-denied-${fixture.suffix}`,
+        reason: 'A same-job retry must never cross an uncertain delivery fence',
+      }),
+      /may already have occurred/,
+    )
+    const uncertainRecoveryInput = {
+      organizationId: fixture.organizationId,
+      jobGlobalId: uncertainSource.globalId,
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `uncertain-new-print-${fixture.suffix}`,
+      reason: 'Operator inspected the printer and confirmed no physical label was present',
+    }
+    const [uncertainRecovery, uncertainRecoveryReplay] = await Promise.all([
+      persistence.reprintOperationsPrintJobInPostgres(uncertainRecoveryInput),
+      persistence.reprintOperationsPrintJobInPostgres(uncertainRecoveryInput),
+    ])
+    assert.equal(uncertainRecovery.status, 'queued')
+    assert.equal(uncertainRecoveryReplay.globalId, uncertainRecovery.globalId)
+    assert.notEqual(uncertainRecovery.globalId, uncertainSource.globalId)
+    assert.equal(uncertainRecovery.reprintOfJobGlobalId, uncertainSource.globalId)
+    assert.match(uncertainRecovery.routingReason, /new print after uncertain outcome/i)
+    const cancelledUncertainRecovery = await persistence.cancelOperationsPrintJobInPostgres({
+      organizationId: fixture.organizationId,
+      jobGlobalId: uncertainRecovery.globalId,
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `cancel-uncertain-recovery-${fixture.suffix}`,
+      reason: 'Recovery contract was proven without physical output',
+    })
+    assert.equal(cancelledUncertainRecovery.status, 'cancelled')
+
     const labelPrinter = await createPrinter(pool, fixture, {
       code: `LABEL-${fixture.suffix}`,
       name: 'Primary carrier-label printer',

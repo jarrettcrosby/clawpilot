@@ -204,6 +204,13 @@ type LockedPrintJobRow = {
   claim_expires_at: TimestampValue | null
 }
 
+type LatestPrintAttemptOutcome = {
+  state: OperationsPrintAttemptListItem['state']
+  actor_type: OperationsPrintAttemptListItem['actorType']
+  error_code: string | null
+  physical_output_verified: boolean
+}
+
 type RateTestLabelPrintAuthorizationRow = {
   integration_account_id: string
   label_provider: 'ups_rest' | 'fedex_rest'
@@ -3020,7 +3027,7 @@ async function assertShippingLabelCanBeEnqueued(input: {
   const nextStep = job.status === 'delivered'
     ? 'Use the controlled reprint action and provide a reprint reason.'
     : job.status === 'failed'
-      ? 'Use the retry action after resolving the printer route.'
+      ? 'Review the latest failure. Retry ordinary pre-delivery failures; after PRINT_OUTCOME_UNCERTAIN, authorize a new print instead.'
       : job.status === 'cancelled'
         ? 'Generate a new carrier label before creating another print job.'
         : 'Wait for or manage the existing print job.'
@@ -3061,7 +3068,7 @@ async function assertRateTestLabelCanBeEnqueued(input: {
   const nextStep = job.status === 'delivered'
     ? 'Use the controlled reprint action and provide a reprint reason.'
     : job.status === 'failed'
-      ? 'Use the retry action after resolving the printer route.'
+      ? 'Review the latest failure. Retry ordinary pre-delivery failures; after PRINT_OUTCOME_UNCERTAIN, authorize a new print instead.'
       : job.status === 'cancelled'
         ? 'Create a new rate-test label before creating another print job.'
         : 'Wait for or manage the existing print job.'
@@ -3103,7 +3110,7 @@ async function assertPackingSlipArtifactCanBeEnqueued(input: {
   const nextStep = job.status === 'delivered'
     ? 'Use the controlled reprint action and provide a reprint reason.'
     : job.status === 'failed'
-      ? 'Use the retry action after resolving the printer route.'
+      ? 'Review the latest failure. Retry ordinary pre-delivery failures; after PRINT_OUTCOME_UNCERTAIN, authorize a new print instead.'
       : job.status === 'cancelled'
         ? 'Generate a replacement Pack Work Instruction only if the package allocation changes.'
         : 'Wait for or manage the existing print job.'
@@ -3398,6 +3405,32 @@ async function lockedJob(
     )
   }
   return result.rows[0]
+}
+
+async function latestPrintAttemptOutcome(
+  client: PoolClient,
+  organizationId: string,
+  printJobId: string,
+): Promise<LatestPrintAttemptOutcome | null> {
+  const result = await client.query<LatestPrintAttemptOutcome>(
+    `SELECT state, actor_type, error_code, physical_output_verified
+     FROM operations_print_delivery_attempts
+     WHERE organization_id = $1::uuid
+       AND print_job_id = $2::uuid
+     ORDER BY sequence_number DESC
+     LIMIT 1`,
+    [organizationId, printJobId],
+  )
+  return result.rows[0] || null
+}
+
+function isUncertainLocalAgentOutcome(
+  outcome: LatestPrintAttemptOutcome | null,
+): boolean {
+  return outcome?.state === 'failed'
+    && outcome.actor_type === 'local_print_agent'
+    && outcome.error_code === 'PRINT_OUTCOME_UNCERTAIN'
+    && outcome.physical_output_verified === false
 }
 
 function carrierRateTestPrintCapabilityError(
@@ -4807,6 +4840,18 @@ export async function retryOperationsPrintJobInPostgres(input: {
         409,
       )
     }
+    const latestOutcome = await latestPrintAttemptOutcome(
+      client,
+      organizationId,
+      job.id,
+    )
+    if (isUncertainLocalAgentOutcome(latestOutcome)) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_RETRY_OUTCOME_UNCERTAIN',
+        'Printer delivery may already have occurred. Inspect the physical printer, then use the controlled new-print authorization with a required reason; the original job will never be resent.',
+        409,
+      )
+    }
     if (job.attempts >= job.max_attempts) {
       throw new OperationsRequestError(
         'OPERATIONS_PRINT_RETRY_EXHAUSTED',
@@ -4958,6 +5003,13 @@ export async function reprintOperationsPrintJobInPostgres(input: {
       `operations:print-reprint:${organizationId}:${callerKey}`,
     )
     const original = await lockedJob(client, organizationId, input.jobGlobalId)
+    const latestOutcome = await latestPrintAttemptOutcome(
+      client,
+      organizationId,
+      original.id,
+    )
+    const uncertainOutcomeRecovery = original.status === 'failed'
+      && isUncertainLocalAgentOutcome(latestOutcome)
     if (original.rate_test_label_id) {
       await assertRateTestLabelPrintCapability(
         client,
@@ -4986,10 +5038,10 @@ export async function reprintOperationsPrintJobInPostgres(input: {
       }
       return oneJob(organizationId, replay.rows[0].global_id, client)
     }
-    if (original.status !== 'delivered') {
+    if (original.status !== 'delivered' && !uncertainOutcomeRecovery) {
       throw new OperationsRequestError(
         'OPERATIONS_PRINT_REPRINT_INVALID',
-        'Only acknowledged durable print jobs can be reprinted',
+        'Only acknowledged print jobs or exact local-agent uncertain outcomes can authorize a new print',
         409,
       )
     }
@@ -5068,7 +5120,7 @@ export async function reprintOperationsPrintJobInPostgres(input: {
         route.printer.id,
         route.requestedPrinter.id,
         route.fallbackPrinter?.id || null,
-        `Audited reprint of ${original.global_id}: ${route.reason}`,
+        `${uncertainOutcomeRecovery ? 'Audited new print after uncertain outcome' : 'Audited reprint'} of ${original.global_id}: ${route.reason}`,
         original.max_attempts,
         requestFingerprint,
         actorEmail,
@@ -5091,7 +5143,9 @@ export async function reprintOperationsPrintJobInPostgres(input: {
         reprintOfJobGlobalId: original.global_id,
         attempt: 1,
       }),
-      detail: `Reprint authorized: ${reason}`,
+      detail: uncertainOutcomeRecovery
+        ? `New print authorized after uncertain outcome: ${reason}`
+        : `Reprint authorized: ${reason}`,
     })
     await recordAuditEvent({
       actor: actorEmail,
@@ -5105,6 +5159,9 @@ export async function reprintOperationsPrintJobInPostgres(input: {
         printJobGlobalId: reprint.global_id,
         reprintOfJobGlobalId: original.global_id,
         reason,
+        uncertainOutcomeRecovery,
+        sourceStatus: original.status,
+        sourceErrorCode: latestOutcome?.error_code || null,
         requestedPrinterGlobalId: route.requestedPrinter.globalId,
         selectedPrinterGlobalId: route.printer.globalId,
         fallbackPrinterGlobalId: route.fallbackPrinter?.globalId || null,

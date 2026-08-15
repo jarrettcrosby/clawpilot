@@ -370,6 +370,8 @@ function verifySourceContracts() {
     'Document integrity',
     'Lifecycle and lineage',
     'Delivery history',
+    'Authorize new print',
+    'Required duplicate-risk authorization reason',
   ]) {
     assert.ok(panel.includes(fragment), `Missing print-job detail contract: ${fragment}`)
   }
