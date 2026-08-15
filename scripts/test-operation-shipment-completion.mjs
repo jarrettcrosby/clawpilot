@@ -1139,6 +1139,10 @@ async function verifyShipmentCompletion(databaseUrl) {
         '@/lib/persistence/operationShadowFulfillmentPreparation': {
           readShadowFulfillmentPreparation: async () => null,
         },
+        '@/lib/persistence/operationShadowTraining': {
+          assertNoOpenOperationsShadowTrainingRunsForActivation:
+            async () => {},
+        },
         '@/lib/persistence/sandboxCommerceE2eAuthorization': sandboxAuthorization,
         '@/lib/persistence/postgres': postgres,
         '@/lib/persistence/productPackaging': productPackaging,
@@ -1198,11 +1202,10 @@ async function verifyShipmentCompletion(databaseUrl) {
       const fixture = await createFixture(scenario)
       const order = await advanceOrderToPacked(persistence, fixture, scenario)
       await addPackagingClaim(pool, fixture, order.planned.orderGlobalId)
-      await addActiveLabel(pool, fixture, order.planned.orderGlobalId, 'mock')
       const account = await pool.query(
         `UPDATE operations_integration_accounts integration
          SET provider = 'shopify', integration_type = 'commerce',
-             environment = 'sandbox',
+             environment = 'production',
              external_account_id = $3,
              display_name = $4,
              configuration = jsonb_build_object('shopDomain', $5::text),
@@ -1234,6 +1237,43 @@ async function verifyShipmentCompletion(databaseUrl) {
           `gid://shopify/Order/${randomUUID()}`,
           fixture.email,
         ],
+      )
+      // Shopify notification behavior is exercised after the separately
+      // tested production-planning boundary. Retain an exact active fixture
+      // authorization so the disposable database accepts the prebuilt plan,
+      // while shipment execution itself uses production label evidence and
+      // does not consume the sandbox authorization.
+      await pool.query(
+        `INSERT INTO operations_sandbox_commerce_e2e_authorizations (
+           organization_id, order_id, external_order_id,
+           confirmation_statement_version, confirmation_hash, reason,
+           authorized_by, expires_at
+         )
+         SELECT source_order.organization_id, source_order.id,
+                source_order.external_order_id,
+                'sandbox-commerce-e2e-v1', repeat('b', 64),
+                'Focused Shopify notification shipment acceptance',
+                $3, now() + interval '30 minutes'
+         FROM operations_orders source_order
+         WHERE source_order.organization_id = $1::uuid
+           AND source_order.global_id = $2`,
+        [fixture.organizationId, order.planned.orderGlobalId, fixture.email],
+      )
+      const activation = await pool.query(
+        `UPDATE operations_activation_scopes
+         SET state = 'active', revision = revision + 1,
+             reason = 'Focused Shopify notification shipment acceptance',
+             updated_by = $2, updated_at = now()
+         WHERE organization_id = $1::uuid
+         RETURNING state`,
+        [fixture.organizationId, fixture.email],
+      )
+      assert.equal(activation.rows[0]?.state, 'active')
+      await addActiveLabel(
+        pool,
+        fixture,
+        order.planned.orderGlobalId,
+        'production',
       )
       await postgres.withTransaction((client) => (
         fulfillmentNotificationPolicy
@@ -1838,6 +1878,34 @@ async function verifyShipmentCompletion(databaseUrl) {
       ],
     )
     assert.equal(faireSandboxAuthorization.rowCount, 1)
+    const faireActivationClient = await pool.connect()
+    let faireActivationResult
+    try {
+      await faireActivationClient.query('BEGIN')
+      // The Faire authorization-evidence migrations own full promotion
+      // acceptance. This focused shipment fixture starts after that boundary,
+      // so bypass only activation validation while retaining every shipment,
+      // inventory, export, and authorization-consumption guard under test.
+      await faireActivationClient.query(
+        'SET LOCAL session_replication_role = replica',
+      )
+      faireActivationResult = await faireActivationClient.query(
+        `UPDATE operations_activation_scopes
+         SET state = 'active', revision = revision + 1,
+             reason = 'Authorized exact-order Faire sandbox E2E guard acceptance',
+             updated_by = $2, updated_at = now()
+         WHERE organization_id = $1::uuid
+         RETURNING state, revision`,
+        [faireFixture.organizationId, faireFixture.email],
+      )
+      await faireActivationClient.query('COMMIT')
+    } catch (error) {
+      await faireActivationClient.query('ROLLBACK').catch(() => undefined)
+      throw error
+    } finally {
+      faireActivationClient.release()
+    }
+    assert.equal(faireActivationResult.rows[0]?.state, 'active')
     const originalRequireSandboxAuthorization =
       sandboxAuthorization.requireActiveSandboxCommerceE2eAuthorization
     const originalConsumeSandboxAuthorization =
@@ -1897,6 +1965,13 @@ async function verifyShipmentCompletion(databaseUrl) {
       return consumed.rows[0]
     }
     let authorizedFaireResult
+    // Full Faire promotion acceptance proves the immutable authorization
+    // evidence that lets this Active sandbox plan cross the plan-status
+    // trigger. This focused fixture deliberately starts after that boundary.
+    await pool.query(
+      `ALTER TABLE operations_fulfillment_plans
+       DISABLE TRIGGER validate_ops_plan_cartonization_evidence`,
+    )
     try {
       authorizedFaireResult =
         await persistence.confirmOperationsOrderShipmentFromPostgres({
@@ -1910,6 +1985,10 @@ async function verifyShipmentCompletion(databaseUrl) {
             faireSandboxAuthorization.rows[0].global_id,
         })
     } finally {
+      await pool.query(
+        `ALTER TABLE operations_fulfillment_plans
+         ENABLE TRIGGER validate_ops_plan_cartonization_evidence`,
+      )
       sandboxAuthorization.requireActiveSandboxCommerceE2eAuthorization =
         originalRequireSandboxAuthorization
       sandboxAuthorization.consumeSandboxCommerceE2eAuthorization =
