@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import http from 'node:http'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import {
   PrintAgentReleaseError,
@@ -296,6 +296,37 @@ try {
   assert.ok(healthRoute.includes('printAgentRelease.enabled && !printAgentRelease.ready'))
   assert.ok(runtimeValidator.includes('CLAWPILOT_PRINT_AGENT_RELEASE_INDEX_SHA256'))
   assert.ok(predeploy.includes("run(process.execPath, ['scripts/test-print-agent-release-download.mjs'])"))
+
+  const applicationPackage = JSON.parse(readFileSync(resolve(root, 'app_src/package.json'), 'utf8'))
+  const rootPackage = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'))
+  const printerPanel = readFileSync(
+    resolve(root, 'app_src/components/operations/PrinterConfigurationPanel.tsx'),
+    'utf8',
+  )
+  const proxySource = readFileSync(resolve(root, 'app_src/proxy.ts'), 'utf8')
+  for (const forbiddenArtifact of [
+    'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip',
+    'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip.sha256',
+    'app_src/public/downloads/ClawPilot-Print-Agent-macOS.json',
+  ]) {
+    assert.equal(
+      existsSync(resolve(root, forbiddenArtifact)),
+      false,
+      `Unsigned preview must not ship: ${forbiddenArtifact}`,
+    )
+  }
+  assert.ok(!String(applicationPackage.scripts?.build || '').includes('build-macos-print-agent-download'))
+  assert.equal(rootPackage.scripts?.['print-agent:build:macos-download'], undefined)
+  assert.equal(rootPackage.scripts?.['print-agent:pair:macos'], undefined)
+  for (const forbiddenPreviewContract of [
+    'ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW',
+    'Download developer preview',
+    'Advanced terminal pairing',
+    '/downloads/ClawPilot-Print-Agent-macOS.zip',
+  ]) {
+    assert.ok(!printerPanel.includes(forbiddenPreviewContract))
+    assert.ok(!proxySource.includes(forbiddenPreviewContract))
+  }
 
   console.log('print-agent release download contract tests passed')
 } finally {

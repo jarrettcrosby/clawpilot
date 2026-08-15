@@ -96,23 +96,6 @@ type PrintAgentPairingGrant = {
   supportedDocumentTypes: PrintDocumentType[]
 }
 
-type PrintAgentDistributionManifest = {
-  version: string
-  artifactHref: string
-  byteLength: number
-  sha256: string
-  checksumHref: string
-  releaseChannel: 'developer-preview'
-  distributionAudience: 'developers-only'
-  customerReleaseReady: false
-  signed: boolean
-  notarized: boolean
-  requiresDeveloperIdSigning: true
-  requiresAppleNotarization: true
-  nodeMinimumMajor: number
-  deliveryBackend: string
-}
-
 type CustomerPrintAgentReleaseArtifact = {
   platform: 'macos' | 'windows'
   architecture: 'universal' | 'x64'
@@ -167,13 +150,6 @@ const LEGACY_BUNDLED_AGENT_DOCUMENT_TYPES =
 const BUNDLED_PRINTER_DEFAULT_FORMATS = LEGACY_BUNDLED_AGENT_FORMATS
 const BUNDLED_PRINTER_DEFAULT_MEDIA = LEGACY_BUNDLED_AGENT_MEDIA
 const BUNDLED_PRINTER_DEFAULT_DOCUMENT_TYPES = LEGACY_BUNDLED_AGENT_DOCUMENT_TYPES
-const MACOS_PRINT_AGENT_DOWNLOAD_PATH = '/downloads/ClawPilot-Print-Agent-macOS.zip'
-const MACOS_PRINT_AGENT_DOWNLOAD_NAME = 'ClawPilot-Print-Agent-macOS.zip'
-const MACOS_PRINT_AGENT_CHECKSUM_PATH = `${MACOS_PRINT_AGENT_DOWNLOAD_PATH}.sha256`
-const MACOS_PRINT_AGENT_CHECKSUM_NAME = `${MACOS_PRINT_AGENT_DOWNLOAD_NAME}.sha256`
-const MACOS_PRINT_AGENT_MANIFEST_PATH = '/downloads/ClawPilot-Print-Agent-macOS.json'
-const ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW =
-  process.env.NEXT_PUBLIC_ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW === 'true'
 const PRINT_AGENT_HEARTBEAT_RECENT_MS = 30_000
 
 const fieldSx = {
@@ -255,48 +231,6 @@ function formatBytes(value: number | null) {
   if (value < 1024) return `${value} B`
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
   return `${(value / (1024 * 1024)).toFixed(1)} MB`
-}
-
-function PrintAgentDistributionFacts({
-  manifest,
-}: {
-  manifest: PrintAgentDistributionManifest | null
-}) {
-  if (!ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW) return null
-  return (
-    <Stack direction="row" alignItems="center" spacing={0.75} flexWrap="wrap" useFlexGap>
-      <Typography variant="caption" color="text.secondary">
-        {manifest
-          ? `Developer-only v${manifest.version} · ${formatBytes(manifest.byteLength)} · raw-network ZPL · unsigned/unnotarized · Node.js ${manifest.nodeMinimumMajor}+ · SHA-256 ${manifest.sha256.slice(0, 12)}…`
-          : 'Developer-only macOS raw-network ZPL preview · unsigned and not notarized · never distribute to operators'}
-      </Typography>
-      <Button
-        component="a"
-        href={MACOS_PRINT_AGENT_CHECKSUM_PATH}
-        download={MACOS_PRINT_AGENT_CHECKSUM_NAME}
-        size="small"
-        variant="text"
-        sx={{ minWidth: 0, p: 0.25, fontSize: '0.72rem' }}
-      >
-        SHA-256
-      </Button>
-    </Stack>
-  )
-}
-
-function DeveloperPrintAgentDownloadButton() {
-  if (!ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW) return null
-  return (
-    <Button
-      component="a"
-      href={MACOS_PRINT_AGENT_DOWNLOAD_PATH}
-      download={MACOS_PRINT_AGENT_DOWNLOAD_NAME}
-      variant="outlined"
-      startIcon={<DownloadRounded />}
-    >
-      Download developer preview
-    </Button>
-  )
 }
 
 function customerReleaseArtifactIsValid(
@@ -589,17 +523,9 @@ export default function PrinterConfigurationPanel() {
   } | null>(null)
   const [pairingGrant, setPairingGrant] = useState<PrintAgentPairingGrant | null>(null)
   const [barcodeLabelsOpen, setBarcodeLabelsOpen] = useState(false)
-  const [pairingBaseUrl, setPairingBaseUrl] = useState('https://dev.aiapp.eigenracing.com')
-  const [printAgentDistribution, setPrintAgentDistribution] =
-    useState<PrintAgentDistributionManifest | null>(null)
   const [customerPrintAgentRelease, setCustomerPrintAgentRelease] =
     useState<CustomerPrintAgentRelease | null>(null)
   const [customerPrintAgentReleaseLoading, setCustomerPrintAgentReleaseLoading] = useState(true)
-  const pairingCommand = `npm run print-agent:pair:macos -- --base-url '${pairingBaseUrl}'`
-
-  useEffect(() => {
-    setPairingBaseUrl(window.location.origin)
-  }, [])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -635,55 +561,12 @@ export default function PrinterConfigurationPanel() {
   }, [])
 
   const printAgentSetupReady = Boolean(customerPrintAgentRelease)
-    || ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW
   const customerMacPrintAgent = customerPrintAgentRelease?.artifacts.find(
     (artifact) => artifact.platform === 'macos',
   ) || null
   const customerWindowsPrintAgent = customerPrintAgentRelease?.artifacts.find(
     (artifact) => artifact.platform === 'windows',
   ) || null
-
-  useEffect(() => {
-    if (!ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW) return undefined
-    const controller = new AbortController()
-    void (async () => {
-      try {
-        const response = await fetch(MACOS_PRINT_AGENT_MANIFEST_PATH, {
-          cache: 'no-store',
-          signal: controller.signal,
-        })
-        if (!response.ok) return
-        const manifest = await response.json() as Partial<PrintAgentDistributionManifest>
-        if (
-          manifest.artifactHref === MACOS_PRINT_AGENT_DOWNLOAD_PATH
-          && manifest.checksumHref === MACOS_PRINT_AGENT_CHECKSUM_PATH
-          && typeof manifest.version === 'string'
-          && /^\d+\.\d+\.\d+-preview\.\d+$/.test(manifest.version)
-          && typeof manifest.byteLength === 'number'
-          && Number.isSafeInteger(manifest.byteLength)
-          && manifest.byteLength > 0
-          && typeof manifest.sha256 === 'string'
-          && /^[a-f0-9]{64}$/.test(manifest.sha256)
-          && manifest.releaseChannel === 'developer-preview'
-          && manifest.distributionAudience === 'developers-only'
-          && manifest.customerReleaseReady === false
-          && manifest.signed === false
-          && manifest.notarized === false
-          && manifest.requiresDeveloperIdSigning === true
-          && manifest.requiresAppleNotarization === true
-          && manifest.nodeMinimumMajor === 20
-          && manifest.deliveryBackend === 'raw-network-zpl'
-        ) {
-          setPrintAgentDistribution(manifest as PrintAgentDistributionManifest)
-        }
-      } catch (caught) {
-        if (!(caught instanceof DOMException && caught.name === 'AbortError')) {
-          setPrintAgentDistribution(null)
-        }
-      }
-    })()
-    return () => controller.abort()
-  }, [])
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true)
@@ -1284,7 +1167,6 @@ export default function PrinterConfigurationPanel() {
             {customerWindowsPrintAgent && (
               <CustomerPrintAgentDownloadButton artifact={customerWindowsPrintAgent} />
             )}
-            {!customerPrintAgentRelease && <DeveloperPrintAgentDownloadButton />}
             <Button
               variant="outlined"
               startIcon={<TokenRounded />}
@@ -1312,12 +1194,6 @@ export default function PrinterConfigurationPanel() {
               only the logical printer-to-agent assignment; the IP stays on the computer. The
               computer must remain on, connected to the printer network, and signed in for
               background printing.
-            </Alert>
-          ) : ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW ? (
-            <Alert severity="warning" sx={{ mt: 2 }}>
-              Developer preview only: enter the printer hostname/IP and raw port (normally 9100)
-              in the local helper on the controlled development Mac. ClawPilot stores the logical
-              printer and agent assignment, but never receives or displays that endpoint.
             </Alert>
           ) : (
             <Alert severity="warning" sx={{ mt: 2 }}>
@@ -1458,18 +1334,6 @@ export default function PrinterConfigurationPanel() {
                       separate delivery choice.
                     </Typography>
                   </>
-                ) : ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW ? (
-                  <>
-                    <Typography fontWeight={700}>Developer-only local printing preview</Typography>
-                    <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                      Use only on a controlled development Mac. Enter the Zebra&apos;s local
-                      hostname/IP and raw port 9100 in the helper before creating the one-time
-                      workspace code. The endpoint stays on the Mac and is never sent to ClawPilot.
-                    </Typography>
-                    <Box sx={{ mt: 0.75 }}>
-                      <PrintAgentDistributionFacts manifest={printAgentDistribution} />
-                    </Box>
-                  </>
                 ) : (
                   <>
                     <Typography fontWeight={700}>Verified Print Agent release unavailable</Typography>
@@ -1488,7 +1352,6 @@ export default function PrinterConfigurationPanel() {
                 {customerWindowsPrintAgent && (
                   <CustomerPrintAgentDownloadButton artifact={customerWindowsPrintAgent} />
                 )}
-                {!customerPrintAgentRelease && <DeveloperPrintAgentDownloadButton />}
                 {printAgentSetupReady && agents?.capabilities.canManage && (
                   <Button
                     variant="contained"
@@ -1523,8 +1386,6 @@ export default function PrinterConfigurationPanel() {
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
                 {customerPrintAgentRelease
                   ? 'Download and open the signed Print Agent, then create a one-time code for this workspace. The app prompts locally for the private Zebra IP and port 9100.'
-                  : ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW
-                  ? 'Open the developer helper first, then create a one-time code for this workspace. The helper prompts locally for the Zebra IP and port 9100.'
                   : 'A verified signed macOS or Windows Print Agent is required before a new operator can pair this workspace.'}
               </Typography>
             </Box>
@@ -2122,11 +1983,9 @@ export default function PrinterConfigurationPanel() {
                 <Alert severity="info">
                   <Stack spacing={1} alignItems="flex-start">
                     <Typography variant="body2">
-                      {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW
-                        ? 'Enter the Zebra hostname/IP and raw port 9100 in the developer helper on the controlled development Mac, not in this hosted form.'
-                        : customerPrintAgentRelease
-                          ? 'Enter the Zebra private network IP and raw port 9100 in the signed ClawPilot Print Agent for macOS or Windows, not in this hosted form.'
-                          : 'A verified signed Print Agent release is required before entering the Zebra private network IP and raw port 9100; this hosted form never collects it.'}
+                      {customerPrintAgentRelease
+                        ? 'Enter the Zebra private network IP and raw port 9100 in the signed ClawPilot Print Agent for macOS or Windows, not in this hosted form.'
+                        : 'A verified signed Print Agent release is required before entering the Zebra private network IP and raw port 9100; this hosted form never collects it.'}
                       {' '}This form defines routing and capabilities only. New Zebra profiles
                       retain the 4 x 6 carrier-label preset; select only the label sizes physically
                       loaded and calibrated.
@@ -2526,38 +2385,21 @@ export default function PrinterConfigurationPanel() {
           <Stack spacing={2}>
             <Box>
               <Typography fontWeight={700}>
-                {customerPrintAgentRelease
-                  ? '1. Download and open the signed Print Agent'
-                  : '1. Open the developer-only macOS helper'}
+                1. Download and open the signed Print Agent
               </Typography>
-              {customerPrintAgentRelease ? (
-                <>
-                  <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                    Choose the installer for this computer. Only use the verified installer linked
-                    here. The app is credential-free and never contains this workspace&apos;s pairing
-                    code, printer IP, or ClawPilot session.
-                  </Typography>
-                  <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mt: 1 }}>
-                    {customerMacPrintAgent && (
-                      <CustomerPrintAgentDownloadButton artifact={customerMacPrintAgent} />
-                    )}
-                    {customerWindowsPrintAgent && (
-                      <CustomerPrintAgentDownloadButton artifact={customerWindowsPrintAgent} />
-                    )}
-                  </Stack>
-                </>
-              ) : (
-                <>
-                  <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                    This unsigned preview is for a controlled development Mac only and is not a
-                    customer installer. Do not bypass or disable Gatekeeper on an operator Mac.
-                  </Typography>
-                  <Box sx={{ mt: 1 }}><DeveloperPrintAgentDownloadButton /></Box>
-                  <Box sx={{ mt: 0.75 }}>
-                    <PrintAgentDistributionFacts manifest={printAgentDistribution} />
-                  </Box>
-                </>
-              )}
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                Choose the installer for this computer. Only use the verified installer linked
+                here. The app is credential-free and never contains this workspace&apos;s pairing
+                code, printer IP, or ClawPilot session.
+              </Typography>
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mt: 1 }}>
+                {customerMacPrintAgent && (
+                  <CustomerPrintAgentDownloadButton artifact={customerMacPrintAgent} />
+                )}
+                {customerWindowsPrintAgent && (
+                  <CustomerPrintAgentDownloadButton artifact={customerWindowsPrintAgent} />
+                )}
+              </Stack>
             </Box>
             <Divider />
             <Box>
@@ -2637,40 +2479,6 @@ export default function PrinterConfigurationPanel() {
               </Button>
             </Box>
             <Divider />
-            {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW && (
-              <Box component="details">
-              <Box component="summary" sx={{ cursor: 'pointer', fontWeight: 700 }}>
-                Advanced terminal pairing
-              </Box>
-              <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-                Repository checkouts can run the guided pairing command. It prompts locally for
-                the code and printer endpoint; neither value is placed in the command.
-              </Typography>
-              <Box
-                component="pre"
-                sx={{
-                  mt: 1,
-                  mb: 1,
-                  p: 1.5,
-                  border: '1px solid rgba(255,255,255,0.15)',
-                  borderRadius: '6px',
-                  overflowWrap: 'anywhere',
-                  whiteSpace: 'pre-wrap',
-                  fontSize: '0.8rem',
-                }}
-              >
-                {pairingCommand}
-              </Box>
-              <Button
-                size="small"
-                variant="outlined"
-                startIcon={<ContentCopyRounded />}
-                onClick={() => void navigator.clipboard.writeText(pairingCommand)}
-              >
-                Copy Mac pairing command
-              </Button>
-              </Box>
-            )}
             <Box>
               <Typography fontWeight={700}>Pair another workspace</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>

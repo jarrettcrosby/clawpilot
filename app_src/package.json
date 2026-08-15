@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "node ../scripts/build-macos-print-agent-download.mjs && next build --webpack",
+    "build": "next build --webpack",
     "build:vercel": "node ../scripts/vercel-build.mjs",
     "start": "next start",
     "lint": "eslint",

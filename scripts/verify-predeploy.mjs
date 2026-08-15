@@ -212,9 +212,6 @@ for (const requiredPath of [
   'db/migrations/0291_operations_order_replanning_corrections.sql',
   'app_src/app/api/operations/print-agent/pair/route.ts',
   'app_src/app/api/operations/print-agents/route.ts',
-  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip',
-  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip.sha256',
-  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.json',
   'app_src/app/api/operations/order-revisions/route.ts',
   'app_src/app/api/integrations/commerce/order-history/route.ts',
   'app_src/app/api/integrations/commerce/authority-policies/route.ts',
@@ -229,7 +226,6 @@ for (const requiredPath of [
   'app_src/lib/integrations/shopifyOrderManagement.ts',
   'app_src/lib/integrations/shopifyOrderManagementRuntime.ts',
   'app_src/lib/integrations/carrierShippingDiagnosticRate.ts',
-  'scripts/build-macos-print-agent-download.mjs',
   'scripts/lib/deterministic-zip.mjs',
   'scripts/lib/macos-print-agent-credential.mjs',
   'scripts/manage-macos-print-agent.mjs',
@@ -270,7 +266,6 @@ for (const requiredPath of [
   'scripts/test-carrier-shipping-account-diagnostics-postgres.mjs',
   'scripts/test-operation-print-agent-pairing.mjs',
   'scripts/test-macos-print-agent-pairing-grant.mjs',
-  'scripts/test-macos-print-agent-download.mjs',
   'scripts/test-submit-raw-print.mjs',
   'scripts/test-shipping-ui-fixture.mjs',
   'scripts/test-apple-manager-pick-management.mjs',
@@ -775,9 +770,6 @@ for (const requiredPath of [
   'scripts/test-operation-printing.mjs',
   'scripts/test-operation-print-agent-runtime.mjs',
   'scripts/test-print-agent-release-download.mjs',
-  'scripts/pair-macos-print-agent.mjs',
-  'scripts/lib/macos-print-agent-pairing.mjs',
-  'scripts/test-macos-print-agent-pairing.mjs',
   'scripts/calibrate-zebra-printer.mjs',
   'scripts/test-zebra-printer-calibration.mjs',
   'scripts/test-operation-shipment-completion.mjs',
@@ -874,6 +866,21 @@ for (const requiredPath of [
   if (!existsSync(resolve(root, requiredPath))) {
     fail(`missing deployment runtime file: ${requiredPath}`)
   }
+}
+
+for (const forbiddenUnsignedPrintAgentArtifact of [
+  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip',
+  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip.sha256',
+  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.json',
+]) {
+  if (existsSync(resolve(root, forbiddenUnsignedPrintAgentArtifact))) {
+    fail(`unsigned print-agent preview must not ship: ${forbiddenUnsignedPrintAgentArtifact}`)
+  }
+}
+
+const applicationPackage = JSON.parse(readFileSync(resolve(root, 'app_src/package.json'), 'utf8'))
+if (String(applicationPackage.scripts?.build || '').includes('build-macos-print-agent-download')) {
+  fail('application build must not regenerate the unsigned macOS print-agent preview')
 }
 
 run(process.execPath, ['scripts/test-print-agent-release-download.mjs'])
